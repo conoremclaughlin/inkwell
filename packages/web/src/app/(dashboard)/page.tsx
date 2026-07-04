@@ -73,18 +73,36 @@ function getAgentStatusBadge(
 } | null {
   // Phase-level overrides (blocked is a phase concern)
   if (phase?.startsWith('blocked'))
-    return { label: 'Blocked', badgeClass: 'bg-amber-100 text-amber-700' };
+    return {
+      label: 'Blocked',
+      badgeClass: 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400',
+    };
 
   // Lifecycle takes priority for runtime state
-  if (lifecycle === 'running') return { label: 'Running', badgeClass: 'bg-blue-100 text-blue-700' };
-  if (lifecycle === 'failed') return { label: 'Failed', badgeClass: 'bg-red-100 text-red-700' };
+  if (lifecycle === 'running')
+    return {
+      label: 'Running',
+      badgeClass: 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400',
+    };
+  if (lifecycle === 'failed')
+    return {
+      label: 'Failed',
+      badgeClass: 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400',
+    };
   if (lifecycle === 'completed')
-    return { label: 'Completed', badgeClass: 'bg-gray-100 text-gray-600' };
-  if (lifecycle === 'idle') return { label: 'Idle', badgeClass: 'bg-green-100 text-green-700' };
+    return { label: 'Completed', badgeClass: 'bg-muted text-muted-foreground' };
+  if (lifecycle === 'idle')
+    return {
+      label: 'Idle',
+      badgeClass: 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400',
+    };
 
   // Backward compat: check old runtime:* phase values
   if (phase === 'runtime:generating')
-    return { label: 'Running', badgeClass: 'bg-blue-100 text-blue-700' };
+    return {
+      label: 'Running',
+      badgeClass: 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400',
+    };
   if (phase === 'runtime:idle') return null;
   if (phase) return null;
 
@@ -94,13 +112,13 @@ function getAgentStatusBadge(
 function getStudioStatusColor(status: string): string {
   switch (status) {
     case 'active':
-      return 'text-green-600';
+      return 'text-green-600 dark:text-green-400';
     case 'idle':
-      return 'text-gray-500';
+      return 'text-muted-foreground';
     case 'archived':
-      return 'text-gray-400';
+      return 'text-muted-foreground/70';
     default:
-      return 'text-gray-400';
+      return 'text-muted-foreground/70';
   }
 }
 
@@ -148,16 +166,16 @@ export default function DashboardPage() {
 
   return (
     <div>
-      <h1 className="text-3xl font-bold text-gray-900">Dashboard</h1>
-      <p className="mt-2 text-gray-600">Monitor your SBs and their studios.</p>
+      <h1 className="text-3xl font-bold text-foreground">Dashboard</h1>
+      <p className="mt-2 text-muted-foreground">Monitor your SBs and their studios.</p>
 
       {/* SBs + Studios */}
       <div className="mt-8">
         <div className="flex items-center justify-between mb-4">
-          <h2 className="text-lg font-semibold text-gray-900">Studios</h2>
+          <h2 className="text-lg font-semibold text-foreground">Studios</h2>
           <Link
             href="/sessions"
-            className="flex items-center gap-1 text-sm text-blue-600 hover:text-blue-800"
+            className="flex items-center gap-1 text-sm text-blue-600 hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300"
           >
             View all sessions
             <ArrowRight className="h-4 w-4" />
@@ -169,15 +187,15 @@ export default function DashboardPage() {
             {[1, 2].map((i) => (
               <div
                 key={i}
-                className="h-24 rounded-lg border border-gray-200 bg-gray-50 animate-pulse"
+                className="h-24 rounded-lg border border-border bg-muted/50 animate-pulse"
               />
             ))}
           </div>
         ) : agents.length === 0 ? (
           <Card>
             <CardContent className="py-6 text-center">
-              <FolderGit2 className="h-8 w-8 mx-auto text-gray-300 mb-2" />
-              <p className="text-sm text-gray-500">No SBs configured</p>
+              <FolderGit2 className="h-8 w-8 mx-auto text-muted-foreground/50 mb-2" />
+              <p className="text-sm text-muted-foreground">No SBs configured</p>
             </CardContent>
           </Card>
         ) : (
@@ -193,7 +211,7 @@ export default function DashboardPage() {
               return (
                 <Card key={agent.agentId} className="overflow-hidden">
                   {/* Agent header */}
-                  <div className="flex items-center gap-4 px-5 py-4 border-b bg-gray-50/50">
+                  <div className="flex items-center gap-4 px-5 py-4 border-b bg-muted/40">
                     <div
                       className={clsx(
                         'h-10 w-10 rounded-full bg-gradient-to-br flex items-center justify-center text-white font-semibold text-sm shrink-0',
@@ -204,8 +222,8 @@ export default function DashboardPage() {
                     </div>
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2">
-                        <h3 className="font-semibold text-gray-900">{agent.agentName}</h3>
-                        <span className="text-xs text-gray-400">@{agent.agentId}</span>
+                        <h3 className="font-semibold text-foreground">{agent.agentName}</h3>
+                        <span className="text-xs text-muted-foreground/80">@{agent.agentId}</span>
                         {status && (
                           <Badge className={clsx('text-[11px]', status.badgeClass)}>
                             {status.label}
@@ -214,22 +232,24 @@ export default function DashboardPage() {
                       </div>
                       <div className="flex items-center gap-2 mt-0.5">
                         {agent.agentRole && (
-                          <p className="text-sm text-gray-500 truncate">{agent.agentRole}</p>
+                          <p className="text-sm text-muted-foreground truncate">
+                            {agent.agentRole}
+                          </p>
                         )}
                       </div>
                     </div>
                     <div className="flex items-center gap-3 shrink-0">
                       {backendLabel && (
-                        <span className="text-xs text-gray-400">{backendLabel}</span>
+                        <span className="text-xs text-muted-foreground/80">{backendLabel}</span>
                       )}
                       {agent.latestSession && (
-                        <span className="text-xs text-gray-400">
+                        <span className="text-xs text-muted-foreground/80">
                           {formatRelativeTime(agent.latestSession.updatedAt)}
                         </span>
                       )}
                       <Link
                         href={`/routing/${agent.agentId}`}
-                        className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-gray-600 bg-white border border-gray-200 rounded-md hover:bg-gray-50 hover:text-gray-900 transition-colors"
+                        className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-muted-foreground bg-card border border-border rounded-md hover:bg-muted/50 hover:text-foreground transition-colors"
                       >
                         <Settings className="h-3 w-3" />
                         Manage
@@ -239,7 +259,7 @@ export default function DashboardPage() {
 
                   {/* Studios list */}
                   {agent.studios.length === 0 ? (
-                    <div className="px-5 py-4 text-sm text-gray-400">No studios</div>
+                    <div className="px-5 py-4 text-sm text-muted-foreground/80">No studios</div>
                   ) : (
                     <div className="divide-y">
                       {agent.studios.map((studio) => {
@@ -253,25 +273,25 @@ export default function DashboardPage() {
                                 <GitBranch
                                   className={clsx('h-4 w-4', getStudioStatusColor(studio.status))}
                                 />
-                                <span className="text-sm font-medium text-gray-700">
+                                <span className="text-sm font-medium text-foreground/90">
                                   {slug || studio.branch}
                                 </span>
                               </div>
                               {repoName && (
                                 <span
-                                  className="text-xs text-gray-400"
+                                  className="text-xs text-muted-foreground/80"
                                   title={studio.repoRoot || undefined}
                                 >
                                   {repoName}
                                 </span>
                               )}
                               {studio.purpose && (
-                                <span className="text-xs text-gray-400 truncate">
+                                <span className="text-xs text-muted-foreground/80 truncate">
                                   {studio.purpose}
                                 </span>
                               )}
                               {studio.workType && (
-                                <Badge className="text-[10px] bg-gray-100 text-gray-500 border-gray-200">
+                                <Badge className="text-[10px] bg-muted text-muted-foreground border-border">
                                   {studio.workType}
                                 </Badge>
                               )}
@@ -282,14 +302,14 @@ export default function DashboardPage() {
                                   className={clsx(
                                     'text-[11px] font-medium border',
                                     studio.status === 'idle'
-                                      ? 'bg-gray-50 text-gray-500 border-gray-200 hover:bg-gray-50'
-                                      : 'bg-gray-50 text-gray-400 border-gray-200 hover:bg-gray-50'
+                                      ? 'bg-muted/50 text-muted-foreground border-border hover:bg-muted/50'
+                                      : 'bg-muted/50 text-muted-foreground/70 border-border hover:bg-muted/50'
                                   )}
                                 >
                                   {studio.status}
                                 </Badge>
                               )}
-                              <span className="text-xs text-gray-400">
+                              <span className="text-xs text-muted-foreground/80">
                                 {formatRelativeTime(studio.updatedAt)}
                               </span>
                             </div>

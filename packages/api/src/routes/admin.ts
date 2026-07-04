@@ -49,6 +49,11 @@ import {
 import type { Database } from '../data/supabase/types';
 import { activityBus } from '../services/events/activity-bus';
 import type { Activity } from '../data/repositories/activity-stream.repository';
+import {
+  shapeAutomations,
+  type ReminderSourceRow,
+  type StrategyGroupSourceRow,
+} from '../services/automations/automation-shaper';
 
 // WhatsApp listener reference (set via setWhatsAppListener)
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -2942,6 +2947,66 @@ router.get('/reminders', async (req: Request, res: Response) => {
   } catch (error) {
     logger.error('Failed to list reminders:', error);
     res.status(500).json(errorJson('Failed to list reminders', error));
+  }
+});
+
+/**
+ * GET /api/admin/automations
+ * Read-only unified view of reminders, heartbeats, and strategies.
+ * Presentation-level only — no schema changes. Strategy watchdog reminders
+ * are folded into their strategy item rather than listed separately.
+ */
+router.get('/automations', async (req: Request, res: Response) => {
+  try {
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const authReq = req as AdminAuthRequest;
+
+    const [remindersResult, strategyGroupsResult] = await Promise.all([
+      supabase
+        .from('scheduled_reminders')
+        .select(
+          'id, title, description, cron_expression, next_run_at, last_run_at, delivery_channel, status, metadata, agent_identities!inner(agent_id, name, workspace_id)'
+        )
+        .eq('user_id', authReq.pcpUserId)
+        .eq('agent_identities.workspace_id', authReq.pcpWorkspaceId)
+        .order('next_run_at', { ascending: true })
+        .limit(200),
+      // Workspace-scoped via the owning identity, same as the reminders
+      // query above — without the inner-join filter, same-user strategies
+      // from other workspaces would leak into this workspace's view.
+      supabase
+        .from('task_groups')
+        .select(
+          'id, title, status, strategy, strategy_config, strategy_started_at, strategy_paused_at, updated_at, agent_identities!inner(agent_id, name, workspace_id)'
+        )
+        .eq('user_id', authReq.pcpUserId)
+        .eq('agent_identities.workspace_id', authReq.pcpWorkspaceId)
+        .eq('status', 'active')
+        .not('strategy', 'is', null)
+        .order('updated_at', { ascending: false })
+        .limit(100),
+    ]);
+
+    if (remindersResult.error) {
+      res.status(500).json(errorJson('Failed to list automations', remindersResult.error));
+      return;
+    }
+    if (strategyGroupsResult.error) {
+      res.status(500).json(errorJson('Failed to list automations', strategyGroupsResult.error));
+      return;
+    }
+
+    const automations = shapeAutomations(
+      (remindersResult.data || []) as unknown as ReminderSourceRow[],
+      (strategyGroupsResult.data || []) as unknown as StrategyGroupSourceRow[]
+    );
+
+    res.json({ automations });
+  } catch (error) {
+    logger.error('Failed to list automations:', error);
+    res.status(500).json(errorJson('Failed to list automations', error));
   }
 });
 
