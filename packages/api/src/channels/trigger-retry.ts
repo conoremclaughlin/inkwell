@@ -36,17 +36,18 @@ export function getTriggerAttempt(payload: AgentTriggerPayload): number {
 }
 
 /**
- * Stable identity for a trigger across re-dispatches. Prefers the source
- * message id (inbox row, thread message, thread), falling back to
- * recipient + threadKey for direct trigger_agent calls.
+ * Stable identity for a trigger across re-dispatches. Combines the source
+ * message id with the target agent so fan-out (one thread message triggering
+ * multiple recipients) gets independent retry timers per recipient.
  */
 export function getTriggerRetryKey(payload: AgentTriggerPayload): string {
-  return (
+  const sourceId =
     payload.inboxMessageId ??
     payload.threadMessageId ??
     payload.threadId ??
-    `${payload.toAgentId}:${payload.threadKey ?? 'no-thread'}`
-  );
+    payload.threadKey ??
+    'no-thread';
+  return `${sourceId}::${payload.toAgentId}`;
 }
 
 export type ScheduleResult =

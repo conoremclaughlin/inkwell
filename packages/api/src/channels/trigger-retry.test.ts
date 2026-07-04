@@ -40,21 +40,30 @@ describe('getTriggerAttempt', () => {
 });
 
 describe('getTriggerRetryKey', () => {
-  it('prefers inboxMessageId, then threadMessageId, then threadId', () => {
-    expect(getTriggerRetryKey(makePayload())).toBe('inbox-msg-1');
+  it('includes toAgentId with source id for fan-out safety', () => {
+    expect(getTriggerRetryKey(makePayload())).toBe('inbox-msg-1::lumen');
     expect(
       getTriggerRetryKey(makePayload({ inboxMessageId: undefined, threadMessageId: 'tm-1' }))
-    ).toBe('tm-1');
+    ).toBe('tm-1::lumen');
     expect(getTriggerRetryKey(makePayload({ inboxMessageId: undefined, threadId: 'th-1' }))).toBe(
-      'th-1'
+      'th-1::lumen'
     );
   });
 
-  it('falls back to recipient + threadKey', () => {
-    expect(getTriggerRetryKey(makePayload({ inboxMessageId: undefined }))).toBe('lumen:pr:42');
+  it('falls back to threadKey when no message ids present', () => {
+    expect(getTriggerRetryKey(makePayload({ inboxMessageId: undefined }))).toBe('pr:42::lumen');
     expect(
       getTriggerRetryKey(makePayload({ inboxMessageId: undefined, threadKey: undefined }))
-    ).toBe('lumen:no-thread');
+    ).toBe('no-thread::lumen');
+  });
+
+  it('produces distinct keys for fan-out to different recipients', () => {
+    const msg = { inboxMessageId: undefined as string | undefined, threadMessageId: 'tm-shared' };
+    const keyLumen = getTriggerRetryKey(makePayload({ ...msg, toAgentId: 'lumen' }));
+    const keyAster = getTriggerRetryKey(makePayload({ ...msg, toAgentId: 'aster' }));
+    expect(keyLumen).toBe('tm-shared::lumen');
+    expect(keyAster).toBe('tm-shared::aster');
+    expect(keyLumen).not.toBe(keyAster);
   });
 });
 
@@ -143,10 +152,25 @@ describe('TriggerRetryScheduler', () => {
 
   it('cancel() clears a pending retry', () => {
     scheduler.scheduleRetry(makePayload(), TRANSIENT);
-    expect(scheduler.cancel('inbox-msg-1')).toBe(true);
-    expect(scheduler.cancel('inbox-msg-1')).toBe(false);
+    expect(scheduler.cancel('inbox-msg-1::lumen')).toBe(true);
+    expect(scheduler.cancel('inbox-msg-1::lumen')).toBe(false);
     vi.advanceTimersByTime(60 * 60 * 1000);
     expect(redispatch).not.toHaveBeenCalled();
+  });
+
+  it('schedules independent retries for fan-out to different recipients', () => {
+    const base = { inboxMessageId: undefined as string | undefined, threadMessageId: 'tm-shared' };
+    const toLumen = makePayload({ ...base, toAgentId: 'lumen' });
+    const toAster = makePayload({ ...base, toAgentId: 'aster' });
+
+    expect(scheduler.scheduleRetry(toLumen, TRANSIENT).scheduled).toBe(true);
+    expect(scheduler.scheduleRetry(toAster, TRANSIENT).scheduled).toBe(true);
+    expect(scheduler.pendingCount).toBe(2);
+
+    vi.advanceTimersByTime(TRIGGER_RETRY_DELAYS_MS[0]);
+    expect(redispatch).toHaveBeenCalledTimes(2);
+    expect(redispatch.mock.calls[0][0].toAgentId).toBe('lumen');
+    expect(redispatch.mock.calls[1][0].toAgentId).toBe('aster');
   });
 
   it('respects custom maxAttempts and delays', () => {

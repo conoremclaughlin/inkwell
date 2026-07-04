@@ -1278,7 +1278,30 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         recipientUserId = thread?.user_id;
       }
 
-      // 1. Transient failure → schedule a delayed retry instead of notifying.
+      // 1. Restore inbox message to unread FIRST — before retry decision.
+      // If we schedule a retry and the server crashes mid-backoff, the
+      // message is still unread and visible to heartbeat scans. The retry
+      // re-dispatch will mark it read again on success.
+      if (payload.inboxMessageId) {
+        const { error: restoreErr } = await client
+          .from('agent_inbox')
+          .update({ status: 'unread', read_at: null })
+          .eq('id', payload.inboxMessageId)
+          .eq('status', 'read');
+
+        if (restoreErr) {
+          logger.warn('[TriggerFailure] Failed to restore inbox message', {
+            inboxMessageId: payload.inboxMessageId,
+            error: restoreErr.message,
+          });
+        } else {
+          logger.info('[TriggerFailure] Restored inbox message to unread', {
+            inboxMessageId: payload.inboxMessageId,
+          });
+        }
+      }
+
+      // 2. Transient failure → schedule a delayed retry instead of notifying.
       // Guard: never retry if the spawn already produced a successful session
       // turn (triggerTurnCompleted is set post-success in the default handler).
       const turnCompleted = payload.metadata?.triggerTurnCompleted === true;
@@ -1326,26 +1349,6 @@ When you complete a task_request, mark it as completed using update_inbox_messag
             }
           }
           return;
-        }
-      }
-
-      // 2. Restore inbox message to unread (only for agent_inbox rows — not thread messages)
-      if (payload.inboxMessageId) {
-        const { error: restoreErr } = await client
-          .from('agent_inbox')
-          .update({ status: 'unread', read_at: null })
-          .eq('id', payload.inboxMessageId)
-          .eq('status', 'read');
-
-        if (restoreErr) {
-          logger.warn('[TriggerFailure] Failed to restore inbox message', {
-            inboxMessageId: payload.inboxMessageId,
-            error: restoreErr.message,
-          });
-        } else {
-          logger.info('[TriggerFailure] Restored inbox message to unread', {
-            inboxMessageId: payload.inboxMessageId,
-          });
         }
       }
 
