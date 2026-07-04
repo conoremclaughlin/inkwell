@@ -41,6 +41,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { ThemeToggle } from '@/components/theme/theme-toggle';
 
 interface NavItem {
   name: string;
@@ -646,6 +647,11 @@ export function Sidebar() {
           ))}
         </div>
       </nav>
+
+      {/* Footer: theme toggle */}
+      <div className="border-t border-white/[0.06] px-3 py-2">
+        <ThemeToggle className="w-full" />
+      </div>
     </div>
   );
 }
