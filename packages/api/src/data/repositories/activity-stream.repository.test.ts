@@ -220,6 +220,80 @@ describe('ActivityStreamRepository', () => {
       expect(result.content).toBe('Of course! What do you need help with?');
       expect(result.platform).toBe('telegram');
     });
+
+    it('should pass taskGroupId through to the inserted row', async () => {
+      const mockActivityRow = {
+        id: 'act-789',
+        user_id: 'user-456',
+        agent_id: 'myra',
+        type: 'message_in',
+        content: 'Check-in on the mission',
+        subtype: null,
+        payload: {},
+        contact_id: null,
+        parent_id: null,
+        correlation_id: null,
+        platform: 'telegram',
+        platform_message_id: null,
+        platform_chat_id: null,
+        is_dm: true,
+        artifact_id: null,
+        child_session_id: null,
+        session_id: null,
+        task_group_id: 'group-123',
+        created_at: '2026-02-02T12:00:00Z',
+        completed_at: null,
+        duration_ms: null,
+        status: 'completed',
+      };
+
+      mockSupabase._setReturnData(mockActivityRow);
+
+      const result = await repo.logMessage({
+        userId: 'user-456',
+        agentId: 'myra',
+        direction: 'in',
+        content: 'Check-in on the mission',
+        platform: 'telegram',
+        taskGroupId: 'group-123',
+      });
+
+      expect(result.taskGroupId).toBe('group-123');
+      expect(mockSupabase._queryBuilder.insert).toHaveBeenCalledWith(
+        expect.objectContaining({ task_group_id: 'group-123' })
+      );
+    });
+  });
+
+  describe('tagActivityTaskGroup', () => {
+    it('should update task_group_id and session_id on the activity row', async () => {
+      mockSupabase._setReturnData(null);
+
+      await repo.tagActivityTaskGroup('act-123', 'group-456', 'session-789');
+
+      expect(mockSupabase.from).toHaveBeenCalledWith('activity_stream');
+      expect(mockSupabase._queryBuilder.update).toHaveBeenCalledWith({
+        task_group_id: 'group-456',
+        session_id: 'session-789',
+      });
+      expect(mockSupabase._queryBuilder.eq).toHaveBeenCalledWith('id', 'act-123');
+    });
+
+    it('should omit session_id when not provided', async () => {
+      mockSupabase._setReturnData(null);
+
+      await repo.tagActivityTaskGroup('act-123', 'group-456');
+
+      expect(mockSupabase._queryBuilder.update).toHaveBeenCalledWith({
+        task_group_id: 'group-456',
+      });
+    });
+
+    it('should not throw when the update fails', async () => {
+      mockSupabase._setReturnData(null, { message: 'update failed' });
+
+      await expect(repo.tagActivityTaskGroup('act-123', 'group-456')).resolves.toBeUndefined();
+    });
   });
 
   describe('getConversationHistory', () => {

@@ -56,6 +56,7 @@ import {
   type SessionAttachedRow,
 } from './services/sessions/trigger-delivery';
 import type { ActivityType } from './data/repositories/activity-stream.repository';
+import { resolveTaskGroupForThreadKey } from './services/task-group-resolver';
 
 // Server configuration
 interface ServerConfig {
@@ -670,6 +671,23 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
     extra?: { sessionId?: string; error?: string; deliveryMethod?: string }
   ): Promise<void> {
     try {
+      // Tag inkmail with its mission (task group) so cross-agent messages
+      // appear on the mission timeline. Strategy triggers carry groupId in
+      // metadata; otherwise resolve conservatively from the threadKey
+      // (verified task:/strategy: ids or an exact task_groups.thread_key match).
+      let taskGroupId =
+        payload.metadata && typeof payload.metadata.groupId === 'string' && payload.metadata.groupId
+          ? payload.metadata.groupId
+          : undefined;
+      if (!taskGroupId && payload.threadKey) {
+        taskGroupId =
+          (await resolveTaskGroupForThreadKey(
+            dataComposer!.getClient(),
+            userId,
+            payload.threadKey
+          )) ?? undefined;
+      }
+
       await dataComposer!.repositories.activityStream.logActivity({
         userId,
         agentId: payload.toAgentId,
@@ -677,6 +695,7 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
         subtype: payload.triggerType,
         content: payload.summary || `Inkmail from ${payload.fromAgentId}`,
         sessionId: extra?.sessionId,
+        taskGroupId,
         correlationId: payload.threadMessageId || payload.inboxMessageId,
         payload: {
           fromAgentId: payload.fromAgentId,

@@ -39,6 +39,7 @@ import { InkRunner } from './ink-runner.js';
 import { ActivityStreamRepository } from '../../data/repositories/activity-stream.repository.js';
 import { resolveIdentityId } from '../../auth/resolve-identity.js';
 import { classifyError } from '@inklabs/shared';
+import { resolveTaskGroupForThreadKey } from '../task-group-resolver.js';
 import { getRunnerFilesDir } from '../sandbox/orchestrator.js';
 import { logger } from '../../utils/logger.js';
 
@@ -82,6 +83,7 @@ export interface IActivityStream {
     platformChatId?: string;
     isDm?: boolean;
     payload?: Json;
+    taskGroupId?: string;
   }): Promise<{ id: string }>;
 
   logActivity(params: {
@@ -96,6 +98,12 @@ export interface IActivityStream {
     platformChatId?: string;
     taskGroupId?: string;
   }): Promise<{ id: string }>;
+
+  /**
+   * Optional: backfill task-group/session linkage on an already-logged
+   * activity (incoming messages are logged before session routing resolves).
+   */
+  tagActivityTaskGroup?(activityId: string, taskGroupId: string, sessionId?: string): Promise<void>;
 }
 
 /**
@@ -196,10 +204,21 @@ export class SessionService implements ISessionService {
       contentLength: content.length,
     });
 
+    // Resolve mission (task group) linkage for the check-in entry so it shows
+    // on the mission timeline. Conservative: only explicit metadata or a
+    // verified threadKey match tags the message — null beats wrong.
+    let messageTaskGroupId: string | undefined = metadata?.taskGroupId;
+    if (!messageTaskGroupId && metadata?.threadKey && this.supabase) {
+      messageTaskGroupId =
+        (await resolveTaskGroupForThreadKey(this.supabase, userId, metadata.threadKey)) ??
+        undefined;
+    }
+
     // Persist incoming message to activity stream immediately
     // This ensures messages are logged even if processing fails
+    let loggedMessageId: string | undefined;
     try {
-      await this.activityStream.logMessage({
+      const logged = await this.activityStream.logMessage({
         userId,
         agentId,
         direction: 'in',
@@ -219,7 +238,9 @@ export class SessionService implements ISessionService {
             studioHint: metadata?.studioHint,
           })
         ),
+        taskGroupId: messageTaskGroupId,
       });
+      loggedMessageId = logged.id;
     } catch (logError) {
       // Don't fail the request if activity logging fails
       logger.warn('Failed to log incoming message to activity stream', {
@@ -243,6 +264,34 @@ export class SessionService implements ISessionService {
         contactId: metadata?.contactId,
         repoRoot: metadata?.repoRoot,
       });
+
+      // Backfill mission linkage now that routing resolved: a check-in that
+      // landed in a session bound to a mission thread (e.g. a Telegram reply
+      // routed into a strategy session) belongs on that mission's timeline.
+      // Also stamps session_id so the timeline can link to the session turn
+      // the check-in triggered.
+      if (loggedMessageId && this.activityStream.tagActivityTaskGroup) {
+        let resolvedGroupId: string | null = messageTaskGroupId ?? null;
+        if (!resolvedGroupId && session.threadKey && this.supabase) {
+          resolvedGroupId = await resolveTaskGroupForThreadKey(
+            this.supabase,
+            userId,
+            session.threadKey
+          );
+        }
+        if (resolvedGroupId) {
+          // Best-effort — never block or fail message processing on this.
+          this.activityStream
+            .tagActivityTaskGroup(loggedMessageId, resolvedGroupId, session.id)
+            .catch((tagError) => {
+              logger.warn('Failed to backfill task group on check-in activity', {
+                activityId: loggedMessageId,
+                taskGroupId: resolvedGroupId,
+                error: tagError instanceof Error ? tagError.message : String(tagError),
+              });
+            });
+        }
+      }
 
       // 2. Log session routing for external + heartbeat channels
       // so we can verify messages and heartbeats land in the same session.
