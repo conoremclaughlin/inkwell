@@ -202,7 +202,9 @@ function activityToLogEntry(activity: StreamActivity): SessionLogEntry {
   const role =
     activity.type === 'message_in' ? 'in' : activity.type === 'message_out' ? 'out' : 'system';
   return {
-    id: activity.id,
+    // Match the id format of polled entries (fetchCloudSessionLogs prefixes
+    // activity_stream rows with "activity:") so merge dedupe works.
+    id: `activity:${activity.id}`,
     source: 'activity_stream',
     type: activity.subtype ? `${activity.type}:${activity.subtype}` : activity.type,
     role,

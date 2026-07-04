@@ -1907,10 +1907,13 @@ router.get('/events', async (req: Request, res: Response) => {
   const seenIds = new Set<string>();
   const buffered: Activity[] = [];
   let backfilling = true;
+  let closed = false;
+  let heartbeat: ReturnType<typeof setInterval> | undefined;
 
   const unsubscribe = activityBus.subscribe(
     { userId: authReq.pcpUserId, sessionId, taskGroupId, agentId },
     (activity) => {
+      if (closed) return;
       if (backfilling) {
         buffered.push(activity);
         return;
@@ -1919,6 +1922,14 @@ router.get('/events', async (req: Request, res: Response) => {
       writeEvent(activity);
     }
   );
+
+  // Register cleanup BEFORE the awaited backfill — a client that disconnects
+  // mid-backfill would otherwise never fire this and leak the subscriber.
+  req.on('close', () => {
+    closed = true;
+    if (heartbeat) clearInterval(heartbeat);
+    unsubscribe();
+  });
 
   try {
     // Unencoded "+" in ISO offsets ("+00:00") arrives as a space after URL
@@ -1943,6 +1954,8 @@ router.get('/events', async (req: Request, res: Response) => {
     res.write(`event: stream_error\ndata: ${JSON.stringify({ message: 'backfill failed' })}\n\n`);
   }
 
+  if (closed) return;
+
   backfilling = false;
   for (const activity of buffered) {
     if (!seenIds.has(activity.id)) writeEvent(activity);
@@ -1951,14 +1964,9 @@ router.get('/events', async (req: Request, res: Response) => {
   res.write(`event: ready\ndata: {}\n\n`);
 
   // Comment heartbeat holds proxies (Next rewrites) open through idle periods.
-  const heartbeat = setInterval(() => {
+  heartbeat = setInterval(() => {
     res.write(`: heartbeat\n\n`);
   }, 25_000);
-
-  req.on('close', () => {
-    clearInterval(heartbeat);
-    unsubscribe();
-  });
 });
 
 /**
