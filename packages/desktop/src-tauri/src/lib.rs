@@ -19,7 +19,7 @@ use tauri::{AppHandle, Manager, Url, WebviewUrl, WebviewWindowBuilder, WindowEve
 
 const MAIN_WINDOW: &str = "main";
 const DEFAULT_HOST: &str = "localhost";
-/// Web dashboard default port (`INK_PORT_BASE - 1`, i.e. 3001 - 1).
+/// Web dashboard default port (`INK_PORT_BASE + 1`, i.e. 3001 + 1).
 const DEFAULT_PORT: u16 = 3002;
 const POLL_INTERVAL: Duration = Duration::from_millis(1500);
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(800);

@@ -142,10 +142,13 @@ export class CodexRunner implements IRunner {
     // depends on the user's ~/.codex/config.toml having (or keeping) the
     // entry. A partial entry (headers without url) makes Codex fail with
     // "Error loading config.toml: invalid transport".
+    // Inside a Docker sandbox, loopback resolves to the container, so use
+    // host.docker.internal (matches the orchestrator's .mcp.json rewrite).
     const codexServerKey = 'inkwell';
+    const mcpHost = config.container ? 'host.docker.internal' : 'localhost';
     args.push(
       '-c',
-      `mcp_servers.${codexServerKey}.url="http://localhost:${env.MCP_HTTP_PORT}/mcp"`
+      `mcp_servers.${codexServerKey}.url="http://${mcpHost}:${env.MCP_HTTP_PORT}/mcp"`
     );
     // Session headers — Codex resolves env var names to values at runtime.
     args.push('-c', `mcp_servers.${codexServerKey}.env_http_headers.x-ink-context="INK_CONTEXT"`);
