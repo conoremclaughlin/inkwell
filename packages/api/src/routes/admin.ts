@@ -5203,6 +5203,8 @@ router.get('/sessions', async (req: Request, res: Response) => {
           lifecycle: s.lifecycle || 'idle',
           status: s.status,
           currentPhase: s.current_phase,
+          threadKey: s.thread_key || null,
+          activeThreadKey: s.active_thread_key || null,
           summary: s.summary,
           context: s.context,
           backend: s.backend,
