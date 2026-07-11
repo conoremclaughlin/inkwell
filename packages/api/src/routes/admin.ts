@@ -5203,6 +5203,8 @@ router.get('/sessions', async (req: Request, res: Response) => {
           lifecycle: s.lifecycle || 'idle',
           status: s.status,
           currentPhase: s.current_phase,
+          threadKey: s.thread_key || null,
+          activeThreadKey: s.active_thread_key || null,
           summary: s.summary,
           context: s.context,
           backend: s.backend,
@@ -5585,6 +5587,167 @@ router.get('/sessions/:id/transcript', async (req: Request, res: Response) => {
   } catch (error) {
     logger.error('Failed to export transcript:', error);
     res.status(500).json(errorJson('Failed to export transcript', error));
+  }
+});
+
+/**
+ * GET /api/admin/sessions/:id/conversation
+ * Returns raw transcript events for the conversation viewer.
+ * Tries synced transcript first, falls back to local.
+ */
+router.get('/sessions/:id/conversation', async (req: Request, res: Response) => {
+  try {
+    const sessionId = req.params.id;
+    const authReq = req as AdminAuthRequest;
+
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+
+    const { scope, error: scopedIdentityError } = await resolveWorkspaceIdentityScope(
+      supabase,
+      authReq.pcpUserId,
+      authReq.pcpWorkspaceId
+    );
+
+    if (scopedIdentityError || !scope || scope.sbIds.length === 0) {
+      res.status(404).json({ error: 'Session not found' });
+      return;
+    }
+
+    const { data: session, error: sessionError } = await supabase
+      .from('sessions')
+      .select(
+        'id, sb_id, agent_id, backend, backend_session_id, lifecycle, current_phase, active_thread_key, started_at, updated_at, ended_at, studio_id'
+      )
+      .eq('id', sessionId)
+      .eq('user_id', authReq.pcpUserId)
+      .single();
+
+    if (sessionError || !session || !isSessionInWorkspace(session, scope)) {
+      res.status(404).json({ error: 'Session not found' });
+      return;
+    }
+
+    const identity = scope.rows.find(
+      (row) => row.id === session.sb_id || row.agent_id === session.agent_id
+    );
+
+    const sessionInfo = {
+      id: session.id,
+      agentId: identity?.agent_id ?? session.agent_id ?? 'unknown',
+      agentName: identity?.name ?? session.agent_id ?? 'Unknown',
+      backend: session.backend,
+      backendSessionId: session.backend_session_id,
+      lifecycle: session.lifecycle,
+      currentPhase: session.current_phase,
+      activeThreadKey: session.active_thread_key ?? null,
+      startedAt: session.started_at,
+      updatedAt: session.updated_at,
+      endedAt: session.ended_at,
+    };
+
+    const backend = session.backend ?? 'claude-code';
+
+    const { data: archive } = await supabase
+      .from('session_transcript_archives')
+      .select('payload')
+      .eq('user_id', authReq.pcpUserId)
+      .eq('session_id', sessionId)
+      .order('synced_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (archive?.payload && typeof archive.payload === 'object') {
+      const payload = archive.payload as Record<string, unknown>;
+      const events = Array.isArray(payload.events) ? payload.events : [];
+      res.json({
+        session: sessionInfo,
+        source: 'synced',
+        backend,
+        transcript: { events },
+        totalEvents: events.length,
+      });
+      return;
+    }
+
+    const localItems = await tryReadLocalTranscript({
+      sessionId: session.id,
+      backendSessionId: session.backend_session_id,
+      backend: session.backend,
+    });
+
+    if (localItems.length > 0) {
+      const descriptor = await resolveLocalTranscriptDescriptor({
+        sessionId: session.id,
+        backend: session.backend,
+        backendSessionId: session.backend_session_id,
+      });
+
+      if (descriptor) {
+        const parsed = await readTranscriptFromDescriptor(descriptor);
+        if (parsed) {
+          res.json({
+            session: sessionInfo,
+            source: 'local',
+            backend,
+            transcript: { events: parsed.events },
+            totalEvents: parsed.events.length,
+          });
+          return;
+        }
+      }
+    }
+
+    // For ink backend: query activity_stream for conversation messages
+    if (backend === 'ink') {
+      const { data: activities, error: actError } = await supabase
+        .from('activity_stream')
+        .select('id, type, direction, content, agent_id, platform, created_at, payload')
+        .eq('user_id', authReq.pcpUserId)
+        .eq('session_id', sessionId)
+        .in('type', [
+          'message_in',
+          'message_out',
+          'message',
+          'agent_spawn',
+          'agent_complete',
+          'error',
+        ])
+        .order('created_at', { ascending: true })
+        .limit(500);
+
+      if (!actError && activities && activities.length > 0) {
+        const events = activities.map((a) => ({
+          type: a.type,
+          direction: a.direction,
+          content: a.content,
+          agentId: a.agent_id,
+          platform: a.platform,
+          timestamp: a.created_at,
+          payload: a.payload,
+        }));
+        res.json({
+          session: sessionInfo,
+          source: 'cloud',
+          backend,
+          transcript: { events },
+          totalEvents: events.length,
+        });
+        return;
+      }
+    }
+
+    res.json({
+      session: sessionInfo,
+      source: 'none',
+      backend,
+      transcript: null,
+      totalEvents: 0,
+    });
+  } catch (error) {
+    logger.error('Failed to load conversation:', error);
+    res.status(500).json(errorJson('Failed to load conversation', error));
   }
 });
 

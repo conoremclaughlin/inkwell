@@ -98,6 +98,14 @@ export function AgentPanel() {
               {agent.phase ? ` · ${agent.phase}` : ''}
             </span>
           </div>
+          {agent.activeThreadKey && (
+            <div
+              className="text-xs mt-1 px-1.5 py-0.5 rounded inline-block"
+              style={{ backgroundColor: skin.colors.bg, color: skin.colors.accent }}
+            >
+              {agent.activeThreadKey}
+            </div>
+          )}
         </div>
 
         {agent.role && (

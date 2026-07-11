@@ -1846,6 +1846,37 @@ function resolveLifecycleBackend(cwd: string, backendOverride?: string): HookCap
   return detectBackend(cwd);
 }
 
+/**
+ * Hydrate threadKey from the server when we have a pre-created session
+ * (e.g., INK_SESSION_ID from a trigger) but no local threadKey yet.
+ *
+ * Triggered sessions skip start_session (the runner pre-creates the session
+ * and passes its id via INK_SESSION_ID), so the thread key never gets
+ * populated locally — without this fetch, activeThreadKey would stay null
+ * for exactly the sessions the thread-key surfacing is meant to cover.
+ */
+export async function hydrateThreadKeyFromServer(
+  pcpSessionId: string | undefined,
+  pcpThreadKey: string | undefined,
+  email?: string
+): Promise<string | undefined> {
+  if (!pcpSessionId || pcpThreadKey) return pcpThreadKey;
+  try {
+    const sessionResult = await callPcpTool('get_session', {
+      email,
+      sessionId: pcpSessionId,
+    });
+    const session = sessionResult?.session as Record<string, unknown> | undefined;
+    if (session) {
+      if (typeof session.activeThreadKey === 'string') return session.activeThreadKey;
+      if (typeof session.threadKey === 'string') return session.threadKey;
+    }
+  } catch {
+    // Non-fatal
+  }
+  return pcpThreadKey;
+}
+
 async function onSessionStartHandler(options?: { backend?: string }): Promise<void> {
   const stdin = await readStdin();
   const cwd = process.cwd();
@@ -2055,6 +2086,8 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
   pcpThreadKey = reconciled.threadKey || pcpThreadKey;
   const backendSessionId = reconciled.backendSessionId;
 
+  pcpThreadKey = await hydrateThreadKeyFromServer(pcpSessionId, pcpThreadKey, config?.email);
+
   // Set lifecycle to idle on startup (ready for user input).
   if (pcpSessionId) {
     try {
@@ -2066,6 +2099,7 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
         workingDir: cwd,
       };
       if (backendSessionId) updateArgs.backendSessionId = backendSessionId;
+      if (pcpThreadKey) updateArgs.activeThreadKey = pcpThreadKey;
       await callPcpTool('update_session_state', updateArgs);
     } catch {
       // Non-fatal; startup should continue even if linkage fails.
@@ -2447,7 +2481,8 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
         '(started/stopped a server, opened a PR, kicked off a build, changed ports, etc.), ' +
         'update your session context via `update_session_state(context: "...")` so it survives ' +
         "compaction. Context is your scratch board for transient active state — what's running, " +
-        "what's pending, what port you're on.\n" +
+        "what's pending, what port you're on. If you're working on a specific artifact " +
+        '(PR, spec, thread), set `activeThreadKey` too (e.g., "pr:350", "spec:auth-refactor").\n' +
         '</ink-reminder>\n'
     );
     writeRuntimeFile(cwd, 'last-context-reminder', new Date().toISOString());

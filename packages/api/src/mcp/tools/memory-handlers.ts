@@ -134,6 +134,7 @@ export function mapSessionForBootstrap(
     agentId?: string;
     studioId?: string;
     threadKey?: string;
+    activeThreadKey?: string;
     lifecycle?: string;
     currentPhase?: string;
     context?: string;
@@ -146,6 +147,7 @@ export function mapSessionForBootstrap(
     agentId: s.agentId,
     studioId: s.studioId || null,
     threadKey: s.threadKey || null,
+    activeThreadKey: s.activeThreadKey || null,
     lifecycle: s.lifecycle || null,
     currentPhase: s.currentPhase || null,
     ...(callerSessionId && s.id === callerSessionId && s.context ? { context: s.context } : {}),
@@ -1331,6 +1333,8 @@ export async function handleGetSession(args: unknown, dataComposer: DataComposer
               studioId: session.studioId,
               lifecycle: session.lifecycle || null,
               currentPhase: session.currentPhase || null,
+              threadKey: session.threadKey || null,
+              activeThreadKey: session.activeThreadKey || null,
               startedAt: session.startedAt.toISOString(),
               endedAt: session.endedAt?.toISOString(),
               summary: session.summary,
@@ -1402,6 +1406,8 @@ export async function handleListSessions(args: unknown, dataComposer: DataCompos
                 : null,
               lifecycle: s.lifecycle || null,
               currentPhase: s.currentPhase || null,
+              threadKey: s.threadKey || null,
+              activeThreadKey: s.activeThreadKey || null,
               status: s.status || null,
               backend: s.backend || null,
               provider: (s.metadata?.provider as string) || null,

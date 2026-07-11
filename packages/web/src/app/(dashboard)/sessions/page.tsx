@@ -303,11 +303,17 @@ function SessionCard({ session }: { session: Session }) {
           <div className="rounded-md bg-muted/50 p-3 text-xs space-y-3">
             <div>
               <Link
-                href={`/sessions/${session.id}`}
+                href={`/sessions/viewer?id=${session.id}`}
                 className="inline-flex items-center gap-1.5 rounded border border-border bg-card px-2 py-1 text-xs font-medium text-foreground/90 hover:bg-muted"
               >
                 <MessageSquare className="h-3.5 w-3.5" />
-                View full log
+                View conversation
+              </Link>
+              <Link
+                href={`/sessions/${session.id}`}
+                className="inline-flex items-center gap-1.5 rounded border border-border bg-card px-2 py-1 text-xs font-medium text-muted-foreground hover:bg-muted"
+              >
+                View raw log
               </Link>
             </div>
             {/* Session IDs */}
