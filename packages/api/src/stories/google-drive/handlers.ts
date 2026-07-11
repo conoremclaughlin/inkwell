@@ -3,6 +3,9 @@
  */
 
 import { z } from 'zod';
+import { mkdir, writeFile } from 'fs/promises';
+import { homedir } from 'os';
+import { join } from 'path';
 import { getGoogleDriveService } from './service';
 import { resolveUserOrThrow } from '../../services/user-resolver';
 import { logger } from '../../utils/logger';
@@ -29,6 +32,7 @@ type ToolResult = {
 export const ALLOWED_DRIVE_OPERATIONS: Set<DriveOperation> = new Set([
   'list_files',
   'get_file',
+  'download_file',
   'create_folder',
   'move_file',
 ]);
@@ -88,6 +92,29 @@ export const createDriveFolderSchema = userIdentifierBaseSchema.extend({
 export const moveDriveFileSchema = userIdentifierBaseSchema.extend({
   fileId: z.string().min(1).describe('Drive file ID to move'),
   newParentFolderId: z.string().min(1).describe('Destination folder ID'),
+});
+
+export const downloadDriveFileSchema = userIdentifierBaseSchema.extend({
+  fileId: z.string().min(1).describe('Drive file ID to download'),
+  exportMimeType: z
+    .string()
+    .optional()
+    .describe(
+      'Export format for Google-native files. Google Docs support text/plain (default), text/html, text/markdown, application/pdf, application/epub+zip, .docx. Ignored for binary files.'
+    ),
+  targetFilename: z
+    .string()
+    .optional()
+    .describe(
+      'Filename to save as (extension appended automatically if missing). Defaults to the Drive file name.'
+    ),
+  returnContent: z
+    .boolean()
+    .optional()
+    .default(false)
+    .describe(
+      'Include the full text content in the response (textual exports under 200KB only). Default: save to disk and return a path + preview.'
+    ),
 });
 
 // ============================================================================
@@ -301,6 +328,109 @@ export async function handleMoveDriveFile(
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown error';
     logger.error('Failed to move Drive file', {
+      userId: user.id,
+      fileId: params.fileId,
+      error: message,
+    });
+    return errorResult(message);
+  }
+}
+
+const INLINE_CONTENT_MAX_BYTES = 200 * 1024;
+const PREVIEW_CHARS = 500;
+
+function driveDownloadDir(): string {
+  return join(homedir(), '.ink', 'files', 'drive');
+}
+
+function sanitizeFilename(name: string): string {
+  return (
+    name
+      .replace(/[/\\:*?"<>|]/g, '_')
+      .trim()
+      .slice(0, 180) || 'file'
+  );
+}
+
+function isTextualMime(mimeType: string): boolean {
+  return (
+    mimeType.startsWith('text/') ||
+    mimeType === 'application/json' ||
+    mimeType === 'application/xml'
+  );
+}
+
+export async function handleDownloadDriveFile(
+  args: unknown,
+  dataComposer: DataComposer
+): Promise<ToolResult> {
+  const params = downloadDriveFileSchema.parse(args);
+  const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
+
+  const permission = isDriveOperationAllowed('download_file');
+  if (!permission.allowed) {
+    return operationBlockedResult('download_file', permission.reason!);
+  }
+
+  try {
+    const result = await getGoogleDriveService().downloadFile(user.id, {
+      fileId: params.fileId,
+      exportMimeType: params.exportMimeType,
+    });
+
+    const baseName = sanitizeFilename(params.targetFilename || result.file.name);
+    const filename = baseName.toLowerCase().endsWith(result.extension.toLowerCase())
+      ? baseName
+      : `${baseName}${result.extension}`;
+    const dir = driveDownloadDir();
+    await mkdir(dir, { recursive: true });
+    const savedPath = join(dir, filename);
+    await writeFile(savedPath, result.content);
+
+    const textual = isTextualMime(result.effectiveMimeType);
+    const text = textual ? result.content.toString('utf-8') : undefined;
+    const includeFullText =
+      params.returnContent &&
+      text !== undefined &&
+      result.content.length <= INLINE_CONTENT_MAX_BYTES;
+
+    logger.info('Downloaded Drive file', {
+      userId: user.id,
+      fileId: params.fileId,
+      savedPath,
+      bytes: result.content.length,
+      exported: result.exported,
+      effectiveMimeType: result.effectiveMimeType,
+    });
+
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: JSON.stringify(
+            {
+              success: true,
+              user: { id: user.id, resolvedBy },
+              file: result.file,
+              savedPath,
+              bytes: result.content.length,
+              mimeType: result.effectiveMimeType,
+              exported: result.exported,
+              ...(text !== undefined
+                ? includeFullText
+                  ? { content: text }
+                  : { preview: text.slice(0, PREVIEW_CHARS) }
+                : {}),
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Unknown error';
+    logger.error('Failed to download Drive file', {
       userId: user.id,
       fileId: params.fileId,
       error: message,

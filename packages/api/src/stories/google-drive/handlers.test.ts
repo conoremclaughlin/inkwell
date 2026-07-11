@@ -10,10 +10,12 @@ import {
   listDriveFilesSchema,
   createDriveFolderSchema,
   moveDriveFileSchema,
+  downloadDriveFileSchema,
   handleListDriveFiles,
   handleGetDriveFile,
   handleCreateDriveFolder,
   handleMoveDriveFile,
+  handleDownloadDriveFile,
 } from './handlers';
 
 vi.mock('./service', () => ({
@@ -28,6 +30,13 @@ vi.mock('../../utils/logger', () => ({
   logger: { info: vi.fn(), error: vi.fn(), warn: vi.fn(), debug: vi.fn() },
 }));
 
+const writeFileMock = vi.fn().mockResolvedValue(undefined);
+const mkdirMock = vi.fn().mockResolvedValue(undefined);
+vi.mock('fs/promises', () => ({
+  writeFile: (...args: unknown[]) => writeFileMock(...args),
+  mkdir: (...args: unknown[]) => mkdirMock(...args),
+}));
+
 import { getGoogleDriveService } from './service';
 import { resolveUserOrThrow } from '../../services/user-resolver';
 
@@ -36,16 +45,17 @@ const mockUser = { id: testUserId, email: 'test@example.com' };
 const mockDataComposer = {} as any;
 
 describe('Drive allowlist', () => {
-  it('allows list/get/create_folder/move; blocks trash/delete', () => {
+  it('allows list/get/download/create_folder/move; blocks trash/delete', () => {
     expect(isDriveOperationAllowed('list_files').allowed).toBe(true);
     expect(isDriveOperationAllowed('get_file').allowed).toBe(true);
+    expect(isDriveOperationAllowed('download_file').allowed).toBe(true);
     expect(isDriveOperationAllowed('create_folder').allowed).toBe(true);
     expect(isDriveOperationAllowed('move_file').allowed).toBe(true);
 
     expect(isDriveOperationAllowed('trash_file').allowed).toBe(false);
     expect(isDriveOperationAllowed('delete_file').allowed).toBe(false);
 
-    expect(ALLOWED_DRIVE_OPERATIONS.has('move_file')).toBe(true);
+    expect(ALLOWED_DRIVE_OPERATIONS.has('download_file')).toBe(true);
     expect(BLOCKED_DRIVE_OPERATIONS.has('delete_file')).toBe(true);
   });
 });
@@ -168,6 +178,114 @@ describe('handleGetDriveFile', () => {
     expect(result.isError).toBe(true);
     const body = JSON.parse(result.content[0].text);
     expect(body.hint).toContain('File not found');
+  });
+});
+
+describe('downloadDriveFileSchema', () => {
+  it('requires fileId and defaults returnContent to false', () => {
+    const r = downloadDriveFileSchema.safeParse({ userId: testUserId, fileId: 'f1' });
+    expect(r.success).toBe(true);
+    if (r.success) expect(r.data.returnContent).toBe(false);
+  });
+
+  it('rejects missing fileId', () => {
+    const r = downloadDriveFileSchema.safeParse({ userId: testUserId });
+    expect(r.success).toBe(false);
+  });
+});
+
+describe('handleDownloadDriveFile', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(resolveUserOrThrow).mockResolvedValue({ user: mockUser, resolvedBy: 'userId' });
+  });
+
+  it('saves an exported Google Doc and returns a preview, not full content, by default', async () => {
+    const body = 'Chapter 679\n' + 'x'.repeat(1000);
+    vi.mocked(getGoogleDriveService).mockReturnValue({
+      downloadFile: vi.fn().mockResolvedValue({
+        file: { id: 'd1', name: 'Chapter 679', mimeType: 'application/vnd.google-apps.document' },
+        content: Buffer.from(body, 'utf-8'),
+        effectiveMimeType: 'text/plain',
+        extension: '.txt',
+        exported: true,
+      }),
+    } as any);
+
+    const result = await handleDownloadDriveFile(
+      { userId: testUserId, fileId: 'd1' },
+      mockDataComposer
+    );
+
+    expect(result.isError).toBeUndefined();
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(true);
+    expect(parsed.exported).toBe(true);
+    expect(parsed.savedPath).toContain('.ink/files/drive/Chapter 679.txt');
+    expect(parsed.preview).toContain('Chapter 679');
+    expect(parsed.content).toBeUndefined();
+    expect(parsed.preview.length).toBeLessThanOrEqual(500);
+    expect(writeFileMock).toHaveBeenCalledOnce();
+    expect(mkdirMock).toHaveBeenCalledOnce();
+  });
+
+  it('returns full text when returnContent is true and under the size cap', async () => {
+    vi.mocked(getGoogleDriveService).mockReturnValue({
+      downloadFile: vi.fn().mockResolvedValue({
+        file: { id: 'd2', name: 'Notes', mimeType: 'application/vnd.google-apps.document' },
+        content: Buffer.from('short body', 'utf-8'),
+        effectiveMimeType: 'text/plain',
+        extension: '.txt',
+        exported: true,
+      }),
+    } as any);
+
+    const result = await handleDownloadDriveFile(
+      { userId: testUserId, fileId: 'd2', returnContent: true },
+      mockDataComposer
+    );
+
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.content).toBe('short body');
+    expect(parsed.preview).toBeUndefined();
+  });
+
+  it('appends the export extension when the target filename lacks it', async () => {
+    vi.mocked(getGoogleDriveService).mockReturnValue({
+      downloadFile: vi.fn().mockResolvedValue({
+        file: { id: 'd3', name: 'Chapter 680', mimeType: 'application/vnd.google-apps.document' },
+        content: Buffer.from('body', 'utf-8'),
+        effectiveMimeType: 'text/plain',
+        extension: '.txt',
+        exported: true,
+      }),
+    } as any);
+
+    const result = await handleDownloadDriveFile(
+      { userId: testUserId, fileId: 'd3', targetFilename: 'chapter-680' },
+      mockDataComposer
+    );
+
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.savedPath.endsWith('chapter-680.txt')).toBe(true);
+  });
+
+  it('surfaces a hint when export format is unknown', async () => {
+    vi.mocked(getGoogleDriveService).mockReturnValue({
+      downloadFile: vi
+        .fn()
+        .mockRejectedValue(new Error('No export format known for application/vnd.google-apps.map')),
+    } as any);
+
+    const result = await handleDownloadDriveFile(
+      { userId: testUserId, fileId: 'd4' },
+      mockDataComposer
+    );
+
+    expect(result.isError).toBe(true);
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toContain('No export format');
   });
 });
 

@@ -11,6 +11,8 @@ import { logger } from '../../utils/logger';
 import {
   FOLDER_MIME_TYPE,
   type CreateFolderOptions,
+  type DownloadedFile,
+  type DownloadFileOptions,
   type DriveFile,
   type GetFileOptions,
   type ListFilesOptions,
@@ -21,6 +23,28 @@ import {
 const FILE_FIELDS =
   'id,name,mimeType,size,createdTime,modifiedTime,webViewLink,parents,owners,trashed';
 const LIST_FIELDS = `nextPageToken,files(${FILE_FIELDS})`;
+
+/** Max bytes for binary downloads (files.get alt=media). */
+const MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024;
+
+/** Default export formats for Google-native files (files.export caps at ~10MB). */
+const GOOGLE_EXPORT_DEFAULTS: Record<string, { mimeType: string; extension: string }> = {
+  'application/vnd.google-apps.document': { mimeType: 'text/plain', extension: '.txt' },
+  'application/vnd.google-apps.spreadsheet': { mimeType: 'text/csv', extension: '.csv' },
+  'application/vnd.google-apps.presentation': { mimeType: 'text/plain', extension: '.txt' },
+};
+
+const EXPORT_MIME_EXTENSIONS: Record<string, string> = {
+  'text/plain': '.txt',
+  'text/csv': '.csv',
+  'text/html': '.html',
+  'application/pdf': '.pdf',
+  'application/rtf': '.rtf',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': '.xlsx',
+  'application/epub+zip': '.epub',
+  'text/markdown': '.md',
+};
 
 export class GoogleDriveService {
   private oauthService = getOAuthService();
@@ -125,6 +149,78 @@ export class GoogleDriveService {
     });
 
     return this.mapFile(response.data);
+  }
+
+  /**
+   * Download a file's content. Google-native files (Docs/Sheets/Slides) go
+   * through files.export with a chosen MIME type (Docs support text/plain,
+   * text/html, application/pdf, application/epub+zip, .docx, and more);
+   * everything else downloads verbatim via files.get alt=media.
+   */
+  async downloadFile(userId: string, options: DownloadFileOptions): Promise<DownloadedFile> {
+    const drive = await this.getClient(userId);
+    const file = await this.getFile(userId, { fileId: options.fileId });
+
+    if (file.isFolder) {
+      throw new Error(`"${file.name}" is a folder — download individual files instead`);
+    }
+
+    if (file.isGoogleNative) {
+      const defaults = GOOGLE_EXPORT_DEFAULTS[file.mimeType];
+      const exportMimeType = options.exportMimeType || defaults?.mimeType;
+      if (!exportMimeType) {
+        throw new Error(
+          `No export format known for ${file.mimeType} — pass exportMimeType explicitly`
+        );
+      }
+
+      logger.info('Exporting Google-native Drive file', {
+        userId,
+        fileId: options.fileId,
+        sourceMimeType: file.mimeType,
+        exportMimeType,
+      });
+
+      const response = await drive.files.export(
+        { fileId: options.fileId, mimeType: exportMimeType },
+        { responseType: 'arraybuffer' }
+      );
+
+      return {
+        file,
+        content: Buffer.from(response.data as ArrayBuffer),
+        effectiveMimeType: exportMimeType,
+        extension: EXPORT_MIME_EXTENSIONS[exportMimeType] || defaults?.extension || '.bin',
+        exported: true,
+      };
+    }
+
+    if (file.size !== undefined && file.size > MAX_DOWNLOAD_BYTES) {
+      throw new Error(
+        `File is ${Math.round(file.size / 1024 / 1024)}MB — exceeds the ${MAX_DOWNLOAD_BYTES / 1024 / 1024}MB download limit`
+      );
+    }
+
+    logger.info('Downloading binary Drive file', {
+      userId,
+      fileId: options.fileId,
+      mimeType: file.mimeType,
+      size: file.size,
+    });
+
+    const response = await drive.files.get(
+      { fileId: options.fileId, alt: 'media' },
+      { responseType: 'arraybuffer' }
+    );
+
+    const dotIndex = file.name.lastIndexOf('.');
+    return {
+      file,
+      content: Buffer.from(response.data as ArrayBuffer),
+      effectiveMimeType: file.mimeType,
+      extension: dotIndex > 0 ? file.name.slice(dotIndex) : '',
+      exported: false,
+    };
   }
 
   private mapFile(file: drive_v3.Schema$File): DriveFile {

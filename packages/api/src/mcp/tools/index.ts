@@ -256,10 +256,12 @@ import {
 import {
   handleListDriveFiles,
   handleGetDriveFile,
+  handleDownloadDriveFile,
   handleCreateDriveFolder,
   handleMoveDriveFile,
   listDriveFilesSchema,
   getDriveFileSchema,
+  downloadDriveFileSchema,
   createDriveFolderSchema,
   moveDriveFileSchema,
 } from '../../stories/google-drive/handlers';
@@ -5284,6 +5286,43 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         return await handleGetDriveFile(args, dataComposer);
       } catch (error) {
         logger.error('Error in get_drive_file:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'download_drive_file',
+    {
+      description: `Download a Google Drive file's content and save it under ~/.ink/files/drive/.
+
+Google-native files (Docs, Sheets, Slides) are exported to a text-friendly format: Docs default to text/plain (also support text/html, text/markdown, application/pdf, application/epub+zip, .docx via exportMimeType), Sheets to CSV. Binary files download as-is (up to 50MB).
+
+Returns the saved path, byte count, and — for textual content — a preview (or the full text when returnContent is true and the file is under 200KB). Use the saved path with local file tools (e.g. Read, or pandoc for format conversion).
+
+Ideal for bulk workflows: list a folder, then download each file by ID.
+
+User must have connected their Google account with Drive permissions.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: downloadDriveFileSchema,
+    },
+    async (args) => {
+      try {
+        return await handleDownloadDriveFile(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in download_drive_file:', error);
         return {
           content: [
             {
