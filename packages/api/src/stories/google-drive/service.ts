@@ -27,23 +27,38 @@ const LIST_FIELDS = `nextPageToken,files(${FILE_FIELDS})`;
 /** Max bytes for binary downloads (files.get alt=media). */
 const MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024;
 
-/** Default export formats for Google-native files (files.export caps at ~10MB). */
+/**
+ * Google-native files (Docs/Sheets/Slides) have no raw bytes — files.export
+ * must pick a format. We default to the editable Office equivalent, the
+ * highest-fidelity "as-is" representation. Convert further downstream with
+ * local tools (pandoc, etc.) if a different format is needed.
+ */
 const GOOGLE_EXPORT_DEFAULTS: Record<string, { mimeType: string; extension: string }> = {
-  'application/vnd.google-apps.document': { mimeType: 'text/plain', extension: '.txt' },
-  'application/vnd.google-apps.spreadsheet': { mimeType: 'text/csv', extension: '.csv' },
-  'application/vnd.google-apps.presentation': { mimeType: 'text/plain', extension: '.txt' },
+  'application/vnd.google-apps.document': {
+    mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    extension: '.docx',
+  },
+  'application/vnd.google-apps.spreadsheet': {
+    mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    extension: '.xlsx',
+  },
+  'application/vnd.google-apps.presentation': {
+    mimeType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    extension: '.pptx',
+  },
 };
 
+/** Extensions for known export MIME types (used when a caller overrides the default). */
 const EXPORT_MIME_EXTENSIONS: Record<string, string> = {
   'text/plain': '.txt',
   'text/csv': '.csv',
   'text/html': '.html',
+  'text/markdown': '.md',
   'application/pdf': '.pdf',
   'application/rtf': '.rtf',
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
   'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': '.xlsx',
-  'application/epub+zip': '.epub',
-  'text/markdown': '.md',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation': '.pptx',
 };
 
 export class GoogleDriveService {
@@ -152,10 +167,11 @@ export class GoogleDriveService {
   }
 
   /**
-   * Download a file's content. Google-native files (Docs/Sheets/Slides) go
-   * through files.export with a chosen MIME type (Docs support text/plain,
-   * text/html, application/pdf, application/epub+zip, .docx, and more);
-   * everything else downloads verbatim via files.get alt=media.
+   * Download a file's content as-is. Binary files download verbatim via
+   * files.get alt=media. Google-native files (Docs/Sheets/Slides) have no
+   * raw form, so they export to their editable Office equivalent
+   * (.docx/.xlsx/.pptx) by default; pass exportMimeType only when a caller
+   * explicitly needs a different format.
    */
   async downloadFile(userId: string, options: DownloadFileOptions): Promise<DownloadedFile> {
     const drive = await this.getClient(userId);

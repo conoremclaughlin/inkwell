@@ -182,10 +182,9 @@ describe('handleGetDriveFile', () => {
 });
 
 describe('downloadDriveFileSchema', () => {
-  it('requires fileId and defaults returnContent to false', () => {
+  it('accepts fileId with optional overrides', () => {
     const r = downloadDriveFileSchema.safeParse({ userId: testUserId, fileId: 'f1' });
     expect(r.success).toBe(true);
-    if (r.success) expect(r.data.returnContent).toBe(false);
   });
 
   it('rejects missing fileId', () => {
@@ -200,14 +199,14 @@ describe('handleDownloadDriveFile', () => {
     vi.mocked(resolveUserOrThrow).mockResolvedValue({ user: mockUser, resolvedBy: 'userId' });
   });
 
-  it('saves an exported Google Doc and returns a preview, not full content, by default', async () => {
-    const body = 'Chapter 679\n' + 'x'.repeat(1000);
+  it('saves an exported Google Doc to disk and returns the path + metadata', async () => {
     vi.mocked(getGoogleDriveService).mockReturnValue({
       downloadFile: vi.fn().mockResolvedValue({
         file: { id: 'd1', name: 'Chapter 679', mimeType: 'application/vnd.google-apps.document' },
-        content: Buffer.from(body, 'utf-8'),
-        effectiveMimeType: 'text/plain',
-        extension: '.txt',
+        content: Buffer.from('body bytes'),
+        effectiveMimeType:
+          'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        extension: '.docx',
         exported: true,
       }),
     } as any);
@@ -221,42 +220,44 @@ describe('handleDownloadDriveFile', () => {
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed.success).toBe(true);
     expect(parsed.exported).toBe(true);
-    expect(parsed.savedPath).toContain('.ink/files/drive/Chapter 679.txt');
-    expect(parsed.preview).toContain('Chapter 679');
+    expect(parsed.savedPath).toContain('.ink/files/drive/Chapter 679.docx');
+    expect(parsed.mimeType).toContain('wordprocessingml');
+    // No inline content — the tool returns a path, not the file body.
     expect(parsed.content).toBeUndefined();
-    expect(parsed.preview.length).toBeLessThanOrEqual(500);
+    expect(parsed.preview).toBeUndefined();
     expect(writeFileMock).toHaveBeenCalledOnce();
     expect(mkdirMock).toHaveBeenCalledOnce();
   });
 
-  it('returns full text when returnContent is true and under the size cap', async () => {
+  it('downloads a binary file as-is', async () => {
     vi.mocked(getGoogleDriveService).mockReturnValue({
       downloadFile: vi.fn().mockResolvedValue({
-        file: { id: 'd2', name: 'Notes', mimeType: 'application/vnd.google-apps.document' },
-        content: Buffer.from('short body', 'utf-8'),
-        effectiveMimeType: 'text/plain',
-        extension: '.txt',
-        exported: true,
+        file: { id: 'b1', name: 'cover.png', mimeType: 'image/png' },
+        content: Buffer.from([0x89, 0x50, 0x4e, 0x47]),
+        effectiveMimeType: 'image/png',
+        extension: '.png',
+        exported: false,
       }),
     } as any);
 
     const result = await handleDownloadDriveFile(
-      { userId: testUserId, fileId: 'd2', returnContent: true },
+      { userId: testUserId, fileId: 'b1' },
       mockDataComposer
     );
 
     const parsed = JSON.parse(result.content[0].text);
-    expect(parsed.content).toBe('short body');
-    expect(parsed.preview).toBeUndefined();
+    expect(parsed.exported).toBe(false);
+    expect(parsed.savedPath.endsWith('cover.png')).toBe(true);
   });
 
   it('appends the export extension when the target filename lacks it', async () => {
     vi.mocked(getGoogleDriveService).mockReturnValue({
       downloadFile: vi.fn().mockResolvedValue({
         file: { id: 'd3', name: 'Chapter 680', mimeType: 'application/vnd.google-apps.document' },
-        content: Buffer.from('body', 'utf-8'),
-        effectiveMimeType: 'text/plain',
-        extension: '.txt',
+        content: Buffer.from('body'),
+        effectiveMimeType:
+          'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        extension: '.docx',
         exported: true,
       }),
     } as any);
@@ -267,7 +268,7 @@ describe('handleDownloadDriveFile', () => {
     );
 
     const parsed = JSON.parse(result.content[0].text);
-    expect(parsed.savedPath.endsWith('chapter-680.txt')).toBe(true);
+    expect(parsed.savedPath.endsWith('chapter-680.docx')).toBe(true);
   });
 
   it('surfaces a hint when export format is unknown', async () => {

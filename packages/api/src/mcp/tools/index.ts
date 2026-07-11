@@ -5305,11 +5305,11 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   server.registerTool(
     'download_drive_file',
     {
-      description: `Download a Google Drive file's content and save it under ~/.ink/files/drive/.
+      description: `Download a Google Drive file as-is and save it under ~/.ink/files/drive/.
 
-Google-native files (Docs, Sheets, Slides) are exported to a text-friendly format: Docs default to text/plain (also support text/html, text/markdown, application/pdf, application/epub+zip, .docx via exportMimeType), Sheets to CSV. Binary files download as-is (up to 50MB).
+Binary files (PDFs, images, zips, etc.) download verbatim (up to 50MB). Google-native files (Docs/Sheets/Slides) have no raw form, so they export to their editable Office equivalent by default — Docs→.docx, Sheets→.xlsx, Slides→.pptx. Pass exportMimeType only when you explicitly need a different format.
 
-Returns the saved path, byte count, and — for textual content — a preview (or the full text when returnContent is true and the file is under 200KB). Use the saved path with local file tools (e.g. Read, or pandoc for format conversion).
+Returns the saved path plus metadata. Read or transform the file afterward with local tools (e.g. Read, or pandoc for format conversion) — this tool only fetches; it does not transform.
 
 Ideal for bulk workflows: list a folder, then download each file by ID.
 

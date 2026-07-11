@@ -100,20 +100,13 @@ export const downloadDriveFileSchema = userIdentifierBaseSchema.extend({
     .string()
     .optional()
     .describe(
-      'Export format for Google-native files. Google Docs support text/plain (default), text/html, text/markdown, application/pdf, application/epub+zip, .docx. Ignored for binary files.'
+      'Override the export format for Google-native files (Docs/Sheets/Slides), which have no raw form. Defaults to the editable Office format (.docx/.xlsx/.pptx). Ignored for binary files, which always download as-is.'
     ),
   targetFilename: z
     .string()
     .optional()
     .describe(
       'Filename to save as (extension appended automatically if missing). Defaults to the Drive file name.'
-    ),
-  returnContent: z
-    .boolean()
-    .optional()
-    .default(false)
-    .describe(
-      'Include the full text content in the response (textual exports under 200KB only). Default: save to disk and return a path + preview.'
     ),
 });
 
@@ -336,9 +329,6 @@ export async function handleMoveDriveFile(
   }
 }
 
-const INLINE_CONTENT_MAX_BYTES = 200 * 1024;
-const PREVIEW_CHARS = 500;
-
 function driveDownloadDir(): string {
   return join(homedir(), '.ink', 'files', 'drive');
 }
@@ -349,14 +339,6 @@ function sanitizeFilename(name: string): string {
       .replace(/[/\\:*?"<>|]/g, '_')
       .trim()
       .slice(0, 180) || 'file'
-  );
-}
-
-function isTextualMime(mimeType: string): boolean {
-  return (
-    mimeType.startsWith('text/') ||
-    mimeType === 'application/json' ||
-    mimeType === 'application/xml'
   );
 }
 
@@ -387,13 +369,6 @@ export async function handleDownloadDriveFile(
     const savedPath = join(dir, filename);
     await writeFile(savedPath, result.content);
 
-    const textual = isTextualMime(result.effectiveMimeType);
-    const text = textual ? result.content.toString('utf-8') : undefined;
-    const includeFullText =
-      params.returnContent &&
-      text !== undefined &&
-      result.content.length <= INLINE_CONTENT_MAX_BYTES;
-
     logger.info('Downloaded Drive file', {
       userId: user.id,
       fileId: params.fileId,
@@ -416,11 +391,6 @@ export async function handleDownloadDriveFile(
               bytes: result.content.length,
               mimeType: result.effectiveMimeType,
               exported: result.exported,
-              ...(text !== undefined
-                ? includeFullText
-                  ? { content: text }
-                  : { preview: text.slice(0, PREVIEW_CHARS) }
-                : {}),
             },
             null,
             2
