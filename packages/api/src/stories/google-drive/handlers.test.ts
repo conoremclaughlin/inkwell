@@ -203,10 +203,9 @@ describe('handleDownloadDriveFile', () => {
     vi.mocked(getGoogleDriveService).mockReturnValue({
       downloadFile: vi.fn().mockResolvedValue({
         file: { id: 'd1', name: 'Chapter 679', mimeType: 'application/vnd.google-apps.document' },
-        content: Buffer.from('body bytes'),
-        effectiveMimeType:
-          'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-        extension: '.docx',
+        content: Buffer.from('Chapter 679 body'),
+        effectiveMimeType: 'text/plain',
+        extension: '.txt',
         exported: true,
       }),
     } as any);
@@ -220,8 +219,8 @@ describe('handleDownloadDriveFile', () => {
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed.success).toBe(true);
     expect(parsed.exported).toBe(true);
-    expect(parsed.savedPath).toContain('.ink/files/drive/Chapter 679.docx');
-    expect(parsed.mimeType).toContain('wordprocessingml');
+    expect(parsed.savedPath).toContain('.ink/files/drive/Chapter 679.txt');
+    expect(parsed.mimeType).toBe('text/plain');
     // No inline content — the tool returns a path, not the file body.
     expect(parsed.content).toBeUndefined();
     expect(parsed.preview).toBeUndefined();
@@ -255,9 +254,8 @@ describe('handleDownloadDriveFile', () => {
       downloadFile: vi.fn().mockResolvedValue({
         file: { id: 'd3', name: 'Chapter 680', mimeType: 'application/vnd.google-apps.document' },
         content: Buffer.from('body'),
-        effectiveMimeType:
-          'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-        extension: '.docx',
+        effectiveMimeType: 'text/plain',
+        extension: '.txt',
         exported: true,
       }),
     } as any);
@@ -268,7 +266,7 @@ describe('handleDownloadDriveFile', () => {
     );
 
     const parsed = JSON.parse(result.content[0].text);
-    expect(parsed.savedPath.endsWith('chapter-680.docx')).toBe(true);
+    expect(parsed.savedPath.endsWith('chapter-680.txt')).toBe(true);
   });
 
   it('surfaces a hint when export format is unknown', async () => {

@@ -100,7 +100,7 @@ export const downloadDriveFileSchema = userIdentifierBaseSchema.extend({
     .string()
     .optional()
     .describe(
-      'Override the export format for Google-native files (Docs/Sheets/Slides), which have no raw form. Defaults to the editable Office format (.docx/.xlsx/.pptx). Ignored for binary files, which always download as-is.'
+      'Override the export format for Google-native files (Docs/Sheets/Slides), which have no raw form. Defaults to plain text (Docs→text/plain, Sheets→text/csv). Supported: text/plain, text/html, text/markdown, application/pdf, application/epub+zip, application/rtf, .docx/.xlsx/.pptx. Ignored for binary files, which always download as-is.'
     ),
   targetFilename: z
     .string()
