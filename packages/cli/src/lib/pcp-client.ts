@@ -41,6 +41,15 @@ let jsonRpcId = 1;
 const MCP_FETCH_TIMEOUT_MS = parseInt(process.env.INK_MCP_TIMEOUT_MS || '', 10) || 30_000;
 
 /**
+ * Tool-call tier — some MCP tools legitimately run for minutes (e.g.
+ * setup_audio_transcription downloads ~600MB). Tool execution uses this
+ * generous ceiling; auth and metadata calls use MCP_FETCH_TIMEOUT_MS above.
+ * Override with INK_MCP_TOOL_TIMEOUT_MS.
+ */
+const MCP_TOOL_TIMEOUT_MS =
+  parseInt(process.env.INK_MCP_TOOL_TIMEOUT_MS || '', 10) || 5 * 60 * 1000;
+
+/**
  * `fetch` with an abort-based deadline. Translates the abort into a clear,
  * actionable error so callers surface "timed out" rather than a raw
  * DOMException. Never overrides a caller-supplied signal.
@@ -312,22 +321,26 @@ export class PcpClient {
     if (!token) return null;
 
     const call = async (accessToken: string): Promise<Response> =>
-      fetchWithTimeout(`${this.baseUrl}/mcp`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          // Streamable HTTP MCP servers may require clients to accept both
-          // JSON responses and SSE frames.
-          Accept: 'application/json, text/event-stream',
-          Authorization: `Bearer ${accessToken}`,
+      fetchWithTimeout(
+        `${this.baseUrl}/mcp`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            // Streamable HTTP MCP servers may require clients to accept both
+            // JSON responses and SSE frames.
+            Accept: 'application/json, text/event-stream',
+            Authorization: `Bearer ${accessToken}`,
+          },
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            method: 'tools/call',
+            params: { name: tool, arguments: args },
+            id: jsonRpcId++,
+          }),
         },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          method: 'tools/call',
-          params: { name: tool, arguments: args },
-          id: jsonRpcId++,
-        }),
-      });
+        MCP_TOOL_TIMEOUT_MS
+      );
 
     let response = await call(token);
 
@@ -370,14 +383,18 @@ export class PcpClient {
     tool: string,
     args: Record<string, unknown>
   ): Promise<PcpToolCallResult> {
-    const response = await fetchWithTimeout(`${this.baseUrl}/api/mcp/call`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
+    const response = await fetchWithTimeout(
+      `${this.baseUrl}/api/mcp/call`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify({ tool, args }),
       },
-      body: JSON.stringify({ tool, args }),
-    });
+      MCP_TOOL_TIMEOUT_MS
+    );
 
     if (!response.ok) {
       const text = await response.text();
