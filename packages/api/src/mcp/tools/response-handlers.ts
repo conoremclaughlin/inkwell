@@ -56,16 +56,14 @@ export function hasExplicitResponse(channel: string, conversationId: string): bo
 
 /**
  * Clear explicit response tracking for a conversation (call after the
- * auto-forward decision in server.ts). Also sweeps entries older than 30
- * minutes as a leak backstop for conversations that never reach this path.
+ * auto-forward decision in server.ts). No time-based sweep — the map is
+ * naturally bounded (one entry per active conversation) and each turn
+ * clears its own key. Stale entries from error paths are overwritten on
+ * the next message to the same conversation.
  */
 export function clearExplicitResponse(channel: string, conversationId: string): void {
   const key = `${channel}:${conversationId}`;
   explicitResponseTracker.delete(key);
-  const cutoff = Date.now() - 30 * 60 * 1000;
-  for (const [k, v] of explicitResponseTracker.entries()) {
-    if (v < cutoff) explicitResponseTracker.delete(k);
-  }
 }
 
 /**
