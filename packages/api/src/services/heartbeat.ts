@@ -174,11 +174,24 @@ export async function processHeartbeat(
         continue;
       }
 
-      // Advance next_run_at BEFORE delivery (at-most-once). This prevents the
-      // same reminder from being picked up by the next tick if delivery takes
-      // longer than the heartbeat interval. Missing one beat is far better than
-      // queuing 67 duplicate deliveries.
-      await updateReminderAfterDelivery(reminder);
+      // Atomically claim the reminder BEFORE delivery. The claim advances
+      // next_run_at (or completes the reminder) only if the row still holds the
+      // next_run_at we fetched — a compare-and-swap. This gives at-most-once
+      // delivery two ways: (1) within one process, it stops the next tick from
+      // re-picking a still-running reminder; (2) across processes, it stops
+      // OVERLAPPING server incarnations (e.g. a tsx-watch reload that hasn't
+      // reaped the old server yet) from both delivering the same beat. Only the
+      // caller that wins the CAS delivers; the loser skips silently. Missing one
+      // beat is far better than firing a heartbeat 2-3x.
+      const claimed = await claimReminderForDelivery(reminder);
+      if (!claimed) {
+        logger.info('Reminder already claimed by another instance — skipping duplicate', {
+          reminderId: reminder.id,
+          nextRunAt: reminder.next_run_at,
+        });
+        stats.skipped++;
+        continue;
+      }
 
       // Deliver via caller-provided callback
       let delivered = false;
@@ -253,10 +266,21 @@ async function getUserTimezone(userId: string): Promise<string> {
 }
 
 /**
- * Update reminder after successful delivery
+ * Atomically claim a due reminder for delivery.
+ *
+ * Advances next_run_at (recurring) or marks it completed (one-time / max-runs),
+ * but ONLY if the row's next_run_at still equals the value we fetched. Because
+ * PostgreSQL applies the matching UPDATE atomically, exactly one caller can win
+ * this compare-and-swap even if several fire it concurrently — the rest match
+ * zero rows. Returns true if THIS caller won the claim and should deliver.
+ *
+ * This is the cross-process at-most-once guard: overlapping server incarnations
+ * that each run processHeartbeat on the same tick will all fetch the same due
+ * reminder, but only the first to land its CAS advances the row; the others see
+ * the already-advanced next_run_at, match nothing, and skip delivery.
  */
-async function updateReminderAfterDelivery(reminder: DueReminder): Promise<void> {
-  if (!supabase) return;
+async function claimReminderForDelivery(reminder: DueReminder): Promise<boolean> {
+  if (!supabase) return false;
 
   const now = new Date().toISOString();
   const newRunCount = reminder.run_count + 1;
@@ -265,30 +289,35 @@ async function updateReminderAfterDelivery(reminder: DueReminder): Promise<void>
   const isCompleted =
     !reminder.cron_expression || (reminder.max_runs !== null && newRunCount >= reminder.max_runs);
 
-  if (isCompleted) {
-    // Mark as completed
-    await supabase
-      .from('scheduled_reminders')
-      .update({
-        status: 'completed',
+  const update: Database['public']['Tables']['scheduled_reminders']['Update'] = isCompleted
+    ? { status: 'completed', last_run_at: now, run_count: newRunCount }
+    : {
         last_run_at: now,
         run_count: newRunCount,
-      })
-      .eq('id', reminder.id);
-  } else {
-    // Calculate next run time in user's timezone
-    const userTimezone = await getUserTimezone(reminder.user_id);
-    const nextRun = calculateNextRun(reminder.cron_expression!, new Date(), userTimezone);
+        next_run_at: calculateNextRun(
+          reminder.cron_expression!,
+          new Date(),
+          await getUserTimezone(reminder.user_id)
+        ).toISOString(),
+      };
 
-    await supabase
-      .from('scheduled_reminders')
-      .update({
-        last_run_at: now,
-        next_run_at: nextRun.toISOString(),
-        run_count: newRunCount,
-      })
-      .eq('id', reminder.id);
+  // CAS: the .eq('next_run_at', ...) guard is the whole point — it fails the
+  // update for any caller whose fetched next_run_at has already been advanced
+  // by a concurrent winner. select('id') returns the affected rows so we can
+  // tell a win (1 row) from a loss (0 rows).
+  const { data, error } = await supabase
+    .from('scheduled_reminders')
+    .update(update)
+    .eq('id', reminder.id)
+    .eq('next_run_at', reminder.next_run_at)
+    .select('id');
+
+  if (error) {
+    logger.error(`Failed to claim reminder ${reminder.id}:`, error);
+    return false;
   }
+
+  return Array.isArray(data) && data.length === 1;
 }
 
 /**
