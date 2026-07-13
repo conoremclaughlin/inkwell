@@ -26,7 +26,15 @@ import { logger } from '../../utils/logger.js';
 import { resolveBinaryPath, buildSpawnPath } from './resolve-binary.js';
 import { injectSessionHeaders, buildSessionEnv, writeRuntimeSessionHint } from '@inklabs/shared';
 
-const PROCESS_TIMEOUT_MS = parseInt(process.env.INK_PROCESS_TIMEOUT_MS || '', 10) || 15 * 60 * 1000;
+// Absolute wall-clock backstop for a single ink turn. This is a blunt
+// instrument — it can't tell a turn that's still legitimately working (e.g.
+// steadily downloading hundreds of files) from a wedged one, so it must sit
+// well above any realistic turn. A 15-min ceiling killed a valid bulk-download
+// turn ~25 files in. 60 min is a safety net for a truly hung process, not a
+// working limit. The real fix is an inactivity-based timeout, which needs the
+// mid-turn stdout stream (streaming work) to supply a liveness signal; until
+// then this is the only lever. Override with INK_PROCESS_TIMEOUT_MS.
+const PROCESS_TIMEOUT_MS = parseInt(process.env.INK_PROCESS_TIMEOUT_MS || '', 10) || 60 * 60 * 1000;
 /** Max --attach-file args forwarded per spawn (matches the channel-side media cap) */
 const MAX_ATTACHMENT_ARGS = 10;
 
