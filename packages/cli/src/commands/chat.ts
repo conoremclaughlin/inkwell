@@ -2460,6 +2460,24 @@ export async function runChat(options: ChatOptions): Promise<void> {
     restorePromptAfterWrite?.();
   };
 
+  // Non-interactive event stream. When running headless (server-spawned via
+  // InkRunner with --non-interactive), emit structured NDJSON lines to stdout
+  // as the turn progresses. Purpose: give the runner a mid-turn liveness signal
+  // (for an inactivity-based timeout) and a live tool-by-tool progress feed.
+  // These lines sit alongside human-readable status chrome — the runner parses
+  // JSON lines and ignores the rest. The authoritative end-of-run summary is
+  // still the single `type:'result'` line emitted at completion. No-op in
+  // interactive mode: nothing consumes stdout there and raw JSON would corrupt
+  // the rendered UI.
+  const emitStreamEvent = (evt: Record<string, unknown>): void => {
+    if (!options.nonInteractive) return;
+    try {
+      process.stdout.write(`${JSON.stringify(evt)}\n`);
+    } catch {
+      // A stdout write failure must never abort the turn.
+    }
+  };
+
   const ledger = new ContextLedger();
   const hookRegistry = new SbHookRegistry();
   let hookTurnCount = 0;
@@ -4262,6 +4280,19 @@ export async function runChat(options: ChatOptions): Promise<void> {
             ledger.addEntry('system', compactForLedger(msg, 400), 'local-tool');
             iterationResults.push({ tool: result.tool, result: result.error, status: 'error' });
           }
+
+          // Headless liveness + progress: one compact NDJSON line per tool as
+          // it completes. Input is capped and results are omitted (can be large
+          // or sensitive). send_response is intentionally NOT streamed here —
+          // that tool already routes server-side, so re-emitting it as a
+          // response line would risk double delivery.
+          const streamArgs = result.args ? JSON.stringify(result.args) : '';
+          emitStreamEvent({
+            type: 'tool_call',
+            toolName: result.tool,
+            status: result.status,
+            ...(streamArgs && streamArgs.length <= 2000 ? { input: result.args } : {}),
+          });
         },
       });
 
