@@ -30,6 +30,39 @@ interface JsonRpcResponse {
 
 let jsonRpcId = 1;
 
+/**
+ * Bound every MCP network call so a stalled connection fails fast instead of
+ * hanging the whole turn. On a flaky link (e.g. a phone hotspot) a bare
+ * `fetch` has no client-side deadline — we observed a single `get_inbox` call
+ * hang for ~159s before the OS gave up, stalling the turn behind it. A 30s
+ * ceiling turns that silent hang into a fast, retryable error. Override with
+ * INK_MCP_TIMEOUT_MS.
+ */
+const MCP_FETCH_TIMEOUT_MS = parseInt(process.env.INK_MCP_TIMEOUT_MS || '', 10) || 30_000;
+
+/**
+ * `fetch` with an abort-based deadline. Translates the abort into a clear,
+ * actionable error so callers surface "timed out" rather than a raw
+ * DOMException. Never overrides a caller-supplied signal.
+ */
+export async function fetchWithTimeout(
+  url: string,
+  init: RequestInit = {},
+  timeoutMs: number = MCP_FETCH_TIMEOUT_MS
+): Promise<Response> {
+  try {
+    return await fetch(url, { ...init, signal: init.signal ?? AbortSignal.timeout(timeoutMs) });
+  } catch (err) {
+    const name = (err as { name?: string })?.name;
+    if (name === 'TimeoutError' || name === 'AbortError') {
+      throw new Error(
+        `PCP request to ${url} timed out after ${Math.round(timeoutMs / 1000)}s (network stalled?)`
+      );
+    }
+    throw err;
+  }
+}
+
 export class PcpClient {
   private configPath: string;
   private baseUrl: string;
@@ -159,7 +192,7 @@ export class PcpClient {
       client_id: clientId,
     });
 
-    const response = await fetch(`${this.baseUrl}/token`, {
+    const response = await fetchWithTimeout(`${this.baseUrl}/token`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
@@ -279,7 +312,7 @@ export class PcpClient {
     if (!token) return null;
 
     const call = async (accessToken: string): Promise<Response> =>
-      fetch(`${this.baseUrl}/mcp`, {
+      fetchWithTimeout(`${this.baseUrl}/mcp`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -337,7 +370,7 @@ export class PcpClient {
     tool: string,
     args: Record<string, unknown>
   ): Promise<PcpToolCallResult> {
-    const response = await fetch(`${this.baseUrl}/api/mcp/call`, {
+    const response = await fetchWithTimeout(`${this.baseUrl}/api/mcp/call`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
