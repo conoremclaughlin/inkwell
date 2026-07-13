@@ -11,6 +11,7 @@ import {
   generatePkce,
   decodeJwtPayload,
   isTokenExpired,
+  isJwtProvablyExpired,
   getValidAccessToken,
   getValidDelegatedAccessToken,
   loadAuth,
@@ -311,6 +312,63 @@ describe('getValidAccessToken', () => {
     process.env.INK_ACCESS_TOKEN = 'env-only-token';
     const token = await getValidAccessToken('http://localhost:3001', { allowEnvToken: false });
     expect(token).toBeNull();
+  });
+
+  // Regression: long-lived agent sessions inherit INK_ACCESS_TOKEN injected at
+  // session start. Once it expires, spawned CLI commands (ink wait, etc.) 401'd
+  // forever — even after a fresh `ink login` — because the stale env token
+  // short-circuited the auth.json path.
+  it('skips a provably-expired env JWT and falls back to auth.json', async () => {
+    process.env.INK_ACCESS_TOKEN = makeJwt({ exp: Math.floor(Date.now() / 1000) - 3600 });
+    saveAuth({
+      access_token: 'fresh-login-token',
+      refresh_token: 'refresh',
+      expires_in: 3600,
+      scope: 'full',
+      issued_at: Date.now(),
+    });
+
+    const token = await getValidAccessToken('http://localhost:3001');
+    expect(token).toBe('fresh-login-token');
+  });
+
+  it('returns null for an expired env JWT when auth.json is absent', async () => {
+    process.env.INK_ACCESS_TOKEN = makeJwt({ exp: Math.floor(Date.now() / 1000) - 3600 });
+    const token = await getValidAccessToken('http://localhost:3001');
+    expect(token).toBeNull();
+  });
+
+  it('still uses an env JWT with a future exp', async () => {
+    const envJwt = makeJwt({ exp: Math.floor(Date.now() / 1000) + 3600 });
+    process.env.INK_ACCESS_TOKEN = envJwt;
+    const token = await getValidAccessToken('http://localhost:3001');
+    expect(token).toBe(envJwt);
+  });
+});
+
+describe('isJwtProvablyExpired', () => {
+  it('returns true for a decodable JWT with exp in the past', () => {
+    expect(isJwtProvablyExpired(makeJwt({ exp: Math.floor(Date.now() / 1000) - 3600 }))).toBe(true);
+  });
+
+  it('returns true when exp is within the buffer window', () => {
+    expect(isJwtProvablyExpired(makeJwt({ exp: Math.floor(Date.now() / 1000) + 30 }), 60)).toBe(
+      true
+    );
+  });
+
+  it('returns false for a JWT with a future exp', () => {
+    expect(isJwtProvablyExpired(makeJwt({ exp: Math.floor(Date.now() / 1000) + 3600 }))).toBe(
+      false
+    );
+  });
+
+  it('returns false for opaque (non-JWT) tokens', () => {
+    expect(isJwtProvablyExpired('opaque-token-string')).toBe(false);
+  });
+
+  it('returns false for a JWT without an exp claim', () => {
+    expect(isJwtProvablyExpired(makeJwt({ sub: 'user-1' }))).toBe(false);
   });
 });
 

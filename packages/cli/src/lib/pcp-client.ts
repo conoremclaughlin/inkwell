@@ -298,6 +298,22 @@ export class PcpClient {
 
     let response = await call(token);
 
+    // If the first credential was the injected env token and it was rejected,
+    // retry with the local auth.json token before giving up (mirrors the
+    // fallback in hooks.ts callPcpTool). Stale env tokens outlive their expiry
+    // in long-running agent sessions and would otherwise 401 forever.
+    if (response.status === 401 && process.env.INK_ACCESS_TOKEN?.trim() === token) {
+      const localToken = await getValidAccessToken(this.baseUrl, { allowEnvToken: false });
+      if (localToken && localToken !== token) {
+        try {
+          await response.text();
+        } catch {
+          // Best-effort body drain before retry.
+        }
+        response = await call(localToken);
+      }
+    }
+
     if (response.status === 401 && this.config.refreshToken) {
       const refreshed = await this.refreshAccessToken();
       if (refreshed?.accessToken) {
