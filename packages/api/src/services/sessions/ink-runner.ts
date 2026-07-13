@@ -26,7 +26,48 @@ import { logger } from '../../utils/logger.js';
 import { resolveBinaryPath, buildSpawnPath } from './resolve-binary.js';
 import { injectSessionHeaders, buildSessionEnv, writeRuntimeSessionHint } from '@inklabs/shared';
 
-const PROCESS_TIMEOUT_MS = parseInt(process.env.INK_PROCESS_TIMEOUT_MS || '', 10) || 15 * 60 * 1000;
+// Absolute wall-clock backstop for a single ink turn — a final safety net for a
+// truly wedged process (dead loop, unkillable I/O), NOT a working limit. It
+// can't distinguish a turn that's still legitimately working from a hung one,
+// so it sits far above any realistic turn. The primary guard is the inactivity
+// timeout below. Override with INK_PROCESS_TIMEOUT_MS.
+export const PROCESS_TIMEOUT_MS =
+  parseInt(process.env.INK_PROCESS_TIMEOUT_MS || '', 10) || 60 * 60 * 1000;
+
+// Inactivity timeout — the primary liveness guard. The countdown resets on any
+// stdout/stderr activity from the ink subprocess. A working turn emits a steady
+// stream of events (one NDJSON line per tool call, plus status chrome), so it
+// never trips no matter how long the whole turn runs — a 350-file download that
+// takes 40 minutes keeps resetting the timer. A genuinely hung turn (provider
+// stalled, network dead, wedged) goes silent and is reaped here, ~12x faster
+// than the absolute backstop.
+//
+// The window must exceed the longest *legitimate* silent gap:
+//   1. Buffered LLM generation — no token stream, so a single generation emits
+//      nothing until it completes (typically 40-55s, sometimes minutes).
+//   2. Away-mode approval polling — requestToolApproval polls silently for up to
+//      300s (DEFAULT_TIMEOUT_SECONDS in approval-api.ts). No stdout/stderr during
+//      the wait. The inactivity window must clear this with margin, or it races
+//      the approval timeout and SIGTERMs the process mid-approval.
+//
+// 7 minutes (420s) clears the 300s approval window with 2 minutes of headroom.
+// Override with INK_INACTIVITY_TIMEOUT_MS.
+export const INACTIVITY_TIMEOUT_MS =
+  parseInt(process.env.INK_INACTIVITY_TIMEOUT_MS || '', 10) || 7 * 60 * 1000;
+
+// stderr substrings that mark a model-provider stall (vs. local work) — the same
+// family the trigger-retry classifier keys on. Logged when an idle turn is
+// reaped so provider stalls are distinguishable from local hangs in the logs.
+const PROVIDER_STALL_SIGNATURES = [
+  'stream disconnected',
+  'error sending request',
+  'models refresh timeout',
+  'request timed out',
+  'econnreset',
+  'etimedout',
+  'fetch failed',
+];
+
 /** Max --attach-file args forwarded per spawn (matches the channel-side media cap) */
 const MAX_ATTACHMENT_ARGS = 10;
 
@@ -223,22 +264,65 @@ export class InkRunner implements IRunner {
 
       let stdout = '';
       let stderr = '';
+      let killed = false;
+      let idleTimer: NodeJS.Timeout;
+
+      const killProcess = (reason: string, detail?: Record<string, unknown>) => {
+        if (killed) return;
+        killed = true;
+        logger.warn(`ink chat process ${reason}, killing`, {
+          sessionId: config.pcpSessionId,
+          inactivityMs: INACTIVITY_TIMEOUT_MS,
+          absoluteMs: PROCESS_TIMEOUT_MS,
+          ...detail,
+        });
+        child.kill('SIGTERM');
+        setTimeout(() => child.kill('SIGKILL'), 3000);
+      };
+
+      // Inactivity guard — reset on every byte the subprocess emits. A turn
+      // that's still working (tool calls, status lines) keeps this alive; a
+      // silent, hung one is reaped.
+      const resetIdleTimer = () => {
+        if (killed) return;
+        clearTimeout(idleTimer);
+        idleTimer = setTimeout(() => {
+          const lower = stderr.toLowerCase();
+          const stallSignature = PROVIDER_STALL_SIGNATURES.find((s) => lower.includes(s));
+          killProcess(`idle for ${Math.round(INACTIVITY_TIMEOUT_MS / 1000)}s`, {
+            cause: stallSignature ? 'provider-stall' : 'unknown-hang',
+            ...(stallSignature ? { stallSignature } : {}),
+            stderrTail: stderr.slice(-500) || undefined,
+          });
+        }, INACTIVITY_TIMEOUT_MS);
+      };
 
       child.stdout?.on('data', (chunk: Buffer) => {
         stdout += chunk.toString();
+        resetIdleTimer();
       });
       child.stderr?.on('data', (chunk: Buffer) => {
         stderr += chunk.toString();
+        resetIdleTimer();
       });
 
-      const timeout = setTimeout(() => {
-        logger.warn('ink chat process timed out, killing', { timeout: PROCESS_TIMEOUT_MS });
-        child.kill('SIGTERM');
-        setTimeout(() => child.kill('SIGKILL'), 3000);
+      // Absolute backstop — fires regardless of activity, for a process wedged
+      // in a way that still emits output (or none at all).
+      const absoluteTimer = setTimeout(() => {
+        killProcess(`exceeded ${Math.round(PROCESS_TIMEOUT_MS / 1000)}s absolute backstop`);
       }, PROCESS_TIMEOUT_MS);
 
+      // Start the inactivity countdown immediately so a process that never
+      // emits anything (wedged at startup) is still reaped.
+      resetIdleTimer();
+
+      const clearTimers = () => {
+        clearTimeout(idleTimer);
+        clearTimeout(absoluteTimer);
+      };
+
       child.on('close', (code) => {
-        clearTimeout(timeout);
+        clearTimers();
         mcpInjection?.cleanup();
 
         if (code !== 0) {
@@ -262,7 +346,7 @@ export class InkRunner implements IRunner {
       });
 
       child.on('error', (err) => {
-        clearTimeout(timeout);
+        clearTimers();
         mcpInjection?.cleanup();
         reject(new Error(`Failed to spawn ink: ${err.message}`));
       });

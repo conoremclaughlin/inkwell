@@ -41,7 +41,11 @@ import {
 } from './services/heartbeat';
 import { StrategyService } from './services/strategy.service';
 import { getOrchestrator } from './services/sandbox/index.js';
-import { setResponseCallback, hasExplicitResponse } from './mcp/tools/response-handlers';
+import {
+  setResponseCallback,
+  hasExplicitResponse,
+  clearExplicitResponse,
+} from './mcp/tools/response-handlers';
 import { getAgentGateway, type AgentTriggerPayload } from './channels/agent-gateway';
 import { resolveRouteAgentId } from './services/routing/resolve-route';
 import { resolveAgentFromMention } from './services/routing/resolve-mention';
@@ -366,6 +370,8 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
         });
         await channelGateway.releaseConversation(channel as GatewayChannel, conversationId);
       }
+
+      clearExplicitResponse(channel, conversationId);
     }
 
     if (!result.success) {

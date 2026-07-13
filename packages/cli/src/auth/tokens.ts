@@ -195,6 +195,7 @@ export async function refreshAccessToken(serverUrl: string, auth: StoredAuth): P
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: body.toString(),
+    signal: AbortSignal.timeout(30_000),
   });
 
   const data = (await response.json()) as TokenResponse;
