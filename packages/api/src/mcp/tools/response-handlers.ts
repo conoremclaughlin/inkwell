@@ -55,24 +55,27 @@ export function hasExplicitResponse(channel: string, conversationId: string): bo
 }
 
 /**
- * Clear explicit response tracking for a conversation (call after message processing complete)
+ * Clear explicit response tracking for a conversation (call after the
+ * auto-forward decision in server.ts). Also sweeps entries older than 30
+ * minutes as a leak backstop for conversations that never reach this path.
  */
 export function clearExplicitResponse(channel: string, conversationId: string): void {
   const key = `${channel}:${conversationId}`;
   explicitResponseTracker.delete(key);
+  const cutoff = Date.now() - 30 * 60 * 1000;
+  for (const [k, v] of explicitResponseTracker.entries()) {
+    if (v < cutoff) explicitResponseTracker.delete(k);
+  }
 }
 
 /**
- * Mark a conversation as having received an explicit response
+ * Mark a conversation as having received an explicit response. No cleanup
+ * here — concurrent turns' markers must not be swept mid-turn. Cleanup
+ * happens in clearExplicitResponse after the auto-forward decision.
  */
 function markExplicitResponse(channel: string, conversationId: string): void {
   const key = `${channel}:${conversationId}`;
   explicitResponseTracker.set(key, Date.now());
-  // Clean up old entries (> 5 minutes) to prevent memory leak
-  const cutoff = Date.now() - 300000;
-  for (const [k, v] of explicitResponseTracker.entries()) {
-    if (v < cutoff) explicitResponseTracker.delete(k);
-  }
 }
 
 interface TtsConfig {
