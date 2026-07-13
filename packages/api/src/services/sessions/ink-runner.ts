@@ -42,13 +42,18 @@ export const PROCESS_TIMEOUT_MS =
 // stalled, network dead, wedged) goes silent and is reaped here, ~12x faster
 // than the absolute backstop.
 //
-// The window must exceed the longest *legitimate* silent gap. The ink backend
-// is buffered (no token-by-token stream), so a single LLM generation emits
-// nothing until it completes — that quiet stretch (typically 40-55s, sometimes
-// a few minutes on a slow link) is the gap to clear. 5 minutes leaves headroom
-// while still catching real hangs quickly. Override with INK_INACTIVITY_TIMEOUT_MS.
+// The window must exceed the longest *legitimate* silent gap:
+//   1. Buffered LLM generation — no token stream, so a single generation emits
+//      nothing until it completes (typically 40-55s, sometimes minutes).
+//   2. Away-mode approval polling — requestToolApproval polls silently for up to
+//      300s (DEFAULT_TIMEOUT_SECONDS in approval-api.ts). No stdout/stderr during
+//      the wait. The inactivity window must clear this with margin, or it races
+//      the approval timeout and SIGTERMs the process mid-approval.
+//
+// 7 minutes (420s) clears the 300s approval window with 2 minutes of headroom.
+// Override with INK_INACTIVITY_TIMEOUT_MS.
 export const INACTIVITY_TIMEOUT_MS =
-  parseInt(process.env.INK_INACTIVITY_TIMEOUT_MS || '', 10) || 5 * 60 * 1000;
+  parseInt(process.env.INK_INACTIVITY_TIMEOUT_MS || '', 10) || 7 * 60 * 1000;
 
 // stderr substrings that mark a model-provider stall (vs. local work) — the same
 // family the trigger-retry classifier keys on. Logged when an idle turn is

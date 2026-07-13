@@ -44,18 +44,14 @@ export function getResponseCallback(): ResponseCallback | null {
 }
 
 /**
- * Check if a conversation has received an explicit send_response within the last N ms.
- * Used by server.ts to decide whether to auto-forward.
+ * Check if a conversation has received an explicit send_response during this
+ * turn. Turn-scoped, not time-windowed — ink turns can run for many minutes,
+ * so a fixed time window would miss early responses. Call clearExplicitResponse
+ * after the auto-forward decision to reset for the next turn.
  */
-export function hasExplicitResponse(
-  channel: string,
-  conversationId: string,
-  withinMs = 60000
-): boolean {
+export function hasExplicitResponse(channel: string, conversationId: string): boolean {
   const key = `${channel}:${conversationId}`;
-  const timestamp = explicitResponseTracker.get(key);
-  if (!timestamp) return false;
-  return Date.now() - timestamp < withinMs;
+  return explicitResponseTracker.has(key);
 }
 
 /**
