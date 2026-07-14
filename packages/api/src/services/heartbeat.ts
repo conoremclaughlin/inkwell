@@ -277,7 +277,7 @@ async function getUserTimezone(userId: string): Promise<string> {
  * This is the cross-process at-most-once guard: overlapping server incarnations
  * that each run processHeartbeat on the same tick will all fetch the same due
  * reminder, but only the first to land its CAS advances the row; the others see
- * the already-advanced next_run_at, match nothing, and skip delivery.
+ * the already-changed row, match nothing, and skip delivery.
  */
 async function claimReminderForDelivery(reminder: DueReminder): Promise<boolean> {
   if (!supabase) return false;
@@ -301,15 +301,20 @@ async function claimReminderForDelivery(reminder: DueReminder): Promise<boolean>
         ).toISOString(),
       };
 
-  // CAS: the .eq('next_run_at', ...) guard is the whole point — it fails the
-  // update for any caller whose fetched next_run_at has already been advanced
-  // by a concurrent winner. select('id') returns the affected rows so we can
-  // tell a win (1 row) from a loss (0 rows).
+  // CAS: guard on id + next_run_at + status='active'. The next_run_at guard
+  // fails the update for a loser whose fetched value was already advanced by a
+  // recurring winner. But a COMPLETING claim (one-time / final max_runs) leaves
+  // next_run_at unchanged and only flips status→completed — so the status guard
+  // is what fails the loser there. Guarding both closes the race for every case:
+  // whichever column the winner mutated, the loser's stale predicate no longer
+  // matches. select('id') returns the affected rows so we can tell a win (1 row)
+  // from a loss (0 rows).
   const { data, error } = await supabase
     .from('scheduled_reminders')
     .update(update)
     .eq('id', reminder.id)
     .eq('next_run_at', reminder.next_run_at)
+    .eq('status', 'active')
     .select('id');
 
   if (error) {

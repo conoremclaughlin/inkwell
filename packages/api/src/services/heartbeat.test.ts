@@ -716,5 +716,51 @@ describe('Heartbeat Service', () => {
       );
       expect(eqNextRunCall?.[1]).toBe(fetchedNextRun);
     });
+
+    // Regression for Lumen's PR #437 review: a COMPLETING claim (one-time or
+    // final max_runs) sets status='completed' but leaves next_run_at unchanged.
+    // Without a status guard, a racing loser still matches id + next_run_at and
+    // delivers a duplicate. The claim must also guard status='active'.
+    it('should guard the CAS on status=active so completing claims are race-safe', async () => {
+      initHeartbeatService({ enableLocalCron: false });
+
+      // One-time reminder: no cron_expression → isCompleted → status='completed'.
+      const reminder = makeDueReminder({ cron_expression: null });
+      setQueryResult('scheduled_reminders', [reminder]); // select due
+      setQueryResult('scheduled_reminders', [{ id: 'rem-001' }]); // claim win
+
+      const mockDeliver = vi.fn().mockResolvedValue(true);
+      await processHeartbeat(mockDeliver);
+
+      const builder = tableBuilders.get('scheduled_reminders')!;
+      const eqCalls = (builder.eq as ReturnType<typeof vi.fn>).mock.calls;
+      const statusEq = eqCalls.find((c) => c[0] === 'status');
+      expect(statusEq?.[1]).toBe('active');
+
+      // The winning update marks the one-time reminder completed.
+      const updateArgs = (builder.update as ReturnType<typeof vi.fn>).mock.calls[0][0] as Record<
+        string,
+        unknown
+      >;
+      expect(updateArgs.status).toBe('completed');
+      expect(updateArgs.next_run_at).toBeUndefined(); // unchanged — hence the status guard
+    });
+
+    it('should NOT deliver a completing reminder when the status-guarded claim loses', async () => {
+      initHeartbeatService({ enableLocalCron: false });
+
+      // Final max_runs run → isCompleted. A concurrent winner already flipped
+      // status→completed, so this claim matches 0 rows (status no longer active).
+      const reminder = makeDueReminder({ cron_expression: '0 * * * *', run_count: 4, max_runs: 5 });
+      setQueryResult('scheduled_reminders', [reminder]); // select due
+      setQueryResult('scheduled_reminders', []); // claim: 0 rows → lost to a concurrent completer
+
+      const mockDeliver = vi.fn().mockResolvedValue(true);
+      const stats = await processHeartbeat(mockDeliver);
+
+      expect(mockDeliver).not.toHaveBeenCalled();
+      expect(stats.delivered).toBe(0);
+      expect(stats.skipped).toBe(1);
+    });
   });
 });
