@@ -24,6 +24,7 @@ import {
 import adminRouter, { setWhatsAppListener } from '../routes/admin';
 import { getAgentGateway } from '../channels/agent-gateway';
 import { createChatRouter } from '../routes/chat';
+import { createSessionsRouter } from '../routes/sessions';
 import { createHookLifecycleRouter } from '../routes/hook-lifecycle';
 import {
   ChannelGateway,
@@ -832,6 +833,15 @@ export class MCPServer {
       app.use('/api/chat', chatRouter);
       logger.info('Chat API routes registered at /api/chat');
     }
+
+    // Live session event stream (SSE) — attached terminals + dashboard subscribe
+    // to a session's turn events, fanned out from the session event bus.
+    const sessionsRouter = createSessionsRouter({
+      authProvider: this.authProvider,
+      dataComposer: this.dataComposer,
+    });
+    app.use('/api/sessions', sessionsRouter);
+    logger.info('Session event routes registered at /api/sessions');
 
     // Kindle routes (registered below after import)
     import('../routes/kindle.js')
