@@ -217,6 +217,17 @@ export async function refreshAccessToken(serverUrl: string, auth: StoredAuth): P
 // High-Level: Get Valid Access Token
 // ============================================================================
 
+/**
+ * True when a token is a decodable JWT whose exp is in the past (with buffer).
+ * Opaque/undecodable tokens return false — we only skip tokens we can PROVE
+ * are expired.
+ */
+export function isJwtProvablyExpired(token: string, bufferSeconds = 60): boolean {
+  const payload = decodeJwtPayload(token);
+  if (!payload || typeof payload.exp !== 'number') return false;
+  return payload.exp * 1000 <= Date.now() + bufferSeconds * 1000;
+}
+
 export async function getValidAccessToken(
   serverUrl: string,
   options?: { allowEnvToken?: boolean }
@@ -224,7 +235,12 @@ export async function getValidAccessToken(
   const allowEnvToken = options?.allowEnvToken !== false;
   if (allowEnvToken) {
     const envToken = process.env.INK_ACCESS_TOKEN?.trim();
-    if (envToken) {
+    // Skip a provably-expired env token instead of returning it blindly.
+    // Long-lived agent sessions inherit INK_ACCESS_TOKEN injected at session
+    // start; once it expires, every spawned CLI command would 401 forever —
+    // even after a fresh `ink login` — because the env token short-circuits
+    // the auth.json path below.
+    if (envToken && !isJwtProvablyExpired(envToken)) {
       return envToken;
     }
   }
