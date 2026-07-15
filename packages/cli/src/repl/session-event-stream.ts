@@ -93,6 +93,27 @@ export function startSessionEventStream(opts: SessionEventStreamOptions): () => 
   let controller: AbortController | null = null;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
+  // Ids we've already surfaced. The server replays its tail on every connect, so
+  // without this a dropped-and-restored connection re-renders the same tool_call.
+  // Survives reconnects by living outside the connect loop. Bounded: the tail is
+  // small and turn-scoped, so we only need to remember recent ids.
+  const seen = new Set<number>();
+  const SEEN_MAX = 1000;
+  const markSeen = (id: number): boolean => {
+    if (seen.has(id)) return false;
+    seen.add(id);
+    if (seen.size > SEEN_MAX) {
+      // Sets keep insertion order — drop the oldest overflow.
+      const excess = seen.size - SEEN_MAX;
+      let dropped = 0;
+      for (const v of seen) {
+        seen.delete(v);
+        if (++dropped >= excess) break;
+      }
+    }
+    return true;
+  };
+
   const run = async (): Promise<void> => {
     while (!stopped) {
       controller = new AbortController();
@@ -132,6 +153,9 @@ export function startSessionEventStream(opts: SessionEventStreamOptions): () => 
                 data = { raw: frame.data };
               }
             }
+            // De-dupe replayed events by stable id (ids come from the bus).
+            // Untagged frames (e.g. the 'connected' preamble) always pass.
+            if (typeof data.id === 'number' && !markSeen(data.id)) continue;
             onEvent({ type: frame.event, data });
           }
         }

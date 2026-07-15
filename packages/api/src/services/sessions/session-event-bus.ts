@@ -24,6 +24,12 @@ import { logger } from '../../utils/logger.js';
 
 /** A single live event about a session's turn (tool call, status, result, …). */
 export interface SessionStreamEvent {
+  /**
+   * Process-unique, monotonic id. Lets a client de-dupe: the replay tail is
+   * re-sent on every (re)connect, so a dropped/restored SSE connection would
+   * otherwise render the same tool_call twice.
+   */
+  id: number;
   /** Session the event belongs to (pcpSessionId). */
   sessionId: string;
   /** ISO timestamp stamped at publish time. */
@@ -51,6 +57,8 @@ const MAX_TRACKED_SESSIONS = 256;
 class SessionEventBus extends EventEmitter {
   /** sessionId -> recent events (bounded), for replay-on-subscribe. */
   private readonly replay = new Map<string, SessionStreamEvent[]>();
+  /** Monotonic event id source (process-unique). */
+  private nextId = 1;
 
   constructor() {
     super();
@@ -60,10 +68,23 @@ class SessionEventBus extends EventEmitter {
     this.setMaxListeners(0);
   }
 
+  /**
+   * Drop a session's replay tail. InkRunner calls this at turn start AND at
+   * turn end, which turn-scopes the buffer: attach mid-turn and you replay only
+   * the in-flight turn's events (real live context); attach while idle and you
+   * replay nothing, so a finished turn can never be re-rendered as if it were
+   * happening now.
+   */
+  clearReplay(sessionId: string): void {
+    if (!sessionId) return;
+    this.replay.delete(sessionId);
+  }
+
   /** Publish one live event for a session. Non-blocking, best-effort. */
   publish(sessionId: string, type: string, data: Record<string, unknown>): void {
     if (!sessionId) return;
     const event: SessionStreamEvent = {
+      id: this.nextId++,
       sessionId,
       ts: new Date().toISOString(),
       type,

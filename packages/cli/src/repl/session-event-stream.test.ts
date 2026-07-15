@@ -87,6 +87,54 @@ describe('startSessionEventStream', () => {
     expect(call[1].headers.Authorization).toBe('Bearer tok-123');
   });
 
+  // Regression for Lumen's PR #438 review: the server replays its tail on every
+  // connect, so a reconnect would re-deliver the same rows. De-dupe by stable id.
+  it('de-dupes replayed events by id (no double-render across a replayed tail)', async () => {
+    const events: SessionEvent[] = [];
+    const fetchImpl = mockFetchStreaming([
+      'event: tool_call\ndata: {"id":7,"type":"tool_call","data":{"toolName":"a"}}\n\n',
+      // Same id re-sent (as a replay would) — must not surface twice.
+      'event: tool_call\ndata: {"id":7,"type":"tool_call","data":{"toolName":"a"}}\n\n',
+      'event: tool_call\ndata: {"id":8,"type":"tool_call","data":{"toolName":"b"}}\n\n',
+    ]);
+
+    const stop = startSessionEventStream({
+      serverUrl: 'http://localhost:3001',
+      sessionId: 's1',
+      token: 't',
+      onEvent: (e) => events.push(e),
+      fetchImpl,
+      setTimeoutImpl: (() => 0 as unknown as ReturnType<typeof setTimeout>) as typeof setTimeout,
+    });
+
+    await vi.waitFor(() => expect(events.length).toBeGreaterThanOrEqual(2));
+    stop();
+
+    expect(events).toHaveLength(2);
+    expect(events.map((e) => (e.data as { id?: number }).id)).toEqual([7, 8]);
+  });
+
+  it('always passes through untagged frames like the connected preamble', async () => {
+    const events: SessionEvent[] = [];
+    const fetchImpl = mockFetchStreaming([
+      'event: connected\ndata: {"sessionId":"s1"}\n\n',
+      'event: connected\ndata: {"sessionId":"s1"}\n\n',
+    ]);
+
+    const stop = startSessionEventStream({
+      serverUrl: 'http://localhost:3001',
+      sessionId: 's1',
+      token: 't',
+      onEvent: (e) => events.push(e),
+      fetchImpl,
+      setTimeoutImpl: (() => 0 as unknown as ReturnType<typeof setTimeout>) as typeof setTimeout,
+    });
+
+    // No id to de-dupe on, so both arrive (the renderer ignores 'connected').
+    await vi.waitFor(() => expect(events.length).toBe(2));
+    stop();
+  });
+
   it('reports connection failures via onError without throwing', async () => {
     const errors: Error[] = [];
     const fetchImpl = vi

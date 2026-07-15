@@ -256,6 +256,11 @@ export class InkRunner implements IRunner {
     // Strip CLAUDECODE to prevent nested-session detection
     delete env.CLAUDECODE;
 
+    // Turn-scope the observer replay tail: drop anything buffered from a prior
+    // turn so an attach mid-turn replays only THIS turn's events, and an attach
+    // while idle replays nothing (a finished turn must never re-render as live).
+    if (config.pcpSessionId) sessionEventBus.clearReplay(config.pcpSessionId);
+
     return new Promise((resolve, reject) => {
       const child: ChildProcess = spawn(inkBin, fullArgs, {
         cwd: config.workingDirectory,
@@ -365,6 +370,9 @@ export class InkRunner implements IRunner {
       child.on('close', (code) => {
         clearTimers();
         mcpInjection?.cleanup();
+        // Turn over: the buffered tail now describes a COMPLETED turn, so drop
+        // it. A later idle attach must not replay it as live activity.
+        if (config.pcpSessionId) sessionEventBus.clearReplay(config.pcpSessionId);
 
         if (code !== 0) {
           // Check for resume failure

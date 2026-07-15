@@ -130,4 +130,38 @@ describe('SessionEventBus', () => {
     unsubBad();
     unsubGood();
   });
+
+  // Regression for Lumen's PR #438 review: the replay tail is re-sent on every
+  // (re)connect, so events need stable ids for a client to de-dupe, and the tail
+  // must be turn-scoped so a finished turn never replays as if it were live.
+  it('assigns unique, monotonically increasing event ids', () => {
+    const sid = nextSession();
+    const got: number[] = [];
+    const unsub = sessionEventBus.subscribe(sid, (e) => got.push(e.id), { replay: false });
+
+    sessionEventBus.publish(sid, 'a', {});
+    sessionEventBus.publish(sid, 'b', {});
+
+    expect(got).toHaveLength(2);
+    expect(got[1]).toBeGreaterThan(got[0]);
+    expect(new Set(got).size).toBe(2);
+    unsub();
+  });
+
+  it('clearReplay drops the tail so a later attach replays nothing', () => {
+    const sid = nextSession();
+    sessionEventBus.publish(sid, 'tool_call', { toolName: 'from-finished-turn' });
+
+    // InkRunner calls this at turn start/end.
+    sessionEventBus.clearReplay(sid);
+
+    const seen: string[] = [];
+    const unsub = sessionEventBus.subscribe(sid, (e) => seen.push(e.type));
+    // Nothing stale replayed...
+    expect(seen).toEqual([]);
+    // ...but the session still streams new events normally.
+    sessionEventBus.publish(sid, 'tool_call', { toolName: 'new-turn' });
+    expect(seen).toEqual(['tool_call']);
+    unsub();
+  });
 });
