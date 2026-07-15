@@ -23,6 +23,7 @@ import type {
 } from './types.js';
 import { formatInjectedContext } from './context-builder.js';
 import { logger } from '../../utils/logger.js';
+import { sessionEventBus } from './session-event-bus.js';
 import { resolveBinaryPath, buildSpawnPath } from './resolve-binary.js';
 import { injectSessionHeaders, buildSessionEnv, writeRuntimeSessionHint } from '@inklabs/shared';
 
@@ -255,6 +256,11 @@ export class InkRunner implements IRunner {
     // Strip CLAUDECODE to prevent nested-session detection
     delete env.CLAUDECODE;
 
+    // Turn-scope the observer replay tail: drop anything buffered from a prior
+    // turn so an attach mid-turn replays only THIS turn's events, and an attach
+    // while idle replays nothing (a finished turn must never re-render as live).
+    if (config.pcpSessionId) sessionEventBus.clearReplay(config.pcpSessionId);
+
     return new Promise((resolve, reject) => {
       const child: ChildProcess = spawn(inkBin, fullArgs, {
         cwd: config.workingDirectory,
@@ -266,6 +272,44 @@ export class InkRunner implements IRunner {
       let stderr = '';
       let killed = false;
       let idleTimer: NodeJS.Timeout;
+      // Carries a partial trailing line between stdout chunks so we only parse
+      // complete NDJSON events for live fan-out.
+      let stdoutLineBuffer = '';
+
+      // Live fan-out: the worker emits one NDJSON event per line as it works
+      // (tool_call, result, status chrome). Parse complete lines as they arrive
+      // and republish to the session event bus so attached terminals and the
+      // dashboard can watch the turn live — instead of the stream dead-ending
+      // here as a mere liveness signal. Best-effort: partial lines and
+      // human-readable chrome are ignored; the authoritative RunnerResult is
+      // still assembled from the full stdout in parseOutput on close.
+      const publishStreamEvents = (text: string): void => {
+        if (!config.pcpSessionId) return;
+        stdoutLineBuffer += text;
+        let nl: number;
+        while ((nl = stdoutLineBuffer.indexOf('\n')) >= 0) {
+          const line = stdoutLineBuffer.slice(0, nl).trim();
+          stdoutLineBuffer = stdoutLineBuffer.slice(nl + 1);
+          if (!line) continue;
+          let evt: unknown;
+          try {
+            evt = JSON.parse(line);
+          } catch {
+            continue; // CLI chrome / status text, not a structured event
+          }
+          if (
+            evt &&
+            typeof evt === 'object' &&
+            typeof (evt as { type?: unknown }).type === 'string'
+          ) {
+            sessionEventBus.publish(
+              config.pcpSessionId,
+              (evt as { type: string }).type,
+              evt as Record<string, unknown>
+            );
+          }
+        }
+      };
 
       const killProcess = (reason: string, detail?: Record<string, unknown>) => {
         if (killed) return;
@@ -298,7 +342,9 @@ export class InkRunner implements IRunner {
       };
 
       child.stdout?.on('data', (chunk: Buffer) => {
-        stdout += chunk.toString();
+        const text = chunk.toString();
+        stdout += text;
+        publishStreamEvents(text);
         resetIdleTimer();
       });
       child.stderr?.on('data', (chunk: Buffer) => {
@@ -324,6 +370,9 @@ export class InkRunner implements IRunner {
       child.on('close', (code) => {
         clearTimers();
         mcpInjection?.cleanup();
+        // Turn over: the buffered tail now describes a COMPLETED turn, so drop
+        // it. A later idle attach must not replay it as live activity.
+        if (config.pcpSessionId) sessionEventBus.clearReplay(config.pcpSessionId);
 
         if (code !== 0) {
           // Check for resume failure

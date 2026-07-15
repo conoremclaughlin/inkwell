@@ -27,6 +27,7 @@ import {
   type BackendAuthBackend,
 } from '../lib/backend-auth.js';
 import { startBackendTurn, runBackendTurn } from '../repl/backend-runner.js';
+import { startSessionEventStream, type SessionEvent } from '../repl/session-event-stream.js';
 import {
   ContextLedger,
   entryRefHash,
@@ -2521,6 +2522,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   const seenInboxIds = new Set<string>();
   const seenActivityIds = new Set<string>();
   let pollTimer: NodeJS.Timeout | null = null;
+  let stopEventStream: (() => void) | null = null;
   let sessionsCache: SessionSummary[] = [];
   let sessionsCacheAt = 0;
   let activitySince = new Date(Date.now() - 5 * 60 * 1000).toISOString();
@@ -4618,6 +4620,71 @@ export async function runChat(options: ChatOptions): Promise<void> {
     },
     Math.max(runtime.pollSeconds, 5) * 1000
   );
+
+  // Live session stream: when attached to an EXISTING session, subscribe to the
+  // server's SSE feed so a background worker's turn (a heartbeat, an incoming
+  // message) renders live in this terminal as it churns — instead of surfacing
+  // only via the 20s activity poll (which filters same-session events anyway).
+  // Best-effort: if the stream can't connect, the activity poll remains the
+  // fallback. Only the attached case needs this; a headless spawn IS the worker.
+  if (
+    !options.nonInteractive &&
+    !options.message &&
+    attachedToExistingSession &&
+    runtime.sessionId
+  ) {
+    try {
+      const { getPcpServerUrl } = await import('../lib/pcp-mcp.js');
+      const { getValidAccessToken } = await import('../auth/tokens.js');
+      const streamServerUrl = getPcpServerUrl().replace(/\/+$/, '');
+      const streamToken = await getValidAccessToken(streamServerUrl);
+      if (streamToken) {
+        const renderSessionEvent = (evt: SessionEvent): void => {
+          if (evt.type === 'connected') return;
+          // SSE data is the bus SessionStreamEvent { sessionId, ts, type, data };
+          // the worker's own NDJSON fields live one level down in `.data`.
+          const wrapper = (evt.data ?? {}) as Record<string, unknown>;
+          const payload = (wrapper.data ?? {}) as Record<string, unknown>;
+          const at = typeof wrapper.ts === 'string' ? wrapper.ts : undefined;
+          if (evt.type === 'tool_call') {
+            const toolName = String(payload.toolName ?? payload.name ?? 'tool');
+            const line = `${agentId} · ${toolName}`;
+            if (inkRepl)
+              inkRepl.addMessage('activity', line, {
+                label: '⚡',
+                time: formatHumanTime(at, runtime.userTimezone),
+              });
+            else printEvent(chalk.dim(`  ⚡ ${line}`));
+          } else if (evt.type === 'result') {
+            const text = String(payload.text ?? '').trim();
+            if (!text) return;
+            if (inkRepl)
+              inkRepl.addMessage('activity', text, {
+                label: 'live',
+                time: formatHumanTime(at, runtime.userTimezone),
+              });
+            else
+              printLine(
+                renderMessageLine('activity', text, {
+                  label: 'live',
+                  timezone: runtime.userTimezone,
+                  ts: at,
+                })
+              );
+          }
+        };
+        stopEventStream = startSessionEventStream({
+          serverUrl: streamServerUrl,
+          sessionId: runtime.sessionId,
+          token: streamToken,
+          onEvent: renderSessionEvent,
+        });
+      }
+    } catch {
+      // Live stream is best-effort; the activity poll remains as fallback.
+    }
+  }
+
   // Status update deferred until after Ink/readline mount below
   if (!useInk) {
     emitStatusLaneIfChanged();
@@ -4676,6 +4743,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     }
 
     if (pollTimer) clearInterval(pollTimer);
+    stopEventStream?.();
     const summary = summarizeForSessionEnd(ledger);
 
     const isBackendFailure = exitReason === 'backend_failure';
@@ -6245,6 +6313,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   }
   restorePromptAfterWrite = null;
   if (pollTimer) clearInterval(pollTimer);
+  stopEventStream?.();
 
   if (pendingTurns > 0) {
     console.log(chalk.dim(`Waiting for ${pendingTurns} pending turn(s) to finish...`));

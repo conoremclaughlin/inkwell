@@ -258,7 +258,7 @@ describe('Heartbeat Service', () => {
 
       const reminder = makeDueReminder();
       setQueryResult('scheduled_reminders', [reminder]); // select
-      setQueryResult('scheduled_reminders', null); // update after delivery
+      setQueryResult('scheduled_reminders', [{ id: 'rem-001' }]); // claim CAS win
 
       const mockDeliver = vi.fn().mockResolvedValue(true);
       const stats = await processHeartbeat(mockDeliver);
@@ -338,7 +338,7 @@ describe('Heartbeat Service', () => {
         run_count: 3,
       });
       setQueryResult('scheduled_reminders', [reminder]); // select
-      setQueryResult('scheduled_reminders', null); // update
+      setQueryResult('scheduled_reminders', [{ id: 'rem-001' }]); // claim CAS win
 
       const mockDeliver = vi.fn().mockResolvedValue(true);
       const beforeProcess = new Date();
@@ -365,7 +365,7 @@ describe('Heartbeat Service', () => {
       const reminder1 = makeDueReminder({ id: 'rem-001', title: 'Check emails' });
       const reminder2 = makeDueReminder({ id: 'rem-002', title: 'Daily standup' });
       setQueryResult('scheduled_reminders', [reminder1, reminder2]); // select
-      setQueryResult('scheduled_reminders', null); // update (reused for both)
+      setQueryResult('scheduled_reminders', [{ id: 'claimed' }]); // claim CAS win (reused for both)
 
       const mockDeliver = vi.fn().mockResolvedValue(true);
       const stats = await processHeartbeat(mockDeliver);
@@ -587,7 +587,7 @@ describe('Heartbeat Service', () => {
 
       const reminder = makeDueReminder({ cron_expression: '0 * * * *' });
       setQueryResult('scheduled_reminders', [reminder]); // select due reminders
-      setQueryResult('scheduled_reminders', null); // update (advance next_run_at)
+      setQueryResult('scheduled_reminders', [{ id: 'rem-001' }]); // claim CAS win (advance next_run_at)
       setQueryResult('users', { timezone: null }); // getUserTimezone
 
       let updateCalledBeforeDeliver = false;
@@ -610,7 +610,7 @@ describe('Heartbeat Service', () => {
 
       const reminder = makeDueReminder({ cron_expression: '0 * * * *' });
       setQueryResult('scheduled_reminders', [reminder]);
-      setQueryResult('scheduled_reminders', null); // update
+      setQueryResult('scheduled_reminders', [{ id: 'rem-001' }]); // claim CAS win
       setQueryResult('users', { timezone: null });
 
       const mockDeliver = vi.fn().mockResolvedValue(false);
@@ -630,7 +630,7 @@ describe('Heartbeat Service', () => {
 
       const reminder = makeDueReminder({ cron_expression: '0 * * * *' });
       setQueryResult('scheduled_reminders', [reminder]);
-      setQueryResult('scheduled_reminders', null); // update
+      setQueryResult('scheduled_reminders', [{ id: 'rem-001' }]); // claim CAS win
       setQueryResult('users', { timezone: null });
 
       const mockDeliver = vi.fn().mockRejectedValue(new Error('Session host down'));
@@ -639,6 +639,128 @@ describe('Heartbeat Service', () => {
       const builder = tableBuilders.get('scheduled_reminders')!;
       const updateCalls = (builder.update as ReturnType<typeof vi.fn>).mock.calls;
       expect(updateCalls.length).toBeGreaterThan(0);
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════════
+  // Cross-process at-most-once — atomic CAS claim
+  //
+  // The heartbeatRunning flag only guards ONE process. When multiple
+  // server incarnations overlap (e.g. a tsx-watch reload that hasn't
+  // reaped the old server), each runs processHeartbeat on the same tick
+  // and fetches the same due reminder. The claim's compare-and-swap on
+  // next_run_at is what makes delivery at-most-once ACROSS processes:
+  // only the caller whose UPDATE matches a row (1 row returned) delivers;
+  // the losers match 0 rows and skip. Regression for the duplicate
+  // heartbeat sessions + 2-3x Telegram sends observed 2026-07-13.
+  // ═══════════════════════════════════════════════════════════════
+  describe('Cross-process at-most-once (atomic CAS claim)', () => {
+    it('should deliver when the CAS claim is won (1 row updated)', async () => {
+      initHeartbeatService({ enableLocalCron: false });
+
+      const reminder = makeDueReminder({ cron_expression: '0 * * * *' });
+      setQueryResult('scheduled_reminders', [reminder]); // select due
+      setQueryResult('scheduled_reminders', [{ id: 'rem-001' }]); // claim: 1 row → win
+      setQueryResult('users', { timezone: null });
+
+      const mockDeliver = vi.fn().mockResolvedValue(true);
+      const stats = await processHeartbeat(mockDeliver);
+
+      expect(mockDeliver).toHaveBeenCalledTimes(1);
+      expect(stats.delivered).toBe(1);
+      expect(stats.skipped).toBe(0);
+    });
+
+    it('should NOT deliver when the CAS claim is lost (0 rows updated)', async () => {
+      initHeartbeatService({ enableLocalCron: false });
+
+      const reminder = makeDueReminder({ cron_expression: '0 * * * *' });
+      setQueryResult('scheduled_reminders', [reminder]); // select due
+      setQueryResult('scheduled_reminders', []); // claim: 0 rows → another instance won
+      setQueryResult('users', { timezone: null });
+
+      const mockDeliver = vi.fn().mockResolvedValue(true);
+      const stats = await processHeartbeat(mockDeliver);
+
+      // The whole point: a concurrent incarnation already claimed this beat,
+      // so this process must NOT deliver a duplicate.
+      expect(mockDeliver).not.toHaveBeenCalled();
+      expect(stats.delivered).toBe(0);
+      expect(stats.skipped).toBe(1);
+    });
+
+    it('should guard the CAS on the fetched next_run_at (optimistic lock)', async () => {
+      initHeartbeatService({ enableLocalCron: false });
+
+      const fetchedNextRun = new Date(Date.now() - 60_000).toISOString();
+      const reminder = makeDueReminder({
+        cron_expression: '0 * * * *',
+        next_run_at: fetchedNextRun,
+      });
+      setQueryResult('scheduled_reminders', [reminder]); // select due
+      setQueryResult('scheduled_reminders', [{ id: 'rem-001' }]); // claim win
+      setQueryResult('users', { timezone: null });
+
+      const mockDeliver = vi.fn().mockResolvedValue(true);
+      await processHeartbeat(mockDeliver);
+
+      // The claim UPDATE must be scoped by BOTH id and the exact next_run_at we
+      // read — that equality guard is what fails the update for a stale loser.
+      const builder = tableBuilders.get('scheduled_reminders')!;
+      const eqCalls = (builder.eq as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0]);
+      expect(eqCalls).toContain('id');
+      expect(eqCalls).toContain('next_run_at');
+
+      const eqNextRunCall = (builder.eq as ReturnType<typeof vi.fn>).mock.calls.find(
+        (c) => c[0] === 'next_run_at'
+      );
+      expect(eqNextRunCall?.[1]).toBe(fetchedNextRun);
+    });
+
+    // Regression for Lumen's PR #437 review: a COMPLETING claim (one-time or
+    // final max_runs) sets status='completed' but leaves next_run_at unchanged.
+    // Without a status guard, a racing loser still matches id + next_run_at and
+    // delivers a duplicate. The claim must also guard status='active'.
+    it('should guard the CAS on status=active so completing claims are race-safe', async () => {
+      initHeartbeatService({ enableLocalCron: false });
+
+      // One-time reminder: no cron_expression → isCompleted → status='completed'.
+      const reminder = makeDueReminder({ cron_expression: null });
+      setQueryResult('scheduled_reminders', [reminder]); // select due
+      setQueryResult('scheduled_reminders', [{ id: 'rem-001' }]); // claim win
+
+      const mockDeliver = vi.fn().mockResolvedValue(true);
+      await processHeartbeat(mockDeliver);
+
+      const builder = tableBuilders.get('scheduled_reminders')!;
+      const eqCalls = (builder.eq as ReturnType<typeof vi.fn>).mock.calls;
+      const statusEq = eqCalls.find((c) => c[0] === 'status');
+      expect(statusEq?.[1]).toBe('active');
+
+      // The winning update marks the one-time reminder completed.
+      const updateArgs = (builder.update as ReturnType<typeof vi.fn>).mock.calls[0][0] as Record<
+        string,
+        unknown
+      >;
+      expect(updateArgs.status).toBe('completed');
+      expect(updateArgs.next_run_at).toBeUndefined(); // unchanged — hence the status guard
+    });
+
+    it('should NOT deliver a completing reminder when the status-guarded claim loses', async () => {
+      initHeartbeatService({ enableLocalCron: false });
+
+      // Final max_runs run → isCompleted. A concurrent winner already flipped
+      // status→completed, so this claim matches 0 rows (status no longer active).
+      const reminder = makeDueReminder({ cron_expression: '0 * * * *', run_count: 4, max_runs: 5 });
+      setQueryResult('scheduled_reminders', [reminder]); // select due
+      setQueryResult('scheduled_reminders', []); // claim: 0 rows → lost to a concurrent completer
+
+      const mockDeliver = vi.fn().mockResolvedValue(true);
+      const stats = await processHeartbeat(mockDeliver);
+
+      expect(mockDeliver).not.toHaveBeenCalled();
+      expect(stats.delivered).toBe(0);
+      expect(stats.skipped).toBe(1);
     });
   });
 });
