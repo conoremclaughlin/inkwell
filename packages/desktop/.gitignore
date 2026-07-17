@@ -1,9 +1,2 @@
-# Rust build output
-src-tauri/target/
-
-# Tauri generated schemas
-src-tauri/gen/
-
-# The root .gitignore excludes *.png globally; re-include the app icons.
+# The root .gitignore excludes *.png globally; re-include the app icon.
 !assets/icon-source.png
-!src-tauri/icons/*.png
