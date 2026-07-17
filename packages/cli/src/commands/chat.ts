@@ -1123,6 +1123,29 @@ function stripLocalToolBlocks(responseText: string): string {
   return responseText.replace(/```ink-tool[\s\S]*?```/gi, '').trim();
 }
 
+/**
+ * True when a signal_status tool result reports a TERMINAL status
+ * (completed or blocked) — the agent explicitly ending its turn.
+ *
+ * The local-tool loop re-invokes the backend as long as any tool executed, and
+ * signal_status counts as an executed tool. Without treating a terminal signal
+ * as a stop condition, a single turn keeps re-invoking the backend up to the
+ * iteration cap; the agent, re-prompted to "continue", just re-signals
+ * completion each round — the multiplied signal_status calls and duplicate
+ * backend/Claude sessions seen per heartbeat. 'continuing' is NOT terminal: the
+ * agent is asking for another round, so the loop should proceed.
+ */
+export function isTerminalSignalToolResult(result: unknown): boolean {
+  const text = (result as { content?: Array<{ text?: string }> } | undefined)?.content?.[0]?.text;
+  if (!text) return false;
+  try {
+    const status = (JSON.parse(text)?.signal as { status?: string } | undefined)?.status;
+    return status === 'completed' || status === 'blocked';
+  } catch {
+    return false;
+  }
+}
+
 function isAbortError(error: unknown): boolean {
   if (!error || typeof error !== 'object') return false;
   const code = (error as { code?: string }).code;
@@ -4321,8 +4344,18 @@ export async function runChat(options: ChatOptions): Promise<void> {
       const hasExecutedTools = iterationResults.some(
         (r) => r.status === 'executed' || r.status === 'approved'
       );
-      if (!hasExecutedTools || toolLoopIteration >= MAX_TOOL_LOOP_ITERATIONS) {
-        if (toolLoopIteration >= MAX_TOOL_LOOP_ITERATIONS) {
+      // A terminal signal_status (completed/blocked) ends the turn immediately —
+      // the agent said it's done. Without this the loop keeps re-invoking the
+      // backend (signal_status counts as an executed tool), and each re-invoke
+      // is a fresh backend/Claude session in which the re-prompted agent just
+      // re-signals completion — the 4x signal_status + duplicate sessions per
+      // heartbeat. This must be checked BEFORE hasExecutedTools so a turn that
+      // both did work and signaled done still stops here.
+      const signaledDone = iterationResults.some(
+        (r) => r.tool === 'signal_status' && isTerminalSignalToolResult(r.result)
+      );
+      if (signaledDone || !hasExecutedTools || toolLoopIteration >= MAX_TOOL_LOOP_ITERATIONS) {
+        if (!signaledDone && toolLoopIteration >= MAX_TOOL_LOOP_ITERATIONS) {
           printLine(
             chalk.dim(`(tool loop limit reached — ${MAX_TOOL_LOOP_ITERATIONS} iterations)`)
           );
