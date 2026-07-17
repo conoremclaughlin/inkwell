@@ -114,7 +114,29 @@ function createWindow() {
   });
 
   // Keep navigation inside the app; external links go to the system browser.
-  window.webContents.setWindowOpenHandler(({ url }) => {
+  // Exception: in-app popup flows must open as real Electron windows. The
+  // Connected Accounts OAuth flow opens the provider's auth URL in a named
+  // popup ('oauth-popup'/'oauth-upgrade-popup', width/height features); the
+  // provider redirects back to the app-origin callback, which reports the
+  // result via window.opener.postMessage — so the popup needs a non-null
+  // window.open return and an intact opener. Plain target=_blank links
+  // (frameName '_blank', no size features) still go to the system browser.
+  window.webContents.setWindowOpenHandler(({ url, frameName, features }) => {
+    const isPopupFlow =
+      (frameName && frameName !== '_blank') || /(^|,)\s*width=/.test(features ?? '');
+    if (isPopupFlow || isAppUrl(url)) {
+      return {
+        action: 'allow',
+        overrideBrowserWindowOptions: {
+          autoHideMenuBar: true,
+          webPreferences: {
+            partition: 'persist:inkwell',
+            contextIsolation: true,
+            nodeIntegration: false,
+          },
+        },
+      };
+    }
     void shell.openExternal(url);
     return { action: 'deny' };
   });
