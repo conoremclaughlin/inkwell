@@ -2917,3 +2917,110 @@ describe('handleListTaskGroupComments', () => {
     expect(data.error).toBe('User not found');
   });
 });
+
+// =====================================================
+// handleUpdateTaskGroup — project re-home
+// =====================================================
+
+describe('handleUpdateTaskGroup — project re-home', () => {
+  let dc: ReturnType<typeof createMockDataComposer>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    dc = createMockDataComposer();
+    resolveUserMock.mockResolvedValue({
+      user: { id: 'user-123' } as any,
+      resolvedBy: 'userId',
+    });
+    dc.repositories.taskGroups.findById.mockResolvedValue({
+      id: 'group-1',
+      user_id: 'user-123',
+      metadata: {},
+    } as any);
+    dc.repositories.taskGroups.update.mockImplementation((_id: string, input: any) =>
+      Promise.resolve({ id: 'group-1', project_id: input.project_id ?? null } as any)
+    );
+  });
+
+  it('re-homes a group under an owned project (validates + passes project_id)', async () => {
+    dc.repositories.projects.findById.mockResolvedValue({
+      id: 'proj-2',
+      user_id: 'user-123',
+      name: 'inkread',
+    } as any);
+
+    const response = await handleUpdateTaskGroup(
+      { userId: 'user-123', groupId: 'group-1', projectId: 'proj-2' } as any,
+      dc as any
+    );
+
+    const data = parseResponse(response);
+    expect(response.isError).toBeFalsy();
+    expect(dc.repositories.projects.findById).toHaveBeenCalledWith('proj-2');
+    expect(dc.repositories.taskGroups.update).toHaveBeenCalledWith(
+      'group-1',
+      expect.objectContaining({ project_id: 'proj-2' })
+    );
+    expect(data.group.projectId).toBe('proj-2');
+  });
+
+  it('rejects a project owned by a different user (no write)', async () => {
+    dc.repositories.projects.findById.mockResolvedValue({
+      id: 'proj-x',
+      user_id: 'someone-else',
+      name: 'theirs',
+    } as any);
+
+    const response = await handleUpdateTaskGroup(
+      { userId: 'user-123', groupId: 'group-1', projectId: 'proj-x' } as any,
+      dc as any
+    );
+
+    const data = parseResponse(response);
+    expect(response.isError).toBe(true);
+    expect(data.error).toBe('Project does not belong to this user');
+    expect(dc.repositories.taskGroups.update).not.toHaveBeenCalled();
+  });
+
+  it('rejects a non-existent project (no write)', async () => {
+    dc.repositories.projects.findById.mockResolvedValue(null);
+
+    const response = await handleUpdateTaskGroup(
+      { userId: 'user-123', groupId: 'group-1', projectId: 'proj-missing' } as any,
+      dc as any
+    );
+
+    const data = parseResponse(response);
+    expect(response.isError).toBe(true);
+    expect(data.error).toBe('Project not found');
+    expect(dc.repositories.taskGroups.update).not.toHaveBeenCalled();
+  });
+
+  it('detaches with projectId: null (passes null, no ownership lookup)', async () => {
+    const response = await handleUpdateTaskGroup(
+      { userId: 'user-123', groupId: 'group-1', projectId: null } as any,
+      dc as any
+    );
+
+    expect(response.isError).toBeFalsy();
+    expect(dc.repositories.projects.findById).not.toHaveBeenCalled();
+    expect(dc.repositories.taskGroups.update).toHaveBeenCalledWith(
+      'group-1',
+      expect.objectContaining({ project_id: null })
+    );
+  });
+
+  it('leaves project unchanged when projectId is omitted (undefined, no lookup)', async () => {
+    const response = await handleUpdateTaskGroup(
+      { userId: 'user-123', groupId: 'group-1', title: 'renamed' } as any,
+      dc as any
+    );
+
+    expect(response.isError).toBeFalsy();
+    expect(dc.repositories.projects.findById).not.toHaveBeenCalled();
+    expect(dc.repositories.taskGroups.update).toHaveBeenCalledWith(
+      'group-1',
+      expect.objectContaining({ project_id: undefined })
+    );
+  });
+});
