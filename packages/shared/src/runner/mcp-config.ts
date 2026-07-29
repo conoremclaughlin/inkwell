@@ -87,9 +87,10 @@ export function injectSessionHeaders(
     return { mcpConfigPath, cleanup: () => {}, modified: false };
   }
 
-  // Find the server entry — prefer 'inkwell', fall back to 'pcp' for backward compat
-  const serverKey = config.mcpServers.inkwell ? 'inkwell' : config.mcpServers.pcp ? 'pcp' : null;
-  if (!serverKey) {
+  // Session headers are injected only into the canonical 'inkwell' server. The
+  // legacy 'pcp' server name is retired — no code should create or feed it.
+  const serverKey = 'inkwell';
+  if (!config.mcpServers[serverKey]) {
     return { mcpConfigPath, cleanup: () => {}, modified: false };
   }
 
@@ -232,8 +233,6 @@ export function buildSessionEnv(options: {
   }
   if (options.accessToken) {
     env.INK_ACCESS_TOKEN = options.accessToken;
-    // Codex env_http_headers maps env var name → full header value
-    env.INK_AUTH_BEARER = `Bearer ${options.accessToken}`;
   }
 
   // Consolidated context token (new — Phase 1)

@@ -483,7 +483,7 @@ describe('backend adapters session resume wiring', () => {
     }
   });
 
-  it('codex adapter injects x-ink-context and Authorization env_http_headers', () => {
+  it('codex adapter injects x-ink-context and a static bearer (not Authorization OAuth)', () => {
     const adapter = new CodexAdapter();
     const prepared = adapter.prepare({
       agentId: 'lumen',
@@ -498,9 +498,16 @@ describe('backend adapters session resume wiring', () => {
       expect(contextArg).toBeDefined();
       expect(contextArg).toContain('INK_CONTEXT');
 
-      const authArg = prepared.args.find((a) => a.includes('Authorization'));
-      expect(authArg).toBeDefined();
-      expect(authArg).toContain('INK_AUTH_BEARER');
+      // Auth goes through codex's static-bearer mechanism, which also suppresses
+      // codex's own managed OAuth refresh for the inkwell server.
+      const bearerArg = prepared.args.find((a) => a.includes('bearer_token_env_var'));
+      expect(bearerArg).toBeDefined();
+      expect(bearerArg).toContain('INK_ACCESS_TOKEN');
+
+      // The old Authorization env_http_header must NOT be present — it would
+      // leave codex running its independent (expiry-prone) OAuth dance.
+      const authHeaderArg = prepared.args.find((a) => a.includes('env_http_headers.Authorization'));
+      expect(authHeaderArg).toBeUndefined();
     } finally {
       prepared.cleanup();
     }
