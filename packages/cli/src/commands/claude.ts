@@ -1684,7 +1684,14 @@ ORDER BY updated_at DESC
 LIMIT 200;
 `;
 
-  const result = spawnSync('sqlite3', ['-tabs', codexStateDbPath, query], { encoding: 'utf-8' });
+  // maxBuffer: the default (~1MB) overflows with ENOBUFS on real codex state
+  // DBs — 200 rows each carrying a (truncated but still multi-KB)
+  // first_user_message can exceed it, which silently drops session listing to
+  // the slower jsonl fallback and adds retry latency to every codex startup.
+  const result = spawnSync('sqlite3', ['-tabs', codexStateDbPath, query], {
+    encoding: 'utf-8',
+    maxBuffer: 64 * 1024 * 1024,
+  });
   if (result.error || result.status !== 0 || !result.stdout) {
     sbDebugLog('backend', 'codex_local_sessions_query_failed', {
       cwd: normalizedCwd,
@@ -3562,10 +3569,9 @@ export async function runClaude(
     env: {
       ...process.env,
       ...authEnv,
-      // INK_AUTH_BEARER: full "Bearer <token>" for Codex env_http_headers
-      ...(authEnv.INK_ACCESS_TOKEN
-        ? { INK_AUTH_BEARER: `Bearer ${authEnv.INK_ACCESS_TOKEN}` }
-        : {}),
+      // authEnv provides INK_ACCESS_TOKEN (raw). Codex references it by name via
+      // bearer_token_env_var and prepends "Bearer " itself, so no pre-formatted
+      // Authorization value is needed here.
       ...prepared.env,
       ...(runtimeLinkId ? { INK_RUNTIME_LINK_ID: runtimeLinkId } : {}),
     },
