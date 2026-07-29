@@ -19,10 +19,13 @@ import type { BackendAdapter, BackendConfig, PreparedBackend } from './types.js'
  *
  * x-ink-context is the consolidated token (preferred). Individual headers
  * are kept for backward compat during migration.
+ *
+ * Authorization is intentionally NOT here — it goes through codex's
+ * `bearer_token_env_var` mechanism instead (see prepare()), which also stops
+ * codex from running its own managed OAuth for the server.
  */
 const PCP_ENV_HEADERS: Array<{ header: string; envVar: string }> = [
   { header: 'x-ink-context', envVar: 'INK_CONTEXT' },
-  { header: 'Authorization', envVar: 'INK_AUTH_BEARER' },
   { header: 'x-ink-agent-id', envVar: 'AGENT_ID' },
   { header: 'x-ink-session-id', envVar: 'INK_SESSION_ID' },
   { header: 'x-ink-studio-id', envVar: 'INK_STUDIO_ID' },
@@ -56,6 +59,16 @@ export class CodexAdapter implements BackendAdapter {
     for (const { header, envVar } of PCP_ENV_HEADERS) {
       args.push('-c', `mcp_servers.inkwell.env_http_headers.${header}="${envVar}"`);
     }
+
+    // Auth: use codex's static-bearer mechanism, NOT an Authorization
+    // env_http_header. `bearer_token_env_var` makes codex authenticate with the
+    // env var's raw token AND skip its own managed OAuth discovery/refresh for
+    // this server — ink already owns a valid token. Without this, codex tries to
+    // refresh its independently-cached (keychain) OAuth credential on startup;
+    // once that refresh token expires the server returns `invalid_grant` and
+    // codex aborts MCP init, even though ink injected a perfectly good bearer.
+    // Point at INK_ACCESS_TOKEN (raw) — codex prepends "Bearer " itself.
+    args.push('-c', `mcp_servers.inkwell.bearer_token_env_var="INK_ACCESS_TOKEN"`);
 
     // Model (only if explicitly specified by user)
     if (config.model) {
@@ -102,9 +115,8 @@ export class CodexAdapter implements BackendAdapter {
       runtime: 'codex',
     });
 
-    // INK_AUTH_BEARER is constructed at the spawn site from INK_ACCESS_TOKEN
-    // (set via authEnv). The adapter declares the header mapping; the spawn
-    // site provides the env var value.
+    // INK_ACCESS_TOKEN (raw token) is provided at the spawn site via authEnv;
+    // the adapter references it by name through bearer_token_env_var above.
 
     return {
       binary: this.binary,
