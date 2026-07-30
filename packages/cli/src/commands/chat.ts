@@ -13,6 +13,7 @@ import {
   watchFile,
 } from 'fs';
 import { isAbsolute, join } from 'path';
+import { randomUUID } from 'crypto';
 import {
   readIdentityJson,
   resolveAgentId,
@@ -3862,6 +3863,19 @@ export async function runChat(options: ChatOptions): Promise<void> {
     }
 
     let prompt = buildPromptEnvelope(agentId, runtime, ledger, raw);
+
+    // Within-turn backend session reuse (claude only). Seed ONE backend-native
+    // session id for this turn: the first spawn creates it (--session-id) with
+    // the full envelope, and every tool-loop continuation resumes it (--resume)
+    // sending only the tool-results delta. This collapses a turn's N tool
+    // round-trips into a single coherent Claude session — the jsonl becomes the
+    // real thread (debuggable) instead of N fragments — and stops re-piping the
+    // whole transcript window on every round-trip. Other backends keep the
+    // stateless full-envelope-per-spawn behavior (codex/gemini can't seed a
+    // session id up front the way claude's --session-id allows).
+    const canReuseBackendSession = runtime.backend === 'claude';
+    const backendSeedId = canReuseBackendSession ? randomUUID() : undefined;
+
     const turnStartedAt = Date.now();
     const backendGate = toolPolicy.getBackendToolGate();
     const passthroughPlan = buildBackendToolPassthrough(
@@ -3952,6 +3966,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
       passthroughArgs,
       timeoutMs: runtime.backendTurnTimeoutMs,
       attachmentDirs: sessionAttachmentDirs.length > 0 ? sessionAttachmentDirs : undefined,
+      // Seed the turn's backend session so tool-loop continuations can resume it.
+      ...(backendSeedId ? { backendSessionSeedId: backendSeedId } : {}),
     });
     currentTurnAbort = turn.abort;
     inkRepl?.setAbortHandler(abortCurrentTurn);
@@ -4370,12 +4386,14 @@ export async function runChat(options: ChatOptions): Promise<void> {
           return `Tool ${r.tool} (${r.status}): ${resultStr}`;
         })
         .join('\n\n');
-      const continuationPrompt = buildPromptEnvelope(
-        agentId,
-        runtime,
-        ledger,
-        `[Tool results from previous turn]\n${toolResultsSummary}\n\nContinue your response based on these tool results. If you need more tools, emit ink-tool blocks. Otherwise, provide your final answer.`
-      );
+      const continuationBody = `[Tool results from previous turn]\n${toolResultsSummary}\n\nContinue your response based on these tool results. If you need more tools, emit ink-tool blocks. Otherwise, provide your final answer.`;
+      // When resuming the same Claude session, the model already holds the full
+      // transcript + tool instructions from the seeded turn — send ONLY the
+      // delta. Otherwise (stateless backends) re-pack the full envelope so the
+      // fresh spawn has the context it needs.
+      const continuationPrompt = canReuseBackendSession
+        ? continuationBody
+        : buildPromptEnvelope(agentId, runtime, ledger, continuationBody);
 
       // Show continuation indicator naming the tools that just ran — this is
       // the SB working, not a system message
@@ -4405,6 +4423,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
         passthroughArgs,
         timeoutMs: runtime.backendTurnTimeoutMs,
         attachmentDirs: sessionAttachmentDirs.length > 0 ? sessionAttachmentDirs : undefined,
+        // Resume the turn's seeded backend session so this round-trip appends to
+        // the same Claude thread instead of re-piping the whole window.
+        ...(backendSeedId ? { backendSessionId: backendSeedId } : {}),
       });
       currentTurnAbort = contTurn.abort;
       inkRepl?.setAbortHandler(abortCurrentTurn);

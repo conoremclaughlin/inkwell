@@ -16,6 +16,17 @@ export interface BackendRunRequest {
    * view attached files natively.
    */
   attachmentDirs?: string[];
+  /**
+   * Resume an existing backend-native session (claude: --resume). When set,
+   * only the delta prompt need be sent — the backend already holds the thread.
+   */
+  backendSessionId?: string;
+  /**
+   * Seed a NEW backend-native session with this id on a fresh spawn
+   * (claude: --session-id). Pass this on the first spawn of a turn, then pass
+   * the same id as `backendSessionId` on subsequent spawns to resume it.
+   */
+  backendSessionSeedId?: string;
 }
 
 export interface BackendRunResult {
@@ -43,6 +54,8 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
     promptParts,
     passthroughArgs: request.passthroughArgs || [],
     attachmentDirs: request.attachmentDirs,
+    backendSessionId: request.backendSessionId,
+    backendSessionSeedId: request.backendSessionSeedId,
   });
 
   const command = `${prepared.binary} ${prepared.args.join(' ')}`;
