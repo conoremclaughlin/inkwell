@@ -2193,6 +2193,57 @@ function formatBootstrapContext(result: Record<string, unknown>, agentId: string
   return sections.join('\n\n');
 }
 
+/**
+ * Detect claude's "resume failed because the session no longer exists locally"
+ * signal from stderr. Mirrors the same check in the server runners
+ * (ink-runner.ts / claude-runner.ts) so the CLI recovers the same way.
+ */
+export function isResumeFailedNoSession(stderr: string): boolean {
+  const lower = (stderr || '').toLowerCase();
+  return lower.includes('session not found') || lower.includes('no such session');
+}
+
+/**
+ * Recover the live provider-native session id from a reattached transcript so a
+ * fresh process (the next server heartbeat, or a reattach) resumes the SAME
+ * native session instead of fragmenting into a new jsonl. Returns the id of the
+ * last `backend_session` marker. A `compaction` marker clears the candidate:
+ * after ink compacts we deliberately roll to a fresh provider session, so a
+ * pre-compaction id must never be resumed (it would drag the pre-compaction
+ * window back in).
+ */
+export function findLastBackendSessionId(transcriptPath: string): string | undefined {
+  if (!transcriptPath || !existsSync(transcriptPath)) return undefined;
+  let content: string;
+  try {
+    content = readFileSync(transcriptPath, 'utf-8');
+  } catch {
+    return undefined;
+  }
+  let found: string | undefined;
+  for (const line of content.split('\n')) {
+    if (!line.trim()) continue;
+    let event: { type?: unknown; id?: unknown };
+    try {
+      event = JSON.parse(line) as { type?: unknown; id?: unknown };
+    } catch {
+      continue;
+    }
+    if (event.type === 'backend_session' && typeof event.id === 'string') {
+      found = event.id;
+    } else if (
+      event.type === 'compaction' ||
+      event.type === 'context_evict' ||
+      event.type === 'context_trim'
+    ) {
+      // A context-boundary mutation rolled the provider session. Abandon any
+      // prior id — a backend_session marker after this point re-establishes it.
+      found = undefined;
+    }
+  }
+  return found;
+}
+
 function buildPromptEnvelope(
   agentId: string,
   runtime: ChatRuntime,
@@ -2246,6 +2297,39 @@ function buildPromptEnvelope(
   ]
     .filter(Boolean)
     .join('\n');
+}
+
+/**
+ * A stable signature of everything buildPromptEnvelope renders that does NOT
+ * change per turn — the static "shape" a seeded provider session already holds:
+ * system framing, tool instructions (from tool mode/routing), strict flag,
+ * skills, thread key, and identity context. Excludes the transcript/recall/raw,
+ * which ARE the intended per-turn delta. When this drifts mid-session — /backend,
+ * /model, /tool-routing, /skill-use, /skill-clear, /refresh, profile changes —
+ * the resumed native session would be stale (e.g. seeded with backend
+ * tool-routing, then /tool-routing local leaves it without ink-tool
+ * instructions), so runUserTurn invalidates and reseeds. Subsumes the backend
+ * check (backend is part of the shape). Hashed so the stored key stays small.
+ * Keep this in sync with buildPromptEnvelope's static (non-transcript) fields.
+ */
+export function envelopeShapeKey(runtime: ChatRuntime): string {
+  const shape = [
+    runtime.backend,
+    runtime.model ?? '',
+    runtime.toolMode,
+    runtime.toolRouting,
+    runtime.strictTools ? '1' : '0',
+    runtime.threadKey ?? '',
+    runtime.activeSkills.map((s) => s.name).join(','),
+    runtime.bootstrapContext ?? '',
+  ].join('');
+  // djb2 — cheap, kept in int32 each step; collision-resistant enough to detect
+  // config drift (we only need change-detection, not cryptographic strength).
+  let hash = 5381;
+  for (let i = 0; i < shape.length; i++) {
+    hash = ((hash << 5) + hash + shape.charCodeAt(i)) | 0;
+  }
+  return (hash >>> 0).toString(36);
 }
 
 export async function runChat(options: ChatOptions): Promise<void> {
@@ -2807,9 +2891,36 @@ export async function runChat(options: ChatOptions): Promise<void> {
       ? findLatestTranscriptForSession(runtime.sessionId)
       : undefined;
   runtime.transcriptPath = existingTranscript || ensureRuntimeTranscriptPath(runtime.sessionId);
+
+  // ── Provider session reuse (claude only) — Stage 2 ──
+  // One provider-native session id per ink session, reused across turns AND
+  // across processes. Seeded on the first backend spawn, resumed thereafter,
+  // and reset at every ink-owned context-boundary change (compaction, trim,
+  // eviction). Recovered from the reattached transcript below so a fresh
+  // process (e.g. the next Myra heartbeat, which reattaches the same pcp
+  // session) RESUMES the same native session — the jsonl accumulates one
+  // coherent thread instead of fragmenting into a new file per message. ink
+  // owns compaction; the provider never runs its own.
+  let activeBackendSessionId: string | undefined;
+  // Signature of the envelope's static shape at the time the session was seeded
+  // (backend, model, tool mode/routing, strict flag, skills, thread key,
+  // identity context). When it drifts mid-session — /backend, /model,
+  // /tool-routing, /skill-use, /skill-clear, /refresh, profile changes — the
+  // resumed native session would be stale, so runUserTurn invalidates and
+  // reseeds. Subsumes the backend check (backend is part of the shape).
+  let activeBackendSessionShape: string | undefined;
+
   let historyHydration: HistoryHydrationResult | null = null;
   if (attachedToExistingSession && existingTranscript) {
     const hydrated = hydrateLedgerFromTranscript(ledger, existingTranscript);
+    // Resume the provider session the prior process left live (delta only),
+    // unless a compaction/eviction rolled it — then the next turn seeds fresh.
+    if (runtime.backend === 'claude') {
+      // Recover the id only; the shape baseline is adopted on the first turn
+      // below, AFTER all startup mutations, so a recovered session resumes
+      // rather than spuriously reseeding on a startup-timing shape difference.
+      activeBackendSessionId = findLastBackendSessionId(existingTranscript);
+    }
     // Continue the event-id sequence from where the file left off
     seedTranscriptEidCounter(existingTranscript, hydrated.maxEid);
     sessionEvictedEntries.push(...hydrated.evictedEntries);
@@ -3188,6 +3299,14 @@ export async function runChat(options: ChatOptions): Promise<void> {
     if (sessionEvictedEntries.length > EVICTED_DISPLAY_MAX) {
       sessionEvictedEntries.splice(0, sessionEvictedEntries.length - EVICTED_DISPLAY_MAX);
     }
+    // A context-boundary mutation (SB evict_context, user /evict, system trim —
+    // all route through this single writer) just removed entries from ink's
+    // window. Roll the provider session so the next turn re-seeds from the
+    // post-eviction ledger; otherwise a resumed native session would still hold
+    // the evicted content. findLastBackendSessionId clears cross-process
+    // recovery on the matching markers.
+    activeBackendSessionId = undefined;
+    activeBackendSessionShape = undefined;
   };
 
   const trimContextToPercent = async (
@@ -3332,6 +3451,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
       }
     } finally {
       compactionInFlight = false;
+      // ink just rolled the ledger — roll the provider session too so the next
+      // turn seeds a fresh native session with the summary (we compact before
+      // the provider ever would). No-op when nothing was compacted: the early
+      // returns above never reach this block. Unconditional: for non-claude
+      // these are already undefined.
+      activeBackendSessionId = undefined;
+      activeBackendSessionShape = undefined;
     }
   };
 
@@ -3862,19 +3988,64 @@ export async function runChat(options: ChatOptions): Promise<void> {
       }
     }
 
-    let prompt = buildPromptEnvelope(agentId, runtime, ledger, raw);
-
-    // Within-turn backend session reuse (claude only). Seed ONE backend-native
-    // session id for this turn: the first spawn creates it (--session-id) with
-    // the full envelope, and every tool-loop continuation resumes it (--resume)
-    // sending only the tool-results delta. This collapses a turn's N tool
-    // round-trips into a single coherent Claude session — the jsonl becomes the
-    // real thread (debuggable) instead of N fragments — and stops re-piping the
-    // whole transcript window on every round-trip. Other backends keep the
-    // stateless full-envelope-per-spawn behavior (codex/gemini can't seed a
-    // session id up front the way claude's --session-id allows).
+    // Provider session seed/resume decision (claude only). The first backend
+    // spawn of the session SEEDS a fresh provider session (--session-id) with
+    // the FULL envelope; every later turn RESUMES it (--resume) sending only
+    // this turn's delta — the new user message plus any passive-recall surfaced
+    // this turn — because the provider already holds the system prompt, tools,
+    // bootstrap, and prior turns. The tool-loop continuations below always
+    // resume the same session. This collapses the whole conversation into ONE
+    // coherent Claude jsonl and stops re-piping the transcript window on every
+    // round-trip. Stateless backends (codex/gemini) always get the full
+    // envelope.
+    //
+    // `canReuseBackendSession` is computed PER-TURN against the current backend
+    // so a mid-session /backend switch is honored (not captured once at
+    // startup). And a live session is invalidated when the envelope's static
+    // SHAPE has drifted since it was seeded — /backend, /model, /tool-routing,
+    // /skill-use, /skill-clear, /refresh, profile changes. Otherwise the resumed
+    // native session would be stale (e.g. seeded with backend tool-routing, then
+    // /tool-routing local leaves it without ink-tool instructions while native
+    // tools are disabled). On drift we reseed fresh with the new envelope.
     const canReuseBackendSession = runtime.backend === 'claude';
-    const backendSeedId = canReuseBackendSession ? randomUUID() : undefined;
+    const currentEnvelopeShape = envelopeShapeKey(runtime);
+    if (activeBackendSessionId !== undefined) {
+      if (activeBackendSessionShape === undefined) {
+        // Recovered from a prior process — adopt this turn's shape as the
+        // baseline (no invalidation). Cross-process bootstrap drift is
+        // tolerated; only in-process drift from here triggers a reseed.
+        activeBackendSessionShape = currentEnvelopeShape;
+      } else if (activeBackendSessionShape !== currentEnvelopeShape) {
+        // In-process envelope drift — the resumed native session would be
+        // stale, so invalidate and reseed fresh with the new envelope.
+        activeBackendSessionId = undefined;
+        activeBackendSessionShape = undefined;
+      }
+    }
+    const resumeProviderSession = canReuseBackendSession && activeBackendSessionId !== undefined;
+    let seedProviderSessionId: string | undefined;
+    if (canReuseBackendSession && !resumeProviderSession) {
+      seedProviderSessionId = randomUUID();
+      activeBackendSessionId = seedProviderSessionId;
+      activeBackendSessionShape = currentEnvelopeShape;
+      // Persist the seed so a later process (next heartbeat / reattach) recovers
+      // and RESUMES this native session instead of fragmenting into a new jsonl.
+      appendTranscript(runtime.transcriptPath, {
+        type: 'backend_session',
+        id: seedProviderSessionId,
+      });
+    }
+
+    let prompt: string;
+    if (resumeProviderSession) {
+      const recallDelta = promptHookResult.injectedEntries
+        .filter((e) => e.source === 'passive-recall')
+        .map((e) => e.content)
+        .join('\n\n');
+      prompt = recallDelta ? `${recallDelta}\n\n${raw}` : raw;
+    } else {
+      prompt = buildPromptEnvelope(agentId, runtime, ledger, raw);
+    }
 
     const turnStartedAt = Date.now();
     const backendGate = toolPolicy.getBackendToolGate();
@@ -3966,8 +4137,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
       passthroughArgs,
       timeoutMs: runtime.backendTurnTimeoutMs,
       attachmentDirs: sessionAttachmentDirs.length > 0 ? sessionAttachmentDirs : undefined,
-      // Seed the turn's backend session so tool-loop continuations can resume it.
-      ...(backendSeedId ? { backendSessionSeedId: backendSeedId } : {}),
+      // Seed a fresh provider session (first spawn) OR resume the live one
+      // (subsequent turns). Tool-loop continuations below always resume it.
+      ...(seedProviderSessionId ? { backendSessionSeedId: seedProviderSessionId } : {}),
+      ...(resumeProviderSession && activeBackendSessionId
+        ? { backendSessionId: activeBackendSessionId }
+        : {}),
     });
     currentTurnAbort = turn.abort;
     inkRepl?.setAbortHandler(abortCurrentTurn);
@@ -3979,6 +4154,44 @@ export async function runChat(options: ChatOptions): Promise<void> {
       turnDurationSeconds = Math.max(0, Math.round((Date.now() - turnStartedAt) / 1000));
       stopWaiting();
     });
+    // If a resumed turn failed because the provider session vanished (jsonl
+    // cleaned up / different machine), drop the live id so the NEXT turn seeds a
+    // fresh one. Within a single interactive process this is near-impossible (we
+    // seeded the id ourselves); the full mid-turn re-seed lands with the
+    // server/cross-process path.
+    if (resumeProviderSession && !runResult.success && isResumeFailedNoSession(runResult.stderr)) {
+      // The resumed provider session no longer exists locally (jsonl pruned /
+      // different machine). Mint a fresh native session, re-send the FULL
+      // envelope (the ledger already holds the history), and retry once so a
+      // server heartbeat still produces output instead of dying on a stale id.
+      // Mirrors ClaudeRunner/InkRunner's resume-not-found recovery.
+      const reseedId = randomUUID();
+      activeBackendSessionId = reseedId;
+      activeBackendSessionShape = currentEnvelopeShape;
+      appendTranscript(runtime.transcriptPath, { type: 'backend_session', id: reseedId });
+      printEvent(
+        chalk.yellow('  ⛁ provider session not found on resume — re-seeding a fresh native session')
+      );
+      process.on('SIGINT', onSigintDuringTurn);
+      const reseedTurn = startBackendTurn({
+        backend: runtime.backend,
+        agentId,
+        model: runtime.model,
+        prompt: buildPromptEnvelope(agentId, runtime, ledger, raw),
+        verbose: runtime.verbose,
+        passthroughArgs,
+        timeoutMs: runtime.backendTurnTimeoutMs,
+        attachmentDirs: sessionAttachmentDirs.length > 0 ? sessionAttachmentDirs : undefined,
+        backendSessionSeedId: reseedId,
+      });
+      currentTurnAbort = reseedTurn.abort;
+      inkRepl?.setAbortHandler(abortCurrentTurn);
+      runResult = await reseedTurn.result.finally(() => {
+        currentTurnAbort = null;
+        inkRepl?.setAbortHandler(null);
+        process.off('SIGINT', onSigintDuringTurn);
+      });
+    }
     sbDebugLog(
       'chat',
       'backend_turn_result',
@@ -4391,9 +4604,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
       // transcript + tool instructions from the seeded turn — send ONLY the
       // delta. Otherwise (stateless backends) re-pack the full envelope so the
       // fresh spawn has the context it needs.
-      const continuationPrompt = canReuseBackendSession
-        ? continuationBody
-        : buildPromptEnvelope(agentId, runtime, ledger, continuationBody);
+      const continuationPrompt =
+        canReuseBackendSession && activeBackendSessionId
+          ? continuationBody
+          : buildPromptEnvelope(agentId, runtime, ledger, continuationBody);
 
       // Show continuation indicator naming the tools that just ran — this is
       // the SB working, not a system message
@@ -4423,9 +4637,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
         passthroughArgs,
         timeoutMs: runtime.backendTurnTimeoutMs,
         attachmentDirs: sessionAttachmentDirs.length > 0 ? sessionAttachmentDirs : undefined,
-        // Resume the turn's seeded backend session so this round-trip appends to
-        // the same Claude thread instead of re-piping the whole window.
-        ...(backendSeedId ? { backendSessionId: backendSeedId } : {}),
+        // Resume the live provider session so this round-trip appends to the
+        // same Claude thread instead of re-piping the whole window.
+        ...(activeBackendSessionId ? { backendSessionId: activeBackendSessionId } : {}),
       });
       currentTurnAbort = contTurn.abort;
       inkRepl?.setAbortHandler(abortCurrentTurn);
