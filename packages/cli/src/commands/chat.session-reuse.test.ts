@@ -2,7 +2,7 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { isResumeFailedNoSession, findLastBackendSessionId } from './chat.js';
+import { isResumeFailedNoSession, findLastBackendSessionId, envelopeShapeKey } from './chat.js';
 
 /**
  * Stage 2A — across-turn provider session reuse.
@@ -242,77 +242,145 @@ describe('findLastBackendSessionId (cross-process recovery)', () => {
   });
 });
 
-// Mirrors runUserTurn's backend-ownership check: a live provider session is
-// invalidated when the current backend differs from the one that seeded it, so
-// a /backend switch never resumes a Claude UUID under codex/gemini and never
-// skips intervening turns on claude→other→claude.
-function decideWithBackend(
-  currentBackend: string,
+// Mirrors runUserTurn's envelope-shape check: a live provider session is
+// invalidated when the current envelope shape differs from the one it was
+// seeded with. A /backend switch, /tool-routing, /skill-use/clear, /model,
+// /refresh, or profile change all shift the shape, so a resumed native session
+// is never left stale. `canReuse` (claude-only) gates seeding independently.
+function decideWithShape(
+  canReuse: boolean,
+  currentShape: string,
   activeId: string | undefined,
-  activeOwner: string | undefined,
+  activeShape: string | undefined,
   mintId: () => string
 ): {
   invalidated: boolean;
   resume: boolean;
   seedId: string | undefined;
   nextActiveId: string | undefined;
-  nextOwner: string | undefined;
+  nextShape: string | undefined;
 } {
   let id = activeId;
-  let owner = activeOwner;
+  let shape = activeShape;
   let invalidated = false;
-  if (id !== undefined && owner !== currentBackend) {
-    id = undefined;
-    owner = undefined;
-    invalidated = true;
+  if (id !== undefined) {
+    if (shape === undefined) {
+      shape = currentShape; // recovered from a prior process — adopt baseline
+    } else if (shape !== currentShape) {
+      id = undefined;
+      shape = undefined;
+      invalidated = true;
+    }
   }
-  const canReuse = currentBackend === 'claude';
   const resume = canReuse && id !== undefined;
   let seedId: string | undefined;
   if (canReuse && !resume) {
     seedId = mintId();
     id = seedId;
-    owner = currentBackend;
+    shape = currentShape;
   }
-  return { invalidated, resume, seedId, nextActiveId: id, nextOwner: owner };
+  return { invalidated, resume, seedId, nextActiveId: id, nextShape: shape };
 }
 
-describe('provider session backend-ownership (mid-session /backend switch)', () => {
+describe('provider session envelope-shape invalidation', () => {
   const minter = () => {
     const ids = ['S1', 'S2', 'S3'];
     let i = 0;
     return () => ids[i++]!;
   };
 
-  it('claude→codex invalidates the Claude session and does not resume it', () => {
+  it('/tool-routing drift (same claude backend) reseeds — Lumen P1 concrete case', () => {
     const mint = minter();
-    // Seed on claude.
-    let d = decideWithBackend('claude', undefined, undefined, mint);
+    // Seed with the backend-routing envelope shape.
+    let d = decideWithShape(true, 'shape:backend-routing', undefined, undefined, mint);
     expect(d.seedId).toBe('S1');
-    // Switch to codex: the Claude UUID is invalidated, codex does not reuse.
-    d = decideWithBackend('codex', d.nextActiveId, d.nextOwner, mint);
+    // /tool-routing local changes the rendered tool instructions → new shape.
+    d = decideWithShape(true, 'shape:local-routing', d.nextActiveId, d.nextShape, mint);
     expect(d.invalidated).toBe(true);
     expect(d.resume).toBe(false);
-    expect(d.seedId).toBeUndefined();
-    expect(d.nextActiveId).toBeUndefined();
+    expect(d.seedId).toBe('S2'); // fresh session carries the new envelope
+  });
+
+  it('/skill-use drift reseeds so the new skill instructions are seen', () => {
+    const mint = minter();
+    let d = decideWithShape(true, 'shape:noskills', undefined, undefined, mint); // S1
+    d = decideWithShape(true, 'shape:skill-a', d.nextActiveId, d.nextShape, mint);
+    expect(d.invalidated).toBe(true);
+    expect(d.seedId).toBe('S2');
+  });
+
+  it('/backend claude→codex invalidates and does not resume (codex cannot reuse)', () => {
+    const mint = minter();
+    const d1 = decideWithShape(true, 'shape:claude', undefined, undefined, mint); // S1
+    const d2 = decideWithShape(false, 'shape:codex', d1.nextActiveId, d1.nextShape, mint);
+    expect(d2.invalidated).toBe(true);
+    expect(d2.resume).toBe(false);
+    expect(d2.seedId).toBeUndefined();
+    expect(d2.nextActiveId).toBeUndefined();
   });
 
   it('claude→codex→claude reseeds fresh (never resumes the pre-switch session)', () => {
     const mint = minter();
-    let d = decideWithBackend('claude', undefined, undefined, mint); // S1
-    const onCodex = decideWithBackend('codex', d.nextActiveId, d.nextOwner, mint);
-    d = decideWithBackend('claude', onCodex.nextActiveId, onCodex.nextOwner, mint);
-    expect(d.resume).toBe(false);
-    expect(d.seedId).toBe('S2'); // fresh, not S1 — intervening codex turns aren't in S1
-    expect(d.nextOwner).toBe('claude');
+    const d1 = decideWithShape(true, 'shape:claude', undefined, undefined, mint); // S1
+    const onCodex = decideWithShape(false, 'shape:codex', d1.nextActiveId, d1.nextShape, mint);
+    const d3 = decideWithShape(true, 'shape:claude', onCodex.nextActiveId, onCodex.nextShape, mint);
+    expect(d3.resume).toBe(false);
+    expect(d3.seedId).toBe('S2'); // not S1 — intervening codex turns aren't in it
   });
 
-  it('claude→claude resumes the same session (no spurious invalidation)', () => {
+  it('stable shape resumes the same session (no spurious invalidation)', () => {
     const mint = minter();
-    const d1 = decideWithBackend('claude', undefined, undefined, mint); // S1
-    const d2 = decideWithBackend('claude', d1.nextActiveId, d1.nextOwner, mint);
+    const d1 = decideWithShape(true, 'shape:claude', undefined, undefined, mint); // S1
+    const d2 = decideWithShape(true, 'shape:claude', d1.nextActiveId, d1.nextShape, mint);
     expect(d2.invalidated).toBe(false);
     expect(d2.resume).toBe(true);
     expect(d2.nextActiveId).toBe('S1');
+  });
+
+  it('a recovered session (no baseline shape yet) adopts the shape and resumes', () => {
+    // Cross-process reattach: the id is recovered from the transcript but the
+    // shape baseline is adopted lazily on this first turn — so it resumes
+    // (Myra heartbeat continuity) instead of spuriously reseeding.
+    const mint = minter();
+    const d = decideWithShape(true, 'shape:claude', 'recovered-id', undefined, mint);
+    expect(d.invalidated).toBe(false);
+    expect(d.resume).toBe(true);
+    expect(d.nextActiveId).toBe('recovered-id');
+    expect(d.nextShape).toBe('shape:claude');
+  });
+});
+
+describe('envelopeShapeKey (real function)', () => {
+  type RT = Parameters<typeof envelopeShapeKey>[0];
+  const base = {
+    backend: 'claude',
+    model: 'claude-sonnet-5',
+    toolMode: 'backend',
+    toolRouting: 'local',
+    strictTools: false,
+    threadKey: undefined,
+    activeSkills: [] as Array<{ name: string }>,
+    bootstrapContext: 'ctx',
+  };
+  const key = (over: Partial<typeof base>): string =>
+    envelopeShapeKey({ ...base, ...over } as unknown as RT);
+
+  it('is stable for an identical shape', () => {
+    expect(key({})).toBe(key({}));
+  });
+
+  it('changes when tool routing changes (the concrete stale-tools case)', () => {
+    expect(key({ toolRouting: 'backend' })).not.toBe(key({ toolRouting: 'local' }));
+  });
+
+  it('changes on any envelope-shaping field, so no mutation site can be missed', () => {
+    const b = key({});
+    expect(key({ backend: 'codex' })).not.toBe(b);
+    expect(key({ model: 'other-model' })).not.toBe(b);
+    expect(key({ toolMode: 'off' })).not.toBe(b);
+    expect(key({ strictTools: true })).not.toBe(b);
+    expect(key({ activeSkills: [{ name: 'skill-a' }] })).not.toBe(b);
+    expect(key({ threadKey: 'pr:1' })).not.toBe(b);
+    expect(key({ bootstrapContext: 'different identity context' })).not.toBe(b);
   });
 });

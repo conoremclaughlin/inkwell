@@ -2299,6 +2299,39 @@ function buildPromptEnvelope(
     .join('\n');
 }
 
+/**
+ * A stable signature of everything buildPromptEnvelope renders that does NOT
+ * change per turn — the static "shape" a seeded provider session already holds:
+ * system framing, tool instructions (from tool mode/routing), strict flag,
+ * skills, thread key, and identity context. Excludes the transcript/recall/raw,
+ * which ARE the intended per-turn delta. When this drifts mid-session — /backend,
+ * /model, /tool-routing, /skill-use, /skill-clear, /refresh, profile changes —
+ * the resumed native session would be stale (e.g. seeded with backend
+ * tool-routing, then /tool-routing local leaves it without ink-tool
+ * instructions), so runUserTurn invalidates and reseeds. Subsumes the backend
+ * check (backend is part of the shape). Hashed so the stored key stays small.
+ * Keep this in sync with buildPromptEnvelope's static (non-transcript) fields.
+ */
+export function envelopeShapeKey(runtime: ChatRuntime): string {
+  const shape = [
+    runtime.backend,
+    runtime.model ?? '',
+    runtime.toolMode,
+    runtime.toolRouting,
+    runtime.strictTools ? '1' : '0',
+    runtime.threadKey ?? '',
+    runtime.activeSkills.map((s) => s.name).join(','),
+    runtime.bootstrapContext ?? '',
+  ].join('');
+  // djb2 — cheap, kept in int32 each step; collision-resistant enough to detect
+  // config drift (we only need change-detection, not cryptographic strength).
+  let hash = 5381;
+  for (let i = 0; i < shape.length; i++) {
+    hash = ((hash << 5) + hash + shape.charCodeAt(i)) | 0;
+  }
+  return (hash >>> 0).toString(36);
+}
+
 export async function runChat(options: ChatOptions): Promise<void> {
   const debugFile = initSbDebug({
     enabled: options.sbDebug,
@@ -2869,11 +2902,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // coherent thread instead of fragmenting into a new file per message. ink
   // owns compaction; the provider never runs its own.
   let activeBackendSessionId: string | undefined;
-  // The backend that owns activeBackendSessionId. A Claude session UUID is
-  // meaningless to codex/gemini, so a mid-session /backend switch must
-  // invalidate it (see the per-turn check in runUserTurn). Whether reuse is
-  // active is computed per-turn against the current backend, not captured here.
-  let activeBackendSessionBackend: string | undefined;
+  // Signature of the envelope's static shape at the time the session was seeded
+  // (backend, model, tool mode/routing, strict flag, skills, thread key,
+  // identity context). When it drifts mid-session — /backend, /model,
+  // /tool-routing, /skill-use, /skill-clear, /refresh, profile changes — the
+  // resumed native session would be stale, so runUserTurn invalidates and
+  // reseeds. Subsumes the backend check (backend is part of the shape).
+  let activeBackendSessionShape: string | undefined;
 
   let historyHydration: HistoryHydrationResult | null = null;
   if (attachedToExistingSession && existingTranscript) {
@@ -2881,8 +2916,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // Resume the provider session the prior process left live (delta only),
     // unless a compaction/eviction rolled it — then the next turn seeds fresh.
     if (runtime.backend === 'claude') {
+      // Recover the id only; the shape baseline is adopted on the first turn
+      // below, AFTER all startup mutations, so a recovered session resumes
+      // rather than spuriously reseeding on a startup-timing shape difference.
       activeBackendSessionId = findLastBackendSessionId(existingTranscript);
-      if (activeBackendSessionId) activeBackendSessionBackend = 'claude';
     }
     // Continue the event-id sequence from where the file left off
     seedTranscriptEidCounter(existingTranscript, hydrated.maxEid);
@@ -3269,7 +3306,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // the evicted content. findLastBackendSessionId clears cross-process
     // recovery on the matching markers.
     activeBackendSessionId = undefined;
-    activeBackendSessionBackend = undefined;
+    activeBackendSessionShape = undefined;
   };
 
   const trimContextToPercent = async (
@@ -3420,7 +3457,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       // returns above never reach this block. Unconditional: for non-claude
       // these are already undefined.
       activeBackendSessionId = undefined;
-      activeBackendSessionBackend = undefined;
+      activeBackendSessionShape = undefined;
     }
   };
 
@@ -3964,21 +4001,33 @@ export async function runChat(options: ChatOptions): Promise<void> {
     //
     // `canReuseBackendSession` is computed PER-TURN against the current backend
     // so a mid-session /backend switch is honored (not captured once at
-    // startup). A live session owned by a different backend is invalidated
-    // first: /backend claude→codex (a Claude UUID is meaningless to
-    // codex/gemini and would wrongly send delta-only), or claude→other→claude
-    // (the old native session is missing the intervening turns). Both reseed.
+    // startup). And a live session is invalidated when the envelope's static
+    // SHAPE has drifted since it was seeded — /backend, /model, /tool-routing,
+    // /skill-use, /skill-clear, /refresh, profile changes. Otherwise the resumed
+    // native session would be stale (e.g. seeded with backend tool-routing, then
+    // /tool-routing local leaves it without ink-tool instructions while native
+    // tools are disabled). On drift we reseed fresh with the new envelope.
     const canReuseBackendSession = runtime.backend === 'claude';
-    if (activeBackendSessionId !== undefined && activeBackendSessionBackend !== runtime.backend) {
-      activeBackendSessionId = undefined;
-      activeBackendSessionBackend = undefined;
+    const currentEnvelopeShape = envelopeShapeKey(runtime);
+    if (activeBackendSessionId !== undefined) {
+      if (activeBackendSessionShape === undefined) {
+        // Recovered from a prior process — adopt this turn's shape as the
+        // baseline (no invalidation). Cross-process bootstrap drift is
+        // tolerated; only in-process drift from here triggers a reseed.
+        activeBackendSessionShape = currentEnvelopeShape;
+      } else if (activeBackendSessionShape !== currentEnvelopeShape) {
+        // In-process envelope drift — the resumed native session would be
+        // stale, so invalidate and reseed fresh with the new envelope.
+        activeBackendSessionId = undefined;
+        activeBackendSessionShape = undefined;
+      }
     }
     const resumeProviderSession = canReuseBackendSession && activeBackendSessionId !== undefined;
     let seedProviderSessionId: string | undefined;
     if (canReuseBackendSession && !resumeProviderSession) {
       seedProviderSessionId = randomUUID();
       activeBackendSessionId = seedProviderSessionId;
-      activeBackendSessionBackend = runtime.backend;
+      activeBackendSessionShape = currentEnvelopeShape;
       // Persist the seed so a later process (next heartbeat / reattach) recovers
       // and RESUMES this native session instead of fragmenting into a new jsonl.
       appendTranscript(runtime.transcriptPath, {
@@ -4118,7 +4167,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       // Mirrors ClaudeRunner/InkRunner's resume-not-found recovery.
       const reseedId = randomUUID();
       activeBackendSessionId = reseedId;
-      activeBackendSessionBackend = runtime.backend;
+      activeBackendSessionShape = currentEnvelopeShape;
       appendTranscript(runtime.transcriptPath, { type: 'backend_session', id: reseedId });
       printEvent(
         chalk.yellow('  ⛁ provider session not found on resume — re-seeding a fresh native session')
