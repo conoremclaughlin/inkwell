@@ -1,5 +1,8 @@
-import { describe, it, expect } from 'vitest';
-import { isResumeFailedNoSession } from './chat.js';
+import { describe, it, expect, afterEach } from 'vitest';
+import { mkdtempSync, writeFileSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { isResumeFailedNoSession, findLastBackendSessionId } from './chat.js';
 
 /**
  * Stage 2A — across-turn provider session reuse.
@@ -133,5 +136,80 @@ describe('isResumeFailedNoSession', () => {
   it('is false for empty/whitespace stderr', () => {
     expect(isResumeFailedNoSession('')).toBe(false);
     expect(isResumeFailedNoSession('   ')).toBe(false);
+  });
+});
+
+describe('findLastBackendSessionId (cross-process recovery)', () => {
+  let dir: string;
+  const writeTranscript = (events: object[]): string => {
+    dir = mkdtempSync(join(tmpdir(), 'sb-transcript-'));
+    const path = join(dir, 'transcript.jsonl');
+    writeFileSync(path, events.map((e) => JSON.stringify(e)).join('\n') + '\n');
+    return path;
+  };
+
+  afterEach(() => {
+    if (dir) {
+      try {
+        rmSync(dir, { recursive: true, force: true });
+      } catch {
+        // best effort
+      }
+    }
+  });
+
+  it('returns undefined when the transcript file does not exist', () => {
+    expect(findLastBackendSessionId(join(tmpdir(), 'does-not-exist-xyz.jsonl'))).toBeUndefined();
+    expect(findLastBackendSessionId('')).toBeUndefined();
+  });
+
+  it('recovers the last backend_session id so the next process resumes it', () => {
+    const path = writeTranscript([
+      { type: 'user', content: 'hi' },
+      { type: 'backend_session', id: 'sess-1' },
+      { type: 'user', content: 'more' },
+      { type: 'backend_session', id: 'sess-2' },
+    ]);
+    expect(findLastBackendSessionId(path)).toBe('sess-2');
+  });
+
+  it('returns undefined when there is no backend_session marker', () => {
+    const path = writeTranscript([
+      { type: 'user', content: 'hi' },
+      { type: 'system_turn', content: 'heartbeat' },
+    ]);
+    expect(findLastBackendSessionId(path)).toBeUndefined();
+  });
+
+  it('a compaction AFTER the last seed clears the candidate (roll to fresh)', () => {
+    // ink compacted and the process ended before seeding again — the next
+    // process must NOT resume the pre-compaction session (it would drag the
+    // pre-compaction window back in). Seed fresh instead.
+    const path = writeTranscript([
+      { type: 'backend_session', id: 'pre-compaction' },
+      { type: 'user', content: 'lots of turns' },
+      { type: 'compaction', summary: '[summary]' },
+    ]);
+    expect(findLastBackendSessionId(path)).toBeUndefined();
+  });
+
+  it('a seed AFTER a compaction is the live session (re-established)', () => {
+    const path = writeTranscript([
+      { type: 'backend_session', id: 'pre-compaction' },
+      { type: 'compaction', summary: '[summary]' },
+      { type: 'backend_session', id: 'post-compaction' },
+      { type: 'user', content: 'next turn' },
+    ]);
+    expect(findLastBackendSessionId(path)).toBe('post-compaction');
+  });
+
+  it('ignores malformed lines', () => {
+    dir = mkdtempSync(join(tmpdir(), 'sb-transcript-'));
+    const path = join(dir, 'transcript.jsonl');
+    writeFileSync(
+      path,
+      ['not json', JSON.stringify({ type: 'backend_session', id: 'ok-1' }), '', '{bad'].join('\n')
+    );
+    expect(findLastBackendSessionId(path)).toBe('ok-1');
   });
 });

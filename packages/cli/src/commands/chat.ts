@@ -2203,6 +2203,41 @@ export function isResumeFailedNoSession(stderr: string): boolean {
   return lower.includes('session not found') || lower.includes('no such session');
 }
 
+/**
+ * Recover the live provider-native session id from a reattached transcript so a
+ * fresh process (the next server heartbeat, or a reattach) resumes the SAME
+ * native session instead of fragmenting into a new jsonl. Returns the id of the
+ * last `backend_session` marker. A `compaction` marker clears the candidate:
+ * after ink compacts we deliberately roll to a fresh provider session, so a
+ * pre-compaction id must never be resumed (it would drag the pre-compaction
+ * window back in).
+ */
+export function findLastBackendSessionId(transcriptPath: string): string | undefined {
+  if (!transcriptPath || !existsSync(transcriptPath)) return undefined;
+  let content: string;
+  try {
+    content = readFileSync(transcriptPath, 'utf-8');
+  } catch {
+    return undefined;
+  }
+  let found: string | undefined;
+  for (const line of content.split('\n')) {
+    if (!line.trim()) continue;
+    let event: { type?: unknown; id?: unknown };
+    try {
+      event = JSON.parse(line) as { type?: unknown; id?: unknown };
+    } catch {
+      continue;
+    }
+    if (event.type === 'backend_session' && typeof event.id === 'string') {
+      found = event.id;
+    } else if (event.type === 'compaction') {
+      found = undefined;
+    }
+  }
+  return found;
+}
+
 function buildPromptEnvelope(
   agentId: string,
   runtime: ChatRuntime,
@@ -2817,9 +2852,27 @@ export async function runChat(options: ChatOptions): Promise<void> {
       ? findLatestTranscriptForSession(runtime.sessionId)
       : undefined;
   runtime.transcriptPath = existingTranscript || ensureRuntimeTranscriptPath(runtime.sessionId);
+
+  // ── Provider session reuse (claude only) — Stage 2 ──
+  // One provider-native session id per ink session, reused across turns AND
+  // across processes. Seeded on the first backend spawn, resumed thereafter,
+  // and reset at the ink-owned compaction boundary. Recovered from the
+  // reattached transcript below so a fresh process (e.g. the next Myra
+  // heartbeat, which reattaches the same pcp session) RESUMES the same native
+  // session — the jsonl accumulates one coherent thread instead of fragmenting
+  // into a new file per message. ink owns compaction; the provider never runs
+  // its own.
+  const canReuseBackendSession = runtime.backend === 'claude';
+  let activeBackendSessionId: string | undefined;
+
   let historyHydration: HistoryHydrationResult | null = null;
   if (attachedToExistingSession && existingTranscript) {
     const hydrated = hydrateLedgerFromTranscript(ledger, existingTranscript);
+    // Resume the provider session the prior process left live (delta only),
+    // unless a compaction rolled it — then the next turn seeds a fresh one.
+    if (canReuseBackendSession) {
+      activeBackendSessionId = findLastBackendSessionId(existingTranscript);
+    }
     // Continue the event-id sequence from where the file left off
     seedTranscriptEidCounter(existingTranscript, hydrated.maxEid);
     sessionEvictedEntries.push(...hydrated.evictedEntries);
@@ -3247,16 +3300,6 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // `compaction` transcript event is the pointer to the new start state —
   // hydration collapses everything before it on reattach. If summarization
   // fails, fall back to a hard trim so the turn can still proceed.
-  // ── Across-turn provider session reuse (claude only) ──
-  // The live provider-native session id for THIS ink process. Seeded on the
-  // first backend spawn and RESUMED on every subsequent turn so the whole
-  // conversation is ONE coherent native jsonl — debuggable, and readable in the
-  // provider's own TUI — instead of a fresh session (new jsonl) per turn. Reset
-  // to undefined at the ink-owned compaction boundary below so the next turn
-  // mints a fresh provider session seeded with the compacted summary: ink owns
-  // compaction, the provider never runs its own.
-  const canReuseBackendSession = runtime.backend === 'claude';
-  let activeBackendSessionId: string | undefined;
   let compactionInFlight = false;
 
   const buildCompactionPrompt = (chunk: string): string =>
@@ -3904,6 +3947,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
     if (canReuseBackendSession && !resumeProviderSession) {
       seedProviderSessionId = randomUUID();
       activeBackendSessionId = seedProviderSessionId;
+      // Persist the seed so a later process (next heartbeat / reattach) recovers
+      // and RESUMES this native session instead of fragmenting into a new jsonl.
+      appendTranscript(runtime.transcriptPath, {
+        type: 'backend_session',
+        id: seedProviderSessionId,
+      });
     }
 
     let prompt: string;
@@ -4030,10 +4079,36 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // seeded the id ourselves); the full mid-turn re-seed lands with the
     // server/cross-process path.
     if (resumeProviderSession && !runResult.success && isResumeFailedNoSession(runResult.stderr)) {
-      activeBackendSessionId = undefined;
+      // The resumed provider session no longer exists locally (jsonl pruned /
+      // different machine). Mint a fresh native session, re-send the FULL
+      // envelope (the ledger already holds the history), and retry once so a
+      // server heartbeat still produces output instead of dying on a stale id.
+      // Mirrors ClaudeRunner/InkRunner's resume-not-found recovery.
+      const reseedId = randomUUID();
+      activeBackendSessionId = reseedId;
+      appendTranscript(runtime.transcriptPath, { type: 'backend_session', id: reseedId });
       printEvent(
-        chalk.yellow('  ⛁ provider session not found on resume — will re-seed on the next turn')
+        chalk.yellow('  ⛁ provider session not found on resume — re-seeding a fresh native session')
       );
+      process.on('SIGINT', onSigintDuringTurn);
+      const reseedTurn = startBackendTurn({
+        backend: runtime.backend,
+        agentId,
+        model: runtime.model,
+        prompt: buildPromptEnvelope(agentId, runtime, ledger, raw),
+        verbose: runtime.verbose,
+        passthroughArgs,
+        timeoutMs: runtime.backendTurnTimeoutMs,
+        attachmentDirs: sessionAttachmentDirs.length > 0 ? sessionAttachmentDirs : undefined,
+        backendSessionSeedId: reseedId,
+      });
+      currentTurnAbort = reseedTurn.abort;
+      inkRepl?.setAbortHandler(abortCurrentTurn);
+      runResult = await reseedTurn.result.finally(() => {
+        currentTurnAbort = null;
+        inkRepl?.setAbortHandler(null);
+        process.off('SIGINT', onSigintDuringTurn);
+      });
     }
     sbDebugLog(
       'chat',
