@@ -2231,7 +2231,13 @@ export function findLastBackendSessionId(transcriptPath: string): string | undef
     }
     if (event.type === 'backend_session' && typeof event.id === 'string') {
       found = event.id;
-    } else if (event.type === 'compaction') {
+    } else if (
+      event.type === 'compaction' ||
+      event.type === 'context_evict' ||
+      event.type === 'context_trim'
+    ) {
+      // A context-boundary mutation rolled the provider session. Abandon any
+      // prior id — a backend_session marker after this point re-establishes it.
       found = undefined;
     }
   }
@@ -2856,22 +2862,27 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // ── Provider session reuse (claude only) — Stage 2 ──
   // One provider-native session id per ink session, reused across turns AND
   // across processes. Seeded on the first backend spawn, resumed thereafter,
-  // and reset at the ink-owned compaction boundary. Recovered from the
-  // reattached transcript below so a fresh process (e.g. the next Myra
-  // heartbeat, which reattaches the same pcp session) RESUMES the same native
-  // session — the jsonl accumulates one coherent thread instead of fragmenting
-  // into a new file per message. ink owns compaction; the provider never runs
-  // its own.
-  const canReuseBackendSession = runtime.backend === 'claude';
+  // and reset at every ink-owned context-boundary change (compaction, trim,
+  // eviction). Recovered from the reattached transcript below so a fresh
+  // process (e.g. the next Myra heartbeat, which reattaches the same pcp
+  // session) RESUMES the same native session — the jsonl accumulates one
+  // coherent thread instead of fragmenting into a new file per message. ink
+  // owns compaction; the provider never runs its own.
   let activeBackendSessionId: string | undefined;
+  // The backend that owns activeBackendSessionId. A Claude session UUID is
+  // meaningless to codex/gemini, so a mid-session /backend switch must
+  // invalidate it (see the per-turn check in runUserTurn). Whether reuse is
+  // active is computed per-turn against the current backend, not captured here.
+  let activeBackendSessionBackend: string | undefined;
 
   let historyHydration: HistoryHydrationResult | null = null;
   if (attachedToExistingSession && existingTranscript) {
     const hydrated = hydrateLedgerFromTranscript(ledger, existingTranscript);
     // Resume the provider session the prior process left live (delta only),
-    // unless a compaction rolled it — then the next turn seeds a fresh one.
-    if (canReuseBackendSession) {
+    // unless a compaction/eviction rolled it — then the next turn seeds fresh.
+    if (runtime.backend === 'claude') {
       activeBackendSessionId = findLastBackendSessionId(existingTranscript);
+      if (activeBackendSessionId) activeBackendSessionBackend = 'claude';
     }
     // Continue the event-id sequence from where the file left off
     seedTranscriptEidCounter(existingTranscript, hydrated.maxEid);
@@ -3251,6 +3262,14 @@ export async function runChat(options: ChatOptions): Promise<void> {
     if (sessionEvictedEntries.length > EVICTED_DISPLAY_MAX) {
       sessionEvictedEntries.splice(0, sessionEvictedEntries.length - EVICTED_DISPLAY_MAX);
     }
+    // A context-boundary mutation (SB evict_context, user /evict, system trim —
+    // all route through this single writer) just removed entries from ink's
+    // window. Roll the provider session so the next turn re-seeds from the
+    // post-eviction ledger; otherwise a resumed native session would still hold
+    // the evicted content. findLastBackendSessionId clears cross-process
+    // recovery on the matching markers.
+    activeBackendSessionId = undefined;
+    activeBackendSessionBackend = undefined;
   };
 
   const trimContextToPercent = async (
@@ -3398,8 +3417,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
       // ink just rolled the ledger — roll the provider session too so the next
       // turn seeds a fresh native session with the summary (we compact before
       // the provider ever would). No-op when nothing was compacted: the early
-      // returns above never reach this block.
-      if (canReuseBackendSession) activeBackendSessionId = undefined;
+      // returns above never reach this block. Unconditional: for non-claude
+      // these are already undefined.
+      activeBackendSessionId = undefined;
+      activeBackendSessionBackend = undefined;
     }
   };
 
@@ -3939,14 +3960,25 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // resume the same session. This collapses the whole conversation into ONE
     // coherent Claude jsonl and stops re-piping the transcript window on every
     // round-trip. Stateless backends (codex/gemini) always get the full
-    // envelope. `canReuseBackendSession`/`activeBackendSessionId` are
-    // session-scoped (declared above) so reuse spans turns and resets at the
-    // compaction boundary.
+    // envelope.
+    //
+    // `canReuseBackendSession` is computed PER-TURN against the current backend
+    // so a mid-session /backend switch is honored (not captured once at
+    // startup). A live session owned by a different backend is invalidated
+    // first: /backend claude→codex (a Claude UUID is meaningless to
+    // codex/gemini and would wrongly send delta-only), or claude→other→claude
+    // (the old native session is missing the intervening turns). Both reseed.
+    const canReuseBackendSession = runtime.backend === 'claude';
+    if (activeBackendSessionId !== undefined && activeBackendSessionBackend !== runtime.backend) {
+      activeBackendSessionId = undefined;
+      activeBackendSessionBackend = undefined;
+    }
     const resumeProviderSession = canReuseBackendSession && activeBackendSessionId !== undefined;
     let seedProviderSessionId: string | undefined;
     if (canReuseBackendSession && !resumeProviderSession) {
       seedProviderSessionId = randomUUID();
       activeBackendSessionId = seedProviderSessionId;
+      activeBackendSessionBackend = runtime.backend;
       // Persist the seed so a later process (next heartbeat / reattach) recovers
       // and RESUMES this native session instead of fragmenting into a new jsonl.
       appendTranscript(runtime.transcriptPath, {
@@ -4086,6 +4118,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       // Mirrors ClaudeRunner/InkRunner's resume-not-found recovery.
       const reseedId = randomUUID();
       activeBackendSessionId = reseedId;
+      activeBackendSessionBackend = runtime.backend;
       appendTranscript(runtime.transcriptPath, { type: 'backend_session', id: reseedId });
       printEvent(
         chalk.yellow('  ⛁ provider session not found on resume — re-seeding a fresh native session')

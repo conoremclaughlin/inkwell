@@ -203,6 +203,34 @@ describe('findLastBackendSessionId (cross-process recovery)', () => {
     expect(findLastBackendSessionId(path)).toBe('post-compaction');
   });
 
+  it('a context_evict AFTER the last seed clears the candidate', () => {
+    // /evict or evict_context removed entries; a resumed native session would
+    // still hold the evicted content, so recovery must NOT resume it.
+    const path = writeTranscript([
+      { type: 'backend_session', id: 'pre-evict' },
+      { type: 'user', content: 'stuff' },
+      { type: 'context_evict', actor: 'sb', refs: [{ hash: 'h' }] },
+    ]);
+    expect(findLastBackendSessionId(path)).toBeUndefined();
+  });
+
+  it('a context_trim AFTER the last seed clears the candidate', () => {
+    const path = writeTranscript([
+      { type: 'backend_session', id: 'pre-trim' },
+      { type: 'context_trim', reason: 'manual' },
+    ]);
+    expect(findLastBackendSessionId(path)).toBeUndefined();
+  });
+
+  it('a seed AFTER an eviction is the live session (re-established)', () => {
+    const path = writeTranscript([
+      { type: 'backend_session', id: 'old' },
+      { type: 'context_evict', actor: 'user', refs: [{ hash: 'h' }] },
+      { type: 'backend_session', id: 'post-evict' },
+    ]);
+    expect(findLastBackendSessionId(path)).toBe('post-evict');
+  });
+
   it('ignores malformed lines', () => {
     dir = mkdtempSync(join(tmpdir(), 'sb-transcript-'));
     const path = join(dir, 'transcript.jsonl');
@@ -211,5 +239,80 @@ describe('findLastBackendSessionId (cross-process recovery)', () => {
       ['not json', JSON.stringify({ type: 'backend_session', id: 'ok-1' }), '', '{bad'].join('\n')
     );
     expect(findLastBackendSessionId(path)).toBe('ok-1');
+  });
+});
+
+// Mirrors runUserTurn's backend-ownership check: a live provider session is
+// invalidated when the current backend differs from the one that seeded it, so
+// a /backend switch never resumes a Claude UUID under codex/gemini and never
+// skips intervening turns on claude→other→claude.
+function decideWithBackend(
+  currentBackend: string,
+  activeId: string | undefined,
+  activeOwner: string | undefined,
+  mintId: () => string
+): {
+  invalidated: boolean;
+  resume: boolean;
+  seedId: string | undefined;
+  nextActiveId: string | undefined;
+  nextOwner: string | undefined;
+} {
+  let id = activeId;
+  let owner = activeOwner;
+  let invalidated = false;
+  if (id !== undefined && owner !== currentBackend) {
+    id = undefined;
+    owner = undefined;
+    invalidated = true;
+  }
+  const canReuse = currentBackend === 'claude';
+  const resume = canReuse && id !== undefined;
+  let seedId: string | undefined;
+  if (canReuse && !resume) {
+    seedId = mintId();
+    id = seedId;
+    owner = currentBackend;
+  }
+  return { invalidated, resume, seedId, nextActiveId: id, nextOwner: owner };
+}
+
+describe('provider session backend-ownership (mid-session /backend switch)', () => {
+  const minter = () => {
+    const ids = ['S1', 'S2', 'S3'];
+    let i = 0;
+    return () => ids[i++]!;
+  };
+
+  it('claude→codex invalidates the Claude session and does not resume it', () => {
+    const mint = minter();
+    // Seed on claude.
+    let d = decideWithBackend('claude', undefined, undefined, mint);
+    expect(d.seedId).toBe('S1');
+    // Switch to codex: the Claude UUID is invalidated, codex does not reuse.
+    d = decideWithBackend('codex', d.nextActiveId, d.nextOwner, mint);
+    expect(d.invalidated).toBe(true);
+    expect(d.resume).toBe(false);
+    expect(d.seedId).toBeUndefined();
+    expect(d.nextActiveId).toBeUndefined();
+  });
+
+  it('claude→codex→claude reseeds fresh (never resumes the pre-switch session)', () => {
+    const mint = minter();
+    let d = decideWithBackend('claude', undefined, undefined, mint); // S1
+    const onCodex = decideWithBackend('codex', d.nextActiveId, d.nextOwner, mint);
+    d = decideWithBackend('claude', onCodex.nextActiveId, onCodex.nextOwner, mint);
+    expect(d.resume).toBe(false);
+    expect(d.seedId).toBe('S2'); // fresh, not S1 — intervening codex turns aren't in S1
+    expect(d.nextOwner).toBe('claude');
+  });
+
+  it('claude→claude resumes the same session (no spurious invalidation)', () => {
+    const mint = minter();
+    const d1 = decideWithBackend('claude', undefined, undefined, mint); // S1
+    const d2 = decideWithBackend('claude', d1.nextActiveId, d1.nextOwner, mint);
+    expect(d2.invalidated).toBe(false);
+    expect(d2.resume).toBe(true);
+    expect(d2.nextActiveId).toBe('S1');
   });
 });
