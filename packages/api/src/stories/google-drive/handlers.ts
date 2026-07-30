@@ -5,7 +5,7 @@
 import { z } from 'zod';
 import { mkdir, writeFile } from 'fs/promises';
 import { homedir } from 'os';
-import { join } from 'path';
+import { join, resolve } from 'path';
 import { getGoogleDriveService } from './service';
 import { resolveUserOrThrow } from '../../services/user-resolver';
 import { logger } from '../../utils/logger';
@@ -334,12 +334,16 @@ function driveDownloadDir(): string {
 }
 
 function sanitizeFilename(name: string): string {
-  return (
+  const cleaned =
     name
       .replace(/[/\\:*?"<>|]/g, '_')
       .trim()
-      .slice(0, 180) || 'file'
-  );
+      .slice(0, 180) || 'file';
+
+  // Reject dot-components that would cause path traversal
+  if (cleaned === '.' || cleaned === '..') return 'file';
+
+  return cleaned;
 }
 
 export async function handleDownloadDriveFile(
@@ -367,6 +371,16 @@ export async function handleDownloadDriveFile(
     const dir = driveDownloadDir();
     await mkdir(dir, { recursive: true });
     const savedPath = join(dir, filename);
+
+    // Defense-in-depth: ensure resolved path stays under the download directory
+    const resolvedPath = resolve(savedPath);
+    const resolvedDir = resolve(dir);
+    if (!resolvedPath.startsWith(resolvedDir + '/') && resolvedPath !== resolvedDir) {
+      return errorResult(
+        `Filename "${filename}" resolves outside the download directory — rejecting for safety`
+      );
+    }
+
     await writeFile(savedPath, result.content);
 
     logger.info('Downloaded Drive file', {

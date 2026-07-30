@@ -269,6 +269,54 @@ describe('handleDownloadDriveFile', () => {
     expect(parsed.savedPath.endsWith('chapter-680.txt')).toBe(true);
   });
 
+  it('rejects ".." targetFilename that would escape the download directory', async () => {
+    vi.mocked(getGoogleDriveService).mockReturnValue({
+      downloadFile: vi.fn().mockResolvedValue({
+        file: { id: 'b2', name: 'legit.bin', mimeType: 'application/octet-stream' },
+        content: Buffer.from([0xde, 0xad]),
+        effectiveMimeType: 'application/octet-stream',
+        extension: '',
+        exported: false,
+      }),
+    } as any);
+
+    const result = await handleDownloadDriveFile(
+      { userId: testUserId, fileId: 'b2', targetFilename: '..' },
+      mockDataComposer
+    );
+
+    // sanitizeFilename converts ".." → "file", so it saves safely
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(true);
+    expect(parsed.savedPath).toContain('drive/file');
+    expect(parsed.savedPath).not.toContain('..');
+    expect(writeFileMock).toHaveBeenCalledOnce();
+  });
+
+  it('rejects ".." Drive filename with no extension (path traversal)', async () => {
+    vi.mocked(getGoogleDriveService).mockReturnValue({
+      downloadFile: vi.fn().mockResolvedValue({
+        file: { id: 'b3', name: '..', mimeType: 'application/octet-stream' },
+        content: Buffer.from([0xde, 0xad]),
+        effectiveMimeType: 'application/octet-stream',
+        extension: '',
+        exported: false,
+      }),
+    } as any);
+
+    const result = await handleDownloadDriveFile(
+      { userId: testUserId, fileId: 'b3' },
+      mockDataComposer
+    );
+
+    // sanitizeFilename converts ".." → "file", so it saves safely
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(true);
+    expect(parsed.savedPath).toContain('drive/file');
+    expect(parsed.savedPath).not.toContain('..');
+    expect(writeFileMock).toHaveBeenCalledOnce();
+  });
+
   it('surfaces a hint when export format is unknown', async () => {
     vi.mocked(getGoogleDriveService).mockReturnValue({
       downloadFile: vi
