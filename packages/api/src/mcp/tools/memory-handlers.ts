@@ -45,13 +45,13 @@ const BUNDLED_CONVENTIONS_PATH = path.resolve(
 );
 
 // Enums for validation
-const memorySourceSchema = z.enum([
-  'conversation',
-  'observation',
-  'user_stated',
-  'inferred',
-  'session',
-]);
+// Source is provenance and is intentionally open. The DB CHECK constraint that
+// limited it to a fixed set was dropped (migration 20260219080201) so agents can
+// use descriptive sources, and the MemorySource model type is likewise open
+// (`string & {}`). Keep this a permissive string — a strict enum here is the one
+// remaining gate that wrongly rejects valid provenance like "pr-review" /
+// "codex-review". Canonical values are documented on the field describes below.
+const memorySourceSchema = z.string().min(1);
 const salienceSchema = z.enum(['low', 'medium', 'high', 'critical']);
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -348,7 +348,11 @@ export const rememberSchema = userIdentifierBaseSchema.extend({
     .describe(
       'One-liner description of the topic itself (not this memory). Used to build the topic index at bootstrap. Only needed when creating a new topic or updating its description.'
     ),
-  source: memorySourceSchema.optional().describe('Source of the memory (default: observation)'),
+  source: memorySourceSchema
+    .optional()
+    .describe(
+      'Provenance of the memory. Canonical values: conversation, observation, user_stated, inferred, session, reflection. Free-form is allowed for specific provenance (e.g. "pr-review", "codex-review", "posthoc-review"). Default: observation.'
+    ),
   salience: salienceSchema.optional().describe('Importance level (default: medium)'),
   topics: topicsSchema.describe('Topics for categorization'),
   metadata: z.record(z.unknown()).optional().describe('Additional metadata'),
@@ -380,7 +384,11 @@ export const recallSchema = userIdentifierBaseSchema.extend({
     .describe(
       'Recall strategy: text (keyword only), semantic (embeddings only), hybrid (blend both), auto (semantic then fallback to text). Default: hybrid.'
     ),
-  source: memorySourceSchema.optional().describe('Filter by source'),
+  source: memorySourceSchema
+    .optional()
+    .describe(
+      'Filter by source (any provenance string, e.g. observation, user_stated, pr-review).'
+    ),
   salience: salienceSchema.optional().describe('Filter by salience'),
   topics: topicsSchema.describe('Filter by topics (any match)'),
   limit: z.number().min(1).max(100).optional().describe('Max results (default: 20)'),
