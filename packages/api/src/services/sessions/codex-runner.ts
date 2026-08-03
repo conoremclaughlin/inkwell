@@ -150,10 +150,12 @@ export class CodexRunner implements IRunner {
       '-c',
       `mcp_servers.${codexServerKey}.env_http_headers.x-ink-studio-id="INK_STUDIO_ID"`
     );
-    args.push(
-      '-c',
-      `mcp_servers.${codexServerKey}.env_http_headers.Authorization="INK_AUTH_BEARER"`
-    );
+    // Auth via codex's static-bearer mechanism instead of an Authorization
+    // env_http_header. This makes codex authenticate with the raw token AND
+    // skip its own managed OAuth refresh for the inkwell server (whose
+    // independently-cached refresh token can expire → invalid_grant → aborted
+    // MCP init). Codex prepends "Bearer " itself, so point at the raw token.
+    args.push('-c', `mcp_servers.${codexServerKey}.bearer_token_env_var="INK_ACCESS_TOKEN"`);
 
     if (config.model) {
       args.push('-m', config.model);

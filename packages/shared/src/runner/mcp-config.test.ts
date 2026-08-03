@@ -173,7 +173,7 @@ describe('injectSessionHeaders', () => {
 });
 
 describe('buildSessionEnv', () => {
-  it('includes INK_ACCESS_TOKEN and INK_AUTH_BEARER when accessToken provided', () => {
+  it('includes INK_ACCESS_TOKEN (raw) when accessToken provided', () => {
     const env = buildSessionEnv({
       pcpSessionId: 'sess-123',
       studioId: 'studio-456',
@@ -184,7 +184,9 @@ describe('buildSessionEnv', () => {
     expect(env.INK_SESSION_ID).toBe('sess-123');
     expect(env.INK_STUDIO_ID).toBe('studio-456');
     expect(env.INK_ACCESS_TOKEN).toBe('tok-789');
-    expect(env.INK_AUTH_BEARER).toBe('Bearer tok-789');
+    // No pre-formatted Authorization value — codex uses bearer_token_env_var
+    // pointing at the raw INK_ACCESS_TOKEN and prepends "Bearer " itself.
+    expect(env).not.toHaveProperty('INK_AUTH_BEARER');
   });
 
   it('omits INK_ACCESS_TOKEN when not provided', () => {
