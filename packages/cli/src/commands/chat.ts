@@ -35,6 +35,10 @@ import {
   estimateTokens,
   type LedgerRole,
 } from '../repl/context-ledger.js';
+import {
+  resolveModelContextWindow as resolveBackendTokenWindow,
+  contextBudgetForWindow as defaultContextBudget,
+} from '../repl/context-limits.js';
 import { parseSlashCommand } from '../repl/slash.js';
 import {
   parseEvictSelection,
@@ -452,25 +456,16 @@ const LEDGER_COMPACT_CHARS = 420;
 const AUTO_TRIM_KEEP_RECENT_ENTRIES = 6;
 const DEFAULT_TRIM_TARGET_PCT = 70;
 const CTRL_C_EXIT_WINDOW_MS = 3000;
-const DEFAULT_BACKEND_TOKEN_WINDOW = 1_000_000;
-// Our working context budget — deliberately smaller than the backend's raw
-// window. When the transcript approaches this, we compact (summarize the
-// oldest entries into a new start state) rather than letting it grow until
-// turns degrade or argv/window limits bite. Override with --max-context-tokens.
-const DEFAULT_MAX_CONTEXT_TOKENS = 200_000;
+// Working context budget + per-model window resolution live in ../repl/
+// context-limits.js (imported above as defaultContextBudget /
+// resolveBackendTokenWindow). ink derives its budget from the model's REAL
+// window so it always compacts before the provider would — that module owns the
+// conservative per-model table and the provider-headroom math.
 // Compact when transcript+identity utilization crosses this fraction of budget
 const AUTO_COMPACT_THRESHOLD_PCT = 0.8;
 // Entries kept verbatim after the compaction summary (the working tail)
 const AUTO_COMPACT_KEEP_RECENT_ENTRIES = 12;
 const HISTORY_PREVIEW_MAX = 200;
-function resolveBackendTokenWindow(_backend: string, _model?: string): number {
-  // Current policy: claude/codex/gemini all default to 1M effective context window.
-  return DEFAULT_BACKEND_TOKEN_WINDOW;
-}
-
-function defaultContextBudget(backendTokenWindow: number): number {
-  return Math.min(backendTokenWindow, DEFAULT_MAX_CONTEXT_TOKENS);
-}
 
 function formatTokenCount(value: number): string {
   return value.toLocaleString();
