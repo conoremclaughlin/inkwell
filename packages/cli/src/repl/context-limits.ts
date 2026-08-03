@@ -62,15 +62,18 @@ export const MODEL_CONTEXT_WINDOWS: ReadonlyArray<readonly [string, number]> = [
   ['claude-fable', 200_000],
   ['claude-', 200_000],
 
-  // OpenAI / codex. GPT-5 / codex models carry large windows; 256K is a
-  // conservative floor. Older gpt-4-class is 128K. (ink's budget caps at 200K
-  // regardless — these mainly drive honest display + the headroom math.)
+  // OpenAI / codex. GPT-5 / GPT-5-Codex carry large windows; 256K is a
+  // conservative floor for those SPECIFIC prefixes. Older gpt-4-class is 128K.
+  // The broad `codex` prefix (and the codex backend default below) must stay at
+  // 200K: `codex-mini-latest` is a 200K-window model, and extending 256K to all
+  // `codex-*` would overestimate it — the unsafe direction. Larger codex windows
+  // belong on specific gpt-5-codex prefixes above, never on the broad entry.
   ['gpt-5', 256_000],
   ['gpt-4', 128_000],
   ['gpt-', 128_000],
   ['o3', 200_000],
   ['o4', 200_000],
-  ['codex', 256_000],
+  ['codex', 200_000],
 
   // Google / gemini. 1M+ windows; assume 1M conservatively (2M variants exist).
   ['gemini-2', 1_000_000],
@@ -87,7 +90,10 @@ function backendDefaultWindow(backend: string): number {
     case 'gemini':
       return 1_000_000;
     case 'codex':
-      return 256_000;
+      // codex-mini-latest is a 200K-window model; the codex default must not
+      // exceed it. (Specific gpt-5-codex prefixes get their larger window via
+      // the table.)
+      return 200_000;
     case 'claude':
       return 200_000;
     default:

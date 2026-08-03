@@ -27,7 +27,11 @@ describe('resolveModelContextWindow', () => {
   });
 
   it('resolves codex / gpt families conservatively', () => {
-    expect(resolveModelContextWindow('codex', 'codex-mini')).toBe(256_000);
+    // codex-mini-latest is a 200K-window model — the broad codex prefix must NOT
+    // overestimate it (that is the unsafe direction this table exists to avoid).
+    expect(resolveModelContextWindow('codex', 'codex-mini-latest')).toBe(200_000);
+    expect(resolveModelContextWindow('codex', 'codex-mini')).toBe(200_000);
+    // The larger window is reserved for the specific gpt-5-codex prefix.
     expect(resolveModelContextWindow('codex', 'gpt-5-codex')).toBe(256_000);
     expect(resolveModelContextWindow('codex', 'gpt-4o')).toBe(128_000);
   });
@@ -48,14 +52,15 @@ describe('resolveModelContextWindow', () => {
     expect(resolveModelContextWindow('claude')).toBe(200_000);
     expect(resolveModelContextWindow('claude', '')).toBe(200_000);
     expect(resolveModelContextWindow('claude', '   ')).toBe(200_000);
-    expect(resolveModelContextWindow('codex')).toBe(256_000);
+    // codex default must match codex-mini-latest (200K), not overestimate it.
+    expect(resolveModelContextWindow('codex')).toBe(200_000);
     expect(resolveModelContextWindow('gemini')).toBe(1_000_000);
   });
 
   it('falls back to the per-backend default for an unrecognized model id', () => {
     // Unknown model on a known backend → backend default, NOT a phantom large window.
     expect(resolveModelContextWindow('claude', 'mystery-model')).toBe(200_000);
-    expect(resolveModelContextWindow('codex', 'mystery-model')).toBe(256_000);
+    expect(resolveModelContextWindow('codex', 'mystery-model')).toBe(200_000);
   });
 
   it('uses the global safe default for an unknown backend with no known model', () => {
@@ -125,6 +130,35 @@ describe('keystone safety invariant — ink compacts before the provider', () =>
       const inkCompactAt = budget * INK_COMPACT_THRESHOLD_PCT;
       const providerTriggerAt = window * PROVIDER_HEADROOM_PCT;
       expect(inkCompactAt).toBeLessThan(providerTriggerAt);
+    }
+  });
+
+  // Documented REAL context windows, specified INDEPENDENTLY of the table so
+  // this guard catches over-estimation (the unsafe direction). If the resolver
+  // ever assumes a window larger than reality, the derived budget can exceed the
+  // real provider-headroom slice and the provider wins the compaction race —
+  // exactly the codex-mini-latest bug this test was added for.
+  const KNOWN_REAL_WINDOWS: ReadonlyArray<readonly [string, string, number]> = [
+    ['claude', 'claude-opus-4-8', 200_000],
+    ['claude', 'claude-sonnet-5', 200_000],
+    ['codex', 'codex-mini-latest', 200_000],
+    ['codex', undefined as unknown as string, 200_000], // codex backend default
+    ['gemini', 'gemini-2.0-flash', 1_000_000],
+  ];
+
+  it('never budgets above the REAL provider-headroom slice for documented models', () => {
+    for (const [backend, model, realWindow] of KNOWN_REAL_WINDOWS) {
+      const assumed = resolveModelContextWindow(backend, model);
+      // The resolver must never assume MORE context than the model really has.
+      expect(assumed, `${backend}/${model ?? '(default)'} assumed window`).toBeLessThanOrEqual(
+        realWindow
+      );
+      // And ink's whole budget must sit under the real provider trigger.
+      const budget = contextBudgetForWindow(assumed);
+      expect(
+        budget,
+        `${backend}/${model ?? '(default)'} budget vs real headroom`
+      ).toBeLessThanOrEqual(Math.floor(realWindow * PROVIDER_HEADROOM_PCT));
     }
   });
 
