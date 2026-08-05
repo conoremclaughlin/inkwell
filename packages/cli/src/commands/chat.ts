@@ -28,6 +28,7 @@ import {
   type BackendAuthBackend,
 } from '../lib/backend-auth.js';
 import { startBackendTurn, runBackendTurn } from '../repl/backend-runner.js';
+import type { BackendTurnEvent } from '../backends/stream.js';
 import { startSessionEventStream, type SessionEvent } from '../repl/session-event-stream.js';
 import {
   ContextLedger,
@@ -188,6 +189,12 @@ interface ChatRuntime {
   bootstrapContext?: string;
   strictTools: boolean;
   backendTurnTimeoutMs?: number;
+  /**
+   * Idle/token-flow timeout for a backend turn (ms). The primary reaper on the
+   * non-interactive path: a turn is killed only after NO output flows for this
+   * long (a real "tokens stopped" signal), replacing the old blunt hard wall.
+   */
+  backendIdleTimeoutMs?: number;
   approvalMode: 'interactive' | 'jsonl' | 'auto-deny' | 'auto-approve';
   approvalChannel?: ApprovalChannel;
 }
@@ -2362,12 +2369,21 @@ export async function runChat(options: ChatOptions): Promise<void> {
     options.backendTimeoutSeconds !== undefined
       ? Number.parseInt(options.backendTimeoutSeconds, 10)
       : Number.NaN;
+  // Hard ceiling: an explicit --backend-timeout-seconds override, else undefined
+  // (→ backend-runner's generous ~20-min backstop). The old blunt 120s
+  // non-interactive wall is GONE — it killed legitimately long turns at the
+  // completion boundary (exit 124 → false backend-error). Long turns are now
+  // governed by the idle/token-flow timeout below, not wall-clock.
   const backendTurnTimeoutMs =
     Number.isFinite(parsedBackendTimeoutSeconds) && parsedBackendTimeoutSeconds > 0
       ? parsedBackendTimeoutSeconds * 1000
-      : options.nonInteractive
-        ? 120_000
-        : undefined;
+      : undefined;
+  // Idle/token-flow timeout — the primary reaper for server (non-interactive)
+  // turns: kill only after 5 min with NO output. With stream-json the backend
+  // emits continuously, so this fires only on a genuine stall. Sits below the
+  // outer InkRunner inactivity window (7 min) so a stalled turn is reaped here
+  // (clean exit 124) instead of escalating to the outer SIGTERM.
+  const backendIdleTimeoutMs = options.nonInteractive ? 5 * 60 * 1000 : undefined;
 
   // Persisted runtime preferences from .ink/identity.json — CLI flags override these
   const persisted = identity?.runtime;
@@ -2401,6 +2417,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     activeSkills: [],
     strictTools: options.sbStrictTools ?? persisted?.strictTools ?? false,
     backendTurnTimeoutMs,
+    backendIdleTimeoutMs,
     approvalMode:
       options.approvalMode === 'jsonl' || persisted?.approvalMode === 'jsonl'
         ? 'jsonl'
@@ -2579,6 +2596,21 @@ export async function runChat(options: ChatOptions): Promise<void> {
       process.stdout.write(`${JSON.stringify(evt)}\n`);
     } catch {
       // A stdout write failure must never abort the turn.
+    }
+  };
+
+  // Bridge normalized backend stream events onto the live feed. Backend tool
+  // calls (the provider calling MCP tools mid-turn) now surface in real time —
+  // before stream-json the feed was silent during a backend-routed generation.
+  // Assistant text lands in the final response; per-token deltas are a follow-on.
+  const handleBackendEvent = (evt: BackendTurnEvent): void => {
+    if (evt.kind === 'tool-use') {
+      emitStreamEvent({
+        type: 'tool_call',
+        toolName: evt.name,
+        status: 'running',
+        layer: 'backend',
+      });
     }
   };
 
@@ -4131,6 +4163,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
       verbose: runtime.verbose,
       passthroughArgs,
       timeoutMs: runtime.backendTurnTimeoutMs,
+      idleTimeoutMs: runtime.backendIdleTimeoutMs,
+      stream: true,
+      onEvent: handleBackendEvent,
       attachmentDirs: sessionAttachmentDirs.length > 0 ? sessionAttachmentDirs : undefined,
       // Seed a fresh provider session (first spawn) OR resume the live one
       // (subsequent turns). Tool-loop continuations below always resume it.
@@ -4154,7 +4189,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // fresh one. Within a single interactive process this is near-impossible (we
     // seeded the id ourselves); the full mid-turn re-seed lands with the
     // server/cross-process path.
-    if (resumeProviderSession && !runResult.success && isResumeFailedNoSession(runResult.stderr)) {
+    if (
+      resumeProviderSession &&
+      !runResult.success &&
+      (runResult.resumeFailedNoSession || isResumeFailedNoSession(runResult.stderr))
+    ) {
       // The resumed provider session no longer exists locally (jsonl pruned /
       // different machine). Mint a fresh native session, re-send the FULL
       // envelope (the ledger already holds the history), and retry once so a
@@ -4176,6 +4215,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
         verbose: runtime.verbose,
         passthroughArgs,
         timeoutMs: runtime.backendTurnTimeoutMs,
+        idleTimeoutMs: runtime.backendIdleTimeoutMs,
+        stream: true,
+        onEvent: handleBackendEvent,
         attachmentDirs: sessionAttachmentDirs.length > 0 ? sessionAttachmentDirs : undefined,
         backendSessionSeedId: reseedId,
       });
@@ -4265,7 +4307,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
     // eslint-disable-next-line no-constant-condition
     while (true) {
-      responseText = runResult.stdout.trim();
+      // In streaming mode `responseText` is the parsed assistant text; `stdout`
+      // is the raw NDJSON event stream, so never use it as the reply there.
+      responseText = (runResult.responseText ?? runResult.stdout).trim();
       if (!responseText && runResult.stderr.trim()) {
         responseText = runResult.stderr.trim();
       }
@@ -4631,6 +4675,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
         verbose: runtime.verbose,
         passthroughArgs,
         timeoutMs: runtime.backendTurnTimeoutMs,
+        idleTimeoutMs: runtime.backendIdleTimeoutMs,
+        stream: true,
+        onEvent: handleBackendEvent,
         attachmentDirs: sessionAttachmentDirs.length > 0 ? sessionAttachmentDirs : undefined,
         // Resume the live provider session so this round-trip appends to the
         // same Claude thread instead of re-piping the whole window.
