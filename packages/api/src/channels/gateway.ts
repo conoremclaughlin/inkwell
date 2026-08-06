@@ -550,7 +550,8 @@ export class ChannelGateway extends EventEmitter {
 
     // Forward the combined message. On error, release the processing lock
     // so the conversation isn't permanently deadlocked.
-    // On success, the lock is released by sendResponse → processPendingMessages.
+    // On success, the lock is released by releaseConversation() (called from
+    // server.ts after the full message handler completes) → processPendingMessages.
     try {
       await this.forwardToHandler(
         buffer.channel,
