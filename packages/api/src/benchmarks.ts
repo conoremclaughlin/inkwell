@@ -9,6 +9,7 @@ export { ClaudeRunner } from './services/sessions';
 export type { ClaudeRunnerConfig, IRunner } from './services/sessions';
 export type {
   MemoryHybridChunkStrategy,
+  MemorySemanticIndex,
   MemorySemanticQueryStrategy,
   MemorySearchChunkType,
   MemorySearchOptions,
