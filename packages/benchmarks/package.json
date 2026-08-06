@@ -9,6 +9,7 @@
     "benchmark:locomo": "tsx src/benchmark-locomo.ts",
     "benchmark:memory-recall": "tsx src/benchmark-memory-recall.ts",
     "benchmark:bootstrap-relevance": "tsx src/benchmark-bootstrap-relevance.ts",
+    "type-check:locomo": "yarn workspace @inklabs/shared build && tsc -p tsconfig.locomo.json --noEmit",
     "test": "vitest run --config vitest.config.ts",
     "benchmark:memory-answer": "tsx src/benchmark-memory-answer.ts",
     "benchmark:memory-dream": "tsx src/benchmark-memory-dream.ts"
@@ -19,6 +20,7 @@
   },
   "devDependencies": {
     "tsx": "^4.20.6",
+    "typescript": "^5.3.3",
     "vitest": "^4.0.18"
   }
 }

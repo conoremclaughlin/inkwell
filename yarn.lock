@@ -1918,6 +1918,7 @@ __metadata:
   dependencies:
     "@inklabs/api": "workspace:*"
     tsx: "npm:^4.20.6"
+    typescript: "npm:^5.3.3"
     vitest: "npm:^4.0.18"
     zod: "npm:^3.25.0"
   languageName: unknown
