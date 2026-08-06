@@ -1919,6 +1919,7 @@ __metadata:
     "@inklabs/api": "workspace:*"
     tsx: "npm:^4.20.6"
     vitest: "npm:^4.0.18"
+    zod: "npm:^3.25.0"
   languageName: unknown
   linkType: soft
 

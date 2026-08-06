@@ -54,3 +54,40 @@ Controlled benchmark flow:
 5. Run recall using explicit modes/variants and record the output/state files.
 
 Future recurrent/dream passes should treat prior extracted views as possible source material too. For example, durable facts may be summarized, deduplicated, contradicted, or consolidated against earlier durable facts rather than only extracted from raw episodic memories.
+
+## LoCoMo experiment terms
+
+LoCoMo is not shaped like LongMemEval. It contains 10 long conversations, and each
+conversation has many questions. We therefore use these terms:
+
+- **Conversation/sample**: one isolated LoCoMo conversation (`sample_id`). This is the normal retrieval scope.
+- **Session document**: one chronological `session_<n>` containing all of that session's turns and timestamp.
+- **Turn document**: one dialog turn identified by `dia_id`.
+- **QA row**: question, answer, category, and evidence IDs. QA labels belong only in the evaluation manifest—never in embedded source text.
+
+Run the loader audit before seeding:
+
+```bash
+yarn workspace @inklabs/benchmarks audit:locomo
+```
+
+For the public `locomo10.json` currently identified by SHA-256
+`79fa87e90f04081343b8c8debecb80a9a6842b76a7aa537dc9fdf651ea698ff4`, the
+clean loader finds:
+
+- 10 conversations
+- 272 sessions
+- 5,882 turns
+- 1,986 QA rows
+- 1,979 questions with fully resolvable evidence
+- 4 questions with no evidence
+- 3 questions with partial/malformed evidence metadata
+
+The loader preserves the malformed raw fields and records every unambiguous repair.
+It does not silently discard those questions.
+
+`loadLoCoMoDataset()` is retained only as a legacy adapter for the generic per-QA
+harness. Its source is explicitly labeled `legacy-qa-duplicated` because it repeats
+the same conversation for each question. Do not publish results from that path. The
+clean LoCoMo harness must seed a conversation once and reuse it for all of that
+conversation's QA rows.
