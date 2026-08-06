@@ -298,7 +298,7 @@ async function seedDocuments(params: {
   userId: string;
   logger: RunLogger;
   progressEvery: number;
-}): Promise<void> {
+}): Promise<{ created: number; reused: number; elapsedMs: number }> {
   const { documents, state, statePath, datasetSha256, userId, logger, progressEvery } = params;
   const supabase = createSupabaseClient();
   const repository = new MemoryRepository(supabase);
@@ -306,11 +306,14 @@ async function seedDocuments(params: {
   const databaseRows = await loadSeedRows(supabase, userId, seedTopic);
   let totalMs = 0;
   let completed = 0;
+  let created = 0;
+  let reused = 0;
 
   await logger.log('seed progress', progressDetails(0, documents.length, 0));
 
   for (const document of documents) {
     const contentSha256 = sha256(document.content);
+    const existingManifestDocument = state.documents[document.documentId];
     let row = databaseRows.get(document.documentId);
     if (row) {
       const metadata = readLoCoMoMetadata(row.metadata);
@@ -377,6 +380,9 @@ async function seedDocuments(params: {
         return persisted;
       });
       databaseRows.set(document.documentId, row);
+      created += 1;
+    } else {
+      reused += 1;
     }
 
     assertRawContentOnly(row, document.documentId);
@@ -392,7 +398,8 @@ async function seedDocuments(params: {
       contentCharacters: document.content.length,
       embeddingReady: true,
       embeddingChunkCount: row.embedding_chunk_count || 0,
-      seedMs,
+      seedMs:
+        existingManifestDocument?.memoryId === row.id ? existingManifestDocument.seedMs : seedMs,
     };
     await writeLoCoMoSeedState(statePath, state);
 
@@ -401,9 +408,13 @@ async function seedDocuments(params: {
         ...progressDetails(completed, documents.length, totalMs),
         documentId: document.documentId,
         last: formatDuration(seedMs),
+        created,
+        reused,
       });
     }
   }
+
+  return { created, reused, elapsedMs: totalMs };
 }
 
 async function recallQuestions(params: {
@@ -697,7 +708,7 @@ async function main(): Promise<void> {
   }
 
   if (phase === 'seed' || phase === 'all') {
-    await seedDocuments({
+    const seedRun = await seedDocuments({
       documents,
       state: seedState,
       statePath: seedStatePath,
@@ -709,6 +720,9 @@ async function main(): Promise<void> {
     await logger.log('seed complete', {
       seedStatePath,
       selectedDocuments: documents.length,
+      createdDocuments: seedRun.created,
+      reusedDocuments: seedRun.reused,
+      elapsed: formatDuration(seedRun.elapsedMs),
       stateDocuments: Object.keys(seedState.documents).length,
       contentCharacters: documents.reduce((sum, document) => sum + document.content.length, 0),
       embeddingChunks: documents.reduce(
