@@ -32,8 +32,11 @@ import { injectSessionHeaders, buildSessionEnv, writeRuntimeSessionHint } from '
 // can't distinguish a turn that's still legitimately working from a hung one,
 // so it sits far above any realistic turn. The primary guard is the inactivity
 // timeout below. Override with INK_PROCESS_TIMEOUT_MS.
+//
+// 4 hours: agents doing real multi-step work on the user's behalf can run a
+// long time — the goal is to keep going wherever possible, not to reap eagerly.
 export const PROCESS_TIMEOUT_MS =
-  parseInt(process.env.INK_PROCESS_TIMEOUT_MS || '', 10) || 60 * 60 * 1000;
+  parseInt(process.env.INK_PROCESS_TIMEOUT_MS || '', 10) || 4 * 60 * 60 * 1000;
 
 // Inactivity timeout — the primary liveness guard. The countdown resets on any
 // stdout/stderr activity from the ink subprocess. A working turn emits a steady
@@ -43,18 +46,19 @@ export const PROCESS_TIMEOUT_MS =
 // stalled, network dead, wedged) goes silent and is reaped here, ~12x faster
 // than the absolute backstop.
 //
-// The window must exceed the longest *legitimate* silent gap:
-//   1. Buffered LLM generation — no token stream, so a single generation emits
-//      nothing until it completes (typically 40-55s, sometimes minutes).
-//   2. Away-mode approval polling — requestToolApproval polls silently for up to
-//      300s (DEFAULT_TIMEOUT_SECONDS in approval-api.ts). No stdout/stderr during
-//      the wait. The inactivity window must clear this with margin, or it races
-//      the approval timeout and SIGTERMs the process mid-approval.
+// The window must exceed the longest *legitimate* silent gap. With the ink
+// claude adapter now on stream-json, a turn emits events continuously while it
+// works, so the old buffered-generation silent gap is gone — the only remaining
+// silent gap is away-mode approval polling (requestToolApproval polls silently
+// for up to 300s, DEFAULT_TIMEOUT_SECONDS in approval-api.ts).
 //
-// 7 minutes (420s) clears the 300s approval window with 2 minutes of headroom.
+// 1 hour: deliberately generous. A working turn keeps resetting this the whole
+// time (a 40-minute download or a long research task never trips it); the window
+// only bites a genuinely wedged process, and we'd rather let real work finish
+// than reap it early. Clears the 300s approval poll with enormous margin.
 // Override with INK_INACTIVITY_TIMEOUT_MS.
 export const INACTIVITY_TIMEOUT_MS =
-  parseInt(process.env.INK_INACTIVITY_TIMEOUT_MS || '', 10) || 7 * 60 * 1000;
+  parseInt(process.env.INK_INACTIVITY_TIMEOUT_MS || '', 10) || 60 * 60 * 1000;
 
 // stderr substrings that mark a model-provider stall (vs. local work) — the same
 // family the trigger-retry classifier keys on. Logged when an idle turn is

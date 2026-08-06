@@ -2379,11 +2379,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
       ? parsedBackendTimeoutSeconds * 1000
       : undefined;
   // Idle/token-flow timeout — the primary reaper for server (non-interactive)
-  // turns: kill only after 5 min with NO output. With stream-json the backend
-  // emits continuously, so this fires only on a genuine stall. Sits below the
-  // outer InkRunner inactivity window (7 min) so a stalled turn is reaped here
-  // (clean exit 124) instead of escalating to the outer SIGTERM.
-  const backendIdleTimeoutMs = options.nonInteractive ? 5 * 60 * 1000 : undefined;
+  // turns: kill only after 15 min with NO output. With stream-json the backend
+  // emits continuously, so this fires only on a genuine stall. 15 min clears the
+  // 300s away-mode approval poll with wide margin (a 5-min value would RACE it
+  // and could SIGTERM a turn mid-approval). Sits below the outer InkRunner
+  // inactivity window (1 h) so a stalled turn is reaped here (clean exit 124)
+  // instead of escalating to the outer SIGTERM.
+  const backendIdleTimeoutMs = options.nonInteractive ? 15 * 60 * 1000 : undefined;
 
   // Persisted runtime preferences from .ink/identity.json — CLI flags override these
   const persisted = identity?.runtime;
