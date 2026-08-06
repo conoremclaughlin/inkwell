@@ -967,9 +967,10 @@ export class MemoryRepository {
     const { data, error } = await rpcClient.rpc('match_memories', rpcArgs);
 
     if (error) {
-      logger.warn('Legacy semantic memory recall failed, falling back to text recall', {
-        error: error.message,
-      });
+      if (options.semanticIndex === 'memory-single-vector') {
+        throw new Error(`Forced memory-single-vector semantic recall failed: ${error.message}`);
+      }
+      logger.warn('Memory-level semantic recall failed', { error: error.message });
       return null;
     }
 

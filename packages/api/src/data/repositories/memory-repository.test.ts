@@ -1743,6 +1743,40 @@ describe('MemoryRepository', () => {
       expect(rpc).toHaveBeenCalledWith('match_memories', expect.anything());
     });
 
+    it('fails forced single-vector recall instead of counting an RPC failure as no match', async () => {
+      const rpc = vi.fn().mockResolvedValue({
+        data: null,
+        error: { message: 'upstream unavailable' },
+      });
+      (mockSupabase as any).rpc = rpc;
+      (repo as any).embeddingRouter = {
+        embedQuery: vi.fn().mockResolvedValue({
+          vector: [0.1, 0.2, 0.3],
+          provider: 'ollama',
+          model: 'mxbai-embed-large',
+          dimensions: 1024,
+        }),
+        getRuntimeConfig: vi.fn().mockReturnValue({
+          enabled: true,
+          provider: 'ollama',
+          model: 'mxbai-embed-large',
+          dimensions: 1024,
+          queryThreshold: 0.2,
+          matchCountMultiplier: 5,
+          chunkedRecallEnabled: false,
+        }),
+      };
+
+      await expect(
+        repo.recall('user-456', 'semantic query', {
+          recallMode: 'semantic',
+          semanticIndex: 'memory-single-vector',
+        })
+      ).rejects.toThrow('Forced memory-single-vector semantic recall failed: upstream unavailable');
+
+      expect(rpc).toHaveBeenCalledTimes(1);
+    });
+
     it('can force chunk recall without silently falling back to a different index', async () => {
       const rpc = vi.fn().mockResolvedValue({
         data: null,
