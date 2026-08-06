@@ -6,6 +6,7 @@
   "description": "Benchmark harnesses for Inkwell memory and runtime evaluation",
   "scripts": {
     "audit:locomo": "tsx src/audit-locomo.ts",
+    "benchmark:locomo": "tsx src/benchmark-locomo.ts",
     "benchmark:memory-recall": "tsx src/benchmark-memory-recall.ts",
     "benchmark:bootstrap-relevance": "tsx src/benchmark-bootstrap-relevance.ts",
     "test": "vitest run --config vitest.config.ts",

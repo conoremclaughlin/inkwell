@@ -92,7 +92,7 @@ describe('LoCoMo benchmark logic', () => {
         malformedEvidence: [],
         targetDocumentIds: ['doc-a', 'doc-b'],
         scorable: true,
-        rank: 2,
+        firstRelevantRank: 2,
         retrieved: [
           { memoryId: 'm0', documentId: 'noise', finalScore: 0.9 },
           { memoryId: 'm1', documentId: 'doc-a', finalScore: 0.8 },
@@ -113,7 +113,7 @@ describe('LoCoMo benchmark logic', () => {
         targetDocumentIds: [],
         scorable: false,
         unscorableReason: 'no-evidence-annotation',
-        rank: null,
+        firstRelevantRank: null,
         retrieved: [],
         recallMs: 200,
       },
@@ -125,11 +125,16 @@ describe('LoCoMo benchmark logic', () => {
       questions: 2,
       scorableQuestions: 1,
       unscorableQuestions: 1,
-      mrr: 0.5,
+      maxK: 3,
+      mrrAtMaxK: 0.5,
       averageRecallMs: 150,
     });
     expect(metrics.byK['1']).toEqual({ hitAny: 0, hitAll: 0, evidenceCoverage: 0 });
     expect(metrics.byK['2']).toEqual({ hitAny: 1, hitAll: 0, evidenceCoverage: 0.5 });
     expect(metrics.byK['3']).toEqual({ hitAny: 1, hitAll: 1, evidenceCoverage: 1 });
+  });
+
+  it('rejects an empty retrieval cutoff list', () => {
+    expect(() => calculateLoCoMoMetrics([], [])).toThrow('retrieval cutoff');
   });
 });

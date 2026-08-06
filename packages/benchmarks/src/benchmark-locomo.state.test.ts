@@ -21,6 +21,7 @@ describe('LoCoMo benchmark state', () => {
       datasetSource: 'file:locomo.json',
       datasetSha256: 'abc',
       representation: 'turn',
+      semanticIndex: 'memory-chunks',
       embeddingConfigKey: 'ollama-model',
       userId: 'user-1',
       agentId: 'lumen',

@@ -45,6 +45,7 @@
     "test:integration:db:local": "bash ./scripts/test-integration-db-local.sh",
     "test:integration:runtime": "yarn workspace @inklabs/api test:integration:runtime",
     "benchmark:memory-recall": "yarn workspace @inklabs/benchmarks benchmark:memory-recall",
+    "benchmark:locomo": "yarn workspace @inklabs/benchmarks benchmark:locomo",
     "benchmark:bootstrap-relevance": "yarn workspace @inklabs/benchmarks benchmark:bootstrap-relevance",
     "backfill:memory-embeddings": "yarn workspace @inklabs/api backfill:memory-embeddings",
     "lint": "yarn workspaces foreach -A run lint",

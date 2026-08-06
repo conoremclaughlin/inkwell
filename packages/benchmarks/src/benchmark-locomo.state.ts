@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
+import type { MemorySemanticIndex } from '@inklabs/api/benchmarks';
 import type { LoCoMoRepresentation } from './benchmark-data/locomo-loader';
 import type { LoCoMoQuestionRun } from './benchmark-locomo.logic';
 
@@ -39,6 +40,8 @@ export interface LoCoMoRunState {
   datasetSha256: string;
   representation: LoCoMoRepresentation;
   recallMode: 'semantic';
+  semanticIndex: Exclude<MemorySemanticIndex, 'runtime-configured'>;
+  semanticChunkTypes: ['content'];
   topKs: number[];
   sampleIds: string[];
   questionLimit: number | null;
@@ -89,6 +92,7 @@ export function createLoCoMoRunState(params: {
   seedId: string;
   datasetSha256: string;
   representation: LoCoMoRepresentation;
+  semanticIndex: Exclude<MemorySemanticIndex, 'runtime-configured'>;
   topKs: number[];
   sampleIds: string[];
   questionLimit: number | null;
@@ -100,6 +104,7 @@ export function createLoCoMoRunState(params: {
     version: 1,
     ...params,
     recallMode: 'semantic',
+    semanticChunkTypes: ['content'],
     createdAt: now,
     updatedAt: now,
     completedQuestions: {},

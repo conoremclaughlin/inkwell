@@ -91,3 +91,67 @@ harness. Its source is explicitly labeled `legacy-qa-duplicated` because it repe
 the same conversation for each question. Do not publish results from that path. The
 clean LoCoMo harness must seed a conversation once and reuse it for all of that
 conversation's QA rows.
+
+## Clean LoCoMo retrieval baseline
+
+The dedicated harness uses one isolated LoCoMo conversation as the retrieval scope.
+It never embeds QA questions, answers, evidence labels, or cross-conversation text.
+Rows use the non-identity recall scope `__benchmark_locomo__`, so they are excluded from
+normal Lumen/Wren/Aster recall despite sharing the same database.
+
+In this harness, **seeding** means all of the following completed for each selected
+source document:
+
+1. one raw `memories` row was created;
+2. its raw content was embedded by the configured provider;
+3. the content vector(s) were persisted in `memory_embedding_chunks`;
+4. the seed manifest recorded the source document ID, memory ID, content hash, chunk count,
+   and elapsed time.
+
+It does **not** mean an LLM extraction or dream pass ran. The harness verifies that every
+seed contains content chunks only and fails if summary, fact, entity, or other derived vectors
+appear. A turn is one source document; a session is one source document that may require
+multiple content chunks because the local model's vetted input limit is shorter than some
+sessions.
+
+Seed the complete turn representation with local embeddings:
+
+```bash
+BENCHMARK_USER_ID=<uuid> \
+MEMORY_EMBEDDINGS_ENABLED=true \
+MEMORY_EMBEDDING_PROVIDER=ollama \
+MEMORY_EMBEDDING_MODEL=mxbai-embed-large \
+LOCOMO_PHASE=seed \
+LOCOMO_REPRESENTATION=turn \
+yarn benchmark:locomo
+```
+
+Run content-only semantic retrieval against that seed:
+
+```bash
+BENCHMARK_USER_ID=<uuid> \
+MEMORY_EMBEDDINGS_ENABLED=true \
+MEMORY_EMBEDDING_PROVIDER=ollama \
+MEMORY_EMBEDDING_MODEL=mxbai-embed-large \
+LOCOMO_PHASE=recall \
+LOCOMO_REPRESENTATION=turn \
+LOCOMO_SEMANTIC_INDEX=memory-chunks \
+LOCOMO_RUN_ID=<stable-run-id> \
+yarn benchmark:locomo
+```
+
+`LOCOMO_SEMANTIC_INDEX=memory-chunks` is forced: an RPC error fails the run rather than
+silently falling back to `memories.embedding`. The alternate
+`memory-single-vector` ablation explicitly searches that memory-level vector. For an
+over-limit session, the current write path stores its first content chunk—not the impossible
+full-session input—in `memories.embedding`; the result manifest states this explicitly.
+
+There are no implicit sample, question, or distractor caps. `LOCOMO_SAMPLE_IDS` and
+`LOCOMO_QUESTION_LIMIT` apply only when explicitly set. A question limit never removes source
+documents from a selected conversation, so every within-conversation distractor remains present.
+
+Each run always writes tail-able progress logs plus atomic resumable state under
+`packages/benchmarks/output/locomo/` (or the paths given by `LOCOMO_LOG_PATH`,
+`LOCOMO_SEED_STATE_PATH`, and `LOCOMO_RUN_STATE_PATH`). The final result separates
+hit-any@K, hit-all@K, evidence coverage@K, and MRR@max-K; it does not call a censored top-K
+rank an unbounded MRR.

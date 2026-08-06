@@ -24,7 +24,8 @@ export interface LoCoMoQuestionRun {
   targetDocumentIds: string[];
   scorable: boolean;
   unscorableReason?: string;
-  rank: number | null;
+  /** Rank of the first evidence document within the retrieved max-K window. */
+  firstRelevantRank: number | null;
   retrieved: LoCoMoRetrievedDocument[];
   recallMs: number;
 }
@@ -33,7 +34,9 @@ export interface LoCoMoMetricSummary {
   questions: number;
   scorableQuestions: number;
   unscorableQuestions: number;
-  mrr: number;
+  maxK: number;
+  /** Mean reciprocal rank censored at maxK, not an unbounded-corpus MRR. */
+  mrrAtMaxK: number;
   averageRecallMs: number;
   byK: Record<
     string,
@@ -48,7 +51,7 @@ export interface LoCoMoMetricSummary {
     {
       questions: number;
       scorableQuestions: number;
-      mrr: number;
+      mrrAtMaxK: number;
       byK: Record<
         string,
         {
@@ -102,6 +105,7 @@ export function buildLoCoMoTargetDocumentIds(
 
 function summarizeRuns(runs: LoCoMoQuestionRun[], topKs: number[]) {
   const scorable = runs.filter((run) => run.scorable);
+  const maxK = Math.max(...topKs);
   const byK: LoCoMoMetricSummary['byK'] = {};
 
   for (const topK of topKs) {
@@ -132,7 +136,10 @@ function summarizeRuns(runs: LoCoMoQuestionRun[], topKs: number[]) {
     questions: runs.length,
     scorableQuestions: scorable.length,
     unscorableQuestions: runs.length - scorable.length,
-    mrr: round(mean(scorable.map((run) => (run.rank ? 1 / run.rank : 0)))),
+    maxK,
+    mrrAtMaxK: round(
+      mean(scorable.map((run) => (run.firstRelevantRank ? 1 / run.firstRelevantRank : 0)))
+    ),
     averageRecallMs: round(mean(runs.map((run) => run.recallMs))),
     byK,
   };
@@ -142,6 +149,7 @@ export function calculateLoCoMoMetrics(
   runs: LoCoMoQuestionRun[],
   topKs: number[]
 ): LoCoMoMetricSummary {
+  if (topKs.length === 0) throw new Error('At least one retrieval cutoff is required.');
   const overall = summarizeRuns(runs, topKs);
   const categoryNames = [...new Set(runs.map((run) => run.categoryName))];
   const byCategory: LoCoMoMetricSummary['byCategory'] = {};
@@ -154,7 +162,7 @@ export function calculateLoCoMoMetrics(
     byCategory[categoryName] = {
       questions: category.questions,
       scorableQuestions: category.scorableQuestions,
-      mrr: category.mrr,
+      mrrAtMaxK: category.mrrAtMaxK,
       byK: category.byK,
     };
   }
