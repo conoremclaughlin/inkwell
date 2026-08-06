@@ -12,6 +12,8 @@ import { encodeContextToken } from '@inklabs/shared';
 import { buildIdentityPrompt } from './identity.js';
 import { buildMergedMcpConfig } from '../lib/skill-mcp.js';
 import type { BackendAdapter, BackendConfig, PreparedBackend } from './types.js';
+import type { BackendStreamParser } from './stream.js';
+import { ClaudeStreamParser } from './claude-stream.js';
 
 /**
  * Check if the PCP channel plugin is registered in .mcp.json.
@@ -44,6 +46,14 @@ export class ClaudeAdapter implements BackendAdapter {
     // stdin when no positional prompt is given.
     if (config.prompt) {
       args.push('-p');
+    }
+
+    // Structured streaming output. Lets ink parse Claude's turn incrementally —
+    // for live CLI/website updates AND a token-flow idle timeout — instead of a
+    // buffered blob. `--verbose` is required by Claude to combine `-p` with
+    // stream-json. Parsed by ClaudeStreamParser (see createStreamParser).
+    if (config.stream) {
+      args.push('--output-format', 'stream-json', '--verbose');
     }
 
     // Model (only if explicitly specified)
@@ -126,5 +136,9 @@ export class ClaudeAdapter implements BackendAdapter {
       cleanup: mcpCleanup,
       ...(config.prompt ? { stdinData: config.prompt } : {}),
     };
+  }
+
+  createStreamParser(): BackendStreamParser {
+    return new ClaudeStreamParser();
   }
 }

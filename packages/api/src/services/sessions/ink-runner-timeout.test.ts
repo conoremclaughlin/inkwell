@@ -100,8 +100,11 @@ describe('InkRunner inactivity timeout', () => {
 
     // Emit a tool_call line every (window - 1s) for well past the window's worth
     // of wall-clock. Each emission resets the idle timer, so it never trips.
+    // Stay under the absolute backstop (derive from the constants so this holds
+    // regardless of their exact values / ratio).
     const step = INACTIVITY_TIMEOUT_MS - 1000;
-    for (let i = 0; i < 5; i++) {
+    const iterations = Math.max(2, Math.floor(PROCESS_TIMEOUT_MS / step) - 1);
+    for (let i = 0; i < iterations; i++) {
       await vi.advanceTimersByTimeAsync(step);
       child.stdout.emit(
         'data',

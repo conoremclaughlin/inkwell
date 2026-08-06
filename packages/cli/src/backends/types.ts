@@ -5,6 +5,8 @@
  * to handle identity injection, MCP config, and flag mapping.
  */
 
+import type { BackendStreamParser } from './stream.js';
+
 export interface BackendConfig {
   agentId: string;
   model?: string; // undefined = use backend's default model
@@ -25,6 +27,12 @@ export interface BackendConfig {
    * this — the attachment paths still appear in the prompt text.
    */
   attachmentDirs?: string[];
+  /**
+   * Opt this turn into structured streaming output. Adapters that support it
+   * (claude: `--output-format stream-json --verbose`) add the flags; others
+   * ignore it and run in plain-text mode.
+   */
+  stream?: boolean;
 }
 
 export interface PreparedBackend {
@@ -51,4 +59,12 @@ export interface BackendAdapter {
    * Returns a cleanup function to remove temp files on exit.
    */
   prepare(config: BackendConfig): PreparedBackend;
+
+  /**
+   * Optional. Presence declares "this adapter emits a parseable event stream"
+   * (when spawned with `stream: true`). Returns a FRESH per-turn parser that
+   * turns raw stdout chunks into normalized `BackendTurnEvent`s. When absent,
+   * the runner treats stdout as opaque response text (plain-text backends).
+   */
+  createStreamParser?(): BackendStreamParser;
 }
