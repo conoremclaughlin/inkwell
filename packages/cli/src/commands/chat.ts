@@ -2370,7 +2370,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       ? Number.parseInt(options.backendTimeoutSeconds, 10)
       : Number.NaN;
   // Hard ceiling: an explicit --backend-timeout-seconds override, else undefined
-  // (→ backend-runner's generous ~20-min backstop). The old blunt 120s
+  // (→ backend-runner's 4-hour runaway backstop). The old blunt 120s
   // non-interactive wall is GONE — it killed legitimately long turns at the
   // completion boundary (exit 124 → false backend-error). Long turns are now
   // governed by the idle/token-flow timeout below, not wall-clock.
@@ -3432,10 +3432,17 @@ export async function runChat(options: ChatOptions): Promise<void> {
           agentId,
           model: runtime.model,
           prompt: buildCompactionPrompt(chunk),
-          // Summarizing a large chunk takes longer than a normal turn
-          timeoutMs: Math.max(runtime.backendTurnTimeoutMs ?? 0, 5 * 60 * 1000),
+          // Summarization is governed like any other turn: token-flow (idle)
+          // is the reaper, with the 4h runaway backstop. An explicit
+          // --backend-timeout-seconds still caps it, floored at 5 min —
+          // summarizing a large chunk outlives short overrides.
+          timeoutMs: runtime.backendTurnTimeoutMs
+            ? Math.max(runtime.backendTurnTimeoutMs, 5 * 60 * 1000)
+            : undefined,
+          idleTimeoutMs: runtime.backendIdleTimeoutMs,
+          stream: true,
         });
-        const summaryText = turn.success ? turn.stdout.trim() : '';
+        const summaryText = turn.success ? (turn.responseText ?? turn.stdout).trim() : '';
         if (!summaryText) {
           throw new Error(turn.stderr.trim().slice(0, 200) || `exit code ${turn.exitCode}`);
         }
@@ -6705,7 +6712,7 @@ export function registerChatCommand(program: Command): void {
       .option('--max-turns <n>', 'Run up to N conversational turns then exit (requires --message)')
       .option(
         '--backend-timeout-seconds <n>',
-        'Backend turn timeout in seconds (default: 120 for --non-interactive, otherwise 1200)'
+        'Hard ceiling for one backend turn, in seconds. Default: none — turns are governed by the idle/token-flow timeout (15 min without output in --non-interactive) plus a 4-hour runaway backstop.'
       )
       .option('--sb-debug', 'Enable ink debug logging for chat runtime')
       .option(

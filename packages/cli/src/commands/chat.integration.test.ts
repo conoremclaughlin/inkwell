@@ -1816,7 +1816,7 @@ describe('runChat integration', () => {
     expect(testState.pcpCalls.some((call) => call.tool === 'send_to_inbox')).toBe(true);
   }, 10_000);
 
-  it('applies default backend timeout for non-interactive turns', async () => {
+  it('leaves the hard timeout unset and applies the idle timeout for non-interactive turns', async () => {
     await runChat({
       agent: 'lumen',
       backend: 'codex',
@@ -1828,8 +1828,15 @@ describe('runChat integration', () => {
     expect(testState.runBackendImpl).toHaveBeenCalledTimes(1);
     const backendRequest = testState.runBackendImpl.mock.calls[0][0] as {
       timeoutMs?: number;
+      idleTimeoutMs?: number;
+      stream?: boolean;
     };
-    expect(backendRequest.timeoutMs).toBe(120_000);
+    // No default hard wall — the turn is governed by token-flow: 15 min of
+    // silence reaps it (below the outer InkRunner 1h inactivity window), and
+    // backend-runner's 4h runaway backstop covers the pathological case.
+    expect(backendRequest.timeoutMs).toBeUndefined();
+    expect(backendRequest.idleTimeoutMs).toBe(900_000);
+    expect(backendRequest.stream).toBe(true);
   });
 
   it('applies explicit --backend-timeout-seconds override', async () => {

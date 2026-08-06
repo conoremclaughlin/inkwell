@@ -3,6 +3,15 @@ import { getBackend } from '../backends/index.js';
 import type { BackendTurnEvent } from '../backends/stream.js';
 import { extractBackendTokenUsage, type BackendTokenUsage } from './token-usage.js';
 
+/**
+ * Default absolute backstop for a single backend turn. Deliberately generous:
+ * the idle/token-flow timeout is the primary reaper (it resets on every output
+ * chunk, so an actively-working streamed turn never trips it). This ceiling
+ * exists only to reap a truly runaway process, mirroring the outer InkRunner
+ * 4-hour PROCESS_TIMEOUT_MS — a working turn should never die on wall-clock.
+ */
+export const DEFAULT_TURN_HARD_TIMEOUT_MS = 4 * 60 * 60 * 1000;
+
 export interface BackendRunRequest {
   backend: string;
   agentId: string;
@@ -10,7 +19,10 @@ export interface BackendRunRequest {
   prompt: string;
   verbose?: boolean;
   passthroughArgs?: string[];
-  /** Hard ceiling (ms). Backstop; the idle timeout is the primary reaper. */
+  /**
+   * Hard ceiling (ms). Runaway backstop only — the idle timeout is the primary
+   * reaper. Defaults to DEFAULT_TURN_HARD_TIMEOUT_MS (4 h).
+   */
   timeoutMs?: number;
   /**
    * Idle/token-flow timeout (ms) — kill the turn only if NO output flows for
@@ -114,7 +126,7 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
     args: prepared.args,
     env: prepared.env,
     stdinData: prepared.stdinData,
-    timeoutMs: request.timeoutMs || 20 * 60 * 1000,
+    timeoutMs: request.timeoutMs || DEFAULT_TURN_HARD_TIMEOUT_MS,
     idleTimeoutMs: request.idleTimeoutMs,
     onStdout:
       streaming || request.verbose
