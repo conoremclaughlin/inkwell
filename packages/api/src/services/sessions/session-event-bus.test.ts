@@ -165,3 +165,231 @@ describe('SessionEventBus', () => {
     unsub();
   });
 });
+
+/**
+ * Observer-attach channel (spec:observer-attach M2) — canonical ledger
+ * entries keyed by ledger eid, durable replay, atomic cutover, and the
+ * overflow-DISCONNECT policy (never skip-ahead). Contracts from Lumen's
+ * v2 review, ported from the standalone draft suite.
+ */
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { afterEach } from 'vitest';
+import {
+  SessionEventBus as _BusForType,
+  type ObserverEntry,
+  type ObserverSink,
+  type ObserverSinkEndReason,
+  OBS_QUEUE_MAX_EVENTS,
+  OBS_QUEUE_MAX_BYTES,
+  OBS_MAX_SUBSCRIBERS,
+} from './session-event-bus.js';
+
+const obsEntry = (eid: number, type = 'backend_tool', extra: Record<string, unknown> = {}) =>
+  ({
+    eid,
+    ts: `2026-08-07T00:00:${String(eid).padStart(2, '0')}.000Z`,
+    type,
+    ...extra,
+  }) as ObserverEntry;
+
+/** A test sink with controllable backpressure. */
+class TestSink implements ObserverSink {
+  received: ObserverEntry[] = [];
+  endedWith: ObserverSinkEndReason | null = null;
+  blocked = false;
+  private drainWaiters: Array<() => void> = [];
+
+  write(e: ObserverEntry): boolean {
+    this.received.push(e);
+    return !this.blocked;
+  }
+  waitDrain(): Promise<void> {
+    return new Promise((resolve) => this.drainWaiters.push(resolve));
+  }
+  end(reason: ObserverSinkEndReason): void {
+    this.endedWith = reason;
+  }
+  release(): void {
+    this.blocked = false;
+    const waiters = this.drainWaiters;
+    this.drainWaiters = [];
+    for (const w of waiters) w();
+  }
+}
+
+describe('SessionEventBus observer channel', () => {
+  let bus: InstanceType<typeof _BusForType>;
+  let dir: string;
+
+  beforeEach(() => {
+    bus = new _BusForType();
+    dir = mkdtempSync(join(tmpdir(), 'obs-bus-test-'));
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  function writeLedger(entries: ObserverEntry[]): string {
+    const replDir = join(dir, '.ink', 'runtime', 'repl');
+    mkdirSync(replDir, { recursive: true });
+    const path = join(replDir, 'sess-1-123.jsonl');
+    writeFileSync(path, entries.map((e) => JSON.stringify(e)).join('\n') + '\n');
+    return path;
+  }
+
+  it('fans out published entries to multiple observers in order', async () => {
+    const a = new TestSink();
+    const b = new TestSink();
+    await bus.subscribeObserver('s1', a);
+    await bus.subscribeObserver('s1', b);
+
+    bus.publishObserverEntry('s1', obsEntry(1));
+    bus.publishObserverEntry('s1', obsEntry(2));
+    await new Promise((r) => setImmediate(r));
+
+    expect(a.received.map((e) => e.eid)).toEqual([1, 2]);
+    expect(b.received.map((e) => e.eid)).toEqual([1, 2]);
+  });
+
+  it('afterEid is exclusive — replay begins at eid > cursor', async () => {
+    for (let i = 1; i <= 5; i++) bus.publishObserverEntry('s1', obsEntry(i));
+    const sink = new TestSink();
+    await bus.subscribeObserver('s1', sink, { afterEid: 3 });
+    expect(sink.received.map((e) => e.eid)).toEqual([4, 5]);
+  });
+
+  it('default attach (no cursor) replays the ring only', async () => {
+    const path = writeLedger([obsEntry(1), obsEntry(2)]);
+    bus.registerLedgerPath('s1', path);
+    bus.publishObserverEntry('s1', obsEntry(3)); // only eid 3 is in the ring
+    const sink = new TestSink();
+    await bus.subscribeObserver('s1', sink);
+    expect(sink.received.map((e) => e.eid)).toEqual([3]);
+  });
+
+  it('backfills from the ledger when the cursor precedes the ring', async () => {
+    const path = writeLedger([obsEntry(1), obsEntry(2), obsEntry(3), obsEntry(4)]);
+    bus.registerLedgerPath('s1', path);
+    bus.publishObserverEntry('s1', obsEntry(3));
+    bus.publishObserverEntry('s1', obsEntry(4));
+
+    const sink = new TestSink();
+    await bus.subscribeObserver('s1', sink, { afterEid: 1 });
+    expect(sink.received.map((e) => e.eid)).toEqual([2, 3, 4]);
+  });
+
+  it('CUTOVER RACE: entries published during disk replay arrive gapless and duplicate-free', async () => {
+    const ledgerEntries = Array.from({ length: 40 }, (_, i) => obsEntry(i + 1));
+    const path = writeLedger(ledgerEntries);
+    bus.registerLedgerPath('s1', path);
+    for (let i = 35; i <= 40; i++) bus.publishObserverEntry('s1', obsEntry(i));
+
+    const sink = new TestSink();
+    const subscribing = bus.subscribeObserver('s1', sink, { afterEid: 0 });
+    for (let i = 41; i <= 45; i++) bus.publishObserverEntry('s1', obsEntry(i));
+    await subscribing;
+    bus.publishObserverEntry('s1', obsEntry(46));
+    await new Promise((r) => setImmediate(r));
+
+    const eids = sink.received.map((e) => e.eid);
+    expect(eids).toEqual(Array.from({ length: 46 }, (_, i) => i + 1));
+  });
+
+  it('overflow DISCONNECTS the observer — it never skips ahead', async () => {
+    const sink = new TestSink();
+    await bus.subscribeObserver('s1', sink);
+    sink.blocked = true;
+
+    for (let i = 1; i <= OBS_QUEUE_MAX_EVENTS + 3; i++) {
+      bus.publishObserverEntry('s1', obsEntry(i));
+    }
+    await new Promise((r) => setImmediate(r));
+
+    expect(sink.endedWith).toBe('overflow');
+    const eids = sink.received.map((e) => e.eid);
+    expect(eids).toEqual(Array.from({ length: eids.length }, (_, i) => i + 1));
+  });
+
+  it('caps observer queues by bytes, not just count', async () => {
+    const sink = new TestSink();
+    await bus.subscribeObserver('s1', sink);
+    sink.blocked = true;
+
+    const big = 'x'.repeat(Math.ceil(OBS_QUEUE_MAX_BYTES / 4));
+    for (let i = 1; i <= 6; i++) {
+      bus.publishObserverEntry('s1', obsEntry(i, 'backend_text', { preview: big }));
+    }
+    await new Promise((r) => setImmediate(r));
+
+    expect(sink.endedWith).toBe('overflow');
+  });
+
+  it('publishObserverEntry never blocks on a stalled observer', async () => {
+    const sink = new TestSink();
+    await bus.subscribeObserver('s1', sink);
+    sink.blocked = true;
+
+    const start = performance.now();
+    for (let i = 1; i <= 10; i++) bus.publishObserverEntry('s1', obsEntry(i));
+    const elapsed = performance.now() - start;
+    expect(elapsed).toBeLessThan(50);
+  });
+
+  it('enforces the per-session observer cap', async () => {
+    for (let i = 0; i < OBS_MAX_SUBSCRIBERS; i++) {
+      await bus.subscribeObserver('s1', new TestSink());
+    }
+    const overflowSink = new TestSink();
+    await expect(bus.subscribeObserver('s1', overflowSink)).rejects.toThrow(/limit/i);
+    expect(overflowSink.endedWith).toBe('replay_failed');
+  });
+
+  it('filters non-projection types at ingest and replay', async () => {
+    // The ledger is always a superset of the ring: the runtime appends
+    // synchronously BEFORE emitting the obs line.
+    const path = writeLedger([
+      obsEntry(1, 'user', { content: 'hi' }),
+      obsEntry(2, 'hook_injection', { content: 'internal' }),
+      obsEntry(3, 'delegation_send', { secret: 'never' }),
+      obsEntry(4, 'assistant', { content: 'hello' }),
+      obsEntry(6, 'backend_tool'),
+    ]);
+    bus.registerLedgerPath('s1', path);
+    bus.publishObserverEntry('s1', obsEntry(5, 'activity')); // ignored at ingest
+    bus.publishObserverEntry('s1', obsEntry(6, 'backend_tool'));
+
+    const sink = new TestSink();
+    await bus.subscribeObserver('s1', sink, { afterEid: 0 });
+    expect(sink.received.map((e) => e.eid)).toEqual([1, 4, 6]);
+  });
+
+  it('fails the subscription when the cursor precedes the ring and no ledger is registered', async () => {
+    bus.publishObserverEntry('s1', obsEntry(10));
+    const sink = new TestSink();
+    await expect(bus.subscribeObserver('s1', sink, { afterEid: 2 })).rejects.toThrow(/ledger/i);
+    expect(sink.endedWith).toBe('replay_failed');
+  });
+
+  it('rejects relative, non-jsonl, and out-of-tree ledger paths', async () => {
+    bus.registerLedgerPath('s1', 'relative/path.jsonl');
+    bus.registerLedgerPath('s1', join(dir, '.ink', 'runtime', 'repl', 'not-jsonl.txt'));
+    bus.registerLedgerPath('s1', join(dir, 'outside', 'evil.jsonl'));
+    bus.publishObserverEntry('s1', obsEntry(5));
+    const sink = new TestSink();
+    await expect(bus.subscribeObserver('s1', sink, { afterEid: 1 })).rejects.toThrow(/ledger/i);
+  });
+
+  it('follow=false replays then ends without following', async () => {
+    for (let i = 1; i <= 3; i++) bus.publishObserverEntry('s1', obsEntry(i));
+    const sink = new TestSink();
+    await bus.subscribeObserver('s1', sink, { afterEid: 0, follow: false });
+    bus.publishObserverEntry('s1', obsEntry(4));
+    await new Promise((r) => setImmediate(r));
+
+    expect(sink.received.map((e) => e.eid)).toEqual([1, 2, 3]);
+    expect(sink.endedWith).toBe('unsubscribed');
+  });
+});

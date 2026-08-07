@@ -2956,6 +2956,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
       : undefined;
   runtime.transcriptPath = existingTranscript || ensureRuntimeTranscriptPath(runtime.sessionId);
 
+  // Announce the ledger's absolute location to the server (session_meta) so
+  // observer replay has a server-owned locator (spec:observer-attach §4.3).
+  // The runtime is the authority on where it writes — the server validates
+  // shape but never derives paths from its own cwd or caller input.
+  emitStreamEvent({ type: 'session_meta', transcriptPath: runtime.transcriptPath });
+
   // ── Provider session reuse (claude only) — Stage 2 ──
   // One provider-native session id per ink session, reused across turns AND
   // across processes. Seeded on the first backend spawn, resumed thereafter,

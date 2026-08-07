@@ -20,6 +20,10 @@
  */
 
 import { EventEmitter } from 'events';
+import { createReadStream } from 'fs';
+import { stat } from 'fs/promises';
+import { createInterface } from 'readline';
+import { isAbsolute, sep } from 'path';
 import { logger } from '../../utils/logger.js';
 
 /** A single live event about a session's turn (tool call, status, result, …). */
@@ -42,6 +46,106 @@ export interface SessionStreamEvent {
 
 export type SessionStreamListener = (event: SessionStreamEvent) => void;
 
+// ─── Observer attach (spec:observer-attach §4.3–4.4) ─────────────────────────
+//
+// Alongside the legacy best-effort live tap above, the bus carries a second,
+// stronger channel: canonical ledger entries (`obs` lines from the ink
+// runtime), keyed by the ledger's monotonic eid. For these, the ledger is the
+// truth — observers attach with *replay after cursor, then follow*, and a
+// subscriber that can't keep up is DISCONNECTED (never skipped ahead) so its
+// view can never diverge from the ledger; it reconverges via durable replay.
+
+/** A canonical ledger entry, exactly as appended by the runtime (eid included). */
+export interface ObserverEntry {
+  eid: number;
+  ts: string;
+  type: string;
+  [key: string]: unknown;
+}
+
+export type ObserverSinkEndReason =
+  | 'overflow'
+  | 'session_released'
+  | 'unsubscribed'
+  | 'replay_failed'
+  | 'sink_error';
+
+/**
+ * Delivery channel for an observer. `write` returns false when the transport
+ * is backpressured; the bus's per-subscriber pump awaits `waitDrain` — the
+ * PUBLISHER never does.
+ */
+export interface ObserverSink {
+  write(entry: ObserverEntry): boolean;
+  waitDrain(): Promise<void>;
+  end(reason: ObserverSinkEndReason): void;
+}
+
+export interface ObserverSubscribeOptions {
+  /** Exclusive cursor: replay begins at the first entry with eid > afterEid.
+   *  Omitted → replay the in-memory ring only (default attach). */
+  afterEid?: number;
+  /** false → replay only, then end('unsubscribed'). Default true. */
+  follow?: boolean;
+}
+
+/**
+ * The observer projection (spec §4.1): ledger entry types observers may see.
+ * Internal bookkeeping (hooks, eviction refs, delegation flows, permission
+ * plumbing) is excluded — identically in replay and live. delegation_* stays
+ * out per the credential sequencing rule (§4.7).
+ */
+export const OBSERVER_PROJECTION_TYPES: ReadonlySet<string> = new Set([
+  'user',
+  'system_turn',
+  'auto_turn',
+  'assistant',
+  'inbox',
+  'backend_tool',
+  'backend_text',
+  'local_tool_call',
+  'pcp_tool',
+  'backend_session',
+  'compaction',
+  'session_pause',
+  'session_end',
+]);
+
+const intFromEnv = (name: string, fallback: number): number => {
+  const raw = Number.parseInt(process.env[name] ?? '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : fallback;
+};
+
+export const OBS_RING_CAPACITY = intFromEnv('SESSION_EVENT_RING_SIZE', 1_000);
+export const OBS_QUEUE_MAX_EVENTS = intFromEnv('SESSION_OBSERVE_QUEUE_EVENTS', 64);
+export const OBS_QUEUE_MAX_BYTES = intFromEnv('SESSION_OBSERVE_QUEUE_BYTES', 256 * 1024);
+export const OBS_MAX_SUBSCRIBERS = intFromEnv('SESSION_OBSERVE_MAX_SUBSCRIBERS', 8);
+export const OBS_RETENTION_MS = intFromEnv('SESSION_OBSERVE_RETENTION_MS', 5 * 60_000);
+
+interface ObserverSubscriber {
+  sink: ObserverSink;
+  /** Post-cutover delivery queue (count- and byte-capped). */
+  queue: ObserverEntry[];
+  queuedBytes: number;
+  pumping: boolean;
+  /** True from synchronous registration until the capture queue is drained. */
+  replaying: boolean;
+  /** Live entries (> high-water H) arriving during replay. Same caps. */
+  capture: ObserverEntry[];
+  captureBytes: number;
+  closed: boolean;
+}
+
+interface ObserverChannel {
+  ledgerPath?: string;
+  ring: ObserverEntry[];
+  lastEid: number;
+  subscribers: Set<ObserverSubscriber>;
+  evictTimer?: NodeJS.Timeout;
+}
+
+const observerEntryBytes = (entry: ObserverEntry): number => JSON.stringify(entry).length;
+
 /** Firehose channel name — subscribers here see every session's events. */
 const FIREHOSE = '*';
 
@@ -54,7 +158,7 @@ const REPLAY_PER_SESSION = 200;
 /** Cap the number of sessions we retain buffers for; evict least-recently-active. */
 const MAX_TRACKED_SESSIONS = 256;
 
-class SessionEventBus extends EventEmitter {
+export class SessionEventBus extends EventEmitter {
   /** sessionId -> recent events (bounded), for replay-on-subscribe. */
   private readonly replay = new Map<string, SessionStreamEvent[]>();
   /** Monotonic event id source (process-unique). */
@@ -150,6 +254,293 @@ class SessionEventBus extends EventEmitter {
   /** How many live subscribers a session currently has (for tests/introspection). */
   subscriberCount(sessionId: string): number {
     return this.listenerCount(sessionId);
+  }
+
+  // ─── Observer attach (canonical obs entries, ledger-eid keyed) ────────────
+
+  /** sessionId -> observer channel state. Separate from the legacy replay tap. */
+  private readonly obsChannels = new Map<string, ObserverChannel>();
+
+  private obsChannel(sessionId: string): ObserverChannel {
+    let ch = this.obsChannels.get(sessionId);
+    if (!ch) {
+      ch = { ring: [], lastEid: 0, subscribers: new Set() };
+      this.obsChannels.set(sessionId, ch);
+    }
+    if (ch.evictTimer) {
+      clearTimeout(ch.evictTimer);
+      ch.evictTimer = undefined;
+    }
+    return ch;
+  }
+
+  /**
+   * Record the session's ledger location, announced by the runtime itself
+   * (session_meta line). Never derived from the API cwd, never caller-supplied
+   * over the observe API.
+   */
+  registerLedgerPath(sessionId: string, ledgerPath: string): void {
+    if (!isAbsolute(ledgerPath) || !ledgerPath.endsWith('.jsonl')) {
+      logger.warn('[EventBus] Rejected non-absolute or non-jsonl ledger path', {
+        sessionId,
+        ledgerPath,
+      });
+      return;
+    }
+    // Runtime transcripts live under .ink/runtime/repl — reject anything else.
+    if (!ledgerPath.includes(`${sep}.ink${sep}runtime${sep}repl${sep}`)) {
+      logger.warn('[EventBus] Rejected ledger path outside runtime/repl', {
+        sessionId,
+        ledgerPath,
+      });
+      return;
+    }
+    this.obsChannel(sessionId).ledgerPath = ledgerPath;
+  }
+
+  /**
+   * Publish one canonical ledger entry (from the runtime's `obs` line).
+   * Synchronous; NEVER awaits a sink. The entry's eid is the ledger's —
+   * this bus never mints ids for observer entries.
+   */
+  publishObserverEntry(sessionId: string, entry: ObserverEntry): void {
+    if (
+      typeof entry?.eid !== 'number' ||
+      typeof entry?.type !== 'string' ||
+      !OBSERVER_PROJECTION_TYPES.has(entry.type)
+    ) {
+      return;
+    }
+    const ch = this.obsChannel(sessionId);
+    if (entry.eid > ch.lastEid) ch.lastEid = entry.eid;
+    ch.ring.push(entry);
+    if (ch.ring.length > OBS_RING_CAPACITY) {
+      ch.ring.splice(0, ch.ring.length - OBS_RING_CAPACITY);
+    }
+
+    const bytes = observerEntryBytes(entry);
+    for (const sub of ch.subscribers) {
+      if (sub.closed) continue;
+      if (sub.replaying) {
+        if (
+          sub.capture.length >= OBS_QUEUE_MAX_EVENTS ||
+          sub.captureBytes + bytes > OBS_QUEUE_MAX_BYTES
+        ) {
+          this.disconnectObserver(ch, sub, 'overflow');
+          continue;
+        }
+        sub.capture.push(entry);
+        sub.captureBytes += bytes;
+      } else {
+        this.enqueueObserver(ch, sub, entry, bytes);
+      }
+    }
+  }
+
+  /**
+   * Attach an observer to the canonical entry stream. The subscriber record
+   * and high-water snapshot are created synchronously BEFORE any I/O — the
+   * atomic half of the replay→follow cutover. Resolves with an unsubscribe
+   * function once replay + cutover complete.
+   */
+  async subscribeObserver(
+    sessionId: string,
+    sink: ObserverSink,
+    options: ObserverSubscribeOptions = {}
+  ): Promise<() => void> {
+    const ch = this.obsChannel(sessionId);
+    if (ch.subscribers.size >= OBS_MAX_SUBSCRIBERS) {
+      sink.end('replay_failed');
+      throw new Error(`Observer limit reached for session ${sessionId}`);
+    }
+
+    const sub: ObserverSubscriber = {
+      sink,
+      queue: [],
+      queuedBytes: 0,
+      pumping: false,
+      replaying: true,
+      capture: [],
+      captureBytes: 0,
+      closed: false,
+    };
+    ch.subscribers.add(sub);
+    const highWater = ch.lastEid;
+    const follow = options.follow !== false;
+
+    const unsubscribe = (): void => {
+      if (!sub.closed) this.disconnectObserver(ch, sub, 'unsubscribed');
+    };
+
+    try {
+      await this.replayObserver(ch, sub, options.afterEid, highWater);
+
+      if (!follow) {
+        unsubscribe();
+        return unsubscribe;
+      }
+
+      // Drain capture in eid order until empty, then flip to direct follow.
+      // New publishes keep landing in capture (bounded) while draining, so
+      // the flip happens only at a genuinely empty queue.
+      while (!sub.closed && sub.capture.length > 0) {
+        const next = sub.capture.shift()!;
+        sub.captureBytes -= observerEntryBytes(next);
+        await this.writeObserver(sub, next);
+      }
+      sub.replaying = false;
+      return unsubscribe;
+    } catch (error) {
+      logger.warn('[EventBus] Observer replay failed', { sessionId, error: String(error) });
+      if (!sub.closed) this.disconnectObserver(ch, sub, 'replay_failed');
+      throw error instanceof Error ? error : new Error(String(error));
+    }
+  }
+
+  /** Session process exited — end observers after the retention window. */
+  releaseObserverSession(sessionId: string): void {
+    const ch = this.obsChannels.get(sessionId);
+    if (!ch) return;
+    if (ch.evictTimer) clearTimeout(ch.evictTimer);
+    ch.evictTimer = setTimeout(() => {
+      for (const sub of ch.subscribers) {
+        if (!sub.closed) this.disconnectObserver(ch, sub, 'session_released');
+      }
+      this.obsChannels.delete(sessionId);
+    }, OBS_RETENTION_MS);
+    ch.evictTimer.unref?.();
+  }
+
+  private async replayObserver(
+    ch: ObserverChannel,
+    sub: ObserverSubscriber,
+    afterEid: number | undefined,
+    highWater: number
+  ): Promise<void> {
+    if (highWater === 0 && afterEid === undefined) return;
+
+    // Default attach: ring only.
+    if (afterEid === undefined) {
+      for (const entry of [...ch.ring]) {
+        if (sub.closed) return;
+        if (entry.eid <= highWater) await this.writeObserver(sub, entry);
+      }
+      return;
+    }
+
+    const ringCoversCursor = ch.ring.length > 0 && ch.ring[0].eid <= afterEid + 1;
+    if (ringCoversCursor) {
+      for (const entry of [...ch.ring]) {
+        if (sub.closed) return;
+        if (entry.eid > afterEid && entry.eid <= highWater) {
+          await this.writeObserver(sub, entry);
+        }
+      }
+      return;
+    }
+
+    // Cursor precedes the ring — durable backfill from the ledger. The ledger
+    // is always a superset of the ring: the runtime appends synchronously
+    // BEFORE emitting the obs line.
+    if (!ch.ledgerPath) {
+      throw new Error('Cursor precedes ring and no ledger path is registered');
+    }
+    await stat(ch.ledgerPath); // surface missing-file as replay failure
+    const rl = createInterface({
+      input: createReadStream(ch.ledgerPath, { encoding: 'utf-8' }),
+      crlfDelay: Infinity,
+    });
+    try {
+      for await (const line of rl) {
+        if (sub.closed) return;
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        let parsed: ObserverEntry;
+        try {
+          parsed = JSON.parse(trimmed) as ObserverEntry;
+        } catch {
+          continue;
+        }
+        if (
+          typeof parsed.eid !== 'number' ||
+          parsed.eid <= afterEid ||
+          parsed.eid > highWater || // filter a concurrently-growing ledger at H
+          !OBSERVER_PROJECTION_TYPES.has(parsed.type)
+        ) {
+          continue;
+        }
+        await this.writeObserver(sub, parsed);
+      }
+    } finally {
+      rl.close();
+    }
+  }
+
+  private async writeObserver(sub: ObserverSubscriber, entry: ObserverEntry): Promise<void> {
+    if (sub.closed) return;
+    let ok: boolean;
+    try {
+      ok = sub.sink.write(entry);
+    } catch (error) {
+      throw new Error(`observer sink write failed: ${String(error)}`);
+    }
+    if (!ok) await sub.sink.waitDrain();
+  }
+
+  private enqueueObserver(
+    ch: ObserverChannel,
+    sub: ObserverSubscriber,
+    entry: ObserverEntry,
+    bytes: number
+  ): void {
+    if (sub.queue.length >= OBS_QUEUE_MAX_EVENTS || sub.queuedBytes + bytes > OBS_QUEUE_MAX_BYTES) {
+      // Overflow DISCONNECTS — clearing the queue and continuing would leave
+      // this observer's view permanently different from the ledger. The
+      // client reconnects from its last processed eid and reconverges via
+      // durable replay.
+      this.disconnectObserver(ch, sub, 'overflow');
+      return;
+    }
+    sub.queue.push(entry);
+    sub.queuedBytes += bytes;
+    if (!sub.pumping) void this.pumpObserver(ch, sub);
+  }
+
+  private async pumpObserver(ch: ObserverChannel, sub: ObserverSubscriber): Promise<void> {
+    sub.pumping = true;
+    try {
+      while (!sub.closed && sub.queue.length > 0) {
+        const entry = sub.queue.shift()!;
+        sub.queuedBytes -= observerEntryBytes(entry);
+        await this.writeObserver(sub, entry);
+      }
+    } catch (error) {
+      logger.debug('[EventBus] Observer sink error during pump; disconnecting', {
+        error: String(error),
+      });
+      this.disconnectObserver(ch, sub, 'sink_error');
+    } finally {
+      sub.pumping = false;
+    }
+  }
+
+  private disconnectObserver(
+    ch: ObserverChannel,
+    sub: ObserverSubscriber,
+    reason: ObserverSinkEndReason
+  ): void {
+    if (sub.closed) return;
+    sub.closed = true;
+    sub.queue = [];
+    sub.queuedBytes = 0;
+    sub.capture = [];
+    sub.captureBytes = 0;
+    ch.subscribers.delete(sub);
+    try {
+      sub.sink.end(reason);
+    } catch {
+      // A failing end() must not propagate into the publish path.
+    }
   }
 
   private recordReplay(event: SessionStreamEvent): void {
