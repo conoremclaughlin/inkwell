@@ -2601,18 +2601,55 @@ export async function runChat(options: ChatOptions): Promise<void> {
     }
   };
 
-  // Bridge normalized backend stream events onto the live feed. Backend tool
-  // calls (the provider calling MCP tools mid-turn) now surface in real time —
-  // before stream-json the feed was silent during a backend-routed generation.
-  // Assistant text lands in the final response; per-token deltas are a follow-on.
+  // Bridge normalized backend stream events onto the live feed AND the ledger.
+  // Backend tool calls (the provider calling MCP tools mid-turn) surface in
+  // real time — before stream-json the feed was silent during a backend-routed
+  // generation. Every observer-visible event is ALSO appended to the transcript
+  // as a compact entry (spec:observer-attach §3.2): the ledger must reproduce
+  // exactly what a live observer saw, or replay forks from the live view. The
+  // ledger-assigned eid rides on the stdout event so downstream consumers can
+  // align the live stream with transcript replay. Compact by design — tool
+  // name/status/id and text previews only; full payloads stay in the provider
+  // transcript, linked by toolUseId.
   const handleBackendEvent = (evt: BackendTurnEvent): void => {
     if (evt.kind === 'tool-use') {
+      const eid = appendTranscript(runtime.transcriptPath, {
+        type: 'backend_tool',
+        name: evt.name,
+        status: 'running',
+        ...(evt.id ? { toolUseId: evt.id } : {}),
+      });
       emitStreamEvent({
         type: 'tool_call',
         toolName: evt.name,
         status: 'running',
         layer: 'backend',
+        eid,
+        ...(evt.id ? { toolUseId: evt.id } : {}),
       });
+    } else if (evt.kind === 'tool-result') {
+      const status = evt.isError ? 'error' : 'done';
+      const eid = appendTranscript(runtime.transcriptPath, {
+        type: 'backend_tool',
+        status,
+        ...(evt.id ? { toolUseId: evt.id } : {}),
+      });
+      // Distinct type from 'tool_call' — the server runner counts tool_call
+      // lines as invocations; completions must not double-count.
+      emitStreamEvent({
+        type: 'tool_result',
+        status,
+        layer: 'backend',
+        eid,
+        ...(evt.id ? { toolUseId: evt.id } : {}),
+      });
+    } else if (evt.kind === 'text' && evt.text.trim()) {
+      const preview = compactForLedger(evt.text, 200);
+      const eid = appendTranscript(runtime.transcriptPath, {
+        type: 'backend_text',
+        preview,
+      });
+      emitStreamEvent({ type: 'backend_text', preview, layer: 'backend', eid });
     }
   };
 

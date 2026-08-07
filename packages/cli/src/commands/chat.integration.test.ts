@@ -1839,6 +1839,73 @@ describe('runChat integration', () => {
     expect(backendRequest.stream).toBe(true);
   });
 
+  it('ledgers compact backend events with monotonic eids (observer-attach M1)', async () => {
+    await runChat({
+      agent: 'lumen',
+      backend: 'codex',
+      nonInteractive: true,
+      message: 'observe me',
+      pollSeconds: '999',
+    });
+
+    const backendRequest = testState.runBackendImpl.mock.calls[0][0] as {
+      onEvent?: (evt: Record<string, unknown>) => void;
+    };
+    expect(backendRequest.onEvent).toBeDefined();
+
+    // Drive normalized backend events through the real handler — a tool
+    // lifecycle plus a long text block (must be truncated to a preview).
+    const longText = 'x'.repeat(500);
+    backendRequest.onEvent!({
+      kind: 'tool-use',
+      id: 'toolu_obs1',
+      name: 'WebSearch',
+      input: { q: 'deep' },
+    });
+    backendRequest.onEvent!({ kind: 'text', text: longText });
+    backendRequest.onEvent!({ kind: 'tool-result', id: 'toolu_obs1', isError: false });
+
+    // The ledger must reproduce exactly what a live observer saw (no-fork
+    // invariant, spec:observer-attach §3.2) — compact entries, real eids.
+    const replDir = join(process.cwd(), '.ink', 'runtime', 'repl');
+    const transcriptFile = readdirSync(replDir).find((f) => f.endsWith('.jsonl'));
+    expect(transcriptFile).toBeDefined();
+    const events = readFileSync(join(replDir, transcriptFile!), 'utf-8')
+      .split('\n')
+      .filter(Boolean)
+      .map((l) => JSON.parse(l) as Record<string, unknown>)
+      .filter((e) => e.type === 'backend_tool' || e.type === 'backend_text');
+
+    expect(events).toHaveLength(3);
+    const [toolStart, text, toolDone] = events;
+
+    expect(toolStart).toMatchObject({
+      type: 'backend_tool',
+      name: 'WebSearch',
+      status: 'running',
+      toolUseId: 'toolu_obs1',
+    });
+    // Compact: tool inputs must NOT be ledgered — full payloads live in the
+    // provider transcript, linked by toolUseId.
+    expect(toolStart).not.toHaveProperty('input');
+
+    expect(text.type).toBe('backend_text');
+    expect((text.preview as string).length).toBeLessThanOrEqual(200);
+    expect(text.preview as string).toContain('…');
+
+    expect(toolDone).toMatchObject({
+      type: 'backend_tool',
+      status: 'done',
+      toolUseId: 'toolu_obs1',
+    });
+
+    // Monotonic eids — the replay ordering contract.
+    const eids = events.map((e) => e.eid as number);
+    expect(eids.every((v) => typeof v === 'number')).toBe(true);
+    expect([...eids].sort((a, b) => a - b)).toEqual(eids);
+    expect(new Set(eids).size).toBe(eids.length);
+  });
+
   it('applies explicit --backend-timeout-seconds override', async () => {
     await runChat({
       agent: 'lumen',
