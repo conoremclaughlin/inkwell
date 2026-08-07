@@ -1058,14 +1058,58 @@ export function seedTranscriptEidCounter(path: string, maxSeen: number): void {
   if (maxSeen > current) transcriptEidCounters.set(path, maxSeen);
 }
 
+/**
+ * The observer projection (spec:observer-attach §4.1) — ledger entry types
+ * that are ALSO mirrored to stdout as `obs` lines for live observers. Must
+ * stay in sync with OBSERVER_PROJECTION_TYPES in the server's
+ * session-event-bus.ts: every projection append is emitted from ONE place
+ * (below) so the live view can never diverge from replay.
+ */
+const OBS_PROJECTION_TYPES = new Set([
+  'user',
+  'system_turn',
+  'auto_turn',
+  'assistant',
+  'inbox',
+  'backend_tool',
+  'backend_text',
+  'local_tool_call',
+  'pcp_tool',
+  'backend_session',
+  'compaction',
+  'session_pause',
+  'session_end',
+]);
+
+/**
+ * Live mirror for projection appends — set by runChat to its stream emitter
+ * (non-interactive stdout NDJSON). The wire event IS the appended ledger
+ * entry, emitted only after the append succeeds; consumers must preserve the
+ * eid and never mint their own.
+ */
+let transcriptObsEmitter: ((entry: Record<string, unknown>) => void) | null = null;
+
+export function setTranscriptObsEmitter(
+  emitter: ((entry: Record<string, unknown>) => void) | null
+): void {
+  transcriptObsEmitter = emitter;
+}
+
 function appendTranscriptEntry(
   path: string,
   event: Record<string, unknown>
 ): Record<string, unknown> {
   const eid = (transcriptEidCounters.get(path) ?? 0) + 1;
   transcriptEidCounters.set(path, eid);
-  const entry = { ts: new Date().toISOString(), eid, ...event };
+  const entry: Record<string, unknown> = { ts: new Date().toISOString(), eid, ...event };
   appendFileSync(path, JSON.stringify(entry) + '\n');
+  if (typeof entry.type === 'string' && OBS_PROJECTION_TYPES.has(entry.type)) {
+    try {
+      transcriptObsEmitter?.(entry);
+    } catch {
+      // The live mirror must never break the ledger write path.
+    }
+  }
   return entry;
 }
 
@@ -2609,23 +2653,21 @@ export async function runChat(options: ChatOptions): Promise<void> {
     }
   };
 
-  // Bridge normalized backend stream events onto the ledger AND the live feed.
-  // Every observer-visible event is appended to the transcript as a compact
-  // entry, and the wire event IS that exact appended entry (spec:observer-attach
-  // §4.2) — emitted as an `obs` line only after the append succeeds, eid and ts
-  // preserved end-to-end. Downstream consumers (SessionEventBus) must never
-  // mint their own ids. Two independently-shaped writes for the same happening
-  // would let live views and replay diverge — the fork this design forbids.
-  // Compact by design: tool name/status/id and text previews only; full
-  // payloads stay in the provider transcript, linked by toolUseId.
-  const ledgerObserverEntry = (event: Record<string, unknown>): void => {
-    const entry = appendTranscriptEntry(runtime.transcriptPath, event);
-    emitStreamEvent({ type: 'obs', entry });
-  };
+  // Register the live obs mirror: EVERY projection-type ledger append (user,
+  // system turns, pcp/local tools, assistant results, backend events, session
+  // markers) is emitted as an `obs` line from inside appendTranscriptEntry —
+  // one place, all paths, so the live view can never diverge from replay
+  // (spec:observer-attach §4.2; the e2e caught exactly this gap when only
+  // backend events were mirrored).
+  setTranscriptObsEmitter((entry) => emitStreamEvent({ type: 'obs', entry }));
 
+  // Bridge normalized backend stream events onto the ledger. The obs mirror
+  // above handles the wire emission; entries are compact by design — tool
+  // name/status/id and text previews only; full payloads stay in the provider
+  // transcript, linked by toolUseId.
   const handleBackendEvent = (evt: BackendTurnEvent): void => {
     if (evt.kind === 'tool-use') {
-      ledgerObserverEntry({
+      appendTranscript(runtime.transcriptPath, {
         type: 'backend_tool',
         name: evt.name,
         status: 'running',
@@ -2641,13 +2683,16 @@ export async function runChat(options: ChatOptions): Promise<void> {
         ...(evt.id ? { toolUseId: evt.id } : {}),
       });
     } else if (evt.kind === 'tool-result') {
-      ledgerObserverEntry({
+      appendTranscript(runtime.transcriptPath, {
         type: 'backend_tool',
         status: evt.isError ? 'error' : 'done',
         ...(evt.id ? { toolUseId: evt.id } : {}),
       });
     } else if (evt.kind === 'text' && evt.text.trim()) {
-      ledgerObserverEntry({ type: 'backend_text', preview: compactForLedger(evt.text, 200) });
+      appendTranscript(runtime.transcriptPath, {
+        type: 'backend_text',
+        preview: compactForLedger(evt.text, 200),
+      });
     }
   };
 
