@@ -1853,6 +1853,15 @@ describe('runChat integration', () => {
     };
     expect(backendRequest.onEvent).toBeDefined();
 
+    // Capture the live stdout feed so the wire events can be compared
+    // against the ledger (spec:observer-attach §4.2: the wire event IS the
+    // appended entry — deep-equal, not merely similar).
+    const stdoutWrites: string[] = [];
+    const stdoutSpy = vi.spyOn(process.stdout, 'write').mockImplementation(((chunk: unknown) => {
+      stdoutWrites.push(String(chunk));
+      return true;
+    }) as typeof process.stdout.write);
+
     // Drive normalized backend events through the real handler — a tool
     // lifecycle plus a long text block (must be truncated to a preview).
     const longText = 'x'.repeat(500);
@@ -1864,6 +1873,7 @@ describe('runChat integration', () => {
     });
     backendRequest.onEvent!({ kind: 'text', text: longText });
     backendRequest.onEvent!({ kind: 'tool-result', id: 'toolu_obs1', isError: false });
+    stdoutSpy.mockRestore();
 
     // The ledger must reproduce exactly what a live observer saw (no-fork
     // invariant, spec:observer-attach §3.2) — compact entries, real eids.
@@ -1904,6 +1914,16 @@ describe('runChat integration', () => {
     expect(eids.every((v) => typeof v === 'number')).toBe(true);
     expect([...eids].sort((a, b) => a - b)).toEqual(eids);
     expect(new Set(eids).size).toBe(eids.length);
+
+    // The wire event IS the ledger entry: every `obs` line's entry must
+    // deep-equal the appended transcript line, ts and eid included. Two
+    // independently-shaped writes would let live views fork from replay.
+    const obsEntries = stdoutWrites
+      .join('')
+      .split('\n')
+      .filter((l) => l.trim().startsWith('{"type":"obs"'))
+      .map((l) => (JSON.parse(l) as { entry: Record<string, unknown> }).entry);
+    expect(obsEntries).toEqual(events);
   });
 
   it('applies explicit --backend-timeout-seconds override', async () => {

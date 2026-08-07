@@ -1058,11 +1058,19 @@ export function seedTranscriptEidCounter(path: string, maxSeen: number): void {
   if (maxSeen > current) transcriptEidCounters.set(path, maxSeen);
 }
 
-function appendTranscript(path: string, event: Record<string, unknown>): number {
+function appendTranscriptEntry(
+  path: string,
+  event: Record<string, unknown>
+): Record<string, unknown> {
   const eid = (transcriptEidCounters.get(path) ?? 0) + 1;
   transcriptEidCounters.set(path, eid);
-  appendFileSync(path, JSON.stringify({ ts: new Date().toISOString(), eid, ...event }) + '\n');
-  return eid;
+  const entry = { ts: new Date().toISOString(), eid, ...event };
+  appendFileSync(path, JSON.stringify(entry) + '\n');
+  return entry;
+}
+
+function appendTranscript(path: string, event: Record<string, unknown>): number {
+  return appendTranscriptEntry(path, event).eid as number;
 }
 
 function compactForLedger(content: string, maxChars = LEDGER_COMPACT_CHARS): string {
@@ -2601,55 +2609,45 @@ export async function runChat(options: ChatOptions): Promise<void> {
     }
   };
 
-  // Bridge normalized backend stream events onto the live feed AND the ledger.
-  // Backend tool calls (the provider calling MCP tools mid-turn) surface in
-  // real time — before stream-json the feed was silent during a backend-routed
-  // generation. Every observer-visible event is ALSO appended to the transcript
-  // as a compact entry (spec:observer-attach §3.2): the ledger must reproduce
-  // exactly what a live observer saw, or replay forks from the live view. The
-  // ledger-assigned eid rides on the stdout event so downstream consumers can
-  // align the live stream with transcript replay. Compact by design — tool
-  // name/status/id and text previews only; full payloads stay in the provider
-  // transcript, linked by toolUseId.
+  // Bridge normalized backend stream events onto the ledger AND the live feed.
+  // Every observer-visible event is appended to the transcript as a compact
+  // entry, and the wire event IS that exact appended entry (spec:observer-attach
+  // §4.2) — emitted as an `obs` line only after the append succeeds, eid and ts
+  // preserved end-to-end. Downstream consumers (SessionEventBus) must never
+  // mint their own ids. Two independently-shaped writes for the same happening
+  // would let live views and replay diverge — the fork this design forbids.
+  // Compact by design: tool name/status/id and text previews only; full
+  // payloads stay in the provider transcript, linked by toolUseId.
+  const ledgerObserverEntry = (event: Record<string, unknown>): void => {
+    const entry = appendTranscriptEntry(runtime.transcriptPath, event);
+    emitStreamEvent({ type: 'obs', entry });
+  };
+
   const handleBackendEvent = (evt: BackendTurnEvent): void => {
     if (evt.kind === 'tool-use') {
-      const eid = appendTranscript(runtime.transcriptPath, {
+      ledgerObserverEntry({
         type: 'backend_tool',
         name: evt.name,
         status: 'running',
         ...(evt.id ? { toolUseId: evt.id } : {}),
       });
+      // Legacy line for the server runner's invocation tracking only — not
+      // observer-facing, no eid contract.
       emitStreamEvent({
         type: 'tool_call',
         toolName: evt.name,
         status: 'running',
         layer: 'backend',
-        eid,
         ...(evt.id ? { toolUseId: evt.id } : {}),
       });
     } else if (evt.kind === 'tool-result') {
-      const status = evt.isError ? 'error' : 'done';
-      const eid = appendTranscript(runtime.transcriptPath, {
+      ledgerObserverEntry({
         type: 'backend_tool',
-        status,
-        ...(evt.id ? { toolUseId: evt.id } : {}),
-      });
-      // Distinct type from 'tool_call' — the server runner counts tool_call
-      // lines as invocations; completions must not double-count.
-      emitStreamEvent({
-        type: 'tool_result',
-        status,
-        layer: 'backend',
-        eid,
+        status: evt.isError ? 'error' : 'done',
         ...(evt.id ? { toolUseId: evt.id } : {}),
       });
     } else if (evt.kind === 'text' && evt.text.trim()) {
-      const preview = compactForLedger(evt.text, 200);
-      const eid = appendTranscript(runtime.transcriptPath, {
-        type: 'backend_text',
-        preview,
-      });
-      emitStreamEvent({ type: 'backend_text', preview, layer: 'backend', eid });
+      ledgerObserverEntry({ type: 'backend_text', preview: compactForLedger(evt.text, 200) });
     }
   };
 
