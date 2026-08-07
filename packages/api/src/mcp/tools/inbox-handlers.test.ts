@@ -627,9 +627,18 @@ function createThreadMockSupabase(
     }
   });
 
+  // Read-pointer advances go through the atomic RPC (read-state.ts)
+  const rpcCalls: Array<{ fn: string; args: Record<string, unknown> }> = [];
+  const rpcFn = vi.fn().mockImplementation((fn: string, args: Record<string, unknown>) => {
+    rpcCalls.push({ fn, args });
+    return Promise.resolve({ data: null, error: null });
+  });
+
   return {
     from: fromFn,
+    rpc: rpcFn,
     getInsertedMetadata: () => insertedMetadata,
+    getRpcCalls: () => rpcCalls,
   };
 }
 
@@ -1279,8 +1288,15 @@ describe('handleUpdateInboxMessage — thread message fallback', () => {
       return { select: vi.fn().mockReturnThis(), eq: vi.fn().mockReturnThis() };
     });
 
+    // Pointer writes now go through the atomic RPC, not table upserts
+    const rpcCalls: Array<{ fn: string; args: Record<string, unknown> }> = [];
+    const rpcFn = vi.fn().mockImplementation((fn: string, args: Record<string, unknown>) => {
+      rpcCalls.push({ fn, args });
+      return Promise.resolve({ data: '2026-08-06T00:00:00Z', error: null });
+    });
+
     const mockDc = {
-      getClient: vi.fn().mockReturnValue({ from: fromFn }),
+      getClient: vi.fn().mockReturnValue({ from: fromFn, rpc: rpcFn }),
       repositories: {},
     };
 
@@ -1298,7 +1314,34 @@ describe('handleUpdateInboxMessage — thread message fallback', () => {
     expect(parsed.success).toBe(true);
     expect(parsed.threadId).toBe(threadId);
     expect(parsed.status).toBe('completed');
-    expect(upsertCalls.length).toBe(1);
+    // Old-style direct upserts are banned; the advance goes through the RPC
+    // with the exact message cursor, never wall-clock.
+    expect(upsertCalls.length).toBe(0);
+    expect(rpcCalls).toEqual([
+      {
+        fn: 'advance_thread_read_pointer',
+        args: {
+          p_thread_id: threadId,
+          p_agent_id: 'wren',
+          p_through_message_id: threadMsgId,
+        },
+      },
+    ]);
+
+    // Lumen PR #454 review blocker 3: a failed durable write must surface as
+    // failure, never as a positive acknowledgement.
+    rpcFn.mockResolvedValueOnce({ data: null, error: { message: 'permission denied' } });
+    await expect(
+      handleUpdateInboxMessage(
+        {
+          email: 'test@test.com',
+          messageId: threadMsgId,
+          agentId: 'wren',
+          status: 'completed',
+        },
+        mockDc as never
+      )
+    ).rejects.toThrow(/Failed to persist read state/);
   });
 });
 
@@ -1359,6 +1402,99 @@ describe('handleSendToInbox — system sender and cross-agent studio routing', (
     // And the warning about suppressed triggers must NOT appear.
     expect(parsed.warning).toBeUndefined();
     expect(parsed.triggered).toContain('wren');
+  });
+
+  it('advances the sender read pointer through the inserted message on ordinary sends', async () => {
+    const { getRequestContext, getSessionContext } = await import('../../utils/request-context');
+    vi.mocked(getRequestContext).mockReturnValue(undefined as never);
+    vi.mocked(getSessionContext).mockReturnValue(undefined as never);
+
+    const mockSb = createThreadMockSupabase({
+      existingThread: undefined,
+      threadMessageId: 'tmsg-777',
+    });
+    const mockDc = createThreadMockDataComposer(mockSb);
+
+    await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientAgentId: 'lumen',
+        senderAgentId: 'wren',
+        threadKey: 'pr:999',
+        content: 'Review please',
+        messageType: 'task_request',
+      },
+      mockDc as never
+    );
+
+    const advances = mockSb.getRpcCalls().filter((c) => c.fn === 'advance_thread_read_pointer');
+    expect(advances).toHaveLength(1);
+    expect(advances[0]!.args).toMatchObject({
+      p_agent_id: 'wren',
+      p_through_message_id: 'tmsg-777',
+    });
+  });
+
+  it('does NOT advance the sender pointer for cross-studio self-sends', async () => {
+    // Spec ink://specs/inkmail-read-state §1: there is one (thread, agent)
+    // pointer. A self-send targeting another studio must stay unread until
+    // the TARGET instance's delivery — sender-advance would hide it.
+    const { getRequestContext, getSessionContext } = await import('../../utils/request-context');
+    vi.mocked(getRequestContext).mockReturnValue(undefined as never);
+    vi.mocked(getSessionContext).mockReturnValue(undefined as never);
+
+    const mockSb = createThreadMockSupabase({
+      existingThread: undefined,
+      threadMessageId: 'tmsg-888',
+    });
+    const mockDc = createThreadMockDataComposer(mockSb);
+
+    await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientAgentId: 'wren',
+        senderAgentId: 'wren',
+        recipientStudioId: '123e4567-e89b-12d3-a456-426614174000',
+        threadKey: 'thread:self-handoff',
+        content: 'Pick this up in the other studio',
+        messageType: 'task_request',
+      },
+      mockDc as never
+    );
+
+    const advances = mockSb.getRpcCalls().filter((c) => c.fn === 'advance_thread_read_pointer');
+    expect(advances).toHaveLength(0);
+  });
+
+  it('does NOT advance the sender pointer for sessionAlias self-sends either', async () => {
+    // Lumen PR #454 review blocker 1: the exemption must cover ALL explicit
+    // self-target forms — alias included — with the same predicate that
+    // drives trigger self-inclusion.
+    const { getRequestContext, getSessionContext } = await import('../../utils/request-context');
+    vi.mocked(getRequestContext).mockReturnValue(undefined as never);
+    vi.mocked(getSessionContext).mockReturnValue(undefined as never);
+
+    const mockSb = createThreadMockSupabase({
+      existingThread: undefined,
+      threadMessageId: 'tmsg-889',
+    });
+    const mockDc = createThreadMockDataComposer(mockSb);
+
+    await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientAgentId: 'wren',
+        senderAgentId: 'wren',
+        sessionAlias: 'review',
+        threadKey: 'thread:self-alias-handoff',
+        content: 'Pick this up in the review session',
+        messageType: 'task_request',
+      },
+      mockDc as never
+    );
+
+    const advances = mockSb.getRpcCalls().filter((c) => c.fn === 'advance_thread_read_pointer');
+    expect(advances).toHaveLength(0);
   });
 
   it('propagates recipientStudioId to the trigger payload for cross-agent delegation', async () => {

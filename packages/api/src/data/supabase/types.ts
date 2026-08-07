@@ -3130,6 +3130,12 @@ export type Database = {
         };
         Relationships: [
           {
+            foreignKeyName: 'studios_default_project_id_fkey';
+            columns: ['default_project_id'];
+            referencedRelation: 'projects';
+            referencedColumns: ['id'];
+          },
+          {
             foreignKeyName: 'studios_sb_id_fkey';
             columns: ['sb_id'];
             referencedRelation: 'agent_identities';
@@ -3860,6 +3866,14 @@ export type Database = {
       [_ in never]: never;
     };
     Functions: {
+      advance_thread_read_pointer: {
+        Args: {
+          p_agent_id: string;
+          p_thread_id: string;
+          p_through_message_id: string;
+        };
+        Returns: string;
+      };
       match_artifacts: {
         Args: {
           match_count?: number;

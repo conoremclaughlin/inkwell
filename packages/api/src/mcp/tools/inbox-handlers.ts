@@ -9,6 +9,7 @@ import { z } from 'zod';
 import type { DataComposer } from '../../data/composer';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
 import { resolveIdentityId, resolveAgentSlug } from '../../auth/resolve-identity';
+import { advanceThreadReadPointer } from './read-state.js';
 import { getEffectiveAgentId } from '../../auth/enforce-identity';
 import { logger } from '../../utils/logger';
 import type { Json } from '../../data/supabase/types';
@@ -516,16 +517,33 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
       .update({ updated_at: new Date().toISOString() })
       .eq('id', thread.id);
 
-    // Update sender's read status
-    if (senderAgentId) {
-      await threadTable(supabase, 'inbox_thread_read_status').upsert(
-        {
-          thread_id: thread.id,
-          agent_id: senderAgentId,
-          last_read_at: new Date().toISOString(),
-        },
-        { onConflict: 'thread_id,agent_id' }
-      );
+    // Update sender's read status — through the just-inserted message via the
+    // atomic RPC, never wall-clock (spec: ink://specs/inkmail-read-state §1-2).
+    //
+    // Self-addressing exemption: when the sender targets ANOTHER of their own
+    // sessions/studios (senderAgentId is a recipient + explicit studio/session
+    // target), do NOT advance. There is only one (thread_id, agent_id)
+    // pointer; advancing at insert would make the target instance see the
+    // message as already read before delivery. The target's delivery advances
+    // the shared pointer instead.
+    // Explicit self-target: the sender addresses ANOTHER of their own
+    // sessions/studios — by studio id/slug, session id, OR session alias.
+    // ONE predicate drives both the sender-advance exemption and trigger
+    // self-inclusion so the two can never disagree (Lumen, PR #454 review:
+    // alias self-sends were advanced before fetch while session-id self-sends
+    // were filtered out of triggering).
+    const explicitSelfTarget = !!(
+      senderAgentId &&
+      allRecipients.includes(senderAgentId) &&
+      (recipientStudioId || recipientStudioSlugOrHint || recipientSessionId || sessionAlias)
+    );
+    if (senderAgentId && threadMessage?.id && !explicitSelfTarget) {
+      await advanceThreadReadPointer(supabase, {
+        threadId: thread.id,
+        agentId: senderAgentId,
+        throughMessageId: threadMessage.id,
+        source: 'send_to_inbox:sender',
+      });
     }
 
     // ── Trigger resolution ──
@@ -533,14 +551,9 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     // For new threads, trigger all recipients (existing behavior).
     let agentsToTrigger: string[] = [];
 
-    // Cross-studio self-messaging: when the sender targets themselves in a
-    // different studio (via recipientStudioId/recipientStudioHint), don't
-    // exclude self from trigger resolution.
-    const selfStudioTarget = !!(
-      senderAgentId &&
-      (recipientStudioId || recipientStudioSlugOrHint) &&
-      allRecipients.includes(senderAgentId)
-    );
+    // Cross-studio/session self-messaging must not exclude self from trigger
+    // resolution — same predicate as the sender-advance exemption above.
+    const selfStudioTarget = explicitSelfTarget;
 
     if (trigger !== false && !missingSenderSession) {
       if (existingThread && senderAgentId) {
@@ -1369,16 +1382,23 @@ export async function handleUpdateInboxMessage(args: unknown, dataComposer: Data
       throw new Error(`Message not found or not accessible: ${messageId}`);
     }
 
-    // Thread messages don't have a status column — mark the thread as read instead
+    // Thread messages don't have a status column — advance the read pointer
+    // through THIS message instead (never wall-clock: a concurrently inserted
+    // later message must not be swept into "read"). This API's purpose IS the
+    // durable write, so a failed advance must surface as failure, never as a
+    // positive acknowledgement.
     if (status === 'read' || status === 'acknowledged' || status === 'completed') {
-      await threadTable(supabase, 'inbox_thread_read_status').upsert(
-        {
-          thread_id: threadMsg.thread_id,
-          agent_id: agentId,
-          last_read_at: new Date().toISOString(),
-        },
-        { onConflict: 'thread_id,agent_id' }
-      );
+      const advanced = await advanceThreadReadPointer(supabase, {
+        threadId: threadMsg.thread_id,
+        agentId,
+        throughMessageId: messageId,
+        source: 'update_inbox_message:thread-fallback',
+      });
+      if (!advanced) {
+        throw new Error(
+          `Failed to persist read state for thread message ${messageId} — status not updated`
+        );
+      }
     }
 
     logger.info('Thread message status updated (via read pointer)', {
