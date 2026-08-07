@@ -9,6 +9,7 @@ import { z } from 'zod';
 import type { DataComposer } from '../../data/composer';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
 import { resolveIdentityId, resolveAgentSlug } from '../../auth/resolve-identity';
+import { advanceThreadReadPointer } from './read-state.js';
 import { getEffectiveAgentId } from '../../auth/enforce-identity';
 import { logger } from '../../utils/logger';
 import type { Json } from '../../data/supabase/types';
@@ -516,16 +517,27 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
       .update({ updated_at: new Date().toISOString() })
       .eq('id', thread.id);
 
-    // Update sender's read status
-    if (senderAgentId) {
-      await threadTable(supabase, 'inbox_thread_read_status').upsert(
-        {
-          thread_id: thread.id,
-          agent_id: senderAgentId,
-          last_read_at: new Date().toISOString(),
-        },
-        { onConflict: 'thread_id,agent_id' }
-      );
+    // Update sender's read status — through the just-inserted message via the
+    // atomic RPC, never wall-clock (spec: ink://specs/inkmail-read-state §1-2).
+    //
+    // Self-addressing exemption: when the sender targets ANOTHER of their own
+    // sessions/studios (senderAgentId is a recipient + explicit studio/session
+    // target), do NOT advance. There is only one (thread_id, agent_id)
+    // pointer; advancing at insert would make the target instance see the
+    // message as already read before delivery. The target's delivery advances
+    // the shared pointer instead.
+    const selfAddressedElsewhere = !!(
+      senderAgentId &&
+      allRecipients.includes(senderAgentId) &&
+      (recipientStudioId || recipientStudioSlugOrHint || recipientSessionId)
+    );
+    if (senderAgentId && threadMessage?.id && !selfAddressedElsewhere) {
+      await advanceThreadReadPointer(supabase, {
+        threadId: thread.id,
+        agentId: senderAgentId,
+        throughMessageId: threadMessage.id,
+        source: 'send_to_inbox:sender',
+      });
     }
 
     // ── Trigger resolution ──
@@ -1369,16 +1381,16 @@ export async function handleUpdateInboxMessage(args: unknown, dataComposer: Data
       throw new Error(`Message not found or not accessible: ${messageId}`);
     }
 
-    // Thread messages don't have a status column — mark the thread as read instead
+    // Thread messages don't have a status column — advance the read pointer
+    // through THIS message instead (never wall-clock: a concurrently inserted
+    // later message must not be swept into "read").
     if (status === 'read' || status === 'acknowledged' || status === 'completed') {
-      await threadTable(supabase, 'inbox_thread_read_status').upsert(
-        {
-          thread_id: threadMsg.thread_id,
-          agent_id: agentId,
-          last_read_at: new Date().toISOString(),
-        },
-        { onConflict: 'thread_id,agent_id' }
-      );
+      await advanceThreadReadPointer(supabase, {
+        threadId: threadMsg.thread_id,
+        agentId,
+        throughMessageId: messageId,
+        source: 'update_inbox_message:thread-fallback',
+      });
     }
 
     logger.info('Thread message status updated (via read pointer)', {

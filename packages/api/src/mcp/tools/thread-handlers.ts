@@ -15,6 +15,7 @@ import { getEffectiveAgentId } from '../../auth/enforce-identity';
 import { logger } from '../../utils/logger';
 import type { Json } from '../../data/supabase/types';
 import { getAgentGateway, type AgentTriggerPayload } from '../../channels/agent-gateway.js';
+import { advanceThreadReadPointer } from './read-state.js';
 
 // The thread tables are new and not yet in generated Supabase types.
 // Use type-safe wrappers that cast the table name for PostgREST queries.
@@ -377,33 +378,27 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
   // Get participants
   const participants = await getParticipants(supabase, thread.id);
 
-  // Mark as read — advance the pointer to the latest created_at in the
-  // returned batch, never to NOW() and never backwards. Monotonicity matters:
-  // a caller passing an old explicit afterMessageId (or a client replaying
-  // with a partial set) must not regress the read pointer.
+  // Mark as read — advance the pointer through the latest message in the
+  // returned batch via the atomic RPC (monotonic; never NOW(), never
+  // backwards). A caller passing an old explicit afterMessageId (or a client
+  // replaying with a partial set) must not regress the read pointer.
   if (markRead && messages && messages.length > 0) {
     let maxCreatedAt = '';
-    for (const m of messages as Array<{ created_at?: string }>) {
+    let maxMessageId = '';
+    for (const m of messages as Array<{ id?: string; created_at?: string }>) {
       const ts = m.created_at;
-      if (ts && ts > maxCreatedAt) maxCreatedAt = ts;
-    }
-    if (maxCreatedAt) {
-      const { data: existing } = await threadTable(supabase, 'inbox_thread_read_status')
-        .select('last_read_at')
-        .eq('thread_id', thread.id)
-        .eq('agent_id', agentId)
-        .maybeSingle();
-      const existingTs = (existing as { last_read_at?: string } | null)?.last_read_at;
-      if (!existingTs || maxCreatedAt > existingTs) {
-        await threadTable(supabase, 'inbox_thread_read_status').upsert(
-          {
-            thread_id: thread.id,
-            agent_id: agentId,
-            last_read_at: maxCreatedAt,
-          },
-          { onConflict: 'thread_id,agent_id' }
-        );
+      if (ts && m.id && ts > maxCreatedAt) {
+        maxCreatedAt = ts;
+        maxMessageId = m.id;
       }
+    }
+    if (maxMessageId) {
+      await advanceThreadReadPointer(supabase, {
+        threadId: thread.id,
+        agentId,
+        throughMessageId: maxMessageId,
+        source: 'get_thread_messages:markRead',
+      });
     }
   }
 
@@ -775,15 +770,23 @@ export async function handleMarkThreadRead(args: unknown, dataComposer: DataComp
     };
   }
 
-  // Upsert read status
-  await threadTable(supabase, 'inbox_thread_read_status').upsert(
-    {
-      thread_id: thread.id,
-      agent_id: agentId,
-      last_read_at: new Date().toISOString(),
-    },
-    { onConflict: 'thread_id,agent_id' }
-  );
+  // "Mark whole thread read" = advance through the thread's current max
+  // message, never wall-clock NOW() — a concurrently inserted, never-seen
+  // message must not be marked read. Empty thread → nothing to advance.
+  const { data: latestMsg } = await threadTable(supabase, 'inbox_thread_messages')
+    .select('id')
+    .eq('thread_id', thread.id)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (latestMsg?.id) {
+    await advanceThreadReadPointer(supabase, {
+      threadId: thread.id,
+      agentId,
+      throughMessageId: latestMsg.id,
+      source: 'mark_thread_read',
+    });
+  }
 
   logger.info('Thread marked as read', { threadKey, agentId });
 
