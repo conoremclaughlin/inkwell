@@ -21,22 +21,38 @@ function getEventsHandler(router: any): (req: unknown, res: unknown) => Promise<
 }
 
 // ── Mocks ──
-function makeAuthProvider(result: { userId: string } | null) {
+function makeAuthProvider(result: { userId: string; sbId?: string } | null) {
   return { verifyAccessToken: vi.fn().mockReturnValue(result) };
 }
 
-function makeDataComposer(session: { user_id: string } | null, error: unknown = null) {
-  const single = vi.fn().mockResolvedValue({ data: session, error });
-  const eq = vi.fn().mockReturnValue({ single });
-  const select = vi.fn().mockReturnValue({ eq });
-  const from = vi.fn().mockReturnValue({ select });
+function makeDataComposer(
+  session: { user_id: string; sb_id?: string | null; contact_id?: string | null } | null,
+  error: unknown = null,
+  grant: { id: string; expires_at: string | null } | null = null
+) {
+  const from = vi.fn().mockImplementation((table: string) => {
+    if (table === 'session_observe_grants') {
+      const maybeSingle = vi.fn().mockResolvedValue({ data: grant, error: null });
+      const chain: Record<string, unknown> = { maybeSingle };
+      chain.eq = vi.fn().mockReturnValue(chain);
+      return { select: vi.fn().mockReturnValue(chain) };
+    }
+    const single = vi.fn().mockResolvedValue({
+      data: session ? { sb_id: null, contact_id: null, ...session } : null,
+      error,
+    });
+    const eq = vi.fn().mockReturnValue({ single });
+    const select = vi.fn().mockReturnValue({ eq });
+    return { select };
+  });
   return { getClient: () => ({ from }) };
 }
 
-function makeReq(id: string, authHeader?: string) {
+function makeReq(id: string, authHeader?: string, query: Record<string, string> = {}) {
   const req = new EventEmitter() as EventEmitter & Record<string, unknown>;
   req.headers = authHeader ? { authorization: authHeader } : {};
   req.params = { id };
+  req.query = query;
   req.socket = { setTimeout: vi.fn() };
   return req;
 }
@@ -139,5 +155,164 @@ describe('GET /api/sessions/:id/events (SSE)', () => {
     const before = writes.length;
     sessionEventBus.publish(SID, 'result', { text: 'done' });
     expect(writes.length).toBe(before);
+  });
+});
+
+/**
+ * Observer-attach M3: the §4.6 permission matrix (pure) and the obs channel
+ * on the SSE route (eid frames, exclusive cursors, grant gating).
+ */
+import { resolveObservePermission } from './sessions.js';
+
+describe('resolveObservePermission (spec §4.6 matrix)', () => {
+  const WREN = '11111111-1111-1111-1111-111111111111';
+  const MYRA = '22222222-2222-2222-2222-222222222222';
+
+  it('denies across users unconditionally', () => {
+    expect(
+      resolveObservePermission(
+        { userId: 'user-a', sbId: WREN },
+        { userId: 'user-b', sbId: WREN, contactId: null }
+      )
+    ).toMatchObject({ allowed: false, status: 403 });
+  });
+
+  it('allows a user token to observe their own sessions', () => {
+    expect(
+      resolveObservePermission({ userId: OWNER }, { userId: OWNER, sbId: MYRA, contactId: null })
+    ).toEqual({ allowed: true });
+  });
+
+  it('allows an agent to observe its own session (same identity UUID)', () => {
+    expect(
+      resolveObservePermission(
+        { userId: OWNER, sbId: WREN },
+        { userId: OWNER, sbId: WREN, contactId: null }
+      )
+    ).toEqual({ allowed: true });
+  });
+
+  it('contact isolation: agents never observe contact-scoped sessions — even their own', () => {
+    expect(
+      resolveObservePermission(
+        { userId: OWNER, sbId: MYRA },
+        { userId: OWNER, sbId: MYRA, contactId: 'contact-x' }
+      )
+    ).toMatchObject({ allowed: false, reason: 'contact_isolated' });
+  });
+
+  it('user tokens still see contact-scoped sessions they own', () => {
+    expect(
+      resolveObservePermission(
+        { userId: OWNER },
+        { userId: OWNER, sbId: MYRA, contactId: 'contact-x' }
+      )
+    ).toEqual({ allowed: true });
+  });
+
+  it('cross-agent requires a grant (needs_grant names the owner identity)', () => {
+    expect(
+      resolveObservePermission(
+        { userId: OWNER, sbId: WREN },
+        { userId: OWNER, sbId: MYRA, contactId: null }
+      )
+    ).toEqual({ allowed: false, status: 'needs_grant', ownerSbId: MYRA });
+  });
+
+  it('denies agent observation of sessions with no owning identity', () => {
+    expect(
+      resolveObservePermission(
+        { userId: OWNER, sbId: WREN },
+        { userId: OWNER, sbId: null, contactId: null }
+      )
+    ).toMatchObject({ allowed: false, reason: 'session_has_no_owner_identity' });
+  });
+});
+
+describe('GET /api/sessions/:id/events?channel=obs', () => {
+  const WREN = '11111111-1111-1111-1111-111111111111';
+  const MYRA = '22222222-2222-2222-2222-222222222222';
+
+  beforeEach(() => vi.clearAllMocks());
+
+  it('403s cross-agent observation without a grant row', async () => {
+    const handler = getEventsHandler(
+      createSessionsRouter({
+        authProvider: makeAuthProvider({ userId: OWNER, sbId: WREN }) as never,
+        dataComposer: makeDataComposer({ user_id: OWNER, sb_id: MYRA }) as never,
+      })
+    );
+    const req = makeReq(SID, 'Bearer t', { channel: 'obs' });
+    const { res } = makeRes();
+    await handler(req, res);
+    expect(res.status as ReturnType<typeof vi.fn>).toHaveBeenCalledWith(403);
+    expect(res.writeHead).not.toHaveBeenCalled();
+  });
+
+  it('admits cross-agent observation with an unexpired grant', async () => {
+    const handler = getEventsHandler(
+      createSessionsRouter({
+        authProvider: makeAuthProvider({ userId: OWNER, sbId: WREN }) as never,
+        dataComposer: makeDataComposer({ user_id: OWNER, sb_id: MYRA }, null, {
+          id: 'grant-1',
+          expires_at: null,
+        }) as never,
+      })
+    );
+    const req = makeReq(`obs-grant-${Date.now()}`, 'Bearer t', { channel: 'obs' });
+    const { res } = makeRes();
+    await handler(req, res);
+    expect(res.writeHead).toHaveBeenCalledWith(200, expect.any(Object));
+  });
+
+  it('rejects an EXPIRED grant', async () => {
+    const handler = getEventsHandler(
+      createSessionsRouter({
+        authProvider: makeAuthProvider({ userId: OWNER, sbId: WREN }) as never,
+        dataComposer: makeDataComposer({ user_id: OWNER, sb_id: MYRA }, null, {
+          id: 'grant-1',
+          expires_at: '2020-01-01T00:00:00Z',
+        }) as never,
+      })
+    );
+    const req = makeReq(SID, 'Bearer t', { channel: 'obs' });
+    const { res } = makeRes();
+    await handler(req, res);
+    expect(res.status as ReturnType<typeof vi.fn>).toHaveBeenCalledWith(403);
+  });
+
+  it('streams canonical entries with SSE id = ledger eid, honoring the exclusive cursor', async () => {
+    const sid = `obs-route-${Date.now()}`;
+    sessionEventBus.publishObserverEntry(sid, {
+      eid: 1,
+      ts: '2026-08-07T00:00:01.000Z',
+      type: 'backend_tool',
+      name: 'WebSearch',
+      status: 'running',
+    });
+    sessionEventBus.publishObserverEntry(sid, {
+      eid: 2,
+      ts: '2026-08-07T00:00:02.000Z',
+      type: 'backend_text',
+      preview: 'working…',
+    });
+
+    const handler = getEventsHandler(
+      createSessionsRouter({
+        authProvider: makeAuthProvider({ userId: OWNER }) as never,
+        dataComposer: makeDataComposer({ user_id: OWNER, sb_id: MYRA }) as never,
+      })
+    );
+    // Last-Event-ID: 1 → resume strictly after eid 1.
+    const req = makeReq(sid, 'Bearer t', { channel: 'obs' });
+    (req.headers as Record<string, string>)['last-event-id'] = '1';
+    const { res, writes } = makeRes();
+    await handler(req, res);
+    await new Promise((r) => setImmediate(r));
+    req.emit('close');
+
+    const frames = writes.join('');
+    expect(frames).toContain('id: 2\nevent: backend_text');
+    expect(frames).not.toContain('id: 1\n');
   });
 });
