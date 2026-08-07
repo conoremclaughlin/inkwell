@@ -316,3 +316,97 @@ describe('GET /api/sessions/:id/events?channel=obs', () => {
     expect(frames).not.toContain('id: 1\n');
   });
 });
+
+describe('M4.2 — uniform gate, per-user cap, close-during-replay', () => {
+  const WREN = '11111111-1111-1111-1111-111111111111';
+  const MYRA = '22222222-2222-2222-2222-222222222222';
+
+  beforeEach(() => vi.clearAllMocks());
+
+  it('the LEGACY channel enforces the same matrix (no bypass by omitting channel=obs)', async () => {
+    const handler = getEventsHandler(
+      createSessionsRouter({
+        authProvider: makeAuthProvider({ userId: OWNER, sbId: WREN }) as never,
+        dataComposer: makeDataComposer({ user_id: OWNER, sb_id: MYRA }) as never,
+      })
+    );
+    // No channel param — the old bypass route. Cross-agent without grant → 403.
+    const req = makeReq(SID, 'Bearer t');
+    const { res } = makeRes();
+    await handler(req, res);
+    expect(res.status as ReturnType<typeof vi.fn>).toHaveBeenCalledWith(403);
+    expect(res.writeHead).not.toHaveBeenCalled();
+  });
+
+  it('contact-scoped sessions are agent-invisible on the legacy channel too', async () => {
+    const handler = getEventsHandler(
+      createSessionsRouter({
+        authProvider: makeAuthProvider({ userId: OWNER, sbId: MYRA }) as never,
+        dataComposer: makeDataComposer({
+          user_id: OWNER,
+          sb_id: MYRA,
+          contact_id: 'contact-x',
+        }) as never,
+      })
+    );
+    const req = makeReq(SID, 'Bearer t');
+    const { res } = makeRes();
+    await handler(req, res);
+    expect(res.status as ReturnType<typeof vi.fn>).toHaveBeenCalledWith(403);
+  });
+
+  it('enforces the per-user connection cap across sessions with 429', async () => {
+    const capUser = `cap-user-${Date.now()}`;
+    const handler = getEventsHandler(
+      createSessionsRouter({
+        authProvider: makeAuthProvider({ userId: capUser }) as never,
+        dataComposer: makeDataComposer({ user_id: capUser }) as never,
+      })
+    );
+    const held: Array<ReturnType<typeof makeRes>> = [];
+    for (let i = 0; i < 16; i++) {
+      const req = makeReq(`sess-${i}`, 'Bearer t');
+      const r = makeRes();
+      held.push(r);
+      await handler(req, r.res);
+      expect(r.res.writeHead).toHaveBeenCalled();
+    }
+    const req17 = makeReq('sess-17', 'Bearer t');
+    const { res: res17 } = makeRes();
+    await handler(req17, res17);
+    expect(res17.status as ReturnType<typeof vi.fn>).toHaveBeenCalledWith(429);
+  });
+
+  it('a client close during backpressured obs replay settles the handler (no strand)', async () => {
+    const sid = `strand-${Date.now()}`;
+    for (let i = 1; i <= 5; i++) {
+      sessionEventBus.publishObserverEntry(sid, {
+        eid: i,
+        ts: 't',
+        type: 'backend_tool',
+        name: 'x',
+        status: 'running',
+      });
+    }
+    const handler = getEventsHandler(
+      createSessionsRouter({
+        authProvider: makeAuthProvider({ userId: OWNER }) as never,
+        dataComposer: makeDataComposer({ user_id: OWNER }) as never,
+      })
+    );
+    const req = makeReq(sid, 'Bearer t', { channel: 'obs', afterEid: '0' });
+    const { res } = makeRes();
+    // Backpressure from the very first frame; drain never fires.
+    (res.write as ReturnType<typeof vi.fn>).mockImplementation(() => false);
+
+    const pending = handler(req, res);
+    // Client vanishes mid-replay.
+    setImmediate(() => (req as EventEmitter).emit('close'));
+
+    const settled = await Promise.race([
+      pending.then(() => 'settled'),
+      new Promise((r) => setTimeout(() => r('stranded'), 1_000)),
+    ]);
+    expect(settled).toBe('settled');
+  });
+});

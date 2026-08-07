@@ -111,6 +111,85 @@ export const OBSERVER_PROJECTION_TYPES: ReadonlySet<string> = new Set([
   'session_end',
 ]);
 
+const truncateForWire = (value: unknown, max: number): string => {
+  const text = String(value ?? '');
+  return text.length <= max ? text : `${text.slice(0, Math.max(1, max - 1))}…`;
+};
+
+/**
+ * Per-type field projection — THE security boundary for observer frames
+ * (Lumen review of PR #455, blocker 1). Frames are CONSTRUCTED from an
+ * allowlist of fields, never by deleting from the original, so unknown or
+ * secret-bearing fields (tool args/results, rawContent, stderr,
+ * delegationToken, …) structurally cannot cross the wire. Applied identically
+ * at ingest and at ledger replay — both paths emit the same projected shape,
+ * preserving the no-fork invariant.
+ *
+ * Returns null for non-projection types.
+ */
+export function projectObserverEntry(entry: ObserverEntry): ObserverEntry | null {
+  if (typeof entry?.eid !== 'number' || typeof entry?.type !== 'string') return null;
+  const base = { eid: entry.eid, ts: String(entry.ts ?? ''), type: entry.type };
+  switch (entry.type) {
+    case 'backend_tool':
+      return {
+        ...base,
+        ...(entry.name !== undefined ? { name: String(entry.name) } : {}),
+        ...(entry.status !== undefined ? { status: String(entry.status) } : {}),
+        ...(entry.toolUseId !== undefined ? { toolUseId: String(entry.toolUseId) } : {}),
+      };
+    case 'backend_text':
+      return { ...base, preview: truncateForWire(entry.preview, 200) };
+    case 'local_tool_call':
+    case 'pcp_tool':
+      // Tool identity + status only — args and results NEVER cross the wire.
+      return {
+        ...base,
+        ...(entry.tool !== undefined || entry.name !== undefined
+          ? { tool: String(entry.tool ?? entry.name) }
+          : {}),
+        ...(entry.status !== undefined ? { status: String(entry.status) } : {}),
+      };
+    case 'user':
+    case 'system_turn':
+    case 'auto_turn':
+    case 'assistant':
+      return {
+        ...base,
+        content: truncateForWire(entry.content, 400),
+        ...(entry.label !== undefined ? { label: String(entry.label) } : {}),
+      };
+    case 'inbox':
+      // Sender + rendered preview only. delegationToken and raw payloads are
+      // excluded by construction (spec §4.7 credential rule).
+      return {
+        ...base,
+        ...(entry.sender !== undefined ? { sender: String(entry.sender) } : {}),
+        ...(entry.subject !== undefined ? { subject: String(entry.subject) } : {}),
+        preview: truncateForWire(entry.rendered ?? entry.content, 200),
+      };
+    case 'backend_session':
+      return { ...base, ...(entry.id !== undefined ? { id: String(entry.id) } : {}) };
+    case 'compaction':
+      return { ...base, ...(entry.reason !== undefined ? { reason: String(entry.reason) } : {}) };
+    case 'session_pause':
+    case 'session_end':
+      return base;
+    default:
+      return null;
+  }
+}
+
+/**
+ * Optional durable locator store (wired by the server to session metadata).
+ * Keeps replay working across bus eviction and process restarts without any
+ * new tables — the sessions row the runtime already owns carries the path.
+ */
+export interface LedgerLocatorStore {
+  persist(sessionId: string, ledgerPath: string): Promise<void>;
+  load(sessionId: string): Promise<string | null>;
+}
+
 const intFromEnv = (name: string, fallback: number): number => {
   const raw = Number.parseInt(process.env[name] ?? '', 10);
   return Number.isFinite(raw) && raw > 0 ? raw : fallback;
@@ -130,10 +209,16 @@ interface ObserverSubscriber {
   pumping: boolean;
   /** True from synchronous registration until the capture queue is drained. */
   replaying: boolean;
-  /** Live entries (> high-water H) arriving during replay. Same caps. */
+  /** Live entries arriving during replay. Same caps. */
   capture: ObserverEntry[];
   captureBytes: number;
   closed: boolean;
+  /**
+   * Monotonic delivery guard: only entries with eid > lastDeliveredEid are
+   * written. Makes replay/capture/ring overlap idempotent by construction —
+   * duplicates are impossible regardless of which path served an entry first.
+   */
+  lastDeliveredEid: number;
 }
 
 interface ObserverChannel {
@@ -261,6 +346,13 @@ export class SessionEventBus extends EventEmitter {
   /** sessionId -> observer channel state. Separate from the legacy replay tap. */
   private readonly obsChannels = new Map<string, ObserverChannel>();
 
+  /** Durable locator store — wired once at server init (session metadata). */
+  private locatorStore: LedgerLocatorStore | null = null;
+
+  setLocatorStore(store: LedgerLocatorStore | null): void {
+    this.locatorStore = store;
+  }
+
   private obsChannel(sessionId: string): ObserverChannel {
     let ch = this.obsChannels.get(sessionId);
     if (!ch) {
@@ -296,6 +388,13 @@ export class SessionEventBus extends EventEmitter {
       return;
     }
     this.obsChannel(sessionId).ledgerPath = ledgerPath;
+    // Durably persist so replay survives bus eviction and process restarts.
+    void this.locatorStore?.persist(sessionId, ledgerPath).catch((err) => {
+      logger.warn('[EventBus] Failed to persist ledger locator', {
+        sessionId,
+        error: String(err),
+      });
+    });
   }
 
   /**
@@ -303,14 +402,11 @@ export class SessionEventBus extends EventEmitter {
    * Synchronous; NEVER awaits a sink. The entry's eid is the ledger's —
    * this bus never mints ids for observer entries.
    */
-  publishObserverEntry(sessionId: string, entry: ObserverEntry): void {
-    if (
-      typeof entry?.eid !== 'number' ||
-      typeof entry?.type !== 'string' ||
-      !OBSERVER_PROJECTION_TYPES.has(entry.type)
-    ) {
-      return;
-    }
+  publishObserverEntry(sessionId: string, rawEntry: ObserverEntry): void {
+    // Project at ingest — the ring and every frame downstream hold ONLY the
+    // allowlisted view; raw payloads never enter observer-facing state.
+    const entry = projectObserverEntry(rawEntry);
+    if (!entry) return;
     const ch = this.obsChannel(sessionId);
     if (entry.eid > ch.lastEid) ch.lastEid = entry.eid;
     ch.ring.push(entry);
@@ -363,10 +459,22 @@ export class SessionEventBus extends EventEmitter {
       capture: [],
       captureBytes: 0,
       closed: false,
+      lastDeliveredEid: options.afterEid ?? 0,
     };
     ch.subscribers.add(sub);
     const highWater = ch.lastEid;
     const follow = options.follow !== false;
+
+    // Durable locator: if this channel has no in-memory path (fresh process,
+    // evicted channel), recover it from the store before any replay decision.
+    if (!ch.ledgerPath && this.locatorStore) {
+      try {
+        const stored = await this.locatorStore.load(sessionId);
+        if (stored) ch.ledgerPath = stored;
+      } catch (err) {
+        logger.warn('[EventBus] Locator load failed', { sessionId, error: String(err) });
+      }
+    }
 
     const unsubscribe = (): void => {
       if (!sub.closed) this.disconnectObserver(ch, sub, 'unsubscribed');
@@ -397,15 +505,21 @@ export class SessionEventBus extends EventEmitter {
     }
   }
 
-  /** Session process exited — end observers after the retention window. */
+  /**
+   * A turn's process exited. Turn-end is NOT session-end (Lumen review,
+   * blocker 5): attached observers stay attached across turns — the next
+   * turn's registration re-arms the channel. Memory is reclaimed only when
+   * nobody is watching; the durable locator store keeps replay working even
+   * after eviction.
+   */
   releaseObserverSession(sessionId: string): void {
     const ch = this.obsChannels.get(sessionId);
     if (!ch) return;
     if (ch.evictTimer) clearTimeout(ch.evictTimer);
     ch.evictTimer = setTimeout(() => {
-      for (const sub of ch.subscribers) {
-        if (!sub.closed) this.disconnectObserver(ch, sub, 'session_released');
-      }
+      const current = this.obsChannels.get(sessionId);
+      if (!current) return;
+      if (current.subscribers.size > 0) return; // watchers ride across turns
       this.obsChannels.delete(sessionId);
     }, OBS_RETENTION_MS);
     ch.evictTimer.unref?.();
@@ -441,7 +555,10 @@ export class SessionEventBus extends EventEmitter {
 
     // Cursor precedes the ring — durable backfill from the ledger. The ledger
     // is always a superset of the ring: the runtime appends synchronously
-    // BEFORE emitting the obs line.
+    // BEFORE emitting the obs line. No high-water cap here: the per-subscriber
+    // monotonic lastDeliveredEid guard makes any overlap with the capture
+    // queue idempotent, and it also serves the fresh-channel case (lastEid=0
+    // after eviction/restart) where a cap would wrongly suppress all history.
     if (!ch.ledgerPath) {
       throw new Error('Cursor precedes ring and no ledger path is registered');
     }
@@ -461,15 +578,11 @@ export class SessionEventBus extends EventEmitter {
         } catch {
           continue;
         }
-        if (
-          typeof parsed.eid !== 'number' ||
-          parsed.eid <= afterEid ||
-          parsed.eid > highWater || // filter a concurrently-growing ledger at H
-          !OBSERVER_PROJECTION_TYPES.has(parsed.type)
-        ) {
-          continue;
-        }
-        await this.writeObserver(sub, parsed);
+        if (typeof parsed.eid !== 'number' || parsed.eid <= afterEid) continue;
+        // Same projection as ingest — replay and live frames are one shape.
+        const projected = projectObserverEntry(parsed);
+        if (!projected) continue;
+        await this.writeObserver(sub, projected);
       }
     } finally {
       rl.close();
@@ -478,12 +591,16 @@ export class SessionEventBus extends EventEmitter {
 
   private async writeObserver(sub: ObserverSubscriber, entry: ObserverEntry): Promise<void> {
     if (sub.closed) return;
+    // Monotonic guard: whatever path got here first wins; duplicates and
+    // out-of-order re-delivery are dropped by construction.
+    if (entry.eid <= sub.lastDeliveredEid) return;
     let ok: boolean;
     try {
       ok = sub.sink.write(entry);
     } catch (error) {
       throw new Error(`observer sink write failed: ${String(error)}`);
     }
+    sub.lastDeliveredEid = entry.eid;
     if (!ok) await sub.sink.waitDrain();
   }
 

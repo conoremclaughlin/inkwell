@@ -25,6 +25,7 @@ import adminRouter, { setWhatsAppListener } from '../routes/admin';
 import { getAgentGateway } from '../channels/agent-gateway';
 import { createChatRouter } from '../routes/chat';
 import { createSessionsRouter } from '../routes/sessions';
+import { sessionEventBus } from '../services/sessions/session-event-bus';
 import { createHookLifecycleRouter } from '../routes/hook-lifecycle';
 import {
   ChannelGateway,
@@ -836,6 +837,30 @@ export class MCPServer {
 
     // Live session event stream (SSE) — attached terminals + dashboard subscribe
     // to a session's turn events, fanned out from the session event bus.
+    // The durable ledger locator rides in the session row's metadata (no new
+    // tables) so observer replay survives bus eviction and process restarts.
+    const locatorClient = this.dataComposer.getClient();
+    sessionEventBus.setLocatorStore({
+      persist: async (sessionId, ledgerPath) => {
+        const { data: row } = await locatorClient
+          .from('sessions')
+          .select('metadata')
+          .eq('id', sessionId)
+          .maybeSingle();
+        const metadata = { ...((row?.metadata as object) ?? {}), observer_ledger_path: ledgerPath };
+        await locatorClient.from('sessions').update({ metadata }).eq('id', sessionId);
+      },
+      load: async (sessionId) => {
+        const { data: row } = await locatorClient
+          .from('sessions')
+          .select('metadata')
+          .eq('id', sessionId)
+          .maybeSingle();
+        const path = (row?.metadata as { observer_ledger_path?: unknown } | null)
+          ?.observer_ledger_path;
+        return typeof path === 'string' ? path : null;
+      },
+    });
     const sessionsRouter = createSessionsRouter({
       authProvider: this.authProvider,
       dataComposer: this.dataComposer,

@@ -101,7 +101,19 @@ export function renderObserverEntry(entry: Record<string, unknown>): string {
     case 'assistant':
       return `${eid} ${chalk.bold.green('assistant')} ${truncate(entry.content, 400)}`;
     case 'inbox':
-      return `${eid} ${chalk.yellow('inbox')} ${chalk.dim(truncate(entry.content))}`;
+      // Frames carry the projected preview (never raw payloads/tokens).
+      return `${eid} ${chalk.yellow('inbox')}${entry.sender ? ` ${chalk.dim(String(entry.sender))}` : ''} ${chalk.dim(truncate(entry.preview ?? entry.content))}`;
+    case 'local_tool_call':
+    case 'pcp_tool': {
+      const status = String(entry.status ?? '');
+      const badge =
+        status === 'error'
+          ? chalk.red('✗')
+          : status === 'running'
+            ? chalk.yellow('▶')
+            : chalk.green('✓');
+      return `${eid} ${badge} ${chalk.cyan(String(entry.tool ?? 'tool'))} ${chalk.dim(status)}`;
+    }
     case 'backend_session':
       return `${eid} ${chalk.dim(`backend session → ${truncate(entry.id, 40)}`)}`;
     case 'compaction':

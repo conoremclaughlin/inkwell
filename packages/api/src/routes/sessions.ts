@@ -43,6 +43,13 @@ import { logger } from '../utils/logger.js';
 /** Comment ping cadence — keeps the connection alive through idle proxies. */
 const SSE_HEARTBEAT_MS = 15_000;
 
+/** Per-user cap across all sessions (env-tunable). */
+const MAX_OBSERVER_CONNECTIONS_PER_USER = (() => {
+  const raw = Number.parseInt(process.env.SESSION_OBSERVE_MAX_PER_USER ?? '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 16;
+})();
+const observerConnectionsByUser = new Map<string, number>();
+
 export interface ObserveAuthContext {
   userId: string;
   /** Verified identity UUID when the caller is an agent; absent for user tokens. */
@@ -162,50 +169,53 @@ export function createSessionsRouter(deps: {
 
     const isObsChannel = req.query.channel === 'obs';
 
-    if (isObsChannel) {
-      // The full spec §4.6 matrix governs the canonical observer channel.
-      const decision = resolveObservePermission(
-        { userId: auth.userId, sbId: auth.sbId },
-        sessionRecord
-      );
-      if (!decision.allowed) {
-        if (decision.status === 'needs_grant') {
-          // Cross-agent: allowed only with an unexpired grant row (default deny).
-          try {
-            const { data: grant } = await deps.dataComposer
-              .getClient()
-              .from('session_observe_grants')
-              .select('id, expires_at')
-              .eq('user_id', auth.userId)
-              .eq('observer_sb_id', auth.sbId!)
-              .eq('owner_sb_id', decision.ownerSbId)
-              .maybeSingle();
-            const valid =
-              grant && (!grant.expires_at || new Date(grant.expires_at).getTime() > Date.now());
-            if (!valid) {
-              res.status(403).json({ error: 'Forbidden' });
-              return;
-            }
-          } catch (err) {
-            logger.error('sessions/:id/events grant check failed', {
-              sessionId,
-              error: err instanceof Error ? err.message : String(err),
-            });
-            res.status(500).json({ error: 'Internal error' });
+    // ONE permission matrix for BOTH channels (Lumen review, blocker 2 — a
+    // legacy channel with weaker auth is just a bypass around the gate). The
+    // legacy stream carries live tool activity; it deserves the same door.
+    const decision = resolveObservePermission(
+      { userId: auth.userId, sbId: auth.sbId },
+      sessionRecord
+    );
+    if (!decision.allowed) {
+      if (decision.status === 'needs_grant') {
+        // Cross-agent: allowed only with an unexpired grant row (default deny).
+        try {
+          const { data: grant } = await deps.dataComposer
+            .getClient()
+            .from('session_observe_grants')
+            .select('id, expires_at')
+            .eq('user_id', auth.userId)
+            .eq('observer_sb_id', auth.sbId!)
+            .eq('owner_sb_id', decision.ownerSbId)
+            .maybeSingle();
+          const valid =
+            grant && (!grant.expires_at || new Date(grant.expires_at).getTime() > Date.now());
+          if (!valid) {
+            res.status(403).json({ error: 'Forbidden' });
             return;
           }
-        } else {
-          res.status(403).json({ error: 'Forbidden' });
+        } catch (err) {
+          logger.error('sessions/:id/events grant check failed', {
+            sessionId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          res.status(500).json({ error: 'Internal error' });
           return;
         }
+      } else {
+        res.status(403).json({ error: 'Forbidden' });
+        return;
       }
-    } else if (sessionRecord.userId !== auth.userId) {
-      // Legacy live tap keeps its ORIGINAL contract: user-ownership scope
-      // only, so pre-existing attach consumers are unaffected by the
-      // observer-attach permission model.
-      res.status(403).json({ error: 'Forbidden' });
+    }
+
+    // Per-user connection cap across all sessions (spec §4.4) — unbounded N
+    // must not become event-loop backpressure.
+    const userConnections = observerConnectionsByUser.get(auth.userId) ?? 0;
+    if (userConnections >= MAX_OBSERVER_CONNECTIONS_PER_USER) {
+      res.status(429).json({ error: 'Too many observer connections' });
       return;
     }
+    observerConnectionsByUser.set(auth.userId, userConnections + 1);
 
     // Open the SSE stream. No body parsing, no buffering, no socket timeout.
     res.writeHead(200, {
@@ -224,17 +234,32 @@ export function createSessionsRouter(deps: {
 
     let closed = false;
     let teardown: () => void = () => undefined;
+    // Pending drain waiters — resolved on real drain OR on close, so a replay
+    // awaiting backpressure always makes progress and settles (blocker 4).
+    let drainWaiters: Array<() => void> = [];
+    const flushDrainWaiters = (): void => {
+      const waiters = drainWaiters;
+      drainWaiters = [];
+      for (const w of waiters) w();
+    };
+    res.on('drain', flushDrainWaiters);
     const cleanup = (): void => {
       if (closed) return;
       closed = true;
       clearInterval(heartbeat);
+      const count = observerConnectionsByUser.get(auth.userId) ?? 1;
+      if (count <= 1) observerConnectionsByUser.delete(auth.userId);
+      else observerConnectionsByUser.set(auth.userId, count - 1);
+      flushDrainWaiters(); // never strand a replay mid-backpressure
       teardown();
       logger.debug('SSE session observer disconnected', { sessionId, userId: auth.userId });
     };
+    // Installed BEFORE any subscribe so a client vanishing during replay is
+    // seen immediately, not only after the subscribe promise settles.
     req.on('close', cleanup);
     res.on('error', cleanup);
 
-    if (req.query.channel === 'obs') {
+    if (isObsChannel) {
       // Canonical observer channel: frame id = ledger eid; exclusive cursor;
       // backpressure honored via res.write()/drain; overflow disconnects.
       const sink: ObserverSink = {
@@ -246,7 +271,7 @@ export function createSessionsRouter(deps: {
         },
         waitDrain(): Promise<void> {
           if (closed) return Promise.resolve();
-          return new Promise((resolve) => res.once('drain', resolve));
+          return new Promise((resolve) => drainWaiters.push(resolve));
         },
         end(reason: ObserverSinkEndReason): void {
           try {

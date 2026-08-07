@@ -313,18 +313,19 @@ describe('SessionEventBus observer channel', () => {
     expect(eids).toEqual(Array.from({ length: eids.length }, (_, i) => i + 1));
   });
 
-  it('caps observer queues by bytes, not just count', async () => {
+  it('projection bounds entry size at ingest (byte cap remains defense-in-depth)', async () => {
+    // Since M4.2, projection truncates previews/content at ingest, so a
+    // hostile mega-entry cannot bloat queues — the byte cap (OBS_QUEUE_MAX_BYTES)
+    // stays as a backstop for pathological cases rather than the primary bound.
     const sink = new TestSink();
     await bus.subscribeObserver('s1', sink);
-    sink.blocked = true;
 
     const big = 'x'.repeat(Math.ceil(OBS_QUEUE_MAX_BYTES / 4));
-    for (let i = 1; i <= 6; i++) {
-      bus.publishObserverEntry('s1', obsEntry(i, 'backend_text', { preview: big }));
-    }
+    bus.publishObserverEntry('s1', obsEntry(1, 'backend_text', { preview: big }));
     await new Promise((r) => setImmediate(r));
 
-    expect(sink.endedWith).toBe('overflow');
+    expect(sink.received).toHaveLength(1);
+    expect(String(sink.received[0].preview).length).toBeLessThanOrEqual(200);
   });
 
   it('publishObserverEntry never blocks on a stalled observer', async () => {
@@ -391,5 +392,183 @@ describe('SessionEventBus observer channel', () => {
 
     expect(sink.received.map((e) => e.eid)).toEqual([1, 2, 3]);
     expect(sink.endedWith).toBe('unsubscribed');
+  });
+});
+
+/**
+ * M4.2 (Lumen re-review blockers): projection security boundary, monotonic
+ * delivery guard, durable locator recovery, cross-turn subscriber retention.
+ */
+import { projectObserverEntry, type LedgerLocatorStore } from './session-event-bus.js';
+
+describe('SessionEventBus observer channel — M4.2', () => {
+  let bus: InstanceType<typeof _BusForType>;
+  let dir: string;
+
+  beforeEach(() => {
+    bus = new _BusForType();
+    dir = mkdtempSync(join(tmpdir(), 'obs-m42-'));
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  function writeLedger42(entries: Record<string, unknown>[]): string {
+    const replDir = join(dir, '.ink', 'runtime', 'repl');
+    mkdirSync(replDir, { recursive: true });
+    const path = join(replDir, 'sess-1-123.jsonl');
+    writeFileSync(path, entries.map((e) => JSON.stringify(e)).join('\n') + '\n');
+    return path;
+  }
+
+  it('SECURITY: secret-bearing fields never cross the wire, at ingest or replay', async () => {
+    const secretLedger = writeLedger42([
+      {
+        eid: 1,
+        ts: 't',
+        type: 'pcp_tool',
+        tool: 'send_to_inbox',
+        status: 'done',
+        args: { content: 'SECRET_ARGS' },
+        result: { token: 'SECRET_RESULT' },
+      },
+      {
+        eid: 2,
+        ts: 't',
+        type: 'inbox',
+        sender: 'myra',
+        content: 'hello',
+        delegationToken: 'SECRET_DELEGATION',
+      },
+      {
+        eid: 3,
+        ts: 't',
+        type: 'assistant',
+        content: 'fine reply',
+        rawContent: 'SECRET_RAW',
+        stderr: 'SECRET_STDERR',
+      },
+      // Ledger-superset invariant: the live entry below exists here too.
+      {
+        eid: 4,
+        ts: 't',
+        type: 'local_tool_call',
+        tool: 'save_link',
+        status: 'running',
+        args: { url: 'SECRET_LIVE_ARGS' },
+      },
+    ]);
+    bus.registerLedgerPath('s1', secretLedger);
+    // Ring copy of the dirty entry (published before attach).
+    bus.publishObserverEntry('s1', {
+      eid: 4,
+      ts: 't',
+      type: 'local_tool_call',
+      tool: 'save_link',
+      status: 'running',
+      args: { url: 'SECRET_LIVE_ARGS' },
+    } as never);
+
+    const sink = new TestSink();
+    await bus.subscribeObserver('s1', sink, { afterEid: 0 });
+    // Live-path ingest after attach — equally dirty, equally projected.
+    bus.publishObserverEntry('s1', {
+      eid: 5,
+      ts: 't',
+      type: 'pcp_tool',
+      tool: 'get_timezone',
+      status: 'done',
+      result: { secret: 'SECRET_LIVE_ARGS' },
+    } as never);
+    await new Promise((r) => setImmediate(r));
+
+    const wire = JSON.stringify(sink.received);
+    expect(sink.received.map((e) => e.eid)).toEqual([1, 2, 3, 4, 5]);
+    for (const secret of [
+      'SECRET_ARGS',
+      'SECRET_RESULT',
+      'SECRET_DELEGATION',
+      'SECRET_RAW',
+      'SECRET_STDERR',
+      'SECRET_LIVE_ARGS',
+    ]) {
+      expect(wire).not.toContain(secret);
+    }
+    // The useful projection survives.
+    expect(wire).toContain('send_to_inbox');
+    expect(wire).toContain('fine reply');
+  });
+
+  it('monotonic guard: overlapping ledger + ring + live delivery is duplicate-free', async () => {
+    const path = writeLedger42(
+      Array.from({ length: 20 }, (_, i) => obsEntry(i + 1) as Record<string, unknown>)
+    );
+    bus.registerLedgerPath('s1', path);
+    // Ring holds a mid-window overlap of the same entries.
+    for (let i = 10; i <= 20; i++) bus.publishObserverEntry('s1', obsEntry(i));
+
+    const sink = new TestSink();
+    const subscribing = bus.subscribeObserver('s1', sink, { afterEid: 0 });
+    // Live entries during replay, including a re-publish overlap.
+    bus.publishObserverEntry('s1', obsEntry(20));
+    bus.publishObserverEntry('s1', obsEntry(21));
+    await subscribing;
+    await new Promise((r) => setImmediate(r));
+
+    const eids = sink.received.map((e) => e.eid);
+    expect(eids).toEqual(Array.from({ length: 21 }, (_, i) => i + 1));
+  });
+
+  it('DURABILITY: a fresh channel recovers the locator from the store and serves full history', async () => {
+    const path = writeLedger42(
+      Array.from({ length: 5 }, (_, i) => obsEntry(i + 1) as Record<string, unknown>)
+    );
+    const store: LedgerLocatorStore = {
+      persist: async () => undefined,
+      load: async (sessionId) => (sessionId === 's1' ? path : null),
+    };
+    bus.setLocatorStore(store);
+
+    // Simulate post-restart: nothing in memory at all for s1.
+    const sink = new TestSink();
+    await bus.subscribeObserver('s1', sink, { afterEid: 0 });
+    expect(sink.received.map((e) => e.eid)).toEqual([1, 2, 3, 4, 5]);
+  });
+
+  it('CROSS-TURN: turn-end release never detaches subscribers; later turns still deliver', async () => {
+    vi.useFakeTimers();
+    try {
+      const sink = new TestSink();
+      await bus.subscribeObserver('s1', sink);
+      bus.publishObserverEntry('s1', obsEntry(1));
+
+      // Turn ends; retention window elapses fully.
+      bus.releaseObserverSession('s1');
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+      expect(sink.endedWith).toBeNull();
+
+      // Next turn re-registers and publishes — still delivered.
+      bus.publishObserverEntry('s1', obsEntry(2));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(sink.received.map((e) => e.eid)).toEqual([1, 2]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('evicts channel memory after the window when nobody is watching', async () => {
+    vi.useFakeTimers();
+    try {
+      bus.publishObserverEntry('s1', obsEntry(1));
+      bus.releaseObserverSession('s1');
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+      // New default attach sees an empty ring (memory reclaimed)…
+      const sink = new TestSink();
+      await bus.subscribeObserver('s1', sink);
+      expect(sink.received).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
