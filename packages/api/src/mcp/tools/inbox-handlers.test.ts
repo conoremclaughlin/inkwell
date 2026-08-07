@@ -1327,6 +1327,21 @@ describe('handleUpdateInboxMessage — thread message fallback', () => {
         },
       },
     ]);
+
+    // Lumen PR #454 review blocker 3: a failed durable write must surface as
+    // failure, never as a positive acknowledgement.
+    rpcFn.mockResolvedValueOnce({ data: null, error: { message: 'permission denied' } });
+    await expect(
+      handleUpdateInboxMessage(
+        {
+          email: 'test@test.com',
+          messageId: threadMsgId,
+          agentId: 'wren',
+          status: 'completed',
+        },
+        mockDc as never
+      )
+    ).rejects.toThrow(/Failed to persist read state/);
   });
 });
 
@@ -1442,6 +1457,37 @@ describe('handleSendToInbox — system sender and cross-agent studio routing', (
         recipientStudioId: '123e4567-e89b-12d3-a456-426614174000',
         threadKey: 'thread:self-handoff',
         content: 'Pick this up in the other studio',
+        messageType: 'task_request',
+      },
+      mockDc as never
+    );
+
+    const advances = mockSb.getRpcCalls().filter((c) => c.fn === 'advance_thread_read_pointer');
+    expect(advances).toHaveLength(0);
+  });
+
+  it('does NOT advance the sender pointer for sessionAlias self-sends either', async () => {
+    // Lumen PR #454 review blocker 1: the exemption must cover ALL explicit
+    // self-target forms — alias included — with the same predicate that
+    // drives trigger self-inclusion.
+    const { getRequestContext, getSessionContext } = await import('../../utils/request-context');
+    vi.mocked(getRequestContext).mockReturnValue(undefined as never);
+    vi.mocked(getSessionContext).mockReturnValue(undefined as never);
+
+    const mockSb = createThreadMockSupabase({
+      existingThread: undefined,
+      threadMessageId: 'tmsg-889',
+    });
+    const mockDc = createThreadMockDataComposer(mockSb);
+
+    await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientAgentId: 'wren',
+        senderAgentId: 'wren',
+        sessionAlias: 'review',
+        threadKey: 'thread:self-alias-handoff',
+        content: 'Pick this up in the review session',
         messageType: 'task_request',
       },
       mockDc as never

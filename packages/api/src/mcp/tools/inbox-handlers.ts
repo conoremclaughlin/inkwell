@@ -526,12 +526,18 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     // pointer; advancing at insert would make the target instance see the
     // message as already read before delivery. The target's delivery advances
     // the shared pointer instead.
-    const selfAddressedElsewhere = !!(
+    // Explicit self-target: the sender addresses ANOTHER of their own
+    // sessions/studios — by studio id/slug, session id, OR session alias.
+    // ONE predicate drives both the sender-advance exemption and trigger
+    // self-inclusion so the two can never disagree (Lumen, PR #454 review:
+    // alias self-sends were advanced before fetch while session-id self-sends
+    // were filtered out of triggering).
+    const explicitSelfTarget = !!(
       senderAgentId &&
       allRecipients.includes(senderAgentId) &&
-      (recipientStudioId || recipientStudioSlugOrHint || recipientSessionId)
+      (recipientStudioId || recipientStudioSlugOrHint || recipientSessionId || sessionAlias)
     );
-    if (senderAgentId && threadMessage?.id && !selfAddressedElsewhere) {
+    if (senderAgentId && threadMessage?.id && !explicitSelfTarget) {
       await advanceThreadReadPointer(supabase, {
         threadId: thread.id,
         agentId: senderAgentId,
@@ -545,14 +551,9 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     // For new threads, trigger all recipients (existing behavior).
     let agentsToTrigger: string[] = [];
 
-    // Cross-studio self-messaging: when the sender targets themselves in a
-    // different studio (via recipientStudioId/recipientStudioHint), don't
-    // exclude self from trigger resolution.
-    const selfStudioTarget = !!(
-      senderAgentId &&
-      (recipientStudioId || recipientStudioSlugOrHint) &&
-      allRecipients.includes(senderAgentId)
-    );
+    // Cross-studio/session self-messaging must not exclude self from trigger
+    // resolution — same predicate as the sender-advance exemption above.
+    const selfStudioTarget = explicitSelfTarget;
 
     if (trigger !== false && !missingSenderSession) {
       if (existingThread && senderAgentId) {
@@ -1383,14 +1384,21 @@ export async function handleUpdateInboxMessage(args: unknown, dataComposer: Data
 
     // Thread messages don't have a status column — advance the read pointer
     // through THIS message instead (never wall-clock: a concurrently inserted
-    // later message must not be swept into "read").
+    // later message must not be swept into "read"). This API's purpose IS the
+    // durable write, so a failed advance must surface as failure, never as a
+    // positive acknowledgement.
     if (status === 'read' || status === 'acknowledged' || status === 'completed') {
-      await advanceThreadReadPointer(supabase, {
+      const advanced = await advanceThreadReadPointer(supabase, {
         threadId: threadMsg.thread_id,
         agentId,
         throughMessageId: messageId,
         source: 'update_inbox_message:thread-fallback',
       });
+      if (!advanced) {
+        throw new Error(
+          `Failed to persist read state for thread message ${messageId} — status not updated`
+        );
+      }
     }
 
     logger.info('Thread message status updated (via read pointer)', {

@@ -773,19 +773,27 @@ export async function handleMarkThreadRead(args: unknown, dataComposer: DataComp
   // "Mark whole thread read" = advance through the thread's current max
   // message, never wall-clock NOW() — a concurrently inserted, never-seen
   // message must not be marked read. Empty thread → nothing to advance.
-  const { data: latestMsg } = await threadTable(supabase, 'inbox_thread_messages')
+  // This API's purpose IS the durable write: a lookup or advance failure must
+  // surface as failure, never as a positive acknowledgement.
+  const { data: latestMsg, error: latestErr } = await threadTable(supabase, 'inbox_thread_messages')
     .select('id')
     .eq('thread_id', thread.id)
     .order('created_at', { ascending: false })
     .limit(1)
     .maybeSingle();
+  if (latestErr) {
+    throw new Error(`Failed to resolve latest message for ${threadKey}: ${latestErr.message}`);
+  }
   if (latestMsg?.id) {
-    await advanceThreadReadPointer(supabase, {
+    const advanced = await advanceThreadReadPointer(supabase, {
       threadId: thread.id,
       agentId,
       throughMessageId: latestMsg.id,
       source: 'mark_thread_read',
     });
+    if (!advanced) {
+      throw new Error(`Failed to persist read state for thread ${threadKey}`);
+    }
   }
 
   logger.info('Thread marked as read', { threadKey, agentId });
