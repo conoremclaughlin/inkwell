@@ -35,6 +35,11 @@ interface ClaudeStreamMessage {
   usage?: Record<string, unknown>;
   message?: { content?: ClaudeContentBlock[] };
   session_id?: string;
+  /** Raw SSE event nested under `stream_event` (--include-partial-messages). */
+  event?: {
+    type?: string;
+    delta?: { type?: string; text?: string };
+  };
 }
 
 const NO_SESSION_MARKER = 'No conversation found with session ID';
@@ -145,8 +150,19 @@ export class ClaudeStreamParser implements BackendStreamParser {
         });
         break;
       }
+      case 'stream_event': {
+        // Partial-message text fragments (--include-partial-messages). Only
+        // text deltas matter here — thinking/input_json deltas are noise for
+        // display, and the completed `assistant` block event remains the
+        // authoritative text (deltas never feed final-response extraction).
+        const delta = ev.event?.type === 'content_block_delta' ? ev.event.delta : undefined;
+        if (delta?.type === 'text_delta' && typeof delta.text === 'string' && delta.text) {
+          out.push({ kind: 'text-delta', text: delta.text });
+        }
+        break;
+      }
       default:
-        break; // system / error / stream_event / etc. — not needed for the turn result
+        break; // system / error / etc. — not needed for the turn result
     }
   }
 }

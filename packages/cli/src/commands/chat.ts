@@ -28,6 +28,7 @@ import {
   type BackendAuthBackend,
 } from '../lib/backend-auth.js';
 import { startBackendTurn, runBackendTurn } from '../repl/backend-runner.js';
+import { ParagraphStreamBuffer } from '../repl/paragraph-stream.js';
 import type { BackendTurnEvent } from '../backends/stream.js';
 import { startSessionEventStream, type SessionEvent } from '../repl/session-event-stream.js';
 import {
@@ -2661,10 +2662,46 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // backend events were mirrored).
   setTranscriptObsEmitter((entry) => emitStreamEvent({ type: 'obs', entry }));
 
-  // Bridge normalized backend stream events onto the ledger. The obs mirror
-  // above handles the wire emission; entries are compact by design — tool
-  // name/status/id and text previews only; full payloads stay in the provider
-  // transcript, linked by toolUseId.
+  // ── Live paragraph streaming (Ink TUI only) ──
+  // Assistant text renders as it flows: partial-message deltas accumulate in a
+  // fence-aware paragraph buffer and each completed paragraph is appended to
+  // scrollback immediately — the first with the agent label, the rest as
+  // continuations. The completed-block `text` event flushes the tail (or
+  // renders the whole block when the backend emitted no deltas), and the final
+  // response add dedupes against the last streamed block so nothing prints
+  // twice. Local tool routing: ```ink-tool blocks arrive as one held unit and
+  // are stripped before display.
+  const streamParaBuffer = new ParagraphStreamBuffer();
+  let streamedThisTurn = false;
+  let streamedThisBlock = false;
+  let turnStreamHeaderShown = false;
+  let lastStreamedBlockText = '';
+
+  const renderStreamedParagraph = (text: string): void => {
+    if (!inkRepl) return; // legacy readline path keeps the buffered final render
+    const display = runtime.toolRouting === 'local' ? stripLocalToolBlocks(text) : text;
+    streamedThisBlock = true; // block produced output even if display-stripped
+    if (!display) return;
+    inkRepl.addMessage(
+      'assistant',
+      display,
+      turnStreamHeaderShown ? { continuation: true } : { label: agentId }
+    );
+    turnStreamHeaderShown = true;
+    streamedThisTurn = true;
+  };
+
+  const resetTurnStreamState = (): void => {
+    streamParaBuffer.reset();
+    streamedThisTurn = false;
+    streamedThisBlock = false;
+    turnStreamHeaderShown = false;
+    lastStreamedBlockText = '';
+  };
+
+  // Bridge normalized backend stream events onto the live feed. Backend tool
+  // calls (the provider calling MCP tools mid-turn) now surface in real time —
+  // before stream-json the feed was silent during a backend-routed generation.
   const handleBackendEvent = (evt: BackendTurnEvent): void => {
     if (evt.kind === 'tool-use') {
       appendTranscript(runtime.transcriptPath, {
@@ -2688,11 +2725,26 @@ export async function runChat(options: ChatOptions): Promise<void> {
         status: evt.isError ? 'error' : 'done',
         ...(evt.id ? { toolUseId: evt.id } : {}),
       });
+    } else if (evt.kind === 'text-delta') {
+      for (const para of streamParaBuffer.push(evt.text)) {
+        renderStreamedParagraph(para);
+      }
     } else if (evt.kind === 'text' && evt.text.trim()) {
       appendTranscript(runtime.transcriptPath, {
         type: 'backend_text',
         preview: compactForLedger(evt.text, 200),
       });
+      // Completed block: flush the buffered tail; when no deltas arrived at
+      // all (backend without partial-message support), render the whole block
+      // so streaming still lands at block granularity.
+      const tail = streamParaBuffer.flush();
+      if (tail) {
+        renderStreamedParagraph(tail);
+      } else if (!streamedThisBlock) {
+        renderStreamedParagraph(evt.text.trim());
+      }
+      lastStreamedBlockText = evt.text;
+      streamedThisBlock = false;
     }
   };
 
@@ -3965,43 +4017,25 @@ export async function runChat(options: ChatOptions): Promise<void> {
     displayLabel?: string
   ) => {
     if (!raw.trim()) return;
+    resetTurnStreamState();
     // Attach pending files to this turn — append the block so the backend
     // sees the paths inline with the message that delivered them.
     if (pendingAttachmentBlock) {
       raw = `${raw}\n\n${pendingAttachmentBlock}`;
       pendingAttachmentBlock = '';
     }
+    // NOTE: display echo happens at SUBMIT time in enqueueTurn — a message
+    // typed while another turn is in flight must appear immediately, not when
+    // the queue reaches it. Ledger/transcript appends stay here, sequenced
+    // with the turn.
     if (source === 'user') {
-      // Echo the user's message
-      if (inkRepl) {
-        inkRepl.addMessage('user', raw, { label: 'you' });
-      } else {
-        printLine(
-          renderMessageLine('user', raw, {
-            label: 'you',
-            timezone: runtime.userTimezone,
-          })
-        );
-        printLine('');
-      }
       ledger.addEntry('user', raw, 'repl');
       appendTranscript(runtime.transcriptPath, { type: 'user', content: raw });
     } else if (source === 'system') {
       // Synthetic turn input: heartbeat triggers, server-delivered messages,
-      // continuation prompts. Rendered as system (not "you") so transcripts
+      // continuation prompts. Recorded as system (not "you") so transcripts
       // distinguish harness prompts from the human's words.
       const label = displayLabel || 'system';
-      if (inkRepl) {
-        inkRepl.addMessage('system', raw, { label });
-      } else {
-        printLine(
-          renderMessageLine('system', raw, {
-            label,
-            timezone: runtime.userTimezone,
-          })
-        );
-        printLine('');
-      }
       ledger.addEntry('system', raw, label);
       appendTranscript(runtime.transcriptPath, { type: 'system_turn', content: raw, label });
     } else {
@@ -4924,10 +4958,21 @@ export async function runChat(options: ChatOptions): Promise<void> {
       if (!isAbortedTurn) {
         const usageMeta = runResult.usage ? formatBackendTokenUsage(runResult.usage) : undefined;
         const trailingParts = [`${turnDurationSeconds}s`, usageMeta].filter(Boolean).join('  ·  ');
-        inkRepl.addMessage('assistant', assistantDisplayText, {
-          label: agentId,
-          trailingMeta: trailingParts,
-        });
+        // When the final text already streamed live (it is the last completed
+        // block, modulo local-tool stripping), don't print the body twice —
+        // close the turn with a compact meta line instead.
+        const streamedFinal =
+          runtime.toolRouting === 'local'
+            ? stripLocalToolBlocks(lastStreamedBlockText)
+            : lastStreamedBlockText.trim();
+        if (streamedThisTurn && assistantDisplayText.trim() === streamedFinal) {
+          inkRepl.printEvent(`✔ ${agentId} · ${trailingParts}`);
+        } else {
+          inkRepl.addMessage('assistant', assistantDisplayText, {
+            label: agentId,
+            trailingMeta: trailingParts,
+          });
+        }
       }
     } else if (!isAbortedTurn) {
       printLine('');
@@ -4978,6 +5023,37 @@ export async function runChat(options: ChatOptions): Promise<void> {
     source: 'user' | 'inbox-auto' | 'system' = 'user',
     displayLabel?: string
   ): Promise<void> => {
+    // Echo at SUBMIT time, not when the queue reaches the turn — a message
+    // typed while another turn is in flight must not vanish until its turn
+    // starts. Ledger/transcript appends remain turn-sequenced in runUserTurn.
+    if (raw.trim()) {
+      if (source === 'user') {
+        if (inkRepl) {
+          inkRepl.addMessage('user', raw, { label: 'you' });
+        } else {
+          printLine(
+            renderMessageLine('user', raw, {
+              label: 'you',
+              timezone: runtime.userTimezone,
+            })
+          );
+          printLine('');
+        }
+      } else if (source === 'system') {
+        const label = displayLabel || 'system';
+        if (inkRepl) {
+          inkRepl.addMessage('system', raw, { label });
+        } else {
+          printLine(
+            renderMessageLine('system', raw, {
+              label,
+              timezone: runtime.userTimezone,
+            })
+          );
+          printLine('');
+        }
+      }
+    }
     pendingTurns += 1;
     emitStatusLaneIfChanged();
     const run = async () => {

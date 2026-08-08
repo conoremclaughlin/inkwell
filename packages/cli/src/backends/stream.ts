@@ -18,6 +18,13 @@ import type { BackendTokenUsage } from '../repl/token-usage.js';
 
 export type BackendTurnEvent =
   | { kind: 'text'; text: string }
+  /**
+   * Partial-message text fragment (claude: `--include-partial-messages`).
+   * Contract: the completed block's `text` event ALWAYS follows its deltas and
+   * carries the full block text — consumers that render deltas live must
+   * dedupe against it. Deltas never feed final-response extraction.
+   */
+  | { kind: 'text-delta'; text: string }
   | { kind: 'tool-use'; id?: string; name: string; input?: unknown }
   | { kind: 'tool-result'; id?: string; isError?: boolean }
   | {

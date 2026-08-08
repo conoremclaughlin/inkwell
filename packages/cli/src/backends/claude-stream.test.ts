@@ -187,4 +187,50 @@ describe('ClaudeStreamParser', () => {
     expect(last.kind === 'result' && last.text).toBe('Done — 3 emails.');
     expect(last.kind === 'result' && last.usage?.inputTokens).toBe(12500);
   });
+
+  describe('partial-message deltas (--include-partial-messages)', () => {
+    const deltaEvent = (text: string) => ({
+      type: 'stream_event',
+      event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } },
+    });
+
+    it('emits text-delta events for text_delta stream events', () => {
+      const p = new ClaudeStreamParser();
+      const evs = p.push(line(deltaEvent('Hel')) + line(deltaEvent('lo.')));
+      expect(evs).toEqual([
+        { kind: 'text-delta', text: 'Hel' },
+        { kind: 'text-delta', text: 'lo.' },
+      ]);
+    });
+
+    it('ignores thinking and input_json deltas', () => {
+      const p = new ClaudeStreamParser();
+      const evs = p.push(
+        line({
+          type: 'stream_event',
+          event: { type: 'content_block_delta', delta: { type: 'thinking_delta', thinking: 'x' } },
+        }) +
+          line({
+            type: 'stream_event',
+            event: {
+              type: 'content_block_delta',
+              delta: { type: 'input_json_delta', partial_json: '{"a"' },
+            },
+          }) +
+          line({ type: 'stream_event', event: { type: 'content_block_start' } })
+      );
+      expect(evs).toEqual([]);
+    });
+
+    it('deltas never feed final-response extraction — the block event stays authoritative', () => {
+      const p = new ClaudeStreamParser();
+      p.push(line(deltaEvent('Partial that must not leak')));
+      p.push(
+        line({ type: 'assistant', message: { content: [{ type: 'text', text: 'Complete.' }] } })
+      );
+      const evs = p.push(line({ type: 'result', result: '' }));
+      const r = evs[0]!;
+      expect(r.kind === 'result' && r.text).toBe('Complete.');
+    });
+  });
 });
