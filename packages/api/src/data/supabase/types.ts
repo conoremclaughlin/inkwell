@@ -2790,6 +2790,7 @@ export type Database = {
           message_count: number | null;
           metadata: Json | null;
           model: string | null;
+          observer_ledger_path: string | null;
           sb_id: string | null;
           started_at: string | null;
           status: string | null;
@@ -2820,6 +2821,7 @@ export type Database = {
           message_count?: number | null;
           metadata?: Json | null;
           model?: string | null;
+          observer_ledger_path?: string | null;
           sb_id?: string | null;
           started_at?: string | null;
           status?: string | null;
@@ -2850,6 +2852,7 @@ export type Database = {
           message_count?: number | null;
           metadata?: Json | null;
           model?: string | null;
+          observer_ledger_path?: string | null;
           sb_id?: string | null;
           started_at?: string | null;
           status?: string | null;

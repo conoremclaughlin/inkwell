@@ -54,8 +54,19 @@ export type SessionStreamListener = (event: SessionStreamEvent) => void;
 // truth — observers attach with *replay after cursor, then follow*, and a
 // subscriber that can't keep up is DISCONNECTED (never skipped ahead) so its
 // view can never diverge from the ledger; it reconverges via durable replay.
+//
+// CONTRACT (v4, reconciled after Lumen's M4.2 re-review): the wire does NOT
+// carry the raw appended ledger object. Every frame — live and replayed — is
+// the deterministic SERVER-SIDE PROJECTION of that entry (projectObserverEntry:
+// type allowlist + per-type field allowlist + preview truncation). The no-fork
+// invariant is therefore: rendered stream ≡ projection(ledger), same eids and
+// order; raw payloads and secrets structurally never cross the wire.
 
-/** A canonical ledger entry, exactly as appended by the runtime (eid included). */
+/**
+ * A ledger entry keyed by the ledger's own eid. Used for BOTH the raw ingest
+ * input (as appended by the runtime) and the projected frame observers
+ * receive — projectObserverEntry maps the former onto the latter.
+ */
 export interface ObserverEntry {
   eid: number;
   ts: string;
@@ -87,6 +98,12 @@ export interface ObserverSubscribeOptions {
   afterEid?: number;
   /** false → replay only, then end('unsubscribed'). Default true. */
   follow?: boolean;
+  /**
+   * Aborted when the transport closes. Checked inside the replay loops so a
+   * vanished client CANCELS an in-progress disk replay instead of letting it
+   * run to EOF while holding a subscriber slot (Lumen re-review, blocker 2).
+   */
+  signal?: AbortSignal;
 }
 
 /**
@@ -389,12 +406,22 @@ export class SessionEventBus extends EventEmitter {
     }
     this.obsChannel(sessionId).ledgerPath = ledgerPath;
     // Durably persist so replay survives bus eviction and process restarts.
-    void this.locatorStore?.persist(sessionId, ledgerPath).catch((err) => {
-      logger.warn('[EventBus] Failed to persist ledger locator', {
-        sessionId,
-        error: String(err),
-      });
-    });
+    // One retry, then an ERROR-level log: a lost locator silently downgrades
+    // durable replay to live-only for this session, so the failure must be
+    // loud (Lumen re-review, blocker 1).
+    const store = this.locatorStore;
+    if (store) {
+      void store
+        .persist(sessionId, ledgerPath)
+        .catch(() => store.persist(sessionId, ledgerPath))
+        .catch((err) => {
+          logger.error('[EventBus] Ledger locator persist failed after retry', {
+            sessionId,
+            ledgerPath,
+            error: String(err),
+          });
+        });
+    }
   }
 
   /**
@@ -481,9 +508,9 @@ export class SessionEventBus extends EventEmitter {
     };
 
     try {
-      await this.replayObserver(ch, sub, options.afterEid, highWater);
+      await this.replayObserver(ch, sub, options.afterEid, highWater, options.signal);
 
-      if (!follow) {
+      if (!follow || options.signal?.aborted) {
         unsubscribe();
         return unsubscribe;
       }
@@ -491,10 +518,14 @@ export class SessionEventBus extends EventEmitter {
       // Drain capture in eid order until empty, then flip to direct follow.
       // New publishes keep landing in capture (bounded) while draining, so
       // the flip happens only at a genuinely empty queue.
-      while (!sub.closed && sub.capture.length > 0) {
+      while (!sub.closed && !options.signal?.aborted && sub.capture.length > 0) {
         const next = sub.capture.shift()!;
         sub.captureBytes -= observerEntryBytes(next);
         await this.writeObserver(sub, next);
+      }
+      if (options.signal?.aborted) {
+        unsubscribe();
+        return unsubscribe;
       }
       sub.replaying = false;
       return unsubscribe;
@@ -529,14 +560,16 @@ export class SessionEventBus extends EventEmitter {
     ch: ObserverChannel,
     sub: ObserverSubscriber,
     afterEid: number | undefined,
-    highWater: number
+    highWater: number,
+    signal?: AbortSignal
   ): Promise<void> {
+    const gone = (): boolean => sub.closed || signal?.aborted === true;
     if (highWater === 0 && afterEid === undefined) return;
 
     // Default attach: ring only.
     if (afterEid === undefined) {
       for (const entry of [...ch.ring]) {
-        if (sub.closed) return;
+        if (gone()) return;
         if (entry.eid <= highWater) await this.writeObserver(sub, entry);
       }
       return;
@@ -545,7 +578,7 @@ export class SessionEventBus extends EventEmitter {
     const ringCoversCursor = ch.ring.length > 0 && ch.ring[0].eid <= afterEid + 1;
     if (ringCoversCursor) {
       for (const entry of [...ch.ring]) {
-        if (sub.closed) return;
+        if (gone()) return;
         if (entry.eid > afterEid && entry.eid <= highWater) {
           await this.writeObserver(sub, entry);
         }
@@ -560,6 +593,13 @@ export class SessionEventBus extends EventEmitter {
     // queue idempotent, and it also serves the fresh-channel case (lastEid=0
     // after eviction/restart) where a cap would wrongly suppress all history.
     if (!ch.ledgerPath) {
+      // No durable locator AND nothing ever published on this channel: the
+      // session has no observable history yet (first-turn attach racing the
+      // runtime's session_meta announcement). The replay is vacuously
+      // complete — follow live instead of failing (Lumen re-review,
+      // blocker 1). With entries already published the gap is real: fail so
+      // the client knows its view would be incomplete.
+      if (highWater === 0) return;
       throw new Error('Cursor precedes ring and no ledger path is registered');
     }
     await stat(ch.ledgerPath); // surface missing-file as replay failure
@@ -569,7 +609,7 @@ export class SessionEventBus extends EventEmitter {
     });
     try {
       for await (const line of rl) {
-        if (sub.closed) return;
+        if (gone()) return;
         const trimmed = line.trim();
         if (!trimmed) continue;
         let parsed: ObserverEntry;

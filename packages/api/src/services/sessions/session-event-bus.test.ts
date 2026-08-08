@@ -572,3 +572,87 @@ describe('SessionEventBus observer channel — M4.2', () => {
     }
   });
 });
+
+/**
+ * M4.3 (Lumen re-review, remaining blockers): close cancels in-progress
+ * replay; locator durability semantics (first-turn race, persist retry).
+ */
+describe('SessionEventBus observer channel — M4.3', () => {
+  let bus: InstanceType<typeof _BusForType>;
+  let dir: string;
+
+  beforeEach(() => {
+    bus = new _BusForType();
+    dir = mkdtempSync(join(tmpdir(), 'obs-m43-'));
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  function writeLedger43(entries: Record<string, unknown>[]): string {
+    const replDir = join(dir, '.ink', 'runtime', 'repl');
+    mkdirSync(replDir, { recursive: true });
+    const path = join(replDir, 'sess-1-123.jsonl');
+    writeFileSync(path, entries.map((e) => JSON.stringify(e)).join('\n') + '\n');
+    return path;
+  }
+
+  it('ABORT: close during a ledger backfill cancels the replay instead of reading to EOF', async () => {
+    const TOTAL = 500;
+    const ledger = Array.from({ length: TOTAL }, (_, i) => obsEntry(i + 1));
+    bus.registerLedgerPath('s1', writeLedger43(ledger));
+    // Publish far past the ring capacity is unnecessary — an empty ring with a
+    // cursor at 0 forces the disk path directly.
+    const ac = new AbortController();
+    const sink = new (class extends TestSink {
+      override write(e: ObserverEntry): boolean {
+        const ok = super.write(e);
+        if (this.received.length === 1) ac.abort(); // client vanishes mid-replay
+        return ok;
+      }
+    })();
+
+    await bus.subscribeObserver('s1', sink, { afterEid: 0, signal: ac.signal });
+
+    // The loop must stop at the abort check, not run the remaining 499 lines.
+    expect(sink.received.length).toBeLessThan(5);
+    // Subscriber slot is released — the session cap is not consumed by a ghost.
+    expect(sink.endedWith).toBe('unsubscribed');
+    for (let i = 0; i < OBS_MAX_SUBSCRIBERS; i++) {
+      await bus.subscribeObserver('s1', new TestSink(), { signal: new AbortController().signal });
+    }
+  });
+
+  it('FIRST-TURN RACE: --from-start attach before session_meta follows live instead of failing', async () => {
+    // No registerLedgerPath, no locator store row, nothing published: the
+    // replay is vacuously complete — the watcher attaches and sees the
+    // session's entries as the runtime produces them.
+    const sink = new TestSink();
+    await bus.subscribeObserver('s1', sink, { afterEid: 0 });
+    for (let i = 1; i <= 3; i++) bus.publishObserverEntry('s1', obsEntry(i));
+    await new Promise((r) => setImmediate(r));
+
+    expect(sink.received.map((e) => e.eid)).toEqual([1, 2, 3]);
+    expect(sink.endedWith).toBeNull();
+  });
+
+  it('persist failures retry once and never leave the locator silently unwritten', async () => {
+    const calls: string[] = [];
+    let failures = 1;
+    const store: LedgerLocatorStore = {
+      persist: async (sessionId, ledgerPath) => {
+        calls.push(ledgerPath);
+        if (failures-- > 0) throw new Error('transient db error');
+      },
+      load: async () => null,
+    };
+    bus.setLocatorStore(store);
+    const path = writeLedger43([obsEntry(1)]);
+    bus.registerLedgerPath('s1', path);
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+
+    expect(calls).toEqual([path, path]); // first attempt + one retry
+  });
+});

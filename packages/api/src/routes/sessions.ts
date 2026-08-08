@@ -10,8 +10,12 @@
  *
  * - **legacy** (default): the best-effort live tap — process-local event ids,
  *   turn-scoped replay. Pre-existing consumers keep this contract unchanged.
- * - **obs**: canonical ledger entries keyed by the ledger's monotonic eid.
- *   SSE frame id = ledger eid. Cursors are EXCLUSIVE: `?afterEid=N` (or the
+ * - **obs**: the deterministic server-side PROJECTION of canonical ledger
+ *   entries (type + field allowlists, preview truncation — see
+ *   projectObserverEntry), keyed by the ledger's monotonic eid. Frames are
+ *   never the raw appended objects; the invariant is rendered stream ≡
+ *   projection(ledger). SSE frame id = ledger eid. Cursors are EXCLUSIVE:
+ *   `?afterEid=N` (or the
  *   `Last-Event-ID: N` header on reconnect) resumes at the first entry with
  *   eid > N; cursors older than the in-memory ring backfill from the durable
  *   ledger automatically. A subscriber that can't keep up is disconnected
@@ -234,6 +238,9 @@ export function createSessionsRouter(deps: {
 
     let closed = false;
     let teardown: () => void = () => undefined;
+    // Aborted on close so an in-progress bus replay CANCELS instead of
+    // running to EOF against a vanished client (Lumen re-review, blocker 2).
+    const closeController = new AbortController();
     // Pending drain waiters — resolved on real drain OR on close, so a replay
     // awaiting backpressure always makes progress and settles (blocker 4).
     let drainWaiters: Array<() => void> = [];
@@ -246,6 +253,7 @@ export function createSessionsRouter(deps: {
     const cleanup = (): void => {
       if (closed) return;
       closed = true;
+      closeController.abort();
       clearInterval(heartbeat);
       const count = observerConnectionsByUser.get(auth.userId) ?? 1;
       if (count <= 1) observerConnectionsByUser.delete(auth.userId);
@@ -290,6 +298,7 @@ export function createSessionsRouter(deps: {
         const unsubscribe = await sessionEventBus.subscribeObserver(sessionId, sink, {
           afterEid: parseAfterEid(req),
           follow: req.query.follow !== 'false',
+          signal: closeController.signal,
         });
         teardown = unsubscribe;
         if (closed) unsubscribe(); // client left during replay

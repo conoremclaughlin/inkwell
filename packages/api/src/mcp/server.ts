@@ -841,24 +841,30 @@ export class MCPServer {
     // tables) so observer replay survives bus eviction and process restarts.
     const locatorClient = this.dataComposer.getClient();
     sessionEventBus.setLocatorStore({
+      // Dedicated column, single-column UPDATE — no read-modify-write of the
+      // shared metadata object (that merge raced other session updates and
+      // could silently drop the locator). PostgREST reports failures via
+      // `error`, not exceptions — check and THROW so the bus's retry/logging
+      // actually sees them (Lumen re-review, blocker 1).
       persist: async (sessionId, ledgerPath) => {
-        const { data: row } = await locatorClient
+        const { error } = await locatorClient
           .from('sessions')
-          .select('metadata')
-          .eq('id', sessionId)
-          .maybeSingle();
-        const metadata = { ...((row?.metadata as object) ?? {}), observer_ledger_path: ledgerPath };
-        await locatorClient.from('sessions').update({ metadata }).eq('id', sessionId);
+          .update({ observer_ledger_path: ledgerPath })
+          .eq('id', sessionId);
+        if (error) {
+          throw new Error(`locator persist failed: ${error.message}`);
+        }
       },
       load: async (sessionId) => {
-        const { data: row } = await locatorClient
+        const { data: row, error } = await locatorClient
           .from('sessions')
-          .select('metadata')
+          .select('observer_ledger_path')
           .eq('id', sessionId)
           .maybeSingle();
-        const path = (row?.metadata as { observer_ledger_path?: unknown } | null)
-          ?.observer_ledger_path;
-        return typeof path === 'string' ? path : null;
+        if (error) {
+          throw new Error(`locator load failed: ${error.message}`);
+        }
+        return row?.observer_ledger_path ?? null;
       },
     });
     const sessionsRouter = createSessionsRouter({
