@@ -14,6 +14,16 @@ describe('validateTelegramChatId', () => {
     expect(validateTelegramChatId('@some_channel')).toBeNull();
   });
 
+  it('accepts the telegram:<chatId> conversation-id form the listener strips', () => {
+    expect(validateTelegramChatId('telegram:12345')).toBeNull();
+    expect(validateTelegramChatId('telegram:-1001234567890')).toBeNull();
+    expect(validateTelegramChatId('telegram:@some_channel')).toBeNull();
+  });
+
+  it('rejects a telegram:-prefixed symbolic label', () => {
+    expect(validateTelegramChatId('telegram:myra')).not.toBeNull();
+  });
+
   it('rejects symbolic labels with a recovery hint', () => {
     const error = validateTelegramChatId('myra-telegram');
     expect(error).toContain('myra-telegram');

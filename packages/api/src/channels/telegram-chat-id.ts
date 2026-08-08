@@ -15,9 +15,14 @@ const USERNAME_CHAT_ID_RE = /^@[A-Za-z0-9_]{5,32}$/;
 /**
  * Returns an actionable error message when the chat id cannot be a real
  * Telegram chat id, or null when it is plausibly valid.
+ *
+ * Accepts the `telegram:<chatId>` conversation-id form — every downstream
+ * TelegramListener send method strips that prefix itself, so validation must
+ * judge the id the listener will actually use, not the wrapper.
  */
 export function validateTelegramChatId(chatId: string): string | null {
-  if (NUMERIC_CHAT_ID_RE.test(chatId) || USERNAME_CHAT_ID_RE.test(chatId)) {
+  const normalized = chatId.startsWith('telegram:') ? chatId.slice('telegram:'.length) : chatId;
+  if (NUMERIC_CHAT_ID_RE.test(normalized) || USERNAME_CHAT_ID_RE.test(normalized)) {
     return null;
   }
   return (

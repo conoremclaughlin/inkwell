@@ -489,6 +489,20 @@ describe('ChannelGateway', () => {
       expect(cleanup).toHaveBeenCalledTimes(1);
     });
 
+    it('passes the telegram:<chatId> conversation-id form through to the listener', async () => {
+      const sendMessage = vi.fn().mockResolvedValue(undefined);
+      (gateway as any).telegramListener = { sendMessage };
+
+      await gateway.sendResponse({
+        channel: 'telegram',
+        conversationId: 'telegram:12345',
+        content: 'hello',
+      });
+      expect(sendMessage).toHaveBeenCalledTimes(1);
+      // The listener owns prefix stripping — the gateway must not alter the id.
+      expect(sendMessage.mock.calls[0]![0]).toBe('telegram:12345');
+    });
+
     it('rejects symbolic Telegram chat ids before any send is attempted', async () => {
       const sendMessage = vi.fn().mockResolvedValue(undefined);
       (gateway as any).telegramListener = { sendMessage };
