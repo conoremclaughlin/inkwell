@@ -28,6 +28,7 @@ import { logger } from '../utils/logger';
 import { env } from '../config/env';
 import { InboundMediaPipeline } from './media-pipeline';
 import { TextToSpeechService } from './text-to-speech';
+import { validateTelegramChatId } from './telegram-chat-id';
 import telegramifyMarkdown from 'telegramify-markdown';
 import type { Platform } from '../types/shared';
 
@@ -696,9 +697,16 @@ export class ChannelGateway extends EventEmitter {
     let mediaResult: { sent: number; failed: number; errors: string[] } | undefined;
 
     switch (channel) {
-      case 'telegram':
+      case 'telegram': {
         if (!this.telegramListener) {
           throw new Error('Telegram listener not available');
+        }
+        // Fail fast on ids Telegram can never accept (symbolic labels guessed
+        // by agents in proactive sessions) — one choke point covers the text,
+        // voice, and media paths below.
+        const chatIdError = validateTelegramChatId(conversationId);
+        if (chatIdError) {
+          throw new Error(chatIdError);
         }
         if (await this.trySendTelegramVoiceReply(response)) {
           if (this.includeTextAfterVoiceReply) {
@@ -739,6 +747,7 @@ export class ChannelGateway extends EventEmitter {
           }
         }
         break;
+      }
 
       case 'whatsapp':
         if (!this.whatsappListener) {
