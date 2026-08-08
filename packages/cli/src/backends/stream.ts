@@ -17,12 +17,18 @@
 import type { BackendTokenUsage } from '../repl/token-usage.js';
 
 export type BackendTurnEvent =
+  /**
+   * Completed assistant-MESSAGE text: all text blocks of one assistant
+   * message concatenated. Identical to what final-response extraction uses,
+   * so consumers can dedupe streamed output against the final text by
+   * equality.
+   */
   | { kind: 'text'; text: string }
   /**
    * Partial-message text fragment (claude: `--include-partial-messages`).
-   * Contract: the completed block's `text` event ALWAYS follows its deltas and
-   * carries the full block text — consumers that render deltas live must
-   * dedupe against it. Deltas never feed final-response extraction.
+   * Contract: the completed message's `text` event ALWAYS follows its deltas
+   * and carries the full concatenated text — consumers that render deltas
+   * live must dedupe against it. Deltas never feed final-response extraction.
    */
   | { kind: 'text-delta'; text: string }
   | { kind: 'tool-use'; id?: string; name: string; input?: unknown }

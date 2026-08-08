@@ -28,7 +28,7 @@ import {
   type BackendAuthBackend,
 } from '../lib/backend-auth.js';
 import { startBackendTurn, runBackendTurn } from '../repl/backend-runner.js';
-import { ParagraphStreamBuffer } from '../repl/paragraph-stream.js';
+import { StreamedTurnRenderer, type StreamedLine } from '../repl/paragraph-stream.js';
 import type { BackendTurnEvent } from '../backends/stream.js';
 import { startSessionEventStream, type SessionEvent } from '../repl/session-event-stream.js';
 import {
@@ -2666,37 +2666,25 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // Assistant text renders as it flows: partial-message deltas accumulate in a
   // fence-aware paragraph buffer and each completed paragraph is appended to
   // scrollback immediately — the first with the agent label, the rest as
-  // continuations. The completed-block `text` event flushes the tail (or
-  // renders the whole block when the backend emitted no deltas), and the final
-  // response add dedupes against the last streamed block so nothing prints
-  // twice. Local tool routing: ```ink-tool blocks arrive as one held unit and
-  // are stripped before display.
-  const streamParaBuffer = new ParagraphStreamBuffer();
-  let streamedThisTurn = false;
-  let streamedThisBlock = false;
-  let turnStreamHeaderShown = false;
-  let lastStreamedBlockText = '';
+  // continuations (invalidated whenever another writer interleaves). The
+  // completed-message `text` event flushes the tail (or renders the whole
+  // message when the backend emitted no deltas), and the final response add
+  // dedupes against the streamed message so nothing prints twice. Local tool
+  // routing: ```ink-tool blocks arrive as one held unit and are stripped
+  // before display. All state lives in StreamedTurnRenderer (unit-tested).
+  const streamRenderer = new StreamedTurnRenderer((text) =>
+    runtime.toolRouting === 'local' ? stripLocalToolBlocks(text) : text
+  );
 
-  const renderStreamedParagraph = (text: string): void => {
+  const renderStreamedLines = (lines: StreamedLine[]): void => {
     if (!inkRepl) return; // legacy readline path keeps the buffered final render
-    const display = runtime.toolRouting === 'local' ? stripLocalToolBlocks(text) : text;
-    streamedThisBlock = true; // block produced output even if display-stripped
-    if (!display) return;
-    inkRepl.addMessage(
-      'assistant',
-      display,
-      turnStreamHeaderShown ? { continuation: true } : { label: agentId }
-    );
-    turnStreamHeaderShown = true;
-    streamedThisTurn = true;
-  };
-
-  const resetTurnStreamState = (): void => {
-    streamParaBuffer.reset();
-    streamedThisTurn = false;
-    streamedThisBlock = false;
-    turnStreamHeaderShown = false;
-    lastStreamedBlockText = '';
+    for (const line of lines) {
+      inkRepl.addMessage(
+        'assistant',
+        line.text,
+        line.continuation ? { continuation: true } : { label: agentId }
+      );
+    }
   };
 
   // Bridge normalized backend stream events onto the live feed. Backend tool
@@ -2726,25 +2714,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
         ...(evt.id ? { toolUseId: evt.id } : {}),
       });
     } else if (evt.kind === 'text-delta') {
-      for (const para of streamParaBuffer.push(evt.text)) {
-        renderStreamedParagraph(para);
-      }
+      renderStreamedLines(streamRenderer.pushDelta(evt.text));
     } else if (evt.kind === 'text' && evt.text.trim()) {
       appendTranscript(runtime.transcriptPath, {
         type: 'backend_text',
         preview: compactForLedger(evt.text, 200),
       });
-      // Completed block: flush the buffered tail; when no deltas arrived at
-      // all (backend without partial-message support), render the whole block
-      // so streaming still lands at block granularity.
-      const tail = streamParaBuffer.flush();
-      if (tail) {
-        renderStreamedParagraph(tail);
-      } else if (!streamedThisBlock) {
-        renderStreamedParagraph(evt.text.trim());
-      }
-      lastStreamedBlockText = evt.text;
-      streamedThisBlock = false;
+      renderStreamedLines(streamRenderer.completeMessage(evt.text));
     }
   };
 
@@ -4017,7 +3993,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     displayLabel?: string
   ) => {
     if (!raw.trim()) return;
-    resetTurnStreamState();
+    streamRenderer.reset();
     // Attach pending files to this turn — append the block so the backend
     // sees the paths inline with the message that delivered them.
     if (pendingAttachmentBlock) {
@@ -4958,14 +4934,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
       if (!isAbortedTurn) {
         const usageMeta = runResult.usage ? formatBackendTokenUsage(runResult.usage) : undefined;
         const trailingParts = [`${turnDurationSeconds}s`, usageMeta].filter(Boolean).join('  ·  ');
-        // When the final text already streamed live (it is the last completed
-        // block, modulo local-tool stripping), don't print the body twice —
-        // close the turn with a compact meta line instead.
-        const streamedFinal =
-          runtime.toolRouting === 'local'
-            ? stripLocalToolBlocks(lastStreamedBlockText)
-            : lastStreamedBlockText.trim();
-        if (streamedThisTurn && assistantDisplayText.trim() === streamedFinal) {
+        // When the final text already streamed live (it equals the last
+        // completed assistant MESSAGE, modulo local-tool stripping), don't
+        // print the body twice — close the turn with a compact meta line.
+        if (streamRenderer.shouldSkipFinal(assistantDisplayText)) {
           inkRepl.printEvent(`✔ ${agentId} · ${trailingParts}`);
         } else {
           inkRepl.addMessage('assistant', assistantDisplayText, {
@@ -5027,6 +4999,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // typed while another turn is in flight must not vanish until its turn
     // starts. Ledger/transcript appends remain turn-sequenced in runUserTurn.
     if (raw.trim()) {
+      // The echo interleaves with any in-flight streamed paragraphs — the next
+      // one must re-render its agent header so it can't read as continuation
+      // of this message.
+      streamRenderer.noteInterleave();
       if (source === 'user') {
         if (inkRepl) {
           inkRepl.addMessage('user', raw, { label: 'you' });

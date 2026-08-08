@@ -107,16 +107,26 @@ export class ClaudeStreamParser implements BackendStreamParser {
       case 'assistant': {
         const content = ev.message?.content;
         if (!Array.isArray(content)) break;
+        // ONE message-level text event per assistant message: all text blocks
+        // concatenated, matching exactly what final-response extraction uses
+        // (lastAssistantText) — so consumers can dedupe streamed output
+        // against the final text by simple equality. Emitted before the
+        // message's tool-use events (text blocks precede tool_use in
+        // practice, so display order is preserved).
         let text = '';
+        const toolUses: BackendTurnEvent[] = [];
         for (const block of content) {
           if (block.type === 'text' && typeof block.text === 'string' && block.text) {
             text += block.text;
-            out.push({ kind: 'text', text: block.text });
           } else if (block.type === 'tool_use' && typeof block.name === 'string') {
-            out.push({ kind: 'tool-use', id: block.id, name: block.name, input: block.input });
+            toolUses.push({ kind: 'tool-use', id: block.id, name: block.name, input: block.input });
           }
         }
-        if (text) this.lastAssistantText = text;
+        if (text) {
+          out.push({ kind: 'text', text });
+          this.lastAssistantText = text;
+        }
+        out.push(...toolUses);
         break;
       }
       case 'user': {

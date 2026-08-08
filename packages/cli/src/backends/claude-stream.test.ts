@@ -188,6 +188,26 @@ describe('ClaudeStreamParser', () => {
     expect(last.kind === 'result' && last.usage?.inputTokens).toBe(12500);
   });
 
+  it('REGRESSION (Lumen): concatenates multiple text blocks into ONE message-level text event', () => {
+    const p = new ClaudeStreamParser();
+    const evs = p.push(
+      line({
+        type: 'assistant',
+        message: {
+          content: [
+            { type: 'text', text: 'One' },
+            { type: 'text', text: 'Two' },
+          ],
+        },
+      })
+    );
+    // One event carrying the full message text — the same value
+    // final-response extraction uses, so consumers dedupe by equality.
+    expect(evs).toEqual([{ kind: 'text', text: 'OneTwo' }]);
+    const [r] = p.push(line({ type: 'result', result: '' }));
+    expect(r?.kind === 'result' && r.text).toBe('OneTwo');
+  });
+
   describe('partial-message deltas (--include-partial-messages)', () => {
     const deltaEvent = (text: string) => ({
       type: 'stream_event',
