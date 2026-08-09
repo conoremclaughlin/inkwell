@@ -29,6 +29,12 @@ afterAll(() => {
   rmSync(emptyHome, { recursive: true, force: true });
 });
 
+/**
+ * No harness-noise bypass here on purpose. Swallowing "Cannot find module" or
+ * an uncaught exception would let a CLI that fails to even start satisfy every
+ * assertion below vacuously — which defeats the point of a command-level test.
+ * A runner that can't launch the CLI is a real failure and should say so.
+ */
 async function runSignedOut(args: string[]): Promise<{ output: string; exitCode: number }> {
   try {
     const { stdout, stderr } = await execFileAsync('npx', ['tsx', CLI_PATH, ...args], {
@@ -43,22 +49,24 @@ async function runSignedOut(args: string[]): Promise<{ output: string; exitCode:
   }
 }
 
-/** tsx/module resolution hiccups in CI shouldn't read as an assertion failure. */
-function isHarnessNoise(output: string): boolean {
-  return output.includes('triggerUncaughtException') || output.includes('Cannot find module');
+/** A crash or unresolved import means the assertions below prove nothing. */
+function assertCliStarted(output: string): void {
+  expect(output).not.toContain('Cannot find module');
+  expect(output).not.toContain('triggerUncaughtException');
+  expect(output).not.toContain('ERR_MODULE_NOT_FOUND');
 }
 
 describe('signed-out guard', () => {
   it('ink awaken prints the guidance and exits non-zero', async () => {
     const { output, exitCode } = await runSignedOut(['awaken', '--backend', 'claude']);
-    if (isHarnessNoise(output)) return;
+    assertCliStarted(output);
     expect(output).toContain(NOT_SIGNED_IN_MESSAGE);
     expect(exitCode).not.toBe(0);
   });
 
   it('ink wait prints the guidance, not a bare prefix', async () => {
     const { output, exitCode } = await runSignedOut(['wait', '--timeout', '5']);
-    if (isHarnessNoise(output)) return;
+    assertCliStarted(output);
     expect(output).toContain(NOT_SIGNED_IN_MESSAGE);
     // The regression: an interpolation slip left "[ink wait] " with no message.
     expect(output).not.toMatch(/\[ink wait\]\s*$/);
@@ -67,7 +75,7 @@ describe('signed-out guard', () => {
 
   it('points at `ink auth login` rather than looping users through `ink init`', async () => {
     const { output } = await runSignedOut(['awaken', '--backend', 'claude']);
-    if (isHarnessNoise(output)) return;
+    assertCliStarted(output);
     expect(output).toContain('ink auth login');
   });
 });
