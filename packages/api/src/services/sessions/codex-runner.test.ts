@@ -123,6 +123,8 @@ describe('CodexRunner', () => {
       contextTokens: 42,
       inputTokens: 12,
       outputTokens: 5,
+      // Codex reports thread-cumulative totals; the repository diffs them.
+      cumulative: true,
     });
     expect(result.finalTextResponse).toBe('done');
     expect(result.toolCalls?.length).toBe(1);
@@ -566,5 +568,111 @@ describe('CodexRunner', () => {
     expect(result.error).toContain('thread.started');
     expect(result.error).toContain('turn.started');
     expect(result.error).toContain('stream disconnected before completion');
+  });
+});
+
+describe('CodexRunner token usage extraction', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function runWithEvents(events: Record<string, unknown>[]) {
+    const mockProc = createMockProcess();
+    (spawn as Mock).mockReturnValue(mockProc);
+
+    const runner = new CodexRunner();
+    const runPromise = runner.run('hello', {
+      config: {
+        workingDirectory: process.cwd(),
+        mcpConfigPath: '',
+        model: 'gpt-5-codex',
+        appendSystemPrompt: 'identity override',
+      },
+    });
+
+    setTimeout(() => {
+      for (const event of events) {
+        mockProc.stdout.emit('data', Buffer.from(`${JSON.stringify(event)}\n`));
+      }
+      mockProc.emit('close', 0);
+    }, 5);
+
+    return runPromise;
+  }
+
+  // codex exec --json emits turn.completed.usage from ThreadTokenUsage.total,
+  // i.e. a running total for the thread. It must be flagged so the repository
+  // diffs rather than adds — adding it re-applied the whole history every turn
+  // and grew one session to 3,441,018,986 tokens, overflowing int32 on write.
+  it('flags Codex usage as cumulative', async () => {
+    const result = await runWithEvents([
+      {
+        type: 'turn.completed',
+        usage: { input_tokens: 1200, output_tokens: 340 },
+      },
+    ]);
+
+    expect(result.usage?.cumulative).toBe(true);
+  });
+
+  // Real 0.146.1 shape. cached_input_tokens and cache_write_input_tokens are
+  // both represented WITHIN input_tokens; reasoning_output_tokens within
+  // output_tokens. None may be added on top.
+  it('does not add cache or reasoning figures already inside the totals', async () => {
+    const result = await runWithEvents([
+      {
+        type: 'turn.completed',
+        usage: {
+          input_tokens: 1000,
+          cached_input_tokens: 900,
+          cache_write_input_tokens: 64,
+          output_tokens: 50,
+          reasoning_output_tokens: 30,
+          total_tokens: 1050,
+        },
+      },
+    ]);
+
+    expect(result.usage?.inputTokens).toBe(1000);
+    expect(result.usage?.outputTokens).toBe(50);
+  });
+
+  it('still reads flat top-level usage fields', async () => {
+    const result = await runWithEvents([
+      { session_id: 'codex-session-123', input_tokens: 12, output_tokens: 5, context_tokens: 42 },
+    ]);
+
+    expect(result.usage?.inputTokens).toBe(12);
+    expect(result.usage?.outputTokens).toBe(5);
+    expect(result.usage?.contextTokens).toBe(42);
+  });
+
+  // Codex emits no per-turn context measure. Aliasing it to the cumulative
+  // input total stored a false 1.3-billion-token "context" reading, so an
+  // absent figure must stay absent — unknown, not zero and not the input sum.
+  it('reports no context figure when the backend does not provide one', async () => {
+    const result = await runWithEvents([
+      { type: 'turn.completed', usage: { input_tokens: 70, output_tokens: 5 } },
+    ]);
+
+    expect(result.usage?.contextTokens).toBeUndefined();
+    expect(result.usage?.inputTokens).toBe(70);
+  });
+
+  // An untyped deep scan for any object carrying input_tokens/output_tokens
+  // can consume token stats that belong to something else entirely — e.g. a
+  // benchmark harness reporting its own numbers into the event stream.
+  it('ignores token-shaped objects outside the usage container', async () => {
+    const result = await runWithEvents([
+      {
+        type: 'item.completed',
+        item: {
+          type: 'mcp_tool_call',
+          result: { benchmark_stats: { input_tokens: 3_437_373_064, output_tokens: 3_645_922 } },
+        },
+      },
+    ]);
+
+    expect(result.usage).toBeUndefined();
   });
 });
