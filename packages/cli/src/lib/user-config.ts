@@ -9,6 +9,12 @@
  * Commands used to each carry their own copy of this reader, and two of them
  * still pointed at the pre-rename ~/.pcp/config.json. Import from here instead
  * of hand-rolling another one.
+ *
+ * ~/.ink is the only location read. Reading the legacy ~/.pcp/config.json as a
+ * fallback would report an email while `authFilePath()` (~/.ink/auth.json) and
+ * PcpClient still see nothing — the command clears the signed-in gate and then
+ * fails deeper with a worse error. A pre-rename install needs `ink auth login`
+ * anyway to mint tokens, and that writes ~/.ink/config.json on its way through.
  */
 
 import { existsSync, readFileSync } from 'fs';
@@ -27,28 +33,19 @@ export function userConfigPath(): string {
   return join(homedir(), '.ink', 'config.json');
 }
 
-/** Pre-rename location, still present on installs that predate `.ink/`. */
-export function legacyUserConfigPath(): string {
-  return join(homedir(), '.pcp', 'config.json');
-}
-
 /** Shown when a command needs an authenticated user and there isn't one. */
 export const NOT_SIGNED_IN_MESSAGE = 'Not signed in to Inkwell. Run: ink auth login';
 
-function readJsonFile(path: string): UserConfig | null {
+/**
+ * Read ~/.ink/config.json. Returns null when it doesn't exist or is
+ * unparseable — both mean "not signed in" to every caller.
+ */
+export function readUserConfig(): UserConfig | null {
+  const path = userConfigPath();
   if (!existsSync(path)) return null;
   try {
     return JSON.parse(readFileSync(path, 'utf-8')) as UserConfig;
   } catch {
     return null;
   }
-}
-
-/**
- * Read ~/.ink/config.json, falling back to the legacy ~/.pcp/config.json so
- * installs that predate the rename keep working. Returns null when neither
- * exists or the file is unparseable.
- */
-export function readUserConfig(): UserConfig | null {
-  return readJsonFile(userConfigPath()) ?? readJsonFile(legacyUserConfigPath());
 }

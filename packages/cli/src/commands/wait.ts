@@ -49,7 +49,7 @@ export function registerWaitCommand(program: Command): void {
       const config = pcp.getConfig();
 
       if (!config.email) {
-        console.error(`[ink wait] `);
+        console.error(`[ink wait] ${NOT_SIGNED_IN_MESSAGE}`);
         process.exit(2);
       }
 

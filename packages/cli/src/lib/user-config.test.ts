@@ -7,12 +7,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdirSync, writeFileSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import {
-  readUserConfig,
-  userConfigPath,
-  legacyUserConfigPath,
-  NOT_SIGNED_IN_MESSAGE,
-} from './user-config.js';
+import { readUserConfig, userConfigPath, NOT_SIGNED_IN_MESSAGE } from './user-config.js';
 
 let tempHome: string;
 let origHome: string | undefined;
@@ -40,7 +35,7 @@ afterEach(() => {
 });
 
 describe('readUserConfig', () => {
-  it('returns null when neither config exists', () => {
+  it('returns null when no config exists', () => {
     expect(readUserConfig()).toBeNull();
   });
 
@@ -49,29 +44,24 @@ describe('readUserConfig', () => {
     expect(readUserConfig()).toEqual({ email: 'user@example.com', userId: 'uuid-1' });
   });
 
-  it('falls back to the legacy ~/.pcp/config.json for pre-rename installs', () => {
+  // ~/.ink is canonical. Honouring a stale ~/.pcp/config.json would report an
+  // email while ~/.ink/auth.json holds no token, clearing the signed-in gate
+  // only to fail deeper. Pre-rename installs need `ink auth login` regardless.
+  it('ignores the legacy ~/.pcp/config.json', () => {
     writeConfig('.pcp', { email: 'legacy@example.com', userId: 'uuid-legacy' });
-    expect(readUserConfig()?.email).toBe('legacy@example.com');
+    expect(readUserConfig()).toBeNull();
   });
 
-  it('prefers ~/.ink over the legacy path when both exist', () => {
+  it('does not let a legacy config shadow a signed-out ~/.ink', () => {
     writeConfig('.pcp', { email: 'legacy@example.com' });
-    writeConfig('.ink', { email: 'current@example.com' });
-    expect(readUserConfig()?.email).toBe('current@example.com');
-  });
-
-  it('falls through to the legacy path when ~/.ink is unparseable', () => {
     mkdirSync(join(tempHome, '.ink'), { recursive: true });
     writeFileSync(join(tempHome, '.ink', 'config.json'), '{ not json');
-    writeConfig('.pcp', { email: 'legacy@example.com' });
-    expect(readUserConfig()?.email).toBe('legacy@example.com');
+    expect(readUserConfig()).toBeNull();
   });
 
-  it('returns null when both files are unparseable', () => {
-    for (const dir of ['.ink', '.pcp']) {
-      mkdirSync(join(tempHome, dir), { recursive: true });
-      writeFileSync(join(tempHome, dir, 'config.json'), '{ not json');
-    }
+  it('returns null when ~/.ink/config.json is unparseable', () => {
+    mkdirSync(join(tempHome, '.ink'), { recursive: true });
+    writeFileSync(join(tempHome, '.ink', 'config.json'), '{ not json');
     expect(readUserConfig()).toBeNull();
   });
 
@@ -88,12 +78,8 @@ describe('readUserConfig', () => {
 });
 
 describe('config paths', () => {
-  it('points at ~/.ink/config.json by default', () => {
+  it('points at ~/.ink/config.json', () => {
     expect(userConfigPath()).toBe(join(tempHome, '.ink', 'config.json'));
-  });
-
-  it('keeps ~/.pcp/config.json as the legacy location', () => {
-    expect(legacyUserConfigPath()).toBe(join(tempHome, '.pcp', 'config.json'));
   });
 });
 
