@@ -855,16 +855,26 @@ export class MCPServer {
           throw new Error(`locator persist failed: ${error.message}`);
         }
       },
+      // hasHistory: authoritative evidence the session has ever run a turn
+      // (provider session seeded, tokens or messages recorded) — the bus
+      // refuses to claim a vacuous first-turn replay for a session with
+      // history whose locator was lost (Lumen M4.3 re-review).
       load: async (sessionId) => {
         const { data: row, error } = await locatorClient
           .from('sessions')
-          .select('observer_ledger_path')
+          .select('observer_ledger_path, backend_session_id, token_count, message_count')
           .eq('id', sessionId)
           .maybeSingle();
         if (error) {
           throw new Error(`locator load failed: ${error.message}`);
         }
-        return row?.observer_ledger_path ?? null;
+        return {
+          ledgerPath: row?.observer_ledger_path ?? null,
+          hasHistory: Boolean(
+            row &&
+            (row.backend_session_id || (row.token_count ?? 0) > 0 || (row.message_count ?? 0) > 0)
+          ),
+        };
       },
     });
     const sessionsRouter = createSessionsRouter({

@@ -198,13 +198,29 @@ export function projectObserverEntry(entry: ObserverEntry): ObserverEntry | null
 }
 
 /**
- * Optional durable locator store (wired by the server to session metadata).
- * Keeps replay working across bus eviction and process restarts without any
- * new tables — the sessions row the runtime already owns carries the path.
+ * What the durable locator store knows about a session. `hasHistory` is the
+ * authoritative evidence the replay decision needs when the locator is
+ * absent: whether the sessions row shows the session has EVER run (backend
+ * session seeded, tokens or messages recorded). An in-memory `highWater === 0`
+ * alone proves nothing — it is also 0 after eviction/restart (Lumen M4.3
+ * re-review).
+ */
+export interface LedgerLocatorRecord {
+  ledgerPath: string | null;
+  hasHistory: boolean;
+}
+
+/**
+ * Optional durable locator store (wired by the server to the dedicated
+ * sessions.observer_ledger_path column). Keeps replay working across bus
+ * eviction and process restarts without any new tables — the sessions row the
+ * runtime already owns carries the path. `load` must THROW on store errors —
+ * the bus propagates them as replay_failed rather than silently downgrading
+ * to an empty replay.
  */
 export interface LedgerLocatorStore {
   persist(sessionId: string, ledgerPath: string): Promise<void>;
-  load(sessionId: string): Promise<string | null>;
+  load(sessionId: string): Promise<LedgerLocatorRecord>;
 }
 
 const intFromEnv = (name: string, fallback: number): number => {
@@ -494,21 +510,33 @@ export class SessionEventBus extends EventEmitter {
 
     // Durable locator: if this channel has no in-memory path (fresh process,
     // evicted channel), recover it from the store before any replay decision.
-    if (!ch.ledgerPath && this.locatorStore) {
-      try {
-        const stored = await this.locatorStore.load(sessionId);
-        if (stored) ch.ledgerPath = stored;
-      } catch (err) {
-        logger.warn('[EventBus] Locator load failed', { sessionId, error: String(err) });
-      }
-    }
-
+    // A load ERROR is not caught here — it propagates through the outer catch
+    // as replay_failed: an unreachable store must fail the subscription
+    // loudly, never silently downgrade an old session to an empty replay
+    // (Lumen M4.3 re-review).
+    let durableHistoryWithoutLocator = false;
     const unsubscribe = (): void => {
       if (!sub.closed) this.disconnectObserver(ch, sub, 'unsubscribed');
     };
 
     try {
-      await this.replayObserver(ch, sub, options.afterEid, highWater, options.signal);
+      if (!ch.ledgerPath && this.locatorStore) {
+        const record = await this.locatorStore.load(sessionId);
+        if (record.ledgerPath) {
+          ch.ledgerPath = record.ledgerPath;
+        } else {
+          durableHistoryWithoutLocator = record.hasHistory;
+        }
+      }
+
+      await this.replayObserver(
+        ch,
+        sub,
+        options.afterEid,
+        highWater,
+        options.signal,
+        durableHistoryWithoutLocator
+      );
 
       if (!follow || options.signal?.aborted) {
         unsubscribe();
@@ -561,7 +589,8 @@ export class SessionEventBus extends EventEmitter {
     sub: ObserverSubscriber,
     afterEid: number | undefined,
     highWater: number,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    durableHistoryWithoutLocator = false
   ): Promise<void> {
     const gone = (): boolean => sub.closed || signal?.aborted === true;
     if (highWater === 0 && afterEid === undefined) return;
@@ -593,14 +622,19 @@ export class SessionEventBus extends EventEmitter {
     // queue idempotent, and it also serves the fresh-channel case (lastEid=0
     // after eviction/restart) where a cap would wrongly suppress all history.
     if (!ch.ledgerPath) {
-      // No durable locator AND nothing ever published on this channel: the
-      // session has no observable history yet (first-turn attach racing the
-      // runtime's session_meta announcement). The replay is vacuously
-      // complete — follow live instead of failing (Lumen re-review,
-      // blocker 1). With entries already published the gap is real: fail so
-      // the client knows its view would be incomplete.
-      if (highWater === 0) return;
-      throw new Error('Cursor precedes ring and no ledger path is registered');
+      // No durable locator. Vacuous replay (follow live) is claimed ONLY with
+      // authoritative evidence of a genuine first turn: nothing published in
+      // this process AND the durable sessions row shows no prior activity.
+      // `highWater === 0` alone is NOT that evidence — it is also 0 after
+      // eviction/restart, where an old session whose locator was lost must
+      // fail loudly rather than silently omit its history (Lumen M4.3
+      // re-review).
+      if (highWater === 0 && !durableHistoryWithoutLocator) return;
+      throw new Error(
+        durableHistoryWithoutLocator
+          ? 'Session has prior history but no ledger locator — durable replay unavailable'
+          : 'Cursor precedes ring and no ledger path is registered'
+      );
     }
     await stat(ch.ledgerPath); // surface missing-file as replay failure
     const rl = createInterface({

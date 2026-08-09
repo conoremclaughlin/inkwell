@@ -526,7 +526,10 @@ describe('SessionEventBus observer channel — M4.2', () => {
     );
     const store: LedgerLocatorStore = {
       persist: async () => undefined,
-      load: async (sessionId) => (sessionId === 's1' ? path : null),
+      load: async (sessionId) => ({
+        ledgerPath: sessionId === 's1' ? path : null,
+        hasHistory: sessionId === 's1',
+      }),
     };
     bus.setLocatorStore(store);
 
@@ -637,6 +640,52 @@ describe('SessionEventBus observer channel — M4.3', () => {
     expect(sink.endedWith).toBeNull();
   });
 
+  it('LOCATOR ERROR: a throwing locator store fails the subscription loudly, never an empty replay', async () => {
+    // Fresh bus (post-restart state, highWater 0) whose store is unreachable:
+    // the client must get replay_failed, not a silently-empty history.
+    bus.setLocatorStore({
+      persist: async () => undefined,
+      load: async () => {
+        throw new Error('store unreachable');
+      },
+    });
+    const sink = new TestSink();
+    await expect(bus.subscribeObserver('s1', sink, { afterEid: 0 })).rejects.toThrow(
+      /store unreachable/
+    );
+    expect(sink.endedWith).toBe('replay_failed');
+    expect(sink.received).toEqual([]);
+  });
+
+  it('LOST LOCATOR: a session with durable history but no locator fails loudly, never vacuously', async () => {
+    // The sessions row proves prior activity (hasHistory) but the locator
+    // column is null (a past persist was lost). highWater===0 on this fresh
+    // bus is NOT evidence of a first turn — claiming a vacuous replay would
+    // silently omit the session's entire history.
+    bus.setLocatorStore({
+      persist: async () => undefined,
+      load: async () => ({ ledgerPath: null, hasHistory: true }),
+    });
+    const sink = new TestSink();
+    await expect(bus.subscribeObserver('s1', sink, { afterEid: 0 })).rejects.toThrow(
+      /prior history but no ledger locator/
+    );
+    expect(sink.endedWith).toBe('replay_failed');
+  });
+
+  it('FIRST-TURN with store: no locator AND no durable history follows live (vacuous replay)', async () => {
+    bus.setLocatorStore({
+      persist: async () => undefined,
+      load: async () => ({ ledgerPath: null, hasHistory: false }),
+    });
+    const sink = new TestSink();
+    await bus.subscribeObserver('s1', sink, { afterEid: 0 });
+    bus.publishObserverEntry('s1', obsEntry(1));
+    await new Promise((r) => setImmediate(r));
+    expect(sink.received.map((e) => e.eid)).toEqual([1]);
+    expect(sink.endedWith).toBeNull();
+  });
+
   it('persist failures retry once and never leave the locator silently unwritten', async () => {
     const calls: string[] = [];
     let failures = 1;
@@ -645,7 +694,7 @@ describe('SessionEventBus observer channel — M4.3', () => {
         calls.push(ledgerPath);
         if (failures-- > 0) throw new Error('transient db error');
       },
-      load: async () => null,
+      load: async () => ({ ledgerPath: null, hasHistory: false }),
     };
     bus.setLocatorStore(store);
     const path = writeLedger43([obsEntry(1)]);
