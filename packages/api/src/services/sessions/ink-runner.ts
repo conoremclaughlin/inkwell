@@ -306,11 +306,24 @@ export class InkRunner implements IRunner {
             typeof evt === 'object' &&
             typeof (evt as { type?: unknown }).type === 'string'
           ) {
-            sessionEventBus.publish(
-              config.pcpSessionId,
-              (evt as { type: string }).type,
-              evt as Record<string, unknown>
-            );
+            const typed = evt as { type: string } & Record<string, unknown>;
+            if (typed.type === 'obs' && typed.entry && typeof typed.entry === 'object') {
+              // Canonical ledger entry (spec:observer-attach §4.2) — the exact
+              // appended transcript object, ledger eid included. Publish on the
+              // observer channel, preserving the eid; the bus never mints one.
+              sessionEventBus.publishObserverEntry(
+                config.pcpSessionId,
+                typed.entry as import('./session-event-bus.js').ObserverEntry
+              );
+            } else if (typed.type === 'session_meta') {
+              // The runtime announces its own ledger location at startup —
+              // the server-owned locator for durable observer replay.
+              if (typeof typed.transcriptPath === 'string') {
+                sessionEventBus.registerLedgerPath(config.pcpSessionId, typed.transcriptPath);
+              }
+            } else {
+              sessionEventBus.publish(config.pcpSessionId, typed.type, typed);
+            }
           }
         }
       };
@@ -376,7 +389,13 @@ export class InkRunner implements IRunner {
         mcpInjection?.cleanup();
         // Turn over: the buffered tail now describes a COMPLETED turn, so drop
         // it. A later idle attach must not replay it as live activity.
-        if (config.pcpSessionId) sessionEventBus.clearReplay(config.pcpSessionId);
+        if (config.pcpSessionId) {
+          sessionEventBus.clearReplay(config.pcpSessionId);
+          // Observer channel: start the retention window; observers detach
+          // after it unless a new turn re-registers the session. The durable
+          // ledger remains the replay source regardless.
+          sessionEventBus.releaseObserverSession(config.pcpSessionId);
+        }
 
         if (code !== 0) {
           // Check for resume failure

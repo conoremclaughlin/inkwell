@@ -25,6 +25,7 @@ import adminRouter, { setWhatsAppListener } from '../routes/admin';
 import { getAgentGateway } from '../channels/agent-gateway';
 import { createChatRouter } from '../routes/chat';
 import { createSessionsRouter } from '../routes/sessions';
+import { sessionEventBus } from '../services/sessions/session-event-bus';
 import { createHookLifecycleRouter } from '../routes/hook-lifecycle';
 import {
   ChannelGateway,
@@ -836,6 +837,58 @@ export class MCPServer {
 
     // Live session event stream (SSE) — attached terminals + dashboard subscribe
     // to a session's turn events, fanned out from the session event bus.
+    // The durable ledger locator rides in the session row's metadata (no new
+    // tables) so observer replay survives bus eviction and process restarts.
+    const locatorClient = this.dataComposer.getClient();
+    sessionEventBus.setLocatorStore({
+      // Dedicated column, single-column UPDATE — no read-modify-write of the
+      // shared metadata object (that merge raced other session updates and
+      // could silently drop the locator). PostgREST reports failures via
+      // `error`, not exceptions — check and THROW so the bus's retry/logging
+      // actually sees them (Lumen re-review, blocker 1).
+      persist: async (sessionId, ledgerPath) => {
+        const { error } = await locatorClient
+          .from('sessions')
+          .update({ observer_ledger_path: ledgerPath })
+          .eq('id', sessionId);
+        if (error) {
+          throw new Error(`locator persist failed: ${error.message}`);
+        }
+      },
+      // activity: authoritative evidence for the vacuous-replay decision —
+      // 'completed' (markers prove durable history), 'attempted' (turn
+      // started, ledger may hold entries), 'none' (durably pristine idle).
+      load: async (sessionId) => {
+        const { data: row, error } = await locatorClient
+          .from('sessions')
+          .select(
+            'observer_ledger_path, backend_session_id, token_count, message_count, lifecycle, ended_at'
+          )
+          .eq('id', sessionId)
+          .maybeSingle();
+        if (error) {
+          throw new Error(`locator load failed: ${error.message}`);
+        }
+        // Completed markers are written only AFTER a turn returns; the ledger
+        // gains entries at turn START. A started-but-never-completed turn
+        // (lifecycle running/failed, or ended without markers) is therefore
+        // 'attempted' — never proof of a pristine session (Lumen M4.4).
+        const completed = Boolean(
+          row &&
+          (row.backend_session_id || (row.token_count ?? 0) > 0 || (row.message_count ?? 0) > 0)
+        );
+        const pristine =
+          !row || ((row.lifecycle === null || row.lifecycle === 'idle') && !row.ended_at);
+        return {
+          ledgerPath: row?.observer_ledger_path ?? null,
+          activity: completed
+            ? ('completed' as const)
+            : pristine
+              ? ('none' as const)
+              : ('attempted' as const),
+        };
+      },
+    });
     const sessionsRouter = createSessionsRouter({
       authProvider: this.authProvider,
       dataComposer: this.dataComposer,
