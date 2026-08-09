@@ -22,6 +22,7 @@ import { fileURLToPath } from 'url';
 import { homedir, tmpdir } from 'os';
 import { getBackend, BACKEND_NAMES } from '../backends/index.js';
 import { callPcpTool } from '../lib/pcp-mcp.js';
+import { readUserConfig, NOT_SIGNED_IN_MESSAGE, type UserConfig } from '../lib/user-config.js';
 import { getValidAccessToken } from '../auth/tokens.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -47,12 +48,6 @@ function renderTemplate(template: string, vars: Record<string, string>): string 
 // Types
 // ============================================================================
 
-interface PcpConfig {
-  userId?: string;
-  email?: string;
-  agentMapping?: Record<string, string>;
-}
-
 interface BootstrapIdentity {
   agentId: string;
   name?: string;
@@ -75,23 +70,11 @@ interface BootstrapResponse {
 // Helpers
 // ============================================================================
 
-function getPcpConfig(): PcpConfig | null {
-  const configPath = join(homedir(), '.pcp', 'config.json');
-  if (existsSync(configPath)) {
-    try {
-      return JSON.parse(readFileSync(configPath, 'utf-8'));
-    } catch {
-      return null;
-    }
-  }
-  return null;
-}
-
 /**
  * Fetch shared values and sibling identities from PCP cloud.
  * Returns null if the server is unreachable.
  */
-async function fetchFromCloud(config: PcpConfig): Promise<{
+async function fetchFromCloud(config: UserConfig): Promise<{
   sharedValues: string;
   siblings: BootstrapIdentity[];
 } | null> {
@@ -210,9 +193,9 @@ function buildAwakeningPrompt(
 // ============================================================================
 
 async function awakenCommand(options: { backend: string; verbose: boolean }): Promise<void> {
-  const config = getPcpConfig();
+  const config = readUserConfig();
   if (!config?.email) {
-    console.error(chalk.red('PCP not configured. Run: ink init'));
+    console.error(chalk.red(NOT_SIGNED_IN_MESSAGE));
     process.exit(1);
   }
 

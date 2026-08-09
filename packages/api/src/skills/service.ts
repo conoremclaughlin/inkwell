@@ -204,16 +204,25 @@ let serviceInstance: SkillsService | null = null;
  * Returns extraDirs if configured under `skills.extraDirs`.
  */
 function readSkillsConfig(): SkillLoadOptions {
-  const configPath = join(homedir(), '.pcp', 'config.json');
-  if (!existsSync(configPath)) return {};
+  // ~/.pcp/ is the pre-rename location, still read as a fallback so installs
+  // that predate `.ink/` keep resolving their extraDirs.
+  const candidates = [
+    join(homedir(), '.ink', 'config.json'),
+    join(homedir(), '.pcp', 'config.json'),
+  ];
 
-  try {
-    const config = JSON.parse(readFileSync(configPath, 'utf-8'));
-    const extraDirs = config?.skills?.extraDirs as string[] | undefined;
-    return extraDirs?.length ? { extraDirs } : {};
-  } catch {
-    return {};
+  for (const configPath of candidates) {
+    if (!existsSync(configPath)) continue;
+    try {
+      const config = JSON.parse(readFileSync(configPath, 'utf-8'));
+      const extraDirs = config?.skills?.extraDirs as string[] | undefined;
+      if (extraDirs?.length) return { extraDirs };
+    } catch {
+      // Unparseable — try the next candidate.
+    }
   }
+
+  return {};
 }
 
 /**

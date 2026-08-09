@@ -19,6 +19,7 @@ import { homedir } from 'os';
 import { resolveAgentId } from '../backends/identity.js';
 import { getCurrentRuntimeSession } from '../session/runtime.js';
 import { callPcpTool } from '../lib/pcp-mcp.js';
+import { NOT_SIGNED_IN_MESSAGE } from '../lib/user-config.js';
 
 interface PcpConfig {
   userId?: string;
@@ -84,7 +85,7 @@ async function triggerAgent(
   try {
     const config = getPcpConfig();
     if (!config?.email) {
-      spinner.fail('PCP not configured. Run: ink init');
+      spinner.fail(NOT_SIGNED_IN_MESSAGE);
       process.exit(1);
     }
 
@@ -122,7 +123,7 @@ async function triggerAgent(
 async function statusCommand(agentId?: string): Promise<void> {
   const config = getPcpConfig();
   if (!config?.email) {
-    console.error(chalk.red('PCP not configured. Run: ink init'));
+    console.error(chalk.red(NOT_SIGNED_IN_MESSAGE));
     process.exit(1);
   }
 
@@ -165,7 +166,7 @@ async function statusCommand(agentId?: string): Promise<void> {
 async function inboxCommand(agentId?: string): Promise<void> {
   const config = getPcpConfig();
   if (!config?.email) {
-    console.error(chalk.red('PCP not configured. Run: ink init'));
+    console.error(chalk.red(NOT_SIGNED_IN_MESSAGE));
     process.exit(1);
   }
 
