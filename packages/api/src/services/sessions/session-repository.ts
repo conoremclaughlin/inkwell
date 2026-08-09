@@ -16,6 +16,15 @@ import type {
 } from './types.js';
 import { logger } from '../../utils/logger.js';
 
+/**
+ * Ceiling on a single turn's reported token usage.
+ *
+ * Well above any real turn (largest context windows are a few million tokens),
+ * and far below the scale a mistakenly-accumulated cumulative counter reaches.
+ * Exported for tests.
+ */
+export const MAX_PLAUSIBLE_TURN_TOKENS = 10_000_000;
+
 type DbSession = Database['public']['Tables']['sessions']['Row'];
 type DbSessionInsert = Database['public']['Tables']['sessions']['Insert'];
 type DbSessionUpdate = Database['public']['Tables']['sessions']['Update'];
@@ -428,6 +437,23 @@ export class SessionRepository implements ISessionRepository {
     const current = await this.findById(id);
     if (!current) {
       throw new Error(`Session not found: ${id}`);
+    }
+
+    // Guard against accumulating a cumulative counter. A runner that reports a
+    // session-wide running total instead of a per-turn delta would re-add the
+    // entire history every turn, growing the stored count quadratically until
+    // it silently corrupts every downstream cost/context metric. Refuse the
+    // write and say so, rather than persisting a number we know is wrong.
+    const turnTotal = usage.inputTokens + usage.outputTokens;
+    if (turnTotal > MAX_PLAUSIBLE_TURN_TOKENS) {
+      logger.error('Implausible single-turn token usage — refusing to accumulate', {
+        id,
+        usage,
+        turnTotal,
+        ceiling: MAX_PLAUSIBLE_TURN_TOKENS,
+        hint: 'Runner likely reported a cumulative total instead of a per-turn delta',
+      });
+      return;
     }
 
     const newInputTokens = current.totalInputTokens + usage.inputTokens;

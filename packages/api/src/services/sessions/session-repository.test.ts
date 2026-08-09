@@ -194,3 +194,57 @@ describe('SessionRepository', () => {
     expect(insertCall.alias).toBe('review');
   });
 });
+
+describe('SessionRepository.updateTokenUsage', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('accumulates a normal per-turn delta', async () => {
+    const { supabase, lastUpdate } = createMockSupabase();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const repo = new SessionRepository(supabase as any);
+
+    await repo.updateTokenUsage('sess-1', {
+      contextTokens: 5000,
+      inputTokens: 1200,
+      outputTokens: 340,
+    });
+
+    expect(lastUpdate.data).toBeDefined();
+    expect(lastUpdate.data?.token_count).toBe(1540);
+  });
+
+  // Regression: a runner reporting a session-cumulative counter instead of a
+  // per-turn delta re-adds the whole history every turn. That grew one session
+  // to 3,441,018,986 tokens, overflowing the int32 column and failing every
+  // subsequent session-state write with Postgres 22003.
+  it('refuses to accumulate an implausible single-turn total', async () => {
+    const { supabase, lastUpdate } = createMockSupabase();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const repo = new SessionRepository(supabase as any);
+
+    await repo.updateTokenUsage('sess-1', {
+      contextTokens: 1_317_195_843,
+      inputTokens: 3_437_373_064,
+      outputTokens: 3_645_922,
+    });
+
+    // No write at all — better to keep the last good value than persist garbage.
+    expect(lastUpdate.data).toBeUndefined();
+  });
+
+  it('accepts a large but plausible turn', async () => {
+    const { supabase, lastUpdate } = createMockSupabase();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const repo = new SessionRepository(supabase as any);
+
+    await repo.updateTokenUsage('sess-1', {
+      contextTokens: 2_000_000,
+      inputTokens: 1_900_000,
+      outputTokens: 60_000,
+    });
+
+    expect(lastUpdate.data?.token_count).toBe(1_960_000);
+  });
+});

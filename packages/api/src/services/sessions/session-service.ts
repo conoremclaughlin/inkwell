@@ -39,6 +39,7 @@ import { InkRunner } from './ink-runner.js';
 import { ActivityStreamRepository } from '../../data/repositories/activity-stream.repository.js';
 import { resolveIdentityId } from '../../auth/resolve-identity.js';
 import { classifyError } from '@inklabs/shared';
+import { serializeError } from '../../utils/serialize-error.js';
 import { resolveTaskGroupForThreadKey } from '../task-group-resolver.js';
 import { getRunnerFilesDir } from '../sandbox/orchestrator.js';
 import { logger } from '../../utils/logger.js';
@@ -335,10 +336,15 @@ export class SessionService implements ISessionService {
         await this.processQueueOrReleaseLock(lockKey);
       }
     } catch (error) {
+      // serializeError, not String(error)/'Unknown error': Supabase rejections
+      // are plain objects, so both of those erase the cause. See
+      // utils/serialize-error.ts.
+      const errorText = serializeError(error);
+
       logger.error('Error handling message', {
         userId,
         agentId,
-        error: error instanceof Error ? error.message : String(error),
+        error: errorText,
       });
 
       return {
@@ -349,7 +355,7 @@ export class SessionService implements ISessionService {
         sessionStatus: 'failed',
         compactionTriggered: false,
         finalTextResponse: undefined,
-        error: error instanceof Error ? error.message : 'Unknown error',
+        error: errorText,
         errorCode: 'INTERNAL_ERROR',
       };
     }

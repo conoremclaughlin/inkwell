@@ -36,6 +36,23 @@ const PROCESS_TIMEOUT_MS =
 const DIAGNOSTIC_MAX_CHARS = 4000;
 const DIAGNOSTIC_MAX_LINES = 20;
 
+/**
+ * Containers that carry usage for the CURRENT turn. Preferred, because the
+ * caller accumulates whatever we return.
+ */
+const CODEX_PER_TURN_USAGE_KEYS = ['last_token_usage', 'last_usage', 'usage'] as const;
+
+/**
+ * Containers that carry a SESSION-CUMULATIVE running total. These must never
+ * be returned or descended into — accumulating a running total re-adds the
+ * whole history every turn.
+ */
+const CODEX_CUMULATIVE_USAGE_KEYS: readonly string[] = [
+  'total_token_usage',
+  'total_usage',
+  'cumulative_token_usage',
+];
+
 interface CodexUsageStats {
   contextTokens: number;
   inputTokens: number;
@@ -525,32 +542,92 @@ export class CodexRunner implements IRunner {
     return undefined;
   }
 
+  /**
+   * Parse a single object into usage stats, or undefined if it isn't one.
+   *
+   * Cache accounting is asymmetric across backends and must not be summed
+   * blindly: `cache_read_input_tokens` / `cache_creation_input_tokens` are
+   * reported ALONGSIDE `input_tokens` and genuinely add, whereas
+   * `cached_input_tokens` is a SUBSET of `input_tokens` — adding it counts the
+   * same tokens twice. On a long session that re-sends context every turn,
+   * cache reads dominate, so that double-count compounds fast.
+   */
+  private parseUsageObject(obj: Record<string, unknown>): CodexUsageStats | undefined {
+    const maybeInput = obj.input_tokens;
+    const maybeOutput = obj.output_tokens;
+    if (typeof maybeInput !== 'number' || typeof maybeOutput !== 'number') {
+      return undefined;
+    }
+
+    const cacheRead =
+      typeof obj.cache_read_input_tokens === 'number' ? obj.cache_read_input_tokens : 0;
+    const cacheCreate =
+      typeof obj.cache_creation_input_tokens === 'number' ? obj.cache_creation_input_tokens : 0;
+    const totalInput = maybeInput + cacheRead + cacheCreate;
+
+    const maybeContext = obj.context_tokens;
+    return {
+      contextTokens: typeof maybeContext === 'number' ? maybeContext : totalInput,
+      inputTokens: totalInput,
+      outputTokens: maybeOutput,
+    };
+  }
+
+  /**
+   * Extract PER-TURN usage from a Codex event.
+   *
+   * The caller accumulates whatever this returns
+   * (`SessionRepository.updateTokenUsage`), so returning a session-cumulative
+   * counter re-adds the whole running total every turn and grows the stored
+   * count quadratically. A previous blind breadth-first "first object with
+   * input_tokens and output_tokens" match did exactly that, producing a
+   * 3.4-billion-token session that overflowed int32 on write.
+   *
+   * So: prefer an explicitly per-turn container, and never descend into a
+   * known cumulative one.
+   */
   private extractUsage(event: Record<string, unknown>): CodexUsageStats | undefined {
+    // Explicit per-turn container wins over any positional match.
+    const perTurn = this.findUsage(event, CODEX_PER_TURN_USAGE_KEYS);
+    if (perTurn) return perTurn;
+
+    // Fall back to positional discovery, still refusing cumulative containers.
+    return this.findUsage(event, null);
+  }
+
+  /**
+   * Breadth-first search for a usage object, skipping cumulative containers.
+   *
+   * When `preferredKeys` is set, only values under those keys are considered;
+   * when null, any object shaped like usage matches.
+   */
+  private findUsage(
+    event: Record<string, unknown>,
+    preferredKeys: readonly string[] | null
+  ): CodexUsageStats | undefined {
     const queue: unknown[] = [event];
+
     while (queue.length > 0) {
       const current = queue.shift();
       if (!current || typeof current !== 'object') continue;
       const obj = current as Record<string, unknown>;
 
-      const maybeInput = obj.input_tokens;
-      const maybeOutput = obj.output_tokens;
-      const maybeContext = obj.context_tokens;
-      if (typeof maybeInput === 'number' && typeof maybeOutput === 'number') {
-        const cachedInput =
-          typeof obj.cached_input_tokens === 'number' ? obj.cached_input_tokens : 0;
-        const cacheRead =
-          typeof obj.cache_read_input_tokens === 'number' ? obj.cache_read_input_tokens : 0;
-        const cacheCreate =
-          typeof obj.cache_creation_input_tokens === 'number' ? obj.cache_creation_input_tokens : 0;
-        const totalInput = maybeInput + cachedInput + cacheRead + cacheCreate;
-        return {
-          contextTokens: typeof maybeContext === 'number' ? maybeContext : totalInput,
-          inputTokens: totalInput,
-          outputTokens: maybeOutput,
-        };
+      if (preferredKeys) {
+        for (const key of preferredKeys) {
+          const candidate = obj[key];
+          if (candidate && typeof candidate === 'object') {
+            const parsed = this.parseUsageObject(candidate as Record<string, unknown>);
+            if (parsed) return parsed;
+          }
+        }
+      } else {
+        const parsed = this.parseUsageObject(obj);
+        if (parsed) return parsed;
       }
 
-      for (const value of Object.values(obj)) {
+      for (const [key, value] of Object.entries(obj)) {
+        // Never accumulate a running total, at any depth.
+        if (CODEX_CUMULATIVE_USAGE_KEYS.includes(key)) continue;
         if (value && typeof value === 'object') queue.push(value);
       }
     }
