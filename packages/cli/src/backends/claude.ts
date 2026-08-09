@@ -6,6 +6,7 @@
  */
 
 import { existsSync, readFileSync } from 'fs';
+import { execFileSync } from 'child_process';
 import { join } from 'path';
 import { homedir } from 'os';
 import { encodeContextToken } from '@inklabs/shared';
@@ -20,6 +21,24 @@ import { ClaudeStreamParser } from './claude-stream.js';
  * If present, Claude Code should be started with --dangerously-load-development-channels
  * so it accepts push notifications from the channel.
  */
+/**
+ * Once-per-process probe for `--include-partial-messages` support. This runs
+ * in the ink CLI process (never the API server), so a brief sync probe just
+ * before spawning a multi-second backend turn is acceptable.
+ */
+let partialMessagesSupport: boolean | null = null;
+function supportsPartialMessages(): boolean {
+  if (partialMessagesSupport === null) {
+    try {
+      const help = execFileSync('claude', ['--help'], { encoding: 'utf-8', timeout: 5000 });
+      partialMessagesSupport = help.includes('--include-partial-messages');
+    } catch {
+      partialMessagesSupport = false;
+    }
+  }
+  return partialMessagesSupport;
+}
+
 function hasPcpInboxPlugin(cwd: string): boolean {
   const mcpJsonPath = join(cwd, '.mcp.json');
   if (!existsSync(mcpJsonPath)) return false;
@@ -54,6 +73,12 @@ export class ClaudeAdapter implements BackendAdapter {
     // stream-json. Parsed by ClaudeStreamParser (see createStreamParser).
     if (config.stream) {
       args.push('--output-format', 'stream-json', '--verbose');
+      // Partial-message deltas drive paragraph-by-paragraph TUI rendering.
+      // Probed (not assumed) so an older claude binary doesn't fail every
+      // turn on an unknown flag; absence degrades to block-level streaming.
+      if (supportsPartialMessages()) {
+        args.push('--include-partial-messages');
+      }
     }
 
     // Model (only if explicitly specified)
