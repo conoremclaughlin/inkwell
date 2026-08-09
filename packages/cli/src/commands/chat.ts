@@ -2317,11 +2317,13 @@ function buildPromptEnvelope(
   const toolInstruction =
     runtime.toolRouting === 'local'
       ? 'IMPORTANT: To call tools, you MUST emit fenced code blocks in this exact format:\n\n```ink-tool\n{"tool":"tool_name","args":{}}\n```\n\nDo NOT use ToolSearch, mcp__inkwell__*, or native MCP tool calling — those will not work in this runtime. Only the fenced block format above will execute tools. You can emit multiple ink-tool blocks in one response.\n\nInkwell tools (server round-trip): get_inbox, recall, remember, list_tasks, send_response, save_link, create_task, update_session_state, bootstrap, etc.\n\nCoding tools (in-process, scoped to working directory):\n- read: Read a file. Args: path (string), offset (number, optional), limit (number, optional).\n- edit: Edit a file by find-and-replace. Args: path (string), edits (array of {oldText, newText}).\n- write: Create or overwrite a file. Args: path (string), content (string).\n- bash: Execute a shell command. Args: command (string), timeout (number, optional).\n- grep: Search file contents. Args: pattern (string), path (string, optional), include (string, optional).\n- find: Find files by name/pattern. Args: pattern (string), path (string, optional).\n- ls: List directory contents. Args: path (string, optional).\n\nClient-local tools (no server round-trip):\n- list_context: Introspect your context window — see all entries with IDs, token counts, sources, and previews.\n- evict_context: Remove specific entries from your context to reclaim tokens. Args: entryIds (number[]), source (string), or role (string).\n- signal_status: Signal your session status. Args: status ("completed" | "blocked" | "continuing"), reason (string, optional). Use this at the end of your work to tell the runtime whether you are done, blocked on something, or need another turn.'
-      : runtime.toolMode === 'off'
-        ? 'Do not call backend-native tools. Provide reasoning and instructions only.'
-        : runtime.toolMode === 'privileged'
-          ? 'Backend-native tools are enabled and external actions are allowed when needed.'
-          : '';
+      : `${
+          runtime.toolMode === 'off'
+            ? 'Do not call backend-native tools. Provide reasoning and instructions only.\n\n'
+            : runtime.toolMode === 'privileged'
+              ? 'Backend-native tools are enabled and external actions are allowed when needed.\n\n'
+              : ''
+        }Client-local runtime tools — emit as a fenced block, NOT an MCP/native tool call:\n\n\`\`\`ink-tool\n{"tool":"signal_status","args":{"status":"completed","reason":"<one line>"}}\n\`\`\`\n\n- signal_status: status "completed" | "blocked" | "continuing" (+ optional reason). REQUIRED when you finish or get stuck — without it the runtime keeps re-prompting you for more turns.\n- list_context / evict_context: introspect or trim your context window (same fenced format).`;
 
   return [
     `You are ${agentId}.`,
@@ -2672,8 +2674,14 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // dedupes against the streamed message so nothing prints twice. Local tool
   // routing: ```ink-tool blocks arrive as one held unit and are stripped
   // before display. All state lives in StreamedTurnRenderer (unit-tested).
+  // Tools executed in the CURRENT turn (backend tool-use events + local/
+  // client-local calls). Drives the no-op continuation backstop.
+  let turnToolActivity = 0;
+
   const streamRenderer = new StreamedTurnRenderer((text) =>
-    runtime.toolRouting === 'local' ? stripLocalToolBlocks(text) : text
+    // Strip in every routing — backend mode carries client-local ink-tool
+    // blocks (signal_status) that must never stream raw.
+    stripLocalToolBlocks(text)
   );
 
   const renderStreamedLines = (lines: StreamedLine[]): void => {
@@ -2692,6 +2700,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // before stream-json the feed was silent during a backend-routed generation.
   const handleBackendEvent = (evt: BackendTurnEvent): void => {
     if (evt.kind === 'tool-use') {
+      turnToolActivity += 1;
       appendTranscript(runtime.transcriptPath, {
         type: 'backend_tool',
         name: evt.name,
@@ -3994,6 +4003,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   ) => {
     if (!raw.trim()) return;
     streamRenderer.reset();
+    turnToolActivity = 0;
     // Attach pending files to this turn — append the block so the backend
     // sees the paths inline with the message that delivered them.
     if (pendingAttachmentBlock) {
@@ -4422,10 +4432,21 @@ export async function runChat(options: ChatOptions): Promise<void> {
         responseText = '(no output)';
       }
 
+      // Local routing honors every ink-tool block. Backend routing honors
+      // ONLY client-local tools (signal_status, list_context, evict_context):
+      // they have no MCP surface, so the fenced block is their only possible
+      // transport — without this, the continuation prompt asks backend-routed
+      // models for a signal_status they structurally cannot call, and every
+      // early-finishing triggered turn burns the full --max-turns budget.
       localToolCalls =
-        runtime.toolRouting === 'local' ? extractLocalToolCalls(responseText).slice(0, 5) : [];
+        runtime.toolRouting === 'local'
+          ? extractLocalToolCalls(responseText).slice(0, 5)
+          : extractLocalToolCalls(responseText)
+              .filter((call) => isClientLocalTool(call.tool))
+              .slice(0, 5);
 
       if (localToolCalls.length === 0) break;
+      turnToolActivity += localToolCalls.length;
 
       // Execute tool calls through ink's policy pipeline
       const iterationResults: typeof allToolResults = [];
@@ -4805,17 +4826,17 @@ export async function runChat(options: ChatOptions): Promise<void> {
     const isAbortedTurn =
       !runResult.success && runResult.exitCode !== undefined && runResult.exitCode >= 128;
 
+    // ink-tool blocks are stripped from display in EVERY routing — backend
+    // mode now carries client-local calls (signal_status) in fenced blocks.
     const assistantDisplayText = isAbortedTurn
       ? ''
-      : runtime.toolRouting === 'local'
-        ? (() => {
-            const stripped = stripLocalToolBlocks(responseText);
-            if (stripped) return stripped;
-            if (localToolCalls.length > 0 || allToolResults.length > 0)
-              return '(local tool call emitted; see tool results above)';
-            return responseText;
-          })()
-        : responseText;
+      : (() => {
+          const stripped = stripLocalToolBlocks(responseText);
+          if (stripped) return stripped;
+          if (localToolCalls.length > 0 || allToolResults.length > 0)
+            return '(local tool call emitted; see tool results above)';
+          return responseText;
+        })();
 
     if (isAbortedTurn) {
       appendTranscript(runtime.transcriptPath, {
@@ -5194,6 +5215,14 @@ export async function runChat(options: ChatOptions): Promise<void> {
         }
         if (consecutiveBackendFailures >= 2) {
           exitReason = 'backend_failure';
+          break;
+        }
+        // Backstop for models that never signal: a continuation turn that
+        // executed NO tools and produced only text cannot be progressing —
+        // re-prompting it just burns the remaining --max-turns budget (the
+        // live observer vet caught 11 wasted "Completed." spawns in a row).
+        if (turnToolActivity === 0) {
+          exitReason = 'no_op_continuation';
           break;
         }
       }
