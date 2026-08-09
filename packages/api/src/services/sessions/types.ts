@@ -206,7 +206,14 @@ export interface SessionResult {
 
   // Token usage from this interaction
   usage?: {
-    contextTokens: number;
+    /**
+     * Tokens currently in the backend's context window.
+     *
+     * Omitted when the backend reports no such measure — Codex JSONL carries
+     * none, and aliasing it to a cumulative input total stores a false
+     * reading. Absent means unknown, not zero.
+     */
+    contextTokens?: number;
     inputTokens: number;
     outputTokens: number;
     cacheReadTokens?: number;
@@ -411,7 +418,8 @@ export interface ISessionRepository {
   updateTokenUsage(
     id: string,
     usage: {
-      contextTokens: number;
+      /** Omitted when the backend reports no per-turn context measure. */
+      contextTokens?: number;
       inputTokens: number;
       outputTokens: number;
       /**

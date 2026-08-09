@@ -48,7 +48,8 @@ const DIAGNOSTIC_MAX_LINES = 20;
 const CODEX_USAGE_IS_CUMULATIVE = true;
 
 interface CodexUsageStats {
-  contextTokens: number;
+  /** Absent on the Codex path — no per-turn context measure is emitted. */
+  contextTokens?: number;
   inputTokens: number;
   outputTokens: number;
   /** Always true for Codex — see CODEX_USAGE_IS_CUMULATIVE. */
@@ -559,9 +560,14 @@ export class CodexRunner implements IRunner {
       return undefined;
     }
 
+    // Context is reported only if a real field carries it. Codex JSONL has no
+    // per-turn context measure — ThreadTokenUsage exposes model_context_window
+    // (the window SIZE, not occupancy). Falling back to the input total, as
+    // this once did, stored a cumulative figure as "context" and produced a
+    // false 1.3-billion-token context reading. Absent means unknown.
     const maybeContext = obj.context_tokens;
     return {
-      contextTokens: typeof maybeContext === 'number' ? maybeContext : maybeInput,
+      ...(typeof maybeContext === 'number' ? { contextTokens: maybeContext } : {}),
       inputTokens: maybeInput,
       outputTokens: maybeOutput,
       cumulative: CODEX_USAGE_IS_CUMULATIVE,

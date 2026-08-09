@@ -848,8 +848,11 @@ export class SessionService implements ISessionService {
       // backend self-compacts inside ink chat (token-budget auto-compaction);
       // its usage is persisted above for visibility but the server must NOT
       // also trigger compaction — one compaction owner per backend.
+      // An absent contextTokens means the backend reports no context measure,
+      // which is unknown rather than zero — never a basis for compacting.
       if (
         resolvedBackend === 'claude-code' &&
+        result.usage.contextTokens !== undefined &&
         result.usage.contextTokens >= this.config.compactionThreshold
       ) {
         logger.info('Session approaching context limit, triggering compaction', {

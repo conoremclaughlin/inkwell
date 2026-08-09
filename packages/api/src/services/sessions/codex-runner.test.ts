@@ -647,12 +647,16 @@ describe('CodexRunner token usage extraction', () => {
     expect(result.usage?.contextTokens).toBe(42);
   });
 
-  it('falls back to input tokens when context_tokens is absent', async () => {
+  // Codex emits no per-turn context measure. Aliasing it to the cumulative
+  // input total stored a false 1.3-billion-token "context" reading, so an
+  // absent figure must stay absent — unknown, not zero and not the input sum.
+  it('reports no context figure when the backend does not provide one', async () => {
     const result = await runWithEvents([
       { type: 'turn.completed', usage: { input_tokens: 70, output_tokens: 5 } },
     ]);
 
-    expect(result.usage?.contextTokens).toBe(70);
+    expect(result.usage?.contextTokens).toBeUndefined();
+    expect(result.usage?.inputTokens).toBe(70);
   });
 
   // An untyped deep scan for any object carrying input_tokens/output_tokens

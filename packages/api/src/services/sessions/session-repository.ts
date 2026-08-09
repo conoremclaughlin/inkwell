@@ -438,7 +438,8 @@ export class SessionRepository implements ISessionRepository {
   async updateTokenUsage(
     id: string,
     usage: {
-      contextTokens: number;
+      /** Omitted when the backend reports no per-turn context measure. */
+      contextTokens?: number;
       inputTokens: number;
       outputTokens: number;
       cumulative?: boolean;
@@ -463,39 +464,54 @@ export class SessionRepository implements ISessionRepository {
       const backendSessionId = options?.backendSessionId ?? null;
       const checkpoint = current.usageCheckpoint;
 
-      // Only diff against a checkpoint from the same backend thread. Totals
-      // restart whenever the thread does (fresh run, resume onto a new
-      // thread, compaction), so a checkpoint from another thread is garbage.
-      const sameThread = !!checkpoint && checkpoint.backendSessionId === backendSessionId;
-
-      // A counter that moved backwards means the thread restarted under the
-      // same id; treat the report itself as the delta.
-      const wentBackwards =
-        sameThread &&
-        (usage.inputTokens < checkpoint!.inputTokens ||
-          usage.outputTokens < checkpoint!.outputTokens);
-
-      if (sameThread && !wentBackwards) {
-        deltaInput = usage.inputTokens - checkpoint!.inputTokens;
-        deltaOutput = usage.outputTokens - checkpoint!.outputTokens;
-      } else {
-        deltaInput = usage.inputTokens;
-        deltaOutput = usage.outputTokens;
-        if (wentBackwards) {
-          logger.info('Backend usage counter reset — rebasing checkpoint', {
-            id,
-            backendSessionId,
-            previous: checkpoint,
-            reported: { input: usage.inputTokens, output: usage.outputTokens },
-          });
-        }
-      }
-
       nextCheckpoint = {
         backendSessionId,
         inputTokens: usage.inputTokens,
         outputTokens: usage.outputTokens,
       };
+
+      if (!checkpoint) {
+        // Rollout case: this session predates checkpointing but already has
+        // accumulated token history. The report covers the whole thread —
+        // including everything already counted — so adding it would duplicate
+        // the entire history. Establish the baseline and count nothing this
+        // turn; subsequent turns diff correctly.
+        //
+        // This must happen BEFORE the plausibility guard below, or a session
+        // whose running total already exceeds the ceiling (the motivating
+        // 3.4B one) could never lay down a baseline and its accounting would
+        // stay disabled permanently.
+        deltaInput = 0;
+        deltaOutput = 0;
+        logger.info('Establishing cumulative usage baseline for existing session', {
+          id,
+          backendSessionId,
+          baseline: { input: usage.inputTokens, output: usage.outputTokens },
+        });
+      } else if (checkpoint.backendSessionId !== backendSessionId) {
+        // Known thread change (fresh run, resume onto a new thread,
+        // compaction). Totals restart with the thread, so the whole report is
+        // genuinely this thread's usage so far.
+        deltaInput = usage.inputTokens;
+        deltaOutput = usage.outputTokens;
+      } else if (
+        usage.inputTokens < checkpoint.inputTokens ||
+        usage.outputTokens < checkpoint.outputTokens
+      ) {
+        // Counter moved backwards under the same thread id — restarted in
+        // place. Same reasoning as a thread change.
+        deltaInput = usage.inputTokens;
+        deltaOutput = usage.outputTokens;
+        logger.info('Backend usage counter reset — rebasing checkpoint', {
+          id,
+          backendSessionId,
+          previous: checkpoint,
+          reported: { input: usage.inputTokens, output: usage.outputTokens },
+        });
+      } else {
+        deltaInput = usage.inputTokens - checkpoint.inputTokens;
+        deltaOutput = usage.outputTokens - checkpoint.outputTokens;
+      }
     }
 
     // Last-ditch heuristic, not a semantic proof: one agent turn can contain
@@ -513,6 +529,14 @@ export class SessionRepository implements ISessionRepository {
         ceiling: MAX_PLAUSIBLE_TURN_TOKENS,
         hint: 'A cumulative total is likely reaching the repository undiffed',
       });
+
+      // Still advance the checkpoint. Skipping it would leave the next report
+      // diffing against a stale baseline, producing an even larger delta that
+      // trips the guard again — wedging accounting off permanently. Dropping
+      // one turn's tokens is recoverable; a stuck baseline is not.
+      if (nextCheckpoint) {
+        await this.update(id, { usageCheckpoint: nextCheckpoint });
+      }
       return;
     }
 
@@ -520,7 +544,10 @@ export class SessionRepository implements ISessionRepository {
     const newOutputTokens = current.totalOutputTokens + deltaOutput;
 
     await this.update(id, {
-      contextTokens: usage.contextTokens,
+      // Only persist a context figure the backend actually reported. Codex
+      // JSONL carries no per-turn context measure, and aliasing it to the
+      // cumulative input total stored a false 1.3B "context" reading.
+      ...(usage.contextTokens !== undefined ? { contextTokens: usage.contextTokens } : {}),
       totalInputTokens: newInputTokens,
       totalOutputTokens: newOutputTokens,
       tokenCount: newInputTokens + newOutputTokens,
