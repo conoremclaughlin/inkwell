@@ -264,9 +264,12 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
   if (hasMany && !threadKey) {
     throw new Error('threadKey is required when using recipients[]');
   }
-  if (recipients && (recipientSessionId || recipientStudioId || recipientStudioSlugOrHint)) {
+  if (
+    recipients &&
+    (recipientSessionId || recipientStudioId || recipientStudioSlugOrHint || sessionAlias)
+  ) {
     throw new Error(
-      'recipientSessionId/recipientStudioId/recipientStudioSlug/recipientStudioHint are only valid for single-recipient sends'
+      'recipientSessionId/recipientStudioId/recipientStudioSlug/recipientStudioHint/sessionAlias are only valid for single-recipient sends'
     );
   }
 
@@ -592,12 +595,25 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
       effectiveRecipientSessionId: effectiveRecipientSessionId || null,
     });
 
-    // Dispatch triggers with session routing from thread history
+    // Dispatch: assignment is wake-independent (§3a). EVERY recipient gets a
+    // dispatch — wake only for agentsToTrigger; the rest go routeOnly so their
+    // session is still assigned/stamped (trigger:false / missingSenderSession
+    // must never mean unaddressed).
     const triggeredAgents: string[] = [];
-    if (agentsToTrigger.length > 0) {
+    // Union with agentsToTrigger: actionable self-sends (session_resume /
+    // task_request strategy kickoffs) wake self without an explicit
+    // studio/session target and must keep dispatching.
+    const routingSet = [
+      ...new Set([
+        ...allRecipients.filter((a) => a !== senderAgentId || explicitSelfTarget),
+        ...agentsToTrigger,
+      ]),
+    ];
+    if (routingSet.length > 0) {
       const gateway = getAgentGateway();
 
-      for (const toAgentId of agentsToTrigger) {
+      for (const toAgentId of routingSet) {
+        const wake = agentsToTrigger.includes(toAgentId);
         // Auto-resolve recipientSessionId: find the recipient's most recent
         // message on this thread to extract their sender session. This ensures
         // replies route back to the session that originated the conversation,
@@ -671,10 +687,11 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
           ...(isAddressedRecipient && !resolvedRecipientStudioId && recipientStudioSlugOrHint
             ? { studioHint: recipientStudioSlugOrHint }
             : {}),
+          ...(wake ? {} : { routeOnly: true }),
           ...(Object.keys(rawMeta).length > 0 ? { metadata: rawMeta } : {}),
         };
         const result = gateway.dispatchTrigger(payload);
-        if (result.accepted) {
+        if (result.accepted && wake) {
           triggeredAgents.push(toAgentId);
         }
       }
@@ -1077,6 +1094,37 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
     callerSessionId = reqCtx?.sessionId || sessCtx?.sessionId || null;
   }
 
+  // Fail-closed (spec inkmail-read-state §3): a channelPoll caller with no
+  // resolvable session context gets NOTHING — never the agent's whole thread
+  // surface. Assignment-at-send (§3a) guarantees stamped threads exist, so a
+  // context-less poller starving is correct, visible (log), and recoverable
+  // (the plugin shows a one-time notice).
+  if (channelPoll && agentId && !callerSessionId) {
+    logger.warn('channel_poll_unscoped', {
+      agentId,
+      userId: resolved.user.id,
+      hint: 'channelPoll caller presented no session context — returning empty (fail-closed)',
+    });
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: JSON.stringify({
+            success: true,
+            agentId,
+            unreadCount: 0,
+            threadUnreadCount: 0,
+            totalUnreadCount: 0,
+            count: 0,
+            messages: [],
+            threadsWithUnread: [],
+            warning: 'channel_poll_unscoped: no session context — delivery disabled (fail-closed)',
+          }),
+        },
+      ],
+    };
+  }
+
   try {
     // Find thread IDs this agent (or any agent for this user) participates in
     let participantQuery = threadTable(supabase, 'inbox_thread_participants').select('thread_id');
@@ -1084,10 +1132,14 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
       participantQuery = participantQuery.eq('agent_id', agentId);
     }
 
-    // Session-scoped filtering: only return threads assigned to this session
-    // (or unassigned threads not yet claimed by any session).
+    // Stamped-only session scoping (spec §3): pollers see ONLY threads
+    // assigned to their session. Unstamped (session_id IS NULL) threads are
+    // invisible to pollers by construction — the trigger path assigns them
+    // before any delivery. (v6's `OR session_id IS NULL` was implicit
+    // broadcast: first poller consumed the message and advanced the shared
+    // pointer, starving the session that actually needed it.)
     if (callerSessionId) {
-      participantQuery = participantQuery.or(`session_id.eq.${callerSessionId},session_id.is.null`);
+      participantQuery = participantQuery.eq('session_id', callerSessionId);
     }
 
     const { data: participantRows } = await participantQuery;

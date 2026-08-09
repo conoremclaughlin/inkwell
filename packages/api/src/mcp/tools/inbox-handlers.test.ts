@@ -1404,6 +1404,40 @@ describe('handleSendToInbox — system sender and cross-agent studio routing', (
     expect(parsed.triggered).toContain('wren');
   });
 
+  it('trigger:false still dispatches a routeOnly assignment and wakes nobody (spec §3a)', async () => {
+    const { getAgentGateway } = await import('../../channels/agent-gateway.js');
+    const mockGateway = (getAgentGateway as ReturnType<typeof vi.fn>)();
+
+    const { getRequestContext, getSessionContext } = await import('../../utils/request-context');
+    vi.mocked(getRequestContext).mockReturnValue({ sessionId: 'session-mock-123' } as never);
+    vi.mocked(getSessionContext).mockReturnValue(undefined as never);
+
+    const mockSb = createThreadMockSupabase({ existingThread: undefined });
+    const mockDc = createThreadMockDataComposer(mockSb);
+
+    const result = await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientAgentId: 'lumen',
+        senderAgentId: 'wren',
+        threadKey: 'thread:quiet-fyi',
+        content: 'No rush — for your next inbox check.',
+        messageType: 'notification',
+        trigger: false,
+      },
+      mockDc as never
+    );
+
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(true);
+    // Assignment dispatch happened — routeOnly, addressed to the recipient
+    expect(mockGateway.dispatchTrigger).toHaveBeenCalledWith(
+      expect.objectContaining({ toAgentId: 'lumen', routeOnly: true })
+    );
+    // But nobody was woken
+    expect(parsed.triggered).toEqual([]);
+  });
+
   it('advances the sender read pointer through the inserted message on ordinary sends', async () => {
     const { getRequestContext, getSessionContext } = await import('../../utils/request-context');
     vi.mocked(getRequestContext).mockReturnValue(undefined as never);

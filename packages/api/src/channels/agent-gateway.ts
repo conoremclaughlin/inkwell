@@ -44,6 +44,13 @@ export interface AgentTriggerPayload {
   recipientSessionId?: string;
   /** Target a session by alias (e.g., "main", "review") */
   sessionAlias?: string;
+  /**
+   * Routing-only dispatch: resolve + stamp the recipient's session but do NOT
+   * wake/spawn/deliver. Used so session assignment happens for every send
+   * regardless of the trigger flag (spec: inkmail-read-state §3a — trigger
+   * controls wake, never addressing).
+   */
+  routeOnly?: boolean;
   /** Additional metadata */
   metadata?: Record<string, unknown>;
 }

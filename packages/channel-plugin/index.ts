@@ -260,8 +260,30 @@ async function stampCliPollAt(): Promise<void> {
   }
 }
 
+// One-time fail-closed notice (spec inkmail-read-state §3): a plugin process
+// with no session context gets nothing from channelPoll (server fail-closed).
+// Surface that ONCE so a directly-launched session isn't silently featureless,
+// then stay quiet — recurring warnings are noise.
+let unscopedNoticeSent = false;
+
 async function pollInbox(): Promise<void> {
   if (!email) return;
+
+  if (!sessionId && !unscopedNoticeSent) {
+    unscopedNoticeSent = true;
+    log('warn', 'No session context — InkMail delivery disabled (fail-closed), notifying once');
+    await mcp
+      .notification({
+        method: 'notifications/claude/channel',
+        params: {
+          content:
+            'InkMail delivery disabled for this session: no session context (INK_SESSION_ID). ' +
+            'Launch via the ink wrapper for scoped delivery. Server log: channel_poll_unscoped.',
+          meta: { sender: 'inkmail', message_type: 'notification' },
+        },
+      })
+      .catch(() => {});
+  }
 
   // Stamp cli_poll_at so the trigger handler knows we're alive
   stampCliPollAt().catch(() => {});
