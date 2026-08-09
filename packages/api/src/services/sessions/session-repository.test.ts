@@ -318,13 +318,18 @@ describe('SessionRepository.updateTokenUsage', () => {
     });
   });
 
-  // The motivating 3.4B session: its running total already exceeds the
-  // ceiling. If the baseline were laid down after the guard, it could never be
-  // written and accounting would stay disabled for that session forever.
-  it('baselines a session whose running total already exceeds the ceiling', async () => {
-    const { supabase, lastUpdate } = createMockSupabase();
+  // The motivating 3.4B session: an EXISTING session whose running total
+  // already exceeds the ceiling. If the baseline were laid down after the
+  // guard, it could never be written and accounting would stay disabled for
+  // that session forever. Prior history is seeded deliberately — with a
+  // zero-history row this would exercise the new-session path instead.
+  it('baselines an existing session whose running total already exceeds the ceiling', async () => {
+    const { supabase, lastUpdate, fakeRow } = createMockSupabase();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const repo = new SessionRepository(supabase as any);
+
+    fakeRow.token_count = 1_500_000;
+    fakeRow.metadata = { totalInputTokens: 1_400_000, totalOutputTokens: 100_000 };
 
     await repo.updateTokenUsage(
       'sess-1',
@@ -332,11 +337,34 @@ describe('SessionRepository.updateTokenUsage', () => {
       { backendSessionId: 'thread-a' }
     );
 
-    expect(lastUpdate.data?.token_count).toBe(0);
+    // Totals untouched, baseline written despite exceeding the ceiling.
+    expect(lastUpdate.data?.token_count).toBe(1_500_000);
     expect((lastUpdate.data?.metadata as Record<string, unknown>).usageCheckpoint).toEqual({
       backendSessionId: 'thread-a',
       inputTokens: 3_437_373_064,
       outputTokens: 3_645_922,
+    });
+  });
+
+  // A brand-new session has no checkpoint AND no history. Its first report is
+  // genuinely the first turn's usage — baselining it would silently discard
+  // that turn from every new Codex session, permanently.
+  it('accumulates the first report on a brand-new session', async () => {
+    const { supabase, lastUpdate } = createMockSupabase();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const repo = new SessionRepository(supabase as any);
+
+    await repo.updateTokenUsage(
+      'sess-1',
+      { inputTokens: 1000, outputTokens: 100, cumulative: true },
+      { backendSessionId: 'thread-a' }
+    );
+
+    expect(lastUpdate.data?.token_count).toBe(1100);
+    expect((lastUpdate.data?.metadata as Record<string, unknown>).usageCheckpoint).toEqual({
+      backendSessionId: 'thread-a',
+      inputTokens: 1000,
+      outputTokens: 100,
     });
   });
 

@@ -470,8 +470,13 @@ export class SessionRepository implements ISessionRepository {
         outputTokens: usage.outputTokens,
       };
 
-      if (!checkpoint) {
-        // Rollout case: this session predates checkpointing but already has
+      // "No checkpoint" covers two genuinely different situations, and they
+      // need opposite handling.
+      const hasPriorUsage =
+        current.totalInputTokens > 0 || current.totalOutputTokens > 0 || current.tokenCount > 0;
+
+      if (!checkpoint && hasPriorUsage) {
+        // Rollout: this session predates checkpointing but already has
         // accumulated token history. The report covers the whole thread —
         // including everything already counted — so adding it would duplicate
         // the entire history. Establish the baseline and count nothing this
@@ -488,6 +493,12 @@ export class SessionRepository implements ISessionRepository {
           backendSessionId,
           baseline: { input: usage.inputTokens, output: usage.outputTokens },
         });
+      } else if (!checkpoint) {
+        // Brand-new session: nothing has been counted yet, so the first
+        // report IS this thread's usage so far. Baselining it here would
+        // discard the entire first turn permanently.
+        deltaInput = usage.inputTokens;
+        deltaOutput = usage.outputTokens;
       } else if (checkpoint.backendSessionId !== backendSessionId) {
         // Known thread change (fresh run, resume onto a new thread,
         // compaction). Totals restart with the thread, so the whole report is
