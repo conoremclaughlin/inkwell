@@ -48,9 +48,18 @@ export interface AgentTriggerPayload {
    * Routing-only dispatch: resolve + stamp the recipient's session but do NOT
    * wake/spawn/deliver. Used so session assignment happens for every send
    * regardless of the trigger flag (spec: inkmail-read-state §3a — trigger
-   * controls wake, never addressing).
+   * controls wake, never addressing). Dispatch routeOnly payloads via
+   * processTrigger (awaited) so the stamp is durable before send returns.
    */
   routeOnly?: boolean;
+  /**
+   * True only when the CALLER explicitly targeted a session/studio
+   * (recipientSessionId/sessionAlias/recipientStudioId/recipientStudioSlug
+   * passed by the sender) — the deliberate-retarget signal (spec §3b.1).
+   * NOT set for recipientSessionId values auto-inferred from thread history;
+   * those are continuity hints, never authorized overwrites.
+   */
+  explicitRecipientTarget?: boolean;
   /** Additional metadata */
   metadata?: Record<string, unknown>;
 }

@@ -54,16 +54,50 @@ interface SessionRow {
 }
 
 async function isSessionDead(supabase: any, sessionId: string): Promise<boolean> {
-  const { data } = (await supabase
+  const { data, error } = (await supabase
     .from('sessions')
     .select('id, ended_at, lifecycle')
     .eq('id', sessionId)
-    .maybeSingle()) as { data: SessionRow | null };
-  // Missing row = dead. Current terminal gate is ended_at/failed; when the
-  // session-lifecycle-model migration lands (archived_at), this helper is the
-  // single place to update.
+    .maybeSingle()) as { data: SessionRow | null; error: { message: string } | null };
+  // FAIL-SAFE: a lookup ERROR is not evidence of death — treating it as dead
+  // would let a transient DB failure authorize a rebind (Lumen, PR #460 §3).
+  if (error) {
+    logger.warn('[Assign] Session liveness lookup failed — treating as alive', {
+      sessionId,
+      error: error.message,
+    });
+    return false;
+  }
+  // A cleanly-missing row IS dead. Current terminal gate is ended_at/failed;
+  // when the session-lifecycle-model migration lands (archived_at), this
+  // helper is the single place to update.
   if (!data) return true;
   return !!data.ended_at || data.lifecycle === 'failed';
+}
+
+/**
+ * FAIL-SAFE recovery for a failed stamp write: never report the candidate as
+ * bound. Reread the durable stamp — if one exists, delivery must follow IT
+ * (reroute); only when the row is genuinely unstamped does delivery proceed
+ * to the candidate (the stamp stays NULL, so the next dispatch retries).
+ */
+async function recoverFromWriteFailure(
+  supabase: any,
+  params: AssignParams,
+  failedVia: BoundVia
+): Promise<AssignResult> {
+  const { threadId, agentId, candidateSessionId } = params;
+  const { data: after } = await supabase
+    .from('inbox_thread_participants')
+    .select('session_id')
+    .eq('thread_id', threadId)
+    .eq('agent_id', agentId)
+    .maybeSingle();
+  const stamp: string | null = after?.session_id ?? null;
+  if (stamp && stamp !== candidateSessionId) {
+    return { sessionId: stamp, rerouted: true, boundVia: 'continuity' };
+  }
+  return { sessionId: stamp || candidateSessionId, rerouted: false, boundVia: failedVia };
 }
 
 export async function assignThreadParticipant(
@@ -101,9 +135,7 @@ export async function assignThreadParticipant(
         source,
         error: error.message,
       });
-      // Fall through with the candidate — delivery proceeds, stamp is retried
-      // on the next send/trigger for this thread.
-      return { sessionId: candidateSessionId, rerouted: false, boundVia };
+      return recoverFromWriteFailure(supabase, params, boundVia);
     }
     logger.info('[Assign] Thread participant bound', {
       threadId,
@@ -151,7 +183,7 @@ export async function assignThreadParticipant(
         source,
         error: rebindErr.message,
       });
-      return { sessionId: candidateSessionId, rerouted: false, boundVia: 'rebind-dead-session' };
+      return recoverFromWriteFailure(supabase, params, 'rebind-dead-session');
     }
     if (!rebound || rebound.length === 0) {
       // Lost the rebind race — reread the winner.
@@ -201,7 +233,7 @@ export async function assignThreadParticipant(
       source,
       error: claimErr.message,
     });
-    return { sessionId: candidateSessionId, rerouted: false, boundVia: 'claim' };
+    return recoverFromWriteFailure(supabase, params, 'claim');
   }
   if (claimed && claimed.length > 0) {
     logger.info('[Assign] Thread participant bound', {

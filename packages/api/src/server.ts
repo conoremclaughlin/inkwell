@@ -1050,7 +1050,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
             threadId: payload.threadId,
             agentId: targetAgentId,
             candidateSessionId: routedSession.id,
-            explicitAnchor: !!(payload.recipientSessionId || payload.sessionAlias),
+            explicitAnchor: !!payload.explicitRecipientTarget,
             source: 'trigger-handler',
           });
           if (assignment.rerouted) {

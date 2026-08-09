@@ -54,6 +54,12 @@ vi.mock('../../channels/agent-gateway.js', () => ({
       processed: false,
       accepted: true,
     }),
+    // Synchronous assignment dispatch (spec §3a) — awaited by handleSendToInbox
+    processTrigger: vi.fn().mockResolvedValue({
+      success: true,
+      triggerId: 'trigger-sync-1',
+      processed: true,
+    }),
   }),
 }));
 
@@ -1430,12 +1436,113 @@ describe('handleSendToInbox — system sender and cross-agent studio routing', (
 
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed.success).toBe(true);
-    // Assignment dispatch happened — routeOnly, addressed to the recipient
-    expect(mockGateway.dispatchTrigger).toHaveBeenCalledWith(
+    // Assignment happened SYNCHRONOUSLY (processTrigger, awaited) with routeOnly
+    expect(mockGateway.processTrigger).toHaveBeenCalledWith(
       expect.objectContaining({ toAgentId: 'lumen', routeOnly: true })
     );
-    // But nobody was woken
+    // No wake dispatch fired
+    expect(mockGateway.dispatchTrigger).not.toHaveBeenCalled();
     expect(parsed.triggered).toEqual([]);
+  });
+
+  it('history-inferred recipientSessionId is NOT an explicit anchor; caller studio target IS', async () => {
+    const { getAgentGateway } = await import('../../channels/agent-gateway.js');
+    const mockGateway = (getAgentGateway as ReturnType<typeof vi.fn>)();
+
+    const { getRequestContext, getSessionContext } = await import('../../utils/request-context');
+    vi.mocked(getRequestContext).mockReturnValue({ sessionId: 'session-mock-123' } as never);
+    vi.mocked(getSessionContext).mockReturnValue(undefined as never);
+
+    // 1) No caller targeting, but thread history yields a recipient session —
+    //    payload must carry recipientSessionId WITHOUT explicitRecipientTarget.
+    const withHistory = createThreadMockSupabase({
+      existingThread: { id: 'thread-hist' },
+      recipientPriorMessage: {
+        metadata: { pcp: { sender: { agentId: 'lumen', sessionId: 'lumen-old-session' } } },
+      },
+    });
+    const { findThread, getParticipants, resolveTriggeredAgents } =
+      await import('./thread-handlers.js');
+    vi.mocked(findThread).mockResolvedValue({
+      id: 'thread-hist',
+      status: 'open',
+      created_by_agent_id: 'wren',
+    } as never);
+    vi.mocked(getParticipants).mockResolvedValue([]);
+    vi.mocked(resolveTriggeredAgents).mockReturnValue(['lumen']);
+
+    await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientAgentId: 'lumen',
+        senderAgentId: 'wren',
+        threadKey: 'pr:hist',
+        content: 'reply',
+      },
+      createThreadMockDataComposer(withHistory) as never
+    );
+    const historyCall = (mockGateway.processTrigger as ReturnType<typeof vi.fn>).mock.calls.find(
+      (c: unknown[]) => (c[0] as { toAgentId: string }).toAgentId === 'lumen'
+    );
+    expect(historyCall![0]).toEqual(
+      expect.objectContaining({ recipientSessionId: 'lumen-old-session' })
+    );
+    expect(
+      (historyCall![0] as { explicitRecipientTarget?: boolean }).explicitRecipientTarget
+    ).toBeUndefined();
+
+    vi.mocked(findThread).mockResolvedValue(null);
+    vi.mocked(resolveTriggeredAgents).mockReturnValue([]);
+    (mockGateway.processTrigger as ReturnType<typeof vi.fn>).mockClear();
+
+    // 2) Caller-passed studio target → explicitRecipientTarget true.
+    const plain = createThreadMockSupabase({ existingThread: undefined });
+    await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientAgentId: 'wren',
+        senderAgentId: 'wren',
+        recipientStudioId: '123e4567-e89b-12d3-a456-426614174000',
+        threadKey: 'thread:studio-target',
+        content: 'handoff',
+        messageType: 'task_request',
+      },
+      createThreadMockDataComposer(plain) as never
+    );
+    expect(mockGateway.processTrigger).toHaveBeenCalledWith(
+      expect.objectContaining({ toAgentId: 'wren', explicitRecipientTarget: true })
+    );
+  });
+
+  it('unscoped channelPoll fails closed BEFORE any read — no legacy fetch, no pointer advance', async () => {
+    const { getRequestContext, getSessionContext } = await import('../../utils/request-context');
+    vi.mocked(getRequestContext).mockReturnValue(undefined as never);
+    vi.mocked(getSessionContext).mockReturnValue(undefined as never);
+
+    const mockSb = createMockSupabase();
+    const mockDc = createMockDataComposer(mockSb);
+
+    // With agentId
+    const result = await handleGetInbox(
+      { email: 'test@test.com', agentId: 'wren', channelPoll: true },
+      mockDc as never
+    );
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.warning).toContain('channel_poll_unscoped');
+    expect(parsed.messages).toEqual([]);
+
+    // And WITHOUT agentId — the gate must not be bypassable by omitting it
+    const result2 = await handleGetInbox(
+      { email: 'test@test.com', channelPoll: true },
+      mockDc as never
+    );
+    expect(JSON.parse(result2.content[0].text).warning).toContain('channel_poll_unscoped');
+
+    // Nothing was read and nothing advanced: no agent_inbox fetch, no
+    // read-pointer table touched.
+    const tablesTouched = (mockSb.from as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0]);
+    expect(tablesTouched).not.toContain('agent_inbox');
+    expect(tablesTouched).not.toContain('agent_inbox_read_status');
   });
 
   it('advances the sender read pointer through the inserted message on ordinary sends', async () => {

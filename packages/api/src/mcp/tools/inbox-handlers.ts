@@ -667,6 +667,13 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
         // was true, so system/human → owner delegation lost the assigned
         // studio and fell back to route patterns / default studio.
         const isAddressedRecipient = !recipients && toAgentId === recipientAgentId;
+        // Anchor provenance (spec §3b.1): only CALLER-passed targeting counts
+        // as the deliberate-retarget signal. History-inferred
+        // recipientSessionId is a continuity hint, never an overwrite.
+        const explicitRecipientTarget = !!(
+          isAddressedRecipient &&
+          (recipientSessionId || sessionAlias || recipientStudioId || recipientStudioSlugOrHint)
+        );
         const payload: AgentTriggerPayload = {
           fromAgentId: triggerSenderId,
           toAgentId,
@@ -680,6 +687,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
           priority,
           threadKey,
           recipientSessionId: resolvedRecipientSessionId,
+          ...(explicitRecipientTarget ? { explicitRecipientTarget } : {}),
           ...(isAddressedRecipient && sessionAlias ? { sessionAlias } : {}),
           ...(isAddressedRecipient && resolvedRecipientStudioId
             ? { studioId: resolvedRecipientStudioId }
@@ -687,12 +695,29 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
           ...(isAddressedRecipient && !resolvedRecipientStudioId && recipientStudioSlugOrHint
             ? { studioHint: recipientStudioSlugOrHint }
             : {}),
-          ...(wake ? {} : { routeOnly: true }),
           ...(Object.keys(rawMeta).length > 0 ? { metadata: rawMeta } : {}),
         };
-        const result = gateway.dispatchTrigger(payload);
-        if (result.accepted && wake) {
-          triggeredAgents.push(toAgentId);
+
+        // 1) Assignment — SYNCHRONOUS (spec §3a): processTrigger awaits the
+        //    handler, so the participant stamp is durable before send returns.
+        //    A crash after this line cannot orphan the message.
+        try {
+          await gateway.processTrigger({ ...payload, routeOnly: true });
+        } catch (err) {
+          logger.warn('[ThreadTrigger] Synchronous assignment failed', {
+            threadKey,
+            toAgentId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+
+        // 2) Wake — optional, fire-and-forget, rides the fresh stamp via
+        //    thread continuity.
+        if (wake) {
+          const result = gateway.dispatchTrigger(payload);
+          if (result.accepted) {
+            triggeredAgents.push(toAgentId);
+          }
         }
       }
     }
@@ -966,6 +991,44 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
     ? (getEffectiveAgentId(parsed.agentId) ?? parsed.agentId)
     : undefined;
 
+  // Fail-closed (spec inkmail-read-state §3) — FIRST, before ANY read or
+  // pointer advance: a channelPoll caller with no resolvable session context
+  // gets nothing, touches nothing. Applies with or without agentId (an
+  // agent-less channelPoll is just as unscoped). Legacy inbox fetch +
+  // auto-advance below must never run for an unscoped poller.
+  let callerSessionId: string | null = null;
+  if (channelPoll) {
+    const reqCtx = getRequestContext();
+    const sessCtx = getSessionContext();
+    callerSessionId = reqCtx?.sessionId || sessCtx?.sessionId || null;
+    if (!callerSessionId) {
+      logger.warn('channel_poll_unscoped', {
+        agentId: agentId || null,
+        userId: resolved.user.id,
+        hint: 'channelPoll caller presented no session context — returning empty (fail-closed)',
+      });
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: JSON.stringify({
+              success: true,
+              agentId: agentId || null,
+              unreadCount: 0,
+              threadUnreadCount: 0,
+              totalUnreadCount: 0,
+              count: 0,
+              messages: [],
+              threadsWithUnread: [],
+              warning:
+                'channel_poll_unscoped: no session context — delivery disabled (fail-closed)',
+            }),
+          },
+        ],
+      };
+    }
+  }
+
   let query = supabase
     .from('agent_inbox')
     .select('*')
@@ -1086,44 +1149,8 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
   let threadsWithUnread: ThreadSummary[] = [];
   let threadUnreadCount = 0;
 
-  // Resolve caller's session ID for channelPoll session scoping
-  let callerSessionId: string | null = null;
-  if (channelPoll && agentId) {
-    const reqCtx = getRequestContext();
-    const sessCtx = getSessionContext();
-    callerSessionId = reqCtx?.sessionId || sessCtx?.sessionId || null;
-  }
-
-  // Fail-closed (spec inkmail-read-state §3): a channelPoll caller with no
-  // resolvable session context gets NOTHING — never the agent's whole thread
-  // surface. Assignment-at-send (§3a) guarantees stamped threads exist, so a
-  // context-less poller starving is correct, visible (log), and recoverable
-  // (the plugin shows a one-time notice).
-  if (channelPoll && agentId && !callerSessionId) {
-    logger.warn('channel_poll_unscoped', {
-      agentId,
-      userId: resolved.user.id,
-      hint: 'channelPoll caller presented no session context — returning empty (fail-closed)',
-    });
-    return {
-      content: [
-        {
-          type: 'text' as const,
-          text: JSON.stringify({
-            success: true,
-            agentId,
-            unreadCount: 0,
-            threadUnreadCount: 0,
-            totalUnreadCount: 0,
-            count: 0,
-            messages: [],
-            threadsWithUnread: [],
-            warning: 'channel_poll_unscoped: no session context — delivery disabled (fail-closed)',
-          }),
-        },
-      ],
-    };
-  }
+  // (callerSessionId resolved + fail-closed gate applied at the top of the
+  // handler — before the legacy inbox fetch/advance. See spec §3.)
 
   try {
     // Find thread IDs this agent (or any agent for this user) participates in

@@ -16,6 +16,10 @@ function mockDb(opts: {
   /** stamp visible on reread after a lost race */
   stampAfterRace?: string | null;
   deadSessions?: string[];
+  /** sessions liveness lookup returns an error (fail-safe: must read as ALIVE) */
+  sessionLookupError?: boolean;
+  /** participant update returns an error (fail-safe: recover, never claim success) */
+  updateError?: boolean;
 }) {
   const updates: Array<Record<string, unknown>> = [];
   let readCount = 0;
@@ -39,10 +43,11 @@ function mockDb(opts: {
       return Promise.resolve({ data: stamp === undefined ? null : { session_id: stamp } });
     });
     chain.then = (resolve: (v: unknown) => unknown) =>
-      Promise.resolve({
-        data: opts.updateAffects > 0 ? [{ session_id: 'x' }] : [],
-        error: null,
-      }).then(resolve);
+      Promise.resolve(
+        opts.updateError
+          ? { data: null, error: { message: 'update failed' } }
+          : { data: opts.updateAffects > 0 ? [{ session_id: 'x' }] : [], error: null }
+      ).then(resolve);
     return chain;
   };
 
@@ -55,13 +60,17 @@ function mockDb(opts: {
       return chain;
     });
     chain.maybeSingle = vi.fn().mockImplementation(() => {
+      if (opts.sessionLookupError) {
+        return Promise.resolve({ data: null, error: { message: 'connection reset' } });
+      }
       const id = (chain as { _id?: string })._id!;
       if (opts.deadSessions?.includes(id)) {
         return Promise.resolve({
           data: { id, ended_at: '2026-08-01T00:00:00Z', lifecycle: 'idle' },
+          error: null,
         });
       }
-      return Promise.resolve({ data: { id, ended_at: null, lifecycle: 'idle' } });
+      return Promise.resolve({ data: { id, ended_at: null, lifecycle: 'idle' }, error: null });
     });
     return chain;
   };
@@ -140,6 +149,33 @@ describe('assignThreadParticipant', () => {
       explicitAnchor: true,
     });
     expect(r.boundVia).toBe('explicit-anchor');
+  });
+
+  it('FAIL-SAFE: a session-liveness lookup ERROR reads as alive — no rebind (Lumen P1-3)', async () => {
+    // Stamp exists; liveness lookup errors. Treating the error as "dead"
+    // would authorize a rebind off a transient DB failure. Must reroute to
+    // the existing stamp instead.
+    const db = mockDb({ currentStamp: 's-live', updateAffects: 0, sessionLookupError: true });
+    const r = await assignThreadParticipant(db, {
+      ...BASE,
+      candidateSessionId: 's-other',
+      explicitAnchor: false,
+    });
+    expect(r).toEqual({ sessionId: 's-live', rerouted: true, boundVia: 'continuity' });
+    expect(db.getUpdates()).toHaveLength(0);
+  });
+
+  it('FAIL-SAFE: an anchor write ERROR never claims success — reroutes to the durable stamp (Lumen P1-3)', async () => {
+    // Anchor write fails; the durable stamp still says s-live. The result
+    // must follow the stamp (rerouted), not pretend the candidate is bound.
+    const db = mockDb({ currentStamp: 's-live', updateAffects: 0, updateError: true });
+    const r = await assignThreadParticipant(db, {
+      ...BASE,
+      candidateSessionId: 's-anchored',
+      explicitAnchor: true,
+    });
+    expect(r.sessionId).toBe('s-live');
+    expect(r.rerouted).toBe(true);
   });
 
   it('no-ops when already bound to the candidate', async () => {
