@@ -46,7 +46,11 @@ function createMockSupabase() {
   const builder = {
     select: vi.fn().mockReturnThis(),
     eq: vi.fn().mockReturnThis(),
-    single: vi.fn().mockResolvedValue({ data: { ...fakeRow }, error: null }),
+    // Read fakeRow at call time, not at construction — tests mutate it between
+    // calls to simulate successive turns.
+    single: vi
+      .fn()
+      .mockImplementation(() => Promise.resolve({ data: { ...fakeRow }, error: null })),
     update: vi.fn().mockImplementation((data: Record<string, unknown>) => {
       lastUpdate.data = data;
       return {
@@ -200,7 +204,7 @@ describe('SessionRepository.updateTokenUsage', () => {
     vi.clearAllMocks();
   });
 
-  it('accumulates a normal per-turn delta', async () => {
+  it('accumulates a per-turn delta as-is when not cumulative', async () => {
     const { supabase, lastUpdate } = createMockSupabase();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const repo = new SessionRepository(supabase as any);
@@ -211,15 +215,92 @@ describe('SessionRepository.updateTokenUsage', () => {
       outputTokens: 340,
     });
 
-    expect(lastUpdate.data).toBeDefined();
     expect(lastUpdate.data?.token_count).toBe(1540);
   });
 
-  // Regression: a runner reporting a session-cumulative counter instead of a
-  // per-turn delta re-adds the whole history every turn. That grew one session
-  // to 3,441,018,986 tokens, overflowing the int32 column and failing every
-  // subsequent session-state write with Postgres 22003.
-  it('refuses to accumulate an implausible single-turn total', async () => {
+  // Codex reports ThreadTokenUsage.total, so consecutive turns carry ever
+  // larger running totals. Adding them re-applies the whole history each turn
+  // (quadratic); only the difference is this turn's real usage.
+  it('diffs consecutive cumulative totals instead of adding them', async () => {
+    const { supabase, lastUpdate, fakeRow } = createMockSupabase();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const repo = new SessionRepository(supabase as any);
+
+    // Turn 1: no checkpoint yet — the whole reported total is the delta.
+    await repo.updateTokenUsage(
+      'sess-1',
+      { contextTokens: 900, inputTokens: 1000, outputTokens: 100, cumulative: true },
+      { backendSessionId: 'thread-a' }
+    );
+    expect(lastUpdate.data?.token_count).toBe(1100);
+
+    // Turn 2: cumulative grew to 2500/250. Real usage is 1500/150, not 2750.
+    fakeRow.metadata = {
+      totalInputTokens: 1000,
+      totalOutputTokens: 100,
+      usageCheckpoint: { backendSessionId: 'thread-a', inputTokens: 1000, outputTokens: 100 },
+    };
+
+    await repo.updateTokenUsage(
+      'sess-1',
+      { contextTokens: 2400, inputTokens: 2500, outputTokens: 250, cumulative: true },
+      { backendSessionId: 'thread-a' }
+    );
+
+    expect(lastUpdate.data?.token_count).toBe(2750);
+    expect((lastUpdate.data?.metadata as Record<string, unknown>).usageCheckpoint).toEqual({
+      backendSessionId: 'thread-a',
+      inputTokens: 2500,
+      outputTokens: 250,
+    });
+  });
+
+  // Totals restart whenever the backend thread does, so a checkpoint from a
+  // different thread must not be diffed against — that would yield a negative
+  // or wildly wrong delta.
+  it('does not diff against a checkpoint from a different backend thread', async () => {
+    const { supabase, lastUpdate, fakeRow } = createMockSupabase();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const repo = new SessionRepository(supabase as any);
+
+    fakeRow.metadata = {
+      totalInputTokens: 5000,
+      totalOutputTokens: 500,
+      usageCheckpoint: { backendSessionId: 'thread-a', inputTokens: 5000, outputTokens: 500 },
+    };
+
+    await repo.updateTokenUsage(
+      'sess-1',
+      { contextTokens: 200, inputTokens: 300, outputTokens: 40, cumulative: true },
+      { backendSessionId: 'thread-b' }
+    );
+
+    // Fresh thread: the report itself is the delta. 5000+300, 500+40.
+    expect(lastUpdate.data?.token_count).toBe(5840);
+  });
+
+  it('rebases when the counter moves backwards under the same thread id', async () => {
+    const { supabase, lastUpdate, fakeRow } = createMockSupabase();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const repo = new SessionRepository(supabase as any);
+
+    fakeRow.metadata = {
+      totalInputTokens: 9000,
+      totalOutputTokens: 900,
+      usageCheckpoint: { backendSessionId: 'thread-a', inputTokens: 9000, outputTokens: 900 },
+    };
+
+    await repo.updateTokenUsage(
+      'sess-1',
+      { contextTokens: 100, inputTokens: 120, outputTokens: 10, cumulative: true },
+      { backendSessionId: 'thread-a' }
+    );
+
+    expect(lastUpdate.data?.token_count).toBe(10030);
+  });
+
+  // Last-ditch heuristic only: a cumulative total still reaching us undiffed.
+  it('refuses to accumulate an implausible delta', async () => {
     const { supabase, lastUpdate } = createMockSupabase();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const repo = new SessionRepository(supabase as any);
@@ -230,7 +311,6 @@ describe('SessionRepository.updateTokenUsage', () => {
       outputTokens: 3_645_922,
     });
 
-    // No write at all — better to keep the last good value than persist garbage.
     expect(lastUpdate.data).toBeUndefined();
   });
 

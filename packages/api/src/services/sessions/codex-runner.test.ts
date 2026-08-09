@@ -123,6 +123,8 @@ describe('CodexRunner', () => {
       contextTokens: 42,
       inputTokens: 12,
       outputTokens: 5,
+      // Codex reports thread-cumulative totals; the repository diffs them.
+      cumulative: true,
     });
     expect(result.finalTextResponse).toBe('done');
     expect(result.toolCalls?.length).toBe(1);
@@ -598,63 +600,41 @@ describe('CodexRunner token usage extraction', () => {
     return runPromise;
   }
 
-  // Regression: the caller accumulates whatever we return. A blind BFS
-  // first-match could latch onto the session-cumulative counter, re-adding the
-  // entire running total every turn. That grew one session to 3,441,018,986
-  // tokens and overflowed the int32 column on write.
-  it('prefers the per-turn delta over the session-cumulative counter', async () => {
+  // codex exec --json emits turn.completed.usage from ThreadTokenUsage.total,
+  // i.e. a running total for the thread. It must be flagged so the repository
+  // diffs rather than adds — adding it re-applied the whole history every turn
+  // and grew one session to 3,441,018,986 tokens, overflowing int32 on write.
+  it('flags Codex usage as cumulative', async () => {
     const result = await runWithEvents([
       {
         type: 'turn.completed',
-        // Cumulative listed first — a first-match BFS would take it.
-        total_token_usage: { input_tokens: 3_437_373_064, output_tokens: 3_645_922 },
-        last_token_usage: { input_tokens: 1200, output_tokens: 340 },
+        usage: { input_tokens: 1200, output_tokens: 340 },
       },
     ]);
 
-    expect(result.usage?.inputTokens).toBe(1200);
-    expect(result.usage?.outputTokens).toBe(340);
+    expect(result.usage?.cumulative).toBe(true);
   });
 
-  it('never returns a cumulative counter even when it is the only usage present', async () => {
-    const result = await runWithEvents([
-      {
-        type: 'turn.completed',
-        total_token_usage: { input_tokens: 3_437_373_064, output_tokens: 3_645_922 },
-      },
-    ]);
-
-    expect(result.usage).toBeUndefined();
-  });
-
-  // cached_input_tokens is a SUBSET of input_tokens; adding it counts the same
-  // tokens twice, and cache reads dominate on long sessions.
-  it('does not double-count cached_input_tokens', async () => {
-    const result = await runWithEvents([
-      {
-        type: 'turn.completed',
-        usage: { input_tokens: 1000, cached_input_tokens: 900, output_tokens: 50 },
-      },
-    ]);
-
-    expect(result.usage?.inputTokens).toBe(1000);
-  });
-
-  // cache_read/cache_creation are reported alongside input_tokens and do add.
-  it('adds cache read and cache creation tokens', async () => {
+  // Real 0.146.1 shape. cached_input_tokens and cache_write_input_tokens are
+  // both represented WITHIN input_tokens; reasoning_output_tokens within
+  // output_tokens. None may be added on top.
+  it('does not add cache or reasoning figures already inside the totals', async () => {
     const result = await runWithEvents([
       {
         type: 'turn.completed',
         usage: {
-          input_tokens: 100,
-          cache_read_input_tokens: 400,
-          cache_creation_input_tokens: 30,
-          output_tokens: 20,
+          input_tokens: 1000,
+          cached_input_tokens: 900,
+          cache_write_input_tokens: 64,
+          output_tokens: 50,
+          reasoning_output_tokens: 30,
+          total_tokens: 1050,
         },
       },
     ]);
 
-    expect(result.usage?.inputTokens).toBe(530);
+    expect(result.usage?.inputTokens).toBe(1000);
+    expect(result.usage?.outputTokens).toBe(50);
   });
 
   it('still reads flat top-level usage fields', async () => {
@@ -667,11 +647,28 @@ describe('CodexRunner token usage extraction', () => {
     expect(result.usage?.contextTokens).toBe(42);
   });
 
-  it('falls back to computed input when context_tokens is absent', async () => {
+  it('falls back to input tokens when context_tokens is absent', async () => {
     const result = await runWithEvents([
       { type: 'turn.completed', usage: { input_tokens: 70, output_tokens: 5 } },
     ]);
 
     expect(result.usage?.contextTokens).toBe(70);
+  });
+
+  // An untyped deep scan for any object carrying input_tokens/output_tokens
+  // can consume token stats that belong to something else entirely — e.g. a
+  // benchmark harness reporting its own numbers into the event stream.
+  it('ignores token-shaped objects outside the usage container', async () => {
+    const result = await runWithEvents([
+      {
+        type: 'item.completed',
+        item: {
+          type: 'mcp_tool_call',
+          result: { benchmark_stats: { input_tokens: 3_437_373_064, output_tokens: 3_645_922 } },
+        },
+      },
+    ]);
+
+    expect(result.usage).toBeUndefined();
   });
 });

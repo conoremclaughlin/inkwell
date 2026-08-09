@@ -829,11 +829,18 @@ export class SessionService implements ISessionService {
     }
 
     if (result.usage) {
-      await this.repository.updateTokenUsage(session.id, {
-        contextTokens: result.usage.contextTokens,
-        inputTokens: result.usage.inputTokens,
-        outputTokens: result.usage.outputTokens,
-      });
+      // Scope the cumulative checkpoint to the backend thread the counts came
+      // from — Codex totals restart whenever the thread does.
+      await this.repository.updateTokenUsage(
+        session.id,
+        {
+          contextTokens: result.usage.contextTokens,
+          inputTokens: result.usage.inputTokens,
+          outputTokens: result.usage.outputTokens,
+          cumulative: result.usage.cumulative,
+        },
+        { backendSessionId: result.backendSessionId ?? session.backendSessionId ?? null }
+      );
 
       // 6. Check if compaction is needed — only for claude-code backend where
       // PCP controls the context window (via sb chat). Native CLI backends

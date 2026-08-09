@@ -37,26 +37,22 @@ const DIAGNOSTIC_MAX_CHARS = 4000;
 const DIAGNOSTIC_MAX_LINES = 20;
 
 /**
- * Containers that carry usage for the CURRENT turn. Preferred, because the
- * caller accumulates whatever we return.
+ * Codex usage is CUMULATIVE for the backend thread, not a per-turn delta.
+ *
+ * `codex exec --json` emits `turn.completed.usage` from `ThreadTokenUsage.total`
+ * (verified against codex-cli 0.146.1). `ThreadTokenUsage` also carries a
+ * `last` field, but the exec JSONL adapter does not export it — so there is no
+ * per-turn figure available on this path and the consumer must diff
+ * successive totals itself. See SessionRepository.updateTokenUsage.
  */
-const CODEX_PER_TURN_USAGE_KEYS = ['last_token_usage', 'last_usage', 'usage'] as const;
-
-/**
- * Containers that carry a SESSION-CUMULATIVE running total. These must never
- * be returned or descended into — accumulating a running total re-adds the
- * whole history every turn.
- */
-const CODEX_CUMULATIVE_USAGE_KEYS: readonly string[] = [
-  'total_token_usage',
-  'total_usage',
-  'cumulative_token_usage',
-];
+const CODEX_USAGE_IS_CUMULATIVE = true;
 
 interface CodexUsageStats {
   contextTokens: number;
   inputTokens: number;
   outputTokens: number;
+  /** Always true for Codex — see CODEX_USAGE_IS_CUMULATIVE. */
+  cumulative: boolean;
 }
 
 export class CodexRunner implements IRunner {
@@ -545,12 +541,16 @@ export class CodexRunner implements IRunner {
   /**
    * Parse a single object into usage stats, or undefined if it isn't one.
    *
-   * Cache accounting is asymmetric across backends and must not be summed
-   * blindly: `cache_read_input_tokens` / `cache_creation_input_tokens` are
-   * reported ALONGSIDE `input_tokens` and genuinely add, whereas
-   * `cached_input_tokens` is a SUBSET of `input_tokens` — adding it counts the
-   * same tokens twice. On a long session that re-sends context every turn,
-   * cache reads dominate, so that double-count compounds fast.
+   * Codex's TokenUsage struct is
+   * `{ input_tokens, cached_input_tokens, cache_write_input_tokens,
+   *    output_tokens, reasoning_output_tokens, total_tokens }`
+   * (codex-cli 0.146.1). Both cache figures are already REPRESENTED WITHIN
+   * `input_tokens`, and `reasoning_output_tokens` within `output_tokens`, so
+   * none of them may be added on top — doing so double-counts, and on a long
+   * session that re-sends context every turn the cache figures dominate.
+   *
+   * The Anthropic-style `cache_read_input_tokens` /
+   * `cache_creation_input_tokens` fields do not exist on this path at all.
    */
   private parseUsageObject(obj: Record<string, unknown>): CodexUsageStats | undefined {
     const maybeInput = obj.input_tokens;
@@ -559,80 +559,38 @@ export class CodexRunner implements IRunner {
       return undefined;
     }
 
-    const cacheRead =
-      typeof obj.cache_read_input_tokens === 'number' ? obj.cache_read_input_tokens : 0;
-    const cacheCreate =
-      typeof obj.cache_creation_input_tokens === 'number' ? obj.cache_creation_input_tokens : 0;
-    const totalInput = maybeInput + cacheRead + cacheCreate;
-
     const maybeContext = obj.context_tokens;
     return {
-      contextTokens: typeof maybeContext === 'number' ? maybeContext : totalInput,
-      inputTokens: totalInput,
+      contextTokens: typeof maybeContext === 'number' ? maybeContext : maybeInput,
+      inputTokens: maybeInput,
       outputTokens: maybeOutput,
+      cumulative: CODEX_USAGE_IS_CUMULATIVE,
     };
   }
 
   /**
-   * Extract PER-TURN usage from a Codex event.
+   * Extract usage from a Codex event.
    *
-   * The caller accumulates whatever this returns
-   * (`SessionRepository.updateTokenUsage`), so returning a session-cumulative
-   * counter re-adds the whole running total every turn and grows the stored
-   * count quadratically. A previous blind breadth-first "first object with
-   * input_tokens and output_tokens" match did exactly that, producing a
-   * 3.4-billion-token session that overflowed int32 on write.
+   * The returned figures are CUMULATIVE for the backend thread — see
+   * CODEX_USAGE_IS_CUMULATIVE. `SessionRepository.updateTokenUsage` diffs them
+   * against its per-thread checkpoint; it must never simply add them, which is
+   * what grew one session to 3,441,018,986 tokens and overflowed int32.
    *
-   * So: prefer an explicitly per-turn container, and never descend into a
-   * known cumulative one.
+   * Matching is restricted to a known usage container rather than a blind
+   * breadth-first scan for any object carrying `input_tokens`/`output_tokens`:
+   * an untyped deep scan can just as easily consume token stats belonging to
+   * something else entirely in the event stream.
    */
   private extractUsage(event: Record<string, unknown>): CodexUsageStats | undefined {
-    // Explicit per-turn container wins over any positional match.
-    const perTurn = this.findUsage(event, CODEX_PER_TURN_USAGE_KEYS);
-    if (perTurn) return perTurn;
-
-    // Fall back to positional discovery, still refusing cumulative containers.
-    return this.findUsage(event, null);
-  }
-
-  /**
-   * Breadth-first search for a usage object, skipping cumulative containers.
-   *
-   * When `preferredKeys` is set, only values under those keys are considered;
-   * when null, any object shaped like usage matches.
-   */
-  private findUsage(
-    event: Record<string, unknown>,
-    preferredKeys: readonly string[] | null
-  ): CodexUsageStats | undefined {
-    const queue: unknown[] = [event];
-
-    while (queue.length > 0) {
-      const current = queue.shift();
-      if (!current || typeof current !== 'object') continue;
-      const obj = current as Record<string, unknown>;
-
-      if (preferredKeys) {
-        for (const key of preferredKeys) {
-          const candidate = obj[key];
-          if (candidate && typeof candidate === 'object') {
-            const parsed = this.parseUsageObject(candidate as Record<string, unknown>);
-            if (parsed) return parsed;
-          }
-        }
-      } else {
-        const parsed = this.parseUsageObject(obj);
-        if (parsed) return parsed;
-      }
-
-      for (const [key, value] of Object.entries(obj)) {
-        // Never accumulate a running total, at any depth.
-        if (CODEX_CUMULATIVE_USAGE_KEYS.includes(key)) continue;
-        if (value && typeof value === 'object') queue.push(value);
-      }
+    // Canonical shape: { type: 'turn.completed', usage: { ... } }
+    const container = event.usage;
+    if (container && typeof container === 'object') {
+      const parsed = this.parseUsageObject(container as Record<string, unknown>);
+      if (parsed) return parsed;
     }
 
-    return undefined;
+    // Legacy/flat shape: usage fields on the event itself.
+    return this.parseUsageObject(event);
   }
 
   private extractFinalText(event: Record<string, unknown>): string | undefined {

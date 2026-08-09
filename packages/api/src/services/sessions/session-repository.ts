@@ -13,6 +13,7 @@ import type {
   SessionStatus,
   SessionType,
   ISessionRepository,
+  UsageCheckpoint,
 } from './types.js';
 import { logger } from '../../utils/logger.js';
 
@@ -60,6 +61,7 @@ function mapDbToSession(row: DbSession): Session {
     contextTokens: (metadata.contextTokens as number) || 0,
     totalInputTokens: (metadata.totalInputTokens as number) || 0,
     totalOutputTokens: (metadata.totalOutputTokens as number) || 0,
+    usageCheckpoint: (metadata.usageCheckpoint as UsageCheckpoint | undefined) || undefined,
 
     // Aggregate counters (persisted as columns)
     messageCount: row.message_count || 0,
@@ -403,6 +405,9 @@ export class SessionRepository implements ISessionRepository {
     if (updates.totalOutputTokens !== undefined) {
       newMetadata.totalOutputTokens = updates.totalOutputTokens;
     }
+    if (updates.usageCheckpoint !== undefined) {
+      newMetadata.usageCheckpoint = updates.usageCheckpoint as unknown as Json;
+    }
     if (updates.lastCompactionAt !== undefined) {
       newMetadata.lastCompactionAt = updates.lastCompactionAt?.toISOString() || null;
     }
@@ -432,38 +437,94 @@ export class SessionRepository implements ISessionRepository {
 
   async updateTokenUsage(
     id: string,
-    usage: { contextTokens: number; inputTokens: number; outputTokens: number }
+    usage: {
+      contextTokens: number;
+      inputTokens: number;
+      outputTokens: number;
+      cumulative?: boolean;
+    },
+    options?: { backendSessionId?: string | null }
   ): Promise<void> {
     const current = await this.findById(id);
     if (!current) {
       throw new Error(`Session not found: ${id}`);
     }
 
-    // Guard against accumulating a cumulative counter. A runner that reports a
-    // session-wide running total instead of a per-turn delta would re-add the
-    // entire history every turn, growing the stored count quadratically until
-    // it silently corrupts every downstream cost/context metric. Refuse the
-    // write and say so, rather than persisting a number we know is wrong.
-    const turnTotal = usage.inputTokens + usage.outputTokens;
+    // Resolve this turn's delta. Backends differ: Claude/Gemini report a
+    // per-turn figure, Codex `turn.completed.usage` carries
+    // `ThreadTokenUsage.total` — a running total for the backend thread.
+    // Adding a running total re-adds the whole history every turn, which is
+    // what grew one session to 3,441,018,986 tokens.
+    let deltaInput = usage.inputTokens;
+    let deltaOutput = usage.outputTokens;
+    let nextCheckpoint: UsageCheckpoint | undefined;
+
+    if (usage.cumulative) {
+      const backendSessionId = options?.backendSessionId ?? null;
+      const checkpoint = current.usageCheckpoint;
+
+      // Only diff against a checkpoint from the same backend thread. Totals
+      // restart whenever the thread does (fresh run, resume onto a new
+      // thread, compaction), so a checkpoint from another thread is garbage.
+      const sameThread = !!checkpoint && checkpoint.backendSessionId === backendSessionId;
+
+      // A counter that moved backwards means the thread restarted under the
+      // same id; treat the report itself as the delta.
+      const wentBackwards =
+        sameThread &&
+        (usage.inputTokens < checkpoint!.inputTokens ||
+          usage.outputTokens < checkpoint!.outputTokens);
+
+      if (sameThread && !wentBackwards) {
+        deltaInput = usage.inputTokens - checkpoint!.inputTokens;
+        deltaOutput = usage.outputTokens - checkpoint!.outputTokens;
+      } else {
+        deltaInput = usage.inputTokens;
+        deltaOutput = usage.outputTokens;
+        if (wentBackwards) {
+          logger.info('Backend usage counter reset — rebasing checkpoint', {
+            id,
+            backendSessionId,
+            previous: checkpoint,
+            reported: { input: usage.inputTokens, output: usage.outputTokens },
+          });
+        }
+      }
+
+      nextCheckpoint = {
+        backendSessionId,
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+      };
+    }
+
+    // Last-ditch heuristic, not a semantic proof: one agent turn can contain
+    // many sampling calls, so a large delta is not inherently wrong. This only
+    // catches the pathological case where a running total is still reaching us
+    // undiffed, so we keep the last good value instead of persisting garbage.
+    const turnTotal = deltaInput + deltaOutput;
     if (turnTotal > MAX_PLAUSIBLE_TURN_TOKENS) {
-      logger.error('Implausible single-turn token usage — refusing to accumulate', {
+      logger.error('Implausible single-turn token delta — refusing to accumulate', {
         id,
         usage,
+        deltaInput,
+        deltaOutput,
         turnTotal,
         ceiling: MAX_PLAUSIBLE_TURN_TOKENS,
-        hint: 'Runner likely reported a cumulative total instead of a per-turn delta',
+        hint: 'A cumulative total is likely reaching the repository undiffed',
       });
       return;
     }
 
-    const newInputTokens = current.totalInputTokens + usage.inputTokens;
-    const newOutputTokens = current.totalOutputTokens + usage.outputTokens;
+    const newInputTokens = current.totalInputTokens + deltaInput;
+    const newOutputTokens = current.totalOutputTokens + deltaOutput;
 
     await this.update(id, {
       contextTokens: usage.contextTokens,
       totalInputTokens: newInputTokens,
       totalOutputTokens: newOutputTokens,
       tokenCount: newInputTokens + newOutputTokens,
+      ...(nextCheckpoint ? { usageCheckpoint: nextCheckpoint } : {}),
     });
 
     logger.debug('Updated token usage', { id, usage });

@@ -48,6 +48,20 @@ export type SessionLifecycle = 'running' | 'idle' | 'completed' | 'failed';
 /** @deprecated Use SessionLifecycle */
 export type SessionStatus = 'active' | 'paused' | 'completed' | 'failed';
 
+/**
+ * Last cumulative usage seen from a backend that reports running thread
+ * totals (Codex `turn.completed.usage` carries `ThreadTokenUsage.total`).
+ *
+ * Scoped to `backendSessionId` because the totals reset whenever the backend
+ * thread changes — resume onto a new thread, compaction, or a fresh run. A
+ * checkpoint from a different thread must never be diffed against.
+ */
+export interface UsageCheckpoint {
+  backendSessionId: string | null;
+  inputTokens: number;
+  outputTokens: number;
+}
+
 export interface Session {
   id: string;
   userId: string;
@@ -74,6 +88,13 @@ export interface Session {
   contextTokens: number;
   totalInputTokens: number;
   totalOutputTokens: number;
+
+  /**
+   * Last cumulative usage observed from a backend that reports running
+   * thread totals rather than per-turn deltas (Codex). Used to diff
+   * successive reports; see SessionRepository.updateTokenUsage.
+   */
+  usageCheckpoint?: UsageCheckpoint;
 
   // Aggregate counters (persisted as columns)
   messageCount: number;
@@ -190,6 +211,12 @@ export interface SessionResult {
     outputTokens: number;
     cacheReadTokens?: number;
     cacheWriteTokens?: number;
+    /**
+     * True when the backend reports running thread totals instead of a
+     * per-turn delta (Codex `turn.completed.usage` is `ThreadTokenUsage.total`).
+     * The repository must diff against its checkpoint rather than add.
+     */
+    cumulative?: boolean;
   };
 
   // Session state after processing
@@ -383,7 +410,18 @@ export interface ISessionRepository {
 
   updateTokenUsage(
     id: string,
-    usage: { contextTokens: number; inputTokens: number; outputTokens: number }
+    usage: {
+      contextTokens: number;
+      inputTokens: number;
+      outputTokens: number;
+      /**
+       * True when the counts are running totals for `backendSessionId`
+       * rather than this turn's delta. The repository diffs them against
+       * its stored checkpoint before accumulating.
+       */
+      cumulative?: boolean;
+    },
+    options?: { backendSessionId?: string | null }
   ): Promise<void>;
 
   markCompacted(id: string, newBackendSessionId: string | null): Promise<void>;
