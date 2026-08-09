@@ -15,9 +15,9 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { NOT_SIGNED_IN_MESSAGE } from '../lib/user-config.js';
+import { CLI_ENTRYPOINT } from '../lib/cli-entrypoint.js';
 
 const execFileAsync = promisify(execFile);
-const CLI_PATH = 'packages/cli/src/cli.ts';
 
 let emptyHome: string;
 
@@ -37,9 +37,8 @@ afterAll(() => {
  */
 async function runSignedOut(args: string[]): Promise<{ output: string; exitCode: number }> {
   try {
-    const { stdout, stderr } = await execFileAsync('npx', ['tsx', CLI_PATH, ...args], {
+    const { stdout, stderr } = await execFileAsync('npx', ['tsx', CLI_ENTRYPOINT, ...args], {
       timeout: 30000,
-      cwd: process.cwd(),
       env: { ...process.env, HOME: emptyHome, AGENT_ID: 'wren' },
     });
     return { output: stdout + stderr, exitCode: 0 };
