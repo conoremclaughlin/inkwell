@@ -763,8 +763,19 @@ describe('SessionEventBus observer channel — M4.5', () => {
     await expect(bus.subscribeObserver('s1', sink, { afterEid: 0 })).rejects.toThrow(
       /retry shortly/
     );
-    expect(sink.endedWith).toBe('replay_failed');
+    // Typed RETRYABLE reason — clients reconnect instead of giving up.
+    expect(sink.endedWith).toBe('locator_pending');
     expect(sink.received).toEqual([]);
+  });
+
+  it('pathWaiters hygiene: timed-out holds do not accumulate settled closures', async () => {
+    bus.setLocatorStore(attemptedStore());
+    await bus.subscribeObserver('s1', new TestSink(), { afterEid: 0 }).catch(() => undefined);
+    await bus.subscribeObserver('s1', new TestSink(), { afterEid: 0 }).catch(() => undefined);
+    const ch = (
+      bus as unknown as { obsChannels: Map<string, { pathWaiters?: unknown[] }> }
+    ).obsChannels.get('s1');
+    expect(ch?.pathWaiters ?? []).toEqual([]);
   });
 
   it('ATTEMPTED TURN: abort during the session_meta hold releases immediately', async () => {

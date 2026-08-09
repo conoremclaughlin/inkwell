@@ -79,6 +79,8 @@ export type ObserverSinkEndReason =
   | 'session_released'
   | 'unsubscribed'
   | 'replay_failed'
+  /** Turn starting, ledger not yet announced — RETRYABLE: reconnect shortly. */
+  | 'locator_pending'
   | 'sink_error';
 
 /**
@@ -413,6 +415,14 @@ export class SessionEventBus extends EventEmitter {
         settled = true;
         clearTimeout(timer);
         signal?.removeEventListener('abort', finish);
+        // Self-remove so repeated timeouts on a never-recovering session
+        // don't accumulate settled closures (Lumen follow-up, PR #455).
+        const waiters = ch.pathWaiters;
+        if (waiters) {
+          const idx = waiters.indexOf(finish);
+          if (idx >= 0) waiters.splice(idx, 1);
+          if (waiters.length === 0) ch.pathWaiters = undefined;
+        }
         resolve();
       };
       const timer = setTimeout(finish, this.locatorWaitMs);
@@ -578,6 +588,9 @@ export class SessionEventBus extends EventEmitter {
           // history (Lumen M4.4 re-review).
           await this.waitForLedgerPath(ch, options.signal);
           if (!ch.ledgerPath) {
+            // Typed retryable end: clients reconnect in follow mode instead
+            // of treating this as terminal (Lumen follow-up, PR #455).
+            this.disconnectObserver(ch, sub, 'locator_pending');
             throw new Error(
               'Session has an in-flight or unresolved turn and no ledger locator yet — retry shortly'
             );

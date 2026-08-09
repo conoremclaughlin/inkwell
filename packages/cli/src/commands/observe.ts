@@ -238,6 +238,10 @@ export function registerObserveCommand(program: Command): void {
                   console.log(
                     chalk.yellow('⚠ fell behind — reconnecting from last processed entry')
                   );
+                } else if (reason === 'locator_pending') {
+                  // Turn starting, ledger not yet announced — retryable by
+                  // contract: reconnect in follow mode.
+                  console.log(chalk.dim('session starting — waiting for its ledger…'));
                 } else {
                   console.log(chalk.dim(`stream ended (${reason})`));
                   return;
