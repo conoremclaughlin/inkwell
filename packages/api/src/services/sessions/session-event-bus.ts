@@ -198,16 +198,23 @@ export function projectObserverEntry(entry: ObserverEntry): ObserverEntry | null
 }
 
 /**
- * What the durable locator store knows about a session. `hasHistory` is the
+ * What the durable locator store knows about a session. `activity` is the
  * authoritative evidence the replay decision needs when the locator is
- * absent: whether the sessions row shows the session has EVER run (backend
- * session seeded, tokens or messages recorded). An in-memory `highWater === 0`
- * alone proves nothing — it is also 0 after eviction/restart (Lumen M4.3
- * re-review).
+ * absent — in-memory `highWater === 0` proves nothing (also 0 after
+ * eviction/restart), and completed-turn markers alone are not enough either:
+ * the ledger gains entries at turn START, while backend_session_id and the
+ * counters are only written after the turn returns (Lumen M4.4 re-review).
+ *
+ * - 'completed' — the session has finished turns (backend session seeded,
+ *   tokens/messages recorded). Durable history certainly exists.
+ * - 'attempted' — a turn was started but never durably completed (lifecycle
+ *   running/failed, or ended without markers). The ledger MAY hold entries;
+ *   only the runtime's session_meta announcement can prove where.
+ * - 'none' — durably pristine idle session: no turn ever attempted.
  */
 export interface LedgerLocatorRecord {
   ledgerPath: string | null;
-  hasHistory: boolean;
+  activity: 'none' | 'attempted' | 'completed';
 }
 
 /**
@@ -260,6 +267,8 @@ interface ObserverChannel {
   lastEid: number;
   subscribers: Set<ObserverSubscriber>;
   evictTimer?: NodeJS.Timeout;
+  /** Subscribers waiting for the runtime's session_meta announcement. */
+  pathWaiters?: Array<() => void>;
 }
 
 const observerEntryBytes = (entry: ObserverEntry): number => JSON.stringify(entry).length;
@@ -386,6 +395,33 @@ export class SessionEventBus extends EventEmitter {
     this.locatorStore = store;
   }
 
+  /**
+   * How long an attach to a session with an in-flight/unresolved turn holds
+   * for the runtime's session_meta announcement before failing retryably.
+   * Instance field (not module const) so tests can shrink it.
+   */
+  locatorWaitMs = intFromEnv('SESSION_OBSERVE_LOCATOR_WAIT_MS', 5_000);
+
+  /** Resolve when the channel's ledger path is announced, the wait times out,
+   *  or the subscriber aborts — the caller re-checks ch.ledgerPath. */
+  private waitForLedgerPath(ch: ObserverChannel, signal?: AbortSignal): Promise<void> {
+    if (ch.ledgerPath || signal?.aborted) return Promise.resolve();
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', finish);
+        resolve();
+      };
+      const timer = setTimeout(finish, this.locatorWaitMs);
+      timer.unref?.();
+      signal?.addEventListener('abort', finish, { once: true });
+      (ch.pathWaiters ??= []).push(finish);
+    });
+  }
+
   private obsChannel(sessionId: string): ObserverChannel {
     let ch = this.obsChannels.get(sessionId);
     if (!ch) {
@@ -420,7 +456,12 @@ export class SessionEventBus extends EventEmitter {
       });
       return;
     }
-    this.obsChannel(sessionId).ledgerPath = ledgerPath;
+    const channel = this.obsChannel(sessionId);
+    channel.ledgerPath = ledgerPath;
+    // Wake any subscriber holding for the session_meta announcement.
+    const waiters = channel.pathWaiters;
+    channel.pathWaiters = undefined;
+    if (waiters) for (const w of waiters) w();
     // Durably persist so replay survives bus eviction and process restarts.
     // One retry, then an ERROR-level log: a lost locator silently downgrades
     // durable replay to live-only for this session, so the failure must be
@@ -524,9 +565,26 @@ export class SessionEventBus extends EventEmitter {
         const record = await this.locatorStore.load(sessionId);
         if (record.ledgerPath) {
           ch.ledgerPath = record.ledgerPath;
-        } else {
-          durableHistoryWithoutLocator = record.hasHistory;
+        } else if (record.activity === 'completed') {
+          // Durable history certainly exists but the locator is lost — an
+          // empty replay would silently omit it. Loud, immediate failure.
+          durableHistoryWithoutLocator = true;
+        } else if (record.activity === 'attempted') {
+          // A turn was started but never durably completed — the normal
+          // first-turn attach race (session_meta imminent), OR a crashed
+          // first turn whose ledger already holds entries. Only the
+          // runtime's announcement can tell: hold briefly for it; if it
+          // doesn't arrive, fail retryably rather than claim vacuous
+          // history (Lumen M4.4 re-review).
+          await this.waitForLedgerPath(ch, options.signal);
+          if (!ch.ledgerPath) {
+            throw new Error(
+              'Session has an in-flight or unresolved turn and no ledger locator yet — retry shortly'
+            );
+          }
         }
+        // activity === 'none': durably pristine idle session — an empty
+        // replay is authoritatively correct; follow live.
       }
 
       await this.replayObserver(

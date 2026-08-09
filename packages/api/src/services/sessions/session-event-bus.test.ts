@@ -528,7 +528,7 @@ describe('SessionEventBus observer channel — M4.2', () => {
       persist: async () => undefined,
       load: async (sessionId) => ({
         ledgerPath: sessionId === 's1' ? path : null,
-        hasHistory: sessionId === 's1',
+        activity: sessionId === 's1' ? ('completed' as const) : ('none' as const),
       }),
     };
     bus.setLocatorStore(store);
@@ -658,13 +658,13 @@ describe('SessionEventBus observer channel — M4.3', () => {
   });
 
   it('LOST LOCATOR: a session with durable history but no locator fails loudly, never vacuously', async () => {
-    // The sessions row proves prior activity (hasHistory) but the locator
+    // The sessions row proves COMPLETED activity but the locator
     // column is null (a past persist was lost). highWater===0 on this fresh
     // bus is NOT evidence of a first turn — claiming a vacuous replay would
     // silently omit the session's entire history.
     bus.setLocatorStore({
       persist: async () => undefined,
-      load: async () => ({ ledgerPath: null, hasHistory: true }),
+      load: async () => ({ ledgerPath: null, activity: 'completed' as const }),
     });
     const sink = new TestSink();
     await expect(bus.subscribeObserver('s1', sink, { afterEid: 0 })).rejects.toThrow(
@@ -676,7 +676,7 @@ describe('SessionEventBus observer channel — M4.3', () => {
   it('FIRST-TURN with store: no locator AND no durable history follows live (vacuous replay)', async () => {
     bus.setLocatorStore({
       persist: async () => undefined,
-      load: async () => ({ ledgerPath: null, hasHistory: false }),
+      load: async () => ({ ledgerPath: null, activity: 'none' as const }),
     });
     const sink = new TestSink();
     await bus.subscribeObserver('s1', sink, { afterEid: 0 });
@@ -694,7 +694,7 @@ describe('SessionEventBus observer channel — M4.3', () => {
         calls.push(ledgerPath);
         if (failures-- > 0) throw new Error('transient db error');
       },
-      load: async () => ({ ledgerPath: null, hasHistory: false }),
+      load: async () => ({ ledgerPath: null, activity: 'none' as const }),
     };
     bus.setLocatorStore(store);
     const path = writeLedger43([obsEntry(1)]);
@@ -703,5 +703,79 @@ describe('SessionEventBus observer channel — M4.3', () => {
     await new Promise((r) => setImmediate(r));
 
     expect(calls).toEqual([path, path]); // first attempt + one retry
+  });
+});
+
+/**
+ * M4.5 (Lumen M4.4 re-review): completed-turn markers are not authoritative
+ * DURING a turn — an attempted-but-unresolved turn must hold for session_meta
+ * or fail retryably, never claim vacuous history.
+ */
+describe('SessionEventBus observer channel — M4.5', () => {
+  let bus: InstanceType<typeof _BusForType>;
+  let dir: string;
+
+  beforeEach(() => {
+    bus = new _BusForType();
+    bus.locatorWaitMs = 150; // shrink the session_meta hold for tests
+    dir = mkdtempSync(join(tmpdir(), 'obs-m45-'));
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  function writeLedger45(entries: Record<string, unknown>[]): string {
+    const replDir = join(dir, '.ink', 'runtime', 'repl');
+    mkdirSync(replDir, { recursive: true });
+    const path = join(replDir, 'sess-1-123.jsonl');
+    writeFileSync(path, entries.map((e) => JSON.stringify(e)).join('\n') + '\n');
+    return path;
+  }
+
+  const attemptedStore = () => ({
+    persist: async () => undefined,
+    load: async () => ({ ledgerPath: null, activity: 'attempted' as const }),
+  });
+
+  it('ATTEMPTED TURN: attach holds for session_meta and then serves the full ledger', async () => {
+    // First turn in flight: lifecycle=running, no completed markers, locator
+    // not yet persisted — but the ledger already holds the turn's entries.
+    const path = writeLedger45([obsEntry(1, 'user', { content: 'hi' }), obsEntry(2)]);
+    bus.setLocatorStore(attemptedStore());
+
+    const sink = new TestSink();
+    const subscribing = bus.subscribeObserver('s1', sink, { afterEid: 0 });
+    // The runtime's announcement lands while the subscriber is holding.
+    setTimeout(() => bus.registerLedgerPath('s1', path), 30);
+    await subscribing;
+
+    expect(sink.received.map((e) => e.eid)).toEqual([1, 2]);
+    expect(sink.endedWith).toBeNull();
+  });
+
+  it('ATTEMPTED TURN: no announcement within the hold fails retryably — never an empty success', async () => {
+    // Crashed first turn + lost locator: durable ledger entries may exist,
+    // and nothing will announce them. The client must learn its view would
+    // be incomplete instead of silently following from now on.
+    bus.setLocatorStore(attemptedStore());
+    const sink = new TestSink();
+    await expect(bus.subscribeObserver('s1', sink, { afterEid: 0 })).rejects.toThrow(
+      /retry shortly/
+    );
+    expect(sink.endedWith).toBe('replay_failed');
+    expect(sink.received).toEqual([]);
+  });
+
+  it('ATTEMPTED TURN: abort during the session_meta hold releases immediately', async () => {
+    bus.locatorWaitMs = 5_000; // long hold — abort must cut through it
+    bus.setLocatorStore(attemptedStore());
+    const ac = new AbortController();
+    const sink = new TestSink();
+    const started = Date.now();
+    const subscribing = bus.subscribeObserver('s1', sink, { afterEid: 0, signal: ac.signal });
+    setTimeout(() => ac.abort(), 20);
+    await expect(subscribing).rejects.toThrow();
+    expect(Date.now() - started).toBeLessThan(2_000);
   });
 });

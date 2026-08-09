@@ -855,25 +855,37 @@ export class MCPServer {
           throw new Error(`locator persist failed: ${error.message}`);
         }
       },
-      // hasHistory: authoritative evidence the session has ever run a turn
-      // (provider session seeded, tokens or messages recorded) — the bus
-      // refuses to claim a vacuous first-turn replay for a session with
-      // history whose locator was lost (Lumen M4.3 re-review).
+      // activity: authoritative evidence for the vacuous-replay decision —
+      // 'completed' (markers prove durable history), 'attempted' (turn
+      // started, ledger may hold entries), 'none' (durably pristine idle).
       load: async (sessionId) => {
         const { data: row, error } = await locatorClient
           .from('sessions')
-          .select('observer_ledger_path, backend_session_id, token_count, message_count')
+          .select(
+            'observer_ledger_path, backend_session_id, token_count, message_count, lifecycle, ended_at'
+          )
           .eq('id', sessionId)
           .maybeSingle();
         if (error) {
           throw new Error(`locator load failed: ${error.message}`);
         }
+        // Completed markers are written only AFTER a turn returns; the ledger
+        // gains entries at turn START. A started-but-never-completed turn
+        // (lifecycle running/failed, or ended without markers) is therefore
+        // 'attempted' — never proof of a pristine session (Lumen M4.4).
+        const completed = Boolean(
+          row &&
+          (row.backend_session_id || (row.token_count ?? 0) > 0 || (row.message_count ?? 0) > 0)
+        );
+        const pristine =
+          !row || ((row.lifecycle === null || row.lifecycle === 'idle') && !row.ended_at);
         return {
           ledgerPath: row?.observer_ledger_path ?? null,
-          hasHistory: Boolean(
-            row &&
-            (row.backend_session_id || (row.token_count ?? 0) > 0 || (row.message_count ?? 0) > 0)
-          ),
+          activity: completed
+            ? ('completed' as const)
+            : pristine
+              ? ('none' as const)
+              : ('attempted' as const),
         };
       },
     });
