@@ -395,7 +395,10 @@ describe('buildMergedMcpConfig omitToolServers (wholly-in-ink)', () => {
           supabase: { type: 'http', url: 'http://127.0.0.1:54321/mcp' },
           github: { type: 'http', url: 'https://api.github.com/mcp' },
           playwright: { type: 'stdio', command: 'npx', args: ['@playwright/mcp'] },
-          inkmail: { command: 'npx', args: ['tsx', '/path/to/channel-plugin/index.ts'] },
+          inkmail: {
+            command: 'npx',
+            args: ['tsx', '/repo/root/packages/channel-plugin/index.ts'],
+          },
         },
       })
     );
@@ -409,7 +412,7 @@ describe('buildMergedMcpConfig omitToolServers (wholly-in-ink)', () => {
       // The channel bridge passes through untouched (no header decoration).
       expect(config.mcpServers.inkmail).toEqual({
         command: 'npx',
-        args: ['tsx', '/path/to/channel-plugin/index.ts'],
+        args: ['tsx', '/repo/root/packages/channel-plugin/index.ts'],
       });
     } finally {
       cleanup();
@@ -470,12 +473,67 @@ mcp:
       })
     );
 
-    const { mcpConfigPath, cleanup } = buildMergedMcpConfig(tmpDir, { omitToolServers: true });
+    const { mcpConfigPath, hasChannelBridge, cleanup } = buildMergedMcpConfig(tmpDir, {
+      omitToolServers: true,
+    });
     try {
       const config = JSON.parse(readFileSync(mcpConfigPath!, 'utf-8'));
       expect(config.mcpServers).toEqual({});
+      expect(hasChannelBridge).toBe(false);
     } finally {
       cleanup();
+    }
+  });
+
+  it('rejects a lookalike path — substring matching is not canonical', () => {
+    // Lumen's adversarial repro: `node /tmp/channel-plugin-evil.js` contains
+    // the substring "channel-plugin" but is NOT the plugin entrypoint. The
+    // invocation must end segment-exactly on packages/channel-plugin/index.ts.
+    writeFileSync(
+      join(tmpDir, '.mcp.json'),
+      JSON.stringify({
+        mcpServers: {
+          inkmail: { type: 'stdio', command: 'node', args: ['/tmp/channel-plugin-evil.js'] },
+        },
+      })
+    );
+
+    const { mcpConfigPath, hasChannelBridge, cleanup } = buildMergedMcpConfig(tmpDir, {
+      omitToolServers: true,
+    });
+    try {
+      const config = JSON.parse(readFileSync(mcpConfigPath!, 'utf-8'));
+      expect(config.mcpServers).toEqual({});
+      expect(hasChannelBridge).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('reports the retained channel bridge via hasChannelBridge', () => {
+    writeFileSync(
+      join(tmpDir, '.mcp.json'),
+      JSON.stringify({
+        mcpServers: {
+          inkwell: { type: 'http', url: 'http://localhost:3001/mcp' },
+          inkmail: { command: 'npx', args: ['tsx', 'packages/channel-plugin/index.ts'] },
+        },
+      })
+    );
+
+    const withheld = buildMergedMcpConfig(tmpDir, { omitToolServers: true });
+    try {
+      expect(withheld.hasChannelBridge).toBe(true);
+    } finally {
+      withheld.cleanup();
+    }
+
+    // Non-withholding path: keyed off the project config's own entry.
+    const passthrough = buildMergedMcpConfig(tmpDir);
+    try {
+      expect(passthrough.hasChannelBridge).toBe(true);
+    } finally {
+      passthrough.cleanup();
     }
   });
 

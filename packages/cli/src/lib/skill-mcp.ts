@@ -150,22 +150,36 @@ interface McpJsonConfig {
 const CHANNEL_SERVER_NAMES = new Set(['inkmail']);
 
 /**
- * A channel bridge must LOOK like the channel plugin, not merely be named
- * after it — a tool-bearing server that happens to claim the `inkmail` key
- * (an HTTP server, or a stdio command pointing anywhere else) would otherwise
- * ride the name allowlist straight through the withholding boundary. Verified
- * shape: stdio command whose invocation references the channel-plugin package.
+ * The channel plugin's canonical entrypoint, as a path suffix. The project
+ * config references it absolutely (root repo) or repo-relatively (worktrees);
+ * either way the invocation must END on exactly these segments.
+ */
+const CANONICAL_CHANNEL_SUFFIX = 'packages/channel-plugin/index.ts';
+
+/**
+ * A channel bridge must BE the channel plugin, not merely be named after it —
+ * a tool-bearing server that claims the `inkmail` key (an HTTP server, a
+ * stdio command pointing anywhere else, or a lookalike like
+ * `node /tmp/channel-plugin-evil.js`) would otherwise ride the name allowlist
+ * straight through the withholding boundary. Verified shape: stdio (or
+ * untyped, the project-config default), a command, no url, and an invocation
+ * argument that resolves segment-exactly to the canonical plugin entrypoint.
  * Fail closed — a non-canonical entry costs inbox push, never the boundary.
  */
 function isCanonicalChannelBridge(server: {
+  type?: string;
   command?: string;
   url?: string;
   args?: string[];
 }): boolean {
   if (!server?.command || server.url) return false;
-  return [server.command, ...(server.args ?? [])].some((part) =>
-    String(part).includes('channel-plugin')
-  );
+  if (server.type !== undefined && server.type !== 'stdio') return false;
+  return [server.command, ...(server.args ?? [])].some((part) => {
+    const normalized = String(part).replace(/\\/g, '/');
+    return (
+      normalized === CANONICAL_CHANNEL_SUFFIX || normalized.endsWith(`/${CANONICAL_CHANNEL_SUFFIX}`)
+    );
+  });
 }
 
 /**
@@ -192,6 +206,14 @@ export function buildMergedMcpConfig(
 ): {
   mcpConfigPath: string | null;
   cleanup: () => void;
+  /**
+   * Whether the FINAL config actually retains the inkmail channel bridge.
+   * The channel flag (`--dangerously-load-development-channels
+   * server:inkmail`) must key off this, never off the raw project file — a
+   * rejected non-canonical entry would otherwise still be requested by name
+   * against a strict config that no longer defines it.
+   */
+  hasChannelBridge: boolean;
 } {
   const projectMcpPath = join(cwd, '.mcp.json');
   const hasProjectConfig = existsSync(projectMcpPath);
@@ -227,6 +249,7 @@ export function buildMergedMcpConfig(
     writeFileSync(tmpPath, JSON.stringify(config, null, 2));
     return {
       mcpConfigPath: tmpPath,
+      hasChannelBridge: 'inkmail' in config.mcpServers,
       cleanup: () => {
         try {
           unlinkSync(tmpPath);
@@ -235,6 +258,19 @@ export function buildMergedMcpConfig(
         }
       },
     };
+  }
+
+  // Non-withholding path: the channel flag keys off the project config's own
+  // inkmail entry (any shape — the full config passes through unchanged, so
+  // whatever is defined there is what claude will see).
+  let hasChannelBridge = false;
+  if (hasProjectConfig) {
+    try {
+      const parsed = JSON.parse(readFileSync(projectMcpPath, 'utf-8')) as Partial<McpJsonConfig>;
+      hasChannelBridge = Boolean(parsed.mcpServers?.['inkmail']);
+    } catch {
+      hasChannelBridge = false;
+    }
   }
 
   // ── Layer 1: Session header injection (shared logic) ──
@@ -268,6 +304,7 @@ export function buildMergedMcpConfig(
   if (skillServers.length === 0) {
     return {
       mcpConfigPath: effectivePath,
+      hasChannelBridge,
       cleanup: () => cleanups.forEach((fn) => fn()),
     };
   }
@@ -299,6 +336,7 @@ export function buildMergedMcpConfig(
   if (!skillsModified) {
     return {
       mcpConfigPath: effectivePath,
+      hasChannelBridge,
       cleanup: () => cleanups.forEach((fn) => fn()),
     };
   }
@@ -314,6 +352,7 @@ export function buildMergedMcpConfig(
 
   return {
     mcpConfigPath: tmpPath,
+    hasChannelBridge,
     cleanup: () => {
       try {
         unlinkSync(tmpPath);

@@ -5198,7 +5198,16 @@ export async function runChat(options: ChatOptions): Promise<void> {
     if (!message) {
       throw new Error('--non-interactive requires --message "<text>"');
     }
-    const maxTurns = parseInt(options.maxTurns || '1', 10);
+    // maxTurns counts OUTER conversational turns (runUserTurn cycles: the
+    // delivered message plus continuation prompts) — not provider subprocess
+    // calls, of which a single turn's tool loop may spawn several. Validate
+    // strictly: this arrives from server spawn args, and a malformed value
+    // silently coerced to NaN/1 would defeat the configured cap.
+    const maxTurnsRaw = String(options.maxTurns ?? '1').trim();
+    const maxTurns = Number.parseInt(maxTurnsRaw, 10);
+    if (!/^\d+$/.test(maxTurnsRaw) || maxTurns < 1 || maxTurns > 25) {
+      throw new Error(`--max-turns must be an integer between 1 and 25 (got "${maxTurnsRaw}")`);
+    }
 
     // Turn 1: the delivered message. When --message-label is set (server
     // spawns pass the originating channel, e.g. "heartbeat"), render as a
@@ -5206,6 +5215,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
     const messageLabel = options.messageLabel?.trim();
     clearLastSignal();
     await enqueueTurn(message, messageLabel ? 'system' : 'user', messageLabel);
+    // Actual completed outer turns — reported instead of the configured cap,
+    // which lies whenever signal_status halts the loop early.
+    let turnsCompleted = 1;
 
     // Check for signal or failure after turn 1
     let exitReason: string | undefined;
@@ -5226,6 +5238,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           'system',
           'continuation'
         );
+        turnsCompleted += 1;
 
         const signal = getLastSignal();
         if (signal?.status === 'completed' || signal?.status === 'blocked') {
@@ -5269,7 +5282,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       type: 'session_pause',
       sessionId: runtime.sessionId || null,
       summary,
-      turnsCompleted: maxTurns,
+      turnsCompleted,
       signal: finalSignal || undefined,
     });
 
@@ -5294,6 +5307,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         sessionId: runtime.sessionId || null,
         phase,
         signal: finalSignal?.status || null,
+        turnsCompleted,
         reason: finalSignal?.reason || (isBackendFailure ? 'backend_failure' : null),
         usage: {
           contextTokens: reportedContextTokens,
@@ -5313,7 +5327,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     } else if (finalSignal?.status === 'completed') {
       console.log(chalk.green(`\nSession completed.`));
     } else {
-      console.log(chalk.dim(`\nSession paused (${maxTurns} turn(s) completed).`));
+      console.log(chalk.dim(`\nSession paused (${turnsCompleted} turn(s) completed).`));
     }
     if (!isBackendFailure) {
       console.log(chalk.cyan(`  Resume with: ink chat --attach-latest ${agentId}\n`));
@@ -6849,8 +6863,12 @@ export function registerChatCommand(program: Command): void {
       .option('-m, --model <model>', 'Model override for backend')
       .option(
         '--tool-routing <mode>',
-        'Tool routing mode: local (ink-tool blocks handled by ink) or backend (native backend tools)',
-        'local'
+        // No Commander default: a default here would make options.toolRouting
+        // always-set and mask the persisted .ink/identity.json preference in
+        // the runtime resolution below. Server spawns always pass the flag
+        // explicitly (ink-runner); interactive sessions fall through to
+        // persisted prefs, then 'local'.
+        'Tool routing mode: local (ink-tool blocks handled by ink) or backend (native backend tools)'
       )
       .option('--ui <mode>', 'UI mode: live (default) or scroll status rendering', 'live')
       .option('--thread-key <key>', 'Thread key for Inkwell session routing')

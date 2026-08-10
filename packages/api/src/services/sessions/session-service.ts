@@ -141,6 +141,28 @@ function routePatternSpecificity(pattern: string): number {
   return 1; // bare wildcard '*'
 }
 
+/**
+ * Parse an identity's dashboard runtime config (agent_identities.metadata
+ * .runtimeConfig) into the spawn-relevant fields. Fails CLOSED: absent or
+ * malformed input yields toolRouting 'local' (ink-owned, provider withheld)
+ * and no maxTurns override (the runner then applies its own default+clamp).
+ */
+export function parseRuntimeConfig(metadata: unknown): {
+  maxTurns?: number;
+  toolRouting: 'backend' | 'local';
+} {
+  const meta = (metadata ?? {}) as Record<string, unknown>;
+  const rc = (meta.runtimeConfig ?? {}) as Record<string, unknown>;
+  const out: { maxTurns?: number; toolRouting: 'backend' | 'local' } = { toolRouting: 'local' };
+  if (typeof rc.maxTurns === 'number' && Number.isFinite(rc.maxTurns)) {
+    out.maxTurns = rc.maxTurns;
+  }
+  if (rc.toolRouting === 'local' || rc.toolRouting === 'backend') {
+    out.toolRouting = rc.toolRouting;
+  }
+  return out;
+}
+
 export class SessionService implements ISessionService {
   private repository: ISessionRepository;
   private contextBuilder: IContextBuilder;
@@ -577,14 +599,9 @@ export class SessionService implements ISessionService {
             .maybeSingle()
         : { data: null };
       sandboxBypass = identity?.sandbox_bypass ?? false;
-      const identityMeta = (identity?.metadata ?? {}) as Record<string, unknown>;
-      const runtimeConfig = (identityMeta.runtimeConfig ?? {}) as Record<string, unknown>;
-      if (typeof runtimeConfig.maxTurns === 'number' && Number.isFinite(runtimeConfig.maxTurns)) {
-        runtimeMaxTurns = runtimeConfig.maxTurns;
-      }
-      if (runtimeConfig.toolRouting === 'local' || runtimeConfig.toolRouting === 'backend') {
-        runtimeToolRouting = runtimeConfig.toolRouting;
-      }
+      const parsed = parseRuntimeConfig(identity?.metadata);
+      runtimeMaxTurns = parsed.maxTurns;
+      runtimeToolRouting = parsed.toolRouting;
 
       // Studio-level override (null = inherit from SB)
       if (session.studioId) {

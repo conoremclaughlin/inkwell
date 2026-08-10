@@ -5,7 +5,7 @@
  * MCP config via --mcp-config <path>
  */
 
-import { existsSync, readFileSync } from 'fs';
+import { existsSync } from 'fs';
 import { execFileSync } from 'child_process';
 import { join } from 'path';
 import { homedir } from 'os';
@@ -16,11 +16,6 @@ import type { BackendAdapter, BackendConfig, PreparedBackend } from './types.js'
 import type { BackendStreamParser } from './stream.js';
 import { ClaudeStreamParser } from './claude-stream.js';
 
-/**
- * Check if the PCP channel plugin is registered in .mcp.json.
- * If present, Claude Code should be started with --dangerously-load-development-channels
- * so it accepts push notifications from the channel.
- */
 /**
  * Once-per-process probe for `--include-partial-messages` support. This runs
  * in the ink CLI process (never the API server), so a brief sync probe just
@@ -37,17 +32,6 @@ function supportsPartialMessages(): boolean {
     }
   }
   return partialMessagesSupport;
-}
-
-function hasPcpInboxPlugin(cwd: string): boolean {
-  const mcpJsonPath = join(cwd, '.mcp.json');
-  if (!existsSync(mcpJsonPath)) return false;
-  try {
-    const config = JSON.parse(readFileSync(mcpJsonPath, 'utf-8'));
-    return Boolean(config?.mcpServers?.['inkmail']);
-  } catch {
-    return false;
-  }
 }
 
 export class ClaudeAdapter implements BackendAdapter {
@@ -108,7 +92,11 @@ export class ClaudeAdapter implements BackendAdapter {
     // its own, and the withheld servers leak straight back in. (Same pattern
     // openclaw uses: `--strict-mcp-config --mcp-config <controlled>`.)
     const localRouting = config.toolRouting === 'local';
-    const { mcpConfigPath, cleanup: mcpCleanup } = buildMergedMcpConfig(process.cwd(), {
+    const {
+      mcpConfigPath,
+      hasChannelBridge,
+      cleanup: mcpCleanup,
+    } = buildMergedMcpConfig(process.cwd(), {
       pcpSessionId: config.pcpSessionId,
       studioId: config.studioId,
       omitToolServers: localRouting,
@@ -120,10 +108,16 @@ export class ClaudeAdapter implements BackendAdapter {
       args.push('--strict-mcp-config');
       // Built-in tools are part of the structural boundary too: strict MCP
       // only withholds servers, not native Bash/Edit/WebSearch/ToolSearch —
-      // all of which would bypass ink's tool policy entirely. Read alone
-      // stays available: it is the multimodal path for turn attachments
-      // (the --add-dir grants below exist exactly for it).
-      args.push('--tools', 'Read');
+      // all of which would bypass ink's tool policy entirely.
+      //
+      // NAMED EXCEPTION (not "wholly in ink" — pending Conor's explicit
+      // ratification, PR #462 review 4894464925): native Read is exposed
+      // ONLY for attachment-bearing sessions. It is the multimodal render
+      // path for --attach-file media (images cannot flow through ink-block
+      // tools); the --add-dir grants below exist exactly for it. Sessions
+      // without attachments get no built-in tools at all.
+      const hasAttachments = (config.attachmentDirs?.length ?? 0) > 0;
+      args.push('--tools', hasAttachments ? 'Read' : '');
     }
 
     // Auto-approve: skip all permission prompts
@@ -149,8 +143,11 @@ export class ClaudeAdapter implements BackendAdapter {
 
     // PCP channel plugin: enable real-time inbox push notifications.
     // The channel plugin is a stdio MCP server that bridges PCP's HTTP
-    // inbox to Claude Code's channel notification system.
-    if (hasPcpInboxPlugin(process.cwd())) {
+    // inbox to Claude Code's channel notification system. Keyed off the
+    // RETAINED entry in the final config — never the raw project file — so a
+    // rejected non-canonical `inkmail` is not requested by name against a
+    // strict config that no longer defines it.
+    if (hasChannelBridge) {
       args.push('--dangerously-load-development-channels', 'server:inkmail');
     }
 

@@ -226,8 +226,9 @@ function RuntimeSettingsPanel({ agentId, identity }: { agentId: string; identity
               className={inputClass}
             />
             <p className="mt-1 text-xs text-gray-400">
-              Continuation-loop cap for server-spawned sessions (default 5). The agent finishes
-              earlier by signalling completion.
+              Cap on conversational turns per server-spawned session — the delivered message plus
+              continuation prompts (default 5, max 25). The agent finishes earlier by signalling
+              completion.
             </p>
           </div>
 
@@ -319,7 +320,7 @@ function RuntimeSettingsPanel({ agentId, identity }: { agentId: string; identity
 ink chat --agent ${agentId}${backend ? ` --backend ${backend}` : ''}${toolProfile ? ` --profile ${toolProfile}` : ''}${toolRouting ? ` --tool-routing ${toolRouting}` : ''}${maxTurns ? ` --max-turns ${maxTurns}` : ''}
 
 # Heartbeat mode
-ink chat --agent ${agentId}${backend ? ` --backend ${backend}` : ''} --profile ${toolProfile || 'collaborative'} --max-turns ${maxTurns || '3'} --message "Heartbeat check"`}
+ink chat --agent ${agentId}${backend ? ` --backend ${backend}` : ''} --profile ${toolProfile || 'collaborative'} --max-turns ${maxTurns || '5'} --message "Heartbeat check"`}
           </pre>
         </CardContent>
       </Card>
