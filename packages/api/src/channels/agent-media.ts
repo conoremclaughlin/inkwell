@@ -18,16 +18,18 @@
  *    a size cap): validating a path now and consuming it at spawn time later
  *    would leave a replace-after-check window, and hard links would make the
  *    root a namespace rather than provenance boundary (Lumen, PR #465
- *    review 4900499698). Snapshots land under <root>/.trigger-snapshots so
- *    they stay inside the recipient's existing --add-dir grant; cleanup is
- *    the shared file-lifecycle TODO.
+ *    review 4900499698). Snapshots are content-addressed (sha256) under a
+ *    canonically-verified <root>/.trigger-snapshots — inside the
+ *    recipient's existing --add-dir grant — so repeated references reuse
+ *    one copy, and LRU retention caps total disk (review 4900565751).
  */
 
 import { homedir } from 'os';
-import { randomUUID } from 'crypto';
+import { createHash } from 'crypto';
 import { basename, join, sep } from 'path';
 import { constants as fsConstants } from 'fs';
-import { mkdir, open, realpath, writeFile } from 'fs/promises';
+import type { FileHandle } from 'fs/promises';
+import { mkdir, open, readdir, realpath, stat, unlink, utimes, writeFile } from 'fs/promises';
 import type { MediaAttachment } from '../services/sessions/types.js';
 import { logger } from '../utils/logger';
 
@@ -40,6 +42,9 @@ export const MAX_TRIGGER_MEDIA_FILE_BYTES = 25 * 1024 * 1024;
 /** Snapshot directory name under the shared media root. */
 export const TRIGGER_SNAPSHOT_DIR = '.trigger-snapshots';
 
+/** Retention cap: oldest snapshots beyond this are pruned (LRU by mtime). */
+export const MAX_TRIGGER_SNAPSHOTS = 64;
+
 const MEDIA_TYPES = new Set(['image', 'video', 'audio', 'document', 'voice']);
 
 export function defaultMediaRoot(): string {
@@ -50,6 +55,83 @@ export interface ResolveTriggerMediaOptions {
   mediaRoot?: string;
   /** Test hook — production always uses MAX_TRIGGER_MEDIA_FILE_BYTES. */
   maxFileBytes?: number;
+  /** Test hook — production always uses MAX_TRIGGER_SNAPSHOTS. */
+  maxSnapshots?: number;
+}
+
+/**
+ * Read at most maxBytes from the handle; null when the underlying inode
+ * holds MORE than maxBytes. The fstat size check is only a fast reject — a
+ * file appended to between fstat and read would otherwise make readFile()
+ * an unbounded read (Lumen, review 4900565751). This loop is the boundary:
+ * it never requests more than maxBytes + 1 total, regardless of file size.
+ */
+export async function readBoundedFromHandle(
+  handle: FileHandle,
+  maxBytes: number
+): Promise<Buffer | null> {
+  const buf = Buffer.allocUnsafe(maxBytes + 1);
+  let total = 0;
+  for (;;) {
+    const { bytesRead } = await handle.read(buf, total, maxBytes + 1 - total, total);
+    if (bytesRead === 0) return buf.subarray(0, total);
+    total += bytesRead;
+    if (total > maxBytes) return null;
+  }
+}
+
+/**
+ * Verify the snapshot destination is REALLY <root>/.trigger-snapshots — a
+ * pre-existing symlink at that name would otherwise route mkdir/writeFile
+ * outside the root while the returned lexical path still looked contained.
+ * Returns the canonical dir, or null (fail closed for the whole batch).
+ */
+async function ensureSnapshotDir(rootReal: string): Promise<string | null> {
+  const lexical = join(rootReal, TRIGGER_SNAPSHOT_DIR);
+  try {
+    await mkdir(lexical, { recursive: true });
+    const real = await realpath(lexical);
+    if (real !== lexical) {
+      logger.warn('[Trigger] snapshot dir is not canonical (symlink?) — media delivery refused', {
+        expected: lexical,
+        actual: real,
+      });
+      return null;
+    }
+    return real;
+  } catch (err) {
+    logger.warn('[Trigger] snapshot dir unavailable — media delivery refused', {
+      dir: lexical,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  }
+}
+
+/** LRU-prune the snapshot dir to the retention cap. Best-effort. */
+async function pruneSnapshots(dirReal: string, maxSnapshots: number): Promise<void> {
+  try {
+    const names = await readdir(dirReal);
+    if (names.length <= maxSnapshots) return;
+    const entries = await Promise.all(
+      names.map(async (name) => {
+        const p = join(dirReal, name);
+        try {
+          const st = await stat(p);
+          return st.isFile() ? { p, mtimeMs: st.mtimeMs } : null;
+        } catch {
+          return null;
+        }
+      })
+    );
+    const files = entries.filter((e): e is { p: string; mtimeMs: number } => e !== null);
+    files.sort((a, b) => a.mtimeMs - b.mtimeMs);
+    for (const f of files.slice(0, Math.max(0, files.length - maxSnapshots))) {
+      await unlink(f.p).catch(() => undefined);
+    }
+  } catch {
+    // Retention is best-effort; delivery already succeeded.
+  }
 }
 
 /**
@@ -81,6 +163,11 @@ export async function resolveTriggerMedia(
       cap: MAX_TRIGGER_MEDIA,
     });
   }
+
+  // One verified destination for the whole batch; a compromised snapshot
+  // dir refuses ALL delivery rather than best-effort partial writes.
+  const snapshotDir = await ensureSnapshotDir(rootReal);
+  if (!snapshotDir) return [];
 
   const out: MediaAttachment[] = [];
   let malformed = 0;
@@ -131,11 +218,32 @@ export async function resolveTriggerMedia(
           continue;
         }
 
-        const bytes = await handle.readFile();
-        const snapshotDir = join(rootReal, TRIGGER_SNAPSHOT_DIR);
-        await mkdir(snapshotDir, { recursive: true });
-        const snapshotPath = join(snapshotDir, `${randomUUID()}-${basename(real)}`);
-        await writeFile(snapshotPath, bytes, { flag: 'wx' });
+        const bytes = await readBoundedFromHandle(handle, maxFileBytes);
+        if (!bytes) {
+          logger.warn('[Trigger] media file exceeded cap during read — dropped', {
+            path: e.path,
+            cap: maxFileBytes,
+          });
+          continue;
+        }
+
+        // Content-addressed snapshot: re-sending the same bytes reuses the
+        // existing copy instead of growing the disk without bound. `wx` is
+        // race-safe (O_CREAT|O_EXCL also refuses a symlink at the final
+        // component); EEXIST means an identical snapshot is already there.
+        const digest = createHash('sha256').update(bytes).digest('hex').slice(0, 32);
+        const snapshotPath = join(snapshotDir, `${digest}-${basename(real)}`);
+        try {
+          await writeFile(snapshotPath, bytes, { flag: 'wx' });
+        } catch (writeErr) {
+          if ((writeErr as NodeJS.ErrnoException).code === 'EEXIST') {
+            // Reuse — refresh mtime so LRU retention keeps live snapshots.
+            const now = new Date();
+            await utimes(snapshotPath, now, now).catch(() => undefined);
+          } else {
+            throw writeErr;
+          }
+        }
 
         out.push({
           type:
@@ -155,6 +263,9 @@ export async function resolveTriggerMedia(
   }
   if (malformed > 0) {
     logger.warn('[Trigger] malformed media entries dropped', { count: malformed });
+  }
+  if (out.length > 0) {
+    await pruneSnapshots(snapshotDir, options.maxSnapshots ?? MAX_TRIGGER_SNAPSHOTS);
   }
   return out;
 }

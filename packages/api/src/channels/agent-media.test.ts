@@ -10,9 +10,11 @@ import {
 } from 'fs';
 import { join, sep } from 'path';
 import { tmpdir } from 'os';
+import { open, readdir } from 'fs/promises';
 import {
   resolveTriggerMedia,
   storedTriggerMedia,
+  readBoundedFromHandle,
   MAX_TRIGGER_MEDIA,
   TRIGGER_SNAPSHOT_DIR,
 } from './agent-media.js';
@@ -157,6 +159,74 @@ describe('resolveTriggerMedia (agent-to-agent attachment containment)', () => {
       { mediaRoot: join(root, 'does-not-exist') }
     );
     expect(out).toEqual([]);
+  });
+
+  it('refuses ALL delivery when the snapshot dir is a symlink out of the root', async () => {
+    // A pre-existing symlink at <root>/.trigger-snapshots would route
+    // mkdir/writeFile outside the root while the returned lexical path
+    // still looked contained (Lumen repro, review 4900565751).
+    const elsewhere = join(outside, 'evil-snapshots');
+    mkdirSync(elsewhere);
+    symlinkSync(elsewhere, join(root, TRIGGER_SNAPSHOT_DIR));
+    const p = png(root, 'ok.png');
+    const out = await resolveTriggerMedia({ media: [{ path: p }] }, { mediaRoot: root });
+    expect(out).toEqual([]);
+    // Nothing escaped through the symlink.
+    expect(await readdir(elsewhere)).toEqual([]);
+    expect(String(mockWarn.mock.calls.flat())).toContain('not canonical');
+  });
+
+  it('reuses content-addressed snapshots — repeated references do not grow storage', async () => {
+    const p = png(root, 'same.png', Buffer.from('identical-bytes'));
+    const first = await resolveTriggerMedia({ media: [{ path: p }] }, { mediaRoot: root });
+    const second = await resolveTriggerMedia({ media: [{ path: p }] }, { mediaRoot: root });
+    expect(first[0]!.path).toBe(second[0]!.path);
+    const snaps = await readdir(join(root, TRIGGER_SNAPSHOT_DIR));
+    expect(snaps).toHaveLength(1);
+  });
+
+  it('prunes oldest snapshots beyond the retention cap', async () => {
+    for (let i = 0; i < 5; i++) {
+      const p = png(root, `distinct-${i}.png`, Buffer.from(`content-${i}`));
+      await resolveTriggerMedia({ media: [{ path: p }] }, { mediaRoot: root, maxSnapshots: 3 });
+    }
+    const snaps = await readdir(join(root, TRIGGER_SNAPSHOT_DIR));
+    expect(snaps.length).toBeLessThanOrEqual(3);
+  });
+});
+
+describe('readBoundedFromHandle (the actual read boundary)', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'bounded-read-'));
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('returns full content at or under the cap, null beyond it', async () => {
+    // fstat's size check is only a fast reject — an inode that grows after
+    // fstat would make readFile() unbounded. This loop never requests more
+    // than cap + 1 bytes, whatever the file holds.
+    const p = join(dir, 'f.bin');
+    const content = Buffer.alloc(1000, 5);
+    writeFileSync(p, content);
+
+    const h1 = await open(p, 'r');
+    try {
+      expect((await readBoundedFromHandle(h1, 1000))!.equals(content)).toBe(true);
+    } finally {
+      await h1.close();
+    }
+
+    const h2 = await open(p, 'r');
+    try {
+      expect(await readBoundedFromHandle(h2, 999)).toBeNull();
+    } finally {
+      await h2.close();
+    }
   });
 });
 

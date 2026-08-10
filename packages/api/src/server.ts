@@ -977,19 +977,6 @@ ${payload.threadKey ? `Fetch the thread using get_thread_messages(threadKey: "${
 If you need to message a user, use send_response with the appropriate channel and conversationId.
 When you complete a task_request, mark it as completed using update_inbox_message(messageId, status: "completed").`;
 
-    // 3b. Media from the STORED message row (agent-to-agent attachments).
-    // storedTriggerMedia is the only entry point: it looks up the referenced
-    // row itself and snapshots each validated file — the trigger payload's
-    // own metadata is not an input. Flows to the spawn as --attach-file and
-    // from there through provider media injection.
-    const triggerMedia = await storedTriggerMedia(dataComposer!.getClient() as never, payload);
-    if (triggerMedia.length > 0) {
-      logger.info('[Trigger] delivering media attachments', {
-        count: triggerMedia.length,
-        to: targetAgentId,
-      });
-    }
-
     // 4. Process via SessionService (stateless - looks up session from DB)
     const request: SessionRequest = {
       userId,
@@ -1003,7 +990,6 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       metadata: {
         triggerType: 'agent',
         chatType: 'direct',
-        ...(triggerMedia.length > 0 ? { media: triggerMedia } : {}),
         threadKey: payload.threadKey,
         studioId: payload.studioId,
         studioHint: payload.studioHint,
@@ -1153,6 +1139,22 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       // If session resolution fails, fall through to normal handleMessage
       logger.debug('[Trigger] CLI-attached check failed, falling through to spawn', {
         error: err instanceof Error ? err.message : String(err),
+      });
+    }
+
+    // Media resolves ONLY on the spawn path — CLI-attached deliveries (early
+    // return above) are text-only via the channel plugin, so snapshotting for
+    // them would guarantee orphaned copies (Lumen, review 4900565751).
+    // storedTriggerMedia is the single entry point: it looks up the stored
+    // row itself and snapshots each validated file; the trigger payload's
+    // own metadata is not an input. Flows to the spawn as --attach-file and
+    // from there through provider media injection.
+    const triggerMedia = await storedTriggerMedia(dataComposer!.getClient() as never, payload);
+    if (triggerMedia.length > 0) {
+      request.metadata!.media = triggerMedia;
+      logger.info('[Trigger] delivering media attachments', {
+        count: triggerMedia.length,
+        to: targetAgentId,
       });
     }
 
