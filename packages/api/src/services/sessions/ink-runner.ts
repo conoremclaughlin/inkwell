@@ -189,12 +189,12 @@ export class InkRunner implements IRunner {
     // loop halts earlier when the model signals completion via signal_status.
     args.push('--max-turns', String(clampMaxTurns(config.maxTurns)));
 
-    // Dashboard-configured tool routing. When set, this overrides the chat
-    // loop's own resolution (.ink/identity.json → default 'local'), making
-    // the SB's settings page authoritative for server spawns.
-    if (config.toolRouting) {
-      args.push('--tool-routing', config.toolRouting);
-    }
+    // Tool routing is ALWAYS explicit for server spawns — the headless
+    // boundary must not depend on worktree .ink/identity.json preferences or
+    // the chat loop's own defaults. session-service resolves the SB's
+    // dashboard setting (runtimeConfig.toolRouting) and fails closed to
+    // 'local' (ink-owned, provider withheld).
+    args.push('--tool-routing', config.toolRouting ?? 'local');
 
     // Use the safe profile with away mode for non-interactive spawns.
     // Safe profile allows read tools freely but requires approval for

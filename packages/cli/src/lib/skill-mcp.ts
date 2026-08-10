@@ -150,6 +150,25 @@ interface McpJsonConfig {
 const CHANNEL_SERVER_NAMES = new Set(['inkmail']);
 
 /**
+ * A channel bridge must LOOK like the channel plugin, not merely be named
+ * after it — a tool-bearing server that happens to claim the `inkmail` key
+ * (an HTTP server, or a stdio command pointing anywhere else) would otherwise
+ * ride the name allowlist straight through the withholding boundary. Verified
+ * shape: stdio command whose invocation references the channel-plugin package.
+ * Fail closed — a non-canonical entry costs inbox push, never the boundary.
+ */
+function isCanonicalChannelBridge(server: {
+  command?: string;
+  url?: string;
+  args?: string[];
+}): boolean {
+  if (!server?.command || server.url) return false;
+  return [server.command, ...(server.args ?? [])].some((part) =>
+    String(part).includes('channel-plugin')
+  );
+}
+
+/**
  * Build a merged MCP config that includes both the project's .mcp.json
  * and any skill-provided MCP servers. Also injects PCP session/studio
  * headers via the shared injectSessionHeaders utility.
@@ -178,7 +197,15 @@ export function buildMergedMcpConfig(
   const hasProjectConfig = existsSync(projectMcpPath);
 
   if (options?.omitToolServers) {
-    // Header injection is intentionally skipped here: it only decorates the
+    // Channel-only, deliberately: skill-provided MCP servers are NOT merged
+    // here. Skill discovery spans repo/home roots independent of active
+    // skills or tool policy, so re-adding them would restore provider-native
+    // tools inside the very mode meant to withhold them (Lumen's review
+    // probe surfaced an inactive playwright skill doing exactly that).
+    // MCP-bearing skills require backend routing until ink has an
+    // active+policy-approved mediation path.
+    //
+    // Header injection is intentionally skipped too: it only decorates the
     // tool servers being dropped. Channel bridges get their context from the
     // spawn env (INK_CONTEXT), not from config headers.
     const config: McpJsonConfig = { mcpServers: {} };
@@ -186,22 +213,12 @@ export function buildMergedMcpConfig(
       try {
         const parsed = JSON.parse(readFileSync(projectMcpPath, 'utf-8')) as Partial<McpJsonConfig>;
         for (const [name, server] of Object.entries(parsed.mcpServers ?? {})) {
-          if (CHANNEL_SERVER_NAMES.has(name)) {
+          if (CHANNEL_SERVER_NAMES.has(name) && isCanonicalChannelBridge(server)) {
             config.mcpServers[name] = server;
           }
         }
       } catch {
         // Unreadable project config — start from an empty server set.
-      }
-    }
-    for (const server of discoverSkillMcpServers(cwd)) {
-      if (!config.mcpServers[server.name]) {
-        config.mcpServers[server.name] = {
-          type: 'stdio',
-          command: server.command,
-          args: server.args,
-          ...(server.env ? { env: server.env } : {}),
-        };
       }
     }
     const tmpDir = join(tmpdir(), 'sb-mcp');

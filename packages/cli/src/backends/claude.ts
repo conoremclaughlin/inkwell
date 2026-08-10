@@ -118,6 +118,12 @@ export class ClaudeAdapter implements BackendAdapter {
     }
     if (localRouting) {
       args.push('--strict-mcp-config');
+      // Built-in tools are part of the structural boundary too: strict MCP
+      // only withholds servers, not native Bash/Edit/WebSearch/ToolSearch —
+      // all of which would bypass ink's tool policy entirely. Read alone
+      // stays available: it is the multimodal path for turn attachments
+      // (the --add-dir grants below exist exactly for it).
+      args.push('--tools', 'Read');
     }
 
     // Auto-approve: skip all permission prompts

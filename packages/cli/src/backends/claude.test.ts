@@ -38,7 +38,7 @@ describe('ClaudeAdapter prepare — tool routing', () => {
         mcpServers: {
           inkwell: { type: 'http', url: 'http://localhost:3001/mcp' },
           github: { type: 'http', url: 'https://api.github.com/mcp' },
-          inkmail: { command: 'npx', args: ['tsx', 'plugin.ts'] },
+          inkmail: { command: 'npx', args: ['tsx', 'packages/channel-plugin/index.ts'] },
         },
       })
     );
@@ -64,6 +64,12 @@ describe('ClaudeAdapter prepare — tool routing', () => {
       // Without strict mode claude merges user/project-scope MCP configs on
       // its own and the withheld servers leak back in.
       expect(prepared.args).toContain('--strict-mcp-config');
+      // Built-ins are part of the boundary: only Read survives (the
+      // multimodal attachment path). Native Bash/Edit/WebSearch/ToolSearch
+      // would bypass ink's tool policy.
+      const toolsIdx = prepared.args.indexOf('--tools');
+      expect(toolsIdx).toBeGreaterThan(-1);
+      expect(prepared.args[toolsIdx + 1]).toBe('Read');
       const servers = mcpConfigFrom(prepared.args);
       expect(Object.keys(servers)).toEqual(['inkmail']);
       // Channel loading still references the surviving inkmail entry.
@@ -83,6 +89,7 @@ describe('ClaudeAdapter prepare — tool routing', () => {
     });
     try {
       expect(prepared.args).not.toContain('--strict-mcp-config');
+      expect(prepared.args).not.toContain('--tools');
       const servers = mcpConfigFrom(prepared.args);
       expect(Object.keys(servers).sort()).toEqual(['github', 'inkmail', 'inkwell']);
     } finally {

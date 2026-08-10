@@ -46,22 +46,26 @@ describe('InkRunner', () => {
       expect(args[idx + 1]).toBe('12');
     });
 
-    it('forwards dashboard-configured tool routing, omits the flag when unset', () => {
+    it('always passes --tool-routing explicitly, failing closed to local', () => {
+      // The headless boundary must never depend on worktree .ink/identity.json
+      // preferences or the chat loop's own defaults.
       const runner = new InkRunner();
       const withRouting = (runner as any).buildArgs('session-tr', {
         workingDirectory: '/tmp',
         agentId: 'myra',
-        toolRouting: 'local',
+        toolRouting: 'backend',
       });
       const idx = withRouting.indexOf('--tool-routing');
       expect(idx).toBeGreaterThan(-1);
-      expect(withRouting[idx + 1]).toBe('local');
+      expect(withRouting[idx + 1]).toBe('backend');
 
       const withoutRouting = (runner as any).buildArgs('session-tr2', {
         workingDirectory: '/tmp',
         agentId: 'myra',
       });
-      expect(withoutRouting).not.toContain('--tool-routing');
+      const defaultIdx = withoutRouting.indexOf('--tool-routing');
+      expect(defaultIdx).toBeGreaterThan(-1);
+      expect(withoutRouting[defaultIdx + 1]).toBe('local');
     });
 
     it('includes --model when specified', () => {

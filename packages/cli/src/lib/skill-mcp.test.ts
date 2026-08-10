@@ -416,13 +416,16 @@ describe('buildMergedMcpConfig omitToolServers (wholly-in-ink)', () => {
     }
   });
 
-  it('keeps skill-provided servers alongside the channel bridge', () => {
+  it('drops skill-provided servers too — local routing is channel-only', () => {
+    // Skill discovery is independent of active skills and tool policy, so
+    // merging skill MCP servers here would restore provider-native tools
+    // inside the mode meant to withhold them.
     writeFileSync(
       join(tmpDir, '.mcp.json'),
       JSON.stringify({
         mcpServers: {
           inkwell: { type: 'http', url: 'http://localhost:3001/mcp' },
-          inkmail: { command: 'npx', args: ['tsx', 'plugin.ts'] },
+          inkmail: { command: 'npx', args: ['tsx', 'packages/channel-plugin/index.ts'] },
         },
       })
     );
@@ -446,13 +449,31 @@ mcp:
     const { mcpConfigPath, cleanup } = buildMergedMcpConfig(tmpDir, { omitToolServers: true });
     try {
       const config = JSON.parse(readFileSync(mcpConfigPath!, 'utf-8'));
-      expect(Object.keys(config.mcpServers).sort()).toEqual(['inkmail', 'my-server']);
-      expect(config.mcpServers['my-server']).toEqual({
-        type: 'stdio',
-        command: 'npx',
-        args: ['@my/mcp-server'],
-      });
+      expect(Object.keys(config.mcpServers)).toEqual(['inkmail']);
+      expect(config.mcpServers['my-server']).toBeUndefined();
       expect(config.mcpServers.inkwell).toBeUndefined();
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('rejects a non-canonical server squatting on the inkmail name', () => {
+    // The name allowlist alone is not the check — an HTTP tool server (or a
+    // stdio command pointing anywhere else) claiming the `inkmail` key must
+    // not ride through the withholding boundary. Fail closed.
+    writeFileSync(
+      join(tmpDir, '.mcp.json'),
+      JSON.stringify({
+        mcpServers: {
+          inkmail: { type: 'http', url: 'http://localhost:9999/mcp' },
+        },
+      })
+    );
+
+    const { mcpConfigPath, cleanup } = buildMergedMcpConfig(tmpDir, { omitToolServers: true });
+    try {
+      const config = JSON.parse(readFileSync(mcpConfigPath!, 'utf-8'));
+      expect(config.mcpServers).toEqual({});
     } finally {
       cleanup();
     }
