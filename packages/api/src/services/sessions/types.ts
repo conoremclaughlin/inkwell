@@ -496,6 +496,22 @@ export interface ClaudeRunnerConfig {
   studioId?: string;
   /** When true, bypass sandbox restrictions (e.g., Codex --dangerously-bypass-approvals-and-sandbox). Opt-in per studio. */
   sandboxBypass?: boolean;
+  /**
+   * Continuation-loop turn cap for InkRunner spawns. Counts OUTER
+   * conversational turns — the delivered message plus continuation prompts
+   * (runUserTurn cycles) — NOT provider subprocess calls, of which one turn's
+   * tool loop may spawn several. Sourced from the SB's dashboard settings
+   * (agent_identities.metadata.runtimeConfig.maxTurns); the runner clamps and
+   * defaults (5) when absent. signal_status is the sanctioned in-loop halt —
+   * this only caps runaway continuations.
+   */
+  maxTurns?: number;
+  /**
+   * Tool routing for InkRunner spawns, from the SB's dashboard settings
+   * (runtimeConfig.toolRouting). Forwarded as `--tool-routing`; when absent
+   * the ink chat loop resolves its own default ('local').
+   */
+  toolRouting?: 'backend' | 'local';
   /** Root repo path — propagated via context token for cross-project 'main' resolution */
   repoRoot?: string;
   /**

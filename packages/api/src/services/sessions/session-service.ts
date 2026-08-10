@@ -141,6 +141,28 @@ function routePatternSpecificity(pattern: string): number {
   return 1; // bare wildcard '*'
 }
 
+/**
+ * Parse an identity's dashboard runtime config (agent_identities.metadata
+ * .runtimeConfig) into the spawn-relevant fields. Fails CLOSED: absent or
+ * malformed input yields toolRouting 'local' (ink-owned, provider withheld)
+ * and no maxTurns override (the runner then applies its own default+clamp).
+ */
+export function parseRuntimeConfig(metadata: unknown): {
+  maxTurns?: number;
+  toolRouting: 'backend' | 'local';
+} {
+  const meta = (metadata ?? {}) as Record<string, unknown>;
+  const rc = (meta.runtimeConfig ?? {}) as Record<string, unknown>;
+  const out: { maxTurns?: number; toolRouting: 'backend' | 'local' } = { toolRouting: 'local' };
+  if (typeof rc.maxTurns === 'number' && Number.isFinite(rc.maxTurns)) {
+    out.maxTurns = rc.maxTurns;
+  }
+  if (rc.toolRouting === 'local' || rc.toolRouting === 'backend') {
+    out.toolRouting = rc.toolRouting;
+  }
+  return out;
+}
+
 export class SessionService implements ISessionService {
   private repository: ISessionRepository;
   private contextBuilder: IContextBuilder;
@@ -558,17 +580,28 @@ export class SessionService implements ISessionService {
 
     // Resolve sandbox_bypass: studio override > SB default > false
     let sandboxBypass = false;
+    // Per-SB runtime config (dashboard-tunable): continuation-loop cap and
+    // tool routing for ink spawns. Lives in agent_identities.metadata,
+    // resolved by the session's canonical identity UUID (session.sbId) —
+    // slugs are only unique per workspace and this path has no workspace
+    // scope. Missing/invalid identity fails CLOSED: toolRouting stays
+    // 'local' (ink-owned, provider withheld) and maxTurns stays default.
+    let runtimeMaxTurns: number | undefined;
+    let runtimeToolRouting: 'backend' | 'local' = 'local';
     if (this.supabase) {
       // SB-level default from agent_identities
-      const { data: identity } = await this.supabase
-        .from('agent_identities')
-        .select('sandbox_bypass')
-        .eq('user_id', userId)
-        .eq('agent_id', agentId)
-        .order('updated_at', { ascending: false })
-        .limit(1)
-        .maybeSingle();
+      const { data: identity } = session.sbId
+        ? await this.supabase
+            .from('agent_identities')
+            .select('sandbox_bypass, metadata')
+            .eq('id', session.sbId)
+            .eq('user_id', userId)
+            .maybeSingle()
+        : { data: null };
       sandboxBypass = identity?.sandbox_bypass ?? false;
+      const parsed = parseRuntimeConfig(identity?.metadata);
+      runtimeMaxTurns = parsed.maxTurns;
+      runtimeToolRouting = parsed.toolRouting;
 
       // Studio-level override (null = inherit from SB)
       if (session.studioId) {
@@ -623,6 +656,10 @@ export class SessionService implements ISessionService {
       channel: request.channel,
       ...(session.studioId ? { studioId: session.studioId } : {}),
       ...(sandboxBypass ? { sandboxBypass: true } : {}),
+      ...(runtimeMaxTurns !== undefined ? { maxTurns: runtimeMaxTurns } : {}),
+      // Always explicit — a headless boundary must never depend on worktree
+      // .ink/identity.json preferences or Commander defaults.
+      toolRouting: runtimeToolRouting,
       ...(permissionOverlay ? { permissionOverlay } : {}),
       // Propagate repo root so spawned backend's context token carries it
       repoRoot: resolvedWorkingDirectory.replace(/--[^/]+$/, ''),

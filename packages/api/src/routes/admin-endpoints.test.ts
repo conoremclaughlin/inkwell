@@ -1461,5 +1461,76 @@ describe('admin endpoint handlers (no-500 regression)', () => {
 
       expect(res._status).toBe(404);
     });
+
+    // Runtime-config validation: these values feed spawn flags directly
+    // (ink-runner --tool-routing / --max-turns), so junk must be rejected at
+    // the door instead of silently falling back to defaults at spawn time.
+    const mockIdentityFound = () => {
+      mockSupabaseFrom.mockImplementation((table: string) => {
+        if (table === 'agent_identities') {
+          return {
+            select: vi.fn().mockReturnValue({
+              eq: vi.fn().mockReturnValue({
+                eq: vi.fn().mockReturnValue({
+                  eq: vi.fn().mockReturnValue({
+                    maybeSingle: vi.fn().mockResolvedValue({
+                      data: { id: 'identity-abc', metadata: {} },
+                      error: null,
+                    }),
+                  }),
+                }),
+              }),
+            }),
+            update: vi.fn().mockReturnValue({
+              eq: vi.fn().mockReturnValue({
+                select: vi.fn().mockReturnValue({
+                  single: vi.fn().mockResolvedValue({
+                    data: {
+                      sandbox_bypass: null,
+                      backend: null,
+                      metadata: { runtimeConfig: { toolRouting: 'local', maxTurns: 5 } },
+                    },
+                    error: null,
+                  }),
+                }),
+              }),
+            }),
+          };
+        }
+        return createQueryChain(null);
+      });
+    };
+
+    const patchSettings = async (body: Record<string, unknown>) => {
+      const handler = findRouteHandler('patch', '/identities/:agentId/settings');
+      const req = createAuthenticatedReq({ params: { agentId: 'myra' }, body });
+      const res = createMockRes();
+      await handler!(req, res);
+      return res;
+    };
+
+    it('rejects an invalid toolRouting value', async () => {
+      mockIdentityFound();
+      const res = await patchSettings({ toolRouting: 'sideways' });
+      expect(res._status).toBe(400);
+      expect(String((res._json as any).error)).toContain('toolRouting');
+    });
+
+    it.each([[0], [26], [2.5], ['five']])('rejects invalid maxTurns %p', async (value) => {
+      mockIdentityFound();
+      const res = await patchSettings({ maxTurns: value });
+      expect(res._status).toBe(400);
+      expect(String((res._json as any).error)).toContain('maxTurns');
+    });
+
+    it('accepts valid toolRouting + maxTurns, and null to clear', async () => {
+      mockIdentityFound();
+      const ok = await patchSettings({ toolRouting: 'local', maxTurns: 5 });
+      expect(ok._status).toBe(200);
+
+      mockIdentityFound();
+      const cleared = await patchSettings({ toolRouting: null, maxTurns: null });
+      expect(cleared._status).toBe(200);
+    });
   });
 });

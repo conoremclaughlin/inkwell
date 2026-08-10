@@ -17,6 +17,7 @@ import { installHooks } from './hooks.js';
 import { syncMcpConfig } from './mcp.js';
 import { syncSkills } from './skills.js';
 import { loadAuth, decodeJwtPayload, isTokenExpired } from '../auth/tokens.js';
+import { resolveChannelPluginPath } from '../lib/skill-mcp.js';
 
 // ============================================================================
 // Helpers
@@ -41,18 +42,6 @@ function getPcpConfig(): PcpConfig | null {
 
 function getPcpServerUrl(): string {
   return process.env.INK_SERVER_URL || 'http://localhost:3001';
-}
-
-function resolveChannelPluginPath(cwd: string): string | null {
-  // Look for the channel plugin relative to the repo root
-  const candidates = [
-    join(cwd, 'packages', 'channel-plugin', 'index.ts'),
-    join(cwd, '..', 'personal-context-protocol', 'packages', 'channel-plugin', 'index.ts'),
-  ];
-  for (const p of candidates) {
-    if (existsSync(p)) return p;
-  }
-  return null;
 }
 
 function buildDefaultMcpJson(serverUrl: string, cwd?: string): Record<string, unknown> {

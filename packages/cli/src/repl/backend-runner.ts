@@ -55,6 +55,11 @@ export interface BackendRunRequest {
   stream?: boolean;
   /** Live sink for normalized turn events (streaming only). */
   onEvent?: (event: BackendTurnEvent) => void;
+  /**
+   * Tool routing for this turn — threaded to the adapter so ink-owned
+   * ('local') routing withholds tool-bearing MCP servers from the provider.
+   */
+  toolRouting?: 'backend' | 'local';
 }
 
 export interface BackendRunResult {
@@ -98,6 +103,7 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
     backendSessionId: request.backendSessionId,
     backendSessionSeedId: request.backendSessionSeedId,
     stream: streaming,
+    toolRouting: request.toolRouting,
   });
 
   const command = `${prepared.binary} ${prepared.args.join(' ')}`;

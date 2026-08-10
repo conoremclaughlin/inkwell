@@ -2258,16 +2258,34 @@ export function isResumeFailedNoSession(stderr: string): boolean {
   return lower.includes('session not found') || lower.includes('no such session');
 }
 
+/** Recovered provider-native session marker (see findLastBackendSession). */
+export interface RecoveredBackendSession {
+  id: string;
+  /**
+   * Tool routing the session's envelope was seeded under. Absent on legacy
+   * markers written before routing was persisted — treated as a mismatch by
+   * the recovery site (reseed full envelope) since the seeded instruction set
+   * is unknowable.
+   */
+  routing?: 'backend' | 'local';
+}
+
 /**
- * Recover the live provider-native session id from a reattached transcript so a
+ * Recover the live provider-native session from a reattached transcript so a
  * fresh process (the next server heartbeat, or a reattach) resumes the SAME
- * native session instead of fragmenting into a new jsonl. Returns the id of the
- * last `backend_session` marker. A `compaction` marker clears the candidate:
- * after ink compacts we deliberately roll to a fresh provider session, so a
+ * native session instead of fragmenting into a new jsonl. Returns the last
+ * `backend_session` marker's id plus the tool routing its envelope was seeded
+ * under — a session seeded under the OTHER routing must not be resumed with a
+ * delta (a backend-seeded session recovered into local routing would never
+ * receive ink-block syntax; the reverse would retain a stale "fenced blocks
+ * only" instruction). A `compaction` marker clears the candidate: after ink
+ * compacts we deliberately roll to a fresh provider session, so a
  * pre-compaction id must never be resumed (it would drag the pre-compaction
  * window back in).
  */
-export function findLastBackendSessionId(transcriptPath: string): string | undefined {
+export function findLastBackendSession(
+  transcriptPath: string
+): RecoveredBackendSession | undefined {
   if (!transcriptPath || !existsSync(transcriptPath)) return undefined;
   let content: string;
   try {
@@ -2275,17 +2293,22 @@ export function findLastBackendSessionId(transcriptPath: string): string | undef
   } catch {
     return undefined;
   }
-  let found: string | undefined;
+  let found: RecoveredBackendSession | undefined;
   for (const line of content.split('\n')) {
     if (!line.trim()) continue;
-    let event: { type?: unknown; id?: unknown };
+    let event: { type?: unknown; id?: unknown; routing?: unknown };
     try {
-      event = JSON.parse(line) as { type?: unknown; id?: unknown };
+      event = JSON.parse(line) as { type?: unknown; id?: unknown; routing?: unknown };
     } catch {
       continue;
     }
     if (event.type === 'backend_session' && typeof event.id === 'string') {
-      found = event.id;
+      found = {
+        id: event.id,
+        ...(event.routing === 'backend' || event.routing === 'local'
+          ? { routing: event.routing }
+          : {}),
+      };
     } else if (
       event.type === 'compaction' ||
       event.type === 'context_evict' ||
@@ -3059,10 +3082,17 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // Resume the provider session the prior process left live (delta only),
     // unless a compaction/eviction rolled it — then the next turn seeds fresh.
     if (runtime.backend === 'claude') {
-      // Recover the id only; the shape baseline is adopted on the first turn
-      // below, AFTER all startup mutations, so a recovered session resumes
-      // rather than spuriously reseeding on a startup-timing shape difference.
-      activeBackendSessionId = findLastBackendSessionId(existingTranscript);
+      // Recover the id only when the marker's persisted tool routing matches
+      // this process's routing — a session seeded under the other routing (or
+      // a legacy marker with no routing) holds the wrong instruction envelope
+      // and must reseed fresh, not resume with a delta. The volatile shape
+      // baseline (bootstrap context, skills) is still adopted on the first
+      // turn below, AFTER all startup mutations, so a matching session
+      // resumes rather than spuriously reseeding on startup-timing drift.
+      const recovered = findLastBackendSession(existingTranscript);
+      if (recovered && recovered.routing === runtime.toolRouting) {
+        activeBackendSessionId = recovered.id;
+      }
     }
     // Continue the event-id sequence from where the file left off
     seedTranscriptEidCounter(existingTranscript, hydrated.maxEid);
@@ -3446,7 +3476,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // all route through this single writer) just removed entries from ink's
     // window. Roll the provider session so the next turn re-seeds from the
     // post-eviction ledger; otherwise a resumed native session would still hold
-    // the evicted content. findLastBackendSessionId clears cross-process
+    // the evicted content. findLastBackendSession clears cross-process
     // recovery on the matching markers.
     activeBackendSessionId = undefined;
     activeBackendSessionShape = undefined;
@@ -4162,9 +4192,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
       activeBackendSessionShape = currentEnvelopeShape;
       // Persist the seed so a later process (next heartbeat / reattach) recovers
       // and RESUMES this native session instead of fragmenting into a new jsonl.
+      // routing rides along so cross-process recovery can refuse a session
+      // seeded under the other instruction envelope.
       appendTranscript(runtime.transcriptPath, {
         type: 'backend_session',
         id: seedProviderSessionId,
+        routing: runtime.toolRouting,
       });
     }
 
@@ -4272,6 +4305,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       stream: true,
       onEvent: handleBackendEvent,
       attachmentDirs: sessionAttachmentDirs.length > 0 ? sessionAttachmentDirs : undefined,
+      toolRouting: runtime.toolRouting,
       // Seed a fresh provider session (first spawn) OR resume the live one
       // (subsequent turns). Tool-loop continuations below always resume it.
       ...(seedProviderSessionId ? { backendSessionSeedId: seedProviderSessionId } : {}),
@@ -4307,7 +4341,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
       const reseedId = randomUUID();
       activeBackendSessionId = reseedId;
       activeBackendSessionShape = currentEnvelopeShape;
-      appendTranscript(runtime.transcriptPath, { type: 'backend_session', id: reseedId });
+      appendTranscript(runtime.transcriptPath, {
+        type: 'backend_session',
+        id: reseedId,
+        routing: runtime.toolRouting,
+      });
       printEvent(
         chalk.yellow('  ⛁ provider session not found on resume — re-seeding a fresh native session')
       );
@@ -4324,6 +4362,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         stream: true,
         onEvent: handleBackendEvent,
         attachmentDirs: sessionAttachmentDirs.length > 0 ? sessionAttachmentDirs : undefined,
+        toolRouting: runtime.toolRouting,
         backendSessionSeedId: reseedId,
       });
       currentTurnAbort = reseedTurn.abort;
@@ -4784,6 +4823,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         stream: true,
         onEvent: handleBackendEvent,
         attachmentDirs: sessionAttachmentDirs.length > 0 ? sessionAttachmentDirs : undefined,
+        toolRouting: runtime.toolRouting,
         // Resume the live provider session so this round-trip appends to the
         // same Claude thread instead of re-piping the whole window.
         ...(activeBackendSessionId ? { backendSessionId: activeBackendSessionId } : {}),
@@ -5158,7 +5198,16 @@ export async function runChat(options: ChatOptions): Promise<void> {
     if (!message) {
       throw new Error('--non-interactive requires --message "<text>"');
     }
-    const maxTurns = parseInt(options.maxTurns || '1', 10);
+    // maxTurns counts OUTER conversational turns (runUserTurn cycles: the
+    // delivered message plus continuation prompts) — not provider subprocess
+    // calls, of which a single turn's tool loop may spawn several. Validate
+    // strictly: this arrives from server spawn args, and a malformed value
+    // silently coerced to NaN/1 would defeat the configured cap.
+    const maxTurnsRaw = String(options.maxTurns ?? '1').trim();
+    const maxTurns = Number.parseInt(maxTurnsRaw, 10);
+    if (!/^\d+$/.test(maxTurnsRaw) || maxTurns < 1 || maxTurns > 25) {
+      throw new Error(`--max-turns must be an integer between 1 and 25 (got "${maxTurnsRaw}")`);
+    }
 
     // Turn 1: the delivered message. When --message-label is set (server
     // spawns pass the originating channel, e.g. "heartbeat"), render as a
@@ -5166,6 +5215,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
     const messageLabel = options.messageLabel?.trim();
     clearLastSignal();
     await enqueueTurn(message, messageLabel ? 'system' : 'user', messageLabel);
+    // Actual completed outer turns — reported instead of the configured cap,
+    // which lies whenever signal_status halts the loop early.
+    let turnsCompleted = 1;
 
     // Check for signal or failure after turn 1
     let exitReason: string | undefined;
@@ -5186,6 +5238,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           'system',
           'continuation'
         );
+        turnsCompleted += 1;
 
         const signal = getLastSignal();
         if (signal?.status === 'completed' || signal?.status === 'blocked') {
@@ -5229,7 +5282,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       type: 'session_pause',
       sessionId: runtime.sessionId || null,
       summary,
-      turnsCompleted: maxTurns,
+      turnsCompleted,
       signal: finalSignal || undefined,
     });
 
@@ -5254,6 +5307,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         sessionId: runtime.sessionId || null,
         phase,
         signal: finalSignal?.status || null,
+        turnsCompleted,
         reason: finalSignal?.reason || (isBackendFailure ? 'backend_failure' : null),
         usage: {
           contextTokens: reportedContextTokens,
@@ -5273,7 +5327,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     } else if (finalSignal?.status === 'completed') {
       console.log(chalk.green(`\nSession completed.`));
     } else {
-      console.log(chalk.dim(`\nSession paused (${maxTurns} turn(s) completed).`));
+      console.log(chalk.dim(`\nSession paused (${turnsCompleted} turn(s) completed).`));
     }
     if (!isBackendFailure) {
       console.log(chalk.cyan(`  Resume with: ink chat --attach-latest ${agentId}\n`));
@@ -6809,8 +6863,12 @@ export function registerChatCommand(program: Command): void {
       .option('-m, --model <model>', 'Model override for backend')
       .option(
         '--tool-routing <mode>',
-        'Tool routing mode: local (ink-tool blocks handled by ink) or backend (native backend tools)',
-        'local'
+        // No Commander default: a default here would make options.toolRouting
+        // always-set and mask the persisted .ink/identity.json preference in
+        // the runtime resolution below. Server spawns always pass the flag
+        // explicitly (ink-runner); interactive sessions fall through to
+        // persisted prefs, then 'local'.
+        'Tool routing mode: local (ink-tool blocks handled by ink) or backend (native backend tools)'
       )
       .option('--ui <mode>', 'UI mode: live (default) or scroll status rendering', 'live')
       .option('--thread-key <key>', 'Thread key for Inkwell session routing')
