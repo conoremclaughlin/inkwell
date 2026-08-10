@@ -194,11 +194,12 @@ function isCanonicalChannelBridge(server: {
  * Returns the path to a temp file and a cleanup function.
  * When no modifications are needed, returns the original .mcp.json path.
  *
- * With `omitToolServers` (wholly-in-ink, ink-owned tool routing) the project
- * config's tool-bearing servers (inkwell, supabase, github, …) are dropped:
- * only channel bridges and skill-provided servers reach the provider. The
- * result is always a temp file, even when empty — the adapter pairs it with
- * `--strict-mcp-config` so an empty config means "no MCP servers at all".
+ * With `omitToolServers` (wholly-in-ink, ink-owned tool routing) the config
+ * is CHANNEL-ONLY: every tool-bearing server (inkwell, supabase, github,
+ * skill-provided, …) is dropped and only the verified canonical channel
+ * bridge survives. The result is always a temp file, even when empty — the
+ * adapter pairs it with `--strict-mcp-config` so an empty config means "no
+ * MCP servers at all".
  */
 export function buildMergedMcpConfig(
   cwd: string,
