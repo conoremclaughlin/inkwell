@@ -47,6 +47,7 @@ import {
   clearExplicitResponse,
 } from './mcp/tools/response-handlers';
 import { getAgentGateway, type AgentTriggerPayload } from './channels/agent-gateway';
+import { resolveTriggerMedia } from './channels/agent-media';
 import { resolveRouteAgentId } from './services/routing/resolve-route';
 import { resolveAgentFromMention } from './services/routing/resolve-mention';
 import { getHeartbeatProcessingConfig } from './config/heartbeat-flags';
@@ -751,6 +752,10 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
     // is blocked and logged as a security warning.
     let userId: string | undefined;
     let recipientSbId: string | undefined;
+    // Media from the STORED message row (trust source — written server-side
+    // at send time, never taken from the trigger payload). Validated and
+    // path-contained by resolveTriggerMedia before reaching the spawn.
+    let storedMessageMetadata: unknown;
 
     const authUser = getUserFromContext();
     const authUserId = authUser?.userId;
@@ -759,7 +764,7 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
       const { data: inboxMsg, error: inboxError } = await dataComposer!
         .getClient()
         .from('agent_inbox')
-        .select('recipient_user_id, recipient_sb_id')
+        .select('recipient_user_id, recipient_sb_id, metadata')
         .eq('id', payload.inboxMessageId)
         .single();
       if (inboxError) {
@@ -787,13 +792,14 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
 
       userId = inboxMsg?.recipient_user_id;
       recipientSbId = inboxMsg?.recipient_sb_id || undefined;
+      storedMessageMetadata = inboxMsg?.metadata ?? undefined;
     } else if (payload.threadMessageId) {
       // Thread message: resolve user_id via inbox_thread_messages → inbox_threads
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const supabase = dataComposer!.getClient() as any;
       const { data: threadMsg, error: tmError } = await supabase
         .from('inbox_thread_messages')
-        .select('thread_id')
+        .select('thread_id, metadata')
         .eq('id', payload.threadMessageId)
         .single();
       if (tmError) {
@@ -802,6 +808,7 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
           error: tmError.message,
         });
       }
+      storedMessageMetadata = threadMsg?.metadata ?? undefined;
       if (threadMsg?.thread_id) {
         const { data: thread, error: threadError } = await supabase
           .from('inbox_threads')
@@ -976,6 +983,17 @@ ${payload.threadKey ? `Fetch the thread using get_thread_messages(threadKey: "${
 If you need to message a user, use send_response with the appropriate channel and conversationId.
 When you complete a task_request, mark it as completed using update_inbox_message(messageId, status: "completed").`;
 
+    // 3b. Media from the stored message (agent-to-agent attachments).
+    // Path-contained to ~/.ink/files and validated; flows to the spawn as
+    // --attach-file and from there through provider media injection.
+    const triggerMedia = await resolveTriggerMedia(storedMessageMetadata);
+    if (triggerMedia.length > 0) {
+      logger.info('[Trigger] delivering media attachments', {
+        count: triggerMedia.length,
+        to: targetAgentId,
+      });
+    }
+
     // 4. Process via SessionService (stateless - looks up session from DB)
     const request: SessionRequest = {
       userId,
@@ -989,6 +1007,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       metadata: {
         triggerType: 'agent',
         chatType: 'direct',
+        ...(triggerMedia.length > 0 ? { media: triggerMedia } : {}),
         threadKey: payload.threadKey,
         studioId: payload.studioId,
         studioHint: payload.studioHint,
