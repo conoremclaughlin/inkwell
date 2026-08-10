@@ -276,14 +276,31 @@ describe('readMediaBounded (single-descriptor, regular files only)', () => {
     expect(readMediaBounded(dir, 4096)).toBeNull();
   });
 
-  it('a FIFO is rejected without blocking the open', { timeout: 2000 }, () => {
-    // Opening a FIFO for read normally BLOCKS until a writer appears — a
-    // hostile/accidental media path must not hang the spawn (Lumen,
-    // review 4900202375). O_NONBLOCK returns immediately; fstat rejects.
-    const p = join(dir, 'pipe.fifo');
-    execSync(`mkfifo ${JSON.stringify(p)}`);
-    expect(readMediaBounded(p, 4096)).toBeNull();
-  });
+  it(
+    'a FIFO is rejected without blocking — verified in a killable child',
+    { timeout: 20000 },
+    () => {
+      // Opening a FIFO for read normally BLOCKS until a writer appears — a
+      // hostile/accidental media path must not hang the spawn (Lumen, review
+      // 4900202375). An in-worker vitest timeout cannot guard this: a
+      // blocking openSync freezes the worker's event loop and the timer
+      // never fires (review 4900276464). So the REAL readMediaBounded runs
+      // in a child process with an external kill timeout — an O_NONBLOCK
+      // regression hangs the CHILD, execSync kills it, and the assertion
+      // fails instead of the suite wedging.
+      const p = join(dir, 'pipe.fifo');
+      execSync(`mkfifo ${JSON.stringify(p)}`);
+      const moduleUrl = new URL('./claude.ts', import.meta.url).href;
+      const script =
+        `import(${JSON.stringify(moduleUrl)})` +
+        `.then((m) => console.log(JSON.stringify(m.readMediaBounded(${JSON.stringify(p)}, 4096))))`;
+      const out = execSync(`npx tsx -e ${JSON.stringify(script)}`, {
+        timeout: 15000,
+        encoding: 'utf-8',
+      });
+      expect(out.trim()).toBe('null');
+    }
+  );
 });
 
 describe('ClaudeAdapter prepare — media injection', () => {
