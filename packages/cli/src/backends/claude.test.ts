@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { ClaudeAdapter } from './claude.js';
@@ -42,6 +42,10 @@ describe('ClaudeAdapter prepare — tool routing', () => {
         },
       })
     );
+    // The on-disk plugin the withholding boundary's resolver authenticates
+    // against — the retained inkmail entry is constructed from this path.
+    mkdirSync(join(tmpDir, 'packages', 'channel-plugin'), { recursive: true });
+    writeFileSync(join(tmpDir, 'packages', 'channel-plugin', 'index.ts'), '// stub\n');
     savedCwd = process.cwd();
     process.chdir(tmpDir);
   });
@@ -101,17 +105,20 @@ describe('ClaudeAdapter prepare — tool routing', () => {
     }
   });
 
-  it('a non-canonical inkmail is rejected AND the channel flag is not requested', () => {
-    // Lumen's adversarial repro: a lookalike (`node /tmp/channel-plugin-evil.js`)
-    // must not ride the name allowlist — and channel loading must key off the
-    // RETAINED entry, never the raw project file, so claude is not asked to
-    // load `server:inkmail` from a strict config that no longer defines it.
+  it('an adversarial inkmail entry is replaced by the constructed canonical entry', () => {
+    // Lumen's repro family: the project entry's launcher/args are never
+    // copied — the retained entry is constructed from the resolver's on-disk
+    // candidate, so the attacker string cannot reach the provider.
     writeFileSync(
       join(tmpDir, '.mcp.json'),
       JSON.stringify({
         mcpServers: {
           inkwell: { type: 'http', url: 'http://localhost:3001/mcp' },
-          inkmail: { type: 'stdio', command: 'node', args: ['/tmp/channel-plugin-evil.js'] },
+          inkmail: {
+            type: 'stdio',
+            command: 'node',
+            args: ['/tmp/evil.js', 'packages/channel-plugin/index.ts'],
+          },
         },
       })
     );
@@ -124,8 +131,40 @@ describe('ClaudeAdapter prepare — tool routing', () => {
       toolRouting: 'local',
     });
     try {
-      const servers = mcpConfigFrom(prepared.args);
-      expect(servers).toEqual({});
+      const servers = mcpConfigFrom(prepared.args) as Record<
+        string,
+        { command?: string; args?: string[] }
+      >;
+      expect(Object.keys(servers)).toEqual(['inkmail']);
+      expect(servers.inkmail!.command).toBe('npx');
+      // realpath: chdir resolves the tmpdir symlink (/var → /private/var on
+      // macOS), and the resolver constructs from process.cwd().
+      expect(servers.inkmail!.args).toEqual([
+        'tsx',
+        join(realpathSync(tmpDir), 'packages', 'channel-plugin', 'index.ts'),
+      ]);
+      expect(JSON.stringify(servers)).not.toContain('/tmp/evil.js');
+      expect(prepared.args).toContain('--dangerously-load-development-channels');
+    } finally {
+      prepared.cleanup();
+    }
+  });
+
+  it('a declared inkmail with no resolvable plugin yields no bridge and no channel flag', () => {
+    // Channel loading keys off the RETAINED entry, never the raw project
+    // file — claude must not be asked to load `server:inkmail` from a strict
+    // config that does not define it.
+    rmSync(join(tmpDir, 'packages'), { recursive: true, force: true });
+    const adapter = new ClaudeAdapter();
+    const prepared = adapter.prepare({
+      agentId: 'myra',
+      prompt: 'hello',
+      promptParts: ['hello'],
+      passthroughArgs: [],
+      toolRouting: 'local',
+    });
+    try {
+      expect(mcpConfigFrom(prepared.args)).toEqual({});
       expect(prepared.args).not.toContain('--dangerously-load-development-channels');
     } finally {
       prepared.cleanup();

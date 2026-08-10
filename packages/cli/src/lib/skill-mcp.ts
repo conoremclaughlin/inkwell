@@ -141,45 +141,21 @@ interface McpJsonConfig {
 }
 
 /**
- * MCP servers that survive tool withholding (`omitToolServers`). These are
- * channel bridges, not tool providers: `inkmail` is resolved by name via
- * `--dangerously-load-development-channels server:inkmail` and registers zero
- * model-callable tools — dropping it kills inbox push notifications without
- * withholding anything.
+ * Resolve the InkMail channel plugin's entrypoint on disk. Shared with
+ * `ink init` (which generates the project entry from the same candidates) so
+ * the generator and the withholding boundary can never disagree about what
+ * the plugin IS. Returns null when no candidate exists.
  */
-const CHANNEL_SERVER_NAMES = new Set(['inkmail']);
-
-/**
- * The channel plugin's canonical entrypoint, as a path suffix. The project
- * config references it absolutely (root repo) or repo-relatively (worktrees);
- * either way the invocation must END on exactly these segments.
- */
-const CANONICAL_CHANNEL_SUFFIX = 'packages/channel-plugin/index.ts';
-
-/**
- * A channel bridge must BE the channel plugin, not merely be named after it —
- * a tool-bearing server that claims the `inkmail` key (an HTTP server, a
- * stdio command pointing anywhere else, or a lookalike like
- * `node /tmp/channel-plugin-evil.js`) would otherwise ride the name allowlist
- * straight through the withholding boundary. Verified shape: stdio (or
- * untyped, the project-config default), a command, no url, and an invocation
- * argument that resolves segment-exactly to the canonical plugin entrypoint.
- * Fail closed — a non-canonical entry costs inbox push, never the boundary.
- */
-function isCanonicalChannelBridge(server: {
-  type?: string;
-  command?: string;
-  url?: string;
-  args?: string[];
-}): boolean {
-  if (!server?.command || server.url) return false;
-  if (server.type !== undefined && server.type !== 'stdio') return false;
-  return [server.command, ...(server.args ?? [])].some((part) => {
-    const normalized = String(part).replace(/\\/g, '/');
-    return (
-      normalized === CANONICAL_CHANNEL_SUFFIX || normalized.endsWith(`/${CANONICAL_CHANNEL_SUFFIX}`)
-    );
-  });
+export function resolveChannelPluginPath(cwd: string): string | null {
+  // Look for the channel plugin relative to the repo root
+  const candidates = [
+    join(cwd, 'packages', 'channel-plugin', 'index.ts'),
+    join(cwd, '..', 'personal-context-protocol', 'packages', 'channel-plugin', 'index.ts'),
+  ];
+  for (const p of candidates) {
+    if (existsSync(p)) return p;
+  }
+  return null;
 }
 
 /**
@@ -235,9 +211,24 @@ export function buildMergedMcpConfig(
     if (hasProjectConfig) {
       try {
         const parsed = JSON.parse(readFileSync(projectMcpPath, 'utf-8')) as Partial<McpJsonConfig>;
-        for (const [name, server] of Object.entries(parsed.mcpServers ?? {})) {
-          if (CHANNEL_SERVER_NAMES.has(name) && isCanonicalChannelBridge(server)) {
-            config.mcpServers[name] = server;
+        // The project entry is only an OPT-IN signal — its launcher, args,
+        // and path are NEVER copied. The retained entry is CONSTRUCTED from
+        // the init-generator's own resolver, so a squatting or lookalike
+        // entry (`node /tmp/evil.js packages/channel-plugin/index.ts`, an
+        // attacker path merely ending in the canonical suffix, `bash -c …`
+        // with a decoy argv) structurally cannot reach the provider —
+        // validation of attacker-controlled strings is replaced by not
+        // consuming them at all (Lumen, PR #462 review 4894572540). No
+        // resolvable plugin on disk → no bridge; fail closed costs inbox
+        // push, never the boundary.
+        if (parsed.mcpServers?.['inkmail']) {
+          const pluginPath = resolveChannelPluginPath(cwd);
+          if (pluginPath) {
+            config.mcpServers['inkmail'] = {
+              type: 'stdio',
+              command: 'npx',
+              args: ['tsx', pluginPath],
+            };
           }
         }
       } catch {
