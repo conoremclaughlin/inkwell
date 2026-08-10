@@ -4319,7 +4319,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
       onEvent: handleBackendEvent,
       attachmentDirs: sessionAttachmentDirs.length > 0 ? sessionAttachmentDirs : undefined,
       toolRouting: runtime.toolRouting,
+      // Delivery spawn: embed this turn's media even when resuming a
+      // recovered provider session — new media on an existing conversation
+      // must reach the provider (heartbeat/reattach path).
       media: turnMedia.length > 0 ? turnMedia : undefined,
+      ...(turnMedia.length > 0 ? { deliverMedia: true } : {}),
       // Seed a fresh provider session (first spawn) OR resume the live one
       // (subsequent turns). Tool-loop continuations below always resume it.
       ...(seedProviderSessionId ? { backendSessionSeedId: seedProviderSessionId } : {}),
@@ -4380,6 +4384,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         // The reseeded provider session is fresh — re-inject this turn's
         // media so the full envelope carries the images too.
         media: turnMedia.length > 0 ? turnMedia : undefined,
+        ...(turnMedia.length > 0 ? { deliverMedia: true } : {}),
         backendSessionSeedId: reseedId,
       });
       currentTurnAbort = reseedTurn.abort;
@@ -4841,10 +4846,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
         onEvent: handleBackendEvent,
         attachmentDirs: sessionAttachmentDirs.length > 0 ? sessionAttachmentDirs : undefined,
         toolRouting: runtime.toolRouting,
-        // Same logical turn — media rides along so the adapter's boundary
-        // disposition (--tools gate) cannot flap between the delivery spawn
-        // and tool-loop continuations. Stateful adapters skip re-embedding
-        // on resume; stateless ones re-attach.
+        // Same logical turn — media rides along (WITHOUT deliverMedia) so
+        // the adapter's boundary disposition (--tools gate) cannot flap
+        // between the delivery spawn and tool-loop continuations, while the
+        // resumed provider session is never re-fed images it already holds.
+        // Stateless adapters re-attach from `media` regardless.
         media: turnMedia.length > 0 ? turnMedia : undefined,
         // Resume the live provider session so this round-trip appends to the
         // same Claude thread instead of re-piping the whole window.

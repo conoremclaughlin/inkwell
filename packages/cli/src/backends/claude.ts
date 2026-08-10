@@ -5,7 +5,7 @@
  * MCP config via --mcp-config <path>
  */
 
-import { closeSync, existsSync, fstatSync, openSync, readSync } from 'fs';
+import { closeSync, constants as fsConstants, existsSync, fstatSync, openSync, readSync } from 'fs';
 import { execFileSync } from 'child_process';
 import { join } from 'path';
 import { homedir } from 'os';
@@ -65,7 +65,11 @@ export function classifyMedia(media: TurnMedia[]): MediaClassification {
 export function readMediaBounded(path: string, maxBytes: number): Buffer | null {
   let fd: number | undefined;
   try {
-    fd = openSync(path, 'r');
+    // O_NONBLOCK: opening a FIFO for read BLOCKS until a writer appears —
+    // a media path pointing at one would hang the spawn indefinitely.
+    // Nonblocking open returns immediately; fstat then rejects it as
+    // non-regular. Regular-file reads are unaffected by the flag.
+    fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK);
     const st = fstatSync(fd);
     if (!st.isFile() || st.size > maxBytes) return null;
     const buf = Buffer.allocUnsafe(st.size);
@@ -157,26 +161,37 @@ export class ClaudeAdapter implements BackendAdapter {
     // the provider pull them via native Read. Requires prompt mode (the
     // message rides stdin).
     //
-    // Callers pass the turn's media on EVERY spawn of the logical turn.
-    // Delivery spawns (fresh provider session) embed the blocks; resume
-    // spawns (--resume, tool-loop continuations) do NOT re-embed — the
-    // provider session already holds the images — but the classification
-    // still drives the --tools gate below so the boundary disposition is
-    // identical across the whole logical turn.
+    // Callers pass the turn's media on EVERY spawn of the logical turn and
+    // mark DELIVERY spawns with deliverMedia. Delivery spawns embed the
+    // blocks — including into a resumed cross-process conversation, where
+    // new media legitimately arrives with a recovered backendSessionId
+    // (Lumen, review 4900202375). Same-turn tool-loop continuations omit
+    // deliverMedia and do not re-embed (the provider session already holds
+    // the images), but the classification still drives the --tools gate
+    // below so the boundary disposition is identical across the whole
+    // logical turn.
     const media = config.media ?? [];
     const classified = classifyMedia(media);
-    const resumingDeliveredSession = Boolean(config.backendSessionId);
     const encoded =
-      config.prompt && !resumingDeliveredSession && classified.candidates.length > 0
+      config.prompt && config.deliverMedia && classified.candidates.length > 0
         ? encodeMediaBlocks(classified.candidates)
         : undefined;
-    for (const r of encoded?.rejected ?? []) {
-      // Loud, fail-closed: a supported image that cannot be injected is NOT
-      // handed back to native read — the boundary stays shut and the skip is
-      // reported instead.
-      console.warn(`[media] not injected (${r.reason}): ${r.media.path}`);
+    // Fail-closed rejections must be LOUD where someone can see them: the
+    // stderr warn is invisible on successful headless runs (InkRunner
+    // discards it), so the note also rides the prompt itself — the provider
+    // tells the user what it never received.
+    let rejectionNote = '';
+    if (encoded && encoded.rejected.length > 0) {
+      for (const r of encoded.rejected) {
+        console.warn(`[media] not injected (${r.reason}): ${r.media.path}`);
+      }
+      rejectionNote =
+        '\n\n[media note] The following attached file(s) could NOT be delivered ' +
+        '(fail-closed; no filesystem fallback). Tell the user, naming each file:\n' +
+        encoded.rejected.map((r) => `- ${r.media.path} — ${r.reason}`).join('\n');
     }
     const injecting = (encoded?.blocks.length ?? 0) > 0;
+    const promptText = config.prompt ? config.prompt + rejectionNote : config.prompt;
 
     // Prompt mode vs interactive. The prompt is passed via stdin (not argv):
     // transcripts can exceed the OS argv limit (~256KB on macOS), which
@@ -306,16 +321,17 @@ export class ClaudeAdapter implements BackendAdapter {
 
     // Injected turns switch stdin to stream-json: one JSONL user message
     // whose content is the prompt text plus base64 image blocks. Text-only
-    // turns and resume spawns keep the plain-stdin path.
-    let stdinData = config.prompt;
-    if (injecting && config.prompt) {
+    // turns and non-delivery spawns keep the plain-stdin path. Either way
+    // the prompt carries the rejection note when something wasn't delivered.
+    let stdinData = promptText;
+    if (injecting && promptText) {
       args.push('--input-format', 'stream-json');
       stdinData =
         JSON.stringify({
           type: 'user',
           message: {
             role: 'user',
-            content: [{ type: 'text', text: config.prompt }, ...(encoded?.blocks ?? [])],
+            content: [{ type: 'text', text: promptText }, ...(encoded?.blocks ?? [])],
           },
         }) + '\n';
     }

@@ -55,13 +55,22 @@ export interface BackendConfig {
    * Media files for the LOGICAL turn (spec:provider-media-injection),
    * passed on every spawn of that turn — delivery, reseed, and tool-loop
    * continuations alike. Injecting adapters embed them in the prompt
-   * envelope (claude: stream-json image content blocks, skipped on resume
-   * spawns whose provider session already holds them; codex: stateless, so
-   * `--image=` flags are re-attached per spawn). Adapters without
+   * envelope (claude: stream-json image content blocks; codex: `--image=`
+   * flags re-attached per spawn, being stateless). Adapters without
    * injection support ignore this; attachmentDirs remains the native-read
    * fallback for explicitly unsupported types only.
    */
   media?: TurnMedia[];
+  /**
+   * True on DELIVERY spawns of the logical turn (initial and reseed) —
+   * the spawns that must embed `media` into the prompt envelope. Omitted
+   * on same-turn tool-loop continuations, whose resumed provider session
+   * already holds the images. This is an explicit signal because
+   * backendSessionId alone cannot distinguish "continuation of this turn"
+   * from "new media delivered into a resumed cross-process conversation"
+   * (server heartbeat/reattach) — the latter MUST embed.
+   */
+  deliverMedia?: boolean;
 }
 
 export interface PreparedBackend {

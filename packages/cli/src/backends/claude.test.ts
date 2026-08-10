@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { execSync } from 'child_process';
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -274,6 +275,15 @@ describe('readMediaBounded (single-descriptor, regular files only)', () => {
     // A directory is not a regular file.
     expect(readMediaBounded(dir, 4096)).toBeNull();
   });
+
+  it('a FIFO is rejected without blocking the open', { timeout: 2000 }, () => {
+    // Opening a FIFO for read normally BLOCKS until a writer appears — a
+    // hostile/accidental media path must not hang the spawn (Lumen,
+    // review 4900202375). O_NONBLOCK returns immediately; fstat rejects.
+    const p = join(dir, 'pipe.fifo');
+    execSync(`mkfifo ${JSON.stringify(p)}`);
+    expect(readMediaBounded(p, 4096)).toBeNull();
+  });
 });
 
 describe('ClaudeAdapter prepare — media injection', () => {
@@ -311,6 +321,7 @@ describe('ClaudeAdapter prepare — media injection', () => {
       toolRouting: 'local',
       attachmentDirs: [tmpDir],
       media: [{ path: pngPath, mimeType: 'image/png' }],
+      deliverMedia: true,
     });
     try {
       expect(prepared.args).toContain('--input-format');
@@ -348,6 +359,7 @@ describe('ClaudeAdapter prepare — media injection', () => {
         { path: pngPath, mimeType: 'image/png' },
         { path: pdfPath, mimeType: 'application/pdf' },
       ],
+      deliverMedia: true,
     });
     try {
       // Image still injected…
@@ -403,9 +415,11 @@ describe('ClaudeAdapter prepare — media injection', () => {
     }
   });
 
-  it('injection failure fails CLOSED: image not embedded, Read stays off', () => {
-    // A supported image that cannot be read (missing file) is rejected
-    // loudly — it neither injects nor reopens the native-read exception.
+  it('injection failure fails CLOSED and the rejection rides the prompt itself', () => {
+    // A supported image that cannot be read (missing file) is rejected —
+    // it neither injects nor reopens the native-read exception. And because
+    // stderr is invisible on successful headless runs, the note is embedded
+    // in the provider input so the user hears about it.
     const adapter = new ClaudeAdapter();
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const prepared = adapter.prepare({
@@ -416,6 +430,7 @@ describe('ClaudeAdapter prepare — media injection', () => {
       toolRouting: 'local',
       attachmentDirs: [tmpDir],
       media: [{ path: join(tmpDir, 'vanished.png'), mimeType: 'image/png' }],
+      deliverMedia: true,
     });
     try {
       expect(prepared.args).not.toContain('--input-format');
@@ -423,8 +438,39 @@ describe('ClaudeAdapter prepare — media injection', () => {
       expect(prepared.args[toolsIdx + 1]).toBe('');
       expect(warn).toHaveBeenCalledOnce();
       expect(String(warn.mock.calls[0])).toContain('vanished.png');
+      expect(prepared.stdinData).toContain('[media note]');
+      expect(prepared.stdinData).toContain('vanished.png');
     } finally {
       warn.mockRestore();
+      prepared.cleanup();
+    }
+  });
+
+  it('new media on a RESUMED conversation embeds when marked as delivery', () => {
+    // Lumen's round-2 repro (review 4900202375): a server heartbeat or
+    // reattach can recover an existing provider session AND deliver brand
+    // new media in the same spawn. backendSessionId alone must not suppress
+    // embedding — deliverMedia is the explicit signal.
+    const adapter = new ClaudeAdapter();
+    const prepared = adapter.prepare({
+      agentId: 'myra',
+      prompt: 'here is a new photo',
+      promptParts: ['here is a new photo'],
+      passthroughArgs: [],
+      toolRouting: 'local',
+      attachmentDirs: [tmpDir],
+      media: [{ path: pngPath, mimeType: 'image/png' }],
+      deliverMedia: true,
+      backendSessionId: 'recovered-session-xyz',
+    });
+    try {
+      expect(prepared.args).toContain('--resume');
+      expect(prepared.args).toContain('--input-format');
+      const line = JSON.parse(prepared.stdinData!.trim());
+      expect(line.message.content[1].type).toBe('image');
+      const toolsIdx = prepared.args.indexOf('--tools');
+      expect(prepared.args[toolsIdx + 1]).toBe('');
+    } finally {
       prepared.cleanup();
     }
   });

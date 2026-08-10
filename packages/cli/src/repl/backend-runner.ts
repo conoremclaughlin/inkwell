@@ -66,6 +66,8 @@ export interface BackendRunRequest {
    * the prompt envelope (spec:provider-media-injection).
    */
   media?: TurnMedia[];
+  /** True on delivery spawns (initial/reseed); omitted on same-turn continuations. */
+  deliverMedia?: boolean;
 }
 
 export interface BackendRunResult {
@@ -111,6 +113,7 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
     stream: streaming,
     toolRouting: request.toolRouting,
     media: request.media,
+    deliverMedia: request.deliverMedia,
   });
 
   const command = `${prepared.binary} ${prepared.args.join(' ')}`;
