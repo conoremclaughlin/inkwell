@@ -34,6 +34,7 @@ const PCP_ENV_HEADERS: Array<{ header: string; envVar: string }> = [
 export class CodexAdapter implements BackendAdapter {
   readonly name = 'codex';
   readonly binary = 'codex';
+  readonly injectsMedia = true;
 
   prepare(config: BackendConfig): PreparedBackend {
     const { promptFile, cleanup } = createIdentityPromptFile(
@@ -97,6 +98,15 @@ export class CodexAdapter implements BackendAdapter {
     if (promptParts.length > 0 && promptParts[0]?.toLowerCase() === 'exec') {
       args.push(promptParts[0]);
       args.push(...config.passthroughArgs);
+      // Media injection (spec:provider-media-injection): codex attaches
+      // images to the initial prompt natively via `-i` — an exec-scoped
+      // option, so it must sit after `exec`. Non-image media stays on the
+      // prompt-text path (paths listed in the attachment block).
+      for (const m of config.media ?? []) {
+        if (m.mimeType?.startsWith('image/')) {
+          args.push('-i', m.path);
+        }
+      }
       args.push(...promptParts.slice(1));
     } else {
       // Passthrough flags

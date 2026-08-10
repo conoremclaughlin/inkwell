@@ -2,7 +2,12 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { ClaudeAdapter } from './claude.js';
+import {
+  ClaudeAdapter,
+  planMediaInjection,
+  MAX_MEDIA_FILE_BYTES,
+  MAX_MEDIA_TOTAL_BYTES,
+} from './claude.js';
 
 // Keep user-installed skills out of the merged MCP config.
 vi.mock('../repl/skills.js', () => ({
@@ -184,6 +189,156 @@ describe('ClaudeAdapter prepare — tool routing', () => {
       expect(prepared.args).not.toContain('--tools');
       const servers = mcpConfigFrom(prepared.args);
       expect(Object.keys(servers).sort()).toEqual(['github', 'inkmail', 'inkwell']);
+    } finally {
+      prepared.cleanup();
+    }
+  });
+});
+
+describe('planMediaInjection (mime + size policy)', () => {
+  const sizes = (map: Record<string, number | null>) => (path: string) => map[path] ?? null;
+
+  it('injects supported images, falls back non-images and unknown mimes', () => {
+    const plan = planMediaInjection(
+      [
+        { path: '/a.png', mimeType: 'image/png' },
+        { path: '/b.pdf', mimeType: 'application/pdf' },
+        { path: '/c.heic', mimeType: 'image/heic' },
+        { path: '/d.bin' },
+      ],
+      sizes({ '/a.png': 1000 })
+    );
+    expect(plan.inject.map((m) => m.path)).toEqual(['/a.png']);
+    expect(plan.fallback.map((m) => m.path)).toEqual(['/b.pdf', '/c.heic', '/d.bin']);
+  });
+
+  it('falls back oversize files and unstatable files', () => {
+    const plan = planMediaInjection(
+      [
+        { path: '/big.png', mimeType: 'image/png' },
+        { path: '/gone.png', mimeType: 'image/png' },
+        { path: '/ok.png', mimeType: 'image/png' },
+      ],
+      sizes({ '/big.png': MAX_MEDIA_FILE_BYTES + 1, '/gone.png': null, '/ok.png': 10 })
+    );
+    expect(plan.inject.map((m) => m.path)).toEqual(['/ok.png']);
+    expect(plan.fallback.map((m) => m.path)).toEqual(['/big.png', '/gone.png']);
+  });
+
+  it('enforces the running total cap across files', () => {
+    // Each file passes the per-file cap; the third breaches the turn total.
+    const nineMb = 9 * 1024 * 1024;
+    expect(nineMb).toBeLessThan(MAX_MEDIA_FILE_BYTES);
+    const plan = planMediaInjection(
+      [
+        { path: '/one.png', mimeType: 'image/png' },
+        { path: '/two.png', mimeType: 'image/png' },
+        { path: '/three.png', mimeType: 'image/png' },
+      ],
+      sizes({ '/one.png': nineMb, '/two.png': nineMb, '/three.png': nineMb })
+    );
+    expect(plan.inject.map((m) => m.path)).toEqual(['/one.png', '/two.png']);
+    expect(plan.fallback.map((m) => m.path)).toEqual(['/three.png']);
+  });
+});
+
+describe('ClaudeAdapter prepare — media injection', () => {
+  // 1x1 transparent PNG — a real image so base64 round-trips honestly.
+  const PNG_BYTES = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+    'base64'
+  );
+
+  let tmpDir: string;
+  let savedCwd: string;
+  let pngPath: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'claude-media-'));
+    writeFileSync(join(tmpDir, '.mcp.json'), JSON.stringify({ mcpServers: {} }));
+    pngPath = join(tmpDir, 'photo.png');
+    writeFileSync(pngPath, PNG_BYTES);
+    savedCwd = process.cwd();
+    process.chdir(tmpDir);
+  });
+
+  afterEach(() => {
+    process.chdir(savedCwd);
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('fully-injected media: stream-json stdin envelope, --tools stays empty', () => {
+    const adapter = new ClaudeAdapter();
+    expect(adapter.injectsMedia).toBe(true);
+    const prepared = adapter.prepare({
+      agentId: 'myra',
+      prompt: 'what is in this image?',
+      promptParts: ['what is in this image?'],
+      passthroughArgs: [],
+      toolRouting: 'local',
+      attachmentDirs: [tmpDir],
+      media: [{ path: pngPath, mimeType: 'image/png' }],
+    });
+    try {
+      expect(prepared.args).toContain('--input-format');
+      expect(prepared.args[prepared.args.indexOf('--input-format') + 1]).toBe('stream-json');
+      // Delivery turn is fully injected — the boundary stays closed.
+      const toolsIdx = prepared.args.indexOf('--tools');
+      expect(prepared.args[toolsIdx + 1]).toBe('');
+
+      const line = JSON.parse(prepared.stdinData!.trim());
+      expect(line.type).toBe('user');
+      expect(line.message.role).toBe('user');
+      expect(line.message.content[0]).toEqual({ type: 'text', text: 'what is in this image?' });
+      expect(line.message.content[1].type).toBe('image');
+      expect(line.message.content[1].source.media_type).toBe('image/png');
+      expect(Buffer.from(line.message.content[1].source.data, 'base64').equals(PNG_BYTES)).toBe(
+        true
+      );
+    } finally {
+      prepared.cleanup();
+    }
+  });
+
+  it('partially-injected media keeps the gated Read fallback for the rest', () => {
+    const pdfPath = join(tmpDir, 'doc.pdf');
+    writeFileSync(pdfPath, 'not really a pdf');
+    const adapter = new ClaudeAdapter();
+    const prepared = adapter.prepare({
+      agentId: 'myra',
+      prompt: 'summarize these',
+      promptParts: ['summarize these'],
+      passthroughArgs: [],
+      toolRouting: 'local',
+      attachmentDirs: [tmpDir],
+      media: [
+        { path: pngPath, mimeType: 'image/png' },
+        { path: pdfPath, mimeType: 'application/pdf' },
+      ],
+    });
+    try {
+      // Image still injected…
+      expect(prepared.args).toContain('--input-format');
+      // …but the uninjectable pdf keeps native Read on.
+      const toolsIdx = prepared.args.indexOf('--tools');
+      expect(prepared.args[toolsIdx + 1]).toBe('Read');
+    } finally {
+      prepared.cleanup();
+    }
+  });
+
+  it('text-only turns keep the plain stdin path', () => {
+    const adapter = new ClaudeAdapter();
+    const prepared = adapter.prepare({
+      agentId: 'myra',
+      prompt: 'hello',
+      promptParts: ['hello'],
+      passthroughArgs: [],
+      toolRouting: 'local',
+    });
+    try {
+      expect(prepared.args).not.toContain('--input-format');
+      expect(prepared.stdinData).toBe('hello');
     } finally {
       prepared.cleanup();
     }

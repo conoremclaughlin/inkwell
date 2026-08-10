@@ -7,6 +7,14 @@
 
 import type { BackendStreamParser } from './stream.js';
 
+/** A media file attached to a turn (downloaded by channel listeners). */
+export interface TurnMedia {
+  /** Absolute path on disk. */
+  path: string;
+  /** Detected from extension; adapters filter by what they can inject. */
+  mimeType?: string;
+}
+
 export interface BackendConfig {
   agentId: string;
   model?: string; // undefined = use backend's default model
@@ -43,6 +51,14 @@ export interface BackendConfig {
    * passthrough commands) omit this and keep today's behavior.
    */
   toolRouting?: 'backend' | 'local';
+  /**
+   * Media files attached to THIS turn (spec:provider-media-injection).
+   * Adapters that inject media embed them in the prompt envelope (claude:
+   * stream-json image content blocks; codex: `-i` flags) so the provider
+   * needs no filesystem tool to see them. attachmentDirs remains the
+   * native-read fallback for anything an adapter cannot inject.
+   */
+  media?: TurnMedia[];
 }
 
 export interface PreparedBackend {
@@ -62,6 +78,16 @@ export interface PreparedBackend {
 export interface BackendAdapter {
   readonly name: string;
   readonly binary: string;
+
+  /**
+   * Whether prepare() embeds BackendConfig.media into the prompt envelope
+   * (spec:provider-media-injection). Injecting adapters deliver media as
+   * prompt CONTENT — claude: stream-json image blocks over stdin; codex:
+   * `-i` flags — so wholly-in-ink routing needs no native filesystem tool
+   * for the delivery turn. Non-injecting adapters fall back to the
+   * attachment-gated native-read path.
+   */
+  readonly injectsMedia: boolean;
 
   /**
    * Prepare everything needed to spawn the backend process.

@@ -5,16 +5,72 @@
  * MCP config via --mcp-config <path>
  */
 
-import { existsSync } from 'fs';
+import { existsSync, readFileSync, statSync } from 'fs';
 import { execFileSync } from 'child_process';
 import { join } from 'path';
 import { homedir } from 'os';
 import { encodeContextToken } from '@inklabs/shared';
 import { buildIdentityPrompt } from './identity.js';
 import { buildMergedMcpConfig } from '../lib/skill-mcp.js';
-import type { BackendAdapter, BackendConfig, PreparedBackend } from './types.js';
+import type { BackendAdapter, BackendConfig, PreparedBackend, TurnMedia } from './types.js';
 import type { BackendStreamParser } from './stream.js';
 import { ClaudeStreamParser } from './claude-stream.js';
+
+/**
+ * Image types claude accepts as base64 content blocks (the Anthropic API
+ * set). Anything else — documents, audio, heic — stays on the native-read
+ * fallback until it has an injection story.
+ */
+const CLAUDE_INJECTABLE_MIME = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
+
+/**
+ * Size guards for injected media, mirroring provider request limits. Files
+ * over the cap (or past the running total) are NOT dropped — they fall back
+ * to the native-read path, and the --tools gate accounts for them.
+ */
+export const MAX_MEDIA_FILE_BYTES = 10 * 1024 * 1024;
+export const MAX_MEDIA_TOTAL_BYTES = 25 * 1024 * 1024;
+
+export interface MediaInjectionPlan {
+  /** Media that will be embedded as base64 image content blocks. */
+  inject: TurnMedia[];
+  /** Media left to the native-read fallback (wrong type, too big, unstatable). */
+  fallback: TurnMedia[];
+}
+
+/**
+ * Decide which media can be injected. Pure given a size probe so the
+ * mime/size policy is unit-testable without multi-megabyte fixtures.
+ */
+export function planMediaInjection(
+  media: TurnMedia[],
+  fileSize: (path: string) => number | null
+): MediaInjectionPlan {
+  const plan: MediaInjectionPlan = { inject: [], fallback: [] };
+  let totalBytes = 0;
+  for (const m of media) {
+    if (!CLAUDE_INJECTABLE_MIME.has(m.mimeType ?? '')) {
+      plan.fallback.push(m);
+      continue;
+    }
+    const size = fileSize(m.path);
+    if (size === null || size > MAX_MEDIA_FILE_BYTES || totalBytes + size > MAX_MEDIA_TOTAL_BYTES) {
+      plan.fallback.push(m);
+      continue;
+    }
+    totalBytes += size;
+    plan.inject.push(m);
+  }
+  return plan;
+}
+
+function statSizeSync(path: string): number | null {
+  try {
+    return statSync(path).size;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Once-per-process probe for `--include-partial-messages` support. This runs
@@ -37,11 +93,41 @@ function supportsPartialMessages(): boolean {
 export class ClaudeAdapter implements BackendAdapter {
   readonly name = 'claude';
   readonly binary = 'claude';
+  readonly injectsMedia = true;
 
   prepare(config: BackendConfig): PreparedBackend {
     const identityPrompt = buildIdentityPrompt(config.agentId);
 
     const args: string[] = [];
+
+    // Media injection (spec:provider-media-injection): embed images as
+    // base64 content blocks in a stream-json user message instead of having
+    // the provider pull them via native Read. Requires prompt mode (the
+    // message rides stdin). Files that can't be injected (non-image, too
+    // big, unreadable at encode time) fall back to native read and keep the
+    // --tools gate open below.
+    const media = config.media ?? [];
+    const plan = config.prompt ? planMediaInjection(media, statSizeSync) : undefined;
+    const imageBlocks: Array<Record<string, unknown>> = [];
+    let injectedCount = 0;
+    if (plan) {
+      for (const m of plan.inject) {
+        try {
+          imageBlocks.push({
+            type: 'image',
+            source: {
+              type: 'base64',
+              media_type: m.mimeType,
+              data: readFileSync(m.path).toString('base64'),
+            },
+          });
+          injectedCount += 1;
+        } catch {
+          // Vanished between stat and read — native-read fallback covers it.
+        }
+      }
+    }
+    const injecting = injectedCount > 0;
 
     // Prompt mode vs interactive. The prompt is passed via stdin (not argv):
     // transcripts can exceed the OS argv limit (~256KB on macOS), which
@@ -110,14 +196,16 @@ export class ClaudeAdapter implements BackendAdapter {
       // only withholds servers, not native Bash/Edit/WebSearch/ToolSearch —
       // all of which would bypass ink's tool policy entirely.
       //
-      // NAMED EXCEPTION (not "wholly in ink" — pending Conor's explicit
-      // ratification, PR #462 review 4894464925): native Read is exposed
-      // ONLY for attachment-bearing sessions. It is the multimodal render
-      // path for --attach-file media (images cannot flow through ink-block
-      // tools); the --add-dir grants below exist exactly for it. Sessions
-      // without attachments get no built-in tools at all.
+      // NAMED EXCEPTION (Conor-ratified, spec:wholly-in-ink-tool-routing):
+      // native Read is exposed ONLY when this spawn carries attachments that
+      // were NOT injected as prompt content — non-image files, oversize
+      // images, callers that didn't thread media, or re-view turns after the
+      // delivery turn. A turn whose media is fully injected gets no built-in
+      // tools at all (spec:provider-media-injection).
       const hasAttachments = (config.attachmentDirs?.length ?? 0) > 0;
-      args.push('--tools', hasAttachments ? 'Read' : '');
+      const needsNativeRead =
+        hasAttachments && (media.length === 0 || injectedCount < media.length);
+      args.push('--tools', needsNativeRead ? 'Read' : '');
     }
 
     // Auto-approve: skip all permission prompts
@@ -165,6 +253,22 @@ export class ClaudeAdapter implements BackendAdapter {
       runtime: 'claude',
     });
 
+    // Injected turns switch stdin to stream-json: one JSONL user message
+    // whose content is the prompt text plus base64 image blocks. Text-only
+    // turns keep the plain-stdin path — smallest blast radius.
+    let stdinData = config.prompt;
+    if (injecting && config.prompt) {
+      args.push('--input-format', 'stream-json');
+      stdinData =
+        JSON.stringify({
+          type: 'user',
+          message: {
+            role: 'user',
+            content: [{ type: 'text', text: config.prompt }, ...imageBlocks],
+          },
+        }) + '\n';
+    }
+
     return {
       binary: this.binary,
       args,
@@ -175,7 +279,7 @@ export class ClaudeAdapter implements BackendAdapter {
         ...(config.studioId ? { INK_STUDIO_ID: config.studioId } : {}),
       },
       cleanup: mcpCleanup,
-      ...(config.prompt ? { stdinData: config.prompt } : {}),
+      ...(stdinData ? { stdinData } : {}),
     };
   }
 

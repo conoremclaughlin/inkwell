@@ -84,7 +84,9 @@ export function buildAttachmentBlock(attachments: ResolvedAttachment[]): string 
       `- ${a.path}${meta ? ` (${meta})` : ''}${a.missing ? ' — MISSING (not readable)' : ''}`
     );
   }
-  lines.push('View attached files with your file-reading tool using the paths above.');
+  lines.push(
+    'Images may be attached inline with this message; use your file-reading tool (when available) for any files not shown inline.'
+  );
   return lines.join('\n');
 }
 

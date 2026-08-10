@@ -100,6 +100,32 @@ describe('backend adapters session resume wiring', () => {
     }
   });
 
+  it('injects image media as exec-scoped -i flags, skipping non-images', () => {
+    const adapter = new CodexAdapter();
+    const prepared = adapter.prepare({
+      agentId: 'lumen',
+      model: undefined,
+      promptParts: ['exec', 'what is in this image?'],
+      passthroughArgs: [],
+      media: [
+        { path: '/tmp/photo.png', mimeType: 'image/png' },
+        { path: '/tmp/doc.pdf', mimeType: 'application/pdf' },
+      ],
+    });
+
+    try {
+      const execIndex = prepared.args.indexOf('exec');
+      const iIndex = prepared.args.indexOf('-i');
+      // -i is an exec-scoped option: after `exec`, before the prompt text.
+      expect(iIndex).toBeGreaterThan(execIndex);
+      expect(prepared.args[iIndex + 1]).toBe('/tmp/photo.png');
+      expect(prepared.args).not.toContain('/tmp/doc.pdf');
+      expect(prepared.args.indexOf('what is in this image?')).toBeGreaterThan(iIndex);
+    } finally {
+      prepared.cleanup();
+    }
+  });
+
   it('places codex passthrough args after exec subcommand', () => {
     const adapter = new CodexAdapter();
     const prepared = adapter.prepare({
