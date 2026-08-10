@@ -19,6 +19,7 @@ import {
   findThread as findExistingThread,
   getParticipants,
   resolveTriggeredAgents,
+  handleGetThreadMessages,
 } from './thread-handlers.js';
 import { resolveStudioHint } from '../../services/sessions/index.js';
 
@@ -179,6 +180,16 @@ const getInboxSchema = userIdentifierBaseSchema.extend({
     .datetime()
     .optional()
     .describe('Only return messages created after this ISO timestamp'),
+  threadKey: z
+    .string()
+    .regex(/^[a-zA-Z][a-zA-Z0-9_-]*:[^\s]+$/)
+    .optional()
+    .describe(
+      'Filter to a conversation thread. Aliases through to get_thread_messages ' +
+        '(thread messages are stored separately from the legacy inbox; participant ' +
+        'membership and read-state are respected). Requires agentId. status "all" ' +
+        'maps to the full thread history; priority/messageType/since do not apply.'
+    ),
   channelPoll: z
     .boolean()
     .optional()
@@ -940,6 +951,37 @@ async function findOrCreateThread(
 export async function handleGetInbox(args: unknown, dataComposer: DataComposer) {
   const supabase = dataComposer.getClient();
   const parsed = getInboxSchema.parse(args);
+
+  // threadKey aliases through to get_thread_messages (Conor, 2026-08-10):
+  // thread messages live in the thread tables, not agent_inbox, and a
+  // threadKey is effectively the conversation's title — callers reaching for
+  // the inbox with one want the thread timeline, not a silently-empty legacy
+  // query. Participant membership and read-state checks are the delegate's.
+  if (parsed.threadKey) {
+    if (!parsed.agentId) {
+      throw new Error(
+        'get_inbox with threadKey requires agentId — thread access is participant-scoped. ' +
+          'Pass your agentId, or use get_thread_messages directly.'
+      );
+    }
+    return handleGetThreadMessages(
+      {
+        ...(parsed.userId ? { userId: parsed.userId } : {}),
+        ...(parsed.email ? { email: parsed.email } : {}),
+        ...(parsed.phone ? { phone: parsed.phone } : {}),
+        ...(parsed.platform ? { platform: parsed.platform } : {}),
+        ...(parsed.platformId ? { platformId: parsed.platformId } : {}),
+        agentId: parsed.agentId,
+        threadKey: parsed.threadKey,
+        limit: parsed.limit ?? 20,
+        // The inbox's "unread by default" maps to the thread read pointer;
+        // status 'all' maps to the full timeline.
+        ...(parsed.status === 'all' ? { fullHistory: true } : {}),
+      },
+      dataComposer
+    );
+  }
+
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
   const { status = 'unread', priority, messageType, limit = 20, since, channelPoll } = parsed;
@@ -1846,7 +1888,7 @@ export const inboxToolDefinitions = [
   {
     name: 'get_inbox',
     description:
-      "Get messages from an agent's inbox. Returns unread messages by default. Omit agentId to get inbox across ALL agents in one query (useful for unified timelines like mission control). Sorted by created_at descending.",
+      "Get messages from an agent's inbox. Returns unread messages by default. Omit agentId to get inbox across ALL agents in one query (useful for unified timelines like mission control). Sorted by created_at descending. Pass threadKey to read a conversation thread instead — this aliases through to get_thread_messages (thread messages are stored separately from the legacy inbox) and requires agentId.",
     schema: getInboxSchema,
     handler: handleGetInbox,
   },
