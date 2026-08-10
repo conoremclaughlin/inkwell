@@ -1,6 +1,7 @@
 import { spawnBackend } from '@inklabs/shared';
 import { getBackend } from '../backends/index.js';
 import type { BackendTurnEvent } from '../backends/stream.js';
+import type { TurnMedia } from '../backends/types.js';
 import { extractBackendTokenUsage, type BackendTokenUsage } from './token-usage.js';
 
 /**
@@ -60,6 +61,13 @@ export interface BackendRunRequest {
    * ('local') routing withholds tool-bearing MCP servers from the provider.
    */
   toolRouting?: 'backend' | 'local';
+  /**
+   * Media files attached to this turn — injecting adapters embed them in
+   * the prompt envelope (spec:provider-media-injection).
+   */
+  media?: TurnMedia[];
+  /** True on delivery spawns (initial/reseed); omitted on same-turn continuations. */
+  deliverMedia?: boolean;
 }
 
 export interface BackendRunResult {
@@ -104,6 +112,8 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
     backendSessionSeedId: request.backendSessionSeedId,
     stream: streaming,
     toolRouting: request.toolRouting,
+    media: request.media,
+    deliverMedia: request.deliverMedia,
   });
 
   const command = `${prepared.binary} ${prepared.args.join(' ')}`;

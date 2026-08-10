@@ -30,6 +30,7 @@ import {
 import { startBackendTurn, runBackendTurn } from '../repl/backend-runner.js';
 import { StreamedTurnRenderer, type StreamedLine } from '../repl/paragraph-stream.js';
 import type { BackendTurnEvent } from '../backends/stream.js';
+import type { TurnMedia } from '../backends/types.js';
 import { startSessionEventStream, type SessionEvent } from '../repl/session-event-stream.js';
 import {
   ContextLedger,
@@ -4001,10 +4002,18 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // files. Server spawns (InkRunner) pass --attach-file per media item.
   let pendingAttachmentBlock = '';
   let sessionAttachmentDirs: string[] = [];
+  // Media for the DELIVERY turn only (spec:provider-media-injection):
+  // injecting adapters embed these as prompt content on the turn that
+  // carries the attachment block. Later turns re-view via the gated
+  // native-read fallback (dirs stay granted for the session).
+  let pendingTurnMedia: TurnMedia[] = [];
   if (options.attachFile && options.attachFile.length > 0) {
     const resolvedAttachments = await resolveAttachments(options.attachFile);
     pendingAttachmentBlock = buildAttachmentBlock(resolvedAttachments);
     sessionAttachmentDirs = collectAttachmentDirs(resolvedAttachments);
+    pendingTurnMedia = resolvedAttachments
+      .filter((a) => !a.missing)
+      .map((a) => ({ path: a.path, ...(a.mime ? { mimeType: a.mime } : {}) }));
     const missingAttachments = resolvedAttachments.filter((a) => a.missing);
     if (missingAttachments.length > 0) {
       console.log(
@@ -4025,11 +4034,15 @@ export async function runChat(options: ChatOptions): Promise<void> {
     if (!raw.trim()) return;
     streamRenderer.reset();
     // Attach pending files to this turn — append the block so the backend
-    // sees the paths inline with the message that delivered them.
+    // sees the paths inline with the message that delivered them. The media
+    // list rides the same turn (injected as prompt content by adapters that
+    // support it) and is consumed here so continuations don't re-inject.
     if (pendingAttachmentBlock) {
       raw = `${raw}\n\n${pendingAttachmentBlock}`;
       pendingAttachmentBlock = '';
     }
+    const turnMedia = pendingTurnMedia;
+    pendingTurnMedia = [];
     // NOTE: display echo happens at SUBMIT time in enqueueTurn — a message
     // typed while another turn is in flight must appear immediately, not when
     // the queue reaches it. Ledger/transcript appends stay here, sequenced
@@ -4306,6 +4319,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
       onEvent: handleBackendEvent,
       attachmentDirs: sessionAttachmentDirs.length > 0 ? sessionAttachmentDirs : undefined,
       toolRouting: runtime.toolRouting,
+      // Delivery spawn: embed this turn's media even when resuming a
+      // recovered provider session — new media on an existing conversation
+      // must reach the provider (heartbeat/reattach path).
+      media: turnMedia.length > 0 ? turnMedia : undefined,
+      ...(turnMedia.length > 0 ? { deliverMedia: true } : {}),
       // Seed a fresh provider session (first spawn) OR resume the live one
       // (subsequent turns). Tool-loop continuations below always resume it.
       ...(seedProviderSessionId ? { backendSessionSeedId: seedProviderSessionId } : {}),
@@ -4363,6 +4381,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
         onEvent: handleBackendEvent,
         attachmentDirs: sessionAttachmentDirs.length > 0 ? sessionAttachmentDirs : undefined,
         toolRouting: runtime.toolRouting,
+        // The reseeded provider session is fresh — re-inject this turn's
+        // media so the full envelope carries the images too.
+        media: turnMedia.length > 0 ? turnMedia : undefined,
+        ...(turnMedia.length > 0 ? { deliverMedia: true } : {}),
         backendSessionSeedId: reseedId,
       });
       currentTurnAbort = reseedTurn.abort;
@@ -4824,6 +4846,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
         onEvent: handleBackendEvent,
         attachmentDirs: sessionAttachmentDirs.length > 0 ? sessionAttachmentDirs : undefined,
         toolRouting: runtime.toolRouting,
+        // Same logical turn — media rides along (WITHOUT deliverMedia) so
+        // the adapter's boundary disposition (--tools gate) cannot flap
+        // between the delivery spawn and tool-loop continuations, while the
+        // resumed provider session is never re-fed images it already holds.
+        // Stateless adapters re-attach from `media` regardless.
+        media: turnMedia.length > 0 ? turnMedia : undefined,
         // Resume the live provider session so this round-trip appends to the
         // same Claude thread instead of re-piping the whole window.
         ...(activeBackendSessionId ? { backendSessionId: activeBackendSessionId } : {}),
