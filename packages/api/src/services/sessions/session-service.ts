@@ -558,17 +558,29 @@ export class SessionService implements ISessionService {
 
     // Resolve sandbox_bypass: studio override > SB default > false
     let sandboxBypass = false;
+    // Per-SB runtime config (dashboard-tunable): continuation-loop cap and
+    // tool routing for ink spawns. Lives in agent_identities.metadata.
+    let runtimeMaxTurns: number | undefined;
+    let runtimeToolRouting: 'backend' | 'local' | undefined;
     if (this.supabase) {
       // SB-level default from agent_identities
       const { data: identity } = await this.supabase
         .from('agent_identities')
-        .select('sandbox_bypass')
+        .select('sandbox_bypass, metadata')
         .eq('user_id', userId)
         .eq('agent_id', agentId)
         .order('updated_at', { ascending: false })
         .limit(1)
         .maybeSingle();
       sandboxBypass = identity?.sandbox_bypass ?? false;
+      const identityMeta = (identity?.metadata ?? {}) as Record<string, unknown>;
+      const runtimeConfig = (identityMeta.runtimeConfig ?? {}) as Record<string, unknown>;
+      if (typeof runtimeConfig.maxTurns === 'number' && Number.isFinite(runtimeConfig.maxTurns)) {
+        runtimeMaxTurns = runtimeConfig.maxTurns;
+      }
+      if (runtimeConfig.toolRouting === 'local' || runtimeConfig.toolRouting === 'backend') {
+        runtimeToolRouting = runtimeConfig.toolRouting;
+      }
 
       // Studio-level override (null = inherit from SB)
       if (session.studioId) {
@@ -623,6 +635,8 @@ export class SessionService implements ISessionService {
       channel: request.channel,
       ...(session.studioId ? { studioId: session.studioId } : {}),
       ...(sandboxBypass ? { sandboxBypass: true } : {}),
+      ...(runtimeMaxTurns !== undefined ? { maxTurns: runtimeMaxTurns } : {}),
+      ...(runtimeToolRouting ? { toolRouting: runtimeToolRouting } : {}),
       ...(permissionOverlay ? { permissionOverlay } : {}),
       // Propagate repo root so spawned backend's context token carries it
       repoRoot: resolvedWorkingDirectory.replace(/--[^/]+$/, ''),

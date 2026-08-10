@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { InkRunner } from './ink-runner';
+import { InkRunner, DEFAULT_MAX_TURNS, clampMaxTurns } from './ink-runner';
 
 vi.mock('../../utils/logger', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -21,6 +21,47 @@ describe('InkRunner', () => {
       expect(args).toContain('--max-turns');
       expect(args).toContain('--session-id');
       expect(args).toContain('session-123');
+    });
+
+    it('defaults --max-turns to DEFAULT_MAX_TURNS when no per-SB value is set', () => {
+      const runner = new InkRunner();
+      const args = (runner as any).buildArgs('session-mt', {
+        workingDirectory: '/tmp',
+        agentId: 'myra',
+      });
+
+      const idx = args.indexOf('--max-turns');
+      expect(idx).toBeGreaterThan(-1);
+      expect(args[idx + 1]).toBe(String(DEFAULT_MAX_TURNS));
+    });
+
+    it('honors a dashboard-configured maxTurns, clamped to a sane range', () => {
+      const runner = new InkRunner();
+      const args = (runner as any).buildArgs('session-mt2', {
+        workingDirectory: '/tmp',
+        agentId: 'myra',
+        maxTurns: 12,
+      });
+      const idx = args.indexOf('--max-turns');
+      expect(args[idx + 1]).toBe('12');
+    });
+
+    it('forwards dashboard-configured tool routing, omits the flag when unset', () => {
+      const runner = new InkRunner();
+      const withRouting = (runner as any).buildArgs('session-tr', {
+        workingDirectory: '/tmp',
+        agentId: 'myra',
+        toolRouting: 'local',
+      });
+      const idx = withRouting.indexOf('--tool-routing');
+      expect(idx).toBeGreaterThan(-1);
+      expect(withRouting[idx + 1]).toBe('local');
+
+      const withoutRouting = (runner as any).buildArgs('session-tr2', {
+        workingDirectory: '/tmp',
+        agentId: 'myra',
+      });
+      expect(withoutRouting).not.toContain('--tool-routing');
     });
 
     it('includes --model when specified', () => {
@@ -228,5 +269,21 @@ describe('InkRunner', () => {
       expect(result.responses[0].content).toBe('Routed via MCP');
       expect(result.finalTextResponse).toBe('Fallback text from ledger');
     });
+  });
+});
+
+describe('clampMaxTurns', () => {
+  it('defaults when absent or non-finite', () => {
+    expect(clampMaxTurns(undefined)).toBe(DEFAULT_MAX_TURNS);
+    expect(clampMaxTurns(Number.NaN)).toBe(DEFAULT_MAX_TURNS);
+    expect(clampMaxTurns(Number.POSITIVE_INFINITY)).toBe(DEFAULT_MAX_TURNS);
+  });
+
+  it('clamps to [1, 25] and rounds fractions', () => {
+    expect(clampMaxTurns(0)).toBe(1);
+    expect(clampMaxTurns(-3)).toBe(1);
+    expect(clampMaxTurns(99)).toBe(25);
+    expect(clampMaxTurns(7.6)).toBe(8);
+    expect(clampMaxTurns(5)).toBe(5);
   });
 });

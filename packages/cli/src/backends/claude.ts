@@ -99,12 +99,25 @@ export class ClaudeAdapter implements BackendAdapter {
     // MCP config: merge project .mcp.json with skill-provided MCP servers.
     // Pass pcpSessionId/studioId explicitly — process.env doesn't have them yet
     // (they're set in the spawn env below, not in the sb CLI's own env).
+    //
+    // Ink-owned routing (wholly-in-ink): tool-bearing servers are withheld
+    // structurally. `--allowedTools ''` cannot do this — it is a permission
+    // auto-approve list, nullified by --dangerously-skip-permissions — so the
+    // provider must never see the servers at all. `--strict-mcp-config` is
+    // essential: without it claude merges user/project-scope MCP configs on
+    // its own, and the withheld servers leak straight back in. (Same pattern
+    // openclaw uses: `--strict-mcp-config --mcp-config <controlled>`.)
+    const localRouting = config.toolRouting === 'local';
     const { mcpConfigPath, cleanup: mcpCleanup } = buildMergedMcpConfig(process.cwd(), {
       pcpSessionId: config.pcpSessionId,
       studioId: config.studioId,
+      omitToolServers: localRouting,
     });
     if (mcpConfigPath) {
       args.push('--mcp-config', mcpConfigPath);
+    }
+    if (localRouting) {
+      args.push('--strict-mcp-config');
     }
 
     // Auto-approve: skip all permission prompts

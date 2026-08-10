@@ -38,6 +38,18 @@ import { injectSessionHeaders, buildSessionEnv, writeRuntimeSessionHint } from '
 export const PROCESS_TIMEOUT_MS =
   parseInt(process.env.INK_PROCESS_TIMEOUT_MS || '', 10) || 4 * 60 * 60 * 1000;
 
+// Continuation-loop turn cap when the SB's dashboard settings don't specify
+// one (agent_identities.metadata.runtimeConfig.maxTurns). Deliberately modest:
+// signal_status is the sanctioned in-loop halt, so this only bounds runaway
+// continuations — and each extra turn is a full provider spawn.
+export const DEFAULT_MAX_TURNS = 5;
+
+/** Clamp a dashboard-supplied turn cap to a sane range; default when absent. */
+export function clampMaxTurns(value: number | undefined): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return DEFAULT_MAX_TURNS;
+  return Math.min(25, Math.max(1, Math.round(value)));
+}
+
 // Inactivity timeout — the primary liveness guard. The countdown resets on any
 // stdout/stderr activity from the ink subprocess. A working turn emits a steady
 // stream of events (one NDJSON line per tool call, plus status chrome), so it
@@ -173,7 +185,16 @@ export class InkRunner implements IRunner {
 
     // Turn backstop only — the real limit is the CLI's token budget
     // (200K default), which auto-compacts the transcript when approached.
-    args.push('--max-turns', '15');
+    // Per-SB tunable from the dashboard (runtimeConfig.maxTurns); the chat
+    // loop halts earlier when the model signals completion via signal_status.
+    args.push('--max-turns', String(clampMaxTurns(config.maxTurns)));
+
+    // Dashboard-configured tool routing. When set, this overrides the chat
+    // loop's own resolution (.ink/identity.json → default 'local'), making
+    // the SB's settings page authoritative for server spawns.
+    if (config.toolRouting) {
+      args.push('--tool-routing', config.toolRouting);
+    }
 
     // Use the safe profile with away mode for non-interactive spawns.
     // Safe profile allows read tools freely but requires approval for

@@ -4272,6 +4272,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       stream: true,
       onEvent: handleBackendEvent,
       attachmentDirs: sessionAttachmentDirs.length > 0 ? sessionAttachmentDirs : undefined,
+      toolRouting: runtime.toolRouting,
       // Seed a fresh provider session (first spawn) OR resume the live one
       // (subsequent turns). Tool-loop continuations below always resume it.
       ...(seedProviderSessionId ? { backendSessionSeedId: seedProviderSessionId } : {}),
@@ -4324,6 +4325,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         stream: true,
         onEvent: handleBackendEvent,
         attachmentDirs: sessionAttachmentDirs.length > 0 ? sessionAttachmentDirs : undefined,
+        toolRouting: runtime.toolRouting,
         backendSessionSeedId: reseedId,
       });
       currentTurnAbort = reseedTurn.abort;
@@ -4784,6 +4786,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         stream: true,
         onEvent: handleBackendEvent,
         attachmentDirs: sessionAttachmentDirs.length > 0 ? sessionAttachmentDirs : undefined,
+        toolRouting: runtime.toolRouting,
         // Resume the live provider session so this round-trip appends to the
         // same Claude thread instead of re-piping the whole window.
         ...(activeBackendSessionId ? { backendSessionId: activeBackendSessionId } : {}),

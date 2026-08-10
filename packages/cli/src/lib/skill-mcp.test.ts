@@ -374,3 +374,108 @@ mcp:
     }
   });
 });
+
+describe('buildMergedMcpConfig omitToolServers (wholly-in-ink)', () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'local-mcp-'));
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('drops tool-bearing servers, keeps the inkmail channel bridge', () => {
+    writeFileSync(
+      join(tmpDir, '.mcp.json'),
+      JSON.stringify({
+        mcpServers: {
+          inkwell: { type: 'http', url: 'http://localhost:3001/mcp' },
+          supabase: { type: 'http', url: 'http://127.0.0.1:54321/mcp' },
+          github: { type: 'http', url: 'https://api.github.com/mcp' },
+          playwright: { type: 'stdio', command: 'npx', args: ['@playwright/mcp'] },
+          inkmail: { command: 'npx', args: ['tsx', '/path/to/channel-plugin/index.ts'] },
+        },
+      })
+    );
+
+    const { mcpConfigPath, cleanup } = buildMergedMcpConfig(tmpDir, { omitToolServers: true });
+    try {
+      // Never the project config itself — always a controlled temp file.
+      expect(mcpConfigPath).not.toBe(join(tmpDir, '.mcp.json'));
+      const config = JSON.parse(readFileSync(mcpConfigPath!, 'utf-8'));
+      expect(Object.keys(config.mcpServers)).toEqual(['inkmail']);
+      // The channel bridge passes through untouched (no header decoration).
+      expect(config.mcpServers.inkmail).toEqual({
+        command: 'npx',
+        args: ['tsx', '/path/to/channel-plugin/index.ts'],
+      });
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('keeps skill-provided servers alongside the channel bridge', () => {
+    writeFileSync(
+      join(tmpDir, '.mcp.json'),
+      JSON.stringify({
+        mcpServers: {
+          inkwell: { type: 'http', url: 'http://localhost:3001/mcp' },
+          inkmail: { command: 'npx', args: ['tsx', 'plugin.ts'] },
+        },
+      })
+    );
+    const skillDir = join(tmpDir, '.pcp', 'skills', 'my-skill');
+    mkdirSync(skillDir, { recursive: true });
+    writeFileSync(
+      join(skillDir, 'SKILL.md'),
+      `---
+name: my-skill
+description: Test skill
+mcp:
+  name: my-server
+  command: npx
+  args: ["@my/mcp-server"]
+---
+
+# My Skill
+`
+    );
+
+    const { mcpConfigPath, cleanup } = buildMergedMcpConfig(tmpDir, { omitToolServers: true });
+    try {
+      const config = JSON.parse(readFileSync(mcpConfigPath!, 'utf-8'));
+      expect(Object.keys(config.mcpServers).sort()).toEqual(['inkmail', 'my-server']);
+      expect(config.mcpServers['my-server']).toEqual({
+        type: 'stdio',
+        command: 'npx',
+        args: ['@my/mcp-server'],
+      });
+      expect(config.mcpServers.inkwell).toBeUndefined();
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('returns an empty (but valid) config when there is no project .mcp.json', () => {
+    const { mcpConfigPath, cleanup } = buildMergedMcpConfig(tmpDir, { omitToolServers: true });
+    try {
+      // Still a real file: paired with --strict-mcp-config this means
+      // "no MCP servers at all" rather than falling back to claude's own
+      // user/project-scope config merging.
+      expect(mcpConfigPath).not.toBeNull();
+      const config = JSON.parse(readFileSync(mcpConfigPath!, 'utf-8'));
+      expect(config.mcpServers).toEqual({});
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('cleanup removes the temp file', () => {
+    const { mcpConfigPath, cleanup } = buildMergedMcpConfig(tmpDir, { omitToolServers: true });
+    expect(existsSync(mcpConfigPath!)).toBe(true);
+    cleanup();
+    expect(existsSync(mcpConfigPath!)).toBe(false);
+  });
+});

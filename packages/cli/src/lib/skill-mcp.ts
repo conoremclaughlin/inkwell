@@ -44,7 +44,10 @@ export function parseSkillMcpConfig(skillPath: string): SkillMcpServer | null {
   //     command: <string>
   //     args: [...]
   //     env: {}
-  const mcpMatch = frontmatter.match(/^mcp:\s*\n((?:  .+\n)*)/m);
+  // `\n?` on the last line: the frontmatter capture strips the newline before
+  // the closing ---, so an mcp block that ends the frontmatter would otherwise
+  // silently lose its final property.
+  const mcpMatch = frontmatter.match(/^mcp:\s*\n((?:  .+\n?)*)/m);
   if (!mcpMatch) return null;
 
   const mcpBlock = mcpMatch[1];
@@ -138,6 +141,15 @@ interface McpJsonConfig {
 }
 
 /**
+ * MCP servers that survive tool withholding (`omitToolServers`). These are
+ * channel bridges, not tool providers: `inkmail` is resolved by name via
+ * `--dangerously-load-development-channels server:inkmail` and registers zero
+ * model-callable tools — dropping it kills inbox push notifications without
+ * withholding anything.
+ */
+const CHANNEL_SERVER_NAMES = new Set(['inkmail']);
+
+/**
  * Build a merged MCP config that includes both the project's .mcp.json
  * and any skill-provided MCP servers. Also injects PCP session/studio
  * headers via the shared injectSessionHeaders utility.
@@ -148,16 +160,65 @@ interface McpJsonConfig {
  *
  * Returns the path to a temp file and a cleanup function.
  * When no modifications are needed, returns the original .mcp.json path.
+ *
+ * With `omitToolServers` (wholly-in-ink, ink-owned tool routing) the project
+ * config's tool-bearing servers (inkwell, supabase, github, …) are dropped:
+ * only channel bridges and skill-provided servers reach the provider. The
+ * result is always a temp file, even when empty — the adapter pairs it with
+ * `--strict-mcp-config` so an empty config means "no MCP servers at all".
  */
 export function buildMergedMcpConfig(
   cwd: string,
-  options?: { pcpSessionId?: string; studioId?: string }
+  options?: { pcpSessionId?: string; studioId?: string; omitToolServers?: boolean }
 ): {
   mcpConfigPath: string | null;
   cleanup: () => void;
 } {
   const projectMcpPath = join(cwd, '.mcp.json');
   const hasProjectConfig = existsSync(projectMcpPath);
+
+  if (options?.omitToolServers) {
+    // Header injection is intentionally skipped here: it only decorates the
+    // tool servers being dropped. Channel bridges get their context from the
+    // spawn env (INK_CONTEXT), not from config headers.
+    const config: McpJsonConfig = { mcpServers: {} };
+    if (hasProjectConfig) {
+      try {
+        const parsed = JSON.parse(readFileSync(projectMcpPath, 'utf-8')) as Partial<McpJsonConfig>;
+        for (const [name, server] of Object.entries(parsed.mcpServers ?? {})) {
+          if (CHANNEL_SERVER_NAMES.has(name)) {
+            config.mcpServers[name] = server;
+          }
+        }
+      } catch {
+        // Unreadable project config — start from an empty server set.
+      }
+    }
+    for (const server of discoverSkillMcpServers(cwd)) {
+      if (!config.mcpServers[server.name]) {
+        config.mcpServers[server.name] = {
+          type: 'stdio',
+          command: server.command,
+          args: server.args,
+          ...(server.env ? { env: server.env } : {}),
+        };
+      }
+    }
+    const tmpDir = join(tmpdir(), 'sb-mcp');
+    mkdirSync(tmpDir, { recursive: true });
+    const tmpPath = join(tmpDir, `mcp-local-${process.pid}.json`);
+    writeFileSync(tmpPath, JSON.stringify(config, null, 2));
+    return {
+      mcpConfigPath: tmpPath,
+      cleanup: () => {
+        try {
+          unlinkSync(tmpPath);
+        } catch {
+          // Best-effort cleanup
+        }
+      },
+    };
+  }
 
   // ── Layer 1: Session header injection (shared logic) ──
   // Delegates to the same injectSessionHeaders used by server runners.

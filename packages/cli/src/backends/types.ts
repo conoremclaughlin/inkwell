@@ -33,6 +33,16 @@ export interface BackendConfig {
    * ignore it and run in plain-text mode.
    */
   stream?: boolean;
+  /**
+   * The chat loop's tool routing for this turn. 'local' = ink owns the
+   * agentic loop (wholly-in-ink): the provider must not see tool-bearing MCP
+   * servers, so adapters withhold them structurally (claude:
+   * `--strict-mcp-config` + a config filtered to channel bridges and skill
+   * servers). 'backend' or undefined = provider-owned loop; the MCP config
+   * passes through unchanged. Callers outside the chat loop (awaken,
+   * passthrough commands) omit this and keep today's behavior.
+   */
+  toolRouting?: 'backend' | 'local';
 }
 
 export interface PreparedBackend {
