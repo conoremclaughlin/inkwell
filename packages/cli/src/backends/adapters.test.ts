@@ -100,7 +100,11 @@ describe('backend adapters session resume wiring', () => {
     }
   });
 
-  it('injects image media as exec-scoped -i flags, skipping non-images', () => {
+  it('injects image media as parse-safe --image= flags terminated by --', () => {
+    // Variadic `-i <FILE>...` swallows the following positional prompt
+    // (Lumen probe, codex 0.146.1, PR #463 review 4900120086). The
+    // single-value `--image=` binding plus a `--` options terminator keeps
+    // the prompt a positional under all parse rules.
     const adapter = new CodexAdapter();
     const prepared = adapter.prepare({
       agentId: 'lumen',
@@ -109,18 +113,37 @@ describe('backend adapters session resume wiring', () => {
       passthroughArgs: [],
       media: [
         { path: '/tmp/photo.png', mimeType: 'image/png' },
+        { path: '/tmp/pic.jpg', mimeType: 'image/jpeg' },
         { path: '/tmp/doc.pdf', mimeType: 'application/pdf' },
       ],
     });
 
     try {
       const execIndex = prepared.args.indexOf('exec');
-      const iIndex = prepared.args.indexOf('-i');
-      // -i is an exec-scoped option: after `exec`, before the prompt text.
-      expect(iIndex).toBeGreaterThan(execIndex);
-      expect(prepared.args[iIndex + 1]).toBe('/tmp/photo.png');
+      const promptIndex = prepared.args.indexOf('what is in this image?');
+      expect(prepared.args.slice(execIndex + 1, promptIndex)).toEqual([
+        '--image=/tmp/photo.png',
+        '--image=/tmp/pic.jpg',
+        '--',
+      ]);
       expect(prepared.args).not.toContain('/tmp/doc.pdf');
-      expect(prepared.args.indexOf('what is in this image?')).toBeGreaterThan(iIndex);
+      expect(prepared.args).not.toContain('-i');
+    } finally {
+      prepared.cleanup();
+    }
+  });
+
+  it('media-free exec turns get no --image flags and no -- terminator', () => {
+    const adapter = new CodexAdapter();
+    const prepared = adapter.prepare({
+      agentId: 'lumen',
+      model: undefined,
+      promptParts: ['exec', 'plain work'],
+      passthroughArgs: [],
+    });
+    try {
+      expect(prepared.args).not.toContain('--');
+      expect(prepared.args.some((a) => a.startsWith('--image='))).toBe(false);
     } finally {
       prepared.cleanup();
     }

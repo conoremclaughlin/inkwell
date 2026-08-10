@@ -86,9 +86,6 @@ function buildGeminiSettings(
 }
 
 export class GeminiAdapter implements BackendAdapter {
-  /** No injection support yet (out of scope) — native-read fallback applies. */
-  readonly injectsMedia = false;
-
   readonly name = 'gemini';
   readonly binary = 'gemini';
 

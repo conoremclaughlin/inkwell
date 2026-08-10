@@ -52,11 +52,14 @@ export interface BackendConfig {
    */
   toolRouting?: 'backend' | 'local';
   /**
-   * Media files attached to THIS turn (spec:provider-media-injection).
-   * Adapters that inject media embed them in the prompt envelope (claude:
-   * stream-json image content blocks; codex: `-i` flags) so the provider
-   * needs no filesystem tool to see them. attachmentDirs remains the
-   * native-read fallback for anything an adapter cannot inject.
+   * Media files for the LOGICAL turn (spec:provider-media-injection),
+   * passed on every spawn of that turn — delivery, reseed, and tool-loop
+   * continuations alike. Injecting adapters embed them in the prompt
+   * envelope (claude: stream-json image content blocks, skipped on resume
+   * spawns whose provider session already holds them; codex: stateless, so
+   * `--image=` flags are re-attached per spawn). Adapters without
+   * injection support ignore this; attachmentDirs remains the native-read
+   * fallback for explicitly unsupported types only.
    */
   media?: TurnMedia[];
 }
@@ -78,16 +81,6 @@ export interface PreparedBackend {
 export interface BackendAdapter {
   readonly name: string;
   readonly binary: string;
-
-  /**
-   * Whether prepare() embeds BackendConfig.media into the prompt envelope
-   * (spec:provider-media-injection). Injecting adapters deliver media as
-   * prompt CONTENT — claude: stream-json image blocks over stdin; codex:
-   * `-i` flags — so wholly-in-ink routing needs no native filesystem tool
-   * for the delivery turn. Non-injecting adapters fall back to the
-   * attachment-gated native-read path.
-   */
-  readonly injectsMedia: boolean;
 
   /**
    * Prepare everything needed to spawn the backend process.

@@ -4,9 +4,10 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import {
   ClaudeAdapter,
-  planMediaInjection,
+  classifyMedia,
+  encodeMediaBlocks,
+  readMediaBounded,
   MAX_MEDIA_FILE_BYTES,
-  MAX_MEDIA_TOTAL_BYTES,
 } from './claude.js';
 
 // Keep user-installed skills out of the merged MCP config.
@@ -195,50 +196,83 @@ describe('ClaudeAdapter prepare — tool routing', () => {
   });
 });
 
-describe('planMediaInjection (mime + size policy)', () => {
-  const sizes = (map: Record<string, number | null>) => (path: string) => map[path] ?? null;
-
-  it('injects supported images, falls back non-images and unknown mimes', () => {
-    const plan = planMediaInjection(
-      [
-        { path: '/a.png', mimeType: 'image/png' },
-        { path: '/b.pdf', mimeType: 'application/pdf' },
-        { path: '/c.heic', mimeType: 'image/heic' },
-        { path: '/d.bin' },
-      ],
-      sizes({ '/a.png': 1000 })
-    );
-    expect(plan.inject.map((m) => m.path)).toEqual(['/a.png']);
-    expect(plan.fallback.map((m) => m.path)).toEqual(['/b.pdf', '/c.heic', '/d.bin']);
+describe('classifyMedia (IO-free mime buckets)', () => {
+  it('supported images are candidates; everything else is the native-read bucket', () => {
+    const c = classifyMedia([
+      { path: '/a.png', mimeType: 'image/png' },
+      { path: '/b.pdf', mimeType: 'application/pdf' },
+      { path: '/c.heic', mimeType: 'image/heic' },
+      { path: '/d.bin' },
+    ]);
+    expect(c.candidates.map((m) => m.path)).toEqual(['/a.png']);
+    expect(c.nativeRead.map((m) => m.path)).toEqual(['/b.pdf', '/c.heic', '/d.bin']);
   });
+});
 
-  it('falls back oversize files and unstatable files', () => {
-    const plan = planMediaInjection(
+describe('encodeMediaBlocks (bounded IO, fail-closed rejection)', () => {
+  const fakeRead =
+    (map: Record<string, number | null>) =>
+    (path: string, maxBytes: number): Buffer | null => {
+      const size = map[path];
+      if (size === null || size === undefined || size > maxBytes) return null;
+      return Buffer.alloc(size, 1);
+    };
+
+  it('rejects unreadable and over-cap candidates instead of falling back', () => {
+    const out = encodeMediaBlocks(
       [
         { path: '/big.png', mimeType: 'image/png' },
         { path: '/gone.png', mimeType: 'image/png' },
         { path: '/ok.png', mimeType: 'image/png' },
       ],
-      sizes({ '/big.png': MAX_MEDIA_FILE_BYTES + 1, '/gone.png': null, '/ok.png': 10 })
+      fakeRead({ '/big.png': MAX_MEDIA_FILE_BYTES + 1, '/gone.png': null, '/ok.png': 10 })
     );
-    expect(plan.inject.map((m) => m.path)).toEqual(['/ok.png']);
-    expect(plan.fallback.map((m) => m.path)).toEqual(['/big.png', '/gone.png']);
+    expect(out.injected.map((m) => m.path)).toEqual(['/ok.png']);
+    expect(out.rejected.map((r) => r.media.path)).toEqual(['/big.png', '/gone.png']);
+    expect(out.blocks).toHaveLength(1);
   });
 
   it('enforces the running total cap across files', () => {
-    // Each file passes the per-file cap; the third breaches the turn total.
     const nineMb = 9 * 1024 * 1024;
-    expect(nineMb).toBeLessThan(MAX_MEDIA_FILE_BYTES);
-    const plan = planMediaInjection(
+    const out = encodeMediaBlocks(
       [
         { path: '/one.png', mimeType: 'image/png' },
         { path: '/two.png', mimeType: 'image/png' },
         { path: '/three.png', mimeType: 'image/png' },
       ],
-      sizes({ '/one.png': nineMb, '/two.png': nineMb, '/three.png': nineMb })
+      fakeRead({ '/one.png': nineMb, '/two.png': nineMb, '/three.png': nineMb })
     );
-    expect(plan.inject.map((m) => m.path)).toEqual(['/one.png', '/two.png']);
-    expect(plan.fallback.map((m) => m.path)).toEqual(['/three.png']);
+    expect(out.injected.map((m) => m.path)).toEqual(['/one.png', '/two.png']);
+    expect(out.rejected.map((r) => r.media.path)).toEqual(['/three.png']);
+  });
+});
+
+describe('readMediaBounded (single-descriptor, regular files only)', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'read-bounded-'));
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('reads a regular file fully within the cap', () => {
+    const p = join(dir, 'f.bin');
+    writeFileSync(p, Buffer.alloc(1024, 7));
+    const buf = readMediaBounded(p, 2048);
+    expect(buf?.byteLength).toBe(1024);
+    expect(buf?.every((b) => b === 7)).toBe(true);
+  });
+
+  it('returns null for oversize, missing, and non-regular paths', () => {
+    const p = join(dir, 'f.bin');
+    writeFileSync(p, Buffer.alloc(1024, 7));
+    expect(readMediaBounded(p, 1023)).toBeNull();
+    expect(readMediaBounded(join(dir, 'nope.bin'), 4096)).toBeNull();
+    // A directory is not a regular file.
+    expect(readMediaBounded(dir, 4096)).toBeNull();
   });
 });
 
@@ -269,7 +303,6 @@ describe('ClaudeAdapter prepare — media injection', () => {
 
   it('fully-injected media: stream-json stdin envelope, --tools stays empty', () => {
     const adapter = new ClaudeAdapter();
-    expect(adapter.injectsMedia).toBe(true);
     const prepared = adapter.prepare({
       agentId: 'myra',
       prompt: 'what is in this image?',
@@ -340,6 +373,58 @@ describe('ClaudeAdapter prepare — media injection', () => {
       expect(prepared.args).not.toContain('--input-format');
       expect(prepared.stdinData).toBe('hello');
     } finally {
+      prepared.cleanup();
+    }
+  });
+
+  it('resume spawns keep the delivery disposition: no re-embed, --tools stays empty', () => {
+    // Lumen's round-1 repro (review 4900120086): a tool-loop continuation
+    // resumes the provider session that already holds the injected image.
+    // It must NOT reopen native Read — the boundary decision derives from
+    // the same mime classification as the delivery spawn.
+    const adapter = new ClaudeAdapter();
+    const prepared = adapter.prepare({
+      agentId: 'myra',
+      prompt: 'continue',
+      promptParts: ['continue'],
+      passthroughArgs: [],
+      toolRouting: 'local',
+      attachmentDirs: [tmpDir],
+      media: [{ path: pngPath, mimeType: 'image/png' }],
+      backendSessionId: 'live-session-abc',
+    });
+    try {
+      expect(prepared.args).not.toContain('--input-format');
+      expect(prepared.stdinData).toBe('continue');
+      const toolsIdx = prepared.args.indexOf('--tools');
+      expect(prepared.args[toolsIdx + 1]).toBe('');
+    } finally {
+      prepared.cleanup();
+    }
+  });
+
+  it('injection failure fails CLOSED: image not embedded, Read stays off', () => {
+    // A supported image that cannot be read (missing file) is rejected
+    // loudly — it neither injects nor reopens the native-read exception.
+    const adapter = new ClaudeAdapter();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const prepared = adapter.prepare({
+      agentId: 'myra',
+      prompt: 'look at this',
+      promptParts: ['look at this'],
+      passthroughArgs: [],
+      toolRouting: 'local',
+      attachmentDirs: [tmpDir],
+      media: [{ path: join(tmpDir, 'vanished.png'), mimeType: 'image/png' }],
+    });
+    try {
+      expect(prepared.args).not.toContain('--input-format');
+      const toolsIdx = prepared.args.indexOf('--tools');
+      expect(prepared.args[toolsIdx + 1]).toBe('');
+      expect(warn).toHaveBeenCalledOnce();
+      expect(String(warn.mock.calls[0])).toContain('vanished.png');
+    } finally {
+      warn.mockRestore();
       prepared.cleanup();
     }
   });

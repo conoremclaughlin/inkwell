@@ -34,7 +34,6 @@ const PCP_ENV_HEADERS: Array<{ header: string; envVar: string }> = [
 export class CodexAdapter implements BackendAdapter {
   readonly name = 'codex';
   readonly binary = 'codex';
-  readonly injectsMedia = true;
 
   prepare(config: BackendConfig): PreparedBackend {
     const { promptFile, cleanup } = createIdentityPromptFile(
@@ -99,13 +98,21 @@ export class CodexAdapter implements BackendAdapter {
       args.push(promptParts[0]);
       args.push(...config.passthroughArgs);
       // Media injection (spec:provider-media-injection): codex attaches
-      // images to the initial prompt natively via `-i` — an exec-scoped
-      // option, so it must sit after `exec`. Non-image media stays on the
-      // prompt-text path (paths listed in the attachment block).
-      for (const m of config.media ?? []) {
-        if (m.mimeType?.startsWith('image/')) {
-          args.push('-i', m.path);
-        }
+      // images to the initial prompt natively — an exec-scoped option, so
+      // it must sit after `exec`. Codex is stateless per spawn, so media is
+      // (re)attached on every spawn of the logical turn. Two parse-safety
+      // measures (Lumen, review 4900120086 — variadic `-i <FILE>...`
+      // swallows the following positional prompt): the single-value
+      // `--image=<path>` binding, plus a `--` options terminator so the
+      // prompt can never be consumed as an option value. Non-image media
+      // stays on the prompt-text path (paths listed in the attachment
+      // block).
+      const imageMedia = (config.media ?? []).filter((m) => m.mimeType?.startsWith('image/'));
+      for (const m of imageMedia) {
+        args.push(`--image=${m.path}`);
+      }
+      if (imageMedia.length > 0) {
+        args.push('--');
       }
       args.push(...promptParts.slice(1));
     } else {

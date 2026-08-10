@@ -5,7 +5,7 @@
  * MCP config via --mcp-config <path>
  */
 
-import { existsSync, readFileSync, statSync } from 'fs';
+import { closeSync, existsSync, fstatSync, openSync, readSync } from 'fs';
 import { execFileSync } from 'child_process';
 import { join } from 'path';
 import { homedir } from 'os';
@@ -18,58 +18,111 @@ import { ClaudeStreamParser } from './claude-stream.js';
 
 /**
  * Image types claude accepts as base64 content blocks (the Anthropic API
- * set). Anything else — documents, audio, heic — stays on the native-read
- * fallback until it has an injection story.
+ * set). Only these — explicitly unsupported types (documents, audio, heic)
+ * — may fall back to native read; everything else about injection fails
+ * CLOSED (see encodeMediaBlocks).
  */
 const CLAUDE_INJECTABLE_MIME = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
 
 /**
- * Size guards for injected media, mirroring provider request limits. Files
- * over the cap (or past the running total) are NOT dropped — they fall back
- * to the native-read path, and the --tools gate accounts for them.
+ * Size guards for injected media, mirroring provider request limits. A
+ * supported image that breaches a cap is REJECTED (loud, fail closed) — it
+ * does not reopen native read.
  */
 export const MAX_MEDIA_FILE_BYTES = 10 * 1024 * 1024;
 export const MAX_MEDIA_TOTAL_BYTES = 25 * 1024 * 1024;
 
-export interface MediaInjectionPlan {
-  /** Media that will be embedded as base64 image content blocks. */
-  inject: TurnMedia[];
-  /** Media left to the native-read fallback (wrong type, too big, unstatable). */
-  fallback: TurnMedia[];
+export interface MediaClassification {
+  /** Supported image types — injection candidates. */
+  candidates: TurnMedia[];
+  /**
+   * Explicitly unsupported types (documents, audio, heic) — the ONLY bucket
+   * allowed to fall back to the gated native-read exception.
+   */
+  nativeRead: TurnMedia[];
 }
 
 /**
- * Decide which media can be injected. Pure given a size probe so the
- * mime/size policy is unit-testable without multi-megabyte fixtures.
+ * Classify media by mime alone. Deterministic and IO-free: the --tools gate
+ * derives from this classification on every spawn of a logical turn, so the
+ * boundary decision cannot flap on filesystem state (TOCTOU) or differ
+ * between the delivery spawn and tool-loop continuations.
  */
-export function planMediaInjection(
-  media: TurnMedia[],
-  fileSize: (path: string) => number | null
-): MediaInjectionPlan {
-  const plan: MediaInjectionPlan = { inject: [], fallback: [] };
-  let totalBytes = 0;
+export function classifyMedia(media: TurnMedia[]): MediaClassification {
+  const out: MediaClassification = { candidates: [], nativeRead: [] };
   for (const m of media) {
-    if (!CLAUDE_INJECTABLE_MIME.has(m.mimeType ?? '')) {
-      plan.fallback.push(m);
-      continue;
-    }
-    const size = fileSize(m.path);
-    if (size === null || size > MAX_MEDIA_FILE_BYTES || totalBytes + size > MAX_MEDIA_TOTAL_BYTES) {
-      plan.fallback.push(m);
-      continue;
-    }
-    totalBytes += size;
-    plan.inject.push(m);
+    (CLAUDE_INJECTABLE_MIME.has(m.mimeType ?? '') ? out.candidates : out.nativeRead).push(m);
   }
-  return plan;
+  return out;
 }
 
-function statSizeSync(path: string): number | null {
+/**
+ * Bounded single-descriptor read: open once, verify it is a REGULAR file
+ * within the cap via fstat on that same descriptor, then read it fully.
+ * Special files (fifos, devices), oversize files, and IO errors all return
+ * null — never a partial or unbounded read.
+ */
+export function readMediaBounded(path: string, maxBytes: number): Buffer | null {
+  let fd: number | undefined;
   try {
-    return statSync(path).size;
+    fd = openSync(path, 'r');
+    const st = fstatSync(fd);
+    if (!st.isFile() || st.size > maxBytes) return null;
+    const buf = Buffer.allocUnsafe(st.size);
+    let offset = 0;
+    while (offset < st.size) {
+      const n = readSync(fd, buf, offset, st.size - offset, offset);
+      if (n <= 0) break;
+      offset += n;
+    }
+    return offset === st.size ? buf : null;
   } catch {
     return null;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
   }
+}
+
+export interface EncodedMedia {
+  /** Base64 image content blocks, in candidate order. */
+  blocks: Array<Record<string, unknown>>;
+  injected: TurnMedia[];
+  /**
+   * Candidates that failed policy or IO (oversize, over-total, special
+   * file, read error). Fail CLOSED: rejected media neither injects nor
+   * reopens native read — the failure is reported loudly instead.
+   */
+  rejected: Array<{ media: TurnMedia; reason: string }>;
+}
+
+/** Encode injection candidates; the read fn is injectable for unit tests. */
+export function encodeMediaBlocks(
+  candidates: TurnMedia[],
+  readBounded: (path: string, maxBytes: number) => Buffer | null = readMediaBounded
+): EncodedMedia {
+  const out: EncodedMedia = { blocks: [], injected: [], rejected: [] };
+  let totalBytes = 0;
+  for (const m of candidates) {
+    if (totalBytes >= MAX_MEDIA_TOTAL_BYTES) {
+      out.rejected.push({ media: m, reason: 'turn media budget exhausted' });
+      continue;
+    }
+    const buf = readBounded(
+      m.path,
+      Math.min(MAX_MEDIA_FILE_BYTES, MAX_MEDIA_TOTAL_BYTES - totalBytes)
+    );
+    if (!buf) {
+      out.rejected.push({ media: m, reason: 'unreadable, not a regular file, or over size cap' });
+      continue;
+    }
+    totalBytes += buf.byteLength;
+    out.blocks.push({
+      type: 'image',
+      source: { type: 'base64', media_type: m.mimeType, data: buf.toString('base64') },
+    });
+    out.injected.push(m);
+  }
+  return out;
 }
 
 /**
@@ -93,7 +146,6 @@ function supportsPartialMessages(): boolean {
 export class ClaudeAdapter implements BackendAdapter {
   readonly name = 'claude';
   readonly binary = 'claude';
-  readonly injectsMedia = true;
 
   prepare(config: BackendConfig): PreparedBackend {
     const identityPrompt = buildIdentityPrompt(config.agentId);
@@ -103,31 +155,28 @@ export class ClaudeAdapter implements BackendAdapter {
     // Media injection (spec:provider-media-injection): embed images as
     // base64 content blocks in a stream-json user message instead of having
     // the provider pull them via native Read. Requires prompt mode (the
-    // message rides stdin). Files that can't be injected (non-image, too
-    // big, unreadable at encode time) fall back to native read and keep the
-    // --tools gate open below.
+    // message rides stdin).
+    //
+    // Callers pass the turn's media on EVERY spawn of the logical turn.
+    // Delivery spawns (fresh provider session) embed the blocks; resume
+    // spawns (--resume, tool-loop continuations) do NOT re-embed — the
+    // provider session already holds the images — but the classification
+    // still drives the --tools gate below so the boundary disposition is
+    // identical across the whole logical turn.
     const media = config.media ?? [];
-    const plan = config.prompt ? planMediaInjection(media, statSizeSync) : undefined;
-    const imageBlocks: Array<Record<string, unknown>> = [];
-    let injectedCount = 0;
-    if (plan) {
-      for (const m of plan.inject) {
-        try {
-          imageBlocks.push({
-            type: 'image',
-            source: {
-              type: 'base64',
-              media_type: m.mimeType,
-              data: readFileSync(m.path).toString('base64'),
-            },
-          });
-          injectedCount += 1;
-        } catch {
-          // Vanished between stat and read — native-read fallback covers it.
-        }
-      }
+    const classified = classifyMedia(media);
+    const resumingDeliveredSession = Boolean(config.backendSessionId);
+    const encoded =
+      config.prompt && !resumingDeliveredSession && classified.candidates.length > 0
+        ? encodeMediaBlocks(classified.candidates)
+        : undefined;
+    for (const r of encoded?.rejected ?? []) {
+      // Loud, fail-closed: a supported image that cannot be injected is NOT
+      // handed back to native read — the boundary stays shut and the skip is
+      // reported instead.
+      console.warn(`[media] not injected (${r.reason}): ${r.media.path}`);
     }
-    const injecting = injectedCount > 0;
+    const injecting = (encoded?.blocks.length ?? 0) > 0;
 
     // Prompt mode vs interactive. The prompt is passed via stdin (not argv):
     // transcripts can exceed the OS argv limit (~256KB on macOS), which
@@ -197,14 +246,16 @@ export class ClaudeAdapter implements BackendAdapter {
       // all of which would bypass ink's tool policy entirely.
       //
       // NAMED EXCEPTION (Conor-ratified, spec:wholly-in-ink-tool-routing):
-      // native Read is exposed ONLY when this spawn carries attachments that
-      // were NOT injected as prompt content — non-image files, oversize
-      // images, callers that didn't thread media, or re-view turns after the
-      // delivery turn. A turn whose media is fully injected gets no built-in
-      // tools at all (spec:provider-media-injection).
+      // native Read is exposed ONLY for attachments that injection can
+      // never carry — explicitly unsupported types (documents, audio,
+      // heic), legacy callers that didn't thread media, and re-view turns
+      // after the delivery turn. The decision derives from the IO-free mime
+      // classification, so it is identical on every spawn of the logical
+      // turn; injection FAILURES (oversize, unreadable, special files) fail
+      // closed and never reopen Read.
       const hasAttachments = (config.attachmentDirs?.length ?? 0) > 0;
       const needsNativeRead =
-        hasAttachments && (media.length === 0 || injectedCount < media.length);
+        hasAttachments && (media.length === 0 || classified.nativeRead.length > 0);
       args.push('--tools', needsNativeRead ? 'Read' : '');
     }
 
@@ -255,7 +306,7 @@ export class ClaudeAdapter implements BackendAdapter {
 
     // Injected turns switch stdin to stream-json: one JSONL user message
     // whose content is the prompt text plus base64 image blocks. Text-only
-    // turns keep the plain-stdin path — smallest blast radius.
+    // turns and resume spawns keep the plain-stdin path.
     let stdinData = config.prompt;
     if (injecting && config.prompt) {
       args.push('--input-format', 'stream-json');
@@ -264,7 +315,7 @@ export class ClaudeAdapter implements BackendAdapter {
           type: 'user',
           message: {
             role: 'user',
-            content: [{ type: 'text', text: config.prompt }, ...imageBlocks],
+            content: [{ type: 'text', text: config.prompt }, ...(encoded?.blocks ?? [])],
           },
         }) + '\n';
     }

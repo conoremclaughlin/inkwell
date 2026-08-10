@@ -4841,6 +4841,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
         onEvent: handleBackendEvent,
         attachmentDirs: sessionAttachmentDirs.length > 0 ? sessionAttachmentDirs : undefined,
         toolRouting: runtime.toolRouting,
+        // Same logical turn — media rides along so the adapter's boundary
+        // disposition (--tools gate) cannot flap between the delivery spawn
+        // and tool-loop continuations. Stateful adapters skip re-embedding
+        // on resume; stateless ones re-attach.
+        media: turnMedia.length > 0 ? turnMedia : undefined,
         // Resume the live provider session so this round-trip appends to the
         // same Claude thread instead of re-piping the whole window.
         ...(activeBackendSessionId ? { backendSessionId: activeBackendSessionId } : {}),
