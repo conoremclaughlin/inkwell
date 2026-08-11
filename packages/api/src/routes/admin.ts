@@ -654,9 +654,9 @@ async function findGeminiTranscriptFile(backendSessionId: string): Promise<strin
 async function findPcpTranscriptFile(sessionId: string): Promise<string | null> {
   const roots = new Set<string>();
   for (const dir of getAncestorDirs(process.cwd(), 8)) {
-    roots.add(path.join(dir, '.pcp', 'runtime', 'repl'));
+    roots.add(path.join(dir, '.ink', 'runtime', 'repl'));
   }
-  roots.add(path.join(os.homedir(), '.pcp', 'runtime', 'repl'));
+  roots.add(path.join(os.homedir(), '.ink', 'runtime', 'repl'));
 
   const matches: string[] = [];
   for (const root of roots) {

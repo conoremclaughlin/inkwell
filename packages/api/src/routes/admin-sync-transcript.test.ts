@@ -201,7 +201,7 @@ describe('POST /sessions/:id/sync-transcript', () => {
 
     const transcriptFile = path.join(
       process.cwd(),
-      '.pcp',
+      '.ink',
       'runtime',
       'repl',
       'session-1-1700000000000.jsonl'
@@ -236,7 +236,7 @@ describe('POST /sessions/:id/sync-transcript', () => {
     });
 
     mockFsReaddir.mockImplementation(async (dir: string) => {
-      if (dir.endsWith(path.join('.pcp', 'runtime', 'repl'))) {
+      if (dir.endsWith(path.join('.ink', 'runtime', 'repl'))) {
         return [
           {
             name: 'session-1-1700000000000.jsonl',

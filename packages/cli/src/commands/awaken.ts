@@ -103,11 +103,11 @@ async function fetchFromCloud(config: UserConfig): Promise<{
 }
 
 /**
- * Fall back to local ~/.pcp files for shared values and sibling info.
+ * Fall back to local ~/.ink files for shared values and sibling info.
  */
 function fetchFromLocal(): { sharedValues: string; siblings: BootstrapIdentity[] } {
   // Read shared values
-  const valuesPath = join(homedir(), '.pcp', 'shared', 'VALUES.md');
+  const valuesPath = join(homedir(), '.ink', 'shared', 'VALUES.md');
   let sharedValues = '';
   if (existsSync(valuesPath)) {
     sharedValues = readFileSync(valuesPath, 'utf-8');
@@ -115,7 +115,7 @@ function fetchFromLocal(): { sharedValues: string; siblings: BootstrapIdentity[]
 
   // Scan for sibling identity files
   const siblings: BootstrapIdentity[] = [];
-  const individualsDir = join(homedir(), '.pcp', 'individuals');
+  const individualsDir = join(homedir(), '.ink', 'individuals');
   const knownAgents = ['wren', 'benson', 'myra', 'lumen'];
 
   for (const agentId of knownAgents) {
