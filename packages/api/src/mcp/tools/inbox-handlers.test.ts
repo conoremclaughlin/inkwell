@@ -1194,6 +1194,40 @@ describe('handleGetInbox — threadKey alias', () => {
     ).rejects.toThrow();
     expect(mockHandleGetThreadMessages).not.toHaveBeenCalled();
   });
+
+  it('unknown parameters are REJECTED by name, never silently stripped (.strict)', async () => {
+    // The original bug class: zod's default strips unknown keys, so a
+    // plausible-but-wrong parameter silently vanishes and the LLM caller
+    // draws confident wrong conclusions. Strict mode names the offender —
+    // self-correcting on the next attempt.
+    const mockDc = createMockDataComposer(createMockSupabase());
+    await expect(
+      handleGetInbox(
+        { email: 'test@test.com', agentId: 'myra', threadKye: 'pr:464' },
+        mockDc as never
+      )
+    ).rejects.toThrow(/threadKye/);
+    expect(mockHandleGetThreadMessages).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [{ status: 'completed' }, /status:'completed'/],
+    [{ priority: 'high' }, /priority/],
+    [{ messageType: 'task_request' }, /messageType/],
+    [{ since: '2026-08-10T00:00:00Z' }, /since/],
+    [{ channelPoll: true }, /channelPoll/],
+  ])('threadKey mode rejects incompatible filter %j actionably', async (filter, pattern) => {
+    // Silent-ignore here returns WRONG results — e.g. status:'completed'
+    // would serve unread-pointer messages and advance the pointer.
+    const mockDc = createMockDataComposer(createMockSupabase());
+    await expect(
+      handleGetInbox(
+        { email: 'test@test.com', agentId: 'myra', threadKey: 'pr:464', ...filter },
+        mockDc as never
+      )
+    ).rejects.toThrow(pattern);
+    expect(mockHandleGetThreadMessages).not.toHaveBeenCalled();
+  });
 });
 
 // =====================================================
