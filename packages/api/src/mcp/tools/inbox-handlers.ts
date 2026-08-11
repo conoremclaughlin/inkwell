@@ -13,7 +13,11 @@ import { advanceThreadReadPointer } from './read-state.js';
 import { getEffectiveAgentId } from '../../auth/enforce-identity';
 import { logger } from '../../utils/logger';
 import type { Json } from '../../data/supabase/types';
-import { getRequestContext, getSessionContext } from '../../utils/request-context';
+import {
+  getRequestContext,
+  getSessionContext,
+  getPinnedAgentId,
+} from '../../utils/request-context';
 import { getAgentGateway, type AgentTriggerPayload } from '../../channels/agent-gateway.js';
 import {
   findThread as findExistingThread,
@@ -282,9 +286,12 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
   if (hasMany && !threadKey) {
     throw new Error('threadKey is required when using recipients[]');
   }
-  if (recipients && (recipientSessionId || recipientStudioId || recipientStudioSlugOrHint)) {
+  if (
+    recipients &&
+    (recipientSessionId || recipientStudioId || recipientStudioSlugOrHint || sessionAlias)
+  ) {
     throw new Error(
-      'recipientSessionId/recipientStudioId/recipientStudioSlug/recipientStudioHint are only valid for single-recipient sends'
+      'recipientSessionId/recipientStudioId/recipientStudioSlug/recipientStudioHint/sessionAlias are only valid for single-recipient sends'
     );
   }
 
@@ -610,12 +617,30 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
       effectiveRecipientSessionId: effectiveRecipientSessionId || null,
     });
 
-    // Dispatch triggers with session routing from thread history
+    // Dispatch: assignment is wake-independent (§3a). EVERY recipient gets a
+    // dispatch — wake only for agentsToTrigger; the rest go routeOnly so their
+    // session is still assigned/stamped (trigger:false / missingSenderSession
+    // must never mean unaddressed).
     const triggeredAgents: string[] = [];
-    if (agentsToTrigger.length > 0) {
+    // Assignment failures per recipient (Lumen, PR #460 round 2): a send whose
+    // routing stamp did not persist must NOT return unqualified success —
+    // for trigger:false recipients no wake follows, so an unstamped thread
+    // is invisible to stamped-only polling with no retry coming.
+    const routingFailures: Array<{ agentId: string; error: string }> = [];
+    // Union with agentsToTrigger: actionable self-sends (session_resume /
+    // task_request strategy kickoffs) wake self without an explicit
+    // studio/session target and must keep dispatching.
+    const routingSet = [
+      ...new Set([
+        ...allRecipients.filter((a) => a !== senderAgentId || explicitSelfTarget),
+        ...agentsToTrigger,
+      ]),
+    ];
+    if (routingSet.length > 0) {
       const gateway = getAgentGateway();
 
-      for (const toAgentId of agentsToTrigger) {
+      for (const toAgentId of routingSet) {
+        const wake = agentsToTrigger.includes(toAgentId);
         // Auto-resolve recipientSessionId: find the recipient's most recent
         // message on this thread to extract their sender session. This ensures
         // replies route back to the session that originated the conversation,
@@ -669,6 +694,13 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
         // was true, so system/human → owner delegation lost the assigned
         // studio and fell back to route patterns / default studio.
         const isAddressedRecipient = !recipients && toAgentId === recipientAgentId;
+        // Anchor provenance (spec §3b.1): only CALLER-passed targeting counts
+        // as the deliberate-retarget signal. History-inferred
+        // recipientSessionId is a continuity hint, never an overwrite.
+        const explicitRecipientTarget = !!(
+          isAddressedRecipient &&
+          (recipientSessionId || sessionAlias || recipientStudioId || recipientStudioSlugOrHint)
+        );
         const payload: AgentTriggerPayload = {
           fromAgentId: triggerSenderId,
           toAgentId,
@@ -682,6 +714,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
           priority,
           threadKey,
           recipientSessionId: resolvedRecipientSessionId,
+          ...(explicitRecipientTarget ? { explicitRecipientTarget } : {}),
           ...(isAddressedRecipient && sessionAlias ? { sessionAlias } : {}),
           ...(isAddressedRecipient && resolvedRecipientStudioId
             ? { studioId: resolvedRecipientStudioId }
@@ -691,9 +724,44 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
             : {}),
           ...(Object.keys(rawMeta).length > 0 ? { metadata: rawMeta } : {}),
         };
-        const result = gateway.dispatchTrigger(payload);
-        if (result.accepted) {
-          triggeredAgents.push(toAgentId);
+
+        // 1) Assignment — SYNCHRONOUS (spec §3a): processTrigger awaits the
+        //    handler, so the participant stamp is durable before send returns.
+        //    A crash after this line cannot orphan the message. A FAILED
+        //    assignment (success:false or throw) is captured per recipient
+        //    and surfaced in the response — never swallowed into success.
+        try {
+          const assignResult = await gateway.processTrigger({ ...payload, routeOnly: true });
+          if (!assignResult.success) {
+            routingFailures.push({
+              agentId: toAgentId,
+              error: assignResult.error || 'assignment failed',
+            });
+            logger.warn('[ThreadTrigger] Synchronous assignment failed', {
+              threadKey,
+              toAgentId,
+              error: assignResult.error || 'assignment failed',
+            });
+          }
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          routingFailures.push({ agentId: toAgentId, error: message });
+          logger.warn('[ThreadTrigger] Synchronous assignment failed', {
+            threadKey,
+            toAgentId,
+            error: message,
+          });
+        }
+
+        // 2) Wake — optional, fire-and-forget, rides the fresh stamp via
+        //    thread continuity. Still attempted after an assignment failure:
+        //    the wake handler re-runs assignment (a transient DB error may
+        //    clear) and the wake itself surfaces the message to the agent.
+        if (wake) {
+          const result = gateway.dispatchTrigger(payload);
+          if (result.accepted) {
+            triggeredAgents.push(toAgentId);
+          }
         }
       }
     }
@@ -703,8 +771,16 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
         {
           type: 'text' as const,
           text: JSON.stringify({
-            success: true,
-            message: `Thread message sent to ${threadKey}`,
+            success: routingFailures.length === 0,
+            message:
+              routingFailures.length === 0
+                ? `Thread message sent to ${threadKey}`
+                : `Thread message stored in ${threadKey}, but session routing FAILED for: ${routingFailures
+                    .map((f) => f.agentId)
+                    .join(
+                      ', '
+                    )}. Untriggered recipients will NOT see it via inbox polling until routing succeeds — resend or re-trigger to retry assignment.`,
+            ...(routingFailures.length > 0 ? { routingFailures } : {}),
             messageId: threadMessage.id,
             threadKey,
             threadId: thread.id,
@@ -1013,10 +1089,83 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
 
   const { status = 'unread', priority, messageType, limit = 20, since, channelPoll } = parsed;
   // Enforce identity: pinned agents can only read their own inbox.
-  // When agentId is omitted, return inbox across ALL agents (unified timeline).
-  const agentId = parsed.agentId
+  // When agentId is omitted, return inbox across ALL agents (unified timeline)
+  // — EXCEPT for channelPoll, where the gate below derives it from the
+  // session so an agent-less poll can never read the all-agent surface.
+  let agentId = parsed.agentId
     ? (getEffectiveAgentId(parsed.agentId) ?? parsed.agentId)
     : undefined;
+
+  // Fail-closed (spec inkmail-read-state §3) — FIRST, before ANY read or
+  // pointer advance: a channelPoll caller must present BOTH scopes — a
+  // resolvable session AND an agent that matches that session — or it gets
+  // nothing and touches nothing. agentId is derived from the session row
+  // when omitted and validated against it when provided (Lumen, PR #460
+  // round 2: an agent-less channelPoll previously passed the gate and read
+  // the all-agent legacy inbox). Unlike thread-assignment's liveness check,
+  // a session lookup ERROR here fails CLOSED: this is a read-authorization
+  // decision, and an unverifiable scope must not widen into a read.
+  let callerSessionId: string | null = null;
+  if (channelPoll) {
+    const reqCtx = getRequestContext();
+    const sessCtx = getSessionContext();
+    callerSessionId = reqCtx?.sessionId || sessCtx?.sessionId || null;
+    let failClosedReason: string | null = null;
+    if (!callerSessionId) {
+      failClosedReason = 'no session context';
+    } else {
+      // Scope the lookup to the RESOLVED USER — a session id belonging to a
+      // different user must read as not-found, never as a scope source.
+      const { data: sessionRow, error: sessionErr } = await supabase
+        .from('sessions')
+        .select('id, agent_id')
+        .eq('id', callerSessionId)
+        .eq('user_id', resolved.user.id)
+        .maybeSingle();
+      const sessionAgentId: string | null = sessionRow?.agent_id ?? null;
+      // Pinned identity must agree with the session's agent — otherwise a
+      // pinned caller can present another agent's session id, omit agentId,
+      // and switch the derived read scope to that agent (Lumen, round 3).
+      const pinnedAgentId = getPinnedAgentId();
+      if (sessionErr) {
+        failClosedReason = `session lookup failed: ${sessionErr.message}`;
+      } else if (!sessionRow || !sessionAgentId) {
+        failClosedReason = 'session not found for this user or has no agent';
+      } else if (pinnedAgentId && pinnedAgentId !== sessionAgentId) {
+        failClosedReason = `session agent '${sessionAgentId}' does not match pinned identity '${pinnedAgentId}'`;
+      } else if (agentId && agentId !== sessionAgentId) {
+        failClosedReason = `agentId '${agentId}' does not match session agent '${sessionAgentId}'`;
+      } else {
+        agentId = sessionAgentId;
+      }
+    }
+    if (failClosedReason) {
+      logger.warn('channel_poll_unscoped', {
+        agentId: agentId || null,
+        sessionId: callerSessionId,
+        userId: resolved.user.id,
+        hint: `channelPoll scope invalid (${failClosedReason}) — returning empty (fail-closed)`,
+      });
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: JSON.stringify({
+              success: true,
+              agentId: agentId || null,
+              unreadCount: 0,
+              threadUnreadCount: 0,
+              totalUnreadCount: 0,
+              count: 0,
+              messages: [],
+              threadsWithUnread: [],
+              warning: `channel_poll_unscoped: ${failClosedReason} — delivery disabled (fail-closed)`,
+            }),
+          },
+        ],
+      };
+    }
+  }
 
   let query = supabase
     .from('agent_inbox')
@@ -1138,13 +1287,8 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
   let threadsWithUnread: ThreadSummary[] = [];
   let threadUnreadCount = 0;
 
-  // Resolve caller's session ID for channelPoll session scoping
-  let callerSessionId: string | null = null;
-  if (channelPoll && agentId) {
-    const reqCtx = getRequestContext();
-    const sessCtx = getSessionContext();
-    callerSessionId = reqCtx?.sessionId || sessCtx?.sessionId || null;
-  }
+  // (callerSessionId resolved + fail-closed gate applied at the top of the
+  // handler — before the legacy inbox fetch/advance. See spec §3.)
 
   try {
     // Find thread IDs this agent (or any agent for this user) participates in
@@ -1153,10 +1297,14 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
       participantQuery = participantQuery.eq('agent_id', agentId);
     }
 
-    // Session-scoped filtering: only return threads assigned to this session
-    // (or unassigned threads not yet claimed by any session).
+    // Stamped-only session scoping (spec §3): pollers see ONLY threads
+    // assigned to their session. Unstamped (session_id IS NULL) threads are
+    // invisible to pollers by construction — the trigger path assigns them
+    // before any delivery. (v6's `OR session_id IS NULL` was implicit
+    // broadcast: first poller consumed the message and advanced the shared
+    // pointer, starving the session that actually needed it.)
     if (callerSessionId) {
-      participantQuery = participantQuery.or(`session_id.eq.${callerSessionId},session_id.is.null`);
+      participantQuery = participantQuery.eq('session_id', callerSessionId);
     }
 
     const { data: participantRows } = await participantQuery;

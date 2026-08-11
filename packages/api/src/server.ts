@@ -60,6 +60,7 @@ import {
   type SessionPollRow,
   type SessionAttachedRow,
 } from './services/sessions/trigger-delivery';
+import { assignThreadParticipant } from './services/sessions/thread-assignment';
 import type { ActivityType } from './data/repositories/activity-stream.repository';
 import { resolveTaskGroupForThreadKey } from './services/task-group-resolver';
 
@@ -1037,29 +1038,96 @@ When you complete a task_request, mark it as completed using update_inbox_messag
             : undefined,
       });
 
-      // Stamp the resolved session on the recipient's thread participant record
-      // so channel plugins can filter threads to their session.
-      // Skip for cross-studio self-messages: the PK is (thread_id, agent_id),
-      // so there's only one row — stamping would hide the thread from the
-      // sender's studio. Leave null so both sessions see it.
-      const isCrossStudioSelf =
-        payload.fromAgentId === targetAgentId && !!(payload.studioId || payload.studioHint);
-      if (payload.threadId && routedSession.id && !isCrossStudioSelf) {
+      // Assign the thread to the resolved session via the single sanctioned
+      // writer (spec: inkmail-read-state §3a). Explicit anchors overwrite
+      // (deliberate retarget); otherwise first assignment is a CAS and a lost
+      // race reroutes delivery to the winner. Cross-studio self-sends stamp
+      // the TARGET session — under stamped-only polling, an unstamped row is
+      // invisible to everyone, so "leave null so both see it" no longer works.
+      let deliverySession = routedSession;
+      // Assignment integrity (Lumen, PR #460 round 2): a failed stamp must
+      // never be swallowed into a routeOnly "success" — with stamped-only
+      // polling and no wake coming, an unstamped thread is permanently
+      // invisible. Wake dispatches tolerate it (the wake surfaces the
+      // message and the next dispatch retries the stamp).
+      let assignmentFailure: string | null = null;
+      if (payload.threadId && routedSession.id) {
         try {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          await (dataComposer!.getClient() as any)
-            .from('inbox_thread_participants')
-            .update({ session_id: routedSession.id })
-            .eq('thread_id', payload.threadId)
-            .eq('agent_id', targetAgentId);
+          const assignment = await assignThreadParticipant(dataComposer!.getClient(), {
+            threadId: payload.threadId,
+            agentId: targetAgentId,
+            candidateSessionId: routedSession.id,
+            explicitAnchor: !!payload.explicitRecipientTarget,
+            source: 'trigger-handler',
+          });
+          if (!assignment.stampPersisted) {
+            assignmentFailure = `participant stamp not persisted (boundVia=${assignment.boundVia})`;
+          }
+          if (assignment.rerouted) {
+            // A concurrent dispatch (or an existing live binding) won — deliver
+            // to the winner, and archive our freshly-created loser candidate so
+            // it doesn't linger as an empty routable session.
+            const winner = await sessionService!.getSession(assignment.sessionId);
+            if (winner) {
+              deliverySession = winner;
+              const candidateIsFresh =
+                routedSession.messageCount === 0 && !routedSession.backendSessionId;
+              if (candidateIsFresh && routedSession.id !== winner.id) {
+                await sessionService!.endSession(routedSession.id).catch((e) =>
+                  logger.warn('[Trigger] Failed to archive loser candidate session', {
+                    sessionId: routedSession.id,
+                    error: e instanceof Error ? e.message : String(e),
+                  })
+                );
+              }
+            }
+          }
         } catch (err) {
-          logger.warn('[Trigger] Failed to stamp session_id on thread participant', {
+          assignmentFailure = err instanceof Error ? err.message : String(err);
+          logger.warn('[Trigger] Thread assignment failed', {
             threadId: payload.threadId,
             agentId: targetAgentId,
             sessionId: routedSession.id,
-            error: err instanceof Error ? err.message : String(err),
+            error: assignmentFailure,
           });
         }
+      }
+
+      // Routing-only dispatch: assignment IS the entire job — a failed stamp
+      // must propagate as a failed trigger (processTrigger returns
+      // success:false and the send surfaces it), never a silent success.
+      // (spec §3a — trigger controls wake, never addressing.)
+      if (payload.routeOnly) {
+        if (assignmentFailure) {
+          logger.error('[Trigger] routeOnly assignment failed — surfacing to sender', {
+            targetAgentId,
+            sessionId: deliverySession.id,
+            threadKey: payload.threadKey,
+            threadId: payload.threadId,
+            error: assignmentFailure,
+          });
+          throw new Error(`routeOnly assignment failed for ${targetAgentId}: ${assignmentFailure}`);
+        }
+        logger.info('[Trigger] routeOnly — assignment complete, no wake', {
+          targetAgentId,
+          sessionId: deliverySession.id,
+          threadKey: payload.threadKey,
+          threadId: payload.threadId,
+        });
+        await logInkmail('inkmail_deliver', payload, userId, {
+          sessionId: deliverySession.id,
+          deliveryMethod: 'route_only',
+        });
+        return;
+      }
+
+      // Deliver to the assigned session (may differ from routedSession after
+      // a lost claim race).
+      if (deliverySession.id !== routedSession.id) {
+        request.metadata = {
+          ...request.metadata,
+          recipientSessionId: deliverySession.id,
+        };
       }
 
       // Check if the routed session has a CLI actively polling or attached.
@@ -1069,14 +1137,14 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       const { data: pollRow } = (await (dataComposer!.getClient() as any)
         .from('sessions')
         .select('id, cli_poll_at, studio_id')
-        .eq('id', routedSession.id)
+        .eq('id', deliverySession.id)
         .maybeSingle()) as { data: SessionPollRow | null };
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const { data: attachedRow } = (await (dataComposer!.getClient() as any)
         .from('sessions')
         .select('cli_attached, updated_at')
-        .eq('id', routedSession.id)
+        .eq('id', deliverySession.id)
         .maybeSingle()) as { data: SessionAttachedRow | null };
 
       // Clear stale cli_attached flag as a side effect (before the skip decision)
@@ -1086,14 +1154,14 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         Date.now() - new Date(attachedRow.updated_at).getTime() > 10 * 60 * 1000
       ) {
         logger.warn('[Trigger] CLI-attached session is stale, clearing flag', {
-          sessionId: routedSession.id,
+          sessionId: deliverySession.id,
           updatedAt: attachedRow.updated_at,
         });
         await dataComposer!
           .getClient()
           .from('sessions')
           .update({ cli_attached: false } as never)
-          .eq('id', routedSession.id);
+          .eq('id', deliverySession.id);
         attachedRow.cli_attached = false;
       }
 
@@ -1115,14 +1183,14 @@ When you complete a task_request, mark it as completed using update_inbox_messag
           `[Trigger] CLI-attached (${delivery.source}) — skipping spawn, channel plugin will deliver`,
           {
             targetAgentId,
-            attachedSessionId: delivery.sessionId || routedSession.id,
-            routedSessionId: routedSession.id,
-            studioId: routedSession.studioId,
+            attachedSessionId: delivery.sessionId || deliverySession.id,
+            routedSessionId: deliverySession.id,
+            studioId: deliverySession.studioId,
             threadKey: payload.threadKey,
           }
         );
         await logInkmail('inkmail_deliver', payload, userId, {
-          sessionId: routedSession.id,
+          sessionId: deliverySession.id,
           deliveryMethod: `cli_${delivery.source}`,
         });
         return;

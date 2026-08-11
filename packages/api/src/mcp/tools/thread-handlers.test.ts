@@ -364,6 +364,14 @@ vi.mock('../../channels/agent-gateway.js', () => ({
       processed: false,
       accepted: true,
     }),
+    // Synchronous assignment dispatch (spec §3a) — a missing/failed
+    // processTrigger now surfaces as routingFailures (round 2), so the mock
+    // must report success for happy-path routing tests.
+    processTrigger: vi.fn().mockResolvedValue({
+      success: true,
+      triggerId: 'trigger-sync-1',
+      processed: true,
+    }),
   }),
 }));
 
