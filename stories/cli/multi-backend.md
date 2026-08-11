@@ -109,7 +109,7 @@ interface BackendAdapter {
 
 ## Open Questions
 
-1. **Default backend**: Should it be configurable in `~/.pcp/config.json`? Or always Claude?
+1. **Default backend**: Should it be configurable in `~/.ink/config.json`? Or always Claude?
 2. **MCP config conflicts**: What if the user already has Codex/Gemini MCP config? Merge or override?
 3. **Instruction file conflicts**: Codex uses `AGENTS.md` — same as our `AGENTS.md`. Need to be careful not to clobber.
 4. **Session tracking**: Should session logs differ by backend? Or is a session just a session regardless?
