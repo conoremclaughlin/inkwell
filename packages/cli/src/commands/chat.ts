@@ -43,6 +43,7 @@ import {
   contextBudgetForWindow as defaultContextBudget,
 } from '../repl/context-limits.js';
 import { parseSlashCommand } from '../repl/slash.js';
+import { createPollGate } from '../repl/poll-gate.js';
 import {
   parseEvictSelection,
   selectEvictionEntries,
@@ -3706,7 +3707,18 @@ export async function runChat(options: ChatOptions): Promise<void> {
     }
   };
 
-  const pollInbox = async (force = false): Promise<number> => {
+  // Poll gates (PR #385): interval ticks skip while a poll is in flight;
+  // forced polls (/inbox, /events) queue behind it instead of overlapping.
+  // Prevents ticks from stacking concurrent requests behind a slow server.
+  const inboxPollGate = createPollGate();
+  const activityPollGate = createPollGate();
+
+  // Phase 1 (gated): fetch + render + collect auto-run candidates. Must not
+  // await backend turns — those run in pollInbox phase 2, after the gate
+  // releases, so grant delivery keeps flowing during a turn.
+  const collectInbox = async (
+    force: boolean
+  ): Promise<{ freshCount: number; autoRunMessages: InboxMessage[] }> => {
     const inboxResult = (await pcp
       .callTool('get_inbox', { agentId, status: 'unread', limit: 10 })
       .catch(() => null)) as Record<string, unknown> | null;
@@ -3733,7 +3745,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           }).allowed
       )
       .sort((a, b) => safeDateMs(a.createdAt) - safeDateMs(b.createdAt));
-    let autoRuns = 0;
+    const autoRunMessages: InboxMessage[] = [];
 
     // Process permission grants separately — they modify local policy, not chat flow.
     const permissionGrants = fresh.filter((msg) => msg.messageType === 'permission_grant');
@@ -3909,10 +3921,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
         msg.messageType !== 'notification' &&
         msg.content.trim().length > 0;
 
-      const autoRunHandler = enqueueAutoRunFromInbox;
-      if (eligibleForAutoRun && autoRunHandler) {
-        await autoRunHandler(msg);
-        autoRuns += 1;
+      if (eligibleForAutoRun) {
+        autoRunMessages.push(msg);
       }
     }
 
@@ -3923,16 +3933,35 @@ export async function runChat(options: ChatOptions): Promise<void> {
         printLine(chalk.dim('No new inbox messages.'));
       }
     }
+    emitStatusLaneIfChanged();
+    return { freshCount: fresh.length, autoRunMessages };
+  };
+
+  const pollInbox = async (force = false): Promise<number> => {
+    const collected = await inboxPollGate.run(() => collectInbox(force), { force });
+    if (!collected) return 0; // another poll in flight — tick skipped
+    // Phase 2 (gate released): auto-run backend turns run BEHIND the gate so
+    // interval polling — and the permission-grant delivery a remote approval
+    // depends on — continues while a turn is in flight.
+    let autoRuns = 0;
+    const autoRunHandler = enqueueAutoRunFromInbox;
+    if (autoRunHandler) {
+      for (const msg of collected.autoRunMessages) {
+        await autoRunHandler(msg);
+        autoRuns += 1;
+      }
+    }
     if (autoRuns > 0) {
       printLine(
         chalk.green(`Auto-run processed ${autoRuns} inbox message${autoRuns === 1 ? '' : 's'}.`)
       );
+      emitStatusLaneIfChanged();
     }
-    emitStatusLaneIfChanged();
-    return fresh.length;
+    return collected.freshCount;
   };
 
-  const pollActivity = async (force = false): Promise<number> => {
+  // Activity polls have no backend-turn phase — the whole body is gated.
+  const collectActivity = async (force: boolean): Promise<number> => {
     const activityResult = (await pcp
       .callTool('get_activity', {
         agentId,
@@ -4057,6 +4086,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
     }
     emitStatusLaneIfChanged();
     return activities.length;
+  };
+
+  const pollActivity = async (force = false): Promise<number> => {
+    const count = await activityPollGate.run(() => collectActivity(force), { force });
+    return count ?? 0;
   };
 
   // ── Turn attachments (--attach-file) ──
