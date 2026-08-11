@@ -536,7 +536,12 @@ mcp:
         });
         expect(hasChannelBridge).toBe(true);
         // …and no attacker-controlled string survives anywhere in the config.
-        expect(raw).not.toContain('/tmp/');
+        // Match attacker markers, not a path prefix: on Linux os.tmpdir() IS
+        // /tmp, so the fixture's legitimate entrypoint would trip a bare
+        // '/tmp/' check (CI-only failure).
+        expect(raw).not.toContain('evil');
+        expect(raw).not.toContain('attacker');
+        expect(raw).not.toContain('/repo/');
         expect(raw).not.toContain('bash');
         expect(raw).not.toContain('curl');
       } finally {
