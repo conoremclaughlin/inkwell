@@ -743,3 +743,144 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     expect(mockGetSession).not.toHaveBeenCalled();
   });
 });
+
+// ===========================================================================
+// Session-anchored identity enrichment (PR #468) — unit seam.
+// Proves the x-ink-context header actually PRODUCES agent/sb/workspace
+// identity, canonical-first: the session's sb_id resolves by UUID even when
+// the same agent slug exists in multiple workspaces (where slug .single()
+// errors and would break enrichment + artifact writes).
+// ===========================================================================
+describe('enrichIdentityFromContextSession + workspace derivation (canonical identity)', () => {
+  const USER = { userId: 'user-456', email: 'test@example.com' };
+  const SID = 'd4e5f6a7-b8c9-0123-def4-567890123456';
+
+  // Two identities share the slug 'myra' (schema-legal, different
+  // workspaces). Slug .single() over these errors; UUID lookup does not.
+  const identities = [
+    {
+      id: 'sb-uuid-A',
+      agent_id: 'myra',
+      user_id: 'user-456',
+      workspace_id: 'ws-AAAA',
+      users: { email: 'test@example.com' },
+    },
+    {
+      id: 'sb-uuid-B',
+      agent_id: 'myra',
+      user_id: 'user-456',
+      workspace_id: 'ws-BBBB',
+      users: { email: 'test@example.com' },
+    },
+  ];
+
+  const makeServer = (session: Record<string, unknown> | null) => {
+    const composer = {
+      getClient: () => ({
+        from: (table: string) => {
+          const filters: Record<string, string> = {};
+          const query: Record<string, unknown> = {};
+          Object.assign(query, {
+            select: () => query,
+            eq: (field: string, value: string) => {
+              filters[field] = value;
+              return query;
+            },
+            single: async () => {
+              if (table !== 'agent_identities') return { data: null, error: { message: 'nf' } };
+              if (filters.id) {
+                const row = identities.find((i) => i.id === filters.id) ?? null;
+                return row
+                  ? { data: row, error: null }
+                  : { data: null, error: { message: 'not found' } };
+              }
+              // Slug path: duplicate rows → PostgREST .single() errors.
+              const rows = identities.filter(
+                (i) => i.agent_id === filters.agent_id && i.user_id === filters.user_id
+              );
+              return rows.length === 1
+                ? { data: rows[0], error: null }
+                : { data: null, error: { message: 'JSON object requested, multiple rows' } };
+            },
+            maybeSingle: async () => {
+              if (table !== 'agent_identities') return { data: null, error: null };
+              const row = identities.find((i) => i.id === filters.id) ?? null;
+              return { data: row, error: null };
+            },
+          });
+          return query;
+        },
+      }),
+      repositories: {
+        memory: { getSession: vi.fn(async () => session) },
+        workspaces: { findById: vi.fn(async () => null) },
+      },
+    } as never;
+    return new MCPServer(composer);
+  };
+
+  const liveSession = (sbId: string | undefined) => ({
+    id: SID,
+    userId: 'user-456',
+    agentId: 'myra',
+    sbId,
+    lifecycle: 'running',
+    startedAt: new Date(),
+    endedAt: undefined,
+    metadata: {},
+  });
+
+  it('resolves identity by session sb_id even with duplicate slugs, then derives workspace by UUID', async () => {
+    const server = makeServer(liveSession('sb-uuid-B')) as never as Record<string, never>;
+    const enriched = await (
+      server as unknown as {
+        enrichIdentityFromContextSession: (
+          u: unknown,
+          t: unknown
+        ) => Promise<{ agentId?: string; sbId?: string } | null>;
+      }
+    ).enrichIdentityFromContextSession(USER, { sessionId: SID, agentId: 'myra' });
+
+    expect(enriched?.agentId).toBe('myra');
+    expect(enriched?.sbId).toBe('sb-uuid-B');
+
+    // The header-produced identity flows through to workspace scope,
+    // unambiguously, from the canonical UUID.
+    const ws = await (
+      server as unknown as {
+        resolveWorkspaceContextForMcpRequest: (
+          req: unknown,
+          u: unknown
+        ) => Promise<{ workspaceId?: string }>;
+      }
+    ).resolveWorkspaceContextForMcpRequest({ header: () => undefined }, { ...USER, ...enriched });
+    expect(ws.workspaceId).toBe('ws-BBBB');
+  });
+
+  it('legacy sessions without sb_id fail closed on duplicate slugs instead of guessing', async () => {
+    const server = makeServer(liveSession(undefined));
+    const enriched = await (
+      server as unknown as {
+        enrichIdentityFromContextSession: (
+          u: unknown,
+          t: unknown
+        ) => Promise<{ agentId?: string } | null>;
+      }
+    ).enrichIdentityFromContextSession(USER, { sessionId: SID, agentId: 'myra' });
+    // Slug fallback hits the duplicate-row error → no enrichment.
+    expect(enriched?.agentId).toBeUndefined();
+  });
+
+  it('refuses enrichment when the session belongs to a different user', async () => {
+    const server = makeServer({ ...liveSession('sb-uuid-A'), userId: 'user-999' });
+    const enriched = await (
+      server as unknown as {
+        enrichIdentityFromContextSession: (
+          u: unknown,
+          t: unknown
+        ) => Promise<{ agentId?: string } | null>;
+      }
+    ).enrichIdentityFromContextSession(USER, { sessionId: SID, agentId: 'myra' });
+    expect(enriched?.agentId).toBeUndefined();
+  });
+});
