@@ -2057,6 +2057,7 @@ export class MemoryRepository {
       id: row.id,
       userId: row.user_id,
       agentId: row.agent_id || undefined,
+      sbId: row.sb_id || undefined,
       studioId,
       threadKey: row.thread_key || undefined,
       activeThreadKey: row.active_thread_key || undefined,

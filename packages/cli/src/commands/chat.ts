@@ -114,6 +114,7 @@ import { formatContextLines, type ContextSections } from '../repl/ink/context-vi
 import {
   classifyError,
   decodeDelegationToken,
+  encodeContextToken,
   mintDelegationToken,
   verifyDelegationToken,
   type DelegationTokenPayload,
@@ -2471,8 +2472,28 @@ export async function runChat(options: ChatOptions): Promise<void> {
     throw new Error('Could not resolve agent identity. Run `ink init` or pass `--agent <id>`.');
   }
   const agentId: string = resolvedAgentId;
-  const pcp = new PcpClient();
   const identity = readIdentityJson(process.cwd());
+  // x-ink-context on every ink-routed tool call: the server validates the
+  // named session against the authenticated user and enriches request
+  // identity from the session row (workspace scope for writes, session
+  // attribution, trigger context). sessionId/studioId are read through live
+  // refs — both can change after client construction (session start,
+  // cross-studio attach) and a stale header would suppress server-side
+  // correction. cliAttached is false for ANY one-shot mode: --message runs
+  // headless even without --non-interactive, and persisting cliAttached=true
+  // from such a run would wrongly suppress concurrent trigger spawns.
+  let currentPcpSessionId: () => string | undefined = () => undefined;
+  let currentPcpStudioId: () => string | undefined = () => identity?.studioId;
+  const pcp = new PcpClient(undefined, undefined, {
+    getContextToken: () =>
+      encodeContextToken({
+        sessionId: currentPcpSessionId() || '',
+        studioId: currentPcpStudioId() || 'main',
+        agentId,
+        cliAttached: !options.nonInteractive && !options.message,
+        runtime: 'ink',
+      }),
+  });
   let autoAttachedLatest = false;
   let contextBudgetAuto = !options.maxContextTokens;
   const initialBackend = options.backend || 'claude';
@@ -2549,6 +2570,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
                 : 'auto-deny'
             : 'interactive',
   };
+  // From here, ink-routed tool calls carry the live session and studio ids
+  // in their x-ink-context header (see PcpClient construction above).
+  currentPcpSessionId = () => runtime.sessionId;
+  currentPcpStudioId = () => runtime.studioId || identity?.studioId;
   // Resolve --sender or --contact-id for per-sender session isolation
   if (options.contactId) {
     runtime.contactId = options.contactId;

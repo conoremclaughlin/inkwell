@@ -179,6 +179,9 @@ export interface PcpContextToken {
  * Encode a context token for the `x-ink-context` header.
  */
 export function encodeContextToken(token: PcpContextToken): string {
+  // token.runtime values in the wild: 'claude' | 'codex' | 'gemini' for
+  // provider-backed spawns, plus 'ink' for the ink chat loop's own PcpClient
+  // (PR #468). The server treats it as an opaque string.
   return Buffer.from(JSON.stringify(token)).toString('base64url');
 }
 

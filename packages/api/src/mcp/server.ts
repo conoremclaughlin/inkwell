@@ -133,6 +133,43 @@ export class MCPServer {
       return null;
     }
 
+    // Canonical-first: the session row stores its owning identity UUID
+    // (sessions.sb_id). Resolving by that UUID is unambiguous where the slug
+    // is not — the same agent_id can exist in multiple workspaces, and a
+    // slug .single() lookup errors on duplicates, breaking enrichment and
+    // artifact writes for exactly the identities that need disambiguation
+    // (PR #468 review 4902919349). Slug lookup remains only as the fallback
+    // for legacy sessions without sb_id.
+    if (session.sbId) {
+      const { data, error } = await this.dataComposer
+        .getClient()
+        .from('agent_identities')
+        .select('id, agent_id, user_id, users!inner(email)')
+        .eq('id', session.sbId)
+        .single();
+
+      if (error || !data) {
+        logger.debug('Context-based auth: session sb_id has no identity row', {
+          sbId: session.sbId,
+          sessionId,
+        });
+        return null;
+      }
+      if (data.user_id !== session.userId || data.agent_id !== agentId) {
+        logger.warn('Context-based auth: session sb_id does not match session user/agent', {
+          sessionId,
+          sbId: session.sbId,
+          identityUserId: data.user_id,
+          sessionUserId: session.userId,
+          identityAgentId: data.agent_id,
+          contextAgentId: agentId,
+        });
+        return null;
+      }
+      const email = (data.users as unknown as { email: string })?.email ?? '';
+      return { userId: session.userId, email, agentId, sbId: data.id };
+    }
+
     const { data, error } = await this.dataComposer
       .getClient()
       .from('agent_identities')
@@ -156,6 +193,69 @@ export class MCPServer {
       agentId,
       sbId: data.id,
     };
+  }
+
+  /**
+   * Canonical workspace derivation: one identity UUID → its workspace.
+   * Preferred over the slug variant whenever sbId is known — the slug can
+   * match identities in multiple workspaces (ambiguous by schema).
+   */
+  private async deriveWorkspaceIdFromSbId(sbId: string): Promise<string | null> {
+    const { data, error } = await this.dataComposer
+      .getClient()
+      .from('agent_identities')
+      .select('workspace_id')
+      .eq('id', sbId)
+      .maybeSingle();
+
+    if (error) {
+      logger.warn('Failed to derive workspace from identity UUID in MCP request context', {
+        sbId,
+        error: error.message,
+      });
+      return null;
+    }
+    return data?.workspace_id ?? null;
+  }
+
+  /**
+   * Session-anchored identity enrichment. The normal local auth shape is an
+   * unbound USER bearer (~/.ink/auth.json) with no agent claim, while the
+   * x-ink-context token names the session's agent. The token alone is a
+   * client assertion, so identity is enriched only when the referenced
+   * session row (server truth) is live, matches the claimed agent, AND is
+   * owned by the AUTHENTICATED user. Without this, ink-routed tool calls run
+   * agent-less: workspace derivation for writes cannot run and
+   * create_artifact fails wanting workspace scope (found live by Myra).
+   */
+  private async enrichIdentityFromContextSession(
+    userData: { userId: string; email: string; agentId?: string; sbId?: string } | null,
+    contextToken: { sessionId?: string; agentId?: string } | null
+  ): Promise<{ userId: string; email: string; agentId?: string; sbId?: string } | null> {
+    if (!userData) return userData;
+    if (userData.agentId || !contextToken?.sessionId || !contextToken?.agentId) return userData;
+
+    const sessionIdentity = await this.resolveUserFromContextSession(
+      contextToken.sessionId,
+      contextToken.agentId
+    );
+    if (!sessionIdentity) return userData;
+    if (sessionIdentity.userId !== userData.userId) {
+      logger.warn('Context session enrichment rejected: session owned by different user', {
+        sessionId: contextToken.sessionId,
+        sessionUserId: sessionIdentity.userId,
+        authenticatedUserId: userData.userId,
+      });
+      return userData;
+    }
+
+    logger.debug('Context session enrichment: agent identity attached to user-token request', {
+      sessionId: contextToken.sessionId,
+      agentId: sessionIdentity.agentId,
+      sbId: sessionIdentity.sbId,
+      userId: userData.userId,
+    });
+    return { ...userData, agentId: sessionIdentity.agentId, sbId: sessionIdentity.sbId };
   }
 
   private async deriveWorkspaceIdFromAgent(
@@ -218,9 +318,13 @@ export class MCPServer {
             return !!workspace;
           }
         : undefined,
-      deriveWorkspaceIdFromAgent: userData.agentId
-        ? () => this.deriveWorkspaceIdFromAgent(userData.userId, userData.agentId!)
-        : undefined,
+      // Canonical UUID derivation first — the slug variant is ambiguous when
+      // the same agent_id exists in multiple workspaces.
+      deriveWorkspaceIdFromAgent: userData.sbId
+        ? () => this.deriveWorkspaceIdFromSbId(userData.sbId!)
+        : userData.agentId
+          ? () => this.deriveWorkspaceIdFromAgent(userData.userId, userData.agentId!)
+          : undefined,
     });
 
     if (!resolution) return {};
@@ -384,6 +488,19 @@ export class MCPServer {
             sbId: userData.sbId,
           }
         : {};
+
+      // Session-anchored identity enrichment (see
+      // enrichIdentityFromContextSession): attaches the session's agent
+      // identity — canonical sbId first — to user-token requests so
+      // pinned-agent dispatch and workspace derivation work for ink-routed
+      // tool calls.
+      const effectiveIdentity = await this.enrichIdentityFromContextSession(userData, contextToken);
+      if (effectiveIdentity && effectiveIdentity !== userData) {
+        Object.assign(ctx, {
+          agentId: effectiveIdentity.agentId,
+          sbId: effectiveIdentity.sbId,
+        });
+      }
       const callerProfileHeader = req.header('x-ink-caller-profile')?.trim().toLowerCase();
       const callerProfile: 'agent' | 'runtime' =
         callerProfileHeader === 'runtime' ? 'runtime' : 'agent';
@@ -429,14 +546,19 @@ export class MCPServer {
       }
 
       // ── Workspace scope (parent-level) ──
-      // Always resolve workspace independently — it's a different scope than studio.
-      if (userData) {
+      // Always resolve workspace independently — it's a different scope than
+      // studio. Uses the session-enriched identity so agent-derived workspace
+      // resolution works for user-token requests too.
+      if (effectiveIdentity) {
         try {
-          Object.assign(ctx, await this.resolveWorkspaceContextForMcpRequest(req, userData));
+          Object.assign(
+            ctx,
+            await this.resolveWorkspaceContextForMcpRequest(req, effectiveIdentity)
+          );
         } catch (error) {
           logger.warn('Rejected MCP request due to invalid workspace scope', {
-            userId: userData.userId,
-            agentId: userData.agentId,
+            userId: effectiveIdentity.userId,
+            agentId: effectiveIdentity.agentId,
             error: error instanceof Error ? error.message : String(error),
           });
           res.status(403).json({
