@@ -384,6 +384,45 @@ export class MCPServer {
             sbId: userData.sbId,
           }
         : {};
+
+      // Session-anchored identity enrichment: the normal local auth shape is
+      // an unbound USER bearer (~/.ink/auth.json) with no agent claim, while
+      // the x-ink-context token names the session's agent. The token alone is
+      // a client assertion, so identity is enriched only when the referenced
+      // session row (server truth) is live, matches the claimed agent, AND is
+      // owned by the AUTHENTICATED user. Without this, ink-routed tool calls
+      // run agent-less: workspace derivation for writes cannot run and
+      // create_artifact fails wanting workspace scope (found live by Myra;
+      // PR #468 review 4902849610).
+      let effectiveIdentity = userData;
+      if (userData && !userData.agentId && contextToken?.sessionId && contextToken?.agentId) {
+        const sessionIdentity = await this.resolveUserFromContextSession(
+          contextToken.sessionId,
+          contextToken.agentId
+        );
+        if (sessionIdentity && sessionIdentity.userId === userData.userId) {
+          effectiveIdentity = {
+            ...userData,
+            agentId: sessionIdentity.agentId,
+            sbId: sessionIdentity.sbId,
+          };
+          Object.assign(ctx, { agentId: sessionIdentity.agentId, sbId: sessionIdentity.sbId });
+          logger.debug(
+            'Context session enrichment: agent identity attached to user-token request',
+            {
+              sessionId: contextToken.sessionId,
+              agentId: sessionIdentity.agentId,
+              userId: userData.userId,
+            }
+          );
+        } else if (sessionIdentity) {
+          logger.warn('Context session enrichment rejected: session owned by different user', {
+            sessionId: contextToken.sessionId,
+            sessionUserId: sessionIdentity.userId,
+            authenticatedUserId: userData.userId,
+          });
+        }
+      }
       const callerProfileHeader = req.header('x-ink-caller-profile')?.trim().toLowerCase();
       const callerProfile: 'agent' | 'runtime' =
         callerProfileHeader === 'runtime' ? 'runtime' : 'agent';
@@ -429,10 +468,15 @@ export class MCPServer {
       }
 
       // ── Workspace scope (parent-level) ──
-      // Always resolve workspace independently — it's a different scope than studio.
-      if (userData) {
+      // Always resolve workspace independently — it's a different scope than
+      // studio. Uses the session-enriched identity so agent-derived workspace
+      // resolution works for user-token requests too.
+      if (effectiveIdentity) {
         try {
-          Object.assign(ctx, await this.resolveWorkspaceContextForMcpRequest(req, userData));
+          Object.assign(
+            ctx,
+            await this.resolveWorkspaceContextForMcpRequest(req, effectiveIdentity)
+          );
         } catch (error) {
           logger.warn('Rejected MCP request due to invalid workspace scope', {
             userId: userData.userId,

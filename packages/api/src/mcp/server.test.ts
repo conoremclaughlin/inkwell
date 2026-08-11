@@ -495,6 +495,86 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     expect(mockGetSession).toHaveBeenCalledWith('a1b2c3d4-e5f6-7890-abcd-ef1234567890');
   });
 
+  it('enriches a user-token request with the context session agent (PR #468)', async () => {
+    if (serverUnavailableError) return;
+    // The normal local auth shape: an unbound USER bearer with no agent
+    // claim. The x-ink-context session must be consulted (server truth)
+    // even though Authorization is present — before this, ink-routed tool
+    // calls ran agent-less and workspace derivation for writes failed.
+    mockVerifyAccessToken.mockResolvedValue({ userId: 'user-456', email: 'test@example.com' });
+    mockGetSession.mockClear();
+    mockGetSession.mockResolvedValue({
+      id: 'b2c3d4e5-f6a7-8901-bcde-f23456789012',
+      userId: 'user-456',
+      agentId: 'myra',
+      lifecycle: 'running',
+      startedAt: new Date(),
+      endedAt: undefined,
+      metadata: {},
+    });
+    contextIdentity = {
+      id: 'sb-myra-1',
+      user_id: 'user-456',
+      users: { email: 'test@example.com' },
+    };
+
+    const contextHeader = encodeContextHeader({
+      sessionId: 'b2c3d4e5-f6a7-8901-bcde-f23456789012',
+      studioId: 'studio-1',
+      agentId: 'myra',
+      cliAttached: false,
+      runtime: 'ink',
+    });
+
+    const res = await mcpPost(baseUrl, INITIALIZE_REQUEST, {
+      Authorization: 'Bearer valid',
+      'x-ink-context': contextHeader,
+    });
+
+    expect(res.status).toBe(200);
+    // The enrichment path consulted the session row under Authorization —
+    // previously getSession was only reached in the no-auth fallback.
+    expect(mockGetSession).toHaveBeenCalledWith('b2c3d4e5-f6a7-8901-bcde-f23456789012');
+  });
+
+  it('does not fail the request when the context session belongs to a different user', async () => {
+    if (serverUnavailableError) return;
+    // Cross-user session reference: enrichment is refused (identity stays
+    // agent-less) but the request itself proceeds under the valid bearer.
+    mockVerifyAccessToken.mockResolvedValue({ userId: 'user-456', email: 'test@example.com' });
+    mockGetSession.mockClear();
+    mockGetSession.mockResolvedValue({
+      id: 'c3d4e5f6-a7b8-9012-cdef-345678901234',
+      userId: 'user-999',
+      agentId: 'myra',
+      lifecycle: 'running',
+      startedAt: new Date(),
+      endedAt: undefined,
+      metadata: {},
+    });
+    contextIdentity = {
+      id: 'sb-myra-1',
+      user_id: 'user-999',
+      users: { email: 'other@example.com' },
+    };
+
+    const contextHeader = encodeContextHeader({
+      sessionId: 'c3d4e5f6-a7b8-9012-cdef-345678901234',
+      studioId: 'studio-1',
+      agentId: 'myra',
+      cliAttached: false,
+      runtime: 'ink',
+    });
+
+    const res = await mcpPost(baseUrl, INITIALIZE_REQUEST, {
+      Authorization: 'Bearer valid',
+      'x-ink-context': contextHeader,
+    });
+
+    expect(res.status).toBe(200);
+    expect(mockGetSession).toHaveBeenCalledWith('c3d4e5f6-a7b8-9012-cdef-345678901234');
+  });
+
   it('should reject forged context with no matching session', async () => {
     if (serverUnavailableError) return;
     (env as any).MCP_REQUIRE_OAUTH = true;
