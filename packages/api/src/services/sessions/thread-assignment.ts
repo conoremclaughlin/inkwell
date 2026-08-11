@@ -45,6 +45,15 @@ export interface AssignResult {
   /** True when the candidate lost the claim and delivery must reroute. */
   rerouted: boolean;
   boundVia: BoundVia | 'already-bound';
+  /**
+   * False when no durable participant stamp exists after this call (write
+   * failed and recovery found the row still NULL, or no participant row).
+   * A wake dispatch may still deliver — the wake itself surfaces the
+   * message — but a routeOnly dispatch MUST treat this as failure: under
+   * stamped-only polling an unstamped thread is invisible to every session,
+   * and with no wake coming there is no retry (Lumen, PR #460 round 2).
+   */
+  stampPersisted: boolean;
 }
 
 interface SessionRow {
@@ -95,9 +104,16 @@ async function recoverFromWriteFailure(
     .maybeSingle();
   const stamp: string | null = after?.session_id ?? null;
   if (stamp && stamp !== candidateSessionId) {
-    return { sessionId: stamp, rerouted: true, boundVia: 'continuity' };
+    return { sessionId: stamp, rerouted: true, boundVia: 'continuity', stampPersisted: true };
   }
-  return { sessionId: stamp || candidateSessionId, rerouted: false, boundVia: failedVia };
+  // stamp === candidate: someone else durably wrote our candidate. Otherwise
+  // the row is still NULL — our write failed and nothing durable exists.
+  return {
+    sessionId: stamp || candidateSessionId,
+    rerouted: false,
+    boundVia: failedVia,
+    stampPersisted: stamp === candidateSessionId,
+  };
 }
 
 export async function assignThreadParticipant(
@@ -119,7 +135,12 @@ export async function assignThreadParticipant(
   // stamp exists, plain anchor otherwise).
   if (explicitAnchor) {
     if (currentStamp === candidateSessionId) {
-      return { sessionId: candidateSessionId, rerouted: false, boundVia: 'already-bound' };
+      return {
+        sessionId: candidateSessionId,
+        rerouted: false,
+        boundVia: 'already-bound',
+        stampPersisted: true,
+      };
     }
     const boundVia: BoundVia = currentStamp ? 'explicit-retarget' : 'explicit-anchor';
     const { error } = await supabase
@@ -145,13 +166,18 @@ export async function assignThreadParticipant(
       boundVia,
       source,
     });
-    return { sessionId: candidateSessionId, rerouted: false, boundVia };
+    return { sessionId: candidateSessionId, rerouted: false, boundVia, stampPersisted: true };
   }
 
   // Continuity: live stamp wins; candidate is discarded.
   if (currentStamp) {
     if (currentStamp === candidateSessionId) {
-      return { sessionId: currentStamp, rerouted: false, boundVia: 'already-bound' };
+      return {
+        sessionId: currentStamp,
+        rerouted: false,
+        boundVia: 'already-bound',
+        stampPersisted: true,
+      };
     }
     const dead = await isSessionDead(supabase, currentStamp);
     if (!dead) {
@@ -163,7 +189,12 @@ export async function assignThreadParticipant(
         boundVia: 'continuity',
         source,
       });
-      return { sessionId: currentStamp, rerouted: true, boundVia: 'continuity' };
+      return {
+        sessionId: currentStamp,
+        rerouted: true,
+        boundVia: 'continuity',
+        stampPersisted: true,
+      };
     }
     // Dead stamp: rebind, guarded against the dead id so a concurrent rebind
     // can't double-write.
@@ -202,9 +233,16 @@ export async function assignThreadParticipant(
           candidateSessionId,
           source,
         });
-        return { sessionId: winner, rerouted: true, boundVia: 'continuity' };
+        return { sessionId: winner, rerouted: true, boundVia: 'continuity', stampPersisted: true };
       }
-      return { sessionId: candidateSessionId, rerouted: false, boundVia: 'rebind-dead-session' };
+      // winner === candidate: durably stamped by a concurrent writer. A NULL
+      // reread means no durable stamp survived — do not claim persistence.
+      return {
+        sessionId: candidateSessionId,
+        rerouted: false,
+        boundVia: 'rebind-dead-session',
+        stampPersisted: winner === candidateSessionId,
+      };
     }
     logger.info('[Assign] Thread participant bound', {
       threadId,
@@ -214,7 +252,12 @@ export async function assignThreadParticipant(
       boundVia: 'rebind-dead-session',
       source,
     });
-    return { sessionId: candidateSessionId, rerouted: false, boundVia: 'rebind-dead-session' };
+    return {
+      sessionId: candidateSessionId,
+      rerouted: false,
+      boundVia: 'rebind-dead-session',
+      stampPersisted: true,
+    };
   }
 
   // First assignment: CAS — claim only while unstamped.
@@ -244,7 +287,12 @@ export async function assignThreadParticipant(
       boundVia: 'claim',
       source,
     });
-    return { sessionId: candidateSessionId, rerouted: false, boundVia: 'claim' };
+    return {
+      sessionId: candidateSessionId,
+      rerouted: false,
+      boundVia: 'claim',
+      stampPersisted: true,
+    };
   }
 
   // Lost the claim — a concurrent dispatch won. Reread and route to the winner.
@@ -263,7 +311,7 @@ export async function assignThreadParticipant(
       candidateSessionId,
       source,
     });
-    return { sessionId: winner, rerouted: true, boundVia: 'continuity' };
+    return { sessionId: winner, rerouted: true, boundVia: 'continuity', stampPersisted: true };
   }
   // No row at all (participant not registered yet) — deliver to candidate;
   // the send path registers participants before dispatch, so this is a
@@ -274,5 +322,10 @@ export async function assignThreadParticipant(
     candidateSessionId,
     source,
   });
-  return { sessionId: candidateSessionId, rerouted: false, boundVia: 'claim' };
+  return {
+    sessionId: candidateSessionId,
+    rerouted: false,
+    boundVia: 'claim',
+    stampPersisted: false,
+  };
 }

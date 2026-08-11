@@ -1045,6 +1045,12 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       // the TARGET session — under stamped-only polling, an unstamped row is
       // invisible to everyone, so "leave null so both see it" no longer works.
       let deliverySession = routedSession;
+      // Assignment integrity (Lumen, PR #460 round 2): a failed stamp must
+      // never be swallowed into a routeOnly "success" — with stamped-only
+      // polling and no wake coming, an unstamped thread is permanently
+      // invisible. Wake dispatches tolerate it (the wake surfaces the
+      // message and the next dispatch retries the stamp).
+      let assignmentFailure: string | null = null;
       if (payload.threadId && routedSession.id) {
         try {
           const assignment = await assignThreadParticipant(dataComposer!.getClient(), {
@@ -1054,6 +1060,9 @@ When you complete a task_request, mark it as completed using update_inbox_messag
             explicitAnchor: !!payload.explicitRecipientTarget,
             source: 'trigger-handler',
           });
+          if (!assignment.stampPersisted) {
+            assignmentFailure = `participant stamp not persisted (boundVia=${assignment.boundVia})`;
+          }
           if (assignment.rerouted) {
             // A concurrent dispatch (or an existing live binding) won — deliver
             // to the winner, and archive our freshly-created loser candidate so
@@ -1074,18 +1083,31 @@ When you complete a task_request, mark it as completed using update_inbox_messag
             }
           }
         } catch (err) {
+          assignmentFailure = err instanceof Error ? err.message : String(err);
           logger.warn('[Trigger] Thread assignment failed', {
             threadId: payload.threadId,
             agentId: targetAgentId,
             sessionId: routedSession.id,
-            error: err instanceof Error ? err.message : String(err),
+            error: assignmentFailure,
           });
         }
       }
 
-      // Routing-only dispatch: assignment is done; wake was not requested.
+      // Routing-only dispatch: assignment IS the entire job — a failed stamp
+      // must propagate as a failed trigger (processTrigger returns
+      // success:false and the send surfaces it), never a silent success.
       // (spec §3a — trigger controls wake, never addressing.)
       if (payload.routeOnly) {
+        if (assignmentFailure) {
+          logger.error('[Trigger] routeOnly assignment failed — surfacing to sender', {
+            targetAgentId,
+            sessionId: deliverySession.id,
+            threadKey: payload.threadKey,
+            threadId: payload.threadId,
+            error: assignmentFailure,
+          });
+          throw new Error(`routeOnly assignment failed for ${targetAgentId}: ${assignmentFailure}`);
+        }
         logger.info('[Trigger] routeOnly — assignment complete, no wake', {
           targetAgentId,
           sessionId: deliverySession.id,

@@ -95,7 +95,12 @@ describe('assignThreadParticipant', () => {
       candidateSessionId: 's-new',
       explicitAnchor: false,
     });
-    expect(r).toEqual({ sessionId: 's-new', rerouted: false, boundVia: 'claim' });
+    expect(r).toEqual({
+      sessionId: 's-new',
+      rerouted: false,
+      boundVia: 'claim',
+      stampPersisted: true,
+    });
   });
 
   it('loses the claim race and reroutes to the winner (Lumen test 2)', async () => {
@@ -116,7 +121,12 @@ describe('assignThreadParticipant', () => {
       candidateSessionId: 's-other',
       explicitAnchor: false,
     });
-    expect(r).toEqual({ sessionId: 's-live', rerouted: true, boundVia: 'continuity' });
+    expect(r).toEqual({
+      sessionId: 's-live',
+      rerouted: true,
+      boundVia: 'continuity',
+      stampPersisted: true,
+    });
     expect(db.getUpdates()).toHaveLength(0);
   });
 
@@ -127,7 +137,12 @@ describe('assignThreadParticipant', () => {
       candidateSessionId: 's-new',
       explicitAnchor: false,
     });
-    expect(r).toEqual({ sessionId: 's-new', rerouted: false, boundVia: 'rebind-dead-session' });
+    expect(r).toEqual({
+      sessionId: 's-new',
+      rerouted: false,
+      boundVia: 'rebind-dead-session',
+      stampPersisted: true,
+    });
   });
 
   it('explicit anchor overwrites a live stamp as deliberate retarget (Lumen test 5)', async () => {
@@ -137,7 +152,12 @@ describe('assignThreadParticipant', () => {
       candidateSessionId: 's-anchored',
       explicitAnchor: true,
     });
-    expect(r).toEqual({ sessionId: 's-anchored', rerouted: false, boundVia: 'explicit-retarget' });
+    expect(r).toEqual({
+      sessionId: 's-anchored',
+      rerouted: false,
+      boundVia: 'explicit-retarget',
+      stampPersisted: true,
+    });
     expect(db.getUpdates()).toEqual([{ session_id: 's-anchored' }]);
   });
 
@@ -161,7 +181,12 @@ describe('assignThreadParticipant', () => {
       candidateSessionId: 's-other',
       explicitAnchor: false,
     });
-    expect(r).toEqual({ sessionId: 's-live', rerouted: true, boundVia: 'continuity' });
+    expect(r).toEqual({
+      sessionId: 's-live',
+      rerouted: true,
+      boundVia: 'continuity',
+      stampPersisted: true,
+    });
     expect(db.getUpdates()).toHaveLength(0);
   });
 
@@ -176,6 +201,23 @@ describe('assignThreadParticipant', () => {
     });
     expect(r.sessionId).toBe('s-live');
     expect(r.rerouted).toBe(true);
+    expect(r.stampPersisted).toBe(true); // the durable stamp exists — just not ours
+  });
+
+  it('FAIL-SAFE: a write ERROR with NO durable stamp reports stampPersisted=false (round 2)', async () => {
+    // Claim write fails and recovery finds the row still NULL: nothing
+    // durable exists. Callers on the routeOnly path must see this and fail
+    // the send — under stamped-only polling an unstamped thread is invisible
+    // and no wake retry is coming.
+    const db = mockDb({ currentStamp: null, updateAffects: 0, updateError: true });
+    const r = await assignThreadParticipant(db, {
+      ...BASE,
+      candidateSessionId: 's-candidate',
+      explicitAnchor: false,
+    });
+    expect(r.sessionId).toBe('s-candidate');
+    expect(r.rerouted).toBe(false);
+    expect(r.stampPersisted).toBe(false);
   });
 
   it('no-ops when already bound to the candidate', async () => {
@@ -185,7 +227,12 @@ describe('assignThreadParticipant', () => {
       candidateSessionId: 's-same',
       explicitAnchor: false,
     });
-    expect(r).toEqual({ sessionId: 's-same', rerouted: false, boundVia: 'already-bound' });
+    expect(r).toEqual({
+      sessionId: 's-same',
+      rerouted: false,
+      boundVia: 'already-bound',
+      stampPersisted: true,
+    });
     expect(db.getUpdates()).toHaveLength(0);
   });
 });

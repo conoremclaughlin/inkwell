@@ -618,6 +618,11 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     // session is still assigned/stamped (trigger:false / missingSenderSession
     // must never mean unaddressed).
     const triggeredAgents: string[] = [];
+    // Assignment failures per recipient (Lumen, PR #460 round 2): a send whose
+    // routing stamp did not persist must NOT return unqualified success —
+    // for trigger:false recipients no wake follows, so an unstamped thread
+    // is invisible to stamped-only polling with no retry coming.
+    const routingFailures: Array<{ agentId: string; error: string }> = [];
     // Union with agentsToTrigger: actionable self-sends (session_resume /
     // task_request strategy kickoffs) wake self without an explicit
     // studio/session target and must keep dispatching.
@@ -718,19 +723,36 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
 
         // 1) Assignment — SYNCHRONOUS (spec §3a): processTrigger awaits the
         //    handler, so the participant stamp is durable before send returns.
-        //    A crash after this line cannot orphan the message.
+        //    A crash after this line cannot orphan the message. A FAILED
+        //    assignment (success:false or throw) is captured per recipient
+        //    and surfaced in the response — never swallowed into success.
         try {
-          await gateway.processTrigger({ ...payload, routeOnly: true });
+          const assignResult = await gateway.processTrigger({ ...payload, routeOnly: true });
+          if (!assignResult.success) {
+            routingFailures.push({
+              agentId: toAgentId,
+              error: assignResult.error || 'assignment failed',
+            });
+            logger.warn('[ThreadTrigger] Synchronous assignment failed', {
+              threadKey,
+              toAgentId,
+              error: assignResult.error || 'assignment failed',
+            });
+          }
         } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          routingFailures.push({ agentId: toAgentId, error: message });
           logger.warn('[ThreadTrigger] Synchronous assignment failed', {
             threadKey,
             toAgentId,
-            error: err instanceof Error ? err.message : String(err),
+            error: message,
           });
         }
 
         // 2) Wake — optional, fire-and-forget, rides the fresh stamp via
-        //    thread continuity.
+        //    thread continuity. Still attempted after an assignment failure:
+        //    the wake handler re-runs assignment (a transient DB error may
+        //    clear) and the wake itself surfaces the message to the agent.
         if (wake) {
           const result = gateway.dispatchTrigger(payload);
           if (result.accepted) {
@@ -745,8 +767,16 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
         {
           type: 'text' as const,
           text: JSON.stringify({
-            success: true,
-            message: `Thread message sent to ${threadKey}`,
+            success: routingFailures.length === 0,
+            message:
+              routingFailures.length === 0
+                ? `Thread message sent to ${threadKey}`
+                : `Thread message stored in ${threadKey}, but session routing FAILED for: ${routingFailures
+                    .map((f) => f.agentId)
+                    .join(
+                      ', '
+                    )}. Untriggered recipients will NOT see it via inbox polling until routing succeeds — resend or re-trigger to retry assignment.`,
+            ...(routingFailures.length > 0 ? { routingFailures } : {}),
             messageId: threadMessage.id,
             threadKey,
             threadId: thread.id,
@@ -1055,26 +1085,53 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
 
   const { status = 'unread', priority, messageType, limit = 20, since, channelPoll } = parsed;
   // Enforce identity: pinned agents can only read their own inbox.
-  // When agentId is omitted, return inbox across ALL agents (unified timeline).
-  const agentId = parsed.agentId
+  // When agentId is omitted, return inbox across ALL agents (unified timeline)
+  // — EXCEPT for channelPoll, where the gate below derives it from the
+  // session so an agent-less poll can never read the all-agent surface.
+  let agentId = parsed.agentId
     ? (getEffectiveAgentId(parsed.agentId) ?? parsed.agentId)
     : undefined;
 
   // Fail-closed (spec inkmail-read-state §3) — FIRST, before ANY read or
-  // pointer advance: a channelPoll caller with no resolvable session context
-  // gets nothing, touches nothing. Applies with or without agentId (an
-  // agent-less channelPoll is just as unscoped). Legacy inbox fetch +
-  // auto-advance below must never run for an unscoped poller.
+  // pointer advance: a channelPoll caller must present BOTH scopes — a
+  // resolvable session AND an agent that matches that session — or it gets
+  // nothing and touches nothing. agentId is derived from the session row
+  // when omitted and validated against it when provided (Lumen, PR #460
+  // round 2: an agent-less channelPoll previously passed the gate and read
+  // the all-agent legacy inbox). Unlike thread-assignment's liveness check,
+  // a session lookup ERROR here fails CLOSED: this is a read-authorization
+  // decision, and an unverifiable scope must not widen into a read.
   let callerSessionId: string | null = null;
   if (channelPoll) {
     const reqCtx = getRequestContext();
     const sessCtx = getSessionContext();
     callerSessionId = reqCtx?.sessionId || sessCtx?.sessionId || null;
+    let failClosedReason: string | null = null;
     if (!callerSessionId) {
+      failClosedReason = 'no session context';
+    } else {
+      const { data: sessionRow, error: sessionErr } = await supabase
+        .from('sessions')
+        .select('id, agent_id')
+        .eq('id', callerSessionId)
+        .maybeSingle();
+      const sessionAgentId: string | null = sessionRow?.agent_id ?? null;
+      if (sessionErr) {
+        failClosedReason = `session lookup failed: ${sessionErr.message}`;
+      } else if (!sessionRow || !sessionAgentId) {
+        failClosedReason = 'session not found or has no agent';
+      } else if (agentId && agentId !== sessionAgentId) {
+        failClosedReason = `agentId '${agentId}' does not match session agent '${sessionAgentId}'`;
+      } else {
+        agentId = sessionAgentId;
+      }
+    }
+    if (failClosedReason) {
       logger.warn('channel_poll_unscoped', {
         agentId: agentId || null,
+        sessionId: callerSessionId,
         userId: resolved.user.id,
-        hint: 'channelPoll caller presented no session context — returning empty (fail-closed)',
+        hint: `channelPoll scope invalid (${failClosedReason}) — returning empty (fail-closed)`,
       });
       return {
         content: [
@@ -1089,8 +1146,7 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
               count: 0,
               messages: [],
               threadsWithUnread: [],
-              warning:
-                'channel_poll_unscoped: no session context — delivery disabled (fail-closed)',
+              warning: `channel_poll_unscoped: ${failClosedReason} — delivery disabled (fail-closed)`,
             }),
           },
         ],
