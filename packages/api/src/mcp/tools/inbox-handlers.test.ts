@@ -57,11 +57,14 @@ vi.mock('../../channels/agent-gateway.js', () => ({
   }),
 }));
 
-// Mock thread-handlers (imported by inbox-handlers for reply semantics)
+// Mock thread-handlers (imported by inbox-handlers for reply semantics and
+// the get_inbox threadKey alias)
+const mockHandleGetThreadMessages = vi.fn();
 vi.mock('./thread-handlers.js', () => ({
   findThread: vi.fn().mockResolvedValue(null),
   getParticipants: vi.fn().mockResolvedValue([]),
   resolveTriggeredAgents: vi.fn().mockReturnValue([]),
+  handleGetThreadMessages: (...args: unknown[]) => mockHandleGetThreadMessages(...args),
 }));
 
 function createMockSupabase(
@@ -1111,6 +1114,119 @@ describe('handleGetInbox - recipient session naming', () => {
 
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed.messages[0].recipientSessionId).toBe('b85490f5-0836-4bdd-8193-f6cfa2562a41');
+  });
+});
+
+// =====================================================
+// get_inbox threadKey alias → get_thread_messages
+// =====================================================
+
+describe('handleGetInbox — threadKey alias', () => {
+  beforeEach(() => {
+    mockHandleGetThreadMessages.mockReset();
+  });
+
+  it('delegates threadKey queries to get_thread_messages with mapped args', async () => {
+    // Previously threadKey was silently stripped by the schema and the query
+    // ran against agent_inbox — where thread messages never live — returning
+    // empty with zero signal (the Myra vet-turn bug). Conor's call: the
+    // inbox is the front door; threadKey aliases through.
+    const delegateResult = {
+      content: [{ type: 'text', text: JSON.stringify({ success: true, messages: [] }) }],
+    };
+    mockHandleGetThreadMessages.mockResolvedValue(delegateResult);
+
+    const mockDc = createMockDataComposer(createMockSupabase());
+    const result = await handleGetInbox(
+      {
+        email: 'test@test.com',
+        agentId: 'myra',
+        threadKey: 'thread:wholly-in-ink-vet',
+        limit: 10,
+      },
+      mockDc as never
+    );
+
+    expect(result).toBe(delegateResult);
+    expect(mockHandleGetThreadMessages).toHaveBeenCalledOnce();
+    const delegatedArgs = mockHandleGetThreadMessages.mock.calls[0]![0] as Record<string, unknown>;
+    expect(delegatedArgs.threadKey).toBe('thread:wholly-in-ink-vet');
+    expect(delegatedArgs.agentId).toBe('myra');
+    expect(delegatedArgs.limit).toBe(10);
+    expect(delegatedArgs.fullHistory).toBeUndefined();
+  });
+
+  it("maps status 'all' to the full thread history", async () => {
+    mockHandleGetThreadMessages.mockResolvedValue({
+      content: [{ type: 'text', text: '{}' }],
+    });
+
+    const mockDc = createMockDataComposer(createMockSupabase());
+    await handleGetInbox(
+      {
+        email: 'test@test.com',
+        agentId: 'myra',
+        threadKey: 'pr:463',
+        status: 'all',
+      },
+      mockDc as never
+    );
+
+    const delegatedArgs = mockHandleGetThreadMessages.mock.calls[0]![0] as Record<string, unknown>;
+    expect(delegatedArgs.fullHistory).toBe(true);
+  });
+
+  it('rejects threadKey without agentId — thread access is participant-scoped', async () => {
+    const mockDc = createMockDataComposer(createMockSupabase());
+    await expect(
+      handleGetInbox({ email: 'test@test.com', threadKey: 'pr:463' }, mockDc as never)
+    ).rejects.toThrow(/requires agentId/);
+    expect(mockHandleGetThreadMessages).not.toHaveBeenCalled();
+  });
+
+  it('malformed threadKey fails schema validation instead of being silently stripped', async () => {
+    const mockDc = createMockDataComposer(createMockSupabase());
+    await expect(
+      handleGetInbox(
+        { email: 'test@test.com', agentId: 'myra', threadKey: 'not a thread key' },
+        mockDc as never
+      )
+    ).rejects.toThrow();
+    expect(mockHandleGetThreadMessages).not.toHaveBeenCalled();
+  });
+
+  it('unknown parameters are REJECTED by name, never silently stripped (.strict)', async () => {
+    // The original bug class: zod's default strips unknown keys, so a
+    // plausible-but-wrong parameter silently vanishes and the LLM caller
+    // draws confident wrong conclusions. Strict mode names the offender —
+    // self-correcting on the next attempt.
+    const mockDc = createMockDataComposer(createMockSupabase());
+    await expect(
+      handleGetInbox(
+        { email: 'test@test.com', agentId: 'myra', threadKye: 'pr:464' },
+        mockDc as never
+      )
+    ).rejects.toThrow(/threadKye/);
+    expect(mockHandleGetThreadMessages).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [{ status: 'completed' }, /status:'completed'/],
+    [{ priority: 'high' }, /priority/],
+    [{ messageType: 'task_request' }, /messageType/],
+    [{ since: '2026-08-10T00:00:00Z' }, /since/],
+    [{ channelPoll: true }, /channelPoll/],
+  ])('threadKey mode rejects incompatible filter %j actionably', async (filter, pattern) => {
+    // Silent-ignore here returns WRONG results — e.g. status:'completed'
+    // would serve unread-pointer messages and advance the pointer.
+    const mockDc = createMockDataComposer(createMockSupabase());
+    await expect(
+      handleGetInbox(
+        { email: 'test@test.com', agentId: 'myra', threadKey: 'pr:464', ...filter },
+        mockDc as never
+      )
+    ).rejects.toThrow(pattern);
+    expect(mockHandleGetThreadMessages).not.toHaveBeenCalled();
   });
 });
 
