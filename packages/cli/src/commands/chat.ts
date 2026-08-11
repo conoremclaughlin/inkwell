@@ -406,6 +406,8 @@ interface LocalToolCall {
   tool: string;
   args: Record<string, unknown>;
   raw: string;
+  /** Parsed from the deprecated <tool_call> XML variant, not an ink-tool fence. */
+  variantFormat?: boolean;
 }
 
 interface SessionTranscriptMetadata {
@@ -1154,10 +1156,10 @@ function compactForHistoryPreview(
     .trim();
 }
 
-function extractLocalToolCalls(responseText: string): LocalToolCall[] {
-  const matches = Array.from(responseText.matchAll(/```ink-tool\s*([\s\S]*?)```/gi));
-  const calls: LocalToolCall[] = [];
-  for (const match of matches) {
+export function extractLocalToolCalls(responseText: string): LocalToolCall[] {
+  const indexed: Array<{ index: number; call: LocalToolCall }> = [];
+
+  for (const match of responseText.matchAll(/```ink-tool\s*([\s\S]*?)```/gi)) {
     const payload = (match[1] || '').trim();
     if (!payload) continue;
     try {
@@ -1168,16 +1170,53 @@ function extractLocalToolCalls(responseText: string): LocalToolCall[] {
         parsed.args && typeof parsed.args === 'object' && !Array.isArray(parsed.args)
           ? (parsed.args as Record<string, unknown>)
           : {};
-      calls.push({ tool, args, raw: match[0] || '' });
+      indexed.push({ index: match.index ?? 0, call: { tool, args, raw: match[0] || '' } });
     } catch {
       continue;
     }
   }
-  return calls;
+
+  // Variant tolerance: a long-lived session whose history predates
+  // wholly-in-ink can drift into emitting tool calls as
+  // `<tool_call>{"name":"mcp__inkwell__X","arguments":{...}}</tool_call>`
+  // XML text — imitating its own pre-#462 native-MCP history (Myra,
+  // 2026-08-10: the calls silently never ran, raw XML leaked to Telegram
+  // via the fallback router, and text-form signal_status never halted the
+  // continuation loop). Parse and execute the variant so the turn WORKS;
+  // the continuation prompt separately steers the model back to the fence.
+  for (const match of responseText.matchAll(/<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/gi)) {
+    const payload = (match[1] || '').trim();
+    if (!payload) continue;
+    try {
+      const parsed = JSON.parse(payload) as Record<string, unknown>;
+      const rawName = typeof parsed.name === 'string' ? parsed.name.trim() : '';
+      if (!rawName) continue;
+      // Strip the MCP namespace here (not just at execution) so client-local
+      // dispatch and terminal-signal detection see the bare tool name.
+      const tool = rawName.replace(/^mcp__inkwell__/, '');
+      const args =
+        parsed.arguments && typeof parsed.arguments === 'object' && !Array.isArray(parsed.arguments)
+          ? (parsed.arguments as Record<string, unknown>)
+          : {};
+      indexed.push({
+        index: match.index ?? 0,
+        call: { tool, args, raw: match[0] || '', variantFormat: true },
+      });
+    } catch {
+      continue;
+    }
+  }
+
+  // Preserve the model's emission order across both formats.
+  indexed.sort((a, b) => a.index - b.index);
+  return indexed.map((entry) => entry.call);
 }
 
-function stripLocalToolBlocks(responseText: string): string {
-  return responseText.replace(/```ink-tool[\s\S]*?```/gi, '').trim();
+export function stripLocalToolBlocks(responseText: string): string {
+  return responseText
+    .replace(/```ink-tool[\s\S]*?```/gi, '')
+    .replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, '')
+    .trim();
 }
 
 /**
@@ -4804,7 +4843,14 @@ export async function runChat(options: ChatOptions): Promise<void> {
           return `Tool ${r.tool} (${r.status}): ${resultStr}`;
         })
         .join('\n\n');
-      const continuationBody = `[Tool results from previous turn]\n${toolResultsSummary}\n\nContinue your response based on these tool results. If you need more tools, emit ink-tool blocks. Otherwise, provide your final answer.`;
+      // If the model used the deprecated <tool_call> XML variant, its calls
+      // were executed anyway (see extractLocalToolCalls) — but correct the
+      // format NOW, while the results prove the runtime heard it, so the
+      // drift doesn't reinforce.
+      const formatCorrection = localToolCalls.some((c) => c.variantFormat)
+        ? '\n\nFORMAT NOTE: your tool calls used <tool_call> XML — the ink runtime executed them this time, but the ONLY supported format is a fenced block:\n```ink-tool\n{"tool":"<name>","args":{...}}\n```\nUse ink-tool fences (bare tool names, no mcp__inkwell__ prefix) from now on.'
+        : '';
+      const continuationBody = `[Tool results from previous turn]\n${toolResultsSummary}${formatCorrection}\n\nContinue your response based on these tool results. If you need more tools, emit ink-tool blocks. Otherwise, provide your final answer.`;
       // When resuming the same Claude session, the model already holds the full
       // transcript + tool instructions from the seeded turn — send ONLY the
       // delta. Otherwise (stateless backends) re-pack the full envelope so the
