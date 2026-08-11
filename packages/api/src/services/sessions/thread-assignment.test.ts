@@ -220,6 +220,21 @@ describe('assignThreadParticipant', () => {
     expect(r.stampPersisted).toBe(false);
   });
 
+  it('FAIL-SAFE: an anchor UPDATE affecting zero rows never reports a durable stamp (round 3)', async () => {
+    // Participant inserts are unchecked upstream — a missing row yields an
+    // error-free zero-row UPDATE. Reporting stampPersisted:true there is a
+    // false durable success on the routeOnly path.
+    const db = mockDb({ currentStamp: null, updateAffects: 0 });
+    const r = await assignThreadParticipant(db, {
+      ...BASE,
+      candidateSessionId: 's-anchored',
+      explicitAnchor: true,
+    });
+    expect(r.sessionId).toBe('s-anchored');
+    expect(r.rerouted).toBe(false);
+    expect(r.stampPersisted).toBe(false);
+  });
+
   it('no-ops when already bound to the candidate', async () => {
     const db = mockDb({ currentStamp: 's-same', updateAffects: 0 });
     const r = await assignThreadParticipant(db, {

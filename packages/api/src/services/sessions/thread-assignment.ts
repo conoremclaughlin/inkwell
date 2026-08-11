@@ -143,11 +143,15 @@ export async function assignThreadParticipant(
       };
     }
     const boundVia: BoundVia = currentStamp ? 'explicit-retarget' : 'explicit-anchor';
-    const { error } = await supabase
+    // Check affected rows, not just the error: participant inserts are
+    // unchecked upstream, so a missing row yields an error-free zero-row
+    // UPDATE — which must never report a durable stamp (Lumen, round 3).
+    const { data: anchored, error } = await supabase
       .from('inbox_thread_participants')
       .update({ session_id: candidateSessionId })
       .eq('thread_id', threadId)
-      .eq('agent_id', agentId);
+      .eq('agent_id', agentId)
+      .select('session_id');
     if (error) {
       logger.error('[Assign] Anchor stamp failed', {
         threadId,
@@ -155,6 +159,15 @@ export async function assignThreadParticipant(
         candidateSessionId,
         source,
         error: error.message,
+      });
+      return recoverFromWriteFailure(supabase, params, boundVia);
+    }
+    if (!anchored || anchored.length === 0) {
+      logger.error('[Assign] Anchor stamp affected no rows — participant row missing', {
+        threadId,
+        agentId,
+        candidateSessionId,
+        source,
       });
       return recoverFromWriteFailure(supabase, params, boundVia);
     }

@@ -42,6 +42,7 @@ vi.mock('../../utils/request-context', async (importOriginal) => {
     ...actual,
     getRequestContext: vi.fn().mockReturnValue({ sessionId: 'session-mock-123' }),
     getSessionContext: vi.fn().mockReturnValue(undefined),
+    getPinnedAgentId: vi.fn().mockReturnValue(undefined),
   };
 });
 
@@ -2172,9 +2173,11 @@ function createScopedPollMockSupabase(
 describe('handleGetInbox — channelPoll dual-scope validation (round 2)', () => {
   beforeEach(async () => {
     vi.clearAllMocks();
-    const { getRequestContext, getSessionContext } = await import('../../utils/request-context');
+    const { getRequestContext, getSessionContext, getPinnedAgentId } =
+      await import('../../utils/request-context');
     vi.mocked(getRequestContext).mockReturnValue({ sessionId: 'session-mock-123' } as never);
     vi.mocked(getSessionContext).mockReturnValue(undefined as never);
+    vi.mocked(getPinnedAgentId).mockReturnValue(undefined as never);
   });
 
   it('derives agentId from the session when omitted — never reads the all-agent surface', async () => {
@@ -2190,8 +2193,42 @@ describe('handleGetInbox — channelPoll dual-scope validation (round 2)', () =>
     // The legacy fetch ran agent-scoped: recipient_agent_id was applied.
     const inboxEqs = mockSb.getEqCalls()['agent_inbox'] || [];
     expect(inboxEqs).toContainEqual(['recipient_agent_id', 'wren']);
-    // And the session scope was validated against the sessions table.
+    // And the session scope was validated against the sessions table,
+    // SCOPED TO THE RESOLVED USER (round 3): a session id from another user
+    // must read as not-found, never as a scope source.
     expect(mockSb.getEqCalls()['sessions']).toContainEqual(['id', 'session-mock-123']);
+    const sessionEqCols = (mockSb.getEqCalls()['sessions'] || []).map((c) => c[0]);
+    expect(sessionEqCols).toContain('user_id');
+  });
+
+  it('fails closed when the session agent does not match the pinned identity (round 3)', async () => {
+    // A pinned Myra caller presenting a Wren session id with agentId omitted
+    // must NOT have the read scope switched to Wren.
+    const { getPinnedAgentId } = await import('../../utils/request-context');
+    vi.mocked(getPinnedAgentId).mockReturnValue('myra' as never);
+    const mockSb = createScopedPollMockSupabase(); // session agent is wren
+    const result = await handleGetInbox(
+      { email: 'test@test.com', channelPoll: true },
+      createMockDataComposer(mockSb as never) as never
+    );
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.warning).toContain('channel_poll_unscoped');
+    expect(parsed.warning).toContain('pinned identity');
+    const tablesTouched = (mockSb.from as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0]);
+    expect(tablesTouched).not.toContain('agent_inbox');
+  });
+
+  it('passes when the pinned identity matches the session agent (round 3)', async () => {
+    const { getPinnedAgentId } = await import('../../utils/request-context');
+    vi.mocked(getPinnedAgentId).mockReturnValue('wren' as never);
+    const mockSb = createScopedPollMockSupabase();
+    const result = await handleGetInbox(
+      { email: 'test@test.com', channelPoll: true },
+      createMockDataComposer(mockSb as never) as never
+    );
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.warning).toBeUndefined();
+    expect(parsed.agentId).toBe('wren');
   });
 
   it('fails closed when the provided agentId does not match the session agent', async () => {

@@ -13,7 +13,11 @@ import { advanceThreadReadPointer } from './read-state.js';
 import { getEffectiveAgentId } from '../../auth/enforce-identity';
 import { logger } from '../../utils/logger';
 import type { Json } from '../../data/supabase/types';
-import { getRequestContext, getSessionContext } from '../../utils/request-context';
+import {
+  getRequestContext,
+  getSessionContext,
+  getPinnedAgentId,
+} from '../../utils/request-context';
 import { getAgentGateway, type AgentTriggerPayload } from '../../channels/agent-gateway.js';
 import {
   findThread as findExistingThread,
@@ -1110,16 +1114,25 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
     if (!callerSessionId) {
       failClosedReason = 'no session context';
     } else {
+      // Scope the lookup to the RESOLVED USER — a session id belonging to a
+      // different user must read as not-found, never as a scope source.
       const { data: sessionRow, error: sessionErr } = await supabase
         .from('sessions')
         .select('id, agent_id')
         .eq('id', callerSessionId)
+        .eq('user_id', resolved.user.id)
         .maybeSingle();
       const sessionAgentId: string | null = sessionRow?.agent_id ?? null;
+      // Pinned identity must agree with the session's agent — otherwise a
+      // pinned caller can present another agent's session id, omit agentId,
+      // and switch the derived read scope to that agent (Lumen, round 3).
+      const pinnedAgentId = getPinnedAgentId();
       if (sessionErr) {
         failClosedReason = `session lookup failed: ${sessionErr.message}`;
       } else if (!sessionRow || !sessionAgentId) {
-        failClosedReason = 'session not found or has no agent';
+        failClosedReason = 'session not found for this user or has no agent';
+      } else if (pinnedAgentId && pinnedAgentId !== sessionAgentId) {
+        failClosedReason = `session agent '${sessionAgentId}' does not match pinned identity '${pinnedAgentId}'`;
       } else if (agentId && agentId !== sessionAgentId) {
         failClosedReason = `agentId '${agentId}' does not match session agent '${sessionAgentId}'`;
       } else {
