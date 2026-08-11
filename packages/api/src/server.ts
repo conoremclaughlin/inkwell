@@ -47,6 +47,7 @@ import {
   clearExplicitResponse,
 } from './mcp/tools/response-handlers';
 import { getAgentGateway, type AgentTriggerPayload } from './channels/agent-gateway';
+import { storedTriggerMedia } from './channels/agent-media';
 import { resolveRouteAgentId } from './services/routing/resolve-route';
 import { resolveAgentFromMention } from './services/routing/resolve-mention';
 import { getHeartbeatProcessingConfig } from './config/heartbeat-flags';
@@ -1138,6 +1139,22 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       // If session resolution fails, fall through to normal handleMessage
       logger.debug('[Trigger] CLI-attached check failed, falling through to spawn', {
         error: err instanceof Error ? err.message : String(err),
+      });
+    }
+
+    // Media resolves ONLY on the spawn path — CLI-attached deliveries (early
+    // return above) are text-only via the channel plugin, so snapshotting for
+    // them would guarantee orphaned copies (Lumen, review 4900565751).
+    // storedTriggerMedia is the single entry point: it looks up the stored
+    // row itself and snapshots each validated file; the trigger payload's
+    // own metadata is not an input. Flows to the spawn as --attach-file and
+    // from there through provider media injection.
+    const triggerMedia = await storedTriggerMedia(dataComposer!.getClient() as never, payload);
+    if (triggerMedia.length > 0) {
+      request.metadata!.media = triggerMedia;
+      logger.info('[Trigger] delivering media attachments', {
+        count: triggerMedia.length,
+        to: targetAgentId,
       });
     }
 
