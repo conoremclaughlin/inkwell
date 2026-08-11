@@ -2,20 +2,22 @@ import { describe, it, expect } from 'vitest';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { validateStrategyResult } from './wait.js';
+import { CLI_ENTRYPOINT } from '../lib/cli-entrypoint.js';
 
 const execFileAsync = promisify(execFile);
-
-const CLI_PATH = 'packages/cli/src/cli.ts';
 
 async function runWait(
   args: string[]
 ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
   try {
-    const { stdout, stderr } = await execFileAsync('npx', ['tsx', CLI_PATH, 'wait', ...args], {
-      timeout: 30000,
-      env: { ...process.env, AGENT_ID: 'wren' },
-      cwd: process.cwd(),
-    });
+    const { stdout, stderr } = await execFileAsync(
+      'npx',
+      ['tsx', CLI_ENTRYPOINT, 'wait', ...args],
+      {
+        timeout: 30000,
+        env: { ...process.env, AGENT_ID: 'wren' },
+      }
+    );
     return { stdout, stderr, exitCode: 0 };
   } catch (error: unknown) {
     const e = error as { stdout?: string; stderr?: string; code?: number };
@@ -28,12 +30,13 @@ async function runWait(
 }
 
 describe('sb wait', () => {
+  // These used to bail out early on 'Cannot find module', which meant they
+  // passed vacuously under `yarn workspace @inklabs/cli test` — where the old
+  // repo-relative CLI_PATH never resolved. With CLI_ENTRYPOINT the spawn works
+  // from any cwd, so a failure to start is a real failure again.
   it('shows help text', async () => {
     const result = await runWait(['--help']);
     const output = result.stdout + result.stderr;
-    if (output.includes('triggerUncaughtException') || output.includes('Cannot find module')) {
-      return;
-    }
     expect(output).toContain('Wait for new inbox or thread messages');
     expect(output).toContain('--thread');
     expect(output).toContain('--timeout');
@@ -42,9 +45,6 @@ describe('sb wait', () => {
   it('shows --group in help', async () => {
     const result = await runWait(['--help']);
     const output = result.stdout + result.stderr;
-    if (output.includes('triggerUncaughtException') || output.includes('Cannot find module')) {
-      return;
-    }
     expect(output).toContain('--group');
   });
 

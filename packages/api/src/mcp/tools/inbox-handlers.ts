@@ -19,6 +19,7 @@ import {
   findThread as findExistingThread,
   getParticipants,
   resolveTriggeredAgents,
+  handleGetThreadMessages,
 } from './thread-handlers.js';
 import { resolveStudioHint } from '../../services/sessions/index.js';
 
@@ -157,38 +158,55 @@ export function isThreadOwnedByStudio(
   });
 }
 
-const getInboxSchema = userIdentifierBaseSchema.extend({
-  agentId: z
-    .string()
-    .optional()
-    .describe(
-      'Agent ID to get inbox for. Omit to get inbox across ALL agents (useful for unified timelines).'
-    ),
-  status: z
-    .enum(['unread', 'read', 'acknowledged', 'completed', 'all'])
-    .optional()
-    .default('unread')
-    .describe('Filter by status'),
-  priority: z.enum(['low', 'normal', 'high', 'urgent']).optional().describe('Filter by priority'),
-  messageType: z
-    .enum(['message', 'task_request', 'session_resume', 'notification', 'permission_grant'])
-    .optional(),
-  limit: z.number().min(1).max(200).optional().default(20).describe('Max messages'),
-  since: z
-    .string()
-    .datetime()
-    .optional()
-    .describe('Only return messages created after this ISO timestamp'),
-  channelPoll: z
-    .boolean()
-    .optional()
-    .default(false)
-    .describe(
-      'When true, filter threads by studio ownership using the studioId from request context. ' +
-        'Used by channel plugins to only receive threads belonging to their studio. ' +
-        'Threads with no studio affinity (new, unrouted) are included as broadcast.'
-    ),
-});
+const getInboxSchema = userIdentifierBaseSchema
+  .extend({
+    agentId: z
+      .string()
+      .optional()
+      .describe(
+        'Agent ID to get inbox for. Omit to get inbox across ALL agents (useful for unified timelines).'
+      ),
+    status: z
+      .enum(['unread', 'read', 'acknowledged', 'completed', 'all'])
+      .optional()
+      .default('unread')
+      .describe('Filter by status'),
+    priority: z.enum(['low', 'normal', 'high', 'urgent']).optional().describe('Filter by priority'),
+    messageType: z
+      .enum(['message', 'task_request', 'session_resume', 'notification', 'permission_grant'])
+      .optional(),
+    limit: z.number().min(1).max(200).optional().default(20).describe('Max messages'),
+    since: z
+      .string()
+      .datetime()
+      .optional()
+      .describe('Only return messages created after this ISO timestamp'),
+    threadKey: z
+      .string()
+      .regex(/^[a-zA-Z][a-zA-Z0-9_-]*:[^\s]+$/)
+      .optional()
+      .describe(
+        'Filter to a conversation thread. Aliases through to get_thread_messages ' +
+          '(thread messages are stored separately from the legacy inbox; participant ' +
+          'membership and read-state are respected). Requires agentId. status "all" ' +
+          'maps to the full thread history; priority/messageType/since do not apply.'
+      ),
+    channelPoll: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe(
+        'When true, filter threads by studio ownership using the studioId from request context. ' +
+          'Used by channel plugins to only receive threads belonging to their studio. ' +
+          'Threads with no studio affinity (new, unrouted) are included as broadcast.'
+      ),
+    // .strict(): unknown keys are REJECTED with their names in the error, not
+    // silently stripped. The callers here are LLMs — a plausible-but-wrong
+    // parameter silently ignored produces confident wrong conclusions (Myra
+    // concluded her inbox was empty), while a named rejection self-corrects on
+    // the next attempt. Conor-approved for this scenario (2026-08-10).
+  })
+  .strict();
 
 const updateInboxMessageSchema = userIdentifierBaseSchema.extend({
   messageId: z.string().uuid().describe('Message ID to update'),
@@ -982,6 +1000,57 @@ async function findOrCreateThread(
 export async function handleGetInbox(args: unknown, dataComposer: DataComposer) {
   const supabase = dataComposer.getClient();
   const parsed = getInboxSchema.parse(args);
+
+  // threadKey aliases through to get_thread_messages (Conor, 2026-08-10):
+  // thread messages live in the thread tables, not agent_inbox, and a
+  // threadKey is effectively the conversation's title — callers reaching for
+  // the inbox with one want the thread timeline, not a silently-empty legacy
+  // query. Participant membership and read-state checks are the delegate's.
+  if (parsed.threadKey) {
+    if (!parsed.agentId) {
+      throw new Error(
+        'get_inbox with threadKey requires agentId — thread access is participant-scoped. ' +
+          'Pass your agentId, or use get_thread_messages directly.'
+      );
+    }
+    // Discovery filters that don't map onto thread reads must reject
+    // actionably, not silently return wrong results — e.g. status:'completed'
+    // would otherwise return unread-pointer messages AND advance the pointer.
+    // Supported: status 'unread' (default → messages since your read pointer)
+    // and 'all' (full history).
+    const incompatible: string[] = [];
+    if (parsed.status !== 'unread' && parsed.status !== 'all') {
+      incompatible.push(`status:'${parsed.status}'`);
+    }
+    if (parsed.priority) incompatible.push('priority');
+    if (parsed.messageType) incompatible.push('messageType');
+    if (parsed.since) incompatible.push('since');
+    if (parsed.channelPoll) incompatible.push('channelPoll');
+    if (incompatible.length > 0) {
+      throw new Error(
+        `get_inbox threadKey mode does not support: ${incompatible.join(', ')}. ` +
+          "Thread reads support status 'unread' (default) or 'all'; " +
+          'use get_thread_messages for cursor-based paging.'
+      );
+    }
+    return handleGetThreadMessages(
+      {
+        ...(parsed.userId ? { userId: parsed.userId } : {}),
+        ...(parsed.email ? { email: parsed.email } : {}),
+        ...(parsed.phone ? { phone: parsed.phone } : {}),
+        ...(parsed.platform ? { platform: parsed.platform } : {}),
+        ...(parsed.platformId ? { platformId: parsed.platformId } : {}),
+        agentId: parsed.agentId,
+        threadKey: parsed.threadKey,
+        limit: parsed.limit ?? 20,
+        // The inbox's "unread by default" maps to the thread read pointer;
+        // status 'all' maps to the full timeline.
+        ...(parsed.status === 'all' ? { fullHistory: true } : {}),
+      },
+      dataComposer
+    );
+  }
+
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
   const { status = 'unread', priority, messageType, limit = 20, since, channelPoll } = parsed;
@@ -1925,7 +1994,7 @@ export const inboxToolDefinitions = [
   {
     name: 'get_inbox',
     description:
-      "Get messages from an agent's inbox. Returns unread messages by default. Omit agentId to get inbox across ALL agents in one query (useful for unified timelines like mission control). Sorted by created_at descending.",
+      "Get messages from an agent's inbox. Returns unread messages by default. Omit agentId to get inbox across ALL agents in one query (useful for unified timelines like mission control). Sorted by created_at descending. Pass threadKey to read a conversation thread instead — this aliases through to get_thread_messages (thread messages are stored separately from the legacy inbox) and requires agentId.",
     schema: getInboxSchema,
     handler: handleGetInbox,
   },

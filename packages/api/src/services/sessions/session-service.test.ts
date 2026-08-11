@@ -8,6 +8,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import {
   SessionService,
+  parseRuntimeConfig,
   readImageAttachmentsAsBase64,
   sanitizeHeaderText,
   stripControlChars,
@@ -2742,5 +2743,35 @@ describe('redactSensitiveValues', () => {
     const result = redactSensitiveValues(circular) as Record<string, unknown>;
     expect(result.token).toBe('[redacted]');
     expect(result.self).toBe('[circular]');
+  });
+});
+
+describe('parseRuntimeConfig (per-SB dashboard settings → spawn flags)', () => {
+  it('fails closed on absent/null metadata: local routing, no maxTurns override', () => {
+    expect(parseRuntimeConfig(null)).toEqual({ toolRouting: 'local' });
+    expect(parseRuntimeConfig(undefined)).toEqual({ toolRouting: 'local' });
+    expect(parseRuntimeConfig({})).toEqual({ toolRouting: 'local' });
+  });
+
+  it('fails closed on malformed values', () => {
+    expect(
+      parseRuntimeConfig({ runtimeConfig: { toolRouting: 'sideways', maxTurns: 'ten' } })
+    ).toEqual({ toolRouting: 'local' });
+    expect(parseRuntimeConfig({ runtimeConfig: { maxTurns: Number.NaN } })).toEqual({
+      toolRouting: 'local',
+    });
+    expect(parseRuntimeConfig({ runtimeConfig: 'not-an-object' })).toEqual({
+      toolRouting: 'local',
+    });
+  });
+
+  it('passes through valid dashboard values', () => {
+    expect(parseRuntimeConfig({ runtimeConfig: { toolRouting: 'backend', maxTurns: 8 } })).toEqual({
+      toolRouting: 'backend',
+      maxTurns: 8,
+    });
+    expect(parseRuntimeConfig({ runtimeConfig: { toolRouting: 'local' } })).toEqual({
+      toolRouting: 'local',
+    });
   });
 });

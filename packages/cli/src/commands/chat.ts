@@ -28,7 +28,9 @@ import {
   type BackendAuthBackend,
 } from '../lib/backend-auth.js';
 import { startBackendTurn, runBackendTurn } from '../repl/backend-runner.js';
+import { StreamedTurnRenderer, type StreamedLine } from '../repl/paragraph-stream.js';
 import type { BackendTurnEvent } from '../backends/stream.js';
+import type { TurnMedia } from '../backends/types.js';
 import { startSessionEventStream, type SessionEvent } from '../repl/session-event-stream.js';
 import {
   ContextLedger,
@@ -41,6 +43,7 @@ import {
   contextBudgetForWindow as defaultContextBudget,
 } from '../repl/context-limits.js';
 import { parseSlashCommand } from '../repl/slash.js';
+import { createPollGate } from '../repl/poll-gate.js';
 import {
   parseEvictSelection,
   selectEvictionEntries,
@@ -112,6 +115,7 @@ import { formatContextLines, type ContextSections } from '../repl/ink/context-vi
 import {
   classifyError,
   decodeDelegationToken,
+  encodeContextToken,
   mintDelegationToken,
   verifyDelegationToken,
   type DelegationTokenPayload,
@@ -404,6 +408,8 @@ interface LocalToolCall {
   tool: string;
   args: Record<string, unknown>;
   raw: string;
+  /** Parsed from the deprecated <tool_call> XML variant, not an ink-tool fence. */
+  variantFormat?: boolean;
 }
 
 interface SessionTranscriptMetadata {
@@ -1058,11 +1064,63 @@ export function seedTranscriptEidCounter(path: string, maxSeen: number): void {
   if (maxSeen > current) transcriptEidCounters.set(path, maxSeen);
 }
 
-function appendTranscript(path: string, event: Record<string, unknown>): number {
+/**
+ * The observer projection (spec:observer-attach §4.1) — ledger entry types
+ * that are ALSO mirrored to stdout as `obs` lines for live observers. Must
+ * stay in sync with OBSERVER_PROJECTION_TYPES in the server's
+ * session-event-bus.ts: every projection append is emitted from ONE place
+ * (below) so the live view can never diverge from replay.
+ */
+const OBS_PROJECTION_TYPES = new Set([
+  'user',
+  'system_turn',
+  'auto_turn',
+  'assistant',
+  'inbox',
+  'backend_tool',
+  'backend_text',
+  'local_tool_call',
+  'pcp_tool',
+  'backend_session',
+  'compaction',
+  'session_pause',
+  'session_end',
+]);
+
+/**
+ * Live mirror for projection appends — set by runChat to its stream emitter
+ * (non-interactive stdout NDJSON). The wire event IS the appended ledger
+ * entry, emitted only after the append succeeds; consumers must preserve the
+ * eid and never mint their own.
+ */
+let transcriptObsEmitter: ((entry: Record<string, unknown>) => void) | null = null;
+
+export function setTranscriptObsEmitter(
+  emitter: ((entry: Record<string, unknown>) => void) | null
+): void {
+  transcriptObsEmitter = emitter;
+}
+
+function appendTranscriptEntry(
+  path: string,
+  event: Record<string, unknown>
+): Record<string, unknown> {
   const eid = (transcriptEidCounters.get(path) ?? 0) + 1;
   transcriptEidCounters.set(path, eid);
-  appendFileSync(path, JSON.stringify({ ts: new Date().toISOString(), eid, ...event }) + '\n');
-  return eid;
+  const entry: Record<string, unknown> = { ts: new Date().toISOString(), eid, ...event };
+  appendFileSync(path, JSON.stringify(entry) + '\n');
+  if (typeof entry.type === 'string' && OBS_PROJECTION_TYPES.has(entry.type)) {
+    try {
+      transcriptObsEmitter?.(entry);
+    } catch {
+      // The live mirror must never break the ledger write path.
+    }
+  }
+  return entry;
+}
+
+function appendTranscript(path: string, event: Record<string, unknown>): number {
+  return appendTranscriptEntry(path, event).eid as number;
 }
 
 function compactForLedger(content: string, maxChars = LEDGER_COMPACT_CHARS): string {
@@ -1100,10 +1158,10 @@ function compactForHistoryPreview(
     .trim();
 }
 
-function extractLocalToolCalls(responseText: string): LocalToolCall[] {
-  const matches = Array.from(responseText.matchAll(/```ink-tool\s*([\s\S]*?)```/gi));
-  const calls: LocalToolCall[] = [];
-  for (const match of matches) {
+export function extractLocalToolCalls(responseText: string): LocalToolCall[] {
+  const indexed: Array<{ index: number; call: LocalToolCall }> = [];
+
+  for (const match of responseText.matchAll(/```ink-tool\s*([\s\S]*?)```/gi)) {
     const payload = (match[1] || '').trim();
     if (!payload) continue;
     try {
@@ -1114,16 +1172,53 @@ function extractLocalToolCalls(responseText: string): LocalToolCall[] {
         parsed.args && typeof parsed.args === 'object' && !Array.isArray(parsed.args)
           ? (parsed.args as Record<string, unknown>)
           : {};
-      calls.push({ tool, args, raw: match[0] || '' });
+      indexed.push({ index: match.index ?? 0, call: { tool, args, raw: match[0] || '' } });
     } catch {
       continue;
     }
   }
-  return calls;
+
+  // Variant tolerance: a long-lived session whose history predates
+  // wholly-in-ink can drift into emitting tool calls as
+  // `<tool_call>{"name":"mcp__inkwell__X","arguments":{...}}</tool_call>`
+  // XML text — imitating its own pre-#462 native-MCP history (Myra,
+  // 2026-08-10: the calls silently never ran, raw XML leaked to Telegram
+  // via the fallback router, and text-form signal_status never halted the
+  // continuation loop). Parse and execute the variant so the turn WORKS;
+  // the continuation prompt separately steers the model back to the fence.
+  for (const match of responseText.matchAll(/<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/gi)) {
+    const payload = (match[1] || '').trim();
+    if (!payload) continue;
+    try {
+      const parsed = JSON.parse(payload) as Record<string, unknown>;
+      const rawName = typeof parsed.name === 'string' ? parsed.name.trim() : '';
+      if (!rawName) continue;
+      // Strip the MCP namespace here (not just at execution) so client-local
+      // dispatch and terminal-signal detection see the bare tool name.
+      const tool = rawName.replace(/^mcp__inkwell__/, '');
+      const args =
+        parsed.arguments && typeof parsed.arguments === 'object' && !Array.isArray(parsed.arguments)
+          ? (parsed.arguments as Record<string, unknown>)
+          : {};
+      indexed.push({
+        index: match.index ?? 0,
+        call: { tool, args, raw: match[0] || '', variantFormat: true },
+      });
+    } catch {
+      continue;
+    }
+  }
+
+  // Preserve the model's emission order across both formats.
+  indexed.sort((a, b) => a.index - b.index);
+  return indexed.map((entry) => entry.call);
 }
 
-function stripLocalToolBlocks(responseText: string): string {
-  return responseText.replace(/```ink-tool[\s\S]*?```/gi, '').trim();
+export function stripLocalToolBlocks(responseText: string): string {
+  return responseText
+    .replace(/```ink-tool[\s\S]*?```/gi, '')
+    .replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, '')
+    .trim();
 }
 
 /**
@@ -2205,16 +2300,34 @@ export function isResumeFailedNoSession(stderr: string): boolean {
   return lower.includes('session not found') || lower.includes('no such session');
 }
 
+/** Recovered provider-native session marker (see findLastBackendSession). */
+export interface RecoveredBackendSession {
+  id: string;
+  /**
+   * Tool routing the session's envelope was seeded under. Absent on legacy
+   * markers written before routing was persisted — treated as a mismatch by
+   * the recovery site (reseed full envelope) since the seeded instruction set
+   * is unknowable.
+   */
+  routing?: 'backend' | 'local';
+}
+
 /**
- * Recover the live provider-native session id from a reattached transcript so a
+ * Recover the live provider-native session from a reattached transcript so a
  * fresh process (the next server heartbeat, or a reattach) resumes the SAME
- * native session instead of fragmenting into a new jsonl. Returns the id of the
- * last `backend_session` marker. A `compaction` marker clears the candidate:
- * after ink compacts we deliberately roll to a fresh provider session, so a
+ * native session instead of fragmenting into a new jsonl. Returns the last
+ * `backend_session` marker's id plus the tool routing its envelope was seeded
+ * under — a session seeded under the OTHER routing must not be resumed with a
+ * delta (a backend-seeded session recovered into local routing would never
+ * receive ink-block syntax; the reverse would retain a stale "fenced blocks
+ * only" instruction). A `compaction` marker clears the candidate: after ink
+ * compacts we deliberately roll to a fresh provider session, so a
  * pre-compaction id must never be resumed (it would drag the pre-compaction
  * window back in).
  */
-export function findLastBackendSessionId(transcriptPath: string): string | undefined {
+export function findLastBackendSession(
+  transcriptPath: string
+): RecoveredBackendSession | undefined {
   if (!transcriptPath || !existsSync(transcriptPath)) return undefined;
   let content: string;
   try {
@@ -2222,17 +2335,22 @@ export function findLastBackendSessionId(transcriptPath: string): string | undef
   } catch {
     return undefined;
   }
-  let found: string | undefined;
+  let found: RecoveredBackendSession | undefined;
   for (const line of content.split('\n')) {
     if (!line.trim()) continue;
-    let event: { type?: unknown; id?: unknown };
+    let event: { type?: unknown; id?: unknown; routing?: unknown };
     try {
-      event = JSON.parse(line) as { type?: unknown; id?: unknown };
+      event = JSON.parse(line) as { type?: unknown; id?: unknown; routing?: unknown };
     } catch {
       continue;
     }
     if (event.type === 'backend_session' && typeof event.id === 'string') {
-      found = event.id;
+      found = {
+        id: event.id,
+        ...(event.routing === 'backend' || event.routing === 'local'
+          ? { routing: event.routing }
+          : {}),
+      };
     } else if (
       event.type === 'compaction' ||
       event.type === 'context_evict' ||
@@ -2355,8 +2473,28 @@ export async function runChat(options: ChatOptions): Promise<void> {
     throw new Error('Could not resolve agent identity. Run `ink init` or pass `--agent <id>`.');
   }
   const agentId: string = resolvedAgentId;
-  const pcp = new PcpClient();
   const identity = readIdentityJson(process.cwd());
+  // x-ink-context on every ink-routed tool call: the server validates the
+  // named session against the authenticated user and enriches request
+  // identity from the session row (workspace scope for writes, session
+  // attribution, trigger context). sessionId/studioId are read through live
+  // refs — both can change after client construction (session start,
+  // cross-studio attach) and a stale header would suppress server-side
+  // correction. cliAttached is false for ANY one-shot mode: --message runs
+  // headless even without --non-interactive, and persisting cliAttached=true
+  // from such a run would wrongly suppress concurrent trigger spawns.
+  let currentPcpSessionId: () => string | undefined = () => undefined;
+  let currentPcpStudioId: () => string | undefined = () => identity?.studioId;
+  const pcp = new PcpClient(undefined, undefined, {
+    getContextToken: () =>
+      encodeContextToken({
+        sessionId: currentPcpSessionId() || '',
+        studioId: currentPcpStudioId() || 'main',
+        agentId,
+        cliAttached: !options.nonInteractive && !options.message,
+        runtime: 'ink',
+      }),
+  });
   let autoAttachedLatest = false;
   let contextBudgetAuto = !options.maxContextTokens;
   const initialBackend = options.backend || 'claude';
@@ -2433,6 +2571,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
                 : 'auto-deny'
             : 'interactive',
   };
+  // From here, ink-routed tool calls carry the live session and studio ids
+  // in their x-ink-context header (see PcpClient construction above).
+  currentPcpSessionId = () => runtime.sessionId;
+  currentPcpStudioId = () => runtime.studioId || identity?.studioId;
   // Resolve --sender or --contact-id for per-sender session isolation
   if (options.contactId) {
     runtime.contactId = options.contactId;
@@ -2601,18 +2743,73 @@ export async function runChat(options: ChatOptions): Promise<void> {
     }
   };
 
+  // Register the live obs mirror: EVERY projection-type ledger append (user,
+  // system turns, pcp/local tools, assistant results, backend events, session
+  // markers) is emitted as an `obs` line from inside appendTranscriptEntry —
+  // one place, all paths, so the live view can never diverge from replay
+  // (spec:observer-attach §4.2; the e2e caught exactly this gap when only
+  // backend events were mirrored).
+  setTranscriptObsEmitter((entry) => emitStreamEvent({ type: 'obs', entry }));
+
+  // ── Live paragraph streaming (Ink TUI only) ──
+  // Assistant text renders as it flows: partial-message deltas accumulate in a
+  // fence-aware paragraph buffer and each completed paragraph is appended to
+  // scrollback immediately — the first with the agent label, the rest as
+  // continuations (invalidated whenever another writer interleaves). The
+  // completed-message `text` event flushes the tail (or renders the whole
+  // message when the backend emitted no deltas), and the final response add
+  // dedupes against the streamed message so nothing prints twice. Local tool
+  // routing: ```ink-tool blocks arrive as one held unit and are stripped
+  // before display. All state lives in StreamedTurnRenderer (unit-tested).
+  const streamRenderer = new StreamedTurnRenderer((text) =>
+    runtime.toolRouting === 'local' ? stripLocalToolBlocks(text) : text
+  );
+
+  const renderStreamedLines = (lines: StreamedLine[]): void => {
+    if (!inkRepl) return; // legacy readline path keeps the buffered final render
+    for (const line of lines) {
+      inkRepl.addMessage(
+        'assistant',
+        line.text,
+        line.continuation ? { continuation: true } : { label: agentId }
+      );
+    }
+  };
+
   // Bridge normalized backend stream events onto the live feed. Backend tool
   // calls (the provider calling MCP tools mid-turn) now surface in real time —
   // before stream-json the feed was silent during a backend-routed generation.
-  // Assistant text lands in the final response; per-token deltas are a follow-on.
   const handleBackendEvent = (evt: BackendTurnEvent): void => {
     if (evt.kind === 'tool-use') {
+      appendTranscript(runtime.transcriptPath, {
+        type: 'backend_tool',
+        name: evt.name,
+        status: 'running',
+        ...(evt.id ? { toolUseId: evt.id } : {}),
+      });
+      // Legacy line for the server runner's invocation tracking only — not
+      // observer-facing, no eid contract.
       emitStreamEvent({
         type: 'tool_call',
         toolName: evt.name,
         status: 'running',
         layer: 'backend',
+        ...(evt.id ? { toolUseId: evt.id } : {}),
       });
+    } else if (evt.kind === 'tool-result') {
+      appendTranscript(runtime.transcriptPath, {
+        type: 'backend_tool',
+        status: evt.isError ? 'error' : 'done',
+        ...(evt.id ? { toolUseId: evt.id } : {}),
+      });
+    } else if (evt.kind === 'text-delta') {
+      renderStreamedLines(streamRenderer.pushDelta(evt.text));
+    } else if (evt.kind === 'text' && evt.text.trim()) {
+      appendTranscript(runtime.transcriptPath, {
+        type: 'backend_text',
+        preview: compactForLedger(evt.text, 200),
+      });
+      renderStreamedLines(streamRenderer.completeMessage(evt.text));
     }
   };
 
@@ -2921,6 +3118,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
       : undefined;
   runtime.transcriptPath = existingTranscript || ensureRuntimeTranscriptPath(runtime.sessionId);
 
+  // Announce the ledger's absolute location to the server (session_meta) so
+  // observer replay has a server-owned locator (spec:observer-attach §4.3).
+  // The runtime is the authority on where it writes — the server validates
+  // shape but never derives paths from its own cwd or caller input.
+  emitStreamEvent({ type: 'session_meta', transcriptPath: runtime.transcriptPath });
+
   // ── Provider session reuse (claude only) — Stage 2 ──
   // One provider-native session id per ink session, reused across turns AND
   // across processes. Seeded on the first backend spawn, resumed thereafter,
@@ -2945,10 +3148,17 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // Resume the provider session the prior process left live (delta only),
     // unless a compaction/eviction rolled it — then the next turn seeds fresh.
     if (runtime.backend === 'claude') {
-      // Recover the id only; the shape baseline is adopted on the first turn
-      // below, AFTER all startup mutations, so a recovered session resumes
-      // rather than spuriously reseeding on a startup-timing shape difference.
-      activeBackendSessionId = findLastBackendSessionId(existingTranscript);
+      // Recover the id only when the marker's persisted tool routing matches
+      // this process's routing — a session seeded under the other routing (or
+      // a legacy marker with no routing) holds the wrong instruction envelope
+      // and must reseed fresh, not resume with a delta. The volatile shape
+      // baseline (bootstrap context, skills) is still adopted on the first
+      // turn below, AFTER all startup mutations, so a matching session
+      // resumes rather than spuriously reseeding on startup-timing drift.
+      const recovered = findLastBackendSession(existingTranscript);
+      if (recovered && recovered.routing === runtime.toolRouting) {
+        activeBackendSessionId = recovered.id;
+      }
     }
     // Continue the event-id sequence from where the file left off
     seedTranscriptEidCounter(existingTranscript, hydrated.maxEid);
@@ -3332,7 +3542,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // all route through this single writer) just removed entries from ink's
     // window. Roll the provider session so the next turn re-seeds from the
     // post-eviction ledger; otherwise a resumed native session would still hold
-    // the evicted content. findLastBackendSessionId clears cross-process
+    // the evicted content. findLastBackendSession clears cross-process
     // recovery on the matching markers.
     activeBackendSessionId = undefined;
     activeBackendSessionShape = undefined;
@@ -3497,7 +3707,18 @@ export async function runChat(options: ChatOptions): Promise<void> {
     }
   };
 
-  const pollInbox = async (force = false): Promise<number> => {
+  // Poll gates (PR #385): interval ticks skip while a poll is in flight;
+  // forced polls (/inbox, /events) queue behind it instead of overlapping.
+  // Prevents ticks from stacking concurrent requests behind a slow server.
+  const inboxPollGate = createPollGate();
+  const activityPollGate = createPollGate();
+
+  // Phase 1 (gated): fetch + render + collect auto-run candidates. Must not
+  // await backend turns — those run in pollInbox phase 2, after the gate
+  // releases, so grant delivery keeps flowing during a turn.
+  const collectInbox = async (
+    force: boolean
+  ): Promise<{ freshCount: number; autoRunMessages: InboxMessage[] }> => {
     const inboxResult = (await pcp
       .callTool('get_inbox', { agentId, status: 'unread', limit: 10 })
       .catch(() => null)) as Record<string, unknown> | null;
@@ -3524,7 +3745,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           }).allowed
       )
       .sort((a, b) => safeDateMs(a.createdAt) - safeDateMs(b.createdAt));
-    let autoRuns = 0;
+    const autoRunMessages: InboxMessage[] = [];
 
     // Process permission grants separately — they modify local policy, not chat flow.
     const permissionGrants = fresh.filter((msg) => msg.messageType === 'permission_grant');
@@ -3700,10 +3921,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
         msg.messageType !== 'notification' &&
         msg.content.trim().length > 0;
 
-      const autoRunHandler = enqueueAutoRunFromInbox;
-      if (eligibleForAutoRun && autoRunHandler) {
-        await autoRunHandler(msg);
-        autoRuns += 1;
+      if (eligibleForAutoRun) {
+        autoRunMessages.push(msg);
       }
     }
 
@@ -3714,16 +3933,35 @@ export async function runChat(options: ChatOptions): Promise<void> {
         printLine(chalk.dim('No new inbox messages.'));
       }
     }
+    emitStatusLaneIfChanged();
+    return { freshCount: fresh.length, autoRunMessages };
+  };
+
+  const pollInbox = async (force = false): Promise<number> => {
+    const collected = await inboxPollGate.run(() => collectInbox(force), { force });
+    if (!collected) return 0; // another poll in flight — tick skipped
+    // Phase 2 (gate released): auto-run backend turns run BEHIND the gate so
+    // interval polling — and the permission-grant delivery a remote approval
+    // depends on — continues while a turn is in flight.
+    let autoRuns = 0;
+    const autoRunHandler = enqueueAutoRunFromInbox;
+    if (autoRunHandler) {
+      for (const msg of collected.autoRunMessages) {
+        await autoRunHandler(msg);
+        autoRuns += 1;
+      }
+    }
     if (autoRuns > 0) {
       printLine(
         chalk.green(`Auto-run processed ${autoRuns} inbox message${autoRuns === 1 ? '' : 's'}.`)
       );
+      emitStatusLaneIfChanged();
     }
-    emitStatusLaneIfChanged();
-    return fresh.length;
+    return collected.freshCount;
   };
 
-  const pollActivity = async (force = false): Promise<number> => {
+  // Activity polls have no backend-turn phase — the whole body is gated.
+  const collectActivity = async (force: boolean): Promise<number> => {
     const activityResult = (await pcp
       .callTool('get_activity', {
         agentId,
@@ -3850,6 +4088,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
     return activities.length;
   };
 
+  const pollActivity = async (force = false): Promise<number> => {
+    const count = await activityPollGate.run(() => collectActivity(force), { force });
+    return count ?? 0;
+  };
+
   // ── Turn attachments (--attach-file) ──
   // Resolved once at startup; the block attaches to the FIRST turn (the
   // message the attachments belong to) and the directories stay granted
@@ -3857,10 +4100,18 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // files. Server spawns (InkRunner) pass --attach-file per media item.
   let pendingAttachmentBlock = '';
   let sessionAttachmentDirs: string[] = [];
+  // Media for the DELIVERY turn only (spec:provider-media-injection):
+  // injecting adapters embed these as prompt content on the turn that
+  // carries the attachment block. Later turns re-view via the gated
+  // native-read fallback (dirs stay granted for the session).
+  let pendingTurnMedia: TurnMedia[] = [];
   if (options.attachFile && options.attachFile.length > 0) {
     const resolvedAttachments = await resolveAttachments(options.attachFile);
     pendingAttachmentBlock = buildAttachmentBlock(resolvedAttachments);
     sessionAttachmentDirs = collectAttachmentDirs(resolvedAttachments);
+    pendingTurnMedia = resolvedAttachments
+      .filter((a) => !a.missing)
+      .map((a) => ({ path: a.path, ...(a.mime ? { mimeType: a.mime } : {}) }));
     const missingAttachments = resolvedAttachments.filter((a) => a.missing);
     if (missingAttachments.length > 0) {
       console.log(
@@ -3879,43 +4130,29 @@ export async function runChat(options: ChatOptions): Promise<void> {
     displayLabel?: string
   ) => {
     if (!raw.trim()) return;
+    streamRenderer.reset();
     // Attach pending files to this turn — append the block so the backend
-    // sees the paths inline with the message that delivered them.
+    // sees the paths inline with the message that delivered them. The media
+    // list rides the same turn (injected as prompt content by adapters that
+    // support it) and is consumed here so continuations don't re-inject.
     if (pendingAttachmentBlock) {
       raw = `${raw}\n\n${pendingAttachmentBlock}`;
       pendingAttachmentBlock = '';
     }
+    const turnMedia = pendingTurnMedia;
+    pendingTurnMedia = [];
+    // NOTE: display echo happens at SUBMIT time in enqueueTurn — a message
+    // typed while another turn is in flight must appear immediately, not when
+    // the queue reaches it. Ledger/transcript appends stay here, sequenced
+    // with the turn.
     if (source === 'user') {
-      // Echo the user's message
-      if (inkRepl) {
-        inkRepl.addMessage('user', raw, { label: 'you' });
-      } else {
-        printLine(
-          renderMessageLine('user', raw, {
-            label: 'you',
-            timezone: runtime.userTimezone,
-          })
-        );
-        printLine('');
-      }
       ledger.addEntry('user', raw, 'repl');
       appendTranscript(runtime.transcriptPath, { type: 'user', content: raw });
     } else if (source === 'system') {
       // Synthetic turn input: heartbeat triggers, server-delivered messages,
-      // continuation prompts. Rendered as system (not "you") so transcripts
+      // continuation prompts. Recorded as system (not "you") so transcripts
       // distinguish harness prompts from the human's words.
       const label = displayLabel || 'system';
-      if (inkRepl) {
-        inkRepl.addMessage('system', raw, { label });
-      } else {
-        printLine(
-          renderMessageLine('system', raw, {
-            label,
-            timezone: runtime.userTimezone,
-          })
-        );
-        printLine('');
-      }
       ledger.addEntry('system', raw, label);
       appendTranscript(runtime.transcriptPath, { type: 'system_turn', content: raw, label });
     } else {
@@ -4066,9 +4303,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
       activeBackendSessionShape = currentEnvelopeShape;
       // Persist the seed so a later process (next heartbeat / reattach) recovers
       // and RESUMES this native session instead of fragmenting into a new jsonl.
+      // routing rides along so cross-process recovery can refuse a session
+      // seeded under the other instruction envelope.
       appendTranscript(runtime.transcriptPath, {
         type: 'backend_session',
         id: seedProviderSessionId,
+        routing: runtime.toolRouting,
       });
     }
 
@@ -4176,6 +4416,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
       stream: true,
       onEvent: handleBackendEvent,
       attachmentDirs: sessionAttachmentDirs.length > 0 ? sessionAttachmentDirs : undefined,
+      toolRouting: runtime.toolRouting,
+      // Delivery spawn: embed this turn's media even when resuming a
+      // recovered provider session — new media on an existing conversation
+      // must reach the provider (heartbeat/reattach path).
+      media: turnMedia.length > 0 ? turnMedia : undefined,
+      ...(turnMedia.length > 0 ? { deliverMedia: true } : {}),
       // Seed a fresh provider session (first spawn) OR resume the live one
       // (subsequent turns). Tool-loop continuations below always resume it.
       ...(seedProviderSessionId ? { backendSessionSeedId: seedProviderSessionId } : {}),
@@ -4211,7 +4457,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
       const reseedId = randomUUID();
       activeBackendSessionId = reseedId;
       activeBackendSessionShape = currentEnvelopeShape;
-      appendTranscript(runtime.transcriptPath, { type: 'backend_session', id: reseedId });
+      appendTranscript(runtime.transcriptPath, {
+        type: 'backend_session',
+        id: reseedId,
+        routing: runtime.toolRouting,
+      });
       printEvent(
         chalk.yellow('  ⛁ provider session not found on resume — re-seeding a fresh native session')
       );
@@ -4228,6 +4478,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
         stream: true,
         onEvent: handleBackendEvent,
         attachmentDirs: sessionAttachmentDirs.length > 0 ? sessionAttachmentDirs : undefined,
+        toolRouting: runtime.toolRouting,
+        // The reseeded provider session is fresh — re-inject this turn's
+        // media so the full envelope carries the images too.
+        media: turnMedia.length > 0 ? turnMedia : undefined,
+        ...(turnMedia.length > 0 ? { deliverMedia: true } : {}),
         backendSessionSeedId: reseedId,
       });
       currentTurnAbort = reseedTurn.abort;
@@ -4647,7 +4902,14 @@ export async function runChat(options: ChatOptions): Promise<void> {
           return `Tool ${r.tool} (${r.status}): ${resultStr}`;
         })
         .join('\n\n');
-      const continuationBody = `[Tool results from previous turn]\n${toolResultsSummary}\n\nContinue your response based on these tool results. If you need more tools, emit ink-tool blocks. Otherwise, provide your final answer.`;
+      // If the model used the deprecated <tool_call> XML variant, its calls
+      // were executed anyway (see extractLocalToolCalls) — but correct the
+      // format NOW, while the results prove the runtime heard it, so the
+      // drift doesn't reinforce.
+      const formatCorrection = localToolCalls.some((c) => c.variantFormat)
+        ? '\n\nFORMAT NOTE: your tool calls used <tool_call> XML — the ink runtime executed them this time, but the ONLY supported format is a fenced block:\n```ink-tool\n{"tool":"<name>","args":{...}}\n```\nUse ink-tool fences (bare tool names, no mcp__inkwell__ prefix) from now on.'
+        : '';
+      const continuationBody = `[Tool results from previous turn]\n${toolResultsSummary}${formatCorrection}\n\nContinue your response based on these tool results. If you need more tools, emit ink-tool blocks. Otherwise, provide your final answer.`;
       // When resuming the same Claude session, the model already holds the full
       // transcript + tool instructions from the seeded turn — send ONLY the
       // delta. Otherwise (stateless backends) re-pack the full envelope so the
@@ -4688,6 +4950,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
         stream: true,
         onEvent: handleBackendEvent,
         attachmentDirs: sessionAttachmentDirs.length > 0 ? sessionAttachmentDirs : undefined,
+        toolRouting: runtime.toolRouting,
+        // Same logical turn — media rides along (WITHOUT deliverMedia) so
+        // the adapter's boundary disposition (--tools gate) cannot flap
+        // between the delivery spawn and tool-loop continuations, while the
+        // resumed provider session is never re-fed images it already holds.
+        // Stateless adapters re-attach from `media` regardless.
+        media: turnMedia.length > 0 ? turnMedia : undefined,
         // Resume the live provider session so this round-trip appends to the
         // same Claude thread instead of re-piping the whole window.
         ...(activeBackendSessionId ? { backendSessionId: activeBackendSessionId } : {}),
@@ -4838,10 +5107,17 @@ export async function runChat(options: ChatOptions): Promise<void> {
       if (!isAbortedTurn) {
         const usageMeta = runResult.usage ? formatBackendTokenUsage(runResult.usage) : undefined;
         const trailingParts = [`${turnDurationSeconds}s`, usageMeta].filter(Boolean).join('  ·  ');
-        inkRepl.addMessage('assistant', assistantDisplayText, {
-          label: agentId,
-          trailingMeta: trailingParts,
-        });
+        // When the final text already streamed live (it equals the last
+        // completed assistant MESSAGE, modulo local-tool stripping), don't
+        // print the body twice — close the turn with a compact meta line.
+        if (streamRenderer.shouldSkipFinal(assistantDisplayText)) {
+          inkRepl.printEvent(`✔ ${agentId} · ${trailingParts}`);
+        } else {
+          inkRepl.addMessage('assistant', assistantDisplayText, {
+            label: agentId,
+            trailingMeta: trailingParts,
+          });
+        }
       }
     } else if (!isAbortedTurn) {
       printLine('');
@@ -4892,6 +5168,41 @@ export async function runChat(options: ChatOptions): Promise<void> {
     source: 'user' | 'inbox-auto' | 'system' = 'user',
     displayLabel?: string
   ): Promise<void> => {
+    // Echo at SUBMIT time, not when the queue reaches the turn — a message
+    // typed while another turn is in flight must not vanish until its turn
+    // starts. Ledger/transcript appends remain turn-sequenced in runUserTurn.
+    if (raw.trim()) {
+      // The echo interleaves with any in-flight streamed paragraphs — the next
+      // one must re-render its agent header so it can't read as continuation
+      // of this message.
+      streamRenderer.noteInterleave();
+      if (source === 'user') {
+        if (inkRepl) {
+          inkRepl.addMessage('user', raw, { label: 'you' });
+        } else {
+          printLine(
+            renderMessageLine('user', raw, {
+              label: 'you',
+              timezone: runtime.userTimezone,
+            })
+          );
+          printLine('');
+        }
+      } else if (source === 'system') {
+        const label = displayLabel || 'system';
+        if (inkRepl) {
+          inkRepl.addMessage('system', raw, { label });
+        } else {
+          printLine(
+            renderMessageLine('system', raw, {
+              label,
+              timezone: runtime.userTimezone,
+            })
+          );
+          printLine('');
+        }
+      }
+    }
     pendingTurns += 1;
     emitStatusLaneIfChanged();
     const run = async () => {
@@ -5020,7 +5331,16 @@ export async function runChat(options: ChatOptions): Promise<void> {
     if (!message) {
       throw new Error('--non-interactive requires --message "<text>"');
     }
-    const maxTurns = parseInt(options.maxTurns || '1', 10);
+    // maxTurns counts OUTER conversational turns (runUserTurn cycles: the
+    // delivered message plus continuation prompts) — not provider subprocess
+    // calls, of which a single turn's tool loop may spawn several. Validate
+    // strictly: this arrives from server spawn args, and a malformed value
+    // silently coerced to NaN/1 would defeat the configured cap.
+    const maxTurnsRaw = String(options.maxTurns ?? '1').trim();
+    const maxTurns = Number.parseInt(maxTurnsRaw, 10);
+    if (!/^\d+$/.test(maxTurnsRaw) || maxTurns < 1 || maxTurns > 25) {
+      throw new Error(`--max-turns must be an integer between 1 and 25 (got "${maxTurnsRaw}")`);
+    }
 
     // Turn 1: the delivered message. When --message-label is set (server
     // spawns pass the originating channel, e.g. "heartbeat"), render as a
@@ -5028,6 +5348,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
     const messageLabel = options.messageLabel?.trim();
     clearLastSignal();
     await enqueueTurn(message, messageLabel ? 'system' : 'user', messageLabel);
+    // Actual completed outer turns — reported instead of the configured cap,
+    // which lies whenever signal_status halts the loop early.
+    let turnsCompleted = 1;
 
     // Check for signal or failure after turn 1
     let exitReason: string | undefined;
@@ -5048,6 +5371,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           'system',
           'continuation'
         );
+        turnsCompleted += 1;
 
         const signal = getLastSignal();
         if (signal?.status === 'completed' || signal?.status === 'blocked') {
@@ -5091,7 +5415,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       type: 'session_pause',
       sessionId: runtime.sessionId || null,
       summary,
-      turnsCompleted: maxTurns,
+      turnsCompleted,
       signal: finalSignal || undefined,
     });
 
@@ -5116,6 +5440,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         sessionId: runtime.sessionId || null,
         phase,
         signal: finalSignal?.status || null,
+        turnsCompleted,
         reason: finalSignal?.reason || (isBackendFailure ? 'backend_failure' : null),
         usage: {
           contextTokens: reportedContextTokens,
@@ -5135,7 +5460,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     } else if (finalSignal?.status === 'completed') {
       console.log(chalk.green(`\nSession completed.`));
     } else {
-      console.log(chalk.dim(`\nSession paused (${maxTurns} turn(s) completed).`));
+      console.log(chalk.dim(`\nSession paused (${turnsCompleted} turn(s) completed).`));
     }
     if (!isBackendFailure) {
       console.log(chalk.cyan(`  Resume with: ink chat --attach-latest ${agentId}\n`));
@@ -6671,8 +6996,12 @@ export function registerChatCommand(program: Command): void {
       .option('-m, --model <model>', 'Model override for backend')
       .option(
         '--tool-routing <mode>',
-        'Tool routing mode: local (ink-tool blocks handled by ink) or backend (native backend tools)',
-        'local'
+        // No Commander default: a default here would make options.toolRouting
+        // always-set and mask the persisted .ink/identity.json preference in
+        // the runtime resolution below. Server spawns always pass the flag
+        // explicitly (ink-runner); interactive sessions fall through to
+        // persisted prefs, then 'local'.
+        'Tool routing mode: local (ink-tool blocks handled by ink) or backend (native backend tools)'
       )
       .option('--ui <mode>', 'UI mode: live (default) or scroll status rendering', 'live')
       .option('--thread-key <key>', 'Thread key for Inkwell session routing')

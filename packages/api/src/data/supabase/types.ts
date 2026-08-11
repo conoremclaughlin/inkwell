@@ -2721,6 +2721,55 @@ export type Database = {
           },
         ];
       };
+      session_observe_grants: {
+        Row: {
+          created_at: string;
+          expires_at: string | null;
+          granted_by: string | null;
+          id: string;
+          observer_sb_id: string;
+          owner_sb_id: string;
+          user_id: string;
+        };
+        Insert: {
+          created_at?: string;
+          expires_at?: string | null;
+          granted_by?: string | null;
+          id?: string;
+          observer_sb_id: string;
+          owner_sb_id: string;
+          user_id: string;
+        };
+        Update: {
+          created_at?: string;
+          expires_at?: string | null;
+          granted_by?: string | null;
+          id?: string;
+          observer_sb_id?: string;
+          owner_sb_id?: string;
+          user_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'session_observe_grants_observer_sb_id_fkey';
+            columns: ['observer_sb_id'];
+            referencedRelation: 'agent_identities';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'session_observe_grants_owner_sb_id_fkey';
+            columns: ['owner_sb_id'];
+            referencedRelation: 'agent_identities';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'session_observe_grants_user_id_fkey';
+            columns: ['user_id'];
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
       sessions: {
         Row: {
           active_thread_key: string | null;
@@ -2741,6 +2790,7 @@ export type Database = {
           message_count: number | null;
           metadata: Json | null;
           model: string | null;
+          observer_ledger_path: string | null;
           sb_id: string | null;
           started_at: string | null;
           status: string | null;
@@ -2771,6 +2821,7 @@ export type Database = {
           message_count?: number | null;
           metadata?: Json | null;
           model?: string | null;
+          observer_ledger_path?: string | null;
           sb_id?: string | null;
           started_at?: string | null;
           status?: string | null;
@@ -2801,6 +2852,7 @@ export type Database = {
           message_count?: number | null;
           metadata?: Json | null;
           model?: string | null;
+          observer_ledger_path?: string | null;
           sb_id?: string | null;
           started_at?: string | null;
           status?: string | null;

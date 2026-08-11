@@ -17,6 +17,11 @@ export interface MessageLineProps {
   label?: string;
   time?: string;
   trailingMeta?: string;
+  /**
+   * Continuation of the previous message (streamed paragraph after the
+   * first): renders content only, no label row.
+   */
+  continuation?: boolean;
 }
 
 const LABEL_COLORS: Record<MessageRole, string> = {
@@ -76,6 +81,7 @@ export const MessageLine = React.memo(function MessageLine({
   label,
   time,
   trailingMeta,
+  continuation,
 }: MessageLineProps): React.ReactElement {
   const displayLabel = label || role;
   const labelColor = LABEL_COLORS[role] || 'gray';
@@ -102,18 +108,21 @@ export const MessageLine = React.memo(function MessageLine({
 
   return (
     <Box flexDirection="column" paddingLeft={1} marginTop={1}>
-      {/* Label is padded to sit flush with the content text below it */}
-      <Box paddingLeft={2}>
-        <Text bold color={labelColor}>
-          {displayLabel}
-        </Text>
-        {meta ? (
-          <>
-            <Text>{'  '}</Text>
-            <Text dimColor>{meta}</Text>
-          </>
-        ) : null}
-      </Box>
+      {/* Label is padded to sit flush with the content text below it.
+          Continuations (streamed paragraphs after the first) skip it. */}
+      {!continuation && (
+        <Box paddingLeft={2}>
+          <Text bold color={labelColor}>
+            {displayLabel}
+          </Text>
+          {meta ? (
+            <>
+              <Text>{'  '}</Text>
+              <Text dimColor>{meta}</Text>
+            </>
+          ) : null}
+        </Box>
+      )}
       <Box paddingLeft={2}>
         <Text color={contentColor} wrap="wrap">
           {displayContent}

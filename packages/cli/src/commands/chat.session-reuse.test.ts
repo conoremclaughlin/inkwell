@@ -2,7 +2,7 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { isResumeFailedNoSession, findLastBackendSessionId, envelopeShapeKey } from './chat.js';
+import { isResumeFailedNoSession, findLastBackendSession, envelopeShapeKey } from './chat.js';
 
 /**
  * Stage 2A — across-turn provider session reuse.
@@ -139,7 +139,7 @@ describe('isResumeFailedNoSession', () => {
   });
 });
 
-describe('findLastBackendSessionId (cross-process recovery)', () => {
+describe('findLastBackendSession (cross-process recovery)', () => {
   let dir: string;
   const writeTranscript = (events: object[]): string => {
     dir = mkdtempSync(join(tmpdir(), 'sb-transcript-'));
@@ -159,8 +159,8 @@ describe('findLastBackendSessionId (cross-process recovery)', () => {
   });
 
   it('returns undefined when the transcript file does not exist', () => {
-    expect(findLastBackendSessionId(join(tmpdir(), 'does-not-exist-xyz.jsonl'))).toBeUndefined();
-    expect(findLastBackendSessionId('')).toBeUndefined();
+    expect(findLastBackendSession(join(tmpdir(), 'does-not-exist-xyz.jsonl'))).toBeUndefined();
+    expect(findLastBackendSession('')).toBeUndefined();
   });
 
   it('recovers the last backend_session id so the next process resumes it', () => {
@@ -170,7 +170,7 @@ describe('findLastBackendSessionId (cross-process recovery)', () => {
       { type: 'user', content: 'more' },
       { type: 'backend_session', id: 'sess-2' },
     ]);
-    expect(findLastBackendSessionId(path)).toBe('sess-2');
+    expect(findLastBackendSession(path)?.id).toBe('sess-2');
   });
 
   it('returns undefined when there is no backend_session marker', () => {
@@ -178,7 +178,7 @@ describe('findLastBackendSessionId (cross-process recovery)', () => {
       { type: 'user', content: 'hi' },
       { type: 'system_turn', content: 'heartbeat' },
     ]);
-    expect(findLastBackendSessionId(path)).toBeUndefined();
+    expect(findLastBackendSession(path)).toBeUndefined();
   });
 
   it('a compaction AFTER the last seed clears the candidate (roll to fresh)', () => {
@@ -190,7 +190,7 @@ describe('findLastBackendSessionId (cross-process recovery)', () => {
       { type: 'user', content: 'lots of turns' },
       { type: 'compaction', summary: '[summary]' },
     ]);
-    expect(findLastBackendSessionId(path)).toBeUndefined();
+    expect(findLastBackendSession(path)).toBeUndefined();
   });
 
   it('a seed AFTER a compaction is the live session (re-established)', () => {
@@ -200,7 +200,7 @@ describe('findLastBackendSessionId (cross-process recovery)', () => {
       { type: 'backend_session', id: 'post-compaction' },
       { type: 'user', content: 'next turn' },
     ]);
-    expect(findLastBackendSessionId(path)).toBe('post-compaction');
+    expect(findLastBackendSession(path)?.id).toBe('post-compaction');
   });
 
   it('a context_evict AFTER the last seed clears the candidate', () => {
@@ -211,7 +211,7 @@ describe('findLastBackendSessionId (cross-process recovery)', () => {
       { type: 'user', content: 'stuff' },
       { type: 'context_evict', actor: 'sb', refs: [{ hash: 'h' }] },
     ]);
-    expect(findLastBackendSessionId(path)).toBeUndefined();
+    expect(findLastBackendSession(path)).toBeUndefined();
   });
 
   it('a context_trim AFTER the last seed clears the candidate', () => {
@@ -219,7 +219,7 @@ describe('findLastBackendSessionId (cross-process recovery)', () => {
       { type: 'backend_session', id: 'pre-trim' },
       { type: 'context_trim', reason: 'manual' },
     ]);
-    expect(findLastBackendSessionId(path)).toBeUndefined();
+    expect(findLastBackendSession(path)).toBeUndefined();
   });
 
   it('a seed AFTER an eviction is the live session (re-established)', () => {
@@ -228,7 +228,7 @@ describe('findLastBackendSessionId (cross-process recovery)', () => {
       { type: 'context_evict', actor: 'user', refs: [{ hash: 'h' }] },
       { type: 'backend_session', id: 'post-evict' },
     ]);
-    expect(findLastBackendSessionId(path)).toBe('post-evict');
+    expect(findLastBackendSession(path)?.id).toBe('post-evict');
   });
 
   it('ignores malformed lines', () => {
@@ -238,7 +238,49 @@ describe('findLastBackendSessionId (cross-process recovery)', () => {
       path,
       ['not json', JSON.stringify({ type: 'backend_session', id: 'ok-1' }), '', '{bad'].join('\n')
     );
-    expect(findLastBackendSessionId(path)).toBe('ok-1');
+    expect(findLastBackendSession(path)?.id).toBe('ok-1');
+  });
+
+  it('recovers the persisted tool routing alongside the id', () => {
+    const path = writeTranscript([{ type: 'backend_session', id: 'sess-local', routing: 'local' }]);
+    expect(findLastBackendSession(path)).toEqual({ id: 'sess-local', routing: 'local' });
+  });
+
+  it('legacy markers (no routing) recover the id with routing undefined', () => {
+    // The recovery site treats missing routing as a mismatch — the session's
+    // seeded instruction envelope is unknowable, so it reseeds fresh. This is
+    // the cross-process routing-flip guard: a session seeded under backend
+    // routing must never be resumed with a delta by a local-routing process
+    // (it would never receive ink-block syntax), and vice versa.
+    const path = writeTranscript([{ type: 'backend_session', id: 'legacy-sess' }]);
+    const recovered = findLastBackendSession(path);
+    expect(recovered?.id).toBe('legacy-sess');
+    expect(recovered?.routing).toBeUndefined();
+    // Mirrors the recovery gate in runChat: resume only on an exact match.
+    const resumableUnder = (routing: 'backend' | 'local'): boolean =>
+      recovered !== undefined && recovered.routing === routing;
+    expect(resumableUnder('local')).toBe(false);
+    expect(resumableUnder('backend')).toBe(false);
+  });
+
+  it('a routing flip across processes refuses the resume; matching routing allows it', () => {
+    const path = writeTranscript([
+      { type: 'backend_session', id: 'sess-backend', routing: 'backend' },
+    ]);
+    const recovered = findLastBackendSession(path);
+    const resumableUnder = (routing: 'backend' | 'local'): boolean =>
+      recovered !== undefined && recovered.routing === routing;
+    expect(resumableUnder('backend')).toBe(true);
+    expect(resumableUnder('local')).toBe(false);
+  });
+
+  it('an invalid routing value is dropped (recovers id, reseeds envelope)', () => {
+    const path = writeTranscript([
+      { type: 'backend_session', id: 'sess-x', routing: 'weird-mode' },
+    ]);
+    const recovered = findLastBackendSession(path);
+    expect(recovered?.id).toBe('sess-x');
+    expect(recovered?.routing).toBeUndefined();
   });
 });
 

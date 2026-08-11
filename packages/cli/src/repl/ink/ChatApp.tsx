@@ -243,6 +243,7 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
       label={msg.label}
       time={msg.time}
       trailingMeta={msg.trailingMeta}
+      continuation={msg.continuation}
     />
   ));
 
@@ -279,6 +280,7 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
                 label={msg.label}
                 time={msg.time}
                 trailingMeta={msg.trailingMeta}
+                continuation={msg.continuation}
               />
             )}
           </Static>
