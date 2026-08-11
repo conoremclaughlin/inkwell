@@ -7,7 +7,10 @@
  */
 
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { fetchWithTimeout } from './pcp-client';
+import { mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { join } from 'path';
+import { tmpdir } from 'os';
+import { fetchWithTimeout, PcpClient } from './pcp-client';
 
 const originalFetch = global.fetch;
 
@@ -75,5 +78,68 @@ describe('fetchWithTimeout', () => {
     }) as unknown as typeof fetch;
 
     await expect(fetchWithTimeout('http://x/mcp', {}, 5_000)).rejects.toThrow(/timed out after 5s/);
+  });
+});
+
+describe('PcpClient x-ink-context header', () => {
+  let dir: string;
+  let configPath: string;
+
+  const okJson = (body: unknown) =>
+    ({
+      ok: true,
+      status: 200,
+      headers: { get: () => 'application/json' },
+      json: async () => body,
+      text: async () => JSON.stringify(body),
+    }) as unknown as Response;
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+    global.fetch = originalFetch;
+  });
+
+  const makeClient = (getContextToken?: () => string | null) => {
+    dir = mkdtempSync(join(tmpdir(), 'pcp-client-'));
+    configPath = join(dir, 'config.json');
+    // Far-future expiry so ensureAccessToken uses the stored token as-is.
+    writeFileSync(
+      configPath,
+      JSON.stringify({ accessToken: 'test-token', tokenExpiresAt: '2099-01-01T00:00:00Z' })
+    );
+    return new PcpClient('http://localhost:9999', configPath, { getContextToken });
+  };
+
+  it('attaches the lazily-built token to tool calls', async () => {
+    // Without this header, ink-routed tool calls reach the server with no
+    // request identity — workspace derivation for artifact writes fails
+    // (the regression Myra hit after wholly-in-ink moved tool calls off the
+    // provider's MCP connection).
+    const spy = vi.fn(async () =>
+      okJson({ jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text: '{}' }] } })
+    );
+    global.fetch = spy as unknown as typeof fetch;
+
+    const client = makeClient(() => 'ctx-token-abc');
+    await client.callTool('list_artifacts', {});
+
+    const mcpCall = spy.mock.calls.find((c) => String(c[0]).includes('/mcp'));
+    expect(mcpCall).toBeDefined();
+    const headers = (mcpCall![1] as { headers: Record<string, string> }).headers;
+    expect(headers['x-ink-context']).toBe('ctx-token-abc');
+  });
+
+  it('omits the header when no context callback is provided', async () => {
+    const spy = vi.fn(async () =>
+      okJson({ jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text: '{}' }] } })
+    );
+    global.fetch = spy as unknown as typeof fetch;
+
+    const client = makeClient(undefined);
+    await client.callTool('list_artifacts', {});
+
+    const mcpCall = spy.mock.calls.find((c) => String(c[0]).includes('/mcp'));
+    const headers = (mcpCall![1] as { headers: Record<string, string> }).headers;
+    expect(headers['x-ink-context']).toBeUndefined();
   });
 });

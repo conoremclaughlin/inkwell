@@ -114,6 +114,7 @@ import { formatContextLines, type ContextSections } from '../repl/ink/context-vi
 import {
   classifyError,
   decodeDelegationToken,
+  encodeContextToken,
   mintDelegationToken,
   verifyDelegationToken,
   type DelegationTokenPayload,
@@ -2471,8 +2472,22 @@ export async function runChat(options: ChatOptions): Promise<void> {
     throw new Error('Could not resolve agent identity. Run `ink init` or pass `--agent <id>`.');
   }
   const agentId: string = resolvedAgentId;
-  const pcp = new PcpClient();
   const identity = readIdentityJson(process.cwd());
+  // x-ink-context on every ink-routed tool call: the server derives request
+  // identity (workspace scope for writes, session attribution, trigger
+  // context) from this token. sessionId is set after session start via
+  // currentPcpSessionId — the callback reads live state per call.
+  let currentPcpSessionId: () => string | undefined = () => undefined;
+  const pcp = new PcpClient(undefined, undefined, {
+    getContextToken: () =>
+      encodeContextToken({
+        sessionId: currentPcpSessionId() || '',
+        studioId: identity?.studioId || 'main',
+        agentId,
+        cliAttached: !options.nonInteractive,
+        runtime: 'ink',
+      }),
+  });
   let autoAttachedLatest = false;
   let contextBudgetAuto = !options.maxContextTokens;
   const initialBackend = options.backend || 'claude';
@@ -2549,6 +2564,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
                 : 'auto-deny'
             : 'interactive',
   };
+  // From here, ink-routed tool calls carry the live session id in their
+  // x-ink-context header (see PcpClient construction above).
+  currentPcpSessionId = () => runtime.sessionId;
   // Resolve --sender or --contact-id for per-sender session isolation
   if (options.contactId) {
     runtime.contactId = options.contactId;
