@@ -594,6 +594,36 @@ describe('handleUpdateSessionState', () => {
       expect(mockDataComposer.repositories.memory.updateSession).not.toHaveBeenCalled();
     });
 
+    it('refuses a fallback-resolved session with the same slug but a different sbId', async () => {
+      // getActiveSession filters by the ambiguous slug — an A-bound caller
+      // naming a studio where a same-slug identity B has the active session
+      // must not write B's session.
+      vi.mocked(getPinnedAgentId).mockReturnValue('wren');
+      vi.mocked(getRequestContext).mockReturnValue({
+        agentId: 'wren',
+        sbId: 'sb-uuid-wren-a',
+        timestamp: new Date(),
+      } as never);
+      mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue({
+        ...mockSession,
+        id: 'other-identity-session',
+        agentId: 'wren',
+        sbId: 'sb-uuid-wren-b',
+      });
+
+      const result = await handleUpdateSessionState(
+        { email: 'test@test.com', phase: 'implementing', agentId: 'wren' },
+        mockDataComposer as never
+      );
+      vi.mocked(getPinnedAgentId).mockReturnValue(null);
+      vi.mocked(getRequestContext).mockReturnValue(undefined as never);
+
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.success).toBe(false);
+      expect(parsed.error).toContain('different agent identity');
+      expect(mockDataComposer.repositories.memory.updateSession).not.toHaveBeenCalled();
+    });
+
     it('allows an unpinned operator to target another agent session by explicit sessionId', async () => {
       // The deliberate cross-agent path: no pinned identity, explicit UUID.
       mockDataComposer.repositories.memory.getSession.mockResolvedValue({

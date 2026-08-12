@@ -1665,6 +1665,15 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
       if (!session) {
         return sessionErr('No active session found. Start a session first.');
       }
+      // The lookup filters by the ambiguous agent SLUG — same-slug
+      // identities across workspaces would collide, so an agent-bound
+      // caller's canonical sbId must also match the result before any
+      // write (Lumen, PR #472 review, round 3).
+      if (!targetMatchesCallerAgent(session)) {
+        return sessionErr(
+          'Resolved session belongs to a different agent identity (same slug, different sbId) — pass sessionId explicitly.'
+        );
+      }
       sessionId = session.id;
     }
   }
