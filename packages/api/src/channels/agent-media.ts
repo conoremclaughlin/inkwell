@@ -29,7 +29,7 @@ import { createHash } from 'crypto';
 import { basename, join, sep } from 'path';
 import { constants as fsConstants } from 'fs';
 import type { FileHandle } from 'fs/promises';
-import { mkdir, open, readdir, realpath, stat, unlink, utimes, writeFile } from 'fs/promises';
+import { mkdir, open, readdir, realpath, stat, unlink, writeFile } from 'fs/promises';
 import type { MediaAttachment } from '../services/sessions/types.js';
 import { logger } from '../utils/logger';
 
@@ -44,6 +44,15 @@ export const TRIGGER_SNAPSHOT_DIR = '.trigger-snapshots';
 
 /** Retention cap: oldest snapshots beyond this are pruned (LRU by mtime). */
 export const MAX_TRIGGER_SNAPSHOTS = 64;
+
+/**
+ * Pruning grace window: snapshots younger than this are never pruned, even
+ * over the retention cap. A concurrent trigger's snapshot exists between its
+ * resolution and the provider open — deleting it in that window loses the
+ * delivery (Lumen, PR #465 review, race 2). The cap can be exceeded
+ * transiently, bounded by churn within the window.
+ */
+export const PRUNE_MIN_AGE_MS = 10 * 60 * 1000;
 
 const MEDIA_TYPES = new Set(['image', 'video', 'audio', 'document', 'voice']);
 
@@ -108,8 +117,16 @@ async function ensureSnapshotDir(rootReal: string): Promise<string | null> {
   }
 }
 
-/** LRU-prune the snapshot dir to the retention cap. Best-effort. */
-async function pruneSnapshots(dirReal: string, maxSnapshots: number): Promise<void> {
+/**
+ * LRU-prune the snapshot dir to the retention cap. Best-effort. Never touches
+ * `protect` paths (this resolution's own outputs) or files younger than the
+ * grace window (another trigger's in-flight delivery).
+ */
+async function pruneSnapshots(
+  dirReal: string,
+  maxSnapshots: number,
+  protect: ReadonlySet<string>
+): Promise<void> {
   try {
     const names = await readdir(dirReal);
     if (names.length <= maxSnapshots) return;
@@ -125,12 +142,50 @@ async function pruneSnapshots(dirReal: string, maxSnapshots: number): Promise<vo
       })
     );
     const files = entries.filter((e): e is { p: string; mtimeMs: number } => e !== null);
-    files.sort((a, b) => a.mtimeMs - b.mtimeMs);
-    for (const f of files.slice(0, Math.max(0, files.length - maxSnapshots))) {
+    const excess = files.length - maxSnapshots;
+    if (excess <= 0) return;
+    const now = Date.now();
+    // Future mtimes count as fresh too (Math.abs): a future-dated entry must
+    // not push a real in-flight snapshot into the deletable set.
+    const eligible = files.filter(
+      (f) => !protect.has(f.p) && Math.abs(now - f.mtimeMs) > PRUNE_MIN_AGE_MS
+    );
+    eligible.sort((a, b) => a.mtimeMs - b.mtimeMs);
+    for (const f of eligible.slice(0, Math.min(excess, eligible.length))) {
       await unlink(f.p).catch(() => undefined);
     }
   } catch {
     // Retention is best-effort; delivery already succeeded.
+  }
+}
+
+/**
+ * Verify an EXISTING snapshot really holds the expected bytes before reusing
+ * it. EEXIST alone is not trust: the name could be a pre-created symlink
+ * (path-based utimes would follow it and the outside-resolving path would be
+ * handed to the provider) or a partial file left by a crash/ENOSPC (Lumen,
+ * PR #465 review, race 1). Verification goes through one O_NOFOLLOW handle:
+ * regular file, nlink 1, exact size, byte-for-byte equality, and the LRU
+ * time refresh via the SAME handle (futimes) — never the path.
+ */
+async function verifyExistingSnapshot(snapshotPath: string, expected: Buffer): Promise<boolean> {
+  let handle: FileHandle | undefined;
+  try {
+    handle = await open(
+      snapshotPath,
+      fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK
+    );
+    const st = await handle.stat();
+    if (!st.isFile() || st.nlink > 1 || st.size !== expected.length) return false;
+    const bytes = await readBoundedFromHandle(handle, expected.length);
+    if (!bytes || bytes.length !== expected.length || !bytes.equals(expected)) return false;
+    const now = new Date();
+    await handle.utimes(now, now).catch(() => undefined);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    await handle?.close().catch(() => undefined);
   }
 }
 
@@ -233,16 +288,31 @@ export async function resolveTriggerMedia(
         // component); EEXIST means an identical snapshot is already there.
         const digest = createHash('sha256').update(bytes).digest('hex').slice(0, 32);
         const snapshotPath = join(snapshotDir, `${digest}-${basename(real)}`);
-        try {
-          await writeFile(snapshotPath, bytes, { flag: 'wx' });
-        } catch (writeErr) {
-          if ((writeErr as NodeJS.ErrnoException).code === 'EEXIST') {
-            // Reuse — refresh mtime so LRU retention keeps live snapshots.
-            const now = new Date();
-            await utimes(snapshotPath, now, now).catch(() => undefined);
-          } else {
-            throw writeErr;
+        // Exclusive write first (`wx` refuses a symlink at the final
+        // component). EEXIST is only reuse after verification; a failed
+        // verify gets ONE repair attempt (unlink the impostor — unlink does
+        // not follow symlinks — and rewrite exclusively). A second failure
+        // means an active race or hostile churn: drop the entry, fail closed.
+        let snapshotOk = false;
+        for (let attempt = 0; attempt < 2 && !snapshotOk; attempt += 1) {
+          try {
+            await writeFile(snapshotPath, bytes, { flag: 'wx' });
+            snapshotOk = true;
+          } catch (writeErr) {
+            if ((writeErr as NodeJS.ErrnoException).code !== 'EEXIST') throw writeErr;
+            if (await verifyExistingSnapshot(snapshotPath, bytes)) {
+              snapshotOk = true;
+            } else if (attempt === 0) {
+              await unlink(snapshotPath).catch(() => undefined);
+            }
           }
+        }
+        if (!snapshotOk) {
+          logger.warn('[Trigger] existing snapshot failed verification — dropped', {
+            path: e.path,
+            snapshot: snapshotPath,
+          });
+          continue;
         }
 
         out.push({
@@ -265,7 +335,11 @@ export async function resolveTriggerMedia(
     logger.warn('[Trigger] malformed media entries dropped', { count: malformed });
   }
   if (out.length > 0) {
-    await pruneSnapshots(snapshotDir, options.maxSnapshots ?? MAX_TRIGGER_SNAPSHOTS);
+    await pruneSnapshots(
+      snapshotDir,
+      options.maxSnapshots ?? MAX_TRIGGER_SNAPSHOTS,
+      new Set(out.map((a) => a.path).filter((p): p is string => typeof p === 'string'))
+    );
   }
   return out;
 }
