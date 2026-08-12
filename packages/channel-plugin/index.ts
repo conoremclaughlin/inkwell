@@ -274,6 +274,17 @@ let unscopedNoticeSent = false;
 // a plain boolean cannot be cleared early by an overlapping entrant.
 let pollInFlight = false;
 
+// Cold-start ceiling (spec inkmail-read-state §4): the first poll of a fresh
+// plugin process delivers at most this many messages across ALL threads —
+// the per-thread 48h/last-10 bound lives server-side (channelPoll on
+// get_thread_messages); this is the aggregate backstop. One summary line per
+// process reports whatever was skipped.
+const COLD_START_TOTAL_CEILING = 100;
+// The cold start lasts until a poll completes WITHOUT hitting the ceiling —
+// a deferred backlog stays budgeted on every subsequent poll until drained.
+let coldStartComplete = false;
+let coldStartSummarySent = false;
+
 async function pollInbox(): Promise<void> {
   if (!email) return;
   if (pollInFlight) {
@@ -322,10 +333,26 @@ async function pollInbox(): Promise<void> {
 
       // Check for new thread messages
       const threads = (result.threadsWithUnread as Array<Record<string, unknown>>) || [];
+      let injectedThisPoll = 0;
+      let skippedTotal = 0;
+      let skippedThreads = 0;
+      let ceilingHit = false;
       for (const thread of threads) {
         const threadKey = thread.threadKey as string;
         const unreadCount = (thread.unreadCount as number) || 0;
         if (!threadKey || unreadCount === 0) continue;
+
+        // Cold-start aggregate ceiling: the first poll stops injecting past
+        // the budget; untouched threads keep their server pointers and are
+        // picked up (server-bounded) on subsequent polls.
+        if (!coldStartComplete && injectedThisPoll >= COLD_START_TOTAL_CEILING) {
+          ceilingHit = true;
+          log('warn', 'Cold-start ceiling reached — deferring remaining threads to next poll', {
+            injectedThisPoll,
+            deferredThread: threadKey,
+          });
+          break;
+        }
 
         // Use our own cursor (afterMessageId) to avoid the ASC-sort + small-limit
         // footgun: without a cursor, get_thread_messages returns the earliest N
@@ -333,6 +360,9 @@ async function pollInbox(): Promise<void> {
         // reaching new ones. markRead advances the server pointer to whatever
         // was actually returned — safe now that the server respects that — but
         // the plugin's own cursor is what guarantees forward progress.
+        // channelPoll activates the server-side cold-start guard: with no
+        // cursor, a stale/missing read pointer delivers only the last 48h
+        // (floor: newest 10) instead of replaying the backlog (spec §4).
         const afterMessageId = lastThreadMessageId.get(threadKey);
         const threadResult = await callPcp('get_thread_messages', {
           email,
@@ -340,10 +370,20 @@ async function pollInbox(): Promise<void> {
           threadKey,
           markRead: true,
           limit: 50,
+          channelPoll: true,
           ...(afterMessageId ? { afterMessageId } : {}),
         });
 
         if (!threadResult?.success) continue;
+        const skippedOlder = (threadResult.skippedOlderCount as number) || 0;
+        if (skippedOlder > 0) {
+          skippedTotal += skippedOlder;
+          skippedThreads += 1;
+          log('info', 'Cold-start guard skipped older messages', {
+            threadKey,
+            skippedOlder,
+          });
+        }
 
         const messages = (threadResult.messages as Array<Record<string, unknown>>) || [];
         const lastKnownTs = lastThreadTimestamps.get(threadKey);
@@ -383,6 +423,7 @@ async function pollInbox(): Promise<void> {
               },
             },
           });
+          injectedThisPoll += 1;
         }
 
         // Advance cursors (id + timestamp) to the last returned message.
@@ -398,6 +439,34 @@ async function pollInbox(): Promise<void> {
           if (lastId) lastThreadMessageId.set(threadKey, lastId);
         }
       }
+
+      // One summary line per cold start (spec §4): report skipped history and
+      // any ceiling deferral once, then stay quiet — the skipped range is
+      // consumed by the pointer advance, not re-offered every poll.
+      if (!coldStartSummarySent && (skippedTotal > 0 || ceilingHit)) {
+        coldStartSummarySent = true;
+        const parts: string[] = [];
+        if (skippedTotal > 0) {
+          parts.push(
+            `${skippedTotal} older unread message(s) across ${skippedThreads} thread(s) were skipped (older than 48h)`
+          );
+        }
+        if (ceilingHit) {
+          parts.push(
+            `delivery paused at ${COLD_START_TOTAL_CEILING} messages this poll — remaining threads arrive on the next poll`
+          );
+        }
+        await mcp
+          .notification({
+            method: 'notifications/claude/channel',
+            params: {
+              content: `InkMail cold-start guard: ${parts.join('; ')}. Older history stays in-thread — use get_thread_messages with fullHistory to view.`,
+              meta: { sender: 'inkmail', message_type: 'notification' },
+            },
+          })
+          .catch(() => {});
+      }
+      if (!ceilingHit) coldStartComplete = true;
 
       // Legacy inbox messages (non-threaded). Since we pass `since: lastPollTime`
       // to get_inbox, only new messages are returned. seenMessageIds prevents

@@ -740,3 +740,250 @@ describe('handleSendToInbox - thread routing', () => {
     );
   });
 });
+
+// =====================================================
+// get_thread_messages — cold-start guard (spec inkmail-read-state §4)
+// =====================================================
+
+import { handleGetThreadMessages } from './thread-handlers';
+
+vi.mock('./read-state.js', () => ({
+  advanceThreadReadPointer: vi.fn().mockResolvedValue({ success: true }),
+}));
+
+interface GuardMsg {
+  id: string;
+  created_at: string;
+  message_type: string;
+  sender_agent_id: string;
+  content: string;
+}
+
+const hoursAgo = (h: number) => new Date(Date.now() - h * 3600 * 1000).toISOString();
+
+function guardMsg(id: string, ageHours: number): GuardMsg {
+  return {
+    id,
+    created_at: hoursAgo(ageHours),
+    message_type: 'message',
+    sender_agent_id: 'lumen',
+    content: `msg ${id}`,
+  };
+}
+
+/**
+ * In-memory query engine over a message table so window math (gt/lt floors,
+ * DESC truncation, head counts) is actually exercised, not stubbed.
+ */
+function createGuardMockSupabase(
+  rows: GuardMsg[],
+  opts: { lastReadAt?: string | null; joinedAt?: string | null } = {}
+) {
+  const messagesChain = () => {
+    const state = {
+      gts: [] as string[],
+      lts: [] as string[],
+      neqType: null as string | null,
+      idEq: null as string | null,
+      asc: true,
+      limit: null as number | null,
+      head: false,
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const self: any = {};
+    self.select = vi.fn((_sel: string, o?: { head?: boolean }) => {
+      state.head = !!o?.head;
+      return self;
+    });
+    self.eq = vi.fn((col: string, val: string) => {
+      if (col === 'id') state.idEq = val;
+      return self;
+    });
+    self.neq = vi.fn((col: string, val: string) => {
+      if (col === 'message_type') state.neqType = val;
+      return self;
+    });
+    self.gt = vi.fn((_col: string, val: string) => {
+      state.gts.push(val);
+      return self;
+    });
+    self.lt = vi.fn((_col: string, val: string) => {
+      state.lts.push(val);
+      return self;
+    });
+    self.order = vi.fn((_col: string, o?: { ascending?: boolean }) => {
+      state.asc = o?.ascending !== false;
+      return self;
+    });
+    self.limit = vi.fn((n: number) => {
+      state.limit = n;
+      return self;
+    });
+    const compute = () => {
+      let out = rows.filter(
+        (r) =>
+          state.gts.every((g) => r.created_at > g) &&
+          state.lts.every((l) => r.created_at < l) &&
+          (state.neqType === null || r.message_type !== state.neqType)
+      );
+      out = out.sort((a, b) =>
+        state.asc
+          ? a.created_at.localeCompare(b.created_at)
+          : b.created_at.localeCompare(a.created_at)
+      );
+      const count = out.length;
+      if (state.limit !== null) out = out.slice(0, state.limit);
+      return { data: state.head ? null : out, error: null, count };
+    };
+    self.single = vi.fn(() => {
+      const row = rows.find((r) => r.id === state.idEq);
+      return Promise.resolve({ data: row || null, error: null });
+    });
+    self.then = (resolve: (v: unknown) => unknown) => Promise.resolve(compute()).then(resolve);
+    return self;
+  };
+
+  const simpleRow = (data: unknown) => ({
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    select: vi.fn().mockReturnValue({
+      eq: vi.fn().mockReturnValue({
+        eq: vi.fn().mockReturnValue({
+          maybeSingle: vi.fn().mockResolvedValue({ data, error: null }),
+        }),
+        maybeSingle: vi.fn().mockResolvedValue({ data, error: null }),
+      }),
+    }),
+  });
+
+  const fromFn = vi.fn().mockImplementation((table: string) => {
+    switch (table) {
+      case 'inbox_threads':
+        return simpleRow({
+          id: 't-guard',
+          thread_key: 'pr:guard',
+          title: null,
+          status: 'open',
+          created_by_agent_id: 'lumen',
+        });
+      case 'inbox_thread_participants':
+        return simpleRow({
+          agent_id: 'wren',
+          joined_at: opts.joinedAt === undefined ? hoursAgo(24 * 120) : opts.joinedAt,
+        });
+      case 'inbox_thread_read_status':
+        return simpleRow(
+          opts.lastReadAt === undefined || opts.lastReadAt === null
+            ? null
+            : { last_read_at: opts.lastReadAt }
+        );
+      case 'inbox_thread_messages':
+        return messagesChain();
+      default:
+        return simpleRow(null);
+    }
+  });
+
+  return { from: fromFn, rpc: vi.fn().mockResolvedValue({ data: null, error: null }) };
+}
+
+function guardComposer(sb: ReturnType<typeof createGuardMockSupabase>) {
+  return { getClient: vi.fn().mockReturnValue(sb) } as never;
+}
+
+async function callGuard(
+  sb: ReturnType<typeof createGuardMockSupabase>,
+  extra: Record<string, unknown> = {}
+) {
+  const result = await handleGetThreadMessages(
+    { email: 'test@test.com', agentId: 'wren', threadKey: 'pr:guard', ...extra },
+    guardComposer(sb)
+  );
+  return JSON.parse(result.content[0].text);
+}
+
+describe('handleGetThreadMessages — cold-start guard (spec §4)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('bounds a stale-pointer delivery poll to the 48h window, newest-first, skips visible', async () => {
+    // 40 old (ages 100h+) + 20 recent (1–40h). Participant joined 120 days
+    // ago, never read — the July 30 shape. Without the guard this replays 60.
+    const rows = [
+      ...Array.from({ length: 40 }, (_, i) => guardMsg(`old-${i}`, 100 + i * 10)),
+      ...Array.from({ length: 20 }, (_, i) => guardMsg(`new-${i}`, 1 + i * 2)),
+    ];
+    const parsed = await callGuard(createGuardMockSupabase(rows), { channelPoll: true });
+    expect(parsed.success).toBe(true);
+    expect(parsed.coldStartGuard).toBe(true);
+    expect(parsed.messageCount).toBe(20);
+    expect(parsed.skippedOlderCount).toBe(40);
+    const ids = (parsed.messages as Array<{ id: string }>).map((m) => m.id);
+    expect(ids.every((id) => id.startsWith('new-'))).toBe(true);
+    // Response ordering stays oldest-first
+    const times = (parsed.messages as Array<{ createdAt: string }>).map((m) => m.createdAt);
+    expect([...times].sort()).toEqual(times);
+  });
+
+  it('floor: delivers the newest 10 unseen when the 48h window is emptier than that', async () => {
+    const rows = Array.from({ length: 30 }, (_, i) => guardMsg(`old-${i}`, 50 + i * 10));
+    const parsed = await callGuard(createGuardMockSupabase(rows), { channelPoll: true });
+    expect(parsed.messageCount).toBe(10);
+    expect(parsed.skippedOlderCount).toBe(20);
+    // The newest 10 (smallest ages), not the earliest
+    const ids = (parsed.messages as Array<{ id: string }>).map((m) => m.id);
+    expect(ids).toContain('old-0');
+    expect(ids).not.toContain('old-29');
+  });
+
+  it('explicit afterMessageId bypasses the guard entirely', async () => {
+    const rows = Array.from({ length: 15 }, (_, i) => guardMsg(`m-${i}`, 200 - i * 10));
+    const parsed = await callGuard(createGuardMockSupabase(rows), {
+      channelPoll: true,
+      afterMessageId: '11111111-1111-1111-1111-111111111111',
+    });
+    // Cursor id not found → no floor from it; guard must NOT kick in.
+    expect(parsed.coldStartGuard).toBeUndefined();
+    expect(parsed.skippedOlderCount).toBeUndefined();
+    expect(parsed.messageCount).toBe(15);
+  });
+
+  it('fullHistory bypasses the guard', async () => {
+    const rows = Array.from({ length: 25 }, (_, i) => guardMsg(`m-${i}`, 100 + i * 20));
+    const parsed = await callGuard(createGuardMockSupabase(rows), {
+      channelPoll: true,
+      fullHistory: true,
+    });
+    expect(parsed.coldStartGuard).toBeUndefined();
+    expect(parsed.messageCount).toBe(25);
+  });
+
+  it('latestN returns the newest N with visible skip accounting (no channelPoll)', async () => {
+    const rows = Array.from({ length: 20 }, (_, i) => guardMsg(`m-${i}`, 1 + i));
+    const parsed = await callGuard(createGuardMockSupabase(rows, { joinedAt: null }), {
+      latestN: 5,
+    });
+    expect(parsed.messageCount).toBe(5);
+    expect(parsed.skippedOlderCount).toBe(15);
+    const ids = (parsed.messages as Array<{ id: string }>).map((m) => m.id);
+    expect(ids).toEqual(['m-4', 'm-3', 'm-2', 'm-1', 'm-0']);
+  });
+
+  it('markRead advances the pointer through the NEWEST delivered message', async () => {
+    const { advanceThreadReadPointer } = await import('./read-state.js');
+    const rows = [guardMsg('older', 30), guardMsg('newest', 1)];
+    await callGuard(createGuardMockSupabase(rows), { channelPoll: true, markRead: true });
+    expect(vi.mocked(advanceThreadReadPointer)).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ throughMessageId: 'newest' })
+    );
+  });
+
+  it('no truncation → no skippedOlderCount field, delivery unchanged', async () => {
+    const rows = Array.from({ length: 5 }, (_, i) => guardMsg(`m-${i}`, 1 + i));
+    const parsed = await callGuard(createGuardMockSupabase(rows), { channelPoll: true });
+    expect(parsed.messageCount).toBe(5);
+    expect(parsed.skippedOlderCount).toBeUndefined();
+    expect(parsed.coldStartGuard).toBe(true);
+  });
+});

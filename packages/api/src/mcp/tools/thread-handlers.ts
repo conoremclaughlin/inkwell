@@ -25,6 +25,13 @@ const threadTable = (supabase: SupabaseClient, table: string) =>
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (supabase as any).from(table);
 
+// Cold-start guard bounds (spec inkmail-read-state §4): a delivery poll with
+// a missing/stale read pointer is limited to the last 48h of unseen messages,
+// with a floor of the newest 10 so quiet threads still surface context. The
+// per-thread ceiling is the caller's `limit` (plugin passes 50).
+const COLD_START_WINDOW_MS = 48 * 60 * 60 * 1000;
+const COLD_START_MIN_MESSAGES = 10;
+
 // ============== Schemas ==============
 
 const threadKeySchema = z
@@ -49,6 +56,29 @@ const getThreadMessagesSchema = userIdentifierBaseSchema.extend({
     .default(false)
     .describe(
       'Return the full timeline regardless of read state. Without this (and without an explicit cursor), results fall back to messages newer than the last-read pointer — which hides already-delivered messages from watchers/pollers that manage their own cursor (e.g., ink wait).'
+    ),
+  newerThan: z
+    .string()
+    .datetime()
+    .optional()
+    .describe(
+      'Explicit floor: only messages created after this timestamp. Combined with the read-state cursor (the later of the two wins).'
+    ),
+  latestN: z
+    .number()
+    .int()
+    .min(1)
+    .max(200)
+    .optional()
+    .describe(
+      'Return only the newest N of the matching messages (truncates older ones first). skippedOlderCount reports what was cut.'
+    ),
+  channelPoll: z
+    .boolean()
+    .optional()
+    .default(false)
+    .describe(
+      'Delivery-poll mode (channel plugin): activates the cold-start guard — with no explicit cursor, unseen messages are bounded to the last 48h (floor: last 10), newest-first-truncated, so a stale or missing read pointer can never replay a months-long backlog (spec: inkmail-read-state §4).'
     ),
 });
 
@@ -279,8 +309,17 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
   const agentId = getEffectiveAgentId(parsed.agentId) ?? parsed.agentId;
-  const { threadKey, limit, beforeMessageId, afterMessageId, includeSystemEvents, markRead } =
-    parsed;
+  const {
+    threadKey,
+    limit,
+    beforeMessageId,
+    afterMessageId,
+    includeSystemEvents,
+    markRead,
+    newerThan,
+    latestN,
+    channelPoll,
+  } = parsed;
 
   // Find thread
   const thread = await findThread(supabase, resolved.user.id, threadKey);
@@ -310,69 +349,124 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
     };
   }
 
-  // Build query
-  let query = threadTable(supabase, 'inbox_thread_messages')
-    .select('*')
-    .eq('thread_id', thread.id)
-    .order('created_at', { ascending: true })
-    .limit(limit);
-
-  if (!includeSystemEvents) {
-    query = query.neq('message_type', 'system');
-  }
-
+  // Resolve explicit cursor bounds (created_at of the cursor messages)
+  let beforeTs: string | null = null;
+  let afterTs: string | null = null;
   if (beforeMessageId) {
-    // Get the created_at of the cursor message for pagination
     const { data: cursor } = await threadTable(supabase, 'inbox_thread_messages')
       .select('created_at')
       .eq('id', beforeMessageId)
       .single();
-    if (cursor) {
-      query = query.lt('created_at', cursor.created_at);
-    }
+    beforeTs = (cursor as { created_at?: string } | null)?.created_at || null;
   }
-
   if (afterMessageId) {
     const { data: cursor } = await threadTable(supabase, 'inbox_thread_messages')
       .select('created_at')
       .eq('id', afterMessageId)
       .single();
-    if (cursor) {
-      query = query.gt('created_at', cursor.created_at);
-    }
-  } else if (!beforeMessageId && !parsed.fullHistory) {
-    // No explicit cursor — fall back to stored read state so a client whose
-    // in-memory cursor was reset doesn't replay the full thread history.
-    // Skipped when fullHistory is set: watchers (ink wait) need the true
-    // timeline to anchor on, or push-delivery read-marking races them into
-    // seeing an eternally-empty thread.
-    // Baseline priority:
-    //   1. last_read_at (explicit read pointer from prior reads)
-    //   2. joined_at (participant join time — no replay of pre-join history)
+    afterTs = (cursor as { created_at?: string } | null)?.created_at || null;
+  }
+
+  // Implicit read-state floor — only when no explicit cursor and not
+  // fullHistory. A client whose in-memory cursor was reset must not replay
+  // the full thread history; watchers (ink wait) pass fullHistory to anchor
+  // on the true timeline. Baseline priority:
+  //   1. last_read_at (explicit read pointer from prior reads)
+  //   2. joined_at (participant join time — no replay of pre-join history)
+  let readStateFloor: string | null = null;
+  if (!afterMessageId && !beforeMessageId && !parsed.fullHistory) {
     const { data: readStatus } = await threadTable(supabase, 'inbox_thread_read_status')
       .select('last_read_at')
       .eq('thread_id', thread.id)
       .eq('agent_id', agentId)
       .maybeSingle();
-    let cursorTs = (readStatus as { last_read_at?: string } | null)?.last_read_at || null;
+    readStateFloor = (readStatus as { last_read_at?: string } | null)?.last_read_at || null;
 
-    if (!cursorTs) {
+    if (!readStateFloor) {
       const { data: participant } = await threadTable(supabase, 'inbox_thread_participants')
         .select('joined_at')
         .eq('thread_id', thread.id)
         .eq('agent_id', agentId)
         .maybeSingle();
-      cursorTs = (participant as { joined_at?: string } | null)?.joined_at || null;
-    }
-
-    if (cursorTs) {
-      query = query.gt('created_at', cursorTs);
+      readStateFloor = (participant as { joined_at?: string } | null)?.joined_at || null;
     }
   }
 
-  const { data: messages, error } = await query;
-  if (error) {
-    throw new Error(`Failed to get thread messages: ${error.message}`);
+  // Effective floor: the latest of read-state floor / after-cursor / newerThan.
+  let floorTs: string | null = readStateFloor;
+  if (afterTs && (!floorTs || afterTs > floorTs)) floorTs = afterTs;
+  if (newerThan && (!floorTs || newerThan > floorTs)) floorTs = newerThan;
+
+  const buildQuery = (selectArg: string, head = false) => {
+    let q = threadTable(supabase, 'inbox_thread_messages')
+      .select(selectArg, head ? { count: 'exact', head: true } : undefined)
+      .eq('thread_id', thread.id);
+    if (!includeSystemEvents) q = q.neq('message_type', 'system');
+    if (floorTs) q = q.gt('created_at', floorTs);
+    if (beforeTs) q = q.lt('created_at', beforeTs);
+    return q;
+  };
+
+  // Cold-start guard (spec inkmail-read-state §4): a delivery poll with no
+  // explicit cursor must never replay a stale backlog — a missing or
+  // months-old read pointer bounds to the last 48h (floor: newest 10),
+  // truncated NEWEST-first. Explicit cursors and fullHistory bypass: those
+  // callers asked for a specific window.
+  const guardActive = channelPoll && !afterMessageId && !beforeMessageId && !parsed.fullHistory;
+  const newestFirst = guardActive || Boolean(latestN);
+  const effectiveLimit = Math.min(limit, latestN ?? limit);
+
+  let messages: Record<string, unknown>[] | null = null;
+  let skippedOlderCount = 0;
+
+  if (!newestFirst) {
+    const { data, error } = await buildQuery('*')
+      .order('created_at', { ascending: true })
+      .limit(effectiveLimit);
+    if (error) {
+      throw new Error(`Failed to get thread messages: ${error.message}`);
+    }
+    messages = data;
+  } else {
+    // Count everything past the floor so truncation is visible, not silent.
+    const { count: totalMatching, error: countErr } = await buildQuery('id', true);
+    if (countErr) {
+      throw new Error(`Failed to count thread messages: ${countErr.message}`);
+    }
+
+    let windowed = buildQuery('*');
+    if (guardActive) {
+      const guardFloor = new Date(Date.now() - COLD_START_WINDOW_MS).toISOString();
+      // Repeated created_at filters AND together — the later floor wins.
+      if (!floorTs || guardFloor > floorTs) {
+        windowed = windowed.gt('created_at', guardFloor);
+      }
+    }
+    const { data: newest, error } = await windowed
+      .order('created_at', { ascending: false })
+      .limit(effectiveLimit);
+    if (error) {
+      throw new Error(`Failed to get thread messages: ${error.message}`);
+    }
+    let delivered = (newest || []) as Record<string, unknown>[];
+
+    // Myra floor: if the 48h window under-delivers relative to what's unseen,
+    // deliver the newest 10 unseen regardless of age — quiet threads still
+    // surface recent context on a cold start.
+    const floorCount = Math.min(COLD_START_MIN_MESSAGES, effectiveLimit);
+    if (guardActive && delivered.length < floorCount && (totalMatching ?? 0) > delivered.length) {
+      const { data: fallback, error: fallbackErr } = await buildQuery('*')
+        .order('created_at', { ascending: false })
+        .limit(floorCount);
+      if (fallbackErr) {
+        throw new Error(`Failed to get thread messages: ${fallbackErr.message}`);
+      }
+      delivered = (fallback || delivered) as Record<string, unknown>[];
+    }
+
+    skippedOlderCount = Math.max(0, (totalMatching ?? delivered.length) - delivered.length);
+    // Response stays oldest-first regardless of how the window was cut.
+    messages = delivered.reverse();
   }
 
   // Get participants
@@ -415,6 +509,10 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
           createdBy: thread.created_by_agent_id,
           participants,
           messageCount: messages?.length || 0,
+          // Truncation is visible, never silent: how many older matching
+          // messages were cut by the cold-start guard or latestN window.
+          ...(skippedOlderCount > 0 ? { skippedOlderCount } : {}),
+          ...(guardActive ? { coldStartGuard: true } : {}),
           messages: (messages || []).map((m: Record<string, unknown>) => ({
             id: m.id,
             senderAgentId: m.sender_agent_id,
