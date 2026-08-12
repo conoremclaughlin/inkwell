@@ -241,6 +241,32 @@ describe('resolveTriggerMedia (agent-to-agent attachment containment)', () => {
     expect(out).toHaveLength(1);
     expect(existsSync(out[0]!.path)).toBe(true);
     expect(readFileSync(out[0]!.path).equals(content)).toBe(true);
+    // The future-dated file is ineligible too (negative age is not "aged") —
+    // it must never displace real files, and it is not itself pruned.
+    expect(existsSync(aggressor)).toBe(true);
+  });
+
+  it('publishes atomically: concurrent same-content resolves never drop or see partial bytes', async () => {
+    // Lumen's PR #474 repro: with writeFile at the final CAS name, 16
+    // concurrent resolves of one large source produced 12/16 drops —
+    // verifiers read partial files and unlinked the live writer. Atomic
+    // temp+rename publication must yield zero drops and complete bytes.
+    const content = Buffer.concat([
+      Buffer.from('large-payload-'),
+      Buffer.alloc(2 * 1024 * 1024, 7),
+    ]);
+    const p = png(root, 'big-shared.bin', content);
+    const results = await Promise.all(
+      Array.from({ length: 16 }, () =>
+        resolveTriggerMedia({ media: [{ path: p }] }, { mediaRoot: root })
+      )
+    );
+    for (const out of results) {
+      expect(out).toHaveLength(1);
+      // Immediate read of every returned path sees complete bytes
+      expect(readFileSync(out[0]!.path).equals(content)).toBe(true);
+    }
+    expect(mockWarn).not.toHaveBeenCalled();
   });
 
   it('EEXIST is not trust: a pre-created symlink at the snapshot name is repaired, not reused', async () => {

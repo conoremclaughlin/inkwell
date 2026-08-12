@@ -25,11 +25,11 @@
  */
 
 import { homedir } from 'os';
-import { createHash } from 'crypto';
+import { createHash, randomBytes } from 'crypto';
 import { basename, join, sep } from 'path';
 import { constants as fsConstants } from 'fs';
 import type { FileHandle } from 'fs/promises';
-import { mkdir, open, readdir, realpath, stat, unlink, writeFile } from 'fs/promises';
+import { mkdir, open, readdir, realpath, rename, stat, unlink, writeFile } from 'fs/promises';
 import type { MediaAttachment } from '../services/sessions/types.js';
 import { logger } from '../utils/logger';
 
@@ -145,11 +145,10 @@ async function pruneSnapshots(
     const excess = files.length - maxSnapshots;
     if (excess <= 0) return;
     const now = Date.now();
-    // Future mtimes count as fresh too (Math.abs): a future-dated entry must
-    // not push a real in-flight snapshot into the deletable set.
-    const eligible = files.filter(
-      (f) => !protect.has(f.p) && Math.abs(now - f.mtimeMs) > PRUNE_MIN_AGE_MS
-    );
+    // Only files AGED past the grace window are deletable. Future mtimes
+    // yield a negative age and stay ineligible — a future-dated entry must
+    // never push a real in-flight snapshot into the deletable set.
+    const eligible = files.filter((f) => !protect.has(f.p) && now - f.mtimeMs > PRUNE_MIN_AGE_MS);
     eligible.sort((a, b) => a.mtimeMs - b.mtimeMs);
     for (const f of eligible.slice(0, Math.min(excess, eligible.length))) {
       await unlink(f.p).catch(() => undefined);
@@ -288,31 +287,32 @@ export async function resolveTriggerMedia(
         // component); EEXIST means an identical snapshot is already there.
         const digest = createHash('sha256').update(bytes).digest('hex').slice(0, 32);
         const snapshotPath = join(snapshotDir, `${digest}-${basename(real)}`);
-        // Exclusive write first (`wx` refuses a symlink at the final
-        // component). EEXIST is only reuse after verification; a failed
-        // verify gets ONE repair attempt (unlink the impostor — unlink does
-        // not follow symlinks — and rewrite exclusively). A second failure
-        // means an active race or hostile churn: drop the entry, fail closed.
-        let snapshotOk = false;
-        for (let attempt = 0; attempt < 2 && !snapshotOk; attempt += 1) {
+        // Reuse only a VERIFIED existing snapshot; otherwise publish
+        // atomically — full bytes on a private temp inode, then rename()
+        // into the CAS name. A writeFile at the final name would create the
+        // pathname before the bytes land, so a concurrent same-content
+        // resolver could verify against a partial file and treat the live
+        // writer as an impostor (Lumen, PR #474 review: 12/16 drops on
+        // concurrent 12 MiB resolves). rename() also atomically replaces a
+        // pre-created symlink or crash leftover at the name — no unlink
+        // repair step, so a live writer's file is never deleted.
+        if (!(await verifyExistingSnapshot(snapshotPath, bytes))) {
+          const tmpPath = join(
+            snapshotDir,
+            `.tmp-${process.pid}-${randomBytes(6).toString('hex')}`
+          );
           try {
-            await writeFile(snapshotPath, bytes, { flag: 'wx' });
-            snapshotOk = true;
-          } catch (writeErr) {
-            if ((writeErr as NodeJS.ErrnoException).code !== 'EEXIST') throw writeErr;
-            if (await verifyExistingSnapshot(snapshotPath, bytes)) {
-              snapshotOk = true;
-            } else if (attempt === 0) {
-              await unlink(snapshotPath).catch(() => undefined);
-            }
+            await writeFile(tmpPath, bytes, { flag: 'wx' });
+            await rename(tmpPath, snapshotPath);
+          } catch (publishErr) {
+            await unlink(tmpPath).catch(() => undefined);
+            logger.warn('[Trigger] snapshot publication failed — dropped', {
+              path: e.path,
+              snapshot: snapshotPath,
+              error: publishErr instanceof Error ? publishErr.message : String(publishErr),
+            });
+            continue;
           }
-        }
-        if (!snapshotOk) {
-          logger.warn('[Trigger] existing snapshot failed verification — dropped', {
-            path: e.path,
-            snapshot: snapshotPath,
-          });
-          continue;
         }
 
         out.push({
