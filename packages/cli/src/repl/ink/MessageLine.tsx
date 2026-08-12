@@ -54,15 +54,28 @@ const CONTENT_COLORS: Record<MessageRole, string | undefined> = {
 };
 
 /**
- * Center a marker glyph within the gutter column: single-width glyphs
- * (❯ ✦ ∗ ✓) sit in the middle column instead of hugging the left edge, while
- * double-width emoji (📬 ⚡) keep their natural left position — a 2-col glyph
- * already fills the 3-col gutter visually. Width is measured with the same
+ * Emoji glyphs, regardless of measured width. string-width reports
+ * text-presentation emoji (🛠 🗑 ⚙) as 1 column, but most terminals render
+ * them emoji-style at 2 — centering by the measured width butts them against
+ * the adjacent text (zero visual gap). Text glyphs (❯ ✦ ∗ ✓ ✻) are not
+ * pictographic and measure truthfully.
+ */
+const PICTOGRAPHIC_RE = /\p{Extended_Pictographic}/u;
+
+/**
+ * Center a marker glyph within the gutter column: single-width TEXT glyphs
+ * (❯ ✦ ∗ ✓ ✻) sit in the middle column instead of hugging the left edge.
+ * Pictographic glyphs are treated as at least 2 columns wide whatever
+ * string-width claims (see PICTOGRAPHIC_RE) — they stay at column 0, which
+ * guarantees at least one column of gap before the text even when the
+ * terminal renders them wide. Width is otherwise measured with the same
  * string-width ink itself uses, so the pad never disagrees with layout.
  */
 export function centerGutterMarker(marker: string): string {
   if (!marker) return marker;
-  const pad = Math.max(0, Math.floor((GUTTER_WIDTH - stringWidth(marker)) / 2));
+  const measured = stringWidth(marker);
+  const width = PICTOGRAPHIC_RE.test(marker) ? Math.max(2, measured) : measured;
+  const pad = Math.max(0, Math.floor((GUTTER_WIDTH - width) / 2));
   return ' '.repeat(pad) + marker;
 }
 
