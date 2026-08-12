@@ -74,6 +74,38 @@ describe('hydrateLedgerFromTranscript — tool call replay', () => {
     expect(result.toolCalls[0].result).toContain('tg-401');
   });
 
+  it('carries denied reasons and thrown errors into the inspector record (reason/error fallback)', () => {
+    writeFileSync(
+      transcriptPath,
+      [
+        {
+          eid: 1,
+          type: 'local_tool_call',
+          tool: 'bash',
+          args: { command: 'rm -rf /' },
+          status: 'denied',
+          reason: 'blocked by tool policy',
+        },
+        {
+          eid: 2,
+          type: 'local_tool_call',
+          tool: 'get_inbox',
+          args: { agentId: 'myra' },
+          status: 'error',
+          error: 'ECONNREFUSED 127.0.0.1:3001',
+        },
+      ]
+        .map((e) => JSON.stringify(e))
+        .join('\n') + '\n'
+    );
+
+    const ledger = new ContextLedger();
+    const result = hydrateLedgerFromTranscript(ledger, transcriptPath);
+    expect(result.toolCalls).toHaveLength(2);
+    expect(result.toolCalls[0].result).toBe('blocked by tool policy');
+    expect(result.toolCalls[1].result).toBe('ECONNREFUSED 127.0.0.1:3001');
+  });
+
   it('caps long tool args and results in the replay preview', () => {
     writeFileSync(
       transcriptPath,

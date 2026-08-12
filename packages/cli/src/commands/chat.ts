@@ -941,11 +941,15 @@ export function hydrateLedgerFromTranscript(
         undefined,
         eid
       );
+      // Blocked/denied rows persist `reason` and thrown errors persist
+      // `error` instead of `result` — fall back so Ctrl+T keeps those
+      // details across reattach, matching the live recentToolCalls entries.
+      const resultSource = event.result ?? event.reason ?? event.error;
       const resultJson =
-        event.result !== undefined
-          ? (typeof event.result === 'string'
-              ? event.result
-              : JSON.stringify(event.result)
+        resultSource !== undefined
+          ? (typeof resultSource === 'string'
+              ? resultSource
+              : JSON.stringify(resultSource)
             ).replace(/\s+/g, ' ')
           : '';
       toolCalls.push({
