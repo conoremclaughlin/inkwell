@@ -526,6 +526,133 @@ describe('hydrateLedgerFromTranscript — context_evict events', () => {
   });
 });
 
+describe('hydrateLedgerFromTranscript — platform message replay (activity entries)', () => {
+  let dir: string;
+  let transcriptPath: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'ink-activity-replay-test-'));
+    transcriptPath = join(dir, 'session-activity.jsonl');
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const write = (events: unknown[]) =>
+    writeFileSync(transcriptPath, events.map((e) => JSON.stringify(e)).join('\n') + '\n');
+
+  it('replays outbound platform messages as directional message blocks, not just tool receipts', () => {
+    // Conor's reattach report (2026-08-12): Myra's Telegram sends showed only
+    // as collapsed send_response events after detach/reattach. The activity
+    // entry holds the FULL sent content — replay it as the same 📤 block the
+    // live activity poll renders.
+    write([
+      {
+        eid: 1,
+        type: 'local_tool_call',
+        tool: 'send_response',
+        args: {
+          channel: 'telegram',
+          conversationId: '726555973',
+          content: 'Post-session catch-up',
+        },
+        status: 'executed',
+        result: { success: true },
+      },
+      {
+        eid: 2,
+        type: 'activity',
+        activityId: 'act-1',
+        activityType: 'message_out',
+        agentId: 'myra',
+        platform: 'telegram',
+        createdAt: '2026-08-12T22:03:00Z',
+        content: 'Post-session catch-up: Ruoshan emailed about the picnic.',
+      },
+    ]);
+
+    const ledger = new ContextLedger();
+    const result = hydrateLedgerFromTranscript(ledger, transcriptPath, 'myra');
+
+    // The tool receipt stays a dim event row...
+    const eventRows = result.tailPreview.filter((p) => p.role === 'event');
+    expect(eventRows).toHaveLength(1);
+    expect(eventRows[0].content).toContain('send_response');
+
+    // ...and the SENT MESSAGE is a labeled assistant block with full content.
+    const sent = result.tailPreview.find((p) => p.role === 'assistant');
+    expect(sent).toBeDefined();
+    expect(sent!.label).toBe('📤 myra → telegram');
+    expect(sent!.content).toContain('Ruoshan emailed about the picnic');
+    expect(sent!.ts).toBe('2026-08-12T22:03:00Z');
+
+    // The activity id is marked seen so the live poll cannot double-render it.
+    expect(result.seenActivityIds).toContain('act-1');
+  });
+
+  it('replays inbound platform messages as user blocks', () => {
+    write([
+      {
+        eid: 1,
+        type: 'activity',
+        activityId: 'act-2',
+        activityType: 'message_in',
+        agentId: 'myra',
+        platform: 'telegram',
+        content: 'Therapy finished 45 minutes ago!',
+      },
+    ]);
+    const ledger = new ContextLedger();
+    const result = hydrateLedgerFromTranscript(ledger, transcriptPath, 'myra');
+    const received = result.tailPreview.find((p) => p.role === 'user');
+    expect(received).toBeDefined();
+    expect(received!.label).toBe('📨 telegram → myra');
+  });
+
+  it('legacy activity entries without platform still replay with the generic channel label', () => {
+    write([
+      {
+        eid: 1,
+        type: 'activity',
+        activityId: 'act-3',
+        activityType: 'message_out',
+        agentId: 'myra',
+        content: 'sent before platform was persisted',
+      },
+    ]);
+    const ledger = new ContextLedger();
+    const result = hydrateLedgerFromTranscript(ledger, transcriptPath, 'myra');
+    expect(result.tailPreview.find((p) => p.role === 'assistant')?.label).toBe('📤 myra → channel');
+  });
+
+  it('bookkeeping and other-agent activity stays out of the message replay', () => {
+    write([
+      {
+        eid: 1,
+        type: 'activity',
+        activityId: 'act-4',
+        activityType: 'tool_call',
+        agentId: 'myra',
+        content: 'list_emails',
+      },
+      {
+        eid: 2,
+        type: 'activity',
+        activityId: 'act-5',
+        activityType: 'state_change',
+        agentId: 'lumen',
+        content: 'phase: reviewing',
+      },
+    ]);
+    const ledger = new ContextLedger();
+    const result = hydrateLedgerFromTranscript(ledger, transcriptPath, 'myra');
+    expect(result.tailPreview).toHaveLength(0);
+    // Still in the ledger (context) and marked seen, as before.
+    expect(result.seenActivityIds).toEqual(expect.arrayContaining(['act-4', 'act-5']));
+  });
+});
+
 describe('findLastDetectedModel — persisted provider model recovery', () => {
   let dir: string;
   let transcriptPath: string;

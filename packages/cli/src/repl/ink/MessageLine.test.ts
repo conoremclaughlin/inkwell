@@ -144,19 +144,25 @@ describe('splitLeadingMarker', () => {
 });
 
 describe('centerGutterMarker', () => {
-  it('centers single-width glyphs at the middle gutter column', () => {
+  it('centers single-width TEXT glyphs at the middle gutter column', () => {
     expect(centerGutterMarker('❯')).toBe(' ❯');
     expect(centerGutterMarker('✦')).toBe(' ✦');
     expect(centerGutterMarker('∗')).toBe(' ∗');
     expect(centerGutterMarker('✓')).toBe(' ✓');
     expect(centerGutterMarker('✻')).toBe(' ✻');
-    expect(centerGutterMarker('🛠')).toBe(' 🛠'); // string-width measures 1
   });
 
-  it('leaves double-width emoji at column 0 — they already fill the gutter', () => {
+  it('keeps ALL pictographic glyphs at column 0 — a rendered-wide emoji must never touch the text', () => {
+    // Measured 2 by string-width:
     expect(centerGutterMarker('📬')).toBe('📬');
     expect(centerGutterMarker('⚡')).toBe('⚡');
     expect(centerGutterMarker('💡')).toBe('💡');
+    // Measured 1 by string-width (text-presentation emoji) but rendered at
+    // 2 columns by most terminals — centering these by measured width butts
+    // them against the text (Conor, 2026-08-12 screenshot).
+    expect(centerGutterMarker('🛠')).toBe('🛠');
+    expect(centerGutterMarker('🗑')).toBe('🗑');
+    expect(centerGutterMarker('⚙')).toBe('⚙');
   });
 
   it('passes empty markers through untouched', () => {

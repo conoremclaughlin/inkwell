@@ -442,7 +442,10 @@ interface HistoryHydrationResult {
     role: 'user' | 'assistant' | 'inbox' | 'system' | 'event';
     content: string;
     ts?: string;
-    /** Display label for system entries (e.g., "heartbeat", "continuation") */
+    /**
+     * Display label override: system entries ("heartbeat", "continuation")
+     * and replayed platform messages ("📤 myra → telegram").
+     */
     label?: string;
     /** Transcript event id (for eviction filtering of the replay) */
     eid?: number;
@@ -992,6 +995,35 @@ export function hydrateLedgerFromTranscript(
       loaded += 1;
       if (typeof event.activityId === 'string') {
         seenActivityIds.add(event.activityId);
+      }
+      // Platform messages are real conversation: replay them as the same
+      // directional message blocks the live activity poll renders, so a
+      // reattached session shows what the agent actually SENT/received —
+      // not only the collapsed send_response receipt. Same classification
+      // as live; the recovered seenActivityIds above keep the live poll
+      // from rendering these again after reattach.
+      const plan = classifyActivity(
+        {
+          type: activityType,
+          subtype: typeof event.activitySubtype === 'string' ? event.activitySubtype : undefined,
+          agentId: typeof event.agentId === 'string' ? event.agentId : undefined,
+          platform: typeof event.platform === 'string' ? event.platform : undefined,
+        },
+        agentId ?? actor
+      );
+      if ((plan.mode === 'message-in' || plan.mode === 'message-out') && event.content.trim()) {
+        pushPreview(
+          plan.role!,
+          event.content,
+          typeof event.createdAt === 'string'
+            ? event.createdAt
+            : typeof event.ts === 'string'
+              ? event.ts
+              : undefined,
+          plan.label,
+          eid
+        );
+        messageCount += 1;
       }
     }
   }
@@ -4268,6 +4300,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
         sessionId: activity.sessionId || null,
         createdAt: activity.createdAt || null,
         content: activity.content || null,
+        // Needed at replay: hydration re-classifies the entry to rebuild the
+        // directional message label (📤 myra → telegram).
+        platform: activity.platform || null,
       });
       // Tiered rendering: platform messages are real conversation and get
       // proper message blocks; the agent's own mechanics (tools, state,
@@ -5844,11 +5879,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
               : entry.role === 'system'
                 ? ('system' as const)
                 : ('inbox' as const);
+        // Replayed platform messages carry their own directional label
+        // (📤 myra → telegram) — same as the live activity rendering.
         const label =
           entry.role === 'user'
-            ? 'you'
+            ? entry.label || 'you'
             : entry.role === 'assistant'
-              ? agentId
+              ? entry.label || agentId
               : entry.role === 'system'
                 ? entry.label || 'system'
                 : '📬 inbox';

@@ -246,8 +246,9 @@ describe('MessageLine rendering', () => {
     // Body rows sit at the content column, aligned under the heading text
     expect(lines).toContainEqual(expect.stringMatching(/^ {3}hello there/));
     expect(lines).toContainEqual(expect.stringMatching(/^ {3}hi back/));
-    // Event marker centered in the gutter (🛠 measures 1), text at column 3
-    expect(lines).toContainEqual(expect.stringMatching(/^ 🛠 +myra · send_response/));
+    // Pictographic event markers stay at column 0 — terminals render them
+    // 2 wide whatever string-width says, so column 0 guarantees a gap
+    expect(lines).toContainEqual(expect.stringMatching(/^🛠 +myra · send_response/));
   });
 
   it('renders a blank row between the heading and the body', () => {
