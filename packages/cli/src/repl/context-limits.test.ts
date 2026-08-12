@@ -10,14 +10,19 @@ import {
 } from './context-limits.js';
 
 describe('resolveModelContextWindow', () => {
-  it('resolves Claude families to the conservative 200K window', () => {
+  it('resolves older Claude families to the conservative 200K window', () => {
     expect(resolveModelContextWindow('claude', 'claude-opus-4-8')).toBe(200_000);
-    expect(resolveModelContextWindow('claude', 'claude-opus-5')).toBe(200_000);
     expect(resolveModelContextWindow('claude', 'claude-sonnet-5')).toBe(200_000);
     expect(resolveModelContextWindow('claude', 'claude-haiku-4-5-20251001')).toBe(200_000);
-    expect(resolveModelContextWindow('claude', 'claude-fable-5')).toBe(200_000);
     // Unknown claude-* still matches the generic family entry.
     expect(resolveModelContextWindow('claude', 'claude-something-new')).toBe(200_000);
+  });
+
+  it('resolves Fable 5 / Opus 5 to their 1M windows (Conor, 2026-08-12)', () => {
+    expect(resolveModelContextWindow('claude', 'claude-fable-5')).toBe(1_000_000);
+    expect(resolveModelContextWindow('claude', 'claude-opus-5')).toBe(1_000_000);
+    // The longest-prefix rule keeps opus-4-x on the conservative family entry.
+    expect(resolveModelContextWindow('claude', 'claude-opus-4-6')).toBe(200_000);
   });
 
   it('resolves gemini to a 1M window', () => {
@@ -77,9 +82,10 @@ describe('contextBudgetForWindow', () => {
     expect(contextBudgetForWindow(200_000)).toBe(170_000);
   });
 
-  it('applies the global cap for large (1M+) windows', () => {
-    // floor(0.85 * 1M)=850K is above the cap → capped at 200K
-    expect(contextBudgetForWindow(1_000_000)).toBe(INK_WORKING_BUDGET_CAP);
+  it('gives 1M windows the full headroom slice; the cap only clips beyond 1M', () => {
+    // floor(0.85 * 1M) = 850K sits under the 1M cap → headroom binds.
+    expect(contextBudgetForWindow(1_000_000)).toBe(850_000);
+    // A hypothetical 2M window is where the absolute cap takes over.
     expect(contextBudgetForWindow(2_000_000)).toBe(INK_WORKING_BUDGET_CAP);
   });
 
@@ -141,6 +147,8 @@ describe('keystone safety invariant — ink compacts before the provider', () =>
   const KNOWN_REAL_WINDOWS: ReadonlyArray<readonly [string, string, number]> = [
     ['claude', 'claude-opus-4-8', 200_000],
     ['claude', 'claude-sonnet-5', 200_000],
+    ['claude', 'claude-fable-5', 1_000_000], // confirmed by Conor, 2026-08-12
+    ['claude', 'claude-opus-5', 1_000_000], // confirmed by Conor, 2026-08-12
     ['codex', 'codex-mini-latest', 200_000],
     ['codex', undefined as unknown as string, 200_000], // codex backend default
     ['gemini', 'gemini-2.0-flash', 1_000_000],

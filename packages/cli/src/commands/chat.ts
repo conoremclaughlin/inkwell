@@ -172,6 +172,12 @@ interface InboxMessage {
 interface ChatRuntime {
   backend: string;
   model?: string;
+  /**
+   * Model id the provider REPORTED for the live session (claude's
+   * `system`/`init` stream event). Used to resolve the real context window
+   * when no explicit --model / /model override is set; reset on /backend.
+   */
+  detectedModel?: string;
   verbose: boolean;
   toolMode: ToolMode;
   toolRouting: 'backend' | 'local';
@@ -1662,14 +1668,27 @@ function buildContextStatusSummary(params: {
   const bootstrapTokens = params.bootstrapTokens || 0;
   const total = transcriptTokens + bootstrapTokens;
   const pct = params.maxContextTokens > 0 ? (total / params.maxContextTokens) * 100 : 0;
-  const queue = params.pendingTurns > 0 ? `queue:${params.pendingTurns}` : 'queue:idle';
+  const queue = params.pendingTurns > 0 ? `queue:${params.pendingTurns}` : 'idle';
+  // Compact — this shares the bottom bar with cwd/branch. transcript+identity
+  // breakdown stays visible in k-notation; full numbers live in Ctrl+O.
   const breakdown =
     bootstrapTokens > 0
-      ? `${transcriptTokens.toLocaleString()} transcript + ${bootstrapTokens.toLocaleString()} identity`
-      : `${total.toLocaleString()}`;
-  return `${breakdown} / ${params.maxContextTokens.toLocaleString()} (${pct.toFixed(
-    1
-  )}%) ${queue} provider:${params.backend}`;
+      ? `${compactTokens(transcriptTokens)}+${compactTokens(bootstrapTokens)}`
+      : compactTokens(total);
+  return `${breakdown}/${compactTokens(params.maxContextTokens)} (${pct.toFixed(1)}%)  ·  ${queue}  ·  ${params.backend}`;
+}
+
+/** 12_735 → '12.7k', 850_000 → '850k', 1_000_000 → '1M' — bar-sized numbers. */
+function compactTokens(value: number): string {
+  if (value >= 1_000_000) {
+    const m = value / 1_000_000;
+    return `${Number.isInteger(m) ? m : m.toFixed(1)}M`;
+  }
+  if (value >= 1_000) {
+    const k = value / 1_000;
+    return `${k >= 100 || Number.isInteger(k) ? Math.round(k) : k.toFixed(1)}k`;
+  }
+  return String(value);
 }
 
 function formatUsageLines(
@@ -2836,6 +2855,24 @@ export async function runChat(options: ChatOptions): Promise<void> {
         preview: compactForLedger(evt.text, 200),
       });
       renderStreamedLines(streamRenderer.completeMessage(evt.text));
+    } else if (evt.kind === 'model' && evt.model !== runtime.detectedModel) {
+      // The provider announced the model actually serving the session — the
+      // ground truth for the context window. Re-resolve unless the user
+      // pinned a model explicitly (then their pin already drove resolution).
+      runtime.detectedModel = evt.model;
+      const window = resolveBackendTokenWindow(runtime.backend, runtime.model ?? evt.model);
+      if (window !== runtime.backendTokenWindow) {
+        runtime.backendTokenWindow = window;
+        if (contextBudgetAuto) {
+          runtime.maxContextTokens = defaultContextBudget(window);
+        }
+        printEvent(
+          chalk.dim(
+            `⚙ ${evt.model} · window ${formatTokenCount(window)} · budget ${formatTokenCount(runtime.maxContextTokens)} tok`
+          )
+        );
+        emitStatusLaneIfChanged(true);
+      }
     }
   };
 
@@ -6059,6 +6096,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
             break;
           }
           runtime.backend = next;
+          // Detection belongs to the previous provider's session.
+          runtime.detectedModel = undefined;
           runtime.backendTokenWindow = resolveBackendTokenWindow(runtime.backend, runtime.model);
           if (contextBudgetAuto) {
             runtime.maxContextTokens = defaultContextBudget(runtime.backendTokenWindow);
@@ -6075,7 +6114,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
         case 'model': {
           const next = slash.args[0];
           runtime.model = next || undefined;
-          runtime.backendTokenWindow = resolveBackendTokenWindow(runtime.backend, runtime.model);
+          runtime.backendTokenWindow = resolveBackendTokenWindow(
+            runtime.backend,
+            runtime.model ?? runtime.detectedModel
+          );
           if (contextBudgetAuto) {
             runtime.maxContextTokens = defaultContextBudget(runtime.backendTokenWindow);
           }

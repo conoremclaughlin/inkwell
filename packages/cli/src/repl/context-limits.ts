@@ -30,12 +30,16 @@
 export const PROVIDER_HEADROOM_PCT = 0.85;
 
 /**
- * ink's working budget is also hard-capped here regardless of window: a
- * deliberately smaller slice than a huge (1M/2M) window so turns stay tight and
- * argv size / latency don't degrade before we ever approach the provider's
- * trigger. This is the historical DEFAULT_MAX_CONTEXT_TOKENS.
+ * Absolute ceiling on ink's working budget regardless of window. Historically
+ * 200K (DEFAULT_MAX_CONTEXT_TOKENS) to bound argv size and reseed latency;
+ * raised to 1M on Conor's direction (2026-08-12) so 1M-window models get
+ * 1M-class budgets — prompt delivery is via stdin (backends/claude.ts), so
+ * there is no argv ceiling, and the reseed-latency trade is accepted. The
+ * PROVIDER_HEADROOM_PCT slice still binds first for every real window ≤ 1M
+ * (e.g. a 1M window yields an 850K working budget); the cap only clips
+ * hypothetical 2M-window models.
  */
-export const INK_WORKING_BUDGET_CAP = 200_000;
+export const INK_WORKING_BUDGET_CAP = 1_000_000;
 
 /**
  * Fallback window for a model we don't recognize. A SAFE default: small enough
@@ -51,15 +55,18 @@ export const DEFAULT_MODEL_CONTEXT_WINDOW = 200_000;
  * purpose (see file header). Add new / smaller-window models here.
  */
 export const MODEL_CONTEXT_WINDOWS: ReadonlyArray<readonly [string, number]> = [
-  // Anthropic / Claude Code. Standard API window is 200K across Opus / Sonnet /
-  // Haiku / Fable. Sonnet's 1M beta is intentionally NOT assumed — Claude Code
+  // Anthropic / Claude Code. Fable 5 and Opus 5 carry 1M windows (confirmed by
+  // Conor, 2026-08-12 — task 6725439e); older Opus / Sonnet / Haiku stay at the
+  // standard 200K. Sonnet's 1M beta is intentionally NOT assumed — Claude Code
   // does not enable it by default, and assuming 200K keeps ink safely ahead.
-  // Kept as family entries (not one `claude-` line) so bumping a single family
-  // to a larger window later is a one-line change.
+  // Sessions normally resolve through the stream-reported model id (the
+  // `system`/`init` event), so these prefixes match REAL model ids, not
+  // guesses from backend defaults.
+  ['claude-opus-5', 1_000_000],
   ['claude-opus', 200_000],
   ['claude-sonnet', 200_000],
   ['claude-haiku', 200_000],
-  ['claude-fable', 200_000],
+  ['claude-fable', 1_000_000],
   ['claude-', 200_000],
 
   // OpenAI / codex. GPT-5 / GPT-5-Codex carry large windows; 256K is a
