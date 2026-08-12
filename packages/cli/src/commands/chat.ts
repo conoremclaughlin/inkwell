@@ -20,6 +20,7 @@ import {
   saveRuntimePreferences,
   type RuntimePreferences,
 } from '../backends/identity.js';
+import { promptTransportFor } from '../backends/index.js';
 import { PcpClient } from '../lib/pcp-client.js';
 import { initSbDebug, sbDebugLog } from '../lib/sb-debug.js';
 import {
@@ -2406,6 +2407,44 @@ export function findLastBackendSession(
   return found;
 }
 
+/**
+ * Recover the provider-reported model persisted by a prior process
+ * (`model_detected` transcript entries, written on the stream's init event).
+ * Backend-scoped: a model detected under a different backend (session
+ * switched via /backend) must not drive this backend's window. Last entry
+ * wins. Applied on reattach BEFORE any budget enforcement so a 1M-window
+ * session is never destructively compacted at the conservative default
+ * budget (Lumen, PR #477 review — finding 2).
+ */
+export function findLastDetectedModel(transcriptPath: string, backend: string): string | undefined {
+  if (!transcriptPath || !existsSync(transcriptPath)) return undefined;
+  let content: string;
+  try {
+    content = readFileSync(transcriptPath, 'utf-8');
+  } catch {
+    return undefined;
+  }
+  let found: string | undefined;
+  for (const line of content.split('\n')) {
+    if (!line.trim()) continue;
+    let event: { type?: unknown; backend?: unknown; model?: unknown };
+    try {
+      event = JSON.parse(line) as { type?: unknown; backend?: unknown; model?: unknown };
+    } catch {
+      continue;
+    }
+    if (
+      event.type === 'model_detected' &&
+      event.backend === backend &&
+      typeof event.model === 'string' &&
+      event.model
+    ) {
+      found = event.model;
+    }
+  }
+  return found;
+}
+
 function buildPromptEnvelope(
   agentId: string,
   runtime: ChatRuntime,
@@ -2542,7 +2581,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
   const initialBackend = options.backend || 'claude';
   const initialBackendTokenWindow = resolveBackendTokenWindow(initialBackend, options.model);
   const configuredMaxContextTokens = Number.parseInt(
-    options.maxContextTokens || String(defaultContextBudget(initialBackendTokenWindow)),
+    options.maxContextTokens ||
+      String(defaultContextBudget(initialBackendTokenWindow, promptTransportFor(initialBackend))),
     10
   );
   const parsedBackendTimeoutSeconds =
@@ -2588,7 +2628,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     backendTokenWindow: initialBackendTokenWindow,
     sessionId: options.sessionId?.trim() || undefined,
     maxContextTokens: Number.isNaN(configuredMaxContextTokens)
-      ? defaultContextBudget(initialBackendTokenWindow)
+      ? defaultContextBudget(initialBackendTokenWindow, promptTransportFor(initialBackend))
       : configuredMaxContextTokens,
     pollSeconds: Number.parseInt(options.pollSeconds || '20', 10),
     showSessionsWatch: false,
@@ -2860,11 +2900,23 @@ export async function runChat(options: ChatOptions): Promise<void> {
       // ground truth for the context window. Re-resolve unless the user
       // pinned a model explicitly (then their pin already drove resolution).
       runtime.detectedModel = evt.model;
+      // Persist so the NEXT process reattaching this session knows the real
+      // window BEFORE its first budget enforcement (destructive compaction
+      // must never run against the conservative default when the session's
+      // model is already known — Lumen, PR #477 review).
+      appendTranscript(runtime.transcriptPath, {
+        type: 'model_detected',
+        backend: runtime.backend,
+        model: evt.model,
+      });
       const window = resolveBackendTokenWindow(runtime.backend, runtime.model ?? evt.model);
       if (window !== runtime.backendTokenWindow) {
         runtime.backendTokenWindow = window;
         if (contextBudgetAuto) {
-          runtime.maxContextTokens = defaultContextBudget(window);
+          runtime.maxContextTokens = defaultContextBudget(
+            window,
+            promptTransportFor(runtime.backend)
+          );
         }
         printEvent(
           chalk.dim(
@@ -3214,6 +3266,25 @@ export async function runChat(options: ChatOptions): Promise<void> {
   let historyHydration: HistoryHydrationResult | null = null;
   if (attachedToExistingSession && existingTranscript) {
     const hydrated = hydrateLedgerFromTranscript(ledger, existingTranscript, agentId);
+    // Recover the provider-reported model persisted by the prior process
+    // BEFORE any budget enforcement runs: a reattached large transcript must
+    // be judged against the session's REAL window, not the conservative
+    // default that stands in until this process's own init event arrives.
+    // An explicit --model override still wins.
+    const persistedModel = findLastDetectedModel(existingTranscript, runtime.backend);
+    if (persistedModel && !runtime.model) {
+      runtime.detectedModel = persistedModel;
+      const recoveredWindow = resolveBackendTokenWindow(runtime.backend, persistedModel);
+      if (recoveredWindow !== runtime.backendTokenWindow) {
+        runtime.backendTokenWindow = recoveredWindow;
+        if (contextBudgetAuto) {
+          runtime.maxContextTokens = defaultContextBudget(
+            recoveredWindow,
+            promptTransportFor(runtime.backend)
+          );
+        }
+      }
+    }
     // Resume the provider session the prior process left live (delta only),
     // unless a compaction/eviction rolled it — then the next turn seeds fresh.
     if (runtime.backend === 'claude') {
@@ -3687,6 +3758,23 @@ export async function runChat(options: ChatOptions): Promise<void> {
     const effectiveBudget = Math.max(1, runtime.maxContextTokens - bootstrapReserve);
     const threshold = Math.floor(effectiveBudget * AUTO_COMPACT_THRESHOLD_PCT);
     if (ledger.totalTokens() <= threshold) return;
+
+    // Claude reports its model on the first turn's init event, which may
+    // RAISE the budget (1M-window models). Until that arrives — legacy
+    // transcripts predate model_detected persistence — compacting would
+    // irreversibly destroy history that the real budget may comfortably
+    // hold. Defer: this fires at most once (the first pre-turn check); the
+    // init event lands during that turn and enforcement resumes with the
+    // real window (Lumen, PR #477 review — finding 2).
+    if (
+      runtime.backend === 'claude' &&
+      !runtime.model &&
+      !runtime.detectedModel &&
+      contextBudgetAuto
+    ) {
+      printEvent(chalk.dim('⛁ Compaction deferred — waiting for the provider to report its model'));
+      return;
+    }
 
     const entries = ledger.listEntries();
     const cutoff = Math.max(0, entries.length - AUTO_COMPACT_KEEP_RECENT_ENTRIES);
@@ -6100,7 +6188,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
           runtime.detectedModel = undefined;
           runtime.backendTokenWindow = resolveBackendTokenWindow(runtime.backend, runtime.model);
           if (contextBudgetAuto) {
-            runtime.maxContextTokens = defaultContextBudget(runtime.backendTokenWindow);
+            runtime.maxContextTokens = defaultContextBudget(
+              runtime.backendTokenWindow,
+              promptTransportFor(runtime.backend)
+            );
           }
           const backendLines = [`Switched backend to ${next}`];
           if (contextBudgetAuto) {
@@ -6119,7 +6210,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
             runtime.model ?? runtime.detectedModel
           );
           if (contextBudgetAuto) {
-            runtime.maxContextTokens = defaultContextBudget(runtime.backendTokenWindow);
+            runtime.maxContextTokens = defaultContextBudget(
+              runtime.backendTokenWindow,
+              promptTransportFor(runtime.backend)
+            );
           }
           showInPanel([
             `Model override: ${runtime.model || '(backend default)'}`,

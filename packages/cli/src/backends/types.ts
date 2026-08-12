@@ -92,6 +92,17 @@ export interface BackendAdapter {
   readonly binary: string;
 
   /**
+   * How the FULL prompt reaches the provider process. 'stdin' has no size
+   * ceiling; 'argv' passes the prompt as a positional argument and is bounded
+   * by the OS ARG_MAX (~1MB total on macOS) — context budgets for argv
+   * transports must stay small enough that a full reseed prompt can never
+   * exceed it (see ARGV_TRANSPORT_BUDGET_CAP in repl/context-limits.ts).
+   * Migrating an adapter to stdin delivery is what unlocks large-window
+   * budgets for its backend.
+   */
+  readonly promptTransport: 'stdin' | 'argv';
+
+  /**
    * Prepare everything needed to spawn the backend process.
    * Writes temp files for identity injection, builds args, sets env vars.
    * Returns a cleanup function to remove temp files on exit.

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  ARGV_TRANSPORT_BUDGET_CAP,
   DEFAULT_MODEL_CONTEXT_WINDOW,
   INK_WORKING_BUDGET_CAP,
   MODEL_CONTEXT_WINDOWS,
@@ -23,6 +24,10 @@ describe('resolveModelContextWindow', () => {
     expect(resolveModelContextWindow('claude', 'claude-opus-5')).toBe(1_000_000);
     // The longest-prefix rule keeps opus-4-x on the conservative family entry.
     expect(resolveModelContextWindow('claude', 'claude-opus-4-6')).toBe(200_000);
+    // Only Fable 5 is CONFIRMED at 1M — an unknown future fable version falls
+    // back to the conservative family entry until verified (Lumen, PR #477).
+    expect(resolveModelContextWindow('claude', 'claude-fable-6')).toBe(200_000);
+    expect(resolveModelContextWindow('claude', 'claude-fable')).toBe(200_000);
   });
 
   it('resolves gemini to a 1M window', () => {
@@ -78,24 +83,37 @@ describe('resolveModelContextWindow', () => {
 
 describe('contextBudgetForWindow', () => {
   it('applies provider headroom below the cap for a 200K window', () => {
-    // min(200K cap, floor(0.85 * 200K)=170K) → 170K
-    expect(contextBudgetForWindow(200_000)).toBe(170_000);
+    // min(cap, floor(0.85 * 200K)=170K) → 170K on either transport
+    expect(contextBudgetForWindow(200_000, 'stdin')).toBe(170_000);
+    expect(contextBudgetForWindow(200_000, 'argv')).toBe(170_000);
   });
 
-  it('gives 1M windows the full headroom slice; the cap only clips beyond 1M', () => {
-    // floor(0.85 * 1M) = 850K sits under the 1M cap → headroom binds.
-    expect(contextBudgetForWindow(1_000_000)).toBe(850_000);
+  it('gives 1M windows the full headroom slice on stdin transports', () => {
+    // floor(0.85 * 1M) = 850K sits under the 1M stdin cap → headroom binds.
+    expect(contextBudgetForWindow(1_000_000, 'stdin')).toBe(850_000);
     // A hypothetical 2M window is where the absolute cap takes over.
-    expect(contextBudgetForWindow(2_000_000)).toBe(INK_WORKING_BUDGET_CAP);
+    expect(contextBudgetForWindow(2_000_000, 'stdin')).toBe(INK_WORKING_BUDGET_CAP);
+  });
+
+  it('caps ARGV transports at the ARG_MAX-safe ceiling regardless of window', () => {
+    // Gemini's 1M window must NOT produce a multi-MB `-p <prompt>` argv
+    // (Lumen, PR #477 review — finding 1): argv budgets stay at 200K.
+    expect(contextBudgetForWindow(1_000_000, 'argv')).toBe(ARGV_TRANSPORT_BUDGET_CAP);
+    expect(contextBudgetForWindow(2_000_000, 'argv')).toBe(ARGV_TRANSPORT_BUDGET_CAP);
   });
 
   it('applies headroom for sub-200K windows', () => {
-    expect(contextBudgetForWindow(128_000)).toBe(Math.floor(128_000 * PROVIDER_HEADROOM_PCT));
+    expect(contextBudgetForWindow(128_000, 'stdin')).toBe(
+      Math.floor(128_000 * PROVIDER_HEADROOM_PCT)
+    );
+    expect(contextBudgetForWindow(128_000, 'argv')).toBe(
+      Math.floor(128_000 * PROVIDER_HEADROOM_PCT)
+    );
   });
 
   it('never returns a non-positive budget for tiny windows', () => {
-    expect(contextBudgetForWindow(1)).toBe(1);
-    expect(contextBudgetForWindow(0)).toBe(1);
+    expect(contextBudgetForWindow(1, 'stdin')).toBe(1);
+    expect(contextBudgetForWindow(0, 'argv')).toBe(1);
   });
 });
 
@@ -107,15 +125,21 @@ describe('keystone safety invariant — ink compacts before the provider', () =>
 
   // Representative real windows across every provider family we support.
   const windows = [128_000, 200_000, 256_000, 1_000_000, 2_000_000];
+  const TRANSPORTS = ['stdin', 'argv'] as const;
+  // Mirrors each adapter's declared promptTransport (pinned in
+  // adapters.test.ts): claude streams via stdin; codex/gemini ride argv.
+  const BACKEND_TRANSPORT = { claude: 'stdin', codex: 'argv', gemini: 'argv' } as const;
 
   it('keeps ink’s ENTIRE working budget within the provider-headroom slice', () => {
     for (const w of windows) {
-      const budget = contextBudgetForWindow(w);
-      // Budget never exceeds the fraction of the window at which we assume the
-      // provider might begin its own auto-compaction.
-      expect(budget).toBeLessThanOrEqual(Math.floor(w * PROVIDER_HEADROOM_PCT));
-      // And of course never exceeds the raw window.
-      expect(budget).toBeLessThan(w);
+      for (const transport of TRANSPORTS) {
+        const budget = contextBudgetForWindow(w, transport);
+        // Budget never exceeds the fraction of the window at which we assume
+        // the provider might begin its own auto-compaction.
+        expect(budget).toBeLessThanOrEqual(Math.floor(w * PROVIDER_HEADROOM_PCT));
+        // And of course never exceeds the raw window.
+        expect(budget).toBeLessThan(w);
+      }
     }
   });
 
@@ -124,6 +148,7 @@ describe('keystone safety invariant — ink compacts before the provider', () =>
     // assert it fires before the provider would (headroom slice of the window).
     const models = [
       ['claude', 'claude-opus-4-8'],
+      ['claude', 'claude-fable-5'],
       ['claude', 'claude-sonnet-5'],
       ['claude', 'claude-haiku-4-5'],
       ['codex', 'gpt-5-codex'],
@@ -132,7 +157,7 @@ describe('keystone safety invariant — ink compacts before the provider', () =>
     ] as const;
     for (const [backend, model] of models) {
       const window = resolveModelContextWindow(backend, model);
-      const budget = contextBudgetForWindow(window);
+      const budget = contextBudgetForWindow(window, BACKEND_TRANSPORT[backend]);
       const inkCompactAt = budget * INK_COMPACT_THRESHOLD_PCT;
       const providerTriggerAt = window * PROVIDER_HEADROOM_PCT;
       expect(inkCompactAt).toBeLessThan(providerTriggerAt);
@@ -161,8 +186,12 @@ describe('keystone safety invariant — ink compacts before the provider', () =>
       expect(assumed, `${backend}/${model ?? '(default)'} assumed window`).toBeLessThanOrEqual(
         realWindow
       );
-      // And ink's whole budget must sit under the real provider trigger.
-      const budget = contextBudgetForWindow(assumed);
+      // And ink's whole budget must sit under the real provider trigger —
+      // on the backend's REAL transport.
+      const budget = contextBudgetForWindow(
+        assumed,
+        BACKEND_TRANSPORT[backend as keyof typeof BACKEND_TRANSPORT]
+      );
       expect(
         budget,
         `${backend}/${model ?? '(default)'} budget vs real headroom`
@@ -173,7 +202,8 @@ describe('keystone safety invariant — ink compacts before the provider', () =>
   it('every table window is positive and yields a positive budget', () => {
     for (const [prefix, window] of MODEL_CONTEXT_WINDOWS) {
       expect(window, `${prefix} window`).toBeGreaterThan(0);
-      expect(contextBudgetForWindow(window), `${prefix} budget`).toBeGreaterThan(0);
+      expect(contextBudgetForWindow(window, 'stdin'), `${prefix} budget`).toBeGreaterThan(0);
+      expect(contextBudgetForWindow(window, 'argv'), `${prefix} argv budget`).toBeGreaterThan(0);
     }
   });
 });

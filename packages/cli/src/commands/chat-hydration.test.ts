@@ -3,7 +3,11 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ContextLedger, entryRefHash } from '../repl/context-ledger.js';
-import { hydrateLedgerFromTranscript, formatTranscriptSize } from './chat.js';
+import {
+  findLastDetectedModel,
+  formatTranscriptSize,
+  hydrateLedgerFromTranscript,
+} from './chat.js';
 
 describe('hydrateLedgerFromTranscript — tool call replay', () => {
   let dir: string;
@@ -519,5 +523,49 @@ describe('hydrateLedgerFromTranscript — context_evict events', () => {
     const ledger = new ContextLedger();
     const result = hydrateLedgerFromTranscript(ledger, transcriptPath);
     expect(result.maxEid).toBe(12);
+  });
+});
+
+describe('findLastDetectedModel — persisted provider model recovery', () => {
+  let dir: string;
+  let transcriptPath: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'ink-model-detect-test-'));
+    transcriptPath = join(dir, 'session-model.jsonl');
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const write = (events: unknown[]) =>
+    writeFileSync(transcriptPath, events.map((e) => JSON.stringify(e)).join('\n') + '\n');
+
+  it('recovers the last model_detected entry for the backend', () => {
+    write([
+      { eid: 1, type: 'user_turn', content: 'hi' },
+      { eid: 2, type: 'model_detected', backend: 'claude', model: 'claude-opus-4-6' },
+      { eid: 3, type: 'model_detected', backend: 'claude', model: 'claude-fable-5' },
+    ]);
+    expect(findLastDetectedModel(transcriptPath, 'claude')).toBe('claude-fable-5');
+  });
+
+  it('ignores entries persisted under a DIFFERENT backend', () => {
+    // A /backend switch mid-session leaves the old provider's entry behind;
+    // it must not drive the new backend's window.
+    write([{ eid: 1, type: 'model_detected', backend: 'claude', model: 'claude-fable-5' }]);
+    expect(findLastDetectedModel(transcriptPath, 'codex')).toBeUndefined();
+  });
+
+  it('returns undefined for legacy transcripts, missing files, and malformed lines', () => {
+    write([{ eid: 1, type: 'user_turn', content: 'no model entry here' }]);
+    expect(findLastDetectedModel(transcriptPath, 'claude')).toBeUndefined();
+    expect(findLastDetectedModel(join(dir, 'nope.jsonl'), 'claude')).toBeUndefined();
+    writeFileSync(
+      transcriptPath,
+      'not json\n{"type":"model_detected","backend":"claude","model":42}\n'
+    );
+    expect(findLastDetectedModel(transcriptPath, 'claude')).toBeUndefined();
   });
 });

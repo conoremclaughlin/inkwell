@@ -30,16 +30,27 @@
 export const PROVIDER_HEADROOM_PCT = 0.85;
 
 /**
- * Absolute ceiling on ink's working budget regardless of window. Historically
- * 200K (DEFAULT_MAX_CONTEXT_TOKENS) to bound argv size and reseed latency;
- * raised to 1M on Conor's direction (2026-08-12) so 1M-window models get
- * 1M-class budgets — prompt delivery is via stdin (backends/claude.ts), so
- * there is no argv ceiling, and the reseed-latency trade is accepted. The
- * PROVIDER_HEADROOM_PCT slice still binds first for every real window ≤ 1M
- * (e.g. a 1M window yields an 850K working budget); the cap only clips
- * hypothetical 2M-window models.
+ * Absolute ceiling on ink's working budget for STDIN-transport backends.
+ * Historically 200K (DEFAULT_MAX_CONTEXT_TOKENS) for every backend; raised to
+ * 1M on Conor's direction (2026-08-12) so 1M-window models get 1M-class
+ * budgets — stdin delivery has no argv ceiling, and the reseed-latency trade
+ * is accepted. The PROVIDER_HEADROOM_PCT slice still binds first for every
+ * real window ≤ 1M (a 1M window yields an 850K working budget); this cap only
+ * clips hypothetical 2M-window models.
  */
 export const INK_WORKING_BUDGET_CAP = 1_000_000;
+
+/**
+ * Ceiling for ARGV-transport backends (codex `exec <prompt>`, gemini
+ * `-p <prompt>`): the full reseed prompt rides a single positional argument,
+ * bounded by the OS ARG_MAX (~1MB total on macOS). An 850K-token budget would
+ * produce multi-MB argv and fail the spawn outright (Lumen, PR #477 review —
+ * finding 1), so argv backends keep the historical 200K ceiling — at the 80%
+ * compaction threshold that is a ~680KB reseed, safely under ARG_MAX.
+ * Migrating an adapter to stdin delivery (BackendAdapter.promptTransport)
+ * is what unlocks the large cap for its backend.
+ */
+export const ARGV_TRANSPORT_BUDGET_CAP = 200_000;
 
 /**
  * Fallback window for a model we don't recognize. A SAFE default: small enough
@@ -62,11 +73,14 @@ export const MODEL_CONTEXT_WINDOWS: ReadonlyArray<readonly [string, number]> = [
   // Sessions normally resolve through the stream-reported model id (the
   // `system`/`init` event), so these prefixes match REAL model ids, not
   // guesses from backend defaults.
+  ['claude-fable-5', 1_000_000],
   ['claude-opus-5', 1_000_000],
   ['claude-opus', 200_000],
   ['claude-sonnet', 200_000],
   ['claude-haiku', 200_000],
-  ['claude-fable', 1_000_000],
+  // Only Fable 5 is CONFIRMED at 1M; unknown future fable versions fall back
+  // to the conservative family entry until verified (round DOWN — file header).
+  ['claude-fable', 200_000],
   ['claude-', 200_000],
 
   // OpenAI / codex. GPT-5 / GPT-5-Codex carry large windows; 256K is a
@@ -130,12 +144,16 @@ export function resolveModelContextWindow(backend: string, model?: string): numb
 }
 
 /**
- * ink's working budget for a given real window: the smaller of the global cap
- * and the provider-headroom slice of the window. This is what guarantees ink's
- * budget — and therefore its 80%-of-budget compaction point — sits below the
- * provider's own auto-compaction trigger.
+ * ink's working budget for a given real window: the smaller of the
+ * transport-specific cap and the provider-headroom slice of the window. The
+ * headroom slice is what guarantees ink's budget — and therefore its
+ * 80%-of-budget compaction point — sits below the provider's own
+ * auto-compaction trigger; the transport cap is what keeps argv-delivered
+ * reseed prompts under the OS ARG_MAX. Pass the ADAPTER's declared transport
+ * (backends: promptTransportFor), never a guess.
  */
-export function contextBudgetForWindow(window: number): number {
+export function contextBudgetForWindow(window: number, transport: 'stdin' | 'argv'): number {
+  const cap = transport === 'stdin' ? INK_WORKING_BUDGET_CAP : ARGV_TRANSPORT_BUDGET_CAP;
   const headroom = Math.floor(window * PROVIDER_HEADROOM_PCT);
-  return Math.max(1, Math.min(INK_WORKING_BUDGET_CAP, headroom));
+  return Math.max(1, Math.min(cap, headroom));
 }
