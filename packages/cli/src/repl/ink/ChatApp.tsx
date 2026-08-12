@@ -2,7 +2,7 @@ import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { Box, Static, Text, useApp } from 'ink';
 import { ContextViewer } from './context-viewer.js';
 import { Dock } from './Dock.js';
-import { MessageLine, type MessageLineProps } from './MessageLine.js';
+import { GUTTER_WIDTH, MessageLine, type MessageLineProps } from './MessageLine.js';
 import { formatNow } from '../tui-components.js';
 
 const WAITING_VERBS = [
@@ -220,7 +220,9 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
   }, [ctrlCTimer]);
 
   const now = formatNow(timezone);
-  const promptLabel = '❯ ';
+  // The prompt marker occupies the same gutter column as message markers so
+  // input text lines up with message text (see GUTTER_WIDTH in MessageLine).
+  const promptLabel = '❯'.padEnd(GUTTER_WIDTH, ' ');
 
   const showingContext = contextViewLines !== null;
   const dockVisible = !showingContext && !dismissingContext;
@@ -307,8 +309,10 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
           onShowToolCalls={handleShowToolCalls}
           waitingElement={
             waiting ? (
-              <Box paddingLeft={3} marginTop={1} marginBottom={1}>
-                <Text color="cyan">{SPINNER_CHAR + ' '}</Text>
+              <Box marginTop={1} marginBottom={1}>
+                <Box width={GUTTER_WIDTH} flexShrink={0}>
+                  <Text color="cyan">{SPINNER_CHAR}</Text>
+                </Box>
                 <Text dimColor>{waitingVerb}...</Text>
               </Box>
             ) : undefined
