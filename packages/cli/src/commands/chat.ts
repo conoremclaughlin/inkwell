@@ -2440,12 +2440,48 @@ export function findLastDetectedModel(transcriptPath: string, backend: string): 
       event.model
     ) {
       found = event.model;
+    } else if (event.type === 'model_detection_reset' && event.backend === backend) {
+      // The model selection changed after this point (/model set or clear) —
+      // prior detection no longer describes what serves the session. A new
+      // model_detected entry after the reset re-establishes authority.
+      found = undefined;
     }
   }
   return found;
 }
 
-function buildPromptEnvelope(
+/**
+ * Apply a /model selection change (set OR clear). The previous model's
+ * detection is void the moment the selection changes — what actually serves
+ * the next turn is unknown until its init event reports it — so detection is
+ * invalidated BOTH in memory and in the transcript (a `model_detection_reset`
+ * entry, so a process reattaching before the next init cannot recover stale
+ * authority). The window/budget recompute from the explicit model alone puts
+ * the session back in the conservative state, where the pre-detection
+ * compaction deferral protects large histories until the truth arrives
+ * (Lumen, PR #477 round 2 — finding 2).
+ */
+export function applyModelSelection(
+  runtime: ChatRuntime,
+  next: string | undefined,
+  contextBudgetAuto: boolean
+): void {
+  runtime.model = next;
+  runtime.detectedModel = undefined;
+  appendTranscript(runtime.transcriptPath, {
+    type: 'model_detection_reset',
+    backend: runtime.backend,
+  });
+  runtime.backendTokenWindow = resolveBackendTokenWindow(runtime.backend, runtime.model);
+  if (contextBudgetAuto) {
+    runtime.maxContextTokens = defaultContextBudget(
+      runtime.backendTokenWindow,
+      promptTransportFor(runtime.backend)
+    );
+  }
+}
+
+export function buildPromptEnvelope(
   agentId: string,
   runtime: ChatRuntime,
   ledger: ContextLedger,
@@ -2517,6 +2553,12 @@ export function envelopeShapeKey(runtime: ChatRuntime): string {
   const shape = [
     runtime.backend,
     runtime.model ?? '',
+    // The packing budget: a session seeded under a smaller budget holds only
+    // that slice of history. When model detection RAISES the budget
+    // (170K → 850K), delta turns can never retrofit the omitted older history
+    // into the live session — the drift this causes here makes the next turn
+    // reseed with the wider envelope (Lumen, PR #477 round 2 — finding 1).
+    String(runtime.maxContextTokens),
     runtime.toolMode,
     runtime.toolRouting,
     runtime.strictTools ? '1' : '0',
@@ -6204,17 +6246,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         }
         case 'model': {
           const next = slash.args[0];
-          runtime.model = next || undefined;
-          runtime.backendTokenWindow = resolveBackendTokenWindow(
-            runtime.backend,
-            runtime.model ?? runtime.detectedModel
-          );
-          if (contextBudgetAuto) {
-            runtime.maxContextTokens = defaultContextBudget(
-              runtime.backendTokenWindow,
-              promptTransportFor(runtime.backend)
-            );
-          }
+          applyModelSelection(runtime, next || undefined, contextBudgetAuto);
           showInPanel([
             `Model override: ${runtime.model || '(backend default)'}`,
             `Backend window: ${formatTokenCount(runtime.backendTokenWindow)} tok`,

@@ -1,8 +1,16 @@
 import { describe, it, expect, afterEach } from 'vitest';
-import { mkdtempSync, writeFileSync, rmSync } from 'fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { isResumeFailedNoSession, findLastBackendSession, envelopeShapeKey } from './chat.js';
+import {
+  applyModelSelection,
+  buildPromptEnvelope,
+  envelopeShapeKey,
+  findLastBackendSession,
+  findLastDetectedModel,
+  isResumeFailedNoSession,
+} from './chat.js';
+import { ContextLedger } from '../repl/context-ledger.js';
 
 /**
  * Stage 2A — across-turn provider session reuse.
@@ -397,6 +405,7 @@ describe('envelopeShapeKey (real function)', () => {
   const base = {
     backend: 'claude',
     model: 'claude-sonnet-5',
+    maxContextTokens: 170_000,
     toolMode: 'backend',
     toolRouting: 'local',
     strictTools: false,
@@ -424,5 +433,146 @@ describe('envelopeShapeKey (real function)', () => {
     expect(key({ activeSkills: [{ name: 'skill-a' }] })).not.toBe(b);
     expect(key({ threadKey: 'pr:1' })).not.toBe(b);
     expect(key({ bootstrapContext: 'different identity context' })).not.toBe(b);
+  });
+
+  it('changes when the packing budget changes (detection raised it → reseed)', () => {
+    expect(key({ maxContextTokens: 850_000 })).not.toBe(key({ maxContextTokens: 170_000 }));
+  });
+});
+
+describe('budget-rise reseed flow — >170K history is un-stranded (PR #477 round 2)', () => {
+  type RT = Parameters<typeof buildPromptEnvelope>[1];
+
+  it('the raised budget widens the seed envelope AND drifts the shape key', () => {
+    // ~300K tokens of history: a legacy large-window transcript reattached
+    // before this process has seen an init event.
+    const ledger = new ContextLedger();
+    const marker = (i: number) => `HISTORY-ENTRY-${i}-MARKER`;
+    for (let i = 0; i < 10; i++) {
+      ledger.addEntry('user', `${marker(i)} ${'x'.repeat(120_000)}`);
+    }
+
+    const rt = {
+      backend: 'claude',
+      model: undefined,
+      maxContextTokens: 170_000,
+      toolMode: 'backend',
+      toolRouting: 'backend',
+      strictTools: false,
+      threadKey: undefined,
+      activeSkills: [],
+      bootstrapContext: undefined,
+    } as unknown as RT;
+
+    // Seeded at the conservative default: the oldest history does not fit.
+    const seeded = buildPromptEnvelope('wren', rt, ledger, 'hello');
+    expect(seeded).not.toContain(marker(0));
+    expect(seeded).toContain(marker(9));
+
+    // Init raises the budget (claude-fable-5 → 850K). The shape key MUST
+    // drift — that is what invalidates the live native session so the next
+    // turn reseeds instead of sending deltas that strand the older history.
+    const shapeBefore = envelopeShapeKey(rt);
+    rt.maxContextTokens = 850_000;
+    expect(envelopeShapeKey(rt)).not.toBe(shapeBefore);
+
+    // And the reseeded envelope now carries the previously omitted history.
+    const reseeded = buildPromptEnvelope('wren', rt, ledger, 'hello');
+    expect(reseeded).toContain(marker(0));
+    expect(reseeded).toContain(marker(9));
+  });
+});
+
+describe('applyModelSelection — /model transitions invalidate detection (PR #477 round 2)', () => {
+  type RT = Parameters<typeof applyModelSelection>[0];
+  let dir: string;
+  let transcriptPath: string;
+
+  const makeRuntime = (over: Record<string, unknown>): RT =>
+    ({
+      backend: 'claude',
+      model: undefined,
+      detectedModel: undefined,
+      backendTokenWindow: 200_000,
+      maxContextTokens: 170_000,
+      transcriptPath,
+      ...over,
+    }) as unknown as RT;
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const setup = () => {
+    dir = mkdtempSync(join(tmpdir(), 'ink-model-selection-test-'));
+    transcriptPath = join(dir, 'session.jsonl');
+  };
+
+  it('CLEARING the override drops to the conservative default and voids detection everywhere', () => {
+    setup();
+    // Prior state: explicit fable-5, init confirmed it, authority persisted.
+    writeFileSync(
+      transcriptPath,
+      JSON.stringify({ type: 'model_detected', backend: 'claude', model: 'claude-fable-5' }) + '\n'
+    );
+    const rt = makeRuntime({
+      model: 'claude-fable-5',
+      detectedModel: 'claude-fable-5',
+      backendTokenWindow: 1_000_000,
+      maxContextTokens: 850_000,
+    });
+
+    applyModelSelection(rt, undefined, true);
+
+    // The default model is UNKNOWN until the next init — conservative state.
+    expect(rt.model).toBeUndefined();
+    expect(rt.detectedModel).toBeUndefined();
+    expect(rt.backendTokenWindow).toBe(200_000);
+    expect(rt.maxContextTokens).toBe(170_000);
+    // Persisted authority is void too: a reattaching process must not
+    // recover the stale fable-5 entry.
+    expect(findLastDetectedModel(transcriptPath, 'claude')).toBeUndefined();
+  });
+
+  it('SETTING a large-window override raises the budget and voids the small-model detection', () => {
+    setup();
+    writeFileSync(
+      transcriptPath,
+      JSON.stringify({ type: 'model_detected', backend: 'claude', model: 'claude-opus-4-6' }) + '\n'
+    );
+    const rt = makeRuntime({ detectedModel: 'claude-opus-4-6' });
+
+    applyModelSelection(rt, 'claude-fable-5', true);
+
+    expect(rt.model).toBe('claude-fable-5');
+    expect(rt.detectedModel).toBeUndefined();
+    expect(rt.backendTokenWindow).toBe(1_000_000);
+    expect(rt.maxContextTokens).toBe(850_000);
+    expect(findLastDetectedModel(transcriptPath, 'claude')).toBeUndefined();
+  });
+
+  it('a NEW init event after the reset re-establishes persisted authority', () => {
+    setup();
+    const rt = makeRuntime({ detectedModel: 'claude-fable-5' });
+    applyModelSelection(rt, undefined, true);
+    expect(findLastDetectedModel(transcriptPath, 'claude')).toBeUndefined();
+
+    // The next turn's init reports the default model — appended AFTER the
+    // reset, so it wins.
+    writeFileSync(
+      transcriptPath,
+      readFileSync(transcriptPath, 'utf-8') +
+        JSON.stringify({ type: 'model_detected', backend: 'claude', model: 'claude-opus-4-6' }) +
+        '\n'
+    );
+    expect(findLastDetectedModel(transcriptPath, 'claude')).toBe('claude-opus-4-6');
+  });
+
+  it('respects an explicit --max-context-tokens (contextBudgetAuto=false)', () => {
+    setup();
+    const rt = makeRuntime({ maxContextTokens: 123_456 });
+    applyModelSelection(rt, 'claude-fable-5', false);
+    expect(rt.backendTokenWindow).toBe(1_000_000);
+    expect(rt.maxContextTokens).toBe(123_456);
   });
 });
