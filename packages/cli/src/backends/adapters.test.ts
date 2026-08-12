@@ -37,6 +37,22 @@ describe('buildIdentityPrompt conditional bootstrap', () => {
   });
 });
 
+describe('backend adapters prompt transport declarations', () => {
+  // Context budgeting depends on these (repl/context-limits.ts): stdin
+  // transports may take the large 1M cap; argv transports MUST stay at the
+  // ARG_MAX-safe 200K cap. Flipping one of these is a budget decision, not a
+  // refactor — an adapter may only declare 'stdin' when its prepare() really
+  // delivers the prompt via stdinData (Lumen, PR #477 review — finding 1).
+  it('claude delivers the prompt via stdin', () => {
+    expect(new ClaudeAdapter().promptTransport).toBe('stdin');
+  });
+
+  it('codex and gemini deliver the prompt via argv', () => {
+    expect(new CodexAdapter().promptTransport).toBe('argv');
+    expect(new GeminiAdapter().promptTransport).toBe('argv');
+  });
+});
+
 describe('backend adapters session resume wiring', () => {
   it('passes claude backendSessionId through --resume', () => {
     const adapter = new ClaudeAdapter();

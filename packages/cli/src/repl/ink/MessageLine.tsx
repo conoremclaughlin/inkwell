@@ -1,5 +1,6 @@
 import React from 'react';
 import { Box, Text } from 'ink';
+import stringWidth from 'string-width';
 
 export type MessageRole =
   | 'user'
@@ -51,6 +52,19 @@ const CONTENT_COLORS: Record<MessageRole, string | undefined> = {
   grant: 'green',
   event: 'gray',
 };
+
+/**
+ * Center a marker glyph within the gutter column: single-width glyphs
+ * (❯ ✦ ∗ ✓) sit in the middle column instead of hugging the left edge, while
+ * double-width emoji (📬 ⚡) keep their natural left position — a 2-col glyph
+ * already fills the 3-col gutter visually. Width is measured with the same
+ * string-width ink itself uses, so the pad never disagrees with layout.
+ */
+export function centerGutterMarker(marker: string): string {
+  if (!marker) return marker;
+  const pad = Math.max(0, Math.floor((GUTTER_WIDTH - stringWidth(marker)) / 2));
+  return ' '.repeat(pad) + marker;
+}
 
 /** Gutter glyph per role, used when the label carries no emoji of its own. */
 const ROLE_MARKERS: Record<MessageRole, string> = {
@@ -136,7 +150,7 @@ export const MessageLine = React.memo(function MessageLine({
     return (
       <Box>
         <Box width={GUTTER_WIDTH} flexShrink={0}>
-          <Text dimColor>{marker}</Text>
+          <Text dimColor>{centerGutterMarker(marker)}</Text>
         </Box>
         <Text dimColor wrap="truncate-end">
           {rest}
@@ -156,7 +170,9 @@ export const MessageLine = React.memo(function MessageLine({
   return (
     <Box marginTop={1}>
       <Box width={GUTTER_WIDTH} flexShrink={0}>
-        {!continuation && marker ? <Text color={labelColor}>{marker}</Text> : null}
+        {!continuation && marker ? (
+          <Text color={labelColor}>{centerGutterMarker(marker)}</Text>
+        ) : null}
       </Box>
       <Box flexDirection="column" flexGrow={1}>
         {/* Continuations (streamed paragraphs after the first) skip the

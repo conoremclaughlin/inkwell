@@ -20,6 +20,7 @@ import {
   saveRuntimePreferences,
   type RuntimePreferences,
 } from '../backends/identity.js';
+import { promptTransportFor } from '../backends/index.js';
 import { PcpClient } from '../lib/pcp-client.js';
 import { initSbDebug, sbDebugLog } from '../lib/sb-debug.js';
 import {
@@ -172,6 +173,12 @@ interface InboxMessage {
 interface ChatRuntime {
   backend: string;
   model?: string;
+  /**
+   * Model id the provider REPORTED for the live session (claude's
+   * `system`/`init` stream event). Used to resolve the real context window
+   * when no explicit --model / /model override is set; reset on /backend.
+   */
+  detectedModel?: string;
   verbose: boolean;
   toolMode: ToolMode;
   toolRouting: 'backend' | 'local';
@@ -1662,14 +1669,27 @@ function buildContextStatusSummary(params: {
   const bootstrapTokens = params.bootstrapTokens || 0;
   const total = transcriptTokens + bootstrapTokens;
   const pct = params.maxContextTokens > 0 ? (total / params.maxContextTokens) * 100 : 0;
-  const queue = params.pendingTurns > 0 ? `queue:${params.pendingTurns}` : 'queue:idle';
+  const queue = params.pendingTurns > 0 ? `queue:${params.pendingTurns}` : 'idle';
+  // Compact — this shares the bottom bar with cwd/branch. transcript+identity
+  // breakdown stays visible in k-notation; full numbers live in Ctrl+O.
   const breakdown =
     bootstrapTokens > 0
-      ? `${transcriptTokens.toLocaleString()} transcript + ${bootstrapTokens.toLocaleString()} identity`
-      : `${total.toLocaleString()}`;
-  return `${breakdown} / ${params.maxContextTokens.toLocaleString()} (${pct.toFixed(
-    1
-  )}%) ${queue} provider:${params.backend}`;
+      ? `${compactTokens(transcriptTokens)}+${compactTokens(bootstrapTokens)}`
+      : compactTokens(total);
+  return `${breakdown}/${compactTokens(params.maxContextTokens)} (${pct.toFixed(1)}%)  ·  ${queue}  ·  ${params.backend}`;
+}
+
+/** 12_735 → '12.7k', 850_000 → '850k', 1_000_000 → '1M' — bar-sized numbers. */
+function compactTokens(value: number): string {
+  if (value >= 1_000_000) {
+    const m = value / 1_000_000;
+    return `${Number.isInteger(m) ? m : m.toFixed(1)}M`;
+  }
+  if (value >= 1_000) {
+    const k = value / 1_000;
+    return `${k >= 100 || Number.isInteger(k) ? Math.round(k) : k.toFixed(1)}k`;
+  }
+  return String(value);
 }
 
 function formatUsageLines(
@@ -2377,17 +2397,144 @@ export function findLastBackendSession(
     } else if (
       event.type === 'compaction' ||
       event.type === 'context_evict' ||
-      event.type === 'context_trim'
+      event.type === 'context_trim' ||
+      event.type === 'context_budget_changed'
     ) {
-      // A context-boundary mutation rolled the provider session. Abandon any
-      // prior id — a backend_session marker after this point re-establishes it.
+      // A context-boundary mutation rolled the provider session — including a
+      // PACKING-WIDTH change from model detection: a session seeded at the
+      // old budget holds only that slice of history and must not be resumed
+      // at the new one (Lumen, PR #477 round 3). Abandon any prior id — a
+      // backend_session marker after this point re-establishes it.
       found = undefined;
     }
   }
   return found;
 }
 
-function buildPromptEnvelope(
+/**
+ * Recover the provider-reported model persisted by a prior process
+ * (`model_detected` transcript entries, written on the stream's init event).
+ * Backend-scoped: a model detected under a different backend (session
+ * switched via /backend) must not drive this backend's window. Last entry
+ * wins. Applied on reattach BEFORE any budget enforcement so a 1M-window
+ * session is never destructively compacted at the conservative default
+ * budget (Lumen, PR #477 review — finding 2).
+ */
+export function findLastDetectedModel(transcriptPath: string, backend: string): string | undefined {
+  if (!transcriptPath || !existsSync(transcriptPath)) return undefined;
+  let content: string;
+  try {
+    content = readFileSync(transcriptPath, 'utf-8');
+  } catch {
+    return undefined;
+  }
+  let found: string | undefined;
+  for (const line of content.split('\n')) {
+    if (!line.trim()) continue;
+    let event: { type?: unknown; backend?: unknown; model?: unknown };
+    try {
+      event = JSON.parse(line) as { type?: unknown; backend?: unknown; model?: unknown };
+    } catch {
+      continue;
+    }
+    if (
+      event.type === 'model_detected' &&
+      event.backend === backend &&
+      typeof event.model === 'string' &&
+      event.model
+    ) {
+      found = event.model;
+    } else if (event.type === 'model_detection_reset' && event.backend === backend) {
+      // The model selection changed after this point (/model set or clear) —
+      // prior detection no longer describes what serves the session. A new
+      // model_detected entry after the reset re-establishes authority.
+      found = undefined;
+    }
+  }
+  return found;
+}
+
+/**
+ * Apply a /model selection change (set OR clear). The previous model's
+ * detection is void the moment the selection changes — what actually serves
+ * the next turn is unknown until its init event reports it — so detection is
+ * invalidated BOTH in memory and in the transcript (a `model_detection_reset`
+ * entry, so a process reattaching before the next init cannot recover stale
+ * authority). The window/budget recompute from the explicit model alone puts
+ * the session back in the conservative state, where the pre-detection
+ * compaction deferral protects large histories until the truth arrives
+ * (Lumen, PR #477 round 2 — finding 2).
+ */
+export function applyModelSelection(
+  runtime: ChatRuntime,
+  next: string | undefined,
+  contextBudgetAuto: boolean
+): void {
+  runtime.model = next;
+  runtime.detectedModel = undefined;
+  appendTranscript(runtime.transcriptPath, {
+    type: 'model_detection_reset',
+    backend: runtime.backend,
+  });
+  runtime.backendTokenWindow = resolveBackendTokenWindow(runtime.backend, runtime.model);
+  if (contextBudgetAuto) {
+    applyBudgetForWindow(runtime, runtime.backendTokenWindow);
+  }
+}
+
+/**
+ * Apply a provider-REPORTED model (the stream's init event): remember it,
+ * persist it for cross-process recovery, and re-resolve the window/budget.
+ * When the packing budget changes, a `context_budget_changed` boundary is
+ * appended so a native session seeded at the OLD packing width is never
+ * resumed-by-recovery in a later process — a one-turn process can seed at
+ * 170K, detect Fable 5, and exit before the in-process shape drift gets a
+ * next turn to reseed; without the boundary, the next process would restore
+ * the 850K budget, recover the narrow-seeded session id, and delta into it
+ * forever, stranding the omitted history (Lumen, PR #477 round 3).
+ * findLastBackendSession treats the boundary like compaction/evict/trim
+ * markers: recovery is refused and the next turn seeds fresh at the new
+ * width (a post-detection reseed writes a new backend_session marker, which
+ * re-establishes recovery).
+ */
+export function applyDetectedModel(
+  runtime: ChatRuntime,
+  model: string,
+  contextBudgetAuto: boolean
+): { windowChanged: boolean } {
+  runtime.detectedModel = model;
+  appendTranscript(runtime.transcriptPath, {
+    type: 'model_detected',
+    backend: runtime.backend,
+    model,
+  });
+  const window = resolveBackendTokenWindow(runtime.backend, runtime.model ?? model);
+  if (window === runtime.backendTokenWindow) return { windowChanged: false };
+  runtime.backendTokenWindow = window;
+  if (contextBudgetAuto) {
+    applyBudgetForWindow(runtime, window);
+  }
+  return { windowChanged: true };
+}
+
+/**
+ * Recompute the AUTO working budget for a window and, when it actually
+ * changes, append the `context_budget_changed` boundary that severs
+ * cross-process recovery of native sessions seeded at the old packing width.
+ */
+function applyBudgetForWindow(runtime: ChatRuntime, window: number): void {
+  const previous = runtime.maxContextTokens;
+  runtime.maxContextTokens = defaultContextBudget(window, promptTransportFor(runtime.backend));
+  if (runtime.maxContextTokens !== previous) {
+    appendTranscript(runtime.transcriptPath, {
+      type: 'context_budget_changed',
+      from: previous,
+      to: runtime.maxContextTokens,
+    });
+  }
+}
+
+export function buildPromptEnvelope(
   agentId: string,
   runtime: ChatRuntime,
   ledger: ContextLedger,
@@ -2459,6 +2606,12 @@ export function envelopeShapeKey(runtime: ChatRuntime): string {
   const shape = [
     runtime.backend,
     runtime.model ?? '',
+    // The packing budget: a session seeded under a smaller budget holds only
+    // that slice of history. When model detection RAISES the budget
+    // (170K → 850K), delta turns can never retrofit the omitted older history
+    // into the live session — the drift this causes here makes the next turn
+    // reseed with the wider envelope (Lumen, PR #477 round 2 — finding 1).
+    String(runtime.maxContextTokens),
     runtime.toolMode,
     runtime.toolRouting,
     runtime.strictTools ? '1' : '0',
@@ -2523,7 +2676,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
   const initialBackend = options.backend || 'claude';
   const initialBackendTokenWindow = resolveBackendTokenWindow(initialBackend, options.model);
   const configuredMaxContextTokens = Number.parseInt(
-    options.maxContextTokens || String(defaultContextBudget(initialBackendTokenWindow)),
+    options.maxContextTokens ||
+      String(defaultContextBudget(initialBackendTokenWindow, promptTransportFor(initialBackend))),
     10
   );
   const parsedBackendTimeoutSeconds =
@@ -2569,7 +2723,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     backendTokenWindow: initialBackendTokenWindow,
     sessionId: options.sessionId?.trim() || undefined,
     maxContextTokens: Number.isNaN(configuredMaxContextTokens)
-      ? defaultContextBudget(initialBackendTokenWindow)
+      ? defaultContextBudget(initialBackendTokenWindow, promptTransportFor(initialBackend))
       : configuredMaxContextTokens,
     pollSeconds: Number.parseInt(options.pollSeconds || '20', 10),
     showSessionsWatch: false,
@@ -2836,6 +2990,19 @@ export async function runChat(options: ChatOptions): Promise<void> {
         preview: compactForLedger(evt.text, 200),
       });
       renderStreamedLines(streamRenderer.completeMessage(evt.text));
+    } else if (evt.kind === 'model' && evt.model !== runtime.detectedModel) {
+      // The provider announced the model actually serving the session — the
+      // ground truth for the context window. Re-resolve unless the user
+      // pinned a model explicitly (then their pin already drove resolution).
+      const { windowChanged } = applyDetectedModel(runtime, evt.model, contextBudgetAuto);
+      if (windowChanged) {
+        printEvent(
+          chalk.dim(
+            `⚙ ${evt.model} · window ${formatTokenCount(runtime.backendTokenWindow)} · budget ${formatTokenCount(runtime.maxContextTokens)} tok`
+          )
+        );
+        emitStatusLaneIfChanged(true);
+      }
     }
   };
 
@@ -3177,6 +3344,25 @@ export async function runChat(options: ChatOptions): Promise<void> {
   let historyHydration: HistoryHydrationResult | null = null;
   if (attachedToExistingSession && existingTranscript) {
     const hydrated = hydrateLedgerFromTranscript(ledger, existingTranscript, agentId);
+    // Recover the provider-reported model persisted by the prior process
+    // BEFORE any budget enforcement runs: a reattached large transcript must
+    // be judged against the session's REAL window, not the conservative
+    // default that stands in until this process's own init event arrives.
+    // An explicit --model override still wins.
+    const persistedModel = findLastDetectedModel(existingTranscript, runtime.backend);
+    if (persistedModel && !runtime.model) {
+      runtime.detectedModel = persistedModel;
+      const recoveredWindow = resolveBackendTokenWindow(runtime.backend, persistedModel);
+      if (recoveredWindow !== runtime.backendTokenWindow) {
+        runtime.backendTokenWindow = recoveredWindow;
+        if (contextBudgetAuto) {
+          runtime.maxContextTokens = defaultContextBudget(
+            recoveredWindow,
+            promptTransportFor(runtime.backend)
+          );
+        }
+      }
+    }
     // Resume the provider session the prior process left live (delta only),
     // unless a compaction/eviction rolled it — then the next turn seeds fresh.
     if (runtime.backend === 'claude') {
@@ -3650,6 +3836,23 @@ export async function runChat(options: ChatOptions): Promise<void> {
     const effectiveBudget = Math.max(1, runtime.maxContextTokens - bootstrapReserve);
     const threshold = Math.floor(effectiveBudget * AUTO_COMPACT_THRESHOLD_PCT);
     if (ledger.totalTokens() <= threshold) return;
+
+    // Claude reports its model on the first turn's init event, which may
+    // RAISE the budget (1M-window models). Until that arrives — legacy
+    // transcripts predate model_detected persistence — compacting would
+    // irreversibly destroy history that the real budget may comfortably
+    // hold. Defer: this fires at most once (the first pre-turn check); the
+    // init event lands during that turn and enforcement resumes with the
+    // real window (Lumen, PR #477 review — finding 2).
+    if (
+      runtime.backend === 'claude' &&
+      !runtime.model &&
+      !runtime.detectedModel &&
+      contextBudgetAuto
+    ) {
+      printEvent(chalk.dim('⛁ Compaction deferred — waiting for the provider to report its model'));
+      return;
+    }
 
     const entries = ledger.listEntries();
     const cutoff = Math.max(0, entries.length - AUTO_COMPACT_KEEP_RECENT_ENTRIES);
@@ -6059,9 +6262,14 @@ export async function runChat(options: ChatOptions): Promise<void> {
             break;
           }
           runtime.backend = next;
+          // Detection belongs to the previous provider's session.
+          runtime.detectedModel = undefined;
           runtime.backendTokenWindow = resolveBackendTokenWindow(runtime.backend, runtime.model);
           if (contextBudgetAuto) {
-            runtime.maxContextTokens = defaultContextBudget(runtime.backendTokenWindow);
+            runtime.maxContextTokens = defaultContextBudget(
+              runtime.backendTokenWindow,
+              promptTransportFor(runtime.backend)
+            );
           }
           const backendLines = [`Switched backend to ${next}`];
           if (contextBudgetAuto) {
@@ -6074,11 +6282,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         }
         case 'model': {
           const next = slash.args[0];
-          runtime.model = next || undefined;
-          runtime.backendTokenWindow = resolveBackendTokenWindow(runtime.backend, runtime.model);
-          if (contextBudgetAuto) {
-            runtime.maxContextTokens = defaultContextBudget(runtime.backendTokenWindow);
-          }
+          applyModelSelection(runtime, next || undefined, contextBudgetAuto);
           showInPanel([
             `Model override: ${runtime.model || '(backend default)'}`,
             `Backend window: ${formatTokenCount(runtime.backendTokenWindow)} tok`,
