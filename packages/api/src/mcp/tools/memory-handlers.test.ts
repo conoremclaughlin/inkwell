@@ -52,7 +52,7 @@ vi.mock('../../utils/request-context', () => ({
   getRequestContext: vi.fn().mockReturnValue(undefined),
 }));
 
-import { getRequestContext } from '../../utils/request-context';
+import { getPinnedAgentId, getRequestContext } from '../../utils/request-context';
 
 // Mock cloud skills
 vi.mock('../../skills/cloud-service', () => ({
@@ -438,7 +438,9 @@ describe('handleUpdateSessionState', () => {
       );
     });
 
-    it('skips a request-context session pinned to a different agent and uses the scoped lookup', async () => {
+    it('refuses when the request-context session belongs to a different agent (contradiction)', async () => {
+      // The caller's own context names a session this write cannot honor —
+      // falling through to a most-recent guess is how misroutes happen.
       vi.mocked(getRequestContext).mockReturnValue({
         sessionId: 'ctx-lumen-1',
         timestamp: new Date(),
@@ -448,11 +450,63 @@ describe('handleUpdateSessionState', () => {
         id: 'ctx-lumen-1',
         agentId: 'lumen',
       });
-      mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue(mockSession);
-      mockDataComposer.repositories.memory.updateSession.mockResolvedValue(mockUpdatedSession);
 
       const result = await handleUpdateSessionState(
         { email: 'test@test.com', phase: 'implementing', agentId: 'wren' },
+        mockDataComposer as never
+      );
+      vi.mocked(getRequestContext).mockReturnValue(undefined as never);
+
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.success).toBe(false);
+      expect(parsed.error).toContain('stale or mismatched');
+      expect(mockDataComposer.repositories.memory.getActiveSession).not.toHaveBeenCalled();
+      expect(mockDataComposer.repositories.memory.updateSession).not.toHaveBeenCalled();
+    });
+
+    it('refuses a stale/ended request-context session instead of guessing', async () => {
+      vi.mocked(getRequestContext).mockReturnValue({
+        sessionId: 'ctx-ended-1',
+        timestamp: new Date(),
+      } as never);
+      mockDataComposer.repositories.memory.getSession.mockResolvedValue({
+        ...mockSession,
+        id: 'ctx-ended-1',
+        endedAt: new Date('2026-08-01T00:00:00Z'),
+      });
+
+      const result = await handleUpdateSessionState(
+        { email: 'test@test.com', phase: 'implementing', agentId: 'wren' },
+        mockDataComposer as never
+      );
+      vi.mocked(getRequestContext).mockReturnValue(undefined as never);
+
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.success).toBe(false);
+      expect(parsed.error).toContain('stale or mismatched');
+      expect(mockDataComposer.repositories.memory.getActiveSession).not.toHaveBeenCalled();
+    });
+
+    it('routes an explicit studioId that differs from the context session to the scoped lookup', async () => {
+      vi.mocked(getRequestContext).mockReturnValue({
+        sessionId: 'ctx-studio-a',
+        timestamp: new Date(),
+      } as never);
+      const studioB = '550e8400-e29b-41d4-a716-446655440099';
+      mockDataComposer.repositories.memory.getSession.mockResolvedValue({
+        ...mockSession,
+        id: 'ctx-studio-a',
+        studioId: '550e8400-e29b-41d4-a716-446655440042',
+      });
+      mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue({
+        ...mockSession,
+        id: 'studio-b-session',
+        studioId: studioB,
+      });
+      mockDataComposer.repositories.memory.updateSession.mockResolvedValue(mockUpdatedSession);
+
+      const result = await handleUpdateSessionState(
+        { email: 'test@test.com', phase: 'implementing', agentId: 'wren', studioId: studioB },
         mockDataComposer as never
       );
       vi.mocked(getRequestContext).mockReturnValue(undefined as never);
@@ -462,8 +516,109 @@ describe('handleUpdateSessionState', () => {
       expect(mockDataComposer.repositories.memory.getActiveSession).toHaveBeenCalledWith(
         'user-123',
         'wren',
-        undefined
+        studioB
       );
+      expect(mockDataComposer.repositories.memory.updateSession).toHaveBeenCalledWith(
+        'studio-b-session',
+        expect.objectContaining({ currentPhase: 'implementing' })
+      );
+    });
+
+    it('refuses an explicit sessionId of another agent when the caller is agent-bound', async () => {
+      vi.mocked(getPinnedAgentId).mockReturnValue('wren');
+      mockDataComposer.repositories.memory.getSession.mockResolvedValue({
+        ...mockSession,
+        id: 'lumen-session',
+        agentId: 'lumen',
+      });
+
+      const result = await handleUpdateSessionState(
+        {
+          email: 'test@test.com',
+          sessionId: '550e8400-e29b-41d4-a716-446655440222',
+          phase: 'reviewing',
+        },
+        mockDataComposer as never
+      );
+      vi.mocked(getPinnedAgentId).mockReturnValue(null);
+
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.success).toBe(false);
+      expect(parsed.error).toContain('different agent');
+      expect(mockDataComposer.repositories.memory.updateSession).not.toHaveBeenCalled();
+    });
+
+    it('compares canonical sbId before agent slugs for agent-bound explicit targets', async () => {
+      // Same slug, different identity UUID — the UUID is authoritative.
+      vi.mocked(getPinnedAgentId).mockReturnValue('wren');
+      vi.mocked(getRequestContext).mockReturnValue({
+        agentId: 'wren',
+        sbId: 'sb-uuid-wren',
+        timestamp: new Date(),
+      } as never);
+      mockDataComposer.repositories.memory.getSession.mockResolvedValue({
+        ...mockSession,
+        id: 'other-workspace-wren',
+        agentId: 'wren',
+        sbId: 'sb-uuid-other-wren',
+      });
+
+      const result = await handleUpdateSessionState(
+        {
+          email: 'test@test.com',
+          sessionId: '550e8400-e29b-41d4-a716-446655440333',
+          phase: 'reviewing',
+        },
+        mockDataComposer as never
+      );
+      vi.mocked(getPinnedAgentId).mockReturnValue(null);
+      vi.mocked(getRequestContext).mockReturnValue(undefined as never);
+
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.success).toBe(false);
+      expect(parsed.error).toContain('different agent');
+    });
+
+    it('refuses a params.agentId that conflicts with the pinned caller identity', async () => {
+      vi.mocked(getPinnedAgentId).mockReturnValue('wren');
+
+      const result = await handleUpdateSessionState(
+        { email: 'test@test.com', phase: 'implementing', agentId: 'lumen' },
+        mockDataComposer as never
+      );
+      vi.mocked(getPinnedAgentId).mockReturnValue(null);
+
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.success).toBe(false);
+      expect(parsed.error).toContain('pinned to "wren"');
+      expect(mockDataComposer.repositories.memory.updateSession).not.toHaveBeenCalled();
+    });
+
+    it('allows an unpinned operator to target another agent session by explicit sessionId', async () => {
+      // The deliberate cross-agent path: no pinned identity, explicit UUID.
+      mockDataComposer.repositories.memory.getSession.mockResolvedValue({
+        ...mockSession,
+        id: 'lumen-session',
+        agentId: 'lumen',
+      });
+      mockDataComposer.repositories.memory.updateSession.mockResolvedValue({
+        ...mockSession,
+        id: 'lumen-session',
+        agentId: 'lumen',
+        currentPhase: 'triggered',
+      });
+
+      const result = await handleUpdateSessionState(
+        {
+          email: 'test@test.com',
+          sessionId: '550e8400-e29b-41d4-a716-446655440444',
+          phase: 'triggered',
+        },
+        mockDataComposer as never
+      );
+
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.success).toBe(true);
     });
 
     it('rejects an explicit sessionId owned by a different user', async () => {

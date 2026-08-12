@@ -16,6 +16,7 @@ import {
   setSessionContext,
   getSessionContext,
   pinSessionAgent,
+  getPinnedAgentId,
   getRequestContext,
 } from '../../utils/request-context';
 import { getEffectiveAgentId } from '../../auth/enforce-identity';
@@ -1567,65 +1568,94 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
 
   // Resolve session: explicit sessionId > the caller's own session from
   // request context > agent-scoped most-recent. An explicit UUID is a
-  // target, not authorization — validate ownership before writing. And this
-  // is a WRITE path, so never fall back to a cross-agent most-recent
-  // lookup: the user's newest active session can belong to a DIFFERENT
-  // agent triggered moments earlier (observed 2026-08-12: an unscoped wren
-  // state update landed on a lumen trigger session created 20s before).
+  // target, not authorization — validate ownership AND agent binding before
+  // writing. This is a WRITE path: never fall back to a cross-agent
+  // most-recent lookup (observed 2026-08-12: an unscoped wren state update
+  // landed on a lumen trigger session created 20s before), and never guess
+  // past an authoritative contradiction in the caller's own context
+  // (Lumen, PR #472 review).
+  const sessionErr = (error: string) => ({
+    content: [
+      {
+        type: 'text' as const,
+        text: JSON.stringify({ success: false, error }, null, 2),
+      },
+    ],
+  });
+
+  const requestCtx = getRequestContext();
+  const pinnedAgentId = getPinnedAgentId();
+  const pinnedSbId = requestCtx?.sbId;
+
+  // An agent-bound caller asserting a different agent is a contradiction,
+  // not an override: refuse loudly. Deliberate cross-agent operations
+  // belong to unpinned human/operator contexts.
+  if (pinnedAgentId && params.agentId && params.agentId !== pinnedAgentId) {
+    return sessionErr(
+      `Caller identity is pinned to "${pinnedAgentId}" — refusing to update sessions as ` +
+        `"${params.agentId}". Cross-agent updates require an unpinned operator context.`
+    );
+  }
+
+  // Agent binding for a target session: canonical identity UUID first
+  // (sessions.sb_id vs the caller's sbId), agent slug as legacy fallback.
+  // Unpinned callers and unattributed sessions pass.
+  const targetMatchesCallerAgent = (target: Session): boolean => {
+    if (pinnedSbId && target.sbId) return target.sbId === pinnedSbId;
+    if (pinnedAgentId && target.agentId) return target.agentId === pinnedAgentId;
+    return true;
+  };
+
   let sessionId = params.sessionId;
   if (sessionId) {
     const target = await dataComposer.repositories.memory.getSession(sessionId);
     if (!target || target.userId !== user.id) {
-      return {
-        content: [
-          {
-            type: 'text' as const,
-            text: JSON.stringify(
-              { success: false, error: 'Session not found for this user.' },
-              null,
-              2
-            ),
-          },
-        ],
-      };
+      return sessionErr('Session not found for this user.');
+    }
+    if (!targetMatchesCallerAgent(target)) {
+      return sessionErr(
+        'Session belongs to a different agent — agent-bound callers may only update their own sessions.'
+      );
     }
   } else {
     const scopeAgentId = getEffectiveAgentId(params.agentId);
-    const ctxSessionId = getRequestContext()?.sessionId;
+    const ctxSessionId = requestCtx?.sessionId;
     if (ctxSessionId) {
+      let ctxSession: Session | null = null;
       try {
-        const ctxSession = await dataComposer.repositories.memory.getSession(ctxSessionId);
-        if (
-          ctxSession &&
-          ctxSession.userId === user.id &&
-          !ctxSession.endedAt &&
-          (!scopeAgentId || !ctxSession.agentId || ctxSession.agentId === scopeAgentId)
-        ) {
-          sessionId = ctxSession.id;
-        }
+        ctxSession = await dataComposer.repositories.memory.getSession(ctxSessionId);
       } catch {
-        // Context session unavailable — fall through to the scoped lookup.
+        ctxSession = null;
+      }
+      const usable =
+        !!ctxSession &&
+        ctxSession.userId === user.id &&
+        !ctxSession.endedAt &&
+        targetMatchesCallerAgent(ctxSession) &&
+        (!scopeAgentId || !ctxSession.agentId || ctxSession.agentId === scopeAgentId);
+      if (!usable) {
+        // The caller's own context names a session this write cannot honor
+        // (stale, ended, another user's, or another agent's). Falling
+        // through to a most-recent guess is how cross-agent/cross-repo
+        // misroutes happen — fail closed instead.
+        return sessionErr(
+          'Request-context session is stale or mismatched — pass sessionId (or a matching agentId) explicitly.'
+        );
+      }
+      // Explicit studio targeting wins over the ambient context session:
+      // naming a different studio means "that studio's session", so route
+      // through the scoped lookup below instead.
+      const ctxStudio = ctxSession!.studioId ?? null;
+      if (studioScope === undefined || ctxStudio === studioScope) {
+        sessionId = ctxSession!.id;
       }
     }
     if (!sessionId) {
       if (!scopeAgentId) {
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: JSON.stringify(
-                {
-                  success: false,
-                  error:
-                    'No agent scope to resolve a session — pass sessionId or agentId. ' +
-                    'Refusing to write to the most recent session across all agents.',
-                },
-                null,
-                2
-              ),
-            },
-          ],
-        };
+        return sessionErr(
+          'No agent scope to resolve a session — pass sessionId or agentId. ' +
+            'Refusing to write to the most recent session across all agents.'
+        );
       }
       const session = await dataComposer.repositories.memory.getActiveSession(
         user.id,
@@ -1633,18 +1663,7 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
         studioScope // null → match NULL studio_id (main), UUID → exact match, undefined → no filter
       );
       if (!session) {
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: JSON.stringify(
-                { success: false, error: 'No active session found. Start a session first.' },
-                null,
-                2
-              ),
-            },
-          ],
-        };
+        return sessionErr('No active session found. Start a session first.');
       }
       sessionId = session.id;
     }
