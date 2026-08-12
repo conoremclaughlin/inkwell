@@ -80,3 +80,65 @@ describe('stripLocalToolBlocks — both formats removed from display/routing tex
     ).toBe('');
   });
 });
+
+describe('ink-tool payloads containing ``` (embedded markdown fences)', () => {
+  // Myra's IRA spec (2026-08-10): create_artifact content held markdown WITH
+  // code fences. A first-``` regex truncated the JSON mid-string — the call
+  // silently never ran AND the raw JSON tail (literal \n escapes, trailing
+  // "}}") leaked into her rendered message.
+  const artifactContent =
+    '# IRA Strategy\n\nDecision tree:\n\n```\nIs AGI below the phase-out?\n├── YES → contribute directly\n└── NO → backdoor\n```\n\n| Strategy | Allowed |\n|---|---|\n| Spreads | Yes |\n';
+  const block =
+    '```ink-tool\n' +
+    JSON.stringify({
+      tool: 'create_artifact',
+      args: { type: 'spec', uri: 'ink://specs/ira-options', content: artifactContent },
+    }) +
+    '\n```';
+
+  it('parses the full JSON payload — the call executes instead of silently dropping', () => {
+    const text = `Creating it properly now.\n\n${block}\n\nDone.`;
+    const calls = extractLocalToolCalls(text);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.tool).toBe('create_artifact');
+    expect((calls[0]!.args as { content: string }).content).toBe(artifactContent);
+  });
+
+  it('strips the entire block — no raw JSON tail leaks into the message', () => {
+    const text = `Creating it properly now.\n\n${block}\n\nDone.`;
+    const stripped = stripLocalToolBlocks(text);
+    expect(stripped).toBe('Creating it properly now.\n\n\n\nDone.');
+    expect(stripped).not.toContain('"}}');
+    expect(stripped).not.toContain('backdoor');
+  });
+
+  it('keeps extraction and stripping aligned across mixed blocks', () => {
+    const plain = '```ink-tool\n{"tool":"signal_status","args":{"status":"completed"}}\n```';
+    const text = `Intro.\n${block}\nMiddle.\n${plain}\nOutro.`;
+    const calls = extractLocalToolCalls(text);
+    expect(calls.map((c) => c.tool)).toEqual(['create_artifact', 'signal_status']);
+    const stripped = stripLocalToolBlocks(text);
+    expect(stripped).toContain('Intro.');
+    expect(stripped).toContain('Middle.');
+    expect(stripped).toContain('Outro.');
+    expect(stripped).not.toContain('ink-tool');
+    expect(stripped).not.toContain('create_artifact');
+  });
+
+  it('accepts a scanned JSON block whose closing fence is missing (executes instead of leaking)', () => {
+    const text = `Before.\n\`\`\`ink-tool\n{"tool":"remember","args":{"content":"has \`\`\` inside"}}\nAfter.`;
+    const calls = extractLocalToolCalls(text);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.tool).toBe('remember');
+    const stripped = stripLocalToolBlocks(text);
+    expect(stripped).toContain('Before.');
+    expect(stripped).toContain('After.');
+    expect(stripped).not.toContain('remember');
+  });
+
+  it('falls back to legacy first-fence handling for non-JSON payloads', () => {
+    const text = 'A.\n```ink-tool\nnot json at all\n```\nB.';
+    expect(extractLocalToolCalls(text)).toEqual([]);
+    expect(stripLocalToolBlocks(text)).toBe('A.\n\nB.');
+  });
+});
