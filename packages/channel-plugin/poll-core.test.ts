@@ -127,14 +127,55 @@ describe('drainThreads — cold-fetch ack protocol (spec §1)', () => {
     ]);
   });
 
-  it('cursored incremental fetch keeps markRead:true and does not ack', async () => {
+  it('cursored incremental fetch is ALSO markRead:false and acks (uniform §7 protocol)', async () => {
     const h = createHarness({ 'pr:x': { messages: [mkMsg('m-9')] } });
     const state = createThreadDrainState();
     state.lastThreadMessageId.set('pr:x', 'm-8');
     await drainThreads(h.deps, state, [mkThread('pr:x', 1)]);
 
-    expect(h.fetchArgs[0]).toMatchObject({ markRead: true, afterMessageId: 'm-8' });
-    expect(h.ackArgs).toHaveLength(0);
+    expect(h.fetchArgs[0]).toMatchObject({ markRead: false, afterMessageId: 'm-8' });
+    expect(h.ackArgs).toEqual([expect.objectContaining({ throughMessageId: 'm-9' })]);
+    expect(state.lastThreadMessageId.get('pr:x')).toBe('m-9');
+  });
+
+  it('ack failure holds cursors, counts against drain proof, and retries next poll', async () => {
+    const state = createThreadDrainState();
+    const msgs = [mkMsg('a-1'), mkMsg('a-2')];
+
+    // Poll 1: emit succeeds but the ack write fails.
+    const h1 = createHarness({ 'pr:x': { messages: msgs, skipped: 3 } });
+    (h1.deps.callPcp as ReturnType<typeof vi.fn>).mockImplementation(
+      async (tool: string, args: Record<string, unknown>) => {
+        if (tool === 'get_thread_messages') {
+          h1.fetchArgs.push(args);
+          return { success: true, messages: msgs, skippedOlderCount: 3 };
+        }
+        if (tool === 'mark_thread_read') {
+          h1.ackArgs.push(args);
+          return { success: false, error: 'db write failed' };
+        }
+        return { success: true };
+      }
+    );
+    const r1 = await drainThreads(h1.deps, state, [mkThread('pr:x', 2)]);
+    expect(r1.ackFailures).toBe(1);
+    // Cursor NOT advanced — next poll must re-fetch cold and retry the ack.
+    expect(state.lastThreadMessageId.has('pr:x')).toBe(false);
+    // Skips exist but ack failed → NOT drained → no summary.
+    expect(state.summarySent).toBe(false);
+
+    // Poll 2: same window re-fetched; messages dedup by seen-set (no double
+    // render); the ack retries and succeeds.
+    const h2 = createHarness({ 'pr:x': { messages: msgs, skipped: 3 } });
+    const r2 = await drainThreads(h2.deps, state, [mkThread('pr:x', 2)]);
+    expect(r2.injected).toBe(0); // seen-set: nothing re-rendered
+    expect(r2.ackFailures).toBe(0);
+    expect(h2.ackArgs).toEqual([expect.objectContaining({ throughMessageId: 'a-2' })]);
+    expect(state.lastThreadMessageId.get('pr:x')).toBe('a-2');
+    // Skip map replaced (not added): 3, not 6 — and now drained → summary.
+    expect(state.summarySent).toBe(true);
+    const summary = h2.notifications.find((n) => n.content.includes('cold-start guard'));
+    expect(summary!.content).toContain('3 older unread message(s)');
   });
 
   it('emit failure mid-batch: ack stops at the last SUCCESS, remainder redelivers', async () => {
@@ -202,7 +243,7 @@ describe('drainThreads — summary accumulation and drain proof', () => {
     });
     await drainThreads(h1.deps, state, [mkThread('pr:a', 110)]);
     expect(state.summarySent).toBe(false);
-    expect(state.skippedTotal).toBe(30);
+    expect([...state.skippedByThread.values()].reduce((a, b) => a + b, 0)).toBe(30);
 
     // Poll 2: more skips on another thread, drained cleanly → ONE summary
     // covering BOTH polls (30 + 5 = 35).

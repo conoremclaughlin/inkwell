@@ -10,6 +10,7 @@ import {
   handleGetInbox,
   handleUpdateInboxMessage,
   isThreadOwnedByStudio,
+  selectCandidateThreadPage,
 } from './inbox-handlers';
 
 // Mock user-resolver
@@ -2265,5 +2266,60 @@ describe('handleGetInbox — channelPoll dual-scope validation (round 2)', () =>
     expect(JSON.parse(result.content[0].text).warning).toContain('channel_poll_unscoped');
     const tablesTouched = (mockSb.from as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0]);
     expect(tablesTouched).not.toContain('agent_inbox');
+  });
+});
+
+// =====================================================
+// selectCandidateThreadPage — delivery-poll paging (round 3)
+// =====================================================
+
+describe('selectCandidateThreadPage', () => {
+  const row = (id: string, updatedAt: string) => ({
+    id,
+    thread_key: `pr:${id}`,
+    title: null,
+    user_id: 'user-123',
+    created_by_agent_id: 'lumen',
+    updated_at: updatedAt,
+  });
+
+  it('an older unread thread is NOT starved by 20 newer already-read threads', async () => {
+    // 20 newest threads: all read (pointer after last activity).
+    const newest = Array.from({ length: 20 }, (_, i) =>
+      row(`new-${i}`, `2026-08-11T12:${String(10 + i).padStart(2, '0')}:00Z`)
+    );
+    // 5 older threads: unread (no pointer / stale pointer).
+    const older = Array.from({ length: 5 }, (_, i) => row(`old-${i}`, `2026-08-01T0${i}:00:00Z`));
+    const pointers = new Map<string, string | null>();
+    for (const t of newest) pointers.set(t.id, '2026-08-12T00:00:00Z'); // read
+    pointers.set('old-0', '2026-07-01T00:00:00Z'); // stale pointer → candidate
+    // old-1..old-4 have no pointer → candidates
+
+    const { page, truncated } = selectCandidateThreadPage([...newest, ...older], pointers, 20);
+    const ids = page.map((t) => t.id);
+    expect(ids).toHaveLength(5);
+    expect(ids).toEqual(expect.arrayContaining(['old-0', 'old-1', 'old-2', 'old-3', 'old-4']));
+    expect(truncated).toBe(false);
+  });
+
+  it('pages newest-first among candidates and reports truncation', async () => {
+    const rows = Array.from({ length: 25 }, (_, i) =>
+      row(`t-${i}`, `2026-08-11T${String(i % 24).padStart(2, '0')}:00:00Z`)
+    );
+    const { page, truncated } = selectCandidateThreadPage(rows, new Map(), 20);
+    expect(page).toHaveLength(20);
+    expect(truncated).toBe(true);
+    // Newest candidate leads the page.
+    expect(page[0].updated_at! >= page[19].updated_at!).toBe(true);
+  });
+
+  it('a thread with activity after its pointer is a candidate; read threads are not', async () => {
+    const rows = [row('active', '2026-08-11T10:00:00Z'), row('read', '2026-08-11T10:00:00Z')];
+    const pointers = new Map<string, string | null>([
+      ['active', '2026-08-11T09:00:00Z'],
+      ['read', '2026-08-11T11:00:00Z'],
+    ]);
+    const { page } = selectCandidateThreadPage(rows, pointers, 20);
+    expect(page.map((t) => t.id)).toEqual(['active']);
   });
 });

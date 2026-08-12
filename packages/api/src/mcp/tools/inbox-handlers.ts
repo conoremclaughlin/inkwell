@@ -131,6 +131,38 @@ const sendToInboxSchema = userIdentifierBaseSchema.extend({
     ),
 });
 
+export interface ThreadPageRow {
+  id: string;
+  thread_key: string;
+  title: string | null;
+  user_id: string;
+  created_by_agent_id: string;
+  updated_at: string | null;
+}
+
+/**
+ * Select the delivery-poll thread page by CANDIDACY, not recency (spec §4,
+ * Lumen PR #473 round 3). A candidate is potentially unread: no read pointer,
+ * or thread activity (updated_at) after the pointer. Acked threads leave the
+ * candidate set, so an older backlog thread surfaces on a later poll instead
+ * of starving behind a fixed newest-N page forever.
+ */
+export function selectCandidateThreadPage(
+  threads: ThreadPageRow[],
+  pointers: Map<string, string | null>,
+  pageLimit: number
+): { page: ThreadPageRow[]; truncated: boolean } {
+  const candidates = threads.filter((t) => {
+    const pointer = pointers.get(t.id);
+    if (!pointer) return true;
+    return (t.updated_at ?? '') > pointer;
+  });
+  const sorted = [...candidates].sort((a, b) =>
+    (b.updated_at ?? '').localeCompare(a.updated_at ?? '')
+  );
+  return { page: sorted.slice(0, pageLimit), truncated: candidates.length > pageLimit };
+}
+
 /**
  * Check if a thread is owned by a specific studio based on the agent's
  * message metadata. Used by channelPoll filtering.
@@ -1326,13 +1358,47 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
       // messages have I seen." Filtering threads by updated_at would
       // cause missed messages when lastPollTime advances past the
       // thread's updated_at between polls.
-      const { data: threads } = await threadTable(supabase, 'inbox_threads')
-        .select('id, thread_key, title, user_id, created_by_agent_id, updated_at')
-        .eq('user_id', resolved.user.id)
-        .eq('status', 'open')
-        .in('id', threadIds)
-        .order('updated_at', { ascending: false })
-        .limit(THREAD_PAGE_LIMIT);
+      let threads: ThreadPageRow[] | null = null;
+      if (channelPoll && agentId) {
+        // Delivery polls page by CANDIDACY, not recency (Lumen, PR #473
+        // round 3): the fixed newest-20 page starved any older unread
+        // thread forever once 20 newer open threads existed. Candidates =
+        // potentially-unread (no pointer, or activity after the pointer);
+        // acked threads leave the set, so older backlog surfaces on later
+        // polls. Cap the scan at 500 stamped threads.
+        const { data: allOpen } = await threadTable(supabase, 'inbox_threads')
+          .select('id, thread_key, title, user_id, created_by_agent_id, updated_at')
+          .eq('user_id', resolved.user.id)
+          .eq('status', 'open')
+          .in('id', threadIds)
+          .order('updated_at', { ascending: false })
+          .limit(500);
+        const openRows = (allOpen || []) as ThreadPageRow[];
+        const { data: ptrRows } = await threadTable(supabase, 'inbox_thread_read_status')
+          .select('thread_id, last_read_at')
+          .in(
+            'thread_id',
+            openRows.map((t) => t.id)
+          )
+          .eq('agent_id', agentId);
+        const pointers = new Map<string, string | null>(
+          ((ptrRows || []) as Array<{ thread_id: string; last_read_at: string | null }>).map(
+            (r) => [r.thread_id, r.last_read_at]
+          )
+        );
+        const selected = selectCandidateThreadPage(openRows, pointers, THREAD_PAGE_LIMIT);
+        threads = selected.page;
+        unreadThreadsTruncated = selected.truncated;
+      } else {
+        const { data } = await threadTable(supabase, 'inbox_threads')
+          .select('id, thread_key, title, user_id, created_by_agent_id, updated_at')
+          .eq('user_id', resolved.user.id)
+          .eq('status', 'open')
+          .in('id', threadIds)
+          .order('updated_at', { ascending: false })
+          .limit(THREAD_PAGE_LIMIT);
+        threads = (data || null) as ThreadPageRow[] | null;
+      }
 
       if (threads?.length) {
         const tIds = threads.map((t: { id: string }) => t.id);
@@ -1388,51 +1454,43 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
         }
 
         // Assemble thread summaries from batched data (pure JS, zero queries)
-        threadsWithUnread = threads.map(
-          (t: {
-            id: string;
-            thread_key: string;
-            title: string | null;
-            created_by_agent_id: string;
-            updated_at: string;
-          }) => {
-            const parts = partsByThread.get(t.id) || [];
-            const participants = parts.map((p) => p.agent_id);
+        threadsWithUnread = threads.map((t: ThreadPageRow) => {
+          const parts = partsByThread.get(t.id) || [];
+          const participants = parts.map((p) => p.agent_id);
 
-            let lastReadAt: string | null = readStatusByThread.get(t.id) || null;
-            let joinedAt: string | null = null;
-            if (agentId) {
-              const callerPart = parts.find((p) => p.agent_id === agentId);
-              joinedAt = callerPart?.joined_at || null;
-            }
-
-            const unreadBaseline = lastReadAt || joinedAt;
-            const threadMsgs = msgsByThread.get(t.id) || [];
-            const unreadCount = unreadBaseline
-              ? threadMsgs.filter((m) => m.created_at > unreadBaseline).length
-              : threadMsgs.length;
-
-            const previewMessages = threadMsgs
-              .filter((m) => m.message_type !== 'system')
-              .slice(0, 3)
-              .reverse()
-              .map((m) => ({
-                senderAgentId: m.sender_agent_id,
-                content: m.content,
-                messageType: m.message_type,
-                createdAt: m.created_at,
-              }));
-
-            return {
-              threadKey: t.thread_key,
-              title: t.title,
-              participants,
-              unreadCount,
-              lastMessageAt: t.updated_at,
-              previewMessages,
-            };
+          let lastReadAt: string | null = readStatusByThread.get(t.id) || null;
+          let joinedAt: string | null = null;
+          if (agentId) {
+            const callerPart = parts.find((p) => p.agent_id === agentId);
+            joinedAt = callerPart?.joined_at || null;
           }
-        );
+
+          const unreadBaseline = lastReadAt || joinedAt;
+          const threadMsgs = msgsByThread.get(t.id) || [];
+          const unreadCount = unreadBaseline
+            ? threadMsgs.filter((m) => m.created_at > unreadBaseline).length
+            : threadMsgs.length;
+
+          const previewMessages = threadMsgs
+            .filter((m) => m.message_type !== 'system')
+            .slice(0, 3)
+            .reverse()
+            .map((m) => ({
+              senderAgentId: m.sender_agent_id,
+              content: m.content,
+              messageType: m.message_type,
+              createdAt: m.created_at,
+            }));
+
+          return {
+            threadKey: t.thread_key,
+            title: t.title,
+            participants,
+            unreadCount,
+            lastMessageAt: t.updated_at,
+            previewMessages,
+          };
+        });
 
         // Only include threads that actually have unread messages
         threadsWithUnread = threadsWithUnread.filter((t) => t.unreadCount > 0);

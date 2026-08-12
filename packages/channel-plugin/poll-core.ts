@@ -5,14 +5,18 @@
  * (Lumen, PR #473: uneven batches, fetch failures, multi-poll summary
  * accumulation, paginated unread threads).
  *
- * Delivery contract (spec inkmail-read-state §1/§4):
- * - COLD FETCH (no in-memory cursor): fetched with markRead:false so
- *   fetched-but-unrendered messages stay unread; after injection the plugin
- *   ACKS the exact last delivered/skipped message id (mark_thread_read
- *   throughMessageId). A crash between fetch and injection loses nothing;
- *   a restart redelivers a window bounded by the server-side guard.
- * - CURSORED FETCH (incremental): keeps the pre-existing fetch-time advance
- *   (markRead:true) until the full ack protocol lands.
+ * Delivery contract (spec inkmail-read-state §1/§7 v11):
+ * - EVERY fetch is markRead:false — fetch never consumes. After injection
+ *   the plugin ACKS the exact last delivered/skipped message id
+ *   (mark_thread_read throughMessageId). In-memory cursors advance ONLY on
+ *   ack success; a failed ack leaves them untouched so the next poll
+ *   re-fetches, dedups by seen-set, and RETRIES the ack. A crash between
+ *   fetch and injection loses nothing; a restart redelivers a window
+ *   bounded by the server-side guard.
+ * - KNOWN LIMIT (spec step 3, deferred): mcp.notification resolving proves
+ *   ENQUEUE into the host, not render into context. The renderer receipt
+ *   (exact messageId + sessionId + method) requires host/hook cooperation
+ *   and is the delivery-receipts implementation step, not this one.
  * - BUDGET: at most POLL_BUDGET injections per poll, ALWAYS active — a
  *   permanent backpressure with no disarm flag to get wrong. Each request's
  *   limit is bounded by the remaining budget so the ceiling cannot overshoot.
@@ -40,9 +44,12 @@ export interface ThreadDrainState {
   lastThreadMessageId: Map<string, string>;
   lastThreadTimestamps: Map<string, string>;
   seenMessageIds: Set<string>;
-  /** Cold-start skip accounting, accumulated across polls until the summary. */
-  skippedTotal: number;
-  skippedThreads: Set<string>;
+  /**
+   * Cold-start skip accounting: LATEST server-reported skip per thread
+   * (replace, never add — a cold retry of the same thread re-reports the
+   * same range and must not double-count).
+   */
+  skippedByThread: Map<string, number>;
   summarySent: boolean;
 }
 
@@ -51,8 +58,7 @@ export function createThreadDrainState(): ThreadDrainState {
     lastThreadMessageId: new Map(),
     lastThreadTimestamps: new Map(),
     seenMessageIds: new Set(),
-    skippedTotal: 0,
-    skippedThreads: new Set(),
+    skippedByThread: new Map(),
     summarySent: false,
   };
 }
@@ -76,6 +82,7 @@ export interface DrainResult {
   ceilingHit: boolean;
   fetchFailures: number;
   emitFailures: number;
+  ackFailures: number;
   skippedThisPoll: number;
 }
 
@@ -115,6 +122,7 @@ export async function drainThreads(
   let ceilingHit = false;
   let fetchFailures = 0;
   let emitFailures = 0;
+  let ackFailures = 0;
   let skippedThisPoll = 0;
   // A batch that fills its requested limit means the thread may hold more —
   // not drain proof, even without a ceiling hit.
@@ -135,16 +143,14 @@ export async function drainThreads(
     }
 
     const afterMessageId = state.lastThreadMessageId.get(threadKey);
-    const coldFetch = !afterMessageId;
     const requestedLimit = Math.min(PER_THREAD_LIMIT, remaining);
     const threadResult = await deps.callPcp('get_thread_messages', {
       ...(deps.email ? { email: deps.email } : {}),
       agentId: deps.agentId,
       threadKey,
-      // Cold fetch: markRead:false — the exact-id ack below is the only
-      // consumption. Cursored incremental fetch: pre-existing fetch-time
-      // advance (until the full ack protocol lands).
-      markRead: !coldFetch,
+      // Fetch NEVER consumes (§7): the exact-id ack below is the only
+      // consumption, for cold and cursored fetches alike.
+      markRead: false,
       channelPoll: true,
       // Budget-bounded request: the aggregate ceiling can never overshoot.
       limit: requestedLimit,
@@ -159,8 +165,9 @@ export async function drainThreads(
 
     const skippedOlder = (threadResult.skippedOlderCount as number) || 0;
     if (skippedOlder > 0) {
-      state.skippedTotal += skippedOlder;
-      state.skippedThreads.add(threadKey);
+      // Replace, never add: a cold RETRY of the same thread re-reports the
+      // same skipped range and must not inflate the summary.
+      state.skippedByThread.set(threadKey, skippedOlder);
       skippedThisPoll += skippedOlder;
       deps.log('info', 'Cold-start guard skipped older messages', { threadKey, skippedOlder });
     }
@@ -213,25 +220,24 @@ export async function drainThreads(
       deps.log('info', 'Pushed thread message to channel', { threadKey, sender, msgId, msgTs });
     }
 
-    // In-memory cursors advance to the last processed message so polls in
-    // this process don't re-render; after an emit failure they stop at the
-    // last success, so the remainder redelivers.
-    if (lastProcessedId) state.lastThreadMessageId.set(threadKey, lastProcessedId);
-    if (lastProcessedTs) state.lastThreadTimestamps.set(threadKey, lastProcessedTs);
-
-    // Cold-fetch ack (spec §1): acknowledge exactly what was delivered or
-    // deliberately skipped. On ack failure the server-side unread persists —
-    // the in-memory cursor prevents duplicates this process; a restart
-    // redelivers a guard-bounded window (at-least-once, never silent loss).
-    if (coldFetch && lastProcessedId) {
+    // Exact-id ack (spec §1) on EVERY fetch that processed messages: the
+    // ack is the only consumption. In-memory cursors advance ONLY on ack
+    // success — a failed ack leaves them untouched, so the next poll
+    // re-fetches the same window, dedups by seen-set (no duplicate render),
+    // and RETRIES the ack. Failed acks count against drain proof.
+    if (lastProcessedId) {
       const ack = await deps.callPcp('mark_thread_read', {
         ...(deps.email ? { email: deps.email } : {}),
         agentId: deps.agentId,
         threadKey,
         throughMessageId: lastProcessedId,
       });
-      if (!ack?.success) {
-        deps.log('error', 'Cold-fetch ack failed — server unread persists', {
+      if (ack?.success) {
+        state.lastThreadMessageId.set(threadKey, lastProcessedId);
+        if (lastProcessedTs) state.lastThreadTimestamps.set(threadKey, lastProcessedTs);
+      } else {
+        ackFailures += 1;
+        deps.log('error', 'Ack failed — cursors held, will re-fetch and retry ack next poll', {
           threadKey,
           throughMessageId: lastProcessedId,
         });
@@ -242,20 +248,22 @@ export async function drainThreads(
   // One summary per process, only at provable drain: no ceiling, no
   // failures, no truncated thread page. Accumulated across all polls so a
   // multi-poll drain reports every skip (nothing omitted).
+  const skippedTotal = [...state.skippedByThread.values()].reduce((a, b) => a + b, 0);
   if (
     !state.summarySent &&
-    state.skippedTotal > 0 &&
+    skippedTotal > 0 &&
     !ceilingHit &&
     !sawFullBatch &&
     fetchFailures === 0 &&
     emitFailures === 0 &&
+    ackFailures === 0 &&
     !opts.moreThreadsPending
   ) {
     state.summarySent = true;
     await deps
       .notify(
-        `InkMail cold-start guard: ${state.skippedTotal} older unread message(s) across ` +
-          `${state.skippedThreads.size} thread(s) were skipped (outside the recent delivery window). ` +
+        `InkMail cold-start guard: ${skippedTotal} older unread message(s) across ` +
+          `${state.skippedByThread.size} thread(s) were skipped (outside the recent delivery window). ` +
           `They remain in-thread — use get_thread_messages with fullHistory to view.`,
         { sender: 'inkmail', message_type: 'notification' }
       )
@@ -265,5 +273,5 @@ export async function drainThreads(
       });
   }
 
-  return { injected, ceilingHit, fetchFailures, emitFailures, skippedThisPoll };
+  return { injected, ceilingHit, fetchFailures, emitFailures, ackFailures, skippedThisPoll };
 }

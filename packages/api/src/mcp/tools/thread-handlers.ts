@@ -500,12 +500,21 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
             .limit(1)
             .maybeSingle();
           if (newestSkipped?.id) {
-            await advanceThreadReadPointer(supabase, {
+            const advanced = await advanceThreadReadPointer(supabase, {
               threadId: thread.id,
               agentId,
               throughMessageId: newestSkipped.id,
               source: 'get_thread_messages:deliberate_skip',
             });
+            if (!advanced) {
+              // Checked write (spec §5): a failed skip-consume must be
+              // visible — the range will re-offer next cold fetch.
+              logger.error('[GetThreadMessages] deliberate_skip advance failed', {
+                threadKey,
+                agentId,
+                throughMessageId: newestSkipped.id,
+              });
+            }
           }
         }
       }
@@ -520,12 +529,19 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
         }
       }
       if (maxMessageId) {
-        await advanceThreadReadPointer(supabase, {
+        const advanced = await advanceThreadReadPointer(supabase, {
           threadId: thread.id,
           agentId,
           throughMessageId: maxMessageId,
           source: 'get_thread_messages:markRead',
         });
+        if (!advanced) {
+          logger.error('[GetThreadMessages] markRead advance failed', {
+            threadKey,
+            agentId,
+            throughMessageId: maxMessageId,
+          });
+        }
       }
     }
   }
