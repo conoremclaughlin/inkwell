@@ -57,14 +57,14 @@ const CONTENT_COLORS: Record<MessageRole, string | undefined> = {
  * Emoji glyphs, regardless of measured width. string-width reports
  * text-presentation emoji (🛠 🗑 ⚙) as 1 column, but most terminals render
  * them emoji-style at 2 — centering by the measured width butts them against
- * the adjacent text (zero visual gap). Text glyphs (❯ ✦ ∗ ✓ ✻) are not
+ * the adjacent text (zero visual gap). Text glyphs (❯ ✦ ✱ ✓ ✻) are not
  * pictographic and measure truthfully.
  */
 const PICTOGRAPHIC_RE = /\p{Extended_Pictographic}/u;
 
 /**
  * Center a marker glyph within the gutter column: single-width TEXT glyphs
- * (❯ ✦ ∗ ✓ ✻) sit in the middle column instead of hugging the left edge.
+ * (❯ ✦ ✱ ✓ ✻) sit in the middle column instead of hugging the left edge.
  * Pictographic glyphs are treated as at least 2 columns wide whatever
  * string-width claims (see PICTOGRAPHIC_RE) — they stay at column 0, which
  * guarantees at least one column of gap before the text even when the
@@ -85,7 +85,9 @@ const ROLE_MARKERS: Record<MessageRole, string> = {
   assistant: '✦',
   inbox: '✉',
   activity: '⚡',
-  system: '∗',
+  // U+2731 HEAVY ASTERISK — full-height glyph; U+2217 ASTERISK OPERATOR
+  // floats at x-height and reads vertically misaligned next to the heading.
+  system: '✱',
   grant: '✓',
   event: '',
 };

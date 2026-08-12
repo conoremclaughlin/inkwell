@@ -147,7 +147,7 @@ describe('centerGutterMarker', () => {
   it('centers single-width TEXT glyphs at the middle gutter column', () => {
     expect(centerGutterMarker('❯')).toBe(' ❯');
     expect(centerGutterMarker('✦')).toBe(' ✦');
-    expect(centerGutterMarker('∗')).toBe(' ∗');
+    expect(centerGutterMarker('✱')).toBe(' ✱');
     expect(centerGutterMarker('✓')).toBe(' ✓');
     expect(centerGutterMarker('✻')).toBe(' ✻');
   });
