@@ -44,6 +44,7 @@ import { installHooks, callPcpTool } from './hooks.js';
 import { loadAuth, decodeJwtPayload, isTokenExpired } from '../auth/tokens.js';
 import { resolveAgentId } from '../backends/identity.js';
 import { registerStudioSandboxCommands } from './studio-sandbox.js';
+import { copyBootstrapFiles, syncMcpConfig } from '@inklabs/shared';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -528,25 +529,6 @@ function listRoleTemplates(): string[] {
   return Array.from(templates).sort();
 }
 
-/**
- * Copy .mcp.json and .env.local when missing in the new studio.
- * These are local bootstrap files and should be present by default.
- */
-function copyBootstrapFiles(sourceRoot: string, wsPath: string): string[] {
-  if (sourceRoot === wsPath) return [];
-
-  const copied: string[] = [];
-  for (const file of ['.mcp.json', '.env.local']) {
-    const source = join(sourceRoot, file);
-    const target = join(wsPath, file);
-    if (existsSync(source) && !existsSync(target)) {
-      cpSync(source, target);
-      copied.push(file);
-    }
-  }
-  return copied;
-}
-
 interface StudioBranchRenamePlan {
   fromBranch: string;
   toBranch: string;
@@ -941,7 +923,11 @@ async function createStudioInner(
     git(`worktree add -b "${branch}" "${wsPath}"`, gitRoot);
   }
 
-  // Copy bootstrap files
+  // Order is load-bearing: copyConfigDirs skips copying stale .codex/.gemini
+  // only when .mcp.json is already present, so the bootstrap copy must land
+  // first. That's why this calls the two shared steps around copyConfigDirs
+  // rather than using bootstrapStudio() — the server has no config-dirs step
+  // and uses the combined helper instead. Both paths share the same logic.
   copyBootstrapFiles(copySourceRoot, wsPath);
 
   // Config dirs
@@ -956,7 +942,6 @@ async function createStudioInner(
   // Sync MCP config
   if (existsSync(join(wsPath, '.mcp.json'))) {
     try {
-      const { syncMcpConfig } = await import('./mcp.js');
       syncMcpConfig(wsPath);
     } catch {
       // Not critical
