@@ -7,6 +7,7 @@ import {
   findLastDetectedModel,
   formatTranscriptSize,
   hydrateLedgerFromTranscript,
+  keptEntriesForCompaction,
 } from './chat.js';
 
 describe('hydrateLedgerFromTranscript — tool call replay', () => {
@@ -650,6 +651,128 @@ describe('hydrateLedgerFromTranscript — platform message replay (activity entr
     expect(result.tailPreview).toHaveLength(0);
     // Still in the ledger (context) and marked seen, as before.
     expect(result.seenActivityIds).toEqual(expect.arrayContaining(['act-4', 'act-5']));
+  });
+});
+
+describe('platform message replay survives compaction (PR #478 round 2)', () => {
+  let dir: string;
+  let transcriptPath: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'ink-compact-replay-test-'));
+    transcriptPath = join(dir, 'session-compact.jsonl');
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const write = (events: unknown[]) =>
+    writeFileSync(transcriptPath, events.map((e) => JSON.stringify(e)).join('\n') + '\n');
+
+  const sendActivity = {
+    eid: 3,
+    type: 'activity',
+    activityId: 'act-send',
+    activityType: 'message_out',
+    agentId: 'myra',
+    platform: 'telegram',
+    createdAt: '2026-08-12T22:03:00Z',
+    content: 'Post-session catch-up: Ruoshan emailed about the picnic.',
+  };
+
+  it('a platform send in the compaction kept tail replays as a message block, not the ⚡ line', () => {
+    // Compact → detach → reattach: the kept tail serializes ledger entries;
+    // the replay metadata rides along so the send stays a visible message.
+    write([
+      { eid: 1, type: 'user', content: 'old question' },
+      { eid: 2, type: 'assistant', content: 'old answer', backend: 'claude' },
+      {
+        eid: 4,
+        type: 'compaction',
+        summary: '[Conversation summary — compacted 2 earlier entries]\nOld stuff.',
+        keptEntries: [
+          { role: 'assistant', content: 'recent answer', source: 'claude' },
+          {
+            role: 'system',
+            content: '⚡ myra sent — Post-session catch-up…',
+            source: 'pcp-activity',
+            eid: 3,
+            replay: {
+              role: 'assistant',
+              label: '📤 myra → telegram',
+              body: 'Post-session catch-up: Ruoshan emailed about the picnic.',
+              at: '2026-08-12T22:03:00Z',
+            },
+          },
+        ],
+        removedCount: 2,
+      },
+    ]);
+
+    const ledger = new ContextLedger();
+    const result = hydrateLedgerFromTranscript(ledger, transcriptPath, 'myra');
+
+    // The send replays as the directional block with FULL content…
+    const sent = result.tailPreview.find((p) => p.label === '📤 myra → telegram');
+    expect(sent).toBeDefined();
+    expect(sent!.role).toBe('assistant');
+    expect(sent!.content).toContain('Ruoshan emailed about the picnic');
+    expect(sent!.ts).toBe('2026-08-12T22:03:00Z');
+
+    // …while the LEDGER keeps the compact ⚡ line (context unchanged) with
+    // the replay metadata restored for the NEXT compaction cycle.
+    const ledgerEntry = ledger.listEntries().find((e) => e.source === 'pcp-activity');
+    expect(ledgerEntry).toBeDefined();
+    expect(ledgerEntry!.content).toContain('⚡ myra sent');
+    expect(ledgerEntry!.replay?.label).toBe('📤 myra → telegram');
+  });
+
+  it('kept internal-source entries WITHOUT replay metadata stay suppressed (legacy behavior)', () => {
+    write([
+      {
+        eid: 2,
+        type: 'compaction',
+        summary: 'summary',
+        keptEntries: [
+          { role: 'system', content: '⚡ myra tool call — list_emails', source: 'pcp-activity' },
+        ],
+        removedCount: 1,
+      },
+    ]);
+    const ledger = new ContextLedger();
+    const result = hydrateLedgerFromTranscript(ledger, transcriptPath, 'myra');
+    expect(result.tailPreview).toHaveLength(0);
+  });
+
+  it('FULL CYCLE: hydrate activity → live compaction serializes replay → next reattach still shows the block', () => {
+    // Cycle 1: reattach hydrates the raw activity event.
+    write([sendActivity]);
+    const ledger = new ContextLedger();
+    hydrateLedgerFromTranscript(ledger, transcriptPath, 'myra');
+    const hydratedEntry = ledger.listEntries().find((e) => e.source === 'pcp-activity-history');
+    expect(hydratedEntry?.replay?.label).toBe('📤 myra → telegram');
+
+    // Live compaction in this process: the production keptEntries writer
+    // serializes the ledger tail — replay metadata must ride along.
+    ledger.compactToSummary('[Conversation summary]', 12);
+    const kept = keptEntriesForCompaction(ledger);
+    const keptSend = kept.find(
+      (k) => (k as { source?: string }).source === 'pcp-activity-history'
+    ) as { replay?: { label?: string; body?: string } } | undefined;
+    expect(keptSend?.replay?.label).toBe('📤 myra → telegram');
+    expect(keptSend?.replay?.body).toContain('Ruoshan emailed');
+
+    // Cycle 2: next process reattaches onto the compaction event.
+    write([
+      sendActivity,
+      { eid: 4, type: 'compaction', summary: '[Conversation summary]', keptEntries: kept },
+    ]);
+    const ledger2 = new ContextLedger();
+    const result2 = hydrateLedgerFromTranscript(ledger2, transcriptPath, 'myra');
+    const sent2 = result2.tailPreview.find((p) => p.label === '📤 myra → telegram');
+    expect(sent2).toBeDefined();
+    expect(sent2!.content).toContain('Ruoshan emailed about the picnic');
   });
 });
 

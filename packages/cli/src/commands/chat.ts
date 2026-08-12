@@ -37,6 +37,7 @@ import {
   ContextLedger,
   entryRefHash,
   estimateTokens,
+  type LedgerReplayMeta,
   type LedgerRole,
 } from '../repl/context-ledger.js';
 import {
@@ -825,10 +826,17 @@ export function hydrateLedgerFromTranscript(
         const source =
           typeof keptRecord.source === 'string' ? keptRecord.source : 'compaction-tail';
         const keptEid = typeof keptRecord.eid === 'number' ? keptRecord.eid : undefined;
-        const entry = ledger.addEntry(role, keptRecord.content, source, keptEid);
+        const keptReplay = parseReplayMeta(keptRecord.replay);
+        const entry = ledger.addEntry(role, keptRecord.content, source, keptEid, keptReplay);
         hydratedEntryIds.push(entry.id);
         loaded += 1;
-        if (role === 'user' || role === 'assistant' || role === 'inbox') {
+        if (keptReplay) {
+          // A platform message in the protected tail: replay the SAME
+          // directional block the live session showed — the compact ⚡
+          // ledger line is context bookkeeping, not the visible message.
+          messageCount += 1;
+          pushPreview(keptReplay.role, keptReplay.body, keptReplay.at, keptReplay.label, keptEid);
+        } else if (role === 'user' || role === 'assistant' || role === 'inbox') {
           messageCount += 1;
           pushPreview(
             role,
@@ -985,23 +993,12 @@ export function hydrateLedgerFromTranscript(
     if (type === 'activity' && typeof event.content === 'string') {
       const actor = typeof event.agentId === 'string' ? event.agentId : 'system';
       const activityType = typeof event.activityType === 'string' ? event.activityType : 'activity';
-      const entry = ledger.addEntry(
-        'system',
-        compactForLedger(`⚡ ${actor} ${activityType} — ${event.content}`, 320),
-        'pcp-activity-history',
-        eid
-      );
-      hydratedEntryIds.push(entry.id);
-      loaded += 1;
-      if (typeof event.activityId === 'string') {
-        seenActivityIds.add(event.activityId);
-      }
       // Platform messages are real conversation: replay them as the same
       // directional message blocks the live activity poll renders, so a
       // reattached session shows what the agent actually SENT/received —
       // not only the collapsed send_response receipt. Same classification
-      // as live; the recovered seenActivityIds above keep the live poll
-      // from rendering these again after reattach.
+      // as live; the recovered seenActivityIds keep the live poll from
+      // rendering these again after reattach.
       const plan = classifyActivity(
         {
           type: activityType,
@@ -1011,18 +1008,41 @@ export function hydrateLedgerFromTranscript(
         },
         agentId ?? actor
       );
-      if ((plan.mode === 'message-in' || plan.mode === 'message-out') && event.content.trim()) {
-        pushPreview(
-          plan.role!,
-          event.content,
-          typeof event.createdAt === 'string'
-            ? event.createdAt
-            : typeof event.ts === 'string'
-              ? event.ts
-              : undefined,
-          plan.label,
-          eid
-        );
+      const activityTs =
+        typeof event.createdAt === 'string'
+          ? event.createdAt
+          : typeof event.ts === 'string'
+            ? event.ts
+            : undefined;
+      const replayMeta =
+        (plan.mode === 'message-in' || plan.mode === 'message-out') &&
+        plan.role &&
+        plan.label &&
+        event.content.trim()
+          ? {
+              role: plan.role,
+              label: plan.label,
+              body: event.content,
+              ...(activityTs ? { at: activityTs } : {}),
+            }
+          : undefined;
+      // The replay metadata rides on the LEDGER entry too, so a compaction
+      // in THIS process serializes it into keptEntries and the block
+      // survives the next detach/reattach cycle as well.
+      const entry = ledger.addEntry(
+        'system',
+        compactForLedger(`⚡ ${actor} ${activityType} — ${event.content}`, 320),
+        'pcp-activity-history',
+        eid,
+        replayMeta
+      );
+      hydratedEntryIds.push(entry.id);
+      loaded += 1;
+      if (typeof event.activityId === 'string') {
+        seenActivityIds.add(event.activityId);
+      }
+      if (replayMeta) {
+        pushPreview(replayMeta.role, replayMeta.body, replayMeta.at, replayMeta.label, eid);
         messageCount += 1;
       }
     }
@@ -1193,6 +1213,42 @@ function compactForLedger(content: string, maxChars = LEDGER_COMPACT_CHARS): str
 
 // System-entry sources that are runtime bookkeeping, not conversation —
 // excluded from the visible history replay (they stay in the ledger).
+/** Validate replay metadata recovered from a transcript record. */
+function parseReplayMeta(raw: unknown): LedgerReplayMeta | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const r = raw as Record<string, unknown>;
+  if (r.role !== 'user' && r.role !== 'assistant') return undefined;
+  if (typeof r.label !== 'string' || !r.label) return undefined;
+  if (typeof r.body !== 'string' || !r.body) return undefined;
+  return {
+    role: r.role,
+    label: r.label,
+    body: r.body,
+    ...(typeof r.at === 'string' ? { at: r.at } : {}),
+  };
+}
+
+/**
+ * Serialize the post-compaction ledger tail for the compaction transcript
+ * event. The event is the COMPLETE new start state — hydration rebuilds the
+ * ledger AND the visible replay from it — so each kept entry carries its
+ * replay metadata (platform message blocks) alongside role/content/source.
+ * Without it, a platform send in the protected tail degrades to its compact
+ * ⚡ bookkeeping line after compact → detach → reattach (Lumen, PR #478).
+ */
+export function keptEntriesForCompaction(ledger: ContextLedger): Array<Record<string, unknown>> {
+  return ledger
+    .listEntries()
+    .slice(1) // entry 0 is the summary itself
+    .map((e) => ({
+      role: e.role,
+      content: e.content,
+      source: e.source,
+      ...(e.eid !== undefined ? { eid: e.eid } : {}),
+      ...(e.replay !== undefined ? { replay: e.replay } : {}),
+    }));
+}
+
 const INTERNAL_SYSTEM_SOURCES = new Set([
   'continuation',
   'compaction-tail',
@@ -1695,6 +1751,8 @@ function buildContextStatusSummary(params: {
   backendTokenWindow: number;
   pendingTurns: number;
   backend: string;
+  /** Model serving the session (pinned or stream-detected), when known. */
+  model?: string;
   bootstrapTokens?: number;
 }): string {
   const transcriptTokens = params.ledger.totalTokens();
@@ -1708,7 +1766,14 @@ function buildContextStatusSummary(params: {
     bootstrapTokens > 0
       ? `${compactTokens(transcriptTokens)}+${compactTokens(bootstrapTokens)}`
       : compactTokens(total);
-  return `${breakdown}/${compactTokens(params.maxContextTokens)} (${pct.toFixed(1)}%)  ·  ${queue}  ·  ${params.backend}`;
+  // The model serving the session (pinned or stream-detected), shortened by
+  // dropping the redundant backend prefix: claude:fable-5, not
+  // claude:claude-fable-5. Backend alone until the first init event reports.
+  const model = (params.model ?? '').trim();
+  const provider = model
+    ? `${params.backend}:${model.startsWith(`${params.backend}-`) ? model.slice(params.backend.length + 1) : model}`
+    : params.backend;
+  return `${breakdown}/${compactTokens(params.maxContextTokens)} (${pct.toFixed(1)}%)  ·  ${queue}  ·  ${provider}`;
 }
 
 /** 12_735 → '12.7k', 850_000 → '850k', 1_000_000 → '1M' — bar-sized numbers. */
@@ -3022,10 +3087,16 @@ export async function runChat(options: ChatOptions): Promise<void> {
         preview: compactForLedger(evt.text, 200),
       });
       renderStreamedLines(streamRenderer.completeMessage(evt.text));
-    } else if (evt.kind === 'model' && evt.model !== runtime.detectedModel) {
+    } else if (
+      evt.kind === 'model' &&
+      evt.model !== runtime.detectedModel &&
+      evt.model !== runtime.model
+    ) {
       // The provider announced the model actually serving the session — the
       // ground truth for the context window. Re-resolve unless the user
-      // pinned a model explicitly (then their pin already drove resolution).
+      // pinned a model explicitly (then their pin already drove resolution —
+      // an init that merely CONFIRMS the pin is skipped entirely, so pinned
+      // spawns don't re-append model_detected every process).
       const { windowChanged } = applyDetectedModel(runtime, evt.model, contextBudgetAuto);
       if (windowChanged) {
         printEvent(
@@ -3931,15 +4002,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         // marker in the file, so hydration must get the tail from here —
         // otherwise reattach would keep only the summary and lose the
         // protected recent entries the live session still has.
-        const keptEntries = ledger
-          .listEntries()
-          .slice(1) // entry 0 is the summary itself
-          .map((e) => ({
-            role: e.role,
-            content: e.content,
-            source: e.source,
-            ...(e.eid !== undefined ? { eid: e.eid } : {}),
-          }));
+        const keptEntries = keptEntriesForCompaction(ledger);
         appendTranscript(runtime.transcriptPath, {
           type: 'compaction',
           reason,
@@ -4290,8 +4353,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
       const preview = (activity.content || '').replace(/\\s+/g, ' ').trim().slice(0, 200);
       const rendered = `⚡ ${actor} ${type}${preview ? ` — ${preview}` : ''}`;
 
-      ledger.addEntry('system', compactForLedger(rendered, 320), 'pcp-activity');
-      appendTranscript(runtime.transcriptPath, {
+      // Tiered rendering: platform messages are real conversation and get
+      // proper message blocks; the agent's own mechanics (tools, state,
+      // backend turn lifecycle) are dim event lines; everything else stays
+      // a ⚡ activity block.
+      const plan = classifyActivity(activity, agentId);
+      const activityEid = appendTranscript(runtime.transcriptPath, {
         type: 'activity',
         activityId: activity.id,
         activityType: activity.type || null,
@@ -4304,11 +4371,28 @@ export async function runChat(options: ChatOptions): Promise<void> {
         // directional message label (📤 myra → telegram).
         platform: activity.platform || null,
       });
-      // Tiered rendering: platform messages are real conversation and get
-      // proper message blocks; the agent's own mechanics (tools, state,
-      // backend turn lifecycle) are dim event lines; everything else stays
-      // a ⚡ activity block.
-      const plan = classifyActivity(activity, agentId);
+      // Platform messages carry replay metadata so their message-block
+      // rendering survives compaction (the kept tail serializes ledger
+      // entries — the compact ⚡ line alone cannot rebuild the block).
+      const replayMeta =
+        (plan.mode === 'message-in' || plan.mode === 'message-out') &&
+        plan.role &&
+        plan.label &&
+        (activity.content || '').trim()
+          ? {
+              role: plan.role,
+              label: plan.label,
+              body: activity.content || '',
+              ...(activity.createdAt ? { at: activity.createdAt } : {}),
+            }
+          : undefined;
+      ledger.addEntry(
+        'system',
+        compactForLedger(rendered, 320),
+        'pcp-activity',
+        activityEid,
+        replayMeta
+      );
       const activityTime = formatHumanTime(activity.createdAt, runtime.userTimezone);
       if (plan.mode === 'message-in' || plan.mode === 'message-out') {
         // Full content, not the 200-char preview — these ARE the conversation
@@ -5450,6 +5534,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       backendTokenWindow: runtime.backendTokenWindow,
       pendingTurns,
       backend: runtime.backend,
+      model: runtime.model ?? runtime.detectedModel,
       bootstrapTokens: runtime.bootstrapContext ? estimateTokens(runtime.bootstrapContext) : 0,
     });
     if (inkRepl) {
@@ -5847,6 +5932,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       backendTokenWindow: runtime.backendTokenWindow,
       pendingTurns: 0,
       backend: runtime.backend,
+      model: runtime.model ?? runtime.detectedModel,
       bootstrapTokens: runtime.bootstrapContext ? estimateTokens(runtime.bootstrapContext) : 0,
     });
     inkRepl.setStatus(initialSummary);
