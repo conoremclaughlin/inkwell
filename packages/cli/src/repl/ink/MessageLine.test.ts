@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { collapseImagePaths, normalizeEventContent } from './MessageLine.js';
+import { collapseImagePaths, normalizeEventContent, splitLeadingMarker } from './MessageLine.js';
 
 describe('collapseImagePaths', () => {
   it('collapses absolute PNG path', () => {
@@ -76,5 +76,64 @@ describe('normalizeEventContent', () => {
     expect(normalizeEventContent('\u001b[2m🛠 already flush\u001b[22m')).toBe(
       '\u001b[2m🛠 already flush\u001b[22m'
     );
+  });
+});
+
+describe('splitLeadingMarker', () => {
+  it('splits a leading emoji marker from event text', () => {
+    expect(splitLeadingMarker('🛠 myra · send_response (executed)')).toEqual({
+      marker: '🛠',
+      rest: 'myra · send_response (executed)',
+    });
+    expect(splitLeadingMarker('🗑 evicted 5 entries')).toEqual({
+      marker: '🗑',
+      rest: 'evicted 5 entries',
+    });
+    expect(splitLeadingMarker('✅ signal: completed')).toEqual({
+      marker: '✅',
+      rest: 'signal: completed',
+    });
+  });
+
+  it('splits emoji from labels ("📬 inbox", "🔐 permission")', () => {
+    expect(splitLeadingMarker('📬 inbox')).toEqual({ marker: '📬', rest: 'inbox' });
+    expect(splitLeadingMarker('🔐 permission')).toEqual({ marker: '🔐', rest: 'permission' });
+  });
+
+  it('treats a marker-only string as marker with empty rest', () => {
+    expect(splitLeadingMarker('⚡')).toEqual({ marker: '⚡', rest: '' });
+  });
+
+  it('sees through a leading ANSI sequence and keeps it on the rest', () => {
+    expect(splitLeadingMarker('\u001b[2m🛠 tool line\u001b[22m')).toEqual({
+      marker: '🛠',
+      rest: '\u001b[2mtool line\u001b[22m',
+    });
+  });
+
+  it('leaves plain text untouched', () => {
+    expect(splitLeadingMarker('waiting for input')).toEqual({
+      marker: '',
+      rest: 'waiting for input',
+    });
+    expect(splitLeadingMarker('you')).toEqual({ marker: '', rest: 'you' });
+  });
+
+  it('leaves divider lines intact (box-drawing chars are not markers)', () => {
+    expect(splitLeadingMarker('─── ⌃ out of context ───')).toEqual({
+      marker: '',
+      rest: '─── ⌃ out of context ───',
+    });
+  });
+
+  it('leaves dash- and bracket-led text intact', () => {
+    expect(splitLeadingMarker('— a stray aside')).toEqual({
+      marker: '',
+      rest: '— a stray aside',
+    });
+    expect(splitLeadingMarker('[media note] rejected: too large')).toEqual({
+      marker: '',
+      rest: '[media note] rejected: too large',
+    });
   });
 });

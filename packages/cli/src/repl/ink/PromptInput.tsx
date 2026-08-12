@@ -280,7 +280,9 @@ export function PromptInput({
   const after = value.slice(cursor + 1);
 
   return (
-    <Box paddingX={1}>
+    // No left padding: the label (`❯` padded to the gutter width) starts at
+    // column 0 so input text lands on the same column as message text.
+    <Box paddingRight={1}>
       <Text wrap="wrap">
         <Text bold color="green">
           {label}

@@ -191,6 +191,77 @@ describe('MessageLine rendering', () => {
     expect(output).toContain('illustrated the problem');
   });
 
+  it('aligns markers in the gutter and text at the content column', () => {
+    const output = renderToString(
+      h(
+        Box,
+        { flexDirection: 'column' },
+        h(MessageLine, {
+          id: 'g-1',
+          role: 'user' as const,
+          content: 'hello there',
+          label: 'you',
+          time: '6:01 PM',
+        }),
+        h(MessageLine, {
+          id: 'g-2',
+          role: 'assistant' as const,
+          content: 'hi back',
+          label: 'myra',
+          time: '6:01 PM',
+        }),
+        h(MessageLine, {
+          id: 'g-3',
+          role: 'event' as const,
+          content: '🛠 myra · send_response (executed)',
+        }),
+        h(MessageLine, {
+          id: 'g-4',
+          role: 'inbox' as const,
+          content: 'ping from lumen',
+          label: '📬 inbox',
+          time: '6:02 PM',
+        })
+      ),
+      { columns: COLS }
+    );
+    console.log('\n=== GUTTER ALIGNMENT ===');
+    console.log(output);
+    // eslint-disable-next-line no-control-regex
+    const lines = output.replace(/\u001b\[[0-9;]*m/g, '').split('\n');
+    // Heading rows: marker at column 0, label text at the content column (3)
+    expect(lines).toContainEqual(expect.stringMatching(/^❯ {2}you {2}6:01 PM/));
+    expect(lines).toContainEqual(expect.stringMatching(/^✦ {2}myra {2}6:01 PM/));
+    // Label emoji moves to the gutter; heading keeps only the text
+    expect(lines).toContainEqual(expect.stringMatching(/^📬 inbox {2}6:02 PM/));
+    // Body rows sit at the content column, aligned under the heading text
+    expect(lines).toContainEqual(expect.stringMatching(/^ {3}hello there/));
+    expect(lines).toContainEqual(expect.stringMatching(/^ {3}hi back/));
+    // Event marker in the gutter, text at the content column (pad width
+    // varies with the glyph's measured width — 🛠 is 1, 📬 is 2)
+    expect(lines).toContainEqual(expect.stringMatching(/^🛠 +myra · send_response/));
+  });
+
+  it('renders a blank row between the heading and the body', () => {
+    const output = renderToString(
+      h(MessageLine, {
+        id: 'm-1',
+        role: 'assistant' as const,
+        content: 'body text',
+        label: 'myra',
+        time: '6:01 PM',
+      }),
+      { columns: COLS }
+    );
+    // eslint-disable-next-line no-control-regex
+    const lines = output.replace(/\u001b\[[0-9;]*m/g, '').split('\n');
+    const headingIdx = lines.findIndex((l) => l.includes('myra'));
+    const bodyIdx = lines.findIndex((l) => l.includes('body text'));
+    expect(headingIdx).toBeGreaterThanOrEqual(0);
+    expect(bodyIdx).toBe(headingIdx + 2);
+    expect(lines[headingIdx + 1]!.trim()).toBe('');
+  });
+
   it('renders conversation flow with multiple roles', () => {
     const output = renderToString(
       h(

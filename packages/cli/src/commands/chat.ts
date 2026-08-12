@@ -659,7 +659,8 @@ function getSessionTranscriptMetadata(sessionId: string): SessionTranscriptMetad
 // Exported for tests — verifies compaction events rehydrate summary + kept tail
 export function hydrateLedgerFromTranscript(
   ledger: ContextLedger,
-  transcriptPath: string
+  transcriptPath: string,
+  agentId?: string
 ): {
   loaded: number;
   messageCount: number;
@@ -929,7 +930,7 @@ export function hydrateLedgerFromTranscript(
       const argsPreview = argsJson.length > 100 ? `${argsJson.slice(0, 100)}…` : argsJson;
       pushPreview(
         'event',
-        `🛠 ${event.tool} (${status})${argsPreview ? ` — ${argsPreview}` : ''}`,
+        `🛠 ${agentId ? `${agentId} · ` : ''}${event.tool} (${status})${argsPreview ? ` — ${argsPreview}` : ''}`,
         typeof event.ts === 'string' ? event.ts : undefined,
         undefined,
         eid
@@ -2781,6 +2782,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // before stream-json the feed was silent during a backend-routed generation.
   const handleBackendEvent = (evt: BackendTurnEvent): void => {
     if (evt.kind === 'tool-use') {
+      // Surface the call in the live feed as the agent's own — one dim line,
+      // same shape as the replay's 🛠 rows.
+      printEvent(chalk.dim(`🛠 ${agentId} · ${evt.name} …`));
       appendTranscript(runtime.transcriptPath, {
         type: 'backend_tool',
         name: evt.name,
@@ -3144,7 +3148,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
   let historyHydration: HistoryHydrationResult | null = null;
   if (attachedToExistingSession && existingTranscript) {
-    const hydrated = hydrateLedgerFromTranscript(ledger, existingTranscript);
+    const hydrated = hydrateLedgerFromTranscript(ledger, existingTranscript, agentId);
     // Resume the provider session the prior process left live (delta only),
     // unless a compaction/eviction rolled it — then the next turn seeds fresh.
     if (runtime.backend === 'claude') {
@@ -4711,7 +4715,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
         onResult: (result: ToolCallResult) => {
           if (result.status === 'blocked' || result.status === 'denied') {
             const msg = `Local tool ${result.status} (${result.tool}): ${result.reason}`;
-            printLine(chalk.yellow(msg));
+            printEvent(
+              chalk.yellow(`🛠 ${agentId} · ${result.tool} (${result.status}) — ${result.reason}`)
+            );
             appendTranscript(runtime.transcriptPath, {
               type: 'local_tool_call',
               tool: result.tool,
@@ -4799,7 +4805,16 @@ export async function runChat(options: ChatOptions): Promise<void> {
                 }
               }
             } else {
-              printLine(chalk.cyan(`🛠 local tool ${result.tool} ${resultJson}`));
+              // One dim line, attributed to the agent, result truncated —
+              // the full payload lives in the Ctrl+T inspector, not scrollback.
+              const resultPreview = compactForLedger(resultJson, 160);
+              printEvent(
+                chalk.dim(
+                  `🛠 ${agentId} · ${result.tool} (${result.status})${
+                    resultPreview ? ` — ${resultPreview}` : ''
+                  }`
+                )
+              );
             }
             appendTranscript(runtime.transcriptPath, {
               type: 'local_tool_call',
@@ -4826,7 +4841,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
             });
           } else if (result.status === 'error') {
             const msg = `Local tool error (${result.tool}): ${result.error}`;
-            printLine(chalk.red(msg));
+            printEvent(
+              chalk.red(
+                `🛠 ${agentId} · ${result.tool} (error) — ${compactForLedger(String(result.error), 160)}`
+              )
+            );
             appendTranscript(runtime.transcriptPath, {
               type: 'local_tool_call',
               tool: result.tool,
@@ -5278,13 +5297,14 @@ export async function runChat(options: ChatOptions): Promise<void> {
           const at = typeof wrapper.ts === 'string' ? wrapper.ts : undefined;
           if (evt.type === 'tool_call') {
             const toolName = String(payload.toolName ?? payload.name ?? 'tool');
-            const line = `${agentId} · ${toolName}`;
+            // The agent's own tool call — a dim event line in the message
+            // flow, not a labeled activity block.
+            const line = `🛠 ${agentId} · ${toolName}`;
             if (inkRepl)
-              inkRepl.addMessage('activity', line, {
-                label: '⚡',
+              inkRepl.addMessage('event', line, {
                 time: formatHumanTime(at, runtime.userTimezone),
               });
-            else printEvent(chalk.dim(`  ⚡ ${line}`));
+            else printEvent(chalk.dim(`  ${line}`));
           } else if (evt.type === 'result') {
             const text = String(payload.text ?? '').trim();
             if (!text) return;
