@@ -672,7 +672,7 @@ export function hydrateLedgerFromTranscript(
   /** Entries excluded by context_evict events — for evicted-content display */
   evictedEntries: EvictedEntryRecord[];
   /** Tool calls replayed from the transcript (for the context inspector) */
-  toolCalls: Array<{ tool: string; status: string; at: string; args?: string }>;
+  toolCalls: Array<{ tool: string; status: string; at: string; args?: string; result?: string }>;
   /** Highest event id seen — seeds the append counter so new eids continue */
   maxEid: number;
 } {
@@ -686,7 +686,13 @@ export function hydrateLedgerFromTranscript(
   const seenActivityIds = new Set<string>();
   const recoveredMemoryIds: string[] = [];
   const evictedEntries: EvictedEntryRecord[] = [];
-  const toolCalls: Array<{ tool: string; status: string; at: string; args?: string }> = [];
+  const toolCalls: Array<{
+    tool: string;
+    status: string;
+    at: string;
+    args?: string;
+    result?: string;
+  }> = [];
   // Entries added by THIS hydration pass — a compaction event collapses them
   // (and only them; entries that pre-date hydration are left alone).
   const hydratedEntryIds: number[] = [];
@@ -935,6 +941,13 @@ export function hydrateLedgerFromTranscript(
         undefined,
         eid
       );
+      const resultJson =
+        event.result !== undefined
+          ? (typeof event.result === 'string'
+              ? event.result
+              : JSON.stringify(event.result)
+            ).replace(/\s+/g, ' ')
+          : '';
       toolCalls.push({
         tool: event.tool,
         status,
@@ -943,6 +956,11 @@ export function hydrateLedgerFromTranscript(
           ? argsJson.length > 400
             ? `${argsJson.slice(0, 400)}…`
             : argsJson
+          : undefined,
+        result: resultJson
+          ? resultJson.length > 2000
+            ? `${resultJson.slice(0, 2000)}…`
+            : resultJson
           : undefined,
       });
       if (toolCalls.length > 100) {
@@ -2822,7 +2840,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
   let hookTurnCount = 0;
 
   // Session-level tool call log — surfaced in the Ctrl+O context inspector
-  const recentToolCalls: Array<{ tool: string; status: string; at: string; args?: string }> = [];
+  const recentToolCalls: Array<{
+    tool: string;
+    status: string;
+    at: string;
+    args?: string;
+    result?: string;
+  }> = [];
 
   // Entries evicted from the window (hydration replay + live evictions) —
   // out of context but never out of sight; surfaced in the inspector
@@ -4770,19 +4794,20 @@ export async function runChat(options: ChatOptions): Promise<void> {
               const content = (r?.content as Array<{ text: string }> | undefined)?.[0]?.text;
               if (content) {
                 const parsed = JSON.parse(content);
-                printLine(
+                const sources = parsed.bySource
+                  ? Object.entries(
+                      parsed.bySource as Record<string, { count: number; tokens: number }>
+                    )
+                      .map(([src, { count, tokens }]) => `${src}(${count}/${tokens}t)`)
+                      .join(' ')
+                  : '';
+                printEvent(
                   chalk.dim(
-                    `  📋 context: ${parsed.totalEntries} entries, ~${parsed.totalTokens} tok`
+                    `📋 ${agentId} · list_context — ${parsed.totalEntries} entries, ~${parsed.totalTokens} tok${
+                      sources ? ` · ${sources}` : ''
+                    }`
                   )
                 );
-                if (parsed.bySource) {
-                  const sources = Object.entries(
-                    parsed.bySource as Record<string, { count: number; tokens: number }>
-                  )
-                    .map(([src, { count, tokens }]) => `${src}(${count}/${tokens}t)`)
-                    .join(' ');
-                  printLine(chalk.dim(`     ${sources}`));
-                }
               }
             } else if (result.tool === 'signal_status') {
               const r = result.result as Record<string, unknown> | undefined;
@@ -4806,7 +4831,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
               }
             } else {
               // One dim line, attributed to the agent, result truncated —
-              // the full payload lives in the Ctrl+T inspector, not scrollback.
+              // the Ctrl+T inspector holds a 2KB result slice per call and
+              // the transcript keeps the complete payload.
               const resultPreview = compactForLedger(resultJson, 160);
               printEvent(
                 chalk.dim(
@@ -4875,6 +4901,16 @@ export async function runChat(options: ChatOptions): Promise<void> {
       allToolResults.push(...iterationResults);
       for (const r of iterationResults) {
         const liveArgsJson = r.args ? JSON.stringify(r.args).replace(/\s+/g, ' ') : '';
+        // The scrollback line shows a 160-char teaser; the inspector (Ctrl+T)
+        // is the drill-down, so it keeps a much larger slice of the result.
+        // The complete payload always lives in the transcript.
+        const liveResultJson =
+          r.result !== undefined
+            ? (typeof r.result === 'string' ? r.result : JSON.stringify(r.result)).replace(
+                /\s+/g,
+                ' '
+              )
+            : '';
         recentToolCalls.push({
           tool: r.tool,
           status: r.status,
@@ -4883,6 +4919,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
             ? liveArgsJson.length > 400
               ? `${liveArgsJson.slice(0, 400)}…`
               : liveArgsJson
+            : undefined,
+          result: liveResultJson
+            ? liveResultJson.length > 2000
+              ? `${liveResultJson.slice(0, 2000)}…`
+              : liveResultJson
             : undefined,
         });
       }

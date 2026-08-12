@@ -34,6 +34,7 @@ describe('hydrateLedgerFromTranscript — tool call replay', () => {
           tool: 'send_response',
           args: { channel: 'telegram', conversationId: '726555973', content: 'heads-up!' },
           status: 'executed',
+          result: { success: true, messageId: 'tg-401' },
         },
         {
           eid: 3,
@@ -47,12 +48,12 @@ describe('hydrateLedgerFromTranscript — tool call replay', () => {
     );
 
     const ledger = new ContextLedger();
-    const result = hydrateLedgerFromTranscript(ledger, transcriptPath);
+    const result = hydrateLedgerFromTranscript(ledger, transcriptPath, 'myra');
 
-    // The tool call shows in the replay as an event row...
+    // The tool call shows in the replay as an event row, attributed to the agent...
     const eventRows = result.tailPreview.filter((p) => p.role === 'event');
     expect(eventRows).toHaveLength(1);
-    expect(eventRows[0].content).toContain('send_response');
+    expect(eventRows[0].content).toContain('myra · send_response');
     expect(eventRows[0].content).toContain('(executed)');
     expect(eventRows[0].content).toContain('telegram');
     expect(eventRows[0].eid).toBe(2);
@@ -65,13 +66,15 @@ describe('hydrateLedgerFromTranscript — tool call replay', () => {
     expect(result.messageCount).toBe(2);
     expect(ledger.listEntries().some((e) => e.content.includes('send_response'))).toBe(false);
 
-    // ...and is collected for the context inspector's Tool Calls section
+    // ...and is collected for the context inspector's Tool Calls section,
+    // result included (Ctrl+T is the drill-down for the scrollback teaser)
     expect(result.toolCalls).toHaveLength(1);
     expect(result.toolCalls[0].tool).toBe('send_response');
     expect(result.toolCalls[0].args).toContain('726555973');
+    expect(result.toolCalls[0].result).toContain('tg-401');
   });
 
-  it('caps long tool args in the replay preview', () => {
+  it('caps long tool args and results in the replay preview', () => {
     writeFileSync(
       transcriptPath,
       JSON.stringify({
@@ -80,6 +83,7 @@ describe('hydrateLedgerFromTranscript — tool call replay', () => {
         tool: 'remember',
         args: { content: 'x'.repeat(500) },
         status: 'executed',
+        result: { echo: 'y'.repeat(3000) },
       }) + '\n'
     );
 
@@ -93,6 +97,8 @@ describe('hydrateLedgerFromTranscript — tool call replay', () => {
     // The inspector record keeps a longer (but still capped) version
     expect(result.toolCalls[0].args!.length).toBeLessThanOrEqual(401);
     expect(result.toolCalls[0].args!.endsWith('…')).toBe(true);
+    expect(result.toolCalls[0].result!.length).toBeLessThanOrEqual(2001);
+    expect(result.toolCalls[0].result!.endsWith('…')).toBe(true);
   });
 });
 
