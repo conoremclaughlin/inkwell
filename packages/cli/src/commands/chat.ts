@@ -2397,10 +2397,14 @@ export function findLastBackendSession(
     } else if (
       event.type === 'compaction' ||
       event.type === 'context_evict' ||
-      event.type === 'context_trim'
+      event.type === 'context_trim' ||
+      event.type === 'context_budget_changed'
     ) {
-      // A context-boundary mutation rolled the provider session. Abandon any
-      // prior id — a backend_session marker after this point re-establishes it.
+      // A context-boundary mutation rolled the provider session — including a
+      // PACKING-WIDTH change from model detection: a session seeded at the
+      // old budget holds only that slice of history and must not be resumed
+      // at the new one (Lumen, PR #477 round 3). Abandon any prior id — a
+      // backend_session marker after this point re-establishes it.
       found = undefined;
     }
   }
@@ -2474,10 +2478,59 @@ export function applyModelSelection(
   });
   runtime.backendTokenWindow = resolveBackendTokenWindow(runtime.backend, runtime.model);
   if (contextBudgetAuto) {
-    runtime.maxContextTokens = defaultContextBudget(
-      runtime.backendTokenWindow,
-      promptTransportFor(runtime.backend)
-    );
+    applyBudgetForWindow(runtime, runtime.backendTokenWindow);
+  }
+}
+
+/**
+ * Apply a provider-REPORTED model (the stream's init event): remember it,
+ * persist it for cross-process recovery, and re-resolve the window/budget.
+ * When the packing budget changes, a `context_budget_changed` boundary is
+ * appended so a native session seeded at the OLD packing width is never
+ * resumed-by-recovery in a later process — a one-turn process can seed at
+ * 170K, detect Fable 5, and exit before the in-process shape drift gets a
+ * next turn to reseed; without the boundary, the next process would restore
+ * the 850K budget, recover the narrow-seeded session id, and delta into it
+ * forever, stranding the omitted history (Lumen, PR #477 round 3).
+ * findLastBackendSession treats the boundary like compaction/evict/trim
+ * markers: recovery is refused and the next turn seeds fresh at the new
+ * width (a post-detection reseed writes a new backend_session marker, which
+ * re-establishes recovery).
+ */
+export function applyDetectedModel(
+  runtime: ChatRuntime,
+  model: string,
+  contextBudgetAuto: boolean
+): { windowChanged: boolean } {
+  runtime.detectedModel = model;
+  appendTranscript(runtime.transcriptPath, {
+    type: 'model_detected',
+    backend: runtime.backend,
+    model,
+  });
+  const window = resolveBackendTokenWindow(runtime.backend, runtime.model ?? model);
+  if (window === runtime.backendTokenWindow) return { windowChanged: false };
+  runtime.backendTokenWindow = window;
+  if (contextBudgetAuto) {
+    applyBudgetForWindow(runtime, window);
+  }
+  return { windowChanged: true };
+}
+
+/**
+ * Recompute the AUTO working budget for a window and, when it actually
+ * changes, append the `context_budget_changed` boundary that severs
+ * cross-process recovery of native sessions seeded at the old packing width.
+ */
+function applyBudgetForWindow(runtime: ChatRuntime, window: number): void {
+  const previous = runtime.maxContextTokens;
+  runtime.maxContextTokens = defaultContextBudget(window, promptTransportFor(runtime.backend));
+  if (runtime.maxContextTokens !== previous) {
+    appendTranscript(runtime.transcriptPath, {
+      type: 'context_budget_changed',
+      from: previous,
+      to: runtime.maxContextTokens,
+    });
   }
 }
 
@@ -2941,28 +2994,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
       // The provider announced the model actually serving the session — the
       // ground truth for the context window. Re-resolve unless the user
       // pinned a model explicitly (then their pin already drove resolution).
-      runtime.detectedModel = evt.model;
-      // Persist so the NEXT process reattaching this session knows the real
-      // window BEFORE its first budget enforcement (destructive compaction
-      // must never run against the conservative default when the session's
-      // model is already known — Lumen, PR #477 review).
-      appendTranscript(runtime.transcriptPath, {
-        type: 'model_detected',
-        backend: runtime.backend,
-        model: evt.model,
-      });
-      const window = resolveBackendTokenWindow(runtime.backend, runtime.model ?? evt.model);
-      if (window !== runtime.backendTokenWindow) {
-        runtime.backendTokenWindow = window;
-        if (contextBudgetAuto) {
-          runtime.maxContextTokens = defaultContextBudget(
-            window,
-            promptTransportFor(runtime.backend)
-          );
-        }
+      const { windowChanged } = applyDetectedModel(runtime, evt.model, contextBudgetAuto);
+      if (windowChanged) {
         printEvent(
           chalk.dim(
-            `⚙ ${evt.model} · window ${formatTokenCount(window)} · budget ${formatTokenCount(runtime.maxContextTokens)} tok`
+            `⚙ ${evt.model} · window ${formatTokenCount(runtime.backendTokenWindow)} · budget ${formatTokenCount(runtime.maxContextTokens)} tok`
           )
         );
         emitStatusLaneIfChanged(true);

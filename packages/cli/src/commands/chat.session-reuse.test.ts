@@ -3,6 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import {
+  applyDetectedModel,
   applyModelSelection,
   buildPromptEnvelope,
   envelopeShapeKey,
@@ -220,6 +221,28 @@ describe('findLastBackendSession (cross-process recovery)', () => {
       { type: 'context_evict', actor: 'sb', refs: [{ hash: 'h' }] },
     ]);
     expect(findLastBackendSession(path)).toBeUndefined();
+  });
+
+  it('a context_budget_changed AFTER the last seed clears the candidate (packing-width change)', () => {
+    // One-turn process: seeded at 170K, detection raised the budget, exited
+    // before any reseed turn. The next process must NOT resume the
+    // narrow-seeded session — its omitted history would stay stranded
+    // (Lumen, PR #477 round 3).
+    const path = writeTranscript([
+      { type: 'backend_session', id: 'seeded-at-170k', routing: 'local' },
+      { type: 'model_detected', backend: 'claude', model: 'claude-fable-5' },
+      { type: 'context_budget_changed', from: 170_000, to: 850_000 },
+    ]);
+    expect(findLastBackendSession(path)).toBeUndefined();
+  });
+
+  it('a seed AFTER a budget change is the live session (post-detection reseed)', () => {
+    const path = writeTranscript([
+      { type: 'backend_session', id: 'seeded-at-170k', routing: 'local' },
+      { type: 'context_budget_changed', from: 170_000, to: 850_000 },
+      { type: 'backend_session', id: 'reseeded-at-850k', routing: 'local' },
+    ]);
+    expect(findLastBackendSession(path)?.id).toBe('reseeded-at-850k');
   });
 
   it('a context_trim AFTER the last seed clears the candidate', () => {
@@ -574,5 +597,106 @@ describe('applyModelSelection — /model transitions invalidate detection (PR #4
     applyModelSelection(rt, 'claude-fable-5', false);
     expect(rt.backendTokenWindow).toBe(1_000_000);
     expect(rt.maxContextTokens).toBe(123_456);
+  });
+
+  it('a budget-changing /model severs recovery of the narrow-seeded session', () => {
+    setup();
+    writeFileSync(
+      transcriptPath,
+      JSON.stringify({ type: 'backend_session', id: 'seeded-at-850k', routing: 'local' }) + '\n'
+    );
+    const rt = makeRuntime({
+      model: 'claude-fable-5',
+      detectedModel: 'claude-fable-5',
+      backendTokenWindow: 1_000_000,
+      maxContextTokens: 850_000,
+    });
+    applyModelSelection(rt, undefined, true); // 850K → 170K
+    expect(findLastBackendSession(transcriptPath)).toBeUndefined();
+  });
+});
+
+describe('one-turn process recovery sequence — detection outlives the seed (PR #477 round 3)', () => {
+  type RT = Parameters<typeof applyDetectedModel>[0];
+  let dir: string;
+  let transcriptPath: string;
+
+  const setup = () => {
+    dir = mkdtempSync(join(tmpdir(), 'ink-one-turn-recovery-'));
+    transcriptPath = join(dir, 'session.jsonl');
+  };
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const makeRuntime = (): RT =>
+    ({
+      backend: 'claude',
+      model: undefined,
+      detectedModel: undefined,
+      backendTokenWindow: 200_000,
+      maxContextTokens: 170_000,
+      transcriptPath,
+    }) as unknown as RT;
+
+  it('process A seeds narrow, detects Fable 5, exits — process B reseeds instead of resuming', () => {
+    setup();
+    // Process A, first (and only) turn: seeds the native session at the
+    // conservative 170K packing width...
+    writeFileSync(
+      transcriptPath,
+      JSON.stringify({ type: 'backend_session', id: 'seeded-at-170k', routing: 'local' }) + '\n'
+    );
+    // ...then the init event reports Fable 5 (production writer).
+    const a = makeRuntime();
+    const { windowChanged } = applyDetectedModel(a, 'claude-fable-5', true);
+    expect(windowChanged).toBe(true);
+    expect(a.maxContextTokens).toBe(850_000);
+    // Process A exits here — no reseed turn ever ran.
+
+    // Process B reattaches: it recovers the REAL model (850K budget before
+    // any enforcement)...
+    expect(findLastDetectedModel(transcriptPath, 'claude')).toBe('claude-fable-5');
+    // ...and MUST NOT recover the narrow-seeded session — resuming it with
+    // deltas would strand the history omitted from the 170K seed forever.
+    expect(findLastBackendSession(transcriptPath)).toBeUndefined();
+  });
+
+  it('detection that does NOT change the packing width preserves session continuity', () => {
+    setup();
+    // The common heartbeat case: a 200K-window model detected on a session
+    // seeded at the matching 170K width. No boundary — the next process
+    // resumes the same native session (continuity is the whole point of
+    // cross-process recovery).
+    writeFileSync(
+      transcriptPath,
+      JSON.stringify({ type: 'backend_session', id: 'seeded-at-170k', routing: 'local' }) + '\n'
+    );
+    const a = makeRuntime();
+    const { windowChanged } = applyDetectedModel(a, 'claude-sonnet-5', true);
+    expect(windowChanged).toBe(false);
+    expect(a.maxContextTokens).toBe(170_000);
+    expect(findLastDetectedModel(transcriptPath, 'claude')).toBe('claude-sonnet-5');
+    expect(findLastBackendSession(transcriptPath)?.id).toBe('seeded-at-170k');
+  });
+
+  it('a post-detection reseed in process A re-establishes recovery for process B', () => {
+    setup();
+    writeFileSync(
+      transcriptPath,
+      JSON.stringify({ type: 'backend_session', id: 'seeded-at-170k', routing: 'local' }) + '\n'
+    );
+    const a = makeRuntime();
+    applyDetectedModel(a, 'claude-fable-5', true);
+    // Process A gets a second turn: shape drift reseeds and persists the new
+    // seed marker AFTER the boundary.
+    writeFileSync(
+      transcriptPath,
+      readFileSync(transcriptPath, 'utf-8') +
+        JSON.stringify({ type: 'backend_session', id: 'reseeded-at-850k', routing: 'local' }) +
+        '\n'
+    );
+    expect(findLastBackendSession(transcriptPath)?.id).toBe('reseeded-at-850k');
   });
 });
