@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { collapseImagePaths, normalizeEventContent, splitLeadingMarker } from './MessageLine.js';
+import {
+  centerGutterMarker,
+  collapseImagePaths,
+  normalizeEventContent,
+  splitLeadingMarker,
+} from './MessageLine.js';
 
 describe('collapseImagePaths', () => {
   it('collapses absolute PNG path', () => {
@@ -135,5 +140,26 @@ describe('splitLeadingMarker', () => {
       marker: '',
       rest: '[media note] rejected: too large',
     });
+  });
+});
+
+describe('centerGutterMarker', () => {
+  it('centers single-width glyphs at the middle gutter column', () => {
+    expect(centerGutterMarker('❯')).toBe(' ❯');
+    expect(centerGutterMarker('✦')).toBe(' ✦');
+    expect(centerGutterMarker('∗')).toBe(' ∗');
+    expect(centerGutterMarker('✓')).toBe(' ✓');
+    expect(centerGutterMarker('✻')).toBe(' ✻');
+    expect(centerGutterMarker('🛠')).toBe(' 🛠'); // string-width measures 1
+  });
+
+  it('leaves double-width emoji at column 0 — they already fill the gutter', () => {
+    expect(centerGutterMarker('📬')).toBe('📬');
+    expect(centerGutterMarker('⚡')).toBe('⚡');
+    expect(centerGutterMarker('💡')).toBe('💡');
+  });
+
+  it('passes empty markers through untouched', () => {
+    expect(centerGutterMarker('')).toBe('');
   });
 });

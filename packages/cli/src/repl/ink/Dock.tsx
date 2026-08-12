@@ -1,6 +1,5 @@
-import React, { useState, useEffect, useCallback } from 'react';
-import { Box, Text, useStdout } from 'ink';
-import { StatusBar } from './StatusBar.js';
+import React, { useState, useCallback } from 'react';
+import { Box, Text } from 'ink';
 import { InfoBar } from './InfoBar.js';
 import { PromptInput } from './PromptInput.js';
 import { Separator } from './Separator.js';
@@ -28,13 +27,15 @@ interface DockProps {
 }
 
 /**
- * The dock is the dynamic tail of the chat UI: separators + status + prompt + info.
+ * The dock is the dynamic tail of the chat UI: separator + prompt + info bar.
+ * Context accounting, queue state, and the clock live in the bottom InfoBar
+ * next to cwd/branch — one consolidated chrome line instead of a dedicated
+ * status row above the prompt.
  *
- * It owns a single resize listener that bumps a React state counter,
- * forcing all children (Separator, StatusBar, etc.) to re-render with
- * the updated stdout.columns. Without this, Ink's resize handler
- * recalculates Yoga layout but does NOT trigger React reconciliation —
- * text content (like separator width) stays stale at the old width.
+ * The SINGLE resize listener lives in ChatApp (it also re-measures the
+ * <Static> width there); the Dock re-renders as its child, so sub-components
+ * (Separator, InfoBar) pick up the updated stdout.columns without their own
+ * listeners.
  */
 export function Dock({
   statusSummary,
@@ -54,17 +55,7 @@ export function Dock({
   onExpandMemories,
   onShowToolCalls,
 }: DockProps): React.ReactElement {
-  const { stdout } = useStdout();
-  const [, setResizeCounter] = useState(0);
   const [inputValue, setInputValue] = useState('');
-
-  useEffect(() => {
-    const onResize = () => setResizeCounter((c) => c + 1);
-    stdout?.on('resize', onResize);
-    return () => {
-      stdout?.off('resize', onResize);
-    };
-  }, [stdout]);
 
   const handleInputChange = useCallback(
     (value: string) => {
@@ -83,8 +74,6 @@ export function Dock({
   return (
     <Box flexDirection="column">
       {waitingElement}
-      <Separator />
-      <StatusBar summary={statusSummary} time={time} />
       <Separator />
       <PromptInput
         label={promptLabel}
@@ -117,7 +106,7 @@ export function Dock({
           <Text dimColor> again to quit</Text>
         </Box>
       ) : (
-        <InfoBar items={infoItems} />
+        <InfoBar items={[...infoItems, statusSummary]} right={time} />
       )}
     </Box>
   );
