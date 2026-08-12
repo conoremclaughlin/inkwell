@@ -489,6 +489,7 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
   // - Non-guard paths keep the pre-existing fetch-time advance through the
   //   returned batch (the global fetch≠delivered fix is the ack-protocol
   //   step, tracked separately).
+  let advanceFailed = false;
   if (markRead && messages && messages.length > 0) {
     if (guardActive) {
       if (skippedOlderCount > 0) {
@@ -509,6 +510,7 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
             if (!advanced) {
               // Checked write (spec §5): a failed skip-consume must be
               // visible — the range will re-offer next cold fetch.
+              advanceFailed = true;
               logger.error('[GetThreadMessages] deliberate_skip advance failed', {
                 threadKey,
                 agentId,
@@ -536,6 +538,7 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
           source: 'get_thread_messages:markRead',
         });
         if (!advanced) {
+          advanceFailed = true;
           logger.error('[GetThreadMessages] markRead advance failed', {
             threadKey,
             agentId,
@@ -563,6 +566,16 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
           // messages were cut by the cold-start guard or latestN window.
           ...(skippedOlderCount > 0 ? { skippedOlderCount } : {}),
           ...(guardActive ? { coldStartGuard: true } : {}),
+          // Checked write surfaced to the caller (spec §5): messages were
+          // returned, but the read-pointer advance did NOT persist — read
+          // state is stale and messages may re-deliver.
+          ...(advanceFailed
+            ? {
+                advanceFailed: true,
+                warning:
+                  'read-pointer advance failed — read state is stale; messages may re-deliver',
+              }
+            : {}),
           messages: (messages || []).map((m: Record<string, unknown>) => ({
             id: m.id,
             senderAgentId: m.sender_agent_id,

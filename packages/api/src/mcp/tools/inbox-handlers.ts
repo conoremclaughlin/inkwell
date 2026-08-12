@@ -141,29 +141,6 @@ export interface ThreadPageRow {
 }
 
 /**
- * Select the delivery-poll thread page by CANDIDACY, not recency (spec §4,
- * Lumen PR #473 round 3). A candidate is potentially unread: no read pointer,
- * or thread activity (updated_at) after the pointer. Acked threads leave the
- * candidate set, so an older backlog thread surfaces on a later poll instead
- * of starving behind a fixed newest-N page forever.
- */
-export function selectCandidateThreadPage(
-  threads: ThreadPageRow[],
-  pointers: Map<string, string | null>,
-  pageLimit: number
-): { page: ThreadPageRow[]; truncated: boolean } {
-  const candidates = threads.filter((t) => {
-    const pointer = pointers.get(t.id);
-    if (!pointer) return true;
-    return (t.updated_at ?? '') > pointer;
-  });
-  const sorted = [...candidates].sort((a, b) =>
-    (b.updated_at ?? '').localeCompare(a.updated_at ?? '')
-  );
-  return { page: sorted.slice(0, pageLimit), truncated: candidates.length > pageLimit };
-}
-
-/**
  * Check if a thread is owned by a specific studio based on the agent's
  * message metadata. Used by channelPoll filtering.
  *
@@ -1360,35 +1337,47 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
       // thread's updated_at between polls.
       let threads: ThreadPageRow[] | null = null;
       if (channelPoll && agentId) {
-        // Delivery polls page by CANDIDACY, not recency (Lumen, PR #473
-        // round 3): the fixed newest-20 page starved any older unread
-        // thread forever once 20 newer open threads existed. Candidates =
-        // potentially-unread (no pointer, or activity after the pointer);
-        // acked threads leave the set, so older backlog surfaces on later
-        // polls. Cap the scan at 500 stamped threads.
-        const { data: allOpen } = await threadTable(supabase, 'inbox_threads')
-          .select('id, thread_key, title, user_id, created_by_agent_id, updated_at')
-          .eq('user_id', resolved.user.id)
-          .eq('status', 'open')
-          .in('id', threadIds)
-          .order('updated_at', { ascending: false })
-          .limit(500);
-        const openRows = (allOpen || []) as ThreadPageRow[];
-        const { data: ptrRows } = await threadTable(supabase, 'inbox_thread_read_status')
-          .select('thread_id, last_read_at')
-          .in(
-            'thread_id',
-            openRows.map((t) => t.id)
-          )
-          .eq('agent_id', agentId);
-        const pointers = new Map<string, string | null>(
-          ((ptrRows || []) as Array<{ thread_id: string; last_read_at: string | null }>).map(
-            (r) => [r.thread_id, r.last_read_at]
-          )
+        // Delivery polls page by EXACT candidacy in SQL (Lumen, PR #473
+        // round 3): candidacy compares the read pointer against the latest
+        // MESSAGE timestamp — thread.updated_at is bumped AFTER the message
+        // insert with a later app timestamp, so updated_at-based candidacy
+        // kept every fully-acked thread a candidate forever. The RPC scans
+        // all stamped threads (no client pre-cap — nothing is silently
+        // unreachable) and returns the newest-first page + total count.
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const { data: candRows, error: candErr } = await (supabase as any).rpc(
+          'get_unread_thread_candidates',
+          {
+            p_user_id: resolved.user.id,
+            p_agent_id: agentId,
+            p_session_id: callerSessionId,
+            p_limit: THREAD_PAGE_LIMIT,
+          }
         );
-        const selected = selectCandidateThreadPage(openRows, pointers, THREAD_PAGE_LIMIT);
-        threads = selected.page;
-        unreadThreadsTruncated = selected.truncated;
+        if (candErr) {
+          logger.error('channel_poll_candidates_failed', {
+            agentId,
+            sessionId: callerSessionId,
+            error: candErr.message,
+          });
+          throw new Error(`Failed to select unread thread candidates: ${candErr.message}`);
+        }
+        const cands = (candRows || []) as Array<{
+          thread_id: string;
+          latest_message_at: string;
+          total_candidates: number | string;
+        }>;
+        unreadThreadsTruncated = (Number(cands[0]?.total_candidates) || 0) > THREAD_PAGE_LIMIT;
+        if (cands.length > 0) {
+          const candIds = cands.map((c) => c.thread_id);
+          const { data: pageRows } = await threadTable(supabase, 'inbox_threads')
+            .select('id, thread_key, title, user_id, created_by_agent_id, updated_at')
+            .in('id', candIds);
+          const byId = new Map(((pageRows || []) as ThreadPageRow[]).map((t) => [t.id, t]));
+          threads = candIds.map((id) => byId.get(id)).filter(Boolean) as ThreadPageRow[];
+        } else {
+          threads = [];
+        }
       } else {
         const { data } = await threadTable(supabase, 'inbox_threads')
           .select('id, thread_key, title, user_id, created_by_agent_id, updated_at')
@@ -1531,8 +1520,9 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
       }
     }
   } catch (err) {
-    // Thread tables may not exist yet (migration not applied) — graceful fallback
-    logger.debug('Failed to fetch thread unread counts (tables may not exist)', { err });
+    // Graceful fallback (legacy: thread tables may not exist) — but LOUD:
+    // for a channelPoll this is a delivery outage, not trivia.
+    logger.warn('Failed to fetch thread unread counts', { err });
   }
 
   const inboxUnreadCount = unreadCount || 0;

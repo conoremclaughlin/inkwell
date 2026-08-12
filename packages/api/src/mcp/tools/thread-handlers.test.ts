@@ -1063,6 +1063,33 @@ describe('handleGetThreadMessages — cold-start guard (spec §4)', () => {
     );
   });
 
+  it('surfaces a failed deliberate_skip advance in the response (checked write, round 3)', async () => {
+    const { advanceThreadReadPointer } = await import('./read-state.js');
+    vi.mocked(advanceThreadReadPointer).mockResolvedValueOnce(false as never);
+    const rows = [
+      ...Array.from({ length: 15 }, (_, i) => guardMsg(`old-${i}`, 100 + i * 10)),
+      ...Array.from({ length: 5 }, (_, i) => guardMsg(`new-${i}`, 1 + i)),
+    ];
+    const parsed = await callGuard(createGuardMockSupabase(rows), {
+      channelPoll: true,
+      markRead: true,
+    });
+    expect(parsed.success).toBe(true); // messages WERE returned
+    expect(parsed.advanceFailed).toBe(true);
+    expect(parsed.warning).toContain('read-pointer advance failed');
+  });
+
+  it('surfaces a failed non-guard markRead advance in the response (checked write, round 3)', async () => {
+    const { advanceThreadReadPointer } = await import('./read-state.js');
+    vi.mocked(advanceThreadReadPointer).mockResolvedValueOnce(false as never);
+    const rows = [guardMsg('m-1', 2), guardMsg('m-2', 1)];
+    const parsed = await callGuard(createGuardMockSupabase(rows, { joinedAt: null }), {
+      markRead: true,
+    });
+    expect(parsed.advanceFailed).toBe(true);
+    expect(parsed.warning).toContain('read-pointer advance failed');
+  });
+
   it('no truncation → no skippedOlderCount field, delivery unchanged', async () => {
     const rows = Array.from({ length: 5 }, (_, i) => guardMsg(`m-${i}`, 1 + i));
     const parsed = await callGuard(createGuardMockSupabase(rows), { channelPoll: true });
