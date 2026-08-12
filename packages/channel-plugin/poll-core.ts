@@ -75,6 +75,12 @@ export interface DrainOptions {
    * the backlog is drained (suppresses the summary this poll).
    */
   moreThreadsPending?: boolean;
+  /**
+   * True when get_inbox reported channelPollIncomplete — the server's
+   * candidacy query failed and the thread list is partial. An empty page
+   * under this flag is an OUTAGE, never drain proof.
+   */
+  pollIncomplete?: boolean;
 }
 
 export interface DrainResult {
@@ -151,6 +157,10 @@ export async function drainThreads(
       // Fetch NEVER consumes (§7): the exact-id ack below is the only
       // consumption, for cold and cursored fetches alike.
       markRead: false,
+      // System events are not channel-deliverable and never advance the
+      // pointer — candidacy (get_unread_thread_candidates) excludes them,
+      // and so must the delivery fetch, or ack ranges and candidacy drift.
+      includeSystemEvents: false,
       channelPoll: true,
       // Budget-bounded request: the aggregate ceiling can never overshoot.
       limit: requestedLimit,
@@ -257,7 +267,8 @@ export async function drainThreads(
     fetchFailures === 0 &&
     emitFailures === 0 &&
     ackFailures === 0 &&
-    !opts.moreThreadsPending
+    !opts.moreThreadsPending &&
+    !opts.pollIncomplete
   ) {
     state.summarySent = true;
     await deps

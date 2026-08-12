@@ -1300,6 +1300,10 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
   // more participant threads exist beyond it.
   const THREAD_PAGE_LIMIT = 20;
   let unreadThreadsTruncated = false;
+  // A failed candidacy query (or any thread-section failure on a delivery
+  // poll) must NEVER masquerade as an empty inbox: the poller would treat it
+  // as drained. Surfaced in the response; the plugin's drain proof honors it.
+  let channelPollIncomplete = false;
 
   // (callerSessionId resolved + fail-closed gate applied at the top of the
   // handler — before the legacy inbox fetch/advance. See spec §3.)
@@ -1344,13 +1348,12 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
         // kept every fully-acked thread a candidate forever. The RPC scans
         // all stamped threads (no client pre-cap — nothing is silently
         // unreachable) and returns the newest-first page + total count.
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const { data: candRows, error: candErr } = await (supabase as any).rpc(
+        const { data: candRows, error: candErr } = await supabase.rpc(
           'get_unread_thread_candidates',
           {
             p_user_id: resolved.user.id,
             p_agent_id: agentId,
-            p_session_id: callerSessionId,
+            p_session_id: callerSessionId ?? undefined,
             p_limit: THREAD_PAGE_LIMIT,
           }
         );
@@ -1360,9 +1363,9 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
             sessionId: callerSessionId,
             error: candErr.message,
           });
-          throw new Error(`Failed to select unread thread candidates: ${candErr.message}`);
+          channelPollIncomplete = true;
         }
-        const cands = (candRows || []) as Array<{
+        const cands = (candErr ? [] : candRows || []) as Array<{
           thread_id: string;
           latest_message_at: string;
           total_candidates: number | string;
@@ -1521,7 +1524,9 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
     }
   } catch (err) {
     // Graceful fallback (legacy: thread tables may not exist) — but LOUD:
-    // for a channelPoll this is a delivery outage, not trivia.
+    // for a channelPoll this is a delivery outage, not trivia, and the
+    // response must not read as a drained inbox.
+    if (channelPoll) channelPollIncomplete = true;
     logger.warn('Failed to fetch thread unread counts', { err });
   }
 
@@ -1556,6 +1561,13 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
             readAt: m.read_at,
           })),
           ...(unreadThreadsTruncated ? { unreadThreadsTruncated: true } : {}),
+          ...(channelPollIncomplete
+            ? {
+                channelPollIncomplete: true,
+                warning:
+                  'channel_poll_incomplete: thread candidacy query failed — results are partial; do NOT treat this poll as drained',
+              }
+            : {}),
           ...(threadsWithUnread.length > 0
             ? {
                 threadsWithUnread,

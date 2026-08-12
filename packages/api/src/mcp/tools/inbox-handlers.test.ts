@@ -2359,6 +2359,11 @@ describe('handleGetInbox — channelPoll thread paging via get_unread_thread_can
       'channel_poll_candidates_failed',
       expect.objectContaining({ agentId: 'wren' })
     );
-    expect(JSON.parse(result.content[0].text).success).toBe(true);
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(true);
+    // The outage must NOT masquerade as a drained inbox (round 4): the
+    // poller sees an explicit incomplete signal and withholds drain proof.
+    expect(parsed.channelPollIncomplete).toBe(true);
+    expect(parsed.warning).toContain('channel_poll_incomplete');
   });
 });

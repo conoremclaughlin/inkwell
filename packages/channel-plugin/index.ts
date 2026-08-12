@@ -342,7 +342,10 @@ async function pollInbox(): Promise<void> {
         },
         drainState,
         (result.threadsWithUnread as Array<Record<string, unknown>>) || [],
-        { moreThreadsPending: result.unreadThreadsTruncated === true }
+        {
+          moreThreadsPending: result.unreadThreadsTruncated === true,
+          pollIncomplete: result.channelPollIncomplete === true,
+        }
       );
       if (drained.injected > 0 || drained.ceilingHit || drained.fetchFailures > 0) {
         log('debug', 'Thread drain result', { ...drained });

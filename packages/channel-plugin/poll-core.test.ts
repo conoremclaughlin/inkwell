@@ -121,7 +121,13 @@ describe('drainThreads — cold-fetch ack protocol (spec §1)', () => {
     const state = createThreadDrainState();
     await drainThreads(h.deps, state, [mkThread('pr:x', 3)]);
 
-    expect(h.fetchArgs[0]).toMatchObject({ markRead: false, channelPoll: true });
+    expect(h.fetchArgs[0]).toMatchObject({
+      markRead: false,
+      channelPoll: true,
+      // System events are excluded from delivery — candidacy excludes them
+      // too, so ack ranges and candidacy never drift (round 4).
+      includeSystemEvents: false,
+    });
     expect(h.ackArgs).toEqual([
       expect.objectContaining({ threadKey: 'pr:x', throughMessageId: 'm-3' }),
     ]);
@@ -259,6 +265,17 @@ describe('drainThreads — summary accumulation and drain proof', () => {
     const h3 = createHarness({ 'pr:c': { messages: [mkMsg('p3-1')], skipped: 2 } });
     await drainThreads(h3.deps, state, [mkThread('pr:c', 1)]);
     expect(h3.notifications.filter((n) => n.content.includes('cold-start guard'))).toHaveLength(0);
+  });
+
+  it('an INCOMPLETE poll (server candidacy failure) suppresses the summary — outage is not drain', async () => {
+    const state = createThreadDrainState();
+    const h1 = createHarness({ 'pr:a': { messages: [mkMsg('i-1')], skipped: 2 } });
+    await drainThreads(h1.deps, state, [mkThread('pr:a', 1)], { pollIncomplete: true });
+    expect(state.summarySent).toBe(false);
+
+    const h2 = createHarness({});
+    await drainThreads(h2.deps, state, [], { pollIncomplete: false });
+    expect(state.summarySent).toBe(true);
   });
 
   it('a truncated thread page (paginated unread threads) suppresses the summary', async () => {
