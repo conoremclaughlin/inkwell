@@ -2108,6 +2108,8 @@ function createScopedPollMockSupabase(
     sessionLookupError?: boolean;
     /** Rows served when a table chain is awaited as a list (thenable). */
     tableRows?: Record<string, unknown[]>;
+    /** PostgREST-style RESOLVED errors ({data:null, error}) per table. */
+    tableErrors?: Record<string, string>;
   } = {}
 ) {
   const eqCalls: Record<string, Array<[string, unknown]>> = {};
@@ -2142,8 +2144,14 @@ function createScopedPollMockSupabase(
     self.maybeSingle = vi
       .fn()
       .mockResolvedValue(table === 'sessions' ? sessionResult : { data: null, error: null });
-    self.then = (resolve: (v: unknown) => unknown) =>
-      Promise.resolve({ data: opts.tableRows?.[table] ?? [], error: null, count: 0 }).then(resolve);
+    self.then = (resolve: (v: unknown) => unknown) => {
+      const injectedError = opts.tableErrors?.[table];
+      return Promise.resolve(
+        injectedError
+          ? { data: null, error: { message: injectedError }, count: null }
+          : { data: opts.tableRows?.[table] ?? [], error: null, count: 0 }
+      ).then(resolve);
+    };
     return self;
   };
 
@@ -2341,6 +2349,56 @@ describe('handleGetInbox — channelPoll thread paging via get_unread_thread_can
     );
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed.unreadThreadsTruncated).toBe(true);
+  });
+
+  it('a RESOLVED participant-query error ({data:null,error}) surfaces as incomplete — not drained', async () => {
+    // PostgREST failures resolve, they do not throw: without checked reads
+    // this poll returned success:true with zero threads and the plugin
+    // emitted its drain summary during an outage.
+    const mockSb = createScopedPollMockSupabase({
+      tableErrors: { inbox_thread_participants: 'connection reset by peer' },
+    });
+    const result = await handleGetInbox(
+      { email: 'test@test.com', channelPoll: true },
+      createMockDataComposer(mockSb as never) as never
+    );
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(true);
+    expect(parsed.channelPollIncomplete).toBe(true);
+    // The RPC must not even run off a failed participant scan.
+    expect((mockSb as { rpc: ReturnType<typeof vi.fn> }).rpc).not.toHaveBeenCalledWith(
+      'get_unread_thread_candidates',
+      expect.anything()
+    );
+  });
+
+  it('a RESOLVED thread-messages error turns candidates into incomplete, not zero unread', async () => {
+    const mockSb = createScopedPollMockSupabase({
+      tableRows: {
+        inbox_thread_participants: [{ thread_id: 't-1' }],
+        inbox_threads: [
+          {
+            id: 't-1',
+            thread_key: 'pr:t1',
+            title: null,
+            user_id: 'user-123',
+            created_by_agent_id: 'lumen',
+            updated_at: '2026-08-12T00:00:01Z',
+          },
+        ],
+      },
+      tableErrors: { inbox_thread_messages: 'statement timeout' },
+    });
+    withCandidates(mockSb, [
+      { thread_id: 't-1', latest_message_at: '2026-08-12T00:00:01Z', total_candidates: 1 },
+    ]);
+    const result = await handleGetInbox(
+      { email: 'test@test.com', channelPoll: true },
+      createMockDataComposer(mockSb as never) as never
+    );
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.channelPollIncomplete).toBe(true);
+    expect(parsed.warning).toContain('channel_poll_incomplete');
   });
 
   it('an RPC failure is LOUD — no silent empty delivery', async () => {
