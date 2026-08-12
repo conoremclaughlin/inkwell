@@ -1286,6 +1286,11 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
   }
   let threadsWithUnread: ThreadSummary[] = [];
   let threadUnreadCount = 0;
+  // Completion signal (Lumen, PR #473 §5): the threads page below is capped —
+  // a poller must not treat a quiet page as proof the backlog is drained when
+  // more participant threads exist beyond it.
+  const THREAD_PAGE_LIMIT = 20;
+  let unreadThreadsTruncated = false;
 
   // (callerSessionId resolved + fail-closed gate applied at the top of the
   // handler — before the legacy inbox fetch/advance. See spec §3.)
@@ -1312,6 +1317,7 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
     const threadIds = [
       ...new Set((participantRows || []).map((p: { thread_id: string }) => p.thread_id)),
     ];
+    unreadThreadsTruncated = threadIds.length > THREAD_PAGE_LIMIT;
 
     if (threadIds.length > 0) {
       // Get open threads for this user.
@@ -1326,7 +1332,7 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
         .eq('status', 'open')
         .in('id', threadIds)
         .order('updated_at', { ascending: false })
-        .limit(20);
+        .limit(THREAD_PAGE_LIMIT);
 
       if (threads?.length) {
         const tIds = threads.map((t: { id: string }) => t.id);
@@ -1501,6 +1507,7 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
             createdAt: m.created_at,
             readAt: m.read_at,
           })),
+          ...(unreadThreadsTruncated ? { unreadThreadsTruncated: true } : {}),
           ...(threadsWithUnread.length > 0
             ? {
                 threadsWithUnread,

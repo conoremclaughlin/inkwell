@@ -105,6 +105,13 @@ const listThreadsSchema = userIdentifierBaseSchema.extend({
 const markThreadReadSchema = userIdentifierBaseSchema.extend({
   threadKey: threadKeySchema,
   agentId: agentIdSchema.describe('Agent ID marking the thread as read'),
+  throughMessageId: z
+    .string()
+    .uuid()
+    .optional()
+    .describe(
+      'Exact-id acknowledgement (spec inkmail-read-state §1): advance the read pointer through THIS message only — the last one actually delivered — instead of the whole thread. Used by delivery consumers (channel plugin) to ack after successful injection.'
+    ),
 });
 
 // ============== Helpers (exported for use by inbox-handlers) ==============
@@ -472,27 +479,54 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
   // Get participants
   const participants = await getParticipants(supabase, thread.id);
 
-  // Mark as read — advance the pointer through the latest message in the
-  // returned batch via the atomic RPC (monotonic; never NOW(), never
-  // backwards). A caller passing an old explicit afterMessageId (or a client
-  // replaying with a partial set) must not regress the read pointer.
+  // Pointer advance semantics (Lumen, PR #473):
+  // - GUARD MODE (cold-start delivery poll): fetched-but-not-yet-rendered
+  //   messages must remain unread — the delivery consumer acks after
+  //   injection via mark_thread_read(throughMessageId). Only the range the
+  //   guard DELIBERATELY skipped is durably consumed here, by advancing
+  //   through the newest skipped message (the cutoff below the delivered
+  //   window) — never through the returned batch.
+  // - Non-guard paths keep the pre-existing fetch-time advance through the
+  //   returned batch (the global fetch≠delivered fix is the ack-protocol
+  //   step, tracked separately).
   if (markRead && messages && messages.length > 0) {
-    let maxCreatedAt = '';
-    let maxMessageId = '';
-    for (const m of messages as Array<{ id?: string; created_at?: string }>) {
-      const ts = m.created_at;
-      if (ts && m.id && ts > maxCreatedAt) {
-        maxCreatedAt = ts;
-        maxMessageId = m.id;
+    if (guardActive) {
+      if (skippedOlderCount > 0) {
+        const oldestDelivered = messages[0] as { created_at?: string };
+        if (oldestDelivered?.created_at) {
+          const { data: newestSkipped } = await buildQuery('id, created_at')
+            .lt('created_at', oldestDelivered.created_at)
+            .order('created_at', { ascending: false })
+            .limit(1)
+            .maybeSingle();
+          if (newestSkipped?.id) {
+            await advanceThreadReadPointer(supabase, {
+              threadId: thread.id,
+              agentId,
+              throughMessageId: newestSkipped.id,
+              source: 'get_thread_messages:deliberate_skip',
+            });
+          }
+        }
       }
-    }
-    if (maxMessageId) {
-      await advanceThreadReadPointer(supabase, {
-        threadId: thread.id,
-        agentId,
-        throughMessageId: maxMessageId,
-        source: 'get_thread_messages:markRead',
-      });
+    } else {
+      let maxCreatedAt = '';
+      let maxMessageId = '';
+      for (const m of messages as Array<{ id?: string; created_at?: string }>) {
+        const ts = m.created_at;
+        if (ts && m.id && ts > maxCreatedAt) {
+          maxCreatedAt = ts;
+          maxMessageId = m.id;
+        }
+      }
+      if (maxMessageId) {
+        await advanceThreadReadPointer(supabase, {
+          threadId: thread.id,
+          agentId,
+          throughMessageId: maxMessageId,
+          source: 'get_thread_messages:markRead',
+        });
+      }
     }
   }
 
@@ -862,6 +896,61 @@ export async function handleMarkThreadRead(args: unknown, dataComposer: DataComp
           text: JSON.stringify({
             success: false,
             error: `Agent ${agentId} is not a participant in thread ${threadKey}`,
+          }),
+        },
+      ],
+    };
+  }
+
+  // Exact-id acknowledgement (spec §1): a delivery consumer acks the LAST
+  // message it actually injected — the pointer advances exactly through it,
+  // never past messages that were fetched but not yet rendered.
+  if (parsed.throughMessageId) {
+    const { data: ackMsg, error: ackErr } = await threadTable(supabase, 'inbox_thread_messages')
+      .select('id')
+      .eq('id', parsed.throughMessageId)
+      .eq('thread_id', thread.id)
+      .maybeSingle();
+    if (ackErr) {
+      throw new Error(`Failed to validate ack message for ${threadKey}: ${ackErr.message}`);
+    }
+    if (!ackMsg?.id) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: JSON.stringify({
+              success: false,
+              error: `Message ${parsed.throughMessageId} not found in thread ${threadKey}`,
+            }),
+          },
+        ],
+      };
+    }
+    const advanced = await advanceThreadReadPointer(supabase, {
+      threadId: thread.id,
+      agentId,
+      throughMessageId: ackMsg.id,
+      source: 'mark_thread_read:ack',
+    });
+    if (!advanced) {
+      throw new Error(`Failed to persist read state for thread ${threadKey}`);
+    }
+    logger.info('Thread read acknowledged through message', {
+      threadKey,
+      agentId,
+      throughMessageId: ackMsg.id,
+    });
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: JSON.stringify({
+            success: true,
+            message: `Thread ${threadKey} acknowledged through ${ackMsg.id}`,
+            threadKey,
+            agentId,
+            throughMessageId: ackMsg.id,
           }),
         },
       ],

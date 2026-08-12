@@ -745,7 +745,7 @@ describe('handleSendToInbox - thread routing', () => {
 // get_thread_messages — cold-start guard (spec inkmail-read-state §4)
 // =====================================================
 
-import { handleGetThreadMessages } from './thread-handlers';
+import { handleGetThreadMessages, handleMarkThreadRead } from './thread-handlers';
 
 vi.mock('./read-state.js', () => ({
   advanceThreadReadPointer: vi.fn().mockResolvedValue({ success: true }),
@@ -838,6 +838,14 @@ function createGuardMockSupabase(
     self.single = vi.fn(() => {
       const row = rows.find((r) => r.id === state.idEq);
       return Promise.resolve({ data: row || null, error: null });
+    });
+    self.maybeSingle = vi.fn(() => {
+      if (state.idEq) {
+        const row = rows.find((r) => r.id === state.idEq);
+        return Promise.resolve({ data: row || null, error: null });
+      }
+      const { data } = compute();
+      return Promise.resolve({ data: data && data.length ? data[0] : null, error: null });
     });
     self.then = (resolve: (v: unknown) => unknown) => Promise.resolve(compute()).then(resolve);
     return self;
@@ -969,13 +977,89 @@ describe('handleGetThreadMessages — cold-start guard (spec §4)', () => {
     expect(ids).toEqual(['m-4', 'm-3', 'm-2', 'm-1', 'm-0']);
   });
 
-  it('markRead advances the pointer through the NEWEST delivered message', async () => {
+  it('guard mode advances ONLY through the newest deliberately-skipped message — never the batch', async () => {
+    // 15 old (100h+) + 5 recent: window delivers 5, floor tops up to the
+    // newest 10 (5 recent + 5 newest-old), skipping the 10 oldest. The
+    // pointer must advance through the newest SKIPPED message — the
+    // delivered batch stays unread until the consumer acks (Lumen §1).
     const { advanceThreadReadPointer } = await import('./read-state.js');
-    const rows = [guardMsg('older', 30), guardMsg('newest', 1)];
-    await callGuard(createGuardMockSupabase(rows), { channelPoll: true, markRead: true });
+    const rows = [
+      ...Array.from({ length: 15 }, (_, i) => guardMsg(`old-${i}`, 100 + i * 10)),
+      ...Array.from({ length: 5 }, (_, i) => guardMsg(`new-${i}`, 1 + i)),
+    ];
+    const parsed = await callGuard(createGuardMockSupabase(rows), {
+      channelPoll: true,
+      markRead: true,
+    });
+    expect(parsed.messageCount).toBe(10);
+    expect(parsed.skippedOlderCount).toBe(10);
+    // Newest skipped = old-4 is delivered (ages 100..140 in the top-10);
+    // the newest NOT delivered is old-5 (age 150).
+    expect(vi.mocked(advanceThreadReadPointer)).toHaveBeenCalledTimes(1);
     expect(vi.mocked(advanceThreadReadPointer)).toHaveBeenCalledWith(
       expect.anything(),
-      expect.objectContaining({ throughMessageId: 'newest' })
+      expect.objectContaining({
+        throughMessageId: 'old-5',
+        source: 'get_thread_messages:deliberate_skip',
+      })
+    );
+  });
+
+  it('guard mode with zero skips advances nothing (batch awaits consumer ack)', async () => {
+    const { advanceThreadReadPointer } = await import('./read-state.js');
+    const rows = [guardMsg('a', 5), guardMsg('b', 1)];
+    await callGuard(createGuardMockSupabase(rows), { channelPoll: true, markRead: true });
+    expect(vi.mocked(advanceThreadReadPointer)).not.toHaveBeenCalled();
+  });
+
+  it('non-guard markRead keeps the pre-existing batch advance', async () => {
+    const { advanceThreadReadPointer } = await import('./read-state.js');
+    const rows = [guardMsg('older', 30), guardMsg('newest', 1)];
+    await callGuard(createGuardMockSupabase(rows, { joinedAt: null }), { markRead: true });
+    expect(vi.mocked(advanceThreadReadPointer)).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        throughMessageId: 'newest',
+        source: 'get_thread_messages:markRead',
+      })
+    );
+  });
+
+  it('mark_thread_read with throughMessageId acks EXACTLY that message', async () => {
+    const { advanceThreadReadPointer } = await import('./read-state.js');
+    const rows = [guardMsg('m-1', 3), guardMsg('m-2', 2), guardMsg('m-3', 1)];
+    const sb = createGuardMockSupabase(rows);
+    const result = await handleMarkThreadRead(
+      {
+        email: 'test@test.com',
+        agentId: 'wren',
+        threadKey: 'pr:guard',
+        throughMessageId: '00000000-0000-0000-0000-000000000000',
+      },
+      guardComposer(sb)
+    );
+    // UUID not in the thread → refused, no advance.
+    expect(JSON.parse(result.content[0].text).success).toBe(false);
+    expect(vi.mocked(advanceThreadReadPointer)).not.toHaveBeenCalled();
+  });
+
+  it('mark_thread_read acks a real message id and advances exactly through it', async () => {
+    const { advanceThreadReadPointer } = await import('./read-state.js');
+    const ackId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const rows = [guardMsg(ackId, 3), guardMsg('m-newer', 1)];
+    const sb = createGuardMockSupabase(rows);
+    const result = await handleMarkThreadRead(
+      { email: 'test@test.com', agentId: 'wren', threadKey: 'pr:guard', throughMessageId: ackId },
+      guardComposer(sb)
+    );
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(true);
+    expect(parsed.throughMessageId).toBe(ackId);
+    // Advanced exactly through the acked message — NOT the thread's newest.
+    expect(vi.mocked(advanceThreadReadPointer)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(advanceThreadReadPointer)).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ throughMessageId: ackId, source: 'mark_thread_read:ack' })
     );
   });
 
