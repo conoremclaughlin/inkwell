@@ -34,6 +34,12 @@ import { SessionRepository } from './session-repository.js';
 import { ContextBuilder } from './context-builder.js';
 import { ClaudeRunner, buildIdentityPrompt } from './claude-runner.js';
 import { CodexRunner } from './codex-runner.js';
+import {
+  registerActiveRun,
+  clearActiveRun,
+  trackStateWrite,
+  admitStateWrite,
+} from './active-runs.js';
 import { GeminiRunner } from './gemini-runner.js';
 import { InkRunner } from './ink-runner.js';
 import { ActivityStreamRepository } from '../../data/repositories/activity-stream.repository.js';
@@ -725,8 +731,41 @@ export class SessionService implements ISessionService {
         logger.warn('Failed to log backend spawn activity', { error: err });
       });
 
-    // Mark session as running before backend turn
-    await this.repository.update(session.id, { lifecycle: 'running' });
+    // Registered BEFORE the write, not after it. The invariant this has to
+    // hold is "registered ⟺ the row is (or is about to be) persisted as
+    // running" — anything narrower leaves a window where a shutdown sees no
+    // active run and walks away from a row that says `running` forever, which
+    // is the exact zombie this is here to prevent (Lumen, PR #490 — P1).
+    const admitted = registerActiveRun({
+      sessionId: session.id,
+      userId,
+      agentId,
+      backend: resolvedBackend,
+      threadKey: metadata?.threadKey as string | undefined,
+      senderAgentId: request.sender?.id,
+      startedAt: Date.now(),
+    });
+
+    // Intake closes at the top of shutdown. A turn started now is guaranteed
+    // to be killed before it finishes, and would be invisible to the drain
+    // that has already run — so refuse it rather than spawn a child that
+    // cannot survive and cannot be reported.
+    if (!admitted) {
+      throw new Error('Server is shutting down; not starting a new backend turn.');
+    }
+
+    // Mark session as running before backend turn. Tracked so the shutdown
+    // drain can wait for it: if this write is still in flight when the
+    // interruption runs, it would land afterwards and restore `running`.
+    try {
+      await trackStateWrite(this.repository.update(session.id, { lifecycle: 'running' }));
+    } catch (runningWriteError) {
+      // The row is not running, so the registration describes nothing. Leaving
+      // it would make shutdown post an interruption notice for a turn that
+      // never started.
+      clearActiveRun(session.id);
+      throw runningWriteError;
+    }
 
     // Media flows to backends as file paths, not inline base64. Channel
     // listeners download attachments to ~/.ink/files/<channel>/; the
@@ -741,6 +780,7 @@ export class SessionService implements ISessionService {
     let result;
     let turnDurationMs: number;
     const turnStartMs = Date.now();
+
     try {
       result = await runner.run(formattedMessage, {
         backendSessionId: session.backendSessionId || undefined,
@@ -750,13 +790,24 @@ export class SessionService implements ISessionService {
       });
       turnDurationMs = Date.now() - turnStartMs;
     } catch (runnerError) {
-      // Runner threw (spawn failure, capacity error, etc.) — mark session as failed
-      await this.repository.update(session.id, { lifecycle: 'failed' }).catch((e) => {
-        logger.warn('Failed to set lifecycle=failed after runner crash', {
-          sessionId: session.id,
-          error: e,
-        });
-      });
+      // Runner threw (spawn failure, capacity error, etc.) — mark session as
+      // failed, unless shutdown already owns this session's state and would
+      // have its interruption record overwritten by this write.
+      let failedWritten = admitStateWrite(session.id);
+      if (failedWritten) {
+        await trackStateWrite(this.repository.update(session.id, { lifecycle: 'failed' })).catch(
+          (e) => {
+            // The row is still `running`. Keeping the registration is the point:
+            // this is precisely a session that needs reporting at shutdown, and
+            // clearing it here is how the zombie survived round 1.
+            failedWritten = false;
+            logger.warn('Failed to set lifecycle=failed after runner crash', {
+              sessionId: session.id,
+              error: e,
+            });
+          }
+        );
+      }
       this.activityStream
         .logActivity({
           userId,
@@ -783,6 +834,10 @@ export class SessionService implements ISessionService {
           } as unknown as Json,
         })
         .catch(() => {});
+      // Cleared only if `failed` actually persisted — not in a `finally`
+      // around runner.run(). A finally fires while the row still says
+      // `running`, reopening the same window on the way out.
+      if (failedWritten) clearActiveRun(session.id);
       throw runnerError;
     }
 
@@ -841,7 +896,19 @@ export class SessionService implements ISessionService {
     // Leaving it true causes future triggers to skip spawning (they expect a
     // channel plugin to deliver, but none runs for headless sessions).
     const postRunLifecycle = result.success ? 'idle' : 'failed';
-    if (result.backendSessionId !== session.backendSessionId) {
+
+    // A runner can return after the shutdown drain has already snapshotted and
+    // interrupted this session. Because repository.update() rewrites the whole
+    // metadata blob from a snapshot taken at its own start, finalizing now
+    // would overwrite the interruption's lifecycle AND erase its breadcrumb.
+    // Shutdown owns the state from here (Lumen, PR #490 round 3).
+    let finalized = false;
+    if (!admitStateWrite(session.id)) {
+      logger.warn('Skipping post-run session write; shutdown already recorded this session', {
+        sessionId: session.id,
+        wouldHaveBeen: postRunLifecycle,
+      });
+    } else if (result.backendSessionId !== session.backendSessionId) {
       logger.info('Backend session ID linked to PCP session', {
         pcpSessionId: session.id,
         backendSessionId: result.backendSessionId,
@@ -849,23 +916,49 @@ export class SessionService implements ISessionService {
         backend: resolvedBackend,
         agentId: session.agentId,
       });
-      await this.repository.update(session.id, {
-        backendSessionId: result.backendSessionId,
-        messageCount: session.messageCount + 1,
-        backend: resolvedBackend,
-        lifecycle: postRunLifecycle as Session['lifecycle'],
-        cliAttached: false,
-      });
+      await trackStateWrite(
+        this.repository.update(session.id, {
+          backendSessionId: result.backendSessionId,
+          messageCount: session.messageCount + 1,
+          backend: resolvedBackend,
+          lifecycle: postRunLifecycle as Session['lifecycle'],
+          cliAttached: false,
+        })
+      );
+      finalized = true;
     } else {
-      await this.repository.update(session.id, {
-        messageCount: session.messageCount + 1,
-        backend: resolvedBackend,
-        lifecycle: postRunLifecycle as Session['lifecycle'],
-        cliAttached: false,
-      });
+      await trackStateWrite(
+        this.repository.update(session.id, {
+          messageCount: session.messageCount + 1,
+          backend: resolvedBackend,
+          lifecycle: postRunLifecycle as Session['lifecycle'],
+          cliAttached: false,
+        })
+      );
+      finalized = true;
     }
 
-    if (result.usage) {
+    // Cleared ONLY if a terminal state actually persisted. Clearing after a
+    // refused write would delete this run from the registry while its row
+    // still says `running` — and if shutdown is mid-drain and has not
+    // snapshotted yet, the session vanishes from the report and gets no
+    // notice. Exactly the original zombie, reached through the gate meant to
+    // prevent it (Lumen, PR #490 round 4).
+    //
+    // Staying registered is also right when something throws between
+    // runner.run() and here: the row really is still `running`, so a later
+    // shutdown reporting it as interrupted is the truth.
+    if (finalized) clearActiveRun(session.id);
+
+    // Gated on `finalized` for the same reason the lifecycle write is:
+    // updateTokenUsage() ends in a full SessionRepository.update(), which
+    // replaces the whole metadata blob and is not tracked by the drain — so
+    // it can erase the interruption breadcrumb written moments earlier. The
+    // compaction trigger below would likewise start new work against a server
+    // that has closed intake. Losing a usage checkpoint costs a stats row;
+    // losing the breadcrumb costs the record of the interruption itself
+    // (Lumen, PR #490 round 5).
+    if (result.usage && finalized) {
       // Scope the cumulative checkpoint to the backend thread the counts came
       // from — Codex totals restart whenever the thread does.
       await this.repository.updateTokenUsage(

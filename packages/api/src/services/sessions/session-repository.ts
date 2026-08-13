@@ -239,7 +239,14 @@ export class SessionRepository implements ISessionRepository {
       .eq('agent_id', agentId)
       .eq('thread_key', threadKey)
       .is('ended_at', null)
-      .neq('lifecycle', 'failed')
+      // `ended_at IS NULL` was doing none of the work it looks like it is
+      // doing: nothing set `ended_at` on completion, so finished sessions
+      // stayed NULL and kept matching here. A thread whose conversation was
+      // over would route the next trigger back into the completed session
+      // instead of starting a fresh one. Filter on lifecycle directly, and
+      // see handleUpdateSessionPhase — which now stamps `ended_at` too, so
+      // the clause above finally means something (PR #349, revived).
+      .not('lifecycle', 'in', '(completed,failed)')
       .order('started_at', { ascending: false })
       .limit(1);
 

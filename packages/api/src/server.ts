@@ -61,6 +61,8 @@ import {
   type SessionAttachedRow,
 } from './services/sessions/trigger-delivery';
 import { assignThreadParticipant } from './services/sessions/thread-assignment';
+import { closeIntakeAndDrain } from './services/sessions/active-runs';
+import { interruptActiveRuns } from './services/sessions/interrupt-active-runs';
 import type { ActivityType } from './data/repositories/activity-stream.repository';
 import { resolveTaskGroupForThreadKey } from './services/task-group-resolver';
 import { sendTriggerFailureNotice } from './services/trigger-failure-notice';
@@ -1572,6 +1574,26 @@ async function shutdown(): Promise<void> {
   forceKillTimer.unref(); // Don't let the timer itself keep the process alive
 
   try {
+    // Before anything is torn down: the agent CLIs we spawned are our children
+    // and are about to die with us. Record that, and tell whoever is waiting.
+    // Runs first because it needs a live DB client, and because the notice is
+    // worth more than a few hundred milliseconds of shutdown latency.
+    // Close intake and let outstanding lifecycle writes settle before taking
+    // the snapshot. Snapshotting first would race the very writes it needs to
+    // order against — a pending `running` write would land after our
+    // interruption and restore the zombie.
+    const { runs: interrupted, drained } = await closeIntakeAndDrain();
+    if (interrupted.length > 0 && dataComposer) {
+      // `drained` is passed through rather than swallowed: if a lifecycle
+      // write was still outstanding, whatever we record here may be
+      // contradicted a moment later, and the notice has to say so.
+      await interruptActiveRuns(dataComposer.getClient(), interrupted, undefined, drained).catch(
+        (err) => {
+          logger.error('Interruption bookkeeping failed', { error: err });
+        }
+      );
+    }
+
     // Stop heartbeat cron job (logs internally)
     stopHeartbeatService();
 

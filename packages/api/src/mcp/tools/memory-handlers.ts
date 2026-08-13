@@ -1449,6 +1449,23 @@ function isSignificantPhaseTransition(phase: string): boolean {
   return phase.startsWith('blocked:') || phase.startsWith('waiting:') || phase === 'complete';
 }
 
+/**
+ * Whether this update finishes the session, and so should stamp `ended_at`.
+ *
+ * Nothing used to stamp it. That left `ended_at` NULL on every completed
+ * session, which in turn made the `ended_at IS NULL` clause in
+ * findByThreadKey filter nothing — so a thread whose conversation was over
+ * routed the next trigger back into the finished session instead of starting
+ * fresh (PR #349, revived).
+ *
+ * Both spellings are checked because either can carry the completion: callers
+ * may pass the legacy `status: 'completed'` or the current
+ * `lifecycle: 'completed'`.
+ */
+export function shouldStampEndedAt(params: { status?: string; lifecycle?: string }): boolean {
+  return params.status === 'completed' || params.lifecycle === 'completed';
+}
+
 function buildPhaseTransitionMemoryContent(params: {
   phase: string;
   note?: string;
@@ -1611,6 +1628,7 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
     cliAttached?: boolean;
     alias?: string | null;
     activeThreadKey?: string | null;
+    endedAt?: Date | null;
   } = {};
 
   // Map runtime: prefix phases to lifecycle (backward compat for old callers)
@@ -1642,6 +1660,11 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
   if (params.status !== undefined) {
     updates.status = params.status;
   }
+
+  if (shouldStampEndedAt({ status: params.status, lifecycle: updates.lifecycle })) {
+    updates.endedAt = new Date();
+  }
+
   if (params.backendSessionId !== undefined) {
     updates.backendSessionId = params.backendSessionId;
   }
