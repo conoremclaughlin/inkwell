@@ -41,6 +41,35 @@ describe('classifyActivity', () => {
     expect(plan.label).toBe('📤 myra → channel');
   });
 
+  it('demotes INBOUND inkmail lifecycle rows to bookkeeping — one message, one render', () => {
+    // One logical inkmail message logs dispatch (sometimes twice), deliver,
+    // and a message_in trigger record, and the content also arrives as the
+    // injected channel turn — Conor watched one message render three-plus
+    // times at 5:30 PM. The mechanics are receipts, not conversation.
+    expect(
+      classifyActivity({ type: 'inkmail_dispatch', agentId: 'myra', fromAgentId: 'wren' }, 'myra')
+        .mode
+    ).toBe('bookkeeping');
+    expect(
+      classifyActivity({ type: 'inkmail_deliver', agentId: 'myra', fromAgentId: 'wren' }, 'myra')
+        .mode
+    ).toBe('bookkeeping');
+  });
+
+  it('keeps the agent OWN outbound inkmail dispatch visible', () => {
+    // The dispatch row is the only feed record of what the agent sent.
+    expect(
+      classifyActivity({ type: 'inkmail_dispatch', agentId: 'lumen', fromAgentId: 'myra' }, 'myra')
+        .mode
+    ).toBe('block');
+  });
+
+  it('keeps inkmail failures loud — a dropped delivery is never a dim receipt', () => {
+    expect(
+      classifyActivity({ type: 'inkmail_fail', agentId: 'myra', fromAgentId: 'wren' }, 'myra').mode
+    ).toBe('block');
+  });
+
   it('classifies own backend turn lifecycle as bookkeeping (regression: rendered as ⚡ blocks)', () => {
     expect(
       classifyActivity(

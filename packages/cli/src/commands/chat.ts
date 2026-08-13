@@ -237,6 +237,8 @@ interface ActivitySummary {
   createdAt?: string;
   /** Originating platform for message activities (telegram, discord, …) */
   platform?: string;
+  /** Sender from the inkmail lifecycle payload — tells own sends from inbound mechanics. */
+  fromAgentId?: string;
 }
 
 function isBackendAuthBackend(value: string): value is BackendAuthBackend {
@@ -1005,6 +1007,7 @@ export function hydrateLedgerFromTranscript(
           subtype: typeof event.activitySubtype === 'string' ? event.activitySubtype : undefined,
           agentId: typeof event.agentId === 'string' ? event.agentId : undefined,
           platform: typeof event.platform === 'string' ? event.platform : undefined,
+          fromAgentId: typeof event.fromAgentId === 'string' ? event.fromAgentId : undefined,
         },
         agentId ?? actor
       );
@@ -1601,6 +1604,12 @@ function extractActivitySummaries(
               ? row.created_at
               : undefined,
         platform: typeof row.platform === 'string' ? row.platform : undefined,
+        fromAgentId: (() => {
+          const payload = row.payload as Record<string, unknown> | undefined;
+          return payload && typeof payload.fromAgentId === 'string'
+            ? payload.fromAgentId
+            : undefined;
+        })(),
       };
     })
     .filter((activity): activity is ActivitySummary => Boolean(activity));
@@ -4368,8 +4377,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
         createdAt: activity.createdAt || null,
         content: activity.content || null,
         // Needed at replay: hydration re-classifies the entry to rebuild the
-        // directional message label (📤 myra → telegram).
+        // directional message label (📤 myra → telegram) and to tell own
+        // inkmail sends from inbound delivery mechanics.
         platform: activity.platform || null,
+        fromAgentId: activity.fromAgentId || null,
       });
       // Platform messages carry replay metadata so their message-block
       // rendering survives compaction (the kept tail serializes ledger
