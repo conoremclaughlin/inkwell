@@ -34,6 +34,8 @@ const PCP_ENV_HEADERS: Array<{ header: string; envVar: string }> = [
 export class CodexAdapter implements BackendAdapter {
   readonly name = 'codex';
   readonly binary = 'codex';
+  // Prompt rides argv (`codex exec <prompt>`) — bounded by OS ARG_MAX.
+  readonly promptTransport = 'argv' as const;
 
   prepare(config: BackendConfig): PreparedBackend {
     const { promptFile, cleanup } = createIdentityPromptFile(

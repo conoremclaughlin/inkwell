@@ -150,6 +150,8 @@ function supportsPartialMessages(): boolean {
 export class ClaudeAdapter implements BackendAdapter {
   readonly name = 'claude';
   readonly binary = 'claude';
+  // Prompt is delivered via stdin (see prepare() below) — no argv ceiling.
+  readonly promptTransport = 'stdin' as const;
 
   prepare(config: BackendConfig): PreparedBackend {
     const identityPrompt = buildIdentityPrompt(config.agentId);

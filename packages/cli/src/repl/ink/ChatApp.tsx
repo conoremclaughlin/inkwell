@@ -1,8 +1,13 @@
 import React, { useState, useCallback, useEffect, useRef } from 'react';
-import { Box, Static, Text, useApp } from 'ink';
+import { Box, Static, Text, useApp, useStdout } from 'ink';
 import { ContextViewer } from './context-viewer.js';
 import { Dock } from './Dock.js';
-import { GUTTER_WIDTH, MessageLine, type MessageLineProps } from './MessageLine.js';
+import {
+  GUTTER_WIDTH,
+  MessageLine,
+  centerGutterMarker,
+  type MessageLineProps,
+} from './MessageLine.js';
 import { formatNow } from '../tui-components.js';
 
 const WAITING_VERBS = [
@@ -20,7 +25,7 @@ const WAITING_VERBS = [
   'Mulling it over',
 ];
 
-const SPINNER_CHAR = '✦';
+const SPINNER_CHAR = '✻';
 
 export interface ChatMessage extends MessageLineProps {
   id: string;
@@ -77,7 +82,19 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
   ref
 ) {
   const { exit } = useApp();
+  const { stdout } = useStdout();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+
+  // Re-render on resize so newly-rendered <Static> items pick up the fresh
+  // width (items already written to scrollback keep their original wrap).
+  const [, setResizeCounter] = useState(0);
+  useEffect(() => {
+    const onResize = () => setResizeCounter((c) => c + 1);
+    stdout?.on('resize', onResize);
+    return () => {
+      stdout?.off('resize', onResize);
+    };
+  }, [stdout]);
   const [statusSummary, setStatusSummary] = useState('waiting for input');
   const [waiting, setWaiting] = useState(false);
   const [waitingBackend, setWaitingBackend] = useState('');
@@ -100,21 +117,21 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
   // frame, erasing the tall context viewer before showing the shorter dock.
   const [dismissingContext, setDismissingContext] = useState(false);
 
-  // Waiting indicator state — verb rotates every 3s
+  // Waiting indicator — ONE random verb per wait (no mid-wait word swapping);
+  // the motion comes from the trailing dots cycling . → .. → ...
   const [waitingVerb, setWaitingVerb] = useState('');
-  const verbIndexRef = useRef(Math.floor(Math.random() * WAITING_VERBS.length));
+  const [waitingDots, setWaitingDots] = useState(3);
 
   useEffect(() => {
     if (!waiting) return;
-    verbIndexRef.current = Math.floor(Math.random() * WAITING_VERBS.length);
-    setWaitingVerb(WAITING_VERBS[verbIndexRef.current]!);
+    setWaitingVerb(WAITING_VERBS[Math.floor(Math.random() * WAITING_VERBS.length)]!);
+    setWaitingDots(3);
 
-    const verbTimer = setInterval(() => {
-      verbIndexRef.current = (verbIndexRef.current + 1) % WAITING_VERBS.length;
-      setWaitingVerb(WAITING_VERBS[verbIndexRef.current]!);
-    }, 3000);
+    const dotsTimer = setInterval(() => {
+      setWaitingDots((prev) => (prev % 3) + 1);
+    }, 500);
 
-    return () => clearInterval(verbTimer);
+    return () => clearInterval(dotsTimer);
   }, [waiting]);
 
   // Expose handle for external state pushing
@@ -222,7 +239,14 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
   const now = formatNow(timezone);
   // The prompt marker occupies the same gutter column as message markers so
   // input text lines up with message text (see GUTTER_WIDTH in MessageLine).
-  const promptLabel = '❯'.padEnd(GUTTER_WIDTH, ' ');
+  const promptLabel = centerGutterMarker('❯');
+
+  // Ink's <Static> positions its subtree absolutely, so it never inherits the
+  // terminal-width constraint — without an explicit width, message text wraps
+  // at the FULL terminal width and then renders 3 columns right of the gutter,
+  // overflowing the terminal by up to GUTTER_WIDTH (the stray 1–3 character
+  // fragments at column 0). Pin it to the real width.
+  const staticWidth = stdout?.columns || 80;
 
   const showingContext = contextViewLines !== null;
   const dockVisible = !showingContext && !dismissingContext;
@@ -272,7 +296,7 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
         (dynamicMessages ? (
           <Box flexDirection="column">{messageElements}</Box>
         ) : (
-          <Static items={messages}>
+          <Static items={messages} style={{ width: staticWidth }}>
             {(msg) => (
               <MessageLine
                 key={msg.id}
@@ -311,9 +335,12 @@ export const ChatApp = React.forwardRef<ChatAppHandle, ChatAppProps>(function Ch
             waiting ? (
               <Box marginTop={1} marginBottom={1}>
                 <Box width={GUTTER_WIDTH} flexShrink={0}>
-                  <Text color="cyan">{SPINNER_CHAR}</Text>
+                  <Text color="cyan">{centerGutterMarker(SPINNER_CHAR)}</Text>
                 </Box>
-                <Text dimColor>{waitingVerb}...</Text>
+                <Text dimColor>
+                  {waitingVerb}
+                  {'.'.repeat(waitingDots)}
+                </Text>
               </Box>
             ) : undefined
           }

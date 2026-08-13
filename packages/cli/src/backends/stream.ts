@@ -33,6 +33,13 @@ export type BackendTurnEvent =
   | { kind: 'text-delta'; text: string }
   | { kind: 'tool-use'; id?: string; name: string; input?: unknown }
   | { kind: 'tool-result'; id?: string; isError?: boolean }
+  /**
+   * The provider announced which model is actually serving the session
+   * (claude: the `system`/`init` event). Emitted once per turn, before any
+   * text. Consumers use it to resolve the REAL context window instead of
+   * guessing from backend defaults (context-limits.ts).
+   */
+  | { kind: 'model'; model: string }
   | {
       kind: 'result';
       text?: string;

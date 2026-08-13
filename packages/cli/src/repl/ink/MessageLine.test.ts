@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { collapseImagePaths, normalizeEventContent, splitLeadingMarker } from './MessageLine.js';
+import {
+  centerGutterMarker,
+  collapseImagePaths,
+  normalizeEventContent,
+  splitLeadingMarker,
+} from './MessageLine.js';
 
 describe('collapseImagePaths', () => {
   it('collapses absolute PNG path', () => {
@@ -135,5 +140,32 @@ describe('splitLeadingMarker', () => {
       marker: '',
       rest: '[media note] rejected: too large',
     });
+  });
+});
+
+describe('centerGutterMarker', () => {
+  it('centers single-width TEXT glyphs at the middle gutter column', () => {
+    expect(centerGutterMarker('❯')).toBe(' ❯');
+    expect(centerGutterMarker('✦')).toBe(' ✦');
+    expect(centerGutterMarker('✱')).toBe(' ✱');
+    expect(centerGutterMarker('✓')).toBe(' ✓');
+    expect(centerGutterMarker('✻')).toBe(' ✻');
+  });
+
+  it('keeps ALL pictographic glyphs at column 0 — a rendered-wide emoji must never touch the text', () => {
+    // Measured 2 by string-width:
+    expect(centerGutterMarker('📬')).toBe('📬');
+    expect(centerGutterMarker('⚡')).toBe('⚡');
+    expect(centerGutterMarker('💡')).toBe('💡');
+    // Measured 1 by string-width (text-presentation emoji) but rendered at
+    // 2 columns by most terminals — centering these by measured width butts
+    // them against the text (Conor, 2026-08-12 screenshot).
+    expect(centerGutterMarker('🛠')).toBe('🛠');
+    expect(centerGutterMarker('🗑')).toBe('🗑');
+    expect(centerGutterMarker('⚙')).toBe('⚙');
+  });
+
+  it('passes empty markers through untouched', () => {
+    expect(centerGutterMarker('')).toBe('');
   });
 });

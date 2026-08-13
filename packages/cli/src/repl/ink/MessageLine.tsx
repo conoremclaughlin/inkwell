@@ -1,5 +1,6 @@
 import React from 'react';
 import { Box, Text } from 'ink';
+import stringWidth from 'string-width';
 
 export type MessageRole =
   | 'user'
@@ -52,13 +53,41 @@ const CONTENT_COLORS: Record<MessageRole, string | undefined> = {
   event: 'gray',
 };
 
+/**
+ * Emoji glyphs, regardless of measured width. string-width reports
+ * text-presentation emoji (🛠 🗑 ⚙) as 1 column, but most terminals render
+ * them emoji-style at 2 — centering by the measured width butts them against
+ * the adjacent text (zero visual gap). Text glyphs (❯ ✦ ✱ ✓ ✻) are not
+ * pictographic and measure truthfully.
+ */
+const PICTOGRAPHIC_RE = /\p{Extended_Pictographic}/u;
+
+/**
+ * Center a marker glyph within the gutter column: single-width TEXT glyphs
+ * (❯ ✦ ✱ ✓ ✻) sit in the middle column instead of hugging the left edge.
+ * Pictographic glyphs are treated as at least 2 columns wide whatever
+ * string-width claims (see PICTOGRAPHIC_RE) — they stay at column 0, which
+ * guarantees at least one column of gap before the text even when the
+ * terminal renders them wide. Width is otherwise measured with the same
+ * string-width ink itself uses, so the pad never disagrees with layout.
+ */
+export function centerGutterMarker(marker: string): string {
+  if (!marker) return marker;
+  const measured = stringWidth(marker);
+  const width = PICTOGRAPHIC_RE.test(marker) ? Math.max(2, measured) : measured;
+  const pad = Math.max(0, Math.floor((GUTTER_WIDTH - width) / 2));
+  return ' '.repeat(pad) + marker;
+}
+
 /** Gutter glyph per role, used when the label carries no emoji of its own. */
 const ROLE_MARKERS: Record<MessageRole, string> = {
   user: '❯',
   assistant: '✦',
   inbox: '✉',
   activity: '⚡',
-  system: '∗',
+  // U+2731 HEAVY ASTERISK — full-height glyph; U+2217 ASTERISK OPERATOR
+  // floats at x-height and reads vertically misaligned next to the heading.
+  system: '✱',
   grant: '✓',
   event: '',
 };
@@ -136,7 +165,7 @@ export const MessageLine = React.memo(function MessageLine({
     return (
       <Box>
         <Box width={GUTTER_WIDTH} flexShrink={0}>
-          <Text dimColor>{marker}</Text>
+          <Text dimColor>{centerGutterMarker(marker)}</Text>
         </Box>
         <Text dimColor wrap="truncate-end">
           {rest}
@@ -156,7 +185,9 @@ export const MessageLine = React.memo(function MessageLine({
   return (
     <Box marginTop={1}>
       <Box width={GUTTER_WIDTH} flexShrink={0}>
-        {!continuation && marker ? <Text color={labelColor}>{marker}</Text> : null}
+        {!continuation && marker ? (
+          <Text color={labelColor}>{centerGutterMarker(marker)}</Text>
+        ) : null}
       </Box>
       <Box flexDirection="column" flexGrow={1}>
         {/* Continuations (streamed paragraphs after the first) skip the
