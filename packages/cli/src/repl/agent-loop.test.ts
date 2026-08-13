@@ -55,7 +55,6 @@ function makePorts(
         };
       },
     },
-    transcript: { append: () => {} },
     tools: {
       execute: async (calls) => {
         executed.push(calls);

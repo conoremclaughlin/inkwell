@@ -75,9 +75,6 @@ export interface AgentLoopPorts {
     /** Begin a waiting indicator; returns the stop function. */
     startWaiting(label?: string): () => void;
   };
-  transcript: {
-    append(entry: Record<string, unknown>): void;
-  };
   tools: {
     /**
      * Execute one iteration's calls and report what happened. Policy, approvals,
@@ -107,29 +104,10 @@ export interface AgentLoopPorts {
       ctx: { iteration: number; isContinuation: boolean; signal?: AbortSignal }
     ): Promise<BackendTurnOutcome>;
   };
-  /**
-   * Per-backend-turn lifecycle, so the host can wire cancellation (SIGINT, the
-   * Ink abort handler) around each turn without the loop importing any of it.
-   */
-  lifecycle?: {
-    onTurnStart?(abort: () => void): void;
-    onTurnEnd?(): void;
-    /** Backend turn finished — the host logs activity, records usage, etc. */
-    onTurnComplete?(result: BackendTurnSummary): void;
-  };
   /** Parent-only observability (Ctrl+T inspector). Clones omit this entirely. */
   observe?: {
     recordToolCall(call: ToolResultRecord): void;
   };
-}
-
-/** What the host learns about a completed backend turn. */
-export interface BackendTurnSummary {
-  success: boolean;
-  exitCode?: number;
-  durationMs?: number;
-  stderr?: string;
-  iteration: number;
 }
 
 /** Raw result of one backend turn, as the host reports it back to the loop. */

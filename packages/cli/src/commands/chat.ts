@@ -5206,7 +5206,6 @@ export async function runChat(options: ChatOptions): Promise<void> {
                   renderAbovePrompt: true,
                 }),
         },
-        transcript: { append: (entry) => appendTranscript(runtime.transcriptPath, entry) },
         tools: { execute: (calls) => runIterationTools(calls) },
         backend: { runTurn: runTurnForLoop },
         observe: {
