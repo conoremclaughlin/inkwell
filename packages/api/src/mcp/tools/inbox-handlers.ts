@@ -1327,33 +1327,14 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
   // handler — before the legacy inbox fetch/advance. See spec §3.)
 
   try {
-    // Find thread IDs this agent (or any agent for this user) participates in
-    let participantQuery = threadTable(supabase, 'inbox_thread_participants').select('thread_id');
-    if (agentId) {
-      participantQuery = participantQuery.eq('agent_id', agentId);
-    }
-
-    // Stamped-only session scoping (spec §3): pollers see ONLY threads
-    // assigned to their session. Unstamped (session_id IS NULL) threads are
-    // invisible to pollers by construction — the trigger path assigns them
-    // before any delivery. (v6's `OR session_id IS NULL` was implicit
-    // broadcast: first poller consumed the message and advanced the shared
-    // pointer, starving the session that actually needed it.)
-    if (callerSessionId) {
-      participantQuery = participantQuery.eq('session_id', callerSessionId);
-    }
-
-    const participantRows = checkedRead<Array<{ thread_id: string }>>(
-      await participantQuery,
-      'participants'
-    );
-
-    const threadIds = [
-      ...new Set((participantRows || []).map((p: { thread_id: string }) => p.thread_id)),
-    ];
-    unreadThreadsTruncated = threadIds.length > THREAD_PAGE_LIMIT;
-
-    if (threadIds.length > 0) {
+    // NO participant pre-scan: it collected EVERY thread id (unfiltered on
+    // the agent-less mission path — 365 threads ≈ 13.5KB of UUIDs) and fed
+    // them into `.in('id', ...)`, which PostgREST encodes into the request
+    // URL → HTTP 414 "URI too long". Silently swallowed for months; visible
+    // since the checked-read sweep. Scoping now happens where the data
+    // lives: the candidacy RPC self-scopes (user+agent+session, spec §3),
+    // and the recency page filters membership with a SQL join.
+    {
       // Get open threads for this user.
       // NOTE: `since` is NOT applied to threads — thread read pointers
       // (inbox_thread_read_status.last_read_at) already handle "which
@@ -1406,14 +1387,25 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
           threads = [];
         }
       } else {
+        // Recency page (mission timeline / non-delivery callers): membership
+        // is filtered with an !inner join on participants when an agent is
+        // given — never a client-side `.in(id-list)`, which blows the URL
+        // past 8KB once a user has a few hundred threads (HTTP 414). Threads
+        // are user-scoped rows, so the agent-less unified view needs no
+        // participant filter at all.
+        let recencyQuery = threadTable(supabase, 'inbox_threads')
+          .select(
+            agentId
+              ? 'id, thread_key, title, user_id, created_by_agent_id, updated_at, inbox_thread_participants!inner(agent_id)'
+              : 'id, thread_key, title, user_id, created_by_agent_id, updated_at'
+          )
+          .eq('user_id', resolved.user.id)
+          .eq('status', 'open');
+        if (agentId) {
+          recencyQuery = recencyQuery.eq('inbox_thread_participants.agent_id', agentId);
+        }
         const data = checkedRead<ThreadPageRow[]>(
-          await threadTable(supabase, 'inbox_threads')
-            .select('id, thread_key, title, user_id, created_by_agent_id, updated_at')
-            .eq('user_id', resolved.user.id)
-            .eq('status', 'open')
-            .in('id', threadIds)
-            .order('updated_at', { ascending: false })
-            .limit(THREAD_PAGE_LIMIT),
+          await recencyQuery.order('updated_at', { ascending: false }).limit(THREAD_PAGE_LIMIT),
           'thread_page_recency'
         );
         threads = data;
