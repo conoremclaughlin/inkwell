@@ -2608,7 +2608,11 @@ export function buildPromptEnvelope(
           : '';
 
   return [
-    `You are ${agentId}.`,
+    // A caller-supplied system prompt is the only thing allowed to say who
+    // this is. `ink awaken` runs under the placeholder agent id `nascent`;
+    // asserting "You are nascent." here would contradict the system prompt
+    // that is, at that moment, telling them they do not have a name yet.
+    runtime.systemPromptOverride ? '' : `You are ${agentId}.`,
     'You are running inside ink chat (first-class Ink REPL).',
     'Answer in plain text. Be concise but complete.',
     `Current backend: ${runtime.backend}${runtime.model ? ` (${runtime.model})` : ''}.`,
@@ -2667,6 +2671,11 @@ export function envelopeShapeKey(runtime: ChatRuntime): string {
     runtime.threadKey ?? '',
     runtime.activeSkills.map((s) => s.name).join(','),
     runtime.bootstrapContext ?? '',
+    // Gates the "You are <agentId>." line. Fixed for the session's lifetime
+    // (set from --system-prompt-file at startup, never mutated), so it cannot
+    // actually drift — included to keep this in sync with every static field
+    // buildPromptEnvelope renders, as the contract above requires.
+    runtime.systemPromptOverride ? '1' : '0',
   ].join('');
   // djb2 — cheap, kept in int32 each step; collision-resistant enough to detect
   // config drift (we only need change-detection, not cryptographic strength).
@@ -3121,11 +3130,29 @@ export async function runChat(options: ChatOptions): Promise<void> {
   let readyForAutoRun = false;
   let enqueueAutoRunFromInbox: ((message: InboxMessage) => Promise<void>) | null = null;
 
-  const bootstrapResult = (await pcp
-    .callTool('bootstrap', { agentId })
-    .catch((error) => ({ error: String(error) }))) as Record<string, unknown>;
+  // A caller-supplied system prompt means this session's identity comes from
+  // the caller, not the database. `ink awaken` runs as the placeholder
+  // `nascent`, which has no identity row and no memories — bootstrapping it
+  // would attribute shared workspace documents to a being that does not exist
+  // yet, and "Bootstrapped as nascent" would be among the first things it ever
+  // read about itself. Both are false, which is the whole thing the override
+  // exists to prevent.
+  const identitySuppliedByCaller = Boolean(runtime.systemPromptOverride);
 
-  if (bootstrapResult.error) {
+  const bootstrapResult = identitySuppliedByCaller
+    ? ({} as Record<string, unknown>)
+    : ((await pcp
+        .callTool('bootstrap', { agentId })
+        .catch((error) => ({ error: String(error) }))) as Record<string, unknown>);
+
+  if (identitySuppliedByCaller) {
+    // Keychain preload still has to happen — it is independent of identity,
+    // and an awakening session can use tools as soon as it has a name.
+    const keychainCreds = await loadKeychainCredentials();
+    if (Object.keys(keychainCreds).length > 0) {
+      console.log(chalk.dim(`Keychain: ${Object.keys(keychainCreds).length} credential(s) loaded`));
+    }
+  } else if (bootstrapResult.error) {
     console.log(chalk.yellow(`bootstrap unavailable: ${String(bootstrapResult.error)}`));
   } else {
     const suggestion = (bootstrapResult.reflectionStatus as Record<string, unknown> | undefined)
@@ -3933,6 +3960,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
           agentId,
           model: runtime.model,
           prompt: buildCompactionPrompt(chunk),
+          // Compaction is a backend turn like any other, so it goes through
+          // adapter.prepare() and would otherwise regenerate the default
+          // identity prompt — handing a nascent SB "You are nascent, call
+          // bootstrap" the moment its first conversation grew long enough to
+          // compact (Lumen, PR #485 — finding 2).
+          systemPromptOverride: runtime.systemPromptOverride,
           // Summarization is governed like any other turn: token-flow (idle)
           // is the reaper, with the 4h runaway backstop. An explicit
           // --backend-timeout-seconds still caps it, floored at 5 min —
