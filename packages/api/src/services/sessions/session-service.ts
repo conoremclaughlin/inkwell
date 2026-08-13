@@ -950,7 +950,15 @@ export class SessionService implements ISessionService {
     // shutdown reporting it as interrupted is the truth.
     if (finalized) clearActiveRun(session.id);
 
-    if (result.usage) {
+    // Gated on `finalized` for the same reason the lifecycle write is:
+    // updateTokenUsage() ends in a full SessionRepository.update(), which
+    // replaces the whole metadata blob and is not tracked by the drain — so
+    // it can erase the interruption breadcrumb written moments earlier. The
+    // compaction trigger below would likewise start new work against a server
+    // that has closed intake. Losing a usage checkpoint costs a stats row;
+    // losing the breadcrumb costs the record of the interruption itself
+    // (Lumen, PR #490 round 5).
+    if (result.usage && finalized) {
       // Scope the cumulative checkpoint to the backend thread the counts came
       // from — Codex totals restart whenever the thread does.
       await this.repository.updateTokenUsage(

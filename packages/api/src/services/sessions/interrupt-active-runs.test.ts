@@ -116,6 +116,17 @@ describe('registry brackets the persisted running state', () => {
     expect(source.slice(clearAt - 30, clearAt)).toMatch(/if \(finalized\)\s*$/);
   });
 
+  /**
+   * updateTokenUsage() ends in a full SessionRepository.update(), which
+   * replaces the whole metadata blob and is not tracked by the drain — so if
+   * it runs after a refused finalization it erases the interruption
+   * breadcrumb. The compaction trigger inside the same block would also start
+   * new work against a server that has closed intake (Lumen, PR #490 r5).
+   */
+  it('gates the usage and compaction block on finalization', () => {
+    expect(source).toContain('if (result.usage && finalized)');
+  });
+
   // The shape that caused P1: a finally fires while the row still says running.
   it('does not clear from a finally around the runner call', () => {
     expect(source).not.toMatch(/finally\s*\{[^}]*clearActiveRun/);
