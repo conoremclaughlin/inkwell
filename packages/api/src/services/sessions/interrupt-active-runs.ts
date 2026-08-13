@@ -29,21 +29,55 @@ export const INTERRUPT_REASON = 'server-shutdown';
 
 export interface InterruptOutcome {
   sessionId: string;
-  /** The session row was moved off `running`. */
+  /**
+   * The bookkeeping write landed. For a normal run that means the row moved
+   * off `running`; for an already-terminal one it means only the metadata
+   * breadcrumb was recorded.
+   */
   marked: boolean;
   /** Someone was told. False when the run had no thread to post into. */
   noticed: boolean;
+  /**
+   * The row had already reached a terminal state under its own power, so its
+   * lifecycle was left alone. See `isAlreadyTerminal`.
+   */
+  alreadyTerminal: boolean;
 }
 
-function noticeContent(run: ActiveRun): string {
+/**
+ * Did this session already terminalize itself before the process died?
+ *
+ * An in-flight child can call `update_session_state(status: 'completed')` and
+ * then be killed before it exits. That stamps `ended_at`, so writing
+ * idle/resumable over the top would produce a session that claims to be
+ * resumable while `findByThreadKey` — which filters `ended_at IS NULL` —
+ * refuses to return it. The notice would promise a resumption that cannot
+ * happen (Lumen, PR #490 — P2).
+ *
+ * Rather than clearing `ended_at` and resurrecting a session the agent
+ * declared finished, leave terminal rows exactly as they are. They are not
+ * the silent case: they already say what happened.
+ */
+export function isAlreadyTerminal(row: {
+  lifecycle?: string | null;
+  ended_at?: string | null;
+}): boolean {
+  return row.lifecycle === 'completed' || row.lifecycle === 'failed' || Boolean(row.ended_at);
+}
+
+function noticeContent(run: ActiveRun, alreadyTerminal: boolean): string {
   const thread = run.threadKey ? ` on \`${run.threadKey}\`` : '';
-  return (
-    `⚠️ ${run.agentId}'s turn${thread} was interrupted — the Inkwell server ` +
-    `shut down while the ${run.backend} process was still running, so no reply ` +
-    `was produced.\n\n` +
-    `The session is resumable and keeps its context. Re-trigger the thread to ` +
-    `pick it up from where it stopped.`
-  );
+  const head =
+    `⚠️ ${run.agentId}'s turn${thread} was cut short — the Inkwell server shut ` +
+    `down while the ${run.backend} process was still running.`;
+
+  // Only promise resumption where the state can actually deliver it.
+  return alreadyTerminal
+    ? `${head}\n\nThe session had already recorded a terminal state, so it is ` +
+        `left as-is rather than reopened. Any reply it was mid-way through ` +
+        `sending may not have arrived — check before assuming it did.`
+    : `${head}\n\nNo reply was produced. The session is resumable and keeps its ` +
+        `context — re-trigger the thread to pick it up from where it stopped.`;
 }
 
 /**
@@ -65,22 +99,32 @@ export async function interruptActiveRuns(
   });
 
   const work = runs.map(async (run): Promise<InterruptOutcome> => {
-    const outcome: InterruptOutcome = { sessionId: run.sessionId, marked: false, noticed: false };
+    const outcome: InterruptOutcome = {
+      sessionId: run.sessionId,
+      marked: false,
+      noticed: false,
+      alreadyTerminal: false,
+    };
 
     try {
       // Read-modify-write: metadata is a single JSONB column, so a blind write
-      // would drop everything else the session is carrying.
+      // would drop everything else the session is carrying. The lifecycle and
+      // ended_at come back in the same read so the terminal check below costs
+      // no extra round-trip.
       const { data: existing } = await client
         .from('sessions')
-        .select('metadata')
+        .select('metadata, lifecycle, ended_at')
         .eq('id', run.sessionId)
         .maybeSingle();
+
+      outcome.alreadyTerminal = isAlreadyTerminal(existing || {});
 
       const { error } = await client
         .from('sessions')
         .update({
-          lifecycle: 'idle',
-          status: 'resumable',
+          // A row that terminalized itself keeps its own account of what
+          // happened; only the metadata breadcrumb is added.
+          ...(outcome.alreadyTerminal ? {} : { lifecycle: 'idle', status: 'resumable' }),
           metadata: {
             ...((existing?.metadata as Record<string, unknown>) || {}),
             interruptedAt: new Date().toISOString(),
@@ -117,12 +161,13 @@ export async function interruptActiveRuns(
         toAgentId: run.agentId,
         threadKey: run.threadKey,
         subject: `Turn interrupted — ${run.agentId} (${run.backend})`,
-        content: noticeContent(run),
+        content: noticeContent(run, outcome.alreadyTerminal),
         metadata: {
           kind: 'session_interrupted',
           reason: INTERRUPT_REASON,
           sessionId: run.sessionId,
           backend: run.backend,
+          alreadyTerminal: outcome.alreadyTerminal,
         },
       });
       outcome.noticed = result.ok;

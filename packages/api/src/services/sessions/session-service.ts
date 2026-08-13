@@ -726,6 +726,21 @@ export class SessionService implements ISessionService {
         logger.warn('Failed to log backend spawn activity', { error: err });
       });
 
+    // Registered BEFORE the write, not after it. The invariant this has to
+    // hold is "registered ⟺ the row is (or is about to be) persisted as
+    // running" — anything narrower leaves a window where a shutdown sees no
+    // active run and walks away from a row that says `running` forever, which
+    // is the exact zombie this is here to prevent (Lumen, PR #490 — P1).
+    registerActiveRun({
+      sessionId: session.id,
+      userId,
+      agentId,
+      backend: resolvedBackend,
+      threadKey: metadata?.threadKey as string | undefined,
+      senderAgentId: request.sender?.id,
+      startedAt: Date.now(),
+    });
+
     // Mark session as running before backend turn
     await this.repository.update(session.id, { lifecycle: 'running' });
 
@@ -742,19 +757,6 @@ export class SessionService implements ISessionService {
     let result;
     let turnDurationMs: number;
     const turnStartMs = Date.now();
-
-    // From here until the finally below, this turn is a child of this process
-    // and dies with it. Registering it is what lets shutdown say so instead of
-    // leaving the row at `lifecycle: 'running'` forever.
-    registerActiveRun({
-      sessionId: session.id,
-      userId,
-      agentId,
-      backend: resolvedBackend,
-      threadKey: metadata?.threadKey as string | undefined,
-      senderAgentId: request.sender?.id,
-      startedAt: turnStartMs,
-    });
 
     try {
       result = await runner.run(formattedMessage, {
@@ -798,12 +800,11 @@ export class SessionService implements ISessionService {
           } as unknown as Json,
         })
         .catch(() => {});
-      throw runnerError;
-    } finally {
-      // Every exit route, including the rethrow above. A turn that ends
-      // without deregistering gets reported as interrupted at the next
-      // shutdown — the same lie, pointing the other way.
+      // Cleared only now, after `failed` is persisted above — not in a
+      // `finally` around runner.run(). A finally fires while the row still
+      // says `running`, reopening the same window on the way out.
       clearActiveRun(session.id);
+      throw runnerError;
     }
 
     // 5b. Log backend CLI completion to activity stream (fire-and-forget)
@@ -884,6 +885,12 @@ export class SessionService implements ISessionService {
         cliAttached: false,
       });
     }
+
+    // The row is off `running` now, so this turn can no longer be orphaned by
+    // a shutdown. If something throws between runner.run() and here, the run
+    // stays registered — which is correct: the row really is still `running`,
+    // and a later shutdown reporting it as interrupted is the truth.
+    clearActiveRun(session.id);
 
     if (result.usage) {
       // Scope the cumulative checkpoint to the backend thread the counts came
