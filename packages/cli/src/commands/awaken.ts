@@ -214,27 +214,37 @@ const MODEL_CHOICES: Record<string, ModelChoice[]> = {
     { label: 'Sonnet', model: 'sonnet', note: 'balanced' },
     { label: 'Haiku', model: 'haiku', note: 'fastest, cheapest' },
   ],
-  codex: [
-    { label: 'Default', note: 'whatever the Codex CLI picks' },
-    // Codex has no stable role aliases (unlike claude's opus/sonnet/haiku), so
-    // these are versioned slugs and will go stale with each model generation.
-    // Catalog: GPT-5.6 series, per the Codex model docs as of 2026-08-12.
-    { label: 'GPT-5.6 Sol', model: 'gpt-5.6-sol', note: 'flagship; complex or ambiguous work' },
-    { label: 'GPT-5.6 Terra', model: 'gpt-5.6-terra', note: 'balanced everyday workhorse' },
-    { label: 'GPT-5.6 Luna', model: 'gpt-5.6-luna', note: 'fastest, cheapest' },
-  ],
+  // Codex deliberately lists no named models. Claude's opus/sonnet/haiku are
+  // stable *role* aliases that keep resolving to the current model, so naming
+  // them costs nothing. Codex ids are versioned slugs — any list we write here
+  // is a snapshot that starts going stale immediately, and a stale menu is
+  // worse than no menu because it looks authoritative. Default tracks the
+  // CLI's current choice; anything specific goes through --model.
+  codex: [{ label: 'Default', note: "whatever the Codex CLI picks — tracks OpenAI's releases" }],
   gemini: [{ label: 'Default', note: 'whatever the Gemini CLI picks' }],
 };
 
 /** Render the model menu for `--help` and for an unrecognised --model value. */
+/**
+ * Extra guidance for runtimes whose menu is intentionally just "Default".
+ * Without this the help would imply the only choice is the default, when in
+ * fact any slug works — it's just not our place to enumerate a moving target.
+ */
+const MODEL_HINTS: Record<string, string> = {
+  codex: 'Any other model: --model <slug> (e.g. the id from the Codex model docs).',
+};
+
 function describeModelChoices(backendName: string): string {
   const choices = MODEL_CHOICES[backendName] ?? [];
-  return choices
-    .map((c) => {
-      const value = c.model ?? '(none — backend default)';
-      return `    ${c.label.padEnd(16)} ${value}${c.note ? chalk.dim(`  · ${c.note}`) : ''}`;
-    })
-    .join('\n');
+  const lines = choices.map((c) => {
+    const value = c.model ?? '(none — backend default)';
+    return `    ${c.label.padEnd(16)} ${value}${c.note ? chalk.dim(`  · ${c.note}`) : ''}`;
+  });
+
+  const hint = MODEL_HINTS[backendName];
+  if (hint) lines.push(chalk.dim(`    ${''.padEnd(16)} ${hint}`));
+
+  return lines.join('\n');
 }
 
 // ============================================================================
