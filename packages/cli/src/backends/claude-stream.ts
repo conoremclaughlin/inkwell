@@ -35,6 +35,8 @@ interface ClaudeStreamMessage {
   usage?: Record<string, unknown>;
   message?: { content?: ClaudeContentBlock[] };
   session_id?: string;
+  /** Model id serving the session (`system`/`init` event). */
+  model?: string;
   /** Raw SSE event nested under `stream_event` (--include-partial-messages). */
   event?: {
     type?: string;
@@ -160,6 +162,14 @@ export class ClaudeStreamParser implements BackendStreamParser {
         });
         break;
       }
+      case 'system': {
+        // The init event names the model actually serving the session —
+        // the ground truth for per-model context-window resolution.
+        if (ev.subtype === 'init' && typeof ev.model === 'string' && ev.model) {
+          out.push({ kind: 'model', model: ev.model });
+        }
+        break;
+      }
       case 'stream_event': {
         // Partial-message text fragments (--include-partial-messages). Only
         // text deltas matter here — thinking/input_json deltas are noise for
@@ -172,7 +182,7 @@ export class ClaudeStreamParser implements BackendStreamParser {
         break;
       }
       default:
-        break; // system / error / etc. — not needed for the turn result
+        break; // error / other chrome — not needed for the turn result
     }
   }
 }

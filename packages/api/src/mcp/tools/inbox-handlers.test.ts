@@ -2106,6 +2106,10 @@ function createScopedPollMockSupabase(
   opts: {
     sessionRow?: { id: string; agent_id: string | null } | null;
     sessionLookupError?: boolean;
+    /** Rows served when a table chain is awaited as a list (thenable). */
+    tableRows?: Record<string, unknown[]>;
+    /** PostgREST-style RESOLVED errors ({data:null, error}) per table. */
+    tableErrors?: Record<string, string>;
   } = {}
 ) {
   const eqCalls: Record<string, Array<[string, unknown]>> = {};
@@ -2140,8 +2144,14 @@ function createScopedPollMockSupabase(
     self.maybeSingle = vi
       .fn()
       .mockResolvedValue(table === 'sessions' ? sessionResult : { data: null, error: null });
-    self.then = (resolve: (v: unknown) => unknown) =>
-      Promise.resolve({ data: [], error: null, count: 0 }).then(resolve);
+    self.then = (resolve: (v: unknown) => unknown) => {
+      const injectedError = opts.tableErrors?.[table];
+      return Promise.resolve(
+        injectedError
+          ? { data: null, error: { message: injectedError }, count: null }
+          : { data: opts.tableRows?.[table] ?? [], error: null, count: 0 }
+      ).then(resolve);
+    };
     return self;
   };
 
@@ -2265,5 +2275,165 @@ describe('handleGetInbox — channelPoll dual-scope validation (round 2)', () =>
     expect(JSON.parse(result.content[0].text).warning).toContain('channel_poll_unscoped');
     const tablesTouched = (mockSb.from as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0]);
     expect(tablesTouched).not.toContain('agent_inbox');
+  });
+});
+
+// =====================================================
+// channelPoll thread paging — exact SQL candidacy (round 3)
+// =====================================================
+
+describe('handleGetInbox — channelPoll thread paging via get_unread_thread_candidates', () => {
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    const { getRequestContext, getSessionContext, getPinnedAgentId } =
+      await import('../../utils/request-context');
+    vi.mocked(getRequestContext).mockReturnValue({ sessionId: 'session-mock-123' } as never);
+    vi.mocked(getSessionContext).mockReturnValue(undefined as never);
+    vi.mocked(getPinnedAgentId).mockReturnValue(undefined as never);
+  });
+
+  function withCandidates(
+    mockSb: ReturnType<typeof createScopedPollMockSupabase>,
+    rows: Array<{ thread_id: string; latest_message_at: string; total_candidates: number }>
+  ) {
+    const rpcCalls: Array<{ fn: string; args: Record<string, unknown> }> = [];
+    (mockSb as { rpc: unknown }).rpc = vi
+      .fn()
+      .mockImplementation((fn: string, args: Record<string, unknown>) => {
+        rpcCalls.push({ fn, args });
+        if (fn === 'get_unread_thread_candidates') {
+          return Promise.resolve({ data: rows, error: null });
+        }
+        return Promise.resolve({ data: null, error: null });
+      });
+    return rpcCalls;
+  }
+
+  const STAMPED = { tableRows: { inbox_thread_participants: [{ thread_id: 't-1' }] } };
+
+  it('selects candidates via the RPC scoped to user+agent+session — never thread.updated_at', async () => {
+    // The participant scan must find stamped thread ids so the block runs.
+    const mockSb = createScopedPollMockSupabase(STAMPED);
+    const rpcCalls = withCandidates(mockSb, [
+      { thread_id: 't-1', latest_message_at: '2026-08-12T00:00:01Z', total_candidates: 1 },
+    ]);
+    const result = await handleGetInbox(
+      { email: 'test@test.com', channelPoll: true },
+      createMockDataComposer(mockSb as never) as never
+    );
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(true);
+    const call = rpcCalls.find((c) => c.fn === 'get_unread_thread_candidates');
+    expect(call).toBeDefined();
+    expect(call!.args).toMatchObject({
+      p_agent_id: 'wren',
+      p_session_id: 'session-mock-123',
+      p_limit: 20,
+    });
+    expect(parsed.unreadThreadsTruncated).toBeUndefined();
+  });
+
+  it('reports truncation from the RPC total, not a client pre-cap', async () => {
+    const mockSb = createScopedPollMockSupabase(STAMPED);
+    withCandidates(
+      mockSb,
+      Array.from({ length: 20 }, (_, i) => ({
+        thread_id: `t-${i}`,
+        latest_message_at: `2026-08-12T00:00:${String(i).padStart(2, '0')}Z`,
+        total_candidates: 37,
+      }))
+    );
+    const result = await handleGetInbox(
+      { email: 'test@test.com', channelPoll: true },
+      createMockDataComposer(mockSb as never) as never
+    );
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.unreadThreadsTruncated).toBe(true);
+  });
+
+  it('no participant pre-scan and no client-side id list — the URI-too-long regression', async () => {
+    // The old flow scanned inbox_thread_participants (unfiltered on the
+    // agent-less mission path), collected EVERY thread id, and fed them to
+    // .in('id', ...) — PostgREST puts that in the URL, so a few hundred
+    // threads produced HTTP 414 and a silently empty mission timeline.
+    // The recency page now filters membership with an !inner join instead.
+    const mockSb = createScopedPollMockSupabase();
+    await handleGetInbox(
+      { email: 'test@test.com', agentId: 'wren' },
+      createMockDataComposer(mockSb as never) as never
+    );
+    const tablesTouched = (mockSb.from as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0]);
+    // No standalone participant scan (allParts would only run with a page).
+    expect(tablesTouched).not.toContain('inbox_thread_participants');
+    // Membership filtered in SQL via the embedded join, not an id list.
+    expect(mockSb.getEqCalls()['inbox_threads']).toContainEqual([
+      'inbox_thread_participants.agent_id',
+      'wren',
+    ]);
+  });
+
+  it('channelPoll goes straight to the candidacy RPC — no pre-scan gate', async () => {
+    const mockSb = createScopedPollMockSupabase();
+    const rpcCalls = withCandidates(mockSb, []);
+    await handleGetInbox(
+      { email: 'test@test.com', channelPoll: true },
+      createMockDataComposer(mockSb as never) as never
+    );
+    expect(rpcCalls.some((c) => c.fn === 'get_unread_thread_candidates')).toBe(true);
+    const tablesTouched = (mockSb.from as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0]);
+    expect(tablesTouched).not.toContain('inbox_thread_participants');
+  });
+
+  it('a RESOLVED thread-messages error turns candidates into incomplete, not zero unread', async () => {
+    const mockSb = createScopedPollMockSupabase({
+      tableRows: {
+        inbox_thread_participants: [{ thread_id: 't-1' }],
+        inbox_threads: [
+          {
+            id: 't-1',
+            thread_key: 'pr:t1',
+            title: null,
+            user_id: 'user-123',
+            created_by_agent_id: 'lumen',
+            updated_at: '2026-08-12T00:00:01Z',
+          },
+        ],
+      },
+      tableErrors: { inbox_thread_messages: 'statement timeout' },
+    });
+    withCandidates(mockSb, [
+      { thread_id: 't-1', latest_message_at: '2026-08-12T00:00:01Z', total_candidates: 1 },
+    ]);
+    const result = await handleGetInbox(
+      { email: 'test@test.com', channelPoll: true },
+      createMockDataComposer(mockSb as never) as never
+    );
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.channelPollIncomplete).toBe(true);
+    expect(parsed.warning).toContain('channel_poll_incomplete');
+  });
+
+  it('an RPC failure is LOUD — no silent empty delivery', async () => {
+    const mockSb = createScopedPollMockSupabase(STAMPED);
+    (mockSb as { rpc: unknown }).rpc = vi
+      .fn()
+      .mockResolvedValue({ data: null, error: { message: 'function does not exist' } });
+    const result = await handleGetInbox(
+      { email: 'test@test.com', channelPoll: true },
+      createMockDataComposer(mockSb as never) as never
+    );
+    // The outer catch degrades gracefully (legacy messages still return),
+    // but the failure must be logged at error level by the paging block.
+    const { logger } = await import('../../utils/logger');
+    expect(vi.mocked(logger.error)).toHaveBeenCalledWith(
+      'channel_poll_candidates_failed',
+      expect.objectContaining({ agentId: 'wren' })
+    );
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(true);
+    // The outage must NOT masquerade as a drained inbox (round 4): the
+    // poller sees an explicit incomplete signal and withholds drain proof.
+    expect(parsed.channelPollIncomplete).toBe(true);
+    expect(parsed.warning).toContain('channel_poll_incomplete');
   });
 });

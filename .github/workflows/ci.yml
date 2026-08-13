@@ -49,9 +49,16 @@ jobs:
       # (e.g. libsignal via @whiskeysockets/baileys) clone without SSH keys
       - run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
 
+      # Pinned deliberately. On `latest`, this job has failed every run since at
+      # least 2026-06-11 with "permission denied for table users" at connection
+      # time, while the identical script passes locally on 2.84.2. The CLI
+      # version is the only material difference — the workflow injects no
+      # secrets and the harness derives every key from `supabase status`.
+      # Bump this on purpose, with a green run, not implicitly on their release
+      # cadence.
       - uses: supabase/setup-cli@v1
         with:
-          version: latest
+          version: 2.84.2
 
       - run: yarn install --immutable
 
