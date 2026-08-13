@@ -122,6 +122,7 @@ import {
   stripLocalToolBlocks,
   toolLoopStopReason,
   type LocalToolCall,
+  type ToolResultRecord,
 } from '../repl/agent-loop.js';
 // Re-exported for callers (and tests) that have always imported these from
 // chat.js. The implementations moved to ../repl/agent-loop.js so the turn
@@ -4402,6 +4403,293 @@ export async function runChat(options: ChatOptions): Promise<void> {
     }
   }
 
+  /**
+   * Execute one iteration's tool calls through ink's policy pipeline and return
+   * what happened.
+   *
+   * This is the `tools.execute` port of the agent loop (see
+   * ink://specs/ink-runtime-shadow-clones): the LOOP sequences, the HOST
+   * authorizes. Policy, approvals, and credential resolution all live here, so a
+   * shadow clone can supply its own executor over a narrowed policy snapshot
+   * without the loop knowing anything about ToolPolicyState.
+   */
+  const runIterationTools = async (calls: LocalToolCall[]): Promise<ToolResultRecord[]> => {
+    const iterationResults: ToolResultRecord[] = [];
+    await executeToolCalls(calls, {
+      policy: toolPolicy,
+      callTool: (tool, args) => {
+        // Client-local tools (context management) are handled in-process
+        if (isClientLocalTool(tool)) {
+          const result = handleClientLocalTool(tool, args, ledger);
+          if (result) return Promise.resolve(result);
+        }
+        // Pi coding tools (read, edit, write, bash, grep, find, ls) execute
+        // in-process via @mariozechner/pi-coding-agent, scoped to cwd
+        if (isPiTool(tool)) {
+          return callPiTool(tool, args, process.cwd());
+        }
+        // Resolve credential references ($VAR / ${VAR}) in tool args.
+        // The LLM emits references; actual values are injected here at the
+        // execution layer so credentials never enter transcripts or context.
+        const { args: resolvedArgs, resolutions } = resolveCredentialRefs(args, buildResolverEnv());
+        if (resolutions.length > 0 && runtime.verbose) {
+          const refs = resolutions.map((r) => `${r.name} at ${r.path}`).join(', ');
+          printLine(
+            chalk.dim(`credential-resolver: resolved ${resolutions.length} ref(s): ${refs}`)
+          );
+        }
+        // Strip MCP namespace prefix — the SB may emit mcp__inkwell__tool_name
+        // but PcpClient expects bare tool names (get_inbox, recall, etc.)
+        const bareTool = tool.replace(/^mcp__inkwell__/, '');
+        return pcp.callTool(bareTool, resolvedArgs);
+      },
+      sessionId: runtime.sessionId,
+      promptForApproval: async (tool, reason, args) => {
+        if (!runtime.awayMode) {
+          return promptForToolApproval(
+            rl,
+            toolPolicy,
+            runtime.sessionId,
+            tool,
+            reason,
+            inkRepl,
+            runtime.approvalChannel,
+            args
+          );
+        }
+        // 2FA approval: create request on the PCP server, which sends
+        // notifications to the user's connected platforms (Telegram, etc.).
+        // The server handles all routing — we just poll for the result.
+        printLine(chalk.yellow(`⏳ Requesting 2FA approval for ${tool}…`));
+        // Sanitize args for the notification — show command/path but redact large content
+        const sanitizedArgs = args ? sanitizeArgsForApproval(tool, args) : undefined;
+        try {
+          const result = await requestToolApproval({
+            tool,
+            args: sanitizedArgs,
+            reason,
+            sessionId: runtime.sessionId,
+            studioId: runtime.studioId,
+            onCreated: (id) => {
+              printLine(chalk.yellow(`   Request ${id.slice(0, 8)}… sent to connected platforms`));
+            },
+          });
+
+          if (result.status === 'granted') {
+            // Apply persistent grants to the tool policy
+            if (
+              result.action === 'grant-agent' ||
+              result.action === 'allow' ||
+              result.action === 'grant-studio'
+            ) {
+              // Grant at the specific scope from the approval response.
+              // persistentGrant writes the permanent grant at the target scope
+              // and removes from promptTools at all scopes so the tool stops prompting.
+              const grantScope = result.action === 'grant-studio' ? 'studio' : 'agent';
+              const scopeId =
+                grantScope === 'studio'
+                  ? toolPolicy.getContext()?.studioId
+                  : toolPolicy.getContext()?.agentId;
+              if (scopeId) {
+                toolPolicy.persistentGrant(tool, { scope: grantScope, id: scopeId });
+                printLine(
+                  chalk.green(`✅ 2FA: ${tool} permanently approved (${grantScope}: ${scopeId})`)
+                );
+              } else {
+                // Can't resolve scope — fall back to session grant instead of leaking to global
+                if (runtime.sessionId) {
+                  toolPolicy.grantToolForSession(runtime.sessionId, tool);
+                }
+                printLine(
+                  chalk.yellow(
+                    `⚠️ 2FA: ${tool} approved for session only (could not resolve ${grantScope} scope)`
+                  )
+                );
+              }
+            } else if (result.action === 'grant-session') {
+              if (runtime.sessionId) {
+                toolPolicy.grantToolForSession(runtime.sessionId, tool);
+              }
+              printLine(chalk.green(`✅ 2FA: ${tool} approved for this session`));
+            } else {
+              printLine(chalk.green(`✅ 2FA approval granted for ${tool}`));
+            }
+            return true;
+          } else if (result.status === 'timeout') {
+            printLine(chalk.yellow(`⏰ 2FA approval timed out for ${tool}`));
+            return false;
+          } else if (result.status === 'error') {
+            printLine(chalk.yellow(`⚠️ 2FA error: ${result.error}`));
+            return false;
+          } else {
+            printLine(chalk.yellow(`🚫 2FA approval denied for ${tool}`));
+            return false;
+          }
+        } catch {
+          printLine(chalk.yellow('Failed to create 2FA approval request — denying tool call'));
+          return false;
+        }
+      },
+      onResult: (result: ToolCallResult) => {
+        if (result.status === 'blocked' || result.status === 'denied') {
+          const msg = `Local tool ${result.status} (${result.tool}): ${result.reason}`;
+          printEvent(
+            chalk.yellow(`🛠 ${agentId} · ${result.tool} (${result.status}) — ${result.reason}`)
+          );
+          appendTranscript(runtime.transcriptPath, {
+            type: 'local_tool_call',
+            tool: result.tool,
+            args: result.args,
+            status: result.status,
+            reason: result.reason,
+          });
+          ledger.addEntry('system', compactForLedger(msg, 400), 'local-tool');
+          iterationResults.push({
+            tool: result.tool,
+            result: result.reason,
+            status: result.status,
+          });
+        } else if (result.status === 'executed' || result.status === 'approved') {
+          const resultJson = JSON.stringify(result.result);
+
+          // Format context-management and signal tools with friendly output
+          if (result.tool === 'evict_context') {
+            const r = result.result as Record<string, unknown> | undefined;
+            const content = (r?.content as Array<{ text: string }> | undefined)?.[0]?.text;
+            if (content) {
+              const parsed = JSON.parse(content);
+              printEvent(
+                chalk.dim(
+                  `  🗑 evicted ${parsed.evicted} entries (${parsed.tokensFreed} tok freed, ${parsed.totalAfter} tok remaining)`
+                )
+              );
+              // Persist the eviction so it survives reattach — without this,
+              // hydration replays the raw events and evicted entries resurrect
+              if (parsed.success && Array.isArray(parsed.evictRefs) && parsed.evicted > 0) {
+                const refs = parsed.evictRefs as Array<Record<string, unknown>>;
+                recordEviction(
+                  'sb',
+                  compactForLedger(JSON.stringify(result.args ?? {}), 200),
+                  typeof parsed.tokensFreed === 'number' ? parsed.tokensFreed : 0,
+                  refs
+                    .filter((ref) => typeof ref.hash === 'string')
+                    .map((ref) => ({
+                      ...(typeof ref.eid === 'number' ? { eid: ref.eid } : {}),
+                      hash: ref.hash as string,
+                      role: (ref.role as LedgerRole) || 'system',
+                      source: typeof ref.source === 'string' ? ref.source : undefined,
+                      preview: typeof ref.preview === 'string' ? ref.preview : '',
+                    }))
+                );
+              }
+            }
+          } else if (result.tool === 'list_context') {
+            const r = result.result as Record<string, unknown> | undefined;
+            const content = (r?.content as Array<{ text: string }> | undefined)?.[0]?.text;
+            if (content) {
+              const parsed = JSON.parse(content);
+              const sources = parsed.bySource
+                ? Object.entries(
+                    parsed.bySource as Record<string, { count: number; tokens: number }>
+                  )
+                    .map(([src, { count, tokens }]) => `${src}(${count}/${tokens}t)`)
+                    .join(' ')
+                : '';
+              printEvent(
+                chalk.dim(
+                  `📋 ${agentId} · list_context — ${parsed.totalEntries} entries, ~${parsed.totalTokens} tok${
+                    sources ? ` · ${sources}` : ''
+                  }`
+                )
+              );
+            }
+          } else if (result.tool === 'signal_status') {
+            const r = result.result as Record<string, unknown> | undefined;
+            const content = (r?.content as Array<{ text: string }> | undefined)?.[0]?.text;
+            if (content) {
+              const parsed = JSON.parse(content);
+              const signal = parsed.signal as { status: string; reason?: string } | undefined;
+              if (signal) {
+                const icon =
+                  signal.status === 'completed' ? '✅' : signal.status === 'blocked' ? '🚫' : '➡️';
+                printEvent(
+                  chalk.dim(
+                    `  ${icon} signal: ${signal.status}${signal.reason ? ` — ${signal.reason}` : ''}`
+                  )
+                );
+              }
+            }
+          } else {
+            // One dim line, attributed to the agent, result truncated —
+            // the Ctrl+T inspector holds a 2KB result slice per call and
+            // the transcript keeps the complete payload.
+            const resultPreview = compactForLedger(resultJson, 160);
+            printEvent(
+              chalk.dim(
+                `🛠 ${agentId} · ${result.tool} (${result.status})${
+                  resultPreview ? ` — ${resultPreview}` : ''
+                }`
+              )
+            );
+          }
+          appendTranscript(runtime.transcriptPath, {
+            type: 'local_tool_call',
+            tool: result.tool,
+            args: result.args,
+            status: result.status,
+            result: result.result,
+          });
+          // Context-management tools (list_context, evict_context) must NOT
+          // persist their results back into the ledger — doing so pollutes the
+          // context they're managing and reintroduces evicted content.
+          if (!isClientLocalTool(result.tool)) {
+            ledger.addEntry(
+              'system',
+              compactForLedger(`local tool ${result.tool} -> ${resultJson}`, 500),
+              'local-tool'
+            );
+          }
+          iterationResults.push({
+            tool: result.tool,
+            result: result.result,
+            status: result.status,
+            args: result.args,
+          });
+        } else if (result.status === 'error') {
+          const msg = `Local tool error (${result.tool}): ${result.error}`;
+          printEvent(
+            chalk.red(
+              `🛠 ${agentId} · ${result.tool} (error) — ${compactForLedger(String(result.error), 160)}`
+            )
+          );
+          appendTranscript(runtime.transcriptPath, {
+            type: 'local_tool_call',
+            tool: result.tool,
+            args: result.args,
+            status: 'error',
+            error: result.error,
+          });
+          ledger.addEntry('system', compactForLedger(msg, 400), 'local-tool');
+          iterationResults.push({ tool: result.tool, result: result.error, status: 'error' });
+        }
+
+        // Headless liveness + progress: one compact NDJSON line per tool as
+        // it completes. Input is capped and results are omitted (can be large
+        // or sensitive). send_response is intentionally NOT streamed here —
+        // that tool already routes server-side, so re-emitting it as a
+        // response line would risk double delivery.
+        const streamArgs = result.args ? JSON.stringify(result.args) : '';
+        emitStreamEvent({
+          type: 'tool_call',
+          toolName: result.tool,
+          status: result.status,
+          ...(streamArgs && streamArgs.length <= 2000 ? { input: result.args } : {}),
+        });
+      },
+    });
+    return iterationResults;
+  };
+
   const runUserTurn = async (
     raw: string,
     source: 'user' | 'inbox-auto' | 'system' = 'user',
@@ -4866,289 +5154,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
       if (localToolCalls.length === 0) break;
 
-      // Execute tool calls through ink's policy pipeline
-      const iterationResults: typeof allToolResults = [];
-      await executeToolCalls(localToolCalls, {
-        policy: toolPolicy,
-        callTool: (tool, args) => {
-          // Client-local tools (context management) are handled in-process
-          if (isClientLocalTool(tool)) {
-            const result = handleClientLocalTool(tool, args, ledger);
-            if (result) return Promise.resolve(result);
-          }
-          // Pi coding tools (read, edit, write, bash, grep, find, ls) execute
-          // in-process via @mariozechner/pi-coding-agent, scoped to cwd
-          if (isPiTool(tool)) {
-            return callPiTool(tool, args, process.cwd());
-          }
-          // Resolve credential references ($VAR / ${VAR}) in tool args.
-          // The LLM emits references; actual values are injected here at the
-          // execution layer so credentials never enter transcripts or context.
-          const { args: resolvedArgs, resolutions } = resolveCredentialRefs(
-            args,
-            buildResolverEnv()
-          );
-          if (resolutions.length > 0 && runtime.verbose) {
-            const refs = resolutions.map((r) => `${r.name} at ${r.path}`).join(', ');
-            printLine(
-              chalk.dim(`credential-resolver: resolved ${resolutions.length} ref(s): ${refs}`)
-            );
-          }
-          // Strip MCP namespace prefix — the SB may emit mcp__inkwell__tool_name
-          // but PcpClient expects bare tool names (get_inbox, recall, etc.)
-          const bareTool = tool.replace(/^mcp__inkwell__/, '');
-          return pcp.callTool(bareTool, resolvedArgs);
-        },
-        sessionId: runtime.sessionId,
-        promptForApproval: async (tool, reason, args) => {
-          if (!runtime.awayMode) {
-            return promptForToolApproval(
-              rl,
-              toolPolicy,
-              runtime.sessionId,
-              tool,
-              reason,
-              inkRepl,
-              runtime.approvalChannel,
-              args
-            );
-          }
-          // 2FA approval: create request on the PCP server, which sends
-          // notifications to the user's connected platforms (Telegram, etc.).
-          // The server handles all routing — we just poll for the result.
-          printLine(chalk.yellow(`⏳ Requesting 2FA approval for ${tool}…`));
-          // Sanitize args for the notification — show command/path but redact large content
-          const sanitizedArgs = args ? sanitizeArgsForApproval(tool, args) : undefined;
-          try {
-            const result = await requestToolApproval({
-              tool,
-              args: sanitizedArgs,
-              reason,
-              sessionId: runtime.sessionId,
-              studioId: runtime.studioId,
-              onCreated: (id) => {
-                printLine(
-                  chalk.yellow(`   Request ${id.slice(0, 8)}… sent to connected platforms`)
-                );
-              },
-            });
-
-            if (result.status === 'granted') {
-              // Apply persistent grants to the tool policy
-              if (
-                result.action === 'grant-agent' ||
-                result.action === 'allow' ||
-                result.action === 'grant-studio'
-              ) {
-                // Grant at the specific scope from the approval response.
-                // persistentGrant writes the permanent grant at the target scope
-                // and removes from promptTools at all scopes so the tool stops prompting.
-                const grantScope = result.action === 'grant-studio' ? 'studio' : 'agent';
-                const scopeId =
-                  grantScope === 'studio'
-                    ? toolPolicy.getContext()?.studioId
-                    : toolPolicy.getContext()?.agentId;
-                if (scopeId) {
-                  toolPolicy.persistentGrant(tool, { scope: grantScope, id: scopeId });
-                  printLine(
-                    chalk.green(`✅ 2FA: ${tool} permanently approved (${grantScope}: ${scopeId})`)
-                  );
-                } else {
-                  // Can't resolve scope — fall back to session grant instead of leaking to global
-                  if (runtime.sessionId) {
-                    toolPolicy.grantToolForSession(runtime.sessionId, tool);
-                  }
-                  printLine(
-                    chalk.yellow(
-                      `⚠️ 2FA: ${tool} approved for session only (could not resolve ${grantScope} scope)`
-                    )
-                  );
-                }
-              } else if (result.action === 'grant-session') {
-                if (runtime.sessionId) {
-                  toolPolicy.grantToolForSession(runtime.sessionId, tool);
-                }
-                printLine(chalk.green(`✅ 2FA: ${tool} approved for this session`));
-              } else {
-                printLine(chalk.green(`✅ 2FA approval granted for ${tool}`));
-              }
-              return true;
-            } else if (result.status === 'timeout') {
-              printLine(chalk.yellow(`⏰ 2FA approval timed out for ${tool}`));
-              return false;
-            } else if (result.status === 'error') {
-              printLine(chalk.yellow(`⚠️ 2FA error: ${result.error}`));
-              return false;
-            } else {
-              printLine(chalk.yellow(`🚫 2FA approval denied for ${tool}`));
-              return false;
-            }
-          } catch {
-            printLine(chalk.yellow('Failed to create 2FA approval request — denying tool call'));
-            return false;
-          }
-        },
-        onResult: (result: ToolCallResult) => {
-          if (result.status === 'blocked' || result.status === 'denied') {
-            const msg = `Local tool ${result.status} (${result.tool}): ${result.reason}`;
-            printEvent(
-              chalk.yellow(`🛠 ${agentId} · ${result.tool} (${result.status}) — ${result.reason}`)
-            );
-            appendTranscript(runtime.transcriptPath, {
-              type: 'local_tool_call',
-              tool: result.tool,
-              args: result.args,
-              status: result.status,
-              reason: result.reason,
-            });
-            ledger.addEntry('system', compactForLedger(msg, 400), 'local-tool');
-            iterationResults.push({
-              tool: result.tool,
-              result: result.reason,
-              status: result.status,
-            });
-          } else if (result.status === 'executed' || result.status === 'approved') {
-            const resultJson = JSON.stringify(result.result);
-
-            // Format context-management and signal tools with friendly output
-            if (result.tool === 'evict_context') {
-              const r = result.result as Record<string, unknown> | undefined;
-              const content = (r?.content as Array<{ text: string }> | undefined)?.[0]?.text;
-              if (content) {
-                const parsed = JSON.parse(content);
-                printEvent(
-                  chalk.dim(
-                    `  🗑 evicted ${parsed.evicted} entries (${parsed.tokensFreed} tok freed, ${parsed.totalAfter} tok remaining)`
-                  )
-                );
-                // Persist the eviction so it survives reattach — without this,
-                // hydration replays the raw events and evicted entries resurrect
-                if (parsed.success && Array.isArray(parsed.evictRefs) && parsed.evicted > 0) {
-                  const refs = parsed.evictRefs as Array<Record<string, unknown>>;
-                  recordEviction(
-                    'sb',
-                    compactForLedger(JSON.stringify(result.args ?? {}), 200),
-                    typeof parsed.tokensFreed === 'number' ? parsed.tokensFreed : 0,
-                    refs
-                      .filter((ref) => typeof ref.hash === 'string')
-                      .map((ref) => ({
-                        ...(typeof ref.eid === 'number' ? { eid: ref.eid } : {}),
-                        hash: ref.hash as string,
-                        role: (ref.role as LedgerRole) || 'system',
-                        source: typeof ref.source === 'string' ? ref.source : undefined,
-                        preview: typeof ref.preview === 'string' ? ref.preview : '',
-                      }))
-                  );
-                }
-              }
-            } else if (result.tool === 'list_context') {
-              const r = result.result as Record<string, unknown> | undefined;
-              const content = (r?.content as Array<{ text: string }> | undefined)?.[0]?.text;
-              if (content) {
-                const parsed = JSON.parse(content);
-                const sources = parsed.bySource
-                  ? Object.entries(
-                      parsed.bySource as Record<string, { count: number; tokens: number }>
-                    )
-                      .map(([src, { count, tokens }]) => `${src}(${count}/${tokens}t)`)
-                      .join(' ')
-                  : '';
-                printEvent(
-                  chalk.dim(
-                    `📋 ${agentId} · list_context — ${parsed.totalEntries} entries, ~${parsed.totalTokens} tok${
-                      sources ? ` · ${sources}` : ''
-                    }`
-                  )
-                );
-              }
-            } else if (result.tool === 'signal_status') {
-              const r = result.result as Record<string, unknown> | undefined;
-              const content = (r?.content as Array<{ text: string }> | undefined)?.[0]?.text;
-              if (content) {
-                const parsed = JSON.parse(content);
-                const signal = parsed.signal as { status: string; reason?: string } | undefined;
-                if (signal) {
-                  const icon =
-                    signal.status === 'completed'
-                      ? '✅'
-                      : signal.status === 'blocked'
-                        ? '🚫'
-                        : '➡️';
-                  printEvent(
-                    chalk.dim(
-                      `  ${icon} signal: ${signal.status}${signal.reason ? ` — ${signal.reason}` : ''}`
-                    )
-                  );
-                }
-              }
-            } else {
-              // One dim line, attributed to the agent, result truncated —
-              // the Ctrl+T inspector holds a 2KB result slice per call and
-              // the transcript keeps the complete payload.
-              const resultPreview = compactForLedger(resultJson, 160);
-              printEvent(
-                chalk.dim(
-                  `🛠 ${agentId} · ${result.tool} (${result.status})${
-                    resultPreview ? ` — ${resultPreview}` : ''
-                  }`
-                )
-              );
-            }
-            appendTranscript(runtime.transcriptPath, {
-              type: 'local_tool_call',
-              tool: result.tool,
-              args: result.args,
-              status: result.status,
-              result: result.result,
-            });
-            // Context-management tools (list_context, evict_context) must NOT
-            // persist their results back into the ledger — doing so pollutes the
-            // context they're managing and reintroduces evicted content.
-            if (!isClientLocalTool(result.tool)) {
-              ledger.addEntry(
-                'system',
-                compactForLedger(`local tool ${result.tool} -> ${resultJson}`, 500),
-                'local-tool'
-              );
-            }
-            iterationResults.push({
-              tool: result.tool,
-              result: result.result,
-              status: result.status,
-              args: result.args,
-            });
-          } else if (result.status === 'error') {
-            const msg = `Local tool error (${result.tool}): ${result.error}`;
-            printEvent(
-              chalk.red(
-                `🛠 ${agentId} · ${result.tool} (error) — ${compactForLedger(String(result.error), 160)}`
-              )
-            );
-            appendTranscript(runtime.transcriptPath, {
-              type: 'local_tool_call',
-              tool: result.tool,
-              args: result.args,
-              status: 'error',
-              error: result.error,
-            });
-            ledger.addEntry('system', compactForLedger(msg, 400), 'local-tool');
-            iterationResults.push({ tool: result.tool, result: result.error, status: 'error' });
-          }
-
-          // Headless liveness + progress: one compact NDJSON line per tool as
-          // it completes. Input is capped and results are omitted (can be large
-          // or sensitive). send_response is intentionally NOT streamed here —
-          // that tool already routes server-side, so re-emitting it as a
-          // response line would risk double delivery.
-          const streamArgs = result.args ? JSON.stringify(result.args) : '';
-          emitStreamEvent({
-            type: 'tool_call',
-            toolName: result.tool,
-            status: result.status,
-            ...(streamArgs && streamArgs.length <= 2000 ? { input: result.args } : {}),
-          });
-        },
-      });
+      const iterationResults = await runIterationTools(localToolCalls);
 
       allToolResults.push(...iterationResults);
       for (const r of iterationResults) {
