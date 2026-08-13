@@ -16,6 +16,7 @@ import { logger } from '../../utils/logger';
 import { bootstrapStudio } from '@inklabs/shared';
 import { ensureStudioSettings } from '../../services/studio-settings';
 import { resolveMainStudio } from '../../services/sessions/session-service';
+import { StudioLeaseService } from '../../services/studio-lease.service';
 
 // ============== Helpers ==============
 
@@ -387,6 +388,12 @@ export async function handleListStudios(args: unknown, dataComposer: DataCompose
       roleTemplate: w.roleTemplate,
       defaultProjectId: w.defaultProjectId,
       hasLinkedSession: !!w.sessionId,
+      // Occupancy: lease is the authoritative "is someone working here" —
+      // status stays 'active' regardless of use and must not be read as such.
+      lease: w.lease,
+      ephemeral: w.ephemeral,
+      parentStudioId: w.parentStudioId,
+      expiresAt: w.expiresAt,
       createdAt: w.createdAt,
     })),
   });
@@ -431,6 +438,10 @@ export async function handleGetStudio(args: unknown, dataComposer: DataComposer)
       defaultProjectId: studio.defaultProjectId,
       status: studio.status,
       sessionId: studio.sessionId,
+      lease: studio.lease,
+      ephemeral: studio.ephemeral,
+      parentStudioId: studio.parentStudioId,
+      expiresAt: studio.expiresAt,
       metadata: studio.metadata,
       createdAt: studio.createdAt,
       updatedAt: studio.updatedAt,
@@ -546,6 +557,18 @@ export async function handleCloseStudio(args: unknown, dataComposer: DataCompose
     branchDeleted: false,
     errors: [],
   };
+
+  // Release any lease before touching the worktree — closing the studio is a
+  // terminal act for its occupant, and release captures final branch/commit
+  // state while the worktree still exists.
+  await new StudioLeaseService(dataComposer.getClient())
+    .releaseByStudio(studioId, { reason: 'studio-closed' })
+    .catch((leaseErr: unknown) => {
+      logger.warn('[StudioLease] Release on close_studio failed (non-fatal)', {
+        studioId,
+        error: leaseErr instanceof Error ? leaseErr.message : String(leaseErr),
+      });
+    });
 
   // Remove the git worktree
   if (removeWorktree) {

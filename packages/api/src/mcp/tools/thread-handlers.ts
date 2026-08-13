@@ -16,6 +16,8 @@ import { logger } from '../../utils/logger';
 import type { Json } from '../../data/supabase/types';
 import { getAgentGateway, type AgentTriggerPayload } from '../../channels/agent-gateway.js';
 import { advanceThreadReadPointer } from './read-state.js';
+import { StudioLeaseService } from '../../services/studio-lease.service.js';
+import { StudioOverflowService } from '../../services/studio-overflow.service.js';
 
 // The thread tables are new and not yet in generated Supabase types.
 // Use type-safe wrappers that cast the table name for PostgREST queries.
@@ -761,6 +763,32 @@ export async function handleCloseThread(args: unknown, dataComposer: DataCompose
     message_type: 'system',
     metadata: { type: 'thread_closed', closedBy: agentId } as Json,
   });
+
+  // Automatic lease release — the work unit completing is what lets studios
+  // go. Releases every studio this thread holds (stamping final branch/commit
+  // state) and tears down ephemeral overflow studios created for it.
+  try {
+    const leases = new StudioLeaseService(supabase);
+    const released = await leases.releaseByThread(resolved.user.id, threadKey, {
+      reason: 'thread-closed',
+    });
+    const overflow = new StudioOverflowService(dataComposer.repositories.studios, leases);
+    const cleaned = await overflow.teardownEphemeralStudiosForThread(resolved.user.id, threadKey, {
+      reason: `thread ${threadKey} closed`,
+    });
+    if (released || cleaned) {
+      logger.info('[StudioLease] Thread close released studios', {
+        threadKey,
+        leasesReleased: released,
+        ephemeralCleaned: cleaned,
+      });
+    }
+  } catch (leaseErr) {
+    logger.warn('[StudioLease] Release on thread close failed (non-fatal)', {
+      threadKey,
+      error: leaseErr instanceof Error ? leaseErr.message : String(leaseErr),
+    });
+  }
 
   logger.info('Thread closed', { threadKey, closedBy: agentId });
 

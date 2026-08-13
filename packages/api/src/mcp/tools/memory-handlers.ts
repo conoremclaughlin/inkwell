@@ -22,6 +22,7 @@ import { getEffectiveAgentId } from '../../auth/enforce-identity';
 import type { MemorySource, Salience, Session } from '../../data/models/memory';
 import { getCloudSkillsService } from '../../skills/cloud-service';
 import { resolveMainStudio } from '../../services/sessions/session-service';
+import { StudioLeaseService } from '../../services/studio-lease.service';
 
 // Helper to safely read a file, returning null if it doesn't exist
 async function safeReadFile(filePath: string): Promise<string | null> {
@@ -1222,6 +1223,17 @@ export async function handleEndSession(args: unknown, dataComposer: DataComposer
     await dataComposer.repositories.memory
       .updateSession(session.id, { cliAttached: false })
       .catch(() => {});
+
+    // Automatic lease release — end_session is a terminal path regardless of
+    // which side (server or agent CLI) initiated it.
+    await new StudioLeaseService(dataComposer.getClient())
+      .releaseBySession(session.id, { userId: user.id, reason: 'session-end' })
+      .catch((err: unknown) => {
+        logger.warn('[StudioLease] Release on end_session failed', {
+          sessionId: session.id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
 
     // Clear stale channel_routes pointing to this session so heartbeat
     // reminders don't try to route to a dead session and spawn duplicates.

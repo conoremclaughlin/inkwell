@@ -287,18 +287,34 @@ export class StudioOverflowService {
    * Sweep companion: close ephemeral studios whose expires_at has passed and
    * whose lease is gone. Runs on the heartbeat cron alongside the lease sweep.
    */
-  async sweepExpiredEphemeralStudios(listCandidates: () => Promise<Studio[]>): Promise<number> {
-    const candidates = await listCandidates();
-    const now = Date.now();
+  async sweepExpiredEphemeralStudios(): Promise<number> {
+    const candidates = await this.studios
+      .listExpiredEphemeral(new Date().toISOString())
+      .catch(() => [] as Studio[]);
     let closed = 0;
     for (const studio of candidates) {
-      if (!studio.ephemeral || !studio.expiresAt) continue;
-      if (Date.parse(studio.expiresAt) > now) continue;
       if (studio.lease) continue;
-      if (studio.status !== 'active' && studio.status !== 'idle') continue;
       await this.teardownEphemeralStudio(studio, { reason: 'expired' });
       closed += 1;
     }
     return closed;
+  }
+
+  /**
+   * Close every ephemeral studio that served a thread. Wired into
+   * close_thread — the work unit completing releases the temp studio.
+   */
+  async teardownEphemeralStudiosForThread(
+    userId: string,
+    threadKey: string,
+    opts: { reason: string }
+  ): Promise<number> {
+    const studios = await this.studios
+      .listEphemeralByThread(userId, threadKey)
+      .catch(() => [] as Studio[]);
+    for (const studio of studios) {
+      await this.teardownEphemeralStudio(studio, opts);
+    }
+    return studios.length;
   }
 }

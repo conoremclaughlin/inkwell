@@ -272,6 +272,40 @@ export class StudiosRepository {
     return (data || []).map((row) => this.mapRow(row as Record<string, unknown>));
   }
 
+  /** Ephemeral studios created for a thread's overflow (metadata.threadKey). */
+  async listEphemeralByThread(userId: string, threadKey: string): Promise<Studio[]> {
+    const { data, error } = await this.client
+      .from('studios')
+      .select('*')
+      .eq('user_id', userId)
+      .eq('ephemeral', true)
+      .eq('metadata->>threadKey', threadKey)
+      .in('status', ['active', 'idle']);
+
+    if (error) {
+      throw new Error(`Failed to list ephemeral studios by thread: ${error.message}`);
+    }
+
+    return (data || []).map((row) => this.mapRow(row as Record<string, unknown>));
+  }
+
+  /** Ephemeral studios past their expires_at, still open. Sweep candidates. */
+  async listExpiredEphemeral(asOfIso: string): Promise<Studio[]> {
+    const { data, error } = await this.client
+      .from('studios')
+      .select('*')
+      .eq('ephemeral', true)
+      .not('expires_at', 'is', null)
+      .lte('expires_at', asOfIso)
+      .in('status', ['active', 'idle']);
+
+    if (error) {
+      throw new Error(`Failed to list expired ephemeral studios: ${error.message}`);
+    }
+
+    return (data || []).map((row) => this.mapRow(row as Record<string, unknown>));
+  }
+
   async listActive(userId: string): Promise<Studio[]> {
     const { data, error } = await this.client
       .from('studios')

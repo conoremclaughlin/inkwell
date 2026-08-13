@@ -66,6 +66,8 @@ import { interruptActiveRuns } from './services/sessions/interrupt-active-runs';
 import type { ActivityType } from './data/repositories/activity-stream.repository';
 import { resolveTaskGroupForThreadKey } from './services/task-group-resolver';
 import { sendTriggerFailureNotice } from './services/trigger-failure-notice';
+import { StudioLeaseService } from './services/studio-lease.service';
+import { StudioOverflowService } from './services/studio-overflow.service';
 
 // Server configuration
 interface ServerConfig {
@@ -653,6 +655,11 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
   };
 
   if (heartbeatServiceEnabled) {
+    const sweepLeaseService = new StudioLeaseService(dataComposer!.getClient());
+    const sweepOverflowService = new StudioOverflowService(
+      dataComposer!.repositories.studios,
+      sweepLeaseService
+    );
     initHeartbeatService({
       interval: heartbeatInterval,
       enableLocalCron,
@@ -660,6 +667,23 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
         logger.info('Heartbeat tick — processing due reminders');
         const stats = await processHeartbeat(deliverReminderViaSession);
         logger.info('Heartbeat complete', stats);
+
+        // Lease sweep: expire leases whose heartbeat went stale (rescuing the
+        // worktree first), renew for sessions still running in-process, and
+        // close ephemeral overflow studios past their TTL. This is the expiry
+        // half of programmatic release — crashed sessions cannot hold a
+        // worktree hostage past the staleness threshold.
+        try {
+          const leaseStats = await sweepLeaseService.sweepExpiredLeases();
+          const ephemeralClosed = await sweepOverflowService.sweepExpiredEphemeralStudios();
+          if (leaseStats.expired || leaseStats.renewed || ephemeralClosed) {
+            logger.info('Lease sweep complete', { ...leaseStats, ephemeralClosed });
+          }
+        } catch (sweepErr) {
+          logger.error('Lease sweep failed', {
+            error: sweepErr instanceof Error ? sweepErr.message : String(sweepErr),
+          });
+        }
       },
     });
     logger.info(

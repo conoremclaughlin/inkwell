@@ -403,6 +403,26 @@ export class StudioLeaseService {
   }
 
   /**
+   * Release whatever lease a studio holds, regardless of holder. Wired into
+   * close_studio — closing the worktree is a terminal act for its occupant.
+   */
+  async releaseByStudio(studioId: string, opts: { reason?: string } = {}): Promise<boolean> {
+    const { data } = await this.supabase
+      .from('studios')
+      .select('id, user_id, lease, worktree_path')
+      .eq('id', studioId)
+      .not('lease', 'is', null)
+      .maybeSingle();
+    const lease = parseLease(data?.lease);
+    if (!data || !lease) return false;
+
+    return this.releaseStudio(data.id, data.user_id, lease, data.worktree_path, {
+      event: 'released',
+      reason: opts.reason ?? 'studio-closed',
+    });
+  }
+
+  /**
    * Release every studio this user's thread holds. Wired into close_thread —
    * the work unit completing is what lets studios go.
    */

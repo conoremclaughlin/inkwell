@@ -12,6 +12,7 @@
 import { Router, type Request, type Response } from 'express';
 import type { DataComposer } from '../data/composer';
 import { PcpAuthProvider } from '../mcp/auth/pcp-auth-provider';
+import { StudioLeaseService } from '../services/studio-lease.service';
 import { logger } from '../utils/logger';
 
 const VALID_LIFECYCLES = ['running', 'idle', 'compacting', 'completed', 'failed'] as const;
@@ -20,6 +21,7 @@ type Lifecycle = (typeof VALID_LIFECYCLES)[number];
 export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
   const router = Router();
   const authProvider = new PcpAuthProvider();
+  const leaseService = new StudioLeaseService(dataComposer.getClient());
 
   /**
    * POST /api/hooks/lifecycle
@@ -102,6 +104,18 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         res.status(500).json({ success: false, error: 'Failed to update session' });
         return;
       }
+
+      // Lease heartbeat: every lifecycle event from a live CLI session renews
+      // the studio lease. This is the primary heartbeatAt refresh path — it
+      // fires on every prompt/stop/compact, well inside the 30-minute
+      // staleness threshold. Fire-and-forget: renewal must never delay the
+      // hook response.
+      void leaseService.renewBySession(sessionId).catch((err: unknown) => {
+        logger.debug('[HookLifecycle] Lease renewal failed (non-fatal)', {
+          sessionId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
 
       logger.debug('[HookLifecycle] Updated', { sessionId, lifecycle, agentId });
       res.json({ success: true, sessionId, lifecycle });
