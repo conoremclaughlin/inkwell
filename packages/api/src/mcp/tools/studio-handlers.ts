@@ -244,10 +244,13 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
       // .env.local are gitignored, so `git worktree add` brings neither —
       // without this the studio has no MCP config at all: Claude sessions get
       // no tools, and Codex spawns against a partial [mcp_servers.inkwell]
-      // and dies on "invalid transport". Best-effort; a studio that fails to
-      // bootstrap is still a usable worktree.
+      // and dies on "invalid transport". Copy from the resolved main root, not
+      // the caller's repoRoot — a linked-worktree caller would otherwise seed
+      // the new studio from its own (possibly customised or missing) config.
+      // Best-effort; a studio that fails to bootstrap is still a usable
+      // worktree.
       try {
-        const result = bootstrapStudio(repoRoot, worktreePath);
+        const result = bootstrapStudio(mainRoot, worktreePath);
         logger.info('Bootstrapped studio config', {
           worktreePath,
           copied: result.copied,
