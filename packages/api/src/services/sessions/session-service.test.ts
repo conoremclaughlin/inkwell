@@ -2774,4 +2774,28 @@ describe('parseRuntimeConfig (per-SB dashboard settings → spawn flags)', () =>
       toolRouting: 'local',
     });
   });
+
+  it('passes through a per-SB model pin, trimmed', () => {
+    // The pin beats the global env default at spawn time — e.g. Benson on
+    // claude-opus-5 while the fleet default is claude-fable-5.
+    expect(parseRuntimeConfig({ runtimeConfig: { model: 'claude-opus-5' } })).toEqual({
+      toolRouting: 'local',
+      model: 'claude-opus-5',
+    });
+    expect(parseRuntimeConfig({ runtimeConfig: { model: '  claude-opus-5  ' } })).toEqual({
+      toolRouting: 'local',
+      model: 'claude-opus-5',
+    });
+  });
+
+  it('fails closed on empty or non-string model values', () => {
+    expect(parseRuntimeConfig({ runtimeConfig: { model: '' } })).toEqual({ toolRouting: 'local' });
+    expect(parseRuntimeConfig({ runtimeConfig: { model: '   ' } })).toEqual({
+      toolRouting: 'local',
+    });
+    expect(parseRuntimeConfig({ runtimeConfig: { model: 42 } })).toEqual({ toolRouting: 'local' });
+    expect(parseRuntimeConfig({ runtimeConfig: { model: null } })).toEqual({
+      toolRouting: 'local',
+    });
+  });
 });
