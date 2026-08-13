@@ -1,5 +1,6 @@
 import React from 'react';
 import { Box, Text } from 'ink';
+import stringWidth from 'string-width';
 
 export type MessageRole =
   | 'user'
@@ -17,7 +18,20 @@ export interface MessageLineProps {
   label?: string;
   time?: string;
   trailingMeta?: string;
+  /**
+   * Continuation of the previous message (streamed paragraph after the
+   * first): renders content only, no label row.
+   */
+  continuation?: boolean;
 }
+
+/**
+ * Width of the leftmost gutter column. Markers (role glyphs, label emoji)
+ * render inside it; ALL text — headings, message bodies, event lines — starts
+ * at this column so it lines up with the prompt input text, whose label
+ * (`❯` + two spaces) occupies the same gutter.
+ */
+export const GUTTER_WIDTH = 3;
 
 const LABEL_COLORS: Record<MessageRole, string> = {
   user: 'greenBright',
@@ -40,17 +54,76 @@ const CONTENT_COLORS: Record<MessageRole, string | undefined> = {
 };
 
 /**
+ * Emoji glyphs, regardless of measured width. string-width reports
+ * text-presentation emoji (🛠 🗑 ⚙) as 1 column, but most terminals render
+ * them emoji-style at 2 — centering by the measured width butts them against
+ * the adjacent text (zero visual gap). Text glyphs (❯ ✦ ✱ ✓ ✻) are not
+ * pictographic and measure truthfully.
+ */
+const PICTOGRAPHIC_RE = /\p{Extended_Pictographic}/u;
+
+/**
+ * Center a marker glyph within the gutter column: single-width TEXT glyphs
+ * (❯ ✦ ✱ ✓ ✻) sit in the middle column instead of hugging the left edge.
+ * Pictographic glyphs are treated as at least 2 columns wide whatever
+ * string-width claims (see PICTOGRAPHIC_RE) — they stay at column 0, which
+ * guarantees at least one column of gap before the text even when the
+ * terminal renders them wide. Width is otherwise measured with the same
+ * string-width ink itself uses, so the pad never disagrees with layout.
+ */
+export function centerGutterMarker(marker: string): string {
+  if (!marker) return marker;
+  const measured = stringWidth(marker);
+  const width = PICTOGRAPHIC_RE.test(marker) ? Math.max(2, measured) : measured;
+  const pad = Math.max(0, Math.floor((GUTTER_WIDTH - width) / 2));
+  return ' '.repeat(pad) + marker;
+}
+
+/** Gutter glyph per role, used when the label carries no emoji of its own. */
+const ROLE_MARKERS: Record<MessageRole, string> = {
+  user: '❯',
+  assistant: '✦',
+  inbox: '✉',
+  activity: '⚡',
+  // U+2731 HEAVY ASTERISK — full-height glyph; U+2217 ASTERISK OPERATOR
+  // floats at x-height and reads vertically misaligned next to the heading.
+  system: '✱',
+  grant: '✓',
+  event: '',
+};
+
+/**
  * Strip leading indentation from event content, including spaces that hide
  * BEHIND leading ANSI color sequences — live call sites wrap their strings
  * in chalk (e.g. chalk.dim('  🗑 …')), so the first bytes are SGR escapes
  * and a plain trimStart() never reaches the embedded spaces. The event
- * role's paddingLeft owns the column; content must not add to it.
+ * role's gutter owns the column; content must not add to it.
  */
 // eslint-disable-next-line no-control-regex
 const LEADING_INDENT_RE = /^((?:\u001b\[[0-9;]*m)*)[ \t]+/;
 
 export function normalizeEventContent(content: string): string {
   return content.replace(LEADING_INDENT_RE, '$1');
+}
+
+/**
+ * A leading marker is a short cluster of symbol characters (emoji like 🛠 ⚡ 🗑,
+ * glyphs like ✅) followed by whitespace or end-of-string, optionally behind
+ * chalk's ANSI prefix. Box-drawing characters and dashes are excluded so
+ * divider lines (`─── ⌃ out of context ───`) stay intact.
+ */
+// eslint-disable-next-line no-control-regex
+const LEADING_MARKER_RE = /^((?:\u001b\[[0-9;]*m)*)([^\sA-Za-z0-9\u001b─-╿—–-]{1,4})(?:[ \t]+|$)/;
+
+/**
+ * Split a leading marker glyph off a label or event line so it can render in
+ * the gutter column while the text stays at the content column. Returns the
+ * original string as `rest` (marker empty) when there is no marker.
+ */
+export function splitLeadingMarker(text: string): { marker: string; rest: string } {
+  const match = LEADING_MARKER_RE.exec(text);
+  if (!match) return { marker: '', rest: text };
+  return { marker: match[2]!, rest: match[1]! + text.slice(match[0].length) };
 }
 
 /**
@@ -69,52 +142,70 @@ export function collapseImagePaths(text: string): string {
   });
 }
 
-/** Single chat message with label, content, and trailing metadata. */
+/** Single chat message with gutter marker, label row, content, and metadata. */
 export const MessageLine = React.memo(function MessageLine({
   role,
   content,
   label,
   time,
   trailingMeta,
+  continuation,
 }: MessageLineProps): React.ReactElement {
-  const displayLabel = label || role;
   const labelColor = LABEL_COLORS[role] || 'gray';
   const contentColor = CONTENT_COLORS[role];
   const meta = [time, trailingMeta].filter(Boolean).join('  ·  ');
   const displayContent = collapseImagePaths(content);
 
   // Events are compact progress/status lines (tool runs, signals, dividers):
-  // a single dim line at the content column — no label row, no spacing.
-  // normalizeEventContent strips call-site indentation (even behind chalk's
-  // leading ANSI escapes) so every event row aligns flush with message
-  // content (column 3), and truncate-end keeps them to ONE line with a
-  // terminal-width ellipsis — full details live in the inspector (Ctrl+T).
+  // a single dim line — marker in the gutter, text at the content column —
+  // truncated to ONE line with a terminal-width ellipsis. Full details live
+  // in the inspector (Ctrl+T).
   if (role === 'event') {
+    const { marker, rest } = splitLeadingMarker(normalizeEventContent(displayContent));
     return (
-      <Box paddingLeft={3}>
+      <Box>
+        <Box width={GUTTER_WIDTH} flexShrink={0}>
+          <Text dimColor>{centerGutterMarker(marker)}</Text>
+        </Box>
         <Text dimColor wrap="truncate-end">
-          {normalizeEventContent(displayContent)}
+          {rest}
           {meta ? `  ·  ${meta}` : ''}
         </Text>
       </Box>
     );
   }
 
+  // Labels may carry their own marker emoji ('📬 inbox', '🔐 permission');
+  // it moves to the gutter and the text stays as the heading. A label that is
+  // ONLY a marker ('⚡') falls back to the role name for its heading.
+  const { marker: labelMarker, rest: labelRest } = splitLeadingMarker(label || '');
+  const marker = labelMarker || ROLE_MARKERS[role] || '';
+  const heading = labelRest.trim() || role;
+
   return (
-    <Box flexDirection="column" paddingLeft={1} marginTop={1}>
-      {/* Label is padded to sit flush with the content text below it */}
-      <Box paddingLeft={2}>
-        <Text bold color={labelColor}>
-          {displayLabel}
-        </Text>
-        {meta ? (
-          <>
-            <Text>{'  '}</Text>
-            <Text dimColor>{meta}</Text>
-          </>
+    <Box marginTop={1}>
+      <Box width={GUTTER_WIDTH} flexShrink={0}>
+        {!continuation && marker ? (
+          <Text color={labelColor}>{centerGutterMarker(marker)}</Text>
         ) : null}
       </Box>
-      <Box paddingLeft={2}>
+      <Box flexDirection="column" flexGrow={1}>
+        {/* Continuations (streamed paragraphs after the first) skip the
+            label row; the blank row below it gives the heading room to
+            breathe before the body text. */}
+        {!continuation && (
+          <Box marginBottom={1}>
+            <Text bold color={labelColor}>
+              {heading}
+            </Text>
+            {meta ? (
+              <>
+                <Text>{'  '}</Text>
+                <Text dimColor>{meta}</Text>
+              </>
+            ) : null}
+          </Box>
+        )}
         <Text color={contentColor} wrap="wrap">
           {displayContent}
         </Text>

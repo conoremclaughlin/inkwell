@@ -72,18 +72,41 @@ export async function fetchWithTimeout(
   }
 }
 
+export interface PcpClientOptions {
+  /**
+   * Lazily builds the x-ink-context token attached to every tool call.
+   * Lazy because session identity (sessionId) is established after client
+   * construction; the callback reflects current runtime state per call.
+   *
+   * Without this header, ink-routed tool calls reach the server with NO
+   * request identity — workspace derivation for artifact writes fails,
+   * session attribution degrades, and trigger context goes missing (the
+   * regression Myra hit when wholly-in-ink moved tool calls off the
+   * provider's MCP connection, which carried the header via .mcp.json).
+   */
+  getContextToken?: () => string | null;
+}
+
 export class PcpClient {
   private configPath: string;
   private baseUrl: string;
   private config: PcpAuthConfig;
+  private options: PcpClientOptions;
 
-  constructor(baseUrl?: string, configPath?: string) {
+  constructor(baseUrl?: string, configPath?: string, options: PcpClientOptions = {}) {
     this.baseUrl = (baseUrl || process.env.INK_SERVER_URL || 'http://localhost:3001').replace(
       /\/+$/,
       ''
     );
     this.configPath = configPath || join(homedir(), '.ink', 'config.json');
     this.config = this.loadConfig();
+    this.options = options;
+  }
+
+  /** Identity context header for the current call, when the caller provides one. */
+  private contextHeader(): Record<string, string> {
+    const token = this.options.getContextToken?.();
+    return token ? { 'x-ink-context': token } : {};
   }
 
   public getConfig(): PcpAuthConfig {
@@ -331,6 +354,7 @@ export class PcpClient {
             // JSON responses and SSE frames.
             Accept: 'application/json, text/event-stream',
             Authorization: `Bearer ${accessToken}`,
+            ...this.contextHeader(),
           },
           body: JSON.stringify({
             jsonrpc: '2.0',
@@ -406,6 +430,7 @@ export class PcpClient {
         headers: {
           'Content-Type': 'application/json',
           Accept: 'application/json',
+          ...this.contextHeader(),
         },
         body: JSON.stringify({ tool, args }),
       },

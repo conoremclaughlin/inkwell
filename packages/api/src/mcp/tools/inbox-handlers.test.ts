@@ -42,6 +42,7 @@ vi.mock('../../utils/request-context', async (importOriginal) => {
     ...actual,
     getRequestContext: vi.fn().mockReturnValue({ sessionId: 'session-mock-123' }),
     getSessionContext: vi.fn().mockReturnValue(undefined),
+    getPinnedAgentId: vi.fn().mockReturnValue(undefined),
   };
 });
 
@@ -54,14 +55,23 @@ vi.mock('../../channels/agent-gateway.js', () => ({
       processed: false,
       accepted: true,
     }),
+    // Synchronous assignment dispatch (spec §3a) — awaited by handleSendToInbox
+    processTrigger: vi.fn().mockResolvedValue({
+      success: true,
+      triggerId: 'trigger-sync-1',
+      processed: true,
+    }),
   }),
 }));
 
-// Mock thread-handlers (imported by inbox-handlers for reply semantics)
+// Mock thread-handlers (imported by inbox-handlers for reply semantics and
+// the get_inbox threadKey alias)
+const mockHandleGetThreadMessages = vi.fn();
 vi.mock('./thread-handlers.js', () => ({
   findThread: vi.fn().mockResolvedValue(null),
   getParticipants: vi.fn().mockResolvedValue([]),
   resolveTriggeredAgents: vi.fn().mockReturnValue([]),
+  handleGetThreadMessages: (...args: unknown[]) => mockHandleGetThreadMessages(...args),
 }));
 
 function createMockSupabase(
@@ -1115,6 +1125,119 @@ describe('handleGetInbox - recipient session naming', () => {
 });
 
 // =====================================================
+// get_inbox threadKey alias → get_thread_messages
+// =====================================================
+
+describe('handleGetInbox — threadKey alias', () => {
+  beforeEach(() => {
+    mockHandleGetThreadMessages.mockReset();
+  });
+
+  it('delegates threadKey queries to get_thread_messages with mapped args', async () => {
+    // Previously threadKey was silently stripped by the schema and the query
+    // ran against agent_inbox — where thread messages never live — returning
+    // empty with zero signal (the Myra vet-turn bug). Conor's call: the
+    // inbox is the front door; threadKey aliases through.
+    const delegateResult = {
+      content: [{ type: 'text', text: JSON.stringify({ success: true, messages: [] }) }],
+    };
+    mockHandleGetThreadMessages.mockResolvedValue(delegateResult);
+
+    const mockDc = createMockDataComposer(createMockSupabase());
+    const result = await handleGetInbox(
+      {
+        email: 'test@test.com',
+        agentId: 'myra',
+        threadKey: 'thread:wholly-in-ink-vet',
+        limit: 10,
+      },
+      mockDc as never
+    );
+
+    expect(result).toBe(delegateResult);
+    expect(mockHandleGetThreadMessages).toHaveBeenCalledOnce();
+    const delegatedArgs = mockHandleGetThreadMessages.mock.calls[0]![0] as Record<string, unknown>;
+    expect(delegatedArgs.threadKey).toBe('thread:wholly-in-ink-vet');
+    expect(delegatedArgs.agentId).toBe('myra');
+    expect(delegatedArgs.limit).toBe(10);
+    expect(delegatedArgs.fullHistory).toBeUndefined();
+  });
+
+  it("maps status 'all' to the full thread history", async () => {
+    mockHandleGetThreadMessages.mockResolvedValue({
+      content: [{ type: 'text', text: '{}' }],
+    });
+
+    const mockDc = createMockDataComposer(createMockSupabase());
+    await handleGetInbox(
+      {
+        email: 'test@test.com',
+        agentId: 'myra',
+        threadKey: 'pr:463',
+        status: 'all',
+      },
+      mockDc as never
+    );
+
+    const delegatedArgs = mockHandleGetThreadMessages.mock.calls[0]![0] as Record<string, unknown>;
+    expect(delegatedArgs.fullHistory).toBe(true);
+  });
+
+  it('rejects threadKey without agentId — thread access is participant-scoped', async () => {
+    const mockDc = createMockDataComposer(createMockSupabase());
+    await expect(
+      handleGetInbox({ email: 'test@test.com', threadKey: 'pr:463' }, mockDc as never)
+    ).rejects.toThrow(/requires agentId/);
+    expect(mockHandleGetThreadMessages).not.toHaveBeenCalled();
+  });
+
+  it('malformed threadKey fails schema validation instead of being silently stripped', async () => {
+    const mockDc = createMockDataComposer(createMockSupabase());
+    await expect(
+      handleGetInbox(
+        { email: 'test@test.com', agentId: 'myra', threadKey: 'not a thread key' },
+        mockDc as never
+      )
+    ).rejects.toThrow();
+    expect(mockHandleGetThreadMessages).not.toHaveBeenCalled();
+  });
+
+  it('unknown parameters are REJECTED by name, never silently stripped (.strict)', async () => {
+    // The original bug class: zod's default strips unknown keys, so a
+    // plausible-but-wrong parameter silently vanishes and the LLM caller
+    // draws confident wrong conclusions. Strict mode names the offender —
+    // self-correcting on the next attempt.
+    const mockDc = createMockDataComposer(createMockSupabase());
+    await expect(
+      handleGetInbox(
+        { email: 'test@test.com', agentId: 'myra', threadKye: 'pr:464' },
+        mockDc as never
+      )
+    ).rejects.toThrow(/threadKye/);
+    expect(mockHandleGetThreadMessages).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [{ status: 'completed' }, /status:'completed'/],
+    [{ priority: 'high' }, /priority/],
+    [{ messageType: 'task_request' }, /messageType/],
+    [{ since: '2026-08-10T00:00:00Z' }, /since/],
+    [{ channelPoll: true }, /channelPoll/],
+  ])('threadKey mode rejects incompatible filter %j actionably', async (filter, pattern) => {
+    // Silent-ignore here returns WRONG results — e.g. status:'completed'
+    // would serve unread-pointer messages and advance the pointer.
+    const mockDc = createMockDataComposer(createMockSupabase());
+    await expect(
+      handleGetInbox(
+        { email: 'test@test.com', agentId: 'myra', threadKey: 'pr:464', ...filter },
+        mockDc as never
+      )
+    ).rejects.toThrow(pattern);
+    expect(mockHandleGetThreadMessages).not.toHaveBeenCalled();
+  });
+});
+
+// =====================================================
 // channelPoll — server-side studio filtering
 // =====================================================
 
@@ -1402,6 +1525,141 @@ describe('handleSendToInbox — system sender and cross-agent studio routing', (
     // And the warning about suppressed triggers must NOT appear.
     expect(parsed.warning).toBeUndefined();
     expect(parsed.triggered).toContain('wren');
+  });
+
+  it('trigger:false still dispatches a routeOnly assignment and wakes nobody (spec §3a)', async () => {
+    const { getAgentGateway } = await import('../../channels/agent-gateway.js');
+    const mockGateway = (getAgentGateway as ReturnType<typeof vi.fn>)();
+
+    const { getRequestContext, getSessionContext } = await import('../../utils/request-context');
+    vi.mocked(getRequestContext).mockReturnValue({ sessionId: 'session-mock-123' } as never);
+    vi.mocked(getSessionContext).mockReturnValue(undefined as never);
+
+    const mockSb = createThreadMockSupabase({ existingThread: undefined });
+    const mockDc = createThreadMockDataComposer(mockSb);
+
+    const result = await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientAgentId: 'lumen',
+        senderAgentId: 'wren',
+        threadKey: 'thread:quiet-fyi',
+        content: 'No rush — for your next inbox check.',
+        messageType: 'notification',
+        trigger: false,
+      },
+      mockDc as never
+    );
+
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(true);
+    // Assignment happened SYNCHRONOUSLY (processTrigger, awaited) with routeOnly
+    expect(mockGateway.processTrigger).toHaveBeenCalledWith(
+      expect.objectContaining({ toAgentId: 'lumen', routeOnly: true })
+    );
+    // No wake dispatch fired
+    expect(mockGateway.dispatchTrigger).not.toHaveBeenCalled();
+    expect(parsed.triggered).toEqual([]);
+  });
+
+  it('history-inferred recipientSessionId is NOT an explicit anchor; caller studio target IS', async () => {
+    const { getAgentGateway } = await import('../../channels/agent-gateway.js');
+    const mockGateway = (getAgentGateway as ReturnType<typeof vi.fn>)();
+
+    const { getRequestContext, getSessionContext } = await import('../../utils/request-context');
+    vi.mocked(getRequestContext).mockReturnValue({ sessionId: 'session-mock-123' } as never);
+    vi.mocked(getSessionContext).mockReturnValue(undefined as never);
+
+    // 1) No caller targeting, but thread history yields a recipient session —
+    //    payload must carry recipientSessionId WITHOUT explicitRecipientTarget.
+    const withHistory = createThreadMockSupabase({
+      existingThread: { id: 'thread-hist' },
+      recipientPriorMessage: {
+        metadata: { pcp: { sender: { agentId: 'lumen', sessionId: 'lumen-old-session' } } },
+      },
+    });
+    const { findThread, getParticipants, resolveTriggeredAgents } =
+      await import('./thread-handlers.js');
+    vi.mocked(findThread).mockResolvedValue({
+      id: 'thread-hist',
+      status: 'open',
+      created_by_agent_id: 'wren',
+    } as never);
+    vi.mocked(getParticipants).mockResolvedValue([]);
+    vi.mocked(resolveTriggeredAgents).mockReturnValue(['lumen']);
+
+    await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientAgentId: 'lumen',
+        senderAgentId: 'wren',
+        threadKey: 'pr:hist',
+        content: 'reply',
+      },
+      createThreadMockDataComposer(withHistory) as never
+    );
+    const historyCall = (mockGateway.processTrigger as ReturnType<typeof vi.fn>).mock.calls.find(
+      (c: unknown[]) => (c[0] as { toAgentId: string }).toAgentId === 'lumen'
+    );
+    expect(historyCall![0]).toEqual(
+      expect.objectContaining({ recipientSessionId: 'lumen-old-session' })
+    );
+    expect(
+      (historyCall![0] as { explicitRecipientTarget?: boolean }).explicitRecipientTarget
+    ).toBeUndefined();
+
+    vi.mocked(findThread).mockResolvedValue(null);
+    vi.mocked(resolveTriggeredAgents).mockReturnValue([]);
+    (mockGateway.processTrigger as ReturnType<typeof vi.fn>).mockClear();
+
+    // 2) Caller-passed studio target → explicitRecipientTarget true.
+    const plain = createThreadMockSupabase({ existingThread: undefined });
+    await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientAgentId: 'wren',
+        senderAgentId: 'wren',
+        recipientStudioId: '123e4567-e89b-12d3-a456-426614174000',
+        threadKey: 'thread:studio-target',
+        content: 'handoff',
+        messageType: 'task_request',
+      },
+      createThreadMockDataComposer(plain) as never
+    );
+    expect(mockGateway.processTrigger).toHaveBeenCalledWith(
+      expect.objectContaining({ toAgentId: 'wren', explicitRecipientTarget: true })
+    );
+  });
+
+  it('unscoped channelPoll fails closed BEFORE any read — no legacy fetch, no pointer advance', async () => {
+    const { getRequestContext, getSessionContext } = await import('../../utils/request-context');
+    vi.mocked(getRequestContext).mockReturnValue(undefined as never);
+    vi.mocked(getSessionContext).mockReturnValue(undefined as never);
+
+    const mockSb = createMockSupabase();
+    const mockDc = createMockDataComposer(mockSb);
+
+    // With agentId
+    const result = await handleGetInbox(
+      { email: 'test@test.com', agentId: 'wren', channelPoll: true },
+      mockDc as never
+    );
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.warning).toContain('channel_poll_unscoped');
+    expect(parsed.messages).toEqual([]);
+
+    // And WITHOUT agentId — the gate must not be bypassable by omitting it
+    const result2 = await handleGetInbox(
+      { email: 'test@test.com', channelPoll: true },
+      mockDc as never
+    );
+    expect(JSON.parse(result2.content[0].text).warning).toContain('channel_poll_unscoped');
+
+    // Nothing was read and nothing advanced: no agent_inbox fetch, no
+    // read-pointer table touched.
+    const tablesTouched = (mockSb.from as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0]);
+    expect(tablesTouched).not.toContain('agent_inbox');
+    expect(tablesTouched).not.toContain('agent_inbox_read_status');
   });
 
   it('advances the sender read pointer through the inserted message on ordinary sends', async () => {
@@ -1742,5 +2000,440 @@ describe('Session-scoped thread filtering', () => {
     );
     const lastParticipantsChain = participantsFrom[participantsFrom.length - 1]?.value;
     expect(lastParticipantsChain?.update).not.toHaveBeenCalled();
+  });
+});
+
+// =====================================================
+// PR #460 round 2 — assignment-failure surfacing (send)
+// and channelPoll dual-scope validation (get_inbox)
+// =====================================================
+
+describe('handleSendToInbox — assignment failure surfacing (round 2)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('returns success:false with routingFailures when routeOnly assignment reports failure', async () => {
+    const { getAgentGateway } = await import('../../channels/agent-gateway.js');
+    const mockGateway = (getAgentGateway as ReturnType<typeof vi.fn>)();
+    mockGateway.processTrigger.mockResolvedValueOnce({
+      success: false,
+      triggerId: 'trigger-sync-err',
+      processed: false,
+      error:
+        'routeOnly assignment failed for lumen: participant stamp not persisted (boundVia=claim)',
+    });
+
+    const mockSb = createThreadMockSupabase({ existingThread: undefined });
+    const result = await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientAgentId: 'lumen',
+        senderAgentId: 'wren',
+        threadKey: 'pr:460',
+        content: 'trigger:false must not fake success',
+        messageType: 'message',
+        trigger: false,
+      },
+      createThreadMockDataComposer(mockSb) as never
+    );
+    const parsed = JSON.parse(result.content[0].text);
+    // The message row was stored, but routing did NOT succeed — the response
+    // must say so, or a trigger:false send leaves a permanently invisible
+    // message behind an unqualified success.
+    expect(parsed.success).toBe(false);
+    expect(parsed.routingFailures).toEqual([
+      { agentId: 'lumen', error: expect.stringContaining('stamp not persisted') },
+    ]);
+    expect(parsed.message).toContain('routing FAILED');
+    expect(parsed.messageId).toBeTruthy();
+    // trigger:false — no wake was dispatched.
+    expect(mockGateway.dispatchTrigger).not.toHaveBeenCalled();
+  });
+
+  it('captures a processTrigger THROW as a routing failure and still attempts the wake', async () => {
+    const { getAgentGateway } = await import('../../channels/agent-gateway.js');
+    const mockGateway = (getAgentGateway as ReturnType<typeof vi.fn>)();
+    mockGateway.processTrigger.mockRejectedValueOnce(new Error('gateway handler crashed'));
+
+    const mockSb = createThreadMockSupabase({ existingThread: undefined });
+    const result = await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientAgentId: 'lumen',
+        senderAgentId: 'wren',
+        threadKey: 'pr:460',
+        content: 'assignment crash must surface',
+        messageType: 'task_request',
+      },
+      createThreadMockDataComposer(mockSb) as never
+    );
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(false);
+    expect(parsed.routingFailures).toEqual([
+      { agentId: 'lumen', error: 'gateway handler crashed' },
+    ]);
+    // Wake still attempted: the wake handler re-runs assignment (a transient
+    // failure may clear) and the wake itself surfaces the message.
+    expect(mockGateway.dispatchTrigger).toHaveBeenCalled();
+  });
+
+  it('stays success:true with no routingFailures key when assignment succeeds', async () => {
+    const mockSb = createThreadMockSupabase({ existingThread: undefined });
+    const result = await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientAgentId: 'lumen',
+        senderAgentId: 'wren',
+        threadKey: 'pr:460',
+        content: 'happy path unchanged',
+        messageType: 'message',
+      },
+      createThreadMockDataComposer(mockSb) as never
+    );
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(true);
+    expect(parsed.routingFailures).toBeUndefined();
+  });
+});
+
+/**
+ * Purpose-built mock for scoped channelPoll flows: serves a configurable
+ * `sessions` row, records per-table .eq() args, and gives every other table
+ * a self-chaining thenable that resolves empty.
+ */
+function createScopedPollMockSupabase(
+  opts: {
+    sessionRow?: { id: string; agent_id: string | null } | null;
+    sessionLookupError?: boolean;
+    /** Rows served when a table chain is awaited as a list (thenable). */
+    tableRows?: Record<string, unknown[]>;
+    /** PostgREST-style RESOLVED errors ({data:null, error}) per table. */
+    tableErrors?: Record<string, string>;
+  } = {}
+) {
+  const eqCalls: Record<string, Array<[string, unknown]>> = {};
+  const record = (table: string, col: string, val: unknown) => {
+    (eqCalls[table] ||= []).push([col, val]);
+  };
+
+  const sessionResult = opts.sessionLookupError
+    ? { data: null, error: { message: 'connection reset' } }
+    : {
+        data:
+          opts.sessionRow === undefined
+            ? { id: 'session-mock-123', agent_id: 'wren' }
+            : opts.sessionRow,
+        error: null,
+      };
+
+  const makeChain = (table: string) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const self: any = {};
+    self.select = vi.fn().mockReturnValue(self);
+    self.upsert = vi.fn().mockResolvedValue({ data: null, error: null });
+    self.eq = vi.fn().mockImplementation((col: string, val: unknown) => {
+      record(table, col, val);
+      return self;
+    });
+    self.gt = vi.fn().mockReturnValue(self);
+    self.in = vi.fn().mockReturnValue(self);
+    self.order = vi.fn().mockReturnValue(self);
+    self.limit = vi.fn().mockReturnValue(self);
+    self.or = vi.fn().mockResolvedValue({ data: [], error: null, count: 0 });
+    self.maybeSingle = vi
+      .fn()
+      .mockResolvedValue(table === 'sessions' ? sessionResult : { data: null, error: null });
+    self.then = (resolve: (v: unknown) => unknown) => {
+      const injectedError = opts.tableErrors?.[table];
+      return Promise.resolve(
+        injectedError
+          ? { data: null, error: { message: injectedError }, count: null }
+          : { data: opts.tableRows?.[table] ?? [], error: null, count: 0 }
+      ).then(resolve);
+    };
+    return self;
+  };
+
+  const identityChain = {
+    select: vi.fn().mockReturnValue({
+      eq: vi.fn().mockReturnValue({
+        eq: vi.fn().mockReturnValue({
+          order: vi.fn().mockResolvedValue({
+            data: [{ id: 'identity-123', workspace_id: 'ws-1', updated_at: null }],
+            error: null,
+          }),
+        }),
+      }),
+    }),
+  };
+
+  const fromFn = vi.fn().mockImplementation((table: string) => {
+    if (table === 'agent_identities') return identityChain;
+    return makeChain(table);
+  });
+
+  return {
+    from: fromFn,
+    rpc: vi.fn().mockResolvedValue({ data: null, error: null }),
+    getEqCalls: () => eqCalls,
+  };
+}
+
+describe('handleGetInbox — channelPoll dual-scope validation (round 2)', () => {
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    const { getRequestContext, getSessionContext, getPinnedAgentId } =
+      await import('../../utils/request-context');
+    vi.mocked(getRequestContext).mockReturnValue({ sessionId: 'session-mock-123' } as never);
+    vi.mocked(getSessionContext).mockReturnValue(undefined as never);
+    vi.mocked(getPinnedAgentId).mockReturnValue(undefined as never);
+  });
+
+  it('derives agentId from the session when omitted — never reads the all-agent surface', async () => {
+    const mockSb = createScopedPollMockSupabase();
+    const result = await handleGetInbox(
+      { email: 'test@test.com', channelPoll: true },
+      createMockDataComposer(mockSb as never) as never
+    );
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(true);
+    expect(parsed.warning).toBeUndefined();
+    expect(parsed.agentId).toBe('wren');
+    // The legacy fetch ran agent-scoped: recipient_agent_id was applied.
+    const inboxEqs = mockSb.getEqCalls()['agent_inbox'] || [];
+    expect(inboxEqs).toContainEqual(['recipient_agent_id', 'wren']);
+    // And the session scope was validated against the sessions table,
+    // SCOPED TO THE RESOLVED USER (round 3): a session id from another user
+    // must read as not-found, never as a scope source.
+    expect(mockSb.getEqCalls()['sessions']).toContainEqual(['id', 'session-mock-123']);
+    const sessionEqCols = (mockSb.getEqCalls()['sessions'] || []).map((c) => c[0]);
+    expect(sessionEqCols).toContain('user_id');
+  });
+
+  it('fails closed when the session agent does not match the pinned identity (round 3)', async () => {
+    // A pinned Myra caller presenting a Wren session id with agentId omitted
+    // must NOT have the read scope switched to Wren.
+    const { getPinnedAgentId } = await import('../../utils/request-context');
+    vi.mocked(getPinnedAgentId).mockReturnValue('myra' as never);
+    const mockSb = createScopedPollMockSupabase(); // session agent is wren
+    const result = await handleGetInbox(
+      { email: 'test@test.com', channelPoll: true },
+      createMockDataComposer(mockSb as never) as never
+    );
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.warning).toContain('channel_poll_unscoped');
+    expect(parsed.warning).toContain('pinned identity');
+    const tablesTouched = (mockSb.from as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0]);
+    expect(tablesTouched).not.toContain('agent_inbox');
+  });
+
+  it('passes when the pinned identity matches the session agent (round 3)', async () => {
+    const { getPinnedAgentId } = await import('../../utils/request-context');
+    vi.mocked(getPinnedAgentId).mockReturnValue('wren' as never);
+    const mockSb = createScopedPollMockSupabase();
+    const result = await handleGetInbox(
+      { email: 'test@test.com', channelPoll: true },
+      createMockDataComposer(mockSb as never) as never
+    );
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.warning).toBeUndefined();
+    expect(parsed.agentId).toBe('wren');
+  });
+
+  it('fails closed when the provided agentId does not match the session agent', async () => {
+    const mockSb = createScopedPollMockSupabase(); // session agent is wren
+    const result = await handleGetInbox(
+      { email: 'test@test.com', agentId: 'myra', channelPoll: true },
+      createMockDataComposer(mockSb as never) as never
+    );
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.warning).toContain('channel_poll_unscoped');
+    expect(parsed.messages).toEqual([]);
+    const tablesTouched = (mockSb.from as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0]);
+    expect(tablesTouched).not.toContain('agent_inbox');
+    expect(tablesTouched).not.toContain('agent_inbox_read_status');
+  });
+
+  it('fails closed when the session row is missing or has no agent', async () => {
+    const mockSb = createScopedPollMockSupabase({ sessionRow: null });
+    const result = await handleGetInbox(
+      { email: 'test@test.com', channelPoll: true },
+      createMockDataComposer(mockSb as never) as never
+    );
+    expect(JSON.parse(result.content[0].text).warning).toContain('channel_poll_unscoped');
+    const tablesTouched = (mockSb.from as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0]);
+    expect(tablesTouched).not.toContain('agent_inbox');
+  });
+
+  it('fails closed on a session lookup ERROR — unverifiable scope never widens into a read', async () => {
+    const mockSb = createScopedPollMockSupabase({ sessionLookupError: true });
+    const result = await handleGetInbox(
+      { email: 'test@test.com', agentId: 'wren', channelPoll: true },
+      createMockDataComposer(mockSb as never) as never
+    );
+    expect(JSON.parse(result.content[0].text).warning).toContain('channel_poll_unscoped');
+    const tablesTouched = (mockSb.from as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0]);
+    expect(tablesTouched).not.toContain('agent_inbox');
+  });
+});
+
+// =====================================================
+// channelPoll thread paging — exact SQL candidacy (round 3)
+// =====================================================
+
+describe('handleGetInbox — channelPoll thread paging via get_unread_thread_candidates', () => {
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    const { getRequestContext, getSessionContext, getPinnedAgentId } =
+      await import('../../utils/request-context');
+    vi.mocked(getRequestContext).mockReturnValue({ sessionId: 'session-mock-123' } as never);
+    vi.mocked(getSessionContext).mockReturnValue(undefined as never);
+    vi.mocked(getPinnedAgentId).mockReturnValue(undefined as never);
+  });
+
+  function withCandidates(
+    mockSb: ReturnType<typeof createScopedPollMockSupabase>,
+    rows: Array<{ thread_id: string; latest_message_at: string; total_candidates: number }>
+  ) {
+    const rpcCalls: Array<{ fn: string; args: Record<string, unknown> }> = [];
+    (mockSb as { rpc: unknown }).rpc = vi
+      .fn()
+      .mockImplementation((fn: string, args: Record<string, unknown>) => {
+        rpcCalls.push({ fn, args });
+        if (fn === 'get_unread_thread_candidates') {
+          return Promise.resolve({ data: rows, error: null });
+        }
+        return Promise.resolve({ data: null, error: null });
+      });
+    return rpcCalls;
+  }
+
+  const STAMPED = { tableRows: { inbox_thread_participants: [{ thread_id: 't-1' }] } };
+
+  it('selects candidates via the RPC scoped to user+agent+session — never thread.updated_at', async () => {
+    // The participant scan must find stamped thread ids so the block runs.
+    const mockSb = createScopedPollMockSupabase(STAMPED);
+    const rpcCalls = withCandidates(mockSb, [
+      { thread_id: 't-1', latest_message_at: '2026-08-12T00:00:01Z', total_candidates: 1 },
+    ]);
+    const result = await handleGetInbox(
+      { email: 'test@test.com', channelPoll: true },
+      createMockDataComposer(mockSb as never) as never
+    );
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(true);
+    const call = rpcCalls.find((c) => c.fn === 'get_unread_thread_candidates');
+    expect(call).toBeDefined();
+    expect(call!.args).toMatchObject({
+      p_agent_id: 'wren',
+      p_session_id: 'session-mock-123',
+      p_limit: 20,
+    });
+    expect(parsed.unreadThreadsTruncated).toBeUndefined();
+  });
+
+  it('reports truncation from the RPC total, not a client pre-cap', async () => {
+    const mockSb = createScopedPollMockSupabase(STAMPED);
+    withCandidates(
+      mockSb,
+      Array.from({ length: 20 }, (_, i) => ({
+        thread_id: `t-${i}`,
+        latest_message_at: `2026-08-12T00:00:${String(i).padStart(2, '0')}Z`,
+        total_candidates: 37,
+      }))
+    );
+    const result = await handleGetInbox(
+      { email: 'test@test.com', channelPoll: true },
+      createMockDataComposer(mockSb as never) as never
+    );
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.unreadThreadsTruncated).toBe(true);
+  });
+
+  it('no participant pre-scan and no client-side id list — the URI-too-long regression', async () => {
+    // The old flow scanned inbox_thread_participants (unfiltered on the
+    // agent-less mission path), collected EVERY thread id, and fed them to
+    // .in('id', ...) — PostgREST puts that in the URL, so a few hundred
+    // threads produced HTTP 414 and a silently empty mission timeline.
+    // The recency page now filters membership with an !inner join instead.
+    const mockSb = createScopedPollMockSupabase();
+    await handleGetInbox(
+      { email: 'test@test.com', agentId: 'wren' },
+      createMockDataComposer(mockSb as never) as never
+    );
+    const tablesTouched = (mockSb.from as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0]);
+    // No standalone participant scan (allParts would only run with a page).
+    expect(tablesTouched).not.toContain('inbox_thread_participants');
+    // Membership filtered in SQL via the embedded join, not an id list.
+    expect(mockSb.getEqCalls()['inbox_threads']).toContainEqual([
+      'inbox_thread_participants.agent_id',
+      'wren',
+    ]);
+  });
+
+  it('channelPoll goes straight to the candidacy RPC — no pre-scan gate', async () => {
+    const mockSb = createScopedPollMockSupabase();
+    const rpcCalls = withCandidates(mockSb, []);
+    await handleGetInbox(
+      { email: 'test@test.com', channelPoll: true },
+      createMockDataComposer(mockSb as never) as never
+    );
+    expect(rpcCalls.some((c) => c.fn === 'get_unread_thread_candidates')).toBe(true);
+    const tablesTouched = (mockSb.from as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0]);
+    expect(tablesTouched).not.toContain('inbox_thread_participants');
+  });
+
+  it('a RESOLVED thread-messages error turns candidates into incomplete, not zero unread', async () => {
+    const mockSb = createScopedPollMockSupabase({
+      tableRows: {
+        inbox_thread_participants: [{ thread_id: 't-1' }],
+        inbox_threads: [
+          {
+            id: 't-1',
+            thread_key: 'pr:t1',
+            title: null,
+            user_id: 'user-123',
+            created_by_agent_id: 'lumen',
+            updated_at: '2026-08-12T00:00:01Z',
+          },
+        ],
+      },
+      tableErrors: { inbox_thread_messages: 'statement timeout' },
+    });
+    withCandidates(mockSb, [
+      { thread_id: 't-1', latest_message_at: '2026-08-12T00:00:01Z', total_candidates: 1 },
+    ]);
+    const result = await handleGetInbox(
+      { email: 'test@test.com', channelPoll: true },
+      createMockDataComposer(mockSb as never) as never
+    );
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.channelPollIncomplete).toBe(true);
+    expect(parsed.warning).toContain('channel_poll_incomplete');
+  });
+
+  it('an RPC failure is LOUD — no silent empty delivery', async () => {
+    const mockSb = createScopedPollMockSupabase(STAMPED);
+    (mockSb as { rpc: unknown }).rpc = vi
+      .fn()
+      .mockResolvedValue({ data: null, error: { message: 'function does not exist' } });
+    const result = await handleGetInbox(
+      { email: 'test@test.com', channelPoll: true },
+      createMockDataComposer(mockSb as never) as never
+    );
+    // The outer catch degrades gracefully (legacy messages still return),
+    // but the failure must be logged at error level by the paging block.
+    const { logger } = await import('../../utils/logger');
+    expect(vi.mocked(logger.error)).toHaveBeenCalledWith(
+      'channel_poll_candidates_failed',
+      expect.objectContaining({ agentId: 'wren' })
+    );
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(true);
+    // The outage must NOT masquerade as a drained inbox (round 4): the
+    // poller sees an explicit incomplete signal and withholds drain proof.
+    expect(parsed.channelPollIncomplete).toBe(true);
+    expect(parsed.warning).toContain('channel_poll_incomplete');
   });
 });

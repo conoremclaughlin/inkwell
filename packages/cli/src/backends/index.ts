@@ -27,3 +27,13 @@ export function getBackend(name: string): BackendAdapter {
   }
   return factory();
 }
+
+/**
+ * The prompt transport a backend's adapter declares. Unknown backends fall
+ * back to 'argv' — the conservative direction for context budgeting (an argv
+ * transport gets the small ARG_MAX-safe budget cap).
+ */
+export function promptTransportFor(name: string): 'stdin' | 'argv' {
+  const factory = BACKENDS[name];
+  return factory ? factory().promptTransport : 'argv';
+}

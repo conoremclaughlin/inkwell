@@ -35,6 +35,13 @@ interface ClaudeStreamMessage {
   usage?: Record<string, unknown>;
   message?: { content?: ClaudeContentBlock[] };
   session_id?: string;
+  /** Model id serving the session (`system`/`init` event). */
+  model?: string;
+  /** Raw SSE event nested under `stream_event` (--include-partial-messages). */
+  event?: {
+    type?: string;
+    delta?: { type?: string; text?: string };
+  };
 }
 
 const NO_SESSION_MARKER = 'No conversation found with session ID';
@@ -102,16 +109,26 @@ export class ClaudeStreamParser implements BackendStreamParser {
       case 'assistant': {
         const content = ev.message?.content;
         if (!Array.isArray(content)) break;
+        // ONE message-level text event per assistant message: all text blocks
+        // concatenated, matching exactly what final-response extraction uses
+        // (lastAssistantText) — so consumers can dedupe streamed output
+        // against the final text by simple equality. Emitted before the
+        // message's tool-use events (text blocks precede tool_use in
+        // practice, so display order is preserved).
         let text = '';
+        const toolUses: BackendTurnEvent[] = [];
         for (const block of content) {
           if (block.type === 'text' && typeof block.text === 'string' && block.text) {
             text += block.text;
-            out.push({ kind: 'text', text: block.text });
           } else if (block.type === 'tool_use' && typeof block.name === 'string') {
-            out.push({ kind: 'tool-use', id: block.id, name: block.name, input: block.input });
+            toolUses.push({ kind: 'tool-use', id: block.id, name: block.name, input: block.input });
           }
         }
-        if (text) this.lastAssistantText = text;
+        if (text) {
+          out.push({ kind: 'text', text });
+          this.lastAssistantText = text;
+        }
+        out.push(...toolUses);
         break;
       }
       case 'user': {
@@ -145,8 +162,27 @@ export class ClaudeStreamParser implements BackendStreamParser {
         });
         break;
       }
+      case 'system': {
+        // The init event names the model actually serving the session —
+        // the ground truth for per-model context-window resolution.
+        if (ev.subtype === 'init' && typeof ev.model === 'string' && ev.model) {
+          out.push({ kind: 'model', model: ev.model });
+        }
+        break;
+      }
+      case 'stream_event': {
+        // Partial-message text fragments (--include-partial-messages). Only
+        // text deltas matter here — thinking/input_json deltas are noise for
+        // display, and the completed `assistant` block event remains the
+        // authoritative text (deltas never feed final-response extraction).
+        const delta = ev.event?.type === 'content_block_delta' ? ev.event.delta : undefined;
+        if (delta?.type === 'text_delta' && typeof delta.text === 'string' && delta.text) {
+          out.push({ kind: 'text-delta', text: delta.text });
+        }
+        break;
+      }
       default:
-        break; // system / error / stream_event / etc. — not needed for the turn result
+        break; // error / other chrome — not needed for the turn result
     }
   }
 }

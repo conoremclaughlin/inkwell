@@ -44,7 +44,10 @@ export function parseSkillMcpConfig(skillPath: string): SkillMcpServer | null {
   //     command: <string>
   //     args: [...]
   //     env: {}
-  const mcpMatch = frontmatter.match(/^mcp:\s*\n((?:  .+\n)*)/m);
+  // `\n?` on the last line: the frontmatter capture strips the newline before
+  // the closing ---, so an mcp block that ends the frontmatter would otherwise
+  // silently lose its final property.
+  const mcpMatch = frontmatter.match(/^mcp:\s*\n((?:  .+\n?)*)/m);
   if (!mcpMatch) return null;
 
   const mcpBlock = mcpMatch[1];
@@ -138,6 +141,24 @@ interface McpJsonConfig {
 }
 
 /**
+ * Resolve the InkMail channel plugin's entrypoint on disk. Shared with
+ * `ink init` (which generates the project entry from the same candidates) so
+ * the generator and the withholding boundary can never disagree about what
+ * the plugin IS. Returns null when no candidate exists.
+ */
+export function resolveChannelPluginPath(cwd: string): string | null {
+  // Look for the channel plugin relative to the repo root
+  const candidates = [
+    join(cwd, 'packages', 'channel-plugin', 'index.ts'),
+    join(cwd, '..', 'personal-context-protocol', 'packages', 'channel-plugin', 'index.ts'),
+  ];
+  for (const p of candidates) {
+    if (existsSync(p)) return p;
+  }
+  return null;
+}
+
+/**
  * Build a merged MCP config that includes both the project's .mcp.json
  * and any skill-provided MCP servers. Also injects PCP session/studio
  * headers via the shared injectSessionHeaders utility.
@@ -148,16 +169,101 @@ interface McpJsonConfig {
  *
  * Returns the path to a temp file and a cleanup function.
  * When no modifications are needed, returns the original .mcp.json path.
+ *
+ * With `omitToolServers` (wholly-in-ink, ink-owned tool routing) the config
+ * is CHANNEL-ONLY: every tool-bearing server (inkwell, supabase, github,
+ * skill-provided, …) is dropped and only the verified canonical channel
+ * bridge survives. The result is always a temp file, even when empty — the
+ * adapter pairs it with `--strict-mcp-config` so an empty config means "no
+ * MCP servers at all".
  */
 export function buildMergedMcpConfig(
   cwd: string,
-  options?: { pcpSessionId?: string; studioId?: string }
+  options?: { pcpSessionId?: string; studioId?: string; omitToolServers?: boolean }
 ): {
   mcpConfigPath: string | null;
   cleanup: () => void;
+  /**
+   * Whether the FINAL config actually retains the inkmail channel bridge.
+   * The channel flag (`--dangerously-load-development-channels
+   * server:inkmail`) must key off this, never off the raw project file — a
+   * rejected non-canonical entry would otherwise still be requested by name
+   * against a strict config that no longer defines it.
+   */
+  hasChannelBridge: boolean;
 } {
   const projectMcpPath = join(cwd, '.mcp.json');
   const hasProjectConfig = existsSync(projectMcpPath);
+
+  if (options?.omitToolServers) {
+    // Channel-only, deliberately: skill-provided MCP servers are NOT merged
+    // here. Skill discovery spans repo/home roots independent of active
+    // skills or tool policy, so re-adding them would restore provider-native
+    // tools inside the very mode meant to withhold them (Lumen's review
+    // probe surfaced an inactive playwright skill doing exactly that).
+    // MCP-bearing skills require backend routing until ink has an
+    // active+policy-approved mediation path.
+    //
+    // Header injection is intentionally skipped too: it only decorates the
+    // tool servers being dropped. Channel bridges get their context from the
+    // spawn env (INK_CONTEXT), not from config headers.
+    const config: McpJsonConfig = { mcpServers: {} };
+    if (hasProjectConfig) {
+      try {
+        const parsed = JSON.parse(readFileSync(projectMcpPath, 'utf-8')) as Partial<McpJsonConfig>;
+        // The project entry is only an OPT-IN signal — its launcher, args,
+        // and path are NEVER copied. The retained entry is CONSTRUCTED from
+        // the init-generator's own resolver, so a squatting or lookalike
+        // entry (`node /tmp/evil.js packages/channel-plugin/index.ts`, an
+        // attacker path merely ending in the canonical suffix, `bash -c …`
+        // with a decoy argv) structurally cannot reach the provider —
+        // validation of attacker-controlled strings is replaced by not
+        // consuming them at all (Lumen, PR #462 review 4894572540). No
+        // resolvable plugin on disk → no bridge; fail closed costs inbox
+        // push, never the boundary.
+        if (parsed.mcpServers?.['inkmail']) {
+          const pluginPath = resolveChannelPluginPath(cwd);
+          if (pluginPath) {
+            config.mcpServers['inkmail'] = {
+              type: 'stdio',
+              command: 'npx',
+              args: ['tsx', pluginPath],
+            };
+          }
+        }
+      } catch {
+        // Unreadable project config — start from an empty server set.
+      }
+    }
+    const tmpDir = join(tmpdir(), 'sb-mcp');
+    mkdirSync(tmpDir, { recursive: true });
+    const tmpPath = join(tmpDir, `mcp-local-${process.pid}.json`);
+    writeFileSync(tmpPath, JSON.stringify(config, null, 2));
+    return {
+      mcpConfigPath: tmpPath,
+      hasChannelBridge: 'inkmail' in config.mcpServers,
+      cleanup: () => {
+        try {
+          unlinkSync(tmpPath);
+        } catch {
+          // Best-effort cleanup
+        }
+      },
+    };
+  }
+
+  // Non-withholding path: the channel flag keys off the project config's own
+  // inkmail entry (any shape — the full config passes through unchanged, so
+  // whatever is defined there is what claude will see).
+  let hasChannelBridge = false;
+  if (hasProjectConfig) {
+    try {
+      const parsed = JSON.parse(readFileSync(projectMcpPath, 'utf-8')) as Partial<McpJsonConfig>;
+      hasChannelBridge = Boolean(parsed.mcpServers?.['inkmail']);
+    } catch {
+      hasChannelBridge = false;
+    }
+  }
 
   // ── Layer 1: Session header injection (shared logic) ──
   // Delegates to the same injectSessionHeaders used by server runners.
@@ -190,6 +296,7 @@ export function buildMergedMcpConfig(
   if (skillServers.length === 0) {
     return {
       mcpConfigPath: effectivePath,
+      hasChannelBridge,
       cleanup: () => cleanups.forEach((fn) => fn()),
     };
   }
@@ -221,6 +328,7 @@ export function buildMergedMcpConfig(
   if (!skillsModified) {
     return {
       mcpConfigPath: effectivePath,
+      hasChannelBridge,
       cleanup: () => cleanups.forEach((fn) => fn()),
     };
   }
@@ -236,6 +344,7 @@ export function buildMergedMcpConfig(
 
   return {
     mcpConfigPath: tmpPath,
+    hasChannelBridge,
     cleanup: () => {
       try {
         unlinkSync(tmpPath);

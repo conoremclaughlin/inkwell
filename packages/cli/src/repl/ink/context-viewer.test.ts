@@ -53,6 +53,28 @@ describe('computeSectionJumps', () => {
     expect(joined).toContain('• get_inbox (approved)');
   });
 
+  it('tool calls section renders the result slice beneath the args', () => {
+    const lines = formatContextLines({
+      ...baseSections,
+      toolCalls: [
+        {
+          tool: 'get_inbox',
+          status: 'executed',
+          at: new Date().toISOString(),
+          args: '{"agentId":"myra","limit":5}',
+          result: '{"success":true,"messages":[{"id":"m1","content":"hello"}]}',
+        },
+        { tool: 'signal_status', status: 'executed', at: new Date().toISOString() },
+      ],
+    });
+    const joined = lines.join('\n');
+    expect(joined).toContain('• get_inbox (executed)');
+    expect(joined).toContain('    {"agentId":"myra","limit":5}');
+    expect(joined).toContain('    → {"success":true,"messages":[{"id":"m1","content":"hello"}]}');
+    // No result line for calls without one
+    expect(joined).toContain('• signal_status (executed)');
+  });
+
   it('evicted section shows attribution and out-of-window note', () => {
     const lines = formatContextLines({
       ...baseSections,

@@ -36,10 +36,24 @@ const PROCESS_TIMEOUT_MS =
 const DIAGNOSTIC_MAX_CHARS = 4000;
 const DIAGNOSTIC_MAX_LINES = 20;
 
+/**
+ * Codex usage is CUMULATIVE for the backend thread, not a per-turn delta.
+ *
+ * `codex exec --json` emits `turn.completed.usage` from `ThreadTokenUsage.total`
+ * (verified against codex-cli 0.146.1). `ThreadTokenUsage` also carries a
+ * `last` field, but the exec JSONL adapter does not export it — so there is no
+ * per-turn figure available on this path and the consumer must diff
+ * successive totals itself. See SessionRepository.updateTokenUsage.
+ */
+const CODEX_USAGE_IS_CUMULATIVE = true;
+
 interface CodexUsageStats {
-  contextTokens: number;
+  /** Absent on the Codex path — no per-turn context measure is emitted. */
+  contextTokens?: number;
   inputTokens: number;
   outputTokens: number;
+  /** Always true for Codex — see CODEX_USAGE_IS_CUMULATIVE. */
+  cumulative: boolean;
 }
 
 export class CodexRunner implements IRunner {
@@ -525,37 +539,64 @@ export class CodexRunner implements IRunner {
     return undefined;
   }
 
-  private extractUsage(event: Record<string, unknown>): CodexUsageStats | undefined {
-    const queue: unknown[] = [event];
-    while (queue.length > 0) {
-      const current = queue.shift();
-      if (!current || typeof current !== 'object') continue;
-      const obj = current as Record<string, unknown>;
-
-      const maybeInput = obj.input_tokens;
-      const maybeOutput = obj.output_tokens;
-      const maybeContext = obj.context_tokens;
-      if (typeof maybeInput === 'number' && typeof maybeOutput === 'number') {
-        const cachedInput =
-          typeof obj.cached_input_tokens === 'number' ? obj.cached_input_tokens : 0;
-        const cacheRead =
-          typeof obj.cache_read_input_tokens === 'number' ? obj.cache_read_input_tokens : 0;
-        const cacheCreate =
-          typeof obj.cache_creation_input_tokens === 'number' ? obj.cache_creation_input_tokens : 0;
-        const totalInput = maybeInput + cachedInput + cacheRead + cacheCreate;
-        return {
-          contextTokens: typeof maybeContext === 'number' ? maybeContext : totalInput,
-          inputTokens: totalInput,
-          outputTokens: maybeOutput,
-        };
-      }
-
-      for (const value of Object.values(obj)) {
-        if (value && typeof value === 'object') queue.push(value);
-      }
+  /**
+   * Parse a single object into usage stats, or undefined if it isn't one.
+   *
+   * Codex's TokenUsage struct is
+   * `{ input_tokens, cached_input_tokens, cache_write_input_tokens,
+   *    output_tokens, reasoning_output_tokens, total_tokens }`
+   * (codex-cli 0.146.1). Both cache figures are already REPRESENTED WITHIN
+   * `input_tokens`, and `reasoning_output_tokens` within `output_tokens`, so
+   * none of them may be added on top — doing so double-counts, and on a long
+   * session that re-sends context every turn the cache figures dominate.
+   *
+   * The Anthropic-style `cache_read_input_tokens` /
+   * `cache_creation_input_tokens` fields do not exist on this path at all.
+   */
+  private parseUsageObject(obj: Record<string, unknown>): CodexUsageStats | undefined {
+    const maybeInput = obj.input_tokens;
+    const maybeOutput = obj.output_tokens;
+    if (typeof maybeInput !== 'number' || typeof maybeOutput !== 'number') {
+      return undefined;
     }
 
-    return undefined;
+    // Context is reported only if a real field carries it. Codex JSONL has no
+    // per-turn context measure — ThreadTokenUsage exposes model_context_window
+    // (the window SIZE, not occupancy). Falling back to the input total, as
+    // this once did, stored a cumulative figure as "context" and produced a
+    // false 1.3-billion-token context reading. Absent means unknown.
+    const maybeContext = obj.context_tokens;
+    return {
+      ...(typeof maybeContext === 'number' ? { contextTokens: maybeContext } : {}),
+      inputTokens: maybeInput,
+      outputTokens: maybeOutput,
+      cumulative: CODEX_USAGE_IS_CUMULATIVE,
+    };
+  }
+
+  /**
+   * Extract usage from a Codex event.
+   *
+   * The returned figures are CUMULATIVE for the backend thread — see
+   * CODEX_USAGE_IS_CUMULATIVE. `SessionRepository.updateTokenUsage` diffs them
+   * against its per-thread checkpoint; it must never simply add them, which is
+   * what grew one session to 3,441,018,986 tokens and overflowed int32.
+   *
+   * Matching is restricted to a known usage container rather than a blind
+   * breadth-first scan for any object carrying `input_tokens`/`output_tokens`:
+   * an untyped deep scan can just as easily consume token stats belonging to
+   * something else entirely in the event stream.
+   */
+  private extractUsage(event: Record<string, unknown>): CodexUsageStats | undefined {
+    // Canonical shape: { type: 'turn.completed', usage: { ... } }
+    const container = event.usage;
+    if (container && typeof container === 'object') {
+      const parsed = this.parseUsageObject(container as Record<string, unknown>);
+      if (parsed) return parsed;
+    }
+
+    // Legacy/flat shape: usage fields on the event itself.
+    return this.parseUsageObject(event);
   }
 
   private extractFinalText(event: Record<string, unknown>): string | undefined {

@@ -48,6 +48,20 @@ export type SessionLifecycle = 'running' | 'idle' | 'completed' | 'failed';
 /** @deprecated Use SessionLifecycle */
 export type SessionStatus = 'active' | 'paused' | 'completed' | 'failed';
 
+/**
+ * Last cumulative usage seen from a backend that reports running thread
+ * totals (Codex `turn.completed.usage` carries `ThreadTokenUsage.total`).
+ *
+ * Scoped to `backendSessionId` because the totals reset whenever the backend
+ * thread changes — resume onto a new thread, compaction, or a fresh run. A
+ * checkpoint from a different thread must never be diffed against.
+ */
+export interface UsageCheckpoint {
+  backendSessionId: string | null;
+  inputTokens: number;
+  outputTokens: number;
+}
+
 export interface Session {
   id: string;
   userId: string;
@@ -74,6 +88,13 @@ export interface Session {
   contextTokens: number;
   totalInputTokens: number;
   totalOutputTokens: number;
+
+  /**
+   * Last cumulative usage observed from a backend that reports running
+   * thread totals rather than per-turn deltas (Codex). Used to diff
+   * successive reports; see SessionRepository.updateTokenUsage.
+   */
+  usageCheckpoint?: UsageCheckpoint;
 
   // Aggregate counters (persisted as columns)
   messageCount: number;
@@ -185,11 +206,24 @@ export interface SessionResult {
 
   // Token usage from this interaction
   usage?: {
-    contextTokens: number;
+    /**
+     * Tokens currently in the backend's context window.
+     *
+     * Omitted when the backend reports no such measure — Codex JSONL carries
+     * none, and aliasing it to a cumulative input total stores a false
+     * reading. Absent means unknown, not zero.
+     */
+    contextTokens?: number;
     inputTokens: number;
     outputTokens: number;
     cacheReadTokens?: number;
     cacheWriteTokens?: number;
+    /**
+     * True when the backend reports running thread totals instead of a
+     * per-turn delta (Codex `turn.completed.usage` is `ThreadTokenUsage.total`).
+     * The repository must diff against its checkpoint rather than add.
+     */
+    cumulative?: boolean;
   };
 
   // Session state after processing
@@ -383,7 +417,19 @@ export interface ISessionRepository {
 
   updateTokenUsage(
     id: string,
-    usage: { contextTokens: number; inputTokens: number; outputTokens: number }
+    usage: {
+      /** Omitted when the backend reports no per-turn context measure. */
+      contextTokens?: number;
+      inputTokens: number;
+      outputTokens: number;
+      /**
+       * True when the counts are running totals for `backendSessionId`
+       * rather than this turn's delta. The repository diffs them against
+       * its stored checkpoint before accumulating.
+       */
+      cumulative?: boolean;
+    },
+    options?: { backendSessionId?: string | null }
   ): Promise<void>;
 
   markCompacted(id: string, newBackendSessionId: string | null): Promise<void>;
@@ -450,6 +496,22 @@ export interface ClaudeRunnerConfig {
   studioId?: string;
   /** When true, bypass sandbox restrictions (e.g., Codex --dangerously-bypass-approvals-and-sandbox). Opt-in per studio. */
   sandboxBypass?: boolean;
+  /**
+   * Continuation-loop turn cap for InkRunner spawns. Counts OUTER
+   * conversational turns — the delivered message plus continuation prompts
+   * (runUserTurn cycles) — NOT provider subprocess calls, of which one turn's
+   * tool loop may spawn several. Sourced from the SB's dashboard settings
+   * (agent_identities.metadata.runtimeConfig.maxTurns); the runner clamps and
+   * defaults (5) when absent. signal_status is the sanctioned in-loop halt —
+   * this only caps runaway continuations.
+   */
+  maxTurns?: number;
+  /**
+   * Tool routing for InkRunner spawns, from the SB's dashboard settings
+   * (runtimeConfig.toolRouting). Forwarded as `--tool-routing`; when absent
+   * the ink chat loop resolves its own default ('local').
+   */
+  toolRouting?: 'backend' | 'local';
   /** Root repo path — propagated via context token for cross-project 'main' resolution */
   repoRoot?: string;
   /**

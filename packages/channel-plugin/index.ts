@@ -25,6 +25,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { readFileSync, existsSync, mkdirSync, appendFileSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
+import { createThreadDrainState, drainThreads } from './poll-core.js';
 
 // ─── Logging ────────────────────────────────────────────────
 // Logs to ~/.ink/logs/channel-plugin.log for debugging.
@@ -239,9 +240,10 @@ Do NOT ignore channel messages — they are from your teammates and deserve time
 // ─── Polling Loop ───────────────────────────────────────────
 
 let lastPollTime = new Date().toISOString();
-const seenMessageIds = new Set<string>(); // belt-and-suspenders dedup
-const lastThreadTimestamps = new Map<string, string>(); // threadKey → last seen created_at
-const lastThreadMessageId = new Map<string, string>(); // threadKey → id of last delivered message (cursor)
+// Thread cursors, dedup, and cold-start skip accounting live in the drain
+// state (poll-core.ts owns the delivery semantics; unit-tested there).
+const drainState = createThreadDrainState();
+const seenMessageIds = drainState.seenMessageIds; // shared with the legacy loop
 
 async function stampCliPollAt(): Promise<void> {
   if (!sessionId || !accessToken) return;
@@ -260,152 +262,140 @@ async function stampCliPollAt(): Promise<void> {
   }
 }
 
+// One-time fail-closed notice (spec inkmail-read-state §3): a plugin process
+// with no session context gets nothing from channelPoll (server fail-closed).
+// Surface that ONCE so a directly-launched session isn't silently featureless,
+// then stay quiet — recurring warnings are noise.
+let unscopedNoticeSent = false;
+
+// In-flight guard (PR #385 pattern): during a slow/degraded server,
+// interval ticks must SKIP rather than stack concurrent polls — every
+// live Claude Code session runs one of these processes, so stacked
+// polls multiply across the fleet. The interval and the one-shot
+// startup poll are the only entry points (no forced path exists), so
+// a plain boolean cannot be cleared early by an overlapping entrant.
+let pollInFlight = false;
+
 async function pollInbox(): Promise<void> {
   if (!email) return;
-
-  // Stamp cli_poll_at so the trigger handler knows we're alive
-  stampCliPollAt().catch(() => {});
-
+  if (pollInFlight) {
+    log('debug', 'Poll skipped — previous poll still in flight');
+    return;
+  }
+  pollInFlight = true;
   try {
-    const result = await callPcp('get_inbox', {
-      email,
-      agentId,
-      status: 'all',
-      since: lastPollTime,
-      limit: 20,
-      channelPoll: true,
-    });
-
-    if (!result?.success) {
-      log('error', 'Poll failed', { result: JSON.stringify(result).slice(0, 300) });
-      return;
+    if (!sessionId && !unscopedNoticeSent) {
+      unscopedNoticeSent = true;
+      log('warn', 'No session context — InkMail delivery disabled (fail-closed), notifying once');
+      await mcp
+        .notification({
+          method: 'notifications/claude/channel',
+          params: {
+            content:
+              'InkMail delivery disabled for this session: no session context (INK_SESSION_ID). ' +
+              'Launch via the ink wrapper for scoped delivery. Server log: channel_poll_unscoped.',
+            meta: { sender: 'inkmail', message_type: 'notification' },
+          },
+        })
+        .catch(() => {});
     }
-    const threadCount = ((result.threadsWithUnread as unknown[]) || []).length;
-    const msgCount = ((result.messages as unknown[]) || []).length;
-    const totalUnread = (result.totalUnreadCount as number) || 0;
-    log('debug', 'Poll result', { threadCount, msgCount, totalUnread, since: lastPollTime });
 
-    // Check for new thread messages
-    const threads = (result.threadsWithUnread as Array<Record<string, unknown>>) || [];
-    for (const thread of threads) {
-      const threadKey = thread.threadKey as string;
-      const unreadCount = (thread.unreadCount as number) || 0;
-      if (!threadKey || unreadCount === 0) continue;
+    // Stamp cli_poll_at so the trigger handler knows we're alive
+    stampCliPollAt().catch(() => {});
 
-      // Use our own cursor (afterMessageId) to avoid the ASC-sort + small-limit
-      // footgun: without a cursor, get_thread_messages returns the earliest N
-      // messages and a repeat poll keeps returning the same slice, never
-      // reaching new ones. markRead advances the server pointer to whatever
-      // was actually returned — safe now that the server respects that — but
-      // the plugin's own cursor is what guarantees forward progress.
-      const afterMessageId = lastThreadMessageId.get(threadKey);
-      const threadResult = await callPcp('get_thread_messages', {
+    try {
+      const result = await callPcp('get_inbox', {
         email,
         agentId,
-        threadKey,
-        markRead: true,
-        limit: 50,
-        ...(afterMessageId ? { afterMessageId } : {}),
+        status: 'all',
+        since: lastPollTime,
+        limit: 20,
+        channelPoll: true,
       });
 
-      if (!threadResult?.success) continue;
+      if (!result?.success) {
+        log('error', 'Poll failed', { result: JSON.stringify(result).slice(0, 300) });
+        return;
+      }
+      const threadCount = ((result.threadsWithUnread as unknown[]) || []).length;
+      const msgCount = ((result.messages as unknown[]) || []).length;
+      const totalUnread = (result.totalUnreadCount as number) || 0;
+      log('debug', 'Poll result', { threadCount, msgCount, totalUnread, since: lastPollTime });
 
-      const messages = (threadResult.messages as Array<Record<string, unknown>>) || [];
-      const lastKnownTs = lastThreadTimestamps.get(threadKey);
+      // Drain thread messages through poll-core (unit-tested): always-on
+      // 100/poll budget with budget-bounded per-request limits, cold fetches
+      // markRead:false + exact-id ack after injection, skip accounting with
+      // one drain-time summary per process.
+      const drained = await drainThreads(
+        {
+          callPcp,
+          notify: async (content, meta) => {
+            await mcp.notification({
+              method: 'notifications/claude/channel',
+              params: { content, meta },
+            });
+          },
+          log,
+          agentId,
+          email,
+          studioId,
+        },
+        drainState,
+        (result.threadsWithUnread as Array<Record<string, unknown>>) || [],
+        {
+          moreThreadsPending: result.unreadThreadsTruncated === true,
+          pollIncomplete: result.channelPollIncomplete === true,
+        }
+      );
+      if (drained.injected > 0 || drained.ceilingHit || drained.fetchFailures > 0) {
+        log('debug', 'Thread drain result', { ...drained });
+      }
 
-      for (const msg of messages) {
+      // Legacy inbox messages (non-threaded). Since we pass `since: lastPollTime`
+      // to get_inbox, only new messages are returned. seenMessageIds prevents
+      // any edge-case re-emission.
+      const inboxMessages = (result.messages as Array<Record<string, unknown>>) || [];
+      for (const msg of inboxMessages) {
         const msgId = msg.id as string;
-        const msgTs = msg.createdAt as string;
-        // Skip own messages UNLESS they came from a different studio (cross-studio self-message)
+        // Skip own messages unless cross-studio (same logic as thread path above)
         if (msg.senderAgentId === agentId) {
-          if (!studioId) continue; // no studio context — always skip self
+          if (!studioId) continue;
           const msgPcp = (msg.metadata as Record<string, unknown>)?.pcp as
             | Record<string, unknown>
             | undefined;
           const msgSender = msgPcp?.sender as Record<string, unknown> | undefined;
           const msgStudioId = msgSender?.studioId as string | undefined;
-          if (!msgStudioId || msgStudioId === studioId) continue; // same studio or unknown — skip
-          // Different studio — accept (cross-studio self-message)
+          if (!msgStudioId || msgStudioId === studioId) continue;
         }
         if (msgId && seenMessageIds.has(msgId)) continue;
-        if (lastKnownTs && msgTs && msgTs <= lastKnownTs) continue;
+        if (!isLegacyMessageForThisStudio(msg)) continue;
         if (msgId) seenMessageIds.add(msgId);
 
         const sender = (msg.senderAgentId as string) || 'unknown';
         const content = (msg.content as string) || '';
         const messageType = (msg.messageType as string) || 'message';
+        const msgThreadKey = (msg.threadKey as string) || '';
 
-        log('info', 'Pushing thread message to channel', { threadKey, sender, msgId, msgTs });
         await mcp.notification({
           method: 'notifications/claude/channel',
           params: {
             content: `From ${sender}: ${content}`,
             meta: {
-              thread_key: threadKey,
-              sender: sender,
+              thread_key: msgThreadKey,
+              sender,
               message_type: messageType,
-              message_id: (msg.id as string) || '',
+              subject: (msg.subject as string) || '',
             },
           },
         });
       }
 
-      // Advance cursors (id + timestamp) to the last returned message.
-      // The id cursor is what the next poll passes as afterMessageId to
-      // guarantee forward progress; the timestamp cursor is the legacy
-      // belt-and-suspenders dedup for cases where the id cursor is empty
-      // (first poll for a thread).
-      if (messages.length > 0) {
-        const lastMsg = messages[messages.length - 1];
-        const lastTs = lastMsg.createdAt as string;
-        const lastId = lastMsg.id as string;
-        if (lastTs) lastThreadTimestamps.set(threadKey, lastTs);
-        if (lastId) lastThreadMessageId.set(threadKey, lastId);
-      }
+      lastPollTime = new Date().toISOString();
+    } catch (err) {
+      log('error', 'Poll error', { error: err instanceof Error ? err.message : String(err) });
     }
-
-    // Legacy inbox messages (non-threaded). Since we pass `since: lastPollTime`
-    // to get_inbox, only new messages are returned. seenMessageIds prevents
-    // any edge-case re-emission.
-    const inboxMessages = (result.messages as Array<Record<string, unknown>>) || [];
-    for (const msg of inboxMessages) {
-      const msgId = msg.id as string;
-      // Skip own messages unless cross-studio (same logic as thread path above)
-      if (msg.senderAgentId === agentId) {
-        if (!studioId) continue;
-        const msgPcp = (msg.metadata as Record<string, unknown>)?.pcp as
-          | Record<string, unknown>
-          | undefined;
-        const msgSender = msgPcp?.sender as Record<string, unknown> | undefined;
-        const msgStudioId = msgSender?.studioId as string | undefined;
-        if (!msgStudioId || msgStudioId === studioId) continue;
-      }
-      if (msgId && seenMessageIds.has(msgId)) continue;
-      if (!isLegacyMessageForThisStudio(msg)) continue;
-      if (msgId) seenMessageIds.add(msgId);
-
-      const sender = (msg.senderAgentId as string) || 'unknown';
-      const content = (msg.content as string) || '';
-      const messageType = (msg.messageType as string) || 'message';
-      const msgThreadKey = (msg.threadKey as string) || '';
-
-      await mcp.notification({
-        method: 'notifications/claude/channel',
-        params: {
-          content: `From ${sender}: ${content}`,
-          meta: {
-            thread_key: msgThreadKey,
-            sender,
-            message_type: messageType,
-            subject: (msg.subject as string) || '',
-          },
-        },
-      });
-    }
-
-    lastPollTime = new Date().toISOString();
-  } catch (err) {
-    log('error', 'Poll error', { error: err instanceof Error ? err.message : String(err) });
+  } finally {
+    pollInFlight = false;
   }
 }
 

@@ -37,6 +37,22 @@ describe('buildIdentityPrompt conditional bootstrap', () => {
   });
 });
 
+describe('backend adapters prompt transport declarations', () => {
+  // Context budgeting depends on these (repl/context-limits.ts): stdin
+  // transports may take the large 1M cap; argv transports MUST stay at the
+  // ARG_MAX-safe 200K cap. Flipping one of these is a budget decision, not a
+  // refactor — an adapter may only declare 'stdin' when its prepare() really
+  // delivers the prompt via stdinData (Lumen, PR #477 review — finding 1).
+  it('claude delivers the prompt via stdin', () => {
+    expect(new ClaudeAdapter().promptTransport).toBe('stdin');
+  });
+
+  it('codex and gemini deliver the prompt via argv', () => {
+    expect(new CodexAdapter().promptTransport).toBe('argv');
+    expect(new GeminiAdapter().promptTransport).toBe('argv');
+  });
+});
+
 describe('backend adapters session resume wiring', () => {
   it('passes claude backendSessionId through --resume', () => {
     const adapter = new ClaudeAdapter();
@@ -95,6 +111,55 @@ describe('backend adapters session resume wiring', () => {
     try {
       expect(prepared.args).toContain('resume');
       expect(prepared.args).toContain('codex-session-123');
+    } finally {
+      prepared.cleanup();
+    }
+  });
+
+  it('injects image media as parse-safe --image= flags terminated by --', () => {
+    // Variadic `-i <FILE>...` swallows the following positional prompt
+    // (Lumen probe, codex 0.146.1, PR #463 review 4900120086). The
+    // single-value `--image=` binding plus a `--` options terminator keeps
+    // the prompt a positional under all parse rules.
+    const adapter = new CodexAdapter();
+    const prepared = adapter.prepare({
+      agentId: 'lumen',
+      model: undefined,
+      promptParts: ['exec', 'what is in this image?'],
+      passthroughArgs: [],
+      media: [
+        { path: '/tmp/photo.png', mimeType: 'image/png' },
+        { path: '/tmp/pic.jpg', mimeType: 'image/jpeg' },
+        { path: '/tmp/doc.pdf', mimeType: 'application/pdf' },
+      ],
+    });
+
+    try {
+      const execIndex = prepared.args.indexOf('exec');
+      const promptIndex = prepared.args.indexOf('what is in this image?');
+      expect(prepared.args.slice(execIndex + 1, promptIndex)).toEqual([
+        '--image=/tmp/photo.png',
+        '--image=/tmp/pic.jpg',
+        '--',
+      ]);
+      expect(prepared.args).not.toContain('/tmp/doc.pdf');
+      expect(prepared.args).not.toContain('-i');
+    } finally {
+      prepared.cleanup();
+    }
+  });
+
+  it('media-free exec turns get no --image flags and no -- terminator', () => {
+    const adapter = new CodexAdapter();
+    const prepared = adapter.prepare({
+      agentId: 'lumen',
+      model: undefined,
+      promptParts: ['exec', 'plain work'],
+      passthroughArgs: [],
+    });
+    try {
+      expect(prepared.args).not.toContain('--');
+      expect(prepared.args.some((a) => a.startsWith('--image='))).toBe(false);
     } finally {
       prepared.cleanup();
     }

@@ -2389,6 +2389,27 @@ router.patch('/identities/:agentId/settings', async (req: Request, res: Response
 
     // Runtime config fields → stored in metadata.runtimeConfig
     const { toolProfile, toolRouting, maxTurns, passiveRecall } = body;
+    // These feed spawn flags directly (ink-runner --tool-routing /
+    // --max-turns), so reject junk at the door: an unvalidated value would
+    // silently fall back to defaults at spawn time and the dashboard would
+    // lie about what's in effect.
+    if (
+      toolRouting !== undefined &&
+      toolRouting !== null &&
+      toolRouting !== 'local' &&
+      toolRouting !== 'backend'
+    ) {
+      res.status(400).json({ error: "toolRouting must be 'local', 'backend', or null" });
+      return;
+    }
+    if (
+      maxTurns !== undefined &&
+      maxTurns !== null &&
+      (typeof maxTurns !== 'number' || !Number.isInteger(maxTurns) || maxTurns < 1 || maxTurns > 25)
+    ) {
+      res.status(400).json({ error: 'maxTurns must be an integer between 1 and 25, or null' });
+      return;
+    }
     if (
       toolProfile !== undefined ||
       toolRouting !== undefined ||

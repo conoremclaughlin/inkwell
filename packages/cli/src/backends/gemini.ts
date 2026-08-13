@@ -88,6 +88,8 @@ function buildGeminiSettings(
 export class GeminiAdapter implements BackendAdapter {
   readonly name = 'gemini';
   readonly binary = 'gemini';
+  // Prompt rides argv (`-p <prompt>`) — bounded by OS ARG_MAX.
+  readonly promptTransport = 'argv' as const;
 
   prepare(config: BackendConfig): PreparedBackend {
     const { promptFile, cleanup: identityCleanup } = createIdentityPromptFile(config.agentId);
