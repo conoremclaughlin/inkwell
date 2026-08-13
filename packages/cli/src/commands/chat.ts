@@ -28,7 +28,7 @@ import {
   runBackendInteractiveLogin,
   type BackendAuthBackend,
 } from '../lib/backend-auth.js';
-import { startBackendTurn, runBackendTurn } from '../repl/backend-runner.js';
+import { startBackendTurn, runBackendTurn, type BackendRunResult } from '../repl/backend-runner.js';
 import { StreamedTurnRenderer, type StreamedLine } from '../repl/paragraph-stream.js';
 import type { BackendTurnEvent } from '../backends/stream.js';
 import type { TurnMedia } from '../backends/types.js';
@@ -115,12 +115,9 @@ import {
 } from '../repl/ink/index.js';
 import { formatContextLines, type ContextSections } from '../repl/ink/context-viewer.js';
 import {
-  DEFAULT_MAX_TOOL_LOOP_ITERATIONS,
-  MAX_TOOL_CALLS_PER_ITERATION,
-  extractLocalToolCalls,
-  isTerminalSignalToolResult,
+  runAgentLoop,
   stripLocalToolBlocks,
-  toolLoopStopReason,
+  type BackendTurnOutcome,
   type LocalToolCall,
   type ToolResultRecord,
 } from '../repl/agent-loop.js';
@@ -4970,286 +4967,189 @@ export async function runChat(options: ChatOptions): Promise<void> {
     };
 
     process.on('SIGINT', onSigintDuringTurn);
-    const turn = startBackendTurn({
-      backend: runtime.backend,
-      agentId,
-      model: runtime.model,
-      prompt,
-      verbose: runtime.verbose,
-      passthroughArgs,
-      timeoutMs: runtime.backendTurnTimeoutMs,
-      idleTimeoutMs: runtime.backendIdleTimeoutMs,
-      stream: true,
-      onEvent: handleBackendEvent,
-      attachmentDirs: sessionAttachmentDirs.length > 0 ? sessionAttachmentDirs : undefined,
-      toolRouting: runtime.toolRouting,
-      // Delivery spawn: embed this turn's media even when resuming a
-      // recovered provider session — new media on an existing conversation
-      // must reach the provider (heartbeat/reattach path).
-      media: turnMedia.length > 0 ? turnMedia : undefined,
-      ...(turnMedia.length > 0 ? { deliverMedia: true } : {}),
-      // Seed a fresh provider session (first spawn) OR resume the live one
-      // (subsequent turns). Tool-loop continuations below always resume it.
-      ...(seedProviderSessionId ? { backendSessionSeedId: seedProviderSessionId } : {}),
-      ...(resumeProviderSession && activeBackendSessionId
-        ? { backendSessionId: activeBackendSessionId }
-        : {}),
-    });
-    currentTurnAbort = turn.abort;
-    inkRepl?.setAbortHandler(abortCurrentTurn);
+    // ── Backend port for this turn ──
+    // The loop (../repl/agent-loop.js) decides WHAT to send and whether to send
+    // again. Everything below is this host's business: provider-session seeding
+    // and reuse, recovery when a resumed session has vanished, media delivery
+    // flags, SIGINT/abort wiring, debug + activity logging. A shadow clone
+    // supplies a far simpler runTurn and shares the loop unchanged.
+    let lastRunResult!: BackendRunResult;
 
-    let runResult = await turn.result.finally(() => {
-      currentTurnAbort = null;
-      inkRepl?.setAbortHandler(null);
-      process.off('SIGINT', onSigintDuringTurn);
-      turnDurationSeconds = Math.max(0, Math.round((Date.now() - turnStartedAt) / 1000));
-      stopWaiting();
-    });
-    // If a resumed turn failed because the provider session vanished (jsonl
-    // cleaned up / different machine), drop the live id so the NEXT turn seeds a
-    // fresh one. Within a single interactive process this is near-impossible (we
-    // seeded the id ourselves); the full mid-turn re-seed lands with the
-    // server/cross-process path.
-    if (
-      resumeProviderSession &&
-      !runResult.success &&
-      (runResult.resumeFailedNoSession || isResumeFailedNoSession(runResult.stderr))
-    ) {
-      // The resumed provider session no longer exists locally (jsonl pruned /
-      // different machine). Mint a fresh native session, re-send the FULL
-      // envelope (the ledger already holds the history), and retry once so a
-      // server heartbeat still produces output instead of dying on a stale id.
-      // Mirrors ClaudeRunner/InkRunner's resume-not-found recovery.
-      const reseedId = randomUUID();
-      activeBackendSessionId = reseedId;
-      activeBackendSessionShape = currentEnvelopeShape;
-      appendTranscript(runtime.transcriptPath, {
-        type: 'backend_session',
-        id: reseedId,
-        routing: runtime.toolRouting,
-      });
-      printEvent(
-        chalk.yellow('  ⛁ provider session not found on resume — re-seeding a fresh native session')
-      );
-      process.on('SIGINT', onSigintDuringTurn);
-      const reseedTurn = startBackendTurn({
-        backend: runtime.backend,
-        agentId,
-        model: runtime.model,
-        prompt: buildPromptEnvelope(agentId, runtime, ledger, raw),
-        verbose: runtime.verbose,
-        passthroughArgs,
-        timeoutMs: runtime.backendTurnTimeoutMs,
-        idleTimeoutMs: runtime.backendIdleTimeoutMs,
-        stream: true,
-        onEvent: handleBackendEvent,
-        attachmentDirs: sessionAttachmentDirs.length > 0 ? sessionAttachmentDirs : undefined,
-        toolRouting: runtime.toolRouting,
-        // The reseeded provider session is fresh — re-inject this turn's
-        // media so the full envelope carries the images too.
-        media: turnMedia.length > 0 ? turnMedia : undefined,
-        ...(turnMedia.length > 0 ? { deliverMedia: true } : {}),
-        backendSessionSeedId: reseedId,
-      });
-      currentTurnAbort = reseedTurn.abort;
-      inkRepl?.setAbortHandler(abortCurrentTurn);
-      runResult = await reseedTurn.result.finally(() => {
-        currentTurnAbort = null;
-        inkRepl?.setAbortHandler(null);
-        process.off('SIGINT', onSigintDuringTurn);
-      });
-    }
-    sbDebugLog(
-      'chat',
-      'backend_turn_result',
-      {
-        backend: runtime.backend,
-        sessionId: runtime.sessionId || null,
-        success: runResult.success,
-        exitCode: runResult.exitCode,
-        durationMs: runResult.durationMs,
-        command: runResult.command,
-        stderrPreview: runResult.stderr.slice(0, 500),
-      },
-      debugFile ? { force: true, file: debugFile } : undefined
-    );
-
-    if (runResult.success) {
-      consecutiveBackendFailures = 0;
-    } else {
-      consecutiveBackendFailures += 1;
-    }
-
-    // Log backend CLI turn completion to activity stream.
-    // Use 'ink' as the runner label (not the LLM backend like 'claude')
-    // so the mission feed shows the correct execution layer.
-    if (runtime.sessionId) {
-      const turnStatus = runResult.success ? 'completed' : 'failed';
-      const cliErrorClassification = !runResult.success
-        ? classifyError({
-            errorText: runResult.stderr || runResult.stdout,
-            backend: runtime.backend,
-            exitCode: runResult.exitCode,
-          })
-        : null;
-
-      const runnerLabel = 'ink';
-      pcp
-        .callTool('log_activity', {
+    const runTurnForLoop = async (
+      body: string,
+      ctx: { isContinuation: boolean }
+    ): Promise<BackendTurnOutcome> => {
+      if (!ctx.isContinuation) {
+        const turn = startBackendTurn({
+          backend: runtime.backend,
           agentId,
-          type: runResult.success ? 'agent_complete' : 'error',
-          subtype: `backend_cli:${runnerLabel}`,
-          content: runResult.success
-            ? `Backend turn completed (${runnerLabel}, ${turnDurationSeconds}s)`
-            : `Backend turn failed (${runnerLabel}, ${cliErrorClassification?.category || 'exit ' + runResult.exitCode}): ${cliErrorClassification?.summary || runResult.stderr.slice(0, 200) || 'unknown error'}`,
-          sessionId: runtime.sessionId,
-          status: turnStatus,
-          payload: {
-            backend: runnerLabel,
-            exitCode: runResult.exitCode,
-            durationMs: turnDurationSeconds * 1000,
-            studioId: runtime.studioId,
-            ...(runResult.success ? {} : { stderr: runResult.stderr.slice(0, 2000) }),
-            ...(cliErrorClassification
-              ? {
-                  errorCategory: cliErrorClassification.category,
-                  errorSummary: cliErrorClassification.summary,
-                  retryable: cliErrorClassification.retryable,
-                }
-              : {}),
-            ...(runResult.usage ? { usage: runResult.usage } : {}),
-          },
-        })
-        .catch(() => undefined);
-    }
-
-    // ── Multi-turn tool loop ──
-    // When local tool routing is active, the backend may emit ink-tool blocks.
-    // We execute them locally, then re-invoke the backend with the results so it
-    // can reason about them and potentially emit more tool calls. This continues
-    // until the backend produces no tool calls or we hit the iteration limit.
-    const MAX_TOOL_LOOP_ITERATIONS = DEFAULT_MAX_TOOL_LOOP_ITERATIONS;
-    let toolLoopIteration = 0;
-    let responseText = '';
-    let localToolCalls: LocalToolCall[] = [];
-    let allToolResults: Array<{ tool: string; result: unknown; status: string; args?: unknown }> =
-      [];
-
-    // eslint-disable-next-line no-constant-condition
-    while (true) {
-      // In streaming mode `responseText` is the parsed assistant text; `stdout`
-      // is the raw NDJSON event stream, so never use it as the reply there.
-      responseText = (runResult.responseText ?? runResult.stdout).trim();
-      if (!responseText && runResult.stderr.trim()) {
-        responseText = runResult.stderr.trim();
-      }
-      if (!responseText) {
-        responseText = '(no output)';
-      }
-
-      localToolCalls =
-        runtime.toolRouting === 'local'
-          ? extractLocalToolCalls(responseText).slice(0, MAX_TOOL_CALLS_PER_ITERATION)
-          : [];
-
-      if (localToolCalls.length === 0) break;
-
-      const iterationResults = await runIterationTools(localToolCalls);
-
-      allToolResults.push(...iterationResults);
-      for (const r of iterationResults) {
-        const liveArgsJson = r.args ? JSON.stringify(r.args).replace(/\s+/g, ' ') : '';
-        // The scrollback line shows a 160-char teaser; the inspector (Ctrl+T)
-        // is the drill-down, so it keeps a much larger slice of the result.
-        // The complete payload always lives in the transcript.
-        const liveResultJson =
-          r.result !== undefined
-            ? (typeof r.result === 'string' ? r.result : JSON.stringify(r.result)).replace(
-                /\s+/g,
-                ' '
-              )
-            : '';
-        recentToolCalls.push({
-          tool: r.tool,
-          status: r.status,
-          at: new Date().toISOString(),
-          args: liveArgsJson
-            ? liveArgsJson.length > 400
-              ? `${liveArgsJson.slice(0, 400)}…`
-              : liveArgsJson
-            : undefined,
-          result: liveResultJson
-            ? liveResultJson.length > 2000
-              ? `${liveResultJson.slice(0, 2000)}…`
-              : liveResultJson
-            : undefined,
+          model: runtime.model,
+          prompt: body,
+          verbose: runtime.verbose,
+          passthroughArgs,
+          timeoutMs: runtime.backendTurnTimeoutMs,
+          idleTimeoutMs: runtime.backendIdleTimeoutMs,
+          stream: true,
+          onEvent: handleBackendEvent,
+          attachmentDirs: sessionAttachmentDirs.length > 0 ? sessionAttachmentDirs : undefined,
+          toolRouting: runtime.toolRouting,
+          // Delivery spawn: embed this turn's media even when resuming a
+          // recovered provider session — new media on an existing conversation
+          // must reach the provider (heartbeat/reattach path).
+          media: turnMedia.length > 0 ? turnMedia : undefined,
+          ...(turnMedia.length > 0 ? { deliverMedia: true } : {}),
+          // Seed a fresh provider session (first spawn) OR resume the live one
+          // (subsequent turns). Tool-loop continuations always resume it.
+          ...(seedProviderSessionId ? { backendSessionSeedId: seedProviderSessionId } : {}),
+          ...(resumeProviderSession && activeBackendSessionId
+            ? { backendSessionId: activeBackendSessionId }
+            : {}),
         });
-      }
-      if (recentToolCalls.length > 100) {
-        recentToolCalls.splice(0, recentToolCalls.length - 100);
-      }
-      toolLoopIteration++;
+        currentTurnAbort = turn.abort;
+        inkRepl?.setAbortHandler(abortCurrentTurn);
 
-      // Check if we should continue the loop. The predicate (including the
-      // ordering that lets a terminal signal_status beat executed tools) lives
-      // in ../repl/agent-loop.js so the loop and its regression test share one
-      // implementation instead of the test mirroring it.
-      const stopReason = toolLoopStopReason(
-        iterationResults,
-        toolLoopIteration,
-        MAX_TOOL_LOOP_ITERATIONS
-      );
-      if (stopReason) {
-        if (stopReason === 'iteration-cap') {
-          printLine(
-            chalk.dim(`(tool loop limit reached — ${MAX_TOOL_LOOP_ITERATIONS} iterations)`)
+        let runResult = await turn.result.finally(() => {
+          currentTurnAbort = null;
+          inkRepl?.setAbortHandler(null);
+          process.off('SIGINT', onSigintDuringTurn);
+          turnDurationSeconds = Math.max(0, Math.round((Date.now() - turnStartedAt) / 1000));
+          stopWaiting();
+        });
+
+        // If a resumed turn failed because the provider session vanished (jsonl
+        // cleaned up / different machine), drop the live id so the NEXT turn seeds
+        // a fresh one. Within a single interactive process this is near-impossible
+        // (we seeded the id ourselves); the full mid-turn re-seed lands with the
+        // server/cross-process path.
+        if (
+          resumeProviderSession &&
+          !runResult.success &&
+          (runResult.resumeFailedNoSession || isResumeFailedNoSession(runResult.stderr))
+        ) {
+          // Mint a fresh native session, re-send the FULL envelope (the ledger
+          // already holds the history), and retry once so a server heartbeat still
+          // produces output instead of dying on a stale id. Mirrors
+          // ClaudeRunner/InkRunner's resume-not-found recovery.
+          const reseedId = randomUUID();
+          activeBackendSessionId = reseedId;
+          activeBackendSessionShape = currentEnvelopeShape;
+          appendTranscript(runtime.transcriptPath, {
+            type: 'backend_session',
+            id: reseedId,
+            routing: runtime.toolRouting,
+          });
+          printEvent(
+            chalk.yellow(
+              '  ⛁ provider session not found on resume — re-seeding a fresh native session'
+            )
           );
+          process.on('SIGINT', onSigintDuringTurn);
+          const reseedTurn = startBackendTurn({
+            backend: runtime.backend,
+            agentId,
+            model: runtime.model,
+            prompt: buildPromptEnvelope(agentId, runtime, ledger, raw),
+            verbose: runtime.verbose,
+            passthroughArgs,
+            timeoutMs: runtime.backendTurnTimeoutMs,
+            idleTimeoutMs: runtime.backendIdleTimeoutMs,
+            stream: true,
+            onEvent: handleBackendEvent,
+            attachmentDirs: sessionAttachmentDirs.length > 0 ? sessionAttachmentDirs : undefined,
+            toolRouting: runtime.toolRouting,
+            // The reseeded provider session is fresh — re-inject this turn's
+            // media so the full envelope carries the images too.
+            media: turnMedia.length > 0 ? turnMedia : undefined,
+            ...(turnMedia.length > 0 ? { deliverMedia: true } : {}),
+            backendSessionSeedId: reseedId,
+          });
+          currentTurnAbort = reseedTurn.abort;
+          inkRepl?.setAbortHandler(abortCurrentTurn);
+          runResult = await reseedTurn.result.finally(() => {
+            currentTurnAbort = null;
+            inkRepl?.setAbortHandler(null);
+            process.off('SIGINT', onSigintDuringTurn);
+          });
         }
-        break;
+
+        sbDebugLog(
+          'chat',
+          'backend_turn_result',
+          {
+            backend: runtime.backend,
+            sessionId: runtime.sessionId || null,
+            success: runResult.success,
+            exitCode: runResult.exitCode,
+            durationMs: runResult.durationMs,
+            command: runResult.command,
+            stderrPreview: runResult.stderr.slice(0, 500),
+          },
+          debugFile ? { force: true, file: debugFile } : undefined
+        );
+
+        if (runResult.success) {
+          consecutiveBackendFailures = 0;
+        } else {
+          consecutiveBackendFailures += 1;
+        }
+
+        // Log backend CLI turn completion to activity stream. Use 'ink' as the
+        // runner label (not the LLM backend like 'claude') so the mission feed
+        // shows the correct execution layer. Continuations are the same logical
+        // turn and deliberately do NOT log again.
+        if (runtime.sessionId) {
+          const turnStatus = runResult.success ? 'completed' : 'failed';
+          const cliErrorClassification = !runResult.success
+            ? classifyError({
+                errorText: runResult.stderr || runResult.stdout,
+                backend: runtime.backend,
+                exitCode: runResult.exitCode,
+              })
+            : null;
+
+          const runnerLabel = 'ink';
+          pcp
+            .callTool('log_activity', {
+              agentId,
+              type: runResult.success ? 'agent_complete' : 'error',
+              subtype: `backend_cli:${runnerLabel}`,
+              content: runResult.success
+                ? `Backend turn completed (${runnerLabel}, ${turnDurationSeconds}s)`
+                : `Backend turn failed (${runnerLabel}, ${cliErrorClassification?.category || 'exit ' + runResult.exitCode}): ${cliErrorClassification?.summary || runResult.stderr.slice(0, 200) || 'unknown error'}`,
+              sessionId: runtime.sessionId,
+              status: turnStatus,
+              payload: {
+                backend: runnerLabel,
+                exitCode: runResult.exitCode,
+                durationMs: turnDurationSeconds * 1000,
+                studioId: runtime.studioId,
+                ...(runResult.success ? {} : { stderr: runResult.stderr.slice(0, 2000) }),
+                ...(cliErrorClassification
+                  ? {
+                      errorCategory: cliErrorClassification.category,
+                      errorSummary: cliErrorClassification.summary,
+                      retryable: cliErrorClassification.retryable,
+                    }
+                  : {}),
+                ...(runResult.usage ? { usage: runResult.usage } : {}),
+              },
+            })
+            .catch(() => undefined);
+        }
+
+        lastRunResult = runResult;
+        return runResult;
       }
 
-      // Build continuation prompt with tool results and re-invoke backend
-      const toolResultsSummary = iterationResults
-        .map((r) => {
-          const resultStr = typeof r.result === 'string' ? r.result : JSON.stringify(r.result);
-          return `Tool ${r.tool} (${r.status}): ${resultStr}`;
-        })
-        .join('\n\n');
-      // If the model used the deprecated <tool_call> XML variant, its calls
-      // were executed anyway (see extractLocalToolCalls) — but correct the
-      // format NOW, while the results prove the runtime heard it, so the
-      // drift doesn't reinforce.
-      const formatCorrection = localToolCalls.some((c) => c.variantFormat)
-        ? '\n\nFORMAT NOTE: your tool calls used <tool_call> XML — the ink runtime executed them this time, but the ONLY supported format is a fenced block:\n```ink-tool\n{"tool":"<name>","args":{...}}\n```\nUse ink-tool fences (bare tool names, no mcp__inkwell__ prefix) from now on.'
-        : '';
-      const continuationBody = `[Tool results from previous turn]\n${toolResultsSummary}${formatCorrection}\n\nContinue your response based on these tool results. If you need more tools, emit ink-tool blocks. Otherwise, provide your final answer.`;
-      // When resuming the same Claude session, the model already holds the full
-      // transcript + tool instructions from the seeded turn — send ONLY the
+      // ── Continuation ──
+      // When resuming the same Claude session the model already holds the full
+      // transcript + tool instructions from the seeded turn, so send ONLY the
       // delta. Otherwise (stateless backends) re-pack the full envelope so the
       // fresh spawn has the context it needs.
       const continuationPrompt =
         canReuseBackendSession && activeBackendSessionId
-          ? continuationBody
-          : buildPromptEnvelope(agentId, runtime, ledger, continuationBody);
-
-      // Show continuation indicator naming the tools that just ran — this is
-      // the SB working, not a system message
-      const ranTools = Array.from(new Set(iterationResults.map((r) => r.tool))).join(', ');
-      printEvent(
-        chalk.dim(
-          `  ⋯ ran ${ranTools} — continuing (${toolLoopIteration}/${MAX_TOOL_LOOP_ITERATIONS})…`
-        )
-      );
-      const stopContinuation = inkRepl
-        ? ((repl) => {
-            repl.setWaiting(true, runtime.backend);
-            return () => repl.setWaiting(false);
-          })(inkRepl)
-        : startWaitingIndicator(runtime.backend, {
-            statusLane,
-            logger: printLine,
-            renderAbovePrompt: true,
-          });
+          ? body
+          : buildPromptEnvelope(agentId, runtime, ledger, body);
 
       const contTurn = startBackendTurn({
         backend: runtime.backend,
@@ -5264,11 +5164,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
         onEvent: handleBackendEvent,
         attachmentDirs: sessionAttachmentDirs.length > 0 ? sessionAttachmentDirs : undefined,
         toolRouting: runtime.toolRouting,
-        // Same logical turn — media rides along (WITHOUT deliverMedia) so
-        // the adapter's boundary disposition (--tools gate) cannot flap
-        // between the delivery spawn and tool-loop continuations, while the
-        // resumed provider session is never re-fed images it already holds.
-        // Stateless adapters re-attach from `media` regardless.
+        // Same logical turn — media rides along (WITHOUT deliverMedia) so the
+        // adapter's boundary disposition (--tools gate) cannot flap between the
+        // delivery spawn and tool-loop continuations, while the resumed provider
+        // session is never re-fed images it already holds. Stateless adapters
+        // re-attach from `media` regardless.
         media: turnMedia.length > 0 ? turnMedia : undefined,
         // Resume the live provider session so this round-trip appends to the
         // same Claude thread instead of re-piping the whole window.
@@ -5278,30 +5178,78 @@ export async function runChat(options: ChatOptions): Promise<void> {
       inkRepl?.setAbortHandler(abortCurrentTurn);
       process.on('SIGINT', onSigintDuringTurn);
 
-      runResult = await contTurn.result.finally(() => {
+      const contResult = await contTurn.result.finally(() => {
         currentTurnAbort = null;
         inkRepl?.setAbortHandler(null);
         process.off('SIGINT', onSigintDuringTurn);
-        stopContinuation();
       });
 
-      if (!runResult.success) break;
-    }
+      lastRunResult = contResult;
+      return contResult;
+    };
 
-    const isAbortedTurn =
-      !runResult.success && runResult.exitCode !== undefined && runResult.exitCode >= 128;
+    const loopResult = await runAgentLoop(
+      { prompt, toolRouting: runtime.toolRouting },
+      {
+        ui: {
+          printLine: (text) => printLine(chalk.dim(text)),
+          printEvent: (text) => printEvent(chalk.dim(text)),
+          startWaiting: () =>
+            inkRepl
+              ? ((repl) => {
+                  repl.setWaiting(true, runtime.backend);
+                  return () => repl.setWaiting(false);
+                })(inkRepl)
+              : startWaitingIndicator(runtime.backend, {
+                  statusLane,
+                  logger: printLine,
+                  renderAbovePrompt: true,
+                }),
+        },
+        transcript: { append: (entry) => appendTranscript(runtime.transcriptPath, entry) },
+        tools: { execute: (calls) => runIterationTools(calls) },
+        backend: { runTurn: runTurnForLoop },
+        observe: {
+          recordToolCall: (r) => {
+            const liveArgsJson = r.args ? JSON.stringify(r.args).replace(/\s+/g, ' ') : '';
+            // The scrollback line shows a 160-char teaser; the inspector (Ctrl+T)
+            // is the drill-down, so it keeps a much larger slice of the result.
+            // The complete payload always lives in the transcript.
+            const liveResultJson =
+              r.result !== undefined
+                ? (typeof r.result === 'string' ? r.result : JSON.stringify(r.result)).replace(
+                    /\s+/g,
+                    ' '
+                  )
+                : '';
+            recentToolCalls.push({
+              tool: r.tool,
+              status: r.status,
+              at: new Date().toISOString(),
+              args: liveArgsJson
+                ? liveArgsJson.length > 400
+                  ? `${liveArgsJson.slice(0, 400)}…`
+                  : liveArgsJson
+                : undefined,
+              result: liveResultJson
+                ? liveResultJson.length > 2000
+                  ? `${liveResultJson.slice(0, 2000)}…`
+                  : liveResultJson
+                : undefined,
+            });
+            if (recentToolCalls.length > 100) {
+              recentToolCalls.splice(0, recentToolCalls.length - 100);
+            }
+          },
+        },
+      }
+    );
 
-    const assistantDisplayText = isAbortedTurn
-      ? ''
-      : runtime.toolRouting === 'local'
-        ? (() => {
-            const stripped = stripLocalToolBlocks(responseText);
-            if (stripped) return stripped;
-            if (localToolCalls.length > 0 || allToolResults.length > 0)
-              return '(local tool call emitted; see tool results above)';
-            return responseText;
-          })()
-        : responseText;
+    const runResult = lastRunResult;
+    const responseText = loopResult.responseText;
+    const allToolResults = loopResult.toolResults;
+    const isAbortedTurn = loopResult.stopReason === 'aborted';
+    const assistantDisplayText = loopResult.assistantDisplayText;
 
     if (isAbortedTurn) {
       appendTranscript(runtime.transcriptPath, {
