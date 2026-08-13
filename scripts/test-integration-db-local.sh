@@ -106,6 +106,29 @@ if [[ -z "${SUPABASE_URL}" || -z "${SUPABASE_SECRET_KEY}" || -z "${JWT_SECRET}" 
   exit 1
 fi
 
+# Non-empty is not the same as service-role. A key that parses but resolves to
+# `anon` sails past the check above and then fails every single test with
+# "permission denied for table users" — 100+ confusing failures for one bad
+# variable. That is exactly how this job stayed red from June to August 2026
+# without anyone being able to read the cause off the log. Probe once, here.
+echo "[integration-db] Verifying the derived key has service-role access..."
+PROBE_STATUS="$(curl -s -o /dev/null -w '%{http_code}' \
+  -H "apikey: ${SUPABASE_SECRET_KEY}" \
+  -H "Authorization: Bearer ${SUPABASE_SECRET_KEY}" \
+  "${SUPABASE_URL}/rest/v1/users?select=id&limit=1" || echo "000")"
+
+if [[ "${PROBE_STATUS}" != "200" ]]; then
+  echo "[integration-db] Derived key cannot read public.users (HTTP ${PROBE_STATUS})." >&2
+  echo "[integration-db] SUPABASE_SECRET_KEY is present but is not a service-role key." >&2
+  echo "[integration-db] Most likely the Supabase CLI changed its 'status -o env' output" >&2
+  echo "[integration-db] and SERVICE_ROLE_KEY no longer means what this script assumes." >&2
+  echo "[integration-db] CLI version in use:" >&2
+  supabase --version >&2 || true
+  echo "[integration-db] Keys emitted by status (values redacted):" >&2
+  echo "${STATUS_ENV}" | sed -E 's/=.*/=<redacted>/' >&2
+  exit 1
+fi
+
 echo "[integration-db] Running API DB integration suite against ${SUPABASE_URL}"
 yarn --cwd "${ROOT_DIR}" workspace @inklabs/api test:integration:db
 

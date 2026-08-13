@@ -109,6 +109,27 @@ describe('ClaudeStreamParser', () => {
     expect(r?.kind === 'result' && r.text).toBe('the real result');
   });
 
+  it('emits a model event from the system/init message', () => {
+    const p = new ClaudeStreamParser();
+    const evs = p.push(
+      line({
+        type: 'system',
+        subtype: 'init',
+        session_id: 'sess-1',
+        model: 'claude-fable-5',
+        tools: ['Bash', 'Read'],
+      })
+    );
+    expect(evs).toEqual([{ kind: 'model', model: 'claude-fable-5' }]);
+  });
+
+  it('ignores system events without an init model', () => {
+    const p = new ClaudeStreamParser();
+    expect(p.push(line({ type: 'system', subtype: 'init' }))).toEqual([]);
+    expect(p.push(line({ type: 'system', subtype: 'other', model: 'x' }))).toEqual([]);
+    expect(p.push(line({ type: 'system', subtype: 'init', model: '' }))).toEqual([]);
+  });
+
   it('reassembles a JSON line split across two chunks', () => {
     const p = new ClaudeStreamParser();
     const full = line(asstTextAndTool);

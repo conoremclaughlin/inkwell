@@ -1,5 +1,6 @@
 import React, { useState, useCallback, useEffect } from 'react';
 import { Box, Text, useInput } from 'ink';
+import { GUTTER_WIDTH } from './MessageLine.js';
 
 interface PromptInputProps {
   label: string;
@@ -280,11 +281,17 @@ export function PromptInput({
   const after = value.slice(cursor + 1);
 
   return (
-    <Box paddingX={1}>
-      <Text wrap="wrap">
+    // The marker lives in its own gutter box (same GUTTER_WIDTH as message
+    // markers) with the input text in a separate wrapping element — wrapped
+    // input lines keep a hanging indent at the content column instead of
+    // sliding back to column 0.
+    <Box paddingRight={1}>
+      <Box width={GUTTER_WIDTH} flexShrink={0}>
         <Text bold color="green">
           {label}
         </Text>
+      </Box>
+      <Text wrap="wrap">
         {before}
         <Text inverse>{cursorChar}</Text>
         {after}
