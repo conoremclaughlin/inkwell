@@ -8,9 +8,12 @@
  *
  * Usage:
  *   ink awaken                     Awaken in an ink chat session (default)
- *   ink awaken -b claude           Awaken in Claude Code
- *   ink awaken -b codex            Awaken in Codex
- *   ink awaken -b gemini           Awaken in Gemini
+ *   ink awaken -r claude           Awaken in Claude Code
+ *   ink awaken -r codex            Awaken in Codex
+ *
+ * --runtime/-r selects what we launch (ink included). --backend/-b is the
+ * older spelling of the same axis and still works. "Provider" is a separate
+ * thing: the model vendor, chosen with --model.
  */
 
 import { Command } from 'commander';
@@ -25,6 +28,7 @@ import { getBackend, BACKEND_NAMES } from '../backends/index.js';
 import { callPcpTool } from '../lib/pcp-mcp.js';
 import { readUserConfig, NOT_SIGNED_IN_MESSAGE, type UserConfig } from '../lib/user-config.js';
 import { getValidAccessToken } from '../auth/tokens.js';
+import { ensureBackendAuthReady, isBackendAuthBackend } from '../lib/backend-auth.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -198,6 +202,19 @@ const INK_RUNTIME = 'ink';
 /** Everything `ink awaken` can start a first conversation in. */
 const AWAKEN_TARGETS = [INK_RUNTIME, ...BACKEND_NAMES];
 
+/**
+ * Resolve --runtime / --backend to one runtime name.
+ *
+ * Both name the same axis: what we launch. `--backend` is the older spelling,
+ * kept working because it is in scripts, docs and muscle memory. `--runtime`
+ * wins when both are given, and the ink default is applied here rather than in
+ * commander — a commander default would make options.runtime always truthy and
+ * silently swallow `--backend`.
+ */
+export function resolveRuntime(options: { runtime?: string; backend?: string }): string {
+  return options.runtime || options.backend || INK_RUNTIME;
+}
+
 // ============================================================================
 // Model selection
 // ============================================================================
@@ -268,7 +285,8 @@ function describeModelChoices(backendName: string): string {
 // ============================================================================
 
 async function awakenCommand(options: {
-  backend: string;
+  runtime?: string;
+  backend?: string;
   model?: string;
   verbose: boolean;
 }): Promise<void> {
@@ -278,7 +296,7 @@ async function awakenCommand(options: {
     process.exit(1);
   }
 
-  const backendName = options.backend;
+  const backendName = resolveRuntime(options);
 
   // `ink` is the ink chat runtime rather than an external CLI — there is no
   // binary to preflight, and it takes the awakening prompt through
@@ -316,6 +334,20 @@ async function awakenCommand(options: {
     }
     console.error('');
     process.exit(1);
+  }
+
+  // 0b. Installed is not the same as logged in, and the difference is only
+  // discoverable at spawn time otherwise — which is the worst moment for it,
+  // after we've composed a being's first words. Shared with `ink chat`, so
+  // awaken gets its offer-to-log-you-in flow rather than a second-rate copy.
+  // Skipped for the ink runtime: ink chat runs this itself for whichever
+  // provider it resolves.
+  if (!useInkRuntime && isBackendAuthBackend(backendName)) {
+    await ensureBackendAuthReady(
+      backendName,
+      { nonInteractive: false, hasMessage: false, verbose: options.verbose },
+      'awaken'
+    );
   }
 
   // Gemini displays the system prompt at startup — auto-enable verbose
@@ -504,12 +536,19 @@ async function awakenCommand(options: {
 export function registerAwakenCommand(program: Command): void {
   program
     .command('awaken')
-    .description('Awaken a new SB on a backend')
+    .description('Awaken a new SB — bring a new being to life in a runtime')
+    // No commander default here on purpose. A default would make
+    // options.runtime always truthy, so `--backend codex` would resolve to the
+    // default 'ink' and be silently ignored — the alias would look supported
+    // and do nothing. The default is applied when resolving the two instead.
     .option(
-      '-b, --backend <name>',
-      `Where to awaken them (${AWAKEN_TARGETS.join(', ')}). 'ink' opens an ink chat session.`,
-      INK_RUNTIME
+      '-r, --runtime <name>',
+      `Where to awaken them (${AWAKEN_TARGETS.join(', ')}), default ${INK_RUNTIME}. 'ink' opens an ink chat session.`
     )
+    // Same axis, older spelling. `backend` named both this and the model
+    // vendor, which is why it is being retired — but it is in scripts, docs and
+    // muscle memory, so it keeps working rather than breaking anyone's habits.
+    .option('-b, --backend <name>', 'Alias for --runtime', undefined)
     .option(
       '-m, --model <model>',
       'Model to awaken on. Omit to use the provider default (recommended).'

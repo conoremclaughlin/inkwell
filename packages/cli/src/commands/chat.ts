@@ -24,6 +24,8 @@ import { promptTransportFor } from '../backends/index.js';
 import { PcpClient } from '../lib/pcp-client.js';
 import { initSbDebug, sbDebugLog } from '../lib/sb-debug.js';
 import {
+  ensureBackendAuthReady,
+  isBackendAuthBackend,
   getBackendAuthStatus,
   runBackendInteractiveLogin,
   type BackendAuthBackend,
@@ -271,90 +273,6 @@ interface ActivitySummary {
   createdAt?: string;
   /** Originating platform for message activities (telegram, discord, …) */
   platform?: string;
-}
-
-function isBackendAuthBackend(value: string): value is BackendAuthBackend {
-  return value === 'claude' || value === 'codex' || value === 'gemini';
-}
-
-async function ensureBackendAuthReady(
-  backend: string,
-  mode: { nonInteractive: boolean; hasMessage: boolean; verbose: boolean }
-): Promise<void> {
-  if (process.env.SB_SKIP_BACKEND_AUTH_CHECK === '1' || process.env.VITEST) {
-    return;
-  }
-  if (!isBackendAuthBackend(backend)) return;
-
-  const status = await getBackendAuthStatus(backend);
-  sbDebugLog('chat', 'backend_auth_status', {
-    backend,
-    authenticated: status.authenticated,
-    detail: status.detail,
-    canInteractiveLogin: status.canInteractiveLogin,
-    loginCommand: status.loginCommand || null,
-    mode,
-  });
-  if (status.authenticated) {
-    if (mode.verbose) {
-      console.log(chalk.dim(`Backend auth: ${backend} (${status.detail})`));
-    }
-    return;
-  }
-
-  const guidance = `Backend ${backend} is not authenticated (${status.detail}).`;
-  const loginHint =
-    status.loginCommand ||
-    (backend === 'gemini' ? 'Start `gemini` once and complete login in the Gemini CLI' : null);
-
-  if (mode.nonInteractive || mode.hasMessage) {
-    sbDebugLog('chat', 'backend_auth_required_non_interactive', {
-      backend,
-      detail: status.detail,
-      loginCommand: loginHint || null,
-      mode,
-    });
-    throw new Error(
-      `${guidance}${loginHint ? `\nRun: ${loginHint}` : '\nAuthenticate backend CLI and retry.'}`
-    );
-  }
-
-  console.log(chalk.yellow(`⚠ ${guidance}`));
-  if (!status.canInteractiveLogin || !status.loginCommand) {
-    if (loginHint) console.log(chalk.dim(`  Run: ${loginHint}`));
-    return;
-  }
-  if (!input.isTTY || !output.isTTY) {
-    console.log(chalk.dim(`  Run: ${status.loginCommand}`));
-    return;
-  }
-
-  const prompt = createInterface({ input, output });
-  try {
-    const answer = (
-      await prompt.question(chalk.cyan(`Run ${status.loginCommand} now? [Y/n] `))
-    ).trim();
-    if (answer && !['y', 'yes'].includes(answer.toLowerCase())) {
-      console.log(chalk.dim(`  Skipping login. Run manually: ${status.loginCommand}`));
-      return;
-    }
-  } finally {
-    prompt.close();
-  }
-
-  const exitCode = await runBackendInteractiveLogin(backend);
-  if (exitCode !== 0) {
-    throw new Error(
-      `Backend ${backend} login exited with code ${exitCode}. Run \`${status.loginCommand}\` and retry.`
-    );
-  }
-  const recheck = await getBackendAuthStatus(backend);
-  if (!recheck.authenticated) {
-    throw new Error(
-      `Backend ${backend} still appears unauthenticated (${recheck.detail}). Run \`${status.loginCommand}\` and retry.`
-    );
-  }
-  console.log(chalk.green(`✓ Backend ${backend} authenticated (${recheck.detail})`));
 }
 
 type BackendToolGateSnapshot = {

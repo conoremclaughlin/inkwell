@@ -33,8 +33,19 @@ export function userConfigPath(): string {
   return join(homedir(), '.ink', 'config.json');
 }
 
-/** Shown when a command needs an authenticated user and there isn't one. */
-export const NOT_SIGNED_IN_MESSAGE = 'Not signed in to Inkwell. Run: ink auth login';
+/**
+ * Shown when a command needs an authenticated user and there isn't one.
+ *
+ * Names account creation as well as login. `ink auth login` opens the browser
+ * at /login, which links to /signup — so it is already the right command for
+ * someone with no account at all. But "login" does not *read* that way to a
+ * brand-new user, who reasonably concludes they need to sign up somewhere
+ * first and goes looking. That was the same dead end as issue #331: the
+ * mechanism existed, the signpost didn't.
+ */
+export const NOT_SIGNED_IN_MESSAGE =
+  'Not signed in to Inkwell. Run: ink auth login\n' +
+  "  No account yet? That's the same command — the page it opens has a sign-up link.";
 
 /**
  * Read ~/.ink/config.json. Returns null when it doesn't exist or is
