@@ -127,6 +127,7 @@ type ChatOptions = {
   agent?: string;
   backend?: string;
   model?: string;
+  systemPromptFile?: string;
   toolRouting?: string;
   ui?: string;
   threadKey?: string;
@@ -171,9 +172,42 @@ interface InboxMessage {
   metadata?: Record<string, unknown>;
 }
 
+/**
+ * Read --system-prompt-file, or exit with a clear reason.
+ *
+ * Fails loudly rather than falling back to the default identity prompt: the
+ * caller asked for a specific system prompt, and silently substituting a
+ * different one is how a nascent SB ends up being told it is someone it isn't.
+ */
+function readSystemPromptFile(path?: string): string | undefined {
+  if (!path) return undefined;
+
+  let content: string;
+  try {
+    content = readFileSync(path, 'utf-8');
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    console.error(chalk.red(`--system-prompt-file: cannot read ${path}`));
+    console.error(chalk.dim(`  ${reason}`));
+    process.exit(1);
+  }
+
+  if (!content.trim()) {
+    console.error(chalk.red(`--system-prompt-file: ${path} is empty`));
+    process.exit(1);
+  }
+
+  return content;
+}
+
 interface ChatRuntime {
   backend: string;
   model?: string;
+  /**
+   * Replaces the generated identity prompt for every backend turn in this
+   * session. Set by --system-prompt-file; see BackendConfig.
+   */
+  systemPromptOverride?: string;
   /**
    * Model id the provider REPORTED for the live session (claude's
    * `system`/`init` stream event). Used to resolve the real context window
@@ -2828,6 +2862,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     autoRunInbox: options.autoRun ?? false,
     awayMode: options.away ?? false,
     transcriptPath: ensureRuntimeTranscriptPath(),
+    systemPromptOverride: readSystemPromptFile(options.systemPromptFile),
     activeSkills: [],
     strictTools: options.sbStrictTools ?? persisted?.strictTools ?? false,
     backendTurnTimeoutMs,
@@ -4710,6 +4745,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         toolRouting: runtime.toolRouting,
         toolMode: backendGate.mode,
         passthroughArgs,
+        systemPromptOverride: runtime.systemPromptOverride,
         timeoutMs: runtime.backendTurnTimeoutMs ?? null,
       },
       debugFile ? { force: true, file: debugFile } : undefined
@@ -4765,6 +4801,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       prompt,
       verbose: runtime.verbose,
       passthroughArgs,
+      systemPromptOverride: runtime.systemPromptOverride,
       timeoutMs: runtime.backendTurnTimeoutMs,
       idleTimeoutMs: runtime.backendIdleTimeoutMs,
       stream: true,
@@ -4827,6 +4864,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         prompt: buildPromptEnvelope(agentId, runtime, ledger, raw),
         verbose: runtime.verbose,
         passthroughArgs,
+        systemPromptOverride: runtime.systemPromptOverride,
         timeoutMs: runtime.backendTurnTimeoutMs,
         idleTimeoutMs: runtime.backendIdleTimeoutMs,
         stream: true,
@@ -5331,6 +5369,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         prompt: continuationPrompt,
         verbose: runtime.verbose,
         passthroughArgs,
+        systemPromptOverride: runtime.systemPromptOverride,
         timeoutMs: runtime.backendTurnTimeoutMs,
         idleTimeoutMs: runtime.backendIdleTimeoutMs,
         stream: true,
@@ -7386,6 +7425,10 @@ export function registerChatCommand(program: Command): void {
       .option('-a, --agent <id>', 'Agent identity to use')
       .option('-b, --backend <name>', 'Backend: claude, codex, gemini', 'claude')
       .option('-m, --model <model>', 'Model override for backend')
+      .option(
+        '--system-prompt-file <path>',
+        'Replace the generated identity prompt with this file (used by `ink awaken`)'
+      )
       .option(
         '--tool-routing <mode>',
         // No Commander default: a default here would make options.toolRouting

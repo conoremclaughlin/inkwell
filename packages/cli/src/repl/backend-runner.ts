@@ -21,6 +21,11 @@ export interface BackendRunRequest {
   verbose?: boolean;
   passthroughArgs?: string[];
   /**
+   * Replace the generated identity prompt for this turn. See
+   * BackendConfig.systemPromptOverride — awakening is the case it exists for.
+   */
+  systemPromptOverride?: string;
+  /**
    * Hard ceiling (ms). Runaway backstop only — the idle timeout is the primary
    * reaper. Defaults to DEFAULT_TURN_HARD_TIMEOUT_MS (4 h).
    */
@@ -107,6 +112,7 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
     prompt: request.prompt,
     promptParts,
     passthroughArgs: request.passthroughArgs || [],
+    systemPromptOverride: request.systemPromptOverride,
     attachmentDirs: request.attachmentDirs,
     backendSessionId: request.backendSessionId,
     backendSessionSeedId: request.backendSessionSeedId,
