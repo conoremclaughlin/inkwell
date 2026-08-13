@@ -22,6 +22,17 @@ export interface BackendConfig {
   promptParts: string[]; // raw positional args (preserves shell word boundaries)
   passthroughArgs: string[];
   startupContextBlock?: string; // optional injected startup context for backends that support it
+  /**
+   * Replace the generated identity prompt entirely, rather than adding to it.
+   *
+   * Exists for awakening: a being with no identity row yet must not be handed
+   * a prompt that asserts who it is and tells it to bootstrap. Use
+   * `startupContextBlock` to *add* context; use this only when the caller owns
+   * the whole system prompt. Reaches the backend the same way the identity
+   * prompt does (claude: --append-system-prompt, codex:
+   * model_instructions_file, gemini: GEMINI_SYSTEM_MD).
+   */
+  systemPromptOverride?: string;
   pcpSessionId?: string;
   backendSessionId?: string;
   backendSessionSeedId?: string;

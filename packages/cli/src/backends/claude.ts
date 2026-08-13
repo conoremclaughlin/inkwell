@@ -154,7 +154,11 @@ export class ClaudeAdapter implements BackendAdapter {
   readonly promptTransport = 'stdin' as const;
 
   prepare(config: BackendConfig): PreparedBackend {
-    const identityPrompt = buildIdentityPrompt(config.agentId);
+    const identityPrompt = buildIdentityPrompt(
+      config.agentId,
+      undefined,
+      config.systemPromptOverride
+    );
 
     const args: string[] = [];
 

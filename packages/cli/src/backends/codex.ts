@@ -40,7 +40,8 @@ export class CodexAdapter implements BackendAdapter {
   prepare(config: BackendConfig): PreparedBackend {
     const { promptFile, cleanup } = createIdentityPromptFile(
       config.agentId,
-      config.startupContextBlock
+      config.startupContextBlock,
+      config.systemPromptOverride
     );
 
     const args: string[] = [];

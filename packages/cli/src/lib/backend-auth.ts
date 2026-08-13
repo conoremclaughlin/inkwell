@@ -1,4 +1,8 @@
 import { spawn } from 'child_process';
+import chalk from 'chalk';
+import { createInterface } from 'readline/promises';
+import { stdin as input, stdout as output } from 'process';
+import { sbDebugLog } from './sb-debug.js';
 import { homedir } from 'os';
 import { join } from 'path';
 import { existsSync, readFileSync } from 'fs';
@@ -250,4 +254,100 @@ export async function runBackendInteractiveLogin(backend: BackendAuthBackend): P
     child.on('error', () => resolve(1));
     child.on('close', (code) => resolve(code ?? 1));
   });
+}
+
+export function isBackendAuthBackend(value: string): value is BackendAuthBackend {
+  return value === 'claude' || value === 'codex' || value === 'gemini';
+}
+
+/**
+ * Make sure a runtime's provider is logged in before we spend a session on it.
+ *
+ * Shared by `ink chat` and `ink awaken`. Awakening especially: nothing is worse
+ * than composing a being's first words and then dying on an auth prompt the
+ * user could have cleared in ten seconds.
+ *
+ * Offers to run the provider's own login when we can (TTY, interactive), falls
+ * back to printing the command otherwise, and rechecks afterwards rather than
+ * assuming the login worked.
+ */
+export async function ensureBackendAuthReady(
+  backend: string,
+  mode: { nonInteractive: boolean; hasMessage: boolean; verbose: boolean },
+  debugScope = 'chat'
+): Promise<void> {
+  if (process.env.SB_SKIP_BACKEND_AUTH_CHECK === '1' || process.env.VITEST) {
+    return;
+  }
+  if (!isBackendAuthBackend(backend)) return;
+
+  const status = await getBackendAuthStatus(backend);
+  sbDebugLog(debugScope, 'backend_auth_status', {
+    backend,
+    authenticated: status.authenticated,
+    detail: status.detail,
+    canInteractiveLogin: status.canInteractiveLogin,
+    loginCommand: status.loginCommand || null,
+    mode,
+  });
+  if (status.authenticated) {
+    if (mode.verbose) {
+      console.log(chalk.dim(`Backend auth: ${backend} (${status.detail})`));
+    }
+    return;
+  }
+
+  const guidance = `Backend ${backend} is not authenticated (${status.detail}).`;
+  const loginHint =
+    status.loginCommand ||
+    (backend === 'gemini' ? 'Start `gemini` once and complete login in the Gemini CLI' : null);
+
+  if (mode.nonInteractive || mode.hasMessage) {
+    sbDebugLog(debugScope, 'backend_auth_required_non_interactive', {
+      backend,
+      detail: status.detail,
+      loginCommand: loginHint || null,
+      mode,
+    });
+    throw new Error(
+      `${guidance}${loginHint ? `\nRun: ${loginHint}` : '\nAuthenticate backend CLI and retry.'}`
+    );
+  }
+
+  console.log(chalk.yellow(`⚠ ${guidance}`));
+  if (!status.canInteractiveLogin || !status.loginCommand) {
+    if (loginHint) console.log(chalk.dim(`  Run: ${loginHint}`));
+    return;
+  }
+  if (!input.isTTY || !output.isTTY) {
+    console.log(chalk.dim(`  Run: ${status.loginCommand}`));
+    return;
+  }
+
+  const prompt = createInterface({ input, output });
+  try {
+    const answer = (
+      await prompt.question(chalk.cyan(`Run ${status.loginCommand} now? [Y/n] `))
+    ).trim();
+    if (answer && !['y', 'yes'].includes(answer.toLowerCase())) {
+      console.log(chalk.dim(`  Skipping login. Run manually: ${status.loginCommand}`));
+      return;
+    }
+  } finally {
+    prompt.close();
+  }
+
+  const exitCode = await runBackendInteractiveLogin(backend);
+  if (exitCode !== 0) {
+    throw new Error(
+      `Backend ${backend} login exited with code ${exitCode}. Run \`${status.loginCommand}\` and retry.`
+    );
+  }
+  const recheck = await getBackendAuthStatus(backend);
+  if (!recheck.authenticated) {
+    throw new Error(
+      `Backend ${backend} still appears unauthenticated (${recheck.detail}). Run \`${status.loginCommand}\` and retry.`
+    );
+  }
+  console.log(chalk.green(`✓ Backend ${backend} authenticated (${recheck.detail})`));
 }

@@ -24,6 +24,8 @@ import { promptTransportFor } from '../backends/index.js';
 import { PcpClient } from '../lib/pcp-client.js';
 import { initSbDebug, sbDebugLog } from '../lib/sb-debug.js';
 import {
+  ensureBackendAuthReady,
+  isBackendAuthBackend,
   getBackendAuthStatus,
   runBackendInteractiveLogin,
   type BackendAuthBackend,
@@ -127,6 +129,7 @@ type ChatOptions = {
   agent?: string;
   backend?: string;
   model?: string;
+  systemPromptFile?: string;
   toolRouting?: string;
   ui?: string;
   threadKey?: string;
@@ -171,9 +174,42 @@ interface InboxMessage {
   metadata?: Record<string, unknown>;
 }
 
+/**
+ * Read --system-prompt-file, or exit with a clear reason.
+ *
+ * Fails loudly rather than falling back to the default identity prompt: the
+ * caller asked for a specific system prompt, and silently substituting a
+ * different one is how a nascent SB ends up being told it is someone it isn't.
+ */
+function readSystemPromptFile(path?: string): string | undefined {
+  if (!path) return undefined;
+
+  let content: string;
+  try {
+    content = readFileSync(path, 'utf-8');
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    console.error(chalk.red(`--system-prompt-file: cannot read ${path}`));
+    console.error(chalk.dim(`  ${reason}`));
+    process.exit(1);
+  }
+
+  if (!content.trim()) {
+    console.error(chalk.red(`--system-prompt-file: ${path} is empty`));
+    process.exit(1);
+  }
+
+  return content;
+}
+
 interface ChatRuntime {
   backend: string;
   model?: string;
+  /**
+   * Replaces the generated identity prompt for every backend turn in this
+   * session. Set by --system-prompt-file; see BackendConfig.
+   */
+  systemPromptOverride?: string;
   /**
    * Model id the provider REPORTED for the live session (claude's
    * `system`/`init` stream event). Used to resolve the real context window
@@ -237,90 +273,6 @@ interface ActivitySummary {
   createdAt?: string;
   /** Originating platform for message activities (telegram, discord, …) */
   platform?: string;
-}
-
-function isBackendAuthBackend(value: string): value is BackendAuthBackend {
-  return value === 'claude' || value === 'codex' || value === 'gemini';
-}
-
-async function ensureBackendAuthReady(
-  backend: string,
-  mode: { nonInteractive: boolean; hasMessage: boolean; verbose: boolean }
-): Promise<void> {
-  if (process.env.SB_SKIP_BACKEND_AUTH_CHECK === '1' || process.env.VITEST) {
-    return;
-  }
-  if (!isBackendAuthBackend(backend)) return;
-
-  const status = await getBackendAuthStatus(backend);
-  sbDebugLog('chat', 'backend_auth_status', {
-    backend,
-    authenticated: status.authenticated,
-    detail: status.detail,
-    canInteractiveLogin: status.canInteractiveLogin,
-    loginCommand: status.loginCommand || null,
-    mode,
-  });
-  if (status.authenticated) {
-    if (mode.verbose) {
-      console.log(chalk.dim(`Backend auth: ${backend} (${status.detail})`));
-    }
-    return;
-  }
-
-  const guidance = `Backend ${backend} is not authenticated (${status.detail}).`;
-  const loginHint =
-    status.loginCommand ||
-    (backend === 'gemini' ? 'Start `gemini` once and complete login in the Gemini CLI' : null);
-
-  if (mode.nonInteractive || mode.hasMessage) {
-    sbDebugLog('chat', 'backend_auth_required_non_interactive', {
-      backend,
-      detail: status.detail,
-      loginCommand: loginHint || null,
-      mode,
-    });
-    throw new Error(
-      `${guidance}${loginHint ? `\nRun: ${loginHint}` : '\nAuthenticate backend CLI and retry.'}`
-    );
-  }
-
-  console.log(chalk.yellow(`⚠ ${guidance}`));
-  if (!status.canInteractiveLogin || !status.loginCommand) {
-    if (loginHint) console.log(chalk.dim(`  Run: ${loginHint}`));
-    return;
-  }
-  if (!input.isTTY || !output.isTTY) {
-    console.log(chalk.dim(`  Run: ${status.loginCommand}`));
-    return;
-  }
-
-  const prompt = createInterface({ input, output });
-  try {
-    const answer = (
-      await prompt.question(chalk.cyan(`Run ${status.loginCommand} now? [Y/n] `))
-    ).trim();
-    if (answer && !['y', 'yes'].includes(answer.toLowerCase())) {
-      console.log(chalk.dim(`  Skipping login. Run manually: ${status.loginCommand}`));
-      return;
-    }
-  } finally {
-    prompt.close();
-  }
-
-  const exitCode = await runBackendInteractiveLogin(backend);
-  if (exitCode !== 0) {
-    throw new Error(
-      `Backend ${backend} login exited with code ${exitCode}. Run \`${status.loginCommand}\` and retry.`
-    );
-  }
-  const recheck = await getBackendAuthStatus(backend);
-  if (!recheck.authenticated) {
-    throw new Error(
-      `Backend ${backend} still appears unauthenticated (${recheck.detail}). Run \`${status.loginCommand}\` and retry.`
-    );
-  }
-  console.log(chalk.green(`✓ Backend ${backend} authenticated (${recheck.detail})`));
 }
 
 type BackendToolGateSnapshot = {
@@ -2656,7 +2608,11 @@ export function buildPromptEnvelope(
           : '';
 
   return [
-    `You are ${agentId}.`,
+    // A caller-supplied system prompt is the only thing allowed to say who
+    // this is. `ink awaken` runs under the placeholder agent id `nascent`;
+    // asserting "You are nascent." here would contradict the system prompt
+    // that is, at that moment, telling them they do not have a name yet.
+    runtime.systemPromptOverride ? '' : `You are ${agentId}.`,
     'You are running inside ink chat (first-class Ink REPL).',
     'Answer in plain text. Be concise but complete.',
     `Current backend: ${runtime.backend}${runtime.model ? ` (${runtime.model})` : ''}.`,
@@ -2715,6 +2671,11 @@ export function envelopeShapeKey(runtime: ChatRuntime): string {
     runtime.threadKey ?? '',
     runtime.activeSkills.map((s) => s.name).join(','),
     runtime.bootstrapContext ?? '',
+    // Gates the "You are <agentId>." line. Fixed for the session's lifetime
+    // (set from --system-prompt-file at startup, never mutated), so it cannot
+    // actually drift — included to keep this in sync with every static field
+    // buildPromptEnvelope renders, as the contract above requires.
+    runtime.systemPromptOverride ? '1' : '0',
   ].join('');
   // djb2 — cheap, kept in int32 each step; collision-resistant enough to detect
   // config drift (we only need change-detection, not cryptographic strength).
@@ -2828,6 +2789,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     autoRunInbox: options.autoRun ?? false,
     awayMode: options.away ?? false,
     transcriptPath: ensureRuntimeTranscriptPath(),
+    systemPromptOverride: readSystemPromptFile(options.systemPromptFile),
     activeSkills: [],
     strictTools: options.sbStrictTools ?? persisted?.strictTools ?? false,
     backendTurnTimeoutMs,
@@ -3168,11 +3130,29 @@ export async function runChat(options: ChatOptions): Promise<void> {
   let readyForAutoRun = false;
   let enqueueAutoRunFromInbox: ((message: InboxMessage) => Promise<void>) | null = null;
 
-  const bootstrapResult = (await pcp
-    .callTool('bootstrap', { agentId })
-    .catch((error) => ({ error: String(error) }))) as Record<string, unknown>;
+  // A caller-supplied system prompt means this session's identity comes from
+  // the caller, not the database. `ink awaken` runs as the placeholder
+  // `nascent`, which has no identity row and no memories — bootstrapping it
+  // would attribute shared workspace documents to a being that does not exist
+  // yet, and "Bootstrapped as nascent" would be among the first things it ever
+  // read about itself. Both are false, which is the whole thing the override
+  // exists to prevent.
+  const identitySuppliedByCaller = Boolean(runtime.systemPromptOverride);
 
-  if (bootstrapResult.error) {
+  const bootstrapResult = identitySuppliedByCaller
+    ? ({} as Record<string, unknown>)
+    : ((await pcp
+        .callTool('bootstrap', { agentId })
+        .catch((error) => ({ error: String(error) }))) as Record<string, unknown>);
+
+  if (identitySuppliedByCaller) {
+    // Keychain preload still has to happen — it is independent of identity,
+    // and an awakening session can use tools as soon as it has a name.
+    const keychainCreds = await loadKeychainCredentials();
+    if (Object.keys(keychainCreds).length > 0) {
+      console.log(chalk.dim(`Keychain: ${Object.keys(keychainCreds).length} credential(s) loaded`));
+    }
+  } else if (bootstrapResult.error) {
     console.log(chalk.yellow(`bootstrap unavailable: ${String(bootstrapResult.error)}`));
   } else {
     const suggestion = (bootstrapResult.reflectionStatus as Record<string, unknown> | undefined)
@@ -3980,6 +3960,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
           agentId,
           model: runtime.model,
           prompt: buildCompactionPrompt(chunk),
+          // Compaction is a backend turn like any other, so it goes through
+          // adapter.prepare() and would otherwise regenerate the default
+          // identity prompt — handing a nascent SB "You are nascent, call
+          // bootstrap" the moment its first conversation grew long enough to
+          // compact (Lumen, PR #485 — finding 2).
+          systemPromptOverride: runtime.systemPromptOverride,
           // Summarization is governed like any other turn: token-flow (idle)
           // is the reaper, with the 4h runaway backstop. An explicit
           // --backend-timeout-seconds still caps it, floored at 5 min —
@@ -4710,6 +4696,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         toolRouting: runtime.toolRouting,
         toolMode: backendGate.mode,
         passthroughArgs,
+        systemPromptOverride: runtime.systemPromptOverride,
         timeoutMs: runtime.backendTurnTimeoutMs ?? null,
       },
       debugFile ? { force: true, file: debugFile } : undefined
@@ -4765,6 +4752,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       prompt,
       verbose: runtime.verbose,
       passthroughArgs,
+      systemPromptOverride: runtime.systemPromptOverride,
       timeoutMs: runtime.backendTurnTimeoutMs,
       idleTimeoutMs: runtime.backendIdleTimeoutMs,
       stream: true,
@@ -4827,6 +4815,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         prompt: buildPromptEnvelope(agentId, runtime, ledger, raw),
         verbose: runtime.verbose,
         passthroughArgs,
+        systemPromptOverride: runtime.systemPromptOverride,
         timeoutMs: runtime.backendTurnTimeoutMs,
         idleTimeoutMs: runtime.backendIdleTimeoutMs,
         stream: true,
@@ -5331,6 +5320,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         prompt: continuationPrompt,
         verbose: runtime.verbose,
         passthroughArgs,
+        systemPromptOverride: runtime.systemPromptOverride,
         timeoutMs: runtime.backendTurnTimeoutMs,
         idleTimeoutMs: runtime.backendIdleTimeoutMs,
         stream: true,
@@ -7386,6 +7376,10 @@ export function registerChatCommand(program: Command): void {
       .option('-a, --agent <id>', 'Agent identity to use')
       .option('-b, --backend <name>', 'Backend: claude, codex, gemini', 'claude')
       .option('-m, --model <model>', 'Model override for backend')
+      .option(
+        '--system-prompt-file <path>',
+        'Replace the generated identity prompt with this file (used by `ink awaken`)'
+      )
       .option(
         '--tool-routing <mode>',
         // No Commander default: a default here would make options.toolRouting
