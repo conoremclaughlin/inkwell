@@ -259,7 +259,11 @@ export async function runAgentLoop(
     }
 
     if (!outcome.success) {
-      responseText = resolveResponseText(outcome);
+      // Deliberately do NOT re-resolve responseText here. It still holds the
+      // last SUCCESSFUL turn's text, and that is what the REPL displays and
+      // writes to the ledger. Overwriting it with the failed spawn's stderr
+      // would publish backend diagnostics as the assistant's answer — and the
+      // host already reports stderr separately from `lastRunResult`.
       stopReason = 'backend-failure';
       break;
     }
@@ -267,6 +271,16 @@ export async function runAgentLoop(
 
   // An aborted turn (SIGINT kills the child) exits >=128 and has no usable text.
   const aborted = !outcome.success && outcome.exitCode !== undefined && outcome.exitCode >= 128;
+
+  // Any failed final outcome is a failure, whichever branch broke the loop.
+  // Without this, an opening turn that fails with no parsed tool calls exits via
+  // the `no-tools` branch and reports as completion — which for a clone means
+  // failed work is indistinguishable from finished work.
+  const finalStopReason: AgentLoopStopReason = aborted
+    ? 'aborted'
+    : !outcome.success
+      ? 'backend-failure'
+      : stopReason;
 
   const assistantDisplayText = aborted
     ? ''
@@ -283,7 +297,7 @@ export async function runAgentLoop(
     toolResults: allToolResults,
     iterations: iteration,
     success: outcome.success,
-    stopReason: aborted ? 'aborted' : stopReason,
+    stopReason: finalStopReason,
   };
 }
 

@@ -202,14 +202,64 @@ describe('runAgentLoop', () => {
 
   it('stops when a continuation turn fails', async () => {
     const { ports } = makePorts([
-      outcome({ responseText: inkTool('read') }),
+      outcome({ responseText: `partial answer${inkTool('read')}` }),
       outcome({ success: false, stderr: 'backend exploded', exitCode: 1 }),
     ]);
     const result = await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, ports);
 
     expect(result.stopReason).toBe('backend-failure');
     expect(result.success).toBe(false);
-    expect(result.responseText).toBe('backend exploded');
+  });
+
+  /**
+   * Pre-refactor, a failed continuation broke the loop WITHOUT re-resolving the
+   * response text, so the REPL still displayed (and the ledger still stored) the
+   * preceding successful turn. Publishing the failed spawn's stderr as the
+   * assistant's answer would leak backend diagnostics into the conversation and
+   * into turn_end hooks. The host reports stderr separately.
+   */
+  it('preserves the last successful response when a continuation fails', async () => {
+    const { ports } = makePorts([
+      outcome({ responseText: `partial answer${inkTool('read')}` }),
+      outcome({ success: false, stderr: 'backend exploded', exitCode: 1 }),
+    ]);
+    const result = await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, ports);
+
+    expect(result.responseText).toContain('partial answer');
+    expect(result.responseText).not.toContain('backend exploded');
+    expect(result.assistantDisplayText).toContain('partial answer');
+    expect(result.assistantDisplayText).not.toContain('backend exploded');
+  });
+
+  /**
+   * stopReason is load-bearing: a clone reports it to its parent to say whether
+   * work finished. An opening turn that fails and parses no tool calls must not
+   * exit via the `no-tools` branch, or failed work reads as completed work.
+   */
+  it('classifies a failed opening turn as backend-failure, not no-tools', async () => {
+    const { ports } = makePorts([
+      outcome({ success: false, stderr: 'backend failed', exitCode: 1 }),
+    ]);
+    const result = await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, ports);
+
+    expect(result.stopReason).toBe('backend-failure');
+    expect(result.success).toBe(false);
+    expect(result.iterations).toBe(0);
+  });
+
+  it('still reports abort (exit >=128) as aborted, not backend-failure', async () => {
+    const { ports } = makePorts([outcome({ success: false, exitCode: 137, stderr: 'killed' })]);
+    const result = await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, ports);
+
+    expect(result.stopReason).toBe('aborted');
+  });
+
+  it('does not misreport a successful no-tools turn as a failure', async () => {
+    const { ports } = makePorts([outcome({ responseText: 'all done' })]);
+    const result = await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, ports);
+
+    expect(result.stopReason).toBe('no-tools');
+    expect(result.success).toBe(true);
   });
 
   it('reports an aborted turn with no display text', async () => {
