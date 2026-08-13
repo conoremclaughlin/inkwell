@@ -1367,6 +1367,14 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         recipientUserId = thread?.user_id;
       }
 
+      // Bare trigger_agent (no source row, possibly just a threadKey): fall
+      // back to the user stamped server-side post-auth by handleTriggerAgent.
+      // Row-derived resolution stays preferred; this fallback is what lets a
+      // threadKey-only failure reach thread resolution at all (PR #487).
+      if (!recipientUserId && payload.recipientUserId) {
+        recipientUserId = payload.recipientUserId;
+      }
+
       if (recipientUserId) {
         await logInkmail('inkmail_fail', payload, recipientUserId, {
           error: errorText.slice(0, 2000),

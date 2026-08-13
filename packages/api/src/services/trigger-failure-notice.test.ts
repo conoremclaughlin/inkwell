@@ -88,9 +88,12 @@ describe('sendTriggerFailureNotice', () => {
     expect(client.threadInserts).toHaveLength(1);
     expect(client.threadInserts[0]).toMatchObject({
       thread_id: 't-1',
-      sender_agent_id: 'aster',
-      // 'notification', NOT 'system' — system events are excluded from
-      // delivery and candidacy, which would bury the notice.
+      // 'system' attribution — a synthetic row bearing the failed agent's
+      // name would shadow their newest REAL message in the recipient-session
+      // lookup and misroute the next reply (Lumen, PR #487 review).
+      sender_agent_id: 'system',
+      // 'notification' TYPE, not 'system' — system-type events are excluded
+      // from delivery and candidacy, which would bury the notice.
       message_type: 'notification',
       priority: 'high',
     });

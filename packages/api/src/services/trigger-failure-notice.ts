@@ -26,7 +26,7 @@ export interface TriggerFailureNotice {
   userId: string;
   /** Original trigger sender — the agent being notified. */
   fromAgentId: string;
-  /** Failed trigger target — the notice's attributed sender. */
+  /** Failed trigger target — named in content; legacy-lane attributed sender. */
   toAgentId: string;
   threadId?: string | null;
   threadKey?: string | null;
@@ -64,15 +64,17 @@ export async function sendTriggerFailureNotice(
     threadId = thread?.id || null;
   }
 
-  // Thread-borne failure → post into the thread. Attribution: the failed
-  // target (participants read "Trigger to aster failed" from aster's seat);
-  // messageType 'notification' so it DELIVERS (system events are excluded
-  // from delivery and candidacy). No wake — failure loops are the reason
-  // the legacy path never triggered either.
+  // Thread-borne failure → post into the thread. Attribution: 'system' —
+  // never the failed target: a synthetic row bearing that agent's name
+  // would shadow their newest REAL message in the recipient-session lookup
+  // (metadata.pcp.sender.sessionId), misrouting the next reply (Lumen,
+  // PR #487). The content names the failed target. messageType stays
+  // 'notification' so it DELIVERS (system-TYPE events are excluded from
+  // delivery and candidacy). No wake — failure-loop protection.
   if (threadId) {
     const { error: insertErr } = await client.from('inbox_thread_messages').insert({
       thread_id: threadId,
-      sender_agent_id: toAgentId,
+      sender_agent_id: 'system',
       content,
       message_type: 'notification',
       priority: 'high',
