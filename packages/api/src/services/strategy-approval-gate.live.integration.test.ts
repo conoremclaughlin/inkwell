@@ -27,10 +27,8 @@
  * - Supabase credentials (.env.local or env vars)
  *
  * Run:
- *   INK_LIVE_TESTS=1 PCP_SERVER_URL=http://localhost:4001 npx vitest run --config packages/api/vitest.live.config.ts \
- *     --config vitest.integration.db.config.ts \
- *     --root packages/api \
- *     src/services/strategy-approval-gate.live.integration.test.ts
+ *   INK_LIVE_TESTS=1 PCP_SERVER_URL=http://localhost:4001 \
+ *     yarn workspace @inklabs/api test:live src/services/strategy-approval-gate.live.integration.test.ts
  */
 
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';

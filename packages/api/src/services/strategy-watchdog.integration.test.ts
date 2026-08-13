@@ -48,10 +48,11 @@ const TEST_USER_ID: string | undefined = INTEGRATION_TEST_USER_ID;
 let TEST_SB_ID: string | undefined;
 
 // INTENTIONAL (Conor, 2026-08-12): this suite is token-free — server/DB
-// round-trips only, no LLM calls — so it runs in CI against the isolated
-// local Supabase stack. LIVE suites (*.live.*, gated on INK_LIVE_TESTS=1)
-// consume real LLM tokens and are DELIBERATELY excluded from CI; that is a
-// cost decision, not an oversight — please don't "fix" it.
+// round-trips only, no LLM calls — so running it in CI is fine on cost
+// grounds; it is CI-deferred below purely for environment-hermeticity
+// reasons. LIVE suites (*.live.*, gated on INK_LIVE_TESTS=1) consume real
+// LLM tokens and are DELIBERATELY excluded from CI; that is a cost
+// decision, not an oversight — please don't "fix" it.
 // CI-DEFERRED (Lumen, PR #439 round 2): this suite assumes a developer
 // environment — resolvable repoRoot/worktrees and strategy lifecycle state —
 // and fails deterministically on Actions (18 failures on run 31656039026,

@@ -8,7 +8,15 @@ import { defineConfig } from 'vitest/config';
  * Both layers are deliberate cost protection — see the CI test-tier policy
  * comments in src/test/integration-setup.ts.
  *
- * Run: INK_LIVE_TESTS=1 npx vitest run --config packages/api/vitest.live.config.ts
+ * Run: yarn workspace @inklabs/api test:live
+ * (the script runs with this package as cwd, so the src/** globs resolve;
+ * a repo-root `npx vitest --config packages/api/...` collects nothing)
+ *
+ * Setup is live-setup.ts ONLY — env loading with no fake credential
+ * fallbacks and no DB safety guard. setup.ts's fake Supabase values would
+ * make DB-dependent live gates look configured, and integration-setup.ts's
+ * guard would abort non-DB live suites (mlx-tts) before their own
+ * INK_LIVE_TESTS gate runs (Lumen, PR #439 round 3).
  */
 export default defineConfig({
   test: {
@@ -18,6 +26,6 @@ export default defineConfig({
     exclude: ['node_modules', 'dist'],
     testTimeout: 300000,
     hookTimeout: 30000,
-    setupFiles: ['./src/test/setup.ts', './src/test/integration-setup.ts'],
+    setupFiles: ['./src/test/live-setup.ts'],
   },
 });
