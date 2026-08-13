@@ -37,7 +37,12 @@ import {
   closeTaskGroupSchema,
 } from './task-handlers';
 
-import { handleSendResponse, handleGetPendingMessages, handleMarkRead } from './response-handlers';
+import {
+  handleSendResponse,
+  handleGetPendingMessages,
+  handleMarkRead,
+  outboundMediaEntrySchema,
+} from './response-handlers';
 
 import {
   handleRemember,
@@ -1419,7 +1424,7 @@ This is the PRIMARY way to send messages to users on external channels. You MUST
 
 ## Media Attachments
 
-To send photos, videos, or documents, use the \`media\` array parameter. Each attachment needs a \`type\` and either a \`path\` (local file) or \`url\` (remote).
+To send photos, videos, or documents, use the \`media\` array parameter. Each attachment needs a \`type\` and either a \`path\` (local file) or \`url\` (remote). A bare path/URL string is also accepted — its type is inferred from the file extension.
 
 Example — send a photo with caption:
   content: "Here's the screenshot"
@@ -1427,6 +1432,9 @@ Example — send a photo with caption:
 
 Example — send a document:
   media: [{ type: "document", path: "/path/to/report.pdf", filename: "report.pdf" }]
+
+Example — bare string shorthand (type inferred):
+  media: ["/absolute/path/to/recording.m4a"]
 
 Supported types: image, video, audio, document. The \`content\` field is sent as a separate text message before the media.
 
@@ -1455,19 +1463,15 @@ Optionally set \`ttsVoice\` to choose a voice. Available voices: serena (default
           .enum(['serena', 'vivian', 'sohee', 'ono_anna', 'ryan', 'aiden', 'eric'])
           .optional()
           .describe('Voice for TTS synthesis. Only used when voiceReply is true. Default: serena.'),
+        // Shared with sendResponseSchema (response-handlers.ts) so the
+        // registered validation and the handler's type can't drift: bare
+        // string entries are coerced to {type, path|url} objects.
         media: z
-          .array(
-            z.object({
-              type: z.enum(['image', 'video', 'audio', 'document']).describe('Media type'),
-              path: z.string().optional().describe('Local file path to upload'),
-              url: z.string().optional().describe('Remote URL'),
-              contentType: z.string().optional().describe('MIME type'),
-              filename: z.string().optional().describe('Display filename'),
-              caption: z.string().optional().describe('Caption for this attachment'),
-            })
-          )
+          .array(outboundMediaEntrySchema)
           .optional()
-          .describe('Media attachments to send (images, videos, documents)'),
+          .describe(
+            'Media attachments to send. Each entry is {type, path|url, ...} — a bare path/URL string is also accepted and coerced.'
+          ),
       },
     },
     async (args) => {
