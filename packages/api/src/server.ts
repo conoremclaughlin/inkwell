@@ -61,6 +61,8 @@ import {
   type SessionAttachedRow,
 } from './services/sessions/trigger-delivery';
 import { assignThreadParticipant } from './services/sessions/thread-assignment';
+import { listActiveRuns } from './services/sessions/active-runs';
+import { interruptActiveRuns } from './services/sessions/interrupt-active-runs';
 import type { ActivityType } from './data/repositories/activity-stream.repository';
 import { resolveTaskGroupForThreadKey } from './services/task-group-resolver';
 import { sendTriggerFailureNotice } from './services/trigger-failure-notice';
@@ -1572,6 +1574,17 @@ async function shutdown(): Promise<void> {
   forceKillTimer.unref(); // Don't let the timer itself keep the process alive
 
   try {
+    // Before anything is torn down: the agent CLIs we spawned are our children
+    // and are about to die with us. Record that, and tell whoever is waiting.
+    // Runs first because it needs a live DB client, and because the notice is
+    // worth more than a few hundred milliseconds of shutdown latency.
+    const interrupted = listActiveRuns();
+    if (interrupted.length > 0 && dataComposer) {
+      await interruptActiveRuns(dataComposer.getClient(), interrupted).catch((err) => {
+        logger.error('Interruption bookkeeping failed', { error: err });
+      });
+    }
+
     // Stop heartbeat cron job (logs internally)
     stopHeartbeatService();
 

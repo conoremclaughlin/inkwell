@@ -34,6 +34,7 @@ import { SessionRepository } from './session-repository.js';
 import { ContextBuilder } from './context-builder.js';
 import { ClaudeRunner, buildIdentityPrompt } from './claude-runner.js';
 import { CodexRunner } from './codex-runner.js';
+import { registerActiveRun, clearActiveRun } from './active-runs.js';
 import { GeminiRunner } from './gemini-runner.js';
 import { InkRunner } from './ink-runner.js';
 import { ActivityStreamRepository } from '../../data/repositories/activity-stream.repository.js';
@@ -741,6 +742,20 @@ export class SessionService implements ISessionService {
     let result;
     let turnDurationMs: number;
     const turnStartMs = Date.now();
+
+    // From here until the finally below, this turn is a child of this process
+    // and dies with it. Registering it is what lets shutdown say so instead of
+    // leaving the row at `lifecycle: 'running'` forever.
+    registerActiveRun({
+      sessionId: session.id,
+      userId,
+      agentId,
+      backend: resolvedBackend,
+      threadKey: metadata?.threadKey as string | undefined,
+      senderAgentId: request.sender?.id,
+      startedAt: turnStartMs,
+    });
+
     try {
       result = await runner.run(formattedMessage, {
         backendSessionId: session.backendSessionId || undefined,
@@ -784,6 +799,11 @@ export class SessionService implements ISessionService {
         })
         .catch(() => {});
       throw runnerError;
+    } finally {
+      // Every exit route, including the rethrow above. A turn that ends
+      // without deregistering gets reported as interrupted at the next
+      // shutdown — the same lie, pointing the other way.
+      clearActiveRun(session.id);
     }
 
     // 5b. Log backend CLI completion to activity stream (fire-and-forget)
