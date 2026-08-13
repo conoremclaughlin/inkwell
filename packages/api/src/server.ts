@@ -61,7 +61,7 @@ import {
   type SessionAttachedRow,
 } from './services/sessions/trigger-delivery';
 import { assignThreadParticipant } from './services/sessions/thread-assignment';
-import { listActiveRuns } from './services/sessions/active-runs';
+import { closeIntakeAndDrain } from './services/sessions/active-runs';
 import { interruptActiveRuns } from './services/sessions/interrupt-active-runs';
 import type { ActivityType } from './data/repositories/activity-stream.repository';
 import { resolveTaskGroupForThreadKey } from './services/task-group-resolver';
@@ -1578,7 +1578,11 @@ async function shutdown(): Promise<void> {
     // and are about to die with us. Record that, and tell whoever is waiting.
     // Runs first because it needs a live DB client, and because the notice is
     // worth more than a few hundred milliseconds of shutdown latency.
-    const interrupted = listActiveRuns();
+    // Close intake and let outstanding lifecycle writes settle before taking
+    // the snapshot. Snapshotting first would race the very writes it needs to
+    // order against — a pending `running` write would land after our
+    // interruption and restore the zombie.
+    const interrupted = await closeIntakeAndDrain();
     if (interrupted.length > 0 && dataComposer) {
       await interruptActiveRuns(dataComposer.getClient(), interrupted).catch((err) => {
         logger.error('Interruption bookkeeping failed', { error: err });

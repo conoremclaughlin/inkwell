@@ -27,8 +27,22 @@ import type { ActiveRun } from './active-runs.js';
 
 export const INTERRUPT_REASON = 'server-shutdown';
 
+/**
+ * What we were able to establish about the session, which decides what the
+ * notice is allowed to promise.
+ *
+ * - `interrupted` — the row was running and we moved it to idle/resumable.
+ * - `already-terminal` — it had (or concurrently reached) a terminal state of
+ *   its own, and we left that alone.
+ * - `unknown` — we could not read or could not write it. Notably NOT the same
+ *   as `already-terminal`: claiming the session completed when we simply could
+ *   not tell is its own false statement.
+ */
+export type InterruptState = 'interrupted' | 'already-terminal' | 'unknown';
+
 export interface InterruptOutcome {
   sessionId: string;
+  state: InterruptState;
   /**
    * The bookkeeping write landed. For a normal run that means the row moved
    * off `running`; for an already-terminal one it means only the metadata
@@ -37,10 +51,7 @@ export interface InterruptOutcome {
   marked: boolean;
   /** Someone was told. False when the run had no thread to post into. */
   noticed: boolean;
-  /**
-   * The row had already reached a terminal state under its own power, so its
-   * lifecycle was left alone. See `isAlreadyTerminal`.
-   */
+  /** Convenience alias for `state === 'already-terminal'`. */
   alreadyTerminal: boolean;
 }
 
@@ -65,19 +76,129 @@ export function isAlreadyTerminal(row: {
   return row.lifecycle === 'completed' || row.lifecycle === 'failed' || Boolean(row.ended_at);
 }
 
-function noticeContent(run: ActiveRun, alreadyTerminal: boolean): string {
+function noticeContent(run: ActiveRun, outcome: InterruptOutcome): string {
   const thread = run.threadKey ? ` on \`${run.threadKey}\`` : '';
   const head =
     `⚠️ ${run.agentId}'s turn${thread} was cut short — the Inkwell server shut ` +
     `down while the ${run.backend} process was still running.`;
 
-  // Only promise resumption where the state can actually deliver it.
-  return alreadyTerminal
-    ? `${head}\n\nThe session had already recorded a terminal state, so it is ` +
-        `left as-is rather than reopened. Any reply it was mid-way through ` +
-        `sending may not have arrived — check before assuming it did.`
-    : `${head}\n\nNo reply was produced. The session is resumable and keeps its ` +
-        `context — re-trigger the thread to pick it up from where it stopped.`;
+  // Each branch promises only what the state it left behind can deliver.
+  if (outcome.state === 'unknown') {
+    return (
+      `${head}\n\nThe session's state could not be updated during shutdown, so ` +
+      `it may still read as running even though nothing is. Treat its status as ` +
+      `unreliable and re-trigger the thread rather than waiting on it.`
+    );
+  }
+
+  if (outcome.state === 'already-terminal') {
+    return (
+      `${head}\n\nThe session had already recorded a terminal state, so it is ` +
+      `left as-is rather than reopened. Any reply it was mid-way through ` +
+      `sending may not have arrived — check before assuming it did.`
+    );
+  }
+
+  return (
+    `${head}\n\nNo reply was produced. The session is resumable and keeps its ` +
+    `context — re-trigger the thread to pick it up from where it stopped.`
+  );
+}
+
+/**
+ * Move one session off `running`, or establish that we must not.
+ *
+ * Extracted so that every path — including the ones that decline to write —
+ * still returns to the caller and gets a notice. An early return from inside
+ * the try block silently skipped notification for already-terminal sessions,
+ * which is the failure this whole PR is about.
+ */
+async function transitionSession(
+  client: any,
+  sessionId: string
+): Promise<{ state: InterruptState; marked: boolean }> {
+  let metadata: Record<string, unknown>;
+
+  try {
+    // Read-modify-write, because metadata is a single JSONB column and a blind
+    // write drops everything else the session carries. lifecycle and ended_at
+    // ride along so the terminal check costs no extra round-trip.
+    const { data: existing, error: readError } = await client
+      .from('sessions')
+      .select('metadata, lifecycle, ended_at')
+      .eq('id', sessionId)
+      .maybeSingle();
+
+    if (readError) {
+      // Fail CLOSED. Treating an unreadable row as non-terminal would let us
+      // write idle/resumable over a session that had already completed — the
+      // exact corruption this function exists to avoid (Lumen, PR #490 round
+      // 2). Declining to write is the recoverable direction, and 'unknown'
+      // keeps us from claiming in the notice that we know which it was.
+      logger.error('[Shutdown] Could not read session; leaving state untouched', {
+        sessionId,
+        error: readError.message,
+      });
+      return { state: 'unknown', marked: false };
+    }
+
+    metadata = {
+      ...((existing?.metadata as Record<string, unknown>) || {}),
+      interruptedAt: new Date().toISOString(),
+      interruptedReason: INTERRUPT_REASON,
+    };
+
+    if (isAlreadyTerminal(existing || {})) {
+      const { error } = await client.from('sessions').update({ metadata }).eq('id', sessionId);
+      if (error) {
+        logger.error('[Shutdown] Failed to record interruption breadcrumb', {
+          sessionId,
+          error: error.message,
+        });
+      }
+      return { state: 'already-terminal', marked: !error };
+    }
+
+    // Conditional write. The predicates are evaluated atomically with the
+    // update by Postgres, which is what closes the read-then-write race: if
+    // the child stamped completion between the read above and this statement,
+    // it matches zero rows instead of overwriting a terminal state with a
+    // resumable one.
+    const { data: changed, error } = await client
+      .from('sessions')
+      .update({ lifecycle: 'idle', status: 'resumable', metadata })
+      .eq('id', sessionId)
+      .eq('lifecycle', 'running')
+      .is('ended_at', null)
+      .select('id');
+
+    if (error) {
+      logger.error('[Shutdown] Failed to terminalize interrupted session', {
+        sessionId,
+        error: error.message,
+      });
+      return { state: 'unknown', marked: false };
+    }
+
+    if (!changed || changed.length === 0) {
+      // Lost the race: the row stopped being running-and-unended between the
+      // read and the write. Whatever it became, it is not ours to overwrite.
+      logger.info('[Shutdown] Session terminalized itself mid-interrupt', { sessionId });
+      const { error: crumbError } = await client
+        .from('sessions')
+        .update({ metadata })
+        .eq('id', sessionId);
+      return { state: 'already-terminal', marked: !crumbError };
+    }
+
+    return { state: 'interrupted', marked: true };
+  } catch (err) {
+    logger.error('[Shutdown] Error terminalizing interrupted session', {
+      sessionId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return { state: 'unknown', marked: false };
+  }
 }
 
 /**
@@ -101,55 +222,19 @@ export async function interruptActiveRuns(
   const work = runs.map(async (run): Promise<InterruptOutcome> => {
     const outcome: InterruptOutcome = {
       sessionId: run.sessionId,
+      state: 'unknown',
       marked: false,
       noticed: false,
       alreadyTerminal: false,
     };
 
-    try {
-      // Read-modify-write: metadata is a single JSONB column, so a blind write
-      // would drop everything else the session is carrying. The lifecycle and
-      // ended_at come back in the same read so the terminal check below costs
-      // no extra round-trip.
-      const { data: existing } = await client
-        .from('sessions')
-        .select('metadata, lifecycle, ended_at')
-        .eq('id', run.sessionId)
-        .maybeSingle();
-
-      outcome.alreadyTerminal = isAlreadyTerminal(existing || {});
-
-      const { error } = await client
-        .from('sessions')
-        .update({
-          // A row that terminalized itself keeps its own account of what
-          // happened; only the metadata breadcrumb is added.
-          ...(outcome.alreadyTerminal ? {} : { lifecycle: 'idle', status: 'resumable' }),
-          metadata: {
-            ...((existing?.metadata as Record<string, unknown>) || {}),
-            interruptedAt: new Date().toISOString(),
-            interruptedReason: INTERRUPT_REASON,
-          },
-        })
-        .eq('id', run.sessionId);
-
-      if (error) {
-        logger.error('[Shutdown] Failed to terminalize interrupted session', {
-          sessionId: run.sessionId,
-          error: error.message,
-        });
-      } else {
-        outcome.marked = true;
-      }
-    } catch (err) {
-      logger.error('[Shutdown] Error terminalizing interrupted session', {
-        sessionId: run.sessionId,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
+    const { state, marked } = await transitionSession(client, run.sessionId);
+    outcome.state = state;
+    outcome.marked = marked;
+    outcome.alreadyTerminal = state === 'already-terminal';
 
     // No thread means no addressable audience — a bare trigger has no sender
-    // to post back to. The log above is the record in that case.
+    // to post back to. The logs in transitionSession are the record there.
     if (!run.threadKey) return outcome;
 
     try {
@@ -161,12 +246,13 @@ export async function interruptActiveRuns(
         toAgentId: run.agentId,
         threadKey: run.threadKey,
         subject: `Turn interrupted — ${run.agentId} (${run.backend})`,
-        content: noticeContent(run, outcome.alreadyTerminal),
+        content: noticeContent(run, outcome),
         metadata: {
           kind: 'session_interrupted',
           reason: INTERRUPT_REASON,
           sessionId: run.sessionId,
           backend: run.backend,
+          state: outcome.state,
           alreadyTerminal: outcome.alreadyTerminal,
         },
       });

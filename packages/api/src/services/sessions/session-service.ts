@@ -34,7 +34,7 @@ import { SessionRepository } from './session-repository.js';
 import { ContextBuilder } from './context-builder.js';
 import { ClaudeRunner, buildIdentityPrompt } from './claude-runner.js';
 import { CodexRunner } from './codex-runner.js';
-import { registerActiveRun, clearActiveRun } from './active-runs.js';
+import { registerActiveRun, clearActiveRun, trackStateWrite } from './active-runs.js';
 import { GeminiRunner } from './gemini-runner.js';
 import { InkRunner } from './ink-runner.js';
 import { ActivityStreamRepository } from '../../data/repositories/activity-stream.repository.js';
@@ -731,7 +731,7 @@ export class SessionService implements ISessionService {
     // running" — anything narrower leaves a window where a shutdown sees no
     // active run and walks away from a row that says `running` forever, which
     // is the exact zombie this is here to prevent (Lumen, PR #490 — P1).
-    registerActiveRun({
+    const admitted = registerActiveRun({
       sessionId: session.id,
       userId,
       agentId,
@@ -741,8 +741,26 @@ export class SessionService implements ISessionService {
       startedAt: Date.now(),
     });
 
-    // Mark session as running before backend turn
-    await this.repository.update(session.id, { lifecycle: 'running' });
+    // Intake closes at the top of shutdown. A turn started now is guaranteed
+    // to be killed before it finishes, and would be invisible to the drain
+    // that has already run — so refuse it rather than spawn a child that
+    // cannot survive and cannot be reported.
+    if (!admitted) {
+      throw new Error('Server is shutting down; not starting a new backend turn.');
+    }
+
+    // Mark session as running before backend turn. Tracked so the shutdown
+    // drain can wait for it: if this write is still in flight when the
+    // interruption runs, it would land afterwards and restore `running`.
+    try {
+      await trackStateWrite(this.repository.update(session.id, { lifecycle: 'running' }));
+    } catch (runningWriteError) {
+      // The row is not running, so the registration describes nothing. Leaving
+      // it would make shutdown post an interruption notice for a turn that
+      // never started.
+      clearActiveRun(session.id);
+      throw runningWriteError;
+    }
 
     // Media flows to backends as file paths, not inline base64. Channel
     // listeners download attachments to ~/.ink/files/<channel>/; the
@@ -768,12 +786,19 @@ export class SessionService implements ISessionService {
       turnDurationMs = Date.now() - turnStartMs;
     } catch (runnerError) {
       // Runner threw (spawn failure, capacity error, etc.) — mark session as failed
-      await this.repository.update(session.id, { lifecycle: 'failed' }).catch((e) => {
-        logger.warn('Failed to set lifecycle=failed after runner crash', {
-          sessionId: session.id,
-          error: e,
-        });
-      });
+      let failedWritten = true;
+      await trackStateWrite(this.repository.update(session.id, { lifecycle: 'failed' })).catch(
+        (e) => {
+          // The row is still `running`. Keeping the registration is the point:
+          // this is precisely a session that needs reporting at shutdown, and
+          // clearing it here is how the zombie survived round 1.
+          failedWritten = false;
+          logger.warn('Failed to set lifecycle=failed after runner crash', {
+            sessionId: session.id,
+            error: e,
+          });
+        }
+      );
       this.activityStream
         .logActivity({
           userId,
@@ -800,10 +825,10 @@ export class SessionService implements ISessionService {
           } as unknown as Json,
         })
         .catch(() => {});
-      // Cleared only now, after `failed` is persisted above — not in a
-      // `finally` around runner.run(). A finally fires while the row still
-      // says `running`, reopening the same window on the way out.
-      clearActiveRun(session.id);
+      // Cleared only if `failed` actually persisted — not in a `finally`
+      // around runner.run(). A finally fires while the row still says
+      // `running`, reopening the same window on the way out.
+      if (failedWritten) clearActiveRun(session.id);
       throw runnerError;
     }
 
@@ -870,20 +895,24 @@ export class SessionService implements ISessionService {
         backend: resolvedBackend,
         agentId: session.agentId,
       });
-      await this.repository.update(session.id, {
-        backendSessionId: result.backendSessionId,
-        messageCount: session.messageCount + 1,
-        backend: resolvedBackend,
-        lifecycle: postRunLifecycle as Session['lifecycle'],
-        cliAttached: false,
-      });
+      await trackStateWrite(
+        this.repository.update(session.id, {
+          backendSessionId: result.backendSessionId,
+          messageCount: session.messageCount + 1,
+          backend: resolvedBackend,
+          lifecycle: postRunLifecycle as Session['lifecycle'],
+          cliAttached: false,
+        })
+      );
     } else {
-      await this.repository.update(session.id, {
-        messageCount: session.messageCount + 1,
-        backend: resolvedBackend,
-        lifecycle: postRunLifecycle as Session['lifecycle'],
-        cliAttached: false,
-      });
+      await trackStateWrite(
+        this.repository.update(session.id, {
+          messageCount: session.messageCount + 1,
+          backend: resolvedBackend,
+          lifecycle: postRunLifecycle as Session['lifecycle'],
+          cliAttached: false,
+        })
+      );
     }
 
     // The row is off `running` now, so this turn can no longer be orphaned by

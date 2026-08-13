@@ -18,6 +18,9 @@ import {
   listActiveRuns,
   activeRunCount,
   resetActiveRuns,
+  trackStateWrite,
+  closeIntakeAndDrain,
+  isIntakeOpen,
 } from './active-runs.js';
 import {
   interruptActiveRuns,
@@ -109,6 +112,98 @@ describe('registry brackets the persisted running state', () => {
   });
 });
 
+/**
+ * The interleavings that source order cannot model (Lumen, PR #490 round 2).
+ * Membership in a Set says nothing about writes still in flight; these pin the
+ * handshake that does.
+ */
+describe('shutdown handshake', () => {
+  beforeEach(() => resetActiveRuns());
+
+  it('refuses new runs once intake has closed', async () => {
+    await closeIntakeAndDrain();
+    expect(isIntakeOpen()).toBe(false);
+    expect(registerActiveRun(run({ sessionId: 'late' }))).toBe(false);
+    expect(activeRunCount()).toBe(0);
+  });
+
+  it('admits runs while intake is open', () => {
+    expect(registerActiveRun(run())).toBe(true);
+    expect(activeRunCount()).toBe(1);
+  });
+
+  // The interleaving that broke round 1: shutdown writes idle, then the turn's
+  // still-pending `running` write lands on top. Draining first means no
+  // lifecycle write is outstanding when the interruption runs.
+  it('waits for an in-flight state write before reporting', async () => {
+    registerActiveRun(run());
+
+    let settled = false;
+    let release!: () => void;
+    trackStateWrite(
+      new Promise<void>((resolve) => {
+        release = () => {
+          settled = true;
+          resolve();
+        };
+      })
+    );
+
+    const draining = closeIntakeAndDrain(5_000);
+    // Give the drain a tick to observe the outstanding write.
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    release();
+    await draining;
+    expect(settled).toBe(true);
+  });
+
+  /**
+   * The "registered after the snapshot" hole is closed by construction rather
+   * than by ordering: intake shuts synchronously at the top of the drain, so
+   * there is no window in which a run can join and then be missed. A run that
+   * tries is refused, and its caller declines to start the turn at all.
+   */
+  it('cannot be joined once draining has begun', async () => {
+    let release!: () => void;
+    trackStateWrite(
+      new Promise<void>((resolve) => {
+        release = resolve;
+      })
+    );
+
+    const draining = closeIntakeAndDrain(5_000);
+    expect(registerActiveRun(run({ sessionId: 'mid-drain' }))).toBe(false);
+    release();
+
+    const snapshot = await draining;
+    expect(snapshot.map((r) => r.sessionId)).not.toContain('mid-drain');
+  });
+
+  it('reports every run that registered before intake closed', async () => {
+    registerActiveRun(run({ sessionId: 'a' }));
+    registerActiveRun(run({ sessionId: 'b' }));
+
+    const snapshot = await closeIntakeAndDrain(5_000);
+    expect(snapshot.map((r) => r.sessionId).sort()).toEqual(['a', 'b']);
+  });
+
+  it('proceeds rather than burning the shutdown budget on a hung write', async () => {
+    registerActiveRun(run());
+    trackStateWrite(new Promise<void>(() => {})); // never settles
+
+    const snapshot = await closeIntakeAndDrain(20);
+    expect(snapshot).toHaveLength(1);
+  });
+
+  it('stops tracking a write once it settles, including on rejection', async () => {
+    await trackStateWrite(Promise.reject(new Error('write failed'))).catch(() => {});
+    // A rejected write must not stall the drain forever.
+    await expect(closeIntakeAndDrain(20)).resolves.toEqual([]);
+  });
+});
+
 describe('isAlreadyTerminal', () => {
   it.each([
     [{ lifecycle: 'completed', ended_at: null }, true],
@@ -122,8 +217,14 @@ describe('isAlreadyTerminal', () => {
   });
 });
 
-/** Minimal Supabase-shaped stub recording what the code writes. */
-function makeClient(sessionRow: Record<string, unknown> = {}) {
+/**
+ * Minimal Supabase-shaped stub recording what the code writes.
+ *
+ * @param sessionRow what the pre-write read returns
+ * @param matchesPredicates whether the conditional update matches a row —
+ *   false simulates the session terminalizing between the read and the write
+ */
+function makeClient(sessionRow: Record<string, unknown> = {}, matchesPredicates = true) {
   const sessionUpdates: Record<string, unknown>[] = [];
   const threadMessages: Record<string, unknown>[] = [];
 
@@ -144,12 +245,34 @@ function makeClient(sessionRow: Record<string, unknown> = {}) {
               }),
             }),
           }),
-          update: (values: Record<string, unknown>) => ({
-            eq: async (_col: string, id: string) => {
-              sessionUpdates.push({ id, ...values });
-              return { error: null };
-            },
-          }),
+          // Mirrors PostgREST: filters accumulate, `.select()` resolves to the
+          // rows the predicates actually matched. `matchesPredicates` lets a
+          // test simulate the row changing between the read and the write.
+          update: (values: Record<string, unknown>) => {
+            const filters: Array<[string, unknown]> = [];
+            const builder = {
+              eq(col: string, value: unknown) {
+                filters.push([col, value]);
+                return builder;
+              },
+              is(col: string, value: unknown) {
+                filters.push([col, value]);
+                return builder;
+              },
+              select: async () => {
+                const conditional = filters.some(([col]) => col === 'lifecycle');
+                if (conditional && !matchesPredicates) return { data: [], error: null };
+                sessionUpdates.push({ id: filters[0]?.[1], ...values });
+                return { data: [{ id: filters[0]?.[1] }], error: null };
+              },
+              // Unconditional metadata-only write (no `.select()`).
+              then(resolve: (v: unknown) => void) {
+                sessionUpdates.push({ id: filters[0]?.[1], ...values });
+                resolve({ error: null });
+              },
+            };
+            return builder;
+          },
         };
       }
       if (table === 'inbox_threads') {
@@ -322,6 +445,139 @@ describe('interruptActiveRuns', () => {
     });
   });
 
+  /**
+   * Read-then-write is not enough on its own: completion can land in the gap.
+   * The predicates on the update are evaluated atomically with it by Postgres,
+   * so a row that stopped being running-and-unended matches zero rows instead
+   * of being overwritten (Lumen, PR #490 round 2).
+   */
+  describe('racing the child’s own completion write', () => {
+    it('does not overwrite a row that terminalized between the read and the write', async () => {
+      const { client, sessionUpdates } = makeClient({ lifecycle: 'running' }, false);
+      const [outcome] = await interruptActiveRuns(client, [run()]);
+
+      expect(outcome.alreadyTerminal).toBe(true);
+      // Only the breadcrumb write — no lifecycle/status downgrade.
+      const wrote = sessionUpdates.find((u) => 'lifecycle' in u);
+      expect(wrote).toBeUndefined();
+    });
+
+    it('still records the breadcrumb after losing that race', async () => {
+      const { client, sessionUpdates } = makeClient({ lifecycle: 'running' }, false);
+      const [outcome] = await interruptActiveRuns(client, [run()]);
+
+      expect(outcome.marked).toBe(true);
+      const metadata = sessionUpdates[0]?.metadata as Record<string, unknown>;
+      expect(metadata.interruptedReason).toBe(INTERRUPT_REASON);
+    });
+
+    it('constrains the write to running and unended rows', async () => {
+      const filters: Array<[string, unknown]> = [];
+      const client = {
+        from: () => ({
+          select: () => ({
+            eq: () => ({
+              maybeSingle: async () => ({
+                data: { metadata: {}, lifecycle: 'running', ended_at: null },
+                error: null,
+              }),
+            }),
+          }),
+          update: () => {
+            const b = {
+              eq(c: string, v: unknown) {
+                filters.push([c, v]);
+                return b;
+              },
+              is(c: string, v: unknown) {
+                filters.push([c, v]);
+                return b;
+              },
+              select: async () => ({ data: [{ id: 'sess-1' }], error: null }),
+            };
+            return b;
+          },
+        }),
+      };
+
+      await interruptActiveRuns(client, [run({ threadKey: undefined })]);
+      expect(filters).toContainEqual(['lifecycle', 'running']);
+      expect(filters).toContainEqual(['ended_at', null]);
+    });
+  });
+
+  /**
+   * An unreadable row must not be assumed non-terminal — that assumption is
+   * how a completed session gets overwritten with a resumable one.
+   */
+  it('fails closed when the session cannot be read', async () => {
+    const sessionUpdates: Record<string, unknown>[] = [];
+    const client = {
+      from: () => ({
+        select: () => ({
+          eq: () => ({
+            maybeSingle: async () => ({ data: null, error: { message: 'connection reset' } }),
+          }),
+        }),
+        update: () => ({
+          eq: async () => {
+            sessionUpdates.push({ shouldNotHappen: true });
+            return { error: null };
+          },
+        }),
+      }),
+    };
+
+    const [outcome] = await interruptActiveRuns(client, [run({ threadKey: undefined })]);
+    // 'unknown', not 'already-terminal' — asserting the session completed when
+    // we merely could not read it is its own false statement.
+    expect(outcome).toMatchObject({ state: 'unknown', alreadyTerminal: false, marked: false });
+    expect(sessionUpdates).toHaveLength(0);
+  });
+
+  it('warns that the state is unreliable when it could not be written', async () => {
+    const client = {
+      from: (table: string) => {
+        if (table === 'sessions') {
+          return {
+            select: () => ({
+              eq: () => ({
+                maybeSingle: async () => ({
+                  data: { metadata: {}, lifecycle: 'running', ended_at: null },
+                  error: null,
+                }),
+              }),
+            }),
+            update: () => {
+              const b = {
+                eq: () => b,
+                is: () => b,
+                select: async () => ({ data: null, error: { message: 'write failed' } }),
+              };
+              return b;
+            },
+          };
+        }
+        if (table === 'inbox_threads') {
+          return {
+            select: () => ({
+              eq: () => ({
+                eq: () => ({
+                  maybeSingle: async () => ({ data: { id: 'thread-1' }, error: null }),
+                }),
+              }),
+            }),
+            update: () => ({ eq: async () => ({ error: null }) }),
+          };
+        }
+        return { insert: async () => ({ error: null }) };
+      },
+    };
+
+    const [outcome] = await interruptActiveRuns(client, [run()]);
+    expect(outcome).toMatchObject({ marked: false, alreadyTerminal: false });
+  });
+
   it('is a no-op with nothing in flight', async () => {
     const { client, sessionUpdates } = makeClient();
     await expect(interruptActiveRuns(client, [])).resolves.toEqual([]);
@@ -337,14 +593,24 @@ describe('interruptActiveRuns', () => {
         if (table === 'sessions') {
           return {
             select: () => ({
-              eq: () => ({ maybeSingle: async () => ({ data: { metadata: {} }, error: null }) }),
+              eq: () => ({
+                maybeSingle: async () => ({
+                  data: { metadata: {}, lifecycle: 'running', ended_at: null },
+                  error: null,
+                }),
+              }),
             }),
-            update: (values: Record<string, unknown>) => ({
-              eq: async (_c: string, id: string) => {
-                sessionUpdates.push({ id, ...values });
-                return { error: null };
-              },
-            }),
+            update: (values: Record<string, unknown>) => {
+              const b = {
+                eq: () => b,
+                is: () => b,
+                select: async () => {
+                  sessionUpdates.push(values);
+                  return { data: [{ id: 'sess-1' }], error: null };
+                },
+              };
+              return b;
+            },
           };
         }
         throw new Error('thread tables unavailable');
@@ -353,7 +619,7 @@ describe('interruptActiveRuns', () => {
 
     const [outcome] = await interruptActiveRuns(client, [run()]);
     expect(sessionUpdates).toHaveLength(1);
-    expect(outcome).toMatchObject({ marked: true, noticed: false });
+    expect(outcome).toMatchObject({ state: 'interrupted', marked: true, noticed: false });
   });
 
   it('gives up rather than blocking shutdown past its budget', async () => {

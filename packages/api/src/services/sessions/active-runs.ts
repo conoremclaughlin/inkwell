@@ -11,11 +11,30 @@
  * during ordinary development: merging to main restarts the server, which
  * kills whatever reviews are in flight. Shipping faster lost more work.
  *
+ * ## Why there is a handshake and not just a Set
+ *
+ * Two writers race for the same row: the turn's own lifecycle writes, and
+ * shutdown's interruption write. Tracking membership alone is not enough,
+ * because membership says nothing about writes that are still in flight
+ * (Lumen, PR #490 rounds 1-2). Two interleavings break a naive registry:
+ *
+ *   - Shutdown snapshots and writes `idle`, then the turn's still-pending
+ *     `running` write lands on top and the zombie is back.
+ *   - A turn registers after shutdown took its one-time snapshot, and is
+ *     never seen at all.
+ *
+ * So intake closes first, then in-flight state writes are drained, and only
+ * then is the snapshot taken. After `closeIntake()` no new run can register,
+ * and after the drain no lifecycle write is outstanding — which makes the
+ * interruption write the last one to touch the row.
+ *
  * The registry is deliberately in-process and not persisted. Its whole job is
  * to answer "which turns die if this process dies", which is only ever a
  * question about *this* process. A second server on another port owns its own
  * children and must not terminalize them.
  */
+
+import { logger } from '../../utils/logger.js';
 
 export interface ActiveRun {
   sessionId: string;
@@ -32,19 +51,51 @@ export interface ActiveRun {
 
 const active = new Map<string, ActiveRun>();
 
-/** Called immediately before a backend turn starts. */
-export function registerActiveRun(run: ActiveRun): void {
+/** Lifecycle writes that have been issued but not yet settled. */
+const inFlightWrites = new Set<Promise<unknown>>();
+
+let intakeOpen = true;
+
+/**
+ * Called immediately before a turn's `running` write is issued.
+ *
+ * Returns false when intake has closed — the process is shutting down and
+ * anything started now is guaranteed to be killed before it finishes. Callers
+ * must not proceed with the turn.
+ */
+export function registerActiveRun(run: ActiveRun): boolean {
+  if (!intakeOpen) {
+    logger.warn('[ActiveRuns] Refusing to register a run during shutdown', {
+      sessionId: run.sessionId,
+      agentId: run.agentId,
+    });
+    return false;
+  }
   active.set(run.sessionId, run);
+  return true;
 }
 
 /**
- * Called when a turn finishes, by any route — success, runner throw, timeout.
- * Must run in a `finally`: a turn that ends without deregistering would be
- * reported as interrupted at the next shutdown, which is the same class of
- * lie in the opposite direction.
+ * Called once a turn's terminal state is DURABLY written — not when the runner
+ * returns. A row still saying `running` must stay registered, or shutdown will
+ * skip the very session that needs reporting.
  */
 export function clearActiveRun(sessionId: string): void {
   active.delete(sessionId);
+}
+
+/**
+ * Wrap a session lifecycle write so the drain can wait for it.
+ *
+ * Returns the same promise, so callers keep their normal await/catch shape.
+ * Rejections are absorbed here only for tracking purposes; the caller still
+ * sees them.
+ */
+export function trackStateWrite<T>(promise: Promise<T>): Promise<T> {
+  inFlightWrites.add(promise);
+  const forget = () => inFlightWrites.delete(promise);
+  promise.then(forget, forget);
+  return promise;
 }
 
 export function listActiveRuns(): ActiveRun[] {
@@ -55,7 +106,53 @@ export function activeRunCount(): number {
   return active.size;
 }
 
+export function isIntakeOpen(): boolean {
+  return intakeOpen;
+}
+
+/**
+ * Shutdown step one: stop accepting new runs, wait for outstanding lifecycle
+ * writes to settle, then report what is still in flight.
+ *
+ * The snapshot is taken AFTER the drain on purpose. Taken before, it would
+ * miss a run that registered while writes were settling, and it would race
+ * the very writes it is trying to order against.
+ *
+ * @param timeoutMs Bound on the drain. Shutdown force-exits at 10s, so a slow
+ *   or hung write must not consume that budget — on timeout we proceed with
+ *   whatever is registered, which is strictly better than reporting nothing.
+ */
+export async function closeIntakeAndDrain(timeoutMs = 2_000): Promise<ActiveRun[]> {
+  intakeOpen = false;
+
+  const outstanding = [...inFlightWrites];
+  if (outstanding.length > 0) {
+    let timer: NodeJS.Timeout | undefined;
+    const expiry = new Promise<'timeout'>((resolve) => {
+      timer = setTimeout(() => resolve('timeout'), timeoutMs);
+      timer.unref();
+    });
+
+    const settled = await Promise.race([
+      Promise.allSettled(outstanding).then(() => 'drained' as const),
+      expiry,
+    ]);
+    if (timer) clearTimeout(timer);
+
+    if (settled === 'timeout') {
+      logger.error('[ActiveRuns] Drain timed out; interrupting against a racing write', {
+        outstanding: outstanding.length,
+        timeoutMs,
+      });
+    }
+  }
+
+  return listActiveRuns();
+}
+
 /** Test seam. Not used in production paths. */
 export function resetActiveRuns(): void {
   active.clear();
+  inFlightWrites.clear();
+  intakeOpen = true;
 }
