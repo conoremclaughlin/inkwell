@@ -34,7 +34,12 @@ import { SessionRepository } from './session-repository.js';
 import { ContextBuilder } from './context-builder.js';
 import { ClaudeRunner, buildIdentityPrompt } from './claude-runner.js';
 import { CodexRunner } from './codex-runner.js';
-import { registerActiveRun, clearActiveRun, trackStateWrite } from './active-runs.js';
+import {
+  registerActiveRun,
+  clearActiveRun,
+  trackStateWrite,
+  admitStateWrite,
+} from './active-runs.js';
 import { GeminiRunner } from './gemini-runner.js';
 import { InkRunner } from './ink-runner.js';
 import { ActivityStreamRepository } from '../../data/repositories/activity-stream.repository.js';
@@ -785,20 +790,24 @@ export class SessionService implements ISessionService {
       });
       turnDurationMs = Date.now() - turnStartMs;
     } catch (runnerError) {
-      // Runner threw (spawn failure, capacity error, etc.) — mark session as failed
-      let failedWritten = true;
-      await trackStateWrite(this.repository.update(session.id, { lifecycle: 'failed' })).catch(
-        (e) => {
-          // The row is still `running`. Keeping the registration is the point:
-          // this is precisely a session that needs reporting at shutdown, and
-          // clearing it here is how the zombie survived round 1.
-          failedWritten = false;
-          logger.warn('Failed to set lifecycle=failed after runner crash', {
-            sessionId: session.id,
-            error: e,
-          });
-        }
-      );
+      // Runner threw (spawn failure, capacity error, etc.) — mark session as
+      // failed, unless shutdown already owns this session's state and would
+      // have its interruption record overwritten by this write.
+      let failedWritten = admitStateWrite(session.id);
+      if (failedWritten) {
+        await trackStateWrite(this.repository.update(session.id, { lifecycle: 'failed' })).catch(
+          (e) => {
+            // The row is still `running`. Keeping the registration is the point:
+            // this is precisely a session that needs reporting at shutdown, and
+            // clearing it here is how the zombie survived round 1.
+            failedWritten = false;
+            logger.warn('Failed to set lifecycle=failed after runner crash', {
+              sessionId: session.id,
+              error: e,
+            });
+          }
+        );
+      }
       this.activityStream
         .logActivity({
           userId,
@@ -887,7 +896,18 @@ export class SessionService implements ISessionService {
     // Leaving it true causes future triggers to skip spawning (they expect a
     // channel plugin to deliver, but none runs for headless sessions).
     const postRunLifecycle = result.success ? 'idle' : 'failed';
-    if (result.backendSessionId !== session.backendSessionId) {
+
+    // A runner can return after the shutdown drain has already snapshotted and
+    // interrupted this session. Because repository.update() rewrites the whole
+    // metadata blob from a snapshot taken at its own start, finalizing now
+    // would overwrite the interruption's lifecycle AND erase its breadcrumb.
+    // Shutdown owns the state from here (Lumen, PR #490 round 3).
+    if (!admitStateWrite(session.id)) {
+      logger.warn('Skipping post-run session write; shutdown already recorded this session', {
+        sessionId: session.id,
+        wouldHaveBeen: postRunLifecycle,
+      });
+    } else if (result.backendSessionId !== session.backendSessionId) {
       logger.info('Backend session ID linked to PCP session', {
         pcpSessionId: session.id,
         backendSessionId: result.backendSessionId,

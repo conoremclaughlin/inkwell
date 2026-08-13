@@ -1582,11 +1582,16 @@ async function shutdown(): Promise<void> {
     // the snapshot. Snapshotting first would race the very writes it needs to
     // order against — a pending `running` write would land after our
     // interruption and restore the zombie.
-    const interrupted = await closeIntakeAndDrain();
+    const { runs: interrupted, drained } = await closeIntakeAndDrain();
     if (interrupted.length > 0 && dataComposer) {
-      await interruptActiveRuns(dataComposer.getClient(), interrupted).catch((err) => {
-        logger.error('Interruption bookkeeping failed', { error: err });
-      });
+      // `drained` is passed through rather than swallowed: if a lifecycle
+      // write was still outstanding, whatever we record here may be
+      // contradicted a moment later, and the notice has to say so.
+      await interruptActiveRuns(dataComposer.getClient(), interrupted, undefined, drained).catch(
+        (err) => {
+          logger.error('Interruption bookkeeping failed', { error: err });
+        }
+      );
     }
 
     // Stop heartbeat cron job (logs internally)

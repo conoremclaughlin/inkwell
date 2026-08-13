@@ -21,6 +21,7 @@ import {
   trackStateWrite,
   closeIntakeAndDrain,
   isIntakeOpen,
+  admitStateWrite,
 } from './active-runs.js';
 import {
   interruptActiveRuns,
@@ -177,7 +178,7 @@ describe('shutdown handshake', () => {
     expect(registerActiveRun(run({ sessionId: 'mid-drain' }))).toBe(false);
     release();
 
-    const snapshot = await draining;
+    const { runs: snapshot } = await draining;
     expect(snapshot.map((r) => r.sessionId)).not.toContain('mid-drain');
   });
 
@@ -185,7 +186,7 @@ describe('shutdown handshake', () => {
     registerActiveRun(run({ sessionId: 'a' }));
     registerActiveRun(run({ sessionId: 'b' }));
 
-    const snapshot = await closeIntakeAndDrain(5_000);
+    const { runs: snapshot } = await closeIntakeAndDrain(5_000);
     expect(snapshot.map((r) => r.sessionId).sort()).toEqual(['a', 'b']);
   });
 
@@ -193,14 +194,37 @@ describe('shutdown handshake', () => {
     registerActiveRun(run());
     trackStateWrite(new Promise<void>(() => {})); // never settles
 
-    const snapshot = await closeIntakeAndDrain(20);
+    const { runs: snapshot, drained } = await closeIntakeAndDrain(20);
     expect(snapshot).toHaveLength(1);
+    // Reported, not swallowed — a racing write may still land.
+    expect(drained).toBe(false);
+  });
+
+  it('reports a clean drain as drained', async () => {
+    registerActiveRun(run());
+    trackStateWrite(Promise.resolve());
+    const { drained } = await closeIntakeAndDrain(5_000);
+    expect(drained).toBe(true);
   });
 
   it('stops tracking a write once it settles, including on rejection', async () => {
     await trackStateWrite(Promise.reject(new Error('write failed'))).catch(() => {});
     // A rejected write must not stall the drain forever.
-    await expect(closeIntakeAndDrain(20)).resolves.toEqual([]);
+    await expect(closeIntakeAndDrain(20)).resolves.toEqual({ runs: [], drained: true });
+  });
+
+  /**
+   * Closing intake stops new turns. It must also stop an already-admitted
+   * runner from finalizing after the snapshot: repository.update() rewrites
+   * the whole metadata blob, so a late write would overwrite the
+   * interruption's lifecycle AND erase its breadcrumb (Lumen, PR #490 r3).
+   */
+  it('refuses late lifecycle writes from runs admitted before shutdown', async () => {
+    registerActiveRun(run());
+    expect(admitStateWrite('sess-1')).toBe(true);
+
+    await closeIntakeAndDrain(20);
+    expect(admitStateWrite('sess-1')).toBe(false);
   });
 });
 
@@ -224,9 +248,14 @@ describe('isAlreadyTerminal', () => {
  * @param matchesPredicates whether the conditional update matches a row —
  *   false simulates the session terminalizing between the read and the write
  */
-function makeClient(sessionRow: Record<string, unknown> = {}, matchesPredicates = true) {
+function makeClient(
+  sessionRow: Record<string, unknown> = {},
+  matchesPredicates = true,
+  rowAfter?: Record<string, unknown>
+) {
   const sessionUpdates: Record<string, unknown>[] = [];
   const threadMessages: Record<string, unknown>[] = [];
+  let reads = 0;
 
   const client = {
     from(table: string) {
@@ -234,15 +263,20 @@ function makeClient(sessionRow: Record<string, unknown> = {}, matchesPredicates 
         return {
           select: () => ({
             eq: () => ({
-              maybeSingle: async () => ({
-                data: {
-                  metadata: { taskDescription: 'review #485' },
-                  lifecycle: 'running',
-                  ended_at: null,
-                  ...sessionRow,
-                },
-                error: null,
-              }),
+              maybeSingle: async () => {
+                // The re-read after a zero-row match sees the row as it is
+                // NOW, which is the whole point of going back to look.
+                const row = reads++ === 0 ? sessionRow : (rowAfter ?? sessionRow);
+                return {
+                  data: {
+                    metadata: { taskDescription: 'review #485' },
+                    lifecycle: 'running',
+                    ended_at: null,
+                    ...row,
+                  },
+                  error: null,
+                };
+              },
             }),
           }),
           // Mirrors PostgREST: filters accumulate, `.select()` resolves to the
@@ -264,11 +298,6 @@ function makeClient(sessionRow: Record<string, unknown> = {}, matchesPredicates 
                 if (conditional && !matchesPredicates) return { data: [], error: null };
                 sessionUpdates.push({ id: filters[0]?.[1], ...values });
                 return { data: [{ id: filters[0]?.[1] }], error: null };
-              },
-              // Unconditional metadata-only write (no `.select()`).
-              then(resolve: (v: unknown) => void) {
-                sessionUpdates.push({ id: filters[0]?.[1], ...values });
-                resolve({ error: null });
               },
             };
             return builder;
@@ -453,22 +482,55 @@ describe('interruptActiveRuns', () => {
    */
   describe('racing the child’s own completion write', () => {
     it('does not overwrite a row that terminalized between the read and the write', async () => {
-      const { client, sessionUpdates } = makeClient({ lifecycle: 'running' }, false);
+      const { client, sessionUpdates } = makeClient({ lifecycle: 'running' }, false, {
+        lifecycle: 'completed',
+        ended_at: '2026-08-13T07:00:00.000Z',
+      });
       const [outcome] = await interruptActiveRuns(client, [run()]);
 
-      expect(outcome.alreadyTerminal).toBe(true);
+      expect(outcome.state).toBe('finalized-elsewhere');
       // Only the breadcrumb write — no lifecycle/status downgrade.
       const wrote = sessionUpdates.find((u) => 'lifecycle' in u);
       expect(wrote).toBeUndefined();
     });
 
     it('still records the breadcrumb after losing that race', async () => {
-      const { client, sessionUpdates } = makeClient({ lifecycle: 'running' }, false);
+      const { client, sessionUpdates } = makeClient({ lifecycle: 'running' }, false, {
+        lifecycle: 'completed',
+        ended_at: '2026-08-13T07:00:00.000Z',
+      });
       const [outcome] = await interruptActiveRuns(client, [run()]);
 
       expect(outcome.marked).toBe(true);
       const metadata = sessionUpdates[0]?.metadata as Record<string, unknown>;
       expect(metadata.interruptedReason).toBe(INTERRUPT_REASON);
+    });
+
+    /**
+     * Zero matches does not prove the session finished. A normal finalizer
+     * writing `idle` produces the same zero-row result, and labelling it
+     * terminal would be a claim we never checked (Lumen, PR #490 round 3).
+     */
+    it('classifies a normal idle finalizer as finalized-elsewhere, not terminal', async () => {
+      const { client } = makeClient({ lifecycle: 'running' }, false, {
+        lifecycle: 'idle',
+        ended_at: null,
+      });
+      const [outcome] = await interruptActiveRuns(client, [run()]);
+      expect(outcome.state).toBe('finalized-elsewhere');
+    });
+
+    // Zero matches while the row still reads running is a contradiction.
+    // Guessing which way would be inventing a fact.
+    it('reports unknown when the row still reads running after a zero-row match', async () => {
+      const { client, sessionUpdates } = makeClient({ lifecycle: 'running' }, false, {
+        lifecycle: 'running',
+        ended_at: null,
+      });
+      const [outcome] = await interruptActiveRuns(client, [run()]);
+
+      expect(outcome).toMatchObject({ state: 'unknown', marked: false });
+      expect(sessionUpdates).toHaveLength(0);
     });
 
     it('constrains the write to running and unended rows', async () => {
@@ -576,6 +638,25 @@ describe('interruptActiveRuns', () => {
 
     const [outcome] = await interruptActiveRuns(client, [run()]);
     expect(outcome).toMatchObject({ marked: false, alreadyTerminal: false });
+  });
+
+  /**
+   * A drain that timed out means a lifecycle write may still land on top of
+   * ours. The write itself succeeded, but we cannot promise the state will
+   * still say that a moment later — so the notice must not (Lumen, r3).
+   */
+  it('downgrades a successful interrupt to unknown when the drain timed out', async () => {
+    const { client, threadMessages } = makeClient();
+    const [outcome] = await interruptActiveRuns(client, [run()], 3_000, false);
+
+    expect(outcome).toMatchObject({ state: 'unknown', marked: true });
+    expect(String(threadMessages[0]!.content)).toContain('unreliable');
+  });
+
+  it('keeps a clean interrupt as interrupted when the drain completed', async () => {
+    const { client } = makeClient();
+    const [outcome] = await interruptActiveRuns(client, [run()], 3_000, true);
+    expect(outcome.state).toBe('interrupted');
   });
 
   it('is a no-op with nothing in flight', async () => {

@@ -32,13 +32,17 @@ export const INTERRUPT_REASON = 'server-shutdown';
  * notice is allowed to promise.
  *
  * - `interrupted` — the row was running and we moved it to idle/resumable.
- * - `already-terminal` — it had (or concurrently reached) a terminal state of
- *   its own, and we left that alone.
- * - `unknown` — we could not read or could not write it. Notably NOT the same
- *   as `already-terminal`: claiming the session completed when we simply could
- *   not tell is its own false statement.
+ * - `finalized-elsewhere` — it left `running` under its own power before we
+ *   got there. That covers a child's own `completed`/`failed`, and equally a
+ *   normal finalizer writing `idle`. Named for what we observed rather than
+ *   `already-terminal`, which claimed more than a zero-row match proves
+ *   (Lumen, PR #490 round 3).
+ * - `unknown` — we could not read it, could not write it, the row is gone, or
+ *   it still reads as running after our conditional write matched nothing.
+ *   Deliberately NOT folded into the above: asserting a session finished when
+ *   we could not tell is its own false statement.
  */
-export type InterruptState = 'interrupted' | 'already-terminal' | 'unknown';
+export type InterruptState = 'interrupted' | 'finalized-elsewhere' | 'unknown';
 
 export interface InterruptOutcome {
   sessionId: string;
@@ -51,8 +55,37 @@ export interface InterruptOutcome {
   marked: boolean;
   /** Someone was told. False when the run had no thread to post into. */
   noticed: boolean;
-  /** Convenience alias for `state === 'already-terminal'`. */
+  /** Convenience alias for `state === 'finalized-elsewhere'`. */
   alreadyTerminal: boolean;
+}
+
+/**
+ * Write the interruption breadcrumb without touching lifecycle, checking that
+ * it actually hit a row.
+ *
+ * `.select('id')` is not decoration: an update matching zero rows returns no
+ * error, so an unchecked write on a missing session would be reported as
+ * successful bookkeeping that never happened.
+ */
+async function writeBreadcrumb(
+  client: any,
+  sessionId: string,
+  metadata: Record<string, unknown>
+): Promise<boolean> {
+  const { data, error } = await client
+    .from('sessions')
+    .update({ metadata })
+    .eq('id', sessionId)
+    .select('id');
+
+  if (error) {
+    logger.error('[Shutdown] Failed to record interruption breadcrumb', {
+      sessionId,
+      error: error.message,
+    });
+    return false;
+  }
+  return Boolean(data && data.length > 0);
 }
 
 /**
@@ -91,10 +124,10 @@ function noticeContent(run: ActiveRun, outcome: InterruptOutcome): string {
     );
   }
 
-  if (outcome.state === 'already-terminal') {
+  if (outcome.state === 'finalized-elsewhere') {
     return (
-      `${head}\n\nThe session had already recorded a terminal state, so it is ` +
-      `left as-is rather than reopened. Any reply it was mid-way through ` +
+      `${head}\n\nThe session had already left the running state on its own, so ` +
+      `it is left as-is rather than reopened. Any reply it was mid-way through ` +
       `sending may not have arrived — check before assuming it did.`
     );
   }
@@ -148,15 +181,16 @@ async function transitionSession(
       interruptedReason: INTERRUPT_REASON,
     };
 
-    if (isAlreadyTerminal(existing || {})) {
-      const { error } = await client.from('sessions').update({ metadata }).eq('id', sessionId);
-      if (error) {
-        logger.error('[Shutdown] Failed to record interruption breadcrumb', {
-          sessionId,
-          error: error.message,
-        });
-      }
-      return { state: 'already-terminal', marked: !error };
+    if (!existing) {
+      logger.error('[Shutdown] Session row not found; nothing to terminalize', { sessionId });
+      return { state: 'unknown', marked: false };
+    }
+
+    if (isAlreadyTerminal(existing)) {
+      return {
+        state: 'finalized-elsewhere',
+        marked: await writeBreadcrumb(client, sessionId, metadata),
+      };
     }
 
     // Conditional write. The predicates are evaluated atomically with the
@@ -181,14 +215,41 @@ async function transitionSession(
     }
 
     if (!changed || changed.length === 0) {
-      // Lost the race: the row stopped being running-and-unended between the
-      // read and the write. Whatever it became, it is not ours to overwrite.
-      logger.info('[Shutdown] Session terminalized itself mid-interrupt', { sessionId });
-      const { error: crumbError } = await client
+      // Zero matches does NOT prove the session finished. It could equally be
+      // a normal finalizer having written `idle`, or the row being gone. Go
+      // and look rather than labelling every miss the same way (Lumen, PR
+      // #490 round 3).
+      const { data: after, error: recheckError } = await client
         .from('sessions')
-        .update({ metadata })
-        .eq('id', sessionId);
-      return { state: 'already-terminal', marked: !crumbError };
+        .select('lifecycle, ended_at')
+        .eq('id', sessionId)
+        .maybeSingle();
+
+      if (recheckError || !after) {
+        logger.error('[Shutdown] Could not classify a zero-row interrupt', {
+          sessionId,
+          error: recheckError?.message ?? 'row not found',
+        });
+        return { state: 'unknown', marked: false };
+      }
+
+      if (after.lifecycle === 'running' && !after.ended_at) {
+        // The predicates should have matched. Something is contradicting us,
+        // and guessing which way would be inventing a fact.
+        logger.error('[Shutdown] Session still reads running after a zero-row interrupt', {
+          sessionId,
+        });
+        return { state: 'unknown', marked: false };
+      }
+
+      logger.info('[Shutdown] Session left running under its own power mid-interrupt', {
+        sessionId,
+        lifecycle: after.lifecycle,
+      });
+      return {
+        state: 'finalized-elsewhere',
+        marked: await writeBreadcrumb(client, sessionId, metadata),
+      };
     }
 
     return { state: 'interrupted', marked: true };
@@ -210,7 +271,8 @@ async function transitionSession(
 export async function interruptActiveRuns(
   client: any,
   runs: ActiveRun[],
-  timeoutMs = 3_000
+  timeoutMs = 3_000,
+  drained = true
 ): Promise<InterruptOutcome[]> {
   if (runs.length === 0) return [];
 
@@ -229,9 +291,16 @@ export async function interruptActiveRuns(
     };
 
     const { state, marked } = await transitionSession(client, run.sessionId);
-    outcome.state = state;
     outcome.marked = marked;
-    outcome.alreadyTerminal = state === 'already-terminal';
+
+    // A drain that timed out means a lifecycle write may still be in flight
+    // and could land on top of what we just wrote. We cannot claim the
+    // session is cleanly resumable when something might contradict it a
+    // moment later, so the honest report is 'unknown' (Lumen, PR #490 round
+    // 3). A session that had already left `running` is unaffected: we did not
+    // write its lifecycle either way.
+    outcome.state = !drained && state === 'interrupted' ? 'unknown' : state;
+    outcome.alreadyTerminal = outcome.state === 'finalized-elsewhere';
 
     // No thread means no addressable audience — a bare trigger has no sender
     // to post back to. The logs in transitionSession are the record there.

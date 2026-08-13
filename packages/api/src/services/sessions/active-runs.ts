@@ -84,6 +84,38 @@ export function clearActiveRun(sessionId: string): void {
   active.delete(sessionId);
 }
 
+export interface DrainResult {
+  runs: ActiveRun[];
+  /**
+   * False when the drain gave up before every outstanding write settled. A
+   * racing write may still land after the interruption, so nothing downstream
+   * may claim certainty about the state it left behind.
+   */
+  drained: boolean;
+}
+
+/**
+ * May a session lifecycle write proceed?
+ *
+ * False once shutdown has begun. An already-admitted runner can return AFTER
+ * the drain snapshot and try to finalize; because `SessionRepository.update`
+ * rewrites the whole metadata blob from a snapshot taken at the start of the
+ * call, that late write would both override the interruption's lifecycle and
+ * erase its breadcrumb (Lumen, PR #490 round 3). Closing intake stops new
+ * turns; this stops late writes from turns already in flight.
+ *
+ * The cost is the backendSessionId link from a turn that finished in that
+ * window. That is worth less than the interruption record it would destroy:
+ * the session still resumes with its Inkwell-side context.
+ */
+export function admitStateWrite(sessionId: string): boolean {
+  if (!intakeOpen) {
+    logger.warn('[ActiveRuns] Refusing a late lifecycle write during shutdown', { sessionId });
+    return false;
+  }
+  return true;
+}
+
 /**
  * Wrap a session lifecycle write so the drain can wait for it.
  *
@@ -122,8 +154,9 @@ export function isIntakeOpen(): boolean {
  *   or hung write must not consume that budget — on timeout we proceed with
  *   whatever is registered, which is strictly better than reporting nothing.
  */
-export async function closeIntakeAndDrain(timeoutMs = 2_000): Promise<ActiveRun[]> {
+export async function closeIntakeAndDrain(timeoutMs = 2_000): Promise<DrainResult> {
   intakeOpen = false;
+  let drained = true;
 
   const outstanding = [...inFlightWrites];
   if (outstanding.length > 0) {
@@ -140,6 +173,7 @@ export async function closeIntakeAndDrain(timeoutMs = 2_000): Promise<ActiveRun[
     if (timer) clearTimeout(timer);
 
     if (settled === 'timeout') {
+      drained = false;
       logger.error('[ActiveRuns] Drain timed out; interrupting against a racing write', {
         outstanding: outstanding.length,
         timeoutMs,
@@ -147,7 +181,7 @@ export async function closeIntakeAndDrain(timeoutMs = 2_000): Promise<ActiveRun[
     }
   }
 
-  return listActiveRuns();
+  return { runs: listActiveRuns(), drained };
 }
 
 /** Test seam. Not used in production paths. */
