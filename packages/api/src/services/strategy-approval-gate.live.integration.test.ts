@@ -17,13 +17,22 @@
  * - claude CLI installed with valid credentials
  * - Inkwell server running (default localhost:3001, override via PCP_SERVER_URL)
  * - Valid access token in ~/.ink/auth.json
- * - Supabase credentials (.env.local or env vars)
+ * - Supabase credentials (.env.local or env vars), pointing at LOCALHOST —
+ *   this suite mutates DB rows (task groups, tasks, activity, memories,
+ *   inbox/thread rows). A remote SUPABASE_URL is refused unless
+ *   INK_ALLOW_REMOTE_INTEGRATION_DB=1 is set explicitly (the live config's
+ *   setup is guard-free, so the boundary is enforced in this suite's canRun).
+ *
+ * INTENTIONAL (Conor, 2026-08-12): this suite consumes REAL LLM tokens and is
+ * DELIBERATELY excluded from CI. Double-gated for real (Lumen, PR #439 round
+ * 2): collected ONLY by vitest.live.config.ts — the default and DB-integration
+ * configs exclude every live pattern — AND gated on INK_LIVE_TESTS=1. A cost
+ * decision, not an oversight — do not wire it into CI. Token-free DB
+ * integration suites run in CI; live ones never do.
  *
  * Run:
- *   INK_LIVE_TESTS=1 PCP_SERVER_URL=http://localhost:4001 npx vitest run \
- *     --config vitest.integration.db.config.ts \
- *     --root packages/api \
- *     src/services/strategy-approval-gate.live.integration.test.ts
+ *   INK_LIVE_TESTS=1 PCP_SERVER_URL=http://localhost:4001 \
+ *     yarn workspace @inklabs/api test:live src/services/strategy-approval-gate.live.integration.test.ts
  */
 
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
@@ -103,10 +112,36 @@ function inkwellReachable(): boolean {
 
 let TEST_SB_ID: string | undefined;
 
+// DB safety boundary (Lumen, PR #439 round 4): this suite creates and deletes
+// task groups, tasks, activity, memories, and inbox/thread rows directly in
+// Supabase. It used to inherit integration-setup.ts's remote-DB refusal via
+// the DB config; the live config's setup is deliberately guard-free (non-DB
+// live suites must not be aborted by a DB guard), so the boundary lives here:
+// refuse a non-local SUPABASE_URL unless INK_ALLOW_REMOTE_INTEGRATION_DB=1.
+const LOCALHOST_HOSTS = new Set(['localhost', '127.0.0.1', '::1']);
+function supabaseTargetAllowed(): boolean {
+  if (process.env.INK_ALLOW_REMOTE_INTEGRATION_DB === '1') return true;
+  if (!SUPABASE_URL) return false;
+  try {
+    return LOCALHOST_HOSTS.has(new URL(SUPABASE_URL).hostname);
+  } catch {
+    return false;
+  }
+}
+if (process.env.INK_LIVE_TESTS === '1' && SUPABASE_URL && !supabaseTargetAllowed()) {
+  // process.stderr.write, not console.error — vitest swallows module-load
+  // console output for skipped suites, and a silent skip would hide the reason.
+  process.stderr.write(
+    '[strategy-approval-gate.live] Refusing non-local SUPABASE_URL. This suite mutates DB rows. ' +
+      'Set INK_ALLOW_REMOTE_INTEGRATION_DB=1 if you intentionally want a remote target.\n'
+  );
+}
+
 const canRun =
   process.env.INK_LIVE_TESTS === '1' &&
   !!SUPABASE_URL &&
   !!SUPABASE_KEY &&
+  supabaseTargetAllowed() &&
   !!TEST_USER_ID &&
   !!accessToken &&
   claudeAvailable() &&
