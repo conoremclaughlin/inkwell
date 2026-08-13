@@ -1314,6 +1314,43 @@ export function isTerminalSignalToolResult(result: unknown): boolean {
   }
 }
 
+export type ToolLoopDecision = 'continue' | 'stop' | 'relay-then-stop';
+
+/**
+ * Decide what the local-tool loop does after executing an iteration's calls.
+ *
+ * - 'continue': feed results back and let the backend keep working.
+ * - 'stop': end the turn with no further backend call. Only safe when the
+ *   agent terminally signaled — it already knows what it signaled, and
+ *   re-invoking after a terminal signal recreates the multiplied
+ *   signal_status / duplicate-session bug.
+ * - 'relay-then-stop': end the turn, but first show the model this
+ *   iteration's results in one last round-trip whose output is final (its
+ *   ink-tool blocks are NOT executed). Applies when the loop exits at the
+ *   iteration cap or after an iteration where nothing executed: those
+ *   results have not reached the model yet, and dropping them is a silent
+ *   failure — a send_response that errored on the capped iteration reads to
+ *   the agent as delivered, and it exits confidently wrong (the Aug 13
+ *   Telegram audio drop).
+ */
+export function decideToolLoopNext(
+  iterationResults: Array<{ tool: string; status: string; result?: unknown }>,
+  iteration: number,
+  maxIterations: number
+): ToolLoopDecision {
+  const signaledDone = iterationResults.some(
+    (r) => r.tool === 'signal_status' && isTerminalSignalToolResult(r.result)
+  );
+  if (signaledDone) return 'stop';
+  const hasExecutedTools = iterationResults.some(
+    (r) => r.status === 'executed' || r.status === 'approved'
+  );
+  if (!hasExecutedTools || iteration >= maxIterations) {
+    return iterationResults.length > 0 ? 'relay-then-stop' : 'stop';
+  }
+  return 'continue';
+}
+
 function isAbortError(error: unknown): boolean {
   if (!error || typeof error !== 'object') return false;
   const code = (error as { code?: string }).code;
@@ -4908,6 +4945,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
     const MAX_TOOL_LOOP_ITERATIONS = 5;
     let toolLoopIteration = 0;
     let responseText = '';
+    // True while awaiting the final relay round-trip: the loop is ending, but
+    // the last iteration's results still have to reach the model (see
+    // decideToolLoopNext). The relay's output is final — no tool execution.
+    let finalRelay = false;
     let localToolCalls: ReturnType<typeof extractLocalToolCalls> = [];
     let allToolResults: Array<{ tool: string; result: unknown; status: string; args?: unknown }> =
       [];
@@ -4922,6 +4963,14 @@ export async function runChat(options: ChatOptions): Promise<void> {
       }
       if (!responseText) {
         responseText = '(no output)';
+      }
+
+      if (finalRelay) {
+        // Relay output is the turn's final answer. The relay prompt said tool
+        // execution is closed, so any ink-tool blocks emitted anyway are
+        // stripped for display (stripLocalToolBlocks below), never executed.
+        localToolCalls = [];
+        break;
       }
 
       localToolCalls =
@@ -5247,27 +5296,25 @@ export async function runChat(options: ChatOptions): Promise<void> {
       }
       toolLoopIteration++;
 
-      // Check if we should continue the loop
-      const hasExecutedTools = iterationResults.some(
-        (r) => r.status === 'executed' || r.status === 'approved'
+      // Decide the loop's next move. Terminal signal → stop with no further
+      // call (re-invoking after a terminal signal recreates the 4x
+      // signal_status / duplicate-session bug). Cap reached or nothing
+      // executed → one final relay round-trip so this iteration's results
+      // reach the model instead of being silently discarded; its output is
+      // final. Otherwise → normal continuation.
+      const decision = decideToolLoopNext(
+        iterationResults,
+        toolLoopIteration,
+        MAX_TOOL_LOOP_ITERATIONS
       );
-      // A terminal signal_status (completed/blocked) ends the turn immediately —
-      // the agent said it's done. Without this the loop keeps re-invoking the
-      // backend (signal_status counts as an executed tool), and each re-invoke
-      // is a fresh backend/Claude session in which the re-prompted agent just
-      // re-signals completion — the 4x signal_status + duplicate sessions per
-      // heartbeat. This must be checked BEFORE hasExecutedTools so a turn that
-      // both did work and signaled done still stops here.
-      const signaledDone = iterationResults.some(
-        (r) => r.tool === 'signal_status' && isTerminalSignalToolResult(r.result)
-      );
-      if (signaledDone || !hasExecutedTools || toolLoopIteration >= MAX_TOOL_LOOP_ITERATIONS) {
-        if (!signaledDone && toolLoopIteration >= MAX_TOOL_LOOP_ITERATIONS) {
-          printLine(
-            chalk.dim(`(tool loop limit reached — ${MAX_TOOL_LOOP_ITERATIONS} iterations)`)
-          );
-        }
-        break;
+      if (decision === 'stop') break;
+      finalRelay = decision === 'relay-then-stop';
+      if (finalRelay && toolLoopIteration >= MAX_TOOL_LOOP_ITERATIONS) {
+        printLine(
+          chalk.dim(
+            `(tool loop limit reached — ${MAX_TOOL_LOOP_ITERATIONS} iterations; relaying final results)`
+          )
+        );
       }
 
       // Build continuation prompt with tool results and re-invoke backend
@@ -5284,7 +5331,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
       const formatCorrection = localToolCalls.some((c) => c.variantFormat)
         ? '\n\nFORMAT NOTE: your tool calls used <tool_call> XML — the ink runtime executed them this time, but the ONLY supported format is a fenced block:\n```ink-tool\n{"tool":"<name>","args":{...}}\n```\nUse ink-tool fences (bare tool names, no mcp__inkwell__ prefix) from now on.'
         : '';
-      const continuationBody = `[Tool results from previous turn]\n${toolResultsSummary}${formatCorrection}\n\nContinue your response based on these tool results. If you need more tools, emit ink-tool blocks. Otherwise, provide your final answer.`;
+      const continuationBody = finalRelay
+        ? `[Tool results from previous turn]\n${toolResultsSummary}\n\nTOOL LOOP CLOSED: this turn's tool budget is exhausted. Do NOT emit further ink-tool blocks — they will not be executed. Review the results above carefully; if a call failed (an error, a denial, a validation rejection), the action did NOT happen — a failed send_response means the user never received that message, so do not describe it as sent. Provide your final answer now.`
+        : `[Tool results from previous turn]\n${toolResultsSummary}${formatCorrection}\n\nContinue your response based on these tool results. If you need more tools, emit ink-tool blocks. Otherwise, provide your final answer.`;
       // When resuming the same Claude session, the model already holds the full
       // transcript + tool instructions from the seeded turn — send ONLY the
       // delta. Otherwise (stateless backends) re-pack the full envelope so the
@@ -5299,7 +5348,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
       const ranTools = Array.from(new Set(iterationResults.map((r) => r.tool))).join(', ');
       printEvent(
         chalk.dim(
-          `  ⋯ ran ${ranTools} — continuing (${toolLoopIteration}/${MAX_TOOL_LOOP_ITERATIONS})…`
+          finalRelay
+            ? `  ⋯ ran ${ranTools} — relaying final results…`
+            : `  ⋯ ran ${ranTools} — continuing (${toolLoopIteration}/${MAX_TOOL_LOOP_ITERATIONS})…`
         )
       );
       const stopContinuation = inkRepl

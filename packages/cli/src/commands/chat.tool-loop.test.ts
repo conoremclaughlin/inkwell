@@ -1,11 +1,17 @@
 import { describe, it, expect } from 'vitest';
-import { isTerminalSignalToolResult } from './chat.js';
+import { isTerminalSignalToolResult, decideToolLoopNext } from './chat.js';
 
 /**
  * Regression for the per-heartbeat multiplication: one ink spawn was emitting
  * signal_status(completed) 4x and opening 5 backend/Claude sessions, because the
  * local-tool loop re-invoked the backend as long as any tool executed — and
  * signal_status counts. A terminal signal must stop the loop.
+ *
+ * And regression for the Aug 13 silent drop: the loop executed the capped
+ * iteration's tools, then broke without relaying their results — a
+ * send_response that failed validation on iteration 5/5 read to the agent as
+ * delivered. Exits at the cap (or after an iteration where nothing executed)
+ * must relay the pending results in one final round-trip.
  */
 
 // Shape a signal_status result the way handleClientLocalTool returns it.
@@ -44,27 +50,10 @@ describe('isTerminalSignalToolResult', () => {
   });
 });
 
-// Mirror the loop's stop decision (chat.ts): stop on a terminal signal OR when
-// no tool executed OR at the iteration cap. This is the exact predicate the fix
-// added, isolated so the multiplication regression is guarded directly.
-function shouldStop(
-  iterationResults: Array<{ tool: string; status: string; result?: unknown }>,
-  iteration: number,
-  max: number
-): boolean {
-  const hasExecutedTools = iterationResults.some(
-    (r) => r.status === 'executed' || r.status === 'approved'
-  );
-  const signaledDone = iterationResults.some(
-    (r) => r.tool === 'signal_status' && isTerminalSignalToolResult(r.result)
-  );
-  return signaledDone || !hasExecutedTools || iteration >= max;
-}
-
-describe('tool-loop stop decision', () => {
+describe('decideToolLoopNext', () => {
   const MAX = 5;
 
-  it('STOPS the iteration that signals completed, even alongside real work', () => {
+  it('STOPS (no relay) the iteration that signals completed, even alongside real work', () => {
     // The exact 3 PM heartbeat shape: real tools AND a completion signal.
     const results = [
       { tool: 'list_calendar_events', status: 'executed' },
@@ -72,12 +61,12 @@ describe('tool-loop stop decision', () => {
       { tool: 'remember', status: 'executed' },
       { tool: 'signal_status', status: 'executed', result: signalResult('completed') },
     ];
-    expect(shouldStop(results, 2, MAX)).toBe(true);
+    expect(decideToolLoopNext(results, 2, MAX)).toBe('stop');
   });
 
   it('CONTINUES when the agent only did work and did not signal (real agentic step)', () => {
     const results = [{ tool: 'list_emails', status: 'executed' }];
-    expect(shouldStop(results, 1, MAX)).toBe(false);
+    expect(decideToolLoopNext(results, 1, MAX)).toBe('continue');
   });
 
   it('CONTINUES on a non-terminal continuing signal', () => {
@@ -85,15 +74,36 @@ describe('tool-loop stop decision', () => {
       { tool: 'read', status: 'executed' },
       { tool: 'signal_status', status: 'executed', result: signalResult('continuing') },
     ];
-    expect(shouldStop(results, 2, MAX)).toBe(false);
+    expect(decideToolLoopNext(results, 2, MAX)).toBe('continue');
   });
 
-  it('STOPS when no tool executed (nothing to reason about)', () => {
-    expect(shouldStop([{ tool: 'list_emails', status: 'blocked' }], 1, MAX)).toBe(true);
+  it('RELAYS then stops when no tool executed — the model must hear the denial', () => {
+    expect(decideToolLoopNext([{ tool: 'list_emails', status: 'blocked' }], 1, MAX)).toBe(
+      'relay-then-stop'
+    );
+    expect(decideToolLoopNext([{ tool: 'bash', status: 'denied' }], 1, MAX)).toBe(
+      'relay-then-stop'
+    );
+    expect(decideToolLoopNext([{ tool: 'bash', status: 'error' }], 1, MAX)).toBe('relay-then-stop');
   });
 
-  it('STOPS at the iteration cap as a backstop', () => {
-    expect(shouldStop([{ tool: 'read', status: 'executed' }], MAX, MAX)).toBe(true);
+  it('RELAYS then stops at the iteration cap — capped results must reach the model', () => {
+    // The Aug 13 shape: send_response executed on iteration 5/5 with a
+    // validation-error result. Pre-fix this was a plain break, and the agent
+    // exited believing the message was delivered.
+    const results = [{ tool: 'send_response', status: 'executed' }];
+    expect(decideToolLoopNext(results, MAX, MAX)).toBe('relay-then-stop');
+  });
+
+  it('terminal signal wins over the cap (no relay after a signaled-done iteration)', () => {
+    const results = [
+      { tool: 'signal_status', status: 'executed', result: signalResult('completed') },
+    ];
+    expect(decideToolLoopNext(results, MAX, MAX)).toBe('stop');
+  });
+
+  it('stops without relay when there is nothing to relay', () => {
+    expect(decideToolLoopNext([], MAX, MAX)).toBe('stop');
   });
 
   it('a completed turn no longer runs the full 5 iterations (regression)', () => {
@@ -113,9 +123,30 @@ describe('tool-loop stop decision', () => {
               { tool: 'signal_status', status: 'executed', result: signalResult('completed') },
             ];
       if (iteration >= 2) signalCalls.push('completed');
-      if (shouldStop(results, iteration, MAX)) break;
+      if (decideToolLoopNext(results, iteration, MAX) !== 'continue') break;
     }
     expect(backendInvocations).toBe(2); // was 5 pre-fix
     expect(signalCalls).toEqual(['completed']); // was ['completed','completed','completed','completed']
+  });
+
+  it('a capped turn makes exactly one relay round-trip, then ends (no relay loop)', () => {
+    // Simulate the chat.ts loop shape: a relay is one more backend call whose
+    // output is never parsed for tools — even if the model emits blocks anyway.
+    const MAX_ITER = 5;
+    let backendCalls = 1; // the initial delivery call
+    let iteration = 0;
+    let finalRelay = false;
+    while (true) {
+      if (finalRelay) break; // relay output is final — no extraction, no execution
+      // every backend response emits another tool call (busy agent)
+      iteration += 1;
+      const results = [{ tool: 'get_artifact', status: 'executed' }];
+      const decision = decideToolLoopNext(results, iteration, MAX_ITER);
+      if (decision === 'stop') break;
+      finalRelay = decision === 'relay-then-stop';
+      backendCalls += 1; // continuation or relay round-trip
+    }
+    expect(iteration).toBe(MAX_ITER); // executed exactly the cap
+    expect(backendCalls).toBe(MAX_ITER + 1); // delivery + 4 continuations + 1 relay
   });
 });
