@@ -223,7 +223,7 @@ const MODEL_CHOICES: Record<string, ModelChoice[]> = {
   // ink chat drives one of the backends below, so its model choices are
   // whatever that backend offers. Listed as Default because awaken doesn't
   // pick the underlying backend for you — `ink chat` resolves it.
-  ink: [{ label: 'Default', note: "the ink chat session's own backend default" }],
+  ink: [{ label: 'Default', note: "the ink chat session's provider default" }],
   claude: [
     { label: 'Default', note: "whatever the Claude CLI picks — tracks Anthropic's releases" },
     { label: 'Opus', model: 'opus', note: 'most capable; slower, pricier' },
@@ -253,7 +253,7 @@ const MODEL_HINTS: Record<string, string> = {
 function describeModelChoices(backendName: string): string {
   const choices = MODEL_CHOICES[backendName] ?? [];
   const lines = choices.map((c) => {
-    const value = c.model ?? '(none — backend default)';
+    const value = c.model ?? '(none — provider default)';
     return `    ${c.label.padEnd(16)} ${value}${c.note ? chalk.dim(`  · ${c.note}`) : ''}`;
   });
 
@@ -512,7 +512,7 @@ export function registerAwakenCommand(program: Command): void {
     )
     .option(
       '-m, --model <model>',
-      'Model to awaken on. Omit to use the backend default (recommended).'
+      'Model to awaken on. Omit to use the provider default (recommended).'
     )
     .option('-v, --verbose', 'Show the awakening prompt and debug info')
     .addHelpText(
@@ -522,7 +522,7 @@ export function registerAwakenCommand(program: Command): void {
         AWAKEN_TARGETS.map((b) => `  ${b}\n${describeModelChoices(b)}`).join('\n') +
         chalk.dim(
           '\n\n  --model takes any string; the list above is a shortcut, not a whitelist.\n' +
-            '  Omitting it lets the backend choose, which tracks its releases instead of\n' +
+            '  Omitting it lets the provider choose, which tracks its releases instead of\n' +
             '  pinning new SBs to whatever was current when this list was written.\n'
         )
     )
