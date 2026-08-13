@@ -2351,25 +2351,37 @@ describe('handleGetInbox — channelPoll thread paging via get_unread_thread_can
     expect(parsed.unreadThreadsTruncated).toBe(true);
   });
 
-  it('a RESOLVED participant-query error ({data:null,error}) surfaces as incomplete — not drained', async () => {
-    // PostgREST failures resolve, they do not throw: without checked reads
-    // this poll returned success:true with zero threads and the plugin
-    // emitted its drain summary during an outage.
-    const mockSb = createScopedPollMockSupabase({
-      tableErrors: { inbox_thread_participants: 'connection reset by peer' },
-    });
-    const result = await handleGetInbox(
+  it('no participant pre-scan and no client-side id list — the URI-too-long regression', async () => {
+    // The old flow scanned inbox_thread_participants (unfiltered on the
+    // agent-less mission path), collected EVERY thread id, and fed them to
+    // .in('id', ...) — PostgREST puts that in the URL, so a few hundred
+    // threads produced HTTP 414 and a silently empty mission timeline.
+    // The recency page now filters membership with an !inner join instead.
+    const mockSb = createScopedPollMockSupabase();
+    await handleGetInbox(
+      { email: 'test@test.com', agentId: 'wren' },
+      createMockDataComposer(mockSb as never) as never
+    );
+    const tablesTouched = (mockSb.from as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0]);
+    // No standalone participant scan (allParts would only run with a page).
+    expect(tablesTouched).not.toContain('inbox_thread_participants');
+    // Membership filtered in SQL via the embedded join, not an id list.
+    expect(mockSb.getEqCalls()['inbox_threads']).toContainEqual([
+      'inbox_thread_participants.agent_id',
+      'wren',
+    ]);
+  });
+
+  it('channelPoll goes straight to the candidacy RPC — no pre-scan gate', async () => {
+    const mockSb = createScopedPollMockSupabase();
+    const rpcCalls = withCandidates(mockSb, []);
+    await handleGetInbox(
       { email: 'test@test.com', channelPoll: true },
       createMockDataComposer(mockSb as never) as never
     );
-    const parsed = JSON.parse(result.content[0].text);
-    expect(parsed.success).toBe(true);
-    expect(parsed.channelPollIncomplete).toBe(true);
-    // The RPC must not even run off a failed participant scan.
-    expect((mockSb as { rpc: ReturnType<typeof vi.fn> }).rpc).not.toHaveBeenCalledWith(
-      'get_unread_thread_candidates',
-      expect.anything()
-    );
+    expect(rpcCalls.some((c) => c.fn === 'get_unread_thread_candidates')).toBe(true);
+    const tablesTouched = (mockSb.from as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0]);
+    expect(tablesTouched).not.toContain('inbox_thread_participants');
   });
 
   it('a RESOLVED thread-messages error turns candidates into incomplete, not zero unread', async () => {
