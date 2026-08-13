@@ -32,6 +32,11 @@ export interface Studio {
   defaultProjectId: string | null;
   status: StudioStatus;
   metadata: Json;
+  /** Occupancy record — see StudioLeaseService. Null = vacant. */
+  lease: Json | null;
+  ephemeral: boolean;
+  parentStudioId: string | null;
+  expiresAt: string | null;
   createdAt: string;
   updatedAt: string;
   archivedAt: string | null;
@@ -51,6 +56,9 @@ export interface CreateStudioInput {
   workType?: WorkType;
   roleTemplate?: string;
   defaultProjectId?: string | null;
+  ephemeral?: boolean;
+  parentStudioId?: string | null;
+  expiresAt?: string | null;
   metadata?: Json;
 }
 
@@ -65,7 +73,8 @@ export interface UpdateStudioInput {
   defaultProjectId?: string | null;
   metadata?: Json;
   archivedAt?: string;
-  cleanedAt?: string;
+  cleanedAt?: string | null;
+  expiresAt?: string | null;
   routePatterns?: string[];
 }
 
@@ -101,6 +110,10 @@ export class StudiosRepository {
       defaultProjectId: (row.default_project_id as string) || null,
       status: row.status as StudioStatus,
       metadata: (row.metadata as Json) || {},
+      lease: (row.lease as Json) ?? null,
+      ephemeral: Boolean(row.ephemeral),
+      parentStudioId: (row.parent_studio_id as string) || null,
+      expiresAt: (row.expires_at as string) || null,
       createdAt: row.created_at as string,
       updatedAt: row.updated_at as string,
       archivedAt: (row.archived_at as string) || null,
@@ -126,6 +139,9 @@ export class StudiosRepository {
       work_type: input.workType,
       role_template: input.roleTemplate,
       default_project_id: input.defaultProjectId ?? null,
+      ephemeral: input.ephemeral ?? false,
+      parent_studio_id: input.parentStudioId ?? null,
+      expires_at: input.expiresAt ?? null,
       slug: deriveStudioSlug(input.worktreePath),
       status: 'active',
       metadata: input.metadata || {},
@@ -286,6 +302,7 @@ export class StudiosRepository {
     if (input.metadata !== undefined) updateData.metadata = input.metadata;
     if (input.archivedAt !== undefined) updateData.archived_at = input.archivedAt;
     if (input.cleanedAt !== undefined) updateData.cleaned_at = input.cleanedAt;
+    if (input.expiresAt !== undefined) updateData.expires_at = input.expiresAt;
     if (input.routePatterns !== undefined) updateData.route_patterns = input.routePatterns;
 
     const { data, error } = await this.client

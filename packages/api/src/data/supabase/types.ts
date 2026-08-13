@@ -3104,6 +3104,58 @@ export type Database = {
           },
         ];
       };
+      studio_lease_events: {
+        Row: {
+          agent_id: string | null;
+          created_at: string;
+          detail: Json;
+          event: string;
+          id: string;
+          reason: string | null;
+          session_id: string | null;
+          studio_id: string;
+          thread_key: string | null;
+          user_id: string;
+        };
+        Insert: {
+          agent_id?: string | null;
+          created_at?: string;
+          detail?: Json;
+          event: string;
+          id?: string;
+          reason?: string | null;
+          session_id?: string | null;
+          studio_id: string;
+          thread_key?: string | null;
+          user_id: string;
+        };
+        Update: {
+          agent_id?: string | null;
+          created_at?: string;
+          detail?: Json;
+          event?: string;
+          id?: string;
+          reason?: string | null;
+          session_id?: string | null;
+          studio_id?: string;
+          thread_key?: string | null;
+          user_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'studio_lease_events_studio_id_fkey';
+            columns: ['studio_id'];
+            referencedRelation: 'studios';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'studio_lease_events_user_id_fkey';
+            columns: ['user_id'];
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
       studios: {
         Row: {
           agent_id: string | null;
@@ -3113,8 +3165,12 @@ export type Database = {
           cleaned_at: string | null;
           created_at: string | null;
           default_project_id: string | null;
+          ephemeral: boolean;
+          expires_at: string | null;
           id: string;
+          lease: Json | null;
           metadata: Json | null;
+          parent_studio_id: string | null;
           permissions: Json;
           purpose: string | null;
           repo_root: string;
@@ -3138,8 +3194,12 @@ export type Database = {
           cleaned_at?: string | null;
           created_at?: string | null;
           default_project_id?: string | null;
+          ephemeral?: boolean;
+          expires_at?: string | null;
           id?: string;
+          lease?: Json | null;
           metadata?: Json | null;
+          parent_studio_id?: string | null;
           permissions?: Json;
           purpose?: string | null;
           repo_root: string;
@@ -3163,8 +3223,12 @@ export type Database = {
           cleaned_at?: string | null;
           created_at?: string | null;
           default_project_id?: string | null;
+          ephemeral?: boolean;
+          expires_at?: string | null;
           id?: string;
+          lease?: Json | null;
           metadata?: Json | null;
+          parent_studio_id?: string | null;
           permissions?: Json;
           purpose?: string | null;
           repo_root?: string;
@@ -3185,6 +3249,12 @@ export type Database = {
             foreignKeyName: 'studios_default_project_id_fkey';
             columns: ['default_project_id'];
             referencedRelation: 'projects';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'studios_parent_studio_id_fkey';
+            columns: ['parent_studio_id'];
+            referencedRelation: 'studios';
             referencedColumns: ['id'];
           },
           {

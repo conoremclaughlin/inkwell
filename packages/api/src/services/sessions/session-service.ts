@@ -48,6 +48,9 @@ import { classifyError } from '@inklabs/shared';
 import { serializeError } from '../../utils/serialize-error.js';
 import { resolveTaskGroupForThreadKey } from '../task-group-resolver.js';
 import { getRunnerFilesDir } from '../sandbox/orchestrator.js';
+import { StudioLeaseService, isLeaseStale } from '../studio-lease.service.js';
+import { StudioOverflowService } from '../studio-overflow.service.js';
+import { StudiosRepository, type Studio } from '../../data/repositories/studios.repository.js';
 import { logger } from '../../utils/logger.js';
 
 /**
@@ -169,6 +172,39 @@ export function parseRuntimeConfig(metadata: unknown): {
   return out;
 }
 
+/**
+ * The routing tier that produced a studio, plus what occupancy did about it.
+ * Stamped into session metadata as `routing_decision` at creation so every
+ * session records why it landed where it did (spec:trigger-studio-routing
+ * §Visibility, carried from studio-routing-rules §Routing Observability).
+ */
+export interface StudioRoutingDecision {
+  studioId?: string;
+  tier:
+    | 'explicit'
+    | 'studio-hint'
+    | 'recipient-session'
+    | 'thread-continuity'
+    | 'route-pattern'
+    | 'repo-root-main'
+    | 'agent-recent'
+    | 'main-fallback'
+    | 'none';
+  /**
+   * True when the tier is an inferred one (route-pattern and below) and the
+   * lease was consulted. Tiers above infer nothing — an explicit studio, a
+   * hint, a session anchor, or thread continuity means the thread already
+   * owns the studio, so occupancy does not gate them (spec v11 §Resolution).
+   */
+  occupancyChecked: boolean;
+  diverted?: {
+    from: string;
+    holderThreadKey: string;
+    holderSessionId: string;
+    via: 'overflow' | 'refused';
+  };
+}
+
 export class SessionService implements ISessionService {
   private repository: ISessionRepository;
   private contextBuilder: IContextBuilder;
@@ -179,6 +215,9 @@ export class SessionService implements ISessionService {
   private activityStream: IActivityStream;
   private config: SessionServiceConfig;
   private supabase: SupabaseClient<Database> | null;
+  private leaseService: StudioLeaseService | null = null;
+  private overflowService: StudioOverflowService | null = null;
+  private studiosRepo: StudiosRepository | null = null;
 
   /**
    * Processing lock per agent session.
@@ -220,6 +259,204 @@ export class SessionService implements ISessionService {
     this.activityStream = activityStream;
     this.config = { ...DEFAULT_CONFIG, ...config };
     this.supabase = supabase || null;
+  }
+
+  private getLeaseService(): StudioLeaseService | null {
+    if (!this.supabase) return null;
+    if (!this.leaseService) {
+      this.leaseService = new StudioLeaseService(this.supabase);
+    }
+    return this.leaseService;
+  }
+
+  private getStudiosRepo(): StudiosRepository | null {
+    if (!this.supabase) return null;
+    if (!this.studiosRepo) {
+      this.studiosRepo = new StudiosRepository(this.supabase);
+    }
+    return this.studiosRepo;
+  }
+
+  private getOverflowService(): StudioOverflowService | null {
+    const studios = this.getStudiosRepo();
+    const leases = this.getLeaseService();
+    if (!studios || !leases) return null;
+    if (!this.overflowService) {
+      this.overflowService = new StudioOverflowService(studios, leases);
+    }
+    return this.overflowService;
+  }
+
+  /**
+   * Occupancy check (spec v11 tier 5a) for studios produced by inferred tiers.
+   * A studio leased by this thread, unleased, or holding only a stale lease
+   * passes through (acquire handles rescue+reclaim of stale holders). A studio
+   * freshly leased by a different thread diverts to the overflow ladder —
+   * never into the occupied worktree.
+   */
+  private async gateOccupancy(
+    candidateStudioId: string,
+    tier: StudioRoutingDecision['tier'],
+    ctx: { userId: string; agentId: string; threadKey?: string }
+  ): Promise<StudioRoutingDecision> {
+    const leases = this.getLeaseService();
+    if (!leases || !ctx.threadKey) {
+      return { studioId: candidateStudioId, tier, occupancyChecked: false };
+    }
+
+    const current = await leases.getLease(candidateStudioId);
+    const holder = current?.lease;
+    if (!holder || holder.threadKey === ctx.threadKey || isLeaseStale(holder)) {
+      return { studioId: candidateStudioId, tier, occupancyChecked: true };
+    }
+
+    logger.info('[StudioResolve] Studio leased by another thread; diverting to overflow', {
+      studioId: candidateStudioId,
+      tier,
+      threadKey: ctx.threadKey,
+      holderThreadKey: holder.threadKey,
+      holderSessionId: holder.sessionId,
+    });
+
+    const overflow = await this.divertToOverflow(candidateStudioId, ctx);
+    if (overflow) {
+      return {
+        studioId: overflow.id,
+        tier,
+        occupancyChecked: true,
+        diverted: {
+          from: candidateStudioId,
+          holderThreadKey: holder.threadKey,
+          holderSessionId: holder.sessionId,
+          via: 'overflow',
+        },
+      };
+    }
+
+    // Overflow creation failed. Never route into the occupied studio — run
+    // studioless (default working directory) and leave a loud trail. Proper
+    // refuse-and-hold is Phase 3b (spec v11 §Refusing to route).
+    logger.error('[StudioResolve] Overflow creation failed; refusing occupied studio', {
+      studioId: candidateStudioId,
+      tier,
+      threadKey: ctx.threadKey,
+      holderThreadKey: holder.threadKey,
+    });
+    await leases.logEvent(ctx.userId, candidateStudioId, 'conflict', {
+      threadKey: ctx.threadKey,
+      agentId: ctx.agentId,
+      reason: `occupied by ${holder.threadKey} and overflow creation failed; session will run studioless`,
+    });
+    return {
+      studioId: undefined,
+      tier,
+      occupancyChecked: true,
+      diverted: {
+        from: candidateStudioId,
+        holderThreadKey: holder.threadKey,
+        holderSessionId: holder.sessionId,
+        via: 'refused',
+      },
+    };
+  }
+
+  private async divertToOverflow(
+    parentStudioId: string,
+    ctx: { userId: string; agentId: string; threadKey?: string }
+  ): Promise<Studio | null> {
+    const overflowService = this.getOverflowService();
+    const studios = this.getStudiosRepo();
+    if (!overflowService || !studios || !ctx.threadKey) return null;
+    const parent = await studios.findById(parentStudioId).catch(() => null);
+    if (!parent) return null;
+    return overflowService.ensureOverflowStudio({
+      userId: ctx.userId,
+      agentId: ctx.agentId,
+      parentStudio: parent,
+      threadKey: ctx.threadKey,
+    });
+  }
+
+  /**
+   * Programmatic lease acquisition — runs on every session resolution with a
+   * threadKey and a studio, whichever path produced the session. The SB never
+   * opts in; routing is what acquires.
+   *
+   * A lost acquire race after a passed occupancy check diverts to overflow
+   * (the loser re-routes rather than retrying into contention). Bypass tiers
+   * that find a foreign holder record a conflict and proceed leaseless —
+   * clobbering a live lease is never an option.
+   */
+  private async withStudioLease(
+    session: Session,
+    routing: StudioRoutingDecision,
+    ctx: { userId: string; agentId: string; threadKey?: string }
+  ): Promise<Session> {
+    const leases = this.getLeaseService();
+    if (!leases || !ctx.threadKey || !session.studioId) return session;
+
+    try {
+      const result = await leases.acquire({
+        studioId: session.studioId,
+        sessionId: session.id,
+        threadKey: ctx.threadKey,
+        agentId: ctx.agentId,
+        userId: ctx.userId,
+        reason: routing.tier,
+      });
+      if (result.acquired) return session;
+
+      if (!routing.occupancyChecked) {
+        await leases.logEvent(ctx.userId, session.studioId, 'conflict', {
+          sessionId: session.id,
+          threadKey: ctx.threadKey,
+          agentId: ctx.agentId,
+          reason: `tier ${routing.tier} resolved a studio leased by ${result.holder.threadKey}`,
+        });
+        logger.warn('[StudioLease] Proceeding without lease — studio held by another thread', {
+          sessionId: session.id,
+          studioId: session.studioId,
+          tier: routing.tier,
+          threadKey: ctx.threadKey,
+          holderThreadKey: result.holder.threadKey,
+        });
+        return session;
+      }
+
+      const overflow = await this.divertToOverflow(session.studioId, ctx);
+      if (!overflow) {
+        logger.error('[StudioLease] Lost acquire race and overflow failed; proceeding leaseless', {
+          sessionId: session.id,
+          studioId: session.studioId,
+          threadKey: ctx.threadKey,
+        });
+        return session;
+      }
+
+      const updated = await this.repository.update(session.id, { studioId: overflow.id });
+      await leases.acquire({
+        studioId: overflow.id,
+        sessionId: session.id,
+        threadKey: ctx.threadKey,
+        agentId: ctx.agentId,
+        userId: ctx.userId,
+        reason: 'overflow-after-lost-race',
+      });
+      logger.info('[StudioLease] Lost acquire race; session diverted to overflow studio', {
+        sessionId: session.id,
+        from: session.studioId,
+        to: overflow.id,
+        threadKey: ctx.threadKey,
+      });
+      return updated;
+    } catch (err) {
+      logger.warn('[StudioLease] Lease acquisition failed (non-fatal)', {
+        sessionId: session.id,
+        studioId: session.studioId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return session;
+    }
   }
 
   async handleMessage(request: SessionRequest): Promise<SessionResult> {
@@ -1066,7 +1303,7 @@ export class SessionService implements ISessionService {
     const type = options?.type || 'primary';
 
     const { backend } = await this.resolveAgentBackend(userId, agentId);
-    const resolvedStudioId = await this.resolveStudioId(userId, agentId, {
+    const routing = await this.resolveStudioId(userId, agentId, {
       threadKey: options?.threadKey,
       explicitStudioId: options?.studioId,
       studioHint: options?.studioHint,
@@ -1074,6 +1311,8 @@ export class SessionService implements ISessionService {
       repoRoot: options?.repoRoot,
       backend,
     });
+    const resolvedStudioId = routing.studioId;
+    const leaseCtx = { userId, agentId, threadKey: options?.threadKey };
 
     // Resolve default_session_id from agent identity. When set, threadKey
     // misses route to this session instead of creating new ones.
@@ -1094,7 +1333,7 @@ export class SessionService implements ISessionService {
             sessionThreadKey: recipientSession.threadKey,
             studioId: recipientSession.studioId || null,
           });
-          return recipientSession;
+          return this.withStudioLease(recipientSession, routing, leaseCtx);
         }
       }
 
@@ -1111,7 +1350,7 @@ export class SessionService implements ISessionService {
             alias: options.alias,
             studioId: aliasMatch.studioId || null,
           });
-          return aliasMatch;
+          return this.withStudioLease(aliasMatch, routing, leaseCtx);
         }
         logger.debug('No session found for alias', {
           alias: options.alias,
@@ -1143,7 +1382,7 @@ export class SessionService implements ISessionService {
             threadKey: options.threadKey,
             studioId: threadMatch.studioId || null,
           });
-          return threadMatch;
+          return this.withStudioLease(threadMatch, routing, leaseCtx);
         }
 
         // Thread-scoped request with no match. If the agent has a default
@@ -1157,7 +1396,7 @@ export class SessionService implements ISessionService {
               threadKey: options.threadKey,
               defaultSessionId,
             });
-            return defaultSession;
+            return this.withStudioLease(defaultSession, routing, leaseCtx);
           }
           logger.debug('default_session_id is set but session is ended/missing; creating new', {
             defaultSessionId,
@@ -1194,7 +1433,7 @@ export class SessionService implements ISessionService {
             backendSessionId: existing.backendSessionId,
             studioId: existing.studioId || null,
           });
-          return existing;
+          return this.withStudioLease(existing, routing, leaseCtx);
         }
       }
     }
@@ -1230,7 +1469,19 @@ export class SessionService implements ISessionService {
       lastCompactionAt: null,
       compactionCount: 0,
       endedAt: null,
-      metadata: {},
+      metadata: {
+        // Which tier fired, what occupancy did about it. Refusals and diverts
+        // are the highest-signal routing events in the system — make them
+        // reconstructable from the session row alone.
+        routing_decision: {
+          tier: routing.tier,
+          studioId: resolvedStudioId ?? null,
+          threadKey: options?.threadKey ?? null,
+          occupancyChecked: routing.occupancyChecked,
+          ...(routing.diverted ? { diverted: { ...routing.diverted } } : {}),
+          resolvedAt: new Date().toISOString(),
+        },
+      },
     });
 
     logger.info('Created new session', {
@@ -1240,9 +1491,10 @@ export class SessionService implements ISessionService {
       type,
       alias: options?.alias || null,
       studioId: resolvedStudioId || null,
+      routingTier: routing.tier,
     });
 
-    return session;
+    return this.withStudioLease(session, routing, leaseCtx);
   }
 
   private async resolveStudioId(
@@ -1256,22 +1508,32 @@ export class SessionService implements ISessionService {
       backend?: string;
       repoRoot?: string;
     }
-  ): Promise<string | undefined> {
+  ): Promise<StudioRoutingDecision> {
+    const leaseCtx = { userId, agentId, threadKey: options.threadKey };
+
     // explicitStudioId takes precedence — it's the precise routing signal.
     if (options.explicitStudioId) {
       if (isMainStudio(options.explicitStudioId)) {
-        return this.resolveMainStudioId(userId, options.repoRoot, agentId);
+        return {
+          studioId: await this.resolveMainStudioId(userId, options.repoRoot, agentId),
+          tier: 'explicit',
+          occupancyChecked: false,
+        };
       }
-      return options.explicitStudioId;
+      return { studioId: options.explicitStudioId, tier: 'explicit', occupancyChecked: false };
     }
 
     if (!this.supabase) {
-      return undefined;
+      return { studioId: undefined, tier: 'none', occupancyChecked: false };
     }
 
     // studioHint is a convenience fallback — only consulted when no explicit studioId.
     if (isMainStudio(options.studioHint)) {
-      return this.resolveMainStudioId(userId, options.repoRoot, agentId);
+      return {
+        studioId: await this.resolveMainStudioId(userId, options.repoRoot, agentId),
+        tier: 'studio-hint',
+        occupancyChecked: false,
+      };
     }
 
     if (options.studioHint) {
@@ -1287,7 +1549,7 @@ export class SessionService implements ISessionService {
         .maybeSingle();
 
       if (namedStudio?.id) {
-        return namedStudio.id;
+        return { studioId: namedStudio.id, tier: 'studio-hint', occupancyChecked: false };
       }
 
       // studioHint was explicit — don't silently fall through to unrelated studios
@@ -1296,7 +1558,7 @@ export class SessionService implements ISessionService {
         agentId,
         studioHint: options.studioHint,
       });
-      return undefined;
+      return { studioId: undefined, tier: 'studio-hint', occupancyChecked: false };
     }
 
     // 1) Related session scope (explicit resume continuity)
@@ -1310,7 +1572,7 @@ export class SessionService implements ISessionService {
 
       const scopedStudioId = data?.studio_id || undefined;
       if (scopedStudioId) {
-        return scopedStudioId;
+        return { studioId: scopedStudioId, tier: 'recipient-session', occupancyChecked: false };
       }
     }
 
@@ -1330,7 +1592,7 @@ export class SessionService implements ISessionService {
 
       const activeThreadStudio = activeThreadSession?.studio_id || undefined;
       if (activeThreadStudio) {
-        return activeThreadStudio;
+        return { studioId: activeThreadStudio, tier: 'thread-continuity', occupancyChecked: false };
       }
 
       const { data: endedThreadSession } = await this.supabase
@@ -1347,7 +1609,7 @@ export class SessionService implements ISessionService {
 
       const endedThreadStudio = endedThreadSession?.studio_id || undefined;
       if (endedThreadStudio) {
-        return endedThreadStudio;
+        return { studioId: endedThreadStudio, tier: 'thread-continuity', occupancyChecked: false };
       }
     }
 
@@ -1394,7 +1656,7 @@ export class SessionService implements ISessionService {
             studioId: matches[0].id,
             specificity: matches[0].specificity,
           });
-          return matches[0].id;
+          return this.gateOccupancy(matches[0].id, 'route-pattern', leaseCtx);
         }
         if (matches.length > 1) {
           logger.warn('[StudioResolve] Ambiguous route pattern match, falling through', {
@@ -1436,7 +1698,7 @@ export class SessionService implements ISessionService {
           agentId,
           studioId: repoRootStudioId,
         });
-        return repoRootStudioId;
+        return this.gateOccupancy(repoRootStudioId, 'repo-root-main', leaseCtx);
       }
     }
 
@@ -1468,7 +1730,7 @@ export class SessionService implements ISessionService {
         agentId,
         studioId: agentStudio.id,
       });
-      return agentStudio.id;
+      return this.gateOccupancy(agentStudio.id, 'agent-recent', leaseCtx);
     }
 
     // NOTE: We intentionally skip "most recent session's studio" as a fallback.
@@ -1483,7 +1745,7 @@ export class SessionService implements ISessionService {
         agentId,
         studioId: mainStudioId,
       });
-      return mainStudioId;
+      return this.gateOccupancy(mainStudioId, 'main-fallback', leaseCtx);
     }
 
     // Codex is worktree-sensitive: keep a deterministic warning when no studio could be resolved.
@@ -1498,7 +1760,7 @@ export class SessionService implements ISessionService {
       );
     }
 
-    return undefined;
+    return { studioId: undefined, tier: 'none', occupancyChecked: false };
   }
 
   private async resolveMainStudioId(
@@ -1798,6 +2060,20 @@ This session will continue with a fresh context after compaction. Your identity,
         endSummary: summary,
       },
     });
+
+    // Automatic lease release — session end is a terminal path, so whatever
+    // studio this session held goes back to the pool without the SB opting in.
+    const leases = this.getLeaseService();
+    if (leases) {
+      await leases
+        .releaseBySession(sessionId, { userId: session.userId, reason: 'session-end' })
+        .catch((err) => {
+          logger.warn('[StudioLease] Release on session end failed', {
+            sessionId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+    }
 
     // Clear stale channel_routes so heartbeat reminders don't route to this ended session
     if (this.supabase) {
