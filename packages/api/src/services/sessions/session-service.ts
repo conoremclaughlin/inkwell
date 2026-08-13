@@ -1348,12 +1348,23 @@ export class SessionService implements ISessionService {
     }
 
     // 5) Agent's own studio (authoritative — from studios table, not session history)
+    //
+    // Archived studios are NOT routing candidates (spec:trigger-studio-routing v5).
+    // Archiving a studio is the operator saying "stop sending work here"; honouring
+    // that only in the tiers above and then resurrecting it in the fallback makes
+    // archival advisory rather than binding.
+    //
+    // Note: resolveMainStudio() below deliberately still accepts 'archived'. It is
+    // scoped to one repo_root/worktree_path and backs an auto-create path guarded by
+    // a unique constraint on (worktree_path, agent_id) — excluding archived there
+    // would miss the row, collide on insert, and miss again on the 23505 retry,
+    // leaving main-studio resolution permanently undefined for that repo.
     const { data: agentStudio } = await this.supabase
       .from('studios')
       .select('id, updated_at')
       .eq('user_id', userId)
       .eq('agent_id', agentId)
-      .in('status', ['active', 'idle', 'archived'])
+      .in('status', ['active', 'idle'])
       .order('updated_at', { ascending: false })
       .limit(1)
       .maybeSingle();

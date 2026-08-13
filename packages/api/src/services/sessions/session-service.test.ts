@@ -2643,6 +2643,129 @@ describe('SessionService', () => {
       );
     });
   });
+
+  describe('archived studios are excluded from routing (spec:trigger-studio-routing v5)', () => {
+    type RecordedCall = { method: string; args: unknown[] };
+
+    function createRecordingChain(terminalResult: unknown, record: RecordedCall[]) {
+      const chain: Record<string, unknown> = {};
+      const chainMethods = ['select', 'eq', 'not', 'is', 'neq', 'in', 'order', 'limit'];
+      for (const m of chainMethods) {
+        chain[m] = vi.fn().mockImplementation((...args: unknown[]) => {
+          record.push({ method: m, args });
+          return chain;
+        });
+      }
+      chain.maybeSingle = vi.fn().mockResolvedValue(terminalResult);
+      chain.single = vi.fn().mockResolvedValue(terminalResult);
+      chain.then = (resolve: (v: unknown) => unknown) =>
+        Promise.resolve(terminalResult).then(resolve);
+      return chain;
+    }
+
+    /**
+     * Archiving a studio means "stop sending work here". Every routing-candidate
+     * query must honour that. The one deliberate exception is resolveMainStudio(),
+     * which is scoped to a single worktree_path and backs an auto-create guarded by
+     * a unique constraint — excluding archived there would miss the row, collide on
+     * insert, and miss again on the 23505 retry, leaving main-studio resolution
+     * permanently undefined for that repo. That query is identified by its
+     * worktree_path filter and exempted below.
+     */
+    it('no unscoped routing query treats archived studios as candidates', async () => {
+      const studioQueries: RecordedCall[][] = [];
+
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          if (table === 'studios') {
+            const calls: RecordedCall[] = [];
+            studioQueries.push(calls);
+            return createRecordingChain({ data: null }, calls);
+          }
+          return createRecordingChain({ data: null }, []);
+        }),
+      };
+
+      const serviceWithSupabase = new SessionService(
+        mockRepository,
+        mockContextBuilder,
+        mockClaudeRunner,
+        mockActivityStream,
+        { defaultWorkingDirectory: '/test', mcpConfigPath: '/test/.mcp.json' },
+        mockCodexRunner,
+        mockSupabase as never
+      );
+
+      // No threadKey, no repoRoot, no studioHint — resolution falls all the way
+      // through to the agent's-own-studio fallback.
+      await serviceWithSupabase.handleMessage(
+        createMockRequest({
+          channel: 'agent',
+          metadata: { triggerType: 'agent', chatType: 'direct' },
+        })
+      );
+
+      const offenders = studioQueries.filter((calls) => {
+        const statusFilter = calls.find((c) => c.method === 'in' && c.args[0] === 'status');
+        if (!statusFilter || !(statusFilter.args[1] as string[]).includes('archived')) {
+          return false;
+        }
+        const isMainStudioLookup = calls.some(
+          (c) => c.method === 'eq' && c.args[0] === 'worktree_path'
+        );
+        return !isMainStudioLookup;
+      });
+
+      expect(offenders).toEqual([]);
+    });
+
+    it("the agent's-own-studio fallback filters to active and idle only", async () => {
+      const studioQueries: RecordedCall[][] = [];
+
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          if (table === 'studios') {
+            const calls: RecordedCall[] = [];
+            studioQueries.push(calls);
+            return createRecordingChain({ data: null }, calls);
+          }
+          return createRecordingChain({ data: null }, []);
+        }),
+      };
+
+      const serviceWithSupabase = new SessionService(
+        mockRepository,
+        mockContextBuilder,
+        mockClaudeRunner,
+        mockActivityStream,
+        { defaultWorkingDirectory: '/test', mcpConfigPath: '/test/.mcp.json' },
+        mockCodexRunner,
+        mockSupabase as never
+      );
+
+      await serviceWithSupabase.handleMessage(
+        createMockRequest({
+          channel: 'agent',
+          metadata: { triggerType: 'agent', chatType: 'direct' },
+        })
+      );
+
+      // Identify the fallback query: filtered by agent_id, ordered by recency,
+      // and not scoped to a repo (which would make it resolveMainStudio).
+      const fallbackQuery = studioQueries.find(
+        (calls) =>
+          calls.some((c) => c.method === 'eq' && c.args[0] === 'agent_id') &&
+          calls.some((c) => c.method === 'order' && c.args[0] === 'updated_at') &&
+          !calls.some((c) => c.method === 'eq' && c.args[0] === 'worktree_path') &&
+          !calls.some((c) => c.method === 'not' && c.args[0] === 'route_patterns')
+      );
+
+      expect(fallbackQuery).toBeDefined();
+      const statusFilter = fallbackQuery!.find((c) => c.method === 'in' && c.args[0] === 'status');
+      expect(statusFilter).toBeDefined();
+      expect(statusFilter!.args[1]).toEqual(['active', 'idle']);
+    });
+  });
 });
 
 describe('summarizeToolArgs', () => {
