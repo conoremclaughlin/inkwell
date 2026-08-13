@@ -107,6 +107,15 @@ describe('registry brackets the persisted running state', () => {
     expect(source.indexOf('clearActiveRun(', postRun)).toBeGreaterThan(postRun);
   });
 
+  // ...and only when that write actually happened. An unconditional clear
+  // after a shutdown-refused write drops the run before the snapshot.
+  it('guards the success-path clear on the write having persisted', () => {
+    const postRun = at('const postRunLifecycle');
+    const clearAt = source.indexOf('clearActiveRun(', postRun);
+    expect(source.slice(postRun, clearAt)).toContain('finalized');
+    expect(source.slice(clearAt - 30, clearAt)).toMatch(/if \(finalized\)\s*$/);
+  });
+
   // The shape that caused P1: a finally fires while the row still says running.
   it('does not clear from a finally around the runner call', () => {
     expect(source).not.toMatch(/finally\s*\{[^}]*clearActiveRun/);
@@ -225,6 +234,41 @@ describe('shutdown handshake', () => {
 
     await closeIntakeAndDrain(20);
     expect(admitStateWrite('sess-1')).toBe(false);
+  });
+
+  /**
+   * The interleaving Lumen asked for (PR #490 round 4).
+   *
+   * A runner finishes WHILE the drain is still waiting on someone else's
+   * write. Its own terminal write is refused by the gate — correctly, or it
+   * would erase the interruption record. But if it then clears itself anyway,
+   * it disappears before the post-drain snapshot and its row stays `running`
+   * with nobody told: the original zombie, reached through the gate built to
+   * prevent it. Clearing must be conditional on a write having persisted.
+   */
+  it('keeps a run whose terminal write was refused mid-drain', async () => {
+    registerActiveRun(run({ sessionId: 'finishes-mid-drain' }));
+
+    // Someone else's write is holding the drain open.
+    let releaseOther!: () => void;
+    trackStateWrite(
+      new Promise<void>((resolve) => {
+        releaseOther = resolve;
+      })
+    );
+
+    const draining = closeIntakeAndDrain(5_000);
+
+    // Our runner returns now. The gate refuses its finalize...
+    const admitted = admitStateWrite('finishes-mid-drain');
+    expect(admitted).toBe(false);
+    // ...so it must NOT clear itself. This mirrors `if (finalized) clearActiveRun(...)`.
+    if (admitted) clearActiveRun('finishes-mid-drain');
+
+    releaseOther();
+    const { runs: snapshot } = await draining;
+
+    expect(snapshot.map((r) => r.sessionId)).toContain('finishes-mid-drain');
   });
 });
 
@@ -511,6 +555,25 @@ describe('interruptActiveRuns', () => {
      * writing `idle` produces the same zero-row result, and labelling it
      * terminal would be a claim we never checked (Lumen, PR #490 round 3).
      */
+    /**
+     * The breadcrumb must merge onto metadata as it is NOW, not the blob read
+     * before the race. `metadata` is one JSONB column, so replaying a stale
+     * snapshot erases whatever the concurrent finalizer wrote (Lumen, r4).
+     */
+    it('does not erase metadata a concurrent finalizer added', async () => {
+      const { client, sessionUpdates } = makeClient({ lifecycle: 'running' }, false, {
+        lifecycle: 'completed',
+        ended_at: '2026-08-13T07:00:00.000Z',
+        metadata: { taskDescription: 'review #485', finalizerWrote: 'usage-checkpoint' },
+      });
+
+      await interruptActiveRuns(client, [run()]);
+
+      const written = sessionUpdates[0]?.metadata as Record<string, unknown>;
+      expect(written.finalizerWrote).toBe('usage-checkpoint');
+      expect(written.interruptedReason).toBe(INTERRUPT_REASON);
+    });
+
     it('classifies a normal idle finalizer as finalized-elsewhere, not terminal', async () => {
       const { client } = makeClient({ lifecycle: 'running' }, false, {
         lifecycle: 'idle',

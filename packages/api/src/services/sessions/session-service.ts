@@ -902,6 +902,7 @@ export class SessionService implements ISessionService {
     // metadata blob from a snapshot taken at its own start, finalizing now
     // would overwrite the interruption's lifecycle AND erase its breadcrumb.
     // Shutdown owns the state from here (Lumen, PR #490 round 3).
+    let finalized = false;
     if (!admitStateWrite(session.id)) {
       logger.warn('Skipping post-run session write; shutdown already recorded this session', {
         sessionId: session.id,
@@ -924,6 +925,7 @@ export class SessionService implements ISessionService {
           cliAttached: false,
         })
       );
+      finalized = true;
     } else {
       await trackStateWrite(
         this.repository.update(session.id, {
@@ -933,13 +935,20 @@ export class SessionService implements ISessionService {
           cliAttached: false,
         })
       );
+      finalized = true;
     }
 
-    // The row is off `running` now, so this turn can no longer be orphaned by
-    // a shutdown. If something throws between runner.run() and here, the run
-    // stays registered — which is correct: the row really is still `running`,
-    // and a later shutdown reporting it as interrupted is the truth.
-    clearActiveRun(session.id);
+    // Cleared ONLY if a terminal state actually persisted. Clearing after a
+    // refused write would delete this run from the registry while its row
+    // still says `running` — and if shutdown is mid-drain and has not
+    // snapshotted yet, the session vanishes from the report and gets no
+    // notice. Exactly the original zombie, reached through the gate meant to
+    // prevent it (Lumen, PR #490 round 4).
+    //
+    // Staying registered is also right when something throws between
+    // runner.run() and here: the row really is still `running`, so a later
+    // shutdown reporting it as interrupted is the truth.
+    if (finalized) clearActiveRun(session.id);
 
     if (result.usage) {
       // Scope the cumulative checkpoint to the backend thread the counts came

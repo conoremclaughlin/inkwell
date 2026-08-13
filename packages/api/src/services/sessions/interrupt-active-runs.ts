@@ -60,21 +60,48 @@ export interface InterruptOutcome {
 }
 
 /**
- * Write the interruption breadcrumb without touching lifecycle, checking that
- * it actually hit a row.
+ * Write the interruption breadcrumb without touching lifecycle.
+ *
+ * Re-reads metadata immediately before writing rather than reusing the blob
+ * from the caller's earlier read. `metadata` is a single JSONB column, so a
+ * write replaces it wholesale — and by the time we get here, a concurrent
+ * finalizer may have added keys of its own. Replaying a pre-race snapshot
+ * would erase them (Lumen, PR #490 round 4).
+ *
+ * This is still read-modify-write, not a true atomic merge: PostgREST has no
+ * way to express `metadata = metadata || '{...}'::jsonb` without an RPC. The
+ * residual window is the round-trip below rather than the whole interruption
+ * sequence, and nothing else writes metadata during shutdown now that late
+ * lifecycle writes are refused.
  *
  * `.select('id')` is not decoration: an update matching zero rows returns no
  * error, so an unchecked write on a missing session would be reported as
  * successful bookkeeping that never happened.
  */
-async function writeBreadcrumb(
-  client: any,
-  sessionId: string,
-  metadata: Record<string, unknown>
-): Promise<boolean> {
+async function writeBreadcrumb(client: any, sessionId: string): Promise<boolean> {
+  const { data: fresh, error: readError } = await client
+    .from('sessions')
+    .select('metadata')
+    .eq('id', sessionId)
+    .maybeSingle();
+
+  if (readError || !fresh) {
+    logger.error('[Shutdown] Could not re-read metadata for breadcrumb', {
+      sessionId,
+      error: readError?.message ?? 'row not found',
+    });
+    return false;
+  }
+
   const { data, error } = await client
     .from('sessions')
-    .update({ metadata })
+    .update({
+      metadata: {
+        ...((fresh.metadata as Record<string, unknown>) || {}),
+        interruptedAt: new Date().toISOString(),
+        interruptedReason: INTERRUPT_REASON,
+      },
+    })
     .eq('id', sessionId)
     .select('id');
 
@@ -189,7 +216,7 @@ async function transitionSession(
     if (isAlreadyTerminal(existing)) {
       return {
         state: 'finalized-elsewhere',
-        marked: await writeBreadcrumb(client, sessionId, metadata),
+        marked: await writeBreadcrumb(client, sessionId),
       };
     }
 
@@ -248,7 +275,7 @@ async function transitionSession(
       });
       return {
         state: 'finalized-elsewhere',
-        marked: await writeBreadcrumb(client, sessionId, metadata),
+        marked: await writeBreadcrumb(client, sessionId),
       };
     }
 
