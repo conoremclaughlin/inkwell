@@ -14,7 +14,9 @@ import { beforeAll } from 'vitest';
 import { createClient } from '@supabase/supabase-js';
 import { INTEGRATION_TEST_USER_ID } from './integration-fixtures';
 
-const LOCALHOST_HOSTS = new Set(['localhost', '127.0.0.1', '::1']);
+// Node's URL.hostname keeps the brackets on IPv6 literals ('[::1]'), so both
+// spellings are listed (Lumen, PR #439 round-4 non-blocking note).
+const LOCALHOST_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
 
 // Reject production environment
 if (process.env.NODE_ENV === 'production') {

@@ -118,7 +118,9 @@ let TEST_SB_ID: string | undefined;
 // the DB config; the live config's setup is deliberately guard-free (non-DB
 // live suites must not be aborted by a DB guard), so the boundary lives here:
 // refuse a non-local SUPABASE_URL unless INK_ALLOW_REMOTE_INTEGRATION_DB=1.
-const LOCALHOST_HOSTS = new Set(['localhost', '127.0.0.1', '::1']);
+// Node's URL.hostname keeps the brackets on IPv6 literals ('[::1]'), so both
+// spellings are listed (Lumen, PR #439 round-4 non-blocking note).
+const LOCALHOST_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
 function supabaseTargetAllowed(): boolean {
   if (process.env.INK_ALLOW_REMOTE_INTEGRATION_DB === '1') return true;
   if (!SUPABASE_URL) return false;
