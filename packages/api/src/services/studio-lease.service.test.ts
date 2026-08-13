@@ -3,9 +3,11 @@
  *
  * The fake supabase client below models the PostgREST semantics the lease
  * service actually uses — filtered UPDATE ... WHERE as CAS, jsonb `->>` path
- * filters — so the acquire ladder (vacant / same-thread adopt / stale reclaim
- * / fresh refuse) is exercised against real conditional-write behavior, not
- * hand-stubbed return values.
+ * filters — so the acquire ladder (vacant / same-thread adopt / stale
+ * fence-then-rescue reclaim / fresh refuse) is exercised against real
+ * conditional-write behavior, not hand-stubbed return values. An afterSelect
+ * hook lets tests interleave a concurrent write between the service's read
+ * and its CAS, which is exactly the race the heartbeat guard exists for.
  *
  * captureWorktreeState is tested against a real temp git repo: the rescue
  * stash is the safety mechanism reclaim depends on, so it has to be proven
@@ -21,6 +23,7 @@ import path from 'path';
 import {
   StudioLeaseService,
   captureWorktreeState,
+  rescueSucceeded,
   isLeaseStale,
   LEASE_STALE_MS,
   type StudioLease,
@@ -32,6 +35,11 @@ const execFileAsync = promisify(execFile);
 // ── Fake supabase ──
 
 type Row = Record<string, unknown>;
+
+interface FakeHooks {
+  /** Fires after each select executes on the named table. */
+  afterSelect?: (table: string, count: number) => void;
+}
 
 function getCol(row: Row, col: string): unknown {
   if (col.includes('->>')) {
@@ -48,9 +56,12 @@ class FakeQuery {
   private limitN?: number;
 
   constructor(
+    private table: string,
     private rows: Row[],
     private mode: 'select' | 'update' | 'insert',
-    private payload?: Row
+    private payload?: Row,
+    private hooks?: FakeHooks,
+    private counters?: Record<string, number>
   ) {}
 
   eq(col: string, val: unknown) {
@@ -91,7 +102,12 @@ class FakeQuery {
       for (const r of matched) Object.assign(r, this.payload);
     }
     if (this.limitN !== undefined) matched = matched.slice(0, this.limitN);
-    return matched.map((r) => ({ ...r }));
+    const copies = matched.map((r) => ({ ...r }));
+    if (this.mode === 'select' && this.hooks?.afterSelect && this.counters) {
+      this.counters[this.table] = (this.counters[this.table] ?? 0) + 1;
+      this.hooks.afterSelect(this.table, this.counters[this.table]);
+    }
+    return copies;
   }
 
   maybeSingle(): Promise<{ data: Row | null; error: null }> {
@@ -99,19 +115,29 @@ class FakeQuery {
     return Promise.resolve({ data: rows[0] ?? null, error: null });
   }
 
+  single(): Promise<{ data: Row | null; error: { code: string; message: string } | null }> {
+    const rows = this.exec();
+    return Promise.resolve(
+      rows[0]
+        ? { data: rows[0], error: null }
+        : { data: null, error: { code: 'PGRST116', message: 'no rows' } }
+    );
+  }
+
   then<T>(resolve: (v: { data: Row[]; error: null }) => T): Promise<T> {
     return Promise.resolve({ data: this.exec(), error: null }).then(resolve);
   }
 }
 
-function makeFakeSupabase(tables: Record<string, Row[]>) {
+function makeFakeSupabase(tables: Record<string, Row[]>, hooks?: FakeHooks) {
+  const counters: Record<string, number> = {};
   return {
     from(table: string) {
       const rows = tables[table] ?? (tables[table] = []);
       return {
-        select: () => new FakeQuery(rows, 'select'),
-        update: (payload: Row) => new FakeQuery(rows, 'update', payload),
-        insert: (payload: Row) => new FakeQuery(rows, 'insert', payload),
+        select: () => new FakeQuery(table, rows, 'select', undefined, hooks, counters),
+        update: (payload: Row) => new FakeQuery(table, rows, 'update', payload, hooks, counters),
+        insert: (payload: Row) => new FakeQuery(table, rows, 'insert', payload, hooks, counters),
       };
     },
   } as never;
@@ -134,6 +160,15 @@ function staleLease(overrides: Partial<StudioLease> = {}): StudioLease {
   return freshLease({ acquiredAt: stale, heartbeatAt: stale, ...overrides });
 }
 
+function baseTables(): Record<string, Row[]> {
+  return {
+    studios: [{ id: 'studio-1', user_id: 'user-1', lease: null, worktree_path: null }],
+    studio_lease_events: [],
+    inbox_threads: [],
+    agent_identities: [],
+  };
+}
+
 describe('isLeaseStale', () => {
   it('is fresh within the threshold and stale beyond it', () => {
     expect(isLeaseStale(freshLease())).toBe(false);
@@ -145,17 +180,22 @@ describe('isLeaseStale', () => {
   });
 });
 
+describe('rescueSucceeded', () => {
+  it('fails on capture error or dirty-without-stash', () => {
+    expect(rescueSucceeded({ error: 'boom' })).toBe(false);
+    expect(rescueSucceeded({ dirty: true })).toBe(false);
+    expect(rescueSucceeded({ dirty: true, rescueStashSha: 'abc' })).toBe(true);
+    expect(rescueSucceeded({ dirty: false })).toBe(true);
+  });
+});
+
 describe('StudioLeaseService.acquire', () => {
   let tables: Record<string, Row[]>;
   let service: StudioLeaseService;
 
   beforeEach(() => {
     resetActiveRuns();
-    tables = {
-      studios: [{ id: 'studio-1', user_id: 'user-1', lease: null, worktree_path: null }],
-      studio_lease_events: [],
-      inbox_threads: [],
-    };
+    tables = baseTables();
     service = new StudioLeaseService(makeFakeSupabase(tables));
   });
 
@@ -179,6 +219,14 @@ describe('StudioLeaseService.acquire', () => {
     expect(tables.studio_lease_events[0].event).toBe('acquired');
   });
 
+  it('never mutates another user’s studio — even with the right studio UUID', async () => {
+    const result = await service.acquire({ ...req, userId: 'user-2' });
+    expect(result.acquired).toBe(false);
+    // user-1's studio untouched, no event written against it.
+    expect(tables.studios[0].lease).toBeNull();
+    expect(tables.studio_lease_events).toHaveLength(0);
+  });
+
   it('adopts a lease held by the same thread — leases follow the thread', async () => {
     tables.studios[0].lease = freshLease({ sessionId: 'session-old', threadKey: 'pr:200' });
     const result = await service.acquire(req);
@@ -194,7 +242,7 @@ describe('StudioLeaseService.acquire', () => {
     const result = await service.acquire(req);
     expect(result.acquired).toBe(false);
     if (!result.acquired) {
-      expect(result.holder.threadKey).toBe('pr:999');
+      expect(result.holder?.threadKey).toBe('pr:999');
     }
     // Holder untouched.
     expect((tables.studios[0].lease as StudioLease).sessionId).toBe('session-a');
@@ -209,6 +257,49 @@ describe('StudioLeaseService.acquire', () => {
     }
     expect((tables.studios[0].lease as StudioLease).threadKey).toBe('pr:200');
     expect(tables.studio_lease_events.map((e) => e.event)).toContain('reclaimed');
+  });
+
+  it('a renewal landing between the stale read and the claim defeats the reclaim', async () => {
+    tables.studios[0].lease = staleLease({ threadKey: 'pr:999' });
+    let interleaved = false;
+    const hookedService = new StudioLeaseService(
+      makeFakeSupabase(tables, {
+        afterSelect: (table, count) => {
+          // After acquire()'s first read of the holder, the holder's lifecycle
+          // hook renews: heartbeatAt changes, sessionId/acquiredAt do not.
+          if (table === 'studios' && count === 1 && !interleaved) {
+            interleaved = true;
+            const lease = tables.studios[0].lease as StudioLease;
+            tables.studios[0].lease = { ...lease, heartbeatAt: new Date().toISOString() };
+          }
+        },
+      })
+    );
+
+    const result = await hookedService.acquire(req);
+    expect(result.acquired).toBe(false);
+    // The renewed holder keeps the studio — the claim's heartbeatAt guard
+    // mismatched, and no reclaim event was written.
+    expect((tables.studios[0].lease as StudioLease).sessionId).toBe('session-a');
+    expect(tables.studio_lease_events.map((e) => e.event)).not.toContain('reclaimed');
+  });
+
+  it('quarantines instead of handing out a studio whose rescue failed', async () => {
+    const nonRepoDir = await mkdtemp(path.join(tmpdir(), 'lease-nonrepo-'));
+    try {
+      // Stale holder over a worktree that is not a git repo — capture errors.
+      tables.studios[0].lease = staleLease({ threadKey: 'pr:999' });
+      tables.studios[0].worktree_path = nonRepoDir;
+
+      const result = await service.acquire(req);
+      expect(result.acquired).toBe(false);
+      // The claim was rolled back — studio is vacant, not ours.
+      expect(tables.studios[0].lease).toBeNull();
+      const conflict = tables.studio_lease_events.find((e) => e.event === 'conflict');
+      expect(conflict?.reason).toBe('reclaim-aborted-rescue-failed');
+    } finally {
+      await rm(nonRepoDir, { recursive: true, force: true });
+    }
   });
 
   it('renews instead of reclaiming when the stale holder has a live in-process run', async () => {
@@ -254,12 +345,18 @@ describe('StudioLeaseService release paths', () => {
       ],
       studio_lease_events: [],
       inbox_threads: [],
+      agent_identities: [],
     };
     service = new StudioLeaseService(makeFakeSupabase(tables));
   });
 
+  afterEach(() => resetActiveRuns());
+
   it('releaseBySession clears exactly that session lease and records held duration', async () => {
-    const ok = await service.releaseBySession('session-a', { reason: 'session-end' });
+    const ok = await service.releaseBySession('session-a', {
+      userId: 'user-1',
+      reason: 'session-end',
+    });
     expect(ok).toBe(true);
     expect(tables.studios[0].lease).toBeNull();
     expect(tables.studios[1].lease).not.toBeNull();
@@ -269,9 +366,25 @@ describe('StudioLeaseService release paths', () => {
     expect((event.detail as { heldMs: number }).heldMs).toBeGreaterThanOrEqual(0);
   });
 
-  it('releaseBySession is a no-op when the session holds nothing', async () => {
-    expect(await service.releaseBySession('session-unknown')).toBe(false);
-    expect(tables.studio_lease_events).toHaveLength(0);
+  it('releaseBySession scoped to the wrong user is a no-op', async () => {
+    expect(await service.releaseBySession('session-a', { userId: 'user-2' })).toBe(false);
+    expect(tables.studios[0].lease).not.toBeNull();
+  });
+
+  it('releaseUnlessRunning defers while the session has a live in-process run', async () => {
+    registerActiveRun({
+      sessionId: 'session-a',
+      userId: 'user-1',
+      agentId: 'wren',
+      backend: 'claude-code',
+      startedAt: Date.now(),
+    });
+    expect(await service.releaseUnlessRunning('session-a', { userId: 'user-1' })).toBe(false);
+    expect(tables.studios[0].lease).not.toBeNull();
+
+    resetActiveRuns();
+    expect(await service.releaseUnlessRunning('session-a', { userId: 'user-1' })).toBe(true);
+    expect(tables.studios[0].lease).toBeNull();
   });
 
   it('releaseByThread clears every studio the thread holds', async () => {
@@ -281,15 +394,18 @@ describe('StudioLeaseService release paths', () => {
     expect(tables.studios[1].lease).toBeNull();
   });
 
-  it('releaseByStudio clears whatever the studio holds', async () => {
-    expect(await service.releaseByStudio('studio-2', { reason: 'studio-closed' })).toBe(true);
+  it('releaseByStudio clears whatever the studio holds, user-scoped', async () => {
+    expect(await service.releaseByStudio('studio-2', { userId: 'user-2' })).toBe(false);
+    expect(
+      await service.releaseByStudio('studio-2', { userId: 'user-1', reason: 'studio-closed' })
+    ).toBe(true);
     expect(tables.studios[1].lease).toBeNull();
   });
 
   it('renewBySession bumps heartbeatAt without logging an event', async () => {
     const before = (tables.studios[0].lease as StudioLease).heartbeatAt;
     await new Promise((resolve) => setTimeout(resolve, 5));
-    expect(await service.renewBySession('session-a')).toBe(true);
+    expect(await service.renewBySession('session-a', 'user-1')).toBe(true);
     const after = (tables.studios[0].lease as StudioLease).heartbeatAt;
     expect(Date.parse(after)).toBeGreaterThan(Date.parse(before));
     expect(tables.studio_lease_events).toHaveLength(0);
@@ -325,6 +441,7 @@ describe('StudioLeaseService.sweepExpiredLeases', () => {
       ],
       studio_lease_events: [],
       inbox_threads: [],
+      agent_identities: [],
     };
     registerActiveRun({
       sessionId: 'sess-3',
@@ -337,36 +454,41 @@ describe('StudioLeaseService.sweepExpiredLeases', () => {
     const service = new StudioLeaseService(makeFakeSupabase(tables));
     const stats = await service.sweepExpiredLeases();
 
-    expect(stats).toEqual({ expired: 1, renewed: 1 });
+    expect(stats).toEqual({ expired: 1, renewed: 1, quarantined: 0 });
     expect(tables.studios[0].lease).not.toBeNull(); // fresh untouched
     expect(tables.studios[1].lease).toBeNull(); // stale expired
     expect(tables.studios[2].lease).not.toBeNull(); // running renewed
     expect(isLeaseStale(tables.studios[2].lease as StudioLease)).toBe(false);
     expect(tables.studio_lease_events.map((e) => e.event)).toEqual(['expired']);
   });
-});
 
-describe('final-state stamping into thread metadata', () => {
-  it('stamps branch/commit onto the owning thread on release', async () => {
-    const tables: Record<string, Row[]> = {
-      studios: [
-        {
-          id: 'studio-1',
-          user_id: 'user-1',
-          lease: freshLease({ sessionId: 'session-a', threadKey: 'pr:100' }),
-          // A real directory so captureWorktreeState runs git — but this is
-          // not a repo, so it records an error and stamping is skipped.
-          worktree_path: null,
-        },
-      ],
-      studio_lease_events: [],
-      inbox_threads: [{ id: 'thread-1', user_id: 'user-1', thread_key: 'pr:100', metadata: null }],
-    };
-    const service = new StudioLeaseService(makeFakeSupabase(tables));
-    await service.releaseBySession('session-a');
-    // No worktree → no final state → no stamp, but release still succeeded.
-    expect(tables.studios[0].lease).toBeNull();
-    expect(tables.inbox_threads[0].metadata).toBeNull();
+  it('keeps the sweeper marker (quarantine) when the expiry rescue fails', async () => {
+    resetActiveRuns();
+    const nonRepoDir = await mkdtemp(path.join(tmpdir(), 'lease-sweep-nonrepo-'));
+    try {
+      const tables: Record<string, Row[]> = {
+        studios: [
+          {
+            id: 's-bad',
+            user_id: 'u',
+            lease: staleLease({ sessionId: 'sess-x' }),
+            worktree_path: nonRepoDir,
+          },
+        ],
+        studio_lease_events: [],
+        inbox_threads: [],
+        agent_identities: [],
+      };
+      const service = new StudioLeaseService(makeFakeSupabase(tables));
+      const stats = await service.sweepExpiredLeases();
+
+      expect(stats).toEqual({ expired: 0, renewed: 0, quarantined: 1 });
+      const marker = tables.studios[0].lease as StudioLease;
+      expect(marker.sessionId).toBe('lease-sweep:sess-x');
+      expect(tables.studio_lease_events.map((e) => e.event)).toEqual(['conflict']);
+    } finally {
+      await rm(nonRepoDir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -396,6 +518,7 @@ describe('captureWorktreeState (real git)', () => {
     expect(state.commit).toMatch(/^[0-9a-f]{40}$/);
     expect(state.dirty).toBe(false);
     expect(state.rescueStashSha).toBeUndefined();
+    expect(rescueSucceeded(state)).toBe(true);
   });
 
   it('rescue-stashes a dirty tree and records the stash commit SHA', async () => {
@@ -405,6 +528,7 @@ describe('captureWorktreeState (real git)', () => {
     const state = await captureWorktreeState(repoDir, { rescue: true, rescueLabel: 'pr:1' });
     expect(state.dirty).toBe(true);
     expect(state.rescueStashSha).toMatch(/^[0-9a-f]{40}$/);
+    expect(rescueSucceeded(state)).toBe(true);
 
     // The tree is clean afterwards — the next occupant starts fresh.
     const { stdout: status } = await execFileAsync('git', ['status', '--porcelain'], {
@@ -435,5 +559,6 @@ describe('captureWorktreeState (real git)', () => {
   it('records an error instead of throwing for a non-repo path', async () => {
     const state = await captureWorktreeState(path.join(tmpdir(), 'does-not-exist-xyz'));
     expect(state.error).toBeTruthy();
+    expect(rescueSucceeded(state)).toBe(false);
   });
 });

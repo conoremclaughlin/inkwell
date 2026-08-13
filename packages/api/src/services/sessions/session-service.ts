@@ -304,7 +304,7 @@ export class SessionService implements ISessionService {
       return { studioId: candidateStudioId, tier, occupancyChecked: false };
     }
 
-    const current = await leases.getLease(candidateStudioId);
+    const current = await leases.getLease(candidateStudioId, ctx.userId);
     const holder = current?.lease;
     if (!holder || holder.threadKey === ctx.threadKey || isLeaseStale(holder)) {
       return { studioId: candidateStudioId, tier, occupancyChecked: true };
@@ -382,10 +382,12 @@ export class SessionService implements ISessionService {
    * threadKey and a studio, whichever path produced the session. The SB never
    * opts in; routing is what acquires.
    *
-   * A lost acquire race after a passed occupancy check diverts to overflow
-   * (the loser re-routes rather than retrying into contention). Bypass tiers
-   * that find a foreign holder record a conflict and proceed leaseless —
-   * clobbering a live lease is never an option.
+   * FAIL CLOSED (PR #492 review): a session is never returned bound to a
+   * studio whose lease was not acquired — the runner would execute inside the
+   * occupied worktree, which is exactly the stomp the lease exists to
+   * prevent. On any refusal, from any tier: divert to overflow; if overflow
+   * cannot be created or acquired, strip the studio binding so the session
+   * runs in the default working directory instead of someone else's worktree.
    */
   private async withStudioLease(
     session: Session,
@@ -395,9 +397,10 @@ export class SessionService implements ISessionService {
     const leases = this.getLeaseService();
     if (!leases || !ctx.threadKey || !session.studioId) return session;
 
+    const boundStudioId = session.studioId;
     try {
       const result = await leases.acquire({
-        studioId: session.studioId,
+        studioId: boundStudioId,
         sessionId: session.id,
         threadKey: ctx.threadKey,
         agentId: ctx.agentId,
@@ -406,56 +409,64 @@ export class SessionService implements ISessionService {
       });
       if (result.acquired) return session;
 
-      if (!routing.occupancyChecked) {
-        await leases.logEvent(ctx.userId, session.studioId, 'conflict', {
-          sessionId: session.id,
-          threadKey: ctx.threadKey,
-          agentId: ctx.agentId,
-          reason: `tier ${routing.tier} resolved a studio leased by ${result.holder.threadKey}`,
-        });
-        logger.warn('[StudioLease] Proceeding without lease — studio held by another thread', {
-          sessionId: session.id,
-          studioId: session.studioId,
-          tier: routing.tier,
-          threadKey: ctx.threadKey,
-          holderThreadKey: result.holder.threadKey,
-        });
-        return session;
-      }
-
-      const overflow = await this.divertToOverflow(session.studioId, ctx);
-      if (!overflow) {
-        logger.error('[StudioLease] Lost acquire race and overflow failed; proceeding leaseless', {
-          sessionId: session.id,
-          studioId: session.studioId,
-          threadKey: ctx.threadKey,
-        });
-        return session;
-      }
-
-      const updated = await this.repository.update(session.id, { studioId: overflow.id });
-      await leases.acquire({
-        studioId: overflow.id,
+      await leases.logEvent(ctx.userId, boundStudioId, 'conflict', {
         sessionId: session.id,
         threadKey: ctx.threadKey,
         agentId: ctx.agentId,
-        userId: ctx.userId,
-        reason: 'overflow-after-lost-race',
+        reason: `tier ${routing.tier} resolved a studio held by ${result.holder?.threadKey ?? 'unknown'}; diverting`,
       });
-      logger.info('[StudioLease] Lost acquire race; session diverted to overflow studio', {
+      logger.warn('[StudioLease] Studio held by another thread; diverting', {
         sessionId: session.id,
-        from: session.studioId,
-        to: overflow.id,
+        studioId: boundStudioId,
+        tier: routing.tier,
         threadKey: ctx.threadKey,
+        holderThreadKey: result.holder?.threadKey ?? null,
       });
-      return updated;
+
+      const overflow = await this.divertToOverflow(boundStudioId, ctx);
+      if (overflow) {
+        const overflowAcquire = await leases.acquire({
+          studioId: overflow.id,
+          sessionId: session.id,
+          threadKey: ctx.threadKey,
+          agentId: ctx.agentId,
+          userId: ctx.userId,
+          reason: `overflow:${routing.tier}`,
+        });
+        if (overflowAcquire.acquired) {
+          const updated = await this.repository.update(session.id, { studioId: overflow.id });
+          logger.info('[StudioLease] Session diverted to overflow studio', {
+            sessionId: session.id,
+            from: boundStudioId,
+            to: overflow.id,
+            threadKey: ctx.threadKey,
+          });
+          return updated;
+        }
+      }
+
+      logger.error(
+        '[StudioLease] Overflow unavailable; clearing studio binding (fail closed, never the occupied worktree)',
+        {
+          sessionId: session.id,
+          studioId: boundStudioId,
+          threadKey: ctx.threadKey,
+        }
+      );
+      return await this.repository.update(session.id, { studioId: null });
     } catch (err) {
-      logger.warn('[StudioLease] Lease acquisition failed (non-fatal)', {
+      logger.error('[StudioLease] Lease acquisition errored; clearing studio binding', {
         sessionId: session.id,
-        studioId: session.studioId,
+        studioId: boundStudioId,
         error: err instanceof Error ? err.message : String(err),
       });
-      return session;
+      try {
+        return await this.repository.update(session.id, { studioId: null });
+      } catch {
+        // Last resort: strip in memory so the runner falls back to the
+        // default working directory rather than the unverified worktree.
+        return { ...session, studioId: undefined };
+      }
     }
   }
 
@@ -1185,7 +1196,16 @@ export class SessionService implements ISessionService {
     // Staying registered is also right when something throws between
     // runner.run() and here: the row really is still `running`, so a later
     // shutdown reporting it as interrupted is the truth.
-    if (finalized) clearActiveRun(session.id);
+    if (finalized) {
+      clearActiveRun(session.id);
+      // The run boundary is the real terminal edge for lease release: a
+      // release requested mid-turn (end_session from inside the run) was
+      // deferred so no other thread could enter the worktree while this
+      // process was still cd'd into it. Now that the run is durably finished,
+      // release if the session ended. Fire-and-forget — release must never
+      // delay response routing.
+      void this.releaseLeaseIfSessionTerminal(session.id);
+    }
 
     // Gated on `finalized` for the same reason the lifecycle write is:
     // updateTokenUsage() ends in a full SessionRepository.update(), which
@@ -2046,6 +2066,33 @@ This session will continue with a fresh context after compaction. Your identity,
     return this.normalizeBackend(identityBackend);
   }
 
+  /**
+   * Run-boundary lease release: called after clearActiveRun once a turn's
+   * terminal state is durably written. If the session ended during the turn
+   * (end_session / update_session_state from inside it), the release that was
+   * deferred then happens now — at the moment the process actually left the
+   * worktree.
+   */
+  private async releaseLeaseIfSessionTerminal(sessionId: string): Promise<void> {
+    const leases = this.getLeaseService();
+    if (!leases) return;
+    try {
+      const session = await this.repository.findById(sessionId);
+      if (!session) return;
+      const terminal = Boolean(session.endedAt) || session.status === 'completed';
+      if (!terminal) return;
+      await leases.releaseBySession(sessionId, {
+        userId: session.userId,
+        reason: 'run-terminal',
+      });
+    } catch (err) {
+      logger.warn('[StudioLease] Run-boundary release failed', {
+        sessionId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
   async endSession(sessionId: string, summary?: string): Promise<void> {
     const session = await this.repository.findById(sessionId);
     if (!session) {
@@ -2062,11 +2109,13 @@ This session will continue with a fresh context after compaction. Your identity,
     });
 
     // Automatic lease release — session end is a terminal path, so whatever
-    // studio this session held goes back to the pool without the SB opting in.
+    // studio this session held goes back to the pool without the SB opting
+    // in. Deferred while an in-process run is still executing in the
+    // worktree; the run boundary (releaseLeaseIfSessionTerminal) picks it up.
     const leases = this.getLeaseService();
     if (leases) {
       await leases
-        .releaseBySession(sessionId, { userId: session.userId, reason: 'session-end' })
+        .releaseUnlessRunning(sessionId, { userId: session.userId, reason: 'session-end' })
         .catch((err) => {
           logger.warn('[StudioLease] Release on session end failed', {
             sessionId,

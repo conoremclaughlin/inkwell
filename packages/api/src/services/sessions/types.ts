@@ -413,7 +413,10 @@ export interface ISessionRepository {
 
   create(session: Omit<Session, 'id' | 'startedAt' | 'lastActivityAt'>): Promise<Session>;
 
-  update(id: string, updates: Partial<Session>): Promise<Session>;
+  update(
+    id: string,
+    updates: Omit<Partial<Session>, 'studioId'> & { studioId?: string | null }
+  ): Promise<Session>;
 
   updateTokenUsage(
     id: string,

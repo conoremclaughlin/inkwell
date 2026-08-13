@@ -3112,6 +3112,7 @@ export type Database = {
           event: string;
           id: string;
           reason: string | null;
+          sb_id: string | null;
           session_id: string | null;
           studio_id: string;
           thread_key: string | null;
@@ -3124,6 +3125,7 @@ export type Database = {
           event: string;
           id?: string;
           reason?: string | null;
+          sb_id?: string | null;
           session_id?: string | null;
           studio_id: string;
           thread_key?: string | null;
@@ -3136,12 +3138,19 @@ export type Database = {
           event?: string;
           id?: string;
           reason?: string | null;
+          sb_id?: string | null;
           session_id?: string | null;
           studio_id?: string;
           thread_key?: string | null;
           user_id?: string;
         };
         Relationships: [
+          {
+            foreignKeyName: 'studio_lease_events_sb_id_fkey';
+            columns: ['sb_id'];
+            referencedRelation: 'agent_identities';
+            referencedColumns: ['id'];
+          },
           {
             foreignKeyName: 'studio_lease_events_studio_id_fkey';
             columns: ['studio_id'];

@@ -110,4 +110,29 @@ describe('StudioOverflowService.ensureOverflowStudio — reuse', () => {
     await service.teardownEphemeralStudio(makeStudio({ ephemeral: false }), { reason: 'test' });
     expect(studios.markCleaned).not.toHaveBeenCalled();
   });
+
+  it('aborts teardown — worktree left in place — when the rescue fails', async () => {
+    // A directory that exists but is not a git repo: capture errors, so
+    // destruction must not proceed and the row must not be marked cleaned.
+    const nonRepoDir = await mkdtemp(path.join(tmpdir(), 'overflow-norescue-'));
+    try {
+      const studios = { markCleaned: vi.fn() } as unknown as StudiosRepository;
+      const logEvent = vi.fn();
+      const leases = { logEvent } as unknown as StudioLeaseService;
+      const service = new StudioOverflowService(studios, leases);
+
+      await service.teardownEphemeralStudio(
+        makeStudio({ ephemeral: true, worktreePath: nonRepoDir, repoRoot: nonRepoDir }),
+        { reason: 'thread pr:476 closed' }
+      );
+
+      expect(studios.markCleaned).not.toHaveBeenCalled();
+      // The worktree is still on disk.
+      await expect(rm(nonRepoDir, { recursive: true })).resolves.toBeUndefined();
+      const conflictCall = logEvent.mock.calls.find((c) => c[2] === 'conflict');
+      expect(conflictCall?.[3]?.reason).toContain('teardown-aborted-rescue-failed');
+    } finally {
+      await rm(nonRepoDir, { recursive: true, force: true }).catch(() => undefined);
+    }
+  });
 });

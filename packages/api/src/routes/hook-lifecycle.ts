@@ -110,7 +110,7 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
       // fires on every prompt/stop/compact, well inside the 30-minute
       // staleness threshold. Fire-and-forget: renewal must never delay the
       // hook response.
-      void leaseService.renewBySession(sessionId).catch((err: unknown) => {
+      void leaseService.renewBySession(sessionId, session.userId).catch((err: unknown) => {
         logger.debug('[HookLifecycle] Lease renewal failed (non-fatal)', {
           sessionId,
           error: err instanceof Error ? err.message : String(err),

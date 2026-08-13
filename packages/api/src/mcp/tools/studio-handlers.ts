@@ -541,7 +541,7 @@ export async function handleUpdateStudio(args: unknown, dataComposer: DataCompos
 
 export async function handleCloseStudio(args: unknown, dataComposer: DataComposer) {
   const parsed = closeStudioSchema.parse(args);
-  await resolveUserOrThrow(parsed, dataComposer);
+  const { user: closingUser } = await resolveUserOrThrow(parsed, dataComposer);
 
   const { studioId, agentId, removeWorktree = true, deleteBranch = false } = parsed;
   const studiosRepo = dataComposer.repositories.studios;
@@ -562,7 +562,7 @@ export async function handleCloseStudio(args: unknown, dataComposer: DataCompose
   // terminal act for its occupant, and release captures final branch/commit
   // state while the worktree still exists.
   await new StudioLeaseService(dataComposer.getClient())
-    .releaseByStudio(studioId, { reason: 'studio-closed' })
+    .releaseByStudio(studioId, { userId: closingUser.id, reason: 'studio-closed' })
     .catch((leaseErr: unknown) => {
       logger.warn('[StudioLease] Release on close_studio failed (non-fatal)', {
         studioId,

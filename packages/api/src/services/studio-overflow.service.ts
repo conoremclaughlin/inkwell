@@ -31,7 +31,9 @@ import { ensureStudioSettings } from './studio-settings';
 import {
   StudioLeaseService,
   captureWorktreeState,
+  rescueSucceeded,
   EPHEMERAL_STUDIO_TTL_MS,
+  type WorktreeFinalState,
 } from './studio-lease.service';
 import { logger } from '../utils/logger';
 
@@ -233,6 +235,12 @@ export class StudioOverflowService {
   /**
    * Close an ephemeral studio when its work unit completes: rescue anything
    * dirty (safe ref), remove the worktree, keep the branch, mark cleaned.
+   *
+   * SAFETY (PR #492 review): destruction is gated on a verified rescue. If
+   * the rescue fails — a conflicted rebase can make `git stash` fail — the
+   * teardown ABORTS with the worktree left in place; --force is only ever
+   * reached with the tree verified clean or stashed. `cleaned` is recorded
+   * only after the worktree is confirmed gone from disk.
    */
   async teardownEphemeralStudio(studio: Studio, opts: { reason: string }): Promise<void> {
     if (!studio.ephemeral) {
@@ -242,29 +250,71 @@ export class StudioOverflowService {
       return;
     }
 
-    const finalState = await captureWorktreeState(studio.worktreePath, {
-      rescue: true,
-      rescueLabel: `teardown:${studio.slug || studio.id}`,
-    });
+    const worktreeExists = await access(studio.worktreePath)
+      .then(() => true)
+      .catch(() => false);
 
-    await execFileAsync('git', ['worktree', 'remove', studio.worktreePath], {
-      cwd: studio.repoRoot,
-    }).catch(async (err) => {
-      logger.warn('[StudioOverflow] worktree remove failed; retrying with --force', {
-        worktreePath: studio.worktreePath,
-        error: err instanceof Error ? err.message : String(err),
+    let finalState: WorktreeFinalState | undefined;
+    if (worktreeExists) {
+      finalState = await captureWorktreeState(studio.worktreePath, {
+        rescue: true,
+        rescueLabel: `teardown:${studio.slug || studio.id}`,
       });
-      // The rescue stash above already preserved dirty work in the shared
-      // .git store, so --force cannot lose anything the stash captured.
-      await execFileAsync('git', ['worktree', 'remove', '--force', studio.worktreePath], {
-        cwd: studio.repoRoot,
-      }).catch((forceErr) => {
-        logger.warn('[StudioOverflow] worktree remove --force failed (may already be gone)', {
-          worktreePath: studio.worktreePath,
-          error: forceErr instanceof Error ? forceErr.message : String(forceErr),
+
+      if (!rescueSucceeded(finalState)) {
+        logger.error(
+          '[StudioOverflow] Teardown aborted — rescue failed; leaving worktree in place',
+          {
+            studioId: studio.id,
+            worktreePath: studio.worktreePath,
+            reason: opts.reason,
+            finalState,
+          }
+        );
+        await this.leases.logEvent(studio.userId, studio.id, 'conflict', {
+          agentId: studio.agentId ?? undefined,
+          reason: `teardown-aborted-rescue-failed (${opts.reason})`,
+          detail: { finalState: JSON.parse(JSON.stringify(finalState)) },
         });
+        return;
+      }
+
+      await execFileAsync('git', ['worktree', 'remove', studio.worktreePath], {
+        cwd: studio.repoRoot,
+      }).catch(async (err) => {
+        logger.warn('[StudioOverflow] worktree remove failed; retrying with --force', {
+          worktreePath: studio.worktreePath,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        // Safe only because the rescue above verified the tree is clean or
+        // its dirty state is stashed with a recorded commit SHA.
+        await execFileAsync('git', ['worktree', 'remove', '--force', studio.worktreePath], {
+          cwd: studio.repoRoot,
+        }).catch(() => undefined);
       });
-    });
+
+      const stillPresent = await access(studio.worktreePath)
+        .then(() => true)
+        .catch(() => false);
+      if (stillPresent) {
+        logger.error(
+          '[StudioOverflow] Worktree still present after removal attempts; NOT marking cleaned',
+          { studioId: studio.id, worktreePath: studio.worktreePath }
+        );
+        await this.leases.logEvent(studio.userId, studio.id, 'conflict', {
+          agentId: studio.agentId ?? undefined,
+          reason: `teardown-remove-failed (${opts.reason})`,
+          detail: { finalState: JSON.parse(JSON.stringify(finalState)) },
+        });
+        return;
+      }
+    } else {
+      // Worktree already gone (manual cleanup) — prune the stale registration
+      // and record the row as cleaned.
+      await execFileAsync('git', ['worktree', 'prune'], { cwd: studio.repoRoot }).catch(
+        () => undefined
+      );
+    }
 
     await this.studios.markCleaned(studio.id).catch(() => undefined);
     await this.leases.logEvent(studio.userId, studio.id, 'released', {
@@ -272,7 +322,7 @@ export class StudioOverflowService {
       reason: opts.reason,
       detail: {
         teardown: true,
-        finalState: JSON.parse(JSON.stringify(finalState)),
+        finalState: finalState ? JSON.parse(JSON.stringify(finalState)) : null,
       },
     });
     logger.info('[StudioOverflow] Ephemeral studio cleaned', {

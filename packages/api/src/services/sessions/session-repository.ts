@@ -336,7 +336,10 @@ export class SessionRepository implements ISessionRepository {
     return mapDbToSession(data);
   }
 
-  async update(id: string, updates: Partial<Session>): Promise<Session> {
+  async update(
+    id: string,
+    updates: Omit<Partial<Session>, 'studioId'> & { studioId?: string | null }
+  ): Promise<Session> {
     // First fetch current session to merge metadata
     const current = await this.findById(id);
     if (!current) {
