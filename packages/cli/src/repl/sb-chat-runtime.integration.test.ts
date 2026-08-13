@@ -37,7 +37,7 @@ try {
 // Dynamic import to avoid breaking when not running integration tests
 async function createPcpClient() {
   const { PcpClient } = await import('../lib/pcp-client.js');
-  const authPath = join(process.env.HOME || '', '.pcp', 'auth.json');
+  const authPath = join(process.env.HOME || '', '.ink', 'auth.json');
   return new PcpClient(PCP_URL, authPath);
 }
 

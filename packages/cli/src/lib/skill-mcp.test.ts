@@ -10,7 +10,7 @@ vi.mock('../repl/skills.js', () => ({
     // Only scan cwd/.ink/skills/ (workspace tier) — skip managed/bundled/extra tiers
     const { existsSync, readdirSync } = require('fs');
     const { join } = require('path');
-    const skillsDir = join(cwd, '.pcp', 'skills');
+    const skillsDir = join(cwd, '.ink', 'skills');
     if (!existsSync(skillsDir)) return [];
     return readdirSync(skillsDir, { withFileTypes: true })
       .filter((d: { isDirectory: () => boolean }) => d.isDirectory())
@@ -141,7 +141,7 @@ describe('buildMergedMcpConfig', () => {
 
   it('merges skill MCP servers into project config', () => {
     // Create a skill with MCP config in .ink/skills/
-    const skillDir = join(tmpDir, '.pcp', 'skills', 'playwright-mcp');
+    const skillDir = join(tmpDir, '.ink', 'skills', 'playwright-mcp');
     mkdirSync(skillDir, { recursive: true });
     writeFileSync(
       join(skillDir, 'SKILL.md'),
@@ -187,7 +187,7 @@ mcp:
   });
 
   it('does not override existing MCP servers', () => {
-    const skillDir = join(tmpDir, '.pcp', 'skills', 'pcp-override');
+    const skillDir = join(tmpDir, '.ink', 'skills', 'pcp-override');
     mkdirSync(skillDir, { recursive: true });
     writeFileSync(
       join(skillDir, 'SKILL.md'),

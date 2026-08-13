@@ -645,7 +645,7 @@ export const bootstrapSchema = userIdentifierBaseSchema.extend({
   identityBasePath: z
     .string()
     .optional()
-    .describe('Base path for identity files (default: ~/.pcp)'),
+    .describe('Base path for identity files (default: ~/.ink)'),
   threadKey: z
     .string()
     .optional()
@@ -2059,7 +2059,7 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
   const memoryLimit = params.memoryLimit ?? 50;
   const postCompact = params.postCompact === true;
   const agentId = params.agentId;
-  const basePath = params.identityBasePath || path.join(os.homedir(), '.pcp');
+  const basePath = params.identityBasePath || path.join(os.homedir(), '.ink');
   const supabase = dataComposer.getClient();
 
   // Load identity files if agentId is provided

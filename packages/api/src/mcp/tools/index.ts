@@ -2282,7 +2282,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `Load identity and context for a new session. Call this at the start of every new conversation.
 
 Returns:
-- Identity Files: shared values/user/process docs and agent-specific identity docs from ~/.pcp
+- Identity Files: shared values/user/process docs and agent-specific identity docs from ~/.ink
 - Identity Core: user profile, assistant role, relationship context from DB
 - Active Context: current projects, session context, project-specific context
 - Active Session: current session if any
@@ -2323,7 +2323,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         identityBasePath: z
           .string()
           .optional()
-          .describe('Base path for identity files (default: ~/.pcp)'),
+          .describe('Base path for identity files (default: ~/.ink)'),
         threadKey: z
           .string()
           .optional()

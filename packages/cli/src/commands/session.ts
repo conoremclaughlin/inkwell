@@ -255,7 +255,7 @@ export function buildTranscriptInstallPlan(options: {
     return {
       destinationPath: join(
         targetCwd,
-        '.pcp',
+        '.ink',
         'runtime',
         'repl',
         `${options.sessionId}-synced-${backendSessionId}.${format === 'json' ? 'json' : 'jsonl'}`
