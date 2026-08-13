@@ -16,16 +16,18 @@
  * - INK_LIVE_TESTS=1
  *
  * INTENTIONAL (Conor, 2026-08-12): this suite consumes REAL LLM tokens and is
- * DELIBERATELY excluded from CI (opt-in env gate + excluded from default
- * vitest configs). That is a cost decision, not an oversight — do not wire it
- * into CI. Token-free DB integration suites run in CI; live ones never do.
+ * DELIBERATELY excluded from CI. Double-gated for real (Lumen, PR #439 round
+ * 2): collected ONLY by vitest.live.config.ts — the default and DB-integration
+ * configs exclude every live pattern — AND gated on INK_LIVE_TESTS=1. A cost
+ * decision, not an oversight — do not wire it into CI. Token-free DB
+ * integration suites run in CI; live ones never do.
  * - claude CLI installed with valid credentials
  * - Inkwell server running (default localhost:3001, override via PCP_SERVER_URL)
  * - Valid access token in ~/.ink/auth.json
  * - Supabase credentials (.env.local or env vars)
  *
  * Run:
- *   INK_LIVE_TESTS=1 PCP_SERVER_URL=http://localhost:4001 npx vitest run \
+ *   INK_LIVE_TESTS=1 PCP_SERVER_URL=http://localhost:4001 npx vitest run --config packages/api/vitest.live.config.ts \
  *     --config vitest.integration.db.config.ts \
  *     --root packages/api \
  *     src/services/strategy-approval-gate.live.integration.test.ts
