@@ -39,6 +39,15 @@ const BOOKKEEPING_PREFIXES = [
   'agent_complete',
 ];
 
+/**
+ * Delivery channels whose inbound "messages" are TRIGGERS, not conversation:
+ * the session already renders the injected prompt as a labeled system turn,
+ * so a message_in block for the same delivery is a duplicate (Conor's
+ * 2026-08-12 screenshot: one heartbeat rendered three times — the system
+ * turn plus two activity blocks).
+ */
+const INTERNAL_MESSAGE_PLATFORMS = new Set(['heartbeat', 'internal']);
+
 export function classifyActivity(activity: ActivityLike, selfAgentId: string): ActivityRenderPlan {
   const rawType = activity.subtype
     ? `${activity.type}:${activity.subtype}`
@@ -47,6 +56,13 @@ export function classifyActivity(activity: ActivityLike, selfAgentId: string): A
   const platform = activity.platform || 'channel';
 
   if (rawType.startsWith('message_in')) {
+    // Only a genuine external platform (telegram, discord, …) is real
+    // inbound conversation. Trigger deliveries — internal platforms or
+    // platformless routing records — stay dim bookkeeping receipts; their
+    // content already renders as the injected system turn.
+    if (!activity.platform || INTERNAL_MESSAGE_PLATFORMS.has(activity.platform)) {
+      return { mode: 'bookkeeping' };
+    }
     // The human's words arriving via a platform — render as a user message
     return { mode: 'message-in', role: 'user', label: `📨 ${platform} → ${actor}` };
   }

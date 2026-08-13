@@ -22,9 +22,23 @@ describe('classifyActivity', () => {
     expect(plan.label).toBe('📤 myra → telegram');
   });
 
-  it('falls back to a generic channel label when platform is missing', () => {
-    const plan = classifyActivity({ type: 'message_in', agentId: 'myra' }, 'myra');
-    expect(plan.label).toBe('📨 channel → myra');
+  it('demotes trigger deliveries to bookkeeping — heartbeat is not conversation', () => {
+    // The injected system turn already renders the trigger prompt; a
+    // message_in block for the same delivery duplicated it (Conor's
+    // 2026-08-12 screenshot: one heartbeat rendered three times).
+    expect(
+      classifyActivity({ type: 'message_in', agentId: 'myra', platform: 'heartbeat' }, 'myra').mode
+    ).toBe('bookkeeping');
+    // Platformless inbound routing records are internal too, not conversation.
+    expect(classifyActivity({ type: 'message_in', agentId: 'myra' }, 'myra').mode).toBe(
+      'bookkeeping'
+    );
+  });
+
+  it('keeps the generic channel label for OUTBOUND messages missing platform (legacy sends)', () => {
+    const plan = classifyActivity({ type: 'message_out', agentId: 'myra' }, 'myra');
+    expect(plan.mode).toBe('message-out');
+    expect(plan.label).toBe('📤 myra → channel');
   });
 
   it('classifies own backend turn lifecycle as bookkeeping (regression: rendered as ⚡ blocks)', () => {
