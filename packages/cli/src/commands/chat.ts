@@ -115,6 +115,24 @@ import {
 } from '../repl/ink/index.js';
 import { formatContextLines, type ContextSections } from '../repl/ink/context-viewer.js';
 import {
+  DEFAULT_MAX_TOOL_LOOP_ITERATIONS,
+  MAX_TOOL_CALLS_PER_ITERATION,
+  extractLocalToolCalls,
+  isTerminalSignalToolResult,
+  stripLocalToolBlocks,
+  toolLoopStopReason,
+  type LocalToolCall,
+} from '../repl/agent-loop.js';
+// Re-exported for callers (and tests) that have always imported these from
+// chat.js. The implementations moved to ../repl/agent-loop.js so the turn
+// primitive can be reused outside the REPL — see
+// ink://specs/ink-runtime-shadow-clones.
+export {
+  extractLocalToolCalls,
+  isTerminalSignalToolResult,
+  stripLocalToolBlocks,
+} from '../repl/agent-loop.js';
+import {
   classifyError,
   decodeDelegationToken,
   encodeContextToken,
@@ -410,14 +428,6 @@ interface McpServerSummary {
   transport?: string;
   url?: string;
   command?: string;
-}
-
-interface LocalToolCall {
-  tool: string;
-  args: Record<string, unknown>;
-  raw: string;
-  /** Parsed from the deprecated <tool_call> XML variant, not an ink-tool fence. */
-  variantFormat?: boolean;
 }
 
 interface SessionTranscriptMetadata {
@@ -1274,92 +1284,6 @@ function compactForHistoryPreview(
     .replace(/[^\S\n]+/g, ' ')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
-}
-
-export function extractLocalToolCalls(responseText: string): LocalToolCall[] {
-  const indexed: Array<{ index: number; call: LocalToolCall }> = [];
-
-  for (const match of responseText.matchAll(/```ink-tool\s*([\s\S]*?)```/gi)) {
-    const payload = (match[1] || '').trim();
-    if (!payload) continue;
-    try {
-      const parsed = JSON.parse(payload) as Record<string, unknown>;
-      const tool = typeof parsed.tool === 'string' ? parsed.tool.trim() : '';
-      if (!tool) continue;
-      const args =
-        parsed.args && typeof parsed.args === 'object' && !Array.isArray(parsed.args)
-          ? (parsed.args as Record<string, unknown>)
-          : {};
-      indexed.push({ index: match.index ?? 0, call: { tool, args, raw: match[0] || '' } });
-    } catch {
-      continue;
-    }
-  }
-
-  // Variant tolerance: a long-lived session whose history predates
-  // wholly-in-ink can drift into emitting tool calls as
-  // `<tool_call>{"name":"mcp__inkwell__X","arguments":{...}}</tool_call>`
-  // XML text — imitating its own pre-#462 native-MCP history (Myra,
-  // 2026-08-10: the calls silently never ran, raw XML leaked to Telegram
-  // via the fallback router, and text-form signal_status never halted the
-  // continuation loop). Parse and execute the variant so the turn WORKS;
-  // the continuation prompt separately steers the model back to the fence.
-  for (const match of responseText.matchAll(/<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/gi)) {
-    const payload = (match[1] || '').trim();
-    if (!payload) continue;
-    try {
-      const parsed = JSON.parse(payload) as Record<string, unknown>;
-      const rawName = typeof parsed.name === 'string' ? parsed.name.trim() : '';
-      if (!rawName) continue;
-      // Strip the MCP namespace here (not just at execution) so client-local
-      // dispatch and terminal-signal detection see the bare tool name.
-      const tool = rawName.replace(/^mcp__inkwell__/, '');
-      const args =
-        parsed.arguments && typeof parsed.arguments === 'object' && !Array.isArray(parsed.arguments)
-          ? (parsed.arguments as Record<string, unknown>)
-          : {};
-      indexed.push({
-        index: match.index ?? 0,
-        call: { tool, args, raw: match[0] || '', variantFormat: true },
-      });
-    } catch {
-      continue;
-    }
-  }
-
-  // Preserve the model's emission order across both formats.
-  indexed.sort((a, b) => a.index - b.index);
-  return indexed.map((entry) => entry.call);
-}
-
-export function stripLocalToolBlocks(responseText: string): string {
-  return responseText
-    .replace(/```ink-tool[\s\S]*?```/gi, '')
-    .replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, '')
-    .trim();
-}
-
-/**
- * True when a signal_status tool result reports a TERMINAL status
- * (completed or blocked) — the agent explicitly ending its turn.
- *
- * The local-tool loop re-invokes the backend as long as any tool executed, and
- * signal_status counts as an executed tool. Without treating a terminal signal
- * as a stop condition, a single turn keeps re-invoking the backend up to the
- * iteration cap; the agent, re-prompted to "continue", just re-signals
- * completion each round — the multiplied signal_status calls and duplicate
- * backend/Claude sessions seen per heartbeat. 'continuing' is NOT terminal: the
- * agent is asking for another round, so the loop should proceed.
- */
-export function isTerminalSignalToolResult(result: unknown): boolean {
-  const text = (result as { content?: Array<{ text?: string }> } | undefined)?.content?.[0]?.text;
-  if (!text) return false;
-  try {
-    const status = (JSON.parse(text)?.signal as { status?: string } | undefined)?.status;
-    return status === 'completed' || status === 'blocked';
-  } catch {
-    return false;
-  }
 }
 
 function isAbortError(error: unknown): boolean {
@@ -4916,10 +4840,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // We execute them locally, then re-invoke the backend with the results so it
     // can reason about them and potentially emit more tool calls. This continues
     // until the backend produces no tool calls or we hit the iteration limit.
-    const MAX_TOOL_LOOP_ITERATIONS = 5;
+    const MAX_TOOL_LOOP_ITERATIONS = DEFAULT_MAX_TOOL_LOOP_ITERATIONS;
     let toolLoopIteration = 0;
     let responseText = '';
-    let localToolCalls: ReturnType<typeof extractLocalToolCalls> = [];
+    let localToolCalls: LocalToolCall[] = [];
     let allToolResults: Array<{ tool: string; result: unknown; status: string; args?: unknown }> =
       [];
 
@@ -4936,7 +4860,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
       }
 
       localToolCalls =
-        runtime.toolRouting === 'local' ? extractLocalToolCalls(responseText).slice(0, 5) : [];
+        runtime.toolRouting === 'local'
+          ? extractLocalToolCalls(responseText).slice(0, MAX_TOOL_CALLS_PER_ITERATION)
+          : [];
 
       if (localToolCalls.length === 0) break;
 
@@ -5258,22 +5184,17 @@ export async function runChat(options: ChatOptions): Promise<void> {
       }
       toolLoopIteration++;
 
-      // Check if we should continue the loop
-      const hasExecutedTools = iterationResults.some(
-        (r) => r.status === 'executed' || r.status === 'approved'
+      // Check if we should continue the loop. The predicate (including the
+      // ordering that lets a terminal signal_status beat executed tools) lives
+      // in ../repl/agent-loop.js so the loop and its regression test share one
+      // implementation instead of the test mirroring it.
+      const stopReason = toolLoopStopReason(
+        iterationResults,
+        toolLoopIteration,
+        MAX_TOOL_LOOP_ITERATIONS
       );
-      // A terminal signal_status (completed/blocked) ends the turn immediately —
-      // the agent said it's done. Without this the loop keeps re-invoking the
-      // backend (signal_status counts as an executed tool), and each re-invoke
-      // is a fresh backend/Claude session in which the re-prompted agent just
-      // re-signals completion — the 4x signal_status + duplicate sessions per
-      // heartbeat. This must be checked BEFORE hasExecutedTools so a turn that
-      // both did work and signaled done still stops here.
-      const signaledDone = iterationResults.some(
-        (r) => r.tool === 'signal_status' && isTerminalSignalToolResult(r.result)
-      );
-      if (signaledDone || !hasExecutedTools || toolLoopIteration >= MAX_TOOL_LOOP_ITERATIONS) {
-        if (!signaledDone && toolLoopIteration >= MAX_TOOL_LOOP_ITERATIONS) {
+      if (stopReason) {
+        if (stopReason === 'iteration-cap') {
           printLine(
             chalk.dim(`(tool loop limit reached — ${MAX_TOOL_LOOP_ITERATIONS} iterations)`)
           );
