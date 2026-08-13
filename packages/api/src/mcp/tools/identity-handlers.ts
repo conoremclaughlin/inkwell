@@ -190,12 +190,12 @@ function withWorkspaceFilter<T>(query: T, workspaceId?: string): T {
  * Write identity to file system
  */
 function syncIdentityToFile(agentId: string, content: string): string {
-  const pcpDir = join(homedir(), '.pcp', 'individuals', agentId);
-  const filePath = join(pcpDir, 'IDENTITY.md');
+  const inkDir = join(homedir(), '.ink', 'individuals', agentId);
+  const filePath = join(inkDir, 'IDENTITY.md');
 
   // Ensure directory exists
-  if (!existsSync(pcpDir)) {
-    mkdirSync(pcpDir, { recursive: true });
+  if (!existsSync(inkDir)) {
+    mkdirSync(inkDir, { recursive: true });
   }
 
   writeFileSync(filePath, content, 'utf-8');
@@ -862,7 +862,7 @@ export async function handleChooseName(args: unknown, dataComposer: DataComposer
 
     // Also write SOUL.md if provided
     if (params.soul) {
-      const soulDir = join(homedir(), '.pcp', 'individuals', agentId);
+      const soulDir = join(homedir(), '.ink', 'individuals', agentId);
       if (!existsSync(soulDir)) {
         mkdirSync(soulDir, { recursive: true });
       }

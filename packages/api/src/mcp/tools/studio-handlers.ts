@@ -13,6 +13,7 @@ import { existsSync } from 'fs';
 import type { DataComposer } from '../../data/composer';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
 import { logger } from '../../utils/logger';
+import { bootstrapStudio } from '@inklabs/shared';
 import { ensureStudioSettings } from '../../services/studio-settings';
 import { resolveMainStudio } from '../../services/sessions/session-service';
 
@@ -236,6 +237,30 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
         execSync('yarn install', {
           cwd: worktreePath,
           stdio: 'pipe',
+        });
+      }
+
+      // Seed local config the same way `ink studio new` does. .mcp.json and
+      // .env.local are gitignored, so `git worktree add` brings neither —
+      // without this the studio has no MCP config at all: Claude sessions get
+      // no tools, and Codex spawns against a partial [mcp_servers.inkwell]
+      // and dies on "invalid transport". Copy from the resolved main root, not
+      // the caller's repoRoot — a linked-worktree caller would otherwise seed
+      // the new studio from its own (possibly customised or missing) config.
+      // Best-effort; a studio that fails to bootstrap is still a usable
+      // worktree.
+      try {
+        const result = bootstrapStudio(mainRoot, worktreePath);
+        logger.info('Bootstrapped studio config', {
+          worktreePath,
+          copied: result.copied,
+          codex: result.codex,
+          gemini: result.gemini,
+        });
+      } catch (bootstrapError) {
+        logger.warn('Studio config bootstrap failed', {
+          worktreePath,
+          error: bootstrapError instanceof Error ? bootstrapError.message : String(bootstrapError),
         });
       }
     } catch (gitError) {

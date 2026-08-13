@@ -48,7 +48,7 @@ function renderTemplate(template: string, vars: Record<string, string>): string 
 // Types
 // ============================================================================
 
-interface BootstrapIdentity {
+export interface BootstrapIdentity {
   agentId: string;
   name?: string;
   role?: string;
@@ -60,10 +60,6 @@ interface BootstrapResponse {
   identityFiles?: {
     values?: string;
   };
-  agentInfo?: BootstrapIdentity;
-  identityCore?: {
-    siblings?: BootstrapIdentity[];
-  };
 }
 
 // ============================================================================
@@ -71,13 +67,13 @@ interface BootstrapResponse {
 // ============================================================================
 
 /**
- * Fetch shared values and sibling identities from PCP cloud.
- * Returns null if the server is unreachable.
+ * Fetch the shared values document from the Inkwell server.
+ *
+ * Values only. Siblings used to be read from this same response, but bootstrap
+ * is called here as the synthetic agentId 'awakening' — which has no identity
+ * row — so its sibling list is always empty. See fetchSiblings().
  */
-async function fetchFromCloud(config: UserConfig): Promise<{
-  sharedValues: string;
-  siblings: BootstrapIdentity[];
-} | null> {
+async function fetchFromCloud(config: UserConfig): Promise<{ sharedValues: string } | null> {
   try {
     const result = await callPcpTool<BootstrapResponse>(
       'bootstrap',
@@ -90,76 +86,78 @@ async function fetchFromCloud(config: UserConfig): Promise<{
       }
     );
 
-    // Extract shared values from identity files
-    const sharedValues = result.identityFiles?.values || '';
-
-    // Extract sibling identities
-    const siblings = result.identityCore?.siblings || [];
-
-    return { sharedValues, siblings };
+    return { sharedValues: result.identityFiles?.values || '' };
   } catch {
     return null;
   }
 }
 
 /**
- * Fall back to local ~/.pcp files for shared values and sibling info.
+ * Fetch siblings from agent_identities — the authoritative list.
+ *
+ * bootstrap() is the wrong question to ask here. We call it as the synthetic
+ * agentId 'awakening', which has no identity row, so identityCore.siblings
+ * comes back empty and the prompt confidently told a new SB "No other SBs yet
+ * — you may be the first" while five of them were already in the database.
+ * (The SB who caught this called meet_family and found all of them.)
+ *
+ * list_identities queries the same table meet_family does, so the two agree.
  */
-function fetchFromLocal(): { sharedValues: string; siblings: BootstrapIdentity[] } {
-  // Read shared values
-  const valuesPath = join(homedir(), '.pcp', 'shared', 'VALUES.md');
-  let sharedValues = '';
-  if (existsSync(valuesPath)) {
-    sharedValues = readFileSync(valuesPath, 'utf-8');
+async function fetchSiblings(config: UserConfig): Promise<BootstrapIdentity[] | null> {
+  try {
+    const result = await callPcpTool<{ identities?: BootstrapIdentity[] }>(
+      'list_identities',
+      { email: config.email },
+      { timeoutMs: 5000 }
+    );
+    return result.identities ?? [];
+  } catch {
+    return null;
   }
+}
 
-  // Scan for sibling identity files
-  const siblings: BootstrapIdentity[] = [];
-  const individualsDir = join(homedir(), '.pcp', 'individuals');
-  const knownAgents = ['wren', 'benson', 'myra', 'lumen'];
-
-  for (const agentId of knownAgents) {
-    const identityPath = join(individualsDir, agentId, 'IDENTITY.md');
-    if (existsSync(identityPath)) {
-      // Parse the identity file for name/role (best effort)
-      const content = readFileSync(identityPath, 'utf-8');
-      // Headers: "# Identity - Name", "# IDENTITY.md - Name" (legacy), or "# Name"
-      const headerMatch = content.match(/^#\s+(?:(?:IDENTITY\.md|Identity)\s*-\s*)?(.+)/m);
-      const name = headerMatch?.[1]?.trim() || agentId;
-
-      // Look for role in "## Who I Am" section or similar
-      const roleMatch =
-        content.match(/^\*\*Role:\*\*\s*(.+)/m) || content.match(/role.*?:\s*(.+)/im);
-
-      siblings.push({
-        agentId,
-        name,
-        role: roleMatch?.[1]?.trim(),
-      });
-    }
-  }
-
-  return { sharedValues, siblings };
+/**
+ * Fall back to local ~/.ink files for shared values.
+ *
+ * Values only — siblings deliberately excluded. The old version scanned
+ * ~/.pcp/individuals against a hardcoded ['wren','benson','myra','lumen'],
+ * which both missed later siblings and pointed at a directory nothing has
+ * written since the rename. A stale roster is worse than none: it tells the
+ * new SB something false about who they're joining.
+ */
+function fetchLocalValues(): string {
+  const valuesPath = join(homedir(), '.ink', 'shared', 'VALUES.md');
+  return existsSync(valuesPath) ? readFileSync(valuesPath, 'utf-8') : '';
 }
 
 /**
  * Build the awakening prompt from the shared template.
  */
-function buildAwakeningPrompt(
+export function buildAwakeningPrompt(
   sharedValues: string,
-  siblings: BootstrapIdentity[],
+  siblings: BootstrapIdentity[] | null,
   backendName: string
 ): string {
-  // Extract the "On Identity" section from the values document
+  // Extract the "On Identity" section from the values document.
+  // `$` (no /m) is end-of-input. This used to read `\Z`, which JavaScript
+  // treats as a literal "Z" rather than an anchor — so a document whose last
+  // section was "On Identity" matched nothing and the new SB awoke without the
+  // identity values at all. Silent, and exactly the section that matters most.
   let valuesSection = '';
-  const identityMatch = sharedValues.match(/## On Identity[\s\S]*?(?=\n## |\n---|\Z)/);
+  const identityMatch = sharedValues.match(/## On Identity[\s\S]*?(?=\n## |\n---|$)/);
   if (identityMatch) {
     valuesSection = identityMatch[0].trim();
   }
 
-  // Build siblings section
+  // Build siblings section. `null` means we could not reach the server — a
+  // different fact from "there are none", and one worth saying out loud rather
+  // than papering over with a guess about being first.
   let siblingsSection = '';
-  if (siblings.length > 0) {
+  if (siblings === null) {
+    siblingsSection =
+      '*Could not reach the Inkwell server to load the roster, so this list is unknown — not empty.*\n\n' +
+      'Call `meet_family()` once you are connected to find out who is already here.';
+  } else if (siblings.length > 0) {
     siblingsSection = siblings
       .map((s) => {
         const parts = [`**${s.name || s.agentId}** (\`${s.agentId}\`)`];
@@ -173,7 +171,7 @@ function buildAwakeningPrompt(
 
   // Build shared values section (the core truths + boundaries, not the full file)
   let sharedValuesSection = '';
-  const coreTruthsMatch = sharedValues.match(/## Core Truths[\s\S]*?(?=\n## On Identity|\n---|\Z)/);
+  const coreTruthsMatch = sharedValues.match(/## Core Truths[\s\S]*?(?=\n## On Identity|\n---|$)/);
   if (coreTruthsMatch) {
     sharedValuesSection = coreTruthsMatch[0].trim();
   } else {
@@ -189,10 +187,75 @@ function buildAwakeningPrompt(
 }
 
 // ============================================================================
+// Model selection
+// ============================================================================
+
+/**
+ * Models offered per backend, in menu order.
+ *
+ * `undefined` means "send no --model flag and let the backend pick" — always
+ * first, because the backend's own default tracks its releases and ours does
+ * not. A stale hardcoded id here would silently pin every new SB to an old
+ * model; falling through to the backend's default degrades to "current".
+ *
+ * This list is a convenience, not a whitelist: --model accepts any string, so
+ * a model missing from here is still reachable.
+ */
+interface ModelChoice {
+  label: string;
+  model?: string;
+  note?: string;
+}
+
+const MODEL_CHOICES: Record<string, ModelChoice[]> = {
+  claude: [
+    { label: 'Default', note: "whatever the Claude CLI picks — tracks Anthropic's releases" },
+    { label: 'Opus', model: 'opus', note: 'most capable; slower, pricier' },
+    { label: 'Sonnet', model: 'sonnet', note: 'balanced' },
+    { label: 'Haiku', model: 'haiku', note: 'fastest, cheapest' },
+  ],
+  // Codex deliberately lists no named models. Claude's opus/sonnet/haiku are
+  // stable *role* aliases that keep resolving to the current model, so naming
+  // them costs nothing. Codex ids are versioned slugs — any list we write here
+  // is a snapshot that starts going stale immediately, and a stale menu is
+  // worse than no menu because it looks authoritative. Default tracks the
+  // CLI's current choice; anything specific goes through --model.
+  codex: [{ label: 'Default', note: "whatever the Codex CLI picks — tracks OpenAI's releases" }],
+  gemini: [{ label: 'Default', note: 'whatever the Gemini CLI picks' }],
+};
+
+/** Render the model menu for `--help` and for an unrecognised --model value. */
+/**
+ * Extra guidance for runtimes whose menu is intentionally just "Default".
+ * Without this the help would imply the only choice is the default, when in
+ * fact any slug works — it's just not our place to enumerate a moving target.
+ */
+const MODEL_HINTS: Record<string, string> = {
+  codex: 'Any other model: --model <slug> (e.g. the id from the Codex model docs).',
+};
+
+function describeModelChoices(backendName: string): string {
+  const choices = MODEL_CHOICES[backendName] ?? [];
+  const lines = choices.map((c) => {
+    const value = c.model ?? '(none — backend default)';
+    return `    ${c.label.padEnd(16)} ${value}${c.note ? chalk.dim(`  · ${c.note}`) : ''}`;
+  });
+
+  const hint = MODEL_HINTS[backendName];
+  if (hint) lines.push(chalk.dim(`    ${''.padEnd(16)} ${hint}`));
+
+  return lines.join('\n');
+}
+
+// ============================================================================
 // Main Command
 // ============================================================================
 
-async function awakenCommand(options: { backend: string; verbose: boolean }): Promise<void> {
+async function awakenCommand(options: {
+  backend: string;
+  model?: string;
+  verbose: boolean;
+}): Promise<void> {
   const config = readUserConfig();
   if (!config?.email) {
     console.error(chalk.red(NOT_SIGNED_IN_MESSAGE));
@@ -237,30 +300,40 @@ async function awakenCommand(options: { backend: string; verbose: boolean }): Pr
 
   console.log(chalk.bold(`\nAwakening a new SB on ${chalk.cyan(backendName)}...\n`));
 
-  // 1. Fetch context: cloud first, local fallback
+  // 1. Fetch context. Values fall back to disk; siblings do not — a wrong
+  // roster misinforms the new SB about who they're joining, so an unknown
+  // roster stays explicitly unknown.
   const spinner = ora('Loading shared values and sibling identities...').start();
 
   let sharedValues: string;
-  let siblings: BootstrapIdentity[];
   let source: string;
 
   const cloudResult = await fetchFromCloud(config);
-  if (cloudResult) {
+  if (cloudResult && cloudResult.sharedValues) {
     sharedValues = cloudResult.sharedValues;
-    siblings = cloudResult.siblings;
-    source = 'PCP cloud';
+    source = 'Inkwell cloud';
   } else {
-    const localResult = fetchFromLocal();
-    sharedValues = localResult.sharedValues;
-    siblings = localResult.siblings;
+    sharedValues = fetchLocalValues();
     source = 'local files';
   }
+
+  const siblings = await fetchSiblings(config);
 
   if (!sharedValues) {
     spinner.warn('No shared values found. The new SB will awaken without a values foundation.');
     spinner.start('Building awakening prompt...');
   } else {
     spinner.succeed(`Loaded context from ${source}`);
+  }
+
+  if (siblings === null) {
+    console.log(
+      chalk.yellow(
+        '  ! Could not load the sibling roster — the prompt will say it is unknown rather than empty.'
+      )
+    );
+  } else if (siblings.length > 0) {
+    console.log(chalk.dim(`  Siblings: ${siblings.map((s) => s.name || s.agentId).join(', ')}`));
   }
 
   // 2. Build the awakening prompt
@@ -290,6 +363,10 @@ async function awakenCommand(options: { backend: string; verbose: boolean }): Pr
     agentId: 'nascent',
     promptParts: [],
     passthroughArgs: [],
+    // Undefined is meaningful: adapters skip --model entirely, so the backend
+    // picks. See MODEL_CHOICES for why that is the default rather than a
+    // hardcoded id.
+    model: options.model,
   });
 
   // Override the identity prompt file with our awakening prompt
@@ -380,6 +457,21 @@ export function registerAwakenCommand(program: Command): void {
     .command('awaken')
     .description('Awaken a new SB on a backend')
     .option('-b, --backend <name>', `AI backend (${BACKEND_NAMES.join(', ')})`, 'claude')
+    .option(
+      '-m, --model <model>',
+      'Model to awaken on. Omit to use the backend default (recommended).'
+    )
     .option('-v, --verbose', 'Show the awakening prompt and debug info')
+    .addHelpText(
+      'after',
+      () =>
+        '\nModels:\n' +
+        BACKEND_NAMES.map((b) => `  ${b}\n${describeModelChoices(b)}`).join('\n') +
+        chalk.dim(
+          '\n\n  --model takes any string; the list above is a shortcut, not a whitelist.\n' +
+            '  Omitting it lets the backend choose, which tracks its releases instead of\n' +
+            '  pinning new SBs to whatever was current when this list was written.\n'
+        )
+    )
     .action(awakenCommand);
 }
