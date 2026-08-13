@@ -88,6 +88,25 @@ export interface AgentLoopPorts {
       ctx: { iteration: number; signal?: AbortSignal }
     ): Promise<ToolResultRecord[]>;
   };
+  backend: {
+    /**
+     * Run ONE backend turn and return its raw outcome.
+     *
+     * The host owns everything specialized about a spawn: provider-session
+     * seeding and reuse, recovery when a resumed session has vanished, media
+     * delivery flags, passthrough args, SIGINT and abort-handler wiring. The
+     * loop only decides *what to say next* and *whether to say it again*.
+     *
+     * `body` is the raw continuation text when `isContinuation` is true; the
+     * host decides whether it needs wrapping in a full prompt envelope, because
+     * only the host knows whether the provider session is being reused (in which
+     * case the model already holds the history and wants the delta alone).
+     */
+    runTurn(
+      body: string,
+      ctx: { iteration: number; isContinuation: boolean; signal?: AbortSignal }
+    ): Promise<BackendTurnOutcome>;
+  };
   /**
    * Per-backend-turn lifecycle, so the host can wire cancellation (SIGINT, the
    * Ink abort handler) around each turn without the loop importing any of it.
@@ -111,6 +130,161 @@ export interface BackendTurnSummary {
   durationMs?: number;
   stderr?: string;
   iteration: number;
+}
+
+/** Raw result of one backend turn, as the host reports it back to the loop. */
+export interface BackendTurnOutcome {
+  success: boolean;
+  /** Parsed assistant text when streaming; absent for stateless/raw backends. */
+  responseText?: string;
+  stdout: string;
+  stderr: string;
+  exitCode?: number;
+}
+
+/**
+ * Resolve a turn's display text.
+ *
+ * In streaming mode `responseText` is the parsed assistant text and `stdout` is
+ * the raw NDJSON event stream, so stdout must never be used as the reply there.
+ * A turn that produced nothing at all still needs *something* to put in the
+ * ledger, hence the placeholder.
+ */
+export function resolveResponseText(outcome: BackendTurnOutcome): string {
+  let text = (outcome.responseText ?? outcome.stdout).trim();
+  if (!text && outcome.stderr.trim()) text = outcome.stderr.trim();
+  return text || '(no output)';
+}
+
+/**
+ * Build the continuation body fed back to the backend after tools ran.
+ *
+ * When the model used the deprecated <tool_call> XML variant its calls were
+ * executed anyway (see extractLocalToolCalls), but the format is corrected HERE,
+ * while the results prove the runtime heard it — so the drift does not reinforce.
+ */
+export function buildContinuationBody(
+  results: ReadonlyArray<ToolResultRecord>,
+  calls: ReadonlyArray<LocalToolCall>
+): string {
+  const toolResultsSummary = results
+    .map((r) => {
+      const resultStr = typeof r.result === 'string' ? r.result : JSON.stringify(r.result);
+      return `Tool ${r.tool} (${r.status}): ${resultStr}`;
+    })
+    .join('\n\n');
+
+  const formatCorrection = calls.some((c) => c.variantFormat)
+    ? '\n\nFORMAT NOTE: your tool calls used <tool_call> XML — the ink runtime executed them this time, but the ONLY supported format is a fenced block:\n```ink-tool\n{"tool":"<name>","args":{...}}\n```\nUse ink-tool fences (bare tool names, no mcp__inkwell__ prefix) from now on.'
+    : '';
+
+  return `[Tool results from previous turn]\n${toolResultsSummary}${formatCorrection}\n\nContinue your response based on these tool results. If you need more tools, emit ink-tool blocks. Otherwise, provide your final answer.`;
+}
+
+export interface AgentLoopInput {
+  /** The opening prompt, already enveloped by the host. */
+  prompt: string;
+  /** Local tool routing off (`backend`) means the loop never extracts calls. */
+  toolRouting: 'backend' | 'local';
+  maxIterations?: number;
+  signal?: AbortSignal;
+}
+
+/**
+ * Drive a backend to completion: run a turn, execute whatever tools it asked
+ * for, feed the results back, repeat until it stops asking.
+ *
+ * This is the whole of what a shadow clone needs and the whole of what the REPL
+ * turn shares with one. Everything specialized — spawn configuration, provider
+ * session lifecycle, approval policy, TUI — lives behind the ports.
+ */
+export async function runAgentLoop(
+  input: AgentLoopInput,
+  ports: AgentLoopPorts
+): Promise<AgentLoopResult> {
+  const maxIterations = input.maxIterations ?? DEFAULT_MAX_TOOL_LOOP_ITERATIONS;
+  const allToolResults: ToolResultRecord[] = [];
+
+  let iteration = 0;
+  let outcome = await ports.backend.runTurn(input.prompt, {
+    iteration,
+    isContinuation: false,
+    signal: input.signal,
+  });
+
+  let responseText = resolveResponseText(outcome);
+  let calls: LocalToolCall[] = [];
+  let stopReason: AgentLoopStopReason = 'no-tools';
+
+  for (;;) {
+    responseText = resolveResponseText(outcome);
+
+    calls =
+      input.toolRouting === 'local'
+        ? extractLocalToolCalls(responseText).slice(0, MAX_TOOL_CALLS_PER_ITERATION)
+        : [];
+
+    if (calls.length === 0) {
+      stopReason = 'no-tools';
+      break;
+    }
+
+    const results = await ports.tools.execute(calls, { iteration, signal: input.signal });
+    allToolResults.push(...results);
+    for (const r of results) ports.observe?.recordToolCall(r);
+
+    iteration++;
+
+    const reason = toolLoopStopReason(results, iteration, maxIterations);
+    if (reason) {
+      stopReason = reason;
+      if (reason === 'iteration-cap') {
+        ports.ui.printLine(`(tool loop limit reached — ${maxIterations} iterations)`);
+      }
+      break;
+    }
+
+    const ranTools = Array.from(new Set(results.map((r) => r.tool))).join(', ');
+    ports.ui.printEvent(`  ⋯ ran ${ranTools} — continuing (${iteration}/${maxIterations})…`);
+
+    const stopWaiting = ports.ui.startWaiting();
+    try {
+      outcome = await ports.backend.runTurn(buildContinuationBody(results, calls), {
+        iteration,
+        isContinuation: true,
+        signal: input.signal,
+      });
+    } finally {
+      stopWaiting();
+    }
+
+    if (!outcome.success) {
+      responseText = resolveResponseText(outcome);
+      stopReason = 'backend-failure';
+      break;
+    }
+  }
+
+  // An aborted turn (SIGINT kills the child) exits >=128 and has no usable text.
+  const aborted = !outcome.success && outcome.exitCode !== undefined && outcome.exitCode >= 128;
+
+  const assistantDisplayText = aborted
+    ? ''
+    : input.toolRouting === 'local'
+      ? stripLocalToolBlocks(responseText) ||
+        (calls.length > 0 || allToolResults.length > 0
+          ? '(local tool call emitted; see tool results above)'
+          : responseText)
+      : responseText;
+
+  return {
+    responseText,
+    assistantDisplayText,
+    toolResults: allToolResults,
+    iterations: iteration,
+    success: outcome.success,
+    stopReason: aborted ? 'aborted' : stopReason,
+  };
 }
 
 export interface AgentLoopResult {
