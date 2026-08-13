@@ -14,6 +14,11 @@
  *
  * Requires:
  * - INK_LIVE_TESTS=1
+ *
+ * INTENTIONAL (Conor, 2026-08-12): this suite consumes REAL LLM tokens and is
+ * DELIBERATELY excluded from CI (opt-in env gate + excluded from default
+ * vitest configs). That is a cost decision, not an oversight — do not wire it
+ * into CI. Token-free DB integration suites run in CI; live ones never do.
  * - claude CLI installed with valid credentials
  * - Inkwell server running (default localhost:3001, override via PCP_SERVER_URL)
  * - Valid access token in ~/.ink/auth.json

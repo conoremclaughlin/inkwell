@@ -11,10 +11,8 @@
  */
 
 import { beforeAll } from 'vitest';
-import { existsSync, readFileSync } from 'fs';
-import { homedir } from 'os';
-import { join } from 'path';
 import { createClient } from '@supabase/supabase-js';
+import { INTEGRATION_TEST_USER_ID } from './integration-fixtures';
 
 const LOCALHOST_HOSTS = new Set(['localhost', '127.0.0.1', '::1']);
 
@@ -53,17 +51,23 @@ if (process.env.INK_ALLOW_REMOTE_INTEGRATION_DB !== '1') {
 }
 
 /**
- * Seed the fixture user the DB integration tests FK against.
+ * Seed the CANONICAL SYNTHETIC fixture user the DB integration tests FK
+ * against (INTEGRATION_TEST_USER_ID from integration-fixtures.ts).
  *
  * The DB integration suites (task-handlers, strategy-*) insert rows whose
- * user_id references users.id, using the userId from ~/.ink/config.json. A
- * freshly-migrated isolated Supabase has no user rows, so every one of those
- * inserts died on `task_groups_user_id_fkey` — 11 failures that looked like
- * product bugs but were a missing fixture.
+ * user_id references users.id. A freshly-migrated isolated Supabase has no
+ * user rows, so every one of those inserts died on `task_groups_user_id_fkey`
+ * — 11 failures that looked like product bugs but were a missing fixture.
  *
- * This can't live in supabase/seed.sql: the id is per-developer and user ids
- * must never be committed to the repo. So we read it at runtime, exactly like
- * the tests do, and upsert it here.
+ * The seeded id is the synthetic constant, NEVER a developer's organic
+ * ~/.ink/config.json id: the organic id doesn't exist on CI (which made these
+ * suites silently skip there — Lumen, PR #439 review) and organic user ids
+ * don't belong in test rows.
+ *
+ * INTENTIONAL (Conor, 2026-08-12): the suites seeded here are token-free —
+ * server/DB round-trips, no LLM calls — which is why they run in CI at all.
+ * LIVE suites (*.live.*, gated on INK_LIVE_TESTS=1) consume real LLM tokens
+ * and are DELIBERATELY excluded from CI as a cost decision, not an oversight.
  *
  * Guards:
  * - LOCALHOST ONLY. We never write fixture rows into a remote database, even
@@ -71,8 +75,6 @@ if (process.env.INK_ALLOW_REMOTE_INTEGRATION_DB !== '1') {
  *   real DB that already has its users.
  * - Idempotent: check first, insert only when missing, so repeat runs and
  *   parallel vitest workers don't collide.
- * - No-op when there's no config (e.g. CI), where the suites self-skip anyway
- *   because canRun requires TEST_USER_ID.
  */
 async function seedTestUser(): Promise<void> {
   const supabaseUrl = process.env.SUPABASE_URL!;
@@ -86,16 +88,7 @@ async function seedTestUser(): Promise<void> {
   }
   if (!LOCALHOST_HOSTS.has(hostname)) return;
 
-  const configPath = join(homedir(), '.ink', 'config.json');
-  if (!existsSync(configPath)) return;
-
-  let userId: string | undefined;
-  try {
-    userId = JSON.parse(readFileSync(configPath, 'utf-8')).userId;
-  } catch {
-    return; // Unparseable config — suites that need the id self-skip.
-  }
-  if (!userId) return;
+  const userId = INTEGRATION_TEST_USER_ID;
 
   const client = createClient(supabaseUrl, supabaseKey, {
     auth: { autoRefreshToken: false, persistSession: false },
