@@ -216,8 +216,12 @@ const MODEL_CHOICES: Record<string, ModelChoice[]> = {
   ],
   codex: [
     { label: 'Default', note: 'whatever the Codex CLI picks' },
-    { label: 'GPT-5.1 Codex', model: 'gpt-5.1-codex' },
-    { label: 'GPT-5.1', model: 'gpt-5.1' },
+    // Codex has no stable role aliases (unlike claude's opus/sonnet/haiku), so
+    // these are versioned slugs and will go stale with each model generation.
+    // Catalog: GPT-5.6 series, per the Codex model docs as of 2026-08-12.
+    { label: 'GPT-5.6 Sol', model: 'gpt-5.6-sol', note: 'flagship; complex or ambiguous work' },
+    { label: 'GPT-5.6 Terra', model: 'gpt-5.6-terra', note: 'balanced everyday workhorse' },
+    { label: 'GPT-5.6 Luna', model: 'gpt-5.6-luna', note: 'fastest, cheapest' },
   ],
   gemini: [{ label: 'Default', note: 'whatever the Gemini CLI picks' }],
 };
