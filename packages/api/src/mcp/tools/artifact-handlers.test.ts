@@ -571,6 +571,71 @@ describe('handleUpdateArtifact', () => {
         )
       ).rejects.toThrow('Artifact write requires workspace scope');
     });
+
+    it('derives write workspace from the request-context agent with no args.agentId (session-enriched identity, PR #468)', async () => {
+      // The ink runtime's tool calls arrive under a USER bearer with the agent
+      // identity supplied via session-validated x-ink-context enrichment —
+      // request context carries agentId, args do not. Workspace derivation
+      // must succeed from the pinned agent alone; before the enrichment this
+      // exact shape failed with 'requires workspace scope' (Myra's
+      // create_artifact bug).
+      clearSessionContext();
+      const supabase = createTableAwareSupabaseMock({
+        agent_identities: [
+          {
+            then: {
+              data: [{ workspace_id: '11111111-1111-1111-1111-111111111111' }],
+              error: null,
+            },
+          },
+          {
+            maybeSingle: [
+              {
+                data: { id: 'identity-myra', agent_id: 'myra', name: 'Myra', backend: 'claude' },
+                error: null,
+              },
+            ],
+          },
+        ],
+        artifacts: [
+          { maybeSingle: [{ data: null, error: null }] },
+          {
+            single: [
+              {
+                data: {
+                  id: 'artifact-ctx-1',
+                  uri: 'ink://specs/ctx-derived',
+                  title: 'Ctx Derived',
+                  artifact_type: 'spec',
+                  version: 1,
+                  created_at: '2026-08-10T00:00:00Z',
+                },
+                error: null,
+              },
+            ],
+          },
+        ],
+        artifact_history: [{ then: { data: null, error: null } }],
+      });
+
+      const result = await runWithRequestContext(
+        { userId: '00000000-0000-0000-0000-000000000001', agentId: 'myra' },
+        async () =>
+          handleCreateArtifact(
+            {
+              userId: '00000000-0000-0000-0000-000000000001',
+              uri: 'ink://specs/ctx-derived',
+              title: 'Ctx Derived',
+              content: '# via pinned agent',
+              artifactType: 'spec',
+            },
+            createMockDataComposer(supabase)
+          )
+      );
+
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.success).toBe(true);
+    });
   });
 });
 

@@ -13,6 +13,7 @@
 
 import type { Command } from 'commander';
 import { PcpClient } from '../lib/pcp-client.js';
+import { NOT_SIGNED_IN_MESSAGE } from '../lib/user-config.js';
 
 interface WaitOptions {
   thread?: string;
@@ -48,7 +49,7 @@ export function registerWaitCommand(program: Command): void {
       const config = pcp.getConfig();
 
       if (!config.email) {
-        console.error('[ink wait] PCP not configured. Run: ink init');
+        console.error(`[ink wait] ${NOT_SIGNED_IN_MESSAGE}`);
         process.exit(2);
       }
 

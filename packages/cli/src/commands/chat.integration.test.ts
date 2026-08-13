@@ -1816,7 +1816,7 @@ describe('runChat integration', () => {
     expect(testState.pcpCalls.some((call) => call.tool === 'send_to_inbox')).toBe(true);
   }, 10_000);
 
-  it('applies default backend timeout for non-interactive turns', async () => {
+  it('leaves the hard timeout unset and applies the idle timeout for non-interactive turns', async () => {
     await runChat({
       agent: 'lumen',
       backend: 'codex',
@@ -1828,8 +1828,102 @@ describe('runChat integration', () => {
     expect(testState.runBackendImpl).toHaveBeenCalledTimes(1);
     const backendRequest = testState.runBackendImpl.mock.calls[0][0] as {
       timeoutMs?: number;
+      idleTimeoutMs?: number;
+      stream?: boolean;
     };
-    expect(backendRequest.timeoutMs).toBe(120_000);
+    // No default hard wall — the turn is governed by token-flow: 15 min of
+    // silence reaps it (below the outer InkRunner 1h inactivity window), and
+    // backend-runner's 4h runaway backstop covers the pathological case.
+    expect(backendRequest.timeoutMs).toBeUndefined();
+    expect(backendRequest.idleTimeoutMs).toBe(900_000);
+    expect(backendRequest.stream).toBe(true);
+  });
+
+  it('ledgers compact backend events with monotonic eids (observer-attach M1)', async () => {
+    await runChat({
+      agent: 'lumen',
+      backend: 'codex',
+      nonInteractive: true,
+      message: 'observe me',
+      pollSeconds: '999',
+    });
+
+    const backendRequest = testState.runBackendImpl.mock.calls[0][0] as {
+      onEvent?: (evt: Record<string, unknown>) => void;
+    };
+    expect(backendRequest.onEvent).toBeDefined();
+
+    // Capture the live stdout feed so the wire events can be compared
+    // against the ledger (spec:observer-attach §4.2: the wire event IS the
+    // appended entry — deep-equal, not merely similar).
+    const stdoutWrites: string[] = [];
+    const stdoutSpy = vi.spyOn(process.stdout, 'write').mockImplementation(((chunk: unknown) => {
+      stdoutWrites.push(String(chunk));
+      return true;
+    }) as typeof process.stdout.write);
+
+    // Drive normalized backend events through the real handler — a tool
+    // lifecycle plus a long text block (must be truncated to a preview).
+    const longText = 'x'.repeat(500);
+    backendRequest.onEvent!({
+      kind: 'tool-use',
+      id: 'toolu_obs1',
+      name: 'WebSearch',
+      input: { q: 'deep' },
+    });
+    backendRequest.onEvent!({ kind: 'text', text: longText });
+    backendRequest.onEvent!({ kind: 'tool-result', id: 'toolu_obs1', isError: false });
+    stdoutSpy.mockRestore();
+
+    // The ledger must reproduce exactly what a live observer saw (no-fork
+    // invariant, spec:observer-attach §3.2) — compact entries, real eids.
+    const replDir = join(process.cwd(), '.ink', 'runtime', 'repl');
+    const transcriptFile = readdirSync(replDir).find((f) => f.endsWith('.jsonl'));
+    expect(transcriptFile).toBeDefined();
+    const events = readFileSync(join(replDir, transcriptFile!), 'utf-8')
+      .split('\n')
+      .filter(Boolean)
+      .map((l) => JSON.parse(l) as Record<string, unknown>)
+      .filter((e) => e.type === 'backend_tool' || e.type === 'backend_text');
+
+    expect(events).toHaveLength(3);
+    const [toolStart, text, toolDone] = events;
+
+    expect(toolStart).toMatchObject({
+      type: 'backend_tool',
+      name: 'WebSearch',
+      status: 'running',
+      toolUseId: 'toolu_obs1',
+    });
+    // Compact: tool inputs must NOT be ledgered — full payloads live in the
+    // provider transcript, linked by toolUseId.
+    expect(toolStart).not.toHaveProperty('input');
+
+    expect(text.type).toBe('backend_text');
+    expect((text.preview as string).length).toBeLessThanOrEqual(200);
+    expect(text.preview as string).toContain('…');
+
+    expect(toolDone).toMatchObject({
+      type: 'backend_tool',
+      status: 'done',
+      toolUseId: 'toolu_obs1',
+    });
+
+    // Monotonic eids — the replay ordering contract.
+    const eids = events.map((e) => e.eid as number);
+    expect(eids.every((v) => typeof v === 'number')).toBe(true);
+    expect([...eids].sort((a, b) => a - b)).toEqual(eids);
+    expect(new Set(eids).size).toBe(eids.length);
+
+    // The wire event IS the ledger entry: every `obs` line's entry must
+    // deep-equal the appended transcript line, ts and eid included. Two
+    // independently-shaped writes would let live views fork from replay.
+    const obsEntries = stdoutWrites
+      .join('')
+      .split('\n')
+      .filter((l) => l.trim().startsWith('{"type":"obs"'))
+      .map((l) => (JSON.parse(l) as { entry: Record<string, unknown> }).entry);
+    expect(obsEntries).toEqual(events);
   });
 
   it('applies explicit --backend-timeout-seconds override', async () => {

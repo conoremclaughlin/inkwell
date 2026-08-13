@@ -39,6 +39,7 @@ import { InkRunner } from './ink-runner.js';
 import { ActivityStreamRepository } from '../../data/repositories/activity-stream.repository.js';
 import { resolveIdentityId } from '../../auth/resolve-identity.js';
 import { classifyError } from '@inklabs/shared';
+import { serializeError } from '../../utils/serialize-error.js';
 import { resolveTaskGroupForThreadKey } from '../task-group-resolver.js';
 import { getRunnerFilesDir } from '../sandbox/orchestrator.js';
 import { logger } from '../../utils/logger.js';
@@ -138,6 +139,28 @@ function routePatternSpecificity(pattern: string): number {
   const literalPrefix = pattern.split('*')[0];
   if (literalPrefix.length > 0) return 2; // prefix wildcard
   return 1; // bare wildcard '*'
+}
+
+/**
+ * Parse an identity's dashboard runtime config (agent_identities.metadata
+ * .runtimeConfig) into the spawn-relevant fields. Fails CLOSED: absent or
+ * malformed input yields toolRouting 'local' (ink-owned, provider withheld)
+ * and no maxTurns override (the runner then applies its own default+clamp).
+ */
+export function parseRuntimeConfig(metadata: unknown): {
+  maxTurns?: number;
+  toolRouting: 'backend' | 'local';
+} {
+  const meta = (metadata ?? {}) as Record<string, unknown>;
+  const rc = (meta.runtimeConfig ?? {}) as Record<string, unknown>;
+  const out: { maxTurns?: number; toolRouting: 'backend' | 'local' } = { toolRouting: 'local' };
+  if (typeof rc.maxTurns === 'number' && Number.isFinite(rc.maxTurns)) {
+    out.maxTurns = rc.maxTurns;
+  }
+  if (rc.toolRouting === 'local' || rc.toolRouting === 'backend') {
+    out.toolRouting = rc.toolRouting;
+  }
+  return out;
 }
 
 export class SessionService implements ISessionService {
@@ -335,10 +358,15 @@ export class SessionService implements ISessionService {
         await this.processQueueOrReleaseLock(lockKey);
       }
     } catch (error) {
+      // serializeError, not String(error)/'Unknown error': Supabase rejections
+      // are plain objects, so both of those erase the cause. See
+      // utils/serialize-error.ts.
+      const errorText = serializeError(error);
+
       logger.error('Error handling message', {
         userId,
         agentId,
-        error: error instanceof Error ? error.message : String(error),
+        error: errorText,
       });
 
       return {
@@ -349,7 +377,7 @@ export class SessionService implements ISessionService {
         sessionStatus: 'failed',
         compactionTriggered: false,
         finalTextResponse: undefined,
-        error: error instanceof Error ? error.message : 'Unknown error',
+        error: errorText,
         errorCode: 'INTERNAL_ERROR',
       };
     }
@@ -552,17 +580,28 @@ export class SessionService implements ISessionService {
 
     // Resolve sandbox_bypass: studio override > SB default > false
     let sandboxBypass = false;
+    // Per-SB runtime config (dashboard-tunable): continuation-loop cap and
+    // tool routing for ink spawns. Lives in agent_identities.metadata,
+    // resolved by the session's canonical identity UUID (session.sbId) —
+    // slugs are only unique per workspace and this path has no workspace
+    // scope. Missing/invalid identity fails CLOSED: toolRouting stays
+    // 'local' (ink-owned, provider withheld) and maxTurns stays default.
+    let runtimeMaxTurns: number | undefined;
+    let runtimeToolRouting: 'backend' | 'local' = 'local';
     if (this.supabase) {
       // SB-level default from agent_identities
-      const { data: identity } = await this.supabase
-        .from('agent_identities')
-        .select('sandbox_bypass')
-        .eq('user_id', userId)
-        .eq('agent_id', agentId)
-        .order('updated_at', { ascending: false })
-        .limit(1)
-        .maybeSingle();
+      const { data: identity } = session.sbId
+        ? await this.supabase
+            .from('agent_identities')
+            .select('sandbox_bypass, metadata')
+            .eq('id', session.sbId)
+            .eq('user_id', userId)
+            .maybeSingle()
+        : { data: null };
       sandboxBypass = identity?.sandbox_bypass ?? false;
+      const parsed = parseRuntimeConfig(identity?.metadata);
+      runtimeMaxTurns = parsed.maxTurns;
+      runtimeToolRouting = parsed.toolRouting;
 
       // Studio-level override (null = inherit from SB)
       if (session.studioId) {
@@ -617,6 +656,10 @@ export class SessionService implements ISessionService {
       channel: request.channel,
       ...(session.studioId ? { studioId: session.studioId } : {}),
       ...(sandboxBypass ? { sandboxBypass: true } : {}),
+      ...(runtimeMaxTurns !== undefined ? { maxTurns: runtimeMaxTurns } : {}),
+      // Always explicit — a headless boundary must never depend on worktree
+      // .ink/identity.json preferences or Commander defaults.
+      toolRouting: runtimeToolRouting,
       ...(permissionOverlay ? { permissionOverlay } : {}),
       // Propagate repo root so spawned backend's context token carries it
       repoRoot: resolvedWorkingDirectory.replace(/--[^/]+$/, ''),
@@ -823,11 +866,18 @@ export class SessionService implements ISessionService {
     }
 
     if (result.usage) {
-      await this.repository.updateTokenUsage(session.id, {
-        contextTokens: result.usage.contextTokens,
-        inputTokens: result.usage.inputTokens,
-        outputTokens: result.usage.outputTokens,
-      });
+      // Scope the cumulative checkpoint to the backend thread the counts came
+      // from — Codex totals restart whenever the thread does.
+      await this.repository.updateTokenUsage(
+        session.id,
+        {
+          contextTokens: result.usage.contextTokens,
+          inputTokens: result.usage.inputTokens,
+          outputTokens: result.usage.outputTokens,
+          cumulative: result.usage.cumulative,
+        },
+        { backendSessionId: result.backendSessionId ?? session.backendSessionId ?? null }
+      );
 
       // 6. Check if compaction is needed — only for claude-code backend where
       // PCP controls the context window (via sb chat). Native CLI backends
@@ -835,8 +885,11 @@ export class SessionService implements ISessionService {
       // backend self-compacts inside ink chat (token-budget auto-compaction);
       // its usage is persisted above for visibility but the server must NOT
       // also trigger compaction — one compaction owner per backend.
+      // An absent contextTokens means the backend reports no context measure,
+      // which is unknown rather than zero — never a basis for compacting.
       if (
         resolvedBackend === 'claude-code' &&
+        result.usage.contextTokens !== undefined &&
         result.usage.contextTokens >= this.config.compactionThreshold
       ) {
         logger.info('Session approaching context limit, triggering compaction', {

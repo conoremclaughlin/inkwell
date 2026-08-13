@@ -3,6 +3,9 @@
  */
 
 import { z } from 'zod';
+import { mkdir, writeFile } from 'fs/promises';
+import { homedir } from 'os';
+import { join, resolve } from 'path';
 import { getGoogleDriveService } from './service';
 import { resolveUserOrThrow } from '../../services/user-resolver';
 import { logger } from '../../utils/logger';
@@ -29,6 +32,7 @@ type ToolResult = {
 export const ALLOWED_DRIVE_OPERATIONS: Set<DriveOperation> = new Set([
   'list_files',
   'get_file',
+  'download_file',
   'create_folder',
   'move_file',
 ]);
@@ -88,6 +92,22 @@ export const createDriveFolderSchema = userIdentifierBaseSchema.extend({
 export const moveDriveFileSchema = userIdentifierBaseSchema.extend({
   fileId: z.string().min(1).describe('Drive file ID to move'),
   newParentFolderId: z.string().min(1).describe('Destination folder ID'),
+});
+
+export const downloadDriveFileSchema = userIdentifierBaseSchema.extend({
+  fileId: z.string().min(1).describe('Drive file ID to download'),
+  exportMimeType: z
+    .string()
+    .optional()
+    .describe(
+      'Override the export format for Google-native files (Docs/Sheets/Slides), which have no raw form. Defaults to plain text (Docs→text/plain, Sheets→text/csv). Supported: text/plain, text/html, text/markdown, application/pdf, application/epub+zip, application/rtf, .docx/.xlsx/.pptx. Ignored for binary files, which always download as-is.'
+    ),
+  targetFilename: z
+    .string()
+    .optional()
+    .describe(
+      'Filename to save as (extension appended automatically if missing). Defaults to the Drive file name.'
+    ),
 });
 
 // ============================================================================
@@ -301,6 +321,100 @@ export async function handleMoveDriveFile(
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown error';
     logger.error('Failed to move Drive file', {
+      userId: user.id,
+      fileId: params.fileId,
+      error: message,
+    });
+    return errorResult(message);
+  }
+}
+
+function driveDownloadDir(): string {
+  return join(homedir(), '.ink', 'files', 'drive');
+}
+
+function sanitizeFilename(name: string): string {
+  const cleaned =
+    name
+      .replace(/[/\\:*?"<>|]/g, '_')
+      .trim()
+      .slice(0, 180) || 'file';
+
+  // Reject dot-components that would cause path traversal
+  if (cleaned === '.' || cleaned === '..') return 'file';
+
+  return cleaned;
+}
+
+export async function handleDownloadDriveFile(
+  args: unknown,
+  dataComposer: DataComposer
+): Promise<ToolResult> {
+  const params = downloadDriveFileSchema.parse(args);
+  const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
+
+  const permission = isDriveOperationAllowed('download_file');
+  if (!permission.allowed) {
+    return operationBlockedResult('download_file', permission.reason!);
+  }
+
+  try {
+    const result = await getGoogleDriveService().downloadFile(user.id, {
+      fileId: params.fileId,
+      exportMimeType: params.exportMimeType,
+    });
+
+    const baseName = sanitizeFilename(params.targetFilename || result.file.name);
+    const filename = baseName.toLowerCase().endsWith(result.extension.toLowerCase())
+      ? baseName
+      : `${baseName}${result.extension}`;
+    const dir = driveDownloadDir();
+    await mkdir(dir, { recursive: true });
+    const savedPath = join(dir, filename);
+
+    // Defense-in-depth: ensure resolved path stays under the download directory
+    const resolvedPath = resolve(savedPath);
+    const resolvedDir = resolve(dir);
+    if (!resolvedPath.startsWith(resolvedDir + '/') && resolvedPath !== resolvedDir) {
+      return errorResult(
+        `Filename "${filename}" resolves outside the download directory — rejecting for safety`
+      );
+    }
+
+    await writeFile(savedPath, result.content);
+
+    logger.info('Downloaded Drive file', {
+      userId: user.id,
+      fileId: params.fileId,
+      savedPath,
+      bytes: result.content.length,
+      exported: result.exported,
+      effectiveMimeType: result.effectiveMimeType,
+    });
+
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: JSON.stringify(
+            {
+              success: true,
+              user: { id: user.id, resolvedBy },
+              file: result.file,
+              savedPath,
+              bytes: result.content.length,
+              mimeType: result.effectiveMimeType,
+              exported: result.exported,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Unknown error';
+    logger.error('Failed to download Drive file', {
       userId: user.id,
       fileId: params.fileId,
       error: message,

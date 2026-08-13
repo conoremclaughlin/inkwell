@@ -2663,6 +2663,55 @@ export type Database = {
           },
         ];
       };
+      session_observe_grants: {
+        Row: {
+          created_at: string;
+          expires_at: string | null;
+          granted_by: string | null;
+          id: string;
+          observer_sb_id: string;
+          owner_sb_id: string;
+          user_id: string;
+        };
+        Insert: {
+          created_at?: string;
+          expires_at?: string | null;
+          granted_by?: string | null;
+          id?: string;
+          observer_sb_id: string;
+          owner_sb_id: string;
+          user_id: string;
+        };
+        Update: {
+          created_at?: string;
+          expires_at?: string | null;
+          granted_by?: string | null;
+          id?: string;
+          observer_sb_id?: string;
+          owner_sb_id?: string;
+          user_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'session_observe_grants_observer_sb_id_fkey';
+            columns: ['observer_sb_id'];
+            referencedRelation: 'agent_identities';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'session_observe_grants_owner_sb_id_fkey';
+            columns: ['owner_sb_id'];
+            referencedRelation: 'agent_identities';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'session_observe_grants_user_id_fkey';
+            columns: ['user_id'];
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
       session_transcript_archives: {
         Row: {
           backend: string | null;
@@ -2741,6 +2790,7 @@ export type Database = {
           message_count: number | null;
           metadata: Json | null;
           model: string | null;
+          observer_ledger_path: string | null;
           sb_id: string | null;
           started_at: string | null;
           status: string | null;
@@ -2771,6 +2821,7 @@ export type Database = {
           message_count?: number | null;
           metadata?: Json | null;
           model?: string | null;
+          observer_ledger_path?: string | null;
           sb_id?: string | null;
           started_at?: string | null;
           status?: string | null;
@@ -2801,6 +2852,7 @@ export type Database = {
           message_count?: number | null;
           metadata?: Json | null;
           model?: string | null;
+          observer_ledger_path?: string | null;
           sb_id?: string | null;
           started_at?: string | null;
           status?: string | null;
@@ -3129,6 +3181,12 @@ export type Database = {
           worktree_path?: string;
         };
         Relationships: [
+          {
+            foreignKeyName: 'studios_default_project_id_fkey';
+            columns: ['default_project_id'];
+            referencedRelation: 'projects';
+            referencedColumns: ['id'];
+          },
           {
             foreignKeyName: 'studios_sb_id_fkey';
             columns: ['sb_id'];
@@ -3860,6 +3918,27 @@ export type Database = {
       [_ in never]: never;
     };
     Functions: {
+      advance_thread_read_pointer: {
+        Args: {
+          p_agent_id: string;
+          p_thread_id: string;
+          p_through_message_id: string;
+        };
+        Returns: string;
+      };
+      get_unread_thread_candidates: {
+        Args: {
+          p_agent_id: string;
+          p_limit?: number;
+          p_session_id?: string;
+          p_user_id: string;
+        };
+        Returns: {
+          latest_message_at: string;
+          thread_id: string;
+          total_candidates: number;
+        }[];
+      };
       match_artifacts: {
         Args: {
           match_count?: number;

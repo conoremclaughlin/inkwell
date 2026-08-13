@@ -23,6 +23,7 @@ import type {
 } from './types.js';
 import { formatInjectedContext } from './context-builder.js';
 import { logger } from '../../utils/logger.js';
+import { sessionEventBus } from './session-event-bus.js';
 import { resolveBinaryPath, buildSpawnPath } from './resolve-binary.js';
 import { injectSessionHeaders, buildSessionEnv, writeRuntimeSessionHint } from '@inklabs/shared';
 
@@ -31,8 +32,23 @@ import { injectSessionHeaders, buildSessionEnv, writeRuntimeSessionHint } from '
 // can't distinguish a turn that's still legitimately working from a hung one,
 // so it sits far above any realistic turn. The primary guard is the inactivity
 // timeout below. Override with INK_PROCESS_TIMEOUT_MS.
+//
+// 4 hours: agents doing real multi-step work on the user's behalf can run a
+// long time — the goal is to keep going wherever possible, not to reap eagerly.
 export const PROCESS_TIMEOUT_MS =
-  parseInt(process.env.INK_PROCESS_TIMEOUT_MS || '', 10) || 60 * 60 * 1000;
+  parseInt(process.env.INK_PROCESS_TIMEOUT_MS || '', 10) || 4 * 60 * 60 * 1000;
+
+// Continuation-loop turn cap when the SB's dashboard settings don't specify
+// one (agent_identities.metadata.runtimeConfig.maxTurns). Deliberately modest:
+// signal_status is the sanctioned in-loop halt, so this only bounds runaway
+// continuations — and each extra turn is a full provider spawn.
+export const DEFAULT_MAX_TURNS = 5;
+
+/** Clamp a dashboard-supplied turn cap to a sane range; default when absent. */
+export function clampMaxTurns(value: number | undefined): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return DEFAULT_MAX_TURNS;
+  return Math.min(25, Math.max(1, Math.round(value)));
+}
 
 // Inactivity timeout — the primary liveness guard. The countdown resets on any
 // stdout/stderr activity from the ink subprocess. A working turn emits a steady
@@ -42,18 +58,19 @@ export const PROCESS_TIMEOUT_MS =
 // stalled, network dead, wedged) goes silent and is reaped here, ~12x faster
 // than the absolute backstop.
 //
-// The window must exceed the longest *legitimate* silent gap:
-//   1. Buffered LLM generation — no token stream, so a single generation emits
-//      nothing until it completes (typically 40-55s, sometimes minutes).
-//   2. Away-mode approval polling — requestToolApproval polls silently for up to
-//      300s (DEFAULT_TIMEOUT_SECONDS in approval-api.ts). No stdout/stderr during
-//      the wait. The inactivity window must clear this with margin, or it races
-//      the approval timeout and SIGTERMs the process mid-approval.
+// The window must exceed the longest *legitimate* silent gap. With the ink
+// claude adapter now on stream-json, a turn emits events continuously while it
+// works, so the old buffered-generation silent gap is gone — the only remaining
+// silent gap is away-mode approval polling (requestToolApproval polls silently
+// for up to 300s, DEFAULT_TIMEOUT_SECONDS in approval-api.ts).
 //
-// 7 minutes (420s) clears the 300s approval window with 2 minutes of headroom.
+// 1 hour: deliberately generous. A working turn keeps resetting this the whole
+// time (a 40-minute download or a long research task never trips it); the window
+// only bites a genuinely wedged process, and we'd rather let real work finish
+// than reap it early. Clears the 300s approval poll with enormous margin.
 // Override with INK_INACTIVITY_TIMEOUT_MS.
 export const INACTIVITY_TIMEOUT_MS =
-  parseInt(process.env.INK_INACTIVITY_TIMEOUT_MS || '', 10) || 7 * 60 * 1000;
+  parseInt(process.env.INK_INACTIVITY_TIMEOUT_MS || '', 10) || 60 * 60 * 1000;
 
 // stderr substrings that mark a model-provider stall (vs. local work) — the same
 // family the trigger-retry classifier keys on. Logged when an idle turn is
@@ -168,7 +185,16 @@ export class InkRunner implements IRunner {
 
     // Turn backstop only — the real limit is the CLI's token budget
     // (200K default), which auto-compacts the transcript when approached.
-    args.push('--max-turns', '15');
+    // Per-SB tunable from the dashboard (runtimeConfig.maxTurns); the chat
+    // loop halts earlier when the model signals completion via signal_status.
+    args.push('--max-turns', String(clampMaxTurns(config.maxTurns)));
+
+    // Tool routing is ALWAYS explicit for server spawns — the headless
+    // boundary must not depend on worktree .ink/identity.json preferences or
+    // the chat loop's own defaults. session-service resolves the SB's
+    // dashboard setting (runtimeConfig.toolRouting) and fails closed to
+    // 'local' (ink-owned, provider withheld).
+    args.push('--tool-routing', config.toolRouting ?? 'local');
 
     // Use the safe profile with away mode for non-interactive spawns.
     // Safe profile allows read tools freely but requires approval for
@@ -255,6 +281,11 @@ export class InkRunner implements IRunner {
     // Strip CLAUDECODE to prevent nested-session detection
     delete env.CLAUDECODE;
 
+    // Turn-scope the observer replay tail: drop anything buffered from a prior
+    // turn so an attach mid-turn replays only THIS turn's events, and an attach
+    // while idle replays nothing (a finished turn must never re-render as live).
+    if (config.pcpSessionId) sessionEventBus.clearReplay(config.pcpSessionId);
+
     return new Promise((resolve, reject) => {
       const child: ChildProcess = spawn(inkBin, fullArgs, {
         cwd: config.workingDirectory,
@@ -266,6 +297,57 @@ export class InkRunner implements IRunner {
       let stderr = '';
       let killed = false;
       let idleTimer: NodeJS.Timeout;
+      // Carries a partial trailing line between stdout chunks so we only parse
+      // complete NDJSON events for live fan-out.
+      let stdoutLineBuffer = '';
+
+      // Live fan-out: the worker emits one NDJSON event per line as it works
+      // (tool_call, result, status chrome). Parse complete lines as they arrive
+      // and republish to the session event bus so attached terminals and the
+      // dashboard can watch the turn live — instead of the stream dead-ending
+      // here as a mere liveness signal. Best-effort: partial lines and
+      // human-readable chrome are ignored; the authoritative RunnerResult is
+      // still assembled from the full stdout in parseOutput on close.
+      const publishStreamEvents = (text: string): void => {
+        if (!config.pcpSessionId) return;
+        stdoutLineBuffer += text;
+        let nl: number;
+        while ((nl = stdoutLineBuffer.indexOf('\n')) >= 0) {
+          const line = stdoutLineBuffer.slice(0, nl).trim();
+          stdoutLineBuffer = stdoutLineBuffer.slice(nl + 1);
+          if (!line) continue;
+          let evt: unknown;
+          try {
+            evt = JSON.parse(line);
+          } catch {
+            continue; // CLI chrome / status text, not a structured event
+          }
+          if (
+            evt &&
+            typeof evt === 'object' &&
+            typeof (evt as { type?: unknown }).type === 'string'
+          ) {
+            const typed = evt as { type: string } & Record<string, unknown>;
+            if (typed.type === 'obs' && typed.entry && typeof typed.entry === 'object') {
+              // Canonical ledger entry (spec:observer-attach §4.2) — the exact
+              // appended transcript object, ledger eid included. Publish on the
+              // observer channel, preserving the eid; the bus never mints one.
+              sessionEventBus.publishObserverEntry(
+                config.pcpSessionId,
+                typed.entry as import('./session-event-bus.js').ObserverEntry
+              );
+            } else if (typed.type === 'session_meta') {
+              // The runtime announces its own ledger location at startup —
+              // the server-owned locator for durable observer replay.
+              if (typeof typed.transcriptPath === 'string') {
+                sessionEventBus.registerLedgerPath(config.pcpSessionId, typed.transcriptPath);
+              }
+            } else {
+              sessionEventBus.publish(config.pcpSessionId, typed.type, typed);
+            }
+          }
+        }
+      };
 
       const killProcess = (reason: string, detail?: Record<string, unknown>) => {
         if (killed) return;
@@ -298,7 +380,9 @@ export class InkRunner implements IRunner {
       };
 
       child.stdout?.on('data', (chunk: Buffer) => {
-        stdout += chunk.toString();
+        const text = chunk.toString();
+        stdout += text;
+        publishStreamEvents(text);
         resetIdleTimer();
       });
       child.stderr?.on('data', (chunk: Buffer) => {
@@ -324,6 +408,15 @@ export class InkRunner implements IRunner {
       child.on('close', (code) => {
         clearTimers();
         mcpInjection?.cleanup();
+        // Turn over: the buffered tail now describes a COMPLETED turn, so drop
+        // it. A later idle attach must not replay it as live activity.
+        if (config.pcpSessionId) {
+          sessionEventBus.clearReplay(config.pcpSessionId);
+          // Observer channel: start the retention window; observers detach
+          // after it unless a new turn re-registers the session. The durable
+          // ledger remains the replay source regardless.
+          sessionEventBus.releaseObserverSession(config.pcpSessionId);
+        }
 
         if (code !== 0) {
           // Check for resume failure

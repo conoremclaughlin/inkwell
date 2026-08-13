@@ -17,12 +17,8 @@ import { basename, dirname, join, resolve as resolvePath } from 'path';
 import { homedir } from 'os';
 import { createInterface } from 'readline/promises';
 import { callPcpTool, getPcpServerUrl } from '../lib/pcp-mcp.js';
+import { readUserConfig, NOT_SIGNED_IN_MESSAGE, type UserConfig } from '../lib/user-config.js';
 import { getValidAccessToken } from '../auth/tokens.js';
-
-interface PcpConfig {
-  userId?: string;
-  email?: string;
-}
 
 export interface Session {
   id: string;
@@ -120,19 +116,6 @@ interface TranscriptInstallPlan {
 // ============================================================================
 // Helpers
 // ============================================================================
-
-function getPcpConfig(): PcpConfig | null {
-  const configPath = join(homedir(), '.pcp', 'config.json');
-  if (existsSync(configPath)) {
-    try {
-      return JSON.parse(readFileSync(configPath, 'utf-8'));
-    } catch {
-      return null;
-    }
-  }
-  return null;
-}
-
 
 function normalizePath(input: string): string {
   return resolvePath(input);
@@ -378,7 +361,7 @@ async function maybeConfirmImplicitCwd(cwd: string, skipConfirmation?: boolean):
 }
 
 async function resolvePullTarget(options: {
-  config: PcpConfig | null;
+  config: UserConfig | null;
   studio?: string;
   cwd?: string;
   path?: string;
@@ -398,7 +381,7 @@ async function resolvePullTarget(options: {
 
   if (options.studio) {
     if (!options.config?.email) {
-      throw new Error('PCP not configured. Run: ink init');
+      throw new Error(NOT_SIGNED_IN_MESSAGE);
     }
     const studio = await callPcpTool<StudioLookupResult>('get_studio', {
       email: options.config.email,
@@ -514,9 +497,9 @@ async function listCommand(options: {
   limit?: string;
   flat?: boolean;
 }): Promise<void> {
-  const config = getPcpConfig();
+  const config = readUserConfig();
   if (!config?.email) {
-    console.error(chalk.red('PCP not configured. Run: ink init'));
+    console.error(chalk.red(NOT_SIGNED_IN_MESSAGE));
     process.exit(1);
   }
 
@@ -538,9 +521,9 @@ async function listCommand(options: {
 }
 
 async function showCommand(sessionId: string): Promise<void> {
-  const config = getPcpConfig();
+  const config = readUserConfig();
   if (!config?.email) {
-    console.error(chalk.red('PCP not configured. Run: ink init'));
+    console.error(chalk.red(NOT_SIGNED_IN_MESSAGE));
     process.exit(1);
   }
 
@@ -600,9 +583,9 @@ async function showCommand(sessionId: string): Promise<void> {
 }
 
 async function resumeCommand(sessionId: string): Promise<void> {
-  const config = getPcpConfig();
+  const config = readUserConfig();
   if (!config?.email) {
-    console.error(chalk.red('PCP not configured. Run: ink init'));
+    console.error(chalk.red(NOT_SIGNED_IN_MESSAGE));
     process.exit(1);
   }
 
@@ -630,9 +613,9 @@ async function resumeCommand(sessionId: string): Promise<void> {
 }
 
 async function endCommand(sessionId?: string): Promise<void> {
-  const config = getPcpConfig();
+  const config = readUserConfig();
   if (!config?.email) {
-    console.error(chalk.red('PCP not configured. Run: ink init'));
+    console.error(chalk.red(NOT_SIGNED_IN_MESSAGE));
     process.exit(1);
   }
 
@@ -740,7 +723,7 @@ async function pullSyncedTranscriptCommand(
     json?: boolean;
   }
 ): Promise<void> {
-  const config = getPcpConfig();
+  const config = readUserConfig();
   try {
     const payload = await fetchAdminJson<SyncedTranscriptPayload>({
       path: `/api/admin/sessions/${encodeURIComponent(sessionId)}/transcript?format=json`,

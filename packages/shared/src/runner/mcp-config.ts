@@ -87,9 +87,10 @@ export function injectSessionHeaders(
     return { mcpConfigPath, cleanup: () => {}, modified: false };
   }
 
-  // Find the server entry — prefer 'inkwell', fall back to 'pcp' for backward compat
-  const serverKey = config.mcpServers.inkwell ? 'inkwell' : config.mcpServers.pcp ? 'pcp' : null;
-  if (!serverKey) {
+  // Session headers are injected only into the canonical 'inkwell' server. The
+  // legacy 'pcp' server name is retired — no code should create or feed it.
+  const serverKey = 'inkwell';
+  if (!config.mcpServers[serverKey]) {
     return { mcpConfigPath, cleanup: () => {}, modified: false };
   }
 
@@ -178,6 +179,9 @@ export interface PcpContextToken {
  * Encode a context token for the `x-ink-context` header.
  */
 export function encodeContextToken(token: PcpContextToken): string {
+  // token.runtime values in the wild: 'claude' | 'codex' | 'gemini' for
+  // provider-backed spawns, plus 'ink' for the ink chat loop's own PcpClient
+  // (PR #468). The server treats it as an opaque string.
   return Buffer.from(JSON.stringify(token)).toString('base64url');
 }
 
@@ -232,8 +236,6 @@ export function buildSessionEnv(options: {
   }
   if (options.accessToken) {
     env.INK_ACCESS_TOKEN = options.accessToken;
-    // Codex env_http_headers maps env var name → full header value
-    env.INK_AUTH_BEARER = `Bearer ${options.accessToken}`;
   }
 
   // Consolidated context token (new — Phase 1)

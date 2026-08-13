@@ -115,7 +115,7 @@
       <h1>Waiting for the Inkwell server<span class="dots"></span></h1>
       <p>
         This app is a shell over your locally running dashboard at
-        <span class="url" id="server-url">http://localhost:3000</span>
+        <span class="url" id="server-url">http://127.0.0.1:3002</span>
       </p>
       <p>
         Start it with <code>yarn dev</code> in the Inkwell repo &mdash; this window will connect
@@ -123,10 +123,10 @@
       </p>
     </main>
     <script>
-      // Injected by the Rust shell before page load (see lib.rs). Falls back
-      // to the default so the page still makes sense when opened standalone.
-      const url = window.__INK_SERVER_URL__;
-      if (typeof url === 'string' && url) {
+      // Passed by the Electron shell as a query param (see main.cjs). Falls
+      // back to the default so the page still makes sense when opened standalone.
+      const url = new URLSearchParams(location.search).get('serverUrl');
+      if (url) {
         document.getElementById('server-url').textContent = url;
       }
     </script>

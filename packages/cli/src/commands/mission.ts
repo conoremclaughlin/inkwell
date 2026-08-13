@@ -5,6 +5,7 @@ import { renderSessionsByAgent, type Session } from './session.js';
 import { renderInkMission, type InkMission } from '../repl/ink/index.js';
 import type { FeedEvent, FeedEventType, AgentSummary } from '../repl/ink/index.js';
 import { formatHumanTime } from '../repl/tui-components.js';
+import { NOT_SIGNED_IN_MESSAGE } from '../lib/user-config.js';
 
 interface MissionOptions {
   agent?: string;
@@ -723,7 +724,7 @@ async function fetchMissionSnapshot(options: MissionOptions): Promise<MissionSna
   const config = pcp.getConfig();
 
   if (!config.email) {
-    throw new Error('PCP not configured. Run: ink init');
+    throw new Error(NOT_SIGNED_IN_MESSAGE);
   }
 
   const listResult = (await pcp.callTool('list_sessions', {
@@ -1126,7 +1127,7 @@ async function runInkMission(options: MissionOptions): Promise<void> {
   const pcp = new PcpClient();
   const config = pcp.getConfig();
   if (!config.email) {
-    throw new Error('PCP not configured. Run: ink init');
+    throw new Error(NOT_SIGNED_IN_MESSAGE);
   }
 
   const intervalSeconds = Math.max(3, Number.parseInt(options.interval || '6', 10));

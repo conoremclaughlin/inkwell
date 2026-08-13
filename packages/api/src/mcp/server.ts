@@ -24,6 +24,8 @@ import {
 import adminRouter, { setWhatsAppListener } from '../routes/admin';
 import { getAgentGateway } from '../channels/agent-gateway';
 import { createChatRouter } from '../routes/chat';
+import { createSessionsRouter } from '../routes/sessions';
+import { sessionEventBus } from '../services/sessions/session-event-bus';
 import { createHookLifecycleRouter } from '../routes/hook-lifecycle';
 import {
   ChannelGateway,
@@ -131,6 +133,43 @@ export class MCPServer {
       return null;
     }
 
+    // Canonical-first: the session row stores its owning identity UUID
+    // (sessions.sb_id). Resolving by that UUID is unambiguous where the slug
+    // is not — the same agent_id can exist in multiple workspaces, and a
+    // slug .single() lookup errors on duplicates, breaking enrichment and
+    // artifact writes for exactly the identities that need disambiguation
+    // (PR #468 review 4902919349). Slug lookup remains only as the fallback
+    // for legacy sessions without sb_id.
+    if (session.sbId) {
+      const { data, error } = await this.dataComposer
+        .getClient()
+        .from('agent_identities')
+        .select('id, agent_id, user_id, users!inner(email)')
+        .eq('id', session.sbId)
+        .single();
+
+      if (error || !data) {
+        logger.debug('Context-based auth: session sb_id has no identity row', {
+          sbId: session.sbId,
+          sessionId,
+        });
+        return null;
+      }
+      if (data.user_id !== session.userId || data.agent_id !== agentId) {
+        logger.warn('Context-based auth: session sb_id does not match session user/agent', {
+          sessionId,
+          sbId: session.sbId,
+          identityUserId: data.user_id,
+          sessionUserId: session.userId,
+          identityAgentId: data.agent_id,
+          contextAgentId: agentId,
+        });
+        return null;
+      }
+      const email = (data.users as unknown as { email: string })?.email ?? '';
+      return { userId: session.userId, email, agentId, sbId: data.id };
+    }
+
     const { data, error } = await this.dataComposer
       .getClient()
       .from('agent_identities')
@@ -154,6 +193,69 @@ export class MCPServer {
       agentId,
       sbId: data.id,
     };
+  }
+
+  /**
+   * Canonical workspace derivation: one identity UUID → its workspace.
+   * Preferred over the slug variant whenever sbId is known — the slug can
+   * match identities in multiple workspaces (ambiguous by schema).
+   */
+  private async deriveWorkspaceIdFromSbId(sbId: string): Promise<string | null> {
+    const { data, error } = await this.dataComposer
+      .getClient()
+      .from('agent_identities')
+      .select('workspace_id')
+      .eq('id', sbId)
+      .maybeSingle();
+
+    if (error) {
+      logger.warn('Failed to derive workspace from identity UUID in MCP request context', {
+        sbId,
+        error: error.message,
+      });
+      return null;
+    }
+    return data?.workspace_id ?? null;
+  }
+
+  /**
+   * Session-anchored identity enrichment. The normal local auth shape is an
+   * unbound USER bearer (~/.ink/auth.json) with no agent claim, while the
+   * x-ink-context token names the session's agent. The token alone is a
+   * client assertion, so identity is enriched only when the referenced
+   * session row (server truth) is live, matches the claimed agent, AND is
+   * owned by the AUTHENTICATED user. Without this, ink-routed tool calls run
+   * agent-less: workspace derivation for writes cannot run and
+   * create_artifact fails wanting workspace scope (found live by Myra).
+   */
+  private async enrichIdentityFromContextSession(
+    userData: { userId: string; email: string; agentId?: string; sbId?: string } | null,
+    contextToken: { sessionId?: string; agentId?: string } | null
+  ): Promise<{ userId: string; email: string; agentId?: string; sbId?: string } | null> {
+    if (!userData) return userData;
+    if (userData.agentId || !contextToken?.sessionId || !contextToken?.agentId) return userData;
+
+    const sessionIdentity = await this.resolveUserFromContextSession(
+      contextToken.sessionId,
+      contextToken.agentId
+    );
+    if (!sessionIdentity) return userData;
+    if (sessionIdentity.userId !== userData.userId) {
+      logger.warn('Context session enrichment rejected: session owned by different user', {
+        sessionId: contextToken.sessionId,
+        sessionUserId: sessionIdentity.userId,
+        authenticatedUserId: userData.userId,
+      });
+      return userData;
+    }
+
+    logger.debug('Context session enrichment: agent identity attached to user-token request', {
+      sessionId: contextToken.sessionId,
+      agentId: sessionIdentity.agentId,
+      sbId: sessionIdentity.sbId,
+      userId: userData.userId,
+    });
+    return { ...userData, agentId: sessionIdentity.agentId, sbId: sessionIdentity.sbId };
   }
 
   private async deriveWorkspaceIdFromAgent(
@@ -216,9 +318,13 @@ export class MCPServer {
             return !!workspace;
           }
         : undefined,
-      deriveWorkspaceIdFromAgent: userData.agentId
-        ? () => this.deriveWorkspaceIdFromAgent(userData.userId, userData.agentId!)
-        : undefined,
+      // Canonical UUID derivation first — the slug variant is ambiguous when
+      // the same agent_id exists in multiple workspaces.
+      deriveWorkspaceIdFromAgent: userData.sbId
+        ? () => this.deriveWorkspaceIdFromSbId(userData.sbId!)
+        : userData.agentId
+          ? () => this.deriveWorkspaceIdFromAgent(userData.userId, userData.agentId!)
+          : undefined,
     });
 
     if (!resolution) return {};
@@ -382,6 +488,19 @@ export class MCPServer {
             sbId: userData.sbId,
           }
         : {};
+
+      // Session-anchored identity enrichment (see
+      // enrichIdentityFromContextSession): attaches the session's agent
+      // identity — canonical sbId first — to user-token requests so
+      // pinned-agent dispatch and workspace derivation work for ink-routed
+      // tool calls.
+      const effectiveIdentity = await this.enrichIdentityFromContextSession(userData, contextToken);
+      if (effectiveIdentity && effectiveIdentity !== userData) {
+        Object.assign(ctx, {
+          agentId: effectiveIdentity.agentId,
+          sbId: effectiveIdentity.sbId,
+        });
+      }
       const callerProfileHeader = req.header('x-ink-caller-profile')?.trim().toLowerCase();
       const callerProfile: 'agent' | 'runtime' =
         callerProfileHeader === 'runtime' ? 'runtime' : 'agent';
@@ -427,14 +546,19 @@ export class MCPServer {
       }
 
       // ── Workspace scope (parent-level) ──
-      // Always resolve workspace independently — it's a different scope than studio.
-      if (userData) {
+      // Always resolve workspace independently — it's a different scope than
+      // studio. Uses the session-enriched identity so agent-derived workspace
+      // resolution works for user-token requests too.
+      if (effectiveIdentity) {
         try {
-          Object.assign(ctx, await this.resolveWorkspaceContextForMcpRequest(req, userData));
+          Object.assign(
+            ctx,
+            await this.resolveWorkspaceContextForMcpRequest(req, effectiveIdentity)
+          );
         } catch (error) {
           logger.warn('Rejected MCP request due to invalid workspace scope', {
-            userId: userData.userId,
-            agentId: userData.agentId,
+            userId: effectiveIdentity.userId,
+            agentId: effectiveIdentity.agentId,
             error: error instanceof Error ? error.message : String(error),
           });
           res.status(403).json({
@@ -832,6 +956,67 @@ export class MCPServer {
       app.use('/api/chat', chatRouter);
       logger.info('Chat API routes registered at /api/chat');
     }
+
+    // Live session event stream (SSE) — attached terminals + dashboard subscribe
+    // to a session's turn events, fanned out from the session event bus.
+    // The durable ledger locator rides in the session row's metadata (no new
+    // tables) so observer replay survives bus eviction and process restarts.
+    const locatorClient = this.dataComposer.getClient();
+    sessionEventBus.setLocatorStore({
+      // Dedicated column, single-column UPDATE — no read-modify-write of the
+      // shared metadata object (that merge raced other session updates and
+      // could silently drop the locator). PostgREST reports failures via
+      // `error`, not exceptions — check and THROW so the bus's retry/logging
+      // actually sees them (Lumen re-review, blocker 1).
+      persist: async (sessionId, ledgerPath) => {
+        const { error } = await locatorClient
+          .from('sessions')
+          .update({ observer_ledger_path: ledgerPath })
+          .eq('id', sessionId);
+        if (error) {
+          throw new Error(`locator persist failed: ${error.message}`);
+        }
+      },
+      // activity: authoritative evidence for the vacuous-replay decision —
+      // 'completed' (markers prove durable history), 'attempted' (turn
+      // started, ledger may hold entries), 'none' (durably pristine idle).
+      load: async (sessionId) => {
+        const { data: row, error } = await locatorClient
+          .from('sessions')
+          .select(
+            'observer_ledger_path, backend_session_id, token_count, message_count, lifecycle, ended_at'
+          )
+          .eq('id', sessionId)
+          .maybeSingle();
+        if (error) {
+          throw new Error(`locator load failed: ${error.message}`);
+        }
+        // Completed markers are written only AFTER a turn returns; the ledger
+        // gains entries at turn START. A started-but-never-completed turn
+        // (lifecycle running/failed, or ended without markers) is therefore
+        // 'attempted' — never proof of a pristine session (Lumen M4.4).
+        const completed = Boolean(
+          row &&
+          (row.backend_session_id || (row.token_count ?? 0) > 0 || (row.message_count ?? 0) > 0)
+        );
+        const pristine =
+          !row || ((row.lifecycle === null || row.lifecycle === 'idle') && !row.ended_at);
+        return {
+          ledgerPath: row?.observer_ledger_path ?? null,
+          activity: completed
+            ? ('completed' as const)
+            : pristine
+              ? ('none' as const)
+              : ('attempted' as const),
+        };
+      },
+    });
+    const sessionsRouter = createSessionsRouter({
+      authProvider: this.authProvider,
+      dataComposer: this.dataComposer,
+    });
+    app.use('/api/sessions', sessionsRouter);
+    logger.info('Session event routes registered at /api/sessions');
 
     // Kindle routes (registered below after import)
     import('../routes/kindle.js')

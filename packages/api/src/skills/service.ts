@@ -199,21 +199,59 @@ export class SkillsService {
 // Singleton instance
 let serviceInstance: SkillsService | null = null;
 
-/**
- * Read skills config from ~/.ink/config.json.
- * Returns extraDirs if configured under `skills.extraDirs`.
- */
-function readSkillsConfig(): SkillLoadOptions {
-  const configPath = join(homedir(), '.pcp', 'config.json');
-  if (!existsSync(configPath)) return {};
+/** What a config file had to say about skills.extraDirs. */
+type ExtraDirsLookup =
+  | { kind: 'absent' } // no file, or the file declares nothing about extraDirs
+  | { kind: 'declared'; extraDirs: string[] } // an explicit array — authoritative
+  | { kind: 'malformed' }; // unreadable, or extraDirs isn't an array
 
+function lookupExtraDirs(configPath: string): ExtraDirsLookup {
+  if (!existsSync(configPath)) return { kind: 'absent' };
+
+  let parsed: unknown;
   try {
-    const config = JSON.parse(readFileSync(configPath, 'utf-8'));
-    const extraDirs = config?.skills?.extraDirs as string[] | undefined;
-    return extraDirs?.length ? { extraDirs } : {};
+    parsed = JSON.parse(readFileSync(configPath, 'utf-8'));
   } catch {
-    return {};
+    return { kind: 'malformed' };
   }
+
+  const skills = (parsed as { skills?: unknown } | null)?.skills;
+  if (!skills || typeof skills !== 'object') return { kind: 'absent' };
+
+  const extraDirs = (skills as { extraDirs?: unknown }).extraDirs;
+  if (extraDirs === undefined) return { kind: 'absent' };
+  if (!Array.isArray(extraDirs) || extraDirs.some((d) => typeof d !== 'string')) {
+    return { kind: 'malformed' };
+  }
+
+  return { kind: 'declared', extraDirs: extraDirs as string[] };
+}
+
+/**
+ * Read skills extraDirs from ~/.ink/config.json.
+ *
+ * Presence-gated, not value-seeking: an explicit `skills.extraDirs` in the
+ * canonical config wins even when it's empty. Treating `[]` as "nothing found"
+ * and continuing would let a stale ~/.pcp config resurrect directories the
+ * user deliberately cleared. A malformed canonical config fails closed for the
+ * same reason — silently loading legacy dirs is worse than loading none.
+ *
+ * ~/.pcp/ is the pre-rename location, consulted only when the canonical config
+ * says nothing at all about extraDirs, so pre-rename installs keep working.
+ */
+export function readSkillsConfig(): SkillLoadOptions {
+  const canonical = lookupExtraDirs(join(homedir(), '.ink', 'config.json'));
+  if (canonical.kind === 'declared') {
+    return canonical.extraDirs.length ? { extraDirs: canonical.extraDirs } : {};
+  }
+  if (canonical.kind === 'malformed') return {};
+
+  const legacy = lookupExtraDirs(join(homedir(), '.pcp', 'config.json'));
+  if (legacy.kind === 'declared' && legacy.extraDirs.length) {
+    return { extraDirs: legacy.extraDirs };
+  }
+
+  return {};
 }
 
 /**

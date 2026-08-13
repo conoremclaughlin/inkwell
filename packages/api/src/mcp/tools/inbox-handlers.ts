@@ -9,15 +9,21 @@ import { z } from 'zod';
 import type { DataComposer } from '../../data/composer';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
 import { resolveIdentityId, resolveAgentSlug } from '../../auth/resolve-identity';
+import { advanceThreadReadPointer } from './read-state.js';
 import { getEffectiveAgentId } from '../../auth/enforce-identity';
 import { logger } from '../../utils/logger';
 import type { Json } from '../../data/supabase/types';
-import { getRequestContext, getSessionContext } from '../../utils/request-context';
+import {
+  getRequestContext,
+  getSessionContext,
+  getPinnedAgentId,
+} from '../../utils/request-context';
 import { getAgentGateway, type AgentTriggerPayload } from '../../channels/agent-gateway.js';
 import {
   findThread as findExistingThread,
   getParticipants,
   resolveTriggeredAgents,
+  handleGetThreadMessages,
 } from './thread-handlers.js';
 import { resolveStudioHint } from '../../services/sessions/index.js';
 
@@ -125,6 +131,15 @@ const sendToInboxSchema = userIdentifierBaseSchema.extend({
     ),
 });
 
+export interface ThreadPageRow {
+  id: string;
+  thread_key: string;
+  title: string | null;
+  user_id: string;
+  created_by_agent_id: string;
+  updated_at: string | null;
+}
+
 /**
  * Check if a thread is owned by a specific studio based on the agent's
  * message metadata. Used by channelPoll filtering.
@@ -156,38 +171,55 @@ export function isThreadOwnedByStudio(
   });
 }
 
-const getInboxSchema = userIdentifierBaseSchema.extend({
-  agentId: z
-    .string()
-    .optional()
-    .describe(
-      'Agent ID to get inbox for. Omit to get inbox across ALL agents (useful for unified timelines).'
-    ),
-  status: z
-    .enum(['unread', 'read', 'acknowledged', 'completed', 'all'])
-    .optional()
-    .default('unread')
-    .describe('Filter by status'),
-  priority: z.enum(['low', 'normal', 'high', 'urgent']).optional().describe('Filter by priority'),
-  messageType: z
-    .enum(['message', 'task_request', 'session_resume', 'notification', 'permission_grant'])
-    .optional(),
-  limit: z.number().min(1).max(200).optional().default(20).describe('Max messages'),
-  since: z
-    .string()
-    .datetime()
-    .optional()
-    .describe('Only return messages created after this ISO timestamp'),
-  channelPoll: z
-    .boolean()
-    .optional()
-    .default(false)
-    .describe(
-      'When true, filter threads by studio ownership using the studioId from request context. ' +
-        'Used by channel plugins to only receive threads belonging to their studio. ' +
-        'Threads with no studio affinity (new, unrouted) are included as broadcast.'
-    ),
-});
+const getInboxSchema = userIdentifierBaseSchema
+  .extend({
+    agentId: z
+      .string()
+      .optional()
+      .describe(
+        'Agent ID to get inbox for. Omit to get inbox across ALL agents (useful for unified timelines).'
+      ),
+    status: z
+      .enum(['unread', 'read', 'acknowledged', 'completed', 'all'])
+      .optional()
+      .default('unread')
+      .describe('Filter by status'),
+    priority: z.enum(['low', 'normal', 'high', 'urgent']).optional().describe('Filter by priority'),
+    messageType: z
+      .enum(['message', 'task_request', 'session_resume', 'notification', 'permission_grant'])
+      .optional(),
+    limit: z.number().min(1).max(200).optional().default(20).describe('Max messages'),
+    since: z
+      .string()
+      .datetime()
+      .optional()
+      .describe('Only return messages created after this ISO timestamp'),
+    threadKey: z
+      .string()
+      .regex(/^[a-zA-Z][a-zA-Z0-9_-]*:[^\s]+$/)
+      .optional()
+      .describe(
+        'Filter to a conversation thread. Aliases through to get_thread_messages ' +
+          '(thread messages are stored separately from the legacy inbox; participant ' +
+          'membership and read-state are respected). Requires agentId. status "all" ' +
+          'maps to the full thread history; priority/messageType/since do not apply.'
+      ),
+    channelPoll: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe(
+        'When true, filter threads by studio ownership using the studioId from request context. ' +
+          'Used by channel plugins to only receive threads belonging to their studio. ' +
+          'Threads with no studio affinity (new, unrouted) are included as broadcast.'
+      ),
+    // .strict(): unknown keys are REJECTED with their names in the error, not
+    // silently stripped. The callers here are LLMs — a plausible-but-wrong
+    // parameter silently ignored produces confident wrong conclusions (Myra
+    // concluded her inbox was empty), while a named rejection self-corrects on
+    // the next attempt. Conor-approved for this scenario (2026-08-10).
+  })
+  .strict();
 
 const updateInboxMessageSchema = userIdentifierBaseSchema.extend({
   messageId: z.string().uuid().describe('Message ID to update'),
@@ -263,9 +295,12 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
   if (hasMany && !threadKey) {
     throw new Error('threadKey is required when using recipients[]');
   }
-  if (recipients && (recipientSessionId || recipientStudioId || recipientStudioSlugOrHint)) {
+  if (
+    recipients &&
+    (recipientSessionId || recipientStudioId || recipientStudioSlugOrHint || sessionAlias)
+  ) {
     throw new Error(
-      'recipientSessionId/recipientStudioId/recipientStudioSlug/recipientStudioHint are only valid for single-recipient sends'
+      'recipientSessionId/recipientStudioId/recipientStudioSlug/recipientStudioHint/sessionAlias are only valid for single-recipient sends'
     );
   }
 
@@ -516,16 +551,33 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
       .update({ updated_at: new Date().toISOString() })
       .eq('id', thread.id);
 
-    // Update sender's read status
-    if (senderAgentId) {
-      await threadTable(supabase, 'inbox_thread_read_status').upsert(
-        {
-          thread_id: thread.id,
-          agent_id: senderAgentId,
-          last_read_at: new Date().toISOString(),
-        },
-        { onConflict: 'thread_id,agent_id' }
-      );
+    // Update sender's read status — through the just-inserted message via the
+    // atomic RPC, never wall-clock (spec: ink://specs/inkmail-read-state §1-2).
+    //
+    // Self-addressing exemption: when the sender targets ANOTHER of their own
+    // sessions/studios (senderAgentId is a recipient + explicit studio/session
+    // target), do NOT advance. There is only one (thread_id, agent_id)
+    // pointer; advancing at insert would make the target instance see the
+    // message as already read before delivery. The target's delivery advances
+    // the shared pointer instead.
+    // Explicit self-target: the sender addresses ANOTHER of their own
+    // sessions/studios — by studio id/slug, session id, OR session alias.
+    // ONE predicate drives both the sender-advance exemption and trigger
+    // self-inclusion so the two can never disagree (Lumen, PR #454 review:
+    // alias self-sends were advanced before fetch while session-id self-sends
+    // were filtered out of triggering).
+    const explicitSelfTarget = !!(
+      senderAgentId &&
+      allRecipients.includes(senderAgentId) &&
+      (recipientStudioId || recipientStudioSlugOrHint || recipientSessionId || sessionAlias)
+    );
+    if (senderAgentId && threadMessage?.id && !explicitSelfTarget) {
+      await advanceThreadReadPointer(supabase, {
+        threadId: thread.id,
+        agentId: senderAgentId,
+        throughMessageId: threadMessage.id,
+        source: 'send_to_inbox:sender',
+      });
     }
 
     // ── Trigger resolution ──
@@ -533,14 +585,9 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     // For new threads, trigger all recipients (existing behavior).
     let agentsToTrigger: string[] = [];
 
-    // Cross-studio self-messaging: when the sender targets themselves in a
-    // different studio (via recipientStudioId/recipientStudioHint), don't
-    // exclude self from trigger resolution.
-    const selfStudioTarget = !!(
-      senderAgentId &&
-      (recipientStudioId || recipientStudioSlugOrHint) &&
-      allRecipients.includes(senderAgentId)
-    );
+    // Cross-studio/session self-messaging must not exclude self from trigger
+    // resolution — same predicate as the sender-advance exemption above.
+    const selfStudioTarget = explicitSelfTarget;
 
     if (trigger !== false && !missingSenderSession) {
       if (existingThread && senderAgentId) {
@@ -579,12 +626,30 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
       effectiveRecipientSessionId: effectiveRecipientSessionId || null,
     });
 
-    // Dispatch triggers with session routing from thread history
+    // Dispatch: assignment is wake-independent (§3a). EVERY recipient gets a
+    // dispatch — wake only for agentsToTrigger; the rest go routeOnly so their
+    // session is still assigned/stamped (trigger:false / missingSenderSession
+    // must never mean unaddressed).
     const triggeredAgents: string[] = [];
-    if (agentsToTrigger.length > 0) {
+    // Assignment failures per recipient (Lumen, PR #460 round 2): a send whose
+    // routing stamp did not persist must NOT return unqualified success —
+    // for trigger:false recipients no wake follows, so an unstamped thread
+    // is invisible to stamped-only polling with no retry coming.
+    const routingFailures: Array<{ agentId: string; error: string }> = [];
+    // Union with agentsToTrigger: actionable self-sends (session_resume /
+    // task_request strategy kickoffs) wake self without an explicit
+    // studio/session target and must keep dispatching.
+    const routingSet = [
+      ...new Set([
+        ...allRecipients.filter((a) => a !== senderAgentId || explicitSelfTarget),
+        ...agentsToTrigger,
+      ]),
+    ];
+    if (routingSet.length > 0) {
       const gateway = getAgentGateway();
 
-      for (const toAgentId of agentsToTrigger) {
+      for (const toAgentId of routingSet) {
+        const wake = agentsToTrigger.includes(toAgentId);
         // Auto-resolve recipientSessionId: find the recipient's most recent
         // message on this thread to extract their sender session. This ensures
         // replies route back to the session that originated the conversation,
@@ -638,6 +703,13 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
         // was true, so system/human → owner delegation lost the assigned
         // studio and fell back to route patterns / default studio.
         const isAddressedRecipient = !recipients && toAgentId === recipientAgentId;
+        // Anchor provenance (spec §3b.1): only CALLER-passed targeting counts
+        // as the deliberate-retarget signal. History-inferred
+        // recipientSessionId is a continuity hint, never an overwrite.
+        const explicitRecipientTarget = !!(
+          isAddressedRecipient &&
+          (recipientSessionId || sessionAlias || recipientStudioId || recipientStudioSlugOrHint)
+        );
         const payload: AgentTriggerPayload = {
           fromAgentId: triggerSenderId,
           toAgentId,
@@ -651,6 +723,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
           priority,
           threadKey,
           recipientSessionId: resolvedRecipientSessionId,
+          ...(explicitRecipientTarget ? { explicitRecipientTarget } : {}),
           ...(isAddressedRecipient && sessionAlias ? { sessionAlias } : {}),
           ...(isAddressedRecipient && resolvedRecipientStudioId
             ? { studioId: resolvedRecipientStudioId }
@@ -660,9 +733,44 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
             : {}),
           ...(Object.keys(rawMeta).length > 0 ? { metadata: rawMeta } : {}),
         };
-        const result = gateway.dispatchTrigger(payload);
-        if (result.accepted) {
-          triggeredAgents.push(toAgentId);
+
+        // 1) Assignment — SYNCHRONOUS (spec §3a): processTrigger awaits the
+        //    handler, so the participant stamp is durable before send returns.
+        //    A crash after this line cannot orphan the message. A FAILED
+        //    assignment (success:false or throw) is captured per recipient
+        //    and surfaced in the response — never swallowed into success.
+        try {
+          const assignResult = await gateway.processTrigger({ ...payload, routeOnly: true });
+          if (!assignResult.success) {
+            routingFailures.push({
+              agentId: toAgentId,
+              error: assignResult.error || 'assignment failed',
+            });
+            logger.warn('[ThreadTrigger] Synchronous assignment failed', {
+              threadKey,
+              toAgentId,
+              error: assignResult.error || 'assignment failed',
+            });
+          }
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          routingFailures.push({ agentId: toAgentId, error: message });
+          logger.warn('[ThreadTrigger] Synchronous assignment failed', {
+            threadKey,
+            toAgentId,
+            error: message,
+          });
+        }
+
+        // 2) Wake — optional, fire-and-forget, rides the fresh stamp via
+        //    thread continuity. Still attempted after an assignment failure:
+        //    the wake handler re-runs assignment (a transient DB error may
+        //    clear) and the wake itself surfaces the message to the agent.
+        if (wake) {
+          const result = gateway.dispatchTrigger(payload);
+          if (result.accepted) {
+            triggeredAgents.push(toAgentId);
+          }
         }
       }
     }
@@ -672,8 +780,16 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
         {
           type: 'text' as const,
           text: JSON.stringify({
-            success: true,
-            message: `Thread message sent to ${threadKey}`,
+            success: routingFailures.length === 0,
+            message:
+              routingFailures.length === 0
+                ? `Thread message sent to ${threadKey}`
+                : `Thread message stored in ${threadKey}, but session routing FAILED for: ${routingFailures
+                    .map((f) => f.agentId)
+                    .join(
+                      ', '
+                    )}. Untriggered recipients will NOT see it via inbox polling until routing succeeds — resend or re-trigger to retry assignment.`,
+            ...(routingFailures.length > 0 ? { routingFailures } : {}),
             messageId: threadMessage.id,
             threadKey,
             threadId: thread.id,
@@ -927,14 +1043,138 @@ async function findOrCreateThread(
 export async function handleGetInbox(args: unknown, dataComposer: DataComposer) {
   const supabase = dataComposer.getClient();
   const parsed = getInboxSchema.parse(args);
+
+  // threadKey aliases through to get_thread_messages (Conor, 2026-08-10):
+  // thread messages live in the thread tables, not agent_inbox, and a
+  // threadKey is effectively the conversation's title — callers reaching for
+  // the inbox with one want the thread timeline, not a silently-empty legacy
+  // query. Participant membership and read-state checks are the delegate's.
+  if (parsed.threadKey) {
+    if (!parsed.agentId) {
+      throw new Error(
+        'get_inbox with threadKey requires agentId — thread access is participant-scoped. ' +
+          'Pass your agentId, or use get_thread_messages directly.'
+      );
+    }
+    // Discovery filters that don't map onto thread reads must reject
+    // actionably, not silently return wrong results — e.g. status:'completed'
+    // would otherwise return unread-pointer messages AND advance the pointer.
+    // Supported: status 'unread' (default → messages since your read pointer)
+    // and 'all' (full history).
+    const incompatible: string[] = [];
+    if (parsed.status !== 'unread' && parsed.status !== 'all') {
+      incompatible.push(`status:'${parsed.status}'`);
+    }
+    if (parsed.priority) incompatible.push('priority');
+    if (parsed.messageType) incompatible.push('messageType');
+    if (parsed.since) incompatible.push('since');
+    if (parsed.channelPoll) incompatible.push('channelPoll');
+    if (incompatible.length > 0) {
+      throw new Error(
+        `get_inbox threadKey mode does not support: ${incompatible.join(', ')}. ` +
+          "Thread reads support status 'unread' (default) or 'all'; " +
+          'use get_thread_messages for cursor-based paging.'
+      );
+    }
+    return handleGetThreadMessages(
+      {
+        ...(parsed.userId ? { userId: parsed.userId } : {}),
+        ...(parsed.email ? { email: parsed.email } : {}),
+        ...(parsed.phone ? { phone: parsed.phone } : {}),
+        ...(parsed.platform ? { platform: parsed.platform } : {}),
+        ...(parsed.platformId ? { platformId: parsed.platformId } : {}),
+        agentId: parsed.agentId,
+        threadKey: parsed.threadKey,
+        limit: parsed.limit ?? 20,
+        // The inbox's "unread by default" maps to the thread read pointer;
+        // status 'all' maps to the full timeline.
+        ...(parsed.status === 'all' ? { fullHistory: true } : {}),
+      },
+      dataComposer
+    );
+  }
+
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
   const { status = 'unread', priority, messageType, limit = 20, since, channelPoll } = parsed;
   // Enforce identity: pinned agents can only read their own inbox.
-  // When agentId is omitted, return inbox across ALL agents (unified timeline).
-  const agentId = parsed.agentId
+  // When agentId is omitted, return inbox across ALL agents (unified timeline)
+  // — EXCEPT for channelPoll, where the gate below derives it from the
+  // session so an agent-less poll can never read the all-agent surface.
+  let agentId = parsed.agentId
     ? (getEffectiveAgentId(parsed.agentId) ?? parsed.agentId)
     : undefined;
+
+  // Fail-closed (spec inkmail-read-state §3) — FIRST, before ANY read or
+  // pointer advance: a channelPoll caller must present BOTH scopes — a
+  // resolvable session AND an agent that matches that session — or it gets
+  // nothing and touches nothing. agentId is derived from the session row
+  // when omitted and validated against it when provided (Lumen, PR #460
+  // round 2: an agent-less channelPoll previously passed the gate and read
+  // the all-agent legacy inbox). Unlike thread-assignment's liveness check,
+  // a session lookup ERROR here fails CLOSED: this is a read-authorization
+  // decision, and an unverifiable scope must not widen into a read.
+  let callerSessionId: string | null = null;
+  if (channelPoll) {
+    const reqCtx = getRequestContext();
+    const sessCtx = getSessionContext();
+    callerSessionId = reqCtx?.sessionId || sessCtx?.sessionId || null;
+    let failClosedReason: string | null = null;
+    if (!callerSessionId) {
+      failClosedReason = 'no session context';
+    } else {
+      // Scope the lookup to the RESOLVED USER — a session id belonging to a
+      // different user must read as not-found, never as a scope source.
+      const { data: sessionRow, error: sessionErr } = await supabase
+        .from('sessions')
+        .select('id, agent_id')
+        .eq('id', callerSessionId)
+        .eq('user_id', resolved.user.id)
+        .maybeSingle();
+      const sessionAgentId: string | null = sessionRow?.agent_id ?? null;
+      // Pinned identity must agree with the session's agent — otherwise a
+      // pinned caller can present another agent's session id, omit agentId,
+      // and switch the derived read scope to that agent (Lumen, round 3).
+      const pinnedAgentId = getPinnedAgentId();
+      if (sessionErr) {
+        failClosedReason = `session lookup failed: ${sessionErr.message}`;
+      } else if (!sessionRow || !sessionAgentId) {
+        failClosedReason = 'session not found for this user or has no agent';
+      } else if (pinnedAgentId && pinnedAgentId !== sessionAgentId) {
+        failClosedReason = `session agent '${sessionAgentId}' does not match pinned identity '${pinnedAgentId}'`;
+      } else if (agentId && agentId !== sessionAgentId) {
+        failClosedReason = `agentId '${agentId}' does not match session agent '${sessionAgentId}'`;
+      } else {
+        agentId = sessionAgentId;
+      }
+    }
+    if (failClosedReason) {
+      logger.warn('channel_poll_unscoped', {
+        agentId: agentId || null,
+        sessionId: callerSessionId,
+        userId: resolved.user.id,
+        hint: `channelPoll scope invalid (${failClosedReason}) — returning empty (fail-closed)`,
+      });
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: JSON.stringify({
+              success: true,
+              agentId: agentId || null,
+              unreadCount: 0,
+              threadUnreadCount: 0,
+              totalUnreadCount: 0,
+              count: 0,
+              messages: [],
+              threadsWithUnread: [],
+              warning: `channel_poll_unscoped: ${failClosedReason} — delivery disabled (fail-closed)`,
+            }),
+          },
+        ],
+      };
+    }
+  }
 
   let query = supabase
     .from('agent_inbox')
@@ -1055,56 +1295,134 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
   }
   let threadsWithUnread: ThreadSummary[] = [];
   let threadUnreadCount = 0;
+  // Completion signal (Lumen, PR #473 §5): the threads page below is capped —
+  // a poller must not treat a quiet page as proof the backlog is drained when
+  // more participant threads exist beyond it.
+  const THREAD_PAGE_LIMIT = 20;
+  let unreadThreadsTruncated = false;
+  // A failed candidacy query (or any thread-section failure on a delivery
+  // poll) must NEVER masquerade as an empty inbox: the poller would treat it
+  // as drained. Surfaced in the response; the plugin's drain proof honors it.
+  // NOTE: PostgREST failures RESOLVE as {data:null, error} — they do not
+  // throw — so every required read below is checked, not just the catch.
+  let channelPollIncomplete = false;
+  const checkedRead = <T>(
+    res: { data: T | null; error: { message: string } | null },
+    queryLabel: string
+  ): T | null => {
+    if (res.error) {
+      logger.error('channel_poll_query_failed', {
+        query: queryLabel,
+        agentId: agentId || null,
+        sessionId: callerSessionId,
+        error: res.error.message,
+      });
+      if (channelPoll) channelPollIncomplete = true;
+      return null;
+    }
+    return res.data;
+  };
 
-  // Resolve caller's session ID for channelPoll session scoping
-  let callerSessionId: string | null = null;
-  if (channelPoll && agentId) {
-    const reqCtx = getRequestContext();
-    const sessCtx = getSessionContext();
-    callerSessionId = reqCtx?.sessionId || sessCtx?.sessionId || null;
-  }
+  // (callerSessionId resolved + fail-closed gate applied at the top of the
+  // handler — before the legacy inbox fetch/advance. See spec §3.)
 
   try {
-    // Find thread IDs this agent (or any agent for this user) participates in
-    let participantQuery = threadTable(supabase, 'inbox_thread_participants').select('thread_id');
-    if (agentId) {
-      participantQuery = participantQuery.eq('agent_id', agentId);
-    }
-
-    // Session-scoped filtering: only return threads assigned to this session
-    // (or unassigned threads not yet claimed by any session).
-    if (callerSessionId) {
-      participantQuery = participantQuery.or(`session_id.eq.${callerSessionId},session_id.is.null`);
-    }
-
-    const { data: participantRows } = await participantQuery;
-
-    const threadIds = [
-      ...new Set((participantRows || []).map((p: { thread_id: string }) => p.thread_id)),
-    ];
-
-    if (threadIds.length > 0) {
+    // NO participant pre-scan: it collected EVERY thread id (unfiltered on
+    // the agent-less mission path — 365 threads ≈ 13.5KB of UUIDs) and fed
+    // them into `.in('id', ...)`, which PostgREST encodes into the request
+    // URL → HTTP 414 "URI too long". Silently swallowed for months; visible
+    // since the checked-read sweep. Scoping now happens where the data
+    // lives: the candidacy RPC self-scopes (user+agent+session, spec §3),
+    // and the recency page filters membership with a SQL join.
+    {
       // Get open threads for this user.
       // NOTE: `since` is NOT applied to threads — thread read pointers
       // (inbox_thread_read_status.last_read_at) already handle "which
       // messages have I seen." Filtering threads by updated_at would
       // cause missed messages when lastPollTime advances past the
       // thread's updated_at between polls.
-      const { data: threads } = await threadTable(supabase, 'inbox_threads')
-        .select('id, thread_key, title, user_id, created_by_agent_id, updated_at')
-        .eq('user_id', resolved.user.id)
-        .eq('status', 'open')
-        .in('id', threadIds)
-        .order('updated_at', { ascending: false })
-        .limit(20);
+      let threads: ThreadPageRow[] | null = null;
+      if (channelPoll && agentId) {
+        // Delivery polls page by EXACT candidacy in SQL (Lumen, PR #473
+        // round 3): candidacy compares the read pointer against the latest
+        // MESSAGE timestamp — thread.updated_at is bumped AFTER the message
+        // insert with a later app timestamp, so updated_at-based candidacy
+        // kept every fully-acked thread a candidate forever. The RPC scans
+        // all stamped threads (no client pre-cap — nothing is silently
+        // unreachable) and returns the newest-first page + total count.
+        const { data: candRows, error: candErr } = await supabase.rpc(
+          'get_unread_thread_candidates',
+          {
+            p_user_id: resolved.user.id,
+            p_agent_id: agentId,
+            p_session_id: callerSessionId ?? undefined,
+            p_limit: THREAD_PAGE_LIMIT,
+          }
+        );
+        if (candErr) {
+          logger.error('channel_poll_candidates_failed', {
+            agentId,
+            sessionId: callerSessionId,
+            error: candErr.message,
+          });
+          channelPollIncomplete = true;
+        }
+        const cands = (candErr ? [] : candRows || []) as Array<{
+          thread_id: string;
+          latest_message_at: string;
+          total_candidates: number | string;
+        }>;
+        unreadThreadsTruncated = (Number(cands[0]?.total_candidates) || 0) > THREAD_PAGE_LIMIT;
+        if (cands.length > 0) {
+          const candIds = cands.map((c) => c.thread_id);
+          const pageRows = checkedRead<ThreadPageRow[]>(
+            await threadTable(supabase, 'inbox_threads')
+              .select('id, thread_key, title, user_id, created_by_agent_id, updated_at')
+              .in('id', candIds),
+            'thread_page'
+          );
+          const byId = new Map((pageRows || []).map((t) => [t.id, t]));
+          threads = candIds.map((id) => byId.get(id)).filter(Boolean) as ThreadPageRow[];
+        } else {
+          threads = [];
+        }
+      } else {
+        // Recency page (mission timeline / non-delivery callers): membership
+        // is filtered with an !inner join on participants when an agent is
+        // given — never a client-side `.in(id-list)`, which blows the URL
+        // past 8KB once a user has a few hundred threads (HTTP 414). Threads
+        // are user-scoped rows, so the agent-less unified view needs no
+        // participant filter at all.
+        let recencyQuery = threadTable(supabase, 'inbox_threads')
+          .select(
+            agentId
+              ? 'id, thread_key, title, user_id, created_by_agent_id, updated_at, inbox_thread_participants!inner(agent_id)'
+              : 'id, thread_key, title, user_id, created_by_agent_id, updated_at'
+          )
+          .eq('user_id', resolved.user.id)
+          .eq('status', 'open');
+        if (agentId) {
+          recencyQuery = recencyQuery.eq('inbox_thread_participants.agent_id', agentId);
+        }
+        const data = checkedRead<ThreadPageRow[]>(
+          await recencyQuery.order('updated_at', { ascending: false }).limit(THREAD_PAGE_LIMIT),
+          'thread_page_recency'
+        );
+        threads = data;
+      }
 
       if (threads?.length) {
         const tIds = threads.map((t: { id: string }) => t.id);
 
         // Batch 1: all participants for all threads (was N queries)
-        const { data: allParts } = await threadTable(supabase, 'inbox_thread_participants')
-          .select('thread_id, agent_id, joined_at')
-          .in('thread_id', tIds);
+        const allParts = checkedRead<
+          Array<{ thread_id: string; agent_id: string; joined_at?: string }>
+        >(
+          await threadTable(supabase, 'inbox_thread_participants')
+            .select('thread_id, agent_id, joined_at')
+            .in('thread_id', tIds),
+          'thread_participants'
+        );
         const partsByThread = new Map<string, Array<{ agent_id: string; joined_at?: string }>>();
         for (const p of allParts || []) {
           const arr = partsByThread.get(p.thread_id) || [];
@@ -1115,10 +1433,15 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
         // Batch 2: all read statuses for all threads (was N queries)
         const readStatusByThread = new Map<string, string | null>();
         if (agentId) {
-          const { data: allReadStatuses } = await threadTable(supabase, 'inbox_thread_read_status')
-            .select('thread_id, last_read_at')
-            .in('thread_id', tIds)
-            .eq('agent_id', agentId);
+          const allReadStatuses = checkedRead<
+            Array<{ thread_id: string; last_read_at: string | null }>
+          >(
+            await threadTable(supabase, 'inbox_thread_read_status')
+              .select('thread_id, last_read_at')
+              .in('thread_id', tIds)
+              .eq('agent_id', agentId),
+            'thread_read_status'
+          );
           for (const rs of allReadStatuses || []) {
             readStatusByThread.set(rs.thread_id, rs.last_read_at);
           }
@@ -1128,11 +1451,23 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
         // and preview messages (was 2N queries). Fetch enough to cover previews +
         // reasonable unread counts. Threads with >50 unread will show a lower-bound.
         const MSG_BATCH_LIMIT = Math.max(tIds.length * 20, 200);
-        const { data: allMsgs } = await threadTable(supabase, 'inbox_thread_messages')
-          .select('thread_id, sender_agent_id, content, message_type, created_at, metadata')
-          .in('thread_id', tIds)
-          .order('created_at', { ascending: false })
-          .limit(MSG_BATCH_LIMIT);
+        const allMsgs = checkedRead<
+          Array<{
+            thread_id: string;
+            sender_agent_id: string;
+            content: string;
+            message_type: string;
+            created_at: string;
+            metadata: unknown;
+          }>
+        >(
+          await threadTable(supabase, 'inbox_thread_messages')
+            .select('thread_id, sender_agent_id, content, message_type, created_at, metadata')
+            .in('thread_id', tIds)
+            .order('created_at', { ascending: false })
+            .limit(MSG_BATCH_LIMIT),
+          'thread_messages'
+        );
 
         const msgsByThread = new Map<
           string,
@@ -1152,51 +1487,43 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
         }
 
         // Assemble thread summaries from batched data (pure JS, zero queries)
-        threadsWithUnread = threads.map(
-          (t: {
-            id: string;
-            thread_key: string;
-            title: string | null;
-            created_by_agent_id: string;
-            updated_at: string;
-          }) => {
-            const parts = partsByThread.get(t.id) || [];
-            const participants = parts.map((p) => p.agent_id);
+        threadsWithUnread = threads.map((t: ThreadPageRow) => {
+          const parts = partsByThread.get(t.id) || [];
+          const participants = parts.map((p) => p.agent_id);
 
-            let lastReadAt: string | null = readStatusByThread.get(t.id) || null;
-            let joinedAt: string | null = null;
-            if (agentId) {
-              const callerPart = parts.find((p) => p.agent_id === agentId);
-              joinedAt = callerPart?.joined_at || null;
-            }
-
-            const unreadBaseline = lastReadAt || joinedAt;
-            const threadMsgs = msgsByThread.get(t.id) || [];
-            const unreadCount = unreadBaseline
-              ? threadMsgs.filter((m) => m.created_at > unreadBaseline).length
-              : threadMsgs.length;
-
-            const previewMessages = threadMsgs
-              .filter((m) => m.message_type !== 'system')
-              .slice(0, 3)
-              .reverse()
-              .map((m) => ({
-                senderAgentId: m.sender_agent_id,
-                content: m.content,
-                messageType: m.message_type,
-                createdAt: m.created_at,
-              }));
-
-            return {
-              threadKey: t.thread_key,
-              title: t.title,
-              participants,
-              unreadCount,
-              lastMessageAt: t.updated_at,
-              previewMessages,
-            };
+          let lastReadAt: string | null = readStatusByThread.get(t.id) || null;
+          let joinedAt: string | null = null;
+          if (agentId) {
+            const callerPart = parts.find((p) => p.agent_id === agentId);
+            joinedAt = callerPart?.joined_at || null;
           }
-        );
+
+          const unreadBaseline = lastReadAt || joinedAt;
+          const threadMsgs = msgsByThread.get(t.id) || [];
+          const unreadCount = unreadBaseline
+            ? threadMsgs.filter((m) => m.created_at > unreadBaseline).length
+            : threadMsgs.length;
+
+          const previewMessages = threadMsgs
+            .filter((m) => m.message_type !== 'system')
+            .slice(0, 3)
+            .reverse()
+            .map((m) => ({
+              senderAgentId: m.sender_agent_id,
+              content: m.content,
+              messageType: m.message_type,
+              createdAt: m.created_at,
+            }));
+
+          return {
+            threadKey: t.thread_key,
+            title: t.title,
+            participants,
+            unreadCount,
+            lastMessageAt: t.updated_at,
+            previewMessages,
+          };
+        });
 
         // Only include threads that actually have unread messages
         threadsWithUnread = threadsWithUnread.filter((t) => t.unreadCount > 0);
@@ -1237,8 +1564,11 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
       }
     }
   } catch (err) {
-    // Thread tables may not exist yet (migration not applied) — graceful fallback
-    logger.debug('Failed to fetch thread unread counts (tables may not exist)', { err });
+    // Graceful fallback (legacy: thread tables may not exist) — but LOUD:
+    // for a channelPoll this is a delivery outage, not trivia, and the
+    // response must not read as a drained inbox.
+    if (channelPoll) channelPollIncomplete = true;
+    logger.warn('Failed to fetch thread unread counts', { err });
   }
 
   const inboxUnreadCount = unreadCount || 0;
@@ -1271,6 +1601,14 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
             createdAt: m.created_at,
             readAt: m.read_at,
           })),
+          ...(unreadThreadsTruncated ? { unreadThreadsTruncated: true } : {}),
+          ...(channelPollIncomplete
+            ? {
+                channelPollIncomplete: true,
+                warning:
+                  'channel_poll_incomplete: thread candidacy query failed — results are partial; do NOT treat this poll as drained',
+              }
+            : {}),
           ...(threadsWithUnread.length > 0
             ? {
                 threadsWithUnread,
@@ -1369,16 +1707,23 @@ export async function handleUpdateInboxMessage(args: unknown, dataComposer: Data
       throw new Error(`Message not found or not accessible: ${messageId}`);
     }
 
-    // Thread messages don't have a status column — mark the thread as read instead
+    // Thread messages don't have a status column — advance the read pointer
+    // through THIS message instead (never wall-clock: a concurrently inserted
+    // later message must not be swept into "read"). This API's purpose IS the
+    // durable write, so a failed advance must surface as failure, never as a
+    // positive acknowledgement.
     if (status === 'read' || status === 'acknowledged' || status === 'completed') {
-      await threadTable(supabase, 'inbox_thread_read_status').upsert(
-        {
-          thread_id: threadMsg.thread_id,
-          agent_id: agentId,
-          last_read_at: new Date().toISOString(),
-        },
-        { onConflict: 'thread_id,agent_id' }
-      );
+      const advanced = await advanceThreadReadPointer(supabase, {
+        threadId: threadMsg.thread_id,
+        agentId,
+        throughMessageId: messageId,
+        source: 'update_inbox_message:thread-fallback',
+      });
+      if (!advanced) {
+        throw new Error(
+          `Failed to persist read state for thread message ${messageId} — status not updated`
+        );
+      }
     }
 
     logger.info('Thread message status updated (via read pointer)', {
@@ -1826,7 +2171,7 @@ export const inboxToolDefinitions = [
   {
     name: 'get_inbox',
     description:
-      "Get messages from an agent's inbox. Returns unread messages by default. Omit agentId to get inbox across ALL agents in one query (useful for unified timelines like mission control). Sorted by created_at descending.",
+      "Get messages from an agent's inbox. Returns unread messages by default. Omit agentId to get inbox across ALL agents in one query (useful for unified timelines like mission control). Sorted by created_at descending. Pass threadKey to read a conversation thread instead — this aliases through to get_thread_messages (thread messages are stored separately from the legacy inbox) and requires agentId.",
     schema: getInboxSchema,
     handler: handleGetInbox,
   },
