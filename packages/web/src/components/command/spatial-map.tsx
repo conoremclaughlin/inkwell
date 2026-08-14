@@ -651,7 +651,15 @@ export function SpatialMap() {
           const from = toScreen(agent.position.x, agent.position.y);
           const to = toScreen(studio.position.x, studio.position.y);
           const color = getAgentColor(agent.agentId);
-          const isActive = studio.id === agent.studioId;
+          // Every studio this agent holds gets a live connection, not just the
+          // one the avatar sits on. An agent running concurrent sessions in
+          // separate worktrees is genuinely present in all of them, and
+          // drawing the others as idle dashes reports it as free — the same
+          // false-vacancy the lease exists to prevent, one layer up.
+          const isActive =
+            agent.heldStudioIds.length > 0
+              ? agent.heldStudioIds.includes(studio.id)
+              : studio.id === agent.studioId;
 
           ctx!.strokeStyle = isActive ? color + '50' : color + '20';
           ctx!.lineWidth = isActive ? 2 * z : 1 * z;
