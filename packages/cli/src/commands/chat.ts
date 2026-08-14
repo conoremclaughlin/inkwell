@@ -5050,7 +5050,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
           if (result) return Promise.resolve(result);
         }
         if (isPiTool(tool)) {
-          return callPiTool(tool, args, process.cwd());
+          // The signal reaches the TOOL, not just the bookkeeping around it.
+          // Without it, cancelling a clone mid-`bash` frees its registry slot
+          // and lets the parent move on while the command keeps running.
+          return callPiTool(tool, args, process.cwd(), opts.signal);
         }
         const { args: resolvedArgs } = resolveCredentialRefs(args, buildResolverEnv());
         return pcp.callTool(tool.replace(/^mcp__inkwell__/, ''), resolvedArgs);
@@ -5384,9 +5387,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
           if (result) return Promise.resolve(result);
         }
         // Pi coding tools (read, edit, write, bash, grep, find, ls) execute
-        // in-process via @mariozechner/pi-coding-agent, scoped to cwd
+        // in-process via @mariozechner/pi-coding-agent, scoped to cwd.
+        // The turn signal goes with them: Ctrl+C during a long `bash` should
+        // stop the command, not just stop waiting for it.
         if (isPiTool(tool)) {
-          return callPiTool(tool, args, process.cwd());
+          return callPiTool(tool, args, process.cwd(), abortSignal);
         }
         // Resolve credential references ($VAR / ${VAR}) in tool args.
         // The LLM emits references; actual values are injected here at the

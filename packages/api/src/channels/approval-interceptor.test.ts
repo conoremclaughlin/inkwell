@@ -545,6 +545,96 @@ describe('notifyPlatformOfApprovalRequest', () => {
     vi.unstubAllGlobals();
   });
 
+  it('preserves the clone origin through the metadata write-back', async () => {
+    // The write-back REPLACES the metadata object, so the origin recorded at
+    // insert is erased unless it is carried forward — and the audit trail is
+    // the one place that has to know which clone asked.
+    vi.useFakeTimers();
+    currentState = makeState({
+      trustedUsersResult: {
+        data: [{ platform: 'telegram', platform_user_id: 'chat-999' }],
+      },
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({ ok: true, json: async () => ({ result: { message_id: 42 } }) })
+    );
+
+    await notifyPlatformOfApprovalRequest({
+      ...baseRequest,
+      origin: { origin: 'clone', cloneId: 'clone-2', cloneLabel: 'audit auth paths' },
+    });
+    await vi.advanceTimersByTimeAsync(2500);
+
+    expect(currentState.updateCalledWith?.metadata).toMatchObject({
+      origin: { origin: 'clone', cloneId: 'clone-2', cloneLabel: 'audit auth paths' },
+      telegramMessageId: 42,
+      platform: 'telegram',
+    });
+
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it('preserves each clone origin across a batched metadata write-back', async () => {
+    vi.useFakeTimers();
+    currentState = makeState({
+      trustedUsersResult: {
+        data: [{ platform: 'telegram', platform_user_id: 'chat-999' }],
+      },
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({ ok: true, json: async () => ({ result: { message_id: 77 } }) })
+    );
+
+    // Two requests inside the debounce window batch into one notification, and
+    // each row's write-back must keep ITS own origin rather than the last one.
+    await notifyPlatformOfApprovalRequest({
+      ...baseRequest,
+      id: 'req-a',
+      origin: { origin: 'clone', cloneId: 'clone-1', cloneLabel: 'auth' },
+    });
+    await notifyPlatformOfApprovalRequest({
+      ...baseRequest,
+      id: 'req-b',
+      origin: { origin: 'clone', cloneId: 'clone-2', cloneLabel: 'coverage' },
+    });
+    await vi.advanceTimersByTimeAsync(2500);
+
+    // The harness records the LAST update; it belongs to the second request.
+    expect(currentState.updateCalledWith?.metadata).toMatchObject({
+      origin: { origin: 'clone', cloneId: 'clone-2', cloneLabel: 'coverage' },
+      batchMessageId: 77,
+    });
+
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it('omits origin entirely for a parent request', async () => {
+    vi.useFakeTimers();
+    currentState = makeState({
+      trustedUsersResult: {
+        data: [{ platform: 'telegram', platform_user_id: 'chat-999' }],
+      },
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({ ok: true, json: async () => ({ result: { message_id: 9 } }) })
+    );
+
+    await notifyPlatformOfApprovalRequest(baseRequest);
+    await vi.advanceTimersByTimeAsync(2500);
+
+    // Absent rather than null: parent rows should read exactly as they did
+    // before clones existed.
+    expect(currentState.updateCalledWith?.metadata).not.toHaveProperty('origin');
+
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
   it('does not write metadata when Telegram send fails (non-OK response)', async () => {
     currentState = makeState({
       trustedUsersResult: {

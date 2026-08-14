@@ -71,6 +71,8 @@ function buildClone(opts: {
   turns: string[];
   signal?: AbortSignal;
   failAfter?: number;
+  /** Observe what reaches the Pi tool boundary. */
+  onPiCall?: (tool: string, signal?: AbortSignal) => void;
 }) {
   const { policy } = deriveClonePolicy(opts.parent);
   const ledger = new ContextLedger();
@@ -134,6 +136,7 @@ function buildClone(opts: {
                 }
                 if (isPiTool(tool)) {
                   executed.push(tool);
+                  opts.onPiCall?.(tool, ctx.signal);
                   return callPiTool(tool, args, workdir, ctx.signal);
                 }
                 executed.push(tool);
@@ -717,5 +720,37 @@ describe('shadow clone cancellation is authoritative', () => {
     expect(clone.backendTurns).toBe(0);
     expect(result.stopReason).toBe('aborted');
     expect(result.success).toBe(false);
+  });
+});
+
+describe('shadow clone cancellation reaches the tools themselves', () => {
+  it('aborts an in-flight Pi tool rather than only abandoning its result', async () => {
+    const parent = new ToolPolicyState('backend', { persist: false });
+    const controller = new AbortController();
+    const coordinator = new ApprovalCoordinator({ concurrency: 1, prompt: async () => false });
+
+    // `grep` over a real directory, with the turn cancelled while it runs.
+    // Production dropped the signal at callPiTool, so the tool kept working
+    // after the clone's slot had already been freed.
+    let sawSignal: AbortSignal | undefined;
+    const clone = buildClone({
+      parent,
+      coordinator,
+      cloneId: 'clone-1',
+      cloneLabel: 'long running tool',
+      signal: controller.signal,
+      turns: [inkTool('grep', { pattern: 'login', path: '.' }), doneSignal],
+      onPiCall: (_tool, signal) => {
+        sawSignal = signal;
+      },
+    });
+
+    await clone.run();
+
+    // The signal has to arrive at the tool boundary. Asserting only that the
+    // loop stopped would pass with the signal dropped, which is exactly how
+    // this shipped.
+    expect(sawSignal).toBeDefined();
+    expect(sawSignal).toBe(controller.signal);
   });
 });
