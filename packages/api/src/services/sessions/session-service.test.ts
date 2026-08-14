@@ -1807,7 +1807,8 @@ describe('SessionService', () => {
         })
       );
 
-      expect(mockFindByAlias).toHaveBeenCalledWith('user-456', 'myra', 'main');
+      // 4th arg is the studio scope: undefined here because no studio was named.
+      expect(mockFindByAlias).toHaveBeenCalledWith('user-456', 'myra', 'main', undefined);
       expect(mockRepository.findByUserAndAgent).not.toHaveBeenCalled();
     });
 
@@ -1824,7 +1825,7 @@ describe('SessionService', () => {
         })
       );
 
-      expect(mockFindByAlias).toHaveBeenCalledWith('user-456', 'myra', 'nonexistent');
+      expect(mockFindByAlias).toHaveBeenCalledWith('user-456', 'myra', 'nonexistent', undefined);
       expect(mockFindByThreadKey).toHaveBeenCalledWith(
         'user-456',
         'myra',
@@ -1851,6 +1852,204 @@ describe('SessionService', () => {
       expect(mockFindByAlias).toHaveBeenCalled();
       // threadKey lookup should NOT be called because alias matched
       expect(mockFindByThreadKey).not.toHaveBeenCalled();
+    });
+
+    it('resolves a bare alias for a repo-less agent asking for "main"', async () => {
+      // PR #495 round 3 (Lumen, P1). A guard added in round 1 skipped the
+      // alias lookup whenever a caller-qualified tier produced no studio.
+      // Once literal slug misses began throwing earlier (round 2), the only
+      // case still reaching that guard was the PERMITTED one — 'main' on an
+      // agent with no root studio — so it disabled alias routing for exactly
+      // the repo-less agents the degrade was written to protect, dropping
+      // them through to threadKey/default/general and a different session.
+      const aliasSession = createMockSession({ id: 'alias-session', studioId: undefined });
+      const otherSession = createMockSession({ id: 'thread-session', studioId: undefined });
+      const mockFindByAlias = vi.fn().mockResolvedValue(aliasSession);
+      const mockFindByThreadKey = vi.fn().mockResolvedValue(otherSession);
+      (mockRepository as Record<string, unknown>).findByAlias = mockFindByAlias;
+      (mockRepository as Record<string, unknown>).findByThreadKey = mockFindByThreadKey;
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(otherSession);
+
+      const emptyChain: Record<string, unknown> = {};
+      for (const m of ['select', 'eq', 'not', 'is', 'neq', 'in', 'order', 'limit']) {
+        emptyChain[m] = vi.fn().mockReturnValue(emptyChain);
+      }
+      emptyChain.maybeSingle = vi.fn().mockResolvedValue({ data: null, error: null });
+      emptyChain.single = vi.fn().mockResolvedValue({ data: null, error: null });
+      emptyChain.then = (resolve: (v: unknown) => unknown) =>
+        Promise.resolve({ data: [], error: null }).then(resolve);
+
+      const service = new SessionService(
+        mockRepository,
+        mockContextBuilder,
+        mockClaudeRunner,
+        mockActivityStream,
+        {
+          defaultWorkingDirectory: '/test',
+          mcpConfigPath: '/test/.mcp.json',
+          compactionThreshold: 150000,
+        },
+        mockCodexRunner,
+        { from: vi.fn().mockReturnValue(emptyChain) } as never
+      );
+
+      const session = await service.getOrCreateSession('user-456', 'myra', {
+        studioHint: 'main',
+        alias: 'main',
+        threadKey: 'pr:42',
+      });
+
+      // The alias wins. Unscoped is safe here on its own terms: findByAlias
+      // refuses an alias spanning two studios, so no-scope means must-be-
+      // unique rather than pick-one.
+      expect(mockFindByAlias).toHaveBeenCalledWith('user-456', 'myra', 'main', undefined);
+      expect(session.id).toBe('alias-session');
+      expect(mockFindByThreadKey).not.toHaveBeenCalled();
+    });
+
+    it('never consults the alias when a named studio does not exist (message path)', async () => {
+      // PR #495 review (Lumen, P1). resolveStudioId returns
+      // { studioId: undefined, tier: 'studio-hint' } for a hint that matches
+      // nothing — deliberately, so an explicit hint never falls through to an
+      // unrelated studio. Running the alias lookup unscoped there would undo
+      // exactly that: a unique alias in some other studio would match and the
+      // caller would land in a worktree they never named.
+      //
+      // Resolution throws; handleMessage catches and reports. The assertion
+      // that matters at this layer is that no lookup ran before the refusal —
+      // the throw itself is pinned on getOrCreateSession in the ladder test.
+      const strayMatch = createMockSession({ id: 'stray-session', alias: 'review' });
+      const mockFindByAlias = vi.fn().mockResolvedValue(strayMatch);
+      (mockRepository as Record<string, unknown>).findByAlias = mockFindByAlias;
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(null);
+
+      // resolveStudioId short-circuits to tier 'none' without a supabase
+      // client, so the hint path needs one. Every query resolves empty: the
+      // named studio does not exist.
+      const emptyChain: Record<string, unknown> = {};
+      for (const m of ['select', 'eq', 'not', 'is', 'neq', 'in', 'order', 'limit']) {
+        emptyChain[m] = vi.fn().mockReturnValue(emptyChain);
+      }
+      emptyChain.maybeSingle = vi.fn().mockResolvedValue({ data: null, error: null });
+      emptyChain.single = vi.fn().mockResolvedValue({ data: null, error: null });
+      emptyChain.then = (resolve: (v: unknown) => unknown) =>
+        Promise.resolve({ data: [], error: null }).then(resolve);
+
+      const serviceWithSupabase = new SessionService(
+        mockRepository,
+        mockContextBuilder,
+        mockClaudeRunner,
+        mockActivityStream,
+        {
+          defaultWorkingDirectory: '/test',
+          mcpConfigPath: '/test/.mcp.json',
+          compactionThreshold: 150000,
+        },
+        mockCodexRunner,
+        { from: vi.fn().mockReturnValue(emptyChain) } as never
+      );
+
+      await serviceWithSupabase.handleMessage(
+        createMockRequest({
+          metadata: {
+            sessionAlias: 'review',
+            // A slug that resolves to nothing — stale, cleaned, or another
+            // agent's studio.
+            studioHint: 'no-such-studio',
+          },
+        })
+      );
+
+      // The alias lookup must not run at all — not run-and-discard, since an
+      // unscoped query is the thing that produces the wrong answer.
+      expect(mockFindByAlias).not.toHaveBeenCalled();
+    });
+
+    it('stops the whole reuse ladder — no stray thread/default/general session can win', async () => {
+      // PR #495 round 2 (Lumen, P1). Skipping only the alias lookup left three
+      // other unscoped rungs that could each return a session bound to a
+      // worktree the caller never named. Every one of them is armed here with
+      // a session that WOULD match; none may be consulted.
+      const stray = (id: string) => createMockSession({ id, studioId: 'some-other-studio' });
+      const mockFindByAlias = vi.fn().mockResolvedValue(stray('stray-alias'));
+      const mockFindByThreadKey = vi.fn().mockResolvedValue(stray('stray-thread'));
+      (mockRepository as Record<string, unknown>).findByAlias = mockFindByAlias;
+      (mockRepository as Record<string, unknown>).findByThreadKey = mockFindByThreadKey;
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(stray('stray-general'));
+
+      const emptyChain: Record<string, unknown> = {};
+      for (const m of ['select', 'eq', 'not', 'is', 'neq', 'in', 'order', 'limit']) {
+        emptyChain[m] = vi.fn().mockReturnValue(emptyChain);
+      }
+      emptyChain.maybeSingle = vi.fn().mockResolvedValue({ data: null, error: null });
+      emptyChain.single = vi.fn().mockResolvedValue({ data: null, error: null });
+      emptyChain.then = (resolve: (v: unknown) => unknown) =>
+        Promise.resolve({ data: [], error: null }).then(resolve);
+
+      const service = new SessionService(
+        mockRepository,
+        mockContextBuilder,
+        mockClaudeRunner,
+        mockActivityStream,
+        {
+          defaultWorkingDirectory: '/test',
+          mcpConfigPath: '/test/.mcp.json',
+          compactionThreshold: 150000,
+        },
+        mockCodexRunner,
+        { from: vi.fn().mockReturnValue(emptyChain) } as never
+      );
+
+      await expect(
+        service.getOrCreateSession('user-456', 'myra', {
+          threadKey: 'pr:42',
+          alias: 'review',
+          studioHint: 'no-such-studio',
+        })
+      ).rejects.toThrow(/does not exist/i);
+
+      expect(mockFindByAlias).not.toHaveBeenCalled();
+      expect(mockFindByThreadKey).not.toHaveBeenCalled();
+      expect(mockRepository.findByUserAndAgent).not.toHaveBeenCalled();
+      // And nothing was created as a consolation prize.
+      expect(mockRepository.create).not.toHaveBeenCalled();
+    });
+
+    it('still degrades for "main" when the agent has no root studio', async () => {
+      // The refusal above must stay narrow. Asking for "main" on an agent that
+      // has no root studio is an ordinary state, not a bad address — throwing
+      // there would break every agent that has never had a repo.
+      const existing = createMockSession({ id: 'existing-session' });
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(existing);
+
+      const emptyChain: Record<string, unknown> = {};
+      for (const m of ['select', 'eq', 'not', 'is', 'neq', 'in', 'order', 'limit']) {
+        emptyChain[m] = vi.fn().mockReturnValue(emptyChain);
+      }
+      emptyChain.maybeSingle = vi.fn().mockResolvedValue({ data: null, error: null });
+      emptyChain.single = vi.fn().mockResolvedValue({ data: null, error: null });
+      emptyChain.then = (resolve: (v: unknown) => unknown) =>
+        Promise.resolve({ data: [], error: null }).then(resolve);
+
+      const service = new SessionService(
+        mockRepository,
+        mockContextBuilder,
+        mockClaudeRunner,
+        mockActivityStream,
+        {
+          defaultWorkingDirectory: '/test',
+          mcpConfigPath: '/test/.mcp.json',
+          compactionThreshold: 150000,
+        },
+        mockCodexRunner,
+        { from: vi.fn().mockReturnValue(emptyChain) } as never
+      );
+
+      const session = await service.getOrCreateSession('user-456', 'myra', {
+        studioHint: 'main',
+      });
+
+      expect(session.id).toBe('existing-session');
     });
   });
 

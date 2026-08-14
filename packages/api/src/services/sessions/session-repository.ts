@@ -19,6 +19,32 @@ import type {
 import { logger } from '../../utils/logger.js';
 
 /**
+ * Raised when a bare session alias matches active sessions in more than one
+ * studio, so no single session is the address the caller asked for.
+ *
+ * Carried to the caller rather than swallowed: the fix is for the sender to
+ * qualify the address (recipientStudioSlug / recipientStudioId), and only an
+ * error that names the candidates makes that possible.
+ */
+export class AmbiguousAliasError extends Error {
+  readonly code = 'AMBIGUOUS_SESSION_ALIAS';
+
+  constructor(
+    readonly alias: string,
+    readonly agentId: string,
+    readonly candidates: Array<{ sessionId: string; studioId: string | null }>
+  ) {
+    const studios = candidates.map((c) => c.studioId ?? '(no studio)').join(', ');
+    super(
+      `Session alias "${alias}" for agent "${agentId}" is ambiguous — it matches ` +
+        `${candidates.length} active sessions across studios: ${studios}. ` +
+        `Qualify the address with recipientStudioSlug or recipientStudioId.`
+    );
+    this.name = 'AmbiguousAliasError';
+  }
+}
+
+/**
  * Ceiling on a diffed CUMULATIVE delta (Codex thread totals).
  *
  * Well above any real turn on that path, and far below the scale a
@@ -244,26 +270,72 @@ export class SessionRepository implements ISessionRepository {
     return session;
   }
 
-  async findByAlias(userId: string, agentId: string, alias: string): Promise<Session | null> {
+  /**
+   * Resolve a session by its human-readable alias.
+   *
+   * Aliases are scoped to (user, agent, studio) — see the
+   * 20260814080050_session_alias_studio_scope migration. Two studios may each
+   * hold a session named "review", so a bare alias is not always a unique
+   * address.
+   *
+   * @param studioId When the caller named a studio explicitly, the lookup is
+   *   pinned to it and a match elsewhere is not a match. When omitted, the
+   *   alias must identify exactly one active session.
+   * @throws {AmbiguousAliasError} when a bare alias matches sessions in more
+   *   than one studio. Refusing is deliberate: the previous implementation
+   *   ordered by started_at and took the newest, which routes work into
+   *   whichever worktree happened to start last. A caller that gets an error
+   *   can qualify the address; a caller that gets the wrong studio cannot
+   *   tell that anything went wrong.
+   */
+  async findByAlias(
+    userId: string,
+    agentId: string,
+    alias: string,
+    studioId?: string
+  ): Promise<Session | null> {
     // alias column not yet in generated Supabase types — cast
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const { data, error } = (await (this.supabase as any)
+    let query = (this.supabase as any)
       .from('sessions')
       .select('*')
       .eq('user_id', userId)
       .eq('agent_id', agentId)
       .eq('alias', alias)
       .is('ended_at', null)
-      .neq('lifecycle', 'failed')
-      .order('started_at', { ascending: false })
-      .limit(1)) as { data: DbSession[] | null; error: { message: string; code?: string } | null };
+      .neq('lifecycle', 'failed');
+
+    if (studioId !== undefined) {
+      query = query.eq('studio_id', studioId);
+    }
+
+    const { data, error } = (await query.order('started_at', { ascending: false })) as {
+      data: DbSession[] | null;
+      error: { message: string; code?: string } | null;
+    };
 
     if (error) {
-      logger.error('Error finding session by alias', { userId, agentId, alias, error });
+      logger.error('Error finding session by alias', { userId, agentId, alias, studioId, error });
       throw error;
     }
 
-    return data && data.length > 0 ? mapDbToSession(data[0]) : null;
+    const rows = data ?? [];
+    if (rows.length === 0) return null;
+
+    // A studio-pinned lookup is unique by index, so anything past the first
+    // row would mean the index is gone. Take it and move on.
+    if (studioId !== undefined) return mapDbToSession(rows[0]);
+
+    const distinctStudios = new Set(rows.map((r) => r.studio_id ?? null));
+    if (distinctStudios.size > 1) {
+      throw new AmbiguousAliasError(
+        alias,
+        agentId,
+        rows.map((r) => ({ sessionId: r.id, studioId: r.studio_id ?? null }))
+      );
+    }
+
+    return mapDbToSession(rows[0]);
   }
 
   async findByThreadKey(
