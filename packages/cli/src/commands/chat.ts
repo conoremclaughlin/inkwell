@@ -108,6 +108,7 @@ import { SbHookRegistry } from '../repl/hook-registry.js';
 import { registerBuiltinHooks } from '../repl/builtin-hooks.js';
 import { applyProfile, formatProfileList, isValidProfileId } from '../repl/tool-profiles.js';
 import { isPiTool, callPiTool } from '../repl/pi-tools.js';
+import { bareToolName, createLocalToolDispatcher } from '../repl/tool-dispatch.js';
 import { ApprovalRequestManager } from '../repl/approval-request.js';
 import { requestToolApproval } from '../repl/approval-api.js';
 import {
@@ -5019,45 +5020,43 @@ export async function runChat(options: ChatOptions): Promise<void> {
       policy: opts.policy,
       sessionId: runtime.sessionId,
       signal: opts.signal,
-      callTool: (tool, args, ctx) => {
-        // Non-nesting is enforced HERE, not by omitting spawn_agent from the
-        // clone's prompt: tool calls travel as text, so a model can name any
-        // tool it likes regardless of what it was told.
-        if (isForbiddenInClone(tool)) {
-          return Promise.resolve({
-            content: [
-              {
-                type: 'text',
-                text: `${tool} is not available to a shadow clone. Report what you found and let your parent act on it.`,
-              },
-            ],
-            isError: true,
-          } as PcpToolCallResult);
-        }
-        if (isClientLocalTool(tool)) {
-          // A throwaway ledger AND a private signal sink. The sink is the
-          // load-bearing half: `signal_status` otherwise writes the module
-          // global that runChat reads to decide whether the whole
-          // non-interactive run completed — and every clone is instructed to
-          // signal when it finishes. A clone would end its parent's run, and
-          // concurrent clones would race for the same slot.
-          const result = handleClientLocalTool(
-            tool,
-            args,
-            cloneLedgerFor(opts.transcriptPath),
-            opts.signalSink
-          );
-          if (result) return Promise.resolve(result);
-        }
-        if (isPiTool(tool)) {
-          // The signal reaches the TOOL, not just the bookkeeping around it.
-          // Without it, cancelling a clone mid-`bash` frees its registry slot
-          // and lets the parent move on while the command keeps running.
-          return callPiTool(tool, args, process.cwd(), ctx.signal);
-        }
-        const { args: resolvedArgs } = resolveCredentialRefs(args, buildResolverEnv());
-        return pcp.callTool(tool.replace(/^mcp__inkwell__/, ''), resolvedArgs);
-      },
+      callTool: createLocalToolDispatcher({
+        cwd: process.cwd(),
+        callPi: callPiTool,
+        callPcp: (bare, resolved) => pcp.callTool(bare, resolved),
+        resolveCredentials: (args) => resolveCredentialRefs(args, buildResolverEnv()).args,
+        head: (tool, args) => {
+          // Non-nesting is enforced HERE, not by omitting spawn_agent from the
+          // clone's prompt: tool calls travel as text, so a model can name any
+          // tool it likes regardless of what it was told.
+          if (isForbiddenInClone(tool)) {
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: `${tool} is not available to a shadow clone. Report what you found and let your parent act on it.`,
+                },
+              ],
+              isError: true,
+            } as PcpToolCallResult;
+          }
+          if (isClientLocalTool(tool)) {
+            // A throwaway ledger AND a private signal sink. The sink is the
+            // load-bearing half: `signal_status` otherwise writes the module
+            // global that runChat reads to decide whether the whole
+            // non-interactive run completed — and every clone is instructed to
+            // signal when it finishes. A clone would end its parent's run, and
+            // concurrent clones would race for the same slot.
+            return handleClientLocalTool(
+              tool,
+              args,
+              cloneLedgerFor(opts.transcriptPath),
+              opts.signalSink
+            );
+          }
+          return null;
+        },
+      }),
       promptForApproval: (tool, reason, args) =>
         approvalCoordinator
           .request({
@@ -5371,43 +5370,43 @@ export async function runChat(options: ChatOptions): Promise<void> {
     await executeToolCalls(calls, {
       policy: toolPolicy,
       signal: abortSignal,
-      callTool: (tool, args, ctx) => {
-        // spawn_agent is NOT a client-local policy bypass. Unlike ledger tools
-        // it costs backend time and fans out authority, so it reaches here only
-        // after executeToolCalls has cleared it through policy.
-        if (tool.replace(/^mcp__inkwell__/, '') === SPAWN_AGENT_TOOL) {
-          return runSpawnAgent(args, { signal: abortSignal });
-        }
-        if (tool.replace(/^mcp__inkwell__/, '') === COLLECT_AGENTS_TOOL) {
-          return runCollectAgents(args);
-        }
-        // Client-local tools (context management) are handled in-process
-        if (isClientLocalTool(tool)) {
-          const result = handleClientLocalTool(tool, args, ledger);
-          if (result) return Promise.resolve(result);
-        }
-        // Pi coding tools (read, edit, write, bash, grep, find, ls) execute
-        // in-process via @mariozechner/pi-coding-agent, scoped to cwd.
-        // The turn signal goes with them: Ctrl+C during a long `bash` should
-        // stop the command, not just stop waiting for it.
-        if (isPiTool(tool)) {
-          return callPiTool(tool, args, process.cwd(), ctx.signal);
-        }
-        // Resolve credential references ($VAR / ${VAR}) in tool args.
-        // The LLM emits references; actual values are injected here at the
-        // execution layer so credentials never enter transcripts or context.
-        const { args: resolvedArgs, resolutions } = resolveCredentialRefs(args, buildResolverEnv());
-        if (resolutions.length > 0 && runtime.verbose) {
-          const refs = resolutions.map((r) => `${r.name} at ${r.path}`).join(', ');
-          printLine(
-            chalk.dim(`credential-resolver: resolved ${resolutions.length} ref(s): ${refs}`)
+      callTool: createLocalToolDispatcher({
+        cwd: process.cwd(),
+        callPi: callPiTool,
+        callPcp: (bare, resolved) => pcp.callTool(bare, resolved),
+        // Resolve credential references ($VAR / ${VAR}) in tool args. The LLM
+        // emits references; actual values are injected at the execution layer
+        // so credentials never enter transcripts or context.
+        resolveCredentials: (args) => {
+          const { args: resolvedArgs, resolutions } = resolveCredentialRefs(
+            args,
+            buildResolverEnv()
           );
-        }
-        // Strip MCP namespace prefix — the SB may emit mcp__inkwell__tool_name
-        // but PcpClient expects bare tool names (get_inbox, recall, etc.)
-        const bareTool = tool.replace(/^mcp__inkwell__/, '');
-        return pcp.callTool(bareTool, resolvedArgs);
-      },
+          if (resolutions.length > 0 && runtime.verbose) {
+            const refs = resolutions.map((r) => `${r.name} at ${r.path}`).join(', ');
+            printLine(
+              chalk.dim(`credential-resolver: resolved ${resolutions.length} ref(s): ${refs}`)
+            );
+          }
+          return resolvedArgs;
+        },
+        head: (tool, args) => {
+          // spawn_agent is NOT a client-local policy bypass. Unlike ledger
+          // tools it costs backend time and fans out authority, so it reaches
+          // here only after executeToolCalls has cleared it through policy.
+          if (bareToolName(tool) === SPAWN_AGENT_TOOL) {
+            return runSpawnAgent(args, { signal: abortSignal });
+          }
+          if (bareToolName(tool) === COLLECT_AGENTS_TOOL) {
+            return runCollectAgents(args);
+          }
+          // Client-local tools (context management) are handled in-process
+          if (isClientLocalTool(tool)) {
+            return handleClientLocalTool(tool, args, ledger);
+          }
+          return null;
+        },
+      }),
       sessionId: runtime.sessionId,
       promptForApproval: (tool, reason, args) =>
         approvalCoordinator
