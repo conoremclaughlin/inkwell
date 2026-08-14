@@ -39,6 +39,7 @@
 import { execFile } from 'child_process';
 import { randomUUID } from 'crypto';
 import { promisify } from 'util';
+import { access } from 'fs/promises';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { Database, Json } from '../data/supabase/types';
 import { hasActiveRun } from './sessions/active-runs';
@@ -124,6 +125,16 @@ export interface WorktreeFinalState {
   /** Set when a dirty tree was stashed; the stash commit SHA survives stash drops. */
   rescueStashSha?: string;
   error?: string;
+}
+
+/** Does the worktree directory actually exist on disk? An absent worktree has
+ * nothing to rescue — treating its capture error as a failed rescue would
+ * quarantine forever with no recovery path. */
+export async function worktreePresent(worktreePath: string | null | undefined): Promise<boolean> {
+  if (!worktreePath) return false;
+  return access(worktreePath)
+    .then(() => true)
+    .catch(() => false);
 }
 
 /** Did a rescue-mode capture actually secure the tree? */
@@ -481,7 +492,10 @@ export class StudioLeaseService {
       return { acquired: false, holder: reread?.lease ?? holder };
     }
 
-    if (worktreePath) {
+    // An absent worktree has nothing to rescue — skip capture rather than
+    // treating the inevitable error as a failed rescue (which would
+    // quarantine forever with no recovery path).
+    if (worktreePath && (await worktreePresent(worktreePath))) {
       const rescue = await captureWorktreeState(worktreePath, {
         rescue: true,
         rescueLabel: holder.heldThreadKey ?? holder.threadKey,
@@ -1022,8 +1036,41 @@ export class StudioLeaseService {
       const claimWon = await this.casLease(row.id, row.user_id, lease, claim);
       if (!claimWon) continue; // renewed, released, or acquired concurrently — not ours
 
-      const rescue = row.worktree_path
-        ? await captureWorktreeState(row.worktree_path, {
+      const present = await worktreePresent(row.worktree_path);
+
+      // Reconciliation: a TEARDOWN claim whose worktree is already gone means
+      // destruction succeeded but the cleaned record didn't land (e.g.,
+      // close_studio's markCleaned failed). Finish the intent — record
+      // cleaned and clear the claim — instead of failing rescue forever on
+      // the missing cwd.
+      if (!present && lease.quarantined && lease.claimKind === 'teardown') {
+        const { data: finalized } = await this.supabase
+          .from('studios')
+          .update({ status: 'cleaned', cleaned_at: new Date().toISOString(), lease: null })
+          .eq('id', row.id)
+          .eq('user_id', row.user_id)
+          .eq('lease->>sessionId', claim.sessionId)
+          .select('id');
+        if (finalized?.length) {
+          logger.warn('[StudioLease] Finalized interrupted teardown — worktree already absent', {
+            studioId: row.id,
+          });
+          await this.logEvent(row.user_id, row.id, 'released', {
+            sessionId: claim.holderSessionId,
+            threadKey: claim.heldThreadKey,
+            agentId: lease.agentId,
+            sbId: lease.sbId,
+            reason: 'teardown-finalized-worktree-absent',
+          });
+          released += 1;
+        }
+        continue;
+      }
+
+      // An absent worktree has nothing to rescue — a capture error there is
+      // not a failed rescue, and must not quarantine forever.
+      const rescue = present
+        ? await captureWorktreeState(row.worktree_path as string, {
             rescue: true,
             rescueLabel: claim.heldThreadKey ?? lease.threadKey,
           })

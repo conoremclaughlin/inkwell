@@ -905,6 +905,82 @@ describe('StudioLeaseService.sweepExpiredLeases', () => {
   });
 });
 
+describe('sweep worktree-absent reconciliation (round 6)', () => {
+  afterEach(() => resetActiveRuns());
+
+  function staleClaim(kind: 'recovery' | 'teardown'): StudioLease {
+    const staleIso = new Date(Date.now() - LEASE_STALE_MS - 60_000).toISOString();
+    return {
+      sessionId: '22222222-2222-2222-2222-222222222222',
+      threadKey: QUARANTINE_THREAD_KEY,
+      heldThreadKey: 'pr:33',
+      holderSessionId: 'sess-orig',
+      agentId: 'wren',
+      acquiredAt: staleIso,
+      heartbeatAt: staleIso,
+      quarantined: true,
+      claimKind: kind,
+    };
+  }
+
+  it('finalizes an interrupted TEARDOWN over an absent worktree: cleaned + released', async () => {
+    resetActiveRuns();
+    const tables: Record<string, Row[]> = {
+      studios: [
+        {
+          id: 's-t',
+          user_id: 'u',
+          status: 'active',
+          lease: staleClaim('teardown') as unknown as Row,
+          worktree_path: path.join(tmpdir(), 'gone-worktree-xyz'),
+        },
+      ],
+      studio_lease_events: [],
+      inbox_threads: [],
+      agent_identities: [],
+      sessions: [],
+    };
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+    const stats = await service.sweepExpiredLeases();
+
+    expect(stats.released).toBe(1);
+    expect(stats.quarantined).toBe(0);
+    expect(tables.studios[0].lease).toBeNull();
+    expect(tables.studios[0].status).toBe('cleaned');
+    const event = tables.studio_lease_events.find((e) => e.event === 'released');
+    expect(event?.reason).toBe('teardown-finalized-worktree-absent');
+  });
+
+  it('clears a stale RECOVERY quarantine over an absent worktree without looping forever', async () => {
+    resetActiveRuns();
+    const tables: Record<string, Row[]> = {
+      studios: [
+        {
+          id: 's-r',
+          user_id: 'u',
+          status: 'active',
+          lease: staleClaim('recovery') as unknown as Row,
+          worktree_path: path.join(tmpdir(), 'gone-worktree-abc'),
+        },
+      ],
+      studio_lease_events: [],
+      inbox_threads: [],
+      agent_identities: [],
+      sessions: [],
+    };
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+    const stats = await service.sweepExpiredLeases();
+
+    // Nothing to rescue on a missing cwd — the quarantine resolves to
+    // vacancy ('expired') instead of re-quarantining every sweep.
+    expect(stats.expired).toBe(1);
+    expect(stats.quarantined).toBe(0);
+    expect(tables.studios[0].lease).toBeNull();
+    // A recovery quarantine does not imply teardown intent — status untouched.
+    expect(tables.studios[0].status).toBe('active');
+  });
+});
+
 describe('sweep pendingRelease backstop', () => {
   afterEach(() => resetActiveRuns());
 
