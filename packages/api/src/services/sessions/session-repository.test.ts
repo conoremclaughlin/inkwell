@@ -641,3 +641,121 @@ interface ModelTotals {
   costUSD: number;
   canonicalModel?: string;
 }
+
+/**
+ * Alias resolution is studio-scoped (migration 20260814080050).
+ *
+ * The behaviour under test is the refusal: the previous implementation ordered
+ * matches by started_at and returned the newest, so an alias could silently
+ * resolve into a different worktree than the caller meant. These tests pin the
+ * three outcomes — pinned lookup, unique match, ambiguous refusal.
+ */
+describe('SessionRepository.findByAlias — studio scoping', () => {
+  /** Mock whose select chain resolves to `rows`, recording the .eq filters. */
+  function aliasSupabase(rows: Array<Record<string, unknown>>) {
+    const filters: Record<string, unknown> = {};
+    const chain: Record<string, unknown> = {};
+
+    Object.assign(chain, {
+      select: vi.fn(() => chain),
+      eq: vi.fn((col: string, val: unknown) => {
+        filters[col] = val;
+        return chain;
+      }),
+      is: vi.fn(() => chain),
+      neq: vi.fn(() => chain),
+      // findByAlias awaits the order() call directly — resolve to the row set.
+      order: vi.fn(() => Promise.resolve({ data: rows, error: null })),
+    });
+
+    return {
+      supabase: { from: vi.fn(() => chain) } as never,
+      filters,
+    };
+  }
+
+  function row(id: string, studioId: string | null) {
+    return {
+      id,
+      user_id: 'user-1',
+      agent_id: 'wren',
+      studio_id: studioId,
+      alias: 'review',
+      lifecycle: 'idle',
+      status: 'active',
+      type: 'primary',
+      backend: 'claude-code',
+      started_at: '2026-08-14T08:00:00.000Z',
+      updated_at: '2026-08-14T08:00:00.000Z',
+      ended_at: null,
+      message_count: 0,
+      token_count: 0,
+      metadata: {},
+    };
+  }
+
+  it('returns the single match when the alias is unique', async () => {
+    const { supabase } = aliasSupabase([row('sess-a', 'studio-1')]);
+    const repo = new SessionRepository(supabase);
+
+    const found = await repo.findByAlias('user-1', 'wren', 'review');
+
+    expect(found?.id).toBe('sess-a');
+  });
+
+  it('returns null when nothing matches', async () => {
+    const { supabase } = aliasSupabase([]);
+    const repo = new SessionRepository(supabase);
+
+    expect(await repo.findByAlias('user-1', 'wren', 'review')).toBeNull();
+  });
+
+  it('refuses a bare alias that matches sessions in two studios', async () => {
+    const { supabase } = aliasSupabase([row('sess-a', 'studio-1'), row('sess-b', 'studio-2')]);
+    const repo = new SessionRepository(supabase);
+
+    // The pre-migration implementation returned sess-a here (newest first),
+    // routing the caller into whichever worktree started last.
+    await expect(repo.findByAlias('user-1', 'wren', 'review')).rejects.toThrow(/ambiguous/i);
+  });
+
+  it('names the candidate studios in the refusal so the caller can qualify', async () => {
+    const { supabase } = aliasSupabase([row('sess-a', 'studio-1'), row('sess-b', null)]);
+    const repo = new SessionRepository(supabase);
+
+    await expect(repo.findByAlias('user-1', 'wren', 'review')).rejects.toThrow(
+      /studio-1.*\(no studio\)/
+    );
+  });
+
+  it('pins the query to the studio when one is named, and does not refuse', async () => {
+    const { supabase, filters } = aliasSupabase([row('sess-a', 'studio-1')]);
+    const repo = new SessionRepository(supabase);
+
+    const found = await repo.findByAlias('user-1', 'wren', 'review', 'studio-1');
+
+    expect(found?.id).toBe('sess-a');
+    expect(filters.studio_id).toBe('studio-1');
+  });
+
+  it('does not filter by studio when no studio is named', async () => {
+    const { supabase, filters } = aliasSupabase([row('sess-a', 'studio-1')]);
+    const repo = new SessionRepository(supabase);
+
+    await repo.findByAlias('user-1', 'wren', 'review');
+
+    expect(filters).not.toHaveProperty('studio_id');
+  });
+
+  it('treats an explicit null studio as a real scope, not "unscoped"', async () => {
+    // A session with no studio is still addressable — the caller passing the
+    // nil-studio scope must not be conflated with passing nothing.
+    const { supabase, filters } = aliasSupabase([row('sess-b', null)]);
+    const repo = new SessionRepository(supabase);
+
+    const found = await repo.findByAlias('user-1', 'wren', 'review', '');
+
+    expect(found?.id).toBe('sess-b');
+    expect(filters).toHaveProperty('studio_id');
+  });
+});

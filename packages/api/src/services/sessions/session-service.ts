@@ -1392,20 +1392,44 @@ export class SessionService implements ISessionService {
       // Takes priority over threadKey because alias is an explicit user intent.
       if (options?.alias && 'findByAlias' in this.repository) {
         const aliasRepo = this.repository as {
-          findByAlias: (u: string, a: string, alias: string) => Promise<Session | null>;
+          findByAlias: (
+            u: string,
+            a: string,
+            alias: string,
+            studioId?: string
+          ) => Promise<Session | null>;
         };
-        const aliasMatch = await aliasRepo.findByAlias(userId, agentId, options.alias);
+
+        // Pin the alias lookup to a studio only when the caller named one.
+        // 'explicit' and 'studio-hint' are the caller-qualified tiers; every
+        // tier below them is inferred (route pattern, most-recent, fallback),
+        // and pinning to an inferred studio would turn a resolvable alias into
+        // a miss — the resolver would refuse to see a session the caller never
+        // said anything about.
+        const aliasStudioScope =
+          routing.tier === 'explicit' || routing.tier === 'studio-hint'
+            ? resolvedStudioId
+            : undefined;
+
+        const aliasMatch = await aliasRepo.findByAlias(
+          userId,
+          agentId,
+          options.alias,
+          aliasStudioScope
+        );
         if (aliasMatch) {
           logger.debug('Found existing session by alias', {
             sessionId: aliasMatch.id,
             alias: options.alias,
             studioId: aliasMatch.studioId || null,
+            aliasStudioScope: aliasStudioScope ?? null,
           });
           return this.withStudioLease(aliasMatch, routing, leaseCtx);
         }
         logger.debug('No session found for alias', {
           alias: options.alias,
           agentId,
+          aliasStudioScope: aliasStudioScope ?? null,
         });
       }
 

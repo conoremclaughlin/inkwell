@@ -1807,7 +1807,8 @@ describe('SessionService', () => {
         })
       );
 
-      expect(mockFindByAlias).toHaveBeenCalledWith('user-456', 'myra', 'main');
+      // 4th arg is the studio scope: undefined here because no studio was named.
+      expect(mockFindByAlias).toHaveBeenCalledWith('user-456', 'myra', 'main', undefined);
       expect(mockRepository.findByUserAndAgent).not.toHaveBeenCalled();
     });
 
@@ -1824,7 +1825,7 @@ describe('SessionService', () => {
         })
       );
 
-      expect(mockFindByAlias).toHaveBeenCalledWith('user-456', 'myra', 'nonexistent');
+      expect(mockFindByAlias).toHaveBeenCalledWith('user-456', 'myra', 'nonexistent', undefined);
       expect(mockFindByThreadKey).toHaveBeenCalledWith(
         'user-456',
         'myra',
