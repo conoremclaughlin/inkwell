@@ -2,12 +2,14 @@ import { describe, expect, it } from 'vitest';
 import {
   MAX_CLONES_PER_SPAWN,
   MAX_CLONE_SUMMARY_CHARS,
+  admitSpawn,
   SPAWN_AGENT_TOOL,
   boundSummary,
   buildClonePrompt,
   classifyCloneOutcome,
   describeCloneToolResult,
   formatFanOutForLedger,
+  isCloneHandoffTool,
   parseSpawnAgentArgs,
   screenIteration,
 } from './spawn-agent.js';
@@ -228,5 +230,90 @@ describe('classifyCloneOutcome', () => {
   it('never silently passes an unknown stop reason as completion', () => {
     const outcome = classifyCloneOutcome({ success: true, stopReason: 'something-new' });
     expect(outcome.status).toBe('failed');
+  });
+});
+
+describe('admitSpawn', () => {
+  it('admits a fan-out that fits under the ceiling', () => {
+    expect(admitSpawn(0, 3)).toEqual({ ok: true });
+    expect(admitSpawn(1, 2)).toEqual({ ok: true });
+  });
+
+  it('counts what is ALREADY running, not just this call', () => {
+    // The whole point: parseSpawnAgentArgs would happily accept three more
+    // while three are alive, because it only sees one call at a time. With
+    // wait:false that is exactly how a parent goes unbounded.
+    const verdict = admitSpawn(2, 2);
+    expect(verdict.ok).toBe(false);
+    expect(!verdict.ok && verdict.reason).toMatch(/2 shadow clone\(s\) already running/);
+    // And it says how many WOULD fit, rather than just refusing.
+    expect(!verdict.ok && verdict.reason).toMatch(/Spawn at most 1/);
+  });
+
+  it('tells a parent already at the ceiling to collect first', () => {
+    const verdict = admitSpawn(MAX_CLONES_PER_SPAWN, 1);
+    expect(verdict.ok).toBe(false);
+    expect(!verdict.ok && verdict.reason).toMatch(/at the ceiling/);
+    expect(!verdict.ok && verdict.reason).toMatch(/collect_agents/);
+  });
+
+  it('honours a caller-supplied ceiling', () => {
+    expect(admitSpawn(1, 1, 2)).toEqual({ ok: true });
+    expect(admitSpawn(1, 2, 2).ok).toBe(false);
+  });
+});
+
+describe('handoff bookkeeping', () => {
+  /**
+   * The dedupe rule chat.ts applies before ledgering a collection: settled
+   * outcomes only, once each. Mirrored here from the production predicate's
+   * two conditions rather than its code — the predicate is a filter expression
+   * inline in the fan-out, and this pins the behaviour it has to keep.
+   */
+  const ledgerable = (
+    outcomes: Array<{ id: string; status: string }>,
+    already: Set<string>
+  ): string[] =>
+    outcomes
+      .filter((o) => o.status !== 'running' && o.status !== 'missing' && !already.has(o.id))
+      .map((o) => o.id);
+
+  it('does not consume a clone dedupe slot while it is still running', () => {
+    const seen = new Set<string>();
+
+    // Poll immediately after wait:false — nothing to ledger yet.
+    expect(ledgerable([{ id: 'clone-1', status: 'running' }], seen)).toEqual([]);
+    // Nothing was marked, so the completed result can still land.
+    expect(ledgerable([{ id: 'clone-1', status: 'completed' }], seen)).toEqual(['clone-1']);
+  });
+
+  it('ledgers a settled clone exactly once across repeated collections', () => {
+    const seen = new Set<string>();
+    const outcomes = [{ id: 'clone-1', status: 'completed' }];
+
+    const first = ledgerable(outcomes, seen);
+    first.forEach((id) => seen.add(id));
+    expect(first).toEqual(['clone-1']);
+
+    // Calling collect_agents again — or polling a fan-out — must not re-inject
+    // the same completed work into the parent's context.
+    expect(ledgerable(outcomes, seen)).toEqual([]);
+  });
+
+  it('ignores an unknown clone rather than ledgering a placeholder', () => {
+    expect(ledgerable([{ id: 'clone-9', status: 'missing' }], new Set())).toEqual([]);
+  });
+});
+
+describe('isCloneHandoffTool', () => {
+  it('recognises the tools that write their own ledger entry', () => {
+    expect(isCloneHandoffTool(SPAWN_AGENT_TOOL)).toBe(true);
+    expect(isCloneHandoffTool('collect_agents')).toBe(true);
+    expect(isCloneHandoffTool('mcp__inkwell__spawn_agent')).toBe(true);
+  });
+
+  it('leaves ordinary tools on the generic path', () => {
+    expect(isCloneHandoffTool('read')).toBe(false);
+    expect(isCloneHandoffTool('recall')).toBe(false);
   });
 });

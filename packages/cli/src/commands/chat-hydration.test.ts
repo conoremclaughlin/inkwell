@@ -819,3 +819,88 @@ describe('findLastDetectedModel — persisted provider model recovery', () => {
     expect(findLastDetectedModel(transcriptPath, 'claude')).toBeUndefined();
   });
 });
+
+describe('hydrateLedgerFromTranscript — shadow clone handoff', () => {
+  let dir: string;
+  let transcriptPath: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'ink-hydration-clones-test-'));
+    transcriptPath = join(dir, 'session-clones.jsonl');
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  function write(events: Array<Record<string, unknown>>) {
+    writeFileSync(transcriptPath, events.map((e) => JSON.stringify(e)).join('\n') + '\n');
+  }
+
+  it('replays a fan-out summary into the reattached ledger', () => {
+    // The clones' summaries are the parent's ONLY record of that work — their
+    // own transcripts are separate files it never replays. Without this branch
+    // a reattached parent silently loses every clone result it paid for.
+    write([
+      { ts: '2026-08-14T09:00:00Z', eid: 1, type: 'user', content: 'go look at two things' },
+      {
+        ts: '2026-08-14T09:01:00Z',
+        eid: 2,
+        type: 'clone_fanout',
+        outcomes: [
+          {
+            id: 'clone-1',
+            label: 'audit auth paths',
+            status: 'completed',
+            summary: 'Three entry points, all in auth.ts.',
+          },
+          {
+            id: 'clone-2',
+            label: 'map coverage',
+            status: 'failed',
+            error: 'backend backend-failure',
+          },
+        ],
+      },
+    ]);
+
+    const ledger = new ContextLedger();
+    hydrateLedgerFromTranscript(ledger, transcriptPath, 'wren');
+
+    const clone = ledger.listEntries().find((e) => e.source === 'shadow-clone');
+    expect(clone).toBeDefined();
+    expect(clone?.content).toContain('clone-1 · audit auth paths — completed');
+    expect(clone?.content).toContain('Three entry points, all in auth.ts.');
+    expect(clone?.content).toContain('backend backend-failure');
+  });
+
+  it('keeps the replayed handoff to one entry, whatever the fan-out width', () => {
+    write([
+      {
+        ts: '2026-08-14T09:01:00Z',
+        eid: 1,
+        type: 'clone_fanout',
+        outcomes: [
+          { id: 'clone-1', label: 'a', status: 'completed', summary: 'x' },
+          { id: 'clone-2', label: 'b', status: 'completed', summary: 'y' },
+          { id: 'clone-3', label: 'c', status: 'completed', summary: 'z' },
+        ],
+      },
+    ]);
+
+    const ledger = new ContextLedger();
+    hydrateLedgerFromTranscript(ledger, transcriptPath, 'wren');
+    expect(ledger.listEntries().filter((e) => e.source === 'shadow-clone')).toHaveLength(1);
+  });
+
+  it('survives a malformed fan-out event rather than dropping the transcript', () => {
+    write([
+      { ts: '2026-08-14T09:01:00Z', eid: 1, type: 'clone_fanout' },
+      { ts: '2026-08-14T09:02:00Z', eid: 2, type: 'user', content: 'still here' },
+    ]);
+
+    const ledger = new ContextLedger();
+    expect(() => hydrateLedgerFromTranscript(ledger, transcriptPath, 'wren')).not.toThrow();
+    expect(ledger.listEntries().some((e) => e.content === 'still here')).toBe(true);
+  });
+});

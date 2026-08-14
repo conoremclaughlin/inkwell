@@ -33,6 +33,7 @@ import {
 import {
   COLLECT_AGENTS_TOOL,
   MAX_CLONES_PER_SPAWN,
+  admitSpawn,
   MAX_CLONE_SUMMARY_CHARS,
   SPAWN_AGENT_TOOL,
   boundSummary,
@@ -40,6 +41,7 @@ import {
   classifyCloneOutcome,
   describeCloneToolResult,
   formatFanOutForLedger,
+  isCloneHandoffTool,
   parseSpawnAgentArgs,
   screenIteration,
   type CloneOutcomeSummary,
@@ -935,6 +937,32 @@ export function hydrateLedgerFromTranscript(
       }
       continue;
     }
+    if (type === 'clone_fanout' && Array.isArray(event.outcomes)) {
+      // The clones' summaries are the parent's ONLY record of that work — their
+      // own transcripts are separate files the parent never replays. Without
+      // this branch a reattached parent loses every clone result it paid for.
+      const outcomes = event.outcomes as Array<Record<string, unknown>>;
+      const rendered = formatFanOutForLedger(
+        outcomes.map((o) => ({
+          id: String(o.id ?? '?'),
+          label: String(o.label ?? ''),
+          status: String(o.status ?? 'unknown'),
+          summary: typeof o.summary === 'string' ? o.summary : undefined,
+          error: typeof o.error === 'string' ? o.error : undefined,
+        }))
+      );
+      ledger.addEntry(
+        'system',
+        rendered.length > MAX_CLONE_SUMMARY_CHARS
+          ? `${rendered.slice(0, MAX_CLONE_SUMMARY_CHARS)}…`
+          : rendered,
+        'shadow-clone',
+        eid
+      );
+      loaded += 1;
+      continue;
+    }
+
     if (type === 'local_tool_call' && typeof event.tool === 'string') {
       // Tool calls are part of the story — when the assistant says "I sent
       // him a heads-up via Telegram", the send_response call is the receipt.
@@ -5099,18 +5127,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
     const { tasks, wait } = parsed.request;
 
-    // The parse cap bounds ONE fan-out. With wait:false the parent can fire
-    // another three the instant the first returns handles, and again, without
-    // limit — so the ceiling has to be checked against what is actually running.
-    const alreadyRunning = cloneRegistry.runningCount;
-    if (alreadyRunning + tasks.length > MAX_CLONES_PER_SPAWN) {
+    // The parse cap bounds ONE fan-out; this bounds what is alive.
+    const admission = admitSpawn(cloneRegistry.runningCount, tasks.length);
+    if (!admission.ok) {
       return {
-        content: [
-          {
-            type: 'text',
-            text: `${alreadyRunning} shadow clone(s) already running; ${tasks.length} more would exceed the ceiling of ${MAX_CLONES_PER_SPAWN}. Collect or cancel the running ones first (collect_agents), then spawn again.`,
-          },
-        ],
+        content: [{ type: 'text', text: admission.reason }],
         isError: true,
       } as PcpToolCallResult;
     }
@@ -5302,7 +5323,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // working detail back into the parent's context, and re-collecting (polling
     // a background fan-out, or calling collect_agents again later) would inject
     // the same completed work over and over.
-    const fresh = outcomes.filter((o) => !ledgeredClones.has(o.id));
+    // Only SETTLED outcomes are ledgered, and only once. Marking a still-running
+    // clone as ledgered — which an immediate collect_agents after wait:false
+    // does — would burn its slot before it had a summary, so the completed
+    // result could never reach the parent at all.
+    const fresh = outcomes.filter(
+      (o) => o.status !== 'running' && o.status !== 'missing' && !ledgeredClones.has(o.id)
+    );
     if (fresh.length > 0) {
       for (const o of fresh) ledgeredClones.add(o.id);
       const rendered = formatFanOutForLedger(fresh);
@@ -5499,7 +5526,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
           // Context-management tools (list_context, evict_context) must NOT
           // persist their results back into the ledger — doing so pollutes the
           // context they're managing and reintroduces evicted content.
-          if (!isClientLocalTool(result.tool)) {
+          //
+          // spawn_agent and collect_agents are excluded for the same reason
+          // from the other direction: they write their OWN dedicated handoff
+          // entry, so the generic append would duplicate every clone summary
+          // and undo the one-entry-per-fan-out guarantee that justifies clones
+          // at all.
+          if (!isClientLocalTool(result.tool) && !isCloneHandoffTool(result.tool)) {
             ledger.addEntry(
               'system',
               compactForLedger(`local tool ${result.tool} -> ${resultJson}`, 500),

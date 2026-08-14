@@ -37,6 +37,15 @@ export interface CloneRecord {
   /** Tool calls the clone executed, for a one-glance sense of what it did. */
   toolCalls: number;
   stopReason?: AgentLoopStopReason;
+  /**
+   * Someone asked this clone to stop; its loop has not unwound yet.
+   *
+   * The status stays `running` until it actually settles, because that is what
+   * `runningCount` — and therefore the concurrency ceiling — is counting. Marking
+   * it aborted the moment cancel is requested would free a slot while the
+   * backend child is still alive, letting a new fan-out overlap the old one.
+   */
+  cancelRequested?: boolean;
   /** What the clone hands back. Bounded before it reaches the parent's ledger. */
   summary?: string;
   error?: string;
@@ -91,12 +100,20 @@ export class CloneRegistry {
   update(id: string, patch: Partial<Omit<CloneRecord, 'id'>>): CloneRecord | undefined {
     const current = this.records.get(id);
     if (!current) return undefined;
-    // A settled clone is final. Late writes from a loop that is still unwinding
-    // must not resurrect it as `running` or overwrite the recorded outcome.
-    if (isSettled(current.status) && patch.status === undefined) return current;
-    if (isSettled(current.status) && patch.status === 'running') return current;
+    // Terminal states are MONOTONIC. A settled clone is final — late writes from
+    // a loop still unwinding must not resurrect it, and must not swap one
+    // outcome for another. Without that, cancelling produced records like
+    // `{status: 'completed', error: 'cancelled', summary: 'late success'}`.
+    if (isSettled(current.status)) return current;
 
     const next: CloneRecord = { ...current, ...patch };
+
+    // A cancelled clone settles as aborted, whatever its loop reports on the way
+    // out. The user's decision outranks whatever the backend managed last.
+    if (current.cancelRequested && isSettled(next.status)) {
+      next.status = 'aborted';
+      next.error = next.error ?? 'cancelled';
+    }
     if (isSettled(next.status)) {
       if (next.endedAt === undefined) next.endedAt = Date.now();
       // Nothing left to cancel — drop the closure so a long session does not
@@ -131,10 +148,10 @@ export class CloneRegistry {
     if (!record || isSettled(record.status)) return false;
     const cancel = this.cancellers.get(id);
     this.cancellers.delete(id);
+    // Record the intent BEFORE firing, so a synchronous unwind still settles as
+    // aborted rather than racing the flag.
+    this.update(id, { cancelRequested: true, error: 'cancelled' });
     cancel?.();
-    // Mark it aborted immediately: the loop unwinds asynchronously, and a
-    // settled record is final, so a later write cannot contradict this.
-    this.update(id, { status: 'aborted', error: 'cancelled' });
     return true;
   }
 
@@ -180,7 +197,9 @@ export class CloneRegistry {
 export function formatCloneLine(record: CloneRecord): string {
   const icon =
     record.status === 'running'
-      ? '🌀'
+      ? record.cancelRequested
+        ? '⏹'
+        : '🌀'
       : record.status === 'completed'
         ? '✅'
         : record.status === 'aborted'
@@ -190,7 +209,9 @@ export function formatCloneLine(record: CloneRecord): string {
   const elapsed = elapsedMs < 1000 ? '<1s' : `${Math.round(elapsedMs / 1000)}s`;
   const detail =
     record.status === 'running'
-      ? `${record.iterations} turn(s), ${record.toolCalls} tool call(s)`
+      ? record.cancelRequested
+        ? `cancelling — ${record.iterations} turn(s), ${record.toolCalls} tool call(s)`
+        : `${record.iterations} turn(s), ${record.toolCalls} tool call(s)`
       : (record.error ?? record.stopReason ?? record.status);
   return `${icon} ${record.id} · ${record.label} — ${detail} (${elapsed})`;
 }

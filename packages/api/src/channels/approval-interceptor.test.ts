@@ -116,7 +116,12 @@ vi.mock('@supabase/supabase-js', () => ({
 }));
 
 // Import after mocks are set up
-import { checkApprovalResponse, notifyPlatformOfApprovalRequest } from './approval-interceptor';
+import {
+  checkApprovalResponse,
+  formatBatchNotification,
+  formatSingleNotification,
+  notifyPlatformOfApprovalRequest,
+} from './approval-interceptor';
 
 const USER_ID = 'user-123';
 const PLATFORM_ID = 'telegram:chat-999';
@@ -589,5 +594,65 @@ describe('notifyPlatformOfApprovalRequest', () => {
     await expect(notifyPlatformOfApprovalRequest(baseRequest)).resolves.toBeUndefined();
 
     vi.unstubAllGlobals();
+  });
+});
+
+describe('approval notifications — shadow clone origin', () => {
+  const base = {
+    id: 'req-1',
+    userId: 'user-1',
+    tool: 'save_link',
+    args: null,
+    reason: 'Tool requires approval.',
+    requestingAgentId: 'wren',
+    studioId: null,
+    sessionId: null,
+    expiresAt: new Date(Date.now() + 300_000).toISOString(),
+  };
+
+  it('names the parent when no clone is involved', () => {
+    expect(formatSingleNotification({ ...base })).toContain('from wren');
+  });
+
+  it('names the clone that asked, not just its parent', () => {
+    // A clone carries its parent's identity, so requestingAgentId alone reads
+    // as the parent asking. Away mode means approving a call whose context the
+    // user cannot see — which clone wants it is the whole judgement.
+    const msg = formatSingleNotification({
+      ...base,
+      origin: { origin: 'clone', cloneId: 'clone-2', cloneLabel: 'audit auth paths' },
+    });
+    expect(msg).toContain('wren');
+    expect(msg).toContain('audit auth paths');
+  });
+
+  it('falls back to the clone id when it has no label', () => {
+    const msg = formatSingleNotification({
+      ...base,
+      origin: { origin: 'clone', cloneId: 'clone-2' },
+    });
+    expect(msg).toContain('clone-2');
+  });
+
+  it('ignores a parent-origin marker', () => {
+    const msg = formatSingleNotification({ ...base, origin: { origin: 'parent' } });
+    expect(msg).toContain('from wren');
+    expect(msg).not.toContain('🌀');
+  });
+
+  it('distinguishes concurrent clones in a batched notification', () => {
+    // Three clones batched under one identity would otherwise read as one
+    // agent asking three times.
+    const msg = formatBatchNotification([
+      { ...base, id: 'r1', origin: { origin: 'clone', cloneId: 'clone-1', cloneLabel: 'auth' } },
+      {
+        ...base,
+        id: 'r2',
+        origin: { origin: 'clone', cloneId: 'clone-2', cloneLabel: 'coverage' },
+      },
+    ]);
+    expect(msg).toContain('auth');
+    expect(msg).toContain('coverage');
+    expect(msg).toContain('2 permission requests');
   });
 });

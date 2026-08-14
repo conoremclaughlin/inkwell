@@ -20,6 +20,17 @@ export const SPAWN_AGENT_TOOL = 'spawn_agent';
 /** Read back what backgrounded clones produced. */
 export const COLLECT_AGENTS_TOOL = 'collect_agents';
 
+/**
+ * Tools whose results the parent ledger records itself, in a dedicated entry.
+ *
+ * The generic "local tool X -> …" append must skip these, or every clone
+ * summary lands twice and the single-entry-per-fan-out promise is broken.
+ */
+export function isCloneHandoffTool(tool: string): boolean {
+  const bare = tool.trim().replace(/^mcp__inkwell__/, '');
+  return bare === SPAWN_AGENT_TOOL || bare === COLLECT_AGENTS_TOOL;
+}
+
 /** Ceiling on one fan-out. Concurrency the user can actually follow. */
 export const MAX_CLONES_PER_SPAWN = 3;
 
@@ -75,6 +86,32 @@ export function parseSpawnAgentArgs(args: Record<string, unknown>): SpawnAgentPa
   }
 
   return { ok: true, request: { tasks, wait: args.wait !== false } };
+}
+
+export type SpawnAdmission = { ok: true } | { ok: false; reason: string };
+
+/**
+ * Whether this fan-out may start, given what is already running.
+ *
+ * `parseSpawnAgentArgs` bounds a single call. That is not the same ceiling:
+ * with `wait:false` a parent gets its handles back immediately and can fire
+ * another full fan-out at once, and again, without limit. The concurrency the
+ * user actually experiences is the number of clones ALIVE, so that is what has
+ * to be checked.
+ */
+export function admitSpawn(
+  runningCount: number,
+  requested: number,
+  ceiling = MAX_CLONES_PER_SPAWN
+): SpawnAdmission {
+  if (runningCount + requested <= ceiling) return { ok: true };
+  return {
+    ok: false,
+    reason:
+      runningCount >= ceiling
+        ? `${runningCount} shadow clone(s) already running, at the ceiling of ${ceiling}. Collect or cancel them first (collect_agents), then spawn again.`
+        : `${runningCount} shadow clone(s) already running; ${requested} more would exceed the ceiling of ${ceiling}. Spawn at most ${ceiling - runningCount}, or collect the running ones first.`,
+  };
 }
 
 export type IterationScreen =

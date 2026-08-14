@@ -21,6 +21,7 @@ import { tmpdir } from 'os';
 import { runAgentLoop, type BackendTurnOutcome, type ToolResultRecord } from './agent-loop.js';
 import { executeToolCalls } from './tool-call-executor.js';
 import { ToolPolicyState } from './tool-policy.js';
+import { applyToolApprovalChoice } from './tool-approval.js';
 import { deriveClonePolicy, isForbiddenInClone } from './clone-policy.js';
 import { ApprovalCoordinator, type ApprovalTicket } from './approval-coordinator.js';
 import { callPiTool, isPiTool } from './pi-tools.js';
@@ -78,6 +79,7 @@ function buildClone(opts: {
   let turnIndex = 0;
 
   const continuations: string[] = [];
+  let backendTurns = 0;
   // What chat.ts gives a clone: its own signal sink, never the process global.
   const signalSink = createSignalSink();
   const runTurn = async (
@@ -85,6 +87,7 @@ function buildClone(opts: {
     turnCtx: { isContinuation: boolean }
   ): Promise<BackendTurnOutcome> => {
     if (turnCtx.isContinuation) continuations.push(body);
+    backendTurns += 1;
     const index = turnIndex++;
     if (opts.failAfter !== undefined && index >= opts.failAfter) {
       return { success: false, stdout: '', stderr: 'backend exploded', exitCode: 1 };
@@ -146,6 +149,9 @@ function buildClone(opts: {
                       cloneLabel: opts.cloneLabel,
                     },
                     signal: ctx.signal,
+                    // Production passes the REQUESTER's policy. Omitting it is
+                    // what let the coordinator recheck and mutate the parent.
+                    policy,
                   })
                   .then((o) => o.approved),
               onResult: (result) => {
@@ -169,7 +175,17 @@ function buildClone(opts: {
       }
     );
 
-  return { run, policy, executed, refused, continuations, signalSink };
+  return {
+    run,
+    policy,
+    executed,
+    refused,
+    continuations,
+    signalSink,
+    get backendTurns() {
+      return backendTurns;
+    },
+  };
 }
 
 describe('shadow clone wiring', () => {
@@ -357,7 +373,50 @@ describe('shadow clone wiring', () => {
     // 5-minute timeout and the test would hang rather than fail.
     const result = await running;
     expect(clone.refused).toEqual([{ tool: 'save_link', status: 'denied' }]);
-    expect(result.iterations).toBeGreaterThan(0);
+
+    // And the abort has to TERMINATE the loop. A cancelled approval comes back
+    // as a denial, which reads as `all-refused`; with continueOnBlocked that
+    // previously started another backend turn — cancelling a clone spawned the
+    // very work it was meant to stop, then reported success.
+    expect(result.stopReason).toBe('aborted');
+    expect(clone.backendTurns).toBe(1);
+    expect(result.success).toBe(false);
+  }, 5000);
+
+  it('does not start another backend turn after an abort during approval', async () => {
+    const parent = new ToolPolicyState('backend', { persist: false });
+    const controller = new AbortController();
+    const coordinator = new ApprovalCoordinator({
+      concurrency: 1,
+      prompt: (ticket) =>
+        new Promise<boolean>((_resolve, reject) => {
+          ticket.signal?.addEventListener('abort', () => {
+            const err = new Error('Input aborted');
+            err.name = 'InkInputAborted';
+            reject(err);
+          });
+        }),
+    });
+
+    const clone = buildClone({
+      parent,
+      coordinator,
+      cloneId: 'clone-1',
+      cloneLabel: 'cancelled mid-approval',
+      signal: controller.signal,
+      // A second scripted turn exists precisely so a continuation would be
+      // visible if one happened.
+      turns: [inkTool('save_link', { url: 'https://a.example' }), `kept working\n${doneSignal}`],
+    });
+
+    const running = clone.run();
+    await new Promise((r) => setTimeout(r, 10));
+    controller.abort();
+    const result = await running;
+
+    expect(clone.backendTurns).toBe(1);
+    expect(result.stopReason).toBe('aborted');
+    expect(result.assistantDisplayText).toBe('');
   }, 5000);
 
   it('one clone failing does not discard its siblings summaries', async () => {
@@ -433,6 +492,83 @@ describe('shadow clone wiring', () => {
     // The grant is untouched, and the parent can still spend it itself.
     expect(parent.listGrants()).toEqual([{ tool: 'save_link', uses: 1 }]);
     expect(parent.canCallPcpTool('save_link').allowed).toBe(true);
+  });
+
+  it('applies an approved clone escalation to the CLONE, and executes it', async () => {
+    const parent = new ToolPolicyState('backend', { persist: false });
+
+    // Production-shaped handler: the choice is applied to the policy the ticket
+    // was raised against, which for a clone is its own.
+    const coordinator = new ApprovalCoordinator<ToolPolicyState>({
+      concurrency: 1,
+      prompt: async (ticket) => {
+        const target = ticket.policy ?? parent;
+        return applyToolApprovalChoice({
+          policy: target,
+          tool: ticket.tool,
+          sessionId: ticket.sessionId,
+          choice: 'once',
+        }).approved;
+      },
+    });
+
+    const clone = buildClone({
+      parent,
+      coordinator,
+      cloneId: 'clone-1',
+      cloneLabel: 'escalates once',
+      turns: [inkTool('save_link', { url: 'https://a.example' }), `saved\n${doneSignal}`],
+    });
+
+    await clone.run();
+
+    // The escalation actually RAN. Applying the grant to the parent instead
+    // left the clone's own post-approval recheck blocking, so the call was
+    // approved and then refused anyway.
+    expect(clone.refused).toEqual([]);
+    expect(clone.executed).toContain('save_link');
+
+    // And the parent is untouched — no grant, no widened allowlist.
+    expect(parent.listGrants()).toEqual([]);
+    expect(parent.listAllowTools()).not.toContain('save_link');
+    expect(parent.canCallPcpTool('save_link').allowed).toBe(true); // parent default, not a grant
+  });
+
+  it('does not let one clone escalation widen a sibling', async () => {
+    const parent = new ToolPolicyState('backend', { persist: false });
+    const coordinator = new ApprovalCoordinator<ToolPolicyState>({
+      concurrency: 1,
+      prompt: async (ticket) =>
+        applyToolApprovalChoice({
+          policy: ticket.policy ?? parent,
+          tool: ticket.tool,
+          sessionId: ticket.sessionId,
+          // The broadest answer available, to prove even that stays local.
+          choice: 'always',
+        }).approved,
+    });
+
+    const first = buildClone({
+      parent,
+      coordinator,
+      cloneId: 'clone-1',
+      cloneLabel: 'asker',
+      turns: [inkTool('save_link', { url: 'https://a.example' }), `done\n${doneSignal}`],
+    });
+    await first.run();
+    expect(first.policy.listAllowTools()).toContain('save_link');
+
+    // A sibling derived from the same parent starts from the parent envelope,
+    // not from whatever its sibling was granted.
+    const sibling = buildClone({
+      parent,
+      coordinator,
+      cloneId: 'clone-2',
+      cloneLabel: 'sibling',
+      turns: [`nothing to do\n${doneSignal}`],
+    });
+    expect(sibling.policy.listAllowTools()).not.toContain('save_link');
+    expect(parent.listAllowTools()).not.toContain('save_link');
   });
 
   it('sibling clones do not rewrite each other policy', async () => {

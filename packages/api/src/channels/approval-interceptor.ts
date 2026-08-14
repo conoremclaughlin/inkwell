@@ -62,13 +62,28 @@ export interface ApprovalInterceptResult {
 // ─── Notification Debounce Buffer ────────────────────────────────
 // Batches rapid-fire approval notifications into one consolidated message.
 
-interface BufferedRequest {
+/**
+ * Which shadow clone raised a request, when one did.
+ *
+ * A clone carries its parent's identity, so `requestingAgentId` alone reads as
+ * the parent asking. Away-mode means approving a call whose context the user
+ * cannot see — "which of my three clones wants this" is the difference between
+ * an informed yes and a blind one.
+ */
+export interface ApprovalOrigin {
+  origin: 'parent' | 'clone';
+  cloneId?: string;
+  cloneLabel?: string;
+}
+
+export interface BufferedRequest {
   id: string;
   userId: string;
   tool: string;
   args?: string | null;
   reason?: string | null;
   requestingAgentId: string;
+  origin?: ApprovalOrigin | null;
   studioId?: string | null;
   sessionId?: string | null;
   expiresAt: string;
@@ -351,6 +366,7 @@ export async function notifyPlatformOfApprovalRequest(request: {
   args?: string | null;
   reason?: string | null;
   requestingAgentId: string;
+  origin?: ApprovalOrigin | null;
   studioId?: string | null;
   sessionId?: string | null;
   expiresAt: string;
@@ -365,6 +381,7 @@ export async function notifyPlatformOfApprovalRequest(request: {
     args: request.args,
     reason: request.reason,
     requestingAgentId: request.requestingAgentId,
+    origin: request.origin ?? null,
     studioId: request.studioId,
     sessionId: request.sessionId,
     expiresAt: request.expiresAt,
@@ -420,7 +437,7 @@ async function flushNotificationBuffer(bufferKey: string): Promise<void> {
   }
 }
 
-function formatSingleNotification(req: BufferedRequest): string {
+export function formatSingleNotification(req: BufferedRequest): string {
   const toolDisplay = req.args ? `${req.tool}(${req.args})` : req.tool;
   const expiresIn = Math.max(
     1,
@@ -428,7 +445,7 @@ function formatSingleNotification(req: BufferedRequest): string {
   );
 
   return (
-    `\u{1F510} *Permission request* from ${req.requestingAgentId}:\n\n` +
+    `\u{1F510} *Permission request* from ${formatRequester(req)}:\n\n` +
     `\`${toolDisplay}\`\n\n` +
     (req.reason ? `Reason: ${req.reason}\n` : '') +
     (req.studioId ? `Studio: ${req.studioId}\n` : '') +
@@ -438,8 +455,20 @@ function formatSingleNotification(req: BufferedRequest): string {
   );
 }
 
-function formatBatchNotification(requests: BufferedRequest[]): string {
-  const agents = [...new Set(requests.map((r) => r.requestingAgentId))];
+/**
+ * Who is asking, as the user needs to read it.
+ *
+ * "wren" and "wren 🌀 audit auth paths" are different asks; collapsing them
+ * hides the one piece of context an away-mode approver has to judge on.
+ */
+function formatRequester(req: BufferedRequest): string {
+  if (req.origin?.origin !== 'clone') return req.requestingAgentId;
+  const label = req.origin.cloneLabel || req.origin.cloneId || 'clone';
+  return `${req.requestingAgentId} \u{1F300} ${label}`;
+}
+
+export function formatBatchNotification(requests: BufferedRequest[]): string {
+  const agents = [...new Set(requests.map((r) => formatRequester(r)))];
   const agentLabel = agents.length === 1 ? agents[0] : agents.join(', ');
   const expiresIn = Math.max(
     1,

@@ -264,6 +264,11 @@ export async function runAgentLoop(
         break;
       }
 
+      if (input.signal?.aborted) {
+        stopReason = 'aborted';
+        break;
+      }
+
       const stopWaitingAfterRejection = ports.ui.startWaiting();
       try {
         outcome = await ports.backend.runTurn(buildContinuationBody([record], extracted), {
@@ -293,6 +298,16 @@ export async function runAgentLoop(
     for (const r of results) ports.observe?.recordToolCall(r);
 
     iteration++;
+
+    // An abort observed here is authoritative, and checking for it is not
+    // optional bookkeeping. A cancelled approval comes back as a DENIAL, which
+    // reads as `all-refused` — and with `continueOnBlocked` that starts another
+    // backend turn, so cancelling a clone would spawn the very work it was
+    // meant to stop, then report `no-tools` success.
+    if (input.signal?.aborted) {
+      stopReason = 'aborted';
+      break;
+    }
 
     const reason = toolLoopStopReason(results, iteration, maxIterations);
     // Everything was refused. Telling the agent so — once, and only where nobody
@@ -338,7 +353,12 @@ export async function runAgentLoop(
   }
 
   // An aborted turn (SIGINT kills the child) exits >=128 and has no usable text.
-  const aborted = !outcome.success && outcome.exitCode !== undefined && outcome.exitCode >= 128;
+  // But cancellation can also be observed WITHOUT a killed child — an approval
+  // wait unblocking on the signal — so an already-decided `aborted` stands.
+  const aborted =
+    stopReason === 'aborted' ||
+    input.signal?.aborted === true ||
+    (!outcome.success && outcome.exitCode !== undefined && outcome.exitCode >= 128);
 
   // Any failed final outcome is a failure, whichever branch broke the loop.
   // Without this, an opening turn that fails with no parsed tool calls exits via
@@ -364,7 +384,11 @@ export async function runAgentLoop(
     assistantDisplayText,
     toolResults: allToolResults,
     iterations: iteration,
-    success: outcome.success,
+    // A cancelled turn is not a successful one, even when the last backend
+    // process exited 0 — cancellation can be observed while nothing is running
+    // (an approval wait unblocking), so the child's exit code says nothing
+    // about whether the turn achieved anything.
+    success: outcome.success && !aborted,
     stopReason: finalStopReason,
   };
 }

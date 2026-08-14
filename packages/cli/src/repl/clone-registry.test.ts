@@ -67,12 +67,19 @@ describe('CloneRegistry', () => {
     expect(record?.summary).toBe('done');
   });
 
-  it('still allows one terminal state to correct another', () => {
+  it('will not swap one terminal state for another', () => {
     const registry = new CloneRegistry();
     seed(registry);
-    registry.update('clone-1', { status: 'completed' });
+    registry.update('clone-1', { status: 'completed', summary: 'done' });
+
+    // Terminal is terminal. An earlier version allowed this, and produced
+    // incoherent records like {status:'completed', error:'cancelled'} when a
+    // cancelled clone's loop finished unwinding.
     registry.update('clone-1', { status: 'aborted', error: 'cancelled' });
-    expect(registry.get('clone-1')?.status).toBe('aborted');
+    const record = registry.get('clone-1');
+    expect(record?.status).toBe('completed');
+    expect(record?.summary).toBe('done');
+    expect(record?.error).toBeUndefined();
   });
 
   it('reports progress while a clone is still running', () => {
@@ -181,7 +188,7 @@ describe('formatCloneLine', () => {
 });
 
 describe('CloneRegistry cancellation', () => {
-  it('stops a running clone and records it as aborted', () => {
+  it('asks a clone to stop without pretending it already has', () => {
     const registry = new CloneRegistry();
     seed(registry);
     let aborted = false;
@@ -191,9 +198,42 @@ describe('CloneRegistry cancellation', () => {
 
     expect(registry.cancel('clone-1')).toBe(true);
     expect(aborted).toBe(true);
-    expect(registry.get('clone-1')?.status).toBe('aborted');
-    expect(registry.get('clone-1')?.error).toBe('cancelled');
+
+    // Still counted as running: the backend child is alive until the loop
+    // unwinds, and runningCount is what the concurrency ceiling reads. Freeing
+    // the slot here would let a new fan-out overlap the one being cancelled.
+    expect(registry.get('clone-1')?.status).toBe('running');
+    expect(registry.get('clone-1')?.cancelRequested).toBe(true);
+    expect(registry.runningCount).toBe(1);
+  });
+
+  it('settles a cancelled clone as aborted even when its loop reports success', () => {
+    const registry = new CloneRegistry();
+    seed(registry);
+    registry.attachCanceller('clone-1', () => {});
+    registry.cancel('clone-1');
+
+    // The race: cancel fires, then the still-unwinding loop writes its own
+    // outcome. The user's decision outranks whatever the backend managed last.
+    registry.update('clone-1', {
+      status: 'completed',
+      summary: 'late success',
+      stopReason: 'terminal-signal',
+    });
+
+    const record = registry.get('clone-1');
+    expect(record?.status).toBe('aborted');
+    expect(record?.error).toBe('cancelled');
     expect(registry.runningCount).toBe(0);
+  });
+
+  it('settles a cancelled clone as aborted when its loop reports failure too', () => {
+    const registry = new CloneRegistry();
+    seed(registry);
+    registry.cancel('clone-1');
+    registry.update('clone-1', { status: 'failed', error: 'backend backend-failure' });
+
+    expect(registry.get('clone-1')?.status).toBe('aborted');
   });
 
   it('refuses to cancel an unknown or already-settled clone', () => {
@@ -203,7 +243,6 @@ describe('CloneRegistry cancellation', () => {
 
     expect(registry.cancel('clone-1')).toBe(false);
     expect(registry.cancel('clone-99')).toBe(false);
-    // The recorded outcome survives.
     expect(registry.get('clone-1')?.status).toBe('completed');
   });
 
@@ -211,7 +250,7 @@ describe('CloneRegistry cancellation', () => {
     const registry = new CloneRegistry();
     seed(registry);
     expect(registry.cancel('clone-1')).toBe(true);
-    expect(registry.get('clone-1')?.status).toBe('aborted');
+    expect(registry.get('clone-1')?.cancelRequested).toBe(true);
   });
 
   it('stops everything still running and reports how many', () => {
@@ -225,15 +264,26 @@ describe('CloneRegistry cancellation', () => {
     }
     registry.update('clone-2', { status: 'completed' });
 
-    // The finished one is left alone; the other two are stopped. This is the
-    // session-exit path — a live clone holds a backend child, which holds Node.
+    // The finished one is left alone; the other two are asked to stop. This is
+    // the session-exit path — a live clone holds a backend child, which holds
+    // Node.
     expect(registry.cancelAll()).toBe(2);
     expect(stopped).toEqual(['clone-1', 'clone-3']);
-    expect(registry.runningCount).toBe(0);
     expect(registry.get('clone-2')?.status).toBe('completed');
 
-    // Idempotent — a second pass has nothing to do.
+    // They stay counted as running until their loops unwind, so a second pass
+    // still sees them — but the cancellers were consumed, so nothing re-fires.
+    expect(registry.cancelAll()).toBe(2);
+    expect(stopped).toEqual(['clone-1', 'clone-3']);
+
+    // Once they settle, they are gone from the count and cancelling is a no-op.
+    registry.update('clone-1', { status: 'completed' });
+    registry.update('clone-3', { status: 'completed' });
+    expect(registry.runningCount).toBe(0);
     expect(registry.cancelAll()).toBe(0);
+    // Both settled as aborted, because cancellation was requested first.
+    expect(registry.get('clone-1')?.status).toBe('aborted');
+    expect(registry.get('clone-3')?.status).toBe('aborted');
   });
 
   it('releases the canceller once a clone settles on its own', () => {
