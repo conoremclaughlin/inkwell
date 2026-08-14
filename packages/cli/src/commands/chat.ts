@@ -21,7 +21,27 @@ import {
   type RuntimePreferences,
 } from '../backends/identity.js';
 import { promptTransportFor } from '../backends/index.js';
-import { PcpClient } from '../lib/pcp-client.js';
+import { PcpClient, type PcpToolCallResult } from '../lib/pcp-client.js';
+import { deriveClonePolicy, isForbiddenInClone } from '../repl/clone-policy.js';
+import {
+  CloneRegistry,
+  formatCloneLine,
+  isSettled,
+  type CloneRecord,
+} from '../repl/clone-registry.js';
+import {
+  COLLECT_AGENTS_TOOL,
+  MAX_CLONES_PER_SPAWN,
+  MAX_CLONE_SUMMARY_CHARS,
+  SPAWN_AGENT_TOOL,
+  boundSummary,
+  buildClonePrompt,
+  formatFanOutForLedger,
+  parseSpawnAgentArgs,
+  screenIteration,
+  type CloneOutcomeSummary,
+  type SpawnAgentTask,
+} from '../repl/spawn-agent.js';
 import { initSbDebug, sbDebugLog } from '../lib/sb-debug.js';
 import {
   ensureBackendAuthReady,
@@ -123,6 +143,7 @@ import {
 } from '../repl/ink/index.js';
 import { formatContextLines, type ContextSections } from '../repl/ink/context-viewer.js';
 import {
+  MAX_TOOL_CALLS_PER_ITERATION,
   runAgentLoop,
   stripLocalToolBlocks,
   type BackendTurnOutcome,
@@ -2264,6 +2285,69 @@ async function promptForToolApproval(
   return result.approved;
 }
 
+/**
+ * How to call tools in local routing mode.
+ *
+ * Two audiences, because a shadow clone's tool surface is genuinely smaller and
+ * telling it otherwise would produce calls that only get refused. The clone
+ * variant omits the write tools and `spawn_agent` — not as enforcement (the
+ * executor refuses them regardless; a text-protocol model can name any tool)
+ * but so the clone spends its turns on work it can actually do.
+ */
+export function buildLocalToolInstruction(opts: { audience: 'parent' | 'clone' }): string {
+  const forClone = opts.audience === 'clone';
+
+  const header = [
+    'IMPORTANT: To call tools, you MUST emit fenced code blocks in this exact format:',
+    '',
+    '```ink-tool',
+    '{"tool":"tool_name","args":{}}',
+    '```',
+    '',
+    'Do NOT use ToolSearch, mcp__inkwell__*, or native MCP tool calling — those will not work in this runtime. Only the fenced block format above will execute tools. You can emit multiple ink-tool blocks in one response.',
+    '',
+  ].join('\n');
+
+  const inkwell = forClone
+    ? 'Inkwell tools (server round-trip, read-only for you): recall, get_artifact, list_artifacts, search_artifacts, list_tasks, list_projects, get_session, list_sessions, get_activity, search_links, bootstrap, etc. Write-side tools (remember, send_to_inbox, create_task, …) are unavailable — report findings instead.'
+    : 'Inkwell tools (server round-trip): get_inbox, recall, remember, list_tasks, send_response, save_link, create_task, update_session_state, bootstrap, etc.';
+
+  const codingTools = [
+    'Coding tools (in-process, scoped to working directory):',
+    '- read: Read a file. Args: path (string), offset (number, optional), limit (number, optional).',
+    ...(forClone
+      ? []
+      : [
+          '- edit: Edit a file by find-and-replace. Args: path (string), edits (array of {oldText, newText}).',
+          '- write: Create or overwrite a file. Args: path (string), content (string).',
+          '- bash: Execute a shell command. Args: command (string), timeout (number, optional).',
+        ]),
+    '- grep: Search file contents. Args: pattern (string), path (string, optional), include (string, optional).',
+    '- find: Find files by name/pattern. Args: pattern (string), path (string, optional).',
+    '- ls: List directory contents. Args: path (string, optional).',
+  ].join('\n');
+
+  const clientLocal = [
+    'Client-local tools (no server round-trip):',
+    '- list_context: Introspect your context window — see all entries with IDs, token counts, sources, and previews.',
+    '- evict_context: Remove specific entries from your context to reclaim tokens. Args: entryIds (number[]), source (string), or role (string).',
+    '- signal_status: Signal your session status. Args: status ("completed" | "blocked" | "continuing"), reason (string, optional). Use this at the end of your work to tell the runtime whether you are done, blocked on something, or need another turn.',
+  ].join('\n');
+
+  const spawn = [
+    'Delegation:',
+    `- ${SPAWN_AGENT_TOOL}: Fork yourself into up to ${MAX_CLONES_PER_SPAWN} shadow clones for bounded, independent work. Args: tasks (array of {label, prompt}), wait (boolean, optional, default true).`,
+    '  Each clone is you with a blank slate and read-only tools. It works alone and hands back one summary; its intermediate steps never enter your context. That is the point — use it when the reading would cost you more context than the answer is worth, or when two lines of enquiry are independent.',
+    `  ${SPAWN_AGENT_TOOL} must be the ONLY tool call in its turn — a turn mixing it with other calls is refused whole and nothing runs.`,
+    '  With wait:false the clones keep running in the background and you continue immediately; collect them later with collect_agents.',
+    '- collect_agents: Read back what clones produced. Args: ids (string[], optional — omit for all), wait (boolean, optional, default true — block until the requested clones finish).',
+  ].join('\n');
+
+  return [header, inkwell, '', codingTools, '', clientLocal, ...(forClone ? [] : ['', spawn])].join(
+    '\n'
+  );
+}
+
 function renderActiveSkills(skills: SkillInstruction[]): string {
   if (skills.length === 0) return '';
   return skills
@@ -2544,7 +2628,7 @@ export function buildPromptEnvelope(
 
   const toolInstruction =
     runtime.toolRouting === 'local'
-      ? 'IMPORTANT: To call tools, you MUST emit fenced code blocks in this exact format:\n\n```ink-tool\n{"tool":"tool_name","args":{}}\n```\n\nDo NOT use ToolSearch, mcp__inkwell__*, or native MCP tool calling — those will not work in this runtime. Only the fenced block format above will execute tools. You can emit multiple ink-tool blocks in one response.\n\nInkwell tools (server round-trip): get_inbox, recall, remember, list_tasks, send_response, save_link, create_task, update_session_state, bootstrap, etc.\n\nCoding tools (in-process, scoped to working directory):\n- read: Read a file. Args: path (string), offset (number, optional), limit (number, optional).\n- edit: Edit a file by find-and-replace. Args: path (string), edits (array of {oldText, newText}).\n- write: Create or overwrite a file. Args: path (string), content (string).\n- bash: Execute a shell command. Args: command (string), timeout (number, optional).\n- grep: Search file contents. Args: pattern (string), path (string, optional), include (string, optional).\n- find: Find files by name/pattern. Args: pattern (string), path (string, optional).\n- ls: List directory contents. Args: path (string, optional).\n\nClient-local tools (no server round-trip):\n- list_context: Introspect your context window — see all entries with IDs, token counts, sources, and previews.\n- evict_context: Remove specific entries from your context to reclaim tokens. Args: entryIds (number[]), source (string), or role (string).\n- signal_status: Signal your session status. Args: status ("completed" | "blocked" | "continuing"), reason (string, optional). Use this at the end of your work to tell the runtime whether you are done, blocked on something, or need another turn.'
+      ? buildLocalToolInstruction({ audience: 'parent' })
       : runtime.toolMode === 'off'
         ? 'Do not call backend-native tools. Provide reasoning and instructions only.'
         : runtime.toolMode === 'privileged'
@@ -3050,6 +3134,15 @@ export async function runChat(options: ChatOptions): Promise<void> {
       return decision.promptable ? 'prompt' : 'deny';
     },
   });
+
+  /**
+   * Shadow clones spawned by this process, running or finished.
+   *
+   * Lives at runChat scope rather than turn scope because a backgrounded clone
+   * outlives the turn that spawned it — the parent can answer the user, start
+   * another turn, or switch sessions while its clones keep working.
+   */
+  const cloneRegistry = new CloneRegistry();
 
   // Non-interactive event stream. When running headless (server-spawned via
   // InkRunner with --non-interactive), emit structured NDJSON lines to stdout
@@ -4587,6 +4680,442 @@ export async function runChat(options: ChatOptions): Promise<void> {
   }
 
   /**
+   * Run ONE shadow clone to completion.
+   *
+   * The clone shares the loop and nothing else: its own narrowed policy, its own
+   * transcript, its own provider session, no ledger of the parent's, and no
+   * `observe` port (its tool calls are its business, not the Ctrl+T inspector's).
+   * What comes back is its final message — the summary the parent asked for.
+   */
+  const runOneClone = async (
+    record: CloneRecord,
+    task: SpawnAgentTask,
+    ctx: { index: number; total: number; signal?: AbortSignal }
+  ): Promise<void> => {
+    // Derived per clone, never shared: canCallPcpTool mutates, so two clones on
+    // one policy object would consume the parent's grants by interleaving.
+    const { policy: clonePolicy } = deriveClonePolicy(toolPolicy, {
+      sessionId: runtime.sessionId,
+    });
+    const cloneOrigin: ApprovalOriginInfo = {
+      origin: 'clone',
+      cloneId: record.id,
+      cloneLabel: record.label,
+    };
+
+    // Recomputed from the CLONE's gate. Inheriting the parent's passthroughArgs
+    // would hand a narrowed clone the parent's full backend tool surface.
+    const clonePassthrough = buildBackendToolPassthrough(
+      runtime.backend,
+      runtime.toolRouting,
+      clonePolicy.getBackendToolGate(),
+      runtime.strictTools
+    ).passthroughArgs;
+
+    let cloneProviderSessionId: string | undefined;
+    let cloneToolCalls = 0;
+
+    const cloneRunTurn = async (
+      body: string,
+      turnCtx: { isContinuation: boolean }
+    ): Promise<BackendTurnOutcome> => {
+      const seedId = cloneProviderSessionId ?? randomUUID();
+      const isFirst = cloneProviderSessionId === undefined;
+      cloneProviderSessionId = seedId;
+
+      const turn = startBackendTurn({
+        backend: runtime.backend,
+        agentId,
+        model: runtime.model,
+        prompt: body,
+        verbose: false,
+        passthroughArgs: clonePassthrough,
+        systemPromptOverride: runtime.systemPromptOverride,
+        timeoutMs: runtime.backendTurnTimeoutMs,
+        idleTimeoutMs: runtime.backendIdleTimeoutMs,
+        stream: true,
+        toolRouting: runtime.toolRouting,
+        // First turn seeds the clone's own provider session; later turns resume
+        // it, so the clone remembers what IT did without seeing the parent's
+        // conversation.
+        ...(isFirst ? { backendSessionSeedId: seedId } : { backendSessionId: seedId }),
+      });
+
+      // Ctrl+C on the parent turn kills the clone's child too, not just the
+      // parent's — otherwise a cancelled turn leaves backends running.
+      const onAbort = () => turn.abort();
+      ctx.signal?.addEventListener('abort', onAbort, { once: true });
+
+      const result = await turn.result.finally(() =>
+        ctx.signal?.removeEventListener('abort', onAbort)
+      );
+      appendTranscript(record.transcriptPath, {
+        type: 'backend_turn',
+        continuation: turnCtx.isContinuation,
+        success: result.success,
+        exitCode: result.exitCode,
+        durationMs: result.durationMs,
+      });
+      return {
+        success: result.success,
+        responseText: result.responseText,
+        stdout: result.stdout,
+        stderr: result.stderr,
+        exitCode: result.exitCode,
+      };
+    };
+
+    try {
+      appendTranscript(record.transcriptPath, {
+        type: 'clone_start',
+        id: record.id,
+        label: record.label,
+        parentSessionId: record.parentSessionId,
+        prompt: task.prompt,
+      });
+
+      const result = await runAgentLoop(
+        {
+          // The clone starts from nothing, so its prompt has to carry the tool
+          // protocol itself — it never sees the parent's envelope.
+          prompt: [
+            buildClonePrompt(task, { id: record.id, index: ctx.index, total: ctx.total }),
+            ...(runtime.toolRouting === 'local'
+              ? ['', buildLocalToolInstruction({ audience: 'clone' })]
+              : []),
+          ].join('\n'),
+          toolRouting: runtime.toolRouting,
+          signal: ctx.signal,
+        },
+        {
+          ui: {
+            // A clone's progress belongs to the clone, not the parent's
+            // scrollback — the parent gets one summary, which is the point.
+            printLine: (text) =>
+              appendTranscript(record.transcriptPath, { type: 'clone_line', text }),
+            printEvent: (text) =>
+              appendTranscript(record.transcriptPath, { type: 'clone_event', text }),
+            startWaiting: () => () => {},
+          },
+          tools: {
+            // No `screen` port: nesting is refused at the executor below, and a
+            // clone has no fan-out rule of its own to enforce.
+            execute: async (calls, execCtx) => {
+              cloneToolCalls += calls.length;
+              cloneRegistry.update(record.id, {
+                iterations: execCtx.iteration + 1,
+                toolCalls: cloneToolCalls,
+              });
+              return runCloneTools(calls, {
+                policy: clonePolicy,
+                origin: cloneOrigin,
+                signal: execCtx.signal,
+                transcriptPath: record.transcriptPath,
+              });
+            },
+          },
+          backend: { runTurn: (body, turnCtx) => cloneRunTurn(body, turnCtx) },
+        }
+      );
+
+      const summary = boundSummary(result.assistantDisplayText || result.responseText);
+      appendTranscript(record.transcriptPath, {
+        type: 'clone_end',
+        stopReason: result.stopReason,
+        iterations: result.iterations,
+        summary,
+      });
+      cloneRegistry.update(record.id, {
+        status: result.success ? 'completed' : 'failed',
+        stopReason: result.stopReason,
+        iterations: result.iterations,
+        toolCalls: cloneToolCalls,
+        summary,
+        ...(result.stopReason === 'aborted' ? { status: 'aborted' as const } : {}),
+        ...(result.success ? {} : { error: `backend ${result.stopReason}` }),
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      appendTranscript(record.transcriptPath, { type: 'clone_error', error: message });
+      cloneRegistry.update(record.id, { status: 'failed', error: message });
+    }
+  };
+
+  /**
+   * A clone's tool executor: the parent's pipeline, over the clone's policy.
+   *
+   * Deliberately NOT `runIterationTools` — that one writes to the parent's
+   * ledger, its transcript, and the Ctrl+T inspector, all of which would leak the
+   * clone's working detail into exactly the context the clone exists to protect.
+   */
+  const runCloneTools = async (
+    calls: LocalToolCall[],
+    opts: {
+      policy: ToolPolicyState;
+      origin: ApprovalOriginInfo;
+      signal?: AbortSignal;
+      transcriptPath: string;
+    }
+  ): Promise<ToolResultRecord[]> => {
+    const results: ToolResultRecord[] = [];
+    await executeToolCalls(calls, {
+      policy: opts.policy,
+      sessionId: runtime.sessionId,
+      callTool: (tool, args) => {
+        // Non-nesting is enforced HERE, not by omitting spawn_agent from the
+        // clone's prompt: tool calls travel as text, so a model can name any
+        // tool it likes regardless of what it was told.
+        if (isForbiddenInClone(tool)) {
+          return Promise.resolve({
+            content: [
+              {
+                type: 'text',
+                text: `${tool} is not available to a shadow clone. Report what you found and let your parent act on it.`,
+              },
+            ],
+            isError: true,
+          } as PcpToolCallResult);
+        }
+        if (isClientLocalTool(tool)) {
+          // Each clone gets a throwaway ledger: context tools must work (the
+          // loop stops on signal_status) without touching the parent's.
+          const result = handleClientLocalTool(tool, args, cloneLedgerFor(opts.transcriptPath));
+          if (result) return Promise.resolve(result);
+        }
+        if (isPiTool(tool)) {
+          return callPiTool(tool, args, process.cwd());
+        }
+        const { args: resolvedArgs } = resolveCredentialRefs(args, buildResolverEnv());
+        return pcp.callTool(tool.replace(/^mcp__inkwell__/, ''), resolvedArgs);
+      },
+      promptForApproval: (tool, reason, args) =>
+        approvalCoordinator
+          .request({
+            tool,
+            args: args ?? {},
+            reason,
+            sessionId: runtime.sessionId,
+            origin: opts.origin,
+            signal: opts.signal,
+          })
+          .then((outcome) => outcome.approved),
+      onResult: (result) => {
+        appendTranscript(opts.transcriptPath, {
+          type: 'clone_tool_call',
+          tool: result.tool,
+          args: result.args,
+          status: result.status,
+          reason: result.reason,
+        });
+        results.push({
+          tool: result.tool,
+          result:
+            result.status === 'executed' || result.status === 'approved'
+              ? result.result
+              : result.reason,
+          status: result.status,
+          args: result.args,
+        });
+      },
+    });
+    return results;
+  };
+
+  /**
+   * Per-clone throwaway ledgers, keyed by transcript path.
+   *
+   * Client-local context tools need *a* ledger to operate on. A clone's is
+   * discarded when the clone ends — its whole context is one bounded task, so
+   * there is nothing to carry forward.
+   */
+  const cloneLedgers = new Map<string, ContextLedger>();
+  const cloneLedgerFor = (transcriptPath: string): ContextLedger => {
+    const existing = cloneLedgers.get(transcriptPath);
+    if (existing) return existing;
+    const fresh = new ContextLedger();
+    cloneLedgers.set(transcriptPath, fresh);
+    return fresh;
+  };
+
+  /**
+   * Fan out a `spawn_agent` call.
+   *
+   * `allSettled`, never `all`: one clone failing to start must not discard the
+   * summaries its siblings already produced.
+   */
+  const runSpawnAgent = async (
+    args: Record<string, unknown>,
+    ctx: { signal?: AbortSignal }
+  ): Promise<PcpToolCallResult> => {
+    const parsed = parseSpawnAgentArgs(args);
+    if (!parsed.ok) {
+      return {
+        content: [{ type: 'text', text: parsed.error }],
+        isError: true,
+      } as PcpToolCallResult;
+    }
+
+    const { tasks, wait } = parsed.request;
+    const records: CloneRecord[] = tasks.map((task) => {
+      const id = cloneRegistry.nextId();
+      return cloneRegistry.register({
+        id,
+        label: task.label,
+        prompt: task.prompt,
+        parentSessionId: runtime.sessionId,
+        transcriptPath: runtime.transcriptPath.replace(/\.jsonl$/, `.${id}.jsonl`),
+      });
+    });
+
+    printEvent(
+      chalk.dim(
+        `  🌀 spawning ${records.length} shadow clone(s): ${records.map((r) => `${r.id} (${r.label})`).join(', ')}`
+      )
+    );
+
+    const running = Promise.allSettled(
+      records.map((record, index) =>
+        runOneClone(record, tasks[index], { index, total: records.length, signal: ctx.signal })
+      )
+    );
+
+    if (!wait) {
+      // Background: the clones keep running in this process while the parent
+      // moves on. Nothing awaits `running` here on purpose — the registry is the
+      // handle, and `collect_agents` (or the TUI) picks the work up later.
+      void running.then(() => {
+        printEvent(
+          chalk.dim(`  🌀 background clone(s) finished: ${records.map((r) => r.id).join(', ')}`)
+        );
+      });
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              spawned: records.map((r) => ({ id: r.id, label: r.label })),
+              mode: 'background',
+              note: 'Clones are running. Call collect_agents to read their summaries, or continue and collect later.',
+            }),
+          },
+        ],
+      } as PcpToolCallResult;
+    }
+
+    await running;
+    return summarizeClones(records.map((r) => r.id));
+  };
+
+  /**
+   * Collect background clones.
+   *
+   * Separate from `spawn_agent` so the parent can fire a fan-out, keep working,
+   * and pick the results up when it actually needs them — including in a later
+   * turn, since the registry outlives the turn that spawned them.
+   */
+  const runCollectAgents = async (args: Record<string, unknown>): Promise<PcpToolCallResult> => {
+    const requested = Array.isArray(args.ids)
+      ? args.ids.filter((id): id is string => typeof id === 'string')
+      : undefined;
+    const ids = requested?.length ? requested : cloneRegistry.list().map((r) => r.id);
+
+    if (ids.length === 0) {
+      return {
+        content: [{ type: 'text', text: 'No shadow clones have been spawned in this session.' }],
+      } as PcpToolCallResult;
+    }
+
+    const unknown = ids.filter((id) => !cloneRegistry.get(id));
+    if (unknown.length > 0) {
+      return {
+        content: [{ type: 'text', text: `Unknown clone id(s): ${unknown.join(', ')}` }],
+        isError: true,
+      } as PcpToolCallResult;
+    }
+
+    if (args.wait !== false) {
+      await Promise.all(ids.map((id) => waitForClone(id)));
+    }
+    return summarizeClones(ids);
+  };
+
+  /** Resolve when a clone reaches a terminal state. */
+  const waitForClone = (id: string): Promise<void> =>
+    new Promise((resolve) => {
+      const record = cloneRegistry.get(id);
+      if (!record || isSettled(record.status)) {
+        resolve();
+        return;
+      }
+      const unsubscribe = cloneRegistry.onChange((change) => {
+        if (change.record.id !== id || !isSettled(change.record.status)) return;
+        unsubscribe();
+        resolve();
+      });
+    });
+
+  /** `/clones` — every clone this session spawned, running or finished. */
+  const cloneOverviewLines = (): string[] => {
+    const records = cloneRegistry.list();
+    if (records.length === 0) {
+      return ['No shadow clones spawned in this session.'];
+    }
+    const running = cloneRegistry.runningCount;
+    return [
+      `Shadow clones (${records.length} total${running > 0 ? `, ${running} running` : ''}):`,
+      ...records.map(formatCloneLine),
+      '',
+      'Use /clones <id> to open one.',
+    ];
+  };
+
+  /** `/clones <id>` — navigate into one clone's work. */
+  const cloneDetailLines = (record: CloneRecord): string[] => {
+    const lines = [
+      formatCloneLine(record),
+      '',
+      `Task: ${record.prompt.split('\n')[0].slice(0, 200)}`,
+      `Transcript: ${record.transcriptPath}`,
+    ];
+    if (record.parentSessionId) lines.push(`Parent session: ${record.parentSessionId}`);
+    if (record.error) lines.push('', `Error: ${record.error}`);
+    if (record.summary) {
+      lines.push('', 'Summary:', ...record.summary.split('\n').slice(0, 40));
+    } else if (record.status === 'running') {
+      lines.push('', 'Still working — no summary yet.');
+    }
+    return lines;
+  };
+
+  /** Read back what clones produced, as one bounded payload. */
+  const summarizeClones = (ids: string[]): PcpToolCallResult => {
+    const outcomes: CloneOutcomeSummary[] = ids.map((id) => {
+      const record = cloneRegistry.get(id);
+      if (!record) return { id, label: '(unknown)', status: 'missing' };
+      return {
+        id: record.id,
+        label: record.label,
+        status: record.status,
+        summary: record.summary,
+        error: record.error,
+        iterations: record.iterations,
+        stopReason: record.stopReason,
+        transcriptPath: record.transcriptPath,
+      };
+    });
+
+    const rendered = formatFanOutForLedger(outcomes);
+    // ONE ledger entry for the whole fan-out. Per-clone entries would put the
+    // clones' working detail back into the parent's context.
+    ledger.addEntry('system', compactForLedger(rendered, MAX_CLONE_SUMMARY_CHARS), 'shadow-clone');
+    appendTranscript(runtime.transcriptPath, { type: 'clone_fanout', outcomes });
+
+    return {
+      content: [{ type: 'text', text: JSON.stringify({ clones: outcomes }) }],
+    } as PcpToolCallResult;
+  };
+
+  /**
    * Execute one iteration's tool calls through ink's policy pipeline and return
    * what happened.
    *
@@ -4608,6 +5137,15 @@ export async function runChat(options: ChatOptions): Promise<void> {
     await executeToolCalls(calls, {
       policy: toolPolicy,
       callTool: (tool, args) => {
+        // spawn_agent is NOT a client-local policy bypass. Unlike ledger tools
+        // it costs backend time and fans out authority, so it reaches here only
+        // after executeToolCalls has cleared it through policy.
+        if (tool.replace(/^mcp__inkwell__/, '') === SPAWN_AGENT_TOOL) {
+          return runSpawnAgent(args, { signal: abortSignal });
+        }
+        if (tool.replace(/^mcp__inkwell__/, '') === COLLECT_AGENTS_TOOL) {
+          return runCollectAgents(args);
+        }
         // Client-local tools (context management) are handled in-process
         if (isClientLocalTool(tool)) {
           const result = handleClientLocalTool(tool, args, ledger);
@@ -5345,7 +5883,16 @@ export async function runChat(options: ChatOptions): Promise<void> {
                   renderAbovePrompt: true,
                 }),
         },
-        tools: { execute: (calls, ctx) => runIterationTools(calls, { signal: ctx.signal }) },
+        tools: {
+          execute: (calls, ctx) => runIterationTools(calls, { signal: ctx.signal }),
+          // Runs over the full extracted list, before the per-iteration cap —
+          // otherwise a spawn_agent in sixth position would be truncated away
+          // instead of caught.
+          screen: (allCalls) => {
+            const verdict = screenIteration(allCalls, MAX_TOOL_CALLS_PER_ITERATION);
+            return verdict.ok ? { calls: verdict.calls } : { rejected: verdict.reason };
+          },
+        },
         backend: { runTurn: runTurnForLoop },
         observe: {
           recordToolCall: (r) => {
@@ -6402,6 +6949,21 @@ export async function runChat(options: ChatOptions): Promise<void> {
             const snapshot = await refreshSessionsSnapshot(true);
             showInPanel(formatSessionsLines(snapshot, { timezone: runtime.userTimezone }));
           }
+          break;
+        }
+        case 'clones': {
+          const target = slash.args[0];
+          if (target) {
+            // Navigate INTO a clone: show what it did, from its own transcript.
+            const record = cloneRegistry.get(target);
+            if (!record) {
+              showInPanel([`Unknown clone: ${target}`, '', ...cloneOverviewLines()]);
+              break;
+            }
+            showInPanel(cloneDetailLines(record));
+            break;
+          }
+          showInPanel(cloneOverviewLines());
           break;
         }
         case 'backend': {

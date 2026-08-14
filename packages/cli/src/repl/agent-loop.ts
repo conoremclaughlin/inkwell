@@ -84,6 +84,17 @@ export interface AgentLoopPorts {
       calls: LocalToolCall[],
       ctx: { iteration: number; signal?: AbortSignal }
     ): Promise<ToolResultRecord[]>;
+    /**
+     * Vet an iteration's FULL extracted call list before anything runs.
+     *
+     * Runs pre-truncation on purpose: a rule like "spawn_agent must be alone"
+     * checked after `.slice()` could be evaded by a spawn in sixth position.
+     * Returning a refusal rejects the iteration whole — no call runs — and the
+     * reason is fed back so the model can correct rather than guess.
+     *
+     * Omit to accept every iteration and simply truncate.
+     */
+    screen?(allCalls: LocalToolCall[]): { calls: LocalToolCall[] } | { rejected: string };
   };
   backend: {
     /**
@@ -197,10 +208,53 @@ export async function runAgentLoop(
   for (;;) {
     responseText = resolveResponseText(outcome);
 
-    calls =
-      input.toolRouting === 'local'
-        ? extractLocalToolCalls(responseText).slice(0, MAX_TOOL_CALLS_PER_ITERATION)
-        : [];
+    const extracted =
+      input.toolRouting === 'local' ? extractLocalToolCalls(responseText) : ([] as LocalToolCall[]);
+
+    // Screening sees every call the model emitted, before the per-iteration cap
+    // discards any — a rule about what may accompany what cannot be enforced on
+    // a truncated list.
+    const screened = ports.tools.screen
+      ? ports.tools.screen(extracted)
+      : { calls: extracted.slice(0, MAX_TOOL_CALLS_PER_ITERATION) };
+
+    if ('rejected' in screened) {
+      // Refused whole. Tell the model why and let it try again; the iteration
+      // still counts, so a model that keeps re-emitting the same bad shape runs
+      // out of budget rather than spinning.
+      iteration++;
+      const record: ToolResultRecord = {
+        tool: 'iteration',
+        result: screened.rejected,
+        status: 'rejected',
+      };
+      allToolResults.push(record);
+      ports.ui.printEvent(`  ⋯ iteration refused — ${screened.rejected}`);
+
+      if (iteration >= maxIterations) {
+        stopReason = 'iteration-cap';
+        ports.ui.printLine(`(tool loop limit reached — ${maxIterations} iterations)`);
+        break;
+      }
+
+      const stopWaitingAfterRejection = ports.ui.startWaiting();
+      try {
+        outcome = await ports.backend.runTurn(buildContinuationBody([record], extracted), {
+          iteration,
+          isContinuation: true,
+          signal: input.signal,
+        });
+      } finally {
+        stopWaitingAfterRejection();
+      }
+      if (!outcome.success) {
+        stopReason = 'backend-failure';
+        break;
+      }
+      continue;
+    }
+
+    calls = screened.calls;
 
     if (calls.length === 0) {
       stopReason = 'no-tools';

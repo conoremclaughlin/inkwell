@@ -325,3 +325,88 @@ describe('runAgentLoop', () => {
     expect(result.toolResults).toHaveLength(1);
   });
 });
+
+describe('runAgentLoop — iteration screening', () => {
+  it('screens the FULL extracted list, not the truncated one', async () => {
+    const seen: LocalToolCall[][] = [];
+    const harness = makePorts([
+      outcome({
+        responseText: ['a', 'b', 'c', 'd', 'e', 'f'].map((t) => inkTool(t)).join('\n'),
+      }),
+    ]);
+    harness.ports.tools.screen = (all) => {
+      seen.push(all);
+      return { calls: all.slice(0, 2) };
+    };
+
+    await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+
+    // Six emitted, all six offered to the screen, two executed. A rule about
+    // what may accompany what cannot be enforced on a truncated list.
+    expect(seen[0].map((c) => c.tool)).toEqual(['a', 'b', 'c', 'd', 'e', 'f']);
+    expect(harness.executed[0].map((c) => c.tool)).toEqual(['a', 'b']);
+  });
+
+  it('refuses a rejected iteration whole and feeds the reason back', async () => {
+    const harness = makePorts([
+      outcome({ responseText: inkTool('spawn_agent') + '\n' + inkTool('read') }),
+      outcome({ responseText: 'ok, spawning alone next time' }),
+    ]);
+    let screened = 0;
+    harness.ports.tools.screen = (all) =>
+      screened++ === 0 ? { rejected: 'spawn_agent must be alone' } : { calls: all };
+
+    const result = await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+
+    // Nothing ran.
+    expect(harness.executed).toEqual([]);
+    // The model was told why, in a continuation.
+    expect(harness.prompts).toHaveLength(2);
+    expect(harness.prompts[1].isContinuation).toBe(true);
+    expect(harness.prompts[1].body).toContain('spawn_agent must be alone');
+    expect(result.toolResults).toEqual([
+      { tool: 'iteration', result: 'spawn_agent must be alone', status: 'rejected' },
+    ]);
+    expect(result.stopReason).toBe('no-tools');
+  });
+
+  it('counts a rejected iteration against the budget so a stuck model stops', async () => {
+    const turns = Array.from({ length: 6 }, () =>
+      outcome({ responseText: inkTool('spawn_agent') + '\n' + inkTool('read') })
+    );
+    const harness = makePorts(turns);
+    harness.ports.tools.screen = () => ({ rejected: 'spawn_agent must be alone' });
+
+    const result = await runAgentLoop(
+      { prompt: 'go', toolRouting: 'local', maxIterations: 3 },
+      harness.ports
+    );
+
+    expect(result.stopReason).toBe('iteration-cap');
+    expect(result.iterations).toBe(3);
+    expect(harness.executed).toEqual([]);
+  });
+
+  it('stops on a backend failure while re-prompting after a rejection', async () => {
+    const harness = makePorts([
+      outcome({ responseText: inkTool('spawn_agent') + '\n' + inkTool('read') }),
+      outcome({ success: false, stderr: 'backend exploded', exitCode: 1 }),
+    ]);
+    harness.ports.tools.screen = () => ({ rejected: 'nope' });
+
+    const result = await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+    expect(result.stopReason).toBe('backend-failure');
+    expect(result.success).toBe(false);
+  });
+
+  it('truncates to the per-iteration cap when no screen is supplied', async () => {
+    const harness = makePorts([
+      outcome({
+        responseText: ['a', 'b', 'c', 'd', 'e', 'f'].map((t) => inkTool(t)).join('\n'),
+      }),
+    ]);
+
+    await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+    expect(harness.executed[0]).toHaveLength(5);
+  });
+});

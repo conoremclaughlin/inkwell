@@ -1,0 +1,181 @@
+import { describe, expect, it, vi } from 'vitest';
+import { CloneRegistry, formatCloneLine, isSettled, type CloneRecord } from './clone-registry.js';
+
+function seed(registry: CloneRegistry, label = 'audit auth paths') {
+  const id = registry.nextId();
+  return registry.register({
+    id,
+    label,
+    prompt: 'Find every auth entry point.',
+    parentSessionId: 'sess-1',
+    transcriptPath: `/tmp/parent.${id}.jsonl`,
+  });
+}
+
+describe('CloneRegistry', () => {
+  it('registers a clone as running with a readable id', () => {
+    const registry = new CloneRegistry();
+    const record = seed(registry);
+
+    expect(record.id).toBe('clone-1');
+    expect(record.status).toBe('running');
+    expect(record.iterations).toBe(0);
+    expect(record.toolCalls).toBe(0);
+    expect(registry.get('clone-1')).toEqual(record);
+    expect(registry.runningCount).toBe(1);
+  });
+
+  it('hands out sequential ids', () => {
+    const registry = new CloneRegistry();
+    expect([seed(registry).id, seed(registry).id, seed(registry).id]).toEqual([
+      'clone-1',
+      'clone-2',
+      'clone-3',
+    ]);
+  });
+
+  it('keeps spawn order, which is how the parent thinks about them', () => {
+    const registry = new CloneRegistry();
+    seed(registry, 'first');
+    seed(registry, 'second');
+    seed(registry, 'third');
+    expect(registry.list().map((r) => r.label)).toEqual(['first', 'second', 'third']);
+  });
+
+  it('stamps endedAt when a clone settles', () => {
+    const registry = new CloneRegistry();
+    seed(registry);
+
+    const settled = registry.update('clone-1', { status: 'completed', summary: 'done' });
+    expect(settled?.status).toBe('completed');
+    expect(settled?.endedAt).toBeGreaterThanOrEqual(settled!.startedAt);
+    expect(registry.runningCount).toBe(0);
+  });
+
+  it('refuses to resurrect a settled clone', () => {
+    const registry = new CloneRegistry();
+    seed(registry);
+    registry.update('clone-1', { status: 'completed', summary: 'done' });
+
+    // A loop still unwinding must not overwrite the recorded outcome.
+    registry.update('clone-1', { iterations: 99 });
+    registry.update('clone-1', { status: 'running' });
+
+    const record = registry.get('clone-1');
+    expect(record?.status).toBe('completed');
+    expect(record?.iterations).toBe(0);
+    expect(record?.summary).toBe('done');
+  });
+
+  it('still allows one terminal state to correct another', () => {
+    const registry = new CloneRegistry();
+    seed(registry);
+    registry.update('clone-1', { status: 'completed' });
+    registry.update('clone-1', { status: 'aborted', error: 'cancelled' });
+    expect(registry.get('clone-1')?.status).toBe('aborted');
+  });
+
+  it('reports progress while a clone is still running', () => {
+    const registry = new CloneRegistry();
+    seed(registry);
+    registry.update('clone-1', { iterations: 2, toolCalls: 7 });
+
+    const record = registry.get('clone-1');
+    expect(record?.status).toBe('running');
+    expect(record?.iterations).toBe(2);
+    expect(record?.toolCalls).toBe(7);
+    expect(record?.endedAt).toBeUndefined();
+  });
+
+  it('filters by status', () => {
+    const registry = new CloneRegistry();
+    seed(registry, 'a');
+    seed(registry, 'b');
+    registry.update('clone-1', { status: 'completed' });
+
+    expect(registry.list({ status: 'running' }).map((r) => r.id)).toEqual(['clone-2']);
+    expect(registry.list({ status: 'settled' }).map((r) => r.id)).toEqual(['clone-1']);
+  });
+
+  it('notifies subscribers and can be unsubscribed', () => {
+    const registry = new CloneRegistry();
+    const seen: string[] = [];
+    const unsubscribe = registry.onChange((c) => seen.push(`${c.kind}:${c.record.id}`));
+
+    seed(registry);
+    registry.update('clone-1', { iterations: 1 });
+    registry.update('clone-1', { status: 'completed' });
+    unsubscribe();
+    seed(registry);
+
+    expect(seen).toEqual(['registered:clone-1', 'updated:clone-1', 'settled:clone-1']);
+  });
+
+  it('survives a subscriber that throws', () => {
+    const registry = new CloneRegistry();
+    const good = vi.fn();
+    registry.onChange(() => {
+      throw new Error('TUI exploded');
+    });
+    registry.onChange(good);
+
+    expect(() => seed(registry)).not.toThrow();
+    expect(good).toHaveBeenCalledTimes(1);
+  });
+
+  it('ignores updates to an unknown clone', () => {
+    const registry = new CloneRegistry();
+    expect(registry.update('clone-99', { status: 'completed' })).toBeUndefined();
+  });
+});
+
+describe('isSettled', () => {
+  it('treats every non-running state as final', () => {
+    expect(isSettled('running')).toBe(false);
+    expect(isSettled('completed')).toBe(true);
+    expect(isSettled('failed')).toBe(true);
+    expect(isSettled('aborted')).toBe(true);
+  });
+});
+
+describe('formatCloneLine', () => {
+  const base: CloneRecord = {
+    id: 'clone-1',
+    label: 'audit auth paths',
+    prompt: 'p',
+    status: 'running',
+    transcriptPath: '/tmp/x.clone-1.jsonl',
+    startedAt: Date.now() - 5000,
+    iterations: 2,
+    toolCalls: 7,
+  };
+
+  it('shows live progress while running', () => {
+    const line = formatCloneLine(base);
+    expect(line).toContain('🌀 clone-1 · audit auth paths');
+    expect(line).toContain('2 turn(s), 7 tool call(s)');
+  });
+
+  it('shows the outcome once settled', () => {
+    const line = formatCloneLine({
+      ...base,
+      status: 'completed',
+      stopReason: 'terminal-signal',
+      endedAt: base.startedAt + 12_000,
+    });
+    expect(line).toContain('✅ clone-1');
+    expect(line).toContain('terminal-signal');
+    expect(line).toContain('(12s)');
+  });
+
+  it('leads with the error when one exists', () => {
+    const line = formatCloneLine({
+      ...base,
+      status: 'failed',
+      error: 'backend backend-failure',
+      endedAt: base.startedAt + 1000,
+    });
+    expect(line).toContain('⚠️');
+    expect(line).toContain('backend backend-failure');
+  });
+});
