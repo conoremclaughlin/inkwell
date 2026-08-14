@@ -9,14 +9,41 @@ export interface AgentState {
   name: string;
   role: string | null;
   backend: string | null;
+  /** Primary studio the agent holds. Null when it holds none. */
   studioId: string | null;
   studioSlug: string | null;
+  /**
+   * Every studio this agent currently holds a lease on. An agent can hold
+   * more than one (concurrent sessions in separate worktrees), so `studioId`
+   * alone would hide real occupancy — it is the marker for where to draw the
+   * agent, not a claim that it is the only place they are.
+   */
+  heldStudioIds: string[];
   lifecycle: string | null;
   phase: string | null;
   activeThreadKey: string | null;
   updatedAt: string | null;
   position: { x: number; y: number };
   targetPosition: { x: number; y: number } | null;
+}
+
+/**
+ * Occupancy for a studio, as recorded by the lease
+ * (spec:trigger-studio-routing Phase 5). Null when the studio is free.
+ */
+export interface StudioLeaseView {
+  sessionId: string;
+  threadKey: string;
+  agentId: string;
+  acquiredAt: string;
+  heartbeatAt: string;
+  reason?: string;
+  quarantined: boolean;
+  claimKind: string | null;
+  pendingRelease: { reason: string; requestedAt: string } | null;
+  /** Past the staleness threshold — reclaimable, not necessarily dead. */
+  stale: boolean;
+  heartbeatAgeMs: number | null;
 }
 
 export interface StudioNode {
@@ -27,6 +54,12 @@ export interface StudioNode {
   workType: string | null;
   status: string;
   agentId: string;
+  /** Repo this studio's worktree belongs to — the Level 0 territory key. */
+  repoRoot: string | null;
+  lease: StudioLeaseView | null;
+  ephemeral: boolean;
+  parentStudioId: string | null;
+  expiresAt: string | null;
   position: { x: number; y: number };
 }
 
@@ -39,6 +72,8 @@ export interface TaskNode {
   groupTitle: string | null;
   taskOrder: number | null;
   agentId: string | null;
+  /** Task IDs that must complete before this one — the real graph edges. */
+  blockedBy: string[];
 }
 
 export interface ActivityEvent {

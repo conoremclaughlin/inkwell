@@ -47,6 +47,7 @@ import {
   exchangeRefreshToken,
 } from '../auth/pcp-tokens';
 import type { Database } from '../data/supabase/types';
+import { isLeaseStale, type StudioLease } from '../services/studio-lease.service';
 import { activityBus } from '../services/events/activity-bus';
 import type { Activity } from '../data/repositories/activity-stream.repository';
 import {
@@ -5250,6 +5251,53 @@ router.get('/sessions', async (req: Request, res: Response) => {
 });
 
 /**
+ * Shape a raw `studios.lease` jsonb value for the dashboard.
+ *
+ * Returns null for an unoccupied studio so the client can branch on presence
+ * alone. `stale` is derived here rather than in the browser because staleness
+ * is measured against LEASE_STALE_MS, and a client clock that disagrees with
+ * the server's would render a healthy lease as reclaimable — the one piece of
+ * this payload where being wrong invites someone to take a studio out from
+ * under a working agent.
+ *
+ * Note that `stale` means "eligible for reclaim", not "dead": the lease
+ * service still vetoes reclaim on live-process signals. The canvas should
+ * present it as a question, not a verdict.
+ */
+function describeLease(raw: unknown): {
+  sessionId: string;
+  threadKey: string;
+  agentId: string;
+  acquiredAt: string;
+  heartbeatAt: string;
+  reason?: string;
+  quarantined: boolean;
+  claimKind: string | null;
+  pendingRelease: { reason: string; requestedAt: string } | null;
+  stale: boolean;
+  heartbeatAgeMs: number | null;
+} | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const lease = raw as StudioLease;
+  if (!lease.sessionId) return null;
+
+  const heartbeatMs = Date.parse(lease.heartbeatAt ?? '');
+  return {
+    sessionId: lease.sessionId,
+    threadKey: lease.threadKey,
+    agentId: lease.agentId,
+    acquiredAt: lease.acquiredAt,
+    heartbeatAt: lease.heartbeatAt,
+    ...(lease.reason ? { reason: lease.reason } : {}),
+    quarantined: lease.quarantined === true,
+    claimKind: lease.claimKind ?? null,
+    pendingRelease: lease.pendingRelease ?? null,
+    stale: isLeaseStale(lease),
+    heartbeatAgeMs: Number.isFinite(heartbeatMs) ? Date.now() - heartbeatMs : null,
+  };
+}
+
+/**
  * GET /api/admin/studios
  * List studios grouped by agent, with latest session status per agent.
  */
@@ -5283,13 +5331,18 @@ router.get('/studios', async (req: Request, res: Response) => {
       status: string;
       updated_at: string | null;
       created_at: string | null;
+      lease: StudioLease | null;
+      ephemeral: boolean | null;
+      parent_studio_id: string | null;
+      expires_at: string | null;
+      default_project_id: string | null;
     }> | null = [];
 
     if (sbIds.length > 0) {
       const { data: scopedStudios } = await supabase
         .from('studios')
         .select(
-          'id, agent_id, branch, base_branch, repo_root, purpose, work_type, worktree_path, slug, status, updated_at, created_at'
+          'id, agent_id, branch, base_branch, repo_root, purpose, work_type, worktree_path, slug, status, updated_at, created_at, lease, ephemeral, parent_studio_id, expires_at, default_project_id'
         )
         .eq('user_id', authReq.pcpUserId)
         .in('sb_id', sbIds)
@@ -5374,6 +5427,14 @@ router.get('/studios', async (req: Request, res: Response) => {
           slug: s.slug,
           status: s.status,
           updatedAt: s.updated_at,
+          // Occupancy (spec:trigger-studio-routing Phase 5 → spec:studio-canvas
+          // MVP items 2 and 6). Without these the canvas can draw studios but
+          // cannot say whether anyone is in one, which is the whole question.
+          ephemeral: s.ephemeral ?? false,
+          parentStudioId: s.parent_studio_id,
+          expiresAt: s.expires_at,
+          defaultProjectId: s.default_project_id,
+          lease: describeLease(s.lease),
         })),
       };
     });
@@ -6576,6 +6637,10 @@ router.get('/tasks', async (req: Request, res: Response) => {
         projectName: (t.projects as { name: string } | null)?.name ?? null,
         taskGroupId: t.task_group_id,
         taskGroupTitle: (t.task_groups as { title: string } | null)?.title ?? null,
+        // Ordering within a group. The dashboard has always typed this field
+        // and the endpoint has never sent it, so every consumer sorting by it
+        // was sorting by undefined — a stable no-op that looked like order.
+        taskOrder: t.task_order ?? null,
         blockedBy: t.blocked_by,
         createdBy: t.created_by,
         completedAt: t.completed_at,

@@ -197,12 +197,43 @@ export interface StudioRoutingDecision {
    * owns the studio, so occupancy does not gate them (spec v11 §Resolution).
    */
   occupancyChecked: boolean;
+  /**
+   * Set when the caller named a *specific* studio by slug and no such studio
+   * exists for this agent. Distinct from `studioId === undefined`, which also
+   * covers the ordinary case of asking for "main" when the agent simply has
+   * no root studio yet — that is a legitimate degrade, this is a bad address.
+   */
+  unresolvedNamedStudio?: string;
   diverted?: {
     from: string;
     holderThreadKey: string;
     holderSessionId: string;
     via: 'overflow' | 'refused';
   };
+}
+
+/**
+ * Raised when a caller names a studio that does not exist.
+ *
+ * Resolution stops rather than continuing down the reuse ladder. The ladder's
+ * later rungs — threadKey continuity, default session, most-recent session —
+ * are all unscoped by studio, so any of them can hand back a session bound to
+ * a worktree the caller never asked for. Skipping only the alias lookup left
+ * three other ways to arrive somewhere unintended.
+ */
+export class UnresolvedStudioError extends Error {
+  readonly code = 'UNRESOLVED_STUDIO';
+
+  constructor(
+    readonly studioHint: string,
+    readonly agentId: string
+  ) {
+    super(
+      `Studio "${studioHint}" does not exist for agent "${agentId}". ` +
+        `Refusing to route elsewhere — check the slug, or omit it to let routing choose.`
+    );
+    this.name = 'UnresolvedStudioError';
+  }
 }
 
 export class SessionService implements ISessionService {
@@ -1363,6 +1394,21 @@ export class SessionService implements ISessionService {
       backend,
     });
     const resolvedStudioId = routing.studioId;
+
+    // A named studio that does not exist stops resolution here, before any
+    // reuse lookup runs. Every rung below — alias, threadKey continuity,
+    // default session, most-recent session — is unscoped by studio, so
+    // continuing would let a session in an unrelated worktree win the
+    // request the caller addressed somewhere specific. Guarding only the
+    // alias lookup (as this PR first did) left the other three open.
+    //
+    // Deliberately narrow: this fires only for a slug naming a studio that is
+    // absent, never for "main" on an agent that has no root studio, which is
+    // an ordinary state that must keep degrading rather than throwing.
+    if (routing.unresolvedNamedStudio) {
+      throw new UnresolvedStudioError(routing.unresolvedNamedStudio, agentId);
+    }
+
     const leaseCtx = { userId, agentId, threadKey: options?.threadKey };
 
     // Resolve default_session_id from agent identity. When set, threadKey
@@ -1392,20 +1438,59 @@ export class SessionService implements ISessionService {
       // Takes priority over threadKey because alias is an explicit user intent.
       if (options?.alias && 'findByAlias' in this.repository) {
         const aliasRepo = this.repository as {
-          findByAlias: (u: string, a: string, alias: string) => Promise<Session | null>;
+          findByAlias: (
+            u: string,
+            a: string,
+            alias: string,
+            studioId?: string
+          ) => Promise<Session | null>;
         };
-        const aliasMatch = await aliasRepo.findByAlias(userId, agentId, options.alias);
+
+        // Pin the alias lookup to a studio only when the caller named one.
+        // 'explicit' and 'studio-hint' are the caller-qualified tiers; every
+        // tier below them is inferred (route pattern, most-recent, fallback),
+        // and pinning to an inferred studio would turn a resolvable alias into
+        // a miss — the resolver would refuse to see a session the caller never
+        // said anything about.
+        const callerNamedStudio = routing.tier === 'explicit' || routing.tier === 'studio-hint';
+
+        // Scope to the caller's studio when they named one that resolved.
+        // Otherwise the lookup is unscoped, which is safe on its own terms:
+        // findByAlias refuses an alias matching across two studios rather
+        // than guessing, so "unscoped" means "must be unique", not "pick one".
+        //
+        // An earlier revision skipped the lookup entirely whenever a
+        // caller-qualified tier produced no studio. That guard was load-
+        // bearing when it was the only defence, but once a literal slug miss
+        // began throwing before this point, the only case still reaching it
+        // was the *permitted* one — `main` on an agent with no root studio.
+        // It then suppressed alias resolution for precisely the repo-less
+        // agents the degrade exists to serve, dropping them through to
+        // threadKey/default/general, which can select a different session
+        // than the alias named. Removing it restores the feature without
+        // reopening the misroute, because the dangerous branch no longer
+        // arrives here at all.
+        const aliasStudioScope = callerNamedStudio ? resolvedStudioId : undefined;
+
+        const aliasMatch = await aliasRepo.findByAlias(
+          userId,
+          agentId,
+          options.alias,
+          aliasStudioScope
+        );
         if (aliasMatch) {
           logger.debug('Found existing session by alias', {
             sessionId: aliasMatch.id,
             alias: options.alias,
             studioId: aliasMatch.studioId || null,
+            aliasStudioScope: aliasStudioScope ?? null,
           });
           return this.withStudioLease(aliasMatch, routing, leaseCtx);
         }
         logger.debug('No session found for alias', {
           alias: options.alias,
           agentId,
+          aliasStudioScope: aliasStudioScope ?? null,
         });
       }
 
@@ -1613,7 +1698,12 @@ export class SessionService implements ISessionService {
         agentId,
         studioHint: options.studioHint,
       });
-      return { studioId: undefined, tier: 'studio-hint', occupancyChecked: false };
+      return {
+        studioId: undefined,
+        tier: 'studio-hint',
+        occupancyChecked: false,
+        unresolvedNamedStudio: options.studioHint,
+      };
     }
 
     // 1) Related session scope (explicit resume continuity)
