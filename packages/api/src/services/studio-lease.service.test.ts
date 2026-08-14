@@ -237,6 +237,62 @@ describe('StudioLeaseService.acquire', () => {
     expect(tables.studios[0].lease).toBeNull();
   });
 
+  it('never leases an ACTIVE, VACANT studio whose worktree is gone (round 8)', async () => {
+    // The vacant fast path used to CAS before any validation — a live-looking
+    // row with a deleted cwd was handed straight to the runner.
+    // `removeWorktree: false` closes produce exactly this state.
+    tables.studios[0].lease = null;
+    tables.studios[0].status = 'active';
+    tables.studios[0].worktree_path = path.join(tmpdir(), 'vacant-missing-worktree-xyz');
+
+    const result = await service.acquire(req);
+    expect(result.acquired).toBe(false);
+    // Retired, not left circulating as an acquirable vacancy.
+    expect(tables.studios[0].status).toBe('cleaned');
+    expect(tables.studios[0].lease).toBeNull();
+    const event = tables.studio_lease_events.find((e) => e.event === 'released');
+    expect(event?.reason).toBe('worktree-absent-retired');
+    // And a second attempt still refuses (now on the status guard).
+    expect((await service.acquire(req)).acquired).toBe(false);
+  });
+
+  it('never adopts a SAME-THREAD lease when the worktree is gone (round 8)', async () => {
+    // Terminal same-thread holder would normally be adopted outright,
+    // bypassing claimAndRescue's missing-cwd check.
+    tables.studios[0].lease = freshLease({ sessionId: 'session-old', threadKey: 'pr:200' });
+    tables.studios[0].worktree_path = path.join(tmpdir(), 'adopt-missing-worktree-xyz');
+    tables.sessions.push({
+      id: 'session-old',
+      user_id: 'user-1',
+      ended_at: new Date().toISOString(),
+      status: 'completed',
+    });
+
+    const result = await service.acquire(req);
+    expect(result.acquired).toBe(false);
+    expect(tables.studios[0].status).toBe('cleaned');
+    expect(tables.studios[0].lease).toBeNull();
+  });
+
+  it('does not disturb a LIVE holder when the worktree is gone (round 8)', async () => {
+    tables.studios[0].lease = freshLease({ sessionId: 'session-live', threadKey: 'pr:200' });
+    tables.studios[0].worktree_path = path.join(tmpdir(), 'live-missing-worktree-xyz');
+    registerActiveRun({
+      sessionId: 'session-live',
+      userId: 'user-1',
+      agentId: 'wren',
+      backend: 'claude-code',
+      startedAt: Date.now(),
+    });
+
+    const result = await service.acquire(req);
+    expect(result.acquired).toBe(false);
+    // Nothing on disk left to protect, but the live holder's lease and the
+    // row's status are left for its own boundary/the sweep to resolve.
+    expect((tables.studios[0].lease as StudioLease).sessionId).toBe('session-live');
+    expect(tables.studios[0].status).toBe('active');
+  });
+
   it('retires a stale holder whose worktree is GONE instead of acquiring it (round 7)', async () => {
     tables.studios[0].lease = staleLease({ threadKey: 'pr:999', sessionId: 'session-dead' });
     tables.studios[0].worktree_path = path.join(tmpdir(), 'definitely-missing-worktree-xyz');

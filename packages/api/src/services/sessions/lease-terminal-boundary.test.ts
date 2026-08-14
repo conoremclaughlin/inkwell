@@ -15,6 +15,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { SessionService } from './session-service';
 import type { Session } from './types';
+import { tmpdir } from 'os';
 import { registerActiveRun, resetActiveRuns } from './active-runs';
 import { LEASE_STALE_MS, type StudioLease } from '../studio-lease.service';
 
@@ -192,7 +193,11 @@ describe('fail-closed routing at the lease boundary', () => {
           id: 'studio-1',
           user_id: 'user-1',
           lease: foreignHolder as unknown as Row,
-          worktree_path: '/nonexistent/worktree',
+          // A REAL directory: this test is about an occupancy conflict, not
+          // a dead studio (a missing worktree would retire the row instead —
+          // see the round-8 missing-cwd tests). Overflow still fails because
+          // repo_root does not exist, which is what this test needs.
+          worktree_path: tmpdir(),
           repo_root: '/nonexistent/repo',
           slug: 'wren-main',
           status: 'active',

@@ -370,19 +370,13 @@ export class StudioLeaseService {
       reason: req.reason,
     };
 
-    // 1) Vacant studio.
-    if (await this.casVacant(req, lease)) {
-      await this.logEvent(req.userId, req.studioId, 'acquired', {
-        sessionId: req.sessionId,
-        threadKey: req.threadKey,
-        agentId: req.agentId,
-        sbId,
-        reason: req.reason,
-      });
-      return { acquired: true, lease };
-    }
-
-    // Occupied (or a race) — read the current holder, user-scoped.
+    // Authoritative read BEFORE any grant. EVERY path below can hand this
+    // studio to a runner, so routability is verified exactly once, here:
+    // the studio exists for this user, its status is acquirable, and its
+    // configured worktree is actually on disk. Validating only inside the
+    // occupied/reclaim paths was the round-8 gap — the vacant fast path
+    // CAS'd first, so an active studio whose worktree had been deleted was
+    // leased straight out to the runner.
     const current = await this.getLease(req.studioId, req.userId);
     if (!current) {
       // Studio doesn't exist for this user — refuse; never treat an
@@ -402,10 +396,17 @@ export class StudioLeaseService {
       });
       return { acquired: false, holder: null };
     }
+    if (current.worktreePath && !(await worktreePresent(current.worktreePath))) {
+      // A configured-but-absent worktree is a dead studio. Never grant it —
+      // vacant, adoptable, or otherwise — and retire it so it stops
+      // circulating. (`removeWorktree: false` closes and externally deleted
+      // directories both produce this state.)
+      await this.retireMissingWorktree(req, current.lease, current.worktreePath);
+      return { acquired: false, holder: null };
+    }
 
     const holder = current.lease;
     if (!holder) {
-      // Released between our CAS and the read — one retry.
       if (await this.casVacant(req, lease)) {
         await this.logEvent(req.userId, req.studioId, 'acquired', {
           sessionId: req.sessionId,
@@ -416,6 +417,7 @@ export class StudioLeaseService {
         });
         return { acquired: true, lease };
       }
+      // Lost the vacant CAS — someone took it between the read and the write.
       const reread = await this.getLease(req.studioId, req.userId);
       if (reread?.lease) {
         return this.resolveOccupied(req, lease, reread.lease, reread.worktreePath);
@@ -424,6 +426,58 @@ export class StudioLeaseService {
     }
 
     return this.resolveOccupied(req, lease, holder, current.worktreePath);
+  }
+
+  /**
+   * Retire a studio whose configured worktree is gone: status cleaned +
+   * lease NULL, in ONE CAS guarded on the exact state we observed (vacant,
+   * or that precise lease). A studio that changed underneath is left alone.
+   *
+   * A LIVE holder is never disturbed — its lease stays and the sweep or its
+   * own boundary deals with it. There is nothing on disk left to protect,
+   * so the point of retiring is only to stop the row being handed out.
+   */
+  private async retireMissingWorktree(
+    req: AcquireRequest,
+    lease: StudioLease | null,
+    worktreePath: string
+  ): Promise<void> {
+    if (lease && (await this.isSessionLive(lease.sessionId, req.userId))) {
+      logger.error('[StudioLease] Acquire refused — worktree is missing under a LIVE holder', {
+        studioId: req.studioId,
+        worktreePath,
+        holderSessionId: lease.sessionId,
+      });
+      return;
+    }
+
+    let query = this.supabase
+      .from('studios')
+      .update({ status: 'cleaned', cleaned_at: new Date().toISOString(), lease: null })
+      .eq('id', req.studioId)
+      .eq('user_id', req.userId);
+    query = lease
+      ? query
+          .eq('lease->>sessionId', lease.sessionId)
+          .eq('lease->>acquiredAt', lease.acquiredAt)
+          .eq('lease->>heartbeatAt', lease.heartbeatAt)
+      : query.is('lease', null);
+
+    const { data } = await query.select('id');
+    if (!data?.length) return;
+
+    logger.warn('[StudioLease] Retired studio with absent worktree', {
+      studioId: req.studioId,
+      worktreePath,
+      hadLease: Boolean(lease),
+    });
+    await this.logEvent(req.userId, req.studioId, 'released', {
+      sessionId: lease?.holderSessionId ?? lease?.sessionId,
+      threadKey: lease?.heldThreadKey ?? lease?.threadKey,
+      agentId: lease?.agentId ?? req.agentId,
+      sbId: lease?.sbId,
+      reason: 'worktree-absent-retired',
+    });
   }
 
   private async casVacant(req: AcquireRequest, lease: StudioLease): Promise<boolean> {
