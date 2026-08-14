@@ -37,6 +37,7 @@ import {
   SPAWN_AGENT_TOOL,
   boundSummary,
   buildClonePrompt,
+  describeCloneToolResult,
   formatFanOutForLedger,
   parseSpawnAgentArgs,
   screenIteration,
@@ -4969,13 +4970,15 @@ export async function runChat(options: ChatOptions): Promise<void> {
           args: result.args,
           status: result.status,
           reason: result.reason,
+          error: result.error,
         });
         results.push({
           tool: result.tool,
-          result:
-            result.status === 'executed' || result.status === 'approved'
-              ? result.result
-              : result.reason,
+          // A thrown tool reports through `error`, a refused one through
+          // `reason` — they are different fields. Reading only `reason` feeds
+          // the clone `Tool read (error): undefined`, which tells it nothing
+          // about what went wrong and invites a blind retry.
+          result: describeCloneToolResult(result),
           status: result.status,
           args: result.args,
         });

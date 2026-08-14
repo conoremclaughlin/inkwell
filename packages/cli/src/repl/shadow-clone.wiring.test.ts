@@ -26,7 +26,7 @@ import { ApprovalCoordinator, type ApprovalTicket } from './approval-coordinator
 import { callPiTool, isPiTool } from './pi-tools.js';
 import { isClientLocalTool, handleClientLocalTool } from './context-tools.js';
 import { ContextLedger } from './context-ledger.js';
-import { boundSummary, screenIteration } from './spawn-agent.js';
+import { boundSummary, describeCloneToolResult, screenIteration } from './spawn-agent.js';
 import type { PcpToolCallResult } from '../lib/pcp-client.js';
 
 let workdir: string;
@@ -71,7 +71,12 @@ function buildClone(opts: {
   const refused: Array<{ tool: string; status: string }> = [];
   let turnIndex = 0;
 
-  const runTurn = async (): Promise<BackendTurnOutcome> => {
+  const continuations: string[] = [];
+  const runTurn = async (
+    body: string,
+    turnCtx: { isContinuation: boolean }
+  ): Promise<BackendTurnOutcome> => {
+    if (turnCtx.isContinuation) continuations.push(body);
     const index = turnIndex++;
     if (opts.failAfter !== undefined && index >= opts.failAfter) {
       return { success: false, stdout: '', stderr: 'backend exploded', exitCode: 1 };
@@ -81,7 +86,15 @@ function buildClone(opts: {
 
   const run = () =>
     runAgentLoop(
-      { prompt: 'clone prompt', toolRouting: 'local', signal: opts.signal },
+      {
+        prompt: 'clone prompt',
+        toolRouting: 'local',
+        signal: opts.signal,
+        // What chat.ts gives a real clone. Without it the harness diverges from
+        // production on exactly the path that matters here — a refused call
+        // ending the clone's turn instead of being fed back.
+        continueOnBlocked: true,
+      },
       {
         ui: { printLine: () => {}, printEvent: () => {}, startWaiting: () => () => {} },
         tools: {
@@ -133,7 +146,9 @@ function buildClone(opts: {
                 }
                 results.push({
                   tool: result.tool,
-                  result: result.result ?? result.reason,
+                  // Same helper chat.ts uses — a mirror here could pass while
+                  // the real mapping drifted.
+                  result: describeCloneToolResult(result),
                   status: result.status,
                   args: result.args,
                 });
@@ -146,7 +161,7 @@ function buildClone(opts: {
       }
     );
 
-  return { run, policy, executed, refused };
+  return { run, policy, executed, refused, continuations };
 }
 
 describe('shadow clone wiring', () => {
@@ -367,6 +382,28 @@ describe('shadow clone wiring', () => {
     expect(settled[1].status === 'fulfilled' && settled[1].value.stopReason).toBe(
       'backend-failure'
     );
+  });
+
+  it('tells a clone what a thrown tool actually said', async () => {
+    const parent = new ToolPolicyState('backend', { persist: false });
+    const coordinator = new ApprovalCoordinator({ concurrency: 1, prompt: async () => false });
+
+    const clone = buildClone({
+      parent,
+      coordinator,
+      cloneId: 'clone-1',
+      cloneLabel: 'read a missing file',
+      turns: [inkTool('read', { path: 'does-not-exist.ts' }), doneSignal],
+    });
+
+    await clone.run();
+
+    // A thrown tool reports through `error`, a refused one through `reason`.
+    // Reading only `reason` fed the clone "Tool read (error): undefined".
+    expect(clone.refused).toEqual([{ tool: 'read', status: 'error' }]);
+    const fed = clone.continuations.find((body) => body.includes('Tool read (error)'));
+    expect(fed).toBeDefined();
+    expect(fed).not.toContain('(error): undefined');
   });
 
   it('a clone cannot spend the parent one-use grant', async () => {

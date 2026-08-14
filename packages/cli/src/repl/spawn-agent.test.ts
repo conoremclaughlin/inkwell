@@ -5,6 +5,7 @@ import {
   SPAWN_AGENT_TOOL,
   boundSummary,
   buildClonePrompt,
+  describeCloneToolResult,
   formatFanOutForLedger,
   parseSpawnAgentArgs,
   screenIteration,
@@ -158,5 +159,31 @@ describe('formatFanOutForLedger', () => {
   it('says so plainly when a clone returned nothing', () => {
     const rendered = formatFanOutForLedger([{ id: 'clone-1', label: 'x', status: 'completed' }]);
     expect(rendered).toContain('(no summary returned)');
+  });
+});
+
+describe('describeCloneToolResult', () => {
+  it('passes the payload through when the call ran', () => {
+    const payload = { content: [{ type: 'text', text: 'file contents' }] };
+    expect(describeCloneToolResult({ status: 'executed', result: payload })).toBe(payload);
+    expect(describeCloneToolResult({ status: 'approved', result: payload })).toBe(payload);
+  });
+
+  it('reports a refusal from reason', () => {
+    expect(
+      describeCloneToolResult({ status: 'blocked', reason: 'Tool is explicitly denied by policy.' })
+    ).toBe('Tool is explicitly denied by policy.');
+  });
+
+  it('reports a thrown tool from error, which lives in a different field', () => {
+    // Reading only `reason` here yields undefined, and a clone told
+    // "Tool read (error): undefined" learns nothing and retries blind.
+    expect(describeCloneToolResult({ status: 'error', error: 'ENOENT: no such file' })).toBe(
+      'ENOENT: no such file'
+    );
+  });
+
+  it('never hands back undefined, whatever the executor omitted', () => {
+    expect(describeCloneToolResult({ status: 'error' })).toBe('Tool call error (no detail given).');
   });
 });

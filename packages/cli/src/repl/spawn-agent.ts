@@ -169,6 +169,25 @@ export function boundSummary(text: string, limit = MAX_CLONE_SUMMARY_CHARS): str
   return `${trimmed.slice(0, limit)}\n…[truncated ${trimmed.length - limit} chars — full transcript on disk]`;
 }
 
+/**
+ * What a clone should be told about one of its own tool calls.
+ *
+ * The executor reports failure through two different fields — `reason` when a
+ * call was refused by policy or denied by the user, `error` when the tool itself
+ * threw — and a clone that reads only one of them gets `undefined` for the
+ * other. Undefined is worse than useless here: it invites a blind retry of a
+ * call that will fail the same way.
+ */
+export function describeCloneToolResult(result: {
+  status: string;
+  result?: unknown;
+  reason?: string;
+  error?: string;
+}): unknown {
+  if (result.status === 'executed' || result.status === 'approved') return result.result;
+  return result.reason ?? result.error ?? `Tool call ${result.status} (no detail given).`;
+}
+
 export interface CloneOutcomeSummary {
   id: string;
   label: string;
