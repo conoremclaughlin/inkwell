@@ -897,6 +897,15 @@ export class SessionService implements ISessionService {
     // channel plugin to deliver, but none runs for headless sessions).
     const postRunLifecycle = result.success ? 'idle' : 'failed';
 
+    // The model that served this turn, as the backend reported it on its own
+    // top-level assistant messages. Not the model we requested (CLI defaults,
+    // aliases and fallbacks all diverge from it) and not inferred from token
+    // volume (a chatty subagent out-writes the parent, which would record the
+    // wrong model). The column means "most recent main model" — one session
+    // can span several — while metadata.modelUsage keeps the per-model
+    // history including cost (Lumen, PR #493 rounds 2-3).
+    const servedModel = result.servedModel;
+
     // A runner can return after the shutdown drain has already snapshotted and
     // interrupted this session. Because repository.update() rewrites the whole
     // metadata blob from a snapshot taken at its own start, finalizing now
@@ -921,6 +930,7 @@ export class SessionService implements ISessionService {
           backendSessionId: result.backendSessionId,
           messageCount: session.messageCount + 1,
           backend: resolvedBackend,
+          ...(servedModel ? { model: servedModel } : {}),
           lifecycle: postRunLifecycle as Session['lifecycle'],
           cliAttached: false,
         })
@@ -931,6 +941,7 @@ export class SessionService implements ISessionService {
         this.repository.update(session.id, {
           messageCount: session.messageCount + 1,
           backend: resolvedBackend,
+          ...(servedModel ? { model: servedModel } : {}),
           lifecycle: postRunLifecycle as Session['lifecycle'],
           cliAttached: false,
         })
@@ -967,6 +978,9 @@ export class SessionService implements ISessionService {
           contextTokens: result.usage.contextTokens,
           inputTokens: result.usage.inputTokens,
           outputTokens: result.usage.outputTokens,
+          cacheReadTokens: result.usage.cacheReadTokens,
+          cacheWriteTokens: result.usage.cacheWriteTokens,
+          modelUsage: result.usage.modelUsage,
           cumulative: result.usage.cumulative,
         },
         { backendSessionId: result.backendSessionId ?? session.backendSessionId ?? null }
@@ -1223,10 +1237,14 @@ export class SessionService implements ISessionService {
       contextTokens: 0,
       totalInputTokens: 0,
       totalOutputTokens: 0,
+      totalCacheReadTokens: 0,
+      totalCacheWriteTokens: 0,
       messageCount: 0,
       tokenCount: 0,
       backend,
-      model: null, // Set explicitly when known; runner model != verified session model
+      // Null until a turn runs — the model that actually served the turn is
+      // recorded post-run, so this never claims a model that was only asked for.
+      model: null,
       lastCompactionAt: null,
       compactionCount: 0,
       endedAt: null,
