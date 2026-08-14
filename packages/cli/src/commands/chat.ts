@@ -28,6 +28,7 @@ import {
   formatCloneLine,
   isSettled,
   type CloneRecord,
+  type CloneStatus,
 } from '../repl/clone-registry.js';
 import {
   COLLECT_AGENTS_TOOL,
@@ -4825,20 +4826,65 @@ export async function runChat(options: ChatOptions): Promise<void> {
         iterations: result.iterations,
         summary,
       });
+      const status =
+        result.stopReason === 'aborted' ? 'aborted' : result.success ? 'completed' : 'failed';
       cloneRegistry.update(record.id, {
-        status: result.success ? 'completed' : 'failed',
+        status,
         stopReason: result.stopReason,
         iterations: result.iterations,
         toolCalls: cloneToolCalls,
         summary,
-        ...(result.stopReason === 'aborted' ? { status: 'aborted' as const } : {}),
         ...(result.success ? {} : { error: `backend ${result.stopReason}` }),
+      });
+      logCloneActivity(record.id, status, {
+        stopReason: result.stopReason,
+        iterations: result.iterations,
+        toolCalls: cloneToolCalls,
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       appendTranscript(record.transcriptPath, { type: 'clone_error', error: message });
       cloneRegistry.update(record.id, { status: 'failed', error: message });
+      logCloneActivity(record.id, 'failed', { error: message });
     }
+  };
+
+  /**
+   * Publish a clone's outcome to the activity stream.
+   *
+   * `sessionId` is the PARENT's, and `payload.cloneId` names the fork. That is
+   * what lets the graph show a clone's work hanging off the turn that asked for
+   * it, rather than as orphan activity from nowhere. Best-effort: a clone's
+   * result is already safe on disk and in the registry, so a failed log line
+   * must never take the clone down with it.
+   */
+  const logCloneActivity = (
+    cloneId: string,
+    status: CloneStatus,
+    payload: Record<string, unknown>
+  ): void => {
+    const record = cloneRegistry.get(cloneId);
+    if (!record || !runtime.sessionId) return;
+    void pcp
+      .callTool('log_activity', {
+        agentId,
+        type: status === 'completed' ? 'agent_complete' : 'error',
+        subtype: 'shadow_clone',
+        content: `🌀 ${record.id} (${record.label}) — ${status}`,
+        sessionId: runtime.sessionId,
+        status,
+        payload: {
+          cloneId: record.id,
+          cloneLabel: record.label,
+          parentSessionId: record.parentSessionId,
+          transcriptPath: record.transcriptPath,
+          studioId: runtime.studioId,
+          ...payload,
+        },
+      })
+      .catch(() => {
+        // Activity logging is observability, not the work.
+      });
   };
 
   /**
@@ -6510,6 +6556,19 @@ export async function runChat(options: ChatOptions): Promise<void> {
     });
     inkRepl.setStatus(initialSummary);
     lastStatusSummary = initialSummary;
+
+    // Background clones are invisible otherwise — they run while the user is
+    // typing, reading, or on another session, and nothing in the chat stream
+    // would say so. The info bar is the standing reminder that work is in
+    // flight; `/clones` is the way in.
+    cloneRegistry.onChange(() => {
+      const running = cloneRegistry.runningCount;
+      inkRepl?.setInfoItems(
+        running > 0
+          ? [...initialInfoItems, `🌀 ${running} clone${running === 1 ? '' : 's'}`]
+          : initialInfoItems
+      );
+    });
 
     // Register Ctrl+O handler — opens context viewer via React state
     inkRepl.handle.setCtrlOHandler(() => {
