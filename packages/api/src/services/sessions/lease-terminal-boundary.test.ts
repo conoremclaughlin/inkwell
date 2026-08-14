@@ -278,6 +278,8 @@ describe('terminal-boundary release', () => {
       inbox_threads: [],
       channel_routes: [],
       agent_identities: [],
+      // The holder session is terminal in the DB — endSession stamped it.
+      sessions: [{ id: sessionId, user_id: 'user-1', ended_at: new Date().toISOString() }],
     };
   }
 

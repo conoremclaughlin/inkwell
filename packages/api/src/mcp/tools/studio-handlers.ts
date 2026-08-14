@@ -546,9 +546,10 @@ export async function handleCloseStudio(args: unknown, dataComposer: DataCompose
   const { studioId, agentId, removeWorktree = true, deleteBranch = false } = parsed;
   const studiosRepo = dataComposer.repositories.studios;
 
-  // Verify studio exists
+  // Verify studio exists AND belongs to the closing user — repository lookups
+  // are id-only, and close is destructive.
   const studio = await studiosRepo.findById(studioId);
-  if (!studio) {
+  if (!studio || studio.userId !== closingUser.id) {
     return errorResponse(`Studio not found: ${studioId}`);
   }
 
@@ -560,14 +561,14 @@ export async function handleCloseStudio(args: unknown, dataComposer: DataCompose
 
   // Release any lease before touching the worktree — closing the studio is a
   // terminal act for its occupant, and release captures final branch/commit
-  // state while the worktree still exists. A holder whose process is still
-  // LIVE refuses the whole close: removing the worktree under a running turn
-  // is exactly the stomp the lease exists to prevent. The lease is marked
-  // pendingRelease so the holder's boundary frees it; re-run close after.
-  const releaseOutcome = await new StudioLeaseService(dataComposer.getClient())
+  // state while the worktree still exists. A holder without a safe
+  // terminal/stale proof refuses the whole close (lease marked
+  // pendingRelease; re-run close after the holder's boundary frees it).
+  const leaseService = new StudioLeaseService(dataComposer.getClient());
+  const releaseOutcome = await leaseService
     .releaseByStudio(studioId, { userId: closingUser.id, reason: 'studio-closed' })
     .catch((leaseErr: unknown) => {
-      logger.warn('[StudioLease] Release on close_studio failed (non-fatal)', {
+      logger.warn('[StudioLease] Release on close_studio failed', {
         studioId,
         error: leaseErr instanceof Error ? leaseErr.message : String(leaseErr),
       });
@@ -578,61 +579,97 @@ export async function handleCloseStudio(args: unknown, dataComposer: DataCompose
       `Studio ${studioId} is in use by a live session. Its lease is marked for release at the holder's turn boundary — close the studio again once the session has finished.`
     );
   }
+  // 'none' is NOT proof of vacancy — it also covers quarantine, a lost CAS,
+  // and the caught release error. Never destroy on ambiguity.
+  const residual = await leaseService.getLease(studioId, closingUser.id);
+  if (residual?.lease) {
+    return errorResponse(
+      `Studio ${studioId} has a ${residual.lease.quarantined ? 'quarantined' : 'contended'} lease; refusing to close. Resolve the lease state first.`
+    );
+  }
 
-  // Remove the git worktree
-  if (removeWorktree) {
-    try {
-      execSync(`git worktree remove ${studio.worktreePath}`, {
-        cwd: studio.repoRoot,
-        stdio: 'pipe',
-      });
+  // Fence the destructive window: hold a unique teardown claim across
+  // removal and mark-cleaned so no acquire can win the studio between the
+  // release above and the removal below.
+  const claim = await leaseService.claimForTeardown(studioId, closingUser.id, {
+    reason: 'close_studio',
+  });
+  if (!claim) {
+    return errorResponse(
+      `Studio ${studioId} became occupied while closing; aborting. Retry once it is free.`
+    );
+  }
+
+  try {
+    // Remove the git worktree
+    if (removeWorktree) {
+      // Token revalidation immediately before destruction.
+      if (!(await leaseService.verifyClaim(studioId, closingUser.id, claim))) {
+        return errorResponse(`Studio ${studioId} teardown claim was lost; aborting close.`);
+      }
+      try {
+        execSync(`git worktree remove ${studio.worktreePath}`, {
+          cwd: studio.repoRoot,
+          stdio: 'pipe',
+        });
+        cleanupResults.worktreeRemoved = true;
+      } catch (worktreeError) {
+        const errorMessage =
+          worktreeError instanceof Error ? worktreeError.message : String(worktreeError);
+        logger.warn('Failed to remove worktree (may already be gone)', {
+          worktreePath: studio.worktreePath,
+          error: errorMessage,
+        });
+        cleanupResults.errors.push(`Worktree removal: ${errorMessage}`);
+      }
+      // Only a confirmed-absent worktree may be recorded as cleaned.
+      if (!cleanupResults.worktreeRemoved && existsSync(studio.worktreePath)) {
+        return errorResponse(
+          `Worktree removal failed and ${studio.worktreePath} still exists; studio NOT marked cleaned. Errors: ${cleanupResults.errors.join('; ')}`
+        );
+      }
       cleanupResults.worktreeRemoved = true;
-    } catch (worktreeError) {
-      const errorMessage =
-        worktreeError instanceof Error ? worktreeError.message : String(worktreeError);
-      logger.warn('Failed to remove worktree (may already be gone)', {
-        worktreePath: studio.worktreePath,
-        error: errorMessage,
-      });
-      cleanupResults.errors.push(`Worktree removal: ${errorMessage}`);
     }
-  }
 
-  // Delete the branch
-  if (deleteBranch) {
-    try {
-      execSync(`git branch -d ${studio.branch}`, {
-        cwd: studio.repoRoot,
-        stdio: 'pipe',
-      });
-      cleanupResults.branchDeleted = true;
-    } catch (branchError) {
-      const errorMessage = branchError instanceof Error ? branchError.message : String(branchError);
-      logger.warn('Failed to delete branch', {
-        branch: studio.branch,
-        error: errorMessage,
-      });
-      cleanupResults.errors.push(`Branch deletion: ${errorMessage}`);
+    // Delete the branch
+    if (deleteBranch) {
+      try {
+        execSync(`git branch -d ${studio.branch}`, {
+          cwd: studio.repoRoot,
+          stdio: 'pipe',
+        });
+        cleanupResults.branchDeleted = true;
+      } catch (branchError) {
+        const errorMessage =
+          branchError instanceof Error ? branchError.message : String(branchError);
+        logger.warn('Failed to delete branch', {
+          branch: studio.branch,
+          error: errorMessage,
+        });
+        cleanupResults.errors.push(`Branch deletion: ${errorMessage}`);
+      }
     }
+
+    // Mark as cleaned in the database (ownership verified above)
+    const updated = await studiosRepo.markCleaned(studioId);
+
+    logger.info('Studio closed', {
+      studioId,
+      agentId,
+      worktreeRemoved: cleanupResults.worktreeRemoved,
+      branchDeleted: cleanupResults.branchDeleted,
+    });
+
+    return successResponse({
+      message: 'Studio closed and marked as cleaned',
+      studioId: updated.id,
+      status: updated.status,
+      cleanedAt: updated.cleanedAt,
+      cleanup: cleanupResults,
+    });
+  } finally {
+    await leaseService.clearTeardownClaim(studioId, closingUser.id, claim).catch(() => undefined);
   }
-
-  // Mark as cleaned in the database
-  const updated = await studiosRepo.markCleaned(studioId);
-
-  logger.info('Studio closed', {
-    studioId,
-    agentId,
-    worktreeRemoved: cleanupResults.worktreeRemoved,
-    branchDeleted: cleanupResults.branchDeleted,
-  });
-
-  return successResponse({
-    message: 'Studio closed and marked as cleaned',
-    studioId: updated.id,
-    status: updated.status,
-    cleanedAt: updated.cleanedAt,
-    cleanup: cleanupResults,
-  });
 }
 
 export async function handleAdoptStudio(args: unknown, dataComposer: DataComposer) {

@@ -1507,6 +1507,7 @@ export class MemoryRepository {
       workingDir?: string;
       cliAttached?: boolean;
       cliPollAt?: string;
+      cliTurnAt?: string | null;
       alias?: string | null;
       activeThreadKey?: string | null;
       endedAt?: Date | null;
@@ -1540,6 +1541,9 @@ export class MemoryRepository {
     }
     if (updates.cliPollAt !== undefined) {
       (dbUpdates as Record<string, unknown>).cli_poll_at = updates.cliPollAt;
+    }
+    if (updates.cliTurnAt !== undefined) {
+      (dbUpdates as Record<string, unknown>).cli_turn_at = updates.cliTurnAt;
     }
     if (updates.alias !== undefined) {
       (dbUpdates as Record<string, unknown>).alias = updates.alias;

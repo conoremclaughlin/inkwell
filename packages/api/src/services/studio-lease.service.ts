@@ -239,24 +239,45 @@ export class StudioLeaseService {
   }
 
   /**
-   * Is the session's process still executing in a worktree? Covers both
-   * server-spawned runners (in-process registry) and interactively attached
-   * CLI turns. CLI liveness is `cli_attached` + fresh `cli_poll_at` — a
-   * timestamp only the CLI's own polling stamps, so a terminal API updating
-   * the row cannot make a dead flag look alive.
+   * Is the session's process still executing in a worktree? Covers:
+   *   - server-spawned runners (in-process registry)
+   *   - attached CLIs with the channel plugin (`cli_poll_at`, a fine-grained
+   *     heartbeat only the plugin stamps)
+   *   - attached CLIs WITHOUT the plugin (`cli_turn_at`, the hook-owned turn
+   *     signal: stamped by on-prompt, cleared only by the real on-stop —
+   *     terminal APIs never touch it, so a terminal write can neither
+   *     resurrect a dead flag nor hide a live turn)
+   * The turn signal is bounded by LEASE_STALE_MS so a CLI that crashed
+   * mid-turn stops blocking after the staleness window; the rescue stash
+   * protects its work if the lease is then reclaimed.
    */
   async isSessionLive(sessionId: string, userId?: string): Promise<boolean> {
     if (hasActiveRun(sessionId)) return true;
     let query = this.supabase
       .from('sessions')
-      .select('cli_attached, cli_poll_at')
+      .select('cli_attached, cli_poll_at, cli_turn_at')
       .eq('id', sessionId);
     if (userId) query = query.eq('user_id', userId);
     const { data } = await query.maybeSingle();
     if (!data?.cli_attached) return false;
     const polledAt = Date.parse(data.cli_poll_at ?? '');
-    if (Number.isNaN(polledAt)) return false;
-    return Date.now() - polledAt < CLI_ATTACHED_FRESH_MS;
+    if (!Number.isNaN(polledAt) && Date.now() - polledAt < CLI_ATTACHED_FRESH_MS) return true;
+    const turnAt = Date.parse(data.cli_turn_at ?? '');
+    if (!Number.isNaN(turnAt) && Date.now() - turnAt < LEASE_STALE_MS) return true;
+    return false;
+  }
+
+  /**
+   * May this lease be released right now, with its holder provably out of
+   * the worktree? Presumes a fresh non-terminal holder LIVE — the admission
+   * gap (a session wins its lease before its run registers) makes "not live
+   * right now" an unsafe proof for fresh leases. Release-now requires:
+   * not live AND (lease stale OR session terminal).
+   */
+  private async canReleaseNow(lease: StudioLease, userId?: string): Promise<boolean> {
+    if (await this.isSessionLive(lease.sessionId, userId)) return false;
+    if (isLeaseStale(lease)) return true;
+    return this.isSessionTerminal(lease.sessionId, userId);
   }
 
   /** Has the session durably ended? (ended_at stamped or status completed) */
@@ -416,10 +437,12 @@ export class StudioLeaseService {
   }
 
   /**
-   * Fence-then-rescue against an exact observed holder. Wins the claim (or
-   * returns not-acquired), then takes the safe ref. A failed rescue converts
-   * the claim into a durable quarantine — the studio is never handed out and
-   * never returns to vacancy without a verified rescue.
+   * Fence-then-rescue against an exact observed holder. The fence is a
+   * RECOVERY CLAIM (quarantined, unique token) — never the requester's normal
+   * lease, which duplicate acquires could adopt and close paths could clear
+   * mid-rescue. Only after a verified rescue does the claim hand over to the
+   * requester's lease, CAS-guarded on the claim's own token. A failed rescue
+   * leaves that exact claim in place as the durable quarantine.
    */
   private async claimAndRescue(
     req: AcquireRequest,
@@ -428,7 +451,8 @@ export class StudioLeaseService {
     worktreePath: string | undefined,
     eventReason: string
   ): Promise<AcquireResult> {
-    const claimed = await this.casLease(req.studioId, req.userId, holder, lease);
+    const recovery = this.claimRecord(holder, 'recovery', 'recovery:in-progress');
+    const claimed = await this.casLease(req.studioId, req.userId, holder, recovery);
     if (!claimed) {
       const reread = await this.getLease(req.studioId, req.userId);
       return { acquired: false, holder: reread?.lease ?? holder };
@@ -440,18 +464,17 @@ export class StudioLeaseService {
         rescueLabel: holder.heldThreadKey ?? holder.threadKey,
       });
       if (!rescueSucceeded(rescue)) {
-        // QUARANTINE: convert our claim into a durable non-vacant,
-        // non-adoptable state. Only a verified rescue clears it.
-        const quarantine = this.claimRecord(holder, 'recovery', 'quarantine:rescue-failed');
-        await this.casLease(req.studioId, req.userId, lease, quarantine);
+        // The recovery claim IS the durable quarantine: non-vacant,
+        // non-adoptable, retried once stale. Nothing to CAS — we already
+        // hold it, so no concurrent mutation can strip the quarantine.
         logger.error('[StudioLease] Rescue failed — studio quarantined', {
           studioId: req.studioId,
           previousHolder: { sessionId: holder.sessionId, threadKey: holder.threadKey },
           rescue,
         });
         await this.logEvent(req.userId, req.studioId, 'conflict', {
-          sessionId: holder.holderSessionId ?? holder.sessionId,
-          threadKey: holder.heldThreadKey ?? holder.threadKey,
+          sessionId: recovery.holderSessionId,
+          threadKey: recovery.heldThreadKey,
           agentId: holder.agentId,
           sbId: holder.sbId,
           reason: 'rescue-failed-quarantined',
@@ -460,7 +483,19 @@ export class StudioLeaseService {
             rescue: rescue as unknown as Json,
           },
         });
-        return { acquired: false, holder: quarantine };
+        return { acquired: false, holder: recovery };
+      }
+
+      // Hand over: claim (our token) → requester's lease. Losing this CAS
+      // means the claim aged out and was taken — abort, never assume.
+      const handedOver = await this.casLease(req.studioId, req.userId, recovery, lease);
+      if (!handedOver) {
+        logger.error('[StudioLease] Recovery claim lost before handover; refusing', {
+          studioId: req.studioId,
+          requestingSessionId: req.sessionId,
+        });
+        const reread = await this.getLease(req.studioId, req.userId);
+        return { acquired: false, holder: reread?.lease ?? null };
       }
 
       logger.warn('[StudioLease] Reclaimed lease after verified rescue', {
@@ -483,7 +518,12 @@ export class StudioLeaseService {
       return { acquired: true, lease, reclaimedFrom: holder };
     }
 
-    // No worktree to rescue — the claim stands as the acquisition.
+    // No worktree to rescue — hand the claim straight over.
+    const handedOver = await this.casLease(req.studioId, req.userId, recovery, lease);
+    if (!handedOver) {
+      const reread = await this.getLease(req.studioId, req.userId);
+      return { acquired: false, holder: reread?.lease ?? null };
+    }
     await this.logEvent(req.userId, req.studioId, 'reclaimed', {
       sessionId: req.sessionId,
       threadKey: req.threadKey,
@@ -521,21 +561,33 @@ export class StudioLeaseService {
     //    does not mean "not about to run". Presume a fresh lease live.
     if (holder.threadKey === req.threadKey) {
       if (holder.sessionId !== req.sessionId) {
-        const terminal = await this.isSessionTerminal(holder.sessionId, req.userId);
-        if (!terminal) {
-          if (!isLeaseStale(holder)) {
-            logger.warn('[StudioLease] Adoption refused — holder is not terminal', {
-              studioId: req.studioId,
-              threadKey: req.threadKey,
-              holderSessionId: holder.sessionId,
-              requestingSessionId: req.sessionId,
-            });
-            return { acquired: false, holder };
-          }
-          if (await this.isSessionLive(holder.sessionId, req.userId)) {
+        // Liveness first: a TERMINAL DB row is not proof the process has left
+        // the worktree — end_session stamps terminal state from inside an
+        // active turn. Only the boundary clearing the process signals makes
+        // the studio movable.
+        if (await this.isSessionLive(holder.sessionId, req.userId)) {
+          if (isLeaseStale(holder)) {
             await this.renewBySession(holder.sessionId, req.userId);
-            return { acquired: false, holder };
           }
+          logger.warn('[StudioLease] Adoption refused — holder process is live', {
+            studioId: req.studioId,
+            threadKey: req.threadKey,
+            holderSessionId: holder.sessionId,
+            requestingSessionId: req.sessionId,
+          });
+          return { acquired: false, holder };
+        }
+        const terminal = await this.isSessionTerminal(holder.sessionId, req.userId);
+        if (!terminal && !isLeaseStale(holder)) {
+          // Fresh, non-terminal, "not live right now" — the admission gap
+          // makes that unprovable. Presume live; refuse.
+          logger.warn('[StudioLease] Adoption refused — holder is not terminal', {
+            studioId: req.studioId,
+            threadKey: req.threadKey,
+            holderSessionId: holder.sessionId,
+            requestingSessionId: req.sessionId,
+          });
+          return { acquired: false, holder };
         }
       }
       const adopted: StudioLease = {
@@ -613,14 +665,25 @@ export class StudioLeaseService {
     sessionId: string,
     opts: { userId?: string; reason?: string } = {}
   ): Promise<boolean> {
-    if (await this.isSessionLive(sessionId, opts.userId)) {
-      logger.info('[StudioLease] Release deferred — session process is still live', {
+    let query = this.supabase
+      .from('studios')
+      .select('id, user_id, lease, worktree_path')
+      .eq('lease->>sessionId', sessionId);
+    if (opts.userId) query = query.eq('user_id', opts.userId);
+    const { data } = await query.limit(1).maybeSingle();
+    const lease = parseStudioLease(data?.lease);
+    if (!data || !lease || lease.quarantined) return false;
+
+    if (!(await this.canReleaseNow(lease, opts.userId ?? data.user_id))) {
+      logger.info('[StudioLease] Release deferred — no safe terminal/stale proof yet', {
         sessionId,
         reason: opts.reason,
       });
       return false;
     }
-    return this.releaseBySession(sessionId, opts);
+    return this.releaseStudio(data.id, data.user_id, lease, data.worktree_path, {
+      reason: opts.reason ?? 'session-end',
+    });
   }
 
   /**
@@ -692,7 +755,9 @@ export class StudioLeaseService {
     const lease = parseStudioLease(data?.lease);
     if (!data || !lease || lease.quarantined) return 'none';
 
-    if (await this.isSessionLive(lease.sessionId, opts.userId)) {
+    // Same conservative rule as adoption: a fresh non-terminal holder is
+    // presumed live (admission gap) — defer, never clear.
+    if (!(await this.canReleaseNow(lease, opts.userId))) {
       const marked = await this.markPendingRelease(
         data.id,
         data.user_id,
@@ -732,7 +797,9 @@ export class StudioLeaseService {
       const lease = parseStudioLease(row.lease);
       if (!lease || lease.quarantined) continue;
 
-      if (await this.isSessionLive(lease.sessionId, userId)) {
+      // Same conservative rule as adoption: a fresh non-terminal holder is
+      // presumed live (admission gap) — defer, never clear.
+      if (!(await this.canReleaseNow(lease, userId))) {
         const marked = await this.markPendingRelease(
           row.id,
           row.user_id,
@@ -902,9 +969,10 @@ export class StudioLeaseService {
       if (!lease) continue;
 
       // Deferred-release backstop: the boundary should have completed this,
-      // but a killed CLI or crashed server never fires its boundary.
+      // but a killed CLI or crashed server never fires its boundary. Same
+      // release-now proof as everywhere else.
       if (lease.pendingRelease && !lease.quarantined) {
-        if (!(await this.isSessionLive(lease.sessionId, row.user_id))) {
+        if (await this.canReleaseNow(lease, row.user_id)) {
           const ok = await this.releaseStudio(row.id, row.user_id, lease, row.worktree_path, {
             reason: lease.pendingRelease.reason,
           });
@@ -1034,8 +1102,10 @@ export class StudioLeaseService {
     }
 
     if (opts.expectedThreadKey && holder.threadKey === opts.expectedThreadKey) {
-      if (await this.isSessionLive(holder.sessionId, userId)) {
-        logger.warn('[StudioLease] Teardown claim refused — holder session is live', {
+      // Same release-now proof as everywhere else: a fresh non-terminal
+      // holder is presumed live (admission gap) — never torn down under it.
+      if (!(await this.canReleaseNow(holder, userId))) {
+        logger.warn('[StudioLease] Teardown claim refused — holder lacks terminal/stale proof', {
           studioId,
           holderSessionId: holder.sessionId,
         });

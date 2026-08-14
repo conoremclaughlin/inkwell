@@ -244,6 +244,68 @@ describe('StudioLeaseService.acquire', () => {
     expect(tables.studio_lease_events).toHaveLength(0);
   });
 
+  it('refuses adoption from a TERMINAL holder whose process is still running (round 4)', async () => {
+    // end_session stamps terminal state from INSIDE the active turn — the
+    // DB row is terminal but the process has not left the worktree.
+    tables.studios[0].lease = freshLease({ sessionId: 'session-old', threadKey: 'pr:200' });
+    tables.sessions.push({
+      id: 'session-old',
+      user_id: 'user-1',
+      ended_at: new Date().toISOString(),
+      status: 'completed',
+    });
+    registerActiveRun({
+      sessionId: 'session-old',
+      userId: 'user-1',
+      agentId: 'wren',
+      backend: 'claude-code',
+      startedAt: Date.now(),
+    });
+
+    const result = await service.acquire(req);
+    expect(result.acquired).toBe(false);
+    expect((tables.studios[0].lease as StudioLease).sessionId).toBe('session-old');
+  });
+
+  it('refuses adoption from a TERMINAL holder with an open CLI turn (round 4)', async () => {
+    tables.studios[0].lease = freshLease({ sessionId: 'session-old', threadKey: 'pr:200' });
+    tables.sessions.push({
+      id: 'session-old',
+      user_id: 'user-1',
+      ended_at: new Date().toISOString(),
+      status: 'completed',
+      cli_attached: true,
+      cli_turn_at: new Date().toISOString(), // on-prompt fired, no on-stop yet
+    });
+
+    const result = await service.acquire(req);
+    expect(result.acquired).toBe(false);
+    expect((tables.studios[0].lease as StudioLease).sessionId).toBe('session-old');
+  });
+
+  it('treats the hook-owned turn signal as liveness for no-plugin CLIs (round 4)', async () => {
+    // cli_poll_at never set (no channel plugin) — cli_turn_at alone must keep
+    // the session live mid-turn, and a stale turn signal must not.
+    tables.studios[0].lease = staleLease({ sessionId: 'session-noplugin', threadKey: 'pr:999' });
+    tables.sessions.push({
+      id: 'session-noplugin',
+      user_id: 'user-1',
+      cli_attached: true,
+      cli_poll_at: null,
+      cli_turn_at: new Date().toISOString(),
+    });
+
+    const mid = await service.acquire(req);
+    expect(mid.acquired).toBe(false);
+    expect((tables.studios[0].lease as StudioLease).sessionId).toBe('session-noplugin');
+
+    // Turn signal aged out (crashed CLI) — reclaim may proceed.
+    tables.sessions[0].cli_turn_at = new Date(Date.now() - LEASE_STALE_MS - 60_000).toISOString();
+    tables.studios[0].lease = staleLease({ sessionId: 'session-noplugin', threadKey: 'pr:999' });
+    const after = await service.acquire(req);
+    expect(after.acquired).toBe(true);
+  });
+
   it('refuses adoption from a fresh non-terminal holder — the admission gap (round 3)', async () => {
     // The holder session exists, is NOT terminal, and is NOT in the run
     // registry — exactly the window between acquire and registerActiveRun.
@@ -492,7 +554,12 @@ describe('StudioLeaseService release paths', () => {
       studio_lease_events: [],
       inbox_threads: [],
       agent_identities: [],
-      sessions: [],
+      // Holder sessions are terminal (ended) — the common release scenario.
+      // Fresh NON-terminal holders defer instead; see the admission-gap test.
+      sessions: [
+        { id: 'session-a', user_id: 'user-1', ended_at: new Date().toISOString() },
+        { id: 'session-b', user_id: 'user-1', ended_at: new Date().toISOString() },
+      ],
     };
     service = new StudioLeaseService(makeFakeSupabase(tables));
   });
@@ -537,33 +604,68 @@ describe('StudioLeaseService release paths', () => {
   it('releaseUnlessRunning defers for a freshly-polling CLI session (round 2)', async () => {
     // The registry cannot see interactive CLI turns; cli_poll_at can — and
     // only the CLI itself stamps it.
-    tables.sessions.push({
-      id: 'session-a',
-      user_id: 'user-1',
+    Object.assign(tables.sessions[0], {
       cli_attached: true,
       cli_poll_at: new Date().toISOString(),
     });
     expect(await service.releaseUnlessRunning('session-a', { userId: 'user-1' })).toBe(false);
     expect(tables.studios[0].lease).not.toBeNull();
 
-    // A stale poll is a dead CLI — release proceeds.
+    // A stale poll is a dead CLI — release proceeds (holder is terminal).
     tables.sessions[0].cli_poll_at = new Date(Date.now() - 11 * 60 * 1000).toISOString();
     expect(await service.releaseUnlessRunning('session-a', { userId: 'user-1' })).toBe(true);
     expect(tables.studios[0].lease).toBeNull();
   });
 
-  it('a stale attached flag cannot look alive via terminal-write timestamps (round 3)', async () => {
-    // cli_attached is true but there is no poll — a dead orphan flag. A
-    // terminal API updating the row (bumping updated_at) must not defer.
-    tables.sessions.push({
-      id: 'session-a',
-      user_id: 'user-1',
+  it('releaseUnlessRunning defers for an open no-plugin CLI turn (round 4)', async () => {
+    Object.assign(tables.sessions[0], {
       cli_attached: true,
       cli_poll_at: null,
+      cli_turn_at: new Date().toISOString(), // on-prompt fired, no on-stop yet
+    });
+    expect(await service.releaseUnlessRunning('session-a', { userId: 'user-1' })).toBe(false);
+    expect(tables.studios[0].lease).not.toBeNull();
+
+    // The real on-stop cleared the turn signal — release proceeds.
+    tables.sessions[0].cli_turn_at = null;
+    expect(await service.releaseUnlessRunning('session-a', { userId: 'user-1' })).toBe(true);
+    expect(tables.studios[0].lease).toBeNull();
+  });
+
+  it('a stale attached flag cannot look alive via terminal-write timestamps (round 3)', async () => {
+    // cli_attached is true but there is no poll and no open turn — a dead
+    // orphan flag. A terminal API updating the row (bumping updated_at) must
+    // not defer.
+    Object.assign(tables.sessions[0], {
+      cli_attached: true,
+      cli_poll_at: null,
+      cli_turn_at: null,
       updated_at: new Date().toISOString(), // freshly touched by endSession
     });
     expect(await service.releaseUnlessRunning('session-a', { userId: 'user-1' })).toBe(true);
     expect(tables.studios[0].lease).toBeNull();
+  });
+
+  it('close-release paths presume a fresh non-terminal holder live — admission gap (round 4)', async () => {
+    // The holder just won its lease in getOrCreateSession and has not yet
+    // reached registerActiveRun: no registry entry, no CLI signals, session
+    // row not terminal. Releasing now would clear the lease under it.
+    tables.sessions[0].ended_at = null;
+
+    const byThread = await service.releaseByThread('user-1', 'pr:100', {
+      reason: 'thread-closed',
+    });
+    // session-a (fresh, non-terminal) deferred; session-b (terminal) released.
+    expect(byThread).toEqual({ released: 1, deferred: 1 });
+    const marked = tables.studios[0].lease as StudioLease;
+    expect(marked.sessionId).toBe('session-a');
+    expect(marked.pendingRelease?.reason).toBe('thread-closed');
+
+    // releaseByStudio applies the same rule.
+    tables.studios[0].lease = freshLease({ sessionId: 'session-a', threadKey: 'pr:100' });
+    expect(
+      await service.releaseByStudio('studio-1', { userId: 'user-1', reason: 'studio-closed' })
+    ).toBe('deferred');
   });
 
   it('releaseByThread clears every studio the thread holds', async () => {
@@ -749,7 +851,7 @@ describe('StudioLeaseService.sweepExpiredLeases', () => {
 describe('sweep pendingRelease backstop', () => {
   afterEach(() => resetActiveRuns());
 
-  it('completes a deferred release once the holder is no longer live', async () => {
+  it('completes a deferred release once the holder is provably done', async () => {
     resetActiveRuns();
     const lease: StudioLease = {
       ...freshLease({ sessionId: 'sess-p', threadKey: 'pr:11' }),
@@ -760,7 +862,7 @@ describe('sweep pendingRelease backstop', () => {
       studio_lease_events: [],
       inbox_threads: [],
       agent_identities: [],
-      sessions: [],
+      sessions: [{ id: 'sess-p', user_id: 'u', ended_at: new Date().toISOString() }],
     };
     const service = new StudioLeaseService(makeFakeSupabase(tables));
     const stats = await service.sweepExpiredLeases();

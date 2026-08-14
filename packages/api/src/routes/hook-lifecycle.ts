@@ -44,10 +44,18 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         return;
       }
 
-      const { sessionId, lifecycle, agentId, workingDir, cliAttached, cliPollAt, alias } =
+      const { sessionId, lifecycle, event, agentId, workingDir, cliAttached, cliPollAt, alias } =
         req.body as {
           sessionId?: string;
           lifecycle?: string;
+          /**
+           * Which hook fired: 'prompt' | 'stop' | 'pre-compact' | 'post-compact'.
+           * Lifecycle values alone are ambiguous — post-compact also sends
+           * 'idle' while the same turn continues, so ONLY event === 'stop'
+           * marks the real CLI turn boundary. Legacy senders without the
+           * field get renewals but never boundary releases.
+           */
+          event?: string;
           agentId?: string;
           workingDir?: string;
           cliAttached?: boolean;
@@ -90,6 +98,7 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         workingDir?: string;
         cliAttached?: boolean;
         cliPollAt?: string;
+        cliTurnAt?: string | null;
         alias?: string | null;
       } = {};
       if (lifecycle) updates.lifecycle = lifecycle;
@@ -97,6 +106,17 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
       if (cliAttached !== undefined) updates.cliAttached = cliAttached;
       if (cliPollAt) updates.cliPollAt = cliPollAt;
       if (alias !== undefined) updates.alias = alias || null;
+
+      // Hook-owned CLI turn signal: on-prompt opens the turn, and ONLY the
+      // real on-stop closes it (post-compact 'idle' leaves it set — the same
+      // turn resumes). Lease liveness reads this, so terminal APIs can never
+      // hide a live turn or resurrect a dead one. Legacy senders without the
+      // event field: infer prompt from lifecycle 'running' (safe — it only
+      // extends protection), never infer stop.
+      const isPromptEvent = event === 'prompt' || (!event && lifecycle === 'running');
+      const isStopEvent = event === 'stop';
+      if (isPromptEvent) updates.cliTurnAt = new Date().toISOString();
+      if (isStopEvent) updates.cliTurnAt = null;
 
       const updated = await dataComposer.repositories.memory.updateSession(sessionId, updates);
 
@@ -107,14 +127,14 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
 
       // Lease heartbeat and CLI run boundary. Prompt/compact events renew the
       // lease heartbeat (the primary refresh path, well inside the 30-minute
-      // staleness threshold). Stop events (idle/completed) are the moment the
-      // CLI turn has actually finished executing in the worktree: ONE ordered
-      // chain runs the boundary release first (terminal session, or a
-      // pendingRelease deferred by close_thread/close_studio mid-turn) and
-      // renews only if nothing was released — release and renewal must never
-      // race each other's heartbeat CAS. Fire-and-forget: never delays the
-      // hook response.
-      const isStopEvent = lifecycle === 'idle' || lifecycle === 'completed';
+      // staleness threshold). ONLY the real on-stop hook is the boundary —
+      // post-compact also reports lifecycle 'idle' while the same turn
+      // continues, so lifecycle alone must never trigger a release. At the
+      // boundary, ONE ordered chain runs the release first (terminal session,
+      // or a pendingRelease deferred by close_thread/close_studio mid-turn)
+      // and renews only if nothing was released — release and renewal must
+      // never race each other's heartbeat CAS. Fire-and-forget: never delays
+      // the hook response.
       if (isStopEvent) {
         void (async () => {
           const postUpdate = await dataComposer.repositories.memory.getSession(sessionId);
