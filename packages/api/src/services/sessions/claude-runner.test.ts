@@ -3,7 +3,8 @@ import {
   parseClaudeUsage,
   parseAssistantContextTokens,
   parseModelUsage,
-  primaryModel,
+  parseAssistantModel,
+  canonicalizeModel,
   createLineReader,
 } from './claude-runner.js';
 import {
@@ -145,14 +146,89 @@ describe('parseModelUsage / primaryModel', () => {
     expect(Object.keys(parsed).sort()).toEqual(['claude-haiku-4-5-20251001', 'claude-opus-5']);
   });
 
-  it('picks the model that did the work, by output volume', () => {
-    expect(primaryModel(parseModelUsage(raw))).toBe('claude-opus-5');
-  });
-
   it('returns undefined for absent or malformed reports', () => {
     expect(parseModelUsage(undefined)).toBeUndefined();
     expect(parseModelUsage({})).toBeUndefined();
-    expect(primaryModel(undefined)).toBeUndefined();
+  });
+});
+
+/**
+ * Which model WAS the agent is stated by the stream, not inferred from token
+ * volume: a subagent or side model can out-write the parent, and picking the
+ * largest usage entry would then record the wrong model on the session.
+ */
+describe('parseAssistantModel / canonicalizeModel', () => {
+  it('reads the model off a top-level assistant message', () => {
+    expect(
+      parseAssistantModel({
+        type: 'assistant',
+        message: { model: 'claude-opus-5', usage: {} },
+      })
+    ).toBe('claude-opus-5');
+  });
+
+  it('ignores subagent messages', () => {
+    expect(
+      parseAssistantModel({
+        type: 'assistant',
+        parent_tool_use_id: 'toolu_1',
+        message: { model: 'claude-haiku-4-5' },
+      })
+    ).toBeUndefined();
+  });
+
+  // The case Lumen called out: the secondary model emits far more output than
+  // the parent. The reported top-level model must still win.
+  it('keeps the parent model when a subagent out-writes it', () => {
+    const modelUsage = parseModelUsage({
+      'claude-opus-5': {
+        inputTokens: 900,
+        outputTokens: 40,
+        cacheReadInputTokens: 10_000,
+        cacheCreationInputTokens: 0,
+        costUSD: 0.02,
+        canonicalModel: 'claude-opus-5',
+      },
+      'claude-haiku-4-5-20251001': {
+        inputTokens: 5_000,
+        outputTokens: 25_000,
+        cacheReadInputTokens: 0,
+        cacheCreationInputTokens: 0,
+        costUSD: 0.03,
+        canonicalModel: 'claude-haiku-4-5',
+      },
+    });
+
+    const parentEvents = [
+      { type: 'assistant', message: { model: 'claude-opus-5' } },
+      // Subagent turns interleave and are far chattier.
+      { type: 'assistant', parent_tool_use_id: 'toolu_1', message: { model: 'claude-haiku-4-5' } },
+    ];
+    let reported: string | undefined;
+    for (const event of parentEvents) {
+      const model = parseAssistantModel(event as Record<string, unknown>);
+      if (model) reported = model;
+    }
+
+    expect(canonicalizeModel(reported, modelUsage)).toBe('claude-opus-5');
+  });
+
+  it('prefers the stable alias over a dated id when one is reported', () => {
+    const modelUsage = parseModelUsage({
+      'claude-haiku-4-5-20251001': {
+        inputTokens: 1,
+        outputTokens: 1,
+        cacheReadInputTokens: 0,
+        cacheCreationInputTokens: 0,
+        costUSD: 0,
+        canonicalModel: 'claude-haiku-4-5',
+      },
+    });
+
+    expect(canonicalizeModel('claude-haiku-4-5-20251001', modelUsage)).toBe('claude-haiku-4-5');
+    // Unknown to the report: kept verbatim rather than dropped.
+    expect(canonicalizeModel('claude-opus-5', modelUsage)).toBe('claude-opus-5');
+    expect(canonicalizeModel(undefined, modelUsage)).toBeUndefined();
   });
 });
 

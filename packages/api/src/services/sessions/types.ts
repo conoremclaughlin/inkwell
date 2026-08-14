@@ -576,6 +576,12 @@ export interface RunnerResult {
   backendSessionId: string | null;
   responses: ChannelResponse[];
   usage?: SessionResult['usage'];
+  /**
+   * The model that served the main conversation, as the backend reported it
+   * on its own top-level assistant messages. Distinct from per-model usage:
+   * that says which models spent tokens, this says which one WAS the agent.
+   */
+  servedModel?: string;
   error?: string;
   /** The final text response from the backend (for auto-routing if no explicit send_response) */
   finalTextResponse?: string;

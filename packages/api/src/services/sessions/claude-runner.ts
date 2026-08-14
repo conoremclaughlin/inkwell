@@ -163,23 +163,37 @@ export function parseModelUsage(modelUsage: unknown): Record<string, ModelUsageE
 }
 
 /**
- * The model that did the main work of a query: the reported entry with the
- * most output tokens. Subagent and side-call models appear alongside the main
- * one, and output volume is what distinguishes them.
+ * The model serving the main conversation, read off a top-level `assistant`
+ * message rather than inferred.
+ *
+ * Output volume cannot identify the parent: a chatty subagent or side model
+ * routinely out-writes it, and picking the largest entry would then record the
+ * wrong model on the session (Lumen, PR #493 round 3). Claude states the
+ * answer on every assistant event, and top-level events are exactly the ones
+ * without `parent_tool_use_id`.
  *
  * Exported for tests.
  */
-export function primaryModel(
+export function parseAssistantModel(event: Record<string, unknown>): string | undefined {
+  if (event.parent_tool_use_id) return undefined;
+  const message = event.message as Record<string, unknown> | undefined;
+  const model = message?.model;
+  return typeof model === 'string' && model.trim() ? model : undefined;
+}
+
+/**
+ * Prefer the stable alias when the backend also reports one for this model —
+ * a dated id like `claude-haiku-4-5-20251001` and its alias `claude-haiku-4-5`
+ * describe the same model, and grouping usage by a rotating date is useless.
+ *
+ * Exported for tests.
+ */
+export function canonicalizeModel(
+  model: string | undefined,
   modelUsage: Record<string, ModelUsageEntry> | undefined
 ): string | undefined {
-  if (!modelUsage) return undefined;
-  let best: { model: string; output: number } | undefined;
-  for (const [model, entry] of Object.entries(modelUsage)) {
-    if (!best || entry.outputTokens > best.output) {
-      best = { model: entry.canonicalModel || model, output: entry.outputTokens };
-    }
-  }
-  return best?.model;
+  if (!model) return undefined;
+  return modelUsage?.[model]?.canonicalModel || model;
 }
 
 /**
@@ -279,6 +293,7 @@ export class ClaudeRunner implements IRunner {
           backendSessionId: sessionId,
           responses: retryResult.responses,
           usage: retryResult.usage,
+          servedModel: retryResult.servedModel,
           finalTextResponse: retryResult.finalTextResponse,
           toolCalls: retryResult.toolCalls,
         };
@@ -289,6 +304,7 @@ export class ClaudeRunner implements IRunner {
         backendSessionId: sessionId,
         responses: result.responses,
         usage: result.usage,
+        servedModel: result.servedModel,
         finalTextResponse: result.finalTextResponse,
         toolCalls: result.toolCalls,
       };
@@ -349,6 +365,7 @@ export class ClaudeRunner implements IRunner {
   ): Promise<{
     responses: ChannelResponse[];
     usage?: ClaudeUsageStats;
+    servedModel?: string;
     resumeFailedNoSession?: boolean;
     finalTextResponse?: string;
     toolCalls: ToolCall[];
@@ -469,7 +486,9 @@ export class ClaudeRunner implements IRunner {
       const responses: ChannelResponse[] = [];
       const toolCalls: ToolCall[] = [];
       let usage: ClaudeUsageStats | undefined;
+      let servedModel: string | undefined;
       let measuredContextTokens: number | undefined;
+      let reportedModel: string | undefined;
       let resumeFailedNoSession = false;
       let finalTextResponse: string | undefined;
       let settled = false;
@@ -544,6 +563,7 @@ export class ClaudeRunner implements IRunner {
               if (parsed.usage) {
                 const billed = parseClaudeUsage(parsed.usage as Record<string, unknown>);
                 const modelUsage = parseModelUsage(parsed.modelUsage);
+                servedModel = canonicalizeModel(reportedModel, modelUsage);
                 usage = {
                   ...billed,
                   // Measured per-step, never taken from the query aggregate.
@@ -565,6 +585,8 @@ export class ClaudeRunner implements IRunner {
             if (parsed.type === 'assistant') {
               const stepContext = parseAssistantContextTokens(parsed as Record<string, unknown>);
               if (stepContext !== undefined) measuredContextTokens = stepContext;
+              const stepModel = parseAssistantModel(parsed as Record<string, unknown>);
+              if (stepModel) reportedModel = stepModel;
             }
 
             // Also capture text from assistant messages (streaming)
@@ -622,7 +644,14 @@ export class ClaudeRunner implements IRunner {
 
         // Handle resume failure gracefully - don't reject, let caller retry
         if (resumeFailedNoSession) {
-          resolve({ responses, usage, toolCalls, resumeFailedNoSession: true, finalTextResponse });
+          resolve({
+            responses,
+            usage,
+            servedModel,
+            toolCalls,
+            resumeFailedNoSession: true,
+            finalTextResponse,
+          });
           return;
         }
 
@@ -635,7 +664,7 @@ export class ClaudeRunner implements IRunner {
           }
         }
 
-        resolve({ responses, usage, toolCalls, finalTextResponse });
+        resolve({ responses, usage, servedModel, toolCalls, finalTextResponse });
       });
 
       // Send the message

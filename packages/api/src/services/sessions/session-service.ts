@@ -32,7 +32,7 @@ import type {
 import type { Json } from '../../data/supabase/types.js';
 import { SessionRepository } from './session-repository.js';
 import { ContextBuilder } from './context-builder.js';
-import { ClaudeRunner, buildIdentityPrompt, primaryModel } from './claude-runner.js';
+import { ClaudeRunner, buildIdentityPrompt } from './claude-runner.js';
 import { CodexRunner } from './codex-runner.js';
 import {
   registerActiveRun,
@@ -897,13 +897,14 @@ export class SessionService implements ISessionService {
     // channel plugin to deliver, but none runs for headless sessions).
     const postRunLifecycle = result.success ? 'idle' : 'failed';
 
-    // The model that actually served this turn, from the backend's own
-    // per-model report rather than the model we requested. A requested default
-    // is not evidence: CLI defaults, aliases, fallbacks and subagents all make
-    // the two diverge, and one session's lifetime can span several models. So
-    // the column means "most recent main model" while metadata.modelUsage
-    // keeps the full per-model history (Lumen, PR #493 round 2).
-    const servedModel = primaryModel(result.usage?.modelUsage);
+    // The model that served this turn, as the backend reported it on its own
+    // top-level assistant messages. Not the model we requested (CLI defaults,
+    // aliases and fallbacks all diverge from it) and not inferred from token
+    // volume (a chatty subagent out-writes the parent, which would record the
+    // wrong model). The column means "most recent main model" — one session
+    // can span several — while metadata.modelUsage keeps the per-model
+    // history including cost (Lumen, PR #493 rounds 2-3).
+    const servedModel = result.servedModel;
 
     // A runner can return after the shutdown drain has already snapshotted and
     // interrupted this session. Because repository.update() rewrites the whole
