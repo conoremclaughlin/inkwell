@@ -230,10 +230,15 @@ export class StudioLeaseService {
   async getLease(
     studioId: string,
     userId?: string
-  ): Promise<{ lease: StudioLease | null; worktreePath?: string; ephemeral?: boolean } | null> {
+  ): Promise<{
+    lease: StudioLease | null;
+    worktreePath?: string;
+    ephemeral?: boolean;
+    status?: string;
+  } | null> {
     let query = this.supabase
       .from('studios')
-      .select('lease, worktree_path, ephemeral')
+      .select('lease, worktree_path, ephemeral, status')
       .eq('id', studioId);
     if (userId) query = query.eq('user_id', userId);
     const { data, error } = await query.maybeSingle();
@@ -246,8 +251,13 @@ export class StudioLeaseService {
       lease: parseStudioLease(data.lease),
       worktreePath: data.worktree_path,
       ephemeral: data.ephemeral,
+      status: data.status,
     };
   }
+
+  /** Only active/idle studios may be leased — a cleaned or archived row must
+   * never route a runner to its (possibly deleted) worktree. */
+  private static readonly ACQUIRABLE_STATUSES = ['active', 'idle'];
 
   /**
    * Is the session's process still executing in a worktree? Covers:
@@ -383,6 +393,15 @@ export class StudioLeaseService {
       });
       return { acquired: false, holder: null };
     }
+    if (current.status && !StudioLeaseService.ACQUIRABLE_STATUSES.includes(current.status)) {
+      // Cleaned/archived studios are not routable — continuity or an explicit
+      // UUID must not send a runner back to a retired (possibly deleted) path.
+      logger.warn('[StudioLease] Acquire refused — studio is not in an acquirable status', {
+        studioId: req.studioId,
+        status: current.status,
+      });
+      return { acquired: false, holder: null };
+    }
 
     const holder = current.lease;
     if (!holder) {
@@ -413,6 +432,7 @@ export class StudioLeaseService {
       .update({ lease: lease as unknown as Json })
       .eq('id', req.studioId)
       .eq('user_id', req.userId)
+      .in('status', StudioLeaseService.ACQUIRABLE_STATUSES)
       .is('lease', null)
       .select('id');
     if (error) {
@@ -425,22 +445,57 @@ export class StudioLeaseService {
     return Boolean(data?.length);
   }
 
-  /** CAS the lease from one exact value (incl. heartbeatAt) to another. */
+  /**
+   * CAS the lease from one exact value (incl. heartbeatAt) to another.
+   * `requireAcquirableStatus` gates writes that GRANT a lease (adopt,
+   * recovery handover) on active/idle — a cleaned studio must never be
+   * re-leased through continuity or an explicit UUID. Releases and
+   * quarantine transitions run regardless of status.
+   */
   private async casLease(
     studioId: string,
     userId: string,
     from: StudioLease,
-    to: StudioLease | null
+    to: StudioLease | null,
+    opts: { requireAcquirableStatus?: boolean } = {}
   ): Promise<boolean> {
-    const { data } = await this.supabase
+    let query = this.supabase
       .from('studios')
       .update({ lease: to as unknown as Json })
       .eq('id', studioId)
       .eq('user_id', userId)
       .eq('lease->>sessionId', from.sessionId)
       .eq('lease->>acquiredAt', from.acquiredAt)
-      .eq('lease->>heartbeatAt', from.heartbeatAt)
+      .eq('lease->>heartbeatAt', from.heartbeatAt);
+    if (opts.requireAcquirableStatus) {
+      query = query.in('status', StudioLeaseService.ACQUIRABLE_STATUSES);
+    }
+    const { data } = await query.select('id');
+    return Boolean(data?.length);
+  }
+
+  /**
+   * Atomic teardown finalization: status → cleaned, cleaned_at stamped, and
+   * the lease cleared in ONE user+exact-claim-guarded CAS. Returns false when
+   * the claim no longer matches (stolen/aged) — the caller must not report
+   * success. This is the only way a teardown/reconciliation may publish its
+   * end state; separate markCleaned + clear steps can interleave with a claim
+   * replacement.
+   */
+  async finalizeTeardown(studioId: string, userId: string, claim: StudioLease): Promise<boolean> {
+    const { data, error } = await this.supabase
+      .from('studios')
+      .update({ status: 'cleaned', cleaned_at: new Date().toISOString(), lease: null })
+      .eq('id', studioId)
+      .eq('user_id', userId)
+      .eq('lease->>sessionId', claim.sessionId)
+      .eq('lease->>acquiredAt', claim.acquiredAt)
+      .eq('lease->>heartbeatAt', claim.heartbeatAt)
       .select('id');
+    if (error) {
+      logger.warn('[StudioLease] finalizeTeardown failed', { studioId, error: error.message });
+      return false;
+    }
     return Boolean(data?.length);
   }
 
@@ -492,10 +547,31 @@ export class StudioLeaseService {
       return { acquired: false, holder: reread?.lease ?? holder };
     }
 
-    // An absent worktree has nothing to rescue — skip capture rather than
-    // treating the inevitable error as a failed rescue (which would
-    // quarantine forever with no recovery path).
-    if (worktreePath && (await worktreePresent(worktreePath))) {
+    // A configured worktree that is ABSENT on disk is a dead studio, not an
+    // acquirable one: never hand a runner a nonexistent cwd, and never
+    // publish it back as vacancy. Retire it — cleaned + lease NULL in one
+    // claim-guarded CAS — and refuse; the caller diverts to overflow.
+    if (worktreePath && !(await worktreePresent(worktreePath))) {
+      const retired = await this.finalizeTeardown(req.studioId, req.userId, recovery);
+      if (retired) {
+        logger.warn('[StudioLease] Retired studio with absent worktree during reclaim', {
+          studioId: req.studioId,
+          worktreePath,
+          previousHolder: { sessionId: holder.sessionId, threadKey: holder.threadKey },
+        });
+        await this.logEvent(req.userId, req.studioId, 'released', {
+          sessionId: holder.holderSessionId ?? holder.sessionId,
+          threadKey: holder.heldThreadKey ?? holder.threadKey,
+          agentId: holder.agentId,
+          sbId: holder.sbId,
+          reason: 'worktree-absent-retired',
+          detail: { previousHolder: holder as unknown as Json },
+        });
+      }
+      return { acquired: false, holder: null };
+    }
+
+    if (worktreePath) {
       const rescue = await captureWorktreeState(worktreePath, {
         rescue: true,
         rescueLabel: holder.heldThreadKey ?? holder.threadKey,
@@ -525,7 +601,9 @@ export class StudioLeaseService {
 
       // Hand over: claim (our token) → requester's lease. Losing this CAS
       // means the claim aged out and was taken — abort, never assume.
-      const handedOver = await this.casLease(req.studioId, req.userId, recovery, lease);
+      const handedOver = await this.casLease(req.studioId, req.userId, recovery, lease, {
+        requireAcquirableStatus: true,
+      });
       if (!handedOver) {
         logger.error('[StudioLease] Recovery claim lost before handover; refusing', {
           studioId: req.studioId,
@@ -556,7 +634,9 @@ export class StudioLeaseService {
     }
 
     // No worktree to rescue — hand the claim straight over.
-    const handedOver = await this.casLease(req.studioId, req.userId, recovery, lease);
+    const handedOver = await this.casLease(req.studioId, req.userId, recovery, lease, {
+      requireAcquirableStatus: true,
+    });
     if (!handedOver) {
       const reread = await this.getLease(req.studioId, req.userId);
       return { acquired: false, holder: reread?.lease ?? null };
@@ -635,7 +715,9 @@ export class StudioLeaseService {
         heartbeatAt: now,
         reason: req.reason ?? holder.reason,
       };
-      const won = await this.casLease(req.studioId, req.userId, holder, adopted);
+      const won = await this.casLease(req.studioId, req.userId, holder, adopted, {
+        requireAcquirableStatus: true,
+      });
       if (won) {
         return { acquired: true, lease: adopted };
       }
@@ -1036,31 +1118,30 @@ export class StudioLeaseService {
       const claimWon = await this.casLease(row.id, row.user_id, lease, claim);
       if (!claimWon) continue; // renewed, released, or acquired concurrently — not ours
 
-      const present = await worktreePresent(row.worktree_path);
+      const hasPath = Boolean(row.worktree_path);
+      const present = hasPath && (await worktreePresent(row.worktree_path));
 
-      // Reconciliation: a TEARDOWN claim whose worktree is already gone means
-      // destruction succeeded but the cleaned record didn't land (e.g.,
-      // close_studio's markCleaned failed). Finish the intent — record
-      // cleaned and clear the claim — instead of failing rescue forever on
-      // the missing cwd.
-      if (!present && lease.quarantined && lease.claimKind === 'teardown') {
-        const { data: finalized } = await this.supabase
-          .from('studios')
-          .update({ status: 'cleaned', cleaned_at: new Date().toISOString(), lease: null })
-          .eq('id', row.id)
-          .eq('user_id', row.user_id)
-          .eq('lease->>sessionId', claim.sessionId)
-          .select('id');
-        if (finalized?.length) {
-          logger.warn('[StudioLease] Finalized interrupted teardown — worktree already absent', {
+      // A configured-but-ABSENT worktree is a dead studio (round 7): finalize
+      // to cleaned + lease NULL in ONE claim-guarded CAS — never publish it
+      // back as an acquirable vacancy pointing at a nonexistent cwd. Covers
+      // interrupted teardowns and externally deleted worktrees alike.
+      if (hasPath && !present) {
+        const finalized = await this.finalizeTeardown(row.id, row.user_id, claim);
+        if (finalized) {
+          logger.warn('[StudioLease] Retired studio with absent worktree', {
             studioId: row.id,
+            worktreePath: row.worktree_path,
+            priorClaimKind: lease.claimKind ?? null,
           });
           await this.logEvent(row.user_id, row.id, 'released', {
             sessionId: claim.holderSessionId,
             threadKey: claim.heldThreadKey,
             agentId: lease.agentId,
             sbId: lease.sbId,
-            reason: 'teardown-finalized-worktree-absent',
+            reason:
+              lease.claimKind === 'teardown'
+                ? 'teardown-finalized-worktree-absent'
+                : 'worktree-absent-retired',
           });
           released += 1;
         }

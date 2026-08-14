@@ -595,27 +595,26 @@ export async function handleCloseStudio(args: unknown, dataComposer: DataCompose
       .then(() => true)
       .catch(() => false));
     if (residual.lease.quarantined && worktreeGone) {
-      try {
-        const reconciled = await studiosRepo.markCleaned(studioId);
-        await leaseService
-          .clearTeardownClaim(studioId, closingUser.id, residual.lease)
-          .catch(() => undefined);
-        logger.info('[StudioLease] close_studio reconciled an interrupted teardown', {
-          studioId,
-        });
-        return successResponse({
-          message: 'Studio close reconciled: worktree already absent; cleaned state recorded',
-          studioId: reconciled.id,
-          status: reconciled.status,
-          cleanedAt: reconciled.cleanedAt,
-          cleanup: { worktreeRemoved: true, branchDeleted: false, errors: [] },
-        });
-      } catch (reconcileErr) {
-        const message = reconcileErr instanceof Error ? reconcileErr.message : String(reconcileErr);
+      // ONE user+exact-claim-guarded CAS finalizes status/cleaned_at/lease
+      // together — a claim replaced between observation and finalization
+      // makes this fail, and failure is reported, never masked as success.
+      const finalized = await leaseService.finalizeTeardown(
+        studioId,
+        closingUser.id,
+        residual.lease
+      );
+      if (!finalized) {
         return errorResponse(
-          `Studio ${studioId} reconciliation failed: could not record cleaned (${message}). The quarantine claim is kept; retry close_studio.`
+          `Studio ${studioId} reconciliation failed: the quarantine claim changed underneath (or the write failed). Nothing was recorded; retry close_studio.`
         );
       }
+      logger.info('[StudioLease] close_studio reconciled an interrupted teardown', { studioId });
+      return successResponse({
+        message: 'Studio close reconciled: worktree already absent; cleaned state recorded',
+        studioId,
+        status: 'cleaned',
+        cleanup: { worktreeRemoved: true, branchDeleted: false, errors: [] },
+      });
     }
     return errorResponse(
       `Studio ${studioId} has a ${residual.lease.quarantined ? 'quarantined' : 'contended'} lease; refusing to close. Resolve the lease state first.`
@@ -702,27 +701,26 @@ export async function handleCloseStudio(args: unknown, dataComposer: DataCompose
   // quarantine+absent-worktree path above. When nothing destructive
   // happened (removeWorktree: false), the claim is freed instead — the
   // studio is fully intact and must stay usable.
-  let updated;
-  try {
-    updated = await studiosRepo.markCleaned(studioId);
-  } catch (cleanErr) {
-    const message = cleanErr instanceof Error ? cleanErr.message : String(cleanErr);
+  //
+  // Finalization is ONE user+exact-claim-guarded CAS setting status,
+  // cleaned_at, and lease NULL together — no separate markCleaned + clear
+  // steps a claim replacement could interleave with.
+  const finalized = await leaseService.finalizeTeardown(studioId, closingUser.id, claim);
+  if (!finalized) {
     if (!removeWorktree) {
       await leaseService.clearTeardownClaim(studioId, closingUser.id, claim).catch(() => undefined);
       return errorResponse(
-        `Studio ${studioId} could not be marked cleaned (${message}). Nothing was removed; the studio remains usable.`
+        `Studio ${studioId} could not be marked cleaned (claim changed or write failed). Nothing was removed; the studio remains usable.`
       );
     }
     logger.error(
-      '[StudioLease] close_studio destroyed the worktree but could not record cleaned; keeping teardown claim as quarantine',
-      { studioId, error: message }
+      '[StudioLease] close_studio destroyed the worktree but could not finalize cleaned; keeping teardown claim as quarantine',
+      { studioId }
     );
     return errorResponse(
-      `Studio ${studioId} worktree was removed but the cleaned state could not be recorded (${message}). The teardown claim is kept so nothing can route here; re-run close_studio to reconcile.`
+      `Studio ${studioId} worktree was removed but the cleaned state could not be recorded. The teardown claim is kept so nothing can route here; re-run close_studio to reconcile.`
     );
   }
-
-  await leaseService.clearTeardownClaim(studioId, closingUser.id, claim).catch(() => undefined);
 
   logger.info('Studio closed', {
     studioId,
@@ -733,9 +731,8 @@ export async function handleCloseStudio(args: unknown, dataComposer: DataCompose
 
   return successResponse({
     message: 'Studio closed and marked as cleaned',
-    studioId: updated.id,
-    status: updated.status,
-    cleanedAt: updated.cleanedAt,
+    studioId,
+    status: 'cleaned',
     cleanup: cleanupResults,
   });
 }

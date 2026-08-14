@@ -80,6 +80,11 @@ class FakeQuery {
     return this;
   }
 
+  in(col: string, vals: unknown[]) {
+    this.filters.push((r) => vals.includes(getCol(r, col)));
+    return this;
+  }
+
   limit(n: number) {
     this.limitN = n;
     return this;
@@ -163,7 +168,9 @@ function staleLease(overrides: Partial<StudioLease> = {}): StudioLease {
 
 function baseTables(): Record<string, Row[]> {
   return {
-    studios: [{ id: 'studio-1', user_id: 'user-1', lease: null, worktree_path: null }],
+    studios: [
+      { id: 'studio-1', user_id: 'user-1', status: 'active', lease: null, worktree_path: null },
+    ],
     studio_lease_events: [],
     inbox_threads: [],
     agent_identities: [],
@@ -219,6 +226,29 @@ describe('StudioLeaseService.acquire', () => {
     expect((tables.studios[0].lease as StudioLease).reason).toBe('route-pattern');
     expect(tables.studio_lease_events).toHaveLength(1);
     expect(tables.studio_lease_events[0].event).toBe('acquired');
+  });
+
+  it('never leases a cleaned studio — even a vacant one (round 7)', async () => {
+    // A successful close leaves status='cleaned', lease=NULL. Continuity or
+    // an explicit UUID must not send a runner back to the deleted path.
+    tables.studios[0].status = 'cleaned';
+    const result = await service.acquire(req);
+    expect(result.acquired).toBe(false);
+    expect(tables.studios[0].lease).toBeNull();
+  });
+
+  it('retires a stale holder whose worktree is GONE instead of acquiring it (round 7)', async () => {
+    tables.studios[0].lease = staleLease({ threadKey: 'pr:999', sessionId: 'session-dead' });
+    tables.studios[0].worktree_path = path.join(tmpdir(), 'definitely-missing-worktree-xyz');
+
+    const result = await service.acquire(req);
+    // Never handed to the requester (nonexistent cwd), never left as an
+    // acquirable vacancy: retired to cleaned in one claim-guarded CAS.
+    expect(result.acquired).toBe(false);
+    expect(tables.studios[0].lease).toBeNull();
+    expect(tables.studios[0].status).toBe('cleaned');
+    const event = tables.studio_lease_events.find((e) => e.event === 'released');
+    expect(event?.reason).toBe('worktree-absent-retired');
   });
 
   it('never mutates another user’s studio — even with the right studio UUID', async () => {
@@ -596,12 +626,14 @@ describe('StudioLeaseService release paths', () => {
         {
           id: 'studio-1',
           user_id: 'user-1',
+          status: 'active',
           lease: freshLease({ sessionId: 'session-a', threadKey: 'pr:100' }),
           worktree_path: null,
         },
         {
           id: 'studio-2',
           user_id: 'user-1',
+          status: 'active',
           lease: freshLease({ sessionId: 'session-b', threadKey: 'pr:100' }),
           worktree_path: null,
         },
@@ -951,7 +983,7 @@ describe('sweep worktree-absent reconciliation (round 6)', () => {
     expect(event?.reason).toBe('teardown-finalized-worktree-absent');
   });
 
-  it('clears a stale RECOVERY quarantine over an absent worktree without looping forever', async () => {
+  it('retires (not vacates) a stale RECOVERY quarantine over an absent worktree', async () => {
     resetActiveRuns();
     const tables: Record<string, Row[]> = {
       studios: [
@@ -971,13 +1003,14 @@ describe('sweep worktree-absent reconciliation (round 6)', () => {
     const service = new StudioLeaseService(makeFakeSupabase(tables));
     const stats = await service.sweepExpiredLeases();
 
-    // Nothing to rescue on a missing cwd — the quarantine resolves to
-    // vacancy ('expired') instead of re-quarantining every sweep.
-    expect(stats.expired).toBe(1);
+    // Round 7: a missing cwd must never become an acquirable vacancy — the
+    // studio is retired to cleaned (non-routable) in one claim-guarded CAS.
+    expect(stats.released).toBe(1);
     expect(stats.quarantined).toBe(0);
     expect(tables.studios[0].lease).toBeNull();
-    // A recovery quarantine does not imply teardown intent — status untouched.
-    expect(tables.studios[0].status).toBe('active');
+    expect(tables.studios[0].status).toBe('cleaned');
+    const event = tables.studio_lease_events.find((e) => e.event === 'released');
+    expect(event?.reason).toBe('worktree-absent-retired');
   });
 });
 
@@ -1060,6 +1093,30 @@ describe('claimForTeardown ownership (round 3)', () => {
     expect(second).toBeNull();
     // First worker's token still owns the studio.
     expect(await service.verifyClaim('s-1', 'u', first!)).toBe(true);
+  });
+
+  it('finalizeTeardown fails when the claim changed underneath — never a phantom success (round 7)', async () => {
+    const tables = claimTables(null);
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+    const claim = await service.claimForTeardown('s-1', 'u', { reason: 'teardown' });
+    expect(claim).not.toBeNull();
+
+    // Another worker replaced the claim (aged-out steal) between our
+    // observation and finalization.
+    const other: StudioLease = {
+      ...claim!,
+      sessionId: '33333333-3333-3333-3333-333333333333',
+    };
+    tables.studios[0].lease = other as unknown as Row;
+
+    expect(await service.finalizeTeardown('s-1', 'u', claim!)).toBe(false);
+    expect(tables.studios[0].status).not.toBe('cleaned');
+    expect((tables.studios[0].lease as StudioLease).sessionId).toBe(other.sessionId);
+
+    // The claim that actually holds the studio finalizes atomically.
+    expect(await service.finalizeTeardown('s-1', 'u', other)).toBe(true);
+    expect(tables.studios[0].status).toBe('cleaned');
+    expect(tables.studios[0].lease).toBeNull();
   });
 
   it('re-claims only a STALE quarantine, and token revalidation detects takeover', async () => {

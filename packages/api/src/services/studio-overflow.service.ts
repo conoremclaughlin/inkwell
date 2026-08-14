@@ -422,8 +422,21 @@ export class StudioOverflowService {
       );
     }
 
-    await this.studios.markCleaned(studio.id).catch(() => undefined);
-    await this.leases.clearTeardownClaim(studio.id, studio.userId, claim).catch(() => undefined);
+    // ONE user+exact-claim-guarded CAS records cleaned + clears the claim
+    // together (round 7) — a claim replaced mid-teardown fails here and the
+    // sweep reconciles instead of us reporting a phantom success.
+    const finalized = await this.leases
+      .finalizeTeardown(studio.id, studio.userId, claim)
+      .catch(() => false);
+    if (!finalized) {
+      logger.error(
+        '[StudioOverflow] Teardown finalization failed — claim changed; sweep will reconcile',
+        {
+          studioId: studio.id,
+        }
+      );
+      return;
+    }
     await this.leases.logEvent(studio.userId, studio.id, 'released', {
       agentId: studio.agentId ?? undefined,
       reason: opts.reason,
