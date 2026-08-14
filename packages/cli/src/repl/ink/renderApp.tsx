@@ -4,23 +4,9 @@ import { ChatApp, type ChatAppHandle, type ChatMessage } from './ChatApp.js';
 import { SessionPicker, type SessionPickerEntry } from './SessionPicker.js';
 import type { MessageRole } from './MessageLine.js';
 import { formatNow } from '../tui-components.js';
+import { InputSlot, InkInputAborted } from './input-slot.js';
 
-/**
- * Deferred promise helper — creates a promise with externally-exposed resolve/reject.
- */
-function deferred<T>(): {
-  promise: Promise<T>;
-  resolve: (v: T) => void;
-  reject: (e: unknown) => void;
-} {
-  let resolve!: (v: T) => void;
-  let reject!: (e: unknown) => void;
-  const promise = new Promise<T>((res, rej) => {
-    resolve = res;
-    reject = rej;
-  });
-  return { promise, resolve, reject };
-}
+export { InkInputAborted };
 
 /**
  * The InkRepl is the bridge between the existing chat orchestration (pull-based
@@ -35,8 +21,19 @@ function deferred<T>(): {
  * - `cleanup()` — unmount the Ink app
  */
 export interface InkRepl {
-  /** Block until the user submits a line (replaces rl.question). */
-  waitForInput: () => Promise<string>;
+  /**
+   * Block until the user submits a line (replaces rl.question).
+   *
+   * There is exactly ONE input slot: a second concurrent call reassigns it and
+   * orphans the first promise forever. Callers that can overlap — approval
+   * prompts from concurrent shadow clones — must serialize through
+   * `ApprovalCoordinator` rather than racing here.
+   *
+   * Passing a signal lets a caller stop waiting (Ctrl+C reaching a clone that
+   * is blocked on an approval prompt); the promise rejects with
+   * `InkInputAborted` and the slot is released for the next caller.
+   */
+  waitForInput: (opts?: { signal?: AbortSignal }) => Promise<string>;
   /** Push a chat message into the scrollback. */
   addMessage: (
     role: MessageRole,
@@ -101,26 +98,21 @@ export function renderInkChat(options: {
     React.createRef<ChatAppHandle>() as React.MutableRefObject<ChatAppHandle | null>;
   const fullscreen = !!options.fullscreen;
 
-  // Pending input promise — resolved when user submits a line
-  let pendingInput: ReturnType<typeof deferred<string>> | null = null;
+  // The single line of input this UI has. See InputSlot — concurrent waiters
+  // are rejected rather than silently evicted.
+  const inputSlot = new InputSlot();
 
   // Exit signal
   let exitRequested = false;
 
   const onUserInput = (raw: string) => {
-    if (pendingInput) {
-      pendingInput.resolve(raw);
-      pendingInput = null;
-    }
+    inputSlot.submit(raw);
   };
 
   const onExit = () => {
     exitRequested = true;
     // If someone is waiting for input, reject with a sentinel
-    if (pendingInput) {
-      pendingInput.reject(new InkExitSignal());
-      pendingInput = null;
-    }
+    inputSlot.fail(new InkExitSignal());
   };
 
   // <Static> handles scroll protection: completed messages go to terminal scrollback,
@@ -150,12 +142,11 @@ export function renderInkChat(options: {
   };
 
   const repl: InkRepl = {
-    waitForInput: () => {
+    waitForInput: (opts) => {
       if (exitRequested) {
         return Promise.reject(new InkExitSignal());
       }
-      pendingInput = deferred<string>();
-      return pendingInput.promise;
+      return inputSlot.wait(opts);
     },
 
     addMessage: (role, content, opts) => {

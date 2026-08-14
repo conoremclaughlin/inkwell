@@ -84,10 +84,16 @@ import { ApprovalRequestManager } from '../repl/approval-request.js';
 import { requestToolApproval } from '../repl/approval-api.js';
 import {
   type ApprovalChannel,
+  type ApprovalOriginInfo,
   type ApprovalResponseDecision,
   JsonlApprovalChannel,
   AutoApprovalChannel,
 } from '../repl/approval-channel.js';
+import {
+  ApprovalCoordinator,
+  concurrencyForAdapter,
+  type ApprovalTicket,
+} from '../repl/approval-coordinator.js';
 import {
   parsePermissionGrant,
   applyPermissionGrant,
@@ -2182,11 +2188,25 @@ async function promptForToolApproval(
   reason: string,
   inkRepl?: InkRepl | null,
   approvalChannel?: ApprovalChannel,
-  args?: Record<string, unknown>
+  args?: Record<string, unknown>,
+  ctx?: {
+    origin?: ApprovalOriginInfo;
+    signal?: AbortSignal;
+    /** How many other approvals are waiting behind this one. */
+    queuedNow?: () => number;
+  }
 ): Promise<boolean> {
   let choice: import('../repl/tool-approval.js').ToolApprovalChoice;
 
   const argsDisplay = args ? sanitizeArgsForApproval(tool, args) : '';
+  // A clone's request must say whose it is — otherwise the user is approving
+  // `read` with no idea which of three concurrent clones asked.
+  const originTag =
+    ctx?.origin?.origin === 'clone'
+      ? ` · 🌀 ${ctx.origin.cloneLabel || ctx.origin.cloneId || 'clone'}`
+      : '';
+  const waiting = ctx?.queuedNow?.() ?? 0;
+  const waitingTag = waiting > 0 ? ` · ${waiting} more waiting` : '';
 
   if (approvalChannel) {
     // JSONL or auto channel — structured approval protocol
@@ -2195,20 +2215,22 @@ async function promptForToolApproval(
       args: args ?? {},
       reason,
       sessionId,
+      signal: ctx?.signal,
+      origin: ctx?.origin,
     });
     // Map channel response decision to tool approval choice
     choice = response.decision as import('../repl/tool-approval.js').ToolApprovalChoice;
   } else if (inkRepl) {
     // Render a visually distinct permission prompt in Ink
-    const lines = [`🔐 ${tool}`];
+    const lines = [`🔐 ${tool}${originTag}${waitingTag}`];
     if (argsDisplay) lines.push(argsDisplay);
     lines.push(reason, '', '[y] once · [s] session · [a] always · [d] deny · [n] cancel');
     inkRepl.addMessage('system', lines.join('\n'), { label: '🔐 permission' });
-    const answer = (await inkRepl.waitForInput()).trim();
+    const answer = (await inkRepl.waitForInput({ signal: ctx?.signal })).trim();
     choice = parseToolApprovalInput(answer);
   } else if (rl) {
     const detail = argsDisplay ? ` (${argsDisplay})` : '';
-    console.log(chalk.yellow(`🔐 ${tool}${detail} — ${reason}`));
+    console.log(chalk.yellow(`🔐 ${tool}${detail}${originTag}${waitingTag} — ${reason}`));
     const answer = (
       await rl.question(
         chalk.yellow(`Allow? [y] once, [s] session, [a] always, [d] deny, [n] cancel: `)
@@ -2882,6 +2904,152 @@ export async function runChat(options: ChatOptions): Promise<void> {
     statusLane.printLine(line);
     restorePromptAfterWrite?.();
   };
+
+  /**
+   * Away-mode approval: create a request on the PCP server, which notifies the
+   * user's connected platforms (Telegram, etc.) and intercepts their reply. The
+   * server owns routing; we create and poll.
+   */
+  const askFor2faApproval = async (ticket: ApprovalTicket): Promise<boolean> => {
+    const { tool, reason, args } = ticket;
+    const who =
+      ticket.origin.origin === 'clone' ? ` (🌀 ${ticket.origin.cloneLabel || 'clone'})` : '';
+    printLine(chalk.yellow(`⏳ Requesting 2FA approval for ${tool}${who}…`));
+    // Sanitize args for the notification — show command/path but redact large content
+    const sanitizedArgs = args ? sanitizeArgsForApproval(tool, args) : undefined;
+    try {
+      const result = await requestToolApproval({
+        tool,
+        args: sanitizedArgs,
+        reason,
+        sessionId: runtime.sessionId,
+        studioId: runtime.studioId,
+        signal: ticket.signal,
+        onCreated: (id) => {
+          printLine(chalk.yellow(`   Request ${id.slice(0, 8)}… sent to connected platforms`));
+        },
+      });
+
+      if (result.status === 'granted') {
+        // Apply persistent grants to the tool policy
+        if (
+          result.action === 'grant-agent' ||
+          result.action === 'allow' ||
+          result.action === 'grant-studio'
+        ) {
+          // Grant at the specific scope from the approval response.
+          // persistentGrant writes the permanent grant at the target scope
+          // and removes from promptTools at all scopes so the tool stops prompting.
+          const grantScope = result.action === 'grant-studio' ? 'studio' : 'agent';
+          const scopeId =
+            grantScope === 'studio'
+              ? toolPolicy.getContext()?.studioId
+              : toolPolicy.getContext()?.agentId;
+          if (scopeId) {
+            toolPolicy.persistentGrant(tool, { scope: grantScope, id: scopeId });
+            printLine(
+              chalk.green(`✅ 2FA: ${tool} permanently approved (${grantScope}: ${scopeId})`)
+            );
+          } else {
+            // Can't resolve scope — fall back to session grant instead of leaking to global
+            if (runtime.sessionId) {
+              toolPolicy.grantToolForSession(runtime.sessionId, tool);
+            }
+            printLine(
+              chalk.yellow(
+                `⚠️ 2FA: ${tool} approved for session only (could not resolve ${grantScope} scope)`
+              )
+            );
+          }
+        } else if (result.action === 'grant-session') {
+          if (runtime.sessionId) {
+            toolPolicy.grantToolForSession(runtime.sessionId, tool);
+          }
+          printLine(chalk.green(`✅ 2FA: ${tool} approved for this session`));
+        } else {
+          printLine(chalk.green(`✅ 2FA approval granted for ${tool}`));
+        }
+        return true;
+      } else if (result.status === 'aborted') {
+        printLine(chalk.dim(`↩ 2FA approval for ${tool} cancelled`));
+        return false;
+      } else if (result.status === 'timeout') {
+        printLine(chalk.yellow(`⏰ 2FA approval timed out for ${tool}`));
+        return false;
+      } else if (result.status === 'error') {
+        printLine(chalk.yellow(`⚠️ 2FA error: ${result.error}`));
+        return false;
+      } else {
+        printLine(chalk.yellow(`🚫 2FA approval denied for ${tool}`));
+        return false;
+      }
+    } catch {
+      printLine(chalk.yellow('Failed to create 2FA approval request — denying tool call'));
+      return false;
+    }
+  };
+
+  /**
+   * Ask the user about one tool call. Two very different waits hide behind this:
+   * the local prompt (Ink / readline / JSONL) and the away-mode 2FA round-trip
+   * through the PCP server. The coordinator below decides *when* this runs; this
+   * function only decides *how* to ask.
+   */
+  const askForToolApproval = async (
+    ticket: ApprovalTicket,
+    promptCtx: { queuedNow: () => number }
+  ): Promise<boolean> => {
+    if (!runtime.awayMode) {
+      return promptForToolApproval(
+        rl,
+        toolPolicy,
+        runtime.sessionId,
+        ticket.tool,
+        ticket.reason,
+        inkRepl,
+        runtime.approvalChannel,
+        ticket.args,
+        { origin: ticket.origin, signal: ticket.signal, queuedNow: promptCtx.queuedNow }
+      );
+    }
+    return askFor2faApproval(ticket);
+  };
+
+  /**
+   * Approvals from the parent turn and from concurrent clones, gated to whatever
+   * the active adapter can sustain.
+   *
+   * Interactive adapters own a single input slot — two overlapping prompts
+   * orphan the first promise forever — so they serialize. JSONL and 2FA
+   * correlate by request id and would only gain head-of-line blocking from a
+   * queue, so they run free. Away mode can be toggled mid-session, hence the
+   * function rather than a frozen number.
+   */
+  const approvalCoordinator = new ApprovalCoordinator({
+    concurrency: () =>
+      concurrencyForAdapter(
+        runtime.awayMode || runtime.approvalChannel ? 'correlated' : 'interactive'
+      ),
+    prompt: askForToolApproval,
+    // Re-check at the FRONT of the queue, not at enqueue time: while this ticket
+    // waited, a sibling's "session"/"always" answer may already have settled the
+    // same tool, and asking again is asking a question already answered. Must be
+    // the non-consuming inspect — a query that spends a one-use grant would
+    // charge the parent for a clone's call that has not happened yet.
+    recheck: (ticket) => {
+      const decision = toolPolicy.inspectPcpTool(
+        ticket.tool.replace(/^mcp__inkwell__/, ''),
+        runtime.sessionId
+      );
+      if (decision.allowed) {
+        // An allow resting on a one-use grant is NOT a free pass: leaving it to
+        // the executor's own canCallPcpTool keeps the grant accounting in one
+        // place instead of spending it here.
+        return decision.wouldConsumeGrant ? 'prompt' : 'allow';
+      }
+      return decision.promptable ? 'prompt' : 'deny';
+    },
+  });
 
   // Non-interactive event stream. When running headless (server-spawned via
   // InkRunner with --non-interactive), emit structured NDJSON lines to stdout
@@ -4428,7 +4596,14 @@ export async function runChat(options: ChatOptions): Promise<void> {
    * shadow clone can supply its own executor over a narrowed policy snapshot
    * without the loop knowing anything about ToolPolicyState.
    */
-  const runIterationTools = async (calls: LocalToolCall[]): Promise<ToolResultRecord[]> => {
+  const runIterationTools = async (
+    calls: LocalToolCall[],
+    ctx?: { signal?: AbortSignal; origin?: ApprovalOriginInfo }
+  ): Promise<ToolResultRecord[]> => {
+    // Approvals raised from here belong to the parent turn unless a clone
+    // supplied its own identity, which is what lets the prompt say *who* asked.
+    const approvalOrigin: ApprovalOriginInfo = ctx?.origin ?? { origin: 'parent' };
+    const abortSignal = ctx?.signal;
     const iterationResults: ToolResultRecord[] = [];
     await executeToolCalls(calls, {
       policy: toolPolicy,
@@ -4459,92 +4634,17 @@ export async function runChat(options: ChatOptions): Promise<void> {
         return pcp.callTool(bareTool, resolvedArgs);
       },
       sessionId: runtime.sessionId,
-      promptForApproval: async (tool, reason, args) => {
-        if (!runtime.awayMode) {
-          return promptForToolApproval(
-            rl,
-            toolPolicy,
-            runtime.sessionId,
+      promptForApproval: (tool, reason, args) =>
+        approvalCoordinator
+          .request({
             tool,
-            reason,
-            inkRepl,
-            runtime.approvalChannel,
-            args
-          );
-        }
-        // 2FA approval: create request on the PCP server, which sends
-        // notifications to the user's connected platforms (Telegram, etc.).
-        // The server handles all routing — we just poll for the result.
-        printLine(chalk.yellow(`⏳ Requesting 2FA approval for ${tool}…`));
-        // Sanitize args for the notification — show command/path but redact large content
-        const sanitizedArgs = args ? sanitizeArgsForApproval(tool, args) : undefined;
-        try {
-          const result = await requestToolApproval({
-            tool,
-            args: sanitizedArgs,
+            args: args ?? {},
             reason,
             sessionId: runtime.sessionId,
-            studioId: runtime.studioId,
-            onCreated: (id) => {
-              printLine(chalk.yellow(`   Request ${id.slice(0, 8)}… sent to connected platforms`));
-            },
-          });
-
-          if (result.status === 'granted') {
-            // Apply persistent grants to the tool policy
-            if (
-              result.action === 'grant-agent' ||
-              result.action === 'allow' ||
-              result.action === 'grant-studio'
-            ) {
-              // Grant at the specific scope from the approval response.
-              // persistentGrant writes the permanent grant at the target scope
-              // and removes from promptTools at all scopes so the tool stops prompting.
-              const grantScope = result.action === 'grant-studio' ? 'studio' : 'agent';
-              const scopeId =
-                grantScope === 'studio'
-                  ? toolPolicy.getContext()?.studioId
-                  : toolPolicy.getContext()?.agentId;
-              if (scopeId) {
-                toolPolicy.persistentGrant(tool, { scope: grantScope, id: scopeId });
-                printLine(
-                  chalk.green(`✅ 2FA: ${tool} permanently approved (${grantScope}: ${scopeId})`)
-                );
-              } else {
-                // Can't resolve scope — fall back to session grant instead of leaking to global
-                if (runtime.sessionId) {
-                  toolPolicy.grantToolForSession(runtime.sessionId, tool);
-                }
-                printLine(
-                  chalk.yellow(
-                    `⚠️ 2FA: ${tool} approved for session only (could not resolve ${grantScope} scope)`
-                  )
-                );
-              }
-            } else if (result.action === 'grant-session') {
-              if (runtime.sessionId) {
-                toolPolicy.grantToolForSession(runtime.sessionId, tool);
-              }
-              printLine(chalk.green(`✅ 2FA: ${tool} approved for this session`));
-            } else {
-              printLine(chalk.green(`✅ 2FA approval granted for ${tool}`));
-            }
-            return true;
-          } else if (result.status === 'timeout') {
-            printLine(chalk.yellow(`⏰ 2FA approval timed out for ${tool}`));
-            return false;
-          } else if (result.status === 'error') {
-            printLine(chalk.yellow(`⚠️ 2FA error: ${result.error}`));
-            return false;
-          } else {
-            printLine(chalk.yellow(`🚫 2FA approval denied for ${tool}`));
-            return false;
-          }
-        } catch {
-          printLine(chalk.yellow('Failed to create 2FA approval request — denying tool call'));
-          return false;
-        }
-      },
+            origin: approvalOrigin,
+            signal: abortSignal,
+          })
+          .then((outcome) => outcome.approved),
       onResult: (result: ToolCallResult) => {
         if (result.status === 'blocked' || result.status === 'denied') {
           const msg = `Local tool ${result.status} (${result.tool}): ${result.reason}`;
@@ -4957,7 +5057,17 @@ export async function runChat(options: ChatOptions): Promise<void> {
     let turnCtrlCAt = 0;
     let currentTurnAbort: (() => void) | null = null;
 
+    /**
+     * Cancellation for everything in this turn that is NOT the backend child
+     * process. Killing the child (`currentTurnAbort`) has always ended the
+     * backend's work, but anything waiting *around* it — an approval prompt, a
+     * 2FA poll — had no way to hear about it and would sit for its full timeout.
+     * Fresh per turn, so a cancelled turn does not disarm the next one.
+     */
+    const turnAbort = new AbortController();
+
     const abortCurrentTurn = () => {
+      if (!turnAbort.signal.aborted) turnAbort.abort();
       if (currentTurnAbort) {
         currentTurnAbort();
         currentTurnAbort = null;
@@ -5218,7 +5328,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     };
 
     const loopResult = await runAgentLoop(
-      { prompt, toolRouting: runtime.toolRouting },
+      { prompt, toolRouting: runtime.toolRouting, signal: turnAbort.signal },
       {
         ui: {
           printLine: (text) => printLine(chalk.dim(text)),
@@ -5235,7 +5345,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
                   renderAbovePrompt: true,
                 }),
         },
-        tools: { execute: (calls) => runIterationTools(calls) },
+        tools: { execute: (calls, ctx) => runIterationTools(calls, { signal: ctx.signal }) },
         backend: { runTurn: runTurnForLoop },
         observe: {
           recordToolCall: (r) => {
@@ -5775,6 +5885,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // heartbeat delivery callback indefinitely.
     readyForAutoRun = false;
     approvalManager.cancelAll();
+    approvalCoordinator.dispose();
     runtime.approvalChannel?.dispose();
     if (pendingTurns > 0) {
       await turnQueue;
@@ -7273,6 +7384,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
   // Cancel any pending remote approval requests
   approvalManager.cancelAll();
+  approvalCoordinator.dispose();
   runtime.approvalChannel?.dispose();
 
   const summary = summarizeForSessionEnd(ledger);
