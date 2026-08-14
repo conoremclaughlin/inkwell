@@ -3,7 +3,7 @@
 import { useEffect } from 'react';
 import { useApiQuery } from '@/lib/api';
 import { useCommandStore } from './store';
-import type { AgentState, StudioNode, TaskNode, ActivityEvent } from './store';
+import type { AgentState, StudioNode, StudioLeaseView, TaskNode, ActivityEvent } from './store';
 
 // ─── Types matching API responses ───
 
@@ -13,9 +13,14 @@ interface StudioInfo {
   purpose: string | null;
   workType: string | null;
   worktreePath: string | null;
+  repoRoot: string | null;
   slug: string | null;
   status: string;
   updatedAt: string;
+  lease: StudioLeaseView | null;
+  ephemeral: boolean;
+  parentStudioId: string | null;
+  expiresAt: string | null;
 }
 
 interface AgentLatestSession {
@@ -48,6 +53,7 @@ interface TaskItem {
   priority: string;
   taskGroupId: string | null;
   taskOrder: number | null;
+  blockedBy: string[] | null;
   createdBy: string | null;
 }
 
@@ -86,6 +92,11 @@ function arrangeStudiosInCircle(
       workType: s.workType,
       status: s.status,
       agentId,
+      repoRoot: s.repoRoot ?? null,
+      lease: s.lease ?? null,
+      ephemeral: s.ephemeral ?? false,
+      parentStudioId: s.parentStudioId ?? null,
+      expiresAt: s.expiresAt ?? null,
       position: {
         x: centerX + radius * Math.cos(angle),
         y: centerY + radius * Math.sin(angle),
@@ -138,15 +149,21 @@ export function useCommandData() {
       const centerX = (col - (rowCount - 1) / 2) * colSpacing;
       const centerY = (row - Math.floor((studiosData.agents.length - 1) / cols) / 2) * rowSpacing;
 
-      const activeStudio = agent.studios.find((s) => s.status === 'active');
+      // Presence is the lease, not the status column (spec:studio-canvas
+      // principle 4). `status` reports 'active' for studios untouched for
+      // months, so status-based presence put every agent in a studio at all
+      // times — which is indistinguishable from putting them nowhere.
+      // A held lease is the only evidence an agent is actually in a worktree.
+      const heldStudio =
+        agent.studios.find((s) => s.lease && !s.lease.quarantined && !s.lease.claimKind) ?? null;
 
       agentStates.push({
         agentId: agent.agentId,
         name: agent.agentName,
         role: agent.agentRole,
         backend: agent.backend,
-        studioId: activeStudio?.id ?? null,
-        studioSlug: activeStudio?.slug ?? null,
+        studioId: heldStudio?.id ?? null,
+        studioSlug: heldStudio?.slug ?? null,
         lifecycle: agent.latestSession?.lifecycle ?? null,
         phase: agent.latestSession?.currentPhase ?? null,
         activeThreadKey: agent.latestSession?.activeThreadKey ?? null,
@@ -189,6 +206,7 @@ export function useCommandData() {
       groupTitle: t.taskGroupId ? (groupMap.get(t.taskGroupId) ?? null) : null,
       taskOrder: t.taskOrder,
       agentId: t.createdBy,
+      blockedBy: t.blockedBy ?? [],
     }));
 
     setTasks(taskNodes);

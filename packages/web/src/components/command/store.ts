@@ -19,6 +19,25 @@ export interface AgentState {
   targetPosition: { x: number; y: number } | null;
 }
 
+/**
+ * Occupancy for a studio, as recorded by the lease
+ * (spec:trigger-studio-routing Phase 5). Null when the studio is free.
+ */
+export interface StudioLeaseView {
+  sessionId: string;
+  threadKey: string;
+  agentId: string;
+  acquiredAt: string;
+  heartbeatAt: string;
+  reason?: string;
+  quarantined: boolean;
+  claimKind: string | null;
+  pendingRelease: { reason: string; requestedAt: string } | null;
+  /** Past the staleness threshold — reclaimable, not necessarily dead. */
+  stale: boolean;
+  heartbeatAgeMs: number | null;
+}
+
 export interface StudioNode {
   id: string;
   slug: string | null;
@@ -27,6 +46,12 @@ export interface StudioNode {
   workType: string | null;
   status: string;
   agentId: string;
+  /** Repo this studio's worktree belongs to — the Level 0 territory key. */
+  repoRoot: string | null;
+  lease: StudioLeaseView | null;
+  ephemeral: boolean;
+  parentStudioId: string | null;
+  expiresAt: string | null;
   position: { x: number; y: number };
 }
 
@@ -39,6 +64,8 @@ export interface TaskNode {
   groupTitle: string | null;
   taskOrder: number | null;
   agentId: string | null;
+  /** Task IDs that must complete before this one — the real graph edges. */
+  blockedBy: string[];
 }
 
 export interface ActivityEvent {
