@@ -125,6 +125,14 @@ export type AcquireResult =
   | { acquired: true; lease: StudioLease; reclaimedFrom?: StudioLease }
   | { acquired: false; holder: StudioLease | null };
 
+/**
+ * Internal outcome of one pass over an occupied studio. `retry` sends control
+ * back to acquire()'s validated ladder: only acquire() grants, and only from
+ * a snapshot it has just validated, so no inner path can accept ownership of
+ * a studio that changed underneath it.
+ */
+type AcquireOutcome = AcquireResult | { retry: true };
+
 export interface WorktreeFinalState {
   branch?: string;
   commit?: string;
@@ -392,7 +400,11 @@ export class StudioLeaseService {
 
       const holder = current?.lease ?? null;
       if (holder) {
-        return this.resolveOccupied(req, lease, holder, current?.worktreePath);
+        const outcome = await this.resolveOccupied(req, lease, holder, current?.worktreePath);
+        // A retry signal means an inner CAS lost: loop to re-read and
+        // re-validate rather than trusting the snapshot that lost.
+        if ('retry' in outcome) continue;
+        return outcome;
       }
 
       if (await this.casVacant(req, lease)) {
@@ -758,7 +770,7 @@ export class StudioLeaseService {
     lease: StudioLease,
     holder: StudioLease,
     worktreePath?: string
-  ): Promise<AcquireResult> {
+  ): Promise<AcquireOutcome> {
     const now = new Date().toISOString();
 
     // 0) Quarantine / destructive claim — checked BEFORE adoption so these
@@ -822,13 +834,14 @@ export class StudioLeaseService {
       if (won) {
         return { acquired: true, lease: adopted };
       }
-      // Lost the adopt race. Acquired ONLY if the re-read shows this session
-      // actually holds the lease — never report acquired for a non-holder.
-      const reread = await this.getLease(req.studioId, req.userId);
-      if (reread?.lease?.sessionId === req.sessionId) {
-        return { acquired: true, lease: reread.lease };
-      }
-      return { acquired: false, holder: reread?.lease ?? holder };
+      // Lost the adopt race. Ownership is NEVER accepted from an unvalidated
+      // snapshot — not even when the reread shows our own session holding the
+      // lease, because the studio it sits on may have changed underneath
+      // (status flipped, worktree deleted). Hand control back to acquire()'s
+      // validated ladder, which re-reads, re-validates, and re-attempts; if
+      // this session really does hold it, the next pass adopts its own lease
+      // and grants. (Round 10 — the same defect round 9 fixed one layer up.)
+      return { retry: true };
     }
 
     // 3) Stale foreign lease — refuse for live holders, else fence and rescue.

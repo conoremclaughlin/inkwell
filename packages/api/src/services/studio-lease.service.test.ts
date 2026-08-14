@@ -294,6 +294,80 @@ describe('StudioLeaseService.acquire', () => {
     expect(tables.studios[0].lease).toBeNull();
   });
 
+  it('re-validates after a lost ADOPTION CAS — never accepts its own lease unchecked (round 10)', async () => {
+    // A validates an old same-thread holder over a present cwd. B then
+    // acquires FOR THE REQUESTING SESSION while the worktree disappears. A
+    // loses the adoption CAS and its reread shows its own sessionId holding
+    // the lease — which must NOT be accepted, because the studio underneath
+    // it has changed.
+    tables.studios[0].lease = freshLease({ sessionId: 'session-old', threadKey: 'pr:200' });
+    tables.studios[0].worktree_path = tmpdir(); // present at the first read
+    tables.sessions.push({
+      id: 'session-old',
+      user_id: 'user-1',
+      ended_at: new Date().toISOString(),
+      status: 'completed',
+    });
+
+    let raced = false;
+    const hooked = new StudioLeaseService(
+      makeFakeSupabase(tables, {
+        afterSelect: (table, count) => {
+          if (table === 'studios' && count === 1 && !raced) {
+            raced = true;
+            // B wins the studio for our own session, and the cwd vanishes.
+            tables.studios[0].lease = freshLease({
+              sessionId: req.sessionId,
+              threadKey: 'pr:200',
+            });
+            tables.studios[0].worktree_path = path.join(tmpdir(), 'vanished-mid-adopt-xyz');
+          }
+        },
+      })
+    );
+
+    const result = await hooked.acquire(req);
+    expect(raced).toBe(true);
+    expect(result.acquired).toBe(false);
+    // The retry pass validated the new snapshot and retired the dead studio.
+    expect(tables.studios[0].status).toBe('cleaned');
+    expect(tables.studios[0].lease).toBeNull();
+  });
+
+  it('still grants when the lost adoption CAS resolves to a healthy own-session lease (round 10)', async () => {
+    // Same lost-CAS shape, but nothing is wrong with the studio: the retry
+    // pass must validate and then grant, not refuse.
+    tables.studios[0].lease = freshLease({ sessionId: 'session-old', threadKey: 'pr:200' });
+    tables.studios[0].worktree_path = tmpdir();
+    tables.sessions.push({
+      id: 'session-old',
+      user_id: 'user-1',
+      ended_at: new Date().toISOString(),
+      status: 'completed',
+    });
+
+    let raced = false;
+    const hooked = new StudioLeaseService(
+      makeFakeSupabase(tables, {
+        afterSelect: (table, count) => {
+          if (table === 'studios' && count === 1 && !raced) {
+            raced = true;
+            tables.studios[0].lease = freshLease({
+              sessionId: req.sessionId,
+              threadKey: 'pr:200',
+            });
+          }
+        },
+      })
+    );
+
+    const result = await hooked.acquire(req);
+    expect(raced).toBe(true);
+    expect(result.acquired).toBe(true);
+    expect((tables.studios[0].lease as StudioLease).sessionId).toBe(req.sessionId);
+    expect(tables.studios[0].status).toBe('active');
+  });
+
   it('never steals a FRESH teardown claim when the worktree is missing (round 9)', async () => {
     // close_studio's normal window: the worktree is legitimately gone
     // between `git worktree remove` and the owner's finalizeTeardown. The
