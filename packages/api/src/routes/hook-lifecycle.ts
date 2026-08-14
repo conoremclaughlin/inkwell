@@ -117,6 +117,32 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         });
       });
 
+      // CLI run boundary: the stop hook is the moment an attached CLI turn
+      // has actually finished executing in the worktree. A terminal session
+      // (end_session / update_session_state(completed) called mid-turn was
+      // deferred precisely for this moment) releases its lease now.
+      if (lifecycle === 'idle' || lifecycle === 'completed') {
+        void dataComposer.repositories.memory
+          .getSession(sessionId)
+          .then((postUpdate) => {
+            const terminal =
+              Boolean(postUpdate?.endedAt) ||
+              postUpdate?.status === 'completed' ||
+              postUpdate?.lifecycle === 'completed';
+            if (!terminal) return false;
+            return leaseService.releaseBySession(sessionId, {
+              userId: session.userId,
+              reason: 'cli-turn-stopped',
+            });
+          })
+          .catch((err: unknown) => {
+            logger.warn('[HookLifecycle] CLI-boundary lease release failed', {
+              sessionId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          });
+      }
+
       logger.debug('[HookLifecycle] Updated', { sessionId, lifecycle, agentId });
       res.json({ success: true, sessionId, lifecycle });
     } catch (error) {

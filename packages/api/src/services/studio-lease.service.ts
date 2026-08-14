@@ -2,7 +2,7 @@
  * Studio Lease Service
  *
  * A studio is a git worktree and can host exactly one work-thread at a time
- * (spec:trigger-studio-routing v12 §Occupancy). The lease jsonb on studios is
+ * (spec:trigger-studio-routing v13 §Occupancy). The lease jsonb on studios is
  * the authoritative occupancy record; this service owns its lifecycle.
  *
  * Every transition is programmatic — the holder never has to opt in:
@@ -10,24 +10,28 @@
  *   - renew:   heartbeatAt bumped by CLI lifecycle hooks (per prompt/stop) and
  *              by the sweep for sessions with a live in-process run
  *   - release: on session end, thread close, or close_studio — at the real
- *              terminal boundary (deferred while an in-process run is live)
+ *              terminal boundary (deferred while the session's process — server
+ *              runner OR attached CLI turn — is still live in the worktree)
  *   - expire:  heartbeatAt stale beyond LEASE_STALE_MS → claimed, rescued, released
  *
- * Safety invariants (PR #492 review, Lumen):
+ * Safety invariants (PR #492 review rounds 1–2, Lumen):
  *   - Every read and CAS is scoped to the owning user. A studio UUID alone
  *     never authorizes a lease mutation.
  *   - Reclaim and expiry FENCE FIRST, RESCUE SECOND: the exact prior lease
- *     (including heartbeatAt) is CAS-claimed before any git command runs, so
- *     a holder that renews concurrently defeats the reclaim, and a losing
- *     reclaimer never stashes a live holder's work.
- *   - If rescue fails after claiming, the studio is quarantined (reclaim:
- *     claim released, caller diverts to overflow; expiry: sweeper marker kept,
- *     retried next sweep) — an unrescued worktree is never handed out.
+ *     (including heartbeatAt) is CAS-claimed before any git command runs.
+ *   - A failed rescue produces a DURABLE QUARANTINE lease: non-vacant (the
+ *     studio cannot be CAS-acquired), non-adoptable (its threadKey is the
+ *     reserved quarantine key no real thread can carry), holding the original
+ *     holder's session UUID for audit. It self-heals: once stale, any acquire
+ *     or sweep may re-claim it, and only a VERIFIED rescue converts it into an
+ *     acquisition or a vacancy.
+ *   - Same-thread adoption never steals from a live holder: if the recorded
+ *     holder session has an in-process run or a freshly-attached CLI, adoption
+ *     is refused and the caller diverts to overflow. A lost adopt race never
+ *     reports acquired unless the re-read shows this session actually holds it.
  *
  * Lease events (studio_lease_events) answer the four occupancy questions from
- * recorded data: why grabbed (reason = routing tier), how long held (heldMs),
- * what was happening (threadKey/sessionId), how released (event + final state).
- * Renewals are not logged; they would drown the signal.
+ * recorded data. Renewals are not logged; they would drown the signal.
  */
 
 import { execFile } from 'child_process';
@@ -50,16 +54,32 @@ export interface StudioLease {
   heartbeatAt: string;
   /** Routing tier that assigned the studio (visibility: "why is someone grabbing it"). */
   reason?: string;
+  /**
+   * Durable quarantine: the worktree could not be rescued. Non-vacant and
+   * non-adoptable until a verified rescue clears it. sessionId keeps the
+   * original holder's UUID for audit.
+   */
+  quarantined?: boolean;
+  /** The real thread the studio was serving when it entered quarantine. */
+  heldThreadKey?: string;
 }
 
 /** No heartbeat for this long → the lease is stale and may be reclaimed. */
 export const LEASE_STALE_MS = 30 * 60 * 1000;
 
+/** cli_attached older than this is treated as a dead flag, not a live CLI. */
+export const CLI_ATTACHED_FRESH_MS = 10 * 60 * 1000;
+
 /** Ephemeral overflow studios expire this long after creation if never re-leased. */
 export const EPHEMERAL_STUDIO_TTL_MS = 72 * 60 * 60 * 1000;
 
-/** sessionId prefix for the sweeper's transitional claim during expiry. */
-const SWEEP_CLAIM_PREFIX = 'lease-sweep:';
+/**
+ * Reserved threadKey for quarantine/teardown leases. Real threadKeys must
+ * match `<type>:<identifier>` (validated at every boundary), so this value —
+ * no colon, reserved prefix — can never collide with or be adopted by a real
+ * thread.
+ */
+export const QUARANTINE_THREAD_KEY = '__quarantine__';
 
 export type LeaseEventType =
   | 'acquired'
@@ -105,7 +125,7 @@ export function isLeaseStale(lease: StudioLease, nowMs: number = Date.now()): bo
   return nowMs - heartbeat > LEASE_STALE_MS;
 }
 
-function parseLease(raw: Json | null | undefined): StudioLease | null {
+export function parseStudioLease(raw: Json | null | undefined): StudioLease | null {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
   const obj = raw as Record<string, unknown>;
   if (typeof obj.sessionId !== 'string' || typeof obj.threadKey !== 'string') return null;
@@ -117,6 +137,8 @@ function parseLease(raw: Json | null | undefined): StudioLease | null {
     acquiredAt: typeof obj.acquiredAt === 'string' ? obj.acquiredAt : '',
     heartbeatAt: typeof obj.heartbeatAt === 'string' ? obj.heartbeatAt : '',
     reason: typeof obj.reason === 'string' ? obj.reason : undefined,
+    quarantined: obj.quarantined === true,
+    heldThreadKey: typeof obj.heldThreadKey === 'string' ? obj.heldThreadKey : undefined,
   };
 }
 
@@ -185,23 +207,47 @@ export class StudioLeaseService {
     }
     if (!data) return null;
     return {
-      lease: parseLease(data.lease),
+      lease: parseStudioLease(data.lease),
       worktreePath: data.worktree_path,
       ephemeral: data.ephemeral,
     };
   }
 
   /**
+   * Is the session's process still executing in a worktree? Covers both
+   * server-spawned runners (in-process registry) and interactively attached
+   * CLI turns (sessions.cli_attached, with the 10-minute freshness rule the
+   * trigger path already applies — a stale flag is a dead flag).
+   */
+  async isSessionLive(sessionId: string, userId?: string): Promise<boolean> {
+    if (hasActiveRun(sessionId)) return true;
+    let query = this.supabase
+      .from('sessions')
+      .select('cli_attached, updated_at')
+      .eq('id', sessionId);
+    if (userId) query = query.eq('user_id', userId);
+    const { data } = await query.maybeSingle();
+    if (!data?.cli_attached) return false;
+    const updatedAt = Date.parse(data.updated_at ?? '');
+    if (Number.isNaN(updatedAt)) return false;
+    return Date.now() - updatedAt < CLI_ATTACHED_FRESH_MS;
+  }
+
+  /**
    * Acquire the studio for a (session, thread), atomically.
    *
    * CAS ladder:
+   *   0. quarantined lease      → refuse while fresh; once stale, re-claim and
+   *                               retry the rescue — only a VERIFIED rescue
+   *                               converts quarantine into an acquisition
    *   1. lease IS NULL          → take it
-   *   2. same threadKey         → adopt (leases are per-thread; a newer session
-   *                               on the same thread takes the lease over)
+   *   2. same threadKey         → adopt, but only from a holder session that is
+   *                               NOT live (no in-process run, no fresh CLI) —
+   *                               two sessions of one thread must not both run
+   *                               in the worktree
    *   3. stale foreign lease    → CLAIM first (CAS guarded on the exact holder
-   *                               including heartbeatAt — a concurrent renewal
-   *                               defeats the reclaim), THEN rescue. Rescue
-   *                               failure releases the claim and refuses.
+   *                               including heartbeatAt), THEN rescue. Rescue
+   *                               failure converts the claim into quarantine.
    *   4. fresh foreign lease    → refuse; caller diverts to overflow
    *
    * Every CAS is additionally guarded on user_id — a studio UUID alone never
@@ -285,6 +331,121 @@ export class StudioLeaseService {
     return Boolean(data?.length);
   }
 
+  /** CAS the lease from one exact value (incl. heartbeatAt) to another. */
+  private async casLease(
+    studioId: string,
+    userId: string,
+    from: StudioLease,
+    to: StudioLease | null
+  ): Promise<boolean> {
+    const { data } = await this.supabase
+      .from('studios')
+      .update({ lease: to as unknown as Json })
+      .eq('id', studioId)
+      .eq('user_id', userId)
+      .eq('lease->>sessionId', from.sessionId)
+      .eq('lease->>acquiredAt', from.acquiredAt)
+      .eq('lease->>heartbeatAt', from.heartbeatAt)
+      .select('id');
+    return Boolean(data?.length);
+  }
+
+  private quarantineRecord(holder: StudioLease, reason: string): StudioLease {
+    return {
+      // Original holder's session UUID preserved for audit (and so event rows
+      // always carry a valid uuid).
+      sessionId: holder.sessionId,
+      threadKey: QUARANTINE_THREAD_KEY,
+      heldThreadKey: holder.heldThreadKey ?? holder.threadKey,
+      agentId: holder.agentId,
+      sbId: holder.sbId,
+      acquiredAt: holder.acquiredAt,
+      heartbeatAt: new Date().toISOString(), // rate-limits retries to LEASE_STALE_MS
+      reason,
+      quarantined: true,
+    };
+  }
+
+  /**
+   * Fence-then-rescue against an exact observed holder. Wins the claim (or
+   * returns not-acquired), then takes the safe ref. A failed rescue converts
+   * the claim into a durable quarantine — the studio is never handed out and
+   * never returns to vacancy without a verified rescue.
+   */
+  private async claimAndRescue(
+    req: AcquireRequest,
+    lease: StudioLease,
+    holder: StudioLease,
+    worktreePath: string | undefined,
+    eventReason: string
+  ): Promise<AcquireResult> {
+    const claimed = await this.casLease(req.studioId, req.userId, holder, lease);
+    if (!claimed) {
+      const reread = await this.getLease(req.studioId, req.userId);
+      return { acquired: false, holder: reread?.lease ?? holder };
+    }
+
+    if (worktreePath) {
+      const rescue = await captureWorktreeState(worktreePath, {
+        rescue: true,
+        rescueLabel: holder.heldThreadKey ?? holder.threadKey,
+      });
+      if (!rescueSucceeded(rescue)) {
+        // QUARANTINE: convert our claim into a durable non-vacant,
+        // non-adoptable state. Only a verified rescue clears it.
+        const quarantine = this.quarantineRecord(holder, 'quarantine:rescue-failed');
+        await this.casLease(req.studioId, req.userId, lease, quarantine);
+        logger.error('[StudioLease] Rescue failed — studio quarantined', {
+          studioId: req.studioId,
+          previousHolder: { sessionId: holder.sessionId, threadKey: holder.threadKey },
+          rescue,
+        });
+        await this.logEvent(req.userId, req.studioId, 'conflict', {
+          sessionId: holder.sessionId,
+          threadKey: holder.heldThreadKey ?? holder.threadKey,
+          agentId: holder.agentId,
+          sbId: holder.sbId,
+          reason: 'rescue-failed-quarantined',
+          detail: {
+            previousHolder: holder as unknown as Json,
+            rescue: rescue as unknown as Json,
+          },
+        });
+        return { acquired: false, holder: quarantine };
+      }
+
+      logger.warn('[StudioLease] Reclaimed lease after verified rescue', {
+        studioId: req.studioId,
+        from: { sessionId: holder.sessionId, threadKey: holder.threadKey },
+        to: { sessionId: req.sessionId, threadKey: req.threadKey },
+        rescue,
+      });
+      await this.logEvent(req.userId, req.studioId, 'reclaimed', {
+        sessionId: req.sessionId,
+        threadKey: req.threadKey,
+        agentId: req.agentId,
+        sbId: lease.sbId,
+        reason: eventReason,
+        detail: {
+          previousHolder: holder as unknown as Json,
+          rescue: rescue as unknown as Json,
+        },
+      });
+      return { acquired: true, lease, reclaimedFrom: holder };
+    }
+
+    // No worktree to rescue — the claim stands as the acquisition.
+    await this.logEvent(req.userId, req.studioId, 'reclaimed', {
+      sessionId: req.sessionId,
+      threadKey: req.threadKey,
+      agentId: req.agentId,
+      sbId: lease.sbId,
+      reason: eventReason,
+      detail: { previousHolder: holder as unknown as Json },
+    });
+    return { acquired: true, lease, reclaimedFrom: holder };
+  }
+
   private async resolveOccupied(
     req: AcquireRequest,
     lease: StudioLease,
@@ -293,8 +454,32 @@ export class StudioLeaseService {
   ): Promise<AcquireResult> {
     const now = new Date().toISOString();
 
-    // 2) Same thread — the lease follows the thread, not the session.
+    // 0) Quarantine — checked BEFORE adoption so a quarantine record can never
+    //    be adopted. Fresh quarantine refuses outright; stale quarantine may be
+    //    re-claimed, but only a verified rescue converts it.
+    if (holder.quarantined) {
+      if (!isLeaseStale(holder)) {
+        return { acquired: false, holder };
+      }
+      return this.claimAndRescue(req, lease, holder, worktreePath, 'quarantine-recovered');
+    }
+
+    // 2) Same thread — the lease follows the thread, but never away from a
+    //    live holder: two sessions of one thread must not both execute in the
+    //    worktree. Live = in-process server run OR freshly-attached CLI.
     if (holder.threadKey === req.threadKey) {
+      if (holder.sessionId !== req.sessionId) {
+        const live = await this.isSessionLive(holder.sessionId, req.userId);
+        if (live) {
+          logger.warn('[StudioLease] Adoption refused — holder session is live', {
+            studioId: req.studioId,
+            threadKey: req.threadKey,
+            holderSessionId: holder.sessionId,
+            requestingSessionId: req.sessionId,
+          });
+          return { acquired: false, holder };
+        }
+      }
       const adopted: StudioLease = {
         ...holder,
         sessionId: req.sessionId,
@@ -303,21 +488,14 @@ export class StudioLeaseService {
         heartbeatAt: now,
         reason: req.reason ?? holder.reason,
       };
-      const { data } = await this.supabase
-        .from('studios')
-        .update({ lease: adopted as unknown as Json })
-        .eq('id', req.studioId)
-        .eq('user_id', req.userId)
-        .eq('lease->>threadKey', req.threadKey)
-        .eq('lease->>sessionId', holder.sessionId)
-        .select('id');
-      if (data?.length) {
+      const won = await this.casLease(req.studioId, req.userId, holder, adopted);
+      if (won) {
         return { acquired: true, lease: adopted };
       }
-      // Lost an adopt race to a sibling on the same thread — that's still our
-      // thread holding the studio; report acquired with the current holder.
+      // Lost the adopt race. Acquired ONLY if the re-read shows this session
+      // actually holds the lease — never report acquired for a non-holder.
       const reread = await this.getLease(req.studioId, req.userId);
-      if (reread?.lease?.threadKey === req.threadKey) {
+      if (reread?.lease?.sessionId === req.sessionId) {
         return { acquired: true, lease: reread.lease };
       }
       return { acquired: false, holder: reread?.lease ?? holder };
@@ -331,86 +509,13 @@ export class StudioLeaseService {
         await this.renewBySession(holder.sessionId, req.userId);
         return { acquired: false, holder };
       }
-
-      // CLAIM: CAS to our lease guarded on the exact prior holder INCLUDING
-      // heartbeatAt. A renewal between our read and this write changes
-      // heartbeatAt, so the claim loses and no git command ever runs against
-      // the live holder's worktree. Once won, the old holder is fenced out —
-      // its renewals no longer match lease->>sessionId.
-      const { data: claimed } = await this.supabase
-        .from('studios')
-        .update({ lease: lease as unknown as Json })
-        .eq('id', req.studioId)
-        .eq('user_id', req.userId)
-        .eq('lease->>sessionId', holder.sessionId)
-        .eq('lease->>acquiredAt', holder.acquiredAt)
-        .eq('lease->>heartbeatAt', holder.heartbeatAt)
-        .select('id');
-
-      if (!claimed?.length) {
-        // Lost the claim — holder renewed or someone else reclaimed first.
-        const reread = await this.getLease(req.studioId, req.userId);
-        return { acquired: false, holder: reread?.lease ?? holder };
-      }
-
-      // We hold the studio; now take the safe ref.
-      let rescue: WorktreeFinalState | undefined;
-      if (worktreePath) {
-        rescue = await captureWorktreeState(worktreePath, {
-          rescue: true,
-          rescueLabel: holder.threadKey,
-        });
-        if (!rescueSucceeded(rescue)) {
-          // QUARANTINE: an unrescued worktree is never handed out. Release
-          // our claim and refuse; the caller diverts to overflow. The dirty
-          // work stays untouched in place.
-          logger.error('[StudioLease] Reclaim aborted — rescue failed; quarantining studio', {
-            studioId: req.studioId,
-            previousHolder: { sessionId: holder.sessionId, threadKey: holder.threadKey },
-            rescue,
-          });
-          await this.supabase
-            .from('studios')
-            .update({ lease: null })
-            .eq('id', req.studioId)
-            .eq('user_id', req.userId)
-            .eq('lease->>sessionId', req.sessionId)
-            .eq('lease->>acquiredAt', lease.acquiredAt)
-            .select('id');
-          await this.logEvent(req.userId, req.studioId, 'conflict', {
-            sessionId: req.sessionId,
-            threadKey: req.threadKey,
-            agentId: req.agentId,
-            sbId: lease.sbId,
-            reason: 'reclaim-aborted-rescue-failed',
-            detail: {
-              previousHolder: holder as unknown as Json,
-              rescue: rescue as unknown as Json,
-            },
-          });
-          return { acquired: false, holder };
-        }
-      }
-
-      logger.warn('[StudioLease] Reclaimed stale lease', {
-        studioId: req.studioId,
-        from: { sessionId: holder.sessionId, threadKey: holder.threadKey },
-        to: { sessionId: req.sessionId, threadKey: req.threadKey },
-        staleSince: holder.heartbeatAt,
-        rescue,
-      });
-      await this.logEvent(req.userId, req.studioId, 'reclaimed', {
-        sessionId: req.sessionId,
-        threadKey: req.threadKey,
-        agentId: req.agentId,
-        sbId: lease.sbId,
-        reason: `stale since ${holder.heartbeatAt || holder.acquiredAt}`,
-        detail: {
-          previousHolder: holder as unknown as Json,
-          rescue: (rescue ?? null) as unknown as Json,
-        },
-      });
-      return { acquired: true, lease, reclaimedFrom: holder };
+      return this.claimAndRescue(
+        req,
+        lease,
+        holder,
+        worktreePath,
+        `stale since ${holder.heartbeatAt || holder.acquiredAt}`
+      );
     }
 
     // 4) Fresh foreign lease — refuse; the caller diverts to overflow.
@@ -420,8 +525,8 @@ export class StudioLeaseService {
   /**
    * Bump heartbeatAt for whichever studio this session holds. Called from the
    * CLI lifecycle hook route on every prompt/stop, and by the sweep for
-   * sessions with a live in-process run. Cheap no-op when the session holds
-   * nothing.
+   * sessions with a live in-process run. Never renews a quarantine record —
+   * quarantine heals through rescue, not heartbeats.
    */
   async renewBySession(sessionId: string, userId?: string): Promise<boolean> {
     let query = this.supabase
@@ -430,35 +535,29 @@ export class StudioLeaseService {
       .eq('lease->>sessionId', sessionId);
     if (userId) query = query.eq('user_id', userId);
     const { data } = await query.limit(1).maybeSingle();
-    const lease = parseLease(data?.lease);
-    if (!data || !lease) return false;
+    const lease = parseStudioLease(data?.lease);
+    if (!data || !lease || lease.quarantined) return false;
 
     const renewed: StudioLease = { ...lease, heartbeatAt: new Date().toISOString() };
-    const { data: updated } = await this.supabase
-      .from('studios')
-      .update({ lease: renewed as unknown as Json })
-      .eq('id', data.id)
-      .eq('user_id', data.user_id)
-      .eq('lease->>sessionId', sessionId)
-      .eq('lease->>heartbeatAt', lease.heartbeatAt)
-      .select('id');
-    return Boolean(updated?.length);
+    return this.casLease(data.id, data.user_id, lease, renewed);
   }
 
   /**
-   * Release whatever this session holds — but only once the session is truly
-   * terminal: while an in-process run is still executing in the worktree,
-   * release is deferred to the run boundary (SessionService clears the active
-   * run and calls releaseBySession then). This is the guard that stops
-   * end_session-from-inside-a-turn from handing the studio to another thread
-   * while the holder's process is still cd'd into it.
+   * Release whatever this session holds — but only once the session's process
+   * has actually left the worktree. Two liveness signals defer the release:
+   * an in-process server run (registry) and a freshly-attached CLI
+   * (sessions.cli_attached) — an MCP end_session issued from inside a live
+   * CLI turn must not free the studio while the local model is still
+   * executing in it. Deferred releases are picked up at the corresponding
+   * run boundary: SessionService's finalized branch for server runs, the
+   * lifecycle stop hook for CLI turns.
    */
   async releaseUnlessRunning(
     sessionId: string,
     opts: { userId?: string; reason?: string } = {}
   ): Promise<boolean> {
-    if (hasActiveRun(sessionId)) {
-      logger.info('[StudioLease] Release deferred — session still has a live in-process run', {
+    if (await this.isSessionLive(sessionId, opts.userId)) {
+      logger.info('[StudioLease] Release deferred — session process is still live', {
         sessionId,
         reason: opts.reason,
       });
@@ -471,6 +570,7 @@ export class StudioLeaseService {
    * Release whatever this session holds, immediately. Captures final worktree
    * state (branch/commit/dirty) and stamps it into the owning thread's
    * metadata so "what did they leave behind" is answerable after the fact.
+   * Quarantine records are not releasable this way — they heal through rescue.
    */
   async releaseBySession(
     sessionId: string,
@@ -482,11 +582,10 @@ export class StudioLeaseService {
       .eq('lease->>sessionId', sessionId);
     if (opts.userId) query = query.eq('user_id', opts.userId);
     const { data } = await query.limit(1).maybeSingle();
-    const lease = parseLease(data?.lease);
-    if (!data || !lease) return false;
+    const lease = parseStudioLease(data?.lease);
+    if (!data || !lease || lease.quarantined) return false;
 
     return this.releaseStudio(data.id, data.user_id, lease, data.worktree_path, {
-      event: 'released',
       reason: opts.reason ?? 'session-end',
     });
   }
@@ -506,11 +605,10 @@ export class StudioLeaseService {
       .eq('user_id', opts.userId)
       .not('lease', 'is', null)
       .maybeSingle();
-    const lease = parseLease(data?.lease);
-    if (!data || !lease) return false;
+    const lease = parseStudioLease(data?.lease);
+    if (!data || !lease || lease.quarantined) return false;
 
     return this.releaseStudio(data.id, data.user_id, lease, data.worktree_path, {
-      event: 'released',
       reason: opts.reason ?? 'studio-closed',
     });
   }
@@ -533,10 +631,9 @@ export class StudioLeaseService {
 
     let released = 0;
     for (const row of data) {
-      const lease = parseLease(row.lease);
-      if (!lease) continue;
+      const lease = parseStudioLease(row.lease);
+      if (!lease || lease.quarantined) continue;
       const ok = await this.releaseStudio(row.id, row.user_id, lease, row.worktree_path, {
-        event: 'released',
         reason: opts.reason ?? 'thread-closed',
       });
       if (ok) released += 1;
@@ -555,23 +652,15 @@ export class StudioLeaseService {
     userId: string,
     lease: StudioLease,
     worktreePath: string | null,
-    opts: { event: 'released'; reason: string }
+    opts: { reason: string }
   ): Promise<boolean> {
-    const { data } = await this.supabase
-      .from('studios')
-      .update({ lease: null })
-      .eq('id', studioId)
-      .eq('user_id', userId)
-      .eq('lease->>sessionId', lease.sessionId)
-      .eq('lease->>acquiredAt', lease.acquiredAt)
-      .eq('lease->>heartbeatAt', lease.heartbeatAt)
-      .select('id');
-    if (!data?.length) return false;
+    const cleared = await this.casLease(studioId, userId, lease, null);
+    if (!cleared) return false;
 
     const finalState = worktreePath ? await captureWorktreeState(worktreePath) : undefined;
 
     const heldMs = Date.now() - Date.parse(lease.acquiredAt);
-    await this.logEvent(userId, studioId, opts.event, {
+    await this.logEvent(userId, studioId, 'released', {
       sessionId: lease.sessionId,
       threadKey: lease.threadKey,
       agentId: lease.agentId,
@@ -641,11 +730,14 @@ export class StudioLeaseService {
    *
    *   1. Live in-process run? Renew on the holder's behalf — a long agentic
    *      turn is not a crash.
-   *   2. CAS-claim the lease to a sweeper marker, guarded on the exact holder
-   *      including heartbeatAt. A concurrent renewal defeats the claim.
-   *   3. Rescue the worktree. Success → clear the marker, log 'expired'.
-   *      Failure → the marker STAYS (quarantine): it blocks new acquirers,
-   *      goes stale itself in LEASE_STALE_MS, and the next sweep retries.
+   *   2. CAS-claim the lease to a quarantine record (non-vacant,
+   *      non-adoptable), guarded on the exact holder including heartbeatAt.
+   *      A concurrent renewal defeats the claim.
+   *   3. Rescue the worktree. Success → clear to vacancy, log 'expired'.
+   *      Failure → the quarantine STAYS: it blocks acquirers and adoption,
+   *      goes stale itself in LEASE_STALE_MS, and is retried next sweep.
+   *
+   * Stale pre-existing quarantines are retried the same way.
    */
   async sweepExpiredLeases(): Promise<{ expired: number; renewed: number; quarantined: number }> {
     const { data, error } = await this.supabase
@@ -658,40 +750,28 @@ export class StudioLeaseService {
     let renewed = 0;
     let quarantined = 0;
     for (const row of data) {
-      const lease = parseLease(row.lease);
+      const lease = parseStudioLease(row.lease);
       if (!lease || !isLeaseStale(lease)) continue;
 
-      if (hasActiveRun(lease.sessionId)) {
+      if (!lease.quarantined && hasActiveRun(lease.sessionId)) {
         const ok = await this.renewBySession(lease.sessionId, row.user_id);
         if (ok) renewed += 1;
         continue;
       }
 
-      const now = new Date().toISOString();
-      const marker: StudioLease = {
-        sessionId: `${SWEEP_CLAIM_PREFIX}${lease.sessionId}`,
-        threadKey: lease.threadKey,
-        agentId: lease.agentId,
-        sbId: lease.sbId,
-        acquiredAt: lease.acquiredAt, // preserved so heldMs spans the real hold
-        heartbeatAt: now,
-        reason: 'expiry-claim',
-      };
-      const { data: claimed } = await this.supabase
-        .from('studios')
-        .update({ lease: marker as unknown as Json })
-        .eq('id', row.id)
-        .eq('user_id', row.user_id)
-        .eq('lease->>sessionId', lease.sessionId)
-        .eq('lease->>acquiredAt', lease.acquiredAt)
-        .eq('lease->>heartbeatAt', lease.heartbeatAt)
-        .select('id');
-      if (!claimed?.length) continue; // renewed or released concurrently — not ours to touch
+      // Fence: convert the stale lease (or stale quarantine) into a fresh
+      // quarantine claim. A concurrent renewal or acquisition defeats this.
+      const claim = this.quarantineRecord(
+        lease,
+        lease.quarantined ? 'quarantine:retry' : 'quarantine:expiry-claim'
+      );
+      const claimWon = await this.casLease(row.id, row.user_id, lease, claim);
+      if (!claimWon) continue; // renewed, released, or acquired concurrently — not ours
 
       const rescue = row.worktree_path
         ? await captureWorktreeState(row.worktree_path, {
             rescue: true,
-            rescueLabel: lease.threadKey,
+            rescueLabel: claim.heldThreadKey ?? lease.threadKey,
           })
         : undefined;
 
@@ -699,12 +779,12 @@ export class StudioLeaseService {
         quarantined += 1;
         logger.error('[StudioLease] Expiry rescue failed — studio quarantined until next sweep', {
           studioId: row.id,
-          holder: { sessionId: lease.sessionId, threadKey: lease.threadKey },
+          holder: { sessionId: lease.sessionId, threadKey: claim.heldThreadKey },
           rescue,
         });
         await this.logEvent(row.user_id, row.id, 'conflict', {
           sessionId: lease.sessionId,
-          threadKey: lease.threadKey,
+          threadKey: claim.heldThreadKey,
           agentId: lease.agentId,
           sbId: lease.sbId,
           reason: 'expiry-rescue-failed-quarantined',
@@ -713,37 +793,110 @@ export class StudioLeaseService {
         continue;
       }
 
-      await this.supabase
-        .from('studios')
-        .update({ lease: null })
-        .eq('id', row.id)
-        .eq('user_id', row.user_id)
-        .eq('lease->>sessionId', marker.sessionId)
-        .select('id');
+      await this.casLease(row.id, row.user_id, claim, null);
 
       const heldMs = Date.now() - Date.parse(lease.acquiredAt);
       logger.warn('[StudioLease] Lease expired and was released', {
         studioId: row.id,
         sessionId: lease.sessionId,
-        threadKey: lease.threadKey,
+        threadKey: claim.heldThreadKey,
         staleSince: lease.heartbeatAt || lease.acquiredAt,
         finalState: rescue,
       });
       await this.logEvent(row.user_id, row.id, 'expired', {
         sessionId: lease.sessionId,
-        threadKey: lease.threadKey,
+        threadKey: claim.heldThreadKey,
         agentId: lease.agentId,
         sbId: lease.sbId,
-        reason: `no heartbeat since ${lease.heartbeatAt || lease.acquiredAt}`,
+        reason: lease.quarantined
+          ? 'quarantine-recovered'
+          : `no heartbeat since ${lease.heartbeatAt || lease.acquiredAt}`,
         detail: {
           heldMs: Number.isNaN(heldMs) ? null : heldMs,
           finalState: (rescue ?? null) as unknown as Json,
         },
       });
-      await this.stampThreadFinalState(row.user_id, lease.threadKey, row.id, rescue);
+      if (claim.heldThreadKey) {
+        await this.stampThreadFinalState(row.user_id, claim.heldThreadKey, row.id, rescue);
+      }
       expired += 1;
     }
     return { expired, renewed, quarantined };
+  }
+
+  /**
+   * Atomically claim a studio for teardown. The claim is a quarantine-style
+   * lease (non-vacant, non-adoptable), so `acquire` refuses the studio while
+   * destruction is in progress — closing the acquire-between-check-and-remove
+   * race. Returns the claim on success, null when a live/foreign holder means
+   * teardown must not proceed.
+   *
+   * Claimable states:
+   *   - vacant (lease IS NULL)
+   *   - an existing quarantine (teardown retries the rescue; it aborts again
+   *     if the rescue still fails)
+   *   - a lease held by `expectedThreadKey` whose holder is not live (the
+   *     thread being closed is what authorizes tearing its own studio down)
+   */
+  async claimForTeardown(
+    studioId: string,
+    userId: string,
+    opts: { expectedThreadKey?: string; reason: string }
+  ): Promise<StudioLease | null> {
+    const current = await this.getLease(studioId, userId);
+    if (!current) return null;
+    const holder = current.lease;
+    const now = new Date().toISOString();
+
+    const claim: StudioLease = {
+      sessionId: holder?.sessionId ?? '00000000-0000-0000-0000-000000000000',
+      threadKey: QUARANTINE_THREAD_KEY,
+      heldThreadKey: holder?.heldThreadKey ?? holder?.threadKey ?? opts.expectedThreadKey,
+      agentId: holder?.agentId ?? 'system',
+      sbId: holder?.sbId ?? null,
+      acquiredAt: holder?.acquiredAt ?? now,
+      heartbeatAt: now,
+      reason: opts.reason,
+      quarantined: true,
+    };
+
+    if (!holder) {
+      const { data } = await this.supabase
+        .from('studios')
+        .update({ lease: claim as unknown as Json })
+        .eq('id', studioId)
+        .eq('user_id', userId)
+        .is('lease', null)
+        .select('id');
+      return data?.length ? claim : null;
+    }
+
+    if (holder.quarantined) {
+      return (await this.casLease(studioId, userId, holder, claim)) ? claim : null;
+    }
+
+    if (opts.expectedThreadKey && holder.threadKey === opts.expectedThreadKey) {
+      if (await this.isSessionLive(holder.sessionId, userId)) {
+        logger.warn('[StudioLease] Teardown claim refused — holder session is live', {
+          studioId,
+          holderSessionId: holder.sessionId,
+        });
+        return null;
+      }
+      return (await this.casLease(studioId, userId, holder, claim)) ? claim : null;
+    }
+
+    logger.warn('[StudioLease] Teardown claim refused — studio held by another thread', {
+      studioId,
+      holderThreadKey: holder.threadKey,
+      expectedThreadKey: opts.expectedThreadKey ?? null,
+    });
+    return null;
+  }
+
+  /** Clear a teardown claim (post-removal, or when aborting a claim taken in error). */
+  async clearTeardownClaim(studioId: string, userId: string, claim: StudioLease): Promise<boolean> {
+    return this.casLease(studioId, userId, claim, null);
   }
 
   private async resolveSbId(userId: string, agentId: string): Promise<string | null> {

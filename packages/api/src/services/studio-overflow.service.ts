@@ -1,14 +1,17 @@
 /**
  * Studio Overflow Service
  *
- * The overflow ladder (spec:trigger-studio-routing v11 §Overflow): when
+ * The overflow ladder (spec:trigger-studio-routing v13 §Overflow): when
  * routing resolves a studio that another thread holds, the flow is
  * "looks taken → spin up a quick temp studio" — never wait, never fall back
  * into the occupied worktree.
  *
- *   1. Reuse — an ephemeral studio already exists for this threadKey.
- *      Deterministic naming makes retries idempotent instead of fanning out
- *      orphan worktrees.
+ *   1. Reuse — an ephemeral studio already exists FOR THIS EXACT THREAD.
+ *      A slug match alone is not identity: reuse requires ephemeral = true,
+ *      the same parent, and the exact threadKey in metadata (slugs are
+ *      normalized/truncated and not unique, so collisions with unrelated
+ *      studios are possible). Colliding slugs disambiguate deterministically
+ *      with a hash suffix, keeping retries idempotent.
  *   2. Create — a fresh git worktree from the parent studio's repo, using the
  *      same machinery as create_studio (worktree add + yarn install +
  *      bootstrap + settings). Docker backing slots in behind this same
@@ -17,8 +20,15 @@
  * Ephemeral studios: `ephemeral = true`, `parent_studio_id` set, no route
  * patterns (never a routing target for new threads), inherit the parent's
  * default project, and expire. They close when their thread closes or when
- * expires_at passes with no live lease. Close = rescue anything dirty, remove
- * the worktree, keep the branch (that is where the work lives), mark cleaned.
+ * expires_at passes with no live lease.
+ *
+ * Teardown is FENCED (PR #492 round 2): destruction only proceeds after
+ * atomically claiming the studio with a quarantine-style lease that `acquire`
+ * refuses — an acquire that wins first aborts the teardown, and a teardown
+ * that wins first blocks acquires until the worktree is gone or the claim is
+ * cleared. Destruction is additionally gated on a verified rescue, and
+ * `cleaned` is recorded only after the worktree is confirmed gone from disk.
+ * The branch is always kept — that is where the work lives.
  */
 
 import { execFile } from 'child_process';
@@ -32,7 +42,9 @@ import {
   StudioLeaseService,
   captureWorktreeState,
   rescueSucceeded,
+  parseStudioLease,
   EPHEMERAL_STUDIO_TTL_MS,
+  type StudioLease,
   type WorktreeFinalState,
 } from './studio-lease.service';
 import { logger } from '../utils/logger';
@@ -50,10 +62,24 @@ export function threadSlug(threadKey: string): string {
   );
 }
 
+/**
+ * Deterministic short hash of the FULL threadKey (djb2, base36). Used to
+ * disambiguate slug collisions — normalization and truncation make distinct
+ * threadKeys collide, and studio slugs are not unique.
+ */
+export function slugHash(input: string): string {
+  let h = 5381;
+  for (let i = 0; i < input.length; i += 1) {
+    h = ((h << 5) + h + input.charCodeAt(i)) >>> 0;
+  }
+  return h.toString(36);
+}
+
 /** Spec naming: `<parent-slug>--<thread-slug>`, e.g. `lumen-review--pr-476`. */
-export function overflowSlug(parentStudio: Studio, threadKey: string): string {
+export function overflowSlug(parentStudio: Studio, threadKey: string, variant?: string): string {
   const parentSlug = parentStudio.slug || path.basename(parentStudio.worktreePath) || 'studio';
-  return `${parentSlug}--${threadSlug(threadKey)}`;
+  const tail = variant ? `${threadSlug(threadKey)}-h${variant}` : threadSlug(threadKey);
+  return `${parentSlug}--${tail}`;
 }
 
 export class StudioOverflowService {
@@ -63,9 +89,27 @@ export class StudioOverflowService {
   ) {}
 
   /**
+   * Is this row genuinely the overflow studio for (parent, threadKey)? A slug
+   * collision with a long-lived studio or another thread's ephemeral must
+   * never be "reused" — that would route this thread into unrelated work.
+   */
+  private matchesOverflow(existing: Studio, parentStudio: Studio, threadKey: string): boolean {
+    if (!existing.ephemeral) return false;
+    if (existing.parentStudioId !== parentStudio.id) return false;
+    const metadata =
+      existing.metadata &&
+      typeof existing.metadata === 'object' &&
+      !Array.isArray(existing.metadata)
+        ? (existing.metadata as Record<string, unknown>)
+        : {};
+    return metadata.threadKey === threadKey;
+  }
+
+  /**
    * Ladder steps 1–2: find or create the ephemeral studio for this threadKey.
-   * Returns null only when worktree creation itself fails (logged loudly);
-   * the caller decides how to degrade.
+   * Returns null only when worktree creation itself fails or every slug
+   * candidate collides with an unrelated studio (both logged loudly); the
+   * caller fails closed.
    */
   async ensureOverflowStudio(opts: {
     userId: string;
@@ -74,104 +118,123 @@ export class StudioOverflowService {
     threadKey: string;
   }): Promise<Studio | null> {
     const { userId, agentId, parentStudio, threadKey } = opts;
-    const slug = overflowSlug(parentStudio, threadKey);
 
-    // 1) Reuse — retries and re-triggers converge on the same studio.
-    const existing = await this.studios.findBySlug(userId, slug).catch(() => null);
-    if (existing && (existing.status === 'active' || existing.status === 'idle')) {
-      const pathExists = await access(existing.worktreePath)
-        .then(() => true)
-        .catch(() => false);
-      if (pathExists) {
-        logger.info('[StudioOverflow] Reusing ephemeral studio for thread', {
-          threadKey,
-          studioId: existing.id,
+    const variants: Array<string | undefined> = [undefined, slugHash(threadKey)];
+    for (const variant of variants) {
+      const slug = overflowSlug(parentStudio, threadKey, variant);
+      const branchTail = variant ? `${threadSlug(threadKey)}-h${variant}` : threadSlug(threadKey);
+
+      const existing = await this.studios.findBySlug(userId, slug).catch(() => null);
+      if (existing && !this.matchesOverflow(existing, parentStudio, threadKey)) {
+        // Slug collision with an unrelated studio — never reuse or revive it.
+        logger.warn('[StudioOverflow] Slug collides with an unrelated studio; disambiguating', {
           slug,
+          threadKey,
+          collidingStudioId: existing.id,
         });
-        return existing;
+        continue;
       }
-      // Row survived but the worktree is gone — recreate in place.
-      const revived = await this.createWorktree(parentStudio, slug, agentId, threadKey);
-      if (!revived) return null;
-      return this.studios.update(existing.id, {
-        status: 'active',
-        worktreePath: revived.worktreePath,
-        cleanedAt: null,
-        expiresAt: new Date(Date.now() + EPHEMERAL_STUDIO_TTL_MS).toISOString(),
-      });
+
+      if (existing && (existing.status === 'active' || existing.status === 'idle')) {
+        const pathExists = await access(existing.worktreePath)
+          .then(() => true)
+          .catch(() => false);
+        if (pathExists) {
+          logger.info('[StudioOverflow] Reusing ephemeral studio for thread', {
+            threadKey,
+            studioId: existing.id,
+            slug,
+          });
+          return existing;
+        }
+        // Row survived but the worktree is gone — recreate in place.
+        const revived = await this.createWorktree(parentStudio, slug, agentId, branchTail);
+        if (!revived) return null;
+        return this.studios.update(existing.id, {
+          status: 'active',
+          worktreePath: revived.worktreePath,
+          cleanedAt: null,
+          expiresAt: new Date(Date.now() + EPHEMERAL_STUDIO_TTL_MS).toISOString(),
+        });
+      }
+
+      const created = await this.createWorktree(parentStudio, slug, agentId, branchTail);
+      if (!created) return null;
+
+      if (existing) {
+        // A cleaned matching row already owns (worktree_path, agent_id) —
+        // revive it rather than colliding with the unique index on insert.
+        const revived = await this.studios.update(existing.id, {
+          status: 'active',
+          worktreePath: created.worktreePath,
+          purpose: `Overflow studio for ${threadKey} (parent ${parentStudio.slug || parentStudio.id} was leased)`,
+          cleanedAt: null,
+          expiresAt: new Date(Date.now() + EPHEMERAL_STUDIO_TTL_MS).toISOString(),
+        });
+        await this.leases.logEvent(userId, revived.id, 'overflow', {
+          threadKey,
+          agentId,
+          reason: `revived ephemeral studio; parent ${parentStudio.id} leased`,
+        });
+        return revived;
+      }
+
+      try {
+        const studio = await this.studios.create({
+          userId,
+          agentId,
+          repoRoot: parentStudio.repoRoot,
+          worktreePath: created.worktreePath,
+          branch: created.branch,
+          baseBranch: parentStudio.baseBranch || 'main',
+          purpose: `Overflow studio for ${threadKey} (parent ${parentStudio.slug || parentStudio.id} was leased)`,
+          workType: 'other',
+          defaultProjectId: parentStudio.defaultProjectId,
+          ephemeral: true,
+          parentStudioId: parentStudio.id,
+          expiresAt: new Date(Date.now() + EPHEMERAL_STUDIO_TTL_MS).toISOString(),
+          metadata: { overflow: true, threadKey },
+        });
+        await this.leases.logEvent(userId, studio.id, 'overflow', {
+          threadKey,
+          agentId,
+          reason: `created ephemeral studio; parent ${parentStudio.id} leased`,
+        });
+        logger.info('[StudioOverflow] Created ephemeral studio', {
+          threadKey,
+          studioId: studio.id,
+          slug,
+          worktreePath: created.worktreePath,
+        });
+        return studio;
+      } catch (err) {
+        logger.error('[StudioOverflow] Studio row insert failed; removing worktree', {
+          slug,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        await execFileAsync('git', ['worktree', 'remove', '--force', created.worktreePath], {
+          cwd: parentStudio.repoRoot,
+        }).catch(() => undefined);
+        return null;
+      }
     }
 
-    // 2) Create.
-    const created = await this.createWorktree(parentStudio, slug, agentId, threadKey);
-    if (!created) return null;
-
-    if (existing) {
-      // A cleaned row already owns (worktree_path, agent_id) — revive it
-      // rather than colliding with the unique index on insert.
-      const revived = await this.studios.update(existing.id, {
-        status: 'active',
-        worktreePath: created.worktreePath,
-        purpose: `Overflow studio for ${threadKey} (parent ${parentStudio.slug || parentStudio.id} was leased)`,
-        cleanedAt: null,
-        expiresAt: new Date(Date.now() + EPHEMERAL_STUDIO_TTL_MS).toISOString(),
-      });
-      await this.leases.logEvent(userId, revived.id, 'overflow', {
-        threadKey,
-        agentId,
-        reason: `revived ephemeral studio; parent ${parentStudio.id} leased`,
-      });
-      return revived;
-    }
-
-    try {
-      const studio = await this.studios.create({
-        userId,
-        agentId,
-        repoRoot: parentStudio.repoRoot,
-        worktreePath: created.worktreePath,
-        branch: created.branch,
-        baseBranch: parentStudio.baseBranch || 'main',
-        purpose: `Overflow studio for ${threadKey} (parent ${parentStudio.slug || parentStudio.id} was leased)`,
-        workType: 'other',
-        defaultProjectId: parentStudio.defaultProjectId,
-        ephemeral: true,
-        parentStudioId: parentStudio.id,
-        expiresAt: new Date(Date.now() + EPHEMERAL_STUDIO_TTL_MS).toISOString(),
-        metadata: { overflow: true, threadKey },
-      });
-      await this.leases.logEvent(userId, studio.id, 'overflow', {
-        threadKey,
-        agentId,
-        reason: `created ephemeral studio; parent ${parentStudio.id} leased`,
-      });
-      logger.info('[StudioOverflow] Created ephemeral studio', {
-        threadKey,
-        studioId: studio.id,
-        slug,
-        worktreePath: created.worktreePath,
-      });
-      return studio;
-    } catch (err) {
-      logger.error('[StudioOverflow] Studio row insert failed; removing worktree', {
-        slug,
-        error: err instanceof Error ? err.message : String(err),
-      });
-      await execFileAsync('git', ['worktree', 'remove', '--force', created.worktreePath], {
-        cwd: parentStudio.repoRoot,
-      }).catch(() => undefined);
-      return null;
-    }
+    logger.error('[StudioOverflow] Every slug candidate collides with unrelated studios', {
+      threadKey,
+      parentStudioId: parentStudio.id,
+    });
+    return null;
   }
 
   private async createWorktree(
     parentStudio: Studio,
     slug: string,
     agentId: string,
-    threadKey: string
+    branchTail: string
   ): Promise<{ worktreePath: string; branch: string } | null> {
     const mainRoot = parentStudio.repoRoot;
     const worktreePath = path.join(path.dirname(mainRoot), `${path.basename(mainRoot)}--${slug}`);
-    const branch = `${agentId}/eph/${threadSlug(threadKey)}`;
+    const branch = `${agentId}/eph/${branchTail}`;
     const baseBranch = parentStudio.baseBranch || 'main';
 
     try {
@@ -233,19 +296,40 @@ export class StudioOverflowService {
   }
 
   /**
-   * Close an ephemeral studio when its work unit completes: rescue anything
-   * dirty (safe ref), remove the worktree, keep the branch, mark cleaned.
+   * Close an ephemeral studio when its work unit completes: claim the studio
+   * against concurrent acquires, rescue anything dirty (safe ref), remove the
+   * worktree, keep the branch, mark cleaned.
    *
-   * SAFETY (PR #492 review): destruction is gated on a verified rescue. If
-   * the rescue fails — a conflicted rebase can make `git stash` fail — the
-   * teardown ABORTS with the worktree left in place; --force is only ever
-   * reached with the tree verified clean or stashed. `cleaned` is recorded
-   * only after the worktree is confirmed gone from disk.
+   * SAFETY (PR #492 rounds 1–2):
+   *   - Destruction only proceeds after `claimForTeardown` wins an atomic
+   *     lease claim that `acquire` refuses — no acquire can slip in between
+   *     the check and the removal, and a holder that won first aborts us.
+   *   - Destruction is gated on a verified rescue; `--force` is only ever
+   *     reached with the tree verified clean or stashed.
+   *   - `cleaned` is recorded only after the worktree is confirmed gone.
+   *   - On abort the claim REMAINS as quarantine, blocking acquirers until a
+   *     later retry (sweep) rescues or a human intervenes.
    */
-  async teardownEphemeralStudio(studio: Studio, opts: { reason: string }): Promise<void> {
+  async teardownEphemeralStudio(
+    studio: Studio,
+    opts: { reason: string; expectedThreadKey?: string }
+  ): Promise<void> {
     if (!studio.ephemeral) {
       logger.warn('[StudioOverflow] Refusing to tear down non-ephemeral studio', {
         studioId: studio.id,
+      });
+      return;
+    }
+
+    // Fence: atomically claim the studio. A live or foreign holder aborts.
+    const claim = await this.leases.claimForTeardown(studio.id, studio.userId, {
+      expectedThreadKey: opts.expectedThreadKey,
+      reason: `teardown-claim (${opts.reason})`,
+    });
+    if (!claim) {
+      logger.info('[StudioOverflow] Teardown skipped — studio is held', {
+        studioId: studio.id,
+        reason: opts.reason,
       });
       return;
     }
@@ -262,8 +346,10 @@ export class StudioOverflowService {
       });
 
       if (!rescueSucceeded(finalState)) {
+        // Abort with the claim left in place: the quarantine blocks acquires
+        // until a later rescue succeeds. The worktree is untouched.
         logger.error(
-          '[StudioOverflow] Teardown aborted — rescue failed; leaving worktree in place',
+          '[StudioOverflow] Teardown aborted — rescue failed; worktree quarantined in place',
           {
             studioId: studio.id,
             worktreePath: studio.worktreePath,
@@ -297,6 +383,7 @@ export class StudioOverflowService {
         .then(() => true)
         .catch(() => false);
       if (stillPresent) {
+        // Claim stays: a half-removed worktree must not be acquirable.
         logger.error(
           '[StudioOverflow] Worktree still present after removal attempts; NOT marking cleaned',
           { studioId: studio.id, worktreePath: studio.worktreePath }
@@ -317,6 +404,7 @@ export class StudioOverflowService {
     }
 
     await this.studios.markCleaned(studio.id).catch(() => undefined);
+    await this.leases.clearTeardownClaim(studio.id, studio.userId, claim).catch(() => undefined);
     await this.leases.logEvent(studio.userId, studio.id, 'released', {
       agentId: studio.agentId ?? undefined,
       reason: opts.reason,
@@ -335,7 +423,9 @@ export class StudioOverflowService {
 
   /**
    * Sweep companion: close ephemeral studios whose expires_at has passed and
-   * whose lease is gone. Runs on the heartbeat cron alongside the lease sweep.
+   * whose lease is gone (or is a stale quarantine/teardown claim to retry).
+   * Runs on the heartbeat cron alongside the lease sweep. Live leases are
+   * skipped here and re-checked atomically inside claimForTeardown.
    */
   async sweepExpiredEphemeralStudios(): Promise<number> {
     const candidates = await this.studios
@@ -343,7 +433,8 @@ export class StudioOverflowService {
       .catch(() => [] as Studio[]);
     let closed = 0;
     for (const studio of candidates) {
-      if (studio.lease) continue;
+      const lease: StudioLease | null = parseStudioLease(studio.lease);
+      if (lease && !lease.quarantined) continue; // genuinely held — not expirable here
       await this.teardownEphemeralStudio(studio, { reason: 'expired' });
       closed += 1;
     }
@@ -352,7 +443,9 @@ export class StudioOverflowService {
 
   /**
    * Close every ephemeral studio that served a thread. Wired into
-   * close_thread — the work unit completing releases the temp studio.
+   * close_thread — the work unit completing releases the temp studio. Each
+   * teardown fences via claimForTeardown with the closing thread's key, so a
+   * studio a different thread has since acquired is skipped, not destroyed.
    */
   async teardownEphemeralStudiosForThread(
     userId: string,
@@ -362,9 +455,14 @@ export class StudioOverflowService {
     const studios = await this.studios
       .listEphemeralByThread(userId, threadKey)
       .catch(() => [] as Studio[]);
+    let closed = 0;
     for (const studio of studios) {
-      await this.teardownEphemeralStudio(studio, opts);
+      await this.teardownEphemeralStudio(studio, {
+        reason: opts.reason,
+        expectedThreadKey: threadKey,
+      });
+      closed += 1;
     }
-    return studios.length;
+    return closed;
   }
 }

@@ -26,6 +26,7 @@ import {
   rescueSucceeded,
   isLeaseStale,
   LEASE_STALE_MS,
+  QUARANTINE_THREAD_KEY,
   type StudioLease,
 } from './studio-lease.service';
 import { registerActiveRun, resetActiveRuns } from './sessions/active-runs';
@@ -166,6 +167,7 @@ function baseTables(): Record<string, Row[]> {
     studio_lease_events: [],
     inbox_threads: [],
     agent_identities: [],
+    sessions: [],
   };
 }
 
@@ -284,22 +286,92 @@ describe('StudioLeaseService.acquire', () => {
     expect(tables.studio_lease_events.map((e) => e.event)).not.toContain('reclaimed');
   });
 
-  it('quarantines instead of handing out a studio whose rescue failed', async () => {
+  it('a failed rescue produces a DURABLE quarantine — not a vacancy', async () => {
     const nonRepoDir = await mkdtemp(path.join(tmpdir(), 'lease-nonrepo-'));
     try {
       // Stale holder over a worktree that is not a git repo — capture errors.
-      tables.studios[0].lease = staleLease({ threadKey: 'pr:999' });
+      const holder = staleLease({ threadKey: 'pr:999', sessionId: 'session-dead' });
+      tables.studios[0].lease = holder;
       tables.studios[0].worktree_path = nonRepoDir;
 
       const result = await service.acquire(req);
       expect(result.acquired).toBe(false);
-      // The claim was rolled back — studio is vacant, not ours.
-      expect(tables.studios[0].lease).toBeNull();
+
+      // Quarantine: non-vacant, non-adoptable, original holder UUID kept.
+      const lease = tables.studios[0].lease as StudioLease;
+      expect(lease.quarantined).toBe(true);
+      expect(lease.threadKey).toBe(QUARANTINE_THREAD_KEY);
+      expect(lease.heldThreadKey).toBe('pr:999');
+      expect(lease.sessionId).toBe('session-dead');
       const conflict = tables.studio_lease_events.find((e) => e.event === 'conflict');
-      expect(conflict?.reason).toBe('reclaim-aborted-rescue-failed');
+      expect(conflict?.reason).toBe('rescue-failed-quarantined');
+
+      // Regression (round 2): a second acquire must NOT enter the unrescued
+      // tree — the fresh quarantine refuses it and stays in place.
+      const second = await service.acquire({ ...req, sessionId: 'session-c' });
+      expect(second.acquired).toBe(false);
+      expect((tables.studios[0].lease as StudioLease).quarantined).toBe(true);
+
+      // Nor can the original thread "adopt" it back via heldThreadKey.
+      const adoptAttempt = await service.acquire({
+        ...req,
+        sessionId: 'session-d',
+        threadKey: 'pr:999',
+      });
+      expect(adoptAttempt.acquired).toBe(false);
+      expect((tables.studios[0].lease as StudioLease).quarantined).toBe(true);
     } finally {
       await rm(nonRepoDir, { recursive: true, force: true });
     }
+  });
+
+  it('a stale quarantine converts to an acquisition only through a verified rescue', async () => {
+    const staleQuarantineHeartbeat = new Date(Date.now() - LEASE_STALE_MS - 60_000).toISOString();
+    tables.studios[0].lease = {
+      sessionId: 'session-dead',
+      threadKey: QUARANTINE_THREAD_KEY,
+      heldThreadKey: 'pr:999',
+      agentId: 'lumen',
+      acquiredAt: staleQuarantineHeartbeat,
+      heartbeatAt: staleQuarantineHeartbeat,
+      quarantined: true,
+    } satisfies StudioLease;
+    // No worktree path → nothing to rescue → the claim stands.
+    const result = await service.acquire(req);
+    expect(result.acquired).toBe(true);
+    expect((tables.studios[0].lease as StudioLease).threadKey).toBe('pr:200');
+    expect((tables.studios[0].lease as StudioLease).quarantined).toBeFalsy();
+  });
+
+  it('refuses same-thread adoption while the holder session is live (server run)', async () => {
+    tables.studios[0].lease = freshLease({ sessionId: 'session-live', threadKey: 'pr:200' });
+    registerActiveRun({
+      sessionId: 'session-live',
+      userId: 'user-1',
+      agentId: 'wren',
+      backend: 'claude-code',
+      startedAt: Date.now(),
+    });
+
+    const result = await service.acquire(req);
+    expect(result.acquired).toBe(false);
+    // The live holder keeps the lease — two sessions of one thread must not
+    // both run in the worktree.
+    expect((tables.studios[0].lease as StudioLease).sessionId).toBe('session-live');
+  });
+
+  it('refuses same-thread adoption while the holder has a freshly-attached CLI', async () => {
+    tables.studios[0].lease = freshLease({ sessionId: 'session-cli', threadKey: 'pr:200' });
+    tables.sessions.push({
+      id: 'session-cli',
+      user_id: 'user-1',
+      cli_attached: true,
+      updated_at: new Date().toISOString(),
+    });
+
+    const result = await service.acquire(req);
+    expect(result.acquired).toBe(false);
+    expect((tables.studios[0].lease as StudioLease).sessionId).toBe('session-cli');
   });
 
   it('renews instead of reclaiming when the stale holder has a live in-process run', async () => {
@@ -346,6 +418,7 @@ describe('StudioLeaseService release paths', () => {
       studio_lease_events: [],
       inbox_threads: [],
       agent_identities: [],
+      sessions: [],
     };
     service = new StudioLeaseService(makeFakeSupabase(tables));
   });
@@ -383,6 +456,23 @@ describe('StudioLeaseService release paths', () => {
     expect(tables.studios[0].lease).not.toBeNull();
 
     resetActiveRuns();
+    expect(await service.releaseUnlessRunning('session-a', { userId: 'user-1' })).toBe(true);
+    expect(tables.studios[0].lease).toBeNull();
+  });
+
+  it('releaseUnlessRunning defers for a freshly-attached CLI session (round 2)', async () => {
+    // The registry cannot see interactive CLI turns; the sessions row can.
+    tables.sessions.push({
+      id: 'session-a',
+      user_id: 'user-1',
+      cli_attached: true,
+      updated_at: new Date().toISOString(),
+    });
+    expect(await service.releaseUnlessRunning('session-a', { userId: 'user-1' })).toBe(false);
+    expect(tables.studios[0].lease).not.toBeNull();
+
+    // A stale attached flag is a dead flag — release proceeds.
+    tables.sessions[0].updated_at = new Date(Date.now() - 11 * 60 * 1000).toISOString();
     expect(await service.releaseUnlessRunning('session-a', { userId: 'user-1' })).toBe(true);
     expect(tables.studios[0].lease).toBeNull();
   });
@@ -442,6 +532,7 @@ describe('StudioLeaseService.sweepExpiredLeases', () => {
       studio_lease_events: [],
       inbox_threads: [],
       agent_identities: [],
+      sessions: [],
     };
     registerActiveRun({
       sessionId: 'sess-3',
@@ -462,7 +553,7 @@ describe('StudioLeaseService.sweepExpiredLeases', () => {
     expect(tables.studio_lease_events.map((e) => e.event)).toEqual(['expired']);
   });
 
-  it('keeps the sweeper marker (quarantine) when the expiry rescue fails', async () => {
+  it('a failed expiry rescue leaves a durable quarantine and blocks acquirers', async () => {
     resetActiveRuns();
     const nonRepoDir = await mkdtemp(path.join(tmpdir(), 'lease-sweep-nonrepo-'));
     try {
@@ -471,21 +562,38 @@ describe('StudioLeaseService.sweepExpiredLeases', () => {
           {
             id: 's-bad',
             user_id: 'u',
-            lease: staleLease({ sessionId: 'sess-x' }),
+            lease: staleLease({ sessionId: 'sess-x', threadKey: 'pr:7' }),
             worktree_path: nonRepoDir,
           },
         ],
         studio_lease_events: [],
         inbox_threads: [],
         agent_identities: [],
+        sessions: [],
       };
       const service = new StudioLeaseService(makeFakeSupabase(tables));
       const stats = await service.sweepExpiredLeases();
 
       expect(stats).toEqual({ expired: 0, renewed: 0, quarantined: 1 });
       const marker = tables.studios[0].lease as StudioLease;
-      expect(marker.sessionId).toBe('lease-sweep:sess-x');
+      expect(marker.quarantined).toBe(true);
+      expect(marker.threadKey).toBe(QUARANTINE_THREAD_KEY);
+      expect(marker.heldThreadKey).toBe('pr:7');
+      // Original holder UUID preserved — audit rows stay uuid-valid on retries.
+      expect(marker.sessionId).toBe('sess-x');
       expect(tables.studio_lease_events.map((e) => e.event)).toEqual(['conflict']);
+
+      // Regression (round 2): the quarantined studio refuses acquisition —
+      // including a same-thread acquire against the held thread.
+      const acq = await service.acquire({
+        studioId: 's-bad',
+        sessionId: 'sess-new',
+        threadKey: 'pr:7',
+        agentId: 'wren',
+        userId: 'u',
+      });
+      expect(acq.acquired).toBe(false);
+      expect((tables.studios[0].lease as StudioLease).quarantined).toBe(true);
     } finally {
       await rm(nonRepoDir, { recursive: true, force: true });
     }

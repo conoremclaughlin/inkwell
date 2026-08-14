@@ -368,7 +368,18 @@ export class SessionService implements ISessionService {
     const studios = this.getStudiosRepo();
     if (!overflowService || !studios || !ctx.threadKey) return null;
     const parent = await studios.findById(parentStudioId).catch(() => null);
-    if (!parent) return null;
+    // Ownership boundary: never seed a caller-owned worktree from another
+    // user's studio. A foreign studio UUID gets no overflow — the caller
+    // fails closed instead.
+    if (!parent || parent.userId !== ctx.userId) {
+      if (parent) {
+        logger.warn('[StudioLease] Overflow refused — parent studio belongs to another user', {
+          parentStudioId,
+          requestingUserId: ctx.userId,
+        });
+      }
+      return null;
+    }
     return overflowService.ensureOverflowStudio({
       userId: ctx.userId,
       agentId: ctx.agentId,
@@ -409,18 +420,24 @@ export class SessionService implements ISessionService {
       });
       if (result.acquired) return session;
 
-      await leases.logEvent(ctx.userId, boundStudioId, 'conflict', {
-        sessionId: session.id,
-        threadKey: ctx.threadKey,
-        agentId: ctx.agentId,
-        reason: `tier ${routing.tier} resolved a studio held by ${result.holder?.threadKey ?? 'unknown'}; diverting`,
-      });
-      logger.warn('[StudioLease] Studio held by another thread; diverting', {
+      // holder === null means the studio could not even be verified as this
+      // user's — do not write an event pairing this user with a studio they
+      // may not own; the fail-closed clear below still applies.
+      if (result.holder) {
+        await leases.logEvent(ctx.userId, boundStudioId, 'conflict', {
+          sessionId: session.id,
+          threadKey: ctx.threadKey,
+          agentId: ctx.agentId,
+          reason: `tier ${routing.tier} resolved a studio held by ${result.holder.threadKey}; diverting`,
+        });
+      }
+      logger.warn('[StudioLease] Studio not acquirable; diverting', {
         sessionId: session.id,
         studioId: boundStudioId,
         tier: routing.tier,
         threadKey: ctx.threadKey,
         holderThreadKey: result.holder?.threadKey ?? null,
+        verified: Boolean(result.holder),
       });
 
       const overflow = await this.divertToOverflow(boundStudioId, ctx);

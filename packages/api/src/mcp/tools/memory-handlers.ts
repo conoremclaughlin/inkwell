@@ -1218,16 +1218,13 @@ export async function handleEndSession(args: unknown, dataComposer: DataComposer
   }
 
   if (session) {
-    // Clear cli_attached flag so triggers don't get stuck in the pending queue
-    // after the CLI detaches.
-    await dataComposer.repositories.memory
-      .updateSession(session.id, { cliAttached: false })
-      .catch(() => {});
-
     // Automatic lease release — end_session is a terminal path regardless of
-    // which side (server or agent CLI) initiated it. Deferred while the
-    // session's in-process run is still executing in the worktree (end_session
-    // called from inside a turn); the run boundary releases then.
+    // which side (server or agent CLI) initiated it. MUST run BEFORE the
+    // cli_attached clear below: releaseUnlessRunning reads that flag to
+    // detect an end_session issued from inside a live CLI turn, and defers so
+    // no other thread enters the worktree while the local model is still
+    // executing in it. The deferred release fires at the CLI stop boundary
+    // (hook-lifecycle) or the server run boundary.
     await new StudioLeaseService(dataComposer.getClient())
       .releaseUnlessRunning(session.id, { userId: user.id, reason: 'session-end' })
       .catch((err: unknown) => {
@@ -1236,6 +1233,12 @@ export async function handleEndSession(args: unknown, dataComposer: DataComposer
           error: err instanceof Error ? err.message : String(err),
         });
       });
+
+    // Clear cli_attached flag so triggers don't get stuck in the pending queue
+    // after the CLI detaches.
+    await dataComposer.repositories.memory
+      .updateSession(session.id, { cliAttached: false })
+      .catch(() => {});
 
     // Clear stale channel_routes pointing to this session so heartbeat
     // reminders don't try to route to a dead session and spawn duplicates.
