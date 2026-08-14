@@ -1853,6 +1853,60 @@ describe('SessionService', () => {
       // threadKey lookup should NOT be called because alias matched
       expect(mockFindByThreadKey).not.toHaveBeenCalled();
     });
+
+    it('does not fall back to a global alias lookup when a named studio fails to resolve', async () => {
+      // PR #495 review (Lumen, P1). resolveStudioId returns
+      // { studioId: undefined, tier: 'studio-hint' } for a hint that matches
+      // nothing — deliberately, so an explicit hint never falls through to an
+      // unrelated studio. Running the alias lookup unscoped there would undo
+      // exactly that: a unique alias in some other studio would match and the
+      // caller would land in a worktree they never named.
+      const strayMatch = createMockSession({ id: 'stray-session', alias: 'review' });
+      const mockFindByAlias = vi.fn().mockResolvedValue(strayMatch);
+      (mockRepository as Record<string, unknown>).findByAlias = mockFindByAlias;
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(null);
+
+      // resolveStudioId short-circuits to tier 'none' without a supabase
+      // client, so the hint path needs one. Every query resolves empty: the
+      // named studio does not exist.
+      const emptyChain: Record<string, unknown> = {};
+      for (const m of ['select', 'eq', 'not', 'is', 'neq', 'in', 'order', 'limit']) {
+        emptyChain[m] = vi.fn().mockReturnValue(emptyChain);
+      }
+      emptyChain.maybeSingle = vi.fn().mockResolvedValue({ data: null, error: null });
+      emptyChain.single = vi.fn().mockResolvedValue({ data: null, error: null });
+      emptyChain.then = (resolve: (v: unknown) => unknown) =>
+        Promise.resolve({ data: [], error: null }).then(resolve);
+
+      const serviceWithSupabase = new SessionService(
+        mockRepository,
+        mockContextBuilder,
+        mockClaudeRunner,
+        mockActivityStream,
+        {
+          defaultWorkingDirectory: '/test',
+          mcpConfigPath: '/test/.mcp.json',
+          compactionThreshold: 150000,
+        },
+        mockCodexRunner,
+        { from: vi.fn().mockReturnValue(emptyChain) } as never
+      );
+
+      await serviceWithSupabase.handleMessage(
+        createMockRequest({
+          metadata: {
+            sessionAlias: 'review',
+            // A slug that resolves to nothing — stale, cleaned, or another
+            // agent's studio.
+            studioHint: 'no-such-studio',
+          },
+        })
+      );
+
+      // The alias lookup must not run at all — not run-and-discard, since an
+      // unscoped query is the thing that produces the wrong answer.
+      expect(mockFindByAlias).not.toHaveBeenCalled();
+    });
   });
 
   describe('Default Session Routing (default_session_id)', () => {

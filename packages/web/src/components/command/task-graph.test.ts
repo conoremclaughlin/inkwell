@@ -50,19 +50,59 @@ describe('computeDepths', () => {
     expect(depth.get('d')).toBe(2);
   });
 
-  it('terminates on a direct cycle and flags it', () => {
+  it('terminates on a direct cycle and flags BOTH members', () => {
     const { depth, cyclic } = computeDepths(['a', 'b'], deps({ a: ['b'], b: ['a'] }));
 
-    expect(cyclic.size).toBeGreaterThan(0);
+    // Marking only the node the back-edge landed on would label a different
+    // task depending on iteration order, and tell the reader nothing about
+    // how far the cycle reaches.
+    expect([...cyclic].sort()).toEqual(['a', 'b']);
     // Still produces a usable layout rather than throwing.
     expect(depth.get('a')).toBeTypeOf('number');
     expect(depth.get('b')).toBeTypeOf('number');
   });
 
-  it('terminates on a longer cycle', () => {
+  it('flags every member of a longer cycle, not just one', () => {
     const { cyclic } = computeDepths(['a', 'b', 'c'], deps({ a: ['c'], b: ['a'], c: ['b'] }));
 
-    expect(cyclic.size).toBeGreaterThan(0);
+    expect([...cyclic].sort()).toEqual(['a', 'b', 'c']);
+  });
+
+  it('flags the same set regardless of which node the walk starts from', () => {
+    const graph = { a: ['c'], b: ['a'], c: ['b'] };
+    const fromA = computeDepths(['a', 'b', 'c'], deps(graph));
+    const fromC = computeDepths(['c', 'b', 'a'], deps(graph));
+
+    expect([...fromA.cyclic].sort()).toEqual([...fromC.cyclic].sort());
+  });
+
+  it('reports exactly one back-edge per cycle, in blocker->task direction', () => {
+    const { backEdges } = computeDepths(['a', 'b'], deps({ a: ['b'], b: ['a'] }));
+
+    expect(backEdges.size).toBe(1);
+    // The recorded edge is the dependency that could not be honoured: it runs
+    // from the blocker to the task it blocks, matching the rendered edge id.
+    expect([...backEdges][0]).toMatch(/^(a->b|b->a)$/);
+  });
+
+  it('records no back-edges when the graph is acyclic', () => {
+    const { backEdges, cyclic } = computeDepths(
+      ['a', 'b', 'c', 'd'],
+      deps({ b: ['a'], c: ['a'], d: ['b', 'c'] })
+    );
+
+    expect(backEdges.size).toBe(0);
+    expect(cyclic.size).toBe(0);
+  });
+
+  it('does not mark a task that merely points into a cycle', () => {
+    // x depends on a, which is in a cycle. x itself is not on the cycle and
+    // must not be labelled as such.
+    const { cyclic } = computeDepths(['a', 'b', 'x'], deps({ a: ['b'], b: ['a'], x: ['a'] }));
+
+    expect(cyclic.has('x')).toBe(false);
+    expect(cyclic.has('a')).toBe(true);
+    expect(cyclic.has('b')).toBe(true);
   });
 
   it('flags a task that blocks itself', () => {

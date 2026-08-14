@@ -154,8 +154,17 @@ export function useCommandData() {
       // months, so status-based presence put every agent in a studio at all
       // times — which is indistinguishable from putting them nowhere.
       // A held lease is the only evidence an agent is actually in a worktree.
-      const heldStudio =
-        agent.studios.find((s) => s.lease && !s.lease.quarantined && !s.lease.claimKind) ?? null;
+      //
+      // An agent can hold several studios at once, so collect them all. The
+      // singular studioId is only where the agent avatar is drawn; taking the
+      // first match as "the" answer would hide every other place it is
+      // working, which is the failure this whole surface exists to fix.
+      // Ordered by acquisition so the avatar lands on the oldest hold rather
+      // than wherever the API happened to sort.
+      const heldStudios = agent.studios
+        .filter((s) => s.lease && !s.lease.quarantined && !s.lease.claimKind)
+        .sort((a, b) => (a.lease!.acquiredAt < b.lease!.acquiredAt ? -1 : 1));
+      const heldStudio = heldStudios[0] ?? null;
 
       agentStates.push({
         agentId: agent.agentId,
@@ -164,6 +173,7 @@ export function useCommandData() {
         backend: agent.backend,
         studioId: heldStudio?.id ?? null,
         studioSlug: heldStudio?.slug ?? null,
+        heldStudioIds: heldStudios.map((s) => s.id),
         lifecycle: agent.latestSession?.lifecycle ?? null,
         phase: agent.latestSession?.currentPhase ?? null,
         activeThreadKey: agent.latestSession?.activeThreadKey ?? null,

@@ -9,8 +9,16 @@ export interface AgentState {
   name: string;
   role: string | null;
   backend: string | null;
+  /** Primary studio the agent holds. Null when it holds none. */
   studioId: string | null;
   studioSlug: string | null;
+  /**
+   * Every studio this agent currently holds a lease on. An agent can hold
+   * more than one (concurrent sessions in separate worktrees), so `studioId`
+   * alone would hide real occupancy — it is the marker for where to draw the
+   * agent, not a claim that it is the only place they are.
+   */
+  heldStudioIds: string[];
   lifecycle: string | null;
   phase: string | null;
   activeThreadKey: string | null;

@@ -100,43 +100,62 @@ const nodeTypes: NodeTypes = {
  * Longest-path depth for every task, following `blockedBy` edges.
  *
  * Depth is the layout column: a task sits one column right of its latest
- * blocker, so an edge never points backwards and the reading order matches
- * the execution order.
+ * blocker, so in an acyclic graph an edge never points backwards and the
+ * reading order matches the execution order.
  *
  * `blocked_by` is a bare `uuid[]` with nothing in the schema forbidding a
- * cycle, and a cycle here would recurse forever. The three-colour walk below
- * detects one, drops the back-edge for layout, and reports it — a task group
- * that cannot ever start is worth surfacing, not silently laying out.
+ * cycle, and a cycle here would recurse forever. The walk below detects one
+ * and drops the back-edge *for layout only* — a task group that can never
+ * start is worth surfacing, not silently laying out.
+ *
+ * Two deliberate choices about how a cycle is reported:
+ *
+ *  - **Every member is marked, not just the task the back-edge landed on.**
+ *    Which task that is depends on iteration order, so marking one would
+ *    label a different node run to run and tell the reader nothing about the
+ *    cycle's extent. `backEdges` records the specific edges that close a
+ *    cycle so the renderer can distinguish them.
+ *  - **The back-edge is still drawn.** It is a real dependency, and hiding it
+ *    would hide the cycle. It is the one edge that points backwards, so the
+ *    renderer marks it rather than pretending the layout is a clean DAG.
  */
 export function computeDepths(
   ids: string[],
   dependenciesOf: (id: string) => string[]
-): { depth: Map<string, number>; cyclic: Set<string> } {
+): { depth: Map<string, number>; cyclic: Set<string>; backEdges: Set<string> } {
   const depth = new Map<string, number>();
   const cyclic = new Set<string>();
+  const backEdges = new Set<string>();
   const state = new Map<string, 'visiting' | 'done'>();
+  const stack: string[] = [];
 
   const walk = (id: string): number => {
     const seen = state.get(id);
     if (seen === 'done') return depth.get(id) ?? 0;
     if (seen === 'visiting') {
-      // Back-edge: this task transitively blocks itself.
-      cyclic.add(id);
+      // Back-edge closes a cycle. Everything from `id` up the current DFS
+      // stack is on that cycle — mark the whole set, not just this node.
+      const from = stack.lastIndexOf(id);
+      if (from !== -1) for (const member of stack.slice(from)) cyclic.add(member);
+      else cyclic.add(id);
       return 0;
     }
 
     state.set(id, 'visiting');
+    stack.push(id);
     let d = 0;
     for (const dep of dependenciesOf(id)) {
+      if (state.get(dep) === 'visiting') backEdges.add(`${dep}->${id}`);
       d = Math.max(d, walk(dep) + 1);
     }
+    stack.pop();
     state.set(id, 'done');
     depth.set(id, d);
     return d;
   };
 
   for (const id of ids) walk(id);
-  return { depth, cyclic };
+  return { depth, cyclic, backEdges };
 }
 
 // ─── Task Graph Component ───
@@ -158,7 +177,7 @@ export function TaskGraph() {
     const dependenciesOf = (id: string) =>
       (byId.get(id)?.blockedBy ?? []).filter((d) => byId.has(d));
 
-    const { depth, cyclic } = computeDepths(
+    const { depth, cyclic, backEdges } = computeDepths(
       tasks.map((t) => t.id),
       dependenciesOf
     );
@@ -273,17 +292,25 @@ export function TaskGraph() {
     for (const task of tasks) {
       for (const depId of dependenciesOf(task.id)) {
         const blocker = byId.get(depId)!;
+        // The one edge that closes a cycle is the one edge the layout could
+        // not honour, so it is the one edge that points backwards. Draw it —
+        // it is a real dependency — but mark it, rather than letting it read
+        // as an ordinary link the reader is meant to trust.
+        const isBackEdge = backEdges.has(`${depId}->${task.id}`);
         e.push({
           id: `e-dep-${depId}-${task.id}`,
           source: `task-${depId}`,
           target: `task-${task.id}`,
-          animated: task.status === 'in_progress',
+          animated: !isBackEdge && task.status === 'in_progress',
+          label: isBackEdge ? '⚠ cycle' : undefined,
           style: {
-            stroke:
-              blocker.status === 'completed'
+            stroke: isBackEdge
+              ? skin.colors.taskBlocked
+              : blocker.status === 'completed'
                 ? skin.colors.taskCompleted + '80'
                 : skin.colors.taskBlocked + '90',
-            strokeWidth: blocker.groupId !== task.groupId ? 2 : 1,
+            strokeWidth: isBackEdge || blocker.groupId !== task.groupId ? 2 : 1,
+            ...(isBackEdge ? { strokeDasharray: '6 3' } : {}),
           },
         });
       }

@@ -1406,31 +1406,47 @@ export class SessionService implements ISessionService {
         // and pinning to an inferred studio would turn a resolvable alias into
         // a miss — the resolver would refuse to see a session the caller never
         // said anything about.
-        const aliasStudioScope =
-          routing.tier === 'explicit' || routing.tier === 'studio-hint'
-            ? resolvedStudioId
-            : undefined;
+        const callerNamedStudio = routing.tier === 'explicit' || routing.tier === 'studio-hint';
 
-        const aliasMatch = await aliasRepo.findByAlias(
-          userId,
-          agentId,
-          options.alias,
-          aliasStudioScope
-        );
-        if (aliasMatch) {
-          logger.debug('Found existing session by alias', {
-            sessionId: aliasMatch.id,
+        if (callerNamedStudio && !resolvedStudioId) {
+          // The caller named a studio and it did not resolve — a stale slug, a
+          // cleaned studio, another agent's. resolveStudioId deliberately
+          // returns undefined here rather than falling through ("studioHint
+          // was explicit — don't silently fall through to unrelated studios").
+          //
+          // Running the alias lookup unscoped would defeat exactly that: a
+          // unique alias in some other studio would match and the caller would
+          // land in a worktree they never named. An unresolvable address is a
+          // miss, not an invitation to search everywhere.
+          logger.warn('Alias lookup skipped: caller named a studio that did not resolve', {
             alias: options.alias,
-            studioId: aliasMatch.studioId || null,
+            agentId,
+            tier: routing.tier,
+          });
+        } else {
+          const aliasStudioScope = callerNamedStudio ? resolvedStudioId : undefined;
+
+          const aliasMatch = await aliasRepo.findByAlias(
+            userId,
+            agentId,
+            options.alias,
+            aliasStudioScope
+          );
+          if (aliasMatch) {
+            logger.debug('Found existing session by alias', {
+              sessionId: aliasMatch.id,
+              alias: options.alias,
+              studioId: aliasMatch.studioId || null,
+              aliasStudioScope: aliasStudioScope ?? null,
+            });
+            return this.withStudioLease(aliasMatch, routing, leaseCtx);
+          }
+          logger.debug('No session found for alias', {
+            alias: options.alias,
+            agentId,
             aliasStudioScope: aliasStudioScope ?? null,
           });
-          return this.withStudioLease(aliasMatch, routing, leaseCtx);
         }
-        logger.debug('No session found for alias', {
-          alias: options.alias,
-          agentId,
-          aliasStudioScope: aliasStudioScope ?? null,
-        });
       }
 
       // ThreadKey match — find session scoped to this topic
