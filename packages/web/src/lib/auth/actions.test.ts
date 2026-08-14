@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 const BASE_PORT = Number(process.env.INK_PORT_BASE || 3001);
 const MCP_PORT = BASE_PORT;
