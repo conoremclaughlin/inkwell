@@ -2276,7 +2276,15 @@ async function promptForToolApproval(
     sessionId,
     choice,
   });
+  // A clone's policy is ephemeral, so "session"/"always" answered for a clone
+  // binds that clone and dies with it. Saying so beats letting the user believe
+  // they have made a durable choice they have not.
+  const cloneScopeNote =
+    ctx?.origin?.origin === 'clone' && (choice === 'session' || choice === 'always')
+      ? ' (this clone only — clones cannot change your saved policy)'
+      : '';
   if (result.message) {
+    result.message += cloneScopeNote;
     if (approvalChannel) {
       // In JSONL mode, emit a log line but don't use TUI
       console.error(
@@ -4769,12 +4777,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
       }
 
       // Stateless providers get the whole thread re-packed; stateful ones get
-      // the delta, because they already hold the history.
+      // the delta, because they already hold the history — and so do not need it
+      // accumulated in memory for the life of the clone either.
       const prompt =
         cloneCanReuseSession || !turnCtx.isContinuation
           ? body
           : [...cloneHistory, body].join('\n\n---\n\n');
-      cloneHistory.push(body);
+      if (!cloneCanReuseSession) cloneHistory.push(body);
 
       const turn = startBackendTurn({
         backend: cloneBackend,
@@ -4800,7 +4809,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         ctx.signal?.removeEventListener('abort', onAbort)
       );
       const text = result.responseText ?? result.stdout;
-      if (text.trim()) cloneHistory.push(text.trim());
+      if (!cloneCanReuseSession && text.trim()) cloneHistory.push(text.trim());
       appendTranscript(record.transcriptPath, {
         type: 'backend_turn',
         continuation: turnCtx.isContinuation,
