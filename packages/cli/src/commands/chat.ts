@@ -2937,6 +2937,36 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // Bridge normalized backend stream events onto the live feed. Backend tool
   // calls (the provider calling MCP tools mid-turn) now surface in real time —
   // before stream-json the feed was silent during a backend-routed generation.
+  // Totals for THIS process, summed across every backend invocation it makes.
+  // One ink run invokes the provider repeatedly — once per outer turn (server
+  // default maxTurns=5) and again for each tool-loop continuation — so the last
+  // result covers only the final invocation. Reporting that as the run's usage
+  // undercounts every invocation but the last (Lumen, PR #494 round 2).
+  const runUsageTotals = {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+  };
+
+  // Called at every backend result inside runTurnForLoop — the single boundary
+  // all invocations flow through since the runAgentLoop extraction (#489).
+  // A failed attempt that still reported usage counts: those tokens were spent.
+  const recordRunUsage = (usage: BackendTokenUsage | undefined): void => {
+    if (!usage) return;
+    runUsageTotals.inputTokens += usage.inputTokens || 0;
+    runUsageTotals.outputTokens += usage.outputTokens || 0;
+    runUsageTotals.cacheReadTokens += usage.cacheReadTokens || 0;
+    runUsageTotals.cacheWriteTokens += usage.cacheWriteTokens || 0;
+  };
+
+  // The model reported by the provider during THIS process. Deliberately
+  // separate from runtime.model (what was REQUESTED) and runtime.detectedModel
+  // (which can be hydrated from a previous process's transcript on reattach) —
+  // neither is evidence of what served this run. Stays undefined when the
+  // provider reported nothing, so the field is omitted rather than guessed.
+  let currentRunModel: string | undefined;
+
   const handleBackendEvent = (evt: BackendTurnEvent): void => {
     if (evt.kind === 'tool-use') {
       // Surface the call in the live feed as the agent's own — one dim line,
@@ -2971,24 +3001,26 @@ export async function runChat(options: ChatOptions): Promise<void> {
         preview: compactForLedger(evt.text, 200),
       });
       renderStreamedLines(streamRenderer.completeMessage(evt.text));
-    } else if (
-      evt.kind === 'model' &&
-      evt.model !== runtime.detectedModel &&
-      evt.model !== runtime.model
-    ) {
-      // The provider announced the model actually serving the session — the
-      // ground truth for the context window. Re-resolve unless the user
-      // pinned a model explicitly (then their pin already drove resolution —
-      // an init that merely CONFIRMS the pin is skipped entirely, so pinned
-      // spawns don't re-append model_detected every process).
-      const { windowChanged } = applyDetectedModel(runtime, evt.model, contextBudgetAuto);
-      if (windowChanged) {
-        printEvent(
-          chalk.dim(
-            `⚙ ${evt.model} · window ${formatTokenCount(runtime.backendTokenWindow)} · budget ${formatTokenCount(runtime.maxContextTokens)} tok`
-          )
-        );
-        emitStatusLaneIfChanged(true);
+    } else if (evt.kind === 'model') {
+      // Recorded unconditionally: an event that merely CONFIRMS the requested
+      // model is still this run's evidence of what served it, even though the
+      // window/transcript work below is skipped for it.
+      currentRunModel = evt.model;
+      if (evt.model !== runtime.detectedModel && evt.model !== runtime.model) {
+        // The provider announced the model actually serving the session — the
+        // ground truth for the context window. Re-resolve unless the user
+        // pinned a model explicitly (then their pin already drove resolution —
+        // an init that merely CONFIRMS the pin is skipped entirely, so pinned
+        // spawns don't re-append model_detected every process).
+        const { windowChanged } = applyDetectedModel(runtime, evt.model, contextBudgetAuto);
+        if (windowChanged) {
+          printEvent(
+            chalk.dim(
+              `⚙ ${evt.model} · window ${formatTokenCount(runtime.backendTokenWindow)} · budget ${formatTokenCount(runtime.maxContextTokens)} tok`
+            )
+          );
+          emitStatusLaneIfChanged(true);
+        }
       }
     }
   };
@@ -5127,6 +5159,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         }
 
         lastRunResult = runResult;
+        recordRunUsage(runResult.usage);
         return runResult;
       }
 
@@ -5175,6 +5208,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       });
 
       lastRunResult = contResult;
+      recordRunUsage(contResult.usage);
       return contResult;
     };
 
@@ -5696,9 +5730,21 @@ export async function runChat(options: ChatOptions): Promise<void> {
         reason: finalSignal?.reason || (isBackendFailure ? 'backend_failure' : null),
         usage: {
           contextTokens: reportedContextTokens,
-          inputTokens: lastBackendUsage?.inputTokens || 0,
-          outputTokens: lastBackendUsage?.outputTokens || 0,
+          // Summed over every backend invocation this run made, not just the
+          // last. The parser's inputTokens is the FRESH remainder only — the
+          // cached portion lives in separate fields, and dropping it here is
+          // what made ink sessions report a few hundred input tokens across
+          // hundreds of messages. Context stays the ledger's own figure, which
+          // was already the right measure and is not the billed sum.
+          inputTokens: runUsageTotals.inputTokens,
+          outputTokens: runUsageTotals.outputTokens,
+          cacheReadTokens: runUsageTotals.cacheReadTokens,
+          cacheWriteTokens: runUsageTotals.cacheWriteTokens,
         },
+        // Only what the provider reported during THIS process. Requested and
+        // transcript-hydrated models are excluded — reporting either would
+        // attribute usage to a model that may not have served the run.
+        ...(currentRunModel ? { model: currentRunModel } : {}),
         ...(isBackendFailure ? { backendFailure: true } : {}),
       })
     );

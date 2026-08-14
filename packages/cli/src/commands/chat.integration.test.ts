@@ -199,6 +199,112 @@ describe('runChat integration', () => {
     expect(testState.pcpCalls.some((call) => call.tool === 'update_session_state')).toBe(true);
   });
 
+  /**
+   * One ink run invokes the provider repeatedly — once per outer turn, again
+   * for local tool-loop subprocesses. Reporting the LAST result as the run's
+   * usage undercounts every invocation but the final one, which is how the
+   * ink path came to record a few hundred input tokens across hundreds of
+   * messages (Lumen, PR #494 round 2).
+   */
+  it('sums usage across every backend invocation in the run, not just the last', async () => {
+    const usageByCall = [
+      { inputTokens: 100, outputTokens: 10, cacheReadTokens: 5_000, cacheWriteTokens: 200 },
+      { inputTokens: 50, outputTokens: 400, cacheReadTokens: 9_000, cacheWriteTokens: 0 },
+    ];
+    let call = 0;
+    testState.runBackendImpl.mockImplementation(async () => {
+      const usage = usageByCall[Math.min(call, usageByCall.length - 1)];
+      // First reply asks for a tool, which drives a second backend invocation.
+      const stdout = call === 0 ? '```ink-tool\n{"tool":"get_timezone","args":{}}\n```' : 'done';
+      call += 1;
+      return {
+        success: true,
+        stdout,
+        stderr: '',
+        exitCode: 0,
+        durationMs: 8,
+        command: 'mock',
+        usage: { backend: 'claude', source: 'json', ...usage },
+        model: 'claude-fable-5',
+      };
+    });
+
+    await runChat({
+      agent: 'lumen',
+      backend: 'claude',
+      nonInteractive: true,
+      message: 'sum my usage',
+      pollSeconds: '999',
+    });
+
+    expect(testState.runBackendImpl.mock.calls.length).toBeGreaterThan(1);
+
+    const resultLine = logSpy.mock.calls
+      .map((args) => String(args[0] ?? ''))
+      .filter((line) => line.trim().startsWith('{'))
+      .map((line) => {
+        try {
+          return JSON.parse(line);
+        } catch {
+          return null;
+        }
+      })
+      .find((parsed) => parsed && parsed.type === 'result');
+
+    expect(resultLine).toBeTruthy();
+    const invoked = Math.min(testState.runBackendImpl.mock.calls.length, usageByCall.length);
+    const expectedInput = usageByCall.slice(0, invoked).reduce((sum, u) => sum + u.inputTokens, 0);
+    const expectedCacheRead = usageByCall
+      .slice(0, invoked)
+      .reduce((sum, u) => sum + u.cacheReadTokens, 0);
+
+    // The last invocation alone would report 50 input / 9,000 cache-read.
+    expect(resultLine.usage.inputTokens).toBeGreaterThanOrEqual(expectedInput);
+    expect(resultLine.usage.cacheReadTokens).toBeGreaterThanOrEqual(expectedCacheRead);
+    expect(resultLine.usage.inputTokens).toBeGreaterThan(usageByCall[1].inputTokens);
+  });
+
+  /**
+   * `model` on the result line must be evidence from THIS run. runtime.model is
+   * what was requested and runtime.detectedModel can be hydrated from a prior
+   * process's transcript on reattach — reporting either would attribute usage
+   * to a model that may never have served the run (Lumen, PR #494 round 2).
+   */
+  it('omits model when the provider reported none during this run', async () => {
+    testState.runBackendImpl.mockResolvedValue({
+      success: true,
+      stdout: 'no model event here',
+      stderr: '',
+      exitCode: 0,
+      durationMs: 8,
+      command: 'mock',
+    });
+
+    await runChat({
+      agent: 'lumen',
+      backend: 'claude',
+      model: 'claude-opus-5', // requested — not evidence of what served the run
+      nonInteractive: true,
+      message: 'who served this?',
+      pollSeconds: '999',
+    });
+
+    const resultLine = logSpy.mock.calls
+      .map((args) => String(args[0] ?? ''))
+      .filter((line) => line.trim().startsWith('{'))
+      .map((line) => {
+        try {
+          return JSON.parse(line);
+        } catch {
+          return null;
+        }
+      })
+      .find((parsed) => parsed && parsed.type === 'result');
+
+    expect(resultLine).toBeTruthy();
+    expect(resultLine.model).toBeUndefined();
+  });
+
   it('forwards --attach-file into the turn prompt, transcript, and backend attachment dirs', async () => {
     const mediaDir = join(testCwd, 'files', 'telegram');
     mkdirSync(mediaDir, { recursive: true });

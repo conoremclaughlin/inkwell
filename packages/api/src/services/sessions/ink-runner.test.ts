@@ -276,6 +276,57 @@ describe('InkRunner', () => {
   });
 });
 
+/**
+ * The ink path had the same undercount as the direct claude path, one layer
+ * further out: the CLI parser keeps cached tokens in separate fields, and the
+ * result line forwarded only the fresh remainder. That is why Myra's sessions
+ * recorded a few hundred input tokens across hundreds of messages.
+ */
+describe('InkRunner usage parsing', () => {
+  it('counts the cache split as input and keeps the breakdown', () => {
+    const runner = new InkRunner();
+    const stdout = JSON.stringify({
+      type: 'result',
+      text: 'done',
+      usage: {
+        contextTokens: 42_000,
+        inputTokens: 120,
+        outputTokens: 900,
+        cacheReadTokens: 38_000,
+        cacheWriteTokens: 1_200,
+      },
+      model: 'claude-fable-5',
+    });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const result = (runner as any).parseOutput(stdout, '');
+
+    expect(result.usage.inputTokens).toBe(39_320);
+    expect(result.usage.cacheReadTokens).toBe(38_000);
+    expect(result.usage.cacheWriteTokens).toBe(1_200);
+    // Context stays the CLI's own budget figure, not the billed sum.
+    expect(result.usage.contextTokens).toBe(42_000);
+    expect(result.servedModel).toBe('claude-fable-5');
+  });
+
+  // An older ink build on a studio that has not been rebuilt omits the new
+  // fields; that must degrade to the previous behaviour, not throw or zero.
+  it('falls back to fresh-only input when cache fields are absent', () => {
+    const runner = new InkRunner();
+    const stdout = JSON.stringify({
+      type: 'result',
+      usage: { contextTokens: 1_000, inputTokens: 120, outputTokens: 900 },
+    });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const result = (runner as any).parseOutput(stdout, '');
+
+    expect(result.usage.inputTokens).toBe(120);
+    expect(result.usage.cacheReadTokens).toBe(0);
+    expect(result.servedModel).toBeUndefined();
+  });
+});
+
 describe('clampMaxTurns', () => {
   it('defaults when absent or non-finite', () => {
     expect(clampMaxTurns(undefined)).toBe(DEFAULT_MAX_TURNS);
