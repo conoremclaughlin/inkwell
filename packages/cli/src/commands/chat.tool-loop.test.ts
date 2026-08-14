@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { isTerminalSignalToolResult } from './chat.js';
+import { toolLoopStopReason } from '../repl/agent-loop.js';
 
 /**
  * Regression for the per-heartbeat multiplication: one ink spawn was emitting
@@ -44,21 +45,17 @@ describe('isTerminalSignalToolResult', () => {
   });
 });
 
-// Mirror the loop's stop decision (chat.ts): stop on a terminal signal OR when
-// no tool executed OR at the iteration cap. This is the exact predicate the fix
-// added, isolated so the multiplication regression is guarded directly.
+// The loop's stop decision: stop on a terminal signal OR when no tool executed
+// OR at the iteration cap. This calls the REAL predicate the loop runs
+// (../repl/agent-loop.js) rather than a local mirror — a mirrored copy can pass
+// while the loop it claims to guard has drifted, which is exactly the failure
+// mode this regression exists to catch.
 function shouldStop(
   iterationResults: Array<{ tool: string; status: string; result?: unknown }>,
   iteration: number,
   max: number
 ): boolean {
-  const hasExecutedTools = iterationResults.some(
-    (r) => r.status === 'executed' || r.status === 'approved'
-  );
-  const signaledDone = iterationResults.some(
-    (r) => r.tool === 'signal_status' && isTerminalSignalToolResult(r.result)
-  );
-  return signaledDone || !hasExecutedTools || iteration >= max;
+  return toolLoopStopReason(iterationResults, iteration, max) !== null;
 }
 
 describe('tool-loop stop decision', () => {
