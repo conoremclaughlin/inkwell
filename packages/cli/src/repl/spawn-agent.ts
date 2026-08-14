@@ -274,6 +274,31 @@ export interface CloneOutcomeSummary {
 }
 
 /**
+ * Which of these outcomes should enter the parent's ledger now.
+ *
+ * Two conditions, and both have bitten:
+ *
+ * - **Settled only.** An immediate `collect_agents` after `wait:false` returns
+ *   `running` outcomes. Marking those seen would burn the clone's slot before it
+ *   had a summary, so the completed result could never land at all.
+ * - **Once each.** Polling a fan-out, or calling `collect_agents` again later,
+ *   must not re-inject the same finished work into the parent's context.
+ *
+ * Mutates `alreadyLedgered` — a caller that asks is a caller that is about to
+ * write, and splitting the two invites exactly the drift this replaced.
+ */
+export function selectOutcomesToLedger(
+  outcomes: readonly CloneOutcomeSummary[],
+  alreadyLedgered: Set<string>
+): CloneOutcomeSummary[] {
+  const fresh = outcomes.filter(
+    (o) => o.status !== 'running' && o.status !== 'missing' && !alreadyLedgered.has(o.id)
+  );
+  for (const outcome of fresh) alreadyLedgered.add(outcome.id);
+  return fresh;
+}
+
+/**
  * Render the fan-out as ONE ledger entry.
  *
  * One entry per fan-out, not per clone: the parent asked one question and gets

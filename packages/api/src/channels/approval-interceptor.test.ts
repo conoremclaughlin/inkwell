@@ -656,3 +656,56 @@ describe('approval notifications — shadow clone origin', () => {
     expect(msg).toContain('2 permission requests');
   });
 });
+
+describe('approval notifications — batch clone mapping', () => {
+  const base = {
+    id: 'req-1',
+    userId: 'user-1',
+    tool: 'save_link',
+    args: null,
+    reason: null,
+    requestingAgentId: 'wren',
+    studioId: null,
+    sessionId: null,
+    expiresAt: new Date(Date.now() + 300_000).toISOString(),
+  };
+
+  it('maps each numbered row to the clone that asked', () => {
+    // Replies are per-number ("approve 1,3"), so a header listing every clone
+    // is not enough — the user has to know which number is which clone.
+    const msg = formatBatchNotification([
+      {
+        ...base,
+        id: 'r1',
+        tool: 'save_link',
+        origin: { origin: 'clone', cloneId: 'clone-1', cloneLabel: 'auth audit' },
+      },
+      {
+        ...base,
+        id: 'r2',
+        tool: 'create_task',
+        origin: { origin: 'clone', cloneId: 'clone-2', cloneLabel: 'coverage map' },
+      },
+    ]);
+
+    const lines = msg.split('\n');
+    const first = lines.find((l) => l.startsWith('1.'));
+    const second = lines.find((l) => l.startsWith('2.'));
+    expect(first).toContain('save_link');
+    expect(first).toContain('auth audit');
+    expect(first).not.toContain('coverage map');
+    expect(second).toContain('create_task');
+    expect(second).toContain('coverage map');
+    expect(second).not.toContain('auth audit');
+  });
+
+  it('leaves rows unadorned when everything came from the same requester', () => {
+    const msg = formatBatchNotification([
+      { ...base, id: 'r1', tool: 'save_link' },
+      { ...base, id: 'r2', tool: 'create_task' },
+    ]);
+    const first = msg.split('\n').find((l) => l.startsWith('1.'));
+    // No per-row attribution to read past when there is nothing to distinguish.
+    expect(first).toBe('1. `save_link`');
+  });
+});

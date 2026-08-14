@@ -903,4 +903,36 @@ describe('hydrateLedgerFromTranscript — shadow clone handoff', () => {
     expect(() => hydrateLedgerFromTranscript(ledger, transcriptPath, 'wren')).not.toThrow();
     expect(ledger.listEntries().some((e) => e.content === 'still here')).toBe(true);
   });
+
+  it('lets a later compaction supersede a replayed fan-out', () => {
+    // The failure this guards: hydration added the fan-out entry but did not
+    // track its id, so the compaction event that replaced it evicted everything
+    // EXCEPT it — leaving the superseded clone summary sitting alongside the
+    // compacted state that was meant to stand in for it.
+    write([
+      { ts: '2026-08-14T09:00:00Z', eid: 1, type: 'user', content: 'go look at two things' },
+      {
+        ts: '2026-08-14T09:01:00Z',
+        eid: 2,
+        type: 'clone_fanout',
+        outcomes: [
+          { id: 'clone-1', label: 'audit', status: 'completed', summary: 'Three entry points.' },
+        ],
+      },
+      {
+        ts: '2026-08-14T09:02:00Z',
+        eid: 3,
+        type: 'compaction',
+        summary: 'Earlier work compacted: clones audited auth.',
+        kept: [],
+      },
+    ]);
+
+    const ledger = new ContextLedger();
+    hydrateLedgerFromTranscript(ledger, transcriptPath, 'wren');
+
+    const entries = ledger.listEntries();
+    expect(entries.some((e) => e.content.includes('Three entry points.'))).toBe(false);
+    expect(entries.some((e) => e.source === 'compaction-history')).toBe(true);
+  });
 });

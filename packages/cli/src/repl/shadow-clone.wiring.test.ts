@@ -118,6 +118,9 @@ function buildClone(opts: {
             await executeToolCalls(calls, {
               policy,
               sessionId: 'sess-1',
+              // Production threads the turn signal here; without it the
+              // executor cannot stop mid-batch.
+              signal: ctx.signal,
               callTool: async (tool, args) => {
                 if (isForbiddenInClone(tool)) {
                   return {
@@ -647,5 +650,72 @@ describe('shadow clone isolation from parent process state', () => {
     expect(done.signalSink.get()?.status).toBe('completed');
     expect(stuck.signalSink.get()?.status).toBe('blocked');
     expect(getLastSignal()).toBeNull();
+  });
+});
+
+describe('shadow clone cancellation is authoritative', () => {
+  it('does not run the rest of a batch after cancelling during the first approval', async () => {
+    const parent = new ToolPolicyState('backend', { persist: false });
+    const controller = new AbortController();
+
+    const coordinator = new ApprovalCoordinator({
+      concurrency: 1,
+      prompt: (ticket) =>
+        new Promise<boolean>((_resolve, reject) => {
+          ticket.signal?.addEventListener('abort', () => {
+            const err = new Error('Input aborted');
+            err.name = 'InkInputAborted';
+            reject(err);
+          });
+        }),
+    });
+
+    const clone = buildClone({
+      parent,
+      coordinator,
+      cloneId: 'clone-1',
+      cloneLabel: 'cancelled mid-batch',
+      signal: controller.signal,
+      // save_link escalates and blocks on approval; read would run freely.
+      turns: [
+        `${inkTool('save_link', { url: 'https://a.example' })}\n${inkTool('read', { path: 'auth.ts' })}`,
+        doneSignal,
+      ],
+    });
+
+    const running = clone.run();
+    await new Promise((r) => setTimeout(r, 10));
+    controller.abort();
+    const result = await running;
+
+    // The batch stops where the cancellation landed. Checking only after the
+    // whole batch returned let `read` execute against a turn the user had
+    // already cancelled.
+    expect(clone.executed).not.toContain('read');
+    expect(result.stopReason).toBe('aborted');
+  }, 5000);
+
+  it('spends no backend invocation when the turn is already cancelled', async () => {
+    const parent = new ToolPolicyState('backend', { persist: false });
+    const controller = new AbortController();
+    controller.abort();
+
+    const coordinator = new ApprovalCoordinator({ concurrency: 1, prompt: async () => false });
+    const clone = buildClone({
+      parent,
+      coordinator,
+      cloneId: 'clone-1',
+      cloneLabel: 'cancelled before starting',
+      signal: controller.signal,
+      turns: [inkTool('read', { path: 'auth.ts' }), doneSignal],
+    });
+
+    const result = await clone.run();
+
+    // The opening spawn is the most expensive thing the loop does; proving a
+    // cancelled turn is cancelled should not cost one.
+    expect(clone.backendTurns).toBe(0);
+    expect(result.stopReason).toBe('aborted');
+    expect(result.success).toBe(false);
   });
 });

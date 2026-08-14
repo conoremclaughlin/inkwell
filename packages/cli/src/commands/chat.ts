@@ -44,6 +44,7 @@ import {
   isCloneHandoffTool,
   parseSpawnAgentArgs,
   screenIteration,
+  selectOutcomesToLedger,
   type CloneOutcomeSummary,
   type SpawnAgentTask,
 } from '../repl/spawn-agent.js';
@@ -951,7 +952,7 @@ export function hydrateLedgerFromTranscript(
           error: typeof o.error === 'string' ? o.error : undefined,
         }))
       );
-      ledger.addEntry(
+      const entry = ledger.addEntry(
         'system',
         rendered.length > MAX_CLONE_SUMMARY_CHARS
           ? `${rendered.slice(0, MAX_CLONE_SUMMARY_CHARS)}…`
@@ -959,6 +960,11 @@ export function hydrateLedgerFromTranscript(
         'shadow-clone',
         eid
       );
+      // Tracked like every other replayed entry: a later compaction event in
+      // the same transcript evicts everything hydrated before it. Dropping the
+      // id here leaves the superseded fan-out sitting alongside the compacted
+      // summary that replaced it.
+      hydratedEntryIds.push(entry.id);
       loaded += 1;
       continue;
     }
@@ -5012,6 +5018,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     await executeToolCalls(calls, {
       policy: opts.policy,
       sessionId: runtime.sessionId,
+      signal: opts.signal,
       callTool: (tool, args) => {
         // Non-nesting is enforced HERE, not by omitting spawn_agent from the
         // clone's prompt: tool calls travel as text, so a model can name any
@@ -5323,15 +5330,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // working detail back into the parent's context, and re-collecting (polling
     // a background fan-out, or calling collect_agents again later) would inject
     // the same completed work over and over.
-    // Only SETTLED outcomes are ledgered, and only once. Marking a still-running
-    // clone as ledgered — which an immediate collect_agents after wait:false
-    // does — would burn its slot before it had a summary, so the completed
-    // result could never reach the parent at all.
-    const fresh = outcomes.filter(
-      (o) => o.status !== 'running' && o.status !== 'missing' && !ledgeredClones.has(o.id)
-    );
+    const fresh = selectOutcomesToLedger(outcomes, ledgeredClones);
     if (fresh.length > 0) {
-      for (const o of fresh) ledgeredClones.add(o.id);
       const rendered = formatFanOutForLedger(fresh);
       ledger.addEntry(
         'system',
@@ -5367,6 +5367,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     const iterationResults: ToolResultRecord[] = [];
     await executeToolCalls(calls, {
       policy: toolPolicy,
+      signal: abortSignal,
       callTool: (tool, args) => {
         // spawn_agent is NOT a client-local policy bypass. Unlike ledger tools
         // it costs backend time and fans out authority, so it reaches here only

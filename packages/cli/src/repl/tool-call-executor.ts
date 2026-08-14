@@ -42,6 +42,15 @@ export interface ToolCallExecutorDeps {
   ) => Promise<boolean>;
   /** Called after each tool call with the result */
   onResult?: (result: ToolCallResult) => void;
+  /**
+   * Cancels the batch.
+   *
+   * Checked BETWEEN calls, not just at the start. A batch can sit for minutes
+   * inside a single approval prompt, and cancelling during the first call must
+   * not leave the rest of the batch to run — which is exactly what happened
+   * when only the caller checked, after the whole batch had returned.
+   */
+  signal?: AbortSignal;
 }
 
 /**
@@ -62,6 +71,19 @@ export async function executeToolCalls(
   const results: ToolCallResult[] = [];
 
   for (const call of calls) {
+    if (deps.signal?.aborted) {
+      // Report the remainder rather than dropping it silently: the agent asked
+      // for these, and "cancelled" is a different answer from "never mentioned".
+      const cancelled: ToolCallResult = {
+        tool: call.tool,
+        args: call.args,
+        status: 'denied',
+        reason: 'Cancelled before this call ran',
+      };
+      results.push(cancelled);
+      deps.onResult?.(cancelled);
+      continue;
+    }
     const result = await executeOneToolCall(call, deps);
     results.push(result);
     deps.onResult?.(result);
@@ -106,6 +128,16 @@ async function executeOneToolCall(
 
   // Promptable — pause for approval (pass args so the notification shows what's being approved)
   const approved = await promptForApproval(call.tool, decision.reason, call.args);
+  if (deps.signal?.aborted) {
+    // The wait ended because the turn was cancelled. Whatever the channel
+    // returned, acting on it now would run work the user just stopped.
+    return {
+      tool: call.tool,
+      args: call.args,
+      status: 'denied',
+      reason: 'Cancelled while waiting for approval',
+    };
+  }
   if (!approved) {
     return {
       tool: call.tool,

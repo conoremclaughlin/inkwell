@@ -222,6 +222,21 @@ export async function runAgentLoop(
   const allToolResults: ToolResultRecord[] = [];
 
   let iteration = 0;
+
+  // Fail fast. A turn cancelled before it started must not spend a backend
+  // invocation proving it — the opening spawn is the single most expensive
+  // thing the loop does.
+  if (input.signal?.aborted) {
+    return {
+      responseText: '',
+      assistantDisplayText: '',
+      toolResults: [],
+      iterations: 0,
+      success: false,
+      stopReason: 'aborted',
+    };
+  }
+
   let outcome = await ports.backend.runTurn(input.prompt, {
     iteration,
     isContinuation: false,

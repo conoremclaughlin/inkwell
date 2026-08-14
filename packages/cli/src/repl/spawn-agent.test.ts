@@ -12,6 +12,7 @@ import {
   isCloneHandoffTool,
   parseSpawnAgentArgs,
   screenIteration,
+  selectOutcomesToLedger,
 } from './spawn-agent.js';
 import type { LocalToolCall } from './agent-loop.js';
 
@@ -263,45 +264,75 @@ describe('admitSpawn', () => {
   });
 });
 
-describe('handoff bookkeeping', () => {
-  /**
-   * The dedupe rule chat.ts applies before ledgering a collection: settled
-   * outcomes only, once each. Mirrored here from the production predicate's
-   * two conditions rather than its code — the predicate is a filter expression
-   * inline in the fan-out, and this pins the behaviour it has to keep.
-   */
-  const ledgerable = (
-    outcomes: Array<{ id: string; status: string }>,
-    already: Set<string>
-  ): string[] =>
-    outcomes
-      .filter((o) => o.status !== 'running' && o.status !== 'missing' && !already.has(o.id))
-      .map((o) => o.id);
-
+describe('selectOutcomesToLedger', () => {
   it('does not consume a clone dedupe slot while it is still running', () => {
     const seen = new Set<string>();
 
-    // Poll immediately after wait:false — nothing to ledger yet.
-    expect(ledgerable([{ id: 'clone-1', status: 'running' }], seen)).toEqual([]);
-    // Nothing was marked, so the completed result can still land.
-    expect(ledgerable([{ id: 'clone-1', status: 'completed' }], seen)).toEqual(['clone-1']);
+    // Poll immediately after wait:false — nothing to ledger yet, and nothing
+    // marked, so the completed result can still land later.
+    expect(
+      selectOutcomesToLedger([{ id: 'clone-1', label: 'a', status: 'running' }], seen)
+    ).toEqual([]);
+    expect(seen.size).toBe(0);
+
+    const settled = selectOutcomesToLedger(
+      [{ id: 'clone-1', label: 'a', status: 'completed', summary: 'done' }],
+      seen
+    );
+    expect(settled.map((o) => o.id)).toEqual(['clone-1']);
   });
 
   it('ledgers a settled clone exactly once across repeated collections', () => {
     const seen = new Set<string>();
-    const outcomes = [{ id: 'clone-1', status: 'completed' }];
+    const outcomes = [{ id: 'clone-1', label: 'a', status: 'completed', summary: 'done' }];
 
-    const first = ledgerable(outcomes, seen);
-    first.forEach((id) => seen.add(id));
-    expect(first).toEqual(['clone-1']);
-
+    expect(selectOutcomesToLedger(outcomes, seen).map((o) => o.id)).toEqual(['clone-1']);
     // Calling collect_agents again — or polling a fan-out — must not re-inject
     // the same completed work into the parent's context.
-    expect(ledgerable(outcomes, seen)).toEqual([]);
+    expect(selectOutcomesToLedger(outcomes, seen)).toEqual([]);
+  });
+
+  it('carries the whole outcome through, not just the id', () => {
+    const seen = new Set<string>();
+    const [only] = selectOutcomesToLedger(
+      [{ id: 'clone-1', label: 'audit', status: 'failed', error: 'backend all-refused' }],
+      seen
+    );
+    expect(only).toEqual({
+      id: 'clone-1',
+      label: 'audit',
+      status: 'failed',
+      error: 'backend all-refused',
+    });
   });
 
   it('ignores an unknown clone rather than ledgering a placeholder', () => {
-    expect(ledgerable([{ id: 'clone-9', status: 'missing' }], new Set())).toEqual([]);
+    const seen = new Set<string>();
+    expect(
+      selectOutcomesToLedger([{ id: 'clone-9', label: '?', status: 'missing' }], seen)
+    ).toEqual([]);
+    expect(seen.size).toBe(0);
+  });
+
+  it('handles a mixed fan-out — settles some, leaves the rest collectable', () => {
+    const seen = new Set<string>();
+    const first = selectOutcomesToLedger(
+      [
+        { id: 'clone-1', label: 'a', status: 'completed', summary: 'x' },
+        { id: 'clone-2', label: 'b', status: 'running' },
+      ],
+      seen
+    );
+    expect(first.map((o) => o.id)).toEqual(['clone-1']);
+
+    const second = selectOutcomesToLedger(
+      [
+        { id: 'clone-1', label: 'a', status: 'completed', summary: 'x' },
+        { id: 'clone-2', label: 'b', status: 'completed', summary: 'y' },
+      ],
+      seen
+    );
+    expect(second.map((o) => o.id)).toEqual(['clone-2']);
   });
 });
 

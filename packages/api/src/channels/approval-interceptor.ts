@@ -479,9 +479,15 @@ export function formatBatchNotification(requests: BufferedRequest[]): string {
 
   let msg = `\u{1F510} *${requests.length} permission requests* from ${agentLabel}:\n\n`;
 
+  // Each numbered row carries its own requester. Replies are per-number
+  // ("approve 1,3"), so a header that merely lists every clone involved leaves
+  // a subset approval ambiguous — the user cannot tell which clone they are
+  // saying yes to.
+  const mixedRequesters = new Set(requests.map((r) => formatRequester(r))).size > 1;
   requests.forEach((req, i) => {
     const toolDisplay = req.args ? `${req.tool}(${req.args})` : req.tool;
-    msg += `${i + 1}. \`${toolDisplay}\`\n`;
+    const who = mixedRequesters ? ` — ${formatRequester(req)}` : '';
+    msg += `${i + 1}. \`${toolDisplay}\`${who}\n`;
     if (req.reason) msg += `   ${req.reason}\n`;
   });
 
@@ -520,6 +526,9 @@ async function sendTelegramNotification(
       const telegramMessageId = result.result?.message_id;
 
       if (telegramMessageId) {
+        // These updates REPLACE the metadata object, so anything written at
+        // insert time — notably the clone origin — has to be carried forward
+        // explicitly or the audit trail loses who actually asked.
         if (isBatch) {
           // Store the batch message ID on ALL requests in the batch
           // so the interceptor can match reply-to for numbered selection
@@ -528,6 +537,7 @@ async function sendTelegramNotification(
               .from('approval_requests')
               .update({
                 metadata: {
+                  ...(req.origin ? { origin: req.origin } : {}),
                   batchMessageId: telegramMessageId,
                   batchIndex: requests.indexOf(req),
                   platform: 'telegram',
@@ -541,6 +551,7 @@ async function sendTelegramNotification(
             .from('approval_requests')
             .update({
               metadata: {
+                ...(requests[0].origin ? { origin: requests[0].origin } : {}),
                 telegramMessageId,
                 platform: 'telegram',
                 chatId: tu.platform_user_id,
