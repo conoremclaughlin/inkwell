@@ -5036,10 +5036,28 @@ export async function runChat(options: ChatOptions): Promise<void> {
       )
     );
 
+    // Each clone gets its own controller, chained from the turn's signal.
+    //
+    // Chained rather than shared because the lifetimes differ: Ctrl+C during the
+    // spawning turn must still kill them, but a background clone outlives that
+    // turn, after which the turn's handler can no longer reach it. Its own
+    // controller is what `/clones cancel` and session-end teardown pull on —
+    // without which a runaway clone is unstoppable, and a still-running one at
+    // exit keeps its backend child (and therefore the process) alive.
     const running = Promise.allSettled(
-      records.map((record, index) =>
-        runOneClone(record, tasks[index], { index, total: records.length, signal: ctx.signal })
-      )
+      records.map((record, index) => {
+        const controller = new AbortController();
+        if (ctx.signal) {
+          if (ctx.signal.aborted) controller.abort();
+          else ctx.signal.addEventListener('abort', () => controller.abort(), { once: true });
+        }
+        cloneRegistry.attachCanceller(record.id, () => controller.abort());
+        return runOneClone(record, tasks[index], {
+          index,
+          total: records.length,
+          signal: controller.signal,
+        });
+      })
     );
 
     if (!wait) {
@@ -5116,6 +5134,20 @@ export async function runChat(options: ChatOptions): Promise<void> {
         resolve();
       });
     });
+
+  /**
+   * Stop anything still running, on the way out.
+   *
+   * A background clone keeps a backend child process alive, and Node will not
+   * exit while that handle is open — so without this, quitting `ink chat` with a
+   * clone still working hangs the terminal rather than closing it.
+   */
+  const cancelRunningClones = (): void => {
+    const stopped = cloneRegistry.cancelAll();
+    if (stopped > 0) {
+      printEvent(chalk.dim(`  🌀 cancelled ${stopped} running clone(s) on exit`));
+    }
+  };
 
   /** `/clones` — every clone this session spawned, running or finished. */
   const cloneOverviewLines = (): string[] => {
@@ -6496,6 +6528,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
     readyForAutoRun = false;
     approvalManager.cancelAll();
     approvalCoordinator.dispose();
+    // A background clone holds a live backend child, which holds the process.
+    cancelRunningClones();
     runtime.approvalChannel?.dispose();
     if (pendingTurns > 0) {
       await turnQueue;
@@ -7029,6 +7063,22 @@ export async function runChat(options: ChatOptions): Promise<void> {
         }
         case 'clones': {
           const target = slash.args[0];
+          if (target === 'cancel') {
+            const which = slash.args[1];
+            if (!which) {
+              const stopped = cloneRegistry.cancelAll();
+              showInPanel([
+                stopped > 0 ? `Cancelled ${stopped} running clone(s).` : 'No clones are running.',
+              ]);
+              break;
+            }
+            showInPanel([
+              cloneRegistry.cancel(which)
+                ? `Cancelled ${which}.`
+                : `${which} is not running (unknown, or already finished).`,
+            ]);
+            break;
+          }
           if (target) {
             // Navigate INTO a clone: show what it did, from its own transcript.
             const record = cloneRegistry.get(target);
@@ -8023,6 +8073,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // Cancel any pending remote approval requests
   approvalManager.cancelAll();
   approvalCoordinator.dispose();
+  cancelRunningClones();
   runtime.approvalChannel?.dispose();
 
   const summary = summarizeForSessionEnd(ledger);

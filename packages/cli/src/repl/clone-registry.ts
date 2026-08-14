@@ -56,6 +56,12 @@ export class CloneRegistry {
   private records = new Map<string, CloneRecord>();
   private order: string[] = [];
   private listeners = new Set<(change: CloneRegistryChange) => void>();
+  /**
+   * How to stop a running clone. Kept beside the records rather than inside
+   * them: a `CloneRecord` is data — it goes over the wire to the TUI and, later,
+   * the desktop app — and a function is not.
+   */
+  private cancellers = new Map<string, () => void>();
   private seq = 0;
 
   /** Sequential id: readable in a prompt, typeable in the TUI. */
@@ -91,7 +97,12 @@ export class CloneRegistry {
     if (isSettled(current.status) && patch.status === 'running') return current;
 
     const next: CloneRecord = { ...current, ...patch };
-    if (isSettled(next.status) && next.endedAt === undefined) next.endedAt = Date.now();
+    if (isSettled(next.status)) {
+      if (next.endedAt === undefined) next.endedAt = Date.now();
+      // Nothing left to cancel — drop the closure so a long session does not
+      // accumulate one per clone it has ever run.
+      this.cancellers.delete(id);
+    }
     this.records.set(id, next);
     this.emit({ record: next, kind: isSettled(next.status) ? 'settled' : 'updated' });
     return next;
@@ -99,6 +110,39 @@ export class CloneRegistry {
 
   get(id: string): CloneRecord | undefined {
     return this.records.get(id);
+  }
+
+  /**
+   * Register how to stop this clone.
+   *
+   * Load-bearing for background clones specifically: a clone spawned with
+   * `wait:false` outlives the turn that started it, so the turn's own abort
+   * handler can no longer reach it. Without a canceller here, a runaway
+   * background clone cannot be stopped, and a still-running one at session end
+   * keeps its backend child alive — which keeps the whole process alive.
+   */
+  attachCanceller(id: string, cancel: () => void): void {
+    this.cancellers.set(id, cancel);
+  }
+
+  /** Stop one running clone. Returns false if it is unknown or already settled. */
+  cancel(id: string): boolean {
+    const record = this.records.get(id);
+    if (!record || isSettled(record.status)) return false;
+    const cancel = this.cancellers.get(id);
+    this.cancellers.delete(id);
+    cancel?.();
+    // Mark it aborted immediately: the loop unwinds asynchronously, and a
+    // settled record is final, so a later write cannot contradict this.
+    this.update(id, { status: 'aborted', error: 'cancelled' });
+    return true;
+  }
+
+  /** Stop every running clone. Returns how many were still running. */
+  cancelAll(): number {
+    const running = this.list({ status: 'running' });
+    for (const record of running) this.cancel(record.id);
+    return running.length;
   }
 
   /** Insertion order — the order the parent spawned them, which is how it thinks. */

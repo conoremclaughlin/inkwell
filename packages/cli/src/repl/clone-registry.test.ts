@@ -179,3 +179,75 @@ describe('formatCloneLine', () => {
     expect(line).toContain('backend backend-failure');
   });
 });
+
+describe('CloneRegistry cancellation', () => {
+  it('stops a running clone and records it as aborted', () => {
+    const registry = new CloneRegistry();
+    seed(registry);
+    let aborted = false;
+    registry.attachCanceller('clone-1', () => {
+      aborted = true;
+    });
+
+    expect(registry.cancel('clone-1')).toBe(true);
+    expect(aborted).toBe(true);
+    expect(registry.get('clone-1')?.status).toBe('aborted');
+    expect(registry.get('clone-1')?.error).toBe('cancelled');
+    expect(registry.runningCount).toBe(0);
+  });
+
+  it('refuses to cancel an unknown or already-settled clone', () => {
+    const registry = new CloneRegistry();
+    seed(registry);
+    registry.update('clone-1', { status: 'completed' });
+
+    expect(registry.cancel('clone-1')).toBe(false);
+    expect(registry.cancel('clone-99')).toBe(false);
+    // The recorded outcome survives.
+    expect(registry.get('clone-1')?.status).toBe('completed');
+  });
+
+  it('cancels a clone that never registered a canceller', () => {
+    const registry = new CloneRegistry();
+    seed(registry);
+    expect(registry.cancel('clone-1')).toBe(true);
+    expect(registry.get('clone-1')?.status).toBe('aborted');
+  });
+
+  it('stops everything still running and reports how many', () => {
+    const registry = new CloneRegistry();
+    seed(registry, 'a');
+    seed(registry, 'b');
+    seed(registry, 'c');
+    const stopped: string[] = [];
+    for (const id of ['clone-1', 'clone-2', 'clone-3']) {
+      registry.attachCanceller(id, () => stopped.push(id));
+    }
+    registry.update('clone-2', { status: 'completed' });
+
+    // The finished one is left alone; the other two are stopped. This is the
+    // session-exit path — a live clone holds a backend child, which holds Node.
+    expect(registry.cancelAll()).toBe(2);
+    expect(stopped).toEqual(['clone-1', 'clone-3']);
+    expect(registry.runningCount).toBe(0);
+    expect(registry.get('clone-2')?.status).toBe('completed');
+
+    // Idempotent — a second pass has nothing to do.
+    expect(registry.cancelAll()).toBe(0);
+  });
+
+  it('releases the canceller once a clone settles on its own', () => {
+    const registry = new CloneRegistry();
+    seed(registry);
+    let called = 0;
+    registry.attachCanceller('clone-1', () => {
+      called += 1;
+    });
+    registry.update('clone-1', { status: 'completed' });
+
+    // Dropped rather than kept: a long session should not accumulate one
+    // closure per clone it has ever run.
+    expect(registry.cancel('clone-1')).toBe(false);
+    expect(called).toBe(0);
+  });
+});
