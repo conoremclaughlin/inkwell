@@ -37,6 +37,7 @@ import {
   SPAWN_AGENT_TOOL,
   boundSummary,
   buildClonePrompt,
+  classifyCloneOutcome,
   describeCloneToolResult,
   formatFanOutForLedger,
   parseSpawnAgentArgs,
@@ -93,8 +94,10 @@ import {
   buildResolverEnv,
 } from '../repl/credential-resolver.js';
 import {
+  createSignalSink,
   isClientLocalTool,
   handleClientLocalTool,
+  type SignalSink,
   getLastSignal,
   clearLastSignal,
 } from '../repl/context-tools.js';
@@ -148,6 +151,7 @@ import {
   MAX_TOOL_CALLS_PER_ITERATION,
   runAgentLoop,
   stripLocalToolBlocks,
+  type AgentLoopResult,
   type BackendTurnOutcome,
   type LocalToolCall,
   type ToolResultRecord,
@@ -2249,7 +2253,9 @@ async function promptForToolApproval(
     if (argsDisplay) lines.push(argsDisplay);
     lines.push(reason, '', '[y] once · [s] session · [a] always · [d] deny · [n] cancel');
     inkRepl.addMessage('system', lines.join('\n'), { label: '🔐 permission' });
-    const answer = (await inkRepl.waitForInput({ signal: ctx?.signal })).trim();
+    // priority: the REPL loop is already waiting for the next command by now,
+    // so this has to take the line rather than queue behind it.
+    const answer = (await inkRepl.waitForInput({ signal: ctx?.signal, priority: true })).trim();
     choice = parseToolApprovalInput(answer);
   } else if (rl) {
     const detail = argsDisplay ? ` (${argsDisplay})` : '';
@@ -2996,7 +3002,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
    * user's connected platforms (Telegram, etc.) and intercepts their reply. The
    * server owns routing; we create and poll.
    */
-  const askFor2faApproval = async (ticket: ApprovalTicket): Promise<boolean> => {
+  const askFor2faApproval = async (
+    ticket: ApprovalTicket<ToolPolicyState>,
+    target: ToolPolicyState
+  ): Promise<boolean> => {
     const { tool, reason, args } = ticket;
     const who =
       ticket.origin.origin === 'clone' ? ` (🌀 ${ticket.origin.cloneLabel || 'clone'})` : '';
@@ -3011,6 +3020,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         sessionId: runtime.sessionId,
         studioId: runtime.studioId,
         signal: ticket.signal,
+        origin: ticket.origin,
         onCreated: (id) => {
           printLine(chalk.yellow(`   Request ${id.slice(0, 8)}… sent to connected platforms`));
         },
@@ -3028,18 +3038,16 @@ export async function runChat(options: ChatOptions): Promise<void> {
           // and removes from promptTools at all scopes so the tool stops prompting.
           const grantScope = result.action === 'grant-studio' ? 'studio' : 'agent';
           const scopeId =
-            grantScope === 'studio'
-              ? toolPolicy.getContext()?.studioId
-              : toolPolicy.getContext()?.agentId;
+            grantScope === 'studio' ? target.getContext()?.studioId : target.getContext()?.agentId;
           if (scopeId) {
-            toolPolicy.persistentGrant(tool, { scope: grantScope, id: scopeId });
+            target.persistentGrant(tool, { scope: grantScope, id: scopeId });
             printLine(
               chalk.green(`✅ 2FA: ${tool} permanently approved (${grantScope}: ${scopeId})`)
             );
           } else {
             // Can't resolve scope — fall back to session grant instead of leaking to global
             if (runtime.sessionId) {
-              toolPolicy.grantToolForSession(runtime.sessionId, tool);
+              target.grantToolForSession(runtime.sessionId, tool);
             }
             printLine(
               chalk.yellow(
@@ -3049,7 +3057,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           }
         } else if (result.action === 'grant-session') {
           if (runtime.sessionId) {
-            toolPolicy.grantToolForSession(runtime.sessionId, tool);
+            target.grantToolForSession(runtime.sessionId, tool);
           }
           printLine(chalk.green(`✅ 2FA: ${tool} approved for this session`));
         } else {
@@ -3082,13 +3090,17 @@ export async function runChat(options: ChatOptions): Promise<void> {
    * function only decides *how* to ask.
    */
   const askForToolApproval = async (
-    ticket: ApprovalTicket,
+    ticket: ApprovalTicket<ToolPolicyState>,
     promptCtx: { queuedNow: () => number }
   ): Promise<boolean> => {
+    // Apply the user's answer to the policy the request was made against. A
+    // clone's grant belongs to the clone: landing it on the parent widens the
+    // parent while leaving the requester still blocked at its own re-check.
+    const target = ticket.policy ?? toolPolicy;
     if (!runtime.awayMode) {
       return promptForToolApproval(
         rl,
-        toolPolicy,
+        target,
         runtime.sessionId,
         ticket.tool,
         ticket.reason,
@@ -3098,7 +3110,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         { origin: ticket.origin, signal: ticket.signal, queuedNow: promptCtx.queuedNow }
       );
     }
-    return askFor2faApproval(ticket);
+    return askFor2faApproval(ticket, target);
   };
 
   /**
@@ -3111,7 +3123,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
    * queue, so they run free. Away mode can be toggled mid-session, hence the
    * function rather than a frozen number.
    */
-  const approvalCoordinator = new ApprovalCoordinator({
+  const approvalCoordinator = new ApprovalCoordinator<ToolPolicyState>({
     concurrency: () =>
       concurrencyForAdapter(
         runtime.awayMode || runtime.approvalChannel ? 'correlated' : 'interactive'
@@ -3123,7 +3135,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // the non-consuming inspect — a query that spends a one-use grant would
     // charge the parent for a clone's call that has not happened yet.
     recheck: (ticket) => {
-      const decision = toolPolicy.inspectPcpTool(
+      const decision = (ticket.policy ?? toolPolicy).inspectPcpTool(
         ticket.tool.replace(/^mcp__inkwell__/, ''),
         runtime.sessionId
       );
@@ -4705,42 +4717,78 @@ export async function runChat(options: ChatOptions): Promise<void> {
       cloneLabel: record.label,
     };
 
-    // Recomputed from the CLONE's gate. Inheriting the parent's passthroughArgs
-    // would hand a narrowed clone the parent's full backend tool surface.
+    /**
+     * Snapshot the provider at launch.
+     *
+     * A background clone outlives the turn that spawned it, so reading
+     * `runtime.backend` / `.model` / `.toolRouting` per turn would let a slash
+     * command switch a running clone's provider mid-flight — and resume a
+     * session id against a CLI that never created it.
+     */
+    const cloneBackend = runtime.backend;
+    const cloneModel = runtime.model;
+    const cloneRouting = runtime.toolRouting;
+    /**
+     * Only Claude actually honours a seeded provider session — the parent host
+     * gates on exactly this (`canReuseBackendSession`). Codex and Gemini ignore
+     * the seed, so handing them `--resume <uuid>` on the second turn resumes a
+     * session that never existed and fails the moment a clone uses a tool.
+     */
+    const cloneCanReuseSession = cloneBackend === 'claude';
+    /**
+     * What a stateless clone has to be re-told each turn, because its provider
+     * remembers nothing: its opening brief, then every exchange since.
+     */
+    const cloneHistory: string[] = [];
+
+    // Recomputed from the CLONE's gate, over the snapshotted backend.
+    // Inheriting the parent's passthroughArgs would hand a narrowed clone the
+    // parent's full backend tool surface.
     const clonePassthrough = buildBackendToolPassthrough(
-      runtime.backend,
-      runtime.toolRouting,
+      cloneBackend,
+      cloneRouting,
       clonePolicy.getBackendToolGate(),
       runtime.strictTools
     ).passthroughArgs;
 
     let cloneProviderSessionId: string | undefined;
     let cloneToolCalls = 0;
+    // This clone's own signal state — never the parent's global.
+    const cloneSignal = createSignalSink();
 
     const cloneRunTurn = async (
       body: string,
       turnCtx: { isContinuation: boolean }
     ): Promise<BackendTurnOutcome> => {
-      const seedId = cloneProviderSessionId ?? randomUUID();
-      const isFirst = cloneProviderSessionId === undefined;
-      cloneProviderSessionId = seedId;
+      let sessionArgs: Record<string, string> = {};
+      if (cloneCanReuseSession) {
+        const isFirst = cloneProviderSessionId === undefined;
+        const seedId = cloneProviderSessionId ?? randomUUID();
+        cloneProviderSessionId = seedId;
+        sessionArgs = isFirst ? { backendSessionSeedId: seedId } : { backendSessionId: seedId };
+      }
+
+      // Stateless providers get the whole thread re-packed; stateful ones get
+      // the delta, because they already hold the history.
+      const prompt =
+        cloneCanReuseSession || !turnCtx.isContinuation
+          ? body
+          : [...cloneHistory, body].join('\n\n---\n\n');
+      cloneHistory.push(body);
 
       const turn = startBackendTurn({
-        backend: runtime.backend,
+        backend: cloneBackend,
         agentId,
-        model: runtime.model,
-        prompt: body,
+        model: cloneModel,
+        prompt,
         verbose: false,
         passthroughArgs: clonePassthrough,
         systemPromptOverride: runtime.systemPromptOverride,
         timeoutMs: runtime.backendTurnTimeoutMs,
         idleTimeoutMs: runtime.backendIdleTimeoutMs,
         stream: true,
-        toolRouting: runtime.toolRouting,
-        // First turn seeds the clone's own provider session; later turns resume
-        // it, so the clone remembers what IT did without seeing the parent's
-        // conversation.
-        ...(isFirst ? { backendSessionSeedId: seedId } : { backendSessionId: seedId }),
+        toolRouting: cloneRouting,
+        ...sessionArgs,
       });
 
       // Ctrl+C on the parent turn kills the clone's child too, not just the
@@ -4751,13 +4799,20 @@ export async function runChat(options: ChatOptions): Promise<void> {
       const result = await turn.result.finally(() =>
         ctx.signal?.removeEventListener('abort', onAbort)
       );
+      const text = result.responseText ?? result.stdout;
+      if (text.trim()) cloneHistory.push(text.trim());
       appendTranscript(record.transcriptPath, {
         type: 'backend_turn',
         continuation: turnCtx.isContinuation,
         success: result.success,
         exitCode: result.exitCode,
         durationMs: result.durationMs,
+        // The clone's actual output, not just its timing. boundSummary promises
+        // the full transcript is on disk; without this it is not.
+        responseText: text,
+        ...(result.stderr?.trim() ? { stderr: result.stderr.slice(0, 4000) } : {}),
       });
+      if (result.usage) recordRunUsage(result.usage);
       return {
         success: result.success,
         responseText: result.responseText,
@@ -4782,11 +4837,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
           // protocol itself — it never sees the parent's envelope.
           prompt: [
             buildClonePrompt(task, { id: record.id, index: ctx.index, total: ctx.total }),
-            ...(runtime.toolRouting === 'local'
+            ...(cloneRouting === 'local'
               ? ['', buildLocalToolInstruction({ audience: 'clone' })]
               : []),
           ].join('\n'),
-          toolRouting: runtime.toolRouting,
+          toolRouting: cloneRouting,
           signal: ctx.signal,
           // Nobody is watching a clone's scrollback, so a refusal it is not told
           // about becomes silent abandonment of the task.
@@ -4816,6 +4871,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
                 origin: cloneOrigin,
                 signal: execCtx.signal,
                 transcriptPath: record.transcriptPath,
+                signalSink: cloneSignal,
               });
             },
           },
@@ -4823,29 +4879,22 @@ export async function runChat(options: ChatOptions): Promise<void> {
         }
       );
 
-      const summary = boundSummary(result.assistantDisplayText || result.responseText);
+      const fullText = result.assistantDisplayText || result.responseText;
+      const summary = boundSummary(fullText);
       appendTranscript(record.transcriptPath, {
         type: 'clone_end',
         stopReason: result.stopReason,
         iterations: result.iterations,
         summary,
+        // Bounded for the parent, whole on disk — otherwise "full transcript on
+        // disk" is a promise the transcript cannot keep.
+        ...(fullText.length > summary.length ? { fullText } : {}),
       });
       // A clone that ran out of road is not a clone that finished. The backend
       // exiting 0 says the process worked, not that the work happened — and the
       // parent only sees this status and the summary, so a false green here
       // means acting on a preamble as if it were an answer.
-      const status: CloneStatus =
-        result.stopReason === 'aborted'
-          ? 'aborted'
-          : !result.success || result.stopReason === 'all-refused'
-            ? 'failed'
-            : 'completed';
-      const error =
-        result.stopReason === 'all-refused'
-          ? 'every tool call was refused — the clone could not do the work'
-          : result.success
-            ? undefined
-            : `backend ${result.stopReason}`;
+      const { status, error } = classifyCloneOutcome(result);
       cloneRegistry.update(record.id, {
         status,
         stopReason: result.stopReason,
@@ -4919,6 +4968,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       origin: ApprovalOriginInfo;
       signal?: AbortSignal;
       transcriptPath: string;
+      signalSink: SignalSink;
     }
   ): Promise<ToolResultRecord[]> => {
     const results: ToolResultRecord[] = [];
@@ -4941,9 +4991,18 @@ export async function runChat(options: ChatOptions): Promise<void> {
           } as PcpToolCallResult);
         }
         if (isClientLocalTool(tool)) {
-          // Each clone gets a throwaway ledger: context tools must work (the
-          // loop stops on signal_status) without touching the parent's.
-          const result = handleClientLocalTool(tool, args, cloneLedgerFor(opts.transcriptPath));
+          // A throwaway ledger AND a private signal sink. The sink is the
+          // load-bearing half: `signal_status` otherwise writes the module
+          // global that runChat reads to decide whether the whole
+          // non-interactive run completed — and every clone is instructed to
+          // signal when it finishes. A clone would end its parent's run, and
+          // concurrent clones would race for the same slot.
+          const result = handleClientLocalTool(
+            tool,
+            args,
+            cloneLedgerFor(opts.transcriptPath),
+            opts.signalSink
+          );
           if (result) return Promise.resolve(result);
         }
         if (isPiTool(tool)) {
@@ -4961,9 +5020,14 @@ export async function runChat(options: ChatOptions): Promise<void> {
             sessionId: runtime.sessionId,
             origin: opts.origin,
             signal: opts.signal,
+            // The clone's own policy: what gets re-checked, and what a grant
+            // applies to. The parent stays untouched.
+            policy: opts.policy,
           })
           .then((outcome) => outcome.approved),
       onResult: (result) => {
+        const resultJson =
+          result.result === undefined ? undefined : JSON.stringify(result.result).slice(0, 20_000);
         appendTranscript(opts.transcriptPath, {
           type: 'clone_tool_call',
           tool: result.tool,
@@ -4971,6 +5035,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
           status: result.status,
           reason: result.reason,
           error: result.error,
+          // The payload, not just the verdict. /clones <id> and the truncation
+          // note both promise the working detail survives on disk.
+          result: resultJson,
         });
         results.push({
           tool: result.tool,
@@ -5022,6 +5089,23 @@ export async function runChat(options: ChatOptions): Promise<void> {
     }
 
     const { tasks, wait } = parsed.request;
+
+    // The parse cap bounds ONE fan-out. With wait:false the parent can fire
+    // another three the instant the first returns handles, and again, without
+    // limit — so the ceiling has to be checked against what is actually running.
+    const alreadyRunning = cloneRegistry.runningCount;
+    if (alreadyRunning + tasks.length > MAX_CLONES_PER_SPAWN) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `${alreadyRunning} shadow clone(s) already running; ${tasks.length} more would exceed the ceiling of ${MAX_CLONES_PER_SPAWN}. Collect or cancel the running ones first (collect_agents), then spawn again.`,
+          },
+        ],
+        isError: true,
+      } as PcpToolCallResult;
+    }
+
     const records: CloneRecord[] = tasks.map((task) => {
       const id = cloneRegistry.nextId();
       return cloneRegistry.register({
@@ -5185,6 +5269,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
     return lines;
   };
 
+  /** Clones whose summary has already entered the parent's ledger. */
+  const ledgeredClones = new Set<string>();
+
   /** Read back what clones produced, as one bounded payload. */
   const summarizeClones = (ids: string[]): PcpToolCallResult => {
     const outcomes: CloneOutcomeSummary[] = ids.map((id) => {
@@ -5202,11 +5289,21 @@ export async function runChat(options: ChatOptions): Promise<void> {
       };
     });
 
-    const rendered = formatFanOutForLedger(outcomes);
-    // ONE ledger entry for the whole fan-out. Per-clone entries would put the
-    // clones' working detail back into the parent's context.
-    ledger.addEntry('system', compactForLedger(rendered, MAX_CLONE_SUMMARY_CHARS), 'shadow-clone');
-    appendTranscript(runtime.transcriptPath, { type: 'clone_fanout', outcomes });
+    // ONE ledger entry per clone, ever. Per-clone entries would put the clones'
+    // working detail back into the parent's context, and re-collecting (polling
+    // a background fan-out, or calling collect_agents again later) would inject
+    // the same completed work over and over.
+    const fresh = outcomes.filter((o) => !ledgeredClones.has(o.id));
+    if (fresh.length > 0) {
+      for (const o of fresh) ledgeredClones.add(o.id);
+      const rendered = formatFanOutForLedger(fresh);
+      ledger.addEntry(
+        'system',
+        compactForLedger(rendered, MAX_CLONE_SUMMARY_CHARS),
+        'shadow-clone'
+      );
+      appendTranscript(runtime.transcriptPath, { type: 'clone_fanout', outcomes: fresh });
+    }
 
     return {
       content: [{ type: 'text', text: JSON.stringify({ clones: outcomes }) }],
@@ -5703,11 +5800,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
     const turnAbort = new AbortController();
 
     const abortCurrentTurn = () => {
+      // Always fire the turn signal, even between backend turns: that is the
+      // only thing that reaches an approval prompt or a 2FA poll, and those are
+      // exactly when no child process is running to kill.
       if (!turnAbort.signal.aborted) turnAbort.abort();
       if (currentTurnAbort) {
         currentTurnAbort();
         currentTurnAbort = null;
-        inkRepl?.setAbortHandler(null);
       }
     };
 
@@ -5731,7 +5830,24 @@ export async function runChat(options: ChatOptions): Promise<void> {
       }
     };
 
+    /**
+     * Cancellation handlers stay armed for the WHOLE turn, not per backend
+     * child.
+     *
+     * They used to be installed and torn down around each `startBackendTurn`,
+     * which left Ctrl+C unhandled during exactly the phase where a turn is most
+     * likely to be waiting on a human: tool execution and approval prompts. The
+     * AbortSignal reached the approval channels, but nothing was left alive to
+     * fire it. `currentTurnAbort` still moves per child, so a Ctrl+C during a
+     * backend turn kills the right process.
+     */
     process.on('SIGINT', onSigintDuringTurn);
+    inkRepl?.setAbortHandler(abortCurrentTurn);
+    const disarmTurnCancellation = () => {
+      process.off('SIGINT', onSigintDuringTurn);
+      inkRepl?.setAbortHandler(null);
+    };
+
     // ── Backend port for this turn ──
     // The loop (../repl/agent-loop.js) decides WHAT to send and whether to send
     // again. Everything below is this host's business: provider-session seeding
@@ -5772,12 +5888,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
             : {}),
         });
         currentTurnAbort = turn.abort;
-        inkRepl?.setAbortHandler(abortCurrentTurn);
 
         let runResult = await turn.result.finally(() => {
           currentTurnAbort = null;
-          inkRepl?.setAbortHandler(null);
-          process.off('SIGINT', onSigintDuringTurn);
           turnDurationSeconds = Math.max(0, Math.round((Date.now() - turnStartedAt) / 1000));
           stopWaiting();
         });
@@ -5814,7 +5927,6 @@ export async function runChat(options: ChatOptions): Promise<void> {
               '  ⛁ provider session not found on resume — re-seeding a fresh native session'
             )
           );
-          process.on('SIGINT', onSigintDuringTurn);
           const reseedTurn = startBackendTurn({
             backend: runtime.backend,
             agentId,
@@ -5836,11 +5948,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
             backendSessionSeedId: reseedId,
           });
           currentTurnAbort = reseedTurn.abort;
-          inkRepl?.setAbortHandler(abortCurrentTurn);
           runResult = await reseedTurn.result.finally(() => {
             currentTurnAbort = null;
-            inkRepl?.setAbortHandler(null);
-            process.off('SIGINT', onSigintDuringTurn);
           });
           recordRunUsage(runResult.usage);
         }
@@ -5949,13 +6058,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
         ...(activeBackendSessionId ? { backendSessionId: activeBackendSessionId } : {}),
       });
       currentTurnAbort = contTurn.abort;
-      inkRepl?.setAbortHandler(abortCurrentTurn);
-      process.on('SIGINT', onSigintDuringTurn);
 
       const contResult = await contTurn.result.finally(() => {
         currentTurnAbort = null;
-        inkRepl?.setAbortHandler(null);
-        process.off('SIGINT', onSigintDuringTurn);
       });
 
       lastRunResult = contResult;
@@ -5963,70 +6068,76 @@ export async function runChat(options: ChatOptions): Promise<void> {
       return contResult;
     };
 
-    const loopResult = await runAgentLoop(
-      { prompt, toolRouting: runtime.toolRouting, signal: turnAbort.signal },
-      {
-        ui: {
-          printLine: (text) => printLine(chalk.dim(text)),
-          printEvent: (text) => printEvent(chalk.dim(text)),
-          startWaiting: () =>
-            inkRepl
-              ? ((repl) => {
-                  repl.setWaiting(true, runtime.backend);
-                  return () => repl.setWaiting(false);
-                })(inkRepl)
-              : startWaitingIndicator(runtime.backend, {
-                  statusLane,
-                  logger: printLine,
-                  renderAbovePrompt: true,
-                }),
-        },
-        tools: {
-          execute: (calls, ctx) => runIterationTools(calls, { signal: ctx.signal }),
-          // Runs over the full extracted list, before the per-iteration cap —
-          // otherwise a spawn_agent in sixth position would be truncated away
-          // instead of caught.
-          screen: (allCalls) => {
-            const verdict = screenIteration(allCalls, MAX_TOOL_CALLS_PER_ITERATION);
-            return verdict.ok ? { calls: verdict.calls } : { rejected: verdict.reason };
+    let loopResult: AgentLoopResult;
+    try {
+      loopResult = await runAgentLoop(
+        { prompt, toolRouting: runtime.toolRouting, signal: turnAbort.signal },
+        {
+          ui: {
+            printLine: (text) => printLine(chalk.dim(text)),
+            printEvent: (text) => printEvent(chalk.dim(text)),
+            startWaiting: () =>
+              inkRepl
+                ? ((repl) => {
+                    repl.setWaiting(true, runtime.backend);
+                    return () => repl.setWaiting(false);
+                  })(inkRepl)
+                : startWaitingIndicator(runtime.backend, {
+                    statusLane,
+                    logger: printLine,
+                    renderAbovePrompt: true,
+                  }),
           },
-        },
-        backend: { runTurn: runTurnForLoop },
-        observe: {
-          recordToolCall: (r) => {
-            const liveArgsJson = r.args ? JSON.stringify(r.args).replace(/\s+/g, ' ') : '';
-            // The scrollback line shows a 160-char teaser; the inspector (Ctrl+T)
-            // is the drill-down, so it keeps a much larger slice of the result.
-            // The complete payload always lives in the transcript.
-            const liveResultJson =
-              r.result !== undefined
-                ? (typeof r.result === 'string' ? r.result : JSON.stringify(r.result)).replace(
-                    /\s+/g,
-                    ' '
-                  )
-                : '';
-            recentToolCalls.push({
-              tool: r.tool,
-              status: r.status,
-              at: new Date().toISOString(),
-              args: liveArgsJson
-                ? liveArgsJson.length > 400
-                  ? `${liveArgsJson.slice(0, 400)}…`
-                  : liveArgsJson
-                : undefined,
-              result: liveResultJson
-                ? liveResultJson.length > 2000
-                  ? `${liveResultJson.slice(0, 2000)}…`
-                  : liveResultJson
-                : undefined,
-            });
-            if (recentToolCalls.length > 100) {
-              recentToolCalls.splice(0, recentToolCalls.length - 100);
-            }
+          tools: {
+            execute: (calls, ctx) => runIterationTools(calls, { signal: ctx.signal }),
+            // Runs over the full extracted list, before the per-iteration cap —
+            // otherwise a spawn_agent in sixth position would be truncated away
+            // instead of caught.
+            screen: (allCalls) => {
+              const verdict = screenIteration(allCalls, MAX_TOOL_CALLS_PER_ITERATION);
+              return verdict.ok ? { calls: verdict.calls } : { rejected: verdict.reason };
+            },
           },
-        },
-      }
-    );
+          backend: { runTurn: runTurnForLoop },
+          observe: {
+            recordToolCall: (r) => {
+              const liveArgsJson = r.args ? JSON.stringify(r.args).replace(/\s+/g, ' ') : '';
+              // The scrollback line shows a 160-char teaser; the inspector (Ctrl+T)
+              // is the drill-down, so it keeps a much larger slice of the result.
+              // The complete payload always lives in the transcript.
+              const liveResultJson =
+                r.result !== undefined
+                  ? (typeof r.result === 'string' ? r.result : JSON.stringify(r.result)).replace(
+                      /\s+/g,
+                      ' '
+                    )
+                  : '';
+              recentToolCalls.push({
+                tool: r.tool,
+                status: r.status,
+                at: new Date().toISOString(),
+                args: liveArgsJson
+                  ? liveArgsJson.length > 400
+                    ? `${liveArgsJson.slice(0, 400)}…`
+                    : liveArgsJson
+                  : undefined,
+                result: liveResultJson
+                  ? liveResultJson.length > 2000
+                    ? `${liveResultJson.slice(0, 2000)}…`
+                    : liveResultJson
+                  : undefined,
+              });
+              if (recentToolCalls.length > 100) {
+                recentToolCalls.splice(0, recentToolCalls.length - 100);
+              }
+            },
+          },
+        }
+      );
+    } finally {
+      // Only here — after tools and approvals, not after the last child exits.
+      disarmTurnCancellation();
+    }
 
     const runResult = lastRunResult;
     const responseText = loopResult.responseText;

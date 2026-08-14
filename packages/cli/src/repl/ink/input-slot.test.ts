@@ -17,7 +17,7 @@ describe('InputSlot', () => {
     expect(slot.submit('nobody home')).toBe(false);
   });
 
-  it('rejects a second concurrent waiter instead of stranding the first', async () => {
+  it('rejects a second standing reader instead of stranding the first', async () => {
     const slot = new InputSlot();
     const first = slot.wait();
 
@@ -80,5 +80,80 @@ describe('InputSlot', () => {
     await expect(pending).rejects.toBe(sentinel);
     expect(slot.occupied).toBe(false);
     expect(slot.fail(sentinel)).toBe(false);
+  });
+});
+
+describe('InputSlot preemption', () => {
+  it('lets a prompt take the line from the standing reader and give it back', async () => {
+    const slot = new InputSlot();
+
+    // This is the real shape: the REPL loop re-arms the instant it dispatches a
+    // turn, so it already holds the line when an approval needs to ask.
+    const reader = slot.wait();
+    const prompt = slot.waitPriority();
+    expect(slot.preempted).toBe(true);
+
+    slot.submit('y');
+    await expect(prompt).resolves.toBe('y');
+    expect(slot.preempted).toBe(false);
+
+    // The reader was never disturbed — it gets the next line, not a rejection.
+    slot.submit('next command');
+    await expect(reader).resolves.toBe('next command');
+  });
+
+  it('serves a prompt that arrives before any reader', async () => {
+    const slot = new InputSlot();
+    const prompt = slot.waitPriority();
+    slot.submit('a');
+    await expect(prompt).resolves.toBe('a');
+  });
+
+  it('lets the reader re-arm underneath a live prompt', async () => {
+    const slot = new InputSlot();
+    const prompt = slot.waitPriority();
+    // No rejection: a reader may legitimately re-arm while a prompt holds the
+    // line, and will be served once the prompt releases.
+    const reader = slot.wait();
+
+    slot.submit('y');
+    await expect(prompt).resolves.toBe('y');
+    slot.submit('later');
+    await expect(reader).resolves.toBe('later');
+  });
+
+  it('still rejects a second prompt — that is the coordinator failing', async () => {
+    const slot = new InputSlot();
+    const first = slot.waitPriority();
+    await expect(slot.waitPriority()).rejects.toThrow(/Another prompt already holds/);
+
+    slot.submit('y');
+    await expect(first).resolves.toBe('y');
+  });
+
+  it('returns the line to the reader when the prompt aborts', async () => {
+    const slot = new InputSlot();
+    const reader = slot.wait();
+    const controller = new AbortController();
+    const prompt = slot.waitPriority({ signal: controller.signal });
+
+    controller.abort();
+    await expect(prompt).rejects.toBeInstanceOf(InkInputAborted);
+    expect(slot.preempted).toBe(false);
+
+    slot.submit('back to the reader');
+    await expect(reader).resolves.toBe('back to the reader');
+  });
+
+  it('fails both waiters on exit', async () => {
+    const slot = new InputSlot();
+    const reader = slot.wait();
+    const prompt = slot.waitPriority();
+    const sentinel = new Error('exit');
+
+    expect(slot.fail(sentinel)).toBe(true);
+    await expect(prompt).rejects.toBe(sentinel);
+    await expect(reader).rejects.toBe(sentinel);
+    expect(slot.occupied).toBe(false);
   });
 });

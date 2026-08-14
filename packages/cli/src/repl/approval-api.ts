@@ -91,6 +91,15 @@ export async function requestToolApproval(options: {
    * minutes), so Ctrl+C would not actually stop a shadow clone waiting here.
    */
   signal?: AbortSignal;
+  /**
+   * Which shadow clone raised this, when one did.
+   *
+   * An away-mode user is approving a tool call they cannot see the context for;
+   * "which of my three clones asked" is the difference between an informed yes
+   * and a blind one. It also has to reach the audit trail, not just the local
+   * console line.
+   */
+  origin?: { origin: 'parent' | 'clone'; cloneId?: string; cloneLabel?: string };
 }): Promise<ApprovalRequestResult> {
   if (options.signal?.aborted) {
     return { requestId: '', status: 'aborted' };
@@ -118,6 +127,7 @@ export async function requestToolApproval(options: {
         sessionId: options.sessionId,
         studioId: options.studioId,
         timeoutSeconds,
+        ...(options.origin?.origin === 'clone' ? { origin: options.origin } : {}),
       }),
       signal: AbortSignal.timeout(10000),
     });

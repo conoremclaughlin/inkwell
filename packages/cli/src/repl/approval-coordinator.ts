@@ -31,7 +31,7 @@ export type { ApprovalOriginInfo };
 /** Concurrency for an adapter that can only ask one question at a time. */
 export const SERIAL_CONCURRENCY = 1;
 
-export interface ApprovalTicket {
+export interface ApprovalTicket<TPolicy = unknown> {
   tool: string;
   args: Record<string, unknown>;
   reason: string;
@@ -40,6 +40,17 @@ export interface ApprovalTicket {
   origin: ApprovalOriginInfo;
   /** Cancels the request whether it is queued or already prompting. */
   signal?: AbortSignal;
+  /**
+   * The policy this request is being made AGAINST — the requester's own, which
+   * for a clone is not the parent's.
+   *
+   * Without it the coordinator rechecks and mutates whatever policy it captured
+   * at construction, so a granted clone escalation lands on the parent while the
+   * clone's own executor re-checks its unchanged policy and blocks the call
+   * anyway. The grant would be spent, the parent widened, and the work still not
+   * done.
+   */
+  policy?: TPolicy;
 }
 
 export type ApprovalOutcomeReason =
@@ -72,7 +83,7 @@ export interface ApprovalOutcome {
  */
 export type ApprovalRecheck = 'allow' | 'deny' | 'prompt';
 
-export interface ApprovalCoordinatorOptions {
+export interface ApprovalCoordinatorOptions<TPolicy = unknown> {
   /**
    * Max prompts in flight. 1 for adapters with a single input slot;
    * `Number.POSITIVE_INFINITY` for id-correlated ones.
@@ -84,12 +95,12 @@ export interface ApprovalCoordinatorOptions {
    */
   concurrency: number | (() => number);
   /** Ask the user. Resolves true when approved. */
-  prompt: (ticket: ApprovalTicket, ctx: PromptContext) => Promise<boolean>;
+  prompt: (ticket: ApprovalTicket<TPolicy>, ctx: PromptContext) => Promise<boolean>;
   /**
    * Re-evaluate authority just before prompting. Omit to always prompt.
    * Must not mutate policy.
    */
-  recheck?: (ticket: ApprovalTicket) => ApprovalRecheck;
+  recheck?: (ticket: ApprovalTicket<TPolicy>) => ApprovalRecheck;
   /** Notified whenever the queue depth changes, for "2 waiting" affordances. */
   onQueueDepth?: (depth: number) => void;
 }
@@ -108,19 +119,19 @@ export interface PromptContext {
   queuedNow: () => number;
 }
 
-interface QueueEntry {
+interface QueueEntry<TPolicy> {
   id: string;
-  ticket: ApprovalTicket;
+  ticket: ApprovalTicket<TPolicy>;
   settle: (outcome: ApprovalOutcome) => void;
   settled: boolean;
 }
 
-export class ApprovalCoordinator {
-  private queue: QueueEntry[] = [];
+export class ApprovalCoordinator<TPolicy = unknown> {
+  private queue: Array<QueueEntry<TPolicy>> = [];
   private active = 0;
   private disposed = false;
 
-  constructor(private readonly options: ApprovalCoordinatorOptions) {}
+  constructor(private readonly options: ApprovalCoordinatorOptions<TPolicy>) {}
 
   /** Prompts currently in flight plus tickets still waiting. */
   get pending(): number {
@@ -131,12 +142,12 @@ export class ApprovalCoordinator {
     return this.queue.length;
   }
 
-  async request(ticket: ApprovalTicket): Promise<ApprovalOutcome> {
+  async request(ticket: ApprovalTicket<TPolicy>): Promise<ApprovalOutcome> {
     if (this.disposed) return { approved: false, reason: 'aborted' };
     if (ticket.signal?.aborted) return { approved: false, reason: 'aborted' };
 
     return new Promise<ApprovalOutcome>((resolve) => {
-      const entry: QueueEntry = {
+      const entry: QueueEntry<TPolicy> = {
         id: randomUUID(),
         ticket,
         settled: false,
@@ -186,7 +197,7 @@ export class ApprovalCoordinator {
     this.options.onQueueDepth?.(0);
   }
 
-  private dropQueued(entry: QueueEntry): void {
+  private dropQueued(entry: QueueEntry<TPolicy>): void {
     const index = this.queue.indexOf(entry);
     if (index === -1) return;
     this.queue.splice(index, 1);
@@ -219,7 +230,7 @@ export class ApprovalCoordinator {
     }
   }
 
-  private async run(entry: QueueEntry): Promise<void> {
+  private async run(entry: QueueEntry<TPolicy>): Promise<void> {
     const { ticket } = entry;
     try {
       if (entry.settled) return;

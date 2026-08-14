@@ -188,6 +188,43 @@ export function describeCloneToolResult(result: {
   return result.reason ?? result.error ?? `Tool call ${result.status} (no detail given).`;
 }
 
+/**
+ * What a parent should be told a clone's run amounted to.
+ *
+ * Derived from `stopReason`, never from the backend exit code: a clone that
+ * exhausted its turn budget still has a successful last backend process, so an
+ * exit-shaped test reports it completed. The parent sees only this status and
+ * the summary, so a false green here means acting on partial work as if it were
+ * an answer.
+ */
+export function classifyCloneOutcome(result: { success: boolean; stopReason: string }): {
+  status: 'completed' | 'failed' | 'aborted';
+  error?: string;
+} {
+  if (result.stopReason === 'aborted') return { status: 'aborted', error: 'cancelled' };
+  if (!result.success) return { status: 'failed', error: `backend ${result.stopReason}` };
+
+  switch (result.stopReason) {
+    // The clone said it was done, or simply stopped asking for tools and wrote
+    // its report. Both are finished work.
+    case 'terminal-signal':
+    case 'no-tools':
+      return { status: 'completed' };
+    case 'all-refused':
+      return {
+        status: 'failed',
+        error: 'every tool call was refused — the clone could not do the work',
+      };
+    case 'iteration-cap':
+      return {
+        status: 'failed',
+        error: 'ran out of turns before finishing — the summary is partial',
+      };
+    default:
+      return { status: 'failed', error: `stopped: ${result.stopReason}` };
+  }
+}
+
 export interface CloneOutcomeSummary {
   id: string;
   label: string;

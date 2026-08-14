@@ -24,7 +24,13 @@ import { ToolPolicyState } from './tool-policy.js';
 import { deriveClonePolicy, isForbiddenInClone } from './clone-policy.js';
 import { ApprovalCoordinator, type ApprovalTicket } from './approval-coordinator.js';
 import { callPiTool, isPiTool } from './pi-tools.js';
-import { isClientLocalTool, handleClientLocalTool } from './context-tools.js';
+import {
+  createSignalSink,
+  getLastSignal,
+  clearLastSignal,
+  isClientLocalTool,
+  handleClientLocalTool,
+} from './context-tools.js';
 import { ContextLedger } from './context-ledger.js';
 import { boundSummary, describeCloneToolResult, screenIteration } from './spawn-agent.js';
 import type { PcpToolCallResult } from '../lib/pcp-client.js';
@@ -72,6 +78,8 @@ function buildClone(opts: {
   let turnIndex = 0;
 
   const continuations: string[] = [];
+  // What chat.ts gives a clone: its own signal sink, never the process global.
+  const signalSink = createSignalSink();
   const runTurn = async (
     body: string,
     turnCtx: { isContinuation: boolean }
@@ -115,7 +123,7 @@ function buildClone(opts: {
                   } as PcpToolCallResult;
                 }
                 if (isClientLocalTool(tool)) {
-                  const local = handleClientLocalTool(tool, args, ledger);
+                  const local = handleClientLocalTool(tool, args, ledger, signalSink);
                   if (local) return local;
                 }
                 if (isPiTool(tool)) {
@@ -161,7 +169,7 @@ function buildClone(opts: {
       }
     );
 
-  return { run, policy, executed, refused, continuations };
+  return { run, policy, executed, refused, continuations, signalSink };
 }
 
 describe('shadow clone wiring', () => {
@@ -449,5 +457,59 @@ describe('shadow clone wiring', () => {
     // not from whatever its sibling accumulated.
     const { policy: sibling } = deriveClonePolicy(parent);
     expect(sibling.canCallPcpTool('save_link').allowed).toBe(false);
+  });
+});
+
+describe('shadow clone isolation from parent process state', () => {
+  it('does not let a clone signal completion on behalf of the parent', async () => {
+    clearLastSignal();
+    const parent = new ToolPolicyState('backend', { persist: false });
+    const coordinator = new ApprovalCoordinator({ concurrency: 1, prompt: async () => false });
+
+    const clone = buildClone({
+      parent,
+      coordinator,
+      cloneId: 'clone-1',
+      cloneLabel: 'signals when done',
+      turns: [`all done\n${doneSignal}`],
+    });
+
+    const result = await clone.run();
+
+    // The clone's own loop stopped on the signal...
+    expect(result.stopReason).toBe('terminal-signal');
+    expect(clone.signalSink.get()?.status).toBe('completed');
+    // ...but runChat reads this global to decide whether the whole
+    // non-interactive run completed. Every clone is instructed to signal, so a
+    // shared sink lets a clone end its parent's run and lets concurrent clones
+    // race for it.
+    expect(getLastSignal()).toBeNull();
+  });
+
+  it('keeps concurrent clones' + String.fromCharCode(39) + ' signals separate', async () => {
+    clearLastSignal();
+    const parent = new ToolPolicyState('backend', { persist: false });
+    const coordinator = new ApprovalCoordinator({ concurrency: 1, prompt: async () => false });
+
+    const done = buildClone({
+      parent,
+      coordinator,
+      cloneId: 'clone-1',
+      cloneLabel: 'finishes',
+      turns: [`done\n${doneSignal}`],
+    });
+    const stuck = buildClone({
+      parent,
+      coordinator,
+      cloneId: 'clone-2',
+      cloneLabel: 'blocked',
+      turns: [`cannot proceed\n${inkTool('signal_status', { status: 'blocked' })}`],
+    });
+
+    await Promise.all([done.run(), stuck.run()]);
+
+    expect(done.signalSink.get()?.status).toBe('completed');
+    expect(stuck.signalSink.get()?.status).toBe('blocked');
+    expect(getLastSignal()).toBeNull();
   });
 });

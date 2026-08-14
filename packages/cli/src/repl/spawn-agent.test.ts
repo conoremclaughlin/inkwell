@@ -5,6 +5,7 @@ import {
   SPAWN_AGENT_TOOL,
   boundSummary,
   buildClonePrompt,
+  classifyCloneOutcome,
   describeCloneToolResult,
   formatFanOutForLedger,
   parseSpawnAgentArgs,
@@ -185,5 +186,47 @@ describe('describeCloneToolResult', () => {
 
   it('never hands back undefined, whatever the executor omitted', () => {
     expect(describeCloneToolResult({ status: 'error' })).toBe('Tool call error (no detail given).');
+  });
+});
+
+describe('classifyCloneOutcome', () => {
+  it('counts an explicit finish and a natural stop as completion', () => {
+    expect(classifyCloneOutcome({ success: true, stopReason: 'terminal-signal' })).toEqual({
+      status: 'completed',
+    });
+    expect(classifyCloneOutcome({ success: true, stopReason: 'no-tools' })).toEqual({
+      status: 'completed',
+    });
+  });
+
+  it('does not count exhausting the budget as finishing the work', () => {
+    // The last backend turn succeeded; the work did not.
+    const outcome = classifyCloneOutcome({ success: true, stopReason: 'iteration-cap' });
+    expect(outcome.status).toBe('failed');
+    expect(outcome.error).toMatch(/ran out of turns/);
+  });
+
+  it('does not count being refused everything as finishing the work', () => {
+    const outcome = classifyCloneOutcome({ success: true, stopReason: 'all-refused' });
+    expect(outcome.status).toBe('failed');
+    expect(outcome.error).toMatch(/every tool call was refused/);
+  });
+
+  it('reports a cancelled clone as aborted, not failed', () => {
+    expect(classifyCloneOutcome({ success: false, stopReason: 'aborted' })).toEqual({
+      status: 'aborted',
+      error: 'cancelled',
+    });
+  });
+
+  it('reports a crashed backend as failed even on a completion-shaped stop', () => {
+    const outcome = classifyCloneOutcome({ success: false, stopReason: 'no-tools' });
+    expect(outcome.status).toBe('failed');
+    expect(outcome.error).toBe('backend no-tools');
+  });
+
+  it('never silently passes an unknown stop reason as completion', () => {
+    const outcome = classifyCloneOutcome({ success: true, stopReason: 'something-new' });
+    expect(outcome.status).toBe('failed');
   });
 });

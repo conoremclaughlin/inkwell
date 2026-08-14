@@ -24,8 +24,41 @@ export interface SessionSignal {
   signalledAt: string;
 }
 
+/**
+ * Where a `signal_status` call is recorded.
+ *
+ * A sink exists because the process-global below is read by `runChat` to decide
+ * whether the whole non-interactive run completed or blocked. A shadow clone is
+ * *instructed* to signal when it finishes, so a clone writing the global would
+ * end its parent's run — and concurrent clones would race each other for it.
+ * Clones pass their own sink; the loop still stops on the returned result.
+ */
+export interface SignalSink {
+  set(signal: SessionSignal): void;
+}
+
 /** Mutable shared state — the main loop reads this after each turn */
 let _lastSignal: SessionSignal | null = null;
+
+/** The parent's sink: the process-global the REPL reads after each turn. */
+export const globalSignalSink: SignalSink = {
+  set(signal) {
+    _lastSignal = signal;
+  },
+};
+
+/** A private sink, for a caller whose signal must not escape into the parent. */
+export function createSignalSink(): SignalSink & { get(): SessionSignal | null } {
+  let held: SessionSignal | null = null;
+  return {
+    set(signal) {
+      held = signal;
+    },
+    get() {
+      return held;
+    },
+  };
+}
 
 export function getLastSignal(): SessionSignal | null {
   return _lastSignal;
@@ -49,7 +82,8 @@ export function isClientLocalTool(toolName: string): boolean {
 export function handleClientLocalTool(
   tool: string,
   args: Record<string, unknown>,
-  ledger: ContextLedger
+  ledger: ContextLedger,
+  signalSink: SignalSink = globalSignalSink
 ): PcpToolCallResult | null {
   switch (tool) {
     case 'list_context':
@@ -57,7 +91,7 @@ export function handleClientLocalTool(
     case 'evict_context':
       return handleEvictContext(args, ledger);
     case 'signal_status':
-      return handleSignalStatus(args);
+      return handleSignalStatus(args, signalSink);
     default:
       return null;
   }
@@ -190,7 +224,7 @@ function handleEvictContext(
 
 // ─── signal_status ──────────────────────────────────────────────
 
-function handleSignalStatus(args: Record<string, unknown>): PcpToolCallResult {
+function handleSignalStatus(args: Record<string, unknown>, sink: SignalSink): PcpToolCallResult {
   const status = args.status as string | undefined;
   const reason = args.reason as string | undefined;
 
@@ -210,19 +244,23 @@ function handleSignalStatus(args: Record<string, unknown>): PcpToolCallResult {
     };
   }
 
-  _lastSignal = {
+  const signal: SessionSignal = {
     status: status as SessionStatus,
     reason: reason || undefined,
     signalledAt: new Date().toISOString(),
   };
+  sink.set(signal);
 
+  // The RESULT is what stops the caller's own loop (isTerminalSignalToolResult
+  // reads it), so a clone halts correctly without its status ever reaching the
+  // parent's global.
   return {
     content: [
       {
         type: 'text',
         text: JSON.stringify({
           success: true,
-          signal: _lastSignal,
+          signal,
         }),
       },
     ],

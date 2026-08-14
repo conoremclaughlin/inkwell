@@ -32,8 +32,14 @@ export interface InkRepl {
    * Passing a signal lets a caller stop waiting (Ctrl+C reaching a clone that
    * is blocked on an approval prompt); the promise rejects with
    * `InkInputAborted` and the slot is released for the next caller.
+   *
+   * `priority` is for a question raised from inside a running turn — a tool
+   * approval. The REPL loop re-arms its own `waitForInput` the instant it
+   * dispatches a turn, so by the time an approval asks, the line is already
+   * taken; a priority wait preempts that standing reader and hands the line back
+   * afterwards, rather than failing because someone got there first.
    */
-  waitForInput: (opts?: { signal?: AbortSignal }) => Promise<string>;
+  waitForInput: (opts?: { signal?: AbortSignal; priority?: boolean }) => Promise<string>;
   /** Push a chat message into the scrollback. */
   addMessage: (
     role: MessageRole,
@@ -146,7 +152,7 @@ export function renderInkChat(options: {
       if (exitRequested) {
         return Promise.reject(new InkExitSignal());
       }
-      return inputSlot.wait(opts);
+      return opts?.priority ? inputSlot.waitPriority(opts) : inputSlot.wait(opts);
     },
 
     addMessage: (role, content, opts) => {
