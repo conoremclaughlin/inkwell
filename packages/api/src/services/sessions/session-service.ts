@@ -1454,45 +1454,44 @@ export class SessionService implements ISessionService {
         // said anything about.
         const callerNamedStudio = routing.tier === 'explicit' || routing.tier === 'studio-hint';
 
-        if (callerNamedStudio && !resolvedStudioId) {
-          // The caller named a studio and it did not resolve — a stale slug, a
-          // cleaned studio, another agent's. resolveStudioId deliberately
-          // returns undefined here rather than falling through ("studioHint
-          // was explicit — don't silently fall through to unrelated studios").
-          //
-          // Running the alias lookup unscoped would defeat exactly that: a
-          // unique alias in some other studio would match and the caller would
-          // land in a worktree they never named. An unresolvable address is a
-          // miss, not an invitation to search everywhere.
-          logger.warn('Alias lookup skipped: caller named a studio that did not resolve', {
-            alias: options.alias,
-            agentId,
-            tier: routing.tier,
-          });
-        } else {
-          const aliasStudioScope = callerNamedStudio ? resolvedStudioId : undefined;
+        // Scope to the caller's studio when they named one that resolved.
+        // Otherwise the lookup is unscoped, which is safe on its own terms:
+        // findByAlias refuses an alias matching across two studios rather
+        // than guessing, so "unscoped" means "must be unique", not "pick one".
+        //
+        // An earlier revision skipped the lookup entirely whenever a
+        // caller-qualified tier produced no studio. That guard was load-
+        // bearing when it was the only defence, but once a literal slug miss
+        // began throwing before this point, the only case still reaching it
+        // was the *permitted* one — `main` on an agent with no root studio.
+        // It then suppressed alias resolution for precisely the repo-less
+        // agents the degrade exists to serve, dropping them through to
+        // threadKey/default/general, which can select a different session
+        // than the alias named. Removing it restores the feature without
+        // reopening the misroute, because the dangerous branch no longer
+        // arrives here at all.
+        const aliasStudioScope = callerNamedStudio ? resolvedStudioId : undefined;
 
-          const aliasMatch = await aliasRepo.findByAlias(
-            userId,
-            agentId,
-            options.alias,
-            aliasStudioScope
-          );
-          if (aliasMatch) {
-            logger.debug('Found existing session by alias', {
-              sessionId: aliasMatch.id,
-              alias: options.alias,
-              studioId: aliasMatch.studioId || null,
-              aliasStudioScope: aliasStudioScope ?? null,
-            });
-            return this.withStudioLease(aliasMatch, routing, leaseCtx);
-          }
-          logger.debug('No session found for alias', {
+        const aliasMatch = await aliasRepo.findByAlias(
+          userId,
+          agentId,
+          options.alias,
+          aliasStudioScope
+        );
+        if (aliasMatch) {
+          logger.debug('Found existing session by alias', {
+            sessionId: aliasMatch.id,
             alias: options.alias,
-            agentId,
+            studioId: aliasMatch.studioId || null,
             aliasStudioScope: aliasStudioScope ?? null,
           });
+          return this.withStudioLease(aliasMatch, routing, leaseCtx);
         }
+        logger.debug('No session found for alias', {
+          alias: options.alias,
+          agentId,
+          aliasStudioScope: aliasStudioScope ?? null,
+        });
       }
 
       // ThreadKey match — find session scoped to this topic
