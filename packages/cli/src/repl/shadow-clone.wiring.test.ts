@@ -71,8 +71,6 @@ function buildClone(opts: {
   turns: string[];
   signal?: AbortSignal;
   failAfter?: number;
-  /** Observe what reaches the Pi tool boundary. */
-  onPiCall?: (tool: string, signal?: AbortSignal) => void;
 }) {
   const { policy } = deriveClonePolicy(opts.parent);
   const ledger = new ContextLedger();
@@ -123,7 +121,7 @@ function buildClone(opts: {
               // Production threads the turn signal here; without it the
               // executor cannot stop mid-batch.
               signal: ctx.signal,
-              callTool: async (tool, args) => {
+              callTool: async (tool, args, callCtx) => {
                 if (isForbiddenInClone(tool)) {
                   return {
                     content: [{ type: 'text', text: `${tool} is not available to a clone.` }],
@@ -136,8 +134,7 @@ function buildClone(opts: {
                 }
                 if (isPiTool(tool)) {
                   executed.push(tool);
-                  opts.onPiCall?.(tool, ctx.signal);
-                  return callPiTool(tool, args, workdir, ctx.signal);
+                  return callPiTool(tool, args, workdir, callCtx.signal);
                 }
                 executed.push(tool);
                 return { content: [{ type: 'text', text: '{}' }] } as PcpToolCallResult;
@@ -724,33 +721,82 @@ describe('shadow clone cancellation is authoritative', () => {
 });
 
 describe('shadow clone cancellation reaches the tools themselves', () => {
-  it('aborts an in-flight Pi tool rather than only abandoning its result', async () => {
-    const parent = new ToolPolicyState('backend', { persist: false });
+  it('hands every dispatcher the signal, so no call site can drop it', async () => {
+    // Driven through executeToolCalls — the boundary BOTH production
+    // dispatchers (runCloneTools and runIterationTools) go through. An earlier
+    // version of this test observed the wiring harness instead, so it stayed
+    // green with the production fix reverted and proved nothing.
+    const policy = new ToolPolicyState('backend', { persist: false });
     const controller = new AbortController();
-    const coordinator = new ApprovalCoordinator({ concurrency: 1, prompt: async () => false });
+    const seen: Array<{ tool: string; signal?: AbortSignal }> = [];
 
-    // `grep` over a real directory, with the turn cancelled while it runs.
-    // Production dropped the signal at callPiTool, so the tool kept working
-    // after the clone's slot had already been freed.
-    let sawSignal: AbortSignal | undefined;
-    const clone = buildClone({
-      parent,
-      coordinator,
-      cloneId: 'clone-1',
-      cloneLabel: 'long running tool',
+    await executeToolCalls([{ tool: 'read', args: { path: 'auth.ts' }, raw: '' }], {
+      policy,
       signal: controller.signal,
-      turns: [inkTool('grep', { pattern: 'login', path: '.' }), doneSignal],
-      onPiCall: (_tool, signal) => {
-        sawSignal = signal;
+      callTool: async (tool, _args, callCtx) => {
+        seen.push({ tool, signal: callCtx.signal });
+        return { content: [{ type: 'text', text: 'ok' }] } as PcpToolCallResult;
       },
+      promptForApproval: async () => false,
     });
 
-    await clone.run();
+    // The signal arrives as an argument. A dispatcher cannot forget to capture
+    // what it is handed.
+    expect(seen).toHaveLength(1);
+    expect(seen[0].signal).toBe(controller.signal);
+  });
 
-    // The signal has to arrive at the tool boundary. Asserting only that the
-    // loop stopped would pass with the signal dropped, which is exactly how
-    // this shipped.
-    expect(sawSignal).toBeDefined();
-    expect(sawSignal).toBe(controller.signal);
+  it('actually interrupts an in-flight tool when the turn is cancelled', async () => {
+    const policy = new ToolPolicyState('backend', { persist: false });
+    const controller = new AbortController();
+    let observed: 'aborted' | 'completed' | 'none' = 'none';
+
+    // A tool that only finishes when its signal fires — so this hangs rather
+    // than passes if the signal never reaches it.
+    const running = executeToolCalls([{ tool: 'bash', args: { command: 'sleep' }, raw: '' }], {
+      policy,
+      signal: controller.signal,
+      callTool: (_tool, _args, callCtx) =>
+        new Promise<PcpToolCallResult>((resolve) => {
+          callCtx.signal?.addEventListener('abort', () => {
+            observed = 'aborted';
+            resolve({ content: [{ type: 'text', text: 'interrupted' }] } as PcpToolCallResult);
+          });
+        }),
+      promptForApproval: async () => false,
+    });
+
+    await new Promise((r) => setTimeout(r, 10));
+    controller.abort();
+    await running;
+
+    expect(observed).toBe('aborted');
+  }, 5000);
+
+  it('stops a batch at the cancellation point rather than running the rest', async () => {
+    const policy = new ToolPolicyState('backend', { persist: false });
+    const controller = new AbortController();
+    const ran: string[] = [];
+
+    const results = await executeToolCalls(
+      [
+        { tool: 'read', args: {}, raw: '' },
+        { tool: 'grep', args: {}, raw: '' },
+      ],
+      {
+        policy,
+        signal: controller.signal,
+        callTool: async (tool) => {
+          ran.push(tool);
+          // Cancel while the first call is in flight.
+          controller.abort();
+          return { content: [{ type: 'text', text: 'ok' }] } as PcpToolCallResult;
+        },
+        promptForApproval: async () => false,
+      }
+    );
+
+    expect(ran).toEqual(['read']);
+    expect(results[1]).toMatchObject({ tool: 'grep', status: 'denied' });
   });
 });

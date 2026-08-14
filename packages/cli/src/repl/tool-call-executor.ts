@@ -30,8 +30,20 @@ export interface ToolCallResult {
 export interface ToolCallExecutorDeps {
   /** Policy engine for permission decisions */
   policy: ToolPolicyState;
-  /** Execute a PCP MCP tool call */
-  callTool: (tool: string, args: Record<string, unknown>) => Promise<PcpToolCallResult>;
+  /**
+   * Execute a PCP MCP tool call.
+   *
+   * The cancellation signal arrives as an ARGUMENT rather than being captured
+   * by the closure. That is deliberate: every dispatcher that reaches a
+   * long-running tool needs it, and a closure is a place to forget it — which
+   * is exactly what happened when `callPiTool` was called without one, leaving
+   * a cancelled clone's `bash` running after its slot had been freed.
+   */
+  callTool: (
+    tool: string,
+    args: Record<string, unknown>,
+    ctx: { signal?: AbortSignal }
+  ) => Promise<PcpToolCallResult>;
   /** Current session ID for session-scoped grants */
   sessionId?: string;
   /** Prompt callback for tools requiring approval — returns true if approved */
@@ -104,7 +116,7 @@ async function executeOneToolCall(
   // retains the full immutable log. The SB must have full control over its own
   // context window without permission gates.
   if (isClientLocalTool(call.tool)) {
-    return executeTool(call, callTool);
+    return executeTool(call, callTool, deps.signal);
   }
 
   // 1. Check policy — strip MCP namespace prefix for policy lookup
@@ -113,7 +125,7 @@ async function executeOneToolCall(
 
   if (decision.allowed) {
     // Allowed — execute immediately
-    return executeTool(call, callTool);
+    return executeTool(call, callTool, deps.signal);
   }
 
   if (!decision.promptable) {
@@ -161,17 +173,22 @@ async function executeOneToolCall(
   }
 
   // Execute after approval
-  const result = await executeTool(call, callTool);
+  const result = await executeTool(call, callTool, deps.signal);
   result.status = result.status === 'executed' ? 'approved' : result.status;
   return result;
 }
 
 async function executeTool(
   call: LocalToolCall,
-  callTool: (tool: string, args: Record<string, unknown>) => Promise<PcpToolCallResult>
+  callTool: (
+    tool: string,
+    args: Record<string, unknown>,
+    ctx: { signal?: AbortSignal }
+  ) => Promise<PcpToolCallResult>,
+  signal?: AbortSignal
 ): Promise<ToolCallResult> {
   try {
-    const result = await callTool(call.tool, call.args);
+    const result = await callTool(call.tool, call.args, { signal });
     return {
       tool: call.tool,
       args: call.args,

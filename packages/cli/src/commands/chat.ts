@@ -5019,7 +5019,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       policy: opts.policy,
       sessionId: runtime.sessionId,
       signal: opts.signal,
-      callTool: (tool, args) => {
+      callTool: (tool, args, ctx) => {
         // Non-nesting is enforced HERE, not by omitting spawn_agent from the
         // clone's prompt: tool calls travel as text, so a model can name any
         // tool it likes regardless of what it was told.
@@ -5053,7 +5053,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           // The signal reaches the TOOL, not just the bookkeeping around it.
           // Without it, cancelling a clone mid-`bash` frees its registry slot
           // and lets the parent move on while the command keeps running.
-          return callPiTool(tool, args, process.cwd(), opts.signal);
+          return callPiTool(tool, args, process.cwd(), ctx.signal);
         }
         const { args: resolvedArgs } = resolveCredentialRefs(args, buildResolverEnv());
         return pcp.callTool(tool.replace(/^mcp__inkwell__/, ''), resolvedArgs);
@@ -5371,7 +5371,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     await executeToolCalls(calls, {
       policy: toolPolicy,
       signal: abortSignal,
-      callTool: (tool, args) => {
+      callTool: (tool, args, ctx) => {
         // spawn_agent is NOT a client-local policy bypass. Unlike ledger tools
         // it costs backend time and fans out authority, so it reaches here only
         // after executeToolCalls has cleared it through policy.
@@ -5391,7 +5391,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         // The turn signal goes with them: Ctrl+C during a long `bash` should
         // stop the command, not just stop waiting for it.
         if (isPiTool(tool)) {
-          return callPiTool(tool, args, process.cwd(), abortSignal);
+          return callPiTool(tool, args, process.cwd(), ctx.signal);
         }
         // Resolve credential references ($VAR / ${VAR}) in tool args.
         // The LLM emits references; actual values are injected here at the

@@ -42,6 +42,14 @@ interface SupabaseMockState {
   updateResult: { data: unknown; error: unknown };
   updateEqChain: Array<{ column: string; value: unknown }>;
   updateCalledWith: Record<string, unknown> | null;
+  /**
+   * Every update, paired with the row it targeted.
+   *
+   * `updateCalledWith` keeps only the last one, so a batch write that put the
+   * SAME payload on every row would pass a single-value assertion. Batches are
+   * exactly where per-row correctness matters.
+   */
+  updates: Array<{ id: unknown; updates: Record<string, unknown> }>;
   trustedUsersResult: { data: Array<{ platform: string; platform_user_id: string }> | null };
   selectCalls: number;
 }
@@ -69,6 +77,7 @@ function createSupabaseMock(state: SupabaseMockState) {
           return {
             eq: vi.fn().mockImplementation((col: string, val: unknown) => {
               state.updateEqChain.push({ column: col, value: val });
+              if (col === 'id') state.updates.push({ id: val, updates });
               return {
                 eq: vi.fn().mockImplementation((col2: string, val2: unknown) => {
                   state.updateEqChain.push({ column: col2, value: val2 });
@@ -100,6 +109,7 @@ function makeState(overrides: Partial<SupabaseMockState> = {}): SupabaseMockStat
     updateResult: { data: null, error: null },
     updateEqChain: [],
     updateCalledWith: null,
+    updates: [],
     trustedUsersResult: { data: [] },
     selectCalls: 0,
     ...overrides,
@@ -602,10 +612,19 @@ describe('notifyPlatformOfApprovalRequest', () => {
     });
     await vi.advanceTimersByTimeAsync(2500);
 
-    // The harness records the LAST update; it belongs to the second request.
-    expect(currentState.updateCalledWith?.metadata).toMatchObject({
+    // Assert BOTH rows, paired with their ids. Checking only the last update
+    // would pass if the loop wrote clone-2's origin onto every row — which is
+    // the shared-object bug a batch write is most likely to have.
+    const byId = new Map(currentState.updates.map((u) => [u.id, u.updates]));
+    expect(byId.get('req-a')?.metadata).toMatchObject({
+      origin: { origin: 'clone', cloneId: 'clone-1', cloneLabel: 'auth' },
+      batchMessageId: 77,
+      batchIndex: 0,
+    });
+    expect(byId.get('req-b')?.metadata).toMatchObject({
       origin: { origin: 'clone', cloneId: 'clone-2', cloneLabel: 'coverage' },
       batchMessageId: 77,
+      batchIndex: 1,
     });
 
     vi.useRealTimers();
