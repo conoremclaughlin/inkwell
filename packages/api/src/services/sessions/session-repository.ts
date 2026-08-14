@@ -61,6 +61,8 @@ function mapDbToSession(row: DbSession): Session {
     contextTokens: (metadata.contextTokens as number) || 0,
     totalInputTokens: (metadata.totalInputTokens as number) || 0,
     totalOutputTokens: (metadata.totalOutputTokens as number) || 0,
+    totalCacheReadTokens: (metadata.totalCacheReadTokens as number) || 0,
+    totalCacheWriteTokens: (metadata.totalCacheWriteTokens as number) || 0,
     usageCheckpoint: (metadata.usageCheckpoint as UsageCheckpoint | undefined) || undefined,
 
     // Aggregate counters (persisted as columns)
@@ -122,6 +124,8 @@ function mapSessionToDb(
       contextTokens: session.contextTokens,
       totalInputTokens: session.totalInputTokens,
       totalOutputTokens: session.totalOutputTokens,
+      totalCacheReadTokens: session.totalCacheReadTokens,
+      totalCacheWriteTokens: session.totalCacheWriteTokens,
       lastCompactionAt: session.lastCompactionAt?.toISOString() || null,
       compactionCount: session.compactionCount,
       ...session.metadata,
@@ -412,6 +416,12 @@ export class SessionRepository implements ISessionRepository {
     if (updates.totalOutputTokens !== undefined) {
       newMetadata.totalOutputTokens = updates.totalOutputTokens;
     }
+    if (updates.totalCacheReadTokens !== undefined) {
+      newMetadata.totalCacheReadTokens = updates.totalCacheReadTokens;
+    }
+    if (updates.totalCacheWriteTokens !== undefined) {
+      newMetadata.totalCacheWriteTokens = updates.totalCacheWriteTokens;
+    }
     if (updates.usageCheckpoint !== undefined) {
       newMetadata.usageCheckpoint = updates.usageCheckpoint as unknown as Json;
     }
@@ -449,6 +459,9 @@ export class SessionRepository implements ISessionRepository {
       contextTokens?: number;
       inputTokens: number;
       outputTokens: number;
+      /** Cache breakdown of `inputTokens`, not additions to it. */
+      cacheReadTokens?: number;
+      cacheWriteTokens?: number;
       cumulative?: boolean;
     },
     options?: { backendSessionId?: string | null }
@@ -561,6 +574,13 @@ export class SessionRepository implements ISessionRepository {
     const newInputTokens = current.totalInputTokens + deltaInput;
     const newOutputTokens = current.totalOutputTokens + deltaOutput;
 
+    // Cache totals are a breakdown of input, so they follow the same
+    // accumulation rule. Only per-turn backends report them (Claude); Codex
+    // sends cumulative thread totals with no cache fields at all, so there is
+    // nothing to diff and nothing to add on that path.
+    const cacheReadDelta = !usage.cumulative ? usage.cacheReadTokens || 0 : 0;
+    const cacheWriteDelta = !usage.cumulative ? usage.cacheWriteTokens || 0 : 0;
+
     await this.update(id, {
       // Only persist a context figure the backend actually reported. Codex
       // JSONL carries no per-turn context measure, and aliasing it to the
@@ -568,6 +588,12 @@ export class SessionRepository implements ISessionRepository {
       ...(usage.contextTokens !== undefined ? { contextTokens: usage.contextTokens } : {}),
       totalInputTokens: newInputTokens,
       totalOutputTokens: newOutputTokens,
+      ...(cacheReadDelta
+        ? { totalCacheReadTokens: current.totalCacheReadTokens + cacheReadDelta }
+        : {}),
+      ...(cacheWriteDelta
+        ? { totalCacheWriteTokens: current.totalCacheWriteTokens + cacheWriteDelta }
+        : {}),
       tokenCount: newInputTokens + newOutputTokens,
       ...(nextCheckpoint ? { usageCheckpoint: nextCheckpoint } : {}),
     });

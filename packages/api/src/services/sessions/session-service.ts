@@ -921,6 +921,10 @@ export class SessionService implements ISessionService {
           backendSessionId: result.backendSessionId,
           messageCount: session.messageCount + 1,
           backend: resolvedBackend,
+          // The model that actually ran this turn. The column existed but was
+          // never written, so usage could not be attributed per model — the
+          // question "is Fable costing more than Opus?" was unanswerable.
+          ...(runtimeModel ? { model: runtimeModel } : {}),
           lifecycle: postRunLifecycle as Session['lifecycle'],
           cliAttached: false,
         })
@@ -931,6 +935,7 @@ export class SessionService implements ISessionService {
         this.repository.update(session.id, {
           messageCount: session.messageCount + 1,
           backend: resolvedBackend,
+          ...(runtimeModel ? { model: runtimeModel } : {}),
           lifecycle: postRunLifecycle as Session['lifecycle'],
           cliAttached: false,
         })
@@ -967,6 +972,8 @@ export class SessionService implements ISessionService {
           contextTokens: result.usage.contextTokens,
           inputTokens: result.usage.inputTokens,
           outputTokens: result.usage.outputTokens,
+          cacheReadTokens: result.usage.cacheReadTokens,
+          cacheWriteTokens: result.usage.cacheWriteTokens,
           cumulative: result.usage.cumulative,
         },
         { backendSessionId: result.backendSessionId ?? session.backendSessionId ?? null }
@@ -1223,10 +1230,14 @@ export class SessionService implements ISessionService {
       contextTokens: 0,
       totalInputTokens: 0,
       totalOutputTokens: 0,
+      totalCacheReadTokens: 0,
+      totalCacheWriteTokens: 0,
       messageCount: 0,
       tokenCount: 0,
       backend,
-      model: null, // Set explicitly when known; runner model != verified session model
+      // Null until a turn runs — the model that actually served the turn is
+      // recorded post-run, so this never claims a model that was only asked for.
+      model: null,
       lastCompactionAt: null,
       compactionCount: 0,
       endedAt: null,

@@ -46,6 +46,39 @@ interface ClaudeUsageStats {
   cacheWriteTokens?: number;
 }
 
+/**
+ * Map a `result.usage` object from Claude's stream-json to our usage stats.
+ *
+ * Claude names its cache fields `cache_read_input_tokens` and
+ * `cache_creation_input_tokens`; `cache_read_tokens` / `cache_write_tokens`
+ * do not exist on this path, so the earlier reads yielded undefined every
+ * turn. That mattered more than a missing breakdown: `input_tokens` counts
+ * only the NON-cached remainder, and Claude Code caches aggressively, so
+ * recorded input collapsed to a few hundred tokens against hundreds of
+ * thousands of output — which made per-agent cost attribution meaningless.
+ *
+ * The prompt that was actually sent is the sum of all three, cached or not
+ * (the same arithmetic as claude-code.backend.ts). The cache split is kept
+ * because it bills differently: reads at 0.1x and writes at 1.25x of input.
+ *
+ * Exported for tests.
+ */
+export function parseClaudeUsage(usage: Record<string, unknown>): ClaudeUsageStats {
+  const num = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
+  const freshInput = num(usage.input_tokens);
+  const cacheReadTokens = num(usage.cache_read_input_tokens);
+  const cacheWriteTokens = num(usage.cache_creation_input_tokens);
+  const totalInput = freshInput + cacheReadTokens + cacheWriteTokens;
+
+  return {
+    contextTokens: totalInput,
+    inputTokens: totalInput,
+    outputTokens: num(usage.output_tokens),
+    cacheReadTokens,
+    cacheWriteTokens,
+  };
+}
+
 export class ClaudeRunner implements IRunner {
   async run(
     message: string,
@@ -371,16 +404,10 @@ export class ClaudeRunner implements IRunner {
               }
             }
 
-            // Extract usage stats and final text response from result
+            // Extract usage stats and final text response from result.
             if (parsed.type === 'result') {
               if (parsed.usage) {
-                usage = {
-                  contextTokens: parsed.usage.context_tokens || 0,
-                  inputTokens: parsed.usage.input_tokens || 0,
-                  outputTokens: parsed.usage.output_tokens || 0,
-                  cacheReadTokens: parsed.usage.cache_read_tokens,
-                  cacheWriteTokens: parsed.usage.cache_write_tokens,
-                };
+                usage = parseClaudeUsage(parsed.usage as Record<string, unknown>);
               }
               // Capture the final text response from the result
               if (parsed.result && typeof parsed.result === 'string') {

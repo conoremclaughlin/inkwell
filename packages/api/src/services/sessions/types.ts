@@ -90,6 +90,15 @@ export interface Session {
   totalOutputTokens: number;
 
   /**
+   * Cache breakdown of `totalInputTokens` — NOT additional tokens. Cached
+   * input bills at a different rate from fresh input (reads 0.1x, writes
+   * 1.25x), so cost attribution needs the split, while context-window math
+   * needs the total. Only backends that report caching populate these.
+   */
+  totalCacheReadTokens: number;
+  totalCacheWriteTokens: number;
+
+  /**
    * Last cumulative usage observed from a backend that reports running
    * thread totals rather than per-turn deltas (Codex). Used to diff
    * successive reports; see SessionRepository.updateTokenUsage.
@@ -422,6 +431,9 @@ export interface ISessionRepository {
       contextTokens?: number;
       inputTokens: number;
       outputTokens: number;
+      /** Cache breakdown of `inputTokens`, not additions to it. */
+      cacheReadTokens?: number;
+      cacheWriteTokens?: number;
       /**
        * True when the counts are running totals for `backendSessionId`
        * rather than this turn's delta. The repository diffs them against
