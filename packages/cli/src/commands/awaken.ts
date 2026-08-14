@@ -7,9 +7,13 @@
  * with the chosen backend.
  *
  * Usage:
- *   ink awaken                     Awaken on default backend (claude)
- *   ink awaken --backend gemini    Awaken on Gemini
- *   ink awaken -b codex            Awaken on Codex
+ *   ink awaken                     Awaken in an ink chat session (default)
+ *   ink awaken -r claude           Awaken in Claude Code
+ *   ink awaken -r codex            Awaken in Codex
+ *
+ * --runtime/-r selects what we launch (ink included). --backend/-b is the
+ * older spelling of the same axis and still works. "Provider" is a separate
+ * thing: the model vendor, chosen with --model.
  */
 
 import { Command } from 'commander';
@@ -24,6 +28,7 @@ import { getBackend, BACKEND_NAMES } from '../backends/index.js';
 import { callPcpTool } from '../lib/pcp-mcp.js';
 import { readUserConfig, NOT_SIGNED_IN_MESSAGE, type UserConfig } from '../lib/user-config.js';
 import { getValidAccessToken } from '../auth/tokens.js';
+import { ensureBackendAuthReady, isBackendAuthBackend } from '../lib/backend-auth.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -186,6 +191,30 @@ export function buildAwakeningPrompt(
   });
 }
 
+/**
+ * The ink chat runtime, as opposed to an external backend CLI.
+ *
+ * Named separately from BACKEND_NAMES because `getBackend()` has no adapter
+ * for it — ink chat *drives* those adapters rather than being one.
+ */
+const INK_RUNTIME = 'ink';
+
+/** Everything `ink awaken` can start a first conversation in. */
+const AWAKEN_TARGETS = [INK_RUNTIME, ...BACKEND_NAMES];
+
+/**
+ * Resolve --runtime / --backend to one runtime name.
+ *
+ * Both name the same axis: what we launch. `--backend` is the older spelling,
+ * kept working because it is in scripts, docs and muscle memory. `--runtime`
+ * wins when both are given, and the ink default is applied here rather than in
+ * commander — a commander default would make options.runtime always truthy and
+ * silently swallow `--backend`.
+ */
+export function resolveRuntime(options: { runtime?: string; backend?: string }): string {
+  return options.runtime || options.backend || INK_RUNTIME;
+}
+
 // ============================================================================
 // Model selection
 // ============================================================================
@@ -208,6 +237,10 @@ interface ModelChoice {
 }
 
 const MODEL_CHOICES: Record<string, ModelChoice[]> = {
+  // ink chat drives one of the backends below, so its model choices are
+  // whatever that backend offers. Listed as Default because awaken doesn't
+  // pick the underlying backend for you — `ink chat` resolves it.
+  ink: [{ label: 'Default', note: "the ink chat session's provider default" }],
   claude: [
     { label: 'Default', note: "whatever the Claude CLI picks — tracks Anthropic's releases" },
     { label: 'Opus', model: 'opus', note: 'most capable; slower, pricier' },
@@ -237,7 +270,7 @@ const MODEL_HINTS: Record<string, string> = {
 function describeModelChoices(backendName: string): string {
   const choices = MODEL_CHOICES[backendName] ?? [];
   const lines = choices.map((c) => {
-    const value = c.model ?? '(none — backend default)';
+    const value = c.model ?? '(none — provider default)';
     return `    ${c.label.padEnd(16)} ${value}${c.note ? chalk.dim(`  · ${c.note}`) : ''}`;
   });
 
@@ -252,7 +285,8 @@ function describeModelChoices(backendName: string): string {
 // ============================================================================
 
 async function awakenCommand(options: {
-  backend: string;
+  runtime?: string;
+  backend?: string;
   model?: string;
   verbose: boolean;
 }): Promise<void> {
@@ -262,14 +296,22 @@ async function awakenCommand(options: {
     process.exit(1);
   }
 
-  const backendName = options.backend;
+  const backendName = resolveRuntime(options);
+
+  // `ink` is the ink chat runtime rather than an external CLI — there is no
+  // binary to preflight, and it takes the awakening prompt through
+  // --system-prompt-file instead of an adapter's identity file. Everything
+  // before the spawn (values, siblings, prompt building) is shared.
+  const useInkRuntime = backendName === INK_RUNTIME;
 
   // 0. Pre-flight: check that the backend CLI is installed and accessible
-  const adapter = getBackend(backendName);
+  const adapter = useInkRuntime ? null : getBackend(backendName);
   try {
-    execFileSync(adapter.binary, ['--version'], { stdio: 'ignore', timeout: 5000 });
+    if (adapter) {
+      execFileSync(adapter.binary, ['--version'], { stdio: 'ignore', timeout: 5000 });
+    }
   } catch {
-    console.error(chalk.red(`\n  Backend CLI not found: ${chalk.bold(adapter.binary)}\n`));
+    console.error(chalk.red(`\n  Backend CLI not found: ${chalk.bold(adapter!.binary)}\n`));
     console.error(chalk.dim("  Make sure it's installed and authenticated:\n"));
 
     const loginHints: Record<string, string[]> = {
@@ -287,11 +329,25 @@ async function awakenCommand(options: {
       ],
     };
 
-    for (const hint of loginHints[backendName] || [`Install and authenticate ${adapter.binary}`]) {
+    for (const hint of loginHints[backendName] || [`Install and authenticate ${adapter!.binary}`]) {
       console.error(chalk.dim(`    ${hint}`));
     }
     console.error('');
     process.exit(1);
+  }
+
+  // 0b. Installed is not the same as logged in, and the difference is only
+  // discoverable at spawn time otherwise — which is the worst moment for it,
+  // after we've composed a being's first words. Shared with `ink chat`, so
+  // awaken gets its offer-to-log-you-in flow rather than a second-rate copy.
+  // Skipped for the ink runtime: ink chat runs this itself for whichever
+  // provider it resolves.
+  if (!useInkRuntime && isBackendAuthBackend(backendName)) {
+    await ensureBackendAuthReady(
+      backendName,
+      { nonInteractive: false, hasMessage: false, verbose: options.verbose },
+      'awaken'
+    );
   }
 
   // Gemini displays the system prompt at startup — auto-enable verbose
@@ -358,8 +414,33 @@ async function awakenCommand(options: {
     }
   };
 
-  // 4. Prepare and spawn the backend
-  const prepared = adapter.prepare({
+  // 4a. Ink runtime: hand the prompt to `ink chat` and let it own the session.
+  // No adapter, no spawn — runChat drives the backend itself, and
+  // --system-prompt-file replaces the identity prompt it would otherwise
+  // generate for an agent that has no identity row yet.
+  if (useInkRuntime) {
+    console.log(chalk.dim('Starting an ink chat session. Talk with your new SB.\n'));
+    console.log(
+      chalk.dim(
+        "When you've chosen a name, they can call the choose_name() MCP tool to save their identity.\n"
+      )
+    );
+    try {
+      const { runChat } = await import('./chat.js');
+      await runChat({
+        agent: 'nascent',
+        model: options.model,
+        systemPromptFile: promptFile,
+        verbose: options.verbose || undefined,
+      });
+    } finally {
+      cleanup();
+    }
+    return;
+  }
+
+  // 4b. Prepare and spawn an external backend CLI
+  const prepared = adapter!.prepare({
     agentId: 'nascent',
     promptParts: [],
     passthroughArgs: [],
@@ -455,21 +536,32 @@ async function awakenCommand(options: {
 export function registerAwakenCommand(program: Command): void {
   program
     .command('awaken')
-    .description('Awaken a new SB on a backend')
-    .option('-b, --backend <name>', `AI backend (${BACKEND_NAMES.join(', ')})`, 'claude')
+    .description('Awaken a new SB — bring a new being to life in a runtime')
+    // No commander default here on purpose. A default would make
+    // options.runtime always truthy, so `--backend codex` would resolve to the
+    // default 'ink' and be silently ignored — the alias would look supported
+    // and do nothing. The default is applied when resolving the two instead.
+    .option(
+      '-r, --runtime <name>',
+      `Where to awaken them (${AWAKEN_TARGETS.join(', ')}), default ${INK_RUNTIME}. 'ink' opens an ink chat session.`
+    )
+    // Same axis, older spelling. `backend` named both this and the model
+    // vendor, which is why it is being retired — but it is in scripts, docs and
+    // muscle memory, so it keeps working rather than breaking anyone's habits.
+    .option('-b, --backend <name>', 'Alias for --runtime', undefined)
     .option(
       '-m, --model <model>',
-      'Model to awaken on. Omit to use the backend default (recommended).'
+      'Model to awaken on. Omit to use the provider default (recommended).'
     )
     .option('-v, --verbose', 'Show the awakening prompt and debug info')
     .addHelpText(
       'after',
       () =>
         '\nModels:\n' +
-        BACKEND_NAMES.map((b) => `  ${b}\n${describeModelChoices(b)}`).join('\n') +
+        AWAKEN_TARGETS.map((b) => `  ${b}\n${describeModelChoices(b)}`).join('\n') +
         chalk.dim(
           '\n\n  --model takes any string; the list above is a shortcut, not a whitelist.\n' +
-            '  Omitting it lets the backend choose, which tracks its releases instead of\n' +
+            '  Omitting it lets the provider choose, which tracks its releases instead of\n' +
             '  pinning new SBs to whatever was current when this list was written.\n'
         )
     )

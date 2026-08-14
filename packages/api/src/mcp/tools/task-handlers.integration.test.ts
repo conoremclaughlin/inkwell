@@ -8,7 +8,6 @@
  *
  * Requires:
  *   - .env.local with SUPABASE_URL + SUPABASE_SECRET_KEY
- *   - ~/.ink/config.json with userId
  *
  * Skipped automatically in CI / when credentials are unavailable.
  */
@@ -18,6 +17,7 @@ import dotenv from 'dotenv';
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { readFileSync, existsSync } from 'fs';
 import { resolve } from 'path';
+import { INTEGRATION_TEST_USER_ID } from '../../test/integration-fixtures';
 
 const projectRoot = resolve(__dirname, '../../../../../');
 const envLocalPath = resolve(projectRoot, '.env.local');
@@ -33,11 +33,18 @@ if (!process.env.PCP_PORT_BASE) process.env.PCP_PORT_BASE = '9997';
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_KEY;
 
-const configPath = resolve(process.env.HOME || '', '.ink/config.json');
-const inkConfig = existsSync(configPath) ? JSON.parse(readFileSync(configPath, 'utf-8')) : {};
-const TEST_USER_ID: string | undefined = inkConfig.userId;
+// Canonical SYNTHETIC integration user (seeded by integration-setup.ts) —
+// never a developer's organic ~/.ink/config.json id. The organic id does not
+// exist on CI, which silently skipped this whole suite there (Lumen, PR #439
+// review), and organic user ids do not belong in test rows.
+const TEST_USER_ID: string | undefined = INTEGRATION_TEST_USER_ID;
 
-const canRun = !!SUPABASE_URL && !!SUPABASE_KEY && !!TEST_USER_ID;
+// INTENTIONAL (Conor, 2026-08-12): this suite is token-free — server/DB
+// round-trips only, no LLM calls — so it runs in CI against the isolated
+// local Supabase stack. LIVE suites (*.live.*, gated on INK_LIVE_TESTS=1)
+// consume real LLM tokens and are DELIBERATELY excluded from CI; that is a
+// cost decision, not an oversight — please don't "fix" it.
+const canRun = !!SUPABASE_URL && !!SUPABASE_KEY;
 
 // Bypass auth helpers that require request context in a server
 vi.mock('../../auth/enforce-identity', () => ({

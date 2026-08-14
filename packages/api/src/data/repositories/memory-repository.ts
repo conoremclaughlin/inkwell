@@ -1509,6 +1509,7 @@ export class MemoryRepository {
       cliPollAt?: string;
       alias?: string | null;
       activeThreadKey?: string | null;
+      endedAt?: Date | null;
     }
   ): Promise<Session | null> {
     const dbUpdates: Record<string, unknown> = {};
@@ -1545,6 +1546,9 @@ export class MemoryRepository {
     }
     if (updates.activeThreadKey !== undefined) {
       (dbUpdates as Record<string, unknown>).active_thread_key = updates.activeThreadKey;
+    }
+    if (updates.endedAt !== undefined) {
+      dbUpdates.ended_at = updates.endedAt ? updates.endedAt.toISOString() : null;
     }
 
     const { data, error } = await this.supabase

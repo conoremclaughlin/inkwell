@@ -61,8 +61,11 @@ import {
   type SessionAttachedRow,
 } from './services/sessions/trigger-delivery';
 import { assignThreadParticipant } from './services/sessions/thread-assignment';
+import { closeIntakeAndDrain } from './services/sessions/active-runs';
+import { interruptActiveRuns } from './services/sessions/interrupt-active-runs';
 import type { ActivityType } from './data/repositories/activity-stream.repository';
 import { resolveTaskGroupForThreadKey } from './services/task-group-resolver';
+import { sendTriggerFailureNotice } from './services/trigger-failure-notice';
 
 // Server configuration
 interface ServerConfig {
@@ -1330,6 +1333,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
 
       // Look up the userId from the original source row (needed for sender inbox insert).
       let recipientUserId: string | undefined;
+      let resolvedThreadId: string | undefined;
       if (payload.inboxMessageId) {
         const { data: origMsg } = await client
           .from('agent_inbox')
@@ -1345,6 +1349,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
           .eq('id', payload.threadMessageId)
           .single();
         if (threadMsg?.thread_id) {
+          resolvedThreadId = threadMsg.thread_id;
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           const { data: thread } = await (client as any)
             .from('inbox_threads')
@@ -1354,6 +1359,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
           recipientUserId = thread?.user_id;
         }
       } else if (payload.threadId) {
+        resolvedThreadId = payload.threadId;
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const { data: thread } = await (client as any)
           .from('inbox_threads')
@@ -1361,6 +1367,14 @@ When you complete a task_request, mark it as completed using update_inbox_messag
           .eq('id', payload.threadId)
           .single();
         recipientUserId = thread?.user_id;
+      }
+
+      // Bare trigger_agent (no source row, possibly just a threadKey): fall
+      // back to the user stamped server-side post-auth by handleTriggerAgent.
+      // Row-derived resolution stays preferred; this fallback is what lets a
+      // threadKey-only failure reach thread resolution at all (PR #487).
+      if (!recipientUserId && payload.recipientUserId) {
+        recipientUserId = payload.recipientUserId;
       }
 
       if (recipientUserId) {
@@ -1378,15 +1392,17 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         classification.category !== 'unknown' ? ` (${classification.category})` : '';
       const notificationContent = `Trigger to ${payload.toAgentId} failed${categoryLabel}: ${classification.summary}`;
 
-      const { error: insertErr } = await client.from('agent_inbox').insert({
-        recipient_user_id: recipientUserId,
-        recipient_agent_id: payload.fromAgentId,
-        sender_agent_id: payload.toAgentId,
+      // Thread-borne trigger → notice joins the thread (participants and
+      // session stamps already exist; stamped-only delivery lands it in
+      // exactly one session per participant). Threadless → legacy inbox.
+      const noticeResult = await sendTriggerFailureNotice(client, {
+        userId: recipientUserId,
+        fromAgentId: payload.fromAgentId,
+        toAgentId: payload.toAgentId,
+        threadId: resolvedThreadId,
+        threadKey: payload.threadKey,
         subject: `Trigger failed: ${payload.toAgentId}`,
         content: notificationContent,
-        message_type: 'notification',
-        priority: 'high',
-        thread_key: payload.threadKey || null,
         metadata: {
           triggerFailure: true,
           triggerId,
@@ -1396,18 +1412,12 @@ When you complete a task_request, mark it as completed using update_inbox_messag
           retryable: classification.retryable,
           originalInboxMessageId: payload.inboxMessageId || null,
         },
-        // No trigger — avoid infinite failure loops
       });
-
-      if (insertErr) {
-        logger.error('[TriggerFailure] Failed to send failure notification to sender', {
-          sender: payload.fromAgentId,
-          error: insertErr.message,
-        });
-      } else {
+      if (noticeResult.ok) {
         logger.info('[TriggerFailure] Sent failure notification to sender', {
           sender: payload.fromAgentId,
           category: classification.category,
+          via: noticeResult.via,
         });
       }
     }
@@ -1564,6 +1574,26 @@ async function shutdown(): Promise<void> {
   forceKillTimer.unref(); // Don't let the timer itself keep the process alive
 
   try {
+    // Before anything is torn down: the agent CLIs we spawned are our children
+    // and are about to die with us. Record that, and tell whoever is waiting.
+    // Runs first because it needs a live DB client, and because the notice is
+    // worth more than a few hundred milliseconds of shutdown latency.
+    // Close intake and let outstanding lifecycle writes settle before taking
+    // the snapshot. Snapshotting first would race the very writes it needs to
+    // order against — a pending `running` write would land after our
+    // interruption and restore the zombie.
+    const { runs: interrupted, drained } = await closeIntakeAndDrain();
+    if (interrupted.length > 0 && dataComposer) {
+      // `drained` is passed through rather than swallowed: if a lifecycle
+      // write was still outstanding, whatever we record here may be
+      // contradicted a moment later, and the notice has to say so.
+      await interruptActiveRuns(dataComposer.getClient(), interrupted, undefined, drained).catch(
+        (err) => {
+          logger.error('Interruption bookkeeping failed', { error: err });
+        }
+      );
+    }
+
     // Stop heartbeat cron job (logs internally)
     stopHeartbeatService();
 

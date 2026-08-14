@@ -184,8 +184,22 @@ export function resolveBackend(cliBackend?: string): string {
 
 /**
  * Build the identity prompt content. Same across all backends.
+ *
+ * `systemPromptOverride` replaces the whole thing rather than adding to it.
+ * That is deliberate and rare: awakening is the case it exists for. A being
+ * with no identity row yet must not be handed a prompt asserting "You are
+ * <agentId>" and telling it to call bootstrap — it has no identity to load,
+ * and the first thing it would read about itself would be wrong. Callers that
+ * want to *add* context want `startupContextBlock`.
  */
-export function buildIdentityPrompt(agentId: string, startupContextBlock?: string): string {
+export function buildIdentityPrompt(
+  agentId: string,
+  startupContextBlock?: string,
+  systemPromptOverride?: string
+): string {
+  const override = systemPromptOverride?.trim();
+  if (override) return override;
+
   const identityHeader = `## Identity Override (CRITICAL)
 
 **You are ${agentId}. Your agent ID is \`${agentId}\`.**
@@ -236,12 +250,13 @@ ${toolPriority}`;
  */
 export function createIdentityPromptFile(
   agentId: string,
-  startupContextBlock?: string
+  startupContextBlock?: string,
+  systemPromptOverride?: string
 ): {
   promptFile: string;
   cleanup: () => void;
 } {
-  const content = buildIdentityPrompt(agentId, startupContextBlock);
+  const content = buildIdentityPrompt(agentId, startupContextBlock, systemPromptOverride);
   const tempDir = mkdtempSync(join(tmpdir(), 'sb-'));
   const promptFile = join(tempDir, 'identity-prompt.md');
   writeFileSync(promptFile, content);

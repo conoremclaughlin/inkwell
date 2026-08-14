@@ -21,6 +21,7 @@
     "server": "tsx src/server.ts",
     "server:dev": "tsx watch --exclude 'dist,node_modules,.next,.pcp' --watch-path=../shared/dist src/server.ts",
     "test": "vitest run",
+    "test:live": "vitest run --config vitest.live.config.ts",
     "test:watch": "vitest",
     "test:integration": "yarn test:integration:db && yarn test:integration:runtime",
     "test:integration:db": "yarn workspace @inklabs/shared build && vitest run --config vitest.integration.db.config.ts",
