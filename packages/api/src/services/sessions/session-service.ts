@@ -2097,9 +2097,11 @@ This session will continue with a fresh context after compaction. Your identity,
       const session = await this.repository.findById(sessionId);
       if (!session) return;
       const terminal = Boolean(session.endedAt) || session.status === 'completed';
-      if (!terminal) return;
-      await leases.releaseBySession(sessionId, {
+      // releaseAtBoundary also completes pendingRelease markers — a
+      // close_thread/close_studio issued mid-turn deferred to this moment.
+      await leases.releaseAtBoundary(sessionId, {
         userId: session.userId,
+        sessionTerminal: terminal,
         reason: 'run-terminal',
       });
     } catch (err) {

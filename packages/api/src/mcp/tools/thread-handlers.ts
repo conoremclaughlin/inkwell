@@ -765,21 +765,25 @@ export async function handleCloseThread(args: unknown, dataComposer: DataCompose
   });
 
   // Automatic lease release — the work unit completing is what lets studios
-  // go. Releases every studio this thread holds (stamping final branch/commit
-  // state) and tears down ephemeral overflow studios created for it.
+  // go. A holder whose process is still live (close_thread is commonly called
+  // from inside the holder's own turn) is DEFERRED via pendingRelease, and
+  // the run/stop boundary or sweep completes it — never cleared out from
+  // under a running process. Ephemeral teardown is claim-fenced per studio
+  // and skips anything still held.
   try {
     const leases = new StudioLeaseService(supabase);
-    const released = await leases.releaseByThread(resolved.user.id, threadKey, {
+    const { released, deferred } = await leases.releaseByThread(resolved.user.id, threadKey, {
       reason: 'thread-closed',
     });
     const overflow = new StudioOverflowService(dataComposer.repositories.studios, leases);
     const cleaned = await overflow.teardownEphemeralStudiosForThread(resolved.user.id, threadKey, {
       reason: `thread ${threadKey} closed`,
     });
-    if (released || cleaned) {
+    if (released || deferred || cleaned) {
       logger.info('[StudioLease] Thread close released studios', {
         threadKey,
         leasesReleased: released,
+        leasesDeferred: deferred,
         ephemeralCleaned: cleaned,
       });
     }

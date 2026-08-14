@@ -229,13 +229,66 @@ describe('StudioLeaseService.acquire', () => {
     expect(tables.studio_lease_events).toHaveLength(0);
   });
 
-  it('adopts a lease held by the same thread — leases follow the thread', async () => {
+  it('adopts a lease from a provably TERMINAL same-thread holder', async () => {
     tables.studios[0].lease = freshLease({ sessionId: 'session-old', threadKey: 'pr:200' });
+    tables.sessions.push({
+      id: 'session-old',
+      user_id: 'user-1',
+      ended_at: new Date().toISOString(),
+      status: 'completed',
+    });
     const result = await service.acquire(req);
     expect(result.acquired).toBe(true);
     expect((tables.studios[0].lease as StudioLease).sessionId).toBe('session-b');
     // Adoption is not a new grab — no second 'acquired' event.
     expect(tables.studio_lease_events).toHaveLength(0);
+  });
+
+  it('refuses adoption from a fresh non-terminal holder — the admission gap (round 3)', async () => {
+    // The holder session exists, is NOT terminal, and is NOT in the run
+    // registry — exactly the window between acquire and registerActiveRun.
+    // "Not live right now" must not mean "adoptable": presume fresh = live.
+    tables.studios[0].lease = freshLease({ sessionId: 'session-old', threadKey: 'pr:200' });
+    tables.sessions.push({
+      id: 'session-old',
+      user_id: 'user-1',
+      ended_at: null,
+      status: 'active',
+    });
+
+    const result = await service.acquire(req);
+    expect(result.acquired).toBe(false);
+    expect((tables.studios[0].lease as StudioLease).sessionId).toBe('session-old');
+  });
+
+  it('adopts from a stale non-terminal holder only when its process is not live', async () => {
+    tables.studios[0].lease = staleLease({ sessionId: 'session-old', threadKey: 'pr:200' });
+    tables.sessions.push({
+      id: 'session-old',
+      user_id: 'user-1',
+      ended_at: null,
+      status: 'active',
+    });
+    const result = await service.acquire(req);
+    expect(result.acquired).toBe(true);
+    expect((tables.studios[0].lease as StudioLease).sessionId).toBe('session-b');
+  });
+
+  it('renews instead of adopting a stale same-thread holder with a live CLI', async () => {
+    tables.studios[0].lease = staleLease({ sessionId: 'session-cli', threadKey: 'pr:200' });
+    tables.sessions.push({
+      id: 'session-cli',
+      user_id: 'user-1',
+      ended_at: null,
+      status: 'active',
+      cli_attached: true,
+      cli_poll_at: new Date().toISOString(),
+    });
+    const result = await service.acquire(req);
+    expect(result.acquired).toBe(false);
+    const lease = tables.studios[0].lease as StudioLease;
+    expect(lease.sessionId).toBe('session-cli');
+    expect(isLeaseStale(lease)).toBe(false); // renewed on the holder's behalf
   });
 
   it('refuses a studio freshly leased by another thread', async () => {
@@ -297,12 +350,14 @@ describe('StudioLeaseService.acquire', () => {
       const result = await service.acquire(req);
       expect(result.acquired).toBe(false);
 
-      // Quarantine: non-vacant, non-adoptable, original holder UUID kept.
+      // Quarantine: non-vacant, non-adoptable, unique claim token as its
+      // sessionId, original holder UUID kept for audit.
       const lease = tables.studios[0].lease as StudioLease;
       expect(lease.quarantined).toBe(true);
       expect(lease.threadKey).toBe(QUARANTINE_THREAD_KEY);
       expect(lease.heldThreadKey).toBe('pr:999');
-      expect(lease.sessionId).toBe('session-dead');
+      expect(lease.holderSessionId).toBe('session-dead');
+      expect(lease.sessionId).toMatch(/^[0-9a-f-]{36}$/);
       const conflict = tables.studio_lease_events.find((e) => e.event === 'conflict');
       expect(conflict?.reason).toBe('rescue-failed-quarantined');
 
@@ -392,6 +447,25 @@ describe('StudioLeaseService.acquire', () => {
     // Heartbeat was renewed on the holder's behalf.
     expect(isLeaseStale(lease)).toBe(false);
   });
+
+  it('never stale-claims a foreign holder with a freshly-polling CLI (round 3)', async () => {
+    // The lifecycle hook updated the row but its async lease renewal has not
+    // landed yet: the lease looks stale while the CLI is demonstrably live.
+    tables.studios[0].lease = staleLease({ threadKey: 'pr:999', sessionId: 'session-cli-live' });
+    tables.sessions.push({
+      id: 'session-cli-live',
+      user_id: 'user-1',
+      cli_attached: true,
+      cli_poll_at: new Date().toISOString(),
+    });
+
+    const result = await service.acquire(req);
+    expect(result.acquired).toBe(false);
+    const lease = tables.studios[0].lease as StudioLease;
+    expect(lease.sessionId).toBe('session-cli-live');
+    expect(isLeaseStale(lease)).toBe(false); // renewed on the holder's behalf
+    expect(tables.studio_lease_events.map((e) => e.event)).not.toContain('reclaimed');
+  });
 });
 
 describe('StudioLeaseService release paths', () => {
@@ -460,36 +534,107 @@ describe('StudioLeaseService release paths', () => {
     expect(tables.studios[0].lease).toBeNull();
   });
 
-  it('releaseUnlessRunning defers for a freshly-attached CLI session (round 2)', async () => {
-    // The registry cannot see interactive CLI turns; the sessions row can.
+  it('releaseUnlessRunning defers for a freshly-polling CLI session (round 2)', async () => {
+    // The registry cannot see interactive CLI turns; cli_poll_at can — and
+    // only the CLI itself stamps it.
     tables.sessions.push({
       id: 'session-a',
       user_id: 'user-1',
       cli_attached: true,
-      updated_at: new Date().toISOString(),
+      cli_poll_at: new Date().toISOString(),
     });
     expect(await service.releaseUnlessRunning('session-a', { userId: 'user-1' })).toBe(false);
     expect(tables.studios[0].lease).not.toBeNull();
 
-    // A stale attached flag is a dead flag — release proceeds.
-    tables.sessions[0].updated_at = new Date(Date.now() - 11 * 60 * 1000).toISOString();
+    // A stale poll is a dead CLI — release proceeds.
+    tables.sessions[0].cli_poll_at = new Date(Date.now() - 11 * 60 * 1000).toISOString();
+    expect(await service.releaseUnlessRunning('session-a', { userId: 'user-1' })).toBe(true);
+    expect(tables.studios[0].lease).toBeNull();
+  });
+
+  it('a stale attached flag cannot look alive via terminal-write timestamps (round 3)', async () => {
+    // cli_attached is true but there is no poll — a dead orphan flag. A
+    // terminal API updating the row (bumping updated_at) must not defer.
+    tables.sessions.push({
+      id: 'session-a',
+      user_id: 'user-1',
+      cli_attached: true,
+      cli_poll_at: null,
+      updated_at: new Date().toISOString(), // freshly touched by endSession
+    });
     expect(await service.releaseUnlessRunning('session-a', { userId: 'user-1' })).toBe(true);
     expect(tables.studios[0].lease).toBeNull();
   });
 
   it('releaseByThread clears every studio the thread holds', async () => {
-    const released = await service.releaseByThread('user-1', 'pr:100');
-    expect(released).toBe(2);
+    const result = await service.releaseByThread('user-1', 'pr:100');
+    expect(result).toEqual({ released: 2, deferred: 0 });
     expect(tables.studios[0].lease).toBeNull();
     expect(tables.studios[1].lease).toBeNull();
   });
 
-  it('releaseByStudio clears whatever the studio holds, user-scoped', async () => {
-    expect(await service.releaseByStudio('studio-2', { userId: 'user-2' })).toBe(false);
+  it('releaseByThread DEFERS a live holder via pendingRelease; the boundary completes it (round 3)', async () => {
+    registerActiveRun({
+      sessionId: 'session-a',
+      userId: 'user-1',
+      agentId: 'wren',
+      backend: 'claude-code',
+      startedAt: Date.now(),
+    });
+
+    const result = await service.releaseByThread('user-1', 'pr:100', { reason: 'thread-closed' });
+    expect(result).toEqual({ released: 1, deferred: 1 });
+    // The live holder keeps its lease — marked, not cleared.
+    const marked = tables.studios[0].lease as StudioLease;
+    expect(marked.sessionId).toBe('session-a');
+    expect(marked.pendingRelease?.reason).toBe('thread-closed');
+    expect(tables.studios[1].lease).toBeNull();
+
+    // The turn finishes; the boundary completes the deferred release even
+    // though the session itself is not terminal.
+    resetActiveRuns();
+    const released = await service.releaseAtBoundary('session-a', {
+      userId: 'user-1',
+      sessionTerminal: false,
+      reason: 'run-terminal',
+    });
+    expect(released).toBe(true);
+    expect(tables.studios[0].lease).toBeNull();
+    const event = tables.studio_lease_events.find(
+      (e) => e.event === 'released' && e.session_id === 'session-a'
+    );
+    expect(event?.reason).toBe('thread-closed');
+  });
+
+  it('releaseAtBoundary is a no-op for a non-terminal session with no pendingRelease', async () => {
+    expect(
+      await service.releaseAtBoundary('session-a', {
+        userId: 'user-1',
+        sessionTerminal: false,
+        reason: 'run-terminal',
+      })
+    ).toBe(false);
+    expect(tables.studios[0].lease).not.toBeNull();
+  });
+
+  it('releaseByStudio clears a non-live holder, defers a live one, user-scoped', async () => {
+    expect(await service.releaseByStudio('studio-2', { userId: 'user-2' })).toBe('none');
     expect(
       await service.releaseByStudio('studio-2', { userId: 'user-1', reason: 'studio-closed' })
-    ).toBe(true);
+    ).toBe('released');
     expect(tables.studios[1].lease).toBeNull();
+
+    registerActiveRun({
+      sessionId: 'session-a',
+      userId: 'user-1',
+      agentId: 'wren',
+      backend: 'claude-code',
+      startedAt: Date.now(),
+    });
+    expect(
+      await service.releaseByStudio('studio-1', { userId: 'user-1', reason: 'studio-closed' })
+    ).toBe('deferred');
+    expect((tables.studios[0].lease as StudioLease).pendingRelease?.reason).toBe('studio-closed');
   });
 
   it('renewBySession bumps heartbeatAt without logging an event', async () => {
@@ -545,7 +690,7 @@ describe('StudioLeaseService.sweepExpiredLeases', () => {
     const service = new StudioLeaseService(makeFakeSupabase(tables));
     const stats = await service.sweepExpiredLeases();
 
-    expect(stats).toEqual({ expired: 1, renewed: 1, quarantined: 0 });
+    expect(stats).toEqual({ expired: 1, renewed: 1, quarantined: 0, released: 0 });
     expect(tables.studios[0].lease).not.toBeNull(); // fresh untouched
     expect(tables.studios[1].lease).toBeNull(); // stale expired
     expect(tables.studios[2].lease).not.toBeNull(); // running renewed
@@ -574,13 +719,14 @@ describe('StudioLeaseService.sweepExpiredLeases', () => {
       const service = new StudioLeaseService(makeFakeSupabase(tables));
       const stats = await service.sweepExpiredLeases();
 
-      expect(stats).toEqual({ expired: 0, renewed: 0, quarantined: 1 });
+      expect(stats).toEqual({ expired: 0, renewed: 0, quarantined: 1, released: 0 });
       const marker = tables.studios[0].lease as StudioLease;
       expect(marker.quarantined).toBe(true);
       expect(marker.threadKey).toBe(QUARANTINE_THREAD_KEY);
       expect(marker.heldThreadKey).toBe('pr:7');
-      // Original holder UUID preserved — audit rows stay uuid-valid on retries.
-      expect(marker.sessionId).toBe('sess-x');
+      // Original holder UUID preserved for audit; claim carries its own token.
+      expect(marker.holderSessionId).toBe('sess-x');
+      expect(marker.sessionId).toMatch(/^[0-9a-f-]{36}$/);
       expect(tables.studio_lease_events.map((e) => e.event)).toEqual(['conflict']);
 
       // Regression (round 2): the quarantined studio refuses acquisition —
@@ -597,6 +743,110 @@ describe('StudioLeaseService.sweepExpiredLeases', () => {
     } finally {
       await rm(nonRepoDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('sweep pendingRelease backstop', () => {
+  afterEach(() => resetActiveRuns());
+
+  it('completes a deferred release once the holder is no longer live', async () => {
+    resetActiveRuns();
+    const lease: StudioLease = {
+      ...freshLease({ sessionId: 'sess-p', threadKey: 'pr:11' }),
+      pendingRelease: { reason: 'thread-closed', requestedAt: new Date().toISOString() },
+    };
+    const tables: Record<string, Row[]> = {
+      studios: [{ id: 's-p', user_id: 'u', lease: lease as unknown as Row, worktree_path: null }],
+      studio_lease_events: [],
+      inbox_threads: [],
+      agent_identities: [],
+      sessions: [],
+    };
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+    const stats = await service.sweepExpiredLeases();
+    expect(stats.released).toBe(1);
+    expect(tables.studios[0].lease).toBeNull();
+  });
+
+  it('leaves a pendingRelease lease alone while the holder is still live', async () => {
+    resetActiveRuns();
+    registerActiveRun({
+      sessionId: 'sess-p',
+      userId: 'u',
+      agentId: 'wren',
+      backend: 'claude-code',
+      startedAt: Date.now(),
+    });
+    const lease: StudioLease = {
+      ...freshLease({ sessionId: 'sess-p', threadKey: 'pr:11' }),
+      pendingRelease: { reason: 'thread-closed', requestedAt: new Date().toISOString() },
+    };
+    const tables: Record<string, Row[]> = {
+      studios: [{ id: 's-p', user_id: 'u', lease: lease as unknown as Row, worktree_path: null }],
+      studio_lease_events: [],
+      inbox_threads: [],
+      agent_identities: [],
+      sessions: [],
+    };
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+    const stats = await service.sweepExpiredLeases();
+    expect(stats.released).toBe(0);
+    expect(tables.studios[0].lease).not.toBeNull();
+  });
+});
+
+describe('claimForTeardown ownership (round 3)', () => {
+  function claimTables(lease: StudioLease | null): Record<string, Row[]> {
+    return {
+      studios: [{ id: 's-1', user_id: 'u', lease: lease as unknown as Row, worktree_path: null }],
+      studio_lease_events: [],
+      inbox_threads: [],
+      agent_identities: [],
+      sessions: [],
+    };
+  }
+
+  it('claims a vacant studio with a unique token', async () => {
+    const tables = claimTables(null);
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+    const claim = await service.claimForTeardown('s-1', 'u', { reason: 'teardown' });
+    expect(claim?.claimKind).toBe('teardown');
+    expect(claim?.sessionId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(await service.verifyClaim('s-1', 'u', claim!)).toBe(true);
+  });
+
+  it('REFUSES to steal a fresh claim — its owner is mid-rescue/removal', async () => {
+    const tables = claimTables(null);
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+    const first = await service.claimForTeardown('s-1', 'u', { reason: 'teardown-a' });
+    expect(first).not.toBeNull();
+
+    const second = await service.claimForTeardown('s-1', 'u', { reason: 'teardown-b' });
+    expect(second).toBeNull();
+    // First worker's token still owns the studio.
+    expect(await service.verifyClaim('s-1', 'u', first!)).toBe(true);
+  });
+
+  it('re-claims only a STALE quarantine, and token revalidation detects takeover', async () => {
+    const staleIso = new Date(Date.now() - LEASE_STALE_MS - 60_000).toISOString();
+    const staleQuarantine: StudioLease = {
+      sessionId: '11111111-1111-1111-1111-111111111111',
+      threadKey: QUARANTINE_THREAD_KEY,
+      heldThreadKey: 'pr:5',
+      agentId: 'wren',
+      acquiredAt: staleIso,
+      heartbeatAt: staleIso,
+      quarantined: true,
+      claimKind: 'recovery',
+    };
+    const tables = claimTables(staleQuarantine);
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const claim = await service.claimForTeardown('s-1', 'u', { reason: 'teardown-retry' });
+    expect(claim).not.toBeNull();
+    // The old quarantine's identity no longer verifies.
+    expect(await service.verifyClaim('s-1', 'u', staleQuarantine)).toBe(false);
+    expect(await service.verifyClaim('s-1', 'u', claim!)).toBe(true);
   });
 });
 

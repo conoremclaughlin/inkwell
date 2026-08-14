@@ -213,8 +213,9 @@ describe('StudioOverflowService.teardownEphemeralStudio — fencing', () => {
     expect(leases.claimForTeardown).not.toHaveBeenCalled();
   });
 
-  it('skips teardown entirely when the claim is refused (studio held) — round 2', async () => {
-    const studios = { markCleaned: vi.fn() } as unknown as StudiosRepository;
+  it('skips teardown when the claim is refused, marking a prompt sweep retry — rounds 2–3', async () => {
+    const update = vi.fn().mockResolvedValue(makeStudio());
+    const studios = { markCleaned: vi.fn(), update } as unknown as StudiosRepository;
     const logEvent = vi.fn();
     const leases = {
       logEvent,
@@ -230,6 +231,11 @@ describe('StudioOverflowService.teardownEphemeralStudio — fencing', () => {
 
     expect(studios.markCleaned).not.toHaveBeenCalled();
     expect(logEvent).not.toHaveBeenCalled();
+    // Thread-close context: expires_at pulled to now so the 5-minute sweep
+    // retries once the holder's boundary releases the lease.
+    expect(update).toHaveBeenCalledWith('parent-1', {
+      expiresAt: expect.any(String),
+    });
   });
 
   it('aborts after a failed rescue with the claim left as quarantine', async () => {

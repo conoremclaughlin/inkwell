@@ -321,7 +321,8 @@ export class StudioOverflowService {
       return;
     }
 
-    // Fence: atomically claim the studio. A live or foreign holder aborts.
+    // Fence: atomically claim the studio. A live holder, a foreign thread, or
+    // another worker's active claim aborts.
     const claim = await this.leases.claimForTeardown(studio.id, studio.userId, {
       expectedThreadKey: opts.expectedThreadKey,
       reason: `teardown-claim (${opts.reason})`,
@@ -331,6 +332,14 @@ export class StudioOverflowService {
         studioId: studio.id,
         reason: opts.reason,
       });
+      // Thread-close context: the holder's boundary will release the lease
+      // soon (pendingRelease). Pull expires_at to now so the 5-minute sweep
+      // retries this teardown promptly instead of waiting out the 72h TTL.
+      if (opts.expectedThreadKey) {
+        await this.studios
+          .update(studio.id, { expiresAt: new Date().toISOString() })
+          .catch(() => undefined);
+      }
       return;
     }
 
@@ -361,6 +370,16 @@ export class StudioOverflowService {
           agentId: studio.agentId ?? undefined,
           reason: `teardown-aborted-rescue-failed (${opts.reason})`,
           detail: { finalState: JSON.parse(JSON.stringify(finalState)) },
+        });
+        return;
+      }
+
+      // Token revalidation immediately before destruction: if our claim aged
+      // out and another worker took over, the removal is theirs, not ours.
+      if (!(await this.leases.verifyClaim(studio.id, studio.userId, claim))) {
+        logger.warn('[StudioOverflow] Teardown aborted — claim no longer ours', {
+          studioId: studio.id,
+          worktreePath: studio.worktreePath,
         });
         return;
       }

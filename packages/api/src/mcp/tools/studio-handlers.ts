@@ -560,15 +560,24 @@ export async function handleCloseStudio(args: unknown, dataComposer: DataCompose
 
   // Release any lease before touching the worktree — closing the studio is a
   // terminal act for its occupant, and release captures final branch/commit
-  // state while the worktree still exists.
-  await new StudioLeaseService(dataComposer.getClient())
+  // state while the worktree still exists. A holder whose process is still
+  // LIVE refuses the whole close: removing the worktree under a running turn
+  // is exactly the stomp the lease exists to prevent. The lease is marked
+  // pendingRelease so the holder's boundary frees it; re-run close after.
+  const releaseOutcome = await new StudioLeaseService(dataComposer.getClient())
     .releaseByStudio(studioId, { userId: closingUser.id, reason: 'studio-closed' })
     .catch((leaseErr: unknown) => {
       logger.warn('[StudioLease] Release on close_studio failed (non-fatal)', {
         studioId,
         error: leaseErr instanceof Error ? leaseErr.message : String(leaseErr),
       });
+      return 'none' as const;
     });
+  if (releaseOutcome === 'deferred') {
+    return errorResponse(
+      `Studio ${studioId} is in use by a live session. Its lease is marked for release at the holder's turn boundary — close the studio again once the session has finished.`
+    );
+  }
 
   // Remove the git worktree
   if (removeWorktree) {

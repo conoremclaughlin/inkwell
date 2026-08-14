@@ -105,42 +105,44 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         return;
       }
 
-      // Lease heartbeat: every lifecycle event from a live CLI session renews
-      // the studio lease. This is the primary heartbeatAt refresh path — it
-      // fires on every prompt/stop/compact, well inside the 30-minute
-      // staleness threshold. Fire-and-forget: renewal must never delay the
+      // Lease heartbeat and CLI run boundary. Prompt/compact events renew the
+      // lease heartbeat (the primary refresh path, well inside the 30-minute
+      // staleness threshold). Stop events (idle/completed) are the moment the
+      // CLI turn has actually finished executing in the worktree: ONE ordered
+      // chain runs the boundary release first (terminal session, or a
+      // pendingRelease deferred by close_thread/close_studio mid-turn) and
+      // renews only if nothing was released — release and renewal must never
+      // race each other's heartbeat CAS. Fire-and-forget: never delays the
       // hook response.
-      void leaseService.renewBySession(sessionId, session.userId).catch((err: unknown) => {
-        logger.debug('[HookLifecycle] Lease renewal failed (non-fatal)', {
-          sessionId,
-          error: err instanceof Error ? err.message : String(err),
-        });
-      });
-
-      // CLI run boundary: the stop hook is the moment an attached CLI turn
-      // has actually finished executing in the worktree. A terminal session
-      // (end_session / update_session_state(completed) called mid-turn was
-      // deferred precisely for this moment) releases its lease now.
-      if (lifecycle === 'idle' || lifecycle === 'completed') {
-        void dataComposer.repositories.memory
-          .getSession(sessionId)
-          .then((postUpdate) => {
-            const terminal =
-              Boolean(postUpdate?.endedAt) ||
-              postUpdate?.status === 'completed' ||
-              postUpdate?.lifecycle === 'completed';
-            if (!terminal) return false;
-            return leaseService.releaseBySession(sessionId, {
-              userId: session.userId,
-              reason: 'cli-turn-stopped',
-            });
-          })
-          .catch((err: unknown) => {
-            logger.warn('[HookLifecycle] CLI-boundary lease release failed', {
-              sessionId,
-              error: err instanceof Error ? err.message : String(err),
-            });
+      const isStopEvent = lifecycle === 'idle' || lifecycle === 'completed';
+      if (isStopEvent) {
+        void (async () => {
+          const postUpdate = await dataComposer.repositories.memory.getSession(sessionId);
+          const terminal =
+            Boolean(postUpdate?.endedAt) ||
+            postUpdate?.status === 'completed' ||
+            postUpdate?.lifecycle === 'completed';
+          const released = await leaseService.releaseAtBoundary(sessionId, {
+            userId: session.userId,
+            sessionTerminal: terminal,
+            reason: 'cli-turn-stopped',
           });
+          if (!released) {
+            await leaseService.renewBySession(sessionId, session.userId);
+          }
+        })().catch((err: unknown) => {
+          logger.warn('[HookLifecycle] CLI-boundary lease release failed', {
+            sessionId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+      } else {
+        void leaseService.renewBySession(sessionId, session.userId).catch((err: unknown) => {
+          logger.debug('[HookLifecycle] Lease renewal failed (non-fatal)', {
+            sessionId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
       }
 
       logger.debug('[HookLifecycle] Updated', { sessionId, lifecycle, agentId });
