@@ -535,3 +535,109 @@ describe('SessionRepository.updateTokenUsage — cache breakdown', () => {
     expect(metadata.totalCacheReadTokens ?? 0).toBe(0);
   });
 });
+
+describe('SessionRepository.updateTokenUsage — plausibility guard scope', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  // One Claude query re-reads its cached prompt on every model step, so ~20
+  // steps against a ~500k context legitimately bills ~10M input. The guard
+  // exists for undiffed running totals, which only the cumulative path can
+  // produce — applying it here discarded real usage.
+  it('accumulates a cache-heavy multi-step turn above the ceiling', async () => {
+    const { supabase, lastUpdate } = createMockSupabase();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const repo = new SessionRepository(supabase as any);
+
+    await repo.updateTokenUsage('sess-1', {
+      contextTokens: 500_000,
+      inputTokens: 12_000_000,
+      outputTokens: 80_000,
+      cacheReadTokens: 11_900_000,
+      cacheWriteTokens: 40_000,
+    });
+
+    expect(lastUpdate.data?.token_count).toBe(12_080_000);
+    const metadata = lastUpdate.data?.metadata as Record<string, number>;
+    expect(metadata.totalCacheReadTokens).toBe(11_900_000);
+  });
+
+  // The original pathology: a running total reaching the repository undiffed.
+  it('still refuses an implausible cumulative delta', async () => {
+    const { supabase, lastUpdate } = createMockSupabase();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const repo = new SessionRepository(supabase as any);
+
+    await repo.updateTokenUsage(
+      'sess-1',
+      { inputTokens: 3_437_373_064, outputTokens: 3_645_922, cumulative: true },
+      { backendSessionId: 'thread-a' }
+    );
+
+    expect(lastUpdate.data?.token_count).toBeUndefined();
+  });
+});
+
+describe('SessionRepository.updateTokenUsage — per-model totals', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('accumulates each reported model key against itself, cost included', async () => {
+    const { supabase, lastUpdate, fakeRow } = createMockSupabase();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const repo = new SessionRepository(supabase as any);
+
+    fakeRow.metadata = {
+      modelUsage: {
+        'claude-opus-5': {
+          inputTokens: 1_000,
+          outputTokens: 100,
+          cacheReadTokens: 500,
+          cacheWriteTokens: 50,
+          costUSD: 0.01,
+          canonicalModel: 'claude-opus-5',
+        },
+      },
+    };
+
+    await repo.updateTokenUsage('sess-1', {
+      inputTokens: 2_000,
+      outputTokens: 200,
+      modelUsage: {
+        'claude-opus-5': {
+          inputTokens: 1_500,
+          outputTokens: 150,
+          cacheReadTokens: 700,
+          cacheWriteTokens: 20,
+          costUSD: 0.02,
+          canonicalModel: 'claude-opus-5',
+        },
+        'claude-haiku-4-5': {
+          inputTokens: 500,
+          outputTokens: 50,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          costUSD: 0.001,
+          canonicalModel: 'claude-haiku-4-5',
+        },
+      },
+    });
+
+    const metadata = lastUpdate.data?.metadata as Record<string, Record<string, ModelTotals>>;
+    expect(metadata.modelUsage['claude-opus-5'].inputTokens).toBe(2_500);
+    expect(metadata.modelUsage['claude-opus-5'].costUSD).toBeCloseTo(0.03);
+    // A model seen for the first time starts from zero, not from another key.
+    expect(metadata.modelUsage['claude-haiku-4-5'].outputTokens).toBe(50);
+  });
+});
+
+interface ModelTotals {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  costUSD: number;
+  canonicalModel?: string;
+}

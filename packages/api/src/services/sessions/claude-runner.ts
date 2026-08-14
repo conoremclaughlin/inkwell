@@ -39,43 +39,183 @@ const PROCESS_TIMEOUT_MS =
  * Parse usage stats from Claude Code stream output.
  */
 interface ClaudeUsageStats {
-  contextTokens: number;
+  /** Live context occupancy, measured per-step — omitted when unmeasured. */
+  contextTokens?: number;
   inputTokens: number;
   outputTokens: number;
   cacheReadTokens?: number;
   cacheWriteTokens?: number;
+  /** Per-model breakdown as reported by Claude, keyed exactly as reported. */
+  modelUsage?: Record<string, ModelUsageEntry>;
+}
+
+/** One model's contribution to a query, from `result.modelUsage`. */
+export interface ModelUsageEntry {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  /** Claude's own cost figure for this model's share of the query. */
+  costUSD: number;
+  canonicalModel?: string;
+}
+
+const num = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
+
+/**
+ * Total prompt size for one API call: fresh + cached-read + cache-write.
+ *
+ * Claude names its cache fields `cache_read_input_tokens` and
+ * `cache_creation_input_tokens`. `cache_read_tokens` / `cache_write_tokens`
+ * do not exist on this path, so earlier reads yielded undefined every turn —
+ * and because `input_tokens` carries only the NON-cached remainder while
+ * Claude Code caches aggressively, recorded input collapsed to a few hundred
+ * tokens against hundreds of thousands of output.
+ */
+function promptTokens(usage: Record<string, unknown>): number {
+  return (
+    num(usage.input_tokens) +
+    num(usage.cache_read_input_tokens) +
+    num(usage.cache_creation_input_tokens)
+  );
 }
 
 /**
- * Map a `result.usage` object from Claude's stream-json to our usage stats.
+ * Map a `result.usage` object to BILLING totals for one `claude -p` query.
  *
- * Claude names its cache fields `cache_read_input_tokens` and
- * `cache_creation_input_tokens`; `cache_read_tokens` / `cache_write_tokens`
- * do not exist on this path, so the earlier reads yielded undefined every
- * turn. That mattered more than a missing breakdown: `input_tokens` counts
- * only the NON-cached remainder, and Claude Code caches aggressively, so
- * recorded input collapsed to a few hundred tokens against hundreds of
- * thousands of output — which made per-agent cost attribution meaningless.
+ * `result.usage` aggregates every model step in the query — it carries an
+ * `iterations[]` array, one entry per step — so it answers "what did this
+ * query cost", NOT "how full is the context window". A 20-step run re-reads
+ * the cached prompt each step, so its billed input is a multiple of the live
+ * context. Context is tracked separately from per-step assistant messages;
+ * conflating them made multi-step runs trip the compaction threshold early
+ * (Lumen, PR #493 round 2).
  *
- * The prompt that was actually sent is the sum of all three, cached or not
- * (the same arithmetic as claude-code.backend.ts). The cache split is kept
- * because it bills differently: reads at 0.1x and writes at 1.25x of input.
+ * `contextTokens` is deliberately absent here — the caller supplies the
+ * measured value, and omitting it means "unknown", never zero.
  *
  * Exported for tests.
  */
-export function parseClaudeUsage(usage: Record<string, unknown>): ClaudeUsageStats {
-  const num = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
-  const freshInput = num(usage.input_tokens);
-  const cacheReadTokens = num(usage.cache_read_input_tokens);
-  const cacheWriteTokens = num(usage.cache_creation_input_tokens);
-  const totalInput = freshInput + cacheReadTokens + cacheWriteTokens;
-
+export function parseClaudeUsage(usage: Record<string, unknown>): Omit<
+  ClaudeUsageStats,
+  'contextTokens'
+> & {
+  contextTokens?: number;
+} {
   return {
-    contextTokens: totalInput,
-    inputTokens: totalInput,
+    inputTokens: promptTokens(usage),
     outputTokens: num(usage.output_tokens),
-    cacheReadTokens,
-    cacheWriteTokens,
+    cacheReadTokens: num(usage.cache_read_input_tokens),
+    cacheWriteTokens: num(usage.cache_creation_input_tokens),
+  };
+}
+
+/**
+ * Live context size from a top-level `assistant` message's usage.
+ *
+ * Each assistant message reports the prompt for that single API call, so the
+ * most recent one is the current context window occupancy — the figure
+ * compaction decisions need. Messages emitted by subagents carry
+ * `parent_tool_use_id` and describe a different context, so they are skipped.
+ *
+ * Returns undefined when the event carries no usable usage.
+ *
+ * Exported for tests.
+ */
+export function parseAssistantContextTokens(event: Record<string, unknown>): number | undefined {
+  if (event.parent_tool_use_id) return undefined;
+  const message = event.message as Record<string, unknown> | undefined;
+  const usage = message?.usage as Record<string, unknown> | undefined;
+  if (!usage) return undefined;
+  const total = promptTokens(usage);
+  return total > 0 ? total : undefined;
+}
+
+/**
+ * Per-model usage from `result.modelUsage` — the authoritative record of
+ * which models actually served the query, including subagents, aliases and
+ * fallbacks, with Claude's own cost figure.
+ *
+ * Entries are kept under the keys Claude reports and are never summed across
+ * keys: the same query can list both a dated id and its alias, and whether
+ * those are one model or two is not decidable here. Preserving the reported
+ * shape lets the reporting layer group by `canonicalModel` without this layer
+ * inventing a total (Lumen, PR #493 round 2).
+ *
+ * Exported for tests.
+ */
+export function parseModelUsage(modelUsage: unknown): Record<string, ModelUsageEntry> | undefined {
+  if (!modelUsage || typeof modelUsage !== 'object') return undefined;
+  const out: Record<string, ModelUsageEntry> = {};
+  for (const [model, raw] of Object.entries(modelUsage as Record<string, unknown>)) {
+    if (!raw || typeof raw !== 'object') continue;
+    const entry = raw as Record<string, unknown>;
+    out[model] = {
+      inputTokens: num(entry.inputTokens),
+      outputTokens: num(entry.outputTokens),
+      cacheReadTokens: num(entry.cacheReadInputTokens),
+      cacheWriteTokens: num(entry.cacheCreationInputTokens),
+      costUSD: num(entry.costUSD),
+      ...(typeof entry.canonicalModel === 'string' ? { canonicalModel: entry.canonicalModel } : {}),
+    };
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/**
+ * The model that did the main work of a query: the reported entry with the
+ * most output tokens. Subagent and side-call models appear alongside the main
+ * one, and output volume is what distinguishes them.
+ *
+ * Exported for tests.
+ */
+export function primaryModel(
+  modelUsage: Record<string, ModelUsageEntry> | undefined
+): string | undefined {
+  if (!modelUsage) return undefined;
+  let best: { model: string; output: number } | undefined;
+  for (const [model, entry] of Object.entries(modelUsage)) {
+    if (!best || entry.outputTokens > best.output) {
+      best = { model: entry.canonicalModel || model, output: entry.outputTokens };
+    }
+  }
+  return best?.model;
+}
+
+/**
+ * Newline-delimited reader over a stream that arrives in arbitrary slices.
+ *
+ * stdout chunk boundaries have nothing to do with line boundaries, so a JSON
+ * event can straddle two chunks. Splitting each chunk on its own left both
+ * halves unparseable and the surrounding try/catch swallowed them silently.
+ * The result line is the longest event and therefore the likeliest to split,
+ * so the entire turn's usage and model attribution could vanish with no error
+ * (Lumen, PR #493 round 2).
+ *
+ * `flush` exists because the final line often has no trailing newline.
+ *
+ * Exported for tests.
+ */
+export function createLineReader(onLine: (line: string) => void): {
+  push: (chunk: string) => void;
+  flush: () => void;
+} {
+  let buffer = '';
+  return {
+    push(chunk: string) {
+      buffer += chunk;
+      let nl: number;
+      while ((nl = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, nl);
+        buffer = buffer.slice(nl + 1);
+        if (line.trim()) onLine(line);
+      }
+    },
+    flush() {
+      const remainder = buffer;
+      buffer = '';
+      if (remainder.trim()) onLine(remainder);
+    },
   };
 }
 
@@ -329,6 +469,7 @@ export class ClaudeRunner implements IRunner {
       const responses: ChannelResponse[] = [];
       const toolCalls: ToolCall[] = [];
       let usage: ClaudeUsageStats | undefined;
+      let measuredContextTokens: number | undefined;
       let resumeFailedNoSession = false;
       let finalTextResponse: string | undefined;
       let settled = false;
@@ -381,14 +522,8 @@ export class ClaudeRunner implements IRunner {
         }
       }, PROCESS_TIMEOUT_MS);
 
-      proc.stdout.on('data', (data) => {
-        lastActivityAt = Date.now();
-        resetIdleTimer();
-        const chunk = data.toString();
-
-        // Parse streaming JSON lines (don't accumulate raw stdout - avoid memory bloat)
-        const lines = chunk.split('\n').filter((line: string) => line.trim());
-        for (const line of lines) {
+      const consumeLine = (line: string) => {
+        {
           try {
             const parsed = JSON.parse(line);
             this.handleStreamEvent(parsed, responses);
@@ -407,12 +542,29 @@ export class ClaudeRunner implements IRunner {
             // Extract usage stats and final text response from result.
             if (parsed.type === 'result') {
               if (parsed.usage) {
-                usage = parseClaudeUsage(parsed.usage as Record<string, unknown>);
+                const billed = parseClaudeUsage(parsed.usage as Record<string, unknown>);
+                const modelUsage = parseModelUsage(parsed.modelUsage);
+                usage = {
+                  ...billed,
+                  // Measured per-step, never taken from the query aggregate.
+                  ...(measuredContextTokens !== undefined
+                    ? { contextTokens: measuredContextTokens }
+                    : {}),
+                  ...(modelUsage ? { modelUsage } : {}),
+                };
               }
               // Capture the final text response from the result
               if (parsed.result && typeof parsed.result === 'string') {
                 finalTextResponse = parsed.result;
               }
+            }
+
+            // Live context occupancy: the newest top-level assistant message
+            // reports the prompt for that one API call, which is what the
+            // compaction threshold is about.
+            if (parsed.type === 'assistant') {
+              const stepContext = parseAssistantContextTokens(parsed as Record<string, unknown>);
+              if (stepContext !== undefined) measuredContextTokens = stepContext;
             }
 
             // Also capture text from assistant messages (streaming)
@@ -430,6 +582,15 @@ export class ClaudeRunner implements IRunner {
             // Not JSON, likely plain text
           }
         }
+      };
+
+      // Only the unterminated remainder is held, never the whole stream.
+      const stdoutReader = createLineReader(consumeLine);
+
+      proc.stdout.on('data', (data) => {
+        lastActivityAt = Date.now();
+        resetIdleTimer();
+        stdoutReader.push(data.toString());
       });
 
       proc.stderr.on('data', (data) => {
@@ -455,6 +616,9 @@ export class ClaudeRunner implements IRunner {
         restoreOverlay?.().catch(() => {});
         if (settled) return; // Already resolved by timeout
         settled = true;
+        // Before resolving: the stream's last line may have arrived without a
+        // trailing newline, and it is usually the result line.
+        stdoutReader.flush();
 
         // Handle resume failure gracefully - don't reject, let caller retry
         if (resumeFailedNoSession) {

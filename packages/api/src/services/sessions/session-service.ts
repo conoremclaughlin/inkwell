@@ -32,7 +32,7 @@ import type {
 import type { Json } from '../../data/supabase/types.js';
 import { SessionRepository } from './session-repository.js';
 import { ContextBuilder } from './context-builder.js';
-import { ClaudeRunner, buildIdentityPrompt } from './claude-runner.js';
+import { ClaudeRunner, buildIdentityPrompt, primaryModel } from './claude-runner.js';
 import { CodexRunner } from './codex-runner.js';
 import {
   registerActiveRun,
@@ -897,6 +897,14 @@ export class SessionService implements ISessionService {
     // channel plugin to deliver, but none runs for headless sessions).
     const postRunLifecycle = result.success ? 'idle' : 'failed';
 
+    // The model that actually served this turn, from the backend's own
+    // per-model report rather than the model we requested. A requested default
+    // is not evidence: CLI defaults, aliases, fallbacks and subagents all make
+    // the two diverge, and one session's lifetime can span several models. So
+    // the column means "most recent main model" while metadata.modelUsage
+    // keeps the full per-model history (Lumen, PR #493 round 2).
+    const servedModel = primaryModel(result.usage?.modelUsage);
+
     // A runner can return after the shutdown drain has already snapshotted and
     // interrupted this session. Because repository.update() rewrites the whole
     // metadata blob from a snapshot taken at its own start, finalizing now
@@ -921,10 +929,7 @@ export class SessionService implements ISessionService {
           backendSessionId: result.backendSessionId,
           messageCount: session.messageCount + 1,
           backend: resolvedBackend,
-          // The model that actually ran this turn. The column existed but was
-          // never written, so usage could not be attributed per model — the
-          // question "is Fable costing more than Opus?" was unanswerable.
-          ...(runtimeModel ? { model: runtimeModel } : {}),
+          ...(servedModel ? { model: servedModel } : {}),
           lifecycle: postRunLifecycle as Session['lifecycle'],
           cliAttached: false,
         })
@@ -935,7 +940,7 @@ export class SessionService implements ISessionService {
         this.repository.update(session.id, {
           messageCount: session.messageCount + 1,
           backend: resolvedBackend,
-          ...(runtimeModel ? { model: runtimeModel } : {}),
+          ...(servedModel ? { model: servedModel } : {}),
           lifecycle: postRunLifecycle as Session['lifecycle'],
           cliAttached: false,
         })
@@ -974,6 +979,7 @@ export class SessionService implements ISessionService {
           outputTokens: result.usage.outputTokens,
           cacheReadTokens: result.usage.cacheReadTokens,
           cacheWriteTokens: result.usage.cacheWriteTokens,
+          modelUsage: result.usage.modelUsage,
           cumulative: result.usage.cumulative,
         },
         { backendSessionId: result.backendSessionId ?? session.backendSessionId ?? null }

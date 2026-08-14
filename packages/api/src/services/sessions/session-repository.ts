@@ -14,17 +14,53 @@ import type {
   SessionType,
   ISessionRepository,
   UsageCheckpoint,
+  ModelUsageTotals,
 } from './types.js';
 import { logger } from '../../utils/logger.js';
 
 /**
- * Ceiling on a single turn's reported token usage.
+ * Ceiling on a diffed CUMULATIVE delta (Codex thread totals).
  *
- * Well above any real turn (largest context windows are a few million tokens),
- * and far below the scale a mistakenly-accumulated cumulative counter reaches.
- * Exported for tests.
+ * Well above any real turn on that path, and far below the scale a
+ * mistakenly-accumulated running counter reaches. Exported for tests.
  */
 export const MAX_PLAUSIBLE_TURN_TOKENS = 10_000_000;
+
+/**
+ * Ceiling on a single PER-TURN report (Claude query totals).
+ *
+ * Much higher, because one query bills its cached prompt again on every model
+ * step: ~20 steps against a ~500k context is ~10M input from one honest turn,
+ * and a long agentic run can reach tens of millions. Only a report orders of
+ * magnitude past that is evidence of a counter bug rather than a busy turn —
+ * the incident that motivated these guards reported 3.4 BILLION.
+ *
+ * Exported for tests.
+ */
+export const MAX_PLAUSIBLE_QUERY_TOKENS = 1_000_000_000;
+
+/**
+ * Add a turn's per-model figures onto a session's running per-model totals,
+ * key by key. Unknown keys start at zero; known ones accumulate.
+ */
+function mergeModelUsage(
+  current: Record<string, ModelUsageTotals> | undefined,
+  turn: Record<string, ModelUsageTotals>
+): Record<string, ModelUsageTotals> {
+  const merged: Record<string, ModelUsageTotals> = { ...(current || {}) };
+  for (const [model, entry] of Object.entries(turn)) {
+    const prior = merged[model];
+    merged[model] = {
+      inputTokens: (prior?.inputTokens || 0) + entry.inputTokens,
+      outputTokens: (prior?.outputTokens || 0) + entry.outputTokens,
+      cacheReadTokens: (prior?.cacheReadTokens || 0) + entry.cacheReadTokens,
+      cacheWriteTokens: (prior?.cacheWriteTokens || 0) + entry.cacheWriteTokens,
+      costUSD: (prior?.costUSD || 0) + entry.costUSD,
+      ...(entry.canonicalModel ? { canonicalModel: entry.canonicalModel } : {}),
+    };
+  }
+  return merged;
+}
 
 type DbSession = Database['public']['Tables']['sessions']['Row'];
 type DbSessionInsert = Database['public']['Tables']['sessions']['Insert'];
@@ -63,6 +99,7 @@ function mapDbToSession(row: DbSession): Session {
     totalOutputTokens: (metadata.totalOutputTokens as number) || 0,
     totalCacheReadTokens: (metadata.totalCacheReadTokens as number) || 0,
     totalCacheWriteTokens: (metadata.totalCacheWriteTokens as number) || 0,
+    modelUsage: (metadata.modelUsage as Record<string, ModelUsageTotals> | undefined) || undefined,
     usageCheckpoint: (metadata.usageCheckpoint as UsageCheckpoint | undefined) || undefined,
 
     // Aggregate counters (persisted as columns)
@@ -422,6 +459,9 @@ export class SessionRepository implements ISessionRepository {
     if (updates.totalCacheWriteTokens !== undefined) {
       newMetadata.totalCacheWriteTokens = updates.totalCacheWriteTokens;
     }
+    if (updates.modelUsage !== undefined) {
+      newMetadata.modelUsage = updates.modelUsage as unknown as Json;
+    }
     if (updates.usageCheckpoint !== undefined) {
       newMetadata.usageCheckpoint = updates.usageCheckpoint as unknown as Json;
     }
@@ -462,6 +502,8 @@ export class SessionRepository implements ISessionRepository {
       /** Cache breakdown of `inputTokens`, not additions to it. */
       cacheReadTokens?: number;
       cacheWriteTokens?: number;
+      /** This turn's per-model figures, keyed as the backend reported them. */
+      modelUsage?: Record<string, ModelUsageTotals>;
       cumulative?: boolean;
     },
     options?: { backendSessionId?: string | null }
@@ -549,15 +591,26 @@ export class SessionRepository implements ISessionRepository {
     // many sampling calls, so a large delta is not inherently wrong. This only
     // catches the pathological case where a running total is still reaching us
     // undiffed, so we keep the last good value instead of persisting garbage.
+    // Two ceilings, because the two paths fail differently. A diffed
+    // cumulative delta above 10M means a running total reached us undiffed —
+    // the original 3.4B incident. A per-turn report has no such failure mode
+    // and legitimately runs far larger, since one query re-bills its cached
+    // prompt on every model step (~20 steps against a ~500k context is ~10M
+    // input from one honest turn). Holding per-turn reports to the cumulative
+    // ceiling discarded real usage, which is the accounting bug this all
+    // started from; leaving them unguarded would drop the backstop entirely
+    // (Lumen, PR #493 round 2).
     const turnTotal = deltaInput + deltaOutput;
-    if (turnTotal > MAX_PLAUSIBLE_TURN_TOKENS) {
+    const ceiling = usage.cumulative ? MAX_PLAUSIBLE_TURN_TOKENS : MAX_PLAUSIBLE_QUERY_TOKENS;
+    if (turnTotal > ceiling) {
       logger.error('Implausible single-turn token delta — refusing to accumulate', {
         id,
         usage,
         deltaInput,
         deltaOutput,
         turnTotal,
-        ceiling: MAX_PLAUSIBLE_TURN_TOKENS,
+        ceiling,
+        cumulative: !!usage.cumulative,
         hint: 'A cumulative total is likely reaching the repository undiffed',
       });
 
@@ -581,6 +634,16 @@ export class SessionRepository implements ISessionRepository {
     const cacheReadDelta = !usage.cumulative ? usage.cacheReadTokens || 0 : 0;
     const cacheWriteDelta = !usage.cumulative ? usage.cacheWriteTokens || 0 : 0;
 
+    // Per-model accumulation. Keys stay exactly as the backend reported them
+    // and are never merged across keys — a query can list both a dated model
+    // id and its alias, and only the reporting layer has the context to decide
+    // whether those are one model or two. Accumulating each key against itself
+    // is safe either way, and preserves costUSD, which is the figure that
+    // actually answers "what did this session spend".
+    const mergedModelUsage = usage.modelUsage
+      ? mergeModelUsage(current.modelUsage, usage.modelUsage)
+      : undefined;
+
     await this.update(id, {
       // Only persist a context figure the backend actually reported. Codex
       // JSONL carries no per-turn context measure, and aliasing it to the
@@ -594,6 +657,7 @@ export class SessionRepository implements ISessionRepository {
       ...(cacheWriteDelta
         ? { totalCacheWriteTokens: current.totalCacheWriteTokens + cacheWriteDelta }
         : {}),
+      ...(mergedModelUsage ? { modelUsage: mergedModelUsage } : {}),
       tokenCount: newInputTokens + newOutputTokens,
       ...(nextCheckpoint ? { usageCheckpoint: nextCheckpoint } : {}),
     });

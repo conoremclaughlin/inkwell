@@ -56,6 +56,20 @@ export type SessionStatus = 'active' | 'paused' | 'completed' | 'failed';
  * thread changes — resume onto a new thread, compaction, or a fresh run. A
  * checkpoint from a different thread must never be diffed against.
  */
+/**
+ * One model's accumulated contribution to a session. `costUSD` is the
+ * backend's own cost figure, which answers the spend question directly
+ * instead of requiring a price table here.
+ */
+export interface ModelUsageTotals {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  costUSD: number;
+  canonicalModel?: string;
+}
+
 export interface UsageCheckpoint {
   backendSessionId: string | null;
   inputTokens: number;
@@ -97,6 +111,15 @@ export interface Session {
    */
   totalCacheReadTokens: number;
   totalCacheWriteTokens: number;
+
+  /**
+   * Per-model totals for this session, keyed exactly as the backend reported
+   * them. Authoritative for "which models actually ran and what did they
+   * cost" — it covers subagents, aliases and mid-session model changes, none
+   * of which the single `model` column can express. Keys are never merged
+   * here; grouping (e.g. by canonicalModel) belongs to the reporting layer.
+   */
+  modelUsage?: Record<string, ModelUsageTotals>;
 
   /**
    * Last cumulative usage observed from a backend that reports running
@@ -227,6 +250,8 @@ export interface SessionResult {
     outputTokens: number;
     cacheReadTokens?: number;
     cacheWriteTokens?: number;
+    /** This turn's per-model figures, keyed as the backend reported them. */
+    modelUsage?: Record<string, ModelUsageTotals>;
     /**
      * True when the backend reports running thread totals instead of a
      * per-turn delta (Codex `turn.completed.usage` is `ThreadTokenUsage.total`).
@@ -434,6 +459,8 @@ export interface ISessionRepository {
       /** Cache breakdown of `inputTokens`, not additions to it. */
       cacheReadTokens?: number;
       cacheWriteTokens?: number;
+      /** This turn's per-model figures, keyed as the backend reported them. */
+      modelUsage?: Record<string, ModelUsageTotals>;
       /**
        * True when the counts are running totals for `backendSessionId`
        * rather than this turn's delta. The repository diffs them against
