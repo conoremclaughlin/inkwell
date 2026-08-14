@@ -139,6 +139,7 @@ export class InkRunner implements IRunner {
           backendSessionId: sessionId,
           responses: retryResult.responses,
           usage: retryResult.usage,
+          servedModel: retryResult.servedModel,
           finalTextResponse: retryResult.finalTextResponse,
           toolCalls: retryResult.toolCalls,
         };
@@ -149,6 +150,7 @@ export class InkRunner implements IRunner {
         backendSessionId: sessionId,
         responses: result.responses,
         usage: result.usage,
+        servedModel: result.servedModel,
         finalTextResponse: result.finalTextResponse,
         toolCalls: result.toolCalls,
       };
@@ -227,7 +229,14 @@ export class InkRunner implements IRunner {
     config: ClaudeRunnerConfig
   ): Promise<{
     responses: ChannelResponse[];
-    usage?: { contextTokens: number; inputTokens: number; outputTokens: number };
+    usage?: {
+      contextTokens: number;
+      inputTokens: number;
+      outputTokens: number;
+      cacheReadTokens?: number;
+      cacheWriteTokens?: number;
+    };
+    servedModel?: string;
     resumeFailedNoSession?: boolean;
     finalTextResponse?: string;
     toolCalls: ToolCall[];
@@ -454,7 +463,14 @@ export class InkRunner implements IRunner {
     _stderr: string
   ): {
     responses: ChannelResponse[];
-    usage?: { contextTokens: number; inputTokens: number; outputTokens: number };
+    usage?: {
+      contextTokens: number;
+      inputTokens: number;
+      outputTokens: number;
+      cacheReadTokens?: number;
+      cacheWriteTokens?: number;
+    };
+    servedModel?: string;
     finalTextResponse?: string;
     toolCalls: ToolCall[];
   } {
@@ -464,7 +480,16 @@ export class InkRunner implements IRunner {
     let exitPhase: string | undefined;
     let exitSignal: string | undefined;
     let exitReason: string | undefined;
-    let usage: { contextTokens: number; inputTokens: number; outputTokens: number } | undefined;
+    let usage:
+      | {
+          contextTokens: number;
+          inputTokens: number;
+          outputTokens: number;
+          cacheReadTokens?: number;
+          cacheWriteTokens?: number;
+        }
+      | undefined;
+    let servedModel: string | undefined;
 
     // ink chat routes responses via MCP send_response — stdout may contain
     // CLI chrome, status lines, or other noise that must NOT be treated as
@@ -501,11 +526,24 @@ export class InkRunner implements IRunner {
           // Without this, sessions report contextTokens=0 and token-based
           // lifecycle decisions never fire for the ink backend.
           if (parsed.usage && typeof parsed.usage === 'object') {
+            // The CLI reports fresh input and the cache split separately;
+            // input is their sum, since cached tokens are still input that
+            // was sent and billed. Older ink builds omit the cache fields —
+            // those degrade to the previous fresh-only figure rather than
+            // failing.
+            const cacheReadTokens = Number(parsed.usage.cacheReadTokens) || 0;
+            const cacheWriteTokens = Number(parsed.usage.cacheWriteTokens) || 0;
             usage = {
               contextTokens: Number(parsed.usage.contextTokens) || 0,
-              inputTokens: Number(parsed.usage.inputTokens) || 0,
+              inputTokens:
+                (Number(parsed.usage.inputTokens) || 0) + cacheReadTokens + cacheWriteTokens,
               outputTokens: Number(parsed.usage.outputTokens) || 0,
+              cacheReadTokens,
+              cacheWriteTokens,
             };
+          }
+          if (typeof parsed.model === 'string' && parsed.model.trim()) {
+            servedModel = parsed.model.trim();
           }
         }
       } catch {
@@ -528,6 +566,7 @@ export class InkRunner implements IRunner {
     return {
       responses,
       usage,
+      servedModel,
       finalTextResponse,
       toolCalls,
     };
