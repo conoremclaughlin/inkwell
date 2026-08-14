@@ -256,6 +256,73 @@ describe('StudioLeaseService.acquire', () => {
     expect((await service.acquire(req)).acquired).toBe(false);
   });
 
+  it('re-validates after a lost vacant CAS — never adopts into a vanished cwd (round 9)', async () => {
+    // A reads vacant + present. Between that read and its CAS, B installs a
+    // TERMINAL same-thread lease and the worktree disappears. A loses the
+    // vacant CAS; the reread must go back through validation rather than
+    // straight to adoption, which would grant a missing cwd.
+    tables.studios[0].lease = null;
+    tables.studios[0].worktree_path = tmpdir(); // present at the first read
+    tables.sessions.push({
+      id: 'session-old',
+      user_id: 'user-1',
+      ended_at: new Date().toISOString(),
+      status: 'completed',
+    });
+
+    let raced = false;
+    const hooked = new StudioLeaseService(
+      makeFakeSupabase(tables, {
+        afterSelect: (table, count) => {
+          if (table === 'studios' && count === 1 && !raced) {
+            raced = true;
+            tables.studios[0].lease = freshLease({
+              sessionId: 'session-old',
+              threadKey: 'pr:200',
+            });
+            tables.studios[0].worktree_path = path.join(tmpdir(), 'vanished-mid-race-xyz');
+          }
+        },
+      })
+    );
+
+    const result = await hooked.acquire(req);
+    expect(raced).toBe(true);
+    expect(result.acquired).toBe(false);
+    // The reread was validated: the dead studio was retired, not adopted.
+    expect(tables.studios[0].status).toBe('cleaned');
+    expect(tables.studios[0].lease).toBeNull();
+  });
+
+  it('never steals a FRESH teardown claim when the worktree is missing (round 9)', async () => {
+    // close_studio's normal window: the worktree is legitimately gone
+    // between `git worktree remove` and the owner's finalizeTeardown. The
+    // claim's sessionId is a random token, not a session, so a liveness
+    // probe calls it dead — stealing it would make the real close's
+    // finalize CAS lose and report a false failure.
+    const claim: StudioLease = {
+      sessionId: '44444444-4444-4444-4444-444444444444',
+      threadKey: QUARANTINE_THREAD_KEY,
+      heldThreadKey: 'pr:5',
+      agentId: 'wren',
+      acquiredAt: new Date().toISOString(),
+      heartbeatAt: new Date().toISOString(),
+      quarantined: true,
+      claimKind: 'teardown',
+    };
+    tables.studios[0].lease = claim;
+    tables.studios[0].worktree_path = path.join(tmpdir(), 'mid-close-worktree-xyz');
+
+    const result = await service.acquire(req);
+    expect(result.acquired).toBe(false);
+    // The owner's claim is intact...
+    expect((tables.studios[0].lease as StudioLease).sessionId).toBe(claim.sessionId);
+    expect(tables.studios[0].status).toBe('active');
+    // ...so its finalization still wins.
+    expect(await service.finalizeTeardown('studio-1', 'user-1', claim)).toBe(true);
+    expect(tables.studios[0].status).toBe('cleaned');
+  });
+
   it('never adopts a SAME-THREAD lease when the worktree is gone (round 8)', async () => {
     // Terminal same-thread holder would normally be adopted outright,
     // bypassing claimAndRescue's missing-cwd check.

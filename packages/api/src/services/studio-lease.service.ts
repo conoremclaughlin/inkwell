@@ -96,6 +96,13 @@ export const EPHEMERAL_STUDIO_TTL_MS = 72 * 60 * 60 * 1000;
  */
 export const QUARANTINE_THREAD_KEY = '__quarantine__';
 
+/**
+ * How many times acquire() re-validates and retries after losing a CAS.
+ * Bounded so a pathologically contended studio cannot spin: losing twice
+ * means someone else genuinely owns it, and the caller diverts to overflow.
+ */
+const ACQUIRE_MAX_ATTEMPTS = 3;
+
 export type LeaseEventType =
   | 'acquired'
   | 'released'
@@ -358,26 +365,67 @@ export class StudioLeaseService {
    * authorizes a mutation.
    */
   async acquire(req: AcquireRequest): Promise<AcquireResult> {
-    const now = new Date().toISOString();
     const sbId = await this.resolveSbId(req.userId, req.agentId);
-    const lease: StudioLease = {
-      sessionId: req.sessionId,
-      threadKey: req.threadKey,
-      agentId: req.agentId,
-      sbId,
-      acquiredAt: now,
-      heartbeatAt: now,
-      reason: req.reason,
-    };
 
-    // Authoritative read BEFORE any grant. EVERY path below can hand this
-    // studio to a runner, so routability is verified exactly once, here:
-    // the studio exists for this user, its status is acquirable, and its
-    // configured worktree is actually on disk. Validating only inside the
-    // occupied/reclaim paths was the round-8 gap — the vacant fast path
-    // CAS'd first, so an active studio whose worktree had been deleted was
-    // leased straight out to the runner.
-    const current = await this.getLease(req.studioId, req.userId);
+    // Bounded validate→grant ladder. EVERY authoritative read passes through
+    // refuseUngrantable() before any grant path runs, and a lost CAS
+    // RESTARTS the ladder rather than granting on the state it read before
+    // the race. Validating only the first read was the round-9 gap: between
+    // that read and a lost vacant CAS, another writer can install a terminal
+    // same-thread lease while the cwd disappears, and adoption on the reread
+    // would then hand out a studio whose worktree is gone.
+    for (let attempt = 0; attempt < ACQUIRE_MAX_ATTEMPTS; attempt += 1) {
+      const current = await this.getLease(req.studioId, req.userId);
+      const refusal = await this.refuseUngrantable(req, current);
+      if (refusal) return refusal;
+
+      const now = new Date().toISOString();
+      const lease: StudioLease = {
+        sessionId: req.sessionId,
+        threadKey: req.threadKey,
+        agentId: req.agentId,
+        sbId,
+        acquiredAt: now,
+        heartbeatAt: now,
+        reason: req.reason,
+      };
+
+      const holder = current?.lease ?? null;
+      if (holder) {
+        return this.resolveOccupied(req, lease, holder, current?.worktreePath);
+      }
+
+      if (await this.casVacant(req, lease)) {
+        await this.logEvent(req.userId, req.studioId, 'acquired', {
+          sessionId: req.sessionId,
+          threadKey: req.threadKey,
+          agentId: req.agentId,
+          sbId,
+          reason: req.reason,
+        });
+        return { acquired: true, lease };
+      }
+      // Lost the vacant CAS — loop and re-validate from scratch.
+    }
+
+    logger.warn('[StudioLease] Acquire abandoned after repeated lost races', {
+      studioId: req.studioId,
+      threadKey: req.threadKey,
+      attempts: ACQUIRE_MAX_ATTEMPTS,
+    });
+    return { acquired: false, holder: null };
+  }
+
+  /**
+   * The gate every grant path shares: the studio must exist for this user,
+   * hold an acquirable status, and have its configured worktree on disk.
+   * Returns a refusal result when any of those fail (retiring a dead studio
+   * as a side effect), or null when the studio may proceed to the CAS ladder.
+   */
+  private async refuseUngrantable(
+    req: AcquireRequest,
+    current: Awaited<ReturnType<StudioLeaseService['getLease']>>
+  ): Promise<AcquireResult | null> {
     if (!current) {
       // Studio doesn't exist for this user — refuse; never treat an
       // unverifiable studio as acquirable.
@@ -404,28 +452,7 @@ export class StudioLeaseService {
       await this.retireMissingWorktree(req, current.lease, current.worktreePath);
       return { acquired: false, holder: null };
     }
-
-    const holder = current.lease;
-    if (!holder) {
-      if (await this.casVacant(req, lease)) {
-        await this.logEvent(req.userId, req.studioId, 'acquired', {
-          sessionId: req.sessionId,
-          threadKey: req.threadKey,
-          agentId: req.agentId,
-          sbId,
-          reason: req.reason,
-        });
-        return { acquired: true, lease };
-      }
-      // Lost the vacant CAS — someone took it between the read and the write.
-      const reread = await this.getLease(req.studioId, req.userId);
-      if (reread?.lease) {
-        return this.resolveOccupied(req, lease, reread.lease, reread.worktreePath);
-      }
-      return { acquired: false, holder: null };
-    }
-
-    return this.resolveOccupied(req, lease, holder, current.worktreePath);
+    return null;
   }
 
   /**
@@ -442,6 +469,26 @@ export class StudioLeaseService {
     lease: StudioLease | null,
     worktreePath: string
   ): Promise<void> {
+    // A FRESH destructive claim belongs to a worker that is mid-teardown or
+    // mid-recovery RIGHT NOW. close_studio's normal window legitimately has
+    // the worktree gone between `git worktree remove` and the owner's
+    // finalizeTeardown — and a claim's sessionId is a random token, not a
+    // session, so a liveness probe always calls it dead. Retiring here would
+    // steal the claim and make the real close's finalize CAS lose and report
+    // a false failure. Leave it to its owner, or to the stale sweep if that
+    // owner died.
+    if (lease?.quarantined && !isLeaseStale(lease)) {
+      logger.info(
+        '[StudioLease] Missing worktree is under an active claim; leaving it to its owner',
+        {
+          studioId: req.studioId,
+          worktreePath,
+          claimKind: lease.claimKind ?? null,
+        }
+      );
+      return;
+    }
+
     if (lease && (await this.isSessionLive(lease.sessionId, req.userId))) {
       logger.error('[StudioLease] Acquire refused — worktree is missing under a LIVE holder', {
         studioId: req.studioId,
