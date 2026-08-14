@@ -5035,6 +5035,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
           turnDurationSeconds = Math.max(0, Math.round((Date.now() - turnStartedAt) / 1000));
           stopWaiting();
         });
+        // Recorded here, not after the reseed branch: a failed resume that
+        // reported usage still spent those tokens, and the retry below
+        // REASSIGNS runResult — recording once at the end would silently drop
+        // the first attempt (Lumen, PR #494 round 3).
+        recordRunUsage(runResult.usage);
 
         // If a resumed turn failed because the provider session vanished (jsonl
         // cleaned up / different machine), drop the live id so the NEXT turn seeds
@@ -5091,6 +5096,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
             inkRepl?.setAbortHandler(null);
             process.off('SIGINT', onSigintDuringTurn);
           });
+          recordRunUsage(runResult.usage);
         }
 
         sbDebugLog(
@@ -5159,7 +5165,6 @@ export async function runChat(options: ChatOptions): Promise<void> {
         }
 
         lastRunResult = runResult;
-        recordRunUsage(runResult.usage);
         return runResult;
       }
 

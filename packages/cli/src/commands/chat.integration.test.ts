@@ -305,6 +305,112 @@ describe('runChat integration', () => {
     expect(resultLine.model).toBeUndefined();
   });
 
+  /**
+   * A resumed turn whose provider session has vanished fails, then retries on a
+   * fresh session. The failed attempt still reported usage — those tokens were
+   * spent — and the retry REASSIGNS runResult, so recording once at the end of
+   * the path drops the first attempt entirely (Lumen, PR #494 round 3).
+   */
+  it('counts both the failed resume and the reseed retry', async () => {
+    const sessionId = 'sess-reseed-usage';
+    const replDir = join(testCwd, '.ink', 'runtime', 'repl');
+    mkdirSync(replDir, { recursive: true });
+    // A prior provider-native session id makes the next turn a RESUME.
+    writeFileSync(
+      join(replDir, `${sessionId}-1700000000000.jsonl`),
+      [
+        JSON.stringify({
+          ts: '2026-02-25T07:00:00.000Z',
+          type: 'backend_session',
+          id: 'provider-session-gone',
+          routing: 'local',
+        }),
+        JSON.stringify({
+          ts: '2026-02-25T07:00:01.000Z',
+          type: 'user',
+          content: 'earlier message',
+        }),
+        JSON.stringify({
+          ts: '2026-02-25T07:00:02.000Z',
+          type: 'assistant',
+          content: 'earlier reply',
+        }),
+      ].join('\n') + '\n'
+    );
+
+    let call = 0;
+    testState.runBackendImpl.mockImplementation(async () => {
+      call += 1;
+      if (call === 1) {
+        // Resume against a provider session that no longer exists — failed,
+        // but tokens were still spent getting there.
+        return {
+          success: false,
+          stdout: '',
+          stderr: 'session not found',
+          exitCode: 1,
+          durationMs: 5,
+          command: 'mock',
+          resumeFailedNoSession: true,
+          usage: {
+            backend: 'claude',
+            source: 'json',
+            inputTokens: 700,
+            outputTokens: 30,
+            cacheReadTokens: 2_000,
+            cacheWriteTokens: 0,
+          },
+        };
+      }
+      return {
+        success: true,
+        stdout: 'recovered reply',
+        stderr: '',
+        exitCode: 0,
+        durationMs: 8,
+        command: 'mock',
+        usage: {
+          backend: 'claude',
+          source: 'json',
+          inputTokens: 300,
+          outputTokens: 90,
+          cacheReadTokens: 1_000,
+          cacheWriteTokens: 0,
+        },
+      };
+    });
+
+    await runChat({
+      agent: 'lumen',
+      backend: 'claude',
+      sessionId,
+      nonInteractive: true,
+      message: 'resume me',
+      pollSeconds: '999',
+    });
+
+    const resultLine = logSpy.mock.calls
+      .map((args) => String(args[0] ?? ''))
+      .filter((line) => line.trim().startsWith('{'))
+      .map((line) => {
+        try {
+          return JSON.parse(line);
+        } catch {
+          return null;
+        }
+      })
+      .find((parsed) => parsed && parsed.type === 'result');
+
+    expect(resultLine).toBeTruthy();
+    // The reseed must actually have happened, or this asserts nothing.
+    expect(testState.runBackendImpl).toHaveBeenCalledTimes(2);
+    // Both attempts: 700 + 300 input, 2,000 + 1,000 cache-read. Recording only
+    // after the reseed would report the retry's 300 / 1,000 alone.
+    expect(resultLine.usage.inputTokens).toBe(1_000);
+    expect(resultLine.usage.cacheReadTokens).toBe(3_000);
+    expect(resultLine.usage.outputTokens).toBe(120);
+  });
+
   it('forwards --attach-file into the turn prompt, transcript, and backend attachment dirs', async () => {
     const mediaDir = join(testCwd, 'files', 'telegram');
     mkdirSync(mediaDir, { recursive: true });
