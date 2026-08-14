@@ -16,6 +16,8 @@ import { logger } from '../../utils/logger';
 import type { Json } from '../../data/supabase/types';
 import { getAgentGateway, type AgentTriggerPayload } from '../../channels/agent-gateway.js';
 import { advanceThreadReadPointer } from './read-state.js';
+import { StudioLeaseService } from '../../services/studio-lease.service.js';
+import { StudioOverflowService } from '../../services/studio-overflow.service.js';
 
 // The thread tables are new and not yet in generated Supabase types.
 // Use type-safe wrappers that cast the table name for PostgREST queries.
@@ -761,6 +763,36 @@ export async function handleCloseThread(args: unknown, dataComposer: DataCompose
     message_type: 'system',
     metadata: { type: 'thread_closed', closedBy: agentId } as Json,
   });
+
+  // Automatic lease release — the work unit completing is what lets studios
+  // go. A holder whose process is still live (close_thread is commonly called
+  // from inside the holder's own turn) is DEFERRED via pendingRelease, and
+  // the run/stop boundary or sweep completes it — never cleared out from
+  // under a running process. Ephemeral teardown is claim-fenced per studio
+  // and skips anything still held.
+  try {
+    const leases = new StudioLeaseService(supabase);
+    const { released, deferred } = await leases.releaseByThread(resolved.user.id, threadKey, {
+      reason: 'thread-closed',
+    });
+    const overflow = new StudioOverflowService(dataComposer.repositories.studios, leases);
+    const cleaned = await overflow.teardownEphemeralStudiosForThread(resolved.user.id, threadKey, {
+      reason: `thread ${threadKey} closed`,
+    });
+    if (released || deferred || cleaned) {
+      logger.info('[StudioLease] Thread close released studios', {
+        threadKey,
+        leasesReleased: released,
+        leasesDeferred: deferred,
+        ephemeralCleaned: cleaned,
+      });
+    }
+  } catch (leaseErr) {
+    logger.warn('[StudioLease] Release on thread close failed (non-fatal)', {
+      threadKey,
+      error: leaseErr instanceof Error ? leaseErr.message : String(leaseErr),
+    });
+  }
 
   logger.info('Thread closed', { threadKey, closedBy: agentId });
 

@@ -134,6 +134,15 @@ export function listActiveRuns(): ActiveRun[] {
   return [...active.values()];
 }
 
+/**
+ * Is this server currently executing a turn for the session? Used by the
+ * lease sweep to distinguish "long agentic turn, no heartbeat yet" from
+ * "holder is gone" — only the latter forfeits a studio.
+ */
+export function hasActiveRun(sessionId: string): boolean {
+  return active.has(sessionId);
+}
+
 export function activeRunCount(): number {
   return active.size;
 }

@@ -113,7 +113,10 @@ describe('registry brackets the persisted running state', () => {
     const postRun = at('const postRunLifecycle');
     const clearAt = source.indexOf('clearActiveRun(', postRun);
     expect(source.slice(postRun, clearAt)).toContain('finalized');
-    expect(source.slice(clearAt - 30, clearAt)).toMatch(/if \(finalized\)\s*$/);
+    // Single-statement or block form — either way, the clear sits directly
+    // inside an `if (finalized)` guard (the block also runs the lease
+    // release at the run boundary, PR #492).
+    expect(source.slice(clearAt - 60, clearAt)).toMatch(/if \(finalized\)\s*\{?\s*$/);
   });
 
   /**
