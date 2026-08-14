@@ -4787,6 +4787,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
           ].join('\n'),
           toolRouting: runtime.toolRouting,
           signal: ctx.signal,
+          // Nobody is watching a clone's scrollback, so a refusal it is not told
+          // about becomes silent abandonment of the task.
+          continueOnBlocked: true,
         },
         {
           ui: {
@@ -4826,15 +4829,29 @@ export async function runChat(options: ChatOptions): Promise<void> {
         iterations: result.iterations,
         summary,
       });
-      const status =
-        result.stopReason === 'aborted' ? 'aborted' : result.success ? 'completed' : 'failed';
+      // A clone that ran out of road is not a clone that finished. The backend
+      // exiting 0 says the process worked, not that the work happened — and the
+      // parent only sees this status and the summary, so a false green here
+      // means acting on a preamble as if it were an answer.
+      const status: CloneStatus =
+        result.stopReason === 'aborted'
+          ? 'aborted'
+          : !result.success || result.stopReason === 'all-refused'
+            ? 'failed'
+            : 'completed';
+      const error =
+        result.stopReason === 'all-refused'
+          ? 'every tool call was refused — the clone could not do the work'
+          : result.success
+            ? undefined
+            : `backend ${result.stopReason}`;
       cloneRegistry.update(record.id, {
         status,
         stopReason: result.stopReason,
         iterations: result.iterations,
         toolCalls: cloneToolCalls,
         summary,
-        ...(result.success ? {} : { error: `backend ${result.stopReason}` }),
+        ...(error ? { error } : {}),
       });
       logCloneActivity(record.id, status, {
         stopReason: result.stopReason,

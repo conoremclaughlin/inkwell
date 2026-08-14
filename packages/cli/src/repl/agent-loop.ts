@@ -39,6 +39,13 @@ export interface ToolResultRecord {
  */
 export type AgentLoopStopReason =
   | 'no-tools'
+  /**
+   * Calls were made and every one was refused — blocked by policy or denied by
+   * the user. Distinct from `no-tools` (the agent stopped asking) because for a
+   * clone the difference is everything: one is a finished report, the other is
+   * work that never happened behind a confident-sounding preamble.
+   */
+  | 'all-refused'
   | 'terminal-signal'
   | 'iteration-cap'
   | 'backend-failure'
@@ -167,7 +174,16 @@ export function buildContinuationBody(
     ? '\n\nFORMAT NOTE: your tool calls used <tool_call> XML — the ink runtime executed them this time, but the ONLY supported format is a fenced block:\n```ink-tool\n{"tool":"<name>","args":{...}}\n```\nUse ink-tool fences (bare tool names, no mcp__inkwell__ prefix) from now on.'
     : '';
 
-  return `[Tool results from previous turn]\n${toolResultsSummary}${formatCorrection}\n\nContinue your response based on these tool results. If you need more tools, emit ink-tool blocks. Otherwise, provide your final answer.`;
+  // Nothing ran. Without saying so, a model reads the results block as ordinary
+  // output and either retries the same refused call or writes its answer as if
+  // the work had happened.
+  const allRefused =
+    results.length > 0 && !results.some((r) => r.status === 'executed' || r.status === 'approved');
+  const refusalNote = allRefused
+    ? '\n\nNOTE: none of those calls ran — every one was refused. Do not retry them. Work with the tools you do have, and if the task cannot be completed without a refused tool, say so plainly and stop.'
+    : '';
+
+  return `[Tool results from previous turn]\n${toolResultsSummary}${formatCorrection}${refusalNote}\n\nContinue your response based on these tool results. If you need more tools, emit ink-tool blocks. Otherwise, provide your final answer.`;
 }
 
 export interface AgentLoopInput {
@@ -177,6 +193,17 @@ export interface AgentLoopInput {
   toolRouting: 'backend' | 'local';
   maxIterations?: number;
   signal?: AbortSignal;
+  /**
+   * Tell the agent when every call in an iteration was refused, and let it try
+   * again, instead of ending the turn.
+   *
+   * Off for the REPL: a human is watching the scrollback, sees the refusal, and
+   * can redirect — re-prompting there would just nag someone who already said
+   * no. On for a shadow clone, where nobody is watching: a clone that silently
+   * gives up hands its parent a confident preamble in place of the work, which
+   * is exactly the failure the live smoke test surfaced.
+   */
+  continueOnBlocked?: boolean;
 }
 
 /**
@@ -268,7 +295,12 @@ export async function runAgentLoop(
     iteration++;
 
     const reason = toolLoopStopReason(results, iteration, maxIterations);
-    if (reason) {
+    // Everything was refused. Telling the agent so — once, and only where nobody
+    // is watching the scrollback for it — is the difference between a clone that
+    // routes around its envelope and one that hands back a preamble.
+    const retryAfterRefusal =
+      reason === 'all-refused' && input.continueOnBlocked === true && iteration < maxIterations;
+    if (reason && !retryAfterRefusal) {
       stopReason = reason;
       if (reason === 'iteration-cap') {
         ports.ui.printLine(`(tool loop limit reached — ${maxIterations} iterations)`);
@@ -277,7 +309,11 @@ export async function runAgentLoop(
     }
 
     const ranTools = Array.from(new Set(results.map((r) => r.tool))).join(', ');
-    ports.ui.printEvent(`  ⋯ ran ${ranTools} — continuing (${iteration}/${maxIterations})…`);
+    ports.ui.printEvent(
+      retryAfterRefusal
+        ? `  ⋯ ${ranTools} refused — continuing (${iteration}/${maxIterations})…`
+        : `  ⋯ ran ${ranTools} — continuing (${iteration}/${maxIterations})…`
+    );
 
     const stopWaiting = ports.ui.startWaiting();
     try {
@@ -452,10 +488,12 @@ export function toolLoopStopReason(
   );
   if (signaledDone) return 'terminal-signal';
 
+  // Reachable only when the agent DID emit calls, so "nothing executed" means
+  // "everything was refused" — never "it stopped asking".
   const hasExecutedTools = iterationResults.some(
     (r) => r.status === 'executed' || r.status === 'approved'
   );
-  if (!hasExecutedTools) return 'no-tools';
+  if (!hasExecutedTools) return 'all-refused';
 
   if (iteration >= maxIterations) return 'iteration-cap';
 

@@ -410,3 +410,88 @@ describe('runAgentLoop — iteration screening', () => {
     expect(harness.executed[0]).toHaveLength(5);
   });
 });
+
+describe('runAgentLoop — refused iterations', () => {
+  const blocked = (tool: string): ToolResultRecord => ({
+    tool,
+    result: 'Tool is explicitly denied by policy.',
+    status: 'blocked',
+  });
+
+  it('distinguishes "everything was refused" from "it stopped asking"', async () => {
+    const harness = makePorts([outcome({ responseText: inkTool('bash') })], () => [
+      blocked('bash'),
+    ]);
+
+    const result = await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+
+    // Not 'no-tools': the agent DID ask, and was refused. For a clone the
+    // difference decides whether the parent reads the summary as an answer.
+    expect(result.stopReason).toBe('all-refused');
+  });
+
+  it('leaves the REPL turn to end on refusal, where a human is watching', async () => {
+    const harness = makePorts(
+      [outcome({ responseText: inkTool('bash') }), outcome({ responseText: 'second turn' })],
+      () => [blocked('bash')]
+    );
+
+    await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+    // One turn only — the user saw the refusal and can redirect; re-prompting
+    // would nag someone who already said no.
+    expect(harness.prompts).toHaveLength(1);
+  });
+
+  it('tells a clone it was refused and lets it route around', async () => {
+    const harness = makePorts(
+      [
+        outcome({ responseText: inkTool('bash') }),
+        outcome({ responseText: `read it instead\n${inkTool('signal_status')}` }),
+      ],
+      (calls) =>
+        calls.map((c) =>
+          c.tool === 'bash'
+            ? blocked('bash')
+            : { tool: c.tool, result: signalResult('completed'), status: 'executed' }
+        )
+    );
+
+    const result = await runAgentLoop(
+      { prompt: 'go', toolRouting: 'local', continueOnBlocked: true },
+      harness.ports
+    );
+
+    expect(harness.prompts).toHaveLength(2);
+    expect(harness.prompts[1].isContinuation).toBe(true);
+    expect(harness.prompts[1].body).toContain('every one was refused');
+    expect(harness.prompts[1].body).toContain('Do not retry them');
+    expect(result.stopReason).toBe('terminal-signal');
+  });
+
+  it('gives up honestly when a clone keeps hitting the wall', async () => {
+    const harness = makePorts(
+      Array.from({ length: 5 }, () => outcome({ responseText: inkTool('bash') })),
+      () => [blocked('bash')]
+    );
+
+    const result = await runAgentLoop(
+      { prompt: 'go', toolRouting: 'local', continueOnBlocked: true, maxIterations: 3 },
+      harness.ports
+    );
+
+    // Bounded, and reported as refused rather than as a completed turn.
+    expect(result.iterations).toBe(3);
+    expect(result.stopReason).toBe('all-refused');
+  });
+
+  it('does not add the refusal note when something did run', async () => {
+    const body = buildContinuationBody(
+      [
+        { tool: 'read', result: 'contents', status: 'executed' },
+        { tool: 'bash', result: 'denied', status: 'blocked' },
+      ],
+      []
+    );
+    expect(body).not.toContain('every one was refused');
+  });
+});
