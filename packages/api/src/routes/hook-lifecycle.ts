@@ -110,9 +110,14 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
       // Hook-owned CLI turn signal: on-prompt opens the turn, and ONLY the
       // real on-stop closes it (post-compact 'idle' leaves it set — the same
       // turn resumes). Lease liveness reads this, so terminal APIs can never
-      // hide a live turn or resurrect a dead one. Legacy senders without the
-      // event field: infer prompt from lifecycle 'running' (safe — it only
-      // extends protection), never infer stop.
+      // hide a live turn or resurrect a dead one. The signal has no wall-time
+      // expiry; its crash recovery is the attach/detach boundary below — a
+      // NEW process attaching, or an explicit detach, is process proof that
+      // any prior turn's process is gone, so a stale open turn is cleared
+      // there. Legacy senders without the event field: infer prompt from
+      // lifecycle 'running' (safe — it only extends protection), never infer
+      // stop.
+      if (cliAttached !== undefined) updates.cliTurnAt = null;
       const isPromptEvent = event === 'prompt' || (!event && lifecycle === 'running');
       const isStopEvent = event === 'stop';
       if (isPromptEvent) updates.cliTurnAt = new Date().toISOString();

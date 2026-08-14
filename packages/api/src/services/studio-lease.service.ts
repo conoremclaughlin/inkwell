@@ -241,15 +241,21 @@ export class StudioLeaseService {
   /**
    * Is the session's process still executing in a worktree? Covers:
    *   - server-spawned runners (in-process registry)
-   *   - attached CLIs with the channel plugin (`cli_poll_at`, a fine-grained
-   *     heartbeat only the plugin stamps)
-   *   - attached CLIs WITHOUT the plugin (`cli_turn_at`, the hook-owned turn
-   *     signal: stamped by on-prompt, cleared only by the real on-stop —
-   *     terminal APIs never touch it, so a terminal write can neither
-   *     resurrect a dead flag nor hide a live turn)
-   * The turn signal is bounded by LEASE_STALE_MS so a CLI that crashed
-   * mid-turn stops blocking after the staleness window; the rescue stash
-   * protects its work if the lease is then reclaimed.
+   *   - CLIs with the channel plugin (`cli_poll_at`, a fine-grained heartbeat
+   *     only the plugin stamps)
+   *   - CLIs WITHOUT the plugin (`cli_turn_at`, the hook-owned turn signal:
+   *     stamped by on-prompt, cleared only by the real on-stop or an
+   *     attach/detach boundary — a NEW process attaching, or an explicit
+   *     detach, is process proof the prior turn's process is gone)
+   *
+   * Neither CLI signal is gated on `cli_attached` — terminal APIs clear that
+   * flag from inside a live turn, and it must not be able to hide one. The
+   * turn signal has NO wall-time expiry: it is a start marker, not a
+   * heartbeat, and a legitimate turn may run arbitrarily long. Crashed-turn
+   * recovery is the attach/detach boundary clearing it, never elapsed time.
+   *
+   * FAILS CLOSED: a liveness read that errors reports LIVE — "could not
+   * verify the holder is gone" must never authorize a release or reclaim.
    */
   async isSessionLive(sessionId: string, userId?: string): Promise<boolean> {
     if (hasActiveRun(sessionId)) return true;
@@ -258,12 +264,18 @@ export class StudioLeaseService {
       .select('cli_attached, cli_poll_at, cli_turn_at')
       .eq('id', sessionId);
     if (userId) query = query.eq('user_id', userId);
-    const { data } = await query.maybeSingle();
-    if (!data?.cli_attached) return false;
+    const { data, error } = await query.maybeSingle();
+    if (error) {
+      logger.warn('[StudioLease] Liveness read failed — treating session as LIVE (fail closed)', {
+        sessionId,
+        error: error.message,
+      });
+      return true;
+    }
+    if (!data) return false; // session row genuinely absent
     const polledAt = Date.parse(data.cli_poll_at ?? '');
     if (!Number.isNaN(polledAt) && Date.now() - polledAt < CLI_ATTACHED_FRESH_MS) return true;
-    const turnAt = Date.parse(data.cli_turn_at ?? '');
-    if (!Number.isNaN(turnAt) && Date.now() - turnAt < LEASE_STALE_MS) return true;
+    if (data.cli_turn_at) return true; // open turn — live until the real stop
     return false;
   }
 
@@ -280,11 +292,22 @@ export class StudioLeaseService {
     return this.isSessionTerminal(lease.sessionId, userId);
   }
 
-  /** Has the session durably ended? (ended_at stamped or status completed) */
+  /**
+   * Has the session durably ended? (ended_at stamped or status completed)
+   * FAILS CLOSED: a read error reports NOT terminal — "could not verify"
+   * must never count as terminal proof.
+   */
   async isSessionTerminal(sessionId: string, userId?: string): Promise<boolean> {
     let query = this.supabase.from('sessions').select('ended_at, status').eq('id', sessionId);
     if (userId) query = query.eq('user_id', userId);
-    const { data } = await query.maybeSingle();
+    const { data, error } = await query.maybeSingle();
+    if (error) {
+      logger.warn('[StudioLease] Terminality read failed — treating as NOT terminal', {
+        sessionId,
+        error: error.message,
+      });
+      return false;
+    }
     if (!data) return false;
     return Boolean(data.ended_at) || data.status === 'completed';
   }

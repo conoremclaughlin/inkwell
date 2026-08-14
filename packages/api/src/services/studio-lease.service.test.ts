@@ -284,26 +284,81 @@ describe('StudioLeaseService.acquire', () => {
   });
 
   it('treats the hook-owned turn signal as liveness for no-plugin CLIs (round 4)', async () => {
-    // cli_poll_at never set (no channel plugin) — cli_turn_at alone must keep
-    // the session live mid-turn, and a stale turn signal must not.
+    // cli_poll_at never set (no channel plugin) — an OPEN cli_turn_at alone
+    // keeps the session live mid-turn, with no wall-time expiry: it is a
+    // start marker, and a legitimate turn may run arbitrarily long (round 5).
     tables.studios[0].lease = staleLease({ sessionId: 'session-noplugin', threadKey: 'pr:999' });
     tables.sessions.push({
       id: 'session-noplugin',
       user_id: 'user-1',
       cli_attached: true,
       cli_poll_at: null,
-      cli_turn_at: new Date().toISOString(),
+      // Opened 45 minutes ago — well past LEASE_STALE_MS, still one turn.
+      cli_turn_at: new Date(Date.now() - 45 * 60 * 1000).toISOString(),
     });
 
     const mid = await service.acquire(req);
     expect(mid.acquired).toBe(false);
     expect((tables.studios[0].lease as StudioLease).sessionId).toBe('session-noplugin');
 
-    // Turn signal aged out (crashed CLI) — reclaim may proceed.
-    tables.sessions[0].cli_turn_at = new Date(Date.now() - LEASE_STALE_MS - 60_000).toISOString();
+    // The attach/detach boundary (or the real on-stop) cleared the marker —
+    // process proof the turn's process is gone. Reclaim may proceed.
+    tables.sessions[0].cli_turn_at = null;
     tables.studios[0].lease = staleLease({ sessionId: 'session-noplugin', threadKey: 'pr:999' });
     const after = await service.acquire(req);
     expect(after.acquired).toBe(true);
+  });
+
+  it('the turn signal survives end_session clearing cli_attached (round 5)', async () => {
+    // end_session clears cli_attached from inside the live turn; the open
+    // turn marker must keep the holder live regardless.
+    tables.studios[0].lease = staleLease({ sessionId: 'session-ending', threadKey: 'pr:999' });
+    tables.sessions.push({
+      id: 'session-ending',
+      user_id: 'user-1',
+      cli_attached: false, // cleared by end_session mid-turn
+      cli_poll_at: null,
+      cli_turn_at: new Date().toISOString(),
+      ended_at: new Date().toISOString(),
+    });
+
+    const result = await service.acquire(req);
+    expect(result.acquired).toBe(false);
+    expect((tables.studios[0].lease as StudioLease).sessionId).toBe('session-ending');
+  });
+
+  it('a failed liveness read fails CLOSED — never authorizes a reclaim (round 5)', async () => {
+    tables.studios[0].lease = staleLease({ threadKey: 'pr:999', sessionId: 'session-x' });
+    const erroringSupabase = {
+      from(table: string) {
+        if (table === 'sessions') {
+          return {
+            select: () => ({
+              eq() {
+                return this;
+              },
+              maybeSingle: () =>
+                Promise.resolve({ data: null, error: { message: 'connection reset' } }),
+            }),
+          };
+        }
+        return (makeFakeSupabase(tables) as { from: (t: string) => unknown }).from(table);
+      },
+    } as never;
+    const failingService = new StudioLeaseService(erroringSupabase);
+
+    const result = await failingService.acquire({
+      studioId: 'studio-1',
+      sessionId: 'session-b',
+      threadKey: 'pr:200',
+      agentId: 'wren',
+      userId: 'user-1',
+    });
+    expect(result.acquired).toBe(false);
+    // The stale holder was treated as live: renewed (or untouched), never
+    // claimed or stashed.
+    expect((tables.studios[0].lease as StudioLease).sessionId).toBe('session-x');
+    expect(tables.studio_lease_events.map((e) => e.event)).not.toContain('reclaimed');
   });
 
   it('refuses adoption from a fresh non-terminal holder — the admission gap (round 3)', async () => {
@@ -619,7 +674,9 @@ describe('StudioLeaseService release paths', () => {
 
   it('releaseUnlessRunning defers for an open no-plugin CLI turn (round 4)', async () => {
     Object.assign(tables.sessions[0], {
-      cli_attached: true,
+      // cli_attached already cleared by end_session — the open turn marker
+      // alone must defer (round 5: signals are not gated on the flag).
+      cli_attached: false,
       cli_poll_at: null,
       cli_turn_at: new Date().toISOString(), // on-prompt fired, no on-stop yet
     });

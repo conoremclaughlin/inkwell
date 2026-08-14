@@ -8,8 +8,12 @@
 
 import { z } from 'zod';
 import path from 'path';
-import { execSync } from 'child_process';
+import { execFile, execSync } from 'child_process';
+import { promisify } from 'util';
 import { existsSync } from 'fs';
+import { access } from 'fs/promises';
+
+const execFileAsync = promisify(execFile);
 import type { DataComposer } from '../../data/composer';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
 import { logger } from '../../utils/logger';
@@ -600,76 +604,100 @@ export async function handleCloseStudio(args: unknown, dataComposer: DataCompose
     );
   }
 
-  try {
-    // Remove the git worktree
-    if (removeWorktree) {
-      // Token revalidation immediately before destruction.
-      if (!(await leaseService.verifyClaim(studioId, closingUser.id, claim))) {
-        return errorResponse(`Studio ${studioId} teardown claim was lost; aborting close.`);
-      }
-      try {
-        execSync(`git worktree remove ${studio.worktreePath}`, {
-          cwd: studio.repoRoot,
-          stdio: 'pipe',
-        });
-        cleanupResults.worktreeRemoved = true;
-      } catch (worktreeError) {
-        const errorMessage =
-          worktreeError instanceof Error ? worktreeError.message : String(worktreeError);
-        logger.warn('Failed to remove worktree (may already be gone)', {
-          worktreePath: studio.worktreePath,
-          error: errorMessage,
-        });
-        cleanupResults.errors.push(`Worktree removal: ${errorMessage}`);
-      }
-      // Only a confirmed-absent worktree may be recorded as cleaned.
-      if (!cleanupResults.worktreeRemoved && existsSync(studio.worktreePath)) {
-        return errorResponse(
-          `Worktree removal failed and ${studio.worktreePath} still exists; studio NOT marked cleaned. Errors: ${cleanupResults.errors.join('; ')}`
-        );
-      }
-      cleanupResults.worktreeRemoved = true;
-    }
-
-    // Delete the branch
-    if (deleteBranch) {
-      try {
-        execSync(`git branch -d ${studio.branch}`, {
-          cwd: studio.repoRoot,
-          stdio: 'pipe',
-        });
-        cleanupResults.branchDeleted = true;
-      } catch (branchError) {
-        const errorMessage =
-          branchError instanceof Error ? branchError.message : String(branchError);
-        logger.warn('Failed to delete branch', {
-          branch: studio.branch,
-          error: errorMessage,
-        });
-        cleanupResults.errors.push(`Branch deletion: ${errorMessage}`);
-      }
-    }
-
-    // Mark as cleaned in the database (ownership verified above)
-    const updated = await studiosRepo.markCleaned(studioId);
-
-    logger.info('Studio closed', {
-      studioId,
-      agentId,
-      worktreeRemoved: cleanupResults.worktreeRemoved,
-      branchDeleted: cleanupResults.branchDeleted,
-    });
-
-    return successResponse({
-      message: 'Studio closed and marked as cleaned',
-      studioId: updated.id,
-      status: updated.status,
-      cleanedAt: updated.cleanedAt,
-      cleanup: cleanupResults,
-    });
-  } finally {
+  // Claim lifecycle: cleared ONLY when the studio ends in a coherent state —
+  // either nothing destructive happened (aborts below) or the cleaned state
+  // is durably recorded. If the worktree was removed but persistence failed,
+  // the claim STAYS so routing cannot acquire a studio whose cwd is gone.
+  const abortKeepingStudioUsable = async (message: string) => {
     await leaseService.clearTeardownClaim(studioId, closingUser.id, claim).catch(() => undefined);
+    return errorResponse(message);
+  };
+
+  // Remove the git worktree. Argument arrays (never shell interpolation —
+  // stored paths/branches must not reach a shell) and async exec/fs — this
+  // is a tool handler on the API server's single event loop.
+  if (removeWorktree) {
+    // Token revalidation immediately before destruction.
+    if (!(await leaseService.verifyClaim(studioId, closingUser.id, claim))) {
+      return errorResponse(`Studio ${studioId} teardown claim was lost; aborting close.`);
+    }
+    try {
+      await execFileAsync('git', ['worktree', 'remove', '--', studio.worktreePath], {
+        cwd: studio.repoRoot,
+      });
+      cleanupResults.worktreeRemoved = true;
+    } catch (worktreeError) {
+      const errorMessage =
+        worktreeError instanceof Error ? worktreeError.message : String(worktreeError);
+      logger.warn('Failed to remove worktree (may already be gone)', {
+        worktreePath: studio.worktreePath,
+        error: errorMessage,
+      });
+      cleanupResults.errors.push(`Worktree removal: ${errorMessage}`);
+    }
+    // Only a confirmed-absent worktree may be recorded as cleaned.
+    const stillPresent = await access(studio.worktreePath)
+      .then(() => true)
+      .catch(() => false);
+    if (!cleanupResults.worktreeRemoved && stillPresent) {
+      // Nothing was destroyed — the studio is still usable; free the claim.
+      return abortKeepingStudioUsable(
+        `Worktree removal failed and ${studio.worktreePath} still exists; studio NOT marked cleaned. Errors: ${cleanupResults.errors.join('; ')}`
+      );
+    }
+    cleanupResults.worktreeRemoved = true;
   }
+
+  // Delete the branch
+  if (deleteBranch) {
+    try {
+      await execFileAsync('git', ['branch', '-d', '--', studio.branch], {
+        cwd: studio.repoRoot,
+      });
+      cleanupResults.branchDeleted = true;
+    } catch (branchError) {
+      const errorMessage = branchError instanceof Error ? branchError.message : String(branchError);
+      logger.warn('Failed to delete branch', {
+        branch: studio.branch,
+        error: errorMessage,
+      });
+      cleanupResults.errors.push(`Branch deletion: ${errorMessage}`);
+    }
+  }
+
+  // Mark as cleaned in the database (ownership verified above). If this
+  // write fails AFTER the worktree was destroyed, the claim must survive —
+  // an active/vacant row pointing at a deleted cwd would be routable.
+  let updated;
+  try {
+    updated = await studiosRepo.markCleaned(studioId);
+  } catch (cleanErr) {
+    const message = cleanErr instanceof Error ? cleanErr.message : String(cleanErr);
+    logger.error(
+      '[StudioLease] close_studio destroyed the worktree but could not record cleaned; keeping teardown claim as quarantine',
+      { studioId, error: message }
+    );
+    return errorResponse(
+      `Studio ${studioId} worktree was removed but the cleaned state could not be recorded (${message}). The teardown claim is kept so nothing can route here; re-run close_studio to reconcile.`
+    );
+  }
+
+  await leaseService.clearTeardownClaim(studioId, closingUser.id, claim).catch(() => undefined);
+
+  logger.info('Studio closed', {
+    studioId,
+    agentId,
+    worktreeRemoved: cleanupResults.worktreeRemoved,
+    branchDeleted: cleanupResults.branchDeleted,
+  });
+
+  return successResponse({
+    message: 'Studio closed and marked as cleaned',
+    studioId: updated.id,
+    status: updated.status,
+    cleanedAt: updated.cleanedAt,
+    cleanup: cleanupResults,
+  });
 }
 
 export async function handleAdoptStudio(args: unknown, dataComposer: DataComposer) {
