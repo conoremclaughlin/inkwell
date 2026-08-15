@@ -76,6 +76,10 @@ export function parseInkModelUsage(raw: unknown): Record<string, ModelUsageTotal
       cacheReadTokens: fields.cacheReadTokens ?? 0,
       cacheWriteTokens: fields.cacheWriteTokens ?? 0,
       ...(fields.costUSD !== undefined ? { costUSD: fields.costUSD } : {}),
+      // The CLI already knows whether its per-run figure is complete — it saw
+      // every invocation. Dropping the marker here silently promoted a lower
+      // bound back to a total at the process boundary (Lumen, PR #500 round 4).
+      ...(entry.costPartial === true ? { costPartial: true } : {}),
       ...(typeof entry.canonicalModel === 'string' ? { canonicalModel: entry.canonicalModel } : {}),
     };
   }

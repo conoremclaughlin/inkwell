@@ -381,6 +381,40 @@ describe('parseInkModelUsage', () => {
     expect(freeTurn!['claude-opus-5'].costUSD).toBe(0);
   });
 
+  // The CLI is the only layer that sees every invocation of a run, so its
+  // completeness verdict is the authoritative one. Dropping it here promoted a
+  // lower bound back to a total at the process boundary (Lumen, PR #500 r4).
+  it('forwards the CLI cost-completeness marker across the boundary', () => {
+    const parsed = parseInkModelUsage({
+      'claude-opus-5': {
+        inputTokens: 10,
+        outputTokens: 20,
+        cacheReadTokens: 1_000,
+        cacheWriteTokens: 0,
+        costUSD: 0.01,
+        costPartial: true,
+        canonicalModel: 'claude-opus-5',
+      },
+    })!;
+
+    expect(parsed['claude-opus-5'].costUSD).toBeCloseTo(0.01);
+    expect(parsed['claude-opus-5'].costPartial).toBe(true);
+  });
+
+  it('does not invent a marker for a complete entry', () => {
+    const parsed = parseInkModelUsage({
+      'claude-opus-5': {
+        inputTokens: 10,
+        outputTokens: 20,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        costUSD: 0.01,
+      },
+    })!;
+
+    expect(parsed['claude-opus-5'].costPartial).toBeUndefined();
+  });
+
   it('carries the block through parseOutput into usage', () => {
     const runner = new InkRunner();
     const stdout = JSON.stringify({

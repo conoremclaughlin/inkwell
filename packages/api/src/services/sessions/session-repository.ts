@@ -91,6 +91,10 @@ function mergeModelUsage(
         if (priorCost === undefined && entryCost === undefined) return {};
         const partial =
           prior?.costPartial === true ||
+          // The incoming turn may ALREADY be a lower bound (the CLI summed a
+          // run whose invocations mixed reported and unreported cost). Reading
+          // only `prior` made a first such entry land as complete.
+          entry.costPartial === true ||
           (prior !== undefined && priorCost === undefined) ||
           entryCost === undefined;
         return {

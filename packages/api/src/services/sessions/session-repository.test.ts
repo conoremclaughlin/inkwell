@@ -815,6 +815,34 @@ describe('SessionRepository.updateTokenUsage — unreported cost', () => {
     expect(entry.costPartial).toBeUndefined();
   });
 
+  // No prior at all, but the incoming turn is itself a lower bound. Reading
+  // only `prior` landed it as complete (Lumen, PR #500 round 4).
+  it('respects an incoming partial marker on the first entry for a key', async () => {
+    const { supabase, lastUpdate } = createMockSupabase();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const repo = new SessionRepository(supabase as any);
+
+    await repo.updateTokenUsage('sess-1', {
+      inputTokens: 20,
+      outputTokens: 40,
+      modelUsage: {
+        'claude-opus-5': {
+          inputTokens: 20,
+          outputTokens: 40,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          costUSD: 0.01,
+          costPartial: true,
+        },
+      },
+    });
+
+    const entry = (lastUpdate.data?.metadata as Record<string, Record<string, ModelTotals>>)
+      .modelUsage['claude-opus-5'];
+    expect(entry.costUSD).toBeCloseTo(0.01);
+    expect(entry.costPartial).toBe(true);
+  });
+
   it('accumulates once a turn does report cost', async () => {
     const { supabase, lastUpdate, fakeRow } = createMockSupabase();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
