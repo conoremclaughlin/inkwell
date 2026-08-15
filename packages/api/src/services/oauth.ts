@@ -68,6 +68,23 @@ export interface TokenResponse {
   scope?: string;
 }
 
+/**
+ * A read-only view of how a provider call would fare right now, derived from
+ * stored account state. `reason` is null when the account looks usable.
+ */
+export interface ProviderAccountHealth {
+  /** 'active' means getValidAccessToken would hand back a usable token. */
+  state: 'active' | 'unusable' | 'missing';
+  /** The stored account status, when a row exists. */
+  accountStatus: 'active' | 'expired' | 'revoked' | 'error' | null;
+  reason: string | null;
+  lastError: string | null;
+  expiresAt: string | null;
+  lastUsedAt: string | null;
+  /** When the account row last changed — the age of this evidence. */
+  observedAt: string | null;
+}
+
 class OAuthService {
   private supabase: SupabaseClient;
 
@@ -436,6 +453,97 @@ class OAuthService {
     }
 
     return data ? this.mapToConnectedAccount(data) : null;
+  }
+
+  /**
+   * Inspect stored account state without refreshing tokens or calling the
+   * provider. The non-mutating twin of getValidAccessToken: it mirrors that
+   * method's account selection, so the answer describes the account a real call
+   * would actually use rather than any row that happens to exist.
+   *
+   * Never throws — a lookup failure reports as 'missing' with a reason, because
+   * a health check that explodes is worse than one that says "I can't tell".
+   */
+  async inspectAccountHealth(
+    userId: string,
+    provider: string,
+    workspaceId?: string | null
+  ): Promise<ProviderAccountHealth> {
+    const resolvedWorkspaceId = this.resolveWorkspaceId(workspaceId);
+
+    let query = this.supabase
+      .from('connected_accounts')
+      .select('status, last_error, expires_at, last_used_at, updated_at, refresh_token')
+      .eq('user_id', userId)
+      .eq('provider', provider);
+
+    if (resolvedWorkspaceId === null) {
+      query = query.is('workspace_id', null);
+    } else if (resolvedWorkspaceId) {
+      query = query.eq('workspace_id', resolvedWorkspaceId);
+    }
+
+    const { data: rows, error } = await query.order('updated_at', { ascending: false });
+
+    if (error) {
+      return {
+        state: 'missing',
+        accountStatus: null,
+        reason: `Could not read account state: ${error.message}`,
+        lastError: null,
+        expiresAt: null,
+        lastUsedAt: null,
+        observedAt: null,
+      };
+    }
+
+    if (!rows || rows.length === 0) {
+      return {
+        state: 'missing',
+        accountStatus: null,
+        reason: `No ${provider} account has been connected`,
+        lastError: null,
+        expiresAt: null,
+        lastUsedAt: null,
+        observedAt: null,
+      };
+    }
+
+    // getValidAccessToken filters on status='active', so an active row is the one
+    // a real call would pick. Only when none is active does the newest failed row
+    // explain why — matching the "No active <provider> account found" it throws.
+    const active = rows.find((row) => row.status === 'active');
+    const row = active ?? rows[0];
+
+    const base = {
+      accountStatus: row.status as ProviderAccountHealth['accountStatus'],
+      lastError: row.last_error ?? null,
+      expiresAt: row.expires_at ?? null,
+      lastUsedAt: row.last_used_at ?? null,
+      observedAt: row.updated_at ?? null,
+    };
+
+    if (!active) {
+      return {
+        ...base,
+        state: 'unusable',
+        reason: `No active ${provider} account found (stored status: ${row.status})`,
+      };
+    }
+
+    // An active row whose token has expired can only recover if it can refresh.
+    // Without a refresh token getValidAccessToken returns the stale token and the
+    // provider rejects it, so this is a real failure rather than a warning.
+    const expiresAt = row.expires_at ? new Date(row.expires_at).getTime() : null;
+    if (expiresAt !== null && expiresAt <= Date.now() && !row.refresh_token) {
+      return {
+        ...base,
+        state: 'unusable',
+        reason: 'Access token expired and no refresh token is stored',
+      };
+    }
+
+    return { ...base, state: 'active', reason: null };
   }
 
   /**
