@@ -35,9 +35,15 @@ vi.mock('fs/promises', async (importOriginal) => {
 
 const { createLogger } = await import('./logger');
 
-beforeEach(() => {
+beforeEach(async () => {
   appendFileSyncSpy.mockClear();
   appendFileSpy.mockClear();
+  // The mkdir mocks live in the module factory, so they accumulate calls
+  // across tests in this file unless cleared here too.
+  const fs = await import('fs');
+  const fsp = await import('fs/promises');
+  vi.mocked(fs.mkdirSync).mockClear();
+  vi.mocked(fsp.mkdir).mockClear();
 });
 
 describe('blocking-API contract', () => {
@@ -72,5 +78,25 @@ describe('blocking-API contract', () => {
 
     expect(appendFileSyncSpy).toHaveBeenCalledTimes(1);
     expect(appendFileSpy).not.toHaveBeenCalled();
+  });
+
+  it('directory creation on the hot path is async too', async () => {
+    // appendFile alone is not enough: writeOne also ensures the directory, and
+    // mkdirSync there would block on every line just as surely (Lumen, PR #499).
+    const fs = await import('fs');
+    const fsp = await import('fs/promises');
+    const logger = createLogger({ dir: '/tmp/ink-fake', file: '/tmp/ink-fake/plugin.log' });
+    logger.log('info', 'line');
+    await logger.flush();
+
+    expect(fsp.mkdir).toHaveBeenCalled();
+    expect(fs.mkdirSync).not.toHaveBeenCalled();
+  });
+
+  it('logSync() may use the sync directory call — it is off the hot path', () => {
+    const logger = createLogger({ dir: '/tmp/ink-fake', file: '/tmp/ink-fake/plugin.log' });
+    logger.logSync('error', 'Channel plugin crashed');
+    // Documents the asymmetry deliberately: sync is correct only here.
+    expect(appendFileSyncSpy).toHaveBeenCalledTimes(1);
   });
 });

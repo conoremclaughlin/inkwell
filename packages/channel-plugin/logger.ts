@@ -26,15 +26,25 @@
  */
 
 import { mkdirSync, appendFileSync } from 'fs';
-import { appendFile, mkdir, rename, stat } from 'fs/promises';
+import { appendFile, mkdir, open, readFile, rename, stat, unlink } from 'fs/promises';
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
 const LEVEL_RANK: Record<LogLevel, number> = { debug: 10, info: 20, warn: 30, error: 40 };
 
 export function isLogLevel(value: unknown): value is LogLevel {
-  return typeof value === 'string' && value in LEVEL_RANK;
+  // hasOwnProperty, not `in`: `in` walks the prototype chain, so 'toString',
+  // 'constructor' and '__proto__' all passed. The resulting rank was a
+  // function, every numeric comparison against it was false, and the gate
+  // silently opened to debug instead of falling back to info.
+  return typeof value === 'string' && Object.prototype.hasOwnProperty.call(LEVEL_RANK, value);
 }
+
+/** A rotation lock older than this is treated as abandoned by a dead process. */
+const LOCK_STALE_MS = 10_000;
+
+/** Disambiguates repeat acquisitions by the same pid. */
+let lockSeq = 0;
 
 export interface LoggerOptions {
   /** Directory holding the log file; created on demand. */
@@ -83,7 +93,10 @@ export function formatLine(
 
 export function createLogger(options: LoggerOptions): Logger {
   const { dir, file } = options;
-  const level = options.level ?? 'info';
+  // Validate rather than trust: an unrecognised level resolves to a non-numeric
+  // rank, which makes every gate comparison false and opens the log to debug —
+  // the opposite of a safe default. Callers outside TypeScript reach this too.
+  const level = isLogLevel(options.level) ? options.level : 'info';
   const minRank = LEVEL_RANK[level];
   const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
   const maxPending = options.maxPending ?? DEFAULT_MAX_PENDING;
@@ -92,8 +105,8 @@ export function createLogger(options: LoggerOptions): Logger {
   let chain: Promise<void> = Promise.resolve();
   let queued = 0;
   let dropped = 0;
-  /** Running size of the active file; null means "re-stat before writing". */
-  let approxBytes: number | null = null;
+
+  const lockPath = `${file}.lock`;
 
   async function sizeOf(path: string): Promise<number> {
     try {
@@ -103,35 +116,94 @@ export function createLogger(options: LoggerOptions): Logger {
     }
   }
 
-  /**
-   * Called when the pending line would push the file past the cap. Confirms
-   * against the real file first: if it is much smaller than the cap, a sibling
-   * process already rotated and we only need to re-sync our counter.
-   */
-  async function rotateIfStillOversized(): Promise<void> {
-    const actual = await sizeOf(file);
-    if (actual < maxBytes / 2) {
-      approxBytes = actual; // Someone else rotated — adopt the new file.
-      return;
-    }
+  async function claimLock(token: string): Promise<boolean> {
+    // 'wx' = O_CREAT|O_EXCL: atomic create-or-fail, the exclusion primitive.
+    const handle = await open(lockPath, 'wx');
     try {
-      await rename(file, `${file}.1`);
-      approxBytes = 0;
+      await handle.writeFile(token);
+    } finally {
+      await handle.close();
+    }
+    return true;
+  }
+
+  /**
+   * Cross-process rotation lock. Returns the token held, or null when another
+   * writer holds it — in which case the caller skips rotating rather than
+   * waiting; the sibling is already doing it.
+   */
+  async function acquireRotationLock(): Promise<string | null> {
+    const token = `${process.pid}:${(lockSeq += 1)}`;
+    try {
+      await claimLock(token);
+      return token;
     } catch {
-      // Lost the rename race (or the file vanished) — re-sync and carry on.
-      approxBytes = await sizeOf(file);
+      // Held. It may also be stale, left by a process that died mid-rotation.
+      try {
+        const info = await stat(lockPath);
+        if (Date.now() - info.mtimeMs > LOCK_STALE_MS) {
+          await unlink(lockPath);
+          await claimLock(token);
+          return token;
+        }
+      } catch {
+        // Lost the reclaim race — someone else got there first.
+      }
+      return null;
+    }
+  }
+
+  async function releaseRotationLock(token: string): Promise<void> {
+    try {
+      // Only remove OUR lock: if it was reclaimed as stale while we ran, the
+      // file now belongs to another rotation and must not be unlinked.
+      const held = await readFile(lockPath, 'utf-8');
+      if (held !== token) return;
+      await unlink(lockPath);
+    } catch {
+      // Already gone.
+    }
+  }
+
+  /**
+   * Rotate under cross-process exclusion.
+   *
+   * The stat and the rename MUST happen under the same lock. Unlocked, a
+   * writer that decided to rotate can have its rename land after a sibling
+   * already rotated and recreated the live file — renaming that fresh, nearly
+   * empty file over a full `.1` and destroying an entire generation. `rename`
+   * overwrites an existing target on POSIX, so nothing throws and no recovery
+   * path runs. Measured at 265/500 races before this lock (Lumen, PR #499).
+   */
+  async function rotateUnderLock(pendingBytes: number): Promise<void> {
+    const token = await acquireRotationLock();
+    // A sibling holds it and is rotating now. Appending anyway overshoots the
+    // cap by at most the lines in flight; the next write re-evaluates.
+    if (!token) return;
+    try {
+      // Re-stat under the lock — the pre-lock reading is already stale.
+      if ((await sizeOf(file)) + pendingBytes <= maxBytes) return;
+      await rename(file, `${file}.1`);
+    } catch {
+      // Rotation is best-effort; a failed rename must never lose the line.
+    } finally {
+      await releaseRotationLock(token);
     }
   }
 
   async function writeOne(line: string): Promise<void> {
     await mkdir(dir, { recursive: true });
-    if (approxBytes === null) approxBytes = await sizeOf(file);
-
     const size = Buffer.byteLength(line);
-    if (approxBytes + size > maxBytes) await rotateIfStillOversized();
+
+    // Size comes from the file itself on every write, never from a running
+    // per-instance counter. A counter only sees THIS process's bytes, so with
+    // N plugin processes sharing the path the shared file reached ~N x the cap
+    // before anyone rotated (Lumen, PR #499: .1 at 1852 bytes for a 1000 cap).
+    if ((await sizeOf(file)) + size > maxBytes) {
+      await rotateUnderLock(size);
+    }
 
     await appendFile(file, line);
-    approxBytes += size;
   }
 
   function enqueue(line: string): void {
@@ -145,8 +217,8 @@ export function createLogger(options: LoggerOptions): Logger {
         writeOne(line)
           .catch(() => {
             // Unwritable log (permissions, disk full) must never surface.
-            // Force a re-stat next time in case the situation changed.
-            approxBytes = null;
+            // Every write re-stats anyway, so there is no cached state to
+            // invalidate — the next line simply retries against the real file.
           })
           .finally(() => {
             queued -= 1;

@@ -48,6 +48,27 @@ describe('isLogLevel', () => {
     expect(isLogLevel('')).toBe(false);
     expect(isLogLevel(undefined)).toBe(false);
   });
+
+  it('rejects inherited Object property names', () => {
+    // `in` walks the prototype chain, so these all passed the old guard. The
+    // rank then resolved to a function, every numeric comparison against it
+    // was false, and INK_PLUGIN_LOG_LEVEL=toString silently opened the gate
+    // to debug instead of falling back to info (Lumen, PR #499 review).
+    for (const name of ['toString', 'constructor', 'valueOf', 'hasOwnProperty', '__proto__']) {
+      expect(isLogLevel(name)).toBe(false);
+    }
+  });
+
+  it('an inherited name falls back to info rather than enabling debug', async () => {
+    // End-to-end proof of the consequence, not just the predicate.
+    const logger = createLogger({ dir, file, level: 'toString' as never });
+    logger.log('debug', 'must-not-appear');
+    logger.log('info', 'must-appear');
+    await logger.flush();
+
+    expect(read(file)).not.toContain('must-not-appear');
+    expect(read(file)).toContain('must-appear');
+  });
 });
 
 describe('level gating', () => {
