@@ -216,6 +216,7 @@ const envSchema = z.object({
   DEFAULT_CLAUDE_MODEL: optionalString,
   DEFAULT_CODEX_MODEL: optionalString,
   DEFAULT_GEMINI_MODEL: optionalString,
+  DEFAULT_ANTIGRAVITY_MODEL: optionalString,
 });
 
 // Parse and validate environment variables

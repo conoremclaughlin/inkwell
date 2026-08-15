@@ -41,6 +41,7 @@ import {
   admitStateWrite,
 } from './active-runs.js';
 import { GeminiRunner } from './gemini-runner.js';
+import { AntigravityRunner } from './antigravity-runner.js';
 import { InkRunner } from './ink-runner.js';
 import { ActivityStreamRepository } from '../../data/repositories/activity-stream.repository.js';
 import { resolveIdentityId } from '../../auth/resolve-identity.js';
@@ -67,6 +68,9 @@ export interface SessionServiceConfig {
   defaultCodexModel?: string;
   /** Optional explicit model override for Gemini backend */
   defaultGeminiModel?: string;
+  defaultAntigravityModel?: string;
+  /** This server's own MCP endpoint, from the port the HTTP listener bound. */
+  inkMcpUrl?: string;
   /** Token threshold for triggering compaction */
   compactionThreshold: number;
   /** Callback to route responses from async operations (compaction, etc.) */
@@ -242,6 +246,7 @@ export class SessionService implements ISessionService {
   private claudeRunner: IRunner;
   private codexRunner: IRunner;
   private geminiRunner: IRunner;
+  private antigravityRunner: IRunner;
   private inkRunner: IRunner;
   private activityStream: IActivityStream;
   private config: SessionServiceConfig;
@@ -279,13 +284,15 @@ export class SessionService implements ISessionService {
     codexRunner?: IRunner,
     supabase?: SupabaseClient<Database>,
     geminiRunner?: IRunner,
-    inkRunner?: IRunner
+    inkRunner?: IRunner,
+    antigravityRunner?: IRunner
   ) {
     this.repository = repository;
     this.contextBuilder = contextBuilder;
     this.claudeRunner = claudeRunner;
     this.codexRunner = codexRunner || claudeRunner;
     this.geminiRunner = geminiRunner || claudeRunner;
+    this.antigravityRunner = antigravityRunner || claudeRunner;
     this.inkRunner = inkRunner || new InkRunner();
     this.activityStream = activityStream;
     this.config = { ...DEFAULT_CONFIG, ...config };
@@ -878,7 +885,9 @@ export class SessionService implements ISessionService {
         ? this.config.defaultCodexModel
         : modelKey === 'gemini'
           ? this.config.defaultGeminiModel
-          : this.config.defaultModel;
+          : modelKey === 'antigravity'
+            ? this.config.defaultAntigravityModel
+            : this.config.defaultModel;
 
     // Resolve sandbox_bypass: studio override > SB default > false
     let sandboxBypass = false;
@@ -939,6 +948,7 @@ export class SessionService implements ISessionService {
     const runnerConfig: ClaudeRunnerConfig = {
       workingDirectory: resolvedWorkingDirectory,
       mcpConfigPath: this.config.mcpConfigPath,
+      ...(this.config.inkMcpUrl ? { inkMcpUrl: this.config.inkMcpUrl } : {}),
       appendSystemPrompt: buildIdentityPrompt(
         agentId,
         injectedContext.agent.name,
@@ -987,14 +997,28 @@ export class SessionService implements ISessionService {
       );
     }
 
+    // Antigravity's MCP access depends on a bridge published at a HOST path and
+    // named in a HOST-global config file; neither exists inside the container,
+    // so agy would start and then run with no Ink tools at all. Refuse loudly
+    // rather than hand back a silently toolless agent. Staging the bridge into
+    // the container runtime dir is the fix, and is not done yet.
+    if (resolvedBackend === 'antigravity' && runnerConfig.container) {
+      throw new Error(
+        'antigravity backend cannot run inside a sandbox container yet — the MCP ' +
+          'bridge is staged on the host. Use claude-code or codex-cli for sandboxed strategies.'
+      );
+    }
+
     const runner =
       resolvedBackend === 'codex-cli'
         ? this.codexRunner
         : resolvedBackend === 'gemini'
           ? this.geminiRunner
-          : resolvedBackend === 'ink'
-            ? this.inkRunner
-            : this.claudeRunner;
+          : resolvedBackend === 'antigravity'
+            ? this.antigravityRunner
+            : resolvedBackend === 'ink'
+              ? this.inkRunner
+              : this.claudeRunner;
 
     // 5a. Log backend spawn to activity stream (fire-and-forget)
     const triggerSource = metadata?.triggerType as string | undefined;
@@ -2054,11 +2078,14 @@ This session will continue with a fresh context after compaction. Your identity,
           ? this.config.defaultCodexModel
           : compactionModelKey === 'gemini'
             ? this.config.defaultGeminiModel
-            : this.config.defaultModel;
+            : compactionModelKey === 'antigravity'
+              ? this.config.defaultAntigravityModel
+              : this.config.defaultModel;
 
       const runnerConfig: ClaudeRunnerConfig = {
         workingDirectory: compactionWorkingDirectory,
         mcpConfigPath: this.config.mcpConfigPath,
+        ...(this.config.inkMcpUrl ? { inkMcpUrl: this.config.inkMcpUrl } : {}),
         appendSystemPrompt: buildIdentityPrompt(
           session.agentId,
           context.agent.name,
@@ -2076,9 +2103,11 @@ This session will continue with a fresh context after compaction. Your identity,
           ? this.codexRunner
           : runtimeBackend === 'gemini'
             ? this.geminiRunner
-            : runtimeBackend === 'ink'
-              ? this.inkRunner
-              : this.claudeRunner;
+            : runtimeBackend === 'antigravity'
+              ? this.antigravityRunner
+              : runtimeBackend === 'ink'
+                ? this.inkRunner
+                : this.claudeRunner;
 
       // Phase 1: Send compaction prompt — agent saves context, notifies users, ends session
       const result = await runner.run(compactionPrompt, {
@@ -2119,10 +2148,12 @@ This session will continue with a fresh context after compaction. Your identity,
    */
   private normalizeBackend(
     raw: string | null | undefined
-  ): 'claude-code' | 'codex-cli' | 'gemini' | 'ink' {
+  ): 'claude-code' | 'codex-cli' | 'gemini' | 'antigravity' | 'ink' {
     const value = (raw || '').toLowerCase().trim();
     if (value === 'codex' || value === 'codex-cli') return 'codex-cli';
     if (value === 'gemini' || value === 'gemini-cli') return 'gemini';
+    if (value === 'antigravity' || value === 'antigravity-cli' || value === 'agy')
+      return 'antigravity';
     if (value === 'ink' || value === 'direct-api' || value === 'direct' || value === 'api')
       return 'ink';
     if (value === 'claude' || value === 'claude-code' || value === '') return 'claude-code';
@@ -2161,8 +2192,8 @@ This session will continue with a fresh context after compaction. Your identity,
     userId: string,
     agentId: string
   ): Promise<{
-    backend: 'claude-code' | 'codex-cli' | 'gemini' | 'ink';
-    provider: 'claude-code' | 'codex-cli' | 'gemini' | 'ink' | null;
+    backend: 'claude-code' | 'codex-cli' | 'gemini' | 'antigravity' | 'ink';
+    provider: 'claude-code' | 'codex-cli' | 'gemini' | 'antigravity' | 'ink' | null;
   }> {
     try {
       const { backend, provider } = await this.contextBuilder.getAgentBackend(userId, agentId);
@@ -2186,7 +2217,7 @@ This session will continue with a fresh context after compaction. Your identity,
   private resolveRuntimeBackend(
     sessionBackend: string | null | undefined,
     identityBackend: string | null | undefined
-  ): 'claude-code' | 'codex-cli' | 'gemini' | 'ink' {
+  ): 'claude-code' | 'codex-cli' | 'gemini' | 'antigravity' | 'ink' {
     if (sessionBackend) return this.normalizeBackend(sessionBackend);
     return this.normalizeBackend(identityBackend);
   }
@@ -2761,6 +2792,7 @@ export function createSessionService(
     new CodexRunner(),
     supabase,
     new GeminiRunner(),
-    new InkRunner()
+    new InkRunner(),
+    new AntigravityRunner()
   );
 }
