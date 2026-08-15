@@ -365,6 +365,15 @@ describe('parseInkModelUsage', () => {
     expect(parseInkModelUsage(undefined)).toBeUndefined();
     expect(parseInkModelUsage({})).toBeUndefined();
     expect(parseInkModelUsage('nonsense')).toBeUndefined();
+    // Entries with nothing numeric are unreadable, not free: a present
+    // zero-cost map would read as a measured $0.00 (Lumen, PR #500 round 1).
+    expect(
+      parseInkModelUsage({ 'claude-opus-5': { inputTokens: 'lots', costUSD: null } })
+    ).toBeUndefined();
+    // A partially-readable entry still counts — only the unusable parts zero.
+    const partial = parseInkModelUsage({ 'claude-opus-5': { outputTokens: 12 } });
+    expect(partial!['claude-opus-5'].outputTokens).toBe(12);
+    expect(partial!['claude-opus-5'].costUSD).toBe(0);
   });
 
   it('carries the block through parseOutput into usage', () => {

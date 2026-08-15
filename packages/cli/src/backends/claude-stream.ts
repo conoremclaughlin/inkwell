@@ -61,12 +61,24 @@ function toModelUsage(raw: unknown): Record<string, BackendModelUsage> | undefin
   for (const [model, value] of Object.entries(raw as Record<string, unknown>)) {
     if (!value || typeof value !== 'object') continue;
     const entry = value as Record<string, unknown>;
+    const fields = {
+      inputTokens: num(entry.inputTokens),
+      outputTokens: num(entry.outputTokens),
+      cacheReadTokens: num(entry.cacheReadInputTokens),
+      cacheWriteTokens: num(entry.cacheCreationInputTokens),
+      costUSD: num(entry.costUSD),
+    };
+    // An entry with nothing numeric in it is unreadable, not a free turn.
+    // Coercing it to zeros would publish "this model cost nothing" as though
+    // it were measured — the same false certainty this whole accounting arc
+    // exists to remove (Lumen, PR #500 round 1).
+    if (Object.values(fields).every((v) => v === undefined)) continue;
     out[model] = {
-      inputTokens: num(entry.inputTokens) ?? 0,
-      outputTokens: num(entry.outputTokens) ?? 0,
-      cacheReadTokens: num(entry.cacheReadInputTokens) ?? 0,
-      cacheWriteTokens: num(entry.cacheCreationInputTokens) ?? 0,
-      costUSD: num(entry.costUSD) ?? 0,
+      inputTokens: fields.inputTokens ?? 0,
+      outputTokens: fields.outputTokens ?? 0,
+      cacheReadTokens: fields.cacheReadTokens ?? 0,
+      cacheWriteTokens: fields.cacheWriteTokens ?? 0,
+      costUSD: fields.costUSD ?? 0,
       ...(typeof entry.canonicalModel === 'string' ? { canonicalModel: entry.canonicalModel } : {}),
     };
   }

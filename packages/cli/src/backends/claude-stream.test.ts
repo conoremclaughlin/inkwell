@@ -275,3 +275,85 @@ describe('ClaudeStreamParser', () => {
     });
   });
 });
+
+/**
+ * Reaches the RAW stream mapping, not a mock downstream of it: this line is a
+ * real `result` event captured verbatim from Claude Code 2.1.233 (trimmed to
+ * the fields under test), pushed through the parser exactly as stdout arrives.
+ * The integration boundary tests start after toModelUsage, so without this the
+ * mapping itself was uncovered (Lumen, PR #500 round 1).
+ */
+describe('modelUsage from a real captured result line', () => {
+  const REAL_RESULT_LINE = JSON.stringify({
+    type: 'result',
+    subtype: 'success',
+    result: '',
+    usage: {
+      input_tokens: 9,
+      output_tokens: 68,
+      cache_read_input_tokens: 18134,
+      cache_creation_input_tokens: 7443,
+    },
+    modelUsage: {
+      'claude-haiku-4-5-20251001': {
+        inputTokens: 520,
+        outputTokens: 12,
+        cacheReadInputTokens: 0,
+        cacheCreationInputTokens: 0,
+        costUSD: 0.00058,
+        canonicalModel: 'claude-haiku-4-5',
+        provider: 'firstParty',
+      },
+      'claude-haiku-4-5': {
+        inputTokens: 9,
+        outputTokens: 68,
+        cacheReadInputTokens: 18134,
+        cacheCreationInputTokens: 7443,
+        costUSD: 0.0170484,
+        canonicalModel: 'claude-haiku-4-5',
+        provider: 'firstParty',
+      },
+    },
+  });
+
+  it('maps Claude camelCase per-model fields, cost included', () => {
+    const parser = new ClaudeStreamParser();
+    const events = parser.push(REAL_RESULT_LINE + '\n');
+    const result = events.find((e) => e.kind === 'result');
+
+    const modelUsage = result?.usage?.modelUsage;
+    expect(modelUsage).toBeDefined();
+    expect(modelUsage!['claude-haiku-4-5'].costUSD).toBeCloseTo(0.0170484);
+    expect(modelUsage!['claude-haiku-4-5'].cacheReadTokens).toBe(18134);
+    expect(modelUsage!['claude-haiku-4-5'].cacheWriteTokens).toBe(7443);
+    expect(modelUsage!['claude-haiku-4-5-20251001'].costUSD).toBeCloseTo(0.00058);
+  });
+
+  // The same run reports a dated id AND its alias with the SAME canonicalModel
+  // but different usage — distinct call sites, not duplicates. Merging them
+  // here would invent a total the backend never reported.
+  it('keeps both reported keys, unmerged', () => {
+    const parser = new ClaudeStreamParser();
+    const result = parser.push(REAL_RESULT_LINE + '\n').find((e) => e.kind === 'result');
+
+    expect(Object.keys(result!.usage!.modelUsage!).sort()).toEqual([
+      'claude-haiku-4-5',
+      'claude-haiku-4-5-20251001',
+    ]);
+  });
+
+  // A block whose entries carry nothing numeric is unreadable, not free.
+  it('leaves modelUsage absent when no entry has a usable number', () => {
+    const parser = new ClaudeStreamParser();
+    const line = JSON.stringify({
+      type: 'result',
+      subtype: 'success',
+      result: '',
+      usage: { input_tokens: 1, output_tokens: 1 },
+      modelUsage: { 'claude-opus-5': { inputTokens: 'lots', costUSD: null } },
+    });
+    const result = parser.push(line + '\n').find((e) => e.kind === 'result');
+
+    expect(result!.usage!.modelUsage).toBeUndefined();
+  });
+});

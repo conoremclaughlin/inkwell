@@ -58,12 +58,24 @@ export function parseInkModelUsage(raw: unknown): Record<string, ModelUsageTotal
   for (const [model, value] of Object.entries(raw as Record<string, unknown>)) {
     if (!value || typeof value !== 'object') continue;
     const entry = value as Record<string, unknown>;
+    const numeric = (v: unknown): number | undefined =>
+      typeof v === 'number' && Number.isFinite(v) ? v : undefined;
+    const fields = {
+      inputTokens: numeric(entry.inputTokens),
+      outputTokens: numeric(entry.outputTokens),
+      cacheReadTokens: numeric(entry.cacheReadTokens),
+      cacheWriteTokens: numeric(entry.cacheWriteTokens),
+      costUSD: numeric(entry.costUSD),
+    };
+    // Unreadable entries stay absent rather than becoming zeros — a zero cost
+    // reads as measured, and "we don't know" is the honest value.
+    if (Object.values(fields).every((v) => v === undefined)) continue;
     out[model] = {
-      inputTokens: Number(entry.inputTokens) || 0,
-      outputTokens: Number(entry.outputTokens) || 0,
-      cacheReadTokens: Number(entry.cacheReadTokens) || 0,
-      cacheWriteTokens: Number(entry.cacheWriteTokens) || 0,
-      costUSD: Number(entry.costUSD) || 0,
+      inputTokens: fields.inputTokens ?? 0,
+      outputTokens: fields.outputTokens ?? 0,
+      cacheReadTokens: fields.cacheReadTokens ?? 0,
+      cacheWriteTokens: fields.cacheWriteTokens ?? 0,
+      costUSD: fields.costUSD ?? 0,
       ...(typeof entry.canonicalModel === 'string' ? { canonicalModel: entry.canonicalModel } : {}),
     };
   }
