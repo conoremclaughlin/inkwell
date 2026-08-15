@@ -20,6 +20,7 @@
  *   INK_POLL_INTERVAL_MS — Poll interval in ms (default: 10000)
  *   INK_PLUGIN_LOG_LEVEL — debug | info | warn | error (default: info)
  *   INK_PLUGIN_LOG_MAX_BYTES — rotate the log past this size (default: 10485760)
+ *   INK_PLUGIN_LOG_RETENTION_DAYS — sweep dead processes' logs older than this (default: 7)
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -28,19 +29,27 @@ import { readFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import { createThreadDrainState, drainThreads } from './poll-core.js';
-import { createLogger, isLogLevel, type LogLevel } from './logger.js';
+import { createLogger, isLogLevel, logFileFor, sweepStaleLogs, type LogLevel } from './logger.js';
 
 // ─── Logging ────────────────────────────────────────────────
-// Logs to ~/.ink/logs/channel-plugin.log for debugging.
+// Logs to ~/.ink/logs/channel-plugin/<pid>.log for debugging.
 // Cannot use stdout (reserved for MCP stdio transport).
 // Async + level-gated + size-capped — see logger.ts for why each matters.
+//
+// ONE FILE PER PROCESS, not one shared file. Every live Claude Code session
+// runs a plugin, and a shared file put rotation on a concurrent path where it
+// kept losing a generation to races. Per-process files make rotation
+// single-writer again. Tail them together: ~/.ink/logs/channel-plugin/*.log
+//
+// Dead processes' logs are swept at startup so the directory stays bounded.
 
-const LOG_DIR = join(homedir(), '.ink', 'logs');
-const LOG_FILE = join(LOG_DIR, 'channel-plugin.log');
+const LOG_DIR = join(homedir(), '.ink', 'logs', 'channel-plugin');
+const LOG_FILE = join(LOG_DIR, logFileFor());
 
 const configuredLevel = process.env.INK_PLUGIN_LOG_LEVEL;
 const LOG_LEVEL: LogLevel = isLogLevel(configuredLevel) ? configuredLevel : 'info';
 const LOG_MAX_BYTES = parseInt(process.env.INK_PLUGIN_LOG_MAX_BYTES || '10485760', 10);
+const LOG_RETENTION_DAYS = parseInt(process.env.INK_PLUGIN_LOG_RETENTION_DAYS || '7', 10);
 
 const logger = createLogger({
   dir: LOG_DIR,
@@ -428,6 +437,16 @@ async function clearCliAttached(): Promise<void> {
 }
 
 async function main(): Promise<void> {
+  // Bound the log directory: drop dead processes' logs past the retention
+  // window. Fire-and-forget — a sweep failure must never delay startup.
+  const retentionDays =
+    Number.isFinite(LOG_RETENTION_DAYS) && LOG_RETENTION_DAYS > 0 ? LOG_RETENTION_DAYS : 7;
+  void sweepStaleLogs({ dir: LOG_DIR, maxAgeMs: retentionDays * 24 * 60 * 60 * 1000 })
+    .then((removed) => {
+      if (removed.length) log('info', 'Swept stale plugin logs', { count: removed.length });
+    })
+    .catch(() => {});
+
   log('info', 'Connecting MCP stdio transport');
   await mcp.connect(new StdioServerTransport());
   log('info', 'MCP connected, starting poll loop');

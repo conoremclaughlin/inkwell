@@ -11,22 +11,47 @@
  *    write would simply be lost.
  *
  * 2. **Level-gated.** Default `info`. The per-tick `Poll result` line is
- *    `debug` and is what made the shared log grow ~35k lines/day across four
- *    plugins. Set `INK_PLUGIN_LOG_LEVEL=debug` to get it back.
+ *    `debug` and is what made the log grow ~35k lines/day across four plugins.
+ *    Set `INK_PLUGIN_LOG_LEVEL=debug` to get it back.
  *
  * 3. **Size-capped.** Rotates to `<file>.1` past `maxBytes`, keeping one
  *    generation. Before this the file was uncapped (it reached 292MB).
  *
- * Multi-writer note: every plugin process appends to the same path, so this
- * deliberately holds NO long-lived file descriptor. `appendFile` resolves the
- * path on every write, which means a process whose file was rotated away by a
- * sibling immediately starts writing to the new file instead of pinning the
- * renamed inode forever. Rotation itself is still racy between processes; the
- * loser detects the smaller file and re-syncs rather than clobbering it.
+ * ## One writer per file — the invariant everything else rests on
+ *
+ * Each plugin process logs to its OWN file (`<pid>.log`); nothing is shared.
+ * This is deliberate and was arrived at the hard way. The first two versions
+ * had all four plugin processes appending to one path, which put rotation on a
+ * concurrent path and produced three separate P1 defects in review (Lumen,
+ * PR #499):
+ *
+ *   1. stat→rename was a cross-writer TOCTOU: a losing writer renamed a
+ *      sibling's freshly recreated live file over a full `.1`, destroying a
+ *      generation. `rename` overwrites on POSIX, so nothing threw.
+ *   2. a per-instance byte counter could not see sibling appends, so the
+ *      shared file grew to roughly N x the cap.
+ *   3. the lockfile added to fix (1) had its own hole: several writers could
+ *      observe the same stale lock, and a delayed reclaimer would unlink a
+ *      lease another writer had already taken fresh — two owners, and the
+ *      generation clobber returned (measured 4/5000 rounds).
+ *
+ * Each fix was locally correct and the next round found another hole, because
+ * the shared file made rotation a distributed-consensus problem for a debug
+ * log. Per-process files delete the problem instead of coordinating around it:
+ * no lock, no lease, no reclaim, no fencing. Rotation is a single-writer
+ * operation again, which is the only reason it can be simple.
+ *
+ * Cost: N files instead of one, bounded by `sweepStaleLogs` at startup. Worth
+ * it — and interleaved output from four pollers was never readable anyway,
+ * since you could not tell which process emitted a line.
+ *
+ * Callers MUST NOT point two loggers at one path. The module does not defend
+ * against it; `logFileFor` exists so nobody has to hand-roll the name.
  */
 
 import { mkdirSync, appendFileSync } from 'fs';
-import { appendFile, mkdir, open, readFile, rename, stat, unlink } from 'fs/promises';
+import { appendFile, mkdir, readdir, rename, stat, unlink } from 'fs/promises';
+import { join } from 'path';
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
@@ -40,20 +65,19 @@ export function isLogLevel(value: unknown): value is LogLevel {
   return typeof value === 'string' && Object.prototype.hasOwnProperty.call(LEVEL_RANK, value);
 }
 
-/** A rotation lock older than this is treated as abandoned by a dead process. */
-const LOCK_STALE_MS = 10_000;
-
-/** Disambiguates repeat acquisitions by the same pid. */
-let lockSeq = 0;
+/** The per-process log file name. One writer per file is the core invariant. */
+export function logFileFor(pid: number = process.pid): string {
+  return `${pid}.log`;
+}
 
 export interface LoggerOptions {
   /** Directory holding the log file; created on demand. */
   dir: string;
-  /** Absolute path of the active log file. */
+  /** Absolute path of this process's log file. Must not be shared. */
   file: string;
   /** Minimum level written. Default 'info'. */
   level?: LogLevel;
-  /** Rotate once the active file would exceed this size. Default 10MB. */
+  /** Rotate once the file would exceed this size. Default 10MB. */
   maxBytes?: number;
   /** Cap on lines queued behind the write chain. Default 1000. */
   maxPending?: number;
@@ -91,6 +115,65 @@ export function formatLine(
   return `${ts} [${level}] ${message} ${encoded}\n`;
 }
 
+/** True when a pid belongs to a running process (EPERM still means alive). */
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException)?.code === 'EPERM';
+  }
+}
+
+export interface SweepOptions {
+  dir: string;
+  /** Delete logs untouched for longer than this. */
+  maxAgeMs: number;
+  /** Never delete this process's own files. */
+  keepPid?: number;
+  now?: number;
+}
+
+/**
+ * Startup cleanup for per-process logs. Deletes only files older than the
+ * retention window whose owning process is gone, so a quiet-but-live session's
+ * log is never pulled out from under it. Best effort throughout: a log sweep
+ * must never prevent the plugin from starting.
+ *
+ * Returns the files removed (for tests and diagnostics).
+ */
+export async function sweepStaleLogs(options: SweepOptions): Promise<string[]> {
+  const { dir, maxAgeMs, keepPid = process.pid, now = Date.now() } = options;
+  const removed: string[] = [];
+  let entries: string[];
+  try {
+    entries = await readdir(dir);
+  } catch {
+    return removed; // No directory yet — nothing to sweep.
+  }
+
+  for (const entry of entries) {
+    // Matches "<pid>.log" and its rotated "<pid>.log.1".
+    const match = /^(\d+)\.log(\.1)?$/.exec(entry);
+    if (!match) continue;
+
+    const pid = Number(match[1]);
+    if (pid === keepPid) continue;
+    if (pidAlive(pid)) continue;
+
+    const path = join(dir, entry);
+    try {
+      const info = await stat(path);
+      if (now - info.mtimeMs <= maxAgeMs) continue;
+      await unlink(path);
+      removed.push(entry);
+    } catch {
+      // Vanished, unreadable, or raced with another sweep — all fine.
+    }
+  }
+  return removed;
+}
+
 export function createLogger(options: LoggerOptions): Logger {
   const { dir, file } = options;
   // Validate rather than trust: an unrecognised level resolves to a non-numeric
@@ -106,8 +189,6 @@ export function createLogger(options: LoggerOptions): Logger {
   let queued = 0;
   let dropped = 0;
 
-  const lockPath = `${file}.lock`;
-
   async function sizeOf(path: string): Promise<number> {
     try {
       return (await stat(path)).size;
@@ -116,91 +197,20 @@ export function createLogger(options: LoggerOptions): Logger {
     }
   }
 
-  async function claimLock(token: string): Promise<boolean> {
-    // 'wx' = O_CREAT|O_EXCL: atomic create-or-fail, the exclusion primitive.
-    const handle = await open(lockPath, 'wx');
-    try {
-      await handle.writeFile(token);
-    } finally {
-      await handle.close();
-    }
-    return true;
-  }
-
-  /**
-   * Cross-process rotation lock. Returns the token held, or null when another
-   * writer holds it — in which case the caller skips rotating rather than
-   * waiting; the sibling is already doing it.
-   */
-  async function acquireRotationLock(): Promise<string | null> {
-    const token = `${process.pid}:${(lockSeq += 1)}`;
-    try {
-      await claimLock(token);
-      return token;
-    } catch {
-      // Held. It may also be stale, left by a process that died mid-rotation.
-      try {
-        const info = await stat(lockPath);
-        if (Date.now() - info.mtimeMs > LOCK_STALE_MS) {
-          await unlink(lockPath);
-          await claimLock(token);
-          return token;
-        }
-      } catch {
-        // Lost the reclaim race — someone else got there first.
-      }
-      return null;
-    }
-  }
-
-  async function releaseRotationLock(token: string): Promise<void> {
-    try {
-      // Only remove OUR lock: if it was reclaimed as stale while we ran, the
-      // file now belongs to another rotation and must not be unlinked.
-      const held = await readFile(lockPath, 'utf-8');
-      if (held !== token) return;
-      await unlink(lockPath);
-    } catch {
-      // Already gone.
-    }
-  }
-
-  /**
-   * Rotate under cross-process exclusion.
-   *
-   * The stat and the rename MUST happen under the same lock. Unlocked, a
-   * writer that decided to rotate can have its rename land after a sibling
-   * already rotated and recreated the live file — renaming that fresh, nearly
-   * empty file over a full `.1` and destroying an entire generation. `rename`
-   * overwrites an existing target on POSIX, so nothing throws and no recovery
-   * path runs. Measured at 265/500 races before this lock (Lumen, PR #499).
-   */
-  async function rotateUnderLock(pendingBytes: number): Promise<void> {
-    const token = await acquireRotationLock();
-    // A sibling holds it and is rotating now. Appending anyway overshoots the
-    // cap by at most the lines in flight; the next write re-evaluates.
-    if (!token) return;
-    try {
-      // Re-stat under the lock — the pre-lock reading is already stale.
-      if ((await sizeOf(file)) + pendingBytes <= maxBytes) return;
-      await rename(file, `${file}.1`);
-    } catch {
-      // Rotation is best-effort; a failed rename must never lose the line.
-    } finally {
-      await releaseRotationLock(token);
-    }
-  }
-
   async function writeOne(line: string): Promise<void> {
     await mkdir(dir, { recursive: true });
     const size = Buffer.byteLength(line);
 
-    // Size comes from the file itself on every write, never from a running
-    // per-instance counter. A counter only sees THIS process's bytes, so with
-    // N plugin processes sharing the path the shared file reached ~N x the cap
-    // before anyone rotated (Lumen, PR #499: .1 at 1852 bytes for a 1000 cap).
+    // Sole writer, so stat→rename needs no coordination: nothing else can
+    // rotate this file or append between the two calls. Size still comes from
+    // the file rather than a counter, which keeps this correct across a
+    // restart that inherits an existing file (and across pid reuse).
     if ((await sizeOf(file)) + size > maxBytes) {
-      await rotateUnderLock(size);
+      try {
+        await rename(file, `${file}.1`);
+      } catch {
+        // Rotation is best-effort; a failed rename must never lose the line.
+      }
     }
 
     await appendFile(file, line);
