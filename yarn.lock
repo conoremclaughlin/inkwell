@@ -1877,7 +1877,6 @@ __metadata:
     "@types/jsonwebtoken": "npm:^9.0.5"
     "@types/node": "npm:^20.10.6"
     "@types/node-cron": "npm:^3.0.11"
-    "@types/proper-lockfile": "npm:^4.1.4"
     "@types/qrcode": "npm:^1.5.6"
     "@typescript-eslint/eslint-plugin": "npm:^6.17.0"
     "@typescript-eslint/parser": "npm:^6.17.0"
@@ -1900,7 +1899,6 @@ __metadata:
     node-cron: "npm:^4.2.1"
     node-diff3: "npm:^3.2.0"
     pdf-parse: "npm:^2.4.5"
-    proper-lockfile: "npm:^4.1.2"
     qrcode: "npm:^1.5.4"
     qrcode-terminal: "npm:^0.12.0"
     telegraf: "npm:^4.15.0"
@@ -5887,15 +5885,6 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@types/proper-lockfile@npm:^4.1.4":
-  version: 4.1.4
-  resolution: "@types/proper-lockfile@npm:4.1.4"
-  dependencies:
-    "@types/retry": "npm:*"
-  checksum: 10/b0d1b8e84a563b2c5f869f7ff7542b1d83dec03d1c9d980847cbb189865f44b4a854673cdde59767e41bcb8c31932e613ac43822d358a6f8eede6b79ccfceb1d
-  languageName: node
-  linkType: hard
-
 "@types/qrcode@npm:^1.5.6":
   version: 1.5.6
   resolution: "@types/qrcode@npm:1.5.6"
@@ -5943,13 +5932,6 @@ __metadata:
   dependencies:
     csstype: "npm:^3.2.2"
   checksum: 10/fbff239089ee64b6bd9b00543594db498278b06de527ef1b0f71bb0eb09cc4445a71b5dd3c0d3d0257255c4eed94406be40a74ad4a987ade8a8d5dd65c82bc5f
-  languageName: node
-  linkType: hard
-
-"@types/retry@npm:*":
-  version: 0.12.5
-  resolution: "@types/retry@npm:0.12.5"
-  checksum: 10/3fb6bf91835ca0eb2987567d6977585235a7567f8aeb38b34a8bb7bbee57ac050ed6f04b9998cda29701b8c893f5dfe315869bc54ac17e536c9235637fe351a2
   languageName: node
   linkType: hard
 

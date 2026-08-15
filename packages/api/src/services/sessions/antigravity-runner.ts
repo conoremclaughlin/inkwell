@@ -25,8 +25,7 @@
 
 import { spawn, type ChildProcess } from 'child_process';
 import { createHash } from 'crypto';
-import lockfile from 'proper-lockfile';
-import { chmod, mkdir, readFile, rename, writeFile } from 'fs/promises';
+import { chmod, mkdir, readFile, rename, rm, writeFile } from 'fs/promises';
 import { join, dirname } from 'path';
 import { homedir } from 'os';
 import type {
@@ -204,18 +203,6 @@ export async function resolveInkMcpUrl(config: ClaudeRunnerConfig): Promise<stri
   return 'http://localhost:3001/mcp';
 }
 
-/** True when the config already names exactly this inkwell entry. */
-async function inkEntryMatches(configPath: string, desired: unknown): Promise<boolean> {
-  try {
-    const raw = await readFile(configPath, 'utf-8');
-    if (!raw.trim()) return false;
-    const parsed = JSON.parse(raw) as { mcpServers?: Record<string, unknown> };
-    return JSON.stringify(parsed.mcpServers?.[INK_SERVER_KEY]) === JSON.stringify(desired);
-  } catch {
-    return false;
-  }
-}
-
 /**
  * Unique scratch name for a temp-then-rename publish.
  *
@@ -230,79 +217,67 @@ function scratchPath(target: string): string {
 }
 
 /**
- * How long before an unrefreshed lock counts as abandoned, and how hard to wait.
- * proper-lockfile refreshes the mtime while the owner holds it, so `stale` only
- * elapses for a process that actually died.
- */
-const LOCK_STALE_MS = 30_000;
-const LOCK_RETRIES = { retries: 10, minTimeout: 50, maxTimeout: 500 } as const;
-
-/**
- * How often the owner refreshes its lock's mtime.
+ * Why there is no mutex here.
  *
- * proper-lockfile defaults this to stale/2 — 15s here — which is also how long
- * a robbed owner would keep writing before noticing. Our critical section is a
- * couple of file operations, so the timer almost never fires at all; paying for
- * a stat every second while actually holding the lock buys prompt detection.
+ * Four attempts at one failed the same way: POSIX has no atomic
+ * compare-and-delete, so every "check who owns the lock, then remove it" scheme
+ * leaves a window — and proper-lockfile's mtime heartbeat cannot see a lock
+ * stolen and replaced between two ticks, which is exactly our case, because
+ * this critical section is two file operations and finishes well inside one.
+ *
+ * The deeper problem is that the lock guarded a conflict that no longer exists
+ * and could never guard the one that does. Since the launcher became
+ * version-invariant, every Ink server writes an IDENTICAL inkwell entry, so
+ * Ink-versus-Ink is not a conflict at all. The remaining risk is a third party
+ * — a human editing this file, or agy itself — and those writers never take our
+ * lock, so no amount of locking constrains them.
+ *
+ * So: no lock. Read, merge, re-read to confirm the base did not move, publish
+ * by atomic rename, then verify our entry actually landed and retry if not.
+ * Every writer wants the same entry, so the loop converges. The residual window
+ * is between the confirming re-read and the rename — one syscall, and one a
+ * mutex would not have closed against a non-participating writer anyway.
  */
-const LOCK_UPDATE_MS = 1_000;
+const CONFIG_WRITE_ATTEMPTS = 5;
 
-/** Raised when the lock was taken from us mid-write; the caller must not claim success. */
-export class LockCompromisedError extends Error {
-  constructor(cause: unknown) {
-    super(`Ink MCP config lock was compromised: ${String(cause)}`);
-    this.name = 'LockCompromisedError';
+interface ConfigSnapshot {
+  /** False only when the file exists but cannot be read or parsed. */
+  readable: boolean;
+  /** Exact bytes, used to detect that the base moved under us. */
+  raw: string;
+  value: { mcpServers?: Record<string, unknown> };
+}
+
+export async function readConfigSnapshot(configPath: string): Promise<ConfigSnapshot> {
+  let raw: string;
+  try {
+    raw = await readFile(configPath, 'utf-8');
+  } catch (error) {
+    // Absent is normal; anything else means we cannot see the file.
+    const code = (error as NodeJS.ErrnoException).code;
+    return { readable: code === 'ENOENT', raw: '', value: {} };
+  }
+
+  if (!raw.trim()) return { readable: true, raw, value: {} };
+
+  try {
+    return {
+      readable: true,
+      raw,
+      value: JSON.parse(raw) as { mcpServers?: Record<string, unknown> },
+    };
+  } catch {
+    // Present but unparseable. Treating this as {} would erase every other MCP
+    // server the user configured, so it is reported unreadable instead.
+    return { readable: false, raw, value: {} };
   }
 }
 
-/**
- * Hold an exclusive, ownership-safe lock across PROCESSES while mutating the
- * host-global config.
- *
- * Hand-rolling this was wrong three times, each the same way: POSIX has no
- * atomic compare-and-delete, so every "check who owns it, then remove it"
- * scheme leaves a window. The last attempt made the stale break a `rename` and
- * I called that atomic — but rename does not compare the owner, so a waiter
- * that had already judged lock A stale could resume after A was released and
- * silently move B's fresh lock instead, putting two writers in the critical
- * section at once. Lumen reproduced exactly that schedule.
- *
- * The established answer is not to prevent theft, which is not possible here,
- * but to detect it and refuse to claim success. proper-lockfile refreshes the
- * lock mtime while held — so a live owner is never judged stale — and calls
- * `onCompromised` if the lock is stolen or disappears. That is treated as a
- * hard failure so the caller fails closed rather than reporting a write it
- * cannot vouch for.
- */
-export async function withFileLock(target: string, fn: () => Promise<void>): Promise<void> {
-  let compromised: unknown;
-
-  const release = await lockfile.lock(target, {
-    stale: LOCK_STALE_MS,
-    update: LOCK_UPDATE_MS,
-    retries: LOCK_RETRIES,
-    // The config may not exist yet, and realpath() throws on a missing file.
-    realpath: false,
-    onCompromised: (error) => {
-      // Do NOT throw from here: it would surface as an unhandled rejection on
-      // proper-lockfile's refresh timer instead of reaching the caller.
-      compromised = error;
-    },
-  });
-
-  try {
-    await fn();
-  } finally {
-    // A compromised lock is already gone; releasing again throws over whatever
-    // the critical section was trying to report.
-    if (!compromised) {
-      await release().catch((error) => {
-        logger.warn('Failed to release Ink MCP config lock', { target, error });
-      });
-    }
-  }
-
-  if (compromised) throw new LockCompromisedError(compromised);
+export function entryMatches(
+  value: { mcpServers?: Record<string, unknown> },
+  desired: unknown
+): boolean {
+  return JSON.stringify(value.mcpServers?.[INK_SERVER_KEY]) === JSON.stringify(desired);
 }
 
 interface AntigravityUsage {
@@ -415,76 +390,66 @@ export class AntigravityRunner implements IRunner {
    */
   private async ensureGlobalMcpConfig(): Promise<string> {
     const { launcher, bridge } = await stageBridge();
-    // The launcher's content is version-invariant, so every server writes the
-    // same bytes here; the revision-specific bridge travels in env instead.
+    // Version-invariant: every Ink server writes byte-identical bytes for this
+    // key, which is what makes the loop below safe without a mutex.
     const desired = { command: launcher, args: [] as string[] };
 
     const configPath = agyMcpConfigPath();
     await mkdir(dirname(configPath), { recursive: true });
 
-    // A cheap unlocked check first. The authoritative comparison happens again
-    // under the lock; this only avoids taking the lock on the common path where
-    // the entry is already correct.
-    if (await inkEntryMatches(configPath, desired)) return bridge;
+    for (let attempt = 1; attempt <= CONFIG_WRITE_ATTEMPTS; attempt += 1) {
+      const before = await readConfigSnapshot(configPath);
 
-    let installed = false;
-    await withFileLock(configPath, async () => {
-      // Re-read INSIDE the lock. The copy we compared a moment ago may already
-      // be stale, and merging onto it would silently drop whatever a peer
-      // process added in between.
-      let existing: { mcpServers?: Record<string, unknown> } = {};
-      let parsed = false;
-      try {
-        const raw = await readFile(configPath, 'utf-8');
-        if (!raw.trim()) {
-          parsed = true;
-        } else {
-          existing = JSON.parse(raw) as { mcpServers?: Record<string, unknown> };
-          parsed = true;
-        }
-      } catch (error) {
-        // Distinguish "no file yet" from "file exists but will not parse".
-        // Treating a transient read/parse failure as {} would wipe every other
-        // MCP server the user configured.
-        const code = (error as NodeJS.ErrnoException).code;
-        if (code === 'ENOENT') parsed = true;
-      }
-
-      if (!parsed) {
-        // Leave the file untouched — we cannot see what else it holds — but do
-        // NOT report success; the caller turns this into a failed spawn.
-        logger.error(
-          'Antigravity global MCP config is unreadable; leaving it alone rather than ' +
-            'overwriting servers we cannot see',
-          { path: configPath }
+      if (!before.readable) {
+        // Leave the file untouched — we cannot see what else it holds — and do
+        // NOT report success. An agy started without this config has no
+        // bootstrap, no memory and no send_response, yet still produces a
+        // fluent-looking answer; a silently toolless agent is worse than a
+        // failed spawn.
+        throw new Error(
+          `Ink MCP config at ${configPath} is unreadable; refusing to start agy without its tools`
         );
-        return;
       }
 
-      const servers = { ...(existing.mcpServers || {}) };
-      if (JSON.stringify(servers[INK_SERVER_KEY]) === JSON.stringify(desired)) {
-        installed = true;
-        return;
-      }
+      if (entryMatches(before.value, desired)) return bridge;
+
+      const servers = { ...(before.value.mcpServers || {}) };
       servers[INK_SERVER_KEY] = desired;
+      const body = `${JSON.stringify({ ...before.value, mcpServers: servers }, null, 2)}\n`;
 
-      // Publish by rename. writeFile truncates in place, so a concurrent agy
-      // start can read a half-written file and see no servers at all.
-      const body = `${JSON.stringify({ ...existing, mcpServers: servers }, null, 2)}\n`;
       const tmp = scratchPath(configPath);
       await writeFile(tmp, body, 'utf-8');
-      await rename(tmp, configPath);
-      installed = true;
-      logger.info('Updated Antigravity global MCP config', { path: configPath, launcher, bridge });
-    });
 
-    if (!installed) {
-      throw new Error(
-        `Could not install the Ink MCP server into ${configPath}; refusing to start agy ` +
-          'without its tools'
-      );
+      // Re-read immediately before publishing. If the file moved under us our
+      // merge is built on stale content and would drop whatever landed in
+      // between, so discard the candidate and rebuild from the new base.
+      const current = await readConfigSnapshot(configPath);
+      if (current.raw !== before.raw) {
+        await rm(tmp, { force: true });
+        continue;
+      }
+
+      // rename is atomic: no reader ever sees a half-written config.
+      await rename(tmp, configPath);
+
+      // Verify rather than assume. The loop converges because every writer
+      // wants the same entry.
+      const after = await readConfigSnapshot(configPath);
+      if (after.readable && entryMatches(after.value, desired)) {
+        logger.info('Updated Antigravity global MCP config', {
+          path: configPath,
+          launcher,
+          bridge,
+          attempt,
+        });
+        return bridge;
+      }
     }
-    return bridge;
+
+    throw new Error(
+      `Could not install the Ink MCP server into ${configPath} after ` +
+        `${CONFIG_WRITE_ATTEMPTS} attempts; refusing to start agy without its tools`
+    );
   }
 
   private async spawnProcess(
