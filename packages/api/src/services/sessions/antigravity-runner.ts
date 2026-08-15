@@ -423,8 +423,16 @@ export class AntigravityRunner implements IRunner {
       // Re-read immediately before publishing. If the file moved under us our
       // merge is built on stale content and would drop whatever landed in
       // between, so discard the candidate and rebuild from the new base.
+      //
+      // `readable` is checked FIRST and is not redundant. An unreadable file
+      // (EACCES, EISDIR, I/O error) reports raw:'' — the same sentinel an
+      // absent or empty file reports. So when the candidate was built from an
+      // absent base and an unreadable file appears in between, the byte
+      // comparison succeeds and we would rename straight over a file we were
+      // never able to inspect. Comparing content is only meaningful if we could
+      // actually read the content.
       const current = await readConfigSnapshot(configPath);
-      if (current.raw !== before.raw) {
+      if (!current.readable || current.raw !== before.raw) {
         await rm(tmp, { force: true });
         continue;
       }

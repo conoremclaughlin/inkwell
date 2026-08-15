@@ -20,7 +20,15 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync, readdirSync } from 'fs';
+import {
+  mkdtempSync,
+  rmSync,
+  readFileSync,
+  writeFileSync,
+  mkdirSync,
+  readdirSync,
+  chmodSync,
+} from 'fs';
 import { join, dirname } from 'path';
 import { tmpdir } from 'os';
 
@@ -162,6 +170,36 @@ describe('a foreign writer that moves the file mid-merge', () => {
     expect(written.mcpServers.inkwell).toBeDefined();
     expect(written.mcpServers.latecomer).toEqual({ command: 'other' });
   }, 20_000);
+});
+
+describe('a file that becomes unreadable mid-merge', () => {
+  // chmod cannot block root, so this cannot demonstrate anything as root.
+  const notRoot = (process.getuid?.() ?? 1) !== 0;
+
+  it.skipIf(!notRoot)(
+    'refuses to publish over a file it could not inspect',
+    async () => {
+      // An unreadable file reports raw:'' — the SAME sentinel as absent/empty.
+      // With the candidate built from an absent base, the byte comparison
+      // therefore succeeds and the old code renamed over a foreign file it had
+      // never read, destroying it. Reported by Lumen, who confirmed mode-000
+      // returns exactly {readable:false, raw:''}.
+      mkdirSync(dirname(configPath), { recursive: true });
+
+      const foreign = JSON.stringify({ mcpServers: { precious: { command: 'do-not-lose-me' } } });
+      hoisted.afterCandidateStaged = () => {
+        writeFileSync(configPath, foreign);
+        chmodSync(configPath, 0o000);
+      };
+
+      // Nothing exists yet, so `before` is the absent/empty base.
+      await expect(ensure(new AntigravityRunner())).rejects.toThrow(/refusing to start agy/);
+
+      chmodSync(configPath, 0o644);
+      expect(readFileSync(configPath, 'utf-8')).toBe(foreign);
+    },
+    20_000
+  );
 });
 
 describe('fail closed', () => {
