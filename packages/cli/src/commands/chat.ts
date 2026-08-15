@@ -60,7 +60,11 @@ import {
 } from '../repl/attachments.js';
 import { classifyActivity } from '../repl/activity-render.js';
 import { ToolMode, ToolPolicyScopeKind, ToolPolicyState } from '../repl/tool-policy.js';
-import { formatBackendTokenUsage, type BackendTokenUsage } from '../repl/token-usage.js';
+import {
+  formatBackendTokenUsage,
+  type BackendTokenUsage,
+  type BackendModelUsage,
+} from '../repl/token-usage.js';
 import { discoverSkills, loadSkillInstruction, type SkillInstruction } from '../repl/skills.js';
 import { applyToolApprovalChoice, parseToolApprovalInput } from '../repl/tool-approval.js';
 import { ensurePcpToolAllowed } from '../repl/tool-gate.js';
@@ -2952,12 +2956,28 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // Called at every backend result inside runTurnForLoop — the single boundary
   // all invocations flow through since the runAgentLoop extraction (#489).
   // A failed attempt that still reported usage counts: those tokens were spent.
+  // Per-model totals for this run, accumulated key by key exactly as the
+  // backend reported them. Carries the backend's own costUSD, which is what
+  // makes spend answerable in dollars without a price table on our side.
+  const runModelUsage: Record<string, BackendModelUsage> = {};
+
   const recordRunUsage = (usage: BackendTokenUsage | undefined): void => {
     if (!usage) return;
     runUsageTotals.inputTokens += usage.inputTokens || 0;
     runUsageTotals.outputTokens += usage.outputTokens || 0;
     runUsageTotals.cacheReadTokens += usage.cacheReadTokens || 0;
     runUsageTotals.cacheWriteTokens += usage.cacheWriteTokens || 0;
+    for (const [model, entry] of Object.entries(usage.modelUsage || {})) {
+      const prior = runModelUsage[model];
+      runModelUsage[model] = {
+        inputTokens: (prior?.inputTokens || 0) + entry.inputTokens,
+        outputTokens: (prior?.outputTokens || 0) + entry.outputTokens,
+        cacheReadTokens: (prior?.cacheReadTokens || 0) + entry.cacheReadTokens,
+        cacheWriteTokens: (prior?.cacheWriteTokens || 0) + entry.cacheWriteTokens,
+        costUSD: (prior?.costUSD || 0) + entry.costUSD,
+        ...(entry.canonicalModel ? { canonicalModel: entry.canonicalModel } : {}),
+      };
+    }
   };
 
   // The model reported by the provider during THIS process. Deliberately
@@ -5750,6 +5770,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         // transcript-hydrated models are excluded — reporting either would
         // attribute usage to a model that may not have served the run.
         ...(currentRunModel ? { model: currentRunModel } : {}),
+        ...(Object.keys(runModelUsage).length > 0 ? { modelUsage: runModelUsage } : {}),
         ...(isBackendFailure ? { backendFailure: true } : {}),
       })
     );

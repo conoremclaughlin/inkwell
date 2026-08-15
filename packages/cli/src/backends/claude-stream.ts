@@ -14,7 +14,7 @@
  * real stream) and mislabels usage fields.
  */
 
-import type { BackendTokenUsage } from '../repl/token-usage.js';
+import type { BackendTokenUsage, BackendModelUsage } from '../repl/token-usage.js';
 import type { BackendStreamParser, BackendTurnEvent } from './stream.js';
 
 interface ClaudeContentBlock {
@@ -48,6 +48,29 @@ const NO_SESSION_MARKER = 'No conversation found with session ID';
 
 function num(v: unknown): number | undefined {
   return typeof v === 'number' && Number.isFinite(v) ? v : undefined;
+}
+
+/**
+ * Map Claude's `result.modelUsage` — the authoritative record of which models
+ * actually served the query (subagents, aliases and fallbacks included), with
+ * its own costUSD per model. Entries keep the keys Claude reports.
+ */
+function toModelUsage(raw: unknown): Record<string, BackendModelUsage> | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const out: Record<string, BackendModelUsage> = {};
+  for (const [model, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!value || typeof value !== 'object') continue;
+    const entry = value as Record<string, unknown>;
+    out[model] = {
+      inputTokens: num(entry.inputTokens) ?? 0,
+      outputTokens: num(entry.outputTokens) ?? 0,
+      cacheReadTokens: num(entry.cacheReadInputTokens) ?? 0,
+      cacheWriteTokens: num(entry.cacheCreationInputTokens) ?? 0,
+      costUSD: num(entry.costUSD) ?? 0,
+      ...(typeof entry.canonicalModel === 'string' ? { canonicalModel: entry.canonicalModel } : {}),
+    };
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 /** Map Claude's `result.usage` object to BackendTokenUsage with the REAL field names. */
@@ -153,11 +176,14 @@ export class ClaudeStreamParser implements BackendStreamParser {
         // `result` text is usually empty in stream-json; the real answer is the
         // last assistant text. Prefer a non-empty `result`, else fall back.
         const resultText = typeof ev.result === 'string' && ev.result ? ev.result : undefined;
+        const modelUsage = toModelUsage((ev as Record<string, unknown>).modelUsage);
         const text = resultText ?? (this.lastAssistantText || undefined);
         out.push({
           kind: 'result',
           text,
-          usage: ev.usage ? toUsage(ev.usage) : undefined,
+          usage: ev.usage
+            ? { ...toUsage(ev.usage), ...(modelUsage ? { modelUsage } : {}) }
+            : undefined,
           resumeFailedNoSession: resumeFailedNoSession || undefined,
         });
         break;
