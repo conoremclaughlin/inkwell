@@ -663,6 +663,158 @@ describe('SessionRepository.updateTokenUsage — unreported cost', () => {
     expect(metadata.modelUsage['claude-opus-5'].costUSD).toBeUndefined();
   });
 
+  // Both orders matter: a subtotal is equally misleading whether the unknown
+  // contribution came first or last (Lumen, PR #500 round 3).
+  it('marks cost partial when an unknown turn precedes a known one', async () => {
+    const { supabase, lastUpdate, fakeRow } = createMockSupabase();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const repo = new SessionRepository(supabase as any);
+
+    fakeRow.metadata = {
+      modelUsage: {
+        'claude-opus-5': {
+          inputTokens: 100,
+          outputTokens: 10,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+        },
+      },
+    };
+
+    await repo.updateTokenUsage('sess-1', {
+      inputTokens: 50,
+      outputTokens: 5,
+      modelUsage: {
+        'claude-opus-5': {
+          inputTokens: 50,
+          outputTokens: 5,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          costUSD: 0.02,
+        },
+      },
+    });
+
+    const entry = (lastUpdate.data?.metadata as Record<string, Record<string, ModelTotals>>)
+      .modelUsage['claude-opus-5'];
+    // $0.02 is real but it is a LOWER BOUND — the earlier turn's cost is unknown.
+    expect(entry.costUSD).toBeCloseTo(0.02);
+    expect(entry.costPartial).toBe(true);
+  });
+
+  it('marks cost partial when a known turn precedes an unknown one', async () => {
+    const { supabase, lastUpdate, fakeRow } = createMockSupabase();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const repo = new SessionRepository(supabase as any);
+
+    fakeRow.metadata = {
+      modelUsage: {
+        'claude-opus-5': {
+          inputTokens: 100,
+          outputTokens: 10,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          costUSD: 0.05,
+        },
+      },
+    };
+
+    await repo.updateTokenUsage('sess-1', {
+      inputTokens: 50,
+      outputTokens: 5,
+      modelUsage: {
+        'claude-opus-5': {
+          inputTokens: 50,
+          outputTokens: 5,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+        },
+      },
+    });
+
+    const entry = (lastUpdate.data?.metadata as Record<string, Record<string, ModelTotals>>)
+      .modelUsage['claude-opus-5'];
+    expect(entry.costUSD).toBeCloseTo(0.05);
+    expect(entry.costPartial).toBe(true);
+  });
+
+  // Once partial, always partial — a later complete turn cannot repair the
+  // gap, and clearing the flag would republish a subtotal as the total.
+  it('keeps the partial marker across a subsequent known turn', async () => {
+    const { supabase, lastUpdate, fakeRow } = createMockSupabase();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const repo = new SessionRepository(supabase as any);
+
+    fakeRow.metadata = {
+      modelUsage: {
+        'claude-opus-5': {
+          inputTokens: 100,
+          outputTokens: 10,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          costUSD: 0.02,
+          costPartial: true,
+        },
+      },
+    };
+
+    await repo.updateTokenUsage('sess-1', {
+      inputTokens: 10,
+      outputTokens: 1,
+      modelUsage: {
+        'claude-opus-5': {
+          inputTokens: 10,
+          outputTokens: 1,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          costUSD: 0.01,
+        },
+      },
+    });
+
+    const entry = (lastUpdate.data?.metadata as Record<string, Record<string, ModelTotals>>)
+      .modelUsage['claude-opus-5'];
+    expect(entry.costUSD).toBeCloseTo(0.03);
+    expect(entry.costPartial).toBe(true);
+  });
+
+  it('leaves a fully-reported model complete', async () => {
+    const { supabase, lastUpdate, fakeRow } = createMockSupabase();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const repo = new SessionRepository(supabase as any);
+
+    fakeRow.metadata = {
+      modelUsage: {
+        'claude-opus-5': {
+          inputTokens: 100,
+          outputTokens: 10,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          costUSD: 0.02,
+        },
+      },
+    };
+
+    await repo.updateTokenUsage('sess-1', {
+      inputTokens: 10,
+      outputTokens: 1,
+      modelUsage: {
+        'claude-opus-5': {
+          inputTokens: 10,
+          outputTokens: 1,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          costUSD: 0.01,
+        },
+      },
+    });
+
+    const entry = (lastUpdate.data?.metadata as Record<string, Record<string, ModelTotals>>)
+      .modelUsage['claude-opus-5'];
+    expect(entry.costUSD).toBeCloseTo(0.03);
+    expect(entry.costPartial).toBeUndefined();
+  });
+
   it('accumulates once a turn does report cost', async () => {
     const { supabase, lastUpdate, fakeRow } = createMockSupabase();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -704,6 +856,7 @@ interface ModelTotals {
   cacheReadTokens: number;
   cacheWriteTokens: number;
   costUSD?: number;
+  costPartial?: boolean;
   canonicalModel?: string;
 }
 

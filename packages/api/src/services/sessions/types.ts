@@ -72,6 +72,13 @@ export interface ModelUsageTotals {
    * silently under-report (Lumen, PR #500 round 2).
    */
   costUSD?: number;
+  /**
+   * True when at least one contribution to `costUSD` did not report a cost, so
+   * the figure is a LOWER BOUND rather than the total. Without this, a mixed
+   * run publishes a subtotal that reads as complete — the same false certainty
+   * as a zero, one level up (Lumen, PR #500 round 3).
+   */
+  costPartial?: boolean;
   canonicalModel?: string;
 }
 

@@ -2993,11 +2993,23 @@ export async function runChat(options: ChatOptions): Promise<void> {
         outputTokens: (prior?.outputTokens || 0) + entry.outputTokens,
         cacheReadTokens: (prior?.cacheReadTokens || 0) + entry.cacheReadTokens,
         cacheWriteTokens: (prior?.cacheWriteTokens || 0) + entry.cacheWriteTokens,
-        // Absent stays absent: only reported figures are summed, so a run
-        // whose cost was never reported carries no cost rather than 0.
-        ...(prior?.costUSD !== undefined || entry.costUSD !== undefined
-          ? { costUSD: (prior?.costUSD ?? 0) + (entry.costUSD ?? 0) }
-          : {}),
+        // Cost completeness, not just cost. Summing only the known parts and
+        // publishing the subtotal as the total under-reports invisibly; a
+        // first contribution that reports cost starts complete, and any
+        // unknown contribution after that marks the running figure partial.
+        ...(() => {
+          const priorCost = prior?.costUSD;
+          const entryCost = entry.costUSD;
+          if (priorCost === undefined && entryCost === undefined) return {};
+          const partial =
+            prior?.costPartial === true ||
+            (prior !== undefined && priorCost === undefined) ||
+            entryCost === undefined;
+          return {
+            costUSD: (priorCost ?? 0) + (entryCost ?? 0),
+            ...(partial ? { costPartial: true } : {}),
+          };
+        })(),
         ...(entry.canonicalModel ? { canonicalModel: entry.canonicalModel } : {}),
       };
     }
