@@ -68,6 +68,21 @@ export async function handleUpdateIntegrationHealth(args: unknown, dataComposer:
   const now = new Date().toISOString();
   const isHealthy = params.status === 'healthy';
 
+  // "When did this last work?" is at its most useful during an outage, so a
+  // non-healthy report must not clear it. Carry the stored value forward.
+  let lastHealthyAt: string | null = now;
+  if (!isHealthy) {
+    const { data: existing } = await dataComposer
+      .getClient()
+      .from('integration_health')
+      .select('last_healthy_at')
+      .eq('user_id', user.id)
+      .eq('service', params.service)
+      .maybeSingle();
+
+    lastHealthyAt = existing?.last_healthy_at ?? null;
+  }
+
   const upsertData = {
     user_id: user.id,
     service: params.service,
@@ -75,7 +90,7 @@ export async function handleUpdateIntegrationHealth(args: unknown, dataComposer:
     error_code: isHealthy ? null : (params.errorCode ?? null),
     error_message: isHealthy ? null : (params.errorMessage ?? null),
     last_check_at: now,
-    last_healthy_at: isHealthy ? now : null,
+    last_healthy_at: lastHealthyAt,
     reported_by_agent_id: params.agentId ?? null,
     metadata: (params.metadata ?? {}) as Json,
     updated_at: now,

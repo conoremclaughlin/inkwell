@@ -11,7 +11,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { DataComposer } from '../../data/composer';
 import { createTableAwareSupabaseMock } from '../../test/table-aware-supabase-mock';
 import type { ProviderAccountHealth } from '../../services/oauth';
-import { handleGetIntegrationHealth } from './integration-health-handlers';
+import {
+  handleGetIntegrationHealth,
+  handleUpdateIntegrationHealth,
+} from './integration-health-handlers';
 
 const USER_ID = '00000000-0000-0000-0000-000000000001';
 
@@ -235,5 +238,93 @@ describe('handleGetIntegrationHealth — staleness for services with no live sig
 
     expect(body.integrations[0].stale).toBe(true);
     expect(body.integrations[0].lastCheckAgeSeconds).toBeNull();
+  });
+});
+
+describe('handleUpdateIntegrationHealth — last_healthy_at retention', () => {
+  it('preserves the stored last_healthy_at when reporting a failure', async () => {
+    const { composer, mock } = composerFor({
+      integration_health: [
+        // The pre-read for the existing last_healthy_at.
+        { maybeSingle: [{ data: { last_healthy_at: '2026-06-21T09:40:00.000Z' }, error: null }] },
+        // The upsert itself.
+        {
+          single: [
+            {
+              data: {
+                id: 'row-1',
+                service: 'google_gmail',
+                status: 'error',
+                error_code: 'oauth_expired',
+                error_message: 'Failed to refresh google token',
+                last_check_at: '2026-08-15T17:00:00.000Z',
+                last_healthy_at: '2026-06-21T09:40:00.000Z',
+                reported_by_agent_id: 'myra',
+              },
+              error: null,
+            },
+          ],
+        },
+      ],
+    });
+
+    await handleUpdateIntegrationHealth(
+      {
+        userId: USER_ID,
+        service: 'google_gmail',
+        status: 'error',
+        errorCode: 'oauth_expired',
+        errorMessage: 'Failed to refresh google token',
+        agentId: 'myra',
+      },
+      composer
+    );
+
+    const upsertCall = mock.calls.find(
+      (c) => (c.builder.upsert as ReturnType<typeof vi.fn>).mock.calls.length > 0
+    );
+    const written = (upsertCall!.builder.upsert as ReturnType<typeof vi.fn>).mock.calls[0][0];
+
+    // Going unhealthy must not erase when the service last worked.
+    expect(written.last_healthy_at).toBe('2026-06-21T09:40:00.000Z');
+    expect(written.status).toBe('error');
+  });
+
+  it('stamps last_healthy_at as now when reporting healthy', async () => {
+    const { composer, mock } = composerFor({
+      integration_health: [
+        {
+          single: [
+            {
+              data: {
+                id: 'row-1',
+                service: 'telegram',
+                status: 'healthy',
+                error_code: null,
+                error_message: null,
+                last_check_at: '2026-08-15T17:00:00.000Z',
+                last_healthy_at: '2026-08-15T17:00:00.000Z',
+                reported_by_agent_id: 'wren',
+              },
+              error: null,
+            },
+          ],
+        },
+      ],
+    });
+
+    await handleUpdateIntegrationHealth(
+      { userId: USER_ID, service: 'telegram', status: 'healthy', agentId: 'wren' },
+      composer
+    );
+
+    const upsertCall = mock.calls.find(
+      (c) => (c.builder.upsert as ReturnType<typeof vi.fn>).mock.calls.length > 0
+    );
+    const written = (upsertCall!.builder.upsert as ReturnType<typeof vi.fn>).mock.calls[0][0];
+
+    expect(written.last_healthy_at).toBe('2026-08-15T17:00:00.000Z');
+    // No pre-read needed on the healthy path.
+    expect(mock.calls).toHaveLength(1);
   });
 });
