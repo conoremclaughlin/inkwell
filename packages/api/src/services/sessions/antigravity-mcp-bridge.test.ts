@@ -19,6 +19,7 @@ const BRIDGE = join(__dirname, 'antigravity-mcp-bridge.mjs');
 interface Captured {
   headers: IncomingMessage['headers'];
   body: string;
+  url?: string;
 }
 
 /** How the stub should answer the next request. */
@@ -39,7 +40,7 @@ beforeAll(async () => {
     let body = '';
     req.on('data', (c) => (body += c));
     req.on('end', () => {
-      captured.push({ headers: req.headers, body });
+      captured.push({ headers: req.headers, body, url: req.url });
       const r = responder(body);
       const headers: Record<string, string> = {
         'Content-Type': r.contentType ?? 'application/json',
@@ -255,5 +256,49 @@ describe('protocol edge cases', () => {
     proc.kill();
 
     expect(out[0]).toMatchObject({ id: 5 });
+  });
+});
+
+describe('server targeting', () => {
+  it('derives /mcp from INK_SERVER_URL when no explicit endpoint is given', async () => {
+    // Without this the bridge defaults to localhost:3001, so an isolated server
+    // on PCP_PORT_BASE=4001 would hand its bearer token and context to the MAIN
+    // server — the one thing this repo is emphatic about not disturbing.
+    responder = () => ({ payload: JSON.stringify({ jsonrpc: '2.0', id: 1, result: {} }) });
+    const base = baseUrl.replace(/\/mcp$/, '');
+
+    const out = await runBridge(
+      [{ jsonrpc: '2.0', id: 1, method: 'tools/list' }],
+      { INK_MCP_URL: '', INK_SERVER_URL: base },
+      1
+    );
+
+    expect(captured).toHaveLength(1);
+    expect(out[0]).toMatchObject({ id: 1 });
+  });
+
+  it('tolerates a trailing slash on INK_SERVER_URL', async () => {
+    responder = () => ({ payload: JSON.stringify({ jsonrpc: '2.0', id: 1, result: {} }) });
+    const base = `${baseUrl.replace(/\/mcp$/, '')}/`;
+
+    await runBridge(
+      [{ jsonrpc: '2.0', id: 1, method: 'tools/list' }],
+      { INK_MCP_URL: '', INK_SERVER_URL: base },
+      1
+    );
+
+    expect(captured[0].url).toBe('/mcp');
+  });
+
+  it('lets an explicit INK_MCP_URL win over INK_SERVER_URL', async () => {
+    responder = () => ({ payload: JSON.stringify({ jsonrpc: '2.0', id: 1, result: {} }) });
+
+    await runBridge(
+      [{ jsonrpc: '2.0', id: 1, method: 'tools/list' }],
+      { INK_MCP_URL: baseUrl, INK_SERVER_URL: 'http://127.0.0.1:9/should-not-be-used' },
+      1
+    );
+
+    expect(captured).toHaveLength(1);
   });
 });

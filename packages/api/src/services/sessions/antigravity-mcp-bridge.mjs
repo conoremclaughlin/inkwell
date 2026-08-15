@@ -27,7 +27,24 @@
 
 import { createInterface } from 'node:readline';
 
-const MCP_URL = process.env.INK_MCP_URL || 'http://localhost:3001/mcp';
+/**
+ * Which server this turn belongs to.
+ *
+ * INK_MCP_URL is the explicit endpoint the runner passes; INK_SERVER_URL is the
+ * canonical runtime/container variable (ENV.SERVER_URL) that the orchestrator
+ * rewrites for Docker. Defaulting straight to localhost:3001 would mean an
+ * isolated server on PCP_PORT_BASE=4001 sends its bearer token and context to
+ * the MAIN server instead — the one thing this repo is emphatic about not
+ * disturbing — and a container would dial port 3001 inside itself.
+ */
+function resolveMcpUrl() {
+  if (process.env.INK_MCP_URL) return process.env.INK_MCP_URL;
+  const base = process.env.INK_SERVER_URL;
+  if (base) return `${base.replace(/\/+$/, '')}/mcp`;
+  return 'http://localhost:3001/mcp';
+}
+
+const MCP_URL = resolveMcpUrl();
 
 /** Streamable HTTP hands out a session id on initialize; every later request must echo it. */
 let mcpSessionId;

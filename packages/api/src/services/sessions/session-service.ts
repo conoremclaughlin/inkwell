@@ -990,7 +990,19 @@ export class SessionService implements ISessionService {
     if (resolvedBackend === 'ink' && runnerConfig.container) {
       throw new Error(
         'ink backend cannot run inside a sandbox container. ' +
-          'Use a CLI backend (claude-code, codex-cli, gemini, antigravity) for sandboxed strategies.'
+          'Use a CLI backend (claude-code, codex-cli, gemini) for sandboxed strategies.'
+      );
+    }
+
+    // Antigravity's MCP access depends on a bridge published at a HOST path and
+    // named in a HOST-global config file; neither exists inside the container,
+    // so agy would start and then run with no Ink tools at all. Refuse loudly
+    // rather than hand back a silently toolless agent. Staging the bridge into
+    // the container runtime dir is the fix, and is not done yet.
+    if (resolvedBackend === 'antigravity' && runnerConfig.container) {
+      throw new Error(
+        'antigravity backend cannot run inside a sandbox container yet — the MCP ' +
+          'bridge is staged on the host. Use claude-code or codex-cli for sandboxed strategies.'
       );
     }
 

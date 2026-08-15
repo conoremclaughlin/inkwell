@@ -24,7 +24,7 @@
  */
 
 import { spawn, type ChildProcess } from 'child_process';
-import { mkdir, readFile, writeFile } from 'fs/promises';
+import { chmod, mkdir, readFile, rename, rm, stat, writeFile } from 'fs/promises';
 import { join, dirname } from 'path';
 import { homedir } from 'os';
 import type {
@@ -72,8 +72,150 @@ const INK_SERVER_KEY = 'inkwell';
 /** Sibling file, copied into dist by the package build step. */
 const BRIDGE_FILENAME = 'antigravity-mcp-bridge.mjs';
 
+/**
+ * Where the bridge is published for agy to execute.
+ *
+ * Deliberately NOT the spawning checkout's copy. `agy` reads one host-global
+ * config, so whatever path lands in it is used by every server on this machine
+ * — the main dev server, a built dist server, and the isolated worktree servers
+ * this repo explicitly runs in parallel. Publishing `__dirname` would mean one
+ * process executes another's bridge revision, or a path whose worktree has
+ * since been deleted. A single installed location keeps the entry identical no
+ * matter who writes it.
+ */
+export function stagedBridgePath(): string {
+  return join(homedir(), '.ink', 'runtime', BRIDGE_FILENAME);
+}
+
+/** Copy the bridge to its installed location if it is missing or out of date. */
+export async function stageBridge(): Promise<string> {
+  const target = stagedBridgePath();
+  const source = join(__dirname, BRIDGE_FILENAME);
+  const desired = await readFile(source, 'utf-8');
+
+  try {
+    if ((await readFile(target, 'utf-8')) === desired) return target;
+  } catch {
+    // Missing or unreadable — fall through and (re)publish it.
+  }
+
+  await mkdir(dirname(target), { recursive: true });
+  // Same reason as the config: rename so agy never execs a half-written file.
+  // 0o755 because the config invokes it directly, relying on its shebang
+  // rather than naming a node binary that differs between nvm versions.
+  const tmp = scratchPath(target);
+  await writeFile(tmp, desired, { encoding: 'utf-8', mode: 0o755 });
+  await chmod(tmp, 0o755);
+  await rename(tmp, target);
+  logger.info('Staged Antigravity MCP bridge', { target });
+  return target;
+}
+
+/**
+ * Which Ink server this turn should talk to.
+ *
+ * Order matters. INK_SERVER_URL is the canonical runtime variable and is what
+ * the container orchestrator rewrites, so it wins. Otherwise fall back to the
+ * URL the workspace's own .mcp.json names — that is how an isolated server on
+ * PCP_PORT_BASE=4001 identifies itself, and GeminiRunner already reads the same
+ * file for the same reason. Only then the default.
+ */
+export async function resolveInkMcpUrl(config: ClaudeRunnerConfig): Promise<string> {
+  const fromEnv = process.env.INK_SERVER_URL;
+  if (fromEnv) return `${fromEnv.replace(/\/+$/, '')}/mcp`;
+
+  try {
+    const raw = await readFile(join(config.workingDirectory, '.mcp.json'), 'utf-8');
+    const parsed = JSON.parse(raw) as {
+      mcpServers?: Record<string, { url?: string; serverUrl?: string }>;
+    };
+    const entry = parsed.mcpServers?.[INK_SERVER_KEY];
+    const url = entry?.url || entry?.serverUrl;
+    if (url) return url;
+  } catch {
+    // No workspace config, or unreadable — fall through to the default.
+  }
+
+  return 'http://localhost:3001/mcp';
+}
+
+/** True when the config already names exactly this inkwell entry. */
+async function inkEntryMatches(configPath: string, desired: unknown): Promise<boolean> {
+  try {
+    const raw = await readFile(configPath, 'utf-8');
+    if (!raw.trim()) return false;
+    const parsed = JSON.parse(raw) as { mcpServers?: Record<string, unknown> };
+    return JSON.stringify(parsed.mcpServers?.[INK_SERVER_KEY]) === JSON.stringify(desired);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Unique scratch name for a temp-then-rename publish.
+ *
+ * The pid alone is not enough: several spawns inside ONE server race here, and
+ * they all share a pid, so they would write the same scratch file and all but
+ * one rename would hit ENOENT.
+ */
+let tmpCounter = 0;
+function scratchPath(target: string): string {
+  tmpCounter += 1;
+  return `${target}.${process.pid}.${tmpCounter}.tmp`;
+}
+
+/** A lock older than this is presumed abandoned by a crashed process. */
+const LOCK_STALE_MS = 30_000;
+const LOCK_POLL_MS = 50;
+const LOCK_TIMEOUT_MS = 5_000;
+
+/**
+ * Hold an exclusive lock across PROCESSES while mutating the host-global config.
+ *
+ * In-process mutexes are not enough here: the contending writers are separate
+ * Node servers (main, isolated, dist), so the lock has to live in the
+ * filesystem. `wx` is atomic on every platform we run on.
+ */
+export async function withFileLock(lockPath: string, fn: () => Promise<void>): Promise<void> {
+  const deadline = Date.now() + LOCK_TIMEOUT_MS;
+  let held = false;
+
+  while (!held) {
+    try {
+      await writeFile(lockPath, `${process.pid}`, { flag: 'wx' });
+      held = true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+
+      // Break a lock left behind by a process that died mid-write, otherwise a
+      // single crash disables MCP for this backend permanently.
+      try {
+        const age = Date.now() - (await stat(lockPath)).mtimeMs;
+        if (age > LOCK_STALE_MS) {
+          await rm(lockPath, { force: true });
+          continue;
+        }
+      } catch {
+        continue; // Vanished under us — retry immediately.
+      }
+
+      if (Date.now() > deadline) {
+        // Proceeding unlocked could clobber a peer's servers. Skipping means
+        // this spawn runs without Ink tools, which is visible and recoverable.
+        throw new Error(`Timed out waiting for ${lockPath}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, LOCK_POLL_MS));
+    }
+  }
+
+  try {
+    await fn();
+  } finally {
+    await rm(lockPath, { force: true }).catch(() => {});
+  }
+}
+
 interface AntigravityUsage {
-  contextTokens: number;
   inputTokens: number;
   outputTokens: number;
 }
@@ -184,38 +326,63 @@ export class AntigravityRunner implements IRunner {
    * preserved.
    */
   private async ensureGlobalMcpConfig(): Promise<void> {
-    // The API compiles to CommonJS, so __dirname — not import.meta.url. It
-    // resolves to src/services/sessions under tsx and dist/services/sessions
-    // in a build; the package build step copies the .mjs across so both hold.
-    const bridgePath = join(__dirname, BRIDGE_FILENAME);
-    const desired = {
-      command: process.execPath,
-      args: [bridgePath],
-    };
+    const bridgePath = await stageBridge();
+    // No `command: process.execPath` and no checkout-relative args: the bridge
+    // carries a `#!/usr/bin/env node` shebang and is executed directly, so this
+    // entry is byte-identical from every process, checkout and build.
+    const desired = { command: bridgePath, args: [] as string[] };
 
     const configPath = agyMcpConfigPath();
-    let existing: { mcpServers?: Record<string, unknown> } = {};
-    try {
-      const raw = await readFile(configPath, 'utf-8');
-      if (raw.trim()) existing = JSON.parse(raw) as { mcpServers?: Record<string, unknown> };
-    } catch {
-      // Missing or unparseable — treat as empty rather than refusing to run.
-      // Overwriting an unparseable file is the lesser harm: agy cannot read it
-      // either, so nothing is lost that was working.
-    }
-
-    const servers = { ...(existing.mcpServers || {}) };
-    const current = servers[INK_SERVER_KEY];
-    if (JSON.stringify(current) === JSON.stringify(desired)) return;
-
-    servers[INK_SERVER_KEY] = desired;
     await mkdir(dirname(configPath), { recursive: true });
-    await writeFile(
-      configPath,
-      `${JSON.stringify({ ...existing, mcpServers: servers }, null, 2)}\n`,
-      'utf-8'
-    );
-    logger.info('Updated Antigravity global MCP config', { path: configPath, bridgePath });
+
+    // A cheap unlocked check first. The authoritative comparison happens again
+    // under the lock; this only avoids taking the lock on the common path where
+    // the entry is already correct.
+    if (await inkEntryMatches(configPath, desired)) return;
+
+    await withFileLock(`${configPath}.ink-lock`, async () => {
+      // Re-read INSIDE the lock. The copy we compared a moment ago may already
+      // be stale, and merging onto it would silently drop whatever a peer
+      // process added in between.
+      let existing: { mcpServers?: Record<string, unknown> } = {};
+      let parsed = false;
+      try {
+        const raw = await readFile(configPath, 'utf-8');
+        if (!raw.trim()) {
+          parsed = true;
+        } else {
+          existing = JSON.parse(raw) as { mcpServers?: Record<string, unknown> };
+          parsed = true;
+        }
+      } catch (error) {
+        // Distinguish "no file yet" from "file exists but will not parse".
+        // Treating a transient read/parse failure as {} would wipe every other
+        // MCP server the user configured.
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === 'ENOENT') parsed = true;
+      }
+
+      if (!parsed) {
+        logger.warn(
+          'Antigravity global MCP config is unreadable; leaving it alone rather than ' +
+            'overwriting servers we cannot see',
+          { path: configPath }
+        );
+        return;
+      }
+
+      const servers = { ...(existing.mcpServers || {}) };
+      if (JSON.stringify(servers[INK_SERVER_KEY]) === JSON.stringify(desired)) return;
+      servers[INK_SERVER_KEY] = desired;
+
+      // Publish by rename. writeFile truncates in place, so a concurrent agy
+      // start can read a half-written file and see no servers at all.
+      const body = `${JSON.stringify({ ...existing, mcpServers: servers }, null, 2)}\n`;
+      const tmp = scratchPath(configPath);
+      await writeFile(tmp, body, 'utf-8');
+      await rename(tmp, configPath);
+      logger.info('Updated Antigravity global MCP config', { path: configPath, bridgePath });
+    });
   }
 
   private async spawnProcess(
@@ -231,6 +398,7 @@ export class AntigravityRunner implements IRunner {
     error?: string;
   }> {
     const agyBin = await resolveBinaryPath('agy');
+    const mcpUrl = await resolveInkMcpUrl(config);
     return new Promise((resolve, reject) => {
       // Strip CLAUDECODE so it doesn't leak into the subprocess and make agy
       // think it is nested inside a Claude Code session.
@@ -239,6 +407,10 @@ export class AntigravityRunner implements IRunner {
         HOME: process.env.HOME || '',
         PATH: buildSpawnPath(agyBin),
         ...(config.agentId ? { AGENT_ID: config.agentId } : {}),
+        // Explicit endpoint for the bridge. Without it the bridge falls back to
+        // localhost:3001, so an isolated server on PCP_PORT_BASE=4001 would send
+        // its bearer token and context to the MAIN server.
+        INK_MCP_URL: mcpUrl,
         // These are what the stdio bridge reads to build its HTTP headers.
         ...buildSessionEnv({
           pcpSessionId: config.pcpSessionId,
@@ -299,8 +471,14 @@ export class AntigravityRunner implements IRunner {
           });
           this.killProcess(proc);
           settled = true;
+          // status/error, not just a marker string: run() decides success from
+          // `status`, so resolving bare here reports a killed turn as a
+          // successful one — the session goes idle and the marker can be
+          // forwarded to a human as if it were the agent's answer.
           resolve({
             ...finish(),
+            status: 'TIMEOUT',
+            error: `Antigravity produced no output for ${idleSecs}s and was killed`,
             finalTextResponse: finalTextResponse || `[Process timed out after ${idleSecs}s idle]`,
           });
         }, IDLE_TIMEOUT_MS);
@@ -316,9 +494,46 @@ export class AntigravityRunner implements IRunner {
         settled = true;
         resolve({
           ...finish(),
+          status: 'TIMEOUT',
+          error: `Antigravity exceeded the ${Math.round(PROCESS_TIMEOUT_MS / 1000)}s ceiling and was killed`,
           finalTextResponse: finalTextResponse || '[Process hit hard timeout]',
         });
       }, PROCESS_TIMEOUT_MS);
+
+      const acc: AgyStreamState = {
+        responses,
+        toolCalls,
+        get usage() {
+          return usage;
+        },
+        set usage(v) {
+          usage = v;
+        },
+        get finalTextResponse() {
+          return finalTextResponse;
+        },
+        set finalTextResponse(v) {
+          finalTextResponse = v;
+        },
+        get conversationId() {
+          return conversationId;
+        },
+        set conversationId(v) {
+          conversationId = v;
+        },
+        get status() {
+          return status;
+        },
+        set status(v) {
+          status = v;
+        },
+        get error() {
+          return resultError;
+        },
+        set error(v) {
+          resultError = v;
+        },
+      };
 
       const consume = (line: string): void => {
         if (!line.trim()) return;
@@ -328,29 +543,7 @@ export class AntigravityRunner implements IRunner {
         } catch {
           return; // Non-JSON on stdout in stream-json mode is noise.
         }
-
-        const extracted = extractToolData(parsed);
-        responses.push(...extracted.responses);
-        toolCalls.push(...extracted.toolCalls);
-
-        const text = extractTextDelta(parsed);
-        if (text) finalTextResponse = (finalTextResponse || '') + text;
-
-        // The final event carries the authoritative id, status and usage.
-        if (parsed.event === 'result' && parsed.result) {
-          const r = parsed.result as AgyResult;
-          if (r.conversation_id) conversationId = r.conversation_id;
-          if (r.status) status = r.status;
-          if (r.error) resultError = r.error;
-          if (r.response) finalTextResponse = r.response;
-          if (r.usage) {
-            usage = {
-              contextTokens: r.usage.total_tokens || 0,
-              inputTokens: r.usage.input_tokens || 0,
-              outputTokens: r.usage.output_tokens || 0,
-            };
-          }
-        }
+        applyAgyEvent(acc, parsed);
       };
 
       proc.stdout.on('data', (data) => {
@@ -405,18 +598,30 @@ export class AntigravityRunner implements IRunner {
   }
 
   private killProcess(proc: ChildProcess): void {
+    // `proc.killed` only means a signal was DELIVERED, so it flips true the
+    // instant SIGTERM is sent — gating the escalation on it means a
+    // SIGTERM-resistant child is never actually force-killed. Track real exit.
+    let exited = false;
+    proc.once('exit', () => {
+      exited = true;
+    });
+
     try {
       proc.kill('SIGTERM');
-      setTimeout(() => {
-        try {
-          if (!proc.killed) proc.kill('SIGKILL');
-        } catch {
-          // Already dead.
-        }
-      }, 5000);
     } catch {
-      // Already dead.
+      return; // Already gone.
     }
+
+    const escalation = setTimeout(() => {
+      if (exited) return;
+      try {
+        proc.kill('SIGKILL');
+      } catch {
+        // Raced with a normal exit.
+      }
+    }, 5000);
+    // Do not hold the event loop open purely to escalate a kill.
+    escalation.unref?.();
   }
 }
 
@@ -472,6 +677,16 @@ export function buildAgyArgs(
 } {
   const responses: ChannelResponse[] = [];
   const toolCalls: ToolCall[] = [];
+
+  // agy reports each tool twice: ACTIVE when it starts, DONE when it finishes.
+  // Recording both doubles every entry in the activity stream and would deliver
+  // any send_response twice. DONE is the one that carries the result, and a
+  // still-running tool is not a completed call, so ACTIVE is dropped.
+  if (event.event === 'step_update') {
+    const update = (event.step_update ?? event) as Record<string, unknown>;
+    if (update.state === 'ACTIVE') return { responses, toolCalls };
+  }
+
   const queue: unknown[] = [event];
   const seen = new Set<unknown>();
 
@@ -482,10 +697,11 @@ export function buildAgyArgs(
     seen.add(current);
     const obj = current as Record<string, unknown>;
 
-    const name = obj.name;
-    if (typeof name === 'string' && name.length > 0) {
+    const rawName = obj.name;
+    if (typeof rawName === 'string' && rawName.length > 0) {
       const rawInput = obj.parameters ?? obj.input ?? obj.args ?? obj.arguments;
-      const input = normalizeInput(rawInput);
+      const unwrapped = unwrapMcpCall(rawName, normalizeInput(rawInput));
+      const { toolName: name, input } = unwrapped;
 
       if (input && typeof input === 'object') {
         toolCalls.push({
@@ -528,6 +744,36 @@ export function buildAgyArgs(
   return { responses, toolCalls };
 }
 
+/**
+ * Turn agy's MCP wrapper into the namespaced tool name the rest of Ink uses.
+ *
+ * agy does not emit `mcp__inkwell__get_timezone`. Every MCP call arrives as a
+ * single generic tool:
+ *
+ *   tool_info.name = "call_mcp_tool"
+ *   parameters     = { ServerName: "inkwell", ToolName: "get_timezone",
+ *                      Arguments: {...} }
+ *
+ * Left as-is, the activity stream records every MCP call as an indistinguishable
+ * `call_mcp_tool`, and send_response is never recognised at all — so a reply the
+ * agent did send would never reach its channel.
+ */
+export function unwrapMcpCall(name: string, input: unknown): { toolName: string; input: unknown } {
+  if (name !== 'call_mcp_tool' || !input || typeof input !== 'object') {
+    return { toolName: name, input };
+  }
+
+  const wrapper = input as Record<string, unknown>;
+  const server = wrapper.ServerName ?? wrapper.serverName;
+  const tool = wrapper.ToolName ?? wrapper.toolName;
+  if (typeof server !== 'string' || typeof tool !== 'string') {
+    return { toolName: name, input };
+  }
+
+  const args = normalizeInput(wrapper.Arguments ?? wrapper.arguments) ?? {};
+  return { toolName: `mcp__${server}__${tool}`, input: args };
+}
+
 export function normalizeInput(raw: unknown): unknown {
   if (raw === undefined || raw === null) return undefined;
   if (typeof raw === 'string') {
@@ -538,4 +784,63 @@ export function normalizeInput(raw: unknown): unknown {
     }
   }
   return raw;
+}
+
+/** Mutable accumulator threaded through the stream. */
+export interface AgyStreamState {
+  responses: ChannelResponse[];
+  toolCalls: ToolCall[];
+  usage?: AntigravityUsage;
+  finalTextResponse?: string;
+  conversationId?: string;
+  status?: string;
+  error?: string;
+}
+
+/** Fresh accumulator — exported so tests can drive the reducer directly. */
+export function newAgyStreamState(): AgyStreamState {
+  return { responses: [], toolCalls: [] };
+}
+
+/**
+ * Fold one agy stream event into the accumulated run state.
+ *
+ * Extracted from the stdout handler so the envelope handling can be tested
+ * against recorded events without spawning agy — the alternative is that the
+ * only coverage of init/result semantics is an end-to-end run.
+ */
+export function applyAgyEvent(acc: AgyStreamState, parsed: Record<string, unknown>): void {
+  const extracted = extractToolData(parsed);
+  acc.responses.push(...extracted.responses);
+  acc.toolCalls.push(...extracted.toolCalls);
+
+  const text = extractTextDelta(parsed);
+  if (text) acc.finalTextResponse = (acc.finalTextResponse || '') + text;
+
+  // agy 1.1.13 emits the id on `init`, before any model or tool work. Recording
+  // it immediately means a crash or kill AFTER side effects still leaves us able
+  // to resume that conversation instead of starting a fresh one and repeating
+  // them. The result event stays authoritative when it arrives.
+  if (parsed.event === 'init' && typeof parsed.conversation_id === 'string') {
+    acc.conversationId = parsed.conversation_id;
+  }
+
+  if (parsed.event === 'result' && parsed.result) {
+    const r = parsed.result as AgyResult;
+    if (r.conversation_id) acc.conversationId = r.conversation_id;
+    if (r.status) acc.status = r.status;
+    if (r.error) acc.error = r.error;
+    if (r.response) acc.finalTextResponse = r.response;
+    if (r.usage) {
+      // No contextTokens. agy's total_tokens sums every step's usage across the
+      // whole invocation, so earlier steps are counted repeatedly — it is run
+      // billing, not what is currently in the context window. The field means
+      // occupancy, and absent means unknown, not zero (CodexRunner omits it for
+      // the same reason).
+      acc.usage = {
+        inputTokens: r.usage.input_tokens || 0,
+        outputTokens: r.usage.output_tokens || 0,
+      };
+    }
+  }
 }
