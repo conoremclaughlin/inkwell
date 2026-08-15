@@ -3,8 +3,45 @@ import type { DataComposer } from '../../data/composer';
 import type { Json } from '../../data/supabase/types';
 import { logger } from '../../utils/logger';
 import { userIdentifierBaseSchema, resolveUserOrThrow } from '../../services/user-resolver';
+import { getOAuthService, type ProviderAccountHealth } from '../../services/oauth';
 
 const VALID_STATUSES = ['healthy', 'degraded', 'error', 'not_configured'] as const;
+
+type HealthStatus = (typeof VALID_STATUSES)[number];
+
+/**
+ * Services whose real availability is decided by an OAuth account rather than by
+ * whatever an agent last wrote to integration_health. Listed explicitly so that
+ * a future `google_*` service which is not OAuth-backed cannot be swept in by a
+ * prefix match.
+ */
+const OAUTH_BACKED_SERVICES: Record<string, string> = {
+  google_calendar: 'google',
+  google_gmail: 'google',
+  google_docs: 'google',
+  google_drive: 'google',
+  google_sheets: 'google',
+};
+
+/**
+ * How old a hand-reported row may be before callers should stop reading it as a
+ * statement about the present. Rows carry their age either way; this only decides
+ * where the `stale` flag flips.
+ */
+const STALE_AFTER_MS = 60 * 60 * 1000;
+
+function ageSeconds(timestamp: string | null): number | null {
+  if (!timestamp) return null;
+  const parsed = new Date(timestamp).getTime();
+  if (Number.isNaN(parsed)) return null;
+  return Math.max(0, Math.round((Date.now() - parsed) / 1000));
+}
+
+function statusFromAccount(account: ProviderAccountHealth): HealthStatus {
+  if (account.state === 'active') return 'healthy';
+  if (account.state === 'missing') return 'not_configured';
+  return 'error';
+}
 
 export const updateIntegrationHealthSchema = userIdentifierBaseSchema.extend({
   service: z
@@ -108,9 +145,94 @@ export async function handleGetIntegrationHealth(args: unknown, dataComposer: Da
     throw new Error(`Failed to get integration health: ${error.message}`);
   }
 
-  logger.info(`Integration health queried: ${data?.length ?? 0} entries for user ${user.id}`, {
+  const cachedRows = data ?? [];
+
+  // Which OAuth-backed services to answer for. An explicit `service` filter must
+  // always get a verdict, even with no cached row — otherwise "is Gmail up?"
+  // returns an empty list, which reads as reassuring and means nothing.
+  const oauthServices = new Set<string>();
+  if (params.service) {
+    if (OAUTH_BACKED_SERVICES[params.service]) oauthServices.add(params.service);
+  } else {
+    for (const row of cachedRows) {
+      if (OAUTH_BACKED_SERVICES[row.service]) oauthServices.add(row.service);
+    }
+  }
+
+  // One lookup per provider rather than per service — the five google_* services
+  // all share a single connected account.
+  const providers = new Set([...oauthServices].map((s) => OAUTH_BACKED_SERVICES[s]));
+  const accountHealth = new Map<string, ProviderAccountHealth>();
+  await Promise.all(
+    [...providers].map(async (provider) => {
+      accountHealth.set(provider, await getOAuthService().inspectAccountHealth(user.id, provider));
+    })
+  );
+
+  const cachedByService = new Map(cachedRows.map((row) => [row.service, row]));
+  const services = [...new Set([...cachedByService.keys(), ...oauthServices])].sort();
+
+  const integrations = services.map((service) => {
+    const row = cachedByService.get(service);
+    const provider = OAUTH_BACKED_SERVICES[service];
+    const live = provider ? accountHealth.get(provider) : undefined;
+
+    const cachedAge = ageSeconds(row?.last_check_at ?? null);
+    const base = {
+      id: row?.id ?? null,
+      service,
+      lastHealthyAt: row?.last_healthy_at ?? null,
+      reportedByAgentId: row?.reported_by_agent_id ?? null,
+      metadata: row?.metadata ?? {},
+      updatedAt: row?.updated_at ?? null,
+      lastCheckAt: row?.last_check_at ?? null,
+      lastCheckAgeSeconds: cachedAge,
+    };
+
+    if (!live) {
+      // Nothing authoritative to consult — report the cache, but say how old it is.
+      return {
+        ...base,
+        status: (row?.status ?? 'not_configured') as HealthStatus,
+        errorCode: row?.error_code ?? null,
+        errorMessage: row?.error_message ?? null,
+        source: 'cached' as const,
+        stale: cachedAge === null || cachedAge * 1000 > STALE_AFTER_MS,
+      };
+    }
+
+    const liveStatus = statusFromAccount(live);
+    return {
+      ...base,
+      status: liveStatus,
+      errorCode: live.state === 'active' ? null : `oauth_${live.accountStatus ?? 'missing'}`,
+      errorMessage: live.reason,
+      source: 'live' as const,
+      // Derived from account state the OAuth service maintains on every call, so
+      // it is current by construction.
+      stale: false,
+      accountStatus: live.accountStatus,
+      accountObservedAt: live.observedAt,
+      accountLastUsedAt: live.lastUsedAt,
+      tokenExpiresAt: live.expiresAt,
+      providerLastError: live.lastError,
+      // A disagreeing hand-written row is kept rather than dropped: an agent may
+      // have seen a failure the account table cannot represent.
+      ...(row && row.status !== liveStatus
+        ? {
+            supersededCachedStatus: row.status,
+            lastReportedError: row.error_message ?? row.error_code ?? null,
+          }
+        : {}),
+    };
+  });
+
+  const unhealthy = integrations.filter((i) => i.status !== 'healthy').map((i) => i.service);
+
+  logger.info(`Integration health queried: ${integrations.length} entries for user ${user.id}`, {
     resolvedBy,
     service: params.service,
+    unhealthy,
   });
 
   return {
@@ -121,19 +243,9 @@ export async function handleGetIntegrationHealth(args: unknown, dataComposer: Da
           {
             success: true,
             user: { id: user.id, resolvedBy },
-            count: data?.length ?? 0,
-            integrations: (data ?? []).map((row) => ({
-              id: row.id,
-              service: row.service,
-              status: row.status,
-              errorCode: row.error_code,
-              errorMessage: row.error_message,
-              lastCheckAt: row.last_check_at,
-              lastHealthyAt: row.last_healthy_at,
-              reportedByAgentId: row.reported_by_agent_id,
-              metadata: row.metadata,
-              updatedAt: row.updated_at,
-            })),
+            count: integrations.length,
+            staleAfterSeconds: STALE_AFTER_MS / 1000,
+            integrations,
           },
           null,
           2

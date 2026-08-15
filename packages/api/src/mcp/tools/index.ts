@@ -6020,6 +6020,17 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description:
         'Check the health status of external service integrations. ' +
         'Returns all integrations for the user, or filter to a specific service.\n\n' +
+        'Read `source` before trusting `status`:\n' +
+        '- source "live": derived from stored OAuth account state, which the server ' +
+        'updates on every provider call. Current by construction. Google services ' +
+        '(gmail/calendar/drive/docs/sheets) always report this way.\n' +
+        '- source "cached": the last status an agent reported by hand. Check `stale` ' +
+        'and `lastCheckAgeSeconds` — a stale row describes the past, not the present, ' +
+        'and must not be relayed as a liveness signal.\n\n' +
+        'When live state contradicts a cached row, live wins and the old value is kept ' +
+        'as `supersededCachedStatus` / `lastReportedError`.\n\n' +
+        'Filtering to a specific service always returns a verdict for it, even with no ' +
+        'cached row, so an empty result never has to be read as good news.\n\n' +
         'User can be identified by ONE of:\n' +
         '- userId: Direct UUID\n' +
         '- email: Email address\n' +
