@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { InkRunner, DEFAULT_MAX_TURNS, clampMaxTurns } from './ink-runner';
+import { InkRunner, DEFAULT_MAX_TURNS, clampMaxTurns, parseInkModelUsage } from './ink-runner';
 
 vi.mock('../../utils/logger', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -324,6 +324,120 @@ describe('InkRunner usage parsing', () => {
     expect(result.usage.inputTokens).toBe(120);
     expect(result.usage.cacheReadTokens).toBe(0);
     expect(result.servedModel).toBeUndefined();
+  });
+});
+
+/**
+ * Cost attribution for ink sessions. #493 gave direct-claude spawns a per-model
+ * map with the backend's own costUSD; the ink path forwarded only the model
+ * name, so ink-backed agents (Myra) had no dollar figure at all.
+ */
+describe('parseInkModelUsage', () => {
+  it('maps the per-model block, cost included, keys as reported', () => {
+    const parsed = parseInkModelUsage({
+      'claude-opus-5': {
+        inputTokens: 900,
+        outputTokens: 120,
+        cacheReadTokens: 40_000,
+        cacheWriteTokens: 1_200,
+        costUSD: 0.0431,
+        canonicalModel: 'claude-opus-5',
+      },
+      'claude-haiku-4-5-20251001': {
+        inputTokens: 500,
+        outputTokens: 15,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        costUSD: 0.0006,
+        canonicalModel: 'claude-haiku-4-5',
+      },
+    })!;
+
+    expect(parsed['claude-opus-5'].costUSD).toBeCloseTo(0.0431);
+    expect(parsed['claude-opus-5'].cacheReadTokens).toBe(40_000);
+    // Both keys survive — a dated id and an alias can be distinct call sites.
+    expect(Object.keys(parsed).sort()).toEqual(['claude-haiku-4-5-20251001', 'claude-opus-5']);
+  });
+
+  // An older ink build emits no block at all; the field must be absent rather
+  // than a zeroed map that would read as "this run cost nothing".
+  it('returns undefined for absent or malformed input', () => {
+    expect(parseInkModelUsage(undefined)).toBeUndefined();
+    expect(parseInkModelUsage({})).toBeUndefined();
+    expect(parseInkModelUsage('nonsense')).toBeUndefined();
+    // Entries with nothing numeric are unreadable, not free: a present
+    // zero-cost map would read as a measured $0.00 (Lumen, PR #500 round 1).
+    expect(
+      parseInkModelUsage({ 'claude-opus-5': { inputTokens: 'lots', costUSD: null } })
+    ).toBeUndefined();
+    // A partially-readable entry still counts — but an unreported cost stays
+    // ABSENT rather than 0, or a summed session cost silently under-reports
+    // with no way to tell a measured zero from a never-reported one.
+    const partial = parseInkModelUsage({ 'claude-opus-5': { outputTokens: 12 } });
+    expect(partial!['claude-opus-5'].outputTokens).toBe(12);
+    expect(partial!['claude-opus-5'].costUSD).toBeUndefined();
+    // A genuinely reported zero is preserved as a measurement.
+    const freeTurn = parseInkModelUsage({ 'claude-opus-5': { outputTokens: 1, costUSD: 0 } });
+    expect(freeTurn!['claude-opus-5'].costUSD).toBe(0);
+  });
+
+  // The CLI is the only layer that sees every invocation of a run, so its
+  // completeness verdict is the authoritative one. Dropping it here promoted a
+  // lower bound back to a total at the process boundary (Lumen, PR #500 r4).
+  it('forwards the CLI cost-completeness marker across the boundary', () => {
+    const parsed = parseInkModelUsage({
+      'claude-opus-5': {
+        inputTokens: 10,
+        outputTokens: 20,
+        cacheReadTokens: 1_000,
+        cacheWriteTokens: 0,
+        costUSD: 0.01,
+        costPartial: true,
+        canonicalModel: 'claude-opus-5',
+      },
+    })!;
+
+    expect(parsed['claude-opus-5'].costUSD).toBeCloseTo(0.01);
+    expect(parsed['claude-opus-5'].costPartial).toBe(true);
+  });
+
+  it('does not invent a marker for a complete entry', () => {
+    const parsed = parseInkModelUsage({
+      'claude-opus-5': {
+        inputTokens: 10,
+        outputTokens: 20,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        costUSD: 0.01,
+      },
+    })!;
+
+    expect(parsed['claude-opus-5'].costPartial).toBeUndefined();
+  });
+
+  it('carries the block through parseOutput into usage', () => {
+    const runner = new InkRunner();
+    const stdout = JSON.stringify({
+      type: 'result',
+      text: 'done',
+      usage: { contextTokens: 5_000, inputTokens: 10, outputTokens: 20 },
+      model: 'claude-opus-5',
+      modelUsage: {
+        'claude-opus-5': {
+          inputTokens: 10,
+          outputTokens: 20,
+          cacheReadTokens: 4_900,
+          cacheWriteTokens: 0,
+          costUSD: 0.0125,
+          canonicalModel: 'claude-opus-5',
+        },
+      },
+    });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const result = (runner as any).parseOutput(stdout, '');
+
+    expect(result.usage.modelUsage['claude-opus-5'].costUSD).toBeCloseTo(0.0125);
   });
 });
 

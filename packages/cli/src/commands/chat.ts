@@ -60,7 +60,11 @@ import {
 } from '../repl/attachments.js';
 import { classifyActivity } from '../repl/activity-render.js';
 import { ToolMode, ToolPolicyScopeKind, ToolPolicyState } from '../repl/tool-policy.js';
-import { formatBackendTokenUsage, type BackendTokenUsage } from '../repl/token-usage.js';
+import {
+  formatBackendTokenUsage,
+  type BackendTokenUsage,
+  type BackendModelUsage,
+} from '../repl/token-usage.js';
 import { discoverSkills, loadSkillInstruction, type SkillInstruction } from '../repl/skills.js';
 import { applyToolApprovalChoice, parseToolApprovalInput } from '../repl/tool-approval.js';
 import { ensurePcpToolAllowed } from '../repl/tool-gate.js';
@@ -2952,12 +2956,63 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // Called at every backend result inside runTurnForLoop — the single boundary
   // all invocations flow through since the runAgentLoop extraction (#489).
   // A failed attempt that still reported usage counts: those tokens were spent.
+  //
+  // SUMMED, not diffed — and that is a deliberate, verified choice. Reading the
+  // Claude Code 2.1.233 binary suggests otherwise: its resume path can restore
+  // `lastModelUsage` into the cost ledger, and the result builder serializes
+  // `usage`/`modelUsage` from that ledger, which reads like every result is a
+  // running total that must be checkpointed and diffed.
+  //
+  // It is not, on this path. The save-on-exit that would populate that ledger
+  // is installed by the interactive React cost/status hook, and `-p` never
+  // mounts it — so a print-mode resume has nothing to restore. Confirmed
+  // black-box on 2.1.233 with three sequential `-p --resume` turns: costs came
+  // back $0.0176 / $0.0030 / $0.0029, each its own invocation, and the session
+  // transcript contained neither `modelUsage` nor `lastModelUsage`.
+  //
+  // This is provider-version behavior, not a contract. If a future version
+  // starts emitting running totals here, the symptom is session costs and
+  // tokens growing quadratically — at which point this needs per-native-session
+  // checkpoint/diff, the way SessionRepository.updateTokenUsage already does
+  // for Codex. (Wren's experiment + Lumen's binary analysis, PR #500.)
+  // Per-model totals for this run, accumulated key by key exactly as the
+  // backend reported them. Carries the backend's own costUSD, which is what
+  // makes spend answerable in dollars without a price table on our side.
+  const runModelUsage: Record<string, BackendModelUsage> = {};
+
   const recordRunUsage = (usage: BackendTokenUsage | undefined): void => {
     if (!usage) return;
     runUsageTotals.inputTokens += usage.inputTokens || 0;
     runUsageTotals.outputTokens += usage.outputTokens || 0;
     runUsageTotals.cacheReadTokens += usage.cacheReadTokens || 0;
     runUsageTotals.cacheWriteTokens += usage.cacheWriteTokens || 0;
+    for (const [model, entry] of Object.entries(usage.modelUsage || {})) {
+      const prior = runModelUsage[model];
+      runModelUsage[model] = {
+        inputTokens: (prior?.inputTokens || 0) + entry.inputTokens,
+        outputTokens: (prior?.outputTokens || 0) + entry.outputTokens,
+        cacheReadTokens: (prior?.cacheReadTokens || 0) + entry.cacheReadTokens,
+        cacheWriteTokens: (prior?.cacheWriteTokens || 0) + entry.cacheWriteTokens,
+        // Cost completeness, not just cost. Summing only the known parts and
+        // publishing the subtotal as the total under-reports invisibly; a
+        // first contribution that reports cost starts complete, and any
+        // unknown contribution after that marks the running figure partial.
+        ...(() => {
+          const priorCost = prior?.costUSD;
+          const entryCost = entry.costUSD;
+          if (priorCost === undefined && entryCost === undefined) return {};
+          const partial =
+            prior?.costPartial === true ||
+            (prior !== undefined && priorCost === undefined) ||
+            entryCost === undefined;
+          return {
+            costUSD: (priorCost ?? 0) + (entryCost ?? 0),
+            ...(partial ? { costPartial: true } : {}),
+          };
+        })(),
+        ...(entry.canonicalModel ? { canonicalModel: entry.canonicalModel } : {}),
+      };
+    }
   };
 
   // The model reported by the provider during THIS process. Deliberately
@@ -5750,6 +5805,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         // transcript-hydrated models are excluded — reporting either would
         // attribute usage to a model that may not have served the run.
         ...(currentRunModel ? { model: currentRunModel } : {}),
+        ...(Object.keys(runModelUsage).length > 0 ? { modelUsage: runModelUsage } : {}),
         ...(isBackendFailure ? { backendFailure: true } : {}),
       })
     );

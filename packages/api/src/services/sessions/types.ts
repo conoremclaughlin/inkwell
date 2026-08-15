@@ -66,7 +66,19 @@ export interface ModelUsageTotals {
   outputTokens: number;
   cacheReadTokens: number;
   cacheWriteTokens: number;
-  costUSD: number;
+  /**
+   * The backend's own cost figure. Optional: tokens can be readable while
+   * cost is not reported, and publishing 0 there would make a summed cost
+   * silently under-report (Lumen, PR #500 round 2).
+   */
+  costUSD?: number;
+  /**
+   * True when at least one contribution to `costUSD` did not report a cost, so
+   * the figure is a LOWER BOUND rather than the total. Without this, a mixed
+   * run publishes a subtotal that reads as complete — the same false certainty
+   * as a zero, one level up (Lumen, PR #500 round 3).
+   */
+  costPartial?: boolean;
   canonicalModel?: string;
 }
 

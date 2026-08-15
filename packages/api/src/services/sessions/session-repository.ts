@@ -81,7 +81,27 @@ function mergeModelUsage(
       outputTokens: (prior?.outputTokens || 0) + entry.outputTokens,
       cacheReadTokens: (prior?.cacheReadTokens || 0) + entry.cacheReadTokens,
       cacheWriteTokens: (prior?.cacheWriteTokens || 0) + entry.cacheWriteTokens,
-      costUSD: (prior?.costUSD || 0) + entry.costUSD,
+      // Cost completeness, not just cost: a mixed set of known and unknown
+      // contributions must not publish its subtotal as the total. Order does
+      // not matter — unknown-then-known and known-then-unknown both mark the
+      // running figure partial.
+      ...(() => {
+        const priorCost = prior?.costUSD;
+        const entryCost = entry.costUSD;
+        if (priorCost === undefined && entryCost === undefined) return {};
+        const partial =
+          prior?.costPartial === true ||
+          // The incoming turn may ALREADY be a lower bound (the CLI summed a
+          // run whose invocations mixed reported and unreported cost). Reading
+          // only `prior` made a first such entry land as complete.
+          entry.costPartial === true ||
+          (prior !== undefined && priorCost === undefined) ||
+          entryCost === undefined;
+        return {
+          costUSD: (priorCost ?? 0) + (entryCost ?? 0),
+          ...(partial ? { costPartial: true } : {}),
+        };
+      })(),
       ...(entry.canonicalModel ? { canonicalModel: entry.canonicalModel } : {}),
     };
   }

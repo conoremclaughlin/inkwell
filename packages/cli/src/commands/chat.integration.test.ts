@@ -411,6 +411,138 @@ describe('runChat integration', () => {
     expect(resultLine.usage.outputTokens).toBe(120);
   });
 
+  /**
+   * Dollar-level attribution for ink sessions. #493 gave direct-claude spawns a
+   * per-model map carrying Claude's own costUSD; the ink path forwarded only
+   * the model name, so ink-backed agents had tokens but no cost.
+   */
+  it('forwards per-model cost, summed across invocations', async () => {
+    let call = 0;
+    testState.runBackendImpl.mockImplementation(async () => {
+      call += 1;
+      return {
+        success: true,
+        stdout: call === 1 ? '```ink-tool\n{"tool":"get_timezone","args":{}}\n```' : 'done',
+        stderr: '',
+        exitCode: 0,
+        durationMs: 8,
+        command: 'mock',
+        usage: {
+          backend: 'claude',
+          source: 'json',
+          inputTokens: 10,
+          outputTokens: 20,
+          cacheReadTokens: 1_000,
+          cacheWriteTokens: 0,
+          modelUsage: {
+            'claude-opus-5': {
+              inputTokens: 10,
+              outputTokens: 20,
+              cacheReadTokens: 1_000,
+              cacheWriteTokens: 0,
+              costUSD: 0.01,
+              canonicalModel: 'claude-opus-5',
+            },
+          },
+        },
+      };
+    });
+
+    await runChat({
+      agent: 'lumen',
+      backend: 'claude',
+      nonInteractive: true,
+      message: 'what did this cost?',
+      pollSeconds: '999',
+    });
+
+    const resultLine = logSpy.mock.calls
+      .map((args) => String(args[0] ?? ''))
+      .filter((line) => line.trim().startsWith('{'))
+      .map((line) => {
+        try {
+          return JSON.parse(line);
+        } catch {
+          return null;
+        }
+      })
+      .find((parsed) => parsed && parsed.type === 'result');
+
+    expect(resultLine).toBeTruthy();
+    const invocations = testState.runBackendImpl.mock.calls.length;
+    expect(invocations).toBeGreaterThan(1);
+    // Cost accumulates per invocation, like tokens — one call's 0.01 alone
+    // would understate a multi-step run.
+    expect(resultLine.modelUsage['claude-opus-5'].costUSD).toBeCloseTo(0.01 * invocations);
+  });
+
+  /**
+   * A run whose invocations MIX reported and unreported cost must publish its
+   * figure as a lower bound, not as the total (Lumen, PR #500 round 3).
+   */
+  it('marks run cost partial when only some invocations reported it', async () => {
+    let call = 0;
+    testState.runBackendImpl.mockImplementation(async () => {
+      call += 1;
+      const modelUsage: Record<string, Record<string, number | string>> = {
+        'claude-opus-5': {
+          inputTokens: 10,
+          outputTokens: 20,
+          cacheReadTokens: 1_000,
+          cacheWriteTokens: 0,
+          canonicalModel: 'claude-opus-5',
+        },
+      };
+      // Only the FIRST invocation reports a cost.
+      if (call === 1) modelUsage['claude-opus-5'].costUSD = 0.01;
+      return {
+        success: true,
+        stdout: call === 1 ? '```ink-tool\n{"tool":"get_timezone","args":{}}\n```' : 'done',
+        stderr: '',
+        exitCode: 0,
+        durationMs: 8,
+        command: 'mock',
+        usage: {
+          backend: 'claude',
+          source: 'json',
+          inputTokens: 10,
+          outputTokens: 20,
+          cacheReadTokens: 1_000,
+          cacheWriteTokens: 0,
+          modelUsage,
+        },
+      };
+    });
+
+    await runChat({
+      agent: 'lumen',
+      backend: 'claude',
+      nonInteractive: true,
+      message: 'mixed cost reporting',
+      pollSeconds: '999',
+    });
+
+    expect(testState.runBackendImpl.mock.calls.length).toBeGreaterThan(1);
+
+    const resultLine = logSpy.mock.calls
+      .map((args) => String(args[0] ?? ''))
+      .filter((line) => line.trim().startsWith('{'))
+      .map((line) => {
+        try {
+          return JSON.parse(line);
+        } catch {
+          return null;
+        }
+      })
+      .find((parsed) => parsed && parsed.type === 'result');
+
+    const entry = resultLine.modelUsage['claude-opus-5'];
+    // The $0.01 is real, but later invocations reported nothing — publishing
+    // it as the run's cost would understate what was actually spent.
+    expect(entry.costUSD).toBeCloseTo(0.01);
+    expect(entry.costPartial).toBe(true);
+  });
+
   it('forwards --attach-file into the turn prompt, transcript, and backend attachment dirs', async () => {
     const mediaDir = join(testCwd, 'files', 'telegram');
     mkdirSync(mediaDir, { recursive: true });
