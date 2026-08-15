@@ -2956,6 +2956,25 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // Called at every backend result inside runTurnForLoop — the single boundary
   // all invocations flow through since the runAgentLoop extraction (#489).
   // A failed attempt that still reported usage counts: those tokens were spent.
+  //
+  // SUMMED, not diffed — and that is a deliberate, verified choice. Reading the
+  // Claude Code 2.1.233 binary suggests otherwise: its resume path can restore
+  // `lastModelUsage` into the cost ledger, and the result builder serializes
+  // `usage`/`modelUsage` from that ledger, which reads like every result is a
+  // running total that must be checkpointed and diffed.
+  //
+  // It is not, on this path. The save-on-exit that would populate that ledger
+  // is installed by the interactive React cost/status hook, and `-p` never
+  // mounts it — so a print-mode resume has nothing to restore. Confirmed
+  // black-box on 2.1.233 with three sequential `-p --resume` turns: costs came
+  // back $0.0176 / $0.0030 / $0.0029, each its own invocation, and the session
+  // transcript contained neither `modelUsage` nor `lastModelUsage`.
+  //
+  // This is provider-version behavior, not a contract. If a future version
+  // starts emitting running totals here, the symptom is session costs and
+  // tokens growing quadratically — at which point this needs per-native-session
+  // checkpoint/diff, the way SessionRepository.updateTokenUsage already does
+  // for Codex. (Wren's experiment + Lumen's binary analysis, PR #500.)
   // Per-model totals for this run, accumulated key by key exactly as the
   // backend reported them. Carries the backend's own costUSD, which is what
   // makes spend answerable in dollars without a price table on our side.
