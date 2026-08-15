@@ -81,7 +81,11 @@ function mergeModelUsage(
       outputTokens: (prior?.outputTokens || 0) + entry.outputTokens,
       cacheReadTokens: (prior?.cacheReadTokens || 0) + entry.cacheReadTokens,
       cacheWriteTokens: (prior?.cacheWriteTokens || 0) + entry.cacheWriteTokens,
-      costUSD: (prior?.costUSD || 0) + entry.costUSD,
+      // Only reported cost accumulates; a model whose cost was never reported
+      // keeps no cost rather than an invented 0.
+      ...(prior?.costUSD !== undefined || entry.costUSD !== undefined
+        ? { costUSD: (prior?.costUSD ?? 0) + (entry.costUSD ?? 0) }
+        : {}),
       ...(entry.canonicalModel ? { canonicalModel: entry.canonicalModel } : {}),
     };
   }

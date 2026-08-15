@@ -633,12 +633,77 @@ describe('SessionRepository.updateTokenUsage — per-model totals', () => {
   });
 });
 
+describe('SessionRepository.updateTokenUsage — unreported cost', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  // Summing an unreported cost as 0 would make a session's total look
+  // measured when part of it was never reported (Lumen, PR #500 round 2).
+  it('keeps cost absent when no turn reported one', async () => {
+    const { supabase, lastUpdate } = createMockSupabase();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const repo = new SessionRepository(supabase as any);
+
+    await repo.updateTokenUsage('sess-1', {
+      inputTokens: 100,
+      outputTokens: 10,
+      modelUsage: {
+        'claude-opus-5': {
+          inputTokens: 100,
+          outputTokens: 10,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+        },
+      },
+    });
+
+    const metadata = lastUpdate.data?.metadata as Record<string, Record<string, ModelTotals>>;
+    expect(metadata.modelUsage['claude-opus-5'].outputTokens).toBe(10);
+    expect(metadata.modelUsage['claude-opus-5'].costUSD).toBeUndefined();
+  });
+
+  it('accumulates once a turn does report cost', async () => {
+    const { supabase, lastUpdate, fakeRow } = createMockSupabase();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const repo = new SessionRepository(supabase as any);
+
+    fakeRow.metadata = {
+      modelUsage: {
+        'claude-opus-5': {
+          inputTokens: 100,
+          outputTokens: 10,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+        },
+      },
+    };
+
+    await repo.updateTokenUsage('sess-1', {
+      inputTokens: 50,
+      outputTokens: 5,
+      modelUsage: {
+        'claude-opus-5': {
+          inputTokens: 50,
+          outputTokens: 5,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          costUSD: 0.02,
+        },
+      },
+    });
+
+    const metadata = lastUpdate.data?.metadata as Record<string, Record<string, ModelTotals>>;
+    expect(metadata.modelUsage['claude-opus-5'].costUSD).toBeCloseTo(0.02);
+  });
+});
+
 interface ModelTotals {
   inputTokens: number;
   outputTokens: number;
   cacheReadTokens: number;
   cacheWriteTokens: number;
-  costUSD: number;
+  costUSD?: number;
   canonicalModel?: string;
 }
 

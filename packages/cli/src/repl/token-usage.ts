@@ -24,7 +24,13 @@ export interface BackendModelUsage {
   outputTokens: number;
   cacheReadTokens: number;
   cacheWriteTokens: number;
-  costUSD: number;
+  /**
+   * The backend's own cost figure. OPTIONAL on purpose: a turn whose tokens
+   * are readable but whose cost was not reported must not publish 0, or a
+   * summed session cost under-reports with no way to tell a measured zero
+   * from a never-reported one (Lumen, PR #500 round 2).
+   */
+  costUSD?: number;
   canonicalModel?: string;
 }
 

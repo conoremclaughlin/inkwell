@@ -75,7 +75,7 @@ export function parseInkModelUsage(raw: unknown): Record<string, ModelUsageTotal
       outputTokens: fields.outputTokens ?? 0,
       cacheReadTokens: fields.cacheReadTokens ?? 0,
       cacheWriteTokens: fields.cacheWriteTokens ?? 0,
-      costUSD: fields.costUSD ?? 0,
+      ...(fields.costUSD !== undefined ? { costUSD: fields.costUSD } : {}),
       ...(typeof entry.canonicalModel === 'string' ? { canonicalModel: entry.canonicalModel } : {}),
     };
   }

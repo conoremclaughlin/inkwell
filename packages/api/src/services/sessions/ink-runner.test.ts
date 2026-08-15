@@ -370,10 +370,15 @@ describe('parseInkModelUsage', () => {
     expect(
       parseInkModelUsage({ 'claude-opus-5': { inputTokens: 'lots', costUSD: null } })
     ).toBeUndefined();
-    // A partially-readable entry still counts — only the unusable parts zero.
+    // A partially-readable entry still counts — but an unreported cost stays
+    // ABSENT rather than 0, or a summed session cost silently under-reports
+    // with no way to tell a measured zero from a never-reported one.
     const partial = parseInkModelUsage({ 'claude-opus-5': { outputTokens: 12 } });
     expect(partial!['claude-opus-5'].outputTokens).toBe(12);
-    expect(partial!['claude-opus-5'].costUSD).toBe(0);
+    expect(partial!['claude-opus-5'].costUSD).toBeUndefined();
+    // A genuinely reported zero is preserved as a measurement.
+    const freeTurn = parseInkModelUsage({ 'claude-opus-5': { outputTokens: 1, costUSD: 0 } });
+    expect(freeTurn!['claude-opus-5'].costUSD).toBe(0);
   });
 
   it('carries the block through parseOutput into usage', () => {

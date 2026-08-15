@@ -66,7 +66,12 @@ export interface ModelUsageTotals {
   outputTokens: number;
   cacheReadTokens: number;
   cacheWriteTokens: number;
-  costUSD: number;
+  /**
+   * The backend's own cost figure. Optional: tokens can be readable while
+   * cost is not reported, and publishing 0 there would make a summed cost
+   * silently under-report (Lumen, PR #500 round 2).
+   */
+  costUSD?: number;
   canonicalModel?: string;
 }
 
