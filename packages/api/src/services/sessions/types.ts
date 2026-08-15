@@ -557,6 +557,15 @@ export interface ClaudeRunnerConfig {
   /** Root repo path — propagated via context token for cross-project 'main' resolution */
   repoRoot?: string;
   /**
+   * This server's own MCP endpoint, derived from the port it actually bound.
+   *
+   * Needed because a committed `.mcp.json` is not evidence of where the server
+   * is listening: `PCP_PORT_BASE=4001 yarn dev` moves the listener without
+   * rewriting that file. Runners that hand credentials to a subprocess must
+   * target the real endpoint or they leak them to whoever owns the default port.
+   */
+  inkMcpUrl?: string;
+  /**
    * Additional permission rules to merge into .claude/settings.local.json
    * before this session's spawn. Restored to the original after the process
    * exits. Used by strategy configs and 2FA permission grants.

@@ -69,6 +69,8 @@ export interface SessionServiceConfig {
   /** Optional explicit model override for Gemini backend */
   defaultGeminiModel?: string;
   defaultAntigravityModel?: string;
+  /** This server's own MCP endpoint, from the port the HTTP listener bound. */
+  inkMcpUrl?: string;
   /** Token threshold for triggering compaction */
   compactionThreshold: number;
   /** Callback to route responses from async operations (compaction, etc.) */
@@ -946,6 +948,7 @@ export class SessionService implements ISessionService {
     const runnerConfig: ClaudeRunnerConfig = {
       workingDirectory: resolvedWorkingDirectory,
       mcpConfigPath: this.config.mcpConfigPath,
+      ...(this.config.inkMcpUrl ? { inkMcpUrl: this.config.inkMcpUrl } : {}),
       appendSystemPrompt: buildIdentityPrompt(
         agentId,
         injectedContext.agent.name,
@@ -2082,6 +2085,7 @@ This session will continue with a fresh context after compaction. Your identity,
       const runnerConfig: ClaudeRunnerConfig = {
         workingDirectory: compactionWorkingDirectory,
         mcpConfigPath: this.config.mcpConfigPath,
+        ...(this.config.inkMcpUrl ? { inkMcpUrl: this.config.inkMcpUrl } : {}),
         appendSystemPrompt: buildIdentityPrompt(
           session.agentId,
           context.agent.name,

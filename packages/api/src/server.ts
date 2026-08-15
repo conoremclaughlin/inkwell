@@ -153,6 +153,10 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     ...(env.DEFAULT_ANTIGRAVITY_MODEL
       ? { defaultAntigravityModel: env.DEFAULT_ANTIGRAVITY_MODEL }
       : {}),
+    // The port this process actually bound, not whatever a checked-in config
+    // file claims — an isolated server started with PCP_PORT_BASE must not hand
+    // its credentials to the main server on 3001.
+    inkMcpUrl: `http://localhost:${env.MCP_HTTP_PORT}/mcp`,
   };
   sessionService = createSessionService(dataComposer.getClient(), sessionServiceConfig);
   logger.info('SessionService ready');

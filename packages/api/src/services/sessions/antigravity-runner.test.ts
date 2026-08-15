@@ -9,7 +9,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync, statSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
@@ -27,12 +27,15 @@ import {
   normalizeInput,
   unwrapMcpCall,
   resolveInkMcpUrl,
+  launcherPath,
+  bridgePathForContent,
+  stageBridge,
   applyAgyEvent,
   newAgyStreamState,
-  stagedBridgePath,
   AntigravityRunner,
 } from './antigravity-runner.js';
 import type { ClaudeRunnerConfig } from './types.js';
+import { classifyError } from '@inklabs/shared';
 
 const baseConfig = (overrides: Partial<ClaudeRunnerConfig> = {}): ClaudeRunnerConfig => ({
   workingDirectory: '/tmp/work',
@@ -124,10 +127,15 @@ describe('extractToolData', () => {
     expect(toolCalls[0].input).toEqual({ path: '/tmp/x' });
   });
 
-  it('captures send_response as a channel response', () => {
-    const { responses } = extractToolData({
+  it('never synthesises a ChannelResponse, because the MCP server already sent it', () => {
+    // The bridge calls the LIVE Inkwell MCP server, so handleSendResponse has
+    // already invoked the ChannelGateway by the time this event is parsed.
+    // Returning a response here makes server.ts route the same message again
+    // and the user receives it twice.
+    const { responses, toolCalls } = extractToolData({
       event: 'step_update',
       step_update: {
+        state: 'DONE',
         tool_info: {
           name: 'mcp__inkwell__send_response',
           parameters: { channel: 'telegram', conversationId: '42', content: 'hi there' },
@@ -135,22 +143,9 @@ describe('extractToolData', () => {
       },
     });
 
-    expect(responses).toHaveLength(1);
-    expect(responses[0]).toMatchObject({
-      channel: 'telegram',
-      conversationId: '42',
-      content: 'hi there',
-    });
-  });
-
-  it('drops a send_response that is missing content rather than emitting an empty message', () => {
-    const { responses } = extractToolData({
-      event: 'step_update',
-      step_update: {
-        tool_info: { name: 'mcp__inkwell__send_response', parameters: { channel: 'telegram' } },
-      },
-    });
     expect(responses).toEqual([]);
+    // Still recorded for the activity stream.
+    expect(toolCalls[0].toolName).toBe('mcp__inkwell__send_response');
   });
 
   it('terminates on a self-referencing event instead of hanging the parser', () => {
@@ -209,13 +204,13 @@ describe('ensureGlobalMcpConfig', () => {
   // The method is private because nothing outside the runner should call it;
   // reaching in is deliberate, and cheaper than spawning agy to observe a file.
   const ensure = (runner: AntigravityRunner) =>
-    (runner as unknown as { ensureGlobalMcpConfig: () => Promise<void> }).ensureGlobalMcpConfig();
+    (runner as unknown as { ensureGlobalMcpConfig: () => Promise<string> }).ensureGlobalMcpConfig();
 
   it('writes an inkwell stdio entry when no config exists', async () => {
     await ensure(new AntigravityRunner());
 
     const written = JSON.parse(readFileSync(configPath, 'utf-8'));
-    expect(written.mcpServers.inkwell.command).toMatch(/antigravity-mcp-bridge\.mjs$/);
+    expect(written.mcpServers.inkwell.command).toBe(launcherPath());
     expect(written.mcpServers.inkwell.args).toEqual([]);
   });
 
@@ -264,7 +259,7 @@ describe('ensureGlobalMcpConfig', () => {
     await ensure(new AntigravityRunner());
 
     const entry = JSON.parse(readFileSync(configPath, 'utf-8')).mcpServers.inkwell;
-    expect(entry.command).toBe(stagedBridgePath());
+    expect(entry.command).toBe(launcherPath());
     expect(entry.args).toEqual([]);
     expect(entry.command).not.toContain('packages/api');
     expect(entry.command).not.toContain(process.execPath);
@@ -283,17 +278,18 @@ describe('ensureGlobalMcpConfig', () => {
 
     const written = JSON.parse(readFileSync(configPath, 'utf-8'));
     expect(written.mcpServers.sqlite).toEqual({ command: 'sqlite-mcp-server' });
-    expect(written.mcpServers.inkwell.command).toBe(stagedBridgePath());
+    expect(written.mcpServers.inkwell.command).toBe(launcherPath());
   });
 
-  it('leaves an unparseable config alone instead of erasing servers it cannot see', async () => {
-    // Reversed from the original behaviour on purpose. Treating a parse failure
-    // as {} and writing over it destroys every other MCP server the user has.
+  it('leaves an unparseable config alone AND fails closed', async () => {
+    // Two separate obligations. Preserving the file is data safety — we cannot
+    // see what else it holds. Throwing is the safety that matters more: a
+    // successful return would start agy with no bootstrap, no memory and no
+    // send_response, and it would still produce a fluent-looking answer.
     mkdirSync(join(home, '.gemini', 'config'), { recursive: true });
     writeFileSync(configPath, '{ not json');
 
-    await ensure(new AntigravityRunner());
-
+    await expect(ensure(new AntigravityRunner())).rejects.toThrow(/refusing to start agy/);
     expect(readFileSync(configPath, 'utf-8')).toBe('{ not json');
   });
 
@@ -317,10 +313,8 @@ describe('unwrapMcpCall', () => {
     expect(input).toEqual({ userId: 'u1' });
   });
 
-  it('recognises send_response through the wrapper', () => {
-    // This is the one that matters most: unrecognised means a reply the agent
-    // genuinely sent never reaches its channel.
-    const { responses } = extractToolData({
+  it('recognises send_response through the wrapper without re-routing it', () => {
+    const { responses, toolCalls } = extractToolData({
       event: 'step_update',
       step_update: {
         state: 'DONE',
@@ -335,8 +329,10 @@ describe('unwrapMcpCall', () => {
       },
     });
 
-    expect(responses).toHaveLength(1);
-    expect(responses[0]).toMatchObject({ channel: 'telegram', content: 'done' });
+    // Named correctly for the activity stream, but NOT re-delivered: the live
+    // MCP handler already sent it.
+    expect(toolCalls[0].toolName).toBe('mcp__inkwell__send_response');
+    expect(responses).toEqual([]);
   });
 
   it('leaves a native tool name untouched', () => {
@@ -527,5 +523,143 @@ describe('run() failure classification', () => {
 
     expect(result.success).toBe(true);
     expect(result.backendSessionId).toBe('conv-ok');
+  });
+});
+
+describe('bridge publication (version crossover)', () => {
+  let home: string;
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), 'agy-home-'));
+    hoisted.home = home;
+  });
+  afterEach(() => rmSync(home, { recursive: true, force: true }));
+
+  it('names the launcher, whose content does not vary with the bridge revision', async () => {
+    // The launcher is what the shared config points at. If ITS bytes changed
+    // per revision we would be back to last-writer-wins on a shared executable.
+    const { launcher } = await stageBridge();
+    expect(launcher).toBe(launcherPath());
+
+    const first = readFileSync(launcher, 'utf-8');
+    await stageBridge();
+    expect(readFileSync(launcher, 'utf-8')).toBe(first);
+    expect(first).toContain('INK_BRIDGE_PATH');
+  });
+
+  it('gives different bridge revisions different paths so they coexist', async () => {
+    // The round-one fix stabilised the config path but left every server
+    // overwriting one shared executable — a peer on another revision could
+    // swap it out between our staging it and agy exec'ing it.
+    const a = bridgePathForContent('bridge revision A');
+    const b = bridgePathForContent('bridge revision B');
+
+    expect(a).not.toBe(b);
+    expect(bridgePathForContent('bridge revision A')).toBe(a);
+  });
+
+  it('stages an executable bridge and returns its content-addressed path', async () => {
+    const { bridge } = await stageBridge();
+    expect(bridge).toMatch(/antigravity-mcp-bridge-[0-9a-f]{16}\.mjs$/);
+    expect(statSync(bridge).mode & 0o111).toBeGreaterThan(0);
+  });
+});
+
+describe('resolveInkMcpUrl — isolated servers', () => {
+  const saved = { url: process.env.INK_SERVER_URL, base: process.env.PCP_PORT_BASE };
+  afterEach(() => {
+    for (const [k, v] of [
+      ['INK_SERVER_URL', saved.url],
+      ['PCP_PORT_BASE', saved.base],
+    ] as const) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    delete process.env.INK_PORT_BASE;
+  });
+
+  it('uses the endpoint the server bound, over any config file', async () => {
+    delete process.env.INK_SERVER_URL;
+    delete process.env.PCP_PORT_BASE;
+    await expect(
+      resolveInkMcpUrl(baseConfig({ inkMcpUrl: 'http://localhost:4001/mcp' }))
+    ).resolves.toBe('http://localhost:4001/mcp');
+  });
+
+  it('honours PCP_PORT_BASE even when the repo .mcp.json still says 3001', async () => {
+    // This is the documented isolation recipe: `PCP_PORT_BASE=4001 yarn dev`
+    // does NOT rewrite the committed .mcp.json. Trusting that file would send
+    // an isolated server's bearer token to the MAIN server.
+    delete process.env.INK_SERVER_URL;
+    process.env.PCP_PORT_BASE = '4001';
+
+    const dir = mkdtempSync(join(tmpdir(), 'agy-repo-'));
+    writeFileSync(
+      join(dir, '.mcp.json'),
+      JSON.stringify({ mcpServers: { inkwell: { url: 'http://localhost:3001/mcp' } } })
+    );
+
+    await expect(resolveInkMcpUrl(baseConfig({ workingDirectory: dir }))).resolves.toBe(
+      'http://localhost:4001/mcp'
+    );
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe('non-zero exit handling', () => {
+  const withSpawnResult = (result: Record<string, unknown>) => {
+    const runner = new AntigravityRunner();
+    (runner as unknown as { spawnProcess: () => Promise<unknown> }).spawnProcess = () =>
+      Promise.resolve(result);
+    return runner;
+  };
+
+  it('reports a crash as a failure and keeps the init conversation id', async () => {
+    // Rejecting here used to discard the accumulator, so the id agy emitted on
+    // `init` was lost and the next message started a fresh conversation —
+    // able to repeat side effects the crashed turn already performed.
+    const runner = withSpawnResult({
+      responses: [],
+      toolCalls: [],
+      conversationId: 'conv-from-init',
+      status: 'CRASH',
+      error: 'agy exited with code 1: no error output captured',
+    });
+
+    const result = await runner.run('hi', { config: baseConfig() });
+
+    expect(result.success).toBe(false);
+    expect(result.backendSessionId).toBe('conv-from-init');
+  });
+
+  it('reports a crash as a failure even when partial text arrived first', async () => {
+    // The old branch only rejected when there was no output at all, so a
+    // non-zero exit after partial text resolved with no status — success:true.
+    const runner = withSpawnResult({
+      responses: [],
+      toolCalls: [],
+      status: 'CRASH',
+      error: 'agy exited with code 1',
+      finalTextResponse: 'I was partway through when',
+    });
+
+    const result = await runner.run('hi', { config: baseConfig() });
+    expect(result.success).toBe(false);
+  });
+
+  it('classifies a timeout as a timeout, not a crash', async () => {
+    // classifyError matches on the word "timeout". Without it the turn is a
+    // non-retryable crash and queued messages get flushed.
+    const runner = withSpawnResult({
+      responses: [],
+      toolCalls: [],
+      status: 'TIMEOUT',
+      error: 'Antigravity timeout: no output for 300s, process killed',
+    });
+
+    const result = await runner.run('hi', { config: baseConfig() });
+    expect(result.success).toBe(false);
+    const classified = classifyError({ errorText: result.error ?? '' });
+    expect(classified.category).toBe('timeout');
+    expect(classified.retryable).toBe(true);
   });
 });
