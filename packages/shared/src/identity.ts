@@ -8,7 +8,7 @@
 // ── Backends ──────────────────────────────────────────────────────
 
 /** CLI backend names — the canonical short names used in identity.json, CLI flags, etc. */
-export const BACKENDS = ['claude', 'codex', 'gemini'] as const;
+export const BACKENDS = ['claude', 'codex', 'gemini', 'antigravity'] as const;
 export type Backend = (typeof BACKENDS)[number];
 
 /**
@@ -20,6 +20,8 @@ export const BACKEND_ALIASES: Record<string, Backend> = {
   'claude-cli': 'claude',
   'codex-cli': 'codex',
   'gemini-cli': 'gemini',
+  agy: 'antigravity',
+  'antigravity-cli': 'antigravity',
 };
 
 /** Resolve a backend string to its canonical name, or undefined if unknown. */
