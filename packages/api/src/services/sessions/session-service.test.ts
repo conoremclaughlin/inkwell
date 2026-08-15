@@ -207,6 +207,53 @@ describe('SessionService', () => {
     );
   });
 
+  describe('MCP endpoint propagation', () => {
+    it('hands the runner the endpoint the server bound, not a config file', async () => {
+      // The standard isolation recipe (`PCP_PORT_BASE=4001 yarn dev`) does not
+      // rewrite the committed .mcp.json, so a runner that trusts that file
+      // sends an isolated server's bearer token to the MAIN server on 3001.
+      // server.ts derives this from env.MCP_HTTP_PORT — the port the listener
+      // actually bound — and it has to survive the trip to runnerConfig.
+      const isolated = new SessionService(
+        mockRepository,
+        mockContextBuilder,
+        mockClaudeRunner,
+        mockActivityStream,
+        {
+          defaultWorkingDirectory: '/test',
+          mcpConfigPath: '/test/.mcp.json',
+          compactionThreshold: 150000,
+          inkMcpUrl: 'http://localhost:4001/mcp',
+        },
+        mockCodexRunner,
+        undefined,
+        undefined,
+        mockInkRunner
+      );
+
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(createMockSession());
+      await isolated.handleMessage(createMockRequest());
+
+      expect(mockClaudeRunner.run).toHaveBeenCalled();
+      const [, options] = vi.mocked(mockClaudeRunner.run).mock.calls[0];
+      expect((options as { config: { inkMcpUrl?: string } }).config.inkMcpUrl).toBe(
+        'http://localhost:4001/mcp'
+      );
+    });
+
+    it('omits the field entirely when the server did not supply one', async () => {
+      // Absent must stay absent rather than becoming a hardcoded default here;
+      // the runner's own precedence chain handles the fallback.
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(createMockSession());
+      await sessionService.handleMessage(createMockRequest());
+
+      const [, options] = vi.mocked(mockClaudeRunner.run).mock.calls[0];
+      expect((options as { config: { inkMcpUrl?: string } }).config).not.toHaveProperty(
+        'inkMcpUrl'
+      );
+    });
+  });
+
   describe('Message Locking', () => {
     it('should process messages sequentially for the same session', async () => {
       const session = createMockSession();

@@ -369,10 +369,25 @@ describe('tool lifecycle deduplication', () => {
 });
 
 describe('resolveInkMcpUrl', () => {
-  const original = process.env.INK_SERVER_URL;
+  // Every port/URL variable has to be isolated, not just INK_SERVER_URL. This
+  // studio runs with INK_PORT_BASE=3001 set, and leaving it visible made the
+  // "falls back to the workspace file" case resolve from the port base instead
+  // — the suite passed for me and failed for Lumen (round three).
+  const PORT_ENV = ['INK_SERVER_URL', 'INK_PORT_BASE', 'PCP_PORT_BASE'] as const;
+  const original: Record<string, string | undefined> = {};
+
+  beforeEach(() => {
+    for (const key of PORT_ENV) {
+      original[key] = process.env[key];
+      delete process.env[key];
+    }
+  });
+
   afterEach(() => {
-    if (original === undefined) delete process.env.INK_SERVER_URL;
-    else process.env.INK_SERVER_URL = original;
+    for (const key of PORT_ENV) {
+      if (original[key] === undefined) delete process.env[key];
+      else process.env[key] = original[key];
+    }
   });
 
   it('prefers INK_SERVER_URL, which is what the container orchestrator rewrites', async () => {
@@ -382,10 +397,7 @@ describe('resolveInkMcpUrl', () => {
     );
   });
 
-  it('falls back to the workspace .mcp.json so an isolated server is not sent to :3001', async () => {
-    // The failure this prevents: a server on PCP_PORT_BASE=4001 handing its
-    // bearer token and context to the MAIN server on 3001.
-    delete process.env.INK_SERVER_URL;
+  it('falls back to the workspace .mcp.json when nothing more authoritative exists', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'agy-ws-'));
     writeFileSync(
       join(dir, '.mcp.json'),
@@ -399,7 +411,6 @@ describe('resolveInkMcpUrl', () => {
   });
 
   it('defaults to :3001 only when nothing else says otherwise', async () => {
-    delete process.env.INK_SERVER_URL;
     await expect(resolveInkMcpUrl(baseConfig({ workingDirectory: '/nonexistent' }))).resolves.toBe(
       'http://localhost:3001/mcp'
     );

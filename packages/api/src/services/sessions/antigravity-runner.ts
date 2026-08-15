@@ -268,15 +268,24 @@ export async function withFileLock(lockPath: string, fn: () => Promise<void>): P
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
 
       // Break a lock left behind by a process that died mid-write, otherwise a
-      // single crash disables MCP for this backend permanently. Re-read the
-      // owner immediately before unlinking so we only break the lock we
-      // judged stale, not a fresh one that replaced it in between.
+      // single crash disables MCP for this backend permanently.
+      //
+      // The break is a RENAME, not a read-then-unlink. Checking the token and
+      // then unlinking is two operations: two waiters can both read the same
+      // stale owner, both decide to break it, and the second unlink removes
+      // whichever fresh lock was acquired in between — putting two writers in
+      // the critical section at once. rename() is atomic, so exactly one
+      // breaker wins and the loser's rename fails with ENOENT.
       try {
-        const owner = await readFile(lockPath, 'utf-8');
         const age = Date.now() - (await stat(lockPath)).mtimeMs;
         if (age > LOCK_STALE_MS) {
-          if ((await readFile(lockPath, 'utf-8')) === owner) {
-            await rm(lockPath, { force: true });
+          const claimed = `${lockPath}.broken.${token.replace(/[^\w.-]/g, '')}`;
+          try {
+            await rename(lockPath, claimed);
+            await rm(claimed, { force: true });
+          } catch {
+            // Someone else broke it, or the owner released it first. Either
+            // way the lock is no longer ours to break.
           }
           continue;
         }
@@ -575,20 +584,26 @@ export class AntigravityRunner implements IRunner {
           // SIGTERM alone lets SessionService finalize and release the session
           // while the old agy and its bridge are still executing MCP side
           // effects against it.
-          void this.killProcess(proc).then(() => {
-            // status/error, not just a marker string: run() decides success
-            // from `status`, so resolving bare reports a killed turn as a
-            // successful one — the session goes idle and the marker can be
-            // forwarded to a human as if it were the agent's answer. The word
-            // "timeout" is load-bearing: classifyError matches on it, and
-            // without it this classifies as a non-retryable crash.
-            resolve({
-              ...finish(),
-              status: 'TIMEOUT',
-              error: `Antigravity timeout: no output for ${idleSecs}s, process killed`,
-              finalTextResponse: finalTextResponse || `[Process timed out after ${idleSecs}s idle]`,
+          void this.killProcess(proc)
+            .catch((error) => {
+              // Never let a fault in teardown strand the turn — resolve anyway.
+              logger.error('Antigravity teardown failed after idle timeout', { error });
+            })
+            .then(() => {
+              // status/error, not just a marker string: run() decides success
+              // from `status`, so resolving bare reports a killed turn as a
+              // successful one — the session goes idle and the marker can be
+              // forwarded to a human as if it were the agent's answer. The word
+              // "timeout" is load-bearing: classifyError matches on it, and
+              // without it this classifies as a non-retryable crash.
+              resolve({
+                ...finish(),
+                status: 'TIMEOUT',
+                error: `Antigravity timeout: no output for ${idleSecs}s, process killed`,
+                finalTextResponse:
+                  finalTextResponse || `[Process timed out after ${idleSecs}s idle]`,
+              });
             });
-          });
         }, IDLE_TIMEOUT_MS);
       };
       resetIdleTimer();
@@ -599,14 +614,18 @@ export class AntigravityRunner implements IRunner {
           timeoutMs: PROCESS_TIMEOUT_MS,
         });
         settled = true;
-        void this.killProcess(proc).then(() => {
-          resolve({
-            ...finish(),
-            status: 'TIMEOUT',
-            error: `Antigravity timeout: exceeded the ${Math.round(PROCESS_TIMEOUT_MS / 1000)}s ceiling, process killed`,
-            finalTextResponse: finalTextResponse || '[Process hit hard timeout]',
+        void this.killProcess(proc)
+          .catch((error) => {
+            logger.error('Antigravity teardown failed after hard timeout', { error });
+          })
+          .then(() => {
+            resolve({
+              ...finish(),
+              status: 'TIMEOUT',
+              error: `Antigravity timeout: exceeded the ${Math.round(PROCESS_TIMEOUT_MS / 1000)}s ceiling, process killed`,
+              finalTextResponse: finalTextResponse || '[Process hit hard timeout]',
+            });
           });
-        });
       }, PROCESS_TIMEOUT_MS);
 
       const acc: AgyStreamState = {
@@ -727,12 +746,21 @@ export class AntigravityRunner implements IRunner {
     if (proc.exitCode !== null || proc.signalCode !== null) return Promise.resolve();
 
     return new Promise<void>((resolve) => {
+      // `let` and declared BEFORE finish(). These were `const` below the
+      // function that clears them, so the `proc.kill` catch path — the one
+      // taken when the child is already gone — hit them in the temporal dead
+      // zone and threw a ReferenceError out of the promise executor. Callers
+      // only attach .then(), so nothing observed the rejection and the turn
+      // stayed pending forever: a hang, not a crash.
+      let escalation: NodeJS.Timeout | undefined;
+      let giveUp: NodeJS.Timeout | undefined;
       let done = false;
+
       const finish = () => {
         if (done) return;
         done = true;
-        clearTimeout(escalation);
-        clearTimeout(giveUp);
+        if (escalation) clearTimeout(escalation);
+        if (giveUp) clearTimeout(giveUp);
         resolve();
       };
 
@@ -745,7 +773,7 @@ export class AntigravityRunner implements IRunner {
         return;
       }
 
-      const escalation = setTimeout(() => {
+      escalation = setTimeout(() => {
         try {
           proc.kill('SIGKILL');
         } catch {
@@ -755,7 +783,7 @@ export class AntigravityRunner implements IRunner {
 
       // Never block the turn forever on an unkillable child. Past this point
       // the process is unreachable and waiting longer helps nobody.
-      const giveUp = setTimeout(() => {
+      giveUp = setTimeout(() => {
         logger.error('Antigravity child did not exit after SIGKILL', { pid: proc.pid });
         finish();
       }, KILL_ESCALATION_MS + KILL_GIVEUP_MS);
