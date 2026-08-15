@@ -25,7 +25,8 @@
 
 import { spawn, type ChildProcess } from 'child_process';
 import { createHash } from 'crypto';
-import { chmod, mkdir, readFile, rename, rm, stat, writeFile } from 'fs/promises';
+import lockfile from 'proper-lockfile';
+import { chmod, mkdir, readFile, rename, writeFile } from 'fs/promises';
 import { join, dirname } from 'path';
 import { homedir } from 'os';
 import type {
@@ -223,89 +224,85 @@ async function inkEntryMatches(configPath: string, desired: unknown): Promise<bo
  * one rename would hit ENOENT.
  */
 let tmpCounter = 0;
-let lockCounter = 0;
 function scratchPath(target: string): string {
   tmpCounter += 1;
   return `${target}.${process.pid}.${tmpCounter}.tmp`;
 }
 
-/** A lock older than this is presumed abandoned by a crashed process. */
+/**
+ * How long before an unrefreshed lock counts as abandoned, and how hard to wait.
+ * proper-lockfile refreshes the mtime while the owner holds it, so `stale` only
+ * elapses for a process that actually died.
+ */
 const LOCK_STALE_MS = 30_000;
-const LOCK_POLL_MS = 50;
-const LOCK_TIMEOUT_MS = 5_000;
+const LOCK_RETRIES = { retries: 10, minTimeout: 50, maxTimeout: 500 } as const;
 
 /**
- * Hold an exclusive lock across PROCESSES while mutating the host-global config.
+ * How often the owner refreshes its lock's mtime.
  *
- * In-process mutexes are not enough here: the contending writers are separate
- * Node servers (main, isolated, dist), so the lock has to live in the
- * filesystem. `wx` is atomic on every platform we run on.
+ * proper-lockfile defaults this to stale/2 — 15s here — which is also how long
+ * a robbed owner would keep writing before noticing. Our critical section is a
+ * couple of file operations, so the timer almost never fires at all; paying for
+ * a stat every second while actually holding the lock buys prompt detection.
  */
-export async function withFileLock(lockPath: string, fn: () => Promise<void>): Promise<void> {
-  const deadline = Date.now() + LOCK_TIMEOUT_MS;
-  // Ownership token, not just a pid. A waiter may decide our lock is stale and
-  // take its own; if we then resume (machine sleep, long GC pause) an
-  // unconditional unlink in our finally would free THEIR lock and let a third
-  // writer into the critical section. Every removal checks this token first.
-  lockCounter += 1;
-  const token = `${process.pid}:${lockCounter}:${process.hrtime.bigint()}`;
-  let held = false;
+const LOCK_UPDATE_MS = 1_000;
 
-  const removeIfOurs = async (): Promise<void> => {
-    try {
-      if ((await readFile(lockPath, 'utf-8')) !== token) return;
-      await rm(lockPath, { force: true });
-    } catch {
-      // Already gone, or unreadable — nothing safe to do either way.
-    }
-  };
-
-  while (!held) {
-    try {
-      await writeFile(lockPath, token, { flag: 'wx' });
-      held = true;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-
-      // Break a lock left behind by a process that died mid-write, otherwise a
-      // single crash disables MCP for this backend permanently.
-      //
-      // The break is a RENAME, not a read-then-unlink. Checking the token and
-      // then unlinking is two operations: two waiters can both read the same
-      // stale owner, both decide to break it, and the second unlink removes
-      // whichever fresh lock was acquired in between — putting two writers in
-      // the critical section at once. rename() is atomic, so exactly one
-      // breaker wins and the loser's rename fails with ENOENT.
-      try {
-        const age = Date.now() - (await stat(lockPath)).mtimeMs;
-        if (age > LOCK_STALE_MS) {
-          const claimed = `${lockPath}.broken.${token.replace(/[^\w.-]/g, '')}`;
-          try {
-            await rename(lockPath, claimed);
-            await rm(claimed, { force: true });
-          } catch {
-            // Someone else broke it, or the owner released it first. Either
-            // way the lock is no longer ours to break.
-          }
-          continue;
-        }
-      } catch {
-        continue; // Vanished under us — retry immediately.
-      }
-
-      if (Date.now() > deadline) {
-        // Proceeding unlocked could clobber a peer's servers.
-        throw new Error(`Timed out waiting for ${lockPath}`);
-      }
-      await new Promise((resolve) => setTimeout(resolve, LOCK_POLL_MS));
-    }
+/** Raised when the lock was taken from us mid-write; the caller must not claim success. */
+export class LockCompromisedError extends Error {
+  constructor(cause: unknown) {
+    super(`Ink MCP config lock was compromised: ${String(cause)}`);
+    this.name = 'LockCompromisedError';
   }
+}
+
+/**
+ * Hold an exclusive, ownership-safe lock across PROCESSES while mutating the
+ * host-global config.
+ *
+ * Hand-rolling this was wrong three times, each the same way: POSIX has no
+ * atomic compare-and-delete, so every "check who owns it, then remove it"
+ * scheme leaves a window. The last attempt made the stale break a `rename` and
+ * I called that atomic — but rename does not compare the owner, so a waiter
+ * that had already judged lock A stale could resume after A was released and
+ * silently move B's fresh lock instead, putting two writers in the critical
+ * section at once. Lumen reproduced exactly that schedule.
+ *
+ * The established answer is not to prevent theft, which is not possible here,
+ * but to detect it and refuse to claim success. proper-lockfile refreshes the
+ * lock mtime while held — so a live owner is never judged stale — and calls
+ * `onCompromised` if the lock is stolen or disappears. That is treated as a
+ * hard failure so the caller fails closed rather than reporting a write it
+ * cannot vouch for.
+ */
+export async function withFileLock(target: string, fn: () => Promise<void>): Promise<void> {
+  let compromised: unknown;
+
+  const release = await lockfile.lock(target, {
+    stale: LOCK_STALE_MS,
+    update: LOCK_UPDATE_MS,
+    retries: LOCK_RETRIES,
+    // The config may not exist yet, and realpath() throws on a missing file.
+    realpath: false,
+    onCompromised: (error) => {
+      // Do NOT throw from here: it would surface as an unhandled rejection on
+      // proper-lockfile's refresh timer instead of reaching the caller.
+      compromised = error;
+    },
+  });
 
   try {
     await fn();
   } finally {
-    await removeIfOurs();
+    // A compromised lock is already gone; releasing again throws over whatever
+    // the critical section was trying to report.
+    if (!compromised) {
+      await release().catch((error) => {
+        logger.warn('Failed to release Ink MCP config lock', { target, error });
+      });
+    }
   }
+
+  if (compromised) throw new LockCompromisedError(compromised);
 }
 
 interface AntigravityUsage {
@@ -431,7 +428,7 @@ export class AntigravityRunner implements IRunner {
     if (await inkEntryMatches(configPath, desired)) return bridge;
 
     let installed = false;
-    await withFileLock(`${configPath}.ink-lock`, async () => {
+    await withFileLock(configPath, async () => {
       // Re-read INSIDE the lock. The copy we compared a moment ago may already
       // be stale, and merging onto it would silently drop whatever a peer
       // process added in between.
