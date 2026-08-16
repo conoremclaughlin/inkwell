@@ -48,6 +48,46 @@ export type SessionLifecycle = 'running' | 'idle' | 'completed' | 'failed';
 /** @deprecated Use SessionLifecycle */
 export type SessionStatus = 'active' | 'paused' | 'completed' | 'failed';
 
+/**
+ * Last cumulative usage seen from a backend that reports running thread
+ * totals (Codex `turn.completed.usage` carries `ThreadTokenUsage.total`).
+ *
+ * Scoped to `backendSessionId` because the totals reset whenever the backend
+ * thread changes — resume onto a new thread, compaction, or a fresh run. A
+ * checkpoint from a different thread must never be diffed against.
+ */
+/**
+ * One model's accumulated contribution to a session. `costUSD` is the
+ * backend's own cost figure, which answers the spend question directly
+ * instead of requiring a price table here.
+ */
+export interface ModelUsageTotals {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  /**
+   * The backend's own cost figure. Optional: tokens can be readable while
+   * cost is not reported, and publishing 0 there would make a summed cost
+   * silently under-report (Lumen, PR #500 round 2).
+   */
+  costUSD?: number;
+  /**
+   * True when at least one contribution to `costUSD` did not report a cost, so
+   * the figure is a LOWER BOUND rather than the total. Without this, a mixed
+   * run publishes a subtotal that reads as complete — the same false certainty
+   * as a zero, one level up (Lumen, PR #500 round 3).
+   */
+  costPartial?: boolean;
+  canonicalModel?: string;
+}
+
+export interface UsageCheckpoint {
+  backendSessionId: string | null;
+  inputTokens: number;
+  outputTokens: number;
+}
+
 export interface Session {
   id: string;
   userId: string;
@@ -74,6 +114,31 @@ export interface Session {
   contextTokens: number;
   totalInputTokens: number;
   totalOutputTokens: number;
+
+  /**
+   * Cache breakdown of `totalInputTokens` — NOT additional tokens. Cached
+   * input bills at a different rate from fresh input (reads 0.1x, writes
+   * 1.25x), so cost attribution needs the split, while context-window math
+   * needs the total. Only backends that report caching populate these.
+   */
+  totalCacheReadTokens: number;
+  totalCacheWriteTokens: number;
+
+  /**
+   * Per-model totals for this session, keyed exactly as the backend reported
+   * them. Authoritative for "which models actually ran and what did they
+   * cost" — it covers subagents, aliases and mid-session model changes, none
+   * of which the single `model` column can express. Keys are never merged
+   * here; grouping (e.g. by canonicalModel) belongs to the reporting layer.
+   */
+  modelUsage?: Record<string, ModelUsageTotals>;
+
+  /**
+   * Last cumulative usage observed from a backend that reports running
+   * thread totals rather than per-turn deltas (Codex). Used to diff
+   * successive reports; see SessionRepository.updateTokenUsage.
+   */
+  usageCheckpoint?: UsageCheckpoint;
 
   // Aggregate counters (persisted as columns)
   messageCount: number;
@@ -185,11 +250,26 @@ export interface SessionResult {
 
   // Token usage from this interaction
   usage?: {
-    contextTokens: number;
+    /**
+     * Tokens currently in the backend's context window.
+     *
+     * Omitted when the backend reports no such measure — Codex JSONL carries
+     * none, and aliasing it to a cumulative input total stores a false
+     * reading. Absent means unknown, not zero.
+     */
+    contextTokens?: number;
     inputTokens: number;
     outputTokens: number;
     cacheReadTokens?: number;
     cacheWriteTokens?: number;
+    /** This turn's per-model figures, keyed as the backend reported them. */
+    modelUsage?: Record<string, ModelUsageTotals>;
+    /**
+     * True when the backend reports running thread totals instead of a
+     * per-turn delta (Codex `turn.completed.usage` is `ThreadTokenUsage.total`).
+     * The repository must diff against its checkpoint rather than add.
+     */
+    cumulative?: boolean;
   };
 
   // Session state after processing
@@ -379,11 +459,31 @@ export interface ISessionRepository {
 
   create(session: Omit<Session, 'id' | 'startedAt' | 'lastActivityAt'>): Promise<Session>;
 
-  update(id: string, updates: Partial<Session>): Promise<Session>;
+  update(
+    id: string,
+    updates: Omit<Partial<Session>, 'studioId'> & { studioId?: string | null }
+  ): Promise<Session>;
 
   updateTokenUsage(
     id: string,
-    usage: { contextTokens: number; inputTokens: number; outputTokens: number }
+    usage: {
+      /** Omitted when the backend reports no per-turn context measure. */
+      contextTokens?: number;
+      inputTokens: number;
+      outputTokens: number;
+      /** Cache breakdown of `inputTokens`, not additions to it. */
+      cacheReadTokens?: number;
+      cacheWriteTokens?: number;
+      /** This turn's per-model figures, keyed as the backend reported them. */
+      modelUsage?: Record<string, ModelUsageTotals>;
+      /**
+       * True when the counts are running totals for `backendSessionId`
+       * rather than this turn's delta. The repository diffs them against
+       * its stored checkpoint before accumulating.
+       */
+      cumulative?: boolean;
+    },
+    options?: { backendSessionId?: string | null }
   ): Promise<void>;
 
   markCompacted(id: string, newBackendSessionId: string | null): Promise<void>;
@@ -450,8 +550,33 @@ export interface ClaudeRunnerConfig {
   studioId?: string;
   /** When true, bypass sandbox restrictions (e.g., Codex --dangerously-bypass-approvals-and-sandbox). Opt-in per studio. */
   sandboxBypass?: boolean;
+  /**
+   * Continuation-loop turn cap for InkRunner spawns. Counts OUTER
+   * conversational turns — the delivered message plus continuation prompts
+   * (runUserTurn cycles) — NOT provider subprocess calls, of which one turn's
+   * tool loop may spawn several. Sourced from the SB's dashboard settings
+   * (agent_identities.metadata.runtimeConfig.maxTurns); the runner clamps and
+   * defaults (5) when absent. signal_status is the sanctioned in-loop halt —
+   * this only caps runaway continuations.
+   */
+  maxTurns?: number;
+  /**
+   * Tool routing for InkRunner spawns, from the SB's dashboard settings
+   * (runtimeConfig.toolRouting). Forwarded as `--tool-routing`; when absent
+   * the ink chat loop resolves its own default ('local').
+   */
+  toolRouting?: 'backend' | 'local';
   /** Root repo path — propagated via context token for cross-project 'main' resolution */
   repoRoot?: string;
+  /**
+   * This server's own MCP endpoint, derived from the port it actually bound.
+   *
+   * Needed because a committed `.mcp.json` is not evidence of where the server
+   * is listening: `PCP_PORT_BASE=4001 yarn dev` moves the listener without
+   * rewriting that file. Runners that hand credentials to a subprocess must
+   * target the real endpoint or they leak them to whoever owns the default port.
+   */
+  inkMcpUrl?: string;
   /**
    * Additional permission rules to merge into .claude/settings.local.json
    * before this session's spawn. Restored to the original after the process
@@ -475,6 +600,12 @@ export interface RunnerResult {
   backendSessionId: string | null;
   responses: ChannelResponse[];
   usage?: SessionResult['usage'];
+  /**
+   * The model that served the main conversation, as the backend reported it
+   * on its own top-level assistant messages. Distinct from per-model usage:
+   * that says which models spent tokens, this says which one WAS the agent.
+   */
+  servedModel?: string;
   error?: string;
   /** The final text response from the backend (for auto-routing if no explicit send_response) */
   finalTextResponse?: string;

@@ -7,7 +7,38 @@ export interface BackendTokenUsage {
   cacheWriteTokens?: number;
   reasoningTokens?: number;
   source: 'json' | 'text';
+  /**
+   * Per-model breakdown as the backend reported it, keyed exactly as reported.
+   * Carries the backend's own cost figure, which answers "what did this spend"
+   * without a price table in our code. Keys are never merged here — a query can
+   * list both a dated model id and its alias, and only the reporting layer has
+   * the context to decide whether those are one model or two.
+   */
+  modelUsage?: Record<string, BackendModelUsage>;
   raw?: Record<string, unknown>;
+}
+
+/** One model's contribution to a turn, from the backend's own report. */
+export interface BackendModelUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  /**
+   * The backend's own cost figure. OPTIONAL on purpose: a turn whose tokens
+   * are readable but whose cost was not reported must not publish 0, or a
+   * summed session cost under-reports with no way to tell a measured zero
+   * from a never-reported one (Lumen, PR #500 round 2).
+   */
+  costUSD?: number;
+  /**
+   * True when at least one contribution to `costUSD` did not report a cost, so
+   * the figure is a LOWER BOUND rather than the total. Without this, a mixed
+   * run publishes a subtotal that reads as complete — the same false certainty
+   * as a zero, one level up (Lumen, PR #500 round 3).
+   */
+  costPartial?: boolean;
+  canonicalModel?: string;
 }
 
 function toNumber(value: unknown): number | undefined {
@@ -38,7 +69,9 @@ function pick(...values: Array<unknown>): number | undefined {
   return undefined;
 }
 
-function normalizeUsageObject(obj: Record<string, unknown>): Omit<BackendTokenUsage, 'backend' | 'source'> | null {
+function normalizeUsageObject(
+  obj: Record<string, unknown>
+): Omit<BackendTokenUsage, 'backend' | 'source'> | null {
   const usageCandidate = (obj.usage as Record<string, unknown> | undefined) || obj;
 
   const inputTokens = pick(
@@ -137,13 +170,18 @@ function parseTextUsage(text: string): Omit<BackendTokenUsage, 'backend' | 'sour
     text.match(/(?:input|prompt)\s*(?:tokens?)?\s*[:=]\s*([\d.,]+(?:\s*[kKmM])?)/i) ||
     text.match(/([\d.,]+(?:\s*[kKmM])?)\s*(?:input|prompt)\s*tokens?/i);
   const outputMatch =
-    text.match(/(?:output|completion|candidate)\s*(?:tokens?)?\s*[:=]\s*([\d.,]+(?:\s*[kKmM])?)/i) ||
-    text.match(/([\d.,]+(?:\s*[kKmM])?)\s*(?:output|completion|candidate)\s*tokens?/i);
+    text.match(
+      /(?:output|completion|candidate)\s*(?:tokens?)?\s*[:=]\s*([\d.,]+(?:\s*[kKmM])?)/i
+    ) || text.match(/([\d.,]+(?:\s*[kKmM])?)\s*(?:output|completion|candidate)\s*tokens?/i);
   const totalMatch =
     text.match(/(?:total|all)\s*(?:tokens?)?\s*[:=]\s*([\d.,]+(?:\s*[kKmM])?)/i) ||
     text.match(/([\d.,]+(?:\s*[kKmM])?)\s*total\s*tokens?/i);
-  const cacheReadMatch = text.match(/(?:cache(?:d)?\s*(?:read|hit)?\s*tokens?)\s*[:=]\s*([\d.,]+(?:\s*[kKmM])?)/i);
-  const cacheWriteMatch = text.match(/(?:cache\s*write\s*tokens?)\s*[:=]\s*([\d.,]+(?:\s*[kKmM])?)/i);
+  const cacheReadMatch = text.match(
+    /(?:cache(?:d)?\s*(?:read|hit)?\s*tokens?)\s*[:=]\s*([\d.,]+(?:\s*[kKmM])?)/i
+  );
+  const cacheWriteMatch = text.match(
+    /(?:cache\s*write\s*tokens?)\s*[:=]\s*([\d.,]+(?:\s*[kKmM])?)/i
+  );
   const reasoningMatch = text.match(/(?:reasoning\s*tokens?)\s*[:=]\s*([\d.,]+(?:\s*[kKmM])?)/i);
 
   const inputTokens = pick(inputMatch?.[1]);
@@ -214,10 +252,15 @@ export function formatBackendTokenUsage(usage: BackendTokenUsage): string {
   if (usage.inputTokens !== undefined) parts.push(`in ${usage.inputTokens.toLocaleString()}`);
   if (usage.outputTokens !== undefined) parts.push(`out ${usage.outputTokens.toLocaleString()}`);
   if (usage.totalTokens !== undefined) parts.push(`total ${usage.totalTokens.toLocaleString()}`);
-  if (usage.cacheReadTokens !== undefined) parts.push(`cache-read ${usage.cacheReadTokens.toLocaleString()}`);
-  if (usage.cacheWriteTokens !== undefined) parts.push(`cache-write ${usage.cacheWriteTokens.toLocaleString()}`);
-  if (usage.reasoningTokens !== undefined) parts.push(`reasoning ${usage.reasoningTokens.toLocaleString()}`);
+  if (usage.cacheReadTokens !== undefined)
+    parts.push(`cache-read ${usage.cacheReadTokens.toLocaleString()}`);
+  if (usage.cacheWriteTokens !== undefined)
+    parts.push(`cache-write ${usage.cacheWriteTokens.toLocaleString()}`);
+  if (usage.reasoningTokens !== undefined)
+    parts.push(`reasoning ${usage.reasoningTokens.toLocaleString()}`);
 
   const details = parts.join(' · ');
-  return details ? `${usage.backend} usage (${usage.source}): ${details}` : `${usage.backend} usage (${usage.source})`;
+  return details
+    ? `${usage.backend} usage (${usage.source}): ${details}`
+    : `${usage.backend} usage (${usage.source})`;
 }

@@ -220,8 +220,8 @@ describe('Studio PCP Identity Integration', () => {
       stdio: 'pipe',
     });
 
-    // Create .pcp directory and identity
-    const pcpDir = join(worktreePath, '.pcp');
+    // Create .ink directory and identity
+    const pcpDir = join(worktreePath, '.ink');
     mkdirSync(pcpDir, { recursive: true });
 
     const identity = {
@@ -236,7 +236,7 @@ describe('Studio PCP Identity Integration', () => {
     writeFileSync(join(pcpDir, 'identity.json'), JSON.stringify(identity, null, 2));
 
     // Verify identity file exists and is valid
-    const identityPath = join(worktreePath, '.pcp', 'identity.json');
+    const identityPath = join(worktreePath, '.ink', 'identity.json');
     expect(existsSync(identityPath)).toBe(true);
 
     const savedIdentity = JSON.parse(readFileSync(identityPath, 'utf-8'));
@@ -259,21 +259,21 @@ describe('Studio PCP Identity Integration', () => {
     });
 
     // Create identities
-    mkdirSync(join(ws1Path, '.pcp'), { recursive: true });
-    mkdirSync(join(ws2Path, '.pcp'), { recursive: true });
+    mkdirSync(join(ws1Path, '.ink'), { recursive: true });
+    mkdirSync(join(ws2Path, '.ink'), { recursive: true });
 
     writeFileSync(
-      join(ws1Path, '.pcp', 'identity.json'),
+      join(ws1Path, '.ink', 'identity.json'),
       JSON.stringify({ agentId: 'wren', context: 'studio-frontend' }, null, 2)
     );
     writeFileSync(
-      join(ws2Path, '.pcp', 'identity.json'),
+      join(ws2Path, '.ink', 'identity.json'),
       JSON.stringify({ agentId: 'wren', context: 'studio-backend' }, null, 2)
     );
 
     // Verify both exist with different contexts
-    const id1 = JSON.parse(readFileSync(join(ws1Path, '.pcp', 'identity.json'), 'utf-8'));
-    const id2 = JSON.parse(readFileSync(join(ws2Path, '.pcp', 'identity.json'), 'utf-8'));
+    const id1 = JSON.parse(readFileSync(join(ws1Path, '.ink', 'identity.json'), 'utf-8'));
+    const id2 = JSON.parse(readFileSync(join(ws2Path, '.ink', 'identity.json'), 'utf-8'));
 
     expect(id1.context).toBe('studio-frontend');
     expect(id2.context).toBe('studio-backend');

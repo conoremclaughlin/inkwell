@@ -95,9 +95,15 @@ function RuntimeSettingsPanel({ agentId, identity }: { agentId: string; identity
   const [toolRouting, setToolRouting] = useState(rc.toolRouting || '');
   const [maxTurns, setMaxTurns] = useState(String(rc.maxTurns || ''));
   const [recallEnabled, setRecallEnabled] = useState(rc.passiveRecall?.enabled !== false);
-  const [recallCooldown, setRecallCooldown] = useState(String(rc.passiveRecall?.cooldownTurns ?? '3'));
-  const [recallCeiling, setRecallCeiling] = useState(String(rc.passiveRecall?.budgetCeiling ?? '0.8'));
-  const [recallMaxInject, setRecallMaxInject] = useState(String(rc.passiveRecall?.maxInjectPerTurn ?? '2'));
+  const [recallCooldown, setRecallCooldown] = useState(
+    String(rc.passiveRecall?.cooldownTurns ?? '3')
+  );
+  const [recallCeiling, setRecallCeiling] = useState(
+    String(rc.passiveRecall?.budgetCeiling ?? '0.8')
+  );
+  const [recallMaxInject, setRecallMaxInject] = useState(
+    String(rc.passiveRecall?.maxInjectPerTurn ?? '2')
+  );
 
   const saveSettings = useApiPatch<
     { success: boolean },
@@ -142,43 +148,68 @@ function RuntimeSettingsPanel({ agentId, identity }: { agentId: string; identity
           </CardTitle>
           <CardDescription>
             Configure default backend, tool permissions, and passive recall for{' '}
-            <span className="font-semibold">{identity.name}</span>. These are stored defaults
-            used by triggers and heartbeats. Use the CLI reference below to apply them manually.
+            <span className="font-semibold">{identity.name}</span>. These are stored defaults used
+            by triggers and heartbeats. Use the CLI reference below to apply them manually.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-6">
           {/* Backend */}
           <div>
             <label className={labelClass}>Default Backend</label>
-            <select value={backend} onChange={(e) => setBackend(e.target.value)} className={selectClass}>
+            <select
+              value={backend}
+              onChange={(e) => setBackend(e.target.value)}
+              className={selectClass}
+            >
               {BACKENDS.map((b) => (
-                <option key={b.value} value={b.value}>{b.label}</option>
+                <option key={b.value} value={b.value}>
+                  {b.label}
+                </option>
               ))}
             </select>
-            <p className="mt-1 text-xs text-gray-400">Which AI provider runs this agent by default.</p>
+            <p className="mt-1 text-xs text-gray-400">
+              Which AI provider runs this agent by default.
+            </p>
           </div>
 
           <div className="grid gap-6 md:grid-cols-2">
             {/* Tool Profile */}
             <div>
               <label className={labelClass}>Tool Profile</label>
-              <select value={toolProfile} onChange={(e) => setToolProfile(e.target.value)} className={selectClass}>
+              <select
+                value={toolProfile}
+                onChange={(e) => setToolProfile(e.target.value)}
+                className={selectClass}
+              >
                 {TOOL_PROFILES.map((p) => (
-                  <option key={p.value} value={p.value}>{p.label}</option>
+                  <option key={p.value} value={p.value}>
+                    {p.label}
+                  </option>
                 ))}
               </select>
-              <p className="mt-1 text-xs text-gray-400">Which Ink tools are allowed without prompting.</p>
+              <p className="mt-1 text-xs text-gray-400">
+                Which Ink tools are allowed without prompting.
+              </p>
             </div>
 
             {/* Tool Routing */}
             <div>
               <label className={labelClass}>Tool Routing</label>
-              <select value={toolRouting} onChange={(e) => setToolRouting(e.target.value)} className={selectClass}>
+              <select
+                value={toolRouting}
+                onChange={(e) => setToolRouting(e.target.value)}
+                className={selectClass}
+              >
                 {TOOL_ROUTING.map((r) => (
-                  <option key={r.value} value={r.value}>{r.label}</option>
+                  <option key={r.value} value={r.value}>
+                    {r.label}
+                  </option>
                 ))}
               </select>
-              <p className="mt-1 text-xs text-gray-400">How Ink tool calls are routed.</p>
+              <p className="mt-1 text-xs text-gray-400">
+                Local: Ink owns the tool loop — the provider gets no tool MCP servers. Backend: the
+                provider calls MCP tools natively.
+              </p>
             </div>
           </div>
 
@@ -188,13 +219,17 @@ function RuntimeSettingsPanel({ agentId, identity }: { agentId: string; identity
             <input
               type="number"
               min="1"
-              max="20"
-              placeholder="3"
+              max="25"
+              placeholder="5"
               value={maxTurns}
               onChange={(e) => setMaxTurns(e.target.value)}
               className={inputClass}
             />
-            <p className="mt-1 text-xs text-gray-400">How many conversational turns in --message mode.</p>
+            <p className="mt-1 text-xs text-gray-400">
+              Cap on conversational turns per server-spawned session — the delivered message plus
+              continuation prompts (default 5, max 25). The agent finishes earlier by signalling
+              completion.
+            </p>
           </div>
 
           {/* Passive Recall */}
@@ -266,7 +301,9 @@ function RuntimeSettingsPanel({ agentId, identity }: { agentId: string; identity
               <span className="text-sm text-green-600">Settings saved.</span>
             )}
             {saveSettings.isError && (
-              <span className="text-sm text-red-600">Failed to save: {saveSettings.error?.message}</span>
+              <span className="text-sm text-red-600">
+                Failed to save: {saveSettings.error?.message}
+              </span>
             )}
           </div>
         </CardContent>
@@ -279,11 +316,11 @@ function RuntimeSettingsPanel({ agentId, identity }: { agentId: string; identity
         </CardHeader>
         <CardContent>
           <pre className="bg-gray-900 text-gray-100 p-3 rounded-md text-xs font-mono overflow-x-auto">
-{`# Run ${identity.name} with these settings
+            {`# Run ${identity.name} with these settings
 ink chat --agent ${agentId}${backend ? ` --backend ${backend}` : ''}${toolProfile ? ` --profile ${toolProfile}` : ''}${toolRouting ? ` --tool-routing ${toolRouting}` : ''}${maxTurns ? ` --max-turns ${maxTurns}` : ''}
 
 # Heartbeat mode
-ink chat --agent ${agentId}${backend ? ` --backend ${backend}` : ''} --profile ${toolProfile || 'collaborative'} --max-turns ${maxTurns || '3'} --message "Heartbeat check"`}
+ink chat --agent ${agentId}${backend ? ` --backend ${backend}` : ''} --profile ${toolProfile || 'collaborative'} --max-turns ${maxTurns || '5'} --message "Heartbeat check"`}
           </pre>
         </CardContent>
       </Card>

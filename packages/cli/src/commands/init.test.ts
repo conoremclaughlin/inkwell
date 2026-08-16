@@ -12,7 +12,7 @@ import { tmpdir } from 'os';
 import { installHooks } from './hooks.js';
 import { syncMcpConfig } from './mcp.js';
 
-const TEST_DIR = join(tmpdir(), 'pcp-init-test-' + Date.now());
+const TEST_DIR = join(tmpdir(), 'ink-init-test-' + Date.now());
 
 beforeEach(() => {
   mkdirSync(TEST_DIR, { recursive: true });
@@ -32,21 +32,21 @@ afterEach(() => {
 
 describe('init: .ink/ directory', () => {
   it('should create .ink/ if it does not exist', () => {
-    const pcpDir = join(TEST_DIR, '.ink');
-    expect(existsSync(pcpDir)).toBe(false);
-    mkdirSync(pcpDir, { recursive: true });
-    expect(existsSync(pcpDir)).toBe(true);
+    const inkDir = join(TEST_DIR, '.ink');
+    expect(existsSync(inkDir)).toBe(false);
+    mkdirSync(inkDir, { recursive: true });
+    expect(existsSync(inkDir)).toBe(true);
   });
 
   it('should be idempotent if .ink/ already exists', () => {
-    const pcpDir = join(TEST_DIR, '.ink');
-    mkdirSync(pcpDir, { recursive: true });
-    writeFileSync(join(pcpDir, 'identity.json'), JSON.stringify({ agentId: 'wren' }));
+    const inkDir = join(TEST_DIR, '.ink');
+    mkdirSync(inkDir, { recursive: true });
+    writeFileSync(join(inkDir, 'identity.json'), JSON.stringify({ agentId: 'wren' }));
 
     // Creating again should not clobber
-    mkdirSync(pcpDir, { recursive: true });
-    expect(existsSync(join(pcpDir, 'identity.json'))).toBe(true);
-    const identity = JSON.parse(readFileSync(join(pcpDir, 'identity.json'), 'utf-8'));
+    mkdirSync(inkDir, { recursive: true });
+    expect(existsSync(join(inkDir, 'identity.json'))).toBe(true);
+    const identity = JSON.parse(readFileSync(join(inkDir, 'identity.json'), 'utf-8'));
     expect(identity.agentId).toBe('wren');
   });
 });
@@ -186,15 +186,15 @@ describe('init: backend config sync', () => {
 
 describe('init: full flow idempotency', () => {
   function simulateInit(cwd: string): {
-    pcp: 'created' | 'exists';
+    ink: 'created' | 'exists';
     mcp: 'created' | 'exists' | 'updated';
     hooks: string;
     sync: boolean;
   } {
     // Step 1: .ink/
-    const pcpDir = join(cwd, '.ink');
-    const pcpResult = existsSync(pcpDir) ? ('exists' as const) : ('created' as const);
-    mkdirSync(pcpDir, { recursive: true });
+    const inkDir = join(cwd, '.ink');
+    const inkResult = existsSync(inkDir) ? ('exists' as const) : ('created' as const);
+    mkdirSync(inkDir, { recursive: true });
 
     // Step 2: .mcp.json
     const mcpPath = join(cwd, '.mcp.json');
@@ -232,7 +232,7 @@ describe('init: full flow idempotency', () => {
     const syncResult = syncMcpConfig(cwd);
 
     return {
-      pcp: pcpResult,
+      ink: inkResult,
       mcp: mcpResult,
       hooks: hooksResult,
       sync: syncResult.codex || syncResult.gemini,
@@ -241,7 +241,7 @@ describe('init: full flow idempotency', () => {
 
   it('should create everything on first run', () => {
     const result = simulateInit(TEST_DIR);
-    expect(result.pcp).toBe('created');
+    expect(result.ink).toBe('created');
     expect(result.mcp).toBe('created');
     expect(result.hooks).toBe('installed');
     expect(result.sync).toBe(true);
@@ -250,15 +250,15 @@ describe('init: full flow idempotency', () => {
   it('should detect everything exists on second run', () => {
     simulateInit(TEST_DIR);
     const result = simulateInit(TEST_DIR);
-    expect(result.pcp).toBe('exists');
+    expect(result.ink).toBe('exists');
     expect(result.mcp).toBe('exists');
     expect(result.hooks).toBe('already-installed');
     // sync still returns true because it overwrites
     expect(result.sync).toBe(true);
   });
 
-  it('should add pcp to existing .mcp.json on first run', () => {
-    // Pre-existing .mcp.json without pcp
+  it('should add inkwell to existing .mcp.json on first run', () => {
+    // Pre-existing .mcp.json without inkwell
     writeFileSync(
       join(TEST_DIR, '.mcp.json'),
       JSON.stringify({

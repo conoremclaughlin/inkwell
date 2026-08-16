@@ -95,14 +95,14 @@ LOG_LEVEL=info                  # error, warn, info, debug
 
 ### Viewing Logs
 
-Winston writes structured logs to `~/.pcp/logs/`:
+Winston writes structured logs to `~/.ink/logs/`:
 
 ```bash
 yarn logs:pcp              # Formatted JSON logs
 yarn logs:pcp:errors       # Errors only
 
 # Or tail directly
-tail -f ~/.pcp/logs/combined.log
+tail -f ~/.ink/logs/combined.log
 ```
 
 ### Running Individual Services

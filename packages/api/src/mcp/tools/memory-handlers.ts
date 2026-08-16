@@ -22,6 +22,7 @@ import { getEffectiveAgentId } from '../../auth/enforce-identity';
 import type { MemorySource, Salience, Session } from '../../data/models/memory';
 import { getCloudSkillsService } from '../../skills/cloud-service';
 import { resolveMainStudio } from '../../services/sessions/session-service';
+import { StudioLeaseService } from '../../services/studio-lease.service';
 
 // Helper to safely read a file, returning null if it doesn't exist
 async function safeReadFile(filePath: string): Promise<string | null> {
@@ -45,13 +46,13 @@ const BUNDLED_CONVENTIONS_PATH = path.resolve(
 );
 
 // Enums for validation
-const memorySourceSchema = z.enum([
-  'conversation',
-  'observation',
-  'user_stated',
-  'inferred',
-  'session',
-]);
+// Source is provenance and is intentionally open. The DB CHECK constraint that
+// limited it to a fixed set was dropped (migration 20260219080201) so agents can
+// use descriptive sources, and the MemorySource model type is likewise open
+// (`string & {}`). Keep this a permissive string — a strict enum here is the one
+// remaining gate that wrongly rejects valid provenance like "pr-review" /
+// "codex-review". Canonical values are documented on the field describes below.
+const memorySourceSchema = z.string().min(1);
 const salienceSchema = z.enum(['low', 'medium', 'high', 'critical']);
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -134,6 +135,7 @@ export function mapSessionForBootstrap(
     agentId?: string;
     studioId?: string;
     threadKey?: string;
+    activeThreadKey?: string;
     lifecycle?: string;
     currentPhase?: string;
     context?: string;
@@ -146,6 +148,7 @@ export function mapSessionForBootstrap(
     agentId: s.agentId,
     studioId: s.studioId || null,
     threadKey: s.threadKey || null,
+    activeThreadKey: s.activeThreadKey || null,
     lifecycle: s.lifecycle || null,
     currentPhase: s.currentPhase || null,
     ...(callerSessionId && s.id === callerSessionId && s.context ? { context: s.context } : {}),
@@ -346,7 +349,11 @@ export const rememberSchema = userIdentifierBaseSchema.extend({
     .describe(
       'One-liner description of the topic itself (not this memory). Used to build the topic index at bootstrap. Only needed when creating a new topic or updating its description.'
     ),
-  source: memorySourceSchema.optional().describe('Source of the memory (default: observation)'),
+  source: memorySourceSchema
+    .optional()
+    .describe(
+      'Provenance of the memory. Canonical values: conversation, observation, user_stated, inferred, session, reflection. Free-form is allowed for specific provenance (e.g. "pr-review", "codex-review", "posthoc-review"). Default: observation.'
+    ),
   salience: salienceSchema.optional().describe('Importance level (default: medium)'),
   topics: topicsSchema.describe('Topics for categorization'),
   metadata: z.record(z.unknown()).optional().describe('Additional metadata'),
@@ -378,7 +385,11 @@ export const recallSchema = userIdentifierBaseSchema.extend({
     .describe(
       'Recall strategy: text (keyword only), semantic (embeddings only), hybrid (blend both), auto (semantic then fallback to text). Default: hybrid.'
     ),
-  source: memorySourceSchema.optional().describe('Filter by source'),
+  source: memorySourceSchema
+    .optional()
+    .describe(
+      'Filter by source (any provenance string, e.g. observation, user_stated, pr-review).'
+    ),
   salience: salienceSchema.optional().describe('Filter by salience'),
   topics: topicsSchema.describe('Filter by topics (any match)'),
   limit: z.number().min(1).max(100).optional().describe('Max results (default: 20)'),
@@ -635,7 +646,7 @@ export const bootstrapSchema = userIdentifierBaseSchema.extend({
   identityBasePath: z
     .string()
     .optional()
-    .describe('Base path for identity files (default: ~/.pcp)'),
+    .describe('Base path for identity files (default: ~/.ink)'),
   threadKey: z
     .string()
     .optional()
@@ -1207,6 +1218,22 @@ export async function handleEndSession(args: unknown, dataComposer: DataComposer
   }
 
   if (session) {
+    // Automatic lease release — end_session is a terminal path regardless of
+    // which side (server or agent CLI) initiated it. MUST run BEFORE the
+    // cli_attached clear below: releaseUnlessRunning reads that flag to
+    // detect an end_session issued from inside a live CLI turn, and defers so
+    // no other thread enters the worktree while the local model is still
+    // executing in it. The deferred release fires at the CLI stop boundary
+    // (hook-lifecycle) or the server run boundary.
+    await new StudioLeaseService(dataComposer.getClient())
+      .releaseUnlessRunning(session.id, { userId: user.id, reason: 'session-end' })
+      .catch((err: unknown) => {
+        logger.warn('[StudioLease] Release on end_session failed', {
+          sessionId: session.id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+
     // Clear cli_attached flag so triggers don't get stuck in the pending queue
     // after the CLI detaches.
     await dataComposer.repositories.memory
@@ -1331,6 +1358,8 @@ export async function handleGetSession(args: unknown, dataComposer: DataComposer
               studioId: session.studioId,
               lifecycle: session.lifecycle || null,
               currentPhase: session.currentPhase || null,
+              threadKey: session.threadKey || null,
+              activeThreadKey: session.activeThreadKey || null,
               startedAt: session.startedAt.toISOString(),
               endedAt: session.endedAt?.toISOString(),
               summary: session.summary,
@@ -1402,6 +1431,8 @@ export async function handleListSessions(args: unknown, dataComposer: DataCompos
                 : null,
               lifecycle: s.lifecycle || null,
               currentPhase: s.currentPhase || null,
+              threadKey: s.threadKey || null,
+              activeThreadKey: s.activeThreadKey || null,
               status: s.status || null,
               backend: s.backend || null,
               provider: (s.metadata?.provider as string) || null,
@@ -1433,6 +1464,23 @@ export async function handleListSessions(args: unknown, dataComposer: DataCompos
  */
 function isSignificantPhaseTransition(phase: string): boolean {
   return phase.startsWith('blocked:') || phase.startsWith('waiting:') || phase === 'complete';
+}
+
+/**
+ * Whether this update finishes the session, and so should stamp `ended_at`.
+ *
+ * Nothing used to stamp it. That left `ended_at` NULL on every completed
+ * session, which in turn made the `ended_at IS NULL` clause in
+ * findByThreadKey filter nothing — so a thread whose conversation was over
+ * routed the next trigger back into the finished session instead of starting
+ * fresh (PR #349, revived).
+ *
+ * Both spellings are checked because either can carry the completion: callers
+ * may pass the legacy `status: 'completed'` or the current
+ * `lifecycle: 'completed'`.
+ */
+export function shouldStampEndedAt(params: { status?: string; lifecycle?: string }): boolean {
+  return params.status === 'completed' || params.lifecycle === 'completed';
 }
 
 function buildPhaseTransitionMemoryContent(params: {
@@ -1597,6 +1645,7 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
     cliAttached?: boolean;
     alias?: string | null;
     activeThreadKey?: string | null;
+    endedAt?: Date | null;
   } = {};
 
   // Map runtime: prefix phases to lifecycle (backward compat for old callers)
@@ -1628,6 +1677,11 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
   if (params.status !== undefined) {
     updates.status = params.status;
   }
+
+  if (shouldStampEndedAt({ status: params.status, lifecycle: updates.lifecycle })) {
+    updates.endedAt = new Date();
+  }
+
   if (params.backendSessionId !== undefined) {
     updates.backendSessionId = params.backendSessionId;
   }
@@ -1658,6 +1712,25 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
         },
       ],
     };
+  }
+
+  // update_session_state(status/lifecycle: completed) is a terminal path just
+  // like end_session — the studio lease must not wait for expiry. Deferred
+  // while the session's in-process run is still executing; the run boundary
+  // releases then.
+  const becameTerminal =
+    updates.endedAt instanceof Date ||
+    updates.status === 'completed' ||
+    updates.lifecycle === 'completed';
+  if (becameTerminal) {
+    await new StudioLeaseService(dataComposer.getClient())
+      .releaseUnlessRunning(sessionId, { userId: user.id, reason: 'session-completed' })
+      .catch((err: unknown) => {
+        logger.warn('[StudioLease] Release on update_session_state(completed) failed', {
+          sessionId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
   }
 
   const messageParts: string[] = [];
@@ -2045,7 +2118,7 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
   const memoryLimit = params.memoryLimit ?? 50;
   const postCompact = params.postCompact === true;
   const agentId = params.agentId;
-  const basePath = params.identityBasePath || path.join(os.homedir(), '.pcp');
+  const basePath = params.identityBasePath || path.join(os.homedir(), '.ink');
   const supabase = dataComposer.getClient();
 
   // Load identity files if agentId is provided

@@ -75,13 +75,20 @@ export const triggerAgentSchema = z.object({
 
 export async function handleTriggerAgent(
   args: z.infer<typeof triggerAgentSchema>,
-  _dataComposer: DataComposer
+  dataComposer: DataComposer
 ): Promise<McpResponse> {
   try {
     logger.info(`trigger_agent called: ${args.fromAgentId} → ${args.toAgentId}`, {
       type: args.triggerType,
       priority: args.priority,
     });
+
+    // Stamp the AUTHENTICATED user onto the payload (server-side, post-auth —
+    // trustworthy provenance, unlike caller-supplied fields on public trigger
+    // routes). Without it, a bare trigger_agent(threadKey) failure cannot be
+    // routed anywhere: the failure listener has no source row to resolve the
+    // user from, so the notice was silently dropped (PR #487, Lumen).
+    const resolved = await resolveUser({}, dataComposer).catch(() => null);
 
     const gateway = getAgentGateway();
 
@@ -102,6 +109,7 @@ export async function handleTriggerAgent(
       studioId: args.studioId,
       studioHint: args.studioHint,
       recipientSessionId: args.recipientSessionId,
+      ...(resolved?.user?.id ? { recipientUserId: resolved.user.id } : {}),
       metadata: args.metadata,
     };
 

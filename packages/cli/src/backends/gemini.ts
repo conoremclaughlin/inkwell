@@ -47,8 +47,9 @@ function buildGeminiSettings(
     }
   }
 
-  // Merge Inkwell auth + session headers — prefer 'inkwell', fall back to 'pcp'
-  const serverKey = mcpServers.inkwell ? 'inkwell' : mcpServers.pcp ? 'pcp' : 'inkwell';
+  // Merge Inkwell auth + session headers into the canonical 'inkwell' server.
+  // The legacy 'pcp' server name is retired — never target or create it.
+  const serverKey = 'inkwell';
   const serverConfig = (mcpServers[serverKey] || {}) as Record<string, unknown>;
   const existingHeaders = (serverConfig.headers || {}) as Record<string, string>;
   mcpServers[serverKey] = {
@@ -87,9 +88,15 @@ function buildGeminiSettings(
 export class GeminiAdapter implements BackendAdapter {
   readonly name = 'gemini';
   readonly binary = 'gemini';
+  // Prompt rides argv (`-p <prompt>`) — bounded by OS ARG_MAX.
+  readonly promptTransport = 'argv' as const;
 
   prepare(config: BackendConfig): PreparedBackend {
-    const { promptFile, cleanup: identityCleanup } = createIdentityPromptFile(config.agentId);
+    const { promptFile, cleanup: identityCleanup } = createIdentityPromptFile(
+      config.agentId,
+      undefined,
+      config.systemPromptOverride
+    );
 
     const args: string[] = [];
 

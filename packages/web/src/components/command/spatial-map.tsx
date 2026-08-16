@@ -118,22 +118,44 @@ function drawStudio(
   z: number,
   timestamp: number
 ) {
-  const isActive = studio.status === 'active';
-  const baseColor = isActive ? skin.colors.studioActive : skin.colors.studioIdle;
+  // Occupancy comes from the lease, never from `status` — `status` reports
+  // 'active' for studios untouched for months, so keying form to it drew every
+  // studio as busy and the map said nothing (spec:studio-canvas, §Why This
+  // Matters). Form carries occupancy, not just hue, so availability survives
+  // colourblindness and a zoomed-out glance (principle 3).
+  const lease = studio.lease;
+  const destructive = !!lease && (lease.quarantined || !!lease.claimKind);
+  const stale = !!lease && lease.stale;
+  const occupied = !!lease;
+
+  const baseColor = destructive
+    ? skin.colors.taskBlocked
+    : occupied
+      ? skin.colors.studioActive
+      : skin.colors.studioIdle;
+
+  // Leased studios are solid; free ones are outline-only and readably empty.
+  const fillAlpha = destructive ? '28' : occupied ? '38' : '00';
+  const strokeAlpha = occupied ? 'cc' : '55';
   const radius = 28 * z;
+
+  // Ephemeral studios get a dashed boundary — their whole point is being
+  // temporary, and one that looks permanent is worse than not drawing it.
+  ctx.save();
+  if (studio.ephemeral) ctx.setLineDash([4 * z, 3 * z]);
 
   if (skin.studioShape === 'hex') {
     hexPath(ctx, pos.x, pos.y, radius);
-    ctx.fillStyle = baseColor + '18';
+    ctx.fillStyle = baseColor + fillAlpha;
     ctx.fill();
-    ctx.strokeStyle = baseColor + '50';
+    ctx.strokeStyle = baseColor + strokeAlpha;
     ctx.lineWidth = 1.5;
     ctx.stroke();
   } else if (skin.studioShape === 'sharp') {
     const r = radius * 0.85;
-    ctx.fillStyle = baseColor + '18';
+    ctx.fillStyle = baseColor + fillAlpha;
     ctx.fillRect(pos.x - r, pos.y - r, r * 2, r * 2);
-    ctx.strokeStyle = baseColor + '50';
+    ctx.strokeStyle = baseColor + strokeAlpha;
     ctx.lineWidth = 1.5;
     ctx.strokeRect(pos.x - r, pos.y - r, r * 2, r * 2);
 
@@ -160,15 +182,43 @@ function drawStudio(
   } else {
     ctx.beginPath();
     ctx.arc(pos.x, pos.y, radius, 0, Math.PI * 2);
-    ctx.fillStyle = baseColor + '18';
+    ctx.fillStyle = baseColor + fillAlpha;
     ctx.fill();
-    ctx.strokeStyle = baseColor + '50';
+    ctx.strokeStyle = baseColor + strokeAlpha;
     ctx.lineWidth = 1.5;
     ctx.stroke();
   }
+  ctx.restore();
 
-  // Active studio pulse
-  if (isActive) {
+  // A stale lease is hatched: someone crashed holding this and it is
+  // reclaimable. Deliberately not drawn as "free" — the lease service still
+  // vetoes reclaim on live-process signals, so this is a question, not a
+  // verdict, and painting it empty would invite exactly the collision the
+  // lease exists to prevent.
+  if (stale) {
+    ctx.save();
+    ctx.beginPath();
+    if (skin.studioShape === 'hex') hexPath(ctx, pos.x, pos.y, radius);
+    else if (skin.studioShape === 'sharp') {
+      const r = radius * 0.85;
+      ctx.rect(pos.x - r, pos.y - r, r * 2, r * 2);
+    } else ctx.arc(pos.x, pos.y, radius, 0, Math.PI * 2);
+    ctx.clip();
+
+    ctx.strokeStyle = baseColor + '66';
+    ctx.lineWidth = 1;
+    for (let o = -radius; o <= radius * 2; o += 6 * z) {
+      ctx.beginPath();
+      ctx.moveTo(pos.x - radius + o, pos.y - radius);
+      ctx.lineTo(pos.x - radius + o - radius * 2, pos.y + radius);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  // Pulse only while a live holder is working — a stale or destructive claim
+  // should not read as healthy activity.
+  if (occupied && !stale && !destructive) {
     const pulse = Math.sin(timestamp / 1200) * 0.15 + 0.85;
     ctx.strokeStyle =
       baseColor +
@@ -196,6 +246,22 @@ function drawStudio(
   ctx.textAlign = 'center';
   ctx.textBaseline = 'top';
   ctx.fillText(label, pos.x, pos.y + radius + 4 * z);
+
+  // Who holds it and what for. "Is someone in it, and on what" is the question
+  // the canvas exists to answer, so the answer belongs on the node rather than
+  // behind a click. Only rendered when zoomed in enough to read.
+  if (lease && z > 0.7) {
+    const holder = destructive
+      ? `⚠ ${lease.claimKind ?? 'quarantined'}`
+      : `${lease.agentId} · ${lease.threadKey}`;
+    ctx.fillStyle = (destructive ? skin.colors.taskBlocked : baseColor) + 'dd';
+    ctx.font = `${Math.max(7, 8 * z)}px ${skin.fonts.mono}`;
+    ctx.fillText(holder, pos.x, pos.y + radius + 15 * z);
+    if (stale) {
+      ctx.fillStyle = skin.colors.taskBlocked + 'cc';
+      ctx.fillText('stale — reclaimable', pos.x, pos.y + radius + 25 * z);
+    }
+  }
 }
 
 function drawAgent(
@@ -344,6 +410,13 @@ function drawAgent(
   ctx.font = `${Math.max(8, 10 * z)}px ${skin.fonts.mono}`;
   ctx.textAlign = 'center';
   ctx.fillText(phaseText, pos.x, barY + barHeight + 6 * z);
+
+  // Active thread key (what artifact they're working on)
+  if (agent.activeThreadKey) {
+    ctx.fillStyle = skin.colors.accent;
+    ctx.font = `${Math.max(7, 9 * z)}px ${skin.fonts.mono}`;
+    ctx.fillText(agent.activeThreadKey, pos.x, barY + barHeight + 18 * z);
+  }
 }
 
 export function SpatialMap() {
@@ -578,7 +651,15 @@ export function SpatialMap() {
           const from = toScreen(agent.position.x, agent.position.y);
           const to = toScreen(studio.position.x, studio.position.y);
           const color = getAgentColor(agent.agentId);
-          const isActive = studio.id === agent.studioId;
+          // Every studio this agent holds gets a live connection, not just the
+          // one the avatar sits on. An agent running concurrent sessions in
+          // separate worktrees is genuinely present in all of them, and
+          // drawing the others as idle dashes reports it as free — the same
+          // false-vacancy the lease exists to prevent, one layer up.
+          const isActive =
+            agent.heldStudioIds.length > 0
+              ? agent.heldStudioIds.includes(studio.id)
+              : studio.id === agent.studioId;
 
           ctx!.strokeStyle = isActive ? color + '50' : color + '20';
           ctx!.lineWidth = isActive ? 2 * z : 1 * z;

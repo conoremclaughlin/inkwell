@@ -30,18 +30,83 @@ interface JsonRpcResponse {
 
 let jsonRpcId = 1;
 
+/**
+ * Bound every MCP network call so a stalled connection fails fast instead of
+ * hanging the whole turn. On a flaky link (e.g. a phone hotspot) a bare
+ * `fetch` has no client-side deadline — we observed a single `get_inbox` call
+ * hang for ~159s before the OS gave up, stalling the turn behind it. A 30s
+ * ceiling turns that silent hang into a fast, retryable error. Override with
+ * INK_MCP_TIMEOUT_MS.
+ */
+const MCP_FETCH_TIMEOUT_MS = parseInt(process.env.INK_MCP_TIMEOUT_MS || '', 10) || 30_000;
+
+/**
+ * Tool-call tier — some MCP tools legitimately run for minutes (e.g.
+ * setup_audio_transcription downloads ~600MB). Tool execution uses this
+ * generous ceiling; auth and metadata calls use MCP_FETCH_TIMEOUT_MS above.
+ * Override with INK_MCP_TOOL_TIMEOUT_MS.
+ */
+const MCP_TOOL_TIMEOUT_MS =
+  parseInt(process.env.INK_MCP_TOOL_TIMEOUT_MS || '', 10) || 5 * 60 * 1000;
+
+/**
+ * `fetch` with an abort-based deadline. Translates the abort into a clear,
+ * actionable error so callers surface "timed out" rather than a raw
+ * DOMException. Never overrides a caller-supplied signal.
+ */
+export async function fetchWithTimeout(
+  url: string,
+  init: RequestInit = {},
+  timeoutMs: number = MCP_FETCH_TIMEOUT_MS
+): Promise<Response> {
+  try {
+    return await fetch(url, { ...init, signal: init.signal ?? AbortSignal.timeout(timeoutMs) });
+  } catch (err) {
+    const name = (err as { name?: string })?.name;
+    if (name === 'TimeoutError' || name === 'AbortError') {
+      throw new Error(
+        `PCP request to ${url} timed out after ${Math.round(timeoutMs / 1000)}s (network stalled?)`
+      );
+    }
+    throw err;
+  }
+}
+
+export interface PcpClientOptions {
+  /**
+   * Lazily builds the x-ink-context token attached to every tool call.
+   * Lazy because session identity (sessionId) is established after client
+   * construction; the callback reflects current runtime state per call.
+   *
+   * Without this header, ink-routed tool calls reach the server with NO
+   * request identity — workspace derivation for artifact writes fails,
+   * session attribution degrades, and trigger context goes missing (the
+   * regression Myra hit when wholly-in-ink moved tool calls off the
+   * provider's MCP connection, which carried the header via .mcp.json).
+   */
+  getContextToken?: () => string | null;
+}
+
 export class PcpClient {
   private configPath: string;
   private baseUrl: string;
   private config: PcpAuthConfig;
+  private options: PcpClientOptions;
 
-  constructor(baseUrl?: string, configPath?: string) {
+  constructor(baseUrl?: string, configPath?: string, options: PcpClientOptions = {}) {
     this.baseUrl = (baseUrl || process.env.INK_SERVER_URL || 'http://localhost:3001').replace(
       /\/+$/,
       ''
     );
     this.configPath = configPath || join(homedir(), '.ink', 'config.json');
     this.config = this.loadConfig();
+    this.options = options;
+  }
+
+  /** Identity context header for the current call, when the caller provides one. */
+  private contextHeader(): Record<string, string> {
+    const token = this.options.getContextToken?.();
+    return token ? { 'x-ink-context': token } : {};
   }
 
   public getConfig(): PcpAuthConfig {
@@ -159,7 +224,7 @@ export class PcpClient {
       client_id: clientId,
     });
 
-    const response = await fetch(`${this.baseUrl}/token`, {
+    const response = await fetchWithTimeout(`${this.baseUrl}/token`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
@@ -279,24 +344,45 @@ export class PcpClient {
     if (!token) return null;
 
     const call = async (accessToken: string): Promise<Response> =>
-      fetch(`${this.baseUrl}/mcp`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          // Streamable HTTP MCP servers may require clients to accept both
-          // JSON responses and SSE frames.
-          Accept: 'application/json, text/event-stream',
-          Authorization: `Bearer ${accessToken}`,
+      fetchWithTimeout(
+        `${this.baseUrl}/mcp`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            // Streamable HTTP MCP servers may require clients to accept both
+            // JSON responses and SSE frames.
+            Accept: 'application/json, text/event-stream',
+            Authorization: `Bearer ${accessToken}`,
+            ...this.contextHeader(),
+          },
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            method: 'tools/call',
+            params: { name: tool, arguments: args },
+            id: jsonRpcId++,
+          }),
         },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          method: 'tools/call',
-          params: { name: tool, arguments: args },
-          id: jsonRpcId++,
-        }),
-      });
+        MCP_TOOL_TIMEOUT_MS
+      );
 
     let response = await call(token);
+
+    // If the first credential was the injected env token and it was rejected,
+    // retry with the local auth.json token before giving up (mirrors the
+    // fallback in hooks.ts callPcpTool). Stale env tokens outlive their expiry
+    // in long-running agent sessions and would otherwise 401 forever.
+    if (response.status === 401 && process.env.INK_ACCESS_TOKEN?.trim() === token) {
+      const localToken = await getValidAccessToken(this.baseUrl, { allowEnvToken: false });
+      if (localToken && localToken !== token) {
+        try {
+          await response.text();
+        } catch {
+          // Best-effort body drain before retry.
+        }
+        response = await call(localToken);
+      }
+    }
 
     if (response.status === 401 && this.config.refreshToken) {
       const refreshed = await this.refreshAccessToken();
@@ -337,14 +423,19 @@ export class PcpClient {
     tool: string,
     args: Record<string, unknown>
   ): Promise<PcpToolCallResult> {
-    const response = await fetch(`${this.baseUrl}/api/mcp/call`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
+    const response = await fetchWithTimeout(
+      `${this.baseUrl}/api/mcp/call`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          ...this.contextHeader(),
+        },
+        body: JSON.stringify({ tool, args }),
       },
-      body: JSON.stringify({ tool, args }),
-    });
+      MCP_TOOL_TIMEOUT_MS
+    );
 
     if (!response.ok) {
       const text = await response.text();

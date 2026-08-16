@@ -812,6 +812,42 @@ describe('MemoryRepository', () => {
       expect(updateCall.status).toBe('resumable');
     });
 
+    // Without this mapping, handleUpdateSessionPhase can compute an endedAt and
+    // have it silently dropped here — which is how `ended_at` stayed NULL on
+    // every completed session and made findByThreadKey's `ended_at IS NULL`
+    // clause a no-op (PR #349, revived).
+    it('should write ended_at when endedAt is supplied', async () => {
+      mockSupabase._setReturnData(mockSessionRow);
+      const endedAt = new Date('2026-08-13T07:00:00Z');
+
+      await repo.updateSession('session-123', { endedAt });
+
+      const updateCall = (mockSupabase._queryBuilder.update as ReturnType<typeof vi.fn>).mock
+        .calls[0][0];
+      expect(updateCall.ended_at).toBe('2026-08-13T07:00:00.000Z');
+    });
+
+    it('should clear ended_at when endedAt is explicitly null', async () => {
+      mockSupabase._setReturnData(mockSessionRow);
+
+      await repo.updateSession('session-123', { endedAt: null });
+
+      const updateCall = (mockSupabase._queryBuilder.update as ReturnType<typeof vi.fn>).mock
+        .calls[0][0];
+      expect(updateCall.ended_at).toBeNull();
+    });
+
+    // "not provided" must stay distinct from "explicitly cleared".
+    it('should leave ended_at untouched when endedAt is omitted', async () => {
+      mockSupabase._setReturnData(mockSessionRow);
+
+      await repo.updateSession('session-123', { status: 'resumable' });
+
+      const updateCall = (mockSupabase._queryBuilder.update as ReturnType<typeof vi.fn>).mock
+        .calls[0][0];
+      expect(updateCall).not.toHaveProperty('ended_at');
+    });
+
     it('should update context and workingDir', async () => {
       mockSupabase._setReturnData(mockSessionRow);
 

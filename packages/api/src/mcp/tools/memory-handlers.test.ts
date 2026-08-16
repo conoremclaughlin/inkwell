@@ -1636,6 +1636,51 @@ describe('rememberSchema - hierarchical memory fields', () => {
   });
 });
 
+describe('rememberSchema - open source provenance', () => {
+  // The DB CHECK constraint on memories.source was dropped (migration
+  // 20260219080201) and the MemorySource model type is open, but the tool
+  // schema used to be a strict 5-value enum that rejected descriptive
+  // provenance. It must now accept any non-empty string.
+  it('accepts canonical source values', () => {
+    for (const source of ['conversation', 'observation', 'user_stated', 'inferred', 'session']) {
+      const result = rememberSchema.safeParse({
+        email: 'test@test.com',
+        content: 'x',
+        source,
+      });
+      expect(result.success).toBe(true);
+    }
+  });
+
+  it('accepts free-form provenance sources (the fix)', () => {
+    for (const source of ['pr-review', 'codex-review', 'posthoc-review', 'reflection']) {
+      const result = rememberSchema.safeParse({
+        email: 'test@test.com',
+        content: 'x',
+        source,
+      });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.source).toBe(source);
+      }
+    }
+  });
+
+  it('still rejects an empty-string source', () => {
+    const result = rememberSchema.safeParse({
+      email: 'test@test.com',
+      content: 'x',
+      source: '',
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('works without a source (optional)', () => {
+    const result = rememberSchema.safeParse({ email: 'test@test.com', content: 'x' });
+    expect(result.success).toBe(true);
+  });
+});
+
 describe('buildKnowledgeSummary', () => {
   function makeMemory(overrides: Partial<Memory> & { content: string }): Memory {
     return {

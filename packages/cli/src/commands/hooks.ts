@@ -742,7 +742,12 @@ async function updateRuntimeGenerationState(
   cwd: string,
   _config: PcpConfig | null,
   agentId: string,
-  lifecycle: 'running' | 'idle' | 'compacting'
+  lifecycle: 'running' | 'idle' | 'compacting',
+  // Which hook fired. Lifecycle values are ambiguous (post-compact and
+  // on-stop both send 'idle'); the server uses the event to manage the
+  // hook-owned CLI turn signal and to run the lease boundary ONLY on the
+  // real stop (PR #492).
+  event?: 'prompt' | 'stop' | 'pre-compact' | 'post-compact'
 ): Promise<void> {
   const sessionId = resolveActivePcpSessionId(cwd);
   if (!sessionId) return;
@@ -755,7 +760,13 @@ async function updateRuntimeGenerationState(
     const resp = await fetch(`${serverUrl}/api/hooks/lifecycle`, {
       method: 'POST',
       headers,
-      body: JSON.stringify({ sessionId, lifecycle, agentId, workingDir: cwd }),
+      body: JSON.stringify({
+        sessionId,
+        lifecycle,
+        ...(event ? { event } : {}),
+        agentId,
+        workingDir: cwd,
+      }),
       signal: AbortSignal.timeout(5000),
     });
     if (!resp.ok) {
@@ -1766,7 +1777,7 @@ async function preCompactHandler(options?: { backend?: string }): Promise<void> 
   // that will reset it to 'idle'. Without postCompact (e.g., Gemini/PreCompress),
   // the lifecycle gets stuck at 'compacting' permanently.
   if (backend.events.postCompact) {
-    await updateRuntimeGenerationState(cwd, config, agentId, 'compacting');
+    await updateRuntimeGenerationState(cwd, config, agentId, 'compacting', 'pre-compact');
   }
 
   process.stdout.write(loadTemplate('hook-pre-compact'));
@@ -1779,8 +1790,9 @@ async function postCompactHandler(): Promise<void> {
   const config = getPcpConfig();
   const agentId = resolveAgentId() || 'unknown';
 
-  // Reset lifecycle from compacting back to idle
-  await updateRuntimeGenerationState(cwd, config, agentId, 'idle');
+  // Reset lifecycle from compacting back to idle. NOT a turn boundary —
+  // the same turn resumes after compaction (PR #492 round 4).
+  await updateRuntimeGenerationState(cwd, config, agentId, 'idle', 'post-compact');
 
   let identityBlock = '';
   let memoriesBlock = '';
@@ -1844,6 +1856,37 @@ function resolveLifecycleBackend(cwd: string, backendOverride?: string): HookCap
   if (process.env.INK_HOOK_BACKEND?.trim())
     return getBackendByName(process.env.INK_HOOK_BACKEND.trim());
   return detectBackend(cwd);
+}
+
+/**
+ * Hydrate threadKey from the server when we have a pre-created session
+ * (e.g., INK_SESSION_ID from a trigger) but no local threadKey yet.
+ *
+ * Triggered sessions skip start_session (the runner pre-creates the session
+ * and passes its id via INK_SESSION_ID), so the thread key never gets
+ * populated locally — without this fetch, activeThreadKey would stay null
+ * for exactly the sessions the thread-key surfacing is meant to cover.
+ */
+export async function hydrateThreadKeyFromServer(
+  pcpSessionId: string | undefined,
+  pcpThreadKey: string | undefined,
+  email?: string
+): Promise<string | undefined> {
+  if (!pcpSessionId || pcpThreadKey) return pcpThreadKey;
+  try {
+    const sessionResult = await callPcpTool('get_session', {
+      email,
+      sessionId: pcpSessionId,
+    });
+    const session = sessionResult?.session as Record<string, unknown> | undefined;
+    if (session) {
+      if (typeof session.activeThreadKey === 'string') return session.activeThreadKey;
+      if (typeof session.threadKey === 'string') return session.threadKey;
+    }
+  } catch {
+    // Non-fatal
+  }
+  return pcpThreadKey;
 }
 
 async function onSessionStartHandler(options?: { backend?: string }): Promise<void> {
@@ -2055,6 +2098,8 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
   pcpThreadKey = reconciled.threadKey || pcpThreadKey;
   const backendSessionId = reconciled.backendSessionId;
 
+  pcpThreadKey = await hydrateThreadKeyFromServer(pcpSessionId, pcpThreadKey, config?.email);
+
   // Set lifecycle to idle on startup (ready for user input).
   if (pcpSessionId) {
     try {
@@ -2066,6 +2111,7 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
         workingDir: cwd,
       };
       if (backendSessionId) updateArgs.backendSessionId = backendSessionId;
+      if (pcpThreadKey) updateArgs.activeThreadKey = pcpThreadKey;
       await callPcpTool('update_session_state', updateArgs);
     } catch {
       // Non-fatal; startup should continue even if linkage fails.
@@ -2344,7 +2390,7 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
   });
 
   // Mark session as actively generating at prompt start.
-  await updateRuntimeGenerationState(cwd, config, agentId, 'running');
+  await updateRuntimeGenerationState(cwd, config, agentId, 'running', 'prompt');
 
   // Mark session as CLI-attached (human present at REPL).
   // Uses the REST lifecycle endpoint, NOT MCP — cliAttached is a runtime
@@ -2447,7 +2493,8 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
         '(started/stopped a server, opened a PR, kicked off a build, changed ports, etc.), ' +
         'update your session context via `update_session_state(context: "...")` so it survives ' +
         "compaction. Context is your scratch board for transient active state — what's running, " +
-        "what's pending, what port you're on.\n" +
+        "what's pending, what port you're on. If you're working on a specific artifact " +
+        '(PR, spec, thread), set `activeThreadKey` too (e.g., "pr:350", "spec:auth-refactor").\n' +
         '</ink-reminder>\n'
     );
     writeRuntimeFile(cwd, 'last-context-reminder', new Date().toISOString());
@@ -2517,7 +2564,7 @@ async function onStopHandler(options?: { backend?: string }): Promise<void> {
   });
 
   // Mark session as idle after each completed backend turn.
-  await updateRuntimeGenerationState(cwd, config, agentId, 'idle');
+  await updateRuntimeGenerationState(cwd, config, agentId, 'idle', 'stop');
 
   // Increment tool call counter
   const countStr = readRuntimeFile(cwd, 'tool-count');

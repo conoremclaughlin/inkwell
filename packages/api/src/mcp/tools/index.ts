@@ -256,10 +256,12 @@ import {
 import {
   handleListDriveFiles,
   handleGetDriveFile,
+  handleDownloadDriveFile,
   handleCreateDriveFolder,
   handleMoveDriveFile,
   listDriveFilesSchema,
   getDriveFileSchema,
+  downloadDriveFileSchema,
   createDriveFolderSchema,
   moveDriveFileSchema,
 } from '../../stories/google-drive/handlers';
@@ -2280,7 +2282,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `Load identity and context for a new session. Call this at the start of every new conversation.
 
 Returns:
-- Identity Files: shared values/user/process docs and agent-specific identity docs from ~/.pcp
+- Identity Files: shared values/user/process docs and agent-specific identity docs from ~/.ink
 - Identity Core: user profile, assistant role, relationship context from DB
 - Active Context: current projects, session context, project-specific context
 - Active Session: current session if any
@@ -2321,7 +2323,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         identityBasePath: z
           .string()
           .optional()
-          .describe('Base path for identity files (default: ~/.pcp)'),
+          .describe('Base path for identity files (default: ~/.ink)'),
         threadKey: z
           .string()
           .optional()
@@ -5284,6 +5286,43 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         return await handleGetDriveFile(args, dataComposer);
       } catch (error) {
         logger.error('Error in get_drive_file:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'download_drive_file',
+    {
+      description: `Download a Google Drive file and save it under ~/.ink/files/drive/.
+
+Binary files (PDFs, images, zips, etc.) download verbatim (up to 50MB). Google-native files (Docs/Sheets/Slides) have no raw form, so they export to plain text by default — Docs→text/plain, Sheets→CSV — which is the most directly workable form for an SB. Pass exportMimeType for another format (application/pdf, text/html, text/markdown, application/epub+zip, .docx, etc.).
+
+Returns the saved path plus metadata. Read or transform the file afterward with local tools (e.g. Read, or pandoc for format conversion) — this tool fetches; it does not transform.
+
+Ideal for bulk workflows: list a folder, then download each file by ID.
+
+User must have connected their Google account with Drive permissions.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: downloadDriveFileSchema,
+    },
+    async (args) => {
+      try {
+        return await handleDownloadDriveFile(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in download_drive_file:', error);
         return {
           content: [
             {

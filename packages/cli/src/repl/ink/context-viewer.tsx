@@ -15,7 +15,7 @@ export interface ContextSections {
     bootstrapTokens: number;
   };
   /** Tool calls executed this session or replayed from the transcript (most recent last) */
-  toolCalls?: Array<{ tool: string; status: string; at: string; args?: string }>;
+  toolCalls?: Array<{ tool: string; status: string; at: string; args?: string; result?: string }>;
   /** Entries evicted from the context window — out of the prompt, not erased */
   evicted?: Array<{
     role: string;
@@ -55,6 +55,9 @@ export function formatContextLines(sections: ContextSections): string[] {
       lines.push(`• ${call.tool} (${call.status})${time ? ` · ${time}` : ''}`);
       if (call.args) {
         lines.push(`    ${call.args}`);
+      }
+      if (call.result) {
+        lines.push(`    → ${call.result}`);
       }
     }
     lines.push('');

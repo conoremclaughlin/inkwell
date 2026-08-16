@@ -1507,8 +1507,10 @@ export class MemoryRepository {
       workingDir?: string;
       cliAttached?: boolean;
       cliPollAt?: string;
+      cliTurnAt?: string | null;
       alias?: string | null;
       activeThreadKey?: string | null;
+      endedAt?: Date | null;
     }
   ): Promise<Session | null> {
     const dbUpdates: Record<string, unknown> = {};
@@ -1540,11 +1542,17 @@ export class MemoryRepository {
     if (updates.cliPollAt !== undefined) {
       (dbUpdates as Record<string, unknown>).cli_poll_at = updates.cliPollAt;
     }
+    if (updates.cliTurnAt !== undefined) {
+      (dbUpdates as Record<string, unknown>).cli_turn_at = updates.cliTurnAt;
+    }
     if (updates.alias !== undefined) {
       (dbUpdates as Record<string, unknown>).alias = updates.alias;
     }
     if (updates.activeThreadKey !== undefined) {
       (dbUpdates as Record<string, unknown>).active_thread_key = updates.activeThreadKey;
+    }
+    if (updates.endedAt !== undefined) {
+      dbUpdates.ended_at = updates.endedAt ? updates.endedAt.toISOString() : null;
     }
 
     const { data, error } = await this.supabase
@@ -2057,6 +2065,7 @@ export class MemoryRepository {
       id: row.id,
       userId: row.user_id,
       agentId: row.agent_id || undefined,
+      sbId: row.sb_id || undefined,
       studioId,
       threadKey: row.thread_key || undefined,
       activeThreadKey: row.active_thread_key || undefined,

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { InkRunner } from './ink-runner';
+import { InkRunner, DEFAULT_MAX_TURNS, clampMaxTurns, parseInkModelUsage } from './ink-runner';
 
 vi.mock('../../utils/logger', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -21,6 +21,51 @@ describe('InkRunner', () => {
       expect(args).toContain('--max-turns');
       expect(args).toContain('--session-id');
       expect(args).toContain('session-123');
+    });
+
+    it('defaults --max-turns to DEFAULT_MAX_TURNS when no per-SB value is set', () => {
+      const runner = new InkRunner();
+      const args = (runner as any).buildArgs('session-mt', {
+        workingDirectory: '/tmp',
+        agentId: 'myra',
+      });
+
+      const idx = args.indexOf('--max-turns');
+      expect(idx).toBeGreaterThan(-1);
+      expect(args[idx + 1]).toBe(String(DEFAULT_MAX_TURNS));
+    });
+
+    it('honors a dashboard-configured maxTurns, clamped to a sane range', () => {
+      const runner = new InkRunner();
+      const args = (runner as any).buildArgs('session-mt2', {
+        workingDirectory: '/tmp',
+        agentId: 'myra',
+        maxTurns: 12,
+      });
+      const idx = args.indexOf('--max-turns');
+      expect(args[idx + 1]).toBe('12');
+    });
+
+    it('always passes --tool-routing explicitly, failing closed to local', () => {
+      // The headless boundary must never depend on worktree .ink/identity.json
+      // preferences or the chat loop's own defaults.
+      const runner = new InkRunner();
+      const withRouting = (runner as any).buildArgs('session-tr', {
+        workingDirectory: '/tmp',
+        agentId: 'myra',
+        toolRouting: 'backend',
+      });
+      const idx = withRouting.indexOf('--tool-routing');
+      expect(idx).toBeGreaterThan(-1);
+      expect(withRouting[idx + 1]).toBe('backend');
+
+      const withoutRouting = (runner as any).buildArgs('session-tr2', {
+        workingDirectory: '/tmp',
+        agentId: 'myra',
+      });
+      const defaultIdx = withoutRouting.indexOf('--tool-routing');
+      expect(defaultIdx).toBeGreaterThan(-1);
+      expect(withoutRouting[defaultIdx + 1]).toBe('local');
     });
 
     it('includes --model when specified', () => {
@@ -228,5 +273,186 @@ describe('InkRunner', () => {
       expect(result.responses[0].content).toBe('Routed via MCP');
       expect(result.finalTextResponse).toBe('Fallback text from ledger');
     });
+  });
+});
+
+/**
+ * The ink path had the same undercount as the direct claude path, one layer
+ * further out: the CLI parser keeps cached tokens in separate fields, and the
+ * result line forwarded only the fresh remainder. That is why Myra's sessions
+ * recorded a few hundred input tokens across hundreds of messages.
+ */
+describe('InkRunner usage parsing', () => {
+  it('counts the cache split as input and keeps the breakdown', () => {
+    const runner = new InkRunner();
+    const stdout = JSON.stringify({
+      type: 'result',
+      text: 'done',
+      usage: {
+        contextTokens: 42_000,
+        inputTokens: 120,
+        outputTokens: 900,
+        cacheReadTokens: 38_000,
+        cacheWriteTokens: 1_200,
+      },
+      model: 'claude-fable-5',
+    });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const result = (runner as any).parseOutput(stdout, '');
+
+    expect(result.usage.inputTokens).toBe(39_320);
+    expect(result.usage.cacheReadTokens).toBe(38_000);
+    expect(result.usage.cacheWriteTokens).toBe(1_200);
+    // Context stays the CLI's own budget figure, not the billed sum.
+    expect(result.usage.contextTokens).toBe(42_000);
+    expect(result.servedModel).toBe('claude-fable-5');
+  });
+
+  // An older ink build on a studio that has not been rebuilt omits the new
+  // fields; that must degrade to the previous behaviour, not throw or zero.
+  it('falls back to fresh-only input when cache fields are absent', () => {
+    const runner = new InkRunner();
+    const stdout = JSON.stringify({
+      type: 'result',
+      usage: { contextTokens: 1_000, inputTokens: 120, outputTokens: 900 },
+    });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const result = (runner as any).parseOutput(stdout, '');
+
+    expect(result.usage.inputTokens).toBe(120);
+    expect(result.usage.cacheReadTokens).toBe(0);
+    expect(result.servedModel).toBeUndefined();
+  });
+});
+
+/**
+ * Cost attribution for ink sessions. #493 gave direct-claude spawns a per-model
+ * map with the backend's own costUSD; the ink path forwarded only the model
+ * name, so ink-backed agents (Myra) had no dollar figure at all.
+ */
+describe('parseInkModelUsage', () => {
+  it('maps the per-model block, cost included, keys as reported', () => {
+    const parsed = parseInkModelUsage({
+      'claude-opus-5': {
+        inputTokens: 900,
+        outputTokens: 120,
+        cacheReadTokens: 40_000,
+        cacheWriteTokens: 1_200,
+        costUSD: 0.0431,
+        canonicalModel: 'claude-opus-5',
+      },
+      'claude-haiku-4-5-20251001': {
+        inputTokens: 500,
+        outputTokens: 15,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        costUSD: 0.0006,
+        canonicalModel: 'claude-haiku-4-5',
+      },
+    })!;
+
+    expect(parsed['claude-opus-5'].costUSD).toBeCloseTo(0.0431);
+    expect(parsed['claude-opus-5'].cacheReadTokens).toBe(40_000);
+    // Both keys survive — a dated id and an alias can be distinct call sites.
+    expect(Object.keys(parsed).sort()).toEqual(['claude-haiku-4-5-20251001', 'claude-opus-5']);
+  });
+
+  // An older ink build emits no block at all; the field must be absent rather
+  // than a zeroed map that would read as "this run cost nothing".
+  it('returns undefined for absent or malformed input', () => {
+    expect(parseInkModelUsage(undefined)).toBeUndefined();
+    expect(parseInkModelUsage({})).toBeUndefined();
+    expect(parseInkModelUsage('nonsense')).toBeUndefined();
+    // Entries with nothing numeric are unreadable, not free: a present
+    // zero-cost map would read as a measured $0.00 (Lumen, PR #500 round 1).
+    expect(
+      parseInkModelUsage({ 'claude-opus-5': { inputTokens: 'lots', costUSD: null } })
+    ).toBeUndefined();
+    // A partially-readable entry still counts — but an unreported cost stays
+    // ABSENT rather than 0, or a summed session cost silently under-reports
+    // with no way to tell a measured zero from a never-reported one.
+    const partial = parseInkModelUsage({ 'claude-opus-5': { outputTokens: 12 } });
+    expect(partial!['claude-opus-5'].outputTokens).toBe(12);
+    expect(partial!['claude-opus-5'].costUSD).toBeUndefined();
+    // A genuinely reported zero is preserved as a measurement.
+    const freeTurn = parseInkModelUsage({ 'claude-opus-5': { outputTokens: 1, costUSD: 0 } });
+    expect(freeTurn!['claude-opus-5'].costUSD).toBe(0);
+  });
+
+  // The CLI is the only layer that sees every invocation of a run, so its
+  // completeness verdict is the authoritative one. Dropping it here promoted a
+  // lower bound back to a total at the process boundary (Lumen, PR #500 r4).
+  it('forwards the CLI cost-completeness marker across the boundary', () => {
+    const parsed = parseInkModelUsage({
+      'claude-opus-5': {
+        inputTokens: 10,
+        outputTokens: 20,
+        cacheReadTokens: 1_000,
+        cacheWriteTokens: 0,
+        costUSD: 0.01,
+        costPartial: true,
+        canonicalModel: 'claude-opus-5',
+      },
+    })!;
+
+    expect(parsed['claude-opus-5'].costUSD).toBeCloseTo(0.01);
+    expect(parsed['claude-opus-5'].costPartial).toBe(true);
+  });
+
+  it('does not invent a marker for a complete entry', () => {
+    const parsed = parseInkModelUsage({
+      'claude-opus-5': {
+        inputTokens: 10,
+        outputTokens: 20,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        costUSD: 0.01,
+      },
+    })!;
+
+    expect(parsed['claude-opus-5'].costPartial).toBeUndefined();
+  });
+
+  it('carries the block through parseOutput into usage', () => {
+    const runner = new InkRunner();
+    const stdout = JSON.stringify({
+      type: 'result',
+      text: 'done',
+      usage: { contextTokens: 5_000, inputTokens: 10, outputTokens: 20 },
+      model: 'claude-opus-5',
+      modelUsage: {
+        'claude-opus-5': {
+          inputTokens: 10,
+          outputTokens: 20,
+          cacheReadTokens: 4_900,
+          cacheWriteTokens: 0,
+          costUSD: 0.0125,
+          canonicalModel: 'claude-opus-5',
+        },
+      },
+    });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const result = (runner as any).parseOutput(stdout, '');
+
+    expect(result.usage.modelUsage['claude-opus-5'].costUSD).toBeCloseTo(0.0125);
+  });
+});
+
+describe('clampMaxTurns', () => {
+  it('defaults when absent or non-finite', () => {
+    expect(clampMaxTurns(undefined)).toBe(DEFAULT_MAX_TURNS);
+    expect(clampMaxTurns(Number.NaN)).toBe(DEFAULT_MAX_TURNS);
+    expect(clampMaxTurns(Number.POSITIVE_INFINITY)).toBe(DEFAULT_MAX_TURNS);
+  });
+
+  it('clamps to [1, 25] and rounds fractions', () => {
+    expect(clampMaxTurns(0)).toBe(1);
+    expect(clampMaxTurns(-3)).toBe(1);
+    expect(clampMaxTurns(99)).toBe(25);
+    expect(clampMaxTurns(7.6)).toBe(8);
+    expect(clampMaxTurns(5)).toBe(5);
   });
 });

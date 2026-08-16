@@ -45,6 +45,8 @@ export interface InkRepl {
       label?: string;
       time?: string;
       trailingMeta?: string;
+      /** Streamed paragraph after the first: content only, no label row. */
+      continuation?: boolean;
     }
   ) => void;
   /** Print a system/info line (replaces printLine for non-message output). */
@@ -164,6 +166,7 @@ export function renderInkChat(options: {
         label: opts?.label,
         time: opts?.time || formatNow(options.timezone),
         trailingMeta: opts?.trailingMeta,
+        continuation: opts?.continuation,
       });
     },
 

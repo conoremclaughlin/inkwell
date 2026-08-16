@@ -56,9 +56,14 @@ export function ActivityLog() {
                 {agent.name}
               </span>
               <span style={{ color: skin.colors.textMuted }}>→</span>
-              <span style={{ color: skin.colors.text }} className="truncate flex-1">
+              <span style={{ color: skin.colors.text }} className="truncate">
                 {phase}
               </span>
+              {agent.activeThreadKey && (
+                <span style={{ color: skin.colors.accent }} className="truncate">
+                  {agent.activeThreadKey}
+                </span>
+              )}
               {agent.lifecycle === 'running' && (
                 <span
                   className="inline-block w-2 h-2 rounded-full animate-pulse"

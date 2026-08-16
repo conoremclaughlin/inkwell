@@ -2663,6 +2663,55 @@ export type Database = {
           },
         ];
       };
+      session_observe_grants: {
+        Row: {
+          created_at: string;
+          expires_at: string | null;
+          granted_by: string | null;
+          id: string;
+          observer_sb_id: string;
+          owner_sb_id: string;
+          user_id: string;
+        };
+        Insert: {
+          created_at?: string;
+          expires_at?: string | null;
+          granted_by?: string | null;
+          id?: string;
+          observer_sb_id: string;
+          owner_sb_id: string;
+          user_id: string;
+        };
+        Update: {
+          created_at?: string;
+          expires_at?: string | null;
+          granted_by?: string | null;
+          id?: string;
+          observer_sb_id?: string;
+          owner_sb_id?: string;
+          user_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'session_observe_grants_observer_sb_id_fkey';
+            columns: ['observer_sb_id'];
+            referencedRelation: 'agent_identities';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'session_observe_grants_owner_sb_id_fkey';
+            columns: ['owner_sb_id'];
+            referencedRelation: 'agent_identities';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'session_observe_grants_user_id_fkey';
+            columns: ['user_id'];
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
       session_transcript_archives: {
         Row: {
           backend: string | null;
@@ -2731,6 +2780,7 @@ export type Database = {
           claude_session_id: string | null;
           cli_attached: boolean | null;
           cli_poll_at: string | null;
+          cli_turn_at: string | null;
           compacting_since: string | null;
           contact_id: string | null;
           context: string | null;
@@ -2741,6 +2791,7 @@ export type Database = {
           message_count: number | null;
           metadata: Json | null;
           model: string | null;
+          observer_ledger_path: string | null;
           sb_id: string | null;
           started_at: string | null;
           status: string | null;
@@ -2761,6 +2812,7 @@ export type Database = {
           claude_session_id?: string | null;
           cli_attached?: boolean | null;
           cli_poll_at?: string | null;
+          cli_turn_at?: string | null;
           compacting_since?: string | null;
           contact_id?: string | null;
           context?: string | null;
@@ -2771,6 +2823,7 @@ export type Database = {
           message_count?: number | null;
           metadata?: Json | null;
           model?: string | null;
+          observer_ledger_path?: string | null;
           sb_id?: string | null;
           started_at?: string | null;
           status?: string | null;
@@ -2791,6 +2844,7 @@ export type Database = {
           claude_session_id?: string | null;
           cli_attached?: boolean | null;
           cli_poll_at?: string | null;
+          cli_turn_at?: string | null;
           compacting_since?: string | null;
           contact_id?: string | null;
           context?: string | null;
@@ -2801,6 +2855,7 @@ export type Database = {
           message_count?: number | null;
           metadata?: Json | null;
           model?: string | null;
+          observer_ledger_path?: string | null;
           sb_id?: string | null;
           started_at?: string | null;
           status?: string | null;
@@ -3052,6 +3107,67 @@ export type Database = {
           },
         ];
       };
+      studio_lease_events: {
+        Row: {
+          agent_id: string | null;
+          created_at: string;
+          detail: Json;
+          event: string;
+          id: string;
+          reason: string | null;
+          sb_id: string | null;
+          session_id: string | null;
+          studio_id: string;
+          thread_key: string | null;
+          user_id: string;
+        };
+        Insert: {
+          agent_id?: string | null;
+          created_at?: string;
+          detail?: Json;
+          event: string;
+          id?: string;
+          reason?: string | null;
+          sb_id?: string | null;
+          session_id?: string | null;
+          studio_id: string;
+          thread_key?: string | null;
+          user_id: string;
+        };
+        Update: {
+          agent_id?: string | null;
+          created_at?: string;
+          detail?: Json;
+          event?: string;
+          id?: string;
+          reason?: string | null;
+          sb_id?: string | null;
+          session_id?: string | null;
+          studio_id?: string;
+          thread_key?: string | null;
+          user_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'studio_lease_events_sb_id_fkey';
+            columns: ['sb_id'];
+            referencedRelation: 'agent_identities';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'studio_lease_events_studio_id_fkey';
+            columns: ['studio_id'];
+            referencedRelation: 'studios';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'studio_lease_events_user_id_fkey';
+            columns: ['user_id'];
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
       studios: {
         Row: {
           agent_id: string | null;
@@ -3061,8 +3177,12 @@ export type Database = {
           cleaned_at: string | null;
           created_at: string | null;
           default_project_id: string | null;
+          ephemeral: boolean;
+          expires_at: string | null;
           id: string;
+          lease: Json | null;
           metadata: Json | null;
+          parent_studio_id: string | null;
           permissions: Json;
           purpose: string | null;
           repo_root: string;
@@ -3086,8 +3206,12 @@ export type Database = {
           cleaned_at?: string | null;
           created_at?: string | null;
           default_project_id?: string | null;
+          ephemeral?: boolean;
+          expires_at?: string | null;
           id?: string;
+          lease?: Json | null;
           metadata?: Json | null;
+          parent_studio_id?: string | null;
           permissions?: Json;
           purpose?: string | null;
           repo_root: string;
@@ -3111,8 +3235,12 @@ export type Database = {
           cleaned_at?: string | null;
           created_at?: string | null;
           default_project_id?: string | null;
+          ephemeral?: boolean;
+          expires_at?: string | null;
           id?: string;
+          lease?: Json | null;
           metadata?: Json | null;
+          parent_studio_id?: string | null;
           permissions?: Json;
           purpose?: string | null;
           repo_root?: string;
@@ -3129,6 +3257,18 @@ export type Database = {
           worktree_path?: string;
         };
         Relationships: [
+          {
+            foreignKeyName: 'studios_default_project_id_fkey';
+            columns: ['default_project_id'];
+            referencedRelation: 'projects';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'studios_parent_studio_id_fkey';
+            columns: ['parent_studio_id'];
+            referencedRelation: 'studios';
+            referencedColumns: ['id'];
+          },
           {
             foreignKeyName: 'studios_sb_id_fkey';
             columns: ['sb_id'];
@@ -3860,6 +4000,27 @@ export type Database = {
       [_ in never]: never;
     };
     Functions: {
+      advance_thread_read_pointer: {
+        Args: {
+          p_agent_id: string;
+          p_thread_id: string;
+          p_through_message_id: string;
+        };
+        Returns: string;
+      };
+      get_unread_thread_candidates: {
+        Args: {
+          p_agent_id: string;
+          p_limit?: number;
+          p_session_id?: string;
+          p_user_id: string;
+        };
+        Returns: {
+          latest_message_at: string;
+          thread_id: string;
+          total_candidates: number;
+        }[];
+      };
       match_artifacts: {
         Args: {
           match_count?: number;

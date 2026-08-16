@@ -28,6 +28,7 @@ import { logger } from '../utils/logger';
 import { env } from '../config/env';
 import { InboundMediaPipeline } from './media-pipeline';
 import { TextToSpeechService } from './text-to-speech';
+import { validateTelegramChatId } from './telegram-chat-id';
 import telegramifyMarkdown from 'telegramify-markdown';
 import type { Platform } from '../types/shared';
 
@@ -550,7 +551,8 @@ export class ChannelGateway extends EventEmitter {
 
     // Forward the combined message. On error, release the processing lock
     // so the conversation isn't permanently deadlocked.
-    // On success, the lock is released by sendResponse → processPendingMessages.
+    // On success, the lock is released by releaseConversation() (called from
+    // server.ts after the full message handler completes) → processPendingMessages.
     try {
       await this.forwardToHandler(
         buffer.channel,
@@ -695,9 +697,16 @@ export class ChannelGateway extends EventEmitter {
     let mediaResult: { sent: number; failed: number; errors: string[] } | undefined;
 
     switch (channel) {
-      case 'telegram':
+      case 'telegram': {
         if (!this.telegramListener) {
           throw new Error('Telegram listener not available');
+        }
+        // Fail fast on ids Telegram can never accept (symbolic labels guessed
+        // by agents in proactive sessions) — one choke point covers the text,
+        // voice, and media paths below.
+        const chatIdError = validateTelegramChatId(conversationId);
+        if (chatIdError) {
+          throw new Error(chatIdError);
         }
         if (await this.trySendTelegramVoiceReply(response)) {
           if (this.includeTextAfterVoiceReply) {
@@ -738,6 +747,7 @@ export class ChannelGateway extends EventEmitter {
           }
         }
         break;
+      }
 
       case 'whatsapp':
         if (!this.whatsappListener) {
@@ -997,7 +1007,11 @@ export class ChannelGateway extends EventEmitter {
   ): Promise<void> {
     const key = this.getBufferKey(channel, conversationId);
 
-    // If an auto-response was provided, send it first
+    // If an auto-response was provided, send it first. Success or failure, we
+    // MUST fall through to the release below — sendResponse deliberately does
+    // NOT process pending messages (see the NOTE in sendResponse), so an early
+    // return here leaks the processing lock: the lane stays "busy" forever and
+    // every later inbound message queues as pending, never drained.
     if (autoResponse && autoResponse.content) {
       try {
         await this.sendResponse({
@@ -1006,11 +1020,8 @@ export class ChannelGateway extends EventEmitter {
           content: autoResponse.content,
           format: autoResponse.format,
         });
-        // sendResponse will call processPendingMessages, so we're done
-        return;
       } catch (error) {
         logger.error(`Failed to send auto-response for ${key}:`, error);
-        // Continue to release the lock even if send fails
       }
     }
 

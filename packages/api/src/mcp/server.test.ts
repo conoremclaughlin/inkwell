@@ -495,6 +495,86 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     expect(mockGetSession).toHaveBeenCalledWith('a1b2c3d4-e5f6-7890-abcd-ef1234567890');
   });
 
+  it('enriches a user-token request with the context session agent (PR #468)', async () => {
+    if (serverUnavailableError) return;
+    // The normal local auth shape: an unbound USER bearer with no agent
+    // claim. The x-ink-context session must be consulted (server truth)
+    // even though Authorization is present — before this, ink-routed tool
+    // calls ran agent-less and workspace derivation for writes failed.
+    mockVerifyAccessToken.mockResolvedValue({ userId: 'user-456', email: 'test@example.com' });
+    mockGetSession.mockClear();
+    mockGetSession.mockResolvedValue({
+      id: 'b2c3d4e5-f6a7-8901-bcde-f23456789012',
+      userId: 'user-456',
+      agentId: 'myra',
+      lifecycle: 'running',
+      startedAt: new Date(),
+      endedAt: undefined,
+      metadata: {},
+    });
+    contextIdentity = {
+      id: 'sb-myra-1',
+      user_id: 'user-456',
+      users: { email: 'test@example.com' },
+    };
+
+    const contextHeader = encodeContextHeader({
+      sessionId: 'b2c3d4e5-f6a7-8901-bcde-f23456789012',
+      studioId: 'studio-1',
+      agentId: 'myra',
+      cliAttached: false,
+      runtime: 'ink',
+    });
+
+    const res = await mcpPost(baseUrl, INITIALIZE_REQUEST, {
+      Authorization: 'Bearer valid',
+      'x-ink-context': contextHeader,
+    });
+
+    expect(res.status).toBe(200);
+    // The enrichment path consulted the session row under Authorization —
+    // previously getSession was only reached in the no-auth fallback.
+    expect(mockGetSession).toHaveBeenCalledWith('b2c3d4e5-f6a7-8901-bcde-f23456789012');
+  });
+
+  it('does not fail the request when the context session belongs to a different user', async () => {
+    if (serverUnavailableError) return;
+    // Cross-user session reference: enrichment is refused (identity stays
+    // agent-less) but the request itself proceeds under the valid bearer.
+    mockVerifyAccessToken.mockResolvedValue({ userId: 'user-456', email: 'test@example.com' });
+    mockGetSession.mockClear();
+    mockGetSession.mockResolvedValue({
+      id: 'c3d4e5f6-a7b8-9012-cdef-345678901234',
+      userId: 'user-999',
+      agentId: 'myra',
+      lifecycle: 'running',
+      startedAt: new Date(),
+      endedAt: undefined,
+      metadata: {},
+    });
+    contextIdentity = {
+      id: 'sb-myra-1',
+      user_id: 'user-999',
+      users: { email: 'other@example.com' },
+    };
+
+    const contextHeader = encodeContextHeader({
+      sessionId: 'c3d4e5f6-a7b8-9012-cdef-345678901234',
+      studioId: 'studio-1',
+      agentId: 'myra',
+      cliAttached: false,
+      runtime: 'ink',
+    });
+
+    const res = await mcpPost(baseUrl, INITIALIZE_REQUEST, {
+      Authorization: 'Bearer valid',
+      'x-ink-context': contextHeader,
+    });
+
+    expect(res.status).toBe(200);
+    expect(mockGetSession).toHaveBeenCalledWith('c3d4e5f6-a7b8-9012-cdef-345678901234');
+  });
+
   it('should reject forged context with no matching session', async () => {
     if (serverUnavailableError) return;
     (env as any).MCP_REQUIRE_OAUTH = true;
@@ -661,5 +741,146 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     expect(res.status).toBe(200);
     // Session lookup should NOT have been called — OAuth was sufficient
     expect(mockGetSession).not.toHaveBeenCalled();
+  });
+});
+
+// ===========================================================================
+// Session-anchored identity enrichment (PR #468) — unit seam.
+// Proves the x-ink-context header actually PRODUCES agent/sb/workspace
+// identity, canonical-first: the session's sb_id resolves by UUID even when
+// the same agent slug exists in multiple workspaces (where slug .single()
+// errors and would break enrichment + artifact writes).
+// ===========================================================================
+describe('enrichIdentityFromContextSession + workspace derivation (canonical identity)', () => {
+  const USER = { userId: 'user-456', email: 'test@example.com' };
+  const SID = 'd4e5f6a7-b8c9-0123-def4-567890123456';
+
+  // Two identities share the slug 'myra' (schema-legal, different
+  // workspaces). Slug .single() over these errors; UUID lookup does not.
+  const identities = [
+    {
+      id: 'sb-uuid-A',
+      agent_id: 'myra',
+      user_id: 'user-456',
+      workspace_id: 'ws-AAAA',
+      users: { email: 'test@example.com' },
+    },
+    {
+      id: 'sb-uuid-B',
+      agent_id: 'myra',
+      user_id: 'user-456',
+      workspace_id: 'ws-BBBB',
+      users: { email: 'test@example.com' },
+    },
+  ];
+
+  const makeServer = (session: Record<string, unknown> | null) => {
+    const composer = {
+      getClient: () => ({
+        from: (table: string) => {
+          const filters: Record<string, string> = {};
+          const query: Record<string, unknown> = {};
+          Object.assign(query, {
+            select: () => query,
+            eq: (field: string, value: string) => {
+              filters[field] = value;
+              return query;
+            },
+            single: async () => {
+              if (table !== 'agent_identities') return { data: null, error: { message: 'nf' } };
+              if (filters.id) {
+                const row = identities.find((i) => i.id === filters.id) ?? null;
+                return row
+                  ? { data: row, error: null }
+                  : { data: null, error: { message: 'not found' } };
+              }
+              // Slug path: duplicate rows → PostgREST .single() errors.
+              const rows = identities.filter(
+                (i) => i.agent_id === filters.agent_id && i.user_id === filters.user_id
+              );
+              return rows.length === 1
+                ? { data: rows[0], error: null }
+                : { data: null, error: { message: 'JSON object requested, multiple rows' } };
+            },
+            maybeSingle: async () => {
+              if (table !== 'agent_identities') return { data: null, error: null };
+              const row = identities.find((i) => i.id === filters.id) ?? null;
+              return { data: row, error: null };
+            },
+          });
+          return query;
+        },
+      }),
+      repositories: {
+        memory: { getSession: vi.fn(async () => session) },
+        workspaces: { findById: vi.fn(async () => null) },
+      },
+    } as never;
+    return new MCPServer(composer);
+  };
+
+  const liveSession = (sbId: string | undefined) => ({
+    id: SID,
+    userId: 'user-456',
+    agentId: 'myra',
+    sbId,
+    lifecycle: 'running',
+    startedAt: new Date(),
+    endedAt: undefined,
+    metadata: {},
+  });
+
+  it('resolves identity by session sb_id even with duplicate slugs, then derives workspace by UUID', async () => {
+    const server = makeServer(liveSession('sb-uuid-B')) as never as Record<string, never>;
+    const enriched = await (
+      server as unknown as {
+        enrichIdentityFromContextSession: (
+          u: unknown,
+          t: unknown
+        ) => Promise<{ agentId?: string; sbId?: string } | null>;
+      }
+    ).enrichIdentityFromContextSession(USER, { sessionId: SID, agentId: 'myra' });
+
+    expect(enriched?.agentId).toBe('myra');
+    expect(enriched?.sbId).toBe('sb-uuid-B');
+
+    // The header-produced identity flows through to workspace scope,
+    // unambiguously, from the canonical UUID.
+    const ws = await (
+      server as unknown as {
+        resolveWorkspaceContextForMcpRequest: (
+          req: unknown,
+          u: unknown
+        ) => Promise<{ workspaceId?: string }>;
+      }
+    ).resolveWorkspaceContextForMcpRequest({ header: () => undefined }, { ...USER, ...enriched });
+    expect(ws.workspaceId).toBe('ws-BBBB');
+  });
+
+  it('legacy sessions without sb_id fail closed on duplicate slugs instead of guessing', async () => {
+    const server = makeServer(liveSession(undefined));
+    const enriched = await (
+      server as unknown as {
+        enrichIdentityFromContextSession: (
+          u: unknown,
+          t: unknown
+        ) => Promise<{ agentId?: string } | null>;
+      }
+    ).enrichIdentityFromContextSession(USER, { sessionId: SID, agentId: 'myra' });
+    // Slug fallback hits the duplicate-row error → no enrichment.
+    expect(enriched?.agentId).toBeUndefined();
+  });
+
+  it('refuses enrichment when the session belongs to a different user', async () => {
+    const server = makeServer({ ...liveSession('sb-uuid-A'), userId: 'user-999' });
+    const enriched = await (
+      server as unknown as {
+        enrichIdentityFromContextSession: (
+          u: unknown,
+          t: unknown
+        ) => Promise<{ agentId?: string } | null>;
+      }
+    ).enrichIdentityFromContextSession(USER, { sessionId: SID, agentId: 'myra' });
+    expect(enriched?.agentId).toBeUndefined();
   });
 });

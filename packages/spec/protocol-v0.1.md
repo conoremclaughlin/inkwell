@@ -109,7 +109,7 @@ Each update MUST increment `version` and archive the previous state to an identi
 
 Identity MUST be portable across backends. An agent's identity record does not depend on which LLM backend animates it. Changing an agent's `backend` field MUST NOT require re-creation of the identity.
 
-Implementations SHOULD sync identity to local files (`~/.pcp/individuals/{agentId}/`) for offline access and system prompt injection.
+Implementations SHOULD sync identity to local files (`~/.ink/individuals/{agentId}/`) for offline access and system prompt injection.
 
 ### 2.3 User-Level Shared Documents
 

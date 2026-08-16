@@ -8,15 +8,16 @@ import { SpatialMap } from './spatial-map';
 import { TaskGraph } from './task-graph';
 import { ActivityLog } from './activity-log';
 import { AgentPanel } from './agent-panel';
+import { AgentCards } from './agent-cards';
 import { SkinPicker } from './skin-picker';
 
-type ViewMode = 'split' | 'map' | 'graph';
+type ViewMode = 'split' | 'map' | 'graph' | 'cards';
 
 export function CommandCenter() {
   useCommandData();
 
   const skin = getSkin(useCommandStore((s) => s.skin));
-  const [viewMode, setViewMode] = useState<ViewMode>('map');
+  const [viewMode, setViewMode] = useState<ViewMode>('cards');
 
   return (
     <div
@@ -39,21 +40,31 @@ export function CommandCenter() {
             COMMAND CENTER
           </h1>
           <div className="flex items-center gap-1">
-            {(['split', 'map', 'graph'] as ViewMode[]).map((mode) => (
-              <button
-                key={mode}
-                onClick={() => setViewMode(mode)}
-                className="px-2 py-0.5 rounded text-xs transition-all"
-                style={{
-                  backgroundColor: viewMode === mode ? skin.colors.accent + '20' : 'transparent',
-                  color: viewMode === mode ? skin.colors.accent : skin.colors.textMuted,
-                  fontFamily: skin.fonts.mono,
-                  fontSize: '11px',
-                }}
-              >
-                {mode === 'split' ? 'SPLIT' : mode === 'map' ? 'MAP' : 'TASKS'}
-              </button>
-            ))}
+            {(['cards', 'split', 'map', 'graph'] as ViewMode[]).map((mode) => {
+              const label =
+                mode === 'cards'
+                  ? 'CARDS'
+                  : mode === 'split'
+                    ? 'SPLIT'
+                    : mode === 'map'
+                      ? 'MAP'
+                      : 'TASKS';
+              return (
+                <button
+                  key={mode}
+                  onClick={() => setViewMode(mode)}
+                  className="px-2 py-0.5 rounded text-xs transition-all"
+                  style={{
+                    backgroundColor: viewMode === mode ? skin.colors.accent + '20' : 'transparent',
+                    color: viewMode === mode ? skin.colors.accent : skin.colors.textMuted,
+                    fontFamily: skin.fonts.mono,
+                    fontSize: '11px',
+                  }}
+                >
+                  {label}
+                </button>
+              );
+            })}
           </div>
         </div>
         <SkinPicker />
@@ -63,7 +74,12 @@ export function CommandCenter() {
       <div className="flex-1 flex overflow-hidden">
         {/* Left panel: spatial map + task graph */}
         <div className="flex-1 flex flex-col relative">
-          {viewMode === 'split' ? (
+          {viewMode === 'cards' ? (
+            <div className="flex-1 relative">
+              <AgentCards />
+              <AgentPanel />
+            </div>
+          ) : viewMode === 'split' ? (
             <>
               <div className="relative" style={{ height: '60%' }}>
                 <SpatialMap />

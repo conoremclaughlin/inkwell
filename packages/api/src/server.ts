@@ -41,8 +41,13 @@ import {
 } from './services/heartbeat';
 import { StrategyService } from './services/strategy.service';
 import { getOrchestrator } from './services/sandbox/index.js';
-import { setResponseCallback, hasExplicitResponse } from './mcp/tools/response-handlers';
+import {
+  setResponseCallback,
+  hasExplicitResponse,
+  clearExplicitResponse,
+} from './mcp/tools/response-handlers';
 import { getAgentGateway, type AgentTriggerPayload } from './channels/agent-gateway';
+import { storedTriggerMedia } from './channels/agent-media';
 import { resolveRouteAgentId } from './services/routing/resolve-route';
 import { resolveAgentFromMention } from './services/routing/resolve-mention';
 import { getHeartbeatProcessingConfig } from './config/heartbeat-flags';
@@ -55,8 +60,14 @@ import {
   type SessionPollRow,
   type SessionAttachedRow,
 } from './services/sessions/trigger-delivery';
+import { assignThreadParticipant } from './services/sessions/thread-assignment';
+import { closeIntakeAndDrain } from './services/sessions/active-runs';
+import { interruptActiveRuns } from './services/sessions/interrupt-active-runs';
 import type { ActivityType } from './data/repositories/activity-stream.repository';
 import { resolveTaskGroupForThreadKey } from './services/task-group-resolver';
+import { sendTriggerFailureNotice } from './services/trigger-failure-notice';
+import { StudioLeaseService } from './services/studio-lease.service';
+import { StudioOverflowService } from './services/studio-overflow.service';
 
 // Server configuration
 interface ServerConfig {
@@ -139,6 +150,13 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     ...(env.DEFAULT_CLAUDE_MODEL ? { defaultModel: env.DEFAULT_CLAUDE_MODEL } : {}),
     ...(env.DEFAULT_CODEX_MODEL ? { defaultCodexModel: env.DEFAULT_CODEX_MODEL } : {}),
     ...(env.DEFAULT_GEMINI_MODEL ? { defaultGeminiModel: env.DEFAULT_GEMINI_MODEL } : {}),
+    ...(env.DEFAULT_ANTIGRAVITY_MODEL
+      ? { defaultAntigravityModel: env.DEFAULT_ANTIGRAVITY_MODEL }
+      : {}),
+    // The port this process actually bound, not whatever a checked-in config
+    // file claims — an isolated server started with PCP_PORT_BASE must not hand
+    // its credentials to the main server on 3001.
+    inkMcpUrl: `http://localhost:${env.MCP_HTTP_PORT}/mcp`,
   };
   sessionService = createSessionService(dataComposer.getClient(), sessionServiceConfig);
   logger.info('SessionService ready');
@@ -366,6 +384,8 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
         });
         await channelGateway.releaseConversation(channel as GatewayChannel, conversationId);
       }
+
+      clearExplicitResponse(channel, conversationId);
     }
 
     if (!result.success) {
@@ -642,6 +662,11 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
   };
 
   if (heartbeatServiceEnabled) {
+    const sweepLeaseService = new StudioLeaseService(dataComposer!.getClient());
+    const sweepOverflowService = new StudioOverflowService(
+      dataComposer!.repositories.studios,
+      sweepLeaseService
+    );
     initHeartbeatService({
       interval: heartbeatInterval,
       enableLocalCron,
@@ -649,6 +674,23 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
         logger.info('Heartbeat tick — processing due reminders');
         const stats = await processHeartbeat(deliverReminderViaSession);
         logger.info('Heartbeat complete', stats);
+
+        // Lease sweep: expire leases whose heartbeat went stale (rescuing the
+        // worktree first), renew for sessions still running in-process, and
+        // close ephemeral overflow studios past their TTL. This is the expiry
+        // half of programmatic release — crashed sessions cannot hold a
+        // worktree hostage past the staleness threshold.
+        try {
+          const leaseStats = await sweepLeaseService.sweepExpiredLeases();
+          const ephemeralClosed = await sweepOverflowService.sweepExpiredEphemeralStudios();
+          if (leaseStats.expired || leaseStats.renewed || ephemeralClosed) {
+            logger.info('Lease sweep complete', { ...leaseStats, ephemeralClosed });
+          }
+        } catch (sweepErr) {
+          logger.error('Lease sweep failed', {
+            error: sweepErr instanceof Error ? sweepErr.message : String(sweepErr),
+          });
+        }
       },
     });
     logger.info(
@@ -1030,29 +1072,96 @@ When you complete a task_request, mark it as completed using update_inbox_messag
             : undefined,
       });
 
-      // Stamp the resolved session on the recipient's thread participant record
-      // so channel plugins can filter threads to their session.
-      // Skip for cross-studio self-messages: the PK is (thread_id, agent_id),
-      // so there's only one row — stamping would hide the thread from the
-      // sender's studio. Leave null so both sessions see it.
-      const isCrossStudioSelf =
-        payload.fromAgentId === targetAgentId && !!(payload.studioId || payload.studioHint);
-      if (payload.threadId && routedSession.id && !isCrossStudioSelf) {
+      // Assign the thread to the resolved session via the single sanctioned
+      // writer (spec: inkmail-read-state §3a). Explicit anchors overwrite
+      // (deliberate retarget); otherwise first assignment is a CAS and a lost
+      // race reroutes delivery to the winner. Cross-studio self-sends stamp
+      // the TARGET session — under stamped-only polling, an unstamped row is
+      // invisible to everyone, so "leave null so both see it" no longer works.
+      let deliverySession = routedSession;
+      // Assignment integrity (Lumen, PR #460 round 2): a failed stamp must
+      // never be swallowed into a routeOnly "success" — with stamped-only
+      // polling and no wake coming, an unstamped thread is permanently
+      // invisible. Wake dispatches tolerate it (the wake surfaces the
+      // message and the next dispatch retries the stamp).
+      let assignmentFailure: string | null = null;
+      if (payload.threadId && routedSession.id) {
         try {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          await (dataComposer!.getClient() as any)
-            .from('inbox_thread_participants')
-            .update({ session_id: routedSession.id })
-            .eq('thread_id', payload.threadId)
-            .eq('agent_id', targetAgentId);
+          const assignment = await assignThreadParticipant(dataComposer!.getClient(), {
+            threadId: payload.threadId,
+            agentId: targetAgentId,
+            candidateSessionId: routedSession.id,
+            explicitAnchor: !!payload.explicitRecipientTarget,
+            source: 'trigger-handler',
+          });
+          if (!assignment.stampPersisted) {
+            assignmentFailure = `participant stamp not persisted (boundVia=${assignment.boundVia})`;
+          }
+          if (assignment.rerouted) {
+            // A concurrent dispatch (or an existing live binding) won — deliver
+            // to the winner, and archive our freshly-created loser candidate so
+            // it doesn't linger as an empty routable session.
+            const winner = await sessionService!.getSession(assignment.sessionId);
+            if (winner) {
+              deliverySession = winner;
+              const candidateIsFresh =
+                routedSession.messageCount === 0 && !routedSession.backendSessionId;
+              if (candidateIsFresh && routedSession.id !== winner.id) {
+                await sessionService!.endSession(routedSession.id).catch((e) =>
+                  logger.warn('[Trigger] Failed to archive loser candidate session', {
+                    sessionId: routedSession.id,
+                    error: e instanceof Error ? e.message : String(e),
+                  })
+                );
+              }
+            }
+          }
         } catch (err) {
-          logger.warn('[Trigger] Failed to stamp session_id on thread participant', {
+          assignmentFailure = err instanceof Error ? err.message : String(err);
+          logger.warn('[Trigger] Thread assignment failed', {
             threadId: payload.threadId,
             agentId: targetAgentId,
             sessionId: routedSession.id,
-            error: err instanceof Error ? err.message : String(err),
+            error: assignmentFailure,
           });
         }
+      }
+
+      // Routing-only dispatch: assignment IS the entire job — a failed stamp
+      // must propagate as a failed trigger (processTrigger returns
+      // success:false and the send surfaces it), never a silent success.
+      // (spec §3a — trigger controls wake, never addressing.)
+      if (payload.routeOnly) {
+        if (assignmentFailure) {
+          logger.error('[Trigger] routeOnly assignment failed — surfacing to sender', {
+            targetAgentId,
+            sessionId: deliverySession.id,
+            threadKey: payload.threadKey,
+            threadId: payload.threadId,
+            error: assignmentFailure,
+          });
+          throw new Error(`routeOnly assignment failed for ${targetAgentId}: ${assignmentFailure}`);
+        }
+        logger.info('[Trigger] routeOnly — assignment complete, no wake', {
+          targetAgentId,
+          sessionId: deliverySession.id,
+          threadKey: payload.threadKey,
+          threadId: payload.threadId,
+        });
+        await logInkmail('inkmail_deliver', payload, userId, {
+          sessionId: deliverySession.id,
+          deliveryMethod: 'route_only',
+        });
+        return;
+      }
+
+      // Deliver to the assigned session (may differ from routedSession after
+      // a lost claim race).
+      if (deliverySession.id !== routedSession.id) {
+        request.metadata = {
+          ...request.metadata,
+          recipientSessionId: deliverySession.id,
+        };
       }
 
       // Check if the routed session has a CLI actively polling or attached.
@@ -1062,14 +1171,14 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       const { data: pollRow } = (await (dataComposer!.getClient() as any)
         .from('sessions')
         .select('id, cli_poll_at, studio_id')
-        .eq('id', routedSession.id)
+        .eq('id', deliverySession.id)
         .maybeSingle()) as { data: SessionPollRow | null };
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const { data: attachedRow } = (await (dataComposer!.getClient() as any)
         .from('sessions')
         .select('cli_attached, updated_at')
-        .eq('id', routedSession.id)
+        .eq('id', deliverySession.id)
         .maybeSingle()) as { data: SessionAttachedRow | null };
 
       // Clear stale cli_attached flag as a side effect (before the skip decision)
@@ -1079,14 +1188,14 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         Date.now() - new Date(attachedRow.updated_at).getTime() > 10 * 60 * 1000
       ) {
         logger.warn('[Trigger] CLI-attached session is stale, clearing flag', {
-          sessionId: routedSession.id,
+          sessionId: deliverySession.id,
           updatedAt: attachedRow.updated_at,
         });
         await dataComposer!
           .getClient()
           .from('sessions')
           .update({ cli_attached: false } as never)
-          .eq('id', routedSession.id);
+          .eq('id', deliverySession.id);
         attachedRow.cli_attached = false;
       }
 
@@ -1108,14 +1217,14 @@ When you complete a task_request, mark it as completed using update_inbox_messag
           `[Trigger] CLI-attached (${delivery.source}) — skipping spawn, channel plugin will deliver`,
           {
             targetAgentId,
-            attachedSessionId: delivery.sessionId || routedSession.id,
-            routedSessionId: routedSession.id,
-            studioId: routedSession.studioId,
+            attachedSessionId: delivery.sessionId || deliverySession.id,
+            routedSessionId: deliverySession.id,
+            studioId: deliverySession.studioId,
             threadKey: payload.threadKey,
           }
         );
         await logInkmail('inkmail_deliver', payload, userId, {
-          sessionId: routedSession.id,
+          sessionId: deliverySession.id,
           deliveryMethod: `cli_${delivery.source}`,
         });
         return;
@@ -1132,6 +1241,22 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       // If session resolution fails, fall through to normal handleMessage
       logger.debug('[Trigger] CLI-attached check failed, falling through to spawn', {
         error: err instanceof Error ? err.message : String(err),
+      });
+    }
+
+    // Media resolves ONLY on the spawn path — CLI-attached deliveries (early
+    // return above) are text-only via the channel plugin, so snapshotting for
+    // them would guarantee orphaned copies (Lumen, review 4900565751).
+    // storedTriggerMedia is the single entry point: it looks up the stored
+    // row itself and snapshots each validated file; the trigger payload's
+    // own metadata is not an input. Flows to the spawn as --attach-file and
+    // from there through provider media injection.
+    const triggerMedia = await storedTriggerMedia(dataComposer!.getClient() as never, payload);
+    if (triggerMedia.length > 0) {
+      request.metadata!.media = triggerMedia;
+      logger.info('[Trigger] delivering media attachments', {
+        count: triggerMedia.length,
+        to: targetAgentId,
       });
     }
 
@@ -1239,6 +1364,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
 
       // Look up the userId from the original source row (needed for sender inbox insert).
       let recipientUserId: string | undefined;
+      let resolvedThreadId: string | undefined;
       if (payload.inboxMessageId) {
         const { data: origMsg } = await client
           .from('agent_inbox')
@@ -1254,6 +1380,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
           .eq('id', payload.threadMessageId)
           .single();
         if (threadMsg?.thread_id) {
+          resolvedThreadId = threadMsg.thread_id;
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           const { data: thread } = await (client as any)
             .from('inbox_threads')
@@ -1263,6 +1390,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
           recipientUserId = thread?.user_id;
         }
       } else if (payload.threadId) {
+        resolvedThreadId = payload.threadId;
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const { data: thread } = await (client as any)
           .from('inbox_threads')
@@ -1270,6 +1398,14 @@ When you complete a task_request, mark it as completed using update_inbox_messag
           .eq('id', payload.threadId)
           .single();
         recipientUserId = thread?.user_id;
+      }
+
+      // Bare trigger_agent (no source row, possibly just a threadKey): fall
+      // back to the user stamped server-side post-auth by handleTriggerAgent.
+      // Row-derived resolution stays preferred; this fallback is what lets a
+      // threadKey-only failure reach thread resolution at all (PR #487).
+      if (!recipientUserId && payload.recipientUserId) {
+        recipientUserId = payload.recipientUserId;
       }
 
       if (recipientUserId) {
@@ -1287,15 +1423,17 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         classification.category !== 'unknown' ? ` (${classification.category})` : '';
       const notificationContent = `Trigger to ${payload.toAgentId} failed${categoryLabel}: ${classification.summary}`;
 
-      const { error: insertErr } = await client.from('agent_inbox').insert({
-        recipient_user_id: recipientUserId,
-        recipient_agent_id: payload.fromAgentId,
-        sender_agent_id: payload.toAgentId,
+      // Thread-borne trigger → notice joins the thread (participants and
+      // session stamps already exist; stamped-only delivery lands it in
+      // exactly one session per participant). Threadless → legacy inbox.
+      const noticeResult = await sendTriggerFailureNotice(client, {
+        userId: recipientUserId,
+        fromAgentId: payload.fromAgentId,
+        toAgentId: payload.toAgentId,
+        threadId: resolvedThreadId,
+        threadKey: payload.threadKey,
         subject: `Trigger failed: ${payload.toAgentId}`,
         content: notificationContent,
-        message_type: 'notification',
-        priority: 'high',
-        thread_key: payload.threadKey || null,
         metadata: {
           triggerFailure: true,
           triggerId,
@@ -1305,18 +1443,12 @@ When you complete a task_request, mark it as completed using update_inbox_messag
           retryable: classification.retryable,
           originalInboxMessageId: payload.inboxMessageId || null,
         },
-        // No trigger — avoid infinite failure loops
       });
-
-      if (insertErr) {
-        logger.error('[TriggerFailure] Failed to send failure notification to sender', {
-          sender: payload.fromAgentId,
-          error: insertErr.message,
-        });
-      } else {
+      if (noticeResult.ok) {
         logger.info('[TriggerFailure] Sent failure notification to sender', {
           sender: payload.fromAgentId,
           category: classification.category,
+          via: noticeResult.via,
         });
       }
     }
@@ -1473,6 +1605,26 @@ async function shutdown(): Promise<void> {
   forceKillTimer.unref(); // Don't let the timer itself keep the process alive
 
   try {
+    // Before anything is torn down: the agent CLIs we spawned are our children
+    // and are about to die with us. Record that, and tell whoever is waiting.
+    // Runs first because it needs a live DB client, and because the notice is
+    // worth more than a few hundred milliseconds of shutdown latency.
+    // Close intake and let outstanding lifecycle writes settle before taking
+    // the snapshot. Snapshotting first would race the very writes it needs to
+    // order against — a pending `running` write would land after our
+    // interruption and restore the zombie.
+    const { runs: interrupted, drained } = await closeIntakeAndDrain();
+    if (interrupted.length > 0 && dataComposer) {
+      // `drained` is passed through rather than swallowed: if a lifecycle
+      // write was still outstanding, whatever we record here may be
+      // contradicted a moment later, and the notice has to say so.
+      await interruptActiveRuns(dataComposer.getClient(), interrupted, undefined, drained).catch(
+        (err) => {
+          logger.error('Interruption bookkeeping failed', { error: err });
+        }
+      );
+    }
+
     // Stop heartbeat cron job (logs internally)
     stopHeartbeatService();
 

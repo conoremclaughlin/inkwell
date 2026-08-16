@@ -2,6 +2,22 @@ import { createHash } from 'crypto';
 
 export type LedgerRole = 'system' | 'user' | 'assistant' | 'inbox';
 
+/**
+ * Display-replay metadata for entries whose LEDGER representation is a
+ * compact bookkeeping line but whose SCROLLBACK representation is a full
+ * message block — platform messages (📤 myra → telegram). Pure display
+ * data: prompt building and token accounting read `content` only, so this
+ * never changes what the model sees. Carried through compaction keptEntries
+ * so a platform send in the protected tail still replays as a message
+ * block after compact → detach → reattach (Lumen, PR #478 review).
+ */
+export interface LedgerReplayMeta {
+  role: 'user' | 'assistant';
+  label: string;
+  body: string;
+  at?: string;
+}
+
 export interface LedgerEntry {
   id: number;
   role: LedgerRole;
@@ -15,6 +31,8 @@ export interface LedgerEntry {
    * been individually tracked — eviction refs fall back to content hash.
    */
   eid?: number;
+  /** Display-replay metadata (see LedgerReplayMeta). */
+  replay?: LedgerReplayMeta;
 }
 
 /**
@@ -80,7 +98,13 @@ export class ContextLedger {
   private entrySeq = 1;
   private bookmarkSeq = 1;
 
-  public addEntry(role: LedgerRole, content: string, source?: string, eid?: number): LedgerEntry {
+  public addEntry(
+    role: LedgerRole,
+    content: string,
+    source?: string,
+    eid?: number,
+    replay?: LedgerReplayMeta
+  ): LedgerEntry {
     const entry: LedgerEntry = {
       id: this.entrySeq++,
       role,
@@ -89,6 +113,7 @@ export class ContextLedger {
       createdAt: new Date().toISOString(),
       approxTokens: estimateTokens(content),
       ...(eid !== undefined ? { eid } : {}),
+      ...(replay !== undefined ? { replay } : {}),
     };
     this.entries.push(entry);
     return entry;

@@ -15,6 +15,9 @@ import { getEffectiveAgentId } from '../../auth/enforce-identity';
 import { logger } from '../../utils/logger';
 import type { Json } from '../../data/supabase/types';
 import { getAgentGateway, type AgentTriggerPayload } from '../../channels/agent-gateway.js';
+import { advanceThreadReadPointer } from './read-state.js';
+import { StudioLeaseService } from '../../services/studio-lease.service.js';
+import { StudioOverflowService } from '../../services/studio-overflow.service.js';
 
 // The thread tables are new and not yet in generated Supabase types.
 // Use type-safe wrappers that cast the table name for PostgREST queries.
@@ -23,6 +26,13 @@ type SupabaseClient = ReturnType<DataComposer['getClient']>;
 const threadTable = (supabase: SupabaseClient, table: string) =>
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (supabase as any).from(table);
+
+// Cold-start guard bounds (spec inkmail-read-state §4): a delivery poll with
+// a missing/stale read pointer is limited to the last 48h of unseen messages,
+// with a floor of the newest 10 so quiet threads still surface context. The
+// per-thread ceiling is the caller's `limit` (plugin passes 50).
+const COLD_START_WINDOW_MS = 48 * 60 * 60 * 1000;
+const COLD_START_MIN_MESSAGES = 10;
 
 // ============== Schemas ==============
 
@@ -49,6 +59,29 @@ const getThreadMessagesSchema = userIdentifierBaseSchema.extend({
     .describe(
       'Return the full timeline regardless of read state. Without this (and without an explicit cursor), results fall back to messages newer than the last-read pointer — which hides already-delivered messages from watchers/pollers that manage their own cursor (e.g., ink wait).'
     ),
+  newerThan: z
+    .string()
+    .datetime()
+    .optional()
+    .describe(
+      'Explicit floor: only messages created after this timestamp. Combined with the read-state cursor (the later of the two wins).'
+    ),
+  latestN: z
+    .number()
+    .int()
+    .min(1)
+    .max(200)
+    .optional()
+    .describe(
+      'Return only the newest N of the matching messages (truncates older ones first). skippedOlderCount reports what was cut.'
+    ),
+  channelPoll: z
+    .boolean()
+    .optional()
+    .default(false)
+    .describe(
+      'Delivery-poll mode (channel plugin): activates the cold-start guard — with no explicit cursor, unseen messages are bounded to the last 48h (floor: last 10), newest-first-truncated, so a stale or missing read pointer can never replay a months-long backlog (spec: inkmail-read-state §4).'
+    ),
 });
 
 const addThreadParticipantSchema = userIdentifierBaseSchema.extend({
@@ -74,6 +107,13 @@ const listThreadsSchema = userIdentifierBaseSchema.extend({
 const markThreadReadSchema = userIdentifierBaseSchema.extend({
   threadKey: threadKeySchema,
   agentId: agentIdSchema.describe('Agent ID marking the thread as read'),
+  throughMessageId: z
+    .string()
+    .uuid()
+    .optional()
+    .describe(
+      'Exact-id acknowledgement (spec inkmail-read-state §1): advance the read pointer through THIS message only — the last one actually delivered — instead of the whole thread. Used by delivery consumers (channel plugin) to ack after successful injection.'
+    ),
 });
 
 // ============== Helpers (exported for use by inbox-handlers) ==============
@@ -278,8 +318,17 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
   const agentId = getEffectiveAgentId(parsed.agentId) ?? parsed.agentId;
-  const { threadKey, limit, beforeMessageId, afterMessageId, includeSystemEvents, markRead } =
-    parsed;
+  const {
+    threadKey,
+    limit,
+    beforeMessageId,
+    afterMessageId,
+    includeSystemEvents,
+    markRead,
+    newerThan,
+    latestN,
+    channelPoll,
+  } = parsed;
 
   // Find thread
   const thread = await findThread(supabase, resolved.user.id, threadKey);
@@ -309,100 +358,195 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
     };
   }
 
-  // Build query
-  let query = threadTable(supabase, 'inbox_thread_messages')
-    .select('*')
-    .eq('thread_id', thread.id)
-    .order('created_at', { ascending: true })
-    .limit(limit);
-
-  if (!includeSystemEvents) {
-    query = query.neq('message_type', 'system');
-  }
-
+  // Resolve explicit cursor bounds (created_at of the cursor messages)
+  let beforeTs: string | null = null;
+  let afterTs: string | null = null;
   if (beforeMessageId) {
-    // Get the created_at of the cursor message for pagination
     const { data: cursor } = await threadTable(supabase, 'inbox_thread_messages')
       .select('created_at')
       .eq('id', beforeMessageId)
       .single();
-    if (cursor) {
-      query = query.lt('created_at', cursor.created_at);
-    }
+    beforeTs = (cursor as { created_at?: string } | null)?.created_at || null;
   }
-
   if (afterMessageId) {
     const { data: cursor } = await threadTable(supabase, 'inbox_thread_messages')
       .select('created_at')
       .eq('id', afterMessageId)
       .single();
-    if (cursor) {
-      query = query.gt('created_at', cursor.created_at);
-    }
-  } else if (!beforeMessageId && !parsed.fullHistory) {
-    // No explicit cursor — fall back to stored read state so a client whose
-    // in-memory cursor was reset doesn't replay the full thread history.
-    // Skipped when fullHistory is set: watchers (ink wait) need the true
-    // timeline to anchor on, or push-delivery read-marking races them into
-    // seeing an eternally-empty thread.
-    // Baseline priority:
-    //   1. last_read_at (explicit read pointer from prior reads)
-    //   2. joined_at (participant join time — no replay of pre-join history)
+    afterTs = (cursor as { created_at?: string } | null)?.created_at || null;
+  }
+
+  // Implicit read-state floor — only when no explicit cursor and not
+  // fullHistory. A client whose in-memory cursor was reset must not replay
+  // the full thread history; watchers (ink wait) pass fullHistory to anchor
+  // on the true timeline. Baseline priority:
+  //   1. last_read_at (explicit read pointer from prior reads)
+  //   2. joined_at (participant join time — no replay of pre-join history)
+  let readStateFloor: string | null = null;
+  if (!afterMessageId && !beforeMessageId && !parsed.fullHistory) {
     const { data: readStatus } = await threadTable(supabase, 'inbox_thread_read_status')
       .select('last_read_at')
       .eq('thread_id', thread.id)
       .eq('agent_id', agentId)
       .maybeSingle();
-    let cursorTs = (readStatus as { last_read_at?: string } | null)?.last_read_at || null;
+    readStateFloor = (readStatus as { last_read_at?: string } | null)?.last_read_at || null;
 
-    if (!cursorTs) {
+    if (!readStateFloor) {
       const { data: participant } = await threadTable(supabase, 'inbox_thread_participants')
         .select('joined_at')
         .eq('thread_id', thread.id)
         .eq('agent_id', agentId)
         .maybeSingle();
-      cursorTs = (participant as { joined_at?: string } | null)?.joined_at || null;
-    }
-
-    if (cursorTs) {
-      query = query.gt('created_at', cursorTs);
+      readStateFloor = (participant as { joined_at?: string } | null)?.joined_at || null;
     }
   }
 
-  const { data: messages, error } = await query;
-  if (error) {
-    throw new Error(`Failed to get thread messages: ${error.message}`);
+  // Effective floor: the latest of read-state floor / after-cursor / newerThan.
+  let floorTs: string | null = readStateFloor;
+  if (afterTs && (!floorTs || afterTs > floorTs)) floorTs = afterTs;
+  if (newerThan && (!floorTs || newerThan > floorTs)) floorTs = newerThan;
+
+  const buildQuery = (selectArg: string, head = false) => {
+    let q = threadTable(supabase, 'inbox_thread_messages')
+      .select(selectArg, head ? { count: 'exact', head: true } : undefined)
+      .eq('thread_id', thread.id);
+    if (!includeSystemEvents) q = q.neq('message_type', 'system');
+    if (floorTs) q = q.gt('created_at', floorTs);
+    if (beforeTs) q = q.lt('created_at', beforeTs);
+    return q;
+  };
+
+  // Cold-start guard (spec inkmail-read-state §4): a delivery poll with no
+  // explicit cursor must never replay a stale backlog — a missing or
+  // months-old read pointer bounds to the last 48h (floor: newest 10),
+  // truncated NEWEST-first. Explicit cursors and fullHistory bypass: those
+  // callers asked for a specific window.
+  const guardActive = channelPoll && !afterMessageId && !beforeMessageId && !parsed.fullHistory;
+  const newestFirst = guardActive || Boolean(latestN);
+  const effectiveLimit = Math.min(limit, latestN ?? limit);
+
+  let messages: Record<string, unknown>[] | null = null;
+  let skippedOlderCount = 0;
+
+  if (!newestFirst) {
+    const { data, error } = await buildQuery('*')
+      .order('created_at', { ascending: true })
+      .limit(effectiveLimit);
+    if (error) {
+      throw new Error(`Failed to get thread messages: ${error.message}`);
+    }
+    messages = data;
+  } else {
+    // Count everything past the floor so truncation is visible, not silent.
+    const { count: totalMatching, error: countErr } = await buildQuery('id', true);
+    if (countErr) {
+      throw new Error(`Failed to count thread messages: ${countErr.message}`);
+    }
+
+    let windowed = buildQuery('*');
+    if (guardActive) {
+      const guardFloor = new Date(Date.now() - COLD_START_WINDOW_MS).toISOString();
+      // Repeated created_at filters AND together — the later floor wins.
+      if (!floorTs || guardFloor > floorTs) {
+        windowed = windowed.gt('created_at', guardFloor);
+      }
+    }
+    const { data: newest, error } = await windowed
+      .order('created_at', { ascending: false })
+      .limit(effectiveLimit);
+    if (error) {
+      throw new Error(`Failed to get thread messages: ${error.message}`);
+    }
+    let delivered = (newest || []) as Record<string, unknown>[];
+
+    // Myra floor: if the 48h window under-delivers relative to what's unseen,
+    // deliver the newest 10 unseen regardless of age — quiet threads still
+    // surface recent context on a cold start.
+    const floorCount = Math.min(COLD_START_MIN_MESSAGES, effectiveLimit);
+    if (guardActive && delivered.length < floorCount && (totalMatching ?? 0) > delivered.length) {
+      const { data: fallback, error: fallbackErr } = await buildQuery('*')
+        .order('created_at', { ascending: false })
+        .limit(floorCount);
+      if (fallbackErr) {
+        throw new Error(`Failed to get thread messages: ${fallbackErr.message}`);
+      }
+      delivered = (fallback || delivered) as Record<string, unknown>[];
+    }
+
+    skippedOlderCount = Math.max(0, (totalMatching ?? delivered.length) - delivered.length);
+    // Response stays oldest-first regardless of how the window was cut.
+    messages = delivered.reverse();
   }
 
   // Get participants
   const participants = await getParticipants(supabase, thread.id);
 
-  // Mark as read — advance the pointer to the latest created_at in the
-  // returned batch, never to NOW() and never backwards. Monotonicity matters:
-  // a caller passing an old explicit afterMessageId (or a client replaying
-  // with a partial set) must not regress the read pointer.
+  // Pointer advance semantics (Lumen, PR #473):
+  // - GUARD MODE (cold-start delivery poll): fetched-but-not-yet-rendered
+  //   messages must remain unread — the delivery consumer acks after
+  //   injection via mark_thread_read(throughMessageId). Only the range the
+  //   guard DELIBERATELY skipped is durably consumed here, by advancing
+  //   through the newest skipped message (the cutoff below the delivered
+  //   window) — never through the returned batch.
+  // - Non-guard paths keep the pre-existing fetch-time advance through the
+  //   returned batch (the global fetch≠delivered fix is the ack-protocol
+  //   step, tracked separately).
+  let advanceFailed = false;
   if (markRead && messages && messages.length > 0) {
-    let maxCreatedAt = '';
-    for (const m of messages as Array<{ created_at?: string }>) {
-      const ts = m.created_at;
-      if (ts && ts > maxCreatedAt) maxCreatedAt = ts;
-    }
-    if (maxCreatedAt) {
-      const { data: existing } = await threadTable(supabase, 'inbox_thread_read_status')
-        .select('last_read_at')
-        .eq('thread_id', thread.id)
-        .eq('agent_id', agentId)
-        .maybeSingle();
-      const existingTs = (existing as { last_read_at?: string } | null)?.last_read_at;
-      if (!existingTs || maxCreatedAt > existingTs) {
-        await threadTable(supabase, 'inbox_thread_read_status').upsert(
-          {
-            thread_id: thread.id,
-            agent_id: agentId,
-            last_read_at: maxCreatedAt,
-          },
-          { onConflict: 'thread_id,agent_id' }
-        );
+    if (guardActive) {
+      if (skippedOlderCount > 0) {
+        const oldestDelivered = messages[0] as { created_at?: string };
+        if (oldestDelivered?.created_at) {
+          const { data: newestSkipped } = await buildQuery('id, created_at')
+            .lt('created_at', oldestDelivered.created_at)
+            .order('created_at', { ascending: false })
+            .limit(1)
+            .maybeSingle();
+          if (newestSkipped?.id) {
+            const advanced = await advanceThreadReadPointer(supabase, {
+              threadId: thread.id,
+              agentId,
+              throughMessageId: newestSkipped.id,
+              source: 'get_thread_messages:deliberate_skip',
+            });
+            if (!advanced) {
+              // Checked write (spec §5): a failed skip-consume must be
+              // visible — the range will re-offer next cold fetch.
+              advanceFailed = true;
+              logger.error('[GetThreadMessages] deliberate_skip advance failed', {
+                threadKey,
+                agentId,
+                throughMessageId: newestSkipped.id,
+              });
+            }
+          }
+        }
+      }
+    } else {
+      let maxCreatedAt = '';
+      let maxMessageId = '';
+      for (const m of messages as Array<{ id?: string; created_at?: string }>) {
+        const ts = m.created_at;
+        if (ts && m.id && ts > maxCreatedAt) {
+          maxCreatedAt = ts;
+          maxMessageId = m.id;
+        }
+      }
+      if (maxMessageId) {
+        const advanced = await advanceThreadReadPointer(supabase, {
+          threadId: thread.id,
+          agentId,
+          throughMessageId: maxMessageId,
+          source: 'get_thread_messages:markRead',
+        });
+        if (!advanced) {
+          advanceFailed = true;
+          logger.error('[GetThreadMessages] markRead advance failed', {
+            threadKey,
+            agentId,
+            throughMessageId: maxMessageId,
+          });
+        }
       }
     }
   }
@@ -420,6 +564,20 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
           createdBy: thread.created_by_agent_id,
           participants,
           messageCount: messages?.length || 0,
+          // Truncation is visible, never silent: how many older matching
+          // messages were cut by the cold-start guard or latestN window.
+          ...(skippedOlderCount > 0 ? { skippedOlderCount } : {}),
+          ...(guardActive ? { coldStartGuard: true } : {}),
+          // Checked write surfaced to the caller (spec §5): messages were
+          // returned, but the read-pointer advance did NOT persist — read
+          // state is stale and messages may re-deliver.
+          ...(advanceFailed
+            ? {
+                advanceFailed: true,
+                warning:
+                  'read-pointer advance failed — read state is stale; messages may re-deliver',
+              }
+            : {}),
           messages: (messages || []).map((m: Record<string, unknown>) => ({
             id: m.id,
             senderAgentId: m.sender_agent_id,
@@ -606,6 +764,36 @@ export async function handleCloseThread(args: unknown, dataComposer: DataCompose
     metadata: { type: 'thread_closed', closedBy: agentId } as Json,
   });
 
+  // Automatic lease release — the work unit completing is what lets studios
+  // go. A holder whose process is still live (close_thread is commonly called
+  // from inside the holder's own turn) is DEFERRED via pendingRelease, and
+  // the run/stop boundary or sweep completes it — never cleared out from
+  // under a running process. Ephemeral teardown is claim-fenced per studio
+  // and skips anything still held.
+  try {
+    const leases = new StudioLeaseService(supabase);
+    const { released, deferred } = await leases.releaseByThread(resolved.user.id, threadKey, {
+      reason: 'thread-closed',
+    });
+    const overflow = new StudioOverflowService(dataComposer.repositories.studios, leases);
+    const cleaned = await overflow.teardownEphemeralStudiosForThread(resolved.user.id, threadKey, {
+      reason: `thread ${threadKey} closed`,
+    });
+    if (released || deferred || cleaned) {
+      logger.info('[StudioLease] Thread close released studios', {
+        threadKey,
+        leasesReleased: released,
+        leasesDeferred: deferred,
+        ephemeralCleaned: cleaned,
+      });
+    }
+  } catch (leaseErr) {
+    logger.warn('[StudioLease] Release on thread close failed (non-fatal)', {
+      threadKey,
+      error: leaseErr instanceof Error ? leaseErr.message : String(leaseErr),
+    });
+  }
+
   logger.info('Thread closed', { threadKey, closedBy: agentId });
 
   return {
@@ -775,15 +963,86 @@ export async function handleMarkThreadRead(args: unknown, dataComposer: DataComp
     };
   }
 
-  // Upsert read status
-  await threadTable(supabase, 'inbox_thread_read_status').upsert(
-    {
-      thread_id: thread.id,
-      agent_id: agentId,
-      last_read_at: new Date().toISOString(),
-    },
-    { onConflict: 'thread_id,agent_id' }
-  );
+  // Exact-id acknowledgement (spec §1): a delivery consumer acks the LAST
+  // message it actually injected — the pointer advances exactly through it,
+  // never past messages that were fetched but not yet rendered.
+  if (parsed.throughMessageId) {
+    const { data: ackMsg, error: ackErr } = await threadTable(supabase, 'inbox_thread_messages')
+      .select('id')
+      .eq('id', parsed.throughMessageId)
+      .eq('thread_id', thread.id)
+      .maybeSingle();
+    if (ackErr) {
+      throw new Error(`Failed to validate ack message for ${threadKey}: ${ackErr.message}`);
+    }
+    if (!ackMsg?.id) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: JSON.stringify({
+              success: false,
+              error: `Message ${parsed.throughMessageId} not found in thread ${threadKey}`,
+            }),
+          },
+        ],
+      };
+    }
+    const advanced = await advanceThreadReadPointer(supabase, {
+      threadId: thread.id,
+      agentId,
+      throughMessageId: ackMsg.id,
+      source: 'mark_thread_read:ack',
+    });
+    if (!advanced) {
+      throw new Error(`Failed to persist read state for thread ${threadKey}`);
+    }
+    logger.info('Thread read acknowledged through message', {
+      threadKey,
+      agentId,
+      throughMessageId: ackMsg.id,
+    });
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: JSON.stringify({
+            success: true,
+            message: `Thread ${threadKey} acknowledged through ${ackMsg.id}`,
+            threadKey,
+            agentId,
+            throughMessageId: ackMsg.id,
+          }),
+        },
+      ],
+    };
+  }
+
+  // "Mark whole thread read" = advance through the thread's current max
+  // message, never wall-clock NOW() — a concurrently inserted, never-seen
+  // message must not be marked read. Empty thread → nothing to advance.
+  // This API's purpose IS the durable write: a lookup or advance failure must
+  // surface as failure, never as a positive acknowledgement.
+  const { data: latestMsg, error: latestErr } = await threadTable(supabase, 'inbox_thread_messages')
+    .select('id')
+    .eq('thread_id', thread.id)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (latestErr) {
+    throw new Error(`Failed to resolve latest message for ${threadKey}: ${latestErr.message}`);
+  }
+  if (latestMsg?.id) {
+    const advanced = await advanceThreadReadPointer(supabase, {
+      threadId: thread.id,
+      agentId,
+      throughMessageId: latestMsg.id,
+      source: 'mark_thread_read',
+    });
+    if (!advanced) {
+      throw new Error(`Failed to persist read state for thread ${threadKey}`);
+    }
+  }
 
   logger.info('Thread marked as read', { threadKey, agentId });
 

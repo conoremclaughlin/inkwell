@@ -44,22 +44,22 @@ export function getResponseCallback(): ResponseCallback | null {
 }
 
 /**
- * Check if a conversation has received an explicit send_response within the last N ms.
- * Used by server.ts to decide whether to auto-forward.
+ * Check if a conversation has received an explicit send_response during this
+ * turn. Turn-scoped, not time-windowed — ink turns can run for many minutes,
+ * so a fixed time window would miss early responses. Call clearExplicitResponse
+ * after the auto-forward decision to reset for the next turn.
  */
-export function hasExplicitResponse(
-  channel: string,
-  conversationId: string,
-  withinMs = 60000
-): boolean {
+export function hasExplicitResponse(channel: string, conversationId: string): boolean {
   const key = `${channel}:${conversationId}`;
-  const timestamp = explicitResponseTracker.get(key);
-  if (!timestamp) return false;
-  return Date.now() - timestamp < withinMs;
+  return explicitResponseTracker.has(key);
 }
 
 /**
- * Clear explicit response tracking for a conversation (call after message processing complete)
+ * Clear explicit response tracking for a conversation (call after the
+ * auto-forward decision in server.ts). No time-based sweep — the map is
+ * naturally bounded (one entry per active conversation) and each turn
+ * clears its own key. Stale entries from error paths are overwritten on
+ * the next message to the same conversation.
  */
 export function clearExplicitResponse(channel: string, conversationId: string): void {
   const key = `${channel}:${conversationId}`;
@@ -67,16 +67,13 @@ export function clearExplicitResponse(channel: string, conversationId: string): 
 }
 
 /**
- * Mark a conversation as having received an explicit response
+ * Mark a conversation as having received an explicit response. No cleanup
+ * here — concurrent turns' markers must not be swept mid-turn. Cleanup
+ * happens in clearExplicitResponse after the auto-forward decision.
  */
 function markExplicitResponse(channel: string, conversationId: string): void {
   const key = `${channel}:${conversationId}`;
   explicitResponseTracker.set(key, Date.now());
-  // Clean up old entries (> 5 minutes) to prevent memory leak
-  const cutoff = Date.now() - 300000;
-  for (const [k, v] of explicitResponseTracker.entries()) {
-    if (v < cutoff) explicitResponseTracker.delete(k);
-  }
 }
 
 interface TtsConfig {

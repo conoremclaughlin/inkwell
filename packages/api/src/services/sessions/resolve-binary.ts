@@ -1,7 +1,7 @@
 /**
  * Binary Path Resolution
  *
- * Resolves CLI binary paths (claude, codex, gemini) with fallback to zsh login shell.
+ * Resolves CLI binary paths (claude, codex, gemini, agy) with fallback to zsh login shell.
  * Node's spawn() only searches the current process PATH, which may be a
  * stripped-down bash PATH missing user-installed tools (nvm, homebrew, etc.).
  *

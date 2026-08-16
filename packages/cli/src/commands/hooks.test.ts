@@ -13,6 +13,7 @@ import {
   installHooks,
   callPcpTool,
   buildIdentityBlock,
+  hydrateThreadKeyFromServer,
   loadApprovalSet,
   matchesApprovalSet,
   isHeadlessSession,
@@ -821,6 +822,96 @@ describe('callPcpTool: Streamable HTTP response formats', () => {
       'Inkwell call failed (401)'
     );
     expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ============================================================================
+// hydrateThreadKeyFromServer: triggered-session thread key (regression)
+//
+// Triggered sessions arrive with INK_SESSION_ID pre-set, so start_session is
+// skipped and the thread key is never populated locally. These tests pin the
+// server-hydration path that keeps activeThreadKey from staying null for
+// exactly the PR/spec sessions the feature targets (PR #373 review blocker).
+// ============================================================================
+
+describe('hydrateThreadKeyFromServer', () => {
+  let fetchSpy: ReturnType<typeof vi.fn>;
+
+  function mockGetSessionResponse(session: Record<string, unknown>) {
+    return mockJsonResponse({
+      jsonrpc: '2.0',
+      result: { content: [{ text: JSON.stringify({ session }) }] },
+      id: 1,
+    });
+  }
+
+  beforeEach(() => {
+    fetchSpy = vi.fn();
+    vi.stubGlobal('fetch', fetchSpy);
+    mockedGetValidAccessToken.mockReset();
+    mockedGetValidAccessToken.mockResolvedValue('token');
+    mockedGetValidDelegatedAccessToken.mockReset();
+    mockedGetValidDelegatedAccessToken.mockReturnValue(null);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it('should hydrate activeThreadKey from get_session for a pre-created session (trigger path)', async () => {
+    fetchSpy.mockResolvedValue(
+      mockGetSessionResponse({ id: 'sess-triggered', activeThreadKey: 'pr:373' })
+    );
+
+    const threadKey = await hydrateThreadKeyFromServer('sess-triggered', undefined, 'me@test.dev');
+
+    expect(threadKey).toBe('pr:373');
+    expect(fetchSpy).toHaveBeenCalledOnce();
+    const [, options] = fetchSpy.mock.calls[0];
+    const body = JSON.parse(options.body);
+    expect(body.params.name).toBe('get_session');
+    expect(body.params.arguments).toMatchObject({ sessionId: 'sess-triggered' });
+  });
+
+  it('should fall back to threadKey field when activeThreadKey is absent', async () => {
+    fetchSpy.mockResolvedValue(
+      mockGetSessionResponse({ id: 'sess-triggered', threadKey: 'spec:cli-session-hooks' })
+    );
+
+    const threadKey = await hydrateThreadKeyFromServer('sess-triggered', undefined);
+
+    expect(threadKey).toBe('spec:cli-session-hooks');
+  });
+
+  it('should keep the local threadKey without a server call when already hydrated', async () => {
+    const threadKey = await hydrateThreadKeyFromServer('sess-1', 'pr:100');
+
+    expect(threadKey).toBe('pr:100');
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('should return undefined without a server call when no session id is available', async () => {
+    const threadKey = await hydrateThreadKeyFromServer(undefined, undefined);
+
+    expect(threadKey).toBeUndefined();
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('should return undefined when the session has no thread key', async () => {
+    fetchSpy.mockResolvedValue(mockGetSessionResponse({ id: 'sess-plain' }));
+
+    const threadKey = await hydrateThreadKeyFromServer('sess-plain', undefined);
+
+    expect(threadKey).toBeUndefined();
+  });
+
+  it('should be non-fatal when the server call fails', async () => {
+    fetchSpy.mockRejectedValue(new Error('connection refused'));
+
+    const threadKey = await hydrateThreadKeyFromServer('sess-1', undefined);
+
+    expect(threadKey).toBeUndefined();
   });
 });
 

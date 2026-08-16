@@ -47,6 +47,7 @@ import {
   exchangeRefreshToken,
 } from '../auth/pcp-tokens';
 import type { Database } from '../data/supabase/types';
+import { isLeaseStale, type StudioLease } from '../services/studio-lease.service';
 import { activityBus } from '../services/events/activity-bus';
 import type { Activity } from '../data/repositories/activity-stream.repository';
 import {
@@ -654,9 +655,9 @@ async function findGeminiTranscriptFile(backendSessionId: string): Promise<strin
 async function findPcpTranscriptFile(sessionId: string): Promise<string | null> {
   const roots = new Set<string>();
   for (const dir of getAncestorDirs(process.cwd(), 8)) {
-    roots.add(path.join(dir, '.pcp', 'runtime', 'repl'));
+    roots.add(path.join(dir, '.ink', 'runtime', 'repl'));
   }
-  roots.add(path.join(os.homedir(), '.pcp', 'runtime', 'repl'));
+  roots.add(path.join(os.homedir(), '.ink', 'runtime', 'repl'));
 
   const matches: string[] = [];
   for (const root of roots) {
@@ -2389,6 +2390,27 @@ router.patch('/identities/:agentId/settings', async (req: Request, res: Response
 
     // Runtime config fields → stored in metadata.runtimeConfig
     const { toolProfile, toolRouting, maxTurns, passiveRecall } = body;
+    // These feed spawn flags directly (ink-runner --tool-routing /
+    // --max-turns), so reject junk at the door: an unvalidated value would
+    // silently fall back to defaults at spawn time and the dashboard would
+    // lie about what's in effect.
+    if (
+      toolRouting !== undefined &&
+      toolRouting !== null &&
+      toolRouting !== 'local' &&
+      toolRouting !== 'backend'
+    ) {
+      res.status(400).json({ error: "toolRouting must be 'local', 'backend', or null" });
+      return;
+    }
+    if (
+      maxTurns !== undefined &&
+      maxTurns !== null &&
+      (typeof maxTurns !== 'number' || !Number.isInteger(maxTurns) || maxTurns < 1 || maxTurns > 25)
+    ) {
+      res.status(400).json({ error: 'maxTurns must be an integer between 1 and 25, or null' });
+      return;
+    }
     if (
       toolProfile !== undefined ||
       toolRouting !== undefined ||
@@ -5203,6 +5225,8 @@ router.get('/sessions', async (req: Request, res: Response) => {
           lifecycle: s.lifecycle || 'idle',
           status: s.status,
           currentPhase: s.current_phase,
+          threadKey: s.thread_key || null,
+          activeThreadKey: s.active_thread_key || null,
           summary: s.summary,
           context: s.context,
           backend: s.backend,
@@ -5225,6 +5249,53 @@ router.get('/sessions', async (req: Request, res: Response) => {
     res.status(500).json(errorJson('Failed to list sessions', error));
   }
 });
+
+/**
+ * Shape a raw `studios.lease` jsonb value for the dashboard.
+ *
+ * Returns null for an unoccupied studio so the client can branch on presence
+ * alone. `stale` is derived here rather than in the browser because staleness
+ * is measured against LEASE_STALE_MS, and a client clock that disagrees with
+ * the server's would render a healthy lease as reclaimable — the one piece of
+ * this payload where being wrong invites someone to take a studio out from
+ * under a working agent.
+ *
+ * Note that `stale` means "eligible for reclaim", not "dead": the lease
+ * service still vetoes reclaim on live-process signals. The canvas should
+ * present it as a question, not a verdict.
+ */
+function describeLease(raw: unknown): {
+  sessionId: string;
+  threadKey: string;
+  agentId: string;
+  acquiredAt: string;
+  heartbeatAt: string;
+  reason?: string;
+  quarantined: boolean;
+  claimKind: string | null;
+  pendingRelease: { reason: string; requestedAt: string } | null;
+  stale: boolean;
+  heartbeatAgeMs: number | null;
+} | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const lease = raw as StudioLease;
+  if (!lease.sessionId) return null;
+
+  const heartbeatMs = Date.parse(lease.heartbeatAt ?? '');
+  return {
+    sessionId: lease.sessionId,
+    threadKey: lease.threadKey,
+    agentId: lease.agentId,
+    acquiredAt: lease.acquiredAt,
+    heartbeatAt: lease.heartbeatAt,
+    ...(lease.reason ? { reason: lease.reason } : {}),
+    quarantined: lease.quarantined === true,
+    claimKind: lease.claimKind ?? null,
+    pendingRelease: lease.pendingRelease ?? null,
+    stale: isLeaseStale(lease),
+    heartbeatAgeMs: Number.isFinite(heartbeatMs) ? Date.now() - heartbeatMs : null,
+  };
+}
 
 /**
  * GET /api/admin/studios
@@ -5260,13 +5331,18 @@ router.get('/studios', async (req: Request, res: Response) => {
       status: string;
       updated_at: string | null;
       created_at: string | null;
+      lease: StudioLease | null;
+      ephemeral: boolean | null;
+      parent_studio_id: string | null;
+      expires_at: string | null;
+      default_project_id: string | null;
     }> | null = [];
 
     if (sbIds.length > 0) {
       const { data: scopedStudios } = await supabase
         .from('studios')
         .select(
-          'id, agent_id, branch, base_branch, repo_root, purpose, work_type, worktree_path, slug, status, updated_at, created_at'
+          'id, agent_id, branch, base_branch, repo_root, purpose, work_type, worktree_path, slug, status, updated_at, created_at, lease, ephemeral, parent_studio_id, expires_at, default_project_id'
         )
         .eq('user_id', authReq.pcpUserId)
         .in('sb_id', sbIds)
@@ -5351,6 +5427,14 @@ router.get('/studios', async (req: Request, res: Response) => {
           slug: s.slug,
           status: s.status,
           updatedAt: s.updated_at,
+          // Occupancy (spec:trigger-studio-routing Phase 5 → spec:studio-canvas
+          // MVP items 2 and 6). Without these the canvas can draw studios but
+          // cannot say whether anyone is in one, which is the whole question.
+          ephemeral: s.ephemeral ?? false,
+          parentStudioId: s.parent_studio_id,
+          expiresAt: s.expires_at,
+          defaultProjectId: s.default_project_id,
+          lease: describeLease(s.lease),
         })),
       };
     });
@@ -5585,6 +5669,167 @@ router.get('/sessions/:id/transcript', async (req: Request, res: Response) => {
   } catch (error) {
     logger.error('Failed to export transcript:', error);
     res.status(500).json(errorJson('Failed to export transcript', error));
+  }
+});
+
+/**
+ * GET /api/admin/sessions/:id/conversation
+ * Returns raw transcript events for the conversation viewer.
+ * Tries synced transcript first, falls back to local.
+ */
+router.get('/sessions/:id/conversation', async (req: Request, res: Response) => {
+  try {
+    const sessionId = req.params.id;
+    const authReq = req as AdminAuthRequest;
+
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+
+    const { scope, error: scopedIdentityError } = await resolveWorkspaceIdentityScope(
+      supabase,
+      authReq.pcpUserId,
+      authReq.pcpWorkspaceId
+    );
+
+    if (scopedIdentityError || !scope || scope.sbIds.length === 0) {
+      res.status(404).json({ error: 'Session not found' });
+      return;
+    }
+
+    const { data: session, error: sessionError } = await supabase
+      .from('sessions')
+      .select(
+        'id, sb_id, agent_id, backend, backend_session_id, lifecycle, current_phase, active_thread_key, started_at, updated_at, ended_at, studio_id'
+      )
+      .eq('id', sessionId)
+      .eq('user_id', authReq.pcpUserId)
+      .single();
+
+    if (sessionError || !session || !isSessionInWorkspace(session, scope)) {
+      res.status(404).json({ error: 'Session not found' });
+      return;
+    }
+
+    const identity = scope.rows.find(
+      (row) => row.id === session.sb_id || row.agent_id === session.agent_id
+    );
+
+    const sessionInfo = {
+      id: session.id,
+      agentId: identity?.agent_id ?? session.agent_id ?? 'unknown',
+      agentName: identity?.name ?? session.agent_id ?? 'Unknown',
+      backend: session.backend,
+      backendSessionId: session.backend_session_id,
+      lifecycle: session.lifecycle,
+      currentPhase: session.current_phase,
+      activeThreadKey: session.active_thread_key ?? null,
+      startedAt: session.started_at,
+      updatedAt: session.updated_at,
+      endedAt: session.ended_at,
+    };
+
+    const backend = session.backend ?? 'claude-code';
+
+    const { data: archive } = await supabase
+      .from('session_transcript_archives')
+      .select('payload')
+      .eq('user_id', authReq.pcpUserId)
+      .eq('session_id', sessionId)
+      .order('synced_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (archive?.payload && typeof archive.payload === 'object') {
+      const payload = archive.payload as Record<string, unknown>;
+      const events = Array.isArray(payload.events) ? payload.events : [];
+      res.json({
+        session: sessionInfo,
+        source: 'synced',
+        backend,
+        transcript: { events },
+        totalEvents: events.length,
+      });
+      return;
+    }
+
+    const localItems = await tryReadLocalTranscript({
+      sessionId: session.id,
+      backendSessionId: session.backend_session_id,
+      backend: session.backend,
+    });
+
+    if (localItems.length > 0) {
+      const descriptor = await resolveLocalTranscriptDescriptor({
+        sessionId: session.id,
+        backend: session.backend,
+        backendSessionId: session.backend_session_id,
+      });
+
+      if (descriptor) {
+        const parsed = await readTranscriptFromDescriptor(descriptor);
+        if (parsed) {
+          res.json({
+            session: sessionInfo,
+            source: 'local',
+            backend,
+            transcript: { events: parsed.events },
+            totalEvents: parsed.events.length,
+          });
+          return;
+        }
+      }
+    }
+
+    // For ink backend: query activity_stream for conversation messages
+    if (backend === 'ink') {
+      const { data: activities, error: actError } = await supabase
+        .from('activity_stream')
+        .select('id, type, direction, content, agent_id, platform, created_at, payload')
+        .eq('user_id', authReq.pcpUserId)
+        .eq('session_id', sessionId)
+        .in('type', [
+          'message_in',
+          'message_out',
+          'message',
+          'agent_spawn',
+          'agent_complete',
+          'error',
+        ])
+        .order('created_at', { ascending: true })
+        .limit(500);
+
+      if (!actError && activities && activities.length > 0) {
+        const events = activities.map((a) => ({
+          type: a.type,
+          direction: a.direction,
+          content: a.content,
+          agentId: a.agent_id,
+          platform: a.platform,
+          timestamp: a.created_at,
+          payload: a.payload,
+        }));
+        res.json({
+          session: sessionInfo,
+          source: 'cloud',
+          backend,
+          transcript: { events },
+          totalEvents: events.length,
+        });
+        return;
+      }
+    }
+
+    res.json({
+      session: sessionInfo,
+      source: 'none',
+      backend,
+      transcript: null,
+      totalEvents: 0,
+    });
+  } catch (error) {
+    logger.error('Failed to load conversation:', error);
+    res.status(500).json(errorJson('Failed to load conversation', error));
   }
 });
 
@@ -6392,6 +6637,10 @@ router.get('/tasks', async (req: Request, res: Response) => {
         projectName: (t.projects as { name: string } | null)?.name ?? null,
         taskGroupId: t.task_group_id,
         taskGroupTitle: (t.task_groups as { title: string } | null)?.title ?? null,
+        // Ordering within a group. The dashboard has always typed this field
+        // and the endpoint has never sent it, so every consumer sorting by it
+        // was sorting by undefined — a stable no-op that looked like order.
+        taskOrder: t.task_order ?? null,
         blockedBy: t.blocked_by,
         createdBy: t.created_by,
         completedAt: t.completed_at,

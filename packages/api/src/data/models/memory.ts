@@ -108,6 +108,8 @@ export interface Session {
   id: string;
   userId: string;
   agentId?: string;
+  /** Owning identity UUID (agent_identities.id) — canonical; agentId is the ambiguous slug. */
+  sbId?: string;
   studioId?: string;
   threadKey?: string;
   activeThreadKey?: string;
@@ -203,6 +205,8 @@ export interface SessionRow {
   id: string;
   user_id: string;
   agent_id: string | null;
+  /** Owning identity UUID (agent_identities.id). */
+  sb_id?: string | null;
   studio_id: string | null;
   thread_key: string | null;
   active_thread_key?: string | null;
