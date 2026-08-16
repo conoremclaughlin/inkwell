@@ -138,6 +138,59 @@ describe('close handler — real subprocess', () => {
   });
 });
 
+describe('recovered tool errors — real subprocess', () => {
+  it('reports success when agy answers despite a tool error', async () => {
+    // The envelope shape is copied from a real agy 1.1.13 run: a malformed MCP
+    // call sets status ERROR and populates error, yet the agent recovered and
+    // response carries its answer. Classifying that as a failed turn threw away
+    // a reply the agent had written — and told the sender it never arrived.
+    hoisted.binary = fakeAgy(
+      'agy-recovered.mjs',
+      [
+        emit({ event: 'init', conversation_id: 'conv-recovered' }),
+        emit({
+          event: 'result',
+          result: {
+            conversation_id: 'conv-recovered',
+            status: 'ERROR',
+            response: 'RECOVERED',
+            error:
+              'Error in MCP tool execution: MCP error -32602: Input validation error: ' +
+              'Invalid arguments for tool get_thread_messages',
+          },
+        }),
+      ].join('\n')
+    );
+
+    const result = await new AntigravityRunner().run('hi', { config: config() });
+
+    expect(result.success).toBe(true);
+    expect(result.finalTextResponse).toBe('RECOVERED');
+    expect(result.backendSessionId).toBe('conv-recovered');
+  });
+
+  it('still fails when agy errors with no answer at all', async () => {
+    // The unauthenticated shape: status ERROR, empty response. Must stay fatal.
+    hoisted.binary = fakeAgy(
+      'agy-broken.mjs',
+      emit({
+        event: 'result',
+        result: {
+          conversation_id: '',
+          status: 'ERROR',
+          response: '',
+          error: 'authentication failed or timed out',
+        },
+      })
+    );
+
+    const result = await new AntigravityRunner().run('hi', { config: config() });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('authentication failed');
+  });
+});
+
 describe('killProcess — real subprocess', () => {
   const kill = (runner: AntigravityRunner, proc: unknown) =>
     (runner as unknown as { killProcess: (p: unknown) => Promise<void> }).killProcess(proc);
