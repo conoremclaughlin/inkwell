@@ -697,6 +697,19 @@ describe('isTurnSuccessful — a recovered tool error is not a failed turn', () 
     expect(isTurnSuccessful({ status: 'ERROR' })).toBe(false);
   });
 
+  it('fails an UNKNOWN non-SUCCESS status even when it carries text', () => {
+    // The property Lumen's blocker protects. A denylist of fatal statuses says
+    // "anything I have not named is recoverable", which extends one measurement
+    // to every status agy might add later — a future fatal status shipping a
+    // diagnostic string would read as a completed turn. We have measured ERROR
+    // and nothing else, so anything else fails by default.
+    expect(
+      isTurnSuccessful({ status: 'SOME_FUTURE_FATAL', finalTextResponse: 'a diagnostic string' })
+    ).toBe(false);
+    expect(isTurnSuccessful({ status: 'WAITING', finalTextResponse: 'partial' })).toBe(false);
+    expect(isTurnSuccessful({ status: 'INVALID', finalTextResponse: 'partial' })).toBe(false);
+  });
+
   it('keeps timeouts and crashes fatal even when partial text exists', () => {
     // These mean the run was STOPPED, so any text is partial by definition —
     // the opposite of a turn that ran to completion despite an error.

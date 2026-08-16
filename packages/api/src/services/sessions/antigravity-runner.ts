@@ -788,23 +788,36 @@ export class AntigravityRunner implements IRunner {
 /**
  * Did this turn actually produce an answer?
  *
- * agy's terminal envelope carries `status: 'ERROR'` in two very different
- * situations: the run genuinely could not proceed (auth, tier, timeout), and a
- * tool call failed but the agent handled it and finished anyway. Only the
- * first is a failed turn. Treating both as fatal is what made a single
- * malformed tool call discard a reply the agent had already written — and it
- * gave the sender a failure notice for a message that had been delivered.
+ * agy overloads exactly ONE status, and we have measured it. `ERROR` covers
+ * both a run that could not proceed and a run where a tool call failed but the
+ * agent handled it and finished:
  *
- * Statuses that are terminal regardless of output: the run was stopped rather
- * than completed, so whatever text exists is partial.
+ *   recovered        {status:'ERROR', response:'RECOVERED\n', error:'...Invalid arguments...'}
+ *   genuinely broken {status:'ERROR', response:'',            error:'authentication failed...'}
+ *
+ * Only the first is a completed turn. Treating both as fatal is what made a
+ * single malformed tool call discard a reply the agent had already written, and
+ * hand the sender a failure notice for a message that had been delivered.
+ *
+ * This is an ALLOWLIST of the overloaded status, deliberately, not a denylist
+ * of fatal ones. A denylist says "anything I have not named is recoverable",
+ * which extends a single measurement to every status agy might add later — an
+ * unlisted fatal status carrying a diagnostic or partial answer would be read
+ * as a success. The safe default for a status we have never observed is
+ * failure, and the cost of being wrong that way is a retry rather than a
+ * silently swallowed error. (Lumen, PR #507.)
  */
-const TERMINAL_STATUSES = new Set(['TIMEOUT', 'CRASH', 'CANCELED', 'INTERRUPTED']);
+const RECOVERABLE_STATUSES = new Set(['ERROR']);
 
 export function isTurnSuccessful(result: { status?: string; finalTextResponse?: string }): boolean {
   if (!result.status || result.status === 'SUCCESS') return true;
-  if (TERMINAL_STATUSES.has(result.status)) return false;
-  // Non-SUCCESS with a response body means the agent recovered and answered.
-  return Boolean(result.finalTextResponse && result.finalTextResponse.trim());
+  // A status we have measured as overloaded succeeds only with a real answer.
+  if (RECOVERABLE_STATUSES.has(result.status)) {
+    return Boolean(result.finalTextResponse && result.finalTextResponse.trim());
+  }
+  // Everything else — TIMEOUT and CRASH from this runner, CANCELED/INTERRUPTED
+  // and anything agy adds later — is a stopped run, so any text is partial.
+  return false;
 }
 
 export function buildAgyArgs(
