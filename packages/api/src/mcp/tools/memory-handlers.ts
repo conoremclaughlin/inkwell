@@ -96,6 +96,116 @@ function resolveStudioScope(rawStudioId: string | undefined): string | null | un
   return undefined;
 }
 
+/** Why an implicit session lookup came back empty — shapes the error the caller sees. */
+type ImplicitSessionFailure = 'no-agent-identity' | 'no-session';
+
+type ImplicitSessionResult =
+  | { session: Session; via: 'context' | 'lookup' }
+  | { session: null; reason: ImplicitSessionFailure };
+
+/**
+ * Resolve the session targeted by a call that omitted `sessionId`.
+ *
+ * Every candidate is scoped to the calling agent. The previous behaviour —
+ * `getActiveSession(user.id, params.agentId, studioScope)` with `params.agentId`
+ * passed through raw — degenerated to "the most recently started open session
+ * for this user" whenever the caller omitted both `agentId` and `studioId`,
+ * because the repository skips the `agent_id` and `studio_id` filters when they
+ * are undefined. On a single-user install every SB's session is a candidate, so
+ * an agent whose own session started long ago would deterministically write to
+ * whichever agent had started a session most recently.
+ *
+ * That is not hypothetical: on 2026-08-16 myra's heartbeat wrote its context and
+ * currentPhase onto lumen's `pr:500` session. myra's session had been open since
+ * Aug 5, so it could never win a recency race against a freshly spawned peer.
+ *
+ * Resolution order:
+ *   1. an explicit `studioId` from the caller — agent-scoped, in that studio
+ *   2. the session the caller is actually running in, per the `x-ink-context`
+ *      token, once confirmed to belong to the calling agent
+ *   3. an agent-scoped lookup using the studio scope from the request context
+ *
+ * Returns `{ session: null, reason: 'no-agent-identity' }` when the caller's
+ * identity cannot be established. Callers MUST fail closed on that: an unscoped
+ * query is what caused the cross-agent write in the first place.
+ */
+async function resolveImplicitSession(
+  dataComposer: DataComposer,
+  userId: string,
+  explicitAgentId: string | undefined,
+  explicitStudioScope: string | null | undefined
+): Promise<ImplicitSessionResult> {
+  const agentId = getEffectiveAgentId(explicitAgentId);
+  if (!agentId) {
+    return { session: null, reason: 'no-agent-identity' };
+  }
+
+  // An explicit studioId means the caller is deliberately targeting a worktree
+  // other than (or including) the one they run in, so it outranks the ambient
+  // session from the request context.
+  if (explicitStudioScope !== undefined) {
+    const session = await dataComposer.repositories.memory.getActiveSession(
+      userId,
+      agentId,
+      explicitStudioScope
+    );
+    return session ? { session, via: 'lookup' } : { session: null, reason: 'no-session' };
+  }
+
+  const ctx = getRequestContext();
+
+  // The runtime tells us which session it is executing in. Prefer it over any
+  // recency heuristic — but verify ownership first. When the caller presents an
+  // agent-bound token, the server skips context-session enrichment, so the
+  // sessionId on the token has not been checked against the agent behind it.
+  if (ctx?.sessionId) {
+    try {
+      const contextSession = await dataComposer.repositories.memory.getSession(ctx.sessionId);
+      if (
+        contextSession &&
+        contextSession.userId === userId &&
+        contextSession.agentId === agentId
+      ) {
+        return { session: contextSession, via: 'context' };
+      }
+      if (contextSession) {
+        logger.warn('Ignoring x-ink-context sessionId that does not belong to the calling agent', {
+          contextSessionId: ctx.sessionId,
+          sessionAgentId: contextSession.agentId,
+          callingAgentId: agentId,
+        });
+      }
+    } catch (error) {
+      logger.warn('Failed to load session named by x-ink-context; falling back to lookup', {
+        contextSessionId: ctx.sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  // No usable context session. Scope the lookup by the studio the caller is in
+  // when we know it, so parallel worktrees do not collide.
+  const contextStudioScope = resolveStudioScope(ctx?.studioId ?? ctx?.studioHint);
+  const session = await dataComposer.repositories.memory.getActiveSession(
+    userId,
+    agentId,
+    contextStudioScope
+  );
+  return session ? { session, via: 'lookup' } : { session: null, reason: 'no-session' };
+}
+
+/** The error returned when an implicit session lookup finds nothing usable. */
+function implicitSessionError(reason: ImplicitSessionFailure, toolName: string): string {
+  if (reason === 'no-agent-identity') {
+    return (
+      `Cannot determine which session to target: no agent identity on this request. ` +
+      `Pass sessionId explicitly (or agentId) — ${toolName} will not fall back to an ` +
+      `unscoped lookup, because that can select another agent's session.`
+    );
+  }
+  return `No active session found for this agent. Start a session first, or pass sessionId explicitly.`;
+}
+
 /**
  * Resolve contactId from explicit param or session context.
  * This is the auto-inheritance mechanism: once a contact-scoped session
@@ -1316,12 +1426,18 @@ export async function handleGetSession(args: unknown, dataComposer: DataComposer
   let session;
   if (params.sessionId) {
     session = await dataComposer.repositories.memory.getSession(params.sessionId);
-  } else {
+  } else if (params.agentId) {
+    // Read semantics: an explicit agentId stays a free filter, so an agent can
+    // inspect a peer's session. Identity pinning deliberately does not apply.
     session = await dataComposer.repositories.memory.getActiveSession(
       user.id,
       params.agentId,
       studioScope
     );
+  } else {
+    // No agentId given: "my session", not "whichever session started last".
+    const resolved = await resolveImplicitSession(dataComposer, user.id, undefined, studioScope);
+    session = resolved.session;
   }
 
   if (!session) {
@@ -1599,21 +1715,27 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
     };
   }
 
-  // Resolve session: sessionId > studioId-scoped lookup > most recent active
+  // Resolve session: explicit sessionId > agent-scoped implicit resolution.
+  // The implicit path is always scoped to the calling agent and fails closed —
+  // see resolveImplicitSession for why an unscoped fallback is unsafe here.
   let sessionId = params.sessionId;
   if (!sessionId) {
-    const session = await dataComposer.repositories.memory.getActiveSession(
+    const resolved = await resolveImplicitSession(
+      dataComposer,
       user.id,
       params.agentId,
-      studioScope // null → match NULL studio_id (main), UUID → exact match, undefined → no filter
+      studioScope // null → match NULL studio_id (main), UUID → exact match, undefined → infer from context
     );
-    if (!session) {
+    if (!resolved.session) {
       return {
         content: [
           {
             type: 'text' as const,
             text: JSON.stringify(
-              { success: false, error: 'No active session found. Start a session first.' },
+              {
+                success: false,
+                error: implicitSessionError(resolved.reason, 'update_session_state'),
+              },
               null,
               2
             ),
@@ -1621,7 +1743,7 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
         ],
       };
     }
-    sessionId = session.id;
+    sessionId = resolved.session.id;
   }
 
   let beforeSession: Session | null = null;
@@ -2613,19 +2735,36 @@ export async function handleCompactSession(args: unknown, dataComposer: DataComp
   const minSalience = params.minSalience || 'medium';
   const preserveLogs = params.preserveLogs ?? false;
 
-  // Get session ID
+  // Get session ID. Compaction soft-deletes the session's logs, so the implicit
+  // path must never select a session belonging to another agent.
   let sessionId = params.sessionId;
   let session;
 
   if (sessionId) {
     session = await dataComposer.repositories.memory.getSession(sessionId);
   } else {
-    session = await dataComposer.repositories.memory.getActiveSession(
+    const resolved = await resolveImplicitSession(
+      dataComposer,
       user.id,
       params.agentId,
       studioScope
     );
-    sessionId = session?.id;
+    if (!resolved.session) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: JSON.stringify(
+              { success: false, error: implicitSessionError(resolved.reason, 'compact_session') },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+    session = resolved.session;
+    sessionId = session.id;
   }
 
   if (!session || !sessionId) {

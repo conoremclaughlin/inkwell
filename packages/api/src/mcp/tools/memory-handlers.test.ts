@@ -17,6 +17,7 @@ import {
   mapSessionForBootstrap,
   isCallerSessionEligible,
 } from './memory-handlers';
+import { getPinnedAgentId, getRequestContext } from '../../utils/request-context';
 
 // =====================================================
 // MOCK SETUP
@@ -47,6 +48,7 @@ vi.mock('../../utils/logger', () => ({
 // Mock request-context
 vi.mock('../../utils/request-context', () => ({
   setSessionContext: vi.fn(),
+  getSessionContext: vi.fn().mockReturnValue(undefined),
   pinSessionAgent: vi.fn(),
   getPinnedAgentId: vi.fn().mockReturnValue(null),
   getRequestContext: vi.fn().mockReturnValue(undefined),
@@ -113,6 +115,15 @@ function createMockDataComposer() {
     },
   };
 }
+
+// vi.clearAllMocks() resets recorded calls but NOT implementations, so a
+// mockReturnValue set inside one describe would otherwise persist into every
+// later describe in the file. Restore the module defaults before each test;
+// suites that need a pinned identity opt in via their own beforeEach.
+beforeEach(() => {
+  vi.mocked(getPinnedAgentId).mockReturnValue(null);
+  vi.mocked(getRequestContext).mockReturnValue(undefined);
+});
 
 // =====================================================
 // SCHEMA TESTS
@@ -381,6 +392,11 @@ describe('handleUpdateSessionState', () => {
   beforeEach(() => {
     mockDataComposer = createMockDataComposer();
     vi.clearAllMocks();
+    // clearAllMocks resets calls but NOT implementations, so identity state set
+    // by one test would otherwise leak into the next. Restore the defaults:
+    // an authenticated agent call, which is what every real caller looks like.
+    vi.mocked(getPinnedAgentId).mockReturnValue('wren');
+    vi.mocked(getRequestContext).mockReturnValue(undefined);
   });
 
   // ---------------------------------------------------
@@ -389,6 +405,10 @@ describe('handleUpdateSessionState', () => {
 
   describe('basic phase updates', () => {
     it('should update phase on active session (auto-resolved)', async () => {
+      // The caller's identity comes from the pinned agent when agentId is omitted.
+      // It is never omitted from the lookup itself — see the cross-agent
+      // isolation suite below for why an unscoped lookup is unsafe.
+      vi.mocked(getPinnedAgentId).mockReturnValue('wren');
       mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue(mockSession);
       mockDataComposer.repositories.memory.updateSession.mockResolvedValue(mockUpdatedSession);
 
@@ -405,7 +425,7 @@ describe('handleUpdateSessionState', () => {
       // Verify repo calls
       expect(mockDataComposer.repositories.memory.getActiveSession).toHaveBeenCalledWith(
         'user-123',
-        undefined,
+        'wren',
         undefined
       );
       expect(mockDataComposer.repositories.memory.updateSession).toHaveBeenCalledWith(
@@ -546,6 +566,148 @@ describe('handleUpdateSessionState', () => {
         'wren',
         studioId
       );
+    });
+  });
+
+  // ---------------------------------------------------
+  // Cross-agent isolation
+  //
+  // Regression coverage for the 2026-08-16 incident: myra's heartbeat called
+  // update_session_state(context) with no sessionId and the write landed on
+  // lumen's pr:500 session, in a different studio. The implicit lookup ran with
+  // both agentId and studioId undefined, which the repository turns into "the
+  // most recently started open session for this user" — every agent's session.
+  // ---------------------------------------------------
+
+  describe('cross-agent isolation', () => {
+    /** lumen's session — started most recently, so it wins any unscoped recency query. */
+    const lumenSession = {
+      ...mockSession,
+      id: 'session-lumen-pr500',
+      agentId: 'lumen',
+      studioId: 'studio-lumen',
+      startedAt: new Date('2026-08-15T04:58:11Z'),
+    };
+
+    /** myra's own session — long-lived, so it can never win on recency. */
+    const myraSession = {
+      ...mockSession,
+      id: 'session-myra',
+      agentId: 'myra',
+      studioId: 'studio-myra',
+      startedAt: new Date('2026-08-05T18:42:09Z'),
+    };
+
+    it('scopes the implicit lookup to the calling agent, not to whoever started last', async () => {
+      vi.mocked(getPinnedAgentId).mockReturnValue('myra');
+      // Stand in for the real query: only myra's own session may come back once
+      // the agent filter is applied. An unscoped call would surface lumen's.
+      mockDataComposer.repositories.memory.getActiveSession.mockImplementation(
+        async (_userId: string, agentId?: string) =>
+          agentId === 'myra' ? myraSession : lumenSession
+      );
+      mockDataComposer.repositories.memory.updateSession.mockResolvedValue(myraSession);
+
+      const result = await handleUpdateSessionState(
+        { email: 'test@test.com', context: 'myra heartbeat notes' },
+        mockDataComposer as never
+      );
+
+      expect(JSON.parse(result.content[0].text).success).toBe(true);
+      expect(mockDataComposer.repositories.memory.getActiveSession).toHaveBeenCalledWith(
+        'user-123',
+        'myra',
+        undefined
+      );
+      // The write must land on myra's row, never lumen's.
+      expect(mockDataComposer.repositories.memory.updateSession).toHaveBeenCalledWith(
+        'session-myra',
+        expect.objectContaining({ context: 'myra heartbeat notes' })
+      );
+    });
+
+    it('fails closed when no agent identity can be established', async () => {
+      vi.mocked(getPinnedAgentId).mockReturnValue(null);
+      mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue(lumenSession);
+
+      const result = await handleUpdateSessionState(
+        { email: 'test@test.com', context: 'anonymous write' },
+        mockDataComposer as never
+      );
+
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.success).toBe(false);
+      expect(parsed.error).toMatch(/no agent identity/i);
+      // Critically: no unscoped query, and no write at all.
+      expect(mockDataComposer.repositories.memory.getActiveSession).not.toHaveBeenCalled();
+      expect(mockDataComposer.repositories.memory.updateSession).not.toHaveBeenCalled();
+    });
+
+    it('targets the session named by the request context without a recency query', async () => {
+      vi.mocked(getPinnedAgentId).mockReturnValue('myra');
+      vi.mocked(getRequestContext).mockReturnValue({
+        sessionId: 'session-myra',
+        timestamp: new Date(),
+      } as never);
+      mockDataComposer.repositories.memory.getSession.mockResolvedValue({
+        ...myraSession,
+        userId: 'user-123',
+      });
+      mockDataComposer.repositories.memory.updateSession.mockResolvedValue(myraSession);
+
+      await handleUpdateSessionState(
+        { email: 'test@test.com', context: 'from my own session' },
+        mockDataComposer as never
+      );
+
+      expect(mockDataComposer.repositories.memory.getActiveSession).not.toHaveBeenCalled();
+      expect(mockDataComposer.repositories.memory.updateSession).toHaveBeenCalledWith(
+        'session-myra',
+        expect.objectContaining({ context: 'from my own session' })
+      );
+    });
+
+    it('ignores a context sessionId that belongs to another agent', async () => {
+      vi.mocked(getPinnedAgentId).mockReturnValue('myra');
+      // A token naming lumen's session — the server skips context-session
+      // enrichment for agent-bound tokens, so this is not pre-validated.
+      vi.mocked(getRequestContext).mockReturnValue({
+        sessionId: 'session-lumen-pr500',
+        timestamp: new Date(),
+      } as never);
+      mockDataComposer.repositories.memory.getSession.mockResolvedValue({
+        ...lumenSession,
+        userId: 'user-123',
+      });
+      mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue(myraSession);
+      mockDataComposer.repositories.memory.updateSession.mockResolvedValue(myraSession);
+
+      await handleUpdateSessionState(
+        { email: 'test@test.com', context: 'should not reach lumen' },
+        mockDataComposer as never
+      );
+
+      expect(mockDataComposer.repositories.memory.updateSession).toHaveBeenCalledWith(
+        'session-myra',
+        expect.anything()
+      );
+    });
+
+    it('still allows an explicit sessionId to target another agent (deliberate repair)', async () => {
+      vi.mocked(getPinnedAgentId).mockReturnValue('myra');
+      mockDataComposer.repositories.memory.updateSession.mockResolvedValue(lumenSession);
+
+      const result = await handleUpdateSessionState(
+        {
+          email: 'test@test.com',
+          sessionId: '95f7f160-6599-449d-9f63-e31ca20a43ce',
+          context: '[marker explaining the clobber]',
+        },
+        mockDataComposer as never
+      );
+
+      expect(JSON.parse(result.content[0].text).success).toBe(true);
+      expect(mockDataComposer.repositories.memory.getActiveSession).not.toHaveBeenCalled();
     });
   });
 
