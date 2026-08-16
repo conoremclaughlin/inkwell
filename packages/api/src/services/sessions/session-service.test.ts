@@ -8,6 +8,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import {
   SessionService,
+  resolveRuntimeModel,
   parseRuntimeConfig,
   readImageAttachmentsAsBase64,
   sanitizeHeaderText,
@@ -205,6 +206,52 @@ describe('SessionService', () => {
       undefined,
       mockInkRunner
     );
+  });
+
+  describe('resolveRuntimeModel — pin composes with the backend ladder', () => {
+    // parseRuntimeConfig's tests cover the PARSER and would stay green with the
+    // pin never applied: verified by deleting the assignment and watching all
+    // 117 tests pass. What needs pinning is the composition.
+    const config = {
+      defaultModel: 'claude-fable-5',
+      defaultCodexModel: 'gpt-5-codex',
+      defaultGeminiModel: 'gemini-3-pro-preview',
+      defaultAntigravityModel: 'gemini-3.1-pro-high',
+    };
+
+    it('falls back to each backend default when nothing is pinned', () => {
+      // The guard against the pin clobbering the ladder. antigravity in
+      // particular did not exist when the pin was written.
+      expect(resolveRuntimeModel({ modelKey: 'antigravity', config })).toBe('gemini-3.1-pro-high');
+      expect(resolveRuntimeModel({ modelKey: 'codex-cli', config })).toBe('gpt-5-codex');
+      expect(resolveRuntimeModel({ modelKey: 'gemini', config })).toBe('gemini-3-pro-preview');
+      expect(resolveRuntimeModel({ modelKey: 'claude-code', config })).toBe('claude-fable-5');
+    });
+
+    it('lets a pin beat the fleet default', () => {
+      expect(resolveRuntimeModel({ modelKey: 'claude-code', config, pin: 'claude-opus-5' })).toBe(
+        'claude-opus-5'
+      );
+    });
+
+    it('lets a pin beat the antigravity default too', () => {
+      expect(
+        resolveRuntimeModel({ modelKey: 'antigravity', config, pin: 'gemini-3.7-flash-high' })
+      ).toBe('gemini-3.7-flash-high');
+    });
+
+    it('ignores an empty pin rather than blanking the model', () => {
+      // parseRuntimeConfig already drops empty strings, but a caller that
+      // bypassed it must not be able to erase the backend default.
+      expect(resolveRuntimeModel({ modelKey: 'antigravity', config, pin: '' })).toBe(
+        'gemini-3.1-pro-high'
+      );
+    });
+
+    it('returns undefined when neither a pin nor a default exists', () => {
+      // The runner then omits --model and the CLI picks its own default.
+      expect(resolveRuntimeModel({ modelKey: 'antigravity', config: {} })).toBe(undefined);
+    });
   });
 
   describe('MCP endpoint propagation', () => {
