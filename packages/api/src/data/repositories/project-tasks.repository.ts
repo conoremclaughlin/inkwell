@@ -46,6 +46,7 @@ export interface CreateProjectTaskInput {
   created_by?: string;
   task_group_id?: string;
   task_order?: number;
+  due_date?: string | null;
 }
 
 export interface UpdateProjectTaskInput {
@@ -58,6 +59,8 @@ export interface UpdateProjectTaskInput {
   outcome?: string;
   outcome_reason?: string;
   completed_at?: string | null;
+  /** UTC ISO-8601 timestamp, or null to clear. */
+  due_date?: string | null;
   metadata?: Record<string, unknown>;
 }
 
@@ -88,6 +91,7 @@ export class ProjectTasksRepository {
     };
     if (input.task_group_id !== undefined) insertData.task_group_id = input.task_group_id;
     if (input.task_order !== undefined) insertData.task_order = input.task_order;
+    if (input.due_date !== undefined) insertData.due_date = input.due_date;
 
     const { data, error } = await this.client
       .from('tasks')
@@ -218,6 +222,14 @@ export class ProjectTasksRepository {
    * Update a task
    */
   async update(id: string, input: UpdateProjectTaskInput): Promise<ProjectTask> {
+    // An empty payload makes PostgREST match zero rows, and `.single()` then
+    // fails with "Cannot coerce the result to a single JSON object" — an error
+    // that describes the response shape rather than the caller's mistake. Say
+    // what actually went wrong instead.
+    if (Object.keys(input).length === 0) {
+      throw new Error('Failed to update task: no fields to update');
+    }
+
     const { data, error } = await this.client
       .from('tasks')
       .update(input as never)

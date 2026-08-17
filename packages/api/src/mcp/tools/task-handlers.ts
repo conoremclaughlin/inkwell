@@ -13,6 +13,7 @@ import { getOrchestrator } from '../../services/sandbox/index.js';
 import { resolveUser, type UserIdentifier } from '../../services/user-resolver';
 import { getEffectiveAgentId } from '../../auth/enforce-identity';
 import { getRequestContext } from '../../utils/request-context';
+import { resolveDueDate } from '../../utils/due-date';
 import { logger } from '../../utils/logger';
 
 // Common user identifier schema
@@ -38,6 +39,25 @@ const userIdentifierSchema = z.object({
     .describe('Platform-specific user ID — only needed for platform-based user lookup'),
 });
 
+/**
+ * Shared `dueDate` field for create_task/update_task.
+ *
+ * Exported so the tool registration in index.ts reuses this exact field rather
+ * than restating it. The registered inputSchema is what the MCP SDK validates
+ * against, and zod strips unknown keys — so a field present here but missing
+ * there is dropped before the handler runs, with no error. That is precisely how
+ * dueDate came to be silently discarded.
+ */
+export const dueDateField = z
+  .string()
+  .nullable()
+  .optional()
+  .describe(
+    'Deadline. "YYYY-MM-DD" is interpreted as the end of that day in the user\'s timezone; ' +
+      'an ISO-8601 datetime with an offset (e.g. "2026-09-14T17:00:00Z") is stored as that exact instant. ' +
+      'Pass null to clear.'
+  );
+
 // ============================================================================
 // CREATE TASK
 // ============================================================================
@@ -52,6 +72,7 @@ export const createTaskSchema = z.object({
   priority: z.enum(['low', 'medium', 'high', 'critical']).optional().default('medium'),
   tags: z.array(z.string()).optional().describe('Tags for categorization'),
   createdBy: z.string().optional().describe('Who created this task (e.g., "claude", "user")'),
+  dueDate: dueDateField,
 });
 
 type McpResponse = {
@@ -101,6 +122,15 @@ export async function handleCreateTask(
       }
     }
 
+    let dueDate: string | null | undefined;
+    if (args.dueDate !== undefined) {
+      const resolvedDueDate = resolveDueDate(args.dueDate, resolved.user.timezone);
+      if (!resolvedDueDate.ok) {
+        return mcpResponse({ success: false, error: resolvedDueDate.error }, true);
+      }
+      dueDate = resolvedDueDate.value;
+    }
+
     const task = await dataComposer.repositories.tasks.create({
       project_id: args.projectId || null,
       user_id: resolved.user.id,
@@ -111,6 +141,7 @@ export async function handleCreateTask(
       created_by: args.createdBy || 'claude',
       task_group_id: args.taskGroupId,
       task_order: args.taskOrder,
+      due_date: dueDate,
     });
 
     return mcpResponse({
@@ -124,6 +155,9 @@ export async function handleCreateTask(
         tags: task.tags,
         taskGroupId: task.task_group_id || null,
         taskOrder: task.task_order ?? null,
+        // Echoed from the stored row, so a caller can tell whether the deadline
+        // actually landed instead of inferring it from success: true.
+        dueDate: task.due_date || null,
         createdAt: task.created_at,
       },
     });
@@ -241,7 +275,11 @@ export const updateTaskSchema = z.object({
   status: z.enum(['pending', 'in_progress', 'completed', 'blocked']).optional(),
   priority: z.enum(['low', 'medium', 'high', 'critical']).optional(),
   tags: z.array(z.string()).optional(),
+  dueDate: dueDateField,
 });
+
+/** Fields update_task can actually write — named in the empty-payload error. */
+const UPDATABLE_TASK_FIELDS = 'title, description, status, priority, tags, dueDate';
 
 export async function handleUpdateTask(
   args: z.infer<typeof updateTaskSchema>,
@@ -275,6 +313,25 @@ export async function handleUpdateTask(
     }
     if (args.priority !== undefined) updates.priority = args.priority;
     if (args.tags !== undefined) updates.tags = args.tags;
+    if (args.dueDate !== undefined) {
+      const resolvedDueDate = resolveDueDate(args.dueDate, resolved.user.timezone);
+      if (!resolvedDueDate.ok) {
+        return mcpResponse({ success: false, error: resolvedDueDate.error }, true);
+      }
+      updates.due_date = resolvedDueDate.value;
+    }
+
+    // Reject a no-op update rather than sending an empty PATCH, which PostgREST
+    // answers with a coercion error that names neither the task nor the problem.
+    if (Object.keys(updates).length === 0) {
+      return mcpResponse(
+        {
+          success: false,
+          error: `No fields to update. Provide at least one of: ${UPDATABLE_TASK_FIELDS}.`,
+        },
+        true
+      );
+    }
 
     const task = await dataComposer.repositories.tasks.update(args.taskId, updates);
 
@@ -310,6 +367,9 @@ export async function handleUpdateTask(
         status: task.status,
         priority: task.priority,
         tags: task.tags,
+        // Echoed from the stored row — the response body should be able to
+        // contradict a caller who thinks the deadline was recorded.
+        dueDate: task.due_date || null,
         completedAt: task.completed_at,
       },
     });

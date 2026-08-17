@@ -20,6 +20,8 @@ import {
   handleAddTaskGroupComment,
   handleListTaskGroupComments,
   updateTaskGroupSchema,
+  updateTaskSchema,
+  createTaskSchema,
 } from './task-handlers';
 
 // =====================================================
@@ -685,6 +687,207 @@ describe('handleUpdateTask', () => {
     expect(response.isError).toBe(true);
     expect(data.success).toBe(false);
     expect(data.error).toBe('User not found');
+  });
+});
+
+// =====================================================
+// dueDate — reported by Myra: update_task returned success: true
+// while writing nothing, because dueDate reached neither the
+// registered inputSchema nor the update payload.
+// =====================================================
+
+describe('task dueDate', () => {
+  let dc: ReturnType<typeof createMockDataComposer>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    dc = createMockDataComposer();
+    resolveUserMock.mockResolvedValue({
+      user: { id: 'user-123', timezone: 'America/Los_Angeles' } as any,
+      resolvedBy: 'userId',
+    });
+    dc.repositories.tasks.findById.mockResolvedValue({
+      id: 'task-1',
+      user_id: 'user-123',
+      title: 'Ship inkah.com',
+      status: 'pending',
+    });
+    dc.repositories.tasks.update.mockResolvedValue({
+      id: 'task-1',
+      title: 'Ship inkah.com',
+      status: 'pending',
+      priority: 'high',
+      tags: [],
+      due_date: '2026-09-15T06:59:59.999Z',
+      completed_at: null,
+    });
+  });
+
+  describe('is accepted by both schemas', () => {
+    // The original bug was schema omission, not handler logic: the MCP SDK validates
+    // against the registered inputSchema and zod strips unknown keys, so a
+    // dueDate absent there is discarded before any handler code runs. Calling
+    // handlers directly bypasses that layer, so assert the schemas too.
+    it('survives updateTaskSchema parsing', () => {
+      const parsed = updateTaskSchema.parse({
+        userId: '11111111-1111-4111-8111-111111111111',
+        taskId: '22222222-2222-4222-8222-222222222222',
+        dueDate: '2026-09-14',
+      });
+      expect(parsed.dueDate).toBe('2026-09-14');
+    });
+
+    it('survives createTaskSchema parsing', () => {
+      const parsed = createTaskSchema.parse({
+        userId: '11111111-1111-4111-8111-111111111111',
+        title: 'Ship inkah.com',
+        dueDate: '2026-09-14',
+      });
+      expect(parsed.dueDate).toBe('2026-09-14');
+    });
+
+    it('accepts null on both schemas, for clearing', () => {
+      expect(
+        updateTaskSchema.parse({ taskId: '22222222-2222-4222-8222-222222222222', dueDate: null })
+          .dueDate
+      ).toBeNull();
+      expect(createTaskSchema.parse({ title: 'x', dueDate: null }).dueDate).toBeNull();
+    });
+  });
+
+  describe('handleUpdateTask', () => {
+    it('writes due_date, resolved to end of day in the user timezone', async () => {
+      const response = await handleUpdateTask(
+        { userId: 'user-123', taskId: 'task-1', dueDate: '2026-09-14' },
+        dc as any
+      );
+
+      expect(response.isError).toBeFalsy();
+      expect(dc.repositories.tasks.update).toHaveBeenCalledWith('task-1', {
+        due_date: '2026-09-15T06:59:59.999Z',
+      });
+    });
+
+    it('echoes the stored dueDate so success cannot be believed on faith', async () => {
+      const data = parseResponse(
+        await handleUpdateTask(
+          { userId: 'user-123', taskId: 'task-1', dueDate: '2026-09-14' },
+          dc as any
+        )
+      );
+
+      expect(data.success).toBe(true);
+      expect(data.task.dueDate).toBe('2026-09-15T06:59:59.999Z');
+    });
+
+    it('carries dueDate alongside other fields', async () => {
+      await handleUpdateTask(
+        {
+          userId: 'user-123',
+          taskId: 'task-1',
+          dueDate: '2026-09-14',
+          priority: 'high',
+          description: 'Launch the site',
+        },
+        dc as any
+      );
+
+      expect(dc.repositories.tasks.update).toHaveBeenCalledWith('task-1', {
+        description: 'Launch the site',
+        priority: 'high',
+        due_date: '2026-09-15T06:59:59.999Z',
+      });
+    });
+
+    it('clears due_date when passed null', async () => {
+      await handleUpdateTask({ userId: 'user-123', taskId: 'task-1', dueDate: null }, dc as any);
+
+      expect(dc.repositories.tasks.update).toHaveBeenCalledWith('task-1', { due_date: null });
+    });
+
+    it('leaves due_date untouched when dueDate is not provided', async () => {
+      await handleUpdateTask({ userId: 'user-123', taskId: 'task-1', priority: 'high' }, dc as any);
+
+      expect(dc.repositories.tasks.update).toHaveBeenCalledWith('task-1', { priority: 'high' });
+    });
+
+    it('rejects an unparseable dueDate without writing', async () => {
+      const data = parseResponse(
+        await handleUpdateTask(
+          { userId: 'user-123', taskId: 'task-1', dueDate: 'next Tuesday' },
+          dc as any
+        )
+      );
+
+      expect(data.success).toBe(false);
+      expect(data.error).toContain('Invalid dueDate');
+      expect(dc.repositories.tasks.update).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('handleCreateTask', () => {
+    beforeEach(() => {
+      dc.repositories.tasks.create.mockResolvedValue({
+        id: 'task-new',
+        title: 'Ship inkah.com',
+        status: 'pending',
+        priority: 'high',
+        tags: [],
+        due_date: '2026-09-15T06:59:59.999Z',
+        created_at: '2026-08-17T22:00:00.000Z',
+      });
+    });
+
+    it('persists due_date on create and echoes it back', async () => {
+      const data = parseResponse(
+        await handleCreateTask(
+          { userId: 'user-123', title: 'Ship inkah.com', priority: 'high', dueDate: '2026-09-14' },
+          dc as any
+        )
+      );
+
+      expect(data.success).toBe(true);
+      expect(data.task.dueDate).toBe('2026-09-15T06:59:59.999Z');
+      expect(dc.repositories.tasks.create).toHaveBeenCalledWith(
+        expect.objectContaining({ due_date: '2026-09-15T06:59:59.999Z' })
+      );
+    });
+
+    it('omits due_date entirely when not provided', async () => {
+      await handleCreateTask({ userId: 'user-123', title: 'No deadline' }, dc as any);
+
+      expect(dc.repositories.tasks.create).toHaveBeenCalledWith(
+        expect.objectContaining({ due_date: undefined })
+      );
+    });
+
+    it('rejects an unparseable dueDate without creating the task', async () => {
+      const data = parseResponse(
+        await handleCreateTask(
+          { userId: 'user-123', title: 'Ship it', dueDate: 'whenever' },
+          dc as any
+        )
+      );
+
+      expect(data.success).toBe(false);
+      expect(data.error).toContain('Invalid dueDate');
+      expect(dc.repositories.tasks.create).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('empty update payload', () => {
+    it('reports which fields are updatable instead of a PostgREST coercion error', async () => {
+      const data = parseResponse(
+        await handleUpdateTask({ userId: 'user-123', taskId: 'task-1' }, dc as any)
+      );
+
+      expect(data.success).toBe(false);
+      expect(data.error).toBe(
+        'No fields to update. Provide at least one of: title, description, status, priority, tags, dueDate.'
+      );
+      expect(data.error).not.toContain('coerce');
+      expect(dc.repositories.tasks.update).not.toHaveBeenCalled();
+    });
   });
 });
 

@@ -504,3 +504,176 @@ describe.skipIf(!canRun)('handleCloseTaskGroup (integration)', () => {
     expect(body.error).toBe('Task group is already completed');
   });
 });
+
+// =====================================================
+// dueDate round-trip (integration)
+//
+// The original defect was invisible to any mocked test: the handler reported
+// success: true and a mock would happily record whatever call it was given.
+// Only reading the row back out of the database showed due_date was still null
+// — which is exactly how Myra found it. So these tests always re-SELECT.
+// =====================================================
+
+describe.skipIf(!canRun)('task dueDate (integration)', () => {
+  let client: SupabaseClient;
+  let dc: any;
+  const createdTaskIds: string[] = [];
+
+  beforeAll(async () => {
+    client = createClient(SUPABASE_URL!, SUPABASE_KEY!, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+
+    const { ProjectTasksRepository } =
+      await import('../../data/repositories/project-tasks.repository');
+
+    dc = {
+      getClient: () => client,
+      repositories: {
+        tasks: new ProjectTasksRepository(client),
+        projects: { findById: vi.fn().mockResolvedValue(null) },
+        taskGroups: { findById: vi.fn().mockResolvedValue(null) },
+        activityStream: { logActivity: vi.fn().mockResolvedValue({ id: 'act-1' }) },
+      },
+    };
+  }, 15_000);
+
+  afterAll(async () => {
+    if (!client || createdTaskIds.length === 0) return;
+    await client.from('tasks').delete().in('id', createdTaskIds);
+  }, 10_000);
+
+  async function seedTask(overrides: Record<string, unknown> = {}): Promise<string> {
+    const task = await dc.repositories.tasks.create({
+      user_id: TEST_USER_ID!,
+      title: `__duedate_integration_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      description: 'Integration test — safe to delete',
+      status: 'pending',
+      priority: 'medium',
+      tags: ['__test'],
+      ...overrides,
+    });
+    createdTaskIds.push(task.id);
+    return task.id;
+  }
+
+  async function readDueDate(taskId: string): Promise<string | null> {
+    const { data } = await client.from('tasks').select('due_date').eq('id', taskId).single();
+    return (data as { due_date: string | null } | null)?.due_date ?? null;
+  }
+
+  it('update_task persists dueDate to the real column', async () => {
+    const { handleUpdateTask } = await import('./task-handlers');
+    const taskId = await seedTask();
+
+    expect(await readDueDate(taskId)).toBeNull();
+
+    const response = await handleUpdateTask(
+      { userId: TEST_USER_ID!, taskId, dueDate: '2026-09-14' } as any,
+      dc
+    );
+    expect(response.isError).toBeFalsy();
+
+    // The assertion Myra had to make by hand.
+    const stored = await readDueDate(taskId);
+    expect(stored).not.toBeNull();
+    expect(new Date(stored!).toISOString()).toBe('2026-09-14T23:59:59.999Z');
+  });
+
+  it('update_task succeeds with dueDate as the only argument', async () => {
+    // This call previously failed with "Cannot coerce the result to a single
+    // JSON object" — the payload was empty once dueDate had been dropped.
+    const { handleUpdateTask } = await import('./task-handlers');
+    const taskId = await seedTask();
+
+    const response = await handleUpdateTask(
+      { userId: TEST_USER_ID!, taskId, dueDate: '2026-09-14T00:00:00.000Z' } as any,
+      dc
+    );
+
+    expect(response.isError).toBeFalsy();
+    const body = JSON.parse(response.content[0].text);
+    expect(body.success).toBe(true);
+    expect(new Date(body.task.dueDate).toISOString()).toBe('2026-09-14T00:00:00.000Z');
+    expect(new Date((await readDueDate(taskId))!).toISOString()).toBe('2026-09-14T00:00:00.000Z');
+  });
+
+  it('update_task preserves dueDate when other fields are updated', async () => {
+    const { handleUpdateTask } = await import('./task-handlers');
+    const taskId = await seedTask();
+
+    await handleUpdateTask({ userId: TEST_USER_ID!, taskId, dueDate: '2026-09-14' } as any, dc);
+    await handleUpdateTask({ userId: TEST_USER_ID!, taskId, priority: 'high' } as any, dc);
+
+    expect(new Date((await readDueDate(taskId))!).toISOString()).toBe('2026-09-14T23:59:59.999Z');
+  });
+
+  it('update_task clears dueDate when passed null', async () => {
+    const { handleUpdateTask } = await import('./task-handlers');
+    const taskId = await seedTask();
+
+    await handleUpdateTask({ userId: TEST_USER_ID!, taskId, dueDate: '2026-09-14' } as any, dc);
+    expect(await readDueDate(taskId)).not.toBeNull();
+
+    await handleUpdateTask({ userId: TEST_USER_ID!, taskId, dueDate: null } as any, dc);
+    expect(await readDueDate(taskId)).toBeNull();
+  });
+
+  it('create_task persists dueDate to the real column', async () => {
+    const { handleCreateTask } = await import('./task-handlers');
+
+    const response = await handleCreateTask(
+      {
+        userId: TEST_USER_ID!,
+        title: `__duedate_create_${Date.now()}`,
+        tags: ['__test'],
+        dueDate: '2026-09-14',
+      } as any,
+      dc
+    );
+    expect(response.isError).toBeFalsy();
+
+    const body = JSON.parse(response.content[0].text);
+    createdTaskIds.push(body.task.id);
+
+    expect(new Date(body.task.dueDate).toISOString()).toBe('2026-09-14T23:59:59.999Z');
+    expect(new Date((await readDueDate(body.task.id))!).toISOString()).toBe(
+      '2026-09-14T23:59:59.999Z'
+    );
+  });
+
+  it('list_tasks reports the dueDate that was written', async () => {
+    // due_date was readable long before it was writable; confirm the two agree.
+    const { handleUpdateTask, handleListTasks } = await import('./task-handlers');
+    const taskId = await seedTask();
+
+    await handleUpdateTask({ userId: TEST_USER_ID!, taskId, dueDate: '2026-09-14' } as any, dc);
+
+    const response = await handleListTasks({ userId: TEST_USER_ID!, limit: 200 } as any, dc);
+    const body = JSON.parse(response.content[0].text);
+    const listed = body.tasks.find((t: { id: string }) => t.id === taskId);
+
+    expect(listed).toBeDefined();
+    expect(new Date(listed.dueDate).toISOString()).toBe('2026-09-14T23:59:59.999Z');
+  });
+
+  it('an update with no updatable fields is refused with a usable message', async () => {
+    const { handleUpdateTask } = await import('./task-handlers');
+    const taskId = await seedTask();
+
+    const response = await handleUpdateTask({ userId: TEST_USER_ID!, taskId } as any, dc);
+
+    expect(response.isError).toBe(true);
+    const body = JSON.parse(response.content[0].text);
+    expect(body.error).toContain('No fields to update');
+    expect(body.error).not.toContain('coerce');
+  });
+
+  it('the repository refuses an empty payload rather than emitting a coercion error', async () => {
+    const taskId = await seedTask();
+
+    await expect(dc.repositories.tasks.update(taskId, {})).rejects.toThrow(
+      'Failed to update task: no fields to update'
+    );
+  });
+});

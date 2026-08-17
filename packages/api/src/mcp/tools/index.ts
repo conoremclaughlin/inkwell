@@ -35,6 +35,7 @@ import {
   listTaskGroupCommentsSchema,
   closeTaskSchema,
   closeTaskGroupSchema,
+  dueDateField,
 } from './task-handlers';
 
 import { handleSendResponse, handleGetPendingMessages, handleMarkRead } from './response-handlers';
@@ -770,7 +771,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   server.registerTool(
     'create_task',
     {
-      description: `Create a task. Tasks persist across sessions and can be tracked. Can be standalone, project-scoped, or added to a task group for strategy execution.
+      description: `Create a task. Tasks persist across sessions and can be tracked. Can be standalone, project-scoped, or added to a task group for strategy execution. Supports an optional dueDate.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: {
@@ -788,6 +789,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         priority: z.enum(['low', 'medium', 'high', 'critical']).optional().default('medium'),
         tags: z.array(z.string()).optional().describe('Tags for categorization'),
         createdBy: z.string().optional().describe('Who created this task (e.g., "claude", "user")'),
+        dueDate: dueDateField,
       },
     },
     async (args) => {
@@ -856,7 +858,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   server.registerTool(
     'update_task',
     {
-      description: `Update a task's title, description, status, priority, or tags.
+      description: `Update a task's title, description, status, priority, tags, or dueDate. At least one of those must be provided. The response echoes the stored dueDate.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: {
@@ -867,6 +869,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         status: z.enum(['pending', 'in_progress', 'completed', 'blocked']).optional(),
         priority: z.enum(['low', 'medium', 'high', 'critical']).optional(),
         tags: z.array(z.string()).optional(),
+        dueDate: dueDateField,
       },
     },
     async (args) => {
