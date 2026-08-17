@@ -47,6 +47,7 @@ export interface CreateProjectTaskInput {
   created_by?: string;
   task_group_id?: string;
   task_order?: number;
+  due_date?: string | null;
 }
 
 export interface UpdateProjectTaskInput {
@@ -59,6 +60,7 @@ export interface UpdateProjectTaskInput {
   outcome?: string;
   outcome_reason?: string;
   completed_at?: string | null;
+  due_date?: string | null;
   metadata?: Record<string, unknown>;
 }
 
@@ -92,6 +94,7 @@ export class ProjectTasksRepository {
     };
     if (input.task_group_id !== undefined) insertData.task_group_id = input.task_group_id;
     if (input.task_order !== undefined) insertData.task_order = input.task_order;
+    if (input.due_date !== undefined) insertData.due_date = input.due_date;
 
     const { data, error } = await this.client
       .from('tasks')
@@ -224,6 +227,14 @@ export class ProjectTasksRepository {
    * Update a task
    */
   async update(id: string, input: UpdateProjectTaskInput): Promise<ProjectTask> {
+    // PostgREST turns an empty payload into an UPDATE that matches no rows, and
+    // .single() then fails with "Cannot coerce the result to a single JSON
+    // object" — an error that points at JSON parsing rather than at the caller
+    // who passed nothing to write.
+    if (Object.keys(input).length === 0) {
+      throw new Error('No fields to update');
+    }
+
     if (input.blocked_by !== undefined) {
       const { data: existing, error: lookupError } = await this.client
         .from('tasks')

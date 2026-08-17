@@ -689,6 +689,230 @@ describe('handleUpdateTask', () => {
 });
 
 // =====================================================
+// dueDate (regression — reported by Myra, 2026-08-17)
+//
+// dueDate was absent from both task schemas, so Zod stripped it silently:
+// update_task reported success while dropping the date, and a dueDate-only
+// call produced an empty UPDATE that surfaced as a JSON coercion error.
+// =====================================================
+
+describe('handleUpdateTask — dueDate', () => {
+  let dc: ReturnType<typeof createMockDataComposer>;
+
+  const existingTask = {
+    id: 'task-1',
+    user_id: 'user-123',
+    title: 'Renew inkah.com',
+    status: 'pending',
+  };
+
+  function updatedTask(overrides: Record<string, unknown> = {}) {
+    return {
+      id: 'task-1',
+      title: 'Renew inkah.com',
+      description: null,
+      status: 'pending',
+      priority: 'medium',
+      tags: null,
+      due_date: null,
+      completed_at: null,
+      ...overrides,
+    };
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    dc = createMockDataComposer();
+    resolveUserMock.mockResolvedValue({
+      user: { id: 'user-123', timezone: 'America/Los_Angeles' } as any,
+      resolvedBy: 'userId',
+    });
+    dc.repositories.tasks.findById.mockResolvedValue(existingTask);
+  });
+
+  it('persists a bare dueDate as end of that day in the user timezone', async () => {
+    dc.repositories.tasks.update.mockResolvedValue(
+      updatedTask({ due_date: '2026-09-15T06:59:59.999Z' })
+    );
+
+    const response = await handleUpdateTask(
+      { userId: 'user-123', taskId: 'task-1', dueDate: '2026-09-14' } as any,
+      dc as any
+    );
+
+    expect(response.isError).toBeFalsy();
+    expect(dc.repositories.tasks.update).toHaveBeenCalledWith('task-1', {
+      due_date: '2026-09-15T06:59:59.999Z',
+    });
+  });
+
+  it('echoes dueDate in the response so the write is verifiable without a read-back', async () => {
+    dc.repositories.tasks.update.mockResolvedValue(
+      updatedTask({ due_date: '2026-09-15T06:59:59.999Z' })
+    );
+
+    const response = await handleUpdateTask(
+      { userId: 'user-123', taskId: 'task-1', dueDate: '2026-09-14' } as any,
+      dc as any
+    );
+
+    expect(parseResponse(response).task.dueDate).toBe('2026-09-15T06:59:59.999Z');
+  });
+
+  it('keeps dueDate alongside other fields (the silent partial no-op)', async () => {
+    dc.repositories.tasks.update.mockResolvedValue(
+      updatedTask({ priority: 'high', description: 'Expires ~Sept 14' })
+    );
+
+    await handleUpdateTask(
+      {
+        userId: 'user-123',
+        taskId: 'task-1',
+        dueDate: '2026-09-14',
+        priority: 'high',
+        description: 'Expires ~Sept 14',
+      } as any,
+      dc as any
+    );
+
+    expect(dc.repositories.tasks.update).toHaveBeenCalledWith('task-1', {
+      description: 'Expires ~Sept 14',
+      priority: 'high',
+      due_date: '2026-09-15T06:59:59.999Z',
+    });
+  });
+
+  it('falls back to UTC when the user has no timezone set', async () => {
+    resolveUserMock.mockResolvedValue({ user: { id: 'user-123' } as any, resolvedBy: 'userId' });
+    dc.repositories.tasks.update.mockResolvedValue(updatedTask());
+
+    await handleUpdateTask(
+      { userId: 'user-123', taskId: 'task-1', dueDate: '2026-09-14' } as any,
+      dc as any
+    );
+
+    expect(dc.repositories.tasks.update).toHaveBeenCalledWith('task-1', {
+      due_date: '2026-09-14T23:59:59.999Z',
+    });
+  });
+
+  it('stores a fully-qualified timestamp as given', async () => {
+    dc.repositories.tasks.update.mockResolvedValue(updatedTask());
+
+    await handleUpdateTask(
+      { userId: 'user-123', taskId: 'task-1', dueDate: '2026-09-14T17:00:00-07:00' } as any,
+      dc as any
+    );
+
+    expect(dc.repositories.tasks.update).toHaveBeenCalledWith('task-1', {
+      due_date: '2026-09-15T00:00:00.000Z',
+    });
+  });
+
+  it('clears the due date when passed null', async () => {
+    dc.repositories.tasks.update.mockResolvedValue(updatedTask());
+
+    await handleUpdateTask(
+      { userId: 'user-123', taskId: 'task-1', dueDate: null } as any,
+      dc as any
+    );
+
+    expect(dc.repositories.tasks.update).toHaveBeenCalledWith('task-1', { due_date: null });
+  });
+
+  it('rejects an unparseable dueDate without writing anything', async () => {
+    const response = await handleUpdateTask(
+      { userId: 'user-123', taskId: 'task-1', dueDate: 'next Tuesday' } as any,
+      dc as any
+    );
+
+    const data = parseResponse(response);
+    expect(response.isError).toBe(true);
+    expect(data.success).toBe(false);
+    expect(data.error).toContain('Invalid dueDate');
+    expect(dc.repositories.tasks.update).not.toHaveBeenCalled();
+  });
+
+  it('reports "no fields to update" instead of a PostgREST coercion error', async () => {
+    const response = await handleUpdateTask(
+      { userId: 'user-123', taskId: 'task-1' } as any,
+      dc as any
+    );
+
+    const data = parseResponse(response);
+    expect(response.isError).toBe(true);
+    expect(data.error).toContain('No fields to update');
+    expect(data.error).toContain('dueDate');
+    expect(dc.repositories.tasks.update).not.toHaveBeenCalled();
+  });
+});
+
+describe('handleCreateTask — dueDate', () => {
+  let dc: ReturnType<typeof createMockDataComposer>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    dc = createMockDataComposer();
+    resolveUserMock.mockResolvedValue({
+      user: { id: 'user-123', timezone: 'America/Los_Angeles' } as any,
+      resolvedBy: 'userId',
+    });
+  });
+
+  it('persists dueDate on create and echoes it back', async () => {
+    dc.repositories.tasks.create.mockResolvedValue({
+      id: 'task-new',
+      title: 'Renew inkah.com',
+      status: 'pending',
+      priority: 'medium',
+      tags: [],
+      due_date: '2026-09-15T06:59:59.999Z',
+      created_at: '2026-08-17T22:00:00Z',
+    });
+
+    const response = await handleCreateTask(
+      { userId: 'user-123', title: 'Renew inkah.com', dueDate: '2026-09-14' } as any,
+      dc as any
+    );
+
+    expect(response.isError).toBeFalsy();
+    expect(dc.repositories.tasks.create).toHaveBeenCalledWith(
+      expect.objectContaining({ due_date: '2026-09-15T06:59:59.999Z' })
+    );
+    expect(parseResponse(response).task.dueDate).toBe('2026-09-15T06:59:59.999Z');
+  });
+
+  it('omits due_date entirely when no dueDate is given', async () => {
+    dc.repositories.tasks.create.mockResolvedValue({
+      id: 'task-new',
+      title: 'No deadline',
+      status: 'pending',
+      priority: 'medium',
+      tags: [],
+      due_date: null,
+      created_at: '2026-08-17T22:00:00Z',
+    });
+
+    await handleCreateTask({ userId: 'user-123', title: 'No deadline' } as any, dc as any);
+
+    expect(dc.repositories.tasks.create).toHaveBeenCalledWith(
+      expect.objectContaining({ due_date: undefined })
+    );
+  });
+
+  it('rejects an unparseable dueDate without creating the task', async () => {
+    const response = await handleCreateTask(
+      { userId: 'user-123', title: 'Bad date', dueDate: '2026-02-30' } as any,
+      dc as any
+    );
+
+    expect(response.isError).toBe(true);
+    expect(parseResponse(response).error).toContain('Invalid dueDate');
+    expect(dc.repositories.tasks.create).not.toHaveBeenCalled();
+  });
+});
+
+// =====================================================
 // handleCompleteTask
 // =====================================================
 

@@ -10,11 +10,17 @@ import type { DataComposer } from '../../data/composer';
 import type { TaskStatus, TaskPriority } from '../../data/repositories/project-tasks.repository';
 import { StrategyService } from '../../services/strategy.service';
 import { getOrchestrator } from '../../services/sandbox/index.js';
-import { resolveUser, type UserIdentifier } from '../../services/user-resolver';
+import { resolveUser, type UserIdentifier, type ResolvedUser } from '../../services/user-resolver';
 import { getEffectiveAgentId } from '../../auth/enforce-identity';
 import { getRequestContext, getSessionContext } from '../../utils/request-context';
 import { GraphExecutorService, type GraphEvaluation } from '../../services/graph-executor.service';
+import { isBareDate, resolveDueDate, InvalidDueDateError } from '../../utils/due-date';
 import { logger } from '../../utils/logger';
+
+export const DUE_DATE_DESCRIPTION =
+  'Deadline. Bare YYYY-MM-DD (e.g. "2026-09-14") resolves to the end of that day in the ' +
+  "user's timezone, so the task is not overdue until the day has passed. A full ISO 8601 " +
+  'timestamp (e.g. "2026-09-14T17:00:00-07:00") is stored exactly as given.';
 
 // Common user identifier schema
 // Usually unnecessary — userId and email are auto-resolved from OAuth token.
@@ -53,6 +59,7 @@ export const createTaskSchema = z.object({
   priority: z.enum(['low', 'medium', 'high', 'critical']).optional().default('medium'),
   tags: z.array(z.string()).optional().describe('Tags for categorization'),
   createdBy: z.string().optional().describe('Who created this task (e.g., "claude", "user")'),
+  dueDate: z.string().optional().describe(DUE_DATE_DESCRIPTION),
 });
 
 type McpResponse = {
@@ -65,6 +72,39 @@ function mcpResponse(data: object, isError = false): McpResponse {
     content: [{ type: 'text' as const, text: JSON.stringify(data) }],
     isError,
   };
+}
+
+/**
+ * Resolve a caller-supplied dueDate to a storable timestamp.
+ *
+ * Only a bare YYYY-MM-DD needs the user's timezone to land on the right day, so
+ * the lookup is skipped for fully-qualified timestamps. A missing or unreadable
+ * timezone falls back to UTC rather than failing the write.
+ */
+async function resolveDueDateForUser(
+  value: string,
+  resolved: ResolvedUser,
+  dataComposer: DataComposer
+): Promise<string> {
+  if (!isBareDate(value)) return resolveDueDate(value, 'UTC');
+
+  const onRow = (resolved.user as { timezone?: string | null }).timezone;
+  let timezone = onRow || undefined;
+  if (!timezone) {
+    try {
+      const { data } = await dataComposer
+        .getClient()
+        .from('users')
+        .select('timezone')
+        .eq('id', resolved.user.id)
+        .single();
+      timezone = (data as { timezone?: string | null } | null)?.timezone || undefined;
+    } catch (err) {
+      logger.warn('Failed to load user timezone for dueDate resolution:', err);
+    }
+  }
+
+  return resolveDueDate(value, timezone || 'UTC');
 }
 
 export async function handleCreateTask(
@@ -102,6 +142,18 @@ export async function handleCreateTask(
       }
     }
 
+    let dueDate: string | undefined;
+    if (args.dueDate !== undefined) {
+      try {
+        dueDate = await resolveDueDateForUser(args.dueDate, resolved, dataComposer);
+      } catch (err) {
+        if (err instanceof InvalidDueDateError) {
+          return mcpResponse({ success: false, error: err.message }, true);
+        }
+        throw err;
+      }
+    }
+
     const task = await dataComposer.repositories.tasks.create({
       project_id: args.projectId || null,
       user_id: resolved.user.id,
@@ -112,6 +164,7 @@ export async function handleCreateTask(
       created_by: args.createdBy || 'claude',
       task_group_id: args.taskGroupId,
       task_order: args.taskOrder,
+      due_date: dueDate,
     });
 
     return mcpResponse({
@@ -125,6 +178,7 @@ export async function handleCreateTask(
         tags: task.tags,
         taskGroupId: task.task_group_id || null,
         taskOrder: task.task_order ?? null,
+        dueDate: task.due_date || null,
         createdAt: task.created_at,
       },
     });
@@ -242,6 +296,11 @@ export const updateTaskSchema = z.object({
   status: z.enum(['pending', 'in_progress', 'completed', 'blocked']).optional(),
   priority: z.enum(['low', 'medium', 'high', 'critical']).optional(),
   tags: z.array(z.string()).optional(),
+  dueDate: z
+    .string()
+    .nullable()
+    .optional()
+    .describe(`${DUE_DATE_DESCRIPTION} Pass null to clear an existing due date.`),
 });
 
 export async function handleUpdateTask(
@@ -294,6 +353,32 @@ export async function handleUpdateTask(
     }
     if (args.priority !== undefined) updates.priority = args.priority;
     if (args.tags !== undefined) updates.tags = args.tags;
+    if (args.dueDate !== undefined) {
+      try {
+        updates.due_date =
+          args.dueDate === null
+            ? null
+            : await resolveDueDateForUser(args.dueDate, resolved, dataComposer);
+      } catch (err) {
+        if (err instanceof InvalidDueDateError) {
+          return mcpResponse({ success: false, error: err.message }, true);
+        }
+        throw err;
+      }
+    }
+
+    // Without this an all-unknown-fields call reaches PostgREST as an empty
+    // UPDATE, which matches no rows and surfaces as a JSON coercion error.
+    if (Object.keys(updates).length === 0) {
+      return mcpResponse(
+        {
+          success: false,
+          error:
+            'No fields to update. Provide at least one of: title, description, status, priority, tags, dueDate.',
+        },
+        true
+      );
+    }
 
     const task = await dataComposer.repositories.tasks.update(args.taskId, updates);
 
@@ -329,6 +414,7 @@ export async function handleUpdateTask(
         status: task.status,
         priority: task.priority,
         tags: task.tags,
+        dueDate: task.due_date || null,
         completedAt: task.completed_at,
       },
     });
