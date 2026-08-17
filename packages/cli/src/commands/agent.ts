@@ -182,6 +182,9 @@ async function inboxCommand(agentId?: string): Promise<void> {
       agentId: agent,
       status: 'all',
       limit: 10,
+      // A human browsing an agent's inbox from the CLI hasn't delivered
+      // anything to that agent — don't move its pointer.
+      markRead: false,
     });
 
     console.log(chalk.bold(`\nInbox for ${agent}:`));

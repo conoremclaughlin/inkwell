@@ -9,7 +9,7 @@ import { z } from 'zod';
 import type { DataComposer } from '../../data/composer';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
 import { resolveIdentityId, resolveAgentSlug } from '../../auth/resolve-identity';
-import { advanceThreadReadPointer } from './read-state.js';
+import { advanceThreadReadPointer, advanceAgentInboxReadPointer } from './read-state.js';
 import { getEffectiveAgentId } from '../../auth/enforce-identity';
 import { logger } from '../../utils/logger';
 import type { Json } from '../../data/supabase/types';
@@ -188,7 +188,12 @@ const getInboxSchema = userIdentifierBaseSchema
       .enum(['unread', 'read', 'acknowledged', 'completed', 'all'])
       .optional()
       .default('unread')
-      .describe('Filter by status'),
+      .describe(
+        "Filter by status. 'unread' (default) means UNSEEN — messages newer than your " +
+          'read pointer — not rows whose status column happens to say "unread". The other ' +
+          'values filter the status column, which records explicit workflow actions ' +
+          '(read/acknowledged/completed) and is never cleared by reading.'
+      ),
     priority: z.enum(['low', 'normal', 'high', 'urgent']).optional().describe('Filter by priority'),
     messageType: z
       .enum(['message', 'task_request', 'session_resume', 'notification', 'permission_grant'])
@@ -217,6 +222,17 @@ const getInboxSchema = userIdentifierBaseSchema
         'When true, filter threads by studio ownership using the studioId from request context. ' +
           'Used by channel plugins to only receive threads belonging to their studio. ' +
           'Threads with no studio affinity (new, unrouted) are included as broadcast.'
+      ),
+    markRead: z
+      .boolean()
+      .optional()
+      .default(true)
+      .describe(
+        'Whether this read advances your inbox read pointer. Pass false to observe without ' +
+          'draining — watchers and pollers that manage their own cursor MUST do this ' +
+          '(spec inkmail-read-state §7: observing is not delivering). Mirrors ' +
+          'get_thread_messages. The pointer only ever advances over messages this call ' +
+          'actually returned: a filtered or truncated page never advances it.'
       ),
     // .strict(): unknown keys are REJECTED with their names in the error, not
     // silently stripped. The callers here are LLMs — a plausible-but-wrong
@@ -1113,6 +1129,9 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
         agentId: parsed.agentId,
         threadKey: parsed.threadKey,
         limit: parsed.limit ?? 20,
+        // markRead carries through: an observer that must not drain the legacy
+        // inbox must not drain a thread either (spec §7).
+        markRead: parsed.markRead ?? true,
         // The inbox's "unread by default" maps to the thread read pointer;
         // status 'all' maps to the full timeline.
         ...(parsed.status === 'all' ? { fullHistory: true } : {}),
@@ -1123,7 +1142,15 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
 
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
-  const { status = 'unread', priority, messageType, limit = 20, since, channelPoll } = parsed;
+  const {
+    status = 'unread',
+    priority,
+    messageType,
+    limit = 20,
+    since,
+    channelPoll,
+    markRead = true,
+  } = parsed;
   // Enforce identity: pinned agents can only read their own inbox.
   // When agentId is omitted, return inbox across ALL agents (unified timeline)
   // — EXCEPT for channelPoll, where the gate below derives it from the
@@ -1203,6 +1230,56 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
     }
   }
 
+  // ── Read state: the pointer is the single source of truth ────────────
+  // `agent_inbox` carries two representations of "unread": the per-row `status`
+  // column, and the (user, agent) read pointer that migration 20260317 added to
+  // REPLACE it. Nothing reconciled them, and this handler used to select the
+  // page by one and count by the other — so `unreadCount: 0` sat beside five
+  // rows reading `status: "unread"` (Myra, 2026-08-17).
+  //
+  // They are reconciled here by demoting the column: reading no longer clears
+  // it, so `status='unread'` only ever meant "nobody ran an explicit action on
+  // this row", which is a workflow fact, not a delivery fact. Unseen-ness is
+  // the pointer's job, and `status: 'unread'` now asks the pointer.
+  //
+  // The floor is captured BEFORE the page query and before any advance. Reading
+  // it afterwards is what made the count structurally zero: the same call moved
+  // the pointer past everything it was about to count.
+  let unreadFloor: string | null = null;
+  if (agentId) {
+    const { data: readStatus, error: pointerErr } = await threadTable(
+      supabase,
+      'agent_inbox_read_status'
+    )
+      .select('last_read_at')
+      .eq('user_id', resolved.user.id)
+      .eq('agent_id', agentId)
+      .maybeSingle();
+    if (pointerErr) {
+      // Fail LOUD but open: a missing floor over-reports (every message looks
+      // unseen), which is the safe direction — the opposite silently empties
+      // the mailbox, which is the bug being fixed.
+      logger.error('[ReadState] Failed to read inbox pointer; treating inbox as fully unread', {
+        agentId,
+        userId: resolved.user.id,
+        error: pointerErr.message,
+      });
+    }
+    unreadFloor = readStatus?.last_read_at ?? null;
+  } else {
+    // All-agent timeline: no single pointer applies, so use the OLDEST across
+    // agents. Over-counts (a message read by one agent still counts for the
+    // aggregate) and is documented as such — "does anyone have unread mail".
+    const { data: readStatuses } = await threadTable(supabase, 'agent_inbox_read_status')
+      .select('agent_id, last_read_at')
+      .eq('user_id', resolved.user.id);
+    unreadFloor = (readStatuses || []).reduce(
+      (oldest: string | null, rs: { last_read_at: string }) =>
+        !oldest || rs.last_read_at < oldest ? rs.last_read_at : oldest,
+      null
+    );
+  }
+
   let query = supabase
     .from('agent_inbox')
     .select('*')
@@ -1213,7 +1290,11 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
   if (agentId) {
     query = query.eq('recipient_agent_id', agentId);
   }
-  if (status !== 'all') {
+  if (status === 'unread') {
+    if (unreadFloor) {
+      query = query.gt('created_at', unreadFloor);
+    }
+  } else if (status !== 'all') {
     query = query.eq('status', status);
   }
   if (since) {
@@ -1235,74 +1316,63 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
     throw new Error(`Failed to get inbox: ${error.message}`);
   }
 
-  // Auto-advance read pointer: when an agent reads their inbox, advance
-  // the pointer to the latest message timestamp. No need for explicit
-  // mark_inbox_read calls.
-  if (agentId && messages?.length) {
-    const maxCreatedAt = (messages as Array<{ created_at: string }>).reduce(
-      (max: string, m) => (m.created_at > max ? m.created_at : max),
-      (messages[0] as { created_at: string }).created_at
-    );
-    await threadTable(supabase, 'agent_inbox_read_status').upsert(
-      {
-        user_id: resolved.user.id,
-        agent_id: agentId,
-        last_read_at: maxCreatedAt,
-      },
-      { onConflict: 'user_id,agent_id' }
-    );
-    logger.debug('Auto-advanced inbox read pointer', { agentId, lastReadAt: maxCreatedAt });
-  }
-
-  // Count unread using pointer-based tracking (agent_inbox_read_status)
-  // Uses the same untyped table helper as thread tables (not yet in generated types)
-  let inboxUnread = 0;
+  // Count unread BEFORE advancing anything. `unreadCount` describes the
+  // mailbox, not this query: it always uses the pointer predicate, whatever
+  // `status` the caller filtered the page by. When status is 'unread' the page
+  // and the count share a predicate by construction, so `count` can differ from
+  // `unreadCount` only by `limit` truncation — which is reported below.
+  let countQuery = supabase
+    .from('agent_inbox')
+    .select('*', { count: 'exact', head: true })
+    .eq('recipient_user_id', resolved.user.id);
   if (agentId) {
-    // Single agent: one pointer lookup + one count
-    const { data: readStatus } = await threadTable(supabase, 'agent_inbox_read_status')
-      .select('last_read_at')
-      .eq('user_id', resolved.user.id)
-      .eq('agent_id', agentId)
-      .maybeSingle();
-
-    let countQuery = supabase
-      .from('agent_inbox')
-      .select('*', { count: 'exact', head: true })
-      .eq('recipient_user_id', resolved.user.id)
-      .eq('recipient_agent_id', agentId);
-
-    if (readStatus?.last_read_at) {
-      countQuery = countQuery.gt('created_at', readStatus.last_read_at);
-    }
-    // Exclude expired messages from unread count
-    countQuery = countQuery.or(`expires_at.is.null,expires_at.gt.${new Date().toISOString()}`);
-    const { count } = await countQuery;
-    inboxUnread = count || 0;
-  } else {
-    // All agents: fall back to aggregate count
-    const { data: readStatuses } = await threadTable(supabase, 'agent_inbox_read_status')
-      .select('agent_id, last_read_at')
-      .eq('user_id', resolved.user.id);
-
-    const oldestPointer = (readStatuses || []).reduce(
-      (oldest: string | null, rs: { last_read_at: string }) =>
-        !oldest || rs.last_read_at < oldest ? rs.last_read_at : oldest,
-      null
-    );
-
-    // Count messages after the oldest pointer (overcount, but correct for "any unread")
-    let countQuery = supabase
-      .from('agent_inbox')
-      .select('*', { count: 'exact', head: true })
-      .eq('recipient_user_id', resolved.user.id);
-    if (oldestPointer) {
-      countQuery = countQuery.gt('created_at', oldestPointer);
-    }
-    countQuery = countQuery.or(`expires_at.is.null,expires_at.gt.${new Date().toISOString()}`);
-    const { count } = await countQuery;
-    inboxUnread = count || 0;
+    countQuery = countQuery.eq('recipient_agent_id', agentId);
   }
-  const unreadCount = inboxUnread;
+  if (unreadFloor) {
+    countQuery = countQuery.gt('created_at', unreadFloor);
+  }
+  // Expired messages are excluded from the page, so they must be excluded here
+  // too — a counter that includes rows the caller can never see is the same
+  // class of lie as the one this fixes.
+  countQuery = countQuery.or(`expires_at.is.null,expires_at.gt.${new Date().toISOString()}`);
+  const { count: unreadCountRaw, error: countError } = await countQuery;
+  if (countError) {
+    throw new Error(`Failed to count unread inbox messages: ${countError.message}`);
+  }
+  const unreadCount = unreadCountRaw || 0;
+
+  // A page smaller than the backlog means the caller did NOT see everything
+  // above the floor. Surfaced so a poller can tell "drained" from "capped".
+  const pageTruncated = status === 'unread' && unreadCount > (messages?.length || 0);
+
+  // ── Advance the pointer, but only over messages actually returned ────
+  // Every guard here corresponds to a way the old unconditional advance lost
+  // mail. The pointer moves through the newest message ON THE PAGE, so it may
+  // only move when the page provably covers everything above the floor:
+  //
+  //  - markRead:false      → caller is an observer (§7); observing is not
+  //                          delivering and never drains.
+  //  - status !== 'unread' → the page was selected by workflow status, so
+  //                          genuinely-unseen mail can sit outside it.
+  //  - priority/messageType/since → same hazard: a narrowed page whose newest
+  //                          row is newer than mail the caller never saw. One
+  //                          get_inbox(priority:'urgent') used to bury every
+  //                          normal-priority message behind it, permanently.
+  //  - pageTruncated       → `limit` cut the backlog; advancing to the newest
+  //                          row would discard the older remainder unseen.
+  //                          Re-delivery beats loss (spec §7).
+  const filteredPage = status !== 'unread' || !!priority || !!messageType || !!since;
+  let readPointerAdvanced = false;
+  if (markRead && agentId && messages?.length && !filteredPage && !pageTruncated) {
+    // Ordered created_at DESC, so messages[0] is the newest on the page.
+    const newest = messages[0] as { id: string; created_at: string };
+    readPointerAdvanced = await advanceAgentInboxReadPointer(supabase, {
+      userId: resolved.user.id,
+      agentId,
+      throughMessageId: newest.id,
+      source: 'get_inbox:markRead',
+    });
+  }
 
   // Get threads with unread counts and preview messages.
   // Works with or without agentId — when omitted, finds threads for ALL agents
@@ -1612,6 +1682,11 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
           threadUnreadCount,
           totalUnreadCount,
           count: messages?.length || 0,
+          // Read-state transparency: a caller that gets fewer rows than the
+          // backlog, or whose read deliberately didn't drain, can tell why.
+          ...(pageTruncated ? { truncated: true } : {}),
+          lastReadAt: unreadFloor,
+          readPointerAdvanced,
           messages: (messages || []).map((m) => ({
             id: m.id,
             subject: m.subject,
@@ -1786,23 +1861,62 @@ export async function handleMarkInboxRead(args: unknown, dataComposer: DataCompo
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
   const agentId = getEffectiveAgentId(parsed.agentId) ?? parsed.agentId;
-  const lastReadAt = parsed.before || new Date().toISOString();
 
-  // Upsert the read pointer — only advance forward, never backwards
-  const { error } = await threadTable(supabase, 'agent_inbox_read_status').upsert(
-    {
-      user_id: resolved.user.id,
-      agent_id: agentId,
-      last_read_at: lastReadAt,
-    },
-    { onConflict: 'user_id,agent_id' }
-  );
+  // Resolve the requested cutoff to a REAL message before touching the pointer.
+  // The old code wrote `before || now()` straight into the row, which is the
+  // wall-clock advance the spec bans (§2): a message inserted between the
+  // caller's decision and this write would be marked read without ever being
+  // seen. Anchoring to the newest message at or before the cutoff preserves the
+  // caller's intent exactly while making that race impossible.
+  let anchorQuery = supabase
+    .from('agent_inbox')
+    .select('id, created_at')
+    .eq('recipient_user_id', resolved.user.id)
+    .eq('recipient_agent_id', agentId)
+    .order('created_at', { ascending: false })
+    .limit(1);
+  if (parsed.before) {
+    anchorQuery = anchorQuery.lte('created_at', parsed.before);
+  }
+  const { data: anchor, error: anchorError } = await anchorQuery.maybeSingle();
 
-  if (error) {
-    throw new Error(`Failed to mark inbox read: ${error.message}`);
+  if (anchorError) {
+    throw new Error(`Failed to mark inbox read: ${anchorError.message}`);
   }
 
-  logger.info('Inbox marked as read', { agentId, lastReadAt });
+  if (!anchor) {
+    // Nothing at or before the cutoff — no message to advance through. The
+    // pointer is monotonic anyway, so this is a no-op, not a failure.
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: JSON.stringify({
+            success: true,
+            agentId,
+            lastReadAt: null,
+            advanced: false,
+            message: parsed.before
+              ? `No messages at or before ${parsed.before} — read pointer unchanged.`
+              : 'Inbox is empty — read pointer unchanged.',
+          }),
+        },
+      ],
+    };
+  }
+
+  const advanced = await advanceAgentInboxReadPointer(supabase, {
+    userId: resolved.user.id,
+    agentId,
+    throughMessageId: anchor.id,
+    source: 'mark_inbox_read',
+  });
+
+  if (!advanced) {
+    throw new Error('Failed to mark inbox read: read pointer advance failed (see server logs)');
+  }
+
+  logger.info('Inbox marked as read', { agentId, lastReadAt: anchor.created_at });
 
   return {
     content: [
@@ -1811,8 +1925,11 @@ export async function handleMarkInboxRead(args: unknown, dataComposer: DataCompo
         text: JSON.stringify({
           success: true,
           agentId,
-          lastReadAt,
-          message: 'Inbox read pointer advanced. Messages before this timestamp are now read.',
+          lastReadAt: anchor.created_at,
+          advanced: true,
+          message:
+            'Inbox read pointer advanced. Messages up to and including this timestamp are now read. ' +
+            'The pointer is monotonic — it never moves backwards.',
         }),
       },
     ],
@@ -1843,6 +1960,11 @@ export async function handleGetAgentStatus(args: unknown, dataComposer: DataComp
     .eq('agent_id', agentId)
     .maybeSingle();
 
+  // Expired messages are excluded here to match get_inbox's predicate. These
+  // two counters are read side by side (mission control shows both) and must
+  // agree, or one of them is quietly wrong.
+  const notExpired = `expires_at.is.null,expires_at.gt.${new Date().toISOString()}`;
+
   let unreadQuery = supabase
     .from('agent_inbox')
     .select('*', { count: 'exact', head: true })
@@ -1851,7 +1973,7 @@ export async function handleGetAgentStatus(args: unknown, dataComposer: DataComp
   if (readStatus?.last_read_at) {
     unreadQuery = unreadQuery.gt('created_at', readStatus.last_read_at);
   }
-  const { count: unreadCount } = await unreadQuery;
+  const { count: unreadCount } = await unreadQuery.or(notExpired);
 
   // Get urgent unread message count (pointer-based)
   let urgentQuery = supabase
@@ -1863,7 +1985,7 @@ export async function handleGetAgentStatus(args: unknown, dataComposer: DataComp
   if (readStatus?.last_read_at) {
     urgentQuery = urgentQuery.gt('created_at', readStatus.last_read_at);
   }
-  const { count: urgentCount } = await urgentQuery;
+  const { count: urgentCount } = await urgentQuery.or(notExpired);
 
   // Get active workspaces for this agent
   const { data: workspaces } = await supabase
@@ -2198,7 +2320,7 @@ export const inboxToolDefinitions = [
   {
     name: 'get_inbox',
     description:
-      "Get messages from an agent's inbox. Returns unread messages by default. Omit agentId to get inbox across ALL agents in one query (useful for unified timelines like mission control). Sorted by created_at descending. Pass threadKey to read a conversation thread instead — this aliases through to get_thread_messages (thread messages are stored separately from the legacy inbox) and requires agentId.",
+      'Get messages from an agent\'s inbox. Returns UNSEEN messages by default — those newer than your read pointer, not rows whose status column says "unread". `unreadCount` is measured before this call advances anything, so it reports the backlog you were handed rather than what\'s left after reading it; `truncated: true` means `limit` cut that backlog short. Reading advances your pointer only over messages this call actually returned — pass markRead:false to observe without draining (watchers and pollers with their own cursor must). Omit agentId to get inbox across ALL agents in one query (useful for unified timelines like mission control). Sorted by created_at descending. Pass threadKey to read a conversation thread instead — this aliases through to get_thread_messages (thread messages are stored separately from the legacy inbox) and requires agentId.',
     schema: getInboxSchema,
     handler: handleGetInbox,
   },
@@ -2211,7 +2333,7 @@ export const inboxToolDefinitions = [
   {
     name: 'mark_inbox_read',
     description:
-      "Advance the agent's inbox read pointer. All messages created before the pointer are considered read. Defaults to now (marks everything read). Use 'before' to mark up to a specific timestamp.",
+      "Advance the agent's inbox read pointer. All messages created at or before the pointer are considered read. Defaults to the newest message currently in the inbox (marks everything read); use 'before' to mark up to a specific timestamp. The advance is monotonic — it never moves the pointer backwards — and always lands on a real message, so mail that arrives mid-call is never marked read without being seen.",
     schema: markInboxReadSchema,
     handler: handleMarkInboxRead,
   },

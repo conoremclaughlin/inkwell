@@ -67,3 +67,60 @@ export async function advanceThreadReadPointer(
     return false;
   }
 }
+
+export interface AdvanceInboxReadPointerParams {
+  userId: string;
+  agentId: string;
+  /** The pointer advances through this message's created_at. */
+  throughMessageId: string;
+  /** Call-site label for logs (e.g. 'get_inbox:markRead'). */
+  source: string;
+}
+
+/**
+ * Canonical LEGACY-inbox read-pointer advance — the ONLY way any code path may
+ * move `agent_inbox_read_status.last_read_at`.
+ *
+ * The `agent_inbox` counterpart of {@link advanceThreadReadPointer}, added when
+ * the spec's deferred "legacy agent_inbox unification" non-goal turned out to
+ * be load-bearing: the raw upsert it replaces was non-monotonic and regressed a
+ * real mailbox's pointer by seven weeks, hiding a task request for 11 days.
+ *
+ * Same guarantees as the thread path: atomic and monotonic (GREATEST), anchored
+ * to a real message rather than wall-clock time, recipient-scoped server-side,
+ * and loud on failure — a dropped pointer write is a delivery fault, not a
+ * silent no-op.
+ */
+export async function advanceAgentInboxReadPointer(
+  supabase: unknown,
+  params: AdvanceInboxReadPointerParams
+): Promise<boolean> {
+  const { userId, agentId, throughMessageId, source } = params;
+  try {
+    const { error } = await (supabase as RpcClient).rpc('advance_agent_inbox_read_pointer', {
+      p_user_id: userId,
+      p_agent_id: agentId,
+      p_through_message_id: throughMessageId,
+    });
+    if (error) {
+      logger.error('[ReadState] Failed to advance agent inbox read pointer', {
+        userId,
+        agentId,
+        throughMessageId,
+        source,
+        error: error.message,
+      });
+      return false;
+    }
+    return true;
+  } catch (err) {
+    logger.error('[ReadState] Agent inbox read pointer advance threw', {
+      userId,
+      agentId,
+      throughMessageId,
+      source,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return false;
+  }
+}

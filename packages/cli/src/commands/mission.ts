@@ -792,6 +792,11 @@ async function fetchMissionSnapshot(options: MissionOptions): Promise<MissionSna
           agentId,
           status: 'unread',
           limit: 200,
+          // Mission control reports on OTHER agents' mailboxes. Displaying a
+          // count to a human is not delivery to the agent, so this read must
+          // never advance their pointer — otherwise opening the dashboard
+          // marks the whole team's mail read.
+          markRead: false,
         })) as Record<string, unknown>;
         unreadByAgent[agentId] = extractUnreadCount(inboxResult);
       } catch {
@@ -808,6 +813,8 @@ async function fetchMissionSnapshot(options: MissionOptions): Promise<MissionSna
         ...(options.agent ? { agentId: options.agent } : {}),
         status: 'all',
         limit: Number.parseInt(options.feedLimit || '40', 10),
+        // Same reasoning as the count above — the feed is a display surface.
+        markRead: false,
       })) as Record<string, unknown>;
       allInboxMessages.push(...extractInboxMessages(inboxResult));
     } catch {
