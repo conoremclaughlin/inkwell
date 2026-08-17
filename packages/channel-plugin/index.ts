@@ -18,37 +18,48 @@
  *   INK_SERVER_URL  — Ink server URL (default: http://localhost:3001)
  *   INK_AGENT_ID    — Agent identity (default: from AGENT_ID or .ink/identity.json)
  *   INK_POLL_INTERVAL_MS — Poll interval in ms (default: 10000)
+ *   INK_PLUGIN_LOG_LEVEL — debug | info | warn | error (default: info)
+ *   INK_PLUGIN_LOG_MAX_BYTES — rotate the log past this size (default: 10485760)
+ *   INK_PLUGIN_LOG_RETENTION_DAYS — sweep dead processes' logs older than this (default: 7)
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { readFileSync, existsSync, mkdirSync, appendFileSync } from 'fs';
+import { readFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import { createThreadDrainState, drainThreads } from './poll-core.js';
+import { createLogger, isLogLevel, logFileFor, sweepStaleLogs, type LogLevel } from './logger.js';
 
 // ─── Logging ────────────────────────────────────────────────
-// Logs to ~/.ink/logs/channel-plugin.log for debugging.
+// Logs to ~/.ink/logs/channel-plugin/<pid>.log for debugging.
 // Cannot use stdout (reserved for MCP stdio transport).
+// Async + level-gated + size-capped — see logger.ts for why each matters.
+//
+// ONE FILE PER PROCESS, not one shared file. Every live Claude Code session
+// runs a plugin, and a shared file put rotation on a concurrent path where it
+// kept losing a generation to races. Per-process files make rotation
+// single-writer again. Tail them together: ~/.ink/logs/channel-plugin/*.log
+//
+// Dead processes' logs are swept at startup so the directory stays bounded.
 
-const LOG_DIR = join(homedir(), '.ink', 'logs');
-const LOG_FILE = join(LOG_DIR, 'channel-plugin.log');
+const LOG_DIR = join(homedir(), '.ink', 'logs', 'channel-plugin');
+const LOG_FILE = join(LOG_DIR, logFileFor());
 
-function log(
-  level: 'info' | 'warn' | 'error' | 'debug',
-  message: string,
-  data?: Record<string, unknown>
-): void {
-  try {
-    mkdirSync(LOG_DIR, { recursive: true });
-    const ts = new Date().toISOString();
-    const line = data
-      ? `${ts} [${level}] ${message} ${JSON.stringify(data)}\n`
-      : `${ts} [${level}] ${message}\n`;
-    appendFileSync(LOG_FILE, line);
-  } catch {
-    // Can't log — don't crash the plugin
-  }
+const configuredLevel = process.env.INK_PLUGIN_LOG_LEVEL;
+const LOG_LEVEL: LogLevel = isLogLevel(configuredLevel) ? configuredLevel : 'info';
+const LOG_MAX_BYTES = parseInt(process.env.INK_PLUGIN_LOG_MAX_BYTES || '10485760', 10);
+const LOG_RETENTION_DAYS = parseInt(process.env.INK_PLUGIN_LOG_RETENTION_DAYS || '7', 10);
+
+const logger = createLogger({
+  dir: LOG_DIR,
+  file: LOG_FILE,
+  level: LOG_LEVEL,
+  maxBytes: Number.isFinite(LOG_MAX_BYTES) && LOG_MAX_BYTES > 0 ? LOG_MAX_BYTES : undefined,
+});
+
+function log(level: LogLevel, message: string, data?: Record<string, unknown>): void {
+  logger.log(level, message, data);
 }
 
 // ─── Config ─────────────────────────────────────────────────
@@ -348,7 +359,10 @@ async function pollInbox(): Promise<void> {
         }
       );
       if (drained.injected > 0 || drained.ceilingHit || drained.fetchFailures > 0) {
-        log('debug', 'Thread drain result', { ...drained });
+        // 'info', not 'debug': this fires only on a real delivery (~tens per
+        // day, not per-tick), and it is the line you actually want when
+        // reconstructing what was delivered at the default log level.
+        log('info', 'Thread drain result', { ...drained });
       }
 
       // Legacy inbox messages (non-threaded). Since we pass `since: lastPollTime`
@@ -423,6 +437,16 @@ async function clearCliAttached(): Promise<void> {
 }
 
 async function main(): Promise<void> {
+  // Bound the log directory: drop dead processes' logs past the retention
+  // window. Fire-and-forget — a sweep failure must never delay startup.
+  const retentionDays =
+    Number.isFinite(LOG_RETENTION_DAYS) && LOG_RETENTION_DAYS > 0 ? LOG_RETENTION_DAYS : 7;
+  void sweepStaleLogs({ dir: LOG_DIR, maxAgeMs: retentionDays * 24 * 60 * 60 * 1000 })
+    .then((removed) => {
+      if (removed.length) log('info', 'Swept stale plugin logs', { count: removed.length });
+    })
+    .catch(() => {});
+
   log('info', 'Connecting MCP stdio transport');
   await mcp.connect(new StdioServerTransport());
   log('info', 'MCP connected, starting poll loop');
@@ -430,20 +454,21 @@ async function main(): Promise<void> {
   // Fire detach cleanup when the host process exits (stdio pipe breaks).
   // This clears cli_attached so future triggers don't skip spawning.
   process.on('exit', () => {
-    // Synchronous — can't await, but the fetch is fire-and-forget.
-    // Use a sync log and kick off the async call (it may or may not complete).
-    log('info', 'Detach: process exiting, clearing cli_attached');
+    // Exit handlers run sync-only: an async stream write here would never
+    // land. This is the one place logSync is correct.
+    logger.logSync('info', 'Detach: process exiting, clearing cli_attached');
   });
-  process.on('SIGTERM', () => {
-    clearCliAttached().finally(() => process.exit(0));
-  });
-  process.on('SIGINT', () => {
-    clearCliAttached().finally(() => process.exit(0));
-  });
+  // Async logging means queued lines are still in flight at shutdown; flush
+  // before exiting or we lose exactly the lines that explain the exit.
+  const shutdown = (code: number) => {
+    clearCliAttached().finally(() => logger.flush().finally(() => process.exit(code)));
+  };
+  process.on('SIGTERM', () => shutdown(0));
+  process.on('SIGINT', () => shutdown(0));
   // Stdio close = Claude Code exited (most reliable signal)
   process.stdin.on('close', () => {
     log('info', 'Detach: stdin closed (host exited)');
-    clearCliAttached().finally(() => process.exit(0));
+    shutdown(0);
   });
 
   // Start polling loop
@@ -456,6 +481,8 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
-  log('error', 'Channel plugin crashed', { error: err.message });
-  clearCliAttached().finally(() => process.exit(1));
+  // Sync write: a crash line that loses the race with process.exit is worse
+  // than useless — this is the one line you always want on disk.
+  logger.logSync('error', 'Channel plugin crashed', { error: err.message });
+  clearCliAttached().finally(() => logger.flush().finally(() => process.exit(1)));
 });
