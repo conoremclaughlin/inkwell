@@ -68,6 +68,7 @@ vi.mock('../../skills/cloud-service', () => ({
 function createMockDataComposer() {
   const mockMemoryRepo = {
     getActiveSession: vi.fn(),
+    findOwnedActiveSessions: vi.fn().mockResolvedValue([]),
     getActiveSessionByThreadKey: vi.fn(),
     updateSession: vi.fn(),
     remember: vi.fn(),
@@ -375,7 +376,9 @@ describe('handleUpdateSessionState', () => {
   const mockSession = {
     id: 'session-123',
     email: 'test@test.com',
+    userId: 'user-123',
     agentId: 'wren',
+    sbId: 'sb-wren',
     studioId: undefined,
     currentPhase: undefined,
     startedAt: new Date('2026-02-10T10:00:00Z'),
@@ -397,6 +400,9 @@ describe('handleUpdateSessionState', () => {
     // an authenticated agent call, which is what every real caller looks like.
     vi.mocked(getPinnedAgentId).mockReturnValue('wren');
     vi.mocked(getRequestContext).mockReturnValue(undefined);
+    // Default: the caller owns the session it resolves/names.
+    mockDataComposer.repositories.memory.findOwnedActiveSessions.mockResolvedValue([mockSession]);
+    mockDataComposer.repositories.memory.getSession.mockResolvedValue(mockSession);
   });
 
   // ---------------------------------------------------
@@ -423,10 +429,8 @@ describe('handleUpdateSessionState', () => {
       expect(parsed.session.currentPhase).toBe('implementing');
 
       // Verify repo calls
-      expect(mockDataComposer.repositories.memory.getActiveSession).toHaveBeenCalledWith(
-        'user-123',
-        'wren',
-        undefined
+      expect(mockDataComposer.repositories.memory.findOwnedActiveSessions).toHaveBeenCalledWith(
+        expect.objectContaining({ userId: 'user-123', agentId: 'wren' })
       );
       expect(mockDataComposer.repositories.memory.updateSession).toHaveBeenCalledWith(
         'session-123',
@@ -449,8 +453,8 @@ describe('handleUpdateSessionState', () => {
       const parsed = JSON.parse(result.content[0].text);
       expect(parsed.success).toBe(true);
 
-      // Should NOT call getActiveSession when sessionId is provided
-      expect(mockDataComposer.repositories.memory.getActiveSession).not.toHaveBeenCalled();
+      // Should NOT run a lookup when sessionId is provided
+      expect(mockDataComposer.repositories.memory.findOwnedActiveSessions).not.toHaveBeenCalled();
     });
 
     it('should update phase with agentId filter for active session lookup', async () => {
@@ -462,10 +466,8 @@ describe('handleUpdateSessionState', () => {
         mockDataComposer as never
       );
 
-      expect(mockDataComposer.repositories.memory.getActiveSession).toHaveBeenCalledWith(
-        'user-123',
-        'wren',
-        undefined
+      expect(mockDataComposer.repositories.memory.findOwnedActiveSessions).toHaveBeenCalledWith(
+        expect.objectContaining({ userId: 'user-123', agentId: 'wren' })
       );
     });
 
@@ -526,10 +528,8 @@ describe('handleUpdateSessionState', () => {
         mockDataComposer as never
       );
 
-      expect(mockDataComposer.repositories.memory.getActiveSession).toHaveBeenCalledWith(
-        'user-123',
-        'wren',
-        studioId
+      expect(mockDataComposer.repositories.memory.findOwnedActiveSessions).toHaveBeenCalledWith(
+        expect.objectContaining({ userId: 'user-123', agentId: 'wren', studioId })
       );
     });
 
@@ -543,8 +543,8 @@ describe('handleUpdateSessionState', () => {
         mockDataComposer as never
       );
 
-      // When sessionId is provided, getActiveSession should NOT be called
-      expect(mockDataComposer.repositories.memory.getActiveSession).not.toHaveBeenCalled();
+      // When sessionId is provided, no lookup should run
+      expect(mockDataComposer.repositories.memory.findOwnedActiveSessions).not.toHaveBeenCalled();
       expect(mockDataComposer.repositories.memory.updateSession).toHaveBeenCalledWith(
         sessionId,
         expect.objectContaining({ currentPhase: 'reviewing' })
@@ -561,10 +561,8 @@ describe('handleUpdateSessionState', () => {
         mockDataComposer as never
       );
 
-      expect(mockDataComposer.repositories.memory.getActiveSession).toHaveBeenCalledWith(
-        'user-123',
-        'wren',
-        studioId
+      expect(mockDataComposer.repositories.memory.findOwnedActiveSessions).toHaveBeenCalledWith(
+        expect.objectContaining({ userId: 'user-123', agentId: 'wren', studioId })
       );
     });
   });
@@ -602,9 +600,8 @@ describe('handleUpdateSessionState', () => {
       vi.mocked(getPinnedAgentId).mockReturnValue('myra');
       // Stand in for the real query: only myra's own session may come back once
       // the agent filter is applied. An unscoped call would surface lumen's.
-      mockDataComposer.repositories.memory.getActiveSession.mockImplementation(
-        async (_userId: string, agentId?: string) =>
-          agentId === 'myra' ? myraSession : lumenSession
+      mockDataComposer.repositories.memory.findOwnedActiveSessions.mockImplementation(
+        async (p: { agentId?: string }) => (p.agentId === 'myra' ? [myraSession] : [lumenSession])
       );
       mockDataComposer.repositories.memory.updateSession.mockResolvedValue(myraSession);
 
@@ -614,10 +611,8 @@ describe('handleUpdateSessionState', () => {
       );
 
       expect(JSON.parse(result.content[0].text).success).toBe(true);
-      expect(mockDataComposer.repositories.memory.getActiveSession).toHaveBeenCalledWith(
-        'user-123',
-        'myra',
-        undefined
+      expect(mockDataComposer.repositories.memory.findOwnedActiveSessions).toHaveBeenCalledWith(
+        expect.objectContaining({ userId: 'user-123', agentId: 'myra' })
       );
       // The write must land on myra's row, never lumen's.
       expect(mockDataComposer.repositories.memory.updateSession).toHaveBeenCalledWith(
@@ -679,7 +674,7 @@ describe('handleUpdateSessionState', () => {
         ...lumenSession,
         userId: 'user-123',
       });
-      mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue(myraSession);
+      mockDataComposer.repositories.memory.findOwnedActiveSessions.mockResolvedValue([myraSession]);
       mockDataComposer.repositories.memory.updateSession.mockResolvedValue(myraSession);
 
       await handleUpdateSessionState(
@@ -693,9 +688,18 @@ describe('handleUpdateSessionState', () => {
       );
     });
 
-    it('still allows an explicit sessionId to target another agent (deliberate repair)', async () => {
+    // The first version of this fix asserted the opposite here — that an
+    // explicit sessionId may target a peer, as "deliberate repair". That test
+    // enshrined an IDOR: updateSession filters on the primary key alone and the
+    // repository runs as the service role, so a bare UUID reached any session,
+    // including another user's. Naming a session is not authorization.
+    it('denies an explicit sessionId belonging to another agent', async () => {
       vi.mocked(getPinnedAgentId).mockReturnValue('myra');
-      mockDataComposer.repositories.memory.updateSession.mockResolvedValue(lumenSession);
+      mockDataComposer.repositories.memory.getSession.mockResolvedValue({
+        ...lumenSession,
+        userId: 'user-123',
+        sbId: 'sb-lumen',
+      });
 
       const result = await handleUpdateSessionState(
         {
@@ -706,8 +710,101 @@ describe('handleUpdateSessionState', () => {
         mockDataComposer as never
       );
 
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.success).toBe(false);
+      expect(parsed.error).toMatch(/not authorized/i);
+      expect(mockDataComposer.repositories.memory.updateSession).not.toHaveBeenCalled();
+    });
+
+    it('denies an explicit sessionId belonging to another user', async () => {
+      vi.mocked(getPinnedAgentId).mockReturnValue('myra');
+      mockDataComposer.repositories.memory.getSession.mockResolvedValue({
+        ...myraSession,
+        userId: 'someone-else',
+        sbId: 'sb-myra',
+      });
+
+      const result = await handleUpdateSessionState(
+        {
+          email: 'test@test.com',
+          sessionId: '95f7f160-6599-449d-9f63-e31ca20a43ce',
+          context: 'cross-user write',
+        },
+        mockDataComposer as never
+      );
+
+      expect(JSON.parse(result.content[0].text).success).toBe(false);
+      expect(mockDataComposer.repositories.memory.updateSession).not.toHaveBeenCalled();
+    });
+
+    it('allows an explicit sessionId for the caller`s own session', async () => {
+      vi.mocked(getPinnedAgentId).mockReturnValue('myra');
+      mockDataComposer.repositories.memory.getSession.mockResolvedValue({
+        ...myraSession,
+        userId: 'user-123',
+      });
+      mockDataComposer.repositories.memory.updateSession.mockResolvedValue(myraSession);
+
+      const result = await handleUpdateSessionState(
+        {
+          email: 'test@test.com',
+          sessionId: '95f7f160-6599-449d-9f63-e31ca20a43ce',
+          context: 'my own note',
+        },
+        mockDataComposer as never
+      );
+
       expect(JSON.parse(result.content[0].text).success).toBe(true);
-      expect(mockDataComposer.repositories.memory.getActiveSession).not.toHaveBeenCalled();
+    });
+
+    it('distinguishes same-slug identities in different workspaces by sbId', async () => {
+      // agent_identities is unique on (user_id, workspace_id, agent_id), so the
+      // slug alone cannot be an ownership predicate.
+      vi.mocked(getPinnedAgentId).mockReturnValue('wren');
+      vi.mocked(getRequestContext).mockReturnValue({
+        agentId: 'wren',
+        sbId: 'sb-wren-workspace-a',
+        sessionId: 'session-wren-b',
+        timestamp: new Date(),
+      } as never);
+      mockDataComposer.repositories.memory.getSession.mockResolvedValue({
+        ...mockSession,
+        id: 'session-wren-b',
+        userId: 'user-123',
+        agentId: 'wren',
+        sbId: 'sb-wren-workspace-b',
+      });
+      mockDataComposer.repositories.memory.findOwnedActiveSessions.mockResolvedValue([]);
+
+      const result = await handleUpdateSessionState(
+        { email: 'test@test.com', context: 'must not cross workspaces' },
+        mockDataComposer as never
+      );
+
+      // The context session is rejected, and the scoped lookup uses sbId.
+      expect(JSON.parse(result.content[0].text).success).toBe(false);
+      expect(mockDataComposer.repositories.memory.findOwnedActiveSessions).toHaveBeenCalledWith(
+        expect.objectContaining({ sbId: 'sb-wren-workspace-a' })
+      );
+      expect(mockDataComposer.repositories.memory.updateSession).not.toHaveBeenCalled();
+    });
+
+    it('refuses to guess when one identity has sessions in several studios', async () => {
+      vi.mocked(getPinnedAgentId).mockReturnValue('wren');
+      mockDataComposer.repositories.memory.findOwnedActiveSessions.mockResolvedValue([
+        { ...mockSession, id: 'session-studio-a', studioId: 'studio-a' },
+        { ...mockSession, id: 'session-studio-b', studioId: 'studio-b' },
+      ]);
+
+      const result = await handleUpdateSessionState(
+        { email: 'test@test.com', context: 'which worktree?' },
+        mockDataComposer as never
+      );
+
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.success).toBe(false);
+      expect(parsed.error).toMatch(/ambiguous/i);
+      expect(mockDataComposer.repositories.memory.updateSession).not.toHaveBeenCalled();
     });
   });
 
@@ -1229,7 +1326,7 @@ describe('handleUpdateSessionState', () => {
     });
 
     it('should error when no active session found', async () => {
-      mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue(null);
+      mockDataComposer.repositories.memory.findOwnedActiveSessions.mockResolvedValue([]);
 
       const result = await handleUpdateSessionState(
         { email: 'test@test.com', phase: 'implementing' },

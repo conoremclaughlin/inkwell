@@ -17,6 +17,7 @@ import {
   getSessionContext,
   pinSessionAgent,
   getRequestContext,
+  getPinnedAgentId,
 } from '../../utils/request-context';
 import { getEffectiveAgentId } from '../../auth/enforce-identity';
 import type { MemorySource, Salience, Session } from '../../data/models/memory';
@@ -97,11 +98,65 @@ function resolveStudioScope(rawStudioId: string | undefined): string | null | un
 }
 
 /** Why an implicit session lookup came back empty — shapes the error the caller sees. */
-type ImplicitSessionFailure = 'no-agent-identity' | 'no-session';
+type ImplicitSessionFailure = 'no-agent-identity' | 'no-session' | 'ambiguous';
 
 type ImplicitSessionResult =
   | { session: Session; via: 'context' | 'lookup' }
-  | { session: null; reason: ImplicitSessionFailure };
+  | { session: null; reason: ImplicitSessionFailure; candidateCount?: number };
+
+/**
+ * The identity behind the current call.
+ *
+ * `sbId` is the canonical `agent_identities.id`. `agentId` is the slug, which is
+ * unique only per (user_id, workspace_id) — two identities named "wren" in
+ * different workspaces collide, so the slug alone is not an ownership predicate.
+ * `agentBound` distinguishes an SB's token from a human user/admin token, which
+ * retains same-user repair authority that agents deliberately do not get.
+ */
+interface CallerIdentity {
+  sbId?: string;
+  agentId?: string;
+  agentBound: boolean;
+}
+
+function resolveCallerIdentity(explicitAgentId?: string): CallerIdentity {
+  const ctx = getRequestContext();
+  const agentId = getEffectiveAgentId(explicitAgentId);
+  // Only trust the context's canonical id when it describes the same agent we
+  // resolved; otherwise the two halves of the identity would disagree.
+  const sbId = agentId && ctx?.agentId === agentId ? ctx.sbId : undefined;
+  return { sbId, agentId, agentBound: !!getPinnedAgentId() };
+}
+
+/**
+ * Decide whether `caller` may act on `session`.
+ *
+ * Same-user is the floor and is never waived — the server repository runs as the
+ * service role, so RLS will not stop a cross-user UUID and this check is the only
+ * thing that does. Agent-bound callers are further confined to their own identity:
+ * naming a peer's session is not an authorization primitive (repairing another
+ * agent's row is a user/admin action, not something an SB grants itself).
+ */
+function isSessionAuthorized(session: Session, userId: string, caller: CallerIdentity): boolean {
+  if (session.userId !== userId) return false;
+  if (!caller.agentBound) return true;
+
+  // Canonical comparison when both sides have one.
+  if (caller.sbId && session.sbId) return session.sbId === caller.sbId;
+
+  // Legacy rows without sb_id fall back to the slug. Weaker, but strictly
+  // better than no identity check, and it still blocks the reported incident.
+  return !!caller.agentId && session.agentId === caller.agentId;
+}
+
+/** Error text for a denied explicit target. Deliberately does not confirm existence. */
+function unauthorizedSessionError(toolName: string): string {
+  return (
+    `Not authorized to target that session: it belongs to another identity. ` +
+    `${toolName} confines agent-bound callers to their own sessions — repairing ` +
+    `another agent's session is a user/admin operation.`
+  );
+}
 
 /**
  * Resolve the session targeted by a call that omitted `sessionId`.
@@ -120,14 +175,18 @@ type ImplicitSessionResult =
  * Aug 5, so it could never win a recency race against a freshly spawned peer.
  *
  * Resolution order:
- *   1. an explicit `studioId` from the caller — agent-scoped, in that studio
+ *   1. an explicit `studioId` from the caller — identity-scoped, in that studio
  *   2. the session the caller is actually running in, per the `x-ink-context`
- *      token, once confirmed to belong to the calling agent
- *   3. an agent-scoped lookup using the studio scope from the request context
+ *      token, once confirmed to belong to the calling identity
+ *   3. an identity-scoped lookup using the studio scope from the request context
  *
- * Returns `{ session: null, reason: 'no-agent-identity' }` when the caller's
- * identity cannot be established. Callers MUST fail closed on that: an unscoped
- * query is what caused the cross-agent write in the first place.
+ * Every step must identify EXACTLY ONE session. Where the first version of this
+ * fix still took the most recent of several, it now reports `ambiguous` — one SB
+ * routinely has a session per worktree, and picking the newest of those is the
+ * same guess that caused the incident, just one level in.
+ *
+ * Returns `no-agent-identity` when the caller cannot be identified. Callers MUST
+ * fail closed on that: an unscoped query is what caused the cross-agent write.
  */
 async function resolveImplicitSession(
   dataComposer: DataComposer,
@@ -135,44 +194,52 @@ async function resolveImplicitSession(
   explicitAgentId: string | undefined,
   explicitStudioScope: string | null | undefined
 ): Promise<ImplicitSessionResult> {
-  const agentId = getEffectiveAgentId(explicitAgentId);
-  if (!agentId) {
+  const caller = resolveCallerIdentity(explicitAgentId);
+  if (!caller.sbId && !caller.agentId) {
     return { session: null, reason: 'no-agent-identity' };
   }
+
+  const pick = (candidates: Session[]): ImplicitSessionResult => {
+    if (candidates.length === 0) return { session: null, reason: 'no-session' };
+    if (candidates.length > 1) {
+      return { session: null, reason: 'ambiguous', candidateCount: candidates.length };
+    }
+    return { session: candidates[0], via: 'lookup' };
+  };
 
   // An explicit studioId means the caller is deliberately targeting a worktree
   // other than (or including) the one they run in, so it outranks the ambient
   // session from the request context.
   if (explicitStudioScope !== undefined) {
-    const session = await dataComposer.repositories.memory.getActiveSession(
-      userId,
-      agentId,
-      explicitStudioScope
+    return pick(
+      await dataComposer.repositories.memory.findOwnedActiveSessions({
+        userId,
+        sbId: caller.sbId,
+        agentId: caller.agentId,
+        studioId: explicitStudioScope,
+      })
     );
-    return session ? { session, via: 'lookup' } : { session: null, reason: 'no-session' };
   }
 
   const ctx = getRequestContext();
 
   // The runtime tells us which session it is executing in. Prefer it over any
-  // recency heuristic — but verify ownership first. When the caller presents an
-  // agent-bound token, the server skips context-session enrichment, so the
-  // sessionId on the token has not been checked against the agent behind it.
+  // lookup — but verify ownership first. When the caller presents an agent-bound
+  // token the server skips context-session enrichment, so the sessionId on the
+  // token is a caller-composed assertion that nothing has checked.
   if (ctx?.sessionId) {
     try {
       const contextSession = await dataComposer.repositories.memory.getSession(ctx.sessionId);
-      if (
-        contextSession &&
-        contextSession.userId === userId &&
-        contextSession.agentId === agentId
-      ) {
+      if (contextSession && isSessionAuthorized(contextSession, userId, caller)) {
         return { session: contextSession, via: 'context' };
       }
       if (contextSession) {
-        logger.warn('Ignoring x-ink-context sessionId that does not belong to the calling agent', {
+        logger.warn('Ignoring x-ink-context sessionId that does not belong to the caller', {
           contextSessionId: ctx.sessionId,
+          sessionSbId: contextSession.sbId,
           sessionAgentId: contextSession.agentId,
-          callingAgentId: agentId,
+          callerSbId: caller.sbId,
+          callerAgentId: caller.agentId,
         });
       }
     } catch (error) {
@@ -183,27 +250,39 @@ async function resolveImplicitSession(
     }
   }
 
-  // No usable context session. Scope the lookup by the studio the caller is in
-  // when we know it, so parallel worktrees do not collide.
-  const contextStudioScope = resolveStudioScope(ctx?.studioId ?? ctx?.studioHint);
-  const session = await dataComposer.repositories.memory.getActiveSession(
-    userId,
-    agentId,
-    contextStudioScope
+  // No usable context session. Scope by the studio the caller is in when we know
+  // it; when we do not, several worktrees can match and we refuse rather than
+  // pick the newest.
+  return pick(
+    await dataComposer.repositories.memory.findOwnedActiveSessions({
+      userId,
+      sbId: caller.sbId,
+      agentId: caller.agentId,
+      studioId: resolveStudioScope(ctx?.studioId ?? ctx?.studioHint),
+    })
   );
-  return session ? { session, via: 'lookup' } : { session: null, reason: 'no-session' };
 }
 
 /** The error returned when an implicit session lookup finds nothing usable. */
-function implicitSessionError(reason: ImplicitSessionFailure, toolName: string): string {
-  if (reason === 'no-agent-identity') {
+function implicitSessionError(
+  result: { reason: ImplicitSessionFailure; candidateCount?: number },
+  toolName: string
+): string {
+  if (result.reason === 'no-agent-identity') {
     return (
       `Cannot determine which session to target: no agent identity on this request. ` +
       `Pass sessionId explicitly (or agentId) — ${toolName} will not fall back to an ` +
       `unscoped lookup, because that can select another agent's session.`
     );
   }
-  return `No active session found for this agent. Start a session first, or pass sessionId explicitly.`;
+  if (result.reason === 'ambiguous') {
+    return (
+      `Ambiguous session: ${result.candidateCount ?? 'several'} active sessions match this ` +
+      `identity across studios, so ${toolName} will not guess which one you mean. ` +
+      `Pass sessionId, or studioId to scope to one worktree.`
+    );
+  }
+  return `No active session found for this identity. Start a session first, or pass sessionId explicitly.`;
 }
 
 /**
@@ -1423,12 +1502,30 @@ export async function handleGetSession(args: unknown, dataComposer: DataComposer
   const rawStudioId = resolveStudioId(params);
   const studioScope = resolveStudioScope(rawStudioId);
 
+  const caller = resolveCallerIdentity(params.agentId);
   let session;
   if (params.sessionId) {
-    session = await dataComposer.repositories.memory.getSession(params.sessionId);
+    // Same gate as the mutating handlers: a bare UUID must not read across
+    // identities, and under the service role nothing else stops it.
+    const target = await dataComposer.repositories.memory.getSession(params.sessionId);
+    if (target && !isSessionAuthorized(target, user.id, caller)) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: JSON.stringify(
+              { success: false, error: unauthorizedSessionError('get_session') },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+    session = target;
   } else if (params.agentId) {
     // Read semantics: an explicit agentId stays a free filter, so an agent can
-    // inspect a peer's session. Identity pinning deliberately does not apply.
+    // see a peer's status. Logs are withheld below — status is not transcript.
     session = await dataComposer.repositories.memory.getActiveSession(
       user.id,
       params.agentId,
@@ -1455,8 +1552,10 @@ export async function handleGetSession(args: unknown, dataComposer: DataComposer
     };
   }
 
+  // Logs are the session's transcript. A peer may see that another SB is
+  // "reviewing"; it may not read what that SB recorded while doing so.
   let logs;
-  if (params.includeLogs) {
+  if (params.includeLogs && isSessionAuthorized(session, user.id, caller)) {
     logs = await dataComposer.repositories.memory.getSessionLogs(session.id);
   }
 
@@ -1719,7 +1818,26 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
   // The implicit path is always scoped to the calling agent and fails closed —
   // see resolveImplicitSession for why an unscoped fallback is unsafe here.
   let sessionId = params.sessionId;
-  if (!sessionId) {
+  if (sessionId) {
+    // An explicit id is a target, not an authorization. updateSession() filters
+    // on the primary key alone and the repository runs as the service role, so
+    // without this check a UUID reaches any session — including another user's.
+    const target = await dataComposer.repositories.memory.getSession(sessionId);
+    if (!target || !isSessionAuthorized(target, user.id, resolveCallerIdentity(params.agentId))) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: JSON.stringify(
+              { success: false, error: unauthorizedSessionError('update_session_state') },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+  } else {
     const resolved = await resolveImplicitSession(
       dataComposer,
       user.id,
@@ -1732,10 +1850,7 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
           {
             type: 'text' as const,
             text: JSON.stringify(
-              {
-                success: false,
-                error: implicitSessionError(resolved.reason, 'update_session_state'),
-              },
+              { success: false, error: implicitSessionError(resolved, 'update_session_state') },
               null,
               2
             ),
@@ -2735,13 +2850,29 @@ export async function handleCompactSession(args: unknown, dataComposer: DataComp
   const minSalience = params.minSalience || 'medium';
   const preserveLogs = params.preserveLogs ?? false;
 
-  // Get session ID. Compaction soft-deletes the session's logs, so the implicit
-  // path must never select a session belonging to another agent.
+  // Get session ID. Compaction reads a session's logs and soft-deletes them, so
+  // both paths must be confined to the caller's own sessions — this is the most
+  // destructive of the three handlers.
   let sessionId = params.sessionId;
   let session;
 
   if (sessionId) {
-    session = await dataComposer.repositories.memory.getSession(sessionId);
+    const target = await dataComposer.repositories.memory.getSession(sessionId);
+    if (!target || !isSessionAuthorized(target, user.id, resolveCallerIdentity(params.agentId))) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: JSON.stringify(
+              { success: false, error: unauthorizedSessionError('compact_session') },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+    session = target;
   } else {
     const resolved = await resolveImplicitSession(
       dataComposer,
@@ -2755,7 +2886,7 @@ export async function handleCompactSession(args: unknown, dataComposer: DataComp
           {
             type: 'text' as const,
             text: JSON.stringify(
-              { success: false, error: implicitSessionError(resolved.reason, 'compact_session') },
+              { success: false, error: implicitSessionError(resolved, 'compact_session') },
               null,
               2
             ),

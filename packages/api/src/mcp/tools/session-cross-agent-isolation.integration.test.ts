@@ -16,7 +16,11 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { getDataComposer, type DataComposer } from '../../data/composer';
 import { ensureEchoIntegrationFixture } from '../../test/integration-fixtures';
-import { handleUpdateSessionState } from './memory-handlers';
+import {
+  handleUpdateSessionState,
+  handleGetSession,
+  handleCompactSession,
+} from './memory-handlers';
 
 describe('Cross-agent session isolation', () => {
   let dataComposer: DataComposer;
@@ -74,7 +78,9 @@ describe('Cross-agent session isolation', () => {
 
   afterAll(async () => {
     if (createdSessionIds.length > 0) {
-      await dataComposer.getClient().from('sessions').delete().in('id', createdSessionIds);
+      const supabase = dataComposer.getClient();
+      await supabase.from('session_logs').delete().in('session_id', createdSessionIds);
+      await supabase.from('sessions').delete().in('id', createdSessionIds);
     }
   });
 
@@ -147,10 +153,11 @@ describe('Cross-agent session isolation', () => {
     expect(foreign?.context).toBe(FOREIGN_CONTEXT);
   });
 
-  it('still honours an explicit sessionId targeting another agent', async () => {
-    // Deliberate cross-agent writes remain possible — that is how the incident
-    // was annotated for the affected agent. Only the implicit path is scoped.
-    const marker = '[marker written deliberately by a peer]';
+  it('lets a user-authority caller repair a peer session by explicit id', async () => {
+    // No pinned agent identity in this process, so this is the user/admin path.
+    // Agent-bound callers are denied the same write — covered in the unit suite,
+    // where the pinned identity can be controlled.
+    const marker = '[marker written by user authority]';
     const result = await handleUpdateSessionState(
       { userId: testUserId, sessionId: foreignSessionId, context: marker },
       dataComposer
@@ -159,5 +166,67 @@ describe('Cross-agent session isolation', () => {
     expect(JSON.parse(result.content[0].text).success).toBe(true);
     const foreign = await readSession(foreignSessionId);
     expect(foreign?.context).toBe(marker);
+  });
+
+  // ── The other two handlers on the shared resolver ──
+  // The resolver change touches all three; compaction is the destructive one.
+
+  it('get_session does not disclose a peer session on an unattributable call', async () => {
+    const result = await handleGetSession({ userId: testUserId }, dataComposer);
+    const parsed = JSON.parse(result.content[0].text);
+
+    // Without an identity it must not answer with whatever started last.
+    expect(parsed.session).toBeNull();
+  });
+
+  it('get_session scopes to the named agent rather than the newest session', async () => {
+    const result = await handleGetSession(
+      { userId: testUserId, agentId: 'iso-test-caller' },
+      dataComposer
+    );
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.session?.id).toBe(ownSessionId);
+    expect(parsed.session?.id).not.toBe(foreignSessionId);
+  });
+
+  it('compact_session refuses an unattributable call, leaving peer logs intact', async () => {
+    const supabase = dataComposer.getClient();
+    await supabase.from('session_logs').insert({
+      session_id: foreignSessionId,
+      content: 'peer log entry that must not be compacted away',
+      salience: 'high',
+    });
+
+    const result = await handleCompactSession({ userId: testUserId }, dataComposer);
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toMatch(/no agent identity/i);
+
+    // The destructive assertion: the peer's logs are still live, not soft-deleted.
+    const { data: logs } = await supabase
+      .from('session_logs')
+      .select('id, compacted_at')
+      .eq('session_id', foreignSessionId);
+    expect(logs?.length).toBe(1);
+    expect(logs?.[0].compacted_at).toBeNull();
+  });
+
+  it('compact_session scoped to an identity does not touch the peer session', async () => {
+    const supabase = dataComposer.getClient();
+    const result = await handleCompactSession(
+      { userId: testUserId, agentId: 'iso-test-caller' },
+      dataComposer
+    );
+
+    // Either it compacts the caller's own (log-less) session or reports nothing
+    // to do — both are fine. What matters is the peer's logs are untouched.
+    expect(JSON.parse(result.content[0].text).sessionId ?? ownSessionId).toBe(ownSessionId);
+
+    const { data: logs } = await supabase
+      .from('session_logs')
+      .select('id, compacted_at')
+      .eq('session_id', foreignSessionId);
+    expect(logs?.[0]?.compacted_at ?? null).toBeNull();
   });
 });
