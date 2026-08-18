@@ -26,6 +26,7 @@ import {
   extractToolData,
   normalizeInput,
   unwrapMcpCall,
+  isTurnSuccessful,
   resolveInkMcpUrl,
   launcherPath,
   bridgePathForContent,
@@ -672,5 +673,69 @@ describe('non-zero exit handling', () => {
     const classified = classifyError({ errorText: result.error ?? '' });
     expect(classified.category).toBe('timeout');
     expect(classified.retryable).toBe(true);
+  });
+});
+
+describe('isTurnSuccessful — a recovered tool error is not a failed turn', () => {
+  // Measured against agy 1.1.13. These two envelopes both carry status:'ERROR'
+  // and mean opposite things; the response body is what separates them.
+  it('treats a recovered tool error as success', () => {
+    // Real capture: the agent hit an MCP validation error, handled it, and
+    // still answered. Failing this turn discarded a reply that was written —
+    // and, when it had already been sent, told the sender it had not arrived.
+    expect(
+      isTurnSuccessful({
+        status: 'ERROR',
+        finalTextResponse: 'RECOVERED\n',
+      })
+    ).toBe(true);
+  });
+
+  it('treats a genuinely broken run as failure', () => {
+    // Real capture from the unauthenticated smoke test: no response at all.
+    expect(isTurnSuccessful({ status: 'ERROR', finalTextResponse: '' })).toBe(false);
+    expect(isTurnSuccessful({ status: 'ERROR' })).toBe(false);
+  });
+
+  it('fails an UNKNOWN non-SUCCESS status even when it carries text', () => {
+    // The property Lumen's blocker protects. A denylist of fatal statuses says
+    // "anything I have not named is recoverable", which extends one measurement
+    // to every status agy might add later — a future fatal status shipping a
+    // diagnostic string would read as a completed turn. We have measured ERROR
+    // and nothing else, so anything else fails by default.
+    expect(
+      isTurnSuccessful({ status: 'SOME_FUTURE_FATAL', finalTextResponse: 'a diagnostic string' })
+    ).toBe(false);
+    expect(isTurnSuccessful({ status: 'WAITING', finalTextResponse: 'partial' })).toBe(false);
+    expect(isTurnSuccessful({ status: 'INVALID', finalTextResponse: 'partial' })).toBe(false);
+  });
+
+  it('keeps timeouts and crashes fatal even when partial text exists', () => {
+    // These mean the run was STOPPED, so any text is partial by definition —
+    // the opposite of a turn that ran to completion despite an error.
+    expect(
+      isTurnSuccessful({
+        status: 'TIMEOUT',
+        finalTextResponse: '[Process timed out after 300s idle]',
+      })
+    ).toBe(false);
+    expect(isTurnSuccessful({ status: 'CRASH', finalTextResponse: 'partway through when' })).toBe(
+      false
+    );
+    expect(isTurnSuccessful({ status: 'CANCELED', finalTextResponse: 'half an answer' })).toBe(
+      false
+    );
+    expect(isTurnSuccessful({ status: 'INTERRUPTED', finalTextResponse: 'half an answer' })).toBe(
+      false
+    );
+  });
+
+  it('treats whitespace as no answer', () => {
+    expect(isTurnSuccessful({ status: 'ERROR', finalTextResponse: '   \n  ' })).toBe(false);
+  });
+
+  it('passes SUCCESS and an absent status through', () => {
+    expect(isTurnSuccessful({ status: 'SUCCESS', finalTextResponse: 'hi' })).toBe(true);
+    expect(isTurnSuccessful({})).toBe(true);
   });
 });

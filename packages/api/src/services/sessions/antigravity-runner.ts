@@ -345,7 +345,20 @@ export class AntigravityRunner implements IRunner {
       // agy reports failure in the result envelope, on stdout, with a real
       // message. Trust that over the exit code — reading the exit code is what
       // let a dead sibling look like a generic timeout for two months.
-      if (result.status && result.status !== 'SUCCESS') {
+      //
+      // But status alone is too blunt. agy stamps status:ERROR for a tool call
+      // that failed even when the agent RECOVERED and completed the turn, so
+      // treating every non-SUCCESS as fatal meant a single malformed tool call
+      // killed a turn the agent had already answered. Measured on 1.1.13:
+      //
+      //   recovered:  {status:'ERROR', response:'RECOVERED\n', error:'...Invalid arguments...'}
+      //   genuinely broken: {status:'ERROR', response:'', error:'authentication failed...'}
+      //
+      // The response body is the discriminator, not the status. GeminiRunner
+      // never read status at all, which is why the same tool errors were
+      // invisible there — this stricter reading arrived with the antigravity
+      // runner and regressed recovery, rather than exposing something new.
+      if (!isTurnSuccessful(result)) {
         return {
           success: false,
           backendSessionId: result.conversationId || backendSessionId || null,
@@ -355,6 +368,17 @@ export class AntigravityRunner implements IRunner {
           finalTextResponse: result.finalTextResponse,
           error: result.error || `Antigravity run ended with status ${result.status}`,
         };
+      }
+
+      if (result.status && result.status !== 'SUCCESS') {
+        // Recovered: the agent produced an answer despite an error along the
+        // way. Surfaced at warn so the tool failure is still visible — it is a
+        // real defect worth fixing — without failing a turn that succeeded.
+        logger.warn('Antigravity turn recovered from an error mid-run', {
+          status: result.status,
+          error: result.error,
+          responseLength: result.finalTextResponse?.length ?? 0,
+        });
       }
 
       return {
@@ -759,6 +783,41 @@ export class AntigravityRunner implements IRunner {
       }, KILL_ESCALATION_MS + KILL_GIVEUP_MS);
     });
   }
+}
+
+/**
+ * Did this turn actually produce an answer?
+ *
+ * agy overloads exactly ONE status, and we have measured it. `ERROR` covers
+ * both a run that could not proceed and a run where a tool call failed but the
+ * agent handled it and finished:
+ *
+ *   recovered        {status:'ERROR', response:'RECOVERED\n', error:'...Invalid arguments...'}
+ *   genuinely broken {status:'ERROR', response:'',            error:'authentication failed...'}
+ *
+ * Only the first is a completed turn. Treating both as fatal is what made a
+ * single malformed tool call discard a reply the agent had already written, and
+ * hand the sender a failure notice for a message that had been delivered.
+ *
+ * This is an ALLOWLIST of the overloaded status, deliberately, not a denylist
+ * of fatal ones. A denylist says "anything I have not named is recoverable",
+ * which extends a single measurement to every status agy might add later — an
+ * unlisted fatal status carrying a diagnostic or partial answer would be read
+ * as a success. The safe default for a status we have never observed is
+ * failure, and the cost of being wrong that way is a retry rather than a
+ * silently swallowed error. (Lumen, PR #507.)
+ */
+const RECOVERABLE_STATUSES = new Set(['ERROR']);
+
+export function isTurnSuccessful(result: { status?: string; finalTextResponse?: string }): boolean {
+  if (!result.status || result.status === 'SUCCESS') return true;
+  // A status we have measured as overloaded succeeds only with a real answer.
+  if (RECOVERABLE_STATUSES.has(result.status)) {
+    return Boolean(result.finalTextResponse && result.finalTextResponse.trim());
+  }
+  // Everything else — TIMEOUT and CRASH from this runner, CANCELED/INTERRUPTED
+  // and anything agy adds later — is a stopped run, so any text is partial.
+  return false;
 }
 
 export function buildAgyArgs(
