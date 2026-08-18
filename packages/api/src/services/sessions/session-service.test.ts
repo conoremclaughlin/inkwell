@@ -6,8 +6,10 @@
  */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { makeFakeSupabase } from './fake-supabase.js';
 import {
   SessionService,
+  resolveRuntimeModel,
   parseRuntimeConfig,
   readImageAttachmentsAsBase64,
   sanitizeHeaderText,
@@ -205,6 +207,122 @@ describe('SessionService', () => {
       undefined,
       mockInkRunner
     );
+  });
+
+  describe('the identity pin actually reaches the runner', () => {
+    // resolveRuntimeModel's own tests prove the FUNCTION is right; they do not
+    // prove `parsed.model` is wired to it. Lumen deleted the assignment at the
+    // call site and the focused suite stayed 122/122 green — so this closes the
+    // last hop: identity row → parseRuntimeConfig → resolveRuntimeModel →
+    // runnerConfig.model → the spawned CLI.
+    const serviceWithIdentity = (
+      metadata: Record<string, unknown>,
+      cfg: Record<string, unknown> = {}
+    ) => {
+      const supabase = makeFakeSupabase({
+        agent_identities: [{ id: 'sb-1', user_id: 'user-456', sandbox_bypass: false, metadata }],
+        studios: [],
+      });
+      return new SessionService(
+        mockRepository,
+        mockContextBuilder,
+        mockClaudeRunner,
+        mockActivityStream,
+        {
+          defaultWorkingDirectory: '/test',
+          mcpConfigPath: '/test/.mcp.json',
+          compactionThreshold: 150000,
+          ...cfg,
+        },
+        mockCodexRunner,
+        supabase,
+        undefined,
+        mockInkRunner
+      );
+    };
+
+    const modelPassedToRunner = () => {
+      const call = vi.mocked(mockClaudeRunner.run).mock.calls[0] as unknown as [
+        string,
+        { config: { model?: string } },
+      ];
+      return call[1].config.model;
+    };
+
+    it('passes a pinned model through to the runner config', async () => {
+      const service = serviceWithIdentity(
+        { runtimeConfig: { model: 'claude-opus-5' } },
+        { defaultModel: 'claude-fable-5' }
+      );
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(
+        createMockSession({ sbId: 'sb-1' } as never)
+      );
+
+      await service.handleMessage(createMockRequest());
+
+      expect(mockClaudeRunner.run).toHaveBeenCalled();
+      expect(modelPassedToRunner()).toBe('claude-opus-5');
+    });
+
+    it('passes the fleet default when the identity pins nothing', async () => {
+      const service = serviceWithIdentity(
+        { runtimeConfig: {} },
+        { defaultModel: 'claude-fable-5' }
+      );
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(
+        createMockSession({ sbId: 'sb-1' } as never)
+      );
+
+      await service.handleMessage(createMockRequest());
+
+      expect(modelPassedToRunner()).toBe('claude-fable-5');
+    });
+  });
+
+  describe('resolveRuntimeModel — pin composes with the backend ladder', () => {
+    // parseRuntimeConfig's tests cover the PARSER and would stay green with the
+    // pin never applied: verified by deleting the assignment and watching all
+    // 117 tests pass. What needs pinning is the composition.
+    const config = {
+      defaultModel: 'claude-fable-5',
+      defaultCodexModel: 'gpt-5-codex',
+      defaultGeminiModel: 'gemini-3-pro-preview',
+      defaultAntigravityModel: 'gemini-3.1-pro-high',
+    };
+
+    it('falls back to each backend default when nothing is pinned', () => {
+      // The guard against the pin clobbering the ladder. antigravity in
+      // particular did not exist when the pin was written.
+      expect(resolveRuntimeModel({ modelKey: 'antigravity', config })).toBe('gemini-3.1-pro-high');
+      expect(resolveRuntimeModel({ modelKey: 'codex-cli', config })).toBe('gpt-5-codex');
+      expect(resolveRuntimeModel({ modelKey: 'gemini', config })).toBe('gemini-3-pro-preview');
+      expect(resolveRuntimeModel({ modelKey: 'claude-code', config })).toBe('claude-fable-5');
+    });
+
+    it('lets a pin beat the fleet default', () => {
+      expect(resolveRuntimeModel({ modelKey: 'claude-code', config, pin: 'claude-opus-5' })).toBe(
+        'claude-opus-5'
+      );
+    });
+
+    it('lets a pin beat the antigravity default too', () => {
+      expect(
+        resolveRuntimeModel({ modelKey: 'antigravity', config, pin: 'gemini-3.7-flash-high' })
+      ).toBe('gemini-3.7-flash-high');
+    });
+
+    it('ignores an empty pin rather than blanking the model', () => {
+      // parseRuntimeConfig already drops empty strings, but a caller that
+      // bypassed it must not be able to erase the backend default.
+      expect(resolveRuntimeModel({ modelKey: 'antigravity', config, pin: '' })).toBe(
+        'gemini-3.1-pro-high'
+      );
+    });
+
+    it('returns undefined when neither a pin nor a default exists', () => {
+      // The runner then omits --model and the CLI picks its own default.
+      expect(resolveRuntimeModel({ modelKey: 'antigravity', config: {} })).toBe(undefined);
+    });
   });
 
   describe('MCP endpoint propagation', () => {
@@ -3140,6 +3258,30 @@ describe('parseRuntimeConfig (per-SB dashboard settings → spawn flags)', () =>
       maxTurns: 8,
     });
     expect(parseRuntimeConfig({ runtimeConfig: { toolRouting: 'local' } })).toEqual({
+      toolRouting: 'local',
+    });
+  });
+
+  it('passes through a per-SB model pin, trimmed', () => {
+    // The pin beats the global env default at spawn time — e.g. Benson on
+    // claude-opus-5 while the fleet default is claude-fable-5.
+    expect(parseRuntimeConfig({ runtimeConfig: { model: 'claude-opus-5' } })).toEqual({
+      toolRouting: 'local',
+      model: 'claude-opus-5',
+    });
+    expect(parseRuntimeConfig({ runtimeConfig: { model: '  claude-opus-5  ' } })).toEqual({
+      toolRouting: 'local',
+      model: 'claude-opus-5',
+    });
+  });
+
+  it('fails closed on empty or non-string model values', () => {
+    expect(parseRuntimeConfig({ runtimeConfig: { model: '' } })).toEqual({ toolRouting: 'local' });
+    expect(parseRuntimeConfig({ runtimeConfig: { model: '   ' } })).toEqual({
+      toolRouting: 'local',
+    });
+    expect(parseRuntimeConfig({ runtimeConfig: { model: 42 } })).toEqual({ toolRouting: 'local' });
+    expect(parseRuntimeConfig({ runtimeConfig: { model: null } })).toEqual({
       toolRouting: 'local',
     });
   });

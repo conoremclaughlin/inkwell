@@ -160,18 +160,63 @@ function routePatternSpecificity(pattern: string): number {
  * malformed input yields toolRouting 'local' (ink-owned, provider withheld)
  * and no maxTurns override (the runner then applies its own default+clamp).
  */
+/**
+ * Which model a spawn should use: the backend's fleet default, unless the SB
+ * pins one.
+ *
+ * Extracted because it is a policy decision, and because it was previously
+ * inline in a 200-line method where the only coverage was of the PARSER. The
+ * pin assignment could be deleted outright and the whole suite stayed green —
+ * so the composition, not the parsing, is what needs pinning down: the pin
+ * layers on top of the ladder and must not erase a backend branch (notably
+ * antigravity, which did not exist when the pin was written).
+ */
+export function resolveRuntimeModel(options: {
+  modelKey: string;
+  config: {
+    defaultModel?: string;
+    defaultCodexModel?: string;
+    defaultGeminiModel?: string;
+    defaultAntigravityModel?: string;
+  };
+  /** Per-SB override from agent_identities.metadata.runtimeConfig.model. */
+  pin?: string;
+}): string | undefined {
+  const { modelKey, config, pin } = options;
+  const fleetDefault =
+    modelKey === 'codex-cli'
+      ? config.defaultCodexModel
+      : modelKey === 'gemini'
+        ? config.defaultGeminiModel
+        : modelKey === 'antigravity'
+          ? config.defaultAntigravityModel
+          : config.defaultModel;
+
+  return pin || fleetDefault;
+}
+
 export function parseRuntimeConfig(metadata: unknown): {
   maxTurns?: number;
   toolRouting: 'backend' | 'local';
+  model?: string;
 } {
   const meta = (metadata ?? {}) as Record<string, unknown>;
   const rc = (meta.runtimeConfig ?? {}) as Record<string, unknown>;
-  const out: { maxTurns?: number; toolRouting: 'backend' | 'local' } = { toolRouting: 'local' };
+  const out: { maxTurns?: number; toolRouting: 'backend' | 'local'; model?: string } = {
+    toolRouting: 'local',
+  };
   if (typeof rc.maxTurns === 'number' && Number.isFinite(rc.maxTurns)) {
     out.maxTurns = rc.maxTurns;
   }
   if (rc.toolRouting === 'local' || rc.toolRouting === 'backend') {
     out.toolRouting = rc.toolRouting;
+  }
+  // Per-SB model pin (e.g. Benson on claude-opus-5 while the fleet default is
+  // claude-fable-5). Must be an exact model id valid for the SB's provider —
+  // operator-set, not validated here; a bad id surfaces as the provider's own
+  // model-not-found error on the next spawn.
+  if (typeof rc.model === 'string' && rc.model.trim()) {
+    out.model = rc.model.trim();
   }
   return out;
 }
@@ -880,14 +925,7 @@ export class SessionService implements ISessionService {
       resolvedBackend === 'ink'
         ? this.normalizeBackend(injectedContext.agent.provider)
         : resolvedBackend;
-    const runtimeModel =
-      modelKey === 'codex-cli'
-        ? this.config.defaultCodexModel
-        : modelKey === 'gemini'
-          ? this.config.defaultGeminiModel
-          : modelKey === 'antigravity'
-            ? this.config.defaultAntigravityModel
-            : this.config.defaultModel;
+    let runtimeModel = resolveRuntimeModel({ modelKey, config: this.config });
 
     // Resolve sandbox_bypass: studio override > SB default > false
     let sandboxBypass = false;
@@ -913,6 +951,10 @@ export class SessionService implements ISessionService {
       const parsed = parseRuntimeConfig(identity?.metadata);
       runtimeMaxTurns = parsed.maxTurns;
       runtimeToolRouting = parsed.toolRouting;
+      // Per-SB model pin beats the global env default (DEFAULT_CLAUDE_MODEL
+      // et al.) — lets one SB run a different model than the fleet without a
+      // server restart (dashboard/DB-tunable, like maxTurns).
+      runtimeModel = resolveRuntimeModel({ modelKey, config: this.config, pin: parsed.model });
 
       // Studio-level override (null = inherit from SB)
       if (session.studioId) {
@@ -2071,16 +2113,18 @@ This session will continue with a fresh context after compaction. Your identity,
       );
 
       const runtimeBackend = this.resolveRuntimeBackend(session.backend, context.agent.backend);
+      // Compaction deliberately uses the FLEET default model, not the SB's
+      // per-identity pin: it is a summarization pass, not the session's
+      // conversational identity, and skipping the identity fetch keeps this
+      // rare path cheap. Revisit if per-SB pins ever diverge across providers.
       const compactionModelKey =
         runtimeBackend === 'ink' ? this.normalizeBackend(context.agent.provider) : runtimeBackend;
-      const runtimeModel =
-        compactionModelKey === 'codex-cli'
-          ? this.config.defaultCodexModel
-          : compactionModelKey === 'gemini'
-            ? this.config.defaultGeminiModel
-            : compactionModelKey === 'antigravity'
-              ? this.config.defaultAntigravityModel
-              : this.config.defaultModel;
+      // No pin here, deliberately: compaction is a summarization pass, not the
+      // session's conversational identity.
+      const runtimeModel = resolveRuntimeModel({
+        modelKey: compactionModelKey,
+        config: this.config,
+      });
 
       const runnerConfig: ClaudeRunnerConfig = {
         workingDirectory: compactionWorkingDirectory,
