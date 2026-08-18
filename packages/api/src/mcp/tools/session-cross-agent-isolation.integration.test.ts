@@ -95,17 +95,23 @@ describe('Cross-agent session isolation', () => {
     return data;
   }
 
-  it('confirms the peer session is the most recent open session for this user', async () => {
-    // Guards the premise of the whole suite: if this stops holding, the tests
-    // below would pass for the wrong reason.
+  it('confirms the peer session is the newer of the two seeded sessions', async () => {
+    // Guards the premise of the whole suite: the peer must out-rank the caller's
+    // own session on recency, or the tests below would pass for the wrong reason.
+    //
+    // Scoped to the rows this fixture created, deliberately. The first version
+    // asked for "the newest open session for this user" across the whole table
+    // and broke in CI: these rows are seeded with dates in the past, so any
+    // session a sibling suite creates for the shared fixture user is newer and
+    // wins. That is the same unscoped-recency defect this PR fixes in
+    // production — a query that answers "the newest row" when the question was
+    // "the newest of mine". It passed locally only because the file ran alone.
     const { data } = await dataComposer
       .getClient()
       .from('sessions')
       .select('id')
-      .eq('user_id', testUserId)
+      .in('id', createdSessionIds)
       .is('ended_at', null)
-      .neq('lifecycle', 'failed')
-      .is('contact_id', null)
       .order('started_at', { ascending: false })
       .limit(1)
       .single();
