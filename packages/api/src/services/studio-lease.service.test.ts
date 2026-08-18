@@ -1233,6 +1233,87 @@ describe('sweep pendingRelease backstop', () => {
     expect(tables.studios[0].lease).toBeNull();
   });
 
+  /**
+   * Regression: pr:498 / pr:499. Reproduces the live rows exactly — a
+   * long-lived CLI session, attached and polling seconds ago, NOT mid-turn
+   * (cli_turn_at null), never terminal (ended_at null), holding a stale lease
+   * that asked to release. Before the fix the sweep read the fresh
+   * cli_poll_at as occupancy, refused the release, fell through to the
+   * stale-but-live branch and RENEWED — which is what pinned pr:498 for 2.84
+   * days and bumped pr:499's heartbeat 46 minutes past its release request.
+   */
+  it('completes a deferred release for an idle-but-attached holder (pr:498/pr:499)', async () => {
+    resetActiveRuns();
+    const lease: StudioLease = {
+      ...freshLease({ sessionId: 'sess-idle', threadKey: 'pr:499' }),
+      // Stale: no renewal since well past the staleness threshold.
+      heartbeatAt: new Date(Date.now() - LEASE_STALE_MS - 60_000).toISOString(),
+      pendingRelease: {
+        reason: 'thread-closed',
+        requestedAt: new Date(Date.now() - 46 * 60 * 1000).toISOString(),
+      },
+    };
+    const tables: Record<string, Row[]> = {
+      studios: [
+        { id: 's-idle', user_id: 'u', lease: lease as unknown as Row, worktree_path: null },
+      ],
+      studio_lease_events: [],
+      inbox_threads: [],
+      agent_identities: [],
+      sessions: [
+        {
+          id: 'sess-idle',
+          user_id: 'u',
+          ended_at: null,
+          status: 'active',
+          cli_attached: true,
+          cli_poll_at: new Date().toISOString(), // terminal open, polling now
+          cli_turn_at: null, // but NOT mid-turn
+        },
+      ],
+    };
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+    const stats = await service.sweepExpiredLeases();
+
+    expect(stats.released).toBe(1);
+    expect(stats.renewed).toBe(0);
+    expect(tables.studios[0].lease).toBeNull();
+  });
+
+  it('still defers a pendingRelease while the holder is MID-TURN (cli_turn_at open)', async () => {
+    resetActiveRuns();
+    const lease: StudioLease = {
+      ...freshLease({ sessionId: 'sess-turn', threadKey: 'pr:12' }),
+      heartbeatAt: new Date(Date.now() - LEASE_STALE_MS - 60_000).toISOString(),
+      pendingRelease: { reason: 'thread-closed', requestedAt: new Date().toISOString() },
+    };
+    const tables: Record<string, Row[]> = {
+      studios: [
+        { id: 's-turn', user_id: 'u', lease: lease as unknown as Row, worktree_path: null },
+      ],
+      studio_lease_events: [],
+      inbox_threads: [],
+      agent_identities: [],
+      sessions: [
+        {
+          id: 'sess-turn',
+          user_id: 'u',
+          ended_at: null,
+          cli_attached: true,
+          cli_poll_at: new Date().toISOString(),
+          // close_thread was called from INSIDE this turn — the process is
+          // still cd'd into the worktree. Release must wait for the boundary.
+          cli_turn_at: new Date().toISOString(),
+        },
+      ],
+    };
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+    const stats = await service.sweepExpiredLeases();
+
+    expect(stats.released).toBe(0);
+    expect(tables.studios[0].lease).not.toBeNull();
+  });
+
   it('leaves a pendingRelease lease alone while the holder is still live', async () => {
     resetActiveRuns();
     registerActiveRun({

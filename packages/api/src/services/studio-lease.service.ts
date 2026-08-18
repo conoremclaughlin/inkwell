@@ -14,6 +14,16 @@
  *              then performed by the run/stop boundary or the sweep
  *   - expire:  heartbeatAt stale beyond LEASE_STALE_MS → claimed, rescued, released
  *
+ * TWO PROOFS, NOT ONE — they are not interchangeable:
+ *   - PRESENCE (isSessionLive: in-process run, fresh cli_poll_at, open turn)
+ *     gates taking a lease AWAY from a holder that never asked to give it up:
+ *     reclaim, adoption, teardown.
+ *   - MID-TURN (isSessionMidTurn: in-process run, open cli_turn_at) gates
+ *     completing a release the holder ITSELF requested.
+ *   Presence is satisfied indefinitely by an idle attached terminal, so using
+ *   it to gate a requested release pins the studio for as long as someone
+ *   leaves a shell open. That is what pinned pr:498 for 2.84 days.
+ *
  * Safety invariants (PR #492 review rounds 1–3, Lumen):
  *   - Every read and CAS is scoped to the owning user.
  *   - Reclaim and expiry FENCE FIRST, RESCUE SECOND, guarded on the exact
@@ -326,6 +336,46 @@ export class StudioLeaseService {
     if (await this.isSessionLive(lease.sessionId, userId)) return false;
     if (isLeaseStale(lease)) return true;
     return this.isSessionTerminal(lease.sessionId, userId);
+  }
+
+  /**
+   * Is the session's process INSIDE a turn right now? A strictly narrower
+   * question than isSessionLive, and the only one a recorded pendingRelease
+   * may wait on.
+   *
+   * isSessionLive answers "is a process attached to this session", which it
+   * derives partly from `cli_poll_at` — the channel plugin's inbox poll. That
+   * is a PRESENCE signal: an idle CLI sitting at a prompt keeps stamping it
+   * for as long as the terminal stays open. Presence is the right proof for
+   * taking a lease AWAY from a holder that never asked to give it up
+   * (reclaim, teardown) — it is the wrong proof for completing a release the
+   * holder itself requested.
+   *
+   * Using presence there deadlocked: close_thread defers to the holder's next
+   * boundary, the holder's reason for closing is that its work is done, so no
+   * next boundary arrives — and the sweep, the designed backstop, refused to
+   * act because the terminal was still polling. Studio 6783f054 held pr:498
+   * for 2.84 days after a release requested 68 seconds post-merge; pr:499
+   * reproduced it, with the sweep RENEWING a lease that had asked to die 46
+   * minutes earlier. Both holders had `cli_turn_at` NULL the whole time.
+   *
+   * FAILS CLOSED: a read error reports MID-TURN — "could not verify the turn
+   * has ended" must never authorize pulling a worktree out from under it.
+   */
+  async isSessionMidTurn(sessionId: string, userId?: string): Promise<boolean> {
+    if (hasActiveRun(sessionId)) return true;
+    let query = this.supabase.from('sessions').select('cli_turn_at').eq('id', sessionId);
+    if (userId) query = query.eq('user_id', userId);
+    const { data, error } = await query.maybeSingle();
+    if (error) {
+      logger.warn('[StudioLease] Turn read failed — treating session as MID-TURN (fail closed)', {
+        sessionId,
+        error: error.message,
+      });
+      return true;
+    }
+    if (!data) return false; // session row genuinely absent
+    return Boolean(data.cli_turn_at);
   }
 
   /**
@@ -1201,11 +1251,14 @@ export class StudioLeaseService {
       const lease = parseStudioLease(row.lease);
       if (!lease) continue;
 
-      // Deferred-release backstop: the boundary should have completed this,
-      // but a killed CLI or crashed server never fires its boundary. Same
-      // release-now proof as everywhere else.
+      // Deferred-release backstop. This is not a rare crash path: the holder
+      // asks to release because its work is DONE, so its next turn boundary
+      // usually never comes and the sweep is the normal completion path, not
+      // the exception. It therefore waits only on the narrow proof — the
+      // holder is not mid-turn — never on the presence proof, which an idle
+      // attached terminal satisfies indefinitely.
       if (lease.pendingRelease && !lease.quarantined) {
-        if (await this.canReleaseNow(lease, row.user_id)) {
+        if (!(await this.isSessionMidTurn(lease.sessionId, row.user_id))) {
           const ok = await this.releaseStudio(row.id, row.user_id, lease, row.worktree_path, {
             reason: lease.pendingRelease.reason,
           });
