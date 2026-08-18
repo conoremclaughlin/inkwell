@@ -2,6 +2,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import type { DataComposer } from '../../data/composer';
 import { logger } from '../../utils/logger';
+import { strictifyInputSchema, strictToolArgsEnabled } from './strict-input-schema';
 
 // Import all tool handlers
 import { handleSaveLink, handleSearchLinks, handleTagLink } from './link-handlers';
@@ -388,6 +389,16 @@ export function registerAllTools(
 
   const originalRegisterTool = server.registerTool.bind(server);
   (server as any).registerTool = (name: string, ...rest: any[]) => {
+    // Reject unknown args instead of silently stripping them. Applied here so
+    // all ~163 tools inherit it, rather than per-schema — see
+    // ./strict-input-schema for why the default rather than the schemas is
+    // treated as the defect.
+    if (strictToolArgsEnabled()) {
+      const config = rest[0];
+      if (config && typeof config === 'object' && 'inputSchema' in config) {
+        config.inputSchema = strictifyInputSchema(config.inputSchema);
+      }
+    }
     const handler = rest[rest.length - 1];
     if (typeof handler === 'function') {
       rest[rest.length - 1] = async (...handlerArgs: any[]) => {
