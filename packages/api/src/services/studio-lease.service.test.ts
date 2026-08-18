@@ -1341,6 +1341,82 @@ describe('sweep pendingRelease backstop', () => {
   });
 });
 
+/**
+ * Regression: session 4896f302 was observed holding two studios at once —
+ * one per thread it had opened. Nothing enforces one-studio-per-session
+ * (jsonb carries no unique constraint), and every release path used
+ * `.limit(1).maybeSingle()`, so it acted on ONE row in unspecified order and
+ * stranded the other: leased, no live holder, no pendingRelease, invisible to
+ * the sweep. These prove the whole set is handled.
+ */
+describe('a session holding multiple studios (leak)', () => {
+  afterEach(() => resetActiveRuns());
+
+  function twoHeld(leaseOverrides: Partial<StudioLease> = {}): Record<string, Row[]> {
+    const mk = (threadKey: string) =>
+      ({
+        ...freshLease({ sessionId: 'sess-multi', threadKey }),
+        ...leaseOverrides,
+      }) as unknown as Row;
+    return {
+      studios: [
+        { id: 's-one', user_id: 'u', status: 'active', lease: mk('pr:504'), worktree_path: null },
+        {
+          id: 's-two',
+          user_id: 'u',
+          status: 'active',
+          lease: mk('pcp:issue:x'),
+          worktree_path: null,
+        },
+      ],
+      studio_lease_events: [],
+      inbox_threads: [],
+      agent_identities: [],
+      sessions: [{ id: 'sess-multi', user_id: 'u', ended_at: new Date().toISOString() }],
+    };
+  }
+
+  it('releaseBySession clears EVERY studio the session holds, not an arbitrary one', async () => {
+    resetActiveRuns();
+    const tables = twoHeld();
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    expect(await service.releaseBySession('sess-multi', { userId: 'u' })).toBe(true);
+    expect(tables.studios[0].lease).toBeNull();
+    expect(tables.studios[1].lease).toBeNull();
+  });
+
+  it('releaseAtBoundary completes a pendingRelease on every held studio', async () => {
+    resetActiveRuns();
+    const tables = twoHeld({
+      pendingRelease: { reason: 'thread-closed', requestedAt: new Date().toISOString() },
+    });
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    expect(
+      await service.releaseAtBoundary('sess-multi', {
+        userId: 'u',
+        sessionTerminal: false,
+        reason: 'cli-turn-stopped',
+      })
+    ).toBe(true);
+    expect(tables.studios[0].lease).toBeNull();
+    expect(tables.studios[1].lease).toBeNull();
+  });
+
+  it('renewBySession heartbeats every held studio, so neither goes stale unwatched', async () => {
+    resetActiveRuns();
+    const stale = new Date(Date.now() - LEASE_STALE_MS - 60_000).toISOString();
+    const tables = twoHeld({ heartbeatAt: stale });
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    expect(await service.renewBySession('sess-multi', 'u')).toBe(true);
+    for (const row of tables.studios) {
+      expect(isLeaseStale(row.lease as unknown as StudioLease)).toBe(false);
+    }
+  });
+});
+
 describe('claimForTeardown ownership (round 3)', () => {
   function claimTables(lease: StudioLease | null): Record<string, Row[]> {
     return {

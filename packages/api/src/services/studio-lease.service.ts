@@ -918,55 +918,99 @@ export class StudioLeaseService {
   }
 
   /**
-   * Bump heartbeatAt for whichever studio this session holds. Called from the
-   * CLI lifecycle hook route on every prompt, and by the sweep for sessions
-   * with a live process. Never renews a quarantine record — quarantine heals
-   * through rescue, not heartbeats.
+   * Every studio this session currently holds a non-quarantine lease on.
+   *
+   * "One session holds at most one studio" is an invariant the service
+   * assumes but nothing enforces — jsonb carries no unique constraint, so the
+   * database cannot object. It is violated in practice: an agent that opens a
+   * second thread from inside a live session acquires a second studio, and
+   * session 4896f302 was observed holding two at once. The previous
+   * `.limit(1).maybeSingle()` then made every release path pick ONE of them in
+   * unspecified order and silently strand the rest — a leased worktree with no
+   * live holder and no pending release, invisible to the sweep.
+   *
+   * Until the storage rework can express this as UNIQUE (session_id), the
+   * lifecycle operates on the whole set.
    */
-  async renewBySession(sessionId: string, userId?: string): Promise<boolean> {
+  private async studiosHeldBy(
+    sessionId: string,
+    userId?: string
+  ): Promise<
+    Array<{ id: string; user_id: string; lease: StudioLease; worktree_path: string | null }>
+  > {
     let query = this.supabase
       .from('studios')
-      .select('id, user_id, lease')
+      .select('id, user_id, lease, worktree_path')
       .eq('lease->>sessionId', sessionId);
     if (userId) query = query.eq('user_id', userId);
-    const { data } = await query.limit(1).maybeSingle();
-    const lease = parseStudioLease(data?.lease);
-    if (!data || !lease || lease.quarantined) return false;
+    const { data } = await query;
+    if (!data?.length) return [];
 
-    const renewed: StudioLease = { ...lease, heartbeatAt: new Date().toISOString() };
-    return this.casLease(data.id, data.user_id, lease, renewed);
+    const held = [];
+    for (const row of data) {
+      const lease = parseStudioLease(row.lease);
+      if (!lease || lease.quarantined) continue;
+      held.push({
+        id: row.id,
+        user_id: row.user_id,
+        lease,
+        worktree_path: row.worktree_path ?? null,
+      });
+    }
+    if (held.length > 1) {
+      logger.warn('[StudioLease] Session holds multiple studios — acting on all of them', {
+        sessionId,
+        studioIds: held.map((h) => h.id),
+      });
+    }
+    return held;
   }
 
   /**
-   * Release whatever this session holds — but only once the session's process
-   * has actually left the worktree (no in-process run, no freshly-polling
-   * attached CLI). Deferred releases are picked up at the corresponding run
-   * boundary: SessionService's finalized branch for server runs, the
-   * lifecycle stop hook for CLI turns, the sweep as backstop.
+   * Bump heartbeatAt on every studio this session holds. Called from the CLI
+   * lifecycle hook route on every prompt, and by the sweep for sessions with
+   * a live process. Never renews a quarantine record — quarantine heals
+   * through rescue, not heartbeats. Returns true if any lease was renewed.
+   */
+  async renewBySession(sessionId: string, userId?: string): Promise<boolean> {
+    let any = false;
+    for (const row of await this.studiosHeldBy(sessionId, userId)) {
+      const renewed: StudioLease = { ...row.lease, heartbeatAt: new Date().toISOString() };
+      if (await this.casLease(row.id, row.user_id, row.lease, renewed)) any = true;
+    }
+    return any;
+  }
+
+  /**
+   * Release what this session holds — but only once its process has actually
+   * left the worktree (no in-process run, no freshly-polling attached CLI).
+   * Deferred releases are picked up at the corresponding run boundary:
+   * SessionService's finalized branch for server runs, the lifecycle stop hook
+   * for CLI turns, the sweep as backstop.
    */
   async releaseUnlessRunning(
     sessionId: string,
     opts: { userId?: string; reason?: string } = {}
   ): Promise<boolean> {
-    let query = this.supabase
-      .from('studios')
-      .select('id, user_id, lease, worktree_path')
-      .eq('lease->>sessionId', sessionId);
-    if (opts.userId) query = query.eq('user_id', opts.userId);
-    const { data } = await query.limit(1).maybeSingle();
-    const lease = parseStudioLease(data?.lease);
-    if (!data || !lease || lease.quarantined) return false;
-
-    if (!(await this.canReleaseNow(lease, opts.userId ?? data.user_id))) {
-      logger.info('[StudioLease] Release deferred — no safe terminal/stale proof yet', {
-        sessionId,
-        reason: opts.reason,
-      });
-      return false;
+    let any = false;
+    for (const row of await this.studiosHeldBy(sessionId, opts.userId)) {
+      if (!(await this.canReleaseNow(row.lease, opts.userId ?? row.user_id))) {
+        logger.info('[StudioLease] Release deferred — no safe terminal/stale proof yet', {
+          sessionId,
+          studioId: row.id,
+          reason: opts.reason,
+        });
+        continue;
+      }
+      if (
+        await this.releaseStudio(row.id, row.user_id, row.lease, row.worktree_path, {
+          reason: opts.reason ?? 'session-end',
+        })
+      ) {
+        any = true;
+      }
     }
-    return this.releaseStudio(data.id, data.user_id, lease, data.worktree_path, {
-      reason: opts.reason ?? 'session-end',
-    });
+    return any;
   }
 
   /**
@@ -979,24 +1023,22 @@ export class StudioLeaseService {
     sessionId: string,
     opts: { userId?: string; sessionTerminal: boolean; reason: string }
   ): Promise<boolean> {
-    let query = this.supabase
-      .from('studios')
-      .select('id, user_id, lease, worktree_path')
-      .eq('lease->>sessionId', sessionId);
-    if (opts.userId) query = query.eq('user_id', opts.userId);
-    const { data } = await query.limit(1).maybeSingle();
-    const lease = parseStudioLease(data?.lease);
-    if (!data || !lease || lease.quarantined) return false;
-
-    if (!opts.sessionTerminal && !lease.pendingRelease) return false;
-
-    return this.releaseStudio(data.id, data.user_id, lease, data.worktree_path, {
-      reason: lease.pendingRelease?.reason ?? opts.reason,
-    });
+    let any = false;
+    for (const row of await this.studiosHeldBy(sessionId, opts.userId)) {
+      if (!opts.sessionTerminal && !row.lease.pendingRelease) continue;
+      if (
+        await this.releaseStudio(row.id, row.user_id, row.lease, row.worktree_path, {
+          reason: row.lease.pendingRelease?.reason ?? opts.reason,
+        })
+      ) {
+        any = true;
+      }
+    }
+    return any;
   }
 
   /**
-   * Release whatever this session holds, immediately. Captures final worktree
+   * Release what this session holds, immediately. Captures final worktree
    * state (branch/commit/dirty) and stamps it into the owning thread's
    * metadata so "what did they leave behind" is answerable after the fact.
    * Quarantine records are not releasable this way — they heal through rescue.
@@ -1005,18 +1047,17 @@ export class StudioLeaseService {
     sessionId: string,
     opts: { userId?: string; reason?: string } = {}
   ): Promise<boolean> {
-    let query = this.supabase
-      .from('studios')
-      .select('id, user_id, lease, worktree_path')
-      .eq('lease->>sessionId', sessionId);
-    if (opts.userId) query = query.eq('user_id', opts.userId);
-    const { data } = await query.limit(1).maybeSingle();
-    const lease = parseStudioLease(data?.lease);
-    if (!data || !lease || lease.quarantined) return false;
-
-    return this.releaseStudio(data.id, data.user_id, lease, data.worktree_path, {
-      reason: opts.reason ?? 'session-end',
-    });
+    let any = false;
+    for (const row of await this.studiosHeldBy(sessionId, opts.userId)) {
+      if (
+        await this.releaseStudio(row.id, row.user_id, row.lease, row.worktree_path, {
+          reason: opts.reason ?? 'session-end',
+        })
+      ) {
+        any = true;
+      }
+    }
+    return any;
   }
 
   /**
