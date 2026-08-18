@@ -8,14 +8,19 @@
 
 import { z } from 'zod';
 import path from 'path';
-import { execSync } from 'child_process';
+import { execFile, execSync } from 'child_process';
+import { promisify } from 'util';
 import { existsSync } from 'fs';
+import { access } from 'fs/promises';
+
+const execFileAsync = promisify(execFile);
 import type { DataComposer } from '../../data/composer';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
 import { logger } from '../../utils/logger';
 import { bootstrapStudio } from '@inklabs/shared';
 import { ensureStudioSettings } from '../../services/studio-settings';
 import { resolveMainStudio } from '../../services/sessions/session-service';
+import { StudioLeaseService } from '../../services/studio-lease.service';
 
 // ============== Helpers ==============
 
@@ -387,6 +392,12 @@ export async function handleListStudios(args: unknown, dataComposer: DataCompose
       roleTemplate: w.roleTemplate,
       defaultProjectId: w.defaultProjectId,
       hasLinkedSession: !!w.sessionId,
+      // Occupancy: lease is the authoritative "is someone working here" —
+      // status stays 'active' regardless of use and must not be read as such.
+      lease: w.lease,
+      ephemeral: w.ephemeral,
+      parentStudioId: w.parentStudioId,
+      expiresAt: w.expiresAt,
       createdAt: w.createdAt,
     })),
   });
@@ -431,6 +442,10 @@ export async function handleGetStudio(args: unknown, dataComposer: DataComposer)
       defaultProjectId: studio.defaultProjectId,
       status: studio.status,
       sessionId: studio.sessionId,
+      lease: studio.lease,
+      ephemeral: studio.ephemeral,
+      parentStudioId: studio.parentStudioId,
+      expiresAt: studio.expiresAt,
       metadata: studio.metadata,
       createdAt: studio.createdAt,
       updatedAt: studio.updatedAt,
@@ -530,14 +545,15 @@ export async function handleUpdateStudio(args: unknown, dataComposer: DataCompos
 
 export async function handleCloseStudio(args: unknown, dataComposer: DataComposer) {
   const parsed = closeStudioSchema.parse(args);
-  await resolveUserOrThrow(parsed, dataComposer);
+  const { user: closingUser } = await resolveUserOrThrow(parsed, dataComposer);
 
   const { studioId, agentId, removeWorktree = true, deleteBranch = false } = parsed;
   const studiosRepo = dataComposer.repositories.studios;
 
-  // Verify studio exists
+  // Verify studio exists AND belongs to the closing user — repository lookups
+  // are id-only, and close is destructive.
   const studio = await studiosRepo.findById(studioId);
-  if (!studio) {
+  if (!studio || studio.userId !== closingUser.id) {
     return errorResponse(`Studio not found: ${studioId}`);
   }
 
@@ -547,12 +563,96 @@ export async function handleCloseStudio(args: unknown, dataComposer: DataCompose
     errors: [],
   };
 
-  // Remove the git worktree
+  // Release any lease before touching the worktree — closing the studio is a
+  // terminal act for its occupant, and release captures final branch/commit
+  // state while the worktree still exists. A holder without a safe
+  // terminal/stale proof refuses the whole close (lease marked
+  // pendingRelease; re-run close after the holder's boundary frees it).
+  const leaseService = new StudioLeaseService(dataComposer.getClient());
+  const releaseOutcome = await leaseService
+    .releaseByStudio(studioId, { userId: closingUser.id, reason: 'studio-closed' })
+    .catch((leaseErr: unknown) => {
+      logger.warn('[StudioLease] Release on close_studio failed', {
+        studioId,
+        error: leaseErr instanceof Error ? leaseErr.message : String(leaseErr),
+      });
+      return 'none' as const;
+    });
+  if (releaseOutcome === 'deferred') {
+    return errorResponse(
+      `Studio ${studioId} is in use by a live session. Its lease is marked for release at the holder's turn boundary — close the studio again once the session has finished.`
+    );
+  }
+  // 'none' is NOT proof of vacancy — it also covers quarantine, a lost CAS,
+  // and the caught release error. Never destroy on ambiguity.
+  const residual = await leaseService.getLease(studioId, closingUser.id);
+  if (residual?.lease) {
+    // Reconciliation (idempotent): a quarantined claim over an ALREADY-ABSENT
+    // worktree means destruction happened but the cleaned record didn't land
+    // (a prior close's markCleaned failed, or the cwd vanished externally).
+    // Nothing is left to protect — record cleaned and clear the exact claim.
+    const worktreeGone = !(await access(studio.worktreePath)
+      .then(() => true)
+      .catch(() => false));
+    if (residual.lease.quarantined && worktreeGone) {
+      // ONE user+exact-claim-guarded CAS finalizes status/cleaned_at/lease
+      // together — a claim replaced between observation and finalization
+      // makes this fail, and failure is reported, never masked as success.
+      const finalized = await leaseService.finalizeTeardown(
+        studioId,
+        closingUser.id,
+        residual.lease
+      );
+      if (!finalized) {
+        return errorResponse(
+          `Studio ${studioId} reconciliation failed: the quarantine claim changed underneath (or the write failed). Nothing was recorded; retry close_studio.`
+        );
+      }
+      logger.info('[StudioLease] close_studio reconciled an interrupted teardown', { studioId });
+      return successResponse({
+        message: 'Studio close reconciled: worktree already absent; cleaned state recorded',
+        studioId,
+        status: 'cleaned',
+        cleanup: { worktreeRemoved: true, branchDeleted: false, errors: [] },
+      });
+    }
+    return errorResponse(
+      `Studio ${studioId} has a ${residual.lease.quarantined ? 'quarantined' : 'contended'} lease; refusing to close. Resolve the lease state first.`
+    );
+  }
+
+  // Fence the destructive window: hold a unique teardown claim across
+  // removal and mark-cleaned so no acquire can win the studio between the
+  // release above and the removal below.
+  const claim = await leaseService.claimForTeardown(studioId, closingUser.id, {
+    reason: 'close_studio',
+  });
+  if (!claim) {
+    return errorResponse(
+      `Studio ${studioId} became occupied while closing; aborting. Retry once it is free.`
+    );
+  }
+
+  // Claim lifecycle: cleared ONLY when the studio ends in a coherent state —
+  // either nothing destructive happened (aborts below) or the cleaned state
+  // is durably recorded. If the worktree was removed but persistence failed,
+  // the claim STAYS so routing cannot acquire a studio whose cwd is gone.
+  const abortKeepingStudioUsable = async (message: string) => {
+    await leaseService.clearTeardownClaim(studioId, closingUser.id, claim).catch(() => undefined);
+    return errorResponse(message);
+  };
+
+  // Remove the git worktree. Argument arrays (never shell interpolation —
+  // stored paths/branches must not reach a shell) and async exec/fs — this
+  // is a tool handler on the API server's single event loop.
   if (removeWorktree) {
+    // Token revalidation immediately before destruction.
+    if (!(await leaseService.verifyClaim(studioId, closingUser.id, claim))) {
+      return errorResponse(`Studio ${studioId} teardown claim was lost; aborting close.`);
+    }
     try {
-      execSync(`git worktree remove ${studio.worktreePath}`, {
+      await execFileAsync('git', ['worktree', 'remove', '--', studio.worktreePath], {
         cwd: studio.repoRoot,
-        stdio: 'pipe',
       });
       cleanupResults.worktreeRemoved = true;
     } catch (worktreeError) {
@@ -564,14 +664,24 @@ export async function handleCloseStudio(args: unknown, dataComposer: DataCompose
       });
       cleanupResults.errors.push(`Worktree removal: ${errorMessage}`);
     }
+    // Only a confirmed-absent worktree may be recorded as cleaned.
+    const stillPresent = await access(studio.worktreePath)
+      .then(() => true)
+      .catch(() => false);
+    if (!cleanupResults.worktreeRemoved && stillPresent) {
+      // Nothing was destroyed — the studio is still usable; free the claim.
+      return abortKeepingStudioUsable(
+        `Worktree removal failed and ${studio.worktreePath} still exists; studio NOT marked cleaned. Errors: ${cleanupResults.errors.join('; ')}`
+      );
+    }
+    cleanupResults.worktreeRemoved = true;
   }
 
   // Delete the branch
   if (deleteBranch) {
     try {
-      execSync(`git branch -d ${studio.branch}`, {
+      await execFileAsync('git', ['branch', '-d', '--', studio.branch], {
         cwd: studio.repoRoot,
-        stdio: 'pipe',
       });
       cleanupResults.branchDeleted = true;
     } catch (branchError) {
@@ -584,8 +694,33 @@ export async function handleCloseStudio(args: unknown, dataComposer: DataCompose
     }
   }
 
-  // Mark as cleaned in the database
-  const updated = await studiosRepo.markCleaned(studioId);
+  // Mark as cleaned in the database (ownership verified above). If this
+  // write fails AFTER the worktree was destroyed, the claim must survive —
+  // an active/vacant row pointing at a deleted cwd would be routable.
+  // Re-running close_studio (or the sweep) reconciles via the
+  // quarantine+absent-worktree path above. When nothing destructive
+  // happened (removeWorktree: false), the claim is freed instead — the
+  // studio is fully intact and must stay usable.
+  //
+  // Finalization is ONE user+exact-claim-guarded CAS setting status,
+  // cleaned_at, and lease NULL together — no separate markCleaned + clear
+  // steps a claim replacement could interleave with.
+  const finalized = await leaseService.finalizeTeardown(studioId, closingUser.id, claim);
+  if (!finalized) {
+    if (!removeWorktree) {
+      await leaseService.clearTeardownClaim(studioId, closingUser.id, claim).catch(() => undefined);
+      return errorResponse(
+        `Studio ${studioId} could not be marked cleaned (claim changed or write failed). Nothing was removed; the studio remains usable.`
+      );
+    }
+    logger.error(
+      '[StudioLease] close_studio destroyed the worktree but could not finalize cleaned; keeping teardown claim as quarantine',
+      { studioId }
+    );
+    return errorResponse(
+      `Studio ${studioId} worktree was removed but the cleaned state could not be recorded. The teardown claim is kept so nothing can route here; re-run close_studio to reconcile.`
+    );
+  }
 
   logger.info('Studio closed', {
     studioId,
@@ -596,9 +731,8 @@ export async function handleCloseStudio(args: unknown, dataComposer: DataCompose
 
   return successResponse({
     message: 'Studio closed and marked as cleaned',
-    studioId: updated.id,
-    status: updated.status,
-    cleanedAt: updated.cleanedAt,
+    studioId,
+    status: 'cleaned',
     cleanup: cleanupResults,
   });
 }

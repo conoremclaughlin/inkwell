@@ -20,6 +20,7 @@ import type {
   IRunner,
   ToolCall,
   MediaAttachment,
+  ModelUsageTotals,
 } from './types.js';
 import { formatInjectedContext } from './context-builder.js';
 import { logger } from '../../utils/logger.js';
@@ -45,6 +46,46 @@ export const PROCESS_TIMEOUT_MS =
 export const DEFAULT_MAX_TURNS = 5;
 
 /** Clamp a dashboard-supplied turn cap to a sane range; default when absent. */
+/**
+ * Map the ink result line's per-model block. Keys stay exactly as reported —
+ * grouping (e.g. by canonicalModel) belongs to the reporting layer, not here.
+ *
+ * Exported for tests.
+ */
+export function parseInkModelUsage(raw: unknown): Record<string, ModelUsageTotals> | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const out: Record<string, ModelUsageTotals> = {};
+  for (const [model, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!value || typeof value !== 'object') continue;
+    const entry = value as Record<string, unknown>;
+    const numeric = (v: unknown): number | undefined =>
+      typeof v === 'number' && Number.isFinite(v) ? v : undefined;
+    const fields = {
+      inputTokens: numeric(entry.inputTokens),
+      outputTokens: numeric(entry.outputTokens),
+      cacheReadTokens: numeric(entry.cacheReadTokens),
+      cacheWriteTokens: numeric(entry.cacheWriteTokens),
+      costUSD: numeric(entry.costUSD),
+    };
+    // Unreadable entries stay absent rather than becoming zeros — a zero cost
+    // reads as measured, and "we don't know" is the honest value.
+    if (Object.values(fields).every((v) => v === undefined)) continue;
+    out[model] = {
+      inputTokens: fields.inputTokens ?? 0,
+      outputTokens: fields.outputTokens ?? 0,
+      cacheReadTokens: fields.cacheReadTokens ?? 0,
+      cacheWriteTokens: fields.cacheWriteTokens ?? 0,
+      ...(fields.costUSD !== undefined ? { costUSD: fields.costUSD } : {}),
+      // The CLI already knows whether its per-run figure is complete — it saw
+      // every invocation. Dropping the marker here silently promoted a lower
+      // bound back to a total at the process boundary (Lumen, PR #500 round 4).
+      ...(entry.costPartial === true ? { costPartial: true } : {}),
+      ...(typeof entry.canonicalModel === 'string' ? { canonicalModel: entry.canonicalModel } : {}),
+    };
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 export function clampMaxTurns(value: number | undefined): number {
   if (typeof value !== 'number' || !Number.isFinite(value)) return DEFAULT_MAX_TURNS;
   return Math.min(25, Math.max(1, Math.round(value)));
@@ -139,6 +180,7 @@ export class InkRunner implements IRunner {
           backendSessionId: sessionId,
           responses: retryResult.responses,
           usage: retryResult.usage,
+          servedModel: retryResult.servedModel,
           finalTextResponse: retryResult.finalTextResponse,
           toolCalls: retryResult.toolCalls,
         };
@@ -149,6 +191,7 @@ export class InkRunner implements IRunner {
         backendSessionId: sessionId,
         responses: result.responses,
         usage: result.usage,
+        servedModel: result.servedModel,
         finalTextResponse: result.finalTextResponse,
         toolCalls: result.toolCalls,
       };
@@ -227,7 +270,15 @@ export class InkRunner implements IRunner {
     config: ClaudeRunnerConfig
   ): Promise<{
     responses: ChannelResponse[];
-    usage?: { contextTokens: number; inputTokens: number; outputTokens: number };
+    usage?: {
+      contextTokens: number;
+      inputTokens: number;
+      outputTokens: number;
+      cacheReadTokens?: number;
+      cacheWriteTokens?: number;
+      modelUsage?: Record<string, ModelUsageTotals>;
+    };
+    servedModel?: string;
     resumeFailedNoSession?: boolean;
     finalTextResponse?: string;
     toolCalls: ToolCall[];
@@ -454,7 +505,15 @@ export class InkRunner implements IRunner {
     _stderr: string
   ): {
     responses: ChannelResponse[];
-    usage?: { contextTokens: number; inputTokens: number; outputTokens: number };
+    usage?: {
+      contextTokens: number;
+      inputTokens: number;
+      outputTokens: number;
+      cacheReadTokens?: number;
+      cacheWriteTokens?: number;
+      modelUsage?: Record<string, ModelUsageTotals>;
+    };
+    servedModel?: string;
     finalTextResponse?: string;
     toolCalls: ToolCall[];
   } {
@@ -464,7 +523,17 @@ export class InkRunner implements IRunner {
     let exitPhase: string | undefined;
     let exitSignal: string | undefined;
     let exitReason: string | undefined;
-    let usage: { contextTokens: number; inputTokens: number; outputTokens: number } | undefined;
+    let usage:
+      | {
+          contextTokens: number;
+          inputTokens: number;
+          outputTokens: number;
+          cacheReadTokens?: number;
+          cacheWriteTokens?: number;
+          modelUsage?: Record<string, ModelUsageTotals>;
+        }
+      | undefined;
+    let servedModel: string | undefined;
 
     // ink chat routes responses via MCP send_response — stdout may contain
     // CLI chrome, status lines, or other noise that must NOT be treated as
@@ -501,11 +570,28 @@ export class InkRunner implements IRunner {
           // Without this, sessions report contextTokens=0 and token-based
           // lifecycle decisions never fire for the ink backend.
           if (parsed.usage && typeof parsed.usage === 'object') {
+            // The CLI reports fresh input and the cache split separately;
+            // input is their sum, since cached tokens are still input that
+            // was sent and billed. Older ink builds omit the cache fields —
+            // those degrade to the previous fresh-only figure rather than
+            // failing.
+            const cacheReadTokens = Number(parsed.usage.cacheReadTokens) || 0;
+            const cacheWriteTokens = Number(parsed.usage.cacheWriteTokens) || 0;
+            // Per-model breakdown with the backend's own costUSD. Older ink
+            // builds omit it; the field is simply absent then, never faked.
+            const modelUsage = parseInkModelUsage(parsed.modelUsage);
             usage = {
               contextTokens: Number(parsed.usage.contextTokens) || 0,
-              inputTokens: Number(parsed.usage.inputTokens) || 0,
+              inputTokens:
+                (Number(parsed.usage.inputTokens) || 0) + cacheReadTokens + cacheWriteTokens,
               outputTokens: Number(parsed.usage.outputTokens) || 0,
+              cacheReadTokens,
+              cacheWriteTokens,
+              ...(modelUsage ? { modelUsage } : {}),
             };
+          }
+          if (typeof parsed.model === 'string' && parsed.model.trim()) {
+            servedModel = parsed.model.trim();
           }
         }
       } catch {
@@ -528,6 +614,7 @@ export class InkRunner implements IRunner {
     return {
       responses,
       usage,
+      servedModel,
       finalTextResponse,
       toolCalls,
     };

@@ -9,7 +9,8 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { buildAwakeningPrompt, type BootstrapIdentity } from './awaken.js';
+import { buildAwakeningPrompt, resolveRuntime, type BootstrapIdentity } from './awaken.js';
+import { NOT_SIGNED_IN_MESSAGE } from '../lib/user-config.js';
 
 const VALUES = `# Values
 
@@ -99,5 +100,37 @@ describe('buildAwakeningPrompt — content', () => {
   it('renders every template placeholder', () => {
     const prompt = buildAwakeningPrompt(VALUES, FAMILY, 'claude');
     expect(prompt).not.toMatch(/\{\{[A-Z_]+\}\}/);
+  });
+});
+
+describe('resolveRuntime — --runtime and --backend are one axis', () => {
+  it('defaults to the ink runtime', () => {
+    expect(resolveRuntime({})).toBe('ink');
+  });
+
+  it('honours --runtime', () => {
+    expect(resolveRuntime({ runtime: 'codex' })).toBe('codex');
+  });
+
+  // The regression this exists for: a commander default on --runtime made
+  // options.runtime always truthy, so --backend resolved to 'ink' and was
+  // silently ignored — an alias that looks supported and does nothing.
+  it('honours --backend, the deprecated alias', () => {
+    expect(resolveRuntime({ backend: 'codex' })).toBe('codex');
+    expect(resolveRuntime({ backend: 'claude' })).toBe('claude');
+  });
+
+  it('lets --runtime win when both are given', () => {
+    expect(resolveRuntime({ runtime: 'claude', backend: 'codex' })).toBe('claude');
+  });
+});
+
+describe('NOT_SIGNED_IN_MESSAGE — signposts account creation', () => {
+  // `ink auth login` is already the right command for someone with no account
+  // (the page it opens links to /signup), but "login" does not read that way
+  // to a brand-new user. Same dead end as issue #331: mechanism without signpost.
+  it('names sign-up, not just login', () => {
+    expect(NOT_SIGNED_IN_MESSAGE).toContain('ink auth login');
+    expect(NOT_SIGNED_IN_MESSAGE.toLowerCase()).toContain('sign-up');
   });
 });

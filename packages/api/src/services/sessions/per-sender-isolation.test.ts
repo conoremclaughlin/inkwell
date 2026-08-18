@@ -60,6 +60,7 @@ function createMockSupabase(rows: Record<string, unknown>[] = []) {
     'update',
     'eq',
     'neq',
+    'not',
     'is',
     'or',
     'order',

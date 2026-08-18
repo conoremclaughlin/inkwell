@@ -742,7 +742,12 @@ async function updateRuntimeGenerationState(
   cwd: string,
   _config: PcpConfig | null,
   agentId: string,
-  lifecycle: 'running' | 'idle' | 'compacting'
+  lifecycle: 'running' | 'idle' | 'compacting',
+  // Which hook fired. Lifecycle values are ambiguous (post-compact and
+  // on-stop both send 'idle'); the server uses the event to manage the
+  // hook-owned CLI turn signal and to run the lease boundary ONLY on the
+  // real stop (PR #492).
+  event?: 'prompt' | 'stop' | 'pre-compact' | 'post-compact'
 ): Promise<void> {
   const sessionId = resolveActivePcpSessionId(cwd);
   if (!sessionId) return;
@@ -755,7 +760,13 @@ async function updateRuntimeGenerationState(
     const resp = await fetch(`${serverUrl}/api/hooks/lifecycle`, {
       method: 'POST',
       headers,
-      body: JSON.stringify({ sessionId, lifecycle, agentId, workingDir: cwd }),
+      body: JSON.stringify({
+        sessionId,
+        lifecycle,
+        ...(event ? { event } : {}),
+        agentId,
+        workingDir: cwd,
+      }),
       signal: AbortSignal.timeout(5000),
     });
     if (!resp.ok) {
@@ -1766,7 +1777,7 @@ async function preCompactHandler(options?: { backend?: string }): Promise<void> 
   // that will reset it to 'idle'. Without postCompact (e.g., Gemini/PreCompress),
   // the lifecycle gets stuck at 'compacting' permanently.
   if (backend.events.postCompact) {
-    await updateRuntimeGenerationState(cwd, config, agentId, 'compacting');
+    await updateRuntimeGenerationState(cwd, config, agentId, 'compacting', 'pre-compact');
   }
 
   process.stdout.write(loadTemplate('hook-pre-compact'));
@@ -1779,8 +1790,9 @@ async function postCompactHandler(): Promise<void> {
   const config = getPcpConfig();
   const agentId = resolveAgentId() || 'unknown';
 
-  // Reset lifecycle from compacting back to idle
-  await updateRuntimeGenerationState(cwd, config, agentId, 'idle');
+  // Reset lifecycle from compacting back to idle. NOT a turn boundary —
+  // the same turn resumes after compaction (PR #492 round 4).
+  await updateRuntimeGenerationState(cwd, config, agentId, 'idle', 'post-compact');
 
   let identityBlock = '';
   let memoriesBlock = '';
@@ -2378,7 +2390,7 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
   });
 
   // Mark session as actively generating at prompt start.
-  await updateRuntimeGenerationState(cwd, config, agentId, 'running');
+  await updateRuntimeGenerationState(cwd, config, agentId, 'running', 'prompt');
 
   // Mark session as CLI-attached (human present at REPL).
   // Uses the REST lifecycle endpoint, NOT MCP — cliAttached is a runtime
@@ -2552,7 +2564,7 @@ async function onStopHandler(options?: { backend?: string }): Promise<void> {
   });
 
   // Mark session as idle after each completed backend turn.
-  await updateRuntimeGenerationState(cwd, config, agentId, 'idle');
+  await updateRuntimeGenerationState(cwd, config, agentId, 'idle', 'stop');
 
   // Increment tool call counter
   const countStr = readRuntimeFile(cwd, 'tool-count');

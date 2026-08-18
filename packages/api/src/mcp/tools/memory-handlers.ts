@@ -22,6 +22,7 @@ import { getEffectiveAgentId } from '../../auth/enforce-identity';
 import type { MemorySource, Salience, Session } from '../../data/models/memory';
 import { getCloudSkillsService } from '../../skills/cloud-service';
 import { resolveMainStudio } from '../../services/sessions/session-service';
+import { StudioLeaseService } from '../../services/studio-lease.service';
 
 // Helper to safely read a file, returning null if it doesn't exist
 async function safeReadFile(filePath: string): Promise<string | null> {
@@ -1217,6 +1218,22 @@ export async function handleEndSession(args: unknown, dataComposer: DataComposer
   }
 
   if (session) {
+    // Automatic lease release — end_session is a terminal path regardless of
+    // which side (server or agent CLI) initiated it. MUST run BEFORE the
+    // cli_attached clear below: releaseUnlessRunning reads that flag to
+    // detect an end_session issued from inside a live CLI turn, and defers so
+    // no other thread enters the worktree while the local model is still
+    // executing in it. The deferred release fires at the CLI stop boundary
+    // (hook-lifecycle) or the server run boundary.
+    await new StudioLeaseService(dataComposer.getClient())
+      .releaseUnlessRunning(session.id, { userId: user.id, reason: 'session-end' })
+      .catch((err: unknown) => {
+        logger.warn('[StudioLease] Release on end_session failed', {
+          sessionId: session.id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+
     // Clear cli_attached flag so triggers don't get stuck in the pending queue
     // after the CLI detaches.
     await dataComposer.repositories.memory
@@ -1449,6 +1466,23 @@ function isSignificantPhaseTransition(phase: string): boolean {
   return phase.startsWith('blocked:') || phase.startsWith('waiting:') || phase === 'complete';
 }
 
+/**
+ * Whether this update finishes the session, and so should stamp `ended_at`.
+ *
+ * Nothing used to stamp it. That left `ended_at` NULL on every completed
+ * session, which in turn made the `ended_at IS NULL` clause in
+ * findByThreadKey filter nothing — so a thread whose conversation was over
+ * routed the next trigger back into the finished session instead of starting
+ * fresh (PR #349, revived).
+ *
+ * Both spellings are checked because either can carry the completion: callers
+ * may pass the legacy `status: 'completed'` or the current
+ * `lifecycle: 'completed'`.
+ */
+export function shouldStampEndedAt(params: { status?: string; lifecycle?: string }): boolean {
+  return params.status === 'completed' || params.lifecycle === 'completed';
+}
+
 function buildPhaseTransitionMemoryContent(params: {
   phase: string;
   note?: string;
@@ -1611,6 +1645,7 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
     cliAttached?: boolean;
     alias?: string | null;
     activeThreadKey?: string | null;
+    endedAt?: Date | null;
   } = {};
 
   // Map runtime: prefix phases to lifecycle (backward compat for old callers)
@@ -1642,6 +1677,11 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
   if (params.status !== undefined) {
     updates.status = params.status;
   }
+
+  if (shouldStampEndedAt({ status: params.status, lifecycle: updates.lifecycle })) {
+    updates.endedAt = new Date();
+  }
+
   if (params.backendSessionId !== undefined) {
     updates.backendSessionId = params.backendSessionId;
   }
@@ -1672,6 +1712,25 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
         },
       ],
     };
+  }
+
+  // update_session_state(status/lifecycle: completed) is a terminal path just
+  // like end_session — the studio lease must not wait for expiry. Deferred
+  // while the session's in-process run is still executing; the run boundary
+  // releases then.
+  const becameTerminal =
+    updates.endedAt instanceof Date ||
+    updates.status === 'completed' ||
+    updates.lifecycle === 'completed';
+  if (becameTerminal) {
+    await new StudioLeaseService(dataComposer.getClient())
+      .releaseUnlessRunning(sessionId, { userId: user.id, reason: 'session-completed' })
+      .catch((err: unknown) => {
+        logger.warn('[StudioLease] Release on update_session_state(completed) failed', {
+          sessionId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
   }
 
   const messageParts: string[] = [];

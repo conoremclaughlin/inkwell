@@ -34,7 +34,14 @@ import { SessionRepository } from './session-repository.js';
 import { ContextBuilder } from './context-builder.js';
 import { ClaudeRunner, buildIdentityPrompt } from './claude-runner.js';
 import { CodexRunner } from './codex-runner.js';
+import {
+  registerActiveRun,
+  clearActiveRun,
+  trackStateWrite,
+  admitStateWrite,
+} from './active-runs.js';
 import { GeminiRunner } from './gemini-runner.js';
+import { AntigravityRunner } from './antigravity-runner.js';
 import { InkRunner } from './ink-runner.js';
 import { ActivityStreamRepository } from '../../data/repositories/activity-stream.repository.js';
 import { resolveIdentityId } from '../../auth/resolve-identity.js';
@@ -42,6 +49,9 @@ import { classifyError } from '@inklabs/shared';
 import { serializeError } from '../../utils/serialize-error.js';
 import { resolveTaskGroupForThreadKey } from '../task-group-resolver.js';
 import { getRunnerFilesDir } from '../sandbox/orchestrator.js';
+import { StudioLeaseService, isLeaseStale } from '../studio-lease.service.js';
+import { StudioOverflowService } from '../studio-overflow.service.js';
+import { StudiosRepository, type Studio } from '../../data/repositories/studios.repository.js';
 import { logger } from '../../utils/logger.js';
 
 /**
@@ -58,6 +68,9 @@ export interface SessionServiceConfig {
   defaultCodexModel?: string;
   /** Optional explicit model override for Gemini backend */
   defaultGeminiModel?: string;
+  defaultAntigravityModel?: string;
+  /** This server's own MCP endpoint, from the port the HTTP listener bound. */
+  inkMcpUrl?: string;
   /** Token threshold for triggering compaction */
   compactionThreshold: number;
   /** Callback to route responses from async operations (compaction, etc.) */
@@ -173,16 +186,84 @@ export function parseRuntimeConfig(metadata: unknown): {
   return out;
 }
 
+/**
+ * The routing tier that produced a studio, plus what occupancy did about it.
+ * Stamped into session metadata as `routing_decision` at creation so every
+ * session records why it landed where it did (spec:trigger-studio-routing
+ * §Visibility, carried from studio-routing-rules §Routing Observability).
+ */
+export interface StudioRoutingDecision {
+  studioId?: string;
+  tier:
+    | 'explicit'
+    | 'studio-hint'
+    | 'recipient-session'
+    | 'thread-continuity'
+    | 'route-pattern'
+    | 'repo-root-main'
+    | 'agent-recent'
+    | 'main-fallback'
+    | 'none';
+  /**
+   * True when the tier is an inferred one (route-pattern and below) and the
+   * lease was consulted. Tiers above infer nothing — an explicit studio, a
+   * hint, a session anchor, or thread continuity means the thread already
+   * owns the studio, so occupancy does not gate them (spec v11 §Resolution).
+   */
+  occupancyChecked: boolean;
+  /**
+   * Set when the caller named a *specific* studio by slug and no such studio
+   * exists for this agent. Distinct from `studioId === undefined`, which also
+   * covers the ordinary case of asking for "main" when the agent simply has
+   * no root studio yet — that is a legitimate degrade, this is a bad address.
+   */
+  unresolvedNamedStudio?: string;
+  diverted?: {
+    from: string;
+    holderThreadKey: string;
+    holderSessionId: string;
+    via: 'overflow' | 'refused';
+  };
+}
+
+/**
+ * Raised when a caller names a studio that does not exist.
+ *
+ * Resolution stops rather than continuing down the reuse ladder. The ladder's
+ * later rungs — threadKey continuity, default session, most-recent session —
+ * are all unscoped by studio, so any of them can hand back a session bound to
+ * a worktree the caller never asked for. Skipping only the alias lookup left
+ * three other ways to arrive somewhere unintended.
+ */
+export class UnresolvedStudioError extends Error {
+  readonly code = 'UNRESOLVED_STUDIO';
+
+  constructor(
+    readonly studioHint: string,
+    readonly agentId: string
+  ) {
+    super(
+      `Studio "${studioHint}" does not exist for agent "${agentId}". ` +
+        `Refusing to route elsewhere — check the slug, or omit it to let routing choose.`
+    );
+    this.name = 'UnresolvedStudioError';
+  }
+}
+
 export class SessionService implements ISessionService {
   private repository: ISessionRepository;
   private contextBuilder: IContextBuilder;
   private claudeRunner: IRunner;
   private codexRunner: IRunner;
   private geminiRunner: IRunner;
+  private antigravityRunner: IRunner;
   private inkRunner: IRunner;
   private activityStream: IActivityStream;
   private config: SessionServiceConfig;
   private supabase: SupabaseClient<Database> | null;
+  private leaseService: StudioLeaseService | null = null;
+  private overflowService: StudioOverflowService | null = null;
+  private studiosRepo: StudiosRepository | null = null;
 
   /**
    * Processing lock per agent session.
@@ -213,17 +294,245 @@ export class SessionService implements ISessionService {
     codexRunner?: IRunner,
     supabase?: SupabaseClient<Database>,
     geminiRunner?: IRunner,
-    inkRunner?: IRunner
+    inkRunner?: IRunner,
+    antigravityRunner?: IRunner
   ) {
     this.repository = repository;
     this.contextBuilder = contextBuilder;
     this.claudeRunner = claudeRunner;
     this.codexRunner = codexRunner || claudeRunner;
     this.geminiRunner = geminiRunner || claudeRunner;
+    this.antigravityRunner = antigravityRunner || claudeRunner;
     this.inkRunner = inkRunner || new InkRunner();
     this.activityStream = activityStream;
     this.config = { ...DEFAULT_CONFIG, ...config };
     this.supabase = supabase || null;
+  }
+
+  private getLeaseService(): StudioLeaseService | null {
+    if (!this.supabase) return null;
+    if (!this.leaseService) {
+      this.leaseService = new StudioLeaseService(this.supabase);
+    }
+    return this.leaseService;
+  }
+
+  private getStudiosRepo(): StudiosRepository | null {
+    if (!this.supabase) return null;
+    if (!this.studiosRepo) {
+      this.studiosRepo = new StudiosRepository(this.supabase);
+    }
+    return this.studiosRepo;
+  }
+
+  private getOverflowService(): StudioOverflowService | null {
+    const studios = this.getStudiosRepo();
+    const leases = this.getLeaseService();
+    if (!studios || !leases) return null;
+    if (!this.overflowService) {
+      this.overflowService = new StudioOverflowService(studios, leases);
+    }
+    return this.overflowService;
+  }
+
+  /**
+   * Occupancy check (spec v11 tier 5a) for studios produced by inferred tiers.
+   * A studio leased by this thread, unleased, or holding only a stale lease
+   * passes through (acquire handles rescue+reclaim of stale holders). A studio
+   * freshly leased by a different thread diverts to the overflow ladder —
+   * never into the occupied worktree.
+   */
+  private async gateOccupancy(
+    candidateStudioId: string,
+    tier: StudioRoutingDecision['tier'],
+    ctx: { userId: string; agentId: string; threadKey?: string }
+  ): Promise<StudioRoutingDecision> {
+    const leases = this.getLeaseService();
+    if (!leases || !ctx.threadKey) {
+      return { studioId: candidateStudioId, tier, occupancyChecked: false };
+    }
+
+    const current = await leases.getLease(candidateStudioId, ctx.userId);
+    const holder = current?.lease;
+    if (!holder || holder.threadKey === ctx.threadKey || isLeaseStale(holder)) {
+      return { studioId: candidateStudioId, tier, occupancyChecked: true };
+    }
+
+    logger.info('[StudioResolve] Studio leased by another thread; diverting to overflow', {
+      studioId: candidateStudioId,
+      tier,
+      threadKey: ctx.threadKey,
+      holderThreadKey: holder.threadKey,
+      holderSessionId: holder.sessionId,
+    });
+
+    const overflow = await this.divertToOverflow(candidateStudioId, ctx);
+    if (overflow) {
+      return {
+        studioId: overflow.id,
+        tier,
+        occupancyChecked: true,
+        diverted: {
+          from: candidateStudioId,
+          holderThreadKey: holder.threadKey,
+          holderSessionId: holder.sessionId,
+          via: 'overflow',
+        },
+      };
+    }
+
+    // Overflow creation failed. Never route into the occupied studio — run
+    // studioless (default working directory) and leave a loud trail. Proper
+    // refuse-and-hold is Phase 3b (spec v11 §Refusing to route).
+    logger.error('[StudioResolve] Overflow creation failed; refusing occupied studio', {
+      studioId: candidateStudioId,
+      tier,
+      threadKey: ctx.threadKey,
+      holderThreadKey: holder.threadKey,
+    });
+    await leases.logEvent(ctx.userId, candidateStudioId, 'conflict', {
+      threadKey: ctx.threadKey,
+      agentId: ctx.agentId,
+      reason: `occupied by ${holder.threadKey} and overflow creation failed; session will run studioless`,
+    });
+    return {
+      studioId: undefined,
+      tier,
+      occupancyChecked: true,
+      diverted: {
+        from: candidateStudioId,
+        holderThreadKey: holder.threadKey,
+        holderSessionId: holder.sessionId,
+        via: 'refused',
+      },
+    };
+  }
+
+  private async divertToOverflow(
+    parentStudioId: string,
+    ctx: { userId: string; agentId: string; threadKey?: string }
+  ): Promise<Studio | null> {
+    const overflowService = this.getOverflowService();
+    const studios = this.getStudiosRepo();
+    if (!overflowService || !studios || !ctx.threadKey) return null;
+    const parent = await studios.findById(parentStudioId).catch(() => null);
+    // Ownership boundary: never seed a caller-owned worktree from another
+    // user's studio. A foreign studio UUID gets no overflow — the caller
+    // fails closed instead.
+    if (!parent || parent.userId !== ctx.userId) {
+      if (parent) {
+        logger.warn('[StudioLease] Overflow refused — parent studio belongs to another user', {
+          parentStudioId,
+          requestingUserId: ctx.userId,
+        });
+      }
+      return null;
+    }
+    return overflowService.ensureOverflowStudio({
+      userId: ctx.userId,
+      agentId: ctx.agentId,
+      parentStudio: parent,
+      threadKey: ctx.threadKey,
+    });
+  }
+
+  /**
+   * Programmatic lease acquisition — runs on every session resolution with a
+   * threadKey and a studio, whichever path produced the session. The SB never
+   * opts in; routing is what acquires.
+   *
+   * FAIL CLOSED (PR #492 review): a session is never returned bound to a
+   * studio whose lease was not acquired — the runner would execute inside the
+   * occupied worktree, which is exactly the stomp the lease exists to
+   * prevent. On any refusal, from any tier: divert to overflow; if overflow
+   * cannot be created or acquired, strip the studio binding so the session
+   * runs in the default working directory instead of someone else's worktree.
+   */
+  private async withStudioLease(
+    session: Session,
+    routing: StudioRoutingDecision,
+    ctx: { userId: string; agentId: string; threadKey?: string }
+  ): Promise<Session> {
+    const leases = this.getLeaseService();
+    if (!leases || !ctx.threadKey || !session.studioId) return session;
+
+    const boundStudioId = session.studioId;
+    try {
+      const result = await leases.acquire({
+        studioId: boundStudioId,
+        sessionId: session.id,
+        threadKey: ctx.threadKey,
+        agentId: ctx.agentId,
+        userId: ctx.userId,
+        reason: routing.tier,
+      });
+      if (result.acquired) return session;
+
+      // holder === null means the studio could not even be verified as this
+      // user's — do not write an event pairing this user with a studio they
+      // may not own; the fail-closed clear below still applies.
+      if (result.holder) {
+        await leases.logEvent(ctx.userId, boundStudioId, 'conflict', {
+          sessionId: session.id,
+          threadKey: ctx.threadKey,
+          agentId: ctx.agentId,
+          reason: `tier ${routing.tier} resolved a studio held by ${result.holder.threadKey}; diverting`,
+        });
+      }
+      logger.warn('[StudioLease] Studio not acquirable; diverting', {
+        sessionId: session.id,
+        studioId: boundStudioId,
+        tier: routing.tier,
+        threadKey: ctx.threadKey,
+        holderThreadKey: result.holder?.threadKey ?? null,
+        verified: Boolean(result.holder),
+      });
+
+      const overflow = await this.divertToOverflow(boundStudioId, ctx);
+      if (overflow) {
+        const overflowAcquire = await leases.acquire({
+          studioId: overflow.id,
+          sessionId: session.id,
+          threadKey: ctx.threadKey,
+          agentId: ctx.agentId,
+          userId: ctx.userId,
+          reason: `overflow:${routing.tier}`,
+        });
+        if (overflowAcquire.acquired) {
+          const updated = await this.repository.update(session.id, { studioId: overflow.id });
+          logger.info('[StudioLease] Session diverted to overflow studio', {
+            sessionId: session.id,
+            from: boundStudioId,
+            to: overflow.id,
+            threadKey: ctx.threadKey,
+          });
+          return updated;
+        }
+      }
+
+      logger.error(
+        '[StudioLease] Overflow unavailable; clearing studio binding (fail closed, never the occupied worktree)',
+        {
+          sessionId: session.id,
+          studioId: boundStudioId,
+          threadKey: ctx.threadKey,
+        }
+      );
+      return await this.repository.update(session.id, { studioId: null });
+    } catch (err) {
+      logger.error('[StudioLease] Lease acquisition errored; clearing studio binding', {
+        sessionId: session.id,
+        studioId: boundStudioId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      try {
+        return await this.repository.update(session.id, { studioId: null });
+      } catch {
+        // Last resort: strip in memory so the runner falls back to the
+        // default working directory rather than the unverified worktree.
+        return { ...session, studioId: undefined };
+      }
+    }
   }
 
   async handleMessage(request: SessionRequest): Promise<SessionResult> {
@@ -586,7 +895,9 @@ export class SessionService implements ISessionService {
         ? this.config.defaultCodexModel
         : modelKey === 'gemini'
           ? this.config.defaultGeminiModel
-          : this.config.defaultModel;
+          : modelKey === 'antigravity'
+            ? this.config.defaultAntigravityModel
+            : this.config.defaultModel;
 
     // Resolve sandbox_bypass: studio override > SB default > false
     let sandboxBypass = false;
@@ -651,6 +962,7 @@ export class SessionService implements ISessionService {
     const runnerConfig: ClaudeRunnerConfig = {
       workingDirectory: resolvedWorkingDirectory,
       mcpConfigPath: this.config.mcpConfigPath,
+      ...(this.config.inkMcpUrl ? { inkMcpUrl: this.config.inkMcpUrl } : {}),
       appendSystemPrompt: buildIdentityPrompt(
         agentId,
         injectedContext.agent.name,
@@ -699,14 +1011,28 @@ export class SessionService implements ISessionService {
       );
     }
 
+    // Antigravity's MCP access depends on a bridge published at a HOST path and
+    // named in a HOST-global config file; neither exists inside the container,
+    // so agy would start and then run with no Ink tools at all. Refuse loudly
+    // rather than hand back a silently toolless agent. Staging the bridge into
+    // the container runtime dir is the fix, and is not done yet.
+    if (resolvedBackend === 'antigravity' && runnerConfig.container) {
+      throw new Error(
+        'antigravity backend cannot run inside a sandbox container yet — the MCP ' +
+          'bridge is staged on the host. Use claude-code or codex-cli for sandboxed strategies.'
+      );
+    }
+
     const runner =
       resolvedBackend === 'codex-cli'
         ? this.codexRunner
         : resolvedBackend === 'gemini'
           ? this.geminiRunner
-          : resolvedBackend === 'ink'
-            ? this.inkRunner
-            : this.claudeRunner;
+          : resolvedBackend === 'antigravity'
+            ? this.antigravityRunner
+            : resolvedBackend === 'ink'
+              ? this.inkRunner
+              : this.claudeRunner;
 
     // 5a. Log backend spawn to activity stream (fire-and-forget)
     const triggerSource = metadata?.triggerType as string | undefined;
@@ -739,8 +1065,41 @@ export class SessionService implements ISessionService {
         logger.warn('Failed to log backend spawn activity', { error: err });
       });
 
-    // Mark session as running before backend turn
-    await this.repository.update(session.id, { lifecycle: 'running' });
+    // Registered BEFORE the write, not after it. The invariant this has to
+    // hold is "registered ⟺ the row is (or is about to be) persisted as
+    // running" — anything narrower leaves a window where a shutdown sees no
+    // active run and walks away from a row that says `running` forever, which
+    // is the exact zombie this is here to prevent (Lumen, PR #490 — P1).
+    const admitted = registerActiveRun({
+      sessionId: session.id,
+      userId,
+      agentId,
+      backend: resolvedBackend,
+      threadKey: metadata?.threadKey as string | undefined,
+      senderAgentId: request.sender?.id,
+      startedAt: Date.now(),
+    });
+
+    // Intake closes at the top of shutdown. A turn started now is guaranteed
+    // to be killed before it finishes, and would be invisible to the drain
+    // that has already run — so refuse it rather than spawn a child that
+    // cannot survive and cannot be reported.
+    if (!admitted) {
+      throw new Error('Server is shutting down; not starting a new backend turn.');
+    }
+
+    // Mark session as running before backend turn. Tracked so the shutdown
+    // drain can wait for it: if this write is still in flight when the
+    // interruption runs, it would land afterwards and restore `running`.
+    try {
+      await trackStateWrite(this.repository.update(session.id, { lifecycle: 'running' }));
+    } catch (runningWriteError) {
+      // The row is not running, so the registration describes nothing. Leaving
+      // it would make shutdown post an interruption notice for a turn that
+      // never started.
+      clearActiveRun(session.id);
+      throw runningWriteError;
+    }
 
     // Media flows to backends as file paths, not inline base64. Channel
     // listeners download attachments to ~/.ink/files/<channel>/; the
@@ -755,6 +1114,7 @@ export class SessionService implements ISessionService {
     let result;
     let turnDurationMs: number;
     const turnStartMs = Date.now();
+
     try {
       result = await runner.run(formattedMessage, {
         backendSessionId: session.backendSessionId || undefined,
@@ -764,13 +1124,24 @@ export class SessionService implements ISessionService {
       });
       turnDurationMs = Date.now() - turnStartMs;
     } catch (runnerError) {
-      // Runner threw (spawn failure, capacity error, etc.) — mark session as failed
-      await this.repository.update(session.id, { lifecycle: 'failed' }).catch((e) => {
-        logger.warn('Failed to set lifecycle=failed after runner crash', {
-          sessionId: session.id,
-          error: e,
-        });
-      });
+      // Runner threw (spawn failure, capacity error, etc.) — mark session as
+      // failed, unless shutdown already owns this session's state and would
+      // have its interruption record overwritten by this write.
+      let failedWritten = admitStateWrite(session.id);
+      if (failedWritten) {
+        await trackStateWrite(this.repository.update(session.id, { lifecycle: 'failed' })).catch(
+          (e) => {
+            // The row is still `running`. Keeping the registration is the point:
+            // this is precisely a session that needs reporting at shutdown, and
+            // clearing it here is how the zombie survived round 1.
+            failedWritten = false;
+            logger.warn('Failed to set lifecycle=failed after runner crash', {
+              sessionId: session.id,
+              error: e,
+            });
+          }
+        );
+      }
       this.activityStream
         .logActivity({
           userId,
@@ -797,6 +1168,10 @@ export class SessionService implements ISessionService {
           } as unknown as Json,
         })
         .catch(() => {});
+      // Cleared only if `failed` actually persisted — not in a `finally`
+      // around runner.run(). A finally fires while the row still says
+      // `running`, reopening the same window on the way out.
+      if (failedWritten) clearActiveRun(session.id);
       throw runnerError;
     }
 
@@ -855,7 +1230,28 @@ export class SessionService implements ISessionService {
     // Leaving it true causes future triggers to skip spawning (they expect a
     // channel plugin to deliver, but none runs for headless sessions).
     const postRunLifecycle = result.success ? 'idle' : 'failed';
-    if (result.backendSessionId !== session.backendSessionId) {
+
+    // The model that served this turn, as the backend reported it on its own
+    // top-level assistant messages. Not the model we requested (CLI defaults,
+    // aliases and fallbacks all diverge from it) and not inferred from token
+    // volume (a chatty subagent out-writes the parent, which would record the
+    // wrong model). The column means "most recent main model" — one session
+    // can span several — while metadata.modelUsage keeps the per-model
+    // history including cost (Lumen, PR #493 rounds 2-3).
+    const servedModel = result.servedModel;
+
+    // A runner can return after the shutdown drain has already snapshotted and
+    // interrupted this session. Because repository.update() rewrites the whole
+    // metadata blob from a snapshot taken at its own start, finalizing now
+    // would overwrite the interruption's lifecycle AND erase its breadcrumb.
+    // Shutdown owns the state from here (Lumen, PR #490 round 3).
+    let finalized = false;
+    if (!admitStateWrite(session.id)) {
+      logger.warn('Skipping post-run session write; shutdown already recorded this session', {
+        sessionId: session.id,
+        wouldHaveBeen: postRunLifecycle,
+      });
+    } else if (result.backendSessionId !== session.backendSessionId) {
       logger.info('Backend session ID linked to PCP session', {
         pcpSessionId: session.id,
         backendSessionId: result.backendSessionId,
@@ -863,23 +1259,60 @@ export class SessionService implements ISessionService {
         backend: resolvedBackend,
         agentId: session.agentId,
       });
-      await this.repository.update(session.id, {
-        backendSessionId: result.backendSessionId,
-        messageCount: session.messageCount + 1,
-        backend: resolvedBackend,
-        lifecycle: postRunLifecycle as Session['lifecycle'],
-        cliAttached: false,
-      });
+      await trackStateWrite(
+        this.repository.update(session.id, {
+          backendSessionId: result.backendSessionId,
+          messageCount: session.messageCount + 1,
+          backend: resolvedBackend,
+          ...(servedModel ? { model: servedModel } : {}),
+          lifecycle: postRunLifecycle as Session['lifecycle'],
+          cliAttached: false,
+        })
+      );
+      finalized = true;
     } else {
-      await this.repository.update(session.id, {
-        messageCount: session.messageCount + 1,
-        backend: resolvedBackend,
-        lifecycle: postRunLifecycle as Session['lifecycle'],
-        cliAttached: false,
-      });
+      await trackStateWrite(
+        this.repository.update(session.id, {
+          messageCount: session.messageCount + 1,
+          backend: resolvedBackend,
+          ...(servedModel ? { model: servedModel } : {}),
+          lifecycle: postRunLifecycle as Session['lifecycle'],
+          cliAttached: false,
+        })
+      );
+      finalized = true;
     }
 
-    if (result.usage) {
+    // Cleared ONLY if a terminal state actually persisted. Clearing after a
+    // refused write would delete this run from the registry while its row
+    // still says `running` — and if shutdown is mid-drain and has not
+    // snapshotted yet, the session vanishes from the report and gets no
+    // notice. Exactly the original zombie, reached through the gate meant to
+    // prevent it (Lumen, PR #490 round 4).
+    //
+    // Staying registered is also right when something throws between
+    // runner.run() and here: the row really is still `running`, so a later
+    // shutdown reporting it as interrupted is the truth.
+    if (finalized) {
+      clearActiveRun(session.id);
+      // The run boundary is the real terminal edge for lease release: a
+      // release requested mid-turn (end_session from inside the run) was
+      // deferred so no other thread could enter the worktree while this
+      // process was still cd'd into it. Now that the run is durably finished,
+      // release if the session ended. Fire-and-forget — release must never
+      // delay response routing.
+      void this.releaseLeaseIfSessionTerminal(session.id);
+    }
+
+    // Gated on `finalized` for the same reason the lifecycle write is:
+    // updateTokenUsage() ends in a full SessionRepository.update(), which
+    // replaces the whole metadata blob and is not tracked by the drain — so
+    // it can erase the interruption breadcrumb written moments earlier. The
+    // compaction trigger below would likewise start new work against a server
+    // that has closed intake. Losing a usage checkpoint costs a stats row;
+    // losing the breadcrumb costs the record of the interruption itself
+    // (Lumen, PR #490 round 5).
+    if (result.usage && finalized) {
       // Scope the cumulative checkpoint to the backend thread the counts came
       // from — Codex totals restart whenever the thread does.
       await this.repository.updateTokenUsage(
@@ -888,6 +1321,9 @@ export class SessionService implements ISessionService {
           contextTokens: result.usage.contextTokens,
           inputTokens: result.usage.inputTokens,
           outputTokens: result.usage.outputTokens,
+          cacheReadTokens: result.usage.cacheReadTokens,
+          cacheWriteTokens: result.usage.cacheWriteTokens,
+          modelUsage: result.usage.modelUsage,
           cumulative: result.usage.cumulative,
         },
         { backendSessionId: result.backendSessionId ?? session.backendSessionId ?? null }
@@ -987,7 +1423,7 @@ export class SessionService implements ISessionService {
     const type = options?.type || 'primary';
 
     const { backend } = await this.resolveAgentBackend(userId, agentId);
-    const resolvedStudioId = await this.resolveStudioId(userId, agentId, {
+    const routing = await this.resolveStudioId(userId, agentId, {
       threadKey: options?.threadKey,
       explicitStudioId: options?.studioId,
       studioHint: options?.studioHint,
@@ -995,6 +1431,23 @@ export class SessionService implements ISessionService {
       repoRoot: options?.repoRoot,
       backend,
     });
+    const resolvedStudioId = routing.studioId;
+
+    // A named studio that does not exist stops resolution here, before any
+    // reuse lookup runs. Every rung below — alias, threadKey continuity,
+    // default session, most-recent session — is unscoped by studio, so
+    // continuing would let a session in an unrelated worktree win the
+    // request the caller addressed somewhere specific. Guarding only the
+    // alias lookup (as this PR first did) left the other three open.
+    //
+    // Deliberately narrow: this fires only for a slug naming a studio that is
+    // absent, never for "main" on an agent that has no root studio, which is
+    // an ordinary state that must keep degrading rather than throwing.
+    if (routing.unresolvedNamedStudio) {
+      throw new UnresolvedStudioError(routing.unresolvedNamedStudio, agentId);
+    }
+
+    const leaseCtx = { userId, agentId, threadKey: options?.threadKey };
 
     // Resolve default_session_id from agent identity. When set, threadKey
     // misses route to this session instead of creating new ones.
@@ -1015,7 +1468,7 @@ export class SessionService implements ISessionService {
             sessionThreadKey: recipientSession.threadKey,
             studioId: recipientSession.studioId || null,
           });
-          return recipientSession;
+          return this.withStudioLease(recipientSession, routing, leaseCtx);
         }
       }
 
@@ -1023,20 +1476,59 @@ export class SessionService implements ISessionService {
       // Takes priority over threadKey because alias is an explicit user intent.
       if (options?.alias && 'findByAlias' in this.repository) {
         const aliasRepo = this.repository as {
-          findByAlias: (u: string, a: string, alias: string) => Promise<Session | null>;
+          findByAlias: (
+            u: string,
+            a: string,
+            alias: string,
+            studioId?: string
+          ) => Promise<Session | null>;
         };
-        const aliasMatch = await aliasRepo.findByAlias(userId, agentId, options.alias);
+
+        // Pin the alias lookup to a studio only when the caller named one.
+        // 'explicit' and 'studio-hint' are the caller-qualified tiers; every
+        // tier below them is inferred (route pattern, most-recent, fallback),
+        // and pinning to an inferred studio would turn a resolvable alias into
+        // a miss — the resolver would refuse to see a session the caller never
+        // said anything about.
+        const callerNamedStudio = routing.tier === 'explicit' || routing.tier === 'studio-hint';
+
+        // Scope to the caller's studio when they named one that resolved.
+        // Otherwise the lookup is unscoped, which is safe on its own terms:
+        // findByAlias refuses an alias matching across two studios rather
+        // than guessing, so "unscoped" means "must be unique", not "pick one".
+        //
+        // An earlier revision skipped the lookup entirely whenever a
+        // caller-qualified tier produced no studio. That guard was load-
+        // bearing when it was the only defence, but once a literal slug miss
+        // began throwing before this point, the only case still reaching it
+        // was the *permitted* one — `main` on an agent with no root studio.
+        // It then suppressed alias resolution for precisely the repo-less
+        // agents the degrade exists to serve, dropping them through to
+        // threadKey/default/general, which can select a different session
+        // than the alias named. Removing it restores the feature without
+        // reopening the misroute, because the dangerous branch no longer
+        // arrives here at all.
+        const aliasStudioScope = callerNamedStudio ? resolvedStudioId : undefined;
+
+        const aliasMatch = await aliasRepo.findByAlias(
+          userId,
+          agentId,
+          options.alias,
+          aliasStudioScope
+        );
         if (aliasMatch) {
           logger.debug('Found existing session by alias', {
             sessionId: aliasMatch.id,
             alias: options.alias,
             studioId: aliasMatch.studioId || null,
+            aliasStudioScope: aliasStudioScope ?? null,
           });
-          return aliasMatch;
+          return this.withStudioLease(aliasMatch, routing, leaseCtx);
         }
         logger.debug('No session found for alias', {
           alias: options.alias,
           agentId,
+          aliasStudioScope: aliasStudioScope ?? null,
         });
       }
 
@@ -1064,7 +1556,7 @@ export class SessionService implements ISessionService {
             threadKey: options.threadKey,
             studioId: threadMatch.studioId || null,
           });
-          return threadMatch;
+          return this.withStudioLease(threadMatch, routing, leaseCtx);
         }
 
         // Thread-scoped request with no match. If the agent has a default
@@ -1078,7 +1570,7 @@ export class SessionService implements ISessionService {
               threadKey: options.threadKey,
               defaultSessionId,
             });
-            return defaultSession;
+            return this.withStudioLease(defaultSession, routing, leaseCtx);
           }
           logger.debug('default_session_id is set but session is ended/missing; creating new', {
             defaultSessionId,
@@ -1115,7 +1607,7 @@ export class SessionService implements ISessionService {
             backendSessionId: existing.backendSessionId,
             studioId: existing.studioId || null,
           });
-          return existing;
+          return this.withStudioLease(existing, routing, leaseCtx);
         }
       }
     }
@@ -1144,14 +1636,30 @@ export class SessionService implements ISessionService {
       contextTokens: 0,
       totalInputTokens: 0,
       totalOutputTokens: 0,
+      totalCacheReadTokens: 0,
+      totalCacheWriteTokens: 0,
       messageCount: 0,
       tokenCount: 0,
       backend,
-      model: null, // Set explicitly when known; runner model != verified session model
+      // Null until a turn runs — the model that actually served the turn is
+      // recorded post-run, so this never claims a model that was only asked for.
+      model: null,
       lastCompactionAt: null,
       compactionCount: 0,
       endedAt: null,
-      metadata: {},
+      metadata: {
+        // Which tier fired, what occupancy did about it. Refusals and diverts
+        // are the highest-signal routing events in the system — make them
+        // reconstructable from the session row alone.
+        routing_decision: {
+          tier: routing.tier,
+          studioId: resolvedStudioId ?? null,
+          threadKey: options?.threadKey ?? null,
+          occupancyChecked: routing.occupancyChecked,
+          ...(routing.diverted ? { diverted: { ...routing.diverted } } : {}),
+          resolvedAt: new Date().toISOString(),
+        },
+      },
     });
 
     logger.info('Created new session', {
@@ -1161,9 +1669,10 @@ export class SessionService implements ISessionService {
       type,
       alias: options?.alias || null,
       studioId: resolvedStudioId || null,
+      routingTier: routing.tier,
     });
 
-    return session;
+    return this.withStudioLease(session, routing, leaseCtx);
   }
 
   private async resolveStudioId(
@@ -1177,22 +1686,32 @@ export class SessionService implements ISessionService {
       backend?: string;
       repoRoot?: string;
     }
-  ): Promise<string | undefined> {
+  ): Promise<StudioRoutingDecision> {
+    const leaseCtx = { userId, agentId, threadKey: options.threadKey };
+
     // explicitStudioId takes precedence — it's the precise routing signal.
     if (options.explicitStudioId) {
       if (isMainStudio(options.explicitStudioId)) {
-        return this.resolveMainStudioId(userId, options.repoRoot, agentId);
+        return {
+          studioId: await this.resolveMainStudioId(userId, options.repoRoot, agentId),
+          tier: 'explicit',
+          occupancyChecked: false,
+        };
       }
-      return options.explicitStudioId;
+      return { studioId: options.explicitStudioId, tier: 'explicit', occupancyChecked: false };
     }
 
     if (!this.supabase) {
-      return undefined;
+      return { studioId: undefined, tier: 'none', occupancyChecked: false };
     }
 
     // studioHint is a convenience fallback — only consulted when no explicit studioId.
     if (isMainStudio(options.studioHint)) {
-      return this.resolveMainStudioId(userId, options.repoRoot, agentId);
+      return {
+        studioId: await this.resolveMainStudioId(userId, options.repoRoot, agentId),
+        tier: 'studio-hint',
+        occupancyChecked: false,
+      };
     }
 
     if (options.studioHint) {
@@ -1208,7 +1727,7 @@ export class SessionService implements ISessionService {
         .maybeSingle();
 
       if (namedStudio?.id) {
-        return namedStudio.id;
+        return { studioId: namedStudio.id, tier: 'studio-hint', occupancyChecked: false };
       }
 
       // studioHint was explicit — don't silently fall through to unrelated studios
@@ -1217,7 +1736,12 @@ export class SessionService implements ISessionService {
         agentId,
         studioHint: options.studioHint,
       });
-      return undefined;
+      return {
+        studioId: undefined,
+        tier: 'studio-hint',
+        occupancyChecked: false,
+        unresolvedNamedStudio: options.studioHint,
+      };
     }
 
     // 1) Related session scope (explicit resume continuity)
@@ -1231,7 +1755,7 @@ export class SessionService implements ISessionService {
 
       const scopedStudioId = data?.studio_id || undefined;
       if (scopedStudioId) {
-        return scopedStudioId;
+        return { studioId: scopedStudioId, tier: 'recipient-session', occupancyChecked: false };
       }
     }
 
@@ -1251,7 +1775,7 @@ export class SessionService implements ISessionService {
 
       const activeThreadStudio = activeThreadSession?.studio_id || undefined;
       if (activeThreadStudio) {
-        return activeThreadStudio;
+        return { studioId: activeThreadStudio, tier: 'thread-continuity', occupancyChecked: false };
       }
 
       const { data: endedThreadSession } = await this.supabase
@@ -1268,7 +1792,7 @@ export class SessionService implements ISessionService {
 
       const endedThreadStudio = endedThreadSession?.studio_id || undefined;
       if (endedThreadStudio) {
-        return endedThreadStudio;
+        return { studioId: endedThreadStudio, tier: 'thread-continuity', occupancyChecked: false };
       }
     }
 
@@ -1315,7 +1839,7 @@ export class SessionService implements ISessionService {
             studioId: matches[0].id,
             specificity: matches[0].specificity,
           });
-          return matches[0].id;
+          return this.gateOccupancy(matches[0].id, 'route-pattern', leaseCtx);
         }
         if (matches.length > 1) {
           logger.warn('[StudioResolve] Ambiguous route pattern match, falling through', {
@@ -1357,17 +1881,28 @@ export class SessionService implements ISessionService {
           agentId,
           studioId: repoRootStudioId,
         });
-        return repoRootStudioId;
+        return this.gateOccupancy(repoRootStudioId, 'repo-root-main', leaseCtx);
       }
     }
 
     // 5) Agent's own studio (authoritative — from studios table, not session history)
+    //
+    // Archived studios are NOT routing candidates (spec:trigger-studio-routing v5).
+    // Archiving a studio is the operator saying "stop sending work here"; honouring
+    // that only in the tiers above and then resurrecting it in the fallback makes
+    // archival advisory rather than binding.
+    //
+    // Note: resolveMainStudio() below deliberately still accepts 'archived'. It is
+    // scoped to one repo_root/worktree_path and backs an auto-create path guarded by
+    // a unique constraint on (worktree_path, agent_id) — excluding archived there
+    // would miss the row, collide on insert, and miss again on the 23505 retry,
+    // leaving main-studio resolution permanently undefined for that repo.
     const { data: agentStudio } = await this.supabase
       .from('studios')
       .select('id, updated_at')
       .eq('user_id', userId)
       .eq('agent_id', agentId)
-      .in('status', ['active', 'idle', 'archived'])
+      .in('status', ['active', 'idle'])
       .order('updated_at', { ascending: false })
       .limit(1)
       .maybeSingle();
@@ -1378,7 +1913,7 @@ export class SessionService implements ISessionService {
         agentId,
         studioId: agentStudio.id,
       });
-      return agentStudio.id;
+      return this.gateOccupancy(agentStudio.id, 'agent-recent', leaseCtx);
     }
 
     // NOTE: We intentionally skip "most recent session's studio" as a fallback.
@@ -1393,7 +1928,7 @@ export class SessionService implements ISessionService {
         agentId,
         studioId: mainStudioId,
       });
-      return mainStudioId;
+      return this.gateOccupancy(mainStudioId, 'main-fallback', leaseCtx);
     }
 
     // Codex is worktree-sensitive: keep a deterministic warning when no studio could be resolved.
@@ -1408,7 +1943,7 @@ export class SessionService implements ISessionService {
       );
     }
 
-    return undefined;
+    return { studioId: undefined, tier: 'none', occupancyChecked: false };
   }
 
   private async resolveMainStudioId(
@@ -1561,11 +2096,14 @@ This session will continue with a fresh context after compaction. Your identity,
           ? this.config.defaultCodexModel
           : compactionModelKey === 'gemini'
             ? this.config.defaultGeminiModel
-            : this.config.defaultModel;
+            : compactionModelKey === 'antigravity'
+              ? this.config.defaultAntigravityModel
+              : this.config.defaultModel;
 
       const runnerConfig: ClaudeRunnerConfig = {
         workingDirectory: compactionWorkingDirectory,
         mcpConfigPath: this.config.mcpConfigPath,
+        ...(this.config.inkMcpUrl ? { inkMcpUrl: this.config.inkMcpUrl } : {}),
         appendSystemPrompt: buildIdentityPrompt(
           session.agentId,
           context.agent.name,
@@ -1583,9 +2121,11 @@ This session will continue with a fresh context after compaction. Your identity,
           ? this.codexRunner
           : runtimeBackend === 'gemini'
             ? this.geminiRunner
-            : runtimeBackend === 'ink'
-              ? this.inkRunner
-              : this.claudeRunner;
+            : runtimeBackend === 'antigravity'
+              ? this.antigravityRunner
+              : runtimeBackend === 'ink'
+                ? this.inkRunner
+                : this.claudeRunner;
 
       // Phase 1: Send compaction prompt — agent saves context, notifies users, ends session
       const result = await runner.run(compactionPrompt, {
@@ -1626,10 +2166,12 @@ This session will continue with a fresh context after compaction. Your identity,
    */
   private normalizeBackend(
     raw: string | null | undefined
-  ): 'claude-code' | 'codex-cli' | 'gemini' | 'ink' {
+  ): 'claude-code' | 'codex-cli' | 'gemini' | 'antigravity' | 'ink' {
     const value = (raw || '').toLowerCase().trim();
     if (value === 'codex' || value === 'codex-cli') return 'codex-cli';
     if (value === 'gemini' || value === 'gemini-cli') return 'gemini';
+    if (value === 'antigravity' || value === 'antigravity-cli' || value === 'agy')
+      return 'antigravity';
     if (value === 'ink' || value === 'direct-api' || value === 'direct' || value === 'api')
       return 'ink';
     if (value === 'claude' || value === 'claude-code' || value === '') return 'claude-code';
@@ -1668,8 +2210,8 @@ This session will continue with a fresh context after compaction. Your identity,
     userId: string,
     agentId: string
   ): Promise<{
-    backend: 'claude-code' | 'codex-cli' | 'gemini' | 'ink';
-    provider: 'claude-code' | 'codex-cli' | 'gemini' | 'ink' | null;
+    backend: 'claude-code' | 'codex-cli' | 'gemini' | 'antigravity' | 'ink';
+    provider: 'claude-code' | 'codex-cli' | 'gemini' | 'antigravity' | 'ink' | null;
   }> {
     try {
       const { backend, provider } = await this.contextBuilder.getAgentBackend(userId, agentId);
@@ -1693,9 +2235,38 @@ This session will continue with a fresh context after compaction. Your identity,
   private resolveRuntimeBackend(
     sessionBackend: string | null | undefined,
     identityBackend: string | null | undefined
-  ): 'claude-code' | 'codex-cli' | 'gemini' | 'ink' {
+  ): 'claude-code' | 'codex-cli' | 'gemini' | 'antigravity' | 'ink' {
     if (sessionBackend) return this.normalizeBackend(sessionBackend);
     return this.normalizeBackend(identityBackend);
+  }
+
+  /**
+   * Run-boundary lease release: called after clearActiveRun once a turn's
+   * terminal state is durably written. If the session ended during the turn
+   * (end_session / update_session_state from inside it), the release that was
+   * deferred then happens now — at the moment the process actually left the
+   * worktree.
+   */
+  private async releaseLeaseIfSessionTerminal(sessionId: string): Promise<void> {
+    const leases = this.getLeaseService();
+    if (!leases) return;
+    try {
+      const session = await this.repository.findById(sessionId);
+      if (!session) return;
+      const terminal = Boolean(session.endedAt) || session.status === 'completed';
+      // releaseAtBoundary also completes pendingRelease markers — a
+      // close_thread/close_studio issued mid-turn deferred to this moment.
+      await leases.releaseAtBoundary(sessionId, {
+        userId: session.userId,
+        sessionTerminal: terminal,
+        reason: 'run-terminal',
+      });
+    } catch (err) {
+      logger.warn('[StudioLease] Run-boundary release failed', {
+        sessionId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 
   async endSession(sessionId: string, summary?: string): Promise<void> {
@@ -1712,6 +2283,22 @@ This session will continue with a fresh context after compaction. Your identity,
         endSummary: summary,
       },
     });
+
+    // Automatic lease release — session end is a terminal path, so whatever
+    // studio this session held goes back to the pool without the SB opting
+    // in. Deferred while an in-process run is still executing in the
+    // worktree; the run boundary (releaseLeaseIfSessionTerminal) picks it up.
+    const leases = this.getLeaseService();
+    if (leases) {
+      await leases
+        .releaseUnlessRunning(sessionId, { userId: session.userId, reason: 'session-end' })
+        .catch((err) => {
+          logger.warn('[StudioLease] Release on session end failed', {
+            sessionId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+    }
 
     // Clear stale channel_routes so heartbeat reminders don't route to this ended session
     if (this.supabase) {
@@ -2223,6 +2810,7 @@ export function createSessionService(
     new CodexRunner(),
     supabase,
     new GeminiRunner(),
-    new InkRunner()
+    new InkRunner(),
+    new AntigravityRunner()
   );
 }

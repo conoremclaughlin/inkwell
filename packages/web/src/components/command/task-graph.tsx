@@ -55,7 +55,15 @@ function TaskNodeComponent({ data }: { data: Record<string, unknown> }) {
       <div className="text-[10px] mt-1" style={{ color: skin.colors.textMuted }}>
         {status}
         {data.agentId ? ` · ${data.agentId}` : ''}
+        {data.blocked ? ' · gated' : ''}
       </div>
+      {/* A dependency cycle means this task can never become unblocked. Say so
+          on the node — it is a data defect, and it is invisible in a list. */}
+      {data.cyclic ? (
+        <div className="text-[10px] mt-0.5 font-bold" style={{ color: skin.colors.taskBlocked }}>
+          ⚠ dependency cycle
+        </div>
+      ) : null}
       <Handle type="source" position={Position.Right} className="!bg-gray-400" />
     </div>
   );
@@ -86,6 +94,70 @@ const nodeTypes: NodeTypes = {
   groupHeader: GroupHeaderNode,
 };
 
+// ─── Dependency layering ───
+
+/**
+ * Longest-path depth for every task, following `blockedBy` edges.
+ *
+ * Depth is the layout column: a task sits one column right of its latest
+ * blocker, so in an acyclic graph an edge never points backwards and the
+ * reading order matches the execution order.
+ *
+ * `blocked_by` is a bare `uuid[]` with nothing in the schema forbidding a
+ * cycle, and a cycle here would recurse forever. The walk below detects one
+ * and drops the back-edge *for layout only* — a task group that can never
+ * start is worth surfacing, not silently laying out.
+ *
+ * Two deliberate choices about how a cycle is reported:
+ *
+ *  - **Every member is marked, not just the task the back-edge landed on.**
+ *    Which task that is depends on iteration order, so marking one would
+ *    label a different node run to run and tell the reader nothing about the
+ *    cycle's extent. `backEdges` records the specific edges that close a
+ *    cycle so the renderer can distinguish them.
+ *  - **The back-edge is still drawn.** It is a real dependency, and hiding it
+ *    would hide the cycle. It is the one edge that points backwards, so the
+ *    renderer marks it rather than pretending the layout is a clean DAG.
+ */
+export function computeDepths(
+  ids: string[],
+  dependenciesOf: (id: string) => string[]
+): { depth: Map<string, number>; cyclic: Set<string>; backEdges: Set<string> } {
+  const depth = new Map<string, number>();
+  const cyclic = new Set<string>();
+  const backEdges = new Set<string>();
+  const state = new Map<string, 'visiting' | 'done'>();
+  const stack: string[] = [];
+
+  const walk = (id: string): number => {
+    const seen = state.get(id);
+    if (seen === 'done') return depth.get(id) ?? 0;
+    if (seen === 'visiting') {
+      // Back-edge closes a cycle. Everything from `id` up the current DFS
+      // stack is on that cycle — mark the whole set, not just this node.
+      const from = stack.lastIndexOf(id);
+      if (from !== -1) for (const member of stack.slice(from)) cyclic.add(member);
+      else cyclic.add(id);
+      return 0;
+    }
+
+    state.set(id, 'visiting');
+    stack.push(id);
+    let d = 0;
+    for (const dep of dependenciesOf(id)) {
+      if (state.get(dep) === 'visiting') backEdges.add(`${dep}->${id}`);
+      d = Math.max(d, walk(dep) + 1);
+    }
+    stack.pop();
+    state.set(id, 'done');
+    depth.set(id, d);
+    return d;
+  };
+
+  for (const id of ids) walk(id);
+  return { depth, cyclic, backEdges };
+}
+
 // ─── Task Graph Component ───
 
 export function TaskGraph() {
@@ -95,6 +167,20 @@ export function TaskGraph() {
   const { nodes, edges } = useMemo(() => {
     const n: Node[] = [];
     const e: Edge[] = [];
+
+    const byId = new Map(tasks.map((t) => [t.id, t]));
+
+    // `blocked_by` may name tasks outside the fetched set — completed ones
+    // filtered out by activeOnly, or tasks in another project. Those are real
+    // dependencies but we have no node to attach them to, so they are dropped
+    // from the layout rather than drawn as edges into nothing.
+    const dependenciesOf = (id: string) =>
+      (byId.get(id)?.blockedBy ?? []).filter((d) => byId.has(d));
+
+    const { depth, cyclic, backEdges } = computeDepths(
+      tasks.map((t) => t.id),
+      dependenciesOf
+    );
 
     // Group tasks by groupId
     const groups = new Map<string, typeof tasks>();
@@ -110,12 +196,48 @@ export function TaskGraph() {
       }
     }
 
+    const COL = 240;
+    const ROW = 92;
     let yOffset = 0;
 
-    // Render grouped tasks
+    /** Places one set of tasks in dependency columns; returns its height. */
+    const layoutSet = (set: typeof tasks, xBase: number, yBase: number): number => {
+      const rowInColumn = new Map<number, number>();
+
+      // Stable order within a column so the layout doesn't reshuffle on every
+      // poll: declared order first, then title.
+      const ordered = [...set].sort(
+        (a, b) =>
+          (a.taskOrder ?? Number.MAX_SAFE_INTEGER) - (b.taskOrder ?? Number.MAX_SAFE_INTEGER) ||
+          a.title.localeCompare(b.title)
+      );
+
+      for (const task of ordered) {
+        const d = depth.get(task.id) ?? 0;
+        const row = rowInColumn.get(d) ?? 0;
+        rowInColumn.set(d, row + 1);
+
+        n.push({
+          id: `task-${task.id}`,
+          type: 'taskNode',
+          position: { x: xBase + d * COL, y: yBase + row * ROW },
+          data: {
+            label: task.title,
+            status: task.status,
+            priority: task.priority,
+            agentId: task.agentId,
+            blocked: dependenciesOf(task.id).length > 0,
+            cyclic: cyclic.has(task.id),
+          },
+        });
+      }
+
+      return Math.max(1, ...rowInColumn.values()) * ROW;
+    };
+
     for (const [groupId, groupTasks] of groups) {
-      const sorted = [...groupTasks].sort((a, b) => (a.taskOrder ?? 0) - (b.taskOrder ?? 0));
-      const groupTitle = sorted[0]?.groupTitle ?? 'Task Group';
+      const groupTitle = groupTasks[0]?.groupTitle ?? 'Task Group';
+      const groupEdgeCount = groupTasks.reduce((sum, t) => sum + dependenciesOf(t.id).length, 0);
 
       n.push({
         id: `group-${groupId}`,
@@ -124,66 +246,75 @@ export function TaskGraph() {
         data: { label: groupTitle },
       });
 
-      sorted.forEach((task, i) => {
-        const nodeId = `task-${task.id}`;
-        n.push({
-          id: nodeId,
-          type: 'taskNode',
-          position: { x: 200 + i * 220, y: yOffset },
-          data: {
-            label: task.title,
-            status: task.status,
-            priority: task.priority,
-            agentId: task.agentId,
-          },
+      const height = layoutSet(groupTasks, 200, yOffset);
+
+      // Header connects to the entry points — every task nothing else blocks.
+      for (const task of groupTasks) {
+        if (dependenciesOf(task.id).length > 0) continue;
+        e.push({
+          id: `e-group-${groupId}-task-${task.id}`,
+          source: `group-${groupId}`,
+          target: `task-${task.id}`,
+          animated: task.status === 'in_progress',
+          style: { stroke: skin.colors.accent + '60' },
         });
+      }
 
-        // Edge from group header to first task
-        if (i === 0) {
+      // A group with no recorded dependencies is a list, and the honest way to
+      // draw a list is as a dashed sequence — implied by task_order, not
+      // declared by anyone. Solid edges are reserved for real blocked_by
+      // links, so the picture never claims a dependency the data doesn't have.
+      if (groupEdgeCount === 0 && groupTasks.length > 1) {
+        const seq = [...groupTasks].sort(
+          (a, b) =>
+            (a.taskOrder ?? Number.MAX_SAFE_INTEGER) - (b.taskOrder ?? Number.MAX_SAFE_INTEGER)
+        );
+        for (let i = 1; i < seq.length; i += 1) {
           e.push({
-            id: `e-group-${groupId}-${nodeId}`,
-            source: `group-${groupId}`,
-            target: nodeId,
-            animated: task.status === 'in_progress',
-            style: { stroke: skin.colors.accent + '60' },
+            id: `e-seq-${seq[i - 1].id}-${seq[i].id}`,
+            source: `task-${seq[i - 1].id}`,
+            target: `task-${seq[i].id}`,
+            animated: false,
+            style: { stroke: skin.colors.border, strokeDasharray: '4 4' },
           });
         }
+      }
 
-        // Chain edges between sequential tasks
-        if (i > 0) {
-          const prevId = `task-${sorted[i - 1].id}`;
-          e.push({
-            id: `e-${prevId}-${nodeId}`,
-            source: prevId,
-            target: nodeId,
-            animated: task.status === 'in_progress',
-            style: {
-              stroke:
-                sorted[i - 1].status === 'completed'
-                  ? skin.colors.taskCompleted + '80'
-                  : skin.colors.border,
-            },
-          });
-        }
-      });
-
-      yOffset += 100;
+      yOffset += height + ROW;
     }
 
-    // Ungrouped tasks
-    ungrouped.forEach((task, i) => {
-      n.push({
-        id: `task-${task.id}`,
-        type: 'taskNode',
-        position: { x: 50 + (i % 4) * 220, y: yOffset + Math.floor(i / 4) * 80 },
-        data: {
-          label: task.title,
-          status: task.status,
-          priority: task.priority,
-          agentId: task.agentId,
-        },
-      });
-    });
+    if (ungrouped.length > 0) {
+      yOffset += layoutSet(ungrouped, 50, yOffset) + ROW;
+    }
+
+    // Dependency edges, including those crossing task groups — a cross-group
+    // blocker is exactly the kind of coupling a per-group list cannot show.
+    for (const task of tasks) {
+      for (const depId of dependenciesOf(task.id)) {
+        const blocker = byId.get(depId)!;
+        // The one edge that closes a cycle is the one edge the layout could
+        // not honour, so it is the one edge that points backwards. Draw it —
+        // it is a real dependency — but mark it, rather than letting it read
+        // as an ordinary link the reader is meant to trust.
+        const isBackEdge = backEdges.has(`${depId}->${task.id}`);
+        e.push({
+          id: `e-dep-${depId}-${task.id}`,
+          source: `task-${depId}`,
+          target: `task-${task.id}`,
+          animated: !isBackEdge && task.status === 'in_progress',
+          label: isBackEdge ? '⚠ cycle' : undefined,
+          style: {
+            stroke: isBackEdge
+              ? skin.colors.taskBlocked
+              : blocker.status === 'completed'
+                ? skin.colors.taskCompleted + '80'
+                : skin.colors.taskBlocked + '90',
+            strokeWidth: isBackEdge || blocker.groupId !== task.groupId ? 2 : 1,
+            ...(isBackEdge ? { strokeDasharray: '6 3' } : {}),
+          },
+        });
+      }
+    }
 
     return { nodes: n, edges: e };
   }, [tasks, skin]);

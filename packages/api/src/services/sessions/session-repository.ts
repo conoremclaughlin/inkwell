@@ -14,17 +14,99 @@ import type {
   SessionType,
   ISessionRepository,
   UsageCheckpoint,
+  ModelUsageTotals,
 } from './types.js';
 import { logger } from '../../utils/logger.js';
 
 /**
- * Ceiling on a single turn's reported token usage.
+ * Raised when a bare session alias matches active sessions in more than one
+ * studio, so no single session is the address the caller asked for.
  *
- * Well above any real turn (largest context windows are a few million tokens),
- * and far below the scale a mistakenly-accumulated cumulative counter reaches.
- * Exported for tests.
+ * Carried to the caller rather than swallowed: the fix is for the sender to
+ * qualify the address (recipientStudioSlug / recipientStudioId), and only an
+ * error that names the candidates makes that possible.
+ */
+export class AmbiguousAliasError extends Error {
+  readonly code = 'AMBIGUOUS_SESSION_ALIAS';
+
+  constructor(
+    readonly alias: string,
+    readonly agentId: string,
+    readonly candidates: Array<{ sessionId: string; studioId: string | null }>
+  ) {
+    const studios = candidates.map((c) => c.studioId ?? '(no studio)').join(', ');
+    super(
+      `Session alias "${alias}" for agent "${agentId}" is ambiguous — it matches ` +
+        `${candidates.length} active sessions across studios: ${studios}. ` +
+        `Qualify the address with recipientStudioSlug or recipientStudioId.`
+    );
+    this.name = 'AmbiguousAliasError';
+  }
+}
+
+/**
+ * Ceiling on a diffed CUMULATIVE delta (Codex thread totals).
+ *
+ * Well above any real turn on that path, and far below the scale a
+ * mistakenly-accumulated running counter reaches. Exported for tests.
  */
 export const MAX_PLAUSIBLE_TURN_TOKENS = 10_000_000;
+
+/**
+ * Ceiling on a single PER-TURN report (Claude query totals).
+ *
+ * Much higher, because one query bills its cached prompt again on every model
+ * step: ~20 steps against a ~500k context is ~10M input from one honest turn,
+ * and a long agentic run can reach tens of millions. Only a report orders of
+ * magnitude past that is evidence of a counter bug rather than a busy turn —
+ * the incident that motivated these guards reported 3.4 BILLION.
+ *
+ * Exported for tests.
+ */
+export const MAX_PLAUSIBLE_QUERY_TOKENS = 1_000_000_000;
+
+/**
+ * Add a turn's per-model figures onto a session's running per-model totals,
+ * key by key. Unknown keys start at zero; known ones accumulate.
+ */
+function mergeModelUsage(
+  current: Record<string, ModelUsageTotals> | undefined,
+  turn: Record<string, ModelUsageTotals>
+): Record<string, ModelUsageTotals> {
+  const merged: Record<string, ModelUsageTotals> = { ...(current || {}) };
+  for (const [model, entry] of Object.entries(turn)) {
+    const prior = merged[model];
+    merged[model] = {
+      inputTokens: (prior?.inputTokens || 0) + entry.inputTokens,
+      outputTokens: (prior?.outputTokens || 0) + entry.outputTokens,
+      cacheReadTokens: (prior?.cacheReadTokens || 0) + entry.cacheReadTokens,
+      cacheWriteTokens: (prior?.cacheWriteTokens || 0) + entry.cacheWriteTokens,
+      // Cost completeness, not just cost: a mixed set of known and unknown
+      // contributions must not publish its subtotal as the total. Order does
+      // not matter — unknown-then-known and known-then-unknown both mark the
+      // running figure partial.
+      ...(() => {
+        const priorCost = prior?.costUSD;
+        const entryCost = entry.costUSD;
+        if (priorCost === undefined && entryCost === undefined) return {};
+        const partial =
+          prior?.costPartial === true ||
+          // The incoming turn may ALREADY be a lower bound (the CLI summed a
+          // run whose invocations mixed reported and unreported cost). Reading
+          // only `prior` made a first such entry land as complete.
+          entry.costPartial === true ||
+          (prior !== undefined && priorCost === undefined) ||
+          entryCost === undefined;
+        return {
+          costUSD: (priorCost ?? 0) + (entryCost ?? 0),
+          ...(partial ? { costPartial: true } : {}),
+        };
+      })(),
+      ...(entry.canonicalModel ? { canonicalModel: entry.canonicalModel } : {}),
+    };
+  }
+  return merged;
+}
 
 type DbSession = Database['public']['Tables']['sessions']['Row'];
 type DbSessionInsert = Database['public']['Tables']['sessions']['Insert'];
@@ -61,6 +143,9 @@ function mapDbToSession(row: DbSession): Session {
     contextTokens: (metadata.contextTokens as number) || 0,
     totalInputTokens: (metadata.totalInputTokens as number) || 0,
     totalOutputTokens: (metadata.totalOutputTokens as number) || 0,
+    totalCacheReadTokens: (metadata.totalCacheReadTokens as number) || 0,
+    totalCacheWriteTokens: (metadata.totalCacheWriteTokens as number) || 0,
+    modelUsage: (metadata.modelUsage as Record<string, ModelUsageTotals> | undefined) || undefined,
     usageCheckpoint: (metadata.usageCheckpoint as UsageCheckpoint | undefined) || undefined,
 
     // Aggregate counters (persisted as columns)
@@ -122,6 +207,8 @@ function mapSessionToDb(
       contextTokens: session.contextTokens,
       totalInputTokens: session.totalInputTokens,
       totalOutputTokens: session.totalOutputTokens,
+      totalCacheReadTokens: session.totalCacheReadTokens,
+      totalCacheWriteTokens: session.totalCacheWriteTokens,
       lastCompactionAt: session.lastCompactionAt?.toISOString() || null,
       compactionCount: session.compactionCount,
       ...session.metadata,
@@ -203,26 +290,72 @@ export class SessionRepository implements ISessionRepository {
     return session;
   }
 
-  async findByAlias(userId: string, agentId: string, alias: string): Promise<Session | null> {
+  /**
+   * Resolve a session by its human-readable alias.
+   *
+   * Aliases are scoped to (user, agent, studio) — see the
+   * 20260814080050_session_alias_studio_scope migration. Two studios may each
+   * hold a session named "review", so a bare alias is not always a unique
+   * address.
+   *
+   * @param studioId When the caller named a studio explicitly, the lookup is
+   *   pinned to it and a match elsewhere is not a match. When omitted, the
+   *   alias must identify exactly one active session.
+   * @throws {AmbiguousAliasError} when a bare alias matches sessions in more
+   *   than one studio. Refusing is deliberate: the previous implementation
+   *   ordered by started_at and took the newest, which routes work into
+   *   whichever worktree happened to start last. A caller that gets an error
+   *   can qualify the address; a caller that gets the wrong studio cannot
+   *   tell that anything went wrong.
+   */
+  async findByAlias(
+    userId: string,
+    agentId: string,
+    alias: string,
+    studioId?: string
+  ): Promise<Session | null> {
     // alias column not yet in generated Supabase types — cast
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const { data, error } = (await (this.supabase as any)
+    let query = (this.supabase as any)
       .from('sessions')
       .select('*')
       .eq('user_id', userId)
       .eq('agent_id', agentId)
       .eq('alias', alias)
       .is('ended_at', null)
-      .neq('lifecycle', 'failed')
-      .order('started_at', { ascending: false })
-      .limit(1)) as { data: DbSession[] | null; error: { message: string; code?: string } | null };
+      .neq('lifecycle', 'failed');
+
+    if (studioId !== undefined) {
+      query = query.eq('studio_id', studioId);
+    }
+
+    const { data, error } = (await query.order('started_at', { ascending: false })) as {
+      data: DbSession[] | null;
+      error: { message: string; code?: string } | null;
+    };
 
     if (error) {
-      logger.error('Error finding session by alias', { userId, agentId, alias, error });
+      logger.error('Error finding session by alias', { userId, agentId, alias, studioId, error });
       throw error;
     }
 
-    return data && data.length > 0 ? mapDbToSession(data[0]) : null;
+    const rows = data ?? [];
+    if (rows.length === 0) return null;
+
+    // A studio-pinned lookup is unique by index, so anything past the first
+    // row would mean the index is gone. Take it and move on.
+    if (studioId !== undefined) return mapDbToSession(rows[0]);
+
+    const distinctStudios = new Set(rows.map((r) => r.studio_id ?? null));
+    if (distinctStudios.size > 1) {
+      throw new AmbiguousAliasError(
+        alias,
+        agentId,
+        rows.map((r) => ({ sessionId: r.id, studioId: r.studio_id ?? null }))
+      );
+    }
+
+    return mapDbToSession(rows[0]);
   }
 
   async findByThreadKey(
@@ -239,7 +372,14 @@ export class SessionRepository implements ISessionRepository {
       .eq('agent_id', agentId)
       .eq('thread_key', threadKey)
       .is('ended_at', null)
-      .neq('lifecycle', 'failed')
+      // `ended_at IS NULL` was doing none of the work it looks like it is
+      // doing: nothing set `ended_at` on completion, so finished sessions
+      // stayed NULL and kept matching here. A thread whose conversation was
+      // over would route the next trigger back into the completed session
+      // instead of starting a fresh one. Filter on lifecycle directly, and
+      // see handleUpdateSessionPhase — which now stamps `ended_at` too, so
+      // the clause above finally means something (PR #349, revived).
+      .not('lifecycle', 'in', '(completed,failed)')
       .order('started_at', { ascending: false })
       .limit(1);
 
@@ -329,7 +469,10 @@ export class SessionRepository implements ISessionRepository {
     return mapDbToSession(data);
   }
 
-  async update(id: string, updates: Partial<Session>): Promise<Session> {
+  async update(
+    id: string,
+    updates: Omit<Partial<Session>, 'studioId'> & { studioId?: string | null }
+  ): Promise<Session> {
     // First fetch current session to merge metadata
     const current = await this.findById(id);
     if (!current) {
@@ -405,6 +548,15 @@ export class SessionRepository implements ISessionRepository {
     if (updates.totalOutputTokens !== undefined) {
       newMetadata.totalOutputTokens = updates.totalOutputTokens;
     }
+    if (updates.totalCacheReadTokens !== undefined) {
+      newMetadata.totalCacheReadTokens = updates.totalCacheReadTokens;
+    }
+    if (updates.totalCacheWriteTokens !== undefined) {
+      newMetadata.totalCacheWriteTokens = updates.totalCacheWriteTokens;
+    }
+    if (updates.modelUsage !== undefined) {
+      newMetadata.modelUsage = updates.modelUsage as unknown as Json;
+    }
     if (updates.usageCheckpoint !== undefined) {
       newMetadata.usageCheckpoint = updates.usageCheckpoint as unknown as Json;
     }
@@ -442,6 +594,11 @@ export class SessionRepository implements ISessionRepository {
       contextTokens?: number;
       inputTokens: number;
       outputTokens: number;
+      /** Cache breakdown of `inputTokens`, not additions to it. */
+      cacheReadTokens?: number;
+      cacheWriteTokens?: number;
+      /** This turn's per-model figures, keyed as the backend reported them. */
+      modelUsage?: Record<string, ModelUsageTotals>;
       cumulative?: boolean;
     },
     options?: { backendSessionId?: string | null }
@@ -529,15 +686,26 @@ export class SessionRepository implements ISessionRepository {
     // many sampling calls, so a large delta is not inherently wrong. This only
     // catches the pathological case where a running total is still reaching us
     // undiffed, so we keep the last good value instead of persisting garbage.
+    // Two ceilings, because the two paths fail differently. A diffed
+    // cumulative delta above 10M means a running total reached us undiffed —
+    // the original 3.4B incident. A per-turn report has no such failure mode
+    // and legitimately runs far larger, since one query re-bills its cached
+    // prompt on every model step (~20 steps against a ~500k context is ~10M
+    // input from one honest turn). Holding per-turn reports to the cumulative
+    // ceiling discarded real usage, which is the accounting bug this all
+    // started from; leaving them unguarded would drop the backstop entirely
+    // (Lumen, PR #493 round 2).
     const turnTotal = deltaInput + deltaOutput;
-    if (turnTotal > MAX_PLAUSIBLE_TURN_TOKENS) {
+    const ceiling = usage.cumulative ? MAX_PLAUSIBLE_TURN_TOKENS : MAX_PLAUSIBLE_QUERY_TOKENS;
+    if (turnTotal > ceiling) {
       logger.error('Implausible single-turn token delta — refusing to accumulate', {
         id,
         usage,
         deltaInput,
         deltaOutput,
         turnTotal,
-        ceiling: MAX_PLAUSIBLE_TURN_TOKENS,
+        ceiling,
+        cumulative: !!usage.cumulative,
         hint: 'A cumulative total is likely reaching the repository undiffed',
       });
 
@@ -554,6 +722,23 @@ export class SessionRepository implements ISessionRepository {
     const newInputTokens = current.totalInputTokens + deltaInput;
     const newOutputTokens = current.totalOutputTokens + deltaOutput;
 
+    // Cache totals are a breakdown of input, so they follow the same
+    // accumulation rule. Only per-turn backends report them (Claude); Codex
+    // sends cumulative thread totals with no cache fields at all, so there is
+    // nothing to diff and nothing to add on that path.
+    const cacheReadDelta = !usage.cumulative ? usage.cacheReadTokens || 0 : 0;
+    const cacheWriteDelta = !usage.cumulative ? usage.cacheWriteTokens || 0 : 0;
+
+    // Per-model accumulation. Keys stay exactly as the backend reported them
+    // and are never merged across keys — a query can list both a dated model
+    // id and its alias, and only the reporting layer has the context to decide
+    // whether those are one model or two. Accumulating each key against itself
+    // is safe either way, and preserves costUSD, which is the figure that
+    // actually answers "what did this session spend".
+    const mergedModelUsage = usage.modelUsage
+      ? mergeModelUsage(current.modelUsage, usage.modelUsage)
+      : undefined;
+
     await this.update(id, {
       // Only persist a context figure the backend actually reported. Codex
       // JSONL carries no per-turn context measure, and aliasing it to the
@@ -561,6 +746,13 @@ export class SessionRepository implements ISessionRepository {
       ...(usage.contextTokens !== undefined ? { contextTokens: usage.contextTokens } : {}),
       totalInputTokens: newInputTokens,
       totalOutputTokens: newOutputTokens,
+      ...(cacheReadDelta
+        ? { totalCacheReadTokens: current.totalCacheReadTokens + cacheReadDelta }
+        : {}),
+      ...(cacheWriteDelta
+        ? { totalCacheWriteTokens: current.totalCacheWriteTokens + cacheWriteDelta }
+        : {}),
+      ...(mergedModelUsage ? { modelUsage: mergedModelUsage } : {}),
       tokenCount: newInputTokens + newOutputTokens,
       ...(nextCheckpoint ? { usageCheckpoint: nextCheckpoint } : {}),
     });
