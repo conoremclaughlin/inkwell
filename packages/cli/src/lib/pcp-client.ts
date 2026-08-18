@@ -20,6 +20,8 @@ export interface PcpAuthConfig {
 
 interface JsonRpcToolResult {
   content?: Array<{ type?: string; text?: string }>;
+  /** MCP's per-call failure flag — set for validation errors, unknown tools, thrown handlers. */
+  isError?: boolean;
   [key: string]: unknown;
 }
 
@@ -271,6 +273,19 @@ export class PcpClient {
       try {
         return JSON.parse(firstText) as PcpToolCallResult;
       } catch {
+        // Unparseable text on an isError result is a protocol-level failure —
+        // argument validation, an unknown tool, a thrown handler. The server
+        // reports these as `isError` with a bare message rather than the usual
+        // JSON envelope, and returning `{ text }` here made them indistinguishable
+        // from success: callers read a result object with no `sessions` key and
+        // concluded there were no sessions. Throw so a failed call fails.
+        //
+        // Structured `{"success":false,...}` bodies deliberately do NOT come
+        // through here — they parse as JSON above and keep their existing
+        // contract, because callers inspect `success` and expect to.
+        if (toolResult?.isError) {
+          throw new Error(`PCP tool call failed: ${firstText}`);
+        }
         return { text: firstText };
       }
     }
