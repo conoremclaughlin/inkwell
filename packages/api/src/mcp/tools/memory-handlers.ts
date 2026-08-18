@@ -375,6 +375,17 @@ export const rememberSchema = userIdentifierBaseSchema.extend({
     .describe(
       'Studio ID — preferred session scope for parallel worktree scenarios. Stored in metadata, not as a first-class field.'
     ),
+  // The caller sometimes knows exactly which session this memory belongs to —
+  // chat's /eject passes its own runtime.sessionId. That is strictly better
+  // information than re-deriving "the active session" server-side, which is a
+  // heuristic that can resolve to a sibling session in parallel worktrees.
+  sessionId: z
+    .string()
+    .uuid()
+    .optional()
+    .describe(
+      'Session to attribute this memory to. Takes precedence over the server-side active-session lookup; omit to let the server infer it.'
+    ),
 });
 
 export const recallSchema = userIdentifierBaseSchema.extend({
@@ -523,6 +534,14 @@ export const listSessionsSchema = userIdentifierBaseSchema.extend({
       }
     ),
   backend: z.string().optional().describe('Filter by backend runtime (e.g., "ink", "claude-code")'),
+  // `ink attach` and `ink mission` have always passed status: 'active' here.
+  // The parameter was never declared, so zod stripped it and every caller
+  // silently received unfiltered results. Declaring it without honouring it
+  // would be the same bug with extra steps, so listSessions filters on it.
+  status: z
+    .enum(['active', 'paused', 'resumable', 'completed'])
+    .optional()
+    .describe('Filter by session status'),
   limit: z.number().min(1).max(100).optional().describe('Max results (default: 20)'),
 });
 
@@ -698,18 +717,23 @@ export async function handleRemember(args: unknown, dataComposer: DataComposer) 
   const studioId = isStudioUuid(rawStudioId) ? rawStudioId : undefined;
   const agentId = getEffectiveAgentId(params.agentId);
 
-  // If there's an active session, attach its ID to the memory metadata for traceability.
-  // Never require a session — memories are too important to lose.
-  let sessionId: string | undefined;
-  try {
-    const activeSession = await dataComposer.repositories.memory.getActiveSession(
-      user.id,
-      agentId,
-      studioScope
-    );
-    sessionId = activeSession?.id;
-  } catch {
-    // Session lookup failed — save the memory anyway
+  // Attach a session ID to the memory metadata for traceability. An explicit
+  // sessionId from the caller wins: it knows which session it is, whereas the
+  // lookup below infers "the active one" and can land on a sibling session in
+  // parallel worktrees. Never require a session — memories are too important
+  // to lose.
+  let sessionId: string | undefined = params.sessionId;
+  if (!sessionId) {
+    try {
+      const activeSession = await dataComposer.repositories.memory.getActiveSession(
+        user.id,
+        agentId,
+        studioScope
+      );
+      sessionId = activeSession?.id;
+    } catch {
+      // Session lookup failed — save the memory anyway
+    }
   }
 
   const metadata = {
@@ -1394,6 +1418,7 @@ export async function handleListSessions(args: unknown, dataComposer: DataCompos
     studioId,
     filterNullStudio,
     backend: params.backend,
+    status: params.status,
     limit: params.limit,
   });
 

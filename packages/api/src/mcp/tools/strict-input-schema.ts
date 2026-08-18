@@ -57,10 +57,12 @@ export function strictToolArgsEnabled(): boolean {
  * to be handled here; a raw shape is promoted to a ZodObject first, which is
  * what the SDK would have done internally anyway.
  *
- * Anything else — an empty `{}` (debug_request), a union, an already-strict
- * object — is returned untouched. Empty shapes are deliberately left alone:
- * the SDK substitutes EMPTY_OBJECT_JSON_SCHEMA for them and there are no
- * declared keys to be strict about.
+ * A union or a non-schema value is returned untouched. An empty `{}`
+ * (debug_request) IS tightened: a tool that declares no parameters should
+ * accept none. Leaving it permissive was an earlier oversight of mine —
+ * "no declared keys to be strict about" confused the published schema with the
+ * enforced one, and an empty ZodObject rejects unknown keys perfectly well
+ * (Lumen, PR #511 review — it made classification 162/163 instead of 163/163).
  */
 export function strictifyInputSchema(schema: unknown): unknown {
   if (!schema || typeof schema !== 'object') return schema;
@@ -71,10 +73,11 @@ export function strictifyInputSchema(schema: unknown): unknown {
 
   // A raw ZodRawShape: a plain record whose values are all zod schemas. The
   // "not itself a schema" check must come first — a ZodObject also has object
-  // values, but its own _def would make this branch misfire.
+  // values, but its own _def would make this branch misfire. An empty record
+  // is a legitimate (parameterless) shape, so it takes this path too.
   if (!isZodSchema(schema)) {
     const values = Object.values(schema as Record<string, unknown>);
-    if (values.length > 0 && values.every(isZodSchema)) {
+    if (values.every(isZodSchema)) {
       return z.object(schema as z.ZodRawShape).strict();
     }
   }

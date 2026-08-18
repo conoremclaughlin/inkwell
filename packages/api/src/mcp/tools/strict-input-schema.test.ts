@@ -27,11 +27,14 @@ describe('strictifyInputSchema', () => {
     expect(schema.safeParse({ url: 'https://x.test', bogus: 1 }).success).toBe(false);
   });
 
-  it('leaves an empty shape alone', () => {
-    // debug_request registers `inputSchema: {}`; the SDK swaps in its own
-    // empty-object JSON Schema for this and there are no keys to be strict on.
-    const empty = {};
-    expect(strictifyInputSchema(empty)).toBe(empty);
+  it('tightens an empty shape too — no declared params means accept none', () => {
+    // debug_request registers `inputSchema: {}`. This used to be left
+    // permissive, which made classification 162/163 (Lumen, #511 review).
+    const schema = strictifyInputSchema({}) as z.ZodTypeAny;
+
+    expect(schema).toBeInstanceOf(z.ZodObject);
+    expect(schema.safeParse({}).success).toBe(true);
+    expect(schema.safeParse({ bogus: true }).success).toBe(false);
   });
 
   it('leaves non-object and non-shape schemas alone', () => {
@@ -41,6 +44,34 @@ describe('strictifyInputSchema', () => {
     // A record whose values are not schemas is not a raw shape.
     const notAShape = { a: 1, b: 'two' };
     expect(strictifyInputSchema(notAShape)).toBe(notAShape);
+  });
+
+  it('covers every registered tool, with no permissive stragglers', async () => {
+    // Lumen's 162/163 finding: one tool slipping through is exactly the kind
+    // of gap that a spot check misses, so assert the whole registry.
+    const { McpServer } = await import('@modelcontextprotocol/sdk/server/mcp.js');
+    const { registerAllTools } = await import('./index');
+
+    const captured: Array<{ name: string; inputSchema: unknown }> = [];
+    const server: any = {
+      registerTool: (name: string, config: any) =>
+        captured.push({ name, inputSchema: config?.inputSchema }),
+    };
+    const stub: any = new Proxy(function () {} as any, {
+      get: () => stub,
+      apply: () => stub,
+      construct: () => stub,
+    });
+    registerAllTools(server, stub);
+    void McpServer;
+
+    const permissive = captured.filter(({ inputSchema }) => {
+      if (!(inputSchema instanceof z.ZodObject)) return true;
+      return inputSchema.safeParse({ __definitely_not_a_real_param__: 1 }).success;
+    });
+
+    expect(permissive.map((t) => t.name)).toEqual([]);
+    expect(captured.length).toBeGreaterThan(150);
   });
 
   it('is idempotent on already-strict schemas', () => {
