@@ -3263,7 +3263,7 @@ describe('SessionService', () => {
             );
           }
           if (table === 'agent_identities') {
-            return createFilterAwareChain(() => ({ data: { id: 'sb-wren' } }), calls);
+            return createFilterAwareChain(() => ({ data: [{ id: 'sb-wren' }] }), calls);
           }
           if (table !== 'studios') return createRecordingChain({ data: null }, calls);
           studioQueries.push(calls);
@@ -3335,7 +3335,7 @@ describe('SessionService', () => {
             );
           }
           if (table === 'agent_identities') {
-            return createFilterAwareChain(() => ({ data: { id: 'sb-wren' } }), calls);
+            return createFilterAwareChain(() => ({ data: [{ id: 'sb-wren' }] }), calls);
           }
           if (table === 'studios') {
             return createFilterAwareChain((c) => {
@@ -3375,6 +3375,107 @@ describe('SessionService', () => {
         service.getOrCreateSession('user-456', 'wren', {
           threadKey: 'pr:1004',
           callerStudioId: 'sender-studio-1',
+        })
+      ).rejects.toMatchObject({ code: 'ROUTING_REFUSED' });
+    });
+
+    it('uses the caller-supplied canonical identity and does not re-resolve the slug', async () => {
+      // The trigger handler has already resolved (and workspace-disambiguated)
+      // the target identity. Re-resolving from the slug throws that away and
+      // is ambiguous by construction (Lumen, PR #514 round 2).
+      const studioQueries: RecordedCall[][] = [];
+      let identityLookups = 0;
+      const has = (calls: RecordedCall[], col: string, val?: unknown) =>
+        calls.some(
+          (c) => c.method === 'eq' && c.args[0] === col && (val === undefined || c.args[1] === val)
+        );
+
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          const calls: RecordedCall[] = [];
+          if (table === 'agent_identities') {
+            identityLookups += 1;
+            return createFilterAwareChain(() => ({ data: [{ id: 'WRONG-sb' }] }), calls);
+          }
+          if (table === 'sessions') {
+            return createFilterAwareChain(
+              (c) =>
+                c.some((call) => call.method === 'eq' && call.args[0] === 'id')
+                  ? { data: { studio_id: 'sender-studio-1' } }
+                  : { data: null },
+              calls
+            );
+          }
+          if (table !== 'studios') return createRecordingChain({ data: null }, calls);
+          studioQueries.push(calls);
+          return createFilterAwareChain((c) => {
+            if (has(c, 'id', 'sender-studio-1')) return { data: { repo_root: '/repos/inkwell' } };
+            if (has(c, 'ephemeral', false)) return { data: { id: 'studio-inkwell-wren' } };
+            return { data: null };
+          }, calls);
+        }),
+      };
+      const service = serviceWith(mockSupabase);
+
+      await service.getOrCreateSession('user-456', 'wren', {
+        threadKey: 'pr:1005',
+        callerStudioId: 'sender-studio-1',
+        callerSessionId: 'sender-session-1',
+        sbId: 'sb-authoritative',
+      });
+
+      const reuseQuery = studioQueries.find((calls) => has(calls, 'ephemeral', false));
+      expect(reuseQuery).toBeDefined();
+      expect(has(reuseQuery!, 'sb_id', 'sb-authoritative')).toBe(true);
+      // The identity table would have yielded 'WRONG-sb'. Asserting on the
+      // resolved value rather than on lookup COUNT: other paths
+      // (resolveAgentBackend, default_session_id) legitimately read
+      // agent_identities, so a call counter pins unrelated behaviour.
+      expect(studioQueries.some((calls) => has(calls, 'sb_id', 'WRONG-sb'))).toBe(false);
+      expect(identityLookups).toBeGreaterThanOrEqual(0);
+    });
+
+    it('refuses rather than guessing when an agent slug is ambiguous', async () => {
+      // Duplicate identities for one slug used to make maybeSingle() error and
+      // silently degrade to slug scoping — exactly the cross-identity routing
+      // the UUID exists to prevent.
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          const calls: RecordedCall[] = [];
+          if (table === 'agent_identities') {
+            return createFilterAwareChain(
+              () => ({ data: [{ id: 'sb-one' }, { id: 'sb-two' }] }),
+              calls
+            );
+          }
+          if (table === 'sessions') {
+            return createFilterAwareChain(
+              (c) =>
+                c.some((call) => call.method === 'eq' && call.args[0] === 'id')
+                  ? { data: { studio_id: 'sender-studio-1' } }
+                  : { data: null },
+              calls
+            );
+          }
+          if (table === 'studios') {
+            return createFilterAwareChain(
+              (c) =>
+                c.some((call) => call.method === 'eq' && call.args[1] === 'sender-studio-1')
+                  ? { data: { repo_root: '/repos/inkwell' } }
+                  : { data: null },
+              calls
+            );
+          }
+          return createRecordingChain({ data: null }, calls);
+        }),
+      };
+      const service = serviceWith(mockSupabase);
+
+      await expect(
+        service.getOrCreateSession('user-456', 'wren', {
+          threadKey: 'pr:1006',
+          callerStudioId: 'sender-studio-1',
+          callerSessionId: 'sender-session-1',
         })
       ).rejects.toMatchObject({ code: 'ROUTING_REFUSED' });
     });

@@ -273,7 +273,7 @@ export interface StudioRoutingDecision {
    * (alias, default_session_id) can still win without a worktree being built
    * and abandoned first.
    */
-  deferredCreate?: { repoRoot: string };
+  deferredCreate?: { repoRoot: string; sbId?: string | null };
   refusal?: {
     reason: 'no-route';
     threadKey: string;
@@ -1501,6 +1501,12 @@ export class SessionService implements ISessionService {
       callerSessionId?: string;
       /** Sender is a bridge/relay identity. */
       callerIsBridge?: boolean;
+      /**
+       * Canonical identity UUID of the TARGET agent, when the caller already
+       * resolved it. Preferred over re-resolving from the slug, which is
+       * ambiguous across workspaces.
+       */
+      sbId?: string | null;
     }
   ): Promise<Session> {
     const type = options?.type || 'primary';
@@ -1515,6 +1521,7 @@ export class SessionService implements ISessionService {
       callerStudioId: options?.callerStudioId,
       callerSessionId: options?.callerSessionId,
       callerIsBridge: options?.callerIsBridge,
+      sbId: options?.sbId,
       backend,
     });
     let resolvedStudioId = routing.studioId;
@@ -1747,7 +1754,8 @@ export class SessionService implements ISessionService {
       const createdStudioId = await this.createParentStudio(
         userId,
         agentId,
-        routing.deferredCreate.repoRoot
+        routing.deferredCreate.repoRoot,
+        routing.deferredCreate.sbId ?? options?.sbId
       );
       if (createdStudioId) {
         routing = await this.gateOccupancy(createdStudioId, 'caller-repo-created', leaseCtx);
@@ -1853,6 +1861,8 @@ export class SessionService implements ISessionService {
       callerSessionId?: string;
       /** Sender is a relay whose ambient repo is its own home, not the subject. */
       callerIsBridge?: boolean;
+      /** Canonical identity UUID of the target agent, if already resolved. */
+      sbId?: string | null;
     }
   ): Promise<StudioRoutingDecision> {
     const leaseCtx = { userId, agentId, threadKey: options.threadKey };
@@ -2074,7 +2084,13 @@ export class SessionService implements ISessionService {
     //     actually resolved.
     const callerRepoRoot = await this.resolveCallerRepoRoot(userId, options);
     if (callerRepoRoot) {
-      const byRepo = await this.resolveStudioForRepo(userId, agentId, callerRepoRoot, leaseCtx);
+      const byRepo = await this.resolveStudioForRepo(
+        userId,
+        agentId,
+        callerRepoRoot,
+        leaseCtx,
+        options.sbId
+      );
       if (byRepo) return byRepo;
     }
 
@@ -2235,7 +2251,8 @@ export class SessionService implements ISessionService {
     userId: string,
     agentId: string,
     repoRoot: string,
-    leaseCtx: { userId: string; agentId: string; threadKey?: string }
+    leaseCtx: { userId: string; agentId: string; threadKey?: string },
+    knownSbId?: string | null
   ): Promise<StudioRoutingDecision | null> {
     if (!this.supabase) return null;
 
@@ -2244,7 +2261,7 @@ export class SessionService implements ISessionService {
     // thread to a different identity that happens to share a name. Prefer
     // sb_id; fall back to the slug only when no identity row exists, and log
     // that so the gap is visible rather than silent.
-    const sbId = await this.resolveSbId(userId, agentId);
+    const sbId = knownSbId || (await this.resolveSbId(userId, agentId));
 
     let reuseQuery = this.supabase
       .from('studios')
@@ -2299,7 +2316,7 @@ export class SessionService implements ISessionService {
       studioId: undefined,
       tier: 'caller-repo-created',
       occupancyChecked: false,
-      deferredCreate: { repoRoot },
+      deferredCreate: { repoRoot, sbId: sbId ?? null },
     };
   }
 
@@ -2315,17 +2332,30 @@ export class SessionService implements ISessionService {
   private async resolveSbId(userId: string, agentId: string): Promise<string | null> {
     if (!this.supabase) return null;
     try {
+      // limit(2), not maybeSingle(): the same slug can exist in more than one
+      // workspace, and maybeSingle ERRORS on duplicates — which previously
+      // degraded to slug scoping, i.e. exactly the cross-identity routing the
+      // UUID is meant to prevent (Lumen, PR #514 round 2).
       const { data } = await this.supabase
         .from('agent_identities')
         .select('id')
         .eq('user_id', userId)
         .eq('agent_id', agentId)
-        .maybeSingle();
-      if (!data?.id) {
+        .limit(2);
+      if (!data?.length) {
         logger.debug('[StudioResolve] No identity row; falling back to slug scoping', { agentId });
         return null;
       }
-      return data.id;
+      if (data.length > 1) {
+        // Ambiguous: refuse to pick. The caller passes the already-resolved
+        // identity on every real path; getting here means we genuinely cannot
+        // tell which agent this is, and guessing is what 3b removes.
+        logger.warn('[StudioResolve] Ambiguous identity slug; no caller-repo resolution', {
+          agentId,
+        });
+        return null;
+      }
+      return data[0].id;
     } catch {
       return null;
     }
@@ -2334,7 +2364,8 @@ export class SessionService implements ISessionService {
   private async createParentStudio(
     userId: string,
     agentId: string,
-    repoRoot: string
+    repoRoot: string,
+    knownSbId?: string | null
   ): Promise<string | undefined> {
     const overflowService = this.getOverflowService();
     if (!overflowService?.ensureParentStudio) return undefined;
@@ -2344,7 +2375,7 @@ export class SessionService implements ISessionService {
         userId,
         agentId,
         repoRoot,
-        sbId: await this.resolveSbId(userId, agentId),
+        sbId: knownSbId ?? (await this.resolveSbId(userId, agentId)),
       });
       if (!parent) return undefined;
       logger.info('[StudioResolve] Created parent studio for caller repo (D1)', {

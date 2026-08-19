@@ -14,6 +14,7 @@ import type { DataComposer } from '../../data/composer';
 import { getAgentGateway, type AgentTriggerPayload } from '../../channels/agent-gateway';
 import { resolveUser } from '../../services/user-resolver';
 import { senderRoutingContext, isBridgeIdentity } from './sender-context.js';
+import { getPinnedAgentId } from '../../utils/request-context';
 import { logger } from '../../utils/logger';
 
 type McpResponse = {
@@ -107,7 +108,17 @@ export async function handleTriggerAgent(
       const client =
         typeof dataComposer?.getClient === 'function' ? dataComposer.getClient() : null;
       if (client && resolved?.user?.id) {
-        senderIsBridge = await isBridgeIdentity(client, resolved.user.id, args.fromAgentId);
+        // Classify the AUTHENTICATED sender, never args.fromAgentId — that is
+        // caller-supplied, so a relay could simply claim a non-bridge name and
+        // re-enable the inference this exclusion exists to prevent
+        // (Lumen, PR #514 round 2). Falls back to the declared slug only when
+        // there is no pinned identity, which is the unauthenticated path.
+        const pinned = getPinnedAgentId();
+        senderIsBridge = await isBridgeIdentity(
+          client,
+          resolved.user.id,
+          pinned || args.fromAgentId
+        );
       }
     } catch {
       senderIsBridge = false;
