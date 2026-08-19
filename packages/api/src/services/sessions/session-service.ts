@@ -44,7 +44,6 @@ import { GeminiRunner } from './gemini-runner.js';
 import { AntigravityRunner } from './antigravity-runner.js';
 import { InkRunner } from './ink-runner.js';
 import { ActivityStreamRepository } from '../../data/repositories/activity-stream.repository.js';
-import { resolveIdentityId } from '../../auth/resolve-identity.js';
 import { classifyError } from '@inklabs/shared';
 import { serializeError } from '../../utils/serialize-error.js';
 import { resolveTaskGroupForThreadKey } from '../task-group-resolver.js';
@@ -1520,30 +1519,63 @@ export class SessionService implements ISessionService {
     // had already derived a studio from it — so a rejected session's studio
     // could still be used, and a same-slug session belonging to another
     // identity could still be reselected afterwards.
-    const identity: { id?: string; absent?: boolean; ambiguous?: boolean } = options?.sbId
-      ? { id: options.sbId }
-      : await this.resolveIdentityScope(userId, agentId);
+    // The scope is resolved even when the caller supplied a UUID (Lumen,
+    // PR #514 round 7). Skipping the lookup skipped AMBIGUITY DISCOVERY, and
+    // the slug fallback below depends on knowing the slug is unambiguous —
+    // so a supplied UUID silently re-enabled the very fallback it was meant
+    // to replace. The supplied UUID still wins as the identity; the query
+    // only tells us whether a slug comparison is permissible at all.
+    const discovered = await this.resolveIdentityScope(userId, agentId);
+    const identity = {
+      id: options?.sbId ?? discovered.id,
+      absent: discovered.absent === true,
+      ambiguous: discovered.ambiguous === true,
+    };
     const identitySbId = identity.id ?? null;
+
+    /**
+     * Authorize an explicit anchor (a session or studio the CALLER named)
+     * against the settled identity. This is the invariant round 7 asked for:
+     * one target UUID, every explicit anchor authorized against it before
+     * routing, slug comparison only after a POSITIVE "no identity exists".
+     */
+    const anchorBelongsToTarget = (row: {
+      userId?: string;
+      sbId?: string | null;
+      agentId?: string | null;
+    }): boolean => {
+      if (row.userId !== userId) return false;
+      if (identitySbId && row.sbId) return row.sbId === identitySbId;
+      // A row with no sb_id can only be compared by slug, and that is a proof
+      // only when the slug names exactly one identity. `absent` is that proof;
+      // an ambiguous or merely unknown slug is not.
+      if (identity.absent) return row.agentId === agentId;
+      return false;
+    };
 
     // Authorize the caller-supplied recipient session BEFORE it can influence
     // routing. repository.findById is unscoped — it accepts any session UUID
     // in the table — so an unauthorized id must be dropped here, not rejected
     // later once its studio has already been consumed.
     let authorizedRecipientSessionId = options?.recipientSessionId;
+    let anchorLookupFailed = false;
     if (options?.recipientSessionId) {
-      const candidate = await this.repository
-        .findById(options.recipientSessionId)
-        .catch(() => null);
-      const sameUser = candidate?.userId === userId;
-      // Compare UUIDs when both sides carry one. A legacy row with no sb_id
-      // can only be compared by slug, which is safe here ONLY because an
-      // ambiguous slug is refused outright.
-      const sameIdentity = candidate
-        ? identitySbId && candidate.sbId
-          ? candidate.sbId === identitySbId
-          : !identity.ambiguous && candidate.agentId === agentId
-        : false;
-      if (!candidate || !sameUser || !sameIdentity) {
+      let candidate: Session | null = null;
+      try {
+        candidate = await this.repository.findById(options.recipientSessionId);
+      } catch (err) {
+        // FAIL CLOSED (Lumen, PR #514 round 7). Swallowing this turned a
+        // database failure into "no such session", so an EXACT anchor the
+        // caller named would silently fall through and deliver somewhere
+        // else. A delivery failure is recoverable; a silent redirect is not.
+        anchorLookupFailed = true;
+        logger.error('[SessionRouting] Recipient session lookup failed — refusing to reroute', {
+          recipientSessionId: options.recipientSessionId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+
+      if (!anchorLookupFailed && (!candidate || !anchorBelongsToTarget(candidate))) {
         if (candidate) {
           logger.warn('[SessionRouting] Refusing recipientSessionId — not this user/identity', {
             recipientSessionId: options.recipientSessionId,
@@ -1558,6 +1590,13 @@ export class SessionService implements ISessionService {
       }
     }
 
+    // An unreadable anchor must not degrade into "route it somewhere else".
+    if (anchorLookupFailed) {
+      throw new RoutingRefusedError(options?.threadKey || '(unthreaded)', agentId, {
+        triedCallerRepo: false,
+      });
+    }
+
     let routing = await this.resolveStudioId(userId, agentId, {
       threadKey: options?.threadKey,
       explicitStudioId: options?.studioId,
@@ -1569,6 +1608,7 @@ export class SessionService implements ISessionService {
       callerIsBridge: options?.callerIsBridge,
       sbId: identitySbId,
       identityAmbiguous: identity.ambiguous === true,
+      identityAbsent: identity.absent === true,
       backend,
     });
     let resolvedStudioId = routing.studioId;
@@ -1783,10 +1823,9 @@ export class SessionService implements ISessionService {
     // identity than the studio routing just picked for it — the session row
     // and its studio disagreeing about who owns the work, which is worse than
     // either being wrong alone.
-    let sbId: string | undefined = options?.sbId ?? undefined;
-    if (!sbId && this.supabase) {
-      sbId = (await resolveIdentityId(this.supabase, userId, agentId)) || undefined;
-    }
+    // The identity settled at entry — not options.sbId, and never re-resolved
+    // from the slug here (Lumen, PR #514 round 7).
+    const sbId: string | undefined = identitySbId ?? undefined;
 
     // Refuse-and-hold (Phase 3b) — checked HERE, not at resolution time.
     //
@@ -1817,7 +1856,7 @@ export class SessionService implements ISessionService {
         userId,
         agentId,
         routing.deferredCreate.repoRoot,
-        routing.deferredCreate.sbId ?? options?.sbId
+        routing.deferredCreate.sbId ?? identitySbId
       );
       if (createdStudioId) {
         routing = await this.gateOccupancy(createdStudioId, 'caller-repo-created', leaseCtx);
@@ -1927,6 +1966,8 @@ export class SessionService implements ISessionService {
       sbId?: string | null;
       /** Several identities share this slug — no tier may match on it. */
       identityAmbiguous?: boolean;
+      /** No identity row exists at all — only then is a slug match a proof. */
+      identityAbsent?: boolean;
     }
   ): Promise<StudioRoutingDecision> {
     const leaseCtx = { userId, agentId, threadKey: options.threadKey };
@@ -1974,6 +2015,35 @@ export class SessionService implements ISessionService {
           tier: 'explicit',
           occupancyChecked: false,
         };
+      }
+      // An explicit studio UUID was being returned VERBATIM — no ownership
+      // check, no identity check, no status check (Lumen, PR #514 round 7).
+      // A caller could name any studio row in the table, and a same-user
+      // sibling studio belonging to another identity passed trivially.
+      // Authorize it exactly like the session anchor.
+      //
+      // With no supabase there is no studios table to validate against and
+      // the id is simply handed to the runner; that degenerate config keeps
+      // its existing behaviour rather than losing explicit routing entirely.
+      if (this.supabase) {
+        const authorized = await this.authorizeStudioAnchor(
+          userId,
+          agentId,
+          options.explicitStudioId,
+          { sbId: options.sbId ?? null, identityAbsent: options.identityAbsent === true }
+        );
+        if (!authorized) {
+          return {
+            studioId: undefined,
+            tier: 'refused',
+            occupancyChecked: false,
+            refusal: {
+              reason: 'no-route',
+              threadKey: options.threadKey || '',
+              triedCallerRepo: false,
+            },
+          };
+        }
       }
       return { studioId: options.explicitStudioId, tier: 'explicit', occupancyChecked: false };
     }
@@ -2579,6 +2649,68 @@ export class SessionService implements ISessionService {
       });
       return undefined;
     }
+  }
+
+  /**
+   * Authorize a caller-named studio against the settled identity.
+   *
+   * Same contract as the session anchor: same user, same identity, and a
+   * status a runner can actually use. Slug comparison is permitted only on a
+   * POSITIVE `absent` — no identity row exists — never on "we did not resolve
+   * one" (Lumen, PR #514 round 7).
+   *
+   * Fails CLOSED: an unreadable or missing studio is not authorized.
+   */
+  private async authorizeStudioAnchor(
+    userId: string,
+    agentId: string,
+    studioId: string,
+    identity: { sbId: string | null; identityAbsent: boolean }
+  ): Promise<boolean> {
+    if (!this.supabase) return false;
+    const { data, error } = await this.supabase
+      .from('studios')
+      .select('user_id, agent_id, sb_id, status')
+      .eq('id', studioId)
+      .maybeSingle();
+
+    if (error || !data) {
+      logger.warn('[StudioResolve] Refusing explicit studio — unreadable or absent', {
+        studioId,
+        error: error?.message || null,
+      });
+      return false;
+    }
+    if (data.user_id !== userId) {
+      logger.warn('[StudioResolve] Refusing explicit studio — belongs to another user', {
+        studioId,
+      });
+      return false;
+    }
+    const sbIdRow = (data as { sb_id?: string | null }).sb_id ?? null;
+    const identityOk =
+      identity.sbId && sbIdRow
+        ? sbIdRow === identity.sbId
+        : identity.identityAbsent && data.agent_id === agentId;
+    if (!identityOk) {
+      logger.warn('[StudioResolve] Refusing explicit studio — belongs to another identity', {
+        studioId,
+        studioAgentId: data.agent_id,
+        studioSbId: sbIdRow,
+        requestedAgentId: agentId,
+        requestedSbId: identity.sbId,
+      });
+      return false;
+    }
+    if (data.status !== 'active' && data.status !== 'idle') {
+      // A cleaned or archived studio is never handed out (spec §invariant 5).
+      logger.warn('[StudioResolve] Refusing explicit studio — not an acquirable status', {
+        studioId,
+        status: data.status,
+      });
+      return false;
+    }
+    return true;
   }
 
   private async resolveMainStudioId(

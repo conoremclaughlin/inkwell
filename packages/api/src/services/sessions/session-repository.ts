@@ -236,17 +236,26 @@ export class SessionRepository implements ISessionRepository {
   async findByUserAndAgent(
     userId: string,
     agentId: string,
-    options?: { status?: SessionStatus; type?: SessionType; studioId?: string; contactId?: string }
+    options?: {
+      status?: SessionStatus;
+      type?: SessionType;
+      studioId?: string;
+      contactId?: string;
+      /** Canonical identity UUID — preferred over the ambiguous slug. */
+      sbId?: string | null;
+    }
   ): Promise<Session | null> {
-    let query = this.supabase
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let query = (this.supabase as any)
       .from('sessions')
       .select('*')
       .eq('user_id', userId)
-      .eq('agent_id', agentId)
       .is('ended_at', null)
       .neq('lifecycle', 'failed')
       .order('started_at', { ascending: false })
       .limit(1);
+    // Same-slug siblings must not satisfy general reuse (Lumen, #514 r7).
+    query = options?.sbId ? query.eq('sb_id', options.sbId) : query.eq('agent_id', agentId);
 
     if (options?.studioId) {
       query = query.eq('studio_id', options.studioId);
