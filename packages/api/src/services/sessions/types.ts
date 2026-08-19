@@ -444,7 +444,10 @@ export interface ISessionRepository {
     userId: string,
     agentId: string,
     threadKey: string,
-    studioId?: string
+    studioId?: string,
+    contactId?: string,
+    /** Canonical identity UUID — preferred over the ambiguous slug. */
+    sbId?: string | null
   ): Promise<Session | null>;
 
   findByUser(

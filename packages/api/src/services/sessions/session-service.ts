@@ -1512,16 +1512,63 @@ export class SessionService implements ISessionService {
     const type = options?.type || 'primary';
 
     const { backend } = await this.resolveAgentBackend(userId, agentId);
+
+    // Identity and authorization are settled ONCE, here, before anything
+    // consumes them (Lumen, PR #514 round 6). Previously the scope was
+    // recomputed inside resolveStudioId while the reuse ladder below stayed
+    // slug-based, and the recipient session was authorized only after routing
+    // had already derived a studio from it — so a rejected session's studio
+    // could still be used, and a same-slug session belonging to another
+    // identity could still be reselected afterwards.
+    const identity: { id?: string; absent?: boolean; ambiguous?: boolean } = options?.sbId
+      ? { id: options.sbId }
+      : await this.resolveIdentityScope(userId, agentId);
+    const identitySbId = identity.id ?? null;
+
+    // Authorize the caller-supplied recipient session BEFORE it can influence
+    // routing. repository.findById is unscoped — it accepts any session UUID
+    // in the table — so an unauthorized id must be dropped here, not rejected
+    // later once its studio has already been consumed.
+    let authorizedRecipientSessionId = options?.recipientSessionId;
+    if (options?.recipientSessionId) {
+      const candidate = await this.repository
+        .findById(options.recipientSessionId)
+        .catch(() => null);
+      const sameUser = candidate?.userId === userId;
+      // Compare UUIDs when both sides carry one. A legacy row with no sb_id
+      // can only be compared by slug, which is safe here ONLY because an
+      // ambiguous slug is refused outright.
+      const sameIdentity = candidate
+        ? identitySbId && candidate.sbId
+          ? candidate.sbId === identitySbId
+          : !identity.ambiguous && candidate.agentId === agentId
+        : false;
+      if (!candidate || !sameUser || !sameIdentity) {
+        if (candidate) {
+          logger.warn('[SessionRouting] Refusing recipientSessionId — not this user/identity', {
+            recipientSessionId: options.recipientSessionId,
+            sessionUserId: candidate.userId,
+            sessionAgentId: candidate.agentId,
+            sessionSbId: candidate.sbId ?? null,
+            requestedAgentId: agentId,
+            requestedSbId: identitySbId,
+          });
+        }
+        authorizedRecipientSessionId = undefined;
+      }
+    }
+
     let routing = await this.resolveStudioId(userId, agentId, {
       threadKey: options?.threadKey,
       explicitStudioId: options?.studioId,
       studioHint: options?.studioHint,
-      recipientSessionId: options?.recipientSessionId,
+      recipientSessionId: authorizedRecipientSessionId,
       repoRoot: options?.repoRoot,
       callerStudioId: options?.callerStudioId,
       callerSessionId: options?.callerSessionId,
       callerIsBridge: options?.callerIsBridge,
-      sbId: options?.sbId,
+      sbId: identitySbId,
+      identityAmbiguous: identity.ambiguous === true,
       backend,
     });
     let resolvedStudioId = routing.studioId;
@@ -1544,7 +1591,7 @@ export class SessionService implements ISessionService {
 
     // Resolve default_session_id from agent identity. When set, threadKey
     // misses route to this session instead of creating new ones.
-    const defaultSessionId = await this.resolveDefaultSessionId(userId, agentId, options?.sbId);
+    const defaultSessionId = await this.resolveDefaultSessionId(userId, agentId, identitySbId);
 
     // For primary sessions, try to find existing active session
     if (type === 'primary') {
@@ -1552,32 +1599,14 @@ export class SessionService implements ISessionService {
       // the reply back to THIS session" signal (e.g., auto-resolved from thread
       // message history). If the session exists and isn't ended, use it directly
       // regardless of threadKey mismatch.
-      if (options?.recipientSessionId) {
-        const recipientSession = await this.repository.findById(options.recipientSessionId);
-        // AUTHORIZATION, not just existence (Lumen, PR #514 round 5).
-        // findById is unscoped — it accepts any session UUID in the table —
-        // and this rung then routed straight into whatever came back. A
-        // caller-supplied id could therefore reach another USER's session, and
-        // another agent's. Both boundaries are checked here before use; the
-        // agent check uses sb_id when both sides have one, since the slug is
-        // ambiguous across workspaces.
-        const belongsToUser = recipientSession?.userId === userId;
-        const belongsToAgent =
-          recipientSession?.sbId && options.sbId
-            ? recipientSession.sbId === options.sbId
-            : recipientSession?.agentId === agentId;
-        if (recipientSession && (!belongsToUser || !belongsToAgent)) {
-          logger.warn('[SessionRouting] Refusing recipientSessionId — not this user/agent', {
-            recipientSessionId: options.recipientSessionId,
-            sessionUserId: recipientSession.userId,
-            sessionAgentId: recipientSession.agentId,
-            requestedAgentId: agentId,
-          });
-        }
-        if (recipientSession && !recipientSession.endedAt && belongsToUser && belongsToAgent) {
+      if (authorizedRecipientSessionId) {
+        // Authorized above (same user, same identity) — this rung only has to
+        // check liveness.
+        const recipientSession = await this.repository.findById(authorizedRecipientSessionId);
+        if (recipientSession && !recipientSession.endedAt) {
           logger.debug('Routing to explicit recipientSession', {
             sessionId: recipientSession.id,
-            threadKey: options.threadKey,
+            threadKey: options?.threadKey,
             sessionThreadKey: recipientSession.threadKey,
             studioId: recipientSession.studioId || null,
           });
@@ -1593,7 +1622,8 @@ export class SessionService implements ISessionService {
             u: string,
             a: string,
             alias: string,
-            studioId?: string
+            studioId?: string,
+            sb?: string | null
           ) => Promise<Session | null>;
         };
 
@@ -1627,7 +1657,10 @@ export class SessionService implements ISessionService {
           userId,
           agentId,
           options.alias,
-          aliasStudioScope
+          aliasStudioScope,
+          // Identity by UUID: a same-slug session from another identity must
+          // not satisfy this alias (Lumen, PR #514 round 6).
+          identitySbId
         );
         if (aliasMatch) {
           logger.debug('Found existing session by alias', {
@@ -1653,7 +1686,8 @@ export class SessionService implements ISessionService {
             a: string,
             t: string,
             s?: string,
-            c?: string
+            c?: string,
+            sb?: string | null
           ) => Promise<Session | null>;
         };
         const threadMatch = await threadRepo.findByThreadKey(
@@ -1661,7 +1695,9 @@ export class SessionService implements ISessionService {
           agentId,
           options.threadKey,
           resolvedStudioId,
-          options?.contactId
+          options?.contactId,
+          // See findByAlias — canonical identity, not the ambiguous slug.
+          identitySbId
         );
         if (threadMatch) {
           logger.debug('Found existing session by threadKey', {
@@ -1887,8 +1923,10 @@ export class SessionService implements ISessionService {
       callerSessionId?: string;
       /** Sender is a relay whose ambient repo is its own home, not the subject. */
       callerIsBridge?: boolean;
-      /** Canonical identity UUID of the target agent, if already resolved. */
+      /** Canonical identity UUID of the target agent, resolved by the caller. */
       sbId?: string | null;
+      /** Several identities share this slug — no tier may match on it. */
+      identityAmbiguous?: boolean;
     }
   ): Promise<StudioRoutingDecision> {
     const leaseCtx = { userId, agentId, threadKey: options.threadKey };
@@ -1903,9 +1941,10 @@ export class SessionService implements ISessionService {
     // `scopeStudios`/`scopeSessions` apply sb_id when it is known and fall
     // back to agent_id only once we have positively established that no
     // identity row exists.
-    const identityScope = options.sbId
-      ? { id: options.sbId }
-      : await this.resolveIdentityScope(userId, agentId);
+    const identityScope = {
+      id: options.sbId ?? undefined,
+      ambiguous: options.identityAmbiguous === true,
+    };
     const scopedSbId = identityScope.id ?? null;
     // Returns the same builder type so the rest of each chain keeps working;
     // PostgrestFilterBuilder's generics are not expressible in a constraint
@@ -1920,12 +1959,11 @@ export class SessionService implements ISessionService {
     // nothing to confuse it with. Ambiguous is not, so it scopes to an
     // impossible sb_id — every early tier misses and routing falls through to
     // refuse-and-hold instead of matching the wrong agent's studio.
-    const IMPOSSIBLE_SB_ID = '00000000-0000-0000-0000-000000000000';
     const scopeBy = <T>(q: T): T => {
       const eq = (q as { eq: (c: string, v: unknown) => unknown }).eq.bind(q);
-      if (scopedSbId) return eq('sb_id', scopedSbId) as T;
-      if (identityScope.ambiguous) return eq('sb_id', IMPOSSIBLE_SB_ID) as T;
-      return eq('agent_id', agentId) as T;
+      // Ambiguity already refused above, so reaching the slug here means the
+      // identity is genuinely absent — nothing to confuse it with.
+      return (scopedSbId ? eq('sb_id', scopedSbId) : eq('agent_id', agentId)) as T;
     };
 
     // explicitStudioId takes precedence — it's the precise routing signal.
@@ -1942,6 +1980,33 @@ export class SessionService implements ISessionService {
 
     if (!this.supabase) {
       return { studioId: undefined, tier: 'none', occupancyChecked: false };
+    }
+
+    // Ambiguous identity refuses HERE, once, rather than being defended
+    // tier-by-tier (Lumen, PR #514 round 6). The sentinel approach only
+    // reached the queries that went through scopeBy; resolveMainStudioId
+    // still received a null sbId and fell back to slug scoping, so explicit
+    // main, hint main and repoRoot main could each match another identity.
+    //
+    // One check is provably complete where N scattered ones are not: if we
+    // cannot tell which agent this is, no tier below can be trusted. Explicit
+    // studioId (above) is exempt — the caller named an exact studio, so the
+    // slug's ambiguity is irrelevant to it.
+    if (identityScope.ambiguous && options.threadKey) {
+      logger.warn('[StudioResolve] Ambiguous identity — refusing to route', {
+        agentId,
+        threadKey: options.threadKey,
+      });
+      return {
+        studioId: undefined,
+        tier: 'refused',
+        occupancyChecked: false,
+        refusal: {
+          reason: 'no-route',
+          threadKey: options.threadKey,
+          triedCallerRepo: false,
+        },
+      };
     }
 
     // studioHint is a convenience fallback — only consulted when no explicit studioId.
@@ -2142,24 +2207,14 @@ export class SessionService implements ISessionService {
     //     actually resolved.
     const callerRepoRoot = await this.resolveCallerRepoRoot(userId, options);
     if (callerRepoRoot) {
-      if (identityScope.ambiguous) {
-        // Several identities share this slug: we cannot tell whose studio to
-        // reuse, and guessing is exactly what this phase deletes. Fall through
-        // to the hold below.
-        logger.warn('[StudioResolve] Ambiguous identity — skipping caller-repo resolution', {
-          agentId,
-          threadKey: options.threadKey || null,
-        });
-      } else {
-        const byRepo = await this.resolveStudioForRepo(
-          userId,
-          agentId,
-          callerRepoRoot,
-          leaseCtx,
-          scopedSbId
-        );
-        if (byRepo) return byRepo;
-      }
+      const byRepo = await this.resolveStudioForRepo(
+        userId,
+        agentId,
+        callerRepoRoot,
+        leaseCtx,
+        scopedSbId
+      );
+      if (byRepo) return byRepo;
     }
 
     // 6) Refuse and hold (spec §Refusing to route).

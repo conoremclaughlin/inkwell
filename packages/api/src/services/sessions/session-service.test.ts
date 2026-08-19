@@ -1417,7 +1417,8 @@ describe('SessionService', () => {
         'myra',
         'pr:43',
         undefined, // studioId
-        undefined // contactId
+        undefined, // contactId
+        null // canonical identity (no identity row in this mock)
       );
       // Should NOT have created a new session
       expect(mockRepoWithThreadKey.create).not.toHaveBeenCalled();
@@ -1465,7 +1466,8 @@ describe('SessionService', () => {
         'myra',
         'pr:999',
         undefined, // studioId
-        undefined // contactId
+        undefined, // contactId
+        null // canonical identity (no identity row in this mock)
       );
       expect(mockRepoWithThreadKey.findByUserAndAgent).not.toHaveBeenCalled();
       expect(mockRepoWithThreadKey.create).toHaveBeenCalledWith(
@@ -1973,7 +1975,7 @@ describe('SessionService', () => {
       );
 
       // 4th arg is the studio scope: undefined here because no studio was named.
-      expect(mockFindByAlias).toHaveBeenCalledWith('user-456', 'myra', 'main', undefined);
+      expect(mockFindByAlias).toHaveBeenCalledWith('user-456', 'myra', 'main', undefined, null);
       expect(mockRepository.findByUserAndAgent).not.toHaveBeenCalled();
     });
 
@@ -1990,13 +1992,21 @@ describe('SessionService', () => {
         })
       );
 
-      expect(mockFindByAlias).toHaveBeenCalledWith('user-456', 'myra', 'nonexistent', undefined);
+      expect(mockFindByAlias).toHaveBeenCalledWith(
+        'user-456',
+        'myra',
+        'nonexistent',
+        undefined,
+        null
+      );
       expect(mockFindByThreadKey).toHaveBeenCalledWith(
         'user-456',
         'myra',
         'pr:42',
         undefined,
-        undefined
+        undefined,
+        // Canonical identity — null here because the mock has no identity row.
+        null
       );
     });
 
@@ -2067,7 +2077,7 @@ describe('SessionService', () => {
       // The alias wins. Unscoped is safe here on its own terms: findByAlias
       // refuses an alias spanning two studios, so no-scope means must-be-
       // unique rather than pick-one.
-      expect(mockFindByAlias).toHaveBeenCalledWith('user-456', 'myra', 'main', undefined);
+      expect(mockFindByAlias).toHaveBeenCalledWith('user-456', 'myra', 'main', undefined, null);
       expect(session.id).toBe('alias-session');
       expect(mockFindByThreadKey).not.toHaveBeenCalled();
     });
@@ -2272,7 +2282,8 @@ describe('SessionService', () => {
         'myra',
         'pr:99',
         undefined,
-        undefined
+        undefined,
+        null
       );
       expect(mockRepository.findById).toHaveBeenCalledWith('default-session');
       expect(mockRepository.create).not.toHaveBeenCalled();
@@ -3658,6 +3669,94 @@ describe('SessionService', () => {
       // It must NOT have been reused; a fresh session is created instead.
       expect(mockRepository.create).toHaveBeenCalled();
       vi.mocked(mockRepository.findById).mockReset();
+    });
+
+    it('refuses a recipientSessionId owned by the same user but a DIFFERENT identity', async () => {
+      // The cross-user case was covered; the same-user/different-sb case is
+      // the one duplicate slugs actually produce (Lumen, PR #514 round 6).
+      const sibling = createMockSession({
+        id: 'sibling-session',
+        userId: 'user-456',
+        agentId: 'wren',
+      });
+      (sibling as unknown as { sbId?: string }).sbId = 'sb-OTHER';
+      vi.mocked(mockRepository.findById).mockResolvedValue(sibling);
+
+      const mockSupabase = {
+        from: vi.fn().mockImplementation(() => createRecordingChain({ data: null }, [])),
+      };
+      const service = serviceWith(mockSupabase);
+
+      await service.getOrCreateSession('user-456', 'wren', {
+        recipientSessionId: 'sibling-session',
+        sbId: 'sb-MINE',
+      });
+
+      expect(mockRepository.create).toHaveBeenCalled();
+      vi.mocked(mockRepository.findById).mockReset();
+    });
+
+    it('accepts a legacy null-sb recipient session only when the identity is unambiguous', async () => {
+      // A legacy row carries no sb_id, so it can only be compared by slug.
+      // That is safe when the slug names exactly one identity — and ambiguity
+      // is refused before this point, which is what makes it safe.
+      const legacy = createMockSession({
+        id: 'legacy-session',
+        userId: 'user-456',
+        agentId: 'wren',
+      });
+      (legacy as unknown as { sbId?: string | null }).sbId = null;
+      vi.mocked(mockRepository.findById).mockResolvedValue(legacy);
+
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          const calls: RecordedCall[] = [];
+          if (table === 'agent_identities') {
+            return createFilterAwareChain(() => ({ data: [{ id: 'sb-wren' }] }), calls);
+          }
+          return createRecordingChain({ data: null }, calls);
+        }),
+      };
+      const service = serviceWith(mockSupabase);
+
+      const session = await service.getOrCreateSession('user-456', 'wren', {
+        recipientSessionId: 'legacy-session',
+      });
+
+      // Reused, not recreated.
+      expect(session.id).toBe('legacy-session');
+      vi.mocked(mockRepository.findById).mockReset();
+    });
+
+    it('refuses to route at all when the identity is ambiguous — main included', async () => {
+      // The sentinel only reached queries going through scopeBy;
+      // resolveMainStudioId still fell back to slug scoping, so explicit main,
+      // hint main and repoRoot main could each match another identity
+      // (Lumen, PR #514 round 6). Ambiguity now refuses once, up front.
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          const calls: RecordedCall[] = [];
+          if (table === 'agent_identities') {
+            return createFilterAwareChain(
+              () => ({ data: [{ id: 'sb-one' }, { id: 'sb-two' }] }),
+              calls
+            );
+          }
+          if (table === 'studios') {
+            // A main studio that a slug-scoped lookup would happily return.
+            return createFilterAwareChain(() => ({ data: { id: 'studio-main-wrong' } }), calls);
+          }
+          return createRecordingChain({ data: null }, calls);
+        }),
+      };
+      const service = serviceWith(mockSupabase);
+
+      await expect(
+        service.getOrCreateSession('user-456', 'wren', {
+          threadKey: 'pr:1010',
+          studioHint: 'main',
+        })
+      ).rejects.toMatchObject({ code: 'ROUTING_REFUSED' });
     });
 
     it('an ambiguous slug does not match early-tier slug rows either', async () => {
