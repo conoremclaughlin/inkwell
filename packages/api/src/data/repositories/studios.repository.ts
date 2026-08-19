@@ -20,6 +20,8 @@ export interface Studio {
   id: string;
   userId: string;
   agentId: string | null;
+  /** Canonical identity UUID — authoritative; agentId is a display slug. */
+  sbId: string | null;
   sessionId: string | null;
   repoRoot: string;
   worktreePath: string;
@@ -98,6 +100,7 @@ export class StudiosRepository {
       id: row.id as string,
       userId: row.user_id as string,
       agentId: (row.agent_id as string) || null,
+      sbId: (row.sb_id as string) || null,
       sessionId: (row.session_id as string) || null,
       repoRoot: row.repo_root as string,
       worktreePath: row.worktree_path as string,

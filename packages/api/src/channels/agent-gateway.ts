@@ -51,6 +51,13 @@ export interface AgentTriggerPayload {
    */
   senderStudioId?: string;
   /**
+   * Sender's session id, stamped from the same server-decoded context token.
+   * Routing cross-checks it against `senderStudioId`: the token is unsigned,
+   * so a lone studio claim proves nothing — two claims that must agree with
+   * the session row do.
+   */
+  senderSessionId?: string;
+  /**
    * Sender is a relay (Telegram, Discord, …). A bridge's ambient repo is its
    * own home, never the repo the conversation is about, so caller-repo
    * inference is skipped for bridges that did not address explicitly.

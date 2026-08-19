@@ -13,6 +13,7 @@ import { z } from 'zod';
 import type { DataComposer } from '../../data/composer';
 import { getAgentGateway, type AgentTriggerPayload } from '../../channels/agent-gateway';
 import { resolveUser } from '../../services/user-resolver';
+import { senderRoutingContext, isBridgeIdentity } from './sender-context.js';
 import { logger } from '../../utils/logger';
 
 type McpResponse = {
@@ -98,6 +99,20 @@ export async function handleTriggerAgent(
       logger.warn(`No handler currently registered for ${args.toAgentId}, attempting anyway`);
     }
 
+    // Resolved before the payload literal and defensively: a composer without
+    // a client (or a lookup failure) must not take down the dispatch — it only
+    // means no bridge exclusion, and routing already fails closed from there.
+    let senderIsBridge = false;
+    try {
+      const client =
+        typeof dataComposer?.getClient === 'function' ? dataComposer.getClient() : null;
+      if (client && resolved?.user?.id) {
+        senderIsBridge = await isBridgeIdentity(client, resolved.user.id, args.fromAgentId);
+      }
+    } catch {
+      senderIsBridge = false;
+    }
+
     const payload: AgentTriggerPayload = {
       fromAgentId: args.fromAgentId,
       toAgentId: args.toAgentId,
@@ -109,6 +124,9 @@ export async function handleTriggerAgent(
       studioId: args.studioId,
       studioHint: args.studioHint,
       recipientSessionId: args.recipientSessionId,
+      // Caller-repo inference degrades silently to refuse-and-hold on any
+      // dispatch path that forgets this (Lumen, PR #514 round 1).
+      ...senderRoutingContext(senderIsBridge),
       ...(resolved?.user?.id ? { recipientUserId: resolved.user.id } : {}),
       metadata: args.metadata,
     };

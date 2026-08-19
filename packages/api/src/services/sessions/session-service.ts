@@ -267,6 +267,13 @@ export interface StudioRoutingDecision {
    * a tier whose job is to produce an answer regardless of evidence.
    * Carries what routing looked for, so the hold explains itself.
    */
+  /**
+   * Set when the caller-repo tier identified a repo but found no studio for
+   * it. Provisioning is left to the create boundary so an explicit address
+   * (alias, default_session_id) can still win without a worktree being built
+   * and abandoned first.
+   */
+  deferredCreate?: { repoRoot: string };
   refusal?: {
     reason: 'no-route';
     threadKey: string;
@@ -1490,6 +1497,8 @@ export class SessionService implements ISessionService {
       repoRoot?: string;
       /** Server-derived sender studio — see resolveCallerRepoRoot. */
       callerStudioId?: string;
+      /** Sender's session, cross-checked against callerStudioId. */
+      callerSessionId?: string;
       /** Sender is a bridge/relay identity. */
       callerIsBridge?: boolean;
     }
@@ -1504,6 +1513,7 @@ export class SessionService implements ISessionService {
       recipientSessionId: options?.recipientSessionId,
       repoRoot: options?.repoRoot,
       callerStudioId: options?.callerStudioId,
+      callerSessionId: options?.callerSessionId,
       callerIsBridge: options?.callerIsBridge,
       backend,
     });
@@ -1729,6 +1739,35 @@ export class SessionService implements ISessionService {
     // guessed worktree. Refusal is for threads with NO addressing at all;
     // keeping it that narrow matters, because an over-broad refusal silently
     // stops real work instead of misrouting it.
+    // Deferred D1 provisioning (Lumen, PR #514 round 1). We are genuinely
+    // about to create a session now — every reuse rung above has missed — so
+    // building the worktree here cannot be wasted by an explicit address
+    // winning afterwards.
+    if (routing.deferredCreate && !resolvedStudioId) {
+      const createdStudioId = await this.createParentStudio(
+        userId,
+        agentId,
+        routing.deferredCreate.repoRoot
+      );
+      if (createdStudioId) {
+        routing = await this.gateOccupancy(createdStudioId, 'caller-repo-created', leaseCtx);
+        resolvedStudioId = routing.studioId;
+      } else {
+        // Provisioning failed — fail closed to a hold rather than to a guess.
+        routing = {
+          studioId: undefined,
+          tier: 'refused',
+          occupancyChecked: false,
+          refusal: {
+            reason: 'no-route',
+            threadKey: options?.threadKey || '',
+            triedCallerRepo: true,
+            callerRepoRoot: routing.deferredCreate.repoRoot,
+          },
+        };
+      }
+    }
+
     if (routing.tier === 'refused' && routing.refusal && !defaultSessionId) {
       throw new RoutingRefusedError(routing.refusal.threadKey, agentId, {
         triedCallerRepo: routing.refusal.triedCallerRepo,
@@ -1810,6 +1849,8 @@ export class SessionService implements ISessionService {
        * token. Never read from caller-supplied metadata (spec v5).
        */
       callerStudioId?: string;
+      /** Sender's session — cross-checked against callerStudioId for provenance. */
+      callerSessionId?: string;
       /** Sender is a relay whose ambient repo is its own home, not the subject. */
       callerIsBridge?: boolean;
     }
@@ -2106,12 +2147,54 @@ export class SessionService implements ISessionService {
    */
   private async resolveCallerRepoRoot(
     userId: string,
-    options: { callerStudioId?: string; callerIsBridge?: boolean; studioHint?: string }
+    options: {
+      callerStudioId?: string;
+      callerSessionId?: string;
+      callerIsBridge?: boolean;
+      studioHint?: string;
+    }
   ): Promise<string | undefined> {
     if (!this.supabase) return undefined;
-    if (!options.callerStudioId) return undefined;
     if (options.callerIsBridge && !options.studioHint) {
       logger.debug('[StudioResolve] Bridge sender without studio_hint — no caller-repo inference');
+      return undefined;
+    }
+
+    // PROVENANCE (Lumen, PR #514 round 1). The x-ink-context token is
+    // base64url JSON set by CLI hooks — it is NOT signed. Taking its studio
+    // claim at face value would make caller-repo inference exactly as
+    // caller-controlled as the metadata.repoRoot this tier refuses to trust;
+    // it would just arrive in a header instead of a body.
+    //
+    // So both of the token's claims must AGREE with server state: look up the
+    // claimed SESSION (scoped to this user) and require its studio_id to equal
+    // the claimed studio. The DB row is the authority; the token only says
+    // which row to check. A caller can still name its own session — that is
+    // its own repo, which is the point — but it cannot assert a studio the
+    // session is not actually bound to.
+    if (!options.callerStudioId || !options.callerSessionId) return undefined;
+
+    const { data: senderSession, error: sessionError } = await this.supabase
+      .from('sessions')
+      .select('studio_id')
+      .eq('id', options.callerSessionId)
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    if (sessionError) {
+      logger.warn('[StudioResolve] Caller session lookup failed; no caller-repo inference', {
+        callerSessionId: options.callerSessionId,
+        error: sessionError.message,
+      });
+      return undefined;
+    }
+
+    if (!senderSession?.studio_id || senderSession.studio_id !== options.callerStudioId) {
+      logger.warn('[StudioResolve] Caller studio claim does not match its session; ignoring', {
+        callerSessionId: options.callerSessionId,
+        claimedStudioId: options.callerStudioId,
+        actualStudioId: senderSession?.studio_id || null,
+      });
       return undefined;
     }
 
@@ -2156,17 +2239,24 @@ export class SessionService implements ISessionService {
   ): Promise<StudioRoutingDecision | null> {
     if (!this.supabase) return null;
 
-    const { data: existing, error } = await this.supabase
+    // Identity by UUID, never the display slug (AGENTS.md): the same slug can
+    // exist in more than one workspace, so keying reuse on agent_id can hand a
+    // thread to a different identity that happens to share a name. Prefer
+    // sb_id; fall back to the slug only when no identity row exists, and log
+    // that so the gap is visible rather than silent.
+    const sbId = await this.resolveSbId(userId, agentId);
+
+    let reuseQuery = this.supabase
       .from('studios')
       .select('id')
       .eq('user_id', userId)
-      .eq('agent_id', agentId)
       .eq('repo_root', repoRoot)
       .eq('ephemeral', false)
       .in('status', ['active', 'idle'])
       .order('created_at', { ascending: true })
-      .limit(1)
-      .maybeSingle();
+      .limit(1);
+    reuseQuery = sbId ? reuseQuery.eq('sb_id', sbId) : reuseQuery.eq('agent_id', agentId);
+    const { data: existing, error } = await reuseQuery.maybeSingle();
 
     if (error) {
       logger.warn('[StudioResolve] Caller-repo studio lookup failed', {
@@ -2198,16 +2288,19 @@ export class SessionService implements ISessionService {
       return this.gateOccupancy(mainStudioId, 'main-fallback', leaseCtx);
     }
 
-    // D1: auto-create the per-(project, agent) parent studio on FIRST work for
-    // this repo. The parent is a working studio, not a pure anchor — it takes
-    // work itself when free, and ephemeral children hang off it via
-    // parent_studio_id when it is busy.
-    const created = await this.createParentStudio(userId, agentId, repoRoot);
-    if (created) {
-      return this.gateOccupancy(created, 'caller-repo-created', leaseCtx);
-    }
-
-    return null;
+    // D1 creation is DEFERRED, not done here (Lumen, PR #514 round 1).
+    // resolveStudioId runs BEFORE the session-reuse rungs — alias,
+    // default_session_id, threadKey continuity — so provisioning a git
+    // worktree at this point can be wasted the moment an explicit address
+    // wins, leaving an unused durable worktree and studio row behind. Hand
+    // back the intent; the create boundary acts on it only if it is actually
+    // about to create a session.
+    return {
+      studioId: undefined,
+      tier: 'caller-repo-created',
+      occupancyChecked: false,
+      deferredCreate: { repoRoot },
+    };
   }
 
   /**
@@ -2218,6 +2311,26 @@ export class SessionService implements ISessionService {
    * Returns undefined when provisioning is unavailable or fails; the caller
    * then refuses rather than falling back to a guess.
    */
+  /** Canonical identity UUID for an agent slug, or null when unresolvable. */
+  private async resolveSbId(userId: string, agentId: string): Promise<string | null> {
+    if (!this.supabase) return null;
+    try {
+      const { data } = await this.supabase
+        .from('agent_identities')
+        .select('id')
+        .eq('user_id', userId)
+        .eq('agent_id', agentId)
+        .maybeSingle();
+      if (!data?.id) {
+        logger.debug('[StudioResolve] No identity row; falling back to slug scoping', { agentId });
+        return null;
+      }
+      return data.id;
+    } catch {
+      return null;
+    }
+  }
+
   private async createParentStudio(
     userId: string,
     agentId: string,
@@ -2227,7 +2340,12 @@ export class SessionService implements ISessionService {
     if (!overflowService?.ensureParentStudio) return undefined;
 
     try {
-      const parent = await overflowService.ensureParentStudio({ userId, agentId, repoRoot });
+      const parent = await overflowService.ensureParentStudio({
+        userId,
+        agentId,
+        repoRoot,
+        sbId: await this.resolveSbId(userId, agentId),
+      });
       if (!parent) return undefined;
       logger.info('[StudioResolve] Created parent studio for caller repo (D1)', {
         studioId: parent.id,

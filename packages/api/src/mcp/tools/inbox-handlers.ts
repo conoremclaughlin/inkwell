@@ -19,6 +19,7 @@ import {
   getPinnedAgentId,
 } from '../../utils/request-context';
 import { getAgentGateway, type AgentTriggerPayload } from '../../channels/agent-gateway.js';
+import { senderRoutingContext, isBridgeIdentity } from './sender-context.js';
 import {
   findThread as findExistingThread,
   getParticipants,
@@ -380,6 +381,11 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
   // context (no x-ink-context token, no session). Suppressing those triggers
   // silently broke the strategy watchdog. Since they have no reply session
   // anyway, the routing concerns that justify suppression don't apply.
+  // Relay identities are excluded from caller-repo inference (spec §Tier 7).
+  // Resolved here, beside the other sender context, so every dispatch site
+  // below gets it without repeating the lookup.
+  const senderIsBridge = await isBridgeIdentity(supabase, resolved.user.id, senderAgentId);
+
   const nonAgentSender = triggerSenderId === 'system' || triggerSenderId === 'unknown';
   const missingSenderSession = !senderSessionId && !!senderAgentId && !nonAgentSender;
 
@@ -725,7 +731,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
           recipientSessionId: resolvedRecipientSessionId,
           // Server-derived, from the same context token that stamps
           // metadata.pcp.sender.studioId — never caller body data.
-          ...(senderStudioId ? { senderStudioId } : {}),
+          ...senderRoutingContext(senderIsBridge),
           ...(explicitRecipientTarget ? { explicitRecipientTarget } : {}),
           ...(isAddressedRecipient && sessionAlias ? { sessionAlias } : {}),
           ...(isAddressedRecipient && resolvedRecipientStudioId
@@ -919,7 +925,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
       summary: triggerSummary || subject || `New ${messageType} from ${triggerSenderId}`,
       priority,
       recipientSessionId: effectiveRecipientSessionId,
-      ...(senderStudioId ? { senderStudioId } : {}),
+      ...senderRoutingContext(senderIsBridge),
       sessionAlias,
       studioId: recipientStudioId,
       studioHint: recipientStudioSlugOrHint,

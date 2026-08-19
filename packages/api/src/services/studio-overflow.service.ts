@@ -251,8 +251,10 @@ export class StudioOverflowService {
     userId: string;
     agentId: string;
     repoRoot: string;
+    /** Canonical identity UUID — authoritative over the display slug. */
+    sbId?: string | null;
   }): Promise<Studio | null> {
-    const { userId, agentId, repoRoot } = opts;
+    const { userId, agentId, repoRoot, sbId } = opts;
     const slug = `${path.basename(repoRoot)}--${agentId}`;
 
     const existing = await this.studios.findBySlug(userId, slug).catch(() => null);
@@ -260,13 +262,33 @@ export class StudioOverflowService {
       // Reuse only a genuine match. A slug collision with an unrelated studio
       // must never be adopted — same reasoning as overflow reuse, and the
       // consequence here is worse because this row is durable.
-      if (
+      // Reuse only a studio a runner can ACTUALLY use (Lumen, PR #514 round 1).
+      //
+      // The earlier predicate accepted any non-ephemeral match, including an
+      // archived or cleaned row, or one whose worktree is gone from disk.
+      // Handing one back creates a session that acquire() then refuses
+      // (spec §The five invariants #5: a cleaned studio is never re-leased,
+      // a configured-but-absent worktree is retired) — and the caller diverts
+      // to overflow or the default cwd instead of holding, which is the
+      // silent-wrong-place outcome this phase removes.
+      const reusable =
         !existing.ephemeral &&
-        existing.agentId === agentId &&
+        existing.userId === userId &&
         existing.repoRoot === repoRoot &&
-        existing.userId === userId
-      ) {
-        return existing;
+        (sbId ? existing.sbId === sbId : existing.agentId === agentId) &&
+        (existing.status === 'active' || existing.status === 'idle');
+
+      if (reusable) {
+        const present = await access(existing.worktreePath)
+          .then(() => true)
+          .catch(() => false);
+        if (present) return existing;
+        logger.warn('[StudioOverflow] Parent studio worktree is gone; refusing reuse', {
+          slug,
+          studioId: existing.id,
+          worktreePath: existing.worktreePath,
+        });
+        return null;
       }
       logger.warn('[StudioOverflow] Parent slug collides with an unrelated studio; refusing', {
         slug,
@@ -294,6 +316,7 @@ export class StudioOverflowService {
       const studio = await this.studios.create({
         userId,
         agentId,
+        sbId: sbId ?? undefined,
         repoRoot,
         worktreePath: created.worktreePath,
         branch: created.branch,

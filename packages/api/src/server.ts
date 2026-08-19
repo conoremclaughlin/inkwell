@@ -707,6 +707,45 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
   // This handles triggers for ANY agent by looking up config from the database
   const agentGateway = getAgentGateway();
 
+  /**
+   * Remove a routingHold stamp once the thread routes again. Best effort and
+   * detached: recovery must never be blocked by bookkeeping about the hold.
+   * Only clears OUR agent's hold — a thread can be held for one participant
+   * and routable for another.
+   */
+  async function clearRoutingHold(
+    client: ReturnType<DataComposer['getClient']>,
+    threadId: string,
+    agentId: string
+  ): Promise<void> {
+    try {
+      const { data: row } = (await client
+        .from('inbox_threads')
+        .select('metadata')
+        .eq('id', threadId)
+        .maybeSingle()) as { data: { metadata: Record<string, unknown> | null } | null };
+      const meta = row?.metadata;
+      if (!meta || typeof meta !== 'object') return;
+      const hold = (meta as Record<string, unknown>).routingHold as
+        | { agentId?: string }
+        | undefined;
+      if (!hold || hold.agentId !== agentId) return;
+
+      const next = { ...(meta as Record<string, unknown>) };
+      delete next.routingHold;
+      await client
+        .from('inbox_threads')
+        .update({ metadata: next as never })
+        .eq('id', threadId);
+      logger.info('[Trigger] Cleared routing hold after successful route', { threadId, agentId });
+    } catch (err) {
+      logger.debug('[Trigger] Could not clear routing hold', {
+        threadId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
   async function logInkmail(
     type: ActivityType & `inkmail_${string}`,
     payload: AgentTriggerPayload,
@@ -1074,6 +1113,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         // Server-stamped at send time; the caller-repo tier resolves the repo
         // from this studio rather than trusting metadata.repoRoot above.
         callerStudioId: payload.senderStudioId,
+        callerSessionId: payload.senderSessionId,
         callerIsBridge: payload.senderIsBridge,
       });
 
@@ -1083,6 +1123,14 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       // race reroutes delivery to the winner. Cross-studio self-sends stamp
       // the TARGET session — under stamped-only polling, an unstamped row is
       // invisible to everyone, so "leave null so both see it" no longer works.
+      // A thread that routes successfully is no longer held. Without this the
+      // routingHold stamp survives recovery and the thread reads as blocked
+      // forever (Lumen, PR #514 round 1) — the stamp exists to explain a
+      // stall, so leaving it after the stall ends is its own false signal.
+      if (payload.threadId) {
+        void clearRoutingHold(dataComposer!.getClient(), payload.threadId, targetAgentId);
+      }
+
       let deliverySession = routedSession;
       // Assignment integrity (Lumen, PR #460 round 2): a failed stamp must
       // never be swallowed into a routeOnly "success" — with stamped-only
@@ -1299,7 +1347,16 @@ When you complete a task_request, mark it as completed using update_inbox_messag
             });
           }
         }
-        return;
+        // Rethrow (Lumen, PR #514 round 1). Returning here made the hold
+        // report SUCCESS: routeOnly's routingFailures stayed empty, the send
+        // reported accepted/triggered, and the sender had no way to learn its
+        // message never landed — the quiet-agent failure this phase exists to
+        // prevent, reproduced one layer up. Throwing propagates to
+        // processTrigger, which reports success:false with this reason, and
+        // the #487 failure-notice path posts it into the thread.
+        //
+        // Nothing is spawned: the throw exits the handler before handleMessage.
+        throw err;
       }
 
       // If session resolution fails, fall through to normal handleMessage

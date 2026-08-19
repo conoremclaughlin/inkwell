@@ -3252,6 +3252,19 @@ describe('SessionService', () => {
       const mockSupabase = {
         from: vi.fn().mockImplementation((table: string) => {
           const calls: RecordedCall[] = [];
+          if (table === 'sessions') {
+            // Provenance: the claimed session's REAL studio_id.
+            return createFilterAwareChain(
+              (c) =>
+                has(c, 'id', 'sender-session-1')
+                  ? { data: { studio_id: 'sender-studio-1' } }
+                  : { data: null },
+              calls
+            );
+          }
+          if (table === 'agent_identities') {
+            return createFilterAwareChain(() => ({ data: { id: 'sb-wren' } }), calls);
+          }
           if (table !== 'studios') return createRecordingChain({ data: null }, calls);
           studioQueries.push(calls);
           return createFilterAwareChain((c) => {
@@ -3270,6 +3283,7 @@ describe('SessionService', () => {
       await service.getOrCreateSession('user-456', 'wren', {
         threadKey: 'pr:1001',
         callerStudioId: 'sender-studio-1',
+        callerSessionId: 'sender-session-1',
       });
 
       // Assert on what routing HANDED the repository, not on the returned
@@ -3289,6 +3303,80 @@ describe('SessionService', () => {
       const reuseQuery = studioQueries.find((calls) => has(calls, 'ephemeral', false));
       expect(reuseQuery).toBeDefined();
       expect(has(reuseQuery!, 'repo_root', '/repos/inkwell')).toBe(true);
+      // Identity by UUID, not the display slug — the same slug can exist in
+      // more than one workspace, so slug-keyed reuse can cross identities.
+      expect(has(reuseQuery!, 'sb_id', 'sb-wren')).toBe(true);
+      expect(has(reuseQuery!, 'agent_id')).toBe(false);
+    });
+
+    it('ignores a studio claim that does not match the sender session row', async () => {
+      // The x-ink-context token is base64url JSON set by CLI hooks — it is NOT
+      // signed. A lone studio claim is therefore exactly as caller-controlled
+      // as metadata.repoRoot; only agreement with server state makes it
+      // evidence (Lumen, PR #514 round 1).
+      //
+      // The claimed studio is deliberately RESOLVABLE here — it maps to a real
+      // repo with a real studio to route into. Without the cross-check this
+      // routes successfully, which is precisely the hole. An earlier version
+      // of this test left the studio lookup empty, so it passed with the
+      // cross-check disabled and proved nothing.
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          const calls: RecordedCall[] = [];
+          if (table === 'sessions') {
+            // Only the provenance lookup (by session id) answers; threadKey
+            // continuity queries must stay empty or they win the route first.
+            return createFilterAwareChain(
+              (c) =>
+                c.some((call) => call.method === 'eq' && call.args[0] === 'id')
+                  ? { data: { studio_id: 'actual-studio' } }
+                  : { data: null },
+              calls
+            );
+          }
+          if (table === 'agent_identities') {
+            return createFilterAwareChain(() => ({ data: { id: 'sb-wren' } }), calls);
+          }
+          if (table === 'studios') {
+            return createFilterAwareChain((c) => {
+              const has = (col: string, val?: unknown) =>
+                c.some(
+                  (call) =>
+                    call.method === 'eq' &&
+                    call.args[0] === col &&
+                    (val === undefined || call.args[1] === val)
+                );
+              if (has('id', 'claimed-studio')) return { data: { repo_root: '/repos/inkwell' } };
+              if (has('ephemeral', false)) return { data: { id: 'studio-inkwell-wren' } };
+              return { data: null };
+            }, calls);
+          }
+          return createRecordingChain({ data: null }, calls);
+        }),
+      };
+      const service = serviceWith(mockSupabase);
+
+      await expect(
+        service.getOrCreateSession('user-456', 'wren', {
+          threadKey: 'pr:1003',
+          callerStudioId: 'claimed-studio',
+          callerSessionId: 'sender-session-1',
+        })
+      ).rejects.toMatchObject({ code: 'ROUTING_REFUSED' });
+    });
+
+    it('requires both claims — a studio without a session id infers nothing', async () => {
+      const mockSupabase = {
+        from: vi.fn().mockImplementation(() => createRecordingChain({ data: null }, [])),
+      };
+      const service = serviceWith(mockSupabase);
+
+      await expect(
+        service.getOrCreateSession('user-456', 'wren', {
+          threadKey: 'pr:1004',
+          callerStudioId: 'sender-studio-1',
+        })
+      ).rejects.toMatchObject({ code: 'ROUTING_REFUSED' });
     });
 
     it('excludes bridge senders without a studio_hint from caller-repo inference', async () => {
@@ -3308,6 +3396,7 @@ describe('SessionService', () => {
         service.getOrCreateSession('user-456', 'myra', {
           threadKey: 'pr:1002',
           callerStudioId: 'bridge-studio',
+          callerSessionId: 'bridge-session',
           callerIsBridge: true,
         })
       ).rejects.toMatchObject({ code: 'ROUTING_REFUSED' });
