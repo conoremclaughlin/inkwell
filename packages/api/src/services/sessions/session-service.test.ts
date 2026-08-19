@@ -3531,6 +3531,101 @@ describe('SessionService', () => {
       );
     });
 
+    it('treats an identity lookup ERROR as ambiguous, not as "no identity"', async () => {
+      // PostgREST failures resolve as { data: null, error } — they do not
+      // throw. Reading only `data` made every transient DB failure look like
+      // "no identity row", which re-enabled slug routing precisely when we
+      // could least justify it (Lumen, PR #514 round 4). Same swallowed-error
+      // shape as the channel-poll bug in #473.
+      const has = (calls: RecordedCall[], col: string, val?: unknown) =>
+        calls.some(
+          (c) => c.method === 'eq' && c.args[0] === col && (val === undefined || c.args[1] === val)
+        );
+      const studioQueries: RecordedCall[][] = [];
+
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          const calls: RecordedCall[] = [];
+          if (table === 'agent_identities') {
+            return createFilterAwareChain(
+              () => ({ data: null, error: { message: 'connection reset' } }),
+              calls
+            );
+          }
+          if (table === 'sessions') {
+            return createFilterAwareChain(
+              (c) =>
+                c.some((call) => call.method === 'eq' && call.args[0] === 'id')
+                  ? { data: { studio_id: 'sender-studio-1' } }
+                  : { data: null },
+              calls
+            );
+          }
+          if (table === 'studios') {
+            studioQueries.push(calls);
+            return createFilterAwareChain((c) => {
+              if (has(c, 'id', 'sender-studio-1')) return { data: { repo_root: '/repos/inkwell' } };
+              // A studio a slug-keyed query would happily return.
+              if (has(c, 'agent_id', 'wren')) return { data: { id: 'studio-slug-match' } };
+              return { data: null };
+            }, calls);
+          }
+          return createRecordingChain({ data: null }, calls);
+        }),
+      };
+      const service = serviceWith(mockSupabase);
+
+      await expect(
+        service.getOrCreateSession('user-456', 'wren', {
+          threadKey: 'pr:1007',
+          callerStudioId: 'sender-studio-1',
+          callerSessionId: 'sender-session-1',
+        })
+      ).rejects.toMatchObject({ code: 'ROUTING_REFUSED' });
+
+      // And no caller-repo reuse query ran on the slug.
+      expect(studioQueries.some((calls) => has(calls, 'ephemeral', false))).toBe(false);
+    });
+
+    it('scopes EARLY tiers by canonical identity, not just caller-repo', async () => {
+      // A duplicate-slug studio winning an earlier tier short-circuits the
+      // fixed caller-repo code entirely, so the fix has to reach every tier
+      // (Lumen, PR #514 round 4). Route-pattern is the earliest tier that
+      // queries studios by identity.
+      const studioQueries: RecordedCall[][] = [];
+      const has = (calls: RecordedCall[], col: string, val?: unknown) =>
+        calls.some(
+          (c) => c.method === 'eq' && c.args[0] === col && (val === undefined || c.args[1] === val)
+        );
+
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          const calls: RecordedCall[] = [];
+          if (table === 'agent_identities') {
+            return createFilterAwareChain(() => ({ data: [{ id: 'sb-wren' }] }), calls);
+          }
+          if (table === 'studios') {
+            studioQueries.push(calls);
+            return createFilterAwareChain(() => ({ data: null }), calls);
+          }
+          return createRecordingChain({ data: null }, calls);
+        }),
+      };
+      const service = serviceWith(mockSupabase);
+
+      await service
+        .getOrCreateSession('user-456', 'wren', { threadKey: 'pr:1008' })
+        .catch(() => undefined);
+
+      // The route-pattern query is identifiable by its route_patterns filter.
+      const patternQuery = studioQueries.find((calls) =>
+        calls.some((c) => c.method === 'not' && c.args[0] === 'route_patterns')
+      );
+      expect(patternQuery).toBeDefined();
+      expect(has(patternQuery!, 'sb_id', 'sb-wren')).toBe(true);
+      expect(has(patternQuery!, 'agent_id')).toBe(false);
+    });
+
     it('excludes bridge senders without a studio_hint from caller-repo inference', async () => {
       // A relay is ambiently in its own home repo, never the subject repo.
       // Inferring would route every bridged thread into the bridge's worktree.

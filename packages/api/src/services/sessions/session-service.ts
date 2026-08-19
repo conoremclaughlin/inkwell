@@ -1873,11 +1873,38 @@ export class SessionService implements ISessionService {
   ): Promise<StudioRoutingDecision> {
     const leaseCtx = { userId, agentId, threadKey: options.threadKey };
 
+    // Canonical identity resolved ONCE, up front, and preferred by EVERY tier
+    // below (Lumen, PR #514 round 4). Scoping only the caller-repo tier by
+    // sb_id left the earlier tiers — studio hint, thread continuity, route
+    // pattern, repo-root main — matching on the display slug, so a
+    // duplicate-slug studio could win before the fixed code ever ran and
+    // short-circuit it entirely.
+    //
+    // `scopeStudios`/`scopeSessions` apply sb_id when it is known and fall
+    // back to agent_id only once we have positively established that no
+    // identity row exists.
+    const identityScope = options.sbId
+      ? { id: options.sbId }
+      : await this.resolveIdentityScope(userId, agentId);
+    const scopedSbId = identityScope.id ?? null;
+    // Returns the same builder type so the rest of each chain keeps working;
+    // PostgrestFilterBuilder's generics are not expressible in a constraint
+    // here without pinning the whole Database type per call.
+    const scopeBy = <T>(q: T): T =>
+      (scopedSbId
+        ? (q as { eq: (c: string, v: unknown) => unknown }).eq('sb_id', scopedSbId)
+        : (q as { eq: (c: string, v: unknown) => unknown }).eq('agent_id', agentId)) as T;
+
     // explicitStudioId takes precedence — it's the precise routing signal.
     if (options.explicitStudioId) {
       if (isMainStudio(options.explicitStudioId)) {
         return {
-          studioId: await this.resolveMainStudioId(userId, options.repoRoot, agentId),
+          studioId: await this.resolveMainStudioId(
+            userId,
+            options.repoRoot,
+            agentId,
+            options.sbId ?? null
+          ),
           tier: 'explicit',
           occupancyChecked: false,
         };
@@ -1892,7 +1919,7 @@ export class SessionService implements ISessionService {
     // studioHint is a convenience fallback — only consulted when no explicit studioId.
     if (isMainStudio(options.studioHint)) {
       return {
-        studioId: await this.resolveMainStudioId(userId, options.repoRoot, agentId),
+        studioId: await this.resolveMainStudioId(userId, options.repoRoot, agentId, scopedSbId),
         tier: 'studio-hint',
         occupancyChecked: false,
       };
@@ -1900,11 +1927,9 @@ export class SessionService implements ISessionService {
 
     if (options.studioHint) {
       // Studios use 'slug' not 'name' — match studioHint against slug
-      const { data: namedStudio } = await this.supabase
-        .from('studios')
-        .select('id')
-        .eq('user_id', userId)
-        .eq('agent_id', agentId)
+      const { data: namedStudio } = await scopeBy(
+        this.supabase.from('studios').select('id').eq('user_id', userId)
+      )
         .eq('slug', options.studioHint)
         .in('status', ['active', 'idle'])
         .limit(1)
@@ -1945,11 +1970,9 @@ export class SessionService implements ISessionService {
 
     // 2) Thread-key scoped continuity (no caller-side studio lookup needed)
     if (options.threadKey) {
-      const { data: activeThreadSession } = await this.supabase
-        .from('sessions')
-        .select('studio_id, updated_at')
-        .eq('user_id', userId)
-        .eq('agent_id', agentId)
+      const { data: activeThreadSession } = await scopeBy(
+        this.supabase.from('sessions').select('studio_id, updated_at').eq('user_id', userId)
+      )
         .eq('thread_key', options.threadKey)
         .is('ended_at', null)
         .not('studio_id', 'is', null)
@@ -1962,11 +1985,9 @@ export class SessionService implements ISessionService {
         return { studioId: activeThreadStudio, tier: 'thread-continuity', occupancyChecked: false };
       }
 
-      const { data: endedThreadSession } = await this.supabase
-        .from('sessions')
-        .select('studio_id, updated_at')
-        .eq('user_id', userId)
-        .eq('agent_id', agentId)
+      const { data: endedThreadSession } = await scopeBy(
+        this.supabase.from('sessions').select('studio_id, updated_at').eq('user_id', userId)
+      )
         .eq('thread_key', options.threadKey)
         .not('ended_at', 'is', null)
         .not('studio_id', 'is', null)
@@ -1986,11 +2007,9 @@ export class SessionService implements ISessionService {
     //    catch-all patterns in project A from capturing triggers for project B.
     if (options.threadKey) {
       // route_patterns is not yet in generated Supabase types — cast result
-      let patternQuery = this.supabase
-        .from('studios')
-        .select('id, route_patterns')
-        .eq('user_id', userId)
-        .eq('agent_id', agentId)
+      let patternQuery = scopeBy(
+        this.supabase.from('studios').select('id, route_patterns').eq('user_id', userId)
+      )
         .in('status', ['active', 'idle'])
         .not('route_patterns', 'eq', '{}');
       if (options.repoRoot) {
@@ -2058,7 +2077,12 @@ export class SessionService implements ISessionService {
     //    main studio for that repo before falling through to the generic
     //    "agent's most recent studio" which may belong to a different project.
     if (options.repoRoot) {
-      const repoRootStudioId = await this.resolveMainStudioId(userId, options.repoRoot, agentId);
+      const repoRootStudioId = await this.resolveMainStudioId(
+        userId,
+        options.repoRoot,
+        agentId,
+        scopedSbId
+      );
       if (repoRootStudioId) {
         logger.debug('[StudioResolve] Resolved studio via repoRoot', {
           repoRoot: options.repoRoot,
@@ -2090,14 +2114,24 @@ export class SessionService implements ISessionService {
     //     actually resolved.
     const callerRepoRoot = await this.resolveCallerRepoRoot(userId, options);
     if (callerRepoRoot) {
-      const byRepo = await this.resolveStudioForRepo(
-        userId,
-        agentId,
-        callerRepoRoot,
-        leaseCtx,
-        options.sbId
-      );
-      if (byRepo) return byRepo;
+      if (identityScope.ambiguous) {
+        // Several identities share this slug: we cannot tell whose studio to
+        // reuse, and guessing is exactly what this phase deletes. Fall through
+        // to the hold below.
+        logger.warn('[StudioResolve] Ambiguous identity — skipping caller-repo resolution', {
+          agentId,
+          threadKey: options.threadKey || null,
+        });
+      } else {
+        const byRepo = await this.resolveStudioForRepo(
+          userId,
+          agentId,
+          callerRepoRoot,
+          leaseCtx,
+          scopedSbId
+        );
+        if (byRepo) return byRepo;
+      }
     }
 
     // 6) Refuse and hold (spec §Refusing to route).
@@ -2267,16 +2301,8 @@ export class SessionService implements ISessionService {
     // thread to a different identity that happens to share a name. Prefer
     // sb_id; fall back to the slug only when no identity row exists, and log
     // that so the gap is visible rather than silent.
-    let sbId: string | null | undefined = knownSbId;
-    if (!sbId) {
-      const scope = await this.resolveIdentityScope(userId, agentId);
-      if (scope.ambiguous) {
-        // No caller-repo resolution at all — the caller falls through to
-        // refuse-and-hold rather than routing by an ambiguous slug.
-        return null;
-      }
-      sbId = scope.id ?? null;
-    }
+    // The scope was resolved once at the top of resolveStudioId and passed in.
+    const sbId: string | null = knownSbId ?? null;
 
     let reuseQuery = this.supabase
       .from('studios')
@@ -2366,12 +2392,27 @@ export class SessionService implements ISessionService {
   ): Promise<{ id?: string; absent?: boolean; ambiguous?: boolean }> {
     if (!this.supabase) return { absent: true };
     try {
-      const { data } = await this.supabase
+      const { data, error } = await this.supabase
         .from('agent_identities')
         .select('id')
         .eq('user_id', userId)
         .eq('agent_id', agentId)
         .limit(2);
+
+      // PostgREST failures RESOLVE as { data: null, error } — they do not
+      // throw. Destructuring only `data` therefore read every transient DB
+      // failure as "no identity row", which re-enabled slug routing exactly
+      // when we could least justify it (Lumen, PR #514 round 4). This is the
+      // same swallowed-error shape as the channel-poll bug in #473; unreadable
+      // is ambiguous, never absent.
+      if (error) {
+        logger.warn('[StudioResolve] Identity lookup failed; treating slug as unusable', {
+          agentId,
+          error: error.message,
+        });
+        return { ambiguous: true };
+      }
+
       if (!data?.length) {
         logger.debug('[StudioResolve] No identity row; slug scoping is unambiguous', { agentId });
         return { absent: true };

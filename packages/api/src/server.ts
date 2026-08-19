@@ -20,6 +20,7 @@
 
 import path from 'path';
 import { getDataComposer, DataComposer } from './data/composer';
+import { stampRoutingHold, clearRoutingHold } from './services/routing-hold';
 import {
   createSessionService,
   SessionService,
@@ -713,54 +714,6 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
    * Only clears OUR agent's hold — a thread can be held for one participant
    * and routable for another.
    */
-  async function clearRoutingHold(
-    client: ReturnType<DataComposer['getClient']>,
-    threadId: string,
-    userId: string,
-    agentId: string,
-    routedSince: string
-  ): Promise<void> {
-    // Atomic and CHECKED (Lumen, PR #514 round 2). The previous version read
-    // metadata, deleted the key locally and wrote the whole object back, so
-    // any concurrent write between read and write was lost — including a
-    // NEWER hold, which would be erased and leave the thread reading as
-    // routable while still stalled. It also ignored the write error and
-    // logged success regardless.
-    //
-    // The RPC deletes only this agent's hold, only when that hold predates
-    // this route, inside a single UPDATE — and returns the affected row count,
-    // so "no hold to clear" is distinguishable from "the write failed".
-    // It also verifies thread ownership server-side (round 3).
-    try {
-      const { data: cleared, error } = await client.rpc(
-        'clear_routing_hold' as never,
-        {
-          p_thread_id: threadId,
-          p_user_id: userId,
-          p_agent_id: agentId,
-          // Only holds older than this route; a newer one belongs to a later
-          // dispatch and must survive.
-          p_routed_since: routedSince,
-        } as never
-      );
-      if (error) {
-        logger.warn('[Trigger] Failed to clear routing hold', {
-          threadId,
-          agentId,
-          error: error.message,
-        });
-        return;
-      }
-      if (cleared) {
-        logger.info('[Trigger] Cleared routing hold after successful route', { threadId, agentId });
-      }
-    } catch (err) {
-      logger.debug('[Trigger] Could not clear routing hold', {
-        threadId,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-  }
 
   async function logInkmail(
     type: ActivityType & `inkmail_${string}`,
@@ -1205,13 +1158,12 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       // that has not happened. Awaited, not detached, so it cannot race the
       // next dispatch's stamp.
       if (payload.threadId && !assignmentFailure) {
-        await clearRoutingHold(
-          dataComposer!.getClient(),
-          payload.threadId,
+        await clearRoutingHold(dataComposer!.getClient(), {
+          threadId: payload.threadId,
           userId,
-          targetAgentId,
-          routeStartedAt
-        );
+          agentId: targetAgentId,
+          routedSince: routeStartedAt,
+        });
       }
 
       // Routing-only dispatch: assignment IS the entire job — a failed stamp
@@ -1344,33 +1296,20 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         });
 
         // Surface on the thread itself so the hold is visible where the work
-        // is, not only in server logs. Atomic jsonb merge via RPC — the
-        // previous read-modify-write could lose a concurrent metadata write
-        // and reported success even when the write failed (Lumen, round 2).
+        // is. Goes through the tested routing-hold boundary — this call site
+        // previously drifted out of sync with the RPC signature and every
+        // refusal went unstamped, with a green suite (Lumen, round 4).
         if (payload.threadId) {
-          const { data: stamped, error: stampErr } = await dataComposer!.getClient().rpc(
-            'stamp_routing_hold' as never,
-            {
-              p_thread_id: payload.threadId,
-              p_hold: {
-                agentId: targetAgentId,
-                reason: 'no-route',
-                triedCallerRepo: err.detail.triedCallerRepo,
-                callerRepoRoot: err.detail.callerRepoRoot || null,
-                heldAt: new Date().toISOString(),
-                recovery: 'route pattern, studioHint, or project affinity',
-              },
-            } as never
-          );
-          if (stampErr || stamped === 0) {
-            // Checked, never assumed: an unstamped hold is invisible on the
-            // thread, so it has to be loud in the log at least.
-            logger.error('[Trigger] Routing hold NOT stamped on thread', {
-              threadId: payload.threadId,
-              rows: stamped ?? null,
-              error: stampErr?.message || null,
-            });
-          }
+          await stampRoutingHold(dataComposer!.getClient(), {
+            threadId: payload.threadId,
+            userId,
+            agentId: targetAgentId,
+            attemptStartedAt: routeStartedAt,
+            detail: {
+              triedCallerRepo: err.detail.triedCallerRepo,
+              callerRepoRoot: err.detail.callerRepoRoot ?? null,
+            },
+          });
         }
 
         // Rethrow (Lumen, PR #514 round 1). Returning here made the hold
