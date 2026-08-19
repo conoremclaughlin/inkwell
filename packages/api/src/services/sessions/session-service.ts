@@ -1544,7 +1544,7 @@ export class SessionService implements ISessionService {
 
     // Resolve default_session_id from agent identity. When set, threadKey
     // misses route to this session instead of creating new ones.
-    const defaultSessionId = await this.resolveDefaultSessionId(userId, agentId);
+    const defaultSessionId = await this.resolveDefaultSessionId(userId, agentId, options?.sbId);
 
     // For primary sessions, try to find existing active session
     if (type === 'primary') {
@@ -1554,7 +1554,27 @@ export class SessionService implements ISessionService {
       // regardless of threadKey mismatch.
       if (options?.recipientSessionId) {
         const recipientSession = await this.repository.findById(options.recipientSessionId);
-        if (recipientSession && !recipientSession.endedAt) {
+        // AUTHORIZATION, not just existence (Lumen, PR #514 round 5).
+        // findById is unscoped — it accepts any session UUID in the table —
+        // and this rung then routed straight into whatever came back. A
+        // caller-supplied id could therefore reach another USER's session, and
+        // another agent's. Both boundaries are checked here before use; the
+        // agent check uses sb_id when both sides have one, since the slug is
+        // ambiguous across workspaces.
+        const belongsToUser = recipientSession?.userId === userId;
+        const belongsToAgent =
+          recipientSession?.sbId && options.sbId
+            ? recipientSession.sbId === options.sbId
+            : recipientSession?.agentId === agentId;
+        if (recipientSession && (!belongsToUser || !belongsToAgent)) {
+          logger.warn('[SessionRouting] Refusing recipientSessionId — not this user/agent', {
+            recipientSessionId: options.recipientSessionId,
+            sessionUserId: recipientSession.userId,
+            sessionAgentId: recipientSession.agentId,
+            requestedAgentId: agentId,
+          });
+        }
+        if (recipientSession && !recipientSession.endedAt && belongsToUser && belongsToAgent) {
           logger.debug('Routing to explicit recipientSession', {
             sessionId: recipientSession.id,
             threadKey: options.threadKey,
@@ -1890,21 +1910,29 @@ export class SessionService implements ISessionService {
     // Returns the same builder type so the rest of each chain keeps working;
     // PostgrestFilterBuilder's generics are not expressible in a constraint
     // here without pinning the whole Database type per call.
-    const scopeBy = <T>(q: T): T =>
-      (scopedSbId
-        ? (q as { eq: (c: string, v: unknown) => unknown }).eq('sb_id', scopedSbId)
-        : (q as { eq: (c: string, v: unknown) => unknown }).eq('agent_id', agentId)) as T;
+    // AMBIGUOUS and ABSENT must not scope the same way (Lumen, PR #514 r5).
+    // Both produced a null sbId, so both fell back to agent_id — meaning an
+    // ambiguous slug or an unreadable identity still matched slug rows in the
+    // early tiers, and a duplicate-slug studio could win before the
+    // caller-repo fix ever ran.
+    //
+    // Absent is safe to scope by slug: no identity row exists, so there is
+    // nothing to confuse it with. Ambiguous is not, so it scopes to an
+    // impossible sb_id — every early tier misses and routing falls through to
+    // refuse-and-hold instead of matching the wrong agent's studio.
+    const IMPOSSIBLE_SB_ID = '00000000-0000-0000-0000-000000000000';
+    const scopeBy = <T>(q: T): T => {
+      const eq = (q as { eq: (c: string, v: unknown) => unknown }).eq.bind(q);
+      if (scopedSbId) return eq('sb_id', scopedSbId) as T;
+      if (identityScope.ambiguous) return eq('sb_id', IMPOSSIBLE_SB_ID) as T;
+      return eq('agent_id', agentId) as T;
+    };
 
     // explicitStudioId takes precedence — it's the precise routing signal.
     if (options.explicitStudioId) {
       if (isMainStudio(options.explicitStudioId)) {
         return {
-          studioId: await this.resolveMainStudioId(
-            userId,
-            options.repoRoot,
-            agentId,
-            options.sbId ?? null
-          ),
+          studioId: await this.resolveMainStudioId(userId, options.repoRoot, agentId, scopedSbId),
           tier: 'explicit',
           occupancyChecked: false,
         };
@@ -2736,19 +2764,26 @@ This session will continue with a fresh context after compaction. Your identity,
    * misses route to this session instead of creating new ones (Myra, etc.).
    * Returns the session UUID or null.
    */
-  private async resolveDefaultSessionId(userId: string, agentId: string): Promise<string | null> {
+  private async resolveDefaultSessionId(
+    userId: string,
+    agentId: string,
+    sbId?: string | null
+  ): Promise<string | null> {
     if (!this.supabase) return null;
     try {
       // default_session_id not yet in generated types — cast result
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const { data } = (await (this.supabase as any)
+      let q = (this.supabase as any)
         .from('agent_identities')
         .select('default_session_id')
-        .eq('user_id', userId)
-        .eq('agent_id', agentId)
-        .not('workspace_id', 'is', null)
-        .limit(1)
-        .maybeSingle()) as { data: { default_session_id: string | null } | null };
+        .eq('user_id', userId);
+      // Canonical identity when known: reading the default session by slug
+      // could hand identity A the session identity B configured
+      // (Lumen, PR #514 round 5).
+      q = sbId ? q.eq('id', sbId) : q.eq('agent_id', agentId).not('workspace_id', 'is', null);
+      const { data } = (await q.limit(1).maybeSingle()) as {
+        data: { default_session_id: string | null } | null;
+      };
       return data?.default_session_id || null;
     } catch {
       return null;

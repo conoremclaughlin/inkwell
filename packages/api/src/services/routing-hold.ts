@@ -55,6 +55,11 @@ export async function stampRoutingHold(client: any, args: StampHoldArgs): Promis
       p_hold: {
         agentId,
         reason: 'no-route',
+        // The hold's GENERATION. `heldAt` is when it was written, which can be
+        // long after the attempt began; comparing that against a successful
+        // route's start let an older failure's hold survive a newer success
+        // (Lumen, PR #514 round 5). The clear compares generations.
+        attemptStartedAt,
         triedCallerRepo: detail.triedCallerRepo,
         callerRepoRoot: detail.callerRepoRoot ?? null,
         heldAt: args.now ?? new Date().toISOString(),

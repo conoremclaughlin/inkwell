@@ -45,6 +45,9 @@ describe('stampRoutingHold', () => {
       p_hold: {
         agentId: 'wren',
         reason: 'no-route',
+        // Generation, not just wall-clock: the clear compares this against
+        // the successful route's start.
+        attemptStartedAt: '2026-08-19T02:00:00.000Z',
         triedCallerRepo: true,
         callerRepoRoot: '/repos/inkwell',
         heldAt: '2026-08-19T02:00:05.000Z',
