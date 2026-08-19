@@ -7,6 +7,7 @@
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { makeFakeSupabase } from './fake-supabase.js';
+import { StudioOverflowService } from '../studio-overflow.service.js';
 import {
   SessionService,
   resolveRuntimeModel,
@@ -3181,6 +3182,105 @@ describe('SessionService', () => {
       // The whole point: no session row. A held message is recoverable; a
       // session in the wrong worktree is not.
       expect(mockRepository.create).not.toHaveBeenCalled();
+    });
+
+    it('holds instead of running studioless when the studio is occupied and overflow FAILS', async () => {
+      /*
+       * The gap 3b left behind. gateOccupancy's last resort returned the
+       * ORIGINAL tier with no `refusal`, so the Phase 3b throw — gated on
+       * `tier === 'refused' && refusal` — never fired. A session was created
+       * with no studio and ran in the server's default working directory:
+       * the silent-wrong-place outcome this phase exists to remove, on the one
+       * path whose own comment said 3b would fix it.
+       *
+       * Nine review rounds and I all walked past it because the comment named
+       * the phase, and because NOTHING in this file covered the divert path.
+       *
+       * Fails provisioning at the real seam (ensureOverflowStudio returning
+       * null — its documented outcome when worktree creation fails or every
+       * slug candidate collides) rather than by starving an earlier lookup, so
+       * the test cannot pass for the wrong reason.
+       */
+      const overflowSpy = vi
+        .spyOn(StudioOverflowService.prototype, 'ensureOverflowStudio')
+        .mockResolvedValue(null);
+
+      const now = new Date().toISOString();
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          const calls: RecordedCall[] = [];
+          if (table === 'agent_identities') {
+            return createFilterAwareChain(() => ({ data: [{ id: 'sb-wren' }] }), calls);
+          }
+          if (table === 'studios') {
+            return createFilterAwareChain((c) => {
+              const selected = c.find((call) => call.method === 'select');
+              const selectArg = String(selected?.args[0] ?? '');
+
+              // The occupancy read — a LIVE lease held by a different thread.
+              if (selectArg.includes('lease')) {
+                return {
+                  data: {
+                    lease: {
+                      threadKey: 'pr:other',
+                      sessionId: 'holder-session',
+                      acquiredAt: now,
+                      heartbeatAt: now,
+                    },
+                    worktree_path: '/repos/inkwell--wren',
+                    ephemeral: false,
+                    status: 'active',
+                  },
+                };
+              }
+
+              // divertToOverflow resolves the parent before provisioning; give
+              // it a real, same-user row so we reach the provisioning seam.
+              if (selectArg === '*') {
+                return {
+                  data: {
+                    id: 'studio-A',
+                    user_id: 'user-456',
+                    agent_id: 'wren',
+                    sb_id: 'sb-wren',
+                    repo_root: '/repos/inkwell',
+                    worktree_path: '/repos/inkwell--wren',
+                    branch: 'wren/studio/wren',
+                    base_branch: 'main',
+                    status: 'active',
+                    ephemeral: false,
+                    metadata: {},
+                    created_at: now,
+                    updated_at: now,
+                  },
+                };
+              }
+
+              const isPatternQuery = c.some(
+                (call) => call.method === 'not' && call.args[0] === 'route_patterns'
+              );
+              return isPatternQuery
+                ? { data: [{ id: 'studio-A', route_patterns: ['pr:*'] }] }
+                : { data: null };
+            }, calls);
+          }
+          return createRecordingChain({ data: null }, calls);
+        }),
+      };
+      const service = serviceWith(mockSupabase);
+
+      await expect(
+        service.getOrCreateSession('user-456', 'wren', { threadKey: 'pr:3100' })
+      ).rejects.toMatchObject({
+        code: 'ROUTING_REFUSED',
+        // `occupied`, not `no-route`: a studio WAS found. Reporting no-route
+        // would send an operator hunting for a missing route pattern.
+        detail: { reason: 'occupied' },
+      });
+
+      expect(overflowSpy).toHaveBeenCalled();
+      expect(mockRepository.create).not.toHaveBeenCalled();
+      overflowSpy.mockRestore();
     });
 
     it('does NOT refuse unthreaded work — heartbeats keep degrading to the default cwd', async () => {

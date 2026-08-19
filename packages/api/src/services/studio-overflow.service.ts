@@ -96,13 +96,12 @@ export class StudioOverflowService {
   private matchesOverflow(existing: Studio, parentStudio: Studio, threadKey: string): boolean {
     if (!existing.ephemeral) return false;
     if (existing.parentStudioId !== parentStudio.id) return false;
-    const metadata =
-      existing.metadata &&
-      typeof existing.metadata === 'object' &&
-      !Array.isArray(existing.metadata)
-        ? (existing.metadata as Record<string, unknown>)
-        : {};
-    return metadata.threadKey === threadKey;
+    // The `thread_key` COLUMN, not `metadata->>'threadKey'`. This value is a
+    // correctness predicate — it decides whether reusing a studio would drop
+    // this thread into another thread's worktree — and teardown fences on it
+    // too, so it should not live in an unconstrained, unindexed JSONB path.
+    // Existing rows were backfilled by the same migration that added it.
+    return existing.threadKey === threadKey;
   }
 
   /**
@@ -192,8 +191,9 @@ export class StudioOverflowService {
           defaultProjectId: parentStudio.defaultProjectId,
           ephemeral: true,
           parentStudioId: parentStudio.id,
+          threadKey,
           expiresAt: new Date(Date.now() + EPHEMERAL_STUDIO_TTL_MS).toISOString(),
-          metadata: { overflow: true, threadKey },
+          metadata: { overflow: true },
         });
         await this.leases.logEvent(userId, studio.id, 'overflow', {
           threadKey,

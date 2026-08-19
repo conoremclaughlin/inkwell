@@ -52,8 +52,33 @@ describe('stampRoutingHold', () => {
         callerRepoRoot: '/repos/inkwell',
         heldAt: '2026-08-19T02:00:05.000Z',
         recovery: 'route pattern, studioHint, or project affinity',
+        occupied: null,
       },
     });
+  });
+
+  it('describes an OCCUPIED refusal as occupied, with its own recovery', async () => {
+    // A hold that says "no-route" when a studio was in fact found and busy
+    // sends the operator after the wrong fix: they go looking for a missing
+    // route pattern instead of a lease holder or an overflow failure.
+    const { client, rpc } = rpcClient({ data: 1 });
+    await expect(
+      stampRoutingHold(client, {
+        ...STAMP,
+        detail: {
+          triedCallerRepo: false,
+          reason: 'occupied',
+          occupied: { studioId: 's-9', holderThreadKey: 'pr:600' },
+        },
+      })
+    ).resolves.toBe(true);
+
+    const hold = rpc.mock.calls[0][1].p_hold;
+    expect(hold.reason).toBe('occupied');
+    expect(hold.occupied).toEqual({ studioId: 's-9', holderThreadKey: 'pr:600' });
+    expect(hold.recovery).toBe(
+      'wait for the lease holder to finish, or fix the overflow provisioning failure'
+    );
   });
 
   it('reports failure when the RPC returns an error rather than assuming success', async () => {

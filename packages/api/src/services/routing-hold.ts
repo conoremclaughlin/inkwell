@@ -19,6 +19,13 @@ import { logger } from '../utils/logger';
 export interface RoutingHoldDetail {
   triedCallerRepo: boolean;
   callerRepoRoot?: string | null;
+  /**
+   * Why routing refused. `occupied` means a studio WAS resolved but was leased
+   * and overflow provisioning failed — a different problem with a different
+   * recovery, so the hold must not describe it as "no route".
+   */
+  reason?: 'no-route' | 'occupied';
+  occupied?: { studioId: string; holderThreadKey: string } | null;
 }
 
 export interface StampHoldArgs {
@@ -54,7 +61,7 @@ export async function stampRoutingHold(client: any, args: StampHoldArgs): Promis
       p_attempt_started: attemptStartedAt,
       p_hold: {
         agentId,
-        reason: 'no-route',
+        reason: detail.reason ?? 'no-route',
         // The hold's GENERATION. `heldAt` is when it was written, which can be
         // long after the attempt began; comparing that against a successful
         // route's start let an older failure's hold survive a newer success
@@ -63,7 +70,11 @@ export async function stampRoutingHold(client: any, args: StampHoldArgs): Promis
         triedCallerRepo: detail.triedCallerRepo,
         callerRepoRoot: detail.callerRepoRoot ?? null,
         heldAt: args.now ?? new Date().toISOString(),
-        recovery: 'route pattern, studioHint, or project affinity',
+        recovery:
+          detail.reason === 'occupied'
+            ? 'wait for the lease holder to finish, or fix the overflow provisioning failure'
+            : 'route pattern, studioHint, or project affinity',
+        occupied: detail.occupied ?? null,
       },
     });
 
