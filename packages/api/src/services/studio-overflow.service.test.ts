@@ -39,6 +39,7 @@ function makeStudio(overrides: Partial<Studio> = {}): Studio {
     lease: null,
     ephemeral: false,
     parentStudioId: null,
+    threadKey: null,
     expiresAt: null,
     createdAt: '',
     updatedAt: '',
@@ -109,7 +110,8 @@ describe('StudioOverflowService.ensureOverflowStudio — reuse', () => {
         slug: 'lumen-review--pr-476',
         ephemeral: true,
         parentStudioId: 'parent-1',
-        metadata: { overflow: true, threadKey: 'pr:476' },
+        threadKey: 'pr:476',
+        metadata: { overflow: true },
         worktreePath,
       });
       const studios = {
@@ -176,7 +178,8 @@ describe('StudioOverflowService.ensureOverflowStudio — reuse', () => {
       slug: 'lumen-review--pr-476',
       ephemeral: true,
       parentStudioId: 'parent-1',
-      metadata: { overflow: true, threadKey: 'pr:9999' },
+      threadKey: 'pr:9999',
+      metadata: { overflow: true },
     });
     const findBySlug = vi.fn().mockResolvedValueOnce(otherThreads).mockResolvedValueOnce(null);
     const studios = {

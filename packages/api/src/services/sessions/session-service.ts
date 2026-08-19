@@ -274,10 +274,20 @@ export interface StudioRoutingDecision {
    */
   deferredCreate?: { repoRoot: string; sbId?: string | null };
   refusal?: {
-    reason: 'no-route';
+    /**
+     * `no-route`  — no tier could place the thread at all.
+     * `occupied`  — a tier DID place it, the studio was leased by another
+     *               thread, and overflow provisioning then failed. Distinct
+     *               because the recovery is different: no-route needs an
+     *               address, occupied needs the holder to finish or the
+     *               overflow failure to be fixed.
+     */
+    reason: 'no-route' | 'occupied';
     threadKey: string;
     triedCallerRepo: boolean;
     callerRepoRoot?: string;
+    /** Set when reason is `occupied`. */
+    occupied?: { studioId: string; holderThreadKey: string };
   };
 }
 
@@ -321,13 +331,24 @@ export class RoutingRefusedError extends Error {
   constructor(
     readonly threadKey: string,
     readonly agentId: string,
-    readonly detail: { triedCallerRepo: boolean; callerRepoRoot?: string }
+    readonly detail: {
+      triedCallerRepo: boolean;
+      callerRepoRoot?: string;
+      reason?: 'no-route' | 'occupied';
+      occupied?: { studioId: string; holderThreadKey: string };
+    }
   ) {
     super(
-      `Refusing to route "${threadKey}" for agent "${agentId}": no route pattern, ` +
-        `no project affinity, and no usable caller repo. Message held. ` +
-        `Add a route pattern to a studio, pass a studioHint, or send from a ` +
-        `session bound to the target repo.`
+      detail.reason === 'occupied'
+        ? `Refusing to route "${threadKey}" for agent "${agentId}": studio ` +
+            `${detail.occupied?.studioId ?? 'unknown'} is leased by ` +
+            `"${detail.occupied?.holderThreadKey ?? 'another thread'}" and an overflow ` +
+            `studio could not be provisioned. Message held. Retry once the holder ` +
+            `finishes, or resolve the overflow failure in the logs.`
+        : `Refusing to route "${threadKey}" for agent "${agentId}": no route pattern, ` +
+            `no project affinity, and no usable caller repo. Message held. ` +
+            `Add a route pattern to a studio, pass a studioHint, or send from a ` +
+            `session bound to the target repo.`
     );
     this.name = 'RoutingRefusedError';
   }
@@ -464,9 +485,13 @@ export class SessionService implements ISessionService {
       };
     }
 
-    // Overflow creation failed. Never route into the occupied studio — run
-    // studioless (default working directory) and leave a loud trail. Proper
-    // refuse-and-hold is Phase 3b (spec v11 §Refusing to route).
+    // Overflow creation failed. Never route into the occupied studio.
+    //
+    // This used to return the ORIGINAL tier with no `refusal`, which meant the
+    // Phase 3b throw (gated on tier === 'refused' && refusal) never fired: the
+    // session was created studioless and ran in the server's default working
+    // directory. That is the silent-wrong-place outcome 3b exists to remove,
+    // on the one path whose own comment said 3b would fix it. Refuse properly.
     logger.error('[StudioResolve] Overflow creation failed; refusing occupied studio', {
       studioId: candidateStudioId,
       tier,
@@ -476,17 +501,23 @@ export class SessionService implements ISessionService {
     await leases.logEvent(ctx.userId, candidateStudioId, 'conflict', {
       threadKey: ctx.threadKey,
       agentId: ctx.agentId,
-      reason: `occupied by ${holder.threadKey} and overflow creation failed; session will run studioless`,
+      reason: `occupied by ${holder.threadKey} and overflow creation failed; holding the message`,
     });
     return {
       studioId: undefined,
-      tier,
+      tier: 'refused',
       occupancyChecked: true,
       diverted: {
         from: candidateStudioId,
         holderThreadKey: holder.threadKey,
         holderSessionId: holder.sessionId,
         via: 'refused',
+      },
+      refusal: {
+        reason: 'occupied',
+        threadKey: ctx.threadKey,
+        triedCallerRepo: false,
+        occupied: { studioId: candidateStudioId, holderThreadKey: holder.threadKey },
       },
     };
   }
@@ -1892,9 +1923,11 @@ export class SessionService implements ISessionService {
     if (routing.tier === 'refused' && routing.refusal && !defaultSessionId) {
       throw new RoutingRefusedError(routing.refusal.threadKey, agentId, {
         triedCallerRepo: routing.refusal.triedCallerRepo,
+        reason: routing.refusal.reason,
         ...(routing.refusal.callerRepoRoot
           ? { callerRepoRoot: routing.refusal.callerRepoRoot }
           : {}),
+        ...(routing.refusal.occupied ? { occupied: routing.refusal.occupied } : {}),
       });
     }
 

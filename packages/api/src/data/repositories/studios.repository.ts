@@ -38,6 +38,8 @@ export interface Studio {
   lease: Json | null;
   ephemeral: boolean;
   parentStudioId: string | null;
+  /** Thread this studio was provisioned for. Overflow studios only. */
+  threadKey: string | null;
   expiresAt: string | null;
   createdAt: string;
   updatedAt: string;
@@ -60,6 +62,7 @@ export interface CreateStudioInput {
   defaultProjectId?: string | null;
   ephemeral?: boolean;
   parentStudioId?: string | null;
+  threadKey?: string | null;
   expiresAt?: string | null;
   metadata?: Json;
 }
@@ -116,6 +119,7 @@ export class StudiosRepository {
       lease: (row.lease as Json) ?? null,
       ephemeral: Boolean(row.ephemeral),
       parentStudioId: (row.parent_studio_id as string) || null,
+      threadKey: (row.thread_key as string) || null,
       expiresAt: (row.expires_at as string) || null,
       createdAt: row.created_at as string,
       updatedAt: row.updated_at as string,
@@ -144,6 +148,7 @@ export class StudiosRepository {
       default_project_id: input.defaultProjectId ?? null,
       ephemeral: input.ephemeral ?? false,
       parent_studio_id: input.parentStudioId ?? null,
+      thread_key: input.threadKey ?? null,
       expires_at: input.expiresAt ?? null,
       slug: deriveStudioSlug(input.worktreePath),
       status: 'active',
@@ -297,14 +302,14 @@ export class StudiosRepository {
     return (data || []).map((row) => this.mapRow(row as Record<string, unknown>));
   }
 
-  /** Ephemeral studios created for a thread's overflow (metadata.threadKey). */
+  /** Ephemeral studios created for a thread's overflow. Indexed on (user_id, thread_key). */
   async listEphemeralByThread(userId: string, threadKey: string): Promise<Studio[]> {
     const { data, error } = await this.client
       .from('studios')
       .select('*')
       .eq('user_id', userId)
       .eq('ephemeral', true)
-      .eq('metadata->>threadKey', threadKey)
+      .eq('thread_key', threadKey)
       .in('status', ['active', 'idle']);
 
     if (error) {

@@ -1282,13 +1282,23 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       // wrong-worktree session the refusal exists to prevent. Stop here: no
       // session, no lease, no spawn, and a loud, recoverable trail.
       if (err instanceof RoutingRefusedError) {
-        logger.warn('[Trigger] HELD — routing refused, no session created', {
+        // ERROR, not warn. A held message never reached its recipient, and
+        // nothing else reports that: the hold lands in thread metadata that no
+        // reader consults, and processTrigger converts the throw into a
+        // success:false FIELD on a 200 response, so no status-code monitoring
+        // sees it either. `warn` kept it out of ~/.ink/logs/error.log, which is
+        // the one place an operator actually looks.
+        logger.error('[Trigger] HELD — routing refused, no session created', {
           threadKey: err.threadKey,
           targetAgentId,
+          reason: err.detail.reason ?? 'no-route',
           triedCallerRepo: err.detail.triedCallerRepo,
           callerRepoRoot: err.detail.callerRepoRoot || null,
+          ...(err.detail.occupied ? { occupied: err.detail.occupied } : {}),
           recovery:
-            'add a route pattern to a studio, pass studioHint, or send from a session bound to the target repo',
+            err.detail.reason === 'occupied'
+              ? 'wait for the lease holder to finish, or fix the overflow provisioning failure'
+              : 'add a route pattern to a studio, pass studioHint, or send from a session bound to the target repo',
         });
 
         await logInkmail('inkmail_fail', payload, userId, {
@@ -1308,6 +1318,8 @@ When you complete a task_request, mark it as completed using update_inbox_messag
             detail: {
               triedCallerRepo: err.detail.triedCallerRepo,
               callerRepoRoot: err.detail.callerRepoRoot ?? null,
+              reason: err.detail.reason,
+              occupied: err.detail.occupied ?? null,
             },
           });
         }

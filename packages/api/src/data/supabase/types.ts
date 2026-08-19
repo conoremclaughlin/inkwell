@@ -3193,6 +3193,7 @@ export type Database = {
           session_id: string | null;
           slug: string | null;
           status: string;
+          thread_key: string | null;
           updated_at: string | null;
           user_id: string;
           work_type: string | null;
@@ -3222,6 +3223,7 @@ export type Database = {
           session_id?: string | null;
           slug?: string | null;
           status?: string;
+          thread_key?: string | null;
           updated_at?: string | null;
           user_id: string;
           work_type?: string | null;
@@ -3251,6 +3253,7 @@ export type Database = {
           session_id?: string | null;
           slug?: string | null;
           status?: string;
+          thread_key?: string | null;
           updated_at?: string | null;
           user_id?: string;
           work_type?: string | null;
