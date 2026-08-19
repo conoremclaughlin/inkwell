@@ -20,6 +20,8 @@ export interface Studio {
   id: string;
   userId: string;
   agentId: string | null;
+  /** Canonical identity UUID — authoritative; agentId is a display slug. */
+  sbId: string | null;
   sessionId: string | null;
   repoRoot: string;
   worktreePath: string;
@@ -98,6 +100,7 @@ export class StudiosRepository {
       id: row.id as string,
       userId: row.user_id as string,
       agentId: (row.agent_id as string) || null,
+      sbId: (row.sb_id as string) || null,
       sessionId: (row.session_id as string) || null,
       repoRoot: row.repo_root as string,
       worktreePath: row.worktree_path as string,
@@ -222,6 +225,28 @@ export class StudiosRepository {
 
     if (error && error.code !== 'PGRST116') {
       throw new Error(`Failed to find studio by slug: ${error.message}`);
+    }
+
+    return data ? this.mapRow(data as Record<string, unknown>) : null;
+  }
+
+  /**
+   * Any studio already bound to this repo, used as a provisioning seed: it
+   * tells us the repo's base branch and project without inventing either.
+   * Oldest-first so the seed is the most established row, not the newest.
+   */
+  async findByRepoRoot(userId: string, repoRoot: string): Promise<Studio | null> {
+    const { data, error } = await this.client
+      .from('studios')
+      .select('*')
+      .eq('user_id', userId)
+      .eq('repo_root', repoRoot)
+      .order('created_at', { ascending: true })
+      .limit(1)
+      .maybeSingle();
+
+    if (error) {
+      throw new Error(`Failed to find studio by repo root: ${error.message}`);
     }
 
     return data ? this.mapRow(data as Record<string, unknown>) : null;

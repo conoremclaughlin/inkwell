@@ -1417,7 +1417,8 @@ describe('SessionService', () => {
         'myra',
         'pr:43',
         undefined, // studioId
-        undefined // contactId
+        undefined, // contactId
+        null // canonical identity (no identity row in this mock)
       );
       // Should NOT have created a new session
       expect(mockRepoWithThreadKey.create).not.toHaveBeenCalled();
@@ -1465,7 +1466,8 @@ describe('SessionService', () => {
         'myra',
         'pr:999',
         undefined, // studioId
-        undefined // contactId
+        undefined, // contactId
+        null // canonical identity (no identity row in this mock)
       );
       expect(mockRepoWithThreadKey.findByUserAndAgent).not.toHaveBeenCalled();
       expect(mockRepoWithThreadKey.create).toHaveBeenCalledWith(
@@ -1973,7 +1975,7 @@ describe('SessionService', () => {
       );
 
       // 4th arg is the studio scope: undefined here because no studio was named.
-      expect(mockFindByAlias).toHaveBeenCalledWith('user-456', 'myra', 'main', undefined);
+      expect(mockFindByAlias).toHaveBeenCalledWith('user-456', 'myra', 'main', undefined, null);
       expect(mockRepository.findByUserAndAgent).not.toHaveBeenCalled();
     });
 
@@ -1990,13 +1992,21 @@ describe('SessionService', () => {
         })
       );
 
-      expect(mockFindByAlias).toHaveBeenCalledWith('user-456', 'myra', 'nonexistent', undefined);
+      expect(mockFindByAlias).toHaveBeenCalledWith(
+        'user-456',
+        'myra',
+        'nonexistent',
+        undefined,
+        null
+      );
       expect(mockFindByThreadKey).toHaveBeenCalledWith(
         'user-456',
         'myra',
         'pr:42',
         undefined,
-        undefined
+        undefined,
+        // Canonical identity — null here because the mock has no identity row.
+        null
       );
     });
 
@@ -2067,7 +2077,7 @@ describe('SessionService', () => {
       // The alias wins. Unscoped is safe here on its own terms: findByAlias
       // refuses an alias spanning two studios, so no-scope means must-be-
       // unique rather than pick-one.
-      expect(mockFindByAlias).toHaveBeenCalledWith('user-456', 'myra', 'main', undefined);
+      expect(mockFindByAlias).toHaveBeenCalledWith('user-456', 'myra', 'main', undefined, null);
       expect(session.id).toBe('alias-session');
       expect(mockFindByThreadKey).not.toHaveBeenCalled();
     });
@@ -2272,7 +2282,8 @@ describe('SessionService', () => {
         'myra',
         'pr:99',
         undefined,
-        undefined
+        undefined,
+        null
       );
       expect(mockRepository.findById).toHaveBeenCalledWith('default-session');
       expect(mockRepository.create).not.toHaveBeenCalled();
@@ -3083,7 +3094,16 @@ describe('SessionService', () => {
       expect(offenders).toEqual([]);
     });
 
-    it("the agent's-own-studio fallback filters to active and idle only", async () => {
+    it("the agent's-own-studio recency tier no longer exists (Phase 3b)", async () => {
+      // Supersedes 3a's "filters to active and idle only" test. That test
+      // guarded the status filter ON the recency tier; 3b deletes the tier, so
+      // the filter has nothing to guard and the stronger claim is that no
+      // recency-ordered, repo-unscoped studio lookup runs at all.
+      //
+      // Why deleted rather than filtered: the tier answered every routing
+      // question whether or not it had evidence, and a wrong answer became
+      // self-reinforcing — the misrouted studio was then the most recent one.
+      // It is what put Lumen's pr:483 review in the inkread worktree.
       const studioQueries: RecordedCall[][] = [];
 
       const mockSupabase = {
@@ -3114,20 +3134,1036 @@ describe('SessionService', () => {
         })
       );
 
-      // Identify the fallback query: filtered by agent_id, ordered by recency,
-      // and not scoped to a repo (which would make it resolveMainStudio).
-      const fallbackQuery = studioQueries.find(
+      // The deleted tier's signature: agent-scoped, ordered by updated_at,
+      // NOT scoped to a repo (that would be resolveMainStudio) and not the
+      // route-pattern query.
+      const recencyQuery = studioQueries.find(
         (calls) =>
           calls.some((c) => c.method === 'eq' && c.args[0] === 'agent_id') &&
           calls.some((c) => c.method === 'order' && c.args[0] === 'updated_at') &&
           !calls.some((c) => c.method === 'eq' && c.args[0] === 'worktree_path') &&
+          !calls.some((c) => c.method === 'eq' && c.args[0] === 'repo_root') &&
           !calls.some((c) => c.method === 'not' && c.args[0] === 'route_patterns')
       );
 
-      expect(fallbackQuery).toBeDefined();
-      const statusFilter = fallbackQuery!.find((c) => c.method === 'in' && c.args[0] === 'status');
-      expect(statusFilter).toBeDefined();
-      expect(statusFilter!.args[1]).toEqual(['active', 'idle']);
+      expect(recencyQuery).toBeUndefined();
+    });
+
+    /**
+     * Phase 3b — caller-repo resolution and refuse-and-hold.
+     *
+     * These pin the two behaviours that replaced recency guessing: the repo
+     * must be derived from the SERVER's view of the sender, and a thread with
+     * no evidence must be held rather than placed somewhere plausible.
+     */
+    function serviceWith(mockSupabase: unknown) {
+      return new SessionService(
+        mockRepository,
+        mockContextBuilder,
+        mockClaudeRunner,
+        mockActivityStream,
+        { defaultWorkingDirectory: '/test', mcpConfigPath: '/test/.mcp.json' },
+        mockCodexRunner,
+        mockSupabase as never
+      );
+    }
+
+    it('refuses to route a threaded message with no pattern, project, or caller repo', async () => {
+      const mockSupabase = {
+        from: vi.fn().mockImplementation(() => createRecordingChain({ data: null }, [])),
+      };
+      const service = serviceWith(mockSupabase);
+
+      await expect(
+        service.getOrCreateSession('user-456', 'wren', { threadKey: 'pr:999' })
+      ).rejects.toMatchObject({ code: 'ROUTING_REFUSED', threadKey: 'pr:999' });
+
+      // The whole point: no session row. A held message is recoverable; a
+      // session in the wrong worktree is not.
+      expect(mockRepository.create).not.toHaveBeenCalled();
+    });
+
+    it('does NOT refuse unthreaded work — heartbeats keep degrading to the default cwd', async () => {
+      const mockSupabase = {
+        from: vi.fn().mockImplementation(() => createRecordingChain({ data: null }, [])),
+      };
+      const service = serviceWith(mockSupabase);
+
+      // Unthreaded sessions do not lease a studio and are out of scope for
+      // refusal (spec §Scope limitations). Refusing them would silently stop
+      // every heartbeat on a fresh install.
+      await expect(service.getOrCreateSession('user-456', 'wren', {})).resolves.toBeDefined();
+      expect(mockRepository.create).toHaveBeenCalled();
+    });
+
+    it('never infers the caller repo from caller-supplied metadata.repoRoot', async () => {
+      // The v5 trust boundary. metadata.repoRoot arrives in the caller's own
+      // payload, so a sender that can name a repo could name ANY repo. It may
+      // still drive the explicit repo-root-main tier, but it must never be the
+      // source for caller-repo inference — and with no studio for it, routing
+      // must refuse rather than place the thread there.
+      const studioQueries: RecordedCall[][] = [];
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          const calls: RecordedCall[] = [];
+          if (table === 'studios') studioQueries.push(calls);
+          return createRecordingChain({ data: null }, calls);
+        }),
+      };
+      const service = serviceWith(mockSupabase);
+
+      await expect(
+        service.getOrCreateSession('user-456', 'wren', {
+          threadKey: 'pr:1000',
+          repoRoot: '/repos/attacker-named',
+        })
+      ).rejects.toMatchObject({ code: 'ROUTING_REFUSED' });
+
+      // No query ever treated the caller-named repo as a caller-repo lookup
+      // (which would be filtered by repo_root AND ephemeral).
+      const callerRepoLookup = studioQueries.find(
+        (calls) =>
+          calls.some((c) => c.method === 'eq' && c.args[0] === 'repo_root') &&
+          calls.some((c) => c.method === 'eq' && c.args[0] === 'ephemeral')
+      );
+      expect(callerRepoLookup).toBeUndefined();
+    });
+
+    /**
+     * Resolves the terminal result from the filters the code actually applied,
+     * rather than from call ORDER — routing queries `studios` several times
+     * before these tiers run, so an order-indexed mock pins the wrong thing
+     * and breaks whenever an earlier tier changes.
+     */
+    function createFilterAwareChain(
+      resolve: (calls: RecordedCall[]) => unknown,
+      record: RecordedCall[]
+    ) {
+      const chain: Record<string, unknown> = {};
+      for (const m of ['select', 'eq', 'not', 'is', 'neq', 'in', 'order', 'limit']) {
+        chain[m] = vi.fn().mockImplementation((...args: unknown[]) => {
+          record.push({ method: m, args });
+          return chain;
+        });
+      }
+      const terminal = () => Promise.resolve(resolve(record));
+      chain.maybeSingle = vi.fn().mockImplementation(terminal);
+      chain.single = vi.fn().mockImplementation(terminal);
+      chain.then = (r: (v: unknown) => unknown) => terminal().then(r);
+      return chain;
+    }
+
+    it('resolves the caller repo from the sender studio and reuses a non-ephemeral studio', async () => {
+      const studioQueries: RecordedCall[][] = [];
+      const has = (calls: RecordedCall[], col: string, val?: unknown) =>
+        calls.some(
+          (c) => c.method === 'eq' && c.args[0] === col && (val === undefined || c.args[1] === val)
+        );
+
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          const calls: RecordedCall[] = [];
+          if (table === 'sessions') {
+            // Provenance: the claimed session's REAL studio_id.
+            return createFilterAwareChain(
+              (c) =>
+                has(c, 'id', 'sender-session-1')
+                  ? { data: { studio_id: 'sender-studio-1' } }
+                  : { data: null },
+              calls
+            );
+          }
+          if (table === 'agent_identities') {
+            return createFilterAwareChain(() => ({ data: [{ id: 'sb-wren' }] }), calls);
+          }
+          if (table !== 'studios') return createRecordingChain({ data: null }, calls);
+          studioQueries.push(calls);
+          return createFilterAwareChain((c) => {
+            // Sender-studio lookup → hands back the repo it is bound to.
+            if (has(c, 'id', 'sender-studio-1')) return { data: { repo_root: '/repos/inkwell' } };
+            // Caller-repo reuse lookup → the recipient's studio for that repo.
+            if (has(c, 'ephemeral', false) && has(c, 'repo_root', '/repos/inkwell')) {
+              return { data: { id: 'studio-inkwell-wren' } };
+            }
+            return { data: null };
+          }, calls);
+        }),
+      };
+      const service = serviceWith(mockSupabase);
+
+      await service.getOrCreateSession('user-456', 'wren', {
+        threadKey: 'pr:1001',
+        callerStudioId: 'sender-studio-1',
+        callerSessionId: 'sender-session-1',
+      });
+
+      // Assert on what routing HANDED the repository, not on the returned
+      // session — the repository is mocked and echoes a fixed row, so reading
+      // studioId back off it would pass regardless of what routing decided.
+      expect(mockRepository.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          studioId: 'studio-inkwell-wren',
+          metadata: expect.objectContaining({
+            routing_decision: expect.objectContaining({ tier: 'caller-repo-reuse' }),
+          }),
+        })
+      );
+
+      // Ephemeral studios belong to exactly one threadKey; reusing one here
+      // would drop this thread into another thread's temporary worktree.
+      const reuseQuery = studioQueries.find((calls) => has(calls, 'ephemeral', false));
+      expect(reuseQuery).toBeDefined();
+      expect(has(reuseQuery!, 'repo_root', '/repos/inkwell')).toBe(true);
+      // Identity by UUID, not the display slug — the same slug can exist in
+      // more than one workspace, so slug-keyed reuse can cross identities.
+      expect(has(reuseQuery!, 'sb_id', 'sb-wren')).toBe(true);
+      expect(has(reuseQuery!, 'agent_id')).toBe(false);
+    });
+
+    it('ignores a studio claim that does not match the sender session row', async () => {
+      // The x-ink-context token is base64url JSON set by CLI hooks — it is NOT
+      // signed. A lone studio claim is therefore exactly as caller-controlled
+      // as metadata.repoRoot; only agreement with server state makes it
+      // evidence (Lumen, PR #514 round 1).
+      //
+      // The claimed studio is deliberately RESOLVABLE here — it maps to a real
+      // repo with a real studio to route into. Without the cross-check this
+      // routes successfully, which is precisely the hole. An earlier version
+      // of this test left the studio lookup empty, so it passed with the
+      // cross-check disabled and proved nothing.
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          const calls: RecordedCall[] = [];
+          if (table === 'sessions') {
+            // Only the provenance lookup (by session id) answers; threadKey
+            // continuity queries must stay empty or they win the route first.
+            return createFilterAwareChain(
+              (c) =>
+                c.some((call) => call.method === 'eq' && call.args[0] === 'id')
+                  ? { data: { studio_id: 'actual-studio' } }
+                  : { data: null },
+              calls
+            );
+          }
+          if (table === 'agent_identities') {
+            return createFilterAwareChain(() => ({ data: [{ id: 'sb-wren' }] }), calls);
+          }
+          if (table === 'studios') {
+            return createFilterAwareChain((c) => {
+              const has = (col: string, val?: unknown) =>
+                c.some(
+                  (call) =>
+                    call.method === 'eq' &&
+                    call.args[0] === col &&
+                    (val === undefined || call.args[1] === val)
+                );
+              if (has('id', 'claimed-studio')) return { data: { repo_root: '/repos/inkwell' } };
+              if (has('ephemeral', false)) return { data: { id: 'studio-inkwell-wren' } };
+              return { data: null };
+            }, calls);
+          }
+          return createRecordingChain({ data: null }, calls);
+        }),
+      };
+      const service = serviceWith(mockSupabase);
+
+      await expect(
+        service.getOrCreateSession('user-456', 'wren', {
+          threadKey: 'pr:1003',
+          callerStudioId: 'claimed-studio',
+          callerSessionId: 'sender-session-1',
+        })
+      ).rejects.toMatchObject({ code: 'ROUTING_REFUSED' });
+    });
+
+    it('requires both claims — a studio without a session id infers nothing', async () => {
+      const mockSupabase = {
+        from: vi.fn().mockImplementation(() => createRecordingChain({ data: null }, [])),
+      };
+      const service = serviceWith(mockSupabase);
+
+      await expect(
+        service.getOrCreateSession('user-456', 'wren', {
+          threadKey: 'pr:1004',
+          callerStudioId: 'sender-studio-1',
+        })
+      ).rejects.toMatchObject({ code: 'ROUTING_REFUSED' });
+    });
+
+    it('uses the caller-supplied canonical identity and does not re-resolve the slug', async () => {
+      // The trigger handler has already resolved (and workspace-disambiguated)
+      // the target identity. Re-resolving from the slug throws that away and
+      // is ambiguous by construction (Lumen, PR #514 round 2).
+      const studioQueries: RecordedCall[][] = [];
+      let identityLookups = 0;
+      const has = (calls: RecordedCall[], col: string, val?: unknown) =>
+        calls.some(
+          (c) => c.method === 'eq' && c.args[0] === col && (val === undefined || c.args[1] === val)
+        );
+
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          const calls: RecordedCall[] = [];
+          if (table === 'agent_identities') {
+            identityLookups += 1;
+            return createFilterAwareChain(() => ({ data: [{ id: 'WRONG-sb' }] }), calls);
+          }
+          if (table === 'sessions') {
+            return createFilterAwareChain(
+              (c) =>
+                c.some((call) => call.method === 'eq' && call.args[0] === 'id')
+                  ? { data: { studio_id: 'sender-studio-1' } }
+                  : { data: null },
+              calls
+            );
+          }
+          if (table !== 'studios') return createRecordingChain({ data: null }, calls);
+          studioQueries.push(calls);
+          return createFilterAwareChain((c) => {
+            if (has(c, 'id', 'sender-studio-1')) return { data: { repo_root: '/repos/inkwell' } };
+            if (has(c, 'ephemeral', false)) return { data: { id: 'studio-inkwell-wren' } };
+            return { data: null };
+          }, calls);
+        }),
+      };
+      const service = serviceWith(mockSupabase);
+
+      await service.getOrCreateSession('user-456', 'wren', {
+        threadKey: 'pr:1005',
+        callerStudioId: 'sender-studio-1',
+        callerSessionId: 'sender-session-1',
+        sbId: 'sb-authoritative',
+      });
+
+      const reuseQuery = studioQueries.find((calls) => has(calls, 'ephemeral', false));
+      expect(reuseQuery).toBeDefined();
+      expect(has(reuseQuery!, 'sb_id', 'sb-authoritative')).toBe(true);
+      // The identity table would have yielded 'WRONG-sb'. Asserting on the
+      // resolved value rather than on lookup COUNT: other paths
+      // (resolveAgentBackend, default_session_id) legitimately read
+      // agent_identities, so a call counter pins unrelated behaviour.
+      expect(studioQueries.some((calls) => has(calls, 'sb_id', 'WRONG-sb'))).toBe(false);
+      expect(identityLookups).toBeGreaterThanOrEqual(0);
+    });
+
+    it('refuses rather than guessing when an agent slug is ambiguous', async () => {
+      // Duplicate identities for one slug used to make maybeSingle() error and
+      // silently degrade to slug scoping — the cross-identity routing the UUID
+      // exists to prevent.
+      //
+      // A slug-matching studio DELIBERATELY exists here (Lumen, PR #514
+      // round 3). The first version of this test returned no studio at all, so
+      // it refused for lack of a candidate and passed with the fix removed —
+      // proving nothing. With a candidate present, only the ambiguity check
+      // produces the refusal.
+      const studioQueries: RecordedCall[][] = [];
+      const has = (calls: RecordedCall[], col: string, val?: unknown) =>
+        calls.some(
+          (c) => c.method === 'eq' && c.args[0] === col && (val === undefined || c.args[1] === val)
+        );
+
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          const calls: RecordedCall[] = [];
+          if (table === 'agent_identities') {
+            return createFilterAwareChain(
+              () => ({ data: [{ id: 'sb-one' }, { id: 'sb-two' }] }),
+              calls
+            );
+          }
+          if (table === 'sessions') {
+            return createFilterAwareChain(
+              (c) =>
+                c.some((call) => call.method === 'eq' && call.args[0] === 'id')
+                  ? { data: { studio_id: 'sender-studio-1' } }
+                  : { data: null },
+              calls
+            );
+          }
+          if (table === 'studios') {
+            studioQueries.push(calls);
+            return createFilterAwareChain((c) => {
+              if (has(c, 'id', 'sender-studio-1')) return { data: { repo_root: '/repos/inkwell' } };
+              // A studio that a SLUG-keyed reuse query would happily return.
+              if (has(c, 'agent_id', 'wren')) return { data: { id: 'studio-wrong-identity' } };
+              return { data: null };
+            }, calls);
+          }
+          return createRecordingChain({ data: null }, calls);
+        }),
+      };
+      const service = serviceWith(mockSupabase);
+
+      await expect(
+        service.getOrCreateSession('user-456', 'wren', {
+          threadKey: 'pr:1006',
+          callerStudioId: 'sender-studio-1',
+          callerSessionId: 'sender-session-1',
+        })
+      ).rejects.toMatchObject({ code: 'ROUTING_REFUSED' });
+
+      // And no CALLER-REPO reuse query ran — narrowed to the query carrying
+      // the `ephemeral` filter, because the route-pattern and studio-hint
+      // tiers legitimately scope by agent_id and a blanket assertion would
+      // pin their behaviour instead of this one.
+      expect(studioQueries.some((calls) => has(calls, 'ephemeral', false))).toBe(false);
+    });
+
+    it('binds the new session to the caller-supplied identity, not a re-resolved slug', async () => {
+      // A session whose sb_id disagrees with the studio routing chose for it
+      // is worse than either being wrong alone (Lumen, PR #514 round 3).
+      const has = (calls: RecordedCall[], col: string, val?: unknown) =>
+        calls.some(
+          (c) => c.method === 'eq' && c.args[0] === col && (val === undefined || c.args[1] === val)
+        );
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          const calls: RecordedCall[] = [];
+          if (table === 'agent_identities') {
+            return createFilterAwareChain(() => ({ data: [{ id: 'sb-WRONG' }] }), calls);
+          }
+          if (table === 'studios') {
+            return createFilterAwareChain(
+              (c) => (has(c, 'ephemeral', false) ? { data: { id: 'studio-x' } } : { data: null }),
+              calls
+            );
+          }
+          return createRecordingChain({ data: null }, calls);
+        }),
+      };
+      const service = serviceWith(mockSupabase);
+
+      await service.getOrCreateSession('user-456', 'wren', {
+        sbId: 'sb-authoritative',
+      });
+
+      expect(mockRepository.create).toHaveBeenCalledWith(
+        expect.objectContaining({ sbId: 'sb-authoritative' })
+      );
+    });
+
+    it('treats an identity lookup ERROR as ambiguous, not as "no identity"', async () => {
+      // PostgREST failures resolve as { data: null, error } — they do not
+      // throw. Reading only `data` made every transient DB failure look like
+      // "no identity row", which re-enabled slug routing precisely when we
+      // could least justify it (Lumen, PR #514 round 4). Same swallowed-error
+      // shape as the channel-poll bug in #473.
+      const has = (calls: RecordedCall[], col: string, val?: unknown) =>
+        calls.some(
+          (c) => c.method === 'eq' && c.args[0] === col && (val === undefined || c.args[1] === val)
+        );
+      const studioQueries: RecordedCall[][] = [];
+
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          const calls: RecordedCall[] = [];
+          if (table === 'agent_identities') {
+            return createFilterAwareChain(
+              () => ({ data: null, error: { message: 'connection reset' } }),
+              calls
+            );
+          }
+          if (table === 'sessions') {
+            return createFilterAwareChain(
+              (c) =>
+                c.some((call) => call.method === 'eq' && call.args[0] === 'id')
+                  ? { data: { studio_id: 'sender-studio-1' } }
+                  : { data: null },
+              calls
+            );
+          }
+          if (table === 'studios') {
+            studioQueries.push(calls);
+            return createFilterAwareChain((c) => {
+              if (has(c, 'id', 'sender-studio-1')) return { data: { repo_root: '/repos/inkwell' } };
+              // A studio a slug-keyed query would happily return.
+              if (has(c, 'agent_id', 'wren')) return { data: { id: 'studio-slug-match' } };
+              return { data: null };
+            }, calls);
+          }
+          return createRecordingChain({ data: null }, calls);
+        }),
+      };
+      const service = serviceWith(mockSupabase);
+
+      await expect(
+        service.getOrCreateSession('user-456', 'wren', {
+          threadKey: 'pr:1007',
+          callerStudioId: 'sender-studio-1',
+          callerSessionId: 'sender-session-1',
+        })
+      ).rejects.toMatchObject({ code: 'ROUTING_REFUSED' });
+
+      // And no caller-repo reuse query ran on the slug.
+      expect(studioQueries.some((calls) => has(calls, 'ephemeral', false))).toBe(false);
+    });
+
+    it('scopes EARLY tiers by canonical identity, not just caller-repo', async () => {
+      // A duplicate-slug studio winning an earlier tier short-circuits the
+      // fixed caller-repo code entirely, so the fix has to reach every tier
+      // (Lumen, PR #514 round 4). Route-pattern is the earliest tier that
+      // queries studios by identity.
+      const studioQueries: RecordedCall[][] = [];
+      const has = (calls: RecordedCall[], col: string, val?: unknown) =>
+        calls.some(
+          (c) => c.method === 'eq' && c.args[0] === col && (val === undefined || c.args[1] === val)
+        );
+
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          const calls: RecordedCall[] = [];
+          if (table === 'agent_identities') {
+            return createFilterAwareChain(() => ({ data: [{ id: 'sb-wren' }] }), calls);
+          }
+          if (table === 'studios') {
+            studioQueries.push(calls);
+            // A studio that a SLUG-scoped query would match. Without it the
+            // test passes even when scoping reverts to agent_id, because
+            // nothing matches either way (Lumen, PR #514 round 5).
+            return createFilterAwareChain(
+              (c) =>
+                c.some((call) => call.method === 'eq' && call.args[0] === 'agent_id')
+                  ? { data: [{ id: 'studio-slug-match', route_patterns: ['pr:*'] }] }
+                  : { data: null },
+              calls
+            );
+          }
+          return createRecordingChain({ data: null }, calls);
+        }),
+      };
+      const service = serviceWith(mockSupabase);
+
+      await service
+        .getOrCreateSession('user-456', 'wren', { threadKey: 'pr:1008' })
+        .catch(() => undefined);
+
+      // The route-pattern query is identifiable by its route_patterns filter.
+      const patternQuery = studioQueries.find((calls) =>
+        calls.some((c) => c.method === 'not' && c.args[0] === 'route_patterns')
+      );
+      expect(patternQuery).toBeDefined();
+      expect(has(patternQuery!, 'sb_id', 'sb-wren')).toBe(true);
+      expect(has(patternQuery!, 'agent_id')).toBe(false);
+    });
+
+    it('refuses a recipientSessionId belonging to another user or agent', async () => {
+      // findById is unscoped — it accepts any session UUID in the table — and
+      // this rung routed straight into whatever it returned, crossing both the
+      // user and the identity boundary (Lumen, PR #514 round 5).
+      const foreign = createMockSession({
+        id: 'foreign-session',
+        userId: 'SOMEONE-ELSE',
+        agentId: 'wren',
+      });
+      vi.mocked(mockRepository.findById).mockResolvedValue(foreign);
+
+      const mockSupabase = {
+        from: vi.fn().mockImplementation(() => createRecordingChain({ data: null }, [])),
+      };
+      const service = serviceWith(mockSupabase);
+
+      await service.getOrCreateSession('user-456', 'wren', {
+        recipientSessionId: 'foreign-session',
+      });
+
+      // It must NOT have been reused; a fresh session is created instead.
+      expect(mockRepository.create).toHaveBeenCalled();
+      vi.mocked(mockRepository.findById).mockReset();
+    });
+
+    /**
+     * Round-8 pattern (Lumen): a guard test must present a PLAUSIBLE LATER
+     * FALLBACK — a session the reuse ladder would happily return if the guard
+     * failed. Mocking every later rung absent proves only that nothing was
+     * available, not that the guard prevented anything. Every test below is
+     * written that way.
+     */
+    function repoWithFallback(fallback: ReturnType<typeof createMockSession>) {
+      // Alias, threadKey and general reuse all match — so if any guard leaks,
+      // resolution lands on this session instead of refusing.
+      (mockRepository as Record<string, unknown>).findByAlias = vi.fn().mockResolvedValue(fallback);
+      (mockRepository as Record<string, unknown>).findByThreadKey = vi
+        .fn()
+        .mockResolvedValue(fallback);
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(fallback);
+      return fallback;
+    }
+
+    function clearFallback() {
+      delete (mockRepository as Record<string, unknown>).findByAlias;
+      delete (mockRepository as Record<string, unknown>).findByThreadKey;
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(null);
+      vi.mocked(mockRepository.findById).mockReset();
+      vi.mocked(mockRepository.findById).mockResolvedValue(null);
+    }
+
+    it('an invalid explicit studio anchor is FATAL — a matching fallback must not rescue it', async () => {
+      // The guard returned an ordinary `refused` tier, which is only inspected
+      // at the create boundary — while alias/threadKey/default/general reuse
+      // all run BEFORE it. A matching fallback therefore satisfied a request
+      // whose explicit anchor had just been rejected (Lumen, #514 r8).
+      const fallback = repoWithFallback(
+        createMockSession({ id: 'tempting-fallback', userId: 'user-456', agentId: 'wren' })
+      );
+
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          const calls: RecordedCall[] = [];
+          if (table === 'agent_identities') {
+            return createFilterAwareChain(() => ({ data: [{ id: 'sb-mine' }] }), calls);
+          }
+          if (table === 'studios') {
+            return createFilterAwareChain(
+              () => ({
+                data: {
+                  user_id: 'user-456',
+                  agent_id: 'wren',
+                  sb_id: 'sb-SOMEONE-ELSE',
+                  status: 'active',
+                },
+              }),
+              calls
+            );
+          }
+          return createRecordingChain({ data: null }, calls);
+        }),
+      };
+      const service = serviceWith(mockSupabase);
+
+      await expect(
+        service.getOrCreateSession('user-456', 'wren', {
+          threadKey: 'pr:2001',
+          studioId: 'studio-of-another-identity',
+        })
+      ).rejects.toMatchObject({ code: 'ROUTING_REFUSED' });
+
+      // And it must not have quietly landed on the fallback instead.
+      expect(fallback.id).toBe('tempting-fallback');
+      expect(mockRepository.create).not.toHaveBeenCalled();
+      clearFallback();
+    });
+
+    it('ambiguity refuses even though alias/thread reuse would have matched', async () => {
+      repoWithFallback(
+        createMockSession({ id: 'sibling-session', userId: 'user-456', agentId: 'wren' })
+      );
+
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          const calls: RecordedCall[] = [];
+          if (table === 'agent_identities') {
+            return createFilterAwareChain(
+              () => ({ data: [{ id: 'sb-one' }, { id: 'sb-two' }] }),
+              calls
+            );
+          }
+          return createRecordingChain({ data: null }, calls);
+        }),
+      };
+      const service = serviceWith(mockSupabase);
+
+      await expect(
+        service.getOrCreateSession('user-456', 'wren', { threadKey: 'pr:2002', alias: 'main' })
+      ).rejects.toMatchObject({ code: 'ROUTING_REFUSED' });
+
+      expect(mockRepository.create).not.toHaveBeenCalled();
+      clearFallback();
+    });
+
+    it('a supplied canonical UUID is NOT invalidated by a duplicate slug', async () => {
+      // Discovery gates the SLUG fallback; it must not veto a UUID we already
+      // hold, since every tier below is then UUID-scoped (Lumen, #514 r8).
+      //
+      // A route-pattern studio scoped to the supplied UUID is provided, so
+      // success is meaningful: it proves resolution reached a UUID-scoped tier
+      // rather than being refused up front. Asserting "does not throw" would
+      // not have distinguished the two — the first version of this test
+      // expected no refusal and got the ORDINARY no-route refusal, which is
+      // correct behaviour and would have looked like a failure of the fix.
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          const calls: RecordedCall[] = [];
+          if (table === 'agent_identities') {
+            return createFilterAwareChain(
+              () => ({ data: [{ id: 'sb-A' }, { id: 'sb-B' }] }),
+              calls
+            );
+          }
+          if (table === 'studios') {
+            return createFilterAwareChain((c) => {
+              const scopedToA = c.some(
+                (call) =>
+                  call.method === 'eq' && call.args[0] === 'sb_id' && call.args[1] === 'sb-A'
+              );
+              const isPatternQuery = c.some(
+                (call) => call.method === 'not' && call.args[0] === 'route_patterns'
+              );
+              return scopedToA && isPatternQuery
+                ? { data: [{ id: 'studio-A', route_patterns: ['pr:*'] }] }
+                : { data: null };
+            }, calls);
+          }
+          return createRecordingChain({ data: null }, calls);
+        }),
+      };
+      const service = serviceWith(mockSupabase);
+
+      await service.getOrCreateSession('user-456', 'wren', {
+        threadKey: 'pr:2003',
+        sbId: 'sb-A',
+      });
+
+      // Routed via the UUID-scoped route-pattern tier, not refused.
+      expect(mockRepository.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          studioId: 'studio-A',
+          sbId: 'sb-A',
+        })
+      );
+    });
+
+    it('a row carrying a DIFFERENT sb_id is never accepted via the absent+slug fallback', async () => {
+      // The fallback exists for null-sb legacy rows only. A row that carries
+      // an identity must match canonically, even when the requested identity
+      // is positively absent (Lumen, #514 r8).
+      const foreign = createMockSession({
+        id: 'foreign-identity-session',
+        userId: 'user-456',
+        agentId: 'wren',
+      });
+      (foreign as unknown as { sbId?: string }).sbId = 'sb-OTHER';
+      vi.mocked(mockRepository.findById).mockResolvedValue(foreign);
+
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          const calls: RecordedCall[] = [];
+          if (table === 'agent_identities') {
+            // Positively absent — no identity row for this slug.
+            return createFilterAwareChain(() => ({ data: [] }), calls);
+          }
+          return createRecordingChain({ data: null }, calls);
+        }),
+      };
+      const service = serviceWith(mockSupabase);
+
+      await service.getOrCreateSession('user-456', 'wren', {
+        recipientSessionId: 'foreign-identity-session',
+      });
+
+      // Refused, so a fresh session is created rather than reusing it.
+      expect(mockRepository.create).toHaveBeenCalled();
+      clearFallback();
+    });
+
+    it('general reuse with a canonical identity never returns a sibling session', async () => {
+      const sibling = createMockSession({
+        id: 'sibling-general',
+        userId: 'user-456',
+        agentId: 'wren',
+      });
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(sibling);
+
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          const calls: RecordedCall[] = [];
+          if (table === 'agent_identities') {
+            return createFilterAwareChain(() => ({ data: [{ id: 'sb-mine' }] }), calls);
+          }
+          return createRecordingChain({ data: null }, calls);
+        }),
+      };
+      const service = serviceWith(mockSupabase);
+
+      await service.getOrCreateSession('user-456', 'wren', {});
+
+      // The canonical id must have been handed to the query — that is what
+      // stops a same-slug sibling satisfying it in the database.
+      expect(mockRepository.findByUserAndAgent).toHaveBeenCalledWith(
+        'user-456',
+        'wren',
+        expect.objectContaining({ sbId: 'sb-mine' })
+      );
+      clearFallback();
+    });
+
+    it('refuses a recipientSessionId owned by the same user but a DIFFERENT identity', async () => {
+      // The cross-user case was covered; the same-user/different-sb case is
+      // the one duplicate slugs actually produce (Lumen, PR #514 round 6).
+      const sibling = createMockSession({
+        id: 'sibling-session',
+        userId: 'user-456',
+        agentId: 'wren',
+      });
+      (sibling as unknown as { sbId?: string }).sbId = 'sb-OTHER';
+      vi.mocked(mockRepository.findById).mockResolvedValue(sibling);
+
+      const mockSupabase = {
+        from: vi.fn().mockImplementation(() => createRecordingChain({ data: null }, [])),
+      };
+      const service = serviceWith(mockSupabase);
+
+      await service.getOrCreateSession('user-456', 'wren', {
+        recipientSessionId: 'sibling-session',
+        sbId: 'sb-MINE',
+      });
+
+      expect(mockRepository.create).toHaveBeenCalled();
+      vi.mocked(mockRepository.findById).mockReset();
+    });
+
+    it('refuses a legacy null-sb recipient session when an identity row DOES exist', async () => {
+      // Slug comparison is a proof only when NO identity row exists — a
+      // positive `absent`. When one exists, a null-sb row cannot be shown to
+      // belong to it, so it is refused rather than slug-matched (Lumen,
+      // PR #514 round 7). The earlier version of this test accepted it,
+      // which is exactly the sibling-legacy-session hole.
+      const legacy = createMockSession({
+        id: 'legacy-session',
+        userId: 'user-456',
+        agentId: 'wren',
+      });
+      (legacy as unknown as { sbId?: string | null }).sbId = null;
+      vi.mocked(mockRepository.findById).mockResolvedValue(legacy);
+
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          const calls: RecordedCall[] = [];
+          if (table === 'agent_identities') {
+            return createFilterAwareChain(() => ({ data: [{ id: 'sb-wren' }] }), calls);
+          }
+          return createRecordingChain({ data: null }, calls);
+        }),
+      };
+      const service = serviceWith(mockSupabase);
+
+      await service.getOrCreateSession('user-456', 'wren', {
+        recipientSessionId: 'legacy-session',
+      });
+
+      // Not reused — a fresh session is created instead.
+      expect(mockRepository.create).toHaveBeenCalled();
+      vi.mocked(mockRepository.findById).mockReset();
+    });
+
+    it('accepts a legacy null-sb recipient session when NO identity row exists', async () => {
+      // The permitted case: nothing to confuse the slug with.
+      const legacy = createMockSession({
+        id: 'legacy-session',
+        userId: 'user-456',
+        agentId: 'wren',
+      });
+      (legacy as unknown as { sbId?: string | null }).sbId = null;
+      vi.mocked(mockRepository.findById).mockResolvedValue(legacy);
+
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          const calls: RecordedCall[] = [];
+          if (table === 'agent_identities') {
+            return createFilterAwareChain(() => ({ data: [] }), calls);
+          }
+          return createRecordingChain({ data: null }, calls);
+        }),
+      };
+      const service = serviceWith(mockSupabase);
+
+      const session = await service.getOrCreateSession('user-456', 'wren', {
+        recipientSessionId: 'legacy-session',
+      });
+
+      expect(session.id).toBe('legacy-session');
+      vi.mocked(mockRepository.findById).mockReset();
+    });
+
+    it('refuses rather than rerouting when the recipient-session lookup FAILS', async () => {
+      // Swallowing the error turned a database failure into "no such
+      // session", so an exact anchor silently fell through and delivered
+      // somewhere else (Lumen, PR #514 round 7).
+      vi.mocked(mockRepository.findById).mockRejectedValue(new Error('connection reset'));
+
+      const mockSupabase = {
+        from: vi.fn().mockImplementation(() => createRecordingChain({ data: null }, [])),
+      };
+      const service = serviceWith(mockSupabase);
+
+      await expect(
+        service.getOrCreateSession('user-456', 'wren', {
+          threadKey: 'pr:1011',
+          recipientSessionId: 'some-session',
+        })
+      ).rejects.toMatchObject({ code: 'ROUTING_REFUSED' });
+
+      expect(mockRepository.create).not.toHaveBeenCalled();
+      vi.mocked(mockRepository.findById).mockReset();
+    });
+
+    it('refuses an explicit studioId owned by another identity', async () => {
+      // The explicit tier returned the caller's UUID verbatim — no ownership,
+      // identity or status check at all (Lumen, PR #514 round 7).
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          const calls: RecordedCall[] = [];
+          if (table === 'agent_identities') {
+            return createFilterAwareChain(() => ({ data: [{ id: 'sb-mine' }] }), calls);
+          }
+          if (table === 'studios') {
+            return createFilterAwareChain(
+              () => ({
+                data: {
+                  user_id: 'user-456',
+                  agent_id: 'wren',
+                  sb_id: 'sb-SOMEONE-ELSE',
+                  status: 'active',
+                },
+              }),
+              calls
+            );
+          }
+          return createRecordingChain({ data: null }, calls);
+        }),
+      };
+      const service = serviceWith(mockSupabase);
+
+      await expect(
+        service.getOrCreateSession('user-456', 'wren', {
+          threadKey: 'pr:1012',
+          studioId: 'studio-of-another-identity',
+        })
+      ).rejects.toMatchObject({ code: 'ROUTING_REFUSED' });
+    });
+
+    it('refuses an explicit studioId whose status is not acquirable', async () => {
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          const calls: RecordedCall[] = [];
+          if (table === 'agent_identities') {
+            return createFilterAwareChain(() => ({ data: [{ id: 'sb-mine' }] }), calls);
+          }
+          if (table === 'studios') {
+            return createFilterAwareChain(
+              () => ({
+                data: {
+                  user_id: 'user-456',
+                  agent_id: 'wren',
+                  sb_id: 'sb-mine',
+                  status: 'cleaned',
+                },
+              }),
+              calls
+            );
+          }
+          return createRecordingChain({ data: null }, calls);
+        }),
+      };
+      const service = serviceWith(mockSupabase);
+
+      // A cleaned studio is never handed out (spec §The five invariants #5).
+      await expect(
+        service.getOrCreateSession('user-456', 'wren', {
+          threadKey: 'pr:1013',
+          studioId: 'cleaned-studio',
+        })
+      ).rejects.toMatchObject({ code: 'ROUTING_REFUSED' });
+    });
+
+    it('refuses to route at all when the identity is ambiguous — main included', async () => {
+      // The sentinel only reached queries going through scopeBy;
+      // resolveMainStudioId still fell back to slug scoping, so explicit main,
+      // hint main and repoRoot main could each match another identity
+      // (Lumen, PR #514 round 6). Ambiguity now refuses once, up front.
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          const calls: RecordedCall[] = [];
+          if (table === 'agent_identities') {
+            return createFilterAwareChain(
+              () => ({ data: [{ id: 'sb-one' }, { id: 'sb-two' }] }),
+              calls
+            );
+          }
+          if (table === 'studios') {
+            // A main studio that a slug-scoped lookup would happily return.
+            return createFilterAwareChain(() => ({ data: { id: 'studio-main-wrong' } }), calls);
+          }
+          return createRecordingChain({ data: null }, calls);
+        }),
+      };
+      const service = serviceWith(mockSupabase);
+
+      await expect(
+        service.getOrCreateSession('user-456', 'wren', {
+          threadKey: 'pr:1010',
+          studioHint: 'main',
+        })
+      ).rejects.toMatchObject({ code: 'ROUTING_REFUSED' });
+    });
+
+    it('an ambiguous slug does not match early-tier slug rows either', async () => {
+      // Ambiguous and absent both produced a null sbId, so both fell back to
+      // agent_id — letting a duplicate-slug studio win an early tier and
+      // short-circuit the caller-repo fix entirely (Lumen, PR #514 round 5).
+      const studioQueries: RecordedCall[][] = [];
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          const calls: RecordedCall[] = [];
+          if (table === 'agent_identities') {
+            return createFilterAwareChain(
+              () => ({ data: [{ id: 'sb-one' }, { id: 'sb-two' }] }),
+              calls
+            );
+          }
+          if (table === 'studios') {
+            studioQueries.push(calls);
+            return createFilterAwareChain(
+              (c) =>
+                c.some((call) => call.method === 'eq' && call.args[0] === 'agent_id')
+                  ? { data: [{ id: 'studio-slug-match', route_patterns: ['pr:*'] }] }
+                  : { data: null },
+              calls
+            );
+          }
+          return createRecordingChain({ data: null }, calls);
+        }),
+      };
+      const service = serviceWith(mockSupabase);
+
+      await expect(
+        service.getOrCreateSession('user-456', 'wren', { threadKey: 'pr:1009' })
+      ).rejects.toMatchObject({ code: 'ROUTING_REFUSED' });
+
+      // No tier may fall back to the slug when the identity is ambiguous.
+      expect(
+        studioQueries.some((calls) =>
+          calls.some((c) => c.method === 'eq' && c.args[0] === 'agent_id')
+        )
+      ).toBe(false);
+    });
+
+    it('excludes bridge senders without a studio_hint from caller-repo inference', async () => {
+      // A relay is ambiently in its own home repo, never the subject repo.
+      // Inferring would route every bridged thread into the bridge's worktree.
+      const studioQueries: RecordedCall[][] = [];
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          const calls: RecordedCall[] = [];
+          if (table === 'studios') studioQueries.push(calls);
+          return createRecordingChain({ data: null }, calls);
+        }),
+      };
+      const service = serviceWith(mockSupabase);
+
+      await expect(
+        service.getOrCreateSession('user-456', 'myra', {
+          threadKey: 'pr:1002',
+          callerStudioId: 'bridge-studio',
+          callerSessionId: 'bridge-session',
+          callerIsBridge: true,
+        })
+      ).rejects.toMatchObject({ code: 'ROUTING_REFUSED' });
+
+      // The sender-studio lookup must not even run for a hintless bridge.
+      const senderLookup = studioQueries.find((calls) =>
+        calls.some((c) => c.method === 'eq' && c.args[0] === 'id' && c.args[1] === 'bridge-studio')
+      );
+      expect(senderLookup).toBeUndefined();
     });
   });
 });

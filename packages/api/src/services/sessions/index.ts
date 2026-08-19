@@ -11,6 +11,9 @@ export {
   resolveMainStudio,
   isMainStudio,
   resolveStudioHint,
+  RoutingRefusedError,
+  UnresolvedStudioError,
+  type StudioRoutingDecision,
   type SessionServiceConfig,
   type IActivityStream,
 } from './session-service.js';

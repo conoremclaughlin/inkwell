@@ -42,6 +42,27 @@ export interface AgentTriggerPayload {
   studioHint?: string;
   /** Recipient session to inherit studio scope from */
   recipientSessionId?: string;
+  /**
+   * Sender's studio, stamped by the SERVER from the decoded x-ink-context
+   * token — never from the caller's request body. Routing's caller-repo tier
+   * reads the repo off this studio (spec §Tier 7). Caller-supplied
+   * `metadata.repoRoot` is deliberately NOT used for that inference: a sender
+   * able to name a repo could name any repo (spec v5 trust boundary).
+   */
+  senderStudioId?: string;
+  /**
+   * Sender's session id, stamped from the same server-decoded context token.
+   * Routing cross-checks it against `senderStudioId`: the token is unsigned,
+   * so a lone studio claim proves nothing — two claims that must agree with
+   * the session row do.
+   */
+  senderSessionId?: string;
+  /**
+   * Sender is a relay (Telegram, Discord, …). A bridge's ambient repo is its
+   * own home, never the repo the conversation is about, so caller-repo
+   * inference is skipped for bridges that did not address explicitly.
+   */
+  senderIsBridge?: boolean;
   /** Target a session by alias (e.g., "main", "review") */
   sessionAlias?: string;
   /**

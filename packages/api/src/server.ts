@@ -20,9 +20,11 @@
 
 import path from 'path';
 import { getDataComposer, DataComposer } from './data/composer';
+import { stampRoutingHold, clearRoutingHold } from './services/routing-hold';
 import {
   createSessionService,
   SessionService,
+  RoutingRefusedError,
   type SessionServiceConfig,
 } from './services/sessions';
 import type { SessionRequest, ChannelResponse, ChannelType } from './services/sessions';
@@ -706,6 +708,13 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
   // This handles triggers for ANY agent by looking up config from the database
   const agentGateway = getAgentGateway();
 
+  /**
+   * Remove a routingHold stamp once the thread routes again. Best effort and
+   * detached: recovery must never be blocked by bookkeeping about the hold.
+   * Only clears OUR agent's hold — a thread can be held for one participant
+   * and routable for another.
+   */
+
   async function logInkmail(
     type: ActivityType & `inkmail_${string}`,
     payload: AgentTriggerPayload,
@@ -1053,6 +1062,12 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       workspaceId: resolvedWorkspaceId || null,
     });
 
+    // Timestamp taken BEFORE routing: a hold stamped after this point belongs
+    // to a later dispatch and must survive our clear (Lumen, round 3).
+    // Awaiting one callback does not serialize AgentGateway callbacks, so the
+    // ordering cannot be assumed — it has to be expressed in the predicate.
+    const routeStartedAt = new Date().toISOString();
+
     // Check if the routed session is CLI-attached — if so, queue the message
     // for the on-prompt hook instead of spawning a new process.
     // Uses getOrCreateSession to resolve through the SAME routing logic
@@ -1070,6 +1085,16 @@ When you complete a task_request, mark it as completed using update_inbox_messag
           payload.metadata?.repoRoot && typeof payload.metadata.repoRoot === 'string'
             ? payload.metadata.repoRoot
             : undefined,
+        // Server-stamped at send time; the caller-repo tier resolves the repo
+        // from this studio rather than trusting metadata.repoRoot above.
+        callerStudioId: payload.senderStudioId,
+        callerSessionId: payload.senderSessionId,
+        callerIsBridge: payload.senderIsBridge,
+        // The canonical target identity is ALREADY resolved here, including
+        // the workspace disambiguation above. Passing only the slug made
+        // routing re-resolve it, and a slug is ambiguous by construction —
+        // the same one can exist in several workspaces (Lumen, round 2).
+        sbId: resolvedIdentityId || undefined,
       });
 
       // Assign the thread to the resolved session via the single sanctioned
@@ -1125,6 +1150,20 @@ When you complete a task_request, mark it as completed using update_inbox_messag
             error: assignmentFailure,
           });
         }
+      }
+
+      // A thread that routes successfully is no longer held. Cleared only
+      // AFTER assignment (Lumen, PR #514 round 2): assignment can still
+      // reroute or fail, and clearing before it lands advertises a recovery
+      // that has not happened. Awaited, not detached, so it cannot race the
+      // next dispatch's stamp.
+      if (payload.threadId && !assignmentFailure) {
+        await clearRoutingHold(dataComposer!.getClient(), {
+          threadId: payload.threadId,
+          userId,
+          agentId: targetAgentId,
+          routedSince: routeStartedAt,
+        });
       }
 
       // Routing-only dispatch: assignment IS the entire job — a failed stamp
@@ -1238,6 +1277,53 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         });
       }
     } catch (err) {
+      // Refuse-and-hold (spec §Refusing to route, Phase 3b) is NOT a resolution
+      // failure to fall through from — falling through would spawn exactly the
+      // wrong-worktree session the refusal exists to prevent. Stop here: no
+      // session, no lease, no spawn, and a loud, recoverable trail.
+      if (err instanceof RoutingRefusedError) {
+        logger.warn('[Trigger] HELD — routing refused, no session created', {
+          threadKey: err.threadKey,
+          targetAgentId,
+          triedCallerRepo: err.detail.triedCallerRepo,
+          callerRepoRoot: err.detail.callerRepoRoot || null,
+          recovery:
+            'add a route pattern to a studio, pass studioHint, or send from a session bound to the target repo',
+        });
+
+        await logInkmail('inkmail_fail', payload, userId, {
+          error: `routing_held: ${err.message}`,
+        });
+
+        // Surface on the thread itself so the hold is visible where the work
+        // is. Goes through the tested routing-hold boundary — this call site
+        // previously drifted out of sync with the RPC signature and every
+        // refusal went unstamped, with a green suite (Lumen, round 4).
+        if (payload.threadId) {
+          await stampRoutingHold(dataComposer!.getClient(), {
+            threadId: payload.threadId,
+            userId,
+            agentId: targetAgentId,
+            attemptStartedAt: routeStartedAt,
+            detail: {
+              triedCallerRepo: err.detail.triedCallerRepo,
+              callerRepoRoot: err.detail.callerRepoRoot ?? null,
+            },
+          });
+        }
+
+        // Rethrow (Lumen, PR #514 round 1). Returning here made the hold
+        // report SUCCESS: routeOnly's routingFailures stayed empty, the send
+        // reported accepted/triggered, and the sender had no way to learn its
+        // message never landed — the quiet-agent failure this phase exists to
+        // prevent, reproduced one layer up. Throwing propagates to
+        // processTrigger, which reports success:false with this reason, and
+        // the #487 failure-notice path posts it into the thread.
+        //
+        // Nothing is spawned: the throw exits the handler before handleMessage.
+        throw err;
+      }
+
       // If session resolution fails, fall through to normal handleMessage
       logger.debug('[Trigger] CLI-attached check failed, falling through to spawn', {
         error: err instanceof Error ? err.message : String(err),

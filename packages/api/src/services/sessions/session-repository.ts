@@ -236,17 +236,26 @@ export class SessionRepository implements ISessionRepository {
   async findByUserAndAgent(
     userId: string,
     agentId: string,
-    options?: { status?: SessionStatus; type?: SessionType; studioId?: string; contactId?: string }
+    options?: {
+      status?: SessionStatus;
+      type?: SessionType;
+      studioId?: string;
+      contactId?: string;
+      /** Canonical identity UUID — preferred over the ambiguous slug. */
+      sbId?: string | null;
+    }
   ): Promise<Session | null> {
-    let query = this.supabase
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let query = (this.supabase as any)
       .from('sessions')
       .select('*')
       .eq('user_id', userId)
-      .eq('agent_id', agentId)
       .is('ended_at', null)
       .neq('lifecycle', 'failed')
       .order('started_at', { ascending: false })
       .limit(1);
+    // Same-slug siblings must not satisfy general reuse (Lumen, #514 r7).
+    query = options?.sbId ? query.eq('sb_id', options.sbId) : query.eq('agent_id', agentId);
 
     if (options?.studioId) {
       query = query.eq('studio_id', options.studioId);
@@ -312,18 +321,22 @@ export class SessionRepository implements ISessionRepository {
     userId: string,
     agentId: string,
     alias: string,
-    studioId?: string
+    studioId?: string,
+    sbId?: string | null
   ): Promise<Session | null> {
     // alias column not yet in generated Supabase types — cast
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    // Canonical identity when the caller resolved one — a slug can name
+    // different identities in different workspaces, so slug-scoped reuse can
+    // hand back another agent's session (Lumen, PR #514 round 6).
     let query = (this.supabase as any)
       .from('sessions')
       .select('*')
       .eq('user_id', userId)
-      .eq('agent_id', agentId)
       .eq('alias', alias)
       .is('ended_at', null)
       .neq('lifecycle', 'failed');
+    query = sbId ? query.eq('sb_id', sbId) : query.eq('agent_id', agentId);
 
     if (studioId !== undefined) {
       query = query.eq('studio_id', studioId);
@@ -363,13 +376,14 @@ export class SessionRepository implements ISessionRepository {
     agentId: string,
     threadKey: string,
     studioId?: string,
-    contactId?: string
+    contactId?: string,
+    sbId?: string | null
   ): Promise<Session | null> {
-    let query = this.supabase
+    // See findByAlias: identity by UUID when known, slug only as a fallback.
+    let query = (this.supabase as any)
       .from('sessions')
       .select('*')
       .eq('user_id', userId)
-      .eq('agent_id', agentId)
       .eq('thread_key', threadKey)
       .is('ended_at', null)
       // `ended_at IS NULL` was doing none of the work it looks like it is
@@ -382,6 +396,7 @@ export class SessionRepository implements ISessionRepository {
       .not('lifecycle', 'in', '(completed,failed)')
       .order('started_at', { ascending: false })
       .limit(1);
+    query = sbId ? query.eq('sb_id', sbId) : query.eq('agent_id', agentId);
 
     if (studioId) {
       query = query.eq('studio_id', studioId);
