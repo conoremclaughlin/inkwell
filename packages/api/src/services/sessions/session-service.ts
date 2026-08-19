@@ -1545,10 +1545,13 @@ export class SessionService implements ISessionService {
       agentId?: string | null;
     }): boolean => {
       if (row.userId !== userId) return false;
-      if (identitySbId && row.sbId) return row.sbId === identitySbId;
-      // A row with no sb_id can only be compared by slug, and that is a proof
-      // only when the slug names exactly one identity. `absent` is that proof;
-      // an ambiguous or merely unknown slug is not.
+      // A row that CARRIES an identity must match it canonically — always
+      // (Lumen, #514 r8). Previously a row with sb_id=OTHER could still be
+      // accepted through the slug fallback whenever the requested identity was
+      // positively absent, which is precisely a cross-identity match.
+      if (row.sbId) return identitySbId ? row.sbId === identitySbId : false;
+      // Only a NULL-sb row may fall back to the slug, and only on a positive
+      // `absent` — nothing exists that the slug could be confused with.
       if (identity.absent) return row.agentId === agentId;
       return false;
     };
@@ -1799,11 +1802,20 @@ export class SessionService implements ISessionService {
 
       if (!options?.threadKey) {
         // Fall back to general active session for non-threaded requests.
-        const existing = await this.repository.findByUserAndAgent(userId, agentId, {
-          type: 'primary',
-          ...(resolvedStudioId ? { studioId: resolvedStudioId } : {}),
-          contactId: options?.contactId,
-        });
+        // Ambiguous identity with no canonical id: general reuse would fall
+        // back to the slug and hand back a sibling's session, so skip reuse
+        // and create a fresh session instead (Lumen, #514 r8). Unthreaded work
+        // is not refused — it does not lease a studio — but it must not be
+        // silently attached to another identity's session either.
+        const canReuseGenerally = !!identitySbId || identity.absent;
+        const existing = canReuseGenerally
+          ? await this.repository.findByUserAndAgent(userId, agentId, {
+              type: 'primary',
+              ...(resolvedStudioId ? { studioId: resolvedStudioId } : {}),
+              contactId: options?.contactId,
+              sbId: identitySbId,
+            })
+          : null;
 
         if (existing) {
           logger.debug('Found existing active session', {
@@ -2033,16 +2045,15 @@ export class SessionService implements ISessionService {
           { sbId: options.sbId ?? null, identityAbsent: options.identityAbsent === true }
         );
         if (!authorized) {
-          return {
-            studioId: undefined,
-            tier: 'refused',
-            occupancyChecked: false,
-            refusal: {
-              reason: 'no-route',
-              threadKey: options.threadKey || '',
-              triedCallerRepo: false,
-            },
-          };
+          // FATAL, not an ordinary refusal (Lumen, #514 r8). A `refused` tier
+          // is only inspected at the create boundary, and alias / threadKey /
+          // default-session / general reuse all run before it — so a matching
+          // fallback would silently satisfy a request whose explicit anchor we
+          // just rejected, defeating the guard entirely. An invalid anchor
+          // must end resolution, not merely fail to contribute a studio.
+          throw new RoutingRefusedError(options.threadKey || '(unthreaded)', agentId, {
+            triedCallerRepo: false,
+          });
         }
       }
       return { studioId: options.explicitStudioId, tier: 'explicit', occupancyChecked: false };
@@ -2062,21 +2073,19 @@ export class SessionService implements ISessionService {
     // cannot tell which agent this is, no tier below can be trusted. Explicit
     // studioId (above) is exempt — the caller named an exact studio, so the
     // slug's ambiguity is irrelevant to it.
-    if (identityScope.ambiguous && options.threadKey) {
+    // Ambiguity only matters when we have NO canonical id (Lumen, #514 r8).
+    // Discovery exists to gate the SLUG fallback, not to invalidate a UUID we
+    // already hold — with an id in hand every tier below is UUID-scoped and a
+    // duplicate slug cannot reach them.
+    if (!scopedSbId && identityScope.ambiguous && options.threadKey) {
       logger.warn('[StudioResolve] Ambiguous identity — refusing to route', {
         agentId,
         threadKey: options.threadKey,
       });
-      return {
-        studioId: undefined,
-        tier: 'refused',
-        occupancyChecked: false,
-        refusal: {
-          reason: 'no-route',
-          threadKey: options.threadKey,
-          triedCallerRepo: false,
-        },
-      };
+      // Also fatal: the reuse rungs below would fall back to the slug and
+      // match a sibling identity's session before the create boundary is
+      // reached (Lumen, #514 r8).
+      throw new RoutingRefusedError(options.threadKey, agentId, { triedCallerRepo: false });
     }
 
     // studioHint is a convenience fallback — only consulted when no explicit studioId.
@@ -2688,10 +2697,12 @@ export class SessionService implements ISessionService {
       return false;
     }
     const sbIdRow = (data as { sb_id?: string | null }).sb_id ?? null;
-    const identityOk =
-      identity.sbId && sbIdRow
-        ? sbIdRow === identity.sbId
-        : identity.identityAbsent && data.agent_id === agentId;
+    // Same rule as the session anchor: a studio carrying an identity must
+    // match it canonically; only a null-sb studio may use the slug fallback,
+    // and only on a positive `absent` (Lumen, #514 r8).
+    const identityOk = sbIdRow
+      ? !!identity.sbId && sbIdRow === identity.sbId
+      : identity.identityAbsent && data.agent_id === agentId;
     if (!identityOk) {
       logger.warn('[StudioResolve] Refusing explicit studio — belongs to another identity', {
         studioId,

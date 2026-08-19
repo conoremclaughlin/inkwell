@@ -3671,6 +3671,221 @@ describe('SessionService', () => {
       vi.mocked(mockRepository.findById).mockReset();
     });
 
+    /**
+     * Round-8 pattern (Lumen): a guard test must present a PLAUSIBLE LATER
+     * FALLBACK — a session the reuse ladder would happily return if the guard
+     * failed. Mocking every later rung absent proves only that nothing was
+     * available, not that the guard prevented anything. Every test below is
+     * written that way.
+     */
+    function repoWithFallback(fallback: ReturnType<typeof createMockSession>) {
+      // Alias, threadKey and general reuse all match — so if any guard leaks,
+      // resolution lands on this session instead of refusing.
+      (mockRepository as Record<string, unknown>).findByAlias = vi.fn().mockResolvedValue(fallback);
+      (mockRepository as Record<string, unknown>).findByThreadKey = vi
+        .fn()
+        .mockResolvedValue(fallback);
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(fallback);
+      return fallback;
+    }
+
+    function clearFallback() {
+      delete (mockRepository as Record<string, unknown>).findByAlias;
+      delete (mockRepository as Record<string, unknown>).findByThreadKey;
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(null);
+      vi.mocked(mockRepository.findById).mockReset();
+      vi.mocked(mockRepository.findById).mockResolvedValue(null);
+    }
+
+    it('an invalid explicit studio anchor is FATAL — a matching fallback must not rescue it', async () => {
+      // The guard returned an ordinary `refused` tier, which is only inspected
+      // at the create boundary — while alias/threadKey/default/general reuse
+      // all run BEFORE it. A matching fallback therefore satisfied a request
+      // whose explicit anchor had just been rejected (Lumen, #514 r8).
+      const fallback = repoWithFallback(
+        createMockSession({ id: 'tempting-fallback', userId: 'user-456', agentId: 'wren' })
+      );
+
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          const calls: RecordedCall[] = [];
+          if (table === 'agent_identities') {
+            return createFilterAwareChain(() => ({ data: [{ id: 'sb-mine' }] }), calls);
+          }
+          if (table === 'studios') {
+            return createFilterAwareChain(
+              () => ({
+                data: {
+                  user_id: 'user-456',
+                  agent_id: 'wren',
+                  sb_id: 'sb-SOMEONE-ELSE',
+                  status: 'active',
+                },
+              }),
+              calls
+            );
+          }
+          return createRecordingChain({ data: null }, calls);
+        }),
+      };
+      const service = serviceWith(mockSupabase);
+
+      await expect(
+        service.getOrCreateSession('user-456', 'wren', {
+          threadKey: 'pr:2001',
+          studioId: 'studio-of-another-identity',
+        })
+      ).rejects.toMatchObject({ code: 'ROUTING_REFUSED' });
+
+      // And it must not have quietly landed on the fallback instead.
+      expect(fallback.id).toBe('tempting-fallback');
+      expect(mockRepository.create).not.toHaveBeenCalled();
+      clearFallback();
+    });
+
+    it('ambiguity refuses even though alias/thread reuse would have matched', async () => {
+      repoWithFallback(
+        createMockSession({ id: 'sibling-session', userId: 'user-456', agentId: 'wren' })
+      );
+
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          const calls: RecordedCall[] = [];
+          if (table === 'agent_identities') {
+            return createFilterAwareChain(
+              () => ({ data: [{ id: 'sb-one' }, { id: 'sb-two' }] }),
+              calls
+            );
+          }
+          return createRecordingChain({ data: null }, calls);
+        }),
+      };
+      const service = serviceWith(mockSupabase);
+
+      await expect(
+        service.getOrCreateSession('user-456', 'wren', { threadKey: 'pr:2002', alias: 'main' })
+      ).rejects.toMatchObject({ code: 'ROUTING_REFUSED' });
+
+      expect(mockRepository.create).not.toHaveBeenCalled();
+      clearFallback();
+    });
+
+    it('a supplied canonical UUID is NOT invalidated by a duplicate slug', async () => {
+      // Discovery gates the SLUG fallback; it must not veto a UUID we already
+      // hold, since every tier below is then UUID-scoped (Lumen, #514 r8).
+      //
+      // A route-pattern studio scoped to the supplied UUID is provided, so
+      // success is meaningful: it proves resolution reached a UUID-scoped tier
+      // rather than being refused up front. Asserting "does not throw" would
+      // not have distinguished the two — the first version of this test
+      // expected no refusal and got the ORDINARY no-route refusal, which is
+      // correct behaviour and would have looked like a failure of the fix.
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          const calls: RecordedCall[] = [];
+          if (table === 'agent_identities') {
+            return createFilterAwareChain(
+              () => ({ data: [{ id: 'sb-A' }, { id: 'sb-B' }] }),
+              calls
+            );
+          }
+          if (table === 'studios') {
+            return createFilterAwareChain((c) => {
+              const scopedToA = c.some(
+                (call) =>
+                  call.method === 'eq' && call.args[0] === 'sb_id' && call.args[1] === 'sb-A'
+              );
+              const isPatternQuery = c.some(
+                (call) => call.method === 'not' && call.args[0] === 'route_patterns'
+              );
+              return scopedToA && isPatternQuery
+                ? { data: [{ id: 'studio-A', route_patterns: ['pr:*'] }] }
+                : { data: null };
+            }, calls);
+          }
+          return createRecordingChain({ data: null }, calls);
+        }),
+      };
+      const service = serviceWith(mockSupabase);
+
+      await service.getOrCreateSession('user-456', 'wren', {
+        threadKey: 'pr:2003',
+        sbId: 'sb-A',
+      });
+
+      // Routed via the UUID-scoped route-pattern tier, not refused.
+      expect(mockRepository.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          studioId: 'studio-A',
+          sbId: 'sb-A',
+        })
+      );
+    });
+
+    it('a row carrying a DIFFERENT sb_id is never accepted via the absent+slug fallback', async () => {
+      // The fallback exists for null-sb legacy rows only. A row that carries
+      // an identity must match canonically, even when the requested identity
+      // is positively absent (Lumen, #514 r8).
+      const foreign = createMockSession({
+        id: 'foreign-identity-session',
+        userId: 'user-456',
+        agentId: 'wren',
+      });
+      (foreign as unknown as { sbId?: string }).sbId = 'sb-OTHER';
+      vi.mocked(mockRepository.findById).mockResolvedValue(foreign);
+
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          const calls: RecordedCall[] = [];
+          if (table === 'agent_identities') {
+            // Positively absent — no identity row for this slug.
+            return createFilterAwareChain(() => ({ data: [] }), calls);
+          }
+          return createRecordingChain({ data: null }, calls);
+        }),
+      };
+      const service = serviceWith(mockSupabase);
+
+      await service.getOrCreateSession('user-456', 'wren', {
+        recipientSessionId: 'foreign-identity-session',
+      });
+
+      // Refused, so a fresh session is created rather than reusing it.
+      expect(mockRepository.create).toHaveBeenCalled();
+      clearFallback();
+    });
+
+    it('general reuse with a canonical identity never returns a sibling session', async () => {
+      const sibling = createMockSession({
+        id: 'sibling-general',
+        userId: 'user-456',
+        agentId: 'wren',
+      });
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(sibling);
+
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          const calls: RecordedCall[] = [];
+          if (table === 'agent_identities') {
+            return createFilterAwareChain(() => ({ data: [{ id: 'sb-mine' }] }), calls);
+          }
+          return createRecordingChain({ data: null }, calls);
+        }),
+      };
+      const service = serviceWith(mockSupabase);
+
+      await service.getOrCreateSession('user-456', 'wren', {});
+
+      // The canonical id must have been handed to the query — that is what
+      // stops a same-slug sibling satisfying it in the database.
+      expect(mockRepository.findByUserAndAgent).toHaveBeenCalledWith(
+        'user-456',
+        'wren',
+        expect.objectContaining({ sbId: 'sb-mine' })
+      );
+      clearFallback();
+    });
+
     it('refuses a recipientSessionId owned by the same user but a DIFFERENT identity', async () => {
       // The cross-user case was covered; the same-user/different-sb case is
       // the one duplicate slugs actually produce (Lumen, PR #514 round 6).
