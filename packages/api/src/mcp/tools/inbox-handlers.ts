@@ -723,6 +723,9 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
           priority,
           threadKey,
           recipientSessionId: resolvedRecipientSessionId,
+          // Server-derived, from the same context token that stamps
+          // metadata.pcp.sender.studioId — never caller body data.
+          ...(senderStudioId ? { senderStudioId } : {}),
           ...(explicitRecipientTarget ? { explicitRecipientTarget } : {}),
           ...(isAddressedRecipient && sessionAlias ? { sessionAlias } : {}),
           ...(isAddressedRecipient && resolvedRecipientStudioId
@@ -916,6 +919,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
       summary: triggerSummary || subject || `New ${messageType} from ${triggerSenderId}`,
       priority,
       recipientSessionId: effectiveRecipientSessionId,
+      ...(senderStudioId ? { senderStudioId } : {}),
       sessionAlias,
       studioId: recipientStudioId,
       studioHint: recipientStudioSlugOrHint,

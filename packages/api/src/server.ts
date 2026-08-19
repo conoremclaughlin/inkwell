@@ -23,6 +23,7 @@ import { getDataComposer, DataComposer } from './data/composer';
 import {
   createSessionService,
   SessionService,
+  RoutingRefusedError,
   type SessionServiceConfig,
 } from './services/sessions';
 import type { SessionRequest, ChannelResponse, ChannelType } from './services/sessions';
@@ -1070,6 +1071,10 @@ When you complete a task_request, mark it as completed using update_inbox_messag
           payload.metadata?.repoRoot && typeof payload.metadata.repoRoot === 'string'
             ? payload.metadata.repoRoot
             : undefined,
+        // Server-stamped at send time; the caller-repo tier resolves the repo
+        // from this studio rather than trusting metadata.repoRoot above.
+        callerStudioId: payload.senderStudioId,
+        callerIsBridge: payload.senderIsBridge,
       });
 
       // Assign the thread to the resolved session via the single sanctioned
@@ -1238,6 +1243,65 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         });
       }
     } catch (err) {
+      // Refuse-and-hold (spec §Refusing to route, Phase 3b) is NOT a resolution
+      // failure to fall through from — falling through would spawn exactly the
+      // wrong-worktree session the refusal exists to prevent. Stop here: no
+      // session, no lease, no spawn, and a loud, recoverable trail.
+      if (err instanceof RoutingRefusedError) {
+        logger.warn('[Trigger] HELD — routing refused, no session created', {
+          threadKey: err.threadKey,
+          targetAgentId,
+          triedCallerRepo: err.detail.triedCallerRepo,
+          callerRepoRoot: err.detail.callerRepoRoot || null,
+          recovery:
+            'add a route pattern to a studio, pass studioHint, or send from a session bound to the target repo',
+        });
+
+        await logInkmail('inkmail_fail', payload, userId, {
+          error: `routing_held: ${err.message}`,
+        });
+
+        // Surface on the thread itself so the hold is visible where the work
+        // is, not only in server logs. Merged onto existing metadata — never
+        // written over it.
+        if (payload.threadId) {
+          try {
+            const client = dataComposer!.getClient();
+            const { data: threadRow } = (await client
+              .from('inbox_threads')
+              .select('metadata')
+              .eq('id', payload.threadId)
+              .maybeSingle()) as { data: { metadata: Record<string, unknown> | null } | null };
+            const existing =
+              threadRow?.metadata && typeof threadRow.metadata === 'object'
+                ? threadRow.metadata
+                : {};
+            await client
+              .from('inbox_threads')
+              .update({
+                metadata: {
+                  ...existing,
+                  routingHold: {
+                    agentId: targetAgentId,
+                    reason: 'no-route',
+                    triedCallerRepo: err.detail.triedCallerRepo,
+                    callerRepoRoot: err.detail.callerRepoRoot || null,
+                    heldAt: new Date().toISOString(),
+                    recovery: 'route pattern, studioHint, or project affinity',
+                  },
+                } as never,
+              })
+              .eq('id', payload.threadId);
+          } catch (stampErr) {
+            logger.warn('[Trigger] Failed to stamp routing hold on thread', {
+              threadId: payload.threadId,
+              error: stampErr instanceof Error ? stampErr.message : String(stampErr),
+            });
+          }
+        }
+        return;
+      }
+
       // If session resolution fails, fall through to normal handleMessage
       logger.debug('[Trigger] CLI-attached check failed, falling through to spawn', {
         error: err instanceof Error ? err.message : String(err),

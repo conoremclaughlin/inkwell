@@ -236,8 +236,10 @@ export interface StudioRoutingDecision {
     | 'thread-continuity'
     | 'route-pattern'
     | 'repo-root-main'
-    | 'agent-recent'
+    | 'caller-repo-reuse'
+    | 'caller-repo-created'
     | 'main-fallback'
+    | 'refused'
     | 'none';
   /**
    * True when the tier is an inferred one (route-pattern and below) and the
@@ -258,6 +260,18 @@ export interface StudioRoutingDecision {
     holderThreadKey: string;
     holderSessionId: string;
     via: 'overflow' | 'refused';
+  };
+  /**
+   * Set on tier `refused` (Phase 3b). Threaded work that no tier could place
+   * is HELD, not guessed at: recency selection is gone, so there is no longer
+   * a tier whose job is to produce an answer regardless of evidence.
+   * Carries what routing looked for, so the hold explains itself.
+   */
+  refusal?: {
+    reason: 'no-route';
+    threadKey: string;
+    triedCallerRepo: boolean;
+    callerRepoRoot?: string;
   };
 }
 
@@ -282,6 +296,34 @@ export class UnresolvedStudioError extends Error {
         `Refusing to route elsewhere — check the slug, or omit it to let routing choose.`
     );
     this.name = 'UnresolvedStudioError';
+  }
+}
+
+/**
+ * Raised when routing refuses to place a threaded message (Phase 3b).
+ *
+ * This is the deliberate replacement for recency guessing. No session row is
+ * created and no studio is leased; the message is HELD and the reason travels
+ * with the error so the hold is legible instead of looking like a drop.
+ *
+ * Recovery needs no special path: give the thread a route pattern, a
+ * studio_hint, or a project, and the next delivery attempt resolves normally.
+ */
+export class RoutingRefusedError extends Error {
+  readonly code = 'ROUTING_REFUSED';
+
+  constructor(
+    readonly threadKey: string,
+    readonly agentId: string,
+    readonly detail: { triedCallerRepo: boolean; callerRepoRoot?: string }
+  ) {
+    super(
+      `Refusing to route "${threadKey}" for agent "${agentId}": no route pattern, ` +
+        `no project affinity, and no usable caller repo. Message held. ` +
+        `Add a route pattern to a studio, pass a studioHint, or send from a ` +
+        `session bound to the target repo.`
+    );
+    this.name = 'RoutingRefusedError';
   }
 }
 
@@ -1446,20 +1488,26 @@ export class SessionService implements ISessionService {
       recipientSessionId?: string;
       contactId?: string;
       repoRoot?: string;
+      /** Server-derived sender studio — see resolveCallerRepoRoot. */
+      callerStudioId?: string;
+      /** Sender is a bridge/relay identity. */
+      callerIsBridge?: boolean;
     }
   ): Promise<Session> {
     const type = options?.type || 'primary';
 
     const { backend } = await this.resolveAgentBackend(userId, agentId);
-    const routing = await this.resolveStudioId(userId, agentId, {
+    let routing = await this.resolveStudioId(userId, agentId, {
       threadKey: options?.threadKey,
       explicitStudioId: options?.studioId,
       studioHint: options?.studioHint,
       recipientSessionId: options?.recipientSessionId,
       repoRoot: options?.repoRoot,
+      callerStudioId: options?.callerStudioId,
+      callerIsBridge: options?.callerIsBridge,
       backend,
     });
-    const resolvedStudioId = routing.studioId;
+    let resolvedStudioId = routing.studioId;
 
     // A named studio that does not exist stops resolution here, before any
     // reuse lookup runs. Every rung below — alias, threadKey continuity,
@@ -1600,9 +1648,24 @@ export class SessionService implements ISessionService {
             });
             return this.withStudioLease(defaultSession, routing, leaseCtx);
           }
+          // The default session ended, so we create — but its studio is still
+          // an EXPLICIT address: the operator pointed this agent's threaded
+          // work at that session, and a session's studio outlives the session.
+          // Inheriting it keeps the successor in the same worktree instead of
+          // falling to refuse-and-hold, which would strand an agent whose only
+          // configured address happens to have ended.
+          if (defaultSession?.studioId && !resolvedStudioId) {
+            resolvedStudioId = defaultSession.studioId;
+            routing = {
+              studioId: defaultSession.studioId,
+              tier: 'recipient-session',
+              occupancyChecked: false,
+            };
+          }
           logger.debug('default_session_id is set but session is ended/missing; creating new', {
             defaultSessionId,
             agentId,
+            inheritedStudioId: defaultSession?.studioId || null,
           });
         } else {
           logger.debug('No thread match; creating new thread-scoped session', {
@@ -1644,6 +1707,35 @@ export class SessionService implements ISessionService {
     let sbId: string | undefined;
     if (this.supabase) {
       sbId = (await resolveIdentityId(this.supabase, userId, agentId)) || undefined;
+    }
+
+    // Refuse-and-hold (Phase 3b) — checked HERE, not at resolution time.
+    //
+    // Placement is the thing being refused, and every rung above this point
+    // reuses a session that is ALREADY placed: an explicit default_session_id,
+    // a session alias, threadKey continuity. Those are addressing, not
+    // guessing, and refusing them would break routing that knows exactly where
+    // the work goes. What we refuse is CREATING a new session with nowhere to
+    // run it — which is precisely the silent wrong-worktree outcome that
+    // deleting the recency tier is meant to eliminate.
+    //
+    // No session row, no lease, nothing to clean up: the caller holds the
+    // message and it routes normally once a pattern, hint, or project exists.
+    // An explicitly configured default_session_id is itself placement
+    // evidence, even when that session ended and even when it carried no
+    // studio: the operator addressed this agent's threaded work, and a
+    // studioless session runs in the default working directory — the same
+    // sanctioned fail-closed destination an overflow miss produces, not a
+    // guessed worktree. Refusal is for threads with NO addressing at all;
+    // keeping it that narrow matters, because an over-broad refusal silently
+    // stops real work instead of misrouting it.
+    if (routing.tier === 'refused' && routing.refusal && !defaultSessionId) {
+      throw new RoutingRefusedError(routing.refusal.threadKey, agentId, {
+        triedCallerRepo: routing.refusal.triedCallerRepo,
+        ...(routing.refusal.callerRepoRoot
+          ? { callerRepoRoot: routing.refusal.callerRepoRoot }
+          : {}),
+      });
     }
 
     // Create new session
@@ -1713,6 +1805,13 @@ export class SessionService implements ISessionService {
       recipientSessionId?: string;
       backend?: string;
       repoRoot?: string;
+      /**
+       * Sender's studio, stamped SERVER-SIDE from the decoded x-ink-context
+       * token. Never read from caller-supplied metadata (spec v5).
+       */
+      callerStudioId?: string;
+      /** Sender is a relay whose ambient repo is its own home, not the subject. */
+      callerIsBridge?: boolean;
     }
   ): Promise<StudioRoutingDecision> {
     const leaseCtx = { userId, agentId, threadKey: options.threadKey };
@@ -1913,50 +2012,61 @@ export class SessionService implements ISessionService {
       }
     }
 
-    // 5) Agent's own studio (authoritative — from studios table, not session history)
+    // 5) Caller-repo resolution (spec §Tier 7 — Phase 3b).
     //
-    // Archived studios are NOT routing candidates (spec:trigger-studio-routing v5).
-    // Archiving a studio is the operator saying "stop sending work here"; honouring
-    // that only in the tiers above and then resurrecting it in the fallback makes
-    // archival advisory rather than binding.
+    // This replaces the deleted recency tier. The sender's repo is derived
+    // SERVER-SIDE from the studio their own session is bound to — never from
+    // caller-supplied metadata (spec v5 trust boundary: a caller that can name
+    // a repo can name ANY repo, including one it should not reach).
     //
-    // Note: resolveMainStudio() below deliberately still accepts 'archived'. It is
-    // scoped to one repo_root/worktree_path and backs an auto-create path guarded by
-    // a unique constraint on (worktree_path, agent_id) — excluding archived there
-    // would miss the row, collide on insert, and miss again on the 23505 retry,
-    // leaving main-studio resolution permanently undefined for that repo.
-    const { data: agentStudio } = await this.supabase
-      .from('studios')
-      .select('id, updated_at')
-      .eq('user_id', userId)
-      .eq('agent_id', agentId)
-      .in('status', ['active', 'idle'])
-      .order('updated_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
-
-    if (agentStudio?.id) {
-      logger.debug("[StudioResolve] Fell back to agent's most recent studio", {
-        threadKey: options.threadKey || null,
-        agentId,
-        studioId: agentStudio.id,
-      });
-      return this.gateOccupancy(agentStudio.id, 'agent-recent', leaseCtx);
+    // Deleted in this phase, deliberately and not merely gated:
+    //   - "agent's most-recently-updated studio". It answered every question,
+    //     correctly or not, which is what made it dangerous: a single misroute
+    //     became self-reinforcing, since the wrong studio was then the most
+    //     recent one. It is what put Lumen's pr:483 review in the inkread
+    //     worktree. Occupancy gating narrowed the blast radius to "wrong but
+    //     vacant"; it never made the answer right.
+    //   - the unscoped per-user main fallback. `resolveMainStudio` defaults to
+    //     the server's own cwd when given no repo, so a repo-less thread
+    //     resolved to whatever the server happened to be running in. The main
+    //     studio is still reachable below, but only scoped to a repo we
+    //     actually resolved.
+    const callerRepoRoot = await this.resolveCallerRepoRoot(userId, options);
+    if (callerRepoRoot) {
+      const byRepo = await this.resolveStudioForRepo(userId, agentId, callerRepoRoot, leaseCtx);
+      if (byRepo) return byRepo;
     }
 
-    // NOTE: We intentionally skip "most recent session's studio" as a fallback.
-    // It creates feedback loops: if an agent is misrouted once, all future sessions
-    // inherit the bad studio. The studios table is the authoritative source.
-
-    // 6) Shared per-user main studio fallback (no repoRoot — uses default cwd)
-    const mainStudioId = await this.resolveMainStudioId(userId, options.repoRoot, agentId);
-    if (mainStudioId) {
-      logger.debug('[StudioResolve] Fell back to main studio', {
-        threadKey: options.threadKey || null,
+    // 6) Refuse and hold (spec §Refusing to route).
+    //
+    // Threaded work that no tier could place is under-specified, and there is
+    // no longer a tier whose job is to invent an answer. Hold it: a delayed
+    // message is recoverable, a misrouted one is silent and self-reinforcing.
+    // The caller turns this into a hold with no session row (see
+    // RoutingRefusedError); the reason travels with the decision so the hold
+    // can explain itself rather than looking like a dropped message.
+    //
+    // Unthreaded work is NOT refused — heartbeats and unthreaded handoffs do
+    // not lease a studio and are explicitly out of scope (spec §Scope
+    // limitations); they keep degrading to the default working directory.
+    if (options.threadKey) {
+      logger.warn('[StudioResolve] Refusing to route — no tier could place this thread', {
+        threadKey: options.threadKey,
         agentId,
-        studioId: mainStudioId,
+        triedCallerRepo: !!callerRepoRoot,
+        callerRepoRoot: callerRepoRoot || null,
       });
-      return this.gateOccupancy(mainStudioId, 'main-fallback', leaseCtx);
+      return {
+        studioId: undefined,
+        tier: 'refused',
+        occupancyChecked: false,
+        refusal: {
+          reason: 'no-route',
+          threadKey: options.threadKey,
+          triedCallerRepo: !!callerRepoRoot,
+          ...(callerRepoRoot ? { callerRepoRoot } : {}),
+        },
+      };
     }
 
     // Codex is worktree-sensitive: keep a deterministic warning when no studio could be resolved.
@@ -1972,6 +2082,168 @@ export class SessionService implements ISessionService {
     }
 
     return { studioId: undefined, tier: 'none', occupancyChecked: false };
+  }
+
+  /**
+   * The sender's repo, derived server-side (spec §Tier 7, v5 trust boundary).
+   *
+   * The ONLY accepted source is `callerStudioId` — stamped by the server from
+   * the decoded `x-ink-context` token at send time, the same protected value
+   * that populates `metadata.pcp.sender.studioId`. We then read that studio's
+   * repo_root from our own table.
+   *
+   * `options.repoRoot` is deliberately NOT consulted here. It arrives as
+   * caller-supplied metadata (`payload.metadata.repoRoot`), so trusting it for
+   * caller-repo inference would let a sender route work into any repo it can
+   * name. It keeps its existing, narrower job in the repo-root-main tier
+   * above, where the caller is explicitly addressing a target repo.
+   *
+   * Bridge asymmetry: a relay (Telegram, Discord, …) is ambiently "in" its own
+   * home repo, which is never the repo the conversation is about. Inferring
+   * from a bridge would confidently route every bridged thread into the
+   * bridge's worktree. Bridges must address explicitly via `studio_hint`, so
+   * one without a hint is excluded here rather than guessed at.
+   */
+  private async resolveCallerRepoRoot(
+    userId: string,
+    options: { callerStudioId?: string; callerIsBridge?: boolean; studioHint?: string }
+  ): Promise<string | undefined> {
+    if (!this.supabase) return undefined;
+    if (!options.callerStudioId) return undefined;
+    if (options.callerIsBridge && !options.studioHint) {
+      logger.debug('[StudioResolve] Bridge sender without studio_hint — no caller-repo inference');
+      return undefined;
+    }
+
+    const { data, error } = await this.supabase
+      .from('studios')
+      .select('repo_root')
+      .eq('id', options.callerStudioId)
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    // Fail closed: an unreadable sender studio yields no inference, which
+    // lands on refuse-and-hold rather than on a guess.
+    if (error) {
+      logger.warn('[StudioResolve] Caller studio lookup failed; no caller-repo inference', {
+        callerStudioId: options.callerStudioId,
+        error: error.message,
+      });
+      return undefined;
+    }
+    return data?.repo_root || undefined;
+  }
+
+  /**
+   * Place a thread in the recipient's studio for a known repo.
+   *
+   * Order: reuse the recipient's existing non-ephemeral studio for that repo →
+   * the repo's main studio → create the D1 parent studio for (project, agent).
+   *
+   * Ephemeral studios are excluded from reuse: they belong to one threadKey by
+   * construction (overflow tier 1 matches on it), so reusing one here would
+   * put this thread in another thread's temporary worktree.
+   *
+   * Every hit is occupancy-gated like any other inferred tier — a busy studio
+   * diverts to overflow, and a failed divert clears the binding rather than
+   * entering an occupied worktree (spec §The five invariants #1, #4).
+   */
+  private async resolveStudioForRepo(
+    userId: string,
+    agentId: string,
+    repoRoot: string,
+    leaseCtx: { userId: string; agentId: string; threadKey?: string }
+  ): Promise<StudioRoutingDecision | null> {
+    if (!this.supabase) return null;
+
+    const { data: existing, error } = await this.supabase
+      .from('studios')
+      .select('id')
+      .eq('user_id', userId)
+      .eq('agent_id', agentId)
+      .eq('repo_root', repoRoot)
+      .eq('ephemeral', false)
+      .in('status', ['active', 'idle'])
+      .order('created_at', { ascending: true })
+      .limit(1)
+      .maybeSingle();
+
+    if (error) {
+      logger.warn('[StudioResolve] Caller-repo studio lookup failed', {
+        repoRoot,
+        agentId,
+        error: error.message,
+      });
+      return null;
+    }
+
+    if (existing?.id) {
+      logger.debug('[StudioResolve] Reused studio for caller repo', {
+        repoRoot,
+        agentId,
+        studioId: existing.id,
+      });
+      return this.gateOccupancy(existing.id, 'caller-repo-reuse', leaseCtx);
+    }
+
+    // The repo-scoped main studio — this is the re-scoped former tier 8. It
+    // only runs against a repo we resolved, never the server's ambient cwd.
+    const mainStudioId = await this.resolveMainStudioId(userId, repoRoot, agentId);
+    if (mainStudioId) {
+      logger.debug('[StudioResolve] Resolved repo-scoped main studio for caller repo', {
+        repoRoot,
+        agentId,
+        studioId: mainStudioId,
+      });
+      return this.gateOccupancy(mainStudioId, 'main-fallback', leaseCtx);
+    }
+
+    // D1: auto-create the per-(project, agent) parent studio on FIRST work for
+    // this repo. The parent is a working studio, not a pure anchor — it takes
+    // work itself when free, and ephemeral children hang off it via
+    // parent_studio_id when it is busy.
+    const created = await this.createParentStudio(userId, agentId, repoRoot);
+    if (created) {
+      return this.gateOccupancy(created, 'caller-repo-created', leaseCtx);
+    }
+
+    return null;
+  }
+
+  /**
+   * D1 parent studio: `<project>--<sbSlug>` (e.g. `personal-context-protocol--wren`).
+   *
+   * Provisioning is the overflow service's existing worktree machinery — since
+   * Phase 5 shipped, this is a thin call rather than new provisioning code.
+   * Returns undefined when provisioning is unavailable or fails; the caller
+   * then refuses rather than falling back to a guess.
+   */
+  private async createParentStudio(
+    userId: string,
+    agentId: string,
+    repoRoot: string
+  ): Promise<string | undefined> {
+    const overflowService = this.getOverflowService();
+    if (!overflowService?.ensureParentStudio) return undefined;
+
+    try {
+      const parent = await overflowService.ensureParentStudio({ userId, agentId, repoRoot });
+      if (!parent) return undefined;
+      logger.info('[StudioResolve] Created parent studio for caller repo (D1)', {
+        studioId: parent.id,
+        slug: parent.slug,
+        repoRoot,
+        agentId,
+      });
+      return parent.id;
+    } catch (err) {
+      logger.warn('[StudioResolve] Parent studio creation failed', {
+        repoRoot,
+        agentId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return undefined;
+    }
   }
 
   private async resolveMainStudioId(

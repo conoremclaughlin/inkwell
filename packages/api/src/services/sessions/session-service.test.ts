@@ -3083,7 +3083,16 @@ describe('SessionService', () => {
       expect(offenders).toEqual([]);
     });
 
-    it("the agent's-own-studio fallback filters to active and idle only", async () => {
+    it("the agent's-own-studio recency tier no longer exists (Phase 3b)", async () => {
+      // Supersedes 3a's "filters to active and idle only" test. That test
+      // guarded the status filter ON the recency tier; 3b deletes the tier, so
+      // the filter has nothing to guard and the stronger claim is that no
+      // recency-ordered, repo-unscoped studio lookup runs at all.
+      //
+      // Why deleted rather than filtered: the tier answered every routing
+      // question whether or not it had evidence, and a wrong answer became
+      // self-reinforcing — the misrouted studio was then the most recent one.
+      // It is what put Lumen's pr:483 review in the inkread worktree.
       const studioQueries: RecordedCall[][] = [];
 
       const mockSupabase = {
@@ -3114,20 +3123,200 @@ describe('SessionService', () => {
         })
       );
 
-      // Identify the fallback query: filtered by agent_id, ordered by recency,
-      // and not scoped to a repo (which would make it resolveMainStudio).
-      const fallbackQuery = studioQueries.find(
+      // The deleted tier's signature: agent-scoped, ordered by updated_at,
+      // NOT scoped to a repo (that would be resolveMainStudio) and not the
+      // route-pattern query.
+      const recencyQuery = studioQueries.find(
         (calls) =>
           calls.some((c) => c.method === 'eq' && c.args[0] === 'agent_id') &&
           calls.some((c) => c.method === 'order' && c.args[0] === 'updated_at') &&
           !calls.some((c) => c.method === 'eq' && c.args[0] === 'worktree_path') &&
+          !calls.some((c) => c.method === 'eq' && c.args[0] === 'repo_root') &&
           !calls.some((c) => c.method === 'not' && c.args[0] === 'route_patterns')
       );
 
-      expect(fallbackQuery).toBeDefined();
-      const statusFilter = fallbackQuery!.find((c) => c.method === 'in' && c.args[0] === 'status');
-      expect(statusFilter).toBeDefined();
-      expect(statusFilter!.args[1]).toEqual(['active', 'idle']);
+      expect(recencyQuery).toBeUndefined();
+    });
+
+    /**
+     * Phase 3b — caller-repo resolution and refuse-and-hold.
+     *
+     * These pin the two behaviours that replaced recency guessing: the repo
+     * must be derived from the SERVER's view of the sender, and a thread with
+     * no evidence must be held rather than placed somewhere plausible.
+     */
+    function serviceWith(mockSupabase: unknown) {
+      return new SessionService(
+        mockRepository,
+        mockContextBuilder,
+        mockClaudeRunner,
+        mockActivityStream,
+        { defaultWorkingDirectory: '/test', mcpConfigPath: '/test/.mcp.json' },
+        mockCodexRunner,
+        mockSupabase as never
+      );
+    }
+
+    it('refuses to route a threaded message with no pattern, project, or caller repo', async () => {
+      const mockSupabase = {
+        from: vi.fn().mockImplementation(() => createRecordingChain({ data: null }, [])),
+      };
+      const service = serviceWith(mockSupabase);
+
+      await expect(
+        service.getOrCreateSession('user-456', 'wren', { threadKey: 'pr:999' })
+      ).rejects.toMatchObject({ code: 'ROUTING_REFUSED', threadKey: 'pr:999' });
+
+      // The whole point: no session row. A held message is recoverable; a
+      // session in the wrong worktree is not.
+      expect(mockRepository.create).not.toHaveBeenCalled();
+    });
+
+    it('does NOT refuse unthreaded work — heartbeats keep degrading to the default cwd', async () => {
+      const mockSupabase = {
+        from: vi.fn().mockImplementation(() => createRecordingChain({ data: null }, [])),
+      };
+      const service = serviceWith(mockSupabase);
+
+      // Unthreaded sessions do not lease a studio and are out of scope for
+      // refusal (spec §Scope limitations). Refusing them would silently stop
+      // every heartbeat on a fresh install.
+      await expect(service.getOrCreateSession('user-456', 'wren', {})).resolves.toBeDefined();
+      expect(mockRepository.create).toHaveBeenCalled();
+    });
+
+    it('never infers the caller repo from caller-supplied metadata.repoRoot', async () => {
+      // The v5 trust boundary. metadata.repoRoot arrives in the caller's own
+      // payload, so a sender that can name a repo could name ANY repo. It may
+      // still drive the explicit repo-root-main tier, but it must never be the
+      // source for caller-repo inference — and with no studio for it, routing
+      // must refuse rather than place the thread there.
+      const studioQueries: RecordedCall[][] = [];
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          const calls: RecordedCall[] = [];
+          if (table === 'studios') studioQueries.push(calls);
+          return createRecordingChain({ data: null }, calls);
+        }),
+      };
+      const service = serviceWith(mockSupabase);
+
+      await expect(
+        service.getOrCreateSession('user-456', 'wren', {
+          threadKey: 'pr:1000',
+          repoRoot: '/repos/attacker-named',
+        })
+      ).rejects.toMatchObject({ code: 'ROUTING_REFUSED' });
+
+      // No query ever treated the caller-named repo as a caller-repo lookup
+      // (which would be filtered by repo_root AND ephemeral).
+      const callerRepoLookup = studioQueries.find(
+        (calls) =>
+          calls.some((c) => c.method === 'eq' && c.args[0] === 'repo_root') &&
+          calls.some((c) => c.method === 'eq' && c.args[0] === 'ephemeral')
+      );
+      expect(callerRepoLookup).toBeUndefined();
+    });
+
+    /**
+     * Resolves the terminal result from the filters the code actually applied,
+     * rather than from call ORDER — routing queries `studios` several times
+     * before these tiers run, so an order-indexed mock pins the wrong thing
+     * and breaks whenever an earlier tier changes.
+     */
+    function createFilterAwareChain(
+      resolve: (calls: RecordedCall[]) => unknown,
+      record: RecordedCall[]
+    ) {
+      const chain: Record<string, unknown> = {};
+      for (const m of ['select', 'eq', 'not', 'is', 'neq', 'in', 'order', 'limit']) {
+        chain[m] = vi.fn().mockImplementation((...args: unknown[]) => {
+          record.push({ method: m, args });
+          return chain;
+        });
+      }
+      const terminal = () => Promise.resolve(resolve(record));
+      chain.maybeSingle = vi.fn().mockImplementation(terminal);
+      chain.single = vi.fn().mockImplementation(terminal);
+      chain.then = (r: (v: unknown) => unknown) => terminal().then(r);
+      return chain;
+    }
+
+    it('resolves the caller repo from the sender studio and reuses a non-ephemeral studio', async () => {
+      const studioQueries: RecordedCall[][] = [];
+      const has = (calls: RecordedCall[], col: string, val?: unknown) =>
+        calls.some(
+          (c) => c.method === 'eq' && c.args[0] === col && (val === undefined || c.args[1] === val)
+        );
+
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          const calls: RecordedCall[] = [];
+          if (table !== 'studios') return createRecordingChain({ data: null }, calls);
+          studioQueries.push(calls);
+          return createFilterAwareChain((c) => {
+            // Sender-studio lookup → hands back the repo it is bound to.
+            if (has(c, 'id', 'sender-studio-1')) return { data: { repo_root: '/repos/inkwell' } };
+            // Caller-repo reuse lookup → the recipient's studio for that repo.
+            if (has(c, 'ephemeral', false) && has(c, 'repo_root', '/repos/inkwell')) {
+              return { data: { id: 'studio-inkwell-wren' } };
+            }
+            return { data: null };
+          }, calls);
+        }),
+      };
+      const service = serviceWith(mockSupabase);
+
+      await service.getOrCreateSession('user-456', 'wren', {
+        threadKey: 'pr:1001',
+        callerStudioId: 'sender-studio-1',
+      });
+
+      // Assert on what routing HANDED the repository, not on the returned
+      // session — the repository is mocked and echoes a fixed row, so reading
+      // studioId back off it would pass regardless of what routing decided.
+      expect(mockRepository.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          studioId: 'studio-inkwell-wren',
+          metadata: expect.objectContaining({
+            routing_decision: expect.objectContaining({ tier: 'caller-repo-reuse' }),
+          }),
+        })
+      );
+
+      // Ephemeral studios belong to exactly one threadKey; reusing one here
+      // would drop this thread into another thread's temporary worktree.
+      const reuseQuery = studioQueries.find((calls) => has(calls, 'ephemeral', false));
+      expect(reuseQuery).toBeDefined();
+      expect(has(reuseQuery!, 'repo_root', '/repos/inkwell')).toBe(true);
+    });
+
+    it('excludes bridge senders without a studio_hint from caller-repo inference', async () => {
+      // A relay is ambiently in its own home repo, never the subject repo.
+      // Inferring would route every bridged thread into the bridge's worktree.
+      const studioQueries: RecordedCall[][] = [];
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          const calls: RecordedCall[] = [];
+          if (table === 'studios') studioQueries.push(calls);
+          return createRecordingChain({ data: null }, calls);
+        }),
+      };
+      const service = serviceWith(mockSupabase);
+
+      await expect(
+        service.getOrCreateSession('user-456', 'myra', {
+          threadKey: 'pr:1002',
+          callerStudioId: 'bridge-studio',
+          callerIsBridge: true,
+        })
+      ).rejects.toMatchObject({ code: 'ROUTING_REFUSED' });
+
+      // The sender-studio lookup must not even run for a hintless bridge.
+      const senderLookup = studioQueries.find((calls) =>
+        calls.some((c) => c.method === 'eq' && c.args[0] === 'id' && c.args[1] === 'bridge-studio')
+      );
+      expect(senderLookup).toBeUndefined();
     });
   });
 });

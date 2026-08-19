@@ -226,15 +226,116 @@ export class StudioOverflowService {
     return null;
   }
 
+  /**
+   * D1: the per-(project, agent) PARENT studio, `<project>--<sbSlug>`.
+   *
+   * Created on first work for a repo, by the caller-repo routing tier
+   * (spec §Tier 7, Phase 3b). Distinct from an overflow child in three ways
+   * that matter:
+   *
+   *   - it is NOT ephemeral and carries no `expires_at` — it is the agent's
+   *     durable home for this project, and a working studio in its own right
+   *     rather than a pure anchor. It takes work itself whenever it is free;
+   *     ephemeral children hang off it only when it is busy.
+   *   - it has no `parent_studio_id` — it IS the parent.
+   *   - its branch is per-agent (`<agent>/studio/<agent>`), not `eph/`.
+   *
+   * Route patterns are deliberately not set: patterns are an operator
+   * convention, and inventing one here would silently start capturing threads
+   * the operator never assigned.
+   *
+   * Returns null when provisioning fails or the slug is already taken by an
+   * unrelated studio; the caller then refuses rather than guessing.
+   */
+  async ensureParentStudio(opts: {
+    userId: string;
+    agentId: string;
+    repoRoot: string;
+  }): Promise<Studio | null> {
+    const { userId, agentId, repoRoot } = opts;
+    const slug = `${path.basename(repoRoot)}--${agentId}`;
+
+    const existing = await this.studios.findBySlug(userId, slug).catch(() => null);
+    if (existing) {
+      // Reuse only a genuine match. A slug collision with an unrelated studio
+      // must never be adopted — same reasoning as overflow reuse, and the
+      // consequence here is worse because this row is durable.
+      if (
+        !existing.ephemeral &&
+        existing.agentId === agentId &&
+        existing.repoRoot === repoRoot &&
+        existing.userId === userId
+      ) {
+        return existing;
+      }
+      logger.warn('[StudioOverflow] Parent slug collides with an unrelated studio; refusing', {
+        slug,
+        repoRoot,
+        agentId,
+        collidingStudioId: existing.id,
+      });
+      return null;
+    }
+
+    // Seed from a studio that already knows this repo, so worktree creation
+    // runs against a real checkout with the right base branch.
+    const seed = await this.studios.findByRepoRoot(userId, repoRoot).catch(() => null);
+    const parentLike = {
+      repoRoot,
+      baseBranch: seed?.baseBranch || 'main',
+    } as Studio;
+
+    const created = await this.createWorktree(parentLike, slug, agentId, agentId, {
+      branch: `${agentId}/studio/${agentId}`,
+    });
+    if (!created) return null;
+
+    try {
+      const studio = await this.studios.create({
+        userId,
+        agentId,
+        repoRoot,
+        worktreePath: created.worktreePath,
+        branch: created.branch,
+        baseBranch: parentLike.baseBranch,
+        purpose: `Home studio for ${agentId} on ${path.basename(repoRoot)} (auto-created)`,
+        ephemeral: false,
+        defaultProjectId: seed?.defaultProjectId ?? null,
+        metadata: { autoCreated: true, createdBy: 'caller-repo-routing' },
+      });
+      logger.info('[StudioOverflow] Created parent studio', {
+        studioId: studio.id,
+        slug: studio.slug,
+        repoRoot,
+        agentId,
+        worktreePath: created.worktreePath,
+      });
+      return studio;
+    } catch (err) {
+      logger.error('[StudioOverflow] Parent studio row insert failed; removing worktree', {
+        slug,
+        worktreePath: created.worktreePath,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      await execFileAsync('git', ['worktree', 'remove', '--force', created.worktreePath], {
+        cwd: repoRoot,
+      }).catch(() => undefined);
+      return null;
+    }
+  }
+
   private async createWorktree(
     parentStudio: Studio,
     slug: string,
     agentId: string,
-    branchTail: string
+    branchTail: string,
+    opts?: { branch?: string }
   ): Promise<{ worktreePath: string; branch: string } | null> {
     const mainRoot = parentStudio.repoRoot;
     const worktreePath = path.join(path.dirname(mainRoot), `${path.basename(mainRoot)}--${slug}`);
-    const branch = `${agentId}/eph/${branchTail}`;
+    // Parent studios pass an explicit branch: `eph/` names a temporary
+    // worktree, and a durable home studio is not one.
+    const branch = opts?.branch || `${agentId}/eph/${branchTail}`;
     const baseBranch = parentStudio.baseBranch || 'main';
 
     try {
