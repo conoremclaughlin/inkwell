@@ -13,7 +13,7 @@ import { z } from 'zod';
 import type { DataComposer } from '../../data/composer';
 import { getAgentGateway, type AgentTriggerPayload } from '../../channels/agent-gateway';
 import { resolveUser } from '../../services/user-resolver';
-import { senderRoutingContext, isBridgeIdentity } from './sender-context.js';
+import { senderRoutingContext, isBridgeIdentity, senderSbId } from './sender-context.js';
 import { getPinnedAgentId } from '../../utils/request-context';
 import { logger } from '../../utils/logger';
 
@@ -117,7 +117,8 @@ export async function handleTriggerAgent(
         senderIsBridge = await isBridgeIdentity(
           client,
           resolved.user.id,
-          pinned || args.fromAgentId
+          pinned || args.fromAgentId,
+          senderSbId()
         );
       }
     } catch {

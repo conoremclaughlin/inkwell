@@ -12,7 +12,7 @@ import { z } from 'zod';
 import type { DataComposer } from '../../data/composer';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
 import { getEffectiveAgentId } from '../../auth/enforce-identity';
-import { senderRoutingContext, isBridgeIdentity } from './sender-context.js';
+import { senderRoutingContext, isBridgeIdentity, senderSbId } from './sender-context.js';
 import { logger } from '../../utils/logger';
 import type { Json } from '../../data/supabase/types';
 import { getAgentGateway, type AgentTriggerPayload } from '../../channels/agent-gateway.js';
@@ -675,7 +675,12 @@ export async function handleAddThreadParticipant(args: unknown, dataComposer: Da
       // Without this the option added in round 1 was never passed by ANY
       // caller here, so bridge exclusion stayed dead on this path
       // (Lumen, PR #514 round 2).
-      senderIsBridge: await isBridgeIdentity(supabase, resolved.user.id, addedByAgentId || null),
+      senderIsBridge: await isBridgeIdentity(
+        supabase,
+        resolved.user.id,
+        addedByAgentId || null,
+        senderSbId()
+      ),
       threadKey,
       summary: `You were added to thread ${threadKey}${reason ? `: ${reason}` : ''}`,
       priority: 'normal',

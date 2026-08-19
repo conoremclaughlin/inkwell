@@ -1720,9 +1720,15 @@ export class SessionService implements ISessionService {
       }
     }
 
-    // Resolve canonical identity UUID
-    let sbId: string | undefined;
-    if (this.supabase) {
+    // Resolve canonical identity UUID.
+    //
+    // The caller's already-resolved identity WINS (Lumen, PR #514 round 3).
+    // Re-resolving from the slug here let the session bind to a different
+    // identity than the studio routing just picked for it — the session row
+    // and its studio disagreeing about who owns the work, which is worse than
+    // either being wrong alone.
+    let sbId: string | undefined = options?.sbId ?? undefined;
+    if (!sbId && this.supabase) {
       sbId = (await resolveIdentityId(this.supabase, userId, agentId)) || undefined;
     }
 
@@ -2261,7 +2267,16 @@ export class SessionService implements ISessionService {
     // thread to a different identity that happens to share a name. Prefer
     // sb_id; fall back to the slug only when no identity row exists, and log
     // that so the gap is visible rather than silent.
-    const sbId = knownSbId || (await this.resolveSbId(userId, agentId));
+    let sbId: string | null | undefined = knownSbId;
+    if (!sbId) {
+      const scope = await this.resolveIdentityScope(userId, agentId);
+      if (scope.ambiguous) {
+        // No caller-repo resolution at all — the caller falls through to
+        // refuse-and-hold rather than routing by an ambiguous slug.
+        return null;
+      }
+      sbId = scope.id ?? null;
+    }
 
     let reuseQuery = this.supabase
       .from('studios')
@@ -2295,7 +2310,9 @@ export class SessionService implements ISessionService {
 
     // The repo-scoped main studio — this is the re-scoped former tier 8. It
     // only runs against a repo we resolved, never the server's ambient cwd.
-    const mainStudioId = await this.resolveMainStudioId(userId, repoRoot, agentId);
+    // Scoped by the canonical identity too — this rung dropped it and looked
+    // up by slug (Lumen, PR #514 round 3).
+    const mainStudioId = await this.resolveMainStudioId(userId, repoRoot, agentId, sbId);
     if (mainStudioId) {
       logger.debug('[StudioResolve] Resolved repo-scoped main studio for caller repo', {
         repoRoot,
@@ -2328,6 +2345,51 @@ export class SessionService implements ISessionService {
    * Returns undefined when provisioning is unavailable or fails; the caller
    * then refuses rather than falling back to a guess.
    */
+  /**
+   * Canonical identity UUID for an agent slug.
+   *
+   * Three outcomes, deliberately distinct (Lumen, PR #514 round 3) — the
+   * previous version returned null for both "no row" and "several rows", and
+   * null selected the agent_id fallback, so an AMBIGUOUS slug still routed by
+   * slug. That is precisely the cross-identity routing the UUID prevents.
+   *
+   *   { id }            → use it
+   *   { absent: true }  → no identity row at all; slug scoping is the only
+   *                       option and is safe, because there is nothing to
+   *                       confuse it with
+   *   { ambiguous }     → several identities share this slug; caller-repo
+   *                       resolution must not run at all
+   */
+  private async resolveIdentityScope(
+    userId: string,
+    agentId: string
+  ): Promise<{ id?: string; absent?: boolean; ambiguous?: boolean }> {
+    if (!this.supabase) return { absent: true };
+    try {
+      const { data } = await this.supabase
+        .from('agent_identities')
+        .select('id')
+        .eq('user_id', userId)
+        .eq('agent_id', agentId)
+        .limit(2);
+      if (!data?.length) {
+        logger.debug('[StudioResolve] No identity row; slug scoping is unambiguous', { agentId });
+        return { absent: true };
+      }
+      if (data.length > 1) {
+        logger.warn('[StudioResolve] Ambiguous identity slug; refusing caller-repo resolution', {
+          agentId,
+        });
+        return { ambiguous: true };
+      }
+      return { id: data[0].id };
+    } catch {
+      // Unreadable identity is not "unambiguous" — treat it as ambiguous and
+      // fall through to a hold rather than routing by slug.
+      return { ambiguous: true };
+    }
+  }
+
   /** Canonical identity UUID for an agent slug, or null when unresolvable. */
   private async resolveSbId(userId: string, agentId: string): Promise<string | null> {
     if (!this.supabase) return null;
@@ -2398,14 +2460,16 @@ export class SessionService implements ISessionService {
   private async resolveMainStudioId(
     userId: string,
     repoRoot?: string,
-    agentId?: string
+    agentId?: string,
+    sbId?: string | null
   ): Promise<string | undefined> {
     if (!this.supabase) return undefined;
     return resolveMainStudio(
       this.supabase,
       userId,
       repoRoot || this.config.defaultWorkingDirectory,
-      agentId
+      agentId,
+      { sbId: sbId ?? undefined }
     );
   }
 
@@ -2986,7 +3050,7 @@ export async function resolveMainStudio(
   userId: string,
   repoRoot?: string,
   agentId?: string,
-  options?: { autoCreate?: boolean }
+  options?: { autoCreate?: boolean; sbId?: string }
 ): Promise<string | undefined> {
   const targetRoot = repoRoot || process.cwd();
 
@@ -3000,7 +3064,10 @@ export async function resolveMainStudio(
       .in('status', ['active', 'idle', 'archived'])
       .order('updated_at', { ascending: false })
       .limit(1);
-    if (agentId) q = q.eq('agent_id', agentId);
+    // Canonical identity when we have it — a slug can name different
+    // identities in different workspaces (Lumen, PR #514 round 3).
+    if (options?.sbId) q = q.eq('sb_id', options.sbId);
+    else if (agentId) q = q.eq('agent_id', agentId);
     return q;
   };
 
@@ -3017,6 +3084,7 @@ export async function resolveMainStudio(
     .insert({
       user_id: userId,
       agent_id: agentId,
+      ...(options?.sbId ? { sb_id: options.sbId } : {}),
       repo_root: targetRoot,
       worktree_path: targetRoot,
       branch: 'main',

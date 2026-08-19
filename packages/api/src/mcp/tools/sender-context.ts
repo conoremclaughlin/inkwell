@@ -14,6 +14,12 @@ import { logger } from '../../utils/logger.js';
  * inference silently degrades to refuse-and-hold on any dispatch path that
  * forgets to stamp it, and three of four paths had (Lumen, PR #514 round 1).
  */
+export function senderSbId(): string | undefined {
+  const reqCtx = getRequestContext();
+  const sessCtx = getSessionContext();
+  return reqCtx?.sbId || sessCtx?.sbId || undefined;
+}
+
 export function senderRoutingContext(isBridge?: boolean): {
   senderStudioId?: string;
   senderSessionId?: string;

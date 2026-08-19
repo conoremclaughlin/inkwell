@@ -3437,8 +3437,20 @@ describe('SessionService', () => {
 
     it('refuses rather than guessing when an agent slug is ambiguous', async () => {
       // Duplicate identities for one slug used to make maybeSingle() error and
-      // silently degrade to slug scoping — exactly the cross-identity routing
-      // the UUID exists to prevent.
+      // silently degrade to slug scoping — the cross-identity routing the UUID
+      // exists to prevent.
+      //
+      // A slug-matching studio DELIBERATELY exists here (Lumen, PR #514
+      // round 3). The first version of this test returned no studio at all, so
+      // it refused for lack of a candidate and passed with the fix removed —
+      // proving nothing. With a candidate present, only the ambiguity check
+      // produces the refusal.
+      const studioQueries: RecordedCall[][] = [];
+      const has = (calls: RecordedCall[], col: string, val?: unknown) =>
+        calls.some(
+          (c) => c.method === 'eq' && c.args[0] === col && (val === undefined || c.args[1] === val)
+        );
+
       const mockSupabase = {
         from: vi.fn().mockImplementation((table: string) => {
           const calls: RecordedCall[] = [];
@@ -3458,13 +3470,13 @@ describe('SessionService', () => {
             );
           }
           if (table === 'studios') {
-            return createFilterAwareChain(
-              (c) =>
-                c.some((call) => call.method === 'eq' && call.args[1] === 'sender-studio-1')
-                  ? { data: { repo_root: '/repos/inkwell' } }
-                  : { data: null },
-              calls
-            );
+            studioQueries.push(calls);
+            return createFilterAwareChain((c) => {
+              if (has(c, 'id', 'sender-studio-1')) return { data: { repo_root: '/repos/inkwell' } };
+              // A studio that a SLUG-keyed reuse query would happily return.
+              if (has(c, 'agent_id', 'wren')) return { data: { id: 'studio-wrong-identity' } };
+              return { data: null };
+            }, calls);
           }
           return createRecordingChain({ data: null }, calls);
         }),
@@ -3478,6 +3490,45 @@ describe('SessionService', () => {
           callerSessionId: 'sender-session-1',
         })
       ).rejects.toMatchObject({ code: 'ROUTING_REFUSED' });
+
+      // And no CALLER-REPO reuse query ran — narrowed to the query carrying
+      // the `ephemeral` filter, because the route-pattern and studio-hint
+      // tiers legitimately scope by agent_id and a blanket assertion would
+      // pin their behaviour instead of this one.
+      expect(studioQueries.some((calls) => has(calls, 'ephemeral', false))).toBe(false);
+    });
+
+    it('binds the new session to the caller-supplied identity, not a re-resolved slug', async () => {
+      // A session whose sb_id disagrees with the studio routing chose for it
+      // is worse than either being wrong alone (Lumen, PR #514 round 3).
+      const has = (calls: RecordedCall[], col: string, val?: unknown) =>
+        calls.some(
+          (c) => c.method === 'eq' && c.args[0] === col && (val === undefined || c.args[1] === val)
+        );
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          const calls: RecordedCall[] = [];
+          if (table === 'agent_identities') {
+            return createFilterAwareChain(() => ({ data: [{ id: 'sb-WRONG' }] }), calls);
+          }
+          if (table === 'studios') {
+            return createFilterAwareChain(
+              (c) => (has(c, 'ephemeral', false) ? { data: { id: 'studio-x' } } : { data: null }),
+              calls
+            );
+          }
+          return createRecordingChain({ data: null }, calls);
+        }),
+      };
+      const service = serviceWith(mockSupabase);
+
+      await service.getOrCreateSession('user-456', 'wren', {
+        sbId: 'sb-authoritative',
+      });
+
+      expect(mockRepository.create).toHaveBeenCalledWith(
+        expect.objectContaining({ sbId: 'sb-authoritative' })
+      );
     });
 
     it('excludes bridge senders without a studio_hint from caller-repo inference', async () => {

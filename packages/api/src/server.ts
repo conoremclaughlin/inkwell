@@ -716,7 +716,9 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
   async function clearRoutingHold(
     client: ReturnType<DataComposer['getClient']>,
     threadId: string,
-    agentId: string
+    userId: string,
+    agentId: string,
+    routedSince: string
   ): Promise<void> {
     // Atomic and CHECKED (Lumen, PR #514 round 2). The previous version read
     // metadata, deleted the key locally and wrote the whole object back, so
@@ -725,15 +727,20 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
     // routable while still stalled. It also ignored the write error and
     // logged success regardless.
     //
-    // The RPC deletes only this agent's hold inside a single UPDATE and
-    // returns the affected row count, so "no hold to clear" is
-    // distinguishable from "the write failed".
+    // The RPC deletes only this agent's hold, only when that hold predates
+    // this route, inside a single UPDATE — and returns the affected row count,
+    // so "no hold to clear" is distinguishable from "the write failed".
+    // It also verifies thread ownership server-side (round 3).
     try {
       const { data: cleared, error } = await client.rpc(
         'clear_routing_hold' as never,
         {
           p_thread_id: threadId,
+          p_user_id: userId,
           p_agent_id: agentId,
+          // Only holds older than this route; a newer one belongs to a later
+          // dispatch and must survive.
+          p_routed_since: routedSince,
         } as never
       );
       if (error) {
@@ -1102,6 +1109,12 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       workspaceId: resolvedWorkspaceId || null,
     });
 
+    // Timestamp taken BEFORE routing: a hold stamped after this point belongs
+    // to a later dispatch and must survive our clear (Lumen, round 3).
+    // Awaiting one callback does not serialize AgentGateway callbacks, so the
+    // ordering cannot be assumed — it has to be expressed in the predicate.
+    const routeStartedAt = new Date().toISOString();
+
     // Check if the routed session is CLI-attached — if so, queue the message
     // for the on-prompt hook instead of spawning a new process.
     // Uses getOrCreateSession to resolve through the SAME routing logic
@@ -1192,7 +1205,13 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       // that has not happened. Awaited, not detached, so it cannot race the
       // next dispatch's stamp.
       if (payload.threadId && !assignmentFailure) {
-        await clearRoutingHold(dataComposer!.getClient(), payload.threadId, targetAgentId);
+        await clearRoutingHold(
+          dataComposer!.getClient(),
+          payload.threadId,
+          userId,
+          targetAgentId,
+          routeStartedAt
+        );
       }
 
       // Routing-only dispatch: assignment IS the entire job — a failed stamp

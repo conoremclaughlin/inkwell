@@ -19,7 +19,11 @@ import {
   getPinnedAgentId,
 } from '../../utils/request-context';
 import { getAgentGateway, type AgentTriggerPayload } from '../../channels/agent-gateway.js';
-import { senderRoutingContext, isBridgeIdentity } from './sender-context.js';
+import {
+  senderRoutingContext,
+  isBridgeIdentity,
+  senderSbId as senderSbIdFromContext,
+} from './sender-context.js';
 import {
   findThread as findExistingThread,
   getParticipants,
@@ -384,7 +388,16 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
   // Relay identities are excluded from caller-repo inference (spec §Tier 7).
   // Resolved here, beside the other sender context, so every dispatch site
   // below gets it without repeating the lookup.
-  const senderIsBridge = await isBridgeIdentity(supabase, resolved.user.id, senderAgentId);
+  // Canonical identity from the SAME context token, so classification is not
+  // slug-ambiguous: two ordinary agents sharing a slug were both being
+  // classified as bridges and losing caller-repo inference entirely
+  // (Lumen, PR #514 round 3).
+  const senderIsBridge = await isBridgeIdentity(
+    supabase,
+    resolved.user.id,
+    senderAgentId,
+    senderSbIdFromContext()
+  );
 
   const nonAgentSender = triggerSenderId === 'system' || triggerSenderId === 'unknown';
   const missingSenderSession = !senderSessionId && !!senderAgentId && !nonAgentSender;
