@@ -47,6 +47,7 @@ import {
   contextBudgetForWindow as defaultContextBudget,
 } from '../repl/context-limits.js';
 import { parseSlashCommand } from '../repl/slash.js';
+import { createTurnSignal } from '../repl/turn-signal.js';
 import { createPollGate } from '../repl/poll-gate.js';
 import {
   parseEvictSelection,
@@ -5508,6 +5509,21 @@ export async function runChat(options: ChatOptions): Promise<void> {
       statusLane.markPromptRefreshed();
     }
   };
+  // The REPL's half of the hook-owned turn marker (PR #506 P1, Lumen):
+  // `cli_turn_at` is `isSessionMidTurn`'s only proof for CLI processes
+  // outside the API run registry, and an interactive Ink turn set neither
+  // signal — so the sweep completed a pendingRelease while a turn was still
+  // running in this worktree. The route stays the single writer; the REPL
+  // only posts the same prompt/stop events the backend lifecycle hooks send.
+  const turnSignal = createTurnSignal({
+    getSessionId: () => runtime.sessionId,
+    agentId,
+    getServerUrl: async () => (await import('../lib/pcp-mcp.js')).getPcpServerUrl(),
+    getToken: async (serverUrl) =>
+      (await import('../auth/tokens.js')).getValidAccessToken(serverUrl),
+    workingDir: process.cwd(),
+    onDebug: (event, detail) => sbDebugLog('chat', event, detail),
+  });
   const enqueueTurn = (
     raw: string,
     source: 'user' | 'inbox-auto' | 'system' = 'user',
@@ -5556,11 +5572,16 @@ export async function runChat(options: ChatOptions): Promise<void> {
       } else {
         statusLane.setTurnActive(true);
       }
+      // Turn open before any backend work; turn close on EVERY exit path via
+      // finally — a thrown turn must still clear the marker, or the lease
+      // outlives the process it protects.
+      await turnSignal.open();
       try {
         await runUserTurn(raw, source, displayLabel);
       } catch (error) {
         printLine(chalk.red(`Turn failed: ${String(error)}`));
       } finally {
+        await turnSignal.close();
         if (inkRepl) {
           inkRepl.setWaiting(false);
         } else {
