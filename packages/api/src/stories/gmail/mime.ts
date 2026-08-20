@@ -35,21 +35,25 @@ const BASE64_LINE_LENGTH = 76;
 /**
  * Max bytes in an attachment filename.
  *
- * 255 is the basename limit on every filesystem we read from, so no real
- * file can exceed it — this only bounds the caller-supplied `filename`
- * override. It also keeps the encoded parameter inside RFC 5322's 998-char
- * hard line limit: 255 bytes percent-encode to at most 765 characters,
- * which still fits after the longest MIME type and parameter prefix.
+ * The bound comes from the header line, not the filesystem: 255 bytes
+ * percent-encode to at most 765 characters, which still fits under 998
+ * after the longest MIME type and parameter prefix (~102). Roughly 298
+ * would fit; 255 is the round number below it.
  *
- * RFC 2231 continuations (`filename*0*`, `filename*1*`…) are the other way
- * to solve this. Rejecting is the better trade here: continuations would be
- * a mechanism that only ever runs on input no real file can produce, so it
- * would rot untested, and a loud failure matches how the rest of this path
- * already behaves.
+ * A real file CAN exceed this — APFS accepts basenames well past 255 bytes
+ * once they are non-ASCII, so this is not merely a guard on the
+ * caller-supplied `filename` override. Such a file fails the send loudly
+ * and the caller can pass a shorter `filename`.
+ *
+ * RFC 2231 continuations (`filename*0*`, `filename*1*`…) would carry any
+ * length. Rejecting is still the trade taken here: names that long are
+ * vanishingly rare, the failure is loud and self-describing, and a
+ * continuation path exercised by almost nothing would rot untested. If
+ * real files start hitting this, build the continuations.
  */
 export const MAX_FILENAME_BYTES = 255;
 
-/** RFC 5322 §2.1.1 hard limit, including CRLF. */
+/** RFC 5322 §2.1.1 hard limit, in octets, excluding the trailing CRLF. */
 const MAX_LINE_LENGTH = 998;
 
 // ============================================================================
@@ -251,7 +255,18 @@ export function headerLine(name: string, value: string): string {
 }
 
 /**
- * Fail loudly if any header line breaches RFC 5322's 998-char hard limit.
+ * Fail loudly if any header line breaches RFC 5322's 998-octet hard limit.
+ *
+ * Measured in UTF-8 BYTES, not `String.length`. RFC 5322 counts octets on
+ * the wire; a JS string length counts UTF-16 code units, which understates
+ * CJK text by 3x. `References: <長×400>` is 414 units but 1,214 bytes, so a
+ * length-based check waves through a line over the limit by more than the
+ * limit's own margin.
+ *
+ * Not hypothetical for `In-Reply-To` and `References`: unlike Subject,
+ * those carry values lifted straight out of received mail and are only
+ * CRLF-stripped, never encoded-word wrapped. Their bytes reach the wire
+ * as-is.
  *
  * Applied only to header lines: bodies and attachments are base64-wrapped
  * at 76 characters by construction, and walking a multi-megabyte payload
@@ -261,10 +276,11 @@ export function headerLine(name: string, value: string): string {
 function assertHeaderLinesFit(lines: string[]): void {
   for (const line of lines) {
     for (const physical of line.split('\r\n')) {
-      if (physical.length > MAX_LINE_LENGTH) {
+      const bytes = Buffer.byteLength(physical, 'utf8');
+      if (bytes > MAX_LINE_LENGTH) {
         throw new Error(
-          `Header line exceeds RFC 5322's ${MAX_LINE_LENGTH}-character limit ` +
-            `(${physical.length}): ${physical.slice(0, 80)}…`
+          `Header line exceeds RFC 5322's ${MAX_LINE_LENGTH}-octet limit ` +
+            `(${bytes} bytes): ${physical.slice(0, 80)}…`
         );
       }
     }

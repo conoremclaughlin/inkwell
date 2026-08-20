@@ -355,6 +355,41 @@ describe('GmailService.replyToEmail', () => {
     expect(headerOf(message, 'Subject')).toBe('Re: Hi Bcc: exfil@evil.com');
   });
 
+  // References/In-Reply-To are lifted straight out of received mail and are
+  // only CRLF-stripped — never encoded-word wrapped — so their bytes reach
+  // the wire as-is. A length-based line check counts UTF-16 units and
+  // undercounts CJK by 3x, waving through a line well over the octet limit.
+  it('refuses to send when an inbound References header overflows the line limit', async () => {
+    mockMessagesGet.mockImplementation(
+      routeMessagesGet([
+        ...ORIGINAL_HEADERS,
+        { name: 'References', value: `<${'長'.repeat(400)}@evil.com>` },
+      ])
+    );
+
+    await expect(
+      service.replyToEmail('user-1', { messageId: 'orig-1', body: 'ok' })
+    ).rejects.toThrow(/998-octet limit/);
+    expect(mockMessagesSend).not.toHaveBeenCalled();
+  });
+
+  it('sends when a non-ASCII References header fits in octets', async () => {
+    mockMessagesGet.mockImplementation(
+      routeMessagesGet([
+        ...ORIGINAL_HEADERS,
+        { name: 'References', value: `<${'長'.repeat(100)}@ok.com>` },
+      ])
+    );
+
+    await service.replyToEmail('user-1', { messageId: 'orig-1', body: 'ok' });
+
+    const headerBlock = sentRaw().split('\r\n\r\n')[0];
+    for (const line of headerBlock.split('\r\n')) {
+      expect(Buffer.byteLength(line, 'utf8')).toBeLessThanOrEqual(998);
+    }
+    expect(mockMessagesSend).toHaveBeenCalled();
+  });
+
   it('still sends when the profile lookup for self-exclusion fails', async () => {
     mockGetProfile.mockRejectedValue(new Error('insufficient scope'));
 
