@@ -161,8 +161,8 @@ export async function handleSaveProject(args: unknown, dataComposer: DataCompose
   // override. That collision is the grammar's one structural ambiguity
   // ("is pr:... segment 1 a project or a type?"), killed at write time.
   if (params.slug) {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const { data: typeRows, error: typeErr } = await (dataComposer.getClient() as any)
+    const { data: typeRows, error: typeErr } = await dataComposer
+      .getClient()
       .from('thread_key_types')
       .select('type, user_id')
       .eq('type', params.slug)
@@ -241,6 +241,7 @@ export async function handleListProjects(args: unknown, dataComposer: DataCompos
             projects: projects.map((p) => ({
               id: p.id,
               name: p.name,
+              slug: p.slug ?? null,
               description: p.description,
               status: p.status,
               tech_stack: p.tech_stack,
@@ -294,6 +295,7 @@ export async function handleGetProject(args: unknown, dataComposer: DataComposer
             project: {
               id: project.id,
               name: project.name,
+              slug: project.slug ?? null,
               description: project.description,
               status: project.status,
               tech_stack: project.tech_stack,

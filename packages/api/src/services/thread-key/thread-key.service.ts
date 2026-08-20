@@ -5,24 +5,22 @@ import {
   UNKNOWN_TYPE_DEFAULT,
   type EffectiveThreadKeyType,
 } from '../../data/repositories/thread-key-types.repository';
-import { parseThreadKey, type ParsedThreadKey } from './parser';
-import { logger } from '../../utils/logger';
 
 /**
- * Thread-key classification — the one place a stored key becomes behavior.
+ * Thread-key behavior resolution.
  *
- * classify() = parse (grammar v2, registry-driven project recognition against
- * projects.slug) + registry resolution (override > template > unknown
- * default). Lease acquisition (Phase 6b), the route matcher (grammar
- * migration step 3), and workflow typing all consume THIS, so type behavior
- * has exactly one derivation site.
+ * There is deliberately NO classify(rawKey) here (Lumen, PR #516 round 2):
+ * an API that parses a raw stored key invites every consumer to live-re-parse
+ * against today's slug registry, which is exactly the reinterpretation the
+ * pinned identity exists to prevent. Stored threads carry their identity in
+ * inbox_threads.key_project/key_type/key_id — pinned by the DB trigger
+ * pin_thread_key_before_insert at creation, immutable after. Consumers
+ * resolve behavior from the STORED type via typeBehavior().
+ *
+ * The TS parser (./parser) remains for the two legitimate non-stored uses:
+ * route-PATTERN parsing (patterns are configuration, not identity) and
+ * tooling. An integration parity test guards TS↔SQL parser drift.
  */
-
-export interface ThreadKeyClassification {
-  parsed: ParsedThreadKey | null;
-  behavior: EffectiveThreadKeyType;
-}
-
 export class ThreadKeyService {
   private registry: ThreadKeyTypesRepository;
 
@@ -30,41 +28,40 @@ export class ThreadKeyService {
     this.registry = new ThreadKeyTypesRepository(supabase);
   }
 
-  /** Registered project slugs for a user. Failure → empty set (keys parse unprefixed). */
+  /**
+   * Registered project slugs for a user — for PATTERN parsing and tooling
+   * only, never for re-parsing a stored key.
+   *
+   * FAILS CLOSED (Lumen, PR #516 round 2 condition 1): a lookup error throws
+   * rather than returning an empty set. The empty-set fallback made
+   * `pcp:issue:x` parse as (null, 'pcp', 'issue:x') — a wrong identity that
+   * callers might then act on. No caller may treat "could not read the
+   * registry" as "there are no projects".
+   */
   async projectSlugs(userId: string): Promise<Set<string>> {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const { data, error } = await (this.supabase as any)
+    const { data, error } = await this.supabase
       .from('projects')
       .select('slug')
       .eq('user_id', userId)
       .not('slug', 'is', null);
     if (error) {
-      logger.warn('[ThreadKey] project slug lookup failed; parsing keys unprefixed', {
-        userId,
-        error: error.message,
-      });
-      return new Set();
+      throw new Error(`Project slug lookup failed: ${error.message}`);
     }
-    return new Set(
-      ((data as Array<{ slug: string | null }>) || [])
-        .map((r) => r.slug)
-        .filter((s): s is string => !!s)
-    );
+    return new Set((data || []).map((r) => r.slug).filter((s): s is string => !!s));
   }
 
   /**
-   * Parse + resolve behavior for a thread key.
-   *
-   * A key that does not parse gets the conservative unknown default (write) —
-   * an unparseable key must never be the cheap way to dodge the lease.
+   * Behavior for a STORED key type (inbox_threads.key_type). This is the
+   * single entry point Phase 6b consumes. An untyped thread (key_type NULL)
+   * gets the conservative unknown default — write.
    */
-  async classify(userId: string, threadKey: string): Promise<ThreadKeyClassification> {
-    const slugs = await this.projectSlugs(userId);
-    const parsed = parseThreadKey(threadKey, slugs);
-    if (!parsed) {
-      return { parsed: null, behavior: { ...UNKNOWN_TYPE_DEFAULT, type: threadKey } };
+  async typeBehavior(
+    userId: string,
+    storedKeyType: string | null
+  ): Promise<EffectiveThreadKeyType> {
+    if (!storedKeyType) {
+      return { ...UNKNOWN_TYPE_DEFAULT, type: '' };
     }
-    const behavior = await this.registry.getEffective(userId, parsed.type);
-    return { parsed, behavior };
+    return this.registry.getEffective(userId, storedKeyType);
   }
 }

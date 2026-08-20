@@ -92,7 +92,21 @@ describe('handleSetThreadKeyType', () => {
     ).rejects.toThrow(/required unless reset/);
   });
 
-  it('upserts an override when the name is clean', async () => {
+  it('REJECTS presence overrides until escalation-on-write ships (6e)', async () => {
+    // All-write templates alone are not conservative while this public
+    // surface can mint a presence row: once 6b consumes the registry, that
+    // row is an unleased writer with no net (Lumen, PR #516 round 2).
+    const { composer } = composerWith({ projects: { data: [] } });
+    await expect(
+      handleSetThreadKeyType(
+        { type: 'standup', writeIntent: 'presence', studioPolicy: 'reuse-only' },
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        composer as any
+      )
+    ).rejects.toThrow(/escalation-on-write/);
+  });
+
+  it('upserts a write override when the name is clean', async () => {
     const { composer, from } = composerWith({
       projects: { data: [] },
       thread_key_types: {
@@ -100,8 +114,8 @@ describe('handleSetThreadKeyType', () => {
           id: 'o1',
           user_id: 'user-1',
           type: 'standup',
-          write_intent: 'presence',
-          studio_policy: 'reuse-only',
+          write_intent: 'write',
+          studio_policy: 'provision',
           description: null,
           created_at: '',
           updated_at: '',
@@ -109,7 +123,7 @@ describe('handleSetThreadKeyType', () => {
       },
     });
     const res = await handleSetThreadKeyType(
-      { type: 'standup', writeIntent: 'presence', studioPolicy: 'reuse-only' },
+      { type: 'standup', writeIntent: 'write', studioPolicy: 'provision' },
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       composer as any
     );
@@ -117,7 +131,7 @@ describe('handleSetThreadKeyType', () => {
     expect(body.success).toBe(true);
     expect(body.type).toMatchObject({
       type: 'standup',
-      writeIntent: 'presence',
+      writeIntent: 'write',
       source: 'override',
     });
     expect(from).toHaveBeenCalledWith('thread_key_types');

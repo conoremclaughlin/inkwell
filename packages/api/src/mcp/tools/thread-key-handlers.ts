@@ -114,12 +114,26 @@ export async function handleSetThreadKeyType(args: unknown, dataComposer: DataCo
     throw new Error('writeIntent and studioPolicy are required unless reset: true');
   }
 
+  // Presence overrides are REJECTED until escalation-on-write ships (Phase
+  // 6e; Lumen PR #516 round 2 condition 3). All-write templates alone do not
+  // make effective behavior conservative while this public surface can mint a
+  // presence row: once 6b consumes the registry, that row is an unleased
+  // writer with no net. 6e lifts this in the same change that makes
+  // escalation live.
+  if (params.writeIntent === 'presence') {
+    throw new Error(
+      'presence overrides are not accepted yet: escalation-on-write (Phase 6e) must ship first, ' +
+        'so a wrongly-presence session cannot mutate an unleased working tree. ' +
+        'The restriction lifts atomically with 6e.'
+    );
+  }
+
   // Reserved-name rule, this direction (grammar v2): a type name must not
   // collide with one of the user's project slugs — that collision is the one
   // structural ambiguity in the grammar, killed at write time on BOTH sides
   // (the other side rejects project slugs colliding with type names).
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const { data: slugRows, error: slugErr } = await (dataComposer.getClient() as any)
+  const { data: slugRows, error: slugErr } = await dataComposer
+    .getClient()
     .from('projects')
     .select('slug')
     .eq('user_id', user.id)

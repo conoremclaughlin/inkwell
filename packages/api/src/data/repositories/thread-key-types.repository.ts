@@ -3,7 +3,7 @@ import type { Database } from '../supabase/types';
 import { BaseRepository } from './base.repository';
 
 /**
- * Thread-key type registry (spec: ink://specs/thread-key-grammar v2).
+ * Thread-key type registry (spec: ink://specs/thread-key-grammar v4).
  *
  * The registry is DATA, not a code constant (Conor, 2026-08-20): general
  * rules like "pr:* creates a studio" are user-adjustable without a deploy,
@@ -11,9 +11,11 @@ import { BaseRepository } from './base.repository';
  *
  * Resolution: a user override row beats the template row for the same type;
  * no row at all resolves to the unknown-type default. Behavior lives HERE,
- * never in call sites (grammar v2 invariant 5) — no consumer hardcodes
+ * never in call sites (grammar invariant 5) — no consumer hardcodes
  * "spec means presence".
  */
+
+type ThreadKeyTypeRow = Database['public']['Tables']['thread_key_types']['Row'];
 
 export type WriteIntent = 'write' | 'presence';
 export type StudioPolicy = 'provision' | 'reuse-only';
@@ -44,7 +46,7 @@ export interface EffectiveThreadKeyType {
  * `write` is v1 ROLLOUT SAFETY, not the end state: until escalation-on-write
  * detection ships (Phase 6e), a wrongly-presence session that edits files
  * would mutate an unleased tree. Once escalation exists this flips to
- * presence, with escalation as the net (grammar v2 §templates).
+ * presence, with escalation as the net (grammar spec §templates).
  */
 export const UNKNOWN_TYPE_DEFAULT: EffectiveThreadKeyType = {
   type: '',
@@ -55,18 +57,25 @@ export const UNKNOWN_TYPE_DEFAULT: EffectiveThreadKeyType = {
 };
 
 export class ThreadKeyTypesRepository extends BaseRepository {
+  /**
+   * BaseRepository holds `SupabaseClient<any>`, which unTypes every query and
+   * forces row casts (the existing repos' `data as X` convention). Keeping a
+   * properly typed reference gives real end-to-end typing instead.
+   */
+  private db: SupabaseClient<Database>;
+
   constructor(client: SupabaseClient<Database>) {
     super(client);
+    this.db = client;
   }
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  private mapRow(row: Record<string, any>): ThreadKeyType {
+  private mapRow(row: ThreadKeyTypeRow): ThreadKeyType {
     return {
       id: row.id,
       userId: row.user_id ?? null,
       type: row.type,
-      writeIntent: row.write_intent,
-      studioPolicy: row.studio_policy,
+      writeIntent: row.write_intent as WriteIntent,
+      studioPolicy: row.studio_policy as StudioPolicy,
       description: row.description ?? null,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
@@ -76,14 +85,13 @@ export class ThreadKeyTypesRepository extends BaseRepository {
   /** All rows visible to this user: system templates + their overrides. */
   async listForUser(userId: string): Promise<ThreadKeyType[]> {
     try {
-      const { data, error } = await this.client
+      const { data, error } = await this.db
         .from('thread_key_types')
         .select('*')
         .or(`user_id.is.null,user_id.eq.${userId}`)
         .order('type');
       if (error) throw error;
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      return ((data as any[]) || []).map((r) => this.mapRow(r));
+      return (data ?? []).map((r) => this.mapRow(r));
     } catch (error) {
       this.handleError(error, 'listForUser');
     }
@@ -116,10 +124,10 @@ export class ThreadKeyTypesRepository extends BaseRepository {
   }
 
   /**
-   * Effective behavior for one type. NEVER throws on lookup problems in a way
-   * that callers could confuse with presence — a registry read failure
-   * surfaces as the conservative unknown-type default (write), because
-   * failing toward presence would let a session mutate an unleased tree.
+   * Effective behavior for one type. NEVER surfaces a lookup failure as
+   * presence — a registry read failure resolves to the conservative
+   * unknown-type default (write), because failing toward presence would let
+   * a session mutate an unleased tree.
    */
   async getEffective(userId: string, type: string): Promise<EffectiveThreadKeyType> {
     try {
@@ -157,7 +165,7 @@ export class ThreadKeyTypesRepository extends BaseRepository {
     values: { writeIntent: WriteIntent; studioPolicy: StudioPolicy; description?: string | null }
   ): Promise<ThreadKeyType> {
     try {
-      const { data: existing, error: findErr } = await this.client
+      const { data: existing, error: findErr } = await this.db
         .from('thread_key_types')
         .select('id')
         .eq('user_id', userId)
@@ -166,34 +174,36 @@ export class ThreadKeyTypesRepository extends BaseRepository {
       if (findErr) throw findErr;
 
       if (existing?.id) {
-        const { data, error } = await this.client
+        const update: Database['public']['Tables']['thread_key_types']['Update'] = {
+          write_intent: values.writeIntent,
+          studio_policy: values.studioPolicy,
+          // Undefined means "not provided", null means "clear" (upsert safety).
+          ...(values.description !== undefined ? { description: values.description } : {}),
+        };
+        const { data, error } = await this.db
           .from('thread_key_types')
-          .update({
-            write_intent: values.writeIntent,
-            studio_policy: values.studioPolicy,
-            // Undefined means "not provided", null means "clear" (upsert safety).
-            ...(values.description !== undefined ? { description: values.description } : {}),
-          } as never)
+          .update(update)
           .eq('id', existing.id)
           .select()
           .single();
         if (error) throw error;
-        return this.mapRow(data as Record<string, unknown>);
+        return this.mapRow(data);
       }
 
-      const { data, error } = await this.client
+      const insert: Database['public']['Tables']['thread_key_types']['Insert'] = {
+        user_id: userId,
+        type,
+        write_intent: values.writeIntent,
+        studio_policy: values.studioPolicy,
+        description: values.description ?? null,
+      };
+      const { data, error } = await this.db
         .from('thread_key_types')
-        .insert({
-          user_id: userId,
-          type,
-          write_intent: values.writeIntent,
-          studio_policy: values.studioPolicy,
-          description: values.description ?? null,
-        } as never)
+        .insert(insert)
         .select()
         .single();
       if (error) throw error;
-      return this.mapRow(data as Record<string, unknown>);
+      return this.mapRow(data);
     } catch (error) {
       this.handleError(error, 'setOverride');
     }
@@ -202,15 +212,14 @@ export class ThreadKeyTypesRepository extends BaseRepository {
   /** Delete a user override; the shipped template (or default) resumes. */
   async clearOverride(userId: string, type: string): Promise<boolean> {
     try {
-      const { data, error } = await this.client
+      const { data, error } = await this.db
         .from('thread_key_types')
         .delete()
         .eq('user_id', userId)
         .eq('type', type)
         .select('id');
       if (error) throw error;
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      return ((data as any[]) || []).length > 0;
+      return (data ?? []).length > 0;
     } catch (error) {
       this.handleError(error, 'clearOverride');
     }
