@@ -2,12 +2,25 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { join } from 'path';
 import { homedir } from 'os';
 
-const { mockAttachmentGet, mockMkdir, mockWriteFile, MockOAuth2 } = vi.hoisted(() => {
+const {
+  mockAttachmentGet,
+  mockMessagesGet,
+  mockMessagesSend,
+  mockDraftsCreate,
+  mockGetProfile,
+  mockMkdir,
+  mockWriteFile,
+  MockOAuth2,
+} = vi.hoisted(() => {
   class _MockOAuth2 {
     setCredentials = vi.fn();
   }
   return {
     mockAttachmentGet: vi.fn(),
+    mockMessagesGet: vi.fn(),
+    mockMessagesSend: vi.fn(),
+    mockDraftsCreate: vi.fn(),
+    mockGetProfile: vi.fn(),
     mockMkdir: vi.fn().mockResolvedValue(undefined),
     mockWriteFile: vi.fn().mockResolvedValue(undefined),
     MockOAuth2: _MockOAuth2,
@@ -19,9 +32,13 @@ vi.mock('googleapis', () => ({
     auth: { OAuth2: MockOAuth2 },
     gmail: vi.fn().mockReturnValue({
       users: {
+        getProfile: mockGetProfile,
         messages: {
           attachments: { get: mockAttachmentGet },
+          get: mockMessagesGet,
+          send: mockMessagesSend,
         },
+        drafts: { create: mockDraftsCreate },
       },
     }),
   },
@@ -45,6 +62,268 @@ vi.mock('fs/promises', async (importOriginal) => {
 import { GmailService } from './service';
 
 const expectedDir = join(homedir(), '.ink', 'files', 'gmail');
+
+/** Headers of a real message: a bare To address plus a named Cc. */
+const ORIGINAL_HEADERS = [
+  { name: 'From', value: 'Sneha Shrestha <sneha@clarus-health.com>' },
+  { name: 'To', value: 'conoremclaughlin@gmail.com' },
+  { name: 'Cc', value: 'Front Desk <desk@clarus-health.com>' },
+  { name: 'Subject', value: 'Appointment Thursday' },
+  { name: 'Message-ID', value: '<abc123@mail.gmail.com>' },
+];
+
+/** Route messages.get: the original under test, else a generic sent message. */
+function routeMessagesGet(headers = ORIGINAL_HEADERS) {
+  return vi.fn(async ({ id }: { id: string }) => {
+    if (id === 'orig-1') {
+      return { data: { id: 'orig-1', threadId: 'thread-1', payload: { headers } } };
+    }
+    return {
+      data: {
+        id: 'sent-1',
+        threadId: 'thread-1',
+        labelIds: ['SENT'],
+        payload: { headers: [{ name: 'Subject', value: 'sent' }] },
+      },
+    };
+  });
+}
+
+/** The RFC 5322 message the service handed to Gmail, decoded. */
+function sentRaw(): string {
+  const raw = mockMessagesSend.mock.calls[0][0].requestBody.raw;
+  return Buffer.from(raw, 'base64url').toString('utf8');
+}
+
+/** Value of a header in a decoded message (headers end at the blank line). */
+function headerOf(message: string, name: string): string | undefined {
+  const head = message.split('\r\n\r\n')[0];
+  return head
+    .split('\r\n')
+    .find((l) => l.startsWith(`${name}: `))
+    ?.slice(name.length + 2);
+}
+
+describe('GmailService.replyToEmail', () => {
+  let service: GmailService;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockMessagesGet.mockImplementation(routeMessagesGet());
+    mockMessagesSend.mockResolvedValue({ data: { id: 'sent-1' } });
+    mockGetProfile.mockResolvedValue({ data: { emailAddress: 'conoremclaughlin@gmail.com' } });
+    service = new GmailService();
+  });
+
+  it('builds a valid Cc when replying all to a bare-address recipient', async () => {
+    // Regression for the live failure: the old parser split the bare To
+    // address into name "conoremclaughlin@gmail.co" + email "m", and "m"
+    // landed in the Cc header, so Gmail returned "Invalid Cc header".
+    await service.replyToEmail('user-1', {
+      messageId: 'orig-1',
+      body: 'Sounds good.',
+      replyAll: true,
+    });
+
+    const cc = headerOf(sentRaw(), 'Cc');
+    expect(cc).toBe('desk@clarus-health.com');
+    expect(cc).not.toContain('m,');
+    expect(cc?.split(', ')).not.toContain('m');
+  });
+
+  it('addresses the reply to the original sender', async () => {
+    await service.replyToEmail('user-1', { messageId: 'orig-1', body: 'ok' });
+    expect(headerOf(sentRaw(), 'To')).toBe('sneha@clarus-health.com');
+  });
+
+  it('excludes the user from their own replyAll Cc', async () => {
+    await service.replyToEmail('user-1', {
+      messageId: 'orig-1',
+      body: 'ok',
+      replyAll: true,
+    });
+    expect(headerOf(sentRaw(), 'Cc')).not.toContain('conoremclaughlin@gmail.com');
+  });
+
+  it('omits Cc entirely when not replying all', async () => {
+    await service.replyToEmail('user-1', { messageId: 'orig-1', body: 'ok' });
+    expect(headerOf(sentRaw(), 'Cc')).toBeUndefined();
+  });
+
+  it('honors Reply-To over From', async () => {
+    mockMessagesGet.mockImplementation(
+      routeMessagesGet([...ORIGINAL_HEADERS, { name: 'Reply-To', value: 'billing@clarus.com' }])
+    );
+
+    await service.replyToEmail('user-1', { messageId: 'orig-1', body: 'ok' });
+    expect(headerOf(sentRaw(), 'To')).toBe('billing@clarus.com');
+  });
+
+  it('drops unroutable entries from the original recipients', async () => {
+    mockMessagesGet.mockImplementation(
+      routeMessagesGet([
+        { name: 'From', value: 'sender@x.com' },
+        { name: 'To', value: 'undisclosed-recipients:;' },
+        { name: 'Cc', value: 'real@y.com, not-an-address' },
+        { name: 'Subject', value: 'Hi' },
+      ])
+    );
+
+    await service.replyToEmail('user-1', {
+      messageId: 'orig-1',
+      body: 'ok',
+      replyAll: true,
+    });
+    expect(headerOf(sentRaw(), 'Cc')).toBe('real@y.com');
+  });
+
+  it('keeps a comma-containing quoted display name as one recipient', async () => {
+    mockMessagesGet.mockImplementation(
+      routeMessagesGet([
+        { name: 'From', value: 'sender@x.com' },
+        { name: 'To', value: '"Shrestha, Sneha" <sneha@y.com>, bob@z.com' },
+        { name: 'Subject', value: 'Hi' },
+      ])
+    );
+
+    await service.replyToEmail('user-1', {
+      messageId: 'orig-1',
+      body: 'ok',
+      replyAll: true,
+    });
+    expect(headerOf(sentRaw(), 'Cc')).toBe('sneha@y.com, bob@z.com');
+  });
+
+  it('deduplicates a recipient listed in both To and Cc', async () => {
+    mockMessagesGet.mockImplementation(
+      routeMessagesGet([
+        { name: 'From', value: 'sender@x.com' },
+        { name: 'To', value: 'dup@y.com' },
+        { name: 'Cc', value: 'DUP@y.com, other@z.com' },
+        { name: 'Subject', value: 'Hi' },
+      ])
+    );
+
+    await service.replyToEmail('user-1', {
+      messageId: 'orig-1',
+      body: 'ok',
+      replyAll: true,
+    });
+    expect(headerOf(sentRaw(), 'Cc')).toBe('dup@y.com, other@z.com');
+  });
+
+  it('prefixes the subject with Re: only once', async () => {
+    mockMessagesGet.mockImplementation(
+      routeMessagesGet([
+        { name: 'From', value: 'sender@x.com' },
+        { name: 'Subject', value: 'RE: Appointment' },
+      ])
+    );
+
+    await service.replyToEmail('user-1', { messageId: 'orig-1', body: 'ok' });
+    expect(headerOf(sentRaw(), 'Subject')).toBe('RE: Appointment');
+  });
+
+  it('refuses to reply when the sender address is unusable', async () => {
+    mockMessagesGet.mockImplementation(
+      routeMessagesGet([{ name: 'From', value: 'Mailer Daemon' }])
+    );
+
+    await expect(
+      service.replyToEmail('user-1', { messageId: 'orig-1', body: 'ok' })
+    ).rejects.toThrow(/no usable sender address/);
+    expect(mockMessagesSend).not.toHaveBeenCalled();
+  });
+
+  it('does not let a hostile original subject inject a header', async () => {
+    mockMessagesGet.mockImplementation(
+      routeMessagesGet([
+        { name: 'From', value: 'attacker@evil.com' },
+        { name: 'Subject', value: 'Hi\r\nBcc: exfil@evil.com' },
+      ])
+    );
+
+    await service.replyToEmail('user-1', { messageId: 'orig-1', body: 'ok' });
+
+    const message = sentRaw();
+    expect(headerOf(message, 'Bcc')).toBeUndefined();
+    expect(message.split('\r\n\r\n')[0]).not.toMatch(/^Bcc:/m);
+    expect(headerOf(message, 'Subject')).toBe('Re: Hi Bcc: exfil@evil.com');
+  });
+
+  it('still sends when the profile lookup for self-exclusion fails', async () => {
+    mockGetProfile.mockRejectedValue(new Error('insufficient scope'));
+
+    await service.replyToEmail('user-1', {
+      messageId: 'orig-1',
+      body: 'ok',
+      replyAll: true,
+    });
+    expect(mockMessagesSend).toHaveBeenCalled();
+  });
+});
+
+describe('GmailService.sendEmail', () => {
+  let service: GmailService;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockMessagesGet.mockImplementation(routeMessagesGet());
+    mockMessagesSend.mockResolvedValue({ data: { id: 'sent-1' } });
+    service = new GmailService();
+  });
+
+  it('sends a plain single-part message with no attachments', async () => {
+    await service.sendEmail('user-1', {
+      to: ['clinic@example.com'],
+      subject: 'Insurance card',
+      body: 'Attached.',
+    });
+
+    const message = sentRaw();
+    expect(headerOf(message, 'To')).toBe('clinic@example.com');
+    expect(message).not.toContain('multipart/mixed');
+  });
+
+  it('rejects an invalid recipient before contacting Gmail', async () => {
+    await expect(
+      service.sendEmail('user-1', { to: ['m'], subject: 'x', body: 'y' })
+    ).rejects.toThrow(/Invalid To address/);
+    expect(mockMessagesSend).not.toHaveBeenCalled();
+  });
+
+  it('rejects a CRLF-bearing recipient', async () => {
+    await expect(
+      service.sendEmail('user-1', {
+        to: ['ok@x.com\r\nBcc: evil@y.com'],
+        subject: 'x',
+        body: 'y',
+      })
+    ).rejects.toThrow(/Invalid To address/);
+  });
+
+  it('does not let a caller-supplied subject inject a header', async () => {
+    await service.sendEmail('user-1', {
+      to: ['a@b.com'],
+      subject: 'Hi\r\nBcc: evil@x.com',
+      body: 'y',
+    });
+    expect(headerOf(sentRaw(), 'Bcc')).toBeUndefined();
+  });
+
+  it('adds threading headers when replying', async () => {
+    await service.sendEmail('user-1', {
+      to: ['a@b.com'],
+      subject: 'Re: x',
+      body: 'y',
+      replyToMessageId: 'orig-1',
+    });
+
+    const message = sentRaw();
+    expect(headerOf(message, 'In-Reply-To')).toBe('<abc123@mail.gmail.com>');
+    expect(headerOf(message, 'References')).toBe('<abc123@mail.gmail.com>');
+  });
+});
 
 describe('GmailService.downloadAttachment', () => {
   let service: GmailService;

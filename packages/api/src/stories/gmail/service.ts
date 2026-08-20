@@ -8,9 +8,18 @@
 import { google, gmail_v1 } from 'googleapis';
 import { getOAuthService } from '../../services/oauth';
 import { logger } from '../../utils/logger';
+import { resolveOutboundAttachments } from './attachments';
+import {
+  buildRawMessage,
+  headerLine,
+  isValidAddress,
+  parseAddress,
+  parseAddressList,
+  type OutboundAttachment,
+} from './mime';
 import type {
+  AttachmentInput,
   Email,
-  EmailAddress,
   EmailAttachment,
   EmailLabel,
   EmailSearchResult,
@@ -25,6 +34,9 @@ import type {
 
 export class GmailService {
   private oauthService = getOAuthService();
+
+  /** Per-user Gmail address, memoized for replyAll self-exclusion. */
+  private ownAddressCache = new Map<string, string | undefined>();
 
   /**
    * Get an authenticated Gmail API client for a user
@@ -108,30 +120,52 @@ export class GmailService {
   }
 
   /**
-   * Send a new email
+   * Validate an outbound recipient list, rejecting anything that is not a
+   * usable address.
+   *
+   * Callers reach this with addresses from two very different places:
+   * schema-validated tool arguments, and addresses parsed out of a
+   * received message (replyAll). Only the first is trustworthy, so the
+   * check happens here where both converge — that is the invariant the
+   * "Invalid Cc header" failure slipped past.
    */
-  async sendEmail(userId: string, options: SendEmailOptions): Promise<Email> {
-    const gmail = await this.getClient(userId);
+  private validateRecipients(field: 'To' | 'Cc' | 'Bcc', addresses: string[]): string[] {
+    const invalid = addresses.filter((a) => !isValidAddress(a));
+    if (invalid.length > 0) {
+      throw new Error(`Invalid ${field} address(es): ${invalid.join(', ')}`);
+    }
+    return addresses.map((a) => a.trim());
+  }
 
-    const { to, cc, bcc, subject, body, isHtml = false, replyToMessageId, threadId } = options;
+  /**
+   * Build the shared header block for an outgoing message.
+   *
+   * sendEmail and createDraft previously carried two copies of this; they
+   * now share one so threading and sanitization cannot drift apart.
+   */
+  private async buildOutboundHeaders(
+    gmail: gmail_v1.Gmail,
+    options: {
+      to: string[];
+      cc?: string[];
+      bcc?: string[];
+      subject: string;
+      replyToMessageId?: string;
+    }
+  ): Promise<string[]> {
+    const { to, cc, bcc, subject, replyToMessageId } = options;
 
-    logger.info('Sending email', { userId, to, subject });
-
-    // Build the email
-    const headers: string[] = [
-      `To: ${to.join(', ')}`,
-      `Subject: ${subject}`,
-      `Content-Type: ${isHtml ? 'text/html' : 'text/plain'}; charset=utf-8`,
-    ];
-
+    const headers: string[] = [`To: ${this.validateRecipients('To', to).join(', ')}`];
     if (cc?.length) {
-      headers.push(`Cc: ${cc.join(', ')}`);
+      headers.push(`Cc: ${this.validateRecipients('Cc', cc).join(', ')}`);
     }
     if (bcc?.length) {
-      headers.push(`Bcc: ${bcc.join(', ')}`);
+      headers.push(`Bcc: ${this.validateRecipients('Bcc', bcc).join(', ')}`);
     }
+    // headerLine strips CR/LF and RFC 2047-encodes: a Subject is free text
+    // and on replies it is derived from a subject an untrusted sender chose.
+    headers.push(headerLine('Subject', subject));
 
-    // If replying, add threading headers
     if (replyToMessageId) {
       const originalMessage = await gmail.users.messages.get({
         userId: 'me',
@@ -145,16 +179,67 @@ export class GmailService {
       const referencesHeader = originalHeaders.find((h) => h.name === 'References')?.value;
 
       if (messageIdHeader) {
-        headers.push(`In-Reply-To: ${messageIdHeader}`);
+        const messageId = messageIdHeader.replace(/[\r\n]+/g, ' ').trim();
+        headers.push(`In-Reply-To: ${messageId}`);
         const references = referencesHeader
-          ? `${referencesHeader} ${messageIdHeader}`
-          : messageIdHeader;
+          ? `${referencesHeader.replace(/[\r\n]+/g, ' ').trim()} ${messageId}`
+          : messageId;
         headers.push(`References: ${references}`);
       }
     }
 
-    const email = `${headers.join('\r\n')}\r\n\r\n${body}`;
-    const encodedEmail = Buffer.from(email).toString('base64url');
+    return headers;
+  }
+
+  /** Read and verify attachment files before any message is assembled. */
+  private async prepareAttachments(attachments?: AttachmentInput[]): Promise<OutboundAttachment[]> {
+    if (!attachments?.length) return [];
+    return resolveOutboundAttachments(attachments);
+  }
+
+  /**
+   * Send a new email
+   */
+  async sendEmail(userId: string, options: SendEmailOptions): Promise<Email> {
+    const gmail = await this.getClient(userId);
+
+    const {
+      to,
+      cc,
+      bcc,
+      subject,
+      body,
+      isHtml = false,
+      replyToMessageId,
+      threadId,
+      attachments,
+    } = options;
+
+    logger.info('Sending email', {
+      userId,
+      to,
+      subject,
+      attachmentCount: attachments?.length ?? 0,
+    });
+
+    // Resolve attachments first: a rejected file must abort before anything
+    // is sent, not leave a message already on its way without them.
+    const resolvedAttachments = await this.prepareAttachments(attachments);
+
+    const headers = await this.buildOutboundHeaders(gmail, {
+      to,
+      cc,
+      bcc,
+      subject,
+      replyToMessageId,
+    });
+
+    const encodedEmail = buildRawMessage({
+      headers,
+      body,
+      isHtml,
+      attachments: resolvedAttachments,
+    });
 
     const response = await gmail.users.messages.send({
       userId: 'me',
@@ -180,7 +265,7 @@ export class GmailService {
   async replyToEmail(userId: string, options: ReplyToEmailOptions): Promise<Email> {
     const gmail = await this.getClient(userId);
 
-    const { messageId, body, isHtml = false, replyAll = false } = options;
+    const { messageId, body, isHtml = false, replyAll = false, attachments } = options;
 
     logger.info('Replying to email', { userId, messageId, replyAll });
 
@@ -189,34 +274,53 @@ export class GmailService {
       userId: 'me',
       id: messageId,
       format: 'metadata',
-      metadataHeaders: ['From', 'To', 'Cc', 'Subject', 'Message-ID', 'References'],
+      metadataHeaders: ['From', 'To', 'Cc', 'Reply-To', 'Subject', 'Message-ID', 'References'],
     });
 
     const originalHeaders = originalMessage.data.payload?.headers || [];
-    const getHeader = (name: string) => originalHeaders.find((h) => h.name === name)?.value;
+    const getHeader = (name: string) =>
+      originalHeaders.find((h) => h.name?.toLowerCase() === name.toLowerCase())?.value || '';
 
-    const originalFrom = getHeader('From') || '';
-    const originalTo = getHeader('To') || '';
-    const originalCc = getHeader('Cc');
-    const originalSubject = getHeader('Subject') || '';
+    const originalFrom = getHeader('From');
+    const originalReplyTo = getHeader('Reply-To');
+    const originalSubject = getHeader('Subject');
 
-    // Build recipient list
-    const to = [this.parseEmailAddress(originalFrom).email];
+    // Reply-To wins over From when the sender set one (RFC 5322 §3.6.2).
+    const primary = parseAddress(originalReplyTo || originalFrom).email;
+    if (!isValidAddress(primary)) {
+      throw new Error(
+        `Cannot reply: the original message has no usable sender address (From: "${originalFrom}").`
+      );
+    }
+
+    const to = [primary];
     let cc: string[] = [];
 
     if (replyAll) {
-      // Add original To and Cc recipients (excluding self)
-      const toAddresses = originalTo.split(',').map((e) => this.parseEmailAddress(e.trim()).email);
-      const ccAddresses = originalCc
-        ? originalCc.split(',').map((e) => this.parseEmailAddress(e.trim()).email)
-        : [];
+      const self = await this.getOwnAddress(userId);
 
-      // TODO: Filter out the user's own email
-      cc = [...toAddresses, ...ccAddresses].filter((e) => e !== to[0]);
+      // Everyone who saw the original, minus the new To and minus the user
+      // themselves — replying should not Cc the sender back to themselves.
+      const seen = new Set([primary.toLowerCase(), ...(self ? [self.toLowerCase()] : [])]);
+
+      cc = [...parseAddressList(getHeader('To')), ...parseAddressList(getHeader('Cc'))]
+        .map((a) => a.email.trim())
+        // Drop anything unroutable rather than letting it reach the header.
+        // Real inboxes carry group syntax, undisclosed-recipients, and
+        // mailer noise that is not an address.
+        .filter((email) => isValidAddress(email))
+        .filter((email) => {
+          const key = email.toLowerCase();
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        });
     }
 
     // Build subject (add Re: if not already present)
-    const subject = originalSubject.startsWith('Re:') ? originalSubject : `Re: ${originalSubject}`;
+    const subject = /^re:/i.test(originalSubject.trim())
+      ? originalSubject
+      : `Re: ${originalSubject}`;
 
     return this.sendEmail(userId, {
       to,
@@ -224,9 +328,32 @@ export class GmailService {
       subject,
       body,
       isHtml,
+      attachments,
       replyToMessageId: messageId,
       threadId: originalMessage.data.threadId || undefined,
     });
+  }
+
+  /**
+   * The authenticated user's own address, used to keep replyAll from
+   * Cc-ing them on their own reply. Best-effort: a profile lookup failure
+   * degrades to a slightly noisy Cc, never a failed send.
+   */
+  private async getOwnAddress(userId: string): Promise<string | undefined> {
+    if (this.ownAddressCache.has(userId)) return this.ownAddressCache.get(userId);
+    try {
+      const gmail = await this.getClient(userId);
+      const profile = await gmail.users.getProfile({ userId: 'me' });
+      const address = profile.data.emailAddress || undefined;
+      this.ownAddressCache.set(userId, address);
+      return address;
+    } catch (error) {
+      logger.warn('[Gmail] could not resolve own address for replyAll', {
+        userId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return undefined;
+    }
   }
 
   /**
@@ -238,47 +365,41 @@ export class GmailService {
   ): Promise<{ draftId: string; message: Email }> {
     const gmail = await this.getClient(userId);
 
-    const { to, cc, bcc, subject, body, isHtml = false, replyToMessageId, threadId } = options;
+    const {
+      to,
+      cc,
+      bcc,
+      subject,
+      body,
+      isHtml = false,
+      replyToMessageId,
+      threadId,
+      attachments,
+    } = options;
 
-    logger.info('Creating email draft', { userId, to, subject });
+    logger.info('Creating email draft', {
+      userId,
+      to,
+      subject,
+      attachmentCount: attachments?.length ?? 0,
+    });
 
-    const headers: string[] = [
-      `To: ${to.join(', ')}`,
-      `Subject: ${subject}`,
-      `Content-Type: ${isHtml ? 'text/html' : 'text/plain'}; charset=utf-8`,
-    ];
+    const resolvedAttachments = await this.prepareAttachments(attachments);
 
-    if (cc?.length) {
-      headers.push(`Cc: ${cc.join(', ')}`);
-    }
-    if (bcc?.length) {
-      headers.push(`Bcc: ${bcc.join(', ')}`);
-    }
+    const headers = await this.buildOutboundHeaders(gmail, {
+      to,
+      cc,
+      bcc,
+      subject,
+      replyToMessageId,
+    });
 
-    // Add threading headers if replying
-    if (replyToMessageId) {
-      const originalMessage = await gmail.users.messages.get({
-        userId: 'me',
-        id: replyToMessageId,
-        format: 'metadata',
-        metadataHeaders: ['Message-ID', 'References'],
-      });
-
-      const originalHeaders = originalMessage.data.payload?.headers || [];
-      const messageIdHeader = originalHeaders.find((h) => h.name === 'Message-ID')?.value;
-      const referencesHeader = originalHeaders.find((h) => h.name === 'References')?.value;
-
-      if (messageIdHeader) {
-        headers.push(`In-Reply-To: ${messageIdHeader}`);
-        const references = referencesHeader
-          ? `${referencesHeader} ${messageIdHeader}`
-          : messageIdHeader;
-        headers.push(`References: ${references}`);
-      }
-    }
-
-    const email = `${headers.join('\r\n')}\r\n\r\n${body}`;
-    const encodedEmail = Buffer.from(email).toString('base64url');
+    const encodedEmail = buildRawMessage({
+      headers,
+      body,
+      isHtml,
+      attachments: resolvedAttachments,
+    });
 
     const response = await gmail.users.drafts.create({
       userId: 'me',
@@ -485,21 +606,6 @@ export class GmailService {
   }
 
   /**
-   * Parse an email address string into EmailAddress
-   */
-  private parseEmailAddress(addressStr: string): EmailAddress {
-    // Handle formats like: "Name <email@example.com>" or "email@example.com"
-    const match = addressStr.match(/^(?:"?([^"<]+)"?\s*)?<?([^>]+)>?$/);
-    if (match) {
-      return {
-        name: match[1]?.trim() || undefined,
-        email: match[2]?.trim() || addressStr.trim(),
-      };
-    }
-    return { email: addressStr.trim() };
-  }
-
-  /**
    * Map Gmail API message to our Email type
    */
   private mapMessage(message: gmail_v1.Schema$Message, includeBody = false): Email {
@@ -524,17 +630,9 @@ export class GmailService {
       labelIds,
       snippet: message.snippet || '',
       subject: getHeader('Subject'),
-      from: this.parseEmailAddress(getHeader('From')),
-      to: getHeader('To')
-        .split(',')
-        .map((e) => this.parseEmailAddress(e.trim()))
-        .filter((e) => e.email),
-      cc: getHeader('Cc')
-        ? getHeader('Cc')
-            .split(',')
-            .map((e) => this.parseEmailAddress(e.trim()))
-            .filter((e) => e.email)
-        : undefined,
+      from: parseAddress(getHeader('From')),
+      to: parseAddressList(getHeader('To')),
+      cc: getHeader('Cc') ? parseAddressList(getHeader('Cc')) : undefined,
       date: getHeader('Date'),
       body,
       attachments: attachments.length > 0 ? attachments : undefined,
