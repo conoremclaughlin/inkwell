@@ -1270,11 +1270,13 @@ describe('sweep pendingRelease backstop', () => {
           cli_poll_at: new Date().toISOString(), // terminal open, polling now
           cli_turn_at: null, // but NOT mid-turn
           // A GATED holder (its runtime refuses turns without the
-          // acknowledged marker — round four), so NULL genuinely means no
-          // turn is running. Historical hook-CLI rows like the real pr:498/
-          // pr:499 stay UNPROVEN and conservative until their runtime gates
-          // (task 0b9bb780) — per Lumen's operational note, no backfill.
-          cli_turn_proven_at: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
+          // acknowledged marker — round four), proven DURING this lease's
+          // tenure (proof ≥ acquiredAt, round five), so NULL genuinely means
+          // no turn is running. Historical hook-CLI rows like the real
+          // pr:498/pr:499 stay UNPROVEN and conservative until their runtime
+          // gates (task 0b9bb780) — per Lumen's operational note, no
+          // backfill.
+          cli_turn_proven_at: new Date().toISOString(),
         },
       ],
     };
@@ -1327,6 +1329,88 @@ describe('sweep pendingRelease backstop', () => {
     expect(stats.released).toBe(0);
     expect(stats.renewed).toBe(1); // stale-but-present → renew, exactly the pre-narrow behavior
     expect(tables.studios[0].lease).not.toBeNull();
+  });
+
+  /**
+   * Round five (Lumen): the contract claim must not outlive its owner.
+   * `ink chat --attach` can prove a session that a hook CLI later resumes;
+   * if that CLI's prompt posts are swallowed, an old proof would vouch for a
+   * turn it cannot see. Tenure scoping: the sweep only trusts proof stamped
+   * AT OR AFTER this lease's acquiredAt — a claim from a previous runtime
+   * attachment (before this lease existed) routes to the conservative path.
+   */
+  it('ignores a gated proof that predates the lease tenure — no cross-runtime inheritance', async () => {
+    resetActiveRuns();
+    const lease: StudioLease = {
+      ...freshLease({ sessionId: 'sess-inherit', threadKey: 'pr:88' }),
+      heartbeatAt: new Date(Date.now() - LEASE_STALE_MS - 60_000).toISOString(),
+      pendingRelease: { reason: 'thread-closed', requestedAt: new Date().toISOString() },
+    };
+    const tables: Record<string, Row[]> = {
+      studios: [
+        { id: 's-inherit', user_id: 'u', lease: lease as unknown as Row, worktree_path: null },
+      ],
+      studio_lease_events: [],
+      inbox_threads: [],
+      agent_identities: [],
+      sessions: [
+        {
+          id: 'sess-inherit',
+          user_id: 'u',
+          ended_at: null,
+          status: 'active',
+          cli_attached: true,
+          cli_poll_at: new Date().toISOString(),
+          cli_turn_at: null,
+          // Proven by an EARLIER Ink attachment, hours before this lease was
+          // acquired — stale testimony from a previous owner.
+          cli_turn_proven_at: new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString(),
+        },
+      ],
+    };
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+    const stats = await service.sweepExpiredLeases();
+
+    expect(stats.released).toBe(0);
+    expect(stats.renewed).toBe(1);
+    expect(tables.studios[0].lease).not.toBeNull();
+  });
+});
+
+describe('touchStudioLeaseForSession — the prompt fence (round five)', () => {
+  afterEach(() => resetActiveRuns());
+
+  it('reports HELD only after a successful exact-CAS heartbeat touch', async () => {
+    const lease = freshLease({ sessionId: 'sess-t', threadKey: 'pr:90' });
+    const before = lease.heartbeatAt;
+    const tables: Record<string, Row[]> = {
+      studios: [{ id: 's-t', user_id: 'u', lease: lease as unknown as Row, worktree_path: null }],
+      studio_lease_events: [],
+      inbox_threads: [],
+      agent_identities: [],
+      sessions: [],
+    };
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+    await expect(service.touchStudioLeaseForSession('s-t', 'sess-t', 'u')).resolves.toBe(true);
+    const after = (tables.studios[0].lease as unknown as StudioLease).heartbeatAt;
+    expect(after >= before).toBe(true); // the touch IS the fence: heartbeat bumped via CAS
+  });
+
+  it('reports NOT HELD for a released or foreign lease — a plain read is never enough', async () => {
+    const foreign = freshLease({ sessionId: 'sess-other', threadKey: 'pr:91' });
+    const tables: Record<string, Row[]> = {
+      studios: [
+        { id: 's-gone', user_id: 'u', lease: null, worktree_path: null },
+        { id: 's-f', user_id: 'u', lease: foreign as unknown as Row, worktree_path: null },
+      ],
+      studio_lease_events: [],
+      inbox_threads: [],
+      agent_identities: [],
+      sessions: [],
+    };
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+    await expect(service.touchStudioLeaseForSession('s-gone', 'sess-t', 'u')).resolves.toBe(false);
+    await expect(service.touchStudioLeaseForSession('s-f', 'sess-t', 'u')).resolves.toBe(false);
   });
 
   it('still defers a pendingRelease while the holder is MID-TURN (cli_turn_at open)', async () => {

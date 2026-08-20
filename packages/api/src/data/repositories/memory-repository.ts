@@ -1508,7 +1508,7 @@ export class MemoryRepository {
       cliAttached?: boolean;
       cliPollAt?: string;
       cliTurnAt?: string | null;
-      cliTurnProvenAt?: string;
+      cliTurnProvenAt?: string | null;
       alias?: string | null;
       activeThreadKey?: string | null;
       endedAt?: Date | null;

@@ -373,7 +373,15 @@ export class StudioLeaseService {
    * live-missed-prompt state are identical (round four). FAILS CLOSED: an
    * unreadable proof reports UNPROVEN → conservative release rule.
    */
-  private async hasProvenTurnSignal(sessionId: string, userId?: string): Promise<boolean> {
+  private async hasProvenTurnSignal(
+    sessionId: string,
+    userId?: string,
+    // Proof must postdate this instant (round five): a gated runtime's claim
+    // cannot outlive its ownership. The sweep passes the lease's acquiredAt,
+    // so a proof stamped by an earlier Ink attachment never vouches for a
+    // lease acquired after a runtime/backend transition.
+    sinceIso?: string
+  ): Promise<boolean> {
     let query = this.supabase.from('sessions').select('cli_turn_proven_at').eq('id', sessionId);
     if (userId) query = query.eq('user_id', userId);
     const { data, error } = await query.maybeSingle();
@@ -384,37 +392,51 @@ export class StudioLeaseService {
       });
       return false;
     }
-    return Boolean(data?.cli_turn_proven_at);
+    const proven = data?.cli_turn_proven_at;
+    if (!proven) return false;
+    return !sinceIso || proven >= sinceIso;
   }
 
   /**
-   * Is this studio's lease currently held by this session? The lifecycle
-   * route's prompt fence: read AFTER the synchronous renewal, so either the
-   * renewal beat a concurrent release (release CAS lost — lease survives) or
-   * the release won (this reads the cleared/foreign lease and the gated
-   * caller refuses the turn). FAILS CLOSED: unreadable → not held.
+   * The lifecycle route's prompt fence: HELD is only reported after a
+   * successful exact-guarded CAS touch of this studio's lease (round five —
+   * a plain read could observe a snapshot an already-running sweep is about
+   * to CAS-clear; a renewal failure was silently ignored). The touch bumps
+   * heartbeatAt guarded on the exact prior lease, so a concurrent release
+   * either already won (we read the cleared/foreign lease → NOT HELD) or
+   * loses its own CAS to ours. One re-read absorbs a benignly lost CAS
+   * (e.g., the session-wide renewal racing this touch); a second loss means
+   * real contention and reports NOT HELD. FAILS CLOSED on any error.
    */
-  async isStudioLeaseHeldBySession(
+  async touchStudioLeaseForSession(
     studioId: string,
     sessionId: string,
     userId: string
   ): Promise<boolean> {
-    const { data, error } = await this.supabase
-      .from('studios')
-      .select('lease')
-      .eq('id', studioId)
-      .eq('user_id', userId)
-      .maybeSingle();
-    if (error) {
-      logger.warn('[StudioLease] Lease-held read failed — reporting NOT HELD (fail closed)', {
-        studioId,
-        sessionId,
-        error: error.message,
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const { data, error } = await this.supabase
+        .from('studios')
+        .select('lease')
+        .eq('id', studioId)
+        .eq('user_id', userId)
+        .maybeSingle();
+      if (error) {
+        logger.warn('[StudioLease] Lease-held read failed — reporting NOT HELD (fail closed)', {
+          studioId,
+          sessionId,
+          error: error.message,
+        });
+        return false;
+      }
+      const lease = parseStudioLease(data?.lease);
+      if (!lease || lease.quarantined || lease.sessionId !== sessionId) return false;
+      const touched = await this.casLease(studioId, userId, lease, {
+        ...lease,
+        heartbeatAt: new Date().toISOString(),
       });
-      return false;
+      if (touched) return true;
     }
-    const lease = parseStudioLease(data?.lease);
-    return Boolean(lease && !lease.quarantined && lease.sessionId === sessionId);
+    return false;
   }
 
   async isSessionMidTurn(sessionId: string, userId?: string): Promise<boolean> {
@@ -1362,7 +1384,11 @@ export class StudioLeaseService {
           // AND (stale OR terminal) — and, below, to sweep renewal while its
           // presence persists. Proven sessions release at the narrow proof,
           // which is the pr:498/pr:499 fix.
-          const proven = await this.hasProvenTurnSignal(lease.sessionId, row.user_id);
+          const proven = await this.hasProvenTurnSignal(
+            lease.sessionId,
+            row.user_id,
+            lease.acquiredAt // proof must postdate THIS lease's tenure (round five)
+          );
           if (proven || (await this.canReleaseNow(lease, row.user_id))) {
             const ok = await this.releaseStudio(row.id, row.user_id, lease, row.worktree_path, {
               reason: lease.pendingRelease.reason,

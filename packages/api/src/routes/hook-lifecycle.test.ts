@@ -129,13 +129,15 @@ describe('hook-lifecycle CLI turn signal', () => {
     expect('cliTurnProvenAt' in attachUpdates).toBe(false);
   });
 
-  it('an UNGATED prompt opens the turn but never stamps the proof (round four)', async () => {
+  it('an UNGATED prompt opens the turn and CLEARS the proof (rounds four–five)', async () => {
     // Hook CLIs proceed even when their prompt post is swallowed, so their
     // idle state and their live-missed-prompt state are identical — a
     // historical proof bit from them would vouch for turns it cannot see.
+    // And an ungated prompt is an ownership boundary: a non-gating producer
+    // just took a turn, so any earlier gated claim must not be inherited.
     const updates = await post({ lifecycle: 'running', event: 'prompt' });
     expect(typeof updates.cliTurnAt).toBe('string');
-    expect('cliTurnProvenAt' in updates).toBe(false);
+    expect(updates.cliTurnProvenAt).toBeNull();
   });
 
   it('a gated prompt with a worktree studio gets the fenced lease-held report', async () => {
@@ -167,9 +169,12 @@ describe('hook-lifecycle CLI turn signal', () => {
     expect('studioLeaseHeld' in body2).toBe(false);
   });
 
-  it('an explicit detach clears the marker (process proof)', async () => {
+  it('an explicit detach clears the marker AND the gated proof (process proof)', async () => {
     const updates = await post({ cliAttached: false });
     expect(updates.cliTurnAt).toBeNull();
+    // Round five: the contract claim dies with its owner — whatever attaches
+    // next (possibly an ungated hook CLI resuming the session) must re-prove.
+    expect(updates.cliTurnProvenAt).toBeNull();
   });
 
   it('only the real stop event closes the turn; post-compact idle does not', async () => {
