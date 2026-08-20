@@ -124,6 +124,34 @@ describe('hook-lifecycle CLI turn signal', () => {
     expect('cliTurnAt' in attachUpdates).toBe(false);
   });
 
+  it('a prompt with a worktree studio gets the fenced lease-held report', async () => {
+    // The fake supabase holds no studios — the truthful answer is NOT HELD,
+    // which the gated caller treats as unacknowledged (no turn under a
+    // released lease). The field exists exactly when a fence is meaningful.
+    const resp = await fetch(`${baseUrl}/api/hooks/lifecycle`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer test' },
+      body: JSON.stringify({
+        sessionId: 'session-1',
+        lifecycle: 'running',
+        event: 'prompt',
+        studioId: '5bea57f3-6b24-4126-abe4-0d1cc2bd9647',
+      }),
+    });
+    expect(resp.status).toBe(200);
+    const body = (await resp.json()) as Record<string, unknown>;
+    expect(body.studioLeaseHeld).toBe(false);
+
+    // No studioId (main/studioless senders): the field is absent, never a veto.
+    const resp2 = await fetch(`${baseUrl}/api/hooks/lifecycle`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer test' },
+      body: JSON.stringify({ sessionId: 'session-1', lifecycle: 'running', event: 'prompt' }),
+    });
+    const body2 = (await resp2.json()) as Record<string, unknown>;
+    expect('studioLeaseHeld' in body2).toBe(false);
+  });
+
   it('an explicit detach clears the marker (process proof)', async () => {
     const updates = await post({ cliAttached: false });
     expect(updates.cliTurnAt).toBeNull();

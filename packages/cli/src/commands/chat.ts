@@ -47,6 +47,7 @@ import {
   contextBudgetForWindow as defaultContextBudget,
 } from '../repl/context-limits.js';
 import { parseSlashCommand } from '../repl/slash.js';
+import { createTurnSignal, turnGateDecision } from '../repl/turn-signal.js';
 import { createPollGate } from '../repl/poll-gate.js';
 import {
   parseEvictSelection,
@@ -5508,6 +5509,22 @@ export async function runChat(options: ChatOptions): Promise<void> {
       statusLane.markPromptRefreshed();
     }
   };
+  // The REPL's half of the hook-owned turn marker (PR #506 P1, Lumen):
+  // `cli_turn_at` is the lease machinery's only turn signal for CLI
+  // processes outside the API run registry, and an interactive Ink turn set
+  // neither signal — the whole turn ran invisible to liveness, deferral, and
+  // boundary logic. The route stays the single writer; the REPL only posts
+  // the same prompt/stop events the backend lifecycle hooks send.
+  const turnSignal = createTurnSignal({
+    getSessionId: () => runtime.sessionId,
+    getStudioId: () => currentPcpStudioId(),
+    agentId,
+    getServerUrl: async () => (await import('../lib/pcp-mcp.js')).getPcpServerUrl(),
+    getToken: async (serverUrl) =>
+      (await import('../auth/tokens.js')).getValidAccessToken(serverUrl),
+    workingDir: process.cwd(),
+    onDebug: (event, detail) => sbDebugLog('chat', event, detail),
+  });
   const enqueueTurn = (
     raw: string,
     source: 'user' | 'inbox-auto' | 'system' = 'user',
@@ -5556,11 +5573,25 @@ export async function runChat(options: ChatOptions): Promise<void> {
       } else {
         statusLane.setTurnActive(true);
       }
+      // Turn open before any backend work; turn close on EVERY exit path via
+      // finally. The directions differ (round-two P1): a missed STOP decays
+      // toward holding and is backstopped by the exit detach, but a missed
+      // PROMPT runs this turn INVISIBLE to the lease machinery — liveness,
+      // deferral, and boundary logic all read the marker. So an
+      // unacknowledged open on studio-backed work refuses the turn instead
+      // of running unprotected.
+      const turnProtected = await turnSignal.open();
       try {
+        const gate = turnGateDecision(runtime.sessionId, turnProtected, currentPcpStudioId());
+        if (!gate.allow) {
+          printLine(chalk.red(`Turn not started: ${gate.reason}`));
+          return;
+        }
         await runUserTurn(raw, source, displayLabel);
       } catch (error) {
         printLine(chalk.red(`Turn failed: ${String(error)}`));
       } finally {
+        await turnSignal.close();
         if (inkRepl) {
           inkRepl.setWaiting(false);
         } else {
@@ -5835,6 +5866,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
     if (pendingTurns > 0) {
       await turnQueue;
     }
+    // Process-proof detach (missed-stop backstop, round-two P1): clears any
+    // cli_turn_at this process opened but failed to close, and marks the
+    // session unattached so trigger spawns resume.
+    await turnSignal.detach();
     // Unref stdio so lingering streams (e.g. piped stdin from InkRunner)
     // don't prevent the event loop from draining. Guarded: some stdin
     // stream types (already-closed pipes) don't implement unref.
@@ -7326,6 +7361,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
     console.log(chalk.dim(`Waiting for ${pendingTurns} pending turn(s) to finish...`));
     await turnQueue;
   }
+
+  // Process-proof detach (missed-stop backstop, round-two P1): clears any
+  // cli_turn_at this process opened but failed to close, and marks the
+  // session unattached so trigger spawns resume.
+  await turnSignal.detach();
 
   // Cancel any pending remote approval requests
   approvalManager.cancelAll();
