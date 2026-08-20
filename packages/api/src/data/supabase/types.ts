@@ -4074,6 +4074,16 @@ export type Database = {
           o_id: string | null;
         };
       };
+      grant_studio_lease: {
+        Args: {
+          p_studio_id: string;
+          p_user_id: string;
+          p_lease: Json;
+          p_expected_prior?: Json | null;
+          p_stale_ms?: number;
+        };
+        Returns: Json;
+      };
       get_unread_thread_candidates: {
         Args: {
           p_agent_id: string;

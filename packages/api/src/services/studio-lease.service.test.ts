@@ -146,6 +146,57 @@ function makeFakeSupabase(tables: Record<string, Row[]>, hooks?: FakeHooks) {
         insert: (payload: Row) => new FakeQuery(table, rows, 'insert', payload, hooks, counters),
       };
     },
+    // grant_studio_lease, faked with the SAME semantics as the SQL function
+    // (Phase 6b): sibling scan over rows sharing the worktree_path, then the
+    // vacant/exact-prior CAS — atomic here because JS is single-threaded, as
+    // the advisory xact lock makes it in Postgres. Keeping the fake at parity
+    // means the ladder tests exercise real grant behavior, path checks
+    // included, rather than a stubbed outcome.
+    async rpc(fn: string, args: Row) {
+      if (fn !== 'grant_studio_lease') {
+        return { data: null, error: { message: `no fake for rpc ${fn}` } };
+      }
+      const studios = tables['studios'] ?? [];
+      const target = studios.find((r) => r.id === args.p_studio_id && r.user_id === args.p_user_id);
+      if (!target) return { data: { outcome: 'lost' }, error: null };
+
+      const pLease = args.p_lease as Row;
+      const staleMs = (args.p_stale_ms as number) ?? 30 * 60 * 1000;
+      const conflict = studios.find((r) => {
+        if (r.id === args.p_studio_id) return false;
+        if (r.user_id !== args.p_user_id) return false;
+        if (r.worktree_path !== target.worktree_path) return false;
+        const sib = r.lease as Row | null;
+        if (!sib) return false;
+        if (sib.threadKey === pLease.threadKey) return false;
+        const hb = Date.parse(String(sib.heartbeatAt ?? sib.acquiredAt ?? ''));
+        return Number.isFinite(hb) && Date.now() - hb <= staleMs;
+      });
+      if (conflict) {
+        return {
+          data: {
+            outcome: 'path-conflict',
+            conflictStudioId: conflict.id,
+            conflictHolder: conflict.lease,
+          },
+          error: null,
+        };
+      }
+
+      const acquirable = target.status === 'active' || target.status === 'idle';
+      const prior = args.p_expected_prior as Row | null;
+      const priorMatches = prior
+        ? !!target.lease &&
+          (target.lease as Row).sessionId === prior.sessionId &&
+          (target.lease as Row).acquiredAt === prior.acquiredAt &&
+          (target.lease as Row).heartbeatAt === prior.heartbeatAt
+        : target.lease == null;
+      if (acquirable && priorMatches) {
+        target.lease = pLease;
+        return { data: { outcome: 'granted' }, error: null };
+      }
+      return { data: { outcome: 'lost' }, error: null };
+    },
   } as never;
 }
 
@@ -226,6 +277,45 @@ describe('StudioLeaseService.acquire', () => {
     expect((tables.studios[0].lease as StudioLease).reason).toBe('route-pattern');
     expect(tables.studio_lease_events).toHaveLength(1);
     expect(tables.studio_lease_events[0].event).toBe('acquired');
+  });
+
+  it('refuses a VACANT row when a sibling row holds the same tree for another thread (6b)', async () => {
+    // Several studio rows can name one checkout (resolveMainStudio: one row
+    // per SB per path). This row's vacancy is a lie about the TREE — the
+    // grant is path-serialized and must surface the sibling's holder so the
+    // caller diverts, exactly as for a row-level conflict.
+    const sibling = freshLease({ sessionId: 'session-sibling', threadKey: 'pr:OTHER' });
+    tables.studios[0].worktree_path = null; // both rows: worktree unset in this harness
+    tables.studios.push({
+      id: 'studio-2',
+      user_id: 'user-1',
+      status: 'active',
+      lease: sibling as unknown as Row,
+      worktree_path: null,
+    });
+
+    const result = await service.acquire(req);
+    expect(result.acquired).toBe(false);
+    if (!result.acquired) {
+      expect(result.holder?.threadKey).toBe('pr:OTHER');
+    }
+    // Our row stays vacant — nothing was granted anywhere.
+    expect(tables.studios[0].lease).toBeNull();
+    // The contradiction is on the record.
+    expect(tables.studio_lease_events.map((e) => e.event)).toContain('conflict');
+  });
+
+  it('a STALE sibling on the same tree does not block a vacant grant (6b)', async () => {
+    tables.studios[0].worktree_path = null;
+    tables.studios.push({
+      id: 'studio-2',
+      user_id: 'user-1',
+      status: 'active',
+      lease: staleLease({ sessionId: 'session-sibling', threadKey: 'pr:OTHER' }) as unknown as Row,
+      worktree_path: null,
+    });
+    const result = await service.acquire(req);
+    expect(result.acquired).toBe(true);
   });
 
   it('never leases a cleaned studio — even a vacant one (round 7)', async () => {

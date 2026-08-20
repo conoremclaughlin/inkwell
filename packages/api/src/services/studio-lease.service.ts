@@ -45,6 +45,7 @@ import type { Database, Json } from '../data/supabase/types';
 import { hasActiveRun } from './sessions/active-runs';
 import { resolveIdentityId } from '../auth/resolve-identity';
 import { logger } from '../utils/logger';
+import { grantStudioLease, type GrantOutcome } from './lease-grant';
 
 const execFileAsync = promisify(execFile);
 
@@ -407,7 +408,8 @@ export class StudioLeaseService {
         return outcome;
       }
 
-      if (await this.casVacant(req, lease)) {
+      const vacant = await this.grantLease(req, lease, null);
+      if (vacant.outcome === 'granted') {
         await this.logEvent(req.userId, req.studioId, 'acquired', {
           sessionId: req.sessionId,
           threadKey: req.threadKey,
@@ -416,6 +418,21 @@ export class StudioLeaseService {
           reason: req.reason,
         });
         return { acquired: true, lease };
+      }
+      if (vacant.outcome === 'path-conflict') {
+        // Another thread holds this WORKING TREE through a sibling studio row
+        // (several rows can name one checkout — resolveMainStudio gives each
+        // SB its own row per path). This row's vacancy was a lie about the
+        // tree; surface the sibling's holder so the caller diverts exactly as
+        // it would for a row-level conflict (Phase 6b, task c82daba1).
+        await this.logEvent(req.userId, req.studioId, 'conflict', {
+          sessionId: req.sessionId,
+          threadKey: req.threadKey,
+          agentId: req.agentId,
+          sbId,
+          reason: `path held by sibling studio ${vacant.conflictStudioId} (${vacant.conflictHolder?.threadKey ?? 'unknown thread'})`,
+        });
+        return { acquired: false, holder: vacant.conflictHolder };
       }
       // Lost the vacant CAS — loop and re-validate from scratch.
     }
@@ -539,23 +556,27 @@ export class StudioLeaseService {
     });
   }
 
-  private async casVacant(req: AcquireRequest, lease: StudioLease): Promise<boolean> {
-    const { data, error } = await this.supabase
-      .from('studios')
-      .update({ lease: lease as unknown as Json })
-      .eq('id', req.studioId)
-      .eq('user_id', req.userId)
-      .in('status', StudioLeaseService.ACQUIRABLE_STATUSES)
-      .is('lease', null)
-      .select('id');
-    if (error) {
-      logger.warn('[StudioLease] acquire CAS failed', {
-        studioId: req.studioId,
-        error: error.message,
-      });
-      return false;
-    }
-    return Boolean(data?.length);
+  /**
+   * Every GRANT goes through the path-serialized grant_studio_lease RPC:
+   * advisory xact lock on (user, worktree_path) held across the sibling scan
+   * AND the CAS, so two rows naming one tree cannot both admit a writer.
+   * expectedPrior NULL = vacant grant; non-null = exact-prior handover/adopt
+   * (v14 invariant: grants CAS from a validated snapshot). Non-grant
+   * transitions (release, renewal, claims, quarantine) stay on casLease —
+   * they never ADD a writer to a tree.
+   */
+  private async grantLease(
+    req: AcquireRequest,
+    lease: StudioLease,
+    expectedPrior: StudioLease | null
+  ): Promise<GrantOutcome> {
+    return grantStudioLease(this.supabase, {
+      studioId: req.studioId,
+      userId: req.userId,
+      lease,
+      expectedPrior,
+      staleMs: LEASE_STALE_MS,
+    });
   }
 
   /**
@@ -713,11 +734,14 @@ export class StudioLeaseService {
       }
 
       // Hand over: claim (our token) → requester's lease. Losing this CAS
-      // means the claim aged out and was taken — abort, never assume.
-      const handedOver = await this.casLease(req.studioId, req.userId, recovery, lease, {
-        requireAcquirableStatus: true,
-      });
-      if (!handedOver) {
+      // means the claim aged out and was taken — abort, never assume. The
+      // grant is path-serialized: a fresh foreign lease on a sibling row for
+      // the same tree blocks it (Phase 6b).
+      const handedOver = await this.grantLease(req, lease, recovery);
+      if (handedOver.outcome === 'path-conflict') {
+        return { acquired: false, holder: handedOver.conflictHolder };
+      }
+      if (handedOver.outcome !== 'granted') {
         logger.error('[StudioLease] Recovery claim lost before handover; refusing', {
           studioId: req.studioId,
           requestingSessionId: req.sessionId,
@@ -746,11 +770,12 @@ export class StudioLeaseService {
       return { acquired: true, lease, reclaimedFrom: holder };
     }
 
-    // No worktree to rescue — hand the claim straight over.
-    const handedOver = await this.casLease(req.studioId, req.userId, recovery, lease, {
-      requireAcquirableStatus: true,
-    });
-    if (!handedOver) {
+    // No worktree to rescue — hand the claim straight over (path-serialized).
+    const handedOver = await this.grantLease(req, lease, recovery);
+    if (handedOver.outcome === 'path-conflict') {
+      return { acquired: false, holder: handedOver.conflictHolder };
+    }
+    if (handedOver.outcome !== 'granted') {
       const reread = await this.getLease(req.studioId, req.userId);
       return { acquired: false, holder: reread?.lease ?? null };
     }
@@ -828,11 +853,15 @@ export class StudioLeaseService {
         heartbeatAt: now,
         reason: req.reason ?? holder.reason,
       };
-      const won = await this.casLease(req.studioId, req.userId, holder, adopted, {
-        requireAcquirableStatus: true,
-      });
-      if (won) {
+      const won = await this.grantLease(req, adopted, holder);
+      if (won.outcome === 'granted') {
         return { acquired: true, lease: adopted };
+      }
+      if (won.outcome === 'path-conflict') {
+        // A different thread freshly holds the tree through a sibling row.
+        // Adoption of THIS row would still put a second thread on the tree —
+        // refuse and let the caller divert (Phase 6b).
+        return { acquired: false, holder: won.conflictHolder };
       }
       // Lost the adopt race. Ownership is NEVER accepted from an unvalidated
       // snapshot — not even when the reread shows our own session holding the

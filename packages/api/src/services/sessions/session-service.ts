@@ -49,6 +49,7 @@ import { serializeError } from '../../utils/serialize-error.js';
 import { resolveTaskGroupForThreadKey } from '../task-group-resolver.js';
 import { getRunnerFilesDir } from '../sandbox/orchestrator.js';
 import { StudioLeaseService, isLeaseStale } from '../studio-lease.service.js';
+import { ThreadKeyService } from '../thread-key/thread-key.service.js';
 import { StudioOverflowService } from '../studio-overflow.service.js';
 import { StudiosRepository, type Studio } from '../../data/repositories/studios.repository.js';
 import { logger } from '../../utils/logger.js';
@@ -570,6 +571,24 @@ export class SessionService implements ISessionService {
     const leases = this.getLeaseService();
     if (!leases || !ctx.threadKey || !session.studioId) return session;
 
+    // Phase 6b: acquisition on INTENT, not arrival. Presence-typed threads
+    // bind to the studio without taking the write lease — they run FROM the
+    // directory and tolerate drift (task c82daba1 rule 2). Intent comes from
+    // the thread's STORED pinned key_type via the registry (grammar v4);
+    // never a live re-parse. MECHANISM ONLY until 6e: every template is
+    // write and presence overrides are rejected at the tool surface, so no
+    // production thread classifies as presence yet — the flip ships
+    // atomically with escalation-on-write.
+    const intent = await this.resolveWriteIntent(ctx.userId, ctx.threadKey);
+    if (intent === 'presence') {
+      logger.debug('[StudioLease] Presence thread — studio bound without lease', {
+        sessionId: session.id,
+        studioId: session.studioId,
+        threadKey: ctx.threadKey,
+      });
+      return session;
+    }
+
     const boundStudioId = session.studioId;
     try {
       const result = await leases.acquire({
@@ -646,6 +665,35 @@ export class SessionService implements ISessionService {
         // default working directory rather than the unverified worktree.
         return { ...session, studioId: undefined };
       }
+    }
+  }
+
+  /**
+   * Write intent for a thread, from its STORED pinned key_type (grammar v4 —
+   * the DB pinned it at creation; consumers never re-parse) resolved through
+   * the type registry. FAILS TOWARD WRITE on every failure mode — missing
+   * thread row, lookup error, registry error — because failing toward
+   * presence would let a session mutate an unleased tree (the registry's own
+   * read-failure rule, applied at this layer too).
+   */
+  private async resolveWriteIntent(
+    userId: string,
+    threadKey: string
+  ): Promise<'write' | 'presence'> {
+    if (!this.supabase) return 'write';
+    try {
+      const { data, error } = await this.supabase
+        .from('inbox_threads')
+        .select('key_type')
+        .eq('user_id', userId)
+        .eq('thread_key', threadKey)
+        .maybeSingle();
+      if (error) return 'write';
+      const service = new ThreadKeyService(this.supabase);
+      const behavior = await service.typeBehavior(userId, data?.key_type ?? null);
+      return behavior.writeIntent;
+    } catch {
+      return 'write';
     }
   }
 
