@@ -47,7 +47,7 @@ import {
   contextBudgetForWindow as defaultContextBudget,
 } from '../repl/context-limits.js';
 import { parseSlashCommand } from '../repl/slash.js';
-import { createTurnSignal } from '../repl/turn-signal.js';
+import { createTurnSignal, turnMustFailClosed } from '../repl/turn-signal.js';
 import { createPollGate } from '../repl/poll-gate.js';
 import {
   parseEvictSelection,
@@ -5573,10 +5573,21 @@ export async function runChat(options: ChatOptions): Promise<void> {
         statusLane.setTurnActive(true);
       }
       // Turn open before any backend work; turn close on EVERY exit path via
-      // finally — a thrown turn must still clear the marker, or the lease
-      // outlives the process it protects.
-      await turnSignal.open();
+      // finally. The directions differ (round-two P1): a missed STOP decays
+      // toward holding and is backstopped by the exit detach, but a missed
+      // PROMPT would run this turn unproven — a healthy sweep then clears a
+      // pendingRelease under the live process. So an unacknowledged open on
+      // studio-backed work refuses the turn instead of running unprotected.
+      const turnProtected = await turnSignal.open();
       try {
+        if (turnMustFailClosed(turnProtected, Boolean(currentPcpStudioId()))) {
+          printLine(
+            chalk.red(
+              'Turn not started: the server did not acknowledge turn ownership, so this worktree’s lease is unprotected. Check server connectivity (`ink doctor`) and resend.'
+            )
+          );
+          return;
+        }
         await runUserTurn(raw, source, displayLabel);
       } catch (error) {
         printLine(chalk.red(`Turn failed: ${String(error)}`));
@@ -5856,6 +5867,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
     if (pendingTurns > 0) {
       await turnQueue;
     }
+    // Process-proof detach (missed-stop backstop, round-two P1): clears any
+    // cli_turn_at this process opened but failed to close, and marks the
+    // session unattached so trigger spawns resume.
+    await turnSignal.detach();
     // Unref stdio so lingering streams (e.g. piped stdin from InkRunner)
     // don't prevent the event loop from draining. Guarded: some stdin
     // stream types (already-closed pipes) don't implement unref.
@@ -7347,6 +7362,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
     console.log(chalk.dim(`Waiting for ${pendingTurns} pending turn(s) to finish...`));
     await turnQueue;
   }
+
+  // Process-proof detach (missed-stop backstop, round-two P1): clears any
+  // cli_turn_at this process opened but failed to close, and marks the
+  // session unattached so trigger spawns resume.
+  await turnSignal.detach();
 
   // Cancel any pending remote approval requests
   approvalManager.cancelAll();

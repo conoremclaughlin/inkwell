@@ -8,21 +8,27 @@
  * turns in its own process and, before this module, never posted the
  * `prompt`/`stop` lifecycle events that own the marker. Consequence (PR #506
  * P1, Lumen): a `pendingRelease` stamped on the session's lease was completed
- * by the sweep while a REPL turn was still running in the worktree — the
- * exact premature-release direction the presence/mid-turn split exists to
- * rule out.
+ * by the sweep while a REPL turn was still running in the worktree.
  *
  * The server route (`/api/hooks/lifecycle`) stays the single writer:
- *   - `open()`  → `event: 'prompt'`  — sets `cli_turn_at`, renews the lease
- *   - `close()` → `event: 'stop'`    — clears it and runs the lease boundary,
+ *   - `open()`   → `event: 'prompt'` — sets `cli_turn_at`, renews the lease
+ *   - `close()`  → `event: 'stop'`   — clears it and runs the lease boundary,
  *     which is what completes a release the turn itself requested
+ *   - `detach()` → `cliAttached: false` — process-proof that this process
+ *     left; clears the marker. The exit-path fallback for a missed stop.
  *
- * Failure posture matches the backend lifecycle hooks (`hooks.ts`): posts are
- * non-fatal and never break the turn. A missed `prompt` degrades to the
- * pre-signal behavior for that one turn; a missed `stop` leaves the marker
- * open until the next turn's stop or an explicit detach (`cliAttached:
- * false`) — the marker deliberately has no wall-time expiry, so errors decay
- * toward HOLDING a lease, never toward releasing one early.
+ * Failure semantics are DIRECTIONAL, not symmetric (round-two P1):
+ *   - A missed `prompt` fails toward PREMATURE RELEASE — the turn would run
+ *     unproven, and a healthy sweep clears any pendingRelease under the live
+ *     process. So `open()` retries, then reports `false`, and the caller MUST
+ *     fail closed for studio-backed work: do not start the turn without the
+ *     acknowledged marker (`turnMustFailClosed`).
+ *   - A missed `stop` fails toward HOLDING — the unbounded marker stays open.
+ *     `close()` retries; the next turn's stop or the REPL exit `detach()`
+ *     (cleanup path in chat.ts) reconciles it. A hard crash (SIGKILL) leaves
+ *     the marker for process-proof recovery — a new attach or explicit
+ *     detach — per the trigger-studio-routing v14 contract; there is
+ *     deliberately no wall-time expiry.
  */
 
 export interface TurnSignalDeps {
@@ -35,48 +41,95 @@ export interface TurnSignalDeps {
   workingDir: string;
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
+  /** Delay between the two post attempts; tests set 0. */
+  retryDelayMs?: number;
   onDebug?: (event: string, detail: Record<string, unknown>) => void;
 }
 
 export interface TurnSignal {
-  /** Turn is starting: post `prompt` (marker set, lease renewed). */
-  open(): Promise<void>;
-  /** Turn is over — every exit path: post `stop` (marker cleared, boundary). */
-  close(): Promise<void>;
+  /**
+   * Turn is starting. Resolves `true` when protection is established (marker
+   * write acknowledged 2xx) or not needed (no PCP session); `false` when the
+   * write could not be confirmed — the caller decides via
+   * `turnMustFailClosed` whether the turn may run.
+   */
+  open(): Promise<boolean>;
+  /** Turn is over — every exit path. Resolves `true` on acknowledged stop. */
+  close(): Promise<boolean>;
+  /** Process is leaving — REPL cleanup path. Clears the marker server-side. */
+  detach(): Promise<boolean>;
 }
 
+/**
+ * The fail-closed policy, as a visible unit: an unacknowledged turn-open on
+ * studio-backed work must refuse the turn. Sessionless / studioless turns
+ * have no lease to endanger and stay best-effort.
+ */
+export function turnMustFailClosed(opened: boolean, studioBacked: boolean): boolean {
+  return !opened && studioBacked;
+}
+
+type PostBody = Record<string, unknown>;
+
 export function createTurnSignal(deps: TurnSignalDeps): TurnSignal {
-  const post = async (event: 'prompt' | 'stop'): Promise<void> => {
-    const sessionId = deps.getSessionId();
-    if (!sessionId) return;
-    try {
-      const serverUrl = (await deps.getServerUrl()).replace(/\/+$/, '');
-      const token = await deps.getToken(serverUrl);
-      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-      if (token) headers.Authorization = `Bearer ${token}`;
-      const fetchImpl = deps.fetchImpl ?? fetch;
-      const resp = await fetchImpl(`${serverUrl}/api/hooks/lifecycle`, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({
-          sessionId,
-          lifecycle: event === 'prompt' ? 'running' : 'idle',
-          event,
-          agentId: deps.agentId,
-          workingDir: deps.workingDir,
-        }),
-        signal: AbortSignal.timeout(deps.timeoutMs ?? 5000),
-      });
-      if (!resp.ok) {
-        deps.onDebug?.('turn_signal_post_failed', { event, sessionId, status: resp.status });
-      }
-    } catch (error) {
-      deps.onDebug?.('turn_signal_post_error', { event, sessionId, error: String(error) });
-    }
+  const attemptPost = async (body: PostBody): Promise<boolean> => {
+    const serverUrl = (await deps.getServerUrl()).replace(/\/+$/, '');
+    const token = await deps.getToken(serverUrl);
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const fetchImpl = deps.fetchImpl ?? fetch;
+    const resp = await fetchImpl(`${serverUrl}/api/hooks/lifecycle`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(deps.timeoutMs ?? 5000),
+    });
+    return resp.ok;
   };
 
+  // Two attempts total: one retry absorbs transient blips (the disk-full
+  // incident's ENOSPC spawn failures, a mid-restart server) without letting a
+  // dead server stall the REPL for long.
+  const post = async (label: string, body: PostBody): Promise<boolean> => {
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        if (await attemptPost(body)) return true;
+        deps.onDebug?.('turn_signal_post_failed', { label, attempt, ...body });
+      } catch (error) {
+        deps.onDebug?.('turn_signal_post_error', { label, attempt, error: String(error) });
+      }
+      if (attempt === 1) {
+        await new Promise((r) => setTimeout(r, deps.retryDelayMs ?? 250));
+      }
+    }
+    return false;
+  };
+
+  const lifecycleBody = (event: 'prompt' | 'stop', sessionId: string): PostBody => ({
+    sessionId,
+    lifecycle: event === 'prompt' ? 'running' : 'idle',
+    event,
+    agentId: deps.agentId,
+    workingDir: deps.workingDir,
+  });
+
   return {
-    open: () => post('prompt'),
-    close: () => post('stop'),
+    async open() {
+      const sessionId = deps.getSessionId();
+      if (!sessionId) return true; // nothing leased, nothing to prove
+      return post('open', lifecycleBody('prompt', sessionId));
+    },
+    async close() {
+      const sessionId = deps.getSessionId();
+      if (!sessionId) return true;
+      return post('close', lifecycleBody('stop', sessionId));
+    },
+    async detach() {
+      const sessionId = deps.getSessionId();
+      if (!sessionId) return true;
+      // cliAttached:false is the route's process-proof detach — it clears the
+      // marker without needing a lifecycle value.
+      return post('detach', { sessionId, cliAttached: false, agentId: deps.agentId });
+    },
   };
 }
