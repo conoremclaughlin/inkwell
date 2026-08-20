@@ -143,14 +143,6 @@ export function isValidAddress(address: string): boolean {
   return /^[^\s@,<>"]+@[^\s@,<>".]+(\.[^\s@,<>".]+)+$/.test(address.trim());
 }
 
-/** Render an address for an outbound header, quoting the display name if present. */
-export function formatAddress(addr: EmailAddress): string {
-  const email = addr.email.trim();
-  if (!addr.name) return email;
-  const name = sanitizeHeaderValue(addr.name);
-  return `${encodeHeaderWord(name, true)} <${email}>`;
-}
-
 // ============================================================================
 // Header encoding
 // ============================================================================
@@ -172,16 +164,12 @@ const NON_ASCII = /[^\x20-\x7E]/;
 /**
  * RFC 2047 encode a header value when it needs it.
  *
- * Pure-ASCII values pass through unchanged (optionally quoted, for display
- * names). Anything else is emitted as one or more `=?UTF-8?B?…?=`
- * encoded-words, split on whole characters so a multi-byte sequence is
- * never cut across two words.
+ * Pure-ASCII values pass through unchanged. Anything else is emitted as one
+ * or more `=?UTF-8?B?…?=` encoded-words, split on whole characters so a
+ * multi-byte sequence is never cut across two words.
  */
-export function encodeHeaderWord(value: string, quoteIfPlain = false): string {
-  if (!NON_ASCII.test(value)) {
-    if (!quoteIfPlain) return value;
-    return `"${value.replace(/(["\\])/g, '\\$1')}"`;
-  }
+export function encodeHeaderWord(value: string): string {
+  if (!NON_ASCII.test(value)) return value;
 
   const words: string[] = [];
   let chunk = '';

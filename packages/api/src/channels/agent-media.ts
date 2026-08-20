@@ -272,10 +272,16 @@ export async function resolveTriggerMedia(
       // Trigger delivery is best-effort: a bad entry is dropped and the rest
       // of the batch still goes. (Outbound email deliberately does NOT do
       // this — see resolveOutboundAttachments.)
-      logger.warn('[Trigger] media entry rejected — dropped', {
-        path: e.path,
-        reason: read.reason,
-      });
+      // Keep the specific reason in the MESSAGE, not just the metadata:
+      // these warnings are grepped when an attachment silently fails to
+      // arrive, and "rejected" alone does not tell an operator why.
+      logger.warn(
+        `[Trigger] media entry rejected — dropped: ${describeContainedFileRejection(
+          read.reason,
+          rootReal
+        )}`,
+        { path: e.path, reason: read.reason }
+      );
       continue;
     }
 

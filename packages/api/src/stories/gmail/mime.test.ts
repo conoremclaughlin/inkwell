@@ -2,7 +2,6 @@ import { describe, it, expect } from 'vitest';
 import {
   buildRawMessage,
   encodeHeaderWord,
-  formatAddress,
   guessMimeType,
   headerLine,
   isValidAddress,
@@ -122,22 +121,6 @@ describe('isValidAddress', () => {
     '<a@b.com>',
   ])('rejects %j', (addr) => {
     expect(isValidAddress(addr)).toBe(false);
-  });
-});
-
-describe('formatAddress', () => {
-  it('emits a bare address when there is no display name', () => {
-    expect(formatAddress({ email: 'a@b.com' })).toBe('a@b.com');
-  });
-
-  it('quotes a display name', () => {
-    expect(formatAddress({ name: 'Bob Smith', email: 'b@x.com' })).toBe('"Bob Smith" <b@x.com>');
-  });
-
-  it('escapes quotes inside a display name', () => {
-    expect(formatAddress({ name: 'Bob "Bo" S', email: 'b@x.com' })).toBe(
-      '"Bob \\"Bo\\" S" <b@x.com>'
-    );
   });
 });
 
