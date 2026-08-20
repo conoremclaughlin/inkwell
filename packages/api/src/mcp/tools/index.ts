@@ -64,6 +64,7 @@ import {
 } from './chat-context-handlers';
 
 import { handleListSkills, handleGetSkill } from './skill-handlers';
+import { handleListThreadKeyTypes, handleSetThreadKeyType } from './thread-key-handlers';
 
 import {
   handlePublishSkill,
@@ -667,6 +668,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           .describe(
             'Local filesystem path to the repo root (e.g., /Users/.../my-project). Used by strategy spawner to know where to start autonomous sessions.'
           ),
+        slug: z
+          .string()
+          .regex(/^[a-z0-9][a-z0-9-]*$/)
+          .max(32)
+          .nullable()
+          .optional()
+          .describe(
+            'Thread-key project prefix (e.g., "inkread" in inkread:pr:42). Reserved against thread-key type names. Pass null to clear.'
+          ),
         goals: z.array(z.string()).optional().describe('Project goals'),
       },
     },
@@ -675,6 +685,92 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         return await handleSaveProject(args, dataComposer);
       } catch (error) {
         logger.error('Error in save_project:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // Register list_thread_key_types tool
+  server.registerTool(
+    'list_thread_key_types',
+    {
+      description: `List thread-key type behaviors — write intent and studio policy per type (spec: thread-key-grammar v2). Shipped templates plus your overrides; overrides shadow templates.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: {
+        ...userIdentifierFields,
+      },
+    },
+    async (args) => {
+      try {
+        return await handleListThreadKeyTypes(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in list_thread_key_types:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // Register set_thread_key_type tool
+  server.registerTool(
+    'set_thread_key_type',
+    {
+      description: `Set (or reset) the behavior of a thread-key type — e.g., make "pr:*" threads take the studio write lease and provision worktrees. Creates a per-user override of the shipped template; reset: true removes the override.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: {
+        ...userIdentifierFields,
+        type: z
+          .string()
+          .min(1)
+          .max(32)
+          .describe('Thread-key type name (e.g., "pr", "spec"). Lowercase [a-z0-9-].'),
+        writeIntent: z
+          .enum(['write', 'presence'])
+          .optional()
+          .describe(
+            'write = sessions on this thread type take the studio write lease at spawn; presence = run without leasing, tolerate drift'
+          ),
+        studioPolicy: z
+          .enum(['provision', 'reuse-only'])
+          .optional()
+          .describe(
+            'provision = routing may create worktrees for this type; reuse-only = existing studios or main only'
+          ),
+        description: z.string().max(500).optional().describe('What this type means'),
+        reset: z
+          .boolean()
+          .optional()
+          .describe('Delete the user override so the shipped template (or default) resumes'),
+      },
+    },
+    async (args) => {
+      try {
+        return await handleSetThreadKeyType(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in set_thread_key_type:', error);
         return {
           content: [
             {

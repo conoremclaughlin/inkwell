@@ -1030,6 +1030,10 @@ async function findOrCreateThread(
   }
 
   // Create new thread
+  // Key identity (key_project/key_type/key_id) is pinned by the DB trigger
+  // pin_thread_key_before_insert — the DB, not the app, is the pinning
+  // authority, so no deploy gap can create an unpinned thread (grammar v4;
+  // Lumen PR #516 round 2 conditions 1/4/6).
   const { data: thread, error } = await threadTable(supabase, 'inbox_threads')
     .insert({
       thread_key: opts.threadKey,
