@@ -27,7 +27,11 @@ export interface RpcClient {
   ): Promise<{ data: unknown; error: { message: string } | null }>;
 }
 
-export const LEASE_STALE_MS_DEFAULT = 30 * 60 * 1000;
+export interface PathConflict {
+  conflict: boolean;
+  conflictStudioId?: string;
+  conflictHolder?: StudioLease | null;
+}
 
 export type GrantOutcome =
   | { outcome: 'granted' }
@@ -44,7 +48,6 @@ export interface GrantArgs {
    * validated snapshot, never from a re-read.
    */
   expectedPrior?: StudioLease | null;
-  staleMs?: number;
 }
 
 /**
@@ -57,14 +60,13 @@ export async function grantStudioLease(client: unknown, args: GrantArgs): Promis
   // overloads are not structurally assignable to the minimal surface, and the
   // exact call shape below is what the unit tests pin.
   const rpcClient = client as RpcClient;
-  const { studioId, userId, lease, expectedPrior, staleMs } = args;
+  const { studioId, userId, lease, expectedPrior } = args;
   try {
     const { data, error } = await rpcClient.rpc('grant_studio_lease', {
       p_studio_id: studioId,
       p_user_id: userId,
       p_lease: lease,
       p_expected_prior: expectedPrior ?? null,
-      p_stale_ms: staleMs ?? LEASE_STALE_MS_DEFAULT,
     });
 
     if (error) {
@@ -95,5 +97,53 @@ export async function grantStudioLease(client: unknown, args: GrantArgs): Promis
       error: err instanceof Error ? err.message : String(err),
     });
     return { outcome: 'lost' };
+  }
+}
+
+/**
+ * The grant's sibling scan as a standalone, advisory-locked check — for
+ * recovery to run AFTER claiming its row and BEFORE any stash/reset mutates
+ * the tree (PR #517 round 1 blocker 4: a rescue could stomp a live sibling
+ * writer's checkout and discover the conflict only at handover).
+ *
+ * FAILS CLOSED: an error reports conflict:true with no holder — "could not
+ * verify the tree is ours to rescue" must never authorize a rescue.
+ */
+export async function studioPathConflict(
+  client: unknown,
+  args: { studioId: string; userId: string }
+): Promise<PathConflict> {
+  const rpcClient = client as RpcClient;
+  try {
+    const { data, error } = await rpcClient.rpc('studio_path_conflict', {
+      p_studio_id: args.studioId,
+      p_user_id: args.userId,
+    });
+    if (error) {
+      logger.warn('[LeaseGrant] Path-conflict check failed — assuming conflict', {
+        studioId: args.studioId,
+        error: error.message,
+      });
+      return { conflict: true };
+    }
+    const payload = data as {
+      conflict?: boolean;
+      conflictStudioId?: string;
+      conflictHolder?: unknown;
+    } | null;
+    if (payload?.conflict) {
+      return {
+        conflict: true,
+        conflictStudioId: payload.conflictStudioId,
+        conflictHolder: (payload.conflictHolder as StudioLease | null) ?? null,
+      };
+    }
+    return { conflict: false };
+  } catch (err) {
+    logger.warn('[LeaseGrant] Path-conflict check threw — assuming conflict', {
+      studioId: args.studioId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return { conflict: true };
   }
 }

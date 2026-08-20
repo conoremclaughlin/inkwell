@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { grantStudioLease, LEASE_STALE_MS_DEFAULT } from './lease-grant';
+import { grantStudioLease, studioPathConflict } from './lease-grant';
 import type { StudioLease } from './studio-lease.service';
 
 vi.mock('../utils/logger', () => ({
@@ -34,7 +34,6 @@ describe('grantStudioLease', () => {
       p_user_id: 'u-1',
       p_lease: LEASE,
       p_expected_prior: null,
-      p_stale_ms: LEASE_STALE_MS_DEFAULT,
     });
   });
 
@@ -46,14 +45,12 @@ describe('grantStudioLease', () => {
       userId: 'u-1',
       lease: LEASE,
       expectedPrior: prior,
-      staleMs: 60_000,
     });
     expect(rpc).toHaveBeenCalledWith('grant_studio_lease', {
       p_studio_id: 's-1',
       p_user_id: 'u-1',
       p_lease: LEASE,
       p_expected_prior: prior,
-      p_stale_ms: 60_000,
     });
   });
 
@@ -90,5 +87,43 @@ describe('grantStudioLease', () => {
     await expect(
       grantStudioLease(client, { studioId: 's-1', userId: 'u-1', lease: LEASE })
     ).resolves.toEqual({ outcome: 'lost' });
+  });
+});
+
+describe('studioPathConflict', () => {
+  it('calls studio_path_conflict with the exact argument keys', async () => {
+    const { client, rpc } = rpcClient({ data: { conflict: false } });
+    await expect(studioPathConflict(client, { studioId: 's-1', userId: 'u-1' })).resolves.toEqual({
+      conflict: false,
+    });
+    expect(rpc).toHaveBeenCalledWith('studio_path_conflict', {
+      p_studio_id: 's-1',
+      p_user_id: 'u-1',
+    });
+  });
+
+  it('maps a conflict with the sibling holder attached', async () => {
+    const holder = { ...LEASE, threadKey: 'pr:OTHER' };
+    const { client } = rpcClient({
+      data: { conflict: true, conflictStudioId: 's-2', conflictHolder: holder },
+    });
+    await expect(studioPathConflict(client, { studioId: 's-1', userId: 'u-1' })).resolves.toEqual({
+      conflict: true,
+      conflictStudioId: 's-2',
+      conflictHolder: holder,
+    });
+  });
+
+  it('FAILS CLOSED: an error or throw reports conflict — never a clear tree', async () => {
+    // "Could not verify the tree is ours to rescue" must never authorize a
+    // rescue that could stomp a live sibling writer.
+    const { client } = rpcClient({ error: { message: 'db down' } });
+    await expect(
+      studioPathConflict(client, { studioId: 's-1', userId: 'u-1' })
+    ).resolves.toMatchObject({ conflict: true });
+    const throwing = { rpc: vi.fn().mockRejectedValue(new Error('network')) };
+    await expect(
+      studioPathConflict(throwing, { studioId: 's-1', userId: 'u-1' })
+    ).resolves.toMatchObject({ conflict: true });
   });
 });

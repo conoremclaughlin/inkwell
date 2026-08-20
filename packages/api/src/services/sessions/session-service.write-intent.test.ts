@@ -1,12 +1,14 @@
 /**
- * Phase 6b — acquisition on intent (task c82daba1 rules 2–3).
+ * Phase 6b — acquisition on intent (task c82daba1 rules 2–3; Lumen #517 r1
+ * blockers 5–6).
  *
  * Isolated from session-service.test.ts because these tests mock the
  * StudioLeaseService and ThreadKeyService MODULES, and file-level vi.mock
  * would leak into the 150+ tests there.
  *
- * MECHANISM tests: until 6e every template is write, so production behavior
- * is unchanged — these prove the gate exists and fails toward write.
+ * Intent is resolved ONCE, before routing (blocker 5): one resolution feeds
+ * both the occupancy gate and the lease gate. MECHANISM tests: until 6e
+ * every template is write, so production behavior is unchanged.
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -94,58 +96,110 @@ const SESSION: Session = {
 } as any;
 
 const ROUTING = { studioId: 'studio-1', tier: 'route-pattern', occupancyChecked: true } as const;
-const CTX = { userId: 'user-1', agentId: 'wren', threadKey: 'spec:some-design' };
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-async function runLease(service: SessionService): Promise<Session> {
+async function runLease(
+  service: SessionService,
+  writeIntent: 'write' | 'presence'
+): Promise<Session> {
   // withStudioLease is private; this suite tests the gate at its boundary.
+  // Intent arrives via ctx — resolved once, before routing (blocker 5).
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return (service as any).withStudioLease(SESSION, ROUTING, CTX);
+  return (service as any).withStudioLease(SESSION, ROUTING, {
+    userId: 'user-1',
+    agentId: 'wren',
+    threadKey: 'spec:some-design',
+    writeIntent,
+  });
 }
 
-describe('Phase 6b — acquisition gated on stored write intent', () => {
+describe('Phase 6b — lease gate consumes the pre-resolved intent', () => {
   beforeEach(() => {
     acquireMock.mockReset().mockResolvedValue({ acquired: true, lease: {} });
     typeBehaviorMock.mockReset();
   });
 
-  it('a presence-typed thread binds the studio WITHOUT acquiring', async () => {
-    typeBehaviorMock.mockResolvedValue({ writeIntent: 'presence', studioPolicy: 'reuse-only' });
-    const { service } = serviceWith({ data: { key_type: 'spec' } });
-
-    const result = await runLease(service);
-
+  it('presence binds the studio WITHOUT acquiring', async () => {
+    const { service } = serviceWith({ data: null });
+    const result = await runLease(service, 'presence');
     expect(result.studioId).toBe('studio-1'); // bound…
     expect(acquireMock).not.toHaveBeenCalled(); // …without the write lock
   });
 
-  it('a write-typed thread acquires exactly as before', async () => {
-    typeBehaviorMock.mockResolvedValue({ writeIntent: 'write', studioPolicy: 'provision' });
-    const { service } = serviceWith({ data: { key_type: 'pr' } });
-
-    await runLease(service);
+  it('write acquires exactly as before', async () => {
+    const { service } = serviceWith({ data: null });
+    await runLease(service, 'write');
     expect(acquireMock).toHaveBeenCalledTimes(1);
   });
 
-  it('an untyped thread (no key_type) FAILS TOWARD WRITE', async () => {
+  it('occupied + overflow unavailable HOLDS — throws occupied, never clears to the default cwd', async () => {
+    // Blocker 6: the cleared binding executed from defaultWorkingDirectory,
+    // which is routinely the SAME occupied root. divertToOverflow fails here
+    // (no overflow service wiring in this harness), so the fallback must
+    // throw the occupied hold.
+    acquireMock.mockResolvedValue({
+      acquired: false,
+      holder: { threadKey: 'pr:OTHER', sessionId: 'sess-foreign' },
+    });
+    const { service, repository } = serviceWith({ data: null });
+    await expect(runLease(service, 'write')).rejects.toMatchObject({
+      code: 'ROUTING_REFUSED',
+      detail: { reason: 'occupied', occupied: { holderThreadKey: 'pr:OTHER' } },
+    });
+    // And the binding was NOT cleared to studioless.
+    expect(repository.update).not.toHaveBeenCalledWith('sess-1', { studioId: null });
+  });
+});
+
+describe('Phase 6b — resolveWriteIntent (the single pre-routing resolution)', () => {
+  beforeEach(() => {
+    typeBehaviorMock.mockReset();
+  });
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const resolve = (service: SessionService) =>
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (service as any).resolveWriteIntent('user-1', 'spec:some-design') as Promise<string>;
+
+  it('resolves presence from the STORED pinned key_type via the registry', async () => {
+    typeBehaviorMock.mockResolvedValue({ writeIntent: 'presence', studioPolicy: 'reuse-only' });
+    const { service } = serviceWith({ data: { key_type: 'spec' } });
+    await expect(resolve(service)).resolves.toBe('presence');
+    expect(typeBehaviorMock).toHaveBeenCalledWith('user-1', 'spec');
+  });
+
+  it('an untyped thread FAILS TOWARD WRITE', async () => {
     typeBehaviorMock.mockResolvedValue({ writeIntent: 'write', studioPolicy: 'reuse-only' });
     const { service } = serviceWith({ data: { key_type: null } });
-
-    await runLease(service);
+    await expect(resolve(service)).resolves.toBe('write');
     expect(typeBehaviorMock).toHaveBeenCalledWith('user-1', null);
-    expect(acquireMock).toHaveBeenCalledTimes(1);
   });
 
   it('a thread-row lookup ERROR fails toward write', async () => {
     const { service } = serviceWith({ error: { message: 'db down' } });
-    await runLease(service);
-    expect(acquireMock).toHaveBeenCalledTimes(1);
+    await expect(resolve(service)).resolves.toBe('write');
   });
 
   it('a registry THROW fails toward write', async () => {
     typeBehaviorMock.mockRejectedValue(new Error('registry down'));
     const { service } = serviceWith({ data: { key_type: 'spec' } });
-    await runLease(service);
-    expect(acquireMock).toHaveBeenCalledTimes(1);
+    await expect(resolve(service)).resolves.toBe('write');
+  });
+});
+
+describe('Phase 6b — occupancy gate is intent-aware (blocker 5)', () => {
+  it('presence bypasses gateOccupancy entirely — no lease read, no divert', async () => {
+    acquireMock.mockReset();
+    const { service } = serviceWith({ data: null });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const decision = await (service as any).gateOccupancy('studio-1', 'route-pattern', {
+      userId: 'user-1',
+      agentId: 'wren',
+      threadKey: 'spec:some-design',
+      writeIntent: 'presence',
+    });
+    expect(decision).toMatchObject({ studioId: 'studio-1', occupancyChecked: false });
+    // The mocked lease service's getLease was never consulted.
+    expect(acquireMock).not.toHaveBeenCalled();
   });
 });

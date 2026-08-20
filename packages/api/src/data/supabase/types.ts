@@ -4080,7 +4080,17 @@ export type Database = {
           p_user_id: string;
           p_lease: Json;
           p_expected_prior?: Json | null;
-          p_stale_ms?: number;
+        };
+        Returns: Json;
+      };
+      normalize_worktree_path: {
+        Args: { p: string | null };
+        Returns: string | null;
+      };
+      studio_path_conflict: {
+        Args: {
+          p_studio_id: string;
+          p_user_id: string;
         };
         Returns: Json;
       };

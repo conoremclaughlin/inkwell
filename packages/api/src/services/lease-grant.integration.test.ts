@@ -17,7 +17,7 @@ import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { readFileSync, existsSync } from 'fs';
 import { resolve } from 'path';
 import type { Database } from '../data/supabase/types';
-import { grantStudioLease } from './lease-grant';
+import { grantStudioLease, studioPathConflict } from './lease-grant';
 import type { StudioLease } from './studio-lease.service';
 
 const projectRoot = resolve(__dirname, '../../../../');
@@ -140,7 +140,10 @@ d('grant_studio_lease — path serialization (real DB)', () => {
     });
   });
 
-  it('a STALE sibling lease does not block — the sweep owns it, not us', async () => {
+  it('a STALE sibling lease ALSO blocks — its holder can renew back to fresh (r2)', async () => {
+    // Round-1 encoded the unsafe case: stale siblings were ignored, then the
+    // sibling's unlocked row-local renewal made both leases fresh (Lumen,
+    // reproduced live). Stale is not proof of departure; the sweep rescues.
     await clearLeases();
     const stale = new Date(Date.now() - 45 * 60 * 1000).toISOString();
     await client
@@ -153,10 +156,13 @@ d('grant_studio_lease — path serialization (real DB)', () => {
       userId,
       lease: lease('pr:4001', 'sess-live'),
     });
-    expect(result.outcome).toBe('granted');
+    expect(result).toMatchObject({ outcome: 'path-conflict', conflictStudioId: studioA });
   });
 
-  it('a SAME-thread sibling lease does not block — one thread, one tree, two rows', async () => {
+  it('a SAME-thread sibling lease ALSO blocks — a thread is not one writer (r2)', async () => {
+    // Round-1 encoded the unsafe case: two sessions of one thread on two
+    // rows both granted (Lumen, reproduced live). The v14 adoption rule
+    // refuses fresh same-thread holders at row level; path level is no freer.
     await clearLeases();
     await client
       .from('studios')
@@ -168,7 +174,86 @@ d('grant_studio_lease — path serialization (real DB)', () => {
       userId,
       lease: lease('pr:5000', 'sess-y'),
     });
-    expect(result.outcome).toBe('granted');
+    expect(result).toMatchObject({ outcome: 'path-conflict', conflictStudioId: studioA });
+  });
+
+  it('textual path aliases are ONE tree: /x and /x/. conflict (r2)', async () => {
+    // Lumen granted both live with '/tmp/x' + '/tmp/x/.'. Normalization makes
+    // them one lock key and one sibling-equality class.
+    await clearLeases();
+    const { data: aliasRow, error: aliasErr } = await client
+      .from('studios')
+      .insert({
+        user_id: userId,
+        agent_id: 'echo-alias',
+        repo_root: PATH,
+        worktree_path: `${PATH}/.`,
+        branch: 'echo-alias/itest',
+        status: 'active',
+      })
+      .select('id')
+      .single();
+    expect(aliasErr).toBeNull();
+    const aliasId = aliasRow!.id;
+    try {
+      const [a, b] = await Promise.all([
+        grantStudioLease(client, { studioId: studioA, userId, lease: lease('pr:8000', 'sess-a8') }),
+        grantStudioLease(client, { studioId: aliasId, userId, lease: lease('pr:8001', 'sess-b8') }),
+      ]);
+      const granted = [a, b].filter((r) => r.outcome === 'granted').length;
+      expect(granted).toBe(1);
+    } finally {
+      await client.from('studios').delete().eq('id', aliasId);
+    }
+  });
+
+  it('empty-path rows back no shared tree — row-scoped grants proceed (r2)', async () => {
+    // worktree_path is NOT NULL in today's schema, so the SQL NULL branch is
+    // future-proofing for materialization v4 (unit-tested against the fake);
+    // the empty string exercises the same row-scoped branch live.
+    await clearLeases();
+    const make = (agent: string) =>
+      client
+        .from('studios')
+        .insert({
+          user_id: userId,
+          agent_id: agent,
+          repo_root: PATH,
+          worktree_path: '',
+          branch: `${agent}/itest`,
+          status: 'active',
+        })
+        .select('id')
+        .single();
+    const { data: n1 } = await make('echo-n1');
+    const { data: n2 } = await make('echo-n2');
+    try {
+      const [a, b] = await Promise.all([
+        grantStudioLease(client, { studioId: n1!.id, userId, lease: lease('pr:9000', 'sess-n1') }),
+        grantStudioLease(client, { studioId: n2!.id, userId, lease: lease('pr:9001', 'sess-n2') }),
+      ]);
+      expect(a.outcome).toBe('granted');
+      expect(b.outcome).toBe('granted');
+    } finally {
+      await client.from('studios').delete().in('id', [n1!.id, n2!.id]);
+    }
+  });
+
+  it('studio_path_conflict reports the sibling for the pre-rescue fence (r2)', async () => {
+    await clearLeases();
+    await client
+      .from('studios')
+      .update({ lease: lease('pr:9500', 'sess-fence') as never })
+      .eq('id', studioA);
+    const conflicted = await studioPathConflict(client, { studioId: studioB, userId });
+    expect(conflicted).toMatchObject({
+      conflict: true,
+      conflictStudioId: studioA,
+      conflictHolder: expect.objectContaining({ threadKey: 'pr:9500' }),
+    });
+    await clearLeases();
+    const clear = await studioPathConflict(client, { studioId: studioB, userId });
+    expect(clear).toEqual({ conflict: false });
   });
 
   it('handover with a mismatched expected prior is LOST, never granted', async () => {

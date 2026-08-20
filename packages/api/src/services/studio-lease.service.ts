@@ -45,7 +45,7 @@ import type { Database, Json } from '../data/supabase/types';
 import { hasActiveRun } from './sessions/active-runs';
 import { resolveIdentityId } from '../auth/resolve-identity';
 import { logger } from '../utils/logger';
-import { grantStudioLease, type GrantOutcome } from './lease-grant';
+import { grantStudioLease, studioPathConflict, type GrantOutcome } from './lease-grant';
 
 const execFileAsync = promisify(execFile);
 
@@ -575,7 +575,6 @@ export class StudioLeaseService {
       userId: req.userId,
       lease,
       expectedPrior,
-      staleMs: LEASE_STALE_MS,
     });
   }
 
@@ -679,6 +678,35 @@ export class StudioLeaseService {
     if (!claimed) {
       const reread = await this.getLease(req.studioId, req.userId);
       return { acquired: false, holder: reread?.lease ?? holder };
+    }
+
+    // PATH FENCE BEFORE RESCUE (PR #517 round 1 blocker 4). The claim above
+    // is row-local; the rescue below MUTATES the tree (stash/reset). If a
+    // sibling row holds a fresh lease on the same tree, rescuing here would
+    // stomp a live writer's checkout and discover the conflict only at
+    // handover — too late. Check now, under the same advisory lock the grant
+    // uses; our claim blocks new sibling grants, so check-then-rescue cannot
+    // be raced. On conflict, RESTORE the observed holder (exact-claim CAS)
+    // and refuse with the sibling surfaced. Fails closed: an unverifiable
+    // check restores and refuses too.
+    const pathState = await studioPathConflict(this.supabase, {
+      studioId: req.studioId,
+      userId: req.userId,
+    });
+    if (pathState.conflict) {
+      const restored = await this.casLease(req.studioId, req.userId, recovery, holder);
+      if (!restored) {
+        logger.error('[StudioLease] Could not restore holder after path-fenced refusal', {
+          studioId: req.studioId,
+          holderSessionId: holder.sessionId,
+        });
+      }
+      logger.warn('[StudioLease] Reclaim refused — sibling row holds the same tree', {
+        studioId: req.studioId,
+        conflictStudioId: pathState.conflictStudioId ?? null,
+        conflictThreadKey: pathState.conflictHolder?.threadKey ?? null,
+      });
+      return { acquired: false, holder: pathState.conflictHolder ?? holder };
     }
 
     // A configured worktree that is ABSENT on disk is a dead studio, not an

@@ -90,6 +90,15 @@ class FakeQuery {
   }
 }
 
+export function normalizePath(p: unknown): string | null {
+  if (typeof p !== 'string' || p === '') return null;
+  return p
+    .replace(/\/{2,}/g, '/')
+    .replace(/\/\.\//g, '/')
+    .replace(/\/\.$/g, '')
+    .replace(/\/$/, '');
+}
+
 export function makeFakeSupabase(tables: Record<string, Row[]>) {
   return {
     from(table: string) {
@@ -100,30 +109,43 @@ export function makeFakeSupabase(tables: Record<string, Row[]>) {
         insert: (payload: Row) => new FakeQuery(rows, 'insert', payload),
       };
     },
-    // grant_studio_lease at SQL parity (Phase 6b): sibling scan over rows
-    // sharing the worktree_path, then the vacant/exact-prior CAS. Atomic here
-    // because JS is single-threaded, as the advisory xact lock makes it in
-    // Postgres. Lease tests exercise real grant behavior, not stubs.
+    // grant_studio_lease + studio_path_conflict at SQL parity (Phase 6b
+    // round 2): ANY sibling lease on the same NORMALIZED path conflicts — no
+    // thread exception (a thread is not one writer), no staleness exception
+    // (stale is not proof of departure; the sweep rescues). NULL paths back
+    // no shared tree and skip the scan. Atomic here because JS is
+    // single-threaded, as the advisory xact lock makes it in Postgres.
     async rpc(fn: string, args: Row) {
+      const studios = tables['studios'] ?? [];
+      const target = studios.find((r) => r.id === args.p_studio_id && r.user_id === args.p_user_id);
+      const findSibling = () => {
+        const path = normalizePath(target?.worktree_path);
+        if (!target || path == null) return undefined;
+        return studios.find(
+          (r) =>
+            r.id !== args.p_studio_id &&
+            r.user_id === args.p_user_id &&
+            normalizePath(r.worktree_path) === path &&
+            r.lease != null
+        );
+      };
+
+      if (fn === 'studio_path_conflict') {
+        const sibling = findSibling();
+        return sibling
+          ? {
+              data: { conflict: true, conflictStudioId: sibling.id, conflictHolder: sibling.lease },
+              error: null,
+            }
+          : { data: { conflict: false }, error: null };
+      }
+
       if (fn !== 'grant_studio_lease') {
         return { data: null, error: { message: `no fake for rpc ${fn}` } };
       }
-      const studios = tables['studios'] ?? [];
-      const target = studios.find((r) => r.id === args.p_studio_id && r.user_id === args.p_user_id);
       if (!target) return { data: { outcome: 'lost' }, error: null };
 
-      const pLease = args.p_lease as Row;
-      const staleMs = (args.p_stale_ms as number) ?? 30 * 60 * 1000;
-      const conflict = studios.find((r) => {
-        if (r.id === args.p_studio_id) return false;
-        if (r.user_id !== args.p_user_id) return false;
-        if (r.worktree_path !== target.worktree_path) return false;
-        const sib = r.lease as Row | null;
-        if (!sib) return false;
-        if (sib.threadKey === pLease.threadKey) return false;
-        const hb = Date.parse(String(sib.heartbeatAt ?? sib.acquiredAt ?? ''));
-        return Number.isFinite(hb) && Date.now() - hb <= staleMs;
-      });
+      const conflict = findSibling();
       if (conflict) {
         return {
           data: {
@@ -136,6 +158,7 @@ export function makeFakeSupabase(tables: Record<string, Row[]>) {
       }
 
       const acquirable = target.status === 'active' || target.status === 'idle';
+      const pLease = args.p_lease as Row;
       const prior = args.p_expected_prior as Row | null;
       const priorMatches = prior
         ? !!target.lease &&
