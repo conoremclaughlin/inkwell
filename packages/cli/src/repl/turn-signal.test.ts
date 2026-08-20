@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { createTurnSignal, turnMustFailClosed, type TurnSignalDeps } from './turn-signal.js';
+import { createTurnSignal, turnGateDecision, type TurnSignalDeps } from './turn-signal.js';
 
 /**
  * PR #506 P1 (Lumen, rounds 1–2): interactive Ink REPL turns never wrote the
@@ -67,10 +67,11 @@ describe('createTurnSignal', () => {
     expect(body).toEqual({ sessionId: 'sess-1', cliAttached: false, agentId: 'wren' });
   });
 
-  it('does not post at all before a PCP session is attached — and reports safe', async () => {
+  it('reports UNACKNOWLEDGED with no PCP session — a failed start_session must not slip the gate', async () => {
     const { deps, fetchImpl } = makeDeps({ getSessionId: () => undefined });
     const signal = createTurnSignal(deps);
-    await expect(signal.open()).resolves.toBe(true);
+    await expect(signal.open()).resolves.toBe(false);
+    // close/detach stay vacuous no-ops — there is no marker to clear.
     await expect(signal.close()).resolves.toBe(true);
     await expect(signal.detach()).resolves.toBe(true);
     expect(fetchImpl).not.toHaveBeenCalled();
@@ -80,7 +81,7 @@ describe('createTurnSignal', () => {
     let session: string | undefined;
     const { deps, fetchImpl } = makeDeps({ getSessionId: () => session });
     const signal = createTurnSignal(deps);
-    await signal.open();
+    await expect(signal.open()).resolves.toBe(false);
     expect(fetchImpl).not.toHaveBeenCalled();
 
     session = 'sess-late';
@@ -144,16 +145,33 @@ describe('createTurnSignal', () => {
   });
 });
 
-describe('turnMustFailClosed', () => {
-  it('refuses a studio-backed turn whose open was not acknowledged', () => {
-    expect(turnMustFailClosed(false, true)).toBe(true);
+describe('turnGateDecision — the exact predicate chain the turn queue evaluates', () => {
+  const WORKTREE_STUDIO = '5bea57f3-6b24-4126-abe4-0d1cc2bd9647';
+
+  it('refuses a worktree-studio turn with NO session attached (round-three no-session bypass)', () => {
+    // runChat catches a failed start_session and continues with
+    // runtime.sessionId undefined — that turn must not run backend/local
+    // tools in a managed worktree with no marker protecting the lease.
+    const gate = turnGateDecision(undefined, false, WORKTREE_STUDIO);
+    expect(gate.allow).toBe(false);
+    if (!gate.allow) expect(gate.reason).toContain('no PCP session');
   });
 
-  it('lets an acknowledged turn run', () => {
-    expect(turnMustFailClosed(true, true)).toBe(false);
+  it('refuses a worktree-studio turn whose open was not acknowledged', () => {
+    const gate = turnGateDecision('sess-1', false, WORKTREE_STUDIO);
+    expect(gate.allow).toBe(false);
+    if (!gate.allow) expect(gate.reason).toContain('did not acknowledge');
   });
 
-  it('lets a studioless turn run best-effort — no lease to endanger', () => {
-    expect(turnMustFailClosed(false, false)).toBe(false);
+  it('allows an acknowledged, sessioned worktree turn', () => {
+    expect(turnGateDecision('sess-1', true, WORKTREE_STUDIO)).toEqual({ allow: true });
+  });
+
+  it('keeps the root repo (main) best-effort — never torn down or rescued', () => {
+    expect(turnGateDecision(undefined, false, 'main')).toEqual({ allow: true });
+  });
+
+  it('keeps studioless runs best-effort — no lease to endanger', () => {
+    expect(turnGateDecision(undefined, false, undefined)).toEqual({ allow: true });
   });
 });

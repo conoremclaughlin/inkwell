@@ -1269,6 +1269,10 @@ describe('sweep pendingRelease backstop', () => {
           cli_attached: true,
           cli_poll_at: new Date().toISOString(), // terminal open, polling now
           cli_turn_at: null, // but NOT mid-turn
+          // The holder's hooks demonstrably write the marker (they did, all
+          // session long — it was NULL because no turn was running). Only a
+          // PROVEN session may release at the narrow proof (round three).
+          cli_turn_proven_at: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
         },
       ],
     };
@@ -1278,6 +1282,49 @@ describe('sweep pendingRelease backstop', () => {
     expect(stats.released).toBe(1);
     expect(stats.renewed).toBe(0);
     expect(tables.studios[0].lease).toBeNull();
+  });
+
+  /**
+   * Round three (Lumen): the narrow proof is only evidence for sessions that
+   * have demonstrated they write the turn marker. For a producer whose
+   * prompt posts are swallowed (hook CLI with a failed lifecycle write),
+   * cli_turn_at NULL may hide a LIVE external turn — releasing on it would
+   * pull the worktree out from under that turn. The sweep must fall back to
+   * the conservative rule and keep renewing while presence persists.
+   */
+  it('defers an UNPROVEN producer at the narrow proof — conservative fallback, not release', async () => {
+    resetActiveRuns();
+    const lease: StudioLease = {
+      ...freshLease({ sessionId: 'sess-unproven', threadKey: 'pr:77' }),
+      heartbeatAt: new Date(Date.now() - LEASE_STALE_MS - 60_000).toISOString(),
+      pendingRelease: { reason: 'thread-closed', requestedAt: new Date().toISOString() },
+    };
+    const tables: Record<string, Row[]> = {
+      studios: [
+        { id: 's-unproven', user_id: 'u', lease: lease as unknown as Row, worktree_path: null },
+      ],
+      studio_lease_events: [],
+      inbox_threads: [],
+      agent_identities: [],
+      sessions: [
+        {
+          id: 'sess-unproven',
+          user_id: 'u',
+          ended_at: null,
+          status: 'active',
+          cli_attached: true,
+          cli_poll_at: new Date().toISOString(), // present — and possibly mid an unproven turn
+          cli_turn_at: null,
+          cli_turn_proven_at: null, // never demonstrated marker ownership
+        },
+      ],
+    };
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+    const stats = await service.sweepExpiredLeases();
+
+    expect(stats.released).toBe(0);
+    expect(stats.renewed).toBe(1); // stale-but-present → renew, exactly the pre-narrow behavior
+    expect(tables.studios[0].lease).not.toBeNull();
   });
 
   it('still defers a pendingRelease while the holder is MID-TURN (cli_turn_at open)', async () => {

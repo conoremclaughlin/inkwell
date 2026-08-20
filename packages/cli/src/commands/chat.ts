@@ -47,7 +47,7 @@ import {
   contextBudgetForWindow as defaultContextBudget,
 } from '../repl/context-limits.js';
 import { parseSlashCommand } from '../repl/slash.js';
-import { createTurnSignal, turnMustFailClosed } from '../repl/turn-signal.js';
+import { createTurnSignal, turnGateDecision } from '../repl/turn-signal.js';
 import { createPollGate } from '../repl/poll-gate.js';
 import {
   parseEvictSelection,
@@ -5580,12 +5580,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
       // studio-backed work refuses the turn instead of running unprotected.
       const turnProtected = await turnSignal.open();
       try {
-        if (turnMustFailClosed(turnProtected, Boolean(currentPcpStudioId()))) {
-          printLine(
-            chalk.red(
-              'Turn not started: the server did not acknowledge turn ownership, so this worktree’s lease is unprotected. Check server connectivity (`ink doctor`) and resend.'
-            )
-          );
+        const gate = turnGateDecision(runtime.sessionId, turnProtected, currentPcpStudioId());
+        if (!gate.allow) {
+          printLine(chalk.red(`Turn not started: ${gate.reason}`));
           return;
         }
         await runUserTurn(raw, source, displayLabel);

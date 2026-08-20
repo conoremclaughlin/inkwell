@@ -362,6 +362,29 @@ export class StudioLeaseService {
    * FAILS CLOSED: a read error reports MID-TURN — "could not verify the turn
    * has ended" must never authorize pulling a worktree out from under it.
    */
+  /**
+   * Has this session's runtime ever demonstrated that it writes the turn
+   * marker? Stamped by the lifecycle route on every prompt event. The narrow
+   * not-mid-turn release proof is only evidence for proven sessions: for a
+   * producer that never writes `cli_turn_at` (hook post swallowed, runtime
+   * without lifecycle wiring), a NULL marker is ambiguity, not evidence
+   * (round three). FAILS CLOSED: an unreadable proof reports UNPROVEN, which
+   * routes the caller to the conservative release rule.
+   */
+  private async hasProvenTurnSignal(sessionId: string, userId?: string): Promise<boolean> {
+    let query = this.supabase.from('sessions').select('cli_turn_proven_at').eq('id', sessionId);
+    if (userId) query = query.eq('user_id', userId);
+    const { data, error } = await query.maybeSingle();
+    if (error) {
+      logger.warn('[StudioLease] Turn-proof read failed — treating session as UNPROVEN', {
+        sessionId,
+        error: error.message,
+      });
+      return false;
+    }
+    return Boolean(data?.cli_turn_proven_at);
+  }
+
   async isSessionMidTurn(sessionId: string, userId?: string): Promise<boolean> {
     if (hasActiveRun(sessionId)) return true;
     let query = this.supabase.from('sessions').select('cli_turn_at').eq('id', sessionId);
@@ -1300,11 +1323,21 @@ export class StudioLeaseService {
       // attached terminal satisfies indefinitely.
       if (lease.pendingRelease && !lease.quarantined) {
         if (!(await this.isSessionMidTurn(lease.sessionId, row.user_id))) {
-          const ok = await this.releaseStudio(row.id, row.user_id, lease, row.worktree_path, {
-            reason: lease.pendingRelease.reason,
-          });
-          if (ok) released += 1;
-          continue;
+          // The narrow proof only counts for sessions that have demonstrated
+          // they write the turn marker (round three): an unproven producer's
+          // NULL marker may hide a live external turn whose prompt post was
+          // swallowed, so it falls back to the conservative rule — not live
+          // AND (stale OR terminal) — and, below, to sweep renewal while its
+          // presence persists. Proven sessions release at the narrow proof,
+          // which is the pr:498/pr:499 fix.
+          const proven = await this.hasProvenTurnSignal(lease.sessionId, row.user_id);
+          if (proven || (await this.canReleaseNow(lease, row.user_id))) {
+            const ok = await this.releaseStudio(row.id, row.user_id, lease, row.worktree_path, {
+              reason: lease.pendingRelease.reason,
+            });
+            if (ok) released += 1;
+            continue;
+          }
         }
       }
 

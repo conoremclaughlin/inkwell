@@ -99,6 +99,7 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         cliAttached?: boolean;
         cliPollAt?: string;
         cliTurnAt?: string | null;
+        cliTurnProvenAt?: string;
         alias?: string | null;
       } = {};
       if (lifecycle) updates.lifecycle = lifecycle;
@@ -123,7 +124,15 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
       if (cliAttached === false) updates.cliTurnAt = null;
       const isPromptEvent = event === 'prompt' || (!event && lifecycle === 'running');
       const isStopEvent = event === 'stop';
-      if (isPromptEvent) updates.cliTurnAt = new Date().toISOString();
+      if (isPromptEvent) {
+        const now = new Date().toISOString();
+        updates.cliTurnAt = now;
+        // The runtime just demonstrated it writes the turn marker. The lease
+        // sweep's narrow not-mid-turn release proof is only valid for such
+        // proven sessions — an unproven session's NULL marker is ambiguity,
+        // not evidence (PR #506 round three).
+        updates.cliTurnProvenAt = now;
+      }
       if (isStopEvent) updates.cliTurnAt = null;
 
       const updated = await dataComposer.repositories.memory.updateSession(sessionId, updates);

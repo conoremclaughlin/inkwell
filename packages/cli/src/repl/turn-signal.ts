@@ -20,9 +20,10 @@
  * Failure semantics are DIRECTIONAL, not symmetric (round-two P1):
  *   - A missed `prompt` fails toward PREMATURE RELEASE — the turn would run
  *     unproven, and a healthy sweep clears any pendingRelease under the live
- *     process. So `open()` retries, then reports `false`, and the caller MUST
- *     fail closed for studio-backed work: do not start the turn without the
- *     acknowledged marker (`turnMustFailClosed`).
+ *     process. So `open()` retries, then reports `false` — including when no
+ *     PCP session is attached at all — and the caller MUST fail closed for
+ *     studio-backed work via `turnGateDecision`: no acknowledged marker, no
+ *     turn.
  *   - A missed `stop` fails toward HOLDING — the unbounded marker stays open.
  *     `close()` retries; the next turn's stop or the REPL exit `detach()`
  *     (cleanup path in chat.ts) reconciles it. A hard crash (SIGKILL) leaves
@@ -60,13 +61,40 @@ export interface TurnSignal {
   detach(): Promise<boolean>;
 }
 
+export type TurnGate = { allow: true } | { allow: false; reason: string };
+
 /**
- * The fail-closed policy, as a visible unit: an unacknowledged turn-open on
- * studio-backed work must refuse the turn. Sessionless / studioless turns
- * have no lease to endanger and stay best-effort.
+ * The fail-closed policy, as one visible unit — the exact predicate chain the
+ * turn queue evaluates before running a backend (round-three P1: a session
+ * that failed to start must not slip past the gate).
+ *
+ * Studio-backed means a REAL worktree studio (UUID). `main` (the root repo)
+ * and studioless runs stay best-effort: the root repo is never torn down or
+ * rescued out from under a process, and refusing turns there would brick the
+ * common degraded case (server hiccup at launch) with nothing to protect.
  */
-export function turnMustFailClosed(opened: boolean, studioBacked: boolean): boolean {
-  return !opened && studioBacked;
+export function turnGateDecision(
+  sessionId: string | undefined,
+  opened: boolean,
+  studioId: string | undefined
+): TurnGate {
+  const studioBacked = Boolean(studioId) && studioId !== 'main';
+  if (!studioBacked) return { allow: true };
+  if (!sessionId) {
+    return {
+      allow: false,
+      reason:
+        'no PCP session is attached, so this worktree’s lease cannot be protected. Restart `ink chat` (or check the server) and resend.',
+    };
+  }
+  if (!opened) {
+    return {
+      allow: false,
+      reason:
+        'the server did not acknowledge turn ownership, so this worktree’s lease is unprotected. Check server connectivity (`ink doctor`) and resend.',
+    };
+  }
+  return { allow: true };
 }
 
 type PostBody = Record<string, unknown>;
@@ -116,7 +144,11 @@ export function createTurnSignal(deps: TurnSignalDeps): TurnSignal {
   return {
     async open() {
       const sessionId = deps.getSessionId();
-      if (!sessionId) return true; // nothing leased, nothing to prove
+      // No session = UNACKNOWLEDGED, not vacuously safe (round-three P1): a
+      // failed start_session can leave the REPL running in a managed
+      // worktree, and that turn must not slip past the fail-closed gate.
+      // turnGateDecision decides whether the missing proof matters.
+      if (!sessionId) return false;
       return post('open', lifecycleBody('prompt', sessionId));
     },
     async close() {

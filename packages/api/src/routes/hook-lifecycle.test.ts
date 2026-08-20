@@ -114,14 +114,18 @@ describe('hook-lifecycle CLI turn signal', () => {
   }
 
   it('the real two-request prompt sequence leaves the turn marker OPEN (round 6)', async () => {
-    // Request 1: the prompt event opens the turn.
+    // Request 1: the prompt event opens the turn — and stamps the proof that
+    // this session's runtime writes the marker (the lease sweep's narrow
+    // release path is only valid for proven sessions, PR #506 round three).
     const promptUpdates = await post({ lifecycle: 'running', event: 'prompt' });
     expect(typeof promptUpdates.cliTurnAt).toBe('string');
+    expect(promptUpdates.cliTurnProvenAt).toBe(promptUpdates.cliTurnAt);
 
     // Request 2: the CLI immediately re-asserts attachment. This must NOT
-    // touch the marker the prompt just opened.
+    // touch the marker the prompt just opened — nor the proof.
     const attachUpdates = await post({ cliAttached: true });
     expect('cliTurnAt' in attachUpdates).toBe(false);
+    expect('cliTurnProvenAt' in attachUpdates).toBe(false);
   });
 
   it('an explicit detach clears the marker (process proof)', async () => {

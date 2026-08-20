@@ -2781,6 +2781,7 @@ export type Database = {
           cli_attached: boolean | null;
           cli_poll_at: string | null;
           cli_turn_at: string | null;
+          cli_turn_proven_at: string | null;
           compacting_since: string | null;
           contact_id: string | null;
           context: string | null;
@@ -2813,6 +2814,7 @@ export type Database = {
           cli_attached?: boolean | null;
           cli_poll_at?: string | null;
           cli_turn_at?: string | null;
+          cli_turn_proven_at?: string | null;
           compacting_since?: string | null;
           contact_id?: string | null;
           context?: string | null;
@@ -2845,6 +2847,7 @@ export type Database = {
           cli_attached?: boolean | null;
           cli_poll_at?: string | null;
           cli_turn_at?: string | null;
+          cli_turn_proven_at?: string | null;
           compacting_since?: string | null;
           contact_id?: string | null;
           context?: string | null;
