@@ -191,21 +191,31 @@ describe('encodeHeaderWord', () => {
     expect(encodeHeaderWord('Café')).toBe(`=?UTF-8?B?${Buffer.from('Café').toString('base64')}?=`);
   });
 
+  /** Split a folded header value back into its encoded-words. */
+  const words = (encoded: string) => encoded.split('\r\n ');
+
   it('keeps every encoded word within the 75-char limit', () => {
-    const encoded = encodeHeaderWord('é'.repeat(200));
-    for (const word of encoded.split(' ')) {
+    for (const word of words(encodeHeaderWord('é'.repeat(200)))) {
       expect(word.length).toBeLessThanOrEqual(75);
     }
   });
 
   it('never splits a multi-byte character across encoded words', () => {
     const value = '🎉'.repeat(40); // 4 bytes each
-    const decoded = encodeHeaderWord(value)
-      .split(' ')
+    const decoded = words(encodeHeaderWord(value))
       .map((w) => Buffer.from(w.replace(/^=\?UTF-8\?B\?/, '').replace(/\?=$/, ''), 'base64'))
       .map((b) => b.toString('utf8'))
       .join('');
     expect(decoded).toBe(value);
+  });
+
+  it('folds between encoded words rather than joining them on one line', () => {
+    const encoded = encodeHeaderWord('é'.repeat(200));
+    expect(words(encoded).length).toBeGreaterThan(1);
+    // Every physical line stays short; no word runs into the next.
+    for (const line of encoded.split('\r\n')) {
+      expect(line.length).toBeLessThanOrEqual(76);
+    }
   });
 });
 
