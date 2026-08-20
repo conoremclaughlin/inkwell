@@ -44,24 +44,45 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         return;
       }
 
-      const { sessionId, lifecycle, event, agentId, workingDir, cliAttached, cliPollAt, alias } =
-        req.body as {
-          sessionId?: string;
-          lifecycle?: string;
-          /**
-           * Which hook fired: 'prompt' | 'stop' | 'pre-compact' | 'post-compact'.
-           * Lifecycle values alone are ambiguous — post-compact also sends
-           * 'idle' while the same turn continues, so ONLY event === 'stop'
-           * marks the real CLI turn boundary. Legacy senders without the
-           * field get renewals but never boundary releases.
-           */
-          event?: string;
-          agentId?: string;
-          workingDir?: string;
-          cliAttached?: boolean;
-          cliPollAt?: string;
-          alias?: string;
-        };
+      const {
+        sessionId,
+        lifecycle,
+        event,
+        agentId,
+        workingDir,
+        cliAttached,
+        cliPollAt,
+        alias,
+        turnGated,
+        studioId,
+      } = req.body as {
+        sessionId?: string;
+        lifecycle?: string;
+        /**
+         * Which hook fired: 'prompt' | 'stop' | 'pre-compact' | 'post-compact'.
+         * Lifecycle values alone are ambiguous — post-compact also sends
+         * 'idle' while the same turn continues, so ONLY event === 'stop'
+         * marks the real CLI turn boundary. Legacy senders without the
+         * field get renewals but never boundary releases.
+         */
+        event?: string;
+        agentId?: string;
+        workingDir?: string;
+        cliAttached?: boolean;
+        cliPollAt?: string;
+        alias?: string;
+        /**
+         * The sender declares that its runtime GATES every turn on an
+         * acknowledged prompt post (the Ink REPL refuses turns otherwise).
+         * Only gated prompts stamp cli_turn_proven_at — a producer that
+         * proceeds regardless (hook CLIs) must never become proven, or an
+         * old proof would vouch for a turn whose prompt was swallowed
+         * (PR #506 round four).
+         */
+        turnGated?: boolean;
+        /** Caller's worktree studio, for the fenced lease-held report. */
+        studioId?: string;
+      };
 
       if (!sessionId) {
         res.status(400).json({ success: false, error: 'sessionId is required' });
@@ -127,11 +148,12 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
       if (isPromptEvent) {
         const now = new Date().toISOString();
         updates.cliTurnAt = now;
-        // The runtime just demonstrated it writes the turn marker. The lease
-        // sweep's narrow not-mid-turn release proof is only valid for such
-        // proven sessions — an unproven session's NULL marker is ambiguity,
-        // not evidence (PR #506 round three).
-        updates.cliTurnProvenAt = now;
+        // Proof is a CONTRACT claim, not a historical fact (round four): only
+        // a runtime that gates every turn on this acknowledgement may become
+        // proven — for it, a NULL marker really means no turn is running.
+        // A hook CLI that proceeds regardless never sets this, so an old
+        // proof can never vouch for a turn whose prompt post was swallowed.
+        if (turnGated === true) updates.cliTurnProvenAt = now;
       }
       if (isStopEvent) updates.cliTurnAt = null;
 
@@ -174,16 +196,43 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
           });
         });
       } else {
-        void leaseService.renewBySession(sessionId, session.userId).catch((err: unknown) => {
+        // FENCED for prompt events (round four): the renewal is awaited
+        // BEFORE the 2xx. The sweep's release CAS is guarded on the exact
+        // prior lease (heartbeatAt included), so a renewal that lands first
+        // defeats a concurrent release — and if the release already won, the
+        // held-check below reads the cleared lease and the response says so,
+        // which a gated producer treats as unacknowledged: no turn starts in
+        // a worktree whose lease is gone. The old fire-and-forget renewal
+        // left a window where a 2xx implied protection the lease no longer
+        // had.
+        try {
+          await leaseService.renewBySession(sessionId, session.userId);
+        } catch (err: unknown) {
           logger.debug('[HookLifecycle] Lease renewal failed (non-fatal)', {
             sessionId,
             error: err instanceof Error ? err.message : String(err),
           });
-        });
+        }
+      }
+
+      // Per-studio held report for gated prompt callers. Absent for stop
+      // events, main, and studioless senders — nothing to fence there.
+      let studioLeaseHeld: boolean | undefined;
+      if (isPromptEvent && typeof studioId === 'string' && studioId && studioId !== 'main') {
+        studioLeaseHeld = await leaseService.isStudioLeaseHeldBySession(
+          studioId,
+          sessionId,
+          session.userId
+        );
       }
 
       logger.debug('[HookLifecycle] Updated', { sessionId, lifecycle, agentId });
-      res.json({ success: true, sessionId, lifecycle });
+      res.json({
+        success: true,
+        sessionId,
+        lifecycle,
+        ...(studioLeaseHeld !== undefined ? { studioLeaseHeld } : {}),
+      });
     } catch (error) {
       logger.error('[HookLifecycle] Error:', error);
       res.status(500).json({

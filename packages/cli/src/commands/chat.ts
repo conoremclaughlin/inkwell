@@ -5517,6 +5517,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // only posts the same prompt/stop events the backend lifecycle hooks send.
   const turnSignal = createTurnSignal({
     getSessionId: () => runtime.sessionId,
+    getStudioId: () => currentPcpStudioId(),
     agentId,
     getServerUrl: async () => (await import('../lib/pcp-mcp.js')).getPcpServerUrl(),
     getToken: async (serverUrl) =>

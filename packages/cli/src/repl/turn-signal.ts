@@ -35,6 +35,8 @@
 export interface TurnSignalDeps {
   /** Live ref — the PCP session can attach/rotate after construction. */
   getSessionId: () => string | undefined;
+  /** Live ref — the worktree studio this REPL runs in, for the lease fence. */
+  getStudioId?: () => string | undefined;
   agentId: string;
   /** Resolved per post so config changes and lazy imports stay cheap. */
   getServerUrl: () => Promise<string> | string;
@@ -100,7 +102,10 @@ export function turnGateDecision(
 type PostBody = Record<string, unknown>;
 
 export function createTurnSignal(deps: TurnSignalDeps): TurnSignal {
-  const attemptPost = async (body: PostBody): Promise<boolean> => {
+  const attemptPost = async (
+    body: PostBody,
+    interpret: (resp: Response) => Promise<boolean>
+  ): Promise<boolean> => {
     const serverUrl = (await deps.getServerUrl()).replace(/\/+$/, '');
     const token = await deps.getToken(serverUrl);
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
@@ -112,16 +117,38 @@ export function createTurnSignal(deps: TurnSignalDeps): TurnSignal {
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(deps.timeoutMs ?? 5000),
     });
-    return resp.ok;
+    return interpret(resp);
+  };
+
+  const acked = async (resp: Response): Promise<boolean> => resp.ok;
+
+  // The prompt fence (round four): a 2xx alone is not protection — the
+  // server reports whether THIS studio's lease is still held by this session
+  // after its synchronous renewal. `studioLeaseHeld: false` means a release
+  // won the race (or the lease is foreign/gone): the turn must not start.
+  // An absent field (stop events, main, studioless, older servers) does not
+  // veto. An unparseable body fails closed.
+  const ackedAndHeld = async (resp: Response): Promise<boolean> => {
+    if (!resp.ok) return false;
+    try {
+      const body = (await resp.json()) as { studioLeaseHeld?: boolean };
+      return body.studioLeaseHeld !== false;
+    } catch {
+      return false;
+    }
   };
 
   // Two attempts total: one retry absorbs transient blips (the disk-full
   // incident's ENOSPC spawn failures, a mid-restart server) without letting a
   // dead server stall the REPL for long.
-  const post = async (label: string, body: PostBody): Promise<boolean> => {
+  const post = async (
+    label: string,
+    body: PostBody,
+    interpret: (resp: Response) => Promise<boolean> = acked
+  ): Promise<boolean> => {
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
-        if (await attemptPost(body)) return true;
+        if (await attemptPost(body, interpret)) return true;
         deps.onDebug?.('turn_signal_post_failed', { label, attempt, ...body });
       } catch (error) {
         deps.onDebug?.('turn_signal_post_error', { label, attempt, error: String(error) });
@@ -149,7 +176,16 @@ export function createTurnSignal(deps: TurnSignalDeps): TurnSignal {
       // worktree, and that turn must not slip past the fail-closed gate.
       // turnGateDecision decides whether the missing proof matters.
       if (!sessionId) return false;
-      return post('open', lifecycleBody('prompt', sessionId));
+      const studioId = deps.getStudioId?.();
+      const body: PostBody = {
+        ...lifecycleBody('prompt', sessionId),
+        // This runtime GATES every turn on this acknowledgement — the claim
+        // that lets the server mark the session proven (round four). Never
+        // send this from a producer that proceeds on failure.
+        turnGated: true,
+        ...(studioId ? { studioId } : {}),
+      };
+      return post('open', body, ackedAndHeld);
     },
     async close() {
       const sessionId = deps.getSessionId();

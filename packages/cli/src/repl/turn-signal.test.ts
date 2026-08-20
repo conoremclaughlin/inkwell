@@ -12,7 +12,9 @@ import { createTurnSignal, turnGateDecision, type TurnSignalDeps } from './turn-
  */
 
 function makeDeps(overrides: Partial<TurnSignalDeps> = {}) {
-  const fetchImpl = vi.fn(async () => ({ ok: true, status: 200 }) as Response);
+  const fetchImpl = vi.fn(
+    async () => ({ ok: true, status: 200, json: async () => ({ success: true }) }) as Response
+  );
   const deps: TurnSignalDeps = {
     getSessionId: () => 'sess-1',
     agentId: 'wren',
@@ -47,6 +49,7 @@ describe('createTurnSignal', () => {
       event: 'prompt',
       agentId: 'wren',
       workingDir: '/work/tree',
+      turnGated: true, // this runtime gates every turn on the acknowledgement
     });
   });
 
@@ -122,7 +125,11 @@ describe('createTurnSignal', () => {
     const fetchImpl = vi.fn(async () => {
       calls += 1;
       if (calls === 1) throw new Error('socket hang up');
-      return { ok: true, status: 200 } as Response;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ success: true }),
+      } as unknown as Response;
     });
     const { deps } = makeDeps({ fetchImpl: fetchImpl as unknown as typeof fetch });
 
@@ -142,6 +149,63 @@ describe('createTurnSignal', () => {
     await createTurnSignal(deps).open();
     const init = fetchImpl.mock.calls[0][1] as RequestInit;
     expect((init.headers as Record<string, string>).Authorization).toBeUndefined();
+  });
+});
+
+describe('the prompt fence — studioLeaseHeld (round four)', () => {
+  const okJson = (body: Record<string, unknown>) =>
+    ({ ok: true, status: 200, json: async () => body }) as unknown as Response;
+
+  it('open() carries the worktree studio for the per-studio held report', async () => {
+    const { deps, fetchImpl } = makeDeps({ getStudioId: () => 'studio-uuid-1' });
+    await createTurnSignal(deps).open();
+    const body = bodyOf(fetchImpl);
+    expect(body.turnGated).toBe(true);
+    expect(body.studioId).toBe('studio-uuid-1');
+  });
+
+  it('a 2xx that reports the lease NOT HELD is not protection — a release won the race', async () => {
+    const fetchImpl = vi.fn(async () => okJson({ success: true, studioLeaseHeld: false }));
+    const { deps } = makeDeps({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      getStudioId: () => 'studio-uuid-1',
+    });
+    await expect(createTurnSignal(deps).open()).resolves.toBe(false);
+    expect(fetchImpl).toHaveBeenCalledTimes(2); // retried, still not held → refuse
+  });
+
+  it('held-true and absent-field (stop/main/older server) both acknowledge', async () => {
+    const held = vi.fn(async () => okJson({ success: true, studioLeaseHeld: true }));
+    const { deps: d1 } = makeDeps({ fetchImpl: held as unknown as typeof fetch });
+    await expect(createTurnSignal(d1).open()).resolves.toBe(true);
+
+    const absent = vi.fn(async () => okJson({ success: true }));
+    const { deps: d2 } = makeDeps({ fetchImpl: absent as unknown as typeof fetch });
+    await expect(createTurnSignal(d2).open()).resolves.toBe(true);
+  });
+
+  it('an unparseable 2xx body fails closed', async () => {
+    const fetchImpl = vi.fn(
+      async () =>
+        ({
+          ok: true,
+          status: 200,
+          json: async () => {
+            throw new Error('bad json');
+          },
+        }) as unknown as Response
+    );
+    const { deps } = makeDeps({ fetchImpl: fetchImpl as unknown as typeof fetch });
+    await expect(createTurnSignal(deps).open()).resolves.toBe(false);
+  });
+
+  it('close and detach never consult the held report', async () => {
+    // No json() on these responses at all — proving the interpreter is not used.
+    const fetchImpl = vi.fn(async () => ({ ok: true, status: 200 }) as Response);
+    const { deps } = makeDeps({ fetchImpl: fetchImpl as unknown as typeof fetch });
+    const signal = createTurnSignal(deps);
+    await expect(signal.close()).resolves.toBe(true);
+    await expect(signal.detach()).resolves.toBe(true);
   });
 });
 

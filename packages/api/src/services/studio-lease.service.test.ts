@@ -1242,7 +1242,7 @@ describe('sweep pendingRelease backstop', () => {
    * stale-but-live branch and RENEWED — which is what pinned pr:498 for 2.84
    * days and bumped pr:499's heartbeat 46 minutes past its release request.
    */
-  it('completes a deferred release for an idle-but-attached holder (pr:498/pr:499)', async () => {
+  it('completes a deferred release for an idle-but-attached GATED holder (the pr:498/pr:499 shape)', async () => {
     resetActiveRuns();
     const lease: StudioLease = {
       ...freshLease({ sessionId: 'sess-idle', threadKey: 'pr:499' }),
@@ -1269,9 +1269,11 @@ describe('sweep pendingRelease backstop', () => {
           cli_attached: true,
           cli_poll_at: new Date().toISOString(), // terminal open, polling now
           cli_turn_at: null, // but NOT mid-turn
-          // The holder's hooks demonstrably write the marker (they did, all
-          // session long — it was NULL because no turn was running). Only a
-          // PROVEN session may release at the narrow proof (round three).
+          // A GATED holder (its runtime refuses turns without the
+          // acknowledged marker — round four), so NULL genuinely means no
+          // turn is running. Historical hook-CLI rows like the real pr:498/
+          // pr:499 stay UNPROVEN and conservative until their runtime gates
+          // (task 0b9bb780) — per Lumen's operational note, no backfill.
           cli_turn_proven_at: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
         },
       ],

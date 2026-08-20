@@ -363,13 +363,15 @@ export class StudioLeaseService {
    * has ended" must never authorize pulling a worktree out from under it.
    */
   /**
-   * Has this session's runtime ever demonstrated that it writes the turn
-   * marker? Stamped by the lifecycle route on every prompt event. The narrow
-   * not-mid-turn release proof is only evidence for proven sessions: for a
-   * producer that never writes `cli_turn_at` (hook post swallowed, runtime
-   * without lifecycle wiring), a NULL marker is ambiguity, not evidence
-   * (round three). FAILS CLOSED: an unreadable proof reports UNPROVEN, which
-   * routes the caller to the conservative release rule.
+   * Does this session's runtime GATE every turn on an acknowledged prompt
+   * post? Stamped by the lifecycle route only for `turnGated` senders (the
+   * Ink REPL, which refuses turns without the acknowledged marker). The
+   * narrow not-mid-turn release proof is only evidence for gated sessions:
+   * for them, a NULL marker really means no turn is running. A historical
+   * "wrote it once" bit could not carry this weight — a hook CLI proceeds
+   * even when its prompt post is swallowed, so its idle state and its
+   * live-missed-prompt state are identical (round four). FAILS CLOSED: an
+   * unreadable proof reports UNPROVEN → conservative release rule.
    */
   private async hasProvenTurnSignal(sessionId: string, userId?: string): Promise<boolean> {
     let query = this.supabase.from('sessions').select('cli_turn_proven_at').eq('id', sessionId);
@@ -383,6 +385,36 @@ export class StudioLeaseService {
       return false;
     }
     return Boolean(data?.cli_turn_proven_at);
+  }
+
+  /**
+   * Is this studio's lease currently held by this session? The lifecycle
+   * route's prompt fence: read AFTER the synchronous renewal, so either the
+   * renewal beat a concurrent release (release CAS lost — lease survives) or
+   * the release won (this reads the cleared/foreign lease and the gated
+   * caller refuses the turn). FAILS CLOSED: unreadable → not held.
+   */
+  async isStudioLeaseHeldBySession(
+    studioId: string,
+    sessionId: string,
+    userId: string
+  ): Promise<boolean> {
+    const { data, error } = await this.supabase
+      .from('studios')
+      .select('lease')
+      .eq('id', studioId)
+      .eq('user_id', userId)
+      .maybeSingle();
+    if (error) {
+      logger.warn('[StudioLease] Lease-held read failed — reporting NOT HELD (fail closed)', {
+        studioId,
+        sessionId,
+        error: error.message,
+      });
+      return false;
+    }
+    const lease = parseStudioLease(data?.lease);
+    return Boolean(lease && !lease.quarantined && lease.sessionId === sessionId);
   }
 
   async isSessionMidTurn(sessionId: string, userId?: string): Promise<boolean> {
