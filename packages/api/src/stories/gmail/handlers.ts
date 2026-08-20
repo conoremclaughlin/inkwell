@@ -7,6 +7,7 @@
 import { z } from 'zod';
 import { getGmailService } from './service';
 import { MAX_OUTBOUND_ATTACHMENTS, MAX_OUTBOUND_ATTACHMENT_TOTAL_BYTES } from './attachments';
+import { MAX_FILENAME_BYTES } from './mime';
 import { resolveUserOrThrow } from '../../services/user-resolver';
 import { logger } from '../../utils/logger';
 import type { DataComposer } from '../../data/composer';
@@ -174,6 +175,7 @@ export const attachmentsSchema = z
       filename: z
         .string()
         .min(1)
+        .max(MAX_FILENAME_BYTES)
         .optional()
         .describe("Name the recipient sees (defaults to the file's own name)"),
     })

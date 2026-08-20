@@ -23,7 +23,7 @@ import {
   resolveMediaRoot,
 } from '../../channels/agent-media';
 import { logger } from '../../utils/logger';
-import { guessMimeType, type OutboundAttachment } from './mime';
+import { guessMimeType, MAX_FILENAME_BYTES, type OutboundAttachment } from './mime';
 
 /** Max attachments on a single outgoing message. */
 export const MAX_OUTBOUND_ATTACHMENTS = 10;
@@ -118,6 +118,18 @@ export async function resolveOutboundAttachments(
     }
 
     const filename = (request.filename || basename(read.realPath)).trim() || 'attachment';
+    // Bounded in BYTES, not characters: 255 characters of non-ASCII is 765
+    // bytes encoded, which would breach the header line limit during
+    // assembly. Checked here so the caller gets an AttachmentError naming
+    // the file rather than a bare failure from the MIME layer.
+    const filenameBytes = Buffer.byteLength(filename, 'utf8');
+    if (filenameBytes > MAX_FILENAME_BYTES) {
+      throw new AttachmentError(
+        `Cannot attach "${request.path}": the filename is ${filenameBytes} bytes ` +
+          `(max ${MAX_FILENAME_BYTES}). Pass a shorter \`filename\`.`
+      );
+    }
+
     resolved.push({
       filename,
       mimeType: guessMimeType(filename),

@@ -119,8 +119,52 @@ describe('isValidAddress', () => {
     'a@b.com, c@d.com', // a whole list is not one address
     'a@b.com\r\nBcc: evil@x.com',
     '<a@b.com>',
+    // Residue from RFC group syntax. The denylist version of this function
+    // accepted every one of these: the excluded set never named them.
+    'b@example.com;',
+    'Team: a@example.com',
+    'a@example.com:',
+    'a@exa mple.com',
+    'a@example..com',
+    'a@-example.com',
+    'a@example.com-',
+    '(comment)a@example.com',
+    'a@[192.168.0.1]',
   ])('rejects %j', (addr) => {
     expect(isValidAddress(addr)).toBe(false);
+  });
+});
+
+describe('splitAddressList — RFC 5322 groups', () => {
+  it('flattens a group into its member mailboxes', () => {
+    expect(splitAddressList('Team: a@example.com, b@example.com;')).toEqual([
+      'a@example.com',
+      'b@example.com',
+    ]);
+  });
+
+  it('yields nothing for an empty group', () => {
+    expect(splitAddressList('undisclosed-recipients:;')).toEqual([]);
+  });
+
+  it('handles a group alongside a plain mailbox', () => {
+    expect(splitAddressList('Team: a@example.com;, plain@example.com')).toEqual([
+      'a@example.com',
+      'plain@example.com',
+    ]);
+  });
+
+  it('keeps a colon inside a quoted display name', () => {
+    expect(splitAddressList('"Smith: John" <j@example.com>')).toEqual([
+      '"Smith: John" <j@example.com>',
+    ]);
+  });
+
+  it('leaves ordinary lists untouched', () => {
+    expect(splitAddressList('a@example.com, B <b@example.com>')).toEqual([
+      'a@example.com',
+      'B <b@example.com>',
+    ]);
   });
 });
 
@@ -363,6 +407,44 @@ describe('buildRawMessage', () => {
       );
       expect(decoded).toContain("filename*=UTF-8''re%C3%A7u.pdf");
       expect(decoded).not.toMatch(/filename="/);
+    });
+
+    // RFC 5322 §2.1.1: no line may exceed 998 characters. An unbounded
+    // filename percent-expands ~3x and blew straight past it.
+    it('keeps every header line under the 998-character hard limit', () => {
+      const longAscii = `${'a'.repeat(250)}.pdf`.slice(0, 255);
+      const decoded = decodeRaw(
+        buildRawMessage({
+          headers: ['To: a@b.com', headerLine('Subject', '長'.repeat(300))],
+          body: 'x',
+          attachments: [
+            { filename: longAscii, mimeType: 'application/pdf', content: Buffer.from('x') },
+            {
+              filename: `${'é'.repeat(120)}.pdf`,
+              mimeType: 'application/pdf',
+              content: Buffer.from('x'),
+            },
+          ],
+        })
+      );
+      const tooLong = decoded.split('\r\n').filter((line) => line.length > 998);
+      expect(tooLong).toEqual([]);
+    });
+
+    it('rejects a filename too long to encode into a header', () => {
+      expect(() =>
+        buildRawMessage({
+          headers: ['To: a@b.com'],
+          body: 'x',
+          attachments: [
+            {
+              filename: `${'é'.repeat(400)}.pdf`,
+              mimeType: 'application/pdf',
+              content: Buffer.from('x'),
+            },
+          ],
+        })
+      ).toThrow(/filename is too long/i);
     });
 
     it('percent-encodes characters encodeURIComponent leaves bare', () => {

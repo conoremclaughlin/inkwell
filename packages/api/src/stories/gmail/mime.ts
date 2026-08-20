@@ -32,6 +32,26 @@ const ENCODED_WORD_MAX_BYTES = 45;
 /** Base64 line length for message bodies (RFC 2045 caps lines at 76). */
 const BASE64_LINE_LENGTH = 76;
 
+/**
+ * Max bytes in an attachment filename.
+ *
+ * 255 is the basename limit on every filesystem we read from, so no real
+ * file can exceed it — this only bounds the caller-supplied `filename`
+ * override. It also keeps the encoded parameter inside RFC 5322's 998-char
+ * hard line limit: 255 bytes percent-encode to at most 765 characters,
+ * which still fits after the longest MIME type and parameter prefix.
+ *
+ * RFC 2231 continuations (`filename*0*`, `filename*1*`…) are the other way
+ * to solve this. Rejecting is the better trade here: continuations would be
+ * a mechanism that only ever runs on input no real file can produce, so it
+ * would rot untested, and a loud failure matches how the rest of this path
+ * already behaves.
+ */
+export const MAX_FILENAME_BYTES = 255;
+
+/** RFC 5322 §2.1.1 hard limit, including CRLF. */
+const MAX_LINE_LENGTH = 998;
+
 // ============================================================================
 // Address parsing
 // ============================================================================
@@ -43,6 +63,13 @@ const BASE64_LINE_LENGTH = 76;
  * comma — `"Shrestha, Sneha" <s@x.com>` is one address, not two — so this
  * walks the string tracking quote state and angle-bracket depth and only
  * breaks on top-level commas.
+ *
+ * RFC 5322 groups (`Team: a@x.com, b@y.com;`) are flattened to their member
+ * mailboxes. The group label before the colon is discarded and the closing
+ * semicolon terminates the member currently being read — otherwise the
+ * label glues itself to the first member and the semicolon to the last,
+ * corrupting both. An empty group like `undisclosed-recipients:;` yields
+ * nothing, which is exactly right.
  */
 export function splitAddressList(header: string): string[] {
   const parts: string[] = [];
@@ -77,7 +104,12 @@ export function splitAddressList(header: string): string[] {
       current += char;
       continue;
     }
-    if (char === ',' && !inQuotes && !inAngles) {
+    // Group label: everything read so far names the group, not a mailbox.
+    if (char === ':' && !inQuotes && !inAngles) {
+      current = '';
+      continue;
+    }
+    if ((char === ',' || char === ';') && !inQuotes && !inAngles) {
       parts.push(current);
       current = '';
       continue;
@@ -130,17 +162,30 @@ export function parseAddressList(header: string): EmailAddress[] {
     .filter((a) => a.email.length > 0);
 }
 
+/** RFC 5322 `atext` — every character legal in an unquoted local part. */
+const ATEXT = "[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]";
+
+/** A DNS label: alphanumerics with internal hyphens. */
+const DNS_LABEL = '[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?';
+
+/** dot-atom local part @ a domain of two or more labels. */
+const ADDR_SPEC = new RegExp(`^${ATEXT}+(?:\\.${ATEXT}+)*@${DNS_LABEL}(?:\\.${DNS_LABEL})+$`);
+
 /**
  * Is this a usable addr-spec for an outbound header?
  *
- * Deliberately permissive about the local part and strict about the
- * shape: an address must have exactly the separators that make it
- * routable and none of the characters that would let it break out of the
- * header it is written into. This is the gate that keeps a mis-parsed
- * fragment like `m` from ever reaching a Cc line again.
+ * This is an ALLOWLIST, and that is the whole point. It was previously a
+ * denylist of characters that could break out of a header, and a denylist
+ * has to anticipate every hostile character: it missed a trailing `;`, so
+ * `Team: a@x.com, b@y.com;` — legal RFC group syntax — split into one
+ * rejected fragment and `b@y.com;`, which sailed through and produced a
+ * malformed `To:`. That was the third round of the same failure shape.
+ *
+ * Enumerating what IS legal ends the pattern: anything unanticipated is
+ * excluded by default rather than by having been thought of.
  */
 export function isValidAddress(address: string): boolean {
-  return /^[^\s@,<>"]+@[^\s@,<>".]+(\.[^\s@,<>".]+)+$/.test(address.trim());
+  return ADDR_SPEC.test(address.trim());
 }
 
 // ============================================================================
@@ -189,13 +234,41 @@ export function encodeHeaderWord(value: string): string {
     words.push(`=?UTF-8?B?${Buffer.from(chunk, 'utf8').toString('base64')}?=`);
   }
 
-  // Encoded-words on one line are separated by a space, which decoders drop.
-  return words.join(' ');
+  // Fold between encoded-words with CRLF + space (RFC 5322 §2.2.3 FWS,
+  // RFC 2047 §5). A long non-ASCII subject inflates ~3.3x through base64,
+  // so ~300 characters of Chinese on one line would breach the 998-char
+  // hard limit; folding keeps every line short no matter the length.
+  //
+  // Inserting CRLF here is safe even though sanitizeHeaderValue exists to
+  // remove it: this is our own structure, between words we generated. The
+  // caller's bytes are base64 *inside* the words and cannot reach the fold.
+  return words.join('\r\n ');
 }
 
 /** Build a header line with its value sanitized and encoded. */
 export function headerLine(name: string, value: string): string {
   return `${name}: ${encodeHeaderWord(sanitizeHeaderValue(value))}`;
+}
+
+/**
+ * Fail loudly if any header line breaches RFC 5322's 998-char hard limit.
+ *
+ * Applied only to header lines: bodies and attachments are base64-wrapped
+ * at 76 characters by construction, and walking a multi-megabyte payload
+ * to re-confirm that would be real work on a single-threaded server for no
+ * information.
+ */
+function assertHeaderLinesFit(lines: string[]): void {
+  for (const line of lines) {
+    for (const physical of line.split('\r\n')) {
+      if (physical.length > MAX_LINE_LENGTH) {
+        throw new Error(
+          `Header line exceeds RFC 5322's ${MAX_LINE_LENGTH}-character limit ` +
+            `(${physical.length}): ${physical.slice(0, 80)}…`
+        );
+      }
+    }
+  }
 }
 
 // ============================================================================
@@ -300,6 +373,11 @@ function quoteParam(value: string): string {
  */
 function encodeFilenameParam(param: 'filename' | 'name', filename: string): string {
   const safe = sanitizeHeaderValue(filename) || 'attachment';
+  if (Buffer.byteLength(safe, 'utf8') > MAX_FILENAME_BYTES) {
+    throw new Error(
+      `Attachment filename is too long (${Buffer.byteLength(safe, 'utf8')} bytes, max ${MAX_FILENAME_BYTES}).`
+    );
+  }
   if (!NON_ASCII.test(safe)) return `${param}=${quoteParam(safe)}`;
   return `${param}*=UTF-8''${encodeExtendedValue(safe)}`;
 }
@@ -330,6 +408,8 @@ export function buildRawMessage(options: BuildMessageOptions): string {
   const contentType = `text/${isHtml ? 'html' : 'plain'}; charset=utf-8`;
   const bodyPart = wrapBase64(Buffer.from(body, 'utf8'));
 
+  assertHeaderLinesFit(headers);
+
   let message: string;
 
   if (attachments.length === 0) {
@@ -356,10 +436,14 @@ export function buildRawMessage(options: BuildMessageOptions): string {
     ];
 
     for (const attachment of attachments) {
-      parts.push(
-        `--${boundary}`,
+      const partHeaders = [
         `Content-Type: ${attachment.mimeType}; ${encodeFilenameParam('name', attachment.filename)}`,
         `Content-Disposition: attachment; ${encodeFilenameParam('filename', attachment.filename)}`,
+      ];
+      assertHeaderLinesFit(partHeaders);
+      parts.push(
+        `--${boundary}`,
+        ...partHeaders,
         'Content-Transfer-Encoding: base64',
         '',
         wrapBase64(attachment.content)

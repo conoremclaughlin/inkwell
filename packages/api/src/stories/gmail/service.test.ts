@@ -230,6 +230,39 @@ describe('GmailService.replyToEmail', () => {
     expect(headerOf(sentRaw(), 'To')).toBe('good@example.com');
   });
 
+  // RFC group syntax is legal inbound. Split naively it leaves a trailing
+  // `;` glued to the last member, which the old denylist validator accepted
+  // and emitted as a malformed `To:` — the same shape as the original
+  // "Invalid Cc header" failure, one round later.
+  it('replies to the members of a grouped Reply-To', async () => {
+    mockMessagesGet.mockImplementation(
+      routeMessagesGet([
+        ...ORIGINAL_HEADERS,
+        { name: 'Reply-To', value: 'Team: a@example.com, b@example.com;' },
+      ])
+    );
+
+    await service.replyToEmail('user-1', { messageId: 'orig-1', body: 'ok' });
+    expect(headerOf(sentRaw(), 'To')).toBe('a@example.com, b@example.com');
+  });
+
+  it('Ccs the members of a grouped To on replyAll', async () => {
+    mockMessagesGet.mockImplementation(
+      routeMessagesGet([
+        { name: 'From', value: 'sender@x.com' },
+        { name: 'To', value: 'Team: a@example.com, b@example.com;' },
+        { name: 'Subject', value: 'Hi' },
+      ])
+    );
+
+    await service.replyToEmail('user-1', {
+      messageId: 'orig-1',
+      body: 'ok',
+      replyAll: true,
+    });
+    expect(headerOf(sentRaw(), 'Cc')).toBe('a@example.com, b@example.com');
+  });
+
   it('drops unroutable entries from the original recipients', async () => {
     mockMessagesGet.mockImplementation(
       routeMessagesGet([
