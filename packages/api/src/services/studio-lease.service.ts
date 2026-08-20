@@ -363,41 +363,6 @@ export class StudioLeaseService {
    * has ended" must never authorize pulling a worktree out from under it.
    */
   /**
-   * Does this session's runtime GATE every turn on an acknowledged prompt
-   * post? Stamped by the lifecycle route only for `turnGated` senders (the
-   * Ink REPL, which refuses turns without the acknowledged marker). The
-   * narrow not-mid-turn release proof is only evidence for gated sessions:
-   * for them, a NULL marker really means no turn is running. A historical
-   * "wrote it once" bit could not carry this weight — a hook CLI proceeds
-   * even when its prompt post is swallowed, so its idle state and its
-   * live-missed-prompt state are identical (round four). FAILS CLOSED: an
-   * unreadable proof reports UNPROVEN → conservative release rule.
-   */
-  private async hasProvenTurnSignal(
-    sessionId: string,
-    userId?: string,
-    // Proof must postdate this instant (round five): a gated runtime's claim
-    // cannot outlive its ownership. The sweep passes the lease's acquiredAt,
-    // so a proof stamped by an earlier Ink attachment never vouches for a
-    // lease acquired after a runtime/backend transition.
-    sinceIso?: string
-  ): Promise<boolean> {
-    let query = this.supabase.from('sessions').select('cli_turn_proven_at').eq('id', sessionId);
-    if (userId) query = query.eq('user_id', userId);
-    const { data, error } = await query.maybeSingle();
-    if (error) {
-      logger.warn('[StudioLease] Turn-proof read failed — treating session as UNPROVEN', {
-        sessionId,
-        error: error.message,
-      });
-      return false;
-    }
-    const proven = data?.cli_turn_proven_at;
-    if (!proven) return false;
-    return !sinceIso || proven >= sinceIso;
-  }
-
-  /**
    * The lifecycle route's prompt fence: HELD is only reported after a
    * successful exact-guarded CAS touch of this studio's lease (round five —
    * a plain read could observe a snapshot an already-running sweep is about
@@ -430,11 +395,33 @@ export class StudioLeaseService {
       }
       const lease = parseStudioLease(data?.lease);
       if (!lease || lease.quarantined || lease.sessionId !== sessionId) return false;
-      const touched = await this.casLease(studioId, userId, lease, {
-        ...lease,
-        heartbeatAt: new Date().toISOString(),
-      });
-      if (touched) return true;
+      // The heartbeat guard alone cannot see a pendingRelease marked between
+      // our read and this CAS — marking leaves heartbeatAt unchanged, so a
+      // stale touch would overwrite the whole JSON and ERASE the request
+      // while close_thread reports success (round six). Guard the exact
+      // pendingRelease state we read: any transition fails this CAS, and the
+      // re-read carries the marker into the rewrite instead of erasing it.
+      let touch = this.supabase
+        .from('studios')
+        .update({ lease: { ...lease, heartbeatAt: new Date().toISOString() } as unknown as Json })
+        .eq('id', studioId)
+        .eq('user_id', userId)
+        .eq('lease->>sessionId', lease.sessionId)
+        .eq('lease->>acquiredAt', lease.acquiredAt)
+        .eq('lease->>heartbeatAt', lease.heartbeatAt);
+      touch = lease.pendingRelease
+        ? touch.eq('lease->pendingRelease->>requestedAt', lease.pendingRelease.requestedAt)
+        : touch.is('lease->pendingRelease', null);
+      const { data: touched, error: touchError } = await touch.select('id');
+      if (touchError) {
+        logger.warn('[StudioLease] Lease touch failed — reporting NOT HELD (fail closed)', {
+          studioId,
+          sessionId,
+          error: touchError.message,
+        });
+        return false;
+      }
+      if (touched?.length) return true;
     }
     return false;
   }
@@ -1377,19 +1364,17 @@ export class StudioLeaseService {
       // attached terminal satisfies indefinitely.
       if (lease.pendingRelease && !lease.quarantined) {
         if (!(await this.isSessionMidTurn(lease.sessionId, row.user_id))) {
-          // The narrow proof only counts for sessions that have demonstrated
-          // they write the turn marker (round three): an unproven producer's
-          // NULL marker may hide a live external turn whose prompt post was
-          // swallowed, so it falls back to the conservative rule — not live
-          // AND (stale OR terminal) — and, below, to sweep renewal while its
-          // presence persists. Proven sessions release at the narrow proof,
-          // which is the pr:498/pr:499 fix.
-          const proven = await this.hasProvenTurnSignal(
-            lease.sessionId,
-            row.user_id,
-            lease.acquiredAt // proof must postdate THIS lease's tenure (round five)
-          );
-          if (proven || (await this.canReleaseNow(lease, row.user_id))) {
+          // Completion authority lives at REAL boundaries only: the holder's
+          // stop event (releaseAtBoundary), a terminal session, or presence
+          // loss. Six review rounds proved client-pushed testimony cannot
+          // safely AUTHORIZE a release — every proof scheme leaked at an
+          // ownership or visibility boundary — so the sweep completes a
+          // pendingRelease only when the holder is provably gone
+          // (canReleaseNow: not live AND (stale OR terminal)). The accepted
+          // residual: an idle holder whose terminal stays open keeps its
+          // pendingRelease deferred (and renewed below) until its next stop
+          // boundary or the terminal closes — delayed, never premature.
+          if (await this.canReleaseNow(lease, row.user_id)) {
             const ok = await this.releaseStudio(row.id, row.user_id, lease, row.worktree_path, {
               reason: lease.pendingRelease.reason,
             });

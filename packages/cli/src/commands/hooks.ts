@@ -753,11 +753,12 @@ async function updateRuntimeGenerationState(
   if (!sessionId) return;
 
   // Two attempts: hooks cannot gate the backend turn (they are out-of-band
-  // observers), so a missed prompt write leaves the turn unproven and the
-  // lease sweep falls back to its conservative unproven-producer path
-  // (studio-lease.service.ts). The retry shrinks that window against
-  // transient blips; a true fail-closed for claude-code (UserPromptSubmit
-  // can block) is tracked separately (task 0b9bb780).
+  // observers), so a missed prompt write leaves the turn invisible — the
+  // lease machinery therefore only ever treats the marker as PROTECTIVE
+  // (an open marker defers releases; its absence never authorizes one).
+  // The retry shrinks the invisibility window against transient blips; a
+  // true fail-closed for claude-code (UserPromptSubmit can block) is
+  // tracked separately (task 0b9bb780).
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
       const serverUrl = getPcpServerUrl();

@@ -53,7 +53,6 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         cliAttached,
         cliPollAt,
         alias,
-        turnGated,
         studioId,
       } = req.body as {
         sessionId?: string;
@@ -71,15 +70,6 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         cliAttached?: boolean;
         cliPollAt?: string;
         alias?: string;
-        /**
-         * The sender declares that its runtime GATES every turn on an
-         * acknowledged prompt post (the Ink REPL refuses turns otherwise).
-         * Only gated prompts stamp cli_turn_proven_at — a producer that
-         * proceeds regardless (hook CLIs) must never become proven, or an
-         * old proof would vouch for a turn whose prompt was swallowed
-         * (PR #506 round four).
-         */
-        turnGated?: boolean;
         /** Caller's worktree studio, for the fenced lease-held report. */
         studioId?: string;
       };
@@ -120,7 +110,6 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         cliAttached?: boolean;
         cliPollAt?: string;
         cliTurnAt?: string | null;
-        cliTurnProvenAt?: string | null;
         alias?: string | null;
       } = {};
       if (lifecycle) updates.lifecycle = lifecycle;
@@ -142,26 +131,10 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
       // the whole turn (PR #492 round 6). Legacy senders without the event
       // field: infer prompt from lifecycle 'running' (safe — it only extends
       // protection), never infer stop.
-      if (cliAttached === false) {
-        updates.cliTurnAt = null;
-        // The proof dies with its owner (round five): detach is process proof
-        // that the gated runtime left; whatever attaches next must re-prove.
-        updates.cliTurnProvenAt = null;
-      }
+      if (cliAttached === false) updates.cliTurnAt = null;
       const isPromptEvent = event === 'prompt' || (!event && lifecycle === 'running');
       const isStopEvent = event === 'stop';
-      if (isPromptEvent) {
-        const now = new Date().toISOString();
-        updates.cliTurnAt = now;
-        // Proof is a CONTRACT claim, not a historical fact (round four): only
-        // a runtime that gates every turn on this acknowledgement may become
-        // proven — for it, a NULL marker really means no turn is running.
-        // An UNGATED prompt is an ownership boundary the other way (round
-        // five): a non-gating producer just took a turn on this session, so
-        // any earlier gated claim no longer describes the process at the
-        // terminal — clear it, never let it be inherited.
-        updates.cliTurnProvenAt = turnGated === true ? now : null;
-      }
+      if (isPromptEvent) updates.cliTurnAt = new Date().toISOString();
       if (isStopEvent) updates.cliTurnAt = null;
 
       const updated = await dataComposer.repositories.memory.updateSession(sessionId, updates);

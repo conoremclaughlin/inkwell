@@ -51,10 +51,10 @@ export interface TurnSignalDeps {
 
 export interface TurnSignal {
   /**
-   * Turn is starting. Resolves `true` when protection is established (marker
-   * write acknowledged 2xx) or not needed (no PCP session); `false` when the
-   * write could not be confirmed — the caller decides via
-   * `turnMustFailClosed` whether the turn may run.
+   * Turn is starting. Resolves `true` when protection is established
+   * (marker write acknowledged AND the studio lease held); `false` when it
+   * could not be confirmed — including when no PCP session is attached. The
+   * caller decides via `turnGateDecision` whether the turn may run.
    */
   open(): Promise<boolean>;
   /** Turn is over — every exit path. Resolves `true` on acknowledged stop. */
@@ -179,10 +179,6 @@ export function createTurnSignal(deps: TurnSignalDeps): TurnSignal {
       const studioId = deps.getStudioId?.();
       const body: PostBody = {
         ...lifecycleBody('prompt', sessionId),
-        // This runtime GATES every turn on this acknowledgement — the claim
-        // that lets the server mark the session proven (round four). Never
-        // send this from a producer that proceeds on failure.
-        turnGated: true,
         ...(studioId ? { studioId } : {}),
       };
       return post('open', body, ackedAndHeld);

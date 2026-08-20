@@ -114,33 +114,17 @@ describe('hook-lifecycle CLI turn signal', () => {
   }
 
   it('the real two-request prompt sequence leaves the turn marker OPEN (round 6)', async () => {
-    // Request 1: a GATED prompt (the Ink REPL, which refuses turns without
-    // this acknowledgement) opens the turn AND stamps the proof — the lease
-    // sweep's narrow release path is only valid for gated sessions (PR #506
-    // round four).
-    const promptUpdates = await post({ lifecycle: 'running', event: 'prompt', turnGated: true });
+    // Request 1: the prompt event opens the turn.
+    const promptUpdates = await post({ lifecycle: 'running', event: 'prompt' });
     expect(typeof promptUpdates.cliTurnAt).toBe('string');
-    expect(promptUpdates.cliTurnProvenAt).toBe(promptUpdates.cliTurnAt);
 
     // Request 2: the CLI immediately re-asserts attachment. This must NOT
-    // touch the marker the prompt just opened — nor the proof.
+    // touch the marker the prompt just opened.
     const attachUpdates = await post({ cliAttached: true });
     expect('cliTurnAt' in attachUpdates).toBe(false);
-    expect('cliTurnProvenAt' in attachUpdates).toBe(false);
   });
 
-  it('an UNGATED prompt opens the turn and CLEARS the proof (rounds four–five)', async () => {
-    // Hook CLIs proceed even when their prompt post is swallowed, so their
-    // idle state and their live-missed-prompt state are identical — a
-    // historical proof bit from them would vouch for turns it cannot see.
-    // And an ungated prompt is an ownership boundary: a non-gating producer
-    // just took a turn, so any earlier gated claim must not be inherited.
-    const updates = await post({ lifecycle: 'running', event: 'prompt' });
-    expect(typeof updates.cliTurnAt).toBe('string');
-    expect(updates.cliTurnProvenAt).toBeNull();
-  });
-
-  it('a gated prompt with a worktree studio gets the fenced lease-held report', async () => {
+  it('a prompt with a worktree studio gets the fenced lease-held report', async () => {
     // The fake supabase holds no studios — the truthful answer is NOT HELD,
     // which the gated caller treats as unacknowledged (no turn under a
     // released lease). The field exists exactly when a fence is meaningful.
@@ -151,7 +135,6 @@ describe('hook-lifecycle CLI turn signal', () => {
         sessionId: 'session-1',
         lifecycle: 'running',
         event: 'prompt',
-        turnGated: true,
         studioId: '5bea57f3-6b24-4126-abe4-0d1cc2bd9647',
       }),
     });
@@ -169,12 +152,9 @@ describe('hook-lifecycle CLI turn signal', () => {
     expect('studioLeaseHeld' in body2).toBe(false);
   });
 
-  it('an explicit detach clears the marker AND the gated proof (process proof)', async () => {
+  it('an explicit detach clears the marker (process proof)', async () => {
     const updates = await post({ cliAttached: false });
     expect(updates.cliTurnAt).toBeNull();
-    // Round five: the contract claim dies with its owner — whatever attaches
-    // next (possibly an ungated hook CLI resuming the session) must re-prove.
-    expect(updates.cliTurnProvenAt).toBeNull();
   });
 
   it('only the real stop event closes the turn; post-compact idle does not', async () => {

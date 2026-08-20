@@ -49,7 +49,6 @@ describe('createTurnSignal', () => {
       event: 'prompt',
       agentId: 'wren',
       workingDir: '/work/tree',
-      turnGated: true, // this runtime gates every turn on the acknowledgement
     });
   });
 
@@ -159,9 +158,7 @@ describe('the prompt fence — studioLeaseHeld (round four)', () => {
   it('open() carries the worktree studio for the per-studio held report', async () => {
     const { deps, fetchImpl } = makeDeps({ getStudioId: () => 'studio-uuid-1' });
     await createTurnSignal(deps).open();
-    const body = bodyOf(fetchImpl);
-    expect(body.turnGated).toBe(true);
-    expect(body.studioId).toBe('studio-uuid-1');
+    expect(bodyOf(fetchImpl).studioId).toBe('studio-uuid-1');
   });
 
   it('a 2xx that reports the lease NOT HELD is not protection — a release won the race', async () => {
