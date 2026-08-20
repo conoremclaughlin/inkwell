@@ -297,14 +297,28 @@ describe('buildRawMessage', () => {
   // `encodeURIComponent` passed such an assertion while emitting parameters
   // that Python's email parser rejects as defective.
   describe('filename round-trip', () => {
-    /** Decode a Content-Disposition filename parameter back to its name. */
+    /**
+     * Decode a Content-Disposition filename parameter back to its name,
+     * STRICTLY — rejecting anything a standards parser would reject.
+     *
+     * The strictness is the whole point. A lenient decoder that just
+     * percent-decodes and passes other bytes through accepts the malformed
+     * output of `encodeURIComponent` and reports a clean round-trip, which
+     * is how this bug survived the first round of tests. Cross-checked
+     * against Python 3.12's email parser, which agrees on all eight cases.
+     */
     const readFilename = (decoded: string): string => {
       const extended = decoded.match(/filename\*=UTF-8''([^\r\n;]+)/);
       if (extended) {
+        const value = extended[1];
+        const illegal = value.replace(/%[0-9A-F]{2}/gi, '').match(/[^A-Za-z0-9!#$&+\-.^_`|~]/);
+        if (illegal) {
+          throw new Error(
+            `filename* carries ${JSON.stringify(illegal[0])}, which is not an RFC 5987 attr-char: ${value}`
+          );
+        }
         return Buffer.from(
-          extended[1].replace(/%([0-9A-F]{2})/gi, (_, hex) =>
-            String.fromCharCode(parseInt(hex, 16))
-          ),
+          value.replace(/%([0-9A-F]{2})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16))),
           'binary'
         ).toString('utf8');
       }
