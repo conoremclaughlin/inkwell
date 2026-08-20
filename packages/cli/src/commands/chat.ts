@@ -5510,11 +5510,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
     }
   };
   // The REPL's half of the hook-owned turn marker (PR #506 P1, Lumen):
-  // `cli_turn_at` is `isSessionMidTurn`'s only proof for CLI processes
-  // outside the API run registry, and an interactive Ink turn set neither
-  // signal — so the sweep completed a pendingRelease while a turn was still
-  // running in this worktree. The route stays the single writer; the REPL
-  // only posts the same prompt/stop events the backend lifecycle hooks send.
+  // `cli_turn_at` is the lease machinery's only turn signal for CLI
+  // processes outside the API run registry, and an interactive Ink turn set
+  // neither signal — the whole turn ran invisible to liveness, deferral, and
+  // boundary logic. The route stays the single writer; the REPL only posts
+  // the same prompt/stop events the backend lifecycle hooks send.
   const turnSignal = createTurnSignal({
     getSessionId: () => runtime.sessionId,
     getStudioId: () => currentPcpStudioId(),
@@ -5576,9 +5576,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
       // Turn open before any backend work; turn close on EVERY exit path via
       // finally. The directions differ (round-two P1): a missed STOP decays
       // toward holding and is backstopped by the exit detach, but a missed
-      // PROMPT would run this turn unproven — a healthy sweep then clears a
-      // pendingRelease under the live process. So an unacknowledged open on
-      // studio-backed work refuses the turn instead of running unprotected.
+      // PROMPT runs this turn INVISIBLE to the lease machinery — liveness,
+      // deferral, and boundary logic all read the marker. So an
+      // unacknowledged open on studio-backed work refuses the turn instead
+      // of running unprotected.
       const turnProtected = await turnSignal.open();
       try {
         const gate = turnGateDecision(runtime.sessionId, turnProtected, currentPcpStudioId());

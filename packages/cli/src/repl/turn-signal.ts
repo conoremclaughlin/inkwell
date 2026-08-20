@@ -6,9 +6,10 @@
  * signals: the API process's in-process run registry (server-spawned runners
  * only) and this marker. An interactive `ink chat` REPL is neither — it runs
  * turns in its own process and, before this module, never posted the
- * `prompt`/`stop` lifecycle events that own the marker. Consequence (PR #506
- * P1, Lumen): a `pendingRelease` stamped on the session's lease was completed
- * by the sweep while a REPL turn was still running in the worktree.
+ * `prompt`/`stop` lifecycle events that own the marker. An unmarked turn is
+ * INVISIBLE to the lease machinery: reclaim/adoption liveness, boundary
+ * releases, and the sweep's defer logic all read the marker, so protection
+ * degrades to presence heuristics for the whole turn (PR #506 P1, Lumen).
  *
  * The server route (`/api/hooks/lifecycle`) stays the single writer:
  *   - `open()`   → `event: 'prompt'` — sets `cli_turn_at`, renews the lease
@@ -18,9 +19,9 @@
  *     left; clears the marker. The exit-path fallback for a missed stop.
  *
  * Failure semantics are DIRECTIONAL, not symmetric (round-two P1):
- *   - A missed `prompt` fails toward PREMATURE RELEASE — the turn would run
- *     unproven, and a healthy sweep clears any pendingRelease under the live
- *     process. So `open()` retries, then reports `false` — including when no
+ *   - A missed `prompt` fails toward an UNPROTECTED TURN — the lease
+ *     machinery cannot see it. So `open()` retries, then reports `false` —
+ *     including when no
  *     PCP session is attached at all — and the caller MUST fail closed for
  *     studio-backed work via `turnGateDecision`: no acknowledged marker, no
  *     turn.

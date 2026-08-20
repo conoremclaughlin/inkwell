@@ -1456,6 +1456,47 @@ describe('touchStudioLeaseForSession — the prompt fence (rounds five–six)', 
     expect(after.pendingRelease).toEqual(marker);
     expect(held).toBe(true);
   });
+
+  /**
+   * Round seven (Lumen, red-verified): the same erasure through RENEWAL.
+   * renewBySession reads the unmarked lease, close_thread stamps
+   * pendingRelease (heartbeat unchanged), and the renewal's whole-JSON CAS
+   * still matched on session/acquired/heartbeat — overwriting the lease with
+   * its stale pre-marker snapshot. The guard now lives in the shared
+   * casLease, so EVERY rewrite path is transition-safe, not just the touch.
+   */
+  it('a pendingRelease marked during a renewal is preserved — the shared CAS guards it', async () => {
+    const staleBeat = new Date(Date.now() - 60_000).toISOString();
+    const lease = freshLease({ sessionId: 'sess-r', threadKey: 'pr:93', heartbeatAt: staleBeat });
+    const tables: Record<string, Row[]> = {
+      studios: [{ id: 's-r', user_id: 'u', lease: lease as unknown as Row, worktree_path: null }],
+      studio_lease_events: [],
+      inbox_threads: [],
+      agent_identities: [],
+      sessions: [],
+    };
+    const marker = { reason: 'thread-closed', requestedAt: new Date().toISOString() };
+    const service = new StudioLeaseService(
+      makeFakeSupabase(tables, {
+        afterSelect: (table, count) => {
+          if (table === 'studios' && count === 1) {
+            const row = tables.studios[0];
+            row.lease = {
+              ...(row.lease as unknown as StudioLease),
+              pendingRelease: marker,
+            } as unknown as Row;
+          }
+        },
+      })
+    );
+
+    const renewed = await service.renewBySession('sess-r', 'u');
+    const after = tables.studios[0].lease as unknown as StudioLease;
+
+    expect(after.pendingRelease).toEqual(marker); // close_thread's request survives
+    expect(after.heartbeatAt).toBe(staleBeat); // the stale rewrite lost its CAS
+    expect(renewed).toBe(false);
+  });
 });
 
 /**

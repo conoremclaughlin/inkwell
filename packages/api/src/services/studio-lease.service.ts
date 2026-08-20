@@ -14,15 +14,19 @@
  *              then performed by the run/stop boundary or the sweep
  *   - expire:  heartbeatAt stale beyond LEASE_STALE_MS → claimed, rescued, released
  *
- * TWO PROOFS, NOT ONE — they are not interchangeable:
+ * TWO PROOFS, NOT ONE — and NEITHER authorizes a release on its own:
  *   - PRESENCE (isSessionLive: in-process run, fresh cli_poll_at, open turn)
  *     gates taking a lease AWAY from a holder that never asked to give it up:
  *     reclaim, adoption, teardown.
- *   - MID-TURN (isSessionMidTurn: in-process run, open cli_turn_at) gates
- *     completing a release the holder ITSELF requested.
- *   Presence is satisfied indefinitely by an idle attached terminal, so using
- *   it to gate a requested release pins the studio for as long as someone
- *   leaves a shell open. That is what pinned pr:498 for 2.84 days.
+ *   - MID-TURN (isSessionMidTurn: in-process run, open cli_turn_at) DEFERS
+ *     completing a release the holder ITSELF requested — protection only.
+ *   A requested release COMPLETES only at a real boundary: the holder's stop
+ *   event (releaseAtBoundary), a terminal session, or presence loss
+ *   (canReleaseNow). Client testimony never authorizes early completion —
+ *   six PR #506 review rounds of proof schemes each leaked at an ownership
+ *   boundary. Accepted residual: an idle holder with an open terminal keeps
+ *   its pendingRelease deferred (bounded delay: next stop, or staleness
+ *   after the terminal closes) — delayed, never premature.
  *
  * Safety invariants (PR #492 review rounds 1–3, Lumen):
  *   - Every read and CAS is scoped to the owning user.
@@ -340,27 +344,19 @@ export class StudioLeaseService {
 
   /**
    * Is the session's process INSIDE a turn right now? A strictly narrower
-   * question than isSessionLive, and the only one a recorded pendingRelease
-   * may wait on.
-   *
-   * isSessionLive answers "is a process attached to this session", which it
-   * derives partly from `cli_poll_at` — the channel plugin's inbox poll. That
-   * is a PRESENCE signal: an idle CLI sitting at a prompt keeps stamping it
-   * for as long as the terminal stays open. Presence is the right proof for
-   * taking a lease AWAY from a holder that never asked to give it up
-   * (reclaim, teardown) — it is the wrong proof for completing a release the
-   * holder itself requested.
-   *
-   * Using presence there deadlocked: close_thread defers to the holder's next
-   * boundary, the holder's reason for closing is that its work is done, so no
-   * next boundary arrives — and the sweep, the designed backstop, refused to
-   * act because the terminal was still polling. Studio 6783f054 held pr:498
-   * for 2.84 days after a release requested 68 seconds post-merge; pr:499
-   * reproduced it, with the sweep RENEWING a lease that had asked to die 46
-   * minutes earlier. Both holders had `cli_turn_at` NULL the whole time.
+   * question than isSessionLive, used as an ADDITIONAL defer on completing a
+   * requested release — protection stacked on protection, never
+   * authorization. An open marker always defers; its absence proves nothing
+   * (a producer whose prompt post was swallowed is invisible), so completion
+   * still requires canReleaseNow's real-boundary proof. Six PR #506 review
+   * rounds of trying to promote this marker's absence into an authorization
+   * (proof bits, contract claims, tenure scoping) each leaked at an
+   * ownership or visibility boundary; the accepted trade is bounded delay —
+   * the pr:498/pr:499 idle-open-terminal shape defers until its next stop
+   * boundary or the terminal closes — never premature release.
    *
    * FAILS CLOSED: a read error reports MID-TURN — "could not verify the turn
-   * has ended" must never authorize pulling a worktree out from under it.
+   * has ended" must never help pull a worktree out from under it.
    */
   /**
    * The lifecycle route's prompt fence: HELD is only reported after a
@@ -395,33 +391,14 @@ export class StudioLeaseService {
       }
       const lease = parseStudioLease(data?.lease);
       if (!lease || lease.quarantined || lease.sessionId !== sessionId) return false;
-      // The heartbeat guard alone cannot see a pendingRelease marked between
-      // our read and this CAS — marking leaves heartbeatAt unchanged, so a
-      // stale touch would overwrite the whole JSON and ERASE the request
-      // while close_thread reports success (round six). Guard the exact
-      // pendingRelease state we read: any transition fails this CAS, and the
-      // re-read carries the marker into the rewrite instead of erasing it.
-      let touch = this.supabase
-        .from('studios')
-        .update({ lease: { ...lease, heartbeatAt: new Date().toISOString() } as unknown as Json })
-        .eq('id', studioId)
-        .eq('user_id', userId)
-        .eq('lease->>sessionId', lease.sessionId)
-        .eq('lease->>acquiredAt', lease.acquiredAt)
-        .eq('lease->>heartbeatAt', lease.heartbeatAt);
-      touch = lease.pendingRelease
-        ? touch.eq('lease->pendingRelease->>requestedAt', lease.pendingRelease.requestedAt)
-        : touch.is('lease->pendingRelease', null);
-      const { data: touched, error: touchError } = await touch.select('id');
-      if (touchError) {
-        logger.warn('[StudioLease] Lease touch failed — reporting NOT HELD (fail closed)', {
-          studioId,
-          sessionId,
-          error: touchError.message,
-        });
-        return false;
-      }
-      if (touched?.length) return true;
+      // casLease carries the pendingRelease-state guard (round seven), so a
+      // marker landing between our read and this CAS fails the CAS and the
+      // re-read carries it into the rewrite instead of erasing it.
+      const touched = await this.casLease(studioId, userId, lease, {
+        ...lease,
+        heartbeatAt: new Date().toISOString(),
+      });
+      if (touched) return true;
     }
     return false;
   }
@@ -694,6 +671,18 @@ export class StudioLeaseService {
       .eq('lease->>sessionId', from.sessionId)
       .eq('lease->>acquiredAt', from.acquiredAt)
       .eq('lease->>heartbeatAt', from.heartbeatAt);
+    // pendingRelease is the ONE lease mutation that changes neither session,
+    // acquiredAt, nor heartbeatAt — so without this guard, any whole-JSON
+    // rewrite (a renewal, a touch) racing close_thread's marker would match
+    // the three fields above and silently ERASE the release request while
+    // close_thread reports success (round seven; first seen on the touch in
+    // round six, then red-verified on renewBySession). Guarding the exact
+    // pendingRelease state `from` was read with makes every CAS
+    // transition-safe: a marker landing after the read fails the CAS, and
+    // the caller's re-read carries it forward instead of overwriting it.
+    query = from.pendingRelease
+      ? query.eq('lease->pendingRelease->>requestedAt', from.pendingRelease.requestedAt)
+      : query.is('lease->pendingRelease', null);
     if (opts.requireAcquirableStatus) {
       query = query.in('status', StudioLeaseService.ACQUIRABLE_STATUSES);
     }
@@ -1356,12 +1345,12 @@ export class StudioLeaseService {
       const lease = parseStudioLease(row.lease);
       if (!lease) continue;
 
-      // Deferred-release backstop. This is not a rare crash path: the holder
-      // asks to release because its work is DONE, so its next turn boundary
-      // usually never comes and the sweep is the normal completion path, not
-      // the exception. It therefore waits only on the narrow proof — the
-      // holder is not mid-turn — never on the presence proof, which an idle
-      // attached terminal satisfies indefinitely.
+      // Deferred-release backstop for holders whose boundary never fires
+      // (crashed processes, closed terminals). An open turn marker always
+      // defers; beyond that, completion requires the real-boundary proof
+      // below — an idle attached terminal therefore keeps its deferred
+      // release pending (bounded delay), because its "done-ness" cannot be
+      // proven from here, only from its own stop event.
       if (lease.pendingRelease && !lease.quarantined) {
         if (!(await this.isSessionMidTurn(lease.sessionId, row.user_id))) {
           // Completion authority lives at REAL boundaries only: the holder's
