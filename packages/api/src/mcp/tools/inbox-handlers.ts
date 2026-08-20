@@ -6,6 +6,8 @@
  */
 
 import { z } from 'zod';
+import { ThreadKeyService } from '../../services/thread-key/thread-key.service';
+import { parseThreadKey } from '../../services/thread-key/parser';
 import type { DataComposer } from '../../data/composer';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
 import { resolveIdentityId, resolveAgentSlug } from '../../auth/resolve-identity';
@@ -1029,6 +1031,34 @@ async function findOrCreateThread(
     return { id: existing.id, isNew: false };
   }
 
+  // Pin the parsed key identity at creation (thread-key-grammar v2; Lumen
+  // re-review condition 2). The parse is registry-driven — the first segment
+  // is a project only when it matches a registered projects.slug — so a LIVE
+  // parse is unstable: creating slug "foo" tomorrow would reinterpret today's
+  // "foo:bar:baz" from (null, foo, bar:baz) to (foo, bar, baz). Keys are
+  // immutable; their identity must be too. Parsed once, stored, consumed from
+  // the row. A parse/lookup failure stamps nothing rather than blocking the
+  // send — an untyped thread degrades to the conservative unknown default.
+  let keyProject: string | null = null;
+  let keyType: string | null = null;
+  let keyId: string | null = null;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const threadKeyService = new ThreadKeyService(supabase as any);
+    const slugs = await threadKeyService.projectSlugs(opts.userId);
+    const parsed = parseThreadKey(opts.threadKey, slugs);
+    if (parsed) {
+      keyProject = parsed.project;
+      keyType = parsed.type;
+      keyId = parsed.id;
+    }
+  } catch (err) {
+    logger.warn('[ThreadKey] Parse-at-creation failed; thread stays untyped', {
+      threadKey: opts.threadKey,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+
   // Create new thread
   const { data: thread, error } = await threadTable(supabase, 'inbox_threads')
     .insert({
@@ -1036,6 +1066,9 @@ async function findOrCreateThread(
       user_id: opts.userId,
       created_by_agent_id: opts.creatorAgentId,
       title: opts.title,
+      key_project: keyProject,
+      key_type: keyType,
+      key_id: keyId,
     })
     .select()
     .single();

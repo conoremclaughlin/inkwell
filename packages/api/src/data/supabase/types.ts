@@ -1512,6 +1512,9 @@ export type Database = {
           created_at: string | null;
           created_by_agent_id: string;
           id: string;
+          key_id: string | null;
+          key_project: string | null;
+          key_type: string | null;
           metadata: Json | null;
           status: string;
           thread_key: string;
@@ -1525,6 +1528,9 @@ export type Database = {
           created_at?: string | null;
           created_by_agent_id: string;
           id?: string;
+          key_id?: string | null;
+          key_project?: string | null;
+          key_type?: string | null;
           metadata?: Json | null;
           status?: string;
           thread_key: string;
@@ -1538,6 +1544,9 @@ export type Database = {
           created_at?: string | null;
           created_by_agent_id?: string;
           id?: string;
+          key_id?: string | null;
+          key_project?: string | null;
+          key_type?: string | null;
           metadata?: Json | null;
           status?: string;
           thread_key?: string;
@@ -2306,6 +2315,7 @@ export type Database = {
           name: string;
           repo_root: string | null;
           repository_url: string | null;
+          slug: string | null;
           status: string | null;
           tech_stack: string[] | null;
           updated_at: string | null;
@@ -2320,6 +2330,7 @@ export type Database = {
           name: string;
           repo_root?: string | null;
           repository_url?: string | null;
+          slug?: string | null;
           status?: string | null;
           tech_stack?: string[] | null;
           updated_at?: string | null;
@@ -2334,6 +2345,7 @@ export type Database = {
           name?: string;
           repo_root?: string | null;
           repository_url?: string | null;
+          slug?: string | null;
           status?: string | null;
           tech_stack?: string[] | null;
           updated_at?: string | null;
@@ -3638,6 +3650,46 @@ export type Database = {
           },
           {
             foreignKeyName: 'tasks_user_id_fkey';
+            columns: ['user_id'];
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
+      thread_key_types: {
+        Row: {
+          created_at: string;
+          description: string | null;
+          id: string;
+          studio_policy: string;
+          type: string;
+          updated_at: string;
+          user_id: string | null;
+          write_intent: string;
+        };
+        Insert: {
+          created_at?: string;
+          description?: string | null;
+          id?: string;
+          studio_policy: string;
+          type: string;
+          updated_at?: string;
+          user_id?: string | null;
+          write_intent: string;
+        };
+        Update: {
+          created_at?: string;
+          description?: string | null;
+          id?: string;
+          studio_policy?: string;
+          type?: string;
+          updated_at?: string;
+          user_id?: string | null;
+          write_intent?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'thread_key_types_user_id_fkey';
             columns: ['user_id'];
             referencedRelation: 'users';
             referencedColumns: ['id'];

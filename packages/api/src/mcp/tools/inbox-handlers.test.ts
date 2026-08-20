@@ -528,6 +528,7 @@ function createThreadMockSupabase(
   let insertedMetadata: Record<string, unknown> | null = null;
 
   // inbox_threads table mock
+  const threadInserts: Array<Record<string, unknown>> = [];
   const threadsFindChain = {
     select: vi.fn().mockReturnValue({
       eq: vi.fn().mockReturnValue({
@@ -539,13 +540,16 @@ function createThreadMockSupabase(
         }),
       }),
     }),
-    insert: vi.fn().mockReturnValue({
-      select: vi.fn().mockReturnValue({
-        single: vi.fn().mockResolvedValue({
-          data: { id: threadId },
-          error: null,
+    insert: vi.fn().mockImplementation((row: Record<string, unknown>) => {
+      threadInserts.push(row);
+      return {
+        select: vi.fn().mockReturnValue({
+          single: vi.fn().mockResolvedValue({
+            data: { id: threadId },
+            error: null,
+          }),
         }),
-      }),
+      };
     }),
     update: vi.fn().mockReturnValue({
       eq: vi.fn().mockResolvedValue({ data: null, error: null }),
@@ -632,6 +636,17 @@ function createThreadMockSupabase(
         return readStatusChain;
       case 'agent_identities':
         return identityChain;
+      case 'projects': {
+        // Project slugs for the registry-driven thread-key parse.
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const projectsChain: Record<string, any> = {};
+        for (const m of ['select', 'eq', 'not']) {
+          projectsChain[m] = vi.fn().mockReturnValue(projectsChain);
+        }
+        projectsChain.then = (resolve: (v: unknown) => unknown) =>
+          Promise.resolve({ data: [{ slug: 'pcp' }], error: null }).then(resolve);
+        return projectsChain;
+      }
       default:
         return threadsFindChain;
     }
@@ -645,6 +660,7 @@ function createThreadMockSupabase(
   });
 
   return {
+    threadInserts,
     from: fromFn,
     rpc: rpcFn,
     getInsertedMetadata: () => insertedMetadata,
@@ -2435,5 +2451,70 @@ describe('handleGetInbox — channelPoll thread paging via get_unread_thread_can
     // poller sees an explicit incomplete signal and withholds drain proof.
     expect(parsed.channelPollIncomplete).toBe(true);
     expect(parsed.warning).toContain('channel_poll_incomplete');
+  });
+});
+
+// =====================================================
+// THREAD-KEY PIN-AT-CREATION (grammar v2; Lumen re-review condition 2)
+// =====================================================
+
+describe('Thread creation pins the parsed key identity', () => {
+  it('stamps (project, type, id) for a project-prefixed key', async () => {
+    const { getRequestContext, getSessionContext } = await import('../../utils/request-context');
+    vi.mocked(getRequestContext).mockReturnValue(undefined as never);
+    vi.mocked(getSessionContext).mockReturnValue(undefined as never);
+
+    const mockSb = createThreadMockSupabase({ existingThread: undefined });
+    const mockDc = createThreadMockDataComposer(mockSb);
+
+    await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientAgentId: 'lumen',
+        senderAgentId: 'wren',
+        threadKey: 'pcp:issue:tool-schema-discovery',
+        content: 'hello',
+      },
+      mockDc as never
+    );
+
+    expect(mockSb.threadInserts).toContainEqual(
+      expect.objectContaining({
+        thread_key: 'pcp:issue:tool-schema-discovery',
+        key_project: 'pcp',
+        key_type: 'issue',
+        key_id: 'tool-schema-discovery',
+      })
+    );
+  });
+
+  it('stamps (null, type, id) for an unprefixed key — and an unregistered first segment is a TYPE', async () => {
+    const { getRequestContext, getSessionContext } = await import('../../utils/request-context');
+    vi.mocked(getRequestContext).mockReturnValue(undefined as never);
+    vi.mocked(getSessionContext).mockReturnValue(undefined as never);
+
+    const mockSb = createThreadMockSupabase({ existingThread: undefined });
+    const mockDc = createThreadMockDataComposer(mockSb);
+
+    await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientAgentId: 'lumen',
+        senderAgentId: 'wren',
+        // 'openclaw' is not a registered slug in the mock (only 'pcp' is), so
+        // it parses as the TYPE — registry-driven, never positional.
+        threadKey: 'openclaw:issue:15',
+        content: 'hello',
+      },
+      mockDc as never
+    );
+
+    expect(mockSb.threadInserts).toContainEqual(
+      expect.objectContaining({
+        key_project: null,
+        key_type: 'openclaw',
+        key_id: 'issue:15',
+      })
+    );
   });
 });

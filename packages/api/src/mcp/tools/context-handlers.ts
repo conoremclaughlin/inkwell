@@ -131,6 +131,15 @@ export const saveProjectSchema = userIdentifierBaseSchema.extend({
     .string()
     .optional()
     .describe('Local filesystem path to the repo root (e.g., /Users/.../my-project)'),
+  slug: z
+    .string()
+    .regex(/^[a-z0-9][a-z0-9-]*$/, 'lowercase letters, digits, and hyphens only')
+    .max(32)
+    .nullable()
+    .optional()
+    .describe(
+      'Thread-key project prefix (e.g., "inkread" in inkread:pr:42). Reserved against thread-key type names. Pass null to clear.'
+    ),
   goals: z.array(z.string()).optional().describe('Project goals/milestones'),
 });
 
@@ -147,6 +156,29 @@ export async function handleSaveProject(args: unknown, dataComposer: DataCompose
   const params = saveProjectSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
 
+  // Reserved-name rule (thread-key-grammar v2): a project slug must not
+  // collide with a registered thread-key TYPE — template or this user's
+  // override. That collision is the grammar's one structural ambiguity
+  // ("is pr:... segment 1 a project or a type?"), killed at write time.
+  if (params.slug) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: typeRows, error: typeErr } = await (dataComposer.getClient() as any)
+      .from('thread_key_types')
+      .select('type, user_id')
+      .eq('type', params.slug)
+      .or(`user_id.is.null,user_id.eq.${user.id}`);
+    if (typeErr) {
+      // Fail closed: cannot prove no collision -> refuse, never guess.
+      throw new Error(`Could not verify slug against thread-key types: ${typeErr.message}`);
+    }
+    if ((typeRows || []).length > 0) {
+      throw new Error(
+        `Project slug "${params.slug}" collides with the thread-key type "${params.slug}". ` +
+          'Type names are reserved against project slugs (thread-key-grammar v2).'
+      );
+    }
+  }
+
   const project = await dataComposer.repositories.projects.upsertByName({
     user_id: user.id,
     name: params.name,
@@ -155,6 +187,7 @@ export async function handleSaveProject(args: unknown, dataComposer: DataCompose
     tech_stack: params.techStack,
     repository_url: params.repositoryUrl,
     repo_root: params.repoRoot,
+    slug: params.slug,
     goals: params.goals,
   });
 
@@ -172,6 +205,7 @@ export async function handleSaveProject(args: unknown, dataComposer: DataCompose
             project: {
               id: project.id,
               name: project.name,
+              slug: project.slug ?? null,
               description: project.description,
               status: project.status,
               tech_stack: project.tech_stack,
