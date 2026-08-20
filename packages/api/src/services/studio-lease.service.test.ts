@@ -40,6 +40,13 @@ type Row = Record<string, unknown>;
 interface FakeHooks {
   /** Fires after each select executes on the named table. */
   afterSelect?: (table: string, count: number) => void;
+  /**
+   * Fires inside grant_studio_lease / studio_path_conflict AFTER the
+   * pre-lock path read and BEFORE the sibling scan + CAS — the r4 P0-2
+   * TOCTOU window. A test mutates rows here to simulate a concurrent
+   * backing move that the CAS predicate must catch.
+   */
+  onGrantWindow?: () => void;
 }
 
 function getCol(row: Row, col: string): unknown {
@@ -137,11 +144,18 @@ class FakeQuery {
 
 function normalizePath(p: unknown): string | null {
   if (typeof p !== 'string' || p === '') return null;
-  return p
-    .replace(/\/{2,}/g, '/')
-    .replace(/\/\.\//g, '/')
-    .replace(/\/\.$/g, '')
-    .replace(/\/$/, '');
+  // SQL parity (r4 P0-1): canonical input or error. The DB rejects relative
+  // paths and '.'/'..' segments instead of guessing at them; what remains
+  // (slash collapse, trailing slash except root) is idempotent.
+  if (!p.startsWith('/')) {
+    throw new Error(`worktree_path must be absolute: ${p}`);
+  }
+  if (/(^|\/)\.\.?(\/|$)/.test(p)) {
+    throw new Error(`worktree_path must not contain . or .. segments: ${p}`);
+  }
+  let v = p.replace(/\/{2,}/g, '/');
+  if (v.length > 1) v = v.replace(/\/$/, '');
+  return v;
 }
 
 function makeFakeSupabase(tables: Record<string, Row[]>, hooks?: FakeHooks) {
@@ -162,66 +176,94 @@ function makeFakeSupabase(tables: Record<string, Row[]>, hooks?: FakeHooks) {
     // no shared tree and skip the scan. Atomic here because JS is
     // single-threaded, as the advisory xact lock makes it in Postgres.
     async rpc(fn: string, args: Row) {
-      const studios = tables['studios'] ?? [];
-      const target = studios.find((r) => r.id === args.p_studio_id && r.user_id === args.p_user_id);
-      const findSibling = () => {
-        if (!target) return undefined;
-        // Pathless rows all execute in the shared defaultWorkingDirectory —
-        // ONE backing class per user (r3 P0-3), mirrored from the SQL.
-        const path = normalizePath(target.worktree_path);
-        return studios.find(
-          (r) =>
-            r.id !== args.p_studio_id &&
-            r.user_id === args.p_user_id &&
-            (path == null
-              ? normalizePath(r.worktree_path) == null
-              : normalizePath(r.worktree_path) === path) &&
-            r.lease != null
+      try {
+        const studios = tables['studios'] ?? [];
+        const target = studios.find(
+          (r) => r.id === args.p_studio_id && r.user_id === args.p_user_id
         );
-      };
+        // The pre-lock read (SQL: SELECT normalize_worktree_path INTO
+        // v_path). A non-canonical stored path RAISEs in SQL — mirrored by
+        // the throw propagating to the catch below as an RPC error.
+        const lockedPath = target ? normalizePath(target.worktree_path) : null;
+        // The r4 P0-2 TOCTOU window: after the pre-lock read, before the
+        // scan + CAS. Tests mutate rows here to simulate a concurrent move.
+        hooks?.onGrantWindow?.();
+        const findSibling = () => {
+          if (!target) return undefined;
+          // Pathless rows all execute in the shared defaultWorkingDirectory —
+          // ONE backing class per user (r3 P0-3). Scanned against the LOCKED
+          // backing, never a re-read (SQL scans v_path).
+          return studios.find(
+            (r) =>
+              r.id !== args.p_studio_id &&
+              r.user_id === args.p_user_id &&
+              (lockedPath == null
+                ? normalizePath(r.worktree_path) == null
+                : normalizePath(r.worktree_path) === lockedPath) &&
+              r.lease != null
+          );
+        };
+        // r4 P0-2: the CAS proves the row still belongs to the backing the
+        // lock serializes; a moved row matches zero rows.
+        const backingMatches = () => {
+          if (!target) return false;
+          const now = normalizePath(target.worktree_path);
+          return lockedPath == null ? now == null : now === lockedPath;
+        };
 
-      if (fn === 'studio_path_conflict') {
-        if (!target) return { data: { conflict: true }, error: null };
-        const sibling = findSibling();
-        return sibling
-          ? {
-              data: { conflict: true, conflictStudioId: sibling.id, conflictHolder: sibling.lease },
-              error: null,
-            }
-          : { data: { conflict: false }, error: null };
-      }
+        if (fn === 'studio_path_conflict') {
+          if (!target) return { data: { conflict: true }, error: null };
+          if (!backingMatches()) return { data: { conflict: true }, error: null };
+          const sibling = findSibling();
+          return sibling
+            ? {
+                data: {
+                  conflict: true,
+                  conflictStudioId: sibling.id,
+                  conflictHolder: sibling.lease,
+                },
+                error: null,
+              }
+            : { data: { conflict: false }, error: null };
+        }
 
-      if (fn !== 'grant_studio_lease') {
-        return { data: null, error: { message: `no fake for rpc ${fn}` } };
-      }
-      if (!target) return { data: { outcome: 'lost' }, error: null };
+        if (fn !== 'grant_studio_lease') {
+          return { data: null, error: { message: `no fake for rpc ${fn}` } };
+        }
+        if (!target) return { data: { outcome: 'lost' }, error: null };
 
-      const conflict = findSibling();
-      if (conflict) {
+        const conflict = findSibling();
+        if (conflict) {
+          return {
+            data: {
+              outcome: 'path-conflict',
+              conflictStudioId: conflict.id,
+              conflictHolder: conflict.lease,
+            },
+            error: null,
+          };
+        }
+
+        const acquirable = target.status === 'active' || target.status === 'idle';
+        const pLease = args.p_lease as Row;
+        const prior = args.p_expected_prior as Row | null;
+        const priorMatches = prior
+          ? !!target.lease &&
+            (target.lease as Row).sessionId === prior.sessionId &&
+            (target.lease as Row).acquiredAt === prior.acquiredAt &&
+            (target.lease as Row).heartbeatAt === prior.heartbeatAt
+          : target.lease == null;
+        if (acquirable && priorMatches && backingMatches()) {
+          target.lease = pLease;
+          return { data: { outcome: 'granted' }, error: null };
+        }
+        return { data: { outcome: 'lost' }, error: null };
+      } catch (err) {
         return {
-          data: {
-            outcome: 'path-conflict',
-            conflictStudioId: conflict.id,
-            conflictHolder: conflict.lease,
-          },
-          error: null,
+          data: null,
+          error: { message: err instanceof Error ? err.message : String(err) },
         };
       }
-
-      const acquirable = target.status === 'active' || target.status === 'idle';
-      const pLease = args.p_lease as Row;
-      const prior = args.p_expected_prior as Row | null;
-      const priorMatches = prior
-        ? !!target.lease &&
-          (target.lease as Row).sessionId === prior.sessionId &&
-          (target.lease as Row).acquiredAt === prior.acquiredAt &&
-          (target.lease as Row).heartbeatAt === prior.heartbeatAt
-        : target.lease == null;
-      if (acquirable && priorMatches) {
-        target.lease = pLease;
-        return { data: { outcome: 'granted' }, error: null };
-      }
-      return { data: { outcome: 'lost' }, error: null };
     },
   } as never;
 }
@@ -358,7 +400,26 @@ describe('StudioLeaseService.acquire', () => {
     expect(tables.studios[0].lease).toBeNull();
   });
 
-  it('textual path aliases are ONE tree: /x and /x/. conflict (6b r2)', async () => {
+  it('textual path aliases are ONE tree: /x and /x// conflict (6b r2, r4 spellings)', async () => {
+    // r4 note: '.'/'..' spellings are REJECTED now (see the fail-closed tests
+    // below); the aliasing that remains normalizable is slash collapse and
+    // trailing slashes, which must still land on one lock.
+    tables.studios[0].worktree_path = tmpdir();
+    tables.studios.push({
+      id: 'studio-2',
+      user_id: 'user-1',
+      status: 'active',
+      lease: freshLease({ sessionId: 'session-sibling', threadKey: 'pr:OTHER' }) as unknown as Row,
+      worktree_path: `${tmpdir()}//`,
+    });
+    const result = await service.acquire(req);
+    expect(result.acquired).toBe(false);
+  });
+
+  it('a non-canonical SIBLING path fails CLOSED — RPC error, no grant (r4 P0-1)', async () => {
+    // '/x/.' used to be normalized; r4 rejects it (the normalizer was not a
+    // fixed point — P and P/child/.. both granted live). Rejection surfaces
+    // as an RPC error, and an error is never a grant.
     tables.studios[0].worktree_path = tmpdir();
     tables.studios.push({
       id: 'studio-2',
@@ -369,6 +430,74 @@ describe('StudioLeaseService.acquire', () => {
     });
     const result = await service.acquire(req);
     expect(result.acquired).toBe(false);
+    expect(tables.studios[0].lease).toBeNull();
+  });
+
+  it('a non-canonical TARGET path fails CLOSED (r4 P0-1)', async () => {
+    tables.studios[0].worktree_path = `${tmpdir()}/child/..`;
+    const result = await service.acquire(req);
+    expect(result.acquired).toBe(false);
+    expect(tables.studios[0].lease).toBeNull();
+  });
+
+  it("root '/' is a real backing, distinct from the pathless class (r4 P0-1)", async () => {
+    // The old trailing-slash strip mapped '/' to '' — conflating filesystem
+    // root with the defaultWorkingDirectory sentinel. They are different
+    // backings: a pathless sibling lease must not block a root-backed grant.
+    tables.studios[0].worktree_path = '/';
+    tables.studios.push({
+      id: 'studio-2',
+      user_id: 'user-1',
+      status: 'active',
+      lease: freshLease({ sessionId: 'session-sibling', threadKey: 'pr:OTHER' }) as unknown as Row,
+      worktree_path: null,
+    });
+    const result = await service.acquire(req);
+    expect(result.acquired).toBe(true);
+  });
+
+  it('the vacant CAS proves the backing it locked — a concurrent move loses (r4 P0-2)', async () => {
+    // Lumen's deterministic schedule: grant(A@P1) passes its pre-lock read;
+    // A moves to P2 and sibling B takes P2 before the CAS runs. Without the
+    // backing predicate both fresh leases land on P2. With it, the queued
+    // grant matches zero rows and loses. Real directories: refuseUngrantable
+    // cleans a studio whose worktree does not exist before any RPC runs.
+    const P1 = tmpdir();
+    const P2 = await mkdtemp(path.join(tmpdir(), 'lease-p2-'));
+    tables.studios[0].worktree_path = P1;
+    tables.studios.push({
+      id: 'studio-2',
+      user_id: 'user-1',
+      status: 'active',
+      lease: null,
+      worktree_path: P2,
+    });
+    const hooked = new StudioLeaseService(
+      makeFakeSupabase(tables, {
+        onGrantWindow: () => {
+          // The unleased target moves backings (the path integrity trigger
+          // permits moving an UNLEASED row), and the P2 backing gains a
+          // legitimate writer — all inside the read→lock window.
+          tables.studios[0].worktree_path = P2;
+          tables.studios[1].lease = freshLease({
+            sessionId: 'session-b2',
+            threadKey: 'pr:B',
+          }) as unknown as Row;
+        },
+      })
+    );
+    try {
+      const result = await hooked.acquire(req);
+      expect(result.acquired).toBe(false);
+      if (!result.acquired) {
+        // The retry re-reads A (now on P2) and surfaces P2's real holder.
+        expect(result.holder?.threadKey).toBe('pr:B');
+      }
+      expect(tables.studios[0].lease).toBeNull();
+      expect((tables.studios[1].lease as StudioLease).sessionId).toBe('session-b2');
+    } finally {
+      await rm(P2, { recursive: true, force: true });
+    }
   });
 
   it('pathless rows are ONE shared backing — they all run in defaultWorkingDirectory (r3 P0-3)', async () => {

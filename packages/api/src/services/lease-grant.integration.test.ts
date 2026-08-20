@@ -177,9 +177,11 @@ d('grant_studio_lease — path serialization (real DB)', () => {
     expect(result).toMatchObject({ outcome: 'path-conflict', conflictStudioId: studioA });
   });
 
-  it('textual path aliases are ONE tree: /x and /x/. conflict (r2)', async () => {
-    // Lumen granted both live with '/tmp/x' + '/tmp/x/.'. Normalization makes
-    // them one lock key and one sibling-equality class.
+  it('textual path aliases are ONE tree: /x and /x// conflict (r2, r4 spellings)', async () => {
+    // Lumen granted both live with '/tmp/x' + '/tmp/x/.' in r2. r4 rejects
+    // '.'/'..' spellings outright (see the rejection test below); the
+    // aliasing that remains normalizable — slash collapse, trailing slash —
+    // must still land on one lock key and one sibling-equality class.
     await clearLeases();
     const { data: aliasRow, error: aliasErr } = await client
       .from('studios')
@@ -187,7 +189,7 @@ d('grant_studio_lease — path serialization (real DB)', () => {
         user_id: userId,
         agent_id: 'echo-alias',
         repo_root: PATH,
-        worktree_path: `${PATH}/.`,
+        worktree_path: `${PATH}//`,
         branch: 'echo-alias/itest',
         status: 'active',
       })
@@ -204,6 +206,107 @@ d('grant_studio_lease — path serialization (real DB)', () => {
       expect(granted).toBe(1);
     } finally {
       await client.from('studios').delete().eq('id', aliasId);
+    }
+  });
+
+  it('non-canonical paths are rejected at every entrance (r4 P0-1)', async () => {
+    // The normalizer was not a fixed point: '..' was neither resolved nor
+    // rejected (P and P/child/.. both granted live), '/a/./b' needed two
+    // passes. Canonical input or error — enforced by the same normalize call
+    // every trigger and RPC already makes.
+    const tryInsert = (path: string) =>
+      client
+        .from('studios')
+        .insert({
+          user_id: userId,
+          agent_id: 'echo-reject',
+          repo_root: PATH,
+          worktree_path: path,
+          branch: 'echo-reject/itest',
+          status: 'active',
+        })
+        .select('id')
+        .single();
+
+    const dotdot = await tryInsert(`${PATH}/child/..`);
+    expect(dotdot.error?.message).toMatch(/must not contain/);
+    const dot = await tryInsert(`${PATH}/./x`);
+    expect(dot.error?.message).toMatch(/must not contain/);
+    const relative = await tryInsert('relative/path');
+    expect(relative.error?.message).toMatch(/must be absolute/);
+
+    // The UPDATE entrance rejects too (unleased row, so only the canonical
+    // check can be what refuses it).
+    await clearLeases();
+    const move = await client
+      .from('studios')
+      .update({ worktree_path: `${PATH}/child/..` })
+      .eq('id', studioA);
+    expect(move.error?.message).toMatch(/must not contain/);
+
+    // What normalization remains is idempotent, and root survives as itself
+    // instead of collapsing into the pathless sentinel.
+    const { data: rootNorm } = await client.rpc('normalize_worktree_path', { p: '/' });
+    expect(rootNorm).toBe('/');
+    const { data: collapsed } = await client.rpc('normalize_worktree_path', { p: '/a//b/' });
+    expect(collapsed).toBe('/a/b');
+    const { data: fixedPoint } = await client.rpc('normalize_worktree_path', { p: '/a/b' });
+    expect(fixedPoint).toBe('/a/b');
+  });
+
+  it('a concurrent backing move cannot double-lease a tree (r4 P0-2)', async () => {
+    // Lumen's TOCTOU: grant(A@P1) reads its path before the advisory lock;
+    // A moves to P2; grant(B@P2) wins P2; the queued grant then CASes a row
+    // the P1 lock no longer serializes → two fresh leases on P2. The CAS now
+    // carries the backing predicate, so every interleaving must satisfy:
+    // both-leased ⇒ different backings. Raced repeatedly since scheduling is
+    // not controllable from here (Lumen's deterministic two-connection proof
+    // complements this).
+    for (let round = 0; round < 12; round += 1) {
+      const p1 = `${PATH}-r4-${round}-a`;
+      const p2 = `${PATH}-r4-${round}-b`;
+      const mk = (agent: string, path: string) =>
+        client
+          .from('studios')
+          .insert({
+            user_id: userId,
+            agent_id: agent,
+            repo_root: PATH,
+            worktree_path: path,
+            branch: `${agent}/itest`,
+            status: 'active',
+          })
+          .select('id')
+          .single();
+      const { data: c } = await mk(`echo-c${round}`, p1);
+      const { data: dRow } = await mk(`echo-d${round}`, p2);
+      try {
+        await Promise.all([
+          grantStudioLease(client, {
+            studioId: c!.id,
+            userId,
+            lease: lease(`pr:r4-${round}-c`, `sess-c${round}`),
+          }),
+          client.from('studios').update({ worktree_path: p2 }).eq('id', c!.id),
+          grantStudioLease(client, {
+            studioId: dRow!.id,
+            userId,
+            lease: lease(`pr:r4-${round}-d`, `sess-d${round}`),
+          }),
+        ]);
+        const { data: after } = await client
+          .from('studios')
+          .select('id, lease, worktree_path')
+          .in('id', [c!.id, dRow!.id]);
+        const leased = (after || []).filter((r) => r.lease != null);
+        if (leased.length === 2) {
+          const [x, y] = leased;
+          expect(x.worktree_path).not.toBe(y.worktree_path);
+        }
+      } finally {
+        await client.from('studios').update({ lease: null }).in('id', [c!.id, dRow!.id]);
+        await client.from('studios').delete().in('id', [c!.id, dRow!.id]);
+      }
     }
   });
 
@@ -278,9 +381,12 @@ d('grant_studio_lease — path serialization (real DB)', () => {
       .single();
     expect(cErr).toBeNull();
     try {
+      // r4 note: the '/.' spelling is rejected as non-canonical before the
+      // collision check can speak; '//' still normalizes onto the leased
+      // backing and must be refused by the collision check itself.
       const { error: movedOnto } = await client
         .from('studios')
-        .update({ worktree_path: `${PATH}/.` })
+        .update({ worktree_path: `${PATH}//` })
         .eq('id', rowC!.id);
       expect(movedOnto?.message).toMatch(/collides with a leased studio/);
     } finally {
@@ -289,10 +395,11 @@ d('grant_studio_lease — path serialization (real DB)', () => {
 
     // Textual change within the SAME canonical backing stays free — even on
     // the LEASED row (the immutability rule is about the backing, not the
-    // string).
+    // string). r4: '/.' spellings are rejected as non-canonical, so the free
+    // rename uses the trailing-slash spelling.
     const { error: sameBacking } = await client
       .from('studios')
-      .update({ worktree_path: `${PATH}/.` })
+      .update({ worktree_path: `${PATH}/` })
       .eq('id', studioA);
     expect(sameBacking).toBeNull();
     await client.from('studios').update({ worktree_path: PATH }).eq('id', studioA);
