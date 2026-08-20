@@ -58,9 +58,25 @@ describe('resolveOutboundAttachments — happy path', () => {
     expect(attachment.mimeType).toBe('application/pdf');
   });
 
-  it('reads files from a nested subdirectory', async () => {
-    const dir = join(root, 'gmail');
+  // The real first use: Telegram downloads land in a subdirectory of the media
+  // root, so a containment rule that accepted the root but not its children
+  // would pass review and fail on the first actual send.
+  it('reads a Telegram download from a subdirectory of the media root', async () => {
+    const dir = join(root, 'telegram');
     await mkdir(dir);
+    const file = join(dir, 'photo_2026-08-20.jpg');
+    await writeFile(file, 'JPEGBYTES');
+
+    const [attachment] = await resolve([{ path: file }]);
+
+    expect(attachment.filename).toBe('photo_2026-08-20.jpg');
+    expect(attachment.mimeType).toBe('image/jpeg');
+    expect(attachment.content.toString()).toBe('JPEGBYTES');
+  });
+
+  it('reads files from a deeply nested subdirectory', async () => {
+    const dir = join(root, 'gmail', 'inbound', '2026-08');
+    await mkdir(dir, { recursive: true });
     const file = join(dir, 'report.pdf');
     await writeFile(file, 'REPORT');
 
