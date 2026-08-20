@@ -4809,6 +4809,11 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
 
 Supports To, CC, BCC recipients. Body can be plain text or HTML.
 
+Attachments: pass \`attachments: [{path, filename?}]\`. Paths must be inside
+~/.ink/files — files from received mail get there via download_email_attachment,
+and media the user sent over Telegram/WhatsApp already lives there. A path
+outside that directory fails the send rather than sending without the file.
+
 User must have connected their Google account with Gmail send permissions.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
@@ -4840,7 +4845,10 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
     {
       description: `Reply to an existing email. Automatically handles threading and subject line.
 
-Use replyAll=true to reply to all original recipients.
+Use replyAll=true to reply to all original recipients (the user's own address
+is excluded automatically). Honors the original Reply-To when present.
+
+Attachments: pass \`attachments: [{path, filename?}]\` with paths inside ~/.ink/files.
 
 User must have connected their Google account with Gmail send permissions.
 
@@ -4874,6 +4882,8 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `Create a draft email for later review and sending.
 
 Drafts appear in the user's Gmail drafts folder and can be edited/sent from the Gmail interface.
+
+Attachments: pass \`attachments: [{path, filename?}]\` with paths inside ~/.ink/files.
 
 User must have connected their Google account with Gmail permissions.
 
