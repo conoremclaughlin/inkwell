@@ -207,10 +207,12 @@ d('grant_studio_lease — path serialization (real DB)', () => {
     }
   });
 
-  it('empty-path rows back no shared tree — row-scoped grants proceed (r2)', async () => {
-    // worktree_path is NOT NULL in today's schema, so the SQL NULL branch is
-    // future-proofing for materialization v4 (unit-tested against the fake);
-    // the empty string exercises the same row-scoped branch live.
+  it('pathless rows share ONE backing: concurrent grants, exactly one winner (r3 P0-3)', async () => {
+    // Every pathless studio executes in the SAME shared defaultWorkingDirectory
+    // at runtime — r2's independent row locks let two writers into one real
+    // tree (Lumen's two-pathless-grants repro). worktree_path is NOT NULL in
+    // today's schema, so empty string exercises the pathless class live; the
+    // SQL NULL branch is future-proofing (fake-parity unit coverage).
     await clearLeases();
     const make = (agent: string) =>
       client
@@ -232,11 +234,68 @@ d('grant_studio_lease — path serialization (real DB)', () => {
         grantStudioLease(client, { studioId: n1!.id, userId, lease: lease('pr:9000', 'sess-n1') }),
         grantStudioLease(client, { studioId: n2!.id, userId, lease: lease('pr:9001', 'sess-n2') }),
       ]);
-      expect(a.outcome).toBe('granted');
-      expect(b.outcome).toBe('granted');
+      const granted = [a, b].filter((r) => r.outcome === 'granted').length;
+      const conflicts = [a, b].filter((r) => r.outcome === 'path-conflict').length;
+      expect({ granted, conflicts }).toEqual({ granted: 1, conflicts: 1 });
     } finally {
       await client.from('studios').delete().in('id', [n1!.id, n2!.id]);
     }
+  });
+
+  it('worktree_path is immutable while leased, and cannot move onto a leased backing (r3 P0-2)', async () => {
+    // Lumen's live repro: grant A@P1 and B@P2, then UPDATE A's path to
+    // 'P2/.' — two fresh leases on one canonical backing, installed AROUND
+    // the grant fence. The path column is part of the lock's identity.
+    await clearLeases();
+    const granted = await grantStudioLease(client, {
+      studioId: studioA,
+      userId,
+      lease: lease('pr:9600', 'sess-p2'),
+    });
+    expect(granted.outcome).toBe('granted');
+
+    // Leased row's path is immutable.
+    const { error: movedLeased } = await client
+      .from('studios')
+      .update({ worktree_path: `${PATH}-elsewhere` })
+      .eq('id', studioA);
+    expect(movedLeased?.message).toMatch(/immutable while the studio is leased/);
+
+    // An UNLEASED row at a DIFFERENT path cannot move ONTO the leased
+    // backing via an alias (studioB shares A's path already, so the repro
+    // needs a fresh row at a distinct path — exactly Lumen's A@P1/B@P2 shape).
+    const { data: rowC, error: cErr } = await client
+      .from('studios')
+      .insert({
+        user_id: userId,
+        agent_id: 'echo-c',
+        repo_root: `${PATH}-p2`,
+        worktree_path: `${PATH}-p2`,
+        branch: 'echo-c/itest',
+        status: 'active',
+      })
+      .select('id')
+      .single();
+    expect(cErr).toBeNull();
+    try {
+      const { error: movedOnto } = await client
+        .from('studios')
+        .update({ worktree_path: `${PATH}/.` })
+        .eq('id', rowC!.id);
+      expect(movedOnto?.message).toMatch(/collides with a leased studio/);
+    } finally {
+      await client.from('studios').delete().eq('id', rowC!.id);
+    }
+
+    // Textual change within the SAME canonical backing stays free — even on
+    // the LEASED row (the immutability rule is about the backing, not the
+    // string).
+    const { error: sameBacking } = await client
+      .from('studios')
+      .update({ worktree_path: `${PATH}/.` })
+      .eq('id', studioA);
+    expect(sameBacking).toBeNull();
+    await client.from('studios').update({ worktree_path: PATH }).eq('id', studioA);
   });
 
   it('studio_path_conflict reports the sibling for the pre-rescue fence (r2)', async () => {

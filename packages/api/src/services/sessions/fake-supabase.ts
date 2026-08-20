@@ -119,18 +119,23 @@ export function makeFakeSupabase(tables: Record<string, Row[]>) {
       const studios = tables['studios'] ?? [];
       const target = studios.find((r) => r.id === args.p_studio_id && r.user_id === args.p_user_id);
       const findSibling = () => {
-        const path = normalizePath(target?.worktree_path);
-        if (!target || path == null) return undefined;
+        if (!target) return undefined;
+        // Pathless rows all execute in the shared defaultWorkingDirectory —
+        // ONE backing class per user (r3 P0-3), mirrored from the SQL.
+        const path = normalizePath(target.worktree_path);
         return studios.find(
           (r) =>
             r.id !== args.p_studio_id &&
             r.user_id === args.p_user_id &&
-            normalizePath(r.worktree_path) === path &&
+            (path == null
+              ? normalizePath(r.worktree_path) == null
+              : normalizePath(r.worktree_path) === path) &&
             r.lease != null
         );
       };
 
       if (fn === 'studio_path_conflict') {
+        if (!target) return { data: { conflict: true }, error: null };
         const sibling = findSibling();
         return sibling
           ? {

@@ -127,18 +127,30 @@ export async function studioPathConflict(
       return { conflict: true };
     }
     const payload = data as {
-      conflict?: boolean;
+      conflict?: unknown;
       conflictStudioId?: string;
       conflictHolder?: unknown;
     } | null;
-    if (payload?.conflict) {
+    // FAIL CLOSED on the payload too (r3 P0-4): only an EXPLICIT
+    // `conflict: false` is a clear tree. null, missing, or non-boolean
+    // payloads mean "could not verify" — which must never authorize a rescue.
+    if (payload?.conflict === false) {
+      return { conflict: false };
+    }
+    if (payload?.conflict === true) {
       return {
         conflict: true,
         conflictStudioId: payload.conflictStudioId,
         conflictHolder: (payload.conflictHolder as StudioLease | null) ?? null,
       };
     }
-    return { conflict: false };
+    logger.warn(
+      '[LeaseGrant] Path-conflict check returned an unrecognized payload — assuming conflict',
+      {
+        studioId: args.studioId,
+      }
+    );
+    return { conflict: true };
   } catch (err) {
     logger.warn('[LeaseGrant] Path-conflict check threw — assuming conflict', {
       studioId: args.studioId,

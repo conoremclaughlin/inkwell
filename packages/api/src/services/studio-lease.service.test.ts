@@ -165,18 +165,23 @@ function makeFakeSupabase(tables: Record<string, Row[]>, hooks?: FakeHooks) {
       const studios = tables['studios'] ?? [];
       const target = studios.find((r) => r.id === args.p_studio_id && r.user_id === args.p_user_id);
       const findSibling = () => {
-        const path = normalizePath(target?.worktree_path);
-        if (!target || path == null) return undefined;
+        if (!target) return undefined;
+        // Pathless rows all execute in the shared defaultWorkingDirectory —
+        // ONE backing class per user (r3 P0-3), mirrored from the SQL.
+        const path = normalizePath(target.worktree_path);
         return studios.find(
           (r) =>
             r.id !== args.p_studio_id &&
             r.user_id === args.p_user_id &&
-            normalizePath(r.worktree_path) === path &&
+            (path == null
+              ? normalizePath(r.worktree_path) == null
+              : normalizePath(r.worktree_path) === path) &&
             r.lease != null
         );
       };
 
       if (fn === 'studio_path_conflict') {
+        if (!target) return { data: { conflict: true }, error: null };
         const sibling = findSibling();
         return sibling
           ? {
@@ -366,7 +371,10 @@ describe('StudioLeaseService.acquire', () => {
     expect(result.acquired).toBe(false);
   });
 
-  it('NULL-path rows back no shared tree — row-scoped grants proceed (6b r2)', async () => {
+  it('pathless rows are ONE shared backing — they all run in defaultWorkingDirectory (r3 P0-3)', async () => {
+    // r2 gave each pathless row its own lock; r3's finding: at runtime every
+    // pathless studio executes in the SAME shared default cwd, so independent
+    // locks let two writers into one real tree.
     tables.studios[0].worktree_path = null;
     tables.studios.push({
       id: 'studio-2',
@@ -376,7 +384,10 @@ describe('StudioLeaseService.acquire', () => {
       worktree_path: null,
     });
     const result = await service.acquire(req);
-    expect(result.acquired).toBe(true);
+    expect(result.acquired).toBe(false);
+    if (!result.acquired) {
+      expect(result.holder?.threadKey).toBe('pr:OTHER');
+    }
   });
 
   it('reclaim FENCES the path BEFORE rescue: fresh sibling refuses and restores the holder (6b r2)', async () => {

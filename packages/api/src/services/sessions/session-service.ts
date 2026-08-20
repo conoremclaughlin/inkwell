@@ -1721,8 +1721,19 @@ export class SessionService implements ISessionService {
       });
     }
 
+    // Phase 6b (Lumen #517 r1 blocker 5, r3 P0-1): intent is resolved BEFORE
+    // routing, because gateOccupancy runs INSIDE resolveStudioId — an
+    // intent-blind gate would divert/refuse a presence thread over a lease it
+    // was never going to take, provisioning overflow worktrees for work that
+    // tolerates drift. One resolution feeds routing's occupancy gate and the
+    // lease gate identically.
+    const writeIntent = options?.threadKey
+      ? await this.resolveWriteIntent(userId, options.threadKey)
+      : ('write' as const);
+
     let routing = await this.resolveStudioId(userId, agentId, {
       threadKey: options?.threadKey,
+      writeIntent,
       explicitStudioId: options?.studioId,
       studioHint: options?.studioHint,
       recipientSessionId: authorizedRecipientSessionId,
@@ -1751,14 +1762,6 @@ export class SessionService implements ISessionService {
       throw new UnresolvedStudioError(routing.unresolvedNamedStudio, agentId);
     }
 
-    // Phase 6b (Lumen #517 r1 blocker 5): intent is resolved BEFORE anything
-    // acts on occupancy. gateOccupancy runs inside routing, ahead of
-    // withStudioLease — an intent-blind gate would divert/refuse a presence
-    // thread over a lease it was never going to take, provisioning overflow
-    // worktrees for work that tolerates drift.
-    const writeIntent = options?.threadKey
-      ? await this.resolveWriteIntent(userId, options.threadKey)
-      : ('write' as const);
     const leaseCtx = { userId, agentId, threadKey: options?.threadKey, writeIntent };
 
     // Resolve default_session_id from agent identity. When set, threadKey
@@ -2091,6 +2094,8 @@ export class SessionService implements ISessionService {
     agentId: string,
     options: {
       threadKey?: string;
+      /** Pre-resolved BEFORE routing (r3 P0-1) — gates must never re-resolve. */
+      writeIntent?: 'write' | 'presence';
       explicitStudioId?: string;
       studioHint?: string;
       recipientSessionId?: string;
@@ -2113,7 +2118,12 @@ export class SessionService implements ISessionService {
       identityAbsent?: boolean;
     }
   ): Promise<StudioRoutingDecision> {
-    const leaseCtx = { userId, agentId, threadKey: options.threadKey };
+    const leaseCtx = {
+      userId,
+      agentId,
+      threadKey: options.threadKey,
+      writeIntent: options.writeIntent,
+    };
 
     // Canonical identity resolved ONCE, up front, and preferred by EVERY tier
     // below (Lumen, PR #514 round 4). Scoping only the caller-repo tier by

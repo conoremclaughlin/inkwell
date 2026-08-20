@@ -2047,7 +2047,7 @@ describe('SessionService', () => {
       vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(otherSession);
 
       const emptyChain: Record<string, unknown> = {};
-      for (const m of ['select', 'eq', 'not', 'is', 'neq', 'in', 'order', 'limit']) {
+      for (const m of ['select', 'eq', 'or', 'not', 'is', 'neq', 'in', 'order', 'limit']) {
         emptyChain[m] = vi.fn().mockReturnValue(emptyChain);
       }
       emptyChain.maybeSingle = vi.fn().mockResolvedValue({ data: null, error: null });
@@ -2103,7 +2103,7 @@ describe('SessionService', () => {
       // client, so the hint path needs one. Every query resolves empty: the
       // named studio does not exist.
       const emptyChain: Record<string, unknown> = {};
-      for (const m of ['select', 'eq', 'not', 'is', 'neq', 'in', 'order', 'limit']) {
+      for (const m of ['select', 'eq', 'or', 'not', 'is', 'neq', 'in', 'order', 'limit']) {
         emptyChain[m] = vi.fn().mockReturnValue(emptyChain);
       }
       emptyChain.maybeSingle = vi.fn().mockResolvedValue({ data: null, error: null });
@@ -2154,7 +2154,7 @@ describe('SessionService', () => {
       vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(stray('stray-general'));
 
       const emptyChain: Record<string, unknown> = {};
-      for (const m of ['select', 'eq', 'not', 'is', 'neq', 'in', 'order', 'limit']) {
+      for (const m of ['select', 'eq', 'or', 'not', 'is', 'neq', 'in', 'order', 'limit']) {
         emptyChain[m] = vi.fn().mockReturnValue(emptyChain);
       }
       emptyChain.maybeSingle = vi.fn().mockResolvedValue({ data: null, error: null });
@@ -2199,7 +2199,7 @@ describe('SessionService', () => {
       vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(existing);
 
       const emptyChain: Record<string, unknown> = {};
-      for (const m of ['select', 'eq', 'not', 'is', 'neq', 'in', 'order', 'limit']) {
+      for (const m of ['select', 'eq', 'or', 'not', 'is', 'neq', 'in', 'order', 'limit']) {
         emptyChain[m] = vi.fn().mockReturnValue(emptyChain);
       }
       emptyChain.maybeSingle = vi.fn().mockResolvedValue({ data: null, error: null });
@@ -3283,6 +3283,97 @@ describe('SessionService', () => {
       overflowSpy.mockRestore();
     });
 
+    it('PRODUCTION ORDER: presence intent bypasses the occupancy gate inside routing (r3 P0-1)', async () => {
+      /*
+       * Through the PUBLIC API, not private methods — the round-3 finding was
+       * precisely that the private-method tests missed the production order
+       * (intent resolved after resolveStudioId had already gated occupancy).
+       *
+       * Setup: a route-pattern studio LEASED by another thread, and a thread
+       * whose stored key_type resolves to presence via a registry OVERRIDE
+       * row (data, not mocks). If intent were still resolved late, the gate
+       * would see the fresh foreign lease and divert to overflow; with
+       * intent-first, the presence session binds to the leased studio
+       * WITHOUT acquiring and WITHOUT overflow.
+       */
+      const now = new Date().toISOString();
+      const studioCallLogs: RecordedCall[][] = [];
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          const calls: RecordedCall[] = [];
+          if (table === 'inbox_threads') {
+            return createFilterAwareChain(() => ({ data: { key_type: 'spec' } }), calls);
+          }
+          if (table === 'thread_key_types') {
+            // A presence override row for 'spec' — the DATA that makes this
+            // thread presence-typed (until 6e no TEMPLATE is presence, so an
+            // override row is the honest way to express it).
+            return createFilterAwareChain(
+              () => ({
+                data: [
+                  {
+                    id: 'o1',
+                    user_id: 'user-456',
+                    type: 'spec',
+                    write_intent: 'presence',
+                    studio_policy: 'reuse-only',
+                    description: null,
+                    created_at: now,
+                    updated_at: now,
+                  },
+                ],
+              }),
+              calls
+            );
+          }
+          if (table === 'agent_identities') {
+            return createFilterAwareChain(() => ({ data: [{ id: 'sb-wren' }] }), calls);
+          }
+          if (table === 'studios') {
+            const studioCalls: RecordedCall[] = [];
+            studioCallLogs.push(studioCalls);
+            return createFilterAwareChain((c) => {
+              const selected = c.find((call) => call.method === 'select');
+              const selectArg = String(selected?.args[0] ?? '');
+              // Occupancy read: a FRESH lease held by a DIFFERENT thread.
+              if (selectArg.includes('lease')) {
+                return {
+                  data: {
+                    lease: {
+                      threadKey: 'pr:other',
+                      sessionId: 'holder-session',
+                      acquiredAt: now,
+                      heartbeatAt: now,
+                    },
+                    worktree_path: '/repos/inkwell--wren',
+                    ephemeral: false,
+                    status: 'active',
+                  },
+                };
+              }
+              const isPatternQuery = c.some(
+                (call) => call.method === 'not' && call.args[0] === 'route_patterns'
+              );
+              return isPatternQuery
+                ? { data: [{ id: 'studio-A', route_patterns: ['spec:*'] }] }
+                : { data: null };
+            }, studioCalls);
+          }
+          return createRecordingChain({ data: null }, calls);
+        }),
+      };
+      const service = serviceWith(mockSupabase);
+
+      await service.getOrCreateSession('user-456', 'wren', { threadKey: 'spec:design-x' });
+
+      // Bound to the LEASED studio — occupancy was bypassed, not diverted.
+      expect(mockRepository.create).toHaveBeenCalledWith(
+        expect.objectContaining({ studioId: 'studio-A' })
+      );
+      // And NOTHING wrote a lease: no studios UPDATE ran at all.
+      expect(studioCallLogs.flat().some((c) => c.method === 'update')).toBe(false);
+    });
+
     it('does NOT refuse unthreaded work — heartbeats keep degrading to the default cwd', async () => {
       const mockSupabase = {
         from: vi.fn().mockImplementation(() => createRecordingChain({ data: null }, [])),
@@ -3340,7 +3431,7 @@ describe('SessionService', () => {
       record: RecordedCall[]
     ) {
       const chain: Record<string, unknown> = {};
-      for (const m of ['select', 'eq', 'not', 'is', 'neq', 'in', 'order', 'limit']) {
+      for (const m of ['select', 'eq', 'or', 'not', 'is', 'neq', 'in', 'order', 'limit']) {
         chain[m] = vi.fn().mockImplementation((...args: unknown[]) => {
           record.push({ method: m, args });
           return chain;

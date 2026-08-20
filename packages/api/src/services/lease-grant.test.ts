@@ -114,6 +114,17 @@ describe('studioPathConflict', () => {
     });
   });
 
+  it('FAILS CLOSED: null, missing, or non-boolean payloads report conflict (r3 P0-4)', async () => {
+    // Only an EXPLICIT conflict:false is a clear tree. "Could not verify"
+    // must never authorize a rescue.
+    for (const data of [null, {}, { conflict: 'nope' }, { conflict: 0 }, 'garbage']) {
+      const { client } = rpcClient({ data });
+      await expect(
+        studioPathConflict(client, { studioId: 's-1', userId: 'u-1' })
+      ).resolves.toMatchObject({ conflict: true });
+    }
+  });
+
   it('FAILS CLOSED: an error or throw reports conflict — never a clear tree', async () => {
     // "Could not verify the tree is ours to rescue" must never authorize a
     // rescue that could stomp a live sibling writer.
