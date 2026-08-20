@@ -4063,6 +4063,17 @@ export type Database = {
         };
         Returns: string;
       };
+      compute_thread_key_pin: {
+        Args: {
+          p_user_id: string;
+          p_key: string;
+        };
+        Returns: {
+          o_project: string | null;
+          o_type: string | null;
+          o_id: string | null;
+        };
+      };
       get_unread_thread_candidates: {
         Args: {
           p_agent_id: string;
