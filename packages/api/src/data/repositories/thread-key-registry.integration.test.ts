@@ -52,6 +52,7 @@ d('thread-key registry + pin integrity (real DB)', () => {
   let projectId: string | null = null;
   const threadIds: string[] = [];
   const overrideTypes: string[] = [];
+  const raceTypeIds: string[] = [];
 
   beforeAll(async () => {
     client = createClient<Database>(SUPABASE_URL!, SUPABASE_KEY!, {
@@ -59,15 +60,17 @@ d('thread-key registry + pin integrity (real DB)', () => {
     });
     repo = new ThreadKeyTypesRepository(client);
 
-    // Any user other than the fixture user, for the owner-change bypass test.
-    const { data: otherUser, error: otherErr } = await client
-      .from('users')
-      .select('id')
-      .neq('id', USER)
-      .limit(1)
-      .single();
-    if (otherErr) throw otherErr;
-    OTHER_USER = otherUser.id;
+    // A SUITE-OWNED second user for the owner-change bypass test. Never
+    // borrow a real user: fresh isolated CI databases have only the fixture
+    // user (single() fails), and on the shared DB the test would mutate a
+    // real user's registry (Lumen, PR #516 round 4).
+    OTHER_USER = crypto.randomUUID();
+    const { error: userErr } = await client.from('users').insert({
+      id: OTHER_USER,
+      email: `tk-itest-${OTHER_USER.slice(0, 8)}@example.com`,
+      username: `tk-itest-${OTHER_USER.slice(0, 8)}`,
+    });
+    if (userErr) throw userErr;
 
     // A project with a slug for the integration user, so project-prefixed
     // pinning is exercised. Cleaned up in afterAll.
@@ -88,7 +91,13 @@ d('thread-key registry + pin integrity (real DB)', () => {
     if (overrideTypes.length) {
       await client.from('thread_key_types').delete().eq('user_id', USER).in('type', overrideTypes);
     }
+    if (raceTypeIds.length) {
+      await client.from('thread_key_types').delete().in('id', raceTypeIds);
+    }
     if (projectId) await client.from('projects').delete().eq('id', projectId);
+    // The temp user last: the ON DELETE CASCADE on thread_key_types.user_id
+    // clears any registry row a failed assertion left behind.
+    if (OTHER_USER) await client.from('users').delete().eq('id', OTHER_USER);
   });
 
   async function createThread(threadKey: string) {
@@ -208,13 +217,16 @@ d('thread-key registry + pin integrity (real DB)', () => {
       .single();
     expect(insErr).toBeNull();
 
-    const { error: moveErr } = await client
-      .from('thread_key_types')
-      .update({ user_id: USER })
-      .eq('id', victim!.id);
-    expect(moveErr?.message).toMatch(/collides/);
-
-    await client.from('thread_key_types').delete().eq('id', victim!.id);
+    try {
+      const { error: moveErr } = await client
+        .from('thread_key_types')
+        .update({ user_id: USER })
+        .eq('id', victim!.id);
+      expect(moveErr?.message).toMatch(/collides/);
+    } finally {
+      // finally, not sequential: a failed assertion must not leak the row.
+      await client.from('thread_key_types').delete().eq('id', victim!.id);
+    }
   });
 
   it('the namespace race is GENUINELY concurrent: exactly one winner', async () => {
@@ -236,15 +248,17 @@ d('thread-key registry + pin integrity (real DB)', () => {
         .single();
 
       const [typeRes, slugRes] = await Promise.all([claimType, claimSlug]);
+      // Track winners and reset BEFORE asserting: a failed assertion must not
+      // leak rows or a mutated slug into later rounds or other suites.
+      if (!typeRes.error && typeRes.data) raceTypeIds.push(typeRes.data.id);
+      if (!slugRes.error) {
+        await client.from('projects').update({ slug: SLUG }).eq('id', projectId!);
+      }
       const winners = [typeRes, slugRes].filter((r) => !r.error).length;
       expect(winners).toBe(1);
 
-      // Reset for the next round.
       if (!typeRes.error) {
         await client.from('thread_key_types').delete().eq('user_id', USER).eq('type', name);
-      }
-      if (!slugRes.error) {
-        await client.from('projects').update({ slug: SLUG }).eq('id', projectId!);
       }
     }
   });
