@@ -29,25 +29,43 @@ export class ThreadKeyService {
   }
 
   /**
-   * Registered project slugs for a user — for PATTERN parsing and tooling
-   * only, never for re-parsing a stored key.
+   * Accepted project prefixes for a user, each mapped to the CANONICAL slug
+   * it pins — canonical slugs map to themselves, slug aliases
+   * (project_slug_aliases) map to their project's canonical slug. For
+   * PATTERN parsing and tooling only, never for re-parsing a stored key.
    *
-   * FAILS CLOSED (Lumen, PR #516 round 2 condition 1): a lookup error throws
-   * rather than returning an empty set. The empty-set fallback made
-   * `pcp:issue:x` parse as (null, 'pcp', 'issue:x') — a wrong identity that
-   * callers might then act on. No caller may treat "could not read the
-   * registry" as "there are no projects".
+   * FAILS CLOSED (Lumen, PR #516 round 2 condition 1): a lookup error on
+   * either query throws rather than returning a partial map. The empty
+   * fallback made `pcp:issue:x` parse as (null, 'pcp', 'issue:x') — a wrong
+   * identity that callers might then act on. No caller may treat "could not
+   * read the registry" as "there are no projects".
+   *
+   * An alias can never equal a canonical slug of the same user (namespace
+   * triggers), so the two loops cannot collide on a map key.
    */
-  async projectSlugs(userId: string): Promise<Set<string>> {
-    const { data, error } = await this.supabase
-      .from('projects')
-      .select('slug')
-      .eq('user_id', userId)
-      .not('slug', 'is', null);
-    if (error) {
-      throw new Error(`Project slug lookup failed: ${error.message}`);
+  async projectSlugLookup(userId: string): Promise<Map<string, string>> {
+    const [slugs, aliases] = await Promise.all([
+      this.supabase.from('projects').select('slug').eq('user_id', userId).not('slug', 'is', null),
+      this.supabase
+        .from('project_slug_aliases')
+        .select('alias, projects!inner(slug)')
+        .eq('user_id', userId),
+    ]);
+    if (slugs.error) {
+      throw new Error(`Project slug lookup failed: ${slugs.error.message}`);
     }
-    return new Set((data || []).map((r) => r.slug).filter((s): s is string => !!s));
+    if (aliases.error) {
+      throw new Error(`Project slug alias lookup failed: ${aliases.error.message}`);
+    }
+    const lookup = new Map<string, string>();
+    for (const r of slugs.data || []) {
+      if (r.slug) lookup.set(r.slug, r.slug);
+    }
+    for (const r of aliases.data || []) {
+      const canonical = r.projects?.slug;
+      if (r.alias && canonical) lookup.set(r.alias, canonical);
+    }
+    return lookup;
   }
 
   /**

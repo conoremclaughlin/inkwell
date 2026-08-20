@@ -24,6 +24,7 @@ import { INTEGRATION_TEST_USER_ID } from '../../test/integration-fixtures';
 import type { Database } from '../supabase/types';
 import { ThreadKeyTypesRepository } from './thread-key-types.repository';
 import { parseThreadKey } from '../../services/thread-key/parser';
+import { ThreadKeyService } from '../../services/thread-key/thread-key.service';
 
 const projectRoot = resolve(__dirname, '../../../../../');
 const envLocalPath = resolve(projectRoot, '.env.local');
@@ -43,6 +44,7 @@ const d = available ? describe : describe.skip;
 const USER = INTEGRATION_TEST_USER_ID;
 let OTHER_USER: string;
 const SLUG = 'tkitest';
+const ALIAS = 'tkitalias';
 const TYPE = 'tkitesttype';
 const KEY_PREFIX = `${TYPE}:pin-itest-`;
 
@@ -81,6 +83,14 @@ d('thread-key registry + pin integrity (real DB)', () => {
       .single();
     if (error) throw error;
     projectId = data.id;
+
+    // A suite-owned alias for the project, so alias-prefixed pinning and the
+    // alias integrity triggers are exercised. Cleaned up in afterAll (the ON
+    // DELETE CASCADE from projects is the backstop).
+    const { error: aliasErr } = await client
+      .from('project_slug_aliases')
+      .insert({ user_id: USER, alias: ALIAS, project_id: data.id });
+    if (aliasErr) throw aliasErr;
   });
 
   afterAll(async () => {
@@ -94,6 +104,7 @@ d('thread-key registry + pin integrity (real DB)', () => {
     if (raceTypeIds.length) {
       await client.from('thread_key_types').delete().in('id', raceTypeIds);
     }
+    await client.from('project_slug_aliases').delete().eq('user_id', USER).eq('alias', ALIAS);
     if (projectId) await client.from('projects').delete().eq('id', projectId);
     // The temp user last: the ON DELETE CASCADE on thread_key_types.user_id
     // clears any registry row a failed assertion left behind.
@@ -263,19 +274,152 @@ d('thread-key registry + pin integrity (real DB)', () => {
     }
   });
 
+  it('an alias-prefixed thread pins the CANONICAL project slug', async () => {
+    const row = await createThread(`${ALIAS}:pr:pin-itest-alias-${Date.now()}`);
+    expect(row.key_project).toBe(SLUG);
+    expect(row.key_type).toBe('pr');
+  });
+
+  it('alias grammar is CHECKed like slugs', async () => {
+    const { error } = await client
+      .from('project_slug_aliases')
+      .insert({ user_id: USER, alias: 'Bad_Alias', project_id: projectId! });
+    expect(error?.message).toMatch(/project_slug_aliases_alias_check/);
+  });
+
+  it("an alias cannot target another user's project", async () => {
+    // OTHER_USER owns a slugged project; USER may not alias it (Lumen round 1
+    // blocker 1: the original table resolved user A's keys to user B's slug).
+    const { data: otherProj, error: opErr } = await client
+      .from('projects')
+      .insert({ user_id: OTHER_USER, name: `TK Other ${Date.now()}`, slug: 'tkitestother' })
+      .select('id')
+      .single();
+    expect(opErr).toBeNull();
+    try {
+      const { error } = await client
+        .from('project_slug_aliases')
+        .insert({ user_id: USER, alias: 'tkitestforeign', project_id: otherProj!.id });
+      expect(error?.message).toMatch(/must belong to the target project's owner/);
+    } finally {
+      await client.from('projects').delete().eq('id', otherProj!.id);
+    }
+  });
+
+  it('an aliased project cannot clear its slug, and an owner move carries the alias', async () => {
+    const { data: proj2, error: p2Err } = await client
+      .from('projects')
+      .insert({ user_id: USER, name: `TK Move ${Date.now()}`, slug: 'tkitest2' })
+      .select('id')
+      .single();
+    expect(p2Err).toBeNull();
+    try {
+      const { error: a2Err } = await client
+        .from('project_slug_aliases')
+        .insert({ user_id: USER, alias: 'tkitest2alias', project_id: proj2!.id });
+      expect(a2Err).toBeNull();
+
+      // Slug clear while aliased: rejected (blocker 2 — the alias would
+      // re-parse as a TYPE with no canonical to pin).
+      const { error: clearErr } = await client
+        .from('projects')
+        .update({ slug: null })
+        .eq('id', proj2!.id);
+      expect(clearErr?.message).toMatch(/cannot clear the slug/);
+
+      // Owner move: the alias follows the project, exactly like the slug
+      // itself does (blocker 1's owner-move variant).
+      const { error: moveErr } = await client
+        .from('projects')
+        .update({ user_id: OTHER_USER })
+        .eq('id', proj2!.id);
+      expect(moveErr).toBeNull();
+      const { data: moved } = await client
+        .from('project_slug_aliases')
+        .select('user_id')
+        .eq('alias', 'tkitest2alias')
+        .single();
+      expect(moved?.user_id).toBe(OTHER_USER);
+
+      // The alias now parses for the NEW owner and no longer for the old.
+      const { data: newParse } = await client.rpc('compute_thread_key_pin', {
+        p_user_id: OTHER_USER,
+        p_key: 'tkitest2alias:pr:1',
+      });
+      const np = (Array.isArray(newParse) ? newParse[0] : newParse) as NonNullable<typeof newParse>;
+      expect(np.o_project).toBe('tkitest2');
+      const { data: oldParse } = await client.rpc('compute_thread_key_pin', {
+        p_user_id: USER,
+        p_key: 'tkitest2alias:pr:1',
+      });
+      const op = (Array.isArray(oldParse) ? oldParse[0] : oldParse) as NonNullable<typeof oldParse>;
+      expect(op.o_project).toBeNull();
+      expect(op.o_type).toBe('tkitest2alias');
+    } finally {
+      await client.from('projects').delete().eq('id', proj2!.id); // cascades the alias
+    }
+  });
+
+  it('the alias namespace is enforced in BOTH directions', async () => {
+    // An alias colliding with a registered (builtin) type is rejected.
+    const { error: aliasVsType } = await client
+      .from('project_slug_aliases')
+      .insert({ user_id: USER, alias: 'pr', project_id: projectId! });
+    expect(aliasVsType?.message).toMatch(/collides with a registered thread-key type/);
+
+    // A type override colliding with an existing alias is rejected.
+    const { data: typeRow, error: typeVsAlias } = await client
+      .from('thread_key_types')
+      .insert({ user_id: USER, type: ALIAS, write_intent: 'write', studio_policy: 'reuse-only' })
+      .select('id')
+      .single();
+    if (typeRow) raceTypeIds.push(typeRow.id);
+    expect(typeVsAlias?.message).toMatch(/collides with your project slug alias/);
+  });
+
+  it('the alias-insert vs slug-clear race has exactly one winner', async () => {
+    // Without the shared 'project-alias:<id>' advisory lock this is a write
+    // skew: the alias insert checks the project while the slug clear checks
+    // the aliases, and each side passes its own snapshot check.
+    const { data: proj3, error: p3Err } = await client
+      .from('projects')
+      .insert({ user_id: USER, name: `TK Race ${Date.now()}`, slug: 'tkitest3' })
+      .select('id')
+      .single();
+    expect(p3Err).toBeNull();
+    try {
+      const [aliasRes, clearRes] = await Promise.all([
+        client
+          .from('project_slug_aliases')
+          .insert({ user_id: USER, alias: 'tkitest3alias', project_id: proj3!.id }),
+        client.from('projects').update({ slug: null }).eq('id', proj3!.id),
+      ]);
+      const aliasWon = aliasRes.error === null;
+      const clearWon = clearRes.error === null;
+      expect(aliasWon !== clearWon).toBe(true);
+    } finally {
+      await client.from('projects').delete().eq('id', proj3!.id);
+    }
+  });
+
   it('TS parser and SQL compute_thread_key_pin agree (parity guard)', async () => {
-    const slugs = new Set([SLUG]);
+    // The lookup comes from the PRODUCTION loader, so this also guards the
+    // service's alias join against the SQL alias branch.
+    const lookup = await new ThreadKeyService(client).projectSlugLookup(USER);
     const cases = [
       `${SLUG}:pr:42`, // project-prefixed
       `${SLUG}:pr:42:with:colons`, // composite id under a project
       `${SLUG}:onlytwo`, // registered slug but only two segments → type
+      `${ALIAS}:pr:42`, // alias-prefixed → canonical slug
+      `${ALIAS}:pr:42:with:colons`, // composite id under an alias
+      `${ALIAS}:onlytwo`, // alias with only two segments → type
       'openclaw:issue:15', // unregistered first segment → type
       'pr:999', // plain
       'thread:review-queue:aug', // colons in id
       'standup:2026-08-18', // unregistered type
     ];
     for (const key of cases) {
-      const ts = parseThreadKey(key, slugs);
+      const ts = parseThreadKey(key, lookup);
       const { data, error } = await client.rpc('compute_thread_key_pin', {
         p_user_id: USER,
         p_key: key,

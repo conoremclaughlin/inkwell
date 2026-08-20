@@ -8,13 +8,19 @@
  *   key := [ project ":" ] type ":" id
  *
  * Parse is REGISTRY-DRIVEN, never positional: the first segment is a project
- * only when it matches a registered projects.slug for the resolved user AND
- * at least two segments follow. Role is never inferred from colon position
- * alone (grammar §Parse procedure rule 3).
+ * only when it matches a registered projects.slug OR a project slug alias for
+ * the resolved user, AND at least two segments follow. Role is never inferred
+ * from colon position alone (grammar §Parse procedure rule 3).
+ *
+ * The lookup maps every ACCEPTED first segment to the canonical slug it pins:
+ * canonical slugs map to themselves, slug aliases (project_slug_aliases) map
+ * to their project's canonical slug. `project` in the result is therefore
+ * always CANONICAL — exactly what SQL compute_thread_key_pin pins — and the
+ * integration parity test holds the two implementations together.
  */
 
 export interface ParsedThreadKey {
-  /** Registered project slug, or null when the key is unprefixed. */
+  /** Canonical project slug (aliases resolve to it), or null when unprefixed. */
   project: string | null;
   /** First non-project segment. May be unregistered — that is legal. */
   type: string;
@@ -25,7 +31,9 @@ export interface ParsedThreadKey {
 }
 
 /**
- * Parse a thread key against the caller's registered project slugs.
+ * Parse a thread key against the caller's accepted project prefixes
+ * (canonical slugs and aliases, each mapped to the canonical slug — build
+ * with ThreadKeyService.projectSlugLookup).
  *
  * Returns null for strings that are not thread keys at all (no colon, empty
  * segments around the first separator). A null is "untyped", not an error —
@@ -33,7 +41,7 @@ export interface ParsedThreadKey {
  */
 export function parseThreadKey(
   key: string,
-  projectSlugs: ReadonlySet<string>
+  slugLookup: ReadonlyMap<string, string>
 ): ParsedThreadKey | null {
   if (!key) return null;
   const segments = key.split(':');
@@ -43,10 +51,11 @@ export function parseThreadKey(
   // keys). Later segments may be empty only as part of a composite id.
   if (segments[0] === '' || segments[1] === '') return null;
 
-  if (segments.length >= 3 && projectSlugs.has(segments[0])) {
+  const canonical = segments.length >= 3 ? slugLookup.get(segments[0]) : undefined;
+  if (canonical !== undefined) {
     if (segments[2] === '') return null;
     return {
-      project: segments[0],
+      project: canonical,
       type: segments[1],
       id: segments.slice(2).join(':'),
       raw: key,
