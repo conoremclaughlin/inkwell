@@ -159,6 +159,77 @@ describe('GmailService.replyToEmail', () => {
     expect(headerOf(sentRaw(), 'To')).toBe('billing@clarus.com');
   });
 
+  // Reply-To is an address-LIST (RFC 5322 §3.6.2), not a single mailbox.
+  // Parsed as one mailbox, the bare form yields a comma-bearing string that
+  // fails validation and kills the reply outright; the display-name form
+  // silently keeps only the last address and drops an intended recipient.
+  it('replies to every address in a bare multi-address Reply-To', async () => {
+    mockMessagesGet.mockImplementation(
+      routeMessagesGet([
+        ...ORIGINAL_HEADERS,
+        { name: 'Reply-To', value: 'a@example.com, b@example.com' },
+      ])
+    );
+
+    await service.replyToEmail('user-1', { messageId: 'orig-1', body: 'ok' });
+    expect(headerOf(sentRaw(), 'To')).toBe('a@example.com, b@example.com');
+  });
+
+  it('replies to every address in a display-name multi-address Reply-To', async () => {
+    mockMessagesGet.mockImplementation(
+      routeMessagesGet([
+        ...ORIGINAL_HEADERS,
+        { name: 'Reply-To', value: 'A <a@example.com>, B <b@example.com>' },
+      ])
+    );
+
+    await service.replyToEmail('user-1', { messageId: 'orig-1', body: 'ok' });
+    expect(headerOf(sentRaw(), 'To')).toBe('a@example.com, b@example.com');
+  });
+
+  it('does not Cc a Reply-To destination that also appears in the original To', async () => {
+    mockMessagesGet.mockImplementation(
+      routeMessagesGet([
+        { name: 'From', value: 'noreply@x.com' },
+        { name: 'Reply-To', value: 'a@example.com, b@example.com' },
+        { name: 'To', value: 'B@example.com, other@z.com' },
+        { name: 'Subject', value: 'Hi' },
+      ])
+    );
+
+    await service.replyToEmail('user-1', {
+      messageId: 'orig-1',
+      body: 'ok',
+      replyAll: true,
+    });
+    expect(headerOf(sentRaw(), 'To')).toBe('a@example.com, b@example.com');
+    expect(headerOf(sentRaw(), 'Cc')).toBe('other@z.com');
+  });
+
+  it('deduplicates addresses repeated within Reply-To itself', async () => {
+    mockMessagesGet.mockImplementation(
+      routeMessagesGet([
+        ...ORIGINAL_HEADERS,
+        { name: 'Reply-To', value: 'a@example.com, A@EXAMPLE.COM' },
+      ])
+    );
+
+    await service.replyToEmail('user-1', { messageId: 'orig-1', body: 'ok' });
+    expect(headerOf(sentRaw(), 'To')).toBe('a@example.com');
+  });
+
+  it('falls back to the routable subset when Reply-To carries junk', async () => {
+    mockMessagesGet.mockImplementation(
+      routeMessagesGet([
+        ...ORIGINAL_HEADERS,
+        { name: 'Reply-To', value: 'not-an-address, good@example.com' },
+      ])
+    );
+
+    await service.replyToEmail('user-1', { messageId: 'orig-1', body: 'ok' });
+    expect(headerOf(sentRaw(), 'To')).toBe('good@example.com');
+  });
+
   it('drops unroutable entries from the original recipients', async () => {
     mockMessagesGet.mockImplementation(
       routeMessagesGet([

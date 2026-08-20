@@ -252,16 +252,56 @@ function wrapBase64(buffer: Buffer): string {
 }
 
 /**
- * Encode a filename for Content-Disposition.
+ * RFC 5987 `attr-char`. Everything outside this set must be percent-encoded
+ * in an RFC 2231 extended parameter value.
  *
- * ASCII names become a quoted-string; anything else uses RFC 2231's
- * `filename*` form, which is the only spec-sanctioned way to carry
- * non-ASCII in a parameter value.
+ * `encodeURIComponent` is NOT a substitute: it passes `!'()*` through
+ * unescaped, and `'` and `(` `)` are not attr-chars. A filename like
+ * `résumé (final).pdf` encoded that way produces a parameter a standards
+ * parser rejects — Python's email module reports a defect and hands back
+ * only `résumé`.
  */
-function encodeFilenameParam(filename: string): string {
-  const safe = sanitizeHeaderValue(filename).replace(/"/g, '');
-  if (!NON_ASCII.test(safe)) return `filename="${safe}"`;
-  return `filename*=UTF-8''${encodeURIComponent(safe)}`;
+const ATTR_CHAR = /[A-Za-z0-9!#$&+\-.^_`|~]/;
+
+/** Percent-encode UTF-8 bytes per RFC 2231 §4 / RFC 5987 §3.2. */
+function encodeExtendedValue(value: string): string {
+  let encoded = '';
+  for (const byte of Buffer.from(value, 'utf8')) {
+    const char = String.fromCharCode(byte);
+    encoded += ATTR_CHAR.test(char) ? char : `%${byte.toString(16).toUpperCase().padStart(2, '0')}`;
+  }
+  return encoded;
+}
+
+/**
+ * Emit a quoted-string parameter value.
+ *
+ * Backslash and double-quote are escaped rather than deleted. Deleting them
+ * silently renames the file: `a\b.pdf` stripped of its backslash arrives as
+ * `ab.pdf`, which looks like a successful attachment of a different name.
+ */
+function quoteParam(value: string): string {
+  return `"${value.replace(/[\\"]/g, (char) => `\\${char}`)}"`;
+}
+
+/**
+ * Encode a filename as a MIME parameter, round-tripping every name we accept.
+ *
+ * Pure-ASCII names are a quoted-string. Non-ASCII names use ONLY RFC 2231's
+ * extended form.
+ *
+ * RFC 6266 §4.3 suggests also emitting an ASCII fallback, and we deliberately
+ * do not: when both are present, which one wins is parser-dependent. Python's
+ * standards-based parser returns the fallback, so `résumé (final).pdf` would
+ * arrive as `r_sum_ (final).pdf` — a plausible-looking wrong name. A legacy
+ * parser that ignores RFC 2231 instead shows no name, which is visibly
+ * degraded rather than quietly incorrect. Same reasoning as failing a send
+ * outright rather than delivering it silently missing its attachments.
+ */
+function encodeFilenameParam(param: 'filename' | 'name', filename: string): string {
+  const safe = sanitizeHeaderValue(filename) || 'attachment';
+  if (!NON_ASCII.test(safe)) return `${param}=${quoteParam(safe)}`;
+  return `${param}*=UTF-8''${encodeExtendedValue(safe)}`;
 }
 
 /** A boundary that cannot collide with base64 part content. */
@@ -316,11 +356,10 @@ export function buildRawMessage(options: BuildMessageOptions): string {
     ];
 
     for (const attachment of attachments) {
-      const name = sanitizeHeaderValue(attachment.filename).replace(/"/g, '') || 'attachment';
       parts.push(
         `--${boundary}`,
-        `Content-Type: ${attachment.mimeType}; name="${name}"`,
-        `Content-Disposition: attachment; ${encodeFilenameParam(attachment.filename)}`,
+        `Content-Type: ${attachment.mimeType}; ${encodeFilenameParam('name', attachment.filename)}`,
+        `Content-Disposition: attachment; ${encodeFilenameParam('filename', attachment.filename)}`,
         'Content-Transfer-Encoding: base64',
         '',
         wrapBase64(attachment.content)

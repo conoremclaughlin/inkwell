@@ -286,22 +286,38 @@ export class GmailService {
     const originalSubject = getHeader('Subject');
 
     // Reply-To wins over From when the sender set one (RFC 5322 §3.6.2).
-    const primary = parseAddress(originalReplyTo || originalFrom).email;
-    if (!isValidAddress(primary)) {
+    //
+    // Both fields are address-LISTS, not single mailboxes. `a@x.com,
+    // b@x.com` parsed as one mailbox yields a comma-bearing string that
+    // fails validation and kills the reply outright; `A <a@x>, B <b@x>`
+    // silently keeps only the last one and drops an intended recipient.
+    const replyToSource = originalReplyTo || originalFrom;
+    const to = parseAddressList(replyToSource)
+      .map((address) => address.email.trim())
+      .filter((email) => isValidAddress(email))
+      .filter(
+        (email, index, all) =>
+          all.findIndex((e) => e.toLowerCase() === email.toLowerCase()) === index
+      );
+
+    if (to.length === 0) {
       throw new Error(
-        `Cannot reply: the original message has no usable sender address (From: "${originalFrom}").`
+        `Cannot reply: the original message has no usable sender address (Reply-To: "${originalReplyTo}", From: "${originalFrom}").`
       );
     }
 
-    const to = [primary];
     let cc: string[] = [];
 
     if (replyAll) {
       const self = await this.getOwnAddress(userId);
 
-      // Everyone who saw the original, minus the new To and minus the user
-      // themselves — replying should not Cc the sender back to themselves.
-      const seen = new Set([primary.toLowerCase(), ...(self ? [self.toLowerCase()] : [])]);
+      // Everyone who saw the original, minus every address already in To and
+      // minus the user themselves — replying should not Cc the sender back to
+      // themselves.
+      const seen = new Set([
+        ...to.map((email) => email.toLowerCase()),
+        ...(self ? [self.toLowerCase()] : []),
+      ]);
 
       cc = [...parseAddressList(getHeader('To')), ...parseAddressList(getHeader('Cc'))]
         .map((a) => a.email.trim())

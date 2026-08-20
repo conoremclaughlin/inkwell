@@ -291,6 +291,80 @@ describe('buildRawMessage', () => {
     expect(decoded).toContain("filename*=UTF-8''re%C3%A7u.pdf");
   });
 
+  // Round-trip, not byte-equality: the property that matters is that a
+  // standards parser recovers the name we put in. Asserting on the exact
+  // encoded bytes would only confirm the encoder agrees with itself —
+  // `encodeURIComponent` passed such an assertion while emitting parameters
+  // that Python's email parser rejects as defective.
+  describe('filename round-trip', () => {
+    /** Decode a Content-Disposition filename parameter back to its name. */
+    const readFilename = (decoded: string): string => {
+      const extended = decoded.match(/filename\*=UTF-8''([^\r\n;]+)/);
+      if (extended) {
+        return Buffer.from(
+          extended[1].replace(/%([0-9A-F]{2})/gi, (_, hex) =>
+            String.fromCharCode(parseInt(hex, 16))
+          ),
+          'binary'
+        ).toString('utf8');
+      }
+      const quoted = decoded.match(/filename="((?:[^"\\]|\\.)*)"/);
+      if (!quoted) throw new Error(`no filename parameter in: ${decoded}`);
+      return quoted[1].replace(/\\(.)/g, '$1');
+    };
+
+    it.each([
+      ['résumé (final).pdf', 'non-ASCII with parentheses — Lumen’s repro'],
+      ["it's a (test)*.jpg", 'apostrophe, parens and asterisk'],
+      ['a\\b.pdf', 'backslash must be escaped, not deleted'],
+      ['quote".pdf', 'double quote must be escaped, not deleted'],
+      ['Insurance Card Front.jpg', 'spaces in an override filename'],
+      ['普通话.txt', 'entirely non-ASCII'],
+      ['reçu.pdf', 'single non-ASCII character'],
+      ['plain.txt', 'nothing special'],
+    ])('recovers %j (%s)', (filename) => {
+      const decoded = decodeRaw(
+        buildRawMessage({
+          headers: ['To: a@b.com'],
+          body: 'x',
+          attachments: [
+            { filename, mimeType: 'application/octet-stream', content: Buffer.from('x') },
+          ],
+        })
+      );
+      expect(readFilename(decoded)).toBe(filename);
+    });
+
+    // A wrong-but-plausible name is worse than a missing one: emitting both
+    // forms lets the parser choose, and Python picks the degraded fallback.
+    it('emits only the extended form for a non-ASCII name', () => {
+      const decoded = decodeRaw(
+        buildRawMessage({
+          headers: ['To: a@b.com'],
+          body: 'x',
+          attachments: [
+            { filename: 'reçu.pdf', mimeType: 'application/pdf', content: Buffer.from('x') },
+          ],
+        })
+      );
+      expect(decoded).toContain("filename*=UTF-8''re%C3%A7u.pdf");
+      expect(decoded).not.toMatch(/filename="/);
+    });
+
+    it('percent-encodes characters encodeURIComponent leaves bare', () => {
+      const decoded = decodeRaw(
+        buildRawMessage({
+          headers: ['To: a@b.com'],
+          body: 'x',
+          attachments: [
+            { filename: "é'()*.pdf", mimeType: 'application/pdf', content: Buffer.from('x') },
+          ],
+        })
+      );
+      expect(decoded).toContain("filename*=UTF-8''%C3%A9%27%28%29%2A.pdf");
+    });
+  });
+
   it('strips CR/LF from an attachment filename', () => {
     const decoded = decodeRaw(
       buildRawMessage({
