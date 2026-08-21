@@ -12,7 +12,7 @@ import { randomUUID } from 'crypto';
 import { access, readFile, stat } from 'fs/promises';
 import path from 'path';
 import { SupabaseClient } from '@supabase/supabase-js';
-import jwt from 'jsonwebtoken';
+import { signRunnerAccessToken } from '../../auth/pcp-tokens';
 import type { Database } from '../../data/supabase/types.js';
 import type {
   Session,
@@ -998,9 +998,7 @@ export class SessionService implements ISessionService {
       userId,
       agentId,
       injectedContext.user.email,
-      session.sbId,
-      session.id,
-      session.contactId
+      session
     );
 
     // 4. Select runtime backend and model
@@ -1489,19 +1487,21 @@ export class SessionService implements ISessionService {
     };
   }
 
+  /**
+   * Mint the access token a spawned runner carries.
+   *
+   * Takes the whole session rather than its id/sbId/contactId as separate
+   * arguments, deliberately. The session IS the binding — a runner is
+   * authorized for the conversation the server put it in — and passing the
+   * parts individually means every call site is one forgotten argument away
+   * from issuing a token with no contact claim, which fails silently: the
+   * runner looks owner-scoped and is refused its own contact's session.
+   */
   private createRunnerAccessToken(
     userId: string,
     agentId: string,
-    email?: string,
-    sbId?: string,
-    /**
-     * The session this runner is being spawned for, and the contact it serves.
-     * Signed into the token so the runner's authorization is bound to the
-     * conversation the server put it in, rather than to whatever the process
-     * later claims in an unsigned header.
-     */
-    sessionId?: string,
-    contactId?: string
+    email: string | undefined,
+    session: { id: string; sbId?: string; contactId?: string }
   ): string | undefined {
     if (!email) {
       logger.warn('Cannot inject PCP access token for backend runner: missing user email', {
@@ -1511,8 +1511,7 @@ export class SessionService implements ISessionService {
       return undefined;
     }
 
-    const jwtSecret = process.env.JWT_SECRET;
-    if (!jwtSecret) {
+    if (!process.env.JWT_SECRET) {
       logger.warn('Cannot inject PCP access token for backend runner: JWT_SECRET missing', {
         userId,
         agentId,
@@ -1520,20 +1519,14 @@ export class SessionService implements ISessionService {
       return undefined;
     }
 
-    return jwt.sign(
-      {
-        type: 'mcp_access',
-        sub: userId,
-        email,
-        scope: 'mcp:tools',
-        ...(agentId ? { agentId } : {}),
-        ...(sbId ? { sbId } : {}),
-        ...(sessionId ? { sessionId } : {}),
-        ...(contactId ? { contactId } : {}),
-      },
-      jwtSecret,
-      { expiresIn: 60 * 60 }
-    );
+    return signRunnerAccessToken({
+      userId,
+      email,
+      agentId,
+      sbId: session.sbId,
+      sessionId: session.id,
+      contactId: session.contactId,
+    });
   }
 
   async getOrCreateSession(
@@ -2919,9 +2912,7 @@ This session will continue with a fresh context after compaction. Your identity,
         session.userId,
         session.agentId,
         fullContext.user.email,
-        session.sbId,
-        session.id,
-        session.contactId
+        session
       );
 
       const runtimeBackend = this.resolveRuntimeBackend(session.backend, context.agent.backend);

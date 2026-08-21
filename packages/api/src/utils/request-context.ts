@@ -93,6 +93,37 @@ let sessionContext: Omit<RequestContextData, 'timestamp'> | null = null;
 let pinnedSessionAgentId: string | null = null;
 
 /**
+ * The authenticated slice of the request context, derived from the bearer
+ * token alone.
+ *
+ * Extracted so the handoff is testable end to end. Everything downstream of
+ * this — contact isolation in particular — depends on these four fields
+ * surviving the trip from the runner's JWT into AsyncLocalStorage. A dropped
+ * claim does not fail loudly: a contact runner simply looks owner-scoped and
+ * is refused its own session.
+ */
+export function tokenIdentityContext(
+  tokenIdentity:
+    | {
+        agentId?: string;
+        sbId?: string;
+        sessionId?: string;
+        contactId?: string;
+      }
+    | null
+    | undefined
+): Partial<RequestContextData> {
+  if (!tokenIdentity?.agentId && !tokenIdentity?.sbId) return {};
+  return {
+    agentTokenBound: true,
+    ...(tokenIdentity.agentId ? { tokenAgentId: tokenIdentity.agentId } : {}),
+    ...(tokenIdentity.sbId ? { tokenSbId: tokenIdentity.sbId } : {}),
+    ...(tokenIdentity.sessionId ? { tokenSessionId: tokenIdentity.sessionId } : {}),
+    ...(tokenIdentity.contactId ? { tokenContactId: tokenIdentity.contactId } : {}),
+  };
+}
+
+/**
  * Run a function with request context set.
  * All code within the callback can access the context via getRequestContext().
  */

@@ -54,6 +54,45 @@ export function signPcpAccessToken(payload: PcpTokenPayload, expiresInSeconds: n
   });
 }
 
+/**
+ * Sign the access token a spawned runner carries.
+ *
+ * Lives here, beside the verifier, because the two have to agree on the claim
+ * names for the contact boundary to hold — a runner issued without
+ * `contactId` looks owner-scoped and is refused its own contact's session.
+ * SessionService used to sign these inline with its own jwt.sign() against
+ * process.env.JWT_SECRET while verification read env.JWT_SECRET; identical
+ * today, but two signing paths for one verifier is a latent way to break that
+ * agreement silently.
+ */
+export function signRunnerAccessToken(
+  claims: {
+    userId: string;
+    email: string;
+    agentId?: string;
+    sbId?: string;
+    /** The session this runner was spawned for. */
+    sessionId?: string;
+    /** The contact conversation it serves; absent for owner sessions. */
+    contactId?: string;
+  },
+  expiresInSeconds = 60 * 60
+): string {
+  return signPcpAccessToken(
+    {
+      type: 'mcp_access',
+      sub: claims.userId,
+      email: claims.email,
+      scope: 'mcp:tools',
+      ...(claims.agentId ? { agentId: claims.agentId } : {}),
+      ...(claims.sbId ? { sbId: claims.sbId } : {}),
+      ...(claims.sessionId ? { sessionId: claims.sessionId } : {}),
+      ...(claims.contactId ? { contactId: claims.contactId } : {}),
+    },
+    expiresInSeconds
+  );
+}
+
 // ============================================================================
 // Verify
 // ============================================================================

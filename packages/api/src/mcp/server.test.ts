@@ -75,9 +75,18 @@ vi.mock('../channels/agent-gateway', () => ({
   })),
 }));
 
-vi.mock('../utils/request-context', () => ({
-  runWithRequestContext: vi.fn((_ctx: unknown, fn: () => unknown) => fn()),
-}));
+// Only runWithRequestContext is stubbed (it would otherwise need real
+// AsyncLocalStorage plumbing per request); everything else stays real. A
+// factory that listed exports by hand went stale the moment server.ts imported
+// another one — the missing export came back undefined, every request threw,
+// and the whole suite timed out rather than saying so.
+vi.mock('../utils/request-context', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../utils/request-context')>();
+  return {
+    ...actual,
+    runWithRequestContext: vi.fn((_ctx: unknown, fn: () => unknown) => fn()),
+  };
+});
 
 vi.mock('@supabase/supabase-js', () => ({
   createClient: vi.fn(() => ({
