@@ -47,6 +47,7 @@ import {
   exchangeRefreshToken,
 } from '../auth/pcp-tokens';
 import type { Database } from '../data/supabase/types';
+import { applyGraphBlockedBy } from '../data/task-graph-read-model';
 import { isLeaseStale, type StudioLease } from '../services/studio-lease.service';
 import { activityBus } from '../services/events/activity-bus';
 import type { Activity } from '../data/repositories/activity-stream.repository';
@@ -6591,7 +6592,8 @@ router.get('/tasks', async (req: Request, res: Response) => {
       return;
     }
 
-    const tasks = data || [];
+    // Graph-mode groups store dependencies in task_edges; blockedBy is derived.
+    const tasks = await applyGraphBlockedBy(supabase, data || []);
 
     // Sort: status priority (in_progress, pending, blocked, completed),
     // then by priority (critical, high, medium, low), then by created_at desc
@@ -6727,6 +6729,8 @@ router.put('/tasks/:id', async (req: Request, res: Response) => {
       return;
     }
 
+    const [derivedTask] = await applyGraphBlockedBy(supabase, [data]);
+
     res.json({
       task: {
         id: data.id,
@@ -6739,7 +6743,7 @@ router.put('/tasks/:id', async (req: Request, res: Response) => {
         projectName: (data.projects as { name: string } | null)?.name ?? null,
         taskGroupId: data.task_group_id,
         taskGroupTitle: (data.task_groups as { title: string } | null)?.title ?? null,
-        blockedBy: data.blocked_by,
+        blockedBy: derivedTask.blocked_by,
         createdBy: data.created_by,
         completedAt: data.completed_at,
         dueDate: data.due_date,
@@ -6890,7 +6894,8 @@ router.get('/task-groups/:id', async (req: Request, res: Response) => {
       return;
     }
 
-    const tasks = tasksData || [];
+    // Graph-mode groups store dependencies in task_edges; blockedBy is derived.
+    const tasks = await applyGraphBlockedBy(supabase, tasksData || []);
 
     res.json({
       group: {
