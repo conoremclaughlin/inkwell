@@ -537,11 +537,15 @@ export const listSessionsSchema = userIdentifierBaseSchema.extend({
   // `ink attach` and `ink mission` have always passed status: 'active' here.
   // The parameter was never declared, so zod stripped it and every caller
   // silently received unfiltered results. Declaring it without honouring it
-  // would be the same bug with extra steps, so listSessions filters on it.
+  // would be the same bug with extra steps, so listSessions filters on it —
+  // on the session's derived current state, not on the deprecated
+  // `sessions.status` column, which no terminal path keeps in sync.
   status: z
     .enum(['active', 'paused', 'resumable', 'completed'])
     .optional()
-    .describe('Filter by session status'),
+    .describe(
+      "Filter by current state. 'active' = not finished, which includes sessions an agent marked paused or resumable; 'completed' = finished or failed; 'paused'/'resumable' = agent-declared, among unfinished sessions only."
+    ),
   limit: z.number().min(1).max(100).optional().describe('Max results (default: 20)'),
 });
 
