@@ -13,7 +13,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { SessionService } from './session-service';
+import { SessionService, RoutingRefusedError } from './session-service';
 import type { Session } from './types';
 import { tmpdir } from 'os';
 import { registerActiveRun, resetActiveRuns } from './active-runs';
@@ -85,7 +85,7 @@ describe('fail-closed routing at the lease boundary', () => {
   beforeEach(() => resetActiveRuns());
   afterEach(() => resetActiveRuns());
 
-  it('clears the studio binding when the studio is held by another thread and overflow is unavailable', async () => {
+  it('HOLDS when the studio is held by another thread and overflow is unavailable (6b r2)', async () => {
     const session = makeSession({ studioId: 'studio-1' });
     const { store, repo } = makeMockRepository(session);
     const foreignHolder: StudioLease = {
@@ -125,18 +125,26 @@ describe('fail-closed routing at the lease boundary', () => {
     const service = makeService(repo, tables);
 
     // recipientSessionId path — a bypass tier (occupancy unchecked).
-    const result = await service.getOrCreateSession('user-1', 'wren', {
-      threadKey: 'pr:200',
-      recipientSessionId: 'session-1',
+    //
+    // 6b r2 (Lumen #517 blocker 6): clearing the binding sent the runner to
+    // defaultWorkingDirectory — routinely the SAME occupied root. The only
+    // safe outcome is a HOLD: throw occupied, no execution anywhere.
+    await expect(
+      service.getOrCreateSession('user-1', 'wren', {
+        threadKey: 'pr:200',
+        recipientSessionId: 'session-1',
+      })
+    ).rejects.toMatchObject({
+      code: 'ROUTING_REFUSED',
+      detail: { reason: 'occupied' },
     });
 
-    // Never bound to the occupied studio.
-    expect(result.studioId).toBeFalsy();
-    expect(store.session.studioId).toBeFalsy();
     // The foreign holder was not clobbered.
     expect((tables.studios[0].lease as unknown as StudioLease).sessionId).toBe('session-foreign');
     // The contradiction is on the record.
     expect(tables.studio_lease_events.map((e) => e.event)).toContain('conflict');
+    void store;
+    void RoutingRefusedError;
   });
 
   it('keeps the binding when the lease is acquired normally', async () => {

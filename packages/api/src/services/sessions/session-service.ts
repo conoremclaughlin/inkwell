@@ -49,6 +49,7 @@ import { serializeError } from '../../utils/serialize-error.js';
 import { resolveTaskGroupForThreadKey } from '../task-group-resolver.js';
 import { getRunnerFilesDir } from '../sandbox/orchestrator.js';
 import { StudioLeaseService, isLeaseStale } from '../studio-lease.service.js';
+import { ThreadKeyService } from '../thread-key/thread-key.service.js';
 import { StudioOverflowService } from '../studio-overflow.service.js';
 import { StudiosRepository, type Studio } from '../../data/repositories/studios.repository.js';
 import { logger } from '../../utils/logger.js';
@@ -457,10 +458,16 @@ export class SessionService implements ISessionService {
   private async gateOccupancy(
     candidateStudioId: string,
     tier: StudioRoutingDecision['tier'],
-    ctx: { userId: string; agentId: string; threadKey?: string }
+    ctx: { userId: string; agentId: string; threadKey?: string; writeIntent?: 'write' | 'presence' }
   ): Promise<StudioRoutingDecision> {
     const leases = this.getLeaseService();
     if (!leases || !ctx.threadKey) {
+      return { studioId: candidateStudioId, tier, occupancyChecked: false };
+    }
+    // Presence threads take no lease, so occupancy is not their concern:
+    // gating them would divert/refuse over a lock they never contend for
+    // (Phase 6b; intent resolved before routing, blocker 5).
+    if (ctx.writeIntent === 'presence') {
       return { studioId: candidateStudioId, tier, occupancyChecked: false };
     }
 
@@ -573,10 +580,29 @@ export class SessionService implements ISessionService {
   private async withStudioLease(
     session: Session,
     routing: StudioRoutingDecision,
-    ctx: { userId: string; agentId: string; threadKey?: string }
+    ctx: { userId: string; agentId: string; threadKey?: string; writeIntent?: 'write' | 'presence' }
   ): Promise<Session> {
     const leases = this.getLeaseService();
     if (!leases || !ctx.threadKey || !session.studioId) return session;
+
+    // Phase 6b: acquisition on INTENT, not arrival. Presence-typed threads
+    // bind to the studio without taking the write lease — they run FROM the
+    // directory and tolerate drift (task c82daba1 rule 2). Intent was
+    // resolved ONCE, before routing, from the thread's STORED pinned
+    // key_type via the registry (grammar v4) — never a live re-parse, and
+    // never re-resolved here (blocker 5: one resolution feeds the occupancy
+    // gate and this gate identically). MECHANISM ONLY until 6e: every
+    // template is write and presence overrides are rejected at the tool
+    // surface — the flip ships atomically with escalation-on-write.
+    const intent = ctx.writeIntent ?? 'write';
+    if (intent === 'presence') {
+      logger.debug('[StudioLease] Presence thread — studio bound without lease', {
+        sessionId: session.id,
+        studioId: session.studioId,
+        threadKey: ctx.threadKey,
+      });
+      return session;
+    }
 
     const boundStudioId = session.studioId;
     try {
@@ -632,8 +658,42 @@ export class SessionService implements ISessionService {
         }
       }
 
+      // VERIFIED conflict + overflow failure: HOLD, do not degrade (Lumen
+      // #517 r1 blocker 6). Clearing the binding sends the runner to
+      // defaultWorkingDirectory — which on this server is routinely the SAME
+      // occupied root the conflict is about (three SBs share the pcp main
+      // checkout). A held message is recoverable; a writer executing inside
+      // the occupied tree via the fallback cwd is the exact stomp the lease
+      // exists to prevent. The session row stays idle; the next delivery
+      // attempt re-routes once the holder finishes.
+      //
+      // Scoped to VERIFIED conflicts (holder present — row-level or sibling).
+      // holder === null means the studio could not even be verified as this
+      // user's (not found, retired, unverifiable): claiming "occupied" there
+      // asserts knowledge we do not have, so the existing fail-closed
+      // clear-binding path below handles it as before.
+      if (result.holder) {
+        logger.error(
+          '[StudioLease] Occupied and overflow unavailable — holding, never the occupied root',
+          {
+            sessionId: session.id,
+            studioId: boundStudioId,
+            threadKey: ctx.threadKey,
+            holderThreadKey: result.holder.threadKey,
+          }
+        );
+        throw new RoutingRefusedError(ctx.threadKey, ctx.agentId, {
+          triedCallerRepo: false,
+          reason: 'occupied',
+          occupied: {
+            studioId: boundStudioId,
+            holderThreadKey: result.holder.threadKey,
+          },
+        });
+      }
+
       logger.error(
-        '[StudioLease] Overflow unavailable; clearing studio binding (fail closed, never the occupied worktree)',
+        '[StudioLease] Studio unverifiable and overflow unavailable; clearing studio binding',
         {
           sessionId: session.id,
           studioId: boundStudioId,
@@ -642,6 +702,7 @@ export class SessionService implements ISessionService {
       );
       return await this.repository.update(session.id, { studioId: null });
     } catch (err) {
+      if (err instanceof RoutingRefusedError) throw err;
       logger.error('[StudioLease] Lease acquisition errored; clearing studio binding', {
         sessionId: session.id,
         studioId: boundStudioId,
@@ -654,6 +715,35 @@ export class SessionService implements ISessionService {
         // default working directory rather than the unverified worktree.
         return { ...session, studioId: undefined };
       }
+    }
+  }
+
+  /**
+   * Write intent for a thread, from its STORED pinned key_type (grammar v4 —
+   * the DB pinned it at creation; consumers never re-parse) resolved through
+   * the type registry. FAILS TOWARD WRITE on every failure mode — missing
+   * thread row, lookup error, registry error — because failing toward
+   * presence would let a session mutate an unleased tree (the registry's own
+   * read-failure rule, applied at this layer too).
+   */
+  private async resolveWriteIntent(
+    userId: string,
+    threadKey: string
+  ): Promise<'write' | 'presence'> {
+    if (!this.supabase) return 'write';
+    try {
+      const { data, error } = await this.supabase
+        .from('inbox_threads')
+        .select('key_type')
+        .eq('user_id', userId)
+        .eq('thread_key', threadKey)
+        .maybeSingle();
+      if (error) return 'write';
+      const service = new ThreadKeyService(this.supabase);
+      const behavior = await service.typeBehavior(userId, data?.key_type ?? null);
+      return behavior.writeIntent;
+    } catch {
+      return 'write';
     }
   }
 
@@ -1649,8 +1739,19 @@ export class SessionService implements ISessionService {
       });
     }
 
+    // Phase 6b (Lumen #517 r1 blocker 5, r3 P0-1): intent is resolved BEFORE
+    // routing, because gateOccupancy runs INSIDE resolveStudioId — an
+    // intent-blind gate would divert/refuse a presence thread over a lease it
+    // was never going to take, provisioning overflow worktrees for work that
+    // tolerates drift. One resolution feeds routing's occupancy gate and the
+    // lease gate identically.
+    const writeIntent = options?.threadKey
+      ? await this.resolveWriteIntent(userId, options.threadKey)
+      : ('write' as const);
+
     let routing = await this.resolveStudioId(userId, agentId, {
       threadKey: options?.threadKey,
+      writeIntent,
       explicitStudioId: options?.studioId,
       studioHint: options?.studioHint,
       recipientSessionId: authorizedRecipientSessionId,
@@ -1679,7 +1780,7 @@ export class SessionService implements ISessionService {
       throw new UnresolvedStudioError(routing.unresolvedNamedStudio, agentId);
     }
 
-    const leaseCtx = { userId, agentId, threadKey: options?.threadKey };
+    const leaseCtx = { userId, agentId, threadKey: options?.threadKey, writeIntent };
 
     // Resolve default_session_id from agent identity. When set, threadKey
     // misses route to this session instead of creating new ones.
@@ -2011,6 +2112,8 @@ export class SessionService implements ISessionService {
     agentId: string,
     options: {
       threadKey?: string;
+      /** Pre-resolved BEFORE routing (r3 P0-1) — gates must never re-resolve. */
+      writeIntent?: 'write' | 'presence';
       explicitStudioId?: string;
       studioHint?: string;
       recipientSessionId?: string;
@@ -2033,7 +2136,12 @@ export class SessionService implements ISessionService {
       identityAbsent?: boolean;
     }
   ): Promise<StudioRoutingDecision> {
-    const leaseCtx = { userId, agentId, threadKey: options.threadKey };
+    const leaseCtx = {
+      userId,
+      agentId,
+      threadKey: options.threadKey,
+      writeIntent: options.writeIntent,
+    };
 
     // Canonical identity resolved ONCE, up front, and preferred by EVERY tier
     // below (Lumen, PR #514 round 4). Scoping only the caller-repo tier by

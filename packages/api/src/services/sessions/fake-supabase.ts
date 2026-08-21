@@ -90,6 +90,22 @@ class FakeQuery {
   }
 }
 
+export function normalizePath(p: unknown): string | null {
+  if (typeof p !== 'string' || p === '') return null;
+  // SQL parity (r4 P0-1): canonical input or error. The DB rejects relative
+  // paths and '.'/'..' segments instead of guessing at them; what remains
+  // (slash collapse, trailing slash except root) is idempotent.
+  if (!p.startsWith('/')) {
+    throw new Error(`worktree_path must be absolute: ${p}`);
+  }
+  if (/(^|\/)\.\.?(\/|$)/.test(p)) {
+    throw new Error(`worktree_path must not contain . or .. segments: ${p}`);
+  }
+  let v = p.replace(/\/{2,}/g, '/');
+  if (v.length > 1) v = v.replace(/\/$/, '');
+  return v;
+}
+
 export function makeFakeSupabase(tables: Record<string, Row[]>) {
   return {
     from(table: string) {
@@ -99,6 +115,99 @@ export function makeFakeSupabase(tables: Record<string, Row[]>) {
         update: (payload: Row) => new FakeQuery(rows, 'update', payload),
         insert: (payload: Row) => new FakeQuery(rows, 'insert', payload),
       };
+    },
+    // grant_studio_lease + studio_path_conflict at SQL parity (Phase 6b
+    // round 2): ANY sibling lease on the same NORMALIZED path conflicts — no
+    // thread exception (a thread is not one writer), no staleness exception
+    // (stale is not proof of departure; the sweep rescues). NULL paths back
+    // no shared tree and skip the scan. Atomic here because JS is
+    // single-threaded, as the advisory xact lock makes it in Postgres.
+    async rpc(fn: string, args: Row) {
+      try {
+        const studios = tables['studios'] ?? [];
+        const target = studios.find(
+          (r) => r.id === args.p_studio_id && r.user_id === args.p_user_id
+        );
+        // The pre-lock read (SQL: SELECT normalize_worktree_path INTO
+        // v_path). A non-canonical stored path RAISEs in SQL — mirrored by
+        // the throw propagating to the catch below as an RPC error.
+        const lockedPath = target ? normalizePath(target.worktree_path) : null;
+        const findSibling = () => {
+          if (!target) return undefined;
+          // Pathless rows all execute in the shared defaultWorkingDirectory —
+          // ONE backing class per user (r3 P0-3). Scanned against the LOCKED
+          // backing, never a re-read (SQL scans v_path).
+          return studios.find(
+            (r) =>
+              r.id !== args.p_studio_id &&
+              r.user_id === args.p_user_id &&
+              (lockedPath == null
+                ? normalizePath(r.worktree_path) == null
+                : normalizePath(r.worktree_path) === lockedPath) &&
+              r.lease != null
+          );
+        };
+        // r4 P0-2: the CAS proves the row still belongs to the backing the
+        // lock serializes; a moved row matches zero rows.
+        const backingMatches = () => {
+          if (!target) return false;
+          const now = normalizePath(target.worktree_path);
+          return lockedPath == null ? now == null : now === lockedPath;
+        };
+
+        if (fn === 'studio_path_conflict') {
+          if (!target) return { data: { conflict: true }, error: null };
+          if (!backingMatches()) return { data: { conflict: true }, error: null };
+          const sibling = findSibling();
+          return sibling
+            ? {
+                data: {
+                  conflict: true,
+                  conflictStudioId: sibling.id,
+                  conflictHolder: sibling.lease,
+                },
+                error: null,
+              }
+            : { data: { conflict: false }, error: null };
+        }
+
+        if (fn !== 'grant_studio_lease') {
+          return { data: null, error: { message: `no fake for rpc ${fn}` } };
+        }
+        if (!target) return { data: { outcome: 'lost' }, error: null };
+
+        const conflict = findSibling();
+        if (conflict) {
+          return {
+            data: {
+              outcome: 'path-conflict',
+              conflictStudioId: conflict.id,
+              conflictHolder: conflict.lease,
+            },
+            error: null,
+          };
+        }
+
+        const acquirable = target.status === 'active' || target.status === 'idle';
+        const pLease = args.p_lease as Row;
+        const prior = args.p_expected_prior as Row | null;
+        const priorMatches = prior
+          ? !!target.lease &&
+            (target.lease as Row).sessionId === prior.sessionId &&
+            (target.lease as Row).acquiredAt === prior.acquiredAt &&
+            (target.lease as Row).heartbeatAt === prior.heartbeatAt
+          : target.lease == null;
+        if (acquirable && priorMatches && backingMatches()) {
+          target.lease = pLease;
+          return { data: { outcome: 'granted' }, error: null };
+        }
+        return { data: { outcome: 'lost' }, error: null };
+      } catch (err) {
+        return {
+          data: null,
+          error: { message: err instanceof Error ? err.message : String(err) },
+        };
+      }
     },
   } as never;
 }
