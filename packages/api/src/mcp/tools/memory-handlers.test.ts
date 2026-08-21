@@ -1846,6 +1846,37 @@ describe('session authorization boundary', () => {
       expect(mockDataComposer.repositories.memory.endSession).not.toHaveBeenCalled();
     });
 
+    it('ignores an unsigned x-ink-context contactId entirely', async () => {
+      // The header can carry contactId too. It must not be a fallback when the
+      // token holds no claim, or the whole binding is decorative — a caller
+      // would simply omit the claim and assert the scope it wants.
+      callerIsAgent('myra', 'sb-myra', { contactId: 'contact-a' });
+      mockDataComposer.repositories.memory.getSession.mockResolvedValue(contactA);
+
+      denied(
+        await handleUpdateSessionState(
+          { email: 'test@test.com', sessionId: TARGET_UUID, context: 'header-claimed scope' },
+          mockDataComposer as never
+        )
+      );
+      expect(mockDataComposer.repositories.memory.updateSession).not.toHaveBeenCalled();
+    });
+
+    it('prefers the signed claim when the header disagrees', async () => {
+      callerIsAgent('myra', 'sb-myra', {
+        tokenContactId: 'contact-a',
+        contactId: 'contact-b',
+      });
+      mockDataComposer.repositories.memory.getSession.mockResolvedValue(contactB);
+
+      denied(
+        await handleUpdateSessionState(
+          { email: 'test@test.com', sessionId: TARGET_UUID, context: 'header says B' },
+          mockDataComposer as never
+        )
+      );
+    });
+
     it('denies an agent with no signed contact claim every contact session', async () => {
       // Fail closed, matching resolveObservePermission's contact_isolated stance:
       // without a claim there is no authenticated per-contact distinction.
