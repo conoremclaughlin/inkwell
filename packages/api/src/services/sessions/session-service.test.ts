@@ -1057,9 +1057,35 @@ describe('SessionService', () => {
   });
 
   describe('Compaction Triggering', () => {
-    it('should trigger compaction when context tokens exceed threshold', async () => {
+    // The server-side gate is OPT-IN (SERVER_COMPACTION_ENABLED): Claude Code
+    // auto-compacts natively, so the default service must stay silent even
+    // over threshold. Backend scoping is asserted against an ENABLED service
+    // so the gate cannot mask a scoping regression.
+    const makeEnabledService = () =>
+      new SessionService(
+        mockRepository,
+        mockContextBuilder,
+        mockClaudeRunner,
+        mockActivityStream,
+        {
+          defaultWorkingDirectory: '/test',
+          mcpConfigPath: '/test/.mcp.json',
+          compactionThreshold: 150000,
+          compactionEnabled: true,
+        },
+        mockCodexRunner,
+        undefined,
+        undefined,
+        mockInkRunner
+      );
+
+    it('does NOT trigger compaction by default — the gate is opt-in', async () => {
       const session = createMockSession();
       vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
+      // findById feeds triggerCompaction's first step; mocked so the ONLY
+      // thing standing between this turn and the lock is the gate itself
+      // (otherwise the silence assertion passes vacuously on a throw).
+      vi.mocked(mockRepository.findById).mockResolvedValue(session);
 
       vi.mocked(mockClaudeRunner.run).mockResolvedValue(
         createMockClaudeResult({
@@ -1068,16 +1094,42 @@ describe('SessionService', () => {
       );
 
       const request = createMockRequest();
-      await sessionService.handleMessage(request);
-
-      // Compaction should be triggered (asynchronously)
-      // We can't easily verify the async compaction call, but we can check no errors occurred
+      const result = await sessionService.handleMessage(request);
+      expect(result.success).toBe(true);
       expect(mockRepository.updateTokenUsage).toHaveBeenCalled();
+
+      // Flush the would-be fire-and-forget trigger before asserting silence.
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(mockRepository.tryAcquireCompactionLock).not.toHaveBeenCalled();
     });
 
-    it('should not trigger compaction when tokens are below threshold', async () => {
+    it('triggers compaction when ENABLED and context tokens exceed threshold', async () => {
+      const enabledService = makeEnabledService();
       const session = createMockSession();
       vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
+      vi.mocked(mockRepository.findById).mockResolvedValue(session);
+
+      vi.mocked(mockClaudeRunner.run).mockResolvedValue(
+        createMockClaudeResult({
+          usage: { contextTokens: 160000, inputTokens: 5000, outputTokens: 2000 },
+        })
+      );
+
+      const request = createMockRequest();
+      await enabledService.handleMessage(request);
+
+      // The trigger is fire-and-forget; the lock attempt is its first act.
+      await vi.waitFor(() => expect(mockRepository.tryAcquireCompactionLock).toHaveBeenCalled());
+    });
+
+    it('should not trigger compaction when ENABLED but tokens are below threshold', async () => {
+      // Through the ENABLED service: on the default one this case is
+      // indistinguishable from the gate, and `compactionTriggered` is a
+      // hardcoded false — asserting it proves nothing (Lumen, PR #520).
+      const enabledService = makeEnabledService();
+      const session = createMockSession();
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
+      vi.mocked(mockRepository.findById).mockResolvedValue(session);
 
       vi.mocked(mockClaudeRunner.run).mockResolvedValue(
         createMockClaudeResult({
@@ -1086,24 +1138,33 @@ describe('SessionService', () => {
       );
 
       const request = createMockRequest();
-      const result = await sessionService.handleMessage(request);
-
+      const result = await enabledService.handleMessage(request);
       expect(result.success).toBe(true);
-      expect(result.compactionTriggered).toBe(false);
+
+      // Cross the fire-and-forget boundary before asserting silence.
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(mockRepository.tryAcquireCompactionLock).not.toHaveBeenCalled();
     });
 
-    it('should not trigger compaction for codex-cli backend even when tokens exceed threshold', async () => {
+    it('should not trigger compaction for codex-cli backend even when ENABLED and tokens exceed threshold', async () => {
+      const enabledService = makeEnabledService();
       const session = createMockSession({ backend: 'codex' });
       vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
+      vi.mocked(mockRepository.findById).mockResolvedValue(session);
 
-      vi.mocked(mockClaudeRunner.run).mockResolvedValue(
+      // The stub must sit on the CODEX runner — a codex-backend session never
+      // consults mockClaudeRunner, so stubbing that one leaves the real usage
+      // at the codex default 5K and the backend-scope condition untested
+      // (Lumen, PR #520).
+      vi.mocked(mockCodexRunner.run).mockResolvedValue(
         createMockClaudeResult({
+          backendSessionId: 'codex-session-1',
           usage: { contextTokens: 300000, inputTokens: 300000, outputTokens: 2000 }, // Way above threshold
         })
       );
 
       const request = createMockRequest();
-      const result = await sessionService.handleMessage(request);
+      const result = await enabledService.handleMessage(request);
 
       expect(result.success).toBe(true);
       // Token usage should still be recorded

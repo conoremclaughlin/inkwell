@@ -44,24 +44,35 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         return;
       }
 
-      const { sessionId, lifecycle, event, agentId, workingDir, cliAttached, cliPollAt, alias } =
-        req.body as {
-          sessionId?: string;
-          lifecycle?: string;
-          /**
-           * Which hook fired: 'prompt' | 'stop' | 'pre-compact' | 'post-compact'.
-           * Lifecycle values alone are ambiguous — post-compact also sends
-           * 'idle' while the same turn continues, so ONLY event === 'stop'
-           * marks the real CLI turn boundary. Legacy senders without the
-           * field get renewals but never boundary releases.
-           */
-          event?: string;
-          agentId?: string;
-          workingDir?: string;
-          cliAttached?: boolean;
-          cliPollAt?: string;
-          alias?: string;
-        };
+      const {
+        sessionId,
+        lifecycle,
+        event,
+        agentId,
+        workingDir,
+        cliAttached,
+        cliPollAt,
+        alias,
+        studioId,
+      } = req.body as {
+        sessionId?: string;
+        lifecycle?: string;
+        /**
+         * Which hook fired: 'prompt' | 'stop' | 'pre-compact' | 'post-compact'.
+         * Lifecycle values alone are ambiguous — post-compact also sends
+         * 'idle' while the same turn continues, so ONLY event === 'stop'
+         * marks the real CLI turn boundary. Legacy senders without the
+         * field get renewals but never boundary releases.
+         */
+        event?: string;
+        agentId?: string;
+        workingDir?: string;
+        cliAttached?: boolean;
+        cliPollAt?: string;
+        alias?: string;
+        /** Caller's worktree studio, for the fenced lease-held report. */
+        studioId?: string;
+      };
 
       if (!sessionId) {
         res.status(400).json({ success: false, error: 'sessionId is required' });
@@ -165,16 +176,46 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
           });
         });
       } else {
-        void leaseService.renewBySession(sessionId, session.userId).catch((err: unknown) => {
+        // FENCED for prompt events (round four): the renewal is awaited
+        // BEFORE the 2xx. The sweep's release CAS is guarded on the exact
+        // prior lease (heartbeatAt included), so a renewal that lands first
+        // defeats a concurrent release — and if the release already won, the
+        // held-check below reads the cleared lease and the response says so,
+        // which a gated producer treats as unacknowledged: no turn starts in
+        // a worktree whose lease is gone. The old fire-and-forget renewal
+        // left a window where a 2xx implied protection the lease no longer
+        // had.
+        try {
+          await leaseService.renewBySession(sessionId, session.userId);
+        } catch (err: unknown) {
           logger.debug('[HookLifecycle] Lease renewal failed (non-fatal)', {
             sessionId,
             error: err instanceof Error ? err.message : String(err),
           });
-        });
+        }
+      }
+
+      // Per-studio held report for gated prompt callers. HELD requires a
+      // successful exact-CAS touch (round five) — a plain read could observe
+      // a snapshot an already-running sweep is about to clear, and a failed
+      // renewal was silently ignored. Absent for stop events, main, and
+      // studioless senders — nothing to fence there.
+      let studioLeaseHeld: boolean | undefined;
+      if (isPromptEvent && typeof studioId === 'string' && studioId && studioId !== 'main') {
+        studioLeaseHeld = await leaseService.touchStudioLeaseForSession(
+          studioId,
+          sessionId,
+          session.userId
+        );
       }
 
       logger.debug('[HookLifecycle] Updated', { sessionId, lifecycle, agentId });
-      res.json({ success: true, sessionId, lifecycle });
+      res.json({
+        success: true,
+        sessionId,
+        lifecycle,
+        ...(studioLeaseHeld !== undefined ? { studioLeaseHeld } : {}),
+      });
     } catch (error) {
       logger.error('[HookLifecycle] Error:', error);
       res.status(500).json({

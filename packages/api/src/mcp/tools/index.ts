@@ -2,6 +2,12 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import type { DataComposer } from '../../data/composer';
 import { logger } from '../../utils/logger';
+import { strictifyInputSchema, strictToolArgsEnabled } from './strict-input-schema';
+import {
+  describeToolSchema,
+  handleDescribeTool,
+  type ToolRegistry,
+} from './tool-discovery-handlers';
 
 // Import all tool handlers
 import { handleSaveLink, handleSearchLinks, handleTagLink } from './link-handlers';
@@ -55,6 +61,9 @@ import {
   handleRestoreMemory,
   handleBootstrap,
   handleCompactSession,
+  rememberSchema,
+  listSessionsSchema,
+  updateSessionStateSchema,
 } from './memory-handlers';
 
 import {
@@ -387,8 +396,32 @@ export function registerAllTools(
     return TRANSIENT_PG_PATTERNS.some((p) => msg.includes(p));
   }
 
+  // Populated by the interceptor below; read at call time by describe_tool, so
+  // registration order does not matter.
+  const toolRegistry: ToolRegistry = new Map();
+
   const originalRegisterTool = server.registerTool.bind(server);
   (server as any).registerTool = (name: string, ...rest: any[]) => {
+    // Reject unknown args instead of silently stripping them. Applied here so
+    // all ~163 tools inherit it, rather than per-schema — see
+    // ./strict-input-schema for why the default rather than the schemas is
+    // treated as the defect.
+    const config = rest[0];
+    if (strictToolArgsEnabled()) {
+      if (config && typeof config === 'object' && 'inputSchema' in config) {
+        config.inputSchema = strictifyInputSchema(config.inputSchema);
+      }
+    }
+    // Record what was registered so describe_tool can answer questions about
+    // it. Captured after strictify so an agent is shown the schema that is
+    // actually enforced, not the one before it was tightened.
+    if (config && typeof config === 'object') {
+      toolRegistry.set(name, {
+        name,
+        description: (config as { description?: string }).description,
+        inputSchema: (config as { inputSchema?: unknown }).inputSchema,
+      });
+    }
     const handler = rest[rest.length - 1];
     if (typeof handler === 'function') {
       rest[rest.length - 1] = async (...handlerArgs: any[]) => {
@@ -1677,51 +1710,10 @@ Examples: "project:pcp/memory", "decision:jwt-auth", "person:conor", "reflection
 Use summary to provide a one-liner when the full content is long/detailed. The summary is what appears in the bootstrap knowledge summary.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: {
-        ...userIdentifierFields,
-        content: z.string().describe('The content to remember'),
-        summary: z
-          .string()
-          .optional()
-          .describe(
-            'One-liner summary of this memory. Used in bootstrap knowledge summary instead of full content. Provide when content is long/detailed.'
-          ),
-        topicKey: z
-          .string()
-          .optional()
-          .describe(
-            'Primary structured topic key (type:identifier). Common types: project, decision, convention, person, reflection, lesson, beauty, growth, value, family, domain. Auto-added to topics array.'
-          ),
-        topicSummary: z
-          .string()
-          .optional()
-          .describe(
-            'Short description of the topic (shown in bootstrap topic index header). Only needed when creating a new topic or updating its description.'
-          ),
-        source: z.string().optional().describe('Source of the memory (default: observation)'),
-        salience: z
-          .enum(['low', 'medium', 'high', 'critical'])
-          .optional()
-          .describe('Importance level (default: medium)'),
-        topics: z
-          .union([z.string(), z.array(z.string())])
-          .optional()
-          .describe('Topics for categorization'),
-        metadata: z.record(z.unknown()).optional().describe('Additional metadata'),
-        expiresAt: z.string().datetime().optional().describe('Optional expiration date (ISO 8601)'),
-        agentId: z
-          .string()
-          .optional()
-          .describe(
-            'Which AI being created this memory (e.g., "wren", "benson"). Null = shared memory.'
-          ),
-        studioId: z
-          .string()
-          .optional()
-          .describe(
-            'Studio ID (UUID or "main") — helps auto-attach the correct session in parallel worktree scenarios. Stored in metadata.'
-          ),
-      },
+      // Canonical schema, not a copy. The duplicate that used to live here was
+      // missing `contactId` and `sessionId`, so chat's /eject silently lost the
+      // session attribution it was explicitly passing.
+      inputSchema: rememberSchema,
     },
     async (args) => {
       try {
@@ -2131,19 +2123,11 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `List past sessions, optionally filtered by agent and/or backend.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: {
-        ...userIdentifierFields,
-        agentId: z.string().optional().describe('Filter by agent'),
-        studioId: z
-          .string()
-          .optional()
-          .describe('Filter by studio (UUID or "main" for the main studio)'),
-        backend: z
-          .string()
-          .optional()
-          .describe('Filter by backend runtime (e.g., "ink", "claude-code")'),
-        limit: z.number().min(1).max(100).optional().describe('Max results (default: 20)'),
-      },
+      // Register the canonical schema the handler parses with, rather than a
+      // hand-copied duplicate. The copy that used to live here had drifted:
+      // it was missing `status` and had dropped the UUID refinement on
+      // studioId, so the registered contract and the enforced one disagreed.
+      inputSchema: listSessionsSchema,
     },
     async (args) => {
       try {
@@ -2172,7 +2156,8 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
     {
       description: `Update your session state — work phase, status, backend session ID, context. This is the primary tool for managing session state.
 
-Session resolution: sessionId (explicit) > studioId (scoped lookup) > most recent active session.
+Session resolution: sessionId (explicit) > studioId (scoped lookup) > the session you are running in > your most recent active session.
+Implicit resolution is always scoped to your own agent identity and fails with an error rather than guessing — it will never select another agent's session.
 For parallel worktrees, pass studioId to target the correct session.
 
 Phase: Communicates real-time work status to other agents.
@@ -2185,62 +2170,11 @@ Context: The session context column is for **transient runtime state** — facts
 Also sets: backendSessionId (for resume), status (active/paused/resumable/completed), workingDir.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: {
-        ...userIdentifierFields,
-        sessionId: z
-          .string()
-          .uuid()
-          .optional()
-          .describe(
-            'Session ID (uses active session if not provided). Most reliable for targeting a specific session.'
-          ),
-        studioId: z
-          .string()
-          .optional()
-          .describe(
-            'Studio ID (UUID or "main") for session resolution when sessionId is not provided. Useful for parallel worktree scenarios.'
-          ),
-        phase: z
-          .string()
-          .optional()
-          .describe(
-            'Work phase (agent-set). Core phases: investigating, implementing, reviewing, paused, complete. Use waiting:<reason> when awaiting an async response within normal flow (review, merge, feedback). Use blocked:<reason> ONLY when extraordinary intervention is required outside normal process — something has gone wrong (permissions denied, infrastructure broken, unresolvable conflict). Both auto-create memories. Do NOT use runtime: prefix — use lifecycle instead.'
-          ),
-        note: z
-          .string()
-          .optional()
-          .describe(
-            'Context for the phase transition (included in auto-created memory for blocked/waiting)'
-          ),
-        agentId: z.string().optional().describe('Agent identity for memory attribution'),
-        createTask: z
-          .boolean()
-          .optional()
-          .describe('Create a PCP task for blocked/waiting phases (default: false)'),
-        backendSessionId: z
-          .string()
-          .optional()
-          .describe(
-            'Backend-specific session ID for resumption (e.g., Claude Code session ID, Codex session ID)'
-          ),
-        status: z
-          .enum(['active', 'paused', 'resumable', 'completed'])
-          .optional()
-          .describe('Session status'),
-        context: z
-          .string()
-          .optional()
-          .describe(
-            'Transient runtime state — active facts too ephemeral for a memory but important to preserve across compaction. E.g. "server on :4001", "waiting on PR #341 review", "vitest running in background". Use as a scratch board; memories handle durable decisions.'
-          ),
-        workingDir: z.string().optional().describe('Working directory'),
-        activeThreadKey: z
-          .string()
-          .optional()
-          .describe(
-            'The thread key the session is currently working on (e.g., "pr:350", "spec:auth-refactor"). Mutable — updates as the session shifts focus. The original thread_key (set at session creation) remains the immutable routing anchor. Set to empty string to clear.'
-          ),
-      },
+      // Canonical schema, not a copy. The duplicate that used to live here was
+      // missing `lifecycle`, `cliAttached` and `alias`, so the session-start
+      // hook's `lifecycle: 'idle'` was stripped before the handler ever saw it
+      // — the stamp had been a silent no-op.
+      inputSchema: updateSessionStateSchema,
     },
     async (args) => {
       try {
@@ -3756,6 +3690,50 @@ Action "transcribe" (with filePath) transcribes a saved audio file under ~/.ink/
   );
 
   server.registerTool(
+    'describe_tool',
+    {
+      description: `Look up what a tool is called and what parameters it takes.
+
+Use this the moment you are unsure of a tool name or a parameter name, instead
+of guessing. Guessing is expensive: a wrong parameter is rejected, and a wrong
+tool name costs a round trip.
+
+- describe_tool({ name: "create_reminder" }) — full description and parameter
+  schema for one tool, including which fields are required
+- describe_tool({ search: "reminder" }) — find tools by keyword when you know
+  what you want to do but not what it is called
+- describe_tool({}) — list every tool name
+
+Examples:
+- Unsure whether it is runAt or remindAt → describe_tool({ name: "create_reminder" })
+- Want to decline a calendar invite → describe_tool({ search: "calendar" })
+- Got "no tool named X" → describe_tool({ search: "<what you were trying to do>" })
+
+This reflects the live server, so it is never out of date.`,
+      inputSchema: describeToolSchema,
+    },
+    async (args) => {
+      try {
+        return handleDescribeTool(args, toolRegistry);
+      } catch (error) {
+        logger.error('Error in describe_tool:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
     'get_timezone',
     {
       description: `Get the user's current timezone setting and local time.
@@ -4809,6 +4787,11 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
 
 Supports To, CC, BCC recipients. Body can be plain text or HTML.
 
+Attachments: pass \`attachments: [{path, filename?}]\`. Paths must be inside
+~/.ink/files — files from received mail get there via download_email_attachment,
+and media the user sent over Telegram/WhatsApp already lives there. A path
+outside that directory fails the send rather than sending without the file.
+
 User must have connected their Google account with Gmail send permissions.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
@@ -4840,7 +4823,10 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
     {
       description: `Reply to an existing email. Automatically handles threading and subject line.
 
-Use replyAll=true to reply to all original recipients.
+Use replyAll=true to reply to all original recipients (the user's own address
+is excluded automatically). Honors the original Reply-To when present.
+
+Attachments: pass \`attachments: [{path, filename?}]\` with paths inside ~/.ink/files.
 
 User must have connected their Google account with Gmail send permissions.
 
@@ -4874,6 +4860,8 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `Create a draft email for later review and sending.
 
 Drafts appear in the user's Gmail drafts folder and can be edited/sent from the Gmail interface.
+
+Attachments: pass \`attachments: [{path, filename?}]\` with paths inside ~/.ink/files.
 
 User must have connected their Google account with Gmail permissions.
 

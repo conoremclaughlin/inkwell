@@ -147,7 +147,8 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
   const sessionServiceConfig: Partial<SessionServiceConfig> = {
     defaultWorkingDirectory: workingDirectory,
     mcpConfigPath,
-    compactionThreshold: config.compactionThreshold || 150000,
+    compactionEnabled: env.SERVER_COMPACTION_ENABLED,
+    compactionThreshold: config.compactionThreshold || env.COMPACTION_THRESHOLD || 150000,
     responseHandler: async (responses) => routeResponses(responses),
     ...(env.DEFAULT_CLAUDE_MODEL ? { defaultModel: env.DEFAULT_CLAUDE_MODEL } : {}),
     ...(env.DEFAULT_CODEX_MODEL ? { defaultCodexModel: env.DEFAULT_CODEX_MODEL } : {}),

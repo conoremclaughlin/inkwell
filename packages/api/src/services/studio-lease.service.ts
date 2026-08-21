@@ -14,6 +14,20 @@
  *              then performed by the run/stop boundary or the sweep
  *   - expire:  heartbeatAt stale beyond LEASE_STALE_MS → claimed, rescued, released
  *
+ * TWO PROOFS, NOT ONE — and NEITHER authorizes a release on its own:
+ *   - PRESENCE (isSessionLive: in-process run, fresh cli_poll_at, open turn)
+ *     gates taking a lease AWAY from a holder that never asked to give it up:
+ *     reclaim, adoption, teardown.
+ *   - MID-TURN (isSessionMidTurn: in-process run, open cli_turn_at) DEFERS
+ *     completing a release the holder ITSELF requested — protection only.
+ *   A requested release COMPLETES only at a real boundary: the holder's stop
+ *   event (releaseAtBoundary), a terminal session, or presence loss
+ *   (canReleaseNow). Client testimony never authorizes early completion —
+ *   six PR #506 review rounds of proof schemes each leaked at an ownership
+ *   boundary. Accepted residual: an idle holder with an open terminal keeps
+ *   its pendingRelease deferred (bounded delay: next stop, or staleness
+ *   after the terminal closes) — delayed, never premature.
+ *
  * Safety invariants (PR #492 review rounds 1–3, Lumen):
  *   - Every read and CAS is scoped to the owning user.
  *   - Reclaim and expiry FENCE FIRST, RESCUE SECOND, guarded on the exact
@@ -330,6 +344,83 @@ export class StudioLeaseService {
   }
 
   /**
+   * Is the session's process INSIDE a turn right now? A strictly narrower
+   * question than isSessionLive, used as an ADDITIONAL defer on completing a
+   * requested release — protection stacked on protection, never
+   * authorization. An open marker always defers; its absence proves nothing
+   * (a producer whose prompt post was swallowed is invisible), so completion
+   * still requires canReleaseNow's real-boundary proof. Six PR #506 review
+   * rounds of trying to promote this marker's absence into an authorization
+   * (proof bits, contract claims, tenure scoping) each leaked at an
+   * ownership or visibility boundary; the accepted trade is bounded delay —
+   * the pr:498/pr:499 idle-open-terminal shape defers until its next stop
+   * boundary or the terminal closes — never premature release.
+   *
+   * FAILS CLOSED: a read error reports MID-TURN — "could not verify the turn
+   * has ended" must never help pull a worktree out from under it.
+   */
+  /**
+   * The lifecycle route's prompt fence: HELD is only reported after a
+   * successful exact-guarded CAS touch of this studio's lease (round five —
+   * a plain read could observe a snapshot an already-running sweep is about
+   * to CAS-clear; a renewal failure was silently ignored). The touch bumps
+   * heartbeatAt guarded on the exact prior lease, so a concurrent release
+   * either already won (we read the cleared/foreign lease → NOT HELD) or
+   * loses its own CAS to ours. One re-read absorbs a benignly lost CAS
+   * (e.g., the session-wide renewal racing this touch); a second loss means
+   * real contention and reports NOT HELD. FAILS CLOSED on any error.
+   */
+  async touchStudioLeaseForSession(
+    studioId: string,
+    sessionId: string,
+    userId: string
+  ): Promise<boolean> {
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const { data, error } = await this.supabase
+        .from('studios')
+        .select('lease')
+        .eq('id', studioId)
+        .eq('user_id', userId)
+        .maybeSingle();
+      if (error) {
+        logger.warn('[StudioLease] Lease-held read failed — reporting NOT HELD (fail closed)', {
+          studioId,
+          sessionId,
+          error: error.message,
+        });
+        return false;
+      }
+      const lease = parseStudioLease(data?.lease);
+      if (!lease || lease.quarantined || lease.sessionId !== sessionId) return false;
+      // casLease carries the pendingRelease-state guard (round seven), so a
+      // marker landing between our read and this CAS fails the CAS and the
+      // re-read carries it into the rewrite instead of erasing it.
+      const touched = await this.casLease(studioId, userId, lease, {
+        ...lease,
+        heartbeatAt: new Date().toISOString(),
+      });
+      if (touched) return true;
+    }
+    return false;
+  }
+
+  async isSessionMidTurn(sessionId: string, userId?: string): Promise<boolean> {
+    if (hasActiveRun(sessionId)) return true;
+    let query = this.supabase.from('sessions').select('cli_turn_at').eq('id', sessionId);
+    if (userId) query = query.eq('user_id', userId);
+    const { data, error } = await query.maybeSingle();
+    if (error) {
+      logger.warn('[StudioLease] Turn read failed — treating session as MID-TURN (fail closed)', {
+        sessionId,
+        error: error.message,
+      });
+      return true;
+    }
+    if (!data) return false; // session row genuinely absent
+    return Boolean(data.cli_turn_at);
+  }
+
+  /**
    * Has the session durably ended? (ended_at stamped or status completed)
    * FAILS CLOSED: a read error reports NOT terminal — "could not verify"
    * must never count as terminal proof.
@@ -600,6 +691,18 @@ export class StudioLeaseService {
       .eq('lease->>sessionId', from.sessionId)
       .eq('lease->>acquiredAt', from.acquiredAt)
       .eq('lease->>heartbeatAt', from.heartbeatAt);
+    // pendingRelease is the ONE lease mutation that changes neither session,
+    // acquiredAt, nor heartbeatAt — so without this guard, any whole-JSON
+    // rewrite (a renewal, a touch) racing close_thread's marker would match
+    // the three fields above and silently ERASE the release request while
+    // close_thread reports success (round seven; first seen on the touch in
+    // round six, then red-verified on renewBySession). Guarding the exact
+    // pendingRelease state `from` was read with makes every CAS
+    // transition-safe: a marker landing after the read fails the CAS, and
+    // the caller's re-read carries it forward instead of overwriting it.
+    query = from.pendingRelease
+      ? query.eq('lease->pendingRelease->>requestedAt', from.pendingRelease.requestedAt)
+      : query.is('lease->pendingRelease', null);
     if (opts.requireAcquirableStatus) {
       query = query.in('status', StudioLeaseService.ACQUIRABLE_STATUSES);
     }
@@ -925,55 +1028,99 @@ export class StudioLeaseService {
   }
 
   /**
-   * Bump heartbeatAt for whichever studio this session holds. Called from the
-   * CLI lifecycle hook route on every prompt, and by the sweep for sessions
-   * with a live process. Never renews a quarantine record — quarantine heals
-   * through rescue, not heartbeats.
+   * Every studio this session currently holds a non-quarantine lease on.
+   *
+   * "One session holds at most one studio" is an invariant the service
+   * assumes but nothing enforces — jsonb carries no unique constraint, so the
+   * database cannot object. It is violated in practice: an agent that opens a
+   * second thread from inside a live session acquires a second studio, and
+   * session 4896f302 was observed holding two at once. The previous
+   * `.limit(1).maybeSingle()` then made every release path pick ONE of them in
+   * unspecified order and silently strand the rest — a leased worktree with no
+   * live holder and no pending release, invisible to the sweep.
+   *
+   * Until the storage rework can express this as UNIQUE (session_id), the
+   * lifecycle operates on the whole set.
    */
-  async renewBySession(sessionId: string, userId?: string): Promise<boolean> {
+  private async studiosHeldBy(
+    sessionId: string,
+    userId?: string
+  ): Promise<
+    Array<{ id: string; user_id: string; lease: StudioLease; worktree_path: string | null }>
+  > {
     let query = this.supabase
       .from('studios')
-      .select('id, user_id, lease')
+      .select('id, user_id, lease, worktree_path')
       .eq('lease->>sessionId', sessionId);
     if (userId) query = query.eq('user_id', userId);
-    const { data } = await query.limit(1).maybeSingle();
-    const lease = parseStudioLease(data?.lease);
-    if (!data || !lease || lease.quarantined) return false;
+    const { data } = await query;
+    if (!data?.length) return [];
 
-    const renewed: StudioLease = { ...lease, heartbeatAt: new Date().toISOString() };
-    return this.casLease(data.id, data.user_id, lease, renewed);
+    const held = [];
+    for (const row of data) {
+      const lease = parseStudioLease(row.lease);
+      if (!lease || lease.quarantined) continue;
+      held.push({
+        id: row.id,
+        user_id: row.user_id,
+        lease,
+        worktree_path: row.worktree_path ?? null,
+      });
+    }
+    if (held.length > 1) {
+      logger.warn('[StudioLease] Session holds multiple studios — acting on all of them', {
+        sessionId,
+        studioIds: held.map((h) => h.id),
+      });
+    }
+    return held;
   }
 
   /**
-   * Release whatever this session holds — but only once the session's process
-   * has actually left the worktree (no in-process run, no freshly-polling
-   * attached CLI). Deferred releases are picked up at the corresponding run
-   * boundary: SessionService's finalized branch for server runs, the
-   * lifecycle stop hook for CLI turns, the sweep as backstop.
+   * Bump heartbeatAt on every studio this session holds. Called from the CLI
+   * lifecycle hook route on every prompt, and by the sweep for sessions with
+   * a live process. Never renews a quarantine record — quarantine heals
+   * through rescue, not heartbeats. Returns true if any lease was renewed.
+   */
+  async renewBySession(sessionId: string, userId?: string): Promise<boolean> {
+    let any = false;
+    for (const row of await this.studiosHeldBy(sessionId, userId)) {
+      const renewed: StudioLease = { ...row.lease, heartbeatAt: new Date().toISOString() };
+      if (await this.casLease(row.id, row.user_id, row.lease, renewed)) any = true;
+    }
+    return any;
+  }
+
+  /**
+   * Release what this session holds — but only once its process has actually
+   * left the worktree (no in-process run, no freshly-polling attached CLI).
+   * Deferred releases are picked up at the corresponding run boundary:
+   * SessionService's finalized branch for server runs, the lifecycle stop hook
+   * for CLI turns, the sweep as backstop.
    */
   async releaseUnlessRunning(
     sessionId: string,
     opts: { userId?: string; reason?: string } = {}
   ): Promise<boolean> {
-    let query = this.supabase
-      .from('studios')
-      .select('id, user_id, lease, worktree_path')
-      .eq('lease->>sessionId', sessionId);
-    if (opts.userId) query = query.eq('user_id', opts.userId);
-    const { data } = await query.limit(1).maybeSingle();
-    const lease = parseStudioLease(data?.lease);
-    if (!data || !lease || lease.quarantined) return false;
-
-    if (!(await this.canReleaseNow(lease, opts.userId ?? data.user_id))) {
-      logger.info('[StudioLease] Release deferred — no safe terminal/stale proof yet', {
-        sessionId,
-        reason: opts.reason,
-      });
-      return false;
+    let any = false;
+    for (const row of await this.studiosHeldBy(sessionId, opts.userId)) {
+      if (!(await this.canReleaseNow(row.lease, opts.userId ?? row.user_id))) {
+        logger.info('[StudioLease] Release deferred — no safe terminal/stale proof yet', {
+          sessionId,
+          studioId: row.id,
+          reason: opts.reason,
+        });
+        continue;
+      }
+      if (
+        await this.releaseStudio(row.id, row.user_id, row.lease, row.worktree_path, {
+          reason: opts.reason ?? 'session-end',
+        })
+      ) {
+        any = true;
+      }
     }
-    return this.releaseStudio(data.id, data.user_id, lease, data.worktree_path, {
-      reason: opts.reason ?? 'session-end',
-    });
+    return any;
   }
 
   /**
@@ -986,24 +1133,22 @@ export class StudioLeaseService {
     sessionId: string,
     opts: { userId?: string; sessionTerminal: boolean; reason: string }
   ): Promise<boolean> {
-    let query = this.supabase
-      .from('studios')
-      .select('id, user_id, lease, worktree_path')
-      .eq('lease->>sessionId', sessionId);
-    if (opts.userId) query = query.eq('user_id', opts.userId);
-    const { data } = await query.limit(1).maybeSingle();
-    const lease = parseStudioLease(data?.lease);
-    if (!data || !lease || lease.quarantined) return false;
-
-    if (!opts.sessionTerminal && !lease.pendingRelease) return false;
-
-    return this.releaseStudio(data.id, data.user_id, lease, data.worktree_path, {
-      reason: lease.pendingRelease?.reason ?? opts.reason,
-    });
+    let any = false;
+    for (const row of await this.studiosHeldBy(sessionId, opts.userId)) {
+      if (!opts.sessionTerminal && !row.lease.pendingRelease) continue;
+      if (
+        await this.releaseStudio(row.id, row.user_id, row.lease, row.worktree_path, {
+          reason: row.lease.pendingRelease?.reason ?? opts.reason,
+        })
+      ) {
+        any = true;
+      }
+    }
+    return any;
   }
 
   /**
-   * Release whatever this session holds, immediately. Captures final worktree
+   * Release what this session holds, immediately. Captures final worktree
    * state (branch/commit/dirty) and stamps it into the owning thread's
    * metadata so "what did they leave behind" is answerable after the fact.
    * Quarantine records are not releasable this way — they heal through rescue.
@@ -1012,18 +1157,17 @@ export class StudioLeaseService {
     sessionId: string,
     opts: { userId?: string; reason?: string } = {}
   ): Promise<boolean> {
-    let query = this.supabase
-      .from('studios')
-      .select('id, user_id, lease, worktree_path')
-      .eq('lease->>sessionId', sessionId);
-    if (opts.userId) query = query.eq('user_id', opts.userId);
-    const { data } = await query.limit(1).maybeSingle();
-    const lease = parseStudioLease(data?.lease);
-    if (!data || !lease || lease.quarantined) return false;
-
-    return this.releaseStudio(data.id, data.user_id, lease, data.worktree_path, {
-      reason: opts.reason ?? 'session-end',
-    });
+    let any = false;
+    for (const row of await this.studiosHeldBy(sessionId, opts.userId)) {
+      if (
+        await this.releaseStudio(row.id, row.user_id, row.lease, row.worktree_path, {
+          reason: opts.reason ?? 'session-end',
+        })
+      ) {
+        any = true;
+      }
+    }
+    return any;
   }
 
   /**
@@ -1258,16 +1402,31 @@ export class StudioLeaseService {
       const lease = parseStudioLease(row.lease);
       if (!lease) continue;
 
-      // Deferred-release backstop: the boundary should have completed this,
-      // but a killed CLI or crashed server never fires its boundary. Same
-      // release-now proof as everywhere else.
+      // Deferred-release backstop for holders whose boundary never fires
+      // (crashed processes, closed terminals). An open turn marker always
+      // defers; beyond that, completion requires the real-boundary proof
+      // below — an idle attached terminal therefore keeps its deferred
+      // release pending (bounded delay), because its "done-ness" cannot be
+      // proven from here, only from its own stop event.
       if (lease.pendingRelease && !lease.quarantined) {
-        if (await this.canReleaseNow(lease, row.user_id)) {
-          const ok = await this.releaseStudio(row.id, row.user_id, lease, row.worktree_path, {
-            reason: lease.pendingRelease.reason,
-          });
-          if (ok) released += 1;
-          continue;
+        if (!(await this.isSessionMidTurn(lease.sessionId, row.user_id))) {
+          // Completion authority lives at REAL boundaries only: the holder's
+          // stop event (releaseAtBoundary), a terminal session, or presence
+          // loss. Six review rounds proved client-pushed testimony cannot
+          // safely AUTHORIZE a release — every proof scheme leaked at an
+          // ownership or visibility boundary — so the sweep completes a
+          // pendingRelease only when the holder is provably gone
+          // (canReleaseNow: not live AND (stale OR terminal)). The accepted
+          // residual: an idle holder whose terminal stays open keeps its
+          // pendingRelease deferred (and renewed below) until its next stop
+          // boundary or the terminal closes — delayed, never premature.
+          if (await this.canReleaseNow(lease, row.user_id)) {
+            const ok = await this.releaseStudio(row.id, row.user_id, lease, row.worktree_path, {
+              reason: lease.pendingRelease.reason,
+            });
+            if (ok) released += 1;
+            continue;
+          }
         }
       }
 
