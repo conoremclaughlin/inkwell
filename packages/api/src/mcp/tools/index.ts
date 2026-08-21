@@ -3,6 +3,11 @@ import { z } from 'zod';
 import type { DataComposer } from '../../data/composer';
 import { logger } from '../../utils/logger';
 import { strictifyInputSchema, strictToolArgsEnabled } from './strict-input-schema';
+import {
+  describeToolSchema,
+  handleDescribeTool,
+  type ToolRegistry,
+} from './tool-discovery-handlers';
 
 // Import all tool handlers
 import { handleSaveLink, handleSearchLinks, handleTagLink } from './link-handlers';
@@ -391,17 +396,31 @@ export function registerAllTools(
     return TRANSIENT_PG_PATTERNS.some((p) => msg.includes(p));
   }
 
+  // Populated by the interceptor below; read at call time by describe_tool, so
+  // registration order does not matter.
+  const toolRegistry: ToolRegistry = new Map();
+
   const originalRegisterTool = server.registerTool.bind(server);
   (server as any).registerTool = (name: string, ...rest: any[]) => {
     // Reject unknown args instead of silently stripping them. Applied here so
     // all ~163 tools inherit it, rather than per-schema — see
     // ./strict-input-schema for why the default rather than the schemas is
     // treated as the defect.
+    const config = rest[0];
     if (strictToolArgsEnabled()) {
-      const config = rest[0];
       if (config && typeof config === 'object' && 'inputSchema' in config) {
         config.inputSchema = strictifyInputSchema(config.inputSchema);
       }
+    }
+    // Record what was registered so describe_tool can answer questions about
+    // it. Captured after strictify so an agent is shown the schema that is
+    // actually enforced, not the one before it was tightened.
+    if (config && typeof config === 'object') {
+      toolRegistry.set(name, {
+        name,
+        description: (config as { description?: string }).description,
+        inputSchema: (config as { inputSchema?: unknown }).inputSchema,
+      });
     }
     const handler = rest[rest.length - 1];
     if (typeof handler === 'function') {
@@ -3665,6 +3684,50 @@ Action "transcribe" (with filePath) transcribes a saved audio file under ~/.ink/
               }),
             },
           ],
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'describe_tool',
+    {
+      description: `Look up what a tool is called and what parameters it takes.
+
+Use this the moment you are unsure of a tool name or a parameter name, instead
+of guessing. Guessing is expensive: a wrong parameter is rejected, and a wrong
+tool name costs a round trip.
+
+- describe_tool({ name: "create_reminder" }) — full description and parameter
+  schema for one tool, including which fields are required
+- describe_tool({ search: "reminder" }) — find tools by keyword when you know
+  what you want to do but not what it is called
+- describe_tool({}) — list every tool name
+
+Examples:
+- Unsure whether it is runAt or remindAt → describe_tool({ name: "create_reminder" })
+- Want to decline a calendar invite → describe_tool({ search: "calendar" })
+- Got "no tool named X" → describe_tool({ search: "<what you were trying to do>" })
+
+This reflects the live server, so it is never out of date.`,
+      inputSchema: describeToolSchema,
+    },
+    async (args) => {
+      try {
+        return handleDescribeTool(args, toolRegistry);
+      } catch (error) {
+        logger.error('Error in describe_tool:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
         };
       }
     }
