@@ -50,6 +50,10 @@ import { resolveTaskGroupForThreadKey } from '../task-group-resolver.js';
 import { getRunnerFilesDir } from '../sandbox/orchestrator.js';
 import { StudioLeaseService, isLeaseStale } from '../studio-lease.service.js';
 import { ThreadKeyService } from '../thread-key/thread-key.service.js';
+import type {
+  StudioPolicy,
+  WriteIntent,
+} from '../../data/repositories/thread-key-types.repository.js';
 import { StudioOverflowService } from '../studio-overflow.service.js';
 import { StudiosRepository, type Studio } from '../../data/repositories/studios.repository.js';
 import { logger } from '../../utils/logger.js';
@@ -458,7 +462,13 @@ export class SessionService implements ISessionService {
   private async gateOccupancy(
     candidateStudioId: string,
     tier: StudioRoutingDecision['tier'],
-    ctx: { userId: string; agentId: string; threadKey?: string; writeIntent?: 'write' | 'presence' }
+    ctx: {
+      userId: string;
+      agentId: string;
+      threadKey?: string;
+      writeIntent?: WriteIntent;
+      studioPolicy?: StudioPolicy;
+    }
   ): Promise<StudioRoutingDecision> {
     const leases = this.getLeaseService();
     if (!leases || !ctx.threadKey) {
@@ -475,6 +485,45 @@ export class SessionService implements ISessionService {
     const holder = current?.lease;
     if (!holder || holder.threadKey === ctx.threadKey || isLeaseStale(holder)) {
       return { studioId: candidateStudioId, tier, occupancyChecked: true };
+    }
+
+    // reuse-only types (discussions: spec/thread/issue/debug/deploy) never get
+    // a worktree built for them. Occupied means HOLD — the message re-routes
+    // once the holder finishes — not "provision a fresh checkout". This is the
+    // registry's studio_policy actually being consumed: before this check,
+    // every occupied studio diverted to overflow regardless of type, which is
+    // where the worktree flood came from. An SB that genuinely needs a studio
+    // for a discussion creates one explicitly; only the automatic path is
+    // policy-gated.
+    if (ctx.studioPolicy === 'reuse-only') {
+      logger.info('[StudioResolve] Studio occupied and type is reuse-only; holding', {
+        studioId: candidateStudioId,
+        tier,
+        threadKey: ctx.threadKey,
+        holderThreadKey: holder.threadKey,
+      });
+      await leases.logEvent(ctx.userId, candidateStudioId, 'conflict', {
+        threadKey: ctx.threadKey,
+        agentId: ctx.agentId,
+        reason: `occupied by ${holder.threadKey}; type policy is reuse-only, holding instead of provisioning`,
+      });
+      return {
+        studioId: undefined,
+        tier: 'refused',
+        occupancyChecked: true,
+        diverted: {
+          from: candidateStudioId,
+          holderThreadKey: holder.threadKey,
+          holderSessionId: holder.sessionId,
+          via: 'refused',
+        },
+        refusal: {
+          reason: 'occupied',
+          threadKey: ctx.threadKey,
+          triedCallerRepo: false,
+          occupied: { studioId: candidateStudioId, holderThreadKey: holder.threadKey },
+        },
+      };
     }
 
     logger.info('[StudioResolve] Studio leased by another thread; diverting to overflow', {
@@ -580,7 +629,13 @@ export class SessionService implements ISessionService {
   private async withStudioLease(
     session: Session,
     routing: StudioRoutingDecision,
-    ctx: { userId: string; agentId: string; threadKey?: string; writeIntent?: 'write' | 'presence' }
+    ctx: {
+      userId: string;
+      agentId: string;
+      threadKey?: string;
+      writeIntent?: WriteIntent;
+      studioPolicy?: StudioPolicy;
+    }
   ): Promise<Session> {
     const leases = this.getLeaseService();
     if (!leases || !ctx.threadKey || !session.studioId) return session;
@@ -636,7 +691,12 @@ export class SessionService implements ISessionService {
         verified: Boolean(result.holder),
       });
 
-      const overflow = await this.divertToOverflow(boundStudioId, ctx);
+      // Same policy gate as gateOccupancy: reuse-only threads hold on
+      // conflict, they do not get a worktree built. Skipping the divert makes
+      // the verified-conflict branch below throw the same hold it throws when
+      // overflow fails — deliberate here rather than a fallback.
+      const overflow =
+        ctx.studioPolicy === 'reuse-only' ? null : await this.divertToOverflow(boundStudioId, ctx);
       if (overflow) {
         const overflowAcquire = await leases.acquire({
           studioId: overflow.id,
@@ -719,18 +779,22 @@ export class SessionService implements ISessionService {
   }
 
   /**
-   * Write intent for a thread, from its STORED pinned key_type (grammar v4 —
-   * the DB pinned it at creation; consumers never re-parse) resolved through
-   * the type registry. FAILS TOWARD WRITE on every failure mode — missing
-   * thread row, lookup error, registry error — because failing toward
-   * presence would let a session mutate an unleased tree (the registry's own
-   * read-failure rule, applied at this layer too).
+   * Write intent and studio policy for a thread, from its STORED pinned
+   * key_type (grammar v4 — the DB pinned it at creation; consumers never
+   * re-parse) resolved through the type registry. Every failure mode —
+   * missing thread row, lookup error, registry error — resolves to the
+   * registry's own unknown-type default: write + reuse-only. Write, because
+   * failing toward presence would let a session mutate an unleased tree;
+   * reuse-only, because a held message is recoverable while a worktree
+   * provisioned off a failed lookup is exactly the waste this policy exists
+   * to stop.
    */
-  private async resolveWriteIntent(
+  private async resolveThreadBehavior(
     userId: string,
     threadKey: string
-  ): Promise<'write' | 'presence'> {
-    if (!this.supabase) return 'write';
+  ): Promise<{ writeIntent: WriteIntent; studioPolicy: StudioPolicy }> {
+    const fallback = { writeIntent: 'write', studioPolicy: 'reuse-only' } as const;
+    if (!this.supabase) return fallback;
     try {
       const { data, error } = await this.supabase
         .from('inbox_threads')
@@ -738,12 +802,12 @@ export class SessionService implements ISessionService {
         .eq('user_id', userId)
         .eq('thread_key', threadKey)
         .maybeSingle();
-      if (error) return 'write';
+      if (error) return fallback;
       const service = new ThreadKeyService(this.supabase);
       const behavior = await service.typeBehavior(userId, data?.key_type ?? null);
-      return behavior.writeIntent;
+      return { writeIntent: behavior.writeIntent, studioPolicy: behavior.studioPolicy };
     } catch {
-      return 'write';
+      return fallback;
     }
   }
 
@@ -1744,14 +1808,18 @@ export class SessionService implements ISessionService {
     // intent-blind gate would divert/refuse a presence thread over a lease it
     // was never going to take, provisioning overflow worktrees for work that
     // tolerates drift. One resolution feeds routing's occupancy gate and the
-    // lease gate identically.
-    const writeIntent = options?.threadKey
-      ? await this.resolveWriteIntent(userId, options.threadKey)
-      : ('write' as const);
+    // lease gate identically. studioPolicy rides the same resolution: whether
+    // routing may CREATE a worktree for this thread is decided here, once,
+    // and both overflow entry points consult it. Without a threadKey neither
+    // gate runs at all, so the values are inert.
+    const { writeIntent, studioPolicy } = options?.threadKey
+      ? await this.resolveThreadBehavior(userId, options.threadKey)
+      : ({ writeIntent: 'write', studioPolicy: 'provision' } as const);
 
     let routing = await this.resolveStudioId(userId, agentId, {
       threadKey: options?.threadKey,
       writeIntent,
+      studioPolicy,
       explicitStudioId: options?.studioId,
       studioHint: options?.studioHint,
       recipientSessionId: authorizedRecipientSessionId,
@@ -1780,7 +1848,7 @@ export class SessionService implements ISessionService {
       throw new UnresolvedStudioError(routing.unresolvedNamedStudio, agentId);
     }
 
-    const leaseCtx = { userId, agentId, threadKey: options?.threadKey, writeIntent };
+    const leaseCtx = { userId, agentId, threadKey: options?.threadKey, writeIntent, studioPolicy };
 
     // Resolve default_session_id from agent identity. When set, threadKey
     // misses route to this session instead of creating new ones.
@@ -2113,7 +2181,9 @@ export class SessionService implements ISessionService {
     options: {
       threadKey?: string;
       /** Pre-resolved BEFORE routing (r3 P0-1) — gates must never re-resolve. */
-      writeIntent?: 'write' | 'presence';
+      writeIntent?: WriteIntent;
+      /** Pre-resolved with writeIntent — may routing provision a worktree for this thread? */
+      studioPolicy?: StudioPolicy;
       explicitStudioId?: string;
       studioHint?: string;
       recipientSessionId?: string;
@@ -2141,6 +2211,7 @@ export class SessionService implements ISessionService {
       agentId,
       threadKey: options.threadKey,
       writeIntent: options.writeIntent,
+      studioPolicy: options.studioPolicy,
     };
 
     // Canonical identity resolved ONCE, up front, and preferred by EVERY tier
@@ -2612,7 +2683,13 @@ export class SessionService implements ISessionService {
     userId: string,
     agentId: string,
     repoRoot: string,
-    leaseCtx: { userId: string; agentId: string; threadKey?: string },
+    leaseCtx: {
+      userId: string;
+      agentId: string;
+      threadKey?: string;
+      writeIntent?: WriteIntent;
+      studioPolicy?: StudioPolicy;
+    },
     knownSbId?: string | null
   ): Promise<StudioRoutingDecision | null> {
     if (!this.supabase) return null;

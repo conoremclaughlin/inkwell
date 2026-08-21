@@ -8,6 +8,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { makeFakeSupabase } from './fake-supabase.js';
 import { StudioOverflowService } from '../studio-overflow.service.js';
+import { StudioLeaseService } from '../studio-lease.service.js';
 import {
   SessionService,
   resolveRuntimeModel,
@@ -3230,6 +3231,25 @@ describe('SessionService', () => {
       );
     }
 
+    /** A registry template row, shaped like the shipped seed rows. */
+    function threadKeyTemplate(
+      type: string,
+      writeIntent: 'write' | 'presence',
+      studioPolicy: 'provision' | 'reuse-only'
+    ) {
+      const now = new Date().toISOString();
+      return {
+        id: `tkt-${type}`,
+        user_id: null,
+        type,
+        write_intent: writeIntent,
+        studio_policy: studioPolicy,
+        description: null,
+        created_at: now,
+        updated_at: now,
+      };
+    }
+
     it('refuses to route a threaded message with no pattern, project, or caller repo', async () => {
       const mockSupabase = {
         from: vi.fn().mockImplementation(() => createRecordingChain({ data: null }, [])),
@@ -3272,6 +3292,19 @@ describe('SessionService', () => {
           const calls: RecordedCall[] = [];
           if (table === 'agent_identities') {
             return createFilterAwareChain(() => ({ data: [{ id: 'sb-wren' }] }), calls);
+          }
+          // Since the studio_policy wiring, overflow is only attempted for
+          // provision-typed threads — an unreadable type falls to reuse-only
+          // and holds BEFORE the provisioning seam this test targets. Declare
+          // the thread as a real `pr` (provision) so the seam is reached.
+          if (table === 'inbox_threads') {
+            return createFilterAwareChain(() => ({ data: { key_type: 'pr' } }), calls);
+          }
+          if (table === 'thread_key_types') {
+            return createFilterAwareChain(
+              () => ({ data: [threadKeyTemplate('pr', 'write', 'provision')] }),
+              calls
+            );
           }
           if (table === 'studios') {
             return createFilterAwareChain((c) => {
@@ -3342,6 +3375,256 @@ describe('SessionService', () => {
       expect(overflowSpy).toHaveBeenCalled();
       expect(mockRepository.create).not.toHaveBeenCalled();
       overflowSpy.mockRestore();
+    });
+
+    /*
+     * studio_policy wiring — the registry column that existed as data with
+     * zero consumers. reuse-only threads (discussions) hold when their studio
+     * is occupied; they never get a worktree provisioned for them. provision
+     * threads (pr/branch/task) keep the overflow ladder — parallel review is
+     * wanted, orphaned discussion worktrees are not.
+     */
+    function occupiedStudioSupabase(opts: {
+      keyType: string | { error: string };
+      template?: ReturnType<typeof threadKeyTemplate>;
+      routePattern: string;
+    }) {
+      const now = new Date().toISOString();
+      return {
+        from: vi.fn().mockImplementation((table: string) => {
+          const calls: RecordedCall[] = [];
+          if (table === 'agent_identities') {
+            return createFilterAwareChain(() => ({ data: [{ id: 'sb-wren' }] }), calls);
+          }
+          if (table === 'inbox_threads') {
+            return createFilterAwareChain(
+              () =>
+                typeof opts.keyType === 'string'
+                  ? { data: { key_type: opts.keyType } }
+                  : { data: null, error: { message: opts.keyType.error } },
+              calls
+            );
+          }
+          if (table === 'thread_key_types') {
+            return createFilterAwareChain(
+              () => ({ data: opts.template ? [opts.template] : [] }),
+              calls
+            );
+          }
+          if (table === 'studios') {
+            return createFilterAwareChain((c) => {
+              const selected = c.find((call) => call.method === 'select');
+              const selectArg = String(selected?.args[0] ?? '');
+              if (selectArg.includes('lease')) {
+                return {
+                  data: {
+                    lease: {
+                      threadKey: 'pr:other',
+                      sessionId: 'holder-session',
+                      acquiredAt: now,
+                      heartbeatAt: now,
+                    },
+                    worktree_path: '/repos/inkwell--wren',
+                    ephemeral: false,
+                    status: 'active',
+                  },
+                };
+              }
+              // The parent row divertToOverflow resolves before provisioning.
+              // Present in EVERY variant so "overflow not attempted" fails the
+              // moment the policy gate is removed, rather than passing because
+              // the parent lookup starved.
+              if (selectArg === '*') {
+                return {
+                  data: {
+                    id: 'studio-A',
+                    user_id: 'user-456',
+                    agent_id: 'wren',
+                    sb_id: 'sb-wren',
+                    repo_root: '/repos/inkwell',
+                    worktree_path: '/repos/inkwell--wren',
+                    branch: 'wren/studio/wren',
+                    base_branch: 'main',
+                    status: 'active',
+                    ephemeral: false,
+                    metadata: {},
+                    created_at: now,
+                    updated_at: now,
+                  },
+                };
+              }
+              const isPatternQuery = c.some(
+                (call) => call.method === 'not' && call.args[0] === 'route_patterns'
+              );
+              return isPatternQuery
+                ? { data: [{ id: 'studio-A', route_patterns: [opts.routePattern] }] }
+                : { data: null };
+            }, calls);
+          }
+          return createRecordingChain({ data: null }, calls);
+        }),
+      };
+    }
+
+    it('reuse-only thread holds when its studio is occupied — overflow is never attempted', async () => {
+      const overflowSpy = vi
+        .spyOn(StudioOverflowService.prototype, 'ensureOverflowStudio')
+        .mockResolvedValue(null);
+
+      // `issue` is the seed's write + reuse-only combination: the occupancy
+      // gate engages (write), and the policy must stop the divert.
+      const service = serviceWith(
+        occupiedStudioSupabase({
+          keyType: 'issue',
+          template: threadKeyTemplate('issue', 'write', 'reuse-only'),
+          routePattern: 'issue:*',
+        })
+      );
+
+      await expect(
+        service.getOrCreateSession('user-456', 'wren', { threadKey: 'issue:42' })
+      ).rejects.toMatchObject({
+        code: 'ROUTING_REFUSED',
+        detail: { reason: 'occupied' },
+      });
+
+      expect(overflowSpy).not.toHaveBeenCalled();
+      expect(mockRepository.create).not.toHaveBeenCalled();
+      overflowSpy.mockRestore();
+    });
+
+    it('an unreadable thread type fails toward reuse-only, never toward provisioning', async () => {
+      const overflowSpy = vi
+        .spyOn(StudioOverflowService.prototype, 'ensureOverflowStudio')
+        .mockResolvedValue(null);
+
+      // Even a provision-looking key: when the type cannot be read, a held
+      // message is recoverable; a worktree built off a failed lookup is the
+      // waste the policy exists to stop.
+      const service = serviceWith(
+        occupiedStudioSupabase({
+          keyType: { error: 'transient lookup failure' },
+          routePattern: 'pr:*',
+        })
+      );
+
+      await expect(
+        service.getOrCreateSession('user-456', 'wren', { threadKey: 'pr:77' })
+      ).rejects.toMatchObject({
+        code: 'ROUTING_REFUSED',
+        detail: { reason: 'occupied' },
+      });
+
+      expect(overflowSpy).not.toHaveBeenCalled();
+      expect(mockRepository.create).not.toHaveBeenCalled();
+      overflowSpy.mockRestore();
+    });
+
+    it('acquire-time conflict on a reuse-only thread holds — the second overflow entry point is gated too', async () => {
+      /*
+       * gateOccupancy sees an unoccupied studio; the lease is then taken by
+       * someone else before acquire (the TOCTOU window withStudioLease's
+       * divert exists for). A provision thread diverts to overflow there; a
+       * reuse-only thread must hold instead.
+       */
+      const overflowSpy = vi
+        .spyOn(StudioOverflowService.prototype, 'ensureOverflowStudio')
+        .mockResolvedValue(null);
+      const getLeaseSpy = vi
+        .spyOn(StudioLeaseService.prototype, 'getLease')
+        .mockResolvedValue({ lease: null } as never);
+      const acquireSpy = vi.spyOn(StudioLeaseService.prototype, 'acquire').mockResolvedValue({
+        acquired: false,
+        holder: {
+          threadKey: 'pr:other',
+          sessionId: 'holder-session',
+          acquiredAt: new Date().toISOString(),
+          heartbeatAt: new Date().toISOString(),
+        } as never,
+      });
+      const logEventSpy = vi
+        .spyOn(StudioLeaseService.prototype, 'logEvent')
+        .mockResolvedValue(undefined);
+
+      (mockRepository as { findByThreadKey?: unknown }).findByThreadKey = vi
+        .fn()
+        .mockResolvedValue(createMockSession({ id: 'thread-session', studioId: 'studio-A' }));
+
+      const service = serviceWith(
+        occupiedStudioSupabase({
+          keyType: 'issue',
+          template: threadKeyTemplate('issue', 'write', 'reuse-only'),
+          routePattern: 'issue:*',
+        })
+      );
+
+      await expect(
+        service.getOrCreateSession('user-456', 'wren', { threadKey: 'issue:43' })
+      ).rejects.toMatchObject({
+        code: 'ROUTING_REFUSED',
+        detail: { reason: 'occupied' },
+      });
+
+      expect(acquireSpy).toHaveBeenCalled();
+      expect(overflowSpy).not.toHaveBeenCalled();
+
+      delete (mockRepository as { findByThreadKey?: unknown }).findByThreadKey;
+      overflowSpy.mockRestore();
+      getLeaseSpy.mockRestore();
+      acquireSpy.mockRestore();
+      logEventSpy.mockRestore();
+    });
+
+    it('acquire-time conflict on a provision thread still diverts to overflow', async () => {
+      // The counterpart: parallel PR review is wanted. Removing the policy
+      // gate must break the reuse-only tests; widening it must break this one.
+      const overflowSpy = vi
+        .spyOn(StudioOverflowService.prototype, 'ensureOverflowStudio')
+        .mockResolvedValue(null);
+      const getLeaseSpy = vi
+        .spyOn(StudioLeaseService.prototype, 'getLease')
+        .mockResolvedValue({ lease: null } as never);
+      const acquireSpy = vi.spyOn(StudioLeaseService.prototype, 'acquire').mockResolvedValue({
+        acquired: false,
+        holder: {
+          threadKey: 'pr:other',
+          sessionId: 'holder-session',
+          acquiredAt: new Date().toISOString(),
+          heartbeatAt: new Date().toISOString(),
+        } as never,
+      });
+      const logEventSpy = vi
+        .spyOn(StudioLeaseService.prototype, 'logEvent')
+        .mockResolvedValue(undefined);
+
+      (mockRepository as { findByThreadKey?: unknown }).findByThreadKey = vi
+        .fn()
+        .mockResolvedValue(createMockSession({ id: 'thread-session', studioId: 'studio-A' }));
+
+      const service = serviceWith(
+        occupiedStudioSupabase({
+          keyType: 'pr',
+          template: threadKeyTemplate('pr', 'write', 'provision'),
+          routePattern: 'pr:*',
+        })
+      );
+
+      // Overflow provisioning fails (spy returns null), so the verified
+      // conflict still ends in a hold — but the attempt itself is the claim.
+      await expect(
+        service.getOrCreateSession('user-456', 'wren', { threadKey: 'pr:3200' })
+      ).rejects.toMatchObject({
+        code: 'ROUTING_REFUSED',
+        detail: { reason: 'occupied' },
+      });
+
+      expect(overflowSpy).toHaveBeenCalled();
+
+      delete (mockRepository as { findByThreadKey?: unknown }).findByThreadKey;
+      overflowSpy.mockRestore();
+      getLeaseSpy.mockRestore();
+      acquireSpy.mockRestore();
+      logEventSpy.mockRestore();
     });
 
     it('PRODUCTION ORDER: presence intent bypasses the occupancy gate inside routing (r3 P0-1)', async () => {
