@@ -74,10 +74,19 @@ d('workflow graph step 1 (real DB)', () => {
     if (tErr) throw new Error(`fixture tasks: ${tErr.message}`);
   });
 
+  const extraTaskIds: string[] = [];
+  const extraGroupIds: string[] = [];
+
   afterAll(async () => {
     // Edge rows cascade with tasks; revision rows cascade with the group.
-    await client.from('tasks').delete().in('id', [t1, t2, t3, x1]);
-    await client.from('task_groups').delete().in('id', [g1, g2]);
+    await client
+      .from('tasks')
+      .delete()
+      .in('id', [t1, t2, t3, x1, ...extraTaskIds]);
+    await client
+      .from('task_groups')
+      .delete()
+      .in('id', [g1, g2, ...extraGroupIds]);
   });
 
   it('refuses edge mutations on a linear group — one canonical source per model', async () => {
@@ -193,6 +202,109 @@ d('workflow graph step 1 (real DB)', () => {
       constructor: 'linear-conversion',
     });
     expect(revisions?.[1]).toMatchObject({ graph_version: 2, system_actor: true });
+  });
+
+  it('freezes blocked_by at the DB — direct writes that bypass the app guard are refused (round 1)', async () => {
+    // The application precheck is check-then-write and therefore advisory;
+    // the enforce_blocked_by_source trigger is the atomic fence. Its
+    // FOR SHARE on the group row serializes against conversion's FOR UPDATE,
+    // so there is no window where a legacy write lands under a graph group.
+    // t2's frozen legacy array is [t1]; write a CHANGED value — re-asserting
+    // the identical array is the trigger's deliberate no-op carve-out.
+    const { error: updateError } = await client
+      .from('tasks')
+      .update({ blocked_by: [t3] })
+      .eq('id', t2);
+    expect(updateError?.message).toMatch(/frozen for graph-mode/);
+
+    const { error: sameValueError } = await client
+      .from('tasks')
+      .update({ blocked_by: [t1] })
+      .eq('id', t2);
+    expect(sameValueError).toBeNull(); // unchanged array: inert, allowed
+
+    const newInGraph = randomUUID();
+    const { error: insertError } = await client
+      .from('tasks')
+      .insert({ id: newInGraph, user_id: USER, task_group_id: g1, title: 'new', blocked_by: [t1] });
+    expect(insertError?.message).toMatch(/frozen for graph-mode/);
+
+    // A new node WITHOUT a legacy array is welcome — edges are the graph.
+    const { error: cleanInsertError } = await client
+      .from('tasks')
+      .insert({ id: newInGraph, user_id: USER, task_group_id: g1, title: 'new node' });
+    expect(cleanInsertError).toBeNull();
+    extraTaskIds.push(newInGraph);
+
+    // Unrelated updates on graph-group tasks pass through the trigger.
+    const { error: titleError } = await client
+      .from('tasks')
+      .update({ title: 't2 renamed' })
+      .eq('id', t2);
+    expect(titleError).toBeNull();
+  });
+
+  it('accepts a valid deep fan-out/convergence ladder — reachability, not path enumeration (round 1)', async () => {
+    // Twenty stacked diamonds: n0 → {a_i, b_i} → n_i → … Under the round-0
+    // path-enumerating cycle check this graph has 2^20 distinct paths and the
+    // validation would effectively hang while holding the group lock; the
+    // deduplicating reachability check is bounded by (origin, node) pairs.
+    const dg = randomUUID();
+    extraGroupIds.push(dg);
+    const { error: gErr } = await client
+      .from('task_groups')
+      .insert({ id: dg, user_id: USER, title: 'graph-itest diamond ladder' });
+    if (gErr) throw new Error(gErr.message);
+
+    const LAYERS = 20;
+    const joins = Array.from({ length: LAYERS + 1 }, () => randomUUID());
+    const lefts = Array.from({ length: LAYERS }, () => randomUUID());
+    const rights = Array.from({ length: LAYERS }, () => randomUUID());
+    const allIds = [...joins, ...lefts, ...rights];
+    extraTaskIds.push(...allIds);
+
+    const { error: tErr } = await client
+      .from('tasks')
+      .insert(allIds.map((id, i) => ({ id, user_id: USER, task_group_id: dg, title: `n${i}` })));
+    if (tErr) throw new Error(tErr.message);
+
+    const edges: Array<{ from: string; to: string }> = [];
+    for (let i = 0; i < LAYERS; i++) {
+      edges.push({ from: joins[i], to: lefts[i] });
+      edges.push({ from: joins[i], to: rights[i] });
+      edges.push({ from: lefts[i], to: joins[i + 1] });
+      edges.push({ from: rights[i], to: joins[i + 1] });
+    }
+
+    const converted = await groups.convertToGraph({
+      userId: USER,
+      taskGroupId: dg,
+      expectedVersion: 0,
+      systemActor: true,
+    });
+    expect(converted).toMatchObject({ success: true });
+
+    const started = Date.now();
+    const result = await groups.applyTaskGraph({
+      userId: USER,
+      taskGroupId: dg,
+      expectedVersion: 1,
+      edges,
+      systemActor: true,
+    });
+    const elapsedMs = Date.now() - started;
+    expect(result).toMatchObject({ success: true, graphVersion: 2 });
+    expect(elapsedMs).toBeLessThan(10_000);
+
+    // And a cycle threaded through the ladder is still caught.
+    const cyclic = await groups.applyTaskGraph({
+      userId: USER,
+      taskGroupId: dg,
+      expectedVersion: 2,
+      edges: [...edges, { from: joins[LAYERS], to: joins[0] }],
+      systemActor: true,
+    });
+    expect(cyclic).toMatchObject({ success: false, reason: 'cycle' });
   });
 
   it('preflight-fails a group with a dangling blocker and leaves it linear, array intact', async () => {

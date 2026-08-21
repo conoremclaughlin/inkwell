@@ -225,11 +225,17 @@ export class ProjectTasksRepository {
    */
   async update(id: string, input: UpdateProjectTaskInput): Promise<ProjectTask> {
     if (input.blocked_by !== undefined) {
-      const { data: existing } = await this.client
+      const { data: existing, error: lookupError } = await this.client
         .from('tasks')
         .select('task_group_id')
         .eq('id', id)
         .maybeSingle();
+      if (lookupError) {
+        // Fail closed: an unverifiable task must not skip the guard. (The
+        // enforce_blocked_by_source trigger is the authoritative fence; this
+        // precheck exists for the friendly error and must not fail open.)
+        throw new Error(`Cannot verify task for blocked_by write: ${lookupError.message}`);
+      }
       await assertBlockedByWritable(this.client, existing?.task_group_id);
     }
     const { data, error } = await this.client

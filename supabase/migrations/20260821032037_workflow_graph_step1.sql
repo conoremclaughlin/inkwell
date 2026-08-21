@@ -214,15 +214,18 @@ BEGIN
       'invalid', v_invalid);
   END IF;
 
-  WITH RECURSIVE walk(node, path, cyc) AS (
-    SELECT e.to_task, ARRAY[e.from_task, e.to_task], false
-    FROM _desired_edges e
-    UNION ALL
-    SELECT e.to_task, w.path || e.to_task, e.to_task = ANY(w.path)
-    FROM walk w JOIN _desired_edges e ON e.from_task = w.node
-    WHERE NOT w.cyc
+  -- Deduplicating reachability, not path enumeration: UNION (not UNION ALL)
+  -- bounds the working set at V² (origin, node) pairs, where enumerating
+  -- paths through a fan-out/convergence ladder is exponential — and this
+  -- runs while holding the group lock. A cycle exists iff some origin
+  -- reaches itself.
+  WITH RECURSIVE reach(origin, node) AS (
+    SELECT e.from_task, e.to_task FROM _desired_edges e
+    UNION
+    SELECT r.origin, e.to_task
+    FROM reach r JOIN _desired_edges e ON e.from_task = r.node
   )
-  SELECT coalesce(bool_or(cyc), false) INTO v_has_cycle FROM walk;
+  SELECT EXISTS (SELECT 1 FROM reach WHERE origin = node) INTO v_has_cycle;
   IF v_has_cycle THEN
     RETURN jsonb_build_object('success', false, 'reason', 'cycle');
   END IF;
@@ -353,15 +356,15 @@ BEGIN
       'invalid', v_report);
   END IF;
 
-  WITH RECURSIVE walk(node, path, cyc) AS (
-    SELECT c.to_task, ARRAY[c.from_task, c.to_task], false
-    FROM _candidate_edges c
-    UNION ALL
-    SELECT c.to_task, w.path || c.to_task, c.to_task = ANY(w.path)
-    FROM walk w JOIN _candidate_edges c ON c.from_task = w.node
-    WHERE NOT w.cyc
+  -- Deduplicating reachability (see apply_task_graph): V²-bounded, never
+  -- path enumeration under the group lock.
+  WITH RECURSIVE reach(origin, node) AS (
+    SELECT c.from_task, c.to_task FROM _candidate_edges c
+    UNION
+    SELECT r.origin, c.to_task
+    FROM reach r JOIN _candidate_edges c ON c.from_task = r.node
   )
-  SELECT coalesce(bool_or(cyc), false) INTO v_has_cycle FROM walk;
+  SELECT EXISTS (SELECT 1 FROM reach WHERE origin = node) INTO v_has_cycle;
   IF v_has_cycle THEN
     RETURN jsonb_build_object('success', false, 'reason', 'preflight-failed',
       'invalid', jsonb_build_array(jsonb_build_object('problem', 'cycle')));
@@ -403,3 +406,60 @@ GRANT EXECUTE ON FUNCTION public.apply_task_graph(uuid, uuid, bigint, jsonb, uui
 REVOKE ALL ON FUNCTION public.convert_task_group_to_graph(uuid, uuid, bigint, uuid, uuid, boolean) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.convert_task_group_to_graph(uuid, uuid, bigint, uuid, uuid, boolean) FROM anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.convert_task_group_to_graph(uuid, uuid, bigint, uuid, uuid, boolean) TO service_role;
+
+-- ── The blocked_by freeze is DB-atomic, not advisory ────────────────────
+--
+-- The application-level precheck (assertBlockedByWritable) is a friendly
+-- error, but check-then-write races conversion: a writer can observe
+-- 'linear', conversion can lock/flip/commit, and the legacy write then
+-- lands silently under a graph group. This trigger makes the freeze part
+-- of the write's own transaction, and its FOR SHARE on the group row
+-- serializes against conversion's FOR UPDATE in either order:
+--
+--   writer first  → conversion's FOR UPDATE waits; its post-lock snapshot
+--                   then reads the committed array and converts it.
+--   convert first → the trigger's FOR SHARE waits; it then observes
+--                   'graph' and refuses the write.
+--
+-- FOR SHARE (not FOR UPDATE) so concurrent legacy writes to different
+-- tasks in one linear group do not serialize against each other.
+
+CREATE OR REPLACE FUNCTION public.enforce_blocked_by_source()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_model text;
+BEGIN
+  IF NEW.task_group_id IS NULL THEN
+    RETURN NEW;
+  END IF;
+  -- Only when blocked_by is actually being introduced or changed. A task
+  -- moving between groups with an unchanged stale array is inert: graph
+  -- reads derive from edges and never consult the column.
+  IF TG_OP = 'UPDATE' AND NEW.blocked_by IS NOT DISTINCT FROM OLD.blocked_by THEN
+    RETURN NEW;
+  END IF;
+  IF TG_OP = 'INSERT' AND NEW.blocked_by IS NULL THEN
+    RETURN NEW;
+  END IF;
+
+  SELECT execution_model INTO v_model
+  FROM task_groups
+  WHERE id = NEW.task_group_id
+  FOR SHARE;
+
+  IF v_model = 'graph' THEN
+    RAISE EXCEPTION
+      'blocked_by is frozen for graph-mode groups — mutate dependencies via apply_task_graph';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS enforce_blocked_by_source ON public.tasks;
+CREATE TRIGGER enforce_blocked_by_source
+  BEFORE INSERT OR UPDATE OF blocked_by, task_group_id ON public.tasks
+  FOR EACH ROW EXECUTE FUNCTION public.enforce_blocked_by_source();
