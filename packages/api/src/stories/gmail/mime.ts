@@ -325,9 +325,12 @@ const MIME_TYPES: Record<string, string> = {
   '.mov': 'video/quicktime',
 };
 
+/** What an unrecognized extension resolves to. */
+export const DEFAULT_MIME_TYPE = 'application/octet-stream';
+
 /** Best-effort content type from a filename extension. */
 export function guessMimeType(filename: string): string {
-  return MIME_TYPES[extname(filename).toLowerCase()] || 'application/octet-stream';
+  return MIME_TYPES[extname(filename).toLowerCase()] || DEFAULT_MIME_TYPE;
 }
 
 /** Wrap base64 to RFC 2045's line limit. */

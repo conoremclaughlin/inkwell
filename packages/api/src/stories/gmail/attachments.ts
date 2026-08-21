@@ -23,7 +23,12 @@ import {
   resolveMediaRoot,
 } from '../../channels/agent-media';
 import { logger } from '../../utils/logger';
-import { guessMimeType, MAX_FILENAME_BYTES, type OutboundAttachment } from './mime';
+import {
+  DEFAULT_MIME_TYPE,
+  guessMimeType,
+  MAX_FILENAME_BYTES,
+  type OutboundAttachment,
+} from './mime';
 
 /** Max attachments on a single outgoing message. */
 export const MAX_OUTBOUND_ATTACHMENTS = 10;
@@ -49,6 +54,26 @@ export interface ResolveOutboundOptions {
   maxTotalBytes?: number;
   /** Test hook — production always uses MAX_OUTBOUND_ATTACHMENT_BYTES. */
   maxFileBytes?: number;
+}
+
+/**
+ * Decide the Content-Type for an attachment.
+ *
+ * Content-Type describes the BYTES; `filename` only decides what the
+ * recipient sees. Deriving the type from the display name lets a rename
+ * silently change the declared type — a JPEG attached as `scan.pdf` went
+ * out as `application/pdf`, so the header stated something untrue about the
+ * payload and nothing warned (found by Myra during live verification).
+ *
+ * The file's own extension wins. The display name is consulted only when
+ * the real name carries no recognizable extension, which is the common case
+ * for downloads saved under an opaque id — those genuinely have no better
+ * signal than what the caller named them.
+ */
+function resolveMimeType(realPath: string, displayName: string): string {
+  const fromFile = guessMimeType(basename(realPath));
+  if (fromFile !== DEFAULT_MIME_TYPE) return fromFile;
+  return guessMimeType(displayName);
 }
 
 /** Thrown when an attachment cannot be used; aborts the send. */
@@ -132,7 +157,7 @@ export async function resolveOutboundAttachments(
 
     resolved.push({
       filename,
-      mimeType: guessMimeType(filename),
+      mimeType: resolveMimeType(read.realPath, filename),
       content: read.bytes,
     });
   }

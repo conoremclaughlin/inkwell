@@ -58,6 +58,38 @@ describe('resolveOutboundAttachments — happy path', () => {
     expect(attachment.mimeType).toBe('application/pdf');
   });
 
+  // Content-Type describes the bytes; `filename` only decides what the
+  // recipient sees. Myra caught this live: a JPEG sent as "scan.pdf" was
+  // declared application/pdf, so the header stated something untrue about
+  // the payload and nothing warned.
+  it('types the attachment from the real file, not the display override', async () => {
+    const file = join(root, 'photo.jpg');
+    await writeFile(file, 'JPEGBYTES');
+
+    const [attachment] = await resolve([{ path: file, filename: 'scan.pdf' }]);
+
+    expect(attachment.filename).toBe('scan.pdf');
+    expect(attachment.mimeType).toBe('image/jpeg');
+  });
+
+  it('falls back to the override when the real file has no usable extension', async () => {
+    const file = join(root, 'AgACAgUAAxkBAAIJQmqH_1787251286114');
+    await writeFile(file, 'PDFBYTES');
+
+    const [attachment] = await resolve([{ path: file, filename: 'Report.pdf' }]);
+
+    expect(attachment.mimeType).toBe('application/pdf');
+  });
+
+  it('falls back to octet-stream when neither name carries an extension', async () => {
+    const file = join(root, 'opaque-download');
+    await writeFile(file, 'BYTES');
+
+    const [attachment] = await resolve([{ path: file, filename: 'attachment' }]);
+
+    expect(attachment.mimeType).toBe('application/octet-stream');
+  });
+
   // The real first use: Telegram downloads land in a subdirectory of the media
   // root, so a containment rule that accepted the root but not its children
   // would pass review and fail on the first actual send.
