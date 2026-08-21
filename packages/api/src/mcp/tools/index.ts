@@ -1060,6 +1060,11 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           .uuid()
           .optional()
           .describe('Required for graph-mode tasks: the claim token from claim_task'),
+        sessionId: z
+          .string()
+          .uuid()
+          .optional()
+          .describe('Claim-holding session for graph-mode tasks — usually resolved from context'),
       },
     },
     async (args) => {

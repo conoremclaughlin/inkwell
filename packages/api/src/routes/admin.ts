@@ -6650,6 +6650,17 @@ router.get('/tasks', async (req: Request, res: Response) => {
         metadata: t.metadata,
         createdAt: t.created_at,
         updatedAt: t.updated_at,
+        // Workflow graph execution state (spec v10 steps 2-3) — lets the
+        // map render gates, claims, and dwell windows distinctly.
+        taskType: t.task_type ?? 'work',
+        outcome: t.outcome ?? null,
+        gateState: t.gate_state ?? null,
+        gateAttempt: t.gate_attempt ?? null,
+        gateOpenedAt: t.gate_opened_at ?? null,
+        eligibleAt: t.eligible_at ?? null,
+        claimedBySessionId: t.claimed_by_session_id ?? null,
+        assigneeIdentityId: t.assignee_identity_id ?? null,
+        assigneeUserId: t.assignee_user_id ?? null,
       })),
       stats,
     });
@@ -6836,6 +6847,9 @@ router.get('/task-groups', async (req: Request, res: Response) => {
         strategyStartedAt: g.strategy_started_at ?? null,
         strategyPausedAt: g.strategy_paused_at ?? null,
         planUri: g.plan_uri ?? null,
+        executionModel: g.execution_model ?? 'linear',
+        executionPhase: g.execution_phase ?? 'idle',
+        graphVersion: g.graph_version ?? 0,
         metadata: g.metadata,
         createdAt: g.created_at,
         updatedAt: g.updated_at,

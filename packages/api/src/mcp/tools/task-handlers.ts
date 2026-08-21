@@ -364,6 +364,13 @@ export const completeTaskSchema = z.object({
     .describe(
       'Required for tasks in graph-mode groups: the claim token returned by claim_task. Graph completion refuses without a valid claim.'
     ),
+  sessionId: z
+    .string()
+    .uuid()
+    .optional()
+    .describe(
+      'Claim-holding session for graph-mode tasks — usually unnecessary, resolved from session context. Must match the claiming session.'
+    ),
 });
 
 /**
@@ -378,10 +385,14 @@ async function completeGraphModeTask(
   taskId: string,
   outcome: 'completed' | 'failed' | 'skipped',
   claimToken: string | undefined,
-  summary: string | undefined
+  summary: string | undefined,
+  explicitSessionId?: string
 ): Promise<McpResponse> {
   const ctx = getRequestContext() || getSessionContext();
-  const sessionId = ctx?.sessionId;
+  // Explicit wins (sessions without CLI-hook context, e.g. raw .mcp.json
+  // runners); the RPC CASes session + token together, so a wrong session
+  // cannot complete over someone else's claim regardless.
+  const sessionId = explicitSessionId || ctx?.sessionId;
   if (!claimToken || !sessionId) {
     return mcpResponse(
       {
@@ -470,7 +481,8 @@ export async function handleCompleteTask(
           args.taskId,
           'completed',
           args.claimToken,
-          args.summary
+          args.summary,
+          args.sessionId
         );
       }
     }
@@ -609,6 +621,11 @@ export const closeTaskSchema = z.object({
     .uuid()
     .optional()
     .describe('Required for tasks in graph-mode groups: the claim token from claim_task'),
+  sessionId: z
+    .string()
+    .uuid()
+    .optional()
+    .describe('Claim-holding session for graph-mode tasks — usually resolved from context'),
 });
 
 export async function handleCloseTask(
@@ -650,7 +667,8 @@ export async function handleCloseTask(
           args.taskId,
           args.outcome,
           args.claimToken,
-          args.summary ?? args.reason
+          args.summary ?? args.reason,
+          args.sessionId
         );
       }
     }
