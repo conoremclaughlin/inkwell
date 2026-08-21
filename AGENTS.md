@@ -451,6 +451,7 @@ ENABLE_HEARTBEAT_SERVICE=false \
 ENABLE_TELEGRAM=false \
 ENABLE_WHATSAPP=false \
 ENABLE_DISCORD=false \
+ENABLE_GRAPH_SWEEP=false \
 PCP_PORT_BASE=4001 \
 yarn dev
 
@@ -458,7 +459,7 @@ yarn dev
 PCP_SERVER_URL=http://localhost:4001 ink mission
 ```
 
-**Disable services you aren't testing.** Telegram, WhatsApp, Discord, and the heartbeat service should stay `false` on isolated servers — the main server already owns those connections. Only enable them if you're explicitly testing that functionality _and_ you've stopped it on the main server first (e.g., two Telegram listeners will conflict).
+**Disable services you aren't testing.** Telegram, WhatsApp, Discord, the heartbeat service, and the workflow-graph sweep (`ENABLE_GRAPH_SWEEP`) should stay `false` on isolated servers — the main server already owns those connections and the sweep's dispatch (both servers share the DB, so two sweeps means duplicate inbox triggers). Only enable them if you're explicitly testing that functionality _and_ you've stopped it on the main server first (e.g., two Telegram listeners will conflict).
 
 Port derivation from `PCP_PORT_BASE`:
 

@@ -18,23 +18,70 @@ import { getSkin } from './skins';
 
 // ─── Custom Task Node ───
 
+/**
+ * One execution-state line per node (spec v10): gates narrate their own
+ * lifecycle (dwelling → open → verifying → passed/failed), work nodes say
+ * when they are READY (every inbound source satisfied) — the "what's about
+ * to occur" read this map exists for.
+ */
+export function executionLabel(
+  data: Record<string, unknown>
+): { text: string; emphasis: boolean } | null {
+  if (data.taskType === 'verification') {
+    const gateState = data.gateState as string | null;
+    const attempt = (data.gateAttempt as number | null) ?? 1;
+    const attemptSuffix = attempt > 1 ? ` · attempt ${attempt}` : '';
+    if (gateState === 'failed') return { text: `✖ gate FAILED${attemptSuffix}`, emphasis: true };
+    if (gateState === 'passed') return { text: `✓ gate passed${attemptSuffix}`, emphasis: false };
+    if (gateState === 'in_progress')
+      return { text: `⚙ verifying${attemptSuffix}`, emphasis: false };
+    if (gateState === 'open')
+      return { text: `🔔 gate OPEN — awaiting verdict${attemptSuffix}`, emphasis: true };
+    const eligibleAt = data.eligibleAt ? Date.parse(data.eligibleAt as string) : NaN;
+    if (!Number.isNaN(eligibleAt) && eligibleAt > Date.now()) {
+      const mins = Math.round((eligibleAt - Date.now()) / 60_000);
+      const when = mins >= 90 ? `${Math.round(mins / 60)}h` : `${mins}m`;
+      return { text: `⏱ scheduled — opens in ${when}`, emphasis: false };
+    }
+    return { text: 'gate waiting on deps', emphasis: false };
+  }
+  if (data.depFailed) return { text: '⛔ upstream failed', emphasis: true };
+  if (data.claimed) return { text: '⚙ claimed', emphasis: false };
+  if (data.ready) return { text: '▶ ready', emphasis: true };
+  return null;
+}
+
 function TaskNodeComponent({ data }: { data: Record<string, unknown> }) {
   const skin = getSkin(useCommandStore((s) => s.skin));
   const status = data.status as string;
   const title = data.label as string;
   const priority = data.priority as string;
+  const isGate = data.taskType === 'verification';
+  const gateState = data.gateState as string | null;
 
-  const statusColor =
-    status === 'completed'
+  // Gates color by their own state machine; work by task status.
+  const statusColor = isGate
+    ? gateState === 'passed'
+      ? skin.colors.taskCompleted
+      : gateState === 'failed'
+        ? skin.colors.taskBlocked
+        : gateState === 'open' || gateState === 'in_progress'
+          ? skin.colors.accent
+          : skin.colors.taskPending
+    : status === 'completed'
       ? skin.colors.taskCompleted
       : status === 'in_progress'
         ? skin.colors.taskInProgress
         : status === 'blocked'
           ? skin.colors.taskBlocked
-          : skin.colors.taskPending;
+          : data.ready
+            ? skin.colors.accent
+            : skin.colors.taskPending;
 
   const priorityBadge =
     priority === 'critical' ? '🔴' : priority === 'high' ? '🟠' : priority === 'medium' ? '🟡' : '';
+
+  const execution = executionLabel(data);
 
   return (
     <div
@@ -42,6 +89,9 @@ function TaskNodeComponent({ data }: { data: Record<string, unknown> }) {
       style={{
         backgroundColor: skin.colors.surface,
         borderColor: statusColor,
+        // A gate is a checkpoint, not work — the dashed border is the visual
+        // grammar for "something must be verified here".
+        borderStyle: isGate ? 'dashed' : 'solid',
         fontFamily: skin.fonts.body,
       }}
     >
@@ -49,14 +99,23 @@ function TaskNodeComponent({ data }: { data: Record<string, unknown> }) {
       <div className="flex items-center gap-1.5">
         <div className="w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: statusColor }} />
         <span className="text-xs font-medium truncate" style={{ color: skin.colors.text }}>
+          {isGate ? '🛡 ' : ''}
           {priorityBadge} {title}
         </span>
       </div>
       <div className="text-[10px] mt-1" style={{ color: skin.colors.textMuted }}>
-        {status}
+        {isGate ? 'verification' : status}
         {data.agentId ? ` · ${data.agentId}` : ''}
-        {data.blocked ? ' · gated' : ''}
+        {!isGate && data.blocked ? ' · gated' : ''}
       </div>
+      {execution ? (
+        <div
+          className={`text-[10px] mt-0.5${execution.emphasis ? ' font-bold' : ''}`}
+          style={{ color: execution.emphasis ? statusColor : skin.colors.textMuted }}
+        >
+          {execution.text}
+        </div>
+      ) : null}
       {/* A dependency cycle means this task can never become unblocked. Say so
           on the node — it is a data defect, and it is invisible in a list. */}
       {data.cyclic ? (
@@ -84,6 +143,17 @@ function GroupHeaderNode({ data }: { data: Record<string, unknown> }) {
       <span className="text-xs font-bold" style={{ color: skin.colors.accent }}>
         📋 {data.label as string}
       </span>
+      {data.model === 'graph' ? (
+        <span
+          className="ml-2 px-1.5 py-0.5 rounded text-[9px] font-bold uppercase tracking-wide"
+          style={{
+            backgroundColor: skin.colors.accent + '30',
+            color: skin.colors.accent,
+          }}
+        >
+          graph
+        </span>
+      ) : null}
       <Handle type="source" position={Position.Right} className="!bg-gray-400" />
     </div>
   );
@@ -182,6 +252,33 @@ export function TaskGraph() {
       dependenciesOf
     );
 
+    // Mirror of the executor's SATISFIES predicate (spec v10): work counts
+    // only when completed, gates only when passed. A dependency absent from
+    // the fetched set was filtered by activeOnly, i.e. it already reached a
+    // satisfying terminal state. Failed gates and failed/skipped work never
+    // satisfy — downstream shows "upstream failed", the executor's
+    // dependency-failure condition.
+    const satisfies = (depId: string): boolean => {
+      const dep = byId.get(depId);
+      if (!dep) return true;
+      return dep.taskType === 'verification'
+        ? dep.gateState === 'passed'
+        : dep.status === 'completed';
+    };
+    const unsatisfiable = (depId: string): boolean => {
+      const dep = byId.get(depId);
+      if (!dep) return false;
+      if (dep.taskType === 'verification') return dep.gateState === 'failed';
+      return dep.outcome === 'failed' || dep.outcome === 'skipped';
+    };
+    const isReady = (t: (typeof tasks)[number]): boolean =>
+      t.taskType !== 'verification' &&
+      t.status === 'pending' &&
+      !t.claimedBySessionId &&
+      (t.blockedBy ?? []).every(satisfies);
+    const hasFailedDep = (t: (typeof tasks)[number]): boolean =>
+      (t.blockedBy ?? []).some(unsatisfiable);
+
     // Group tasks by groupId
     const groups = new Map<string, typeof tasks>();
     const ungrouped: typeof tasks = [];
@@ -228,6 +325,13 @@ export function TaskGraph() {
             agentId: task.agentId,
             blocked: dependenciesOf(task.id).length > 0,
             cyclic: cyclic.has(task.id),
+            taskType: task.taskType,
+            gateState: task.gateState,
+            gateAttempt: task.gateAttempt,
+            eligibleAt: task.eligibleAt,
+            claimed: Boolean(task.claimedBySessionId),
+            ready: isReady(task),
+            depFailed: hasFailedDep(task),
           },
         });
       }
@@ -243,7 +347,7 @@ export function TaskGraph() {
         id: `group-${groupId}`,
         type: 'groupHeader',
         position: { x: 0, y: yOffset },
-        data: { label: groupTitle },
+        data: { label: groupTitle, model: groupTasks[0]?.groupExecutionModel ?? null },
       });
 
       const height = layoutSet(groupTasks, 200, yOffset);
@@ -264,7 +368,10 @@ export function TaskGraph() {
       // draw a list is as a dashed sequence — implied by task_order, not
       // declared by anyone. Solid edges are reserved for real blocked_by
       // links, so the picture never claims a dependency the data doesn't have.
-      if (groupEdgeCount === 0 && groupTasks.length > 1) {
+      // A GRAPH group with no edges is different: genuinely parallel work,
+      // not an implied order — drawing a sequence there would lie.
+      const isGraphGroup = groupTasks[0]?.groupExecutionModel === 'graph';
+      if (groupEdgeCount === 0 && groupTasks.length > 1 && !isGraphGroup) {
         const seq = [...groupTasks].sort(
           (a, b) =>
             (a.taskOrder ?? Number.MAX_SAFE_INTEGER) - (b.taskOrder ?? Number.MAX_SAFE_INTEGER)

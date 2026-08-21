@@ -74,6 +74,17 @@ export interface TaskNode {
   agentId: string | null;
   /** Task IDs that must complete before this one — the real graph edges. */
   blockedBy: string[];
+  // Workflow graph execution state (spec: ink://specs/workflow-graph v10).
+  // 'work' for every legacy task; verification nodes are gates.
+  taskType: 'work' | 'verification';
+  outcome: string | null;
+  gateState: string | null;
+  gateAttempt: number | null;
+  /** Dwelling gates: when the gate becomes openable (scheduled ≠ stalled). */
+  eligibleAt: string | null;
+  claimedBySessionId: string | null;
+  /** The owning group's executor — 'graph' groups run the ready-node scheduler. */
+  groupExecutionModel: 'linear' | 'graph' | null;
 }
 
 export interface ActivityEvent {
