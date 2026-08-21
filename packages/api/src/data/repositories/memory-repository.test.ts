@@ -699,20 +699,27 @@ describe('MemoryRepository', () => {
           started_at: '2026-08-19T00:00:00Z',
           metadata: {},
         };
+        // Lumen's regression, retargeted at the stricter predicate: terminal
+        // lifecycles are excluded by name rather than only 'failed', so that a
+        // 'completed' lifecycle carrying no ended_at cannot leak through.
+        // list-sessions-status.test.ts covers the row selection itself.
         let filtersOpenSessions = false;
-        let filtersFailedSessions = false;
+        let filtersTerminalLifecycles = false;
         mockSupabase._queryBuilder.is = vi.fn((column: string, value: unknown) => {
           filtersOpenSessions ||= column === 'ended_at' && value === null;
           return mockSupabase._queryBuilder;
         });
-        mockSupabase._queryBuilder.neq = vi.fn((column: string, value: unknown) => {
-          filtersFailedSessions ||= column === 'lifecycle' && value === 'failed';
-          return mockSupabase._queryBuilder;
-        });
+        mockSupabase._queryBuilder.not = vi.fn(
+          (column: string, operator: string, value: unknown) => {
+            filtersTerminalLifecycles ||=
+              column === 'lifecycle' && operator === 'in' && value === '(completed,failed)';
+            return mockSupabase._queryBuilder;
+          }
+        );
         mockSupabase._queryBuilder.then = (
           resolve: (value: { data: unknown; error: unknown }) => void
         ) => {
-          const data = filtersOpenSessions && filtersFailedSessions ? [] : [staleTerminalRow];
+          const data = filtersOpenSessions && filtersTerminalLifecycles ? [] : [staleTerminalRow];
           resolve({ data, error: null });
           return Promise.resolve({ data, error: null });
         };
@@ -721,7 +728,11 @@ describe('MemoryRepository', () => {
 
         expect(sessions).toEqual([]);
         expect(mockSupabase._queryBuilder.is).toHaveBeenCalledWith('ended_at', null);
-        expect(mockSupabase._queryBuilder.neq).toHaveBeenCalledWith('lifecycle', 'failed');
+        expect(mockSupabase._queryBuilder.not).toHaveBeenCalledWith(
+          'lifecycle',
+          'in',
+          '(completed,failed)'
+        );
         expect(mockSupabase._queryBuilder.eq).not.toHaveBeenCalledWith('status', 'active');
       });
 

@@ -1,0 +1,246 @@
+/**
+ * `list_sessions` status filtering — behaviour, not query shape.
+ *
+ * The five real callers (chat.ts:3218/3275/3391/3796, mission.ts:730) pass
+ * status 'active' and mean "sessions that are still going". The filter used to
+ * read the deprecated `sessions.status` column, which no terminal path keeps in
+ * sync: `endSession()` writes ended_at + lifecycle 'completed' and leaves
+ * status at its 'active' default, and lifecycle-only completions do the same.
+ * So finished sessions came back as active to every one of those callers.
+ *
+ * The existing supabase mock resolves whatever data the test sets, ignoring the
+ * filters — which can prove a query was *built*, never that it *selects the
+ * right rows*. These tests run the real query chain against an in-memory table
+ * instead, so a regression shows up as the wrong rows rather than the wrong
+ * method calls.
+ */
+
+import { describe, it, expect } from 'vitest';
+import { MemoryRepository } from './memory-repository';
+import type { SupabaseClient } from '@supabase/supabase-js';
+import type { Database } from '../supabase/types';
+
+type Row = Record<string, unknown>;
+type Predicate = (row: Row) => boolean;
+
+/**
+ * A Supabase query builder that actually filters.
+ *
+ * It models only the operators `listSessions` uses, and **throws on anything
+ * else** — a fake that silently ignores an unmodelled operator would report
+ * green for a query it never ran.
+ *
+ * Where SQL and JavaScript disagree, SQL wins:
+ *   - `NOT IN` over a NULL column is NULL, not true, so the row is excluded.
+ *   - `eq` never matches NULL.
+ * Getting that backwards is the difference between this test and a lie.
+ */
+function createFilteringSupabase(rows: Row[]) {
+  const predicates: Predicate[] = [];
+  let sortColumn: string | null = null;
+  let sortAscending = true;
+  let rangeFrom = 0;
+  let rangeTo = Number.MAX_SAFE_INTEGER;
+
+  const parseInList = (list: string): string[] => {
+    const match = /^\((.*)\)$/.exec(list);
+    if (!match) throw new Error(`Unmodelled PostgREST in-list: ${list}`);
+    return match[1].split(',').map((v) => v.trim().replace(/^"|"$/g, ''));
+  };
+
+  /** Parse one clause of an `.or(...)` string, e.g. `lifecycle.in.(a,b)`. */
+  const parseOrClause = (clause: string): Predicate => {
+    if (clause === 'ended_at.not.is.null') {
+      return (row) => row.ended_at !== null && row.ended_at !== undefined;
+    }
+    const inMatch = /^([a-z_]+)\.in\.(\(.*\))$/.exec(clause);
+    if (inMatch) {
+      const [, column, list] = inMatch;
+      const values = parseInList(list);
+      return (row) => typeof row[column] === 'string' && values.includes(row[column] as string);
+    }
+    throw new Error(`Unmodelled PostgREST or-clause: ${clause}`);
+  };
+
+  const builder: Record<string, unknown> = {
+    select: () => builder,
+    eq: (column: string, value: unknown) => {
+      // SQL: `col = value` is never true for NULL.
+      predicates.push((row) => row[column] !== null && row[column] === value);
+      return builder;
+    },
+    is: (column: string, value: unknown) => {
+      if (value !== null) throw new Error(`Unmodelled is() value: ${String(value)}`);
+      predicates.push((row) => row[column] === null || row[column] === undefined);
+      return builder;
+    },
+    not: (column: string, operator: string, list: string) => {
+      if (operator !== 'in') throw new Error(`Unmodelled not() operator: ${operator}`);
+      const values = parseInList(list);
+      // SQL: `col NOT IN (...)` over NULL yields NULL, so the row drops out.
+      predicates.push(
+        (row) => typeof row[column] === 'string' && !values.includes(row[column] as string)
+      );
+      return builder;
+    },
+    or: (clauses: string) => {
+      // Split on the commas that separate clauses, not the ones inside an
+      // in-list. Nested and()/or() groups are not modelled and will throw
+      // out of parseOrClause rather than quietly matching nothing.
+      const parts = clauses.split(/,(?![^()]*\))/).map(parseOrClause);
+      predicates.push((row) => parts.some((p) => p(row)));
+      return builder;
+    },
+    order: (column: string, opts?: { ascending?: boolean }) => {
+      sortColumn = column;
+      sortAscending = opts?.ascending !== false;
+      return builder;
+    },
+    range: (from: number, to: number) => {
+      rangeFrom = from;
+      rangeTo = to;
+      return builder;
+    },
+    then: (resolve: (value: { data: Row[]; error: null }) => void) => {
+      let result = rows.filter((row) => predicates.every((p) => p(row)));
+      if (sortColumn) {
+        const column = sortColumn;
+        result = [...result].sort((a, b) => {
+          const left = String(a[column] ?? '');
+          const right = String(b[column] ?? '');
+          return sortAscending ? left.localeCompare(right) : right.localeCompare(left);
+        });
+      }
+      result = result.slice(rangeFrom, rangeTo + 1);
+      resolve({ data: result, error: null });
+      return Promise.resolve({ data: result, error: null });
+    },
+  };
+
+  return { from: () => builder } as unknown as SupabaseClient<Database>;
+}
+
+const USER = 'user-1';
+
+function session(overrides: Row): Row {
+  return {
+    user_id: USER,
+    agent_id: 'wren',
+    studio_id: null,
+    started_at: '2026-08-01T00:00:00Z',
+    ended_at: null,
+    lifecycle: 'running',
+    status: 'active',
+    metadata: {},
+    ...overrides,
+  };
+}
+
+/**
+ * Every one of these carries `status: 'active'` in the legacy column, because
+ * nothing ever writes anything else there on the way out. That is the whole
+ * bug: the column cannot distinguish these rows, so the filter must not use it.
+ */
+const LIVE = session({ id: 'live', lifecycle: 'running', started_at: '2026-08-05T00:00:00Z' });
+const ENDED_BY_HOOK = session({
+  id: 'ended-by-hook',
+  ended_at: '2026-08-02T00:00:00Z',
+  lifecycle: 'completed',
+  started_at: '2026-08-02T00:00:00Z',
+});
+const COMPLETED_WITHOUT_ENDED_AT = session({
+  id: 'lifecycle-only',
+  ended_at: null,
+  lifecycle: 'completed',
+  started_at: '2026-08-03T00:00:00Z',
+});
+const FAILED = session({ id: 'failed', ended_at: null, lifecycle: 'failed' });
+const PAUSED = session({ id: 'paused', lifecycle: 'idle', status: 'paused' });
+const RESUMABLE_THEN_ENDED = session({
+  id: 'resumable-then-ended',
+  ended_at: '2026-08-04T00:00:00Z',
+  lifecycle: 'completed',
+  status: 'resumable',
+});
+
+const ALL = [LIVE, ENDED_BY_HOOK, COMPLETED_WITHOUT_ENDED_AT, FAILED, PAUSED, RESUMABLE_THEN_ENDED];
+
+function repoOver(rows: Row[]): MemoryRepository {
+  return new MemoryRepository(createFilteringSupabase(rows));
+}
+
+async function idsFor(rows: Row[], status: 'active' | 'paused' | 'resumable' | 'completed') {
+  const sessions = await repoOver(rows).listSessions(USER, { status });
+  return sessions.map((s) => s.id).sort();
+}
+
+describe('listSessions status filtering', () => {
+  it("excludes a session ended by the hook whose legacy status is still 'active'", async () => {
+    // Lumen's reported case, and the reason ink attach and Mission have been
+    // listing sessions that finished hours ago.
+    expect(await idsFor(ALL, 'active')).not.toContain('ended-by-hook');
+  });
+
+  it('excludes a lifecycle-only completion, which never stamps ended_at', async () => {
+    expect(await idsFor(ALL, 'active')).not.toContain('lifecycle-only');
+  });
+
+  it('excludes a failed session, which is terminal without an ended_at', async () => {
+    expect(await idsFor(ALL, 'active')).not.toContain('failed');
+  });
+
+  it("returns every non-terminal session for 'active', including paused ones", async () => {
+    // 'active' means "not finished", so a session an agent marked paused or
+    // resumable is still active — which is what `ink attach` wants, since a
+    // resumable session is precisely one you can attach to. The consequence is
+    // that 'active' overlaps 'paused' rather than partitioning against it.
+    expect(await idsFor(ALL, 'active')).toEqual(['live', 'paused']);
+  });
+
+  it("returns terminal sessions for 'completed', by either spelling", async () => {
+    expect(await idsFor(ALL, 'completed')).toEqual([
+      'ended-by-hook',
+      'failed',
+      'lifecycle-only',
+      'resumable-then-ended',
+    ]);
+  });
+
+  it("reads the legacy column for 'paused', which has no authoritative equivalent", async () => {
+    expect(await idsFor(ALL, 'paused')).toEqual(['paused']);
+  });
+
+  it("does not return a terminal session for 'resumable' just because it says so", async () => {
+    // resumable-then-ended still carries status 'resumable'; it ended anyway.
+    expect(await idsFor(ALL, 'resumable')).toEqual([]);
+  });
+
+  it('treats a NULL lifecycle as non-active, matching SQL three-valued logic', async () => {
+    // Unreachable for real rows — the column has defaulted to 'idle' since the
+    // lifecycle migration and existing rows were backfilled — but asserted so
+    // the behaviour is a decision rather than an accident. getActiveSessions
+    // has the same property, so the two agree.
+    const legacy = session({ id: 'null-lifecycle', lifecycle: null });
+    expect(await idsFor([LIVE, legacy], 'active')).toEqual(['live']);
+  });
+
+  it('still applies agent, studio and backend filters alongside status', async () => {
+    const otherAgent = session({ id: 'other-agent', agent_id: 'lumen' });
+    const sessions = await repoOver([LIVE, otherAgent, ENDED_BY_HOOK]).listSessions(USER, {
+      agentId: 'wren',
+      status: 'active',
+    });
+    expect(sessions.map((s) => s.id)).toEqual(['live']);
+  });
+
+  it('returns unfiltered results when no status is given', async () => {
+    const sessions = await repoOver(ALL).listSessions(USER, {});
+    expect(sessions).toHaveLength(ALL.length);
+  });
+
+  it('orders by started_at descending and honours limit', async () => {
+    // live started 08-05, lifecycle-only 08-03 — newest first, capped at two.
+    const sessions = await repoOver(ALL).listSessions(USER, { limit: 2 });
+    expect(sessions.map((s) => s.id)).toEqual(['live', 'lifecycle-only']);
+  });
+});
