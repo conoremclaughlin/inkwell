@@ -70,7 +70,14 @@ export interface SessionServiceConfig {
   defaultAntigravityModel?: string;
   /** This server's own MCP endpoint, from the port the HTTP listener bound. */
   inkMcpUrl?: string;
-  /** Token threshold for triggering compaction */
+  /**
+   * Server-triggered compaction gate (claude-code backend only). OFF by
+   * default: Claude Code auto-compacts natively (--autocompact), and the
+   * measured context count is billing-derived and approximate, so the
+   * server's rotate-at-threshold is opt-in (SERVER_COMPACTION_ENABLED).
+   */
+  compactionEnabled: boolean;
+  /** Token threshold for triggering compaction (COMPACTION_THRESHOLD) */
   compactionThreshold: number;
   /** Callback to route responses from async operations (compaction, etc.) */
   responseHandler?: (responses: ChannelResponse[]) => Promise<void>;
@@ -79,6 +86,7 @@ export interface SessionServiceConfig {
 const DEFAULT_CONFIG: SessionServiceConfig = {
   defaultWorkingDirectory: process.cwd(),
   mcpConfigPath: '',
+  compactionEnabled: false,
   compactionThreshold: 150000, // ~150k tokens
 };
 
@@ -1436,15 +1444,20 @@ export class SessionService implements ISessionService {
         { backendSessionId: result.backendSessionId ?? session.backendSessionId ?? null }
       );
 
-      // 6. Check if compaction is needed — only for claude-code backend where
-      // PCP controls the context window (via sb chat). Native CLI backends
-      // (codex-cli, gemini) manage their own context lifecycle. The ink
-      // backend self-compacts inside ink chat (token-budget auto-compaction);
-      // its usage is persisted above for visibility but the server must NOT
-      // also trigger compaction — one compaction owner per backend.
+      // 6. Check if compaction is needed — only for claude-code backend, and
+      // only when the gate is EXPLICITLY enabled: Claude Code auto-compacts
+      // natively (--autocompact), so the server's rotate-at-threshold is
+      // redundant in the common case, and the measured contextTokens here is
+      // billing-derived and approximate — a weak basis for ending a session
+      // early (Conor, 2026-08-20). Native CLI backends (codex-cli, gemini)
+      // manage their own context lifecycle. The ink backend self-compacts
+      // inside ink chat (token-budget auto-compaction); its usage is
+      // persisted above for visibility but the server must NOT also trigger
+      // compaction — one compaction owner per backend.
       // An absent contextTokens means the backend reports no context measure,
       // which is unknown rather than zero — never a basis for compacting.
       if (
+        this.config.compactionEnabled &&
         resolvedBackend === 'claude-code' &&
         result.usage.contextTokens !== undefined &&
         result.usage.contextTokens >= this.config.compactionThreshold

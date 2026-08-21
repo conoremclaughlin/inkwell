@@ -641,6 +641,8 @@ Optional:
 - `MCP_TRANSPORT` - `stdio` (default) or `http`
 - `NODE_ENV` - `development` or `production`
 - `SENTRY_DSN` - Error tracking (optional)
+- `SERVER_COMPACTION_ENABLED` - `true` to let the server rotate claude-code sessions at the compaction threshold (default `false`: Claude Code auto-compacts natively via `--autocompact`)
+- `COMPACTION_THRESHOLD` - context-token threshold for the server-side trigger when enabled (default 150000)
 
 ## Testing
 
