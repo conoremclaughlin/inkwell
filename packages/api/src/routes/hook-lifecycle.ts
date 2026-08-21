@@ -13,6 +13,7 @@ import { Router, type Request, type Response } from 'express';
 import type { DataComposer } from '../data/composer';
 import { PcpAuthProvider } from '../mcp/auth/pcp-auth-provider';
 import { StudioLeaseService } from '../services/studio-lease.service';
+import { releaseGraphClaimsForSession } from '../services/graph-executor.service';
 import { logger } from '../utils/logger';
 
 const VALID_LIFECYCLES = ['running', 'idle', 'compacting', 'completed', 'failed'] as const;
@@ -155,6 +156,24 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
       // never race each other's heartbeat CAS. Fire-and-forget: never delays
       // the hook response.
       if (isStopEvent) {
+        // Captured synchronously at the boundary: the release helper only
+        // touches claims from BEFORE this instant, so a delayed release can
+        // never take the next turn's claims (Lumen round 3 P1).
+        const boundaryAt = new Date().toISOString();
+        // Graph claims are turn-scoped: the CLI stop hook IS the real turn
+        // boundary. Independent chain, FIRST — a lease-release error must
+        // not skip it (round 3 P1); the helper itself never throws.
+        void releaseGraphClaimsForSession(
+          dataComposer.getClient(),
+          sessionId,
+          'cli-turn-stopped',
+          boundaryAt
+        ).catch((err: unknown) => {
+          logger.warn('[HookLifecycle] CLI-boundary graph claim release failed', {
+            sessionId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
         void (async () => {
           const postUpdate = await dataComposer.repositories.memory.getSession(sessionId);
           const terminal =

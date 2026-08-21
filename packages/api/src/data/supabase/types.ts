@@ -4379,6 +4379,25 @@ export type Database = {
         };
         Returns: Json;
       };
+      claim_graph_task: {
+        Args: {
+          p_user_id: string;
+          p_task_id: string;
+          p_session_id: string;
+        };
+        Returns: Json;
+      };
+      complete_graph_task: {
+        Args: {
+          p_user_id: string;
+          p_task_id: string;
+          p_session_id: string;
+          p_claim_token: string;
+          p_outcome: string;
+          p_reason?: string | null;
+        };
+        Returns: Json;
+      };
       compute_thread_key_pin: {
         Args: {
           p_user_id: string;
@@ -4573,12 +4592,57 @@ export type Database = {
         Args: { p: string | null };
         Returns: string | null;
       };
+      record_gate_verdict: {
+        Args: {
+          p_user_id: string;
+          p_task_id: string;
+          p_verdict: string;
+          p_expected_attempt: number;
+          p_expected_gate_version: number;
+          p_actor_identity_id?: string | null;
+          p_actor_user_id?: string | null;
+          p_session_id?: string | null;
+          p_claim_token?: string | null;
+          p_evidence?: Json | null;
+          p_reason?: string | null;
+        };
+        Returns: Json;
+      };
+      release_graph_claim: {
+        Args: {
+          p_user_id: string;
+          p_task_id: string;
+          p_claim_token: string;
+          p_session_id?: string | null;
+          p_reclaim?: boolean;
+          p_reason?: string | null;
+        };
+        Returns: Json;
+      };
+      retry_gate: {
+        Args: {
+          p_user_id: string;
+          p_task_id: string;
+          p_expected_attempt: number;
+          p_actor_identity_id?: string | null;
+          p_actor_user_id?: string | null;
+          p_reason?: string | null;
+        };
+        Returns: Json;
+      };
       show_limit: { Args: never; Returns: number };
       show_trgm: { Args: { '': string }; Returns: string[] };
       studio_path_conflict: {
         Args: {
           p_studio_id: string;
           p_user_id: string;
+        };
+        Returns: Json;
+      };
+      sweep_task_graph: {
+        Args: {
+          p_user_id: string;
+          p_task_group_id: string;
         };
         Returns: Json;
       };

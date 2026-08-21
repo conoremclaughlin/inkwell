@@ -55,6 +55,13 @@ interface TaskItem {
   taskOrder: number | null;
   blockedBy: string[] | null;
   createdBy: string | null;
+  // Workflow graph execution state (spec v10 steps 2-3)
+  taskType?: 'work' | 'verification';
+  outcome?: string | null;
+  gateState?: string | null;
+  gateAttempt?: number | null;
+  eligibleAt?: string | null;
+  claimedBySessionId?: string | null;
 }
 
 interface TaskGroupItem {
@@ -62,6 +69,7 @@ interface TaskGroupItem {
   title: string;
   agentId: string | null;
   agentName: string | null;
+  executionModel?: 'linear' | 'graph';
 }
 
 interface TasksResponse {
@@ -69,8 +77,10 @@ interface TasksResponse {
   stats: Record<string, number>;
 }
 
+// The endpoint has always returned `groups`; this hook used to type the key
+// as `taskGroups`, so the map silently never resolved group titles.
 interface TaskGroupsResponse {
-  taskGroups: TaskGroupItem[];
+  groups: TaskGroupItem[];
 }
 
 // ─── Layout helpers ───
@@ -200,24 +210,34 @@ export function useCommandData() {
   useEffect(() => {
     if (!tasksData?.tasks) return;
 
-    const groupMap = new Map<string, string>();
-    if (groupsData?.taskGroups) {
-      for (const g of groupsData.taskGroups) {
-        groupMap.set(g.id, g.title);
+    const groupMap = new Map<string, TaskGroupItem>();
+    if (groupsData?.groups) {
+      for (const g of groupsData.groups) {
+        groupMap.set(g.id, g);
       }
     }
 
-    const taskNodes: TaskNode[] = tasksData.tasks.map((t) => ({
-      id: t.id,
-      title: t.title,
-      status: t.status,
-      priority: t.priority,
-      groupId: t.taskGroupId,
-      groupTitle: t.taskGroupId ? (groupMap.get(t.taskGroupId) ?? null) : null,
-      taskOrder: t.taskOrder,
-      agentId: t.createdBy,
-      blockedBy: t.blockedBy ?? [],
-    }));
+    const taskNodes: TaskNode[] = tasksData.tasks.map((t) => {
+      const group = t.taskGroupId ? groupMap.get(t.taskGroupId) : undefined;
+      return {
+        id: t.id,
+        title: t.title,
+        status: t.status,
+        priority: t.priority,
+        groupId: t.taskGroupId,
+        groupTitle: group?.title ?? null,
+        taskOrder: t.taskOrder,
+        agentId: t.createdBy,
+        blockedBy: t.blockedBy ?? [],
+        taskType: t.taskType ?? 'work',
+        outcome: t.outcome ?? null,
+        gateState: t.gateState ?? null,
+        gateAttempt: t.gateAttempt ?? null,
+        eligibleAt: t.eligibleAt ?? null,
+        claimedBySessionId: t.claimedBySessionId ?? null,
+        groupExecutionModel: group?.executionModel ?? null,
+      };
+    });
 
     setTasks(taskNodes);
   }, [tasksData, groupsData, setTasks]);

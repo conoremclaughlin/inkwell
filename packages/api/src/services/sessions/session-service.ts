@@ -30,6 +30,7 @@ import type {
   ImageContent,
 } from './types.js';
 import type { Json } from '../../data/supabase/types.js';
+import { releaseGraphClaimsForSession } from '../graph-executor.service';
 import { SessionRepository } from './session-repository.js';
 import { ContextBuilder } from './context-builder.js';
 import { ClaudeRunner, buildIdentityPrompt } from './claude-runner.js';
@@ -1629,6 +1630,25 @@ export class SessionService implements ISessionService {
       // release if the session ended. Fire-and-forget — release must never
       // delay response routing.
       void this.releaseLeaseIfSessionTerminal(session.id);
+      // Graph claims are turn-scoped: for a server-spawned session the run
+      // IS the turn, so its claims return to the pool at this boundary
+      // (spec v10; the sweep remains the crash backstop). Fire-and-forget
+      // with the boundary instant captured HERE, so a delayed release can
+      // never touch claims a later run acquires (Lumen round 3 P1).
+      if (this.supabase) {
+        const boundaryAt = new Date().toISOString();
+        void releaseGraphClaimsForSession(
+          this.supabase,
+          session.id,
+          'run-completed',
+          boundaryAt
+        ).catch((err: unknown) => {
+          logger.warn('Graph boundary release failed at run completion', {
+            sessionId: session.id,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+      }
     }
 
     // Gated on `finalized` for the same reason the lifecycle write is:
