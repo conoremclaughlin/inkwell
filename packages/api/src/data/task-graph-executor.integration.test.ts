@@ -513,9 +513,312 @@ d('workflow graph executor (real DB)', () => {
         evidence: { kind: 'review', ref: 'post-mutation' },
       });
       expect(passed.success).toBe(true);
+
+      // Round 2: a PASSED gate's verdict is a per-attempt fact — mutating
+      // its inbound would restate the premises of a decided gate. Refused.
+      const intoPassed = await groups.applyTaskGraph({
+        userId: USER,
+        taskGroupId: g4,
+        expectedVersion: 4,
+        edges: [
+          { from: m1, to: mg },
+          { from: m2, to: mg },
+        ],
+        systemActor: true,
+      });
+      expect(intoPassed).toMatchObject({ success: false, reason: 'passed-gate-inbound' });
+      expect(intoPassed.gates).toEqual([mg]);
     } finally {
       await client.from('tasks').delete().in('id', [m1, m2, mg]);
       await client.from('task_groups').delete().eq('id', g4);
+    }
+  });
+
+  it('P1 regression (r2): a failed gate never completes the group — retry stays reachable, then completion is earned', async () => {
+    const g5 = randomUUID();
+    const loneGate = randomUUID();
+    await client
+      .from('task_groups')
+      .insert([{ id: g5, user_id: USER, title: 'exec-itest failed-gate-completion' }]);
+    await client.from('tasks').insert([
+      {
+        id: loneGate,
+        user_id: USER,
+        task_group_id: g5,
+        title: 'lone gate',
+        task_type: 'verification',
+        gate_state: 'not_ready',
+        assignee_identity_id: ident,
+      },
+    ] as never);
+    await groups.convertToGraph({
+      userId: USER,
+      taskGroupId: g5,
+      expectedVersion: 0,
+      systemActor: true,
+    });
+
+    try {
+      // No deps: the sweep opens it immediately.
+      await groups.sweepTaskGraph({ userId: USER, taskGroupId: g5 });
+      const { data: openRow } = await client
+        .from('tasks')
+        .select('gate_attempt, gate_version')
+        .eq('id', loneGate)
+        .single();
+
+      const failed = await groups.recordGateVerdict({
+        userId: USER,
+        taskId: loneGate,
+        verdict: 'failed',
+        expectedAttempt: openRow!.gate_attempt,
+        expectedGateVersion: openRow!.gate_version,
+        actorIdentityId: ident!,
+        reason: 'checks red',
+      });
+      expect(failed.success).toBe(true);
+      // The exploit: every node terminal, but the gate is NOT passed.
+      expect(evalOf(failed).groupComplete).toBe(false);
+
+      const { error: completeError } = await client
+        .from('task_groups')
+        .update({ status: 'completed' } as never)
+        .eq('id', g5);
+      expect(completeError?.message).toMatch(/unpassed verification gates/);
+
+      // Retry is still reachable (the group stayed active and swept)…
+      const retried = await groups.retryGate({
+        userId: USER,
+        taskId: loneGate,
+        expectedAttempt: openRow!.gate_attempt,
+        actorIdentityId: ident!,
+        reason: 'remediated',
+      });
+      expect(retried.success).toBe(true);
+      // …and completion is earned once the gate passes.
+      const { data: freshRow } = await client
+        .from('tasks')
+        .select('gate_attempt, gate_version')
+        .eq('id', loneGate)
+        .single();
+      const passed = await groups.recordGateVerdict({
+        userId: USER,
+        taskId: loneGate,
+        verdict: 'passed',
+        expectedAttempt: freshRow!.gate_attempt,
+        expectedGateVersion: freshRow!.gate_version,
+        actorIdentityId: ident!,
+        evidence: { kind: 'ok' },
+      });
+      expect(evalOf(passed).groupComplete).toBe(true);
+      const { error: nowAllowed } = await client
+        .from('task_groups')
+        .update({ status: 'completed' } as never)
+        .eq('id', g5);
+      expect(nowAllowed).toBeNull();
+    } finally {
+      await client.from('tasks').delete().eq('id', loneGate);
+      await client.from('task_groups').delete().eq('id', g5);
+    }
+  });
+
+  it('P1 regression (r2): gate config and assignees freeze once execution starts; authoring stays free while idle', async () => {
+    const g6 = randomUUID();
+    const cfgGate = randomUUID();
+    await client
+      .from('task_groups')
+      .insert([{ id: g6, user_id: USER, title: 'exec-itest config-freeze' }]);
+    await client.from('tasks').insert([
+      {
+        id: cfgGate,
+        user_id: USER,
+        task_group_id: g6,
+        title: 'configurable gate',
+        task_type: 'verification',
+        gate_state: 'not_ready',
+        assignee_identity_id: ident,
+      },
+    ] as never);
+    await groups.convertToGraph({
+      userId: USER,
+      taskGroupId: g6,
+      expectedVersion: 0,
+      systemActor: true,
+    });
+
+    try {
+      // Idle phase: authoring edits pass.
+      const { error: idleEdit } = await client
+        .from('tasks')
+        .update({ verification: { notBeforeSeconds: 5 } } as never)
+        .eq('id', cfgGate);
+      expect(idleEdit).toBeNull();
+
+      // Execution starts: config and authority freeze.
+      await client
+        .from('task_groups')
+        .update({ execution_phase: 'worker_active' } as never)
+        .eq('id', g6);
+      const { error: cfgError } = await client
+        .from('tasks')
+        .update({ verification: { mode: 'approval', notBeforeSeconds: 3600 } } as never)
+        .eq('id', cfgGate);
+      expect(cfgError?.message).toMatch(/frozen once graph execution starts/);
+      const { error: assigneeError } = await client
+        .from('tasks')
+        .update({ assignee_identity_id: null, assignee_user_id: USER } as never)
+        .eq('id', cfgGate);
+      expect(assigneeError?.message).toMatch(/frozen once graph execution starts/);
+      const { error: reasonError } = await client
+        .from('tasks')
+        .update({ outcome_reason: 'forged' } as never)
+        .eq('id', cfgGate);
+      expect(reasonError?.message).toMatch(/executor-owned/);
+    } finally {
+      await client.from('tasks').delete().eq('id', cfgGate);
+      await client.from('task_groups').delete().eq('id', g6);
+    }
+  });
+
+  it('P1 regression (r2): the turn boundary releases every claim the session holds', async () => {
+    const { releaseGraphClaimsForSession } = await import('../services/graph-executor.service');
+    const g7 = randomUUID();
+    const p1 = randomUUID();
+    const p2 = randomUUID();
+    await client
+      .from('task_groups')
+      .insert([{ id: g7, user_id: USER, title: 'exec-itest boundary-release' }]);
+    await client.from('tasks').insert([
+      { id: p1, user_id: USER, task_group_id: g7, title: 'p1', task_type: 'work' },
+      { id: p2, user_id: USER, task_group_id: g7, title: 'p2', task_type: 'work' },
+    ] as never);
+    await groups.convertToGraph({
+      userId: USER,
+      taskGroupId: g7,
+      expectedVersion: 0,
+      systemActor: true,
+    });
+
+    try {
+      const c1 = await groups.claimGraphTask({ userId: USER, taskId: p1, sessionId: sess1 });
+      const c2 = await groups.claimGraphTask({ userId: USER, taskId: p2, sessionId: sess1 });
+      expect(c1.success).toBe(true);
+      expect(c2.success).toBe(true);
+
+      const released = await releaseGraphClaimsForSession(client, sess1, 'test-turn-boundary');
+      expect(released).toBe(2);
+
+      const { data: rows } = await client
+        .from('tasks')
+        .select('id, status, claimed_by_session_id')
+        .in('id', [p1, p2]);
+      for (const row of rows ?? []) {
+        expect(row.status).toBe('pending');
+        expect(row.claimed_by_session_id).toBeNull();
+      }
+      // Idempotent: nothing left to release.
+      expect(await releaseGraphClaimsForSession(client, sess1, 'again')).toBe(0);
+    } finally {
+      await client.from('tasks').delete().in('id', [p1, p2]);
+      await client.from('task_groups').delete().eq('id', g7);
+    }
+  });
+
+  it('concurrency: parallel graph mutations and executor operations never deadlock (r2 lock order)', async () => {
+    const g8 = randomUUID();
+    const nodes = [randomUUID(), randomUUID(), randomUUID()];
+    const cGate = randomUUID();
+    await client
+      .from('task_groups')
+      .insert([{ id: g8, user_id: USER, title: 'exec-itest concurrency' }]);
+    await client.from('tasks').insert([
+      ...nodes.map((id, i) => ({
+        id,
+        user_id: USER,
+        task_group_id: g8,
+        title: `c${i}`,
+        task_type: 'work',
+      })),
+      {
+        id: cGate,
+        user_id: USER,
+        task_group_id: g8,
+        title: 'c gate',
+        task_type: 'verification',
+        gate_state: 'not_ready',
+        assignee_identity_id: ident,
+      },
+    ] as never);
+    await groups.convertToGraph({
+      userId: USER,
+      taskGroupId: g8,
+      expectedVersion: 0,
+      systemActor: true,
+    });
+
+    try {
+      const edgeSets = [
+        [{ from: nodes[0], to: cGate }],
+        [
+          { from: nodes[0], to: cGate },
+          { from: nodes[1], to: cGate },
+        ],
+        [{ from: nodes[1], to: cGate }],
+      ];
+      const applyLoop = async (rounds: number) => {
+        for (let i = 0; i < rounds; i += 1) {
+          const { data: row } = await client
+            .from('task_groups')
+            .select('graph_version')
+            .eq('id', g8)
+            .single();
+          // version-conflict refusals under contention are expected and
+          // structured — only thrown errors (deadlocks) fail this test.
+          await groups.applyTaskGraph({
+            userId: USER,
+            taskGroupId: g8,
+            expectedVersion: (row!.graph_version as number) ?? 0,
+            edges: edgeSets[i % edgeSets.length],
+            systemActor: true,
+          });
+        }
+      };
+      const claimLoop = async (taskId: string, sessionId: string, rounds: number) => {
+        for (let i = 0; i < rounds; i += 1) {
+          const claim = await groups.claimGraphTask({ userId: USER, taskId, sessionId });
+          if (claim.success) {
+            await groups.releaseGraphClaim({
+              userId: USER,
+              taskId,
+              claimToken: claim.claimToken as string,
+              sessionId,
+            });
+          }
+        }
+      };
+      const sweepLoop = async (rounds: number) => {
+        for (let i = 0; i < rounds; i += 1) {
+          await groups.sweepTaskGraph({ userId: USER, taskGroupId: g8 });
+        }
+      };
+
+      const outcomes = await Promise.allSettled([
+        applyLoop(12),
+        claimLoop(nodes[0], sess1, 12),
+        claimLoop(nodes[1], sess2, 12),
+        sweepLoop(12),
+      ]);
+      const failures = outcomes.filter((o): o is PromiseRejectedResult => o.status === 'rejected');
+      expect(
+        failures.map((f) => String(f.reason)),
+        'no operation may throw under contention (deadlocks surface here)'
+      ).toEqual([]);
+    } finally {
+      await client
+        .from('tasks')
+        .delete()
+        .in('id', [...nodes, cGate]);
+      await client.from('task_groups').delete().eq('id', g8);
     }
   });
 

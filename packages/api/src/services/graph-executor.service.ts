@@ -20,9 +20,10 @@
  * message, not repeat work.
  */
 
+import type { SupabaseClient } from '@supabase/supabase-js';
 import type { DataComposer } from '../data/composer';
 import type { TaskGroup } from '../data/repositories/task-groups.repository';
-import type { Json } from '../data/supabase/types';
+import type { Database, Json } from '../data/supabase/types';
 import { handleSendToInbox } from '../mcp/tools/inbox-handlers';
 import { resolveAgentSlug } from '../auth/resolve-identity';
 import { StudioLeaseService } from './studio-lease.service';
@@ -42,7 +43,7 @@ export interface GraphNodeRef {
 export interface GraphDependencyFailure {
   id: string;
   title: string;
-  sources: Array<{ id: string; title: string; state: string }>;
+  sources: Array<{ id: string; title: string; state: string; attempt?: number | null }>;
 }
 
 export interface GraphEvaluation {
@@ -66,6 +67,60 @@ export interface GraphClaimRef {
 
 /** Don't re-trigger a still-undispatched node more often than this. */
 const REDISPATCH_INTERVAL_MS = 30 * 60 * 1000;
+
+/**
+ * Claims are TURN-scoped (spec principle 9; Lumen round 2 P1): the real
+ * release points are the session's actual turn boundaries — the CLI stop
+ * hook and server-run completion — not a sweep timeout. This is the
+ * release-by-session both boundaries call: every claim the session holds
+ * is released by token CAS, returning the nodes to the pool for the next
+ * dispatch (usually re-claimed by the same session's next turn). The
+ * sweep's idle-window reclaim remains the CRASH backstop only.
+ *
+ * Fire-and-forget-safe: refusals and lookup errors are logged, never
+ * thrown — a boundary must never fail because a claim record was stale.
+ */
+export async function releaseGraphClaimsForSession(
+  client: SupabaseClient<Database>,
+  sessionId: string,
+  reason: string
+): Promise<number> {
+  let released = 0;
+  try {
+    const { data: held, error } = await client
+      .from('tasks')
+      .select('id, user_id, claim_token')
+      .eq('claimed_by_session_id', sessionId);
+    if (error) {
+      logger.warn(`Graph boundary release: claim lookup failed for session ${sessionId}:`, error);
+      return 0;
+    }
+    for (const row of held ?? []) {
+      if (!row.claim_token) continue;
+      const { data, error: rpcError } = await client.rpc('release_graph_claim', {
+        p_user_id: row.user_id,
+        p_task_id: row.id,
+        p_claim_token: row.claim_token,
+        p_session_id: sessionId,
+        p_reclaim: false,
+        p_reason: reason,
+      });
+      if (rpcError) {
+        logger.warn(`Graph boundary release failed for task ${row.id}:`, rpcError);
+        continue;
+      }
+      if ((data as Record<string, unknown> | null)?.success) released += 1;
+    }
+    if (released > 0) {
+      logger.info(
+        `Graph boundary release: session ${sessionId} released ${released} claim(s) (${reason})`
+      );
+    }
+  } catch (err) {
+    logger.warn(`Graph boundary release errored for session ${sessionId}:`, err);
+  }
+  return released;
+}
 
 /**
  * A claim held by a live, non-terminal session is reclaimed only after this
@@ -349,15 +404,29 @@ export class GraphExecutorService {
     group: TaskGroup,
     failures: GraphDependencyFailure[]
   ): Promise<void> {
-    if (!failures || failures.length === 0) return;
-    // Key on (destination, source, state) triples, not destination ids: a
-    // SECOND source failing on an already-notified destination is fresh
-    // information and must re-surface (Lumen round 1 P2).
+    const meta = (group.metadata || {}) as Record<string, unknown>;
+    if (!failures || failures.length === 0) {
+      // Recovery observed (retry, edge cut): clear the stamp so the SAME
+      // failure re-surfaces if it happens again — without this, attempt 2
+      // refailing identically stays suppressed forever (Lumen round 2 P2).
+      if (meta.graphDepFailuresNotified) {
+        const { graphDepFailuresNotified: _cleared, ...rest } = meta;
+        await this.dataComposer.repositories.taskGroups.update(group.id, { metadata: rest });
+      }
+      return;
+    }
+    // Key on (destination, source, state, attempt) — a SECOND source
+    // failing on a notified destination, or the same gate refailing on a
+    // NEW attempt, is fresh information and must re-surface (rounds 1-2).
     const key = failures
-      .map((f) => `${f.id}:${f.sources.map((s) => `${s.id}=${s.state}`).join(',')}`)
+      .map(
+        (f) =>
+          `${f.id}:${f.sources
+            .map((s) => `${s.id}=${s.state}${s.attempt != null ? `@${s.attempt}` : ''}`)
+            .join(',')}`
+      )
       .sort()
       .join(';');
-    const meta = (group.metadata || {}) as Record<string, unknown>;
     if (meta.graphDepFailuresNotified === key) return;
 
     const lines = failures.map(

@@ -370,6 +370,51 @@ describe('GraphExecutorService dispatch', () => {
     expect(failureCount()).toBe(2);
   });
 
+  it('recovery clears the failure stamp, so an identical refail on a NEW attempt re-surfaces (r2 P2)', async () => {
+    const ctx = makeComposer();
+    const service = new GraphExecutorService(ctx.composer);
+    const failureAttempt1 = {
+      id: 'd1',
+      title: 'downstream',
+      sources: [{ id: 'g1', title: 'gate', state: 'failed', attempt: 1 }],
+    };
+    const failureCount = () =>
+      ctx.activities.filter((a) => a.subtype === 'graph_dependency_failure').length;
+
+    await service.dispatchEvaluation(
+      USER,
+      baseGroup,
+      { ...emptyEval, dependencyFailures: [failureAttempt1] },
+      { dedupe: true }
+    );
+    expect(failureCount()).toBe(1);
+    const stampedKey = (ctx.groupUpdates.at(-1)?.metadata as Record<string, unknown>)
+      .graphDepFailuresNotified as string;
+    const stampedGroup = {
+      ...baseGroup,
+      metadata: { graphDepFailuresNotified: stampedKey },
+    } as TaskGroup;
+
+    // Retry recovers the gate: no failures → the stamp is CLEARED.
+    await service.dispatchEvaluation(USER, stampedGroup, { ...emptyEval }, { dedupe: true });
+    const clearedMeta = ctx.groupUpdates.at(-1)?.metadata as Record<string, unknown>;
+    expect(clearedMeta.graphDepFailuresNotified).toBeUndefined();
+
+    // Attempt 2 refails the same way: with attempt in the key this is a
+    // DIFFERENT fact even against a stale stamp — it re-surfaces.
+    const failureAttempt2 = {
+      ...failureAttempt1,
+      sources: [{ ...failureAttempt1.sources[0], attempt: 2 }],
+    };
+    await service.dispatchEvaluation(
+      USER,
+      stampedGroup,
+      { ...emptyEval, dependencyFailures: [failureAttempt2] },
+      { dedupe: true }
+    );
+    expect(failureCount()).toBe(2);
+  });
+
   it('a human-assigned gate is surfaced as awaiting-human, never messaged as an agent', async () => {
     const ctx = makeComposer();
     const service = new GraphExecutorService(ctx.composer);

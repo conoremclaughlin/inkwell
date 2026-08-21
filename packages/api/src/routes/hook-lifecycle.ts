@@ -13,6 +13,7 @@ import { Router, type Request, type Response } from 'express';
 import type { DataComposer } from '../data/composer';
 import { PcpAuthProvider } from '../mcp/auth/pcp-auth-provider';
 import { StudioLeaseService } from '../services/studio-lease.service';
+import { releaseGraphClaimsForSession } from '../services/graph-executor.service';
 import { logger } from '../utils/logger';
 
 const VALID_LIFECYCLES = ['running', 'idle', 'compacting', 'completed', 'failed'] as const;
@@ -169,6 +170,14 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
           if (!released) {
             await leaseService.renewBySession(sessionId, session.userId);
           }
+          // Graph claims are turn-scoped: the CLI stop hook IS the real
+          // turn boundary, so the session's claims return to the pool here
+          // (spec v10; the sweep is only the crash backstop).
+          await releaseGraphClaimsForSession(
+            dataComposer.getClient(),
+            sessionId,
+            'cli-turn-stopped'
+          );
         })().catch((err: unknown) => {
           logger.warn('[HookLifecycle] CLI-boundary lease release failed', {
             sessionId,

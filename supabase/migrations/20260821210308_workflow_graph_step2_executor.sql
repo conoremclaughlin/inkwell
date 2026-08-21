@@ -18,12 +18,26 @@
 -- deferred" — and the reconciliation sweep calls the SAME evaluator, so
 -- crash recovery and time-driven gate opening are one mechanism, not two.
 --
--- Lock discipline: mutation RPCs lock the task row FOR UPDATE, then the
--- group row FOR SHARE. FOR SHARE serializes every executor action against
--- apply_task_graph / convert_task_group_to_graph (FOR UPDATE) while letting
--- concurrent completions on different tasks proceed. The evaluator visits
--- gate rows in id order so two concurrent evaluations lock rows in the same
--- order (no deadlock); every transition is a per-row CAS.
+-- Lock discipline (ONE order everywhere — Lumen round 2 P1, reproduced
+-- deadlock): GROUP before TASK. Every executor RPC reads the task's group
+-- id WITHOUT locking, locks the group row FOR SHARE, then locks the task
+-- row FOR UPDATE and REVALIDATES that it still belongs to the locked group
+-- (a concurrent move between the unlocked read and the lock returns a
+-- structured 'concurrent-move' refusal — retry, never a wrong-group
+-- mutation). apply_task_graph already runs group (FOR UPDATE) → task, so
+-- edge FK locks and gate resets can no longer deadlock against a verdict
+-- holding a task row and waiting on the group. The evaluator visits gate
+-- rows in id order; every transition is a per-row CAS.
+--
+-- Known residual: the legacy-write fences (enforce_blocked_by_source,
+-- enforce_graph_execution_path) fire INSIDE a task UPDATE (task lock held
+-- by the statement) and then read the group FOR SHARE — an inversion by
+-- construction of BEFORE-row triggers. The only writes on that path in a
+-- graph group are ILLEGAL ones the trigger is about to refuse; if one
+-- deadlocks against a live mutation instead, PostgreSQL kills it with an
+-- error — the same terminal outcome as the refusal, just a blunter
+-- message. Legit linear-group writes never contend: apply_task_graph
+-- refuses linear groups before taking task locks.
 
 -- ── Satisfaction predicates (spec §Semantics) ───────────────────────────
 --
@@ -190,7 +204,9 @@ BEGIN
            jsonb_agg(jsonb_build_object(
              'id', s.id, 'title', s.title,
              'state', CASE WHEN s.task_type = 'verification'
-                           THEN s.gate_state ELSE coalesce(s.outcome, s.status) END)
+                           THEN s.gate_state ELSE coalesce(s.outcome, s.status) END,
+             'attempt', CASE WHEN s.task_type = 'verification'
+                             THEN s.gate_attempt END)
              ORDER BY s.id) AS sources
     FROM tasks t
     JOIN task_edges e ON e.to_task = t.id
@@ -204,6 +220,8 @@ BEGIN
 
   SELECT count(*) FILTER (WHERE NOT (t.status IN ('completed', 'archived')
                                      OR (t.status = 'blocked' AND t.outcome IS NOT NULL))) AS open_count,
+         count(*) FILTER (WHERE t.task_type = 'verification'
+                            AND t.gate_state IS DISTINCT FROM 'passed') AS unpassed_gates,
          count(*) AS total,
          count(*) FILTER (WHERE t.status = 'completed') AS completed,
          count(*) FILTER (WHERE t.status = 'blocked' AND t.outcome = 'failed') AS failed,
@@ -211,7 +229,11 @@ BEGIN
   INTO v_counts
   FROM tasks t
   WHERE t.task_group_id = p_task_group_id AND t.user_id = p_user_id;
-  v_group_complete := v_counts.open_count = 0 AND v_counts.total > 0;
+  -- A failed gate is terminal PER ATTEMPT, never for the group: completion
+  -- requires every verification gate PASSED, so retry stays reachable
+  -- (completed groups are unswept and unclaimable — Lumen round 2 P1).
+  v_group_complete := v_counts.open_count = 0 AND v_counts.unpassed_gates = 0
+    AND v_counts.total > 0;
 
   RETURN jsonb_build_object(
     'readyWork', v_ready_work,
@@ -244,30 +266,42 @@ AS $$
 DECLARE
   v_task record;
   v_group record;
+  v_group_id uuid;
   v_token uuid;
 BEGIN
   -- Mark this transaction as the executor path (see
   -- enforce_graph_execution_path): transaction-local, resets at commit.
   PERFORM set_config('app.graph_executor', 'on', true);
-  SELECT * INTO v_task FROM tasks
-  WHERE id = p_task_id AND user_id = p_user_id
-  FOR UPDATE;
+  -- GROUP before TASK (see lock discipline): unlocked read for the group
+  -- id, group FOR SHARE, task FOR UPDATE, then revalidate membership.
+  SELECT task_group_id INTO v_group_id FROM tasks
+  WHERE id = p_task_id AND user_id = p_user_id;
   IF NOT FOUND THEN
     RETURN jsonb_build_object('success', false, 'reason', 'task-not-found');
   END IF;
-  IF v_task.task_group_id IS NULL THEN
+  IF v_group_id IS NULL THEN
     RETURN jsonb_build_object('success', false, 'reason', 'not-graph-mode');
   END IF;
 
   SELECT execution_model, status INTO v_group
-  FROM task_groups WHERE id = v_task.task_group_id
+  FROM task_groups WHERE id = v_group_id
   FOR SHARE;
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'reason', 'group-not-found');
+  END IF;
   IF v_group.execution_model <> 'graph' THEN
     RETURN jsonb_build_object('success', false, 'reason', 'not-graph-mode');
   END IF;
   IF v_group.status <> 'active' THEN
     RETURN jsonb_build_object('success', false, 'reason', 'group-not-active',
       'groupStatus', v_group.status);
+  END IF;
+
+  SELECT * INTO v_task FROM tasks
+  WHERE id = p_task_id AND user_id = p_user_id
+  FOR UPDATE;
+  IF NOT FOUND OR v_task.task_group_id IS DISTINCT FROM v_group_id THEN
+    RETURN jsonb_build_object('success', false, 'reason', 'concurrent-move');
   END IF;
 
   IF v_task.claimed_by_session_id IS NOT NULL THEN
@@ -348,15 +382,28 @@ SET search_path = public, pg_temp
 AS $$
 DECLARE
   v_task record;
+  v_group_id uuid;
 BEGIN
   -- Mark this transaction as the executor path (see
   -- enforce_graph_execution_path): transaction-local, resets at commit.
   PERFORM set_config('app.graph_executor', 'on', true);
+  -- GROUP before TASK (see lock discipline). A claim only ever exists on a
+  -- graph-group task, so the group lock serializes this release against
+  -- apply_task_graph's gate resets in the one shared order.
+  SELECT task_group_id INTO v_group_id FROM tasks
+  WHERE id = p_task_id AND user_id = p_user_id;
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'reason', 'task-not-found');
+  END IF;
+  IF v_group_id IS NOT NULL THEN
+    PERFORM 1 FROM task_groups WHERE id = v_group_id FOR SHARE;
+  END IF;
+
   SELECT * INTO v_task FROM tasks
   WHERE id = p_task_id AND user_id = p_user_id
   FOR UPDATE;
-  IF NOT FOUND THEN
-    RETURN jsonb_build_object('success', false, 'reason', 'task-not-found');
+  IF NOT FOUND OR v_task.task_group_id IS DISTINCT FROM v_group_id THEN
+    RETURN jsonb_build_object('success', false, 'reason', 'concurrent-move');
   END IF;
   IF v_task.claimed_by_session_id IS NULL OR v_task.claim_token IS DISTINCT FROM p_claim_token THEN
     RETURN jsonb_build_object('success', false, 'reason', 'claim-mismatch');
@@ -408,6 +455,7 @@ AS $$
 DECLARE
   v_task record;
   v_group record;
+  v_group_id uuid;
   v_eval jsonb;
 BEGIN
   -- Mark this transaction as the executor path (see
@@ -417,25 +465,32 @@ BEGIN
     RETURN jsonb_build_object('success', false, 'reason', 'invalid-outcome');
   END IF;
 
-  SELECT * INTO v_task FROM tasks
-  WHERE id = p_task_id AND user_id = p_user_id
-  FOR UPDATE;
+  -- GROUP before TASK (see lock discipline).
+  SELECT task_group_id INTO v_group_id FROM tasks
+  WHERE id = p_task_id AND user_id = p_user_id;
   IF NOT FOUND THEN
     RETURN jsonb_build_object('success', false, 'reason', 'task-not-found');
   END IF;
-  IF v_task.task_group_id IS NULL THEN
+  IF v_group_id IS NULL THEN
     RETURN jsonb_build_object('success', false, 'reason', 'not-graph-mode');
+  END IF;
+
+  SELECT execution_model INTO v_group
+  FROM task_groups WHERE id = v_group_id
+  FOR SHARE;
+  IF NOT FOUND OR v_group.execution_model <> 'graph' THEN
+    RETURN jsonb_build_object('success', false, 'reason', 'not-graph-mode');
+  END IF;
+
+  SELECT * INTO v_task FROM tasks
+  WHERE id = p_task_id AND user_id = p_user_id
+  FOR UPDATE;
+  IF NOT FOUND OR v_task.task_group_id IS DISTINCT FROM v_group_id THEN
+    RETURN jsonb_build_object('success', false, 'reason', 'concurrent-move');
   END IF;
   IF v_task.task_type <> 'work' THEN
     RETURN jsonb_build_object('success', false, 'reason', 'verification-node',
       'hint', 'verification nodes take verdicts via record_gate_verdict, never completion');
-  END IF;
-
-  SELECT execution_model INTO v_group
-  FROM task_groups WHERE id = v_task.task_group_id
-  FOR SHARE;
-  IF v_group.execution_model <> 'graph' THEN
-    RETURN jsonb_build_object('success', false, 'reason', 'not-graph-mode');
   END IF;
 
   IF v_task.claimed_by_session_id IS DISTINCT FROM p_session_id
@@ -495,6 +550,7 @@ AS $$
 DECLARE
   v_task record;
   v_group record;
+  v_group_id uuid;
   v_eval jsonb;
   v_new_version bigint;
 BEGIN
@@ -508,21 +564,31 @@ BEGIN
     RETURN jsonb_build_object('success', false, 'reason', 'exactly-one-actor');
   END IF;
 
-  SELECT * INTO v_task FROM tasks
-  WHERE id = p_task_id AND user_id = p_user_id
-  FOR UPDATE;
+  -- GROUP before TASK (see lock discipline).
+  SELECT task_group_id INTO v_group_id FROM tasks
+  WHERE id = p_task_id AND user_id = p_user_id;
   IF NOT FOUND THEN
     RETURN jsonb_build_object('success', false, 'reason', 'task-not-found');
   END IF;
-  IF v_task.task_type <> 'verification' THEN
-    RETURN jsonb_build_object('success', false, 'reason', 'not-verification');
+  IF v_group_id IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'reason', 'not-graph-mode');
   END IF;
 
   SELECT execution_model INTO v_group
-  FROM task_groups WHERE id = v_task.task_group_id
+  FROM task_groups WHERE id = v_group_id
   FOR SHARE;
-  IF v_group.execution_model <> 'graph' THEN
+  IF NOT FOUND OR v_group.execution_model <> 'graph' THEN
     RETURN jsonb_build_object('success', false, 'reason', 'not-graph-mode');
+  END IF;
+
+  SELECT * INTO v_task FROM tasks
+  WHERE id = p_task_id AND user_id = p_user_id
+  FOR UPDATE;
+  IF NOT FOUND OR v_task.task_group_id IS DISTINCT FROM v_group_id THEN
+    RETURN jsonb_build_object('success', false, 'reason', 'concurrent-move');
+  END IF;
+  IF v_task.task_type <> 'verification' THEN
+    RETURN jsonb_build_object('success', false, 'reason', 'not-verification');
   END IF;
 
   IF v_task.gate_state NOT IN ('open', 'in_progress') THEN
@@ -627,6 +693,7 @@ AS $$
 DECLARE
   v_task record;
   v_group record;
+  v_group_id uuid;
   v_eval jsonb;
 BEGIN
   -- Mark this transaction as the executor path (see
@@ -636,21 +703,31 @@ BEGIN
     RETURN jsonb_build_object('success', false, 'reason', 'exactly-one-actor');
   END IF;
 
-  SELECT * INTO v_task FROM tasks
-  WHERE id = p_task_id AND user_id = p_user_id
-  FOR UPDATE;
+  -- GROUP before TASK (see lock discipline).
+  SELECT task_group_id INTO v_group_id FROM tasks
+  WHERE id = p_task_id AND user_id = p_user_id;
   IF NOT FOUND THEN
     RETURN jsonb_build_object('success', false, 'reason', 'task-not-found');
   END IF;
-  IF v_task.task_type <> 'verification' THEN
-    RETURN jsonb_build_object('success', false, 'reason', 'not-verification');
+  IF v_group_id IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'reason', 'not-graph-mode');
   END IF;
 
   SELECT execution_model INTO v_group
-  FROM task_groups WHERE id = v_task.task_group_id
+  FROM task_groups WHERE id = v_group_id
   FOR SHARE;
-  IF v_group.execution_model <> 'graph' THEN
+  IF NOT FOUND OR v_group.execution_model <> 'graph' THEN
     RETURN jsonb_build_object('success', false, 'reason', 'not-graph-mode');
+  END IF;
+
+  SELECT * INTO v_task FROM tasks
+  WHERE id = p_task_id AND user_id = p_user_id
+  FOR UPDATE;
+  IF NOT FOUND OR v_task.task_group_id IS DISTINCT FROM v_group_id THEN
+    RETURN jsonb_build_object('success', false, 'reason', 'concurrent-move');
+  END IF;
+  IF v_task.task_type <> 'verification' THEN
+    RETURN jsonb_build_object('success', false, 'reason', 'not-verification');
   END IF;
 
   IF v_task.gate_state <> 'failed' THEN
@@ -760,7 +837,9 @@ SECURITY DEFINER
 SET search_path = public
 AS $$
 DECLARE
-  v_model text;
+  v_group record;
+  v_exec_change boolean := false;
+  v_config_change boolean := false;
 BEGIN
   IF current_setting('app.graph_executor', true) = 'on' THEN
     RETURN NEW;
@@ -768,29 +847,50 @@ BEGIN
   IF NEW.task_group_id IS NULL THEN
     RETURN NEW;
   END IF;
-  -- Server-owned timing (dwell windows, eligibility, claim/open stamps) is
-  -- execution state too: a direct eligible_at rewrite would force an
-  -- hour-dwell gate open on the next sweep (Lumen, round 1 P1).
-  IF TG_OP = 'UPDATE'
-     AND NEW.status IS NOT DISTINCT FROM OLD.status
-     AND NEW.outcome IS NOT DISTINCT FROM OLD.outcome
-     AND NEW.gate_state IS NOT DISTINCT FROM OLD.gate_state
-     AND NEW.gate_attempt IS NOT DISTINCT FROM OLD.gate_attempt
-     AND NEW.gate_version IS NOT DISTINCT FROM OLD.gate_version
-     AND NEW.gate_opened_at IS NOT DISTINCT FROM OLD.gate_opened_at
-     AND NEW.dwell_started_at IS NOT DISTINCT FROM OLD.dwell_started_at
-     AND NEW.eligible_at IS NOT DISTINCT FROM OLD.eligible_at
-     AND NEW.completed_at IS NOT DISTINCT FROM OLD.completed_at
-     AND NEW.claimed_by_session_id IS NOT DISTINCT FROM OLD.claimed_by_session_id
-     AND NEW.claim_token IS NOT DISTINCT FROM OLD.claim_token
-     AND NEW.claimed_at IS NOT DISTINCT FROM OLD.claimed_at THEN
+
+  -- Tier 1 — executor-owned, ALWAYS fenced for graph groups: lifecycle
+  -- state, verdict/outcome projections, claims, and server-owned timing
+  -- (a direct eligible_at rewrite would force an hour-dwell gate open on
+  -- the next sweep — Lumen round 1 P1; outcome_reason joined in round 2).
+  IF TG_OP = 'UPDATE' AND NOT (
+       NEW.status IS NOT DISTINCT FROM OLD.status
+   AND NEW.outcome IS NOT DISTINCT FROM OLD.outcome
+   AND NEW.outcome_reason IS NOT DISTINCT FROM OLD.outcome_reason
+   AND NEW.gate_state IS NOT DISTINCT FROM OLD.gate_state
+   AND NEW.gate_attempt IS NOT DISTINCT FROM OLD.gate_attempt
+   AND NEW.gate_version IS NOT DISTINCT FROM OLD.gate_version
+   AND NEW.gate_opened_at IS NOT DISTINCT FROM OLD.gate_opened_at
+   AND NEW.dwell_started_at IS NOT DISTINCT FROM OLD.dwell_started_at
+   AND NEW.eligible_at IS NOT DISTINCT FROM OLD.eligible_at
+   AND NEW.completed_at IS NOT DISTINCT FROM OLD.completed_at
+   AND NEW.claimed_by_session_id IS NOT DISTINCT FROM OLD.claimed_by_session_id
+   AND NEW.claim_token IS NOT DISTINCT FROM OLD.claim_token
+   AND NEW.claimed_at IS NOT DISTINCT FROM OLD.claimed_at) THEN
+    v_exec_change := true;
+  END IF;
+
+  -- Tier 2 — gate config and authority, frozen once execution has STARTED
+  -- (Lumen round 2 P1: flipping an OPEN gate from executable/no-dwell to
+  -- approval/3600s rewrites its meaning mid-attempt; assignee changes must
+  -- be explicit and evented, which no path provides yet). Pre-start
+  -- authoring (execution_phase 'idle') stays free.
+  IF TG_OP = 'UPDATE' AND NOT (
+       NEW.verification IS NOT DISTINCT FROM OLD.verification
+   AND NEW.assignee_identity_id IS NOT DISTINCT FROM OLD.assignee_identity_id
+   AND NEW.assignee_user_id IS NOT DISTINCT FROM OLD.assignee_user_id) THEN
+    v_config_change := true;
+  END IF;
+
+  IF TG_OP = 'UPDATE' AND NOT v_exec_change AND NOT v_config_change THEN
     RETURN NEW;
   END IF;
   -- INSERTs are inert unless they arrive pre-executed (non-pending status,
-  -- a claim, timing stamps, or a gate already past not_ready).
+  -- a claim, timing stamps, or a gate already past not_ready). Config and
+  -- assignees at INSERT are authoring, always allowed.
   IF TG_OP = 'INSERT'
      AND NEW.status = 'pending'
      AND NEW.outcome IS NULL
+     AND NEW.outcome_reason IS NULL
      AND NEW.claimed_by_session_id IS NULL
      AND NEW.gate_opened_at IS NULL
      AND NEW.dwell_started_at IS NULL
@@ -800,14 +900,20 @@ BEGIN
     RETURN NEW;
   END IF;
 
-  SELECT execution_model INTO v_model
+  SELECT execution_model, execution_phase INTO v_group
   FROM task_groups
   WHERE id = NEW.task_group_id
   FOR SHARE;
 
-  IF v_model = 'graph' THEN
-    RAISE EXCEPTION
-      'execution state is executor-owned for graph-mode groups — use claim_task / complete_task(claimToken) / record_gate_verdict / retry_gate';
+  IF v_group.execution_model = 'graph' THEN
+    IF TG_OP = 'INSERT' OR v_exec_change THEN
+      RAISE EXCEPTION
+        'execution state is executor-owned for graph-mode groups — use claim_task / complete_task(claimToken) / record_gate_verdict / retry_gate';
+    END IF;
+    IF v_config_change AND v_group.execution_phase <> 'idle' THEN
+      RAISE EXCEPTION
+        'gate config and assignees are frozen once graph execution starts — author before start_graph_execution';
+    END IF;
   END IF;
   RETURN NEW;
 END;
@@ -815,9 +921,10 @@ $$;
 
 DROP TRIGGER IF EXISTS enforce_graph_execution_path ON public.tasks;
 CREATE TRIGGER enforce_graph_execution_path
-  BEFORE INSERT OR UPDATE OF status, outcome, gate_state, gate_attempt, gate_version,
-    gate_opened_at, dwell_started_at, eligible_at, completed_at,
-    claimed_by_session_id, claim_token, claimed_at, task_group_id ON public.tasks
+  BEFORE INSERT OR UPDATE OF status, outcome, outcome_reason, gate_state, gate_attempt,
+    gate_version, gate_opened_at, dwell_started_at, eligible_at, completed_at,
+    claimed_by_session_id, claim_token, claimed_at, verification,
+    assignee_identity_id, assignee_user_id, task_group_id ON public.tasks
   FOR EACH ROW EXECUTE FUNCTION public.enforce_graph_execution_path();
 
 -- ── apply_task_graph, amended: mutation is an executor event ────────────
@@ -863,6 +970,7 @@ DECLARE
   v_removed jsonb;
   v_new_version bigint;
   v_gate record;
+  v_passed_gates jsonb;
   v_reset jsonb := '[]'::jsonb;
   v_eval jsonb;
 BEGIN
@@ -876,7 +984,7 @@ BEGIN
   END IF;
 
   -- Lock BEFORE reading anything about the graph.
-  SELECT graph_version, execution_model INTO v_group
+  SELECT graph_version, execution_model, status INTO v_group
   FROM task_groups
   WHERE id = p_task_group_id AND user_id = p_user_id
   FOR UPDATE;
@@ -885,6 +993,13 @@ BEGIN
   END IF;
   IF v_group.execution_model <> 'graph' THEN
     RETURN jsonb_build_object('success', false, 'reason', 'not-graph-mode');
+  END IF;
+  -- A completed/cancelled group is off the executor: it is unswept and
+  -- unclaimable, so a mutation could never take effect — refuse loudly
+  -- rather than store an inert graph (Lumen round 2).
+  IF v_group.status NOT IN ('active', 'paused') THEN
+    RETURN jsonb_build_object('success', false, 'reason', 'group-not-active',
+      'groupStatus', v_group.status);
   END IF;
   v_current_version := v_group.graph_version;
   IF v_current_version <> p_expected_version THEN
@@ -941,6 +1056,26 @@ BEGIN
   FROM _desired_edges d
   WHERE NOT EXISTS (SELECT 1 FROM task_edges te
                     WHERE te.from_task = d.from_task AND te.to_task = d.to_task);
+
+  -- A PASSED gate's verdict is a per-attempt fact whose downstream may
+  -- already have consumed it — restating its premises by mutating inbound
+  -- would leave a decided gate standing on evidence for a different graph
+  -- (Lumen round 2 P1). Refused outright: remediate with new nodes or
+  -- explicit cancellation, never a silent restatement. FAILED gates stay
+  -- mutable — retry_gate establishes the fresh attempt that will read the
+  -- new inbound set.
+  SELECT jsonb_agg(DISTINCT changed.to_id) INTO v_passed_gates
+  FROM (
+    SELECT (e ->> 'to')::uuid AS to_id FROM jsonb_array_elements(v_added) e
+    UNION
+    SELECT (e ->> 'to')::uuid FROM jsonb_array_elements(v_removed) e
+  ) changed
+  JOIN tasks t ON t.id = changed.to_id
+  WHERE t.task_type = 'verification' AND t.gate_state = 'passed';
+  IF v_passed_gates IS NOT NULL THEN
+    RETURN jsonb_build_object('success', false, 'reason', 'passed-gate-inbound',
+      'gates', v_passed_gates);
+  END IF;
 
   DELETE FROM task_edges te
   USING tasks tk
@@ -1038,11 +1173,12 @@ BEGIN
   IF EXISTS (
     SELECT 1 FROM tasks t
     WHERE t.task_group_id = NEW.id
-      AND NOT (t.status IN ('completed', 'archived')
-               OR (t.status = 'blocked' AND t.outcome IS NOT NULL))
+      AND (NOT (t.status IN ('completed', 'archived')
+                OR (t.status = 'blocked' AND t.outcome IS NOT NULL))
+           OR (t.task_type = 'verification' AND t.gate_state IS DISTINCT FROM 'passed'))
   ) THEN
     RAISE EXCEPTION
-      'graph-mode group cannot complete with non-terminal nodes — the executor finalizes when every node is terminal (cancel to abandon)';
+      'graph-mode group cannot complete: non-terminal nodes or unpassed verification gates remain — retry the failed gate, or cancel to abandon';
   END IF;
   RETURN NEW;
 END;
