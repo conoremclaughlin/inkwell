@@ -50,6 +50,10 @@ import { resolveTaskGroupForThreadKey } from '../task-group-resolver.js';
 import { getRunnerFilesDir } from '../sandbox/orchestrator.js';
 import { StudioLeaseService, isLeaseStale } from '../studio-lease.service.js';
 import { ThreadKeyService } from '../thread-key/thread-key.service.js';
+import type {
+  StudioPolicy,
+  WriteIntent,
+} from '../../data/repositories/thread-key-types.repository.js';
 import { StudioOverflowService } from '../studio-overflow.service.js';
 import { StudiosRepository, type Studio } from '../../data/repositories/studios.repository.js';
 import { logger } from '../../utils/logger.js';
@@ -297,6 +301,13 @@ export interface StudioRoutingDecision {
     callerRepoRoot?: string;
     /** Set when reason is `occupied`. */
     occupied?: { studioId: string; holderThreadKey: string };
+    /**
+     * Set when the hold is the thread type's studio_policy DECIDING, not a
+     * provisioning failure. The distinction matters for recovery: a policy
+     * hold needs the holder to finish (occupied) or an explicit studio
+     * (no-route) — there is no overflow failure to go fix in the logs.
+     */
+    policy?: 'reuse-only';
   };
 }
 
@@ -345,21 +356,53 @@ export class RoutingRefusedError extends Error {
       callerRepoRoot?: string;
       reason?: 'no-route' | 'occupied';
       occupied?: { studioId: string; holderThreadKey: string };
+      /** The hold is the thread type's studio_policy deciding, not a failure. */
+      policy?: 'reuse-only';
     }
   ) {
-    super(
-      detail.reason === 'occupied'
-        ? `Refusing to route "${threadKey}" for agent "${agentId}": studio ` +
-            `${detail.occupied?.studioId ?? 'unknown'} is leased by ` +
-            `"${detail.occupied?.holderThreadKey ?? 'another thread'}" and an overflow ` +
-            `studio could not be provisioned. Message held. Retry once the holder ` +
-            `finishes, or resolve the overflow failure in the logs.`
-        : `Refusing to route "${threadKey}" for agent "${agentId}": no route pattern, ` +
-            `no project affinity, and no usable caller repo. Message held. ` +
-            `Add a route pattern to a studio, pass a studioHint, or send from a ` +
-            `session bound to the target repo.`
-    );
+    super(RoutingRefusedError.describe(threadKey, agentId, detail));
     this.name = 'RoutingRefusedError';
+  }
+
+  private static describe(
+    threadKey: string,
+    agentId: string,
+    detail: RoutingRefusedError['detail']
+  ): string {
+    if (detail.reason === 'occupied' && detail.policy === 'reuse-only') {
+      return (
+        `Refusing to route "${threadKey}" for agent "${agentId}": studio ` +
+        `${detail.occupied?.studioId ?? 'unknown'} is leased by ` +
+        `"${detail.occupied?.holderThreadKey ?? 'another thread'}" and this thread ` +
+        `type's policy is reuse-only, so no worktree is provisioned for it. ` +
+        `Message held; it re-routes when the holder finishes. Create a studio ` +
+        `explicitly if this thread needs its own.`
+      );
+    }
+    if (detail.reason === 'occupied') {
+      return (
+        `Refusing to route "${threadKey}" for agent "${agentId}": studio ` +
+        `${detail.occupied?.studioId ?? 'unknown'} is leased by ` +
+        `"${detail.occupied?.holderThreadKey ?? 'another thread'}" and an overflow ` +
+        `studio could not be provisioned. Message held. Retry once the holder ` +
+        `finishes, or resolve the overflow failure in the logs.`
+      );
+    }
+    if (detail.policy === 'reuse-only' && detail.callerRepoRoot) {
+      return (
+        `Refusing to route "${threadKey}" for agent "${agentId}": the caller repo ` +
+        `${detail.callerRepoRoot} has no studio for this agent, and this thread ` +
+        `type's policy is reuse-only, so routing will not create one automatically. ` +
+        `Message held. Create a studio for the repo explicitly, or register the ` +
+        `thread type as provision.`
+      );
+    }
+    return (
+      `Refusing to route "${threadKey}" for agent "${agentId}": no route pattern, ` +
+      `no project affinity, and no usable caller repo. Message held. ` +
+      `Add a route pattern to a studio, pass a studioHint, or send from a ` +
+      `session bound to the target repo.`
+    );
   }
 }
 
@@ -458,7 +501,13 @@ export class SessionService implements ISessionService {
   private async gateOccupancy(
     candidateStudioId: string,
     tier: StudioRoutingDecision['tier'],
-    ctx: { userId: string; agentId: string; threadKey?: string; writeIntent?: 'write' | 'presence' }
+    ctx: {
+      userId: string;
+      agentId: string;
+      threadKey?: string;
+      writeIntent?: WriteIntent;
+      studioPolicy?: StudioPolicy;
+    }
   ): Promise<StudioRoutingDecision> {
     const leases = this.getLeaseService();
     if (!leases || !ctx.threadKey) {
@@ -475,6 +524,46 @@ export class SessionService implements ISessionService {
     const holder = current?.lease;
     if (!holder || holder.threadKey === ctx.threadKey || isLeaseStale(holder)) {
       return { studioId: candidateStudioId, tier, occupancyChecked: true };
+    }
+
+    // reuse-only types (discussions: spec/thread/issue/debug/deploy) never get
+    // a worktree built for them. Occupied means HOLD — the message re-routes
+    // once the holder finishes — not "provision a fresh checkout". This is the
+    // registry's studio_policy actually being consumed: before this check,
+    // every occupied studio diverted to overflow regardless of type, which is
+    // where the worktree flood came from. An SB that genuinely needs a studio
+    // for a discussion creates one explicitly; only the automatic path is
+    // policy-gated.
+    if (ctx.studioPolicy === 'reuse-only') {
+      logger.info('[StudioResolve] Studio occupied and type is reuse-only; holding', {
+        studioId: candidateStudioId,
+        tier,
+        threadKey: ctx.threadKey,
+        holderThreadKey: holder.threadKey,
+      });
+      await leases.logEvent(ctx.userId, candidateStudioId, 'conflict', {
+        threadKey: ctx.threadKey,
+        agentId: ctx.agentId,
+        reason: `occupied by ${holder.threadKey}; type policy is reuse-only, holding instead of provisioning`,
+      });
+      return {
+        studioId: undefined,
+        tier: 'refused',
+        occupancyChecked: true,
+        diverted: {
+          from: candidateStudioId,
+          holderThreadKey: holder.threadKey,
+          holderSessionId: holder.sessionId,
+          via: 'refused',
+        },
+        refusal: {
+          reason: 'occupied',
+          threadKey: ctx.threadKey,
+          triedCallerRepo: false,
+          occupied: { studioId: candidateStudioId, holderThreadKey: holder.threadKey },
+          policy: 'reuse-only',
+        },
+      };
     }
 
     logger.info('[StudioResolve] Studio leased by another thread; diverting to overflow', {
@@ -580,7 +669,13 @@ export class SessionService implements ISessionService {
   private async withStudioLease(
     session: Session,
     routing: StudioRoutingDecision,
-    ctx: { userId: string; agentId: string; threadKey?: string; writeIntent?: 'write' | 'presence' }
+    ctx: {
+      userId: string;
+      agentId: string;
+      threadKey?: string;
+      writeIntent?: WriteIntent;
+      studioPolicy?: StudioPolicy;
+    }
   ): Promise<Session> {
     const leases = this.getLeaseService();
     if (!leases || !ctx.threadKey || !session.studioId) return session;
@@ -619,24 +714,42 @@ export class SessionService implements ISessionService {
       // holder === null means the studio could not even be verified as this
       // user's — do not write an event pairing this user with a studio they
       // may not own; the fail-closed clear below still applies.
+      // Same policy gate as gateOccupancy: reuse-only threads never get a
+      // worktree built, so provisioning is SKIPPED. But "hold" semantics
+      // require a VERIFIED holder — acquire() returns holder: null for
+      // missing/retired/foreign/unverifiable studios, and that branch clears
+      // the binding rather than holding. The two are named apart so every
+      // diagnostic below describes what actually happens next (Lumen #523
+      // r1+r2 P2).
+      const skipProvisioning = ctx.studioPolicy === 'reuse-only';
+      const policyHold = skipProvisioning && Boolean(result.holder);
       if (result.holder) {
         await leases.logEvent(ctx.userId, boundStudioId, 'conflict', {
           sessionId: session.id,
           threadKey: ctx.threadKey,
           agentId: ctx.agentId,
-          reason: `tier ${routing.tier} resolved a studio held by ${result.holder.threadKey}; diverting`,
+          reason: policyHold
+            ? `tier ${routing.tier} resolved a studio held by ${result.holder.threadKey}; type policy is reuse-only, holding instead of provisioning`
+            : `tier ${routing.tier} resolved a studio held by ${result.holder.threadKey}; diverting`,
         });
       }
-      logger.warn('[StudioLease] Studio not acquirable; diverting', {
-        sessionId: session.id,
-        studioId: boundStudioId,
-        tier: routing.tier,
-        threadKey: ctx.threadKey,
-        holderThreadKey: result.holder?.threadKey ?? null,
-        verified: Boolean(result.holder),
-      });
+      logger.warn(
+        policyHold
+          ? '[StudioLease] Studio not acquirable and type is reuse-only; holding'
+          : skipProvisioning
+            ? '[StudioLease] Studio not acquirable and unverifiable; type is reuse-only, clearing studio binding'
+            : '[StudioLease] Studio not acquirable; diverting',
+        {
+          sessionId: session.id,
+          studioId: boundStudioId,
+          tier: routing.tier,
+          threadKey: ctx.threadKey,
+          holderThreadKey: result.holder?.threadKey ?? null,
+          verified: Boolean(result.holder),
+        }
+      );
 
-      const overflow = await this.divertToOverflow(boundStudioId, ctx);
+      const overflow = skipProvisioning ? null : await this.divertToOverflow(boundStudioId, ctx);
       if (overflow) {
         const overflowAcquire = await leases.acquire({
           studioId: overflow.id,
@@ -674,7 +787,9 @@ export class SessionService implements ISessionService {
       // clear-binding path below handles it as before.
       if (result.holder) {
         logger.error(
-          '[StudioLease] Occupied and overflow unavailable — holding, never the occupied root',
+          policyHold
+            ? '[StudioLease] Occupied and type is reuse-only — holding, never the occupied root'
+            : '[StudioLease] Occupied and overflow unavailable — holding, never the occupied root',
           {
             sessionId: session.id,
             studioId: boundStudioId,
@@ -689,11 +804,14 @@ export class SessionService implements ISessionService {
             studioId: boundStudioId,
             holderThreadKey: result.holder.threadKey,
           },
+          ...(policyHold ? { policy: 'reuse-only' as const } : {}),
         });
       }
 
       logger.error(
-        '[StudioLease] Studio unverifiable and overflow unavailable; clearing studio binding',
+        skipProvisioning
+          ? '[StudioLease] Studio unverifiable; type is reuse-only (provisioning skipped), clearing studio binding'
+          : '[StudioLease] Studio unverifiable and overflow unavailable; clearing studio binding',
         {
           sessionId: session.id,
           studioId: boundStudioId,
@@ -719,18 +837,22 @@ export class SessionService implements ISessionService {
   }
 
   /**
-   * Write intent for a thread, from its STORED pinned key_type (grammar v4 —
-   * the DB pinned it at creation; consumers never re-parse) resolved through
-   * the type registry. FAILS TOWARD WRITE on every failure mode — missing
-   * thread row, lookup error, registry error — because failing toward
-   * presence would let a session mutate an unleased tree (the registry's own
-   * read-failure rule, applied at this layer too).
+   * Write intent and studio policy for a thread, from its STORED pinned
+   * key_type (grammar v4 — the DB pinned it at creation; consumers never
+   * re-parse) resolved through the type registry. Every failure mode —
+   * missing thread row, lookup error, registry error — resolves to the
+   * registry's own unknown-type default: write + reuse-only. Write, because
+   * failing toward presence would let a session mutate an unleased tree;
+   * reuse-only, because a held message is recoverable while a worktree
+   * provisioned off a failed lookup is exactly the waste this policy exists
+   * to stop.
    */
-  private async resolveWriteIntent(
+  private async resolveThreadBehavior(
     userId: string,
     threadKey: string
-  ): Promise<'write' | 'presence'> {
-    if (!this.supabase) return 'write';
+  ): Promise<{ writeIntent: WriteIntent; studioPolicy: StudioPolicy }> {
+    const fallback = { writeIntent: 'write', studioPolicy: 'reuse-only' } as const;
+    if (!this.supabase) return fallback;
     try {
       const { data, error } = await this.supabase
         .from('inbox_threads')
@@ -738,12 +860,12 @@ export class SessionService implements ISessionService {
         .eq('user_id', userId)
         .eq('thread_key', threadKey)
         .maybeSingle();
-      if (error) return 'write';
+      if (error) return fallback;
       const service = new ThreadKeyService(this.supabase);
       const behavior = await service.typeBehavior(userId, data?.key_type ?? null);
-      return behavior.writeIntent;
+      return { writeIntent: behavior.writeIntent, studioPolicy: behavior.studioPolicy };
     } catch {
-      return 'write';
+      return fallback;
     }
   }
 
@@ -1744,14 +1866,18 @@ export class SessionService implements ISessionService {
     // intent-blind gate would divert/refuse a presence thread over a lease it
     // was never going to take, provisioning overflow worktrees for work that
     // tolerates drift. One resolution feeds routing's occupancy gate and the
-    // lease gate identically.
-    const writeIntent = options?.threadKey
-      ? await this.resolveWriteIntent(userId, options.threadKey)
-      : ('write' as const);
+    // lease gate identically. studioPolicy rides the same resolution: whether
+    // routing may CREATE a worktree for this thread is decided here, once,
+    // and both overflow entry points consult it. Without a threadKey neither
+    // gate runs at all, so the values are inert.
+    const { writeIntent, studioPolicy } = options?.threadKey
+      ? await this.resolveThreadBehavior(userId, options.threadKey)
+      : ({ writeIntent: 'write', studioPolicy: 'provision' } as const);
 
     let routing = await this.resolveStudioId(userId, agentId, {
       threadKey: options?.threadKey,
       writeIntent,
+      studioPolicy,
       explicitStudioId: options?.studioId,
       studioHint: options?.studioHint,
       recipientSessionId: authorizedRecipientSessionId,
@@ -1780,7 +1906,7 @@ export class SessionService implements ISessionService {
       throw new UnresolvedStudioError(routing.unresolvedNamedStudio, agentId);
     }
 
-    const leaseCtx = { userId, agentId, threadKey: options?.threadKey, writeIntent };
+    const leaseCtx = { userId, agentId, threadKey: options?.threadKey, writeIntent, studioPolicy };
 
     // Resolve default_session_id from agent identity. When set, threadKey
     // misses route to this session instead of creating new ones.
@@ -2013,7 +2139,30 @@ export class SessionService implements ISessionService {
     // about to create a session now — every reuse rung above has missed — so
     // building the worktree here cannot be wasted by an explicit address
     // winning afterwards.
-    if (routing.deferredCreate && !resolvedStudioId) {
+    if (routing.deferredCreate && !resolvedStudioId && studioPolicy === 'reuse-only') {
+      // The third worktree-creating path, gated like the other two (Lumen
+      // #523 r1 P1): the D1 parent is durable rather than ephemeral, but it
+      // is still an AUTOMATIC worktree built for a thread whose type says
+      // reuse-only. Hold instead — an explicit create_studio remains the way
+      // a discussion gets a studio when it genuinely needs one.
+      logger.info('[StudioResolve] Caller repo has no studio and type is reuse-only; holding', {
+        threadKey: options?.threadKey,
+        agentId,
+        repoRoot: routing.deferredCreate.repoRoot,
+      });
+      routing = {
+        studioId: undefined,
+        tier: 'refused',
+        occupancyChecked: false,
+        refusal: {
+          reason: 'no-route',
+          threadKey: options?.threadKey || '',
+          triedCallerRepo: true,
+          callerRepoRoot: routing.deferredCreate.repoRoot,
+          policy: 'reuse-only',
+        },
+      };
+    } else if (routing.deferredCreate && !resolvedStudioId) {
       const createdStudioId = await this.createParentStudio(
         userId,
         agentId,
@@ -2047,6 +2196,7 @@ export class SessionService implements ISessionService {
           ? { callerRepoRoot: routing.refusal.callerRepoRoot }
           : {}),
         ...(routing.refusal.occupied ? { occupied: routing.refusal.occupied } : {}),
+        ...(routing.refusal.policy ? { policy: routing.refusal.policy } : {}),
       });
     }
 
@@ -2113,7 +2263,9 @@ export class SessionService implements ISessionService {
     options: {
       threadKey?: string;
       /** Pre-resolved BEFORE routing (r3 P0-1) — gates must never re-resolve. */
-      writeIntent?: 'write' | 'presence';
+      writeIntent?: WriteIntent;
+      /** Pre-resolved with writeIntent — may routing provision a worktree for this thread? */
+      studioPolicy?: StudioPolicy;
       explicitStudioId?: string;
       studioHint?: string;
       recipientSessionId?: string;
@@ -2141,6 +2293,7 @@ export class SessionService implements ISessionService {
       agentId,
       threadKey: options.threadKey,
       writeIntent: options.writeIntent,
+      studioPolicy: options.studioPolicy,
     };
 
     // Canonical identity resolved ONCE, up front, and preferred by EVERY tier
@@ -2612,7 +2765,13 @@ export class SessionService implements ISessionService {
     userId: string,
     agentId: string,
     repoRoot: string,
-    leaseCtx: { userId: string; agentId: string; threadKey?: string },
+    leaseCtx: {
+      userId: string;
+      agentId: string;
+      threadKey?: string;
+      writeIntent?: WriteIntent;
+      studioPolicy?: StudioPolicy;
+    },
     knownSbId?: string | null
   ): Promise<StudioRoutingDecision | null> {
     if (!this.supabase) return null;

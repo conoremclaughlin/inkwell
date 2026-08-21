@@ -151,39 +151,64 @@ describe('Phase 6b — lease gate consumes the pre-resolved intent', () => {
   });
 });
 
-describe('Phase 6b — resolveWriteIntent (the single pre-routing resolution)', () => {
+describe('Phase 6b — resolveThreadBehavior (the single pre-routing resolution)', () => {
   beforeEach(() => {
     typeBehaviorMock.mockReset();
   });
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const resolve = (service: SessionService) =>
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (service as any).resolveWriteIntent('user-1', 'spec:some-design') as Promise<string>;
+    (service as any).resolveThreadBehavior('user-1', 'spec:some-design') as Promise<{
+      writeIntent: string;
+      studioPolicy: string;
+    }>;
 
-  it('resolves presence from the STORED pinned key_type via the registry', async () => {
+  it('resolves intent AND policy from the STORED pinned key_type via the registry', async () => {
     typeBehaviorMock.mockResolvedValue({ writeIntent: 'presence', studioPolicy: 'reuse-only' });
     const { service } = serviceWith({ data: { key_type: 'spec' } });
-    await expect(resolve(service)).resolves.toBe('presence');
+    await expect(resolve(service)).resolves.toEqual({
+      writeIntent: 'presence',
+      studioPolicy: 'reuse-only',
+    });
     expect(typeBehaviorMock).toHaveBeenCalledWith('user-1', 'spec');
   });
 
-  it('an untyped thread FAILS TOWARD WRITE', async () => {
+  it('a provision type carries its policy through', async () => {
+    typeBehaviorMock.mockResolvedValue({ writeIntent: 'write', studioPolicy: 'provision' });
+    const { service } = serviceWith({ data: { key_type: 'pr' } });
+    await expect(resolve(service)).resolves.toEqual({
+      writeIntent: 'write',
+      studioPolicy: 'provision',
+    });
+  });
+
+  it('an untyped thread resolves through the registry default (write + reuse-only)', async () => {
     typeBehaviorMock.mockResolvedValue({ writeIntent: 'write', studioPolicy: 'reuse-only' });
     const { service } = serviceWith({ data: { key_type: null } });
-    await expect(resolve(service)).resolves.toBe('write');
+    await expect(resolve(service)).resolves.toEqual({
+      writeIntent: 'write',
+      studioPolicy: 'reuse-only',
+    });
     expect(typeBehaviorMock).toHaveBeenCalledWith('user-1', null);
   });
 
-  it('a thread-row lookup ERROR fails toward write', async () => {
+  it('a thread-row lookup ERROR fails toward write + reuse-only', async () => {
+    // Write: failing toward presence would mutate an unleased tree.
+    // Reuse-only: a worktree built off a failed lookup is pure waste.
     const { service } = serviceWith({ error: { message: 'db down' } });
-    await expect(resolve(service)).resolves.toBe('write');
+    await expect(resolve(service)).resolves.toEqual({
+      writeIntent: 'write',
+      studioPolicy: 'reuse-only',
+    });
   });
 
-  it('a registry THROW fails toward write', async () => {
+  it('a registry THROW fails toward write + reuse-only', async () => {
     typeBehaviorMock.mockRejectedValue(new Error('registry down'));
     const { service } = serviceWith({ data: { key_type: 'spec' } });
-    await expect(resolve(service)).resolves.toBe('write');
+    await expect(resolve(service)).resolves.toEqual({
+      writeIntent: 'write',
+      studioPolicy: 'reuse-only',
+    });
   });
 });
 
