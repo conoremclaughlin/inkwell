@@ -25,6 +25,19 @@ export interface PcpTokenPayload {
   agentId?: string; // Bound agent identity label (absent for human users)
   identityId?: string; // Canonical agent_identities UUID (JWT claim — kept as identityId for token compat)
   sbId?: string; // New-style alias for identityId in runner tokens
+  /**
+   * Session and contact this runner token was minted FOR.
+   *
+   * These are the authenticated binding between a runner process and the
+   * conversation it serves. The `x-ink-context` header carries the same two
+   * values, but it is unsigned base64url JSON the caller composes, so it can
+   * only ever be a routing hint. One SB identity serves many contacts, which
+   * means without a signed claim there is no authenticated per-contact
+   * distinction at all — naming another contact's session would pass an
+   * identity check that only compares sbId (Lumen, PR #501 round 3).
+   */
+  sessionId?: string;
+  contactId?: string;
 }
 
 // ============================================================================

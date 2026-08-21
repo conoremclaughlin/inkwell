@@ -14,6 +14,7 @@ import {
   handleStartSession,
   handleGetSession,
   handleCompactSession,
+  handleEndSession,
   curateRecallSchema,
   handleCurateRecall,
   mapSessionForBootstrap,
@@ -166,6 +167,24 @@ function callerIsAgent(
   } as never);
 }
 
+/**
+ * A runner token the server minted FOR a specific session and contact — the
+ * signed binding. `headerSessionId` models what the caller puts in the
+ * unsigned x-ink-context header, which may disagree with the claim.
+ */
+function callerIsRunner(
+  agentId: string,
+  sbId: string,
+  binding: { sessionId?: string; contactId?: string },
+  headerSessionId?: string
+): void {
+  callerIsAgent(agentId, sbId, {
+    ...(binding.sessionId ? { tokenSessionId: binding.sessionId } : {}),
+    ...(binding.contactId ? { tokenContactId: binding.contactId } : {}),
+    ...(headerSessionId ? { sessionId: headerSessionId } : {}),
+  });
+}
+
 /** A stdio caller: no request context, identity from the bootstrap pin. */
 function callerIsStdioAgent(agentId: string, sbId?: string): void {
   vi.mocked(getRequestContext).mockReturnValue(undefined);
@@ -187,6 +206,27 @@ function callerIsUserToken(ctxExtra: Record<string, unknown> = {}): void {
     timestamp: new Date(),
     ...ctxExtra,
   } as never);
+}
+
+/**
+ * A permissive chainable stand-in for the Supabase client. end_session's
+ * success path releases the studio lease and clears channel_routes, neither of
+ * which this suite is testing — it only needs them not to throw.
+ */
+function chainableClient(): never {
+  const make = (): never =>
+    new Proxy(function () {} as never, {
+      get: (_t, prop) =>
+        // Terminating a PostgREST chain resolves to { data, error }; the
+        // handler calls .then() on it directly, so this has to be a real
+        // function rather than another link in the chain.
+        prop === 'then'
+          ? (resolve: (v: unknown) => unknown) =>
+              Promise.resolve(resolve({ data: null, error: null }))
+          : make(),
+      apply: () => make(),
+    }) as never;
+  return make();
 }
 
 /** No identity at all. */
@@ -1687,55 +1727,24 @@ describe('session authorization boundary', () => {
   // separate two conversations. The caller's contact scope comes from its
   // ambient session, because the HTTP path never populates ctx.contactId.
   // ---------------------------------------------------
+  // ---------------------------------------------------
+  // Gap 3: per-contact isolation, bound to the SIGNED claim
+  //
+  // Round three killed the previous mechanism. Deriving the caller's contact
+  // scope from the ambient session named by x-ink-context was not an
+  // authentication boundary: the header is unsigned, and a runner serving
+  // contact A can name contact B's session under the SAME sbId, so the
+  // identity check passes and the caller inherits B's scope.
+  // ---------------------------------------------------
   describe('preserves per-contact session isolation', () => {
     const contactA = { ...myraSession, id: 'session-contact-a', contactId: 'contact-a' };
     const contactB = { ...myraSession, id: 'session-contact-b', contactId: 'contact-b' };
 
-    /** Myra serving contact A: her ambient session carries the contact scope. */
-    function servingContactA() {
-      callerIsAgent('myra', 'sb-myra', { sessionId: 'session-contact-a' });
-      mockDataComposer.repositories.memory.getSession.mockImplementation(async (id: string) =>
-        id === 'session-contact-a' ? contactA : contactB
-      );
-    }
-
-    it('denies update_session_state across contacts under one identity', async () => {
-      servingContactA();
-
-      denied(
-        await handleUpdateSessionState(
-          { email: 'test@test.com', sessionId: TARGET_UUID, context: 'into contact B' },
-          mockDataComposer as never
-        )
-      );
-      expect(mockDataComposer.repositories.memory.updateSession).not.toHaveBeenCalled();
-    });
-
-    it('denies reading another contact`s logs', async () => {
-      servingContactA();
-
-      const result = await handleGetSession(
-        { email: 'test@test.com', sessionId: TARGET_UUID, includeLogs: true },
-        mockDataComposer as never
-      );
-
-      denied(result);
-      expect(mockDataComposer.repositories.memory.getSessionLogs).not.toHaveBeenCalled();
-    });
-
-    it('denies compacting another contact`s session', async () => {
-      servingContactA();
-
-      denied(
-        await handleCompactSession(
-          { email: 'test@test.com', sessionId: TARGET_UUID },
-          mockDataComposer as never
-        )
-      );
-    });
-
-    it('allows the caller its own contact session', async () => {
-      callerIsAgent('myra', 'sb-myra', { sessionId: 'session-contact-a' });
+    it('allows a runner its own contact session', async () => {
+      callerIsRunner('myra', 'sb-myra', {
+        sessionId: 'session-contact-a',
+        contactId: 'contact-a',
+      });
       mockDataComposer.repositories.memory.getSession.mockResolvedValue(contactA);
       mockDataComposer.repositories.memory.updateSession.mockResolvedValue(contactA);
 
@@ -1747,22 +1756,128 @@ describe('session authorization boundary', () => {
       expect(JSON.parse(result.content[0].text).success).toBe(true);
     });
 
-    it('denies an owner-scoped caller reaching a contact session', async () => {
-      // Symmetric on purpose: findOwnedActiveSessions already treats owner and
-      // contact sessions as disjoint sets rather than a hierarchy.
-      callerIsAgent('myra', 'sb-myra');
-      mockDataComposer.repositories.memory.getSession.mockResolvedValue(contactA);
+    it('denies a runner another contact under the SAME identity', async () => {
+      // The attack the previous mechanism allowed. Same sbId on both sides, so
+      // the identity check cannot separate them — only the signed claim can.
+      callerIsRunner('myra', 'sb-myra', {
+        sessionId: 'session-contact-a',
+        contactId: 'contact-a',
+      });
+      mockDataComposer.repositories.memory.getSession.mockResolvedValue(contactB);
 
       denied(
         await handleUpdateSessionState(
-          { email: 'test@test.com', sessionId: TARGET_UUID, context: 'owner into contact' },
+          { email: 'test@test.com', sessionId: TARGET_UUID, context: 'into contact B' },
+          mockDataComposer as never
+        )
+      );
+      expect(mockDataComposer.repositories.memory.updateSession).not.toHaveBeenCalled();
+    });
+
+    it('ignores a forged x-ink-context naming the other contact', async () => {
+      // Signed for contact A; header claims B's session. The header must not
+      // move the scope — under the old ambient-derivation it did, because B's
+      // session passes the sbId check.
+      callerIsRunner(
+        'myra',
+        'sb-myra',
+        { sessionId: 'session-contact-a', contactId: 'contact-a' },
+        'session-contact-b'
+      );
+      // Explicit target is B, and the forged header also names B — so if the
+      // header could move the scope, this would succeed.
+      mockDataComposer.repositories.memory.getSession.mockImplementation(async (id: string) =>
+        id === 'session-contact-a' ? contactA : contactB
+      );
+
+      denied(
+        await handleUpdateSessionState(
+          { email: 'test@test.com', sessionId: TARGET_UUID, context: 'forged header' },
+          mockDataComposer as never
+        )
+      );
+      expect(mockDataComposer.repositories.memory.updateSession).not.toHaveBeenCalled();
+    });
+
+    it('denies reading another contact`s logs under the same identity', async () => {
+      callerIsRunner('myra', 'sb-myra', {
+        sessionId: 'session-contact-a',
+        contactId: 'contact-a',
+      });
+      mockDataComposer.repositories.memory.getSession.mockResolvedValue(contactB);
+
+      denied(
+        await handleGetSession(
+          { email: 'test@test.com', sessionId: TARGET_UUID, includeLogs: true },
+          mockDataComposer as never
+        )
+      );
+      expect(mockDataComposer.repositories.memory.getSessionLogs).not.toHaveBeenCalled();
+    });
+
+    it('denies compacting another contact`s session under the same identity', async () => {
+      callerIsRunner('myra', 'sb-myra', {
+        sessionId: 'session-contact-a',
+        contactId: 'contact-a',
+      });
+      mockDataComposer.repositories.memory.getSession.mockResolvedValue(contactB);
+
+      denied(
+        await handleCompactSession(
+          { email: 'test@test.com', sessionId: TARGET_UUID },
           mockDataComposer as never
         )
       );
     });
 
-    it('scopes the implicit lookup to the caller`s contact', async () => {
-      callerIsAgent('myra', 'sb-myra', { sessionId: 'session-contact-a' });
+    it('denies ending another contact`s session under the same identity', async () => {
+      callerIsRunner('myra', 'sb-myra', {
+        sessionId: 'session-contact-a',
+        contactId: 'contact-a',
+      });
+      mockDataComposer.repositories.memory.getSession.mockResolvedValue(contactB);
+
+      denied(
+        await handleEndSession(
+          { email: 'test@test.com', sessionId: TARGET_UUID },
+          mockDataComposer as never
+        )
+      );
+      expect(mockDataComposer.repositories.memory.endSession).not.toHaveBeenCalled();
+    });
+
+    it('denies an agent with no signed contact claim every contact session', async () => {
+      // Fail closed, matching resolveObservePermission's contact_isolated stance:
+      // without a claim there is no authenticated per-contact distinction.
+      callerIsAgent('myra', 'sb-myra');
+      mockDataComposer.repositories.memory.getSession.mockResolvedValue(contactA);
+
+      denied(
+        await handleUpdateSessionState(
+          { email: 'test@test.com', sessionId: TARGET_UUID, context: 'unclaimed' },
+          mockDataComposer as never
+        )
+      );
+    });
+
+    it('denies a contact-scoped runner an owner session', async () => {
+      // Symmetric, mirroring findOwnedActiveSessions' disjoint sets.
+      callerIsRunner('myra', 'sb-myra', { contactId: 'contact-a' });
+      mockDataComposer.repositories.memory.getSession.mockResolvedValue(myraSession);
+
+      denied(
+        await handleUpdateSessionState(
+          { email: 'test@test.com', sessionId: TARGET_UUID, context: 'contact into owner' },
+          mockDataComposer as never
+        )
+      );
+    });
+
+    it('scopes the implicit lookup to the signed session', async () => {
+      callerIsRunner('myra', 'sb-myra', {
+        sessionId: 'session-contact-a',
+        contactId: 'contact-a',
+      });
       mockDataComposer.repositories.memory.getSession.mockResolvedValue(contactA);
       mockDataComposer.repositories.memory.updateSession.mockResolvedValue(contactA);
 
@@ -1771,28 +1886,113 @@ describe('session authorization boundary', () => {
         mockDataComposer as never
       );
 
-      // Resolved via the ambient session, so no unscoped recency query ran.
       expect(mockDataComposer.repositories.memory.updateSession).toHaveBeenCalledWith(
         'session-contact-a',
         expect.objectContaining({ context: 'implicit within contact A' })
       );
     });
 
-    it('does not let an unowned ambient session set the contact scope', async () => {
-      // A caller-composed x-ink-context naming someone else's contact session
-      // must not become the caller's scope.
-      callerIsAgent('myra', 'sb-myra', { sessionId: 'session-lumen' });
+    it('resolves implicitly to the SIGNED session, not the header one', async () => {
+      callerIsRunner(
+        'myra',
+        'sb-myra',
+        { sessionId: 'session-contact-a', contactId: 'contact-a' },
+        'session-contact-b'
+      );
       mockDataComposer.repositories.memory.getSession.mockImplementation(async (id: string) =>
-        id === 'session-lumen' ? { ...lumenSession, contactId: 'contact-b' } : contactB
+        id === 'session-contact-b' ? contactB : contactA
+      );
+      mockDataComposer.repositories.memory.updateSession.mockResolvedValue(contactA);
+
+      await handleUpdateSessionState(
+        { email: 'test@test.com', context: 'signed wins' },
+        mockDataComposer as never
       );
 
+      expect(mockDataComposer.repositories.memory.updateSession).toHaveBeenCalledWith(
+        'session-contact-a',
+        expect.anything()
+      );
+    });
+  });
+
+  // ---------------------------------------------------
+  // end_session had NO boundary at all: an explicit UUID went straight to
+  // endSession(), and the implicit branch used the old slug+recency lookup.
+  // ---------------------------------------------------
+  describe('end_session is authorized like the others', () => {
+    beforeEach(() => {
+      // The handler chains .catch() onto the cli_attached clear.
+      mockDataComposer.repositories.memory.updateSession.mockResolvedValue(myraSession);
+      mockDataComposer.getClient.mockReturnValue(chainableClient());
+    });
+
+    it('denies ending a peer session', async () => {
+      mockDataComposer.repositories.memory.getSession.mockResolvedValue(lumenSession);
+
       denied(
-        await handleUpdateSessionState(
-          { email: 'test@test.com', sessionId: TARGET_UUID, context: 'borrowed scope' },
+        await handleEndSession(
+          { email: 'test@test.com', sessionId: TARGET_UUID },
           mockDataComposer as never
         )
       );
-      expect(mockDataComposer.repositories.memory.updateSession).not.toHaveBeenCalled();
+      expect(mockDataComposer.repositories.memory.endSession).not.toHaveBeenCalled();
+    });
+
+    it('denies ending another user`s session', async () => {
+      mockDataComposer.repositories.memory.getSession.mockResolvedValue({
+        ...myraSession,
+        userId: 'someone-else',
+      });
+
+      denied(
+        await handleEndSession(
+          { email: 'test@test.com', sessionId: TARGET_UUID },
+          mockDataComposer as never
+        )
+      );
+      expect(mockDataComposer.repositories.memory.endSession).not.toHaveBeenCalled();
+    });
+
+    it('allows ending the caller`s own session', async () => {
+      mockDataComposer.repositories.memory.getSession.mockResolvedValue(myraSession);
+      mockDataComposer.repositories.memory.endSession.mockResolvedValue(myraSession);
+
+      const result = await handleEndSession(
+        { email: 'test@test.com', sessionId: TARGET_UUID },
+        mockDataComposer as never
+      );
+
+      expect(JSON.parse(result.content[0].text).success).toBe(true);
+      // The authorized target is ended by the id the caller named.
+      expect(mockDataComposer.repositories.memory.endSession).toHaveBeenCalledWith(
+        TARGET_UUID,
+        undefined
+      );
+    });
+
+    it('uses the canonical resolver, not the old recency lookup', async () => {
+      mockDataComposer.repositories.memory.findOwnedActiveSessions.mockResolvedValue([myraSession]);
+      mockDataComposer.repositories.memory.endSession.mockResolvedValue(myraSession);
+
+      await handleEndSession({ email: 'test@test.com' }, mockDataComposer as never);
+
+      expect(mockDataComposer.repositories.memory.getActiveSession).not.toHaveBeenCalled();
+      expect(mockDataComposer.repositories.memory.findOwnedActiveSessions).toHaveBeenCalledWith(
+        expect.objectContaining({ sbId: 'sb-myra' })
+      );
+    });
+
+    it('refuses to guess when the identity has sessions in several studios', async () => {
+      mockDataComposer.repositories.memory.findOwnedActiveSessions.mockResolvedValue([
+        { ...myraSession, id: 'a', studioId: 'studio-a' },
+        { ...myraSession, id: 'b', studioId: 'studio-b' },
+      ]);
+
+      const result = await handleEndSession({ email: 'test@test.com' }, mockDataComposer as never);
+
+      expect(JSON.parse(result.content[0].text).success).toBe(false);
+      expect(mockDataComposer.repositories.memory.endSession).not.toHaveBeenCalled();
     });
   });
 
@@ -2003,7 +2203,8 @@ describe('handleStartSession - threadKey matching', () => {
       'lumen',
       'pr:32',
       undefined,
-      undefined // contactId
+      undefined, // contactId
+      undefined // sbId — canonical owner when the caller has one
     );
     // Should NOT have fallen through to studioId lookup
     expect(mockDataComposer.repositories.memory.getActiveSession).not.toHaveBeenCalled();
@@ -2070,7 +2271,8 @@ describe('handleStartSession - threadKey matching', () => {
       'lumen',
       'pr:32',
       studioId,
-      undefined // contactId
+      undefined, // contactId
+      undefined // sbId
     );
   });
 
@@ -2178,6 +2380,170 @@ describe('handleStartSession - threadKey matching', () => {
   });
 });
 
+// =====================================================
+// start_session authorization (PR #501 round 3)
+// =====================================================
+
+describe('handleStartSession - identity and contact scope', () => {
+  let mockDataComposer: ReturnType<typeof createMockDataComposer>;
+
+  const newSession = {
+    id: 'session-new',
+    userId: 'user-123',
+    agentId: 'myra',
+    sbId: 'sb-myra',
+    studioId: undefined,
+    startedAt: new Date('2026-08-20T10:00:00Z'),
+    metadata: {},
+  };
+
+  // contactId is schema-validated as a UUID.
+  const CONTACT_A = '11111111-1111-4111-8111-111111111111';
+  const CONTACT_B = '22222222-2222-4222-8222-222222222222';
+
+  beforeEach(() => {
+    mockDataComposer = createMockDataComposer();
+    vi.clearAllMocks();
+    callerIsAgent('myra', 'sb-myra');
+    mockDataComposer.repositories.memory.getActiveSessionByThreadKey.mockResolvedValue(null);
+    mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue(null);
+    mockDataComposer.repositories.memory.startSession.mockResolvedValue(newSession);
+  });
+
+  // ---- Reuse must be canonical, not slug-only -------------------------
+  it('scopes the threadKey reuse lookup by the canonical owner', async () => {
+    await handleStartSession(
+      { email: 'test@test.com', agentId: 'myra', threadKey: 'pr:501' },
+      mockDataComposer as never
+    );
+
+    expect(mockDataComposer.repositories.memory.getActiveSessionByThreadKey).toHaveBeenCalledWith(
+      'user-123',
+      'myra',
+      'pr:501',
+      undefined,
+      undefined,
+      'sb-myra'
+    );
+  });
+
+  it('scopes the studio reuse lookup by the canonical owner', async () => {
+    await handleStartSession(
+      { email: 'test@test.com', agentId: 'myra' },
+      mockDataComposer as never
+    );
+
+    expect(mockDataComposer.repositories.memory.getActiveSession).toHaveBeenCalledWith(
+      'user-123',
+      'myra',
+      undefined,
+      undefined,
+      'sb-myra'
+    );
+  });
+
+  it('refuses to hand back a same-slug session from another workspace', async () => {
+    // The canonical creator used to be computed only at insert time, so reuse
+    // matched on the slug and could return another workspace's session —
+    // including its backendSessionId, which resumes that conversation.
+    mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue({
+      ...newSession,
+      id: 'session-other-workspace',
+      sbId: 'sb-myra-workspace-b',
+      backendSessionId: 'backend-secret',
+    });
+
+    const result = await handleStartSession(
+      { email: 'test@test.com', agentId: 'myra' },
+      mockDataComposer as never
+    );
+
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.session.isExisting).toBeUndefined();
+    expect(JSON.stringify(parsed)).not.toContain('backend-secret');
+    expect(JSON.stringify(parsed)).not.toContain('session-other-workspace');
+    expect(mockDataComposer.repositories.memory.startSession).toHaveBeenCalled();
+  });
+
+  it('stamps the new row with the verified canonical identity', async () => {
+    await handleStartSession(
+      { email: 'test@test.com', agentId: 'myra' },
+      mockDataComposer as never
+    );
+
+    expect(mockDataComposer.repositories.memory.startSession).toHaveBeenCalledWith(
+      expect.objectContaining({ sbId: 'sb-myra' })
+    );
+  });
+
+  // ---- Contact scope is identity, not a parameter ---------------------
+  it('refuses an agent-bound caller a contactId it was not issued for', async () => {
+    callerIsRunner('myra', 'sb-myra', { contactId: CONTACT_A });
+
+    const result = await handleStartSession(
+      { email: 'test@test.com', agentId: 'myra', contactId: CONTACT_B },
+      mockDataComposer as never
+    );
+
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toMatch(/contact scope/i);
+    expect(mockDataComposer.repositories.memory.startSession).not.toHaveBeenCalled();
+  });
+
+  it('refuses an agent-bound caller any contactId when it holds no claim', async () => {
+    callerIsAgent('myra', 'sb-myra'); // no signed contact binding
+
+    const result = await handleStartSession(
+      { email: 'test@test.com', agentId: 'myra', contactId: CONTACT_A },
+      mockDataComposer as never
+    );
+
+    expect(JSON.parse(result.content[0].text).success).toBe(false);
+    expect(mockDataComposer.repositories.memory.startSession).not.toHaveBeenCalled();
+  });
+
+  it('accepts the contactId the runner was issued for', async () => {
+    callerIsRunner('myra', 'sb-myra', { contactId: CONTACT_A });
+
+    await handleStartSession(
+      { email: 'test@test.com', agentId: 'myra', contactId: CONTACT_A },
+      mockDataComposer as never
+    );
+
+    expect(mockDataComposer.repositories.memory.startSession).toHaveBeenCalledWith(
+      expect.objectContaining({ contactId: CONTACT_A })
+    );
+  });
+
+  it('applies the signed contact scope even when the caller omits it', async () => {
+    callerIsRunner('myra', 'sb-myra', { contactId: CONTACT_A });
+
+    await handleStartSession(
+      { email: 'test@test.com', agentId: 'myra' },
+      mockDataComposer as never
+    );
+
+    expect(mockDataComposer.repositories.memory.startSession).toHaveBeenCalledWith(
+      expect.objectContaining({ contactId: CONTACT_A })
+    );
+  });
+
+  it('still lets a user token open a session in a contact scope', async () => {
+    // Channel plumbing driven by a human/admin token keeps working.
+    callerIsUserToken();
+
+    await handleStartSession(
+      { email: 'test@test.com', agentId: 'myra', contactId: CONTACT_A },
+      mockDataComposer as never
+    );
+
+    expect(mockDataComposer.repositories.memory.startSession).toHaveBeenCalledWith(
+      expect.objectContaining({ contactId: CONTACT_A })
+    );
+  });
+});
+
 describe('handleStartSession - studioId="main" scope resolution', () => {
   // Regression: before resolveStudioScope, studioId="main" collapsed to undefined,
   // dropping the filter entirely. A main-repo attach could reattach to any
@@ -2215,7 +2581,8 @@ describe('handleStartSession - studioId="main" scope resolution', () => {
       'user-123',
       'wren',
       null,
-      undefined // contactId
+      undefined, // contactId
+      undefined // sbId
     );
   });
 

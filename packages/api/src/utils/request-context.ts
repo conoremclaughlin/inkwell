@@ -43,6 +43,14 @@ export interface RequestContextData {
   tokenAgentId?: string;
   tokenSbId?: string;
   /**
+   * Session and contact the bearer token was MINTED for — signed, therefore
+   * authenticated. `sessionId`/`contactId` above come from the unsigned
+   * x-ink-context header and are routing hints only; authorization must use
+   * these.
+   */
+  tokenSessionId?: string;
+  tokenContactId?: string;
+  /**
    * True when the bearer token itself was agent-bound. Distinct from
    * `callerProfile`, which defaults to 'agent' for every HTTP request and
    * therefore says nothing about how the caller authenticated.

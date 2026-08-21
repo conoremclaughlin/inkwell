@@ -998,7 +998,9 @@ export class SessionService implements ISessionService {
       userId,
       agentId,
       injectedContext.user.email,
-      session.sbId
+      session.sbId,
+      session.id,
+      session.contactId
     );
 
     // 4. Select runtime backend and model
@@ -1491,7 +1493,15 @@ export class SessionService implements ISessionService {
     userId: string,
     agentId: string,
     email?: string,
-    sbId?: string
+    sbId?: string,
+    /**
+     * The session this runner is being spawned for, and the contact it serves.
+     * Signed into the token so the runner's authorization is bound to the
+     * conversation the server put it in, rather than to whatever the process
+     * later claims in an unsigned header.
+     */
+    sessionId?: string,
+    contactId?: string
   ): string | undefined {
     if (!email) {
       logger.warn('Cannot inject PCP access token for backend runner: missing user email', {
@@ -1518,6 +1528,8 @@ export class SessionService implements ISessionService {
         scope: 'mcp:tools',
         ...(agentId ? { agentId } : {}),
         ...(sbId ? { sbId } : {}),
+        ...(sessionId ? { sessionId } : {}),
+        ...(contactId ? { contactId } : {}),
       },
       jwtSecret,
       { expiresIn: 60 * 60 }
@@ -2907,7 +2919,9 @@ This session will continue with a fresh context after compaction. Your identity,
         session.userId,
         session.agentId,
         fullContext.user.email,
-        session.sbId
+        session.sbId,
+        session.id,
+        session.contactId
       );
 
       const runtimeBackend = this.resolveRuntimeBackend(session.backend, context.agent.backend);

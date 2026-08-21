@@ -394,9 +394,15 @@ export class PcpAuthProvider {
   // Token verification (for /mcp endpoint auth)
   // --------------------------------------------------------------------------
 
-  verifyAccessToken(
-    authHeader: string | undefined
-  ): { userId: string; email: string; agentId?: string; sbId?: string } | null {
+  verifyAccessToken(authHeader: string | undefined): {
+    userId: string;
+    email: string;
+    agentId?: string;
+    sbId?: string;
+    /** Signed runner binding — authenticated, unlike the x-ink-context header. */
+    sessionId?: string;
+    contactId?: string;
+  } | null {
     if (!authHeader?.startsWith('Bearer ')) return null;
     const token = authHeader.substring(7);
 
@@ -412,6 +418,8 @@ export class PcpAuthProvider {
         : payload.identityId
           ? { sbId: payload.identityId }
           : {}),
+      ...(payload.sessionId ? { sessionId: payload.sessionId } : {}),
+      ...(payload.contactId ? { contactId: payload.contactId } : {}),
     };
   }
 

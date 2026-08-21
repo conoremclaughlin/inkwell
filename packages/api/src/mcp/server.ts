@@ -502,6 +502,8 @@ export class MCPServer {
           agentTokenBound: true,
           ...(userData.agentId ? { tokenAgentId: userData.agentId } : {}),
           ...(userData.sbId ? { tokenSbId: userData.sbId } : {}),
+          ...(userData.sessionId ? { tokenSessionId: userData.sessionId } : {}),
+          ...(userData.contactId ? { tokenContactId: userData.contactId } : {}),
         });
       }
 
