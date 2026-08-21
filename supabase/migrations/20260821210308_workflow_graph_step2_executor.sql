@@ -1182,11 +1182,143 @@ BEGIN
     v_reset := v_reset || to_jsonb(v_gate.id);
   END LOOP;
 
-  v_eval := _graph_evaluate_group(p_user_id, p_task_group_id);
+  -- A PAUSED group accepts authoring, but pause means FROZEN for
+  -- execution: evaluating here would open gates (starting their
+  -- actionable clocks) and emit ready work no session may claim
+  -- (claim_graph_task refuses non-active groups) — Lumen round 4 P1.
+  -- Evaluation and dispatch are deferred to resume: start_graph_execution
+  -- sweeps the group the moment it is active again.
+  IF v_group.status = 'active' THEN
+    v_eval := _graph_evaluate_group(p_user_id, p_task_group_id);
+  END IF;
 
   RETURN jsonb_build_object('success', true, 'graphVersion', v_new_version,
     'added', v_added, 'removed', v_removed, 'resetGates', v_reset,
-    'evaluation', v_eval);
+    'evaluation', v_eval, 'evaluationDeferred', v_group.status <> 'active');
+END;
+$$;
+
+-- ── convert_task_group_to_graph, amended (round 4): marks itself ───────
+--
+-- Redefines the step-1 function verbatim plus one line: the conversion
+-- transaction sets the executor GUC, because the model fence below makes
+-- execution_model conversion-owned and would otherwise refuse the flip
+-- this function exists to perform.
+
+CREATE OR REPLACE FUNCTION public.convert_task_group_to_graph(
+  p_user_id uuid,
+  p_task_group_id uuid,
+  p_expected_version bigint,
+  p_actor_identity_id uuid DEFAULT NULL,
+  p_actor_user_id uuid DEFAULT NULL,
+  p_system_actor boolean DEFAULT false
+) RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_group record;
+  v_report jsonb;
+  v_has_cycle boolean;
+  v_edge_count int;
+  v_added jsonb;
+  v_new_version bigint;
+BEGIN
+  -- Conversion IS the one legitimate execution_model writer — mark the
+  -- transaction so the model fence admits the flip (Lumen round 4 P1).
+  PERFORM set_config('app.graph_executor', 'on', true);
+  IF num_nonnulls(p_actor_identity_id, p_actor_user_id) + p_system_actor::int <> 1 THEN
+    RETURN jsonb_build_object('success', false, 'reason', 'exactly-one-actor');
+  END IF;
+
+  SELECT graph_version, execution_model, execution_phase INTO v_group
+  FROM task_groups
+  WHERE id = p_task_group_id AND user_id = p_user_id
+  FOR UPDATE;
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'reason', 'group-not-found');
+  END IF;
+  IF v_group.execution_model = 'graph' THEN
+    RETURN jsonb_build_object('success', false, 'reason', 'already-graph');
+  END IF;
+  IF v_group.graph_version <> p_expected_version THEN
+    RETURN jsonb_build_object('success', false, 'reason', 'version-conflict',
+      'currentVersion', v_group.graph_version);
+  END IF;
+  IF v_group.execution_phase NOT IN ('idle', 'paused') THEN
+    RETURN jsonb_build_object('success', false, 'reason', 'execution-started',
+      'executionPhase', v_group.execution_phase);
+  END IF;
+
+  DROP TABLE IF EXISTS _candidate_edges;
+  CREATE TEMP TABLE _candidate_edges ON COMMIT DROP AS
+    SELECT DISTINCT b.blocker AS from_task, t.id AS to_task
+    FROM tasks t
+    CROSS JOIN LATERAL unnest(coalesce(t.blocked_by, '{}'::uuid[])) AS b(blocker)
+    WHERE t.task_group_id = p_task_group_id AND t.user_id = p_user_id;
+
+  SELECT jsonb_agg(jsonb_build_object('from', c.from_task, 'to', c.to_task,
+           'problem',
+           CASE
+             WHEN c.from_task = c.to_task THEN 'self'
+             WHEN f.id IS NULL THEN 'dangling'
+             WHEN f.user_id <> p_user_id THEN 'cross-user'
+             ELSE 'cross-group'
+           END))
+  INTO v_report
+  FROM _candidate_edges c
+  LEFT JOIN tasks f ON f.id = c.from_task
+  WHERE c.from_task = c.to_task
+     OR f.id IS NULL
+     OR f.user_id <> p_user_id
+     OR f.task_group_id IS DISTINCT FROM p_task_group_id;
+  IF v_report IS NOT NULL THEN
+    RETURN jsonb_build_object('success', false, 'reason', 'preflight-failed',
+      'invalid', v_report);
+  END IF;
+
+  -- Deduplicating reachability (see apply_task_graph): V²-bounded, never
+  -- path enumeration under the group lock.
+  WITH RECURSIVE reach(origin, node) AS (
+    SELECT c.from_task, c.to_task FROM _candidate_edges c
+    UNION
+    SELECT r.origin, c.to_task
+    FROM reach r JOIN _candidate_edges c ON c.from_task = r.node
+  )
+  SELECT EXISTS (SELECT 1 FROM reach WHERE origin = node) INTO v_has_cycle;
+  IF v_has_cycle THEN
+    RETURN jsonb_build_object('success', false, 'reason', 'preflight-failed',
+      'invalid', jsonb_build_array(jsonb_build_object('problem', 'cycle')));
+  END IF;
+
+  INSERT INTO task_edges (from_task, to_task)
+  SELECT c.from_task, c.to_task FROM _candidate_edges c;
+  GET DIAGNOSTICS v_edge_count = ROW_COUNT;
+
+  SELECT coalesce(jsonb_agg(jsonb_build_object('from', c.from_task, 'to', c.to_task)), '[]'::jsonb)
+  INTO v_added FROM _candidate_edges c;
+
+  v_new_version := v_group.graph_version + 1;
+  INSERT INTO task_graph_revisions (
+    user_id, task_group_id, graph_version,
+    actor_identity_id, actor_user_id, system_actor,
+    constructor, constructor_version, diff
+  ) VALUES (
+    p_user_id, p_task_group_id, v_new_version,
+    p_actor_identity_id, p_actor_user_id, p_system_actor,
+    'linear-conversion', '1',
+    jsonb_build_object('edgesAdded', v_added, 'convertedFrom', 'blocked_by')
+  );
+
+  -- The flip is LAST, visible only at commit. blocked_by is left intact as
+  -- the historical array; it is no longer written or read for graph groups.
+  UPDATE task_groups
+  SET graph_version = v_new_version, execution_model = 'graph'
+  WHERE id = p_task_group_id;
+
+  RETURN jsonb_build_object('success', true, 'graphVersion', v_new_version,
+    'edgeCount', v_edge_count);
 END;
 $$;
 
@@ -1207,10 +1339,24 @@ SECURITY DEFINER
 SET search_path = public
 AS $$
 BEGIN
+  -- execution_model is CONVERSION-owned (Lumen round 4 P1): a direct
+  -- linear → graph flip bypasses preflight, revisioning, and blocked_by
+  -- validation (yielding a version-0 zero-edge graph where everything is
+  -- READY); graph → linear detaches the executor while leaving edges
+  -- behind. Only the conversion RPC (executor GUC) may change it.
+  IF NEW.execution_model IS DISTINCT FROM OLD.execution_model
+     AND current_setting('app.graph_executor', true) IS DISTINCT FROM 'on' THEN
+    RAISE EXCEPTION
+      'execution_model is conversion-owned — use convert_task_group_to_graph';
+  END IF;
   IF NEW.status IS NOT DISTINCT FROM OLD.status THEN
     RETURN NEW;
   END IF;
-  IF NEW.execution_model <> 'graph' THEN
+  -- OLD model, deliberately: a one-write {execution_model:'linear',
+  -- status:'active'} on a cancelled GRAPH group must not slip past
+  -- terminal finality by changing its clothes in the same statement
+  -- (Lumen round 4 P1).
+  IF OLD.execution_model <> 'graph' THEN
     RETURN NEW;
   END IF;
   -- Terminal is terminal: a cancelled group must stay cancelled (a late
@@ -1240,7 +1386,7 @@ $$;
 
 DROP TRIGGER IF EXISTS enforce_graph_group_completion ON public.task_groups;
 CREATE TRIGGER enforce_graph_group_completion
-  BEFORE UPDATE OF status ON public.task_groups
+  BEFORE UPDATE OF status, execution_model ON public.task_groups
   FOR EACH ROW EXECUTE FUNCTION public.enforce_graph_group_completion();
 
 -- ── Grants (house pattern: service-role only; evaluator internal) ───────

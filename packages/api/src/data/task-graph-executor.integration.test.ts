@@ -495,6 +495,124 @@ d('workflow graph executor (real DB)', () => {
     }
   });
 
+  it('P1 regression (r4): a paused group accepts authoring but never starts actionable clocks', async () => {
+    const gP = randomUUID();
+    const freeGate = randomUUID();
+    await client
+      .from('task_groups')
+      .insert([{ id: gP, user_id: USER, title: 'exec-itest paused-authoring' }]);
+    await client.from('tasks').insert([
+      {
+        id: freeGate,
+        user_id: USER,
+        task_group_id: gP,
+        title: 'dependency-free gate',
+        task_type: 'verification',
+        gate_state: 'not_ready',
+        assignee_identity_id: ident,
+      },
+    ] as never);
+    await groups.convertToGraph({
+      userId: USER,
+      taskGroupId: gP,
+      expectedVersion: 0,
+      systemActor: true,
+    });
+
+    try {
+      await client
+        .from('task_groups')
+        .update({ status: 'paused' } as never)
+        .eq('id', gP);
+
+      // The round-4 exploit: this apply OPENED the gate (actionable clock
+      // running, unclaimable work dispatched). Now evaluation defers.
+      const applied = await groups.applyTaskGraph({
+        userId: USER,
+        taskGroupId: gP,
+        expectedVersion: 1,
+        edges: [],
+        systemActor: true,
+      });
+      expect(applied.success).toBe(true);
+      expect(applied.evaluationDeferred).toBe(true);
+      expect(applied.evaluation ?? null).toBeNull();
+
+      const { data: gateRow } = await client
+        .from('tasks')
+        .select('gate_state, gate_opened_at')
+        .eq('id', freeGate)
+        .single();
+      expect(gateRow?.gate_state).toBe('not_ready');
+      expect(gateRow?.gate_opened_at).toBeNull();
+
+      // Resume: the sweep opens it — the clock starts when work is claimable.
+      await client
+        .from('task_groups')
+        .update({ status: 'active' } as never)
+        .eq('id', gP);
+      const sweep = await groups.sweepTaskGraph({ userId: USER, taskGroupId: gP });
+      expect(evalOf(sweep as Record<string, unknown>).openedGates.map((g) => g.id)).toEqual([
+        freeGate,
+      ]);
+    } finally {
+      await client.from('tasks').delete().eq('id', freeGate);
+      await client.from('task_groups').delete().eq('id', gP);
+    }
+  });
+
+  it('P1 regression (r4): execution_model is conversion-owned — no direct flips, no one-write resurrection', async () => {
+    const gM = randomUUID();
+    const mTask = randomUUID();
+    await client
+      .from('task_groups')
+      .insert([{ id: gM, user_id: USER, title: 'exec-itest model-fence' }]);
+    await client
+      .from('tasks')
+      .insert([
+        { id: mTask, user_id: USER, task_group_id: gM, title: 'm', task_type: 'work' },
+      ] as never);
+
+    try {
+      // Direct linear → graph bypasses preflight/revisioning: refused.
+      const { error: toGraph } = await client
+        .from('task_groups')
+        .update({ execution_model: 'graph' } as never)
+        .eq('id', gM);
+      expect(toGraph?.message).toMatch(/conversion-owned/);
+
+      // The real conversion path still works.
+      const conv = await groups.convertToGraph({
+        userId: USER,
+        taskGroupId: gM,
+        expectedVersion: 0,
+        systemActor: true,
+      });
+      expect(conv.success).toBe(true);
+
+      // graph → linear would detach the executor and leave edges: refused.
+      const { error: toLinear } = await client
+        .from('task_groups')
+        .update({ execution_model: 'linear' } as never)
+        .eq('id', gM);
+      expect(toLinear?.message).toMatch(/conversion-owned/);
+
+      // One-write resurrection: cancel, then {model linear, status active}.
+      await client
+        .from('task_groups')
+        .update({ status: 'cancelled' } as never)
+        .eq('id', gM);
+      const { error: resurrect } = await client
+        .from('task_groups')
+        .update({ execution_model: 'linear', status: 'active' } as never)
+        .eq('id', gM);
+      expect(resurrect?.message).toMatch(/conversion-owned|terminal/);
+    } finally {
+      await client.from('tasks').delete().eq('id', mTask);
+      await client.from('task_groups').delete().eq('id', gM);
+    }
+  });
+
   it('P1 regression (r3): a delayed old-boundary release never takes the next turn’s claims', async () => {
     const { releaseGraphClaimsForSession } = await import('../services/graph-executor.service');
     const gB = randomUUID();
