@@ -83,14 +83,21 @@ const REDISPATCH_INTERVAL_MS = 30 * 60 * 1000;
 export async function releaseGraphClaimsForSession(
   client: SupabaseClient<Database>,
   sessionId: string,
-  reason: string
+  reason: string,
+  boundaryAt?: string
 ): Promise<number> {
+  // Turn-generation guard (Lumen round 3 P1): a delayed release from an OLD
+  // boundary must never touch a claim the session's NEXT turn acquired.
+  // Callers capture the boundary instant synchronously at the stop event;
+  // only claims from before that instant are this boundary's to release.
+  const cutoff = boundaryAt ?? new Date().toISOString();
   let released = 0;
   try {
     const { data: held, error } = await client
       .from('tasks')
       .select('id, user_id, claim_token')
-      .eq('claimed_by_session_id', sessionId);
+      .eq('claimed_by_session_id', sessionId)
+      .lte('claimed_at', cutoff);
     if (error) {
       logger.warn(`Graph boundary release: claim lookup failed for session ${sessionId}:`, error);
       return 0;
@@ -161,6 +168,15 @@ export class GraphExecutorService {
         success: false,
         reason: 'not-graph-mode',
         hint: 'convert the group first (convert_task_group_to_graph), then start',
+      };
+    }
+    // Terminal is terminal (the DB status fence enforces this too): start
+    // must never resurrect a completed/cancelled group (Lumen round 3 P1).
+    if (group.status === 'completed' || group.status === 'cancelled') {
+      return {
+        success: false,
+        reason: 'group-terminal',
+        groupStatus: group.status,
       };
     }
 

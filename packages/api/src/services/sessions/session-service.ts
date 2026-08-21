@@ -1632,16 +1632,22 @@ export class SessionService implements ISessionService {
       void this.releaseLeaseIfSessionTerminal(session.id);
       // Graph claims are turn-scoped: for a server-spawned session the run
       // IS the turn, so its claims return to the pool at this boundary
-      // (spec v10; the sweep remains the crash backstop). Fire-and-forget.
+      // (spec v10; the sweep remains the crash backstop). Fire-and-forget
+      // with the boundary instant captured HERE, so a delayed release can
+      // never touch claims a later run acquires (Lumen round 3 P1).
       if (this.supabase) {
-        void releaseGraphClaimsForSession(this.supabase, session.id, 'run-completed').catch(
-          (err: unknown) => {
-            logger.warn('Graph boundary release failed at run completion', {
-              sessionId: session.id,
-              error: err instanceof Error ? err.message : String(err),
-            });
-          }
-        );
+        const boundaryAt = new Date().toISOString();
+        void releaseGraphClaimsForSession(
+          this.supabase,
+          session.id,
+          'run-completed',
+          boundaryAt
+        ).catch((err: unknown) => {
+          logger.warn('Graph boundary release failed at run completion', {
+            sessionId: session.id,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
       }
     }
 

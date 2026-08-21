@@ -475,11 +475,17 @@ BEGIN
     RETURN jsonb_build_object('success', false, 'reason', 'not-graph-mode');
   END IF;
 
-  SELECT execution_model INTO v_group
+  SELECT execution_model, status INTO v_group
   FROM task_groups WHERE id = v_group_id
   FOR SHARE;
   IF NOT FOUND OR v_group.execution_model <> 'graph' THEN
     RETURN jsonb_build_object('success', false, 'reason', 'not-graph-mode');
+  END IF;
+  -- A cancelled/completed group is DONE: a late completion must not
+  -- resurrect it into a finalizable state (Lumen round 3 P1).
+  IF v_group.status <> 'active' THEN
+    RETURN jsonb_build_object('success', false, 'reason', 'group-not-active',
+      'groupStatus', v_group.status);
   END IF;
 
   SELECT * INTO v_task FROM tasks
@@ -574,11 +580,15 @@ BEGIN
     RETURN jsonb_build_object('success', false, 'reason', 'not-graph-mode');
   END IF;
 
-  SELECT execution_model INTO v_group
+  SELECT execution_model, status INTO v_group
   FROM task_groups WHERE id = v_group_id
   FOR SHARE;
   IF NOT FOUND OR v_group.execution_model <> 'graph' THEN
     RETURN jsonb_build_object('success', false, 'reason', 'not-graph-mode');
+  END IF;
+  IF v_group.status <> 'active' THEN
+    RETURN jsonb_build_object('success', false, 'reason', 'group-not-active',
+      'groupStatus', v_group.status);
   END IF;
 
   SELECT * INTO v_task FROM tasks
@@ -713,11 +723,15 @@ BEGIN
     RETURN jsonb_build_object('success', false, 'reason', 'not-graph-mode');
   END IF;
 
-  SELECT execution_model INTO v_group
+  SELECT execution_model, status INTO v_group
   FROM task_groups WHERE id = v_group_id
   FOR SHARE;
   IF NOT FOUND OR v_group.execution_model <> 'graph' THEN
     RETURN jsonb_build_object('success', false, 'reason', 'not-graph-mode');
+  END IF;
+  IF v_group.status <> 'active' THEN
+    RETURN jsonb_build_object('success', false, 'reason', 'group-not-active',
+      'groupStatus', v_group.status);
   END IF;
 
   SELECT * INTO v_task FROM tasks
@@ -844,6 +858,35 @@ BEGIN
   IF current_setting('app.graph_executor', true) = 'on' THEN
     RETURN NEW;
   END IF;
+
+  -- Tier 0 — membership. task_group_id was in the trigger's column list
+  -- but neither change predicate consulted it, so direct moves bypassed
+  -- the whole fence and could strand cross-group edges no mutation could
+  -- remove (Lumen round 3 P1). Spec §Task moves: pre-start SET moves go
+  -- through a serialized RPC that does not exist yet — until it does, a
+  -- task's graph membership is fixed. Groups locked in id order so two
+  -- concurrent movers cannot deadlock.
+  IF TG_OP = 'UPDATE' AND NEW.task_group_id IS DISTINCT FROM OLD.task_group_id THEN
+    DECLARE
+      v_side uuid;
+      v_side_model text;
+    BEGIN
+      FOR v_side IN
+        SELECT g_id FROM unnest(ARRAY[OLD.task_group_id, NEW.task_group_id]) AS g(g_id)
+        WHERE g_id IS NOT NULL
+        ORDER BY g_id
+      LOOP
+        SELECT execution_model INTO v_side_model
+        FROM task_groups WHERE id = v_side FOR SHARE;
+        IF v_side_model = 'graph' THEN
+          RAISE EXCEPTION
+            'graph membership is fixed — tasks cannot move into or out of a graph-mode group (spec: pre-start set moves need the serialized move RPC)';
+        END IF;
+      END LOOP;
+    END;
+    RETURN NEW;
+  END IF;
+
   IF NEW.task_group_id IS NULL THEN
     RETURN NEW;
   END IF;
@@ -1164,10 +1207,21 @@ SECURITY DEFINER
 SET search_path = public
 AS $$
 BEGIN
-  IF NEW.status <> 'completed' OR OLD.status = 'completed' THEN
+  IF NEW.status IS NOT DISTINCT FROM OLD.status THEN
     RETURN NEW;
   END IF;
   IF NEW.execution_model <> 'graph' THEN
+    RETURN NEW;
+  END IF;
+  -- Terminal is terminal: a cancelled group must stay cancelled (a late
+  -- finalizer write was observed resurrecting cancelled → completed —
+  -- Lumen round 3 P1), and a completed group must not quietly reopen.
+  -- Un-cancelling, if ever wanted, deserves an explicit evented RPC.
+  IF OLD.status IN ('completed', 'cancelled') THEN
+    RAISE EXCEPTION
+      'graph-mode group is terminal (%) — status cannot change', OLD.status;
+  END IF;
+  IF NEW.status <> 'completed' THEN
     RETURN NEW;
   END IF;
   IF EXISTS (

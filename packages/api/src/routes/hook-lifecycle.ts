@@ -156,6 +156,24 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
       // never race each other's heartbeat CAS. Fire-and-forget: never delays
       // the hook response.
       if (isStopEvent) {
+        // Captured synchronously at the boundary: the release helper only
+        // touches claims from BEFORE this instant, so a delayed release can
+        // never take the next turn's claims (Lumen round 3 P1).
+        const boundaryAt = new Date().toISOString();
+        // Graph claims are turn-scoped: the CLI stop hook IS the real turn
+        // boundary. Independent chain, FIRST — a lease-release error must
+        // not skip it (round 3 P1); the helper itself never throws.
+        void releaseGraphClaimsForSession(
+          dataComposer.getClient(),
+          sessionId,
+          'cli-turn-stopped',
+          boundaryAt
+        ).catch((err: unknown) => {
+          logger.warn('[HookLifecycle] CLI-boundary graph claim release failed', {
+            sessionId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
         void (async () => {
           const postUpdate = await dataComposer.repositories.memory.getSession(sessionId);
           const terminal =
@@ -170,14 +188,6 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
           if (!released) {
             await leaseService.renewBySession(sessionId, session.userId);
           }
-          // Graph claims are turn-scoped: the CLI stop hook IS the real
-          // turn boundary, so the session's claims return to the pool here
-          // (spec v10; the sweep is only the crash backstop).
-          await releaseGraphClaimsForSession(
-            dataComposer.getClient(),
-            sessionId,
-            'cli-turn-stopped'
-          );
         })().catch((err: unknown) => {
           logger.warn('[HookLifecycle] CLI-boundary lease release failed', {
             sessionId,

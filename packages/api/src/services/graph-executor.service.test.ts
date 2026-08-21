@@ -245,6 +245,21 @@ describe('GraphExecutorService reclaim (fail-closed)', () => {
   });
 });
 
+describe('GraphExecutorService startGroup', () => {
+  it('refuses to resurrect a terminal group (r3)', async () => {
+    const ctx = makeComposer();
+    const repos = ctx.composer.repositories.taskGroups as unknown as {
+      findById: ReturnType<typeof vi.fn>;
+      update: ReturnType<typeof vi.fn>;
+    };
+    repos.findById.mockResolvedValue({ ...baseGroup, status: 'cancelled' });
+    const service = new GraphExecutorService(ctx.composer);
+    const result = await service.startGroup(USER, 'g-1');
+    expect(result).toMatchObject({ success: false, reason: 'group-terminal' });
+    expect(repos.update).not.toHaveBeenCalled();
+  });
+});
+
 describe('GraphExecutorService dispatch', () => {
   beforeEach(() => {
     sendMock.mockClear();

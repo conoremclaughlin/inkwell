@@ -384,11 +384,169 @@ d('workflow graph executor (real DB)', () => {
       .update({ status: 'completed' } as never)
       .eq('id', g1);
     expect(error).toBeNull();
-    // restore for any later reads
-    await client
+    // Round 3: no resurrection — a terminal graph group's status is fixed.
+    const { error: reopenError } = await client
       .from('task_groups')
       .update({ status: 'active' } as never)
       .eq('id', g1);
+    expect(reopenError?.message).toMatch(/terminal/);
+  });
+
+  it('P1 regression (r3): cancellation is final — late completions refuse and nothing resurrects', async () => {
+    const gC = randomUUID();
+    const solo = randomUUID();
+    await client
+      .from('task_groups')
+      .insert([{ id: gC, user_id: USER, title: 'exec-itest cancellation' }]);
+    await client
+      .from('tasks')
+      .insert([
+        { id: solo, user_id: USER, task_group_id: gC, title: 'solo', task_type: 'work' },
+      ] as never);
+    await groups.convertToGraph({
+      userId: USER,
+      taskGroupId: gC,
+      expectedVersion: 0,
+      systemActor: true,
+    });
+
+    try {
+      const claim = await groups.claimGraphTask({ userId: USER, taskId: solo, sessionId: sess1 });
+      expect(claim.success).toBe(true);
+
+      // Operator cancels while the node is claimed.
+      const { error: cancelError } = await client
+        .from('task_groups')
+        .update({ status: 'cancelled' } as never)
+        .eq('id', gC);
+      expect(cancelError).toBeNull();
+
+      // The round-3 exploit: a late completion landed and finalized the
+      // cancelled group. Now it refuses.
+      const late = await groups.completeGraphTask({
+        userId: USER,
+        taskId: solo,
+        sessionId: sess1,
+        claimToken: claim.claimToken as string,
+        outcome: 'completed',
+      });
+      expect(late).toMatchObject({ success: false, reason: 'group-not-active' });
+
+      // No resurrection in either direction, and no mutations either.
+      const { error: toCompleted } = await client
+        .from('task_groups')
+        .update({ status: 'completed' } as never)
+        .eq('id', gC);
+      expect(toCompleted?.message).toMatch(/terminal/);
+      const { error: toActive } = await client
+        .from('task_groups')
+        .update({ status: 'active' } as never)
+        .eq('id', gC);
+      expect(toActive?.message).toMatch(/terminal/);
+      const mutate = await groups.applyTaskGraph({
+        userId: USER,
+        taskGroupId: gC,
+        expectedVersion: 1,
+        edges: [],
+        systemActor: true,
+      });
+      expect(mutate).toMatchObject({ success: false, reason: 'group-not-active' });
+    } finally {
+      await client.from('tasks').delete().eq('id', solo);
+      await client.from('task_groups').delete().eq('id', gC);
+    }
+  });
+
+  it('P1 regression (r3): graph membership is fixed — moves in or out refuse; linear moves stay free', async () => {
+    const gLin = randomUUID();
+    const mover = randomUUID();
+    await client
+      .from('task_groups')
+      .insert([{ id: gLin, user_id: USER, title: 'exec-itest linear-moves' }]);
+    await client
+      .from('tasks')
+      .insert([
+        { id: mover, user_id: USER, task_group_id: gLin, title: 'mover', task_type: 'work' },
+      ] as never);
+
+    try {
+      // g2 is a started graph group with live nodes.
+      const { error: moveOut } = await client
+        .from('tasks')
+        .update({ task_group_id: gLin } as never)
+        .eq('id', b);
+      expect(moveOut?.message).toMatch(/graph membership is fixed/);
+
+      const { error: moveIn } = await client
+        .from('tasks')
+        .update({ task_group_id: g2 } as never)
+        .eq('id', mover);
+      expect(moveIn?.message).toMatch(/graph membership is fixed/);
+
+      // Linear-world moves keep their legacy semantics.
+      const { error: linearMove } = await client
+        .from('tasks')
+        .update({ task_group_id: null } as never)
+        .eq('id', mover);
+      expect(linearMove).toBeNull();
+    } finally {
+      await client.from('tasks').delete().eq('id', mover);
+      await client.from('task_groups').delete().eq('id', gLin);
+    }
+  });
+
+  it('P1 regression (r3): a delayed old-boundary release never takes the next turn’s claims', async () => {
+    const { releaseGraphClaimsForSession } = await import('../services/graph-executor.service');
+    const gB = randomUUID();
+    const node = randomUUID();
+    await client
+      .from('task_groups')
+      .insert([{ id: gB, user_id: USER, title: 'exec-itest boundary-generation' }]);
+    await client
+      .from('tasks')
+      .insert([
+        { id: node, user_id: USER, task_group_id: gB, title: 'node', task_type: 'work' },
+      ] as never);
+    await groups.convertToGraph({
+      userId: USER,
+      taskGroupId: gB,
+      expectedVersion: 0,
+      systemActor: true,
+    });
+
+    try {
+      // The OLD boundary happened a minute ago; the claim below belongs to
+      // the session's NEXT turn.
+      const staleBoundary = new Date(Date.now() - 60_000).toISOString();
+      const claim = await groups.claimGraphTask({ userId: USER, taskId: node, sessionId: sess1 });
+      expect(claim.success).toBe(true);
+
+      const staleReleased = await releaseGraphClaimsForSession(
+        client,
+        sess1,
+        'delayed-old-boundary',
+        staleBoundary
+      );
+      expect(staleReleased).toBe(0);
+      const { data: stillClaimed } = await client
+        .from('tasks')
+        .select('claimed_by_session_id')
+        .eq('id', node)
+        .single();
+      expect(stillClaimed?.claimed_by_session_id).toBe(sess1);
+
+      // The CURRENT boundary releases it.
+      const released = await releaseGraphClaimsForSession(
+        client,
+        sess1,
+        'current-boundary',
+        new Date().toISOString()
+      );
+      expect(released).toBe(1);
+    } finally {
+      await client.from('tasks').delete().eq('id', node);
+      await client.from('task_groups').delete().eq('id', gB);
+    }
   });
 
   it('P1 regression: mutating an OPEN gate’s inbound set resets it — fresh window, stale verdicts bounce, cut reopens in-transaction', async () => {
