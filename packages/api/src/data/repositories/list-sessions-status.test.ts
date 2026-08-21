@@ -156,6 +156,7 @@ const COMPLETED_WITHOUT_ENDED_AT = session({
 });
 const FAILED = session({ id: 'failed', ended_at: null, lifecycle: 'failed' });
 const PAUSED = session({ id: 'paused', lifecycle: 'idle', status: 'paused' });
+const RESUMABLE_LIVE = session({ id: 'resumable-live', lifecycle: 'idle', status: 'resumable' });
 const RESUMABLE_THEN_ENDED = session({
   id: 'resumable-then-ended',
   ended_at: '2026-08-04T00:00:00Z',
@@ -163,7 +164,15 @@ const RESUMABLE_THEN_ENDED = session({
   status: 'resumable',
 });
 
-const ALL = [LIVE, ENDED_BY_HOOK, COMPLETED_WITHOUT_ENDED_AT, FAILED, PAUSED, RESUMABLE_THEN_ENDED];
+const ALL = [
+  LIVE,
+  ENDED_BY_HOOK,
+  COMPLETED_WITHOUT_ENDED_AT,
+  FAILED,
+  PAUSED,
+  RESUMABLE_LIVE,
+  RESUMABLE_THEN_ENDED,
+];
 
 function repoOver(rows: Row[]): MemoryRepository {
   return new MemoryRepository(createFilteringSupabase(rows));
@@ -194,7 +203,17 @@ describe('listSessions status filtering', () => {
     // resumable is still active — which is what `ink attach` wants, since a
     // resumable session is precisely one you can attach to. The consequence is
     // that 'active' overlaps 'paused' rather than partitioning against it.
-    expect(await idsFor(ALL, 'active')).toEqual(['live', 'paused']);
+    expect(await idsFor(ALL, 'active')).toEqual(['live', 'paused', 'resumable-live']);
+  });
+
+  it("returns a live resumable session under both 'active' and 'resumable'", async () => {
+    // The attach rationale stated positively rather than by exclusion. Without
+    // this the fixtures only prove that a *terminal* resumable row is filtered
+    // out, which would also hold if 'active' still read the legacy column and
+    // dropped every resumable session — the exact behaviour this contract
+    // changes. The overlap is the point, so both memberships are asserted.
+    expect(await idsFor(ALL, 'active')).toContain('resumable-live');
+    expect(await idsFor(ALL, 'resumable')).toContain('resumable-live');
   });
 
   it("returns terminal sessions for 'completed', by either spelling", async () => {
@@ -212,7 +231,9 @@ describe('listSessions status filtering', () => {
 
   it("does not return a terminal session for 'resumable' just because it says so", async () => {
     // resumable-then-ended still carries status 'resumable'; it ended anyway.
-    expect(await idsFor(ALL, 'resumable')).toEqual([]);
+    // The live one is returned, so this is exclusion of the terminal row rather
+    // than the filter matching nothing at all.
+    expect(await idsFor(ALL, 'resumable')).toEqual(['resumable-live']);
   });
 
   it('treats a NULL lifecycle as non-active, matching SQL three-valued logic', async () => {
