@@ -684,6 +684,47 @@ describe('MemoryRepository', () => {
     });
 
     describe('listSessions', () => {
+      it('uses authoritative terminal fields for the legacy active filter', async () => {
+        // Terminal sessions can retain the deprecated DB-default status='active':
+        // endSession() stamps ended_at + lifecycle but deliberately no longer
+        // synchronizes status. An active listing must therefore filter on the
+        // authoritative fields rather than that stale legacy value.
+        const staleTerminalRow = {
+          id: 'terminal-with-stale-status',
+          user_id: 'user-456',
+          agent_id: 'wren',
+          status: 'active',
+          lifecycle: 'completed',
+          ended_at: '2026-08-20T00:00:00Z',
+          started_at: '2026-08-19T00:00:00Z',
+          metadata: {},
+        };
+        let filtersOpenSessions = false;
+        let filtersFailedSessions = false;
+        mockSupabase._queryBuilder.is = vi.fn((column: string, value: unknown) => {
+          filtersOpenSessions ||= column === 'ended_at' && value === null;
+          return mockSupabase._queryBuilder;
+        });
+        mockSupabase._queryBuilder.neq = vi.fn((column: string, value: unknown) => {
+          filtersFailedSessions ||= column === 'lifecycle' && value === 'failed';
+          return mockSupabase._queryBuilder;
+        });
+        mockSupabase._queryBuilder.then = (
+          resolve: (value: { data: unknown; error: unknown }) => void
+        ) => {
+          const data = filtersOpenSessions && filtersFailedSessions ? [] : [staleTerminalRow];
+          resolve({ data, error: null });
+          return Promise.resolve({ data, error: null });
+        };
+
+        const sessions = await repo.listSessions('user-456', { status: 'active' });
+
+        expect(sessions).toEqual([]);
+        expect(mockSupabase._queryBuilder.is).toHaveBeenCalledWith('ended_at', null);
+        expect(mockSupabase._queryBuilder.neq).toHaveBeenCalledWith('lifecycle', 'failed');
+        expect(mockSupabase._queryBuilder.eq).not.toHaveBeenCalledWith('status', 'active');
+      });
+
       it('should filter by studioId when provided', async () => {
         mockSupabase._setArrayData([]);
 

@@ -1753,7 +1753,9 @@ export class MemoryRepository {
       query = query.eq('backend', options.backend);
     }
 
-    if (options.status) {
+    if (options.status === 'active') {
+      query = query.is('ended_at', null).neq('lifecycle', 'failed');
+    } else if (options.status) {
       query = query.eq('status', options.status);
     }
 
