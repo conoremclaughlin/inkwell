@@ -33,6 +33,21 @@ export interface RequestContextData {
   agentId?: string;
   /** Canonical agent_identities UUID (strongest identity binding) */
   sbId?: string;
+  /**
+   * Identity carried by the bearer token ITSELF, before any session-derived
+   * enrichment. `agentId`/`sbId` above may have been filled in from the
+   * caller's ambient session so that dispatch and workspace derivation work
+   * for ink-routed user-token calls — useful for routing, but not an
+   * authentication fact. Authorization must use these fields instead.
+   */
+  tokenAgentId?: string;
+  tokenSbId?: string;
+  /**
+   * True when the bearer token itself was agent-bound. Distinct from
+   * `callerProfile`, which defaults to 'agent' for every HTTP request and
+   * therefore says nothing about how the caller authenticated.
+   */
+  agentTokenBound?: boolean;
   /** Session ID if in a session */
   sessionId?: string;
   /** Active product workspace ID (parent-level, contains all documents and SBs) */

@@ -116,16 +116,95 @@ type ImplicitSessionResult =
 interface CallerIdentity {
   sbId?: string;
   agentId?: string;
+  /**
+   * Contact scope the caller is confined to; undefined means owner scope
+   * (sessions with no contact). Never taken from a tool parameter — a caller
+   * that could name its own contact scope could name someone else's.
+   */
+  contactId?: string;
   agentBound: boolean;
 }
 
+/**
+ * The authenticated identity behind this call, from verified sources only.
+ *
+ * Three things here are deliberate, and each one was a hole:
+ *
+ * 1. On HTTP the bearer token is the ONLY authentication fact. `ctx.agentId`
+ *    and `ctx.sbId` may have been enriched from the caller's ambient session
+ *    so routing and workspace derivation work for ink-routed user-token calls;
+ *    that is a hint, not a credential. Authorization reads `tokenAgentId` /
+ *    `tokenSbId`, captured before enrichment.
+ * 2. `callerProfile` is NOT an agent-bound signal — it defaults to 'agent' on
+ *    every HTTP request, including web-dashboard user tokens.
+ * 3. `explicitAgentId` never confers agent authority. It previously flowed
+ *    through `getEffectiveAgentId()`, which returns the caller's own value
+ *    whenever no identity is pinned, so a request with no verified identity
+ *    could name any agent it liked. It survives only as attribution on
+ *    non-agent-bound calls.
+ */
 function resolveCallerIdentity(explicitAgentId?: string): CallerIdentity {
   const ctx = getRequestContext();
-  const agentId = getEffectiveAgentId(explicitAgentId);
-  // Only trust the context's canonical id when it describes the same agent we
-  // resolved; otherwise the two halves of the identity would disagree.
-  const sbId = agentId && ctx?.agentId === agentId ? ctx.sbId : undefined;
-  return { sbId, agentId, agentBound: !!getPinnedAgentId() };
+
+  if (ctx) {
+    if (ctx.agentTokenBound) {
+      return {
+        sbId: ctx.tokenSbId,
+        agentId: ctx.tokenAgentId,
+        contactId: ctx.contactId,
+        agentBound: true,
+      };
+    }
+    // User/admin token: keeps same-user repair authority.
+    return { agentId: explicitAgentId, contactId: ctx.contactId, agentBound: false };
+  }
+
+  // stdio: one session per process, so bootstrap's pin is the identity.
+  const pinned = getPinnedAgentId();
+  if (!pinned) return { agentId: explicitAgentId, agentBound: false };
+
+  const sess = getSessionContext();
+  return {
+    sbId: sess?.agentId === pinned ? sess.sbId : undefined,
+    agentId: pinned,
+    contactId: sess?.contactId,
+    agentBound: true,
+  };
+}
+
+/**
+ * Resolve the caller, including the contact scope it is confined to.
+ *
+ * The scope has to be looked up rather than read off the context: the HTTP MCP
+ * path never populates `ctx.contactId` (start_session explicitly no-ops there),
+ * so for an agent-bound HTTP caller the ambient session named by `x-ink-context`
+ * is the only record of which conversation it is serving. That session is
+ * trusted for this purpose ONLY after it passes the identity check — otherwise
+ * a caller could nominate its own contact scope and walk into another one.
+ *
+ * Resolved once per handler invocation and passed down, so the extra read
+ * happens at most once per call.
+ */
+async function resolveCaller(
+  dataComposer: DataComposer,
+  userId: string,
+  explicitAgentId?: string
+): Promise<CallerIdentity> {
+  const caller = resolveCallerIdentity(explicitAgentId);
+  if (!caller.agentBound || caller.contactId !== undefined) return caller;
+
+  const ctx = getRequestContext();
+  if (!ctx?.sessionId) return caller;
+
+  try {
+    const ambient = await dataComposer.repositories.memory.getSession(ctx.sessionId);
+    if (ambient && isIdentityAuthorized(ambient, userId, caller)) {
+      return { ...caller, contactId: ambient.contactId };
+    }
+  } catch {
+    // Unreadable ambient session: stay at owner scope rather than widening.
+  }
+  return caller;
 }
 
 /**
@@ -137,16 +216,43 @@ function resolveCallerIdentity(explicitAgentId?: string): CallerIdentity {
  * naming a peer's session is not an authorization primitive (repairing another
  * agent's row is a user/admin action, not something an SB grants itself).
  */
-function isSessionAuthorized(session: Session, userId: string, caller: CallerIdentity): boolean {
+function isIdentityAuthorized(session: Session, userId: string, caller: CallerIdentity): boolean {
   if (session.userId !== userId) return false;
   if (!caller.agentBound) return true;
 
-  // Canonical comparison when both sides have one.
-  if (caller.sbId && session.sbId) return session.sbId === caller.sbId;
+  if (session.sbId) {
+    // The target names a canonical owner, so only a canonical caller can match
+    // it. Falling back to the slug when the CALLER lacks an sbId would reopen
+    // the collision this check exists to close: agent-bound tokens without a
+    // canonical claim are valid today, and "wren" in two workspaces is two
+    // different identities wearing the same name.
+    return !!caller.sbId && session.sbId === caller.sbId;
+  }
 
-  // Legacy rows without sb_id fall back to the slug. Weaker, but strictly
-  // better than no identity check, and it still blocks the reported incident.
+  // The target row predates sb_id, so the slug is the only identity it carries.
   return !!caller.agentId && session.agentId === caller.agentId;
+}
+
+/**
+ * Decide whether `caller` may act on `session`.
+ *
+ * Same-user is the floor and is never waived — the server repository runs as the
+ * service role, so RLS will not stop a cross-user UUID and this check is the only
+ * thing that does. Agent-bound callers are further confined to their own identity
+ * AND their own contact scope: naming a peer's session is not an authorization
+ * primitive (repairing another agent's row is a user/admin action, not something
+ * an SB grants itself), and one SB identity serves many contacts, so identity
+ * alone does not keep two conversations apart.
+ *
+ * The contact comparison is symmetric on purpose. A contact-scoped caller cannot
+ * reach an owner session and an owner-scoped caller cannot reach a contact
+ * session, which mirrors how `findOwnedActiveSessions` already treats the two as
+ * disjoint sets rather than a hierarchy.
+ */
+function isSessionAuthorized(session: Session, userId: string, caller: CallerIdentity): boolean {
+  if (!isIdentityAuthorized(session, userId, caller)) return false;
+  if (!caller.agentBound) return true;
+  return (session.contactId ?? null) === (caller.contactId ?? null);
 }
 
 /** Error text for a denied explicit target. Deliberately does not confirm existence. */
@@ -191,10 +297,9 @@ function unauthorizedSessionError(toolName: string): string {
 async function resolveImplicitSession(
   dataComposer: DataComposer,
   userId: string,
-  explicitAgentId: string | undefined,
+  caller: CallerIdentity,
   explicitStudioScope: string | null | undefined
 ): Promise<ImplicitSessionResult> {
-  const caller = resolveCallerIdentity(explicitAgentId);
   if (!caller.sbId && !caller.agentId) {
     return { session: null, reason: 'no-agent-identity' };
   }
@@ -216,6 +321,7 @@ async function resolveImplicitSession(
         userId,
         sbId: caller.sbId,
         agentId: caller.agentId,
+        contactId: caller.contactId,
         studioId: explicitStudioScope,
       })
     );
@@ -258,6 +364,7 @@ async function resolveImplicitSession(
       userId,
       sbId: caller.sbId,
       agentId: caller.agentId,
+      contactId: caller.contactId,
       studioId: resolveStudioScope(ctx?.studioId ?? ctx?.studioHint),
     })
   );
@@ -1287,10 +1394,19 @@ export async function handleStartSession(args: unknown, dataComposer: DataCompos
 
   // Pass studioScope directly: "main" → null writes studio_id=NULL explicitly,
   // UUID → writes the UUID, undefined → column omitted (DB default NULL).
+  // Stamp the row with the caller's VERIFIED canonical identity when there is
+  // one. Without it startSession re-resolves the slug, and `agent_id` is unique
+  // only per (user_id, workspace_id) — so a same-named identity in another
+  // workspace can end up owning the row, which is the collision the
+  // authorization checks then have to litigate.
+  const creator = resolveCallerIdentity(params.agentId);
   const session = await dataComposer.repositories.memory.startSession({
     id: params.sessionId,
     userId: user.id,
     agentId,
+    ...(creator.agentBound && creator.sbId && creator.agentId === agentId
+      ? { sbId: creator.sbId }
+      : {}),
     studioId: studioScope,
     threadKey: params.threadKey,
     backend: params.backend,
@@ -1502,7 +1618,7 @@ export async function handleGetSession(args: unknown, dataComposer: DataComposer
   const rawStudioId = resolveStudioId(params);
   const studioScope = resolveStudioScope(rawStudioId);
 
-  const caller = resolveCallerIdentity(params.agentId);
+  const caller = await resolveCaller(dataComposer, user.id, params.agentId);
   let session;
   if (params.sessionId) {
     // Same gate as the mutating handlers: a bare UUID must not read across
@@ -1533,7 +1649,7 @@ export async function handleGetSession(args: unknown, dataComposer: DataComposer
     );
   } else {
     // No agentId given: "my session", not "whichever session started last".
-    const resolved = await resolveImplicitSession(dataComposer, user.id, undefined, studioScope);
+    const resolved = await resolveImplicitSession(dataComposer, user.id, caller, studioScope);
     session = resolved.session;
   }
 
@@ -1817,13 +1933,14 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
   // Resolve session: explicit sessionId > agent-scoped implicit resolution.
   // The implicit path is always scoped to the calling agent and fails closed —
   // see resolveImplicitSession for why an unscoped fallback is unsafe here.
+  const updateCaller = await resolveCaller(dataComposer, user.id, params.agentId);
   let sessionId = params.sessionId;
   if (sessionId) {
     // An explicit id is a target, not an authorization. updateSession() filters
     // on the primary key alone and the repository runs as the service role, so
     // without this check a UUID reaches any session — including another user's.
     const target = await dataComposer.repositories.memory.getSession(sessionId);
-    if (!target || !isSessionAuthorized(target, user.id, resolveCallerIdentity(params.agentId))) {
+    if (!target || !isSessionAuthorized(target, user.id, updateCaller)) {
       return {
         content: [
           {
@@ -1841,7 +1958,7 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
     const resolved = await resolveImplicitSession(
       dataComposer,
       user.id,
-      params.agentId,
+      updateCaller,
       studioScope // null → match NULL studio_id (main), UUID → exact match, undefined → infer from context
     );
     if (!resolved.session) {
@@ -2853,12 +2970,13 @@ export async function handleCompactSession(args: unknown, dataComposer: DataComp
   // Get session ID. Compaction reads a session's logs and soft-deletes them, so
   // both paths must be confined to the caller's own sessions — this is the most
   // destructive of the three handlers.
+  const compactCaller = await resolveCaller(dataComposer, user.id, params.agentId);
   let sessionId = params.sessionId;
   let session;
 
   if (sessionId) {
     const target = await dataComposer.repositories.memory.getSession(sessionId);
-    if (!target || !isSessionAuthorized(target, user.id, resolveCallerIdentity(params.agentId))) {
+    if (!target || !isSessionAuthorized(target, user.id, compactCaller)) {
       return {
         content: [
           {
@@ -2877,7 +2995,7 @@ export async function handleCompactSession(args: unknown, dataComposer: DataComp
     const resolved = await resolveImplicitSession(
       dataComposer,
       user.id,
-      params.agentId,
+      compactCaller,
       studioScope
     );
     if (!resolved.session) {

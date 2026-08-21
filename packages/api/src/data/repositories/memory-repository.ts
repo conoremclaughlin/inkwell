@@ -1430,10 +1430,15 @@ export class MemoryRepository {
    * Start a new session
    */
   async startSession(input: SessionCreateInput): Promise<Session> {
+    // Prefer the caller's verified canonical identity. Re-resolving from the
+    // slug is a fallback for callers that have none: `agent_id` is unique only
+    // per (user_id, workspace_id), so the lookup can land on a same-named
+    // identity in another workspace and stamp the row with the wrong owner.
     const sbId =
-      input.agentId && input.userId
+      input.sbId ??
+      (input.agentId && input.userId
         ? await resolveIdentityId(this.supabase, input.userId, input.agentId)
-        : null;
+        : null);
 
     const insertData: Record<string, unknown> = {
       ...(input.id ? { id: input.id } : {}),
@@ -2126,6 +2131,7 @@ export class MemoryRepository {
       userId: row.user_id,
       agentId: row.agent_id || undefined,
       sbId: row.sb_id || undefined,
+      contactId: row.contact_id || undefined,
       studioId,
       threadKey: row.thread_key || undefined,
       activeThreadKey: row.active_thread_key || undefined,

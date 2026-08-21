@@ -12,12 +12,18 @@ import {
   updateSessionStateSchema,
   handleUpdateSessionState,
   handleStartSession,
+  handleGetSession,
+  handleCompactSession,
   curateRecallSchema,
   handleCurateRecall,
   mapSessionForBootstrap,
   isCallerSessionEligible,
 } from './memory-handlers';
-import { getPinnedAgentId, getRequestContext } from '../../utils/request-context';
+import {
+  getPinnedAgentId,
+  getRequestContext,
+  getSessionContext,
+} from '../../utils/request-context';
 
 // =====================================================
 // MOCK SETUP
@@ -122,9 +128,73 @@ function createMockDataComposer() {
 // later describe in the file. Restore the module defaults before each test;
 // suites that need a pinned identity opt in via their own beforeEach.
 beforeEach(() => {
-  vi.mocked(getPinnedAgentId).mockReturnValue(null);
-  vi.mocked(getRequestContext).mockReturnValue(undefined);
+  callerIsAnonymous();
 });
+
+// =====================================================
+// IDENTITY HELPERS
+//
+// Authorization reads the VERIFIED request identity, so tests have to model
+// how a caller actually authenticated rather than just pinning a slug. The
+// earlier suite set getPinnedAgentId() to 'wren' and left the request context
+// undefined, which is the stdio shape — that hid every HTTP path, where the
+// pin is null and the token carries the identity (Lumen, PR #501 round 2).
+// =====================================================
+
+/**
+ * An agent-bound bearer token: the shape the HTTP MCP server produces for
+ * every SB. Note getPinnedAgentId() is null here — that is the real HTTP
+ * condition, and the path the old suite never exercised.
+ */
+function callerIsAgent(
+  agentId: string,
+  sbId?: string,
+  ctxExtra: Record<string, unknown> = {}
+): void {
+  vi.mocked(getPinnedAgentId).mockReturnValue(null);
+  vi.mocked(getSessionContext).mockReturnValue(undefined as never);
+  vi.mocked(getRequestContext).mockReturnValue({
+    userId: 'user-123',
+    agentTokenBound: true,
+    tokenAgentId: agentId,
+    ...(sbId ? { tokenSbId: sbId } : {}),
+    agentId,
+    ...(sbId ? { sbId } : {}),
+    callerProfile: 'agent',
+    timestamp: new Date(),
+    ...ctxExtra,
+  } as never);
+}
+
+/** A stdio caller: no request context, identity from the bootstrap pin. */
+function callerIsStdioAgent(agentId: string, sbId?: string): void {
+  vi.mocked(getRequestContext).mockReturnValue(undefined);
+  vi.mocked(getPinnedAgentId).mockReturnValue(agentId);
+  vi.mocked(getSessionContext).mockReturnValue({ agentId, sbId } as never);
+}
+
+/**
+ * A human user/admin token. callerProfile is 'agent' deliberately: the HTTP
+ * server sets that on every request, so it must not be read as "authenticated
+ * as an agent".
+ */
+function callerIsUserToken(ctxExtra: Record<string, unknown> = {}): void {
+  vi.mocked(getPinnedAgentId).mockReturnValue(null);
+  vi.mocked(getSessionContext).mockReturnValue(undefined as never);
+  vi.mocked(getRequestContext).mockReturnValue({
+    userId: 'user-123',
+    callerProfile: 'agent',
+    timestamp: new Date(),
+    ...ctxExtra,
+  } as never);
+}
+
+/** No identity at all. */
+function callerIsAnonymous(): void {
+  vi.mocked(getPinnedAgentId).mockReturnValue(null);
+  vi.mocked(getSessionContext).mockReturnValue(undefined as never);
+  vi.mocked(getRequestContext).mockReturnValue(undefined);
+}
 
 // =====================================================
 // SCHEMA TESTS
@@ -398,8 +468,7 @@ describe('handleUpdateSessionState', () => {
     // clearAllMocks resets calls but NOT implementations, so identity state set
     // by one test would otherwise leak into the next. Restore the defaults:
     // an authenticated agent call, which is what every real caller looks like.
-    vi.mocked(getPinnedAgentId).mockReturnValue('wren');
-    vi.mocked(getRequestContext).mockReturnValue(undefined);
+    callerIsAgent('wren', 'sb-wren');
     // Default: the caller owns the session it resolves/names.
     mockDataComposer.repositories.memory.findOwnedActiveSessions.mockResolvedValue([mockSession]);
     mockDataComposer.repositories.memory.getSession.mockResolvedValue(mockSession);
@@ -414,7 +483,7 @@ describe('handleUpdateSessionState', () => {
       // The caller's identity comes from the pinned agent when agentId is omitted.
       // It is never omitted from the lookup itself — see the cross-agent
       // isolation suite below for why an unscoped lookup is unsafe.
-      vi.mocked(getPinnedAgentId).mockReturnValue('wren');
+      callerIsAgent('wren', 'sb-wren');
       mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue(mockSession);
       mockDataComposer.repositories.memory.updateSession.mockResolvedValue(mockUpdatedSession);
 
@@ -583,6 +652,7 @@ describe('handleUpdateSessionState', () => {
       ...mockSession,
       id: 'session-lumen-pr500',
       agentId: 'lumen',
+      sbId: 'sb-lumen',
       studioId: 'studio-lumen',
       startedAt: new Date('2026-08-15T04:58:11Z'),
     };
@@ -592,12 +662,13 @@ describe('handleUpdateSessionState', () => {
       ...mockSession,
       id: 'session-myra',
       agentId: 'myra',
+      sbId: 'sb-myra',
       studioId: 'studio-myra',
       startedAt: new Date('2026-08-05T18:42:09Z'),
     };
 
     it('scopes the implicit lookup to the calling agent, not to whoever started last', async () => {
-      vi.mocked(getPinnedAgentId).mockReturnValue('myra');
+      callerIsAgent('myra', 'sb-myra');
       // Stand in for the real query: only myra's own session may come back once
       // the agent filter is applied. An unscoped call would surface lumen's.
       mockDataComposer.repositories.memory.findOwnedActiveSessions.mockImplementation(
@@ -622,7 +693,7 @@ describe('handleUpdateSessionState', () => {
     });
 
     it('fails closed when no agent identity can be established', async () => {
-      vi.mocked(getPinnedAgentId).mockReturnValue(null);
+      callerIsAnonymous();
       mockDataComposer.repositories.memory.getActiveSession.mockResolvedValue(lumenSession);
 
       const result = await handleUpdateSessionState(
@@ -639,11 +710,7 @@ describe('handleUpdateSessionState', () => {
     });
 
     it('targets the session named by the request context without a recency query', async () => {
-      vi.mocked(getPinnedAgentId).mockReturnValue('myra');
-      vi.mocked(getRequestContext).mockReturnValue({
-        sessionId: 'session-myra',
-        timestamp: new Date(),
-      } as never);
+      callerIsAgent('myra', 'sb-myra', { sessionId: 'session-myra' });
       mockDataComposer.repositories.memory.getSession.mockResolvedValue({
         ...myraSession,
         userId: 'user-123',
@@ -663,13 +730,9 @@ describe('handleUpdateSessionState', () => {
     });
 
     it('ignores a context sessionId that belongs to another agent', async () => {
-      vi.mocked(getPinnedAgentId).mockReturnValue('myra');
       // A token naming lumen's session — the server skips context-session
       // enrichment for agent-bound tokens, so this is not pre-validated.
-      vi.mocked(getRequestContext).mockReturnValue({
-        sessionId: 'session-lumen-pr500',
-        timestamp: new Date(),
-      } as never);
+      callerIsAgent('myra', 'sb-myra', { sessionId: 'session-lumen-pr500' });
       mockDataComposer.repositories.memory.getSession.mockResolvedValue({
         ...lumenSession,
         userId: 'user-123',
@@ -694,7 +757,7 @@ describe('handleUpdateSessionState', () => {
     // repository runs as the service role, so a bare UUID reached any session,
     // including another user's. Naming a session is not authorization.
     it('denies an explicit sessionId belonging to another agent', async () => {
-      vi.mocked(getPinnedAgentId).mockReturnValue('myra');
+      callerIsAgent('myra', 'sb-myra');
       mockDataComposer.repositories.memory.getSession.mockResolvedValue({
         ...lumenSession,
         userId: 'user-123',
@@ -717,7 +780,7 @@ describe('handleUpdateSessionState', () => {
     });
 
     it('denies an explicit sessionId belonging to another user', async () => {
-      vi.mocked(getPinnedAgentId).mockReturnValue('myra');
+      callerIsAgent('myra', 'sb-myra');
       mockDataComposer.repositories.memory.getSession.mockResolvedValue({
         ...myraSession,
         userId: 'someone-else',
@@ -738,7 +801,7 @@ describe('handleUpdateSessionState', () => {
     });
 
     it('allows an explicit sessionId for the caller`s own session', async () => {
-      vi.mocked(getPinnedAgentId).mockReturnValue('myra');
+      callerIsAgent('myra', 'sb-myra');
       mockDataComposer.repositories.memory.getSession.mockResolvedValue({
         ...myraSession,
         userId: 'user-123',
@@ -760,13 +823,7 @@ describe('handleUpdateSessionState', () => {
     it('distinguishes same-slug identities in different workspaces by sbId', async () => {
       // agent_identities is unique on (user_id, workspace_id, agent_id), so the
       // slug alone cannot be an ownership predicate.
-      vi.mocked(getPinnedAgentId).mockReturnValue('wren');
-      vi.mocked(getRequestContext).mockReturnValue({
-        agentId: 'wren',
-        sbId: 'sb-wren-workspace-a',
-        sessionId: 'session-wren-b',
-        timestamp: new Date(),
-      } as never);
+      callerIsAgent('wren', 'sb-wren-workspace-a', { sessionId: 'session-wren-b' });
       mockDataComposer.repositories.memory.getSession.mockResolvedValue({
         ...mockSession,
         id: 'session-wren-b',
@@ -790,7 +847,7 @@ describe('handleUpdateSessionState', () => {
     });
 
     it('refuses to guess when one identity has sessions in several studios', async () => {
-      vi.mocked(getPinnedAgentId).mockReturnValue('wren');
+      callerIsAgent('wren', 'sb-wren');
       mockDataComposer.repositories.memory.findOwnedActiveSessions.mockResolvedValue([
         { ...mockSession, id: 'session-studio-a', studioId: 'studio-a' },
         { ...mockSession, id: 'session-studio-b', studioId: 'studio-b' },
@@ -1414,6 +1471,331 @@ describe('handleUpdateSessionState', () => {
 // =====================================================
 // THREAD KEY TESTS
 // =====================================================
+
+// =====================================================
+// AUTHORIZATION BOUNDARY (PR #501 round 3)
+//
+// Three gaps Lumen found in round two, each one a way to reach a session the
+// caller does not own. They share a shape: an identity check that consults
+// something weaker than the verified request identity.
+// =====================================================
+
+describe('session authorization boundary', () => {
+  let mockDataComposer: ReturnType<typeof createMockDataComposer>;
+
+  const TARGET_UUID = '95f7f160-6599-449d-9f63-e31ca20a43ce';
+
+  /** Lumen's session — the thing a caller must never reach. */
+  const lumenSession = {
+    id: 'session-lumen',
+    userId: 'user-123',
+    agentId: 'lumen',
+    sbId: 'sb-lumen',
+    studioId: 'studio-lumen',
+    startedAt: new Date('2026-08-15T04:58:11Z'),
+    metadata: {},
+  };
+
+  const myraSession = {
+    id: 'session-myra',
+    userId: 'user-123',
+    agentId: 'myra',
+    sbId: 'sb-myra',
+    startedAt: new Date('2026-08-05T18:42:09Z'),
+    metadata: {},
+  };
+
+  beforeEach(() => {
+    mockDataComposer = createMockDataComposer();
+    vi.clearAllMocks();
+    callerIsAgent('myra', 'sb-myra');
+    mockDataComposer.repositories.memory.findOwnedActiveSessions.mockResolvedValue([]);
+    mockDataComposer.repositories.memory.getSessionLogs.mockResolvedValue([]);
+  });
+
+  const denied = (result: { content: Array<{ text: string }> }) => {
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toMatch(/not authorized/i);
+  };
+
+  // ---------------------------------------------------
+  // Gap 1: authorization bound to the verified request identity
+  //
+  // getEffectiveAgentId() and the old agentBound flag both consulted the
+  // process-global bootstrap pin. On HTTP that pin is null, so an agent-bound
+  // bearer resolved to "no identity" and fell through to user/admin authority.
+  // ---------------------------------------------------
+  describe('binds to the verified request identity, not the bootstrap pin', () => {
+    it('denies update_session_state on a peer session when the pin is null', async () => {
+      expect(vi.mocked(getPinnedAgentId)()).toBeNull(); // the HTTP condition
+      mockDataComposer.repositories.memory.getSession.mockResolvedValue(lumenSession);
+
+      denied(
+        await handleUpdateSessionState(
+          { email: 'test@test.com', sessionId: TARGET_UUID, context: 'clobber' },
+          mockDataComposer as never
+        )
+      );
+      expect(mockDataComposer.repositories.memory.updateSession).not.toHaveBeenCalled();
+    });
+
+    it('denies get_session logs on a peer session when the pin is null', async () => {
+      mockDataComposer.repositories.memory.getSession.mockResolvedValue(lumenSession);
+
+      const result = await handleGetSession(
+        { email: 'test@test.com', sessionId: TARGET_UUID, includeLogs: true },
+        mockDataComposer as never
+      );
+
+      denied(result);
+      expect(mockDataComposer.repositories.memory.getSessionLogs).not.toHaveBeenCalled();
+    });
+
+    it('denies compact_session on a peer session when the pin is null', async () => {
+      mockDataComposer.repositories.memory.getSession.mockResolvedValue(lumenSession);
+
+      denied(
+        await handleCompactSession(
+          { email: 'test@test.com', sessionId: TARGET_UUID },
+          mockDataComposer as never
+        )
+      );
+    });
+
+    it('does not let params.agentId stand in for the request identity', async () => {
+      // The old path ran the caller-supplied slug through getEffectiveAgentId(),
+      // which returns it verbatim when nothing is pinned.
+      mockDataComposer.repositories.memory.getSession.mockResolvedValue(lumenSession);
+
+      denied(
+        await handleUpdateSessionState(
+          {
+            email: 'test@test.com',
+            sessionId: TARGET_UUID,
+            agentId: 'lumen',
+            context: 'claiming to be lumen',
+          },
+          mockDataComposer as never
+        )
+      );
+      expect(mockDataComposer.repositories.memory.updateSession).not.toHaveBeenCalled();
+    });
+
+    it('still allows the caller its own session', async () => {
+      mockDataComposer.repositories.memory.getSession.mockResolvedValue(myraSession);
+      mockDataComposer.repositories.memory.updateSession.mockResolvedValue(myraSession);
+
+      const result = await handleUpdateSessionState(
+        { email: 'test@test.com', sessionId: TARGET_UUID, context: 'my own note' },
+        mockDataComposer as never
+      );
+
+      expect(JSON.parse(result.content[0].text).success).toBe(true);
+    });
+
+    it('keeps same-user repair authority for a human user token', async () => {
+      // callerProfile is 'agent' on every HTTP request, so it must not be read
+      // as "authenticated as an agent" — a user token still repairs its own rows.
+      callerIsUserToken();
+      mockDataComposer.repositories.memory.getSession.mockResolvedValue(lumenSession);
+      mockDataComposer.repositories.memory.updateSession.mockResolvedValue(lumenSession);
+
+      const result = await handleUpdateSessionState(
+        { email: 'test@test.com', sessionId: TARGET_UUID, context: 'operator repair' },
+        mockDataComposer as never
+      );
+
+      expect(JSON.parse(result.content[0].text).success).toBe(true);
+    });
+
+    it('never crosses users, whatever the caller presents', async () => {
+      callerIsUserToken();
+      mockDataComposer.repositories.memory.getSession.mockResolvedValue({
+        ...lumenSession,
+        userId: 'someone-else',
+      });
+
+      denied(
+        await handleUpdateSessionState(
+          { email: 'test@test.com', sessionId: TARGET_UUID, context: 'cross-user' },
+          mockDataComposer as never
+        )
+      );
+      expect(mockDataComposer.repositories.memory.updateSession).not.toHaveBeenCalled();
+    });
+  });
+
+  // ---------------------------------------------------
+  // Gap 2: a canonical target requires a canonical caller
+  //
+  // Agent-bound tokens without a canonical claim are valid today, and the slug
+  // fallback fired whenever EITHER side lacked sbId — so such a caller could
+  // reach a modern session owned by a same-named identity in another workspace.
+  // ---------------------------------------------------
+  describe('does not slug-authorize a canonical target', () => {
+    it('denies a caller with no sbId against a target that has one', async () => {
+      callerIsAgent('lumen'); // agent-bound, no canonical claim
+      mockDataComposer.repositories.memory.getSession.mockResolvedValue(lumenSession);
+
+      denied(
+        await handleUpdateSessionState(
+          { email: 'test@test.com', sessionId: TARGET_UUID, context: 'same slug, no sbId' },
+          mockDataComposer as never
+        )
+      );
+      expect(mockDataComposer.repositories.memory.updateSession).not.toHaveBeenCalled();
+    });
+
+    it('denies the same slug in a different workspace', async () => {
+      callerIsAgent('wren', 'sb-wren-workspace-a');
+      mockDataComposer.repositories.memory.getSession.mockResolvedValue({
+        ...lumenSession,
+        agentId: 'wren',
+        sbId: 'sb-wren-workspace-b',
+      });
+
+      denied(
+        await handleUpdateSessionState(
+          { email: 'test@test.com', sessionId: TARGET_UUID, context: 'across workspaces' },
+          mockDataComposer as never
+        )
+      );
+    });
+
+    it('still accepts the slug for a legacy target row that predates sb_id', async () => {
+      callerIsAgent('myra', 'sb-myra');
+      mockDataComposer.repositories.memory.getSession.mockResolvedValue({
+        ...myraSession,
+        sbId: undefined,
+      });
+      mockDataComposer.repositories.memory.updateSession.mockResolvedValue(myraSession);
+
+      const result = await handleUpdateSessionState(
+        { email: 'test@test.com', sessionId: TARGET_UUID, context: 'legacy row' },
+        mockDataComposer as never
+      );
+
+      expect(JSON.parse(result.content[0].text).success).toBe(true);
+    });
+  });
+
+  // ---------------------------------------------------
+  // Gap 3: per-contact isolation
+  //
+  // One SB identity serves many contacts, so identity ownership alone does not
+  // separate two conversations. The caller's contact scope comes from its
+  // ambient session, because the HTTP path never populates ctx.contactId.
+  // ---------------------------------------------------
+  describe('preserves per-contact session isolation', () => {
+    const contactA = { ...myraSession, id: 'session-contact-a', contactId: 'contact-a' };
+    const contactB = { ...myraSession, id: 'session-contact-b', contactId: 'contact-b' };
+
+    /** Myra serving contact A: her ambient session carries the contact scope. */
+    function servingContactA() {
+      callerIsAgent('myra', 'sb-myra', { sessionId: 'session-contact-a' });
+      mockDataComposer.repositories.memory.getSession.mockImplementation(async (id: string) =>
+        id === 'session-contact-a' ? contactA : contactB
+      );
+    }
+
+    it('denies update_session_state across contacts under one identity', async () => {
+      servingContactA();
+
+      denied(
+        await handleUpdateSessionState(
+          { email: 'test@test.com', sessionId: TARGET_UUID, context: 'into contact B' },
+          mockDataComposer as never
+        )
+      );
+      expect(mockDataComposer.repositories.memory.updateSession).not.toHaveBeenCalled();
+    });
+
+    it('denies reading another contact`s logs', async () => {
+      servingContactA();
+
+      const result = await handleGetSession(
+        { email: 'test@test.com', sessionId: TARGET_UUID, includeLogs: true },
+        mockDataComposer as never
+      );
+
+      denied(result);
+      expect(mockDataComposer.repositories.memory.getSessionLogs).not.toHaveBeenCalled();
+    });
+
+    it('denies compacting another contact`s session', async () => {
+      servingContactA();
+
+      denied(
+        await handleCompactSession(
+          { email: 'test@test.com', sessionId: TARGET_UUID },
+          mockDataComposer as never
+        )
+      );
+    });
+
+    it('allows the caller its own contact session', async () => {
+      callerIsAgent('myra', 'sb-myra', { sessionId: 'session-contact-a' });
+      mockDataComposer.repositories.memory.getSession.mockResolvedValue(contactA);
+      mockDataComposer.repositories.memory.updateSession.mockResolvedValue(contactA);
+
+      const result = await handleUpdateSessionState(
+        { email: 'test@test.com', sessionId: TARGET_UUID, context: 'my own contact' },
+        mockDataComposer as never
+      );
+
+      expect(JSON.parse(result.content[0].text).success).toBe(true);
+    });
+
+    it('denies an owner-scoped caller reaching a contact session', async () => {
+      // Symmetric on purpose: findOwnedActiveSessions already treats owner and
+      // contact sessions as disjoint sets rather than a hierarchy.
+      callerIsAgent('myra', 'sb-myra');
+      mockDataComposer.repositories.memory.getSession.mockResolvedValue(contactA);
+
+      denied(
+        await handleUpdateSessionState(
+          { email: 'test@test.com', sessionId: TARGET_UUID, context: 'owner into contact' },
+          mockDataComposer as never
+        )
+      );
+    });
+
+    it('scopes the implicit lookup to the caller`s contact', async () => {
+      callerIsAgent('myra', 'sb-myra', { sessionId: 'session-contact-a' });
+      mockDataComposer.repositories.memory.getSession.mockResolvedValue(contactA);
+      mockDataComposer.repositories.memory.updateSession.mockResolvedValue(contactA);
+
+      await handleUpdateSessionState(
+        { email: 'test@test.com', context: 'implicit within contact A' },
+        mockDataComposer as never
+      );
+
+      // Resolved via the ambient session, so no unscoped recency query ran.
+      expect(mockDataComposer.repositories.memory.updateSession).toHaveBeenCalledWith(
+        'session-contact-a',
+        expect.objectContaining({ context: 'implicit within contact A' })
+      );
+    });
+
+    it('does not let an unowned ambient session set the contact scope', async () => {
+      // A caller-composed x-ink-context naming someone else's contact session
+      // must not become the caller's scope.
+      callerIsAgent('myra', 'sb-myra', { sessionId: 'session-lumen' });
+      mockDataComposer.repositories.memory.getSession.mockImplementation(async (id: string) =>
+        id === 'session-lumen' ? { ...lumenSession, contactId: 'contact-b' } : contactB
+      );
+
+      denied(
+        await handleUpdateSessionState(
+          { email: 'test@test.com', sessionId: TARGET_UUID, context: 'borrowed scope' },
+          mockDataComposer as never
+        )
+      );
+      expect(mockDataComposer.repositories.memory.updateSession).not.toHaveBeenCalled();
+    });
+  });
+});
 
 describe('startSessionSchema - threadKey', () => {
   it('should accept threadKey as optional string', () => {

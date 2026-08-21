@@ -494,6 +494,17 @@ export class MCPServer {
       // identity — canonical sbId first — to user-token requests so
       // pinned-agent dispatch and workspace derivation work for ink-routed
       // tool calls.
+      // Snapshot the token's own identity before enrichment. Authorization
+      // reads these; everything below may be overwritten by session-derived
+      // values that are routing hints, not authentication facts.
+      if (userData?.agentId || userData?.sbId) {
+        Object.assign(ctx, {
+          agentTokenBound: true,
+          ...(userData.agentId ? { tokenAgentId: userData.agentId } : {}),
+          ...(userData.sbId ? { tokenSbId: userData.sbId } : {}),
+        });
+      }
+
       const effectiveIdentity = await this.enrichIdentityFromContextSession(userData, contextToken);
       if (effectiveIdentity && effectiveIdentity !== userData) {
         Object.assign(ctx, {
