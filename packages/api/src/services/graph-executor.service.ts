@@ -25,6 +25,7 @@ import type { TaskGroup } from '../data/repositories/task-groups.repository';
 import type { Json } from '../data/supabase/types';
 import { handleSendToInbox } from '../mcp/tools/inbox-handlers';
 import { resolveAgentSlug } from '../auth/resolve-identity';
+import { StudioLeaseService } from './studio-lease.service';
 import { logger } from '../utils/logger';
 
 export interface GraphNodeRef {
@@ -66,8 +67,30 @@ export interface GraphClaimRef {
 /** Don't re-trigger a still-undispatched node more often than this. */
 const REDISPATCH_INTERVAL_MS = 30 * 60 * 1000;
 
+/**
+ * A claim held by a live, non-terminal session is reclaimed only after this
+ * idle window AND a fail-closed not-mid-turn proof (#506 boundary). The
+ * window keeps a session that is iterating across turns (claimed, waiting
+ * on CI, next turn pending) from losing work between turns.
+ */
+const CLAIM_IDLE_RECLAIM_MS = Number(process.env.GRAPH_CLAIM_IDLE_RECLAIM_MS || 30 * 60 * 1000);
+
 export class GraphExecutorService {
-  constructor(private dataComposer: DataComposer) {}
+  private leaseService?: StudioLeaseService;
+
+  constructor(
+    private dataComposer: DataComposer,
+    leaseService?: StudioLeaseService
+  ) {
+    this.leaseService = leaseService;
+  }
+
+  private getLeaseService(): StudioLeaseService {
+    if (!this.leaseService) {
+      this.leaseService = new StudioLeaseService(this.dataComposer.getClient());
+    }
+    return this.leaseService;
+  }
 
   /**
    * Start (or resume) executing a graph-mode group: activate it, evaluate,
@@ -207,7 +230,7 @@ export class GraphExecutorService {
           dedupe: true,
         });
         triggered += result.triggered.length;
-        reclaimed += await this.reclaimTerminalClaims(
+        reclaimed += await this.reclaimAbandonedClaims(
           g.user_id,
           group,
           (sweep.claims as unknown as GraphClaimRef[]) ?? []
@@ -220,12 +243,20 @@ export class GraphExecutorService {
   }
 
   /**
-   * Reclaim claims held by ENDED sessions only. Fail-closed in both
-   * directions: a session we cannot verify keeps its claim, and a live but
-   * quiet session is never presumed abandoned — ending the session is the
-   * turn boundary that proves the holder is gone (#506 semantics).
+   * Reclaim abandoned claims — the #506 boundary, wired (Lumen round 1 P1).
+   * Two paths, both fail-closed:
+   *
+   *   TERMINAL: the holder session ended, completed, or crashed
+   *     (`ended_at`, status 'completed', lifecycle 'failed'/'completed') —
+   *     reclaimed immediately; a dead session holds nothing.
+   *   IDLE PAST THE WINDOW: the claim is older than CLAIM_IDLE_RECLAIM_MS
+   *     AND the lease service proves the holder is NOT mid-turn
+   *     (isSessionMidTurn fails closed: active run, open turn signal, or an
+   *     unreadable row all report mid-turn and the claim is kept).
+   *
+   * A session we cannot verify keeps its claim in every branch.
    */
-  private async reclaimTerminalClaims(
+  private async reclaimAbandonedClaims(
     userId: string,
     group: TaskGroup,
     claims: GraphClaimRef[]
@@ -237,19 +268,35 @@ export class GraphExecutorService {
       try {
         const { data: session, error } = await client
           .from('sessions')
-          .select('id, status, ended_at')
+          .select('id, status, ended_at, lifecycle')
           .eq('id', claim.sessionId)
           .maybeSingle();
         if (error) continue; // cannot verify → keep the claim
-        const terminal = Boolean(session?.ended_at) || session?.status === 'completed';
-        if (!session || !terminal) continue;
+        if (!session) continue; // absence is not proof of death
+
+        const terminal =
+          Boolean(session.ended_at) ||
+          session.status === 'completed' ||
+          session.lifecycle === 'failed' ||
+          session.lifecycle === 'completed';
+
+        let reason: string | null = null;
+        if (terminal) {
+          reason = `holder session ${claim.sessionId} ended (${session.lifecycle ?? session.status})`;
+        } else {
+          const age = Date.now() - Date.parse(claim.claimedAt);
+          if (Number.isNaN(age) || age < CLAIM_IDLE_RECLAIM_MS) continue;
+          const midTurn = await this.getLeaseService().isSessionMidTurn(claim.sessionId, userId);
+          if (midTurn) continue; // fail-closed: never steal from a live turn
+          reason = `holder session ${claim.sessionId} idle past reclaim window, not mid-turn`;
+        }
 
         const result = await this.dataComposer.repositories.taskGroups.releaseGraphClaim({
           userId,
           taskId: claim.taskId,
           claimToken: claim.claimToken,
           reclaim: true,
-          reason: `holder session ${claim.sessionId} ended`,
+          reason,
         });
         if (result.success) {
           reclaimed += 1;
@@ -257,6 +304,7 @@ export class GraphExecutorService {
             taskId: claim.taskId,
             taskTitle: claim.title,
             sessionId: claim.sessionId,
+            reason,
           });
         }
       } catch (err) {
@@ -302,10 +350,13 @@ export class GraphExecutorService {
     failures: GraphDependencyFailure[]
   ): Promise<void> {
     if (!failures || failures.length === 0) return;
+    // Key on (destination, source, state) triples, not destination ids: a
+    // SECOND source failing on an already-notified destination is fresh
+    // information and must re-surface (Lumen round 1 P2).
     const key = failures
-      .map((f) => f.id)
+      .map((f) => `${f.id}:${f.sources.map((s) => `${s.id}=${s.state}`).join(',')}`)
       .sort()
-      .join(',');
+      .join(';');
     const meta = (group.metadata || {}) as Record<string, unknown>;
     if (meta.graphDepFailuresNotified === key) return;
 

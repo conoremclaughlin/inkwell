@@ -52,6 +52,15 @@ interface Evaluation {
 
 const evalOf = (r: Record<string, unknown>) => r.evaluation as unknown as Evaluation;
 const readyIds = (e: Evaluation) => e.readyWork.map((n) => n.id).sort();
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Real dwell window for tests: long enough that the schedule assertion runs
+ * while the gate is still dwelling, short enough to sleep through. Direct
+ * eligible_at rewrites are fenced now (round-1 P1) — tests wait like
+ * everyone else.
+ */
+const TEST_DWELL_SECONDS = 3;
 
 d('workflow graph executor (real DB)', () => {
   let client: SupabaseClient<Database>;
@@ -132,7 +141,7 @@ d('workflow graph executor (real DB)', () => {
         task_type: 'verification',
         gate_state: 'not_ready',
         assignee_identity_id: ident,
-        verification: { notBeforeSeconds: 3600 },
+        verification: { notBeforeSeconds: TEST_DWELL_SECONDS },
       },
     ] as never);
     if (tErr) throw new Error(`fixture tasks: ${tErr.message}`);
@@ -369,6 +378,147 @@ d('workflow graph executor (real DB)', () => {
     expect(kinds).toContain('passed');
   });
 
+  it('a fully-terminal graph group may be completed manually — the fence is a predicate, not a path', async () => {
+    const { error } = await client
+      .from('task_groups')
+      .update({ status: 'completed' } as never)
+      .eq('id', g1);
+    expect(error).toBeNull();
+    // restore for any later reads
+    await client
+      .from('task_groups')
+      .update({ status: 'active' } as never)
+      .eq('id', g1);
+  });
+
+  it('P1 regression: mutating an OPEN gate’s inbound set resets it — fresh window, stale verdicts bounce, cut reopens in-transaction', async () => {
+    const g4 = randomUUID();
+    const m1 = randomUUID();
+    const m2 = randomUUID();
+    const mg = randomUUID();
+    await client
+      .from('task_groups')
+      .insert([{ id: g4, user_id: USER, title: 'exec-itest mutation-reset' }]);
+    await client.from('tasks').insert([
+      { id: m1, user_id: USER, task_group_id: g4, title: 'm1', task_type: 'work' },
+      { id: m2, user_id: USER, task_group_id: g4, title: 'm2 late dep', task_type: 'work' },
+      {
+        id: mg,
+        user_id: USER,
+        task_group_id: g4,
+        title: 'mg gate',
+        task_type: 'verification',
+        gate_state: 'not_ready',
+        assignee_identity_id: ident,
+      },
+    ] as never);
+    await groups.convertToGraph({
+      userId: USER,
+      taskGroupId: g4,
+      expectedVersion: 0,
+      systemActor: true,
+    });
+    await groups.applyTaskGraph({
+      userId: USER,
+      taskGroupId: g4,
+      expectedVersion: 1,
+      edges: [{ from: m1, to: mg }],
+      systemActor: true,
+    });
+
+    try {
+      // Open the gate.
+      const claim = await groups.claimGraphTask({ userId: USER, taskId: m1, sessionId: sess1 });
+      const done = await groups.completeGraphTask({
+        userId: USER,
+        taskId: m1,
+        sessionId: sess1,
+        claimToken: claim.claimToken as string,
+        outcome: 'completed',
+      });
+      expect(evalOf(done).openedGates.map((g) => g.id)).toEqual([mg]);
+      const { data: openRow } = await client
+        .from('tasks')
+        .select('gate_attempt, gate_version')
+        .eq('id', mg)
+        .single();
+
+      // While OPEN, a live mutation adds an unsatisfied inbound edge.
+      const mutated = await groups.applyTaskGraph({
+        userId: USER,
+        taskGroupId: g4,
+        expectedVersion: 2,
+        edges: [
+          { from: m1, to: mg },
+          { from: m2, to: mg },
+        ],
+        systemActor: true,
+      });
+      expect(mutated.success).toBe(true);
+      expect(mutated.resetGates).toEqual([mg]);
+      const { data: resetRow } = await client
+        .from('tasks')
+        .select('gate_state, gate_opened_at, dwell_started_at, eligible_at')
+        .eq('id', mg)
+        .single();
+      expect(resetRow?.gate_state).toBe('not_ready');
+      expect(resetRow?.gate_opened_at).toBeNull();
+      expect(resetRow?.dwell_started_at).toBeNull();
+
+      // A verdict carrying the pre-mutation attempt/version must bounce —
+      // the round-1 exploit was exactly this verdict landing.
+      const stale = await groups.recordGateVerdict({
+        userId: USER,
+        taskId: mg,
+        verdict: 'passed',
+        expectedAttempt: openRow!.gate_attempt,
+        expectedGateVersion: openRow!.gate_version,
+        actorIdentityId: ident!,
+        evidence: { kind: 'stale' },
+      });
+      expect(stale.success).toBe(false);
+
+      // P1 regression: the group cannot be declared complete around the
+      // executor while nodes are live.
+      const { error: completeError } = await client
+        .from('task_groups')
+        .update({ status: 'completed' } as never)
+        .eq('id', g4);
+      expect(completeError?.message).toMatch(/non-terminal/);
+
+      // Cutting the unsatisfied edge re-opens the gate IN the mutation
+      // transaction — readiness propagates on mutation events too.
+      const cut = await groups.applyTaskGraph({
+        userId: USER,
+        taskGroupId: g4,
+        expectedVersion: 3,
+        edges: [{ from: m1, to: mg }],
+        systemActor: true,
+      });
+      expect(evalOf(cut).openedGates.map((g) => g.id)).toEqual([mg]);
+
+      // And the gate is decidable again at its CURRENT attempt/version.
+      const { data: freshRow } = await client
+        .from('tasks')
+        .select('gate_attempt, gate_version')
+        .eq('id', mg)
+        .single();
+      const passed = await groups.recordGateVerdict({
+        userId: USER,
+        taskId: mg,
+        verdict: 'passed',
+        expectedAttempt: freshRow!.gate_attempt,
+        expectedGateVersion: freshRow!.gate_version,
+        actorIdentityId: ident!,
+        evidence: { kind: 'review', ref: 'post-mutation' },
+      });
+      expect(passed.success).toBe(true);
+    } finally {
+      await client.from('tasks').delete().in('id', [m1, m2, mg]);
+      await client.from('task_groups').delete().eq('id', g4);
+    }
+  });
+
   // ── Failure, dwell, retry, reclaim ───────────────────────────────────
 
   it('a failed work node surfaces a dependency failure and blocks downstream forever', async () => {
@@ -426,13 +576,16 @@ d('workflow graph executor (real DB)', () => {
     expect(gateRow?.gate_state).toBe('not_ready');
     expect(gateRow?.dwell_started_at).toBeTruthy();
 
-    // Force the window over (eligible_at is server-owned timing, not
-    // executor-owned execution state — writable for test control).
-    await client
+    // Timing is server-owned and FENCED (round-1 P1): forcing the window
+    // over from outside the executor must refuse.
+    const { error: forceError } = await client
       .from('tasks')
       .update({ eligible_at: new Date(Date.now() - 1000).toISOString() } as never)
       .eq('id', dwellGate);
+    expect(forceError?.message).toMatch(/executor-owned/);
 
+    // So the test waits out the real window; the sweep opens the gate.
+    await sleep(TEST_DWELL_SECONDS * 1000 + 500);
     const sweep = await groups.sweepTaskGraph({ userId: USER, taskGroupId: g2 });
     expect(evalOf(sweep as Record<string, unknown>).openedGates.map((g) => g.id)).toEqual([
       dwellGate,
@@ -536,10 +689,8 @@ d('workflow graph executor (real DB)', () => {
   });
 
   it('reclaim CASes on the token and returns the gate to the pool; sweep lists live claims', async () => {
-    await client
-      .from('tasks')
-      .update({ eligible_at: new Date(Date.now() - 1000).toISOString() } as never)
-      .eq('id', dwellGate);
+    // The retry left a fresh dwell window — wait it out, sweep opens.
+    await sleep(TEST_DWELL_SECONDS * 1000 + 500);
     await groups.sweepTaskGraph({ userId: USER, taskGroupId: g2 });
 
     const claim = await groups.claimGraphTask({

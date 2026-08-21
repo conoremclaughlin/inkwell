@@ -529,6 +529,18 @@ BEGIN
     RETURN jsonb_build_object('success', false, 'reason', 'gate-not-open',
       'gateState', v_task.gate_state);
   END IF;
+  -- Revalidate dependency satisfaction at verdict time (spec §Verdicts
+  -- step 2; Lumen round 1 P1). apply_task_graph resets affected gates on
+  -- inbound mutation, so this refusal should be unreachable — but a verdict
+  -- deciding a gate whose inbound no longer satisfies must never land on
+  -- the strength of a stale opening.
+  IF EXISTS (
+    SELECT 1 FROM task_edges e JOIN tasks s ON s.id = e.from_task
+    WHERE e.to_task = p_task_id
+      AND NOT graph_satisfies(s.task_type, s.status, s.gate_state)
+  ) THEN
+    RETURN jsonb_build_object('success', false, 'reason', 'dependencies-unsatisfied');
+  END IF;
   -- Attempt + version CAS: late attempt-1 results never decide attempt 2 —
   -- including from a released-and-reused studio.
   IF v_task.gate_attempt <> p_expected_attempt THEN
@@ -756,22 +768,34 @@ BEGIN
   IF NEW.task_group_id IS NULL THEN
     RETURN NEW;
   END IF;
+  -- Server-owned timing (dwell windows, eligibility, claim/open stamps) is
+  -- execution state too: a direct eligible_at rewrite would force an
+  -- hour-dwell gate open on the next sweep (Lumen, round 1 P1).
   IF TG_OP = 'UPDATE'
      AND NEW.status IS NOT DISTINCT FROM OLD.status
      AND NEW.outcome IS NOT DISTINCT FROM OLD.outcome
      AND NEW.gate_state IS NOT DISTINCT FROM OLD.gate_state
      AND NEW.gate_attempt IS NOT DISTINCT FROM OLD.gate_attempt
      AND NEW.gate_version IS NOT DISTINCT FROM OLD.gate_version
+     AND NEW.gate_opened_at IS NOT DISTINCT FROM OLD.gate_opened_at
+     AND NEW.dwell_started_at IS NOT DISTINCT FROM OLD.dwell_started_at
+     AND NEW.eligible_at IS NOT DISTINCT FROM OLD.eligible_at
+     AND NEW.completed_at IS NOT DISTINCT FROM OLD.completed_at
      AND NEW.claimed_by_session_id IS NOT DISTINCT FROM OLD.claimed_by_session_id
-     AND NEW.claim_token IS NOT DISTINCT FROM OLD.claim_token THEN
+     AND NEW.claim_token IS NOT DISTINCT FROM OLD.claim_token
+     AND NEW.claimed_at IS NOT DISTINCT FROM OLD.claimed_at THEN
     RETURN NEW;
   END IF;
   -- INSERTs are inert unless they arrive pre-executed (non-pending status,
-  -- a claim, or a gate already past not_ready).
+  -- a claim, timing stamps, or a gate already past not_ready).
   IF TG_OP = 'INSERT'
      AND NEW.status = 'pending'
      AND NEW.outcome IS NULL
      AND NEW.claimed_by_session_id IS NULL
+     AND NEW.gate_opened_at IS NULL
+     AND NEW.dwell_started_at IS NULL
+     AND NEW.eligible_at IS NULL
+     AND NEW.completed_at IS NULL
      AND (NEW.gate_state IS NULL OR NEW.gate_state = 'not_ready') THEN
     RETURN NEW;
   END IF;
@@ -792,8 +816,242 @@ $$;
 DROP TRIGGER IF EXISTS enforce_graph_execution_path ON public.tasks;
 CREATE TRIGGER enforce_graph_execution_path
   BEFORE INSERT OR UPDATE OF status, outcome, gate_state, gate_attempt, gate_version,
-    claimed_by_session_id, claim_token, task_group_id ON public.tasks
+    gate_opened_at, dwell_started_at, eligible_at, completed_at,
+    claimed_by_session_id, claim_token, claimed_at, task_group_id ON public.tasks
   FOR EACH ROW EXECUTE FUNCTION public.enforce_graph_execution_path();
+
+-- ── apply_task_graph, amended: mutation is an executor event ────────────
+--
+-- Redefines the step-1 function (Lumen, round 1 P1). Two obligations the
+-- step-1 version predates:
+--
+-- 1. "Retry and inbound/config mutation establish a fresh window" (v7):
+--    mutating a non-terminal gate's inbound set resets it to not_ready
+--    with a fresh dwell, releases any claim, and bumps gate_version so
+--    in-flight verdicts CAS-bounce. Without this, adding an unsatisfied
+--    edge to an OPEN gate left it decidable on the strength of a stale
+--    opening. Terminal gates (passed/failed) are per-attempt facts and
+--    stay untouched.
+-- 2. Readiness propagates on mutation events, not just completions: the
+--    same-transaction evaluation opens/schedules whatever the new graph
+--    makes ready (e.g. cutting a failed edge unblocks downstream now, not
+--    at the next sweep) and returns the evaluation for post-commit
+--    dispatch.
+
+CREATE OR REPLACE FUNCTION public.apply_task_graph(
+  p_user_id uuid,
+  p_task_group_id uuid,
+  p_expected_version bigint,
+  p_edges jsonb,
+  p_actor_identity_id uuid DEFAULT NULL,
+  p_actor_user_id uuid DEFAULT NULL,
+  p_system_actor boolean DEFAULT false,
+  p_constructor text DEFAULT NULL,
+  p_constructor_version text DEFAULT NULL,
+  p_config_hash text DEFAULT NULL
+) RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_group record;
+  v_current_version bigint;
+  v_invalid jsonb;
+  v_has_cycle boolean;
+  v_added jsonb;
+  v_removed jsonb;
+  v_new_version bigint;
+  v_gate record;
+  v_reset jsonb := '[]'::jsonb;
+  v_eval jsonb;
+BEGIN
+  -- Mark this transaction as the executor path (see
+  -- enforce_graph_execution_path): the gate resets below are executor
+  -- transitions. Transaction-local, resets at commit.
+  PERFORM set_config('app.graph_executor', 'on', true);
+
+  IF num_nonnulls(p_actor_identity_id, p_actor_user_id) + p_system_actor::int <> 1 THEN
+    RETURN jsonb_build_object('success', false, 'reason', 'exactly-one-actor');
+  END IF;
+
+  -- Lock BEFORE reading anything about the graph.
+  SELECT graph_version, execution_model INTO v_group
+  FROM task_groups
+  WHERE id = p_task_group_id AND user_id = p_user_id
+  FOR UPDATE;
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'reason', 'group-not-found');
+  END IF;
+  IF v_group.execution_model <> 'graph' THEN
+    RETURN jsonb_build_object('success', false, 'reason', 'not-graph-mode');
+  END IF;
+  v_current_version := v_group.graph_version;
+  IF v_current_version <> p_expected_version THEN
+    RETURN jsonb_build_object('success', false, 'reason', 'version-conflict',
+      'currentVersion', v_current_version);
+  END IF;
+
+  DROP TABLE IF EXISTS _desired_edges;
+  CREATE TEMP TABLE _desired_edges ON COMMIT DROP AS
+    SELECT DISTINCT (e->>'from')::uuid AS from_task, (e->>'to')::uuid AS to_task
+    FROM jsonb_array_elements(coalesce(p_edges, '[]'::jsonb)) e;
+
+  SELECT jsonb_agg(jsonb_build_object('from', d.from_task, 'to', d.to_task,
+           'problem',
+           CASE
+             WHEN d.from_task = d.to_task THEN 'self'
+             WHEN f.id IS NULL OR t.id IS NULL THEN 'unknown-task'
+             ELSE 'cross-group'
+           END))
+  INTO v_invalid
+  FROM _desired_edges d
+  LEFT JOIN tasks f ON f.id = d.from_task AND f.user_id = p_user_id
+  LEFT JOIN tasks t ON t.id = d.to_task AND t.user_id = p_user_id
+  WHERE d.from_task = d.to_task
+     OR f.id IS NULL OR t.id IS NULL
+     OR f.task_group_id IS DISTINCT FROM p_task_group_id
+     OR t.task_group_id IS DISTINCT FROM p_task_group_id;
+  IF v_invalid IS NOT NULL THEN
+    RETURN jsonb_build_object('success', false, 'reason', 'invalid-edges',
+      'invalid', v_invalid);
+  END IF;
+
+  WITH RECURSIVE reach(origin, node) AS (
+    SELECT e.from_task, e.to_task FROM _desired_edges e
+    UNION
+    SELECT r.origin, e.to_task
+    FROM reach r JOIN _desired_edges e ON e.from_task = r.node
+  )
+  SELECT EXISTS (SELECT 1 FROM reach WHERE origin = node) INTO v_has_cycle;
+  IF v_has_cycle THEN
+    RETURN jsonb_build_object('success', false, 'reason', 'cycle');
+  END IF;
+
+  SELECT coalesce(jsonb_agg(jsonb_build_object('from', te.from_task, 'to', te.to_task)), '[]'::jsonb)
+  INTO v_removed
+  FROM task_edges te
+  JOIN tasks tk ON tk.id = te.from_task
+  WHERE tk.task_group_id = p_task_group_id
+    AND NOT EXISTS (SELECT 1 FROM _desired_edges d
+                    WHERE d.from_task = te.from_task AND d.to_task = te.to_task);
+
+  SELECT coalesce(jsonb_agg(jsonb_build_object('from', d.from_task, 'to', d.to_task)), '[]'::jsonb)
+  INTO v_added
+  FROM _desired_edges d
+  WHERE NOT EXISTS (SELECT 1 FROM task_edges te
+                    WHERE te.from_task = d.from_task AND te.to_task = d.to_task);
+
+  DELETE FROM task_edges te
+  USING tasks tk
+  WHERE te.from_task = tk.id AND tk.task_group_id = p_task_group_id
+    AND NOT EXISTS (SELECT 1 FROM _desired_edges d
+                    WHERE d.from_task = te.from_task AND d.to_task = te.to_task);
+  INSERT INTO task_edges (from_task, to_task)
+  SELECT d.from_task, d.to_task FROM _desired_edges d
+  ON CONFLICT (from_task, to_task) DO NOTHING;
+
+  v_new_version := v_current_version + 1;
+  UPDATE task_groups SET graph_version = v_new_version WHERE id = p_task_group_id;
+
+  INSERT INTO task_graph_revisions (
+    user_id, task_group_id, graph_version,
+    actor_identity_id, actor_user_id, system_actor,
+    constructor, constructor_version, config_hash, diff
+  ) VALUES (
+    p_user_id, p_task_group_id, v_new_version,
+    p_actor_identity_id, p_actor_user_id, p_system_actor,
+    p_constructor, p_constructor_version, p_config_hash,
+    jsonb_build_object('edgesAdded', v_added, 'edgesRemoved', v_removed)
+  );
+
+  -- Fresh window for every NON-TERMINAL gate whose inbound set changed:
+  -- back to not_ready, dwell cleared, claim released, version bumped
+  -- (stale verdicts bounce on the CAS). Id order, same as the evaluator.
+  FOR v_gate IN
+    SELECT t.id, t.gate_attempt, t.gate_version, t.claimed_by_session_id, t.claim_token
+    FROM tasks t
+    WHERE t.task_group_id = p_task_group_id
+      AND t.user_id = p_user_id
+      AND t.task_type = 'verification'
+      AND t.gate_state IN ('not_ready', 'open', 'in_progress')
+      AND t.id IN (
+        SELECT (e->>'to')::uuid FROM jsonb_array_elements(v_added) e
+        UNION
+        SELECT (e->>'to')::uuid FROM jsonb_array_elements(v_removed) e
+      )
+    ORDER BY t.id
+    FOR UPDATE
+  LOOP
+    IF v_gate.claimed_by_session_id IS NOT NULL THEN
+      INSERT INTO task_gate_events (user_id, task_id, event, attempt, gate_version,
+                                    session_id, claim_token, reason)
+      VALUES (p_user_id, v_gate.id, 'claim_released', v_gate.gate_attempt,
+              v_gate.gate_version + 1, v_gate.claimed_by_session_id,
+              v_gate.claim_token, 'inbound-mutation');
+    END IF;
+    UPDATE tasks SET
+      gate_state = 'not_ready',
+      gate_version = gate_version + 1,
+      gate_opened_at = NULL,
+      dwell_started_at = NULL,
+      eligible_at = NULL,
+      status = 'pending',
+      claimed_by_session_id = NULL,
+      claim_token = NULL,
+      claimed_at = NULL
+    WHERE id = v_gate.id;
+    v_reset := v_reset || to_jsonb(v_gate.id);
+  END LOOP;
+
+  v_eval := _graph_evaluate_group(p_user_id, p_task_group_id);
+
+  RETURN jsonb_build_object('success', true, 'graphVersion', v_new_version,
+    'added', v_added, 'removed', v_removed, 'resetGates', v_reset,
+    'evaluation', v_eval);
+END;
+$$;
+
+-- ── Group completion is earned, never declared (Lumen round 1 P1) ───────
+--
+-- update_task_group(status:'completed') / close_task_group on a graph
+-- group with live nodes would strand them: the sweep only reconciles
+-- ACTIVE groups. The rule is predicate-based, not path-based: a graph
+-- group reaches 'completed' only when every node is terminal — which is
+-- exactly the state in which the executor's own finalization runs, so the
+-- legitimate path needs no marker. 'cancelled' stays available as the
+-- operator escape hatch.
+
+CREATE OR REPLACE FUNCTION public.enforce_graph_group_completion()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  IF NEW.status <> 'completed' OR OLD.status = 'completed' THEN
+    RETURN NEW;
+  END IF;
+  IF NEW.execution_model <> 'graph' THEN
+    RETURN NEW;
+  END IF;
+  IF EXISTS (
+    SELECT 1 FROM tasks t
+    WHERE t.task_group_id = NEW.id
+      AND NOT (t.status IN ('completed', 'archived')
+               OR (t.status = 'blocked' AND t.outcome IS NOT NULL))
+  ) THEN
+    RAISE EXCEPTION
+      'graph-mode group cannot complete with non-terminal nodes — the executor finalizes when every node is terminal (cancel to abandon)';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS enforce_graph_group_completion ON public.task_groups;
+CREATE TRIGGER enforce_graph_group_completion
+  BEFORE UPDATE OF status ON public.task_groups
+  FOR EACH ROW EXECUTE FUNCTION public.enforce_graph_group_completion();
 
 -- ── Grants (house pattern: service-role only; evaluator internal) ───────
 

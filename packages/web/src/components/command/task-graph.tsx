@@ -70,13 +70,15 @@ function TaskNodeComponent({ data }: { data: Record<string, unknown> }) {
           : skin.colors.taskPending
     : status === 'completed'
       ? skin.colors.taskCompleted
-      : status === 'in_progress'
-        ? skin.colors.taskInProgress
-        : status === 'blocked'
-          ? skin.colors.taskBlocked
-          : data.ready
-            ? skin.colors.accent
-            : skin.colors.taskPending;
+      : status === 'archived'
+        ? skin.colors.border
+        : status === 'in_progress'
+          ? skin.colors.taskInProgress
+          : status === 'blocked'
+            ? skin.colors.taskBlocked
+            : data.ready
+              ? skin.colors.accent
+              : skin.colors.taskPending;
 
   const priorityBadge =
     priority === 'critical' ? '🔴' : priority === 'high' ? '🟠' : priority === 'medium' ? '🟡' : '';
@@ -269,7 +271,10 @@ export function TaskGraph() {
       const dep = byId.get(depId);
       if (!dep) return false;
       if (dep.taskType === 'verification') return dep.gateState === 'failed';
-      return dep.outcome === 'failed' || dep.outcome === 'skipped';
+      // Archived work is unsatisfiable-terminal (matches graph_unsatisfiable
+      // in the DB) — the API ships archived blockers of the active set
+      // precisely so this reads them.
+      return dep.status === 'archived' || dep.outcome === 'failed' || dep.outcome === 'skipped';
     };
     const isReady = (t: (typeof tasks)[number]): boolean =>
       t.taskType !== 'verification' &&

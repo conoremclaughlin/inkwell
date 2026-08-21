@@ -116,6 +116,16 @@ export async function handleApplyTaskGraph(
       actorIdentityId,
       actorUserId: actorIdentityId ? undefined : resolved.user.id,
     });
+    // A mutation is an executor event: whatever the new graph made ready
+    // (e.g. a cut edge unblocking downstream) is dispatched now.
+    if (result.success) {
+      await dispatchAfterMutation(
+        dataComposer,
+        resolved.user.id,
+        args.taskGroupId,
+        result.evaluation
+      );
+    }
     return mcpResponse(result, result.success === false);
   } catch (error) {
     return mcpResponse(

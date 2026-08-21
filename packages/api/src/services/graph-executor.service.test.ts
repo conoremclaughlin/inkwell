@@ -29,6 +29,18 @@ vi.mock('../auth/resolve-identity', () => ({
   resolveAgentSlug: vi.fn().mockResolvedValue('wren'),
 }));
 
+// The #506 boundary primitive: tests drive it directly. Defaults to
+// MID-TURN (the fail-closed answer) so no test accidentally passes because
+// the mock was permissive.
+const { midTurnMock } = vi.hoisted(() => ({
+  midTurnMock: vi.fn<() => Promise<boolean>>().mockResolvedValue(true),
+}));
+vi.mock('./studio-lease.service', () => ({
+  StudioLeaseService: class {
+    isSessionMidTurn = midTurnMock;
+  },
+}));
+
 const sendMock = vi.mocked(handleSendToInbox);
 
 const USER = 'u-1';
@@ -56,7 +68,12 @@ const emptyEval: GraphEvaluation = {
 };
 
 interface ComposerConfig {
-  sessionRow?: { id: string; status: string | null; ended_at: string | null } | null;
+  sessionRow?: {
+    id: string;
+    status: string | null;
+    ended_at: string | null;
+    lifecycle?: string | null;
+  } | null;
   sessionLookupError?: boolean;
   taskStamps?: Record<string, string>;
 }
@@ -134,6 +151,12 @@ const claim: GraphClaimRef = {
   claimedAt: new Date().toISOString(),
 };
 
+/** A claim well past the idle-reclaim window (default 30 min). */
+const oldClaim: GraphClaimRef = {
+  ...claim,
+  claimedAt: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
+};
+
 function sweepResult(claims: GraphClaimRef[]) {
   return { success: true, evaluation: emptyEval, claims };
 }
@@ -156,6 +179,8 @@ async function runSweep(cfg: ComposerConfig, claims: GraphClaimRef[]) {
 describe('GraphExecutorService reclaim (fail-closed)', () => {
   beforeEach(() => {
     sendMock.mockClear();
+    midTurnMock.mockClear();
+    midTurnMock.mockResolvedValue(true);
   });
 
   it('reclaims a claim whose holder session has ended', async () => {
@@ -167,23 +192,54 @@ describe('GraphExecutorService reclaim (fail-closed)', () => {
     expect(releases[0]).toMatchObject({ taskId: 't-1', claimToken: 'tok-1', reclaim: true });
   });
 
-  it('a live session keeps its claim — quiet is not abandoned', async () => {
+  it("reclaims a claim whose holder crashed — lifecycle 'failed' is terminal (round-1 P1)", async () => {
     const { releases, result } = await runSweep(
-      { sessionRow: { id: 's-1', status: 'active', ended_at: null } },
+      { sessionRow: { id: 's-1', status: 'active', ended_at: null, lifecycle: 'failed' } },
       [claim]
+    );
+    expect(result.reclaimed).toBe(1);
+    expect(releases[0]).toMatchObject({ reclaim: true });
+  });
+
+  it('a fresh claim on a live session is kept without even consulting the turn signal', async () => {
+    const { releases, result } = await runSweep(
+      { sessionRow: { id: 's-1', status: 'active', ended_at: null, lifecycle: 'idle' } },
+      [claim]
+    );
+    expect(result.reclaimed).toBe(0);
+    expect(releases).toHaveLength(0);
+    expect(midTurnMock).not.toHaveBeenCalled();
+  });
+
+  it('an idle session past the window loses its claim once provably not mid-turn (round-1 P1)', async () => {
+    midTurnMock.mockResolvedValue(false);
+    const { releases, result } = await runSweep(
+      { sessionRow: { id: 's-1', status: 'active', ended_at: null, lifecycle: 'idle' } },
+      [oldClaim]
+    );
+    expect(result.reclaimed).toBe(1);
+    expect(releases[0]).toMatchObject({ reclaim: true });
+    expect(midTurnMock).toHaveBeenCalledWith('s-1', USER);
+  });
+
+  it('an idle session past the window KEEPS its claim while mid-turn — never steal from a live turn', async () => {
+    midTurnMock.mockResolvedValue(true);
+    const { releases, result } = await runSweep(
+      { sessionRow: { id: 's-1', status: 'active', ended_at: null, lifecycle: 'idle' } },
+      [oldClaim]
     );
     expect(result.reclaimed).toBe(0);
     expect(releases).toHaveLength(0);
   });
 
   it('an unverifiable session keeps its claim — lookup errors fail closed', async () => {
-    const { releases, result } = await runSweep({ sessionLookupError: true }, [claim]);
+    const { releases, result } = await runSweep({ sessionLookupError: true }, [oldClaim]);
     expect(result.reclaimed).toBe(0);
     expect(releases).toHaveLength(0);
   });
 
   it('a missing session row keeps its claim — absence is not proof of death', async () => {
-    const { releases, result } = await runSweep({ sessionRow: null }, [claim]);
+    const { releases, result } = await runSweep({ sessionRow: null }, [oldClaim]);
     expect(result.reclaimed).toBe(0);
     expect(releases).toHaveLength(0);
   });
@@ -264,6 +320,54 @@ describe('GraphExecutorService dispatch', () => {
     expect(sendMock).toHaveBeenCalledTimes(1);
     const sent = sendMock.mock.calls[0][0] as Record<string, unknown>;
     expect(String(sent.content)).toContain('complete');
+  });
+
+  it('a NEW failed source on an already-notified destination re-surfaces (round-1 P2)', async () => {
+    const ctx = makeComposer();
+    const service = new GraphExecutorService(ctx.composer);
+    const oneSource = {
+      id: 'd1',
+      title: 'downstream',
+      sources: [{ id: 's1', title: 'a', state: 'failed' }],
+    };
+
+    await service.dispatchEvaluation(
+      USER,
+      baseGroup,
+      { ...emptyEval, dependencyFailures: [oneSource] },
+      { dedupe: true }
+    );
+    const failureCount = () =>
+      ctx.activities.filter((a) => a.subtype === 'graph_dependency_failure').length;
+    expect(failureCount()).toBe(1);
+    const stampedKey = (ctx.groupUpdates.at(-1)?.metadata as Record<string, unknown>)
+      .graphDepFailuresNotified as string;
+
+    // Same failure set on a stamped group → suppressed.
+    const stampedGroup = {
+      ...baseGroup,
+      metadata: { graphDepFailuresNotified: stampedKey },
+    } as TaskGroup;
+    await service.dispatchEvaluation(
+      USER,
+      stampedGroup,
+      { ...emptyEval, dependencyFailures: [oneSource] },
+      { dedupe: true }
+    );
+    expect(failureCount()).toBe(1);
+
+    // A SECOND source failing on the SAME destination is fresh information.
+    const twoSources = {
+      ...oneSource,
+      sources: [...oneSource.sources, { id: 's2', title: 'b', state: 'skipped' }],
+    };
+    await service.dispatchEvaluation(
+      USER,
+      stampedGroup,
+      { ...emptyEval, dependencyFailures: [twoSources] },
+      { dedupe: true }
+    );
+    expect(failureCount()).toBe(2);
   });
 
   it('a human-assigned gate is surfaced as awaiting-human, never messaged as an agent', async () => {
