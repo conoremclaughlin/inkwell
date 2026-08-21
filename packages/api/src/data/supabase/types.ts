@@ -4433,6 +4433,15 @@ export type Database = {
           total_candidates: number;
         }[];
       };
+      grant_studio_lease: {
+        Args: {
+          p_studio_id: string;
+          p_user_id: string;
+          p_lease: Json;
+          p_expected_prior?: Json | null;
+        };
+        Returns: Json;
+      };
       match_artifacts: {
         Args: {
           match_count?: number;
@@ -4579,6 +4588,10 @@ export type Database = {
           title: string;
         }[];
       };
+      normalize_worktree_path: {
+        Args: { p: string | null };
+        Returns: string | null;
+      };
       record_gate_verdict: {
         Args: {
           p_user_id: string;
@@ -4619,6 +4632,13 @@ export type Database = {
       };
       show_limit: { Args: never; Returns: number };
       show_trgm: { Args: { '': string }; Returns: string[] };
+      studio_path_conflict: {
+        Args: {
+          p_studio_id: string;
+          p_user_id: string;
+        };
+        Returns: Json;
+      };
       sweep_task_graph: {
         Args: {
           p_user_id: string;
