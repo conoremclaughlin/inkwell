@@ -90,6 +90,9 @@ DECLARE
   v_group_complete boolean;
   v_counts record;
 BEGIN
+  -- Mark this transaction as the executor path (see
+  -- enforce_graph_execution_path): transaction-local, resets at commit.
+  PERFORM set_config('app.graph_executor', 'on', true);
   -- Gate transitions, id order (see lock discipline above).
   FOR v_gate IN
     SELECT t.id, t.title, t.gate_attempt, t.gate_version,
@@ -243,6 +246,9 @@ DECLARE
   v_group record;
   v_token uuid;
 BEGIN
+  -- Mark this transaction as the executor path (see
+  -- enforce_graph_execution_path): transaction-local, resets at commit.
+  PERFORM set_config('app.graph_executor', 'on', true);
   SELECT * INTO v_task FROM tasks
   WHERE id = p_task_id AND user_id = p_user_id
   FOR UPDATE;
@@ -343,6 +349,9 @@ AS $$
 DECLARE
   v_task record;
 BEGIN
+  -- Mark this transaction as the executor path (see
+  -- enforce_graph_execution_path): transaction-local, resets at commit.
+  PERFORM set_config('app.graph_executor', 'on', true);
   SELECT * INTO v_task FROM tasks
   WHERE id = p_task_id AND user_id = p_user_id
   FOR UPDATE;
@@ -401,6 +410,9 @@ DECLARE
   v_group record;
   v_eval jsonb;
 BEGIN
+  -- Mark this transaction as the executor path (see
+  -- enforce_graph_execution_path): transaction-local, resets at commit.
+  PERFORM set_config('app.graph_executor', 'on', true);
   IF p_outcome NOT IN ('completed', 'failed', 'skipped') THEN
     RETURN jsonb_build_object('success', false, 'reason', 'invalid-outcome');
   END IF;
@@ -486,6 +498,9 @@ DECLARE
   v_eval jsonb;
   v_new_version bigint;
 BEGIN
+  -- Mark this transaction as the executor path (see
+  -- enforce_graph_execution_path): transaction-local, resets at commit.
+  PERFORM set_config('app.graph_executor', 'on', true);
   IF p_verdict NOT IN ('passed', 'failed') THEN
     RETURN jsonb_build_object('success', false, 'reason', 'invalid-verdict');
   END IF;
@@ -602,6 +617,9 @@ DECLARE
   v_group record;
   v_eval jsonb;
 BEGIN
+  -- Mark this transaction as the executor path (see
+  -- enforce_graph_execution_path): transaction-local, resets at commit.
+  PERFORM set_config('app.graph_executor', 'on', true);
   IF num_nonnulls(p_actor_identity_id, p_actor_user_id) <> 1 THEN
     RETURN jsonb_build_object('success', false, 'reason', 'exactly-one-actor');
   END IF;
@@ -711,6 +729,71 @@ BEGIN
   RETURN jsonb_build_object('success', true, 'evaluation', v_eval, 'claims', v_claims);
 END;
 $$;
+
+-- ── The executor path is DB-atomic, not advisory ────────────────────────
+--
+-- Same lesson as enforce_blocked_by_source (step 1, Lumen round 1): an
+-- application-level "graph tasks must use claim/complete/verdict" check is
+-- check-then-write and therefore advisory. This trigger makes the refusal
+-- part of the write's own transaction: execution-owned columns (status,
+-- outcome, gate projections, claim fields) on graph-mode tasks change only
+-- inside the executor RPCs, which mark their transaction with a local GUC.
+-- update_task, legacy completeTask, admin endpoints, and ad-hoc SQL all
+-- hit the fence; metadata/title/priority edits pass untouched.
+
+CREATE OR REPLACE FUNCTION public.enforce_graph_execution_path()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_model text;
+BEGIN
+  IF current_setting('app.graph_executor', true) = 'on' THEN
+    RETURN NEW;
+  END IF;
+  IF NEW.task_group_id IS NULL THEN
+    RETURN NEW;
+  END IF;
+  IF TG_OP = 'UPDATE'
+     AND NEW.status IS NOT DISTINCT FROM OLD.status
+     AND NEW.outcome IS NOT DISTINCT FROM OLD.outcome
+     AND NEW.gate_state IS NOT DISTINCT FROM OLD.gate_state
+     AND NEW.gate_attempt IS NOT DISTINCT FROM OLD.gate_attempt
+     AND NEW.gate_version IS NOT DISTINCT FROM OLD.gate_version
+     AND NEW.claimed_by_session_id IS NOT DISTINCT FROM OLD.claimed_by_session_id
+     AND NEW.claim_token IS NOT DISTINCT FROM OLD.claim_token THEN
+    RETURN NEW;
+  END IF;
+  -- INSERTs are inert unless they arrive pre-executed (non-pending status,
+  -- a claim, or a gate already past not_ready).
+  IF TG_OP = 'INSERT'
+     AND NEW.status = 'pending'
+     AND NEW.outcome IS NULL
+     AND NEW.claimed_by_session_id IS NULL
+     AND (NEW.gate_state IS NULL OR NEW.gate_state = 'not_ready') THEN
+    RETURN NEW;
+  END IF;
+
+  SELECT execution_model INTO v_model
+  FROM task_groups
+  WHERE id = NEW.task_group_id
+  FOR SHARE;
+
+  IF v_model = 'graph' THEN
+    RAISE EXCEPTION
+      'execution state is executor-owned for graph-mode groups — use claim_task / complete_task(claimToken) / record_gate_verdict / retry_gate';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS enforce_graph_execution_path ON public.tasks;
+CREATE TRIGGER enforce_graph_execution_path
+  BEFORE INSERT OR UPDATE OF status, outcome, gate_state, gate_attempt, gate_version,
+    claimed_by_session_id, claim_token, task_group_id ON public.tasks
+  FOR EACH ROW EXECUTE FUNCTION public.enforce_graph_execution_path();
 
 -- ── Grants (house pattern: service-role only; evaluator internal) ───────
 

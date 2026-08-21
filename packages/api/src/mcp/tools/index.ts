@@ -43,6 +43,25 @@ import {
   closeTaskGroupSchema,
 } from './task-handlers';
 
+import {
+  handleApplyTaskGraph,
+  handleConvertTaskGroupToGraph,
+  handleGetTaskGraph,
+  handleStartGraphExecution,
+  handleClaimTask,
+  handleReleaseClaim,
+  handleRecordGateVerdict,
+  handleRetryGate,
+  applyTaskGraphSchema,
+  convertTaskGroupToGraphSchema,
+  getTaskGraphSchema,
+  startGraphExecutionSchema,
+  claimTaskSchema,
+  releaseClaimSchema,
+  recordGateVerdictSchema,
+  retryGateSchema,
+} from './task-graph-handlers';
+
 import { handleSendResponse, handleGetPendingMessages, handleMarkRead } from './response-handlers';
 
 import {
@@ -1025,10 +1044,22 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
     {
       description: `Mark a task as completed.
 
+For tasks in graph-mode groups, completion is claim-token-gated: claim the task first (claim_task) and pass claimToken here.
+
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: {
         ...userIdentifierFields,
         taskId: z.string().uuid().describe('Task ID to mark as completed'),
+        summary: z
+          .string()
+          .max(2000)
+          .optional()
+          .describe('Brief summary of what was accomplished (shown in mission feed)'),
+        claimToken: z
+          .string()
+          .uuid()
+          .optional()
+          .describe('Required for graph-mode tasks: the claim token from claim_task'),
       },
     },
     async (args) => {
@@ -1048,6 +1079,160 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           ],
           isError: true,
         };
+      }
+    }
+  );
+
+  // ── Workflow graph tools (spec: ink://specs/workflow-graph v10) ────────
+
+  const graphToolError = (name: string) => (error: unknown) => {
+    logger.error(`Error in ${name}:`, error);
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: JSON.stringify({
+            success: false,
+            error: error instanceof Error ? error.message : 'Unknown error',
+          }),
+        },
+      ],
+      isError: true,
+    };
+  };
+
+  server.registerTool(
+    'convert_task_group_to_graph',
+    {
+      description: `Convert a linear task group to graph execution. Validated preflight: existing blocked_by arrays become task_edges only when fully valid (no dangling/self/cross-group/cyclic entries); on any failure the group stays linear, reported explicitly. Only idle/paused groups convert.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: convertTaskGroupToGraphSchema,
+    },
+    async (args) => {
+      try {
+        return await handleConvertTaskGroupToGraph(args, dataComposer);
+      } catch (error) {
+        return graphToolError('convert_task_group_to_graph')(error);
+      }
+    }
+  );
+
+  server.registerTool(
+    'apply_task_graph',
+    {
+      description: `Replace a graph-mode group's dependency edges with the complete desired set (serialized, graph_version CAS, cycle-checked). An edge from→to means "from must complete/pass before to can start". This is the ONLY way to mutate graph dependencies — blocked_by is frozen for graph groups.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: applyTaskGraphSchema,
+    },
+    async (args) => {
+      try {
+        return await handleApplyTaskGraph(args, dataComposer);
+      } catch (error) {
+        return graphToolError('apply_task_graph')(error);
+      }
+    }
+  );
+
+  server.registerTool(
+    'get_task_graph',
+    {
+      description: `Read a task group's graph: nodes (with gate state, claims, dwell windows, assignees) and edges, plus graphVersion for CAS on mutations. Use before apply_task_graph, record_gate_verdict, or retry_gate.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: getTaskGraphSchema,
+    },
+    async (args) => {
+      try {
+        return await handleGetTaskGraph(args, dataComposer);
+      } catch (error) {
+        return graphToolError('get_task_graph')(error);
+      }
+    }
+  );
+
+  server.registerTool(
+    'start_graph_execution',
+    {
+      description: `Start (or resume) executing a graph-mode task group: activates it, evaluates readiness, and dispatches every ready node to its assignee. The reconciliation sweep keeps it moving afterward.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: startGraphExecutionSchema,
+    },
+    async (args) => {
+      try {
+        return await handleStartGraphExecution(args, dataComposer);
+      } catch (error) {
+        return graphToolError('start_graph_execution')(error);
+      }
+    }
+  );
+
+  server.registerTool(
+    'claim_task',
+    {
+      description: `Claim a ready graph node for this session. Returns a claimToken required to complete the task (work) or record a verdict (claimed executable gate). Exactly one session holds a claim; refusals are structured (not-ready, already-claimed, gate-not-open, approval-gate).
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: claimTaskSchema,
+    },
+    async (args) => {
+      try {
+        return await handleClaimTask(args, dataComposer);
+      } catch (error) {
+        return graphToolError('claim_task')(error);
+      }
+    }
+  );
+
+  server.registerTool(
+    'release_claim',
+    {
+      description: `Release a claim you hold on a graph node without completing it — the node returns to the ready pool (work → pending, gate → open) for another session.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: releaseClaimSchema,
+    },
+    async (args) => {
+      try {
+        return await handleReleaseClaim(args, dataComposer);
+      } catch (error) {
+        return graphToolError('release_claim')(error);
+      }
+    }
+  );
+
+  server.registerTool(
+    'record_gate_verdict',
+    {
+      description: `Record a verdict on an open verification gate: passed (evidence required) or failed (reason required). Attempt + gateVersion CAS — read them via get_task_graph first. Authority: the claim holder for claimed gates, the assignee otherwise. Passing pushes downstream nodes ready in the same transaction.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: recordGateVerdictSchema,
+    },
+    async (args) => {
+      try {
+        return await handleRecordGateVerdict(args, dataComposer);
+      } catch (error) {
+        return graphToolError('record_gate_verdict')(error);
+      }
+    }
+  );
+
+  server.registerTool(
+    'retry_gate',
+    {
+      description: `Retry a FAILED verification gate after remediation: new attempt on the same node, fresh dwell window, prior evidence immutable in the event log.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: retryGateSchema,
+    },
+    async (args) => {
+      try {
+        return await handleRetryGate(args, dataComposer);
+      } catch (error) {
+        return graphToolError('retry_gate')(error);
       }
     }
   );
