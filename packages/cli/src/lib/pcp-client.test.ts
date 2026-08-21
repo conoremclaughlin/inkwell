@@ -229,6 +229,43 @@ describe('PcpClient surfaces failed tool calls', () => {
     expect(result.error).toBe('User not found');
   });
 
+  it('surfaces error text even when a non-text content block comes first', async () => {
+    global.fetch = vi.fn(async () =>
+      okJson({
+        jsonrpc: '2.0',
+        id: 1,
+        result: {
+          content: [
+            { type: 'image', data: 'not-used-by-the-client', mimeType: 'image/png' },
+            { type: 'text', text: 'handler exploded after rendering diagnostics' },
+          ],
+          isError: true,
+        },
+      })
+    ) as unknown as typeof fetch;
+
+    await expect(makeClient().callTool('some_tool', {})).rejects.toThrow(
+      /handler exploded after rendering diagnostics/
+    );
+  });
+
+  it('throws a generic error when a failed result contains no text', async () => {
+    global.fetch = vi.fn(async () =>
+      okJson({
+        jsonrpc: '2.0',
+        id: 1,
+        result: {
+          content: [{ type: 'image', data: 'not-used-by-the-client', mimeType: 'image/png' }],
+          isError: true,
+        },
+      })
+    ) as unknown as typeof fetch;
+
+    await expect(makeClient().callTool('some_tool', {})).rejects.toThrow(
+      /failed without a text error message/
+    );
+  });
+
   it('still returns plain non-JSON text when the call did not fail', async () => {
     global.fetch = vi.fn(async () =>
       okJson({

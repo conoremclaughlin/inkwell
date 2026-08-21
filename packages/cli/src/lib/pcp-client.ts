@@ -268,7 +268,7 @@ export class PcpClient {
     }
 
     const toolResult = payload.result;
-    const firstText = toolResult?.content?.[0]?.text;
+    const firstText = toolResult?.content?.find((item) => typeof item.text === 'string')?.text;
     if (typeof firstText === 'string') {
       try {
         return JSON.parse(firstText) as PcpToolCallResult;
@@ -288,6 +288,13 @@ export class PcpClient {
         }
         return { text: firstText };
       }
+    }
+
+    // CallToolResult content is not restricted to text. Preserve the failure
+    // boundary even when an error contains only media (or no content at all),
+    // rather than returning the raw isError object as a successful result.
+    if (toolResult?.isError) {
+      throw new Error('PCP tool call failed without a text error message');
     }
 
     return (toolResult as PcpToolCallResult) || {};
