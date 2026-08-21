@@ -3485,7 +3485,9 @@ describe('SessionService', () => {
         service.getOrCreateSession('user-456', 'wren', { threadKey: 'issue:42' })
       ).rejects.toMatchObject({
         code: 'ROUTING_REFUSED',
-        detail: { reason: 'occupied' },
+        // policy travels with the hold so it reads as the policy deciding,
+        // not as an overflow failure someone should go fix (r1 P2).
+        detail: { reason: 'occupied', policy: 'reuse-only' },
       });
 
       expect(overflowSpy).not.toHaveBeenCalled();
@@ -3558,12 +3560,20 @@ describe('SessionService', () => {
         })
       );
 
-      await expect(
-        service.getOrCreateSession('user-456', 'wren', { threadKey: 'issue:43' })
-      ).rejects.toMatchObject({
+      const rejection = await service
+        .getOrCreateSession('user-456', 'wren', { threadKey: 'issue:43' })
+        .then(
+          () => null,
+          (err: Error & { detail?: Record<string, unknown> }) => err
+        );
+      expect(rejection).toMatchObject({
         code: 'ROUTING_REFUSED',
-        detail: { reason: 'occupied' },
+        detail: { reason: 'occupied', policy: 'reuse-only' },
       });
+      // The hold explains ITSELF as a policy decision — not as an overflow
+      // provisioning failure to go hunt for in the logs (r1 P2).
+      expect(rejection?.message).toContain('reuse-only');
+      expect(rejection?.message).not.toContain('overflow');
 
       expect(acquireSpy).toHaveBeenCalled();
       expect(overflowSpy).not.toHaveBeenCalled();
@@ -3625,6 +3635,124 @@ describe('SessionService', () => {
       getLeaseSpy.mockRestore();
       acquireSpy.mockRestore();
       logEventSpy.mockRestore();
+    });
+
+    /**
+     * The THIRD worktree-creating path (r1 P1): deferred D1 parent creation.
+     * The caller repo resolves but the agent has no studio for it at all —
+     * for a provision thread the create boundary builds the D1 parent; for a
+     * reuse-only thread it must hold instead. Durable vs ephemeral makes no
+     * difference: it is still an automatic worktree for a discussion.
+     */
+    function callerRepoNoStudioSupabase(opts: {
+      keyType: string;
+      template: ReturnType<typeof threadKeyTemplate>;
+    }) {
+      const has = (calls: RecordedCall[], col: string, val?: unknown) =>
+        calls.some(
+          (c) => c.method === 'eq' && c.args[0] === col && (val === undefined || c.args[1] === val)
+        );
+      return {
+        from: vi.fn().mockImplementation((table: string) => {
+          const calls: RecordedCall[] = [];
+          if (table === 'sessions') {
+            return createFilterAwareChain(
+              (c) =>
+                has(c, 'id', 'sender-session-1')
+                  ? { data: { studio_id: 'sender-studio-1' } }
+                  : { data: null },
+              calls
+            );
+          }
+          if (table === 'agent_identities') {
+            return createFilterAwareChain(() => ({ data: [{ id: 'sb-wren' }] }), calls);
+          }
+          if (table === 'inbox_threads') {
+            return createFilterAwareChain(() => ({ data: { key_type: opts.keyType } }), calls);
+          }
+          if (table === 'thread_key_types') {
+            return createFilterAwareChain(() => ({ data: [opts.template] }), calls);
+          }
+          if (table === 'studios') {
+            return createFilterAwareChain((c) => {
+              // Sender-studio lookup hands back the repo; every other studio
+              // lookup misses — the agent has NO studio for this repo.
+              if (has(c, 'id', 'sender-studio-1')) {
+                return { data: { repo_root: '/repos/inkwell' } };
+              }
+              return { data: null };
+            }, calls);
+          }
+          return createRecordingChain({ data: null }, calls);
+        }),
+      };
+    }
+
+    it('reuse-only thread with no studio for its repo holds — the D1 parent is not auto-created', async () => {
+      const parentSpy = vi
+        .spyOn(StudioOverflowService.prototype, 'ensureParentStudio')
+        .mockResolvedValue(null as never);
+
+      const service = serviceWith(
+        callerRepoNoStudioSupabase({
+          keyType: 'issue',
+          template: threadKeyTemplate('issue', 'write', 'reuse-only'),
+        })
+      );
+
+      const rejection = await service
+        .getOrCreateSession('user-456', 'wren', {
+          threadKey: 'issue:44',
+          callerStudioId: 'sender-studio-1',
+          callerSessionId: 'sender-session-1',
+        })
+        .then(
+          () => null,
+          (err: Error & { detail?: Record<string, unknown> }) => err
+        );
+
+      expect(rejection).toMatchObject({
+        code: 'ROUTING_REFUSED',
+        detail: {
+          reason: 'no-route',
+          policy: 'reuse-only',
+          callerRepoRoot: '/repos/inkwell',
+        },
+      });
+      expect(rejection?.message).toContain('reuse-only');
+
+      expect(parentSpy).not.toHaveBeenCalled();
+      expect(mockRepository.create).not.toHaveBeenCalled();
+      parentSpy.mockRestore();
+    });
+
+    it('provision thread with no studio for its repo still auto-creates the D1 parent', async () => {
+      const parentSpy = vi
+        .spyOn(StudioOverflowService.prototype, 'ensureParentStudio')
+        .mockResolvedValue(null as never);
+      // getLease is consulted by gateOccupancy if creation succeeded; with
+      // the spy returning null, creation FAILS and the no-route hold fires —
+      // the attempt itself is the claim, mirroring the overflow tests.
+      const service = serviceWith(
+        callerRepoNoStudioSupabase({
+          keyType: 'pr',
+          template: threadKeyTemplate('pr', 'write', 'provision'),
+        })
+      );
+
+      await expect(
+        service.getOrCreateSession('user-456', 'wren', {
+          threadKey: 'pr:3300',
+          callerStudioId: 'sender-studio-1',
+          callerSessionId: 'sender-session-1',
+        })
+      ).rejects.toMatchObject({
+        code: 'ROUTING_REFUSED',
+        detail: { reason: 'no-route' },
+      });
+
+      expect(parentSpy).toHaveBeenCalled();
+      parentSpy.mockRestore();
     });
 
     it('PRODUCTION ORDER: presence intent bypasses the occupancy gate inside routing (r3 P0-1)', async () => {
