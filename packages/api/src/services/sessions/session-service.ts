@@ -714,12 +714,15 @@ export class SessionService implements ISessionService {
       // holder === null means the studio could not even be verified as this
       // user's — do not write an event pairing this user with a studio they
       // may not own; the fail-closed clear below still applies.
-      // Same policy gate as gateOccupancy: reuse-only threads hold on
-      // conflict, they do not get a worktree built. Decided HERE, before the
-      // conflict is logged, so the event and warn describe a deliberate
-      // policy hold rather than claiming a divert that never runs (Lumen
-      // #523 r1 P2).
-      const policyHold = ctx.studioPolicy === 'reuse-only';
+      // Same policy gate as gateOccupancy: reuse-only threads never get a
+      // worktree built, so provisioning is SKIPPED. But "hold" semantics
+      // require a VERIFIED holder — acquire() returns holder: null for
+      // missing/retired/foreign/unverifiable studios, and that branch clears
+      // the binding rather than holding. The two are named apart so every
+      // diagnostic below describes what actually happens next (Lumen #523
+      // r1+r2 P2).
+      const skipProvisioning = ctx.studioPolicy === 'reuse-only';
+      const policyHold = skipProvisioning && Boolean(result.holder);
       if (result.holder) {
         await leases.logEvent(ctx.userId, boundStudioId, 'conflict', {
           sessionId: session.id,
@@ -733,7 +736,9 @@ export class SessionService implements ISessionService {
       logger.warn(
         policyHold
           ? '[StudioLease] Studio not acquirable and type is reuse-only; holding'
-          : '[StudioLease] Studio not acquirable; diverting',
+          : skipProvisioning
+            ? '[StudioLease] Studio not acquirable and unverifiable; type is reuse-only, clearing studio binding'
+            : '[StudioLease] Studio not acquirable; diverting',
         {
           sessionId: session.id,
           studioId: boundStudioId,
@@ -744,7 +749,7 @@ export class SessionService implements ISessionService {
         }
       );
 
-      const overflow = policyHold ? null : await this.divertToOverflow(boundStudioId, ctx);
+      const overflow = skipProvisioning ? null : await this.divertToOverflow(boundStudioId, ctx);
       if (overflow) {
         const overflowAcquire = await leases.acquire({
           studioId: overflow.id,
@@ -804,7 +809,9 @@ export class SessionService implements ISessionService {
       }
 
       logger.error(
-        '[StudioLease] Studio unverifiable and overflow unavailable; clearing studio binding',
+        skipProvisioning
+          ? '[StudioLease] Studio unverifiable; type is reuse-only (provisioning skipped), clearing studio binding'
+          : '[StudioLease] Studio unverifiable and overflow unavailable; clearing studio binding',
         {
           sessionId: session.id,
           studioId: boundStudioId,

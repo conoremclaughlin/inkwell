@@ -3637,6 +3637,68 @@ describe('SessionService', () => {
       logEventSpy.mockRestore();
     });
 
+    it('holder-null on a reuse-only thread clears the binding — and says so, not "holding"', async () => {
+      /*
+       * r2 P2: acquire() returns holder: null for missing/retired/foreign/
+       * unverifiable studios. That branch does NOT hold — it clears the
+       * session's studio binding — so the diagnostics must not claim a hold,
+       * and must not blame overflow when policy skipped the attempt.
+       */
+      const { logger: mockedLogger } = await import('../../utils/logger.js');
+      vi.mocked(mockedLogger.warn).mockClear();
+      vi.mocked(mockedLogger.error).mockClear();
+
+      const overflowSpy = vi
+        .spyOn(StudioOverflowService.prototype, 'ensureOverflowStudio')
+        .mockResolvedValue(null);
+      const getLeaseSpy = vi
+        .spyOn(StudioLeaseService.prototype, 'getLease')
+        .mockResolvedValue({ lease: null } as never);
+      const acquireSpy = vi
+        .spyOn(StudioLeaseService.prototype, 'acquire')
+        .mockResolvedValue({ acquired: false, holder: null });
+      const logEventSpy = vi
+        .spyOn(StudioLeaseService.prototype, 'logEvent')
+        .mockResolvedValue(undefined);
+
+      (mockRepository as { findByThreadKey?: unknown }).findByThreadKey = vi
+        .fn()
+        .mockResolvedValue(createMockSession({ id: 'thread-session', studioId: 'studio-A' }));
+
+      const service = serviceWith(
+        occupiedStudioSupabase({
+          keyType: 'issue',
+          template: threadKeyTemplate('issue', 'write', 'reuse-only'),
+          routePattern: 'issue:*',
+        })
+      );
+
+      // No hold: the session comes back with its binding cleared.
+      await service.getOrCreateSession('user-456', 'wren', { threadKey: 'issue:45' });
+      expect(mockRepository.update).toHaveBeenCalledWith('thread-session', { studioId: null });
+      expect(overflowSpy).not.toHaveBeenCalled();
+
+      // Every [StudioLease] diagnostic on this path tells the truth: no
+      // claim of holding, no claim about overflow.
+      const leaseMessages = [
+        ...vi.mocked(mockedLogger.warn).mock.calls,
+        ...vi.mocked(mockedLogger.error).mock.calls,
+      ]
+        .map((args) => String(args[0]))
+        .filter((msg) => msg.includes('[StudioLease]'));
+      expect(leaseMessages.length).toBeGreaterThan(0);
+      for (const msg of leaseMessages) {
+        expect(msg).not.toContain('holding');
+        expect(msg).not.toContain('overflow');
+      }
+
+      delete (mockRepository as { findByThreadKey?: unknown }).findByThreadKey;
+      overflowSpy.mockRestore();
+      getLeaseSpy.mockRestore();
+      acquireSpy.mockRestore();
+      logEventSpy.mockRestore();
+    });
+
     /**
      * The THIRD worktree-creating path (r1 P1): deferred D1 parent creation.
      * The caller repo resolves but the agent has no studio for it at all —
