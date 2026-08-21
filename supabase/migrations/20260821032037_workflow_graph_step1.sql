@@ -154,6 +154,7 @@ SECURITY DEFINER
 SET search_path = public, pg_temp
 AS $$
 DECLARE
+  v_group record;
   v_current_version bigint;
   v_invalid jsonb;
   v_has_cycle boolean;
@@ -166,13 +167,21 @@ BEGIN
   END IF;
 
   -- Lock BEFORE reading anything about the graph.
-  SELECT graph_version INTO v_current_version
+  SELECT graph_version, execution_model INTO v_group
   FROM task_groups
   WHERE id = p_task_group_id AND user_id = p_user_id
   FOR UPDATE;
   IF NOT FOUND THEN
     RETURN jsonb_build_object('success', false, 'reason', 'group-not-found');
   END IF;
+  -- One canonical source per execution model: a linear group's dependencies
+  -- live in blocked_by; writing edges under it would create a second,
+  -- silently diverging source. Convert first (convert_task_group_to_graph
+  -- flips an empty or valid group trivially), then mutate edges.
+  IF v_group.execution_model <> 'graph' THEN
+    RETURN jsonb_build_object('success', false, 'reason', 'not-graph-mode');
+  END IF;
+  v_current_version := v_group.graph_version;
   IF v_current_version <> p_expected_version THEN
     RETURN jsonb_build_object('success', false, 'reason', 'version-conflict',
       'currentVersion', v_current_version);

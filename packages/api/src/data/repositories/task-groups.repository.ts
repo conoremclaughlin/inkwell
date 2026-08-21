@@ -386,4 +386,86 @@ export class TaskGroupsRepository {
     }
     return counts;
   }
+
+  // ── Workflow graph (spec: ink://specs/workflow-graph v10, step 1) ──────
+  //
+  // Both mutations run through SECURITY DEFINER RPCs that lock the group row
+  // before reading, CAS graph_version, validate the complete desired graph,
+  // and append a task_graph_revisions record — one transaction each. The
+  // RPCs return structured refusals ({success:false, reason}) rather than
+  // throwing for expected conflicts; transport errors still throw.
+
+  /**
+   * Replace the group's edge set with the complete desired graph.
+   * Exactly one of actorIdentityId / actorUserId / systemActor must be set.
+   */
+  async applyTaskGraph(params: {
+    userId: string;
+    taskGroupId: string;
+    expectedVersion: number;
+    edges: Array<{ from: string; to: string }>;
+    actorIdentityId?: string;
+    actorUserId?: string;
+    systemActor?: boolean;
+    constructor?: string;
+    constructorVersion?: string;
+    configHash?: string;
+  }): Promise<Record<string, unknown>> {
+    const { data, error } = await this.client.rpc('apply_task_graph', {
+      p_user_id: params.userId,
+      p_task_group_id: params.taskGroupId,
+      p_expected_version: params.expectedVersion,
+      p_edges: params.edges,
+      p_actor_identity_id: params.actorIdentityId ?? null,
+      p_actor_user_id: params.actorUserId ?? null,
+      p_system_actor: params.systemActor ?? false,
+      p_constructor: params.constructor ?? null,
+      p_constructor_version: params.constructorVersion ?? null,
+      p_config_hash: params.configHash ?? null,
+    });
+    if (error) throw new Error(`apply_task_graph failed: ${error.message}`);
+    return data as Record<string, unknown>;
+  }
+
+  /**
+   * Validated linear → graph conversion. Preflight failures come back as
+   * {success:false, reason:'preflight-failed', invalid:[...]} and leave the
+   * group linear with its blocked_by arrays intact.
+   */
+  async convertToGraph(params: {
+    userId: string;
+    taskGroupId: string;
+    expectedVersion: number;
+    actorIdentityId?: string;
+    actorUserId?: string;
+    systemActor?: boolean;
+  }): Promise<Record<string, unknown>> {
+    const { data, error } = await this.client.rpc('convert_task_group_to_graph', {
+      p_user_id: params.userId,
+      p_task_group_id: params.taskGroupId,
+      p_expected_version: params.expectedVersion,
+      p_actor_identity_id: params.actorIdentityId ?? null,
+      p_actor_user_id: params.actorUserId ?? null,
+      p_system_actor: params.systemActor ?? false,
+    });
+    if (error) throw new Error(`convert_task_group_to_graph failed: ${error.message}`);
+    return data as Record<string, unknown>;
+  }
+
+  /** The group's stored edge set (graph-mode groups only have one). */
+  async getEdges(taskGroupId: string): Promise<Array<{ from_task: string; to_task: string }>> {
+    const { data: tasks, error: tasksError } = await this.client
+      .from('tasks')
+      .select('id')
+      .eq('task_group_id', taskGroupId);
+    if (tasksError) throw new Error(`Failed to list group tasks: ${tasksError.message}`);
+    const ids = (tasks ?? []).map((t) => t.id);
+    if (ids.length === 0) return [];
+    const { data, error } = await this.client
+      .from('task_edges')
+      .select('from_task, to_task')
+      .in('to_task', ids);
+    if (error) throw new Error(`Failed to read task edges: ${error.message}`);
+    return data ?? [];
+  }
 }
