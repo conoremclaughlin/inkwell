@@ -143,3 +143,139 @@ describe('PcpClient x-ink-context header', () => {
     expect(headers['x-ink-context']).toBeUndefined();
   });
 });
+
+/**
+ * A failed tool call must fail.
+ *
+ * The server reports argument-validation failures as `isError: true` with a
+ * bare message instead of the usual JSON envelope. The client used to return
+ * that as `{ text }`, which is shaped exactly like a successful result — so
+ * `ink attach` read a payload with no `sessions` key and reported no sessions,
+ * the session-start hook's lifecycle stamp vanished, and chat's /eject dropped
+ * its memory write. All three looked like working features (Lumen, PR #511
+ * review).
+ */
+describe('PcpClient surfaces failed tool calls', () => {
+  let dir: string;
+  let configPath: string;
+
+  const okJson = (body: unknown) =>
+    ({
+      ok: true,
+      status: 200,
+      headers: { get: () => 'application/json' },
+      json: async () => body,
+      text: async () => JSON.stringify(body),
+    }) as unknown as Response;
+
+  const makeClient = () => {
+    dir = mkdtempSync(join(tmpdir(), 'pcp-client-err-'));
+    configPath = join(dir, 'config.json');
+    writeFileSync(
+      configPath,
+      JSON.stringify({ accessToken: 'test-token', tokenExpiresAt: '2099-01-01T00:00:00Z' })
+    );
+    return new PcpClient('http://localhost:9999', configPath);
+  };
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+    global.fetch = originalFetch;
+  });
+
+  it('throws when a call is rejected for an unrecognized argument', async () => {
+    global.fetch = vi.fn(async () =>
+      okJson({
+        jsonrpc: '2.0',
+        id: 1,
+        result: {
+          content: [
+            {
+              type: 'text',
+              text: "MCP error -32602: Input validation error: Invalid arguments for tool list_sessions: Unrecognized key(s) in object: 'status'",
+            },
+          ],
+          isError: true,
+        },
+      })
+    ) as unknown as typeof fetch;
+
+    await expect(makeClient().callTool('list_sessions', { status: 'active' })).rejects.toThrow(
+      /Unrecognized key/
+    );
+  });
+
+  it('leaves a structured {success:false} body alone — callers inspect it', async () => {
+    // These are handled failures, not protocol failures. Throwing here would
+    // break every caller that reads `success` and branches on it.
+    global.fetch = vi.fn(async () =>
+      okJson({
+        jsonrpc: '2.0',
+        id: 1,
+        result: {
+          content: [
+            { type: 'text', text: JSON.stringify({ success: false, error: 'User not found' }) },
+          ],
+          isError: true,
+        },
+      })
+    ) as unknown as typeof fetch;
+
+    const result = (await makeClient().callTool('create_reminder', { title: 'x' })) as Record<
+      string,
+      unknown
+    >;
+    expect(result.success).toBe(false);
+    expect(result.error).toBe('User not found');
+  });
+
+  it('surfaces error text even when a non-text content block comes first', async () => {
+    global.fetch = vi.fn(async () =>
+      okJson({
+        jsonrpc: '2.0',
+        id: 1,
+        result: {
+          content: [
+            { type: 'image', data: 'not-used-by-the-client', mimeType: 'image/png' },
+            { type: 'text', text: 'handler exploded after rendering diagnostics' },
+          ],
+          isError: true,
+        },
+      })
+    ) as unknown as typeof fetch;
+
+    await expect(makeClient().callTool('some_tool', {})).rejects.toThrow(
+      /handler exploded after rendering diagnostics/
+    );
+  });
+
+  it('throws a generic error when a failed result contains no text', async () => {
+    global.fetch = vi.fn(async () =>
+      okJson({
+        jsonrpc: '2.0',
+        id: 1,
+        result: {
+          content: [{ type: 'image', data: 'not-used-by-the-client', mimeType: 'image/png' }],
+          isError: true,
+        },
+      })
+    ) as unknown as typeof fetch;
+
+    await expect(makeClient().callTool('some_tool', {})).rejects.toThrow(
+      /failed without a text error message/
+    );
+  });
+
+  it('still returns plain non-JSON text when the call did not fail', async () => {
+    global.fetch = vi.fn(async () =>
+      okJson({
+        jsonrpc: '2.0',
+        id: 1,
+        result: { content: [{ type: 'text', text: 'plain prose, not JSON' }] },
+      })
+    ) as unknown as typeof fetch;
+
+    const result = (await makeClient().callTool('some_tool', {})) as Record<string, unknown>;
+    expect(result.text).toBe('plain prose, not JSON');
+  });
+});
