@@ -574,6 +574,21 @@ d('workflow graph executor (real DB)', () => {
       ] as never);
 
     try {
+      // Round 5: a group cannot be BORN graph, nor with version history it
+      // never earned — lineage starts linear/version 0, through conversion.
+      const { error: bornGraph } = await client
+        .from('task_groups')
+        .insert([
+          { id: randomUUID(), user_id: USER, title: 'born graph', execution_model: 'graph' },
+        ] as never);
+      expect(bornGraph?.message).toMatch(/born by conversion/);
+      const { error: bornVersioned } = await client
+        .from('task_groups')
+        .insert([
+          { id: randomUUID(), user_id: USER, title: 'born versioned', graph_version: 7 },
+        ] as never);
+      expect(bornVersioned?.message).toMatch(/born by conversion/);
+
       // Direct linear → graph bypasses preflight/revisioning: refused.
       const { error: toGraph } = await client
         .from('task_groups')
@@ -596,6 +611,14 @@ d('workflow graph executor (real DB)', () => {
         .update({ execution_model: 'linear' } as never)
         .eq('id', gM);
       expect(toLinear?.message).toMatch(/conversion-owned/);
+
+      // Round 5: the mutation CAS itself is executor-owned — a direct
+      // graph_version write would detach it from the revision sequence.
+      const { error: versionWrite } = await client
+        .from('task_groups')
+        .update({ graph_version: 999 } as never)
+        .eq('id', gM);
+      expect(versionWrite?.message).toMatch(/executor-owned/);
 
       // One-write resurrection: cancel, then {model linear, status active}.
       await client

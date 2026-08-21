@@ -1339,6 +1339,19 @@ SECURITY DEFINER
 SET search_path = public
 AS $$
 BEGIN
+  -- Graph groups are BORN by conversion (Lumen round 5 P1): an INSERT
+  -- arriving already-graph (or with a non-zero version) has no preflight
+  -- and no revision history — every graph group's lineage must start at
+  -- linear/version 0 and pass through convert_task_group_to_graph.
+  IF TG_OP = 'INSERT' THEN
+    IF current_setting('app.graph_executor', true) IS DISTINCT FROM 'on'
+       AND (NEW.execution_model = 'graph' OR NEW.graph_version <> 0) THEN
+      RAISE EXCEPTION
+        'graph groups are born by conversion — INSERT linear at version 0, then convert_task_group_to_graph';
+    END IF;
+    RETURN NEW;
+  END IF;
+
   -- execution_model is CONVERSION-owned (Lumen round 4 P1): a direct
   -- linear → graph flip bypasses preflight, revisioning, and blocked_by
   -- validation (yielding a version-0 zero-edge graph where everything is
@@ -1348,6 +1361,14 @@ BEGIN
      AND current_setting('app.graph_executor', true) IS DISTINCT FROM 'on' THEN
     RAISE EXCEPTION
       'execution_model is conversion-owned — use convert_task_group_to_graph';
+  END IF;
+  -- graph_version is the mutation CAS: a direct write would let a stale
+  -- apply land as if it were current, detached from the revision sequence
+  -- (Lumen round 5 P1). Only the serialized mutation paths advance it.
+  IF NEW.graph_version IS DISTINCT FROM OLD.graph_version
+     AND current_setting('app.graph_executor', true) IS DISTINCT FROM 'on' THEN
+    RAISE EXCEPTION
+      'graph_version is executor-owned — mutate through apply_task_graph / convert_task_group_to_graph';
   END IF;
   IF NEW.status IS NOT DISTINCT FROM OLD.status THEN
     RETURN NEW;
@@ -1386,7 +1407,7 @@ $$;
 
 DROP TRIGGER IF EXISTS enforce_graph_group_completion ON public.task_groups;
 CREATE TRIGGER enforce_graph_group_completion
-  BEFORE UPDATE OF status, execution_model ON public.task_groups
+  BEFORE INSERT OR UPDATE OF status, execution_model, graph_version ON public.task_groups
   FOR EACH ROW EXECUTE FUNCTION public.enforce_graph_group_completion();
 
 -- ── Grants (house pattern: service-role only; evaluator internal) ───────
