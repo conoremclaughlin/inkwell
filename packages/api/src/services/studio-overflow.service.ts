@@ -96,13 +96,12 @@ export class StudioOverflowService {
   private matchesOverflow(existing: Studio, parentStudio: Studio, threadKey: string): boolean {
     if (!existing.ephemeral) return false;
     if (existing.parentStudioId !== parentStudio.id) return false;
-    const metadata =
-      existing.metadata &&
-      typeof existing.metadata === 'object' &&
-      !Array.isArray(existing.metadata)
-        ? (existing.metadata as Record<string, unknown>)
-        : {};
-    return metadata.threadKey === threadKey;
+    // The `thread_key` COLUMN, not `metadata->>'threadKey'`. This value is a
+    // correctness predicate — it decides whether reusing a studio would drop
+    // this thread into another thread's worktree — and teardown fences on it
+    // too, so it should not live in an unconstrained, unindexed JSONB path.
+    // Existing rows were backfilled by the same migration that added it.
+    return existing.threadKey === threadKey;
   }
 
   /**
@@ -192,8 +191,9 @@ export class StudioOverflowService {
           defaultProjectId: parentStudio.defaultProjectId,
           ephemeral: true,
           parentStudioId: parentStudio.id,
+          threadKey,
           expiresAt: new Date(Date.now() + EPHEMERAL_STUDIO_TTL_MS).toISOString(),
-          metadata: { overflow: true, threadKey },
+          metadata: { overflow: true },
         });
         await this.leases.logEvent(userId, studio.id, 'overflow', {
           threadKey,
@@ -226,15 +226,139 @@ export class StudioOverflowService {
     return null;
   }
 
+  /**
+   * D1: the per-(project, agent) PARENT studio, `<project>--<sbSlug>`.
+   *
+   * Created on first work for a repo, by the caller-repo routing tier
+   * (spec §Tier 7, Phase 3b). Distinct from an overflow child in three ways
+   * that matter:
+   *
+   *   - it is NOT ephemeral and carries no `expires_at` — it is the agent's
+   *     durable home for this project, and a working studio in its own right
+   *     rather than a pure anchor. It takes work itself whenever it is free;
+   *     ephemeral children hang off it only when it is busy.
+   *   - it has no `parent_studio_id` — it IS the parent.
+   *   - its branch is per-agent (`<agent>/studio/<agent>`), not `eph/`.
+   *
+   * Route patterns are deliberately not set: patterns are an operator
+   * convention, and inventing one here would silently start capturing threads
+   * the operator never assigned.
+   *
+   * Returns null when provisioning fails or the slug is already taken by an
+   * unrelated studio; the caller then refuses rather than guessing.
+   */
+  async ensureParentStudio(opts: {
+    userId: string;
+    agentId: string;
+    repoRoot: string;
+    /** Canonical identity UUID — authoritative over the display slug. */
+    sbId?: string | null;
+  }): Promise<Studio | null> {
+    const { userId, agentId, repoRoot, sbId } = opts;
+    const slug = `${path.basename(repoRoot)}--${agentId}`;
+
+    const existing = await this.studios.findBySlug(userId, slug).catch(() => null);
+    if (existing) {
+      // Reuse only a genuine match. A slug collision with an unrelated studio
+      // must never be adopted — same reasoning as overflow reuse, and the
+      // consequence here is worse because this row is durable.
+      // Reuse only a studio a runner can ACTUALLY use (Lumen, PR #514 round 1).
+      //
+      // The earlier predicate accepted any non-ephemeral match, including an
+      // archived or cleaned row, or one whose worktree is gone from disk.
+      // Handing one back creates a session that acquire() then refuses
+      // (spec §The five invariants #5: a cleaned studio is never re-leased,
+      // a configured-but-absent worktree is retired) — and the caller diverts
+      // to overflow or the default cwd instead of holding, which is the
+      // silent-wrong-place outcome this phase removes.
+      const reusable =
+        !existing.ephemeral &&
+        existing.userId === userId &&
+        existing.repoRoot === repoRoot &&
+        (sbId ? existing.sbId === sbId : existing.agentId === agentId) &&
+        (existing.status === 'active' || existing.status === 'idle');
+
+      if (reusable) {
+        const present = await access(existing.worktreePath)
+          .then(() => true)
+          .catch(() => false);
+        if (present) return existing;
+        logger.warn('[StudioOverflow] Parent studio worktree is gone; refusing reuse', {
+          slug,
+          studioId: existing.id,
+          worktreePath: existing.worktreePath,
+        });
+        return null;
+      }
+      logger.warn('[StudioOverflow] Parent slug collides with an unrelated studio; refusing', {
+        slug,
+        repoRoot,
+        agentId,
+        collidingStudioId: existing.id,
+      });
+      return null;
+    }
+
+    // Seed from a studio that already knows this repo, so worktree creation
+    // runs against a real checkout with the right base branch.
+    const seed = await this.studios.findByRepoRoot(userId, repoRoot).catch(() => null);
+    const parentLike = {
+      repoRoot,
+      baseBranch: seed?.baseBranch || 'main',
+    } as Studio;
+
+    const created = await this.createWorktree(parentLike, slug, agentId, agentId, {
+      branch: `${agentId}/studio/${agentId}`,
+    });
+    if (!created) return null;
+
+    try {
+      const studio = await this.studios.create({
+        userId,
+        agentId,
+        sbId: sbId ?? undefined,
+        repoRoot,
+        worktreePath: created.worktreePath,
+        branch: created.branch,
+        baseBranch: parentLike.baseBranch,
+        purpose: `Home studio for ${agentId} on ${path.basename(repoRoot)} (auto-created)`,
+        ephemeral: false,
+        defaultProjectId: seed?.defaultProjectId ?? null,
+        metadata: { autoCreated: true, createdBy: 'caller-repo-routing' },
+      });
+      logger.info('[StudioOverflow] Created parent studio', {
+        studioId: studio.id,
+        slug: studio.slug,
+        repoRoot,
+        agentId,
+        worktreePath: created.worktreePath,
+      });
+      return studio;
+    } catch (err) {
+      logger.error('[StudioOverflow] Parent studio row insert failed; removing worktree', {
+        slug,
+        worktreePath: created.worktreePath,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      await execFileAsync('git', ['worktree', 'remove', '--force', created.worktreePath], {
+        cwd: repoRoot,
+      }).catch(() => undefined);
+      return null;
+    }
+  }
+
   private async createWorktree(
     parentStudio: Studio,
     slug: string,
     agentId: string,
-    branchTail: string
+    branchTail: string,
+    opts?: { branch?: string }
   ): Promise<{ worktreePath: string; branch: string } | null> {
     const mainRoot = parentStudio.repoRoot;
     const worktreePath = path.join(path.dirname(mainRoot), `${path.basename(mainRoot)}--${slug}`);
-    const branch = `${agentId}/eph/${branchTail}`;
+    // Parent studios pass an explicit branch: `eph/` names a temporary
+    // worktree, and a durable home studio is not one.
+    const branch = opts?.branch || `${agentId}/eph/${branchTail}`;
     const baseBranch = parentStudio.baseBranch || 'main';
 
     try {

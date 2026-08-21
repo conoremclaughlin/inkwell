@@ -43,13 +43,15 @@ interface FakeHooks {
 }
 
 function getCol(row: Row, col: string): unknown {
-  if (col.includes('->>')) {
-    const [base, key] = col.split('->>');
-    const obj = row[base];
-    if (!obj || typeof obj !== 'object') return null;
-    return (obj as Row)[key] ?? null;
+  // Nested JSON paths as PostgREST parses them: base->child->>leaf.
+  const parts = col.split('->');
+  let cur: unknown = row;
+  for (let part of parts) {
+    if (part.startsWith('>')) part = part.slice(1);
+    if (!cur || typeof cur !== 'object') return null;
+    cur = (cur as Record<string, unknown>)[part];
   }
-  return row[col] ?? null;
+  return cur ?? null;
 }
 
 class FakeQuery {
@@ -1233,6 +1235,121 @@ describe('sweep pendingRelease backstop', () => {
     expect(tables.studios[0].lease).toBeNull();
   });
 
+  /**
+   * The pr:498/pr:499 shape — an idle CLI, attached and polling, NOT
+   * mid-turn, never terminal, holding a stale lease that asked to release.
+   * Round six DELETED the proof-based narrow release: six review rounds
+   * showed client-pushed testimony cannot safely AUTHORIZE a release (every
+   * scheme leaked at an ownership or visibility boundary). Completion now
+   * waits for a REAL boundary — the holder's stop event, session end, or
+   * presence loss — so the sweep defers and renews here. Delayed, never
+   * premature: that trade is the design.
+   */
+  it('defers an idle-but-attached holder and renews — completion waits for a real boundary', async () => {
+    resetActiveRuns();
+    const lease: StudioLease = {
+      ...freshLease({ sessionId: 'sess-idle', threadKey: 'pr:499' }),
+      heartbeatAt: new Date(Date.now() - LEASE_STALE_MS - 60_000).toISOString(),
+      pendingRelease: {
+        reason: 'thread-closed',
+        requestedAt: new Date(Date.now() - 46 * 60 * 1000).toISOString(),
+      },
+    };
+    const tables: Record<string, Row[]> = {
+      studios: [
+        { id: 's-idle', user_id: 'u', lease: lease as unknown as Row, worktree_path: null },
+      ],
+      studio_lease_events: [],
+      inbox_threads: [],
+      agent_identities: [],
+      sessions: [
+        {
+          id: 'sess-idle',
+          user_id: 'u',
+          ended_at: null,
+          status: 'active',
+          cli_attached: true,
+          cli_poll_at: new Date().toISOString(), // terminal open, polling now
+          cli_turn_at: null,
+        },
+      ],
+    };
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+    const stats = await service.sweepExpiredLeases();
+
+    expect(stats.released).toBe(0);
+    expect(stats.renewed).toBe(1);
+    expect(tables.studios[0].lease).not.toBeNull();
+  });
+
+  it("completes the deferred release once the holder's presence lapses", async () => {
+    resetActiveRuns();
+    const lease: StudioLease = {
+      ...freshLease({ sessionId: 'sess-gone', threadKey: 'pr:499' }),
+      heartbeatAt: new Date(Date.now() - LEASE_STALE_MS - 60_000).toISOString(),
+      pendingRelease: { reason: 'thread-closed', requestedAt: new Date().toISOString() },
+    };
+    const tables: Record<string, Row[]> = {
+      studios: [
+        { id: 's-gone', user_id: 'u', lease: lease as unknown as Row, worktree_path: null },
+      ],
+      studio_lease_events: [],
+      inbox_threads: [],
+      agent_identities: [],
+      sessions: [
+        {
+          id: 'sess-gone',
+          user_id: 'u',
+          ended_at: null,
+          status: 'active',
+          cli_attached: true,
+          // The terminal closed 20 minutes ago: polls stopped, no open turn.
+          cli_poll_at: new Date(Date.now() - 20 * 60 * 1000).toISOString(),
+          cli_turn_at: null,
+        },
+      ],
+    };
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+    const stats = await service.sweepExpiredLeases();
+
+    expect(stats.released).toBe(1);
+    expect(tables.studios[0].lease).toBeNull();
+  });
+
+  it('still defers a pendingRelease while the holder is MID-TURN (cli_turn_at open)', async () => {
+    resetActiveRuns();
+    const lease: StudioLease = {
+      ...freshLease({ sessionId: 'sess-turn', threadKey: 'pr:12' }),
+      heartbeatAt: new Date(Date.now() - LEASE_STALE_MS - 60_000).toISOString(),
+      pendingRelease: { reason: 'thread-closed', requestedAt: new Date().toISOString() },
+    };
+    const tables: Record<string, Row[]> = {
+      studios: [
+        { id: 's-turn', user_id: 'u', lease: lease as unknown as Row, worktree_path: null },
+      ],
+      studio_lease_events: [],
+      inbox_threads: [],
+      agent_identities: [],
+      sessions: [
+        {
+          id: 'sess-turn',
+          user_id: 'u',
+          ended_at: null,
+          cli_attached: true,
+          cli_poll_at: new Date().toISOString(),
+          // close_thread was called from INSIDE this turn — the process is
+          // still cd'd into the worktree. Release must wait for the boundary.
+          cli_turn_at: new Date().toISOString(),
+        },
+      ],
+    };
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+    const stats = await service.sweepExpiredLeases();
+
+    expect(stats.released).toBe(0);
+    expect(tables.studios[0].lease).not.toBeNull();
+  });
+
   it('leaves a pendingRelease lease alone while the holder is still live', async () => {
     resetActiveRuns();
     registerActiveRun({
@@ -1257,6 +1374,204 @@ describe('sweep pendingRelease backstop', () => {
     const stats = await service.sweepExpiredLeases();
     expect(stats.released).toBe(0);
     expect(tables.studios[0].lease).not.toBeNull();
+  });
+});
+
+describe('touchStudioLeaseForSession — the prompt fence (rounds five–six)', () => {
+  afterEach(() => resetActiveRuns());
+
+  it('reports HELD only after a successful exact-CAS heartbeat touch', async () => {
+    const lease = freshLease({ sessionId: 'sess-t', threadKey: 'pr:90' });
+    const before = lease.heartbeatAt;
+    const tables: Record<string, Row[]> = {
+      studios: [{ id: 's-t', user_id: 'u', lease: lease as unknown as Row, worktree_path: null }],
+      studio_lease_events: [],
+      inbox_threads: [],
+      agent_identities: [],
+      sessions: [],
+    };
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+    await expect(service.touchStudioLeaseForSession('s-t', 'sess-t', 'u')).resolves.toBe(true);
+    const after = (tables.studios[0].lease as unknown as StudioLease).heartbeatAt;
+    expect(after >= before).toBe(true); // the touch IS the fence: heartbeat bumped via CAS
+  });
+
+  it('reports NOT HELD for a released or foreign lease — a plain read is never enough', async () => {
+    const foreign = freshLease({ sessionId: 'sess-other', threadKey: 'pr:91' });
+    const tables: Record<string, Row[]> = {
+      studios: [
+        { id: 's-gone', user_id: 'u', lease: null, worktree_path: null },
+        { id: 's-f', user_id: 'u', lease: foreign as unknown as Row, worktree_path: null },
+      ],
+      studio_lease_events: [],
+      inbox_threads: [],
+      agent_identities: [],
+      sessions: [],
+    };
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+    await expect(service.touchStudioLeaseForSession('s-gone', 'sess-t', 'u')).resolves.toBe(false);
+    await expect(service.touchStudioLeaseForSession('s-f', 'sess-t', 'u')).resolves.toBe(false);
+  });
+
+  /**
+   * Round six (Lumen): the heartbeat guard alone cannot see a pendingRelease
+   * marked between the touch's read and its CAS — marking leaves heartbeatAt
+   * unchanged, so the stale touch would match and overwrite the whole lease
+   * JSON with its pre-marker snapshot: close_thread returned success, but
+   * the request vanished. The pendingRelease-state guard makes that first
+   * CAS fail; the re-read carries the marker into the rewrite instead.
+   */
+  it('a pendingRelease marked after the touch read is preserved, never erased', async () => {
+    const lease = freshLease({ sessionId: 'sess-t', threadKey: 'pr:92' });
+    const tables: Record<string, Row[]> = {
+      studios: [{ id: 's-t', user_id: 'u', lease: lease as unknown as Row, worktree_path: null }],
+      studio_lease_events: [],
+      inbox_threads: [],
+      agent_identities: [],
+      sessions: [],
+    };
+    const marker = { reason: 'thread-closed', requestedAt: new Date().toISOString() };
+    const service = new StudioLeaseService(
+      makeFakeSupabase(tables, {
+        afterSelect: (table, count) => {
+          // Interleave: close_thread stamps pendingRelease AFTER the touch's
+          // first read returns its snapshot (heartbeat unchanged).
+          if (table === 'studios' && count === 1) {
+            const row = tables.studios[0];
+            row.lease = {
+              ...(row.lease as unknown as StudioLease),
+              pendingRelease: marker,
+            } as unknown as Row;
+          }
+        },
+      })
+    );
+
+    const held = await service.touchStudioLeaseForSession('s-t', 'sess-t', 'u');
+    const after = tables.studios[0].lease as unknown as StudioLease;
+
+    // The request survives — this is the P1. The touch itself still reports
+    // held via its re-read (the holder may finish its turn; the marker only
+    // defers the release to the boundary).
+    expect(after.pendingRelease).toEqual(marker);
+    expect(held).toBe(true);
+  });
+
+  /**
+   * Round seven (Lumen, red-verified): the same erasure through RENEWAL.
+   * renewBySession reads the unmarked lease, close_thread stamps
+   * pendingRelease (heartbeat unchanged), and the renewal's whole-JSON CAS
+   * still matched on session/acquired/heartbeat — overwriting the lease with
+   * its stale pre-marker snapshot. The guard now lives in the shared
+   * casLease, so EVERY rewrite path is transition-safe, not just the touch.
+   */
+  it('a pendingRelease marked during a renewal is preserved — the shared CAS guards it', async () => {
+    const staleBeat = new Date(Date.now() - 60_000).toISOString();
+    const lease = freshLease({ sessionId: 'sess-r', threadKey: 'pr:93', heartbeatAt: staleBeat });
+    const tables: Record<string, Row[]> = {
+      studios: [{ id: 's-r', user_id: 'u', lease: lease as unknown as Row, worktree_path: null }],
+      studio_lease_events: [],
+      inbox_threads: [],
+      agent_identities: [],
+      sessions: [],
+    };
+    const marker = { reason: 'thread-closed', requestedAt: new Date().toISOString() };
+    const service = new StudioLeaseService(
+      makeFakeSupabase(tables, {
+        afterSelect: (table, count) => {
+          if (table === 'studios' && count === 1) {
+            const row = tables.studios[0];
+            row.lease = {
+              ...(row.lease as unknown as StudioLease),
+              pendingRelease: marker,
+            } as unknown as Row;
+          }
+        },
+      })
+    );
+
+    const renewed = await service.renewBySession('sess-r', 'u');
+    const after = tables.studios[0].lease as unknown as StudioLease;
+
+    expect(after.pendingRelease).toEqual(marker); // close_thread's request survives
+    expect(after.heartbeatAt).toBe(staleBeat); // the stale rewrite lost its CAS
+    expect(renewed).toBe(false);
+  });
+});
+
+/**
+ * Regression: session 4896f302 was observed holding two studios at once —
+ * one per thread it had opened. Nothing enforces one-studio-per-session
+ * (jsonb carries no unique constraint), and every release path used
+ * `.limit(1).maybeSingle()`, so it acted on ONE row in unspecified order and
+ * stranded the other: leased, no live holder, no pendingRelease, invisible to
+ * the sweep. These prove the whole set is handled.
+ */
+describe('a session holding multiple studios (leak)', () => {
+  afterEach(() => resetActiveRuns());
+
+  function twoHeld(leaseOverrides: Partial<StudioLease> = {}): Record<string, Row[]> {
+    const mk = (threadKey: string) =>
+      ({
+        ...freshLease({ sessionId: 'sess-multi', threadKey }),
+        ...leaseOverrides,
+      }) as unknown as Row;
+    return {
+      studios: [
+        { id: 's-one', user_id: 'u', status: 'active', lease: mk('pr:504'), worktree_path: null },
+        {
+          id: 's-two',
+          user_id: 'u',
+          status: 'active',
+          lease: mk('pcp:issue:x'),
+          worktree_path: null,
+        },
+      ],
+      studio_lease_events: [],
+      inbox_threads: [],
+      agent_identities: [],
+      sessions: [{ id: 'sess-multi', user_id: 'u', ended_at: new Date().toISOString() }],
+    };
+  }
+
+  it('releaseBySession clears EVERY studio the session holds, not an arbitrary one', async () => {
+    resetActiveRuns();
+    const tables = twoHeld();
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    expect(await service.releaseBySession('sess-multi', { userId: 'u' })).toBe(true);
+    expect(tables.studios[0].lease).toBeNull();
+    expect(tables.studios[1].lease).toBeNull();
+  });
+
+  it('releaseAtBoundary completes a pendingRelease on every held studio', async () => {
+    resetActiveRuns();
+    const tables = twoHeld({
+      pendingRelease: { reason: 'thread-closed', requestedAt: new Date().toISOString() },
+    });
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    expect(
+      await service.releaseAtBoundary('sess-multi', {
+        userId: 'u',
+        sessionTerminal: false,
+        reason: 'cli-turn-stopped',
+      })
+    ).toBe(true);
+    expect(tables.studios[0].lease).toBeNull();
+    expect(tables.studios[1].lease).toBeNull();
+  });
+
+  it('renewBySession heartbeats every held studio, so neither goes stale unwatched', async () => {
+    resetActiveRuns();
+    const stale = new Date(Date.now() - LEASE_STALE_MS - 60_000).toISOString();
+    const tables = twoHeld({ heartbeatAt: stale });
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    expect(await service.renewBySession('sess-multi', 'u')).toBe(true);
+    for (const row of tables.studios) {
+      expect(isLeaseStale(row.lease as unknown as StudioLease)).toBe(false);
+    }
   });
 });
 

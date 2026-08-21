@@ -20,6 +20,8 @@ export interface Studio {
   id: string;
   userId: string;
   agentId: string | null;
+  /** Canonical identity UUID — authoritative; agentId is a display slug. */
+  sbId: string | null;
   sessionId: string | null;
   repoRoot: string;
   worktreePath: string;
@@ -36,6 +38,8 @@ export interface Studio {
   lease: Json | null;
   ephemeral: boolean;
   parentStudioId: string | null;
+  /** Thread this studio was provisioned for. Overflow studios only. */
+  threadKey: string | null;
   expiresAt: string | null;
   createdAt: string;
   updatedAt: string;
@@ -58,6 +62,7 @@ export interface CreateStudioInput {
   defaultProjectId?: string | null;
   ephemeral?: boolean;
   parentStudioId?: string | null;
+  threadKey?: string | null;
   expiresAt?: string | null;
   metadata?: Json;
 }
@@ -98,6 +103,7 @@ export class StudiosRepository {
       id: row.id as string,
       userId: row.user_id as string,
       agentId: (row.agent_id as string) || null,
+      sbId: (row.sb_id as string) || null,
       sessionId: (row.session_id as string) || null,
       repoRoot: row.repo_root as string,
       worktreePath: row.worktree_path as string,
@@ -113,6 +119,7 @@ export class StudiosRepository {
       lease: (row.lease as Json) ?? null,
       ephemeral: Boolean(row.ephemeral),
       parentStudioId: (row.parent_studio_id as string) || null,
+      threadKey: (row.thread_key as string) || null,
       expiresAt: (row.expires_at as string) || null,
       createdAt: row.created_at as string,
       updatedAt: row.updated_at as string,
@@ -141,6 +148,7 @@ export class StudiosRepository {
       default_project_id: input.defaultProjectId ?? null,
       ephemeral: input.ephemeral ?? false,
       parent_studio_id: input.parentStudioId ?? null,
+      thread_key: input.threadKey ?? null,
       expires_at: input.expiresAt ?? null,
       slug: deriveStudioSlug(input.worktreePath),
       status: 'active',
@@ -227,6 +235,28 @@ export class StudiosRepository {
     return data ? this.mapRow(data as Record<string, unknown>) : null;
   }
 
+  /**
+   * Any studio already bound to this repo, used as a provisioning seed: it
+   * tells us the repo's base branch and project without inventing either.
+   * Oldest-first so the seed is the most established row, not the newest.
+   */
+  async findByRepoRoot(userId: string, repoRoot: string): Promise<Studio | null> {
+    const { data, error } = await this.client
+      .from('studios')
+      .select('*')
+      .eq('user_id', userId)
+      .eq('repo_root', repoRoot)
+      .order('created_at', { ascending: true })
+      .limit(1)
+      .maybeSingle();
+
+    if (error) {
+      throw new Error(`Failed to find studio by repo root: ${error.message}`);
+    }
+
+    return data ? this.mapRow(data as Record<string, unknown>) : null;
+  }
+
   async listByUser(
     userId: string,
     opts?: { status?: StudioStatus; agentId?: string }
@@ -272,14 +302,14 @@ export class StudiosRepository {
     return (data || []).map((row) => this.mapRow(row as Record<string, unknown>));
   }
 
-  /** Ephemeral studios created for a thread's overflow (metadata.threadKey). */
+  /** Ephemeral studios created for a thread's overflow. Indexed on (user_id, thread_key). */
   async listEphemeralByThread(userId: string, threadKey: string): Promise<Studio[]> {
     const { data, error } = await this.client
       .from('studios')
       .select('*')
       .eq('user_id', userId)
       .eq('ephemeral', true)
-      .eq('metadata->>threadKey', threadKey)
+      .eq('thread_key', threadKey)
       .in('status', ['active', 'idle']);
 
     if (error) {

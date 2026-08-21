@@ -1512,6 +1512,9 @@ export type Database = {
           created_at: string | null;
           created_by_agent_id: string;
           id: string;
+          key_id: string | null;
+          key_project: string | null;
+          key_type: string | null;
           metadata: Json | null;
           status: string;
           thread_key: string;
@@ -1525,6 +1528,9 @@ export type Database = {
           created_at?: string | null;
           created_by_agent_id: string;
           id?: string;
+          key_id?: string | null;
+          key_project?: string | null;
+          key_type?: string | null;
           metadata?: Json | null;
           status?: string;
           thread_key: string;
@@ -1538,6 +1544,9 @@ export type Database = {
           created_at?: string | null;
           created_by_agent_id?: string;
           id?: string;
+          key_id?: string | null;
+          key_project?: string | null;
+          key_type?: string | null;
           metadata?: Json | null;
           status?: string;
           thread_key?: string;
@@ -2296,6 +2305,43 @@ export type Database = {
         };
         Relationships: [];
       };
+      project_slug_aliases: {
+        Row: {
+          alias: string;
+          created_at: string;
+          id: string;
+          project_id: string;
+          user_id: string;
+        };
+        Insert: {
+          alias: string;
+          created_at?: string;
+          id?: string;
+          project_id: string;
+          user_id: string;
+        };
+        Update: {
+          alias?: string;
+          created_at?: string;
+          id?: string;
+          project_id?: string;
+          user_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'project_slug_aliases_project_id_fkey';
+            columns: ['project_id'];
+            referencedRelation: 'projects';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'project_slug_aliases_user_id_fkey';
+            columns: ['user_id'];
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
       projects: {
         Row: {
           created_at: string | null;
@@ -2306,6 +2352,7 @@ export type Database = {
           name: string;
           repo_root: string | null;
           repository_url: string | null;
+          slug: string | null;
           status: string | null;
           tech_stack: string[] | null;
           updated_at: string | null;
@@ -2320,6 +2367,7 @@ export type Database = {
           name: string;
           repo_root?: string | null;
           repository_url?: string | null;
+          slug?: string | null;
           status?: string | null;
           tech_stack?: string[] | null;
           updated_at?: string | null;
@@ -2334,6 +2382,7 @@ export type Database = {
           name?: string;
           repo_root?: string | null;
           repository_url?: string | null;
+          slug?: string | null;
           status?: string | null;
           tech_stack?: string[] | null;
           updated_at?: string | null;
@@ -3193,6 +3242,7 @@ export type Database = {
           session_id: string | null;
           slug: string | null;
           status: string;
+          thread_key: string | null;
           updated_at: string | null;
           user_id: string;
           work_type: string | null;
@@ -3222,6 +3272,7 @@ export type Database = {
           session_id?: string | null;
           slug?: string | null;
           status?: string;
+          thread_key?: string | null;
           updated_at?: string | null;
           user_id: string;
           work_type?: string | null;
@@ -3251,6 +3302,7 @@ export type Database = {
           session_id?: string | null;
           slug?: string | null;
           status?: string;
+          thread_key?: string | null;
           updated_at?: string | null;
           user_id?: string;
           work_type?: string | null;
@@ -3641,6 +3693,46 @@ export type Database = {
           },
         ];
       };
+      thread_key_types: {
+        Row: {
+          created_at: string;
+          description: string | null;
+          id: string;
+          studio_policy: string;
+          type: string;
+          updated_at: string;
+          user_id: string | null;
+          write_intent: string;
+        };
+        Insert: {
+          created_at?: string;
+          description?: string | null;
+          id?: string;
+          studio_policy: string;
+          type: string;
+          updated_at?: string;
+          user_id?: string | null;
+          write_intent: string;
+        };
+        Update: {
+          created_at?: string;
+          description?: string | null;
+          id?: string;
+          studio_policy?: string;
+          type?: string;
+          updated_at?: string;
+          user_id?: string | null;
+          write_intent?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'thread_key_types_user_id_fkey';
+            columns: ['user_id'];
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
       trusted_users: {
         Row: {
           added_at: string | null;
@@ -4007,6 +4099,17 @@ export type Database = {
           p_through_message_id: string;
         };
         Returns: string;
+      };
+      compute_thread_key_pin: {
+        Args: {
+          p_user_id: string;
+          p_key: string;
+        };
+        Returns: {
+          o_project: string | null;
+          o_type: string | null;
+          o_id: string | null;
+        };
       };
       get_unread_thread_candidates: {
         Args: {
