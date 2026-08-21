@@ -2,6 +2,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import type { DataComposer } from '../../data/composer';
 import { logger } from '../../utils/logger';
+import { strictifyInputSchema, strictToolArgsEnabled } from './strict-input-schema';
 
 // Import all tool handlers
 import { handleSaveLink, handleSearchLinks, handleTagLink } from './link-handlers';
@@ -55,6 +56,9 @@ import {
   handleRestoreMemory,
   handleBootstrap,
   handleCompactSession,
+  rememberSchema,
+  listSessionsSchema,
+  updateSessionStateSchema,
 } from './memory-handlers';
 
 import {
@@ -389,6 +393,16 @@ export function registerAllTools(
 
   const originalRegisterTool = server.registerTool.bind(server);
   (server as any).registerTool = (name: string, ...rest: any[]) => {
+    // Reject unknown args instead of silently stripping them. Applied here so
+    // all ~163 tools inherit it, rather than per-schema — see
+    // ./strict-input-schema for why the default rather than the schemas is
+    // treated as the defect.
+    if (strictToolArgsEnabled()) {
+      const config = rest[0];
+      if (config && typeof config === 'object' && 'inputSchema' in config) {
+        config.inputSchema = strictifyInputSchema(config.inputSchema);
+      }
+    }
     const handler = rest[rest.length - 1];
     if (typeof handler === 'function') {
       rest[rest.length - 1] = async (...handlerArgs: any[]) => {
@@ -1677,51 +1691,10 @@ Examples: "project:pcp/memory", "decision:jwt-auth", "person:conor", "reflection
 Use summary to provide a one-liner when the full content is long/detailed. The summary is what appears in the bootstrap knowledge summary.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: {
-        ...userIdentifierFields,
-        content: z.string().describe('The content to remember'),
-        summary: z
-          .string()
-          .optional()
-          .describe(
-            'One-liner summary of this memory. Used in bootstrap knowledge summary instead of full content. Provide when content is long/detailed.'
-          ),
-        topicKey: z
-          .string()
-          .optional()
-          .describe(
-            'Primary structured topic key (type:identifier). Common types: project, decision, convention, person, reflection, lesson, beauty, growth, value, family, domain. Auto-added to topics array.'
-          ),
-        topicSummary: z
-          .string()
-          .optional()
-          .describe(
-            'Short description of the topic (shown in bootstrap topic index header). Only needed when creating a new topic or updating its description.'
-          ),
-        source: z.string().optional().describe('Source of the memory (default: observation)'),
-        salience: z
-          .enum(['low', 'medium', 'high', 'critical'])
-          .optional()
-          .describe('Importance level (default: medium)'),
-        topics: z
-          .union([z.string(), z.array(z.string())])
-          .optional()
-          .describe('Topics for categorization'),
-        metadata: z.record(z.unknown()).optional().describe('Additional metadata'),
-        expiresAt: z.string().datetime().optional().describe('Optional expiration date (ISO 8601)'),
-        agentId: z
-          .string()
-          .optional()
-          .describe(
-            'Which AI being created this memory (e.g., "wren", "benson"). Null = shared memory.'
-          ),
-        studioId: z
-          .string()
-          .optional()
-          .describe(
-            'Studio ID (UUID or "main") — helps auto-attach the correct session in parallel worktree scenarios. Stored in metadata.'
-          ),
-      },
+      // Canonical schema, not a copy. The duplicate that used to live here was
+      // missing `contactId` and `sessionId`, so chat's /eject silently lost the
+      // session attribution it was explicitly passing.
+      inputSchema: rememberSchema,
     },
     async (args) => {
       try {
@@ -2131,19 +2104,11 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `List past sessions, optionally filtered by agent and/or backend.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: {
-        ...userIdentifierFields,
-        agentId: z.string().optional().describe('Filter by agent'),
-        studioId: z
-          .string()
-          .optional()
-          .describe('Filter by studio (UUID or "main" for the main studio)'),
-        backend: z
-          .string()
-          .optional()
-          .describe('Filter by backend runtime (e.g., "ink", "claude-code")'),
-        limit: z.number().min(1).max(100).optional().describe('Max results (default: 20)'),
-      },
+      // Register the canonical schema the handler parses with, rather than a
+      // hand-copied duplicate. The copy that used to live here had drifted:
+      // it was missing `status` and had dropped the UUID refinement on
+      // studioId, so the registered contract and the enforced one disagreed.
+      inputSchema: listSessionsSchema,
     },
     async (args) => {
       try {
@@ -2185,62 +2150,11 @@ Context: The session context column is for **transient runtime state** — facts
 Also sets: backendSessionId (for resume), status (active/paused/resumable/completed), workingDir.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: {
-        ...userIdentifierFields,
-        sessionId: z
-          .string()
-          .uuid()
-          .optional()
-          .describe(
-            'Session ID (uses active session if not provided). Most reliable for targeting a specific session.'
-          ),
-        studioId: z
-          .string()
-          .optional()
-          .describe(
-            'Studio ID (UUID or "main") for session resolution when sessionId is not provided. Useful for parallel worktree scenarios.'
-          ),
-        phase: z
-          .string()
-          .optional()
-          .describe(
-            'Work phase (agent-set). Core phases: investigating, implementing, reviewing, paused, complete. Use waiting:<reason> when awaiting an async response within normal flow (review, merge, feedback). Use blocked:<reason> ONLY when extraordinary intervention is required outside normal process — something has gone wrong (permissions denied, infrastructure broken, unresolvable conflict). Both auto-create memories. Do NOT use runtime: prefix — use lifecycle instead.'
-          ),
-        note: z
-          .string()
-          .optional()
-          .describe(
-            'Context for the phase transition (included in auto-created memory for blocked/waiting)'
-          ),
-        agentId: z.string().optional().describe('Agent identity for memory attribution'),
-        createTask: z
-          .boolean()
-          .optional()
-          .describe('Create a PCP task for blocked/waiting phases (default: false)'),
-        backendSessionId: z
-          .string()
-          .optional()
-          .describe(
-            'Backend-specific session ID for resumption (e.g., Claude Code session ID, Codex session ID)'
-          ),
-        status: z
-          .enum(['active', 'paused', 'resumable', 'completed'])
-          .optional()
-          .describe('Session status'),
-        context: z
-          .string()
-          .optional()
-          .describe(
-            'Transient runtime state — active facts too ephemeral for a memory but important to preserve across compaction. E.g. "server on :4001", "waiting on PR #341 review", "vitest running in background". Use as a scratch board; memories handle durable decisions.'
-          ),
-        workingDir: z.string().optional().describe('Working directory'),
-        activeThreadKey: z
-          .string()
-          .optional()
-          .describe(
-            'The thread key the session is currently working on (e.g., "pr:350", "spec:auth-refactor"). Mutable — updates as the session shifts focus. The original thread_key (set at session creation) remains the immutable routing anchor. Set to empty string to clear.'
-          ),
-      },
+      // Canonical schema, not a copy. The duplicate that used to live here was
+      // missing `lifecycle`, `cliAttached` and `alias`, so the session-start
+      // hook's `lifecycle: 'idle'` was stripped before the handler ever saw it
+      // — the stamp had been a silent no-op.
+      inputSchema: updateSessionStateSchema,
     },
     async (args) => {
       try {
