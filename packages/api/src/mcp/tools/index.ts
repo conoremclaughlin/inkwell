@@ -2137,7 +2137,8 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
     {
       description: `Update your session state — work phase, status, backend session ID, context. This is the primary tool for managing session state.
 
-Session resolution: sessionId (explicit) > studioId (scoped lookup) > most recent active session.
+Session resolution: sessionId (explicit) > studioId (scoped lookup) > the session you are running in > your most recent active session.
+Implicit resolution is always scoped to your own agent identity and fails with an error rather than guessing — it will never select another agent's session.
 For parallel worktrees, pass studioId to target the correct session.
 
 Phase: Communicates real-time work status to other agents.

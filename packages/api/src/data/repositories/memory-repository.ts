@@ -1430,10 +1430,15 @@ export class MemoryRepository {
    * Start a new session
    */
   async startSession(input: SessionCreateInput): Promise<Session> {
+    // Prefer the caller's verified canonical identity. Re-resolving from the
+    // slug is a fallback for callers that have none: `agent_id` is unique only
+    // per (user_id, workspace_id), so the lookup can land on a same-named
+    // identity in another workspace and stamp the row with the wrong owner.
     const sbId =
-      input.agentId && input.userId
+      input.sbId ??
+      (input.agentId && input.userId
         ? await resolveIdentityId(this.supabase, input.userId, input.agentId)
-        : null;
+        : null);
 
     const insertData: Record<string, unknown> = {
       ...(input.id ? { id: input.id } : {}),
@@ -1587,6 +1592,66 @@ export class MemoryRepository {
   }
 
   /**
+   * Active sessions owned by one identity, newest first.
+   *
+   * Unlike getActiveSession this returns candidates rather than a single row,
+   * so callers can tell "exactly one session" apart from "several — refuse to
+   * guess". Picking the newest of several is what let a write land on a peer's
+   * session (see resolveImplicitSession).
+   *
+   * Ownership is scoped by user_id plus a canonical `sbId` when the caller has
+   * one. `agentId` is a fallback for rows predating sb_id: the slug is unique
+   * only per (user_id, workspace_id), so two identities in different workspaces
+   * share it and it cannot be an ownership predicate on its own.
+   *
+   * studioId: undefined = any studio, null = only sessions with no studio,
+   * string = that studio.
+   */
+  async findOwnedActiveSessions(params: {
+    userId: string;
+    sbId?: string;
+    agentId?: string;
+    studioId?: string | null;
+    contactId?: string;
+    limit?: number;
+  }): Promise<Session[]> {
+    const { userId, sbId, agentId, studioId, contactId, limit = 5 } = params;
+
+    let query = this.supabase
+      .from('sessions')
+      .select('*')
+      .eq('user_id', userId)
+      .is('ended_at', null)
+      .neq('lifecycle', 'failed')
+      .order('started_at', { ascending: false })
+      .limit(limit);
+
+    // Prefer the canonical identity; only fall back to the ambiguous slug.
+    if (sbId) {
+      query = query.eq('sb_id', sbId);
+    } else if (agentId) {
+      query = query.eq('agent_id', agentId);
+    }
+
+    if (studioId !== undefined) {
+      query = studioId === null ? query.is('studio_id', null) : query.eq('studio_id', studioId);
+    }
+
+    // Mirrors getActiveSession: contact sessions match their contact, owner
+    // sessions match NULL, so per-sender isolation is never collapsed.
+    query = contactId ? query.eq('contact_id', contactId) : query.is('contact_id', null);
+
+    const { data, error } = await query;
+
+    if (error) {
+      logger.error('Failed to find owned active sessions:', error);
+      throw new Error(`Failed to find owned active sessions: ${error.message}`);
+    }
+
+    return (data || []).map((row) => this.rowToSession(row));
+  }
+
+  /**
    * Get active session for a user (most recent without ended_at).
    *
    * studioId behavior:
@@ -1598,7 +1663,13 @@ export class MemoryRepository {
     userId: string,
     agentId?: string,
     studioId?: string | null,
-    contactId?: string
+    contactId?: string,
+    /**
+     * Canonical owner. When supplied it REPLACES the slug filter: `agent_id` is
+     * unique only per (user_id, workspace_id), so matching on it alone can
+     * return a same-named identity's session from another workspace.
+     */
+    sbId?: string
   ): Promise<Session | null> {
     let query = this.supabase
       .from('sessions')
@@ -1609,7 +1680,11 @@ export class MemoryRepository {
       .order('started_at', { ascending: false })
       .limit(1);
 
-    if (agentId) {
+    // Prefer the canonical owner; the slug is the fallback for callers that
+    // have no canonical identity.
+    if (sbId) {
+      query = query.eq('sb_id', sbId);
+    } else if (agentId) {
       query = query.eq('agent_id', agentId);
     }
 
@@ -1649,18 +1724,23 @@ export class MemoryRepository {
     agentId: string,
     threadKey: string,
     studioId?: string | null,
-    contactId?: string
+    contactId?: string,
+    /** Canonical owner; replaces the slug filter when supplied. */
+    sbId?: string
   ): Promise<Session | null> {
     let query = this.supabase
       .from('sessions')
       .select('*')
       .eq('user_id', userId)
-      .eq('agent_id', agentId)
       .eq('thread_key', threadKey)
       .is('ended_at', null)
       .neq('lifecycle', 'failed')
       .order('started_at', { ascending: false })
       .limit(1);
+
+    // Prefer the canonical owner; the slug is the fallback for callers that
+    // have no canonical identity.
+    query = sbId ? query.eq('sb_id', sbId) : query.eq('agent_id', agentId);
 
     if (studioId !== undefined) {
       if (studioId === null) {
@@ -2073,6 +2153,7 @@ export class MemoryRepository {
       userId: row.user_id,
       agentId: row.agent_id || undefined,
       sbId: row.sb_id || undefined,
+      contactId: row.contact_id || undefined,
       studioId,
       threadKey: row.thread_key || undefined,
       activeThreadKey: row.active_thread_key || undefined,

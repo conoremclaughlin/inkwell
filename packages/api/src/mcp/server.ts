@@ -33,7 +33,7 @@ import {
   type ChannelGatewayConfig,
   type IncomingMessageHandler,
 } from '../channels/gateway';
-import { runWithRequestContext } from '../utils/request-context';
+import { runWithRequestContext, tokenIdentityContext } from '../utils/request-context';
 import { resolveWorkspaceContextForRequest } from '../utils/workspace-scope';
 import { getRuntimeBuildInfo } from '../utils/runtime-build-info';
 import { PcpAuthProvider } from './auth/pcp-auth-provider';
@@ -494,6 +494,11 @@ export class MCPServer {
       // identity — canonical sbId first — to user-token requests so
       // pinned-agent dispatch and workspace derivation work for ink-routed
       // tool calls.
+      // Snapshot the token's own identity before enrichment. Authorization
+      // reads these; everything below may be overwritten by session-derived
+      // values that are routing hints, not authentication facts.
+      Object.assign(ctx, tokenIdentityContext(userData));
+
       const effectiveIdentity = await this.enrichIdentityFromContextSession(userData, contextToken);
       if (effectiveIdentity && effectiveIdentity !== userData) {
         Object.assign(ctx, {
