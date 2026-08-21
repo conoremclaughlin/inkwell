@@ -1795,6 +1795,98 @@ describe('session authorization boundary', () => {
       expect(mockDataComposer.repositories.memory.updateSession).not.toHaveBeenCalled();
     });
   });
+
+  // ---------------------------------------------------
+  // stdio callers
+  //
+  // The other half of the identity surface. Mutation testing found this whole
+  // branch unasserted: every test above sets a request context, so nothing
+  // pinned what happens when there is none.
+  // ---------------------------------------------------
+  describe('stdio callers', () => {
+    it('allows a pinned stdio caller its own session', async () => {
+      callerIsStdioAgent('myra', 'sb-myra');
+      mockDataComposer.repositories.memory.getSession.mockResolvedValue(myraSession);
+      mockDataComposer.repositories.memory.updateSession.mockResolvedValue(myraSession);
+
+      const result = await handleUpdateSessionState(
+        { email: 'test@test.com', sessionId: TARGET_UUID, context: 'stdio own' },
+        mockDataComposer as never
+      );
+
+      expect(JSON.parse(result.content[0].text).success).toBe(true);
+    });
+
+    it('denies a pinned stdio caller a peer session', async () => {
+      callerIsStdioAgent('myra', 'sb-myra');
+      mockDataComposer.repositories.memory.getSession.mockResolvedValue(lumenSession);
+
+      denied(
+        await handleUpdateSessionState(
+          { email: 'test@test.com', sessionId: TARGET_UUID, context: 'stdio peer' },
+          mockDataComposer as never
+        )
+      );
+      expect(mockDataComposer.repositories.memory.updateSession).not.toHaveBeenCalled();
+    });
+
+    it('denies a pinned stdio caller whose session context names a different agent', async () => {
+      // sbId is only adopted when the session context describes the pinned
+      // agent, so a mismatched context cannot lend its canonical identity.
+      callerIsStdioAgent('myra', 'sb-myra');
+      vi.mocked(getSessionContext).mockReturnValue({
+        agentId: 'lumen',
+        sbId: 'sb-lumen',
+      } as never);
+      mockDataComposer.repositories.memory.getSession.mockResolvedValue(lumenSession);
+
+      denied(
+        await handleUpdateSessionState(
+          { email: 'test@test.com', sessionId: TARGET_UUID, context: 'borrowed sbId' },
+          mockDataComposer as never
+        )
+      );
+    });
+
+    it('treats an unpinned stdio call as the local operator, not as the agent it names', async () => {
+      // No pin and no request context is the pre-bootstrap local operator, who
+      // keeps same-user repair authority. The point of the explicit agentId
+      // here is that it must NOT convert the call into an agent-bound one —
+      // it is attribution, and an agent-bound caller with no canonical claim
+      // would be refused this target rather than granted it.
+      callerIsAnonymous();
+      mockDataComposer.repositories.memory.getSession.mockResolvedValue(lumenSession);
+      mockDataComposer.repositories.memory.updateSession.mockResolvedValue(lumenSession);
+
+      const result = await handleUpdateSessionState(
+        {
+          email: 'test@test.com',
+          sessionId: TARGET_UUID,
+          agentId: 'lumen',
+          context: 'operator repair from the CLI',
+        },
+        mockDataComposer as never
+      );
+
+      expect(JSON.parse(result.content[0].text).success).toBe(true);
+    });
+
+    it('still refuses to cross users on an unpinned stdio call', async () => {
+      callerIsAnonymous();
+      mockDataComposer.repositories.memory.getSession.mockResolvedValue({
+        ...lumenSession,
+        userId: 'someone-else',
+      });
+
+      denied(
+        await handleUpdateSessionState(
+          { email: 'test@test.com', sessionId: TARGET_UUID, agentId: 'lumen', context: 'nope' },
+          mockDataComposer as never
+        )
+      );
+      expect(mockDataComposer.repositories.memory.updateSession).not.toHaveBeenCalled();
+    });
+  });
 });
 
 describe('startSessionSchema - threadKey', () => {
