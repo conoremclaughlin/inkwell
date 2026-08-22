@@ -72,22 +72,45 @@ describe('resolveOutboundAttachments — happy path', () => {
     expect(attachment.mimeType).toBe('image/jpeg');
   });
 
-  it('falls back to the override when the real file has no usable extension', async () => {
-    const file = join(root, 'AgACAgUAAxkBAAIJQmqH_1787251286114');
-    await writeFile(file, 'PDFBYTES');
+  // Lumen's catch: an earlier revision fell back to the display name whenever
+  // the real file was unmapped, which reinstated the very coupling this change
+  // removes. `.html` is not in the map, so `payload.html` shown as
+  // `report.pdf` went out declared a PDF on the strength of a name that never
+  // saw the bytes.
+  it('never borrows the display type for a real file it cannot type', async () => {
+    const file = join(root, 'payload.html');
+    await writeFile(file, '<html>NOT A PDF</html>');
 
-    const [attachment] = await resolve([{ path: file, filename: 'Report.pdf' }]);
+    const [attachment] = await resolve([{ path: file, filename: 'report.pdf' }]);
 
-    expect(attachment.mimeType).toBe('application/pdf');
+    expect(attachment.filename).toBe('report.pdf');
+    expect(attachment.mimeType).toBe('application/octet-stream');
   });
 
-  it('falls back to octet-stream when neither name carries an extension', async () => {
+  // A genuinely extension-less file — the earlier fixture used a real Telegram
+  // id with `.jpg` stripped, which reads as covering production but tests a
+  // shape that does not occur there: every file in the media root has a
+  // suffix. This one is honestly opaque.
+  it('stays octet-stream when the real file has no extension at all', async () => {
     const file = join(root, 'opaque-download');
     await writeFile(file, 'BYTES');
 
-    const [attachment] = await resolve([{ path: file, filename: 'attachment' }]);
+    const [attachment] = await resolve([{ path: file, filename: 'Report.pdf' }]);
 
     expect(attachment.mimeType).toBe('application/octet-stream');
+  });
+
+  // Myra found this by listing the media root rather than reasoning about it:
+  // Telegram voice notes land as `.oga`, 6 of the 23 files there, and `.oga`
+  // was absent from the map — so a file we positively know is Ogg audio went
+  // out as generic bytes.
+  it('types a Telegram voice note as Ogg audio', async () => {
+    const file = join(root, 'AgACAgUAAxkBAAIJQmqH_1787251286114.oga');
+    await writeFile(file, 'OGGBYTES');
+
+    const [attachment] = await resolve([{ path: file }]);
+
+    expect(attachment.mimeType).toBe('audio/ogg');
   });
 
   // The real first use: Telegram downloads land in a subdirectory of the media
