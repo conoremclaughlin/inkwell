@@ -4821,6 +4821,40 @@ describe('SessionService', () => {
       ).rejects.toMatchObject({ code: 'ROUTING_REFUSED' });
     });
 
+    it('says the identity is ambiguous instead of blaming route patterns', async () => {
+      // The refusal fires before any tier runs, but reported itself with the
+      // generic text: "no route pattern, no project affinity, and no usable
+      // caller repo". All three are false — none were consulted. Myra and
+      // Lumen each spent a night rewriting threadKeys and auditing route
+      // patterns against a studio whose `pr:*` would have matched fine; the
+      // real cause was a duplicate row in agent_identities.
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          const calls: RecordedCall[] = [];
+          if (table === 'agent_identities') {
+            return createFilterAwareChain(
+              () => ({ data: [{ id: 'sb-one' }, { id: 'sb-two' }] }),
+              calls
+            );
+          }
+          return createRecordingChain({ data: null }, calls);
+        }),
+      };
+      const service = serviceWith(mockSupabase);
+
+      const err = await service
+        .getOrCreateSession('user-456', 'wren', { threadKey: 'pr:525' })
+        .then(
+          () => null,
+          (e: Error) => e
+        );
+
+      expect(err).toBeInstanceOf(Error);
+      expect(err!.message).toMatch(/several identity rows share this agent slug/);
+      expect(err!.message).toMatch(/Route patterns were NOT consulted/);
+      expect(err!.message).not.toMatch(/no route pattern/);
+    });
+
     it('an ambiguous slug does not match early-tier slug rows either', async () => {
       // Ambiguous and absent both produced a null sbId, so both fell back to
       // agent_id — letting a duplicate-slug studio win an early tier and

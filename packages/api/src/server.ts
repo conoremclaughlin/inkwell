@@ -1299,7 +1299,9 @@ When you complete a task_request, mark it as completed using update_inbox_messag
           recovery:
             err.detail.reason === 'occupied'
               ? 'wait for the lease holder to finish, or fix the overflow provisioning failure'
-              : 'add a route pattern to a studio, pass studioHint, or send from a session bound to the target repo',
+              : err.detail.reason === 'ambiguous-identity'
+                ? 'de-duplicate this agent slug in agent_identities — no route pattern was consulted, so routing config is not the cause'
+                : 'add a route pattern to a studio, pass studioHint, or send from a session bound to the target repo',
         });
 
         await logInkmail('inkmail_fail', payload, userId, {

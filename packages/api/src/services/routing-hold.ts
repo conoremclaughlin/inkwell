@@ -23,8 +23,12 @@ export interface RoutingHoldDetail {
    * Why routing refused. `occupied` means a studio WAS resolved but was leased
    * and overflow provisioning failed — a different problem with a different
    * recovery, so the hold must not describe it as "no route".
+   *
+   * `ambiguous-identity` refuses before any tier runs, so its recovery is not
+   * routing configuration at all: no route pattern would have helped, because
+   * none was consulted.
    */
-  reason?: 'no-route' | 'occupied';
+  reason?: 'no-route' | 'occupied' | 'ambiguous-identity';
   occupied?: { studioId: string; holderThreadKey: string } | null;
 }
 
@@ -73,7 +77,9 @@ export async function stampRoutingHold(client: any, args: StampHoldArgs): Promis
         recovery:
           detail.reason === 'occupied'
             ? 'wait for the lease holder to finish, or fix the overflow provisioning failure'
-            : 'route pattern, studioHint, or project affinity',
+            : detail.reason === 'ambiguous-identity'
+              ? 'de-duplicate the agent slug in agent_identities — routing config is not the cause'
+              : 'route pattern, studioHint, or project affinity',
         occupied: detail.occupied ?? null,
       },
     });
