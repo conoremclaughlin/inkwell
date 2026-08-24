@@ -69,12 +69,28 @@ export interface TokenResponse {
 }
 
 /**
+ * How close to expiry getValidAccessToken stops trusting a stored token and
+ * refreshes it before use. inspectAccountHealth reads the same constant, so the
+ * two cannot disagree about which accounts are one refresh away from a verdict.
+ */
+const TOKEN_REFRESH_WINDOW_MS = 5 * 60 * 1000;
+
+/**
  * A read-only view of how a provider call would fare right now, derived from
- * stored account state. `reason` is null when the account looks usable.
+ * stored account state. `reason` is null only when the account is usable as-is.
  */
 export interface ProviderAccountHealth {
-  /** 'active' means getValidAccessToken would hand back a usable token. */
-  state: 'active' | 'unusable' | 'missing';
+  /**
+   * - `active`: getValidAccessToken would hand back the stored token unchanged.
+   * - `refresh_required`: the token is inside the refresh window, so the next
+   *   call has to refresh it first. Whether that refresh succeeds cannot be
+   *   known without performing it — and with Google's testing-mode seven-day
+   *   token expiry, this is exactly the state that fails.
+   * - `unusable`: no call would succeed.
+   * - `missing`: nothing is connected for this provider.
+   * - `unknown`: account state could not be read, so there is no verdict.
+   */
+  state: 'active' | 'refresh_required' | 'unusable' | 'missing' | 'unknown';
   /** The stored account status, when a row exists. */
   accountStatus: 'active' | 'expired' | 'revoked' | 'error' | null;
   reason: string | null;
@@ -461,8 +477,10 @@ class OAuthService {
    * method's account selection, so the answer describes the account a real call
    * would actually use rather than any row that happens to exist.
    *
-   * Never throws — a lookup failure reports as 'missing' with a reason, because
+   * Never throws — a lookup failure reports as 'unknown' with a reason, because
    * a health check that explodes is worse than one that says "I can't tell".
+   * 'unknown' is deliberately distinct from 'missing': "I could not read the
+   * account table" is not the same claim as "nothing is connected".
    */
   async inspectAccountHealth(
     userId: string,
@@ -487,7 +505,7 @@ class OAuthService {
 
     if (error) {
       return {
-        state: 'missing',
+        state: 'unknown',
         accountStatus: null,
         reason: `Could not read account state: ${error.message}`,
         lastError: null,
@@ -543,6 +561,21 @@ class OAuthService {
       };
     }
 
+    // Inside the same window getValidAccessToken uses, the stored token is not
+    // what the next call will send — a refresh happens first, and a refresh can
+    // fail. Calling this 'active' would promise a usable token that this method
+    // has not obtained and cannot obtain without mutating state. Say what is
+    // actually known: a refresh is pending and its outcome is not yet decided.
+    if (expiresAt !== null && expiresAt - Date.now() < TOKEN_REFRESH_WINDOW_MS) {
+      return {
+        ...base,
+        state: 'refresh_required',
+        reason: row.refresh_token
+          ? `Access token expires at ${row.expires_at}; the next call must refresh it first, and that refresh may fail`
+          : `Access token expires at ${row.expires_at} and no refresh token is stored to renew it`,
+      };
+    }
+
     return { ...base, state: 'active', reason: null };
   }
 
@@ -577,9 +610,10 @@ class OAuthService {
       throw new Error(`No active ${provider} account found`);
     }
 
-    // Check if token is expired or expiring soon (within 5 minutes)
+    // Check if token is expired or expiring soon. Shared with inspectAccountHealth
+    // so the health verdict describes the same window this refresh acts on.
     const expiresAt = account.expires_at ? new Date(account.expires_at) : null;
-    const isExpiringSoon = expiresAt && expiresAt.getTime() - Date.now() < 5 * 60 * 1000;
+    const isExpiringSoon = expiresAt && expiresAt.getTime() - Date.now() < TOKEN_REFRESH_WINDOW_MS;
 
     if (isExpiringSoon && account.refresh_token) {
       logger.info(`Refreshing ${provider} token for user ${userId}`);
