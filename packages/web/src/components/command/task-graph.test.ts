@@ -187,3 +187,104 @@ describe('executionLabel', () => {
     expect(executionLabel({ taskType: 'work' })).toBeNull();
   });
 });
+
+// ─── summarizeGroups ───
+
+import { summarizeGroups } from './task-graph';
+import type { TaskNode } from './store';
+
+function task(overrides: Partial<TaskNode> & { id: string }): TaskNode {
+  return {
+    title: overrides.id,
+    status: 'pending',
+    priority: 'medium',
+    groupId: null,
+    groupTitle: null,
+    taskOrder: null,
+    agentId: null,
+    blockedBy: [],
+    taskType: 'work',
+    outcome: null,
+    gateState: null,
+    gateAttempt: null,
+    eligibleAt: null,
+    claimedBySessionId: null,
+    assigneeIdentityId: null,
+    groupExecutionModel: null,
+    ...overrides,
+  };
+}
+
+describe('summarizeGroups', () => {
+  it('sorts running work above open gates above ready above size', () => {
+    const tasks: TaskNode[] = [
+      // g-big: large but dormant (blocked behind an active fetched dep)
+      ...Array.from({ length: 10 }, (_, i) =>
+        task({
+          id: `big-${i}`,
+          groupId: 'g-big',
+          groupTitle: 'Big backlog',
+          blockedBy: ['big-anchor'],
+        })
+      ),
+      task({ id: 'big-anchor', groupId: 'g-big', groupTitle: 'Big backlog', status: 'blocked' }),
+      // g-gate: an open verification gate
+      task({
+        id: 'gate-1',
+        groupId: 'g-gate',
+        groupTitle: 'Gated',
+        taskType: 'verification',
+        gateState: 'open',
+      }),
+      // g-run: one in-progress task
+      task({ id: 'run-1', groupId: 'g-run', groupTitle: 'Running', status: 'in_progress' }),
+      // g-ready: one ready task
+      task({ id: 'ready-1', groupId: 'g-ready', groupTitle: 'Ready' }),
+    ];
+    const ordered = summarizeGroups(tasks).map((g) => g.id);
+    expect(ordered).toEqual(['g-run', 'g-gate', 'g-ready', 'g-big']);
+  });
+
+  it('counts gates, failures, and readiness per the SATISFIES mirror', () => {
+    const tasks: TaskNode[] = [
+      task({ id: 'w1', groupId: 'g', groupTitle: 'G', status: 'completed' }),
+      // ready: sole dep is completed work
+      task({ id: 'w2', groupId: 'g', groupTitle: 'G', blockedBy: ['w1'] }),
+      // NOT ready: claimed
+      task({ id: 'w3', groupId: 'g', groupTitle: 'G', claimedBySessionId: 'sess-1' }),
+      // failed gate counts in failed, not gatesOpen
+      task({
+        id: 'v1',
+        groupId: 'g',
+        groupTitle: 'G',
+        taskType: 'verification',
+        gateState: 'failed',
+      }),
+      // downstream of the failed gate: dependency-failure
+      task({ id: 'w4', groupId: 'g', groupTitle: 'G', blockedBy: ['v1'] }),
+      task({
+        id: 'v2',
+        groupId: 'g',
+        groupTitle: 'G',
+        taskType: 'verification',
+        gateState: 'in_progress',
+      }),
+    ];
+    const [g] = summarizeGroups(tasks);
+    expect(g.total).toBe(6);
+    expect(g.ready).toBe(1); // only w2
+    expect(g.gatesOpen).toBe(1); // v2 (in_progress verification)
+    expect(g.failed).toBe(2); // v1 (failed gate) + w4 (failed dep)
+  });
+
+  it('collects groupless tasks under an Ungrouped row', () => {
+    const tasks: TaskNode[] = [
+      task({ id: 'solo-1' }),
+      task({ id: 'in-group', groupId: 'g', groupTitle: 'G' }),
+    ];
+    const rows = summarizeGroups(tasks);
+    const ungrouped = rows.find((r) => r.id === 'ungrouped');
+    expect(ungrouped?.title).toBe('Ungrouped');
+    expect(ungrouped?.total).toBe(1);
+  });
+});
