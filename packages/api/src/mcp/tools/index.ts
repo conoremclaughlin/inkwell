@@ -2,6 +2,12 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import type { DataComposer } from '../../data/composer';
 import { logger } from '../../utils/logger';
+import { strictifyInputSchema, strictToolArgsEnabled } from './strict-input-schema';
+import {
+  describeToolSchema,
+  handleDescribeTool,
+  type ToolRegistry,
+} from './tool-discovery-handlers';
 
 // Import all tool handlers
 import { handleSaveLink, handleSearchLinks, handleTagLink } from './link-handlers';
@@ -37,6 +43,25 @@ import {
   closeTaskGroupSchema,
 } from './task-handlers';
 
+import {
+  handleApplyTaskGraph,
+  handleConvertTaskGroupToGraph,
+  handleGetTaskGraph,
+  handleStartGraphExecution,
+  handleClaimTask,
+  handleReleaseClaim,
+  handleRecordGateVerdict,
+  handleRetryGate,
+  applyTaskGraphSchema,
+  convertTaskGroupToGraphSchema,
+  getTaskGraphSchema,
+  startGraphExecutionSchema,
+  claimTaskSchema,
+  releaseClaimSchema,
+  recordGateVerdictSchema,
+  retryGateSchema,
+} from './task-graph-handlers';
+
 import { handleSendResponse, handleGetPendingMessages, handleMarkRead } from './response-handlers';
 
 import {
@@ -55,6 +80,9 @@ import {
   handleRestoreMemory,
   handleBootstrap,
   handleCompactSession,
+  rememberSchema,
+  listSessionsSchema,
+  updateSessionStateSchema,
 } from './memory-handlers';
 
 import {
@@ -64,6 +92,7 @@ import {
 } from './chat-context-handlers';
 
 import { handleListSkills, handleGetSkill } from './skill-handlers';
+import { handleListThreadKeyTypes, handleSetThreadKeyType } from './thread-key-handlers';
 
 import {
   handlePublishSkill,
@@ -386,8 +415,32 @@ export function registerAllTools(
     return TRANSIENT_PG_PATTERNS.some((p) => msg.includes(p));
   }
 
+  // Populated by the interceptor below; read at call time by describe_tool, so
+  // registration order does not matter.
+  const toolRegistry: ToolRegistry = new Map();
+
   const originalRegisterTool = server.registerTool.bind(server);
   (server as any).registerTool = (name: string, ...rest: any[]) => {
+    // Reject unknown args instead of silently stripping them. Applied here so
+    // all ~163 tools inherit it, rather than per-schema — see
+    // ./strict-input-schema for why the default rather than the schemas is
+    // treated as the defect.
+    const config = rest[0];
+    if (strictToolArgsEnabled()) {
+      if (config && typeof config === 'object' && 'inputSchema' in config) {
+        config.inputSchema = strictifyInputSchema(config.inputSchema);
+      }
+    }
+    // Record what was registered so describe_tool can answer questions about
+    // it. Captured after strictify so an agent is shown the schema that is
+    // actually enforced, not the one before it was tightened.
+    if (config && typeof config === 'object') {
+      toolRegistry.set(name, {
+        name,
+        description: (config as { description?: string }).description,
+        inputSchema: (config as { inputSchema?: unknown }).inputSchema,
+      });
+    }
     const handler = rest[rest.length - 1];
     if (typeof handler === 'function') {
       rest[rest.length - 1] = async (...handlerArgs: any[]) => {
@@ -667,6 +720,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           .describe(
             'Local filesystem path to the repo root (e.g., /Users/.../my-project). Used by strategy spawner to know where to start autonomous sessions.'
           ),
+        slug: z
+          .string()
+          .regex(/^[a-z0-9][a-z0-9-]*$/)
+          .max(32)
+          .nullable()
+          .optional()
+          .describe(
+            'Thread-key project prefix (e.g., "inkread" in inkread:pr:42). Reserved against thread-key type names. Pass null to clear.'
+          ),
         goals: z.array(z.string()).optional().describe('Project goals'),
       },
     },
@@ -675,6 +737,92 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         return await handleSaveProject(args, dataComposer);
       } catch (error) {
         logger.error('Error in save_project:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // Register list_thread_key_types tool
+  server.registerTool(
+    'list_thread_key_types',
+    {
+      description: `List thread-key type behaviors — write intent and studio policy per type (spec: thread-key-grammar v2). Shipped templates plus your overrides; overrides shadow templates.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: {
+        ...userIdentifierFields,
+      },
+    },
+    async (args) => {
+      try {
+        return await handleListThreadKeyTypes(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in list_thread_key_types:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // Register set_thread_key_type tool
+  server.registerTool(
+    'set_thread_key_type',
+    {
+      description: `Set (or reset) the behavior of a thread-key type — e.g., make "pr:*" threads take the studio write lease and provision worktrees. Creates a per-user override of the shipped template; reset: true removes the override.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: {
+        ...userIdentifierFields,
+        type: z
+          .string()
+          .min(1)
+          .max(32)
+          .describe('Thread-key type name (e.g., "pr", "spec"). Lowercase [a-z0-9-].'),
+        writeIntent: z
+          .enum(['write', 'presence'])
+          .optional()
+          .describe(
+            'write = sessions on this thread type take the studio write lease at spawn; presence = run without leasing, tolerate drift'
+          ),
+        studioPolicy: z
+          .enum(['provision', 'reuse-only'])
+          .optional()
+          .describe(
+            'provision = routing may create worktrees for this type; reuse-only = existing studios or main only'
+          ),
+        description: z.string().max(500).optional().describe('What this type means'),
+        reset: z
+          .boolean()
+          .optional()
+          .describe('Delete the user override so the shipped template (or default) resumes'),
+      },
+    },
+    async (args) => {
+      try {
+        return await handleSetThreadKeyType(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in set_thread_key_type:', error);
         return {
           content: [
             {
@@ -896,10 +1044,27 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
     {
       description: `Mark a task as completed.
 
+For tasks in graph-mode groups, completion is claim-token-gated: claim the task first (claim_task) and pass claimToken here.
+
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: {
         ...userIdentifierFields,
         taskId: z.string().uuid().describe('Task ID to mark as completed'),
+        summary: z
+          .string()
+          .max(2000)
+          .optional()
+          .describe('Brief summary of what was accomplished (shown in mission feed)'),
+        claimToken: z
+          .string()
+          .uuid()
+          .optional()
+          .describe('Required for graph-mode tasks: the claim token from claim_task'),
+        sessionId: z
+          .string()
+          .uuid()
+          .optional()
+          .describe('Claim-holding session for graph-mode tasks — usually resolved from context'),
       },
     },
     async (args) => {
@@ -919,6 +1084,160 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           ],
           isError: true,
         };
+      }
+    }
+  );
+
+  // ── Workflow graph tools (spec: ink://specs/workflow-graph v10) ────────
+
+  const graphToolError = (name: string) => (error: unknown) => {
+    logger.error(`Error in ${name}:`, error);
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: JSON.stringify({
+            success: false,
+            error: error instanceof Error ? error.message : 'Unknown error',
+          }),
+        },
+      ],
+      isError: true,
+    };
+  };
+
+  server.registerTool(
+    'convert_task_group_to_graph',
+    {
+      description: `Convert a linear task group to graph execution. Validated preflight: existing blocked_by arrays become task_edges only when fully valid (no dangling/self/cross-group/cyclic entries); on any failure the group stays linear, reported explicitly. Only idle/paused groups convert.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: convertTaskGroupToGraphSchema,
+    },
+    async (args) => {
+      try {
+        return await handleConvertTaskGroupToGraph(args, dataComposer);
+      } catch (error) {
+        return graphToolError('convert_task_group_to_graph')(error);
+      }
+    }
+  );
+
+  server.registerTool(
+    'apply_task_graph',
+    {
+      description: `Replace a graph-mode group's dependency edges with the complete desired set (serialized, graph_version CAS, cycle-checked). An edge from→to means "from must complete/pass before to can start". This is the ONLY way to mutate graph dependencies — blocked_by is frozen for graph groups.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: applyTaskGraphSchema,
+    },
+    async (args) => {
+      try {
+        return await handleApplyTaskGraph(args, dataComposer);
+      } catch (error) {
+        return graphToolError('apply_task_graph')(error);
+      }
+    }
+  );
+
+  server.registerTool(
+    'get_task_graph',
+    {
+      description: `Read a task group's graph: nodes (with gate state, claims, dwell windows, assignees) and edges, plus graphVersion for CAS on mutations. Use before apply_task_graph, record_gate_verdict, or retry_gate.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: getTaskGraphSchema,
+    },
+    async (args) => {
+      try {
+        return await handleGetTaskGraph(args, dataComposer);
+      } catch (error) {
+        return graphToolError('get_task_graph')(error);
+      }
+    }
+  );
+
+  server.registerTool(
+    'start_graph_execution',
+    {
+      description: `Start (or resume) executing a graph-mode task group: activates it, evaluates readiness, and dispatches every ready node to its assignee. The reconciliation sweep keeps it moving afterward.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: startGraphExecutionSchema,
+    },
+    async (args) => {
+      try {
+        return await handleStartGraphExecution(args, dataComposer);
+      } catch (error) {
+        return graphToolError('start_graph_execution')(error);
+      }
+    }
+  );
+
+  server.registerTool(
+    'claim_task',
+    {
+      description: `Claim a ready graph node for this session. Returns a claimToken required to complete the task (work) or record a verdict (claimed executable gate). Exactly one session holds a claim; refusals are structured (not-ready, already-claimed, gate-not-open, approval-gate).
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: claimTaskSchema,
+    },
+    async (args) => {
+      try {
+        return await handleClaimTask(args, dataComposer);
+      } catch (error) {
+        return graphToolError('claim_task')(error);
+      }
+    }
+  );
+
+  server.registerTool(
+    'release_claim',
+    {
+      description: `Release a claim you hold on a graph node without completing it — the node returns to the ready pool (work → pending, gate → open) for another session.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: releaseClaimSchema,
+    },
+    async (args) => {
+      try {
+        return await handleReleaseClaim(args, dataComposer);
+      } catch (error) {
+        return graphToolError('release_claim')(error);
+      }
+    }
+  );
+
+  server.registerTool(
+    'record_gate_verdict',
+    {
+      description: `Record a verdict on an open verification gate: passed (evidence required) or failed (reason required). Attempt + gateVersion CAS — read them via get_task_graph first. Authority: the claim holder for claimed gates, the assignee otherwise. Passing pushes downstream nodes ready in the same transaction.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: recordGateVerdictSchema,
+    },
+    async (args) => {
+      try {
+        return await handleRecordGateVerdict(args, dataComposer);
+      } catch (error) {
+        return graphToolError('record_gate_verdict')(error);
+      }
+    }
+  );
+
+  server.registerTool(
+    'retry_gate',
+    {
+      description: `Retry a FAILED verification gate after remediation: new attempt on the same node, fresh dwell window, prior evidence immutable in the event log.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: retryGateSchema,
+    },
+    async (args) => {
+      try {
+        return await handleRetryGate(args, dataComposer);
+      } catch (error) {
+        return graphToolError('retry_gate')(error);
       }
     }
   );
@@ -1581,51 +1900,10 @@ Examples: "project:pcp/memory", "decision:jwt-auth", "person:conor", "reflection
 Use summary to provide a one-liner when the full content is long/detailed. The summary is what appears in the bootstrap knowledge summary.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: {
-        ...userIdentifierFields,
-        content: z.string().describe('The content to remember'),
-        summary: z
-          .string()
-          .optional()
-          .describe(
-            'One-liner summary of this memory. Used in bootstrap knowledge summary instead of full content. Provide when content is long/detailed.'
-          ),
-        topicKey: z
-          .string()
-          .optional()
-          .describe(
-            'Primary structured topic key (type:identifier). Common types: project, decision, convention, person, reflection, lesson, beauty, growth, value, family, domain. Auto-added to topics array.'
-          ),
-        topicSummary: z
-          .string()
-          .optional()
-          .describe(
-            'Short description of the topic (shown in bootstrap topic index header). Only needed when creating a new topic or updating its description.'
-          ),
-        source: z.string().optional().describe('Source of the memory (default: observation)'),
-        salience: z
-          .enum(['low', 'medium', 'high', 'critical'])
-          .optional()
-          .describe('Importance level (default: medium)'),
-        topics: z
-          .union([z.string(), z.array(z.string())])
-          .optional()
-          .describe('Topics for categorization'),
-        metadata: z.record(z.unknown()).optional().describe('Additional metadata'),
-        expiresAt: z.string().datetime().optional().describe('Optional expiration date (ISO 8601)'),
-        agentId: z
-          .string()
-          .optional()
-          .describe(
-            'Which AI being created this memory (e.g., "wren", "benson"). Null = shared memory.'
-          ),
-        studioId: z
-          .string()
-          .optional()
-          .describe(
-            'Studio ID (UUID or "main") — helps auto-attach the correct session in parallel worktree scenarios. Stored in metadata.'
-          ),
-      },
+      // Canonical schema, not a copy. The duplicate that used to live here was
+      // missing `contactId` and `sessionId`, so chat's /eject silently lost the
+      // session attribution it was explicitly passing.
+      inputSchema: rememberSchema,
     },
     async (args) => {
       try {
@@ -2035,19 +2313,11 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `List past sessions, optionally filtered by agent and/or backend.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: {
-        ...userIdentifierFields,
-        agentId: z.string().optional().describe('Filter by agent'),
-        studioId: z
-          .string()
-          .optional()
-          .describe('Filter by studio (UUID or "main" for the main studio)'),
-        backend: z
-          .string()
-          .optional()
-          .describe('Filter by backend runtime (e.g., "ink", "claude-code")'),
-        limit: z.number().min(1).max(100).optional().describe('Max results (default: 20)'),
-      },
+      // Register the canonical schema the handler parses with, rather than a
+      // hand-copied duplicate. The copy that used to live here had drifted:
+      // it was missing `status` and had dropped the UUID refinement on
+      // studioId, so the registered contract and the enforced one disagreed.
+      inputSchema: listSessionsSchema,
     },
     async (args) => {
       try {
@@ -2076,7 +2346,8 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
     {
       description: `Update your session state — work phase, status, backend session ID, context. This is the primary tool for managing session state.
 
-Session resolution: sessionId (explicit) > studioId (scoped lookup) > most recent active session.
+Session resolution: sessionId (explicit) > studioId (scoped lookup) > the session you are running in > your most recent active session.
+Implicit resolution is always scoped to your own agent identity and fails with an error rather than guessing — it will never select another agent's session.
 For parallel worktrees, pass studioId to target the correct session.
 
 Phase: Communicates real-time work status to other agents.
@@ -2089,62 +2360,11 @@ Context: The session context column is for **transient runtime state** — facts
 Also sets: backendSessionId (for resume), status (active/paused/resumable/completed), workingDir.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: {
-        ...userIdentifierFields,
-        sessionId: z
-          .string()
-          .uuid()
-          .optional()
-          .describe(
-            'Session ID (uses active session if not provided). Most reliable for targeting a specific session.'
-          ),
-        studioId: z
-          .string()
-          .optional()
-          .describe(
-            'Studio ID (UUID or "main") for session resolution when sessionId is not provided. Useful for parallel worktree scenarios.'
-          ),
-        phase: z
-          .string()
-          .optional()
-          .describe(
-            'Work phase (agent-set). Core phases: investigating, implementing, reviewing, paused, complete. Use waiting:<reason> when awaiting an async response within normal flow (review, merge, feedback). Use blocked:<reason> ONLY when extraordinary intervention is required outside normal process — something has gone wrong (permissions denied, infrastructure broken, unresolvable conflict). Both auto-create memories. Do NOT use runtime: prefix — use lifecycle instead.'
-          ),
-        note: z
-          .string()
-          .optional()
-          .describe(
-            'Context for the phase transition (included in auto-created memory for blocked/waiting)'
-          ),
-        agentId: z.string().optional().describe('Agent identity for memory attribution'),
-        createTask: z
-          .boolean()
-          .optional()
-          .describe('Create a PCP task for blocked/waiting phases (default: false)'),
-        backendSessionId: z
-          .string()
-          .optional()
-          .describe(
-            'Backend-specific session ID for resumption (e.g., Claude Code session ID, Codex session ID)'
-          ),
-        status: z
-          .enum(['active', 'paused', 'resumable', 'completed'])
-          .optional()
-          .describe('Session status'),
-        context: z
-          .string()
-          .optional()
-          .describe(
-            'Transient runtime state — active facts too ephemeral for a memory but important to preserve across compaction. E.g. "server on :4001", "waiting on PR #341 review", "vitest running in background". Use as a scratch board; memories handle durable decisions.'
-          ),
-        workingDir: z.string().optional().describe('Working directory'),
-        activeThreadKey: z
-          .string()
-          .optional()
-          .describe(
-            'The thread key the session is currently working on (e.g., "pr:350", "spec:auth-refactor"). Mutable — updates as the session shifts focus. The original thread_key (set at session creation) remains the immutable routing anchor. Set to empty string to clear.'
-          ),
-      },
+      // Canonical schema, not a copy. The duplicate that used to live here was
+      // missing `lifecycle`, `cliAttached` and `alias`, so the session-start
+      // hook's `lifecycle: 'idle'` was stripped before the handler ever saw it
+      // — the stamp had been a silent no-op.
+      inputSchema: updateSessionStateSchema,
     },
     async (args) => {
       try {
@@ -2282,7 +2502,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `Load identity and context for a new session. Call this at the start of every new conversation.
 
 Returns:
-- Identity Files: shared values/user/process docs and agent-specific identity docs from ~/.pcp
+- Identity Files: shared values/user/process docs and agent-specific identity docs from ~/.ink
 - Identity Core: user profile, assistant role, relationship context from DB
 - Active Context: current projects, session context, project-specific context
 - Active Session: current session if any
@@ -2323,7 +2543,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         identityBasePath: z
           .string()
           .optional()
-          .describe('Base path for identity files (default: ~/.pcp)'),
+          .describe('Base path for identity files (default: ~/.ink)'),
         threadKey: z
           .string()
           .optional()
@@ -3660,6 +3880,50 @@ Action "transcribe" (with filePath) transcribes a saved audio file under ~/.ink/
   );
 
   server.registerTool(
+    'describe_tool',
+    {
+      description: `Look up what a tool is called and what parameters it takes.
+
+Use this the moment you are unsure of a tool name or a parameter name, instead
+of guessing. Guessing is expensive: a wrong parameter is rejected, and a wrong
+tool name costs a round trip.
+
+- describe_tool({ name: "create_reminder" }) — full description and parameter
+  schema for one tool, including which fields are required
+- describe_tool({ search: "reminder" }) — find tools by keyword when you know
+  what you want to do but not what it is called
+- describe_tool({}) — list every tool name
+
+Examples:
+- Unsure whether it is runAt or remindAt → describe_tool({ name: "create_reminder" })
+- Want to decline a calendar invite → describe_tool({ search: "calendar" })
+- Got "no tool named X" → describe_tool({ search: "<what you were trying to do>" })
+
+This reflects the live server, so it is never out of date.`,
+      inputSchema: describeToolSchema,
+    },
+    async (args) => {
+      try {
+        return handleDescribeTool(args, toolRegistry);
+      } catch (error) {
+        logger.error('Error in describe_tool:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
     'get_timezone',
     {
       description: `Get the user's current timezone setting and local time.
@@ -4713,6 +4977,11 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
 
 Supports To, CC, BCC recipients. Body can be plain text or HTML.
 
+Attachments: pass \`attachments: [{path, filename?}]\`. Paths must be inside
+~/.ink/files — files from received mail get there via download_email_attachment,
+and media the user sent over Telegram/WhatsApp already lives there. A path
+outside that directory fails the send rather than sending without the file.
+
 User must have connected their Google account with Gmail send permissions.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
@@ -4744,7 +5013,10 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
     {
       description: `Reply to an existing email. Automatically handles threading and subject line.
 
-Use replyAll=true to reply to all original recipients.
+Use replyAll=true to reply to all original recipients (the user's own address
+is excluded automatically). Honors the original Reply-To when present.
+
+Attachments: pass \`attachments: [{path, filename?}]\` with paths inside ~/.ink/files.
 
 User must have connected their Google account with Gmail send permissions.
 
@@ -4778,6 +5050,8 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `Create a draft email for later review and sending.
 
 Drafts appear in the user's Gmail drafts folder and can be edited/sent from the Gmail interface.
+
+Attachments: pass \`attachments: [{path, filename?}]\` with paths inside ~/.ink/files.
 
 User must have connected their Google account with Gmail permissions.
 
@@ -6020,6 +6294,34 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description:
         'Check the health status of external service integrations. ' +
         'Returns all integrations for the user, or filter to a specific service.\n\n' +
+        '`status` describes the SERVICE. `accountHealth` describes the OAuth ' +
+        'CREDENTIAL. They fail independently and neither substitutes for the other: ' +
+        'Gmail can be rate limited, out of scope, or down while the account stays ' +
+        'perfectly active.\n\n' +
+        '**`status: "healthy"` requires a recent service-level report.** It is never ' +
+        'inferred from a working credential — otherwise an ongoing outage would be ' +
+        'declared fixed the moment the last report aged out. Account state can only ' +
+        'LOWER a verdict, never raise it:\n' +
+        '- accountHealth "unusable"/"not_connected" is decisive (no call can succeed) ' +
+        'and overrides any report, which is kept as `supersededCachedStatus` / ' +
+        '`lastReportedError`.\n' +
+        '- accountHealth "refresh_required" caps the verdict at "degraded": the next ' +
+        'call must refresh the token first and that refresh may fail.\n' +
+        '- accountHealth "ok"/"unknown" leaves the reported verdict alone. A failed ' +
+        'account lookup is not evidence about the service, so it does not erase an ' +
+        'observed failure.\n\n' +
+        'Read `source` before trusting `status`:\n' +
+        '- source "cached": a status an agent reported by hand. Check `stale` and ' +
+        '`lastCheckAgeSeconds` — a stale row describes the past, not the present, and ' +
+        'must not be relayed as a liveness signal.\n' +
+        '- source "live": derived from stored OAuth account state, which the server ' +
+        'updates on every provider call. Only decisive credential failures report ' +
+        'this way.\n' +
+        '- source "unknown" with `status: "unknown"`: nobody has checked this service. ' +
+        'Not good news and not bad news — the absence of a report.\n\n' +
+        'Google services (gmail/calendar/drive/docs/sheets) always get a verdict, ' +
+        'whether or not anyone has reported on them. Filtering to a specific service ' +
+        'always returns one too, so an empty result never has to be read as good news.\n\n' +
         'User can be identified by ONE of:\n' +
         '- userId: Direct UUID\n' +
         '- email: Email address\n' +

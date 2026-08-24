@@ -92,7 +92,11 @@ export class GeminiAdapter implements BackendAdapter {
   readonly promptTransport = 'argv' as const;
 
   prepare(config: BackendConfig): PreparedBackend {
-    const { promptFile, cleanup: identityCleanup } = createIdentityPromptFile(config.agentId);
+    const { promptFile, cleanup: identityCleanup } = createIdentityPromptFile(
+      config.agentId,
+      undefined,
+      config.systemPromptOverride
+    );
 
     const args: string[] = [];
 

@@ -89,6 +89,93 @@ export async function readBoundedFromHandle(
   }
 }
 
+export type ContainedFileRejection =
+  | 'outside-root'
+  | 'not-a-file'
+  | 'hard-linked'
+  | 'too-large'
+  | 'unresolvable';
+
+export type ContainedFileResult =
+  | { ok: true; bytes: Buffer; realPath: string }
+  | { ok: false; reason: ContainedFileRejection };
+
+/** Human-readable explanation for a rejection, for surfacing to a caller. */
+export function describeContainedFileRejection(
+  reason: ContainedFileRejection,
+  mediaRoot: string
+): string {
+  switch (reason) {
+    case 'outside-root':
+      return `path resolves outside the shared media directory (${mediaRoot})`;
+    case 'not-a-file':
+      return 'path is not a regular file';
+    case 'hard-linked':
+      return 'file has multiple hard links, so its contents may alias data outside the media directory';
+    case 'too-large':
+      return 'file exceeds the size limit';
+    case 'unresolvable':
+      return 'path could not be resolved or read';
+  }
+}
+
+/**
+ * Read a file the caller referenced by path, enforcing the containment and
+ * provenance boundary described at the top of this module.
+ *
+ * This is THE single implementation of that check — trigger media
+ * snapshots and Gmail outbound attachments both route through it, so the
+ * rules cannot drift apart between the two callers.
+ *
+ * `rootReal` must already be realpath-resolved (see `resolveMediaRoot`);
+ * taking it as a parameter keeps per-file work off the root lookup.
+ */
+export async function readContainedFile(
+  requestedPath: string,
+  rootReal: string,
+  maxFileBytes: number
+): Promise<ContainedFileResult> {
+  try {
+    // Policy check on the reference: only inside the shared root. Realpath
+    // first so symlinks are judged by their target.
+    const real = await realpath(requestedPath);
+    if (!real.startsWith(rootReal + sep)) return { ok: false, reason: 'outside-root' };
+
+    // Provenance + content: one descriptor for verification AND the read.
+    // O_NOFOLLOW kills a symlink swapped in after the realpath; O_NONBLOCK
+    // keeps a swapped-in FIFO from hanging the handler; nlink === 1
+    // rejects hard links that alias content from outside the root.
+    const handle = await open(
+      real,
+      fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK
+    );
+    try {
+      const st = await handle.stat();
+      if (!st.isFile()) return { ok: false, reason: 'not-a-file' };
+      if (st.nlink > 1) return { ok: false, reason: 'hard-linked' };
+      if (st.size > maxFileBytes) return { ok: false, reason: 'too-large' };
+
+      const bytes = await readBoundedFromHandle(handle, maxFileBytes);
+      if (!bytes) return { ok: false, reason: 'too-large' };
+
+      return { ok: true, bytes, realPath: real };
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    return { ok: false, reason: 'unresolvable' };
+  }
+}
+
+/** Realpath the shared media root, or null when it is missing. */
+export async function resolveMediaRoot(mediaRoot = defaultMediaRoot()): Promise<string | null> {
+  try {
+    return await realpath(mediaRoot);
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Verify the snapshot destination is REALLY <root>/.trigger-snapshots — a
  * pre-existing symlink at that name would otherwise route mkdir/writeFile
@@ -203,10 +290,8 @@ export async function resolveTriggerMedia(
   const raw = (metadata as { media?: unknown } | null | undefined)?.media;
   if (!Array.isArray(raw) || raw.length === 0) return [];
 
-  let rootReal: string;
-  try {
-    rootReal = await realpath(mediaRoot);
-  } catch {
+  const rootReal = await resolveMediaRoot(mediaRoot);
+  if (!rootReal) {
     logger.warn('[Trigger] media requested but shared media dir is missing', { mediaRoot });
     return [];
   }
@@ -236,99 +321,69 @@ export async function resolveTriggerMedia(
       malformed += 1;
       continue;
     }
-    try {
-      // Policy check on the reference: the sender may only point inside the
-      // shared root. Realpath first so symlinks are judged by target.
-      const real = await realpath(e.path);
-      if (!real.startsWith(rootReal + sep)) {
-        logger.warn('[Trigger] media path outside shared media dir — dropped', { path: e.path });
-        continue;
-      }
-
-      // Provenance + content: one descriptor for verification AND the copy.
-      // O_NOFOLLOW kills a symlink swapped in after the realpath; O_NONBLOCK
-      // keeps a swapped-in FIFO from hanging the handler; nlink === 1
-      // rejects hard links that alias content from outside the root.
-      const handle = await open(
-        real,
-        fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK
+    const read = await readContainedFile(e.path, rootReal, maxFileBytes);
+    if (!read.ok) {
+      // Trigger delivery is best-effort: a bad entry is dropped and the rest
+      // of the batch still goes. (Outbound email deliberately does NOT do
+      // this — see resolveOutboundAttachments.)
+      // Keep the specific reason in the MESSAGE, not just the metadata:
+      // these warnings are grepped when an attachment silently fails to
+      // arrive, and "rejected" alone does not tell an operator why.
+      logger.warn(
+        `[Trigger] media entry rejected — dropped: ${describeContainedFileRejection(
+          read.reason,
+          rootReal
+        )}`,
+        { path: e.path, reason: read.reason }
       );
-      try {
-        const st = await handle.stat();
-        if (!st.isFile()) {
-          logger.warn('[Trigger] media path is not a regular file — dropped', { path: e.path });
-          continue;
-        }
-        if (st.nlink > 1) {
-          logger.warn('[Trigger] media file has multiple hard links — dropped', { path: e.path });
-          continue;
-        }
-        if (st.size > maxFileBytes) {
-          logger.warn('[Trigger] media file over size cap — dropped', {
+      continue;
+    }
+
+    try {
+      // Content-addressed snapshot: re-sending the same bytes reuses the
+      // existing copy instead of growing the disk without bound.
+      const digest = createHash('sha256').update(read.bytes).digest('hex').slice(0, 32);
+      const snapshotPath = join(snapshotDir, `${digest}-${basename(read.realPath)}`);
+      // Reuse only a VERIFIED existing snapshot; otherwise publish
+      // atomically — full bytes on a private temp inode, then rename()
+      // into the CAS name. Blind EEXIST reuse trusted the pathname: a
+      // symlink pre-planted at the CAS name, or a concurrent writer's
+      // partial file, would be served as if it held the sender's bytes. A
+      // writeFile at the final name would likewise create the pathname
+      // before the bytes land, so a concurrent same-content resolver could
+      // verify against a partial file and treat the live writer as an
+      // impostor (Lumen, PR #474 review: 12/16 drops on concurrent 12 MiB
+      // resolves). rename() also atomically replaces a pre-created symlink
+      // or crash leftover at the name — no unlink repair step, so a live
+      // writer's file is never deleted. Verified reuse refreshes mtime so
+      // LRU retention keeps live snapshots.
+      if (!(await verifyExistingSnapshot(snapshotPath, read.bytes))) {
+        const tmpPath = join(snapshotDir, `.tmp-${process.pid}-${randomBytes(6).toString('hex')}`);
+        try {
+          await writeFile(tmpPath, read.bytes, { flag: 'wx' });
+          await rename(tmpPath, snapshotPath);
+        } catch (publishErr) {
+          await unlink(tmpPath).catch(() => undefined);
+          logger.warn('[Trigger] snapshot publication failed — dropped', {
             path: e.path,
-            size: st.size,
-            cap: maxFileBytes,
+            snapshot: snapshotPath,
+            error: publishErr instanceof Error ? publishErr.message : String(publishErr),
           });
           continue;
         }
-
-        const bytes = await readBoundedFromHandle(handle, maxFileBytes);
-        if (!bytes) {
-          logger.warn('[Trigger] media file exceeded cap during read — dropped', {
-            path: e.path,
-            cap: maxFileBytes,
-          });
-          continue;
-        }
-
-        // Content-addressed snapshot: re-sending the same bytes reuses the
-        // existing copy instead of growing the disk without bound. `wx` is
-        // race-safe (O_CREAT|O_EXCL also refuses a symlink at the final
-        // component); EEXIST means an identical snapshot is already there.
-        const digest = createHash('sha256').update(bytes).digest('hex').slice(0, 32);
-        const snapshotPath = join(snapshotDir, `${digest}-${basename(real)}`);
-        // Reuse only a VERIFIED existing snapshot; otherwise publish
-        // atomically — full bytes on a private temp inode, then rename()
-        // into the CAS name. A writeFile at the final name would create the
-        // pathname before the bytes land, so a concurrent same-content
-        // resolver could verify against a partial file and treat the live
-        // writer as an impostor (Lumen, PR #474 review: 12/16 drops on
-        // concurrent 12 MiB resolves). rename() also atomically replaces a
-        // pre-created symlink or crash leftover at the name — no unlink
-        // repair step, so a live writer's file is never deleted.
-        if (!(await verifyExistingSnapshot(snapshotPath, bytes))) {
-          const tmpPath = join(
-            snapshotDir,
-            `.tmp-${process.pid}-${randomBytes(6).toString('hex')}`
-          );
-          try {
-            await writeFile(tmpPath, bytes, { flag: 'wx' });
-            await rename(tmpPath, snapshotPath);
-          } catch (publishErr) {
-            await unlink(tmpPath).catch(() => undefined);
-            logger.warn('[Trigger] snapshot publication failed — dropped', {
-              path: e.path,
-              snapshot: snapshotPath,
-              error: publishErr instanceof Error ? publishErr.message : String(publishErr),
-            });
-            continue;
-          }
-        }
-
-        out.push({
-          type:
-            typeof e.type === 'string' && MEDIA_TYPES.has(e.type)
-              ? (e.type as MediaAttachment['type'])
-              : 'document',
-          path: snapshotPath,
-          ...(typeof e.mimeType === 'string' ? { mimeType: e.mimeType } : {}),
-          ...(typeof e.filename === 'string' ? { filename: e.filename } : {}),
-        });
-      } finally {
-        await handle.close();
       }
+
+      out.push({
+        type:
+          typeof e.type === 'string' && MEDIA_TYPES.has(e.type)
+            ? (e.type as MediaAttachment['type'])
+            : 'document',
+        path: snapshotPath,
+        ...(typeof e.mimeType === 'string' ? { mimeType: e.mimeType } : {}),
+        ...(typeof e.filename === 'string' ? { filename: e.filename } : {}),
+      });
     } catch {
-      logger.warn('[Trigger] media path unresolvable — dropped', { path: e.path });
+      logger.warn('[Trigger] media snapshot failed — dropped', { path: e.path });
     }
   }
   if (malformed > 0) {

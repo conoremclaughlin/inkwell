@@ -20,6 +20,7 @@ import type {
   ToolCall,
 } from './types.js';
 import { formatInjectedContext } from './context-builder.js';
+import { env } from '../../config/env.js';
 import { logger } from '../../utils/logger.js';
 import { resolveBinaryPath, buildSpawnPath } from './resolve-binary.js';
 import {
@@ -69,7 +70,9 @@ export class CodexRunner implements IRunner {
     const isResume = !!backendSessionId;
 
     let fullMessage = message;
+    let runConfig = config;
     if (injectedContext && !isResume) {
+      runConfig = { ...config, constitutionInjected: true };
       const contextBlock = formatInjectedContext(injectedContext);
       fullMessage = `${contextBlock}\n\n---\n\n${message}`;
     }
@@ -98,7 +101,7 @@ export class CodexRunner implements IRunner {
         hasPcpAccessToken: !!config.pcpAccessToken,
       });
 
-      const result = await this.spawnProcess(args, config);
+      const result = await this.spawnProcess(args, runConfig);
 
       // Only return a backend session ID if we actually extracted one from
       // the Codex event stream, or if we were resuming an existing session.
@@ -151,9 +154,19 @@ export class CodexRunner implements IRunner {
     args.push('--json');
     args.push('-c', `model_instructions_file=${promptPath}`);
 
-    // Ink session headers — Codex resolves env var names to values at runtime.
-    // The server key must match what's in .codex/config.toml (mcp_servers.inkwell).
+    // Ink MCP server — fully defined via -c overrides so the spawn never
+    // depends on the user's ~/.codex/config.toml having (or keeping) the
+    // entry. A partial entry (headers without url) makes Codex fail with
+    // "Error loading config.toml: invalid transport".
+    // Inside a Docker sandbox, loopback resolves to the container, so use
+    // host.docker.internal (matches the orchestrator's .mcp.json rewrite).
     const codexServerKey = 'inkwell';
+    const mcpHost = config.container ? 'host.docker.internal' : 'localhost';
+    args.push(
+      '-c',
+      `mcp_servers.${codexServerKey}.url="http://${mcpHost}:${env.MCP_HTTP_PORT}/mcp"`
+    );
+    // Session headers — Codex resolves env var names to values at runtime.
     args.push('-c', `mcp_servers.${codexServerKey}.env_http_headers.x-ink-context="INK_CONTEXT"`);
     args.push('-c', `mcp_servers.${codexServerKey}.env_http_headers.x-ink-agent-id="AGENT_ID"`);
     args.push(
@@ -216,6 +229,9 @@ export class CodexRunner implements IRunner {
         HOME: process.env.HOME || '',
         PATH: buildSpawnPath(codexBin),
         ...(config.agentId ? { AGENT_ID: config.agentId } : {}),
+        // Tells the session-start hook the constitution is already in the
+        // prompt, so it does not inject a second copy.
+        ...(config.constitutionInjected ? { INK_CONSTITUTION_INJECTED: '1' } : {}),
         ...buildSessionEnv({
           pcpSessionId: config.pcpSessionId,
           runtimeLinkId: config.pcpSessionId ? runtimeLinkId : undefined,

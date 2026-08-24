@@ -61,9 +61,11 @@ export class GeminiRunner implements IRunner {
 
     // Build the message with injected context on first turn (same as Claude/Codex)
     let fullMessage = message;
+    let runConfig = config;
     if (injectedContext && !isResume) {
       const contextBlock = formatInjectedContext(injectedContext);
       fullMessage = `${contextBlock}\n\n---\n\n${message}`;
+      runConfig = { ...config, constitutionInjected: true };
     }
 
     // Optionally write system prompt to a temp policy file
@@ -152,7 +154,7 @@ export class GeminiRunner implements IRunner {
 
       const result = await this.spawnProcess(
         args,
-        config,
+        runConfig,
         geminiSettingsEnvPath
           ? { GEMINI_CLI_SYSTEM_SETTINGS_PATH: geminiSettingsEnvPath }
           : undefined
@@ -235,6 +237,9 @@ export class GeminiRunner implements IRunner {
         HOME: process.env.HOME || '',
         PATH: buildSpawnPath(geminiBin),
         ...(config.agentId ? { AGENT_ID: config.agentId } : {}),
+        // Tells the session-start hook the constitution is already in the
+        // prompt, so it does not inject a second copy.
+        ...(config.constitutionInjected ? { INK_CONSTITUTION_INJECTED: '1' } : {}),
         ...(extraEnv || {}),
         ...buildSessionEnv({
           pcpSessionId: config.pcpSessionId,

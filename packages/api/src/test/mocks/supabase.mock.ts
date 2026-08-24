@@ -63,6 +63,7 @@ export function createMockSupabaseClient() {
 
   return {
     from: vi.fn().mockReturnValue(queryBuilder),
+    rpc: vi.fn().mockImplementation(() => Promise.resolve(createResult())),
     _queryBuilder: queryBuilder,
 
     // Helper to set return data for single() calls

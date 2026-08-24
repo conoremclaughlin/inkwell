@@ -43,10 +43,27 @@ function getContextHeaders(): Record<string, string> {
 
 export interface ApprovalRequestResult {
   requestId: string;
-  status: 'granted' | 'denied' | 'expired' | 'timeout' | 'error';
+  status: 'granted' | 'denied' | 'expired' | 'timeout' | 'error' | 'aborted';
   action?: string;
   grantedTools?: string[];
   error?: string;
+}
+
+/** Resolve after `ms`, or as soon as `signal` fires. */
+function sleepOrAbort(ms: number, signal?: AbortSignal): Promise<void> {
+  if (!signal) return new Promise((r) => setTimeout(r, ms));
+  if (signal.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 /**
@@ -68,7 +85,25 @@ export async function requestToolApproval(options: {
   timeoutSeconds?: number;
   onCreated?: (requestId: string) => void;
   onPoll?: (elapsed: number) => void;
+  /**
+   * Give up early. Without it, cancelling a turn cannot reach a 2FA request
+   * already in flight — the poll loop below runs for the full timeout (5
+   * minutes), so Ctrl+C would not actually stop a shadow clone waiting here.
+   */
+  signal?: AbortSignal;
+  /**
+   * Which shadow clone raised this, when one did.
+   *
+   * An away-mode user is approving a tool call they cannot see the context for;
+   * "which of my three clones asked" is the difference between an informed yes
+   * and a blind one. It also has to reach the audit trail, not just the local
+   * console line.
+   */
+  origin?: { origin: 'parent' | 'clone'; cloneId?: string; cloneLabel?: string };
 }): Promise<ApprovalRequestResult> {
+  if (options.signal?.aborted) {
+    return { requestId: '', status: 'aborted' };
+  }
   const serverUrl = getServerUrl();
   const token = await getValidAccessToken(serverUrl);
   const timeoutSeconds = options.timeoutSeconds ?? DEFAULT_TIMEOUT_SECONDS;
@@ -92,6 +127,7 @@ export async function requestToolApproval(options: {
         sessionId: options.sessionId,
         studioId: options.studioId,
         timeoutSeconds,
+        ...(options.origin?.origin === 'clone' ? { origin: options.origin } : {}),
       }),
       signal: AbortSignal.timeout(10000),
     });
@@ -120,7 +156,10 @@ export async function requestToolApproval(options: {
   const startTime = Date.now();
 
   while (Date.now() - startTime < maxPollTime) {
-    await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+    await sleepOrAbort(POLL_INTERVAL_MS, options.signal);
+    if (options.signal?.aborted) {
+      return { requestId, status: 'aborted' };
+    }
     options.onPoll?.(Date.now() - startTime);
 
     try {

@@ -3,7 +3,7 @@
 import { useEffect } from 'react';
 import { useApiQuery } from '@/lib/api';
 import { useCommandStore } from './store';
-import type { AgentState, StudioNode, TaskNode, ActivityEvent } from './store';
+import type { AgentState, StudioNode, StudioLeaseView, TaskNode, ActivityEvent } from './store';
 
 // ─── Types matching API responses ───
 
@@ -13,9 +13,14 @@ interface StudioInfo {
   purpose: string | null;
   workType: string | null;
   worktreePath: string | null;
+  repoRoot: string | null;
   slug: string | null;
   status: string;
   updatedAt: string;
+  lease: StudioLeaseView | null;
+  ephemeral: boolean;
+  parentStudioId: string | null;
+  expiresAt: string | null;
 }
 
 interface AgentLatestSession {
@@ -48,26 +53,71 @@ interface TaskItem {
   priority: string;
   taskGroupId: string | null;
   taskOrder: number | null;
+  blockedBy: string[] | null;
   createdBy: string | null;
+  // Workflow graph execution state (spec v10 steps 2-3)
+  taskType?: 'work' | 'verification';
+  outcome?: string | null;
+  gateState?: string | null;
+  gateAttempt?: number | null;
+  eligibleAt?: string | null;
+  claimedBySessionId?: string | null;
+  assigneeIdentityId?: string | null;
 }
 
 interface TaskGroupItem {
   id: string;
   title: string;
+  status?: string;
   agentId: string | null;
   agentName: string | null;
+  executionModel?: 'linear' | 'graph';
+  executionPhase?: string;
+}
+
+interface FeedMetaResponse {
+  fetched: number;
+  total: number;
+  truncated: boolean;
+}
+
+interface ActivityEventItem {
+  id: string;
+  type: string;
+  subtype: string | null;
+  agentId: string | null;
+  content: string | null;
+  status: string | null;
+  createdAt: string;
+}
+
+interface ActivityResponse {
+  events: ActivityEventItem[];
 }
 
 interface TasksResponse {
   tasks: TaskItem[];
   stats: Record<string, number>;
+  meta?: FeedMetaResponse;
 }
 
+// The endpoint has always returned `groups`; this hook used to type the key
+// as `taskGroups`, so the map silently never resolved group titles.
 interface TaskGroupsResponse {
-  taskGroups: TaskGroupItem[];
+  groups: TaskGroupItem[];
+  meta?: FeedMetaResponse;
 }
 
 // ─── Layout helpers ───
+
+/**
+ * Radius that fits `count` studio nodes (~56px wide each) around a circle
+ * without overlap. The old fixed 65px radius was sized for 2-3 studios;
+ * an agent holding 15 rendered as a single unreadable smear.
+ */
+function studioRingRadius(count: number): number {
+  return Math.max(65, (count * 78) / (2 * Math.PI));
+}
 
 function arrangeStudiosInCircle(
   studios: StudioInfo[],
@@ -86,6 +136,11 @@ function arrangeStudiosInCircle(
       workType: s.workType,
       status: s.status,
       agentId,
+      repoRoot: s.repoRoot ?? null,
+      lease: s.lease ?? null,
+      ephemeral: s.ephemeral ?? false,
+      parentStudioId: s.parentStudioId ?? null,
+      expiresAt: s.expiresAt ?? null,
       position: {
         x: centerX + radius * Math.cos(angle),
         y: centerY + radius * Math.sin(angle),
@@ -100,6 +155,8 @@ export function useCommandData() {
   const setAgents = useCommandStore((s) => s.setAgents);
   const setStudios = useCommandStore((s) => s.setStudios);
   const setTasks = useCommandStore((s) => s.setTasks);
+  const setTasksMeta = useCommandStore((s) => s.setTasksMeta);
+  const setGroupsMeta = useCommandStore((s) => s.setGroupsMeta);
   const setActivity = useCommandStore((s) => s.setActivity);
 
   const { data: studiosData } = useApiQuery<StudiosResponse>(
@@ -120,6 +177,12 @@ export function useCommandData() {
     { refetchInterval: 10000 }
   );
 
+  const { data: activityData } = useApiQuery<ActivityResponse>(
+    ['command-activity'],
+    '/api/admin/activity?limit=50',
+    { refetchInterval: 10000 }
+  );
+
   // Transform studios data into agent + studio state
   useEffect(() => {
     if (!studiosData?.agents) return;
@@ -128,8 +191,16 @@ export function useCommandData() {
     const studioNodes: StudioNode[] = [];
 
     const cols = Math.min(3, studiosData.agents.length);
-    const colSpacing = 200;
-    const rowSpacing = 200;
+    // Spacing must clear the widest studio ring, or dense agents (one agent
+    // can hold 15 worktrees) overlap their neighbours into a single blob.
+    const maxRing = Math.max(
+      65,
+      ...studiosData.agents.map((a) =>
+        studioRingRadius(a.studios.filter((s) => s.status !== 'cleaned').length)
+      )
+    );
+    const colSpacing = maxRing * 2 + 140;
+    const rowSpacing = maxRing * 2 + 140;
 
     studiosData.agents.forEach((agent, agentIdx) => {
       const col = agentIdx % cols;
@@ -138,15 +209,32 @@ export function useCommandData() {
       const centerX = (col - (rowCount - 1) / 2) * colSpacing;
       const centerY = (row - Math.floor((studiosData.agents.length - 1) / cols) / 2) * rowSpacing;
 
-      const activeStudio = agent.studios.find((s) => s.status === 'active');
+      // Presence is the lease, not the status column (spec:studio-canvas
+      // principle 4). `status` reports 'active' for studios untouched for
+      // months, so status-based presence put every agent in a studio at all
+      // times — which is indistinguishable from putting them nowhere.
+      // A held lease is the only evidence an agent is actually in a worktree.
+      //
+      // An agent can hold several studios at once, so collect them all. The
+      // singular studioId is only where the agent avatar is drawn; taking the
+      // first match as "the" answer would hide every other place it is
+      // working, which is the failure this whole surface exists to fix.
+      // Ordered by acquisition so the avatar lands on the oldest hold rather
+      // than wherever the API happened to sort.
+      const heldStudios = agent.studios
+        .filter((s) => s.lease && !s.lease.quarantined && !s.lease.claimKind)
+        .sort((a, b) => (a.lease!.acquiredAt < b.lease!.acquiredAt ? -1 : 1));
+      const heldStudio = heldStudios[0] ?? null;
 
       agentStates.push({
         agentId: agent.agentId,
         name: agent.agentName,
         role: agent.agentRole,
         backend: agent.backend,
-        studioId: activeStudio?.id ?? null,
-        studioSlug: activeStudio?.slug ?? null,
+        sbId: agent.sbId ?? null,
+        studioId: heldStudio?.id ?? null,
+        studioSlug: heldStudio?.slug ?? null,
+        heldStudioIds: heldStudios.map((s) => s.id),
         lifecycle: agent.latestSession?.lifecycle ?? null,
         phase: agent.latestSession?.currentPhase ?? null,
         activeThreadKey: agent.latestSession?.activeThreadKey ?? null,
@@ -155,12 +243,13 @@ export function useCommandData() {
         targetPosition: null,
       });
 
+      const visibleStudios = agent.studios.filter((s) => s.status !== 'cleaned');
       const arranged = arrangeStudiosInCircle(
-        agent.studios.filter((s) => s.status !== 'cleaned'),
+        visibleStudios,
         agent.agentId,
         centerX,
         centerY,
-        65
+        studioRingRadius(visibleStudios.length)
       );
       studioNodes.push(...arranged);
     });
@@ -173,24 +262,62 @@ export function useCommandData() {
   useEffect(() => {
     if (!tasksData?.tasks) return;
 
-    const groupMap = new Map<string, string>();
-    if (groupsData?.taskGroups) {
-      for (const g of groupsData.taskGroups) {
-        groupMap.set(g.id, g.title);
+    const groupMap = new Map<string, TaskGroupItem>();
+    if (groupsData?.groups) {
+      for (const g of groupsData.groups) {
+        groupMap.set(g.id, g);
       }
     }
 
-    const taskNodes: TaskNode[] = tasksData.tasks.map((t) => ({
-      id: t.id,
-      title: t.title,
-      status: t.status,
-      priority: t.priority,
-      groupId: t.taskGroupId,
-      groupTitle: t.taskGroupId ? (groupMap.get(t.taskGroupId) ?? null) : null,
-      taskOrder: t.taskOrder,
-      agentId: t.createdBy,
-    }));
+    const taskNodes: TaskNode[] = tasksData.tasks.map((t) => {
+      const group = t.taskGroupId ? groupMap.get(t.taskGroupId) : undefined;
+      return {
+        id: t.id,
+        title: t.title,
+        status: t.status,
+        priority: t.priority,
+        groupId: t.taskGroupId,
+        groupTitle: group?.title ?? null,
+        taskOrder: t.taskOrder,
+        agentId: t.createdBy,
+        blockedBy: t.blockedBy ?? [],
+        taskType: t.taskType ?? 'work',
+        outcome: t.outcome ?? null,
+        gateState: t.gateState ?? null,
+        gateAttempt: t.gateAttempt ?? null,
+        eligibleAt: t.eligibleAt ?? null,
+        claimedBySessionId: t.claimedBySessionId ?? null,
+        assigneeIdentityId: t.assigneeIdentityId ?? null,
+        groupExecutionModel: group?.executionModel ?? null,
+        groupExecutionPhase: group?.executionPhase ?? null,
+      };
+    });
 
     setTasks(taskNodes);
-  }, [tasksData, groupsData, setTasks]);
+    setTasksMeta(tasksData.meta ?? null);
+  }, [tasksData, groupsData, setTasks, setTasksMeta]);
+
+  // A truncated group feed silently loses titles, models, and phases for
+  // tasks past the cap — surfaced separately from task truncation because
+  // either feed can overflow while the other is fine.
+  useEffect(() => {
+    if (!groupsData) return;
+    setGroupsMeta(groupsData.meta ?? null);
+  }, [groupsData, setGroupsMeta]);
+
+  // Transform activity events
+  useEffect(() => {
+    if (!activityData?.events) return;
+    setActivity(
+      activityData.events.map((e) => ({
+        id: e.id,
+        type: e.type,
+        subtype: e.subtype,
+        agentId: e.agentId,
+        content: e.content,
+        status: e.status,
+        timestamp: e.createdAt,
+      }))
+    );
+  }, [activityData, setActivity]);
 }

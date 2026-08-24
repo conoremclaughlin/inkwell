@@ -742,33 +742,62 @@ async function updateRuntimeGenerationState(
   cwd: string,
   _config: PcpConfig | null,
   agentId: string,
-  lifecycle: 'running' | 'idle' | 'compacting'
+  lifecycle: 'running' | 'idle' | 'compacting',
+  // Which hook fired. Lifecycle values are ambiguous (post-compact and
+  // on-stop both send 'idle'); the server uses the event to manage the
+  // hook-owned CLI turn signal and to run the lease boundary ONLY on the
+  // real stop (PR #492).
+  event?: 'prompt' | 'stop' | 'pre-compact' | 'post-compact'
 ): Promise<void> {
   const sessionId = resolveActivePcpSessionId(cwd);
   if (!sessionId) return;
 
-  try {
-    const serverUrl = getPcpServerUrl();
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-    const token = await getValidAccessToken(serverUrl);
-    if (token) headers.Authorization = `Bearer ${token}`;
-    const resp = await fetch(`${serverUrl}/api/hooks/lifecycle`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({ sessionId, lifecycle, agentId, workingDir: cwd }),
-      signal: AbortSignal.timeout(5000),
-    });
-    if (!resp.ok) {
+  // Two attempts: hooks cannot gate the backend turn (they are out-of-band
+  // observers), so a missed prompt write leaves the turn invisible — the
+  // lease machinery therefore only ever treats the marker as PROTECTIVE
+  // (an open marker defers releases; its absence never authorizes one).
+  // The retry shrinks the invisibility window against transient blips; a
+  // true fail-closed for claude-code (UserPromptSubmit can block) is
+  // tracked separately (task 0b9bb780).
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const serverUrl = getPcpServerUrl();
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      const token = await getValidAccessToken(serverUrl);
+      if (token) headers.Authorization = `Bearer ${token}`;
+      const resp = await fetch(`${serverUrl}/api/hooks/lifecycle`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          sessionId,
+          lifecycle,
+          ...(event ? { event } : {}),
+          agentId,
+          workingDir: cwd,
+        }),
+        signal: AbortSignal.timeout(5000),
+      });
+      if (resp.ok) return;
       const body = await resp.text().catch(() => '');
       sbDebugLog('hooks', 'lifecycle_update_failed', {
         sessionId,
         lifecycle,
+        attempt,
         status: resp.status,
         body,
       });
+    } catch (error) {
+      // Non-fatal; hook execution should not fail due to transient session sync issues.
+      sbDebugLog('hooks', 'lifecycle_update_error', {
+        sessionId,
+        lifecycle,
+        attempt,
+        error: String(error),
+      });
     }
-  } catch {
-    // Non-fatal; hook execution should not fail due to transient session sync issues.
+    if (attempt === 1) {
+      await new Promise((r) => setTimeout(r, 250));
+    }
   }
 }
 
@@ -865,6 +894,18 @@ function renderTemplate(template: string, vars: Record<string, string>): string 
 // Shared Block Builders
 // ============================================================================
 
+/**
+ * Whether the server already put the constitution and knowledge summary in this
+ * turn's prompt.
+ *
+ * Set by the runners when they inject. Only the session-start hook honours it:
+ * post-compact must re-inject unconditionally, because compaction is exactly
+ * the event that removes the original copy.
+ */
+export function serverAlreadyInjectedContext(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.INK_CONSTITUTION_INJECTED === '1';
+}
+
 export function buildIdentityBlock(bootstrapResult: Record<string, unknown>): string {
   const files = bootstrapResult?.identityFiles as Record<string, string> | undefined;
   if (!files) return '';
@@ -919,11 +960,27 @@ function buildInboxBlock(messages: Array<Record<string, unknown>> | undefined): 
   return lines.join('\n');
 }
 
-function buildMemoriesBlock(memories: Array<Record<string, unknown>> | undefined): string {
-  if (!memories || memories.length === 0) return '';
+/**
+ * Render the memory block from a bootstrap result.
+ *
+ * Bootstrap returns `knowledgeSummary` — a pre-formatted, budget-constrained
+ * digest grouped by topic, critical salience first. It does NOT return
+ * `recentMemories`; reading that key silently produced an empty block, so
+ * these hooks injected no memories at all. The array branch is kept only so an
+ * older server that still sends one keeps working.
+ */
+export function buildMemoriesBlock(bootstrapResult: Record<string, unknown>): string {
+  const summary = bootstrapResult?.knowledgeSummary;
+  if (typeof summary === 'string' && summary.trim()) {
+    return `### What You Know\n${summary.trim()}`;
+  }
+
+  const memories = bootstrapResult?.recentMemories;
+  if (!Array.isArray(memories) || memories.length === 0) return '';
   const lines = ['### Recent Memories'];
-  for (const mem of memories.slice(0, 5)) {
-    lines.push(`- ${mem.content || mem.key || JSON.stringify(mem)}`);
+  for (const mem of memories as Array<Record<string, unknown>>) {
+    const salience = mem.salience ? `[${mem.salience}] ` : '';
+    lines.push(`- ${salience}${mem.summary || mem.content || mem.key || JSON.stringify(mem)}`);
   }
   return lines.join('\n');
 }
@@ -1766,7 +1823,7 @@ async function preCompactHandler(options?: { backend?: string }): Promise<void> 
   // that will reset it to 'idle'. Without postCompact (e.g., Gemini/PreCompress),
   // the lifecycle gets stuck at 'compacting' permanently.
   if (backend.events.postCompact) {
-    await updateRuntimeGenerationState(cwd, config, agentId, 'compacting');
+    await updateRuntimeGenerationState(cwd, config, agentId, 'compacting', 'pre-compact');
   }
 
   process.stdout.write(loadTemplate('hook-pre-compact'));
@@ -1779,8 +1836,9 @@ async function postCompactHandler(): Promise<void> {
   const config = getPcpConfig();
   const agentId = resolveAgentId() || 'unknown';
 
-  // Reset lifecycle from compacting back to idle
-  await updateRuntimeGenerationState(cwd, config, agentId, 'idle');
+  // Reset lifecycle from compacting back to idle. NOT a turn boundary —
+  // the same turn resumes after compaction (PR #492 round 4).
+  await updateRuntimeGenerationState(cwd, config, agentId, 'idle', 'post-compact');
 
   let identityBlock = '';
   let memoriesBlock = '';
@@ -1795,9 +1853,7 @@ async function postCompactHandler(): Promise<void> {
       postCompact: true,
     });
     identityBlock = buildIdentityBlock(bootstrap);
-    memoriesBlock = buildMemoriesBlock(
-      bootstrap.recentMemories as Array<Record<string, unknown>> | undefined
-    );
+    memoriesBlock = buildMemoriesBlock(bootstrap);
   } catch {
     identityBlock =
       '*FAILED: Could not reach Inkwell server for `bootstrap`. You should call the `bootstrap` MCP tool manually to reload your identity context.*';
@@ -1924,10 +1980,13 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
     if (studioId) bootstrapArgs.studioId = studioId;
 
     const bootstrap = await callPcpTool('bootstrap', bootstrapArgs);
-    identityBlock = buildIdentityBlock(bootstrap);
-    memoriesBlock = buildMemoriesBlock(
-      bootstrap.recentMemories as Array<Record<string, unknown>> | undefined
-    );
+    // A server-spawned session already carries the constitution AND the
+    // knowledge summary in its first message (the runner sets this). Re-emitting
+    // either here duplicates several thousand tokens for no gain. Post-compact
+    // deliberately does not check this — after compaction the original is gone.
+    const serverInjected = serverAlreadyInjectedContext();
+    identityBlock = serverInjected ? '' : buildIdentityBlock(bootstrap);
+    memoriesBlock = serverInjected ? '' : buildMemoriesBlock(bootstrap);
     sessionsBlock = buildSessionsBlock(
       bootstrap.activeSessions as Array<Record<string, unknown>> | undefined
     );
@@ -2378,7 +2437,7 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
   });
 
   // Mark session as actively generating at prompt start.
-  await updateRuntimeGenerationState(cwd, config, agentId, 'running');
+  await updateRuntimeGenerationState(cwd, config, agentId, 'running', 'prompt');
 
   // Mark session as CLI-attached (human present at REPL).
   // Uses the REST lifecycle endpoint, NOT MCP — cliAttached is a runtime
@@ -2552,7 +2611,7 @@ async function onStopHandler(options?: { backend?: string }): Promise<void> {
   });
 
   // Mark session as idle after each completed backend turn.
-  await updateRuntimeGenerationState(cwd, config, agentId, 'idle');
+  await updateRuntimeGenerationState(cwd, config, agentId, 'idle', 'stop');
 
   // Increment tool call counter
   const countStr = readRuntimeFile(cwd, 'tool-count');

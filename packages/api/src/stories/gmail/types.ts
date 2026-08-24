@@ -64,6 +64,15 @@ export interface GetEmailOptions {
   format?: 'minimal' | 'full' | 'raw' | 'metadata';
 }
 
+/**
+ * A file to attach to an outgoing message. `path` must resolve inside the
+ * shared media root (~/.ink/files) — see stories/gmail/attachments.ts.
+ */
+export interface AttachmentInput {
+  path: string;
+  filename?: string; // Defaults to the file's own basename
+}
+
 export interface SendEmailOptions {
   to: string[]; // Email addresses
   cc?: string[];
@@ -73,6 +82,7 @@ export interface SendEmailOptions {
   isHtml?: boolean;
   replyToMessageId?: string; // For threading
   threadId?: string; // For threading
+  attachments?: AttachmentInput[];
 }
 
 export interface DraftEmailOptions {
@@ -84,6 +94,7 @@ export interface DraftEmailOptions {
   isHtml?: boolean;
   replyToMessageId?: string;
   threadId?: string;
+  attachments?: AttachmentInput[];
 }
 
 export interface ReplyToEmailOptions {
@@ -91,6 +102,7 @@ export interface ReplyToEmailOptions {
   body: string;
   isHtml?: boolean;
   replyAll?: boolean; // Reply to all recipients
+  attachments?: AttachmentInput[];
 }
 
 export interface EmailSearchResult {

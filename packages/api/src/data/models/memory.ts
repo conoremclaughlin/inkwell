@@ -110,6 +110,12 @@ export interface Session {
   agentId?: string;
   /** Owning identity UUID (agent_identities.id) — canonical; agentId is the ambiguous slug. */
   sbId?: string;
+  /**
+   * Per-sender scope. One SB identity serves many contacts, so identity
+   * ownership alone does not separate two conversations — authorization has to
+   * see this field to keep contact A out of contact B's session.
+   */
+  contactId?: string;
   studioId?: string;
   threadKey?: string;
   activeThreadKey?: string;
@@ -135,6 +141,12 @@ export interface SessionCreateInput {
   id?: string;
   userId: string;
   agentId?: string;
+  /**
+   * Canonical owning identity. Supply the request's verified identity so the
+   * row records who actually created it; without it creation falls back to
+   * re-resolving the slug, which is ambiguous across workspaces.
+   */
+  sbId?: string;
   /**
    * Three-state: UUID = scoped to that studio; null = root-repo session
    * (persisted as `studio_id = NULL`); undefined = column omitted on insert
@@ -207,6 +219,8 @@ export interface SessionRow {
   agent_id: string | null;
   /** Owning identity UUID (agent_identities.id). */
   sb_id?: string | null;
+  /** Per-sender scope; NULL for owner sessions. */
+  contact_id?: string | null;
   studio_id: string | null;
   thread_key: string | null;
   active_thread_key?: string | null;

@@ -175,7 +175,116 @@ describe('JsonlApprovalChannel', () => {
   });
 });
 
+describe('JsonlApprovalChannel cancellation', () => {
+  it('resolves as cancelled when the signal fires mid-wait', async () => {
+    const output = new PassThrough();
+    const channel = new JsonlApprovalChannel(output);
+    const controller = new AbortController();
+
+    const promise = channel.requestApproval({
+      tool: 'send_to_inbox',
+      args: {},
+      reason: 'test',
+      signal: controller.signal,
+      // Long enough that a timeout fallback would hang the test — the point is
+      // that abort must not wait for it.
+      timeoutMs: 300_000,
+    });
+
+    controller.abort();
+    const result = await promise;
+    expect(result.decision).toBe('cancel');
+    expect(result.by).toBe('aborted');
+
+    channel.dispose();
+  });
+
+  it('short-circuits a request whose signal already fired', async () => {
+    const output = new PassThrough();
+    const chunks: string[] = [];
+    output.on('data', (chunk) => chunks.push(String(chunk)));
+    const channel = new JsonlApprovalChannel(output);
+
+    const controller = new AbortController();
+    controller.abort();
+
+    const result = await channel.requestApproval({
+      tool: 'send_to_inbox',
+      args: {},
+      reason: 'test',
+      signal: controller.signal,
+    });
+    expect(result.decision).toBe('cancel');
+    expect(result.by).toBe('aborted');
+    // Nothing was published — no consumer should see a request nobody awaits.
+    expect(chunks.join('')).toBe('');
+
+    channel.dispose();
+  });
+
+  it('still resolves normally when a response beats the signal', async () => {
+    const output = new PassThrough();
+    const chunks: string[] = [];
+    output.on('data', (chunk) => chunks.push(String(chunk)));
+    const channel = new JsonlApprovalChannel(output);
+    const controller = new AbortController();
+
+    const promise = channel.requestApproval({
+      tool: 'get_inbox',
+      args: {},
+      reason: 'test',
+      signal: controller.signal,
+    });
+
+    const request = JSON.parse(chunks.join('').trim()) as ApprovalRequestEvent;
+    channel.respond({ type: 'approval_response', id: request.id, decision: 'once' });
+    await expect(promise).resolves.toMatchObject({ decision: 'once' });
+
+    // A later abort must not disturb the settled request.
+    controller.abort();
+    channel.dispose();
+  });
+
+  it('publishes clone origin metadata on the request', async () => {
+    const output = new PassThrough();
+    const chunks: string[] = [];
+    output.on('data', (chunk) => chunks.push(String(chunk)));
+    const channel = new JsonlApprovalChannel(output);
+
+    void channel.requestApproval({
+      tool: 'read',
+      args: {},
+      reason: 'test',
+      origin: { origin: 'clone', cloneId: 'c-2', cloneLabel: 'map test coverage' },
+    });
+
+    const request = JSON.parse(chunks.join('').trim()) as ApprovalRequestEvent;
+    expect(request.origin).toEqual({
+      origin: 'clone',
+      cloneId: 'c-2',
+      cloneLabel: 'map test coverage',
+    });
+
+    channel.dispose();
+  });
+});
+
 describe('AutoApprovalChannel', () => {
+  it('refuses once the turn is already cancelled', async () => {
+    const channel = new AutoApprovalChannel('once');
+    const controller = new AbortController();
+    controller.abort();
+
+    const result = await channel.requestApproval({
+      tool: 'anything',
+      args: {},
+      reason: 'test',
+      signal: controller.signal,
+    });
+    expect(result.decision).toBe('cancel');
+    expect(result.by).toBe('aborted');
+  });
+
   it('auto-denies by default', async () => {
     const channel = new AutoApprovalChannel();
     const result = await channel.requestApproval({

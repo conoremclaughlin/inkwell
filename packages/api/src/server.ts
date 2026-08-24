@@ -20,9 +20,11 @@
 
 import path from 'path';
 import { getDataComposer, DataComposer } from './data/composer';
+import { stampRoutingHold, clearRoutingHold } from './services/routing-hold';
 import {
   createSessionService,
   SessionService,
+  RoutingRefusedError,
   type SessionServiceConfig,
 } from './services/sessions';
 import type { SessionRequest, ChannelResponse, ChannelType } from './services/sessions';
@@ -61,8 +63,13 @@ import {
   type SessionAttachedRow,
 } from './services/sessions/trigger-delivery';
 import { assignThreadParticipant } from './services/sessions/thread-assignment';
+import { closeIntakeAndDrain } from './services/sessions/active-runs';
+import { interruptActiveRuns } from './services/sessions/interrupt-active-runs';
 import type { ActivityType } from './data/repositories/activity-stream.repository';
 import { resolveTaskGroupForThreadKey } from './services/task-group-resolver';
+import { sendTriggerFailureNotice } from './services/trigger-failure-notice';
+import { StudioLeaseService } from './services/studio-lease.service';
+import { StudioOverflowService } from './services/studio-overflow.service';
 
 // Server configuration
 interface ServerConfig {
@@ -140,11 +147,19 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
   const sessionServiceConfig: Partial<SessionServiceConfig> = {
     defaultWorkingDirectory: workingDirectory,
     mcpConfigPath,
-    compactionThreshold: config.compactionThreshold || 150000,
+    compactionEnabled: env.SERVER_COMPACTION_ENABLED,
+    compactionThreshold: config.compactionThreshold || env.COMPACTION_THRESHOLD || 150000,
     responseHandler: async (responses) => routeResponses(responses),
     ...(env.DEFAULT_CLAUDE_MODEL ? { defaultModel: env.DEFAULT_CLAUDE_MODEL } : {}),
     ...(env.DEFAULT_CODEX_MODEL ? { defaultCodexModel: env.DEFAULT_CODEX_MODEL } : {}),
     ...(env.DEFAULT_GEMINI_MODEL ? { defaultGeminiModel: env.DEFAULT_GEMINI_MODEL } : {}),
+    ...(env.DEFAULT_ANTIGRAVITY_MODEL
+      ? { defaultAntigravityModel: env.DEFAULT_ANTIGRAVITY_MODEL }
+      : {}),
+    // The port this process actually bound, not whatever a checked-in config
+    // file claims — an isolated server started with PCP_PORT_BASE must not hand
+    // its credentials to the main server on 3001.
+    inkMcpUrl: `http://localhost:${env.MCP_HTTP_PORT}/mcp`,
   };
   sessionService = createSessionService(dataComposer.getClient(), sessionServiceConfig);
   logger.info('SessionService ready');
@@ -650,6 +665,11 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
   };
 
   if (heartbeatServiceEnabled) {
+    const sweepLeaseService = new StudioLeaseService(dataComposer!.getClient());
+    const sweepOverflowService = new StudioOverflowService(
+      dataComposer!.repositories.studios,
+      sweepLeaseService
+    );
     initHeartbeatService({
       interval: heartbeatInterval,
       enableLocalCron,
@@ -657,6 +677,23 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
         logger.info('Heartbeat tick — processing due reminders');
         const stats = await processHeartbeat(deliverReminderViaSession);
         logger.info('Heartbeat complete', stats);
+
+        // Lease sweep: expire leases whose heartbeat went stale (rescuing the
+        // worktree first), renew for sessions still running in-process, and
+        // close ephemeral overflow studios past their TTL. This is the expiry
+        // half of programmatic release — crashed sessions cannot hold a
+        // worktree hostage past the staleness threshold.
+        try {
+          const leaseStats = await sweepLeaseService.sweepExpiredLeases();
+          const ephemeralClosed = await sweepOverflowService.sweepExpiredEphemeralStudios();
+          if (leaseStats.expired || leaseStats.renewed || ephemeralClosed) {
+            logger.info('Lease sweep complete', { ...leaseStats, ephemeralClosed });
+          }
+        } catch (sweepErr) {
+          logger.error('Lease sweep failed', {
+            error: sweepErr instanceof Error ? sweepErr.message : String(sweepErr),
+          });
+        }
       },
     });
     logger.info(
@@ -671,6 +708,13 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
   // 7. Register default trigger handler for stateless, database-driven agent routing
   // This handles triggers for ANY agent by looking up config from the database
   const agentGateway = getAgentGateway();
+
+  /**
+   * Remove a routingHold stamp once the thread routes again. Best effort and
+   * detached: recovery must never be blocked by bookkeeping about the hold.
+   * Only clears OUR agent's hold — a thread can be held for one participant
+   * and routable for another.
+   */
 
   async function logInkmail(
     type: ActivityType & `inkmail_${string}`,
@@ -1019,6 +1063,12 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       workspaceId: resolvedWorkspaceId || null,
     });
 
+    // Timestamp taken BEFORE routing: a hold stamped after this point belongs
+    // to a later dispatch and must survive our clear (Lumen, round 3).
+    // Awaiting one callback does not serialize AgentGateway callbacks, so the
+    // ordering cannot be assumed — it has to be expressed in the predicate.
+    const routeStartedAt = new Date().toISOString();
+
     // Check if the routed session is CLI-attached — if so, queue the message
     // for the on-prompt hook instead of spawning a new process.
     // Uses getOrCreateSession to resolve through the SAME routing logic
@@ -1036,6 +1086,16 @@ When you complete a task_request, mark it as completed using update_inbox_messag
           payload.metadata?.repoRoot && typeof payload.metadata.repoRoot === 'string'
             ? payload.metadata.repoRoot
             : undefined,
+        // Server-stamped at send time; the caller-repo tier resolves the repo
+        // from this studio rather than trusting metadata.repoRoot above.
+        callerStudioId: payload.senderStudioId,
+        callerSessionId: payload.senderSessionId,
+        callerIsBridge: payload.senderIsBridge,
+        // The canonical target identity is ALREADY resolved here, including
+        // the workspace disambiguation above. Passing only the slug made
+        // routing re-resolve it, and a slug is ambiguous by construction —
+        // the same one can exist in several workspaces (Lumen, round 2).
+        sbId: resolvedIdentityId || undefined,
       });
 
       // Assign the thread to the resolved session via the single sanctioned
@@ -1091,6 +1151,20 @@ When you complete a task_request, mark it as completed using update_inbox_messag
             error: assignmentFailure,
           });
         }
+      }
+
+      // A thread that routes successfully is no longer held. Cleared only
+      // AFTER assignment (Lumen, PR #514 round 2): assignment can still
+      // reroute or fail, and clearing before it lands advertises a recovery
+      // that has not happened. Awaited, not detached, so it cannot race the
+      // next dispatch's stamp.
+      if (payload.threadId && !assignmentFailure) {
+        await clearRoutingHold(dataComposer!.getClient(), {
+          threadId: payload.threadId,
+          userId,
+          agentId: targetAgentId,
+          routedSince: routeStartedAt,
+        });
       }
 
       // Routing-only dispatch: assignment IS the entire job — a failed stamp
@@ -1204,6 +1278,67 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         });
       }
     } catch (err) {
+      // Refuse-and-hold (spec §Refusing to route, Phase 3b) is NOT a resolution
+      // failure to fall through from — falling through would spawn exactly the
+      // wrong-worktree session the refusal exists to prevent. Stop here: no
+      // session, no lease, no spawn, and a loud, recoverable trail.
+      if (err instanceof RoutingRefusedError) {
+        // ERROR, not warn. A held message never reached its recipient, and
+        // nothing else reports that: the hold lands in thread metadata that no
+        // reader consults, and processTrigger converts the throw into a
+        // success:false FIELD on a 200 response, so no status-code monitoring
+        // sees it either. `warn` kept it out of ~/.ink/logs/error.log, which is
+        // the one place an operator actually looks.
+        logger.error('[Trigger] HELD — routing refused, no session created', {
+          threadKey: err.threadKey,
+          targetAgentId,
+          reason: err.detail.reason ?? 'no-route',
+          triedCallerRepo: err.detail.triedCallerRepo,
+          callerRepoRoot: err.detail.callerRepoRoot || null,
+          ...(err.detail.occupied ? { occupied: err.detail.occupied } : {}),
+          recovery:
+            err.detail.reason === 'occupied'
+              ? 'wait for the lease holder to finish, or fix the overflow provisioning failure'
+              : err.detail.reason === 'ambiguous-identity'
+                ? 'de-duplicate this agent slug in agent_identities — no route pattern was consulted, so routing config is not the cause'
+                : 'add a route pattern to a studio, pass studioHint, or send from a session bound to the target repo',
+        });
+
+        await logInkmail('inkmail_fail', payload, userId, {
+          error: `routing_held: ${err.message}`,
+        });
+
+        // Surface on the thread itself so the hold is visible where the work
+        // is. Goes through the tested routing-hold boundary — this call site
+        // previously drifted out of sync with the RPC signature and every
+        // refusal went unstamped, with a green suite (Lumen, round 4).
+        if (payload.threadId) {
+          await stampRoutingHold(dataComposer!.getClient(), {
+            threadId: payload.threadId,
+            userId,
+            agentId: targetAgentId,
+            attemptStartedAt: routeStartedAt,
+            detail: {
+              triedCallerRepo: err.detail.triedCallerRepo,
+              callerRepoRoot: err.detail.callerRepoRoot ?? null,
+              reason: err.detail.reason,
+              occupied: err.detail.occupied ?? null,
+            },
+          });
+        }
+
+        // Rethrow (Lumen, PR #514 round 1). Returning here made the hold
+        // report SUCCESS: routeOnly's routingFailures stayed empty, the send
+        // reported accepted/triggered, and the sender had no way to learn its
+        // message never landed — the quiet-agent failure this phase exists to
+        // prevent, reproduced one layer up. Throwing propagates to
+        // processTrigger, which reports success:false with this reason, and
+        // the #487 failure-notice path posts it into the thread.
+        //
+        // Nothing is spawned: the throw exits the handler before handleMessage.
+        throw err;
+      }
+
       // If session resolution fails, fall through to normal handleMessage
       logger.debug('[Trigger] CLI-attached check failed, falling through to spawn', {
         error: err instanceof Error ? err.message : String(err),
@@ -1330,6 +1465,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
 
       // Look up the userId from the original source row (needed for sender inbox insert).
       let recipientUserId: string | undefined;
+      let resolvedThreadId: string | undefined;
       if (payload.inboxMessageId) {
         const { data: origMsg } = await client
           .from('agent_inbox')
@@ -1345,6 +1481,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
           .eq('id', payload.threadMessageId)
           .single();
         if (threadMsg?.thread_id) {
+          resolvedThreadId = threadMsg.thread_id;
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           const { data: thread } = await (client as any)
             .from('inbox_threads')
@@ -1354,6 +1491,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
           recipientUserId = thread?.user_id;
         }
       } else if (payload.threadId) {
+        resolvedThreadId = payload.threadId;
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const { data: thread } = await (client as any)
           .from('inbox_threads')
@@ -1361,6 +1499,14 @@ When you complete a task_request, mark it as completed using update_inbox_messag
           .eq('id', payload.threadId)
           .single();
         recipientUserId = thread?.user_id;
+      }
+
+      // Bare trigger_agent (no source row, possibly just a threadKey): fall
+      // back to the user stamped server-side post-auth by handleTriggerAgent.
+      // Row-derived resolution stays preferred; this fallback is what lets a
+      // threadKey-only failure reach thread resolution at all (PR #487).
+      if (!recipientUserId && payload.recipientUserId) {
+        recipientUserId = payload.recipientUserId;
       }
 
       if (recipientUserId) {
@@ -1378,15 +1524,17 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         classification.category !== 'unknown' ? ` (${classification.category})` : '';
       const notificationContent = `Trigger to ${payload.toAgentId} failed${categoryLabel}: ${classification.summary}`;
 
-      const { error: insertErr } = await client.from('agent_inbox').insert({
-        recipient_user_id: recipientUserId,
-        recipient_agent_id: payload.fromAgentId,
-        sender_agent_id: payload.toAgentId,
+      // Thread-borne trigger → notice joins the thread (participants and
+      // session stamps already exist; stamped-only delivery lands it in
+      // exactly one session per participant). Threadless → legacy inbox.
+      const noticeResult = await sendTriggerFailureNotice(client, {
+        userId: recipientUserId,
+        fromAgentId: payload.fromAgentId,
+        toAgentId: payload.toAgentId,
+        threadId: resolvedThreadId,
+        threadKey: payload.threadKey,
         subject: `Trigger failed: ${payload.toAgentId}`,
         content: notificationContent,
-        message_type: 'notification',
-        priority: 'high',
-        thread_key: payload.threadKey || null,
         metadata: {
           triggerFailure: true,
           triggerId,
@@ -1396,18 +1544,12 @@ When you complete a task_request, mark it as completed using update_inbox_messag
           retryable: classification.retryable,
           originalInboxMessageId: payload.inboxMessageId || null,
         },
-        // No trigger — avoid infinite failure loops
       });
-
-      if (insertErr) {
-        logger.error('[TriggerFailure] Failed to send failure notification to sender', {
-          sender: payload.fromAgentId,
-          error: insertErr.message,
-        });
-      } else {
+      if (noticeResult.ok) {
         logger.info('[TriggerFailure] Sent failure notification to sender', {
           sender: payload.fromAgentId,
           category: classification.category,
+          via: noticeResult.via,
         });
       }
     }
@@ -1564,6 +1706,26 @@ async function shutdown(): Promise<void> {
   forceKillTimer.unref(); // Don't let the timer itself keep the process alive
 
   try {
+    // Before anything is torn down: the agent CLIs we spawned are our children
+    // and are about to die with us. Record that, and tell whoever is waiting.
+    // Runs first because it needs a live DB client, and because the notice is
+    // worth more than a few hundred milliseconds of shutdown latency.
+    // Close intake and let outstanding lifecycle writes settle before taking
+    // the snapshot. Snapshotting first would race the very writes it needs to
+    // order against — a pending `running` write would land after our
+    // interruption and restore the zombie.
+    const { runs: interrupted, drained } = await closeIntakeAndDrain();
+    if (interrupted.length > 0 && dataComposer) {
+      // `drained` is passed through rather than swallowed: if a lifecycle
+      // write was still outstanding, whatever we record here may be
+      // contradicted a moment later, and the notice has to say so.
+      await interruptActiveRuns(dataComposer.getClient(), interrupted, undefined, drained).catch(
+        (err) => {
+          logger.error('Interruption bookkeeping failed', { error: err });
+        }
+      );
+    }
+
     // Stop heartbeat cron job (logs internally)
     stopHeartbeatService();
 

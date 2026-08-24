@@ -12,7 +12,8 @@ import { StrategyService } from '../../services/strategy.service';
 import { getOrchestrator } from '../../services/sandbox/index.js';
 import { resolveUser, type UserIdentifier } from '../../services/user-resolver';
 import { getEffectiveAgentId } from '../../auth/enforce-identity';
-import { getRequestContext } from '../../utils/request-context';
+import { getRequestContext, getSessionContext } from '../../utils/request-context';
+import { GraphExecutorService, type GraphEvaluation } from '../../services/graph-executor.service';
 import { logger } from '../../utils/logger';
 
 // Common user identifier schema
@@ -262,6 +263,24 @@ export async function handleUpdateTask(
       return mcpResponse({ success: false, error: 'Task does not belong to this user' }, true);
     }
 
+    // Friendly precheck; the enforce_graph_execution_path trigger is the
+    // authoritative fence for graph-mode execution state.
+    if (args.status !== undefined && existing.task_group_id) {
+      const group = await dataComposer.repositories.taskGroups.findById(existing.task_group_id);
+      if (group?.execution_model === 'graph') {
+        return mcpResponse(
+          {
+            success: false,
+            error:
+              'Status is executor-owned for graph-mode groups — use claim_task / ' +
+              'complete_task(claimToken) / record_gate_verdict / retry_gate. ' +
+              'Title, description, priority, and tags remain editable here.',
+          },
+          true
+        );
+      }
+    }
+
     const updates: Record<string, unknown> = {};
     if (args.title !== undefined) updates.title = args.title;
     if (args.description !== undefined) updates.description = args.description;
@@ -338,7 +357,99 @@ export const completeTaskSchema = z.object({
     .describe(
       'Brief summary of what was accomplished (shown in mission feed and preserved in activity stream)'
     ),
+  claimToken: z
+    .string()
+    .uuid()
+    .optional()
+    .describe(
+      'Required for tasks in graph-mode groups: the claim token returned by claim_task. Graph completion refuses without a valid claim.'
+    ),
+  sessionId: z
+    .string()
+    .uuid()
+    .optional()
+    .describe(
+      'Claim-holding session for graph-mode tasks — usually unnecessary, resolved from session context. Must match the claiming session.'
+    ),
 });
+
+/**
+ * Graph-mode completion path shared by complete_task and close_task: the
+ * claim-token-gated RPC terminates the node and transitions newly-ready
+ * downstream nodes in the same transaction; dispatch happens post-commit
+ * and its failure never fails the completion (the sweep recovers it).
+ */
+async function completeGraphModeTask(
+  dataComposer: DataComposer,
+  userId: string,
+  taskId: string,
+  outcome: 'completed' | 'failed' | 'skipped',
+  claimToken: string | undefined,
+  summary: string | undefined,
+  explicitSessionId?: string
+): Promise<McpResponse> {
+  const ctx = getRequestContext() || getSessionContext();
+  // Explicit wins (sessions without CLI-hook context, e.g. raw .mcp.json
+  // runners); the RPC CASes session + token together, so a wrong session
+  // cannot complete over someone else's claim regardless.
+  const sessionId = explicitSessionId || ctx?.sessionId;
+  if (!claimToken || !sessionId) {
+    return mcpResponse(
+      {
+        success: false,
+        error:
+          'This task is in a graph-mode group: completion is claim-token-gated. ' +
+          'Claim it first with claim_task (from a bootstrapped session) and pass claimToken here.',
+      },
+      true
+    );
+  }
+
+  const result = await dataComposer.repositories.taskGroups.completeGraphTask({
+    userId,
+    taskId,
+    sessionId,
+    claimToken,
+    outcome,
+    reason: summary,
+  });
+  if (result.success === false) return mcpResponse(result, true);
+
+  const taskGroupId = (await dataComposer.repositories.tasks.findById(taskId))?.task_group_id;
+  try {
+    const agentId = getEffectiveAgentId(undefined) || 'system';
+    await dataComposer.repositories.activityStream.logActivity({
+      userId,
+      agentId,
+      type: 'state_change',
+      subtype: outcome === 'completed' ? 'task_completed' : 'task_closed',
+      content: summary || `${outcome}: graph node ${taskId}`,
+      taskGroupId: taskGroupId || undefined,
+      payload: { taskId, outcome, summary: summary || null, graphMode: true },
+    });
+  } catch (err) {
+    logger.warn('Failed to log graph task completion activity:', err);
+  }
+
+  if (taskGroupId) {
+    try {
+      const group = await dataComposer.repositories.taskGroups.findById(taskGroupId);
+      if (group) {
+        const executor = new GraphExecutorService(dataComposer);
+        await executor.dispatchEvaluation(
+          userId,
+          group,
+          result.evaluation as unknown as GraphEvaluation,
+          { dedupe: false }
+        );
+      }
+    } catch (err) {
+      logger.warn(`Graph post-completion dispatch failed for task ${taskId}:`, err);
+    }
+  }
+
+  return mcpResponse(result);
+}
 
 export async function handleCompleteTask(
   args: z.infer<typeof completeTaskSchema>,
@@ -357,6 +468,23 @@ export async function handleCompleteTask(
     }
     if (existing.user_id !== resolved.user.id) {
       return mcpResponse({ success: false, error: 'Task does not belong to this user' }, true);
+    }
+
+    // Graph-mode groups complete through the claim-token-gated RPC — the
+    // legacy path would bypass the executor (no claim check, no push).
+    if (existing.task_group_id) {
+      const group = await dataComposer.repositories.taskGroups.findById(existing.task_group_id);
+      if (group?.execution_model === 'graph') {
+        return completeGraphModeTask(
+          dataComposer,
+          resolved.user.id,
+          args.taskId,
+          'completed',
+          args.claimToken,
+          args.summary,
+          args.sessionId
+        );
+      }
     }
 
     const task = await dataComposer.repositories.tasks.completeTask(args.taskId);
@@ -488,6 +616,16 @@ export const closeTaskSchema = z.object({
     .max(2000)
     .optional()
     .describe('Brief summary of what happened (shown in mission feed)'),
+  claimToken: z
+    .string()
+    .uuid()
+    .optional()
+    .describe('Required for tasks in graph-mode groups: the claim token from claim_task'),
+  sessionId: z
+    .string()
+    .uuid()
+    .optional()
+    .describe('Claim-holding session for graph-mode tasks — usually resolved from context'),
 });
 
 export async function handleCloseTask(
@@ -506,6 +644,33 @@ export async function handleCloseTask(
     }
     if (existing.user_id !== resolved.user.id) {
       return mcpResponse({ success: false, error: 'Task does not belong to this user' }, true);
+    }
+
+    // Graph-mode groups terminate through the claim-token-gated RPC.
+    if (existing.task_group_id) {
+      const group = await dataComposer.repositories.taskGroups.findById(existing.task_group_id);
+      if (group?.execution_model === 'graph') {
+        if (args.outcome === 'blocked') {
+          return mcpResponse(
+            {
+              success: false,
+              error:
+                "Graph-mode nodes don't close as 'blocked' — blockage is derived from the graph. " +
+                "Release the claim (release_claim) to hand the node back, or fail it (outcome: 'failed').",
+            },
+            true
+          );
+        }
+        return completeGraphModeTask(
+          dataComposer,
+          resolved.user.id,
+          args.taskId,
+          args.outcome,
+          args.claimToken,
+          args.summary ?? args.reason,
+          args.sessionId
+        );
+      }
     }
 
     const task = await dataComposer.repositories.tasks.closeTask(

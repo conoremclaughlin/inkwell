@@ -47,6 +47,8 @@ import {
   exchangeRefreshToken,
 } from '../auth/pcp-tokens';
 import type { Database } from '../data/supabase/types';
+import { applyGraphBlockedBy } from '../data/task-graph-read-model';
+import { isLeaseStale, type StudioLease } from '../services/studio-lease.service';
 import { activityBus } from '../services/events/activity-bus';
 import type { Activity } from '../data/repositories/activity-stream.repository';
 import {
@@ -654,9 +656,9 @@ async function findGeminiTranscriptFile(backendSessionId: string): Promise<strin
 async function findPcpTranscriptFile(sessionId: string): Promise<string | null> {
   const roots = new Set<string>();
   for (const dir of getAncestorDirs(process.cwd(), 8)) {
-    roots.add(path.join(dir, '.pcp', 'runtime', 'repl'));
+    roots.add(path.join(dir, '.ink', 'runtime', 'repl'));
   }
-  roots.add(path.join(os.homedir(), '.pcp', 'runtime', 'repl'));
+  roots.add(path.join(os.homedir(), '.ink', 'runtime', 'repl'));
 
   const matches: string[] = [];
   for (const root of roots) {
@@ -5250,6 +5252,53 @@ router.get('/sessions', async (req: Request, res: Response) => {
 });
 
 /**
+ * Shape a raw `studios.lease` jsonb value for the dashboard.
+ *
+ * Returns null for an unoccupied studio so the client can branch on presence
+ * alone. `stale` is derived here rather than in the browser because staleness
+ * is measured against LEASE_STALE_MS, and a client clock that disagrees with
+ * the server's would render a healthy lease as reclaimable — the one piece of
+ * this payload where being wrong invites someone to take a studio out from
+ * under a working agent.
+ *
+ * Note that `stale` means "eligible for reclaim", not "dead": the lease
+ * service still vetoes reclaim on live-process signals. The canvas should
+ * present it as a question, not a verdict.
+ */
+function describeLease(raw: unknown): {
+  sessionId: string;
+  threadKey: string;
+  agentId: string;
+  acquiredAt: string;
+  heartbeatAt: string;
+  reason?: string;
+  quarantined: boolean;
+  claimKind: string | null;
+  pendingRelease: { reason: string; requestedAt: string } | null;
+  stale: boolean;
+  heartbeatAgeMs: number | null;
+} | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const lease = raw as StudioLease;
+  if (!lease.sessionId) return null;
+
+  const heartbeatMs = Date.parse(lease.heartbeatAt ?? '');
+  return {
+    sessionId: lease.sessionId,
+    threadKey: lease.threadKey,
+    agentId: lease.agentId,
+    acquiredAt: lease.acquiredAt,
+    heartbeatAt: lease.heartbeatAt,
+    ...(lease.reason ? { reason: lease.reason } : {}),
+    quarantined: lease.quarantined === true,
+    claimKind: lease.claimKind ?? null,
+    pendingRelease: lease.pendingRelease ?? null,
+    stale: isLeaseStale(lease),
+    heartbeatAgeMs: Number.isFinite(heartbeatMs) ? Date.now() - heartbeatMs : null,
+  };
+}
+
+/**
  * GET /api/admin/studios
  * List studios grouped by agent, with latest session status per agent.
  */
@@ -5283,13 +5332,18 @@ router.get('/studios', async (req: Request, res: Response) => {
       status: string;
       updated_at: string | null;
       created_at: string | null;
+      lease: StudioLease | null;
+      ephemeral: boolean | null;
+      parent_studio_id: string | null;
+      expires_at: string | null;
+      default_project_id: string | null;
     }> | null = [];
 
     if (sbIds.length > 0) {
       const { data: scopedStudios } = await supabase
         .from('studios')
         .select(
-          'id, agent_id, branch, base_branch, repo_root, purpose, work_type, worktree_path, slug, status, updated_at, created_at'
+          'id, agent_id, branch, base_branch, repo_root, purpose, work_type, worktree_path, slug, status, updated_at, created_at, lease, ephemeral, parent_studio_id, expires_at, default_project_id'
         )
         .eq('user_id', authReq.pcpUserId)
         .in('sb_id', sbIds)
@@ -5374,6 +5428,14 @@ router.get('/studios', async (req: Request, res: Response) => {
           slug: s.slug,
           status: s.status,
           updatedAt: s.updated_at,
+          // Occupancy (spec:trigger-studio-routing Phase 5 → spec:studio-canvas
+          // MVP items 2 and 6). Without these the canvas can draw studios but
+          // cannot say whether anyone is in one, which is the whole question.
+          ephemeral: s.ephemeral ?? false,
+          parentStudioId: s.parent_studio_id,
+          expiresAt: s.expires_at,
+          defaultProjectId: s.default_project_id,
+          lease: describeLease(s.lease),
         })),
       };
     });
@@ -6505,7 +6567,7 @@ router.get('/tasks', async (req: Request, res: Response) => {
 
     let query = supabase
       .from('tasks')
-      .select('*, projects(name), task_groups(title)')
+      .select('*, projects(name), task_groups(title)', { count: 'exact' })
       .eq('user_id', authReq.pcpUserId);
 
     // Optional filters
@@ -6523,14 +6585,54 @@ router.get('/tasks', async (req: Request, res: Response) => {
       query = query.in('status', ['pending', 'in_progress', 'blocked']);
     }
 
-    const { data, error } = await query.limit(200);
+    // Order before capping: the old unordered .limit(200) silently dropped an
+    // arbitrary third of the active set — whole task groups simply never
+    // appeared on the map, newest work included. The exact count rides along
+    // so truncation is REPORTED, never silent: beyond the cap, an omitted
+    // active blocker would otherwise read as satisfied downstream.
+    const TASKS_CAP = 1000;
+    const {
+      data,
+      error,
+      count: totalMatched,
+    } = await query.order('created_at', { ascending: false }).limit(TASKS_CAP);
 
     if (error) {
       res.status(500).json(errorJson('Failed to list tasks', error));
       return;
     }
+    const fetchedCount = (data || []).length;
+    const meta = {
+      fetched: fetchedCount,
+      total: totalMatched ?? fetchedCount,
+      truncated: (totalMatched ?? fetchedCount) > fetchedCount,
+    };
 
-    const tasks = data || [];
+    // Graph-mode groups store dependencies in task_edges; blockedBy is derived.
+    const tasks = await applyGraphBlockedBy(supabase, data || []);
+
+    // activeOnly hides terminal tasks, but an ARCHIVED predecessor is
+    // unsatisfiable — downstream can never run, and treating it as
+    // satisfied-because-absent would render blocked work as ready (Lumen,
+    // PR #524 round 1). Pull in exactly the archived blockers of the
+    // fetched set so the map can mark them.
+    if (activeOnly === 'true' && tasks.length > 0) {
+      const present = new Set(tasks.map((t) => t.id));
+      const missingBlockers = [
+        ...new Set(tasks.flatMap((t) => t.blocked_by ?? []).filter((depId) => !present.has(depId))),
+      ];
+      if (missingBlockers.length > 0) {
+        const { data: archivedDeps, error: archivedError } = await supabase
+          .from('tasks')
+          .select('*, projects(name), task_groups(title)')
+          .eq('user_id', authReq.pcpUserId)
+          .eq('status', 'archived')
+          .in('id', missingBlockers);
+        if (!archivedError && archivedDeps && archivedDeps.length > 0) {
+          tasks.push(...(await applyGraphBlockedBy(supabase, archivedDeps)));
+        }
+      }
+    }
 
     // Sort: status priority (in_progress, pending, blocked, completed),
     // then by priority (critical, high, medium, low), then by created_at desc
@@ -6576,6 +6678,10 @@ router.get('/tasks', async (req: Request, res: Response) => {
         projectName: (t.projects as { name: string } | null)?.name ?? null,
         taskGroupId: t.task_group_id,
         taskGroupTitle: (t.task_groups as { title: string } | null)?.title ?? null,
+        // Ordering within a group. The dashboard has always typed this field
+        // and the endpoint has never sent it, so every consumer sorting by it
+        // was sorting by undefined — a stable no-op that looked like order.
+        taskOrder: t.task_order ?? null,
         blockedBy: t.blocked_by,
         createdBy: t.created_by,
         completedAt: t.completed_at,
@@ -6583,12 +6689,68 @@ router.get('/tasks', async (req: Request, res: Response) => {
         metadata: t.metadata,
         createdAt: t.created_at,
         updatedAt: t.updated_at,
+        // Workflow graph execution state (spec v10 steps 2-3) — lets the
+        // map render gates, claims, and dwell windows distinctly.
+        taskType: t.task_type ?? 'work',
+        outcome: t.outcome ?? null,
+        gateState: t.gate_state ?? null,
+        gateAttempt: t.gate_attempt ?? null,
+        gateOpenedAt: t.gate_opened_at ?? null,
+        eligibleAt: t.eligible_at ?? null,
+        claimedBySessionId: t.claimed_by_session_id ?? null,
+        assigneeIdentityId: t.assignee_identity_id ?? null,
+        assigneeUserId: t.assignee_user_id ?? null,
       })),
       stats,
+      meta,
     });
   } catch (error) {
     logger.error('Failed to list tasks:', error);
     res.status(500).json(errorJson('Failed to list tasks', error));
+  }
+});
+
+/**
+ * GET /api/admin/activity
+ * Recent activity_stream events for the command center feed. Tool telemetry
+ * (tool_call/tool_result) is excluded — it is ~half the stream and narrates
+ * plumbing, not work the operator can act on.
+ */
+router.get('/activity', async (req: Request, res: Response) => {
+  try {
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const authReq = req as AdminAuthRequest;
+    const limit = Math.min(Number(req.query.limit) || 50, 200);
+
+    const { data, error } = await supabase
+      .from('activity_stream')
+      .select('id, type, subtype, agent_id, content, status, created_at')
+      .eq('user_id', authReq.pcpUserId)
+      .not('type', 'in', '(tool_call,tool_result)')
+      .order('created_at', { ascending: false })
+      .limit(limit);
+
+    if (error) {
+      res.status(500).json(errorJson('Failed to list activity', error));
+      return;
+    }
+
+    res.json({
+      events: (data || []).map((e) => ({
+        id: e.id,
+        type: e.type,
+        subtype: e.subtype,
+        agentId: e.agent_id,
+        content: e.content,
+        status: e.status,
+        createdAt: e.created_at,
+      })),
+    });
+  } catch (error) {
+    logger.error('Failed to list activity:', error);
+    res.status(500).json(errorJson('Failed to list activity', error));
   }
 });
 
@@ -6662,6 +6824,8 @@ router.put('/tasks/:id', async (req: Request, res: Response) => {
       return;
     }
 
+    const [derivedTask] = await applyGraphBlockedBy(supabase, [data]);
+
     res.json({
       task: {
         id: data.id,
@@ -6674,7 +6838,7 @@ router.put('/tasks/:id', async (req: Request, res: Response) => {
         projectName: (data.projects as { name: string } | null)?.name ?? null,
         taskGroupId: data.task_group_id,
         taskGroupTitle: (data.task_groups as { title: string } | null)?.title ?? null,
-        blockedBy: data.blocked_by,
+        blockedBy: derivedTask.blocked_by,
         createdBy: data.created_by,
         completedAt: data.completed_at,
         dueDate: data.due_date,
@@ -6704,13 +6868,19 @@ router.get('/task-groups', async (req: Request, res: Response) => {
     });
     const authReq = req as AdminAuthRequest;
 
-    // Fetch task groups with joined agent identity and project
-    const { data, error } = await supabase
+    // Fetch task groups with joined agent identity and project. Count rides
+    // along so a capped listing says so instead of silently thinning the map.
+    const GROUPS_CAP = 500;
+    const {
+      data,
+      error,
+      count: groupsMatched,
+    } = await supabase
       .from('task_groups')
-      .select('*, agent_identities(agent_id, name), projects(name)')
+      .select('*, agent_identities(agent_id, name), projects(name)', { count: 'exact' })
       .eq('user_id', authReq.pcpUserId)
       .order('created_at', { ascending: false })
-      .limit(200);
+      .limit(GROUPS_CAP);
 
     if (error) {
       res.status(500).json(errorJson('Failed to list task groups', error));
@@ -6767,10 +6937,18 @@ router.get('/task-groups', async (req: Request, res: Response) => {
         strategyStartedAt: g.strategy_started_at ?? null,
         strategyPausedAt: g.strategy_paused_at ?? null,
         planUri: g.plan_uri ?? null,
+        executionModel: g.execution_model ?? 'linear',
+        executionPhase: g.execution_phase ?? 'idle',
+        graphVersion: g.graph_version ?? 0,
         metadata: g.metadata,
         createdAt: g.created_at,
         updatedAt: g.updated_at,
       })),
+      meta: {
+        fetched: groups.length,
+        total: groupsMatched ?? groups.length,
+        truncated: (groupsMatched ?? groups.length) > groups.length,
+      },
     });
   } catch (error) {
     logger.error('Failed to list task groups:', error);
@@ -6825,7 +7003,8 @@ router.get('/task-groups/:id', async (req: Request, res: Response) => {
       return;
     }
 
-    const tasks = tasksData || [];
+    // Graph-mode groups store dependencies in task_edges; blockedBy is derived.
+    const tasks = await applyGraphBlockedBy(supabase, tasksData || []);
 
     res.json({
       group: {
@@ -7288,6 +7467,31 @@ router.post('/contacts/resolve', async (req: Request, res: Response) => {
  * The server generates the request ID, sends to connected platforms, and returns
  * the ID for polling.
  */
+/**
+ * Accept a clone origin only in the shape we publish.
+ *
+ * The body is agent-supplied, so this keeps a malformed or oversized field from
+ * reaching storage and the notification formatter; anything unrecognised
+ * degrades to "the parent asked", which is the pre-clone behaviour.
+ */
+function normalizeApprovalOrigin(
+  raw: unknown
+): { origin: 'clone'; cloneId?: string; cloneLabel?: string } | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const value = raw as Record<string, unknown>;
+  if (value.origin !== 'clone') return null;
+  const str = (v: unknown): string | undefined =>
+    typeof v === 'string' && v.trim() ? v.trim().slice(0, 120) : undefined;
+  const cloneId = str(value.cloneId);
+  const cloneLabel = str(value.cloneLabel);
+  if (!cloneId && !cloneLabel) return null;
+  return {
+    origin: 'clone',
+    ...(cloneId ? { cloneId } : {}),
+    ...(cloneLabel ? { cloneLabel } : {}),
+  };
+}
+
 router.post('/approval-requests', async (req: Request, res: Response) => {
   try {
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
@@ -7295,7 +7499,7 @@ router.post('/approval-requests', async (req: Request, res: Response) => {
     });
     const authReq = req as AdminAuthRequest;
 
-    const { tool, args, reason, studioId, sessionId, timeoutSeconds = 300 } = req.body;
+    const { tool, args, reason, studioId, sessionId, origin, timeoutSeconds = 300 } = req.body;
 
     if (!tool) {
       res.status(400).json({ error: 'tool is required' });
@@ -7303,6 +7507,7 @@ router.post('/approval-requests', async (req: Request, res: Response) => {
     }
 
     const expiresAt = new Date(Date.now() + timeoutSeconds * 1000).toISOString();
+    const cloneOrigin = normalizeApprovalOrigin(origin);
 
     // Resolve requesting agent from x-ink-context header (set by CLI hooks).
     // This is the sole trusted identity channel — agents cannot set it themselves.
@@ -7341,6 +7546,15 @@ router.post('/approval-requests', async (req: Request, res: Response) => {
         tool,
         args: args || null,
         reason: reason || null,
+        // Which clone asked, when one did. A clone carries its parent's
+        // identity, so requesting_agent_id alone cannot tell them apart — and
+        // the audit trail is the one place that has to.
+        //
+        // Stored under `metadata` rather than a dedicated column: the column
+        // exists for exactly this kind of optional annotation, and a migration
+        // for a field that is absent on most rows buys nothing. Omitted
+        // entirely for parent requests, so existing rows read unchanged.
+        ...(cloneOrigin ? { metadata: { origin: cloneOrigin } } : {}),
         timeout_seconds: timeoutSeconds,
         expires_at: expiresAt,
       })
@@ -7376,6 +7590,7 @@ router.post('/approval-requests', async (req: Request, res: Response) => {
       args,
       reason: req.body.reason,
       requestingAgentId,
+      origin: cloneOrigin,
       studioId,
       sessionId,
       expiresAt,
