@@ -372,6 +372,244 @@ describe.skipIf(!canRun)('handleCloseTask (integration)', () => {
 });
 
 // =====================================================
+// dueDate round-trip (integration)
+//
+// Regression for Myra's 2026-08-17 report: update_task reported success while
+// silently dropping dueDate, and a dueDate-only call failed with "Cannot coerce
+// the result to a single JSON object". Both were only visible by reading the
+// row back — which is exactly what these tests do, against the real DB.
+// =====================================================
+
+describe.skipIf(!canRun)('task dueDate (integration)', () => {
+  let client: SupabaseClient;
+  let dc: any;
+  let userTimezone = 'UTC';
+  const createdTaskIds: string[] = [];
+
+  beforeAll(async () => {
+    client = createClient(SUPABASE_URL!, SUPABASE_KEY!, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+
+    const { ProjectTasksRepository } =
+      await import('../../data/repositories/project-tasks.repository');
+
+    dc = {
+      getClient: () => client,
+      repositories: {
+        tasks: new ProjectTasksRepository(client),
+        projects: { findById: vi.fn().mockResolvedValue(null) },
+        taskGroups: { findById: vi.fn().mockResolvedValue(null) },
+        activityStream: { logActivity: vi.fn().mockResolvedValue({ id: 'act-1' }) },
+      },
+    };
+
+    const { data } = await client.from('users').select('timezone').eq('id', TEST_USER_ID!).single();
+    userTimezone = (data as { timezone?: string | null } | null)?.timezone || 'UTC';
+  }, 15_000);
+
+  afterAll(async () => {
+    if (!client || createdTaskIds.length === 0) return;
+    await client.from('tasks').delete().in('id', createdTaskIds);
+  }, 10_000);
+
+  async function seedTask(): Promise<string> {
+    const task = await dc.repositories.tasks.create({
+      user_id: TEST_USER_ID!,
+      title: `__duedate_integration_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      description: 'Integration test — safe to delete',
+      priority: 'medium',
+      tags: ['__test'],
+    });
+    createdTaskIds.push(task.id);
+    return task.id;
+  }
+
+  async function readDueDate(taskId: string): Promise<string | null> {
+    const { data } = await client.from('tasks').select('due_date').eq('id', taskId).single();
+    return (data as { due_date: string | null } | null)?.due_date ?? null;
+  }
+
+  /** The calendar day the stored instant falls on, as the user sees it. */
+  function localDay(iso: string): string {
+    return new Date(iso).toLocaleDateString('en-US', { timeZone: userTimezone });
+  }
+
+  it('persists a dueDate-only update instead of failing to coerce', async () => {
+    const { handleUpdateTask } = await import('./task-handlers');
+    const taskId = await seedTask();
+
+    const response = await handleUpdateTask(
+      { userId: TEST_USER_ID!, taskId, dueDate: '2026-09-14' } as any,
+      dc
+    );
+
+    expect(response.isError).toBeFalsy();
+    const stored = await readDueDate(taskId);
+    expect(stored).not.toBeNull();
+    expect(localDay(stored!)).toBe('9/14/2026');
+  });
+
+  it('persists dueDate alongside other fields (no silent partial write)', async () => {
+    const { handleUpdateTask } = await import('./task-handlers');
+    const taskId = await seedTask();
+
+    const response = await handleUpdateTask(
+      {
+        userId: TEST_USER_ID!,
+        taskId,
+        dueDate: '2026-09-14',
+        priority: 'high',
+        description: 'Domain renewal — expires ~Sept 14',
+      } as any,
+      dc
+    );
+    expect(response.isError).toBeFalsy();
+
+    const { data } = await client
+      .from('tasks')
+      .select('due_date, priority, description')
+      .eq('id', taskId)
+      .single();
+
+    const row = data as { due_date: string | null; priority: string; description: string };
+    expect(row.priority).toBe('high');
+    expect(row.description).toBe('Domain renewal — expires ~Sept 14');
+    expect(row.due_date).not.toBeNull();
+    expect(localDay(row.due_date!)).toBe('9/14/2026');
+  });
+
+  it('echoes the stored dueDate in the response', async () => {
+    const { handleUpdateTask } = await import('./task-handlers');
+    const taskId = await seedTask();
+
+    const response = await handleUpdateTask(
+      { userId: TEST_USER_ID!, taskId, dueDate: '2026-09-14' } as any,
+      dc
+    );
+
+    const body = JSON.parse(response.content[0].text);
+    expect(body.task.dueDate).toBe(await readDueDate(taskId));
+  });
+
+  it('surfaces the due date through list_tasks', async () => {
+    const { handleUpdateTask, handleListTasks } = await import('./task-handlers');
+    const taskId = await seedTask();
+
+    await handleUpdateTask({ userId: TEST_USER_ID!, taskId, dueDate: '2026-09-14' } as any, dc);
+
+    const response = await handleListTasks({ userId: TEST_USER_ID!, limit: 200 } as any, dc);
+    const body = JSON.parse(response.content[0].text);
+    const listed = body.tasks.find((t: { id: string }) => t.id === taskId);
+
+    expect(listed?.dueDate).not.toBeNull();
+    expect(localDay(listed.dueDate)).toBe('9/14/2026');
+  });
+
+  it('stores a bare date so it still reads as that day west of UTC', async () => {
+    // The test fixture user is UTC, so drive the zone through the resolved user
+    // to prove the round-trip for someone in Conor's timezone: UTC midnight
+    // would come back as Sep 13 in PDT and show overdue all day on Sep 14.
+    const { resolveUser } = await import('../../services/user-resolver');
+    const mocked = vi.mocked(resolveUser);
+    const original = mocked.getMockImplementation();
+    mocked.mockImplementation(
+      async (args: any) =>
+        ({
+          user: { id: args.userId, timezone: 'America/Los_Angeles' },
+          resolvedBy: 'userId',
+        }) as any
+    );
+
+    try {
+      const { handleUpdateTask } = await import('./task-handlers');
+      const taskId = await seedTask();
+
+      await handleUpdateTask({ userId: TEST_USER_ID!, taskId, dueDate: '2026-09-14' } as any, dc);
+
+      const stored = await readDueDate(taskId);
+      expect(stored).not.toBeNull();
+      expect(
+        new Date(stored!).toLocaleDateString('en-US', { timeZone: 'America/Los_Angeles' })
+      ).toBe('9/14/2026');
+      // Not yet overdue at any point during Sep 14 in that zone.
+      expect(new Date(stored!).getTime()).toBeGreaterThan(
+        new Date('2026-09-14T23:00:00-07:00').getTime()
+      );
+    } finally {
+      if (original) mocked.mockImplementation(original);
+    }
+  });
+
+  it('clears a due date when passed null', async () => {
+    const { handleUpdateTask } = await import('./task-handlers');
+    const taskId = await seedTask();
+
+    await handleUpdateTask({ userId: TEST_USER_ID!, taskId, dueDate: '2026-09-14' } as any, dc);
+    expect(await readDueDate(taskId)).not.toBeNull();
+
+    const response = await handleUpdateTask(
+      { userId: TEST_USER_ID!, taskId, dueDate: null } as any,
+      dc
+    );
+
+    expect(response.isError).toBeFalsy();
+    expect(await readDueDate(taskId)).toBeNull();
+  });
+
+  it('persists a dueDate given at creation', async () => {
+    const { handleCreateTask } = await import('./task-handlers');
+
+    const response = await handleCreateTask(
+      {
+        userId: TEST_USER_ID!,
+        title: `__duedate_create_${Date.now()}`,
+        description: 'Integration test — safe to delete',
+        priority: 'medium',
+        tags: ['__test'],
+        dueDate: '2026-09-14',
+      } as any,
+      dc
+    );
+
+    expect(response.isError).toBeFalsy();
+    const body = JSON.parse(response.content[0].text);
+    createdTaskIds.push(body.task.id);
+
+    const stored = await readDueDate(body.task.id);
+    expect(stored).not.toBeNull();
+    expect(localDay(stored!)).toBe('9/14/2026');
+    expect(body.task.dueDate).toBe(stored);
+  });
+
+  it('rejects an all-unknown-fields update with a usable message', async () => {
+    const { handleUpdateTask } = await import('./task-handlers');
+    const taskId = await seedTask();
+
+    const response = await handleUpdateTask({ userId: TEST_USER_ID!, taskId } as any, dc);
+
+    expect(response.isError).toBe(true);
+    const body = JSON.parse(response.content[0].text);
+    expect(body.error).toContain('No fields to update');
+    expect(body.error).not.toContain('coerce');
+  });
+
+  it('rejects an unparseable dueDate without touching the row', async () => {
+    const { handleUpdateTask } = await import('./task-handlers');
+    const taskId = await seedTask();
+
+    const response = await handleUpdateTask(
+      { userId: TEST_USER_ID!, taskId, dueDate: '2026-02-30' } as any,
+      dc
+    );
+
+    expect(response.isError).toBe(true);
+    expect(JSON.parse(response.content[0].text).error).toContain('Invalid dueDate');
+    expect(await readDueDate(taskId)).toBeNull();
+  });
+});
+
+// =====================================================
 // handleCloseTaskGroup (integration)
 // =====================================================
 

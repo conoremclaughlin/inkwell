@@ -91,3 +91,26 @@ describe('ProjectTasksRepository blocked_by guard', () => {
     expect(client.updates).toHaveLength(1);
   });
 });
+
+describe('update — empty-payload guard (PR #503 r1 P3)', () => {
+  it('rejects an all-undefined payload — one key wearing no value is still empty', async () => {
+    // JSON.stringify drops undefined-valued properties from the PostgREST
+    // body, so { due_date: undefined } IS the empty payload; only the MCP
+    // handler happened to pre-filter, leaving other repository callers open.
+    const client = makeClient({});
+    const repo = new ProjectTasksRepository(client);
+
+    await expect(repo.update('t1', { due_date: undefined })).rejects.toThrow('No fields to update');
+    expect(client.updates).toHaveLength(0);
+  });
+
+  it('strips undefined values from a mixed payload before writing', async () => {
+    const client = makeClient({});
+    const repo = new ProjectTasksRepository(client);
+
+    await repo.update('t1', { title: 'renamed', due_date: undefined });
+
+    expect(client.updates).toHaveLength(1);
+    expect(client.updates[0]).toEqual({ title: 'renamed' });
+  });
+});

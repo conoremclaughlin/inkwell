@@ -47,6 +47,7 @@ export interface CreateProjectTaskInput {
   created_by?: string;
   task_group_id?: string;
   task_order?: number;
+  due_date?: string | null;
 }
 
 export interface UpdateProjectTaskInput {
@@ -59,6 +60,7 @@ export interface UpdateProjectTaskInput {
   outcome?: string;
   outcome_reason?: string;
   completed_at?: string | null;
+  due_date?: string | null;
   metadata?: Record<string, unknown>;
 }
 
@@ -92,6 +94,7 @@ export class ProjectTasksRepository {
     };
     if (input.task_group_id !== undefined) insertData.task_group_id = input.task_group_id;
     if (input.task_order !== undefined) insertData.task_order = input.task_order;
+    if (input.due_date !== undefined) insertData.due_date = input.due_date;
 
     const { data, error } = await this.client
       .from('tasks')
@@ -224,7 +227,22 @@ export class ProjectTasksRepository {
    * Update a task
    */
   async update(id: string, input: UpdateProjectTaskInput): Promise<ProjectTask> {
-    if (input.blocked_by !== undefined) {
+    // PostgREST turns an empty payload into an UPDATE that matches no rows, and
+    // .single() then fails with "Cannot coerce the result to a single JSON
+    // object" — an error that points at JSON parsing rather than at the caller
+    // who passed nothing to write. Explicit-undefined values are stripped
+    // FIRST: JSON.stringify drops them from the request body anyway, so
+    // { due_date: undefined } is the same empty payload wearing a key
+    // (Lumen #503 r1 P3) — and every repository caller gets the guard, not
+    // just the MCP handler that happens to pre-filter.
+    const provided = Object.fromEntries(
+      Object.entries(input).filter(([, v]) => v !== undefined)
+    ) as UpdateProjectTaskInput;
+    if (Object.keys(provided).length === 0) {
+      throw new Error('No fields to update');
+    }
+
+    if (provided.blocked_by !== undefined) {
       const { data: existing, error: lookupError } = await this.client
         .from('tasks')
         .select('task_group_id')
@@ -240,7 +258,7 @@ export class ProjectTasksRepository {
     }
     const { data, error } = await this.client
       .from('tasks')
-      .update(input as never)
+      .update(provided as never)
       .eq('id', id)
       .select()
       .single();
