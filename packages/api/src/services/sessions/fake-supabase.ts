@@ -25,6 +25,7 @@ function getCol(row: Row, col: string): unknown {
 
 class FakeQuery {
   private filters: Array<(r: Row) => boolean> = [];
+  private sorts: Array<{ col: string; ascending: boolean }> = [];
   private limitN?: number;
 
   constructor(
@@ -54,10 +55,39 @@ class FakeQuery {
     this.limitN = n;
     return this;
   }
+  gte(col: string, val: unknown) {
+    this.filters.push((r) => String(getCol(r, col) ?? '') >= String(val));
+    return this;
+  }
+  /**
+   * PostgREST `or=(a.eq.x,b.is.null)`. Supports the `is`/`eq`/`gt` operators
+   * this codebase actually passes; anything else matches everything rather
+   * than silently filtering rows out. Multiple `.or()` calls AND together,
+   * matching PostgREST.
+   */
+  or(expr: string) {
+    const clauses = expr.split(',').map((c) => c.trim());
+    this.filters.push((r) =>
+      clauses.some((clause) => {
+        const [col, op, ...rest] = clause.split('.');
+        const raw = rest.join('.');
+        const actual = getCol(r, col);
+        if (op === 'is') return raw === 'null' ? actual == null : actual === raw;
+        if (op === 'eq') return String(actual) === raw;
+        if (op === 'gt') {
+          const bound = raw === 'now()' ? new Date().toISOString() : raw;
+          return actual != null && String(actual) > bound;
+        }
+        return true;
+      })
+    );
+    return this;
+  }
   select(_cols?: string) {
     return this;
   }
-  order() {
+  order(col?: string, opts?: { ascending?: boolean }) {
+    if (col) this.sorts.push({ col, ascending: opts?.ascending !== false });
     return this;
   }
 
@@ -69,6 +99,13 @@ class FakeQuery {
     let matched = this.rows.filter((r) => this.filters.every((f) => f(r)));
     if (this.mode === 'update') {
       for (const r of matched) Object.assign(r, this.payload);
+    }
+    for (const { col, ascending } of [...this.sorts].reverse()) {
+      matched = [...matched].sort((a, b) => {
+        const av = String(getCol(a, col) ?? '');
+        const bv = String(getCol(b, col) ?? '');
+        return ascending ? av.localeCompare(bv) : bv.localeCompare(av);
+      });
     }
     if (this.limitN !== undefined) matched = matched.slice(0, this.limitN);
     return matched.map((r) => ({ ...r }));

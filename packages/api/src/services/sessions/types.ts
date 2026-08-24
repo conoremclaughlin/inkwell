@@ -333,10 +333,30 @@ export interface ContactContext {
   platform?: string;
 }
 
+/**
+ * The constitution documents, resolved from the database.
+ *
+ * Mirrors what `bootstrap` returns as `identityFiles`. Spawned sessions get
+ * this from the server because not every backend runs a session-start hook —
+ * Antigravity has none at all, so without this the agent starts with nothing
+ * but its soul.
+ */
+export interface ConstitutionDocs {
+  /** Shared across the workspace: how the team operates. */
+  values?: string;
+  process?: string;
+  /** Who the human is. */
+  user?: string;
+  /** Per-agent: operational wake-up checklist. */
+  heartbeat?: string;
+}
+
 export interface InjectedContext {
   agent: AgentIdentity;
   user: UserContext;
   temporal: TemporalContext;
+  /** Constitution docs (values/process/user/heartbeat). Soul lives on `agent`. */
+  constitution?: ConstitutionDocs;
   /** Contact identity when in a per-sender session */
   contact?: ContactContext;
   recentMemories: Array<{
@@ -346,6 +366,12 @@ export interface InjectedContext {
     salience: string;
     createdAt: string;
   }>;
+  /**
+   * The same budgeted, topic-grouped digest `bootstrap` returns. Preferred over
+   * rendering `recentMemories` directly — a raw dump of the critical and high
+   * tiers ran past 170KB for an agent with a long history.
+   */
+  knowledgeSummary?: string;
   activeProjects: Array<{
     id: string;
     name: string;
@@ -560,6 +586,13 @@ export interface ClaudeRunnerConfig {
   studioId?: string;
   /** When true, bypass sandbox restrictions (e.g., Codex --dangerously-bypass-approvals-and-sandbox). Opt-in per studio. */
   sandboxBypass?: boolean;
+  /**
+   * Set by a runner when it has already prefixed this turn's message with the
+   * constitution. Surfaces to the child as INK_CONSTITUTION_INJECTED=1 so the
+   * session-start hook skips its own copy instead of duplicating ~9k tokens.
+   * Only ever true on a fresh spawn — a resume carries the original in history.
+   */
+  constitutionInjected?: boolean;
   /**
    * Continuation-loop turn cap for InkRunner spawns. Counts OUTER
    * conversational turns — the delivered message plus continuation prompts

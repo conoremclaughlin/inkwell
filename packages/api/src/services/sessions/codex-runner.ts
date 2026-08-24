@@ -70,7 +70,9 @@ export class CodexRunner implements IRunner {
     const isResume = !!backendSessionId;
 
     let fullMessage = message;
+    let runConfig = config;
     if (injectedContext && !isResume) {
+      runConfig = { ...config, constitutionInjected: true };
       const contextBlock = formatInjectedContext(injectedContext);
       fullMessage = `${contextBlock}\n\n---\n\n${message}`;
     }
@@ -99,7 +101,7 @@ export class CodexRunner implements IRunner {
         hasPcpAccessToken: !!config.pcpAccessToken,
       });
 
-      const result = await this.spawnProcess(args, config);
+      const result = await this.spawnProcess(args, runConfig);
 
       // Only return a backend session ID if we actually extracted one from
       // the Codex event stream, or if we were resuming an existing session.
@@ -227,6 +229,9 @@ export class CodexRunner implements IRunner {
         HOME: process.env.HOME || '',
         PATH: buildSpawnPath(codexBin),
         ...(config.agentId ? { AGENT_ID: config.agentId } : {}),
+        // Tells the session-start hook the constitution is already in the
+        // prompt, so it does not inject a second copy.
+        ...(config.constitutionInjected ? { INK_CONSTITUTION_INJECTED: '1' } : {}),
         ...buildSessionEnv({
           pcpSessionId: config.pcpSessionId,
           runtimeLinkId: config.pcpSessionId ? runtimeLinkId : undefined,
