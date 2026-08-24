@@ -216,6 +216,8 @@ type ChatOptions = {
   dynamic?: boolean;
   approvalMode?: string;
   away?: boolean;
+  sessionCandidates?: boolean;
+  sessionCandidatesJson?: boolean;
 };
 
 interface InboxMessage {
@@ -311,9 +313,11 @@ interface SessionSummary {
   studioId?: string;
   studioName?: string;
   status?: string;
+  lifecycle?: string;
   currentPhase?: string;
   threadKey?: string;
   startedAt?: string;
+  endedAt?: string;
   backend?: string;
   provider?: string;
   model?: string;
@@ -1508,9 +1512,32 @@ function extractSessionSummaries(
             : typeof row.claude_session_id === 'string'
               ? row.claude_session_id
               : undefined,
+        lifecycle: typeof row.lifecycle === 'string' ? row.lifecycle : undefined,
+        endedAt:
+          typeof row.endedAt === 'string'
+            ? row.endedAt
+            : typeof row.ended_at === 'string'
+              ? row.ended_at
+              : undefined,
       };
     })
     .filter((session): session is SessionSummary => Boolean(session));
+}
+
+/**
+ * Whether a session is worth offering in an attach/picker flow.
+ *
+ * A crashed backend (lifecycle 'failed') is prime attach material — that
+ * session is exactly the one its agent keeps resuming after an outage — so
+ * callers list WITHOUT the server-side status filter ('active' groups
+ * 'failed' with the terminal lifecycles, which is right for trigger routing
+ * and wrong here) and apply this instead. Only sessions that actually
+ * finished are excluded.
+ */
+export function isAttachableSessionSummary(session: SessionSummary): boolean {
+  if (session.endedAt) return false;
+  if (session.lifecycle === 'completed') return false;
+  return session.status !== 'completed';
 }
 
 function extractActivitySummaries(
@@ -3008,6 +3035,61 @@ export async function runChat(options: ChatOptions): Promise<void> {
     }
   }
 
+  // --session-candidates / --session-candidates-json: list what the session
+  // picker would offer and exit. Handled before any identity/bootstrap output
+  // so the JSON stays machine-parseable, and before the TUI so a TTY-less
+  // invocation exits instead of blocking on stdin forever.
+  if (options.sessionCandidates || options.sessionCandidatesJson) {
+    const sessionsResult = (await pcp
+      .callTool('list_sessions', { agentId, backend: 'ink', limit: 50 })
+      .catch(() => null)) as Record<string, unknown> | null;
+    const attachable = extractSessionSummaries(sessionsResult).filter(isAttachableSessionSummary);
+    const sessions = filterSessionsByPolicy(attachable, runtime, agentId, toolPolicy, 'attach');
+    const candidates = sessions.map((session) => ({
+      type: 'pcp' as const,
+      id: session.id,
+      agentId: session.agentId || null,
+      backend: session.backend || 'ink',
+      phase: session.currentPhase || session.status || null,
+      lifecycle: session.lifecycle || null,
+      threadKey: session.threadKey || null,
+      studioName: session.studioName || null,
+      startedAt: session.startedAt || null,
+    }));
+    if (options.sessionCandidatesJson) {
+      console.log(
+        JSON.stringify(
+          {
+            backend: 'ink',
+            agentId,
+            pcpAvailable: sessionsResult !== null,
+            counts: { pcp: candidates.length },
+            candidates: [{ type: 'new' as const }, ...candidates],
+          },
+          null,
+          2
+        )
+      );
+    } else {
+      console.log(chalk.bold(`\nInk session candidates for ${agentId}:`));
+      console.log(chalk.dim('  new — start a new session'));
+      for (const candidate of candidates) {
+        const bits = [
+          candidate.id.slice(0, 8),
+          candidate.agentId || '-',
+          candidate.phase || '-',
+          candidate.threadKey || '-',
+          candidate.studioName || '-',
+        ];
+        console.log(`  ${bits.join('  ·  ')}`);
+      }
+      if (candidates.length === 0) {
+        console.log(chalk.dim('  (no attachable ink sessions)'));
+      }
+    }
+    return;
+  }
+
   const useInk = runtime.uiMode === 'live' && Boolean(output.isTTY);
   const statusLane = new LiveStatusLane(!useInk && Boolean(output.isTTY), runtime.userTimezone);
   // Build the info items used by both Ink and legacy dock
@@ -3543,7 +3625,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       typeof options.attachLatest === 'string' ? options.attachLatest.trim() : undefined;
     const query = attachLatestQuery || attachQuery;
     const sessionsResult = (await pcp
-      .callTool('list_sessions', { agentId, status: 'active', limit: 30 })
+      .callTool('list_sessions', { agentId, limit: 50 })
       .catch((error) => ({ error: String(error) }))) as Record<string, unknown>;
 
     if ((sessionsResult as Record<string, unknown>).error) {
@@ -3557,7 +3639,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       );
     } else {
       const sessions = filterSessionsByPolicy(
-        extractSessionSummaries(sessionsResult),
+        extractSessionSummaries(sessionsResult).filter(isAttachableSessionSummary),
         runtime,
         agentId,
         toolPolicy,
@@ -3600,10 +3682,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
     !runtime.threadKey
   ) {
     const sessionsResult = (await pcp
-      .callTool('list_sessions', { agentId, status: 'active', backend: 'ink', limit: 30 })
+      .callTool('list_sessions', { agentId, backend: 'ink', limit: 50 })
       .catch(() => null)) as Record<string, unknown> | null;
     const sessions = filterSessionsByPolicy(
-      extractSessionSummaries(sessionsResult),
+      extractSessionSummaries(sessionsResult).filter(isAttachableSessionSummary),
       runtime,
       agentId,
       toolPolicy,
@@ -8406,6 +8488,8 @@ export function registerChatCommand(program: Command): void {
       .option('--profile <name>', 'Apply security profile: minimal|safe|collaborative|full')
       .option('--away', 'Start with away mode on (route tool approvals to inbox for 2FA)')
       .option('--auto-run', 'Automatically execute backend turns for new inbox task messages')
+      .option('--session-candidates', 'List attachable ink sessions and exit')
+      .option('--session-candidates-json', 'Output attachable ink sessions as JSON (testing/debug)')
       .option('--message <text>', 'Single-turn message for non-interactive mode')
       .option(
         '--attach-file <path>',

@@ -255,6 +255,8 @@ program
         message: prompt || undefined,
         sbDebug: resolvedOptions.sbDebug || undefined,
         verbose: resolvedOptions.verbose || undefined,
+        sessionCandidates: resolvedOptions.sessionCandidates || undefined,
+        sessionCandidatesJson: resolvedOptions.sessionCandidatesJson || undefined,
       });
       return;
     }
