@@ -16,6 +16,13 @@
 -- Deliberate consequence: last_healthy_at can no longer be cleared or backdated
 -- by an ordinary write. That is the point. Clearing it requires disabling this
 -- trigger explicitly.
+--
+-- The healthy branch therefore stamps now() unconditionally rather than
+-- COALESCE-ing a caller-supplied value. "Healthy" is a claim about the present;
+-- a writer that supplies its own timestamp is either restating now() or
+-- backdating, and COALESCE silently accepted the second — a direct write of
+-- ('healthy', '2000-01-01') moved the column backwards, which is precisely the
+-- erasure this trigger exists to prevent, arriving through the other door.
 
 CREATE OR REPLACE FUNCTION public.integration_health_retain_last_healthy_at()
 RETURNS TRIGGER
@@ -23,7 +30,7 @@ LANGUAGE plpgsql
 AS $$
 BEGIN
   IF NEW.status = 'healthy' THEN
-    NEW.last_healthy_at := COALESCE(NEW.last_healthy_at, now());
+    NEW.last_healthy_at := now();
   ELSIF TG_OP = 'UPDATE' THEN
     NEW.last_healthy_at := OLD.last_healthy_at;
   ELSE

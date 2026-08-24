@@ -126,6 +126,27 @@ describe('integration_health last_healthy_at retention', () => {
     expect(row?.last_healthy_at).toBe(advanced);
   });
 
+  it('cannot be backdated by a healthy write', async () => {
+    // COALESCE let a caller supply its own timestamp on the healthy branch, so
+    // ('healthy', '2000-01-01') walked the column backwards — the same erasure
+    // arriving through the other door (Lumen, PR #505 round 2).
+    await report('healthy');
+    const stamped = (await storedRow())!.last_healthy_at!;
+
+    await dataComposer
+      .getClient()
+      .from('integration_health')
+      .update({ status: 'healthy', last_healthy_at: '2000-01-01T00:00:00Z' })
+      .eq('user_id', userId)
+      .eq('service', SERVICE);
+
+    const row = await storedRow();
+    expect(new Date(row!.last_healthy_at!).getTime()).toBeGreaterThanOrEqual(
+      new Date(stamped).getTime()
+    );
+    expect(new Date(row!.last_healthy_at!).getFullYear()).toBe(2026);
+  });
+
   it('cannot be erased by writing null directly', async () => {
     await report('healthy');
     const stamped = (await storedRow())!.last_healthy_at;
