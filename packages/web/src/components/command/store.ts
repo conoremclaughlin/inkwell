@@ -141,6 +141,9 @@ interface CommandStore {
   tasksMeta: FeedMeta | null;
   setTasksMeta: (meta: FeedMeta | null) => void;
 
+  groupsMeta: FeedMeta | null;
+  setGroupsMeta: (meta: FeedMeta | null) => void;
+
   activity: ActivityEvent[];
   addActivity: (event: ActivityEvent) => void;
   setActivity: (events: ActivityEvent[]) => void;
@@ -178,6 +181,9 @@ export const useCommandStore = create<CommandStore>((set) => ({
 
   tasksMeta: null,
   setTasksMeta: (meta) => set({ tasksMeta: meta }),
+
+  groupsMeta: null,
+  setGroupsMeta: (meta) => set({ groupsMeta: meta }),
 
   activity: [],
   addActivity: (event) => set((s) => ({ activity: [event, ...s.activity].slice(0, 100) })),

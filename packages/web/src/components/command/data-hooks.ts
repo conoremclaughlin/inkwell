@@ -105,6 +105,7 @@ interface TasksResponse {
 // as `taskGroups`, so the map silently never resolved group titles.
 interface TaskGroupsResponse {
   groups: TaskGroupItem[];
+  meta?: FeedMetaResponse;
 }
 
 // ─── Layout helpers ───
@@ -155,6 +156,7 @@ export function useCommandData() {
   const setStudios = useCommandStore((s) => s.setStudios);
   const setTasks = useCommandStore((s) => s.setTasks);
   const setTasksMeta = useCommandStore((s) => s.setTasksMeta);
+  const setGroupsMeta = useCommandStore((s) => s.setGroupsMeta);
   const setActivity = useCommandStore((s) => s.setActivity);
 
   const { data: studiosData } = useApiQuery<StudiosResponse>(
@@ -294,6 +296,14 @@ export function useCommandData() {
     setTasks(taskNodes);
     setTasksMeta(tasksData.meta ?? null);
   }, [tasksData, groupsData, setTasks, setTasksMeta]);
+
+  // A truncated group feed silently loses titles, models, and phases for
+  // tasks past the cap — surfaced separately from task truncation because
+  // either feed can overflow while the other is fine.
+  useEffect(() => {
+    if (!groupsData) return;
+    setGroupsMeta(groupsData.meta ?? null);
+  }, [groupsData, setGroupsMeta]);
 
   // Transform activity events
   useEffect(() => {

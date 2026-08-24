@@ -14,7 +14,7 @@ import {
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import { useCommandStore } from './store';
-import type { TaskNode as TaskNodeData } from './store';
+import type { TaskNode as TaskNodeData, FeedMeta } from './store';
 import { getSkin } from './skins';
 import type { SkinConfig } from './skins';
 
@@ -511,12 +511,37 @@ export function buildGroupFlow(
   return { nodes: n, edges: e, listTasks: null };
 }
 
+// ─── Feed-completeness warnings ───
+
+/**
+ * One warning line per truncated feed. Either feed can overflow while the
+ * other is fine, and each lies differently: a capped task feed hides work
+ * (and treats omitted blockers as satisfied), a capped group feed strips
+ * titles/model/phase from tasks past the cap — which also suppresses their
+ * READY verdicts, so the safe direction, but still a partial picture.
+ */
+export function feedWarnings(tasksMeta: FeedMeta | null, groupsMeta: FeedMeta | null): string[] {
+  const warnings: string[] = [];
+  if (tasksMeta?.truncated) {
+    warnings.push(
+      `⚠ showing ${tasksMeta.fetched} of ${tasksMeta.total} active tasks — oldest omitted; counts and readiness may be incomplete`
+    );
+  }
+  if (groupsMeta?.truncated) {
+    warnings.push(
+      `⚠ showing ${groupsMeta.fetched} of ${groupsMeta.total} task groups — tasks in older groups lose their title, model, and readiness`
+    );
+  }
+  return warnings;
+}
+
 // ─── Task Graph Component ───
 
 export function TaskGraph() {
   const skin = getSkin(useCommandStore((s) => s.skin));
   const tasks = useCommandStore((s) => s.tasks);
   const tasksMeta = useCommandStore((s) => s.tasksMeta);
+  const groupsMeta = useCommandStore((s) => s.groupsMeta);
   const selectedTaskGroup = useCommandStore((s) => s.selectedTaskGroup);
   const selectTaskGroup = useCommandStore((s) => s.selectTaskGroup);
 
@@ -573,8 +598,9 @@ export function TaskGraph() {
         >
           Task Groups ({groupList.length})
         </div>
-        {tasksMeta?.truncated && (
+        {feedWarnings(tasksMeta, groupsMeta).map((warning) => (
           <div
+            key={warning}
             className="mx-3 mb-2 px-2 py-1 rounded text-[10px]"
             style={{
               backgroundColor: skin.colors.taskBlocked + '18',
@@ -582,10 +608,9 @@ export function TaskGraph() {
               fontFamily: skin.fonts.mono,
             }}
           >
-            ⚠ showing {tasksMeta.fetched} of {tasksMeta.total} active tasks — oldest omitted; counts
-            and readiness may be incomplete
+            {warning}
           </div>
-        )}
+        ))}
         {groupList.map((g) => {
           const selected = g.id === activeGroupId;
           return (

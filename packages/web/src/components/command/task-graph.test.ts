@@ -342,3 +342,33 @@ describe('buildGroupFlow', () => {
     expect(flow.edges.map((e) => e.id).sort()).toEqual(['e-dep-in-1-in-2', 'e-group-g1-task-in-1']);
   });
 });
+
+// ─── feedWarnings ───
+
+import { feedWarnings } from './task-graph';
+
+describe('feedWarnings', () => {
+  const full = { fetched: 100, total: 100, truncated: false };
+  const cut = { fetched: 100, total: 250, truncated: true };
+
+  it('is silent when both feeds are complete (or unknown)', () => {
+    expect(feedWarnings(full, full)).toEqual([]);
+    expect(feedWarnings(null, null)).toEqual([]);
+  });
+
+  it('warns for a truncated TASK feed alone', () => {
+    const warnings = feedWarnings(cut, full);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('100 of 250 active tasks');
+  });
+
+  it('warns for a truncated GROUP feed alone — the task banner must not stay hidden', () => {
+    const warnings = feedWarnings(full, cut);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('100 of 250 task groups');
+  });
+
+  it('warns for both feeds independently when both overflow', () => {
+    expect(feedWarnings(cut, cut)).toHaveLength(2);
+  });
+});
