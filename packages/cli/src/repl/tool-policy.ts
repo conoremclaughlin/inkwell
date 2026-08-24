@@ -49,6 +49,16 @@ export interface ToolPolicyDecision {
   allowed: boolean;
   reason: string;
   promptable?: boolean;
+  /**
+   * True when the `allowed` verdict was bought with a one-use grant.
+   *
+   * Set only by the inspecting (non-consuming) path — `canCallPcpTool` has
+   * already spent the grant by the time it returns, so there is nothing left to
+   * warn a caller about. `inspectPcpTool` DID NOT spend it, so a caller that
+   * acts on an `allowed: true` carrying this flag must understand that the same
+   * verdict will not repeat for free.
+   */
+  wouldConsumeGrant?: boolean;
 }
 
 export interface SessionAccessQuery {
@@ -626,7 +636,18 @@ export class ToolPolicyState {
     return undefined;
   }
 
-  private consumeScopedGrant(tool: string): {
+  /**
+   * Find the innermost scope holding a one-use grant for `tool`.
+   *
+   * `consume: false` answers "would a grant be spent here?" without spending
+   * one. That distinction is load-bearing for shadow clones: a coordinator that
+   * merely *asks* whether a queued call is still authorized must not burn the
+   * parent's grant on behalf of a clone that may never run.
+   */
+  private resolveScopedGrant(
+    tool: string,
+    consume: boolean
+  ): {
     consumed: boolean;
     remaining: number;
     scopeLabel?: string;
@@ -636,9 +657,11 @@ export class ToolPolicyState {
       const current = rules.grants.get(tool) || 0;
       if (current <= 0) continue;
       const next = current - 1;
-      if (next <= 0) rules.grants.delete(tool);
-      else rules.grants.set(tool, next);
-      this.saveToDisk();
+      if (consume) {
+        if (next <= 0) rules.grants.delete(tool);
+        else rules.grants.set(tool, next);
+        this.saveToDisk();
+      }
       return {
         consumed: true,
         remaining: next,
@@ -648,22 +671,46 @@ export class ToolPolicyState {
     return { consumed: false, remaining: 0 };
   }
 
-  private hasSessionGrant(sessionId: string | undefined, tool: string): boolean {
-    if (!sessionId) return false;
+  private consumeScopedGrant(tool: string): {
+    consumed: boolean;
+    remaining: number;
+    scopeLabel?: string;
+  } {
+    return this.resolveScopedGrant(tool, true);
+  }
+
+  /**
+   * Session grants come in two flavours, and only one of them is spent by use:
+   * an `Infinity` grant ("allow for this session") is a standing permission,
+   * while a finite one is a countdown. Callers that only want to look need to
+   * know which they are holding, hence the tri-state rather than a boolean.
+   */
+  private resolveSessionGrant(
+    sessionId: string | undefined,
+    tool: string,
+    consume: boolean
+  ): 'none' | 'unlimited' | 'finite' {
+    if (!sessionId) return 'none';
     const sid = sessionId.trim();
-    if (!sid) return false;
+    if (!sid) return 'none';
 
     const grants = this.sessionGrants.get(sid);
-    if (!grants) return false;
+    if (!grants) return 'none';
     const uses = grants.get(tool);
-    if (uses === undefined) return false;
+    if (uses === undefined) return 'none';
 
-    if (!Number.isFinite(uses)) return true;
+    if (!Number.isFinite(uses)) return 'unlimited';
+    if (!consume) return 'finite';
+
     const next = uses - 1;
     if (next <= 0) grants.delete(tool);
     else grants.set(tool, next);
 
-    return true;
+    return 'finite';
+  }
+
+  private hasSessionGrant(sessionId: string | undefined, tool: string): boolean {
+    return this.resolveSessionGrant(sessionId, tool, true) !== 'none';
   }
 
   private resolveEffectiveMode(): ToolMode {
@@ -1199,7 +1246,34 @@ export class ToolPolicyState {
       .sort((a, b) => a.tool.localeCompare(b.tool));
   }
 
+  /**
+   * Decide whether a PCP tool call may proceed, SPENDING any one-use grant that
+   * makes it possible. Call this exactly once per actual call — it is the
+   * authorization, not a query about one.
+   */
   public canCallPcpTool(tool: string, sessionId?: string): ToolPolicyDecision {
+    return this.evaluatePcpTool(tool, sessionId, true);
+  }
+
+  /**
+   * The same decision, without spending anything.
+   *
+   * `canCallPcpTool` reads like a query but mutates: it decrements session
+   * grants and scoped one-use grants, and persists the latter to disk. Anything
+   * that wants to *look* — an approval coordinator re-checking a queued request
+   * after a sibling's decision changed policy, a clone envelope computing what
+   * it may pass through, a status display — must use this instead, or it will
+   * silently burn the user's grants on calls that never happen.
+   */
+  public inspectPcpTool(tool: string, sessionId?: string): ToolPolicyDecision {
+    return this.evaluatePcpTool(tool, sessionId, false);
+  }
+
+  private evaluatePcpTool(
+    tool: string,
+    sessionId: string | undefined,
+    consume: boolean
+  ): ToolPolicyDecision {
     const key = normalizeToolName(tool);
     if (!key) {
       return { allowed: false, reason: 'Invalid tool name.', promptable: false };
@@ -1213,17 +1287,31 @@ export class ToolPolicyState {
       return { allowed: true, reason: 'Tool mode is privileged.' };
     }
 
-    if (this.hasSessionGrant(sessionId, key)) {
-      return { allowed: true, reason: 'Tool is granted for this PCP session.' };
-    }
-
-    const scopedGrant = this.consumeScopedGrant(key);
-    if (scopedGrant.consumed) {
-      const suffix = scopedGrant.scopeLabel ? ` in ${scopedGrant.scopeLabel}` : '';
+    const sessionGrant = this.resolveSessionGrant(sessionId, key, consume);
+    if (sessionGrant !== 'none') {
       return {
         allowed: true,
-        reason: `One-time grant consumed${suffix} (${scopedGrant.remaining} remaining).`,
+        reason: 'Tool is granted for this PCP session.',
+        // A session-wide grant is standing permission and costs nothing to use;
+        // only a finite one is spent, and only the inspecting path still owes
+        // the caller that warning.
+        ...(!consume && sessionGrant === 'finite' ? { wouldConsumeGrant: true } : {}),
       };
+    }
+
+    const scopedGrant = this.resolveScopedGrant(key, consume);
+    if (scopedGrant.consumed) {
+      const suffix = scopedGrant.scopeLabel ? ` in ${scopedGrant.scopeLabel}` : '';
+      return consume
+        ? {
+            allowed: true,
+            reason: `One-time grant consumed${suffix} (${scopedGrant.remaining} remaining).`,
+          }
+        : {
+            allowed: true,
+            reason: `One-time grant available${suffix} (${scopedGrant.remaining} would remain).`,
+            wouldConsumeGrant: true,
+          };
     }
 
     if (this.matchesAnyPromptTool(key)) {

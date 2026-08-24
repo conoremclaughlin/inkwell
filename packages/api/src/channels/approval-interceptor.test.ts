@@ -42,6 +42,14 @@ interface SupabaseMockState {
   updateResult: { data: unknown; error: unknown };
   updateEqChain: Array<{ column: string; value: unknown }>;
   updateCalledWith: Record<string, unknown> | null;
+  /**
+   * Every update, paired with the row it targeted.
+   *
+   * `updateCalledWith` keeps only the last one, so a batch write that put the
+   * SAME payload on every row would pass a single-value assertion. Batches are
+   * exactly where per-row correctness matters.
+   */
+  updates: Array<{ id: unknown; updates: Record<string, unknown> }>;
   trustedUsersResult: { data: Array<{ platform: string; platform_user_id: string }> | null };
   selectCalls: number;
 }
@@ -69,6 +77,7 @@ function createSupabaseMock(state: SupabaseMockState) {
           return {
             eq: vi.fn().mockImplementation((col: string, val: unknown) => {
               state.updateEqChain.push({ column: col, value: val });
+              if (col === 'id') state.updates.push({ id: val, updates });
               return {
                 eq: vi.fn().mockImplementation((col2: string, val2: unknown) => {
                   state.updateEqChain.push({ column: col2, value: val2 });
@@ -100,6 +109,7 @@ function makeState(overrides: Partial<SupabaseMockState> = {}): SupabaseMockStat
     updateResult: { data: null, error: null },
     updateEqChain: [],
     updateCalledWith: null,
+    updates: [],
     trustedUsersResult: { data: [] },
     selectCalls: 0,
     ...overrides,
@@ -116,7 +126,12 @@ vi.mock('@supabase/supabase-js', () => ({
 }));
 
 // Import after mocks are set up
-import { checkApprovalResponse, notifyPlatformOfApprovalRequest } from './approval-interceptor';
+import {
+  checkApprovalResponse,
+  formatBatchNotification,
+  formatSingleNotification,
+  notifyPlatformOfApprovalRequest,
+} from './approval-interceptor';
 
 const USER_ID = 'user-123';
 const PLATFORM_ID = 'telegram:chat-999';
@@ -540,6 +555,105 @@ describe('notifyPlatformOfApprovalRequest', () => {
     vi.unstubAllGlobals();
   });
 
+  it('preserves the clone origin through the metadata write-back', async () => {
+    // The write-back REPLACES the metadata object, so the origin recorded at
+    // insert is erased unless it is carried forward — and the audit trail is
+    // the one place that has to know which clone asked.
+    vi.useFakeTimers();
+    currentState = makeState({
+      trustedUsersResult: {
+        data: [{ platform: 'telegram', platform_user_id: 'chat-999' }],
+      },
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({ ok: true, json: async () => ({ result: { message_id: 42 } }) })
+    );
+
+    await notifyPlatformOfApprovalRequest({
+      ...baseRequest,
+      origin: { origin: 'clone', cloneId: 'clone-2', cloneLabel: 'audit auth paths' },
+    });
+    await vi.advanceTimersByTimeAsync(2500);
+
+    expect(currentState.updateCalledWith?.metadata).toMatchObject({
+      origin: { origin: 'clone', cloneId: 'clone-2', cloneLabel: 'audit auth paths' },
+      telegramMessageId: 42,
+      platform: 'telegram',
+    });
+
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it('preserves each clone origin across a batched metadata write-back', async () => {
+    vi.useFakeTimers();
+    currentState = makeState({
+      trustedUsersResult: {
+        data: [{ platform: 'telegram', platform_user_id: 'chat-999' }],
+      },
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({ ok: true, json: async () => ({ result: { message_id: 77 } }) })
+    );
+
+    // Two requests inside the debounce window batch into one notification, and
+    // each row's write-back must keep ITS own origin rather than the last one.
+    await notifyPlatformOfApprovalRequest({
+      ...baseRequest,
+      id: 'req-a',
+      origin: { origin: 'clone', cloneId: 'clone-1', cloneLabel: 'auth' },
+    });
+    await notifyPlatformOfApprovalRequest({
+      ...baseRequest,
+      id: 'req-b',
+      origin: { origin: 'clone', cloneId: 'clone-2', cloneLabel: 'coverage' },
+    });
+    await vi.advanceTimersByTimeAsync(2500);
+
+    // Assert BOTH rows, paired with their ids. Checking only the last update
+    // would pass if the loop wrote clone-2's origin onto every row — which is
+    // the shared-object bug a batch write is most likely to have.
+    const byId = new Map(currentState.updates.map((u) => [u.id, u.updates]));
+    expect(byId.get('req-a')?.metadata).toMatchObject({
+      origin: { origin: 'clone', cloneId: 'clone-1', cloneLabel: 'auth' },
+      batchMessageId: 77,
+      batchIndex: 0,
+    });
+    expect(byId.get('req-b')?.metadata).toMatchObject({
+      origin: { origin: 'clone', cloneId: 'clone-2', cloneLabel: 'coverage' },
+      batchMessageId: 77,
+      batchIndex: 1,
+    });
+
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it('omits origin entirely for a parent request', async () => {
+    vi.useFakeTimers();
+    currentState = makeState({
+      trustedUsersResult: {
+        data: [{ platform: 'telegram', platform_user_id: 'chat-999' }],
+      },
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({ ok: true, json: async () => ({ result: { message_id: 9 } }) })
+    );
+
+    await notifyPlatformOfApprovalRequest(baseRequest);
+    await vi.advanceTimersByTimeAsync(2500);
+
+    // Absent rather than null: parent rows should read exactly as they did
+    // before clones existed.
+    expect(currentState.updateCalledWith?.metadata).not.toHaveProperty('origin');
+
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
   it('does not write metadata when Telegram send fails (non-OK response)', async () => {
     currentState = makeState({
       trustedUsersResult: {
@@ -589,5 +703,118 @@ describe('notifyPlatformOfApprovalRequest', () => {
     await expect(notifyPlatformOfApprovalRequest(baseRequest)).resolves.toBeUndefined();
 
     vi.unstubAllGlobals();
+  });
+});
+
+describe('approval notifications — shadow clone origin', () => {
+  const base = {
+    id: 'req-1',
+    userId: 'user-1',
+    tool: 'save_link',
+    args: null,
+    reason: 'Tool requires approval.',
+    requestingAgentId: 'wren',
+    studioId: null,
+    sessionId: null,
+    expiresAt: new Date(Date.now() + 300_000).toISOString(),
+  };
+
+  it('names the parent when no clone is involved', () => {
+    expect(formatSingleNotification({ ...base })).toContain('from wren');
+  });
+
+  it('names the clone that asked, not just its parent', () => {
+    // A clone carries its parent's identity, so requestingAgentId alone reads
+    // as the parent asking. Away mode means approving a call whose context the
+    // user cannot see — which clone wants it is the whole judgement.
+    const msg = formatSingleNotification({
+      ...base,
+      origin: { origin: 'clone', cloneId: 'clone-2', cloneLabel: 'audit auth paths' },
+    });
+    expect(msg).toContain('wren');
+    expect(msg).toContain('audit auth paths');
+  });
+
+  it('falls back to the clone id when it has no label', () => {
+    const msg = formatSingleNotification({
+      ...base,
+      origin: { origin: 'clone', cloneId: 'clone-2' },
+    });
+    expect(msg).toContain('clone-2');
+  });
+
+  it('ignores a parent-origin marker', () => {
+    const msg = formatSingleNotification({ ...base, origin: { origin: 'parent' } });
+    expect(msg).toContain('from wren');
+    expect(msg).not.toContain('🌀');
+  });
+
+  it('distinguishes concurrent clones in a batched notification', () => {
+    // Three clones batched under one identity would otherwise read as one
+    // agent asking three times.
+    const msg = formatBatchNotification([
+      { ...base, id: 'r1', origin: { origin: 'clone', cloneId: 'clone-1', cloneLabel: 'auth' } },
+      {
+        ...base,
+        id: 'r2',
+        origin: { origin: 'clone', cloneId: 'clone-2', cloneLabel: 'coverage' },
+      },
+    ]);
+    expect(msg).toContain('auth');
+    expect(msg).toContain('coverage');
+    expect(msg).toContain('2 permission requests');
+  });
+});
+
+describe('approval notifications — batch clone mapping', () => {
+  const base = {
+    id: 'req-1',
+    userId: 'user-1',
+    tool: 'save_link',
+    args: null,
+    reason: null,
+    requestingAgentId: 'wren',
+    studioId: null,
+    sessionId: null,
+    expiresAt: new Date(Date.now() + 300_000).toISOString(),
+  };
+
+  it('maps each numbered row to the clone that asked', () => {
+    // Replies are per-number ("approve 1,3"), so a header listing every clone
+    // is not enough — the user has to know which number is which clone.
+    const msg = formatBatchNotification([
+      {
+        ...base,
+        id: 'r1',
+        tool: 'save_link',
+        origin: { origin: 'clone', cloneId: 'clone-1', cloneLabel: 'auth audit' },
+      },
+      {
+        ...base,
+        id: 'r2',
+        tool: 'create_task',
+        origin: { origin: 'clone', cloneId: 'clone-2', cloneLabel: 'coverage map' },
+      },
+    ]);
+
+    const lines = msg.split('\n');
+    const first = lines.find((l) => l.startsWith('1.'));
+    const second = lines.find((l) => l.startsWith('2.'));
+    expect(first).toContain('save_link');
+    expect(first).toContain('auth audit');
+    expect(first).not.toContain('coverage map');
+    expect(second).toContain('create_task');
+    expect(second).toContain('coverage map');
+    expect(second).not.toContain('auth audit');
+  });
+
+  it('leaves rows unadorned when everything came from the same requester', () => {
+    const msg = formatBatchNotification([
+      { ...base, id: 'r1', tool: 'save_link' },
+      { ...base, id: 'r2', tool: 'create_task' },
+    ]);
+    const first = msg.split('\n').find((l) => l.startsWith('1.'));
+    // No per-row attribution to read past when there is nothing to distinguish.
+    expect(first).toBe('1. `save_link`');
   });
 });

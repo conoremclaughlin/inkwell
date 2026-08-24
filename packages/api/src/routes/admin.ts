@@ -7395,6 +7395,31 @@ router.post('/contacts/resolve', async (req: Request, res: Response) => {
  * The server generates the request ID, sends to connected platforms, and returns
  * the ID for polling.
  */
+/**
+ * Accept a clone origin only in the shape we publish.
+ *
+ * The body is agent-supplied, so this keeps a malformed or oversized field from
+ * reaching storage and the notification formatter; anything unrecognised
+ * degrades to "the parent asked", which is the pre-clone behaviour.
+ */
+function normalizeApprovalOrigin(
+  raw: unknown
+): { origin: 'clone'; cloneId?: string; cloneLabel?: string } | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const value = raw as Record<string, unknown>;
+  if (value.origin !== 'clone') return null;
+  const str = (v: unknown): string | undefined =>
+    typeof v === 'string' && v.trim() ? v.trim().slice(0, 120) : undefined;
+  const cloneId = str(value.cloneId);
+  const cloneLabel = str(value.cloneLabel);
+  if (!cloneId && !cloneLabel) return null;
+  return {
+    origin: 'clone',
+    ...(cloneId ? { cloneId } : {}),
+    ...(cloneLabel ? { cloneLabel } : {}),
+  };
+}
+
 router.post('/approval-requests', async (req: Request, res: Response) => {
   try {
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
@@ -7402,7 +7427,7 @@ router.post('/approval-requests', async (req: Request, res: Response) => {
     });
     const authReq = req as AdminAuthRequest;
 
-    const { tool, args, reason, studioId, sessionId, timeoutSeconds = 300 } = req.body;
+    const { tool, args, reason, studioId, sessionId, origin, timeoutSeconds = 300 } = req.body;
 
     if (!tool) {
       res.status(400).json({ error: 'tool is required' });
@@ -7410,6 +7435,7 @@ router.post('/approval-requests', async (req: Request, res: Response) => {
     }
 
     const expiresAt = new Date(Date.now() + timeoutSeconds * 1000).toISOString();
+    const cloneOrigin = normalizeApprovalOrigin(origin);
 
     // Resolve requesting agent from x-ink-context header (set by CLI hooks).
     // This is the sole trusted identity channel — agents cannot set it themselves.
@@ -7448,6 +7474,15 @@ router.post('/approval-requests', async (req: Request, res: Response) => {
         tool,
         args: args || null,
         reason: reason || null,
+        // Which clone asked, when one did. A clone carries its parent's
+        // identity, so requesting_agent_id alone cannot tell them apart — and
+        // the audit trail is the one place that has to.
+        //
+        // Stored under `metadata` rather than a dedicated column: the column
+        // exists for exactly this kind of optional annotation, and a migration
+        // for a field that is absent on most rows buys nothing. Omitted
+        // entirely for parent requests, so existing rows read unchanged.
+        ...(cloneOrigin ? { metadata: { origin: cloneOrigin } } : {}),
         timeout_seconds: timeoutSeconds,
         expires_at: expiresAt,
       })
@@ -7483,6 +7518,7 @@ router.post('/approval-requests', async (req: Request, res: Response) => {
       args,
       reason: req.body.reason,
       requestingAgentId,
+      origin: cloneOrigin,
       studioId,
       sessionId,
       expiresAt,

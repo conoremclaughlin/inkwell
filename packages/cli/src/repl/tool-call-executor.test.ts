@@ -32,7 +32,9 @@ describe('executeToolCalls', () => {
     expect(results).toHaveLength(1);
     expect(results[0].status).toBe('executed');
     expect(results[0].result).toEqual({ success: true });
-    expect(deps.callTool).toHaveBeenCalledWith('recall', { query: 'test' });
+    // The executor hands every dispatcher the cancellation context, so no
+    // call site can forget to capture it.
+    expect(deps.callTool).toHaveBeenCalledWith('recall', { query: 'test' }, { signal: undefined });
     expect(deps.promptForApproval).not.toHaveBeenCalled();
   });
 
@@ -77,7 +79,11 @@ describe('executeToolCalls', () => {
     expect(deps.promptForApproval).toHaveBeenCalledWith('send_to_inbox', 'Requires approval', {
       content: 'hi',
     });
-    expect(deps.callTool).toHaveBeenCalledWith('send_to_inbox', { content: 'hi' });
+    expect(deps.callTool).toHaveBeenCalledWith(
+      'send_to_inbox',
+      { content: 'hi' },
+      { signal: undefined }
+    );
   });
 
   it('reports denied when user rejects approval prompt', async () => {
