@@ -97,22 +97,33 @@ describe('integration_health last_healthy_at retention', () => {
     );
   });
 
-  it('does not let a concurrent failure report roll back a healthy stamp', async () => {
-    // The lost update the old read-then-write allowed: an unhealthy reporter
-    // read the old timestamp, a healthy reporter stamped a new one, and the
-    // unhealthy write put the old value back. Both writers now race against a
-    // single statement, so whichever lands last, the timestamp cannot regress.
+  it('does not let a late failure report roll back a newer healthy stamp', async () => {
+    // The lost update the old read-then-write allowed, replayed deterministically
+    // rather than raced: the unhealthy reporter reads the timestamp, a healthy
+    // reporter stamps a newer one, and then the unhealthy write lands still
+    // carrying the value it read. Ordering it explicitly means the assertion
+    // does not depend on which of two concurrent writes happens to win.
     await report('healthy');
-    const before = new Date((await storedRow())!.last_healthy_at!).getTime();
+    const readByTheFailureReporter = (await storedRow())!.last_healthy_at!;
 
     await new Promise((resolve) => setTimeout(resolve, 20));
-    await Promise.all([
-      report('healthy'),
-      report('error', { errorMessage: 'concurrent failure report' }),
-    ]);
+    await report('healthy');
+    const advanced = (await storedRow())!.last_healthy_at!;
+    expect(new Date(advanced).getTime()).toBeGreaterThan(
+      new Date(readByTheFailureReporter).getTime()
+    );
 
-    const after = new Date((await storedRow())!.last_healthy_at!).getTime();
-    expect(after).toBeGreaterThan(before);
+    // The write the old implementation would have issued.
+    await dataComposer
+      .getClient()
+      .from('integration_health')
+      .update({ status: 'error', last_healthy_at: readByTheFailureReporter })
+      .eq('user_id', userId)
+      .eq('service', SERVICE);
+
+    const row = await storedRow();
+    expect(row?.status).toBe('error');
+    expect(row?.last_healthy_at).toBe(advanced);
   });
 
   it('cannot be erased by writing null directly', async () => {
