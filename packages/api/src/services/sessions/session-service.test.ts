@@ -3903,9 +3903,10 @@ describe('SessionService', () => {
             return createFilterAwareChain(() => ({ data: { key_type: 'spec' } }), calls);
           }
           if (table === 'thread_key_types') {
-            // A presence override row for 'spec' — the DATA that makes this
-            // thread presence-typed (until 6e no TEMPLATE is presence, so an
-            // override row is the honest way to express it).
+            // A presence override row for 'spec'. Templates are presence for
+            // discussions as of 2026-08-24; the override fixture stays because
+            // this test pins that a USER override row feeds the gate the same
+            // way a template does.
             return createFilterAwareChain(
               () => ({
                 data: [
