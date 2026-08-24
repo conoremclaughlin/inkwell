@@ -419,21 +419,97 @@ export interface AgentLoopResult {
   stopReason: AgentLoopStopReason;
 }
 
+/**
+ * End of the JSON object/array that starts at (or after whitespace from)
+ * `from` — walked with a string/escape-aware depth counter. Needed because
+ * an ink-tool payload's strings can legally contain ``` (markdown artifact
+ * content), which breaks any first-``` fence regex.
+ */
+function scanJsonValueEnd(text: string, from: number): { start: number; end: number } | null {
+  let i = from;
+  while (i < text.length && /\s/.test(text[i]!)) i += 1;
+  const open = text[i];
+  if (open !== '{' && open !== '[') return null;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let j = i; j < text.length; j += 1) {
+    const ch = text[j]!;
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+    } else if (ch === '"') inString = true;
+    else if (ch === '{' || ch === '[') depth += 1;
+    else if (ch === '}' || ch === ']') {
+      depth -= 1;
+      if (depth === 0) return { start: i, end: j + 1 };
+    }
+  }
+  return null;
+}
+
+interface InkToolBlock {
+  /** Offset of the opening ``` in the response text. */
+  start: number;
+  /** Offset just past the closing ``` (or past the JSON when unfenced). */
+  end: number;
+  /** The payload between the fences (the JSON value when scanned). */
+  payload: string;
+}
+
+/**
+ * Locate every ```ink-tool block. The payload JSON is found by scanning the
+ * actual value, so ``` embedded in its strings does not truncate the block —
+ * a first-``` regex here both dropped the tool call (truncated JSON fails to
+ * parse) AND leaked the raw JSON tail into the rendered message (Myra's IRA
+ * spec, 2026-08-10). Fallbacks: a payload that isn't a JSON value keeps the
+ * legacy to-first-``` treatment; a scanned JSON with a missing closing fence
+ * is still accepted (executing beats leaking).
+ */
+export function findInkToolBlocks(text: string): InkToolBlock[] {
+  const blocks: InkToolBlock[] = [];
+  const openRe = /```ink-tool[ \t]*\r?\n?/gi;
+  let m: RegExpExecArray | null;
+  while ((m = openRe.exec(text))) {
+    const payloadStart = m.index + m[0].length;
+    const scanned = scanJsonValueEnd(text, payloadStart);
+    if (scanned) {
+      const closeMatch = /^[ \t\r\n]*```/.exec(text.slice(scanned.end));
+      const end = closeMatch ? scanned.end + closeMatch[0].length : scanned.end;
+      blocks.push({ start: m.index, end, payload: text.slice(scanned.start, scanned.end) });
+      openRe.lastIndex = end;
+      continue;
+    }
+    const closeIdx = text.indexOf('```', payloadStart);
+    if (closeIdx === -1) break;
+    blocks.push({
+      start: m.index,
+      end: closeIdx + 3,
+      payload: text.slice(payloadStart, closeIdx).trim(),
+    });
+    openRe.lastIndex = closeIdx + 3;
+  }
+  return blocks;
+}
+
 export function extractLocalToolCalls(responseText: string): LocalToolCall[] {
   const indexed: Array<{ index: number; call: LocalToolCall }> = [];
 
-  for (const match of responseText.matchAll(/```ink-tool\s*([\s\S]*?)```/gi)) {
-    const payload = (match[1] || '').trim();
-    if (!payload) continue;
+  for (const block of findInkToolBlocks(responseText)) {
+    if (!block.payload) continue;
     try {
-      const parsed = JSON.parse(payload) as Record<string, unknown>;
+      const parsed = JSON.parse(block.payload) as Record<string, unknown>;
       const tool = typeof parsed.tool === 'string' ? parsed.tool.trim() : '';
       if (!tool) continue;
       const args =
         parsed.args && typeof parsed.args === 'object' && !Array.isArray(parsed.args)
           ? (parsed.args as Record<string, unknown>)
           : {};
-      indexed.push({ index: match.index ?? 0, call: { tool, args, raw: match[0] || '' } });
+      indexed.push({
+        index: block.start,
+        call: { tool, args, raw: responseText.slice(block.start, block.end) },
+      });
     } catch {
       continue;
     }
@@ -476,10 +552,17 @@ export function extractLocalToolCalls(responseText: string): LocalToolCall[] {
 }
 
 export function stripLocalToolBlocks(responseText: string): string {
-  return responseText
-    .replace(/```ink-tool[\s\S]*?```/gi, '')
-    .replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, '')
-    .trim();
+  // Remove ink-tool blocks by the SAME scan the extractor uses — a regex
+  // here would disagree with extraction on payloads containing ``` and leak
+  // the JSON tail as visible text.
+  let out = '';
+  let cursor = 0;
+  for (const block of findInkToolBlocks(responseText)) {
+    out += responseText.slice(cursor, block.start);
+    cursor = block.end;
+  }
+  out += responseText.slice(cursor);
+  return out.replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, '').trim();
 }
 
 /**
