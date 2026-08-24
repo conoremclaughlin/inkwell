@@ -166,56 +166,69 @@ export class StudioOverflowService {
     const parentStudio = await this.resolveDurableAnchor(opts.parentStudio);
 
     const variants: Array<string | undefined> = [undefined, slugHash(threadKey)];
+
+    // Preflight EVERY variant before creating anything. The hash fallback
+    // must be STICKY: once a variant row exists for this (parent, threadKey),
+    // later calls have to find it even when an earlier variant has since
+    // become creatable — a legacy branch checkout forces the hash variant,
+    // the blocker later frees, and a sequential check-then-create would mint
+    // the primary alongside the live hash studio, splitting one thread across
+    // two studios (PR #537 round 1).
+    const states: Array<{
+      slug: string;
+      branchTail: string;
+      existing: Studio | null;
+      matches: boolean;
+    }> = [];
     for (const variant of variants) {
       const slug = overflowSlug(parentStudio, threadKey, variant);
       const branchTail = variant ? `${threadSlug(threadKey)}-h${variant}` : threadSlug(threadKey);
-
       const existing = await this.studios.findBySlug(userId, slug).catch(() => null);
-      if (existing && !this.matchesOverflow(existing, parentStudio, threadKey)) {
+      const matches = existing ? this.matchesOverflow(existing, parentStudio, threadKey) : false;
+      if (existing && !matches) {
         // Slug collision with an unrelated studio — never reuse or revive it.
         logger.warn('[StudioOverflow] Slug collides with an unrelated studio; disambiguating', {
           slug,
           threadKey,
           collidingStudioId: existing.id,
         });
-        continue;
       }
+      states.push({ slug, branchTail, existing, matches });
+    }
 
-      if (existing && (existing.status === 'active' || existing.status === 'idle')) {
-        const pathExists = await access(existing.worktreePath)
-          .then(() => true)
-          .catch(() => false);
-        if (pathExists) {
-          logger.info('[StudioOverflow] Reusing ephemeral studio for thread', {
-            threadKey,
-            studioId: existing.id,
-            slug,
-          });
-          return existing;
-        }
-        // Row survived but the worktree is gone — recreate in place. On
-        // failure, fall through to the hash variant: the usual cause is the
-        // `eph/` branch being checked out by another worktree (e.g. a legacy
-        // chained studio from before durable anchoring), and the variant's
-        // suffixed branch sidesteps it.
-        const revived = await this.createWorktree(parentStudio, slug, agentId, branchTail);
-        if (!revived) continue;
-        return this.studios.update(existing.id, {
-          status: 'active',
-          worktreePath: revived.worktreePath,
-          cleanedAt: null,
-          expiresAt: new Date(Date.now() + EPHEMERAL_STUDIO_TTL_MS).toISOString(),
+    // Step 1 — reuse: a live matching row on ANY variant wins outright.
+    for (const s of states) {
+      const { existing } = s;
+      if (!existing || !s.matches) continue;
+      if (existing.status !== 'active' && existing.status !== 'idle') continue;
+      const pathExists = await access(existing.worktreePath)
+        .then(() => true)
+        .catch(() => false);
+      if (pathExists) {
+        logger.info('[StudioOverflow] Reusing ephemeral studio for thread', {
+          threadKey,
+          studioId: existing.id,
+          slug: s.slug,
         });
+        return existing;
       }
+    }
 
-      // Same fallthrough as the revive path: a creation failure tries the
-      // hash variant (fresh slug AND fresh branch name) before giving up.
-      const created = await this.createWorktree(parentStudio, slug, agentId, branchTail);
+    // Step 2 — revive or create, in variant order. Slugs held by unrelated
+    // studios are skipped, and a worktree-creation failure falls through to
+    // the next variant (fresh slug AND fresh branch name): the usual cause
+    // is the `eph/` branch being checked out by another worktree, e.g. a
+    // legacy chained studio from before durable anchoring.
+    for (const s of states) {
+      const { existing } = s;
+      if (existing && !s.matches) continue;
+
+      const created = await this.createWorktree(parentStudio, s.slug, agentId, s.branchTail);
       if (!created) continue;
 
       if (existing) {
-        // A cleaned matching row already owns (worktree_path, agent_id) —
-        // revive it rather than colliding with the unique index on insert.
+        // A matching row whose worktree is missing or cleaned — revive it
+        // rather than colliding with the unique index on insert.
         const revived = await this.studios.update(existing.id, {
           status: 'active',
           worktreePath: created.worktreePath,
@@ -256,13 +269,17 @@ export class StudioOverflowService {
         logger.info('[StudioOverflow] Created ephemeral studio', {
           threadKey,
           studioId: studio.id,
-          slug,
+          slug: s.slug,
           worktreePath: created.worktreePath,
         });
         return studio;
       } catch (err) {
+        // An insert loss here usually means a concurrent ensure won the
+        // unique index — remove our worktree and fail THIS call rather than
+        // falling through to mint a variant beside the winner; the caller's
+        // retry converges on the winner via the reuse preflight.
         logger.error('[StudioOverflow] Studio row insert failed; removing worktree', {
-          slug,
+          slug: s.slug,
           error: err instanceof Error ? err.message : String(err),
         });
         await execFileAsync('git', ['worktree', 'remove', '--force', created.worktreePath], {

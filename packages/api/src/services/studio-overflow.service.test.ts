@@ -8,8 +8,24 @@
 
 import { describe, it, expect, vi } from 'vitest';
 import { mkdtemp, rm } from 'fs/promises';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 import { tmpdir } from 'os';
 import path from 'path';
+
+const execFileAsync = promisify(execFile);
+
+/** A real (tiny) git repo, for tests where worktree creation must SUCCEED. */
+async function makeGitRepo(): Promise<string> {
+  const dir = await mkdtemp(path.join(tmpdir(), 'overflow-repo-'));
+  await execFileAsync('git', ['init', '-b', 'main'], { cwd: dir });
+  await execFileAsync(
+    'git',
+    ['-c', 'user.email=test@test', '-c', 'user.name=test', 'commit', '--allow-empty', '-m', 'init'],
+    { cwd: dir }
+  );
+  return dir;
+}
 import {
   threadSlug,
   slugHash,
@@ -299,30 +315,116 @@ describe('StudioOverflowService.ensureOverflowStudio — durable anchoring', () 
   });
 
   // Transition hazard: legacy chained worktrees keep flat `eph/` branches
-  // checked out, so a post-fix flat mint can fail `git worktree add` on
+  // checked out, so a post-fix flat mint fails `git worktree add` on
   // `already used by worktree`. Creation failure must fall through to the
-  // hash variant (fresh slug AND fresh branch), not give up.
-  it('worktree-creation failure falls through to the hash variant', async () => {
-    const findBySlug = vi.fn().mockResolvedValue(null);
-    const studios = {
-      findById: vi.fn(),
-      findBySlug,
-      create: vi.fn(),
-      update: vi.fn(),
-    } as unknown as StudiosRepository;
-    const leases = { logEvent: vi.fn() } as unknown as StudioLeaseService;
+  // hash variant (fresh slug AND fresh branch), not give up. Real repo so
+  // the primary genuinely fails on the branch and the variant genuinely
+  // succeeds.
+  it('a branch held by a legacy worktree falls through to the hash variant', async () => {
+    const repoRoot = await makeGitRepo();
+    const blocker = path.join(path.dirname(repoRoot), `${path.basename(repoRoot)}--legacy-chain`);
+    const hashSlug = `lumen-review--pr-476-h${slugHash('pr:476')}`;
+    const hashWorktree = path.join(
+      path.dirname(repoRoot),
+      `${path.basename(repoRoot)}--${hashSlug}`
+    );
+    try {
+      // The legacy chained studio still has the flat eph/ branch checked out.
+      await execFileAsync('git', ['worktree', 'add', '-b', 'lumen/eph/pr-476', blocker, 'main'], {
+        cwd: repoRoot,
+      });
+      const createdInputs: Array<Record<string, unknown>> = [];
+      const studios = {
+        findById: vi.fn(),
+        findBySlug: vi.fn().mockResolvedValue(null),
+        create: vi.fn().mockImplementation((input: Record<string, unknown>) => {
+          createdInputs.push(input);
+          return Promise.resolve(makeStudio({ id: 'new-hash', ...(input as Partial<Studio>) }));
+        }),
+        update: vi.fn(),
+      } as unknown as StudiosRepository;
+      const leases = { logEvent: vi.fn() } as unknown as StudioLeaseService;
 
-    const service = new StudioOverflowService(studios, leases);
-    const result = await service.ensureOverflowStudio({
-      userId: 'user-1',
-      agentId: 'lumen',
-      parentStudio: makeStudio({ repoRoot: '/nonexistent/repo' }),
-      threadKey: 'pr:476',
-    });
+      const service = new StudioOverflowService(studios, leases);
+      const result = await service.ensureOverflowStudio({
+        userId: 'user-1',
+        agentId: 'lumen',
+        parentStudio: makeStudio({ repoRoot, worktreePath: repoRoot }),
+        threadKey: 'pr:476',
+      });
 
-    expect(result).toBeNull();
-    expect(findBySlug).toHaveBeenCalledTimes(2);
-    expect(findBySlug.mock.calls[1][1]).toBe(`lumen-review--pr-476-h${slugHash('pr:476')}`);
+      expect(result?.id).toBe('new-hash');
+      expect(createdInputs).toHaveLength(1);
+      expect(createdInputs[0].branch).toBe(`lumen/eph/pr-476-h${slugHash('pr:476')}`);
+      expect(String(createdInputs[0].worktreePath)).toContain(hashSlug);
+    } finally {
+      await execFileAsync('git', ['worktree', 'remove', '--force', hashWorktree], {
+        cwd: repoRoot,
+      }).catch(() => undefined);
+      await execFileAsync('git', ['worktree', 'remove', '--force', blocker], {
+        cwd: repoRoot,
+      }).catch(() => undefined);
+      await rm(repoRoot, { recursive: true, force: true });
+    }
+  });
+
+  // r1 P1 (Lumen): the hash fallback must be STICKY. A blocker once forced
+  // the hash variant; the blocker later freed the primary branch. A
+  // sequential check-then-create would now mint the primary alongside the
+  // live hash studio — two studios for one (parent, threadKey), sessions
+  // split across them. The preflight must find the hash row first.
+  it('an existing hash-variant studio is reused before the primary is reminted', async () => {
+    const repoRoot = await makeGitRepo();
+    const hashWorktree = await mkdtemp(path.join(tmpdir(), 'overflow-hash-'));
+    const primaryWorktree = path.join(
+      path.dirname(repoRoot),
+      `${path.basename(repoRoot)}--lumen-review--pr-476`
+    );
+    try {
+      const root = makeStudio({ repoRoot, worktreePath: repoRoot });
+      const hashRow = makeStudio({
+        id: 'eph-hash',
+        slug: `lumen-review--pr-476-h${slugHash('pr:476')}`,
+        ephemeral: true,
+        parentStudioId: 'parent-1',
+        threadKey: 'pr:476',
+        metadata: { overflow: true },
+        worktreePath: hashWorktree,
+      });
+      const studios = {
+        findById: vi.fn(),
+        findBySlug: vi
+          .fn()
+          .mockImplementation((_userId: string, slug: string) =>
+            Promise.resolve(slug === hashRow.slug ? hashRow : null)
+          ),
+        create: vi.fn(),
+        update: vi.fn(),
+      } as unknown as StudiosRepository;
+      const leases = { logEvent: vi.fn() } as unknown as StudioLeaseService;
+
+      const service = new StudioOverflowService(studios, leases);
+      const result = await service.ensureOverflowStudio({
+        userId: 'user-1',
+        agentId: 'lumen',
+        parentStudio: root,
+        threadKey: 'pr:476',
+      });
+
+      // The primary is creatable in this real repo — but the live hash row
+      // stays authoritative.
+      expect(result?.id).toBe('eph-hash');
+      expect(studios.create).not.toHaveBeenCalled();
+      expect(studios.update).not.toHaveBeenCalled();
+    } finally {
+      // Under a regressed sequential loop the primary worktree gets created;
+      // sweep it so the mutation run leaves nothing behind.
+      await execFileAsync('git', ['worktree', 'remove', '--force', primaryWorktree], {
+        cwd: repoRoot,
+      }).catch(() => undefined);
+      await rm(hashWorktree, { recursive: true, force: true });
+      await rm(repoRoot, { recursive: true, force: true });
+    }
   });
 
   it('a parent-chain cycle terminates instead of walking forever', async () => {
