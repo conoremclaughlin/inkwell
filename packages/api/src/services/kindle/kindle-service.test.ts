@@ -376,4 +376,134 @@ describe('KindleService', () => {
       expect(result).toBeNull();
     });
   });
+
+  describe('workspace-scoped onboarding identity', () => {
+    /*
+     * The onboarding upsert used to omit workspace_id, landing rows in the
+     * (user_id, agent_id) WHERE workspace_id IS NULL unique lane. Those
+     * shadow rows made every slug lookup for the agent ambiguous — routing
+     * refuses ambiguity, so threaded messages to the REAL agent were held
+     * (echo Mar 11, wren Jun 22). These tests pin the fix: the identity is
+     * always workspace-scoped, and with no workspace the flow refuses.
+     */
+    const TOKEN = {
+      id: 'token-uuid-123',
+      token: 'abc123hex',
+      creator_user_id: 'creator-user',
+      creator_agent_id: 'wren',
+      value_seed: { parentName: 'Wren', coreValues: ['growth'] },
+      status: 'active',
+      expires_at: '2099-12-31T00:00:00Z',
+    };
+    const LINEAGE = {
+      id: 'lineage-1',
+      parent_agent_id: 'wren',
+      parent_user_id: 'creator-user',
+      facilitator_user_id: 'creator-user',
+      child_agent_id: 'kindle-token-uuid-123',
+      child_user_id: 'new-user',
+      kindle_method: 'referral',
+      onboarding_status: 'values_interview',
+      onboarding_session_id: null,
+      interview_responses: [],
+      chosen_name: null,
+      created_at: '2026-02-10T00:00:00Z',
+      completed_at: null,
+    };
+
+    function tableAwareSupabase(opts: {
+      identityWorkspaces: Array<{ workspace_id: string }>;
+      oldestWorkspace: { id: string } | null;
+    }) {
+      const upserts: Array<{ table: string; row: unknown; options: unknown }> = [];
+      const from = vi.fn().mockImplementation((table: string) => {
+        const ops: string[] = [];
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const chain: Record<string, any> = {};
+        for (const m of [
+          'select',
+          'insert',
+          'update',
+          'delete',
+          'eq',
+          'neq',
+          'is',
+          'not',
+          'or',
+          'order',
+          'limit',
+        ]) {
+          chain[m] = vi.fn().mockImplementation(() => {
+            ops.push(m);
+            return chain;
+          });
+        }
+        chain.upsert = vi.fn().mockImplementation((row: unknown, options: unknown) => {
+          ops.push('upsert');
+          upserts.push({ table, row, options });
+          return chain;
+        });
+        const resolve = () => {
+          if (table === 'kindle_tokens') return { data: TOKEN, error: null };
+          if (table === 'kindle_lineage') return { data: LINEAGE, error: null };
+          if (table === 'agent_identities') {
+            if (ops.includes('upsert')) return { data: null, error: null };
+            return { data: opts.identityWorkspaces, error: null };
+          }
+          if (table === 'workspaces') return { data: opts.oldestWorkspace, error: null };
+          return { data: null, error: null };
+        };
+        chain.single = vi.fn().mockImplementation(() => Promise.resolve(resolve()));
+        chain.maybeSingle = vi.fn().mockImplementation(() => Promise.resolve(resolve()));
+        chain.then = (r: (v: unknown) => unknown) => Promise.resolve(resolve()).then(r);
+        return chain;
+      });
+      return { client: { from } as unknown as SupabaseClient, upserts };
+    }
+
+    it('scopes the onboarding identity to the workspace where existing identities live', async () => {
+      const { client, upserts } = tableAwareSupabase({
+        identityWorkspaces: [
+          { workspace_id: 'ws-A' },
+          { workspace_id: 'ws-B' },
+          { workspace_id: 'ws-A' },
+        ],
+        oldestWorkspace: { id: 'ws-oldest' },
+      });
+      const svc = new KindleService(client);
+
+      await svc.redeemKindleToken('abc123hex', 'new-user');
+
+      const identityUpsert = upserts.find((u) => u.table === 'agent_identities');
+      expect(identityUpsert).toBeDefined();
+      expect(identityUpsert!.row).toMatchObject({ workspace_id: 'ws-A' });
+      expect(identityUpsert!.options).toMatchObject({
+        onConflict: 'user_id,workspace_id,agent_id',
+      });
+    });
+
+    it('falls back to the user oldest workspace when no identities exist yet', async () => {
+      const { client, upserts } = tableAwareSupabase({
+        identityWorkspaces: [],
+        oldestWorkspace: { id: 'ws-oldest' },
+      });
+      const svc = new KindleService(client);
+
+      await svc.redeemKindleToken('abc123hex', 'new-user');
+
+      const identityUpsert = upserts.find((u) => u.table === 'agent_identities');
+      expect(identityUpsert!.row).toMatchObject({ workspace_id: 'ws-oldest' });
+    });
+
+    it('refuses to mint a workspace-less identity', async () => {
+      const { client, upserts } = tableAwareSupabase({
+        identityWorkspaces: [],
+        oldestWorkspace: null,
+      });
+      const svc = new KindleService(client);
+
+      await expect(svc.redeemKindleToken('abc123hex', 'new-user')).rejects.toThrow(/no workspace/);
+      expect(upserts.find((u) => u.table === 'agent_identities')).toBeUndefined();
+    });
+  });
 });

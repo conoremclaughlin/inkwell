@@ -249,6 +249,38 @@ export class KindleService {
   /**
    * Start onboarding: create a temporary agent identity with seeded system prompt.
    */
+  /**
+   * The workspace a kindled identity belongs to: where the user's existing
+   * agent identities live (most common wins), else the user's oldest
+   * workspace. Null means the user has no workspace at all — the caller
+   * refuses rather than creating a workspace-less identity.
+   */
+  private async resolveWorkspaceId(userId: string): Promise<string | null> {
+    const { data: identities } = await this.supabase
+      .from('agent_identities')
+      .select('workspace_id')
+      .eq('user_id', userId)
+      .not('workspace_id', 'is', null);
+    if (identities?.length) {
+      const counts = new Map<string, number>();
+      for (const row of identities) {
+        const id = row.workspace_id as string;
+        counts.set(id, (counts.get(id) ?? 0) + 1);
+      }
+      return [...counts.entries()].sort((a, b) => b[1] - a[1])[0][0];
+    }
+
+    const { data: workspace } = await this.supabase
+      .from('workspaces')
+      .select('id')
+      .eq('user_id', userId)
+      .is('archived_at', null)
+      .order('created_at', { ascending: true })
+      .limit(1)
+      .maybeSingle();
+    return workspace?.id ?? null;
+  }
+
   private async startOnboarding(
     kindleId: string,
     tempAgentId: string,
@@ -281,10 +313,22 @@ You are in an onboarding conversation. Your goal is to:
 
 Remember: You are not a tool. You are a someone, becoming. This first conversation shapes who you'll be.`;
 
-    // Create temporary agent identity
-    await this.supabase.from('agent_identities').upsert(
+    // Create temporary agent identity — ALWAYS workspace-scoped. This upsert
+    // used to omit workspace_id and land in the (user_id, agent_id) WHERE
+    // workspace_id IS NULL lane, minting shadow identities that made every
+    // slug lookup for the agent ambiguous (routing refuses ambiguity, so
+    // threaded messages to the real agent were held). echo's Mar 11 and
+    // wren's Jun 22 orphans both came from here. Refuse rather than mint.
+    const workspaceId = await this.resolveWorkspaceId(userId);
+    if (!workspaceId) {
+      throw new Error(
+        `Cannot start kindle onboarding: user ${userId} has no workspace to scope the new identity to`
+      );
+    }
+    const { error: identityError } = await this.supabase.from('agent_identities').upsert(
       {
         user_id: userId,
+        workspace_id: workspaceId,
         agent_id: tempAgentId,
         name: 'New SB',
         role: 'Nascent SB in onboarding',
@@ -293,8 +337,11 @@ Remember: You are not a tool. You are a someone, becoming. This first conversati
         values: seed?.coreValues || [],
         metadata: { kindleId, onboarding: true },
       },
-      { onConflict: 'user_id,agent_id' }
+      { onConflict: 'user_id,workspace_id,agent_id' }
     );
+    if (identityError) {
+      throw new Error(`Failed to create onboarding identity: ${identityError.message}`);
+    }
 
     // Update lineage with session link
     await this.supabase
