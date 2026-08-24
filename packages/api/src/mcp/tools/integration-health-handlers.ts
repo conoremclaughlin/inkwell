@@ -37,10 +37,57 @@ function ageSeconds(timestamp: string | null): number | null {
   return Math.max(0, Math.round((Date.now() - parsed) / 1000));
 }
 
+/**
+ * What the OAuth account proves, kept separate from what the service is doing.
+ * An account is credentials; a service is Gmail answering or not. They fail
+ * independently and this tool must not conflate them.
+ */
+type AccountHealth = 'ok' | 'refresh_required' | 'unusable' | 'not_connected' | 'unknown';
+
+function accountHealthOf(account: ProviderAccountHealth): AccountHealth {
+  switch (account.state) {
+    case 'active':
+      return 'ok';
+    case 'refresh_required':
+      return 'refresh_required';
+    case 'unusable':
+      return 'unusable';
+    case 'missing':
+      return 'not_connected';
+    case 'unknown':
+      return 'unknown';
+  }
+}
+
+/**
+ * The verdict an account can support on its own, used only when there is no
+ * fresher service-level report to defer to. `refresh_required` is degraded and
+ * not healthy: the credential works this second and may not on the next call.
+ */
 function statusFromAccount(account: ProviderAccountHealth): HealthStatus {
-  if (account.state === 'active') return 'healthy';
-  if (account.state === 'missing') return 'not_configured';
-  return 'error';
+  switch (account.state) {
+    case 'active':
+      return 'healthy';
+    case 'refresh_required':
+      return 'degraded';
+    case 'missing':
+      return 'not_configured';
+    default:
+      return 'error';
+  }
+}
+
+function errorCodeFromAccount(account: ProviderAccountHealth): string | null {
+  switch (account.state) {
+    case 'active':
+      return null;
+    case 'refresh_required':
+      return 'oauth_refresh_required';
+    case 'unknown':
+      return 'oauth_inspection_failed';
+    default:
+      return `oauth_${account.accountStatus ?? 'missing'}`;
+  }
 }
 
 export const updateIntegrationHealthSchema = userIdentifierBaseSchema.extend({
@@ -68,21 +115,6 @@ export async function handleUpdateIntegrationHealth(args: unknown, dataComposer:
   const now = new Date().toISOString();
   const isHealthy = params.status === 'healthy';
 
-  // "When did this last work?" is at its most useful during an outage, so a
-  // non-healthy report must not clear it. Carry the stored value forward.
-  let lastHealthyAt: string | null = now;
-  if (!isHealthy) {
-    const { data: existing } = await dataComposer
-      .getClient()
-      .from('integration_health')
-      .select('last_healthy_at')
-      .eq('user_id', user.id)
-      .eq('service', params.service)
-      .maybeSingle();
-
-    lastHealthyAt = existing?.last_healthy_at ?? null;
-  }
-
   const upsertData = {
     user_id: user.id,
     service: params.service,
@@ -90,7 +122,14 @@ export async function handleUpdateIntegrationHealth(args: unknown, dataComposer:
     error_code: isHealthy ? null : (params.errorCode ?? null),
     error_message: isHealthy ? null : (params.errorMessage ?? null),
     last_check_at: now,
-    last_healthy_at: lastHealthyAt,
+    // "When did this last work?" is at its most useful during an outage, so a
+    // non-healthy report must not clear it. The value written here is advisory:
+    // the integration_health_retain_last_healthy_at trigger owns the column and
+    // keeps the stored timestamp on any non-healthy write. Preserving it here
+    // instead would mean a read followed by a write — a lost update whenever a
+    // healthy report lands between the two, and an erasure whenever the read
+    // fails.
+    last_healthy_at: isHealthy ? now : null,
     reported_by_agent_id: params.agentId ?? null,
     metadata: (params.metadata ?? {}) as Json,
     updated_at: now,
@@ -165,13 +204,17 @@ export async function handleGetIntegrationHealth(args: unknown, dataComposer: Da
   // Which OAuth-backed services to answer for. An explicit `service` filter must
   // always get a verdict, even with no cached row — otherwise "is Gmail up?"
   // returns an empty list, which reads as reassuring and means nothing.
+  //
+  // The unfiltered call enumerates every OAuth-backed service outright rather
+  // than discovering them from the cache. Reading the cache to decide what to
+  // inspect made liveness conditional on somebody having hand-written a row
+  // first: a freshly connected account with no rows got `count: 0` from the
+  // default heartbeat call — the same ambiguous silence this PR exists to end.
   const oauthServices = new Set<string>();
   if (params.service) {
     if (OAUTH_BACKED_SERVICES[params.service]) oauthServices.add(params.service);
   } else {
-    for (const row of cachedRows) {
-      if (OAUTH_BACKED_SERVICES[row.service]) oauthServices.add(row.service);
-    }
+    for (const service of Object.keys(OAUTH_BACKED_SERVICES)) oauthServices.add(service);
   }
 
   // One lookup per provider rather than per service — the five google_* services
@@ -185,7 +228,15 @@ export async function handleGetIntegrationHealth(args: unknown, dataComposer: Da
   );
 
   const cachedByService = new Map(cachedRows.map((row) => [row.service, row]));
-  const services = [...new Set([...cachedByService.keys(), ...oauthServices])].sort();
+  const services = [
+    ...new Set([
+      ...cachedByService.keys(),
+      ...oauthServices,
+      // A filter names a service the caller cares about. Answer for it whether or
+      // not it is OAuth-backed and whether or not anyone has ever reported on it.
+      ...(params.service ? [params.service] : []),
+    ]),
+  ].sort();
 
   const integrations = services.map((service) => {
     const row = cachedByService.get(service);
@@ -193,6 +244,7 @@ export async function handleGetIntegrationHealth(args: unknown, dataComposer: Da
     const live = provider ? accountHealth.get(provider) : undefined;
 
     const cachedAge = ageSeconds(row?.last_check_at ?? null);
+    const cachedStale = cachedAge === null || cachedAge * 1000 > STALE_AFTER_MS;
     const base = {
       id: row?.id ?? null,
       service,
@@ -204,33 +256,65 @@ export async function handleGetIntegrationHealth(args: unknown, dataComposer: Da
       lastCheckAgeSeconds: cachedAge,
     };
 
+    const cached = {
+      ...base,
+      status: (row?.status ?? 'not_configured') as HealthStatus,
+      errorCode: row?.error_code ?? null,
+      errorMessage: row?.error_message ?? null,
+      source: 'cached' as const,
+      stale: cachedStale,
+    };
+
     if (!live) {
       // Nothing authoritative to consult — report the cache, but say how old it is.
+      if (row) return cached;
+      // Asked about a service nobody has ever reported on and that has no live
+      // signal to derive one from. Say that, rather than returning nothing and
+      // letting the silence be read as good news.
       return {
         ...base,
-        status: (row?.status ?? 'not_configured') as HealthStatus,
-        errorCode: row?.error_code ?? null,
-        errorMessage: row?.error_message ?? null,
-        source: 'cached' as const,
-        stale: cachedAge === null || cachedAge * 1000 > STALE_AFTER_MS,
+        status: 'not_configured' as HealthStatus,
+        errorCode: 'never_reported',
+        errorMessage: `No health has ever been reported for ${service}, and it has no live signal to derive one from`,
+        source: 'unknown' as const,
+        stale: true,
       };
+    }
+
+    const account = {
+      accountHealth: accountHealthOf(live),
+      accountStatus: live.accountStatus,
+      accountObservedAt: live.observedAt,
+      accountLastUsedAt: live.lastUsedAt,
+      tokenExpiresAt: live.expiresAt,
+      providerLastError: live.lastError,
+    };
+
+    // A usable credential proves that auth works, and nothing more. Gmail can be
+    // rate limited, missing a scope, or simply down while the account stays
+    // perfectly active — connected_accounts has no column that could say so. So
+    // when an agent has reported a service-level failure *recently*, that report
+    // is the better evidence and it stands; the account state travels alongside
+    // it as `accountHealth` rather than overwriting it. An unusable credential is
+    // the reverse: no call can succeed, so it does override a cached claim.
+    const authUsable = live.state === 'active' || live.state === 'refresh_required';
+    if (authUsable && row && row.status !== 'healthy' && !cachedStale) {
+      return { ...cached, ...account };
     }
 
     const liveStatus = statusFromAccount(live);
     return {
       ...base,
       status: liveStatus,
-      errorCode: live.state === 'active' ? null : `oauth_${live.accountStatus ?? 'missing'}`,
+      errorCode: errorCodeFromAccount(live),
       errorMessage: live.reason,
-      source: 'live' as const,
-      // Derived from account state the OAuth service maintains on every call, so
-      // it is current by construction.
-      stale: false,
-      accountStatus: live.accountStatus,
-      accountObservedAt: live.observedAt,
-      accountLastUsedAt: live.lastUsedAt,
-      tokenExpiresAt: live.expiresAt,
-      providerLastError: live.lastError,
+      // 'unknown' is not a live reading — the account lookup itself failed, so
+      // nothing about the present has been established.
+      source: live.state === 'unknown' ? ('unknown' as const) : ('live' as const),
+      // Live state is derived from account rows the OAuth service maintains on
+      // every call, so it is current by construction.
+      stale: live.state === 'unknown',
+      ...account,
       // A disagreeing hand-written row is kept rather than dropped: an agent may
       // have seen a failure the account table cannot represent.
       ...(row && row.status !== liveStatus

@@ -6023,12 +6023,26 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         'Read `source` before trusting `status`:\n' +
         '- source "live": derived from stored OAuth account state, which the server ' +
         'updates on every provider call. Current by construction. Google services ' +
-        '(gmail/calendar/drive/docs/sheets) always report this way.\n' +
+        '(gmail/calendar/drive/docs/sheets) are always inspected, whether or not ' +
+        'anyone has ever reported on them.\n' +
         '- source "cached": the last status an agent reported by hand. Check `stale` ' +
         'and `lastCheckAgeSeconds` — a stale row describes the past, not the present, ' +
-        'and must not be relayed as a liveness signal.\n\n' +
-        'When live state contradicts a cached row, live wins and the old value is kept ' +
-        'as `supersededCachedStatus` / `lastReportedError`.\n\n' +
+        'and must not be relayed as a liveness signal.\n' +
+        '- source "unknown": no verdict could be established (the account lookup ' +
+        'failed, or nothing has ever been reported for a service with no live ' +
+        'signal). `stale` is true. Do not read this as either good or bad news.\n\n' +
+        '`accountHealth` is credentials, `status` is the service. They fail ' +
+        'independently:\n' +
+        '- accountHealth "unusable"/"not_connected" is decisive — no call can ' +
+        'succeed — so it overrides a cached row, which is kept as ' +
+        '`supersededCachedStatus` / `lastReportedError`.\n' +
+        '- accountHealth "ok"/"refresh_required" only proves auth works. A service ' +
+        'can be rate limited, out of scope, or down with the account perfectly ' +
+        'active, so a NON-stale agent-reported failure stands as `status` rather ' +
+        'than being overwritten by healthy-looking credentials.\n' +
+        '- accountHealth "refresh_required" means the token must be refreshed ' +
+        'before the next call and that refresh may fail; it reports as "degraded", ' +
+        'never "healthy".\n\n' +
         'Filtering to a specific service always returns a verdict for it, even with no ' +
         'cached row, so an empty result never has to be read as good news.\n\n' +
         'User can be identified by ONE of:\n' +
