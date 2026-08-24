@@ -151,104 +151,121 @@ export class InkRunner implements IRunner {
     const isResume = !!backendSessionId;
     const sessionId = config.pcpSessionId || backendSessionId || randomUUID();
 
-    let fullMessage = message;
-    if (injectedContext && !isResume) {
-      // `ink chat` calls bootstrap itself and renders the constitution, the
-      // knowledge summary and active projects through formatBootstrapContext.
-      // Emitting them here as well sent Myra the same ~50KB twice.
-      const contextBlock = formatInjectedContext(injectedContext, { childCallsBootstrap: true });
-      fullMessage = `${contextBlock}\n\n---\n\n${message}`;
-    }
+    // Two things can go wrong that we can do something about: the child refuses
+    // to answer without identity context, and a resume finds no local session.
+    // They compose in either order, and each was previously handled by its own
+    // nested spawn whose result nothing re-examined — a refusal on the inner
+    // spawn was reported as a successful turn with no response at all.
+    //
+    // So there is one attempt loop instead. Every result, first or last, goes
+    // through the same checks, and each recovery may be applied once.
+    let suppliedContext = false;
+    let freshAfterFailedResume = false;
+    let usedContextFallback = false;
+    let resetAfterFailedResume = false;
 
-    // Demanded on every server-spawned turn, resumes included: each run is a
-    // brand-new `ink chat` process that bootstraps from scratch, so a resumed
-    // turn is exactly as exposed to a bootstrap failure as a fresh one.
-    // Healthy resumed prompts stay lean — fullMessage is untouched above.
-    const args = this.buildArgs(sessionId, config, mediaAttachments, {
-      requireBootstrap: true,
-    });
+    const composeMessage = (): string => {
+      if (!injectedContext) return message;
 
-    logger.info('Spawning ink chat (non-interactive)', {
-      sessionId,
-      pcpSessionId: config.pcpSessionId,
-      isResume,
-      workingDirectory: config.workingDirectory,
-      messageLength: fullMessage.length,
-    });
-
-    try {
-      let result = await this.spawnProcess(args, fullMessage, config);
-
-      if (result.bootstrapRequiredFailure) {
-        // The child could not reach bootstrap, so it stopped rather than reply
-        // as a stranger. We have the constitution already — send it inline and
-        // let the turn succeed, instead of leaving a person without an answer.
-        logger.warn('ink chat could not load identity context; retrying with server copy', {
-          sessionId,
-          pcpSessionId: config.pcpSessionId,
-        });
-
-        if (!injectedContext) {
-          // Nothing to fall back to. Report the failure rather than respawn a
-          // child we already know will answer as a stranger.
-          logger.error('ink chat has no identity context and none to supply', {
-            sessionId,
-            pcpSessionId: config.pcpSessionId,
-          });
-          return {
-            success: false,
-            backendSessionId: sessionId,
-            responses: [],
-            error: 'ink chat could not load identity context and none was available to supply',
-          };
-        }
-
-        // Sole delivery, so it carries soul too: this child has no
-        // appendSystemPrompt path and its own bootstrap just failed.
-        const contextBlock = formatInjectedContext(injectedContext, { includeSoul: true });
-        fullMessage = `${contextBlock}\n\n---\n\n${message}`;
-
-        const fallbackArgs = this.buildArgs(sessionId, config, mediaAttachments, {
-          requireBootstrap: false,
-        });
-        result = await this.spawnProcess(fallbackArgs, fullMessage, config);
+      // The child normally loads all of this itself. We only carry it when its
+      // own bootstrap has failed — and then it is the sole delivery, so it
+      // includes soul, which no appendSystemPrompt reaches this runner with.
+      if (suppliedContext) {
+        const block = formatInjectedContext(injectedContext, { includeSoul: true });
+        return `${block}\n\n---\n\n${message}`;
       }
 
-      if (result.resumeFailedNoSession && isResume) {
-        logger.warn('Resume failed - session not found locally. Starting fresh session.', {
-          oldSessionId: sessionId,
+      // Lean. A resumed prompt carries nothing; a fresh one carries only what
+      // bootstrap cannot know.
+      if (isResume && !freshAfterFailedResume) return message;
+
+      const block = formatInjectedContext(injectedContext, { childCallsBootstrap: true });
+      return `${block}\n\n---\n\n${message}`;
+    };
+
+    const noContextFailure = (): RunnerResult => {
+      logger.error('ink chat has no identity context and none to supply', {
+        sessionId,
+        pcpSessionId: config.pcpSessionId,
+      });
+      return {
+        success: false,
+        backendSessionId: sessionId,
+        responses: [],
+        error: 'ink chat could not load identity context and none was available to supply',
+      };
+    };
+
+    try {
+      // Bounded by the two recoveries plus one final attempt.
+      for (let attempt = 1; attempt <= 3; attempt += 1) {
+        const fullMessage = composeMessage();
+        const args = this.buildArgs(sessionId, config, mediaAttachments, {
+          // Demanded on every server-spawned turn, resumes included: each run
+          // is a brand-new `ink chat` that bootstraps from scratch. Dropped
+          // only once we are the ones supplying the context.
+          requireBootstrap: !suppliedContext,
         });
 
-        if (injectedContext) {
-          const contextBlock = formatInjectedContext(injectedContext, {
-            childCallsBootstrap: true,
+        logger.info('Spawning ink chat (non-interactive)', {
+          sessionId,
+          pcpSessionId: config.pcpSessionId,
+          isResume,
+          attempt,
+          suppliedContext,
+          workingDirectory: config.workingDirectory,
+          messageLength: fullMessage.length,
+        });
+
+        const result = await this.spawnProcess(args, fullMessage, config);
+
+        if (result.bootstrapRequiredFailure) {
+          if (usedContextFallback || !injectedContext) return noContextFailure();
+          logger.warn('ink chat could not load identity context; retrying with server copy', {
+            sessionId,
+            pcpSessionId: config.pcpSessionId,
+            attempt,
           });
-          fullMessage = `${contextBlock}\n\n---\n\n${message}`;
+          usedContextFallback = true;
+          suppliedContext = true;
+          continue;
         }
 
-        const freshArgs = this.buildArgs(sessionId, config, mediaAttachments, {
-          requireBootstrap: true,
-        });
-        const retryResult = await this.spawnProcess(freshArgs, fullMessage, config);
+        if (result.resumeFailedNoSession && isResume) {
+          if (resetAfterFailedResume) {
+            return {
+              success: false,
+              backendSessionId: sessionId,
+              responses: [],
+              error: 'ink chat could not resume or start a session',
+            };
+          }
+          logger.warn('Resume failed - session not found locally. Starting fresh session.', {
+            oldSessionId: sessionId,
+            attempt,
+          });
+          resetAfterFailedResume = true;
+          freshAfterFailedResume = true;
+          continue;
+        }
+
         return {
           success: true,
           backendSessionId: sessionId,
-          responses: retryResult.responses,
-          usage: retryResult.usage,
-          servedModel: retryResult.servedModel,
-          finalTextResponse: retryResult.finalTextResponse,
-          toolCalls: retryResult.toolCalls,
+          responses: result.responses,
+          usage: result.usage,
+          servedModel: result.servedModel,
+          finalTextResponse: result.finalTextResponse,
+          toolCalls: result.toolCalls,
         };
       }
 
+      // Both recoveries applied and the last attempt still asked for another.
       return {
-        success: true,
+        success: false,
         backendSessionId: sessionId,
-        responses: result.responses,
-        usage: result.usage,
-        servedModel: result.servedModel,
-        finalTextResponse: result.finalTextResponse,
-        toolCalls: result.toolCalls,
+        responses: [],
+        error: 'ink chat exhausted its recovery attempts',
       };
     } catch (error) {
       logger.error('ink chat process failed', {

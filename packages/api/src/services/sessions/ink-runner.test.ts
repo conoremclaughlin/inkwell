@@ -752,3 +752,135 @@ describe('InkRunner — resumed turns are equally exposed', () => {
     expect(result.error).toContain('identity context');
   });
 });
+
+// ============================================================================
+// Recoveries compose: whichever fires first, the next result is still checked
+// ============================================================================
+
+describe('InkRunner — chained failures', () => {
+  function ctx() {
+    return {
+      agent: {
+        agentId: 'myra',
+        name: 'Myra',
+        role: 'messaging',
+        soul: 'SOUL-BODY',
+        values: [],
+        capabilities: [],
+        relationships: {},
+      },
+      user: { id: 'u1', timezone: 'UTC', contacts: {}, preferences: {} },
+      temporal: {
+        currentTime: '9:00 AM',
+        currentDate: 'Monday, August 24, 2026',
+        dayOfWeek: 'Monday',
+        timezone: 'UTC',
+        greeting: 'Good morning',
+      },
+      constitution: { values: 'VALUES-BODY', process: 'PROCESS-BODY', user: 'USER-BODY' },
+      knowledgeSummary: 'DIGEST-BODY',
+      recentMemories: [],
+      activeProjects: [],
+    } as never;
+  }
+
+  const cfg = {
+    workingDirectory: '/tmp',
+    mcpConfigPath: '/tmp/.mcp.json',
+    agentId: 'myra',
+  } as never;
+
+  function stub(runner: InkRunner, outcomes: Array<Record<string, unknown>>) {
+    const calls: Array<{ args: string[]; message: string }> = [];
+    (runner as any).spawnProcess = vi.fn(async (args: string[], message: string) => {
+      calls.push({ args, message });
+      const next = outcomes.shift() ?? { responses: [], toolCalls: [], finalTextResponse: 'ok' };
+      return { responses: [], toolCalls: [], ...next };
+    });
+    return calls;
+  }
+
+  it('recovers when a failed resume is followed by a bootstrap refusal', async () => {
+    // The hole: the nested spawn after resumeFailedNoSession was returned as
+    // success:true with no responses, so SessionService recorded a successful
+    // turn and the person's message was dropped without trace.
+    const runner = new InkRunner();
+    const calls = stub(runner, [
+      { resumeFailedNoSession: true },
+      { bootstrapRequiredFailure: true },
+      { finalTextResponse: 'recovered' },
+    ]);
+
+    const result = await runner.run('hello', {
+      backendSessionId: 'old',
+      injectedContext: ctx(),
+      config: cfg,
+    } as never);
+
+    expect(calls).toHaveLength(3);
+    expect(calls[2].message).toContain('SOUL-BODY');
+    expect(calls[2].message).toContain('VALUES-BODY');
+    expect(calls[2].args).not.toContain('--require-bootstrap');
+    expect(result.success).toBe(true);
+    expect(result.finalTextResponse).toBe('recovered');
+  });
+
+  it('recovers in the inverse order too', async () => {
+    const runner = new InkRunner();
+    const calls = stub(runner, [
+      { bootstrapRequiredFailure: true },
+      { resumeFailedNoSession: true },
+      { finalTextResponse: 'recovered' },
+    ]);
+
+    const result = await runner.run('hello', {
+      backendSessionId: 'old',
+      injectedContext: ctx(),
+      config: cfg,
+    } as never);
+
+    expect(calls).toHaveLength(3);
+    // Context supplied by attempt 2 must not be dropped by the resume reset.
+    expect(calls[2].message).toContain('SOUL-BODY');
+    expect(result.success).toBe(true);
+    expect(result.finalTextResponse).toBe('recovered');
+  });
+
+  it('never reports success with nothing to say', async () => {
+    // Every failure path must be visible to SessionService. A silently
+    // successful empty turn is the one outcome that loses the message.
+    const runner = new InkRunner();
+    stub(runner, [
+      { resumeFailedNoSession: true },
+      { bootstrapRequiredFailure: true },
+      { bootstrapRequiredFailure: true },
+    ]);
+
+    const result = await runner.run('hello', {
+      backendSessionId: 'old',
+      injectedContext: ctx(),
+      config: cfg,
+    } as never);
+
+    expect(result.success).toBe(false);
+    expect(result.error).toBeTruthy();
+  });
+
+  it('does not retry a resume reset forever', async () => {
+    const runner = new InkRunner();
+    stub(runner, [
+      { resumeFailedNoSession: true },
+      { resumeFailedNoSession: true },
+      { resumeFailedNoSession: true },
+    ]);
+
+    const result = await runner.run('hello', {
+      backendSessionId: 'old',
+      injectedContext: ctx(),
+      config: cfg,
+    } as never);
+
+    expect(result.success).toBe(false);
+    expect(result.error).toBeTruthy();
+  });
+});
