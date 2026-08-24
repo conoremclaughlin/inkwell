@@ -687,9 +687,11 @@ export class SessionService implements ISessionService {
     // resolved ONCE, before routing, from the thread's STORED pinned
     // key_type via the registry (grammar v4) — never a live re-parse, and
     // never re-resolved here (blocker 5: one resolution feeds the occupancy
-    // gate and this gate identically). MECHANISM ONLY until 6e: every
-    // template is write and presence overrides are rejected at the tool
-    // surface — the flip ships atomically with escalation-on-write.
+    // gate and this gate identically). Discussions (thread/spec/issue/debug)
+    // are LIVE presence as of 2026-08-24, by Conor's direction and without
+    // waiting for the 6e escalation net: discussions execute, they never
+    // queue behind the lock, and the unlocked-edit risk is consciously
+    // accepted.
     const intent = ctx.writeIntent ?? 'write';
     if (intent === 'presence') {
       logger.debug('[StudioLease] Presence thread — studio bound without lease', {
@@ -2163,25 +2165,43 @@ export class SessionService implements ISessionService {
       // The third worktree-creating path, gated like the other two (Lumen
       // #523 r1 P1): the D1 parent is durable rather than ephemeral, but it
       // is still an AUTOMATIC worktree built for a thread whose type says
-      // reuse-only. Hold instead — an explicit create_studio remains the way
-      // a discussion gets a studio when it genuinely needs one.
-      logger.info('[StudioResolve] Caller repo has no studio and type is reuse-only; holding', {
-        threadKey: options?.threadKey,
-        agentId,
-        repoRoot: routing.deferredCreate.repoRoot,
-      });
-      routing = {
-        studioId: undefined,
-        tier: 'refused',
-        occupancyChecked: false,
-        refusal: {
-          reason: 'no-route',
-          threadKey: options?.threadKey || '',
-          triedCallerRepo: true,
-          callerRepoRoot: routing.deferredCreate.repoRoot,
-          policy: 'reuse-only',
-        },
-      };
+      // reuse-only. What happens instead depends on intent:
+      //
+      //   presence — discussions EXECUTE, they never queue (Conor's ruling).
+      //     Run studioless in the default working directory, the sanctioned
+      //     pre-registry destination for exactly this case. The SB opts into
+      //     a studio explicitly (create_studio) when one is needed.
+      //   write    — a writer with nowhere safe to write holds; deploy and
+      //     unknown types land here.
+      if (writeIntent === 'presence') {
+        logger.info(
+          '[StudioResolve] Caller repo has no studio; presence thread proceeds studioless',
+          {
+            threadKey: options?.threadKey,
+            agentId,
+            repoRoot: routing.deferredCreate.repoRoot,
+          }
+        );
+        routing = { ...routing, deferredCreate: undefined };
+      } else {
+        logger.info('[StudioResolve] Caller repo has no studio and type is reuse-only; holding', {
+          threadKey: options?.threadKey,
+          agentId,
+          repoRoot: routing.deferredCreate.repoRoot,
+        });
+        routing = {
+          studioId: undefined,
+          tier: 'refused',
+          occupancyChecked: false,
+          refusal: {
+            reason: 'no-route',
+            threadKey: options?.threadKey || '',
+            triedCallerRepo: true,
+            callerRepoRoot: routing.deferredCreate.repoRoot,
+            policy: 'reuse-only',
+          },
+        };
+      }
     } else if (routing.deferredCreate && !resolvedStudioId) {
       const createdStudioId = await this.createParentStudio(
         userId,
