@@ -62,8 +62,11 @@ describe('KindleService', () => {
     identityUpdateResult?: { data: unknown; error: { message: string } | null };
     /** Override the kindle_lineage row (completeOnboarding reads + returns it). */
     lineage?: Record<string, unknown>;
+    /** Result of the redeem_kindle_token RPC. */
+    rpcResult?: { data: unknown; error: { message: string } | null };
   }) {
     const mutations: MutationCall[] = [];
+    const rpcCalls: Array<{ fn: string; args: Record<string, unknown> }> = [];
     const from = vi.fn().mockImplementation((table: string) => {
       const ops: Array<{ method: string; args: unknown[] }> = [];
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -110,7 +113,11 @@ describe('KindleService', () => {
       chain.then = (r: (v: unknown) => unknown) => Promise.resolve(resolve()).then(r);
       return chain;
     });
-    return { client: { from } as unknown as SupabaseClient, mutations };
+    const rpc = vi.fn().mockImplementation((fn: string, args: Record<string, unknown>) => {
+      rpcCalls.push({ fn, args });
+      return Promise.resolve(opts.rpcResult ?? { data: opts.lineage ?? LINEAGE, error: null });
+    });
+    return { client: { from, rpc } as unknown as SupabaseClient, mutations, rpcCalls };
   }
 
   describe('extractValueSeed', () => {
@@ -305,7 +312,12 @@ describe('KindleService', () => {
       expect(result.onboardingStatus).toBe('values_interview');
       expect(result.parentAgentId).toBe('wren');
       expect(mockSupabase.from).toHaveBeenCalledWith('kindle_tokens');
-      expect(mockSupabase.from).toHaveBeenCalledWith('kindle_lineage');
+      // Lineage + identity + token consumption all live inside the atomic
+      // redeem_kindle_token RPC — no client-side table writes.
+      expect(mockSupabase.rpc).toHaveBeenCalledWith(
+        'redeem_kindle_token',
+        expect.objectContaining({ p_token: 'abc123hex', p_new_user_id: 'new-user' })
+      );
     });
 
     it('should reject invalid or inactive tokens', async () => {
@@ -471,7 +483,7 @@ describe('KindleService', () => {
      * workspaces are not inherited, and a failed rename fails completion.
      */
     it('scopes the onboarding identity to the workspace where existing identities live', async () => {
-      const { client, mutations } = tableAwareSupabase({
+      const { client, rpcCalls } = tableAwareSupabase({
         identityWorkspaces: [
           { workspace_id: 'ws-A' },
           { workspace_id: 'ws-B' },
@@ -484,18 +496,18 @@ describe('KindleService', () => {
 
       await svc.redeemKindleToken('abc123hex', 'new-user');
 
-      const identityUpsert = mutations.find(
-        (m) => m.table === 'agent_identities' && m.method === 'upsert'
-      );
-      expect(identityUpsert).toBeDefined();
-      expect(identityUpsert!.row).toMatchObject({ workspace_id: 'ws-A' });
-      expect(identityUpsert!.options).toMatchObject({
-        onConflict: 'user_id,workspace_id,agent_id',
+      expect(rpcCalls).toHaveLength(1);
+      expect(rpcCalls[0].fn).toBe('redeem_kindle_token');
+      expect(rpcCalls[0].args).toMatchObject({
+        p_token: 'abc123hex',
+        p_new_user_id: 'new-user',
+        p_workspace_id: 'ws-A',
       });
+      expect((rpcCalls[0].args.p_identity as { soul?: string })?.soul).toContain('Nascent SB');
     });
 
     it('falls back to the user oldest workspace when no identities exist yet', async () => {
-      const { client, mutations } = tableAwareSupabase({
+      const { client, rpcCalls } = tableAwareSupabase({
         identityWorkspaces: [],
         oldestWorkspace: { id: 'ws-oldest' },
       });
@@ -503,17 +515,14 @@ describe('KindleService', () => {
 
       await svc.redeemKindleToken('abc123hex', 'new-user');
 
-      const identityUpsert = mutations.find(
-        (m) => m.table === 'agent_identities' && m.method === 'upsert'
-      );
-      expect(identityUpsert!.row).toMatchObject({ workspace_id: 'ws-oldest' });
+      expect(rpcCalls[0].args).toMatchObject({ p_workspace_id: 'ws-oldest' });
     });
 
     it('an archived identity workspace is not inherited — falls to the oldest active', async () => {
       // All existing identities point at a workspace that fails verification
       // (archived or foreign). Inheriting it would scope the new SB into a
       // dead workspace; the oldest ACTIVE workspace wins instead (r1 P2).
-      const { client, mutations } = tableAwareSupabase({
+      const { client, rpcCalls } = tableAwareSupabase({
         identityWorkspaces: [{ workspace_id: 'ws-dead' }, { workspace_id: 'ws-dead' }],
         activeWorkspaceIds: ['ws-oldest'],
         oldestWorkspace: { id: 'ws-oldest' },
@@ -522,17 +531,14 @@ describe('KindleService', () => {
 
       await svc.redeemKindleToken('abc123hex', 'new-user');
 
-      const identityUpsert = mutations.find(
-        (m) => m.table === 'agent_identities' && m.method === 'upsert'
-      );
-      expect(identityUpsert!.row).toMatchObject({ workspace_id: 'ws-oldest' });
+      expect(rpcCalls[0].args).toMatchObject({ p_workspace_id: 'ws-oldest' });
     });
 
     it('refuses BEFORE any mutation when the user has no workspace — the token survives', async () => {
       // r1 P1: the refusal must come before the lineage insert and the
       // token-used update. A failed redeem that burns the one-time token
       // strands the invitee permanently.
-      const { client, mutations } = tableAwareSupabase({
+      const { client, mutations, rpcCalls } = tableAwareSupabase({
         identityWorkspaces: [],
         oldestWorkspace: null,
       });
@@ -540,10 +546,11 @@ describe('KindleService', () => {
 
       await expect(svc.redeemKindleToken('abc123hex', 'new-user')).rejects.toThrow(/no workspace/);
       expect(mutations).toEqual([]);
+      expect(rpcCalls).toEqual([]);
     });
 
     it('a workspace lookup error refuses before any mutation — fail closed, token survives', async () => {
-      const { client, mutations } = tableAwareSupabase({
+      const { client, mutations, rpcCalls } = tableAwareSupabase({
         identityWorkspaces: { error: 'db down' },
         oldestWorkspace: { id: 'ws-oldest' },
       });
@@ -551,6 +558,26 @@ describe('KindleService', () => {
 
       await expect(svc.redeemKindleToken('abc123hex', 'new-user')).rejects.toThrow(
         /Cannot resolve workspace/
+      );
+      expect(mutations).toEqual([]);
+      expect(rpcCalls).toEqual([]);
+    });
+
+    it('an atomic-redeem failure surfaces — nothing to unwind client-side', async () => {
+      // The transaction boundary lives in redeem_kindle_token: an identity
+      // collision or FK violation inside it rolls back token consumption and
+      // lineage together (proven against the real DB in
+      // kindle-redeem.integration.test.ts). The unit claim is propagation:
+      // the RPC error becomes a redeem error, and no client-side writes ran.
+      const { client, mutations } = tableAwareSupabase({
+        identityWorkspaces: [],
+        oldestWorkspace: { id: 'ws-oldest' },
+        rpcResult: { data: null, error: { message: 'duplicate key value' } },
+      });
+      const svc = new KindleService(client);
+
+      await expect(svc.redeemKindleToken('abc123hex', 'new-user')).rejects.toThrow(
+        /Failed to redeem kindle token: duplicate key/
       );
       expect(mutations).toEqual([]);
     });
