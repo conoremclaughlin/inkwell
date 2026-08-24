@@ -13,6 +13,8 @@ import { z } from 'zod';
 import type { DataComposer } from '../../data/composer';
 import { getAgentGateway, type AgentTriggerPayload } from '../../channels/agent-gateway';
 import { resolveUser } from '../../services/user-resolver';
+import { senderRoutingContext, isBridgeIdentity, senderSbId } from './sender-context.js';
+import { getPinnedAgentId } from '../../utils/request-context';
 import { logger } from '../../utils/logger';
 
 type McpResponse = {
@@ -75,7 +77,7 @@ export const triggerAgentSchema = z.object({
 
 export async function handleTriggerAgent(
   args: z.infer<typeof triggerAgentSchema>,
-  _dataComposer: DataComposer
+  dataComposer: DataComposer
 ): Promise<McpResponse> {
   try {
     logger.info(`trigger_agent called: ${args.fromAgentId} → ${args.toAgentId}`, {
@@ -83,12 +85,44 @@ export async function handleTriggerAgent(
       priority: args.priority,
     });
 
+    // Stamp the AUTHENTICATED user onto the payload (server-side, post-auth —
+    // trustworthy provenance, unlike caller-supplied fields on public trigger
+    // routes). Without it, a bare trigger_agent(threadKey) failure cannot be
+    // routed anywhere: the failure listener has no source row to resolve the
+    // user from, so the notice was silently dropped (PR #487, Lumen).
+    const resolved = await resolveUser({}, dataComposer).catch(() => null);
+
     const gateway = getAgentGateway();
 
     // Check if target has a handler
     if (!gateway.hasHandler(args.toAgentId)) {
       // Still attempt - handler might be registered by the time we process
       logger.warn(`No handler currently registered for ${args.toAgentId}, attempting anyway`);
+    }
+
+    // Resolved before the payload literal and defensively: a composer without
+    // a client (or a lookup failure) must not take down the dispatch — it only
+    // means no bridge exclusion, and routing already fails closed from there.
+    let senderIsBridge = false;
+    try {
+      const client =
+        typeof dataComposer?.getClient === 'function' ? dataComposer.getClient() : null;
+      if (client && resolved?.user?.id) {
+        // Classify the AUTHENTICATED sender, never args.fromAgentId — that is
+        // caller-supplied, so a relay could simply claim a non-bridge name and
+        // re-enable the inference this exclusion exists to prevent
+        // (Lumen, PR #514 round 2). Falls back to the declared slug only when
+        // there is no pinned identity, which is the unauthenticated path.
+        const pinned = getPinnedAgentId();
+        senderIsBridge = await isBridgeIdentity(
+          client,
+          resolved.user.id,
+          pinned || args.fromAgentId,
+          senderSbId()
+        );
+      }
+    } catch {
+      senderIsBridge = false;
     }
 
     const payload: AgentTriggerPayload = {
@@ -102,6 +136,10 @@ export async function handleTriggerAgent(
       studioId: args.studioId,
       studioHint: args.studioHint,
       recipientSessionId: args.recipientSessionId,
+      // Caller-repo inference degrades silently to refuse-and-hold on any
+      // dispatch path that forgets this (Lumen, PR #514 round 1).
+      ...senderRoutingContext(senderIsBridge),
+      ...(resolved?.user?.id ? { recipientUserId: resolved.user.id } : {}),
       metadata: args.metadata,
     };
 

@@ -216,6 +216,18 @@ const envSchema = z.object({
   DEFAULT_CLAUDE_MODEL: optionalString,
   DEFAULT_CODEX_MODEL: optionalString,
   DEFAULT_GEMINI_MODEL: optionalString,
+  DEFAULT_ANTIGRAVITY_MODEL: optionalString,
+
+  // Server-triggered compaction for claude-code-backend sessions. OPT-IN:
+  // Claude Code auto-compacts natively (--autocompact), and the server's
+  // measured context count is billing-derived and approximate, so the
+  // server-side rotate-at-threshold stays off unless explicitly enabled
+  // (Conor, 2026-08-20).
+  SERVER_COMPACTION_ENABLED: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((v) => v === 'true'),
+  COMPACTION_THRESHOLD: optionalNumber,
 });
 
 // Parse and validate environment variables

@@ -152,11 +152,16 @@ vite.config.ts.timestamp-*
 .gemini/
 .mcp.json
 
-# Local PCP identity should be machine/user-specific
-.ink/identity.json
+# Local PCP identity should be machine/user-specific.
+# Leading **/ matters: a pattern containing a slash is anchored to this file's
+# directory, so plain `.ink/identity.json` only ever matched the repo root.
+# Hooks create a .ink/ beside whatever cwd they run in — packages/api,
+# packages/web, any studio worktree — and those went untracked-but-not-ignored
+# until someone's `git add -A` swept them in.
+**/.ink/identity.json
 
 # PCP hook runtime state (transient, per-session)
-.ink/runtime/
+**/.ink/runtime/
 
 # Local automation / benchmark artifacts
 .playwright-cli/

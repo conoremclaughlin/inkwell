@@ -11,6 +11,9 @@ export {
   resolveMainStudio,
   isMainStudio,
   resolveStudioHint,
+  RoutingRefusedError,
+  UnresolvedStudioError,
+  type StudioRoutingDecision,
   type SessionServiceConfig,
   type IActivityStream,
 } from './session-service.js';
@@ -25,6 +28,7 @@ export { ContextBuilder, formatInjectedContext } from './context-builder.js';
 export { ClaudeRunner, buildIdentityPrompt } from './claude-runner.js';
 export { CodexRunner } from './codex-runner.js';
 export { GeminiRunner } from './gemini-runner.js';
+export { AntigravityRunner } from './antigravity-runner.js';
 export { InkRunner } from './ink-runner.js';
 
 // Types

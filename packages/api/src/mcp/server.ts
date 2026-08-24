@@ -9,6 +9,7 @@ import { MCP_SERVER_NAME, MCP_SERVER_VERSION, MCP_SERVER_DESCRIPTION } from '../
 import { env } from '../config/env';
 import { logger } from '../utils/logger';
 import type { DataComposer } from '../data/composer';
+import { GraphExecutorService } from '../services/graph-executor.service';
 import {
   registerAllTools,
   setMiniAppsRegistry,
@@ -33,7 +34,7 @@ import {
   type ChannelGatewayConfig,
   type IncomingMessageHandler,
 } from '../channels/gateway';
-import { runWithRequestContext } from '../utils/request-context';
+import { runWithRequestContext, tokenIdentityContext } from '../utils/request-context';
 import { resolveWorkspaceContextForRequest } from '../utils/workspace-scope';
 import { getRuntimeBuildInfo } from '../utils/runtime-build-info';
 import { PcpAuthProvider } from './auth/pcp-auth-provider';
@@ -494,6 +495,11 @@ export class MCPServer {
       // identity — canonical sbId first — to user-token requests so
       // pinned-agent dispatch and workspace derivation work for ink-routed
       // tool calls.
+      // Snapshot the token's own identity before enrichment. Authorization
+      // reads these; everything below may be overwritten by session-derived
+      // values that are routing hints, not authentication facts.
+      Object.assign(ctx, tokenIdentityContext(userData));
+
       const effectiveIdentity = await this.enrichIdentityFromContextSession(userData, contextToken);
       if (effectiveIdentity && effectiveIdentity !== userData) {
         Object.assign(ctx, {
@@ -1069,6 +1075,21 @@ export class MCPServer {
       },
       6 * 60 * 60 * 1000
     );
+
+    // Workflow graph reconciliation sweep (spec v10 §Durable push): re-runs
+    // the same readiness evaluator as the push path over active graph
+    // groups — recovering lost dispatches, opening dwelling gates at
+    // eligible_at, reclaiming ended-session claims. Idempotent; duplicate
+    // triggers are absorbed by claims. Set ENABLE_GRAPH_SWEEP=false on
+    // isolated test servers (the main server owns dispatch).
+    if (process.env.ENABLE_GRAPH_SWEEP !== 'false') {
+      const sweepMs = Number(process.env.GRAPH_SWEEP_INTERVAL_MS || 60_000);
+      const graphExecutor = new GraphExecutorService(this.dataComposer);
+      setInterval(() => {
+        graphExecutor.sweepAll().catch((err) => logger.warn('Graph sweep tick failed:', err));
+      }, sweepMs);
+      logger.info(`Graph reconciliation sweep enabled (every ${Math.round(sweepMs / 1000)}s)`);
+    }
 
     // Initialize channel gateway if message handler is configured
     if (this.config.messageHandler) {

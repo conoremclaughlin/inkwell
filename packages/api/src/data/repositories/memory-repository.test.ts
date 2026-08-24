@@ -22,6 +22,106 @@ describe('MemoryRepository', () => {
     repo = new MemoryRepository(mockSupabase as unknown as SupabaseClient);
   });
 
+  // ---------------------------------------------------
+  // Session reuse must be scoped by the canonical owner.
+  //
+  // `agent_id` is unique only per (user_id, workspace_id), so matching on the
+  // slug can return a same-named identity's session from another workspace —
+  // including its backendSessionId, which resumes that conversation.
+  // ---------------------------------------------------
+  describe('session reuse scoping', () => {
+    const eqCalls = () =>
+      (mockSupabase._queryBuilder.eq as unknown as { mock: { calls: unknown[][] } }).mock.calls;
+
+    it('getActiveSession filters on sb_id and not agent_id when given one', async () => {
+      mockSupabase._setReturnData(null, { code: 'PGRST116' });
+
+      await repo.getActiveSession('user-1', 'myra', undefined, undefined, 'sb-myra');
+
+      expect(eqCalls()).toContainEqual(['sb_id', 'sb-myra']);
+      expect(eqCalls()).not.toContainEqual(['agent_id', 'myra']);
+    });
+
+    it('getActiveSession falls back to agent_id without a canonical owner', async () => {
+      mockSupabase._setReturnData(null, { code: 'PGRST116' });
+
+      await repo.getActiveSession('user-1', 'myra');
+
+      expect(eqCalls()).toContainEqual(['agent_id', 'myra']);
+      expect(eqCalls().some((c) => c[0] === 'sb_id')).toBe(false);
+    });
+
+    it('getActiveSessionByThreadKey filters on sb_id and not agent_id', async () => {
+      mockSupabase._setReturnData(null, { code: 'PGRST116' });
+
+      await repo.getActiveSessionByThreadKey(
+        'user-1',
+        'myra',
+        'pr:501',
+        undefined,
+        undefined,
+        'sb-myra'
+      );
+
+      expect(eqCalls()).toContainEqual(['sb_id', 'sb-myra']);
+      expect(eqCalls()).not.toContainEqual(['agent_id', 'myra']);
+    });
+
+    it('getActiveSessionByThreadKey falls back to agent_id without one', async () => {
+      mockSupabase._setReturnData(null, { code: 'PGRST116' });
+
+      await repo.getActiveSessionByThreadKey('user-1', 'myra', 'pr:501');
+
+      expect(eqCalls()).toContainEqual(['agent_id', 'myra']);
+      expect(eqCalls().some((c) => c[0] === 'sb_id')).toBe(false);
+    });
+
+    it('startSession stamps the supplied canonical owner without re-resolving', async () => {
+      mockSupabase._setReturnData({
+        id: 's1',
+        user_id: 'user-1',
+        agent_id: 'myra',
+        sb_id: 'sb-myra',
+        studio_id: null,
+        thread_key: null,
+        current_phase: null,
+        started_at: '2026-08-20T10:00:00Z',
+        ended_at: null,
+        summary: null,
+        metadata: {},
+      });
+
+      await repo.startSession({ userId: 'user-1', agentId: 'myra', sbId: 'sb-myra' });
+
+      const insert = (
+        mockSupabase._queryBuilder.insert as unknown as { mock: { calls: unknown[][] } }
+      ).mock.calls[0][0] as Record<string, unknown>;
+      expect(insert.sb_id).toBe('sb-myra');
+    });
+
+    it('maps contact_id onto the session model', async () => {
+      // Authorization compares session.contactId; if the mapper drops it every
+      // contact session reads as owner-scoped.
+      mockSupabase._setReturnData({
+        id: 's1',
+        user_id: 'user-1',
+        agent_id: 'myra',
+        sb_id: 'sb-myra',
+        contact_id: 'contact-a',
+        studio_id: null,
+        thread_key: null,
+        current_phase: null,
+        started_at: '2026-08-20T10:00:00Z',
+        ended_at: null,
+        summary: null,
+        metadata: {},
+      });
+
+      const session = await repo.getSession('s1');
+      expect(session?.contactId).toBe('contact-a');
+    });
+  });
+
   describe('remember', () => {
     it('should create a memory with required fields', async () => {
       disableEmbeddings();
@@ -684,6 +784,58 @@ describe('MemoryRepository', () => {
     });
 
     describe('listSessions', () => {
+      it('uses authoritative terminal fields for the legacy active filter', async () => {
+        // Terminal sessions can retain the deprecated DB-default status='active':
+        // endSession() stamps ended_at + lifecycle but deliberately no longer
+        // synchronizes status. An active listing must therefore filter on the
+        // authoritative fields rather than that stale legacy value.
+        const staleTerminalRow = {
+          id: 'terminal-with-stale-status',
+          user_id: 'user-456',
+          agent_id: 'wren',
+          status: 'active',
+          lifecycle: 'completed',
+          ended_at: '2026-08-20T00:00:00Z',
+          started_at: '2026-08-19T00:00:00Z',
+          metadata: {},
+        };
+        // Lumen's regression, retargeted at the stricter predicate: terminal
+        // lifecycles are excluded by name rather than only 'failed', so that a
+        // 'completed' lifecycle carrying no ended_at cannot leak through.
+        // list-sessions-status.test.ts covers the row selection itself.
+        let filtersOpenSessions = false;
+        let filtersTerminalLifecycles = false;
+        mockSupabase._queryBuilder.is = vi.fn((column: string, value: unknown) => {
+          filtersOpenSessions ||= column === 'ended_at' && value === null;
+          return mockSupabase._queryBuilder;
+        });
+        mockSupabase._queryBuilder.not = vi.fn(
+          (column: string, operator: string, value: unknown) => {
+            filtersTerminalLifecycles ||=
+              column === 'lifecycle' && operator === 'in' && value === '(completed,failed)';
+            return mockSupabase._queryBuilder;
+          }
+        );
+        mockSupabase._queryBuilder.then = (
+          resolve: (value: { data: unknown; error: unknown }) => void
+        ) => {
+          const data = filtersOpenSessions && filtersTerminalLifecycles ? [] : [staleTerminalRow];
+          resolve({ data, error: null });
+          return Promise.resolve({ data, error: null });
+        };
+
+        const sessions = await repo.listSessions('user-456', { status: 'active' });
+
+        expect(sessions).toEqual([]);
+        expect(mockSupabase._queryBuilder.is).toHaveBeenCalledWith('ended_at', null);
+        expect(mockSupabase._queryBuilder.not).toHaveBeenCalledWith(
+          'lifecycle',
+          'in',
+          '(completed,failed)'
+        );
+        expect(mockSupabase._queryBuilder.eq).not.toHaveBeenCalledWith('status', 'active');
+      });
+
       it('should filter by studioId when provided', async () => {
         mockSupabase._setArrayData([]);
 
@@ -810,6 +962,42 @@ describe('MemoryRepository', () => {
       const updateCall = (mockSupabase._queryBuilder.update as ReturnType<typeof vi.fn>).mock
         .calls[0][0];
       expect(updateCall.status).toBe('resumable');
+    });
+
+    // Without this mapping, handleUpdateSessionPhase can compute an endedAt and
+    // have it silently dropped here — which is how `ended_at` stayed NULL on
+    // every completed session and made findByThreadKey's `ended_at IS NULL`
+    // clause a no-op (PR #349, revived).
+    it('should write ended_at when endedAt is supplied', async () => {
+      mockSupabase._setReturnData(mockSessionRow);
+      const endedAt = new Date('2026-08-13T07:00:00Z');
+
+      await repo.updateSession('session-123', { endedAt });
+
+      const updateCall = (mockSupabase._queryBuilder.update as ReturnType<typeof vi.fn>).mock
+        .calls[0][0];
+      expect(updateCall.ended_at).toBe('2026-08-13T07:00:00.000Z');
+    });
+
+    it('should clear ended_at when endedAt is explicitly null', async () => {
+      mockSupabase._setReturnData(mockSessionRow);
+
+      await repo.updateSession('session-123', { endedAt: null });
+
+      const updateCall = (mockSupabase._queryBuilder.update as ReturnType<typeof vi.fn>).mock
+        .calls[0][0];
+      expect(updateCall.ended_at).toBeNull();
+    });
+
+    // "not provided" must stay distinct from "explicitly cleared".
+    it('should leave ended_at untouched when endedAt is omitted', async () => {
+      mockSupabase._setReturnData(mockSessionRow);
+
+      await repo.updateSession('session-123', { status: 'resumable' });
+
+      const updateCall = (mockSupabase._queryBuilder.update as ReturnType<typeof vi.fn>).mock
+        .calls[0][0];
+      expect(updateCall).not.toHaveProperty('ended_at');
     });
 
     it('should update context and workingDir', async () => {

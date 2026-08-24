@@ -56,6 +56,32 @@ export type SessionStatus = 'active' | 'paused' | 'completed' | 'failed';
  * thread changes — resume onto a new thread, compaction, or a fresh run. A
  * checkpoint from a different thread must never be diffed against.
  */
+/**
+ * One model's accumulated contribution to a session. `costUSD` is the
+ * backend's own cost figure, which answers the spend question directly
+ * instead of requiring a price table here.
+ */
+export interface ModelUsageTotals {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  /**
+   * The backend's own cost figure. Optional: tokens can be readable while
+   * cost is not reported, and publishing 0 there would make a summed cost
+   * silently under-report (Lumen, PR #500 round 2).
+   */
+  costUSD?: number;
+  /**
+   * True when at least one contribution to `costUSD` did not report a cost, so
+   * the figure is a LOWER BOUND rather than the total. Without this, a mixed
+   * run publishes a subtotal that reads as complete — the same false certainty
+   * as a zero, one level up (Lumen, PR #500 round 3).
+   */
+  costPartial?: boolean;
+  canonicalModel?: string;
+}
+
 export interface UsageCheckpoint {
   backendSessionId: string | null;
   inputTokens: number;
@@ -88,6 +114,24 @@ export interface Session {
   contextTokens: number;
   totalInputTokens: number;
   totalOutputTokens: number;
+
+  /**
+   * Cache breakdown of `totalInputTokens` — NOT additional tokens. Cached
+   * input bills at a different rate from fresh input (reads 0.1x, writes
+   * 1.25x), so cost attribution needs the split, while context-window math
+   * needs the total. Only backends that report caching populate these.
+   */
+  totalCacheReadTokens: number;
+  totalCacheWriteTokens: number;
+
+  /**
+   * Per-model totals for this session, keyed exactly as the backend reported
+   * them. Authoritative for "which models actually ran and what did they
+   * cost" — it covers subagents, aliases and mid-session model changes, none
+   * of which the single `model` column can express. Keys are never merged
+   * here; grouping (e.g. by canonicalModel) belongs to the reporting layer.
+   */
+  modelUsage?: Record<string, ModelUsageTotals>;
 
   /**
    * Last cumulative usage observed from a backend that reports running
@@ -218,6 +262,8 @@ export interface SessionResult {
     outputTokens: number;
     cacheReadTokens?: number;
     cacheWriteTokens?: number;
+    /** This turn's per-model figures, keyed as the backend reported them. */
+    modelUsage?: Record<string, ModelUsageTotals>;
     /**
      * True when the backend reports running thread totals instead of a
      * per-turn delta (Codex `turn.completed.usage` is `ThreadTokenUsage.total`).
@@ -391,14 +437,24 @@ export interface ISessionRepository {
   findByUserAndAgent(
     userId: string,
     agentId: string,
-    options?: { status?: SessionStatus; type?: SessionType; studioId?: string; contactId?: string }
+    options?: {
+      status?: SessionStatus;
+      type?: SessionType;
+      studioId?: string;
+      contactId?: string;
+      /** Canonical identity UUID — preferred over the ambiguous slug. */
+      sbId?: string | null;
+    }
   ): Promise<Session | null>;
 
   findByThreadKey?(
     userId: string,
     agentId: string,
     threadKey: string,
-    studioId?: string
+    studioId?: string,
+    contactId?: string,
+    /** Canonical identity UUID — preferred over the ambiguous slug. */
+    sbId?: string | null
   ): Promise<Session | null>;
 
   findByUser(
@@ -413,7 +469,10 @@ export interface ISessionRepository {
 
   create(session: Omit<Session, 'id' | 'startedAt' | 'lastActivityAt'>): Promise<Session>;
 
-  update(id: string, updates: Partial<Session>): Promise<Session>;
+  update(
+    id: string,
+    updates: Omit<Partial<Session>, 'studioId'> & { studioId?: string | null }
+  ): Promise<Session>;
 
   updateTokenUsage(
     id: string,
@@ -422,6 +481,11 @@ export interface ISessionRepository {
       contextTokens?: number;
       inputTokens: number;
       outputTokens: number;
+      /** Cache breakdown of `inputTokens`, not additions to it. */
+      cacheReadTokens?: number;
+      cacheWriteTokens?: number;
+      /** This turn's per-model figures, keyed as the backend reported them. */
+      modelUsage?: Record<string, ModelUsageTotals>;
       /**
        * True when the counts are running totals for `backendSessionId`
        * rather than this turn's delta. The repository diffs them against
@@ -515,6 +579,15 @@ export interface ClaudeRunnerConfig {
   /** Root repo path — propagated via context token for cross-project 'main' resolution */
   repoRoot?: string;
   /**
+   * This server's own MCP endpoint, derived from the port it actually bound.
+   *
+   * Needed because a committed `.mcp.json` is not evidence of where the server
+   * is listening: `PCP_PORT_BASE=4001 yarn dev` moves the listener without
+   * rewriting that file. Runners that hand credentials to a subprocess must
+   * target the real endpoint or they leak them to whoever owns the default port.
+   */
+  inkMcpUrl?: string;
+  /**
    * Additional permission rules to merge into .claude/settings.local.json
    * before this session's spawn. Restored to the original after the process
    * exits. Used by strategy configs and 2FA permission grants.
@@ -537,6 +610,12 @@ export interface RunnerResult {
   backendSessionId: string | null;
   responses: ChannelResponse[];
   usage?: SessionResult['usage'];
+  /**
+   * The model that served the main conversation, as the backend reported it
+   * on its own top-level assistant messages. Distinct from per-model usage:
+   * that says which models spent tokens, this says which one WAS the agent.
+   */
+  servedModel?: string;
   error?: string;
   /** The final text response from the backend (for auto-routing if no explicit send_response) */
   finalTextResponse?: string;

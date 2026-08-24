@@ -25,6 +25,19 @@ export interface PcpTokenPayload {
   agentId?: string; // Bound agent identity label (absent for human users)
   identityId?: string; // Canonical agent_identities UUID (JWT claim — kept as identityId for token compat)
   sbId?: string; // New-style alias for identityId in runner tokens
+  /**
+   * Session and contact this runner token was minted FOR.
+   *
+   * These are the authenticated binding between a runner process and the
+   * conversation it serves. The `x-ink-context` header carries the same two
+   * values, but it is unsigned base64url JSON the caller composes, so it can
+   * only ever be a routing hint. One SB identity serves many contacts, which
+   * means without a signed claim there is no authenticated per-contact
+   * distinction at all — naming another contact's session would pass an
+   * identity check that only compares sbId (Lumen, PR #501 round 3).
+   */
+  sessionId?: string;
+  contactId?: string;
 }
 
 // ============================================================================
@@ -39,6 +52,45 @@ export function signPcpAccessToken(payload: PcpTokenPayload, expiresInSeconds: n
   return jwt.sign(payload, env.JWT_SECRET, {
     expiresIn: expiresInSeconds,
   });
+}
+
+/**
+ * Sign the access token a spawned runner carries.
+ *
+ * Lives here, beside the verifier, because the two have to agree on the claim
+ * names for the contact boundary to hold — a runner issued without
+ * `contactId` looks owner-scoped and is refused its own contact's session.
+ * SessionService used to sign these inline with its own jwt.sign() against
+ * process.env.JWT_SECRET while verification read env.JWT_SECRET; identical
+ * today, but two signing paths for one verifier is a latent way to break that
+ * agreement silently.
+ */
+export function signRunnerAccessToken(
+  claims: {
+    userId: string;
+    email: string;
+    agentId?: string;
+    sbId?: string;
+    /** The session this runner was spawned for. */
+    sessionId?: string;
+    /** The contact conversation it serves; absent for owner sessions. */
+    contactId?: string;
+  },
+  expiresInSeconds = 60 * 60
+): string {
+  return signPcpAccessToken(
+    {
+      type: 'mcp_access',
+      sub: claims.userId,
+      email: claims.email,
+      scope: 'mcp:tools',
+      ...(claims.agentId ? { agentId: claims.agentId } : {}),
+      ...(claims.sbId ? { sbId: claims.sbId } : {}),
+      ...(claims.sessionId ? { sessionId: claims.sessionId } : {}),
+      ...(claims.contactId ? { contactId: claims.contactId } : {}),
+    },
+    expiresInSeconds
+  );
 }
 
 // ============================================================================

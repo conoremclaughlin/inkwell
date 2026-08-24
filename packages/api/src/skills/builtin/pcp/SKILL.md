@@ -55,7 +55,7 @@ Inkwell tools are available via MCP. If the Inkwell MCP server is not already co
 ```json
 {
   "mcpServers": {
-    "pcp": {
+    "inkwell": {
       "command": "node",
       "args": ["/path/to/pcp/packages/api/dist/index.js"],
       "env": { "MCP_TRANSPORT": "stdio" }
@@ -69,7 +69,7 @@ Inkwell tools are available via MCP. If the Inkwell MCP server is not already co
 ```json
 {
   "mcpServers": {
-    "pcp": {
+    "inkwell": {
       "url": "http://localhost:3001/mcp",
       "headers": {
         "Authorization": "Bearer ${INK_ACCESS_TOKEN}"

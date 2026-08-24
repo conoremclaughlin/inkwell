@@ -41,6 +41,19 @@ import type {
 
 type RecallMode = NonNullable<MemorySearchOptions['recallMode']>;
 
+/**
+ * Lifecycle values that mean the session is over. PostgREST `in` list syntax,
+ * shared by the queries that need to tell live sessions from finished ones.
+ */
+const TERMINAL_LIFECYCLES = '(completed,failed)';
+
+/**
+ * The `status` values `list_sessions` accepts. Mirrors the enum on
+ * `listSessionsSchema` — this is a filter over derived current state, not a
+ * read of the deprecated `sessions.status` column.
+ */
+export type SessionStatusFilter = 'active' | 'paused' | 'resumable' | 'completed';
+
 export interface KnowledgeMemoryContext {
   threadKey?: string;
   focusText?: string;
@@ -1430,10 +1443,15 @@ export class MemoryRepository {
    * Start a new session
    */
   async startSession(input: SessionCreateInput): Promise<Session> {
+    // Prefer the caller's verified canonical identity. Re-resolving from the
+    // slug is a fallback for callers that have none: `agent_id` is unique only
+    // per (user_id, workspace_id), so the lookup can land on a same-named
+    // identity in another workspace and stamp the row with the wrong owner.
     const sbId =
-      input.agentId && input.userId
+      input.sbId ??
+      (input.agentId && input.userId
         ? await resolveIdentityId(this.supabase, input.userId, input.agentId)
-        : null;
+        : null);
 
     const insertData: Record<string, unknown> = {
       ...(input.id ? { id: input.id } : {}),
@@ -1507,8 +1525,10 @@ export class MemoryRepository {
       workingDir?: string;
       cliAttached?: boolean;
       cliPollAt?: string;
+      cliTurnAt?: string | null;
       alias?: string | null;
       activeThreadKey?: string | null;
+      endedAt?: Date | null;
     }
   ): Promise<Session | null> {
     const dbUpdates: Record<string, unknown> = {};
@@ -1540,11 +1560,17 @@ export class MemoryRepository {
     if (updates.cliPollAt !== undefined) {
       (dbUpdates as Record<string, unknown>).cli_poll_at = updates.cliPollAt;
     }
+    if (updates.cliTurnAt !== undefined) {
+      (dbUpdates as Record<string, unknown>).cli_turn_at = updates.cliTurnAt;
+    }
     if (updates.alias !== undefined) {
       (dbUpdates as Record<string, unknown>).alias = updates.alias;
     }
     if (updates.activeThreadKey !== undefined) {
       (dbUpdates as Record<string, unknown>).active_thread_key = updates.activeThreadKey;
+    }
+    if (updates.endedAt !== undefined) {
+      dbUpdates.ended_at = updates.endedAt ? updates.endedAt.toISOString() : null;
     }
 
     const { data, error } = await this.supabase
@@ -1579,6 +1605,66 @@ export class MemoryRepository {
   }
 
   /**
+   * Active sessions owned by one identity, newest first.
+   *
+   * Unlike getActiveSession this returns candidates rather than a single row,
+   * so callers can tell "exactly one session" apart from "several — refuse to
+   * guess". Picking the newest of several is what let a write land on a peer's
+   * session (see resolveImplicitSession).
+   *
+   * Ownership is scoped by user_id plus a canonical `sbId` when the caller has
+   * one. `agentId` is a fallback for rows predating sb_id: the slug is unique
+   * only per (user_id, workspace_id), so two identities in different workspaces
+   * share it and it cannot be an ownership predicate on its own.
+   *
+   * studioId: undefined = any studio, null = only sessions with no studio,
+   * string = that studio.
+   */
+  async findOwnedActiveSessions(params: {
+    userId: string;
+    sbId?: string;
+    agentId?: string;
+    studioId?: string | null;
+    contactId?: string;
+    limit?: number;
+  }): Promise<Session[]> {
+    const { userId, sbId, agentId, studioId, contactId, limit = 5 } = params;
+
+    let query = this.supabase
+      .from('sessions')
+      .select('*')
+      .eq('user_id', userId)
+      .is('ended_at', null)
+      .neq('lifecycle', 'failed')
+      .order('started_at', { ascending: false })
+      .limit(limit);
+
+    // Prefer the canonical identity; only fall back to the ambiguous slug.
+    if (sbId) {
+      query = query.eq('sb_id', sbId);
+    } else if (agentId) {
+      query = query.eq('agent_id', agentId);
+    }
+
+    if (studioId !== undefined) {
+      query = studioId === null ? query.is('studio_id', null) : query.eq('studio_id', studioId);
+    }
+
+    // Mirrors getActiveSession: contact sessions match their contact, owner
+    // sessions match NULL, so per-sender isolation is never collapsed.
+    query = contactId ? query.eq('contact_id', contactId) : query.is('contact_id', null);
+
+    const { data, error } = await query;
+
+    if (error) {
+      logger.error('Failed to find owned active sessions:', error);
+      throw new Error(`Failed to find owned active sessions: ${error.message}`);
+    }
+
+    return (data || []).map((row) => this.rowToSession(row));
+  }
+
+  /**
    * Get active session for a user (most recent without ended_at).
    *
    * studioId behavior:
@@ -1590,7 +1676,13 @@ export class MemoryRepository {
     userId: string,
     agentId?: string,
     studioId?: string | null,
-    contactId?: string
+    contactId?: string,
+    /**
+     * Canonical owner. When supplied it REPLACES the slug filter: `agent_id` is
+     * unique only per (user_id, workspace_id), so matching on it alone can
+     * return a same-named identity's session from another workspace.
+     */
+    sbId?: string
   ): Promise<Session | null> {
     let query = this.supabase
       .from('sessions')
@@ -1601,7 +1693,11 @@ export class MemoryRepository {
       .order('started_at', { ascending: false })
       .limit(1);
 
-    if (agentId) {
+    // Prefer the canonical owner; the slug is the fallback for callers that
+    // have no canonical identity.
+    if (sbId) {
+      query = query.eq('sb_id', sbId);
+    } else if (agentId) {
       query = query.eq('agent_id', agentId);
     }
 
@@ -1641,18 +1737,23 @@ export class MemoryRepository {
     agentId: string,
     threadKey: string,
     studioId?: string | null,
-    contactId?: string
+    contactId?: string,
+    /** Canonical owner; replaces the slug filter when supplied. */
+    sbId?: string
   ): Promise<Session | null> {
     let query = this.supabase
       .from('sessions')
       .select('*')
       .eq('user_id', userId)
-      .eq('agent_id', agentId)
       .eq('thread_key', threadKey)
       .is('ended_at', null)
       .neq('lifecycle', 'failed')
       .order('started_at', { ascending: false })
       .limit(1);
+
+    // Prefer the canonical owner; the slug is the fallback for callers that
+    // have no canonical identity.
+    query = sbId ? query.eq('sb_id', sbId) : query.eq('agent_id', agentId);
 
     if (studioId !== undefined) {
       if (studioId === null) {
@@ -1722,6 +1823,7 @@ export class MemoryRepository {
       studioId?: string;
       filterNullStudio?: boolean;
       backend?: string;
+      status?: SessionStatusFilter;
     } = {}
   ): Promise<Session[]> {
     let query = this.supabase
@@ -1742,6 +1844,40 @@ export class MemoryRepository {
 
     if (options.backend) {
       query = query.eq('backend', options.backend);
+    }
+
+    if (options.status) {
+      // `status` filters on the session's *current* state, derived from the
+      // authoritative columns rather than from the deprecated `status`
+      // column — which no terminal path keeps in sync. `endSession()` sets
+      // ended_at + lifecycle 'completed' and leaves status at its 'active'
+      // default, and lifecycle-only completions do the same. Filtering the
+      // legacy column therefore handed finished sessions back to every
+      // caller that asked for live ones.
+      //
+      // Terminal lifecycles are excluded by name rather than just
+      // `neq('lifecycle', 'failed')`, so that a 'completed' lifecycle with no
+      // ended_at cannot leak through. Every completion path stamps ended_at
+      // today, so the two forms agree; this one keeps agreeing if one stops.
+      // findByThreadKey in services/sessions/session-repository.ts made the
+      // same move against the same defect — see the note there.
+      //
+      // A NULL lifecycle sorts as non-active here, because SQL's `NOT IN`
+      // yields NULL rather than true. The column has defaulted to 'idle'
+      // since the lifecycle migration and existing rows were backfilled, so
+      // that is unreachable in practice; getActiveSessions has the same
+      // property, so the two agree either way.
+      if (options.status === 'completed') {
+        query = query.or(`ended_at.not.is.null,lifecycle.in.${TERMINAL_LIFECYCLES}`);
+      } else {
+        query = query.is('ended_at', null).not('lifecycle', 'in', TERMINAL_LIFECYCLES);
+        // 'paused' and 'resumable' are agent-declared intent with no
+        // authoritative equivalent, so they still read the legacy column —
+        // but only among sessions that are still live.
+        if (options.status !== 'active') {
+          query = query.eq('status', options.status);
+        }
+      }
     }
 
     const limit = options.limit || 20;
@@ -2058,6 +2194,7 @@ export class MemoryRepository {
       userId: row.user_id,
       agentId: row.agent_id || undefined,
       sbId: row.sb_id || undefined,
+      contactId: row.contact_id || undefined,
       studioId,
       threadKey: row.thread_key || undefined,
       activeThreadKey: row.active_thread_key || undefined,

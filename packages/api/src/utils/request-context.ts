@@ -33,6 +33,29 @@ export interface RequestContextData {
   agentId?: string;
   /** Canonical agent_identities UUID (strongest identity binding) */
   sbId?: string;
+  /**
+   * Identity carried by the bearer token ITSELF, before any session-derived
+   * enrichment. `agentId`/`sbId` above may have been filled in from the
+   * caller's ambient session so that dispatch and workspace derivation work
+   * for ink-routed user-token calls — useful for routing, but not an
+   * authentication fact. Authorization must use these fields instead.
+   */
+  tokenAgentId?: string;
+  tokenSbId?: string;
+  /**
+   * Session and contact the bearer token was MINTED for — signed, therefore
+   * authenticated. `sessionId`/`contactId` above come from the unsigned
+   * x-ink-context header and are routing hints only; authorization must use
+   * these.
+   */
+  tokenSessionId?: string;
+  tokenContactId?: string;
+  /**
+   * True when the bearer token itself was agent-bound. Distinct from
+   * `callerProfile`, which defaults to 'agent' for every HTTP request and
+   * therefore says nothing about how the caller authenticated.
+   */
+  agentTokenBound?: boolean;
   /** Session ID if in a session */
   sessionId?: string;
   /** Active product workspace ID (parent-level, contains all documents and SBs) */
@@ -68,6 +91,37 @@ let sessionContext: Omit<RequestContextData, 'timestamp'> | null = null;
 // Session-scoped identity pin (immutable once set by bootstrap or token)
 // Prevents mid-session identity changes (e.g. via prompt injection)
 let pinnedSessionAgentId: string | null = null;
+
+/**
+ * The authenticated slice of the request context, derived from the bearer
+ * token alone.
+ *
+ * Extracted so the handoff is testable end to end. Everything downstream of
+ * this — contact isolation in particular — depends on these four fields
+ * surviving the trip from the runner's JWT into AsyncLocalStorage. A dropped
+ * claim does not fail loudly: a contact runner simply looks owner-scoped and
+ * is refused its own session.
+ */
+export function tokenIdentityContext(
+  tokenIdentity:
+    | {
+        agentId?: string;
+        sbId?: string;
+        sessionId?: string;
+        contactId?: string;
+      }
+    | null
+    | undefined
+): Partial<RequestContextData> {
+  if (!tokenIdentity?.agentId && !tokenIdentity?.sbId) return {};
+  return {
+    agentTokenBound: true,
+    ...(tokenIdentity.agentId ? { tokenAgentId: tokenIdentity.agentId } : {}),
+    ...(tokenIdentity.sbId ? { tokenSbId: tokenIdentity.sbId } : {}),
+    ...(tokenIdentity.sessionId ? { tokenSessionId: tokenIdentity.sessionId } : {}),
+    ...(tokenIdentity.contactId ? { tokenContactId: tokenIdentity.contactId } : {}),
+  };
+}
 
 /**
  * Run a function with request context set.
