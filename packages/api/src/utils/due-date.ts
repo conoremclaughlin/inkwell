@@ -14,6 +14,10 @@
 
 const BARE_DATE = /^\d{4}-\d{2}-\d{2}$/;
 
+/** Strict full timestamp: date, time, and a REQUIRED offset (Z or ±HH:MM). */
+const STRICT_TIMESTAMP =
+  /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?(Z|z|[+-]\d{2}:?\d{2})$/;
+
 /** A due date string the caller supplied that we cannot turn into an instant. */
 export class InvalidDueDateError extends Error {
   constructor(message: string) {
@@ -69,27 +73,47 @@ function offsetMinutesAt(instant: Date, timeZone: string): number {
   return Math.round((asIfUtc - instant.getTime()) / 60_000);
 }
 
+/** The zone-local calendar date of an instant, as a comparable number. */
+function localDateKey(instantMs: number, timeZone: string): number {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(new Date(instantMs));
+  const field = (type: string) => Number(parts.find((p) => p.type === type)?.value ?? '0');
+  return field('year') * 10_000 + field('month') * 100 + field('day');
+}
+
 /**
- * Convert wall-clock fields in `timeZone` to the UTC instant they name.
+ * The LAST instant of a calendar day in `timeZone`: the first instant of the
+ * next local day, minus 1 ms.
  *
- * Two passes: the offset depends on the instant, and the instant depends on the
- * offset. The first guess is corrected once, which settles every case except a
- * wall-clock time that a DST jump skipped entirely.
+ * Built as a boundary WALK rather than wall-clock arithmetic, because
+ * 23:59:59.999 does not always exist (a DST gap can swallow it — the old
+ * two-pass produced an instant an hour before the day actually ended in
+ * America/Godthab) and can exist twice (an overlap made the earlier
+ * occurrence win in America/Santiago, again ending the day early). The walk
+ * is definitionally correct in both cases: it finds the exact instant the
+ * local date flips, whatever the zone did that night. Offsets are
+ * whole-minute in every IANA zone since 1972, so a minute-granular walk
+ * lands exactly on the boundary; the two-pass guess starts within a few
+ * hours of it, bounding the walk.
  */
-function zonedWallClockToUtc(
-  year: number,
-  month: number,
-  day: number,
-  hour: number,
-  minute: number,
-  second: number,
-  ms: number,
-  timeZone: string
-): Date {
-  const wallClockAsUtc = Date.UTC(year, month - 1, day, hour, minute, second, ms);
-  const firstGuess = wallClockAsUtc - offsetMinutesAt(new Date(wallClockAsUtc), timeZone) * 60_000;
-  const corrected = wallClockAsUtc - offsetMinutesAt(new Date(firstGuess), timeZone) * 60_000;
-  return new Date(corrected);
+function endOfLocalDayUtc(year: number, month: number, day: number, timeZone: string): Date {
+  const dayKey = year * 10_000 + month * 100 + day;
+
+  // Initial guess: next-day local midnight via the offset at that wall clock.
+  const nextMidnightAsUtc = Date.UTC(year, month - 1, day + 1, 0, 0, 0, 0);
+  let t = nextMidnightAsUtc - offsetMinutesAt(new Date(nextMidnightAsUtc), timeZone) * 60_000;
+
+  // Walk forward while still inside the target day, back while the previous
+  // minute is already past it — converging on the first instant of the next
+  // local day.
+  while (localDateKey(t, timeZone) <= dayKey) t += 60_000;
+  while (localDateKey(t - 60_000, timeZone) > dayKey) t -= 60_000;
+
+  return new Date(t - 1);
 }
 
 /** Reject dates that roll over, e.g. 2026-02-30 or 2026-13-01. */
@@ -124,14 +148,39 @@ export function resolveDueDate(value: string, timezone: string): string {
       throw new InvalidDueDateError(`Invalid dueDate "${value}" — not a real calendar date.`);
     }
     const zone = isValidTimeZone(timezone) ? timezone : 'UTC';
-    return zonedWallClockToUtc(year, month, day, 23, 59, 59, 999, zone).toISOString();
+    return endOfLocalDayUtc(year, month, day, zone).toISOString();
   }
 
-  const parsed = new Date(trimmed);
-  if (Number.isNaN(parsed.getTime())) {
+  // Full timestamps must be STRICT ISO 8601 with an explicit offset.
+  // `new Date(string)` accepts far more — an offsetless timestamp resolves
+  // differently per API host's TZ, locale strings like 09/14/2026 parse, and
+  // impossible dates (Feb 30) silently normalize to March. The deadline a
+  // caller stated must not depend on where the server runs.
+  const m = STRICT_TIMESTAMP.exec(trimmed);
+  if (!m) {
     throw new InvalidDueDateError(
-      `Invalid dueDate "${value}" — use YYYY-MM-DD or a full ISO 8601 timestamp (e.g. 2026-09-14T17:00:00-07:00).`
+      `Invalid dueDate "${value}" — use YYYY-MM-DD, or a full ISO 8601 timestamp with an ` +
+        `explicit offset (e.g. 2026-09-14T17:00:00-07:00 or 2026-09-14T17:00:00Z).`
     );
   }
-  return parsed.toISOString();
+  const [, ys, mos, ds, hs, mins, secs = '0', msRaw = '0', offset] = m;
+  const [year, month, day, hour, minute, second] = [ys, mos, ds, hs, mins, secs].map(Number);
+  const ms = Number(msRaw.padEnd(3, '0').slice(0, 3));
+  if (!isRealCalendarDate(year, month, day)) {
+    throw new InvalidDueDateError(`Invalid dueDate "${value}" — not a real calendar date.`);
+  }
+  if (hour > 23 || minute > 59 || second > 59) {
+    throw new InvalidDueDateError(`Invalid dueDate "${value}" — not a real time of day.`);
+  }
+  let offsetMinutes = 0;
+  if (offset !== 'Z' && offset !== 'z') {
+    const om = /^([+-])(\d{2}):?(\d{2})$/.exec(offset)!;
+    offsetMinutes = (om[1] === '-' ? -1 : 1) * (Number(om[2]) * 60 + Number(om[3]));
+    if (Math.abs(offsetMinutes) > 14 * 60) {
+      throw new InvalidDueDateError(`Invalid dueDate "${value}" — impossible UTC offset.`);
+    }
+  }
+  return new Date(
+    Date.UTC(year, month - 1, day, hour, minute, second, ms) - offsetMinutes * 60_000
+  ).toISOString();
 }

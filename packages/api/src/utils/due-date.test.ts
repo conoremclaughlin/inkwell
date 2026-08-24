@@ -96,3 +96,62 @@ describe('resolveDueDate — qualified timestamps', () => {
     expect(() => resolveDueDate('   ', 'UTC')).toThrow(InvalidDueDateError);
   });
 });
+
+describe('resolveDueDate — DST transitions end the day when the day ends (r1 P2)', () => {
+  /** Local calendar day of an instant in a zone, as YYYYMMDD. */
+  function localDay(iso: string, timeZone: string): number {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).formatToParts(new Date(iso));
+    const f = (t: string) => Number(parts.find((p) => p.type === t)?.value ?? '0');
+    return f('year') * 10_000 + f('month') * 100 + f('day');
+  }
+
+  /** The boundary property that DEFINES end-of-day, robust across tzdata. */
+  function assertLastInstantOfDay(value: string, zone: string, expectDay: number) {
+    const resolved = resolveDueDate(value, zone);
+    const t = new Date(resolved).getTime();
+    expect(localDay(resolved, zone)).toBe(expectDay);
+    expect(localDay(new Date(t + 1).toISOString(), zone)).toBeGreaterThan(expectDay);
+  }
+
+  it('a spring-forward gap night (America/Godthab) still resolves to the LAST instant of the day', () => {
+    // The old wall-clock arithmetic produced an instant rendering locally as
+    // 22:59:59 — overdue an hour before the day ended.
+    assertLastInstantOfDay('2026-03-28', 'America/Godthab', 20260328);
+  });
+
+  it('a fall-back overlap night (America/Santiago) resolves past BOTH occurrences', () => {
+    assertLastInstantOfDay('2026-04-04', 'America/Santiago', 20260404);
+  });
+
+  it('an ordinary day still ends at local 23:59:59.999', () => {
+    expect(resolveDueDate('2026-09-14', 'America/Los_Angeles')).toBe('2026-09-15T06:59:59.999Z');
+  });
+});
+
+describe('resolveDueDate — strict timestamps only (r1 P2)', () => {
+  it('rejects an offsetless timestamp — the deadline must not depend on the API host TZ', () => {
+    expect(() => resolveDueDate('2026-09-14T17:00:00', 'UTC')).toThrow(InvalidDueDateError);
+  });
+
+  it('rejects impossible calendar fields instead of normalizing them', () => {
+    expect(() => resolveDueDate('2026-02-30T00:00:00Z', 'UTC')).toThrow(InvalidDueDateError);
+    expect(() => resolveDueDate('2026-09-14T24:30:00Z', 'UTC')).toThrow(InvalidDueDateError);
+  });
+
+  it('rejects locale strings', () => {
+    expect(() => resolveDueDate('09/14/2026', 'UTC')).toThrow(InvalidDueDateError);
+  });
+
+  it('accepts compact offsets and normalizes exactly', () => {
+    expect(resolveDueDate('2026-09-14T17:00:00+0530', 'UTC')).toBe('2026-09-14T11:30:00.000Z');
+  });
+
+  it('rejects impossible UTC offsets', () => {
+    expect(() => resolveDueDate('2026-09-14T17:00:00+19:00', 'UTC')).toThrow(InvalidDueDateError);
+  });
+});
