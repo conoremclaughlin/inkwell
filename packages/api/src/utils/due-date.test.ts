@@ -153,5 +153,11 @@ describe('resolveDueDate — strict timestamps only (r1 P2)', () => {
 
   it('rejects impossible UTC offsets', () => {
     expect(() => resolveDueDate('2026-09-14T17:00:00+19:00', 'UTC')).toThrow(InvalidDueDateError);
+    // The minute component is base-60 — a 99-minute field must not total
+    // into an accepted offset (r2), including under the 14:00 cap.
+    expect(() => resolveDueDate('2026-09-14T17:00:00+00:99', 'UTC')).toThrow(InvalidDueDateError);
+    expect(() => resolveDueDate('2026-09-14T17:00:00+12:60', 'UTC')).toThrow(InvalidDueDateError);
+    // The ISO maximum itself stays valid.
+    expect(resolveDueDate('2026-09-14T17:00:00+14:00', 'UTC')).toBe('2026-09-14T03:00:00.000Z');
   });
 });

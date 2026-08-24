@@ -175,7 +175,14 @@ export function resolveDueDate(value: string, timezone: string): string {
   let offsetMinutes = 0;
   if (offset !== 'Z' && offset !== 'z') {
     const om = /^([+-])(\d{2}):?(\d{2})$/.exec(offset)!;
-    offsetMinutes = (om[1] === '-' ? -1 : 1) * (Number(om[2]) * 60 + Number(om[3]));
+    const offsetHourPart = Number(om[2]);
+    const offsetMinutePart = Number(om[3]);
+    // The minute component is a base-60 field, not a free integer: +00:99
+    // would otherwise total to a "valid" 99-minute offset (Lumen #503 r2).
+    if (offsetMinutePart > 59) {
+      throw new InvalidDueDateError(`Invalid dueDate "${value}" — impossible UTC offset.`);
+    }
+    offsetMinutes = (om[1] === '-' ? -1 : 1) * (offsetHourPart * 60 + offsetMinutePart);
     if (Math.abs(offsetMinutes) > 14 * 60) {
       throw new InvalidDueDateError(`Invalid dueDate "${value}" — impossible UTC offset.`);
     }
