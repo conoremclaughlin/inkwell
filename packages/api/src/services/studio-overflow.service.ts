@@ -229,19 +229,35 @@ export class StudioOverflowService {
       if (existing) {
         // A matching row whose worktree is missing or cleaned — revive it
         // rather than colliding with the unique index on insert.
-        const revived = await this.studios.update(existing.id, {
-          status: 'active',
-          worktreePath: created.worktreePath,
-          purpose: `Overflow studio for ${threadKey} (parent ${parentStudio.slug || parentStudio.id} was leased)`,
-          cleanedAt: null,
-          expiresAt: new Date(Date.now() + EPHEMERAL_STUDIO_TTL_MS).toISOString(),
-        });
-        await this.leases.logEvent(userId, revived.id, 'overflow', {
-          threadKey,
-          agentId,
-          reason: `revived ephemeral studio; parent ${parentStudio.id} leased`,
-        });
-        return revived;
+        try {
+          const revived = await this.studios.update(existing.id, {
+            status: 'active',
+            worktreePath: created.worktreePath,
+            purpose: `Overflow studio for ${threadKey} (parent ${parentStudio.slug || parentStudio.id} was leased)`,
+            cleanedAt: null,
+            expiresAt: new Date(Date.now() + EPHEMERAL_STUDIO_TTL_MS).toISOString(),
+          });
+          await this.leases.logEvent(userId, revived.id, 'overflow', {
+            threadKey,
+            agentId,
+            reason: `revived ephemeral studio; parent ${parentStudio.id} leased`,
+          });
+          return revived;
+        } catch (err) {
+          // Reviving INTO the live predicate is arbitrated by the same
+          // partial unique index as inserts — a loss means a concurrent
+          // ensure won on another variant. Same doctrine: remove our
+          // worktree, fail this call, let the retry converge on the winner.
+          logger.error('[StudioOverflow] Studio revive failed; removing worktree', {
+            slug: s.slug,
+            studioId: existing.id,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          await execFileAsync('git', ['worktree', 'remove', '--force', created.worktreePath], {
+            cwd: parentStudio.repoRoot,
+          }).catch(() => undefined);
+          return null;
+        }
       }
 
       try {

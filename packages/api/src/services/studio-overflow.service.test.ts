@@ -427,6 +427,59 @@ describe('StudioOverflowService.ensureOverflowStudio — durable anchoring', () 
     }
   });
 
+  // r2: a revive UPDATE back into the live predicate is arbitrated by the
+  // partial unique index (integration-proven); the service's side of the
+  // contract is losing cleanly — null result, worktree removed, no throw.
+  it('a revive loss fails the call and removes the created worktree', async () => {
+    const repoRoot = await makeGitRepo();
+    const primaryWorktree = path.join(
+      path.dirname(repoRoot),
+      `${path.basename(repoRoot)}--lumen-review--pr-476`
+    );
+    try {
+      const cleanedRow = makeStudio({
+        id: 'eph-cleaned',
+        slug: 'lumen-review--pr-476',
+        ephemeral: true,
+        parentStudioId: 'parent-1',
+        threadKey: 'pr:476',
+        // Live row whose worktree is gone (default fake path) — the revive
+        // path, not the reuse path.
+        metadata: { overflow: true },
+      });
+      const studios = {
+        findById: vi.fn(),
+        findBySlug: vi
+          .fn()
+          .mockImplementation((_userId: string, slug: string) =>
+            Promise.resolve(slug === cleanedRow.slug ? cleanedRow : null)
+          ),
+        create: vi.fn(),
+        update: vi.fn().mockRejectedValue(new Error('duplicate key value violates uniq_live...')),
+      } as unknown as StudiosRepository;
+      const leases = { logEvent: vi.fn() } as unknown as StudioLeaseService;
+
+      const service = new StudioOverflowService(studios, leases);
+      const result = await service.ensureOverflowStudio({
+        userId: 'user-1',
+        agentId: 'lumen',
+        parentStudio: makeStudio({ repoRoot, worktreePath: repoRoot }),
+        threadKey: 'pr:476',
+      });
+
+      expect(result).toBeNull();
+      expect(studios.create).not.toHaveBeenCalled();
+      // The worktree the losing revive created is gone again.
+      const { access: fsAccess } = await import('fs/promises');
+      await expect(fsAccess(primaryWorktree)).rejects.toThrow();
+    } finally {
+      await execFileAsync('git', ['worktree', 'remove', '--force', primaryWorktree], {
+        cwd: repoRoot,
+      }).catch(() => undefined);
+      await rm(repoRoot, { recursive: true, force: true });
+    }
+  });
+
   it('a parent-chain cycle terminates instead of walking forever', async () => {
     const ephA = makeStudio({
       id: 'eph-a',
