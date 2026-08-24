@@ -427,10 +427,12 @@ describe('StudioOverflowService.ensureOverflowStudio — durable anchoring', () 
     }
   });
 
-  // r2: a revive UPDATE back into the live predicate is arbitrated by the
-  // partial unique index (integration-proven); the service's side of the
-  // contract is losing cleanly — null result, worktree removed, no throw.
-  it('a revive loss fails the call and removes the created worktree', async () => {
+  // r2/r3: a revive UPDATE back into the live predicate is arbitrated by the
+  // partial unique index (integration-proven). Losing cleanly means removing
+  // the worktree and not throwing. When no live winner turns up on the
+  // re-read — as here, the only matching row's worktree is gone — the call
+  // still fails closed with null.
+  it('a revive loss with no live winner fails the call and removes the created worktree', async () => {
     const repoRoot = await makeGitRepo();
     const primaryWorktree = path.join(
       path.dirname(repoRoot),
@@ -472,6 +474,131 @@ describe('StudioOverflowService.ensureOverflowStudio — durable anchoring', () 
       // The worktree the losing revive created is gone again.
       const { access: fsAccess } = await import('fs/promises');
       await expect(fsAccess(primaryWorktree)).rejects.toThrow();
+    } finally {
+      await execFileAsync('git', ['worktree', 'remove', '--force', primaryWorktree], {
+        cwd: repoRoot,
+      }).catch(() => undefined);
+      await rm(repoRoot, { recursive: true, force: true });
+    }
+  });
+
+  // r3: losing the unique index means a CONCURRENT ensure won live ownership.
+  // Returning null there is not "failing closed" — neither divertToOverflow
+  // call site retries, so null becomes `tier: 'refused'` and the trigger is
+  // HELD. The loser must hand back the winner's row.
+  it('an insert loss converges on the concurrent winner instead of failing', async () => {
+    const repoRoot = await makeGitRepo();
+    const winnerWorktree = await mkdtemp(path.join(tmpdir(), 'overflow-winner-'));
+    const primaryWorktree = path.join(
+      path.dirname(repoRoot),
+      `${path.basename(repoRoot)}--lumen-review--pr-476`
+    );
+    try {
+      const winnerRow = makeStudio({
+        id: 'eph-winner',
+        slug: 'lumen-review--pr-476',
+        ephemeral: true,
+        parentStudioId: 'parent-1',
+        threadKey: 'pr:476',
+        metadata: { overflow: true },
+        worktreePath: winnerWorktree,
+      });
+
+      // The winner's row only becomes visible once our insert has lost — the
+      // whole point of a check-then-act race.
+      let winnerVisible = false;
+      const studios = {
+        findById: vi.fn(),
+        findBySlug: vi
+          .fn()
+          .mockImplementation((_userId: string, slug: string) =>
+            Promise.resolve(winnerVisible && slug === winnerRow.slug ? winnerRow : null)
+          ),
+        create: vi.fn().mockImplementation(() => {
+          winnerVisible = true;
+          return Promise.reject(
+            new Error(
+              'duplicate key value violates unique constraint "uniq_live_ephemeral_studio_per_parent_thread"'
+            )
+          );
+        }),
+        update: vi.fn(),
+      } as unknown as StudiosRepository;
+      const leases = { logEvent: vi.fn() } as unknown as StudioLeaseService;
+
+      const service = new StudioOverflowService(studios, leases);
+      const result = await service.ensureOverflowStudio({
+        userId: 'user-1',
+        agentId: 'lumen',
+        parentStudio: makeStudio({ repoRoot, worktreePath: repoRoot }),
+        threadKey: 'pr:476',
+      });
+
+      expect(result?.id).toBe('eph-winner');
+      expect(studios.create).toHaveBeenCalledTimes(1);
+      // Our own losing worktree is gone; the winner's is untouched.
+      const { access: fsAccess } = await import('fs/promises');
+      await expect(fsAccess(primaryWorktree)).rejects.toThrow();
+      await expect(fsAccess(winnerWorktree)).resolves.toBeUndefined();
+    } finally {
+      await execFileAsync('git', ['worktree', 'remove', '--force', primaryWorktree], {
+        cwd: repoRoot,
+      }).catch(() => undefined);
+      await rm(winnerWorktree, { recursive: true, force: true });
+      await rm(repoRoot, { recursive: true, force: true });
+    }
+  });
+
+  // r3: a row revived out of 'archived' is runtime-live again, so its archive
+  // stamp has to go with it — otherwise the row's status and its timestamps
+  // disagree about whether it is live.
+  it('reviving an archived studio clears archived_at as well as cleaned_at', async () => {
+    const repoRoot = await makeGitRepo();
+    const primaryWorktree = path.join(
+      path.dirname(repoRoot),
+      `${path.basename(repoRoot)}--lumen-review--pr-476`
+    );
+    try {
+      const archivedRow = makeStudio({
+        id: 'eph-archived',
+        slug: 'lumen-review--pr-476',
+        ephemeral: true,
+        parentStudioId: 'parent-1',
+        threadKey: 'pr:476',
+        metadata: { overflow: true },
+        status: 'archived',
+        archivedAt: new Date().toISOString(),
+      });
+      const studios = {
+        findById: vi.fn(),
+        findBySlug: vi
+          .fn()
+          .mockImplementation((_userId: string, slug: string) =>
+            Promise.resolve(slug === archivedRow.slug ? archivedRow : null)
+          ),
+        create: vi.fn(),
+        update: vi
+          .fn()
+          .mockImplementation((_id: string, patch: Record<string, unknown>) =>
+            Promise.resolve({ ...archivedRow, ...patch })
+          ),
+      } as unknown as StudiosRepository;
+      const leases = { logEvent: vi.fn() } as unknown as StudioLeaseService;
+
+      const service = new StudioOverflowService(studios, leases);
+      const result = await service.ensureOverflowStudio({
+        userId: 'user-1',
+        agentId: 'lumen',
+        parentStudio: makeStudio({ repoRoot, worktreePath: repoRoot }),
+        threadKey: 'pr:476',
+      });
+
+      expect(result?.id).toBe('eph-archived');
+      expect(studios.create).not.toHaveBeenCalled();
+      expect(studios.update).toHaveBeenCalledWith(
+        'eph-archived',
+        expect.objectContaining({ status: 'active', cleanedAt: null, archivedAt: null })
+      );
     } finally {
       await execFileAsync('git', ['worktree', 'remove', '--force', primaryWorktree], {
         cwd: repoRoot,

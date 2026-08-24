@@ -10,8 +10,12 @@
  * index; these tests prove it at the seams the race actually crosses:
  *   1. two racing inserts for one (parent, threadKey) — exactly one wins;
  *   2. a revive UPDATE back into the live predicate loses to a live winner;
- *   3. end-to-end: two concurrent ensureOverflowStudio calls held at a
- *      barrier past the preflight leave exactly ONE live studio.
+ *   3. a runtime-live row carrying an archive stamp still holds the fence
+ *      (r3: the index and the runtime must agree on what "live" means);
+ *   4. end-to-end: two concurrent ensureOverflowStudio calls held at a
+ *      barrier past the preflight leave exactly ONE live studio — and BOTH
+ *      calls return it (r3: the loser converges instead of failing, because
+ *      no divertToOverflow call site retries a null).
  *
  * Requires .env.local with SUPABASE_URL + SUPABASE_SECRET_KEY.
  * Skipped automatically when credentials/DB are unavailable.
@@ -152,7 +156,8 @@ describe.skipIf(!available)('overflow studio live-uniqueness (integration)', () 
     });
     studioIds.push(winner.id);
 
-    // A cleaned row for the same thread sits outside the index …
+    // A cleaned row for the same thread sits outside the fence — and as of r3
+    // it is the row's STATUS that puts it there, not its cleaned_at stamp.
     const cleaned = await repo.create({
       userId: USER,
       repoRoot,
@@ -163,17 +168,78 @@ describe.skipIf(!available)('overflow studio live-uniqueness (integration)', () 
       threadKey: `pr:it-revive-placeholder-${RUN}`,
     });
     studioIds.push(cleaned.id);
-    await client
+    const { error: parkError } = await client
       .from('studios')
-      .update({ thread_key: threadKey, cleaned_at: new Date().toISOString() })
+      .update({
+        thread_key: threadKey,
+        status: 'cleaned',
+        cleaned_at: new Date().toISOString(),
+      })
       .eq('id', cleaned.id);
+    expect(parkError).toBeNull();
 
-    // … and reviving it while the winner is live must fail.
+    // … and reviving it — status back to live, exactly what the service's
+    // revive path writes — while the winner is live must fail.
     const { error } = await client
       .from('studios')
-      .update({ cleaned_at: null })
+      .update({ status: 'active', cleaned_at: null })
       .eq('id', cleaned.id);
     expect(error?.message).toMatch(/duplicate key|uniq_live_ephemeral_studio_per_parent_thread/);
+  });
+
+  // r3 (Lumen): the fence and the runtime must agree on what "live" means.
+  // The r2 predicate keyed on cleaned_at/archived_at while every admission
+  // path keys on status — so the r2 dedupe's own output (archived_at stamped,
+  // status left 'active') was runtime-live yet invisible to the index, and a
+  // second live row could be inserted right beside it.
+  it('a row that is runtime-live but archive-stamped still holds the fence', async () => {
+    const threadKey = `pr:it-status-fence-${RUN}`;
+
+    const first = await repo.create({
+      userId: USER,
+      repoRoot,
+      worktreePath: `${repoRoot}--status-fence-primary`,
+      branch: 'it/eph/status-fence-primary',
+      ephemeral: true,
+      parentStudioId: parent.id,
+      threadKey,
+    });
+    studioIds.push(first.id);
+
+    // Exactly the shape the r2 dedupe produced: archived timestamp set,
+    // status still runtime-live, so reuse/admission would happily return it.
+    const { error: stampError } = await client
+      .from('studios')
+      .update({ archived_at: new Date().toISOString(), status: 'active' })
+      .eq('id', first.id);
+    expect(stampError).toBeNull();
+
+    const reread = await repo.findById(first.id);
+    expect(reread?.status).toBe('active');
+    expect(reread?.archivedAt).not.toBeNull();
+
+    // Under the r2 predicate this insert SUCCEEDED — the archive stamp took
+    // `first` out of the index — leaving two runtime-live studios for one
+    // thread. Under the status predicate it loses.
+    await expect(
+      repo.create({
+        userId: USER,
+        repoRoot,
+        worktreePath: `${repoRoot}--status-fence-hash`,
+        branch: 'it/eph/status-fence-hash',
+        ephemeral: true,
+        parentStudioId: parent.id,
+        threadKey,
+      })
+    ).rejects.toThrow(/duplicate key|uniq_live_ephemeral_studio_per_parent_thread/);
+
+    const { data: liveRows } = await client
+      .from('studios')
+      .select('id')
+      .eq('parent_studio_id', parent.id)
+      .eq('thread_key', threadKey)
+      .in('status', ['active', 'idle']);
+    expect(liveRows).toHaveLength(1);
   });
 
   it('two concurrent ensureOverflowStudio calls leave exactly one live studio', async () => {
@@ -213,17 +279,22 @@ describe.skipIf(!available)('overflow studio live-uniqueness (integration)', () 
         });
       const results = await Promise.all([ensure(), ensure()]);
 
+      // Liveness is asked for the way every runtime path asks it (r3).
       const { data: liveRows } = await client
         .from('studios')
         .select('id, slug')
         .eq('parent_studio_id', parent.id)
         .eq('thread_key', threadKey)
-        .is('cleaned_at', null)
-        .is('archived_at', null);
+        .in('status', ['active', 'idle']);
       expect(liveRows).toHaveLength(1);
 
+      // r3: BOTH calls get the winner. The loser used to return null, and
+      // since neither divertToOverflow call site retries, that null became
+      // `tier: 'refused'` and a HELD message — the correctness fix silently
+      // reintroducing symptom #3 of the bug this PR fixes. Asserting
+      // "at most one non-null" would pass on that regression; this does not.
       const returned = results.filter((r): r is Studio => r !== null);
-      expect(returned.length).toBeLessThanOrEqual(1);
+      expect(returned).toHaveLength(2);
       for (const studio of returned) {
         expect(studio.id).toBe((liveRows as Array<{ id: string }>)[0].id);
       }

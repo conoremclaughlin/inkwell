@@ -92,6 +92,14 @@ export function overflowSlug(parentStudio: Studio, threadKey: string, variant?: 
   return `${parentSlug}--${tail}`;
 }
 
+/** One slug variant's preflight result for a given (parent, threadKey). */
+interface OverflowVariantState {
+  slug: string;
+  branchTail: string;
+  existing: Studio | null;
+  matches: boolean;
+}
+
 export class StudioOverflowService {
   constructor(
     private studios: StudiosRepository,
@@ -151,35 +159,23 @@ export class StudioOverflowService {
   }
 
   /**
-   * Ladder steps 1–2: find or create the ephemeral studio for this threadKey,
-   * anchored on the candidate's durable ancestor. Returns null only when
-   * every slug candidate collides with an unrelated studio or fails worktree
-   * creation (both logged loudly); the caller fails closed.
+   * Look up every slug variant for this (parent, threadKey) in one pass.
+   *
+   * Preflight EVERY variant before creating anything. The hash fallback must
+   * be STICKY: once a variant row exists for this (parent, threadKey), later
+   * calls have to find it even when an earlier variant has since become
+   * creatable — a legacy branch checkout forces the hash variant, the blocker
+   * later frees, and a sequential check-then-create would mint the primary
+   * alongside the live hash studio, splitting one thread across two studios
+   * (PR #537 round 1).
    */
-  async ensureOverflowStudio(opts: {
-    userId: string;
-    agentId: string;
-    parentStudio: Studio;
-    threadKey: string;
-  }): Promise<Studio | null> {
-    const { userId, agentId, threadKey } = opts;
-    const parentStudio = await this.resolveDurableAnchor(opts.parentStudio);
-
+  private async loadVariantStates(
+    userId: string,
+    parentStudio: Studio,
+    threadKey: string
+  ): Promise<OverflowVariantState[]> {
     const variants: Array<string | undefined> = [undefined, slugHash(threadKey)];
-
-    // Preflight EVERY variant before creating anything. The hash fallback
-    // must be STICKY: once a variant row exists for this (parent, threadKey),
-    // later calls have to find it even when an earlier variant has since
-    // become creatable — a legacy branch checkout forces the hash variant,
-    // the blocker later frees, and a sequential check-then-create would mint
-    // the primary alongside the live hash studio, splitting one thread across
-    // two studios (PR #537 round 1).
-    const states: Array<{
-      slug: string;
-      branchTail: string;
-      existing: Studio | null;
-      matches: boolean;
-    }> = [];
+    const states: OverflowVariantState[] = [];
     for (const variant of variants) {
       const slug = overflowSlug(parentStudio, threadKey, variant);
       const branchTail = variant ? `${threadSlug(threadKey)}-h${variant}` : threadSlug(threadKey);
@@ -195,8 +191,21 @@ export class StudioOverflowService {
       }
       states.push({ slug, branchTail, existing, matches });
     }
+    return states;
+  }
 
-    // Step 1 — reuse: a live matching row on ANY variant wins outright.
+  /**
+   * The first variant row that is genuinely reusable right now.
+   *
+   * "Live" here is `status IN ('active','idle')` — the same canonical runtime
+   * predicate the DB fence indexes on (PR #537 round 3). Admission and the
+   * fence must agree on what live means, or a row can be routable in one and
+   * invisible to the other.
+   */
+  private async firstLiveMatch(
+    states: OverflowVariantState[],
+    threadKey: string
+  ): Promise<Studio | null> {
     for (const s of states) {
       const { existing } = s;
       if (!existing || !s.matches) continue;
@@ -204,15 +213,75 @@ export class StudioOverflowService {
       const pathExists = await access(existing.worktreePath)
         .then(() => true)
         .catch(() => false);
-      if (pathExists) {
-        logger.info('[StudioOverflow] Reusing ephemeral studio for thread', {
-          threadKey,
-          studioId: existing.id,
-          slug: s.slug,
-        });
-        return existing;
-      }
+      if (!pathExists) continue;
+      logger.info('[StudioOverflow] Reusing ephemeral studio for thread', {
+        threadKey,
+        studioId: existing.id,
+        slug: s.slug,
+      });
+      return existing;
     }
+    return null;
+  }
+
+  /**
+   * Losing the unique index means a CONCURRENT ensure won live ownership of
+   * this (parent, threadKey) — so hand back the winner's row rather than the
+   * caller's failure.
+   *
+   * Returning null here instead would be a real availability regression: the
+   * only two `divertToOverflow` call sites (session-service) do not retry, so
+   * null becomes `tier: 'refused'` and the message is HELD — symptom #3 of the
+   * bug this PR exists to fix, on the commonest path there is (two concurrent
+   * triggers for one thread). The re-read uses the SAME preflight as
+   * admission, so the row we converge on is by construction the row a fresh
+   * call would have reused. Genuine exhaustion still yields null and fails
+   * closed.
+   */
+  private async convergeOnRaceWinner(
+    userId: string,
+    parentStudio: Studio,
+    threadKey: string
+  ): Promise<Studio | null> {
+    const winner = await this.firstLiveMatch(
+      await this.loadVariantStates(userId, parentStudio, threadKey),
+      threadKey
+    );
+    if (winner) {
+      logger.info('[StudioOverflow] Lost live-ownership race; converged on the winner', {
+        threadKey,
+        studioId: winner.id,
+        slug: winner.slug,
+      });
+    } else {
+      logger.error('[StudioOverflow] Lost live-ownership race but found no live winner', {
+        threadKey,
+        parentStudioId: parentStudio.id,
+      });
+    }
+    return winner;
+  }
+
+  /**
+   * Ladder steps 1–2: find or create the ephemeral studio for this threadKey,
+   * anchored on the candidate's durable ancestor. Returns null only when
+   * every slug candidate collides with an unrelated studio or fails worktree
+   * creation (both logged loudly); the caller fails closed.
+   */
+  async ensureOverflowStudio(opts: {
+    userId: string;
+    agentId: string;
+    parentStudio: Studio;
+    threadKey: string;
+  }): Promise<Studio | null> {
+    const { userId, agentId, threadKey } = opts;
+    const parentStudio = await this.resolveDurableAnchor(opts.parentStudio);
+
+    const states = await this.loadVariantStates(userId, parentStudio, threadKey);
+
+    // Step 1 — reuse: a live matching row on ANY variant wins outright.
+    const reusable = await this.firstLiveMatch(states, threadKey);
+    if (reusable) return reusable;
 
     // Step 2 — revive or create, in variant order. Slugs held by unrelated
     // studios are skipped, and a worktree-creation failure falls through to
@@ -235,6 +304,12 @@ export class StudioOverflowService {
             worktreePath: created.worktreePath,
             purpose: `Overflow studio for ${threadKey} (parent ${parentStudio.slug || parentStudio.id} was leased)`,
             cleanedAt: null,
+            // Clearing archived_at is not cosmetic: a row revived from
+            // 'archived' is runtime-live again, and leaving the timestamp set
+            // would have left it outside the round-2 fence entirely. The
+            // round-3 fence keys on status instead, but the row's own columns
+            // still have to tell one coherent story (PR #537 round 3).
+            archivedAt: null,
             expiresAt: new Date(Date.now() + EPHEMERAL_STUDIO_TTL_MS).toISOString(),
           });
           await this.leases.logEvent(userId, revived.id, 'overflow', {
@@ -247,7 +322,7 @@ export class StudioOverflowService {
           // Reviving INTO the live predicate is arbitrated by the same
           // partial unique index as inserts — a loss means a concurrent
           // ensure won on another variant. Same doctrine: remove our
-          // worktree, fail this call, let the retry converge on the winner.
+          // worktree, then converge on the winner rather than failing.
           logger.error('[StudioOverflow] Studio revive failed; removing worktree', {
             slug: s.slug,
             studioId: existing.id,
@@ -256,7 +331,7 @@ export class StudioOverflowService {
           await execFileAsync('git', ['worktree', 'remove', '--force', created.worktreePath], {
             cwd: parentStudio.repoRoot,
           }).catch(() => undefined);
-          return null;
+          return this.convergeOnRaceWinner(userId, parentStudio, threadKey);
         }
       }
 
@@ -291,9 +366,8 @@ export class StudioOverflowService {
         return studio;
       } catch (err) {
         // An insert loss here usually means a concurrent ensure won the
-        // unique index — remove our worktree and fail THIS call rather than
-        // falling through to mint a variant beside the winner; the caller's
-        // retry converges on the winner via the reuse preflight.
+        // unique index — remove our worktree rather than falling through to
+        // mint a variant beside the winner, then converge on the winner.
         logger.error('[StudioOverflow] Studio row insert failed; removing worktree', {
           slug: s.slug,
           error: err instanceof Error ? err.message : String(err),
@@ -301,7 +375,7 @@ export class StudioOverflowService {
         await execFileAsync('git', ['worktree', 'remove', '--force', created.worktreePath], {
           cwd: parentStudio.repoRoot,
         }).catch(() => undefined);
-        return null;
+        return this.convergeOnRaceWinner(userId, parentStudio, threadKey);
       }
     }
 
