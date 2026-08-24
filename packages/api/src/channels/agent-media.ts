@@ -66,6 +66,48 @@ export interface ResolveTriggerMediaOptions {
   maxFileBytes?: number;
   /** Test hook — production always uses MAX_TRIGGER_SNAPSHOTS. */
   maxSnapshots?: number;
+  /**
+   * Test hook — awaited inside pruneSnapshots between the stat sweep and the
+   * unlinks, to pin the stale-stat interleaving deterministically. Production
+   * never passes it.
+   */
+  onPruneStatted?: () => Promise<void>;
+}
+
+/**
+ * In-process serialization of snapshot-dir mutations, keyed by the canonical
+ * dir. Every state transition on a snapshot — verify-and-refresh, publish,
+ * prune — runs inside this lock.
+ *
+ * A re-stat inside pruneSnapshots would NOT be enough: eligibility is decided
+ * from a stat and acted on with an unlink, so a concurrent resolver can verify
+ * the same CAS file, refresh its mtime, and return it in the gap, after which
+ * the pruner deletes a path already handed to a provider (Lumen, PR #474
+ * review r3847776268 — reproduced with a barrier). Making the decision and the
+ * unlink one transaction removes the gap: the only surviving order is
+ * prune-then-verify, where verification simply fails and the snapshot is
+ * republished from the bytes in hand. Once the transaction releases,
+ * PRUNE_MIN_AGE_MS covers the resolution → provider-open interval.
+ */
+const snapshotDirLocks = new Map<string, Promise<void>>();
+
+async function withSnapshotDirLock<T>(dirReal: string, fn: () => Promise<T>): Promise<T> {
+  const prev = snapshotDirLocks.get(dirReal) ?? Promise.resolve();
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const chain = prev.then(() => held);
+  snapshotDirLocks.set(dirReal, chain);
+  await prev;
+  try {
+    return await fn();
+  } finally {
+    release();
+    // Drop the key once this holder is the tail, so the map does not grow one
+    // entry per media root forever.
+    if (snapshotDirLocks.get(dirReal) === chain) snapshotDirLocks.delete(dirReal);
+  }
 }
 
 /**
@@ -208,11 +250,15 @@ async function ensureSnapshotDir(rootReal: string): Promise<string | null> {
  * LRU-prune the snapshot dir to the retention cap. Best-effort. Never touches
  * `protect` paths (this resolution's own outputs) or files younger than the
  * grace window (another trigger's in-flight delivery).
+ *
+ * MUST be called inside `withSnapshotDirLock` — the stat sweep and the unlinks
+ * are one transaction against concurrent verify/refresh (see the lock's note).
  */
 async function pruneSnapshots(
   dirReal: string,
   maxSnapshots: number,
-  protect: ReadonlySet<string>
+  protect: ReadonlySet<string>,
+  onStatted?: () => Promise<void>
 ): Promise<void> {
   try {
     const names = await readdir(dirReal);
@@ -237,6 +283,7 @@ async function pruneSnapshots(
     // never push a real in-flight snapshot into the deletable set.
     const eligible = files.filter((f) => !protect.has(f.p) && now - f.mtimeMs > PRUNE_MIN_AGE_MS);
     eligible.sort((a, b) => a.mtimeMs - b.mtimeMs);
+    if (onStatted) await onStatted();
     for (const f of eligible.slice(0, Math.min(excess, eligible.length))) {
       await unlink(f.p).catch(() => undefined);
     }
@@ -356,12 +403,16 @@ export async function resolveTriggerMedia(
       // resolves). rename() also atomically replaces a pre-created symlink
       // or crash leftover at the name — no unlink repair step, so a live
       // writer's file is never deleted. Verified reuse refreshes mtime so
-      // LRU retention keeps live snapshots.
-      if (!(await verifyExistingSnapshot(snapshotPath, read.bytes))) {
+      // LRU retention keeps live snapshots. The whole verify-or-publish runs
+      // under the snapshot-dir lock so a concurrent prune cannot decide this
+      // file is stale and then unlink it after the refresh.
+      const published = await withSnapshotDirLock(snapshotDir, async () => {
+        if (await verifyExistingSnapshot(snapshotPath, read.bytes)) return true;
         const tmpPath = join(snapshotDir, `.tmp-${process.pid}-${randomBytes(6).toString('hex')}`);
         try {
           await writeFile(tmpPath, read.bytes, { flag: 'wx' });
           await rename(tmpPath, snapshotPath);
+          return true;
         } catch (publishErr) {
           await unlink(tmpPath).catch(() => undefined);
           logger.warn('[Trigger] snapshot publication failed — dropped', {
@@ -369,9 +420,10 @@ export async function resolveTriggerMedia(
             snapshot: snapshotPath,
             error: publishErr instanceof Error ? publishErr.message : String(publishErr),
           });
-          continue;
+          return false;
         }
-      }
+      });
+      if (!published) continue;
 
       out.push({
         type:
@@ -390,10 +442,16 @@ export async function resolveTriggerMedia(
     logger.warn('[Trigger] malformed media entries dropped', { count: malformed });
   }
   if (out.length > 0) {
-    await pruneSnapshots(
-      snapshotDir,
-      options.maxSnapshots ?? MAX_TRIGGER_SNAPSHOTS,
-      new Set(out.map((a) => a.path).filter((p): p is string => typeof p === 'string'))
+    const protect = new Set(
+      out.map((a) => a.path).filter((p): p is string => typeof p === 'string')
+    );
+    await withSnapshotDirLock(snapshotDir, () =>
+      pruneSnapshots(
+        snapshotDir,
+        options.maxSnapshots ?? MAX_TRIGGER_SNAPSHOTS,
+        protect,
+        options.onPruneStatted
+      )
     );
   }
   return out;

@@ -269,6 +269,71 @@ describe('resolveTriggerMedia (agent-to-agent attachment containment)', () => {
     expect(mockWarn).not.toHaveBeenCalled();
   });
 
+  it('prune cannot delete a snapshot a concurrent resolve just verified and returned', async () => {
+    // Lumen's PR #474 repro (r3847776268): pruneSnapshots decided eligibility
+    // from a stat, then unlinked. Pausing between those two steps and letting
+    // a same-content resolve verify + refresh + return the file in the gap
+    // made the returned path vanish. Verify/publish and prune are now one
+    // transaction per snapshot dir, so this interleaving cannot occur; the
+    // only surviving order is prune-then-verify, which republishes.
+    const shared = Buffer.from('in-flight-shared-content');
+    const sharedSrc = png(root, 'shared.bin', shared);
+    const firstOut = await resolveTriggerMedia(
+      { media: [{ path: sharedSrc }] },
+      { mediaRoot: root }
+    );
+    const sharedSnap = firstOut[0]!.path!;
+    for (let i = 0; i < 3; i++) {
+      const filler = png(root, `filler-${i}.bin`, Buffer.from(`filler-${i}`));
+      await resolveTriggerMedia({ media: [{ path: filler }] }, { mediaRoot: root });
+    }
+    // Age everything past the grace window, and make the shared snapshot the
+    // OLDEST so LRU order puts it first in line for deletion.
+    const dir = join(realpathSync(root), TRIGGER_SNAPSHOT_DIR);
+    const aged = (Date.now() - PRUNE_MIN_AGE_MS - 60_000) / 1000;
+    for (const name of await readdir(dir)) utimesSync(join(dir, name), aged, aged);
+    const oldest = (Date.now() - PRUNE_MIN_AGE_MS - 600_000) / 1000;
+    utimesSync(sharedSnap, oldest, oldest);
+
+    let barrierReached!: () => void;
+    const reached = new Promise<void>((r) => {
+      barrierReached = r;
+    });
+    let releaseBarrier!: () => void;
+    const released = new Promise<void>((r) => {
+      releaseBarrier = r;
+    });
+
+    // Call A: delivers a new snapshot, then parks inside prune with its
+    // eligibility list (including sharedSnap) already computed.
+    const evictor = png(root, 'evictor.bin', Buffer.from('evictor-content'));
+    const a = resolveTriggerMedia(
+      { media: [{ path: evictor }] },
+      {
+        mediaRoot: root,
+        maxSnapshots: 2,
+        onPruneStatted: async () => {
+          barrierReached();
+          await released;
+        },
+      }
+    );
+    await reached;
+
+    // Call B: re-resolves the shared content — verify, refresh mtime, return.
+    const b = resolveTriggerMedia({ media: [{ path: sharedSrc }] }, { mediaRoot: root });
+    // Give B every chance to finish inside A's stale window. Serialized, it
+    // cannot start until A's prune commits.
+    await new Promise((r) => setTimeout(r, 50));
+    releaseBarrier();
+
+    const [, outB] = await Promise.all([a, b]);
+    expect(outB).toHaveLength(1);
+    // The path handed to the provider still exists, with the real bytes.
+    expect(existsSync(outB[0]!.path!)).toBe(true);
+    expect(readFileSync(outB[0]!.path!).equals(shared)).toBe(true);
+  });
+
   it('EEXIST is not trust: a pre-created symlink at the snapshot name is repaired, not reused', async () => {
     const content = Buffer.from('victim-content');
     const p = png(root, 'photo.png', content);
