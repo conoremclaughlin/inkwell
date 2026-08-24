@@ -77,7 +77,8 @@ export interface UpdateStudioInput {
   slug?: string | null;
   defaultProjectId?: string | null;
   metadata?: Json;
-  archivedAt?: string;
+  /** Nullable: reviving an archived ephemeral studio must be able to clear it. */
+  archivedAt?: string | null;
   cleanedAt?: string | null;
   expiresAt?: string | null;
   routePatterns?: string[];

@@ -8,8 +8,24 @@
 
 import { describe, it, expect, vi } from 'vitest';
 import { mkdtemp, rm } from 'fs/promises';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 import { tmpdir } from 'os';
 import path from 'path';
+
+const execFileAsync = promisify(execFile);
+
+/** A real (tiny) git repo, for tests where worktree creation must SUCCEED. */
+async function makeGitRepo(): Promise<string> {
+  const dir = await mkdtemp(path.join(tmpdir(), 'overflow-repo-'));
+  await execFileAsync('git', ['init', '-b', 'main'], { cwd: dir });
+  await execFileAsync(
+    'git',
+    ['-c', 'user.email=test@test', '-c', 'user.name=test', 'commit', '--allow-empty', '-m', 'init'],
+    { cwd: dir }
+  );
+  return dir;
+}
 import {
   threadSlug,
   slugHash,
@@ -199,6 +215,434 @@ describe('StudioOverflowService.ensureOverflowStudio — reuse', () => {
 
     expect(result).toBeNull();
     expect(studios.update).not.toHaveBeenCalled();
+  });
+});
+
+describe('StudioOverflowService.ensureOverflowStudio — durable anchoring', () => {
+  // 2026-08-24: `lumen-review--pr-503--pr-503--pr-534--pr-474--pr-535`. Each
+  // provisioning was parented on the ephemeral studio the agent's live
+  // session occupied, so slugs compounded one suffix per hop. Overflow must
+  // anchor on the durable ancestor no matter which studio routing hands in.
+  it('mints from the durable ancestor when the candidate is a chained ephemeral', async () => {
+    const root = makeStudio(); // parent-1, slug lumen-review, durable
+    const eph1 = makeStudio({
+      id: 'eph-1',
+      slug: 'lumen-review--pr-503',
+      ephemeral: true,
+      parentStudioId: 'parent-1',
+      threadKey: 'pr:503',
+      repoRoot: '/nonexistent/repo',
+    });
+    const chainEnd = makeStudio({
+      id: 'eph-2',
+      slug: 'lumen-review--pr-503--pr-534',
+      ephemeral: true,
+      parentStudioId: 'eph-1',
+      threadKey: 'pr:534',
+      repoRoot: '/nonexistent/repo',
+    });
+    const findById = vi
+      .fn()
+      .mockImplementation((id: string) =>
+        Promise.resolve(id === 'eph-1' ? eph1 : id === 'parent-1' ? root : null)
+      );
+    const findBySlug = vi.fn().mockResolvedValue(null);
+    const studios = {
+      findById,
+      findBySlug,
+      create: vi.fn(),
+      update: vi.fn(),
+    } as unknown as StudiosRepository;
+    const leases = { logEvent: vi.fn() } as unknown as StudioLeaseService;
+
+    const service = new StudioOverflowService(studios, leases);
+    // Worktree creation fails (root's repoRoot exists only in the fixture),
+    // so the assertion is on the slugs LOOKED UP, which is where minting
+    // decides its name.
+    await service.ensureOverflowStudio({
+      userId: 'user-1',
+      agentId: 'lumen',
+      parentStudio: chainEnd,
+      threadKey: 'pr:474',
+    });
+
+    expect(findById).toHaveBeenCalledWith('eph-1');
+    expect(findById).toHaveBeenCalledWith('parent-1');
+    expect(findBySlug.mock.calls[0][1]).toBe('lumen-review--pr-474');
+    for (const call of findBySlug.mock.calls) {
+      expect(call[1]).not.toContain('pr-503');
+    }
+  });
+
+  // The doubled `--pr-503--pr-503`: a thread overflowing from its OWN
+  // ephemeral studio must resolve to reusing that studio, not minting an
+  // overflow-of-the-overflow for the identical thread.
+  it('self-overflow — a thread anchored on its own ephemeral reuses it', async () => {
+    const worktreePath = await mkdtemp(path.join(tmpdir(), 'overflow-self-'));
+    try {
+      const root = makeStudio();
+      const own = makeStudio({
+        id: 'eph-own',
+        slug: 'lumen-review--pr-476',
+        ephemeral: true,
+        parentStudioId: 'parent-1',
+        threadKey: 'pr:476',
+        metadata: { overflow: true },
+        worktreePath,
+      });
+      const studios = {
+        findById: vi.fn().mockResolvedValue(root),
+        findBySlug: vi.fn().mockResolvedValue(own),
+        create: vi.fn(),
+        update: vi.fn(),
+      } as unknown as StudiosRepository;
+      const leases = { logEvent: vi.fn() } as unknown as StudioLeaseService;
+
+      const service = new StudioOverflowService(studios, leases);
+      const result = await service.ensureOverflowStudio({
+        userId: 'user-1',
+        agentId: 'lumen',
+        parentStudio: own,
+        threadKey: 'pr:476',
+      });
+
+      expect(result?.id).toBe('eph-own');
+      expect(studios.create).not.toHaveBeenCalled();
+      expect(studios.update).not.toHaveBeenCalled();
+    } finally {
+      await rm(worktreePath, { recursive: true, force: true });
+    }
+  });
+
+  // Transition hazard: legacy chained worktrees keep flat `eph/` branches
+  // checked out, so a post-fix flat mint fails `git worktree add` on
+  // `already used by worktree`. Creation failure must fall through to the
+  // hash variant (fresh slug AND fresh branch), not give up. Real repo so
+  // the primary genuinely fails on the branch and the variant genuinely
+  // succeeds.
+  it('a branch held by a legacy worktree falls through to the hash variant', async () => {
+    const repoRoot = await makeGitRepo();
+    const blocker = path.join(path.dirname(repoRoot), `${path.basename(repoRoot)}--legacy-chain`);
+    const hashSlug = `lumen-review--pr-476-h${slugHash('pr:476')}`;
+    const hashWorktree = path.join(
+      path.dirname(repoRoot),
+      `${path.basename(repoRoot)}--${hashSlug}`
+    );
+    try {
+      // The legacy chained studio still has the flat eph/ branch checked out.
+      await execFileAsync('git', ['worktree', 'add', '-b', 'lumen/eph/pr-476', blocker, 'main'], {
+        cwd: repoRoot,
+      });
+      const createdInputs: Array<Record<string, unknown>> = [];
+      const studios = {
+        findById: vi.fn(),
+        findBySlug: vi.fn().mockResolvedValue(null),
+        create: vi.fn().mockImplementation((input: Record<string, unknown>) => {
+          createdInputs.push(input);
+          return Promise.resolve(makeStudio({ id: 'new-hash', ...(input as Partial<Studio>) }));
+        }),
+        update: vi.fn(),
+      } as unknown as StudiosRepository;
+      const leases = { logEvent: vi.fn() } as unknown as StudioLeaseService;
+
+      const service = new StudioOverflowService(studios, leases);
+      const result = await service.ensureOverflowStudio({
+        userId: 'user-1',
+        agentId: 'lumen',
+        parentStudio: makeStudio({ repoRoot, worktreePath: repoRoot }),
+        threadKey: 'pr:476',
+      });
+
+      expect(result?.id).toBe('new-hash');
+      expect(createdInputs).toHaveLength(1);
+      expect(createdInputs[0].branch).toBe(`lumen/eph/pr-476-h${slugHash('pr:476')}`);
+      expect(String(createdInputs[0].worktreePath)).toContain(hashSlug);
+    } finally {
+      await execFileAsync('git', ['worktree', 'remove', '--force', hashWorktree], {
+        cwd: repoRoot,
+      }).catch(() => undefined);
+      await execFileAsync('git', ['worktree', 'remove', '--force', blocker], {
+        cwd: repoRoot,
+      }).catch(() => undefined);
+      await rm(repoRoot, { recursive: true, force: true });
+    }
+  });
+
+  // r1 P1 (Lumen): the hash fallback must be STICKY. A blocker once forced
+  // the hash variant; the blocker later freed the primary branch. A
+  // sequential check-then-create would now mint the primary alongside the
+  // live hash studio — two studios for one (parent, threadKey), sessions
+  // split across them. The preflight must find the hash row first.
+  it('an existing hash-variant studio is reused before the primary is reminted', async () => {
+    const repoRoot = await makeGitRepo();
+    const hashWorktree = await mkdtemp(path.join(tmpdir(), 'overflow-hash-'));
+    const primaryWorktree = path.join(
+      path.dirname(repoRoot),
+      `${path.basename(repoRoot)}--lumen-review--pr-476`
+    );
+    try {
+      const root = makeStudio({ repoRoot, worktreePath: repoRoot });
+      const hashRow = makeStudio({
+        id: 'eph-hash',
+        slug: `lumen-review--pr-476-h${slugHash('pr:476')}`,
+        ephemeral: true,
+        parentStudioId: 'parent-1',
+        threadKey: 'pr:476',
+        metadata: { overflow: true },
+        worktreePath: hashWorktree,
+      });
+      const studios = {
+        findById: vi.fn(),
+        findBySlug: vi
+          .fn()
+          .mockImplementation((_userId: string, slug: string) =>
+            Promise.resolve(slug === hashRow.slug ? hashRow : null)
+          ),
+        create: vi.fn(),
+        update: vi.fn(),
+      } as unknown as StudiosRepository;
+      const leases = { logEvent: vi.fn() } as unknown as StudioLeaseService;
+
+      const service = new StudioOverflowService(studios, leases);
+      const result = await service.ensureOverflowStudio({
+        userId: 'user-1',
+        agentId: 'lumen',
+        parentStudio: root,
+        threadKey: 'pr:476',
+      });
+
+      // The primary is creatable in this real repo — but the live hash row
+      // stays authoritative.
+      expect(result?.id).toBe('eph-hash');
+      expect(studios.create).not.toHaveBeenCalled();
+      expect(studios.update).not.toHaveBeenCalled();
+    } finally {
+      // Under a regressed sequential loop the primary worktree gets created;
+      // sweep it so the mutation run leaves nothing behind.
+      await execFileAsync('git', ['worktree', 'remove', '--force', primaryWorktree], {
+        cwd: repoRoot,
+      }).catch(() => undefined);
+      await rm(hashWorktree, { recursive: true, force: true });
+      await rm(repoRoot, { recursive: true, force: true });
+    }
+  });
+
+  // r2/r3: a revive UPDATE back into the live predicate is arbitrated by the
+  // partial unique index (integration-proven). Losing cleanly means removing
+  // the worktree and not throwing. When no live winner turns up on the
+  // re-read — as here, the only matching row's worktree is gone — the call
+  // still fails closed with null.
+  it('a revive loss with no live winner fails the call and removes the created worktree', async () => {
+    const repoRoot = await makeGitRepo();
+    const primaryWorktree = path.join(
+      path.dirname(repoRoot),
+      `${path.basename(repoRoot)}--lumen-review--pr-476`
+    );
+    try {
+      const cleanedRow = makeStudio({
+        id: 'eph-cleaned',
+        slug: 'lumen-review--pr-476',
+        ephemeral: true,
+        parentStudioId: 'parent-1',
+        threadKey: 'pr:476',
+        // Live row whose worktree is gone (default fake path) — the revive
+        // path, not the reuse path.
+        metadata: { overflow: true },
+      });
+      const studios = {
+        findById: vi.fn(),
+        findBySlug: vi
+          .fn()
+          .mockImplementation((_userId: string, slug: string) =>
+            Promise.resolve(slug === cleanedRow.slug ? cleanedRow : null)
+          ),
+        create: vi.fn(),
+        update: vi.fn().mockRejectedValue(new Error('duplicate key value violates uniq_live...')),
+      } as unknown as StudiosRepository;
+      const leases = { logEvent: vi.fn() } as unknown as StudioLeaseService;
+
+      const service = new StudioOverflowService(studios, leases);
+      const result = await service.ensureOverflowStudio({
+        userId: 'user-1',
+        agentId: 'lumen',
+        parentStudio: makeStudio({ repoRoot, worktreePath: repoRoot }),
+        threadKey: 'pr:476',
+      });
+
+      expect(result).toBeNull();
+      expect(studios.create).not.toHaveBeenCalled();
+      // The worktree the losing revive created is gone again.
+      const { access: fsAccess } = await import('fs/promises');
+      await expect(fsAccess(primaryWorktree)).rejects.toThrow();
+    } finally {
+      await execFileAsync('git', ['worktree', 'remove', '--force', primaryWorktree], {
+        cwd: repoRoot,
+      }).catch(() => undefined);
+      await rm(repoRoot, { recursive: true, force: true });
+    }
+  });
+
+  // r3: losing the unique index means a CONCURRENT ensure won live ownership.
+  // Returning null there is not "failing closed" — neither divertToOverflow
+  // call site retries, so null becomes `tier: 'refused'` and the trigger is
+  // HELD. The loser must hand back the winner's row.
+  it('an insert loss converges on the concurrent winner instead of failing', async () => {
+    const repoRoot = await makeGitRepo();
+    const winnerWorktree = await mkdtemp(path.join(tmpdir(), 'overflow-winner-'));
+    const primaryWorktree = path.join(
+      path.dirname(repoRoot),
+      `${path.basename(repoRoot)}--lumen-review--pr-476`
+    );
+    try {
+      const winnerRow = makeStudio({
+        id: 'eph-winner',
+        slug: 'lumen-review--pr-476',
+        ephemeral: true,
+        parentStudioId: 'parent-1',
+        threadKey: 'pr:476',
+        metadata: { overflow: true },
+        worktreePath: winnerWorktree,
+      });
+
+      // The winner's row only becomes visible once our insert has lost — the
+      // whole point of a check-then-act race.
+      let winnerVisible = false;
+      const studios = {
+        findById: vi.fn(),
+        findBySlug: vi
+          .fn()
+          .mockImplementation((_userId: string, slug: string) =>
+            Promise.resolve(winnerVisible && slug === winnerRow.slug ? winnerRow : null)
+          ),
+        create: vi.fn().mockImplementation(() => {
+          winnerVisible = true;
+          return Promise.reject(
+            new Error(
+              'duplicate key value violates unique constraint "uniq_live_ephemeral_studio_per_parent_thread"'
+            )
+          );
+        }),
+        update: vi.fn(),
+      } as unknown as StudiosRepository;
+      const leases = { logEvent: vi.fn() } as unknown as StudioLeaseService;
+
+      const service = new StudioOverflowService(studios, leases);
+      const result = await service.ensureOverflowStudio({
+        userId: 'user-1',
+        agentId: 'lumen',
+        parentStudio: makeStudio({ repoRoot, worktreePath: repoRoot }),
+        threadKey: 'pr:476',
+      });
+
+      expect(result?.id).toBe('eph-winner');
+      expect(studios.create).toHaveBeenCalledTimes(1);
+      // Our own losing worktree is gone; the winner's is untouched.
+      const { access: fsAccess } = await import('fs/promises');
+      await expect(fsAccess(primaryWorktree)).rejects.toThrow();
+      await expect(fsAccess(winnerWorktree)).resolves.toBeUndefined();
+    } finally {
+      await execFileAsync('git', ['worktree', 'remove', '--force', primaryWorktree], {
+        cwd: repoRoot,
+      }).catch(() => undefined);
+      await rm(winnerWorktree, { recursive: true, force: true });
+      await rm(repoRoot, { recursive: true, force: true });
+    }
+  });
+
+  // r3: a row revived out of 'archived' is runtime-live again, so its archive
+  // stamp has to go with it — otherwise the row's status and its timestamps
+  // disagree about whether it is live.
+  it('reviving an archived studio clears archived_at as well as cleaned_at', async () => {
+    const repoRoot = await makeGitRepo();
+    const primaryWorktree = path.join(
+      path.dirname(repoRoot),
+      `${path.basename(repoRoot)}--lumen-review--pr-476`
+    );
+    try {
+      const archivedRow = makeStudio({
+        id: 'eph-archived',
+        slug: 'lumen-review--pr-476',
+        ephemeral: true,
+        parentStudioId: 'parent-1',
+        threadKey: 'pr:476',
+        metadata: { overflow: true },
+        status: 'archived',
+        archivedAt: new Date().toISOString(),
+      });
+      const studios = {
+        findById: vi.fn(),
+        findBySlug: vi
+          .fn()
+          .mockImplementation((_userId: string, slug: string) =>
+            Promise.resolve(slug === archivedRow.slug ? archivedRow : null)
+          ),
+        create: vi.fn(),
+        update: vi
+          .fn()
+          .mockImplementation((_id: string, patch: Record<string, unknown>) =>
+            Promise.resolve({ ...archivedRow, ...patch })
+          ),
+      } as unknown as StudiosRepository;
+      const leases = { logEvent: vi.fn() } as unknown as StudioLeaseService;
+
+      const service = new StudioOverflowService(studios, leases);
+      const result = await service.ensureOverflowStudio({
+        userId: 'user-1',
+        agentId: 'lumen',
+        parentStudio: makeStudio({ repoRoot, worktreePath: repoRoot }),
+        threadKey: 'pr:476',
+      });
+
+      expect(result?.id).toBe('eph-archived');
+      expect(studios.create).not.toHaveBeenCalled();
+      expect(studios.update).toHaveBeenCalledWith(
+        'eph-archived',
+        expect.objectContaining({ status: 'active', cleanedAt: null, archivedAt: null })
+      );
+    } finally {
+      await execFileAsync('git', ['worktree', 'remove', '--force', primaryWorktree], {
+        cwd: repoRoot,
+      }).catch(() => undefined);
+      await rm(repoRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('a parent-chain cycle terminates instead of walking forever', async () => {
+    const ephA = makeStudio({
+      id: 'eph-a',
+      slug: 'lumen-review--a',
+      ephemeral: true,
+      parentStudioId: 'eph-b',
+      repoRoot: '/nonexistent/repo',
+    });
+    const ephB = makeStudio({
+      id: 'eph-b',
+      slug: 'lumen-review--b',
+      ephemeral: true,
+      parentStudioId: 'eph-a',
+      repoRoot: '/nonexistent/repo',
+    });
+    const findById = vi
+      .fn()
+      .mockImplementation((id: string) => Promise.resolve(id === 'eph-b' ? ephB : ephA));
+    const studios = {
+      findById,
+      findBySlug: vi.fn().mockResolvedValue(null),
+      create: vi.fn(),
+      update: vi.fn(),
+    } as unknown as StudiosRepository;
+    const leases = { logEvent: vi.fn() } as unknown as StudioLeaseService;
+
+    const service = new StudioOverflowService(studios, leases);
+    const result = await service.ensureOverflowStudio({
+      userId: 'user-1',
+      agentId: 'lumen',
+      parentStudio: ephA,
+      threadKey: 'pr:476',
+    });
+
+    expect(result).toBeNull();
+    expect(findById).toHaveBeenCalledTimes(1);
   });
 });
 
