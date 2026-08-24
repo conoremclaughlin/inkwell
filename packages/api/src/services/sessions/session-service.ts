@@ -527,14 +527,16 @@ export class SessionService implements ISessionService {
       return { studioId: candidateStudioId, tier, occupancyChecked: true };
     }
 
-    // reuse-only types (discussions: spec/thread/issue/debug/deploy) never get
-    // a worktree built for them. Occupied means HOLD — the message re-routes
-    // once the holder finishes — not "provision a fresh checkout". This is the
-    // registry's studio_policy actually being consumed: before this check,
-    // every occupied studio diverted to overflow regardless of type, which is
-    // where the worktree flood came from. An SB that genuinely needs a studio
-    // for a discussion creates one explicitly; only the automatic path is
-    // policy-gated.
+    // reuse-only types never get a worktree built for them. For a WRITE-typed
+    // reuse-only thread (deploy, unknown types), occupied means HOLD — a
+    // state-mutator with nowhere safe to write waits for the holder, not
+    // "provision a fresh checkout". Discussions never reach this branch: they
+    // are presence-typed and bypassed the gate above (they bind without the
+    // lock and execute). This is the registry's studio_policy actually being
+    // consumed: before this check, every occupied studio diverted to overflow
+    // regardless of type, which is where the worktree flood came from. An SB
+    // that genuinely needs a studio creates one explicitly; only the
+    // automatic path is policy-gated.
     if (ctx.studioPolicy === 'reuse-only') {
       logger.info('[StudioResolve] Studio occupied and type is reuse-only; holding', {
         studioId: candidateStudioId,

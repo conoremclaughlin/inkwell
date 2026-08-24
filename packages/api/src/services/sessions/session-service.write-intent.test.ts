@@ -7,8 +7,10 @@
  * would leak into the 150+ tests there.
  *
  * Intent is resolved ONCE, before routing (blocker 5): one resolution feeds
- * both the occupancy gate and the lease gate. MECHANISM tests: until 6e
- * every template is write, so production behavior is unchanged.
+ * both the occupancy gate and the lease gate. Discussion templates
+ * (thread/spec/issue/debug) are LIVE presence as of 2026-08-24 — they bind
+ * without the lock and execute; write-typed threads (pr/branch/task/deploy)
+ * still acquire.
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';

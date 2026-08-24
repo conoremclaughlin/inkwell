@@ -174,9 +174,23 @@ d('thread-key registry + pin integrity (real DB)', () => {
     expect(slugErr?.message).toMatch(/collides/);
   });
 
+  it('the four discussion templates are presence + reuse-only (Conor, 2026-08-24)', async () => {
+    // Discussions EXECUTE: they bind without the lock and never get a
+    // worktree auto-built. This pins the migration against the real DB so a
+    // rebuild cannot silently resurrect write-typed (queueing) discussions.
+    for (const type of ['thread', 'spec', 'issue', 'debug']) {
+      const effective = await repo.getEffective(USER, type);
+      expect(effective).toMatchObject({
+        writeIntent: 'presence',
+        studioPolicy: 'reuse-only',
+        source: 'template',
+      });
+    }
+  });
+
   it('registry round-trip: override shadows template, reset restores it', async () => {
     const before = await repo.getEffective(USER, 'debug');
-    expect(before).toMatchObject({ writeIntent: 'write', source: 'template' });
+    expect(before).toMatchObject({ writeIntent: 'presence', source: 'template' });
 
     overrideTypes.push('debug');
     await repo.setOverride(USER, 'debug', { writeIntent: 'write', studioPolicy: 'provision' });

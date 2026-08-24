@@ -3379,10 +3379,13 @@ describe('SessionService', () => {
 
     /*
      * studio_policy wiring — the registry column that existed as data with
-     * zero consumers. reuse-only threads (discussions) hold when their studio
-     * is occupied; they never get a worktree provisioned for them. provision
-     * threads (pr/branch/task) keep the overflow ladder — parallel review is
-     * wanted, orphaned discussion worktrees are not.
+     * zero consumers. Discussions (thread/spec/issue/debug) are presence:
+     * they bind without the lock and EXECUTE, and never get a worktree
+     * provisioned. WRITE-typed reuse-only threads (deploy, unknown types)
+     * hold when their studio is locked — a state-mutator with nowhere safe
+     * to write waits. provision threads (pr/branch/task) keep the overflow
+     * ladder — parallel review is wanted, orphaned discussion worktrees are
+     * not.
      */
     function occupiedStudioSupabase(opts: {
       keyType: string | { error: string };
@@ -3466,7 +3469,7 @@ describe('SessionService', () => {
       };
     }
 
-    it('reuse-only thread holds when its studio is occupied — overflow is never attempted', async () => {
+    it('a WRITE-typed reuse-only thread (deploy) holds when its studio is occupied — overflow is never attempted', async () => {
       const overflowSpy = vi
         .spyOn(StudioOverflowService.prototype, 'ensureOverflowStudio')
         .mockResolvedValue(null);
@@ -3522,7 +3525,7 @@ describe('SessionService', () => {
       overflowSpy.mockRestore();
     });
 
-    it('acquire-time conflict on a reuse-only thread holds — the second overflow entry point is gated too', async () => {
+    it('acquire-time conflict on a write-typed reuse-only thread holds — the second overflow entry point is gated too', async () => {
       /*
        * gateOccupancy sees an unoccupied studio; the lease is then taken by
        * someone else before acquire (the TOCTOU window withStudioLease's
@@ -3637,7 +3640,7 @@ describe('SessionService', () => {
       logEventSpy.mockRestore();
     });
 
-    it('holder-null on a reuse-only thread clears the binding — and says so, not "holding"', async () => {
+    it('holder-null on a write-typed reuse-only thread clears the binding — and says so, not "holding"', async () => {
       /*
        * r2 P2: acquire() returns holder: null for missing/retired/foreign/
        * unverifiable studios. That branch does NOT hold — it clears the
@@ -3702,9 +3705,10 @@ describe('SessionService', () => {
     /**
      * The THIRD worktree-creating path (r1 P1): deferred D1 parent creation.
      * The caller repo resolves but the agent has no studio for it at all —
-     * for a provision thread the create boundary builds the D1 parent; for a
-     * reuse-only thread it must hold instead. Durable vs ephemeral makes no
-     * difference: it is still an automatic worktree for a discussion.
+     * for a provision thread the create boundary builds the D1 parent; a
+     * write-typed reuse-only thread (deploy) holds; a presence discussion
+     * proceeds studioless. Durable vs ephemeral makes no difference: none of
+     * them may trigger an automatic worktree.
      */
     function callerRepoNoStudioSupabase(opts: {
       keyType: string;
@@ -3750,7 +3754,7 @@ describe('SessionService', () => {
       };
     }
 
-    it('reuse-only thread with no studio for its repo holds — the D1 parent is not auto-created', async () => {
+    it('a write-typed reuse-only thread with no studio for its repo holds — the D1 parent is not auto-created', async () => {
       const parentSpy = vi
         .spyOn(StudioOverflowService.prototype, 'ensureParentStudio')
         .mockResolvedValue(null as never);

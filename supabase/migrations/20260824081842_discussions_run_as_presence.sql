@@ -18,3 +18,14 @@
 UPDATE public.thread_key_types
 SET write_intent = 'presence'
 WHERE user_id IS NULL AND type IN ('thread', 'spec', 'issue', 'debug');
+
+-- Descriptions are user-facing (list_thread_key_types) — keep them telling
+-- the truth about the flipped behavior.
+UPDATE public.thread_key_types SET description = 'General conversation — runs without the lock, tolerates drift'
+WHERE user_id IS NULL AND type = 'thread';
+UPDATE public.thread_key_types SET description = 'Design discussion — runs without the lock, tolerates drift'
+WHERE user_id IS NULL AND type = 'spec';
+UPDATE public.thread_key_types SET description = 'Issue triage/discussion — runs without the lock; check out a studio explicitly for heavy repros'
+WHERE user_id IS NULL AND type = 'issue';
+UPDATE public.thread_key_types SET description = 'Collaborative debugging — runs without the lock; check out a studio explicitly for heavy repros'
+WHERE user_id IS NULL AND type = 'debug';
