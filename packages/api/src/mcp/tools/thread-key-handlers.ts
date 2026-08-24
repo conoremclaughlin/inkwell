@@ -65,7 +65,7 @@ export async function handleListThreadKeyTypes(args: unknown, dataComposer: Data
             unknownTypeDefault: {
               writeIntent: 'write',
               studioPolicy: 'reuse-only',
-              note: 'Conservative until escalation-on-write ships (Phase 6e), then flips to presence.',
+              note: 'Unregistered types stay conservative: they take the lock and never auto-provision a worktree.',
             },
           },
           null,
@@ -114,19 +114,11 @@ export async function handleSetThreadKeyType(args: unknown, dataComposer: DataCo
     throw new Error('writeIntent and studioPolicy are required unless reset: true');
   }
 
-  // Presence overrides are REJECTED until escalation-on-write ships (Phase
-  // 6e; Lumen PR #516 round 2 condition 3). All-write templates alone do not
-  // make effective behavior conservative while this public surface can mint a
-  // presence row: once 6b consumes the registry, that row is an unleased
-  // writer with no net. 6e lifts this in the same change that makes
-  // escalation live.
-  if (params.writeIntent === 'presence') {
-    throw new Error(
-      'presence overrides are not accepted yet: escalation-on-write (Phase 6e) must ship first, ' +
-        'so a wrongly-presence session cannot mutate an unleased working tree. ' +
-        'The restriction lifts atomically with 6e.'
-    );
-  }
+  // Presence overrides are accepted. The 6e-gated rejection (Lumen PR #516
+  // round 2 condition 3) was lifted 2026-08-24 with the discussion templates
+  // themselves going presence, by Conor's direction: discussions execute
+  // rather than queue, and the unlocked-edit risk before escalation-on-write
+  // ships is consciously accepted.
 
   // Reserved-name rule, this direction (grammar v2): a type name must not
   // collide with one of the user's project slugs — that collision is the one

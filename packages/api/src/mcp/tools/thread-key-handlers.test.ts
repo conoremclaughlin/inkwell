@@ -92,18 +92,38 @@ describe('handleSetThreadKeyType', () => {
     ).rejects.toThrow(/required unless reset/);
   });
 
-  it('REJECTS presence overrides until escalation-on-write ships (6e)', async () => {
-    // All-write templates alone are not conservative while this public
-    // surface can mint a presence row: once 6b consumes the registry, that
-    // row is an unleased writer with no net (Lumen, PR #516 round 2).
-    const { composer } = composerWith({ projects: { data: [] } });
-    await expect(
-      handleSetThreadKeyType(
-        { type: 'standup', writeIntent: 'presence', studioPolicy: 'reuse-only' },
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        composer as any
-      )
-    ).rejects.toThrow(/escalation-on-write/);
+  it('accepts presence overrides (6e gate lifted with the discussion-template flip)', async () => {
+    // Discussions execute rather than queue (Conor, 2026-08-24); the public
+    // surface matches the templates. Unlocked-edit risk before 6e is a
+    // conscious acceptance.
+    const { composer, from } = composerWith({
+      projects: { data: [] },
+      thread_key_types: {
+        data: {
+          id: 'o2',
+          user_id: 'user-1',
+          type: 'standup',
+          write_intent: 'presence',
+          studio_policy: 'reuse-only',
+          description: null,
+          created_at: '',
+          updated_at: '',
+        },
+      },
+    });
+    const res = await handleSetThreadKeyType(
+      { type: 'standup', writeIntent: 'presence', studioPolicy: 'reuse-only' },
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      composer as any
+    );
+    const body = parsed(res);
+    expect(body.success).toBe(true);
+    expect(body.type).toMatchObject({
+      type: 'standup',
+      writeIntent: 'presence',
+      source: 'override',
+    });
+    expect(from).toHaveBeenCalledWith('thread_key_types');
   });
 
   it('upserts a write override when the name is clean', async () => {

@@ -3379,10 +3379,13 @@ describe('SessionService', () => {
 
     /*
      * studio_policy wiring — the registry column that existed as data with
-     * zero consumers. reuse-only threads (discussions) hold when their studio
-     * is occupied; they never get a worktree provisioned for them. provision
-     * threads (pr/branch/task) keep the overflow ladder — parallel review is
-     * wanted, orphaned discussion worktrees are not.
+     * zero consumers. Discussions (thread/spec/issue/debug) are presence:
+     * they bind without the lock and EXECUTE, and never get a worktree
+     * provisioned. WRITE-typed reuse-only threads (deploy, unknown types)
+     * hold when their studio is locked — a state-mutator with nowhere safe
+     * to write waits. provision threads (pr/branch/task) keep the overflow
+     * ladder — parallel review is wanted, orphaned discussion worktrees are
+     * not.
      */
     function occupiedStudioSupabase(opts: {
       keyType: string | { error: string };
@@ -3466,23 +3469,23 @@ describe('SessionService', () => {
       };
     }
 
-    it('reuse-only thread holds when its studio is occupied — overflow is never attempted', async () => {
+    it('a WRITE-typed reuse-only thread (deploy) holds when its studio is occupied — overflow is never attempted', async () => {
       const overflowSpy = vi
         .spyOn(StudioOverflowService.prototype, 'ensureOverflowStudio')
         .mockResolvedValue(null);
 
-      // `issue` is the seed's write + reuse-only combination: the occupancy
+      // `deploy` is the seed's write + reuse-only combination: the occupancy
       // gate engages (write), and the policy must stop the divert.
       const service = serviceWith(
         occupiedStudioSupabase({
-          keyType: 'issue',
-          template: threadKeyTemplate('issue', 'write', 'reuse-only'),
-          routePattern: 'issue:*',
+          keyType: 'deploy',
+          template: threadKeyTemplate('deploy', 'write', 'reuse-only'),
+          routePattern: 'deploy:*',
         })
       );
 
       await expect(
-        service.getOrCreateSession('user-456', 'wren', { threadKey: 'issue:42' })
+        service.getOrCreateSession('user-456', 'wren', { threadKey: 'deploy:42' })
       ).rejects.toMatchObject({
         code: 'ROUTING_REFUSED',
         // policy travels with the hold so it reads as the policy deciding,
@@ -3522,7 +3525,7 @@ describe('SessionService', () => {
       overflowSpy.mockRestore();
     });
 
-    it('acquire-time conflict on a reuse-only thread holds — the second overflow entry point is gated too', async () => {
+    it('acquire-time conflict on a write-typed reuse-only thread holds — the second overflow entry point is gated too', async () => {
       /*
        * gateOccupancy sees an unoccupied studio; the lease is then taken by
        * someone else before acquire (the TOCTOU window withStudioLease's
@@ -3554,14 +3557,14 @@ describe('SessionService', () => {
 
       const service = serviceWith(
         occupiedStudioSupabase({
-          keyType: 'issue',
-          template: threadKeyTemplate('issue', 'write', 'reuse-only'),
-          routePattern: 'issue:*',
+          keyType: 'deploy',
+          template: threadKeyTemplate('deploy', 'write', 'reuse-only'),
+          routePattern: 'deploy:*',
         })
       );
 
       const rejection = await service
-        .getOrCreateSession('user-456', 'wren', { threadKey: 'issue:43' })
+        .getOrCreateSession('user-456', 'wren', { threadKey: 'deploy:43' })
         .then(
           () => null,
           (err: Error & { detail?: Record<string, unknown> }) => err
@@ -3637,7 +3640,7 @@ describe('SessionService', () => {
       logEventSpy.mockRestore();
     });
 
-    it('holder-null on a reuse-only thread clears the binding — and says so, not "holding"', async () => {
+    it('holder-null on a write-typed reuse-only thread clears the binding — and says so, not "holding"', async () => {
       /*
        * r2 P2: acquire() returns holder: null for missing/retired/foreign/
        * unverifiable studios. That branch does NOT hold — it clears the
@@ -3667,14 +3670,14 @@ describe('SessionService', () => {
 
       const service = serviceWith(
         occupiedStudioSupabase({
-          keyType: 'issue',
-          template: threadKeyTemplate('issue', 'write', 'reuse-only'),
-          routePattern: 'issue:*',
+          keyType: 'deploy',
+          template: threadKeyTemplate('deploy', 'write', 'reuse-only'),
+          routePattern: 'deploy:*',
         })
       );
 
       // No hold: the session comes back with its binding cleared.
-      await service.getOrCreateSession('user-456', 'wren', { threadKey: 'issue:45' });
+      await service.getOrCreateSession('user-456', 'wren', { threadKey: 'deploy:45' });
       expect(mockRepository.update).toHaveBeenCalledWith('thread-session', { studioId: null });
       expect(overflowSpy).not.toHaveBeenCalled();
 
@@ -3702,9 +3705,10 @@ describe('SessionService', () => {
     /**
      * The THIRD worktree-creating path (r1 P1): deferred D1 parent creation.
      * The caller repo resolves but the agent has no studio for it at all —
-     * for a provision thread the create boundary builds the D1 parent; for a
-     * reuse-only thread it must hold instead. Durable vs ephemeral makes no
-     * difference: it is still an automatic worktree for a discussion.
+     * for a provision thread the create boundary builds the D1 parent; a
+     * write-typed reuse-only thread (deploy) holds; a presence discussion
+     * proceeds studioless. Durable vs ephemeral makes no difference: none of
+     * them may trigger an automatic worktree.
      */
     function callerRepoNoStudioSupabase(opts: {
       keyType: string;
@@ -3750,21 +3754,21 @@ describe('SessionService', () => {
       };
     }
 
-    it('reuse-only thread with no studio for its repo holds — the D1 parent is not auto-created', async () => {
+    it('a write-typed reuse-only thread with no studio for its repo holds — the D1 parent is not auto-created', async () => {
       const parentSpy = vi
         .spyOn(StudioOverflowService.prototype, 'ensureParentStudio')
         .mockResolvedValue(null as never);
 
       const service = serviceWith(
         callerRepoNoStudioSupabase({
-          keyType: 'issue',
-          template: threadKeyTemplate('issue', 'write', 'reuse-only'),
+          keyType: 'deploy',
+          template: threadKeyTemplate('deploy', 'write', 'reuse-only'),
         })
       );
 
       const rejection = await service
         .getOrCreateSession('user-456', 'wren', {
-          threadKey: 'issue:44',
+          threadKey: 'deploy:44',
           callerStudioId: 'sender-studio-1',
           callerSessionId: 'sender-session-1',
         })
@@ -3817,6 +3821,66 @@ describe('SessionService', () => {
       parentSpy.mockRestore();
     });
 
+    /*
+     * The ruling itself (Conor, 2026-08-24): discussions EXECUTE. As of the
+     * presence flip, thread/spec/issue/debug bind to the studio without the
+     * lock and run immediately — they never queue behind it, and they never
+     * get a worktree built. Holds are for write-typed reuse-only threads
+     * (deploy, unknown types) only.
+     */
+    it('a discussion runs in a LOCKED studio — no hold, no lock, no worktree', async () => {
+      const overflowSpy = vi
+        .spyOn(StudioOverflowService.prototype, 'ensureOverflowStudio')
+        .mockResolvedValue(null);
+      const acquireSpy = vi.spyOn(StudioLeaseService.prototype, 'acquire');
+
+      const service = serviceWith(
+        occupiedStudioSupabase({
+          keyType: 'issue',
+          template: threadKeyTemplate('issue', 'presence', 'reuse-only'),
+          routePattern: 'issue:*',
+        })
+      );
+
+      // The studio's lock is held by pr:other, and the session is created
+      // anyway, bound to that studio: discussions tolerate drift.
+      await service.getOrCreateSession('user-456', 'wren', { threadKey: 'issue:46' });
+      expect(mockRepository.create).toHaveBeenCalledWith(
+        expect.objectContaining({ studioId: 'studio-A' })
+      );
+      expect(acquireSpy).not.toHaveBeenCalled();
+      expect(overflowSpy).not.toHaveBeenCalled();
+
+      overflowSpy.mockRestore();
+      acquireSpy.mockRestore();
+    });
+
+    it('a discussion with no studio for its repo runs studioless — no D1 create, no hold', async () => {
+      const parentSpy = vi
+        .spyOn(StudioOverflowService.prototype, 'ensureParentStudio')
+        .mockResolvedValue(null as never);
+
+      const service = serviceWith(
+        callerRepoNoStudioSupabase({
+          keyType: 'spec',
+          template: threadKeyTemplate('spec', 'presence', 'reuse-only'),
+        })
+      );
+
+      // Resolves (no refusal) with no studio binding: the runner falls back
+      // to the default working directory, the pre-registry behavior.
+      await service.getOrCreateSession('user-456', 'wren', {
+        threadKey: 'spec:some-design',
+        callerStudioId: 'sender-studio-1',
+        callerSessionId: 'sender-session-1',
+      });
+      expect(mockRepository.create).toHaveBeenCalledWith(
+        expect.objectContaining({ studioId: undefined })
+      );
+      expect(parentSpy).not.toHaveBeenCalled();
+      parentSpy.mockRestore();
+    });
+
     it('PRODUCTION ORDER: presence intent bypasses the occupancy gate inside routing (r3 P0-1)', async () => {
       /*
        * Through the PUBLIC API, not private methods — the round-3 finding was
@@ -3839,9 +3903,10 @@ describe('SessionService', () => {
             return createFilterAwareChain(() => ({ data: { key_type: 'spec' } }), calls);
           }
           if (table === 'thread_key_types') {
-            // A presence override row for 'spec' — the DATA that makes this
-            // thread presence-typed (until 6e no TEMPLATE is presence, so an
-            // override row is the honest way to express it).
+            // A presence override row for 'spec'. Templates are presence for
+            // discussions as of 2026-08-24; the override fixture stays because
+            // this test pins that a USER override row feeds the gate the same
+            // way a template does.
             return createFilterAwareChain(
               () => ({
                 data: [
