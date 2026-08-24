@@ -130,9 +130,19 @@ export async function resolveOutboundAttachments(
       );
     }
 
+    // Content-Type describes the BYTES; `filename` is presentation-only and
+    // never gets a say. Deriving the type from the display name let a rename
+    // silently change the declared type — a JPEG attached as `scan.pdf` went
+    // out as `application/pdf` (found by Myra during live verification).
+    //
+    // A real file we cannot type stays `application/octet-stream`. Borrowing
+    // the display name there would reinstate the same defect through the back
+    // door: `payload.html` shown as `report.pdf` would be declared a PDF on
+    // the strength of a name that has never seen the bytes. An honest
+    // "unknown" beats a confident wrong answer.
     resolved.push({
       filename,
-      mimeType: guessMimeType(filename),
+      mimeType: guessMimeType(basename(read.realPath)),
       content: read.bytes,
     });
   }

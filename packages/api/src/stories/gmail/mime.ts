@@ -320,14 +320,23 @@ const MIME_TYPES: Record<string, string> = {
   '.mp3': 'audio/mpeg',
   '.m4a': 'audio/mp4',
   '.ogg': 'audio/ogg',
+  // Telegram voice notes are Opus-in-Ogg and land under both suffixes. `.oga`
+  // is the second most common extension in the media root, so leaving it
+  // unmapped sent every forwarded voice note out as generic bytes.
+  '.oga': 'audio/ogg',
+  '.opus': 'audio/ogg',
+  '.aiff': 'audio/x-aiff',
   '.wav': 'audio/wav',
   '.mp4': 'video/mp4',
   '.mov': 'video/quicktime',
 };
 
+/** What an unrecognized extension resolves to. */
+export const DEFAULT_MIME_TYPE = 'application/octet-stream';
+
 /** Best-effort content type from a filename extension. */
 export function guessMimeType(filename: string): string {
-  return MIME_TYPES[extname(filename).toLowerCase()] || 'application/octet-stream';
+  return MIME_TYPES[extname(filename).toLowerCase()] || DEFAULT_MIME_TYPE;
 }
 
 /** Wrap base64 to RFC 2045's line limit. */
