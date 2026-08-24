@@ -49,9 +49,15 @@ describe('task tool schemas accept dueDate', () => {
     registerAllTools(server as unknown as any, { getClient: () => ({}) } as any, {
       includeInternalLifecycleTools: true,
     });
-    const shape = server.schemas.get(tool);
-    expect(shape, `${tool} registered no inputSchema`).toBeDefined();
-    return z.object(shape!);
+    const registered = server.schemas.get(tool);
+    expect(registered, `${tool} registered no inputSchema`).toBeDefined();
+    // The registration interceptor (strict-input-schema) may have already
+    // converted the raw shape into a ZodObject — use what is actually
+    // enforced; wrap only a raw shape.
+    if (typeof (registered as { safeParse?: unknown }).safeParse === 'function') {
+      return registered as unknown as z.ZodObject<z.ZodRawShape>;
+    }
+    return z.object(registered!);
   }
 
   it('create_task keeps dueDate through validation', () => {
