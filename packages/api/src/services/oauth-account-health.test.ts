@@ -99,13 +99,17 @@ describe('inspectAccountHealth — the refresh window', () => {
     expect(health.accountStatus).toBe('active');
   });
 
-  it('says so when an account in the refresh window has no refresh token', async () => {
+  it('keeps a pre-expiry token with no refresh token active', async () => {
+    // getValidAccessToken refreshes only when it has something to refresh WITH.
+    // With no refresh token it hands back the stored token, which works until it
+    // expires — so calling this refresh_required would be the inspector claiming
+    // a refresh the real call never attempts.
     accountRows([activeRow({ expires_at: '2026-08-15T17:04:00.000Z', refresh_token: null })]);
 
     const health = await new OAuthService().inspectAccountHealth(USER_ID, 'google');
 
-    expect(health.state).toBe('refresh_required');
-    expect(health.reason).toContain('no refresh token is stored');
+    expect(health.state).toBe('active');
+    expect(health.reason).toBeNull();
   });
 
   it('reports an expired token with no refresh token as unusable', async () => {
@@ -116,11 +120,94 @@ describe('inspectAccountHealth — the refresh window', () => {
     expect(health.state).toBe('unusable');
   });
 
+  it('flips a no-refresh-token account straight from active to unusable at expiry', async () => {
+    // No refresh_required in between, because there is no refresh to require.
+    const row = activeRow({ expires_at: '2026-08-15T17:01:00.000Z', refresh_token: null });
+
+    accountRows([row]);
+    expect((await new OAuthService().inspectAccountHealth(USER_ID, 'google')).state).toBe('active');
+
+    vi.setSystemTime(new Date('2026-08-15T17:01:30.000Z'));
+    accountRows([row]);
+    expect((await new OAuthService().inspectAccountHealth(USER_ID, 'google')).state).toBe(
+      'unusable'
+    );
+  });
+
   it('treats a null expiry as no expiry rather than as expired', async () => {
     accountRows([activeRow({ expires_at: null })]);
 
     expect((await new OAuthService().inspectAccountHealth(USER_ID, 'google')).state).toBe('active');
   });
+});
+
+describe('inspectAccountHealth agrees with getValidAccessToken', () => {
+  // Every test above states what I believe each method does. This one runs both
+  // and compares them, which is the only version that can catch the belief being
+  // wrong — as it was for the pre-expiry/no-refresh-token case, where the
+  // inspector announced a refresh the real call never attempts.
+  const CASES = [
+    {
+      name: 'inside the refresh window, refresh token present',
+      expiresAt: '2026-08-15T17:02:00.000Z',
+      refreshToken: 'refresh-abc',
+    },
+    {
+      name: 'inside the refresh window, no refresh token',
+      expiresAt: '2026-08-15T17:02:00.000Z',
+      refreshToken: null,
+    },
+    {
+      name: 'comfortably valid, refresh token present',
+      expiresAt: '2026-08-16T17:00:00.000Z',
+      refreshToken: 'refresh-abc',
+    },
+    {
+      name: 'expired, refresh token present',
+      expiresAt: '2026-08-15T16:00:00.000Z',
+      refreshToken: 'refresh-abc',
+    },
+    {
+      name: 'expired, no refresh token',
+      expiresAt: '2026-08-15T16:00:00.000Z',
+      refreshToken: null,
+    },
+    { name: 'no expiry recorded', expiresAt: null, refreshToken: 'refresh-abc' },
+  ];
+
+  for (const testCase of CASES) {
+    it(`${testCase.name}: reports refresh_required exactly when a refresh is attempted`, async () => {
+      const row = activeRow({
+        expires_at: testCase.expiresAt,
+        refresh_token: testCase.refreshToken,
+      });
+
+      accountRows([row]);
+      const inspected = await new OAuthService().inspectAccountHealth(USER_ID, 'google');
+
+      // Now run the method it claims to describe, and watch for the token call.
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ access_token: 'fresh', token_type: 'Bearer', expires_in: 3600 }),
+      });
+      vi.stubGlobal('fetch', fetchMock);
+
+      const mock = createTableAwareSupabaseMock({
+        connected_accounts: [
+          {
+            maybeSingle: [{ data: { ...row, id: 'acct-1', access_token: 'stored' }, error: null }],
+          },
+          { then: { data: null, error: null } },
+        ],
+      });
+      from.mockImplementation(mock.from);
+      await new OAuthService().getValidAccessToken(USER_ID, 'google');
+
+      const refreshed = fetchMock.mock.calls.length > 0;
+      expect(inspected.state === 'refresh_required').toBe(refreshed);
+      vi.unstubAllGlobals();
+    });
+  }
 });
 
 describe('inspectAccountHealth — absence versus ignorance', () => {

@@ -70,10 +70,32 @@ export interface TokenResponse {
 
 /**
  * How close to expiry getValidAccessToken stops trusting a stored token and
- * refreshes it before use. inspectAccountHealth reads the same constant, so the
- * two cannot disagree about which accounts are one refresh away from a verdict.
+ * refreshes it before use.
  */
 const TOKEN_REFRESH_WINDOW_MS = 5 * 60 * 1000;
+
+/**
+ * The token getValidAccessToken would refresh with before its next call, or null
+ * if it would send the stored access token unchanged.
+ *
+ * Both halves of the condition matter: without a refresh token there is nothing
+ * to refresh with, so that method hands back the stored token and it works right
+ * up until expiry. Sharing only the five-minute window left the two methods
+ * disagreeing about exactly that case.
+ *
+ * Returning the token rather than a boolean means the caller that performs the
+ * refresh and the caller that describes it read one value, instead of two
+ * expressions that have to be kept in step by hand.
+ */
+function pendingRefreshToken(
+  expiresAt: string | null | undefined,
+  refreshToken: string | null | undefined
+): string | null {
+  if (!refreshToken || !expiresAt) return null;
+  const expiry = new Date(expiresAt).getTime();
+  if (Number.isNaN(expiry)) return null;
+  return expiry - Date.now() < TOKEN_REFRESH_WINDOW_MS ? refreshToken : null;
+}
 
 /**
  * A read-only view of how a provider call would fare right now, derived from
@@ -82,10 +104,12 @@ const TOKEN_REFRESH_WINDOW_MS = 5 * 60 * 1000;
 export interface ProviderAccountHealth {
   /**
    * - `active`: getValidAccessToken would hand back the stored token unchanged.
-   * - `refresh_required`: the token is inside the refresh window, so the next
-   *   call has to refresh it first. Whether that refresh succeeds cannot be
-   *   known without performing it — and with Google's testing-mode seven-day
-   *   token expiry, this is exactly the state that fails.
+   * - `refresh_required`: the next call will refresh before using the token —
+   *   inside the refresh window AND holding a refresh token to do it with.
+   *   Whether that refresh succeeds cannot be known without performing it, and
+   *   with Google's testing-mode seven-day expiry this is the state that fails.
+   *   An account with no refresh token never reaches here: nothing refreshes it,
+   *   so it stays `active` until expiry and is `unusable` after.
    * - `unusable`: no call would succeed.
    * - `missing`: nothing is connected for this provider.
    * - `unknown`: account state could not be read, so there is no verdict.
@@ -549,30 +573,27 @@ class OAuthService {
       };
     }
 
-    // An active row whose token has expired can only recover if it can refresh.
-    // Without a refresh token getValidAccessToken returns the stale token and the
-    // provider rejects it, so this is a real failure rather than a warning.
+    // These branches mirror getValidAccessToken exactly, in its order.
+    //
+    // It refreshes if and only if pendingRefreshToken returns one. The stored
+    // token is then not what the next call sends, and a refresh can fail, so no
+    // usable token can be promised without performing one.
+    if (pendingRefreshToken(row.expires_at, row.refresh_token)) {
+      return {
+        ...base,
+        state: 'refresh_required',
+        reason: `Access token expires at ${row.expires_at}; the next call must refresh it first, and that refresh may fail`,
+      };
+    }
+
+    // Otherwise it hands back the stored token untouched — which works right up
+    // until expiry, and is rejected by the provider after it.
     const expiresAt = row.expires_at ? new Date(row.expires_at).getTime() : null;
-    if (expiresAt !== null && expiresAt <= Date.now() && !row.refresh_token) {
+    if (expiresAt !== null && expiresAt <= Date.now()) {
       return {
         ...base,
         state: 'unusable',
         reason: 'Access token expired and no refresh token is stored',
-      };
-    }
-
-    // Inside the same window getValidAccessToken uses, the stored token is not
-    // what the next call will send — a refresh happens first, and a refresh can
-    // fail. Calling this 'active' would promise a usable token that this method
-    // has not obtained and cannot obtain without mutating state. Say what is
-    // actually known: a refresh is pending and its outcome is not yet decided.
-    if (expiresAt !== null && expiresAt - Date.now() < TOKEN_REFRESH_WINDOW_MS) {
-      return {
-        ...base,
-        state: 'refresh_required',
-        reason: row.refresh_token
-          ? `Access token expires at ${row.expires_at}; the next call must refresh it first, and that refresh may fail`
-          : `Access token expires at ${row.expires_at} and no refresh token is stored to renew it`,
       };
     }
 
@@ -610,16 +631,15 @@ class OAuthService {
       throw new Error(`No active ${provider} account found`);
     }
 
-    // Check if token is expired or expiring soon. Shared with inspectAccountHealth
-    // so the health verdict describes the same window this refresh acts on.
-    const expiresAt = account.expires_at ? new Date(account.expires_at) : null;
-    const isExpiringSoon = expiresAt && expiresAt.getTime() - Date.now() < TOKEN_REFRESH_WINDOW_MS;
+    // Shared with inspectAccountHealth so the health verdict describes the same
+    // decision this call actually makes.
+    const refreshToken = pendingRefreshToken(account.expires_at, account.refresh_token);
 
-    if (isExpiringSoon && account.refresh_token) {
+    if (refreshToken) {
       logger.info(`Refreshing ${provider} token for user ${userId}`);
 
       try {
-        const tokens = await this.refreshAccessToken(provider, account.refresh_token);
+        const tokens = await this.refreshAccessToken(provider, refreshToken);
 
         // Update stored tokens
         const newExpiresAt = tokens.expiresIn
