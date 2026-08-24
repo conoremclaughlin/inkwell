@@ -26,6 +26,7 @@ import { classifyError } from '@inklabs/shared';
 import { getValidAccessToken } from '../auth/tokens.js';
 import { callPcpTool, getPcpServerUrl } from '../lib/pcp-mcp.js';
 import { sbDebugLog } from '../lib/sb-debug.js';
+import { divertConsoleLogToStderr, restoreConsoleLog } from '../lib/stdout-purity.js';
 import {
   getCurrentRuntimeSession,
   listRuntimeSessions,
@@ -2504,6 +2505,13 @@ async function ensurePcpSessionContext(
   backendSessionSeedId?: string;
   threadKey?: string;
 }> {
+  // Candidate JSON is machine-read: keep stdout to the payload alone.
+  // Idempotent with the diversion the CLI entry point may already have
+  // installed; restored immediately before the payload is written.
+  if (options.listCandidatesJson) {
+    divertConsoleLogToStderr();
+  }
+
   const hasSessionOverride = hasBackendSessionOverride(backend, passthroughArgs, promptParts);
   const overrideBackendSessionId = extractBackendSessionOverrideId(
     backend,
@@ -2993,6 +3001,7 @@ async function ensurePcpSessionContext(
     ]);
 
     if (options.listCandidatesJson) {
+      restoreConsoleLog();
       console.log(
         JSON.stringify(
           {

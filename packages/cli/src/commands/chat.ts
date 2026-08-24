@@ -49,6 +49,7 @@ import {
   type SpawnAgentTask,
 } from '../repl/spawn-agent.js';
 import { initSbDebug, sbDebugLog } from '../lib/sb-debug.js';
+import { divertConsoleLogToStderr, restoreConsoleLog } from '../lib/stdout-purity.js';
 import {
   ensureBackendAuthReady,
   isBackendAuthBackend,
@@ -1529,15 +1530,65 @@ function extractSessionSummaries(
  *
  * A crashed backend (lifecycle 'failed') is prime attach material — that
  * session is exactly the one its agent keeps resuming after an outage — so
- * callers list WITHOUT the server-side status filter ('active' groups
- * 'failed' with the terminal lifecycles, which is right for trigger routing
- * and wrong here) and apply this instead. Only sessions that actually
- * finished are excluded.
+ * callers ask the server for `status: 'attachable'` rather than 'active'
+ * ('active' groups 'failed' with the terminal lifecycles, which is right for
+ * trigger routing and wrong here). The server filter runs before the row
+ * limit; this predicate is the client-side backstop for the agent-declared
+ * terminal markers the DB filter does not read, and mirrors
+ * isSessionResumable in claude.ts so the two pickers agree.
  */
 export function isAttachableSessionSummary(session: SessionSummary): boolean {
   if (session.endedAt) return false;
   if (session.lifecycle === 'completed') return false;
-  return session.status !== 'completed';
+
+  const phase = (session.currentPhase || '').trim().toLowerCase();
+  if (phase === 'complete' || phase.startsWith('complete:')) return false;
+
+  const status = (session.status || '').trim().toLowerCase();
+  if (status === 'completed' || status.startsWith('completed:')) return false;
+
+  return true;
+}
+
+/**
+ * List the sessions this agent could attach to.
+ *
+ * Asks for `status: 'attachable'` so the server excludes finished sessions
+ * *before* applying the row limit. A server that predates that enum value
+ * rejects the call outright, which would empty the picker — the very bug
+ * this filter exists to fix — so an unrecognised-status failure retries
+ * unfiltered and leans on {@link isAttachableSessionSummary}. That fallback
+ * restores the pre-server-filter behaviour rather than the pre-fix one: the
+ * rows are still correct, only the limit-before-filter edge returns.
+ *
+ * Any other failure (auth, network) is a real failure and returns null, so
+ * callers can tell "no sessions" from "could not ask".
+ */
+export async function listAttachableSessions(
+  pcp: Pick<PcpClient, 'callTool'>,
+  params: Record<string, unknown>
+): Promise<Record<string, unknown> | null> {
+  try {
+    return (await pcp.callTool('list_sessions', {
+      ...params,
+      status: 'attachable',
+    })) as Record<string, unknown>;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    // Zod rejects an out-of-enum value by name; match loosely so a wording
+    // change degrades to the fallback rather than to an empty picker.
+    const looksLikeUnknownStatus =
+      message.includes('attachable') ||
+      message.toLowerCase().includes('invalid enum') ||
+      message.toLowerCase().includes('invalid_enum_value');
+    if (!looksLikeUnknownStatus) return null;
+    sbDebugLog('chat', 'list_sessions_attachable_unsupported', { message });
+    try {
+      return (await pcp.callTool('list_sessions', params)) as Record<string, unknown>;
+    } catch {
+      return null;
+    }
+  }
 }
 
 function extractActivitySummaries(
@@ -2822,6 +2873,16 @@ export async function runChat(options: ChatOptions): Promise<void> {
     return;
   }
 
+  const listingSessionCandidates = Boolean(
+    options.sessionCandidates || options.sessionCandidatesJson
+  );
+  // --session-candidates-json must put nothing but JSON on stdout, and the
+  // path to the payload prints diagnostics that are not ours to silence
+  // (sender-resolution failures, profile notices, anything a callee logs).
+  if (options.sessionCandidatesJson) {
+    divertConsoleLogToStderr();
+  }
+
   const resolvedAgentId = resolveAgentId(options.agent);
   if (!resolvedAgentId) {
     throw new Error('Could not resolve agent identity. Run `ink init` or pass `--agent <id>`.');
@@ -2986,11 +3047,17 @@ export async function runChat(options: ChatOptions): Promise<void> {
     }
   }
 
-  await ensureBackendAuthReady(runtime.backend, {
-    nonInteractive: Boolean(options.nonInteractive),
-    hasMessage: Boolean(options.message?.trim()),
-    verbose: runtime.verbose,
-  });
+  // Listing session candidates never reaches the model provider — it only
+  // asks the Inkwell server what is attachable. Running provider-auth
+  // diagnostics first would print warnings (or prompt) for a backend the
+  // command is not going to use.
+  if (!listingSessionCandidates) {
+    await ensureBackendAuthReady(runtime.backend, {
+      nonInteractive: Boolean(options.nonInteractive),
+      hasMessage: Boolean(options.message?.trim()),
+      verbose: runtime.verbose,
+    });
+  }
   const approvalManager = new ApprovalRequestManager();
 
   // Initialize approval channel based on mode
@@ -3040,9 +3107,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // so the JSON stays machine-parseable, and before the TUI so a TTY-less
   // invocation exits instead of blocking on stdin forever.
   if (options.sessionCandidates || options.sessionCandidatesJson) {
-    const sessionsResult = (await pcp
-      .callTool('list_sessions', { agentId, backend: 'ink', limit: 50 })
-      .catch(() => null)) as Record<string, unknown> | null;
+    const sessionsResult = await listAttachableSessions(pcp, {
+      agentId,
+      backend: 'ink',
+      limit: 50,
+    });
     const attachable = extractSessionSummaries(sessionsResult).filter(isAttachableSessionSummary);
     const sessions = filterSessionsByPolicy(attachable, runtime, agentId, toolPolicy, 'attach');
     const candidates = sessions.map((session) => ({
@@ -3057,6 +3126,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       startedAt: session.startedAt || null,
     }));
     if (options.sessionCandidatesJson) {
+      restoreConsoleLog();
       console.log(
         JSON.stringify(
           {
@@ -3624,9 +3694,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
     const attachLatestQuery =
       typeof options.attachLatest === 'string' ? options.attachLatest.trim() : undefined;
     const query = attachLatestQuery || attachQuery;
-    const sessionsResult = (await pcp
-      .callTool('list_sessions', { agentId, limit: 50 })
-      .catch((error) => ({ error: String(error) }))) as Record<string, unknown>;
+    const listed = await listAttachableSessions(pcp, { agentId, limit: 50 });
+    const sessionsResult: Record<string, unknown> = listed ?? {
+      error: 'could not fetch attachable sessions',
+    };
 
     if ((sessionsResult as Record<string, unknown>).error) {
       const modeLabel = options.attachLatest ? '--attach-latest' : '--attach';
@@ -3681,9 +3752,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
     !options.attachLatest &&
     !runtime.threadKey
   ) {
-    const sessionsResult = (await pcp
-      .callTool('list_sessions', { agentId, backend: 'ink', limit: 50 })
-      .catch(() => null)) as Record<string, unknown> | null;
+    const sessionsResult = await listAttachableSessions(pcp, {
+      agentId,
+      backend: 'ink',
+      limit: 50,
+    });
     const sessions = filterSessionsByPolicy(
       extractSessionSummaries(sessionsResult).filter(isAttachableSessionSummary),
       runtime,

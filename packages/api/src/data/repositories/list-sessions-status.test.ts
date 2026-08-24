@@ -74,6 +74,13 @@ function createFilteringSupabase(rows: Row[]) {
       predicates.push((row) => row[column] === null || row[column] === undefined);
       return builder;
     },
+    neq: (column: string, value: unknown) => {
+      // SQL: `col <> value` over NULL yields NULL, so the row drops out —
+      // same three-valued logic as the NOT IN above, and the same answer for
+      // a NULL lifecycle, which keeps 'attachable' and 'active' consistent.
+      predicates.push((row) => typeof row[column] === 'string' && row[column] !== value);
+      return builder;
+    },
     not: (column: string, operator: string, list: string) => {
       if (operator !== 'in') throw new Error(`Unmodelled not() operator: ${operator}`);
       const values = parseInList(list);
@@ -178,7 +185,10 @@ function repoOver(rows: Row[]): MemoryRepository {
   return new MemoryRepository(createFilteringSupabase(rows));
 }
 
-async function idsFor(rows: Row[], status: 'active' | 'paused' | 'resumable' | 'completed') {
+async function idsFor(
+  rows: Row[],
+  status: 'active' | 'paused' | 'resumable' | 'completed' | 'attachable'
+) {
   const sessions = await repoOver(rows).listSessions(USER, { status });
   return sessions.map((s) => s.id).sort();
 }
@@ -263,5 +273,68 @@ describe('listSessions status filtering', () => {
     // live started 08-05, lifecycle-only 08-03 — newest first, capped at two.
     const sessions = await repoOver(ALL).listSessions(USER, { limit: 2 });
     expect(sessions.map((s) => s.id)).toEqual(['live', 'lifecycle-only']);
+  });
+});
+
+/**
+ * 'attachable' — what a session picker needs.
+ *
+ * A crashed session is the one its agent resumes next, so a picker must see
+ * lifecycle 'failed'; trigger routing must not. 'active' serves the second
+ * and cannot serve the first, hence a separate filter rather than a change
+ * to 'active' semantics.
+ */
+describe("listSessions status 'attachable'", () => {
+  it('includes crashed sessions, unlike active', async () => {
+    expect(await idsFor(ALL, 'attachable')).toContain('failed');
+    expect(await idsFor(ALL, 'active')).not.toContain('failed');
+  });
+
+  it('is exactly active plus the crashed ones', async () => {
+    expect(await idsFor(ALL, 'attachable')).toEqual(['failed', 'live', 'paused', 'resumable-live']);
+  });
+
+  it('still excludes both spellings of a finished session', async () => {
+    const ids = await idsFor(ALL, 'attachable');
+    expect(ids).not.toContain('ended-by-hook');
+    expect(ids).not.toContain('lifecycle-only');
+    expect(ids).not.toContain('resumable-then-ended');
+  });
+
+  it('treats a NULL lifecycle as non-attachable, agreeing with active', async () => {
+    const legacy = session({ id: 'null-lifecycle', lifecycle: null });
+    expect(await idsFor([LIVE, legacy], 'attachable')).toEqual(['live']);
+  });
+
+  /**
+   * The regression this filter exists to prevent.
+   *
+   * Filtering client-side after the query applies the row limit *before* the
+   * exclusion, so newer finished sessions consume the page and push older
+   * resumable ones off it — which is how the picker went empty for an agent
+   * whose recent sessions had all completed. Server-side, the limit applies
+   * to rows that survived the filter.
+   */
+  it('does not let newer finished sessions push a crashed one off the page', async () => {
+    const olderCrashed = session({
+      id: 'older-crashed',
+      lifecycle: 'failed',
+      started_at: '2026-07-01T00:00:00Z',
+    });
+    const newerFinished = Array.from({ length: 5 }, (_, i) =>
+      session({
+        id: `finished-${i}`,
+        ended_at: '2026-08-10T00:00:00Z',
+        lifecycle: 'completed',
+        started_at: `2026-08-1${i}T00:00:00Z`,
+      })
+    );
+
+    const sessions = await repoOver([...newerFinished, olderCrashed]).listSessions(USER, {
+      status: 'attachable',
+      limit: 3,
+    });
+
+    expect(sessions.map((s) => s.id)).toEqual(['older-crashed']);
   });
 });

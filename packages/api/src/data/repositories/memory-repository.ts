@@ -52,7 +52,7 @@ const TERMINAL_LIFECYCLES = '(completed,failed)';
  * `listSessionsSchema` — this is a filter over derived current state, not a
  * read of the deprecated `sessions.status` column.
  */
-export type SessionStatusFilter = 'active' | 'paused' | 'resumable' | 'completed';
+export type SessionStatusFilter = 'active' | 'paused' | 'resumable' | 'completed' | 'attachable';
 
 export interface KnowledgeMemoryContext {
   threadKey?: string;
@@ -1869,6 +1869,15 @@ export class MemoryRepository {
       // property, so the two agree either way.
       if (options.status === 'completed') {
         query = query.or(`ended_at.not.is.null,lifecycle.in.${TERMINAL_LIFECYCLES}`);
+      } else if (options.status === 'attachable') {
+        // 'attachable' is 'active' minus the crash exclusion: a session whose
+        // backend died (lifecycle 'failed') is exactly the one its agent
+        // resumes next, so pickers must still see it. 'active' cannot serve
+        // this — it groups 'failed' with 'completed', which is right for
+        // trigger routing and wrong for attach, and filtering the difference
+        // client-side would apply the row limit before the exclusion and let
+        // newer finished sessions push older resumable ones off the page.
+        query = query.is('ended_at', null).neq('lifecycle', 'completed');
       } else {
         query = query.is('ended_at', null).not('lifecycle', 'in', TERMINAL_LIFECYCLES);
         // 'paused' and 'resumable' are agent-declared intent with no

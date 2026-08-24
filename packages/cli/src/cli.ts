@@ -41,6 +41,7 @@ import { runClaude, runClaudeInteractive } from './commands/claude.js';
 import { resolveBackend } from './backends/index.js';
 import { initSbDebug, sbDebugLog } from './lib/sb-debug.js';
 import { maybeWarnServerUpdate } from './lib/server-update-notice.js';
+import { divertConsoleLogToStderr } from './lib/stdout-purity.js';
 
 const VERSION = '0.3.0';
 
@@ -219,6 +220,12 @@ program
 
     // Resolve backend from identity.json if not explicitly set
     const resolvedOptions = { ...sbOptions, backend: resolveBackend(sbOptions.backend) };
+    // Machine-readable output mode: everything printed between here and the
+    // payload (debug path, dangerous banner, server-update notice, hook
+    // health, PCP availability) belongs on stderr.
+    if (resolvedOptions.sessionCandidatesJson) {
+      divertConsoleLogToStderr();
+    }
     const debugFile = initSbDebug({
       enabled: resolvedOptions.sbDebug,
       context: {
