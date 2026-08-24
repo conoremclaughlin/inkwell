@@ -543,6 +543,180 @@ export type Database = {
           },
         ];
       };
+      alert_events: {
+        Row: {
+          created_at: string;
+          dedupe_key: string;
+          delivery: Json;
+          detail: string | null;
+          first_seen_at: string;
+          id: string;
+          last_notified_at: string | null;
+          last_seen_at: string;
+          metrics: Json;
+          occurrence_count: number;
+          resolved_at: string | null;
+          severity: string;
+          source: string;
+          title: string;
+          user_id: string;
+        };
+        Insert: {
+          created_at?: string;
+          dedupe_key: string;
+          delivery?: Json;
+          detail?: string | null;
+          first_seen_at?: string;
+          id?: string;
+          last_notified_at?: string | null;
+          last_seen_at?: string;
+          metrics?: Json;
+          occurrence_count?: number;
+          resolved_at?: string | null;
+          severity: string;
+          source: string;
+          title: string;
+          user_id: string;
+        };
+        Update: {
+          created_at?: string;
+          dedupe_key?: string;
+          delivery?: Json;
+          detail?: string | null;
+          first_seen_at?: string;
+          id?: string;
+          last_notified_at?: string | null;
+          last_seen_at?: string;
+          metrics?: Json;
+          occurrence_count?: number;
+          resolved_at?: string | null;
+          severity?: string;
+          source?: string;
+          title?: string;
+          user_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'alert_events_user_id_fkey';
+            columns: ['user_id'];
+            isOneToOne: false;
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
+      alert_sources: {
+        Row: {
+          created_at: string;
+          description: string | null;
+          expected_interval_seconds: number | null;
+          id: string;
+          last_detail: string | null;
+          last_seen_at: string | null;
+          last_status: string | null;
+          source: string;
+          stale_alerted_at: string | null;
+          staleness_grace_factor: number;
+          updated_at: string;
+          user_id: string;
+        };
+        Insert: {
+          created_at?: string;
+          description?: string | null;
+          expected_interval_seconds?: number | null;
+          id?: string;
+          last_detail?: string | null;
+          last_seen_at?: string | null;
+          last_status?: string | null;
+          source: string;
+          stale_alerted_at?: string | null;
+          staleness_grace_factor?: number;
+          updated_at?: string;
+          user_id: string;
+        };
+        Update: {
+          created_at?: string;
+          description?: string | null;
+          expected_interval_seconds?: number | null;
+          id?: string;
+          last_detail?: string | null;
+          last_seen_at?: string | null;
+          last_status?: string | null;
+          source?: string;
+          stale_alerted_at?: string | null;
+          staleness_grace_factor?: number;
+          updated_at?: string;
+          user_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'alert_sources_user_id_fkey';
+            columns: ['user_id'];
+            isOneToOne: false;
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
+      alert_webhooks: {
+        Row: {
+          consecutive_failures: number;
+          created_at: string;
+          enabled: boolean;
+          id: string;
+          last_delivery_at: string | null;
+          last_delivery_error: string | null;
+          last_delivery_status: number | null;
+          name: string;
+          secret: string;
+          severities: string[];
+          sources: string[];
+          updated_at: string;
+          url: string;
+          user_id: string;
+        };
+        Insert: {
+          consecutive_failures?: number;
+          created_at?: string;
+          enabled?: boolean;
+          id?: string;
+          last_delivery_at?: string | null;
+          last_delivery_error?: string | null;
+          last_delivery_status?: number | null;
+          name: string;
+          secret: string;
+          severities?: string[];
+          sources?: string[];
+          updated_at?: string;
+          url: string;
+          user_id: string;
+        };
+        Update: {
+          consecutive_failures?: number;
+          created_at?: string;
+          enabled?: boolean;
+          id?: string;
+          last_delivery_at?: string | null;
+          last_delivery_error?: string | null;
+          last_delivery_status?: number | null;
+          name?: string;
+          secret?: string;
+          severities?: string[];
+          sources?: string[];
+          updated_at?: string;
+          url?: string;
+          user_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'alert_webhooks_user_id_fkey';
+            columns: ['user_id'];
+            isOneToOne: false;
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
       approval_requests: {
         Row: {
           action: string | null;
@@ -4512,6 +4686,7 @@ export type Database = {
         };
         Returns: string;
       };
+      alert_severity_rank: { Args: { p_severity: string }; Returns: number };
       apply_task_graph: {
         Args: {
           p_user_id: string;
@@ -4654,6 +4829,25 @@ export type Database = {
           isOneToOne: true;
           isSetofReturn: false;
         };
+      };
+      ingest_alert_event: {
+        Args: {
+          p_cooldown_seconds?: number;
+          p_dedupe_key: string;
+          p_detail?: string;
+          p_metrics?: Json;
+          p_severity: string;
+          p_source: string;
+          p_title: string;
+          p_user_id: string;
+        };
+        Returns: {
+          event_id: string;
+          first_seen_at: string;
+          is_new: boolean;
+          occurrence_count: number;
+          should_notify: boolean;
+        }[];
       };
       match_artifacts: {
         Args: {
@@ -4805,6 +4999,10 @@ export type Database = {
         Args: { p: string | null };
         Returns: string | null;
       };
+      record_alert_webhook_failure: {
+        Args: { p_error?: string; p_status?: number; p_webhook_id: string };
+        Returns: number;
+      };
       record_gate_verdict: {
         Args: {
           p_user_id: string;
@@ -4831,6 +5029,17 @@ export type Database = {
           p_reason?: string | null;
         };
         Returns: Json;
+      };
+      resolve_alert_event: {
+        Args: { p_dedupe_key: string; p_user_id: string };
+        Returns: {
+          event_id: string;
+          first_seen_at: string;
+          occurrence_count: number;
+          severity: string;
+          title: string;
+          was_notified: boolean;
+        }[];
       };
       retry_gate: {
         Args: {

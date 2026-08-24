@@ -28,6 +28,7 @@ import { createChatRouter } from '../routes/chat';
 import { createSessionsRouter } from '../routes/sessions';
 import { sessionEventBus } from '../services/sessions/session-event-bus';
 import { createHookLifecycleRouter } from '../routes/hook-lifecycle';
+import { createAlertsRouter } from '../routes/alerts';
 import {
   ChannelGateway,
   createChannelGateway,
@@ -1023,6 +1024,13 @@ export class MCPServer {
     });
     app.use('/api/sessions', sessionsRouter);
     logger.info('Session event routes registered at /api/sessions');
+
+    // Alert webhook routes. Registered synchronously and unconditionally —
+    // an alarm path that silently fails to mount is worse than no alarm path,
+    // because the absence is invisible until the outage it was meant to catch.
+    const alertsRouter = createAlertsRouter(this.dataComposer);
+    app.use('/api/alerts', alertsRouter);
+    logger.info('Alert webhook routes registered at /api/alerts');
 
     // Kindle routes (registered below after import)
     import('../routes/kindle.js')
