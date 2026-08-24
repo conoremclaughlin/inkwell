@@ -23,6 +23,8 @@ import type { Database } from '../supabase/types';
 type Row = Record<string, unknown>;
 type Predicate = (row: Row) => boolean;
 
+const escapeRegExp = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
 /**
  * A Supabase query builder that actually filters.
  *
@@ -48,6 +50,14 @@ function createFilteringSupabase(rows: Row[]) {
     return match[1].split(',').map((v) => v.trim().replace(/^"|"$/g, ''));
   };
 
+  /**
+   * PostgREST `ilike` pattern → RegExp. `*` is the wildcard alias for `%`;
+   * everything else is literal, so a pattern like `complete:*` must not let
+   * its colon or any regex metacharacter through as syntax.
+   */
+  const ilikeToRegExp = (pattern: string): RegExp =>
+    new RegExp(`^${pattern.split('*').map(escapeRegExp).join('.*')}$`, 'i');
+
   /** Parse one clause of an `.or(...)` string, e.g. `lifecycle.in.(a,b)`. */
   const parseOrClause = (clause: string): Predicate => {
     if (clause === 'ended_at.not.is.null') {
@@ -58,6 +68,20 @@ function createFilteringSupabase(rows: Row[]) {
       const [, column, list] = inMatch;
       const values = parseInList(list);
       return (row) => typeof row[column] === 'string' && values.includes(row[column] as string);
+    }
+    const isNullMatch = /^([a-z_]+)\.is\.null$/.exec(clause);
+    if (isNullMatch) {
+      const [, column] = isNullMatch;
+      return (row) => row[column] === null || row[column] === undefined;
+    }
+    const notIlikeMatch = /^([a-z_]+)\.not\.ilike\.(.+)$/.exec(clause);
+    if (notIlikeMatch) {
+      const [, column, pattern] = notIlikeMatch;
+      const regex = ilikeToRegExp(pattern);
+      // SQL: `col NOT ILIKE pattern` over NULL is NULL, not true. Inside an
+      // or() the NULL row is carried by its own is.null clause, so returning
+      // false here is both correct and the reason that pairing is required.
+      return (row) => typeof row[column] === 'string' && !regex.test(row[column] as string);
     }
     throw new Error(`Unmodelled PostgREST or-clause: ${clause}`);
   };
@@ -336,5 +360,84 @@ describe("listSessions status 'attachable'", () => {
     });
 
     expect(sessions.map((s) => s.id)).toEqual(['older-crashed']);
+  });
+
+  /**
+   * The same defect one column further in, and the reason the agent-declared
+   * markers cannot be left to the client.
+   *
+   * `update_session_state({ phase: 'complete' })` writes current_phase and
+   * nothing else — ended_at stays null, lifecycle stays 'idle'. Excluding
+   * only the authoritative columns server-side lets those rows fill the
+   * page, and the client discards them afterwards, leaving the picker empty
+   * with the older attachable session never having been sent.
+   */
+  it('does not let newer phase-complete sessions push a crashed one off the page', async () => {
+    const olderCrashed = session({
+      id: 'older-crashed',
+      lifecycle: 'failed',
+      started_at: '2026-07-01T00:00:00Z',
+    });
+    const newerPhaseComplete = Array.from({ length: 5 }, (_, i) =>
+      session({
+        id: `phase-complete-${i}`,
+        ended_at: null,
+        lifecycle: 'idle',
+        current_phase: 'complete',
+        started_at: `2026-08-1${i}T00:00:00Z`,
+      })
+    );
+
+    const sessions = await repoOver([...newerPhaseComplete, olderCrashed]).listSessions(USER, {
+      status: 'attachable',
+      limit: 3,
+    });
+
+    expect(sessions.map((s) => s.id)).toEqual(['older-crashed']);
+  });
+
+  it('excludes the prefixed spellings of both markers before the limit', async () => {
+    const rows = [
+      session({ id: 'phase-complete-prefixed', current_phase: 'complete:shipped' }),
+      session({ id: 'status-completed-prefixed', status: 'completed:merged' }),
+      session({ id: 'status-completed', status: 'completed' }),
+      session({ id: 'live-row', current_phase: 'implementing' }),
+    ];
+
+    expect(await idsFor(rows, 'attachable')).toEqual(['live-row']);
+  });
+
+  it('keeps a session that never declared a phase', async () => {
+    // NULL current_phase means "never set", which is attachable — but SQL's
+    // `col <> x` over NULL is NULL, so without the paired is.null allowance
+    // every such row would silently vanish.
+    const rows = [
+      session({ id: 'no-phase', current_phase: null }),
+      session({ id: 'phase-complete', current_phase: 'complete' }),
+    ];
+
+    expect(await idsFor(rows, 'attachable')).toEqual(['no-phase']);
+  });
+
+  it('does not mistake an in-progress phase for a terminal one', async () => {
+    // 'completing-review' starts with 'complete' — a prefix match rather than
+    // the exact/`complete:` forms would wrongly drop it.
+    const rows = [
+      session({ id: 'completing', current_phase: 'completing-review' }),
+      session({ id: 'blocked', current_phase: 'blocked:backend-error' }),
+      session({ id: 'done', current_phase: 'complete' }),
+    ];
+
+    expect(await idsFor(rows, 'attachable')).toEqual(['blocked', 'completing']);
+  });
+
+  it('matches the markers case-insensitively, as the client predicate does', async () => {
+    const rows = [
+      session({ id: 'shouty', current_phase: 'COMPLETE' }),
+      session({ id: 'mixed', status: 'Completed' }),
+      session({ id: 'live-row', current_phase: 'reviewing' }),
+    ];
+
+    expect(await idsFor(rows, 'attachable')).toEqual(['live-row']);
   });
 });
