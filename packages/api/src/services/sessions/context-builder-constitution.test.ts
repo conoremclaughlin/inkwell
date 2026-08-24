@@ -62,10 +62,10 @@ function makeSession(overrides: Partial<Session> = {}): Session {
 }
 
 describe('formatInjectedContext — constitution', () => {
-  it('renders values, process, the user doc, and heartbeat', () => {
+  it('renders values, process, and the user doc', () => {
     const out = formatInjectedContext(
       baseContext({
-        agent: { ...baseContext().agent, soul: 'SOUL-BODY', heartbeat: 'HEARTBEAT-BODY' },
+        agent: { ...baseContext().agent, soul: 'SOUL-BODY' },
         constitution: { values: 'VALUES-BODY', process: 'PROCESS-BODY', user: 'USER-BODY' },
       })
     );
@@ -74,7 +74,17 @@ describe('formatInjectedContext — constitution', () => {
     expect(out).toContain('VALUES-BODY');
     expect(out).toContain('PROCESS-BODY');
     expect(out).toContain('USER-BODY');
-    expect(out).toContain('HEARTBEAT-BODY');
+  });
+
+  it('leaves the heartbeat to the system prompt', () => {
+    // buildIdentityPrompt already puts the heartbeat in appendSystemPrompt,
+    // where it survives compaction. Rendering it here too would ship the whole
+    // document twice.
+    const out = formatInjectedContext(
+      baseContext({ agent: { ...baseContext().agent, heartbeat: 'HEARTBEAT-BODY' } })
+    );
+
+    expect(out).not.toContain('HEARTBEAT-BODY');
   });
 
   it('omits each section it has no content for', () => {
@@ -82,7 +92,6 @@ describe('formatInjectedContext — constitution', () => {
     expect(out).not.toContain('## Values');
     expect(out).not.toContain('## Process');
     expect(out).not.toContain('## About Your Human');
-    expect(out).not.toContain('## Heartbeat');
   });
 });
 
@@ -138,8 +147,6 @@ describe('ContextBuilder.buildContext — constitution', () => {
     expect(ctx.constitution?.values).toBe('VALUES-BODY');
     expect(ctx.constitution?.process).toBe('PROCESS-BODY');
     expect(ctx.constitution?.user).toBe('USER-BODY');
-    // Heartbeat is fetched onto the identity and must survive into the render.
-    expect(formatInjectedContext(ctx)).toContain('HEARTBEAT-BODY');
   });
 
   it('falls back to the legacy user_identity docs when the workspace has none', async () => {
@@ -386,5 +393,134 @@ describe('ContextBuilder.buildContext — memory selection', () => {
     // Raw would be 40 x 4000 = 160KB. The digest is budget-capped.
     expect(block.length).toBeLessThan(20_000);
     expect(block).toContain('## What You Know');
+  });
+
+  it('keeps an on-thread critical in the RENDERED digest, not just the ranked array', async () => {
+    // The array being ranked correctly is not the property that matters — the
+    // digest is what reaches the model. buildKnowledgeSummary used to regroup
+    // by topic and re-sort by topic recency, so a top-ranked older memory could
+    // be ranked first and still be cut from the 8KB prompt.
+    const rows: Row[] = [
+      memoryRow({
+        id: 'on-thread',
+        salience: 'critical',
+        created_at: '2026-01-05T00:00:00Z',
+        topics: ['pr:527'],
+        content: 'THE-ANSWER-IS-HERE'.padEnd(900, '.'),
+      }),
+    ];
+    for (let i = 0; i < 29; i += 1) {
+      rows.push(
+        memoryRow({
+          id: `newer-${i}`,
+          salience: 'critical',
+          created_at: `2026-08-${String(1 + i).padStart(2, '0')}T00:00:00Z`,
+          topics: [`unrelated:topic-${i}`],
+          content: `filler-${i}`.padEnd(900, '.'),
+        })
+      );
+    }
+
+    const supabase = makeFakeSupabase({
+      agent_identities: [
+        {
+          id: 'sb-1',
+          user_id: USER_ID,
+          agent_id: 'aster',
+          name: 'Aster',
+          role: 'dev',
+          values: [],
+          capabilities: [],
+          relationships: {},
+          updated_at: '2026-08-01T00:00:00Z',
+        },
+      ],
+      users: [{ id: USER_ID, timezone: 'UTC', preferences: {} }],
+      contacts: [],
+      memories: rows,
+      projects: [],
+      workspaces: [],
+      user_identity: [],
+    });
+
+    const ctx = await new ContextBuilder(supabase).buildContext(
+      USER_ID,
+      'aster',
+      makeSession({ threadKey: 'pr:527' })
+    );
+
+    expect(ctx.recentMemories[0].id).toBe('on-thread');
+    expect(ctx.knowledgeSummary).toContain('THE-ANSWER-IS-HERE');
+  });
+});
+
+describe('ContextBuilder.buildContext — workspace scoping', () => {
+  it("reads the constitution of the agent's own workspace, not the personal one", async () => {
+    // A team-workspace agent must not be handed the personal workspace's docs.
+    const supabase = makeFakeSupabase({
+      agent_identities: [
+        {
+          id: 'sb-team',
+          user_id: USER_ID,
+          agent_id: 'aster',
+          name: 'Aster',
+          role: 'dev',
+          values: [],
+          capabilities: [],
+          relationships: {},
+          workspace_id: 'ws-team',
+          updated_at: '2026-08-01T00:00:00Z',
+        },
+      ],
+      users: [{ id: USER_ID, timezone: 'UTC', preferences: {} }],
+      contacts: [],
+      memories: [],
+      projects: [],
+      workspaces: [
+        {
+          id: 'ws-personal',
+          user_id: USER_ID,
+          type: 'personal',
+          archived_at: null,
+          shared_values: 'PERSONAL-VALUES',
+          process: 'PERSONAL-PROCESS',
+          created_at: '2026-01-01T00:00:00Z',
+        },
+        {
+          id: 'ws-team',
+          user_id: USER_ID,
+          type: 'team',
+          archived_at: null,
+          shared_values: 'TEAM-VALUES',
+          process: 'TEAM-PROCESS',
+          created_at: '2026-02-01T00:00:00Z',
+        },
+      ],
+      user_identity: [
+        {
+          user_id: USER_ID,
+          workspace_id: 'ws-personal',
+          user_profile_md: 'PERSONAL-USER-DOC',
+          shared_values_md: null,
+          process_md: null,
+          updated_at: '2026-08-01T00:00:00Z',
+        },
+        {
+          user_id: USER_ID,
+          workspace_id: 'ws-team',
+          user_profile_md: 'TEAM-USER-DOC',
+          shared_values_md: null,
+          process_md: null,
+          updated_at: '2026-01-01T00:00:00Z',
+        },
+      ],
+    });
+
+    const ctx = await new ContextBuilder(supabase).buildContext(USER_ID, 'aster', makeSession());
+
+    expect(ctx.constitution?.values).toBe('TEAM-VALUES');
+    expect(ctx.constitution?.process).toBe('TEAM-PROCESS');
+    // The personal row was updated more recently — an unscoped query picks it.
+    expect(ctx.constitution?.user).toBe('TEAM-USER-DOC');
   });
 });

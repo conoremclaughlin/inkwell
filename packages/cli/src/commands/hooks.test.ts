@@ -14,6 +14,7 @@ import {
   callPcpTool,
   buildIdentityBlock,
   buildMemoriesBlock,
+  serverAlreadyInjectedContext,
   hydrateThreadKeyFromServer,
   loadApprovalSet,
   matchesApprovalSet,
@@ -1248,5 +1249,25 @@ describe('buildMemoriesBlock', () => {
   it('returns empty when there is genuinely nothing to say', () => {
     expect(buildMemoriesBlock({})).toBe('');
     expect(buildMemoriesBlock({ knowledgeSummary: '   ' })).toBe('');
+  });
+});
+
+// ============================================================================
+// serverAlreadyInjectedContext: the runner/hook handshake
+// ============================================================================
+
+describe('serverAlreadyInjectedContext', () => {
+  it('is true only for the exact flag the runners set', () => {
+    expect(serverAlreadyInjectedContext({ INK_CONSTITUTION_INJECTED: '1' })).toBe(true);
+  });
+
+  it('is false when absent, so a CLI session still loads its own constitution', () => {
+    expect(serverAlreadyInjectedContext({})).toBe(false);
+  });
+
+  it('does not treat other truthy-looking values as set', () => {
+    expect(serverAlreadyInjectedContext({ INK_CONSTITUTION_INJECTED: '0' })).toBe(false);
+    expect(serverAlreadyInjectedContext({ INK_CONSTITUTION_INJECTED: 'true' })).toBe(false);
+    expect(serverAlreadyInjectedContext({ INK_CONSTITUTION_INJECTED: '' })).toBe(false);
   });
 });

@@ -894,6 +894,18 @@ function renderTemplate(template: string, vars: Record<string, string>): string 
 // Shared Block Builders
 // ============================================================================
 
+/**
+ * Whether the server already put the constitution and knowledge summary in this
+ * turn's prompt.
+ *
+ * Set by the runners when they inject. Only the session-start hook honours it:
+ * post-compact must re-inject unconditionally, because compaction is exactly
+ * the event that removes the original copy.
+ */
+export function serverAlreadyInjectedContext(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.INK_CONSTITUTION_INJECTED === '1';
+}
+
 export function buildIdentityBlock(bootstrapResult: Record<string, unknown>): string {
   const files = bootstrapResult?.identityFiles as Record<string, string> | undefined;
   if (!files) return '';
@@ -1968,13 +1980,13 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
     if (studioId) bootstrapArgs.studioId = studioId;
 
     const bootstrap = await callPcpTool('bootstrap', bootstrapArgs);
-    // A server-spawned session already carries the constitution in its first
-    // message (the runner sets this). Re-emitting it here would duplicate
-    // several thousand tokens for no gain. Post-compact deliberately does not
-    // check this — after compaction the original copy is gone.
-    identityBlock =
-      process.env.INK_CONSTITUTION_INJECTED === '1' ? '' : buildIdentityBlock(bootstrap);
-    memoriesBlock = buildMemoriesBlock(bootstrap);
+    // A server-spawned session already carries the constitution AND the
+    // knowledge summary in its first message (the runner sets this). Re-emitting
+    // either here duplicates several thousand tokens for no gain. Post-compact
+    // deliberately does not check this — after compaction the original is gone.
+    const serverInjected = serverAlreadyInjectedContext();
+    identityBlock = serverInjected ? '' : buildIdentityBlock(bootstrap);
+    memoriesBlock = serverInjected ? '' : buildMemoriesBlock(bootstrap);
     sessionsBlock = buildSessionsBlock(
       bootstrap.activeSessions as Array<Record<string, unknown>> | undefined
     );

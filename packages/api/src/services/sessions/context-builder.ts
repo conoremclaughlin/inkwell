@@ -42,6 +42,7 @@ function mapAgentIdentity(row: DbAgentIdentity): AgentIdentity {
     description: row.description || undefined,
     backend: row.backend || undefined,
     provider: row.provider || undefined,
+    workspaceId: row.workspace_id || undefined,
     values: Array.isArray(row.values) ? (row.values as string[]) : [],
     capabilities: Array.isArray(row.capabilities) ? (row.capabilities as string[]) : [],
     soul: row.soul || undefined,
@@ -146,15 +147,15 @@ export class ContextBuilder implements IContextBuilder {
 
   async buildContext(userId: string, agentId: string, session: Session): Promise<InjectedContext> {
     // Fetch all required data in parallel
-    const [agentIdentity, user, contacts, recentMemories, activeProjects, constitution] =
-      await Promise.all([
-        this.getAgentIdentity(userId, agentId, session.sbId),
-        this.getUser(userId),
-        this.getContacts(userId),
-        this.getKnowledgeMemories(userId, agentId, session),
-        this.getActiveProjects(userId),
-        this.getConstitution(userId),
-      ]);
+    // The identity resolves first because it names the workspace whose
+    // constitution this session should read. Everything else runs alongside it.
+    const [agentIdentity, user, contacts, recentMemories, activeProjects] = await Promise.all([
+      this.getAgentIdentity(userId, agentId, session.sbId),
+      this.getUser(userId),
+      this.getContacts(userId),
+      this.getKnowledgeMemories(userId, agentId, session),
+      this.getActiveProjects(userId),
+    ]);
 
     if (!agentIdentity) {
       throw new Error(`Agent identity not found: ${agentId} for user ${userId}`);
@@ -163,6 +164,8 @@ export class ContextBuilder implements IContextBuilder {
     if (!user) {
       throw new Error(`User not found: ${userId}`);
     }
+
+    const constitution = await this.getConstitution(userId, agentIdentity.workspaceId);
 
     const userContext = mapUserContext(user, contacts);
     const temporal = buildTemporalContext(userContext.timezone);
@@ -402,35 +405,82 @@ export class ContextBuilder implements IContextBuilder {
   }
 
   /**
-   * Constitution docs from the database, resolved in the same order `bootstrap`
-   * uses: workspace-level shared docs first, then the legacy `user_identity`
-   * row. The `~/.ink` filesystem copies are a stale cache and are not consulted
-   * here — the database is the source of truth.
+   * Constitution docs from the database, scoped to the workspace this agent
+   * actually belongs to.
+   *
+   * Scoping matters: an agent in a team workspace must not be handed the
+   * personal workspace's values/process/user doc. The agent's own
+   * `workspace_id` wins; only when it has none do we fall back to the oldest
+   * personal workspace, which is what `bootstrap` does when given no explicit
+   * scope. The `user_identity` row is then read within that same scope, with
+   * the unscoped (workspace_id IS NULL) row as the legacy fallback.
+   *
+   * The `~/.ink` filesystem copies are a stale cache and are not consulted —
+   * the database is the source of truth.
    */
-  private async getConstitution(userId: string): Promise<ConstitutionDocs | undefined> {
+  private async getConstitution(
+    userId: string,
+    agentWorkspaceId?: string
+  ): Promise<ConstitutionDocs | undefined> {
     try {
-      const { data: personalWorkspace } = await this.supabase
-        .from('workspaces')
-        .select('shared_values, process')
-        .eq('user_id', userId)
-        .eq('type', 'personal')
-        .is('archived_at', null)
-        .order('created_at', { ascending: true })
-        .limit(1)
-        .maybeSingle();
+      let workspaceId = agentWorkspaceId;
 
-      const { data: userIdentity } = await this.supabase
-        .from('user_identity')
-        .select('user_profile_md, shared_values_md, process_md')
-        .eq('user_id', userId)
-        .order('updated_at', { ascending: false })
-        .limit(1)
-        .maybeSingle();
+      if (!workspaceId) {
+        const { data: personalWorkspace } = await this.supabase
+          .from('workspaces')
+          .select('id')
+          .eq('user_id', userId)
+          .eq('type', 'personal')
+          .is('archived_at', null)
+          .order('created_at', { ascending: true })
+          .limit(1)
+          .maybeSingle();
+        workspaceId = personalWorkspace?.id || undefined;
+      }
+
+      const { data: workspace } = workspaceId
+        ? await this.supabase
+            .from('workspaces')
+            .select('shared_values, process')
+            .eq('id', workspaceId)
+            .eq('user_id', userId)
+            .maybeSingle()
+        : { data: null };
+
+      // Scope the legacy row to the same workspace. Reading it unscoped would
+      // hand this agent whichever row happened to be updated most recently.
+      let userIdentity: { user_profile_md: string | null } | null = null;
+      if (workspaceId) {
+        const { data } = await this.supabase
+          .from('user_identity')
+          .select('user_profile_md, shared_values_md, process_md')
+          .eq('user_id', userId)
+          .eq('workspace_id', workspaceId)
+          .maybeSingle();
+        userIdentity = data;
+      }
+      if (!userIdentity) {
+        const { data } = await this.supabase
+          .from('user_identity')
+          .select('user_profile_md, shared_values_md, process_md')
+          .eq('user_id', userId)
+          .is('workspace_id', null)
+          .order('updated_at', { ascending: false })
+          .limit(1)
+          .maybeSingle();
+        userIdentity = data;
+      }
+
+      const legacy = userIdentity as {
+        user_profile_md?: string | null;
+        shared_values_md?: string | null;
+        process_md?: string | null;
+      } | null;
 
       const docs: ConstitutionDocs = {
-        values: personalWorkspace?.shared_values || userIdentity?.shared_values_md || undefined,
-        process: personalWorkspace?.process || userIdentity?.process_md || undefined,
-        user: userIdentity?.user_profile_md || undefined,
+        values: workspace?.shared_values || legacy?.shared_values_md || undefined,
+        process: workspace?.process || legacy?.process_md || undefined,
+        user: legacy?.user_profile_md || undefined,
       };
 
       return docs.values || docs.process || docs.user ? docs : undefined;
@@ -492,7 +542,12 @@ ${context.agent.soul}`);
   }
 
   // Constitution — the shared docs a session-start hook would otherwise load.
-  // Antigravity has no such hook, so without these the agent runs on soul alone.
+  // Antigravity has no such hook, so without these the agent gets no team
+  // process and no user document at all.
+  //
+  // Heartbeat is deliberately absent: buildIdentityPrompt already carries it in
+  // appendSystemPrompt, where it survives compaction. Repeating it here would
+  // duplicate the whole document.
   if (context.constitution?.values) {
     sections.push(`## Values
 ${context.constitution.values}`);
@@ -505,11 +560,6 @@ ${context.constitution.process}`);
     sections.push(`## About Your Human
 ${context.constitution.user}`);
   }
-  if (context.agent.heartbeat) {
-    sections.push(`## Heartbeat
-${context.agent.heartbeat}`);
-  }
-
   // Temporal context
   sections.push(`## Current Time
 ${context.temporal.greeting}! It is ${context.temporal.currentTime} on ${context.temporal.currentDate}.`);

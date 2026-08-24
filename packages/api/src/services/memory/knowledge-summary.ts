@@ -93,8 +93,19 @@ export function buildKnowledgeSummary(memories: Memory[]): {
     }
   }
 
-  // Sort groups: most recent activity first
-  const sortedGroups = Array.from(groups.values()).sort((a, b) =>
+  // Render groups in the order the CALLER ranked them, not by topic recency.
+  //
+  // Both callers hand this function a deliberately ordered list — critical tier
+  // first, ranked by relevance within the tier. Re-sorting by lastActivity threw
+  // that away and then cut at the budget, so a highly-relevant older memory
+  // could be ranked first by the repository and still be absent from the
+  // rendered prompt. Groups therefore keep the position of their best-ranked
+  // member, which is their first appearance in the input.
+  const rankedGroups = Array.from(groups.values());
+
+  // The topic index is a navigation aid, not a prompt, so it stays
+  // recency-ordered.
+  const recencyOrderedGroups = [...rankedGroups].sort((a, b) =>
     b.lastActivity.localeCompare(a.lastActivity)
   );
 
@@ -104,9 +115,9 @@ export function buildKnowledgeSummary(memories: Memory[]): {
   let memoriesIncluded = 0;
   const includedTopics = new Set<string>();
   const includedMemoryIds: string[] = [];
-  const overflowTopics: typeof sortedGroups = [];
+  const overflowTopics: typeof rankedGroups = [];
 
-  for (const group of sortedGroups) {
+  for (const group of rankedGroups) {
     // Format this group
     const header = group.topicSummary
       ? `### ${group.topicKey} — ${truncateContent(group.topicSummary, 120)}\n`
@@ -149,7 +160,7 @@ export function buildKnowledgeSummary(memories: Memory[]): {
   }
 
   // Build topic index from ALL topics (including overflow)
-  const topicIndex = sortedGroups.map((g) => ({
+  const topicIndex = recencyOrderedGroups.map((g) => ({
     topicKey: g.topicKey,
     memoryCount: g.memoryCount,
     lastActivity: g.lastActivity,

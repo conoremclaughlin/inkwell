@@ -299,6 +299,8 @@ export interface AgentIdentity {
   name: string;
   role: string;
   description?: string;
+  /** Workspace this identity belongs to — scopes which constitution it reads. */
+  workspaceId?: string;
   backend?: string;
   provider?: string;
   values: string[];
