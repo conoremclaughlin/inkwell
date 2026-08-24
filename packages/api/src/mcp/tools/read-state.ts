@@ -91,13 +91,23 @@ export interface AdvanceInboxReadPointerParams {
  * and loud on failure — a dropped pointer write is a delivery fault, not a
  * silent no-op.
  */
+export interface AdvanceInboxReadPointerResult {
+  /** The RPC ran and the pointer's resulting position is known. */
+  ok: boolean;
+  /** The pointer's position AFTER the call — the monotonic RESULT, which is
+   * what responses must report, never the anchor the caller requested. */
+  lastReadAt: string | null;
+  /** Whether THIS call actually moved the pointer forward. */
+  changed: boolean;
+}
+
 export async function advanceAgentInboxReadPointer(
   supabase: unknown,
   params: AdvanceInboxReadPointerParams
-): Promise<boolean> {
+): Promise<AdvanceInboxReadPointerResult> {
   const { userId, agentId, throughMessageId, source } = params;
   try {
-    const { error } = await (supabase as RpcClient).rpc('advance_agent_inbox_read_pointer', {
+    const { data, error } = await (supabase as RpcClient).rpc('advance_agent_inbox_read_pointer', {
       p_user_id: userId,
       p_agent_id: agentId,
       p_through_message_id: throughMessageId,
@@ -110,9 +120,17 @@ export async function advanceAgentInboxReadPointer(
         source,
         error: error.message,
       });
-      return false;
+      return { ok: false, lastReadAt: null, changed: false };
     }
-    return true;
+    const row = (Array.isArray(data) ? data[0] : data) as
+      | { last_read_at?: string; changed?: boolean }
+      | null
+      | undefined;
+    return {
+      ok: true,
+      lastReadAt: row?.last_read_at ?? null,
+      changed: row?.changed === true,
+    };
   } catch (err) {
     logger.error('[ReadState] Agent inbox read pointer advance threw', {
       userId,
@@ -121,6 +139,6 @@ export async function advanceAgentInboxReadPointer(
       source,
       error: err instanceof Error ? err.message : String(err),
     });
-    return false;
+    return { ok: false, lastReadAt: null, changed: false };
   }
 }

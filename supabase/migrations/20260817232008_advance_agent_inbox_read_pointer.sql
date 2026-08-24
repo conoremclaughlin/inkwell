@@ -20,14 +20,20 @@
 -- message must actually be addressed to (p_user_id, p_agent_id), so one agent
 -- cannot advance another's pointer by passing a foreign message id.
 
-CREATE OR REPLACE FUNCTION public.advance_agent_inbox_read_pointer(
+-- Returns the RESULTING pointer and whether this call actually moved it —
+-- callers must report the monotonic outcome, not the anchor they requested
+-- (Lumen #504 r1: the response said `lastReadAt: June 18, advanced: true`
+-- while the DB correctly kept Aug 16).
+DROP FUNCTION IF EXISTS public.advance_agent_inbox_read_pointer(uuid, text, uuid);
+CREATE FUNCTION public.advance_agent_inbox_read_pointer(
   p_user_id uuid,
   p_agent_id text,
   p_through_message_id uuid
-) RETURNS timestamptz AS $$
+) RETURNS TABLE (last_read_at timestamptz, changed boolean) AS $$
 DECLARE
   v_created_at timestamptz;
-  v_result timestamptz;
+  v_old timestamptz;
+  v_new timestamptz;
 BEGIN
   SELECT created_at INTO v_created_at
   FROM public.agent_inbox
@@ -40,14 +46,18 @@ BEGIN
       p_through_message_id, p_user_id, p_agent_id;
   END IF;
 
+  SELECT ars.last_read_at INTO v_old
+  FROM public.agent_inbox_read_status ars
+  WHERE ars.user_id = p_user_id AND ars.agent_id = p_agent_id;
+
   INSERT INTO public.agent_inbox_read_status (user_id, agent_id, last_read_at)
   VALUES (p_user_id, p_agent_id, v_created_at)
   ON CONFLICT (user_id, agent_id)
   DO UPDATE SET last_read_at =
     GREATEST(agent_inbox_read_status.last_read_at, EXCLUDED.last_read_at)
-  RETURNING last_read_at INTO v_result;
+  RETURNING agent_inbox_read_status.last_read_at INTO v_new;
 
-  RETURN v_result;
+  RETURN QUERY SELECT v_new, (v_old IS NULL OR v_new > v_old);
 END;
 $$ LANGUAGE plpgsql;
 

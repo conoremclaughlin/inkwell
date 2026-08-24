@@ -28,7 +28,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { readFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
-import { createThreadDrainState, drainThreads } from './poll-core.js';
+import { createThreadDrainState, drainThreads, drainLegacyInbox } from './poll-core.js';
 import { createLogger, isLogLevel, logFileFor, sweepStaleLogs, type LogLevel } from './logger.js';
 
 // ─── Logging ────────────────────────────────────────────────
@@ -365,43 +365,45 @@ async function pollInbox(): Promise<void> {
         log('info', 'Thread drain result', { ...drained });
       }
 
-      // Legacy inbox messages (non-threaded). Since we pass `since: lastPollTime`
-      // to get_inbox, only new messages are returned. seenMessageIds prevents
-      // any edge-case re-emission.
+      // Legacy inbox messages (non-threaded), drained through poll-core
+      // (unit-tested) under the same exact-id ack contract as threads: the
+      // mark_inbox_read throughMessageId ack after the batch is the ONLY
+      // consumption, so what this caller injects is what gets consumed —
+      // without it, the pointer never moves for this caller and delivered
+      // task requests stay counted/re-delivered forever (Lumen #504 r1 P1).
       const inboxMessages = (result.messages as Array<Record<string, unknown>>) || [];
-      for (const msg of inboxMessages) {
-        const msgId = msg.id as string;
-        // Skip own messages unless cross-studio (same logic as thread path above)
-        if (msg.senderAgentId === agentId) {
-          if (!studioId) continue;
-          const msgPcp = (msg.metadata as Record<string, unknown>)?.pcp as
-            | Record<string, unknown>
-            | undefined;
-          const msgSender = msgPcp?.sender as Record<string, unknown> | undefined;
-          const msgStudioId = msgSender?.studioId as string | undefined;
-          if (!msgStudioId || msgStudioId === studioId) continue;
-        }
-        if (msgId && seenMessageIds.has(msgId)) continue;
-        if (!isLegacyMessageForThisStudio(msg)) continue;
-        if (msgId) seenMessageIds.add(msgId);
-
-        const sender = (msg.senderAgentId as string) || 'unknown';
-        const content = (msg.content as string) || '';
-        const messageType = (msg.messageType as string) || 'message';
-        const msgThreadKey = (msg.threadKey as string) || '';
-
-        await mcp.notification({
-          method: 'notifications/claude/channel',
-          params: {
-            content: `From ${sender}: ${content}`,
-            meta: {
-              thread_key: msgThreadKey,
-              sender,
-              message_type: messageType,
-              subject: (msg.subject as string) || '',
-            },
+      const legacyDrained = await drainLegacyInbox(
+        {
+          callPcp,
+          notify: async (content, meta) => {
+            await mcp.notification({
+              method: 'notifications/claude/channel',
+              params: { content, meta },
+            });
           },
-        });
+          log,
+          agentId,
+          email,
+          studioId,
+        },
+        seenMessageIds,
+        inboxMessages,
+        (msg) => {
+          // Own messages are skipped unless cross-studio (same as threads).
+          if (msg.senderAgentId === agentId) {
+            if (!studioId) return true;
+            const msgPcp = (msg.metadata as Record<string, unknown>)?.pcp as
+              | Record<string, unknown>
+              | undefined;
+            const msgSender = msgPcp?.sender as Record<string, unknown> | undefined;
+            const msgStudioId = msgSender?.studioId as string | undefined;
+            if (!msgStudioId || msgStudioId === studioId) return true;
+          }
+          return !isLegacyMessageForThisStudio(msg);
+        }
+      );
+      if (legacyDrained.injected > 0 || legacyDrained.ackFailures > 0) {
+        log('info', 'Legacy inbox drain result', { ...legacyDrained });
       }
 
       lastPollTime = new Date().toISOString();

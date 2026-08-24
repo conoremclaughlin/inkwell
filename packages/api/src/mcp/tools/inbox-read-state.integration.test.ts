@@ -19,7 +19,10 @@ import { getDataComposer, type DataComposer } from '../../data/composer';
 import { handleGetInbox, handleMarkInboxRead, handleGetAgentStatus } from './inbox-handlers';
 import { ensureEchoIntegrationFixture } from '../../test/integration-fixtures';
 
-const AGENT = 'echo';
+// Uniquely namespaced per run: this suite's rows and pointer can NEVER
+// collide with another suite's use of the shared Echo fixture (the previous
+// shared slug made cross-suite sweeps possible at all — Lumen #504 r1 P2).
+const AGENT = `echo-readstate-${Math.random().toString(36).slice(2, 8)}`;
 
 describe('agent_inbox read state (integration)', () => {
   let dataComposer: DataComposer;
@@ -50,11 +53,11 @@ describe('agent_inbox read state (integration)', () => {
   });
 
   afterAll(async () => {
-    await supabase
-      .from('agent_inbox')
-      .delete()
-      .eq('recipient_user_id', userId)
-      .eq('recipient_agent_id', AGENT);
+    // Cleanup is suite-owned ONLY: afterEach already deletes exactly the rows
+    // this suite created (tracked ids) plus its own pointer row. A broad
+    // recipient-wide sweep here deleted OTHER suites' rows for the shared
+    // Echo fixture mid-run (agent-gateway resolves the user through its own
+    // agent_inbox row) — a direct source of flaky DB CI (Lumen #504 r1 P2).
     await supabase
       .from('agent_inbox_read_status')
       .delete()
@@ -224,20 +227,48 @@ describe('agent_inbox read state (integration)', () => {
     expect(followUp.messages.map((m: { id: string }) => m.id)).toContain(normal);
   });
 
-  it('does not advance past a backlog that limit cut short', async () => {
-    await insert({ createdAt: '2026-08-16T10:00:00Z' });
-    await insert({ createdAt: '2026-08-16T11:00:00Z' });
+  it('drains a limit-cut backlog batch by batch — progress without loss', async () => {
+    /*
+     * Lumen #504 r1 P1: the old guard refused to advance on truncation, but
+     * the page held the NEWEST rows with no cursor to the rest — the same
+     * page returned forever, and a backlog above the cap could never drain.
+     * The consuming path now selects the OLDEST unseen batch and advances
+     * through its maximum, so each call makes progress and nothing is
+     * skipped.
+     */
+    const a = await insert({ createdAt: '2026-08-16T10:00:00Z' });
+    const b = await insert({ createdAt: '2026-08-16T11:00:00Z' });
+    const c = await insert({ createdAt: '2026-08-16T12:00:00Z' });
+    await setPointer('2026-08-01T00:00:00Z');
+
+    const first = await getInbox({ limit: 1 });
+    expect(first.unreadCount).toBe(3);
+    expect(first.truncated).toBe(true);
+    // The OLDEST unseen message, not the newest — and the pointer advanced
+    // through it, because the batch is contiguous with the floor.
+    expect(first.messages.map((m: { id: string }) => m.id)).toEqual([a]);
+    expect(first.readPointerAdvanced).toBe(true);
+
+    const second = await getInbox({ limit: 1 });
+    expect(second.messages.map((m: { id: string }) => m.id)).toEqual([b]);
+
+    const third = await getInbox({ limit: 1 });
+    expect(third.messages.map((m: { id: string }) => m.id)).toEqual([c]);
+
+    // Fully drained — nothing lost, nothing repeated.
+    expect((await getInbox()).unreadCount).toBe(0);
+  });
+
+  it('a multi-row batch is returned newest-first but advances through the batch max', async () => {
+    const a = await insert({ createdAt: '2026-08-16T10:00:00Z' });
+    const b = await insert({ createdAt: '2026-08-16T11:00:00Z' });
     await insert({ createdAt: '2026-08-16T12:00:00Z' });
     await setPointer('2026-08-01T00:00:00Z');
 
-    const res = await getInbox({ limit: 1 });
-
-    expect(res.count).toBe(1);
-    expect(res.unreadCount).toBe(3);
-    expect(res.truncated).toBe(true);
-    expect(res.readPointerAdvanced).toBe(false);
-    // Re-delivery beats loss: the two older messages survive.
-    expect((await getInbox()).unreadCount).toBe(3);
+    const res = await getInbox({ limit: 2 });
+    // Oldest BATCH (a, b), displayed newest-first (b, a).
+    expect(res.messages.map((m: { id: string }) => m.id)).toEqual([b, a]);
+    expect(await getPointer()).toBe('2026-08-16T11:00:00+00:00');
   });
 
   it('does not advance when the page was selected by workflow status', async () => {
@@ -305,7 +336,63 @@ describe('agent_inbox read state (integration)', () => {
     );
 
     expect(res.success).toBe(true);
+    // The RESPONSE reports the monotonic RESULT, not the requested anchor
+    // (Lumen #504 r1 P2): the DB kept Aug 16, so the response must too.
+    expect(res.lastReadAt).toBe('2026-08-16T10:00:00+00:00');
+    expect(res.advanced).toBe(false);
     expect(await getPointer()).toBe('2026-08-16T10:00:00+00:00');
+  });
+
+  it('acks an exact message id (throughMessageId) — the legacy delivery ack', async () => {
+    const older = await insert({ createdAt: '2026-08-16T10:00:00Z' });
+    await insert({ createdAt: '2026-08-16T11:00:00Z' });
+
+    const res = JSON.parse(
+      (
+        await handleMarkInboxRead(
+          { userId, agentId: AGENT, throughMessageId: older },
+          dataComposer as never
+        )
+      ).content[0].text
+    );
+
+    expect(res.success).toBe(true);
+    expect(res.advanced).toBe(true);
+    // Advanced through EXACTLY the acked message — the newer row stays unseen.
+    expect(res.lastReadAt).toBe('2026-08-16T10:00:00+00:00');
+    expect(await getPointer()).toBe('2026-08-16T10:00:00+00:00');
+    expect((await getInbox({ markRead: false })).unreadCount).toBe(1);
+  });
+
+  it("throughMessageId for another agent's message is a no-op, not an advance", async () => {
+    const { data: foreign } = await supabase
+      .from('agent_inbox')
+      .insert({
+        recipient_user_id: userId,
+        recipient_agent_id: `${AGENT}-other`,
+        sender_agent_id: 'wren',
+        content: 'not yours',
+        message_type: 'message',
+        priority: 'normal',
+        status: 'unread',
+        created_at: '2026-08-16T10:00:00Z',
+      })
+      .select('id')
+      .single();
+    created.push(foreign.id);
+
+    const res = JSON.parse(
+      (
+        await handleMarkInboxRead(
+          { userId, agentId: AGENT, throughMessageId: foreign.id },
+          dataComposer as never
+        )
+      ).content[0].text
+    );
+
+    expect(res.success).toBe(true);
+    expect(res.advanced).toBe(false);
+    expect(await getPointer()).toBeNull();
   });
 
   it('is a no-op, not a failure, when nothing precedes the cutoff', async () => {
@@ -323,5 +410,51 @@ describe('agent_inbox read state (integration)', () => {
     expect(res.success).toBe(true);
     expect(res.advanced).toBe(false);
     expect(await getPointer()).toBeNull();
+  });
+
+  // ── Aggregate floor (agent-less timeline) ───────────────────────────
+
+  it('a recipient with mail but NO pointer forces a null aggregate floor', async () => {
+    /*
+     * Lumen #504 r1 P1: the aggregate floor was min() over EXISTING pointer
+     * rows only. An agent with mail and no pointer row (Echo's July message)
+     * was hidden behind the other agents' floor — an under-count to zero,
+     * which is the exact bug class this PR fixes. Any such recipient must
+     * force a null floor so everything counts.
+     */
+    const unpointeredAgent = `${AGENT}-nopointer`;
+    // Future-dated so parallel suites' rows cannot push these off the page.
+    const future = (mins: number) => new Date(Date.now() + mins * 60_000).toISOString();
+
+    // The unpointered agent's mail is OLDER than the pointered agent's floor.
+    const { data: hidden } = await supabase
+      .from('agent_inbox')
+      .insert({
+        recipient_user_id: userId,
+        recipient_agent_id: unpointeredAgent,
+        sender_agent_id: 'wren',
+        content: 'genuinely unread',
+        message_type: 'task_request',
+        priority: 'normal',
+        status: 'unread',
+        created_at: future(30),
+      })
+      .select('id')
+      .single();
+    created.push(hidden.id);
+
+    const seen = await insert({ createdAt: future(60) });
+    // AGENT has read through the newer message: with min-over-existing-rows,
+    // the aggregate floor would be future(60) and the older row vanishes.
+    await handleMarkInboxRead(
+      { userId, agentId: AGENT, throughMessageId: seen },
+      dataComposer as never
+    );
+
+    const res = JSON.parse(
+      (await handleGetInbox({ userId, status: 'unread', limit: 50 }, dataComposer as never))
+        .content[0].text
+    );
+    expect(res.messages.map((m: { id: string }) => m.id)).toContain(hidden.id);
   });
 });

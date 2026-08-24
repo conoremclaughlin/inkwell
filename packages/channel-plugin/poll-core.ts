@@ -286,3 +286,97 @@ export async function drainThreads(
 
   return { injected, ceilingHit, fetchFailures, emitFailures, ackFailures, skippedThisPoll };
 }
+
+// ─── Legacy (non-threaded) inbox drain ─────────────────────────────────────
+
+export interface LegacyDrainResult {
+  injected: number;
+  emitFailures: number;
+  ackFailures: number;
+}
+
+/**
+ * Deliver LEGACY inbox rows and CONSUME them under the same exact-id ack
+ * contract as the thread drain (Lumen #504 r1 P1). Without an ack, this
+ * caller never advances the read pointer past what it injects: once the
+ * pointer defines unseen-ness, every successfully delivered task request
+ * stays counted as unread, and heartbeat/status surfaces re-deliver it until
+ * some unrelated unfiltered reader happens to drain it.
+ *
+ * Contract, mirroring drainThreads:
+ * - The ack range walks OLDEST-first; client-filtered rows (own messages,
+ *   other studios, seen-set dedup) count as deliberately processed and stay
+ *   INSIDE the range. Only an emit FAILURE stops the range, leaving the
+ *   newer remainder unacked for redelivery.
+ * - The ack (mark_inbox_read throughMessageId) is the only consumption.
+ *   A failed ack leaves the pointer untouched; the next poll re-fetches,
+ *   dedups by seen-set (no duplicate render), and retries the ack.
+ */
+export async function drainLegacyInbox(
+  deps: PollDeps,
+  seenMessageIds: Set<string>,
+  messages: Array<Record<string, unknown>>,
+  shouldSkip: (msg: Record<string, unknown>) => boolean
+): Promise<LegacyDrainResult> {
+  let injected = 0;
+  let emitFailures = 0;
+  let ackFailures = 0;
+
+  // Pages arrive newest-first (display order); consumption walks oldest-first
+  // so a mid-batch failure never acks past an undelivered older row.
+  const batch = [...messages].sort((a, b) =>
+    String(a.createdAt ?? '').localeCompare(String(b.createdAt ?? ''))
+  );
+
+  let lastProcessedId: string | null = null;
+  for (const msg of batch) {
+    const msgId = (msg.id as string) || '';
+
+    if ((msgId && seenMessageIds.has(msgId)) || shouldSkip(msg)) {
+      if (msgId) lastProcessedId = msgId;
+      continue;
+    }
+
+    const sender = (msg.senderAgentId as string) || 'unknown';
+    const content = (msg.content as string) || '';
+    const messageType = (msg.messageType as string) || 'message';
+    try {
+      await deps.notify(`From ${sender}: ${content}`, {
+        thread_key: (msg.threadKey as string) || '',
+        sender,
+        message_type: messageType,
+        subject: (msg.subject as string) || '',
+        message_id: msgId,
+      });
+    } catch (err) {
+      emitFailures += 1;
+      deps.log('error', 'Legacy emit failed — leaving remainder unread for redelivery', {
+        msgId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      break;
+    }
+    if (msgId) {
+      seenMessageIds.add(msgId);
+      lastProcessedId = msgId;
+    }
+    injected += 1;
+    deps.log('info', 'Pushed legacy inbox message to channel', { sender, msgId });
+  }
+
+  if (lastProcessedId) {
+    const ack = await deps.callPcp('mark_inbox_read', {
+      ...(deps.email ? { email: deps.email } : {}),
+      agentId: deps.agentId,
+      throughMessageId: lastProcessedId,
+    });
+    if (!ack?.success) {
+      ackFailures += 1;
+      deps.log('error', 'Legacy inbox ack failed — pointer held, will retry next poll', {
+        throughMessageId: lastProcessedId,
+      });
+    }
+  }
+
+  return { injected, emitFailures, ackFailures };
+}
