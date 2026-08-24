@@ -39,6 +39,13 @@ export interface ToolResultRecord {
  */
 export type AgentLoopStopReason =
   | 'no-tools'
+  /**
+   * Calls were made and every one was refused — blocked by policy or denied by
+   * the user. Distinct from `no-tools` (the agent stopped asking) because for a
+   * clone the difference is everything: one is a finished report, the other is
+   * work that never happened behind a confident-sounding preamble.
+   */
+  | 'all-refused'
   | 'terminal-signal'
   | 'iteration-cap'
   | 'backend-failure'
@@ -84,6 +91,17 @@ export interface AgentLoopPorts {
       calls: LocalToolCall[],
       ctx: { iteration: number; signal?: AbortSignal }
     ): Promise<ToolResultRecord[]>;
+    /**
+     * Vet an iteration's FULL extracted call list before anything runs.
+     *
+     * Runs pre-truncation on purpose: a rule like "spawn_agent must be alone"
+     * checked after `.slice()` could be evaded by a spawn in sixth position.
+     * Returning a refusal rejects the iteration whole — no call runs — and the
+     * reason is fed back so the model can correct rather than guess.
+     *
+     * Omit to accept every iteration and simply truncate.
+     */
+    screen?(allCalls: LocalToolCall[]): { calls: LocalToolCall[] } | { rejected: string };
   };
   backend: {
     /**
@@ -156,7 +174,16 @@ export function buildContinuationBody(
     ? '\n\nFORMAT NOTE: your tool calls used <tool_call> XML — the ink runtime executed them this time, but the ONLY supported format is a fenced block:\n```ink-tool\n{"tool":"<name>","args":{...}}\n```\nUse ink-tool fences (bare tool names, no mcp__inkwell__ prefix) from now on.'
     : '';
 
-  return `[Tool results from previous turn]\n${toolResultsSummary}${formatCorrection}\n\nContinue your response based on these tool results. If you need more tools, emit ink-tool blocks. Otherwise, provide your final answer.`;
+  // Nothing ran. Without saying so, a model reads the results block as ordinary
+  // output and either retries the same refused call or writes its answer as if
+  // the work had happened.
+  const allRefused =
+    results.length > 0 && !results.some((r) => r.status === 'executed' || r.status === 'approved');
+  const refusalNote = allRefused
+    ? '\n\nNOTE: none of those calls ran — every one was refused. Do not retry them. Work with the tools you do have, and if the task cannot be completed without a refused tool, say so plainly and stop.'
+    : '';
+
+  return `[Tool results from previous turn]\n${toolResultsSummary}${formatCorrection}${refusalNote}\n\nContinue your response based on these tool results. If you need more tools, emit ink-tool blocks. Otherwise, provide your final answer.`;
 }
 
 export interface AgentLoopInput {
@@ -166,6 +193,17 @@ export interface AgentLoopInput {
   toolRouting: 'backend' | 'local';
   maxIterations?: number;
   signal?: AbortSignal;
+  /**
+   * Tell the agent when every call in an iteration was refused, and let it try
+   * again, instead of ending the turn.
+   *
+   * Off for the REPL: a human is watching the scrollback, sees the refusal, and
+   * can redirect — re-prompting there would just nag someone who already said
+   * no. On for a shadow clone, where nobody is watching: a clone that silently
+   * gives up hands its parent a confident preamble in place of the work, which
+   * is exactly the failure the live smoke test surfaced.
+   */
+  continueOnBlocked?: boolean;
 }
 
 /**
@@ -184,6 +222,21 @@ export async function runAgentLoop(
   const allToolResults: ToolResultRecord[] = [];
 
   let iteration = 0;
+
+  // Fail fast. A turn cancelled before it started must not spend a backend
+  // invocation proving it — the opening spawn is the single most expensive
+  // thing the loop does.
+  if (input.signal?.aborted) {
+    return {
+      responseText: '',
+      assistantDisplayText: '',
+      toolResults: [],
+      iterations: 0,
+      success: false,
+      stopReason: 'aborted',
+    };
+  }
+
   let outcome = await ports.backend.runTurn(input.prompt, {
     iteration,
     isContinuation: false,
@@ -197,10 +250,58 @@ export async function runAgentLoop(
   for (;;) {
     responseText = resolveResponseText(outcome);
 
-    calls =
-      input.toolRouting === 'local'
-        ? extractLocalToolCalls(responseText).slice(0, MAX_TOOL_CALLS_PER_ITERATION)
-        : [];
+    const extracted =
+      input.toolRouting === 'local' ? extractLocalToolCalls(responseText) : ([] as LocalToolCall[]);
+
+    // Screening sees every call the model emitted, before the per-iteration cap
+    // discards any — a rule about what may accompany what cannot be enforced on
+    // a truncated list.
+    const screened = ports.tools.screen
+      ? ports.tools.screen(extracted)
+      : { calls: extracted.slice(0, MAX_TOOL_CALLS_PER_ITERATION) };
+
+    if ('rejected' in screened) {
+      // Refused whole. Tell the model why and let it try again; the iteration
+      // still counts, so a model that keeps re-emitting the same bad shape runs
+      // out of budget rather than spinning.
+      iteration++;
+      const record: ToolResultRecord = {
+        tool: 'iteration',
+        result: screened.rejected,
+        status: 'rejected',
+      };
+      allToolResults.push(record);
+      ports.ui.printEvent(`  ⋯ iteration refused — ${screened.rejected}`);
+
+      if (iteration >= maxIterations) {
+        stopReason = 'iteration-cap';
+        ports.ui.printLine(`(tool loop limit reached — ${maxIterations} iterations)`);
+        break;
+      }
+
+      if (input.signal?.aborted) {
+        stopReason = 'aborted';
+        break;
+      }
+
+      const stopWaitingAfterRejection = ports.ui.startWaiting();
+      try {
+        outcome = await ports.backend.runTurn(buildContinuationBody([record], extracted), {
+          iteration,
+          isContinuation: true,
+          signal: input.signal,
+        });
+      } finally {
+        stopWaitingAfterRejection();
+      }
+      if (!outcome.success) {
+        stopReason = 'backend-failure';
+        break;
+      }
+      continue;
+    }
+
+    calls = screened.calls;
 
     if (calls.length === 0) {
       stopReason = 'no-tools';
@@ -213,8 +314,23 @@ export async function runAgentLoop(
 
     iteration++;
 
+    // An abort observed here is authoritative, and checking for it is not
+    // optional bookkeeping. A cancelled approval comes back as a DENIAL, which
+    // reads as `all-refused` — and with `continueOnBlocked` that starts another
+    // backend turn, so cancelling a clone would spawn the very work it was
+    // meant to stop, then report `no-tools` success.
+    if (input.signal?.aborted) {
+      stopReason = 'aborted';
+      break;
+    }
+
     const reason = toolLoopStopReason(results, iteration, maxIterations);
-    if (reason) {
+    // Everything was refused. Telling the agent so — once, and only where nobody
+    // is watching the scrollback for it — is the difference between a clone that
+    // routes around its envelope and one that hands back a preamble.
+    const retryAfterRefusal =
+      reason === 'all-refused' && input.continueOnBlocked === true && iteration < maxIterations;
+    if (reason && !retryAfterRefusal) {
       stopReason = reason;
       if (reason === 'iteration-cap') {
         ports.ui.printLine(`(tool loop limit reached — ${maxIterations} iterations)`);
@@ -223,7 +339,11 @@ export async function runAgentLoop(
     }
 
     const ranTools = Array.from(new Set(results.map((r) => r.tool))).join(', ');
-    ports.ui.printEvent(`  ⋯ ran ${ranTools} — continuing (${iteration}/${maxIterations})…`);
+    ports.ui.printEvent(
+      retryAfterRefusal
+        ? `  ⋯ ${ranTools} refused — continuing (${iteration}/${maxIterations})…`
+        : `  ⋯ ran ${ranTools} — continuing (${iteration}/${maxIterations})…`
+    );
 
     const stopWaiting = ports.ui.startWaiting();
     try {
@@ -248,7 +368,12 @@ export async function runAgentLoop(
   }
 
   // An aborted turn (SIGINT kills the child) exits >=128 and has no usable text.
-  const aborted = !outcome.success && outcome.exitCode !== undefined && outcome.exitCode >= 128;
+  // But cancellation can also be observed WITHOUT a killed child — an approval
+  // wait unblocking on the signal — so an already-decided `aborted` stands.
+  const aborted =
+    stopReason === 'aborted' ||
+    input.signal?.aborted === true ||
+    (!outcome.success && outcome.exitCode !== undefined && outcome.exitCode >= 128);
 
   // Any failed final outcome is a failure, whichever branch broke the loop.
   // Without this, an opening turn that fails with no parsed tool calls exits via
@@ -274,7 +399,11 @@ export async function runAgentLoop(
     assistantDisplayText,
     toolResults: allToolResults,
     iterations: iteration,
-    success: outcome.success,
+    // A cancelled turn is not a successful one, even when the last backend
+    // process exited 0 — cancellation can be observed while nothing is running
+    // (an approval wait unblocking), so the child's exit code says nothing
+    // about whether the turn achieved anything.
+    success: outcome.success && !aborted,
     stopReason: finalStopReason,
   };
 }
@@ -398,10 +527,12 @@ export function toolLoopStopReason(
   );
   if (signaledDone) return 'terminal-signal';
 
+  // Reachable only when the agent DID emit calls, so "nothing executed" means
+  // "everything was refused" — never "it stopped asking".
   const hasExecutedTools = iterationResults.some(
     (r) => r.status === 'executed' || r.status === 'approved'
   );
-  if (!hasExecutedTools) return 'no-tools';
+  if (!hasExecutedTools) return 'all-refused';
 
   if (iteration >= maxIterations) return 'iteration-cap';
 

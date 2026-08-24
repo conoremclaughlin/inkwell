@@ -13,9 +13,12 @@ import { Router, type Request, type Response } from 'express';
 import type { DataComposer } from '../data/composer';
 import { PcpAuthProvider } from '../mcp/auth/pcp-auth-provider';
 import { StudioLeaseService } from '../services/studio-lease.service';
+import { releaseGraphClaimsForSession } from '../services/graph-executor.service';
 import { logger } from '../utils/logger';
 
 const VALID_LIFECYCLES = ['running', 'idle', 'compacting', 'completed', 'failed'] as const;
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 type Lifecycle = (typeof VALID_LIFECYCLES)[number];
 
 export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
@@ -44,27 +47,48 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         return;
       }
 
-      const { sessionId, lifecycle, event, agentId, workingDir, cliAttached, cliPollAt, alias } =
-        req.body as {
-          sessionId?: string;
-          lifecycle?: string;
-          /**
-           * Which hook fired: 'prompt' | 'stop' | 'pre-compact' | 'post-compact'.
-           * Lifecycle values alone are ambiguous — post-compact also sends
-           * 'idle' while the same turn continues, so ONLY event === 'stop'
-           * marks the real CLI turn boundary. Legacy senders without the
-           * field get renewals but never boundary releases.
-           */
-          event?: string;
-          agentId?: string;
-          workingDir?: string;
-          cliAttached?: boolean;
-          cliPollAt?: string;
-          alias?: string;
-        };
+      const {
+        sessionId,
+        lifecycle,
+        event,
+        agentId,
+        workingDir,
+        cliAttached,
+        cliPollAt,
+        alias,
+        studioId,
+      } = req.body as {
+        sessionId?: string;
+        lifecycle?: string;
+        /**
+         * Which hook fired: 'prompt' | 'stop' | 'pre-compact' | 'post-compact'.
+         * Lifecycle values alone are ambiguous — post-compact also sends
+         * 'idle' while the same turn continues, so ONLY event === 'stop'
+         * marks the real CLI turn boundary. Legacy senders without the
+         * field get renewals but never boundary releases.
+         */
+        event?: string;
+        agentId?: string;
+        workingDir?: string;
+        cliAttached?: boolean;
+        cliPollAt?: string;
+        alias?: string;
+        /** Caller's worktree studio, for the fenced lease-held report. */
+        studioId?: string;
+      };
 
       if (!sessionId) {
         res.status(400).json({ success: false, error: 'sessionId is required' });
+        return;
+      }
+
+      // Reject non-UUID session ids BEFORE they reach Postgres. Without this,
+      // a malformed id (e.g. a test fixture like "sess-1" leaking from an
+      // integration run pointed at this server) raises 22P02 inside
+      // getSession, and every such request error-spams the log with a stack
+      // trace for what is simply bad caller input.
+      if (!UUID_RE.test(sessionId)) {
+        res.status(400).json({ success: false, error: 'sessionId must be a UUID' });
         return;
       }
 
@@ -144,6 +168,24 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
       // never race each other's heartbeat CAS. Fire-and-forget: never delays
       // the hook response.
       if (isStopEvent) {
+        // Captured synchronously at the boundary: the release helper only
+        // touches claims from BEFORE this instant, so a delayed release can
+        // never take the next turn's claims (Lumen round 3 P1).
+        const boundaryAt = new Date().toISOString();
+        // Graph claims are turn-scoped: the CLI stop hook IS the real turn
+        // boundary. Independent chain, FIRST — a lease-release error must
+        // not skip it (round 3 P1); the helper itself never throws.
+        void releaseGraphClaimsForSession(
+          dataComposer.getClient(),
+          sessionId,
+          'cli-turn-stopped',
+          boundaryAt
+        ).catch((err: unknown) => {
+          logger.warn('[HookLifecycle] CLI-boundary graph claim release failed', {
+            sessionId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
         void (async () => {
           const postUpdate = await dataComposer.repositories.memory.getSession(sessionId);
           const terminal =
@@ -165,16 +207,46 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
           });
         });
       } else {
-        void leaseService.renewBySession(sessionId, session.userId).catch((err: unknown) => {
+        // FENCED for prompt events (round four): the renewal is awaited
+        // BEFORE the 2xx. The sweep's release CAS is guarded on the exact
+        // prior lease (heartbeatAt included), so a renewal that lands first
+        // defeats a concurrent release — and if the release already won, the
+        // held-check below reads the cleared lease and the response says so,
+        // which a gated producer treats as unacknowledged: no turn starts in
+        // a worktree whose lease is gone. The old fire-and-forget renewal
+        // left a window where a 2xx implied protection the lease no longer
+        // had.
+        try {
+          await leaseService.renewBySession(sessionId, session.userId);
+        } catch (err: unknown) {
           logger.debug('[HookLifecycle] Lease renewal failed (non-fatal)', {
             sessionId,
             error: err instanceof Error ? err.message : String(err),
           });
-        });
+        }
+      }
+
+      // Per-studio held report for gated prompt callers. HELD requires a
+      // successful exact-CAS touch (round five) — a plain read could observe
+      // a snapshot an already-running sweep is about to clear, and a failed
+      // renewal was silently ignored. Absent for stop events, main, and
+      // studioless senders — nothing to fence there.
+      let studioLeaseHeld: boolean | undefined;
+      if (isPromptEvent && typeof studioId === 'string' && studioId && studioId !== 'main') {
+        studioLeaseHeld = await leaseService.touchStudioLeaseForSession(
+          studioId,
+          sessionId,
+          session.userId
+        );
       }
 
       logger.debug('[HookLifecycle] Updated', { sessionId, lifecycle, agentId });
-      res.json({ success: true, sessionId, lifecycle });
+      res.json({
+        success: true,
+        sessionId,
+        lifecycle,
+        ...(studioLeaseHeld !== undefined ? { studioLeaseHeld } : {}),
+      });
     } catch (error) {
       logger.error('[HookLifecycle] Error:', error);
       res.status(500).json({

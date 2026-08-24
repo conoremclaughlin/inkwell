@@ -13,7 +13,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { SessionService } from './session-service';
+import { SessionService, RoutingRefusedError } from './session-service';
 import type { Session } from './types';
 import { tmpdir } from 'os';
 import { registerActiveRun, resetActiveRuns } from './active-runs';
@@ -21,97 +21,7 @@ import { LEASE_STALE_MS, type StudioLease } from '../studio-lease.service';
 
 // ── Minimal fake supabase (same PostgREST semantics as the lease unit tests) ──
 
-type Row = Record<string, unknown>;
-
-function getCol(row: Row, col: string): unknown {
-  if (col.includes('->>')) {
-    const [base, key] = col.split('->>');
-    const obj = row[base];
-    if (!obj || typeof obj !== 'object') return null;
-    return (obj as Row)[key] ?? null;
-  }
-  return row[col] ?? null;
-}
-
-class FakeQuery {
-  private filters: Array<(r: Row) => boolean> = [];
-  private limitN?: number;
-
-  constructor(
-    private rows: Row[],
-    private mode: 'select' | 'update' | 'insert',
-    private payload?: Row
-  ) {}
-
-  eq(col: string, val: unknown) {
-    this.filters.push((r) => getCol(r, col) === val);
-    return this;
-  }
-  is(col: string, val: unknown) {
-    if (val === null) this.filters.push((r) => getCol(r, col) == null);
-    return this;
-  }
-  not(col: string, op: string, val: unknown) {
-    if (op === 'is' && val === null) this.filters.push((r) => getCol(r, col) != null);
-    else if (op === 'eq') this.filters.push((r) => getCol(r, col) !== val);
-    return this;
-  }
-  in(col: string, vals: unknown[]) {
-    this.filters.push((r) => vals.includes(getCol(r, col)));
-    return this;
-  }
-  limit(n: number) {
-    this.limitN = n;
-    return this;
-  }
-  select(_cols?: string) {
-    return this;
-  }
-  order() {
-    return this;
-  }
-
-  private exec(): Row[] {
-    if (this.mode === 'insert') {
-      this.rows.push({ ...this.payload });
-      return [{ ...this.payload }];
-    }
-    let matched = this.rows.filter((r) => this.filters.every((f) => f(r)));
-    if (this.mode === 'update') {
-      for (const r of matched) Object.assign(r, this.payload);
-    }
-    if (this.limitN !== undefined) matched = matched.slice(0, this.limitN);
-    return matched.map((r) => ({ ...r }));
-  }
-
-  maybeSingle(): Promise<{ data: Row | null; error: null }> {
-    return Promise.resolve({ data: this.exec()[0] ?? null, error: null });
-  }
-  single(): Promise<{ data: Row | null; error: { code: string; message: string } | null }> {
-    const rows = this.exec();
-    return Promise.resolve(
-      rows[0]
-        ? { data: rows[0], error: null }
-        : { data: null, error: { code: 'PGRST116', message: 'no rows' } }
-    );
-  }
-  then<T>(resolve: (v: { data: Row[]; error: null }) => T): Promise<T> {
-    return Promise.resolve({ data: this.exec(), error: null }).then(resolve);
-  }
-}
-
-function makeFakeSupabase(tables: Record<string, Row[]>) {
-  return {
-    from(table: string) {
-      const rows = tables[table] ?? (tables[table] = []);
-      return {
-        select: () => new FakeQuery(rows, 'select'),
-        update: (payload: Row) => new FakeQuery(rows, 'update', payload),
-        insert: (payload: Row) => new FakeQuery(rows, 'insert', payload),
-      };
-    },
-  } as never;
-}
+import { makeFakeSupabase, type Row } from './fake-supabase.js';
 
 // ── Minimal session repository ──
 
@@ -175,7 +85,7 @@ describe('fail-closed routing at the lease boundary', () => {
   beforeEach(() => resetActiveRuns());
   afterEach(() => resetActiveRuns());
 
-  it('clears the studio binding when the studio is held by another thread and overflow is unavailable', async () => {
+  it('HOLDS when the studio is held by another thread and overflow is unavailable (6b r2)', async () => {
     const session = makeSession({ studioId: 'studio-1' });
     const { store, repo } = makeMockRepository(session);
     const foreignHolder: StudioLease = {
@@ -215,18 +125,26 @@ describe('fail-closed routing at the lease boundary', () => {
     const service = makeService(repo, tables);
 
     // recipientSessionId path — a bypass tier (occupancy unchecked).
-    const result = await service.getOrCreateSession('user-1', 'wren', {
-      threadKey: 'pr:200',
-      recipientSessionId: 'session-1',
+    //
+    // 6b r2 (Lumen #517 blocker 6): clearing the binding sent the runner to
+    // defaultWorkingDirectory — routinely the SAME occupied root. The only
+    // safe outcome is a HOLD: throw occupied, no execution anywhere.
+    await expect(
+      service.getOrCreateSession('user-1', 'wren', {
+        threadKey: 'pr:200',
+        recipientSessionId: 'session-1',
+      })
+    ).rejects.toMatchObject({
+      code: 'ROUTING_REFUSED',
+      detail: { reason: 'occupied' },
     });
 
-    // Never bound to the occupied studio.
-    expect(result.studioId).toBeFalsy();
-    expect(store.session.studioId).toBeFalsy();
     // The foreign holder was not clobbered.
     expect((tables.studios[0].lease as unknown as StudioLease).sessionId).toBe('session-foreign');
     // The contradiction is on the record.
     expect(tables.studio_lease_events.map((e) => e.event)).toContain('conflict');
+    void store;
+    void RoutingRefusedError;
   });
 
   it('keeps the binding when the lease is acquired normally', async () => {

@@ -819,3 +819,120 @@ describe('findLastDetectedModel — persisted provider model recovery', () => {
     expect(findLastDetectedModel(transcriptPath, 'claude')).toBeUndefined();
   });
 });
+
+describe('hydrateLedgerFromTranscript — shadow clone handoff', () => {
+  let dir: string;
+  let transcriptPath: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'ink-hydration-clones-test-'));
+    transcriptPath = join(dir, 'session-clones.jsonl');
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  function write(events: Array<Record<string, unknown>>) {
+    writeFileSync(transcriptPath, events.map((e) => JSON.stringify(e)).join('\n') + '\n');
+  }
+
+  it('replays a fan-out summary into the reattached ledger', () => {
+    // The clones' summaries are the parent's ONLY record of that work — their
+    // own transcripts are separate files it never replays. Without this branch
+    // a reattached parent silently loses every clone result it paid for.
+    write([
+      { ts: '2026-08-14T09:00:00Z', eid: 1, type: 'user', content: 'go look at two things' },
+      {
+        ts: '2026-08-14T09:01:00Z',
+        eid: 2,
+        type: 'clone_fanout',
+        outcomes: [
+          {
+            id: 'clone-1',
+            label: 'audit auth paths',
+            status: 'completed',
+            summary: 'Three entry points, all in auth.ts.',
+          },
+          {
+            id: 'clone-2',
+            label: 'map coverage',
+            status: 'failed',
+            error: 'backend backend-failure',
+          },
+        ],
+      },
+    ]);
+
+    const ledger = new ContextLedger();
+    hydrateLedgerFromTranscript(ledger, transcriptPath, 'wren');
+
+    const clone = ledger.listEntries().find((e) => e.source === 'shadow-clone');
+    expect(clone).toBeDefined();
+    expect(clone?.content).toContain('clone-1 · audit auth paths — completed');
+    expect(clone?.content).toContain('Three entry points, all in auth.ts.');
+    expect(clone?.content).toContain('backend backend-failure');
+  });
+
+  it('keeps the replayed handoff to one entry, whatever the fan-out width', () => {
+    write([
+      {
+        ts: '2026-08-14T09:01:00Z',
+        eid: 1,
+        type: 'clone_fanout',
+        outcomes: [
+          { id: 'clone-1', label: 'a', status: 'completed', summary: 'x' },
+          { id: 'clone-2', label: 'b', status: 'completed', summary: 'y' },
+          { id: 'clone-3', label: 'c', status: 'completed', summary: 'z' },
+        ],
+      },
+    ]);
+
+    const ledger = new ContextLedger();
+    hydrateLedgerFromTranscript(ledger, transcriptPath, 'wren');
+    expect(ledger.listEntries().filter((e) => e.source === 'shadow-clone')).toHaveLength(1);
+  });
+
+  it('survives a malformed fan-out event rather than dropping the transcript', () => {
+    write([
+      { ts: '2026-08-14T09:01:00Z', eid: 1, type: 'clone_fanout' },
+      { ts: '2026-08-14T09:02:00Z', eid: 2, type: 'user', content: 'still here' },
+    ]);
+
+    const ledger = new ContextLedger();
+    expect(() => hydrateLedgerFromTranscript(ledger, transcriptPath, 'wren')).not.toThrow();
+    expect(ledger.listEntries().some((e) => e.content === 'still here')).toBe(true);
+  });
+
+  it('lets a later compaction supersede a replayed fan-out', () => {
+    // The failure this guards: hydration added the fan-out entry but did not
+    // track its id, so the compaction event that replaced it evicted everything
+    // EXCEPT it — leaving the superseded clone summary sitting alongside the
+    // compacted state that was meant to stand in for it.
+    write([
+      { ts: '2026-08-14T09:00:00Z', eid: 1, type: 'user', content: 'go look at two things' },
+      {
+        ts: '2026-08-14T09:01:00Z',
+        eid: 2,
+        type: 'clone_fanout',
+        outcomes: [
+          { id: 'clone-1', label: 'audit', status: 'completed', summary: 'Three entry points.' },
+        ],
+      },
+      {
+        ts: '2026-08-14T09:02:00Z',
+        eid: 3,
+        type: 'compaction',
+        summary: 'Earlier work compacted: clones audited auth.',
+        kept: [],
+      },
+    ]);
+
+    const ledger = new ContextLedger();
+    hydrateLedgerFromTranscript(ledger, transcriptPath, 'wren');
+
+    const entries = ledger.listEntries();
+    expect(entries.some((e) => e.content.includes('Three entry points.'))).toBe(false);
+    expect(entries.some((e) => e.source === 'compaction-history')).toBe(true);
+  });
+});

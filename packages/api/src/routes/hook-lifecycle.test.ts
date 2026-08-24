@@ -62,12 +62,14 @@ function makeFakeClient() {
   } as never;
 }
 
+const SESSION_ID = 'a1b2c3d4-0000-4000-8000-000000000001';
+
 describe('hook-lifecycle CLI turn signal', () => {
   const updateSession = vi.fn(async (_id: string, _updates: Record<string, unknown>) => ({
-    id: 'session-1',
+    id: SESSION_ID,
   }));
   const getSession = vi.fn(async () => ({
-    id: 'session-1',
+    id: SESSION_ID,
     userId: 'user-1',
     endedAt: null,
     status: 'active',
@@ -107,11 +109,24 @@ describe('hook-lifecycle CLI turn signal', () => {
     const resp = await fetch(`${baseUrl}/api/hooks/lifecycle`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: 'Bearer test' },
-      body: JSON.stringify({ sessionId: 'session-1', ...body }),
+      body: JSON.stringify({ sessionId: SESSION_ID, ...body }),
     });
     expect(resp.status).toBe(200);
     return updateSession.mock.calls.at(-1)?.[1] as Record<string, unknown>;
   }
+
+  it('a non-UUID sessionId is rejected before it reaches the database', async () => {
+    // "sess-1"-shaped ids (test fixtures leaking from integration runs, or
+    // any malformed caller) used to reach Postgres, raise 22P02, and
+    // error-spam the log with a stack per request. Bad input is a 400.
+    const resp = await fetch(`${baseUrl}/api/hooks/lifecycle`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer test' },
+      body: JSON.stringify({ sessionId: 'sess-1', lifecycle: 'running', event: 'prompt' }),
+    });
+    expect(resp.status).toBe(400);
+    expect(getSession).not.toHaveBeenCalled();
+  });
 
   it('the real two-request prompt sequence leaves the turn marker OPEN (round 6)', async () => {
     // Request 1: the prompt event opens the turn.
@@ -122,6 +137,34 @@ describe('hook-lifecycle CLI turn signal', () => {
     // touch the marker the prompt just opened.
     const attachUpdates = await post({ cliAttached: true });
     expect('cliTurnAt' in attachUpdates).toBe(false);
+  });
+
+  it('a prompt with a worktree studio gets the fenced lease-held report', async () => {
+    // The fake supabase holds no studios — the truthful answer is NOT HELD,
+    // which the gated caller treats as unacknowledged (no turn under a
+    // released lease). The field exists exactly when a fence is meaningful.
+    const resp = await fetch(`${baseUrl}/api/hooks/lifecycle`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer test' },
+      body: JSON.stringify({
+        sessionId: SESSION_ID,
+        lifecycle: 'running',
+        event: 'prompt',
+        studioId: '5bea57f3-6b24-4126-abe4-0d1cc2bd9647',
+      }),
+    });
+    expect(resp.status).toBe(200);
+    const body = (await resp.json()) as Record<string, unknown>;
+    expect(body.studioLeaseHeld).toBe(false);
+
+    // No studioId (main/studioless senders): the field is absent, never a veto.
+    const resp2 = await fetch(`${baseUrl}/api/hooks/lifecycle`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer test' },
+      body: JSON.stringify({ sessionId: SESSION_ID, lifecycle: 'running', event: 'prompt' }),
+    });
+    const body2 = (await resp2.json()) as Record<string, unknown>;
+    expect('studioLeaseHeld' in body2).toBe(false);
   });
 
   it('an explicit detach clears the marker (process proof)', async () => {

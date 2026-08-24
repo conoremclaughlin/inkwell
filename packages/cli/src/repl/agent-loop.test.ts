@@ -325,3 +325,173 @@ describe('runAgentLoop', () => {
     expect(result.toolResults).toHaveLength(1);
   });
 });
+
+describe('runAgentLoop — iteration screening', () => {
+  it('screens the FULL extracted list, not the truncated one', async () => {
+    const seen: LocalToolCall[][] = [];
+    const harness = makePorts([
+      outcome({
+        responseText: ['a', 'b', 'c', 'd', 'e', 'f'].map((t) => inkTool(t)).join('\n'),
+      }),
+    ]);
+    harness.ports.tools.screen = (all) => {
+      seen.push(all);
+      return { calls: all.slice(0, 2) };
+    };
+
+    await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+
+    // Six emitted, all six offered to the screen, two executed. A rule about
+    // what may accompany what cannot be enforced on a truncated list.
+    expect(seen[0].map((c) => c.tool)).toEqual(['a', 'b', 'c', 'd', 'e', 'f']);
+    expect(harness.executed[0].map((c) => c.tool)).toEqual(['a', 'b']);
+  });
+
+  it('refuses a rejected iteration whole and feeds the reason back', async () => {
+    const harness = makePorts([
+      outcome({ responseText: inkTool('spawn_agent') + '\n' + inkTool('read') }),
+      outcome({ responseText: 'ok, spawning alone next time' }),
+    ]);
+    let screened = 0;
+    harness.ports.tools.screen = (all) =>
+      screened++ === 0 ? { rejected: 'spawn_agent must be alone' } : { calls: all };
+
+    const result = await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+
+    // Nothing ran.
+    expect(harness.executed).toEqual([]);
+    // The model was told why, in a continuation.
+    expect(harness.prompts).toHaveLength(2);
+    expect(harness.prompts[1].isContinuation).toBe(true);
+    expect(harness.prompts[1].body).toContain('spawn_agent must be alone');
+    expect(result.toolResults).toEqual([
+      { tool: 'iteration', result: 'spawn_agent must be alone', status: 'rejected' },
+    ]);
+    expect(result.stopReason).toBe('no-tools');
+  });
+
+  it('counts a rejected iteration against the budget so a stuck model stops', async () => {
+    const turns = Array.from({ length: 6 }, () =>
+      outcome({ responseText: inkTool('spawn_agent') + '\n' + inkTool('read') })
+    );
+    const harness = makePorts(turns);
+    harness.ports.tools.screen = () => ({ rejected: 'spawn_agent must be alone' });
+
+    const result = await runAgentLoop(
+      { prompt: 'go', toolRouting: 'local', maxIterations: 3 },
+      harness.ports
+    );
+
+    expect(result.stopReason).toBe('iteration-cap');
+    expect(result.iterations).toBe(3);
+    expect(harness.executed).toEqual([]);
+  });
+
+  it('stops on a backend failure while re-prompting after a rejection', async () => {
+    const harness = makePorts([
+      outcome({ responseText: inkTool('spawn_agent') + '\n' + inkTool('read') }),
+      outcome({ success: false, stderr: 'backend exploded', exitCode: 1 }),
+    ]);
+    harness.ports.tools.screen = () => ({ rejected: 'nope' });
+
+    const result = await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+    expect(result.stopReason).toBe('backend-failure');
+    expect(result.success).toBe(false);
+  });
+
+  it('truncates to the per-iteration cap when no screen is supplied', async () => {
+    const harness = makePorts([
+      outcome({
+        responseText: ['a', 'b', 'c', 'd', 'e', 'f'].map((t) => inkTool(t)).join('\n'),
+      }),
+    ]);
+
+    await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+    expect(harness.executed[0]).toHaveLength(5);
+  });
+});
+
+describe('runAgentLoop — refused iterations', () => {
+  const blocked = (tool: string): ToolResultRecord => ({
+    tool,
+    result: 'Tool is explicitly denied by policy.',
+    status: 'blocked',
+  });
+
+  it('distinguishes "everything was refused" from "it stopped asking"', async () => {
+    const harness = makePorts([outcome({ responseText: inkTool('bash') })], () => [
+      blocked('bash'),
+    ]);
+
+    const result = await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+
+    // Not 'no-tools': the agent DID ask, and was refused. For a clone the
+    // difference decides whether the parent reads the summary as an answer.
+    expect(result.stopReason).toBe('all-refused');
+  });
+
+  it('leaves the REPL turn to end on refusal, where a human is watching', async () => {
+    const harness = makePorts(
+      [outcome({ responseText: inkTool('bash') }), outcome({ responseText: 'second turn' })],
+      () => [blocked('bash')]
+    );
+
+    await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+    // One turn only — the user saw the refusal and can redirect; re-prompting
+    // would nag someone who already said no.
+    expect(harness.prompts).toHaveLength(1);
+  });
+
+  it('tells a clone it was refused and lets it route around', async () => {
+    const harness = makePorts(
+      [
+        outcome({ responseText: inkTool('bash') }),
+        outcome({ responseText: `read it instead\n${inkTool('signal_status')}` }),
+      ],
+      (calls) =>
+        calls.map((c) =>
+          c.tool === 'bash'
+            ? blocked('bash')
+            : { tool: c.tool, result: signalResult('completed'), status: 'executed' }
+        )
+    );
+
+    const result = await runAgentLoop(
+      { prompt: 'go', toolRouting: 'local', continueOnBlocked: true },
+      harness.ports
+    );
+
+    expect(harness.prompts).toHaveLength(2);
+    expect(harness.prompts[1].isContinuation).toBe(true);
+    expect(harness.prompts[1].body).toContain('every one was refused');
+    expect(harness.prompts[1].body).toContain('Do not retry them');
+    expect(result.stopReason).toBe('terminal-signal');
+  });
+
+  it('gives up honestly when a clone keeps hitting the wall', async () => {
+    const harness = makePorts(
+      Array.from({ length: 5 }, () => outcome({ responseText: inkTool('bash') })),
+      () => [blocked('bash')]
+    );
+
+    const result = await runAgentLoop(
+      { prompt: 'go', toolRouting: 'local', continueOnBlocked: true, maxIterations: 3 },
+      harness.ports
+    );
+
+    // Bounded, and reported as refused rather than as a completed turn.
+    expect(result.iterations).toBe(3);
+    expect(result.stopReason).toBe('all-refused');
+  });
+
+  it('does not add the refusal note when something did run', async () => {
+    const body = buildContinuationBody(
+      [
+        { tool: 'read', result: 'contents', status: 'executed' },
+        { tool: 'bash', result: 'denied', status: 'blocked' },
+      ],
+      []
+    );
+    expect(body).not.toContain('every one was refused');
+  });
+});

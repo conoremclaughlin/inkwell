@@ -462,6 +462,63 @@ describe('CodexRunner', () => {
       expect(configArg).toMatch(/^model_instructions_file=\/run\/ink\//);
     });
 
+    it('injects host.docker.internal, not loopback, when running in a container', async () => {
+      // Lumen's blocker on PR #430. Inside a Docker sandbox `resolveSpawnTarget`
+      // wraps the command in `docker exec`, so a hardcoded localhost resolves to
+      // the CONTAINER's own loopback rather than the API server — bypassing the
+      // orchestrator's host.docker.internal rewrite and stranding the run with
+      // no Ink tools.
+      const mockProc = createMockProcess();
+      (spawn as Mock).mockReturnValue(mockProc);
+
+      const runner = new CodexRunner();
+      const runPromise = runner.run('hello', {
+        config: {
+          workingDirectory: process.cwd(),
+          mcpConfigPath: '',
+          container: { containerName: 'ink-sandbox-test-abc', runtimeDir },
+        },
+      });
+
+      setTimeout(() => {
+        mockProc.stdout.emit('data', Buffer.from(`${JSON.stringify({ result: 'ok' })}\n`));
+        mockProc.emit('close', 0);
+      }, 5);
+      await runPromise;
+
+      const [, args] = (spawn as Mock).mock.calls[0] as [string, string[]];
+      const urlArg = args.find(
+        (a: string) => typeof a === 'string' && a.startsWith('mcp_servers.inkwell.url=')
+      );
+      expect(urlArg).toBeDefined();
+      expect(urlArg).toContain('host.docker.internal');
+      expect(urlArg).not.toContain('localhost');
+    });
+
+    it('injects localhost when running on the host', async () => {
+      const mockProc = createMockProcess();
+      (spawn as Mock).mockReturnValue(mockProc);
+
+      const runner = new CodexRunner();
+      const runPromise = runner.run('hello', {
+        config: { workingDirectory: process.cwd(), mcpConfigPath: '' },
+      });
+
+      setTimeout(() => {
+        mockProc.stdout.emit('data', Buffer.from(`${JSON.stringify({ result: 'ok' })}\n`));
+        mockProc.emit('close', 0);
+      }, 5);
+      await runPromise;
+
+      const [, args] = (spawn as Mock).mock.calls[0] as [string, string[]];
+      const urlArg = args.find(
+        (a: string) => typeof a === 'string' && a.startsWith('mcp_servers.inkwell.url=')
+      );
+      expect(urlArg).toBeDefined();
+      expect(urlArg).toContain('localhost');
+      expect(urlArg).not.toContain('host.docker.internal');
+    });
+
     it('writes the identity prompt file to runtimeDir on the host', async () => {
       const mockProc = createMockProcess();
       (spawn as Mock).mockReturnValue(mockProc);

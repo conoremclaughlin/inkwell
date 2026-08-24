@@ -9,7 +9,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { computeDepths } from './task-graph';
+import { computeDepths, executionLabel } from './task-graph';
 
 /** Builds a dependenciesOf lookup from a plain adjacency map. */
 function deps(map: Record<string, string[]>) {
@@ -137,5 +137,53 @@ describe('computeDepths', () => {
 
     // One expansion per task, regardless of how many dependents share it.
     expect(calls).toBe(5);
+  });
+});
+
+describe('executionLabel', () => {
+  it('narrates the gate lifecycle in order of severity', () => {
+    const gate = (gateState: string | null, extra: Record<string, unknown> = {}) =>
+      executionLabel({ taskType: 'verification', gateState, ...extra });
+
+    expect(gate('failed', { gateAttempt: 2 })).toEqual({
+      text: '✖ gate FAILED · attempt 2',
+      emphasis: true,
+    });
+    expect(gate('passed')?.text).toBe('✓ gate passed');
+    expect(gate('open')?.emphasis).toBe(true);
+    expect(gate('in_progress')?.text).toContain('verifying');
+  });
+
+  it('a dwelling gate is scheduled, never stalled — shows time to eligible', () => {
+    const label = executionLabel({
+      taskType: 'verification',
+      gateState: 'not_ready',
+      eligibleAt: new Date(Date.now() + 2 * 60 * 60_000).toISOString(),
+    });
+    expect(label?.text).toMatch(/scheduled — opens in 2h/);
+  });
+
+  it('a gate past its window but unopened reads as waiting on deps, not scheduled', () => {
+    const label = executionLabel({
+      taskType: 'verification',
+      gateState: 'not_ready',
+      eligibleAt: new Date(Date.now() - 1000).toISOString(),
+    });
+    expect(label?.text).toBe('gate waiting on deps');
+  });
+
+  it('work nodes: upstream failure outranks claims and readiness', () => {
+    expect(executionLabel({ taskType: 'work', depFailed: true, ready: true })).toEqual({
+      text: '⛔ upstream failed',
+      emphasis: true,
+    });
+    expect(executionLabel({ taskType: 'work', claimed: true, ready: true })?.text).toBe(
+      '⚙ claimed'
+    );
+    expect(executionLabel({ taskType: 'work', ready: true })).toEqual({
+      text: '▶ ready',
+      emphasis: true,
+    });
+    expect(executionLabel({ taskType: 'work' })).toBeNull();
   });
 });

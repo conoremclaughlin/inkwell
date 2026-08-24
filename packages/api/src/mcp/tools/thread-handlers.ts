@@ -12,6 +12,7 @@ import { z } from 'zod';
 import type { DataComposer } from '../../data/composer';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
 import { getEffectiveAgentId } from '../../auth/enforce-identity';
+import { senderRoutingContext, isBridgeIdentity, senderSbId } from './sender-context.js';
 import { logger } from '../../utils/logger';
 import type { Json } from '../../data/supabase/types';
 import { getAgentGateway, type AgentTriggerPayload } from '../../channels/agent-gateway.js';
@@ -290,6 +291,8 @@ export function dispatchTriggers(
     priority: string;
     threadMessageId?: string;
     threadId?: string;
+    /** Sender is a relay — excluded from caller-repo inference. */
+    senderIsBridge?: boolean;
   }
 ): void {
   if (agentsToTrigger.length === 0) return;
@@ -305,6 +308,9 @@ export function dispatchTriggers(
       summary: opts.summary,
       priority: opts.priority as AgentTriggerPayload['priority'],
       threadKey: opts.threadKey,
+      // Without this the recipient loses caller-repo inference entirely and
+      // every thread dispatched here lands on refuse-and-hold.
+      ...senderRoutingContext(opts.senderIsBridge),
     };
     gateway.dispatchTrigger(payload);
   }
@@ -666,6 +672,15 @@ export async function handleAddThreadParticipant(args: unknown, dataComposer: Da
   if (triggerNewParticipant) {
     dispatchTriggers([agentId], {
       fromAgentId: addedByAgentId || 'system',
+      // Without this the option added in round 1 was never passed by ANY
+      // caller here, so bridge exclusion stayed dead on this path
+      // (Lumen, PR #514 round 2).
+      senderIsBridge: await isBridgeIdentity(
+        supabase,
+        resolved.user.id,
+        addedByAgentId || null,
+        senderSbId()
+      ),
       threadKey,
       summary: `You were added to thread ${threadKey}${reason ? `: ${reason}` : ''}`,
       priority: 'normal',

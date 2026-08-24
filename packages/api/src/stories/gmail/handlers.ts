@@ -6,6 +6,8 @@
 
 import { z } from 'zod';
 import { getGmailService } from './service';
+import { MAX_OUTBOUND_ATTACHMENTS, MAX_OUTBOUND_ATTACHMENT_TOTAL_BYTES } from './attachments';
+import { MAX_FILENAME_BYTES } from './mime';
 import { resolveUserOrThrow } from '../../services/user-resolver';
 import { logger } from '../../utils/logger';
 import type { DataComposer } from '../../data/composer';
@@ -159,6 +161,32 @@ export const getEmailSchema = userIdentifierBaseSchema.extend({
     .describe('Level of detail to return (default: full)'),
 });
 
+/**
+ * Files to attach to an outgoing message.
+ *
+ * Paths must resolve inside the shared media root (~/.ink/files) — the
+ * same containment boundary that governs agent-to-agent trigger media.
+ * Anything outside it fails the send rather than silently dropping.
+ */
+export const attachmentsSchema = z
+  .array(
+    z.object({
+      path: z.string().min(1).describe('Absolute path to the file. Must be inside ~/.ink/files.'),
+      filename: z
+        .string()
+        .min(1)
+        .max(MAX_FILENAME_BYTES)
+        .optional()
+        .describe("Name the recipient sees (defaults to the file's own name)"),
+    })
+  )
+  .max(MAX_OUTBOUND_ATTACHMENTS)
+  .optional()
+  .describe(
+    `Files to attach (max ${MAX_OUTBOUND_ATTACHMENTS}, ${MAX_OUTBOUND_ATTACHMENT_TOTAL_BYTES / (1024 * 1024)}MB total). ` +
+      'Paths must be inside ~/.ink/files — use download_email_attachment for files from received mail.'
+  );
+
 export const sendEmailSchema = userIdentifierBaseSchema.extend({
   to: z.array(z.string().email()).describe('Recipient email addresses'),
   cc: z.array(z.string().email()).optional().describe('CC recipients'),
@@ -170,6 +198,7 @@ export const sendEmailSchema = userIdentifierBaseSchema.extend({
     .optional()
     .default(false)
     .describe('Whether body is HTML (default: plain text)'),
+  attachments: attachmentsSchema,
 });
 
 export const replyToEmailSchema = userIdentifierBaseSchema.extend({
@@ -177,6 +206,7 @@ export const replyToEmailSchema = userIdentifierBaseSchema.extend({
   body: z.string().describe('Reply body content'),
   isHtml: z.boolean().optional().default(false).describe('Whether body is HTML'),
   replyAll: z.boolean().optional().default(false).describe('Reply to all recipients'),
+  attachments: attachmentsSchema,
 });
 
 export const draftEmailSchema = userIdentifierBaseSchema.extend({
@@ -187,6 +217,7 @@ export const draftEmailSchema = userIdentifierBaseSchema.extend({
   body: z.string().describe('Email body content'),
   isHtml: z.boolean().optional().default(false).describe('Whether body is HTML'),
   replyToMessageId: z.string().optional().describe('Message ID if this is a reply draft'),
+  attachments: attachmentsSchema,
 });
 
 export const listLabelsSchema = userIdentifierBaseSchema.extend({});
@@ -390,6 +421,7 @@ export async function handleSendEmail(
       subject: params.subject,
       body: params.body,
       isHtml: params.isHtml,
+      attachments: params.attachments,
     });
 
     logger.info('Sent email', {
@@ -397,6 +429,7 @@ export async function handleSendEmail(
       to: params.to,
       subject: params.subject,
       messageId: email.id,
+      attachmentCount: params.attachments?.length ?? 0,
     });
 
     return {
@@ -469,6 +502,7 @@ export async function handleReplyToEmail(
       body: params.body,
       isHtml: params.isHtml,
       replyAll: params.replyAll,
+      attachments: params.attachments,
     });
 
     logger.info('Replied to email', {
@@ -548,6 +582,7 @@ export async function handleDraftEmail(
       body: params.body,
       isHtml: params.isHtml,
       replyToMessageId: params.replyToMessageId,
+      attachments: params.attachments,
     });
 
     logger.info('Created email draft', {
@@ -555,6 +590,7 @@ export async function handleDraftEmail(
       to: params.to,
       subject: params.subject,
       draftId,
+      attachmentCount: params.attachments?.length ?? 0,
     });
 
     return {

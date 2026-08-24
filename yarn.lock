@@ -1909,6 +1909,7 @@ __metadata:
     winston: "npm:^3.11.0"
     yaml: "npm:^2.8.2"
     zod: "npm:^3.25.0"
+    zod-to-json-schema: "npm:^3.25.2"
   languageName: unknown
   linkType: soft
 
@@ -17061,7 +17062,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"zod-to-json-schema@npm:^3.24.6, zod-to-json-schema@npm:^3.25.0":
+"zod-to-json-schema@npm:^3.24.6, zod-to-json-schema@npm:^3.25.0, zod-to-json-schema@npm:^3.25.2":
   version: 3.25.2
   resolution: "zod-to-json-schema@npm:3.25.2"
   peerDependencies:

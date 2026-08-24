@@ -752,34 +752,52 @@ async function updateRuntimeGenerationState(
   const sessionId = resolveActivePcpSessionId(cwd);
   if (!sessionId) return;
 
-  try {
-    const serverUrl = getPcpServerUrl();
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-    const token = await getValidAccessToken(serverUrl);
-    if (token) headers.Authorization = `Bearer ${token}`;
-    const resp = await fetch(`${serverUrl}/api/hooks/lifecycle`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
-        sessionId,
-        lifecycle,
-        ...(event ? { event } : {}),
-        agentId,
-        workingDir: cwd,
-      }),
-      signal: AbortSignal.timeout(5000),
-    });
-    if (!resp.ok) {
+  // Two attempts: hooks cannot gate the backend turn (they are out-of-band
+  // observers), so a missed prompt write leaves the turn invisible — the
+  // lease machinery therefore only ever treats the marker as PROTECTIVE
+  // (an open marker defers releases; its absence never authorizes one).
+  // The retry shrinks the invisibility window against transient blips; a
+  // true fail-closed for claude-code (UserPromptSubmit can block) is
+  // tracked separately (task 0b9bb780).
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const serverUrl = getPcpServerUrl();
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      const token = await getValidAccessToken(serverUrl);
+      if (token) headers.Authorization = `Bearer ${token}`;
+      const resp = await fetch(`${serverUrl}/api/hooks/lifecycle`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          sessionId,
+          lifecycle,
+          ...(event ? { event } : {}),
+          agentId,
+          workingDir: cwd,
+        }),
+        signal: AbortSignal.timeout(5000),
+      });
+      if (resp.ok) return;
       const body = await resp.text().catch(() => '');
       sbDebugLog('hooks', 'lifecycle_update_failed', {
         sessionId,
         lifecycle,
+        attempt,
         status: resp.status,
         body,
       });
+    } catch (error) {
+      // Non-fatal; hook execution should not fail due to transient session sync issues.
+      sbDebugLog('hooks', 'lifecycle_update_error', {
+        sessionId,
+        lifecycle,
+        attempt,
+        error: String(error),
+      });
     }
-  } catch {
-    // Non-fatal; hook execution should not fail due to transient session sync issues.
+    if (attempt === 1) {
+      await new Promise((r) => setTimeout(r, 250));
+    }
   }
 }
 

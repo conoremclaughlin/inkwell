@@ -148,6 +148,7 @@
 - **CI hardened** — Node 22 standardized, cross-platform lockfile via `supportedArchitectures`, pre-commit hook auto-updates `yarn.lock` when `package.json` changes.
 - **PM2 removed** — replaced with `yarn dev` via concurrently. Simpler, no env caching footguns.
 - **tsx watch excludes** — `--exclude 'dist,node_modules,.next,.pcp'` prevents CPU feedback loop with Next.js dev artifacts.
+  - _Editor's note (2026-08-18, [#509](https://github.com/conoremclaughlin/inkwell/pull/509)): this never worked as written. `tsx` does not split `--exclude` on commas, so the comma-joined string was one literal path and excluded nothing. No feedback loop appeared, but not for the reason claimed here — a separate stray flag (`--watch-path`, which `tsx` forwards to `node`, whose own watch mode then watches only the listed paths) had already disabled source watching entirely. Both flags were corrected in #509; the exclusions take effect from that release onward. Entry left as originally published._
 - **Graceful shutdown** — stop heartbeat + agent gateway on SIGTERM, 10s force-kill timeout.
 - **Next.js 16.1.7** — bumped from 15.x.
 

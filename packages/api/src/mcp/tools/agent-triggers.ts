@@ -13,6 +13,8 @@ import { z } from 'zod';
 import type { DataComposer } from '../../data/composer';
 import { getAgentGateway, type AgentTriggerPayload } from '../../channels/agent-gateway';
 import { resolveUser } from '../../services/user-resolver';
+import { senderRoutingContext, isBridgeIdentity, senderSbId } from './sender-context.js';
+import { getPinnedAgentId } from '../../utils/request-context';
 import { logger } from '../../utils/logger';
 
 type McpResponse = {
@@ -98,6 +100,31 @@ export async function handleTriggerAgent(
       logger.warn(`No handler currently registered for ${args.toAgentId}, attempting anyway`);
     }
 
+    // Resolved before the payload literal and defensively: a composer without
+    // a client (or a lookup failure) must not take down the dispatch — it only
+    // means no bridge exclusion, and routing already fails closed from there.
+    let senderIsBridge = false;
+    try {
+      const client =
+        typeof dataComposer?.getClient === 'function' ? dataComposer.getClient() : null;
+      if (client && resolved?.user?.id) {
+        // Classify the AUTHENTICATED sender, never args.fromAgentId — that is
+        // caller-supplied, so a relay could simply claim a non-bridge name and
+        // re-enable the inference this exclusion exists to prevent
+        // (Lumen, PR #514 round 2). Falls back to the declared slug only when
+        // there is no pinned identity, which is the unauthenticated path.
+        const pinned = getPinnedAgentId();
+        senderIsBridge = await isBridgeIdentity(
+          client,
+          resolved.user.id,
+          pinned || args.fromAgentId,
+          senderSbId()
+        );
+      }
+    } catch {
+      senderIsBridge = false;
+    }
+
     const payload: AgentTriggerPayload = {
       fromAgentId: args.fromAgentId,
       toAgentId: args.toAgentId,
@@ -109,6 +136,9 @@ export async function handleTriggerAgent(
       studioId: args.studioId,
       studioHint: args.studioHint,
       recipientSessionId: args.recipientSessionId,
+      // Caller-repo inference degrades silently to refuse-and-hold on any
+      // dispatch path that forgets this (Lumen, PR #514 round 1).
+      ...senderRoutingContext(senderIsBridge),
       ...(resolved?.user?.id ? { recipientUserId: resolved.user.id } : {}),
       metadata: args.metadata,
     };

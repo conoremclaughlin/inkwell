@@ -22,9 +22,52 @@ describe('classifyActivity', () => {
     expect(plan.label).toBe('📤 myra → telegram');
   });
 
-  it('falls back to a generic channel label when platform is missing', () => {
-    const plan = classifyActivity({ type: 'message_in', agentId: 'myra' }, 'myra');
-    expect(plan.label).toBe('📨 channel → myra');
+  it('demotes trigger deliveries to bookkeeping — heartbeat is not conversation', () => {
+    // The injected system turn already renders the trigger prompt; a
+    // message_in block for the same delivery duplicated it (Conor's
+    // 2026-08-12 screenshot: one heartbeat rendered three times).
+    expect(
+      classifyActivity({ type: 'message_in', agentId: 'myra', platform: 'heartbeat' }, 'myra').mode
+    ).toBe('bookkeeping');
+    // Platformless inbound routing records are internal too, not conversation.
+    expect(classifyActivity({ type: 'message_in', agentId: 'myra' }, 'myra').mode).toBe(
+      'bookkeeping'
+    );
+  });
+
+  it('keeps the generic channel label for OUTBOUND messages missing platform (legacy sends)', () => {
+    const plan = classifyActivity({ type: 'message_out', agentId: 'myra' }, 'myra');
+    expect(plan.mode).toBe('message-out');
+    expect(plan.label).toBe('📤 myra → channel');
+  });
+
+  it('demotes INBOUND inkmail lifecycle rows to bookkeeping — one message, one render', () => {
+    // One logical inkmail message logs dispatch (sometimes twice), deliver,
+    // and a message_in trigger record, and the content also arrives as the
+    // injected channel turn — Conor watched one message render three-plus
+    // times at 5:30 PM. The mechanics are receipts, not conversation.
+    expect(
+      classifyActivity({ type: 'inkmail_dispatch', agentId: 'myra', fromAgentId: 'wren' }, 'myra')
+        .mode
+    ).toBe('bookkeeping');
+    expect(
+      classifyActivity({ type: 'inkmail_deliver', agentId: 'myra', fromAgentId: 'wren' }, 'myra')
+        .mode
+    ).toBe('bookkeeping');
+  });
+
+  it('keeps the agent OWN outbound inkmail dispatch visible', () => {
+    // The dispatch row is the only feed record of what the agent sent.
+    expect(
+      classifyActivity({ type: 'inkmail_dispatch', agentId: 'lumen', fromAgentId: 'myra' }, 'myra')
+        .mode
+    ).toBe('block');
+  });
+
+  it('keeps inkmail failures loud — a dropped delivery is never a dim receipt', () => {
+    expect(
+      classifyActivity({ type: 'inkmail_fail', agentId: 'myra', fromAgentId: 'wren' }, 'myra').mode
+    ).toBe('block');
   });
 
   it('classifies own backend turn lifecycle as bookkeeping (regression: rendered as ⚡ blocks)', () => {

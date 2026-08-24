@@ -38,6 +38,12 @@ export interface ApprovalRequestEvent {
   reason: string;
   sessionId?: string;
   ts: string;
+  /**
+   * Present when a shadow clone raised the request. Structured rather than
+   * smuggled through `reason`, so the TUI, JSONL consumers, 2FA, audit, and
+   * tests all correlate on one key.
+   */
+  origin?: ApprovalOriginInfo;
 }
 
 export type ApprovalResponseDecision = 'once' | 'session' | 'always' | 'deny' | 'cancel';
@@ -62,18 +68,38 @@ function isApprovalResponse(obj: Record<string, unknown>): boolean {
 
 // ─── Channel interface ──────────────────────────────────────────
 
+export interface ApprovalRequestParams {
+  tool: string;
+  args: Record<string, unknown>;
+  reason: string;
+  sessionId?: string;
+  timeoutMs?: number;
+  /**
+   * Abort the wait. Without this, cancelling a turn cannot reach a request
+   * already in flight — it sits for the full timeout (5 minutes by default),
+   * which for a shadow clone means Ctrl+C does not actually stop it.
+   * Resolves as `cancel` rather than rejecting, so callers keep one code path.
+   */
+  signal?: AbortSignal;
+  /** Who asked. Lets consumers label, correlate, and audit clone requests. */
+  origin?: ApprovalOriginInfo;
+}
+
+/** Where an approval request came from — the parent turn, or one of its clones. */
+export interface ApprovalOriginInfo {
+  origin: 'parent' | 'clone';
+  /** Stable id of the requesting clone; absent for the parent. */
+  cloneId?: string;
+  /** Human-facing clone label ("audit auth paths"), for prompts and audit. */
+  cloneLabel?: string;
+}
+
 export interface ApprovalChannel {
   /**
    * Emit an approval request and wait for a response.
    * Returns the decision (once/session/always/deny/cancel).
    */
-  requestApproval(params: {
-    tool: string;
-    args: Record<string, unknown>;
-    reason: string;
-    sessionId?: string;
-    timeoutMs?: number;
-  }): Promise<ApprovalResponseEvent>;
+  requestApproval(params: ApprovalRequestParams): Promise<ApprovalResponseEvent>;
 
   /** Clean up resources (timers, listeners, etc.) */
   dispose(): void;
@@ -140,15 +166,13 @@ export class JsonlApprovalChannel implements ApprovalChannel {
     this.emitter.emit(`response:${response.id}`, response);
   }
 
-  requestApproval(params: {
-    tool: string;
-    args: Record<string, unknown>;
-    reason: string;
-    sessionId?: string;
-    timeoutMs?: number;
-  }): Promise<ApprovalResponseEvent> {
+  requestApproval(params: ApprovalRequestParams): Promise<ApprovalResponseEvent> {
     const id = randomUUID();
     const timeoutMs = params.timeoutMs ?? 300_000;
+
+    if (params.signal?.aborted) {
+      return Promise.resolve({ type: 'approval_response', id, decision: 'cancel', by: 'aborted' });
+    }
 
     const request: ApprovalRequestEvent = {
       type: 'approval_request',
@@ -158,25 +182,42 @@ export class JsonlApprovalChannel implements ApprovalChannel {
       reason: params.reason,
       sessionId: params.sessionId,
       ts: new Date().toISOString(),
+      ...(params.origin ? { origin: params.origin } : {}),
     };
 
     // Emit the request as a JSON line
     this.output.write(JSON.stringify(request) + '\n');
 
     return new Promise<ApprovalResponseEvent>((resolve) => {
-      const timer = setTimeout(() => {
+      let onAbort: (() => void) | undefined;
+
+      const finish = (response: ApprovalResponseEvent) => {
         this.pending.delete(id);
         this.emitter.removeAllListeners(`response:${id}`);
-        resolve({ type: 'approval_response', id, decision: 'cancel', by: 'timeout' });
+        if (onAbort) params.signal?.removeEventListener('abort', onAbort);
+        resolve(response);
+      };
+
+      const timer = setTimeout(() => {
+        finish({ type: 'approval_response', id, decision: 'cancel', by: 'timeout' });
       }, timeoutMs);
       if (timer.unref) timer.unref();
 
-      this.pending.set(id, { resolve, timer });
+      const settle = (response: ApprovalResponseEvent) => {
+        clearTimeout(timer);
+        finish(response);
+      };
+
+      this.pending.set(id, { resolve: settle, timer });
+
+      if (params.signal) {
+        onAbort = () =>
+          settle({ type: 'approval_response', id, decision: 'cancel', by: 'aborted' });
+        params.signal.addEventListener('abort', onAbort, { once: true });
+      }
 
       this.emitter.once(`response:${id}`, (response: ApprovalResponseEvent) => {
-        clearTimeout(timer);
-        this.pending.delete(id);
-        resolve(response);
+        settle(response);
       });
     });
   }
@@ -199,16 +240,14 @@ export class JsonlApprovalChannel implements ApprovalChannel {
 export class AutoApprovalChannel implements ApprovalChannel {
   constructor(private decision: ApprovalResponseDecision = 'cancel') {}
 
-  async requestApproval(params: {
-    tool: string;
-    args: Record<string, unknown>;
-    reason: string;
-  }): Promise<ApprovalResponseEvent> {
+  async requestApproval(params: ApprovalRequestParams): Promise<ApprovalResponseEvent> {
     return {
       type: 'approval_response',
       id: randomUUID(),
-      decision: this.decision,
-      by: 'auto',
+      // An auto channel answers instantly, so there is no wait to interrupt —
+      // but an already-cancelled turn must not be handed a fresh approval.
+      decision: params.signal?.aborted ? 'cancel' : this.decision,
+      by: params.signal?.aborted ? 'aborted' : 'auto',
     };
   }
 
