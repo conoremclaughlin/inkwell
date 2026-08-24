@@ -68,6 +68,63 @@ export interface TokenResponse {
   scope?: string;
 }
 
+/**
+ * How close to expiry getValidAccessToken stops trusting a stored token and
+ * refreshes it before use.
+ */
+const TOKEN_REFRESH_WINDOW_MS = 5 * 60 * 1000;
+
+/**
+ * The token getValidAccessToken would refresh with before its next call, or null
+ * if it would send the stored access token unchanged.
+ *
+ * Both halves of the condition matter: without a refresh token there is nothing
+ * to refresh with, so that method hands back the stored token and it works right
+ * up until expiry. Sharing only the five-minute window left the two methods
+ * disagreeing about exactly that case.
+ *
+ * Returning the token rather than a boolean means the caller that performs the
+ * refresh and the caller that describes it read one value, instead of two
+ * expressions that have to be kept in step by hand.
+ */
+function pendingRefreshToken(
+  expiresAt: string | null | undefined,
+  refreshToken: string | null | undefined
+): string | null {
+  if (!refreshToken || !expiresAt) return null;
+  const expiry = new Date(expiresAt).getTime();
+  if (Number.isNaN(expiry)) return null;
+  return expiry - Date.now() < TOKEN_REFRESH_WINDOW_MS ? refreshToken : null;
+}
+
+/**
+ * A read-only view of how a provider call would fare right now, derived from
+ * stored account state. `reason` is null only when the account is usable as-is.
+ */
+export interface ProviderAccountHealth {
+  /**
+   * - `active`: getValidAccessToken would hand back the stored token unchanged.
+   * - `refresh_required`: the next call will refresh before using the token —
+   *   inside the refresh window AND holding a refresh token to do it with.
+   *   Whether that refresh succeeds cannot be known without performing it, and
+   *   with Google's testing-mode seven-day expiry this is the state that fails.
+   *   An account with no refresh token never reaches here: nothing refreshes it,
+   *   so it stays `active` until expiry and is `unusable` after.
+   * - `unusable`: no call would succeed.
+   * - `missing`: nothing is connected for this provider.
+   * - `unknown`: account state could not be read, so there is no verdict.
+   */
+  state: 'active' | 'refresh_required' | 'unusable' | 'missing' | 'unknown';
+  /** The stored account status, when a row exists. */
+  accountStatus: 'active' | 'expired' | 'revoked' | 'error' | null;
+  reason: string | null;
+  lastError: string | null;
+  expiresAt: string | null;
+  lastUsedAt: string | null;
+  /** When the account row last changed — the age of this evidence. */
+  observedAt: string | null;
+}
+
 class OAuthService {
   private supabase: SupabaseClient;
 
@@ -439,6 +496,111 @@ class OAuthService {
   }
 
   /**
+   * Inspect stored account state without refreshing tokens or calling the
+   * provider. The non-mutating twin of getValidAccessToken: it mirrors that
+   * method's account selection, so the answer describes the account a real call
+   * would actually use rather than any row that happens to exist.
+   *
+   * Never throws — a lookup failure reports as 'unknown' with a reason, because
+   * a health check that explodes is worse than one that says "I can't tell".
+   * 'unknown' is deliberately distinct from 'missing': "I could not read the
+   * account table" is not the same claim as "nothing is connected".
+   */
+  async inspectAccountHealth(
+    userId: string,
+    provider: string,
+    workspaceId?: string | null
+  ): Promise<ProviderAccountHealth> {
+    const resolvedWorkspaceId = this.resolveWorkspaceId(workspaceId);
+
+    let query = this.supabase
+      .from('connected_accounts')
+      .select('status, last_error, expires_at, last_used_at, updated_at, refresh_token')
+      .eq('user_id', userId)
+      .eq('provider', provider);
+
+    if (resolvedWorkspaceId === null) {
+      query = query.is('workspace_id', null);
+    } else if (resolvedWorkspaceId) {
+      query = query.eq('workspace_id', resolvedWorkspaceId);
+    }
+
+    const { data: rows, error } = await query.order('updated_at', { ascending: false });
+
+    if (error) {
+      return {
+        state: 'unknown',
+        accountStatus: null,
+        reason: `Could not read account state: ${error.message}`,
+        lastError: null,
+        expiresAt: null,
+        lastUsedAt: null,
+        observedAt: null,
+      };
+    }
+
+    if (!rows || rows.length === 0) {
+      return {
+        state: 'missing',
+        accountStatus: null,
+        reason: `No ${provider} account has been connected`,
+        lastError: null,
+        expiresAt: null,
+        lastUsedAt: null,
+        observedAt: null,
+      };
+    }
+
+    // getValidAccessToken filters on status='active', so an active row is the one
+    // a real call would pick. Only when none is active does the newest failed row
+    // explain why — matching the "No active <provider> account found" it throws.
+    const active = rows.find((row) => row.status === 'active');
+    const row = active ?? rows[0];
+
+    const base = {
+      accountStatus: row.status as ProviderAccountHealth['accountStatus'],
+      lastError: row.last_error ?? null,
+      expiresAt: row.expires_at ?? null,
+      lastUsedAt: row.last_used_at ?? null,
+      observedAt: row.updated_at ?? null,
+    };
+
+    if (!active) {
+      return {
+        ...base,
+        state: 'unusable',
+        reason: `No active ${provider} account found (stored status: ${row.status})`,
+      };
+    }
+
+    // These branches mirror getValidAccessToken exactly, in its order.
+    //
+    // It refreshes if and only if pendingRefreshToken returns one. The stored
+    // token is then not what the next call sends, and a refresh can fail, so no
+    // usable token can be promised without performing one.
+    if (pendingRefreshToken(row.expires_at, row.refresh_token)) {
+      return {
+        ...base,
+        state: 'refresh_required',
+        reason: `Access token expires at ${row.expires_at}; the next call must refresh it first, and that refresh may fail`,
+      };
+    }
+
+    // Otherwise it hands back the stored token untouched — which works right up
+    // until expiry, and is rejected by the provider after it.
+    const expiresAt = row.expires_at ? new Date(row.expires_at).getTime() : null;
+    if (expiresAt !== null && expiresAt <= Date.now()) {
+      return {
+        ...base,
+        state: 'unusable',
+        reason: 'Access token expired and no refresh token is stored',
+      };
+    }
+
+    return { ...base, state: 'active', reason: null };
+  }
+
+  /**
    * Get a valid access token, refreshing if necessary
    */
   async getValidAccessToken(
@@ -469,15 +631,15 @@ class OAuthService {
       throw new Error(`No active ${provider} account found`);
     }
 
-    // Check if token is expired or expiring soon (within 5 minutes)
-    const expiresAt = account.expires_at ? new Date(account.expires_at) : null;
-    const isExpiringSoon = expiresAt && expiresAt.getTime() - Date.now() < 5 * 60 * 1000;
+    // Shared with inspectAccountHealth so the health verdict describes the same
+    // decision this call actually makes.
+    const refreshToken = pendingRefreshToken(account.expires_at, account.refresh_token);
 
-    if (isExpiringSoon && account.refresh_token) {
+    if (refreshToken) {
       logger.info(`Refreshing ${provider} token for user ${userId}`);
 
       try {
-        const tokens = await this.refreshAccessToken(provider, account.refresh_token);
+        const tokens = await this.refreshAccessToken(provider, refreshToken);
 
         // Update stored tokens
         const newExpiresAt = tokens.expiresIn

@@ -6294,6 +6294,34 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description:
         'Check the health status of external service integrations. ' +
         'Returns all integrations for the user, or filter to a specific service.\n\n' +
+        '`status` describes the SERVICE. `accountHealth` describes the OAuth ' +
+        'CREDENTIAL. They fail independently and neither substitutes for the other: ' +
+        'Gmail can be rate limited, out of scope, or down while the account stays ' +
+        'perfectly active.\n\n' +
+        '**`status: "healthy"` requires a recent service-level report.** It is never ' +
+        'inferred from a working credential — otherwise an ongoing outage would be ' +
+        'declared fixed the moment the last report aged out. Account state can only ' +
+        'LOWER a verdict, never raise it:\n' +
+        '- accountHealth "unusable"/"not_connected" is decisive (no call can succeed) ' +
+        'and overrides any report, which is kept as `supersededCachedStatus` / ' +
+        '`lastReportedError`.\n' +
+        '- accountHealth "refresh_required" caps the verdict at "degraded": the next ' +
+        'call must refresh the token first and that refresh may fail.\n' +
+        '- accountHealth "ok"/"unknown" leaves the reported verdict alone. A failed ' +
+        'account lookup is not evidence about the service, so it does not erase an ' +
+        'observed failure.\n\n' +
+        'Read `source` before trusting `status`:\n' +
+        '- source "cached": a status an agent reported by hand. Check `stale` and ' +
+        '`lastCheckAgeSeconds` — a stale row describes the past, not the present, and ' +
+        'must not be relayed as a liveness signal.\n' +
+        '- source "live": derived from stored OAuth account state, which the server ' +
+        'updates on every provider call. Only decisive credential failures report ' +
+        'this way.\n' +
+        '- source "unknown" with `status: "unknown"`: nobody has checked this service. ' +
+        'Not good news and not bad news — the absence of a report.\n\n' +
+        'Google services (gmail/calendar/drive/docs/sheets) always get a verdict, ' +
+        'whether or not anyone has reported on them. Filtering to a specific service ' +
+        'always returns one too, so an empty result never has to be read as good news.\n\n' +
         'User can be identified by ONE of:\n' +
         '- userId: Direct UUID\n' +
         '- email: Email address\n' +
