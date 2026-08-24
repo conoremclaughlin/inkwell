@@ -41,6 +41,19 @@ import type {
 
 type RecallMode = NonNullable<MemorySearchOptions['recallMode']>;
 
+/**
+ * Lifecycle values that mean the session is over. PostgREST `in` list syntax,
+ * shared by the queries that need to tell live sessions from finished ones.
+ */
+const TERMINAL_LIFECYCLES = '(completed,failed)';
+
+/**
+ * The `status` values `list_sessions` accepts. Mirrors the enum on
+ * `listSessionsSchema` — this is a filter over derived current state, not a
+ * read of the deprecated `sessions.status` column.
+ */
+export type SessionStatusFilter = 'active' | 'paused' | 'resumable' | 'completed';
+
 export interface KnowledgeMemoryContext {
   threadKey?: string;
   focusText?: string;
@@ -1810,7 +1823,7 @@ export class MemoryRepository {
       studioId?: string;
       filterNullStudio?: boolean;
       backend?: string;
-      status?: string;
+      status?: SessionStatusFilter;
     } = {}
   ): Promise<Session[]> {
     let query = this.supabase
@@ -1833,10 +1846,38 @@ export class MemoryRepository {
       query = query.eq('backend', options.backend);
     }
 
-    if (options.status === 'active') {
-      query = query.is('ended_at', null).neq('lifecycle', 'failed');
-    } else if (options.status) {
-      query = query.eq('status', options.status);
+    if (options.status) {
+      // `status` filters on the session's *current* state, derived from the
+      // authoritative columns rather than from the deprecated `status`
+      // column — which no terminal path keeps in sync. `endSession()` sets
+      // ended_at + lifecycle 'completed' and leaves status at its 'active'
+      // default, and lifecycle-only completions do the same. Filtering the
+      // legacy column therefore handed finished sessions back to every
+      // caller that asked for live ones.
+      //
+      // Terminal lifecycles are excluded by name rather than just
+      // `neq('lifecycle', 'failed')`, so that a 'completed' lifecycle with no
+      // ended_at cannot leak through. Every completion path stamps ended_at
+      // today, so the two forms agree; this one keeps agreeing if one stops.
+      // findByThreadKey in services/sessions/session-repository.ts made the
+      // same move against the same defect — see the note there.
+      //
+      // A NULL lifecycle sorts as non-active here, because SQL's `NOT IN`
+      // yields NULL rather than true. The column has defaulted to 'idle'
+      // since the lifecycle migration and existing rows were backfilled, so
+      // that is unreachable in practice; getActiveSessions has the same
+      // property, so the two agree either way.
+      if (options.status === 'completed') {
+        query = query.or(`ended_at.not.is.null,lifecycle.in.${TERMINAL_LIFECYCLES}`);
+      } else {
+        query = query.is('ended_at', null).not('lifecycle', 'in', TERMINAL_LIFECYCLES);
+        // 'paused' and 'resumable' are agent-declared intent with no
+        // authoritative equivalent, so they still read the legacy column —
+        // but only among sessions that are still live.
+        if (options.status !== 'active') {
+          query = query.eq('status', options.status);
+        }
+      }
     }
 
     const limit = options.limit || 20;
