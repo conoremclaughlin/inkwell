@@ -459,6 +459,21 @@ describe('agent_inbox read state (integration)', () => {
     expect((await getInbox()).unreadCount).toBe(0);
   });
 
+  it('tie completion never smuggles filtered-out rows (urgent-only stays urgent-only)', async () => {
+    // r3 P2, reproduced on the migrated DB: urgent-only limit:1 returned
+    // both the urgent message AND a normal task request sharing its
+    // timestamp. Filtered pages never advance or ack, so they get no tie
+    // extension at all.
+    const t = '2026-08-16T10:00:00Z';
+    const urgent = await insert({ createdAt: t, priority: 'urgent' });
+    await insert({ createdAt: t, priority: 'normal', messageType: 'task_request' });
+    await setPointer('2026-08-01T00:00:00Z');
+
+    const res = await getInbox({ priority: 'urgent', limit: 1 });
+    expect(res.messages.map((m: { id: string }) => m.id)).toEqual([urgent]);
+    expect(res.readPointerAdvanced).toBe(false);
+  });
+
   // ── r2 P2: the RPC computes `changed` atomically ────────────────────
 
   it('replaying an already-covered anchor reports changed:false with the stored pointer', async () => {

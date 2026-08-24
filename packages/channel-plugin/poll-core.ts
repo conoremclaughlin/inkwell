@@ -339,21 +339,46 @@ export async function drainLegacyInbox(
 
   // Pages arrive newest-first (display order); consumption walks oldest-first
   // so a mid-batch failure never acks past an undelivered older row.
-  const batch = [...messages].sort((a, b) =>
-    String(a.createdAt ?? '').localeCompare(String(b.createdAt ?? ''))
+  const batch = [...messages].sort(
+    (a, b) =>
+      String(a.createdAt ?? '').localeCompare(String(b.createdAt ?? '')) ||
+      String(a.id ?? '').localeCompare(String(b.id ?? ''))
   );
 
-  let lastProcessedId: string | null = null;
+  // The ack anchor is only ever the last row of a COMPLETE created_at group
+  // (Lumen #504 r3 P1): the stored pointer is a bare timestamp, so acking a
+  // row from inside a split tie group consumes its unprocessed siblings
+  // globally — a failed or foreign twin would vanish. A group commits when
+  // the walk moves PAST its timestamp; a stop inside a group acks only
+  // through the previous committed group.
+  let ackThroughId: string | null = null;
+  let pendingGroupTs: string | null = null;
+  let pendingGroupLastId: string | null = null;
+  let walkBroke = false;
+  const commitPendingGroup = () => {
+    if (pendingGroupLastId) ackThroughId = pendingGroupLastId;
+    pendingGroupTs = null;
+    pendingGroupLastId = null;
+  };
+
   for (const msg of batch) {
     const msgId = (msg.id as string) || '';
+    const msgTs = String(msg.createdAt ?? '');
+
+    // Moving past a timestamp completes its group, whatever this row's fate.
+    if (pendingGroupTs !== null && msgTs !== pendingGroupTs) commitPendingGroup();
 
     const disposition = classify(msg);
     if (disposition === 'foreign') {
       stoppedAtForeignStudio = true;
+      walkBroke = true;
       break;
     }
     if ((msgId && seenMessageIds.has(msgId)) || disposition === 'skip') {
-      if (msgId) lastProcessedId = msgId;
+      if (msgId) {
+        pendingGroupTs = msgTs;
+        pendingGroupLastId = msgId;
+      }
       continue;
     }
     const sender = (msg.senderAgentId as string) || 'unknown';
@@ -373,26 +398,35 @@ export async function drainLegacyInbox(
         msgId,
         error: err instanceof Error ? err.message : String(err),
       });
+      walkBroke = true;
       break;
     }
     if (msgId) {
       seenMessageIds.add(msgId);
-      lastProcessedId = msgId;
+      pendingGroupTs = msgTs;
+      pendingGroupLastId = msgId;
     }
     injected += 1;
     deps.log('info', 'Pushed legacy inbox message to channel', { sender, msgId });
   }
 
-  if (lastProcessedId) {
+  // A walk that finished the batch completes its final group — the server's
+  // tie-completion guarantees the page never splits a timestamp group. A walk
+  // that BROKE leaves its pending group uncommitted on purpose: the stop may
+  // sit INSIDE that timestamp group, and acking it would consume the
+  // unprocessed sibling globally.
+  if (!walkBroke) commitPendingGroup();
+
+  if (ackThroughId) {
     const ack = await deps.callPcp('mark_inbox_read', {
       ...(deps.email ? { email: deps.email } : {}),
       agentId: deps.agentId,
-      throughMessageId: lastProcessedId,
+      throughMessageId: ackThroughId,
     });
     if (!ack?.success) {
       ackFailures += 1;
       deps.log('error', 'Legacy inbox ack failed — pointer held, will retry next poll', {
-        throughMessageId: lastProcessedId,
+        throughMessageId: ackThroughId,
       });
     }
   }

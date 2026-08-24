@@ -432,6 +432,60 @@ describe('drainLegacyInbox — exact-id consumption (Lumen #504 r1 P1)', () => {
     expect(ackArgs).toHaveLength(0);
   });
 
+  it('a mid-tie-group emit failure acks only through the PRIOR complete group', async () => {
+    // Two rows share a timestamp; the second twin's emit fails. Acking the
+    // first twin would move the timestamp pointer past BOTH — the failed
+    // sibling vanishes globally (Lumen #504 r3 P1). The ack must stop at the
+    // previous complete created_at group.
+    const { deps, ackArgs } = legacyHarness({ notifyFailOn: 'content twin-b' });
+    const page = [
+      { ...mkMsg('twin-b'), content: 'content twin-b', createdAt: '2026-08-16T11:00:00Z' },
+      { ...mkMsg('twin-a'), content: 'content twin-a', createdAt: '2026-08-16T11:00:00Z' },
+      { ...mkMsg('older'), createdAt: '2026-08-16T10:00:00Z' },
+    ];
+
+    const res = await drainLegacyInbox(deps, new Set<string>(), page, () => 'deliver' as const);
+
+    expect(res.injected).toBe(2); // older + twin-a delivered
+    expect(res.emitFailures).toBe(1);
+    expect(ackArgs).toHaveLength(1);
+    // NOT twin-a: its group is split. The prior complete group is 'older'.
+    expect(ackArgs[0]).toMatchObject({ throughMessageId: 'older' });
+  });
+
+  it('a mid-tie-group foreign row acks only through the PRIOR complete group', async () => {
+    const { deps, ackArgs } = legacyHarness();
+    // ids chosen so THIS studio's twin sorts first: the walk is genuinely
+    // inside the tie group when it hits the foreign sibling.
+    const page = [
+      { ...mkMsg('twin-z-foreign'), createdAt: '2026-08-16T11:00:00Z' },
+      { ...mkMsg('twin-a-mine'), createdAt: '2026-08-16T11:00:00Z' },
+      { ...mkMsg('older'), createdAt: '2026-08-16T10:00:00Z' },
+    ];
+
+    const res = await drainLegacyInbox(deps, new Set<string>(), page, (m) =>
+      m.id === 'twin-z-foreign' ? 'foreign' : 'deliver'
+    );
+
+    expect(res.stoppedAtForeignStudio).toBe(true);
+    expect(ackArgs).toHaveLength(1);
+    expect(ackArgs[0]).toMatchObject({ throughMessageId: 'older' });
+  });
+
+  it('a fully processed tie group at the end of the batch acks through its last row', async () => {
+    const { deps, ackArgs } = legacyHarness();
+    const page = [
+      { ...mkMsg('twin-b'), createdAt: '2026-08-16T11:00:00Z' },
+      { ...mkMsg('twin-a'), createdAt: '2026-08-16T11:00:00Z' },
+    ];
+
+    const res = await drainLegacyInbox(deps, new Set<string>(), page, () => 'deliver' as const);
+
+    expect(res.injected).toBe(2);
+    // Both twins processed — the group is complete and acks through its max.
+    expect(ackArgs[0]).toMatchObject({ throughMessageId: 'twin-b' });
+  });
+
   it('an empty or fully-skipped-by-seen page still acks (retry path)', async () => {
     const { deps, ackArgs } = legacyHarness();
     const seen = new Set<string>(['m1']);

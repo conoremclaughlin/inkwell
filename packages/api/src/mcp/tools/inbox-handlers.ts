@@ -1364,7 +1364,12 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
   // siblings. Extend the page with every remaining row that shares the
   // boundary timestamp so a tie group is always delivered whole.
   let page = fetched ?? [];
-  if (oldestFirst && page.length >= limit && page.length > 0) {
+  // Only ack-capable shapes (no narrowing filters) extend: a filtered page
+  // never advances the pointer OR acks, so completion there would smuggle
+  // rows the caller filtered OUT (urgent-only limit:1 returned a normal
+  // task request sharing the boundary timestamp — Lumen #504 r3 P2).
+  const tieCompletionApplies = oldestFirst && !priority && !messageType && !since;
+  if (tieCompletionApplies && page.length >= limit && page.length > 0) {
     const boundary = (page[page.length - 1] as { created_at: string }).created_at;
     const pageIds = page.map((m) => (m as { id: string }).id);
     let tieQuery = supabase
