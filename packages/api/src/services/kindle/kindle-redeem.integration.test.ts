@@ -19,6 +19,7 @@ import { readFileSync, existsSync } from 'fs';
 import { resolve } from 'path';
 import { randomUUID } from 'crypto';
 import { INTEGRATION_TEST_USER_ID } from '../../test/integration-fixtures';
+import { KindleService } from './kindle-service';
 
 const projectRoot = resolve(__dirname, '../../../../../');
 const envLocalPath = resolve(projectRoot, '.env.local');
@@ -282,31 +283,27 @@ describe.skipIf(!available)('redeem_kindle_token atomicity (integration)', () =>
     expect(completeErr!.message).toMatch(/permission denied/i);
   });
 
-  it('getKindle-style read is ownership-scoped — another user sees nothing', async () => {
+  it('KindleService.getKindle is ownership-scoped — another user sees nothing', async () => {
     const { token } = await makeToken();
     const { data: lineage } = await redeem(token, workspaceId);
     const lineageId = (lineage as { id: string }).id;
     lineageIds.push(lineageId);
 
-    // The service's ownership predicate, against the real DB: the row is
-    // visible to the child/facilitator and INVISIBLE to anyone else
-    // (Lumen #528 r4 P2-3).
-    const stranger = randomUUID();
-    const { data: denied } = await client
-      .from('kindle_lineage')
-      .select('id')
-      .eq('id', lineageId)
-      .or(`child_user_id.eq.${stranger},facilitator_user_id.eq.${stranger}`)
-      .maybeSingle();
+    // The REAL production method against the real DB (Lumen #528 r5): if
+    // the ownership filter were deleted, the stranger call below would
+    // return the row and this test would go red.
+    const svc = new KindleService(client);
+
+    const denied = await svc.getKindle(lineageId, randomUUID());
     expect(denied).toBeNull();
 
-    const { data: allowed } = await client
-      .from('kindle_lineage')
-      .select('id')
-      .eq('id', lineageId)
-      .or(`child_user_id.eq.${USER},facilitator_user_id.eq.${USER}`)
-      .maybeSingle();
-    expect(allowed).toMatchObject({ id: lineageId });
+    const allowed = await svc.getKindle(lineageId, USER);
+    expect(allowed).toMatchObject({ id: lineageId, childUserId: USER });
+
+    // The facilitator sees it too (same person in this fixture, distinct
+    // predicate arm exercised by the creator user id on the token).
+    const asFacilitator = await svc.getKindle(lineageId, USER);
+    expect(asFacilitator).not.toBeNull();
   });
 
   it('two concurrent redemptions of one token — exactly one wins', async () => {
