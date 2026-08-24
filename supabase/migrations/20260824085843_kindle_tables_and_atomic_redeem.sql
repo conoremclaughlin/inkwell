@@ -278,3 +278,9 @@ $$ LANGUAGE plpgsql;
 -- and consume invites — no anon/authenticated execution.
 REVOKE ALL ON FUNCTION public.redeem_kindle_token(text, uuid, uuid, jsonb) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.complete_kindle_onboarding(uuid, uuid, text, text, text) FROM PUBLIC, anon, authenticated;
+
+-- Explicit grant (Lumen #528 r4 P2-1): the REVOKEs above strip everyone;
+-- service_role must be granted back explicitly rather than relying on
+-- default privileges.
+GRANT EXECUTE ON FUNCTION public.redeem_kindle_token(text, uuid, uuid, jsonb) TO service_role;
+GRANT EXECUTE ON FUNCTION public.complete_kindle_onboarding(uuid, uuid, text, text, text) TO service_role;

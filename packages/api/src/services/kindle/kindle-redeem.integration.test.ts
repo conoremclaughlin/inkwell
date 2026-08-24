@@ -203,15 +203,13 @@ describe.skipIf(!available)('redeem_kindle_token atomicity (integration)', () =>
 
     // Occupy the final slug in the same workspace so the rename collides.
     const taken = `it-taken-${id.slice(0, 8)}`;
-    const { error: fixtureErr } = await client
-      .from('agent_identities')
-      .insert({
-        user_id: USER,
-        workspace_id: workspaceId,
-        agent_id: taken,
-        name: taken,
-        role: 'fixture',
-      });
+    const { error: fixtureErr } = await client.from('agent_identities').insert({
+      user_id: USER,
+      workspace_id: workspaceId,
+      agent_id: taken,
+      name: taken,
+      role: 'fixture',
+    });
     expect(fixtureErr).toBeNull();
 
     const { error } = await client.rpc('complete_kindle_onboarding', {
@@ -251,6 +249,64 @@ describe.skipIf(!available)('redeem_kindle_token atomicity (integration)', () =>
     });
     expect(error).toBeTruthy();
     expect(error!.message).toMatch(/not found for this user/);
+  });
+
+  it('anon cannot execute the kindle RPCs — privileges are behaviorally enforced', async () => {
+    // The REVOKEs strip PUBLIC/anon/authenticated and the explicit GRANT
+    // returns execution to service_role alone (Lumen #528 r4 P2-1). Proven
+    // behaviorally: a real anon-key client is refused by Postgres, not by
+    // application code.
+    const anonKey = process.env.SUPABASE_PUBLISHABLE_KEY;
+    if (!anonKey) return; // env without an anon key — cannot express the claim
+    const anon = createClient(SUPABASE_URL!, anonKey, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+
+    const { error: redeemErr } = await anon.rpc('redeem_kindle_token', {
+      p_token: 'nope',
+      p_new_user_id: USER,
+      p_workspace_id: randomUUID(),
+      p_identity: {},
+    });
+    expect(redeemErr).toBeTruthy();
+    expect(redeemErr!.message).toMatch(/permission denied/i);
+
+    const { error: completeErr } = await anon.rpc('complete_kindle_onboarding', {
+      p_kindle_id: randomUUID(),
+      p_user_id: USER,
+      p_chosen_name: 'x',
+      p_final_agent_id: 'x',
+      p_soul: null,
+    });
+    expect(completeErr).toBeTruthy();
+    expect(completeErr!.message).toMatch(/permission denied/i);
+  });
+
+  it('getKindle-style read is ownership-scoped — another user sees nothing', async () => {
+    const { token } = await makeToken();
+    const { data: lineage } = await redeem(token, workspaceId);
+    const lineageId = (lineage as { id: string }).id;
+    lineageIds.push(lineageId);
+
+    // The service's ownership predicate, against the real DB: the row is
+    // visible to the child/facilitator and INVISIBLE to anyone else
+    // (Lumen #528 r4 P2-3).
+    const stranger = randomUUID();
+    const { data: denied } = await client
+      .from('kindle_lineage')
+      .select('id')
+      .eq('id', lineageId)
+      .or(`child_user_id.eq.${stranger},facilitator_user_id.eq.${stranger}`)
+      .maybeSingle();
+    expect(denied).toBeNull();
+
+    const { data: allowed } = await client
+      .from('kindle_lineage')
+      .select('id')
+      .eq('id', lineageId)
+      .or(`child_user_id.eq.${USER},facilitator_user_id.eq.${USER}`)
+      .maybeSingle();
+    expect(allowed).toMatchObject({ id: lineageId });
   });
 
   it('two concurrent redemptions of one token — exactly one wins', async () => {

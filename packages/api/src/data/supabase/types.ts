@@ -4581,22 +4581,68 @@ export type Database = {
       };
       complete_kindle_onboarding: {
         Args: {
-          p_kindle_id: string;
-          p_user_id: string;
           p_chosen_name: string;
           p_final_agent_id: string;
-          p_soul: string | null;
+          p_kindle_id: string;
+          p_soul: string;
+          p_user_id: string;
         };
-        Returns: Database['public']['Tables']['kindle_lineage']['Row'];
+        Returns: {
+          child_agent_id: string;
+          child_sb_id: string | null;
+          child_user_id: string;
+          chosen_name: string | null;
+          completed_at: string | null;
+          created_at: string | null;
+          facilitator_user_id: string;
+          id: string;
+          interview_responses: Json | null;
+          kindle_method: string;
+          onboarding_session_id: string | null;
+          onboarding_status: string;
+          parent_agent_id: string | null;
+          parent_user_id: string | null;
+          updated_at: string;
+          value_seed: Json | null;
+        };
+        SetofOptions: {
+          from: '*';
+          to: 'kindle_lineage';
+          isOneToOne: true;
+          isSetofReturn: false;
+        };
       };
       redeem_kindle_token: {
         Args: {
-          p_token: string;
-          p_new_user_id: string;
-          p_workspace_id: string;
           p_identity: Json;
+          p_new_user_id: string;
+          p_token: string;
+          p_workspace_id: string;
         };
-        Returns: Database['public']['Tables']['kindle_lineage']['Row'];
+        Returns: {
+          child_agent_id: string;
+          child_sb_id: string | null;
+          child_user_id: string;
+          chosen_name: string | null;
+          completed_at: string | null;
+          created_at: string | null;
+          facilitator_user_id: string;
+          id: string;
+          interview_responses: Json | null;
+          kindle_method: string;
+          onboarding_session_id: string | null;
+          onboarding_status: string;
+          parent_agent_id: string | null;
+          parent_user_id: string | null;
+          updated_at: string;
+          value_seed: Json | null;
+        };
+        SetofOptions: {
+          from: '*';
+          to: 'kindle_lineage';
+          isOneToOne: true;
+          isSetofReturn: false;
+        };
       };
       match_artifacts: {
         Args: {
