@@ -495,3 +495,72 @@ describe('runAgentLoop — refused iterations', () => {
     expect(body).not.toContain('every one was refused');
   });
 });
+
+describe('runAgentLoop — final relay at the iteration cap (PR #491 port)', () => {
+  it("relays the capped iteration's results in one FINAL turn — no execution of its blocks", async () => {
+    // Every scripted turn emits a tool call, so the loop runs to the cap.
+    const harness = makePorts([
+      outcome({ responseText: `t1 ${inkTool('send_response', { content: 'hi' })}` }),
+      outcome({ responseText: `t2 ${inkTool('send_response', { content: 'hi' })}` }),
+      // The relay's output — contains an ink-tool block that must NOT run.
+      outcome({ responseText: `final answer ${inkTool('remember', { content: 'nope' })}` }),
+    ]);
+
+    const result = await runAgentLoop(
+      { prompt: 'go', toolRouting: 'local', maxIterations: 2 },
+      harness.ports
+    );
+
+    expect(result.stopReason).toBe('iteration-cap');
+    // Opening turn + 1 continuation + the final relay = 3 prompts.
+    expect(harness.prompts).toHaveLength(3);
+    expect(harness.prompts[2]!.body).toContain('[Tool results from previous turn — FINAL]');
+    expect(harness.prompts[2]!.body).toContain('no further tool calls will be executed');
+    // The capped iteration executed twice; the relay's block never ran.
+    expect(harness.executed).toHaveLength(2);
+    // The relay's text is the final answer.
+    expect(result.responseText).toContain('final answer');
+  });
+
+  it('does NOT relay after a terminal signal, even at the cap', async () => {
+    const harness = makePorts(
+      [
+        outcome({ responseText: inkTool('signal_status', { status: 'completed' }) }),
+        outcome({ responseText: 'should never be requested' }),
+      ],
+      (calls) =>
+        calls.map((c) => ({
+          tool: c.tool,
+          result: signalResult('completed'),
+          status: 'executed',
+          args: c.args,
+        }))
+    );
+
+    const result = await runAgentLoop(
+      { prompt: 'go', toolRouting: 'local', maxIterations: 1 },
+      harness.ports
+    );
+
+    expect(result.stopReason).toBe('terminal-signal');
+    expect(harness.prompts).toHaveLength(1);
+  });
+
+  it('a failed relay keeps the last successful text', async () => {
+    const harness = makePorts([
+      outcome({ responseText: `working ${inkTool('send_response', { content: 'hi' })}` }),
+      outcome({ responseText: `still working ${inkTool('send_response', { content: 'hi' })}` }),
+      outcome({ success: false, exitCode: 1, stderr: 'relay boom' }),
+    ]);
+
+    const result = await runAgentLoop(
+      { prompt: 'go', toolRouting: 'local', maxIterations: 2 },
+      harness.ports
+    );
+
+    expect(result.stopReason).toBe('iteration-cap');
+    // The failed relay's stderr must not become the answer.
+    expect(result.responseText).toContain('still working');
+    expect(result.responseText).not.toContain('relay boom');
+  });
+});

@@ -186,6 +186,29 @@ export function buildContinuationBody(
   return `[Tool results from previous turn]\n${toolResultsSummary}${formatCorrection}${refusalNote}\n\nContinue your response based on these tool results. If you need more tools, emit ink-tool blocks. Otherwise, provide your final answer.`;
 }
 
+/**
+ * Build the FINAL relay body: the loop is ending (iteration cap or an
+ * all-refused iteration), but this iteration's results never reached the
+ * model. Dropping them is a silent failure — a send_response that errored on
+ * the capped iteration reads to the agent as delivered, and it exits
+ * confidently wrong (the Aug 13 Telegram audio drop; PR #491). The relay's
+ * output is final: its ink-tool blocks are NOT executed.
+ */
+export function buildFinalRelayBody(results: ReadonlyArray<ToolResultRecord>): string {
+  const toolResultsSummary = results
+    .map((r) => {
+      const resultStr = typeof r.result === 'string' ? r.result : JSON.stringify(r.result);
+      return `Tool ${r.tool} (${r.status}): ${resultStr}`;
+    })
+    .join('\n\n');
+  return (
+    `[Tool results from previous turn — FINAL]\n${toolResultsSummary}\n\n` +
+    'The tool loop has ended; no further tool calls will be executed this turn. ' +
+    'Review these results and provide your final answer. If a call above failed, ' +
+    'say so plainly instead of reporting the work as done.'
+  );
+}
+
 export interface AgentLoopInput {
   /** The opening prompt, already enveloped by the host. */
   prompt: string;
@@ -246,6 +269,8 @@ export async function runAgentLoop(
   let responseText = resolveResponseText(outcome);
   let calls: LocalToolCall[] = [];
   let stopReason: AgentLoopStopReason = 'no-tools';
+  // The final executed iteration's results — candidates for the final relay.
+  let lastIterationResults: ToolResultRecord[] = [];
 
   for (;;) {
     responseText = resolveResponseText(outcome);
@@ -310,6 +335,7 @@ export async function runAgentLoop(
 
     const results = await ports.tools.execute(calls, { iteration, signal: input.signal });
     allToolResults.push(...results);
+    lastIterationResults = results;
     for (const r of results) ports.observe?.recordToolCall(r);
 
     iteration++;
@@ -365,6 +391,41 @@ export async function runAgentLoop(
       stopReason = 'backend-failure';
       break;
     }
+  }
+
+  // FINAL RELAY (PR #491 port): the loop exited at the iteration cap, so the
+  // capped iteration's results never reached the model — a send_response
+  // that errored there reads to the agent as delivered, and it exits
+  // confidently wrong (the Aug 13 Telegram audio drop). One last round-trip
+  // shows them; its output is FINAL — ink-tool blocks in it are not executed
+  // (extraction stops with the loop). Only the cap: a terminal signal means
+  // the agent already knows what it signaled (re-invoking recreates the
+  // multiplied-signal bug), and a refusal ends the turn by design — in the
+  // REPL the human watched it happen, and clones retry via continueOnBlocked.
+  if (
+    stopReason === 'iteration-cap' &&
+    lastIterationResults.length > 0 &&
+    outcome.success &&
+    !input.signal?.aborted
+  ) {
+    ports.ui.printEvent('  ⋯ relaying final tool results (no further execution)…');
+    const stopRelayWaiting = ports.ui.startWaiting();
+    let relay: BackendTurnOutcome;
+    try {
+      relay = await ports.backend.runTurn(buildFinalRelayBody(lastIterationResults), {
+        iteration,
+        isContinuation: true,
+        signal: input.signal,
+      });
+    } finally {
+      stopRelayWaiting();
+    }
+    if (relay.success) {
+      outcome = relay;
+      responseText = resolveResponseText(relay);
+    }
+    // A failed relay keeps the last successful text — the results are still
+    // in allToolResults for the host's own reporting.
   }
 
   // An aborted turn (SIGINT kills the child) exits >=128 and has no usable text.

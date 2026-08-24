@@ -118,6 +118,44 @@ const outboundMediaSchema = z.object({
   caption: z.string().optional().describe('Caption for this attachment'),
 });
 
+const IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'heic', 'heif', 'bmp']);
+const VIDEO_EXTENSIONS = new Set(['mp4', 'mov', 'm4v', 'webm', 'avi', 'mkv']);
+const AUDIO_EXTENSIONS = new Set(['m4a', 'mp3', 'ogg', 'oga', 'opus', 'wav', 'aac', 'flac']);
+
+export function inferMediaTypeFromPath(
+  pathOrUrl: string
+): 'image' | 'video' | 'audio' | 'document' {
+  const ext =
+    pathOrUrl
+      .toLowerCase()
+      .replace(/[?#].*$/, '')
+      .split('.')
+      .pop() ?? '';
+  if (IMAGE_EXTENSIONS.has(ext)) return 'image';
+  if (VIDEO_EXTENSIONS.has(ext)) return 'video';
+  if (AUDIO_EXTENSIONS.has(ext)) return 'audio';
+  return 'document';
+}
+
+/**
+ * One media entry: the canonical {type, path|url, ...} object, or a bare
+ * path/URL string coerced into one. Agents naturally write
+ * media: ["/path/file.m4a"], and rejecting that shape cost a real outbound
+ * Telegram message (Aug 13 silent-drop bug) — coerce it, inferring the type
+ * from the file extension.
+ */
+export const outboundMediaEntrySchema = z.union([
+  outboundMediaSchema,
+  z
+    .string()
+    .transform(
+      (entry): z.infer<typeof outboundMediaSchema> =>
+        /^https?:\/\//i.test(entry)
+          ? { type: inferMediaTypeFromPath(entry), url: entry }
+          : { type: inferMediaTypeFromPath(entry), path: entry }
+    ),
+]);
+
 export const sendResponseSchema = z.object({
   channel: z
     .enum(['telegram', 'terminal', 'discord', 'whatsapp', 'slack', 'http', 'api', 'agent'])
@@ -143,9 +181,11 @@ export const sendResponseSchema = z.object({
     ),
   metadata: z.record(z.unknown()).optional().describe('Additional channel-specific metadata'),
   media: z
-    .array(outboundMediaSchema)
+    .array(outboundMediaEntrySchema)
     .optional()
-    .describe('Media attachments to send (images, videos, documents)'),
+    .describe(
+      'Media attachments to send. Each entry is {type, path|url, ...} — a bare path/URL string is also accepted and coerced.'
+    ),
 });
 
 type McpResponse = {
