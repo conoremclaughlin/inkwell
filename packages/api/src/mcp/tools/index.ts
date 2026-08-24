@@ -3,6 +3,11 @@ import { z } from 'zod';
 import type { DataComposer } from '../../data/composer';
 import { logger } from '../../utils/logger';
 import { strictifyInputSchema, strictToolArgsEnabled } from './strict-input-schema';
+import {
+  describeToolSchema,
+  handleDescribeTool,
+  type ToolRegistry,
+} from './tool-discovery-handlers';
 
 // Import all tool handlers
 import { handleSaveLink, handleSearchLinks, handleTagLink } from './link-handlers';
@@ -37,6 +42,25 @@ import {
   closeTaskSchema,
   closeTaskGroupSchema,
 } from './task-handlers';
+
+import {
+  handleApplyTaskGraph,
+  handleConvertTaskGroupToGraph,
+  handleGetTaskGraph,
+  handleStartGraphExecution,
+  handleClaimTask,
+  handleReleaseClaim,
+  handleRecordGateVerdict,
+  handleRetryGate,
+  applyTaskGraphSchema,
+  convertTaskGroupToGraphSchema,
+  getTaskGraphSchema,
+  startGraphExecutionSchema,
+  claimTaskSchema,
+  releaseClaimSchema,
+  recordGateVerdictSchema,
+  retryGateSchema,
+} from './task-graph-handlers';
 
 import { handleSendResponse, handleGetPendingMessages, handleMarkRead } from './response-handlers';
 
@@ -391,17 +415,31 @@ export function registerAllTools(
     return TRANSIENT_PG_PATTERNS.some((p) => msg.includes(p));
   }
 
+  // Populated by the interceptor below; read at call time by describe_tool, so
+  // registration order does not matter.
+  const toolRegistry: ToolRegistry = new Map();
+
   const originalRegisterTool = server.registerTool.bind(server);
   (server as any).registerTool = (name: string, ...rest: any[]) => {
     // Reject unknown args instead of silently stripping them. Applied here so
     // all ~163 tools inherit it, rather than per-schema — see
     // ./strict-input-schema for why the default rather than the schemas is
     // treated as the defect.
+    const config = rest[0];
     if (strictToolArgsEnabled()) {
-      const config = rest[0];
       if (config && typeof config === 'object' && 'inputSchema' in config) {
         config.inputSchema = strictifyInputSchema(config.inputSchema);
       }
+    }
+    // Record what was registered so describe_tool can answer questions about
+    // it. Captured after strictify so an agent is shown the schema that is
+    // actually enforced, not the one before it was tightened.
+    if (config && typeof config === 'object') {
+      toolRegistry.set(name, {
+        name,
+        description: (config as { description?: string }).description,
+        inputSchema: (config as { inputSchema?: unknown }).inputSchema,
+      });
     }
     const handler = rest[rest.length - 1];
     if (typeof handler === 'function') {
@@ -1006,10 +1044,27 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
     {
       description: `Mark a task as completed.
 
+For tasks in graph-mode groups, completion is claim-token-gated: claim the task first (claim_task) and pass claimToken here.
+
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: {
         ...userIdentifierFields,
         taskId: z.string().uuid().describe('Task ID to mark as completed'),
+        summary: z
+          .string()
+          .max(2000)
+          .optional()
+          .describe('Brief summary of what was accomplished (shown in mission feed)'),
+        claimToken: z
+          .string()
+          .uuid()
+          .optional()
+          .describe('Required for graph-mode tasks: the claim token from claim_task'),
+        sessionId: z
+          .string()
+          .uuid()
+          .optional()
+          .describe('Claim-holding session for graph-mode tasks — usually resolved from context'),
       },
     },
     async (args) => {
@@ -1029,6 +1084,160 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           ],
           isError: true,
         };
+      }
+    }
+  );
+
+  // ── Workflow graph tools (spec: ink://specs/workflow-graph v10) ────────
+
+  const graphToolError = (name: string) => (error: unknown) => {
+    logger.error(`Error in ${name}:`, error);
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: JSON.stringify({
+            success: false,
+            error: error instanceof Error ? error.message : 'Unknown error',
+          }),
+        },
+      ],
+      isError: true,
+    };
+  };
+
+  server.registerTool(
+    'convert_task_group_to_graph',
+    {
+      description: `Convert a linear task group to graph execution. Validated preflight: existing blocked_by arrays become task_edges only when fully valid (no dangling/self/cross-group/cyclic entries); on any failure the group stays linear, reported explicitly. Only idle/paused groups convert.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: convertTaskGroupToGraphSchema,
+    },
+    async (args) => {
+      try {
+        return await handleConvertTaskGroupToGraph(args, dataComposer);
+      } catch (error) {
+        return graphToolError('convert_task_group_to_graph')(error);
+      }
+    }
+  );
+
+  server.registerTool(
+    'apply_task_graph',
+    {
+      description: `Replace a graph-mode group's dependency edges with the complete desired set (serialized, graph_version CAS, cycle-checked). An edge from→to means "from must complete/pass before to can start". This is the ONLY way to mutate graph dependencies — blocked_by is frozen for graph groups.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: applyTaskGraphSchema,
+    },
+    async (args) => {
+      try {
+        return await handleApplyTaskGraph(args, dataComposer);
+      } catch (error) {
+        return graphToolError('apply_task_graph')(error);
+      }
+    }
+  );
+
+  server.registerTool(
+    'get_task_graph',
+    {
+      description: `Read a task group's graph: nodes (with gate state, claims, dwell windows, assignees) and edges, plus graphVersion for CAS on mutations. Use before apply_task_graph, record_gate_verdict, or retry_gate.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: getTaskGraphSchema,
+    },
+    async (args) => {
+      try {
+        return await handleGetTaskGraph(args, dataComposer);
+      } catch (error) {
+        return graphToolError('get_task_graph')(error);
+      }
+    }
+  );
+
+  server.registerTool(
+    'start_graph_execution',
+    {
+      description: `Start (or resume) executing a graph-mode task group: activates it, evaluates readiness, and dispatches every ready node to its assignee. The reconciliation sweep keeps it moving afterward.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: startGraphExecutionSchema,
+    },
+    async (args) => {
+      try {
+        return await handleStartGraphExecution(args, dataComposer);
+      } catch (error) {
+        return graphToolError('start_graph_execution')(error);
+      }
+    }
+  );
+
+  server.registerTool(
+    'claim_task',
+    {
+      description: `Claim a ready graph node for this session. Returns a claimToken required to complete the task (work) or record a verdict (claimed executable gate). Exactly one session holds a claim; refusals are structured (not-ready, already-claimed, gate-not-open, approval-gate).
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: claimTaskSchema,
+    },
+    async (args) => {
+      try {
+        return await handleClaimTask(args, dataComposer);
+      } catch (error) {
+        return graphToolError('claim_task')(error);
+      }
+    }
+  );
+
+  server.registerTool(
+    'release_claim',
+    {
+      description: `Release a claim you hold on a graph node without completing it — the node returns to the ready pool (work → pending, gate → open) for another session.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: releaseClaimSchema,
+    },
+    async (args) => {
+      try {
+        return await handleReleaseClaim(args, dataComposer);
+      } catch (error) {
+        return graphToolError('release_claim')(error);
+      }
+    }
+  );
+
+  server.registerTool(
+    'record_gate_verdict',
+    {
+      description: `Record a verdict on an open verification gate: passed (evidence required) or failed (reason required). Attempt + gateVersion CAS — read them via get_task_graph first. Authority: the claim holder for claimed gates, the assignee otherwise. Passing pushes downstream nodes ready in the same transaction.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: recordGateVerdictSchema,
+    },
+    async (args) => {
+      try {
+        return await handleRecordGateVerdict(args, dataComposer);
+      } catch (error) {
+        return graphToolError('record_gate_verdict')(error);
+      }
+    }
+  );
+
+  server.registerTool(
+    'retry_gate',
+    {
+      description: `Retry a FAILED verification gate after remediation: new attempt on the same node, fresh dwell window, prior evidence immutable in the event log.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: retryGateSchema,
+    },
+    async (args) => {
+      try {
+        return await handleRetryGate(args, dataComposer);
+      } catch (error) {
+        return graphToolError('retry_gate')(error);
       }
     }
   );
@@ -2137,7 +2346,8 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
     {
       description: `Update your session state — work phase, status, backend session ID, context. This is the primary tool for managing session state.
 
-Session resolution: sessionId (explicit) > studioId (scoped lookup) > most recent active session.
+Session resolution: sessionId (explicit) > studioId (scoped lookup) > the session you are running in > your most recent active session.
+Implicit resolution is always scoped to your own agent identity and fails with an error rather than guessing — it will never select another agent's session.
 For parallel worktrees, pass studioId to target the correct session.
 
 Phase: Communicates real-time work status to other agents.
@@ -3664,6 +3874,50 @@ Action "transcribe" (with filePath) transcribes a saved audio file under ~/.ink/
               }),
             },
           ],
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'describe_tool',
+    {
+      description: `Look up what a tool is called and what parameters it takes.
+
+Use this the moment you are unsure of a tool name or a parameter name, instead
+of guessing. Guessing is expensive: a wrong parameter is rejected, and a wrong
+tool name costs a round trip.
+
+- describe_tool({ name: "create_reminder" }) — full description and parameter
+  schema for one tool, including which fields are required
+- describe_tool({ search: "reminder" }) — find tools by keyword when you know
+  what you want to do but not what it is called
+- describe_tool({}) — list every tool name
+
+Examples:
+- Unsure whether it is runAt or remindAt → describe_tool({ name: "create_reminder" })
+- Want to decline a calendar invite → describe_tool({ search: "calendar" })
+- Got "no tool named X" → describe_tool({ search: "<what you were trying to do>" })
+
+This reflects the live server, so it is never out of date.`,
+      inputSchema: describeToolSchema,
+    },
+    async (args) => {
+      try {
+        return handleDescribeTool(args, toolRegistry);
+      } catch (error) {
+        logger.error('Error in describe_tool:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
         };
       }
     }

@@ -47,6 +47,7 @@ import {
   exchangeRefreshToken,
 } from '../auth/pcp-tokens';
 import type { Database } from '../data/supabase/types';
+import { applyGraphBlockedBy } from '../data/task-graph-read-model';
 import { isLeaseStale, type StudioLease } from '../services/studio-lease.service';
 import { activityBus } from '../services/events/activity-bus';
 import type { Activity } from '../data/repositories/activity-stream.repository';
@@ -6591,7 +6592,31 @@ router.get('/tasks', async (req: Request, res: Response) => {
       return;
     }
 
-    const tasks = data || [];
+    // Graph-mode groups store dependencies in task_edges; blockedBy is derived.
+    const tasks = await applyGraphBlockedBy(supabase, data || []);
+
+    // activeOnly hides terminal tasks, but an ARCHIVED predecessor is
+    // unsatisfiable — downstream can never run, and treating it as
+    // satisfied-because-absent would render blocked work as ready (Lumen,
+    // PR #524 round 1). Pull in exactly the archived blockers of the
+    // fetched set so the map can mark them.
+    if (activeOnly === 'true' && tasks.length > 0) {
+      const present = new Set(tasks.map((t) => t.id));
+      const missingBlockers = [
+        ...new Set(tasks.flatMap((t) => t.blocked_by ?? []).filter((depId) => !present.has(depId))),
+      ];
+      if (missingBlockers.length > 0) {
+        const { data: archivedDeps, error: archivedError } = await supabase
+          .from('tasks')
+          .select('*, projects(name), task_groups(title)')
+          .eq('user_id', authReq.pcpUserId)
+          .eq('status', 'archived')
+          .in('id', missingBlockers);
+        if (!archivedError && archivedDeps && archivedDeps.length > 0) {
+          tasks.push(...(await applyGraphBlockedBy(supabase, archivedDeps)));
+        }
+      }
+    }
 
     // Sort: status priority (in_progress, pending, blocked, completed),
     // then by priority (critical, high, medium, low), then by created_at desc
@@ -6648,6 +6673,17 @@ router.get('/tasks', async (req: Request, res: Response) => {
         metadata: t.metadata,
         createdAt: t.created_at,
         updatedAt: t.updated_at,
+        // Workflow graph execution state (spec v10 steps 2-3) — lets the
+        // map render gates, claims, and dwell windows distinctly.
+        taskType: t.task_type ?? 'work',
+        outcome: t.outcome ?? null,
+        gateState: t.gate_state ?? null,
+        gateAttempt: t.gate_attempt ?? null,
+        gateOpenedAt: t.gate_opened_at ?? null,
+        eligibleAt: t.eligible_at ?? null,
+        claimedBySessionId: t.claimed_by_session_id ?? null,
+        assigneeIdentityId: t.assignee_identity_id ?? null,
+        assigneeUserId: t.assignee_user_id ?? null,
       })),
       stats,
     });
@@ -6727,6 +6763,8 @@ router.put('/tasks/:id', async (req: Request, res: Response) => {
       return;
     }
 
+    const [derivedTask] = await applyGraphBlockedBy(supabase, [data]);
+
     res.json({
       task: {
         id: data.id,
@@ -6739,7 +6777,7 @@ router.put('/tasks/:id', async (req: Request, res: Response) => {
         projectName: (data.projects as { name: string } | null)?.name ?? null,
         taskGroupId: data.task_group_id,
         taskGroupTitle: (data.task_groups as { title: string } | null)?.title ?? null,
-        blockedBy: data.blocked_by,
+        blockedBy: derivedTask.blocked_by,
         createdBy: data.created_by,
         completedAt: data.completed_at,
         dueDate: data.due_date,
@@ -6832,6 +6870,9 @@ router.get('/task-groups', async (req: Request, res: Response) => {
         strategyStartedAt: g.strategy_started_at ?? null,
         strategyPausedAt: g.strategy_paused_at ?? null,
         planUri: g.plan_uri ?? null,
+        executionModel: g.execution_model ?? 'linear',
+        executionPhase: g.execution_phase ?? 'idle',
+        graphVersion: g.graph_version ?? 0,
         metadata: g.metadata,
         createdAt: g.created_at,
         updatedAt: g.updated_at,
@@ -6890,7 +6931,8 @@ router.get('/task-groups/:id', async (req: Request, res: Response) => {
       return;
     }
 
-    const tasks = tasksData || [];
+    // Graph-mode groups store dependencies in task_edges; blockedBy is derived.
+    const tasks = await applyGraphBlockedBy(supabase, tasksData || []);
 
     res.json({
       group: {

@@ -3417,6 +3417,204 @@ export type Database = {
           },
         ];
       };
+      task_edges: {
+        Row: {
+          created_at: string;
+          from_task: string;
+          to_task: string;
+        };
+        Insert: {
+          created_at?: string;
+          from_task: string;
+          to_task: string;
+        };
+        Update: {
+          created_at?: string;
+          from_task?: string;
+          to_task?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'task_edges_from_task_fkey';
+            columns: ['from_task'];
+            referencedRelation: 'tasks';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'task_edges_to_task_fkey';
+            columns: ['to_task'];
+            referencedRelation: 'tasks';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
+      task_gate_events: {
+        Row: {
+          actor_identity_id: string | null;
+          actor_user_id: string | null;
+          assignee_identity_id: string | null;
+          assignee_user_id: string | null;
+          attempt: number;
+          claim_token: string | null;
+          created_at: string;
+          event: string;
+          evidence: Json | null;
+          gate_version: number;
+          id: string;
+          reason: string | null;
+          session_id: string | null;
+          task_id: string;
+          user_id: string;
+        };
+        Insert: {
+          actor_identity_id?: string | null;
+          actor_user_id?: string | null;
+          assignee_identity_id?: string | null;
+          assignee_user_id?: string | null;
+          attempt: number;
+          claim_token?: string | null;
+          created_at?: string;
+          event: string;
+          evidence?: Json | null;
+          gate_version: number;
+          id?: string;
+          reason?: string | null;
+          session_id?: string | null;
+          task_id: string;
+          user_id: string;
+        };
+        Update: {
+          actor_identity_id?: string | null;
+          actor_user_id?: string | null;
+          assignee_identity_id?: string | null;
+          assignee_user_id?: string | null;
+          attempt?: number;
+          claim_token?: string | null;
+          created_at?: string;
+          event?: string;
+          evidence?: Json | null;
+          gate_version?: number;
+          id?: string;
+          reason?: string | null;
+          session_id?: string | null;
+          task_id?: string;
+          user_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'task_gate_events_actor_identity_id_fkey';
+            columns: ['actor_identity_id'];
+            referencedRelation: 'agent_identities';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'task_gate_events_actor_user_id_fkey';
+            columns: ['actor_user_id'];
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'task_gate_events_assignee_identity_id_fkey';
+            columns: ['assignee_identity_id'];
+            referencedRelation: 'agent_identities';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'task_gate_events_assignee_user_id_fkey';
+            columns: ['assignee_user_id'];
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'task_gate_events_session_id_fkey';
+            columns: ['session_id'];
+            referencedRelation: 'sessions';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'task_gate_events_task_id_fkey';
+            columns: ['task_id'];
+            referencedRelation: 'tasks';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'task_gate_events_user_id_fkey';
+            columns: ['user_id'];
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
+      task_graph_revisions: {
+        Row: {
+          actor_identity_id: string | null;
+          actor_user_id: string | null;
+          config_hash: string | null;
+          constructor: string | null;
+          constructor_version: string | null;
+          created_at: string;
+          diff: Json;
+          graph_version: number;
+          id: string;
+          system_actor: boolean;
+          task_group_id: string;
+          user_id: string;
+        };
+        Insert: {
+          actor_identity_id?: string | null;
+          actor_user_id?: string | null;
+          config_hash?: string | null;
+          constructor?: string | null;
+          constructor_version?: string | null;
+          created_at?: string;
+          diff: Json;
+          graph_version: number;
+          id?: string;
+          system_actor?: boolean;
+          task_group_id: string;
+          user_id: string;
+        };
+        Update: {
+          actor_identity_id?: string | null;
+          actor_user_id?: string | null;
+          config_hash?: string | null;
+          constructor?: string | null;
+          constructor_version?: string | null;
+          created_at?: string;
+          diff?: Json;
+          graph_version?: number;
+          id?: string;
+          system_actor?: boolean;
+          task_group_id?: string;
+          user_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'task_graph_revisions_actor_identity_id_fkey';
+            columns: ['actor_identity_id'];
+            referencedRelation: 'agent_identities';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'task_graph_revisions_actor_user_id_fkey';
+            columns: ['actor_user_id'];
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'task_graph_revisions_task_group_id_fkey';
+            columns: ['task_group_id'];
+            referencedRelation: 'task_groups';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'task_graph_revisions_user_id_fkey';
+            columns: ['user_id'];
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
       task_group_comments: {
         Row: {
           agent_id: string | null;
@@ -3486,7 +3684,9 @@ export type Database = {
           created_at: string;
           current_task_index: number;
           description: string | null;
+          execution_model: string;
           execution_phase: string;
+          graph_version: number;
           group_number: number | null;
           id: string;
           instructions: string | null;
@@ -3522,7 +3722,9 @@ export type Database = {
           created_at?: string;
           current_task_index?: number;
           description?: string | null;
+          execution_model?: string;
           execution_phase?: string;
+          graph_version?: number;
           group_number?: number | null;
           id?: string;
           instructions?: string | null;
@@ -3558,7 +3760,9 @@ export type Database = {
           created_at?: string;
           current_task_index?: number;
           description?: string | null;
+          execution_model?: string;
           execution_phase?: string;
+          graph_version?: number;
           group_number?: number | null;
           id?: string;
           instructions?: string | null;
@@ -3610,14 +3814,26 @@ export type Database = {
       };
       tasks: {
         Row: {
+          assignee_identity_id: string | null;
+          assignee_user_id: string | null;
           blocked_by: string[] | null;
+          claim_token: string | null;
+          claimed_at: string | null;
+          claimed_by_session_id: string | null;
           completed_at: string | null;
           created_at: string;
           created_by: string | null;
           description: string | null;
           due_date: string | null;
+          dwell_started_at: string | null;
+          eligible_at: string | null;
+          gate_attempt: number;
+          gate_opened_at: string | null;
+          gate_state: string | null;
+          gate_version: number;
           id: string;
           metadata: Json;
+          node_slug: string | null;
           outcome: string | null;
           outcome_reason: string | null;
           priority: string | null;
@@ -3626,19 +3842,33 @@ export type Database = {
           tags: string[] | null;
           task_group_id: string | null;
           task_order: number | null;
+          task_type: string;
           title: string;
           updated_at: string;
           user_id: string;
+          verification: Json | null;
         };
         Insert: {
+          assignee_identity_id?: string | null;
+          assignee_user_id?: string | null;
           blocked_by?: string[] | null;
+          claim_token?: string | null;
+          claimed_at?: string | null;
+          claimed_by_session_id?: string | null;
           completed_at?: string | null;
           created_at?: string;
           created_by?: string | null;
           description?: string | null;
           due_date?: string | null;
+          dwell_started_at?: string | null;
+          eligible_at?: string | null;
+          gate_attempt?: number;
+          gate_opened_at?: string | null;
+          gate_state?: string | null;
+          gate_version?: number;
           id?: string;
           metadata?: Json;
+          node_slug?: string | null;
           outcome?: string | null;
           outcome_reason?: string | null;
           priority?: string | null;
@@ -3647,19 +3877,33 @@ export type Database = {
           tags?: string[] | null;
           task_group_id?: string | null;
           task_order?: number | null;
+          task_type?: string;
           title: string;
           updated_at?: string;
           user_id: string;
+          verification?: Json | null;
         };
         Update: {
+          assignee_identity_id?: string | null;
+          assignee_user_id?: string | null;
           blocked_by?: string[] | null;
+          claim_token?: string | null;
+          claimed_at?: string | null;
+          claimed_by_session_id?: string | null;
           completed_at?: string | null;
           created_at?: string;
           created_by?: string | null;
           description?: string | null;
           due_date?: string | null;
+          dwell_started_at?: string | null;
+          eligible_at?: string | null;
+          gate_attempt?: number;
+          gate_opened_at?: string | null;
+          gate_state?: string | null;
+          gate_version?: number;
           id?: string;
           metadata?: Json;
+          node_slug?: string | null;
           outcome?: string | null;
           outcome_reason?: string | null;
           priority?: string | null;
@@ -3668,11 +3912,31 @@ export type Database = {
           tags?: string[] | null;
           task_group_id?: string | null;
           task_order?: number | null;
+          task_type?: string;
           title?: string;
           updated_at?: string;
           user_id?: string;
+          verification?: Json | null;
         };
         Relationships: [
+          {
+            foreignKeyName: 'tasks_assignee_identity_id_fkey';
+            columns: ['assignee_identity_id'];
+            referencedRelation: 'agent_identities';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'tasks_assignee_user_id_fkey';
+            columns: ['assignee_user_id'];
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'tasks_claimed_by_session_id_fkey';
+            columns: ['claimed_by_session_id'];
+            referencedRelation: 'sessions';
+            referencedColumns: ['id'];
+          },
           {
             foreignKeyName: 'tasks_project_id_fkey';
             columns: ['project_id'];
@@ -4100,6 +4364,40 @@ export type Database = {
         };
         Returns: string;
       };
+      apply_task_graph: {
+        Args: {
+          p_user_id: string;
+          p_task_group_id: string;
+          p_expected_version: number;
+          p_edges: Json;
+          p_actor_identity_id?: string | null;
+          p_actor_user_id?: string | null;
+          p_system_actor?: boolean;
+          p_constructor?: string | null;
+          p_constructor_version?: string | null;
+          p_config_hash?: string | null;
+        };
+        Returns: Json;
+      };
+      claim_graph_task: {
+        Args: {
+          p_user_id: string;
+          p_task_id: string;
+          p_session_id: string;
+        };
+        Returns: Json;
+      };
+      complete_graph_task: {
+        Args: {
+          p_user_id: string;
+          p_task_id: string;
+          p_session_id: string;
+          p_claim_token: string;
+          p_outcome: string;
+          p_reason?: string | null;
+        };
+        Returns: Json;
+      };
       compute_thread_key_pin: {
         Args: {
           p_user_id: string;
@@ -4110,6 +4408,17 @@ export type Database = {
           o_type: string | null;
           o_id: string | null;
         };
+      };
+      convert_task_group_to_graph: {
+        Args: {
+          p_user_id: string;
+          p_task_group_id: string;
+          p_expected_version: number;
+          p_actor_identity_id?: string | null;
+          p_actor_user_id?: string | null;
+          p_system_actor?: boolean;
+        };
+        Returns: Json;
       };
       get_unread_thread_candidates: {
         Args: {
@@ -4123,6 +4432,15 @@ export type Database = {
           thread_id: string;
           total_candidates: number;
         }[];
+      };
+      grant_studio_lease: {
+        Args: {
+          p_studio_id: string;
+          p_user_id: string;
+          p_lease: Json;
+          p_expected_prior?: Json | null;
+        };
+        Returns: Json;
       };
       match_artifacts: {
         Args: {
@@ -4270,8 +4588,64 @@ export type Database = {
           title: string;
         }[];
       };
+      normalize_worktree_path: {
+        Args: { p: string | null };
+        Returns: string | null;
+      };
+      record_gate_verdict: {
+        Args: {
+          p_user_id: string;
+          p_task_id: string;
+          p_verdict: string;
+          p_expected_attempt: number;
+          p_expected_gate_version: number;
+          p_actor_identity_id?: string | null;
+          p_actor_user_id?: string | null;
+          p_session_id?: string | null;
+          p_claim_token?: string | null;
+          p_evidence?: Json | null;
+          p_reason?: string | null;
+        };
+        Returns: Json;
+      };
+      release_graph_claim: {
+        Args: {
+          p_user_id: string;
+          p_task_id: string;
+          p_claim_token: string;
+          p_session_id?: string | null;
+          p_reclaim?: boolean;
+          p_reason?: string | null;
+        };
+        Returns: Json;
+      };
+      retry_gate: {
+        Args: {
+          p_user_id: string;
+          p_task_id: string;
+          p_expected_attempt: number;
+          p_actor_identity_id?: string | null;
+          p_actor_user_id?: string | null;
+          p_reason?: string | null;
+        };
+        Returns: Json;
+      };
       show_limit: { Args: never; Returns: number };
       show_trgm: { Args: { '': string }; Returns: string[] };
+      studio_path_conflict: {
+        Args: {
+          p_studio_id: string;
+          p_user_id: string;
+        };
+        Returns: Json;
+      };
+      sweep_task_graph: {
+        Args: {
+          p_user_id: string;
+          p_task_group_id: string;
+        };
+        Returns: Json;
+      };
       trigger_heartbeat: { Args: never; Returns: undefined };
     };
     Enums: {

@@ -8,6 +8,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { makeFakeSupabase } from './fake-supabase.js';
 import { StudioOverflowService } from '../studio-overflow.service.js';
+import { StudioLeaseService } from '../studio-lease.service.js';
 import {
   SessionService,
   resolveRuntimeModel,
@@ -2108,7 +2109,7 @@ describe('SessionService', () => {
       vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(otherSession);
 
       const emptyChain: Record<string, unknown> = {};
-      for (const m of ['select', 'eq', 'not', 'is', 'neq', 'in', 'order', 'limit']) {
+      for (const m of ['select', 'eq', 'or', 'not', 'is', 'neq', 'in', 'order', 'limit']) {
         emptyChain[m] = vi.fn().mockReturnValue(emptyChain);
       }
       emptyChain.maybeSingle = vi.fn().mockResolvedValue({ data: null, error: null });
@@ -2164,7 +2165,7 @@ describe('SessionService', () => {
       // client, so the hint path needs one. Every query resolves empty: the
       // named studio does not exist.
       const emptyChain: Record<string, unknown> = {};
-      for (const m of ['select', 'eq', 'not', 'is', 'neq', 'in', 'order', 'limit']) {
+      for (const m of ['select', 'eq', 'or', 'not', 'is', 'neq', 'in', 'order', 'limit']) {
         emptyChain[m] = vi.fn().mockReturnValue(emptyChain);
       }
       emptyChain.maybeSingle = vi.fn().mockResolvedValue({ data: null, error: null });
@@ -2215,7 +2216,7 @@ describe('SessionService', () => {
       vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(stray('stray-general'));
 
       const emptyChain: Record<string, unknown> = {};
-      for (const m of ['select', 'eq', 'not', 'is', 'neq', 'in', 'order', 'limit']) {
+      for (const m of ['select', 'eq', 'or', 'not', 'is', 'neq', 'in', 'order', 'limit']) {
         emptyChain[m] = vi.fn().mockReturnValue(emptyChain);
       }
       emptyChain.maybeSingle = vi.fn().mockResolvedValue({ data: null, error: null });
@@ -2260,7 +2261,7 @@ describe('SessionService', () => {
       vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(existing);
 
       const emptyChain: Record<string, unknown> = {};
-      for (const m of ['select', 'eq', 'not', 'is', 'neq', 'in', 'order', 'limit']) {
+      for (const m of ['select', 'eq', 'or', 'not', 'is', 'neq', 'in', 'order', 'limit']) {
         emptyChain[m] = vi.fn().mockReturnValue(emptyChain);
       }
       emptyChain.maybeSingle = vi.fn().mockResolvedValue({ data: null, error: null });
@@ -3230,6 +3231,25 @@ describe('SessionService', () => {
       );
     }
 
+    /** A registry template row, shaped like the shipped seed rows. */
+    function threadKeyTemplate(
+      type: string,
+      writeIntent: 'write' | 'presence',
+      studioPolicy: 'provision' | 'reuse-only'
+    ) {
+      const now = new Date().toISOString();
+      return {
+        id: `tkt-${type}`,
+        user_id: null,
+        type,
+        write_intent: writeIntent,
+        studio_policy: studioPolicy,
+        description: null,
+        created_at: now,
+        updated_at: now,
+      };
+    }
+
     it('refuses to route a threaded message with no pattern, project, or caller repo', async () => {
       const mockSupabase = {
         from: vi.fn().mockImplementation(() => createRecordingChain({ data: null }, [])),
@@ -3272,6 +3292,19 @@ describe('SessionService', () => {
           const calls: RecordedCall[] = [];
           if (table === 'agent_identities') {
             return createFilterAwareChain(() => ({ data: [{ id: 'sb-wren' }] }), calls);
+          }
+          // Since the studio_policy wiring, overflow is only attempted for
+          // provision-typed threads — an unreadable type falls to reuse-only
+          // and holds BEFORE the provisioning seam this test targets. Declare
+          // the thread as a real `pr` (provision) so the seam is reached.
+          if (table === 'inbox_threads') {
+            return createFilterAwareChain(() => ({ data: { key_type: 'pr' } }), calls);
+          }
+          if (table === 'thread_key_types') {
+            return createFilterAwareChain(
+              () => ({ data: [threadKeyTemplate('pr', 'write', 'provision')] }),
+              calls
+            );
           }
           if (table === 'studios') {
             return createFilterAwareChain((c) => {
@@ -3344,6 +3377,537 @@ describe('SessionService', () => {
       overflowSpy.mockRestore();
     });
 
+    /*
+     * studio_policy wiring — the registry column that existed as data with
+     * zero consumers. reuse-only threads (discussions) hold when their studio
+     * is occupied; they never get a worktree provisioned for them. provision
+     * threads (pr/branch/task) keep the overflow ladder — parallel review is
+     * wanted, orphaned discussion worktrees are not.
+     */
+    function occupiedStudioSupabase(opts: {
+      keyType: string | { error: string };
+      template?: ReturnType<typeof threadKeyTemplate>;
+      routePattern: string;
+    }) {
+      const now = new Date().toISOString();
+      return {
+        from: vi.fn().mockImplementation((table: string) => {
+          const calls: RecordedCall[] = [];
+          if (table === 'agent_identities') {
+            return createFilterAwareChain(() => ({ data: [{ id: 'sb-wren' }] }), calls);
+          }
+          if (table === 'inbox_threads') {
+            return createFilterAwareChain(
+              () =>
+                typeof opts.keyType === 'string'
+                  ? { data: { key_type: opts.keyType } }
+                  : { data: null, error: { message: opts.keyType.error } },
+              calls
+            );
+          }
+          if (table === 'thread_key_types') {
+            return createFilterAwareChain(
+              () => ({ data: opts.template ? [opts.template] : [] }),
+              calls
+            );
+          }
+          if (table === 'studios') {
+            return createFilterAwareChain((c) => {
+              const selected = c.find((call) => call.method === 'select');
+              const selectArg = String(selected?.args[0] ?? '');
+              if (selectArg.includes('lease')) {
+                return {
+                  data: {
+                    lease: {
+                      threadKey: 'pr:other',
+                      sessionId: 'holder-session',
+                      acquiredAt: now,
+                      heartbeatAt: now,
+                    },
+                    worktree_path: '/repos/inkwell--wren',
+                    ephemeral: false,
+                    status: 'active',
+                  },
+                };
+              }
+              // The parent row divertToOverflow resolves before provisioning.
+              // Present in EVERY variant so "overflow not attempted" fails the
+              // moment the policy gate is removed, rather than passing because
+              // the parent lookup starved.
+              if (selectArg === '*') {
+                return {
+                  data: {
+                    id: 'studio-A',
+                    user_id: 'user-456',
+                    agent_id: 'wren',
+                    sb_id: 'sb-wren',
+                    repo_root: '/repos/inkwell',
+                    worktree_path: '/repos/inkwell--wren',
+                    branch: 'wren/studio/wren',
+                    base_branch: 'main',
+                    status: 'active',
+                    ephemeral: false,
+                    metadata: {},
+                    created_at: now,
+                    updated_at: now,
+                  },
+                };
+              }
+              const isPatternQuery = c.some(
+                (call) => call.method === 'not' && call.args[0] === 'route_patterns'
+              );
+              return isPatternQuery
+                ? { data: [{ id: 'studio-A', route_patterns: [opts.routePattern] }] }
+                : { data: null };
+            }, calls);
+          }
+          return createRecordingChain({ data: null }, calls);
+        }),
+      };
+    }
+
+    it('reuse-only thread holds when its studio is occupied — overflow is never attempted', async () => {
+      const overflowSpy = vi
+        .spyOn(StudioOverflowService.prototype, 'ensureOverflowStudio')
+        .mockResolvedValue(null);
+
+      // `issue` is the seed's write + reuse-only combination: the occupancy
+      // gate engages (write), and the policy must stop the divert.
+      const service = serviceWith(
+        occupiedStudioSupabase({
+          keyType: 'issue',
+          template: threadKeyTemplate('issue', 'write', 'reuse-only'),
+          routePattern: 'issue:*',
+        })
+      );
+
+      await expect(
+        service.getOrCreateSession('user-456', 'wren', { threadKey: 'issue:42' })
+      ).rejects.toMatchObject({
+        code: 'ROUTING_REFUSED',
+        // policy travels with the hold so it reads as the policy deciding,
+        // not as an overflow failure someone should go fix (r1 P2).
+        detail: { reason: 'occupied', policy: 'reuse-only' },
+      });
+
+      expect(overflowSpy).not.toHaveBeenCalled();
+      expect(mockRepository.create).not.toHaveBeenCalled();
+      overflowSpy.mockRestore();
+    });
+
+    it('an unreadable thread type fails toward reuse-only, never toward provisioning', async () => {
+      const overflowSpy = vi
+        .spyOn(StudioOverflowService.prototype, 'ensureOverflowStudio')
+        .mockResolvedValue(null);
+
+      // Even a provision-looking key: when the type cannot be read, a held
+      // message is recoverable; a worktree built off a failed lookup is the
+      // waste the policy exists to stop.
+      const service = serviceWith(
+        occupiedStudioSupabase({
+          keyType: { error: 'transient lookup failure' },
+          routePattern: 'pr:*',
+        })
+      );
+
+      await expect(
+        service.getOrCreateSession('user-456', 'wren', { threadKey: 'pr:77' })
+      ).rejects.toMatchObject({
+        code: 'ROUTING_REFUSED',
+        detail: { reason: 'occupied' },
+      });
+
+      expect(overflowSpy).not.toHaveBeenCalled();
+      expect(mockRepository.create).not.toHaveBeenCalled();
+      overflowSpy.mockRestore();
+    });
+
+    it('acquire-time conflict on a reuse-only thread holds — the second overflow entry point is gated too', async () => {
+      /*
+       * gateOccupancy sees an unoccupied studio; the lease is then taken by
+       * someone else before acquire (the TOCTOU window withStudioLease's
+       * divert exists for). A provision thread diverts to overflow there; a
+       * reuse-only thread must hold instead.
+       */
+      const overflowSpy = vi
+        .spyOn(StudioOverflowService.prototype, 'ensureOverflowStudio')
+        .mockResolvedValue(null);
+      const getLeaseSpy = vi
+        .spyOn(StudioLeaseService.prototype, 'getLease')
+        .mockResolvedValue({ lease: null } as never);
+      const acquireSpy = vi.spyOn(StudioLeaseService.prototype, 'acquire').mockResolvedValue({
+        acquired: false,
+        holder: {
+          threadKey: 'pr:other',
+          sessionId: 'holder-session',
+          acquiredAt: new Date().toISOString(),
+          heartbeatAt: new Date().toISOString(),
+        } as never,
+      });
+      const logEventSpy = vi
+        .spyOn(StudioLeaseService.prototype, 'logEvent')
+        .mockResolvedValue(undefined);
+
+      (mockRepository as { findByThreadKey?: unknown }).findByThreadKey = vi
+        .fn()
+        .mockResolvedValue(createMockSession({ id: 'thread-session', studioId: 'studio-A' }));
+
+      const service = serviceWith(
+        occupiedStudioSupabase({
+          keyType: 'issue',
+          template: threadKeyTemplate('issue', 'write', 'reuse-only'),
+          routePattern: 'issue:*',
+        })
+      );
+
+      const rejection = await service
+        .getOrCreateSession('user-456', 'wren', { threadKey: 'issue:43' })
+        .then(
+          () => null,
+          (err: Error & { detail?: Record<string, unknown> }) => err
+        );
+      expect(rejection).toMatchObject({
+        code: 'ROUTING_REFUSED',
+        detail: { reason: 'occupied', policy: 'reuse-only' },
+      });
+      // The hold explains ITSELF as a policy decision — not as an overflow
+      // provisioning failure to go hunt for in the logs (r1 P2).
+      expect(rejection?.message).toContain('reuse-only');
+      expect(rejection?.message).not.toContain('overflow');
+
+      expect(acquireSpy).toHaveBeenCalled();
+      expect(overflowSpy).not.toHaveBeenCalled();
+
+      delete (mockRepository as { findByThreadKey?: unknown }).findByThreadKey;
+      overflowSpy.mockRestore();
+      getLeaseSpy.mockRestore();
+      acquireSpy.mockRestore();
+      logEventSpy.mockRestore();
+    });
+
+    it('acquire-time conflict on a provision thread still diverts to overflow', async () => {
+      // The counterpart: parallel PR review is wanted. Removing the policy
+      // gate must break the reuse-only tests; widening it must break this one.
+      const overflowSpy = vi
+        .spyOn(StudioOverflowService.prototype, 'ensureOverflowStudio')
+        .mockResolvedValue(null);
+      const getLeaseSpy = vi
+        .spyOn(StudioLeaseService.prototype, 'getLease')
+        .mockResolvedValue({ lease: null } as never);
+      const acquireSpy = vi.spyOn(StudioLeaseService.prototype, 'acquire').mockResolvedValue({
+        acquired: false,
+        holder: {
+          threadKey: 'pr:other',
+          sessionId: 'holder-session',
+          acquiredAt: new Date().toISOString(),
+          heartbeatAt: new Date().toISOString(),
+        } as never,
+      });
+      const logEventSpy = vi
+        .spyOn(StudioLeaseService.prototype, 'logEvent')
+        .mockResolvedValue(undefined);
+
+      (mockRepository as { findByThreadKey?: unknown }).findByThreadKey = vi
+        .fn()
+        .mockResolvedValue(createMockSession({ id: 'thread-session', studioId: 'studio-A' }));
+
+      const service = serviceWith(
+        occupiedStudioSupabase({
+          keyType: 'pr',
+          template: threadKeyTemplate('pr', 'write', 'provision'),
+          routePattern: 'pr:*',
+        })
+      );
+
+      // Overflow provisioning fails (spy returns null), so the verified
+      // conflict still ends in a hold — but the attempt itself is the claim.
+      await expect(
+        service.getOrCreateSession('user-456', 'wren', { threadKey: 'pr:3200' })
+      ).rejects.toMatchObject({
+        code: 'ROUTING_REFUSED',
+        detail: { reason: 'occupied' },
+      });
+
+      expect(overflowSpy).toHaveBeenCalled();
+
+      delete (mockRepository as { findByThreadKey?: unknown }).findByThreadKey;
+      overflowSpy.mockRestore();
+      getLeaseSpy.mockRestore();
+      acquireSpy.mockRestore();
+      logEventSpy.mockRestore();
+    });
+
+    it('holder-null on a reuse-only thread clears the binding — and says so, not "holding"', async () => {
+      /*
+       * r2 P2: acquire() returns holder: null for missing/retired/foreign/
+       * unverifiable studios. That branch does NOT hold — it clears the
+       * session's studio binding — so the diagnostics must not claim a hold,
+       * and must not blame overflow when policy skipped the attempt.
+       */
+      const { logger: mockedLogger } = await import('../../utils/logger.js');
+      vi.mocked(mockedLogger.warn).mockClear();
+      vi.mocked(mockedLogger.error).mockClear();
+
+      const overflowSpy = vi
+        .spyOn(StudioOverflowService.prototype, 'ensureOverflowStudio')
+        .mockResolvedValue(null);
+      const getLeaseSpy = vi
+        .spyOn(StudioLeaseService.prototype, 'getLease')
+        .mockResolvedValue({ lease: null } as never);
+      const acquireSpy = vi
+        .spyOn(StudioLeaseService.prototype, 'acquire')
+        .mockResolvedValue({ acquired: false, holder: null });
+      const logEventSpy = vi
+        .spyOn(StudioLeaseService.prototype, 'logEvent')
+        .mockResolvedValue(undefined);
+
+      (mockRepository as { findByThreadKey?: unknown }).findByThreadKey = vi
+        .fn()
+        .mockResolvedValue(createMockSession({ id: 'thread-session', studioId: 'studio-A' }));
+
+      const service = serviceWith(
+        occupiedStudioSupabase({
+          keyType: 'issue',
+          template: threadKeyTemplate('issue', 'write', 'reuse-only'),
+          routePattern: 'issue:*',
+        })
+      );
+
+      // No hold: the session comes back with its binding cleared.
+      await service.getOrCreateSession('user-456', 'wren', { threadKey: 'issue:45' });
+      expect(mockRepository.update).toHaveBeenCalledWith('thread-session', { studioId: null });
+      expect(overflowSpy).not.toHaveBeenCalled();
+
+      // Every [StudioLease] diagnostic on this path tells the truth: no
+      // claim of holding, no claim about overflow.
+      const leaseMessages = [
+        ...vi.mocked(mockedLogger.warn).mock.calls,
+        ...vi.mocked(mockedLogger.error).mock.calls,
+      ]
+        .map((args) => String(args[0]))
+        .filter((msg) => msg.includes('[StudioLease]'));
+      expect(leaseMessages.length).toBeGreaterThan(0);
+      for (const msg of leaseMessages) {
+        expect(msg).not.toContain('holding');
+        expect(msg).not.toContain('overflow');
+      }
+
+      delete (mockRepository as { findByThreadKey?: unknown }).findByThreadKey;
+      overflowSpy.mockRestore();
+      getLeaseSpy.mockRestore();
+      acquireSpy.mockRestore();
+      logEventSpy.mockRestore();
+    });
+
+    /**
+     * The THIRD worktree-creating path (r1 P1): deferred D1 parent creation.
+     * The caller repo resolves but the agent has no studio for it at all —
+     * for a provision thread the create boundary builds the D1 parent; for a
+     * reuse-only thread it must hold instead. Durable vs ephemeral makes no
+     * difference: it is still an automatic worktree for a discussion.
+     */
+    function callerRepoNoStudioSupabase(opts: {
+      keyType: string;
+      template: ReturnType<typeof threadKeyTemplate>;
+    }) {
+      const has = (calls: RecordedCall[], col: string, val?: unknown) =>
+        calls.some(
+          (c) => c.method === 'eq' && c.args[0] === col && (val === undefined || c.args[1] === val)
+        );
+      return {
+        from: vi.fn().mockImplementation((table: string) => {
+          const calls: RecordedCall[] = [];
+          if (table === 'sessions') {
+            return createFilterAwareChain(
+              (c) =>
+                has(c, 'id', 'sender-session-1')
+                  ? { data: { studio_id: 'sender-studio-1' } }
+                  : { data: null },
+              calls
+            );
+          }
+          if (table === 'agent_identities') {
+            return createFilterAwareChain(() => ({ data: [{ id: 'sb-wren' }] }), calls);
+          }
+          if (table === 'inbox_threads') {
+            return createFilterAwareChain(() => ({ data: { key_type: opts.keyType } }), calls);
+          }
+          if (table === 'thread_key_types') {
+            return createFilterAwareChain(() => ({ data: [opts.template] }), calls);
+          }
+          if (table === 'studios') {
+            return createFilterAwareChain((c) => {
+              // Sender-studio lookup hands back the repo; every other studio
+              // lookup misses — the agent has NO studio for this repo.
+              if (has(c, 'id', 'sender-studio-1')) {
+                return { data: { repo_root: '/repos/inkwell' } };
+              }
+              return { data: null };
+            }, calls);
+          }
+          return createRecordingChain({ data: null }, calls);
+        }),
+      };
+    }
+
+    it('reuse-only thread with no studio for its repo holds — the D1 parent is not auto-created', async () => {
+      const parentSpy = vi
+        .spyOn(StudioOverflowService.prototype, 'ensureParentStudio')
+        .mockResolvedValue(null as never);
+
+      const service = serviceWith(
+        callerRepoNoStudioSupabase({
+          keyType: 'issue',
+          template: threadKeyTemplate('issue', 'write', 'reuse-only'),
+        })
+      );
+
+      const rejection = await service
+        .getOrCreateSession('user-456', 'wren', {
+          threadKey: 'issue:44',
+          callerStudioId: 'sender-studio-1',
+          callerSessionId: 'sender-session-1',
+        })
+        .then(
+          () => null,
+          (err: Error & { detail?: Record<string, unknown> }) => err
+        );
+
+      expect(rejection).toMatchObject({
+        code: 'ROUTING_REFUSED',
+        detail: {
+          reason: 'no-route',
+          policy: 'reuse-only',
+          callerRepoRoot: '/repos/inkwell',
+        },
+      });
+      expect(rejection?.message).toContain('reuse-only');
+
+      expect(parentSpy).not.toHaveBeenCalled();
+      expect(mockRepository.create).not.toHaveBeenCalled();
+      parentSpy.mockRestore();
+    });
+
+    it('provision thread with no studio for its repo still auto-creates the D1 parent', async () => {
+      const parentSpy = vi
+        .spyOn(StudioOverflowService.prototype, 'ensureParentStudio')
+        .mockResolvedValue(null as never);
+      // getLease is consulted by gateOccupancy if creation succeeded; with
+      // the spy returning null, creation FAILS and the no-route hold fires —
+      // the attempt itself is the claim, mirroring the overflow tests.
+      const service = serviceWith(
+        callerRepoNoStudioSupabase({
+          keyType: 'pr',
+          template: threadKeyTemplate('pr', 'write', 'provision'),
+        })
+      );
+
+      await expect(
+        service.getOrCreateSession('user-456', 'wren', {
+          threadKey: 'pr:3300',
+          callerStudioId: 'sender-studio-1',
+          callerSessionId: 'sender-session-1',
+        })
+      ).rejects.toMatchObject({
+        code: 'ROUTING_REFUSED',
+        detail: { reason: 'no-route' },
+      });
+
+      expect(parentSpy).toHaveBeenCalled();
+      parentSpy.mockRestore();
+    });
+
+    it('PRODUCTION ORDER: presence intent bypasses the occupancy gate inside routing (r3 P0-1)', async () => {
+      /*
+       * Through the PUBLIC API, not private methods — the round-3 finding was
+       * precisely that the private-method tests missed the production order
+       * (intent resolved after resolveStudioId had already gated occupancy).
+       *
+       * Setup: a route-pattern studio LEASED by another thread, and a thread
+       * whose stored key_type resolves to presence via a registry OVERRIDE
+       * row (data, not mocks). If intent were still resolved late, the gate
+       * would see the fresh foreign lease and divert to overflow; with
+       * intent-first, the presence session binds to the leased studio
+       * WITHOUT acquiring and WITHOUT overflow.
+       */
+      const now = new Date().toISOString();
+      const studioCallLogs: RecordedCall[][] = [];
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          const calls: RecordedCall[] = [];
+          if (table === 'inbox_threads') {
+            return createFilterAwareChain(() => ({ data: { key_type: 'spec' } }), calls);
+          }
+          if (table === 'thread_key_types') {
+            // A presence override row for 'spec' — the DATA that makes this
+            // thread presence-typed (until 6e no TEMPLATE is presence, so an
+            // override row is the honest way to express it).
+            return createFilterAwareChain(
+              () => ({
+                data: [
+                  {
+                    id: 'o1',
+                    user_id: 'user-456',
+                    type: 'spec',
+                    write_intent: 'presence',
+                    studio_policy: 'reuse-only',
+                    description: null,
+                    created_at: now,
+                    updated_at: now,
+                  },
+                ],
+              }),
+              calls
+            );
+          }
+          if (table === 'agent_identities') {
+            return createFilterAwareChain(() => ({ data: [{ id: 'sb-wren' }] }), calls);
+          }
+          if (table === 'studios') {
+            const studioCalls: RecordedCall[] = [];
+            studioCallLogs.push(studioCalls);
+            return createFilterAwareChain((c) => {
+              const selected = c.find((call) => call.method === 'select');
+              const selectArg = String(selected?.args[0] ?? '');
+              // Occupancy read: a FRESH lease held by a DIFFERENT thread.
+              if (selectArg.includes('lease')) {
+                return {
+                  data: {
+                    lease: {
+                      threadKey: 'pr:other',
+                      sessionId: 'holder-session',
+                      acquiredAt: now,
+                      heartbeatAt: now,
+                    },
+                    worktree_path: '/repos/inkwell--wren',
+                    ephemeral: false,
+                    status: 'active',
+                  },
+                };
+              }
+              const isPatternQuery = c.some(
+                (call) => call.method === 'not' && call.args[0] === 'route_patterns'
+              );
+              return isPatternQuery
+                ? { data: [{ id: 'studio-A', route_patterns: ['spec:*'] }] }
+                : { data: null };
+            }, studioCalls);
+          }
+          return createRecordingChain({ data: null }, calls);
+        }),
+      };
+      const service = serviceWith(mockSupabase);
+
+      await service.getOrCreateSession('user-456', 'wren', { threadKey: 'spec:design-x' });
+
+      // Bound to the LEASED studio — occupancy was bypassed, not diverted.
+      expect(mockRepository.create).toHaveBeenCalledWith(
+        expect.objectContaining({ studioId: 'studio-A' })
+      );
+      // And NOTHING wrote a lease: no studios UPDATE ran at all.
+      expect(studioCallLogs.flat().some((c) => c.method === 'update')).toBe(false);
+    });
+
     it('does NOT refuse unthreaded work — heartbeats keep degrading to the default cwd', async () => {
       const mockSupabase = {
         from: vi.fn().mockImplementation(() => createRecordingChain({ data: null }, [])),
@@ -3401,7 +3965,7 @@ describe('SessionService', () => {
       record: RecordedCall[]
     ) {
       const chain: Record<string, unknown> = {};
-      for (const m of ['select', 'eq', 'not', 'is', 'neq', 'in', 'order', 'limit']) {
+      for (const m of ['select', 'eq', 'or', 'not', 'is', 'neq', 'in', 'order', 'limit']) {
         chain[m] = vi.fn().mockImplementation((...args: unknown[]) => {
           record.push({ method: m, args });
           return chain;

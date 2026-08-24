@@ -9,7 +9,7 @@
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js';
-import type { Database } from '../supabase/types';
+import type { Database, Json } from '../supabase/types';
 
 export type TaskGroupStatus = 'active' | 'paused' | 'completed' | 'cancelled';
 export type TaskGroupPriority = 'low' | 'normal' | 'high' | 'urgent';
@@ -49,6 +49,9 @@ export interface TaskGroup {
   strategy_started_at: string | null;
   strategy_paused_at: string | null;
   execution_phase: ExecutionPhase;
+  // Workflow graph (spec v10): which executor owns this group's dependencies
+  execution_model: 'linear' | 'graph';
+  graph_version: number;
   group_number: number;
   slug: string | null;
   outcome: string | null;
@@ -385,5 +388,249 @@ export class TaskGroupsRepository {
       else if (row.status === 'blocked') bucket.blocked += 1;
     }
     return counts;
+  }
+
+  // ── Workflow graph (spec: ink://specs/workflow-graph v10, step 1) ──────
+  //
+  // Both mutations run through SECURITY DEFINER RPCs that lock the group row
+  // before reading, CAS graph_version, validate the complete desired graph,
+  // and append a task_graph_revisions record — one transaction each. The
+  // RPCs return structured refusals ({success:false, reason}) rather than
+  // throwing for expected conflicts; transport errors still throw.
+
+  /**
+   * Replace the group's edge set with the complete desired graph.
+   * Exactly one of actorIdentityId / actorUserId / systemActor must be set.
+   */
+  async applyTaskGraph(params: {
+    userId: string;
+    taskGroupId: string;
+    expectedVersion: number;
+    edges: Array<{ from: string; to: string }>;
+    actorIdentityId?: string;
+    actorUserId?: string;
+    systemActor?: boolean;
+    /** Emitting preset/template id ("constructor" in the schema — renamed
+     *  here because a `constructor` object key trips TS structural checks). */
+    constructorId?: string;
+    constructorVersion?: string;
+    configHash?: string;
+  }): Promise<Record<string, unknown>> {
+    const { data, error } = await this.client.rpc('apply_task_graph', {
+      p_user_id: params.userId,
+      p_task_group_id: params.taskGroupId,
+      p_expected_version: params.expectedVersion,
+      p_edges: params.edges,
+      p_actor_identity_id: params.actorIdentityId ?? null,
+      p_actor_user_id: params.actorUserId ?? null,
+      p_system_actor: params.systemActor ?? false,
+      p_constructor: params.constructorId ?? null,
+      p_constructor_version: params.constructorVersion ?? null,
+      p_config_hash: params.configHash ?? null,
+    });
+    if (error) throw new Error(`apply_task_graph failed: ${error.message}`);
+    return data as Record<string, unknown>;
+  }
+
+  /**
+   * Validated linear → graph conversion. Preflight failures come back as
+   * {success:false, reason:'preflight-failed', invalid:[...]} and leave the
+   * group linear with its blocked_by arrays intact.
+   */
+  async convertToGraph(params: {
+    userId: string;
+    taskGroupId: string;
+    expectedVersion: number;
+    actorIdentityId?: string;
+    actorUserId?: string;
+    systemActor?: boolean;
+  }): Promise<Record<string, unknown>> {
+    const { data, error } = await this.client.rpc('convert_task_group_to_graph', {
+      p_user_id: params.userId,
+      p_task_group_id: params.taskGroupId,
+      p_expected_version: params.expectedVersion,
+      p_actor_identity_id: params.actorIdentityId ?? null,
+      p_actor_user_id: params.actorUserId ?? null,
+      p_system_actor: params.systemActor ?? false,
+    });
+    if (error) throw new Error(`convert_task_group_to_graph failed: ${error.message}`);
+    return data as Record<string, unknown>;
+  }
+
+  // ── Workflow graph executor (spec v10, steps 2-3) ──────────────────────
+  //
+  // Same posture as the mutation RPCs: SECURITY DEFINER, task row locked
+  // FOR UPDATE + group FOR SHARE, structured refusals for expected
+  // conflicts, downstream transitions inside the source transaction.
+  // Every mutating RPC returns an `evaluation` (the readiness report) so
+  // the caller can dispatch newly-ready nodes post-commit.
+
+  /**
+   * Claim a ready node for a session. Returns {success, claimToken} or a
+   * structured refusal (not-ready / already-claimed / gate-not-open /
+   * approval-gate / group-not-active / not-graph-mode).
+   */
+  async claimGraphTask(params: {
+    userId: string;
+    taskId: string;
+    sessionId: string;
+  }): Promise<Record<string, unknown>> {
+    const { data, error } = await this.client.rpc('claim_graph_task', {
+      p_user_id: params.userId,
+      p_task_id: params.taskId,
+      p_session_id: params.sessionId,
+    });
+    if (error) throw new Error(`claim_graph_task failed: ${error.message}`);
+    return data as Record<string, unknown>;
+  }
+
+  /**
+   * Release (holder, voluntary) or reclaim (sweep, after the app's
+   * fail-closed liveness check) a claim. Both CAS on the token.
+   */
+  async releaseGraphClaim(params: {
+    userId: string;
+    taskId: string;
+    claimToken: string;
+    sessionId?: string;
+    reclaim?: boolean;
+    reason?: string;
+  }): Promise<Record<string, unknown>> {
+    const { data, error } = await this.client.rpc('release_graph_claim', {
+      p_user_id: params.userId,
+      p_task_id: params.taskId,
+      p_claim_token: params.claimToken,
+      p_session_id: params.sessionId ?? null,
+      p_reclaim: params.reclaim ?? false,
+      p_reason: params.reason ?? null,
+    });
+    if (error) throw new Error(`release_graph_claim failed: ${error.message}`);
+    return data as Record<string, unknown>;
+  }
+
+  /**
+   * Complete a graph-mode WORK node — claim-token-gated, the only terminal
+   * path. Verification nodes refuse ('verification-node'); verdicts go
+   * through recordGateVerdict.
+   */
+  async completeGraphTask(params: {
+    userId: string;
+    taskId: string;
+    sessionId: string;
+    claimToken: string;
+    outcome: 'completed' | 'failed' | 'skipped';
+    reason?: string;
+  }): Promise<Record<string, unknown>> {
+    const { data, error } = await this.client.rpc('complete_graph_task', {
+      p_user_id: params.userId,
+      p_task_id: params.taskId,
+      p_session_id: params.sessionId,
+      p_claim_token: params.claimToken,
+      p_outcome: params.outcome,
+      p_reason: params.reason ?? null,
+    });
+    if (error) throw new Error(`complete_graph_task failed: ${error.message}`);
+    return data as Record<string, unknown>;
+  }
+
+  /**
+   * Record a gate verdict. Attempt + gate_version CAS; authority is the
+   * claim holder (session + token) for claimed gates, the assignee
+   * otherwise. Evidence required to pass, reason required to fail.
+   */
+  async recordGateVerdict(params: {
+    userId: string;
+    taskId: string;
+    verdict: 'passed' | 'failed';
+    expectedAttempt: number;
+    expectedGateVersion: number;
+    actorIdentityId?: string;
+    actorUserId?: string;
+    sessionId?: string;
+    claimToken?: string;
+    evidence?: Record<string, unknown>;
+    reason?: string;
+  }): Promise<Record<string, unknown>> {
+    const { data, error } = await this.client.rpc('record_gate_verdict', {
+      p_user_id: params.userId,
+      p_task_id: params.taskId,
+      p_verdict: params.verdict,
+      p_expected_attempt: params.expectedAttempt,
+      p_expected_gate_version: params.expectedGateVersion,
+      p_actor_identity_id: params.actorIdentityId ?? null,
+      p_actor_user_id: params.actorUserId ?? null,
+      p_session_id: params.sessionId ?? null,
+      p_claim_token: params.claimToken ?? null,
+      p_evidence: (params.evidence ?? null) as Json,
+      p_reason: params.reason ?? null,
+    });
+    if (error) throw new Error(`record_gate_verdict failed: ${error.message}`);
+    return data as Record<string, unknown>;
+  }
+
+  /** Retry a failed gate: new attempt, fresh dwell window, same node. */
+  async retryGate(params: {
+    userId: string;
+    taskId: string;
+    expectedAttempt: number;
+    actorIdentityId?: string;
+    actorUserId?: string;
+    reason?: string;
+  }): Promise<Record<string, unknown>> {
+    const { data, error } = await this.client.rpc('retry_gate', {
+      p_user_id: params.userId,
+      p_task_id: params.taskId,
+      p_expected_attempt: params.expectedAttempt,
+      p_actor_identity_id: params.actorIdentityId ?? null,
+      p_actor_user_id: params.actorUserId ?? null,
+      p_reason: params.reason ?? null,
+    });
+    if (error) throw new Error(`retry_gate failed: ${error.message}`);
+    return data as Record<string, unknown>;
+  }
+
+  /**
+   * Reconciliation sweep for one active graph group: re-runs the same
+   * readiness evaluator (recovering lost dispatches, opening dwelling
+   * gates) and reports live claims for the app's liveness check.
+   */
+  async sweepTaskGraph(params: {
+    userId: string;
+    taskGroupId: string;
+  }): Promise<Record<string, unknown>> {
+    const { data, error } = await this.client.rpc('sweep_task_graph', {
+      p_user_id: params.userId,
+      p_task_group_id: params.taskGroupId,
+    });
+    if (error) throw new Error(`sweep_task_graph failed: ${error.message}`);
+    return data as Record<string, unknown>;
+  }
+
+  /** Active graph-mode groups — the sweep's work list. */
+  async listActiveGraphGroups(): Promise<Array<{ id: string; user_id: string; title: string }>> {
+    const { data, error } = await this.client
+      .from('task_groups')
+      .select('id, user_id, title')
+      .eq('execution_model', 'graph')
+      .eq('status', 'active');
+    if (error) throw new Error(`Failed to list active graph groups: ${error.message}`);
+    return (data ?? []) as Array<{ id: string; user_id: string; title: string }>;
+  }
+
+  /** The group's stored edge set (graph-mode groups only have one). */
+  async getEdges(taskGroupId: string): Promise<Array<{ from_task: string; to_task: string }>> {
+    const { data: tasks, error: tasksError } = await this.client
+      .from('tasks')
+      .select('id')
+      .eq('task_group_id', taskGroupId);
+    if (tasksError) throw new Error(`Failed to list group tasks: ${tasksError.message}`);
+    const ids = (tasks ?? []).map((t) => t.id);
+    if (ids.length === 0) return [];
+    const { data, error } = await this.client
+      .from('task_edges')
+      .select('from_task, to_task')
+      .in('to_task', ids);
+    if (error) throw new Error(`Failed to read task edges: ${error.message}`);
+    return data ?? [];
   }
 }
