@@ -52,7 +52,7 @@ const TERMINAL_LIFECYCLES = '(completed,failed)';
  * `listSessionsSchema` — this is a filter over derived current state, not a
  * read of the deprecated `sessions.status` column.
  */
-export type SessionStatusFilter = 'active' | 'paused' | 'resumable' | 'completed';
+export type SessionStatusFilter = 'active' | 'paused' | 'resumable' | 'completed' | 'attachable';
 
 export interface KnowledgeMemoryContext {
   threadKey?: string;
@@ -1907,6 +1907,33 @@ export class MemoryRepository {
       // property, so the two agree either way.
       if (options.status === 'completed') {
         query = query.or(`ended_at.not.is.null,lifecycle.in.${TERMINAL_LIFECYCLES}`);
+      } else if (options.status === 'attachable') {
+        // 'attachable' is 'active' minus the crash exclusion: a session whose
+        // backend died (lifecycle 'failed') is exactly the one its agent
+        // resumes next, so pickers must still see it. 'active' cannot serve
+        // this — it groups 'failed' with 'completed', which is right for
+        // trigger routing and wrong for attach.
+        query = query.is('ended_at', null).neq('lifecycle', 'completed');
+
+        // The agent-declared terminal markers belong here too, not just in
+        // the client predicate. `update_session_state({ phase: 'complete' })`
+        // writes current_phase alone — no ended_at, no lifecycle change — so
+        // a filter that stops at the authoritative columns hands back rows
+        // the caller is about to discard, and `range()` has already spent the
+        // page on them. That is the same limit-before-filter defect as
+        // filtering entirely client-side, one column further in.
+        //
+        // Each exclusion is paired with an explicit NULL allowance: a session
+        // that never declared a phase is attachable, but SQL's `col <> x`
+        // over NULL yields NULL and would drop it. `ilike` rather than `like`
+        // to match the client predicate's lowercasing; the client also trims,
+        // which SQL does not, so a phase stored with surrounding whitespace
+        // still relies on the backstop.
+        query = query
+          .or('current_phase.is.null,current_phase.not.ilike.complete')
+          .or('current_phase.is.null,current_phase.not.ilike.complete:*')
+          .or('status.is.null,status.not.ilike.completed')
+          .or('status.is.null,status.not.ilike.completed:*');
       } else {
         query = query.is('ended_at', null).not('lifecycle', 'in', TERMINAL_LIFECYCLES);
         // 'paused' and 'resumable' are agent-declared intent with no

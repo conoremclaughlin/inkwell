@@ -693,10 +693,10 @@ export const listSessionsSchema = userIdentifierBaseSchema.extend({
   // on the session's derived current state, not on the deprecated
   // `sessions.status` column, which no terminal path keeps in sync.
   status: z
-    .enum(['active', 'paused', 'resumable', 'completed'])
+    .enum(['active', 'paused', 'resumable', 'completed', 'attachable'])
     .optional()
     .describe(
-      "Filter by current state. 'active' = not finished, which includes sessions an agent marked paused or resumable; 'completed' = finished or failed; 'paused'/'resumable' = agent-declared, among unfinished sessions only."
+      "Filter by current state. 'active' = not finished, which includes sessions an agent marked paused or resumable, and excludes crashed ones; 'attachable' = 'active' plus crashed sessions (lifecycle 'failed'), which is what session pickers want since a crashed session is the one its agent resumes next; 'completed' = finished or failed; 'paused'/'resumable' = agent-declared, among unfinished sessions only."
     ),
   limit: z.number().min(1).max(100).optional().describe('Max results (default: 20)'),
 });
