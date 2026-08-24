@@ -160,8 +160,12 @@ export class InkRunner implements IRunner {
       fullMessage = `${contextBlock}\n\n---\n\n${message}`;
     }
 
+    // Demanded on every server-spawned turn, resumes included: each run is a
+    // brand-new `ink chat` process that bootstraps from scratch, so a resumed
+    // turn is exactly as exposed to a bootstrap failure as a fresh one.
+    // Healthy resumed prompts stay lean — fullMessage is untouched above.
     const args = this.buildArgs(sessionId, config, mediaAttachments, {
-      requireBootstrap: Boolean(injectedContext && !isResume),
+      requireBootstrap: true,
     });
 
     logger.info('Spawning ink chat (non-interactive)', {
@@ -184,10 +188,25 @@ export class InkRunner implements IRunner {
           pcpSessionId: config.pcpSessionId,
         });
 
-        if (injectedContext) {
-          const contextBlock = formatInjectedContext(injectedContext);
-          fullMessage = `${contextBlock}\n\n---\n\n${message}`;
+        if (!injectedContext) {
+          // Nothing to fall back to. Report the failure rather than respawn a
+          // child we already know will answer as a stranger.
+          logger.error('ink chat has no identity context and none to supply', {
+            sessionId,
+            pcpSessionId: config.pcpSessionId,
+          });
+          return {
+            success: false,
+            backendSessionId: sessionId,
+            responses: [],
+            error: 'ink chat could not load identity context and none was available to supply',
+          };
         }
+
+        // Sole delivery, so it carries soul too: this child has no
+        // appendSystemPrompt path and its own bootstrap just failed.
+        const contextBlock = formatInjectedContext(injectedContext, { includeSoul: true });
+        fullMessage = `${contextBlock}\n\n---\n\n${message}`;
 
         const fallbackArgs = this.buildArgs(sessionId, config, mediaAttachments, {
           requireBootstrap: false,
@@ -208,7 +227,7 @@ export class InkRunner implements IRunner {
         }
 
         const freshArgs = this.buildArgs(sessionId, config, mediaAttachments, {
-          requireBootstrap: Boolean(injectedContext),
+          requireBootstrap: true,
         });
         const retryResult = await this.spawnProcess(freshArgs, fullMessage, config);
         return {

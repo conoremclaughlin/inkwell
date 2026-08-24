@@ -1,5 +1,6 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
+  ClaudeRunner,
   parseClaudeUsage,
   parseAssistantContextTokens,
   parseModelUsage,
@@ -282,5 +283,75 @@ describe('createLineReader', () => {
     reader.flush();
 
     expect(lines).toEqual([]);
+  });
+});
+
+// ============================================================================
+// A resumed prompt must stay lean, even though the runner is handed context
+// ============================================================================
+
+describe('ClaudeRunner — resume does not re-inject context', () => {
+  const ctx = {
+    agent: {
+      agentId: 'wren',
+      name: 'Wren',
+      role: 'dev',
+      soul: 'SOUL-BODY',
+      values: [],
+      capabilities: [],
+      relationships: {},
+    },
+    user: { id: 'u1', timezone: 'UTC', contacts: {}, preferences: {} },
+    temporal: {
+      currentTime: '9:00 AM',
+      currentDate: 'Monday, August 24, 2026',
+      dayOfWeek: 'Monday',
+      timezone: 'UTC',
+      greeting: 'Good morning',
+    },
+    constitution: { values: 'VALUES-BODY', process: 'PROCESS-BODY', user: 'USER-BODY' },
+    knowledgeSummary: 'DIGEST-BODY',
+    recentMemories: [],
+    activeProjects: [],
+  } as never;
+
+  const cfg = {
+    workingDirectory: '/tmp',
+    mcpConfigPath: '/tmp/.mcp.json',
+    agentId: 'wren',
+  } as never;
+
+  it('injects on a fresh turn', async () => {
+    const runner = new ClaudeRunner();
+    let sent = '';
+    (runner as any).spawnProcess = vi.fn(async (_a: string[], message: string) => {
+      sent = message;
+      return { responses: [], toolCalls: [], finalTextResponse: 'ok' };
+    });
+
+    await runner.run('hello', { injectedContext: ctx, config: cfg } as never);
+
+    expect(sent).toContain('VALUES-BODY');
+  });
+
+  it('does not inject on resume, now that session-service passes context regardless', async () => {
+    // session-service hands over injectedContext on every turn so InkRunner can
+    // recover from a failed child bootstrap. That makes this guard the only
+    // thing keeping a resumed Claude prompt from re-sending the constitution.
+    const runner = new ClaudeRunner();
+    let sent = '';
+    (runner as any).spawnProcess = vi.fn(async (_a: string[], message: string) => {
+      sent = message;
+      return { responses: [], toolCalls: [], finalTextResponse: 'ok' };
+    });
+
+    await runner.run('hello', {
+      backendSessionId: 'existing-session',
+      injectedContext: ctx,
+      config: cfg,
+    } as never);
+
+    expect(sent).toBe('hello');
+    expect(sent).not.toContain('VALUES-BODY');
   });
 });

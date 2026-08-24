@@ -537,6 +537,16 @@ export interface FormatContextOptions {
    * block is the only delivery of the constitution.
    */
   childCallsBootstrap?: boolean;
+  /**
+   * Render soul into the block.
+   *
+   * Off by default because `buildIdentityPrompt` carries it in
+   * `appendSystemPrompt`, where it survives compaction and is re-sent on
+   * resume. Only a caller with no such path — InkRunner, whose child normally
+   * loads soul through its own bootstrap — needs this, and only when that path
+   * has failed and this block is soul's sole delivery.
+   */
+  includeSoul?: boolean;
 }
 
 export function formatInjectedContext(
@@ -554,6 +564,11 @@ export function formatInjectedContext(
 You are **${context.agent.name}** (agent ID: \`${context.agent.agentId}\`).
 Role: ${context.agent.role}
 ${context.agent.description ? `\n${context.agent.description}` : ''}`);
+
+  if (options.includeSoul && context.agent.soul) {
+    sections.push(`### Soul
+${context.agent.soul}`);
+  }
 
   // Constitution — the shared docs a session-start hook would otherwise load.
   // Antigravity has no such hook, so without these the agent gets no team

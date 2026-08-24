@@ -1481,7 +1481,12 @@ export class SessionService implements ISessionService {
     try {
       result = await runner.run(formattedMessage, {
         backendSessionId: session.backendSessionId || undefined,
-        injectedContext: session.backendSessionId ? undefined : injectedContext,
+        // Always handed over, including on resume. Every runner already gates
+        // its own injection on `!isResume`, so this does not change what a
+        // resumed prompt carries — but InkRunner spawns a fresh `ink chat`
+        // that re-bootstraps on every turn, and needs this copy on hand to
+        // recover when that bootstrap fails.
+        injectedContext,
         config: runnerConfig,
         mediaAttachments: mediaAttachments.length > 0 ? mediaAttachments : undefined,
       });

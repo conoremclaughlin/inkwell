@@ -626,6 +626,10 @@ describe('InkRunner — bootstrap failure in the child', () => {
     expect(calls[1].message).toContain('PROCESS-BODY');
     expect(calls[1].message).toContain('USER-BODY');
     expect(calls[1].message).toContain('DIGEST-BODY');
+    // Soul too. This child has no appendSystemPrompt path, and its own
+    // bootstrap just failed, so the fallback is soul's only delivery. The
+    // fixture carried SOUL-BODY all along and nothing asserted it.
+    expect(calls[1].message).toContain('SOUL-BODY');
 
     expect(result.success).toBe(true);
     expect(result.finalTextResponse).toBe('recovered');
@@ -635,5 +639,116 @@ describe('InkRunner — bootstrap failure in the child', () => {
     // The two processes share no module. If either literal is edited alone,
     // the runner silently stops recovering and the failure becomes invisible.
     expect(BOOTSTRAP_REQUIRED_EXIT_MARKER).toBe('INK_BOOTSTRAP_REQUIRED_FAILURE');
+  });
+});
+
+describe('InkRunner — resumed turns are equally exposed', () => {
+  function ctx() {
+    return {
+      agent: {
+        agentId: 'myra',
+        name: 'Myra',
+        role: 'messaging',
+        soul: 'SOUL-BODY',
+        values: [],
+        capabilities: [],
+        relationships: {},
+      },
+      user: { id: 'u1', timezone: 'UTC', contacts: {}, preferences: {} },
+      temporal: {
+        currentTime: '9:00 AM',
+        currentDate: 'Monday, August 24, 2026',
+        dayOfWeek: 'Monday',
+        timezone: 'UTC',
+        greeting: 'Good morning',
+      },
+      constitution: { values: 'VALUES-BODY', process: 'PROCESS-BODY', user: 'USER-BODY' },
+      knowledgeSummary: 'DIGEST-BODY',
+      recentMemories: [],
+      activeProjects: [],
+    } as never;
+  }
+
+  const cfg = {
+    workingDirectory: '/tmp',
+    mcpConfigPath: '/tmp/.mcp.json',
+    agentId: 'myra',
+  } as never;
+
+  it('requires bootstrap on a resumed turn too', async () => {
+    // Every run is a new `ink chat` process that bootstraps from scratch, so a
+    // resume is exactly as exposed as a fresh turn.
+    const runner = new InkRunner();
+    const seen: string[][] = [];
+    (runner as any).spawnProcess = vi.fn(async (args: string[]) => {
+      seen.push(args);
+      return { responses: [], toolCalls: [], finalTextResponse: 'ok' };
+    });
+
+    await runner.run('hello', {
+      backendSessionId: 'existing-session',
+      injectedContext: ctx(),
+      config: cfg,
+    } as never);
+
+    expect(seen[0]).toContain('--require-bootstrap');
+  });
+
+  it('keeps a healthy resumed prompt lean', async () => {
+    const runner = new InkRunner();
+    let sent = '';
+    (runner as any).spawnProcess = vi.fn(async (_a: string[], message: string) => {
+      sent = message;
+      return { responses: [], toolCalls: [], finalTextResponse: 'ok' };
+    });
+
+    await runner.run('hello', {
+      backendSessionId: 'existing-session',
+      injectedContext: ctx(),
+      config: cfg,
+    } as never);
+
+    expect(sent).toBe('hello');
+  });
+
+  it('recovers a resumed turn with the full context, soul included', async () => {
+    const runner = new InkRunner();
+    const calls: Array<{ args: string[]; message: string }> = [];
+    (runner as any).spawnProcess = vi.fn(async (args: string[], message: string) => {
+      calls.push({ args, message });
+      if (calls.length === 1) {
+        return { responses: [], toolCalls: [], bootstrapRequiredFailure: true };
+      }
+      return { responses: [], toolCalls: [], finalTextResponse: 'recovered' };
+    });
+
+    const result = await runner.run('hello', {
+      backendSessionId: 'existing-session',
+      injectedContext: ctx(),
+      config: cfg,
+    } as never);
+
+    expect(calls).toHaveLength(2);
+    expect(calls[1].message).toContain('SOUL-BODY');
+    expect(calls[1].message).toContain('VALUES-BODY');
+    expect(result.success).toBe(true);
+  });
+
+  it('reports failure rather than respawning a stranger when it has nothing to supply', async () => {
+    const runner = new InkRunner();
+    const calls: string[][] = [];
+    (runner as any).spawnProcess = vi.fn(async (args: string[]) => {
+      calls.push(args);
+      return { responses: [], toolCalls: [], bootstrapRequiredFailure: true };
+    });
+
+    const result = await runner.run('hello', {
+      backendSessionId: 'existing-session',
+      config: cfg,
+    } as never);
+
+    expect(calls).toHaveLength(1);
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('identity context');
   });
 });

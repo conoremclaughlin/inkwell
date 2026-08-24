@@ -821,7 +821,11 @@ describe('SessionService', () => {
       expect(runArgs.backendSessionId).toBe('existing-thread-uuid');
     });
 
-    it('should not inject context when resuming an existing backend session', async () => {
+    it('hands the runner context even on resume, and tells it this is a resume', async () => {
+      // The context is passed so a runner whose child re-bootstraps every turn
+      // (InkRunner) has a copy to fall back on when that bootstrap fails.
+      // Keeping it OUT of the resumed prompt is the runner's job, gated on
+      // backendSessionId — see the `!isResume` guards and their tests.
       const session = createMockSession({ backendSessionId: 'existing-thread-uuid' });
       vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
 
@@ -830,7 +834,8 @@ describe('SessionService', () => {
 
       expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
       const runArgs = vi.mocked(mockClaudeRunner.run).mock.calls[0][1];
-      expect(runArgs.injectedContext).toBeUndefined();
+      expect(runArgs.injectedContext).toBeDefined();
+      expect(runArgs.backendSessionId).toBe('existing-thread-uuid');
     });
 
     it('should inject context for fresh sessions without backendSessionId', async () => {
