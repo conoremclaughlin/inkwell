@@ -22,6 +22,16 @@
  * default project, and expire. They close when their thread closes or when
  * expires_at passes with no live lease.
  *
+ * Overflow ALWAYS hangs off the durable ancestor, never off another
+ * ephemeral. Routing hands this service whatever studio the agent's live
+ * session happens to occupy — after one overflow, that candidate is itself
+ * an ephemeral, and minting from it compounds slugs
+ * (`lumen-review--pr-503--pr-503--pr-534--pr-474`, 2026-08-24), splits one
+ * thread across several studios, and collides `eph/` branches (the second
+ * pr:534 mint failed on `already used by worktree` and the message was
+ * held). `ensureOverflowStudio` therefore re-anchors an ephemeral parent to
+ * its first non-ephemeral ancestor before doing anything else.
+ *
  * Teardown is FENCED (PR #492 round 2): destruction only proceeds after
  * atomically claiming the studio with a quarantine-style lease that `acquire`
  * refuses — an acquire that wins first aborts the teardown, and a teardown
@@ -105,10 +115,46 @@ export class StudioOverflowService {
   }
 
   /**
-   * Ladder steps 1–2: find or create the ephemeral studio for this threadKey.
-   * Returns null only when worktree creation itself fails or every slug
-   * candidate collides with an unrelated studio (both logged loudly); the
-   * caller fails closed.
+   * Walk `parent_studio_id` from the routing candidate to the first
+   * non-ephemeral ancestor. The candidate is only where the agent's live
+   * session happened to be sitting; the durable ancestor is what overflow
+   * children hang off, or slugs and paths compound one suffix per hop.
+   *
+   * A broken chain — missing parent row, cross-user link, or a cycle —
+   * stops the walk and keeps the last sound studio rather than failing the
+   * route; that studio may still be ephemeral, which is logged loudly.
+   */
+  private async resolveDurableAnchor(candidate: Studio): Promise<Studio> {
+    let anchor = candidate;
+    const seen = new Set<string>([anchor.id]);
+    while (anchor.ephemeral && anchor.parentStudioId && !seen.has(anchor.parentStudioId)) {
+      const next = await this.studios.findById(anchor.parentStudioId).catch(() => null);
+      if (!next || next.userId !== candidate.userId) break;
+      seen.add(next.id);
+      anchor = next;
+    }
+    if (anchor.id !== candidate.id) {
+      logger.info('[StudioOverflow] Re-anchored overflow parent to durable ancestor', {
+        candidateStudioId: candidate.id,
+        candidateSlug: candidate.slug,
+        anchorStudioId: anchor.id,
+        anchorSlug: anchor.slug,
+      });
+    }
+    if (anchor.ephemeral) {
+      logger.warn('[StudioOverflow] No durable ancestor found; anchoring on an ephemeral', {
+        candidateStudioId: candidate.id,
+        anchorStudioId: anchor.id,
+      });
+    }
+    return anchor;
+  }
+
+  /**
+   * Ladder steps 1–2: find or create the ephemeral studio for this threadKey,
+   * anchored on the candidate's durable ancestor. Returns null only when
+   * every slug candidate collides with an unrelated studio or fails worktree
+   * creation (both logged loudly); the caller fails closed.
    */
   async ensureOverflowStudio(opts: {
     userId: string;
@@ -116,7 +162,8 @@ export class StudioOverflowService {
     parentStudio: Studio;
     threadKey: string;
   }): Promise<Studio | null> {
-    const { userId, agentId, parentStudio, threadKey } = opts;
+    const { userId, agentId, threadKey } = opts;
+    const parentStudio = await this.resolveDurableAnchor(opts.parentStudio);
 
     const variants: Array<string | undefined> = [undefined, slugHash(threadKey)];
     for (const variant of variants) {
@@ -146,9 +193,13 @@ export class StudioOverflowService {
           });
           return existing;
         }
-        // Row survived but the worktree is gone — recreate in place.
+        // Row survived but the worktree is gone — recreate in place. On
+        // failure, fall through to the hash variant: the usual cause is the
+        // `eph/` branch being checked out by another worktree (e.g. a legacy
+        // chained studio from before durable anchoring), and the variant's
+        // suffixed branch sidesteps it.
         const revived = await this.createWorktree(parentStudio, slug, agentId, branchTail);
-        if (!revived) return null;
+        if (!revived) continue;
         return this.studios.update(existing.id, {
           status: 'active',
           worktreePath: revived.worktreePath,
@@ -157,8 +208,10 @@ export class StudioOverflowService {
         });
       }
 
+      // Same fallthrough as the revive path: a creation failure tries the
+      // hash variant (fresh slug AND fresh branch name) before giving up.
       const created = await this.createWorktree(parentStudio, slug, agentId, branchTail);
-      if (!created) return null;
+      if (!created) continue;
 
       if (existing) {
         // A cleaned matching row already owns (worktree_path, agent_id) —
@@ -219,10 +272,13 @@ export class StudioOverflowService {
       }
     }
 
-    logger.error('[StudioOverflow] Every slug candidate collides with unrelated studios', {
-      threadKey,
-      parentStudioId: parentStudio.id,
-    });
+    logger.error(
+      '[StudioOverflow] Every slug candidate collided with an unrelated studio or failed worktree creation',
+      {
+        threadKey,
+        parentStudioId: parentStudio.id,
+      }
+    );
     return null;
   }
 

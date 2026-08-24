@@ -202,6 +202,168 @@ describe('StudioOverflowService.ensureOverflowStudio — reuse', () => {
   });
 });
 
+describe('StudioOverflowService.ensureOverflowStudio — durable anchoring', () => {
+  // 2026-08-24: `lumen-review--pr-503--pr-503--pr-534--pr-474--pr-535`. Each
+  // provisioning was parented on the ephemeral studio the agent's live
+  // session occupied, so slugs compounded one suffix per hop. Overflow must
+  // anchor on the durable ancestor no matter which studio routing hands in.
+  it('mints from the durable ancestor when the candidate is a chained ephemeral', async () => {
+    const root = makeStudio(); // parent-1, slug lumen-review, durable
+    const eph1 = makeStudio({
+      id: 'eph-1',
+      slug: 'lumen-review--pr-503',
+      ephemeral: true,
+      parentStudioId: 'parent-1',
+      threadKey: 'pr:503',
+      repoRoot: '/nonexistent/repo',
+    });
+    const chainEnd = makeStudio({
+      id: 'eph-2',
+      slug: 'lumen-review--pr-503--pr-534',
+      ephemeral: true,
+      parentStudioId: 'eph-1',
+      threadKey: 'pr:534',
+      repoRoot: '/nonexistent/repo',
+    });
+    const findById = vi
+      .fn()
+      .mockImplementation((id: string) =>
+        Promise.resolve(id === 'eph-1' ? eph1 : id === 'parent-1' ? root : null)
+      );
+    const findBySlug = vi.fn().mockResolvedValue(null);
+    const studios = {
+      findById,
+      findBySlug,
+      create: vi.fn(),
+      update: vi.fn(),
+    } as unknown as StudiosRepository;
+    const leases = { logEvent: vi.fn() } as unknown as StudioLeaseService;
+
+    const service = new StudioOverflowService(studios, leases);
+    // Worktree creation fails (root's repoRoot exists only in the fixture),
+    // so the assertion is on the slugs LOOKED UP, which is where minting
+    // decides its name.
+    await service.ensureOverflowStudio({
+      userId: 'user-1',
+      agentId: 'lumen',
+      parentStudio: chainEnd,
+      threadKey: 'pr:474',
+    });
+
+    expect(findById).toHaveBeenCalledWith('eph-1');
+    expect(findById).toHaveBeenCalledWith('parent-1');
+    expect(findBySlug.mock.calls[0][1]).toBe('lumen-review--pr-474');
+    for (const call of findBySlug.mock.calls) {
+      expect(call[1]).not.toContain('pr-503');
+    }
+  });
+
+  // The doubled `--pr-503--pr-503`: a thread overflowing from its OWN
+  // ephemeral studio must resolve to reusing that studio, not minting an
+  // overflow-of-the-overflow for the identical thread.
+  it('self-overflow — a thread anchored on its own ephemeral reuses it', async () => {
+    const worktreePath = await mkdtemp(path.join(tmpdir(), 'overflow-self-'));
+    try {
+      const root = makeStudio();
+      const own = makeStudio({
+        id: 'eph-own',
+        slug: 'lumen-review--pr-476',
+        ephemeral: true,
+        parentStudioId: 'parent-1',
+        threadKey: 'pr:476',
+        metadata: { overflow: true },
+        worktreePath,
+      });
+      const studios = {
+        findById: vi.fn().mockResolvedValue(root),
+        findBySlug: vi.fn().mockResolvedValue(own),
+        create: vi.fn(),
+        update: vi.fn(),
+      } as unknown as StudiosRepository;
+      const leases = { logEvent: vi.fn() } as unknown as StudioLeaseService;
+
+      const service = new StudioOverflowService(studios, leases);
+      const result = await service.ensureOverflowStudio({
+        userId: 'user-1',
+        agentId: 'lumen',
+        parentStudio: own,
+        threadKey: 'pr:476',
+      });
+
+      expect(result?.id).toBe('eph-own');
+      expect(studios.create).not.toHaveBeenCalled();
+      expect(studios.update).not.toHaveBeenCalled();
+    } finally {
+      await rm(worktreePath, { recursive: true, force: true });
+    }
+  });
+
+  // Transition hazard: legacy chained worktrees keep flat `eph/` branches
+  // checked out, so a post-fix flat mint can fail `git worktree add` on
+  // `already used by worktree`. Creation failure must fall through to the
+  // hash variant (fresh slug AND fresh branch), not give up.
+  it('worktree-creation failure falls through to the hash variant', async () => {
+    const findBySlug = vi.fn().mockResolvedValue(null);
+    const studios = {
+      findById: vi.fn(),
+      findBySlug,
+      create: vi.fn(),
+      update: vi.fn(),
+    } as unknown as StudiosRepository;
+    const leases = { logEvent: vi.fn() } as unknown as StudioLeaseService;
+
+    const service = new StudioOverflowService(studios, leases);
+    const result = await service.ensureOverflowStudio({
+      userId: 'user-1',
+      agentId: 'lumen',
+      parentStudio: makeStudio({ repoRoot: '/nonexistent/repo' }),
+      threadKey: 'pr:476',
+    });
+
+    expect(result).toBeNull();
+    expect(findBySlug).toHaveBeenCalledTimes(2);
+    expect(findBySlug.mock.calls[1][1]).toBe(`lumen-review--pr-476-h${slugHash('pr:476')}`);
+  });
+
+  it('a parent-chain cycle terminates instead of walking forever', async () => {
+    const ephA = makeStudio({
+      id: 'eph-a',
+      slug: 'lumen-review--a',
+      ephemeral: true,
+      parentStudioId: 'eph-b',
+      repoRoot: '/nonexistent/repo',
+    });
+    const ephB = makeStudio({
+      id: 'eph-b',
+      slug: 'lumen-review--b',
+      ephemeral: true,
+      parentStudioId: 'eph-a',
+      repoRoot: '/nonexistent/repo',
+    });
+    const findById = vi
+      .fn()
+      .mockImplementation((id: string) => Promise.resolve(id === 'eph-b' ? ephB : ephA));
+    const studios = {
+      findById,
+      findBySlug: vi.fn().mockResolvedValue(null),
+      create: vi.fn(),
+      update: vi.fn(),
+    } as unknown as StudiosRepository;
+    const leases = { logEvent: vi.fn() } as unknown as StudioLeaseService;
+
+    const service = new StudioOverflowService(studios, leases);
+    const result = await service.ensureOverflowStudio({
+      userId: 'user-1',
+      agentId: 'lumen',
+      parentStudio: ephA,
+      threadKey: 'pr:476',
+    });
+
+    expect(result).toBeNull();
+    expect(findById).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('StudioOverflowService.teardownEphemeralStudio — fencing', () => {
   it('refuses to tear down a non-ephemeral studio', async () => {
     const studios = { markCleaned: vi.fn() } as unknown as StudiosRepository;
