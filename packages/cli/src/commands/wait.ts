@@ -109,6 +109,12 @@ export function registerWaitCommand(program: Command): void {
             agentId,
             status: 'unread',
             limit: 1,
+            // A watcher has no drain authority (spec inkmail-read-state §7):
+            // it observes on someone else's behalf and never renders anything
+            // into agent context. Until this flag existed, every poll advanced
+            // the pointer past the newest unread message — so merely watching
+            // for a reply marked the whole inbox read.
+            markRead: false,
           })) as Record<string, unknown>;
           baselineInboxCount =
             ((inboxResult.totalUnreadCount as number) ?? (inboxResult.unreadCount as number)) || 0;
@@ -214,6 +220,10 @@ export function registerWaitCommand(program: Command): void {
               agentId,
               status: 'unread',
               limit: 5,
+              // Observe only — see the baseline read above. The poll loop is
+              // also why draining here was so destructive: it ran every
+              // interval for the life of the wait.
+              markRead: false,
             })) as Record<string, unknown>;
 
             const currentUnread =

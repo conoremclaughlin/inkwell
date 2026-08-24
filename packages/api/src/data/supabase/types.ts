@@ -4493,6 +4493,17 @@ export type Database = {
       [_ in never]: never;
     };
     Functions: {
+      advance_agent_inbox_read_pointer: {
+        Args: {
+          p_agent_id: string;
+          p_through_message_id: string;
+          p_user_id: string;
+        };
+        Returns: {
+          changed: boolean;
+          last_read_at: string;
+        }[];
+      };
       advance_thread_read_pointer: {
         Args: {
           p_agent_id: string;

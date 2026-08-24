@@ -1,5 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
-import { createThreadDrainState, drainThreads, POLL_BUDGET, type PollDeps } from './poll-core.js';
+import {
+  createThreadDrainState,
+  drainThreads,
+  drainLegacyInbox,
+  POLL_BUDGET,
+  type PollDeps,
+} from './poll-core.js';
 
 let msgClock = 0;
 function mkMsg(id: string, sender = 'lumen') {
@@ -288,5 +294,207 @@ describe('drainThreads — summary accumulation and drain proof', () => {
     const h2 = createHarness({ 'pr:a': { messages: [] } });
     await drainThreads(h2.deps, state, [], { moreThreadsPending: false });
     expect(state.summarySent).toBe(true);
+  });
+});
+
+describe('drainLegacyInbox — exact-id consumption (Lumen #504 r1 P1)', () => {
+  function legacyHarness(opts: { notifyFailOn?: string; ackFail?: boolean } = {}) {
+    const ackArgs: Array<Record<string, unknown>> = [];
+    const notifications: Array<{ content: string; meta: Record<string, unknown> }> = [];
+    const deps: PollDeps = {
+      callPcp: vi.fn(async (tool: string, args: Record<string, unknown>) => {
+        if (tool === 'mark_inbox_read') {
+          ackArgs.push(args);
+          return opts.ackFail ? { success: false } : { success: true };
+        }
+        return { success: true };
+      }),
+      notify: vi.fn(async (content: string, meta: Record<string, unknown>) => {
+        if (opts.notifyFailOn && content.includes(opts.notifyFailOn)) {
+          throw new Error('emit failed');
+        }
+        notifications.push({ content, meta });
+      }),
+      log: vi.fn(),
+      agentId: 'wren',
+      email: 'test@test.com',
+      studioId: 'studio-1',
+    };
+    return { deps, ackArgs, notifications };
+  }
+
+  it('acks through the last delivered message after a clean batch', async () => {
+    const { deps, ackArgs, notifications } = legacyHarness();
+    const seen = new Set<string>();
+    // Newest-first page, as get_inbox serves it.
+    const res = await drainLegacyInbox(
+      deps,
+      seen,
+      [mkMsg('m3'), mkMsg('m2'), mkMsg('m1')].map((m, i) => ({
+        ...m,
+        createdAt: new Date(1700000100000 - i * 1000).toISOString(),
+      })),
+      () => false
+    );
+
+    expect(res.injected).toBe(3);
+    expect(notifications).toHaveLength(3);
+    // Delivered oldest-first; the ack is the newest processed id.
+    expect(ackArgs).toHaveLength(1);
+    expect(ackArgs[0]).toMatchObject({ agentId: 'wren', throughMessageId: 'm3' });
+  });
+
+  it('an emit failure stops the ack range — the newer remainder redelivers', async () => {
+    const { deps, ackArgs } = legacyHarness({ notifyFailOn: 'content m2' });
+    const seen = new Set<string>();
+    const page = [
+      { ...mkMsg('m3'), createdAt: '2026-08-16T12:00:00Z' },
+      { ...mkMsg('m2'), createdAt: '2026-08-16T11:00:00Z' },
+      { ...mkMsg('m1'), createdAt: '2026-08-16T10:00:00Z' },
+    ];
+
+    const res = await drainLegacyInbox(deps, seen, page, () => 'deliver' as const);
+
+    expect(res.injected).toBe(1);
+    expect(res.emitFailures).toBe(1);
+    // Only m1 (older, delivered) is acked; m2/m3 stay unread for redelivery.
+    expect(ackArgs[0]).toMatchObject({ throughMessageId: 'm1' });
+    expect(seen.has('m2')).toBe(false);
+  });
+
+  it('deliberately skipped rows stay inside the ack range', async () => {
+    const { deps, ackArgs, notifications } = legacyHarness();
+    const seen = new Set<string>();
+    const page = [
+      { ...mkMsg('own'), senderAgentId: 'wren', createdAt: '2026-08-16T12:00:00Z' },
+      { ...mkMsg('m1'), createdAt: '2026-08-16T10:00:00Z' },
+    ];
+
+    // Skip own messages (the caller-side filter).
+    const res = await drainLegacyInbox(deps, seen, page, (m) =>
+      m.senderAgentId === 'wren' ? 'skip' : 'deliver'
+    );
+
+    expect(res.injected).toBe(1);
+    expect(notifications).toHaveLength(1);
+    // The skipped OWN message is newer and still consumed — seen, not lost.
+    expect(ackArgs[0]).toMatchObject({ throughMessageId: 'own' });
+  });
+
+  it('a failed ack holds the pointer and reports — next poll retries', async () => {
+    const { deps, ackArgs } = legacyHarness({ ackFail: true });
+    const seen = new Set<string>();
+
+    const res = await drainLegacyInbox(deps, seen, [mkMsg('m1')], () => 'deliver' as const);
+
+    expect(res.injected).toBe(1);
+    expect(res.ackFailures).toBe(1);
+    expect(ackArgs).toHaveLength(1);
+    // The seen-set keeps the render deduped while the ack retries.
+    expect(seen.has('m1')).toBe(true);
+  });
+
+  it('a foreign-studio row STOPS the ack range — never consumed globally', async () => {
+    // mark_inbox_read advances one global (user, agent) pointer. Acking past
+    // a row routed to another studio would consume mail this studio never
+    // owned (Lumen #504 r2 P1). The walk stops AT the foreign row: earlier
+    // own rows are acked, everything from the foreign row on redelivers.
+    const { deps, ackArgs, notifications } = legacyHarness();
+    const seen = new Set<string>();
+    const page = [
+      { ...mkMsg('mine-new'), createdAt: '2026-08-16T12:00:00Z' },
+      { ...mkMsg('foreign-mid'), createdAt: '2026-08-16T11:00:00Z' },
+      { ...mkMsg('mine-old'), createdAt: '2026-08-16T10:00:00Z' },
+    ];
+
+    const res = await drainLegacyInbox(deps, seen, page, (m) =>
+      m.id === 'foreign-mid' ? 'foreign' : 'deliver'
+    );
+
+    expect(res.stoppedAtForeignStudio).toBe(true);
+    expect(res.injected).toBe(1);
+    expect(notifications.map((n) => n.meta.message_id)).toEqual(['mine-old']);
+    // Ack stops BEFORE the foreign row — mine-new stays unread too
+    // (contiguity: it cannot be acked without consuming foreign-mid).
+    expect(ackArgs).toHaveLength(1);
+    expect(ackArgs[0]).toMatchObject({ throughMessageId: 'mine-old' });
+  });
+
+  it('a leading foreign-studio row acks nothing at all', async () => {
+    const { deps, ackArgs } = legacyHarness();
+    const res = await drainLegacyInbox(
+      deps,
+      new Set<string>(),
+      [{ ...mkMsg('foreign-1'), createdAt: '2026-08-16T10:00:00Z' }],
+      () => 'foreign' as const
+    );
+    expect(res.stoppedAtForeignStudio).toBe(true);
+    expect(ackArgs).toHaveLength(0);
+  });
+
+  it('a mid-tie-group emit failure acks only through the PRIOR complete group', async () => {
+    // Two rows share a timestamp; the second twin's emit fails. Acking the
+    // first twin would move the timestamp pointer past BOTH — the failed
+    // sibling vanishes globally (Lumen #504 r3 P1). The ack must stop at the
+    // previous complete created_at group.
+    const { deps, ackArgs } = legacyHarness({ notifyFailOn: 'content twin-b' });
+    const page = [
+      { ...mkMsg('twin-b'), content: 'content twin-b', createdAt: '2026-08-16T11:00:00Z' },
+      { ...mkMsg('twin-a'), content: 'content twin-a', createdAt: '2026-08-16T11:00:00Z' },
+      { ...mkMsg('older'), createdAt: '2026-08-16T10:00:00Z' },
+    ];
+
+    const res = await drainLegacyInbox(deps, new Set<string>(), page, () => 'deliver' as const);
+
+    expect(res.injected).toBe(2); // older + twin-a delivered
+    expect(res.emitFailures).toBe(1);
+    expect(ackArgs).toHaveLength(1);
+    // NOT twin-a: its group is split. The prior complete group is 'older'.
+    expect(ackArgs[0]).toMatchObject({ throughMessageId: 'older' });
+  });
+
+  it('a mid-tie-group foreign row acks only through the PRIOR complete group', async () => {
+    const { deps, ackArgs } = legacyHarness();
+    // ids chosen so THIS studio's twin sorts first: the walk is genuinely
+    // inside the tie group when it hits the foreign sibling.
+    const page = [
+      { ...mkMsg('twin-z-foreign'), createdAt: '2026-08-16T11:00:00Z' },
+      { ...mkMsg('twin-a-mine'), createdAt: '2026-08-16T11:00:00Z' },
+      { ...mkMsg('older'), createdAt: '2026-08-16T10:00:00Z' },
+    ];
+
+    const res = await drainLegacyInbox(deps, new Set<string>(), page, (m) =>
+      m.id === 'twin-z-foreign' ? 'foreign' : 'deliver'
+    );
+
+    expect(res.stoppedAtForeignStudio).toBe(true);
+    expect(ackArgs).toHaveLength(1);
+    expect(ackArgs[0]).toMatchObject({ throughMessageId: 'older' });
+  });
+
+  it('a fully processed tie group at the end of the batch acks through its last row', async () => {
+    const { deps, ackArgs } = legacyHarness();
+    const page = [
+      { ...mkMsg('twin-b'), createdAt: '2026-08-16T11:00:00Z' },
+      { ...mkMsg('twin-a'), createdAt: '2026-08-16T11:00:00Z' },
+    ];
+
+    const res = await drainLegacyInbox(deps, new Set<string>(), page, () => 'deliver' as const);
+
+    expect(res.injected).toBe(2);
+    // Both twins processed — the group is complete and acks through its max.
+    expect(ackArgs[0]).toMatchObject({ throughMessageId: 'twin-b' });
+  });
+
+  it('an empty or fully-skipped-by-seen page still acks (retry path)', async () => {
+    const { deps, ackArgs } = legacyHarness();
+    const seen = new Set<string>(['m1']);
+
+    // Previously delivered but unacked (ack failed last poll): the retry
+    // must ack without re-rendering.
+    const res = await drainLegacyInbox(deps, seen, [mkMsg('m1')], () => 'deliver' as const);
+
+    expect(res.injected).toBe(0);
+    expect(ackArgs[0]).toMatchObject({ throughMessageId: 'm1' });
   });
 });
