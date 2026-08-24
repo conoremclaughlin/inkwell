@@ -4886,6 +4886,130 @@ describe('SessionService', () => {
       ).rejects.toMatchObject({ code: 'ROUTING_REFUSED' });
     });
 
+    it('says the identity is ambiguous instead of blaming route patterns', async () => {
+      // The refusal fires before any tier runs, but reported itself with the
+      // generic text: "no route pattern, no project affinity, and no usable
+      // caller repo". All three are false — none were consulted. Myra and
+      // Lumen each spent a night rewriting threadKeys and auditing route
+      // patterns against a studio whose `pr:*` would have matched fine; the
+      // real cause was a duplicate row in agent_identities.
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          const calls: RecordedCall[] = [];
+          if (table === 'agent_identities') {
+            return createFilterAwareChain(
+              () => ({ data: [{ id: 'sb-one' }, { id: 'sb-two' }] }),
+              calls
+            );
+          }
+          return createRecordingChain({ data: null }, calls);
+        }),
+      };
+      const service = serviceWith(mockSupabase);
+
+      const err = await service
+        .getOrCreateSession('user-456', 'wren', { threadKey: 'pr:525' })
+        .then(
+          () => null,
+          (e: Error) => e
+        );
+
+      expect(err).toBeInstanceOf(Error);
+      expect(err!.message).toMatch(/several identity rows share this agent slug/);
+      expect(err!.message).toMatch(/Route patterns were NOT consulted/);
+      expect(err!.message).not.toMatch(/no route pattern/);
+    });
+
+    // Myra tested the escape hatch the message recommended and it doesn't
+    // exist: server.ts resolves `recipientAgentId` with .eq('agent_id', …),
+    // the SLUG column, so a UUID matches zero rows and comes back "Unknown
+    // agent for user: <uuid>. Register in agent_identities first." — which
+    // flatly contradicts the row she'd just read out of that table. A remedy
+    // that sends someone hunting a registration bug that isn't there is worse
+    // than no remedy offered.
+    it('does not offer the identity-UUID escape hatch, which send_to_inbox cannot reach', async () => {
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          const calls: RecordedCall[] = [];
+          if (table === 'agent_identities') {
+            return createFilterAwareChain(
+              () => ({ data: [{ id: 'sb-one' }, { id: 'sb-two' }] }),
+              calls
+            );
+          }
+          return createRecordingChain({ data: null }, calls);
+        }),
+      };
+      const service = serviceWith(mockSupabase);
+
+      const err = await service
+        .getOrCreateSession('user-456', 'wren', { threadKey: 'pr:525' })
+        .then(
+          () => null,
+          (e: Error) => e
+        );
+
+      // It must not RECOMMEND the UUID; saying it fails is what's wanted,
+      // since the next person will otherwise reach for it exactly as Myra did.
+      expect(err!.message).not.toMatch(/or address the recipient by identity UUID/);
+      expect(err!.message).toMatch(/resolves slugs only/);
+      expect(err!.message).toMatch(/de-duplicate/i);
+    });
+
+    // Lumen read the new ambiguity message, concluded correctly that naming an
+    // exact studio would bypass slug resolution, and sent again with one. The
+    // anchor is refused by the SAME ambiguity — a studio carrying an sb_id
+    // needs a canonical identity to match against, and ambiguity nulls it —
+    // but that throw carried no reason, so it fell into the generic text and
+    // told Lumen to "pass a studioHint". They had just passed one. The fix for
+    // a lying message is not to fix one caller's copy of it.
+    it('names the ambiguity when it is what disqualified an explicit studio anchor', async () => {
+      const mockSupabase = {
+        from: vi.fn().mockImplementation((table: string) => {
+          const calls: RecordedCall[] = [];
+          if (table === 'agent_identities') {
+            return createFilterAwareChain(
+              () => ({ data: [{ id: 'sb-one' }, { id: 'sb-two' }] }),
+              calls
+            );
+          }
+          if (table === 'studios') {
+            // A real, healthy studio that genuinely belongs to this agent —
+            // the anchor fails only because the identity cannot be settled.
+            return createRecordingChain(
+              {
+                data: {
+                  user_id: 'user-456',
+                  agent_id: 'wren',
+                  sb_id: 'sb-one',
+                  status: 'active',
+                },
+              },
+              calls
+            );
+          }
+          return createRecordingChain({ data: null }, calls);
+        }),
+      };
+      const service = serviceWith(mockSupabase);
+
+      const err = await service
+        .getOrCreateSession('user-456', 'wren', {
+          threadKey: 'pr:525',
+          studioId: 'studio-mine',
+        })
+        .then(
+          () => null,
+          (e: Error) => e
+        );
+
+      expect(err).toBeInstanceOf(Error);
+      expect(err!.message).toMatch(/several identity rows share this agent slug/);
+      // The three claims that cost Lumen a night must not appear.
+      expect(err!.message).not.toMatch(/no route pattern/);
+      expect(err!.message).not.toMatch(/pass a studioHint/);
+    });
+
     it('an ambiguous slug does not match early-tier slug rows either', async () => {
       // Ambiguous and absent both produced a null sbId, so both fell back to
       // agent_id — letting a duplicate-slug studio win an early tier and

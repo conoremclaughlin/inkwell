@@ -355,7 +355,13 @@ export class RoutingRefusedError extends Error {
     readonly detail: {
       triedCallerRepo: boolean;
       callerRepoRoot?: string;
-      reason?: 'no-route' | 'occupied';
+      reason?: 'no-route' | 'occupied' | 'ambiguous-identity';
+      /**
+       * The caller named an exact studio/session and THAT is what we refused.
+       * Without this the message recommends naming one — advice the caller has
+       * already taken (Lumen, pr:525).
+       */
+      anchor?: 'studio' | 'session';
       occupied?: { studioId: string; holderThreadKey: string };
       /** The hold is the thread type's studio_policy deciding, not a failure. */
       policy?: 'reuse-only';
@@ -370,6 +376,31 @@ export class RoutingRefusedError extends Error {
     agentId: string,
     detail: RoutingRefusedError['detail']
   ): string {
+    // Ambiguity refuses BEFORE any tier runs, so the generic message below —
+    // which names route patterns, project affinity and the caller repo — is
+    // false here: none of them were consulted. It cost Myra and Lumen a night
+    // of chasing route patterns and threadKey conventions for a duplicate
+    // `agent_identities` row. Name the actual cause and the actual fix.
+    if (detail.reason === 'ambiguous-identity') {
+      // Naming an exact studio is the obvious workaround, and it does not
+      // work: a studio carrying an sb_id must match ONE canonical identity,
+      // which is exactly what ambiguity denies. Lumen inferred the workaround
+      // from this message, took it, and got told to pass a studioHint.
+      const anchorClause = detail.anchor
+        ? `you named an exact ${detail.anchor}, but several identity rows share ` +
+          `this agent slug, so the ${detail.anchor}'s owning identity cannot be ` +
+          `matched against one canonical id and the anchor cannot be authorized`
+        : `several identity rows share this agent slug, so every studio lookup ` +
+          `below would be scoped by an ambiguous identity`;
+      return (
+        `Refusing to route "${threadKey}" for agent "${agentId}": ${anchorClause}. ` +
+        `Route patterns were NOT consulted — this is not a routing-configuration ` +
+        `problem. Message held. De-duplicate the agent's rows in agent_identities; ` +
+        `nothing the sender can pass works around it — naming a studio or session ` +
+        `hits this same check, and recipientAgentId resolves slugs only, so a ` +
+        `recipient's identity UUID resolves to no agent at all.`
+      );
+    }
     if (detail.reason === 'occupied' && detail.policy === 'reuse-only') {
       return (
         `Refusing to route "${threadKey}" for agent "${agentId}": studio ` +
@@ -2405,8 +2436,18 @@ export class SessionService implements ISessionService {
           // fallback would silently satisfy a request whose explicit anchor we
           // just rejected, defeating the guard entirely. An invalid anchor
           // must end resolution, not merely fail to contribute a studio.
+          //
+          // Carry WHY. An ambiguous identity disqualifies every anchor that
+          // carries an sb_id (authorizeStudioAnchor needs one canonical id to
+          // compare against), and a reasonless throw reported that as "no
+          // route pattern, no project affinity, and no usable caller repo" —
+          // three claims that were never checked, ending in advice to pass the
+          // studioHint the caller had just passed.
           throw new RoutingRefusedError(options.threadKey || '(unthreaded)', agentId, {
             triedCallerRepo: false,
+            ...(options.identityAmbiguous
+              ? { reason: 'ambiguous-identity' as const, anchor: 'studio' as const }
+              : {}),
           });
         }
       }
@@ -2439,7 +2480,10 @@ export class SessionService implements ISessionService {
       // Also fatal: the reuse rungs below would fall back to the slug and
       // match a sibling identity's session before the create boundary is
       // reached (Lumen, #514 r8).
-      throw new RoutingRefusedError(options.threadKey, agentId, { triedCallerRepo: false });
+      throw new RoutingRefusedError(options.threadKey, agentId, {
+        triedCallerRepo: false,
+        reason: 'ambiguous-identity',
+      });
     }
 
     // studioHint is a convenience fallback — only consulted when no explicit studioId.
