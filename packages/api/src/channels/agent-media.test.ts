@@ -1,13 +1,18 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
+  existsSync,
   linkSync,
+  lstatSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from 'fs';
+import { createHash } from 'crypto';
 import { join, sep } from 'path';
 import { tmpdir } from 'os';
 import { open, readdir } from 'fs/promises';
@@ -17,7 +22,11 @@ import {
   readBoundedFromHandle,
   MAX_TRIGGER_MEDIA,
   TRIGGER_SNAPSHOT_DIR,
+  PRUNE_MIN_AGE_MS,
 } from './agent-media.js';
+
+const snapshotDigest = (bytes: Buffer): string =>
+  createHash('sha256').update(bytes).digest('hex').slice(0, 32);
 
 const mockWarn = vi.fn();
 vi.mock('../utils/logger', () => ({
@@ -185,13 +194,192 @@ describe('resolveTriggerMedia (agent-to-agent attachment containment)', () => {
     expect(snaps).toHaveLength(1);
   });
 
-  it('prunes oldest snapshots beyond the retention cap', async () => {
+  it('prunes AGED snapshots beyond the cap; fresh ones ride the grace window', async () => {
     for (let i = 0; i < 5; i++) {
       const p = png(root, `distinct-${i}.png`, Buffer.from(`content-${i}`));
       await resolveTriggerMedia({ media: [{ path: p }] }, { mediaRoot: root, maxSnapshots: 3 });
     }
-    const snaps = await readdir(join(root, TRIGGER_SNAPSHOT_DIR));
+    const dir = join(realpathSync(root), TRIGGER_SNAPSHOT_DIR);
+    // All five are inside the grace window — a concurrent trigger's snapshot
+    // must never be pruned between resolution and provider open, so the cap
+    // is transiently exceeded rather than fresh files deleted.
+    expect((await readdir(dir)).length).toBe(5);
+
+    // Age everything past the window; the next delivery enforces the cap.
+    const old = (Date.now() - PRUNE_MIN_AGE_MS - 60_000) / 1000;
+    for (const name of await readdir(dir)) {
+      utimesSync(join(dir, name), old, old);
+    }
+    const p = png(root, 'distinct-5.png', Buffer.from('content-5'));
+    const out = await resolveTriggerMedia(
+      { media: [{ path: p }] },
+      { mediaRoot: root, maxSnapshots: 3 }
+    );
+    const snaps = await readdir(dir);
     expect(snaps.length).toBeLessThanOrEqual(3);
+    // The just-delivered snapshot always survives its own prune
+    expect(existsSync(out[0]!.path)).toBe(true);
+  });
+
+  it('never prunes the snapshot it just returned (future-mtime aggressor, cap 1)', async () => {
+    // Lumen's PR #465 repro: with cap 1 and one future-mtime existing entry,
+    // the old prune deleted the freshly-returned snapshot before the
+    // provider could open it.
+    const dir = join(realpathSync(root), TRIGGER_SNAPSHOT_DIR);
+    mkdirSync(dir, { recursive: true });
+    const aggressor = join(dir, 'aggressor.bin');
+    writeFileSync(aggressor, Buffer.from('future-dated'));
+    const future = (Date.now() + 60 * 60 * 1000) / 1000;
+    utimesSync(aggressor, future, future);
+
+    const content = Buffer.from('fresh-delivery');
+    const p = png(root, 'fresh.png', content);
+    const out = await resolveTriggerMedia(
+      { media: [{ path: p }] },
+      { mediaRoot: root, maxSnapshots: 1 }
+    );
+    expect(out).toHaveLength(1);
+    expect(existsSync(out[0]!.path)).toBe(true);
+    expect(readFileSync(out[0]!.path).equals(content)).toBe(true);
+    // The future-dated file is ineligible too (negative age is not "aged") —
+    // it must never displace real files, and it is not itself pruned.
+    expect(existsSync(aggressor)).toBe(true);
+  });
+
+  it('publishes atomically: concurrent same-content resolves never drop or see partial bytes', async () => {
+    // Lumen's PR #474 repro: with writeFile at the final CAS name, 16
+    // concurrent resolves of one large source produced 12/16 drops —
+    // verifiers read partial files and unlinked the live writer. Atomic
+    // temp+rename publication must yield zero drops and complete bytes.
+    const content = Buffer.concat([
+      Buffer.from('large-payload-'),
+      Buffer.alloc(2 * 1024 * 1024, 7),
+    ]);
+    const p = png(root, 'big-shared.bin', content);
+    const results = await Promise.all(
+      Array.from({ length: 16 }, () =>
+        resolveTriggerMedia({ media: [{ path: p }] }, { mediaRoot: root })
+      )
+    );
+    for (const out of results) {
+      expect(out).toHaveLength(1);
+      // Immediate read of every returned path sees complete bytes
+      expect(readFileSync(out[0]!.path).equals(content)).toBe(true);
+    }
+    expect(mockWarn).not.toHaveBeenCalled();
+  });
+
+  it('prune cannot delete a snapshot a concurrent resolve just verified and returned', async () => {
+    // Lumen's PR #474 repro (r3847776268): pruneSnapshots decided eligibility
+    // from a stat, then unlinked. Pausing between those two steps and letting
+    // a same-content resolve verify + refresh + return the file in the gap
+    // made the returned path vanish. Verify/publish and prune are now one
+    // transaction per snapshot dir, so this interleaving cannot occur; the
+    // only surviving order is prune-then-verify, which republishes.
+    const shared = Buffer.from('in-flight-shared-content');
+    const sharedSrc = png(root, 'shared.bin', shared);
+    const firstOut = await resolveTriggerMedia(
+      { media: [{ path: sharedSrc }] },
+      { mediaRoot: root }
+    );
+    const sharedSnap = firstOut[0]!.path!;
+    for (let i = 0; i < 3; i++) {
+      const filler = png(root, `filler-${i}.bin`, Buffer.from(`filler-${i}`));
+      await resolveTriggerMedia({ media: [{ path: filler }] }, { mediaRoot: root });
+    }
+    // Age everything past the grace window, and make the shared snapshot the
+    // OLDEST so LRU order puts it first in line for deletion.
+    const dir = join(realpathSync(root), TRIGGER_SNAPSHOT_DIR);
+    const aged = (Date.now() - PRUNE_MIN_AGE_MS - 60_000) / 1000;
+    for (const name of await readdir(dir)) utimesSync(join(dir, name), aged, aged);
+    const oldest = (Date.now() - PRUNE_MIN_AGE_MS - 600_000) / 1000;
+    utimesSync(sharedSnap, oldest, oldest);
+
+    let barrierReached!: () => void;
+    const reached = new Promise<void>((r) => {
+      barrierReached = r;
+    });
+    let releaseBarrier!: () => void;
+    const released = new Promise<void>((r) => {
+      releaseBarrier = r;
+    });
+
+    // Call A: delivers a new snapshot, then parks inside prune with its
+    // eligibility list (including sharedSnap) already computed.
+    const evictor = png(root, 'evictor.bin', Buffer.from('evictor-content'));
+    const a = resolveTriggerMedia(
+      { media: [{ path: evictor }] },
+      {
+        mediaRoot: root,
+        maxSnapshots: 2,
+        onPruneStatted: async () => {
+          barrierReached();
+          await released;
+        },
+      }
+    );
+    await reached;
+
+    // Call B: re-resolves the shared content — verify, refresh mtime, return.
+    const b = resolveTriggerMedia({ media: [{ path: sharedSrc }] }, { mediaRoot: root });
+    // Give B every chance to finish inside A's stale window. Serialized, it
+    // cannot start until A's prune commits.
+    await new Promise((r) => setTimeout(r, 50));
+    releaseBarrier();
+
+    const [, outB] = await Promise.all([a, b]);
+    expect(outB).toHaveLength(1);
+    // The path handed to the provider still exists, with the real bytes.
+    expect(existsSync(outB[0]!.path!)).toBe(true);
+    expect(readFileSync(outB[0]!.path!).equals(shared)).toBe(true);
+  });
+
+  it('EEXIST is not trust: a pre-created symlink at the snapshot name is repaired, not reused', async () => {
+    const content = Buffer.from('victim-content');
+    const p = png(root, 'photo.png', content);
+    const dir = join(realpathSync(root), TRIGGER_SNAPSHOT_DIR);
+    mkdirSync(dir, { recursive: true });
+    const snapshotName = join(dir, `${snapshotDigest(content)}-photo.png`);
+    const target = join(outside, 'attacker-target.bin');
+    writeFileSync(target, Buffer.from('outside-bytes'));
+    symlinkSync(target, snapshotName);
+
+    const out = await resolveTriggerMedia({ media: [{ path: p }] }, { mediaRoot: root });
+    expect(out).toHaveLength(1);
+    expect(out[0]!.path).toBe(snapshotName);
+    // The delivered path is a REGULAR contained file with the expected bytes…
+    expect(lstatSync(snapshotName).isSymbolicLink()).toBe(false);
+    expect(readFileSync(snapshotName).equals(content)).toBe(true);
+    // …and the outside target was never touched (path-based utimes/write
+    // through the symlink is exactly what the old code risked)
+    expect(readFileSync(target).equals(Buffer.from('outside-bytes'))).toBe(true);
+  });
+
+  it('EEXIST with wrong content (crash/ENOSPC leftover) is repaired to the true bytes', async () => {
+    const content = Buffer.from('full-and-correct-content');
+    const p = png(root, 'doc.pdf', content);
+    const dir = join(realpathSync(root), TRIGGER_SNAPSHOT_DIR);
+    mkdirSync(dir, { recursive: true });
+    const snapshotName = join(dir, `${snapshotDigest(content)}-doc.pdf`);
+    writeFileSync(snapshotName, content.subarray(0, 8)); // truncated leftover
+
+    const out = await resolveTriggerMedia({ media: [{ path: p }] }, { mediaRoot: root });
+    expect(out).toHaveLength(1);
+    expect(readFileSync(out[0]!.path).equals(content)).toBe(true);
+  });
+
+  it('verified EEXIST reuse still works and refreshes retention time', async () => {
+    const content = Buffer.from('identical-bytes-verified');
+    const p = png(root, 'same.png', content);
+    const first = await resolveTriggerMedia({ media: [{ path: p }] }, { mediaRoot: root });
+    // Age the snapshot, then re-deliver: reuse must refresh mtime (via the
+    // handle) so LRU retention sees it as live.
+    const old = (Date.now() - PRUNE_MIN_AGE_MS - 60_000) / 1000;
+    utimesSync(first[0]!.path, old, old);
+    const second = await resolveTriggerMedia({ media: [{ path: p }] }, { mediaRoot: root });
+    expect(second[0]!.path).toBe(first[0]!.path);
+    const st = lstatSync(first[0]!.path);
+    expect(Date.now() - st.mtimeMs).toBeLessThan(PRUNE_MIN_AGE_MS);
   });
 });
 
