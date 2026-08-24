@@ -129,6 +129,13 @@ const PROVIDER_STALL_SIGNATURES = [
 /** Max --attach-file args forwarded per spawn (matches the channel-side media cap) */
 const MAX_ATTACHMENT_ARGS = 10;
 
+/**
+ * Emitted by `ink chat --require-bootstrap` when it refuses to answer without
+ * identity context. Duplicated as a literal in packages/cli chat.ts — the two
+ * processes share no module, so the string itself is the contract.
+ */
+export const BOOTSTRAP_REQUIRED_EXIT_MARKER = 'INK_BOOTSTRAP_REQUIRED_FAILURE';
+
 export class InkRunner implements IRunner {
   async run(
     message: string,
@@ -153,7 +160,9 @@ export class InkRunner implements IRunner {
       fullMessage = `${contextBlock}\n\n---\n\n${message}`;
     }
 
-    const args = this.buildArgs(sessionId, config, mediaAttachments);
+    const args = this.buildArgs(sessionId, config, mediaAttachments, {
+      requireBootstrap: Boolean(injectedContext && !isResume),
+    });
 
     logger.info('Spawning ink chat (non-interactive)', {
       sessionId,
@@ -164,7 +173,27 @@ export class InkRunner implements IRunner {
     });
 
     try {
-      const result = await this.spawnProcess(args, fullMessage, config);
+      let result = await this.spawnProcess(args, fullMessage, config);
+
+      if (result.bootstrapRequiredFailure) {
+        // The child could not reach bootstrap, so it stopped rather than reply
+        // as a stranger. We have the constitution already — send it inline and
+        // let the turn succeed, instead of leaving a person without an answer.
+        logger.warn('ink chat could not load identity context; retrying with server copy', {
+          sessionId,
+          pcpSessionId: config.pcpSessionId,
+        });
+
+        if (injectedContext) {
+          const contextBlock = formatInjectedContext(injectedContext);
+          fullMessage = `${contextBlock}\n\n---\n\n${message}`;
+        }
+
+        const fallbackArgs = this.buildArgs(sessionId, config, mediaAttachments, {
+          requireBootstrap: false,
+        });
+        result = await this.spawnProcess(fallbackArgs, fullMessage, config);
+      }
 
       if (result.resumeFailedNoSession && isResume) {
         logger.warn('Resume failed - session not found locally. Starting fresh session.', {
@@ -178,7 +207,9 @@ export class InkRunner implements IRunner {
           fullMessage = `${contextBlock}\n\n---\n\n${message}`;
         }
 
-        const freshArgs = this.buildArgs(sessionId, config, mediaAttachments);
+        const freshArgs = this.buildArgs(sessionId, config, mediaAttachments, {
+          requireBootstrap: Boolean(injectedContext),
+        });
         const retryResult = await this.spawnProcess(freshArgs, fullMessage, config);
         return {
           success: true,
@@ -217,9 +248,17 @@ export class InkRunner implements IRunner {
   private buildArgs(
     sessionId: string,
     config: ClaudeRunnerConfig,
-    mediaAttachments?: MediaAttachment[]
+    mediaAttachments?: MediaAttachment[],
+    options: { requireBootstrap?: boolean } = {}
   ): string[] {
     const args: string[] = ['chat', '--non-interactive'];
+
+    // We omit the constitution from the prompt because this child loads its
+    // own. Demand that it actually did: without this the child warns and
+    // answers as a stranger, and we would record that as a successful turn.
+    if (options.requireBootstrap) {
+      args.push('--require-bootstrap');
+    }
 
     if (config.agentId) {
       args.push('--agent', config.agentId);
@@ -285,6 +324,7 @@ export class InkRunner implements IRunner {
     };
     servedModel?: string;
     resumeFailedNoSession?: boolean;
+    bootstrapRequiredFailure?: boolean;
     finalTextResponse?: string;
     toolCalls: ToolCall[];
   }> {
@@ -475,6 +515,17 @@ export class InkRunner implements IRunner {
         }
 
         if (code !== 0) {
+          // The child refused to answer without identity context. Recoverable:
+          // the server holds that context and can supply it directly.
+          if (stderr.includes(BOOTSTRAP_REQUIRED_EXIT_MARKER)) {
+            resolve({
+              responses: [],
+              bootstrapRequiredFailure: true,
+              toolCalls: [],
+            });
+            return;
+          }
+
           // Check for resume failure
           if (stderr.includes('session not found') || stderr.includes('No such session')) {
             resolve({

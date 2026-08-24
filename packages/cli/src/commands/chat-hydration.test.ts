@@ -1,9 +1,11 @@
 import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ContextLedger, entryRefHash } from '../repl/context-ledger.js';
 import {
+  BOOTSTRAP_REQUIRED_EXIT_MARKER,
+  failIfBootstrapRequired,
   findLastDetectedModel,
   formatTranscriptSize,
   hydrateLedgerFromTranscript,
@@ -934,5 +936,46 @@ describe('hydrateLedgerFromTranscript — shadow clone handoff', () => {
     const entries = ledger.listEntries();
     expect(entries.some((e) => e.content.includes('Three entry points.'))).toBe(false);
     expect(entries.some((e) => e.source === 'compaction-history')).toBe(true);
+  });
+});
+
+describe('BOOTSTRAP_REQUIRED_EXIT_MARKER', () => {
+  it('matches the literal the server-side InkRunner greps stderr for', () => {
+    // packages/api InkRunner carries its own copy of this string; the two
+    // processes share no module, so the literal is the whole contract. If this
+    // side is renamed alone, the runner stops recognising the refusal and a
+    // failed turn looks like a crash instead of something recoverable.
+    expect(BOOTSTRAP_REQUIRED_EXIT_MARKER).toBe('INK_BOOTSTRAP_REQUIRED_FAILURE');
+  });
+});
+
+describe('failIfBootstrapRequired', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('stops the run and names itself on stderr when identity context is required', () => {
+    const exit = vi.spyOn(process, 'exit').mockImplementation((() => {
+      throw new Error('exited');
+    }) as never);
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    expect(() =>
+      failIfBootstrapRequired({ requireBootstrap: true }, 'bootstrap unavailable')
+    ).toThrow('exited');
+
+    expect(exit).toHaveBeenCalledWith(78);
+    // The runner greps stderr for this; a bare exit code is not enough to tell
+    // a refusal apart from a crash.
+    expect(String(err.mock.calls[0][0])).toContain(BOOTSTRAP_REQUIRED_EXIT_MARKER);
+  });
+
+  it('leaves an interactive run alone, where a human can read the warning', () => {
+    const exit = vi.spyOn(process, 'exit').mockImplementation((() => {
+      throw new Error('exited');
+    }) as never);
+
+    expect(() => failIfBootstrapRequired({}, 'bootstrap unavailable')).not.toThrow();
+    expect(exit).not.toHaveBeenCalled();
   });
 });

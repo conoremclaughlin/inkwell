@@ -1,5 +1,11 @@
 import { describe, it, expect, vi } from 'vitest';
-import { InkRunner, DEFAULT_MAX_TURNS, clampMaxTurns, parseInkModelUsage } from './ink-runner';
+import {
+  InkRunner,
+  DEFAULT_MAX_TURNS,
+  clampMaxTurns,
+  parseInkModelUsage,
+  BOOTSTRAP_REQUIRED_EXIT_MARKER,
+} from './ink-runner';
 
 vi.mock('../../utils/logger', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -536,5 +542,98 @@ describe('InkRunner — bootstrap-derived content', () => {
 
     expect(sentMessage).toContain('CONTACT-NAME');
     expect(sentMessage).toContain('Myra');
+  });
+});
+
+// ============================================================================
+// Failure path: the child could not load the context we chose not to send
+// ============================================================================
+
+describe('InkRunner — bootstrap failure in the child', () => {
+  function ctx() {
+    return {
+      agent: {
+        agentId: 'myra',
+        name: 'Myra',
+        role: 'messaging',
+        soul: 'SOUL-BODY',
+        values: [],
+        capabilities: [],
+        relationships: {},
+      },
+      user: { id: 'u1', timezone: 'UTC', contacts: {}, preferences: {} },
+      temporal: {
+        currentTime: '9:00 AM',
+        currentDate: 'Monday, August 24, 2026',
+        dayOfWeek: 'Monday',
+        timezone: 'UTC',
+        greeting: 'Good morning',
+      },
+      constitution: { values: 'VALUES-BODY', process: 'PROCESS-BODY', user: 'USER-BODY' },
+      knowledgeSummary: 'DIGEST-BODY',
+      recentMemories: [],
+      activeProjects: [],
+    } as never;
+  }
+
+  const cfg = {
+    workingDirectory: '/tmp',
+    mcpConfigPath: '/tmp/.mcp.json',
+    agentId: 'myra',
+  } as never;
+
+  it('demands the child prove it loaded identity context on a fresh turn', async () => {
+    const runner = new InkRunner();
+    const seen: string[][] = [];
+    (runner as any).spawnProcess = vi.fn(async (args: string[]) => {
+      seen.push(args);
+      return { responses: [], toolCalls: [], finalTextResponse: 'ok' };
+    });
+
+    await runner.run('hello', { injectedContext: ctx(), config: cfg } as never);
+
+    expect(seen[0]).toContain('--require-bootstrap');
+  });
+
+  it('resends the constitution itself when the child refuses, rather than losing the turn', async () => {
+    // Without this the person on the other end gets either no reply, or a
+    // confident one from an agent with no soul, values or memory.
+    const runner = new InkRunner();
+    const calls: Array<{ args: string[]; message: string }> = [];
+    (runner as any).spawnProcess = vi.fn(async (args: string[], message: string) => {
+      calls.push({ args, message });
+      if (calls.length === 1) {
+        return { responses: [], toolCalls: [], bootstrapRequiredFailure: true };
+      }
+      return { responses: [], toolCalls: [], finalTextResponse: 'recovered' };
+    });
+
+    const result = await runner.run('hello', {
+      injectedContext: ctx(),
+      config: cfg,
+    } as never);
+
+    expect(calls).toHaveLength(2);
+
+    // First attempt: lean, and demanding proof.
+    expect(calls[0].args).toContain('--require-bootstrap');
+    expect(calls[0].message).not.toContain('VALUES-BODY');
+
+    // Retry: the server supplies what the child could not fetch, and stops
+    // demanding proof it already knows the child cannot provide.
+    expect(calls[1].args).not.toContain('--require-bootstrap');
+    expect(calls[1].message).toContain('VALUES-BODY');
+    expect(calls[1].message).toContain('PROCESS-BODY');
+    expect(calls[1].message).toContain('USER-BODY');
+    expect(calls[1].message).toContain('DIGEST-BODY');
+
+    expect(result.success).toBe(true);
+    expect(result.finalTextResponse).toBe('recovered');
+  });
+
+  it('recognises the marker the CLI actually prints', () => {
+    // The two processes share no module. If either literal is edited alone,
+    // the runner silently stops recovering and the failure becomes invisible.
+    expect(BOOTSTRAP_REQUIRED_EXIT_MARKER).toBe('INK_BOOTSTRAP_REQUIRED_FAILURE');
   });
 });
