@@ -17,6 +17,8 @@ import { releaseGraphClaimsForSession } from '../services/graph-executor.service
 import { logger } from '../utils/logger';
 
 const VALID_LIFECYCLES = ['running', 'idle', 'compacting', 'completed', 'failed'] as const;
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 type Lifecycle = (typeof VALID_LIFECYCLES)[number];
 
 export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
@@ -77,6 +79,16 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
 
       if (!sessionId) {
         res.status(400).json({ success: false, error: 'sessionId is required' });
+        return;
+      }
+
+      // Reject non-UUID session ids BEFORE they reach Postgres. Without this,
+      // a malformed id (e.g. a test fixture like "sess-1" leaking from an
+      // integration run pointed at this server) raises 22P02 inside
+      // getSession, and every such request error-spams the log with a stack
+      // trace for what is simply bad caller input.
+      if (!UUID_RE.test(sessionId)) {
+        res.status(400).json({ success: false, error: 'sessionId must be a UUID' });
         return;
       }
 
