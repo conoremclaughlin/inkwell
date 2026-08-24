@@ -221,20 +221,26 @@ describe('handleGetIntegrationHealth — live status for OAuth-backed services',
     expect(serviceIn(body, 'google_gmail').id).toBeNull();
   });
 
-  it('reports healthy from live state when the account is usable', async () => {
+  it('reports a fresh healthy service report as healthy, with the account alongside', async () => {
     inspectAccountHealth.mockResolvedValue(ACTIVE_GOOGLE);
     const { composer } = composerFor({
-      integration_health: [{ then: { data: [staleHealthyRow('google_gmail')], error: null } }],
+      integration_health: [
+        {
+          then: {
+            data: [freshRow('google_gmail', { status: 'healthy', error_code: null })],
+            error: null,
+          },
+        },
+      ],
     });
 
     const body = parse(await handleGetIntegrationHealth({ userId: USER_ID }, composer));
     const gmail = serviceIn(body, 'google_gmail');
 
     expect(gmail.status).toBe('healthy');
-    expect(gmail.source).toBe('live');
+    expect(gmail.source).toBe('cached');
     expect(gmail.stale).toBe(false);
     expect(gmail.accountHealth).toBe('ok');
-    expect(gmail.supersededCachedStatus).toBeUndefined();
   });
 
   it('answers an explicit service filter that has no cached row at all', async () => {
@@ -277,7 +283,10 @@ describe('handleGetIntegrationHealth — account health is not service health', 
     expect(gmail.accountStatus).toBe('active');
   });
 
-  it('stops deferring to an agent report once it goes stale', async () => {
+  it('does not declare an outage recovered once the report ages past the threshold', async () => {
+    // An active credential is not a service probe. Promoting it to healthy meant
+    // any ongoing outage was automatically declared fixed one hour after it was
+    // reported, on no evidence at all (Lumen, PR #505 round 2).
     inspectAccountHealth.mockResolvedValue(ACTIVE_GOOGLE);
     const { composer } = composerFor({
       integration_health: [
@@ -293,9 +302,48 @@ describe('handleGetIntegrationHealth — account health is not service health', 
     const body = parse(await handleGetIntegrationHealth({ userId: USER_ID }, composer));
     const gmail = serviceIn(body, 'google_gmail');
 
-    expect(gmail.status).toBe('healthy');
-    expect(gmail.source).toBe('live');
-    expect(gmail.supersededCachedStatus).toBe('error');
+    expect(gmail.status).not.toBe('healthy');
+    expect(gmail.status).toBe('error');
+    // The verdict is old, and says so, rather than being replaced by the account.
+    expect(gmail.source).toBe('cached');
+    expect(gmail.stale).toBe(true);
+    expect(gmail.accountHealth).toBe('ok');
+  });
+
+  it('never reports healthy for a service nobody has probed', async () => {
+    // A usable credential with no service report at all. `healthy` here would be
+    // the original bug in a new costume.
+    inspectAccountHealth.mockResolvedValue(ACTIVE_GOOGLE);
+    const { composer } = composerFor({
+      integration_health: [{ then: { data: [], error: null } }],
+    });
+
+    const body = parse(await handleGetIntegrationHealth({ userId: USER_ID }, composer));
+    const gmail = serviceIn(body, 'google_gmail');
+
+    expect(gmail.status).not.toBe('healthy');
+    expect(gmail.status).toBe('unknown');
+    expect(gmail.errorCode).toBe('never_reported');
+    expect(gmail.source).toBe('unknown');
+    expect(gmail.stale).toBe(true);
+    // Auth is fine — that is a separate question, and it gets a separate answer.
+    expect(gmail.accountHealth).toBe('ok');
+  });
+
+  it('does not present a months-old healthy row as current', async () => {
+    inspectAccountHealth.mockResolvedValue(ACTIVE_GOOGLE);
+    const { composer } = composerFor({
+      integration_health: [{ then: { data: [staleHealthyRow('google_gmail')], error: null } }],
+    });
+
+    const body = parse(await handleGetIntegrationHealth({ userId: USER_ID }, composer));
+    const gmail = serviceIn(body, 'google_gmail');
+
+    // This is the exact shape Myra read on Aug 14. It may still say healthy —
+    // it is the only service evidence there is — but never as a live reading.
+    expect(gmail.source).not.toBe('live');
+    expect(gmail.stale).toBe(true);
+    expect(gmail.lastCheckAgeSeconds).toBeGreaterThan(54 * 24 * 60 * 60);
   });
 
   it('overrides even a fresh healthy report when the credential is unusable', async () => {
@@ -321,10 +369,20 @@ describe('handleGetIntegrationHealth — account health is not service health', 
     expect(gmail.accountHealth).toBe('unusable');
   });
 
-  it('reports an account awaiting refresh as degraded, never healthy', async () => {
+  it('downgrades a fresh healthy report to degraded while a refresh is pending', async () => {
+    // The one direction account state may move a verdict: downward. The service
+    // answered a minute ago, but the next call has to refresh first and that can
+    // fail, so this is not something to relay as simply working.
     inspectAccountHealth.mockResolvedValue(REFRESHING_GOOGLE);
     const { composer } = composerFor({
-      integration_health: [{ then: { data: [], error: null } }],
+      integration_health: [
+        {
+          then: {
+            data: [freshRow('google_gmail', { status: 'healthy', error_code: null })],
+            error: null,
+          },
+        },
+      ],
     });
 
     const body = parse(await handleGetIntegrationHealth({ userId: USER_ID }, composer));
@@ -333,8 +391,22 @@ describe('handleGetIntegrationHealth — account health is not service health', 
     expect(gmail.status).toBe('degraded');
     expect(gmail.status).not.toBe('healthy');
     expect(gmail.accountHealth).toBe('refresh_required');
-    expect(gmail.errorCode).toBe('oauth_refresh_required');
-    expect(gmail.errorMessage).toContain('may fail');
+    expect(gmail.accountReason).toContain('may fail');
+  });
+
+  it('reports a pending refresh with no service report as unknown, not degraded', async () => {
+    inspectAccountHealth.mockResolvedValue(REFRESHING_GOOGLE);
+    const { composer } = composerFor({
+      integration_health: [{ then: { data: [], error: null } }],
+    });
+
+    const body = parse(await handleGetIntegrationHealth({ userId: USER_ID }, composer));
+    const gmail = serviceIn(body, 'google_gmail');
+
+    // Nobody looked at the service. The pending refresh is a fact about the
+    // credential and is reported as one.
+    expect(gmail.status).toBe('unknown');
+    expect(gmail.accountHealth).toBe('refresh_required');
   });
 
   it('still defers to a fresh service failure while a refresh is pending', async () => {
@@ -361,11 +433,31 @@ describe('handleGetIntegrationHealth — account health is not service health', 
     const gmail = serviceIn(body, 'google_gmail');
 
     expect(gmail.status).not.toBe('not_configured');
-    expect(gmail.status).toBe('error');
-    expect(gmail.errorCode).toBe('oauth_inspection_failed');
+    expect(gmail.status).not.toBe('healthy');
+    expect(gmail.status).toBe('unknown');
     // Not a live reading — the lookup itself is what failed.
     expect(gmail.source).toBe('unknown');
     expect(gmail.stale).toBe(true);
+    expect(gmail.accountHealth).toBe('unknown');
+    expect(gmail.accountReason).toContain('Could not read account state');
+  });
+
+  it('keeps a fresh concrete service failure when the account lookup fails', async () => {
+    // A failed inspection is not counter-evidence. Replacing an observed
+    // "Gmail returned 429" with a generic inspection error threw away the only
+    // real information in the response (Lumen, PR #505 round 2).
+    inspectAccountHealth.mockResolvedValue(UNKNOWN_GOOGLE);
+    const { composer } = composerFor({
+      integration_health: [{ then: { data: [freshRow('google_gmail')], error: null } }],
+    });
+
+    const body = parse(await handleGetIntegrationHealth({ userId: USER_ID }, composer));
+    const gmail = serviceIn(body, 'google_gmail');
+
+    expect(gmail.status).toBe('error');
+    expect(gmail.errorCode).toBe('rate_limited');
+    expect(gmail.errorMessage).toBe('Gmail returned 429');
+    expect(gmail.source).toBe('cached');
     expect(gmail.accountHealth).toBe('unknown');
   });
 
@@ -461,6 +553,7 @@ describe('handleGetIntegrationHealth — staleness for services with no live sig
     );
 
     expect(body.count).toBe(1);
+    expect(body.integrations[0].status).toBe('unknown');
     expect(body.integrations[0].source).toBe('unknown');
     expect(body.integrations[0].errorCode).toBe('never_reported');
     expect(body.integrations[0].stale).toBe(true);

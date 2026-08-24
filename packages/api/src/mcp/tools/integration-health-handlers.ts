@@ -60,35 +60,12 @@ function accountHealthOf(account: ProviderAccountHealth): AccountHealth {
 }
 
 /**
- * The verdict an account can support on its own, used only when there is no
- * fresher service-level report to defer to. `refresh_required` is degraded and
- * not healthy: the credential works this second and may not on the next call.
+ * What `get_integration_health` reports back. Wider than the four storable
+ * statuses by one: `unknown` means no service-level check has been recorded, and
+ * it is deliberately not writable — you should not be able to file a report
+ * saying you did not look.
  */
-function statusFromAccount(account: ProviderAccountHealth): HealthStatus {
-  switch (account.state) {
-    case 'active':
-      return 'healthy';
-    case 'refresh_required':
-      return 'degraded';
-    case 'missing':
-      return 'not_configured';
-    default:
-      return 'error';
-  }
-}
-
-function errorCodeFromAccount(account: ProviderAccountHealth): string | null {
-  switch (account.state) {
-    case 'active':
-      return null;
-    case 'refresh_required':
-      return 'oauth_refresh_required';
-    case 'unknown':
-      return 'oauth_inspection_failed';
-    default:
-      return `oauth_${account.accountStatus ?? 'missing'}`;
-  }
-}
+type ReportedStatus = HealthStatus | 'unknown';
 
 export const updateIntegrationHealthSchema = userIdentifierBaseSchema.extend({
   service: z
@@ -256,74 +233,85 @@ export async function handleGetIntegrationHealth(args: unknown, dataComposer: Da
       lastCheckAgeSeconds: cachedAge,
     };
 
-    const cached = {
-      ...base,
-      status: (row?.status ?? 'not_configured') as HealthStatus,
-      errorCode: row?.error_code ?? null,
-      errorMessage: row?.error_message ?? null,
-      source: 'cached' as const,
-      stale: cachedStale,
-    };
+    // The only service-level evidence that exists is what an agent reported.
+    // Reported months ago it is still the only evidence there is — `stale` and
+    // `lastCheckAgeSeconds` say how much to trust it.
+    const reported = row
+      ? {
+          ...base,
+          status: row.status as ReportedStatus,
+          errorCode: row.error_code ?? null,
+          errorMessage: row.error_message ?? null,
+          source: 'cached' as const,
+          stale: cachedStale,
+        }
+      : {
+          // Nobody has ever looked. That is not the same as working, and it is
+          // not the same as broken.
+          ...base,
+          status: 'unknown' as ReportedStatus,
+          errorCode: 'never_reported',
+          errorMessage: `No service-level health has ever been reported for ${service}`,
+          source: 'unknown' as const,
+          stale: true,
+        };
 
-    if (!live) {
-      // Nothing authoritative to consult — report the cache, but say how old it is.
-      if (row) return cached;
-      // Asked about a service nobody has ever reported on and that has no live
-      // signal to derive one from. Say that, rather than returning nothing and
-      // letting the silence be read as good news.
-      return {
-        ...base,
-        status: 'not_configured' as HealthStatus,
-        errorCode: 'never_reported',
-        errorMessage: `No health has ever been reported for ${service}, and it has no live signal to derive one from`,
-        source: 'unknown' as const,
-        stale: true,
-      };
-    }
+    if (!live) return reported;
 
+    const accountState = accountHealthOf(live);
     const account = {
-      accountHealth: accountHealthOf(live),
+      accountHealth: accountState,
       accountStatus: live.accountStatus,
+      accountReason: live.reason,
       accountObservedAt: live.observedAt,
       accountLastUsedAt: live.lastUsedAt,
       tokenExpiresAt: live.expiresAt,
       providerLastError: live.lastError,
     };
 
-    // A usable credential proves that auth works, and nothing more. Gmail can be
-    // rate limited, missing a scope, or simply down while the account stays
-    // perfectly active — connected_accounts has no column that could say so. So
-    // when an agent has reported a service-level failure *recently*, that report
-    // is the better evidence and it stands; the account state travels alongside
-    // it as `accountHealth` rather than overwriting it. An unusable credential is
-    // the reverse: no call can succeed, so it does override a cached claim.
-    const authUsable = live.state === 'active' || live.state === 'refresh_required';
-    if (authUsable && row && row.status !== 'healthy' && !cachedStale) {
-      return { ...cached, ...account };
+    // One rule decides the rest: account state can LOWER a service verdict,
+    // never raise it.
+    //
+    // A credential that cannot be used rules the service out no matter what
+    // anyone observed — no call can succeed — so it is the one case where the
+    // account decides `status` outright.
+    if (live.state === 'unusable' || live.state === 'missing') {
+      const liveStatus: ReportedStatus = live.state === 'missing' ? 'not_configured' : 'error';
+      return {
+        ...base,
+        status: liveStatus,
+        errorCode: `oauth_${live.accountStatus ?? 'missing'}`,
+        errorMessage: live.reason,
+        source: 'live' as const,
+        // Derived from account rows the OAuth service maintains on every call,
+        // so it is current by construction.
+        stale: false,
+        ...account,
+        // A disagreeing report is kept rather than dropped: an agent may have
+        // seen something the account table cannot represent.
+        ...(row && row.status !== liveStatus
+          ? {
+              supersededCachedStatus: row.status,
+              lastReportedError: row.error_message ?? row.error_code ?? null,
+            }
+          : {}),
+      };
     }
 
-    const liveStatus = statusFromAccount(live);
-    return {
-      ...base,
-      status: liveStatus,
-      errorCode: errorCodeFromAccount(live),
-      errorMessage: live.reason,
-      // 'unknown' is not a live reading — the account lookup itself failed, so
-      // nothing about the present has been established.
-      source: live.state === 'unknown' ? ('unknown' as const) : ('live' as const),
-      // Live state is derived from account rows the OAuth service maintains on
-      // every call, so it is current by construction.
-      stale: live.state === 'unknown',
-      ...account,
-      // A disagreeing hand-written row is kept rather than dropped: an agent may
-      // have seen a failure the account table cannot represent.
-      ...(row && row.status !== liveStatus
-        ? {
-            supersededCachedStatus: row.status,
-            lastReportedError: row.error_message ?? row.error_code ?? null,
-          }
-        : {}),
-    };
+    // Everything else — a working credential, or one we failed to read — is not
+    // evidence about the service. Promoting it to `status: healthy` is what made
+    // the original bug possible: an outage would be declared recovered the hour
+    // after it was reported, on the strength of an OAuth row nobody had probed.
+    // So the reported verdict stands, with the account state alongside it.
+    //
+    // The single exception is downward: a pending refresh may fail on the next
+    // call, so nothing is called healthy while one is outstanding.
+    const status: ReportedStatus =
+      accountState === 'refresh_required' && reported.status === 'healthy'
+        ? 'degraded'
+        : reported.status;
+
+    return { ...reported, status, ...account };
   });
 
   const unhealthy = integrations.filter((i) => i.status !== 'healthy').map((i) => i.service);
