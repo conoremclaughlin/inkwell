@@ -89,6 +89,19 @@ export interface TaskNode {
   assigneeIdentityId: string | null;
   /** The owning group's executor — 'graph' groups run the ready-node scheduler. */
   groupExecutionModel: 'linear' | 'graph' | null;
+  /**
+   * The owning group's execution phase. Executor semantics (READY, gate
+   * lifecycle) only apply while a graph group is worker_active — a pending
+   * task in a linear or idle group is just pending, not "about to run".
+   */
+  groupExecutionPhase: string | null;
+}
+
+/** Completeness of the active-task feed — the caps are reported, not silent. */
+export interface FeedMeta {
+  fetched: number;
+  total: number;
+  truncated: boolean;
 }
 
 export interface ActivityEvent {
@@ -125,6 +138,9 @@ interface CommandStore {
   tasks: TaskNode[];
   setTasks: (tasks: TaskNode[]) => void;
 
+  tasksMeta: FeedMeta | null;
+  setTasksMeta: (meta: FeedMeta | null) => void;
+
   activity: ActivityEvent[];
   addActivity: (event: ActivityEvent) => void;
   setActivity: (events: ActivityEvent[]) => void;
@@ -159,6 +175,9 @@ export const useCommandStore = create<CommandStore>((set) => ({
 
   tasks: [],
   setTasks: (tasks) => set({ tasks }),
+
+  tasksMeta: null,
+  setTasksMeta: (meta) => set({ tasksMeta: meta }),
 
   activity: [],
   addActivity: (event) => set((s) => ({ activity: [event, ...s.activity].slice(0, 100) })),

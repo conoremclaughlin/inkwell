@@ -16,6 +16,7 @@ import '@xyflow/react/dist/style.css';
 import { useCommandStore } from './store';
 import type { TaskNode as TaskNodeData } from './store';
 import { getSkin } from './skins';
+import type { SkinConfig } from './skins';
 
 // ─── Custom Task Node ───
 
@@ -260,7 +261,13 @@ function makePredicates(byId: Map<string, TaskLike>) {
     // precisely so this reads them.
     return dep.status === 'archived' || dep.outcome === 'failed' || dep.outcome === 'skipped';
   };
+  // READY is an executor verdict — "the scheduler will hand this out next" —
+  // and the executor only runs graph groups in worker_active. A pending task
+  // in a linear or ungrouped or idle-graph group is just pending; labelling
+  // it ready would call ~280 backlog items "about to run" (Lumen, round 1).
   const isReady = (t: TaskLike): boolean =>
+    t.groupExecutionModel === 'graph' &&
+    t.groupExecutionPhase === 'worker_active' &&
     t.taskType !== 'verification' &&
     t.status === 'pending' &&
     !t.claimedBySessionId &&
@@ -329,11 +336,187 @@ export function summarizeGroups(tasks: TaskLike[]): GroupSummary[] {
   );
 }
 
+// ─── Flow construction (pure — unit-testable without React) ───
+
+export interface GroupFlow {
+  nodes: Node[];
+  edges: Edge[];
+  /**
+   * Non-null when the selection should render as a scrollable LIST, not a
+   * flow canvas. Ungrouped tasks are an unbounded backlog with no declared
+   * structure — laying 160 of them out as one 14,000px column recreated the
+   * exact unreadable-wall failure this view was rebuilt to kill (Lumen,
+   * round 1). A list scrolls; a graph canvas compresses.
+   */
+  listTasks: TaskLike[] | null;
+}
+
+export function buildGroupFlow(
+  tasks: TaskLike[],
+  activeGroupId: string | null,
+  skin: SkinConfig
+): GroupFlow {
+  const n: Node[] = [];
+  const e: Edge[] = [];
+  if (!activeGroupId) return { nodes: n, edges: e, listTasks: null };
+
+  if (activeGroupId === UNGROUPED) {
+    const statusOrder: Record<string, number> = { in_progress: 0, pending: 1, blocked: 2 };
+    const listTasks = tasks
+      .filter((t) => !t.groupId)
+      .sort(
+        (a, b) =>
+          (statusOrder[a.status] ?? 9) - (statusOrder[b.status] ?? 9) ||
+          a.title.localeCompare(b.title)
+      );
+    return { nodes: n, edges: e, listTasks };
+  }
+
+  // Readiness is judged over the FULL fetched set (a blocker may live in
+  // another group), but only the focused group's nodes are drawn.
+  const byId = new Map(tasks.map((t) => [t.id, t]));
+  const { isReady, hasFailedDep } = makePredicates(byId);
+
+  const shown = tasks.filter((t) => t.groupId === activeGroupId);
+  const shownIds = new Set(shown.map((t) => t.id));
+
+  // Only edges with both endpoints on this canvas are drawable; deps that
+  // are fetched but outside the group still count for the blocked flag.
+  const dependenciesShown = (id: string) =>
+    (byId.get(id)?.blockedBy ?? []).filter((d) => shownIds.has(d));
+  const dependenciesFetched = (id: string) =>
+    (byId.get(id)?.blockedBy ?? []).filter((d) => byId.has(d));
+
+  const { depth, cyclic, backEdges } = computeDepths(
+    shown.map((t) => t.id),
+    dependenciesShown
+  );
+
+  const COL = 240;
+  const ROW = 92;
+
+  const rowInColumn = new Map<number, number>();
+  // Stable order within a column so the layout doesn't reshuffle on every
+  // poll: declared order first, then title.
+  const ordered = [...shown].sort(
+    (a, b) =>
+      (a.taskOrder ?? Number.MAX_SAFE_INTEGER) - (b.taskOrder ?? Number.MAX_SAFE_INTEGER) ||
+      a.title.localeCompare(b.title)
+  );
+
+  for (const task of ordered) {
+    const d = depth.get(task.id) ?? 0;
+    const row = rowInColumn.get(d) ?? 0;
+    rowInColumn.set(d, row + 1);
+
+    n.push({
+      id: `task-${task.id}`,
+      type: 'taskNode',
+      position: { x: 200 + d * COL, y: row * ROW },
+      data: {
+        label: task.title,
+        status: task.status,
+        priority: task.priority,
+        agentId: task.agentId,
+        blocked: dependenciesFetched(task.id).length > 0,
+        cyclic: cyclic.has(task.id),
+        taskType: task.taskType,
+        gateState: task.gateState,
+        gateAttempt: task.gateAttempt,
+        eligibleAt: task.eligibleAt,
+        claimed: Boolean(task.claimedBySessionId),
+        ready: isReady(task),
+        depFailed: hasFailedDep(task),
+      },
+    });
+  }
+
+  const isGraphGroup = shown[0]?.groupExecutionModel === 'graph';
+  const groupEdgeCount = shown.reduce((sum, t) => sum + dependenciesShown(t.id).length, 0);
+
+  if (activeGroupId !== UNGROUPED) {
+    const midY = ((Math.max(1, ...rowInColumn.values()) - 1) * ROW) / 2;
+    n.push({
+      id: `group-${activeGroupId}`,
+      type: 'groupHeader',
+      position: { x: -80, y: midY },
+      data: {
+        label: shown[0]?.groupTitle ?? 'Task Group',
+        model: shown[0]?.groupExecutionModel ?? null,
+      },
+    });
+
+    // Header connects to the entry points — every task nothing else blocks.
+    for (const task of shown) {
+      if (dependenciesShown(task.id).length > 0) continue;
+      e.push({
+        id: `e-group-${activeGroupId}-task-${task.id}`,
+        source: `group-${activeGroupId}`,
+        target: `task-${task.id}`,
+        animated: task.status === 'in_progress',
+        style: { stroke: skin.colors.accent + '60' },
+      });
+    }
+  }
+
+  // A group with no recorded dependencies is a list, and the honest way to
+  // draw a list is as a dashed sequence — implied by task_order, not
+  // declared by anyone. Solid edges are reserved for real blocked_by
+  // links, so the picture never claims a dependency the data doesn't have.
+  // A GRAPH group with no edges is different: genuinely parallel work,
+  // not an implied order — drawing a sequence there would lie.
+  if (groupEdgeCount === 0 && shown.length > 1 && !isGraphGroup && activeGroupId !== UNGROUPED) {
+    const seq = [...shown].sort(
+      (a, b) => (a.taskOrder ?? Number.MAX_SAFE_INTEGER) - (b.taskOrder ?? Number.MAX_SAFE_INTEGER)
+    );
+    for (let i = 1; i < seq.length; i += 1) {
+      e.push({
+        id: `e-seq-${seq[i - 1].id}-${seq[i].id}`,
+        source: `task-${seq[i - 1].id}`,
+        target: `task-${seq[i].id}`,
+        animated: false,
+        style: { stroke: skin.colors.border, strokeDasharray: '4 4' },
+      });
+    }
+  }
+
+  // Dependency edges within the focused group.
+  for (const task of shown) {
+    for (const depId of dependenciesShown(task.id)) {
+      const blocker = byId.get(depId)!;
+      // The one edge that closes a cycle is the one edge the layout could
+      // not honour, so it is the one edge that points backwards. Draw it —
+      // it is a real dependency — but mark it, rather than letting it read
+      // as an ordinary link the reader is meant to trust.
+      const isBackEdge = backEdges.has(`${depId}->${task.id}`);
+      e.push({
+        id: `e-dep-${depId}-${task.id}`,
+        source: `task-${depId}`,
+        target: `task-${task.id}`,
+        animated: !isBackEdge && task.status === 'in_progress',
+        label: isBackEdge ? '⚠ cycle' : undefined,
+        style: {
+          stroke: isBackEdge
+            ? skin.colors.taskBlocked
+            : blocker.status === 'completed'
+              ? skin.colors.taskCompleted + '80'
+              : skin.colors.taskBlocked + '90',
+          strokeWidth: isBackEdge ? 2 : 1,
+          ...(isBackEdge ? { strokeDasharray: '6 3' } : {}),
+        },
+      });
+    }
+  }
+
+  return { nodes: n, edges: e, listTasks: null };
+}
+
 // ─── Task Graph Component ───
 
 export function TaskGraph() {
   const skin = getSkin(useCommandStore((s) => s.skin));
   const tasks = useCommandStore((s) => s.tasks);
+  const tasksMeta = useCommandStore((s) => s.tasksMeta);
   const selectedTaskGroup = useCommandStore((s) => s.selectedTaskGroup);
   const selectTaskGroup = useCommandStore((s) => s.selectTaskGroup);
 
@@ -348,153 +531,10 @@ export function TaskGraph() {
       ? selectedTaskGroup
       : (groupList[0]?.id ?? null);
 
-  const { nodes, edges } = useMemo(() => {
-    const n: Node[] = [];
-    const e: Edge[] = [];
-    if (!activeGroupId) return { nodes: n, edges: e };
-
-    // Readiness is judged over the FULL fetched set (a blocker may live in
-    // another group), but only the focused group's nodes are drawn.
-    const byId = new Map(tasks.map((t) => [t.id, t]));
-    const { isReady, hasFailedDep } = makePredicates(byId);
-
-    const shown =
-      activeGroupId === UNGROUPED
-        ? tasks.filter((t) => !t.groupId)
-        : tasks.filter((t) => t.groupId === activeGroupId);
-    const shownIds = new Set(shown.map((t) => t.id));
-
-    // Only edges with both endpoints on this canvas are drawable; deps that
-    // are fetched but outside the group still count for the blocked flag.
-    const dependenciesShown = (id: string) =>
-      (byId.get(id)?.blockedBy ?? []).filter((d) => shownIds.has(d));
-    const dependenciesFetched = (id: string) =>
-      (byId.get(id)?.blockedBy ?? []).filter((d) => byId.has(d));
-
-    const { depth, cyclic, backEdges } = computeDepths(
-      shown.map((t) => t.id),
-      dependenciesShown
-    );
-
-    const COL = 240;
-    const ROW = 92;
-
-    const rowInColumn = new Map<number, number>();
-    // Stable order within a column so the layout doesn't reshuffle on every
-    // poll: declared order first, then title.
-    const ordered = [...shown].sort(
-      (a, b) =>
-        (a.taskOrder ?? Number.MAX_SAFE_INTEGER) - (b.taskOrder ?? Number.MAX_SAFE_INTEGER) ||
-        a.title.localeCompare(b.title)
-    );
-
-    for (const task of ordered) {
-      const d = depth.get(task.id) ?? 0;
-      const row = rowInColumn.get(d) ?? 0;
-      rowInColumn.set(d, row + 1);
-
-      n.push({
-        id: `task-${task.id}`,
-        type: 'taskNode',
-        position: { x: 200 + d * COL, y: row * ROW },
-        data: {
-          label: task.title,
-          status: task.status,
-          priority: task.priority,
-          agentId: task.agentId,
-          blocked: dependenciesFetched(task.id).length > 0,
-          cyclic: cyclic.has(task.id),
-          taskType: task.taskType,
-          gateState: task.gateState,
-          gateAttempt: task.gateAttempt,
-          eligibleAt: task.eligibleAt,
-          claimed: Boolean(task.claimedBySessionId),
-          ready: isReady(task),
-          depFailed: hasFailedDep(task),
-        },
-      });
-    }
-
-    const isGraphGroup = shown[0]?.groupExecutionModel === 'graph';
-    const groupEdgeCount = shown.reduce((sum, t) => sum + dependenciesShown(t.id).length, 0);
-
-    if (activeGroupId !== UNGROUPED) {
-      const midY = ((Math.max(1, ...rowInColumn.values()) - 1) * ROW) / 2;
-      n.push({
-        id: `group-${activeGroupId}`,
-        type: 'groupHeader',
-        position: { x: -80, y: midY },
-        data: {
-          label: shown[0]?.groupTitle ?? 'Task Group',
-          model: shown[0]?.groupExecutionModel ?? null,
-        },
-      });
-
-      // Header connects to the entry points — every task nothing else blocks.
-      for (const task of shown) {
-        if (dependenciesShown(task.id).length > 0) continue;
-        e.push({
-          id: `e-group-${activeGroupId}-task-${task.id}`,
-          source: `group-${activeGroupId}`,
-          target: `task-${task.id}`,
-          animated: task.status === 'in_progress',
-          style: { stroke: skin.colors.accent + '60' },
-        });
-      }
-    }
-
-    // A group with no recorded dependencies is a list, and the honest way to
-    // draw a list is as a dashed sequence — implied by task_order, not
-    // declared by anyone. Solid edges are reserved for real blocked_by
-    // links, so the picture never claims a dependency the data doesn't have.
-    // A GRAPH group with no edges is different: genuinely parallel work,
-    // not an implied order — drawing a sequence there would lie.
-    if (groupEdgeCount === 0 && shown.length > 1 && !isGraphGroup && activeGroupId !== UNGROUPED) {
-      const seq = [...shown].sort(
-        (a, b) =>
-          (a.taskOrder ?? Number.MAX_SAFE_INTEGER) - (b.taskOrder ?? Number.MAX_SAFE_INTEGER)
-      );
-      for (let i = 1; i < seq.length; i += 1) {
-        e.push({
-          id: `e-seq-${seq[i - 1].id}-${seq[i].id}`,
-          source: `task-${seq[i - 1].id}`,
-          target: `task-${seq[i].id}`,
-          animated: false,
-          style: { stroke: skin.colors.border, strokeDasharray: '4 4' },
-        });
-      }
-    }
-
-    // Dependency edges within the focused group.
-    for (const task of shown) {
-      for (const depId of dependenciesShown(task.id)) {
-        const blocker = byId.get(depId)!;
-        // The one edge that closes a cycle is the one edge the layout could
-        // not honour, so it is the one edge that points backwards. Draw it —
-        // it is a real dependency — but mark it, rather than letting it read
-        // as an ordinary link the reader is meant to trust.
-        const isBackEdge = backEdges.has(`${depId}->${task.id}`);
-        e.push({
-          id: `e-dep-${depId}-${task.id}`,
-          source: `task-${depId}`,
-          target: `task-${task.id}`,
-          animated: !isBackEdge && task.status === 'in_progress',
-          label: isBackEdge ? '⚠ cycle' : undefined,
-          style: {
-            stroke: isBackEdge
-              ? skin.colors.taskBlocked
-              : blocker.status === 'completed'
-                ? skin.colors.taskCompleted + '80'
-                : skin.colors.taskBlocked + '90',
-            strokeWidth: isBackEdge ? 2 : 1,
-            ...(isBackEdge ? { strokeDasharray: '6 3' } : {}),
-          },
-        });
-      }
-    }
-
-    return { nodes: n, edges: e };
-  }, [tasks, skin, activeGroupId]);
+  const { nodes, edges, listTasks } = useMemo(
+    () => buildGroupFlow(tasks, activeGroupId, skin),
+    [tasks, skin, activeGroupId]
+  );
 
   if (tasks.length === 0) {
     return (
@@ -533,6 +573,19 @@ export function TaskGraph() {
         >
           Task Groups ({groupList.length})
         </div>
+        {tasksMeta?.truncated && (
+          <div
+            className="mx-3 mb-2 px-2 py-1 rounded text-[10px]"
+            style={{
+              backgroundColor: skin.colors.taskBlocked + '18',
+              color: skin.colors.taskBlocked,
+              fontFamily: skin.fonts.mono,
+            }}
+          >
+            ⚠ showing {tasksMeta.fetched} of {tasksMeta.total} active tasks — oldest omitted; counts
+            and readiness may be incomplete
+          </div>
+        )}
         {groupList.map((g) => {
           const selected = g.id === activeGroupId;
           return (
@@ -591,48 +644,99 @@ export function TaskGraph() {
         })}
       </div>
 
-      {/* Focused group graph. Keyed by group so ReactFlow re-mounts and
+      {/* Ungrouped renders as a scrollable list — see GroupFlow.listTasks. */}
+      {listTasks ? (
+        <div className="flex-1 min-w-0 overflow-y-auto p-4">
+          <div
+            className="text-[10px] uppercase tracking-wider mb-2"
+            style={{ color: skin.colors.textMuted, fontFamily: skin.fonts.mono }}
+          >
+            {listTasks.length} ungrouped tasks — no declared structure, listed by status
+          </div>
+          <div className="space-y-1 max-w-2xl">
+            {listTasks.map((t) => {
+              const statusColor =
+                t.status === 'in_progress'
+                  ? skin.colors.taskInProgress
+                  : t.status === 'blocked'
+                    ? skin.colors.taskBlocked
+                    : skin.colors.taskPending;
+              return (
+                <div
+                  key={t.id}
+                  className="flex items-center gap-2 px-2 py-1.5 rounded text-xs"
+                  style={{ backgroundColor: skin.colors.bg, fontFamily: skin.fonts.body }}
+                >
+                  <span
+                    className="w-2 h-2 rounded-full shrink-0"
+                    style={{ backgroundColor: statusColor }}
+                  />
+                  <span className="truncate" style={{ color: skin.colors.text }}>
+                    {t.title}
+                  </span>
+                  <span
+                    className="ml-auto shrink-0 text-[10px]"
+                    style={{ color: statusColor, fontFamily: skin.fonts.mono }}
+                  >
+                    {t.status}
+                  </span>
+                  {t.agentId && (
+                    <span
+                      className="shrink-0 text-[10px]"
+                      style={{ color: skin.colors.textMuted, fontFamily: skin.fonts.mono }}
+                    >
+                      {t.agentId}
+                    </span>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      ) : (
+        /* Focused group graph. Keyed by group so ReactFlow re-mounts and
           re-fits the viewport on every selection instead of leaving the
           camera where the previous graph was. Node-count presence is part of
           the key because fitView only runs on mount: on first load the flow
           mounts before the poll returns, and without the remount the graph
-          renders wherever the default camera happened to be. */}
-      <div className="flex-1 min-w-0">
-        <ReactFlow
-          key={`${activeGroupId ?? 'none'}-${nodes.length === 0 ? 'empty' : 'ready'}`}
-          nodes={nodes}
-          edges={edges}
-          nodeTypes={nodeTypes}
-          fitView
-          fitViewOptions={{ maxZoom: 1 }}
-          proOptions={{ hideAttribution: true }}
-          style={{ backgroundColor: skin.colors.bg }}
-        >
-          <Background color={skin.colors.border} gap={20} />
-          <Controls
-            style={{
-              backgroundColor: skin.colors.surface,
-              borderColor: skin.colors.border,
-            }}
-          />
-          <MiniMap
-            style={{
-              backgroundColor: skin.colors.bg,
-              border: `1px solid ${skin.colors.border}`,
-            }}
-            // Default mask is light gray — on a dark skin it renders as a
-            // glaring box that hides the map it is supposed to frame.
-            maskColor={skin.colors.bg + 'b3'}
-            nodeColor={(node) => {
-              const status = node.data?.status as string;
-              if (status === 'completed') return skin.colors.taskCompleted;
-              if (status === 'in_progress') return skin.colors.taskInProgress;
-              if (status === 'blocked') return skin.colors.taskBlocked;
-              return skin.colors.taskPending;
-            }}
-          />
-        </ReactFlow>
-      </div>
+          renders wherever the default camera happened to be. */
+        <div className="flex-1 min-w-0">
+          <ReactFlow
+            key={`${activeGroupId ?? 'none'}-${nodes.length === 0 ? 'empty' : 'ready'}`}
+            nodes={nodes}
+            edges={edges}
+            nodeTypes={nodeTypes}
+            fitView
+            fitViewOptions={{ maxZoom: 1 }}
+            proOptions={{ hideAttribution: true }}
+            style={{ backgroundColor: skin.colors.bg }}
+          >
+            <Background color={skin.colors.border} gap={20} />
+            <Controls
+              style={{
+                backgroundColor: skin.colors.surface,
+                borderColor: skin.colors.border,
+              }}
+            />
+            <MiniMap
+              style={{
+                backgroundColor: skin.colors.bg,
+                border: `1px solid ${skin.colors.border}`,
+              }}
+              // Default mask is light gray — on a dark skin it renders as a
+              // glaring box that hides the map it is supposed to frame.
+              maskColor={skin.colors.bg + 'b3'}
+              nodeColor={(node) => {
+                const status = node.data?.status as string;
+                if (status === 'completed') return skin.colors.taskCompleted;
+                if (status === 'in_progress') return skin.colors.taskInProgress;
+                if (status === 'blocked') return skin.colors.taskBlocked;
+                return skin.colors.taskPending;
+              }}
+            />
+          </ReactFlow>
+        </div>
+      )}
     </div>
   );
 }

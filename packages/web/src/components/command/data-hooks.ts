@@ -72,6 +72,13 @@ interface TaskGroupItem {
   agentId: string | null;
   agentName: string | null;
   executionModel?: 'linear' | 'graph';
+  executionPhase?: string;
+}
+
+interface FeedMetaResponse {
+  fetched: number;
+  total: number;
+  truncated: boolean;
 }
 
 interface ActivityEventItem {
@@ -91,6 +98,7 @@ interface ActivityResponse {
 interface TasksResponse {
   tasks: TaskItem[];
   stats: Record<string, number>;
+  meta?: FeedMetaResponse;
 }
 
 // The endpoint has always returned `groups`; this hook used to type the key
@@ -146,6 +154,7 @@ export function useCommandData() {
   const setAgents = useCommandStore((s) => s.setAgents);
   const setStudios = useCommandStore((s) => s.setStudios);
   const setTasks = useCommandStore((s) => s.setTasks);
+  const setTasksMeta = useCommandStore((s) => s.setTasksMeta);
   const setActivity = useCommandStore((s) => s.setActivity);
 
   const { data: studiosData } = useApiQuery<StudiosResponse>(
@@ -278,11 +287,13 @@ export function useCommandData() {
         claimedBySessionId: t.claimedBySessionId ?? null,
         assigneeIdentityId: t.assigneeIdentityId ?? null,
         groupExecutionModel: group?.executionModel ?? null,
+        groupExecutionPhase: group?.executionPhase ?? null,
       };
     });
 
     setTasks(taskNodes);
-  }, [tasksData, groupsData, setTasks]);
+    setTasksMeta(tasksData.meta ?? null);
+  }, [tasksData, groupsData, setTasks, setTasksMeta]);
 
   // Transform activity events
   useEffect(() => {

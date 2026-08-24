@@ -190,7 +190,8 @@ describe('executionLabel', () => {
 
 // ─── summarizeGroups ───
 
-import { summarizeGroups } from './task-graph';
+import { summarizeGroups, buildGroupFlow } from './task-graph';
+import { getSkin } from './skins';
 import type { TaskNode } from './store';
 
 function task(overrides: Partial<TaskNode> & { id: string }): TaskNode {
@@ -211,9 +212,13 @@ function task(overrides: Partial<TaskNode> & { id: string }): TaskNode {
     claimedBySessionId: null,
     assigneeIdentityId: null,
     groupExecutionModel: null,
+    groupExecutionPhase: null,
     ...overrides,
   };
 }
+
+/** Marks a task as living in an executable graph group. */
+const executable = { groupExecutionModel: 'graph', groupExecutionPhase: 'worker_active' } as const;
 
 describe('summarizeGroups', () => {
   it('sorts running work above open gates above ready above size', () => {
@@ -238,37 +243,26 @@ describe('summarizeGroups', () => {
       }),
       // g-run: one in-progress task
       task({ id: 'run-1', groupId: 'g-run', groupTitle: 'Running', status: 'in_progress' }),
-      // g-ready: one ready task
-      task({ id: 'ready-1', groupId: 'g-ready', groupTitle: 'Ready' }),
+      // g-ready: one ready task in an executable graph group
+      task({ id: 'ready-1', groupId: 'g-ready', groupTitle: 'Ready', ...executable }),
     ];
     const ordered = summarizeGroups(tasks).map((g) => g.id);
     expect(ordered).toEqual(['g-run', 'g-gate', 'g-ready', 'g-big']);
   });
 
   it('counts gates, failures, and readiness per the SATISFIES mirror', () => {
+    const inG = { groupId: 'g', groupTitle: 'G', ...executable };
     const tasks: TaskNode[] = [
-      task({ id: 'w1', groupId: 'g', groupTitle: 'G', status: 'completed' }),
+      task({ id: 'w1', ...inG, status: 'completed' }),
       // ready: sole dep is completed work
-      task({ id: 'w2', groupId: 'g', groupTitle: 'G', blockedBy: ['w1'] }),
+      task({ id: 'w2', ...inG, blockedBy: ['w1'] }),
       // NOT ready: claimed
-      task({ id: 'w3', groupId: 'g', groupTitle: 'G', claimedBySessionId: 'sess-1' }),
+      task({ id: 'w3', ...inG, claimedBySessionId: 'sess-1' }),
       // failed gate counts in failed, not gatesOpen
-      task({
-        id: 'v1',
-        groupId: 'g',
-        groupTitle: 'G',
-        taskType: 'verification',
-        gateState: 'failed',
-      }),
+      task({ id: 'v1', ...inG, taskType: 'verification', gateState: 'failed' }),
       // downstream of the failed gate: dependency-failure
-      task({ id: 'w4', groupId: 'g', groupTitle: 'G', blockedBy: ['v1'] }),
-      task({
-        id: 'v2',
-        groupId: 'g',
-        groupTitle: 'G',
-        taskType: 'verification',
-        gateState: 'in_progress',
-      }),
+      task({ id: 'w4', ...inG, blockedBy: ['v1'] }),
+      task({ id: 'v2', ...inG, taskType: 'verification', gateState: 'in_progress' }),
     ];
     const [g] = summarizeGroups(tasks);
     expect(g.total).toBe(6);
@@ -286,5 +280,65 @@ describe('summarizeGroups', () => {
     const ungrouped = rows.find((r) => r.id === 'ungrouped');
     expect(ungrouped?.title).toBe('Ungrouped');
     expect(ungrouped?.total).toBe(1);
+  });
+
+  it('READY is executor-scoped: linear, ungrouped, and idle-graph tasks are never ready', () => {
+    // Identical pending/unclaimed/no-dep tasks; only the executable graph
+    // group's task earns the READY verdict — the executor will not act on
+    // the others, so calling them ready lies about "what's about to occur".
+    const tasks: TaskNode[] = [
+      task({ id: 'lin', groupId: 'g-linear', groupTitle: 'Linear' }),
+      task({ id: 'solo' }),
+      task({
+        id: 'idle',
+        groupId: 'g-idle',
+        groupTitle: 'Authoring',
+        groupExecutionModel: 'graph',
+        groupExecutionPhase: 'idle',
+      }),
+      task({ id: 'exec', groupId: 'g-exec', groupTitle: 'Executing', ...executable }),
+    ];
+    const byId = Object.fromEntries(summarizeGroups(tasks).map((g) => [g.id, g.ready]));
+    expect(byId).toEqual({ 'g-linear': 0, ungrouped: 0, 'g-idle': 0, 'g-exec': 1 });
+  });
+});
+
+// ─── buildGroupFlow ───
+
+describe('buildGroupFlow', () => {
+  const skin = getSkin('pixel');
+
+  it('regression: a large ungrouped set renders as a LIST, never a node column', () => {
+    // 200 live ungrouped tasks once produced a ~18,000px single-column flow
+    // compressed to nothing by fitView — the original unreadable wall.
+    const tasks: TaskNode[] = Array.from({ length: 200 }, (_, i) => task({ id: `solo-${i}` }));
+    const flow = buildGroupFlow(tasks, 'ungrouped', skin);
+    expect(flow.nodes).toHaveLength(0);
+    expect(flow.edges).toHaveLength(0);
+    expect(flow.listTasks).toHaveLength(200);
+  });
+
+  it('ungrouped list orders by status then title', () => {
+    const tasks: TaskNode[] = [
+      task({ id: 'b-pend', title: 'b', status: 'pending' }),
+      task({ id: 'z-run', title: 'z', status: 'in_progress' }),
+      task({ id: 'a-block', title: 'a', status: 'blocked' }),
+    ];
+    const flow = buildGroupFlow(tasks, 'ungrouped', skin);
+    expect(flow.listTasks?.map((t) => t.id)).toEqual(['z-run', 'b-pend', 'a-block']);
+  });
+
+  it('a graph group renders its own nodes plus the header, nothing else', () => {
+    const tasks: TaskNode[] = [
+      task({ id: 'in-1', groupId: 'g1', groupTitle: 'Mine', ...executable }),
+      task({ id: 'in-2', groupId: 'g1', groupTitle: 'Mine', blockedBy: ['in-1'], ...executable }),
+      task({ id: 'other', groupId: 'g2', groupTitle: 'Other' }),
+      task({ id: 'solo' }),
+    ];
+    const flow = buildGroupFlow(tasks, 'g1', skin);
+    expect(flow.listTasks).toBeNull();
+    expect(flow.nodes.map((n) => n.id).sort()).toEqual(['group-g1', 'task-in-1', 'task-in-2']);
+    // in-1 → in-2 dependency edge plus header → entry-point edge
+    expect(flow.edges.map((e) => e.id).sort()).toEqual(['e-dep-in-1-in-2', 'e-group-g1-task-in-1']);
   });
 });
