@@ -62,28 +62,62 @@ interface TaskItem {
   gateAttempt?: number | null;
   eligibleAt?: string | null;
   claimedBySessionId?: string | null;
+  assigneeIdentityId?: string | null;
 }
 
 interface TaskGroupItem {
   id: string;
   title: string;
+  status?: string;
   agentId: string | null;
   agentName: string | null;
   executionModel?: 'linear' | 'graph';
+  executionPhase?: string;
+}
+
+interface FeedMetaResponse {
+  fetched: number;
+  total: number;
+  truncated: boolean;
+}
+
+interface ActivityEventItem {
+  id: string;
+  type: string;
+  subtype: string | null;
+  agentId: string | null;
+  content: string | null;
+  status: string | null;
+  createdAt: string;
+}
+
+interface ActivityResponse {
+  events: ActivityEventItem[];
 }
 
 interface TasksResponse {
   tasks: TaskItem[];
   stats: Record<string, number>;
+  meta?: FeedMetaResponse;
 }
 
 // The endpoint has always returned `groups`; this hook used to type the key
 // as `taskGroups`, so the map silently never resolved group titles.
 interface TaskGroupsResponse {
   groups: TaskGroupItem[];
+  meta?: FeedMetaResponse;
 }
 
 // ─── Layout helpers ───
+
+/**
+ * Radius that fits `count` studio nodes (~56px wide each) around a circle
+ * without overlap. The old fixed 65px radius was sized for 2-3 studios;
+ * an agent holding 15 rendered as a single unreadable smear.
+ */
+function studioRingRadius(count: number): number {
+  return Math.max(65, (count * 78) / (2 * Math.PI));
+}
 
 function arrangeStudiosInCircle(
   studios: StudioInfo[],
@@ -121,6 +155,8 @@ export function useCommandData() {
   const setAgents = useCommandStore((s) => s.setAgents);
   const setStudios = useCommandStore((s) => s.setStudios);
   const setTasks = useCommandStore((s) => s.setTasks);
+  const setTasksMeta = useCommandStore((s) => s.setTasksMeta);
+  const setGroupsMeta = useCommandStore((s) => s.setGroupsMeta);
   const setActivity = useCommandStore((s) => s.setActivity);
 
   const { data: studiosData } = useApiQuery<StudiosResponse>(
@@ -141,6 +177,12 @@ export function useCommandData() {
     { refetchInterval: 10000 }
   );
 
+  const { data: activityData } = useApiQuery<ActivityResponse>(
+    ['command-activity'],
+    '/api/admin/activity?limit=50',
+    { refetchInterval: 10000 }
+  );
+
   // Transform studios data into agent + studio state
   useEffect(() => {
     if (!studiosData?.agents) return;
@@ -149,8 +191,16 @@ export function useCommandData() {
     const studioNodes: StudioNode[] = [];
 
     const cols = Math.min(3, studiosData.agents.length);
-    const colSpacing = 200;
-    const rowSpacing = 200;
+    // Spacing must clear the widest studio ring, or dense agents (one agent
+    // can hold 15 worktrees) overlap their neighbours into a single blob.
+    const maxRing = Math.max(
+      65,
+      ...studiosData.agents.map((a) =>
+        studioRingRadius(a.studios.filter((s) => s.status !== 'cleaned').length)
+      )
+    );
+    const colSpacing = maxRing * 2 + 140;
+    const rowSpacing = maxRing * 2 + 140;
 
     studiosData.agents.forEach((agent, agentIdx) => {
       const col = agentIdx % cols;
@@ -181,6 +231,7 @@ export function useCommandData() {
         name: agent.agentName,
         role: agent.agentRole,
         backend: agent.backend,
+        sbId: agent.sbId ?? null,
         studioId: heldStudio?.id ?? null,
         studioSlug: heldStudio?.slug ?? null,
         heldStudioIds: heldStudios.map((s) => s.id),
@@ -192,12 +243,13 @@ export function useCommandData() {
         targetPosition: null,
       });
 
+      const visibleStudios = agent.studios.filter((s) => s.status !== 'cleaned');
       const arranged = arrangeStudiosInCircle(
-        agent.studios.filter((s) => s.status !== 'cleaned'),
+        visibleStudios,
         agent.agentId,
         centerX,
         centerY,
-        65
+        studioRingRadius(visibleStudios.length)
       );
       studioNodes.push(...arranged);
     });
@@ -235,10 +287,37 @@ export function useCommandData() {
         gateAttempt: t.gateAttempt ?? null,
         eligibleAt: t.eligibleAt ?? null,
         claimedBySessionId: t.claimedBySessionId ?? null,
+        assigneeIdentityId: t.assigneeIdentityId ?? null,
         groupExecutionModel: group?.executionModel ?? null,
+        groupExecutionPhase: group?.executionPhase ?? null,
       };
     });
 
     setTasks(taskNodes);
-  }, [tasksData, groupsData, setTasks]);
+    setTasksMeta(tasksData.meta ?? null);
+  }, [tasksData, groupsData, setTasks, setTasksMeta]);
+
+  // A truncated group feed silently loses titles, models, and phases for
+  // tasks past the cap — surfaced separately from task truncation because
+  // either feed can overflow while the other is fine.
+  useEffect(() => {
+    if (!groupsData) return;
+    setGroupsMeta(groupsData.meta ?? null);
+  }, [groupsData, setGroupsMeta]);
+
+  // Transform activity events
+  useEffect(() => {
+    if (!activityData?.events) return;
+    setActivity(
+      activityData.events.map((e) => ({
+        id: e.id,
+        type: e.type,
+        subtype: e.subtype,
+        agentId: e.agentId,
+        content: e.content,
+        status: e.status,
+        timestamp: e.createdAt,
+      }))
+    );
+  }, [activityData, setActivity]);
 }

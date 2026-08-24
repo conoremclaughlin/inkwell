@@ -9,6 +9,8 @@ export interface AgentState {
   name: string;
   role: string | null;
   backend: string | null;
+  /** Identity UUID (agent_identities.id) — matches task assignee references. */
+  sbId: string | null;
   /** Primary studio the agent holds. Null when it holds none. */
   studioId: string | null;
   studioSlug: string | null;
@@ -83,15 +85,32 @@ export interface TaskNode {
   /** Dwelling gates: when the gate becomes openable (scheduled ≠ stalled). */
   eligibleAt: string | null;
   claimedBySessionId: string | null;
+  /** Identity UUID this node is assigned to (verdict authority for gates). */
+  assigneeIdentityId: string | null;
   /** The owning group's executor — 'graph' groups run the ready-node scheduler. */
   groupExecutionModel: 'linear' | 'graph' | null;
+  /**
+   * The owning group's execution phase. Executor semantics (READY, gate
+   * lifecycle) only apply while a graph group is worker_active — a pending
+   * task in a linear or idle group is just pending, not "about to run".
+   */
+  groupExecutionPhase: string | null;
+}
+
+/** Completeness of the active-task feed — the caps are reported, not silent. */
+export interface FeedMeta {
+  fetched: number;
+  total: number;
+  truncated: boolean;
 }
 
 export interface ActivityEvent {
   id: string;
   type: string;
+  subtype: string | null;
   agentId: string | null;
-  content: string;
+  content: string | null;
+  status: string | null;
   timestamp: string;
 }
 
@@ -119,6 +138,12 @@ interface CommandStore {
   tasks: TaskNode[];
   setTasks: (tasks: TaskNode[]) => void;
 
+  tasksMeta: FeedMeta | null;
+  setTasksMeta: (meta: FeedMeta | null) => void;
+
+  groupsMeta: FeedMeta | null;
+  setGroupsMeta: (meta: FeedMeta | null) => void;
+
   activity: ActivityEvent[];
   addActivity: (event: ActivityEvent) => void;
   setActivity: (events: ActivityEvent[]) => void;
@@ -128,6 +153,14 @@ interface CommandStore {
 
   selectedStudio: string | null;
   selectStudio: (studioId: string | null) => void;
+
+  /**
+   * Group focused in the TASKS view. Hundreds of active tasks exist at any
+   * time, so the graph renders ONE group's tasks; this picks which. Null =
+   * nothing picked yet (the view defaults to the most active group).
+   */
+  selectedTaskGroup: string | null;
+  selectTaskGroup: (groupId: string | null) => void;
 
   showTaskGraph: boolean;
   toggleTaskGraph: () => void;
@@ -146,6 +179,12 @@ export const useCommandStore = create<CommandStore>((set) => ({
   tasks: [],
   setTasks: (tasks) => set({ tasks }),
 
+  tasksMeta: null,
+  setTasksMeta: (meta) => set({ tasksMeta: meta }),
+
+  groupsMeta: null,
+  setGroupsMeta: (meta) => set({ groupsMeta: meta }),
+
   activity: [],
   addActivity: (event) => set((s) => ({ activity: [event, ...s.activity].slice(0, 100) })),
   setActivity: (events) => set({ activity: events }),
@@ -155,6 +194,9 @@ export const useCommandStore = create<CommandStore>((set) => ({
 
   selectedStudio: null,
   selectStudio: (studioId) => set({ selectedStudio: studioId }),
+
+  selectedTaskGroup: null,
+  selectTaskGroup: (groupId) => set({ selectedTaskGroup: groupId }),
 
   showTaskGraph: true,
   toggleTaskGraph: () => set((s) => ({ showTaskGraph: !s.showTaskGraph })),

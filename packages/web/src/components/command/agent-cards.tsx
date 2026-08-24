@@ -21,6 +21,7 @@ function formatBackend(b: string | null): string {
     'codex-cli': 'Codex CLI',
     codex: 'Codex',
     gemini: 'Gemini',
+    ink: 'Inkwell',
   };
   return map[b] ?? b;
 }
@@ -40,6 +41,9 @@ function timeAgo(ts: string | null): string {
 function lifecycleColor(lifecycle: string | null, phase: string | null, skin: SkinConfig): string {
   if (lifecycle === 'running') return skin.colors.agentActive;
   if (phase?.startsWith('blocked')) return skin.colors.agentBlocked;
+  // No session at all is offline, and a green dot on an offline agent claims
+  // presence that isn't there.
+  if (!lifecycle) return skin.colors.border;
   return skin.colors.agentIdle;
 }
 
@@ -52,41 +56,45 @@ function lifecycleLabel(lifecycle: string | null, phase: string | null): string 
 
 interface TaskStats {
   total: number;
-  completed: number;
   inProgress: number;
+  pending: number;
   blocked: number;
 }
 
-function computeTaskStats(agentId: string, tasks: TaskNode[]): TaskStats {
-  const agentTasks = tasks.filter((t) => t.agentId === agentId);
-  return {
-    total: agentTasks.length,
-    completed: agentTasks.filter((t) => t.status === 'completed' || t.status === 'done').length,
-    inProgress: agentTasks.filter((t) => t.status === 'in_progress').length,
-    blocked: agentTasks.filter((t) => t.status === 'blocked').length,
-  };
+/**
+ * Active-work counts for one agent. The task feed is activeOnly, so completed
+ * tasks are never in it — the old completed/total progress bar could only
+ * ever render 0% and was pure noise. Attribution: assignee identity UUID
+ * when recorded, creator slug otherwise (created_by predates the identity
+ * system and mixes slugs with backend names, so it is a fallback, not truth).
+ */
+function computeTaskStats(agent: AgentState, tasks: TaskNode[]): TaskStats {
+  const agentTasks = tasks.filter(
+    (t) =>
+      (agent.sbId && t.assigneeIdentityId === agent.sbId) ||
+      (!t.assigneeIdentityId && t.agentId === agent.agentId)
+  );
+  const inProgress = agentTasks.filter((t) => t.status === 'in_progress').length;
+  const pending = agentTasks.filter((t) => t.status === 'pending').length;
+  const blocked = agentTasks.filter((t) => t.status === 'blocked').length;
+  // total from the counted states only — the feed also carries archived
+  // blockers of the active set, which are context, not this agent's workload.
+  return { total: inProgress + pending + blocked, inProgress, pending, blocked };
 }
 
-function ProgressBar({ stats, skin }: { stats: TaskStats; skin: SkinConfig }) {
+function TaskCounts({ stats, skin }: { stats: TaskStats; skin: SkinConfig }) {
   if (stats.total === 0) return null;
-  const pct = (stats.completed / stats.total) * 100;
   return (
-    <div className="flex items-center gap-2">
-      <div
-        className="flex-1 h-1.5 rounded-full overflow-hidden"
-        style={{ backgroundColor: skin.colors.border }}
-      >
-        <div
-          className="h-full rounded-full transition-all"
-          style={{
-            width: `${pct}%`,
-            backgroundColor: skin.colors.taskCompleted,
-          }}
-        />
-      </div>
-      <span className="text-[10px] shrink-0" style={{ color: skin.colors.textMuted }}>
-        {stats.completed}/{stats.total}
-      </span>
+    <div className="flex items-center gap-2 text-[10px]" style={{ fontFamily: skin.fonts.mono }}>
+      {stats.inProgress > 0 && (
+        <span style={{ color: skin.colors.taskInProgress }}>{stats.inProgress} in progress</span>
+      )}
+      {stats.pending > 0 && (
+        <span style={{ color: skin.colors.textMuted }}>{stats.pending} pending</span>
+      )}
+      {stats.blocked > 0 && (
+        <span style={{ color: skin.colors.taskBlocked }}>{stats.blocked} blocked</span>
+      )}
     </div>
   );
 }
@@ -130,18 +138,20 @@ function AgentCard({
         </div>
         <div className="flex-1 min-w-0">
           <div className="flex items-center justify-between gap-2">
-            <span className="font-semibold text-sm truncate" style={{ color: skin.colors.text }}>
+            {/* The name never truncates — a long phase label (waiting:pr-…)
+                must not squeeze the one word that identifies the card. */}
+            <span className="font-semibold text-sm shrink-0" style={{ color: skin.colors.text }}>
               {agent.name}
             </span>
-            <div className="flex items-center gap-1.5 shrink-0">
+            <div className="flex items-center gap-1.5 min-w-0">
               <div
-                className="w-2 h-2 rounded-full"
+                className="w-2 h-2 rounded-full shrink-0"
                 style={{
                   backgroundColor: statusColor,
                   animation: isActive ? 'pulse 2s infinite' : 'none',
                 }}
               />
-              <span className="text-[10px]" style={{ color: statusColor }}>
+              <span className="text-[10px] truncate" style={{ color: statusColor }}>
                 {statusLabel}
               </span>
             </div>
@@ -202,7 +212,7 @@ function AgentCard({
         style={{ borderColor: skin.colors.border + '60' }}
       >
         <div className="flex-1 min-w-0">
-          <ProgressBar stats={taskStats} skin={skin} />
+          <TaskCounts stats={taskStats} skin={skin} />
           {taskStats.total === 0 && (
             <span className="text-[10px]" style={{ color: skin.colors.textMuted }}>
               No active tasks
@@ -267,7 +277,7 @@ export function AgentCards() {
                 key={agent.agentId}
                 agent={agent}
                 studios={studios.filter((s) => s.agentId === agent.agentId)}
-                taskStats={computeTaskStats(agent.agentId, tasks)}
+                taskStats={computeTaskStats(agent, tasks)}
                 skin={skin}
                 onSelect={() => selectAgent(agent.agentId)}
               />
@@ -291,7 +301,7 @@ export function AgentCards() {
                 key={agent.agentId}
                 agent={agent}
                 studios={studios.filter((s) => s.agentId === agent.agentId)}
-                taskStats={computeTaskStats(agent.agentId, tasks)}
+                taskStats={computeTaskStats(agent, tasks)}
                 skin={skin}
                 onSelect={() => selectAgent(agent.agentId)}
               />
