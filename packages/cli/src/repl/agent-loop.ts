@@ -269,8 +269,11 @@ export async function runAgentLoop(
   let responseText = resolveResponseText(outcome);
   let calls: LocalToolCall[] = [];
   let stopReason: AgentLoopStopReason = 'no-tools';
-  // The final executed iteration's results — candidates for the final relay.
-  let lastIterationResults: ToolResultRecord[] = [];
+  // Set only where an EXECUTED iteration is itself what reaches the cap.
+  // Tracking "the last results seen" as ambient state relays the wrong thing:
+  // a screen rejection at the cap would replay the previous iteration's
+  // already-seen results and omit the refusal that actually ended the loop.
+  let relayResults: ToolResultRecord[] = [];
 
   for (;;) {
     responseText = resolveResponseText(outcome);
@@ -335,7 +338,6 @@ export async function runAgentLoop(
 
     const results = await ports.tools.execute(calls, { iteration, signal: input.signal });
     allToolResults.push(...results);
-    lastIterationResults = results;
     for (const r of results) ports.observe?.recordToolCall(r);
 
     iteration++;
@@ -359,6 +361,7 @@ export async function runAgentLoop(
     if (reason && !retryAfterRefusal) {
       stopReason = reason;
       if (reason === 'iteration-cap') {
+        relayResults = results;
         ports.ui.printLine(`(tool loop limit reached — ${maxIterations} iterations)`);
       }
       break;
@@ -404,7 +407,7 @@ export async function runAgentLoop(
   // REPL the human watched it happen, and clones retry via continueOnBlocked.
   if (
     stopReason === 'iteration-cap' &&
-    lastIterationResults.length > 0 &&
+    relayResults.length > 0 &&
     outcome.success &&
     !input.signal?.aborted
   ) {
@@ -412,7 +415,7 @@ export async function runAgentLoop(
     const stopRelayWaiting = ports.ui.startWaiting();
     let relay: BackendTurnOutcome;
     try {
-      relay = await ports.backend.runTurn(buildFinalRelayBody(lastIterationResults), {
+      relay = await ports.backend.runTurn(buildFinalRelayBody(relayResults), {
         iteration,
         isContinuation: true,
         signal: input.signal,

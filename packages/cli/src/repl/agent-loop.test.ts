@@ -563,4 +563,35 @@ describe('runAgentLoop — final relay at the iteration cap (PR #491 port)', () 
     expect(result.responseText).toContain('still working');
     expect(result.responseText).not.toContain('relay boom');
   });
+
+  it('does NOT relay when a screen rejection is what reached the cap', async () => {
+    const harness = makePorts([
+      outcome({ responseText: `t1 ${inkTool('send_response', { content: 'hi' })}` }),
+      outcome({ responseText: `t2 ${inkTool('spawn_agent')}\n${inkTool('read')}` }),
+      outcome({ responseText: 'should never be requested' }),
+    ]);
+    // Iteration 1 passes the screen and executes; iteration 2 is refused whole,
+    // and that refusal is what hits the cap.
+    let screened = 0;
+    harness.ports.tools.screen = (all) =>
+      screened++ === 0 ? { calls: all } : { rejected: 'spawn_agent must be alone' };
+
+    const result = await runAgentLoop(
+      { prompt: 'go', toolRouting: 'local', maxIterations: 2 },
+      harness.ports
+    );
+
+    expect(result.stopReason).toBe('iteration-cap');
+    // Opening turn + 1 continuation. A third turn would relay iteration 1's
+    // already-seen results and bury iteration 2's refusal.
+    expect(harness.prompts).toHaveLength(2);
+    expect(harness.prompts.some((p) => p.body.includes('FINAL'))).toBe(false);
+    expect(harness.executed).toHaveLength(1);
+    // The refusal is what ended the turn, and it is on the record.
+    expect(result.toolResults.at(-1)).toEqual({
+      tool: 'iteration',
+      result: 'spawn_agent must be alone',
+      status: 'rejected',
+    });
+  });
 });
