@@ -293,7 +293,16 @@ export interface LegacyDrainResult {
   injected: number;
   emitFailures: number;
   ackFailures: number;
+  /** The walk stopped at a message routed to ANOTHER studio. */
+  stoppedAtForeignStudio: boolean;
 }
+
+export type LegacyMessageDisposition =
+  | 'deliver'
+  /** This studio's row, deliberately not rendered (own message, seen-set). */
+  | 'skip'
+  /** Routed to ANOTHER studio — must never enter this studio's ack range. */
+  | 'foreign';
 
 /**
  * Deliver LEGACY inbox rows and CONSUME them under the same exact-id ack
@@ -304,10 +313,15 @@ export interface LegacyDrainResult {
  * some unrelated unfiltered reader happens to drain it.
  *
  * Contract, mirroring drainThreads:
- * - The ack range walks OLDEST-first; client-filtered rows (own messages,
- *   other studios, seen-set dedup) count as deliberately processed and stay
+ * - The ack range walks OLDEST-first; this studio's client-filtered rows
+ *   (own messages, seen-set dedup) count as deliberately processed and stay
  *   INSIDE the range. Only an emit FAILURE stops the range, leaving the
  *   newer remainder unacked for redelivery.
+ * - A message routed to ANOTHER studio STOPS the range entirely (Lumen #504
+ *   r2 P1): mark_inbox_read advances one global (user, agent) pointer, so
+ *   acking past a foreign row would consume mail this studio never owned.
+ *   Everything after the foreign row redelivers here until the owning studio
+ *   drains it — redelivery beats cross-studio loss.
  * - The ack (mark_inbox_read throughMessageId) is the only consumption.
  *   A failed ack leaves the pointer untouched; the next poll re-fetches,
  *   dedups by seen-set (no duplicate render), and retries the ack.
@@ -316,11 +330,12 @@ export async function drainLegacyInbox(
   deps: PollDeps,
   seenMessageIds: Set<string>,
   messages: Array<Record<string, unknown>>,
-  shouldSkip: (msg: Record<string, unknown>) => boolean
+  classify: (msg: Record<string, unknown>) => LegacyMessageDisposition
 ): Promise<LegacyDrainResult> {
   let injected = 0;
   let emitFailures = 0;
   let ackFailures = 0;
+  let stoppedAtForeignStudio = false;
 
   // Pages arrive newest-first (display order); consumption walks oldest-first
   // so a mid-batch failure never acks past an undelivered older row.
@@ -332,11 +347,15 @@ export async function drainLegacyInbox(
   for (const msg of batch) {
     const msgId = (msg.id as string) || '';
 
-    if ((msgId && seenMessageIds.has(msgId)) || shouldSkip(msg)) {
+    const disposition = classify(msg);
+    if (disposition === 'foreign') {
+      stoppedAtForeignStudio = true;
+      break;
+    }
+    if ((msgId && seenMessageIds.has(msgId)) || disposition === 'skip') {
       if (msgId) lastProcessedId = msgId;
       continue;
     }
-
     const sender = (msg.senderAgentId as string) || 'unknown';
     const content = (msg.content as string) || '';
     const messageType = (msg.messageType as string) || 'message';
@@ -378,5 +397,5 @@ export async function drainLegacyInbox(
     }
   }
 
-  return { injected, emitFailures, ackFailures };
+  return { injected, emitFailures, ackFailures, stoppedAtForeignStudio };
 }

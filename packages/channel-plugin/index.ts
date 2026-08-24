@@ -250,7 +250,6 @@ Do NOT ignore channel messages — they are from your teammates and deserve time
 
 // ─── Polling Loop ───────────────────────────────────────────
 
-let lastPollTime = new Date().toISOString();
 // Thread cursors, dedup, and cold-start skip accounting live in the drain
 // state (poll-core.ts owns the delivery semantics; unit-tested there).
 const drainState = createThreadDrainState();
@@ -315,11 +314,17 @@ async function pollInbox(): Promise<void> {
     stampCliPollAt().catch(() => {});
 
     try {
+      // Pointer-based unseen fetch, NOT a wall-clock window (Lumen #504 r2
+      // P1): `since` windows skipped startup backlog, and a truncated newest
+      // page buried the unreturned oldest row forever. status:'unread' with
+      // markRead:false serves the OLDEST unseen batch; only the exact-id ack
+      // below advances delivery state, so truncation/ack failure simply
+      // re-serves the same batch next poll.
       const result = await callPcp('get_inbox', {
         email,
         agentId,
-        status: 'all',
-        since: lastPollTime,
+        status: 'unread',
+        markRead: false,
         limit: 20,
         channelPoll: true,
       });
@@ -331,7 +336,7 @@ async function pollInbox(): Promise<void> {
       const threadCount = ((result.threadsWithUnread as unknown[]) || []).length;
       const msgCount = ((result.messages as unknown[]) || []).length;
       const totalUnread = (result.totalUnreadCount as number) || 0;
-      log('debug', 'Poll result', { threadCount, msgCount, totalUnread, since: lastPollTime });
+      log('debug', 'Poll result', { threadCount, msgCount, totalUnread });
 
       // Drain thread messages through poll-core (unit-tested): always-on
       // 100/poll budget with budget-bounded per-request limits, cold fetches
@@ -371,42 +376,73 @@ async function pollInbox(): Promise<void> {
       // consumption, so what this caller injects is what gets consumed —
       // without it, the pointer never moves for this caller and delivered
       // task requests stay counted/re-delivered forever (Lumen #504 r1 P1).
-      const inboxMessages = (result.messages as Array<Record<string, unknown>>) || [];
-      const legacyDrained = await drainLegacyInbox(
-        {
-          callPcp,
-          notify: async (content, meta) => {
-            await mcp.notification({
-              method: 'notifications/claude/channel',
-              params: { content, meta },
-            });
-          },
-          log,
-          agentId,
-          email,
-          studioId,
-        },
-        seenMessageIds,
-        inboxMessages,
-        (msg) => {
-          // Own messages are skipped unless cross-studio (same as threads).
-          if (msg.senderAgentId === agentId) {
-            if (!studioId) return true;
-            const msgPcp = (msg.metadata as Record<string, unknown>)?.pcp as
-              | Record<string, unknown>
-              | undefined;
-            const msgSender = msgPcp?.sender as Record<string, unknown> | undefined;
-            const msgStudioId = msgSender?.studioId as string | undefined;
-            if (!msgStudioId || msgStudioId === studioId) return true;
-          }
-          return !isLegacyMessageForThisStudio(msg);
+      const classifyLegacy = (msg: Record<string, unknown>) => {
+        // A row routed to ANOTHER studio must stop the ack range — the
+        // pointer is (user, agent)-global (Lumen #504 r2 P1).
+        if (!isLegacyMessageForThisStudio(msg)) return 'foreign' as const;
+        // Own messages are skipped unless cross-studio (same as threads).
+        if (msg.senderAgentId === agentId) {
+          if (!studioId) return 'skip' as const;
+          const msgPcp = (msg.metadata as Record<string, unknown>)?.pcp as
+            | Record<string, unknown>
+            | undefined;
+          const msgSender = msgPcp?.sender as Record<string, unknown> | undefined;
+          const msgStudioId = msgSender?.studioId as string | undefined;
+          if (!msgStudioId || msgStudioId === studioId) return 'skip' as const;
         }
-      );
-      if (legacyDrained.injected > 0 || legacyDrained.ackFailures > 0) {
-        log('info', 'Legacy inbox drain result', { ...legacyDrained });
-      }
+        return 'deliver' as const;
+      };
+      const legacyDeps = {
+        callPcp,
+        notify: async (content: string, meta: Record<string, unknown>) => {
+          await mcp.notification({
+            method: 'notifications/claude/channel',
+            params: { content, meta },
+          });
+        },
+        log,
+        agentId,
+        email,
+        studioId,
+      };
 
-      lastPollTime = new Date().toISOString();
+      // Contiguity loop (Lumen #504 r2 P1): a truncated backlog drains batch
+      // by batch — after a clean, fully-acked batch, fetch the next oldest
+      // batch immediately. Any failure (emit, ack, foreign-studio stop)
+      // holds; the next poll resumes from the pointer.
+      let inboxMessages = (result.messages as Array<Record<string, unknown>>) || [];
+      let legacyTruncated = result.truncated === true;
+      for (let round = 0; round < 5; round++) {
+        const legacyDrained = await drainLegacyInbox(
+          legacyDeps,
+          seenMessageIds,
+          inboxMessages,
+          classifyLegacy
+        );
+        if (legacyDrained.injected > 0 || legacyDrained.ackFailures > 0) {
+          log('info', 'Legacy inbox drain result', { ...legacyDrained, round });
+        }
+        if (
+          !legacyTruncated ||
+          legacyDrained.emitFailures > 0 ||
+          legacyDrained.ackFailures > 0 ||
+          legacyDrained.stoppedAtForeignStudio
+        ) {
+          break;
+        }
+        const next = await callPcp('get_inbox', {
+          email,
+          agentId,
+          status: 'unread',
+          markRead: false,
+          limit: 20,
+          channelPoll: true,
+        });
+        if (!next?.success) break;
+        inboxMessages = (next.messages as Array<Record<string, unknown>>) || [];
+        legacyTruncated = next.truncated === true;
+        if (!inboxMessages.length) break;
+      }
     } catch (err) {
       log('error', 'Poll error', { error: err instanceof Error ? err.message : String(err) });
     }

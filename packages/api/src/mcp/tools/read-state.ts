@@ -122,10 +122,7 @@ export async function advanceAgentInboxReadPointer(
       });
       return { ok: false, lastReadAt: null, changed: false };
     }
-    const row = (Array.isArray(data) ? data[0] : data) as
-      | { last_read_at?: string; changed?: boolean }
-      | null
-      | undefined;
+    const row = Array.isArray(data) ? data[0] : null;
     return {
       ok: true,
       lastReadAt: row?.last_read_at ?? null,

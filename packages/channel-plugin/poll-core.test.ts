@@ -353,7 +353,7 @@ describe('drainLegacyInbox — exact-id consumption (Lumen #504 r1 P1)', () => {
       { ...mkMsg('m1'), createdAt: '2026-08-16T10:00:00Z' },
     ];
 
-    const res = await drainLegacyInbox(deps, seen, page, () => false);
+    const res = await drainLegacyInbox(deps, seen, page, () => 'deliver' as const);
 
     expect(res.injected).toBe(1);
     expect(res.emitFailures).toBe(1);
@@ -371,7 +371,9 @@ describe('drainLegacyInbox — exact-id consumption (Lumen #504 r1 P1)', () => {
     ];
 
     // Skip own messages (the caller-side filter).
-    const res = await drainLegacyInbox(deps, seen, page, (m) => m.senderAgentId === 'wren');
+    const res = await drainLegacyInbox(deps, seen, page, (m) =>
+      m.senderAgentId === 'wren' ? 'skip' : 'deliver'
+    );
 
     expect(res.injected).toBe(1);
     expect(notifications).toHaveLength(1);
@@ -383,7 +385,7 @@ describe('drainLegacyInbox — exact-id consumption (Lumen #504 r1 P1)', () => {
     const { deps, ackArgs } = legacyHarness({ ackFail: true });
     const seen = new Set<string>();
 
-    const res = await drainLegacyInbox(deps, seen, [mkMsg('m1')], () => false);
+    const res = await drainLegacyInbox(deps, seen, [mkMsg('m1')], () => 'deliver' as const);
 
     expect(res.injected).toBe(1);
     expect(res.ackFailures).toBe(1);
@@ -392,13 +394,51 @@ describe('drainLegacyInbox — exact-id consumption (Lumen #504 r1 P1)', () => {
     expect(seen.has('m1')).toBe(true);
   });
 
+  it('a foreign-studio row STOPS the ack range — never consumed globally', async () => {
+    // mark_inbox_read advances one global (user, agent) pointer. Acking past
+    // a row routed to another studio would consume mail this studio never
+    // owned (Lumen #504 r2 P1). The walk stops AT the foreign row: earlier
+    // own rows are acked, everything from the foreign row on redelivers.
+    const { deps, ackArgs, notifications } = legacyHarness();
+    const seen = new Set<string>();
+    const page = [
+      { ...mkMsg('mine-new'), createdAt: '2026-08-16T12:00:00Z' },
+      { ...mkMsg('foreign-mid'), createdAt: '2026-08-16T11:00:00Z' },
+      { ...mkMsg('mine-old'), createdAt: '2026-08-16T10:00:00Z' },
+    ];
+
+    const res = await drainLegacyInbox(deps, seen, page, (m) =>
+      m.id === 'foreign-mid' ? 'foreign' : 'deliver'
+    );
+
+    expect(res.stoppedAtForeignStudio).toBe(true);
+    expect(res.injected).toBe(1);
+    expect(notifications.map((n) => n.meta.message_id)).toEqual(['mine-old']);
+    // Ack stops BEFORE the foreign row — mine-new stays unread too
+    // (contiguity: it cannot be acked without consuming foreign-mid).
+    expect(ackArgs).toHaveLength(1);
+    expect(ackArgs[0]).toMatchObject({ throughMessageId: 'mine-old' });
+  });
+
+  it('a leading foreign-studio row acks nothing at all', async () => {
+    const { deps, ackArgs } = legacyHarness();
+    const res = await drainLegacyInbox(
+      deps,
+      new Set<string>(),
+      [{ ...mkMsg('foreign-1'), createdAt: '2026-08-16T10:00:00Z' }],
+      () => 'foreign' as const
+    );
+    expect(res.stoppedAtForeignStudio).toBe(true);
+    expect(ackArgs).toHaveLength(0);
+  });
+
   it('an empty or fully-skipped-by-seen page still acks (retry path)', async () => {
     const { deps, ackArgs } = legacyHarness();
     const seen = new Set<string>(['m1']);
 
     // Previously delivered but unacked (ack failed last poll): the retry
     // must ack without re-rendering.
-    const res = await drainLegacyInbox(deps, seen, [mkMsg('m1')], () => false);
+    const res = await drainLegacyInbox(deps, seen, [mkMsg('m1')], () => 'deliver' as const);
 
     expect(res.injected).toBe(0);
     expect(ackArgs[0]).toMatchObject({ throughMessageId: 'm1' });

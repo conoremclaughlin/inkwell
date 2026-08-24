@@ -1310,19 +1310,22 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
   }
 
   // The CONSUMING path: an unfiltered unread read that will advance the
-  // pointer. It selects the OLDEST unseen batch (ascending) so that advancing
-  // through the batch maximum skips nothing and a backlog larger than `limit`
-  // drains batch by batch — newest-first selection returned the same page
-  // forever once truncated, with no cursor to reach the remainder (Lumen #504
-  // r1 P1). The response is re-ordered newest-first for display either way.
+  // pointer. Every status:'unread' page selects the OLDEST unseen batch
+  // (ascending, id as deterministic tie order) so both the consuming path and
+  // exact-ack pagers (the channel plugin) drain contiguously — newest-first
+  // selection returned the same page forever once truncated, with no cursor
+  // to the remainder (Lumen #504 r1 P1). The response is re-ordered
+  // newest-first for display either way.
   const consumingUnread =
     status === 'unread' && markRead && !!agentId && !priority && !messageType && !since;
+  const oldestFirst = status === 'unread';
 
   let query = supabase
     .from('agent_inbox')
     .select('*')
     .eq('recipient_user_id', resolved.user.id)
-    .order('created_at', { ascending: consumingUnread })
+    .order('created_at', { ascending: oldestFirst })
+    .order('id', { ascending: oldestFirst })
     .limit(limit);
 
   if (agentId) {
@@ -1353,8 +1356,35 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
   if (error) {
     throw new Error(`Failed to get inbox: ${error.message}`);
   }
+
+  // TIE-GROUP COMPLETION (Lumen #504 r2 P1): the stored pointer is a bare
+  // timestamp, and now() is transaction-stable, so identical created_at
+  // values are normal. If the limit cut the batch mid-tie, advancing (or an
+  // exact ack) through the boundary timestamp would consume the unreturned
+  // siblings. Extend the page with every remaining row that shares the
+  // boundary timestamp so a tie group is always delivered whole.
+  let page = fetched ?? [];
+  if (oldestFirst && page.length >= limit && page.length > 0) {
+    const boundary = (page[page.length - 1] as { created_at: string }).created_at;
+    const pageIds = page.map((m) => (m as { id: string }).id);
+    let tieQuery = supabase
+      .from('agent_inbox')
+      .select('*')
+      .eq('recipient_user_id', resolved.user.id)
+      .eq('created_at', boundary)
+      .not('id', 'in', `(${pageIds.join(',')})`)
+      .order('id', { ascending: true });
+    if (agentId) tieQuery = tieQuery.eq('recipient_agent_id', agentId);
+    tieQuery = tieQuery.or(`expires_at.is.null,expires_at.gt.${new Date().toISOString()}`);
+    const { data: siblings, error: tieError } = await tieQuery;
+    if (tieError) {
+      throw new Error(`Failed to complete timestamp tie group: ${tieError.message}`);
+    }
+    if (siblings?.length) page = [...page, ...siblings];
+  }
+
   // Display contract stays newest-first; only the SELECTION flipped.
-  const messages = consumingUnread && fetched ? [...fetched].reverse() : fetched;
+  const messages = oldestFirst ? [...page].reverse() : page;
 
   // Count unread BEFORE advancing anything. `unreadCount` describes the
   // mailbox, not this query: it always uses the pointer predicate, whatever
@@ -1394,6 +1424,7 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
   // skips nothing — truncation no longer blocks progress, it just means the
   // next call gets the next batch (Lumen #504 r1 P1).
   let readPointerAdvanced = false;
+  let readPointerAt: string | null = null;
   if (consumingUnread && messages?.length) {
     // Display order is newest-first, so messages[0] is the batch maximum.
     const newest = messages[0] as { id: string; created_at: string };
@@ -1403,7 +1434,10 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
       throughMessageId: newest.id,
       source: 'get_inbox:markRead',
     });
-    readPointerAdvanced = advance.ok;
+    // The MONOTONIC outcome, not RPC success: a concurrent reader may have
+    // already moved the pointer past this batch (Lumen #504 r2 P2).
+    readPointerAdvanced = advance.changed;
+    readPointerAt = advance.lastReadAt;
   }
 
   // Get threads with unread counts and preview messages.
@@ -1719,6 +1753,7 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
           ...(pageTruncated ? { truncated: true } : {}),
           lastReadAt: unreadFloor,
           readPointerAdvanced,
+          ...(readPointerAt ? { readPointerAt } : {}),
           messages: (messages || []).map((m) => ({
             id: m.id,
             subject: m.subject,
@@ -2158,10 +2193,18 @@ export async function handleGetAgentSummaries(args: unknown, dataComposer: DataC
     readPointerMap.set(rp.agent_id, rp.last_read_at);
   }
 
-  // Find the earliest pointer so we can fetch all potentially-unread messages in one query
+  // The fetch floor is an optimization, not the truth source — and it is
+  // only sound when EVERY requested agent has a pointer row. An agent with
+  // mail but no pointer must contribute ALL its rows to the per-agent count
+  // below; filtering the fetch by other agents' minimum silently zeroed such
+  // agents on the Mission path (Lumen #504 r2 P1). Min over REQUESTED agents
+  // only, and only when none of them is pointer-less.
   let minPointer: string | null = null;
-  for (const [, ts] of readPointerMap) {
-    if (!minPointer || ts < minPointer) minPointer = ts;
+  if (agentIds.every((a) => readPointerMap.has(a))) {
+    for (const a of agentIds) {
+      const ts = readPointerMap.get(a)!;
+      if (!minPointer || ts < minPointer) minPointer = ts;
+    }
   }
 
   // Collect unique thread IDs from participation
@@ -2179,7 +2222,10 @@ export async function handleGetAgentSummaries(args: unknown, dataComposer: DataC
         .from('agent_inbox')
         .select('recipient_agent_id, created_at')
         .eq('recipient_user_id', userId)
-        .in('recipient_agent_id', agentIds);
+        .in('recipient_agent_id', agentIds)
+        // Expiry parity with get_inbox/get_agent_status (Lumen #504 r2 P2):
+        // Mission's total must not disagree with the surfaces it links to.
+        .or(`expires_at.is.null,expires_at.gt.${now.toISOString()}`);
       if (minPointer) {
         q = q.gt('created_at', minPointer);
       }

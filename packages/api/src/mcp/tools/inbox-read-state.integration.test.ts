@@ -16,7 +16,12 @@
 
 import { describe, it, expect, beforeAll, afterEach, afterAll } from 'vitest';
 import { getDataComposer, type DataComposer } from '../../data/composer';
-import { handleGetInbox, handleMarkInboxRead, handleGetAgentStatus } from './inbox-handlers';
+import {
+  handleGetInbox,
+  handleMarkInboxRead,
+  handleGetAgentStatus,
+  handleGetAgentSummaries,
+} from './inbox-handlers';
 import { ensureEchoIntegrationFixture } from '../../test/integration-fixtures';
 
 // Uniquely namespaced per run: this suite's rows and pointer can NEVER
@@ -193,6 +198,8 @@ describe('agent_inbox read state (integration)', () => {
 
     expect(first.unreadCount).toBe(2);
     expect(first.readPointerAdvanced).toBe(true);
+    // The response reports the RESULTING pointer from the RPC (r2 P2).
+    expect(first.readPointerAt).toBe('2026-08-16T11:00:00+00:00');
     expect(second.unreadCount).toBe(0);
     expect(second.count).toBe(0);
     expect(await getPointer()).toBe('2026-08-16T11:00:00+00:00');
@@ -410,6 +417,141 @@ describe('agent_inbox read state (integration)', () => {
     expect(res.success).toBe(true);
     expect(res.advanced).toBe(false);
     expect(await getPointer()).toBeNull();
+  });
+
+  // ── r2 P1: timestamp ties at a limited batch boundary ───────────────
+
+  it('a timestamp tie group is delivered and consumed WHOLE, even past the limit', async () => {
+    /*
+     * now() is transaction-stable, so identical created_at values are
+     * normal. With limit:1 and two unseen siblings at the same instant, the
+     * old code returned one and advanced the timestamp pointer past both —
+     * the sibling was never delivered (Lumen #504 r2, reproduced on the
+     * migrated DB). The page now extends to the whole boundary tie group.
+     */
+    const t = '2026-08-16T10:00:00Z';
+    const a = await insert({ createdAt: t, content: 'twin A' });
+    const b = await insert({ createdAt: t, content: 'twin B' });
+    await setPointer('2026-08-01T00:00:00Z');
+
+    const res = await getInbox({ limit: 1 });
+
+    // BOTH siblings arrive despite limit:1 — the tie group is atomic.
+    expect(res.messages.map((m: { id: string }) => m.id).sort()).toEqual([a, b].sort());
+    expect(res.readPointerAdvanced).toBe(true);
+    // Nothing left behind.
+    expect((await getInbox()).unreadCount).toBe(0);
+  });
+
+  it('a tie at the boundary between batches also survives', async () => {
+    const t2 = '2026-08-16T11:00:00Z';
+    const first = await insert({ createdAt: '2026-08-16T10:00:00Z' });
+    const twinA = await insert({ createdAt: t2, content: 'twin A' });
+    const twinB = await insert({ createdAt: t2, content: 'twin B' });
+    await setPointer('2026-08-01T00:00:00Z');
+
+    // Batch 1: limit 2 → oldest row + the first twin — page extends to the
+    // twin's sibling so the boundary timestamp is complete.
+    const page1 = await getInbox({ limit: 2 });
+    expect(page1.messages.map((m: { id: string }) => m.id).sort()).toEqual(
+      [first, twinA, twinB].sort()
+    );
+    expect((await getInbox()).unreadCount).toBe(0);
+  });
+
+  // ── r2 P2: the RPC computes `changed` atomically ────────────────────
+
+  it('replaying an already-covered anchor reports changed:false with the stored pointer', async () => {
+    const older = await insert({ createdAt: '2026-08-16T10:00:00Z' });
+    const newer = await insert({ createdAt: '2026-08-16T11:00:00Z' });
+
+    const advance = (id: string) =>
+      supabase
+        .rpc('advance_agent_inbox_read_pointer', {
+          p_user_id: userId,
+          p_agent_id: AGENT,
+          p_through_message_id: id,
+        })
+        .then((r: { data: Array<{ last_read_at: string; changed: boolean }> }) => r.data[0]);
+
+    const firstResult = await advance(newer);
+    expect(firstResult.changed).toBe(true);
+
+    const replay = await advance(older);
+    expect(replay.changed).toBe(false);
+    expect(replay.last_read_at).toBe('2026-08-16T11:00:00+00:00');
+  });
+
+  it('concurrent advances through the same anchor: exactly one reports changed', async () => {
+    const msg = await insert({ createdAt: '2026-08-16T10:00:00Z' });
+
+    const call = () =>
+      supabase
+        .rpc('advance_agent_inbox_read_pointer', {
+          p_user_id: userId,
+          p_agent_id: AGENT,
+          p_through_message_id: msg,
+        })
+        .then((r: { data: Array<{ changed: boolean }> }) => r.data[0]);
+
+    const results = await Promise.all([call(), call()]);
+    const changedCount = results.filter((r) => r.changed).length;
+    expect(changedCount).toBe(1);
+  });
+
+  // ── r2 P1: get_agent_summaries floor (the Mission path) ─────────────
+
+  it('summaries: an agent with mail but NO pointer is counted, not zeroed', async () => {
+    /*
+     * Lumen's exact repro: agent A has a 10:00 pointer, agent B has unread
+     * mail at 09:00 and no pointer row. The shared fetch floor (min over
+     * existing pointers) excluded B's row before per-agent counting ran, so
+     * Mission reported zero for B.
+     */
+    const agentB = `${AGENT}-nopointer`;
+    const { data: bMail } = await supabase
+      .from('agent_inbox')
+      .insert({
+        recipient_user_id: userId,
+        recipient_agent_id: agentB,
+        sender_agent_id: 'wren',
+        content: 'genuinely unread for B',
+        message_type: 'task_request',
+        priority: 'normal',
+        status: 'unread',
+        created_at: '2026-08-16T09:00:00Z',
+      })
+      .select('id')
+      .single();
+    created.push(bMail.id);
+    const seenByA = await insert({ createdAt: '2026-08-16T10:00:00Z' });
+    await handleMarkInboxRead(
+      { userId, agentId: AGENT, throughMessageId: seenByA },
+      dataComposer as never
+    );
+
+    const body = JSON.parse(
+      (await handleGetAgentSummaries({ userId, agentIds: [AGENT, agentB] }, dataComposer as never))
+        .content[0].text
+    );
+    const bRow = body.agents.find((a: { agentId: string }) => a.agentId === agentB);
+    expect(bRow).toBeDefined();
+    expect(bRow.inboxUnread).toBeGreaterThanOrEqual(1);
+  });
+
+  it('summaries: expired rows are excluded, matching get_inbox (r2 P2)', async () => {
+    await insert({ createdAt: '2026-08-16T10:00:00Z' });
+    await insert({
+      createdAt: '2026-08-16T11:00:00Z',
+      expiresAt: '2026-08-16T12:00:00Z', // long past
+    });
+
+    const body = JSON.parse(
+      (await handleGetAgentSummaries({ userId, agentIds: [AGENT] }, dataComposer as never))
+        .content[0].text
+    );
+    const row = body.agents.find((a: { agentId: string }) => a.agentId === AGENT);
+    expect(row.inboxUnread).toBe(1);
   });
 
   // ── Aggregate floor (agent-less timeline) ───────────────────────────

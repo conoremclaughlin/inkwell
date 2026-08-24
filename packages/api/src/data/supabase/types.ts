@@ -4362,7 +4362,10 @@ export type Database = {
           p_through_message_id: string;
           p_user_id: string;
         };
-        Returns: string;
+        Returns: {
+          changed: boolean;
+          last_read_at: string;
+        }[];
       };
       advance_thread_read_pointer: {
         Args: {

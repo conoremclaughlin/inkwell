@@ -32,7 +32,6 @@ CREATE FUNCTION public.advance_agent_inbox_read_pointer(
 ) RETURNS TABLE (last_read_at timestamptz, changed boolean) AS $$
 DECLARE
   v_created_at timestamptz;
-  v_old timestamptz;
   v_new timestamptz;
 BEGIN
   SELECT created_at INTO v_created_at
@@ -46,18 +45,26 @@ BEGIN
       p_through_message_id, p_user_id, p_agent_id;
   END IF;
 
-  SELECT ars.last_read_at INTO v_old
-  FROM public.agent_inbox_read_status ars
-  WHERE ars.user_id = p_user_id AND ars.agent_id = p_agent_id;
-
-  INSERT INTO public.agent_inbox_read_status (user_id, agent_id, last_read_at)
+  -- `changed` is computed ATOMICALLY with the write (Lumen #504 r2 P2): the
+  -- conditional DO UPDATE only fires when this call genuinely moves the
+  -- pointer forward, so RETURNING produces a row exactly when a change
+  -- happened — no unlocked pre-read for concurrent callers to race on.
+  INSERT INTO public.agent_inbox_read_status AS ars (user_id, agent_id, last_read_at)
   VALUES (p_user_id, p_agent_id, v_created_at)
   ON CONFLICT (user_id, agent_id)
-  DO UPDATE SET last_read_at =
-    GREATEST(agent_inbox_read_status.last_read_at, EXCLUDED.last_read_at)
-  RETURNING agent_inbox_read_status.last_read_at INTO v_new;
+  DO UPDATE SET last_read_at = EXCLUDED.last_read_at
+  WHERE ars.last_read_at < EXCLUDED.last_read_at
+  RETURNING ars.last_read_at INTO v_new;
 
-  RETURN QUERY SELECT v_new, (v_old IS NULL OR v_new > v_old);
+  IF v_new IS NOT NULL THEN
+    RETURN QUERY SELECT v_new, true;
+  ELSE
+    -- No row written: the stored pointer already sits at or past the anchor.
+    RETURN QUERY
+      SELECT ars.last_read_at, false
+      FROM public.agent_inbox_read_status ars
+      WHERE ars.user_id = p_user_id AND ars.agent_id = p_agent_id;
+  END IF;
 END;
 $$ LANGUAGE plpgsql;
 
