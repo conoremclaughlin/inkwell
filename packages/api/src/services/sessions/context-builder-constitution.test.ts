@@ -65,26 +65,78 @@ describe('formatInjectedContext — constitution', () => {
   it('renders values, process, and the user doc', () => {
     const out = formatInjectedContext(
       baseContext({
-        agent: { ...baseContext().agent, soul: 'SOUL-BODY' },
         constitution: { values: 'VALUES-BODY', process: 'PROCESS-BODY', user: 'USER-BODY' },
       })
     );
 
-    expect(out).toContain('SOUL-BODY');
     expect(out).toContain('VALUES-BODY');
     expect(out).toContain('PROCESS-BODY');
     expect(out).toContain('USER-BODY');
   });
 
-  it('leaves the heartbeat to the system prompt', () => {
-    // buildIdentityPrompt already puts the heartbeat in appendSystemPrompt,
-    // where it survives compaction. Rendering it here too would ship the whole
-    // document twice.
+  it('leaves soul and heartbeat to the system prompt', () => {
+    // buildIdentityPrompt puts both in appendSystemPrompt, where they survive
+    // compaction and are re-sent on resume. Rendering them here too shipped
+    // each document twice — 7.2KB of soul alone, for myra.
     const out = formatInjectedContext(
-      baseContext({ agent: { ...baseContext().agent, heartbeat: 'HEARTBEAT-BODY' } })
+      baseContext({
+        agent: { ...baseContext().agent, soul: 'SOUL-BODY', heartbeat: 'HEARTBEAT-BODY' },
+      })
     );
 
+    expect(out).not.toContain('SOUL-BODY');
     expect(out).not.toContain('HEARTBEAT-BODY');
+  });
+
+  it('omits everything bootstrap provides when the child calls bootstrap itself', () => {
+    // `ink chat` renders the constitution, knowledge summary and projects from
+    // its own bootstrap call. This is the regression that shipped in #530:
+    // both layers emitted them, doubling myra's first turn.
+    const ctx = baseContext({
+      constitution: { values: 'VALUES-BODY', process: 'PROCESS-BODY', user: 'USER-BODY' },
+      knowledgeSummary: 'DIGEST-BODY',
+      activeProjects: [{ id: 'p1', name: 'PROJECT-BODY', status: 'active' }],
+    });
+
+    const out = formatInjectedContext(ctx, { childCallsBootstrap: true });
+
+    expect(out).not.toContain('VALUES-BODY');
+    expect(out).not.toContain('PROCESS-BODY');
+    expect(out).not.toContain('USER-BODY');
+    expect(out).not.toContain('DIGEST-BODY');
+    expect(out).not.toContain('PROJECT-BODY');
+  });
+
+  it('still carries what only the server knows when the child self-hydrates', () => {
+    // Bootstrap cannot supply these: which contact this session belongs to,
+    // and the wall-clock time in their timezone.
+    const ctx = baseContext({
+      constitution: { values: 'VALUES-BODY' },
+      contact: { id: 'c1', name: 'CONTACT-NAME', type: 'external', platform: 'telegram' },
+    });
+
+    const out = formatInjectedContext(ctx, { childCallsBootstrap: true });
+
+    expect(out).toContain('CONTACT-NAME');
+    expect(out).toContain('Aster');
+    expect(out).toContain('Good morning');
+  });
+
+  it('falls back to the raw memory list only when it is the sole delivery', () => {
+    const ctx = baseContext({
+      recentMemories: [
+        {
+          id: 'm1',
+          content: 'RAW-MEMORY',
+          source: 'observation',
+          salience: 'critical',
+          createdAt: '2026-08-01T00:00:00Z',
+        },
+      ],
+    });
+
+    expect(formatInjectedContext(ctx)).toContain('RAW-MEMORY');
+    expect(formatInjectedContext(ctx, { childCallsBootstrap: true })).not.toContain('RAW-MEMORY');
   });
 
   it('omits each section it has no content for', () => {

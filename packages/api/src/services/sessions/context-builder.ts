@@ -526,20 +526,34 @@ export class ContextBuilder implements IContextBuilder {
 /**
  * Format injected context as a string for inclusion in messages.
  */
-export function formatInjectedContext(context: InjectedContext): string {
+export interface FormatContextOptions {
+  /**
+   * True when the spawned child calls `bootstrap` itself and renders the
+   * result into its own prompt — `ink chat` does this via
+   * `formatBootstrapContext`. Those sections are then omitted here, because
+   * emitting them too ships the same ~50KB twice.
+   *
+   * Runners whose child does NOT self-hydrate leave this false; for them this
+   * block is the only delivery of the constitution.
+   */
+  childCallsBootstrap?: boolean;
+}
+
+export function formatInjectedContext(
+  context: InjectedContext,
+  options: FormatContextOptions = {}
+): string {
   const sections: string[] = [];
+  // Everything bootstrap also returns is the child's to render when it calls
+  // bootstrap itself. What stays below is what only the server knows: which
+  // session this is, who is on the other end, and what time it is there.
+  const includeBootstrapDerived = !options.childCallsBootstrap;
 
   // Agent identity section
   sections.push(`## Agent Identity
 You are **${context.agent.name}** (agent ID: \`${context.agent.agentId}\`).
 Role: ${context.agent.role}
 ${context.agent.description ? `\n${context.agent.description}` : ''}`);
-
-  // Add soul if present
-  if (context.agent.soul) {
-    sections.push(`### Soul
-${context.agent.soul}`);
-  }
 
   // Constitution — the shared docs a session-start hook would otherwise load.
   // Antigravity has no such hook, so without these the agent gets no team
@@ -548,15 +562,15 @@ ${context.agent.soul}`);
   // Heartbeat is deliberately absent: buildIdentityPrompt already carries it in
   // appendSystemPrompt, where it survives compaction. Repeating it here would
   // duplicate the whole document.
-  if (context.constitution?.values) {
+  if (includeBootstrapDerived && context.constitution?.values) {
     sections.push(`## Values
 ${context.constitution.values}`);
   }
-  if (context.constitution?.process) {
+  if (includeBootstrapDerived && context.constitution?.process) {
     sections.push(`## Process
 ${context.constitution.process}`);
   }
-  if (context.constitution?.user) {
+  if (includeBootstrapDerived && context.constitution?.user) {
     sections.push(`## About Your Human
 ${context.constitution.user}`);
   }
@@ -580,10 +594,10 @@ This is a contact-scoped session — memories and conversation history are priva
 
   // What the agent knows. Prefer the budgeted digest; fall back to a raw list
   // only when a caller built the context without one.
-  if (context.knowledgeSummary) {
+  if (includeBootstrapDerived && context.knowledgeSummary) {
     sections.push(`## What You Know
 ${context.knowledgeSummary}`);
-  } else if (context.recentMemories.length > 0) {
+  } else if (includeBootstrapDerived && context.recentMemories.length > 0) {
     const memoryList = context.recentMemories
       .map((m) => `- [${m.salience}] ${m.content}`)
       .join('\n');
@@ -592,7 +606,7 @@ ${memoryList}`);
   }
 
   // Active projects (if any)
-  if (context.activeProjects.length > 0) {
+  if (includeBootstrapDerived && context.activeProjects.length > 0) {
     const projectList = context.activeProjects.map((p) => `- ${p.name} (${p.status})`).join('\n');
     sections.push(`## Active Projects
 ${projectList}`);

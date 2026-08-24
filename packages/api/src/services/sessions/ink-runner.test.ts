@@ -456,3 +456,85 @@ describe('clampMaxTurns', () => {
     expect(clampMaxTurns(5)).toBe(5);
   });
 });
+
+// ============================================================================
+// The child self-hydrates: the server must not send bootstrap content twice
+// ============================================================================
+
+describe('InkRunner — bootstrap-derived content', () => {
+  function contextWithEverything() {
+    return {
+      agent: {
+        agentId: 'myra',
+        name: 'Myra',
+        role: 'messaging',
+        soul: 'SOUL-BODY',
+        heartbeat: 'HEARTBEAT-BODY',
+        values: [],
+        capabilities: [],
+        relationships: {},
+      },
+      user: { id: 'u1', timezone: 'UTC', contacts: {}, preferences: {} },
+      temporal: {
+        currentTime: '9:00 AM',
+        currentDate: 'Monday, August 24, 2026',
+        dayOfWeek: 'Monday',
+        timezone: 'UTC',
+        greeting: 'Good morning',
+      },
+      constitution: { values: 'VALUES-BODY', process: 'PROCESS-BODY', user: 'USER-BODY' },
+      knowledgeSummary: 'DIGEST-BODY',
+      recentMemories: [],
+      activeProjects: [{ id: 'p1', name: 'PROJECT-BODY', status: 'active' }],
+    } as never;
+  }
+
+  it('does not resend the constitution or digest that `ink chat` already renders', async () => {
+    // `ink chat` calls bootstrap and renders these through
+    // formatBootstrapContext. Sending them here too doubled myra's first turn.
+    const runner = new InkRunner();
+    let sentMessage = '';
+    (runner as any).spawnProcess = vi.fn(async (_args: string[], message: string) => {
+      sentMessage = message;
+      return { responses: [], toolCalls: [], finalTextResponse: 'ok' };
+    });
+
+    await runner.run('hello', {
+      injectedContext: contextWithEverything(),
+      config: { workingDirectory: '/tmp', mcpConfigPath: '/tmp/.mcp.json', agentId: 'myra' },
+    } as never);
+
+    expect(sentMessage).toContain('hello');
+    for (const dup of [
+      'VALUES-BODY',
+      'PROCESS-BODY',
+      'USER-BODY',
+      'DIGEST-BODY',
+      'PROJECT-BODY',
+      'SOUL-BODY',
+      'HEARTBEAT-BODY',
+    ]) {
+      expect(sentMessage).not.toContain(dup);
+    }
+  });
+
+  it('still sends the sender and time context, which bootstrap cannot supply', async () => {
+    const runner = new InkRunner();
+    let sentMessage = '';
+    (runner as any).spawnProcess = vi.fn(async (_args: string[], message: string) => {
+      sentMessage = message;
+      return { responses: [], toolCalls: [], finalTextResponse: 'ok' };
+    });
+
+    const ctx = contextWithEverything() as unknown as Record<string, unknown>;
+    ctx.contact = { id: 'c1', name: 'CONTACT-NAME', type: 'external', platform: 'telegram' };
+
+    await runner.run('hello', {
+      injectedContext: ctx,
+      config: { workingDirectory: '/tmp', mcpConfigPath: '/tmp/.mcp.json', agentId: 'myra' },
+    } as never);
+
+    expect(sentMessage).toContain('CONTACT-NAME');
+    expect(sentMessage).toContain('Myra');
+  });
+});

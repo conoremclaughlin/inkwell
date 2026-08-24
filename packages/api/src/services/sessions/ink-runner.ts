@@ -146,7 +146,10 @@ export class InkRunner implements IRunner {
 
     let fullMessage = message;
     if (injectedContext && !isResume) {
-      const contextBlock = formatInjectedContext(injectedContext);
+      // `ink chat` calls bootstrap itself and renders the constitution, the
+      // knowledge summary and active projects through formatBootstrapContext.
+      // Emitting them here as well sent Myra the same ~50KB twice.
+      const contextBlock = formatInjectedContext(injectedContext, { childCallsBootstrap: true });
       fullMessage = `${contextBlock}\n\n---\n\n${message}`;
     }
 
@@ -169,7 +172,9 @@ export class InkRunner implements IRunner {
         });
 
         if (injectedContext) {
-          const contextBlock = formatInjectedContext(injectedContext);
+          const contextBlock = formatInjectedContext(injectedContext, {
+            childCallsBootstrap: true,
+          });
           fullMessage = `${contextBlock}\n\n---\n\n${message}`;
         }
 
