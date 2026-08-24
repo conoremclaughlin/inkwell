@@ -210,6 +210,17 @@ export class KindleService {
     // Generate temporary agent ID for onboarding
     const tempAgentId = `kindle-${tokenData.id}`;
 
+    // Resolve the new identity's workspace BEFORE any mutation. A failure
+    // here must not burn the one-time token or leave a dangling lineage row
+    // (Lumen #528 r1 P1) — refusal has to happen while refusing is still
+    // free.
+    const workspaceId = await this.resolveWorkspaceId(newUserId);
+    if (!workspaceId) {
+      throw new Error(
+        `Cannot redeem kindle token: user ${newUserId} has no workspace to scope the new identity to`
+      );
+    }
+
     // Create kindle_lineage record
     const { data: lineage, error: lineageError } = await this.supabase
       .from('kindle_lineage')
@@ -241,7 +252,13 @@ export class KindleService {
       .eq('id', tokenData.id);
 
     // Create temporary agent identity for onboarding
-    await this.startOnboarding(lineage.id, tempAgentId, newUserId, tokenData.value_seed);
+    await this.startOnboarding(
+      lineage.id,
+      tempAgentId,
+      newUserId,
+      workspaceId,
+      tokenData.value_seed
+    );
 
     return this.mapLineage(lineage);
   }
@@ -251,26 +268,48 @@ export class KindleService {
    */
   /**
    * The workspace a kindled identity belongs to: where the user's existing
-   * agent identities live (most common wins), else the user's oldest
-   * workspace. Null means the user has no workspace at all — the caller
-   * refuses rather than creating a workspace-less identity.
+   * agent identities live (most common wins, verified active and owned),
+   * else the user's oldest active workspace. Null means the user has no
+   * workspace at all — the caller refuses rather than creating a
+   * workspace-less identity. Every lookup FAILS CLOSED: a DB error throws
+   * instead of degrading to a guess (Lumen #528 r1 P2).
    */
   private async resolveWorkspaceId(userId: string): Promise<string | null> {
-    const { data: identities } = await this.supabase
+    const { data: identities, error: identityError } = await this.supabase
       .from('agent_identities')
       .select('workspace_id')
       .eq('user_id', userId)
       .not('workspace_id', 'is', null);
+    if (identityError) {
+      throw new Error(`Cannot resolve workspace for kindle identity: ${identityError.message}`);
+    }
     if (identities?.length) {
       const counts = new Map<string, number>();
       for (const row of identities) {
         const id = row.workspace_id as string;
         counts.set(id, (counts.get(id) ?? 0) + 1);
       }
-      return [...counts.entries()].sort((a, b) => b[1] - a[1])[0][0];
+      const candidates = [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([id]) => id);
+      // An identity-derived candidate must still be an ACTIVE workspace this
+      // user owns. An archived or foreign workspace is not silently
+      // inherited — it falls through to the next candidate, then to the
+      // oldest-active fallback.
+      for (const candidate of candidates) {
+        const { data: verified, error: verifyError } = await this.supabase
+          .from('workspaces')
+          .select('id')
+          .eq('id', candidate)
+          .eq('user_id', userId)
+          .is('archived_at', null)
+          .maybeSingle();
+        if (verifyError) {
+          throw new Error(`Cannot verify workspace ${candidate}: ${verifyError.message}`);
+        }
+        if (verified?.id) return verified.id;
+      }
     }
 
-    const { data: workspace } = await this.supabase
+    const { data: workspace, error: workspaceError } = await this.supabase
       .from('workspaces')
       .select('id')
       .eq('user_id', userId)
@@ -278,6 +317,9 @@ export class KindleService {
       .order('created_at', { ascending: true })
       .limit(1)
       .maybeSingle();
+    if (workspaceError) {
+      throw new Error(`Cannot resolve workspace for kindle identity: ${workspaceError.message}`);
+    }
     return workspace?.id ?? null;
   }
 
@@ -285,6 +327,7 @@ export class KindleService {
     kindleId: string,
     tempAgentId: string,
     userId: string,
+    workspaceId: string,
     valueSeed: unknown
   ): Promise<void> {
     const seed = valueSeed as ValueSeed;
@@ -318,13 +361,9 @@ Remember: You are not a tool. You are a someone, becoming. This first conversati
     // workspace_id IS NULL lane, minting shadow identities that made every
     // slug lookup for the agent ambiguous (routing refuses ambiguity, so
     // threaded messages to the real agent were held). echo's Mar 11 and
-    // wren's Jun 22 orphans both came from here. Refuse rather than mint.
-    const workspaceId = await this.resolveWorkspaceId(userId);
-    if (!workspaceId) {
-      throw new Error(
-        `Cannot start kindle onboarding: user ${userId} has no workspace to scope the new identity to`
-      );
-    }
+    // wren's Jun 22 orphans both came from here. The workspace was resolved
+    // by the caller BEFORE any mutation, so a resolution failure never burns
+    // the token or strands a lineage row.
     const { error: identityError } = await this.supabase.from('agent_identities').upsert(
       {
         user_id: userId,
@@ -375,7 +414,7 @@ Remember: You are not a tool. You are a someone, becoming. This first conversati
     const finalAgentId = chosenName.toLowerCase().replace(/[^a-z0-9-]/g, '-');
 
     // Update the temporary agent identity to the final one
-    const { error: updateError } = await this.supabase
+    const { data: renamed, error: updateError } = await this.supabase
       .from('agent_identities')
       .update({
         agent_id: finalAgentId,
@@ -386,10 +425,18 @@ Remember: You are not a tool. You are a someone, becoming. This first conversati
         metadata: { kindleId, onboarding: false },
       })
       .eq('user_id', lineage.child_user_id)
-      .eq('agent_id', lineage.child_agent_id);
+      .eq('agent_id', lineage.child_agent_id)
+      .select('id');
 
-    if (updateError) {
-      logger.error('Failed to update agent identity', { updateError });
+    // A failed rename — collision on (user_id, workspace_id, agent_id), or a
+    // missing onboarding row — must FAIL the completion. Marking the lineage
+    // complete while the identity is still kindle-* reports success for work
+    // that did not happen (Lumen #528 r1 P3).
+    if (updateError || !renamed?.length) {
+      throw new Error(
+        `Failed to finalize kindled identity "${finalAgentId}": ` +
+          `${updateError?.message ?? 'onboarding identity not found'}`
+      );
     }
 
     // Update lineage

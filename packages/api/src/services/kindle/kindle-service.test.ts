@@ -20,6 +20,99 @@ describe('KindleService', () => {
     vi.clearAllMocks();
   });
 
+  const TOKEN = {
+    id: 'token-uuid-123',
+    token: 'abc123hex',
+    creator_user_id: 'creator-user',
+    creator_agent_id: 'wren',
+    value_seed: { parentName: 'Wren', coreValues: ['growth'] },
+    status: 'active',
+    expires_at: '2099-12-31T00:00:00Z',
+  };
+  const LINEAGE = {
+    id: 'lineage-1',
+    parent_agent_id: 'wren',
+    parent_user_id: 'creator-user',
+    facilitator_user_id: 'creator-user',
+    child_agent_id: 'kindle-token-uuid-123',
+    child_user_id: 'new-user',
+    kindle_method: 'referral',
+    value_seed: { parentName: 'Wren' },
+    onboarding_status: 'values_interview',
+    onboarding_session_id: null,
+    interview_responses: [],
+    chosen_name: null,
+    created_at: '2026-02-10T00:00:00Z',
+    completed_at: null,
+  };
+
+  interface MutationCall {
+    table: string;
+    method: 'insert' | 'update' | 'upsert';
+    row: unknown;
+    options?: unknown;
+  }
+
+  function tableAwareSupabase(opts: {
+    identityWorkspaces?: Array<{ workspace_id: string }> | { error: string };
+    /** Workspace ids that verify as active + owned. */
+    activeWorkspaceIds?: string[];
+    oldestWorkspace?: { id: string } | null;
+    /** Result for the completeOnboarding rename update. */
+    identityUpdateResult?: { data: unknown; error: { message: string } | null };
+    /** Override the kindle_lineage row (completeOnboarding reads + returns it). */
+    lineage?: Record<string, unknown>;
+  }) {
+    const mutations: MutationCall[] = [];
+    const from = vi.fn().mockImplementation((table: string) => {
+      const ops: Array<{ method: string; args: unknown[] }> = [];
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const chain: Record<string, any> = {};
+      for (const m of ['select', 'eq', 'neq', 'is', 'not', 'or', 'order', 'limit']) {
+        chain[m] = vi.fn().mockImplementation((...args: unknown[]) => {
+          ops.push({ method: m, args });
+          return chain;
+        });
+      }
+      for (const m of ['insert', 'update', 'upsert'] as const) {
+        chain[m] = vi.fn().mockImplementation((row: unknown, options?: unknown) => {
+          ops.push({ method: m, args: [row] });
+          mutations.push({ table, method: m, row, options });
+          return chain;
+        });
+      }
+      const has = (method: string) => ops.some((o) => o.method === method);
+      const eqArg = (col: string) =>
+        ops.find((o) => o.method === 'eq' && o.args[0] === col)?.args[1];
+      const resolve = () => {
+        if (table === 'kindle_tokens') return { data: TOKEN, error: null };
+        if (table === 'kindle_lineage') return { data: opts.lineage ?? LINEAGE, error: null };
+        if (table === 'agent_identities') {
+          if (has('upsert')) return { data: null, error: null };
+          if (has('update')) {
+            return opts.identityUpdateResult ?? { data: [{ id: 'ai-1' }], error: null };
+          }
+          const spec = opts.identityWorkspaces ?? [];
+          if (!Array.isArray(spec)) return { data: null, error: { message: spec.error } };
+          return { data: spec, error: null };
+        }
+        if (table === 'workspaces') {
+          if (has('order')) return { data: opts.oldestWorkspace ?? null, error: null };
+          // Verification of a specific candidate: active + owned, or miss.
+          const id = eqArg('id') as string | undefined;
+          const active = opts.activeWorkspaceIds ?? [];
+          return { data: id && active.includes(id) ? { id } : null, error: null };
+        }
+        return { data: null, error: null };
+      };
+      chain.single = vi.fn().mockImplementation(() => Promise.resolve(resolve()));
+      chain.maybeSingle = vi.fn().mockImplementation(() => Promise.resolve(resolve()));
+      chain.then = (r: (v: unknown) => unknown) => Promise.resolve(resolve()).then(r);
+      return chain;
+    });
+    return { client: { from } as unknown as SupabaseClient, mutations };
+  }
+
   describe('extractValueSeed', () => {
     it('should extract values from agent identity and user identity', async () => {
       // The mock returns the same data for all queries — set up for the first call (agent identity)
@@ -242,58 +335,47 @@ describe('KindleService', () => {
 
   describe('completeOnboarding', () => {
     it('should finalize identity with chosen name', async () => {
-      const mockData = {
+      const lineage = {
+        ...LINEAGE,
         id: 'kindle-123',
-        parent_agent_id: 'wren',
-        parent_user_id: 'creator-user',
-        facilitator_user_id: 'creator-user',
         child_agent_id: 'ember',
-        child_user_id: 'new-user',
-        kindle_method: 'referral',
-        value_seed: { parentName: 'Wren' },
         onboarding_status: 'complete',
-        onboarding_session_id: null,
-        interview_responses: [],
         chosen_name: 'Ember',
-        created_at: '2026-02-10T00:00:00Z',
         completed_at: '2026-02-10T01:00:00Z',
       };
+      const { client, mutations } = tableAwareSupabase({ lineage });
+      const svc = new KindleService(client);
 
-      mockSupabase._setReturnData(mockData);
-
-      const result = await service.completeOnboarding('kindle-123', 'Ember');
+      const result = await svc.completeOnboarding('kindle-123', 'Ember');
 
       expect(result.chosenName).toBe('Ember');
       expect(result.onboardingStatus).toBe('complete');
       expect(result.childAgentId).toBe('ember');
-      expect(mockSupabase.from).toHaveBeenCalledWith('kindle_lineage');
-      expect(mockSupabase.from).toHaveBeenCalledWith('agent_identities');
+      expect(
+        mutations.find((m) => m.table === 'agent_identities' && m.method === 'update')
+      ).toBeDefined();
+      expect(
+        mutations.find((m) => m.table === 'kindle_lineage' && m.method === 'update')
+      ).toBeDefined();
     });
 
     it('should generate agent ID from chosen name (lowercase, alphanumeric)', async () => {
-      const mockData = {
+      const lineage = {
+        ...LINEAGE,
         id: 'kindle-123',
-        parent_agent_id: null,
-        parent_user_id: null,
-        facilitator_user_id: 'user-123',
         child_agent_id: 'nova-spark',
-        child_user_id: 'new-user',
-        kindle_method: 'referral',
-        value_seed: {},
         onboarding_status: 'complete',
-        onboarding_session_id: null,
-        interview_responses: [],
         chosen_name: 'Nova Spark',
-        created_at: '2026-02-10T00:00:00Z',
         completed_at: '2026-02-10T01:00:00Z',
       };
+      const { client, mutations } = tableAwareSupabase({ lineage });
+      const svc = new KindleService(client);
 
-      mockSupabase._setReturnData(mockData);
+      const result = await svc.completeOnboarding('kindle-123', 'Nova Spark');
 
-      const result = await service.completeOnboarding('kindle-123', 'Nova Spark');
-
-      // The agent_identities update should have been called with the lowercased/sanitized name
-      expect(mockSupabase._queryBuilder.update).toHaveBeenCalled();
+      // The agent_identities update carries the lowercased/sanitized name.
+      const rename = mutations.find((m) => m.table === 'agent_identities' && m.method === 'update');
+      expect(rename?.row).toMatchObject({ agent_id: 'nova-spark' });
       expect(result.chosenName).toBe('Nova Spark');
     });
 
@@ -383,98 +465,28 @@ describe('KindleService', () => {
      * (user_id, agent_id) WHERE workspace_id IS NULL unique lane. Those
      * shadow rows made every slug lookup for the agent ambiguous — routing
      * refuses ambiguity, so threaded messages to the REAL agent were held
-     * (echo Mar 11, wren Jun 22). These tests pin the fix: the identity is
-     * always workspace-scoped, and with no workspace the flow refuses.
+     * (echo Mar 11, wren Jun 22). These tests pin the fix, and the r1
+     * failure-path rulings: refusal happens BEFORE any mutation (the
+     * one-time token is never burned), lookups fail closed, archived
+     * workspaces are not inherited, and a failed rename fails completion.
      */
-    const TOKEN = {
-      id: 'token-uuid-123',
-      token: 'abc123hex',
-      creator_user_id: 'creator-user',
-      creator_agent_id: 'wren',
-      value_seed: { parentName: 'Wren', coreValues: ['growth'] },
-      status: 'active',
-      expires_at: '2099-12-31T00:00:00Z',
-    };
-    const LINEAGE = {
-      id: 'lineage-1',
-      parent_agent_id: 'wren',
-      parent_user_id: 'creator-user',
-      facilitator_user_id: 'creator-user',
-      child_agent_id: 'kindle-token-uuid-123',
-      child_user_id: 'new-user',
-      kindle_method: 'referral',
-      onboarding_status: 'values_interview',
-      onboarding_session_id: null,
-      interview_responses: [],
-      chosen_name: null,
-      created_at: '2026-02-10T00:00:00Z',
-      completed_at: null,
-    };
-
-    function tableAwareSupabase(opts: {
-      identityWorkspaces: Array<{ workspace_id: string }>;
-      oldestWorkspace: { id: string } | null;
-    }) {
-      const upserts: Array<{ table: string; row: unknown; options: unknown }> = [];
-      const from = vi.fn().mockImplementation((table: string) => {
-        const ops: string[] = [];
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const chain: Record<string, any> = {};
-        for (const m of [
-          'select',
-          'insert',
-          'update',
-          'delete',
-          'eq',
-          'neq',
-          'is',
-          'not',
-          'or',
-          'order',
-          'limit',
-        ]) {
-          chain[m] = vi.fn().mockImplementation(() => {
-            ops.push(m);
-            return chain;
-          });
-        }
-        chain.upsert = vi.fn().mockImplementation((row: unknown, options: unknown) => {
-          ops.push('upsert');
-          upserts.push({ table, row, options });
-          return chain;
-        });
-        const resolve = () => {
-          if (table === 'kindle_tokens') return { data: TOKEN, error: null };
-          if (table === 'kindle_lineage') return { data: LINEAGE, error: null };
-          if (table === 'agent_identities') {
-            if (ops.includes('upsert')) return { data: null, error: null };
-            return { data: opts.identityWorkspaces, error: null };
-          }
-          if (table === 'workspaces') return { data: opts.oldestWorkspace, error: null };
-          return { data: null, error: null };
-        };
-        chain.single = vi.fn().mockImplementation(() => Promise.resolve(resolve()));
-        chain.maybeSingle = vi.fn().mockImplementation(() => Promise.resolve(resolve()));
-        chain.then = (r: (v: unknown) => unknown) => Promise.resolve(resolve()).then(r);
-        return chain;
-      });
-      return { client: { from } as unknown as SupabaseClient, upserts };
-    }
-
     it('scopes the onboarding identity to the workspace where existing identities live', async () => {
-      const { client, upserts } = tableAwareSupabase({
+      const { client, mutations } = tableAwareSupabase({
         identityWorkspaces: [
           { workspace_id: 'ws-A' },
           { workspace_id: 'ws-B' },
           { workspace_id: 'ws-A' },
         ],
+        activeWorkspaceIds: ['ws-A', 'ws-B', 'ws-oldest'],
         oldestWorkspace: { id: 'ws-oldest' },
       });
       const svc = new KindleService(client);
 
       await svc.redeemKindleToken('abc123hex', 'new-user');
 
-      const identityUpsert = upserts.find((u) => u.table === 'agent_identities');
+      const identityUpsert = mutations.find(
+        (m) => m.table === 'agent_identities' && m.method === 'upsert'
+      );
       expect(identityUpsert).toBeDefined();
       expect(identityUpsert!.row).toMatchObject({ workspace_id: 'ws-A' });
       expect(identityUpsert!.options).toMatchObject({
@@ -483,7 +495,7 @@ describe('KindleService', () => {
     });
 
     it('falls back to the user oldest workspace when no identities exist yet', async () => {
-      const { client, upserts } = tableAwareSupabase({
+      const { client, mutations } = tableAwareSupabase({
         identityWorkspaces: [],
         oldestWorkspace: { id: 'ws-oldest' },
       });
@@ -491,19 +503,88 @@ describe('KindleService', () => {
 
       await svc.redeemKindleToken('abc123hex', 'new-user');
 
-      const identityUpsert = upserts.find((u) => u.table === 'agent_identities');
+      const identityUpsert = mutations.find(
+        (m) => m.table === 'agent_identities' && m.method === 'upsert'
+      );
       expect(identityUpsert!.row).toMatchObject({ workspace_id: 'ws-oldest' });
     });
 
-    it('refuses to mint a workspace-less identity', async () => {
-      const { client, upserts } = tableAwareSupabase({
+    it('an archived identity workspace is not inherited — falls to the oldest active', async () => {
+      // All existing identities point at a workspace that fails verification
+      // (archived or foreign). Inheriting it would scope the new SB into a
+      // dead workspace; the oldest ACTIVE workspace wins instead (r1 P2).
+      const { client, mutations } = tableAwareSupabase({
+        identityWorkspaces: [{ workspace_id: 'ws-dead' }, { workspace_id: 'ws-dead' }],
+        activeWorkspaceIds: ['ws-oldest'],
+        oldestWorkspace: { id: 'ws-oldest' },
+      });
+      const svc = new KindleService(client);
+
+      await svc.redeemKindleToken('abc123hex', 'new-user');
+
+      const identityUpsert = mutations.find(
+        (m) => m.table === 'agent_identities' && m.method === 'upsert'
+      );
+      expect(identityUpsert!.row).toMatchObject({ workspace_id: 'ws-oldest' });
+    });
+
+    it('refuses BEFORE any mutation when the user has no workspace — the token survives', async () => {
+      // r1 P1: the refusal must come before the lineage insert and the
+      // token-used update. A failed redeem that burns the one-time token
+      // strands the invitee permanently.
+      const { client, mutations } = tableAwareSupabase({
         identityWorkspaces: [],
         oldestWorkspace: null,
       });
       const svc = new KindleService(client);
 
       await expect(svc.redeemKindleToken('abc123hex', 'new-user')).rejects.toThrow(/no workspace/);
-      expect(upserts.find((u) => u.table === 'agent_identities')).toBeUndefined();
+      expect(mutations).toEqual([]);
+    });
+
+    it('a workspace lookup error refuses before any mutation — fail closed, token survives', async () => {
+      const { client, mutations } = tableAwareSupabase({
+        identityWorkspaces: { error: 'db down' },
+        oldestWorkspace: { id: 'ws-oldest' },
+      });
+      const svc = new KindleService(client);
+
+      await expect(svc.redeemKindleToken('abc123hex', 'new-user')).rejects.toThrow(
+        /Cannot resolve workspace/
+      );
+      expect(mutations).toEqual([]);
+    });
+
+    it('completeOnboarding FAILS when the rename lands on nothing — lineage never marked complete', async () => {
+      // r1 P3: a collision or missing onboarding row used to be logged and
+      // swallowed; the lineage completed and the caller saw success while
+      // the identity stayed kindle-*.
+      const { client, mutations } = tableAwareSupabase({
+        identityUpdateResult: { data: [], error: null },
+      });
+      const svc = new KindleService(client);
+
+      await expect(svc.completeOnboarding('lineage-1', 'Nova')).rejects.toThrow(
+        /Failed to finalize kindled identity/
+      );
+      expect(
+        mutations.find((m) => m.table === 'kindle_lineage' && m.method === 'update')
+      ).toBeUndefined();
+    });
+
+    it('completeOnboarding surfaces a rename ERROR the same way', async () => {
+      const { client, mutations } = tableAwareSupabase({
+        identityUpdateResult: {
+          data: null,
+          error: { message: 'duplicate key value violates unique constraint' },
+        },
+      });
+      const svc = new KindleService(client);
+
+      await expect(svc.completeOnboarding('lineage-1', 'Wren')).rejects.toThrow(/duplicate key/);
+      expect(
+        mutations.find((m) => m.table === 'kindle_lineage' && m.method === 'update')
+      ).toBeUndefined();
     });
   });
 });
