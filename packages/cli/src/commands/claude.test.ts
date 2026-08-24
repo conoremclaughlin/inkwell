@@ -3,6 +3,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import {
+  buildBackendSessionOwnerIndex,
   extractClaudeHistorySessionsForProject,
   extractBackendSessionOverrideId,
   extractLatestPreviewFromClaudeSessionJsonl,
@@ -1574,5 +1575,84 @@ describe('resolveStartedSessionFromList', () => {
     });
 
     expect(resolved).toBeUndefined();
+  });
+});
+
+describe('buildBackendSessionOwnerIndex', () => {
+  const session = (
+    id: string,
+    agentId: string | null,
+    backendSessionId: string | null,
+    claudeSessionId: string | null = null
+  ) => ({
+    id,
+    agentId,
+    backendSessionId,
+    claudeSessionId,
+    startedAt: '2026-08-01T00:00:00Z',
+  });
+
+  it('maps backendSessionId to its agent across a cross-agent list', () => {
+    const owners = buildBackendSessionOwnerIndex(
+      [session('p1', 'myra', 'b-111'), session('p2', 'wren', 'b-222')],
+      []
+    );
+    expect(owners.get('b-111')).toBe('myra');
+    expect(owners.get('b-222')).toBe('wren');
+  });
+
+  it('first (newest) row wins when two agents registered the same backend session', () => {
+    const owners = buildBackendSessionOwnerIndex(
+      [session('p1', 'myra', 'b-shared'), session('p2', 'wren', 'b-shared')],
+      []
+    );
+    expect(owners.get('b-shared')).toBe('myra');
+  });
+
+  it('falls back to claudeSessionId when backendSessionId is absent', () => {
+    const owners = buildBackendSessionOwnerIndex([session('p1', 'myra', null, 'c-333')], []);
+    expect(owners.get('c-333')).toBe('myra');
+  });
+
+  it('skips rows without an agent or backend id', () => {
+    const owners = buildBackendSessionOwnerIndex(
+      [session('p1', null, 'b-444'), session('p2', 'wren', null)],
+      []
+    );
+    expect(owners.size).toBe(0);
+  });
+
+  it('runtime records fill gaps but never override the session list', () => {
+    const owners = buildBackendSessionOwnerIndex(
+      [session('p1', 'wren', 'b-known')],
+      [
+        {
+          pcpSessionId: 'p2',
+          backend: 'claude',
+          agentId: 'myra',
+          backendSessionId: 'b-runtime-only',
+          backendSessionIds: ['b-known', 'b-extra'],
+          updatedAt: '2026-08-01T00:00:00Z',
+        },
+      ]
+    );
+    expect(owners.get('b-runtime-only')).toBe('myra');
+    expect(owners.get('b-extra')).toBe('myra');
+    expect(owners.get('b-known')).toBe('wren');
+  });
+
+  it('ignores runtime records with no agent attribution', () => {
+    const owners = buildBackendSessionOwnerIndex(
+      [],
+      [
+        {
+          pcpSessionId: 'p1',
+          backend: 'claude',
+          backendSessionId: 'b-555',
+          updatedAt: '2026-08-01T00:00:00Z',
+        },
+      ]
+    );
+    expect(owners.size).toBe(0);
   });
 });

@@ -31,6 +31,7 @@ import {
   listRuntimeSessions,
   setCurrentRuntimeSession,
   upsertRuntimeSession,
+  type RuntimeSessionRecord,
 } from '../session/runtime.js';
 
 export interface SbOptions {
@@ -860,6 +861,35 @@ function withAgentPreviewSpeaker(
     return `${normalizedLabel}: ${preview.replace(/^assistant:\s*/i, '')}`;
   }
   return preview;
+}
+
+/**
+ * backendSessionId → owning agent, assembled from a cross-agent session list
+ * plus this directory's runtime session records.
+ *
+ * Session-list rows arrive newest-first and the first writer wins, so a
+ * backend session that more than one agent has registered over its life reads
+ * as its most recent registrant. Runtime records only fill ids the session
+ * list missed — they are hook-written at spawn time and cover sessions past
+ * the lookup limit, but go stale rather than being re-registered.
+ */
+export function buildBackendSessionOwnerIndex(
+  allAgentSessions: PcpSessionSummary[],
+  runtimeRecords: RuntimeSessionRecord[]
+): Map<string, string> {
+  const owners = new Map<string, string>();
+  for (const session of allAgentSessions) {
+    const backendSessionId = getSessionBackendId(session);
+    if (!backendSessionId || !session.agentId) continue;
+    if (!owners.has(backendSessionId)) owners.set(backendSessionId, session.agentId);
+  }
+  for (const record of runtimeRecords) {
+    if (!record.agentId) continue;
+    for (const id of [record.backendSessionId, ...(record.backendSessionIds || [])]) {
+      if (id && !owners.has(id)) owners.set(id, record.agentId);
+    }
+  }
+  return owners;
 }
 
 export function withSessionFileSize(
@@ -2533,6 +2563,7 @@ async function ensurePcpSessionContext(
 
   // Pull active session list so caller can resume or start new.
   let activeSessions: PcpSessionSummary[] = [];
+  let allAgentSessions: PcpSessionSummary[] = [];
   let pcpAvailable = Boolean(email);
   let pcpUnavailableReason: string | undefined;
 
@@ -2541,12 +2572,21 @@ async function ensurePcpSessionContext(
     pcpUnavailableReason = 'not authenticated';
   } else {
     try {
-      const listed = await callPcpTool<ListSessionsResult>('list_sessions', {
-        email,
-        agentId,
-        ...(studioId ? { studioId } : {}),
-        limit: pcpSessionLimit,
-      });
+      const [listed, allAgentListed] = await Promise.all([
+        callPcpTool<ListSessionsResult>('list_sessions', {
+          email,
+          agentId,
+          ...(studioId ? { studioId } : {}),
+          limit: pcpSessionLimit,
+        }),
+        // Cross-agent view, used only for ownership attribution. Local
+        // backend transcripts in a shared directory can belong to any agent
+        // (a sibling's heartbeat spawns land in the same encoded-cwd dir),
+        // and the agent-scoped list above can never name those owners.
+        // Best-effort: attribution degrades to unlabeled rows on failure.
+        callPcpTool<ListSessionsResult>('list_sessions', { email, limit: 100 }).catch(() => null),
+      ]);
+      allAgentSessions = allAgentListed?.sessions || [];
       activeSessions = filterPcpSessionsForContext(
         (listed.sessions || []).filter((s) => isSessionResumable(s)),
         backend,
@@ -2626,6 +2666,17 @@ async function ensurePcpSessionContext(
     if (!backendSessionId || pcpSessionByBackendSessionId.has(backendSessionId)) continue;
     pcpSessionByBackendSessionId.set(backendSessionId, session);
   }
+  const ownerAgentByBackendSessionId = buildBackendSessionOwnerIndex(
+    allAgentSessions,
+    runtimeSessionsForBackend
+  );
+  // Owner of a local backend transcript: the requester's own linked session
+  // wins (it carries phase/thread context), then the cross-agent index. Null
+  // means unknown — render honestly as unlabeled rather than guessing.
+  const resolveLocalSessionOwner = (backendSessionId: string): string | null =>
+    pcpSessionByBackendSessionId.get(backendSessionId)?.agentId ||
+    ownerAgentByBackendSessionId.get(backendSessionId) ||
+    null;
   // Keep the picker de-duplicated: linked locals are rendered through the Inkwell row
   // (with linked preview/timestamp), while untracked locals remain independently selectable.
   const displayLocalBackendSessions = untrackedLocalBackendSessions;
@@ -2898,10 +2949,14 @@ async function ensurePcpSessionContext(
     });
     const localCandidates = displayLocalBackendSessions.map((session) => {
       const linkedPcpSession = pcpSessionByBackendSessionId.get(session.sessionId);
+      const ownerAgentId = resolveLocalSessionOwner(session.sessionId);
+      // Preview speaker is the resolved owner or nothing — never the
+      // requesting agent. Labeling a sibling's transcript with the
+      // requester's name fabricates authorship.
       const preview = withSessionFileSize(
         withAgentPreviewSpeaker(
           session.latestPrompt || session.firstPrompt,
-          linkedPcpSession?.agentId || agentId
+          ownerAgentId || undefined
         ),
         session.fileSizeBytes
       );
@@ -2914,6 +2969,7 @@ async function ensurePcpSessionContext(
         fileSizeBytes: session.fileSizeBytes || null,
         fileSize: formatFileSize(session.fileSizeBytes) || null,
         gitBranch: session.gitBranch || null,
+        ownerAgentId: ownerAgentId || null,
         linkedPcpSessionId: linkedPcpSession?.id || null,
         linkedPcpAgentId: linkedPcpSession?.agentId || null,
         linkedPcpPhase: linkedPcpSession ? getSessionPhaseLabel(linkedPcpSession) || null : null,
@@ -2997,18 +3053,19 @@ async function ensurePcpSessionContext(
             };
           }
           const localSession = entry.candidate;
-          const showOwner = Boolean(
-            localSession.linkedPcpAgentId && localSession.linkedPcpAgentId !== agentId
-          );
+          const localOwner = localSession.linkedPcpAgentId || localSession.ownerAgentId;
+          const showOwner = Boolean(localOwner && localOwner !== agentId);
           const ownerPhase = showOwner
-            ? `${localSession.linkedPcpAgentId} · ${localSession.linkedPcpPhase || '-'}`
+            ? `${localOwner} · ${localSession.linkedPcpPhase || '-'}`
             : localSession.linkedPcpPhase || '-';
           return {
             type: localSession.linkedPcpSessionId
               ? showOwner
-                ? `local:${localSession.linkedPcpAgentId}`
+                ? `local:${localOwner}`
                 : 'local+pcp'
-              : 'local',
+              : showOwner
+                ? `local:${localOwner}`
+                : 'local',
             choice: `local:${localSession.id.slice(0, 8)}`,
             updated: formatCandidateTimestamp(localSession.modified),
             phase: ownerPhase,
@@ -3035,6 +3092,10 @@ async function ensurePcpSessionContext(
       console.log('');
     }
     if (!normalizedSelectionOverride) {
+      // console.log to a piped stdout is asynchronous — exiting immediately
+      // truncates the JSON at the 64KB pipe buffer. Writes flush FIFO, so
+      // once this empty chunk's callback fires, everything before it landed.
+      await new Promise<void>((resolve) => process.stdout.write('', () => resolve()));
       process.exit(0);
     }
   }
@@ -3159,21 +3220,26 @@ async function ensurePcpSessionContext(
       const previewAt = localSession.latestPromptAt || localSession.modified;
       const backendLabel = localSession.backend[0].toUpperCase() + localSession.backend.slice(1);
       const linkedPcpSession = pcpSessionByBackendSessionId.get(localSession.sessionId);
-      const ownerLabel = linkedPcpSession?.agentId || null;
+      const ownerLabel = resolveLocalSessionOwner(localSession.sessionId);
       const showOwner = Boolean(ownerLabel && ownerLabel !== agentId);
+      // Speaker prefix comes from the resolved owner only — an unowned
+      // transcript keeps its raw "assistant:" prefix instead of being
+      // misattributed to whoever happens to be running the picker.
       const previewText = withSessionFileSize(
         withAgentPreviewSpeaker(
           localSession.latestPrompt || localSession.firstPrompt,
-          ownerLabel || agentId
+          ownerLabel || undefined
         ),
         localSession.fileSizeBytes
       );
       const sourceLabel = showOwner ? `${backendLabel}/${ownerLabel}` : backendLabel;
       const stateLabel = linkedPcpSession
         ? showOwner
-          ? `${ownerLabel} · linked pcp:${linkedPcpSession.id.slice(0, 8)}`
+          ? `owner ${ownerLabel} · linked pcp:${linkedPcpSession.id.slice(0, 8)}`
           : `linked pcp:${linkedPcpSession.id.slice(0, 8)}`
-        : 'local';
+        : showOwner
+          ? `owner ${ownerLabel} · local`
+          : 'local';
       choiceEntries.push({
         key: value,
         sortMs: toEpochMs(previewAt) ?? 0,
