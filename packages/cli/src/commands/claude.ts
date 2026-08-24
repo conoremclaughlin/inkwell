@@ -53,6 +53,7 @@ interface PcpConfig {
 interface BootstrapContextResult {
   identityFiles?: Record<string, string>;
   recentMemories?: Array<Record<string, unknown>>;
+  knowledgeSummary?: string;
   activeSessions?: Array<Record<string, unknown>>;
 }
 
@@ -485,16 +486,24 @@ function buildInjectedStartupContext(
     sections.push(identitySections.join('\n\n'));
   }
 
-  const memories = Array.isArray(bootstrap.recentMemories) ? bootstrap.recentMemories : [];
-  if (memories.length > 0) {
-    const memoryLines = memories.slice(0, 8).map((memory) => {
-      const content =
-        typeof memory.content === 'string'
-          ? memory.content
-          : JSON.stringify(memory).slice(0, 280) || '(empty)';
-      return `- ${truncateForStartupContext(content.trim(), 280)}`;
-    });
-    sections.push(`### RECENT MEMORIES\n${memoryLines.join('\n')}`);
+  // Bootstrap returns `knowledgeSummary` (pre-formatted, critical salience
+  // first), not `recentMemories` — reading the latter injected nothing.
+  const knowledgeSummary =
+    typeof bootstrap.knowledgeSummary === 'string' ? bootstrap.knowledgeSummary.trim() : '';
+  if (knowledgeSummary) {
+    sections.push(`### WHAT YOU KNOW\n${knowledgeSummary}`);
+  } else {
+    const memories = Array.isArray(bootstrap.recentMemories) ? bootstrap.recentMemories : [];
+    if (memories.length > 0) {
+      const memoryLines = memories.slice(0, 8).map((memory) => {
+        const content =
+          typeof memory.content === 'string'
+            ? memory.content
+            : JSON.stringify(memory).slice(0, 280) || '(empty)';
+        return `- ${truncateForStartupContext(content.trim(), 280)}`;
+      });
+      sections.push(`### RECENT MEMORIES\n${memoryLines.join('\n')}`);
+    }
   }
 
   const activeSessions = Array.isArray(bootstrap.activeSessions) ? bootstrap.activeSessions : [];

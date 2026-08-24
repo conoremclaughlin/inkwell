@@ -894,6 +894,18 @@ function renderTemplate(template: string, vars: Record<string, string>): string 
 // Shared Block Builders
 // ============================================================================
 
+/**
+ * Whether the server already put the constitution and knowledge summary in this
+ * turn's prompt.
+ *
+ * Set by the runners when they inject. Only the session-start hook honours it:
+ * post-compact must re-inject unconditionally, because compaction is exactly
+ * the event that removes the original copy.
+ */
+export function serverAlreadyInjectedContext(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.INK_CONSTITUTION_INJECTED === '1';
+}
+
 export function buildIdentityBlock(bootstrapResult: Record<string, unknown>): string {
   const files = bootstrapResult?.identityFiles as Record<string, string> | undefined;
   if (!files) return '';
@@ -948,11 +960,27 @@ function buildInboxBlock(messages: Array<Record<string, unknown>> | undefined): 
   return lines.join('\n');
 }
 
-function buildMemoriesBlock(memories: Array<Record<string, unknown>> | undefined): string {
-  if (!memories || memories.length === 0) return '';
+/**
+ * Render the memory block from a bootstrap result.
+ *
+ * Bootstrap returns `knowledgeSummary` — a pre-formatted, budget-constrained
+ * digest grouped by topic, critical salience first. It does NOT return
+ * `recentMemories`; reading that key silently produced an empty block, so
+ * these hooks injected no memories at all. The array branch is kept only so an
+ * older server that still sends one keeps working.
+ */
+export function buildMemoriesBlock(bootstrapResult: Record<string, unknown>): string {
+  const summary = bootstrapResult?.knowledgeSummary;
+  if (typeof summary === 'string' && summary.trim()) {
+    return `### What You Know\n${summary.trim()}`;
+  }
+
+  const memories = bootstrapResult?.recentMemories;
+  if (!Array.isArray(memories) || memories.length === 0) return '';
   const lines = ['### Recent Memories'];
-  for (const mem of memories.slice(0, 5)) {
-    lines.push(`- ${mem.content || mem.key || JSON.stringify(mem)}`);
+  for (const mem of memories as Array<Record<string, unknown>>) {
+    const salience = mem.salience ? `[${mem.salience}] ` : '';
+    lines.push(`- ${salience}${mem.summary || mem.content || mem.key || JSON.stringify(mem)}`);
   }
   return lines.join('\n');
 }
@@ -1825,9 +1853,7 @@ async function postCompactHandler(): Promise<void> {
       postCompact: true,
     });
     identityBlock = buildIdentityBlock(bootstrap);
-    memoriesBlock = buildMemoriesBlock(
-      bootstrap.recentMemories as Array<Record<string, unknown>> | undefined
-    );
+    memoriesBlock = buildMemoriesBlock(bootstrap);
   } catch {
     identityBlock =
       '*FAILED: Could not reach Inkwell server for `bootstrap`. You should call the `bootstrap` MCP tool manually to reload your identity context.*';
@@ -1954,10 +1980,13 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
     if (studioId) bootstrapArgs.studioId = studioId;
 
     const bootstrap = await callPcpTool('bootstrap', bootstrapArgs);
-    identityBlock = buildIdentityBlock(bootstrap);
-    memoriesBlock = buildMemoriesBlock(
-      bootstrap.recentMemories as Array<Record<string, unknown>> | undefined
-    );
+    // A server-spawned session already carries the constitution AND the
+    // knowledge summary in its first message (the runner sets this). Re-emitting
+    // either here duplicates several thousand tokens for no gain. Post-compact
+    // deliberately does not check this — after compaction the original is gone.
+    const serverInjected = serverAlreadyInjectedContext();
+    identityBlock = serverInjected ? '' : buildIdentityBlock(bootstrap);
+    memoriesBlock = serverInjected ? '' : buildMemoriesBlock(bootstrap);
     sessionsBlock = buildSessionsBlock(
       bootstrap.activeSessions as Array<Record<string, unknown>> | undefined
     );

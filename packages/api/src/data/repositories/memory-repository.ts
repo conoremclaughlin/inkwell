@@ -316,6 +316,30 @@ function summarizeChunkPersistenceContext(params: {
   };
 }
 
+/**
+ * How many critical memories to consider, and how many to return. The pool is
+ * wider than the result so the tier can be ranked rather than truncated.
+ */
+const CRITICAL_CANDIDATE_LIMIT = 100;
+const CRITICAL_RETURN_LIMIT = 30;
+
+/**
+ * Relevance of a memory to the work at hand, ignoring age and salience.
+ *
+ * The critical tier ranks on this alone. A memory marked critical is a
+ * statement that it should keep mattering, so letting recency decay decide
+ * which criticals survive the cap re-introduces exactly the forgetting the
+ * salience was meant to prevent. Age is used only to break ties.
+ */
+export function computeRelevanceBoost(
+  memory: Memory,
+  context: KnowledgeMemoryContext = {}
+): number {
+  return (
+    computeThreadBoost(memory, context.threadKey) * computeFocusBoost(memory, context.focusText)
+  );
+}
+
 export function computeKnowledgeMemoryScore(
   memory: Memory,
   context: KnowledgeMemoryContext = {},
@@ -1205,9 +1229,11 @@ export class MemoryRepository {
       return q;
     };
 
-    // Fetch critical + two high strategies in parallel
+    // Fetch critical + two high strategies in parallel.
+    // Critical pulls a wider candidate pool than it returns so the tier can be
+    // ranked by relevance rather than truncated by recency alone.
     const [criticalResult, highByCountResult, highByWindowResult] = await Promise.all([
-      buildQuery('critical', 30),
+      buildQuery('critical', CRITICAL_CANDIDATE_LIMIT),
       buildQuery('high', highLimit),
       buildWindowedQuery('high', highWindowDays, 50),
     ]);
@@ -1222,7 +1248,18 @@ export class MemoryRepository {
       logger.error('Failed to fetch high memories (by window):', highByWindowResult.error);
     }
 
-    const criticalMemories = (criticalResult.data || []).map(this.rowToMemory);
+    // Rank within the critical tier by relevance, not recency. Taking the
+    // newest N silently dropped older critical memories once the tier outgrew
+    // the cap — exactly the memories most likely to be durable rather than
+    // situational. Equally-relevant memories still fall back to newest-first.
+    const criticalMemories = (criticalResult.data || [])
+      .map(this.rowToMemory)
+      .map((memory) => ({ memory, score: computeRelevanceBoost(memory, context) }))
+      .sort(
+        (a, b) => b.score - a.score || b.memory.createdAt.getTime() - a.memory.createdAt.getTime()
+      )
+      .slice(0, CRITICAL_RETURN_LIMIT)
+      .map((entry) => entry.memory);
 
     // Merge the two high strategies — dedupe by ID, keep recency order
     const highById = new Map<string, Memory>();
@@ -1248,8 +1285,9 @@ export class MemoryRepository {
       )
       .map((entry) => entry.memory);
 
-    // Critical first, then high.
-    // Critical remains recency-ordered; high can be boosted by thread/focus relevance.
+    // Critical first, then high. Both tiers are relevance-ranked internally;
+    // the tier boundary itself is never crossed, so a stale critical memory
+    // still outranks a fresh high one.
     return [...criticalMemories, ...scoredHighMemories];
   }
 

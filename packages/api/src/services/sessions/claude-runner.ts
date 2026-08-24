@@ -250,10 +250,12 @@ export class ClaudeRunner implements IRunner {
 
     // Build the message with injected context
     let fullMessage = message;
+    let runConfig = config;
     if (injectedContext && !isResume) {
       // Only inject full context on first message (not resume)
       const contextBlock = formatInjectedContext(injectedContext);
       fullMessage = `${contextBlock}\n\n---\n\n${message}`;
+      runConfig = { ...config, constitutionInjected: true };
     }
 
     // Build Claude Code arguments
@@ -267,7 +269,7 @@ export class ClaudeRunner implements IRunner {
     });
 
     try {
-      const result = await this.spawnProcess(args, fullMessage, config);
+      const result = await this.spawnProcess(args, fullMessage, runConfig);
 
       // Check if resume failed because session doesn't exist
       if (result.resumeFailedNoSession && isResume) {
@@ -283,10 +285,11 @@ export class ClaudeRunner implements IRunner {
         if (injectedContext) {
           const contextBlock = formatInjectedContext(injectedContext);
           fullMessage = `${contextBlock}\n\n---\n\n${message}`;
+          runConfig = { ...config, constitutionInjected: true };
         }
 
         logger.info('Retrying with fresh session', { sessionId });
-        const retryResult = await this.spawnProcess(args, fullMessage, config);
+        const retryResult = await this.spawnProcess(args, fullMessage, runConfig);
 
         return {
           success: true,
@@ -453,6 +456,9 @@ export class ClaudeRunner implements IRunner {
         PATH: buildSpawnPath(claudeBin),
         // Agent identity — hooks resolve identity from $AGENT_ID.
         ...(config.agentId ? { AGENT_ID: config.agentId } : {}),
+        // Tells the session-start hook the constitution is already in the
+        // prompt, so it does not inject a second copy.
+        ...(config.constitutionInjected ? { INK_CONSTITUTION_INJECTED: '1' } : {}),
         // Session env vars
         ...buildSessionEnv({
           pcpSessionId: config.pcpSessionId,

@@ -13,6 +13,8 @@ import {
   installHooks,
   callPcpTool,
   buildIdentityBlock,
+  buildMemoriesBlock,
+  serverAlreadyInjectedContext,
   hydrateThreadKeyFromServer,
   loadApprovalSet,
   matchesApprovalSet,
@@ -1193,5 +1195,79 @@ describe('isHeadlessSession', () => {
     const token = { sessionId: 's1', agentId: 'wren', studioId: 'x', runtime: 'claude' };
     process.env.INK_CONTEXT = Buffer.from(JSON.stringify(token)).toString('base64url');
     expect(isHeadlessSession()).toBe(false);
+  });
+});
+
+// ============================================================================
+// buildMemoriesBlock: bootstrap returns `knowledgeSummary`, not `recentMemories`
+// ============================================================================
+
+describe('buildMemoriesBlock', () => {
+  it('renders the knowledgeSummary bootstrap actually returns', () => {
+    const result = buildMemoriesBlock({
+      knowledgeSummary: '## project:inkwell\n- [critical] Never squash merge.',
+    });
+
+    expect(result).toContain('Never squash merge.');
+  });
+
+  it('does not depend on `recentMemories`, which bootstrap never sends', () => {
+    // The whole bug: both hooks read this key, got undefined, and silently
+    // injected an empty memory block into every session they touched.
+    const result = buildMemoriesBlock({
+      knowledgeSummary: 'KNOWN-FACT',
+      activeSessions: [],
+    });
+
+    expect(result).not.toBe('');
+    expect(result).toContain('KNOWN-FACT');
+  });
+
+  it('keeps working against an older server that still sends an array', () => {
+    const result = buildMemoriesBlock({
+      recentMemories: [
+        { content: 'legacy-one', salience: 'critical' },
+        { content: 'legacy-two', salience: 'high' },
+      ],
+    });
+
+    expect(result).toContain('[critical] legacy-one');
+    expect(result).toContain('[high] legacy-two');
+  });
+
+  it('does not truncate a long array to five entries', () => {
+    const result = buildMemoriesBlock({
+      recentMemories: Array.from({ length: 9 }, (_, i) => ({
+        content: `mem-${i}`,
+        salience: 'critical',
+      })),
+    });
+
+    expect(result).toContain('mem-8');
+  });
+
+  it('returns empty when there is genuinely nothing to say', () => {
+    expect(buildMemoriesBlock({})).toBe('');
+    expect(buildMemoriesBlock({ knowledgeSummary: '   ' })).toBe('');
+  });
+});
+
+// ============================================================================
+// serverAlreadyInjectedContext: the runner/hook handshake
+// ============================================================================
+
+describe('serverAlreadyInjectedContext', () => {
+  it('is true only for the exact flag the runners set', () => {
+    expect(serverAlreadyInjectedContext({ INK_CONSTITUTION_INJECTED: '1' })).toBe(true);
+  });
+
+  it('is false when absent, so a CLI session still loads its own constitution', () => {
+    expect(serverAlreadyInjectedContext({})).toBe(false);
+  });
+
+  it('does not treat other truthy-looking values as set', () => {
+    expect(serverAlreadyInjectedContext({ INK_CONSTITUTION_INJECTED: '0' })).toBe(false);
+    expect(serverAlreadyInjectedContext({ INK_CONSTITUTION_INJECTED: 'true' })).toBe(false);
+    expect(serverAlreadyInjectedContext({ INK_CONSTITUTION_INJECTED: '' })).toBe(false);
   });
 });

@@ -317,11 +317,15 @@ export class AntigravityRunner implements IRunner {
     // conversation history, and repeating it every turn would both waste
     // context and read as the caller re-introducing themselves each time.
     let fullMessage = message;
+    let runConfig = config;
     if (!isResume) {
       const preamble: string[] = [];
       const systemPrompt = config.appendSystemPrompt || config.systemPrompt;
       if (systemPrompt) preamble.push(systemPrompt);
-      if (injectedContext) preamble.push(formatInjectedContext(injectedContext));
+      if (injectedContext) {
+        preamble.push(formatInjectedContext(injectedContext));
+        runConfig = { ...config, constitutionInjected: true };
+      }
       if (preamble.length > 0) {
         fullMessage = `${preamble.join('\n\n')}\n\n---\n\n${message}`;
       }
@@ -340,7 +344,7 @@ export class AntigravityRunner implements IRunner {
         identityInPrompt: !isResume && !!(config.appendSystemPrompt || config.systemPrompt),
       });
 
-      const result = await this.spawnProcess(args, config, bridgePath);
+      const result = await this.spawnProcess(args, runConfig, bridgePath);
 
       // agy reports failure in the result envelope, on stdout, with a real
       // message. Trust that over the exit code — reading the exit code is what
@@ -507,6 +511,9 @@ export class AntigravityRunner implements IRunner {
         HOME: process.env.HOME || '',
         PATH: buildSpawnPath(agyBin),
         ...(config.agentId ? { AGENT_ID: config.agentId } : {}),
+        // Tells the session-start hook the constitution is already in the
+        // prompt, so it does not inject a second copy.
+        ...(config.constitutionInjected ? { INK_CONSTITUTION_INJECTED: '1' } : {}),
         // Explicit endpoint for the bridge. Without it the bridge falls back to
         // localhost:3001, so an isolated server on PCP_PORT_BASE=4001 would send
         // its bearer token and context to the MAIN server.

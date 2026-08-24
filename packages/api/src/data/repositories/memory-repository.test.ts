@@ -1569,9 +1569,11 @@ describe('MemoryRepository', () => {
 
       await repo.getKnowledgeMemories('user-456', undefined, 25);
 
-      // 3 queries: critical (30), high by count (25), high by window (50)
+      // 3 queries: critical candidates (100), high by count (25), high by
+      // window (50). Critical fetches a wider pool than the 30 it returns so
+      // the tier can be ranked by relevance instead of truncated by recency.
       const limitCalls = (mockSupabase._queryBuilder.limit as ReturnType<typeof vi.fn>).mock.calls;
-      expect(limitCalls).toContainEqual([30]);
+      expect(limitCalls).toContainEqual([100]);
       expect(limitCalls).toContainEqual([25]);
       expect(limitCalls).toContainEqual([50]);
     });
