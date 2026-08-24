@@ -1615,6 +1615,143 @@ export type Database = {
           },
         ];
       };
+      kindle_lineage: {
+        Row: {
+          child_agent_id: string;
+          child_sb_id: string | null;
+          child_user_id: string;
+          chosen_name: string | null;
+          completed_at: string | null;
+          created_at: string | null;
+          facilitator_user_id: string;
+          id: string;
+          interview_responses: Json | null;
+          kindle_method: string;
+          onboarding_session_id: string | null;
+          onboarding_status: string;
+          parent_agent_id: string | null;
+          parent_user_id: string | null;
+          updated_at: string;
+          value_seed: Json | null;
+        };
+        Insert: {
+          child_agent_id: string;
+          child_sb_id?: string | null;
+          child_user_id: string;
+          chosen_name?: string | null;
+          completed_at?: string | null;
+          created_at?: string | null;
+          facilitator_user_id: string;
+          id?: string;
+          interview_responses?: Json | null;
+          kindle_method?: string;
+          onboarding_session_id?: string | null;
+          onboarding_status?: string;
+          parent_agent_id?: string | null;
+          parent_user_id?: string | null;
+          updated_at?: string;
+          value_seed?: Json | null;
+        };
+        Update: {
+          child_agent_id?: string;
+          child_sb_id?: string | null;
+          child_user_id?: string;
+          chosen_name?: string | null;
+          completed_at?: string | null;
+          created_at?: string | null;
+          facilitator_user_id?: string;
+          id?: string;
+          interview_responses?: Json | null;
+          kindle_method?: string;
+          onboarding_session_id?: string | null;
+          onboarding_status?: string;
+          parent_agent_id?: string | null;
+          parent_user_id?: string | null;
+          updated_at?: string;
+          value_seed?: Json | null;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'kindle_lineage_child_sb_id_fkey';
+            columns: ['child_sb_id'];
+            referencedRelation: 'agent_identities';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'kindle_lineage_child_user_id_fkey';
+            columns: ['child_user_id'];
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'kindle_lineage_facilitator_user_id_fkey';
+            columns: ['facilitator_user_id'];
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'kindle_lineage_parent_user_id_fkey';
+            columns: ['parent_user_id'];
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
+      kindle_tokens: {
+        Row: {
+          created_at: string | null;
+          creator_agent_id: string | null;
+          creator_user_id: string;
+          expires_at: string | null;
+          id: string;
+          status: string;
+          token: string;
+          updated_at: string;
+          used_at: string | null;
+          used_by_user_id: string | null;
+          value_seed: Json | null;
+        };
+        Insert: {
+          created_at?: string | null;
+          creator_agent_id?: string | null;
+          creator_user_id: string;
+          expires_at?: string | null;
+          id?: string;
+          status?: string;
+          token?: string;
+          updated_at?: string;
+          used_at?: string | null;
+          used_by_user_id?: string | null;
+          value_seed?: Json | null;
+        };
+        Update: {
+          created_at?: string | null;
+          creator_agent_id?: string | null;
+          creator_user_id?: string;
+          expires_at?: string | null;
+          id?: string;
+          status?: string;
+          token?: string;
+          updated_at?: string;
+          used_at?: string | null;
+          used_by_user_id?: string | null;
+          value_seed?: Json | null;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'kindle_tokens_creator_user_id_fkey';
+            columns: ['creator_user_id'];
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'kindle_tokens_used_by_user_id_fkey';
+            columns: ['used_by_user_id'];
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
       links: {
         Row: {
           created_at: string | null;
@@ -4441,6 +4578,25 @@ export type Database = {
           p_expected_prior?: Json | null;
         };
         Returns: Json;
+      };
+      complete_kindle_onboarding: {
+        Args: {
+          p_kindle_id: string;
+          p_user_id: string;
+          p_chosen_name: string;
+          p_final_agent_id: string;
+          p_soul: string | null;
+        };
+        Returns: Database['public']['Tables']['kindle_lineage']['Row'];
+      };
+      redeem_kindle_token: {
+        Args: {
+          p_token: string;
+          p_new_user_id: string;
+          p_workspace_id: string;
+          p_identity: Json;
+        };
+        Returns: Database['public']['Tables']['kindle_lineage']['Row'];
       };
       match_artifacts: {
         Args: {

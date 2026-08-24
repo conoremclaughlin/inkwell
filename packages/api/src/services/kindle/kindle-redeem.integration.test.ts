@@ -151,6 +151,108 @@ describe.skipIf(!available)('redeem_kindle_token atomicity (integration)', () =>
     }
   });
 
+  it('a token row self-generates its token (original server default restored)', async () => {
+    // Every production create-token call omits `token` and relies on the
+    // original DEFAULT encode(gen_random_bytes(16),'hex') — its loss made
+    // REST/MCP token creation fail unconditionally (Lumen #528 r3 P1-1).
+    const { data, error } = await client
+      .from('kindle_tokens')
+      .insert({ creator_user_id: USER, creator_agent_id: 'wren' })
+      .select('token, expires_at')
+      .single();
+    expect(error).toBeNull();
+    expect(data!.token).toMatch(/^[0-9a-f]{32}$/);
+    // The 7-day expiry default is back too.
+    expect(new Date(data!.expires_at).getTime()).toBeGreaterThan(Date.now());
+    tokens.push(data!.token);
+  });
+
+  it('completion is atomic and bound to the identity UUID', async () => {
+    const { token, id } = await makeToken();
+    const { data: lineage } = await redeem(token, workspaceId);
+    const lineageId = (lineage as { id: string; child_sb_id: string }).id;
+    lineageIds.push(lineageId);
+    // Redemption bound the identity UUID (AGENTS.md: programmatic refs use
+    // agent_identities.id, never the slug).
+    expect((lineage as { child_sb_id: string }).child_sb_id).toBeTruthy();
+
+    const chosen = `it-nova-${id.slice(0, 8)}`;
+    const { data: completed, error } = await client.rpc('complete_kindle_onboarding', {
+      p_kindle_id: lineageId,
+      p_user_id: USER,
+      p_chosen_name: chosen,
+      p_final_agent_id: chosen,
+      p_soul: '# final soul',
+    });
+    expect(error).toBeNull();
+    expect(completed).toMatchObject({ onboarding_status: 'complete', child_agent_id: chosen });
+
+    const { data: identity } = await client
+      .from('agent_identities')
+      .select('agent_id, name')
+      .eq('id', (lineage as { child_sb_id: string }).child_sb_id)
+      .single();
+    expect(identity).toMatchObject({ agent_id: chosen, name: chosen });
+  });
+
+  it('a rename collision rolls back the WHOLE completion — no half-completed onboarding', async () => {
+    const { token, id } = await makeToken();
+    const { data: lineage } = await redeem(token, workspaceId);
+    const lineageId = (lineage as { id: string }).id;
+    lineageIds.push(lineageId);
+
+    // Occupy the final slug in the same workspace so the rename collides.
+    const taken = `it-taken-${id.slice(0, 8)}`;
+    const { error: fixtureErr } = await client
+      .from('agent_identities')
+      .insert({
+        user_id: USER,
+        workspace_id: workspaceId,
+        agent_id: taken,
+        name: taken,
+        role: 'fixture',
+      });
+    expect(fixtureErr).toBeNull();
+
+    const { error } = await client.rpc('complete_kindle_onboarding', {
+      p_kindle_id: lineageId,
+      p_user_id: USER,
+      p_chosen_name: taken,
+      p_final_agent_id: taken,
+      p_soul: null,
+    });
+    expect(error).toBeTruthy();
+
+    // The rename rolled back WITH the lineage write: status untouched, and
+    // the onboarding identity still carries its temp slug — retry works.
+    const { data: after } = await client
+      .from('kindle_lineage')
+      .select('onboarding_status, child_agent_id')
+      .eq('id', lineageId)
+      .single();
+    expect(after).toMatchObject({
+      onboarding_status: 'values_interview',
+      child_agent_id: `kindle-${id}`,
+    });
+  });
+
+  it('another user cannot read or complete the lineage', async () => {
+    const { token } = await makeToken();
+    const { data: lineage } = await redeem(token, workspaceId);
+    const lineageId = (lineage as { id: string }).id;
+    lineageIds.push(lineageId);
+
+    const { error } = await client.rpc('complete_kindle_onboarding', {
+      p_kindle_id: lineageId,
+      p_user_id: randomUUID(),
+      p_chosen_name: 'thief',
+      p_final_agent_id: 'thief',
+      p_soul: null,
+    });
+    expect(error).toBeTruthy();
+    expect(error!.message).toMatch(/not found for this user/);
+  });
+
   it('two concurrent redemptions of one token — exactly one wins', async () => {
     const { token } = await makeToken();
 

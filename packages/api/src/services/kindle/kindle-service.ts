@@ -347,78 +347,47 @@ Remember: You are not a tool. You are a someone, becoming. This first conversati
   async completeOnboarding(
     kindleId: string,
     chosenName: string,
-    soulMd?: string
+    soulMd: string | undefined,
+    userId: string
   ): Promise<KindleLineage> {
-    // Get the lineage record
-    const { data: lineage, error } = await this.supabase
-      .from('kindle_lineage')
-      .select('*')
-      .eq('id', kindleId)
-      .single();
-
-    if (error || !lineage) {
-      throw new Error('Kindle lineage not found');
-    }
-
     // Generate final agent ID from chosen name
     const finalAgentId = chosenName.toLowerCase().replace(/[^a-z0-9-]/g, '-');
 
-    // Update the temporary agent identity to the final one
-    const { data: renamed, error: updateError } = await this.supabase
-      .from('agent_identities')
-      .update({
-        agent_id: finalAgentId,
-        name: chosenName,
-        role: 'Personal SB',
-        description: `Kindled from ${(lineage.value_seed as ValueSeed)?.parentName || 'first principles'}`,
-        soul: soulMd || null,
-        metadata: { kindleId, onboarding: false },
-      })
-      .eq('user_id', lineage.child_user_id)
-      .eq('agent_id', lineage.child_agent_id)
-      .select('id');
+    // Rename + lineage completion in ONE transaction, user-scoped inside the
+    // function (Lumen #528 r3 P1-3/P1-4): only the kindled user completes
+    // their own onboarding, the rename targets the lineage's bound identity
+    // UUID (never the slug when the binding exists), and a lineage-write
+    // failure rolls back the rename — a half-completed onboarding cannot
+    // exist.
+    const { data: lineage, error } = await this.supabase.rpc('complete_kindle_onboarding', {
+      p_kindle_id: kindleId,
+      p_user_id: userId,
+      p_chosen_name: chosenName,
+      p_final_agent_id: finalAgentId,
+      p_soul: soulMd ?? null,
+    });
 
-    // A failed rename — collision on (user_id, workspace_id, agent_id), or a
-    // missing onboarding row — must FAIL the completion. Marking the lineage
-    // complete while the identity is still kindle-* reports success for work
-    // that did not happen (Lumen #528 r1 P3).
-    if (updateError || !renamed?.length) {
-      throw new Error(
-        `Failed to finalize kindled identity "${finalAgentId}": ` +
-          `${updateError?.message ?? 'onboarding identity not found'}`
-      );
-    }
-
-    // Update lineage
-    const { data: updated, error: lineageError } = await this.supabase
-      .from('kindle_lineage')
-      .update({
-        child_agent_id: finalAgentId,
-        chosen_name: chosenName,
-        onboarding_status: 'complete',
-        completed_at: new Date().toISOString(),
-      })
-      .select('*')
-      .eq('id', kindleId)
-      .single();
-
-    if (lineageError || !updated) {
-      throw new Error(`Failed to complete onboarding: ${lineageError?.message}`);
+    if (error || !lineage) {
+      throw new Error(`Failed to complete onboarding: ${error?.message ?? 'no lineage row'}`);
     }
 
     logger.info('Kindle onboarding completed', { kindleId, chosenName, finalAgentId });
-    return this.mapLineage(updated);
+    return this.mapLineage(lineage);
   }
 
   /**
    * Get a kindle lineage record by ID.
    */
-  async getKindle(kindleId: string): Promise<KindleLineage | null> {
+  async getKindle(kindleId: string, userId: string): Promise<KindleLineage | null> {
+    // User-scoped (Lumen #528 r3 P1-3): the service runs with the service
+    // role, so an unscoped by-UUID read is a cross-user read. Only the
+    // kindled user or the facilitator may see a lineage.
     const { data } = await this.supabase
       .from('kindle_lineage')
       .select('*')
       .eq('id', kindleId)
-      .single();
+      .or(`child_user_id.eq.${userId},facilitator_user_id.eq.${userId}`)
+      .maybeSingle();
 
     return data ? this.mapLineage(data) : null;
   }

@@ -58,10 +58,10 @@ describe('KindleService', () => {
     /** Workspace ids that verify as active + owned. */
     activeWorkspaceIds?: string[];
     oldestWorkspace?: { id: string } | null;
-    /** Result for the completeOnboarding rename update. */
-    identityUpdateResult?: { data: unknown; error: { message: string } | null };
-    /** Override the kindle_lineage row (completeOnboarding reads + returns it). */
+    /** Override the kindle_lineage row (RPCs return it). */
     lineage?: Record<string, unknown>;
+    /** Result of the complete_kindle_onboarding RPC. */
+    completeRpcResult?: { data: unknown; error: { message: string } | null };
     /** Result of the redeem_kindle_token RPC. */
     rpcResult?: { data: unknown; error: { message: string } | null };
   }) {
@@ -92,9 +92,6 @@ describe('KindleService', () => {
         if (table === 'kindle_lineage') return { data: opts.lineage ?? LINEAGE, error: null };
         if (table === 'agent_identities') {
           if (has('upsert')) return { data: null, error: null };
-          if (has('update')) {
-            return opts.identityUpdateResult ?? { data: [{ id: 'ai-1' }], error: null };
-          }
           const spec = opts.identityWorkspaces ?? [];
           if (!Array.isArray(spec)) return { data: null, error: { message: spec.error } };
           return { data: spec, error: null };
@@ -115,6 +112,11 @@ describe('KindleService', () => {
     });
     const rpc = vi.fn().mockImplementation((fn: string, args: Record<string, unknown>) => {
       rpcCalls.push({ fn, args });
+      if (fn === 'complete_kindle_onboarding') {
+        return Promise.resolve(
+          opts.completeRpcResult ?? { data: opts.lineage ?? LINEAGE, error: null }
+        );
+      }
       return Promise.resolve(opts.rpcResult ?? { data: opts.lineage ?? LINEAGE, error: null });
     });
     return { client: { from, rpc } as unknown as SupabaseClient, mutations, rpcCalls };
@@ -355,20 +357,21 @@ describe('KindleService', () => {
         chosen_name: 'Ember',
         completed_at: '2026-02-10T01:00:00Z',
       };
-      const { client, mutations } = tableAwareSupabase({ lineage });
+      const { client, rpcCalls } = tableAwareSupabase({ lineage });
       const svc = new KindleService(client);
 
-      const result = await svc.completeOnboarding('kindle-123', 'Ember');
+      const result = await svc.completeOnboarding('kindle-123', 'Ember', undefined, 'new-user');
 
       expect(result.chosenName).toBe('Ember');
       expect(result.onboardingStatus).toBe('complete');
       expect(result.childAgentId).toBe('ember');
-      expect(
-        mutations.find((m) => m.table === 'agent_identities' && m.method === 'update')
-      ).toBeDefined();
-      expect(
-        mutations.find((m) => m.table === 'kindle_lineage' && m.method === 'update')
-      ).toBeDefined();
+      // Rename + lineage completion live in ONE transaction, user-scoped.
+      expect(rpcCalls[0].fn).toBe('complete_kindle_onboarding');
+      expect(rpcCalls[0].args).toMatchObject({
+        p_kindle_id: 'kindle-123',
+        p_user_id: 'new-user',
+        p_chosen_name: 'Ember',
+      });
     });
 
     it('should generate agent ID from chosen name (lowercase, alphanumeric)', async () => {
@@ -380,23 +383,32 @@ describe('KindleService', () => {
         chosen_name: 'Nova Spark',
         completed_at: '2026-02-10T01:00:00Z',
       };
-      const { client, mutations } = tableAwareSupabase({ lineage });
+      const { client, rpcCalls } = tableAwareSupabase({ lineage });
       const svc = new KindleService(client);
 
-      const result = await svc.completeOnboarding('kindle-123', 'Nova Spark');
+      const result = await svc.completeOnboarding(
+        'kindle-123',
+        'Nova Spark',
+        undefined,
+        'new-user'
+      );
 
-      // The agent_identities update carries the lowercased/sanitized name.
-      const rename = mutations.find((m) => m.table === 'agent_identities' && m.method === 'update');
-      expect(rename?.row).toMatchObject({ agent_id: 'nova-spark' });
+      // The RPC receives the lowercased/sanitized slug.
+      expect(rpcCalls[0].args).toMatchObject({ p_final_agent_id: 'nova-spark' });
       expect(result.chosenName).toBe('Nova Spark');
     });
+    it('should throw if kindle lineage not found (RPC error propagates)', async () => {
+      const { client } = tableAwareSupabase({
+        completeRpcResult: {
+          data: null,
+          error: { message: 'kindle lineage nonexistent not found for this user' },
+        },
+      });
+      const svc = new KindleService(client);
 
-    it('should throw if kindle lineage not found', async () => {
-      mockSupabase._setReturnData(null, { code: 'PGRST116', message: 'not found' });
-
-      await expect(service.completeOnboarding('nonexistent', 'Ember')).rejects.toThrow(
-        'Kindle lineage not found'
-      );
+      await expect(
+        svc.completeOnboarding('nonexistent', 'Ember', undefined, 'new-user')
+      ).rejects.toThrow(/not found for this user/);
     });
   });
 
@@ -419,7 +431,7 @@ describe('KindleService', () => {
         completed_at: '2026-02-10T01:00:00Z',
       });
 
-      const result = await service.getKindle('kindle-123');
+      const result = await service.getKindle('kindle-123', 'user-123');
 
       expect(result).not.toBeNull();
       expect(result!.id).toBe('kindle-123');
@@ -429,7 +441,7 @@ describe('KindleService', () => {
     it('should return null for non-existent kindle', async () => {
       mockSupabase._setReturnData(null);
 
-      const result = await service.getKindle('nonexistent');
+      const result = await service.getKindle('nonexistent', 'user-123');
 
       expect(result).toBeNull();
     });
@@ -582,36 +594,25 @@ describe('KindleService', () => {
       expect(mutations).toEqual([]);
     });
 
-    it('completeOnboarding FAILS when the rename lands on nothing — lineage never marked complete', async () => {
-      // r1 P3: a collision or missing onboarding row used to be logged and
-      // swallowed; the lineage completed and the caller saw success while
-      // the identity stayed kindle-*.
+    it('a completion failure surfaces — nothing to unwind client-side (r1 P3, r3 P1-4)', async () => {
+      // Rename + lineage completion live in ONE transaction inside
+      // complete_kindle_onboarding: a collision, a missing identity, or a
+      // lineage-write failure rolls back the whole completion (proven
+      // against the real DB in kindle-redeem.integration.test.ts). The unit
+      // claim is propagation: the RPC error becomes a completion error, and
+      // no client-side writes ran.
       const { client, mutations } = tableAwareSupabase({
-        identityUpdateResult: { data: [], error: null },
-      });
-      const svc = new KindleService(client);
-
-      await expect(svc.completeOnboarding('lineage-1', 'Nova')).rejects.toThrow(
-        /Failed to finalize kindled identity/
-      );
-      expect(
-        mutations.find((m) => m.table === 'kindle_lineage' && m.method === 'update')
-      ).toBeUndefined();
-    });
-
-    it('completeOnboarding surfaces a rename ERROR the same way', async () => {
-      const { client, mutations } = tableAwareSupabase({
-        identityUpdateResult: {
+        completeRpcResult: {
           data: null,
           error: { message: 'duplicate key value violates unique constraint' },
         },
       });
       const svc = new KindleService(client);
 
-      await expect(svc.completeOnboarding('lineage-1', 'Wren')).rejects.toThrow(/duplicate key/);
-      expect(
-        mutations.find((m) => m.table === 'kindle_lineage' && m.method === 'update')
-      ).toBeUndefined();
+      await expect(
+        svc.completeOnboarding('lineage-1', 'Wren', undefined, 'new-user')
+      ).rejects.toThrow(/duplicate key/);
+      expect(mutations).toEqual([]);
     });
   });
 });

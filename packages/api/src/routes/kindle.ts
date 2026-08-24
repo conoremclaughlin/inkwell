@@ -123,9 +123,12 @@ export function createKindleRouter(): Router {
    */
   router.get('/:kindleId', async (req: Request, res: Response) => {
     try {
+      const { userId } = req as ChatAuthRequest;
       const { kindleId } = req.params;
       const kindleService = getKindleService();
-      const lineage = await kindleService.getKindle(kindleId);
+      // Scoped to the authenticated user — a lineage UUID alone must never
+      // read across users (Lumen #528 r3 P1-3).
+      const lineage = await kindleService.getKindle(kindleId, userId);
 
       if (!lineage) {
         res.status(404).json({ error: 'Kindle not found' });
@@ -145,6 +148,7 @@ export function createKindleRouter(): Router {
    */
   router.post('/:kindleId/complete', async (req: Request, res: Response) => {
     try {
+      const { userId } = req as ChatAuthRequest;
       const { kindleId } = req.params;
       const { chosenName, soulMd } = req.body;
 
@@ -154,15 +158,18 @@ export function createKindleRouter(): Router {
       }
 
       const kindleService = getKindleService();
-      const lineage = await kindleService.completeOnboarding(kindleId, chosenName, soulMd);
+      // The RPC scopes to the authenticated user — only the kindled user can
+      // rename their own onboarding identity (Lumen #528 r3 P1-3).
+      const lineage = await kindleService.completeOnboarding(kindleId, chosenName, soulMd, userId);
 
       res.json({
         kindle: lineage,
         agentId: lineage.childAgentId,
       });
     } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to complete onboarding';
       logger.error('Complete kindle error:', error);
-      res.status(500).json({ error: 'Failed to complete onboarding' });
+      res.status(400).json({ error: message });
     }
   });
 
