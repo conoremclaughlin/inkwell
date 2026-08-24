@@ -6585,7 +6585,10 @@ router.get('/tasks', async (req: Request, res: Response) => {
       query = query.in('status', ['pending', 'in_progress', 'blocked']);
     }
 
-    const { data, error } = await query.limit(200);
+    // Order before capping: the old unordered .limit(200) silently dropped an
+    // arbitrary third of the active set — whole task groups simply never
+    // appeared on the map, newest work included.
+    const { data, error } = await query.order('created_at', { ascending: false }).limit(1000);
 
     if (error) {
       res.status(500).json(errorJson('Failed to list tasks', error));
@@ -6690,6 +6693,50 @@ router.get('/tasks', async (req: Request, res: Response) => {
   } catch (error) {
     logger.error('Failed to list tasks:', error);
     res.status(500).json(errorJson('Failed to list tasks', error));
+  }
+});
+
+/**
+ * GET /api/admin/activity
+ * Recent activity_stream events for the command center feed. Tool telemetry
+ * (tool_call/tool_result) is excluded — it is ~half the stream and narrates
+ * plumbing, not work the operator can act on.
+ */
+router.get('/activity', async (req: Request, res: Response) => {
+  try {
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const authReq = req as AdminAuthRequest;
+    const limit = Math.min(Number(req.query.limit) || 50, 200);
+
+    const { data, error } = await supabase
+      .from('activity_stream')
+      .select('id, type, subtype, agent_id, content, status, created_at')
+      .eq('user_id', authReq.pcpUserId)
+      .not('type', 'in', '(tool_call,tool_result)')
+      .order('created_at', { ascending: false })
+      .limit(limit);
+
+    if (error) {
+      res.status(500).json(errorJson('Failed to list activity', error));
+      return;
+    }
+
+    res.json({
+      events: (data || []).map((e) => ({
+        id: e.id,
+        type: e.type,
+        subtype: e.subtype,
+        agentId: e.agent_id,
+        content: e.content,
+        status: e.status,
+        createdAt: e.created_at,
+      })),
+    });
+  } catch (error) {
+    logger.error('Failed to list activity:', error);
+    res.status(500).json(errorJson('Failed to list activity', error));
   }
 });
 
