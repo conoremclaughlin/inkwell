@@ -28,8 +28,21 @@ import {
   webhookMatches,
 } from './alert-policy';
 
-/** Per-sink ceiling. A hung sink must not hold the checker's request open. */
+/** Per-operation ceiling for a single outbound send. */
 const SINK_TIMEOUT_MS = 10_000;
+
+/**
+ * Whole-sink ceiling.
+ *
+ * SINK_TIMEOUT_MS bounds the individual sends, but a sink is more than its
+ * sends: quiet-hours lookup, webhook-registry load, per-delivery bookkeeping.
+ * Those sit outside the per-send race, so one hung DB call could keep
+ * Promise.allSettled open indefinitely and the checker's request with it —
+ * the alerting path hanging on the infrastructure it is trying to report on
+ * (PR #539, Lumen). Generous enough to cover several sequential webhook
+ * deliveries, finite enough that nothing waits forever.
+ */
+const SINK_TOTAL_TIMEOUT_MS = 45_000;
 
 export interface SinkResult {
   sink: 'user' | 'agents' | 'webhook';
@@ -48,15 +61,19 @@ export interface AlertDispatchResult {
   deliveries: SinkResult[];
 }
 
-async function withTimeout<T>(label: string, work: Promise<T>): Promise<T> {
+async function withTimeout<T>(
+  label: string,
+  work: Promise<T>,
+  budgetMs: number = SINK_TIMEOUT_MS
+): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
   try {
     return await Promise.race([
       work,
       new Promise<never>((_, reject) => {
         timer = setTimeout(
-          () => reject(new Error(`${label} timed out after ${SINK_TIMEOUT_MS}ms`)),
-          SINK_TIMEOUT_MS
+          () => reject(new Error(`${label} timed out after ${budgetMs}ms`)),
+          budgetMs
         );
       }),
     ]);
@@ -268,11 +285,14 @@ export class AlertDispatchService {
     }
   ): Promise<SinkResult[]> {
     // Sinks run concurrently and are settled independently — one sink's
-    // failure must never cancel another's delivery.
+    // failure must never cancel another's delivery. Each is bounded as a
+    // WHOLE, not just at its outbound sends: a sink's DB lookups and
+    // bookkeeping are part of what can hang, and an unbounded one holds the
+    // checker's request open for as long as it likes.
     const results = await Promise.allSettled([
-      this.notifyUserChannel(userId, event),
-      this.notifyAgents(userId, event),
-      this.notifyWebhooks(userId, event),
+      withTimeout('user sink', this.notifyUserChannel(userId, event), SINK_TOTAL_TIMEOUT_MS),
+      withTimeout('agents sink', this.notifyAgents(userId, event), SINK_TOTAL_TIMEOUT_MS),
+      withTimeout('webhook sink', this.notifyWebhooks(userId, event), SINK_TOTAL_TIMEOUT_MS),
     ]);
 
     return results.flatMap((r, i) => {
@@ -505,7 +525,7 @@ export class AlertDispatchService {
 
       const ok = response.ok;
       if (ok) {
-        await this.supabase
+        const { error: bookkeepingError } = await this.supabase
           .from('alert_webhooks')
           .update({
             last_delivery_at: new Date().toISOString(),
@@ -514,6 +534,15 @@ export class AlertDispatchService {
             consecutive_failures: 0,
           })
           .eq('id', webhook.id);
+        if (bookkeepingError) {
+          // The delivery itself succeeded, so this does not change the result
+          // — but a failure counter that cannot be reset will eventually
+          // disable a healthy webhook.
+          logger.warn('Failed to record webhook delivery success', {
+            webhook: webhook.name,
+            error: bookkeepingError.message,
+          });
+        }
       } else {
         await this.bumpWebhookFailure(webhook.id, `HTTP ${response.status}`, response.status);
       }
@@ -537,11 +566,22 @@ export class AlertDispatchService {
     status?: number
   ): Promise<void> {
     try {
-      await this.supabase.rpc('record_alert_webhook_failure', {
+      const { error } = await this.supabase.rpc('record_alert_webhook_failure', {
         p_webhook_id: webhookId,
         ...(detail === undefined ? {} : { p_error: detail }),
         ...(status === undefined ? {} : { p_status: status }),
       });
+      if (error) {
+        // Still never rethrown — this must not mask the delivery outcome we
+        // are in the middle of reporting. But it does need to be visible: the
+        // counter this increments is what eventually disables a dead webhook,
+        // so losing increments silently means a broken endpoint is retried
+        // forever with nothing to show for it.
+        logger.warn('Failed to record webhook delivery failure', {
+          webhookId,
+          error: error.message,
+        });
+      }
     } catch {
       // Failure bookkeeping is diagnostic; never let it mask the delivery
       // outcome we are in the middle of reporting.
@@ -553,7 +593,11 @@ export class AlertDispatchService {
   /** Record that this source is alive, whatever it is reporting. */
   private async touchSource(userId: string, alert: ParsedAlert): Promise<void> {
     try {
-      await this.supabase.from('alert_sources').upsert(
+      // PostgREST reports failures in the returned { error }, not by throwing.
+      // The try/catch alone therefore caught nothing, and a failed liveness
+      // stamp passed as success — on the one table whose whole purpose is
+      // noticing that something stopped reporting.
+      const { error } = await this.supabase.from('alert_sources').upsert(
         {
           user_id: userId,
           source: alert.source,
@@ -566,6 +610,12 @@ export class AlertDispatchService {
         },
         { onConflict: 'user_id,source' }
       );
+      if (error) {
+        logger.error('Failed to touch alert source', {
+          source: alert.source,
+          error: error.message,
+        });
+      }
     } catch (error) {
       logger.error('Failed to touch alert source', { source: alert.source, error });
     }
@@ -690,12 +740,18 @@ export class AlertDispatchService {
 
   private async recordDelivery(eventId: string, deliveries: SinkResult[]): Promise<void> {
     try {
-      await this.supabase
+      const { error } = await this.supabase
         .from('alert_events')
         // SinkResult is a flat record of primitives, so it is structurally Json
         // even though TypeScript cannot narrow an interface to it.
         .update({ delivery: deliveries as unknown as Json })
         .eq('id', eventId);
+      if (error) {
+        // This is the per-sink record that answers "why did nobody hear about
+        // this" after the fact. Losing it silently costs exactly the debugging
+        // the column exists for.
+        logger.error('Failed to record alert delivery', { eventId, error: error.message });
+      }
     } catch (error) {
       logger.error('Failed to record alert delivery', { eventId, error });
     }
