@@ -18,8 +18,14 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { readFileSync } from 'fs';
+import { resolve } from 'path';
 import type { SupabaseClient } from '@supabase/supabase-js';
-import { AlertDispatchService } from './alert-dispatch.service';
+import {
+  AlertDispatchService,
+  RECOVERY_FANOUT_TIMEOUT_MS,
+  SINK_TOTAL_TIMEOUT_MS,
+} from './alert-dispatch.service';
 import type { DataComposer } from '../../data/composer';
 
 const USER = 'user-1';
@@ -249,6 +255,30 @@ describe('liveness recovery', () => {
 
     // Recovering from an alarm nobody heard is not news.
     expect(fanOut).not.toHaveBeenCalled();
+  });
+
+  it('bounds the recovery notice so two fan-outs fit inside the checker’s budget', async () => {
+    // A monitor returning from the dead posts its alert through the same
+    // request that closes its liveness incident, so POST /alerts can run the
+    // recovery fan-out AND the alert fan-out back to back. ink-disk-monitor.sh
+    // gives that request --max-time 20; at the full budget each, the pair sums
+    // to 24s and the checker times out and fires a direct Telegram — the exact
+    // double-notification this round removed.
+    //
+    // Asserted against the shell script rather than a copied constant, so
+    // raising --max-time there does not silently invalidate the reasoning here.
+    const script = readFileSync(
+      resolve(__dirname, '../../../../../scripts/ink-disk-monitor.sh'),
+      'utf8'
+    );
+    // The ingest POST specifically — the script also curls /checkin and the
+    // deadman URL on their own budgets.
+    const ingestBudgetSec = Number(
+      /--max-time (\d+) \\\s*\n\s*-X POST "\$INK_ALERT_URL"/.exec(script)?.[1]
+    );
+    expect(Number.isFinite(ingestBudgetSec)).toBe(true);
+
+    expect(RECOVERY_FANOUT_TIMEOUT_MS + SINK_TOTAL_TIMEOUT_MS).toBeLessThan(ingestBudgetSec * 1000);
   });
 
   it('does not try to resolve liveness for the liveness source itself', async () => {

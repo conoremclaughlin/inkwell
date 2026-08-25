@@ -49,7 +49,20 @@ const SINK_TIMEOUT_MS = 5_000;
  * fallback that had not actually fallen back (PR #539 r2, Lumen). 12s leaves
  * room for the ingest RPC and the response inside the client's 20s.
  */
-const SINK_TOTAL_TIMEOUT_MS = 12_000;
+export const SINK_TOTAL_TIMEOUT_MS = 12_000;
+
+/**
+ * Budget for the liveness *recovery* notice, which is not the request's main
+ * work.
+ *
+ * A monitor coming back from the dead posts its alert through the same request
+ * that closes its liveness incident, so two fan-outs can run in one call:
+ * "disk-monitor is alive again" and then the disk alert itself. At the full
+ * budget each, those sum to 24s and blow past the checker's 20s — re-creating,
+ * out of the fix, precisely the timeout-then-double-notify this round set out
+ * to remove. Bounded so the worst case (5 + 12) still lands inside it.
+ */
+export const RECOVERY_FANOUT_TIMEOUT_MS = 5_000;
 
 /**
  * A sink that ran out of time, as distinct from one that failed.
@@ -362,7 +375,8 @@ export class AlertDispatchService {
       notifyAgents?: string[];
       notifyUser?: boolean;
       kind: 'raised' | 'resolved';
-    }
+    },
+    budgetMs: number = SINK_TOTAL_TIMEOUT_MS
   ): Promise<SinkResult[]> {
     // Sinks run concurrently and are settled independently — one sink's
     // failure must never cancel another's delivery. Each is bounded as a
@@ -376,19 +390,15 @@ export class AlertDispatchService {
     const deadline = new AbortController();
     const deadlineTimer = setTimeout(
       () => deadline.abort(new SinkTimeoutError('fan-out deadline reached')),
-      SINK_TOTAL_TIMEOUT_MS
+      budgetMs
     );
 
     let results: PromiseSettledResult<SinkResult[]>[];
     try {
       results = await Promise.allSettled([
-        withTimeout('user sink', this.notifyUserChannel(userId, event), SINK_TOTAL_TIMEOUT_MS),
-        withTimeout('agents sink', this.notifyAgents(userId, event), SINK_TOTAL_TIMEOUT_MS),
-        withTimeout(
-          'webhook sink',
-          this.notifyWebhooks(userId, event, deadline.signal),
-          SINK_TOTAL_TIMEOUT_MS
-        ),
+        withTimeout('user sink', this.notifyUserChannel(userId, event), budgetMs),
+        withTimeout('agents sink', this.notifyAgents(userId, event), budgetMs),
+        withTimeout('webhook sink', this.notifyWebhooks(userId, event, deadline.signal), budgetMs),
       ]);
     } finally {
       clearTimeout(deadlineTimer);
@@ -778,16 +788,20 @@ export class AlertDispatchService {
         Math.round((Date.now() - new Date(row.first_seen_at).getTime()) / 60000)
       );
 
-      const deliveries = await this.fanOut(userId, {
-        severity: 'info',
-        source: 'alert-liveness',
-        title: `Recovered: ${row.title}`,
-        detail: `Monitor "${source}" checked in again after ${minutes} min of silence.`,
-        dedupeKey: `alert-liveness:${source}`,
-        occurrenceCount: row.occurrence_count ?? 0,
-        notifyAgents: ['myra'],
-        kind: 'resolved',
-      });
+      const deliveries = await this.fanOut(
+        userId,
+        {
+          severity: 'info',
+          source: 'alert-liveness',
+          title: `Recovered: ${row.title}`,
+          detail: `Monitor "${source}" checked in again after ${minutes} min of silence.`,
+          dedupeKey: `alert-liveness:${source}`,
+          occurrenceCount: row.occurrence_count ?? 0,
+          notifyAgents: ['myra'],
+          kind: 'resolved',
+        },
+        RECOVERY_FANOUT_TIMEOUT_MS
+      );
       await this.recordDelivery(row.event_id, deliveries);
     } catch (error) {
       logger.error('Failed to resolve liveness incident', { source, error });
