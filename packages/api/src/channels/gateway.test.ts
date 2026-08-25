@@ -873,6 +873,59 @@ describe('Activity Stream Integration', () => {
       );
     });
 
+    it('credits the SB that authored the response, not the channel default', async () => {
+      // The bug this pins: agentId used to be the literal 'myra' on every
+      // Telegram send, so the column was constant rather than occasionally
+      // wrong — it looked like attribution while carrying no information.
+      // All 1259 message_out rows in production read 'myra' for this reason.
+      mockFindByPlatformId.mockResolvedValueOnce({ id: 'resolved-user-uuid' });
+
+      gateway.setMessageHandler(vi.fn().mockResolvedValue(undefined));
+      const forwardToHandler = (gateway as any).forwardToHandler.bind(gateway);
+      await forwardToHandler('telegram', '778001', { id: 'sender456' }, 'Incoming', {
+        chatType: 'direct',
+      });
+
+      (gateway as any).telegramListener = { sendMessage: vi.fn().mockResolvedValue(undefined) };
+      mockLogMessage.mockClear();
+
+      await gateway.sendResponse({
+        channel: 'telegram',
+        conversationId: '778001',
+        content: 'Wren speaking, not Myra',
+        agentId: 'wren',
+      });
+
+      expect(mockLogMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ agentId: 'wren', direction: 'out', platform: 'telegram' })
+      );
+    });
+
+    it('falls back to the channel default SB when no author is known', async () => {
+      // A channel-initiated send has no acting agent. Falling back is correct;
+      // inventing an author would be worse than a known-imprecise default.
+      mockFindByPlatformId.mockResolvedValueOnce({ id: 'resolved-user-uuid' });
+
+      gateway.setMessageHandler(vi.fn().mockResolvedValue(undefined));
+      const forwardToHandler = (gateway as any).forwardToHandler.bind(gateway);
+      await forwardToHandler('telegram', '778002', { id: 'sender456' }, 'Incoming', {
+        chatType: 'direct',
+      });
+
+      (gateway as any).telegramListener = { sendMessage: vi.fn().mockResolvedValue(undefined) };
+      mockLogMessage.mockClear();
+
+      await gateway.sendResponse({
+        channel: 'telegram',
+        conversationId: '778002',
+        content: 'No author supplied',
+      });
+
+      expect(mockLogMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ agentId: 'myra', direction: 'out' })
+      );
+    });
+
     it('should not log outgoing message when userId is not in conversationUserMap', async () => {
       (gateway as any).telegramListener = {
         sendMessage: vi.fn().mockResolvedValue(undefined),

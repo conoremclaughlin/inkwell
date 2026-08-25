@@ -154,6 +154,19 @@ export interface AgentResponse {
   metadata?: Record<string, unknown>;
   /** Optional media attachments to send alongside or instead of text */
   media?: OutboundMedia[];
+  /**
+   * Which SB authored this response.
+   *
+   * The activity stream previously recorded a per-channel literal here, so
+   * every outbound Telegram message was logged as Myra regardless of who
+   * actually wrote it. That field was not occasionally wrong — it was
+   * constant, which looks like data while carrying none.
+   *
+   * Undefined means the author is genuinely unknown (a channel-initiated
+   * send with no acting agent), and callers fall back to the channel's
+   * default SB rather than inventing one.
+   */
+  agentId?: string;
 }
 
 /**
