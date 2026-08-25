@@ -310,6 +310,27 @@ describe.skipIf(!canRun)('alert ingest SQL (integration)', () => {
       expect(data?.last_notified_at).not.toBeNull();
     });
 
+    it('returns should_notify as a real boolean, never null', async () => {
+      // Three-valued logic caught this in CI. Once a delivery is recorded the
+      // claim is cleared to NULL, so a deduped ingest keeps that NULL — and
+      // `NULL = now()` is NULL, not false. The service assigns the result to a
+      // `boolean` and it survived only because null is falsy in JS.
+      //
+      // Named explicitly so nobody relaxes the toBe(false) assertions above to
+      // toBeFalsy() and silently restores the ambiguity: toBeFalsy() passes on
+      // null, which is exactly the value this pins against.
+      const k = key('boolean-contract');
+
+      const first = await ingest({ dedupeKey: k });
+      expect(first.should_notify).toBe(true);
+      await markNotified(first.event_id);
+
+      const deduped = await ingest({ dedupeKey: k });
+      expect(deduped.should_notify).toBe(false);
+      expect(deduped.should_notify).not.toBeNull();
+      expect(typeof deduped.should_notify).toBe('boolean');
+    });
+
     it('lets an escalation through even while another dispatch holds the claim', async () => {
       const k = key('escalation-vs-claim');
 

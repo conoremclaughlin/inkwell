@@ -262,7 +262,14 @@ AS $$
   RETURNING
     ae.id,
     (ae.occurrence_count = 1),
-    (ae.notify_claimed_at = now()),
+    -- IS NOT DISTINCT FROM, not `=`. Once a delivery is recorded the claim is
+    -- cleared to NULL, so a subsequent deduped ingest lands on the ELSE branch
+    -- and keeps that NULL — and `NULL = now()` is NULL, not false. That fed a
+    -- null should_notify to the service, where it survived only because null
+    -- happens to be falsy in JS. Returning a real boolean is the contract;
+    -- relying on the coercion is how a three-valued column reads as two-valued
+    -- right up until someone writes `if (row.should_notify === false)`.
+    (ae.notify_claimed_at IS NOT DISTINCT FROM now()),
     ae.occurrence_count,
     ae.first_seen_at;
 $$;
