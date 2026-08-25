@@ -207,6 +207,7 @@ type ChatOptions = {
   messageLabel?: string;
   attachFile?: string[];
   nonInteractive?: boolean;
+  requireBootstrap?: boolean;
   maxTurns?: string;
   backendTimeoutSeconds?: string;
   tailTranscript?: string;
@@ -2506,6 +2507,36 @@ function renderActiveSkills(skills: SkillInstruction[]): string {
  * This is the primary mechanism for the backend to know who it is, who it's talking to,
  * and what it cares about.
  */
+/**
+ * Marker the server-side InkRunner matches on. Kept as a literal string on both
+ * sides of the process boundary — there is no shared module between the CLI and
+ * the runner, so this is the contract.
+ */
+export const BOOTSTRAP_REQUIRED_EXIT_MARKER = 'INK_BOOTSTRAP_REQUIRED_FAILURE';
+
+/**
+ * Under `--require-bootstrap`, refuse to answer rather than answer as a
+ * stranger.
+ *
+ * A server-spawned run gets no constitution in its prompt — the runner omits it
+ * precisely because this process loads its own. If that load fails and we
+ * continue anyway, the agent replies to a real person with no soul, no values,
+ * no user document and no memory, and the runner sees a successful turn it
+ * cannot correct. For a messaging bridge a visible failed turn is far better
+ * than a confident reply from someone who is not Myra.
+ *
+ * Interactive runs never pass the flag and keep the old warn-and-continue
+ * behaviour, which is right for a human who can see the warning.
+ */
+export function failIfBootstrapRequired(
+  options: Pick<ChatOptions, 'requireBootstrap'>,
+  reason: string
+): never | void {
+  if (!options.requireBootstrap) return;
+  console.error(chalk.red(`${BOOTSTRAP_REQUIRED_EXIT_MARKER}: ${reason}`));
+  process.exit(78); // EX_CONFIG — the environment is wrong, not the request
+}
+
 function formatBootstrapContext(result: Record<string, unknown>, agentId: string): string {
   const sections: string[] = [];
 
@@ -3642,6 +3673,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       console.log(chalk.dim(`Keychain: ${Object.keys(keychainCreds).length} credential(s) loaded`));
     }
   } else if (bootstrapResult.error) {
+    failIfBootstrapRequired(options, `bootstrap unavailable: ${String(bootstrapResult.error)}`);
     console.log(chalk.yellow(`bootstrap unavailable: ${String(bootstrapResult.error)}`));
   } else {
     const suggestion = (bootstrapResult.reflectionStatus as Record<string, unknown> | undefined)
@@ -3655,6 +3687,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // Format and inject the full bootstrap context into the prompt envelope.
     // This is what gives the backend its identity, values, and memories.
     const ctx = formatBootstrapContext(bootstrapResult, agentId);
+    if (!ctx) {
+      // Bootstrap answered, but with nothing to render. Same outcome as a
+      // failed call for our purposes: this session has no identity context.
+      failIfBootstrapRequired(options, 'bootstrap returned no identity context');
+    }
     if (ctx) {
       runtime.bootstrapContext = ctx;
       const ctxTokens = estimateTokens(ctx);
@@ -8575,6 +8612,10 @@ export function registerChatCommand(program: Command): void {
         'Render the --message as a system message with this label (e.g., heartbeat, telegram). Used by server spawns.'
       )
       .option('--non-interactive', 'Run one turn and exit (requires --message)')
+      .option(
+        '--require-bootstrap',
+        'Exit non-zero if identity context cannot be loaded, instead of answering without it'
+      )
       .option('--max-turns <n>', 'Run up to N conversational turns then exit (requires --message)')
       .option(
         '--backend-timeout-seconds <n>',
