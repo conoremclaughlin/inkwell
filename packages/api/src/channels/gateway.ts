@@ -1024,7 +1024,7 @@ export class ChannelGateway extends EventEmitter {
   async releaseConversation(
     channel: GatewayChannel,
     conversationId: string,
-    autoResponse?: { content: string; format?: 'text' | 'markdown' }
+    autoResponse?: { content: string; format?: 'text' | 'markdown'; agentId?: string }
   ): Promise<void> {
     const key = this.getBufferKey(channel, conversationId);
 
@@ -1040,6 +1040,11 @@ export class ChannelGateway extends EventEmitter {
           conversationId,
           content: autoResponse.content,
           format: autoResponse.format,
+          // The auto-forward fires precisely when the SB did NOT call
+          // send_response, so this is the only place the author can come
+          // from. Dropping it credited every conversational reply to the
+          // channel's default SB.
+          agentId: autoResponse.agentId,
         });
       } catch (error) {
         logger.error(`Failed to send auto-response for ${key}:`, error);

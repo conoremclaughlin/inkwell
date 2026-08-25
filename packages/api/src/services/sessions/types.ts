@@ -238,6 +238,15 @@ export interface ChannelResponse {
   metadata?: Record<string, unknown>;
   /** Media attachments (images, videos, documents) to send alongside text */
   media?: import('../../agent/types').OutboundMedia[];
+  /**
+   * Which SB authored this response. Mirrors `AgentResponse.agentId`.
+   *
+   * Runners that can attribute a response set it directly; otherwise the
+   * router stamps the session's acting agent. Undefined means the author is
+   * genuinely unknown, and the gateway falls back to the channel's default SB
+   * rather than inventing one.
+   */
+  agentId?: string;
 }
 
 export interface SessionResult {

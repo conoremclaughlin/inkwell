@@ -86,7 +86,7 @@ export interface SessionServiceConfig {
   /** Token threshold for triggering compaction (COMPACTION_THRESHOLD) */
   compactionThreshold: number;
   /** Callback to route responses from async operations (compaction, etc.) */
-  responseHandler?: (responses: ChannelResponse[]) => Promise<void>;
+  responseHandler?: (responses: ChannelResponse[], actingAgentId?: string) => Promise<void>;
 }
 
 const DEFAULT_CONFIG: SessionServiceConfig = {
@@ -3317,7 +3317,7 @@ This session will continue with a fresh context after compaction. Your identity,
 
       // Route any responses from the compaction phase (e.g., "I'm consolidating my memories...")
       if (result.responses.length > 0 && this.config.responseHandler) {
-        await this.config.responseHandler(result.responses).catch((err) => {
+        await this.config.responseHandler(result.responses, session.agentId).catch((err) => {
           logger.warn('Failed to route compaction responses', { sessionId, error: err });
         });
       }

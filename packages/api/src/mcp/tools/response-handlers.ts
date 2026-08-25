@@ -263,6 +263,13 @@ export async function handleSendResponse(
             conversationId: args.conversationId,
             content: args.content,
             media: args.media,
+            // The author is resolved above and set on `response`, but this
+            // branch serializes a fresh body rather than sending that object —
+            // so the fallback silently dropped attribution while the local
+            // callback path preserved it. The receiver (Myra's send endpoint)
+            // lives outside this repo; a receiver that ignores the field is
+            // unaffected, one that reads it gets the real author.
+            agentId: authorAgentId,
           }),
         });
 
