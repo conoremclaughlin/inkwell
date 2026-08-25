@@ -554,6 +554,7 @@ export type Database = {
           last_notified_at: string | null;
           last_seen_at: string;
           metrics: Json;
+          notify_claimed_at: string | null;
           occurrence_count: number;
           resolved_at: string | null;
           severity: string;
@@ -571,6 +572,7 @@ export type Database = {
           last_notified_at?: string | null;
           last_seen_at?: string;
           metrics?: Json;
+          notify_claimed_at?: string | null;
           occurrence_count?: number;
           resolved_at?: string | null;
           severity: string;
@@ -588,6 +590,7 @@ export type Database = {
           last_notified_at?: string | null;
           last_seen_at?: string;
           metrics?: Json;
+          notify_claimed_at?: string | null;
           occurrence_count?: number;
           resolved_at?: string | null;
           severity?: string;
@@ -4832,6 +4835,7 @@ export type Database = {
       };
       ingest_alert_event: {
         Args: {
+          p_claim_ttl_seconds?: number;
           p_cooldown_seconds?: number;
           p_dedupe_key: string;
           p_detail?: string;
@@ -4998,6 +5002,14 @@ export type Database = {
       normalize_worktree_path: {
         Args: { p: string | null };
         Returns: string | null;
+      };
+      mark_alert_notified: {
+        Args: { p_event_id: string };
+        Returns: undefined;
+      };
+      release_alert_claim: {
+        Args: { p_event_id: string };
+        Returns: undefined;
       };
       record_alert_webhook_failure: {
         Args: { p_error?: string; p_status?: number; p_webhook_id: string };

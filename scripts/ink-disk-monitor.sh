@@ -122,10 +122,58 @@ notify_direct() {
   return 1
 }
 
+# ── Fallback rate limiting ────────────────────────────────────────────────
+#
+# The direct path deliberately bypasses inkwell, which also means it bypasses
+# the dedupe and cooldown that live in the database. On a five-minute cron an
+# unchanged condition would send a direct Telegram message every five minutes
+# — 288 a day, exactly the flood the DB cooldown exists to prevent, arriving
+# by the one route designed to work when everything else is broken (PR #539,
+# Lumen). So the fallback carries its own per-condition cooldown.
+#
+# Keyed per dedupe key, not globally: two distinct problems during one outage
+# should both get through. Losing the state directory only costs extra
+# notifications, which is the right direction to fail for an alerting path.
+FALLBACK_STATE_DIR="${INK_FALLBACK_STATE_DIR:-$HOME/.ink/runtime/alert-fallback}"
+FALLBACK_NOTIFY_INTERVAL="${INK_FALLBACK_NOTIFY_INTERVAL:-3600}"
+
+# Flatten the key for use as a filename: dedupe keys contain ':' and '/'.
+fallback_state_path() {
+  printf '%s/%s' "$FALLBACK_STATE_DIR" "$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_')"
+}
+
+# Returns 0 when this condition is allowed to notify directly again.
+# Checking and stamping are separate so a failed send does not consume the
+# window — the same shape note_unreachable already uses. Otherwise a Telegram
+# outage during an inkwell outage would burn the cooldown on a message that
+# was never delivered, and silence the one path left.
+fallback_cooldown_due() {
+  local now last state
+  state=$(fallback_state_path "$1")
+  now=$(date +%s)
+  last=0
+  [ -f "$state" ] && last=$(cat "$state" 2>/dev/null || echo 0)
+  case "$last" in *[!0-9]* | '') last=0 ;; esac
+  [ $((now - last)) -ge "$FALLBACK_NOTIFY_INTERVAL" ]
+}
+
+fallback_cooldown_stamp() {
+  local state
+  state=$(fallback_state_path "$1")
+  mkdir -p "$FALLBACK_STATE_DIR" 2>/dev/null
+  printf '%s' "$(date +%s)" >"$state" 2>/dev/null
+}
+
+# A condition that resolves should be able to alarm again immediately if it
+# recurs, rather than waiting out a cooldown from the previous incident.
+fallback_cooldown_clear() {
+  rm -f "$(fallback_state_path "$1")" 2>/dev/null
+}
+
 # ── Primary delivery ──────────────────────────────────────────────────────
 post_alert() {
   local severity="$1" title="$2" detail="$3" dedupe="$4" metrics="$5" status="${6:-alerting}"
-  local body code
+  local body code response_file
 
   body=$(cat <<JSON
 {"source":"$SOURCE","severity":"$severity","status":"$status",
@@ -135,27 +183,65 @@ post_alert() {
 JSON
 )
 
-  code=$(curl -sS -o /tmp/ink-alert-response.$$ -w '%{http_code}' --max-time 20 \
+  response_file="/tmp/ink-alert-response.$$"
+  code=$(curl -sS -o "$response_file" -w '%{http_code}' --max-time 20 \
     -X POST "$INK_ALERT_URL" \
     -H 'content-type: application/json' \
     -H "x-ink-alert-token: ${INK_ALERT_TOKEN}" \
     -d "$body" 2>/dev/null)
   local curl_rc=$?
-  rm -f /tmp/ink-alert-response.$$
+
+  local response=''
+  [ -f "$response_file" ] && response=$(cat "$response_file" 2>/dev/null)
+  rm -f "$response_file"
 
   if [ $curl_rc -ne 0 ] || [ -z "$code" ] || [ "${code:0:1}" != "2" ]; then
     log "inkwell ingest failed (curl rc=$curl_rc http=$code) — falling back"
     # Only escalate to the human directly for real problems; a failed 'ok'
     # post is for the dead-man's switch to notice, not for a 3am message.
-    if [ "$status" = "alerting" ]; then
-      notify_direct "🚨 ${title}
+    if [ "$status" = "alerting" ] && fallback_cooldown_due "$dedupe"; then
+      if notify_direct "🚨 ${title}
 
 ${detail}
 
-(Delivered directly — the inkwell alert endpoint at ${INK_ALERT_URL} could not be reached, which may itself be the problem.)"
+(Delivered directly — the inkwell alert endpoint at ${INK_ALERT_URL} could not be reached, which may itself be the problem.)"; then
+        fallback_cooldown_stamp "$dedupe"
+      fi
     fi
     return 1
   fi
+
+  # A 2xx means inkwell RECORDED the alert, not that anyone was told. The
+  # response carries notified:false when every sink failed — and this script
+  # used to discard the body, so the one signal that says "your alarm went
+  # nowhere" was thrown away and the fallback never fired for it. An accepted
+  # alert that reached no one is exactly the case the direct path is for.
+  #
+  # Both halves of the condition matter. status:"deduped" ALSO reports
+  # notified:false, but that is the cooldown working — a correctly suppressed
+  # repeat, not a failed delivery. Keying on notified alone would send a direct
+  # Telegram for every deduped repeat and rebuild the 288-a-day flood out of
+  # the very check meant to catch delivery failure. Only "raised" means
+  # inkwell tried.
+  if [ "$status" = "alerting" ] &&
+    printf '%s' "$response" | grep -q '"status"[[:space:]]*:[[:space:]]*"raised"' &&
+    printf '%s' "$response" | grep -q '"notified"[[:space:]]*:[[:space:]]*false'; then
+    log "inkwell accepted the alert but delivered it nowhere (notified:false)"
+    if fallback_cooldown_due "$dedupe"; then
+      if notify_direct "🚨 ${title}
+
+${detail}
+
+(Delivered directly — inkwell recorded this alert but every delivery channel failed.)"; then
+        fallback_cooldown_stamp "$dedupe"
+      fi
+    fi
+    return 1
+  fi
+
+  # Recovered: let a recurrence alarm directly without waiting out a cooldown
+  # inherited from the incident that just closed.
+  [ "$status" = "ok" ] && fallback_cooldown_clear "$dedupe"
 
   log "reported: $severity $dedupe (http $code)"
   return 0

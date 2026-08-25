@@ -135,16 +135,50 @@ export class AlertDispatchService {
     });
 
     await this.recordDelivery(eventId, deliveries);
+    const notified = await this.settleClaim(eventId, deliveries);
 
     return {
       accepted: true,
       eventId,
       status: 'raised',
       isNew,
-      notified: deliveries.some((d) => d.ok),
+      notified,
       occurrenceCount,
       deliveries,
     };
+  }
+
+  /**
+   * Close out the notification claim taken by ingest_alert_event.
+   *
+   * The claim is the right to attempt; this records what actually happened.
+   * On success last_notified_at is stamped and the cooldown starts running
+   * from a real delivery. On total failure the claim is released so the next
+   * occurrence retries immediately — the alternative is an hour of silence
+   * bought by a notification nobody received.
+   *
+   * Returns whether anything was delivered.
+   */
+  private async settleClaim(eventId: string, deliveries: SinkResult[]): Promise<boolean> {
+    const delivered = deliveries.some((d) => d.ok);
+
+    const { error } = await this.supabase.rpc(
+      delivered ? 'mark_alert_notified' : 'release_alert_claim',
+      { p_event_id: eventId }
+    );
+
+    if (error) {
+      // Never throw: the alert itself is recorded and the fan-out already
+      // happened. But this must not pass silently either — a stuck claim
+      // suppresses this condition until the TTL expires.
+      logger.error('[Alerts] Failed to settle notification claim', {
+        eventId,
+        delivered,
+        error: error.message,
+      });
+    }
+
+    return delivered;
   }
 
   private async resolve(userId: string, alert: ParsedAlert): Promise<AlertDispatchResult> {

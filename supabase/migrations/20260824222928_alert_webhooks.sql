@@ -92,7 +92,17 @@ CREATE TABLE public.alert_events (
   metrics jsonb NOT NULL DEFAULT '{}'::jsonb,
   first_seen_at timestamptz NOT NULL DEFAULT now(),
   last_seen_at timestamptz NOT NULL DEFAULT now(),
+  -- Set ONLY after at least one sink actually delivered. This is the column
+  -- the cooldown gates on and the one resolve_alert_event reads to decide
+  -- whether a recovery is worth announcing.
   last_notified_at timestamptz,
+  -- Set when an ingest wins the right to ATTEMPT a notification. A claim is
+  -- not evidence of delivery; keeping the two in one column meant an
+  -- all-sinks-failed dispatch started the cooldown anyway and reported itself
+  -- as notified (PR #539, Lumen). Cleared on success (superseded by
+  -- last_notified_at) or on failure (so the next occurrence retries at once);
+  -- a claim whose holder died is reaped by the TTL in ingest_alert_event.
+  notify_claimed_at timestamptz,
   occurrence_count integer NOT NULL DEFAULT 1,
   resolved_at timestamptz,
   -- What actually went out, per sink, for after-the-fact debugging of a
@@ -158,9 +168,27 @@ CREATE TRIGGER alert_webhooks_updated_at
 --
 -- The notify decision is computed inside the UPDATE for the same reason. It
 -- relies on now() being stable within a transaction: if the CASE chooses to
--- notify it writes now(), so `last_notified_at = now()` in the RETURNING
--- clause distinguishes "we just notified" from "we kept the old timestamp"
+-- claim it writes now(), so `notify_claimed_at = now()` in the RETURNING
+-- clause distinguishes "we just claimed" from "we kept the old timestamp"
 -- without a second read.
+--
+-- What this function decides is the right to ATTEMPT a notification, not the
+-- fact of one. The original version wrote last_notified_at here and let the
+-- cooldown gate on it, which meant a dispatch where every sink failed — or
+-- where quiet hours suppressed the only destination — still silenced the next
+-- hour of repeats, and resolve_alert_event went on to announce a recovery from
+-- an incident nobody was ever told about. Delivery is recorded separately by
+-- mark_alert_notified() once a sink actually succeeds.
+--
+-- Two conditions must both hold to claim:
+--
+--   1. No other dispatcher currently holds the claim. p_claim_ttl_seconds
+--      bounds how long a claim survives its holder: a process that crashes
+--      mid-fan-out would otherwise wedge the condition permanently, since it
+--      is not around to release what it took.
+--   2. The cooldown permits it — escalation always does, a condition never
+--      successfully delivered always does (that is the retry), and otherwise
+--      only once the cooldown has elapsed since the last real delivery.
 
 -- Optional parameters carry defaults so callers may omit them entirely rather
 -- than passing an explicit null. Required params come first, as postgres
@@ -173,7 +201,8 @@ CREATE FUNCTION public.ingest_alert_event(
   p_dedupe_key text,
   p_detail text DEFAULT NULL,
   p_metrics jsonb DEFAULT '{}'::jsonb,
-  p_cooldown_seconds integer DEFAULT 3600
+  p_cooldown_seconds integer DEFAULT 3600,
+  p_claim_ttl_seconds integer DEFAULT 300
 )
 RETURNS TABLE (
   event_id uuid,
@@ -186,12 +215,14 @@ LANGUAGE sql
 AS $$
   INSERT INTO public.alert_events AS ae (
     user_id, source, severity, title, detail, dedupe_key, metrics,
-    first_seen_at, last_seen_at, last_notified_at, occurrence_count
+    first_seen_at, last_seen_at, last_notified_at, notify_claimed_at,
+    occurrence_count
   )
   VALUES (
     p_user_id, p_source, p_severity, p_title, p_detail, p_dedupe_key,
     COALESCE(p_metrics, '{}'::jsonb),
-    now(), now(), now(), 1
+    -- A brand new condition claims immediately but has delivered nothing yet.
+    now(), now(), NULL, now(), 1
   )
   ON CONFLICT (user_id, dedupe_key) WHERE resolved_at IS NULL
   DO UPDATE SET
@@ -202,29 +233,80 @@ AS $$
     metrics = EXCLUDED.metrics,
     last_seen_at = now(),
     occurrence_count = ae.occurrence_count + 1,
-    last_notified_at = CASE
-      -- Escalation always speaks, even mid-cooldown. A condition getting
-      -- worse is new information; suppressing it is the failure mode the
-      -- cooldown is not meant to cause.
+    notify_claimed_at = CASE
+      -- Escalation always speaks, even mid-cooldown AND even while another
+      -- dispatcher holds the claim. A condition getting worse is new
+      -- information; suppressing it is the failure mode the cooldown is not
+      -- meant to cause, and that reasoning does not stop applying just
+      -- because a fan-out for the lesser severity is in flight. Two
+      -- notifications for a worsening incident is the acceptable direction to
+      -- err; silence is not.
       WHEN public.alert_severity_rank(EXCLUDED.severity)
            > public.alert_severity_rank(ae.severity) THEN now()
-      WHEN ae.last_notified_at IS NULL THEN now()
-      WHEN now() - ae.last_notified_at
-           >= make_interval(secs => GREATEST(p_cooldown_seconds, 0)) THEN now()
-      ELSE ae.last_notified_at
+      WHEN
+        -- (1) the claim is free, or its holder has outlived the TTL
+        (ae.notify_claimed_at IS NULL
+         OR now() - ae.notify_claimed_at
+            >= make_interval(secs => GREATEST(p_claim_ttl_seconds, 0)))
+        AND (
+          -- (2a) Never actually delivered — keep trying. This is the retry
+          -- that the old single-column design made impossible.
+          ae.last_notified_at IS NULL
+          -- (2b) Delivered, and the cooldown has since elapsed.
+          OR now() - ae.last_notified_at
+             >= make_interval(secs => GREATEST(p_cooldown_seconds, 0))
+        )
+      THEN now()
+      ELSE ae.notify_claimed_at
     END
   RETURNING
     ae.id,
     (ae.occurrence_count = 1),
-    (ae.last_notified_at = now()),
+    (ae.notify_claimed_at = now()),
     ae.occurrence_count,
     ae.first_seen_at;
+$$;
+
+-- ── Delivery outcome ────────────────────────────────────────────────────
+--
+-- The other half of the claim. Exactly one of these runs after every fan-out,
+-- which is what keeps last_notified_at meaning "someone actually heard this".
+
+-- At least one sink succeeded. Record the delivery and drop the claim — the
+-- cooldown now runs from last_notified_at.
+CREATE FUNCTION public.mark_alert_notified(p_event_id uuid)
+RETURNS void
+LANGUAGE sql
+AS $$
+  UPDATE public.alert_events
+  SET last_notified_at = now(),
+      notify_claimed_at = NULL
+  WHERE id = p_event_id;
+$$;
+
+-- Nothing got out: every sink failed, or the only destination was suppressed.
+-- Release the claim so the next occurrence retries immediately instead of
+-- waiting out a cooldown for a notification that never happened. Deliberately
+-- does NOT touch last_notified_at — a failed attempt must leave no trace that
+-- resolve_alert_event could mistake for delivery.
+CREATE FUNCTION public.release_alert_claim(p_event_id uuid)
+RETURNS void
+LANGUAGE sql
+AS $$
+  UPDATE public.alert_events
+  SET notify_claimed_at = NULL
+  WHERE id = p_event_id;
 $$;
 
 -- ── Resolve ─────────────────────────────────────────────────────────────
 --
 -- Returns the row only when this call is the one that closed it, so recovery
 -- is announced exactly once no matter how many "ok" posts arrive.
+--
+-- was_notified reads last_notified_at, which is now written only by
+-- mark_alert_notified() after a sink genuinely delivered. Before the claim
+-- split it also went true for an incident whose every sink failed, so the
+-- first thing the user heard about an outage could be its recovery.
 
 CREATE FUNCTION public.resolve_alert_event(
   p_user_id uuid,
@@ -280,17 +362,76 @@ $$;
 
 -- ── RLS ─────────────────────────────────────────────────────────────────
 --
--- Service-role access only, consistent with the rest of the schema: the real
--- authorization boundary is the API server's auth middleware.
+-- Service-role access only. The first version of this block wrote
+-- `USING (true) WITH CHECK (true)` with no role clause and a comment claiming
+-- service-role-only — but a policy with no TO clause applies to PUBLIC, so it
+-- granted exactly what the comment said it withheld (PR #539, Lumen). On the
+-- public schema that reaches anon/authenticated, and alert_webhooks stores
+-- outbound secrets in plaintext. The comment was the only thing that was
+-- service-role-only.
+--
+-- Predicate matches the pattern established in 20260824085843: assert the
+-- caller's JWT role rather than naming the DB role, so a connection that
+-- merely reaches the table without service-role credentials still fails.
 
 ALTER TABLE public.alert_sources ENABLE ROW LEVEL SECURITY;
-CREATE POLICY "Service role full access to alert_sources" ON public.alert_sources
-  USING (true) WITH CHECK (true);
+CREATE POLICY "Service role full access to alert_sources"
+  ON public.alert_sources FOR ALL
+  TO service_role
+  USING ((auth.jwt() ->> 'role'::text) = 'service_role'::text)
+  WITH CHECK ((auth.jwt() ->> 'role'::text) = 'service_role'::text);
 
 ALTER TABLE public.alert_events ENABLE ROW LEVEL SECURITY;
-CREATE POLICY "Service role full access to alert_events" ON public.alert_events
-  USING (true) WITH CHECK (true);
+CREATE POLICY "Service role full access to alert_events"
+  ON public.alert_events FOR ALL
+  TO service_role
+  USING ((auth.jwt() ->> 'role'::text) = 'service_role'::text)
+  WITH CHECK ((auth.jwt() ->> 'role'::text) = 'service_role'::text);
 
 ALTER TABLE public.alert_webhooks ENABLE ROW LEVEL SECURITY;
-CREATE POLICY "Service role full access to alert_webhooks" ON public.alert_webhooks
-  USING (true) WITH CHECK (true);
+CREATE POLICY "Service role full access to alert_webhooks"
+  ON public.alert_webhooks FOR ALL
+  TO service_role
+  USING ((auth.jwt() ->> 'role'::text) = 'service_role'::text)
+  WITH CHECK ((auth.jwt() ->> 'role'::text) = 'service_role'::text);
+
+-- ── Table grants ────────────────────────────────────────────────────────
+--
+-- RLS only filters rows for roles that hold table privileges in the first
+-- place. Supabase grants anon/authenticated on public-schema tables by
+-- default, so strip them explicitly rather than relying on the policies alone
+-- — defense in depth, and it makes the intent readable without knowing the
+-- default grant set.
+
+REVOKE ALL ON TABLE public.alert_sources FROM anon, authenticated;
+REVOKE ALL ON TABLE public.alert_events FROM anon, authenticated;
+REVOKE ALL ON TABLE public.alert_webhooks FROM anon, authenticated;
+
+GRANT ALL ON TABLE public.alert_sources TO service_role;
+GRANT ALL ON TABLE public.alert_events TO service_role;
+GRANT ALL ON TABLE public.alert_webhooks TO service_role;
+
+-- ── Function grants ─────────────────────────────────────────────────────
+--
+-- Postgres grants EXECUTE on new functions to PUBLIC by default. These three
+-- mutate alert state and take p_user_id / p_webhook_id directly, so a caller
+-- that can execute them bypasses the ingest token's binding to one configured
+-- user entirely — it just names whichever user it likes.
+
+REVOKE ALL ON FUNCTION public.ingest_alert_event(uuid, text, text, text, text, text, jsonb, integer, integer)
+  FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.resolve_alert_event(uuid, text)
+  FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.record_alert_webhook_failure(uuid, text, integer)
+  FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.mark_alert_notified(uuid) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.release_alert_claim(uuid) FROM PUBLIC, anon, authenticated;
+
+-- The REVOKEs above strip everyone; service_role is granted back explicitly
+-- rather than relying on default privileges (the #528 r4 correction).
+GRANT EXECUTE ON FUNCTION public.ingest_alert_event(uuid, text, text, text, text, text, jsonb, integer, integer)
+  TO service_role;
+GRANT EXECUTE ON FUNCTION public.resolve_alert_event(uuid, text) TO service_role;
+GRANT EXECUTE ON FUNCTION public.record_alert_webhook_failure(uuid, text, integer) TO service_role;
+GRANT EXECUTE ON FUNCTION public.mark_alert_notified(uuid) TO service_role;
+GRANT EXECUTE ON FUNCTION public.release_alert_claim(uuid) TO service_role;
