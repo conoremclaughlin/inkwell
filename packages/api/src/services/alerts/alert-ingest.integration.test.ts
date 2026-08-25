@@ -71,10 +71,15 @@ describe.skipIf(!canRun)('alert ingest SQL (integration)', () => {
       event_id: string;
       is_new: boolean;
       should_notify: boolean;
+      claim_token: string | null;
       occurrence_count: number;
     }>;
-    return rows[0];
+    // The severity travels with the row so settling can report what it was
+    // dispatching without every call site restating it.
+    return { ...rows[0], severity: args.severity ?? 'warning' };
   };
+
+  type IngestResult = Awaited<ReturnType<typeof ingest>>;
 
   /**
    * Ingest only takes the *claim*; the dispatcher records the outcome. These
@@ -83,14 +88,25 @@ describe.skipIf(!canRun)('alert ingest SQL (integration)', () => {
    * production does. Before the claim split, ingest implied delivery on its
    * own, which is exactly the conflation that let an all-sinks-failed dispatch
    * start an hour of cooldown.
+   *
+   * Both take the whole ingest result rather than an id, because settling is
+   * fenced on the claim token: a dispatcher may only settle the claim it
+   * actually holds.
    */
-  const markNotified = async (eventId: string) => {
-    const { error } = await client.rpc('mark_alert_notified', { p_event_id: eventId } as never);
+  const markNotified = async (row: IngestResult) => {
+    const { error } = await client.rpc('mark_alert_notified', {
+      p_event_id: row.event_id,
+      p_claim_token: row.claim_token,
+      p_severity: row.severity,
+    } as never);
     if (error) throw new Error(error.message);
   };
 
-  const releaseClaim = async (eventId: string) => {
-    const { error } = await client.rpc('release_alert_claim', { p_event_id: eventId } as never);
+  const releaseClaim = async (row: IngestResult) => {
+    const { error } = await client.rpc('release_alert_claim', {
+      p_event_id: row.event_id,
+      p_claim_token: row.claim_token,
+    } as never);
     if (error) throw new Error(error.message);
   };
 
@@ -128,7 +144,7 @@ describe.skipIf(!canRun)('alert ingest SQL (integration)', () => {
   it('collapses a repeat onto the same incident and stays silent inside the cooldown', async () => {
     const k = key('cooldown');
     const first = await ingest({ dedupeKey: k });
-    await markNotified(first.event_id);
+    await markNotified(first);
     const second = await ingest({ dedupeKey: k });
 
     expect(second.is_new).toBe(false);
@@ -152,7 +168,7 @@ describe.skipIf(!canRun)('alert ingest SQL (integration)', () => {
   it('does not re-notify on de-escalation', async () => {
     const k = key('de-escalation');
     const first = await ingest({ dedupeKey: k, severity: 'critical' });
-    await markNotified(first.event_id);
+    await markNotified(first);
     const improved = await ingest({ dedupeKey: k, severity: 'warning' });
 
     expect(improved.should_notify).toBe(false);
@@ -161,7 +177,7 @@ describe.skipIf(!canRun)('alert ingest SQL (integration)', () => {
   it('re-notifies once the cooldown has elapsed', async () => {
     const k = key('cooldown-expiry');
     const first = await ingest({ dedupeKey: k });
-    await markNotified(first.event_id);
+    await markNotified(first);
 
     // Backdate rather than sleep an hour.
     const { error } = await client
@@ -179,7 +195,7 @@ describe.skipIf(!canRun)('alert ingest SQL (integration)', () => {
   it('honours a zero cooldown by notifying every time', async () => {
     const k = key('zero-cooldown');
     const first = await ingest({ dedupeKey: k, cooldownSeconds: 0 });
-    await markNotified(first.event_id);
+    await markNotified(first);
     const second = await ingest({ dedupeKey: k, cooldownSeconds: 0 });
     expect(second.should_notify).toBe(true);
   });
@@ -189,7 +205,7 @@ describe.skipIf(!canRun)('alert ingest SQL (integration)', () => {
     const first = await ingest({ dedupeKey: k });
     // was_notified below now means a sink genuinely delivered, so the test has
     // to say that happened rather than let ingest imply it.
-    await markNotified(first.event_id);
+    await markNotified(first);
     await ingest({ dedupeKey: k });
 
     const { data: firstResolve, error: e1 } = await client.rpc('resolve_alert_event', {
@@ -260,7 +276,7 @@ describe.skipIf(!canRun)('alert ingest SQL (integration)', () => {
       // than marks. Previously ingest had already written last_notified_at,
       // so this condition went quiet for an hour on the strength of a
       // notification nobody received.
-      await releaseClaim(first.event_id);
+      await releaseClaim(first);
 
       const second = await ingest({ dedupeKey: k });
       expect(second.should_notify).toBe(true);
@@ -273,7 +289,7 @@ describe.skipIf(!canRun)('alert ingest SQL (integration)', () => {
       const k = key('never-delivered');
 
       const first = await ingest({ dedupeKey: k });
-      await releaseClaim(first.event_id);
+      await releaseClaim(first);
 
       const { data, error } = await client.rpc('resolve_alert_event', {
         p_user_id: TEST_USER_ID!,
@@ -299,7 +315,7 @@ describe.skipIf(!canRun)('alert ingest SQL (integration)', () => {
       const during = await ingest({ dedupeKey: k });
       expect(during.should_notify).toBe(false);
 
-      await markNotified(first.event_id);
+      await markNotified(first);
 
       const { data } = await client
         .from('alert_events')
@@ -323,7 +339,7 @@ describe.skipIf(!canRun)('alert ingest SQL (integration)', () => {
 
       const first = await ingest({ dedupeKey: k });
       expect(first.should_notify).toBe(true);
-      await markNotified(first.event_id);
+      await markNotified(first);
 
       const deduped = await ingest({ dedupeKey: k });
       expect(deduped.should_notify).toBe(false);
@@ -361,6 +377,131 @@ describe.skipIf(!canRun)('alert ingest SQL (integration)', () => {
 
       const after = await ingest({ dedupeKey: k });
       expect(after.should_notify).toBe(true);
+    });
+  });
+
+  /**
+   * Claim ownership and the delivered-severity fence (PR #539 r3, Lumen).
+   *
+   * Escalation deliberately runs two dispatchers at once, which made "a
+   * notification went out recently" a claim about the wrong thing. The round-two
+   * design could not tell WHICH severity had been delivered, nor WHO held the
+   * claim, so a warning could settle a critical's claim and then lend the
+   * critical its cooldown.
+   */
+  describe('claims are owned, and cooldowns are earned per severity', () => {
+    it('does not suppress a critical whose fan-out failed while a warning succeeded', async () => {
+      const k = key('severity-fence');
+
+      // 1. warning claims; its dispatcher (A) starts a fan-out.
+      const warning = await ingest({ dedupeKey: k, severity: 'warning' });
+      expect(warning.should_notify).toBe(true);
+
+      // 2. critical arrives mid-flight and claims too (escalation overrides).
+      const critical = await ingest({ dedupeKey: k, severity: 'critical' });
+      expect(critical.should_notify).toBe(true);
+      expect(critical.claim_token).not.toBe(warning.claim_token);
+
+      // 3. A succeeds — but it delivered the WARNING, not the critical.
+      await markNotified(warning);
+
+      // 4. B's critical fan-out fails and releases its own claim.
+      await releaseClaim(critical);
+
+      // 5. The next critical must claim again. Before the fence it saw
+      //    severity=critical plus a recent last_notified_at and went quiet, so
+      //    the critical was never delivered at all — the user heard only the
+      //    warning and then silence.
+      const retry = await ingest({ dedupeKey: k, severity: 'critical' });
+      expect(retry.should_notify).toBe(true);
+    });
+
+    it('records a superseded dispatcher’s delivery without clearing the live claim', async () => {
+      const k = key('supersede-settle');
+
+      const warning = await ingest({ dedupeKey: k, severity: 'warning' });
+      const critical = await ingest({ dedupeKey: k, severity: 'critical' });
+
+      // The superseded dispatcher settles. Its delivery is real and must be
+      // recorded, but the claim it is settling is no longer its own.
+      await markNotified(warning);
+
+      const { data } = await client
+        .from('alert_events')
+        .select('notify_claim_token, last_delivered_severity, last_notified_at')
+        .eq('id', critical.event_id)
+        .single();
+
+      expect(data?.last_notified_at).not.toBeNull();
+      expect(data?.last_delivered_severity).toBe('warning');
+      // The critical is still in flight and still owns the claim.
+      expect(data?.notify_claim_token).toBe(critical.claim_token);
+    });
+
+    it('ignores a settle from a stale token', async () => {
+      const k = key('stale-settle');
+
+      const first = await ingest({ dedupeKey: k });
+      expect(first.should_notify).toBe(true);
+
+      // Reap the claim the way the TTL does, handing it to a successor.
+      const { error } = await client
+        .from('alert_events')
+        .update({ notify_claimed_at: new Date(Date.now() - 10 * 60_000).toISOString() })
+        .eq('id', first.event_id);
+      if (error) throw new Error(error.message);
+
+      const successor = await ingest({ dedupeKey: k });
+      expect(successor.should_notify).toBe(true);
+      expect(successor.claim_token).not.toBe(first.claim_token);
+
+      // The reaped holder wakes up and releases. It must not free the
+      // successor's claim — two live dispatchers is what the claim prevents.
+      await releaseClaim(first);
+
+      const { data } = await client
+        .from('alert_events')
+        .select('notify_claim_token')
+        .eq('id', first.event_id)
+        .single();
+      expect(data?.notify_claim_token).toBe(successor.claim_token);
+    });
+
+    it('keeps the delivered severity at its high-water mark', async () => {
+      const k = key('delivered-high-water');
+
+      const critical = await ingest({ dedupeKey: k, severity: 'critical' });
+      await markNotified(critical);
+
+      // A later, lesser delivery must not demote the record and thereby
+      // re-open the fence for a severity that already got through.
+      const info = await ingest({ dedupeKey: k, severity: 'info', cooldownSeconds: 0 });
+      await markNotified(info);
+
+      const { data } = await client
+        .from('alert_events')
+        .select('last_delivered_severity')
+        .eq('id', critical.event_id)
+        .single();
+      expect(data?.last_delivered_severity).toBe('critical');
+    });
+
+    it('grants exactly one claim token when concurrent posts race', async () => {
+      const k = key('concurrent-claim');
+
+      // The dedupe race, now also asserted on the claim: six posts, one
+      // incident, and exactly one dispatcher authorised to notify.
+      const results = await Promise.all(Array.from({ length: 6 }, () => ingest({ dedupeKey: k })));
+
+      expect(results.every((r) => r.event_id === results[0].event_id)).toBe(true);
+      const claimants = results.filter((r) => r.should_notify);
+      expect(claimants).toHaveLength(1);
+      expect(claimants[0].claim_token).not.toBeNull();
+      // Non-claimants must carry no token to settle with.
+      expect(results.filter((r) => !r.should_notify).every((r) => r.claim_token === null)).toBe(
+        true
+      );
+      expect(await openRowsFor(k)).toHaveLength(1);
     });
   });
 

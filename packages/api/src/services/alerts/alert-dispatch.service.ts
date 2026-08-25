@@ -29,7 +29,7 @@ import {
 } from './alert-policy';
 
 /** Per-operation ceiling for a single outbound send. */
-const SINK_TIMEOUT_MS = 10_000;
+const SINK_TIMEOUT_MS = 5_000;
 
 /**
  * Whole-sink ceiling.
@@ -39,16 +39,37 @@ const SINK_TIMEOUT_MS = 10_000;
  * Those sit outside the per-send race, so one hung DB call could keep
  * Promise.allSettled open indefinitely and the checker's request with it —
  * the alerting path hanging on the infrastructure it is trying to report on
- * (PR #539, Lumen). Generous enough to cover several sequential webhook
- * deliveries, finite enough that nothing waits forever.
+ * (PR #539, Lumen).
+ *
+ * The number is bounded from ABOVE by the client, not chosen for comfort.
+ * ink-disk-monitor.sh gives the ingest POST `--max-time 20`, so a 45s
+ * server-side budget meant the checker could give up, declare the pipeline
+ * blind and fire a direct Telegram while this process was still delivering
+ * the same alert through the normal path — one incident, two messages, and a
+ * fallback that had not actually fallen back (PR #539 r2, Lumen). 12s leaves
+ * room for the ingest RPC and the response inside the client's 20s.
  */
-const SINK_TOTAL_TIMEOUT_MS = 45_000;
+const SINK_TOTAL_TIMEOUT_MS = 12_000;
+
+/**
+ * A sink that ran out of time, as distinct from one that failed.
+ *
+ * The difference matters exactly once, at settle time: a failed fan-out
+ * released its claim so the next occurrence could retry immediately, but a
+ * timed-out one may still be in flight and may still deliver. Releasing that
+ * claim invites a second dispatcher to run alongside the first. Timeout is
+ * therefore *uncertain* rather than failed, and an uncertain claim is left for
+ * the TTL to reap.
+ */
+class SinkTimeoutError extends Error {}
 
 export interface SinkResult {
   sink: 'user' | 'agents' | 'webhook';
   target: string;
   ok: boolean;
   detail?: string;
+  /** Ran out of time; may or may not have delivered. See SinkTimeoutError. */
+  timedOut?: boolean;
 }
 
 export interface AlertDispatchResult {
@@ -72,7 +93,7 @@ async function withTimeout<T>(
       work,
       new Promise<never>((_, reject) => {
         timer = setTimeout(
-          () => reject(new Error(`${label} timed out after ${budgetMs}ms`)),
+          () => reject(new SinkTimeoutError(`${label} timed out after ${budgetMs}ms`)),
           budgetMs
         );
       }),
@@ -80,6 +101,38 @@ async function withTimeout<T>(
   } finally {
     if (timer) clearTimeout(timer);
   }
+}
+
+/**
+ * An abort signal that fires on whichever comes first: this operation's own
+ * budget, or the whole fan-out's deadline.
+ *
+ * Promise.race only stops *waiting* — it does not stop the work. A timed-out
+ * webhook POST would carry on and could still deliver after the service had
+ * already written off the attempt. Passing a real signal to fetch() means the
+ * request is actually cancelled.
+ *
+ * AbortSignal.any() would say this in one line but landed in Node 20, and the
+ * package still declares 18.
+ */
+function deadlineSignal(parent: AbortSignal, budgetMs: number): AbortSignal {
+  const controller = new AbortController();
+  const timer = setTimeout(
+    () => controller.abort(new SinkTimeoutError('send timed out')),
+    budgetMs
+  );
+  const onParentAbort = () => {
+    clearTimeout(timer);
+    controller.abort(parent.reason);
+  };
+
+  if (parent.aborted) onParentAbort();
+  else parent.addEventListener('abort', onParentAbort, { once: true });
+
+  // Node keeps a pending timer alive on its own; clearing it once the signal
+  // is settled keeps a finished dispatch from holding the event loop open.
+  controller.signal.addEventListener('abort', () => clearTimeout(timer), { once: true });
+  return controller.signal;
 }
 
 export class AlertDispatchService {
@@ -124,6 +177,7 @@ export class AlertDispatchService {
     const eventId: string = row.event_id;
     const isNew: boolean = row.is_new;
     const shouldNotify: boolean = row.should_notify;
+    const claimToken: string | null = row.claim_token ?? null;
     const occurrenceCount: number = row.occurrence_count ?? 1;
 
     if (!shouldNotify) {
@@ -152,7 +206,7 @@ export class AlertDispatchService {
     });
 
     await this.recordDelivery(eventId, deliveries);
-    const notified = await this.settleClaim(eventId, deliveries);
+    const notified = await this.settleClaim(eventId, claimToken, alert.severity, deliveries);
 
     return {
       accepted: true,
@@ -169,19 +223,45 @@ export class AlertDispatchService {
    * Close out the notification claim taken by ingest_alert_event.
    *
    * The claim is the right to attempt; this records what actually happened.
-   * On success last_notified_at is stamped and the cooldown starts running
-   * from a real delivery. On total failure the claim is released so the next
-   * occurrence retries immediately — the alternative is an hour of silence
-   * bought by a notification nobody received.
+   * Three outcomes, not two:
+   *
+   *   delivered  — stamp last_notified_at and drop the claim. The cooldown now
+   *                runs from a real delivery.
+   *   failed     — release the claim so the next occurrence retries at once.
+   *                The alternative is an hour of silence bought by a
+   *                notification nobody received.
+   *   uncertain  — a sink ran out of time and may still be in flight. Releasing
+   *                here would let the next occurrence dispatch alongside it, so
+   *                the claim is left for the TTL to reap instead.
+   *
+   * Settlement is fenced on the claim token: an escalation may have superseded
+   * this dispatcher mid-fan-out, and a superseded dispatcher must record its
+   * own delivery without disturbing the claim now in force.
    *
    * Returns whether anything was delivered.
    */
-  private async settleClaim(eventId: string, deliveries: SinkResult[]): Promise<boolean> {
+  private async settleClaim(
+    eventId: string,
+    claimToken: string | null,
+    severity: AlertSeverity,
+    deliveries: SinkResult[]
+  ): Promise<boolean> {
     const delivered = deliveries.some((d) => d.ok);
+    const uncertain = !delivered && deliveries.some((d) => d.timedOut);
+
+    if (uncertain) {
+      logger.warn('[Alerts] Fan-out timed out; leaving claim for TTL rather than releasing', {
+        eventId,
+        severity,
+      });
+      return false;
+    }
 
     const { error } = await this.supabase.rpc(
       delivered ? 'mark_alert_notified' : 'release_alert_claim',
-      { p_event_id: eventId }
+      delivered
+        ? { p_event_id: eventId, p_claim_token: claimToken, p_severity: severity }
+        : { p_event_id: eventId, p_claim_token: claimToken }
     );
 
     if (error) {
@@ -289,17 +369,37 @@ export class AlertDispatchService {
     // WHOLE, not just at its outbound sends: a sink's DB lookups and
     // bookkeeping are part of what can hang, and an unbounded one holds the
     // checker's request open for as long as it likes.
-    const results = await Promise.allSettled([
-      withTimeout('user sink', this.notifyUserChannel(userId, event), SINK_TOTAL_TIMEOUT_MS),
-      withTimeout('agents sink', this.notifyAgents(userId, event), SINK_TOTAL_TIMEOUT_MS),
-      withTimeout('webhook sink', this.notifyWebhooks(userId, event), SINK_TOTAL_TIMEOUT_MS),
-    ]);
+    //
+    // The deadline is also an abort signal, not just a race. Cancellable work
+    // (the webhook POSTs) is actually cancelled when it fires, so a written-off
+    // send cannot quietly deliver afterwards.
+    const deadline = new AbortController();
+    const deadlineTimer = setTimeout(
+      () => deadline.abort(new SinkTimeoutError('fan-out deadline reached')),
+      SINK_TOTAL_TIMEOUT_MS
+    );
+
+    let results: PromiseSettledResult<SinkResult[]>[];
+    try {
+      results = await Promise.allSettled([
+        withTimeout('user sink', this.notifyUserChannel(userId, event), SINK_TOTAL_TIMEOUT_MS),
+        withTimeout('agents sink', this.notifyAgents(userId, event), SINK_TOTAL_TIMEOUT_MS),
+        withTimeout(
+          'webhook sink',
+          this.notifyWebhooks(userId, event, deadline.signal),
+          SINK_TOTAL_TIMEOUT_MS
+        ),
+      ]);
+    } finally {
+      clearTimeout(deadlineTimer);
+    }
 
     return results.flatMap((r, i) => {
       if (r.status === 'fulfilled') return r.value;
       const sink = (['user', 'agents', 'webhook'] as const)[i];
-      logger.error('Alert sink failed', { sink, error: r.reason });
-      return [{ sink, target: sink, ok: false, detail: String(r.reason) }];
+      const timedOut = r.reason instanceof SinkTimeoutError;
+      logger.error('Alert sink failed', { sink, timedOut, error: r.reason });
+      return [{ sink, target: sink, ok: false, detail: String(r.reason), timedOut }];
     });
   }
 
@@ -448,7 +548,8 @@ export class AlertDispatchService {
       metrics?: Record<string, unknown>;
       occurrenceCount: number;
       kind: 'raised' | 'resolved';
-    }
+    },
+    deadline: AbortSignal
   ): Promise<SinkResult[]> {
     const { data, error } = await this.supabase
       .from('alert_webhooks')
@@ -478,7 +579,7 @@ export class AlertDispatchService {
     return Promise.all(
       webhooks.map(
         (w: { id: string; name: string; url: string; secret: string }) =>
-          this.deliverWebhook(w, event) as Promise<SinkResult>
+          this.deliverWebhook(w, event, deadline) as Promise<SinkResult>
       )
     );
   }
@@ -494,7 +595,8 @@ export class AlertDispatchService {
       metrics?: Record<string, unknown>;
       occurrenceCount: number;
       kind: 'raised' | 'resolved';
-    }
+    },
+    deadline: AbortSignal
   ): Promise<SinkResult> {
     const timestamp = Date.now();
     const body = JSON.stringify({
@@ -510,6 +612,8 @@ export class AlertDispatchService {
     });
 
     try {
+      // The signal is what actually stops the request; withTimeout only stops
+      // this function waiting for it.
       const response = await withTimeout(
         `webhook ${webhook.name}`,
         fetch(webhook.url, {
@@ -520,6 +624,7 @@ export class AlertDispatchService {
             'x-ink-signature': signWebhookPayload(webhook.secret, body, timestamp),
           },
           body,
+          signal: deadlineSignal(deadline, SINK_TIMEOUT_MS),
         })
       );
 
@@ -556,7 +661,13 @@ export class AlertDispatchService {
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       await this.bumpWebhookFailure(webhook.id, detail);
-      return { sink: 'webhook', target: webhook.name, ok: false, detail };
+      // An aborted POST is cancelled, so unlike a whole-sink timeout it cannot
+      // still be in flight — but the receiver may already have acted on it, so
+      // it stays uncertain rather than counting as a clean failure.
+      const timedOut =
+        error instanceof SinkTimeoutError ||
+        (error instanceof Error && error.name === 'AbortError');
+      return { sink: 'webhook', target: webhook.name, ok: false, detail, timedOut };
     }
   }
 
@@ -619,6 +730,68 @@ export class AlertDispatchService {
     } catch (error) {
       logger.error('Failed to touch alert source', { source: alert.source, error });
     }
+
+    await this.resolveLiveness(userId, alert.source);
+  }
+
+  /**
+   * A source that just reported is alive, so close any open "gone silent"
+   * incident against it.
+   *
+   * Clearing stale_alerted_at (which touchSource and checkIn already did) only
+   * re-arms the *sweep*; it leaves the liveness event itself open. A monitor
+   * that died, recovered, and died again within the hour then deduped onto
+   * that still-open incident and was suppressed by a cooldown earned by the
+   * first outage — the second death went unreported (PR #539 r2, Lumen).
+   * Resolving closes the row, so a recurrence opens a fresh incident with its
+   * own cooldown.
+   *
+   * Never throws: liveness bookkeeping must not fail the alert or check-in
+   * that triggered it.
+   */
+  private async resolveLiveness(userId: string, source: string): Promise<void> {
+    // The liveness sweep posts under its own source name; it cannot be its own
+    // aliveness evidence, and letting it resolve `alert-liveness:alert-liveness`
+    // would be meaningless besides.
+    if (source === 'alert-liveness') return;
+
+    try {
+      const { data, error } = await this.supabase.rpc('resolve_alert_event', {
+        p_user_id: userId,
+        p_dedupe_key: `alert-liveness:${source}`,
+      });
+      if (error) {
+        logger.error('Failed to resolve liveness incident', { source, error: error.message });
+        return;
+      }
+
+      const row = Array.isArray(data) ? data[0] : data;
+      // Nothing open is the overwhelmingly common case — a healthy monitor
+      // checking in on schedule. It must stay silent.
+      if (!row) return;
+
+      // Recovering from an alarm nobody heard is not news.
+      if (!row.was_notified) return;
+
+      const minutes = Math.max(
+        1,
+        Math.round((Date.now() - new Date(row.first_seen_at).getTime()) / 60000)
+      );
+
+      const deliveries = await this.fanOut(userId, {
+        severity: 'info',
+        source: 'alert-liveness',
+        title: `Recovered: ${row.title}`,
+        detail: `Monitor "${source}" checked in again after ${minutes} min of silence.`,
+        dedupeKey: `alert-liveness:${source}`,
+        occurrenceCount: row.occurrence_count ?? 0,
+        notifyAgents: ['myra'],
+        kind: 'resolved',
+      });
+      await this.recordDelivery(row.event_id, deliveries);
+    } catch (error) {
+      logger.error('Failed to resolve liveness incident', { source, error });
+    }
   }
 
   /** Explicit heartbeat with no alert attached — the check-in half. */
@@ -646,6 +819,11 @@ export class AlertDispatchService {
       .from('alert_sources')
       .upsert(row, { onConflict: 'user_id,source' });
     if (error) throw new Error(`Failed to record check-in: ${error.message}`);
+
+    // A check-in is the source proving it is alive, so it closes any open
+    // "gone silent" incident — including announcing the recovery if the
+    // silence was ever announced.
+    await this.resolveLiveness(userId, params.source);
   }
 
   /**
@@ -689,7 +867,7 @@ export class AlertDispatchService {
 
       const minutes = Math.round(verdict.silentForSeconds / 60);
       try {
-        await this.ingest(row.user_id, {
+        const result = await this.ingest(row.user_id, {
           source: 'alert-liveness',
           severity: 'critical',
           title: `Monitor "${row.source}" has gone silent`,
@@ -702,12 +880,42 @@ export class AlertDispatchService {
           cooldownSeconds: 3600,
           notifyAgents: ['myra'],
         });
-        // Marked after a successful raise so a failed raise is retried next
-        // sweep instead of being silently marked as handled.
-        await this.supabase
+
+        // Only mark the silence as handled if it genuinely was.
+        //
+        // `raised` was previously stamped for any fulfilled ingest, but ingest
+        // returns { status: 'raised', notified: false } when every sink failed
+        // and released its claim. Stamping there made the source
+        // alreadyAlerted, so the next sweep skipped it and the retry the claim
+        // release exists to enable never happened — the original "state says
+        // something happened when it did not" defect, surviving in the
+        // liveness path (PR #539 r2, Lumen).
+        //
+        // 'deduped' counts as handled: it means an open incident for this
+        // silence already exists and someone was already told about it.
+        const handled = result.notified || result.status === 'deduped';
+        if (!handled) {
+          logger.warn('Staleness alert reached no sink; leaving source unstamped for retry', {
+            source: row.source,
+            status: result.status,
+          });
+          continue;
+        }
+
+        const { error: stampError } = await this.supabase
           .from('alert_sources')
           .update({ stale_alerted_at: now.toISOString() })
           .eq('id', row.id);
+        if (stampError) {
+          // PostgREST reports failures in { error } rather than throwing, so
+          // an unchecked update read as success and the next sweep would raise
+          // the same silence again.
+          logger.error('Failed to stamp staleness alert', {
+            source: row.source,
+            error: stampError.message,
+          });
+          continue;
+        }
         raised++;
       } catch (error) {
         logger.error('Failed to raise staleness alert', { source: row.source, error });

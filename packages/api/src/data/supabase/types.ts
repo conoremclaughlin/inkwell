@@ -551,9 +551,12 @@ export type Database = {
           detail: string | null;
           first_seen_at: string;
           id: string;
+          last_delivered_severity: string | null;
           last_notified_at: string | null;
           last_seen_at: string;
           metrics: Json;
+          notify_claim_severity: string | null;
+          notify_claim_token: string | null;
           notify_claimed_at: string | null;
           occurrence_count: number;
           resolved_at: string | null;
@@ -569,9 +572,12 @@ export type Database = {
           detail?: string | null;
           first_seen_at?: string;
           id?: string;
+          last_delivered_severity?: string | null;
           last_notified_at?: string | null;
           last_seen_at?: string;
           metrics?: Json;
+          notify_claim_severity?: string | null;
+          notify_claim_token?: string | null;
           notify_claimed_at?: string | null;
           occurrence_count?: number;
           resolved_at?: string | null;
@@ -587,9 +593,12 @@ export type Database = {
           detail?: string | null;
           first_seen_at?: string;
           id?: string;
+          last_delivered_severity?: string | null;
           last_notified_at?: string | null;
           last_seen_at?: string;
           metrics?: Json;
+          notify_claim_severity?: string | null;
+          notify_claim_token?: string | null;
           notify_claimed_at?: string | null;
           occurrence_count?: number;
           resolved_at?: string | null;
@@ -4690,6 +4699,19 @@ export type Database = {
         Returns: string;
       };
       alert_severity_rank: { Args: { p_severity: string }; Returns: number };
+      alert_should_claim: {
+        Args: {
+          p_claim_ttl_seconds: number;
+          p_claimed_at: string | null;
+          p_cooldown_seconds: number;
+          p_delivered_severity: string | null;
+          p_last_notified_at: string | null;
+          p_new_severity: string;
+          p_now: string;
+          p_row_severity: string;
+        };
+        Returns: boolean;
+      };
       apply_task_graph: {
         Args: {
           p_user_id: string;
@@ -4846,6 +4868,7 @@ export type Database = {
           p_user_id: string;
         };
         Returns: {
+          claim_token: string | null;
           event_id: string;
           first_seen_at: string;
           is_new: boolean;
@@ -5004,11 +5027,11 @@ export type Database = {
         Returns: string | null;
       };
       mark_alert_notified: {
-        Args: { p_event_id: string };
+        Args: { p_claim_token?: string | null; p_event_id: string; p_severity?: string };
         Returns: undefined;
       };
       release_alert_claim: {
-        Args: { p_event_id: string };
+        Args: { p_claim_token?: string | null; p_event_id: string };
         Returns: undefined;
       };
       record_alert_webhook_failure: {

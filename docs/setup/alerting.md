@@ -50,6 +50,30 @@ becomes an alerting channel for every user in the system.
 Requests may authenticate with **either** `x-ink-alert-token` (for dumb
 checkers) or a normal `Authorization: Bearer` PCP JWT (for SBs and services).
 
+### The staleness sweep
+
+```bash
+ALERT_STALENESS_SWEEP_SECONDS=300   # default when unset
+ALERT_STALENESS_SWEEP_SECONDS=0     # disabled
+```
+
+| Value        | Behaviour                                           |
+| ------------ | --------------------------------------------------- |
+| unset        | Sweep every 300s                                    |
+| `0` or below | Disabled, logged at startup                         |
+| unparseable  | Sweep every 300s, logged as a warning — **not** off |
+
+A typo must not silently switch monitoring off, which is why an unparseable
+value falls back to the default rather than disabling.
+
+**This sweep is on by default, so isolated servers must turn it off explicitly.**
+Every server pointed at the database runs its own sweep, and they all see the
+same sources: two servers means two "monitor has gone silent" incidents raised
+for one silence, and a review server left running overnight will page people
+about production. Add `ALERT_STALENESS_SWEEP_SECONDS=0` to the isolated-server
+recipe in [AGENTS.md](../../AGENTS.md#testing-with-an-isolated-server-important)
+alongside the other disable knobs. The main server owns this sweep.
+
 ## Checker configuration
 
 `~/.ink/monitor.env`:

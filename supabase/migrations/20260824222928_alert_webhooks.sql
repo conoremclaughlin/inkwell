@@ -96,6 +96,16 @@ CREATE TABLE public.alert_events (
   -- the cooldown gates on and the one resolve_alert_event reads to decide
   -- whether a recovery is worth announcing.
   last_notified_at timestamptz,
+  -- The severity that was actually DELIVERED, which is not the same as the
+  -- severity of the row. Escalation deliberately runs two dispatchers at once,
+  -- so "a notification went out recently" does not mean "this severity went
+  -- out". Without this column a warning that delivered while the critical
+  -- fan-out failed left the row looking notified-and-critical, and the next
+  -- critical post was suppressed by a cooldown earned by the warning
+  -- (PR #539 r2, Lumen). Tracks the high-water mark for the open incident.
+  last_delivered_severity text
+    CHECK (last_delivered_severity IS NULL
+           OR last_delivered_severity IN ('info', 'warning', 'critical')),
   -- Set when an ingest wins the right to ATTEMPT a notification. A claim is
   -- not evidence of delivery; keeping the two in one column meant an
   -- all-sinks-failed dispatch started the cooldown anyway and reported itself
@@ -103,6 +113,19 @@ CREATE TABLE public.alert_events (
   -- last_notified_at) or on failure (so the next occurrence retries at once);
   -- a claim whose holder died is reaped by the TTL in ingest_alert_event.
   notify_claimed_at timestamptz,
+  -- WHO holds the claim. A timestamp alone identifies no owner, so any
+  -- dispatcher could settle any claim: an in-flight warning calling
+  -- mark_alert_notified() cleared the newer critical's claim and stamped its
+  -- delivery, and a TTL-reaped holder could clear its own successor. The token
+  -- is opaque and regenerated on every claim, so settling is conditional on
+  -- still being the holder — and it removes the now()-equality sentinel the
+  -- RETURNING clause used to depend on, along with its ABA ambiguity.
+  notify_claim_token uuid,
+  -- The severity the current claim is dispatching, promoted to
+  -- last_delivered_severity only if that dispatch actually delivers.
+  notify_claim_severity text
+    CHECK (notify_claim_severity IS NULL
+           OR notify_claim_severity IN ('info', 'warning', 'critical')),
   occurrence_count integer NOT NULL DEFAULT 1,
   resolved_at timestamptz,
   -- What actually went out, per sink, for after-the-fact debugging of a
@@ -190,9 +213,61 @@ CREATE TRIGGER alert_webhooks_updated_at
 --      successfully delivered always does (that is the retry), and otherwise
 --      only once the cooldown has elapsed since the last real delivery.
 
+-- The claim predicate, lifted out of the ON CONFLICT clause because it has to
+-- be written three times there (token, timestamp, severity all move together)
+-- and because a rule this fiddly deserves to be readable on its own.
+--
+-- Two independent gates, both of which must pass:
+--
+--   A. the claim is available -- free, or its holder outlived the TTL, or this
+--      post is an escalation above the severity currently on the row. That last
+--      case deliberately overrides a live claim: a condition getting worse is
+--      new information, and two messages about a worsening incident is the
+--      acceptable direction to err. Silence is not.
+--
+--   B. the cooldown permits it -- nothing was ever delivered (that is the
+--      retry), or the cooldown has elapsed since a real delivery, or the
+--      severity now exceeds what was actually DELIVERED. The last clause is the
+--      fence: it lets a critical through on a cooldown that only a warning ever
+--      earned.
+CREATE FUNCTION public.alert_should_claim(
+  p_claimed_at timestamptz,
+  p_last_notified_at timestamptz,
+  p_row_severity text,
+  p_delivered_severity text,
+  p_new_severity text,
+  p_cooldown_seconds integer,
+  p_claim_ttl_seconds integer,
+  p_now timestamptz
+)
+RETURNS boolean
+LANGUAGE sql
+IMMUTABLE
+AS $$
+  SELECT
+    (
+      p_claimed_at IS NULL
+      OR p_now - p_claimed_at
+         >= make_interval(secs => GREATEST(p_claim_ttl_seconds, 0))
+      OR public.alert_severity_rank(p_new_severity)
+         > public.alert_severity_rank(p_row_severity)
+    )
+    AND (
+      p_last_notified_at IS NULL
+      OR p_now - p_last_notified_at
+         >= make_interval(secs => GREATEST(p_cooldown_seconds, 0))
+      OR public.alert_severity_rank(p_new_severity)
+         > public.alert_severity_rank(COALESCE(p_delivered_severity, ''))
+    );
+$$;
+
 -- Optional parameters carry defaults so callers may omit them entirely rather
 -- than passing an explicit null. Required params come first, as postgres
 -- demands; supabase calls by name, so the reordering is invisible to callers.
+--
+-- plpgsql rather than sql so the claim token can be generated once and be the
+-- same value in both the SET and the RETURNING clause. uuid_generate_v4() is
+-- volatile: calling it twice in one statement yields two different tokens.
 CREATE FUNCTION public.ingest_alert_event(
   p_user_id uuid,
   p_source text,
@@ -208,21 +283,27 @@ RETURNS TABLE (
   event_id uuid,
   is_new boolean,
   should_notify boolean,
+  claim_token uuid,
   occurrence_count integer,
   first_seen_at timestamptz
 )
-LANGUAGE sql
+LANGUAGE plpgsql
 AS $$
+DECLARE
+  v_token uuid := uuid_generate_v4();
+BEGIN
+  RETURN QUERY
   INSERT INTO public.alert_events AS ae (
     user_id, source, severity, title, detail, dedupe_key, metrics,
-    first_seen_at, last_seen_at, last_notified_at, notify_claimed_at,
+    first_seen_at, last_seen_at, last_notified_at, last_delivered_severity,
+    notify_claimed_at, notify_claim_token, notify_claim_severity,
     occurrence_count
   )
   VALUES (
     p_user_id, p_source, p_severity, p_title, p_detail, p_dedupe_key,
     COALESCE(p_metrics, '{}'::jsonb),
     -- A brand new condition claims immediately but has delivered nothing yet.
-    now(), now(), NULL, now(), 1
+    now(), now(), NULL, NULL, now(), v_token, p_severity, 1
   )
   ON CONFLICT (user_id, dedupe_key) WHERE resolved_at IS NULL
   DO UPDATE SET
@@ -233,45 +314,42 @@ AS $$
     metrics = EXCLUDED.metrics,
     last_seen_at = now(),
     occurrence_count = ae.occurrence_count + 1,
+    -- All three claim columns move together, gated on the same predicate.
+    -- Every SET expression sees the OLD row, so repeating the call is
+    -- consistent rather than three separate decisions.
     notify_claimed_at = CASE
-      -- Escalation always speaks, even mid-cooldown AND even while another
-      -- dispatcher holds the claim. A condition getting worse is new
-      -- information; suppressing it is the failure mode the cooldown is not
-      -- meant to cause, and that reasoning does not stop applying just
-      -- because a fan-out for the lesser severity is in flight. Two
-      -- notifications for a worsening incident is the acceptable direction to
-      -- err; silence is not.
-      WHEN public.alert_severity_rank(EXCLUDED.severity)
-           > public.alert_severity_rank(ae.severity) THEN now()
-      WHEN
-        -- (1) the claim is free, or its holder has outlived the TTL
-        (ae.notify_claimed_at IS NULL
-         OR now() - ae.notify_claimed_at
-            >= make_interval(secs => GREATEST(p_claim_ttl_seconds, 0)))
-        AND (
-          -- (2a) Never actually delivered — keep trying. This is the retry
-          -- that the old single-column design made impossible.
-          ae.last_notified_at IS NULL
-          -- (2b) Delivered, and the cooldown has since elapsed.
-          OR now() - ae.last_notified_at
-             >= make_interval(secs => GREATEST(p_cooldown_seconds, 0))
-        )
-      THEN now()
+      WHEN public.alert_should_claim(
+        ae.notify_claimed_at, ae.last_notified_at, ae.severity,
+        ae.last_delivered_severity, EXCLUDED.severity,
+        p_cooldown_seconds, p_claim_ttl_seconds, now()
+      ) THEN now()
       ELSE ae.notify_claimed_at
+    END,
+    notify_claim_token = CASE
+      WHEN public.alert_should_claim(
+        ae.notify_claimed_at, ae.last_notified_at, ae.severity,
+        ae.last_delivered_severity, EXCLUDED.severity,
+        p_cooldown_seconds, p_claim_ttl_seconds, now()
+      ) THEN v_token
+      ELSE ae.notify_claim_token
+    END,
+    notify_claim_severity = CASE
+      WHEN public.alert_should_claim(
+        ae.notify_claimed_at, ae.last_notified_at, ae.severity,
+        ae.last_delivered_severity, EXCLUDED.severity,
+        p_cooldown_seconds, p_claim_ttl_seconds, now()
+      ) THEN EXCLUDED.severity
+      ELSE ae.notify_claim_severity
     END
   RETURNING
     ae.id,
     (ae.occurrence_count = 1),
-    -- IS NOT DISTINCT FROM, not `=`. Once a delivery is recorded the claim is
-    -- cleared to NULL, so a subsequent deduped ingest lands on the ELSE branch
-    -- and keeps that NULL — and `NULL = now()` is NULL, not false. That fed a
-    -- null should_notify to the service, where it survived only because null
-    -- happens to be falsy in JS. Returning a real boolean is the contract;
-    -- relying on the coercion is how a three-valued column reads as two-valued
-    -- right up until someone writes `if (row.should_notify === false)`.
-    (ae.notify_claimed_at IS NOT DISTINCT FROM now()),
+    (ae.notify_claim_token IS NOT DISTINCT FROM v_token),
+    CASE WHEN ae.notify_claim_token IS NOT DISTINCT FROM v_token
+         THEN v_token ELSE NULL END,
     ae.occurrence_count,
     ae.first_seen_at;
+END;
 $$;
 
 -- ── Delivery outcome ────────────────────────────────────────────────────
@@ -279,16 +357,48 @@ $$;
 -- The other half of the claim. Exactly one of these runs after every fan-out,
 -- which is what keeps last_notified_at meaning "someone actually heard this".
 
--- At least one sink succeeded. Record the delivery and drop the claim — the
--- cooldown now runs from last_notified_at.
-CREATE FUNCTION public.mark_alert_notified(p_event_id uuid)
+-- At least one sink succeeded.
+--
+-- The two halves of this are fenced differently on purpose:
+--
+--   * The DELIVERY is recorded unconditionally. "A warning went out at 10:03"
+--     is true no matter who holds the claim now, so an escalation that
+--     superseded this dispatcher must not erase the fact that it delivered.
+--     last_delivered_severity keeps the high-water mark rather than the latest
+--     value, so a late info delivery cannot demote a critical that already got
+--     through.
+--
+--   * The CLAIM is released only if this caller still holds it. Without the
+--     token check an in-flight warning cleared the newer critical's claim on
+--     its way past, and a TTL-reaped holder could clear its own successor's.
+--     Plain `=` is what is wanted here: a NULL on either side yields NULL,
+--     which is not true, so a caller with no token settles nothing.
+CREATE FUNCTION public.mark_alert_notified(
+  p_event_id uuid,
+  p_claim_token uuid DEFAULT NULL,
+  p_severity text DEFAULT NULL
+)
 RETURNS void
 LANGUAGE sql
 AS $$
-  UPDATE public.alert_events
+  UPDATE public.alert_events AS ae
   SET last_notified_at = now(),
-      notify_claimed_at = NULL
-  WHERE id = p_event_id;
+      last_delivered_severity = CASE
+        WHEN public.alert_severity_rank(COALESCE(p_severity, ae.notify_claim_severity))
+             > public.alert_severity_rank(COALESCE(ae.last_delivered_severity, ''))
+        THEN COALESCE(p_severity, ae.notify_claim_severity)
+        ELSE ae.last_delivered_severity
+      END,
+      notify_claimed_at = CASE
+        WHEN ae.notify_claim_token = p_claim_token THEN NULL
+        ELSE ae.notify_claimed_at END,
+      notify_claim_severity = CASE
+        WHEN ae.notify_claim_token = p_claim_token THEN NULL
+        ELSE ae.notify_claim_severity END,
+      notify_claim_token = CASE
+        WHEN ae.notify_claim_token = p_claim_token THEN NULL
+        ELSE ae.notify_claim_token END
+  WHERE ae.id = p_event_id;
 $$;
 
 -- Nothing got out: every sink failed, or the only destination was suppressed.
@@ -296,13 +406,23 @@ $$;
 -- waiting out a cooldown for a notification that never happened. Deliberately
 -- does NOT touch last_notified_at — a failed attempt must leave no trace that
 -- resolve_alert_event could mistake for delivery.
-CREATE FUNCTION public.release_alert_claim(p_event_id uuid)
+--
+-- Token-fenced for the same reason as above, and one more: a dispatcher whose
+-- claim was already superseded by an escalation must not release the claim the
+-- escalation is actively using, or two dispatchers end up live at once.
+CREATE FUNCTION public.release_alert_claim(
+  p_event_id uuid,
+  p_claim_token uuid DEFAULT NULL
+)
 RETURNS void
 LANGUAGE sql
 AS $$
-  UPDATE public.alert_events
-  SET notify_claimed_at = NULL
-  WHERE id = p_event_id;
+  UPDATE public.alert_events AS ae
+  SET notify_claimed_at = NULL,
+      notify_claim_token = NULL,
+      notify_claim_severity = NULL
+  WHERE ae.id = p_event_id
+    AND ae.notify_claim_token = p_claim_token;
 $$;
 
 -- ── Resolve ─────────────────────────────────────────────────────────────
@@ -431,8 +551,10 @@ REVOKE ALL ON FUNCTION public.resolve_alert_event(uuid, text)
   FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.record_alert_webhook_failure(uuid, text, integer)
   FROM PUBLIC, anon, authenticated;
-REVOKE ALL ON FUNCTION public.mark_alert_notified(uuid) FROM PUBLIC, anon, authenticated;
-REVOKE ALL ON FUNCTION public.release_alert_claim(uuid) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.mark_alert_notified(uuid, uuid, text)
+  FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.release_alert_claim(uuid, uuid)
+  FROM PUBLIC, anon, authenticated;
 
 -- The REVOKEs above strip everyone; service_role is granted back explicitly
 -- rather than relying on default privileges (the #528 r4 correction).
@@ -440,5 +562,5 @@ GRANT EXECUTE ON FUNCTION public.ingest_alert_event(uuid, text, text, text, text
   TO service_role;
 GRANT EXECUTE ON FUNCTION public.resolve_alert_event(uuid, text) TO service_role;
 GRANT EXECUTE ON FUNCTION public.record_alert_webhook_failure(uuid, text, integer) TO service_role;
-GRANT EXECUTE ON FUNCTION public.mark_alert_notified(uuid) TO service_role;
-GRANT EXECUTE ON FUNCTION public.release_alert_claim(uuid) TO service_role;
+GRANT EXECUTE ON FUNCTION public.mark_alert_notified(uuid, uuid, text) TO service_role;
+GRANT EXECUTE ON FUNCTION public.release_alert_claim(uuid, uuid) TO service_role;
