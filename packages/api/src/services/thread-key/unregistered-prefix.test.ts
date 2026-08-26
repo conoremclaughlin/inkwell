@@ -48,12 +48,38 @@ describe('detectUnregisteredProjectPrefix', () => {
     expect(detectUnregisteredProjectPrefix('somethingnew:1', SLUGS, TYPES)).toBeNull();
   });
 
-  it('ignores malformed keys rather than guessing at them', () => {
+  it('ignores strings the parser does not accept as keys', () => {
     expect(detectUnregisteredProjectPrefix('', SLUGS, TYPES)).toBeNull();
     expect(detectUnregisteredProjectPrefix('cnr', SLUGS, TYPES)).toBeNull();
     expect(detectUnregisteredProjectPrefix(':issue:7', SLUGS, TYPES)).toBeNull();
+  });
+
+  it('agrees with the parser on a trailing-empty id instead of calling it malformed', () => {
+    // parseThreadKey pins `cnr:issue:` as type=cnr id=`issue:` — later empty
+    // segments are legal in an unprefixed parse. An earlier revision re-split
+    // the key here and rejected this, which is exactly the drift the shared
+    // parser exists to prevent.
+    const found = detectUnregisteredProjectPrefix('cnr:issue:', SLUGS, TYPES);
+    expect(found).toEqual({
+      suspectedProject: 'cnr',
+      pinnedAsType: 'cnr',
+      pinnedAsId: 'issue:',
+    });
+  });
+
+  it('stays quiet on an unknown type whose id merely contains colons', () => {
+    // Unknown types are legal and their ids may be namespaced or dated. These
+    // are ordinary keys, and warning on them is how a warning gets ignored.
+    expect(detectUnregisteredProjectPrefix('incident:2026:08:25', SLUGS, TYPES)).toBeNull();
+    expect(detectUnregisteredProjectPrefix('custom:compound:id', SLUGS, TYPES)).toBeNull();
     expect(detectUnregisteredProjectPrefix('cnr::7', SLUGS, TYPES)).toBeNull();
-    expect(detectUnregisteredProjectPrefix('cnr:issue:', SLUGS, TYPES)).toBeNull();
+  });
+
+  it('requires a known type in second position as the evidence of intent', () => {
+    // `issue` in second position is what distinguishes "meant as a prefix"
+    // from "unknown type with a compound id".
+    expect(detectUnregisteredProjectPrefix('openclaw:issue:15', SLUGS, TYPES)).not.toBeNull();
+    expect(detectUnregisteredProjectPrefix('openclaw:notatype:15', SLUGS, TYPES)).toBeNull();
   });
 
   it('keeps the whole remainder as the id, colons and all', () => {
@@ -61,16 +87,20 @@ describe('detectUnregisteredProjectPrefix', () => {
     expect(found?.pinnedAsId).toBe('spec:a:b:c');
   });
 
-  it('reports what the key will actually become, not just that it is wrong', () => {
+  it('describes an accomplished fact and a recovery that still works', () => {
     const found = detectUnregisteredProjectPrefix('cnr:issue:7', SLUGS, TYPES)!;
     const message = describeUnregisteredProjectPrefix('cnr:issue:7', found);
 
-    // The agent needs three things to act: what it wrote, what it will become,
-    // and that waiting will not help.
-    expect(message).toContain('cnr');
-    expect(message).toContain('issue:7');
-    expect(message).toContain('cannot be changed');
+    // By the time anyone reads this the thread exists and the pin is set, so
+    // "register before sending" would be advice that can no longer be taken.
+    expect(message).toContain('is pinned as');
+    expect(message).not.toMatch(/will be recorded|before sending/);
+
+    // The only recovery that works: register, then use a DIFFERENT key.
     expect(message).toContain('save_project');
+    expect(message).toContain('NEW thread key');
+    expect(message).toContain('reuses');
+    expect(message).toContain('issue:7');
   });
 
   it('treats an empty registry as "nothing is registered", not "everything is fine"', () => {

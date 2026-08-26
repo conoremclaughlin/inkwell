@@ -1,11 +1,13 @@
+import { parseThreadKey } from './parser';
+
 /**
- * Catch a project prefix that is about to be pinned as a type.
+ * Catch a project prefix that has been pinned as a type.
  *
  * AGENTS.md tells agents to prefix any cross-project thread key —
  * `inktrade:pr:42`, `cnr:issue:7`. Both parsers, TS and SQL, accept a first
  * segment as a project ONLY when it is a registered slug or alias. When it is
- * not registered, `cnr:issue:7` does not fail; it pins as
- * type=`cnr`, id=`issue:7`, which routes and behaves as an unknown type.
+ * not registered, `cnr:issue:7` does not fail; it pins as type=`cnr`,
+ * id=`issue:7`, and behaves as an unknown type from then on.
  *
  * Two things make that worth interrupting for:
  *
@@ -14,26 +16,36 @@
  *  - It is permanent. `pin_thread_key_before_insert` stamps
  *    key_project/key_type/key_id at creation and they are immutable after, so
  *    registering the project later does NOT repair threads already created.
- *    The only moment this is cheap to fix is before the first send.
  *
- * The signal has to be narrow or it is noise. A first segment is only
- * suspicious when it is neither a registered project NOR a known thread-key
- * type — `thread:perf:audit` is three segments with a legitimate type in
- * front, and must stay quiet.
+ * The pin itself comes from `parseThreadKey`, never from a second set of rules
+ * here. An earlier revision re-split the key inline and immediately drifted:
+ * it called `cnr:issue:` malformed, while the real parser (and SQL) pin it as
+ * type=`cnr`, id=`issue:`. This layer decides only whether an unprefixed parse
+ * looks *unintended*; what the key became is the parser's answer.
  */
 
 export interface UnregisteredProjectPrefix {
   /** The first segment, which looks intended as a project. */
   suspectedProject: string;
-  /** What the key will actually be pinned as if this send proceeds. */
+  /** What the key is actually pinned as — straight from the parser. */
   pinnedAsType: string;
   pinnedAsId: string;
 }
 
 /**
- * Returns a description of the misparse a key is heading for, or null when the
- * key is fine — registered project, known type, or too few segments to be
- * ambiguous at all.
+ * Returns a description of the misparse, or null when the key is fine or
+ * merely unusual.
+ *
+ * The positive signal is deliberately narrow, because a warning that fires on
+ * ordinary keys stops being read:
+ *
+ *   1. the key parses, and parsed WITHOUT a project;
+ *   2. the first segment is not itself a known type — `thread:perf:audit` is
+ *      a typed key whose id contains a colon, not a prefix;
+ *   3. the SECOND segment IS a known type — this is the evidence that a
+ *      prefix was intended. Unknown types are legal and their ids may contain
+ *      colons, so `incident:2026:08:25` and `custom:compound:id` are ordinary
+ *      keys, not mistakes.
  *
  * `knownTypes` should be the effective thread-key types for the user;
  * `slugLookup` the accepted project prefixes (canonical slugs and aliases),
@@ -44,44 +56,53 @@ export function detectUnregisteredProjectPrefix(
   slugLookup: ReadonlyMap<string, string>,
   knownTypes: ReadonlySet<string>
 ): UnregisteredProjectPrefix | null {
-  if (!key) return null;
+  const parsed = parseThreadKey(key, slugLookup);
+
+  // Not a thread key at all, or a registered project that parsed as intended.
+  if (!parsed) return null;
+  if (parsed.project !== null) return null;
 
   const segments = key.split(':');
-  // Fewer than three segments cannot carry a project prefix, so there is no
-  // ambiguity to warn about.
   if (segments.length < 3) return null;
-  if (segments[0] === '' || segments[1] === '' || segments[2] === '') return null;
 
-  const first = segments[0];
+  const [first, second] = segments;
 
-  // Registered project (or alias) — this key parses exactly as intended.
-  if (slugLookup.has(first)) return null;
-
-  // A known type in front is the ordinary shape of an unprefixed key whose id
-  // happens to contain a colon. Not a project prefix.
+  // A known type in front is the ordinary shape of an unprefixed key.
   if (knownTypes.has(first)) return null;
+
+  // Without a known type in second position there is nothing to suggest the
+  // first segment was meant as a project rather than as the type it became.
+  if (!knownTypes.has(second)) return null;
 
   return {
     suspectedProject: first,
-    pinnedAsType: first,
-    pinnedAsId: segments.slice(1).join(':'),
+    pinnedAsType: parsed.type,
+    pinnedAsId: parsed.id,
   };
 }
 
 /**
- * Operator-facing sentence for the detection. Kept next to the detector so the
- * wording and the condition cannot drift apart.
+ * Sentence for the caller. Kept next to the detector so the wording and the
+ * condition cannot drift apart.
+ *
+ * Written in the present tense and about an accomplished fact: by the time
+ * anything reads this, the thread exists and the pin is set. Telling the
+ * sender to "register before sending" would be advice they can no longer take,
+ * so it names the only recovery that works — register the slug, then use a
+ * different key, because re-sending this one reuses the pin that already
+ * exists.
  */
 export function describeUnregisteredProjectPrefix(
   key: string,
   found: UnregisteredProjectPrefix
 ): string {
   return (
-    `"${found.suspectedProject}" is not a registered project, so ${key} will be recorded ` +
-    `as type "${found.pinnedAsType}" with id "${found.pinnedAsId}" rather than as a ` +
-    `project-scoped key. Thread identity is pinned at creation and cannot be changed ` +
-    `afterwards. If "${found.suspectedProject}" is meant to be a project, register it ` +
-    `(save_project with that slug, or add it as a slug alias) before sending, or drop ` +
-    `the prefix.`
+    `"${key}" is pinned as type "${found.pinnedAsType}" with id "${found.pinnedAsId}", ` +
+    `not as a project-scoped key, because "${found.suspectedProject}" is not a registered ` +
+    `project. Thread identity is set when the thread is created and cannot be changed ` +
+    `afterwards — registering the project now will not re-scope this thread. To scope ` +
+    `future work to it: register the slug (save_project with slug "${found.suspectedProject}", ` +
+    `or add it as a slug alias), then start a NEW thread key. Re-sending "${key}" reuses ` +
+    `this existing pin.`
   );
 }
