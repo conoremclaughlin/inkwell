@@ -27,7 +27,9 @@ import {
   CONTAINER_RUNNER_FILES,
 } from '@inklabs/shared';
 import { homedir } from 'os';
+import { mkdirSync } from 'fs';
 import { join } from 'path';
+import { inkStudiosRoot } from '../studio-paths.js';
 import { ensureStudioSettings, applyPermissionOverlay } from '../studio-settings.js';
 
 /** Maximum time (ms) to wait for a Claude Code subprocess before killing it.
@@ -357,6 +359,19 @@ export class ClaudeRunner implements IRunner {
     // Allow access to ~/.ink/files (Telegram/Discord/Slack media downloads, Gmail attachments)
     const inkFilesDir = join(homedir(), '.ink', 'files');
     args.push('--add-dir', inkFilesDir);
+
+    // Allow access to the ephemeral-studio root (spec:studio-materialization
+    // v8): granting it at spawn is the whole point of a static root — a live
+    // session can never be granted a new directory, so every future
+    // create_studio/overflow worktree must land somewhere already in scope.
+    // Ensured on disk first: Claude Code ignores a nonexistent --add-dir.
+    const studiosRoot = inkStudiosRoot();
+    try {
+      mkdirSync(studiosRoot, { recursive: true });
+    } catch {
+      // Non-fatal — worst case the grant is a no-op until the dir exists.
+    }
+    args.push('--add-dir', studiosRoot);
 
     return args;
   }

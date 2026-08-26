@@ -28,6 +28,7 @@ import type { ProjectTask, TaskAssignment } from '../data/repositories/project-t
 import { handleSendToInbox } from '../mcp/tools/inbox-handlers';
 import { resolveAgentSlug } from '../auth/resolve-identity';
 import { logger } from '../utils/logger';
+import { ephemeralWorktreePath } from './studio-paths';
 import { ensureStudioSettings } from './studio-settings';
 import type { SandboxOrchestrator, SandboxSpinUpResult } from './sandbox/orchestrator';
 
@@ -1194,7 +1195,14 @@ export class StrategyService {
       // Fall through with original repoRoot
     }
 
-    const worktreePath = path.join(path.dirname(mainRoot), `${path.basename(mainRoot)}--${slug}`);
+    // Ephemeral studios materialize under the canonical root, never as repo
+    // siblings (spec:studio-materialization v8; studio-paths.ts). Persistent
+    // strategy studios below keep the legacy sibling location — durable.
+    const worktreePath = ephemeralWorktreePath({
+      agentId: ownerSlug,
+      repoRoot: mainRoot,
+      leaf: slug,
+    });
 
     // Create git worktree
     try {
@@ -1242,6 +1250,9 @@ export class StrategyService {
         purpose: `Ephemeral sandbox for: ${group.title}`,
         workType: 'feature',
         metadata: { ephemeral: true, taskGroupId: group.id },
+        // Root-based paths don't encode the slug — pass it explicitly or
+        // the derived fallback is null and slug lookups silently break.
+        slug,
       });
 
       // Update the task group metadata with the new studioId

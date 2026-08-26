@@ -22,6 +22,14 @@
  * default project, and expire. They close when their thread closes or when
  * expires_at passes with no live lease.
  *
+ * Ephemeral worktrees materialize under the canonical root
+ * `~/.ink/studios/<agent>/<project>/<slug>` (see studio-paths.ts and
+ * spec:studio-materialization v8) — never as siblings of the durable
+ * checkouts. The durable D1 parent (ensureParentStudio) keeps the legacy
+ * sibling location: it is a home a human also lives in. Because root paths
+ * do not follow the `<repo>--<slug>` folder convention, the row's slug is
+ * passed to create() explicitly rather than derived from the path.
+ *
  * Overflow ALWAYS hangs off the durable ancestor, never off another
  * ephemeral. Routing hands this service whatever studio the agent's live
  * session happens to occupy — after one overflow, that candidate is itself
@@ -47,6 +55,7 @@ import path from 'path';
 import { access } from 'fs/promises';
 import { bootstrapStudio } from '@inklabs/shared';
 import type { StudiosRepository, Studio } from '../data/repositories/studios.repository';
+import { ephemeralWorktreePath } from './studio-paths';
 import { ensureStudioSettings } from './studio-settings';
 import {
   StudioLeaseService,
@@ -292,7 +301,13 @@ export class StudioOverflowService {
       const { existing } = s;
       if (existing && !s.matches) continue;
 
-      const created = await this.createWorktree(parentStudio, s.slug, agentId, s.branchTail);
+      const created = await this.createWorktree(parentStudio, s.slug, agentId, s.branchTail, {
+        worktreePath: ephemeralWorktreePath({
+          agentId,
+          repoRoot: parentStudio.repoRoot,
+          leaf: s.slug,
+        }),
+      });
       if (!created) continue;
 
       if (existing) {
@@ -351,6 +366,9 @@ export class StudioOverflowService {
           threadKey,
           expiresAt: new Date(Date.now() + EPHEMERAL_STUDIO_TTL_MS).toISOString(),
           metadata: { overflow: true },
+          // Root-based paths don't encode the slug — pass it explicitly or
+          // the derived fallback is null and reuse-by-slug silently breaks.
+          slug: s.slug,
         });
         await this.leases.logEvent(userId, studio.id, 'overflow', {
           threadKey,
@@ -515,10 +533,15 @@ export class StudioOverflowService {
     slug: string,
     agentId: string,
     branchTail: string,
-    opts?: { branch?: string }
+    opts?: { branch?: string; worktreePath?: string }
   ): Promise<{ worktreePath: string; branch: string } | null> {
     const mainRoot = parentStudio.repoRoot;
-    const worktreePath = path.join(path.dirname(mainRoot), `${path.basename(mainRoot)}--${slug}`);
+    // Ephemeral callers pass the canonical-root path; the durable D1 parent
+    // omits it and keeps the legacy sibling-of-repo location. `git worktree
+    // add` creates missing parent directories itself (verified empirically).
+    const worktreePath =
+      opts?.worktreePath ??
+      path.join(path.dirname(mainRoot), `${path.basename(mainRoot)}--${slug}`);
     // Parent studios pass an explicit branch: `eph/` names a temporary
     // worktree, and a durable home studio is not one.
     const branch = opts?.branch || `${agentId}/eph/${branchTail}`;
