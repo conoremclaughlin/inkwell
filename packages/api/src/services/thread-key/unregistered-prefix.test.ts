@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   detectUnregisteredProjectPrefix,
   describeUnregisteredProjectPrefix,
+  mayHaveProjectPrefix,
 } from './unregistered-prefix';
 
 // Mirrors the real registry shape: canonical slugs map to themselves, aliases
@@ -107,5 +108,19 @@ describe('detectUnregisteredProjectPrefix', () => {
     // A user with no projects yet still gets told their prefix will not work.
     const found = detectUnregisteredProjectPrefix('cnr:issue:7', new Map(), TYPES);
     expect(found?.suspectedProject).toBe('cnr');
+  });
+});
+
+describe('mayHaveProjectPrefix', () => {
+  it('agrees with the detector about what can never warn', () => {
+    // The precheck exists to skip registry reads. If it ever said "no" to
+    // something the detector would flag, the warning would silently vanish.
+    for (const key of ['cnr:issue:7', 'openclaw:issue:15', 'cnr:issue:', 'cnr:spec:a:b:c']) {
+      expect(mayHaveProjectPrefix(key)).toBe(true);
+    }
+    for (const key of ['', 'cnr', 'pr:545', 'somethingnew:1']) {
+      expect(mayHaveProjectPrefix(key)).toBe(false);
+      expect(detectUnregisteredProjectPrefix(key, SLUGS, TYPES)).toBeNull();
+    }
   });
 });

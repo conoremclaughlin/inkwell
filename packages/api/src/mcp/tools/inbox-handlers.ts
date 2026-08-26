@@ -18,6 +18,7 @@ import { ThreadKeyService } from '../../services/thread-key/thread-key.service';
 import {
   detectUnregisteredProjectPrefix,
   describeUnregisteredProjectPrefix,
+  mayHaveProjectPrefix,
 } from '../../services/thread-key/unregistered-prefix';
 import {
   getRequestContext,
@@ -304,6 +305,10 @@ async function warnOnUnregisteredProjectPrefix(
   userId: string,
   threadKey: string
 ): Promise<string | undefined> {
+  // Skip the registry entirely for keys that could never warn. Two-segment
+  // keys are the common case, and this is on the first-send path.
+  if (!mayHaveProjectPrefix(threadKey)) return undefined;
+
   try {
     const service = new ThreadKeyService(supabase);
     const [slugLookup, knownTypes] = await Promise.all([

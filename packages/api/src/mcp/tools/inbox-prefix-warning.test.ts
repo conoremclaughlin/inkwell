@@ -186,4 +186,20 @@ describe('send_to_inbox — unregistered project prefix warning', () => {
     expect(parsed.messageId).toBe('msg-1');
     expect(parsed.threadKeyWarning).toBeUndefined();
   });
+
+  it('does not touch the registry for a key that could never warn', async () => {
+    // `pr:545` is the commonest new-thread shape. Reading both registries to
+    // conclude nothing would be a round-trip on every first send.
+    await send('pr:545');
+
+    expect(projectSlugLookup).not.toHaveBeenCalled();
+    expect(knownTypeNames).not.toHaveBeenCalled();
+  });
+
+  it('still reads the registry when the key has room for a prefix', async () => {
+    await send('cnr:issue:7');
+
+    expect(projectSlugLookup).toHaveBeenCalled();
+    expect(knownTypeNames).toHaveBeenCalled();
+  });
 });

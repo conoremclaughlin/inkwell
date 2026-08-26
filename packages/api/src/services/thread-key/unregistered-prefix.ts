@@ -24,6 +24,23 @@ import { parseThreadKey } from './parser';
  * looks *unintended*; what the key became is the parser's answer.
  */
 
+/**
+ * Cheap structural precheck: could this key possibly warn?
+ *
+ * A key with fewer than three segments has no room for a project prefix, so
+ * the answer is already no before any registry is consulted. `pr:545` is the
+ * commonest new-thread shape there is, and reading the project and type
+ * registries to conclude nothing would be a database round-trip on every
+ * first send.
+ *
+ * Lives beside the detector so the segment rule stays in one place rather than
+ * being restated by each caller that wants to skip the lookup.
+ */
+export function mayHaveProjectPrefix(key: string): boolean {
+  if (!key) return false;
+  return key.split(':').length >= 3;
+}
+
 export interface UnregisteredProjectPrefix {
   /** The first segment, which looks intended as a project. */
   suspectedProject: string;
