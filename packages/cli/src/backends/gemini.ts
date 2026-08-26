@@ -10,7 +10,7 @@
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'fs';
 import { join } from 'path';
-import { tmpdir } from 'os';
+import { tmpdir, homedir } from 'os';
 import { createIdentityPromptFile } from './identity.js';
 import { encodeContextToken } from '@inklabs/shared';
 import type { BackendAdapter, BackendConfig, PreparedBackend } from './types.js';
@@ -122,6 +122,17 @@ export class GeminiAdapter implements BackendAdapter {
     if (config.dangerous) {
       args.push('--yolo');
     }
+
+    // Ephemeral-studio root (spec:studio-materialization v8): Gemini's
+    // workspace-grant equivalent of --add-dir, so studios minted mid-session
+    // stay editable. Created if missing.
+    const inkStudiosDir = process.env.INK_STUDIOS_ROOT || join(homedir(), '.ink', 'studios');
+    try {
+      mkdirSync(inkStudiosDir, { recursive: true });
+    } catch {
+      // Non-fatal — worst case the grant is a no-op until the dir exists.
+    }
+    args.push('--include-directories', inkStudiosDir);
 
     // Passthrough flags
     args.push(...config.passthroughArgs);

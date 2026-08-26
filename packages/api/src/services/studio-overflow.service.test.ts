@@ -6,8 +6,8 @@
  * gated on winning the teardown claim.
  */
 
-import { describe, it, expect, vi } from 'vitest';
-import { mkdtemp, rm } from 'fs/promises';
+import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
+import { mkdtemp, mkdir, rm } from 'fs/promises';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { tmpdir } from 'os';
@@ -34,6 +34,23 @@ import {
 } from './studio-overflow.service';
 import type { Studio, StudiosRepository } from '../data/repositories/studios.repository';
 import type { StudioLeaseService, StudioLease } from './studio-lease.service';
+import { ephemeralWorktreePath } from './studio-paths';
+
+// Every ephemeral mint in this file materializes under an isolated root —
+// never the real ~/.ink/studios. Restored so parallel-worker siblings that
+// share this process env are unaffected after the file completes.
+let studiosRootOverride: string;
+let prevStudiosRoot: string | undefined;
+beforeAll(async () => {
+  prevStudiosRoot = process.env.INK_STUDIOS_ROOT;
+  studiosRootOverride = await mkdtemp(path.join(tmpdir(), 'ink-studios-root-'));
+  process.env.INK_STUDIOS_ROOT = studiosRootOverride;
+});
+afterAll(async () => {
+  if (prevStudiosRoot === undefined) delete process.env.INK_STUDIOS_ROOT;
+  else process.env.INK_STUDIOS_ROOT = prevStudiosRoot;
+  await rm(studiosRootOverride, { recursive: true, force: true });
+});
 
 function makeStudio(overrides: Partial<Studio> = {}): Studio {
   return {
@@ -324,10 +341,7 @@ describe('StudioOverflowService.ensureOverflowStudio — durable anchoring', () 
     const repoRoot = await makeGitRepo();
     const blocker = path.join(path.dirname(repoRoot), `${path.basename(repoRoot)}--legacy-chain`);
     const hashSlug = `lumen-review--pr-476-h${slugHash('pr:476')}`;
-    const hashWorktree = path.join(
-      path.dirname(repoRoot),
-      `${path.basename(repoRoot)}--${hashSlug}`
-    );
+    const hashWorktree = ephemeralWorktreePath({ agentId: 'lumen', repoRoot, leaf: hashSlug });
     try {
       // The legacy chained studio still has the flat eph/ branch checked out.
       await execFileAsync('git', ['worktree', 'add', '-b', 'lumen/eph/pr-476', blocker, 'main'], {
@@ -357,6 +371,8 @@ describe('StudioOverflowService.ensureOverflowStudio — durable anchoring', () 
       expect(createdInputs).toHaveLength(1);
       expect(createdInputs[0].branch).toBe(`lumen/eph/pr-476-h${slugHash('pr:476')}`);
       expect(String(createdInputs[0].worktreePath)).toContain(hashSlug);
+      // Root paths don't encode the slug, so create() must receive it.
+      expect(createdInputs[0].slug).toBe(hashSlug);
     } finally {
       await execFileAsync('git', ['worktree', 'remove', '--force', hashWorktree], {
         cwd: repoRoot,
@@ -376,10 +392,11 @@ describe('StudioOverflowService.ensureOverflowStudio — durable anchoring', () 
   it('an existing hash-variant studio is reused before the primary is reminted', async () => {
     const repoRoot = await makeGitRepo();
     const hashWorktree = await mkdtemp(path.join(tmpdir(), 'overflow-hash-'));
-    const primaryWorktree = path.join(
-      path.dirname(repoRoot),
-      `${path.basename(repoRoot)}--lumen-review--pr-476`
-    );
+    const primaryWorktree = ephemeralWorktreePath({
+      agentId: 'lumen',
+      repoRoot,
+      leaf: 'lumen-review--pr-476',
+    });
     try {
       const root = makeStudio({ repoRoot, worktreePath: repoRoot });
       const hashRow = makeStudio({
@@ -434,10 +451,11 @@ describe('StudioOverflowService.ensureOverflowStudio — durable anchoring', () 
   // still fails closed with null.
   it('a revive loss with no live winner fails the call and removes the created worktree', async () => {
     const repoRoot = await makeGitRepo();
-    const primaryWorktree = path.join(
-      path.dirname(repoRoot),
-      `${path.basename(repoRoot)}--lumen-review--pr-476`
-    );
+    const primaryWorktree = ephemeralWorktreePath({
+      agentId: 'lumen',
+      repoRoot,
+      leaf: 'lumen-review--pr-476',
+    });
     try {
       const cleanedRow = makeStudio({
         id: 'eph-cleaned',
@@ -489,10 +507,11 @@ describe('StudioOverflowService.ensureOverflowStudio — durable anchoring', () 
   it('an insert loss converges on the concurrent winner instead of failing', async () => {
     const repoRoot = await makeGitRepo();
     const winnerWorktree = await mkdtemp(path.join(tmpdir(), 'overflow-winner-'));
-    const primaryWorktree = path.join(
-      path.dirname(repoRoot),
-      `${path.basename(repoRoot)}--lumen-review--pr-476`
-    );
+    const primaryWorktree = ephemeralWorktreePath({
+      agentId: 'lumen',
+      repoRoot,
+      leaf: 'lumen-review--pr-476',
+    });
     try {
       const winnerRow = makeStudio({
         id: 'eph-winner',
@@ -554,10 +573,11 @@ describe('StudioOverflowService.ensureOverflowStudio — durable anchoring', () 
   // disagree about whether it is live.
   it('reviving an archived studio clears archived_at as well as cleaned_at', async () => {
     const repoRoot = await makeGitRepo();
-    const primaryWorktree = path.join(
-      path.dirname(repoRoot),
-      `${path.basename(repoRoot)}--lumen-review--pr-476`
-    );
+    const primaryWorktree = ephemeralWorktreePath({
+      agentId: 'lumen',
+      repoRoot,
+      leaf: 'lumen-review--pr-476',
+    });
     try {
       const archivedRow = makeStudio({
         id: 'eph-archived',
@@ -643,6 +663,115 @@ describe('StudioOverflowService.ensureOverflowStudio — durable anchoring', () 
 
     expect(result).toBeNull();
     expect(findById).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('StudioOverflowService — canonical ephemeral root (spec v8)', () => {
+  // The whole point of the root: paths are `<root>/<agent>/<project>/<slug>`,
+  // flat by construction, and the row slug travels explicitly because the
+  // path no longer encodes it. The expectation is hand-built — using the
+  // helper here would let a helper bug self-certify.
+  it('ephemeral mints materialize under the root with an explicit slug', async () => {
+    // A canonical repo basename, so the hand-built expectation needs no
+    // digest arithmetic (mkdtemp basenames are mixed-case → digest-suffixed).
+    const holder = await mkdtemp(path.join(tmpdir(), 'overflow-canon-'));
+    const repoRoot = path.join(holder, 'inkwell-fixture');
+    await mkdir(repoRoot);
+    await execFileAsync('git', ['init', '-b', 'main'], { cwd: repoRoot });
+    await execFileAsync(
+      'git',
+      [
+        '-c',
+        'user.email=test@test',
+        '-c',
+        'user.name=test',
+        'commit',
+        '--allow-empty',
+        '-m',
+        'init',
+      ],
+      { cwd: repoRoot }
+    );
+    const expected = path.join(
+      studiosRootOverride,
+      'lumen',
+      'inkwell-fixture',
+      'lumen-review--pr-476'
+    );
+    try {
+      const createdInputs: Array<Record<string, unknown>> = [];
+      const studios = {
+        findById: vi.fn(),
+        findBySlug: vi.fn().mockResolvedValue(null),
+        create: vi.fn().mockImplementation((input: Record<string, unknown>) => {
+          createdInputs.push(input);
+          return Promise.resolve(makeStudio({ id: 'new-root', ...(input as Partial<Studio>) }));
+        }),
+        update: vi.fn(),
+      } as unknown as StudiosRepository;
+      const leases = { logEvent: vi.fn() } as unknown as StudioLeaseService;
+
+      const service = new StudioOverflowService(studios, leases);
+      const result = await service.ensureOverflowStudio({
+        userId: 'user-1',
+        agentId: 'lumen',
+        parentStudio: makeStudio({ repoRoot, worktreePath: repoRoot }),
+        threadKey: 'pr:476',
+      });
+
+      expect(result?.id).toBe('new-root');
+      expect(createdInputs[0].worktreePath).toBe(expected);
+      expect(createdInputs[0].slug).toBe('lumen-review--pr-476');
+      // The worktree genuinely exists at the canonical location.
+      const { access: fsAccess } = await import('fs/promises');
+      await expect(fsAccess(expected)).resolves.toBeUndefined();
+    } finally {
+      await execFileAsync('git', ['worktree', 'remove', '--force', expected], {
+        cwd: repoRoot,
+      }).catch(() => undefined);
+      await rm(holder, { recursive: true, force: true });
+    }
+  });
+
+  // Scope boundary: durable homes are checkouts a human also lives in. Only
+  // the EPHEMERAL mints move; the D1 parent stays a sibling of the repo.
+  it('the durable D1 parent studio stays a sibling of the repo, not under the root', async () => {
+    const repoRoot = await makeGitRepo();
+    const createdInputs: Array<Record<string, unknown>> = [];
+    try {
+      const studios = {
+        findById: vi.fn(),
+        findBySlug: vi.fn().mockResolvedValue(null),
+        findByRepoRoot: vi.fn().mockResolvedValue(null),
+        create: vi.fn().mockImplementation((input: Record<string, unknown>) => {
+          createdInputs.push(input);
+          return Promise.resolve(makeStudio({ id: 'parent-new', ...(input as Partial<Studio>) }));
+        }),
+        update: vi.fn(),
+      } as unknown as StudiosRepository;
+      const leases = { logEvent: vi.fn() } as unknown as StudioLeaseService;
+
+      const service = new StudioOverflowService(studios, leases);
+      const result = await service.ensureParentStudio({
+        userId: 'user-1',
+        agentId: 'lumen',
+        repoRoot,
+      });
+
+      expect(result?.id).toBe('parent-new');
+      const worktreePath = String(createdInputs[0].worktreePath);
+      expect(path.dirname(worktreePath)).toBe(path.dirname(repoRoot));
+      expect(worktreePath.startsWith(studiosRootOverride)).toBe(false);
+    } finally {
+      if (createdInputs[0]?.worktreePath) {
+        await execFileAsync(
+          'git',
+          ['worktree', 'remove', '--force', String(createdInputs[0].worktreePath)],
+          { cwd: repoRoot }
+        ).catch(() => undefined);
+      }
+      await rm(repoRoot, { recursive: true, force: true });
+    }
   });
 });
 

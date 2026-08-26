@@ -20,6 +20,7 @@ import type {
   ToolCall,
 } from './types.js';
 import { formatInjectedContext } from './context-builder.js';
+import { inkStudiosRoot, ensureInkStudiosRoot } from '../studio-paths.js';
 import { env } from '../../config/env.js';
 import { logger } from '../../utils/logger.js';
 import { resolveBinaryPath, buildSpawnPath } from './resolve-binary.js';
@@ -83,6 +84,10 @@ export class CodexRunner implements IRunner {
     );
 
     try {
+      // The --add-dir grant below requires the directory to exist; async so
+      // the event loop is never blocked.
+      await ensureInkStudiosRoot();
+
       // Only pass a session ID to buildArgs when resuming a known backend session.
       // For fresh runs, Codex assigns its own session UUID — we extract it from stdout.
       const argsSessionId = isResume ? backendSessionId! : undefined;
@@ -147,6 +152,17 @@ export class CodexRunner implements IRunner {
     const args: string[] = config.sandboxBypass
       ? ['--dangerously-bypass-approvals-and-sandbox', 'exec']
       : ['-a', 'never', 'exec'];
+
+    // Ephemeral-studio root (spec:studio-materialization v8): writable
+    // alongside the primary workspace, on BOTH the fresh and resume shapes —
+    // Codex defaults to workspace-write, so without this a Codex session can
+    // have the host MCP mint a studio it then cannot edit, build, or test
+    // (PR #544 r1 P1). Placement matters: `--add-dir` is valid on `exec` but
+    // NOT on the `exec resume` subcommand ("unexpected argument", r2), so it
+    // must precede `resume` — exec scope applies to the resumed session too.
+    // The run path ensures the directory exists first.
+    args.push('--add-dir', inkStudiosRoot());
+
     if (isResume) {
       args.push('resume');
     }

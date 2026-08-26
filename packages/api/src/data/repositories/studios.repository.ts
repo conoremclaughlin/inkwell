@@ -65,6 +65,13 @@ export interface CreateStudioInput {
   threadKey?: string | null;
   expiresAt?: string | null;
   metadata?: Json;
+  /**
+   * Explicit slug. REQUIRED when the worktree path does not follow the
+   * legacy `<repo>--<slug>` sibling convention (e.g. ephemeral studios under
+   * ~/.ink/studios) — the derived fallback would come back null there and
+   * silently break reuse-by-slug.
+   */
+  slug?: string | null;
 }
 
 export interface UpdateStudioInput {
@@ -151,7 +158,7 @@ export class StudiosRepository {
       parent_studio_id: input.parentStudioId ?? null,
       thread_key: input.threadKey ?? null,
       expires_at: input.expiresAt ?? null,
-      slug: deriveStudioSlug(input.worktreePath),
+      slug: input.slug !== undefined ? input.slug : deriveStudioSlug(input.worktreePath),
       status: 'active',
       metadata: input.metadata || {},
     };

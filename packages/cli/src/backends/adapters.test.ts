@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { readFileSync } from 'fs';
+import { readFileSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import { ClaudeAdapter } from './claude.js';
 import { CodexAdapter } from './codex.js';
 import { GeminiAdapter } from './gemini.js';
@@ -326,6 +328,9 @@ describe('backend adapters session resume wiring', () => {
   });
 
   it('claude adapter adds no attachment --add-dir without attachment directories', () => {
+    // Keep the standing studios-root grant off the real home dir.
+    const prevRoot = process.env.INK_STUDIOS_ROOT;
+    process.env.INK_STUDIOS_ROOT = join(tmpdir(), `ink-studios-adapter-${process.pid}`);
     const adapter = new ClaudeAdapter();
     const prepared = adapter.prepare({
       agentId: 'wren',
@@ -335,16 +340,86 @@ describe('backend adapters session resume wiring', () => {
     });
 
     try {
-      // The only --add-dir should be ~/.ink/files (if it exists on this machine).
-      // No attachment-specific dirs should appear.
+      // Without attachments the only grants are Inkwell's own standing dirs:
+      // ~/.ink/files (if present) and the ephemeral-studio root
+      // (spec:studio-materialization v8). No attachment-specific dirs.
       const addDirPairs = prepared.args
         .map((arg, i) => (arg === '--add-dir' ? prepared.args[i + 1] : null))
         .filter(Boolean);
       for (const dir of addDirPairs) {
-        expect(dir).toMatch(/\.ink\/files$/);
+        expect(dir).toMatch(/\.ink\/files$|ink-studios-adapter-/);
       }
+      // The studios root is granted unconditionally — a live session can
+      // never be granted a new directory after spawn.
+      expect(addDirPairs).toContain(process.env.INK_STUDIOS_ROOT);
     } finally {
       prepared.cleanup();
+      rmSync(process.env.INK_STUDIOS_ROOT!, { recursive: true, force: true });
+      if (prevRoot === undefined) delete process.env.INK_STUDIOS_ROOT;
+      else process.env.INK_STUDIOS_ROOT = prevRoot;
+    }
+  });
+
+  // PR #544 r1 P1 — the studios-root grant is a per-backend obligation, not a
+  // Claude feature. Codex defaults to workspace-write: without --add-dir the
+  // host MCP can mint a studio the session cannot edit, build, or test. The
+  // flag must ride BOTH shapes; codex scopes flags to the subcommand they
+  // follow, so on resume it must land after `resume`.
+  it('codex adapter grants --add-dir for the ephemeral-studio root (fresh and resume)', () => {
+    const prevRoot = process.env.INK_STUDIOS_ROOT;
+    process.env.INK_STUDIOS_ROOT = join(tmpdir(), `ink-studios-codex-${process.pid}`);
+    try {
+      for (const backendSessionId of [undefined, 'codex-sess-1']) {
+        const prepared = new CodexAdapter().prepare({
+          agentId: 'lumen',
+          model: undefined,
+          promptParts: [],
+          passthroughArgs: [],
+          backendSessionId,
+        });
+        try {
+          const granted = prepared.args
+            .map((arg, i) => (arg === '--add-dir' ? prepared.args[i + 1] : null))
+            .filter(Boolean);
+          expect(granted).toContain(process.env.INK_STUDIOS_ROOT);
+          if (backendSessionId) {
+            expect(prepared.args.indexOf('--add-dir')).toBeGreaterThan(
+              prepared.args.indexOf('resume')
+            );
+          }
+        } finally {
+          prepared.cleanup();
+        }
+      }
+    } finally {
+      rmSync(process.env.INK_STUDIOS_ROOT!, { recursive: true, force: true });
+      if (prevRoot === undefined) delete process.env.INK_STUDIOS_ROOT;
+      else process.env.INK_STUDIOS_ROOT = prevRoot;
+    }
+  });
+
+  it('gemini adapter grants --include-directories for the ephemeral-studio root', () => {
+    const prevRoot = process.env.INK_STUDIOS_ROOT;
+    process.env.INK_STUDIOS_ROOT = join(tmpdir(), `ink-studios-gemini-${process.pid}`);
+    try {
+      const prepared = new GeminiAdapter().prepare({
+        agentId: 'aster',
+        model: undefined,
+        promptParts: [],
+        passthroughArgs: [],
+      });
+      try {
+        const granted = prepared.args
+          .map((arg, i) => (arg === '--include-directories' ? prepared.args[i + 1] : null))
+          .filter(Boolean);
+        expect(granted).toContain(process.env.INK_STUDIOS_ROOT);
+      } finally {
+        prepared.cleanup();
+      }
+    } finally {
+      rmSync(process.env.INK_STUDIOS_ROOT!, { recursive: true, force: true });
+      if (prevRoot === undefined) delete process.env.INK_STUDIOS_ROOT;
+      else process.env.INK_STUDIOS_ROOT = prevRoot;
     }
   });
 

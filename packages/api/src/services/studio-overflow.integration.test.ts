@@ -60,6 +60,8 @@ describe.skipIf(!available)('overflow studio live-uniqueness (integration)', () 
   let repo: StudiosRepository;
   let parent: Studio;
   let repoRoot: string;
+  let studiosRoot: string;
+  let prevStudiosRoot: string | undefined;
   const studioIds: string[] = [];
 
   beforeAll(async () => {
@@ -67,6 +69,12 @@ describe.skipIf(!available)('overflow studio live-uniqueness (integration)', () 
       auth: { autoRefreshToken: false, persistSession: false },
     });
     repo = new StudiosRepository(client as SupabaseClient<never>);
+
+    // Ephemeral mints land under an isolated canonical root, never the real
+    // ~/.ink/studios (spec v8).
+    prevStudiosRoot = process.env.INK_STUDIOS_ROOT;
+    studiosRoot = await mkdtemp(path.join(tmpdir(), `ink-studios-it-${RUN}-`));
+    process.env.INK_STUDIOS_ROOT = studiosRoot;
 
     repoRoot = await mkdtemp(path.join(tmpdir(), `overflow-it-${RUN}-`));
     await execFileAsync('git', ['init', '-b', 'main'], { cwd: repoRoot });
@@ -106,7 +114,8 @@ describe.skipIf(!available)('overflow studio live-uniqueness (integration)', () 
     }
     await client.from('studios').delete().eq('id', parent.id);
 
-    // Worktrees the service created live beside the repo as `<repo>--*`.
+    // Legacy-convention leftovers beside the repo (fixture rows use these
+    // paths), plus everything under the isolated canonical root.
     const dir = path.dirname(repoRoot);
     const base = path.basename(repoRoot);
     const { readdir } = await import('fs/promises');
@@ -116,6 +125,9 @@ describe.skipIf(!available)('overflow studio live-uniqueness (integration)', () 
       }
     }
     await rm(repoRoot, { recursive: true, force: true });
+    await rm(studiosRoot, { recursive: true, force: true });
+    if (prevStudiosRoot === undefined) delete process.env.INK_STUDIOS_ROOT;
+    else process.env.INK_STUDIOS_ROOT = prevStudiosRoot;
   }, 30_000);
 
   it('two racing inserts for one (parent, threadKey) — exactly one wins', async () => {
@@ -282,11 +294,17 @@ describe.skipIf(!available)('overflow studio live-uniqueness (integration)', () 
       // Liveness is asked for the way every runtime path asks it (r3).
       const { data: liveRows } = await client
         .from('studios')
-        .select('id, slug')
+        .select('id, slug, worktree_path')
         .eq('parent_studio_id', parent.id)
         .eq('thread_key', threadKey)
         .in('status', ['active', 'idle']);
       expect(liveRows).toHaveLength(1);
+
+      // spec v8: the mint materialized under the canonical root, and the row
+      // carries a real slug even though the path no longer encodes one.
+      const winner = (liveRows as Array<{ id: string; slug: string; worktree_path: string }>)[0];
+      expect(winner.worktree_path.startsWith(studiosRoot)).toBe(true);
+      expect(winner.slug).toBeTruthy();
 
       // r3: BOTH calls get the winner. The loser used to return null, and
       // since neither divertToOverflow call site retries, that null became
@@ -302,5 +320,46 @@ describe.skipIf(!available)('overflow studio live-uniqueness (integration)', () 
     } finally {
       spy.mockRestore();
     }
+  }, 30_000);
+
+  // spec v8: root paths don't follow the `<repo>--<slug>` folder convention
+  // deriveStudioSlug expects, so create() must be handed the slug explicitly.
+  // If it were derived, this row's slug would be NULL, the second ensure's
+  // preflight would miss it, and a SECOND studio would be minted for the
+  // same thread — the exact class of split this whole arc exists to end.
+  it('a root-minted studio round-trips its slug — the second ensure reuses, not re-mints', async () => {
+    const threadKey = `pr:it-reuse-${RUN}`;
+    const leases = { logEvent: vi.fn() } as unknown as StudioLeaseService;
+    const service = new StudioOverflowService(repo, leases);
+
+    const first = await service.ensureOverflowStudio({
+      userId: USER,
+      agentId: `it-agent-${RUN}`,
+      parentStudio: parent,
+      threadKey,
+    });
+    expect(first).not.toBeNull();
+    studioIds.push(first!.id);
+    expect(first!.worktreePath.startsWith(studiosRoot)).toBe(true);
+
+    const row = await repo.findById(first!.id);
+    expect(row?.slug).toBeTruthy();
+    expect(row?.slug?.endsWith(`--pr-it-reuse-${RUN}`)).toBe(true);
+
+    const second = await service.ensureOverflowStudio({
+      userId: USER,
+      agentId: `it-agent-${RUN}`,
+      parentStudio: parent,
+      threadKey,
+    });
+    expect(second?.id).toBe(first!.id);
+
+    const { data: liveRows } = await client
+      .from('studios')
+      .select('id')
+      .eq('parent_studio_id', parent.id)
+      .eq('thread_key', threadKey)
+      .in('status', ['active', 'idle']);
+    expect(liveRows).toHaveLength(1);
   }, 30_000);
 });
