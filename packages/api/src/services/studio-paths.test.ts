@@ -54,9 +54,13 @@ describe('ephemeralWorktreePath', () => {
 
   it('falls back to safe segment names when inputs are empty or missing', () => {
     process.env.INK_STUDIOS_ROOT = '/tmp/studios';
-    expect(ephemeralWorktreePath({ agentId: null, repoRoot: '/x/:::', leaf: '' })).toBe(
-      '/tmp/studios/agent/project/studio'
-    );
+    // Absent agent/leaf → plain fallbacks; the repo basename ':::' is a
+    // NON-EMPTY input that sanitizes away, so it gets the digested fallback.
+    const p = ephemeralWorktreePath({ agentId: null, repoRoot: '/x/:::', leaf: '' });
+    const parts = p.split('/');
+    expect(parts.slice(0, 4).join('/')).toBe('/tmp/studios/agent');
+    expect(parts[4]).toMatch(/^project-h[a-z0-9]+$/);
+    expect(parts[5]).toBe('studio');
   });
 });
 
@@ -75,7 +79,8 @@ describe('studioPathSegment', () => {
   });
 
   it('neutralizes path traversal — dots never survive', () => {
-    expect(studioPathSegment('..', 'x')).toBe('x');
+    // '..' is non-empty input that sanitizes away → digested fallback (r2).
+    expect(studioPathSegment('..', 'x')).toMatch(/^x-h[a-z0-9]+$/);
     expect(studioPathSegment('../../etc', 'x')).toMatch(/^etc-h[a-z0-9]+$/);
     expect(studioPathSegment('.hidden', 'x')).toMatch(/^hidden-h[a-z0-9]+$/);
     // No sanitized segment can contain a separator or a dot.
@@ -93,9 +98,11 @@ describe('studioPathSegment', () => {
     expect(capped).not.toMatch(/-h[a-z0-9]+-/); // digest is terminal
   });
 
-  it('uses the fallback only when nothing survives sanitization', () => {
-    expect(studioPathSegment(':::', 'fallback')).toBe('fallback');
+  it('genuinely absent input gets the plain fallback; sanitized-away input gets a digested one', () => {
     expect(studioPathSegment(undefined, 'fallback')).toBe('fallback');
+    expect(studioPathSegment(null, 'fallback')).toBe('fallback');
+    expect(studioPathSegment('', 'fallback')).toBe('fallback');
+    expect(studioPathSegment(':::', 'fallback')).toMatch(/^fallback-h[a-z0-9]+$/);
   });
 
   // PR #544 r1 P1 (Lumen): sanitization and truncation are many-to-one.
@@ -126,6 +133,16 @@ describe('studioPathSegment', () => {
 
     it('is deterministic — the digest is a function of the input alone', () => {
       expect(studioPathSegment('PR:537', 'x')).toBe(studioPathSegment('PR:537', 'x'));
+    });
+
+    // r2 (Lumen): the empty-cleaned early return skipped the digest, so
+    // ':::' and '___' both landed on the bare fallback directory.
+    it('two distinct inputs that sanitize away entirely do not alias', () => {
+      const a = studioPathSegment(':::', 'project');
+      const b = studioPathSegment('___', 'project');
+      expect(a).not.toBe(b);
+      expect(a).not.toBe('project');
+      expect(b).not.toBe('project');
     });
   });
 });

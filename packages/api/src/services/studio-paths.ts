@@ -60,11 +60,15 @@ function segmentHash(input: string): string {
  */
 export function studioPathSegment(input: string | null | undefined, fallback: string): string {
   const raw = input || '';
+  if (!raw) return fallback;
   const cleaned = raw
     .toLowerCase()
     .replace(/[^a-z0-9-]+/g, '-')
     .replace(/^-+|-+$/g, '');
-  if (!cleaned) return fallback;
+  // A NON-EMPTY input that sanitizes away entirely still needs the digest:
+  // ':::' and '___' must not share the bare fallback directory (r2). Only
+  // genuinely absent input gets the plain fallback.
+  if (!cleaned) return `${fallback}-h${segmentHash(raw)}`;
   if (cleaned === raw && raw.length <= 100) return cleaned;
   const base = cleaned.slice(0, 91).replace(/-+$/g, '');
   return `${base}-h${segmentHash(raw)}`;

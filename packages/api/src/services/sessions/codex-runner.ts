@@ -152,19 +152,22 @@ export class CodexRunner implements IRunner {
     const args: string[] = config.sandboxBypass
       ? ['--dangerously-bypass-approvals-and-sandbox', 'exec']
       : ['-a', 'never', 'exec'];
-    if (isResume) {
-      args.push('resume');
-    }
-
-    args.push('--json');
 
     // Ephemeral-studio root (spec:studio-materialization v8): writable
     // alongside the primary workspace, on BOTH the fresh and resume shapes —
     // Codex defaults to workspace-write, so without this a Codex session can
     // have the host MCP mint a studio it then cannot edit, build, or test
-    // (PR #544 r1 P1). The run path ensures the directory exists first.
+    // (PR #544 r1 P1). Placement matters: `--add-dir` is valid on `exec` but
+    // NOT on the `exec resume` subcommand ("unexpected argument", r2), so it
+    // must precede `resume` — exec scope applies to the resumed session too.
+    // The run path ensures the directory exists first.
     args.push('--add-dir', inkStudiosRoot());
 
+    if (isResume) {
+      args.push('resume');
+    }
+
+    args.push('--json');
     args.push('-c', `model_instructions_file=${promptPath}`);
 
     // Ink MCP server — fully defined via -c overrides so the spawn never

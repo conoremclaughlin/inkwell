@@ -757,11 +757,13 @@ describe('CodexRunner ephemeral-studio root grant', () => {
           .map((arg, i) => (arg === '--add-dir' ? args[i + 1] : null))
           .filter(Boolean);
         expect(granted).toContain(process.env.INK_STUDIOS_ROOT);
-        // The flag must land inside the exec/resume subcommand scope, not
-        // before it — codex scopes flags to the subcommand they follow.
+        // r2: `--add-dir` is valid on `exec` but REJECTED by the
+        // `exec resume` subcommand ("unexpected argument", verified against
+        // the installed binary). exec scope applies to the resumed session,
+        // so the required order is exec < --add-dir < resume.
         expect(args.indexOf('--add-dir')).toBeGreaterThan(args.indexOf('exec'));
         if (isResume) {
-          expect(args.indexOf('--add-dir')).toBeGreaterThan(args.indexOf('resume'));
+          expect(args.indexOf('--add-dir')).toBeLessThan(args.indexOf('resume'));
         }
       }
     } finally {
