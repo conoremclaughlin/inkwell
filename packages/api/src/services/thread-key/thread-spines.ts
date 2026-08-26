@@ -139,6 +139,39 @@ export interface MergeThreadSpinesInput {
   parse: (key: string) => { project: string | null; type: string; id: string } | null;
 }
 
+/**
+ * Keys referenced by sessions/studios/groups that have no row in the fetched
+ * thread window. The list feed is capped to the newest threads, but a carrier
+ * can reference an older real thread — merging without its row would fabricate
+ * a "no thread yet" state and re-parse a key whose identity is already pinned
+ * (the reinterpretation the grammar spec forbids). The route hydrates thread
+ * rows for exactly these keys before merging.
+ */
+export function missingThreadKeys(
+  fetchedThreadKeys: Iterable<string>,
+  sessions: SpineSessionRow[],
+  studios: SpineStudioRow[],
+  groups: SpineGroupRow[]
+): string[] {
+  const have = new Set(fetchedThreadKeys);
+  const missing = new Set<string>();
+  const consider = (key: string | null) => {
+    if (key && !have.has(key)) missing.add(key);
+  };
+  for (const s of sessions) {
+    consider(s.threadKey);
+    consider(s.activeThreadKey);
+  }
+  for (const st of studios) {
+    consider(st.threadKey);
+    consider(st.leaseThreadKey);
+  }
+  for (const g of groups) {
+    consider(g.threadKey);
+  }
+  return [...missing];
+}
+
 interface WorkingSpine {
   key: string;
   identity: SpineIdentity | null;

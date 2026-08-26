@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   mergeThreadSpines,
+  missingThreadKeys,
   type SpineGroupRow,
   type SpineSessionRow,
   type SpineStudioRow,
@@ -182,5 +183,71 @@ describe('mergeThreadSpines', () => {
 
     expect(spines.map((s) => s.key)).toEqual(['pr:2', 'pr:3', 'pr:1']);
     expect(spines[0].sessions.map((s) => s.id)).toEqual(['s-new', 's-old']);
+  });
+});
+
+describe('missingThreadKeys', () => {
+  it('collects every carrier key absent from the fetched window, deduped', () => {
+    const keys = missingThreadKeys(
+      ['pr:1'],
+      [session({ threadKey: 'pr:1', activeThreadKey: 'pr:2' })],
+      [studio({ threadKey: 'spec:a', leaseThreadKey: 'pr:2' })],
+      [group({ threadKey: 'task:x' })]
+    );
+    expect(keys.sort()).toEqual(['pr:2', 'spec:a', 'task:x']);
+  });
+
+  it('returns nothing when the window already covers all carriers', () => {
+    expect(
+      missingThreadKeys(
+        ['pr:1', 'spec:a'],
+        [session({ threadKey: 'pr:1' })],
+        [studio({ threadKey: 'spec:a' })],
+        []
+      )
+    ).toEqual([]);
+  });
+
+  it('boundary: a pinned thread omitted by the window is re-fetched, never re-parsed', () => {
+    // A session references an old thread that fell past the list cap. The
+    // route asks missingThreadKeys which rows to hydrate; once the hydrated
+    // row is in the merge input, the spine keeps its DB-pinned identity and
+    // its thread — the parser must never see the key.
+    const oldKey = 'inkread:pr:12';
+    const carrier = session({ threadKey: oldKey, updatedAt: at(3) });
+
+    const toHydrate = missingThreadKeys([], [carrier], [], []);
+    expect(toHydrate).toEqual([oldKey]);
+
+    let parserCalls = 0;
+    const spines = mergeThreadSpines({
+      threads: [
+        thread({
+          threadKey: oldKey,
+          keyProject: 'inkread',
+          keyType: 'pr',
+          keyId: '12',
+          status: 'closed',
+          updatedAt: at(1),
+        }),
+      ],
+      sessions: [carrier],
+      studios: [],
+      groups: [],
+      parse: () => {
+        parserCalls += 1;
+        return { project: null, type: 'wrong', id: 'wrong' };
+      },
+    });
+
+    expect(spines).toHaveLength(1);
+    expect(spines[0].thread).not.toBeNull();
+    expect(spines[0].identity).toEqual({
+      project: 'inkread',
+      type: 'pr',
+      id: '12',
+      pinned: true,
+    });
+    expect(parserCalls).toBe(0);
   });
 });
