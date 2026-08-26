@@ -8,6 +8,7 @@ import { Input } from '@/components/ui/input';
 import {
   Activity,
   AlertTriangle,
+  ChevronLeft,
   GitBranch,
   Hash,
   ListTodo,
@@ -108,6 +109,7 @@ interface ThreadMessagesResponse {
     priority: string;
     createdAt: string;
   }>;
+  meta?: FeedMeta;
 }
 
 // ─── Helpers ───
@@ -241,7 +243,7 @@ export default function ThreadsPage() {
   const warnings: string[] = [];
   if (data?.meta.threads.truncated) {
     warnings.push(
-      `Showing ${data.meta.threads.fetched} of ${data.meta.threads.total} threads — older threads are not listed.`
+      `Showing ${data.meta.threads.fetched} of ${data.meta.threads.total} threads — older conversations without live sessions, leases, or task groups are not listed.`
     );
   }
   if (data?.meta.sessions.truncated) {
@@ -259,7 +261,7 @@ export default function ThreadsPage() {
   }
 
   return (
-    <div className="flex h-full flex-col gap-4 p-6">
+    <div className="flex h-full flex-col gap-4 p-0 md:p-6">
       <div>
         <h1 className="text-2xl font-semibold">Threads</h1>
         <p className="text-sm text-muted-foreground">
@@ -308,7 +310,7 @@ export default function ThreadsPage() {
           placeholder="Search key, title, participant…"
           value={search}
           onChange={(e) => setSearch(e.target.value)}
-          className="h-8 w-64"
+          className="h-8 w-full sm:w-64"
         />
         {typeCounts.map(([type, count]) => (
           <button
@@ -333,8 +335,14 @@ export default function ThreadsPage() {
         </div>
       )}
 
-      <div className="flex min-h-0 flex-1 gap-4">
-        <div className="w-[380px] shrink-0 overflow-y-auto rounded-md border">
+      {/* Mobile drills into the detail pane; desktop shows both side by side. */}
+      <div className="flex min-h-0 flex-1 flex-col gap-4 md:flex-row">
+        <div
+          className={clsx(
+            'w-full overflow-y-auto rounded-md border md:block md:w-[380px] md:shrink-0',
+            selectedKey && 'hidden'
+          )}
+        >
           {isLoading && (
             <div className="p-4 text-sm text-muted-foreground">Loading thread spines…</div>
           )}
@@ -391,9 +399,14 @@ export default function ThreadsPage() {
           })}
         </div>
 
-        <div className="min-w-0 flex-1 overflow-y-auto rounded-md border">
+        <div
+          className={clsx(
+            'min-w-0 flex-1 overflow-y-auto rounded-md border md:block',
+            !selectedKey && 'hidden'
+          )}
+        >
           {selected ? (
-            <SpineDetail spine={selected} />
+            <SpineDetail spine={selected} onBack={() => setSelectedKey(null)} />
           ) : (
             <div className="flex h-full items-center justify-center p-8 text-sm text-muted-foreground">
               Select a thread to see everything on its key.
@@ -407,7 +420,7 @@ export default function ThreadsPage() {
 
 // ─── Detail pane ───
 
-function SpineDetail({ spine }: { spine: ThreadSpine }) {
+function SpineDetail({ spine, onBack }: { spine: ThreadSpine; onBack: () => void }) {
   const { data: messagesData, isLoading: messagesLoading } = useApiQuery<ThreadMessagesResponse>(
     ['thread-messages', spine.key],
     `/api/admin/threads/messages?key=${encodeURIComponent(spine.key)}`,
@@ -416,6 +429,14 @@ function SpineDetail({ spine }: { spine: ThreadSpine }) {
 
   return (
     <div className="flex flex-col gap-4 p-4">
+      <button
+        type="button"
+        onClick={onBack}
+        className="flex items-center gap-1 self-start text-xs text-muted-foreground hover:text-foreground md:hidden"
+      >
+        <ChevronLeft className="h-3.5 w-3.5" />
+        All threads
+      </button>
       <div>
         <div className="flex flex-wrap items-center gap-2">
           <Hash className="h-4 w-4 text-muted-foreground" />
@@ -530,6 +551,13 @@ function SpineDetail({ spine }: { spine: ThreadSpine }) {
           <div className="p-2 text-xs text-muted-foreground">Loading messages…</div>
         ) : (
           <div className="flex flex-col gap-2">
+            {messagesData?.meta?.truncated && (
+              <div className="flex items-center gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-600">
+                <AlertTriangle className="h-3 w-3 shrink-0" />
+                Showing the latest {messagesData.meta.fetched} of {messagesData.meta.total}{' '}
+                messages.
+              </div>
+            )}
             {(messagesData?.messages ?? []).map((m) => (
               <div key={m.id} className="rounded-md border px-3 py-2">
                 <div className="flex items-center gap-2 text-[10px] text-muted-foreground">
