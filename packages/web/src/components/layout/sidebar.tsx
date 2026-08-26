@@ -20,6 +20,7 @@ import {
   Activity,
   Route,
   MessageSquare,
+  MessagesSquare,
   ListTodo,
   Swords,
   KeyRound,
@@ -67,6 +68,7 @@ const mainNav: NavGroup[] = [
     items: [
       { name: 'Individuals', href: '/individuals', icon: Bot },
       { name: 'Tasks', href: '/tasks', icon: ListTodo },
+      { name: 'Threads', href: '/threads', icon: MessagesSquare },
       { name: 'Documents', href: '/artifacts', icon: FileText },
       { name: 'Messaging', href: '/messaging', icon: MessageSquare },
       { name: 'Skills', href: '/skills', icon: Puzzle },
