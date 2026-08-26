@@ -49,6 +49,9 @@ import {
 import type { Database } from '../data/supabase/types';
 import { applyGraphBlockedBy } from '../data/task-graph-read-model';
 import { isLeaseStale, type StudioLease } from '../services/studio-lease.service';
+import { ThreadKeyService } from '../services/thread-key/thread-key.service';
+import { parseThreadKey } from '../services/thread-key/parser';
+import { mergeThreadSpines } from '../services/thread-key/thread-spines';
 import { activityBus } from '../services/events/activity-bus';
 import type { Activity } from '../data/repositories/activity-stream.repository';
 import {
@@ -6547,6 +6550,264 @@ router.post('/skills/manage/:skillId/fork', async (req: Request, res: Response) 
     logger.error('Failed to fork skill:', error);
     const message = error instanceof Error ? error.message : 'Failed to fork skill';
     res.status(500).json(errorJson(message, error));
+  }
+});
+
+// =============================================================================
+// Thread spines — browse everything by threadKey
+// =============================================================================
+
+/**
+ * GET /api/admin/threads
+ *
+ * One row per threadKey the system knows about, merged across all four
+ * carriers: inbox threads (the conversation), sessions (anchor + active
+ * focus), studios (affinity + live lease), and task groups (workflow
+ * instances). A key that only a session references — work begun, nothing
+ * announced — is a first-class row with `thread: null`, not an absence.
+ * Merge semantics live in services/thread-key/thread-spines.ts.
+ */
+router.get('/threads', async (req: Request, res: Response) => {
+  try {
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const authReq = req as AdminAuthRequest;
+    const userId = authReq.pcpUserId;
+
+    // Reported caps, same contract as /tasks and /task-groups: the response
+    // says what was dropped instead of silently truncating.
+    const THREADS_CAP = 500;
+    const SESSIONS_CAP = 500;
+    const GROUPS_CAP = 500;
+
+    const [threadsRes, sessionsRes, studiosRes, groupsRes] = await Promise.all([
+      supabase
+        .from('inbox_threads')
+        .select(
+          'id, thread_key, key_project, key_type, key_id, title, status, created_by_agent_id, updated_at, closed_at',
+          { count: 'exact' }
+        )
+        .eq('user_id', userId)
+        .order('updated_at', { ascending: false })
+        .limit(THREADS_CAP),
+      supabase
+        .from('sessions')
+        .select(
+          'id, agent_id, lifecycle, status, current_phase, thread_key, active_thread_key, updated_at, studio_id',
+          { count: 'exact' }
+        )
+        .eq('user_id', userId)
+        .or('thread_key.not.is.null,active_thread_key.not.is.null')
+        .order('updated_at', { ascending: false })
+        .limit(SESSIONS_CAP),
+      supabase
+        .from('studios')
+        .select('id, slug, branch, agent_id, thread_key, lease, updated_at')
+        .eq('user_id', userId)
+        .neq('status', 'cleaned'),
+      supabase
+        .from('task_groups')
+        .select('id, title, status, thread_key, execution_model, execution_phase, updated_at', {
+          count: 'exact',
+        })
+        .eq('user_id', userId)
+        .not('thread_key', 'is', null)
+        .order('updated_at', { ascending: false })
+        .limit(GROUPS_CAP),
+    ]);
+
+    const failed = [threadsRes, sessionsRes, studiosRes, groupsRes].find((r) => r.error);
+    if (failed?.error) {
+      logger.error('Failed to list thread spines:', failed.error);
+      res.status(500).json(errorJson('Failed to list threads', failed.error));
+      return;
+    }
+
+    const threadRows = threadsRes.data || [];
+
+    // Participants in one query, filtered through the thread join rather
+    // than .in(threadIds): 500 UUIDs in a PostgREST .in() is a ~20KB GET
+    // URL, which the server rejects with "URI too long" (found live). The
+    // join may return participants for threads past the cap; the map lookup
+    // below only consults fetched ones.
+    const participantsByThreadId = new Map<string, string[]>();
+    if (threadRows.length > 0) {
+      const { data: participantRows, error: participantsError } = await supabase
+        .from('inbox_thread_participants')
+        .select('thread_id, agent_id, inbox_threads!inner(user_id)')
+        .eq('inbox_threads.user_id', userId);
+      if (participantsError) {
+        logger.error('Failed to list thread participants:', participantsError);
+        res.status(500).json(errorJson('Failed to list threads', participantsError));
+        return;
+      }
+      for (const row of participantRows || []) {
+        const list = participantsByThreadId.get(row.thread_id) ?? [];
+        list.push(row.agent_id);
+        participantsByThreadId.set(row.thread_id, list);
+      }
+    }
+
+    // Provisional identity for keys with no pinned thread row. Fail-closed
+    // per the grammar spec: an unreadable slug registry degrades to
+    // "identity unknown" for those keys, never to a wrong identity parsed
+    // against an empty slug set — and never fails the whole browse.
+    let parse: (key: string) => { project: string | null; type: string; id: string } | null;
+    let parseUnavailable = false;
+    try {
+      const slugLookup = await new ThreadKeyService(
+        supabase as SupabaseClient<Database>
+      ).projectSlugLookup(userId);
+      parse = (key) => parseThreadKey(key, slugLookup);
+    } catch (error) {
+      logger.warn('Thread spine slug lookup failed; provisional identities disabled:', error);
+      parse = () => null;
+      parseUnavailable = true;
+    }
+
+    const spines = mergeThreadSpines({
+      threads: threadRows.map((t) => ({
+        threadKey: t.thread_key,
+        keyProject: t.key_project ?? null,
+        keyType: t.key_type ?? null,
+        keyId: t.key_id ?? null,
+        title: t.title ?? null,
+        status: t.status,
+        createdByAgentId: t.created_by_agent_id,
+        updatedAt: t.updated_at,
+        closedAt: t.closed_at ?? null,
+        participants: participantsByThreadId.get(t.id) ?? [],
+      })),
+      sessions: (sessionsRes.data || []).map((s) => ({
+        id: s.id,
+        agentId: s.agent_id ?? null,
+        lifecycle: s.lifecycle ?? null,
+        status: s.status ?? null,
+        currentPhase: s.current_phase ?? null,
+        threadKey: s.thread_key ?? null,
+        activeThreadKey: s.active_thread_key ?? null,
+        updatedAt: s.updated_at,
+        studioId: s.studio_id ?? null,
+      })),
+      studios: (studiosRes.data || []).map((st) => {
+        const lease = describeLease(st.lease);
+        return {
+          id: st.id,
+          slug: st.slug ?? null,
+          branch: st.branch,
+          agentId: st.agent_id,
+          threadKey: st.thread_key ?? null,
+          leaseThreadKey: lease?.threadKey ?? null,
+          leaseAgentId: lease?.agentId ?? null,
+          updatedAt: st.updated_at,
+        };
+      }),
+      groups: (groupsRes.data || []).map((g) => ({
+        id: g.id,
+        title: g.title,
+        status: g.status ?? null,
+        threadKey: g.thread_key,
+        executionModel: g.execution_model ?? null,
+        executionPhase: g.execution_phase ?? null,
+        updatedAt: g.updated_at,
+      })),
+      parse,
+    });
+
+    const capMeta = (fetched: number, total: number | null, cap: number) => ({
+      fetched,
+      total: total ?? fetched,
+      truncated: (total ?? fetched) > cap,
+    });
+
+    res.json({
+      spines,
+      meta: {
+        threads: capMeta(threadRows.length, threadsRes.count, THREADS_CAP),
+        sessions: capMeta((sessionsRes.data || []).length, sessionsRes.count, SESSIONS_CAP),
+        taskGroups: capMeta((groupsRes.data || []).length, groupsRes.count, GROUPS_CAP),
+        parseUnavailable,
+      },
+    });
+  } catch (error) {
+    logger.error('Failed to list thread spines:', error);
+    res.status(500).json(errorJson('Failed to list threads', error));
+  }
+});
+
+/**
+ * GET /api/admin/threads/messages?key=<threadKey>
+ *
+ * Conversation for one threadKey. The key rides a query param, not a path
+ * segment — keys contain colons and slashes. A key with no thread row is a
+ * valid answer ({ thread: null }), not a 404: the browse page shows those
+ * keys as "no thread yet".
+ */
+router.get('/threads/messages', async (req: Request, res: Response) => {
+  try {
+    const key = typeof req.query.key === 'string' ? req.query.key : '';
+    if (!key) {
+      res.status(400).json({ error: 'key query parameter is required' });
+      return;
+    }
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const authReq = req as AdminAuthRequest;
+
+    const { data: thread, error: threadError } = await supabase
+      .from('inbox_threads')
+      .select('id, thread_key, title, status, created_by_agent_id, created_at, closed_at')
+      .eq('user_id', authReq.pcpUserId)
+      .eq('thread_key', key)
+      .maybeSingle();
+    if (threadError) {
+      logger.error('Failed to load thread:', threadError);
+      res.status(500).json(errorJson('Failed to load thread messages', threadError));
+      return;
+    }
+    if (!thread) {
+      res.json({ thread: null, messages: [] });
+      return;
+    }
+
+    // Newest 100 fetched descending, served ascending for display.
+    const { data: messageRows, error: messagesError } = await supabase
+      .from('inbox_thread_messages')
+      .select('id, sender_agent_id, content, message_type, priority, created_at')
+      .eq('thread_id', thread.id)
+      .order('created_at', { ascending: false })
+      .limit(100);
+    if (messagesError) {
+      logger.error('Failed to load thread messages:', messagesError);
+      res.status(500).json(errorJson('Failed to load thread messages', messagesError));
+      return;
+    }
+
+    res.json({
+      thread: {
+        threadKey: thread.thread_key,
+        title: thread.title ?? null,
+        status: thread.status,
+        createdByAgentId: thread.created_by_agent_id,
+        createdAt: thread.created_at,
+        closedAt: thread.closed_at ?? null,
+      },
+      messages: (messageRows || [])
+        .map((m) => ({
+          id: m.id,
+          senderAgentId: m.sender_agent_id,
+          content: m.content,
+          messageType: m.message_type,
+          priority: m.priority,
+          createdAt: m.created_at,
+        }))
+        .reverse(),
+    });
+  } catch (error) {
+    logger.error('Failed to load thread messages:', error);
+    res.status(500).json(errorJson('Failed to load thread messages', error));
   }
 });
 
