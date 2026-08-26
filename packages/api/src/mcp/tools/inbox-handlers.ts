@@ -12,7 +12,14 @@ import { resolveIdentityId, resolveAgentSlug } from '../../auth/resolve-identity
 import { advanceThreadReadPointer, advanceAgentInboxReadPointer } from './read-state.js';
 import { getEffectiveAgentId } from '../../auth/enforce-identity';
 import { logger } from '../../utils/logger';
-import type { Json } from '../../data/supabase/types';
+import type { SupabaseClient } from '@supabase/supabase-js';
+import type { Database, Json } from '../../data/supabase/types';
+import { ThreadKeyService } from '../../services/thread-key/thread-key.service';
+import {
+  detectUnregisteredProjectPrefix,
+  describeUnregisteredProjectPrefix,
+  mayHaveProjectPrefix,
+} from '../../services/thread-key/unregistered-prefix';
 import {
   getRequestContext,
   getSessionContext,
@@ -282,6 +289,53 @@ const getAgentSummariesSchema = userIdentifierBaseSchema.extend({
 
 // ============== Handlers ==============
 
+/**
+ * Warn when a thread key is about to pin an intended project prefix as a type.
+ *
+ * Advisory only. An unregistered first segment is legal — the parsers accept
+ * unknown types deliberately — so this must not block a send. It exists
+ * because the alternative is silence: the key records a different identity
+ * than the sender meant, permanently, and nothing reports it.
+ *
+ * Never throws. A registry that cannot be read is a reason to stay quiet, not
+ * a reason to fail someone's message.
+ */
+async function warnOnUnregisteredProjectPrefix(
+  supabase: SupabaseClient<Database>,
+  userId: string,
+  threadKey: string
+): Promise<string | undefined> {
+  // Skip the registry entirely for keys that could never warn. Two-segment
+  // keys are the common case, and this is on the first-send path.
+  if (!mayHaveProjectPrefix(threadKey)) return undefined;
+
+  try {
+    const service = new ThreadKeyService(supabase);
+    const [slugLookup, knownTypes] = await Promise.all([
+      service.projectSlugLookup(userId),
+      service.knownTypeNames(userId),
+    ]);
+
+    const found = detectUnregisteredProjectPrefix(threadKey, slugLookup, knownTypes);
+    if (!found) return undefined;
+
+    const message = describeUnregisteredProjectPrefix(threadKey, found);
+    logger.warn('Thread key uses an unregistered project prefix', {
+      userId,
+      threadKey,
+      suspectedProject: found.suspectedProject,
+      pinnedAsType: found.pinnedAsType,
+    });
+    return message;
+  } catch (error) {
+    logger.debug('Could not check thread key prefix', {
+      threadKey,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return undefined;
+  }
+}
+
 export async function handleSendToInbox(args: unknown, dataComposer: DataComposer) {
   const supabase = dataComposer.getClient();
   const parsed = sendToInboxSchema.parse(args);
@@ -431,11 +485,19 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
   // Single-recipient with threadKey creates a 2-participant thread (spec invariant #5).
   // recipients[] creates a multi-participant thread.
   // Without threadKey, falls through to legacy agent_inbox path.
+  let prefixWarning: string | undefined;
+
   if (threadKey) {
     const allRecipients = recipients || [recipientAgentId!];
 
     // Check if thread already exists — determines reply vs create behavior
     const existingThread = await findExistingThread(supabase, resolved.user.id, threadKey);
+
+    // Only meaningful before creation: an existing thread's identity was pinned
+    // when it was made and cannot be revised now.
+    if (!existingThread) {
+      prefixWarning = await warnOnUnregisteredProjectPrefix(supabase, resolved.user.id, threadKey);
+    }
 
     // ── Reply semantics: enforce participant membership and closed-thread rejection ──
     if (existingThread) {
@@ -840,6 +902,9 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
             threadKey,
             threadId: thread.id,
             isNewThread: thread.isNew,
+            // Distinct from `warning` below so a key problem and a session
+            // problem can both be reported on the same send.
+            ...(prefixWarning ? { threadKeyWarning: prefixWarning } : {}),
             recipients: allRecipients,
             participants: allParticipants,
             messageType,
