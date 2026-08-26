@@ -37,6 +37,7 @@ import type {
   ToolCall,
 } from './types.js';
 import { formatInjectedContext } from './context-builder.js';
+import { inkStudiosRoot, ensureInkStudiosRoot } from '../studio-paths.js';
 import { logger } from '../../utils/logger.js';
 import { resolveBinaryPath, buildSpawnPath } from './resolve-binary.js';
 import { buildSessionEnv, resolveSpawnTarget } from '@inklabs/shared';
@@ -333,6 +334,10 @@ export class AntigravityRunner implements IRunner {
 
     try {
       const bridgePath = config.pcpAccessToken ? await this.ensureGlobalMcpConfig() : undefined;
+
+      // The --add-dir grant requires the directory to exist; async so the
+      // event loop is never blocked.
+      await ensureInkStudiosRoot();
 
       const args = buildAgyArgs(fullMessage, config, backendSessionId);
       logger.info('Spawning Antigravity CLI', {
@@ -841,6 +846,14 @@ export function buildAgyArgs(
     '--print-timeout',
     `${PRINT_TIMEOUT_SECONDS}s`,
   ];
+
+  // Ephemeral-studio root (spec:studio-materialization v8, PR #544 r3):
+  // agy's workspace grant. --dangerously-skip-permissions approves prompts
+  // but does NOT add a workspace directory, so without this an agy session
+  // can have the host MCP mint a studio it cannot edit, build, or test.
+  // One flat arg shape covers fresh and resume; the run path ensures the
+  // directory exists first.
+  args.push('--add-dir', inkStudiosRoot());
 
   if (resumeConversationId) {
     args.push('--conversation', resumeConversationId);
