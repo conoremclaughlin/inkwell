@@ -61,15 +61,23 @@ describe('ephemeralWorktreePath', () => {
 });
 
 describe('studioPathSegment', () => {
-  it('lowercases and hyphenates unsafe characters', () => {
-    expect(studioPathSegment('Wren Agent!', 'x')).toBe('wren-agent');
-    expect(studioPathSegment('pr:537', 'x')).toBe('pr-537');
+  it('lowercases and hyphenates unsafe characters, digest-suffixed', () => {
+    expect(studioPathSegment('Wren Agent!', 'x')).toMatch(/^wren-agent-h[a-z0-9]+$/);
+    expect(studioPathSegment('pr:537', 'x')).toMatch(/^pr-537-h[a-z0-9]+$/);
+  });
+
+  it('passes already-canonical inputs through byte-for-byte', () => {
+    expect(studioPathSegment('ok', 'fallback')).toBe('ok');
+    expect(studioPathSegment('wren', 'x')).toBe('wren');
+    expect(studioPathSegment('lumen-review--pr-476-h1a2b3', 'x')).toBe(
+      'lumen-review--pr-476-h1a2b3'
+    );
   });
 
   it('neutralizes path traversal — dots never survive', () => {
     expect(studioPathSegment('..', 'x')).toBe('x');
-    expect(studioPathSegment('../../etc', 'x')).toBe('etc');
-    expect(studioPathSegment('.hidden', 'x')).toBe('hidden');
+    expect(studioPathSegment('../../etc', 'x')).toMatch(/^etc-h[a-z0-9]+$/);
+    expect(studioPathSegment('.hidden', 'x')).toMatch(/^hidden-h[a-z0-9]+$/);
     // No sanitized segment can contain a separator or a dot.
     for (const hostile of ['a/b', 'a\\b', '..', 'a..b', './x']) {
       const seg = studioPathSegment(hostile, 'fallback');
@@ -77,17 +85,47 @@ describe('studioPathSegment', () => {
     }
   });
 
-  it('trims leading/trailing hyphens and caps length', () => {
-    expect(studioPathSegment('--edge--', 'x')).toBe('edge');
-    expect(studioPathSegment('a'.repeat(300), 'x')).toHaveLength(100);
-    // The cap must not leave a dangling hyphen at the cut point.
+  it('trims leading/trailing hyphens and caps length without a dangling hyphen', () => {
+    expect(studioPathSegment('--edge--', 'x')).toMatch(/^edge-h[a-z0-9]+$/);
+    expect(studioPathSegment('a'.repeat(300), 'x').length).toBeLessThanOrEqual(100);
     const capped = studioPathSegment(`${'a'.repeat(99)}-tail`, 'x');
-    expect(capped.endsWith('-')).toBe(false);
+    expect(capped.length).toBeLessThanOrEqual(100);
+    expect(capped).not.toMatch(/-h[a-z0-9]+-/); // digest is terminal
   });
 
   it('uses the fallback only when nothing survives sanitization', () => {
     expect(studioPathSegment(':::', 'fallback')).toBe('fallback');
     expect(studioPathSegment(undefined, 'fallback')).toBe('fallback');
-    expect(studioPathSegment('ok', 'fallback')).toBe('ok');
+  });
+
+  // PR #544 r1 P1 (Lumen): sanitization and truncation are many-to-one.
+  // Every transformed/truncated output carries a digest of the ORIGINAL so
+  // distinct inputs can never share a directory.
+  describe('alias resistance', () => {
+    it('two long slugs differing past the cap do not alias', () => {
+      const a = studioPathSegment(`${'a'.repeat(100)}--pr-1`, 'x');
+      const b = studioPathSegment(`${'a'.repeat(100)}--pr-2`, 'x');
+      expect(a).not.toBe(b);
+      expect(a.length).toBeLessThanOrEqual(100);
+      expect(b.length).toBeLessThanOrEqual(100);
+    });
+
+    it('case normalization does not alias onto a canonical input', () => {
+      expect(studioPathSegment('A-b', 'x')).not.toBe(studioPathSegment('a-b', 'x'));
+      expect(studioPathSegment('a-b', 'x')).toBe('a-b');
+    });
+
+    it('punctuation normalization does not alias onto a canonical input', () => {
+      expect(studioPathSegment('pr:1', 'x')).not.toBe(studioPathSegment('pr-1', 'x'));
+      expect(studioPathSegment('pr-1', 'x')).toBe('pr-1');
+    });
+
+    it('hyphen trimming does not alias onto a canonical input', () => {
+      expect(studioPathSegment('--edge--', 'x')).not.toBe(studioPathSegment('edge', 'x'));
+    });
+
+    it('is deterministic — the digest is a function of the input alone', () => {
+      expect(studioPathSegment('PR:537', 'x')).toBe(studioPathSegment('PR:537', 'x'));
+    });
   });
 });

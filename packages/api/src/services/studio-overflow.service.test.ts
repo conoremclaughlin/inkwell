@@ -7,7 +7,7 @@
  */
 
 import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
-import { mkdtemp, rm } from 'fs/promises';
+import { mkdtemp, mkdir, rm } from 'fs/promises';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { tmpdir } from 'os';
@@ -672,11 +672,30 @@ describe('StudioOverflowService — canonical ephemeral root (spec v8)', () => {
   // path no longer encodes it. The expectation is hand-built — using the
   // helper here would let a helper bug self-certify.
   it('ephemeral mints materialize under the root with an explicit slug', async () => {
-    const repoRoot = await makeGitRepo();
+    // A canonical repo basename, so the hand-built expectation needs no
+    // digest arithmetic (mkdtemp basenames are mixed-case → digest-suffixed).
+    const holder = await mkdtemp(path.join(tmpdir(), 'overflow-canon-'));
+    const repoRoot = path.join(holder, 'inkwell-fixture');
+    await mkdir(repoRoot);
+    await execFileAsync('git', ['init', '-b', 'main'], { cwd: repoRoot });
+    await execFileAsync(
+      'git',
+      [
+        '-c',
+        'user.email=test@test',
+        '-c',
+        'user.name=test',
+        'commit',
+        '--allow-empty',
+        '-m',
+        'init',
+      ],
+      { cwd: repoRoot }
+    );
     const expected = path.join(
       studiosRootOverride,
       'lumen',
-      path.basename(repoRoot).toLowerCase(),
+      'inkwell-fixture',
       'lumen-review--pr-476'
     );
     try {
@@ -710,7 +729,7 @@ describe('StudioOverflowService — canonical ephemeral root (spec v8)', () => {
       await execFileAsync('git', ['worktree', 'remove', '--force', expected], {
         cwd: repoRoot,
       }).catch(() => undefined);
-      await rm(repoRoot, { recursive: true, force: true });
+      await rm(holder, { recursive: true, force: true });
     }
   });
 

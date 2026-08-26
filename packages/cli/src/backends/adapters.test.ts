@@ -360,6 +360,69 @@ describe('backend adapters session resume wiring', () => {
     }
   });
 
+  // PR #544 r1 P1 — the studios-root grant is a per-backend obligation, not a
+  // Claude feature. Codex defaults to workspace-write: without --add-dir the
+  // host MCP can mint a studio the session cannot edit, build, or test. The
+  // flag must ride BOTH shapes; codex scopes flags to the subcommand they
+  // follow, so on resume it must land after `resume`.
+  it('codex adapter grants --add-dir for the ephemeral-studio root (fresh and resume)', () => {
+    const prevRoot = process.env.INK_STUDIOS_ROOT;
+    process.env.INK_STUDIOS_ROOT = join(tmpdir(), `ink-studios-codex-${process.pid}`);
+    try {
+      for (const backendSessionId of [undefined, 'codex-sess-1']) {
+        const prepared = new CodexAdapter().prepare({
+          agentId: 'lumen',
+          model: undefined,
+          promptParts: [],
+          passthroughArgs: [],
+          backendSessionId,
+        });
+        try {
+          const granted = prepared.args
+            .map((arg, i) => (arg === '--add-dir' ? prepared.args[i + 1] : null))
+            .filter(Boolean);
+          expect(granted).toContain(process.env.INK_STUDIOS_ROOT);
+          if (backendSessionId) {
+            expect(prepared.args.indexOf('--add-dir')).toBeGreaterThan(
+              prepared.args.indexOf('resume')
+            );
+          }
+        } finally {
+          prepared.cleanup();
+        }
+      }
+    } finally {
+      rmSync(process.env.INK_STUDIOS_ROOT!, { recursive: true, force: true });
+      if (prevRoot === undefined) delete process.env.INK_STUDIOS_ROOT;
+      else process.env.INK_STUDIOS_ROOT = prevRoot;
+    }
+  });
+
+  it('gemini adapter grants --include-directories for the ephemeral-studio root', () => {
+    const prevRoot = process.env.INK_STUDIOS_ROOT;
+    process.env.INK_STUDIOS_ROOT = join(tmpdir(), `ink-studios-gemini-${process.pid}`);
+    try {
+      const prepared = new GeminiAdapter().prepare({
+        agentId: 'aster',
+        model: undefined,
+        promptParts: [],
+        passthroughArgs: [],
+      });
+      try {
+        const granted = prepared.args
+          .map((arg, i) => (arg === '--include-directories' ? prepared.args[i + 1] : null))
+          .filter(Boolean);
+        expect(granted).toContain(process.env.INK_STUDIOS_ROOT);
+      } finally {
+        prepared.cleanup();
+      }
+    } finally {
+      rmSync(process.env.INK_STUDIOS_ROOT!, { recursive: true, force: true });
+      if (prevRoot === undefined) delete process.env.INK_STUDIOS_ROOT;
+      else process.env.INK_STUDIOS_ROOT = prevRoot;
+    }
+  });
+
   // ── INK_SESSION_ID env propagation ──
   // These tests verify the most fragile link in the session identity chain:
   // the CLI backends must inject INK_SESSION_ID into the spawned process's

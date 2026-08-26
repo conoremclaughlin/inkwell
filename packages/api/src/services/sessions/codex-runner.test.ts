@@ -33,6 +33,7 @@ vi.mock('child_process', async (importOriginal) => {
 
 vi.mock('fs/promises', () => ({
   access: vi.fn().mockResolvedValue(undefined),
+  mkdir: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock('./resolve-binary.js', () => ({
@@ -731,5 +732,41 @@ describe('CodexRunner token usage extraction', () => {
     ]);
 
     expect(result.usage).toBeUndefined();
+  });
+});
+
+// spec:studio-materialization v8 (PR #544 r1 P1) — Codex defaults to
+// workspace-write, so without --add-dir the host MCP can mint a studio the
+// Codex session cannot edit, build, or test. The grant must ride BOTH arg
+// shapes: `exec ...` and `exec resume <sid> ...`.
+describe('CodexRunner ephemeral-studio root grant', () => {
+  it('grants --add-dir for the studios root on fresh and resume shapes', () => {
+    const prevRoot = process.env.INK_STUDIOS_ROOT;
+    process.env.INK_STUDIOS_ROOT = join(tmpdir(), `ink-studios-codex-${process.pid}`);
+    try {
+      const runner = new CodexRunner();
+      const config = { workingDirectory: '/tmp', mcpConfigPath: '' } as never;
+      const shapes: Array<[string | undefined, boolean]> = [
+        [undefined, false],
+        ['sess-1', true],
+      ];
+      for (const [sid, isResume] of shapes) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const args: string[] = (runner as any).buildArgs(sid, isResume, 'msg', config, '/tmp/p.md');
+        const granted = args
+          .map((arg, i) => (arg === '--add-dir' ? args[i + 1] : null))
+          .filter(Boolean);
+        expect(granted).toContain(process.env.INK_STUDIOS_ROOT);
+        // The flag must land inside the exec/resume subcommand scope, not
+        // before it — codex scopes flags to the subcommand they follow.
+        expect(args.indexOf('--add-dir')).toBeGreaterThan(args.indexOf('exec'));
+        if (isResume) {
+          expect(args.indexOf('--add-dir')).toBeGreaterThan(args.indexOf('resume'));
+        }
+      }
+    } finally {
+      if (prevRoot === undefined) delete process.env.INK_STUDIOS_ROOT;
+      else process.env.INK_STUDIOS_ROOT = prevRoot;
+    }
   });
 });
