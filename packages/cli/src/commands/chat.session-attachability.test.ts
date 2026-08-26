@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
-import { isAttachableSessionSummary, listAttachableSessions } from './chat.js';
+import {
+  isAttachableSessionSummary,
+  listAttachableSessions,
+  mergeSessionsWithHistory,
+} from './chat.js';
 
 /**
  * Regression coverage for the picker erasing crashed sessions.
@@ -126,5 +130,31 @@ describe('listAttachableSessions', () => {
 
     expect(await listAttachableSessions({ callTool }, { agentId: 'myra' })).toBeNull();
     expect(callTool).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('mergeSessionsWithHistory', () => {
+  const s = (id: string, extra: Record<string, unknown> = {}) => ({ id, ...extra });
+
+  it('shows history after attachable rows — sessions are chat history, resumable unless deleted', () => {
+    const merged = mergeSessionsWithHistory(
+      [s('live-1'), s('crashed-2', { lifecycle: 'failed' })],
+      [s('live-1'), s('done-3', { lifecycle: 'completed' }), s('done-4', { status: 'completed' })]
+    );
+    expect(merged.map((x) => x.id)).toEqual(['live-1', 'crashed-2', 'done-3', 'done-4']);
+  });
+
+  it('attachable rows keep their seat — a completed flood cannot displace them', () => {
+    const history = Array.from({ length: 50 }, (_, i) =>
+      s(`done-${i}`, { lifecycle: 'completed' })
+    );
+    const merged = mergeSessionsWithHistory([s('daily-driver', { lifecycle: 'failed' })], history);
+    expect(merged[0].id).toBe('daily-driver');
+    expect(merged).toHaveLength(51);
+  });
+
+  it('handles either side empty', () => {
+    expect(mergeSessionsWithHistory([], [s('a')]).map((x) => x.id)).toEqual(['a']);
+    expect(mergeSessionsWithHistory([s('b')], []).map((x) => x.id)).toEqual(['b']);
   });
 });

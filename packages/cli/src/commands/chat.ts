@@ -1552,6 +1552,25 @@ export function isAttachableSessionSummary(session: SessionSummary): boolean {
 }
 
 /**
+ * Union of the attachable list and full history for the interactive picker.
+ *
+ * Sessions are chat history — always resumable unless deleted — so the
+ * picker shows finished ones too. The two lists stay separate fetches so a
+ * flood of completed rows can never push a live session past the history
+ * call's row limit (the limit-before-filter defect from PR #532 r2):
+ * attachable rows are guaranteed a seat first, history fills in around them.
+ * Auto-attach paths keep using the attachable list alone — a non-interactive
+ * launch should never silently resume a finished session.
+ */
+export function mergeSessionsWithHistory(
+  attachable: SessionSummary[],
+  history: SessionSummary[]
+): SessionSummary[] {
+  const seen = new Set(attachable.map((session) => session.id));
+  return [...attachable, ...history.filter((session) => !seen.has(session.id))];
+}
+
+/**
  * List the sessions this agent could attach to.
  *
  * Asks for `status: 'attachable'` so the server excludes finished sessions
@@ -3138,13 +3157,24 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // so the JSON stays machine-parseable, and before the TUI so a TTY-less
   // invocation exits instead of blocking on stdin forever.
   if (options.sessionCandidates || options.sessionCandidatesJson) {
-    const sessionsResult = await listAttachableSessions(pcp, {
-      agentId,
-      backend: 'ink',
-      limit: 50,
-    });
+    const [sessionsResult, historyResult] = await Promise.all([
+      listAttachableSessions(pcp, {
+        agentId,
+        backend: 'ink',
+        limit: 50,
+      }),
+      pcp
+        .callTool('list_sessions', { agentId, backend: 'ink', limit: 50 })
+        .catch(() => null) as Promise<Record<string, unknown> | null>,
+    ]);
     const attachable = extractSessionSummaries(sessionsResult).filter(isAttachableSessionSummary);
-    const sessions = filterSessionsByPolicy(attachable, runtime, agentId, toolPolicy, 'attach');
+    const sessions = filterSessionsByPolicy(
+      mergeSessionsWithHistory(attachable, extractSessionSummaries(historyResult)),
+      runtime,
+      agentId,
+      toolPolicy,
+      'attach'
+    );
     const candidates = sessions.map((session) => ({
       type: 'pcp' as const,
       id: session.id,
@@ -3155,6 +3185,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       threadKey: session.threadKey || null,
       studioName: session.studioName || null,
       startedAt: session.startedAt || null,
+      attachable: isAttachableSessionSummary(session),
     }));
     if (options.sessionCandidatesJson) {
       restoreConsoleLog();
@@ -3185,7 +3216,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         console.log(`  ${bits.join('  ·  ')}`);
       }
       if (candidates.length === 0) {
-        console.log(chalk.dim('  (no attachable ink sessions)'));
+        console.log(chalk.dim('  (no ink sessions)'));
       }
     }
     return;
@@ -3789,13 +3820,21 @@ export async function runChat(options: ChatOptions): Promise<void> {
     !options.attachLatest &&
     !runtime.threadKey
   ) {
-    const sessionsResult = await listAttachableSessions(pcp, {
-      agentId,
-      backend: 'ink',
-      limit: 50,
-    });
+    const [sessionsResult, historyResult] = await Promise.all([
+      listAttachableSessions(pcp, {
+        agentId,
+        backend: 'ink',
+        limit: 50,
+      }),
+      pcp
+        .callTool('list_sessions', { agentId, backend: 'ink', limit: 50 })
+        .catch(() => null) as Promise<Record<string, unknown> | null>,
+    ]);
+    const attachableSessions = extractSessionSummaries(sessionsResult).filter(
+      isAttachableSessionSummary
+    );
     const sessions = filterSessionsByPolicy(
-      extractSessionSummaries(sessionsResult).filter(isAttachableSessionSummary),
+      mergeSessionsWithHistory(attachableSessions, extractSessionSummaries(historyResult)),
       runtime,
       agentId,
       toolPolicy,
@@ -3865,8 +3904,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
       }
       // picked === null means "New session" — fall through to create one
     } else {
-      // Non-interactive or no sessions — auto-attach to latest (existing behavior)
-      const selected = pickLatestSession(sessions, undefined, { studioId: runtime.studioId });
+      // Non-interactive or no sessions — auto-attach to latest. Filters back
+      // to attachable: history rows are for the human picker; a headless
+      // launch must not silently resume a finished session.
+      const selected = pickLatestSession(sessions.filter(isAttachableSessionSummary), undefined, {
+        studioId: runtime.studioId,
+      });
       if (selected) {
         attachedSessionSummary = selected;
         runtime.sessionId = selected.id;
