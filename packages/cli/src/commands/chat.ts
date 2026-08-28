@@ -5267,6 +5267,15 @@ export async function runChat(options: ChatOptions): Promise<void> {
         // A clone asking what it can call gets its own narrower surface —
         // the same one its prompt described, not the parent's.
         audience: 'clone',
+        // And what its OWN policy will refuse, which is not the same thing:
+        // a derived clone policy inherits the parent's denials on top of the
+        // clone's, so a parent that denies `read` yields a clone that cannot
+        // read. inspectPcpTool, never canCallPcpTool — asking what exists must
+        // not spend the parent's one-use grants.
+        isHardDenied: (tool) => {
+          const decision = opts.policy.inspectPcpTool(bareToolName(tool), runtime.sessionId);
+          return !decision.allowed && !decision.promptable;
+        },
         head: (tool, args) => {
           // Non-nesting is enforced HERE, not by omitting spawn_agent from the
           // clone's prompt: tool calls travel as text, so a model can name any
@@ -5633,6 +5642,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
           return resolvedArgs;
         },
         audience: 'parent',
+        isHardDenied: (tool) => {
+          const decision = toolPolicy.inspectPcpTool(bareToolName(tool), runtime.sessionId);
+          return !decision.allowed && !decision.promptable;
+        },
         head: (tool, args) => {
           // spawn_agent is NOT a client-local policy bypass. Unlike ledger
           // tools it costs backend time and fans out authority, so it reaches

@@ -128,6 +128,13 @@ async function runDiscoveryTurn(opts: {
                   : ({ success: true } as PcpToolCallResult),
               resolveCredentials: (args) => args,
               audience: opts.audience ?? 'parent',
+              // What chat.ts wires: the LIVE policy decides visibility, so a
+              // denial the static list never heard of still hides the tool.
+              // inspectPcpTool — asking what exists must not spend grants.
+              isHardDenied: (tool) => {
+                const decision = policy.inspectPcpTool(tool, 'sess-discovery');
+                return !decision.allowed && !decision.promptable;
+              },
               // The head chat.ts gives each host, refusal included.
               head: (tool, args) => {
                 if (isClone && isForbiddenInClone(tool)) {
@@ -201,7 +208,16 @@ describe('a turn that asks what it can call', () => {
     expect(refusals).toEqual([]);
     expect(approvalsAsked).toBe(0);
     expect(result.stopReason).toBe('terminal-signal');
-    expect(continuations.join('\n')).toContain('bash');
+
+    // And the answer is honest about that profile rather than generous: minimal
+    // denies group:write, so `bash` is genuinely uncallable here and is left
+    // out, while the reads it does have are listed. This expectation used to
+    // say `toContain('bash')`, written when visibility came from the audience
+    // flag alone — the live policy is what makes it wrong.
+    const seenByModel = continuations.join('\n');
+    expect(seenByModel).toContain('read');
+    expect(seenByModel).toContain('grep');
+    expect(seenByModel).not.toContain('"bash"');
   });
 
   it('describes bash to the agent rather than denying it exists', async () => {
@@ -239,8 +255,28 @@ describe('a turn that asks what it can call', () => {
 
     const seenByModel = continuations.join('\n');
     expect(seenByModel).toContain('exists in this runtime');
-    expect(seenByModel).toContain('not available to a shadow clone');
+    // The clone's derived policy really does deny bash, so the reason given is
+    // the policy — not the catalog. Naming the check that actually excluded it
+    // is the point: a message that guessed would be a confident wrong answer
+    // about its own reasoning.
+    expect(seenByModel).toContain('denies it outright');
+    expect(seenByModel).toContain('let your parent act on it');
     // The sentence that started all of this, now wrong for a second reason.
     expect(seenByModel).not.toContain('No tool named');
+  });
+
+  it('says AUDIENCE, not policy, when the catalog is what excluded it', async () => {
+    // collect_agents is the live case for the other branch: off a clone's
+    // catalog (it cannot spawn, so it has nothing to collect) but not denied by
+    // CLONE_DENIED_TOOLS, so the policy has no opinion. Reporting a denial here
+    // would state a reason nothing checked.
+    const { continuations } = await runDiscoveryTurn({
+      audience: 'clone',
+      args: { name: 'collect_agents' },
+    });
+
+    const seenByModel = continuations.join('\n');
+    expect(seenByModel).toContain('not available to a shadow clone');
+    expect(seenByModel).not.toContain('denies it outright');
   });
 });

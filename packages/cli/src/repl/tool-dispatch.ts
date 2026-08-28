@@ -69,6 +69,13 @@ export interface LocalToolDispatchDeps {
    * Defaults to the parent's.
    */
   audience?: LocalToolAudience;
+  /**
+   * Whether the caller is hard-denied a tool — for `describe_tool`, so the
+   * answer reflects what policy will actually refuse rather than what this
+   * host advertises. Must be backed by `inspectPcpTool`; `canCallPcpTool`
+   * spends one-use grants, and asking what exists must not bill the user.
+   */
+  isHardDenied?: (tool: string) => boolean;
 }
 
 /** Strip the MCP namespace the model may emit; PcpClient wants bare names. */
@@ -220,6 +227,7 @@ export function createLocalToolDispatcher(deps: LocalToolDispatchDeps): LocalToo
       return describeToolWithLocalSurface(args, {
         audience: deps.audience ?? 'parent',
         cwd: deps.cwd,
+        isHardDenied: deps.isHardDenied,
         callServer: () => deps.callPcp(name, deps.resolveCredentials(args)),
       });
     }

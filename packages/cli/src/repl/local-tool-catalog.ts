@@ -359,27 +359,48 @@ const SCOPE_NOTE =
  * the same field.
  */
 const MERGED_SCOPE_NOTE =
-  'This list covers both namespaces reachable from this session: Inkwell MCP tools served by the server, and the tools this runtime runs in-process (named under runtimeTools).';
+  'This covers both namespaces reachable from this session: Inkwell MCP tools served by the server, and the tools this runtime runs in-process.';
 
-const CLONE_SCOPE_NOTE =
-  'Tools a shadow clone may not call are omitted from this list. Some of what remains still needs the parent to approve it at call time.';
+/**
+ * Only the list shape has `runtimeTools`. Saying so on a search or an exact
+ * lookup pointed at a field that is not there — a smaller version of the same
+ * habit that produced this PR: describing the answer instead of reading it.
+ */
+const LIST_SHAPE_NOTE = 'Runtime tools are named under runtimeTools.';
+const ENTRY_SHAPE_NOTE = 'Runtime entries carry source: "ink-runtime".';
 
-function scopeFor(audience: LocalToolAudience): string {
-  return audience === 'clone' ? `${MERGED_SCOPE_NOTE} ${CLONE_SCOPE_NOTE}` : MERGED_SCOPE_NOTE;
+const DENIAL_SCOPE_NOTE =
+  'Tools your policy denies outright are omitted. What remains is callable, though some of it needs approval at call time.';
+
+function scopeFor(shape: 'list' | 'entry', narrowed: boolean): string {
+  const parts = [MERGED_SCOPE_NOTE, shape === 'list' ? LIST_SHAPE_NOTE : ENTRY_SHAPE_NOTE];
+  if (narrowed) parts.push(DENIAL_SCOPE_NOTE);
+  return parts.join(' ');
 }
 
 /**
- * Server names this audience genuinely cannot call.
+ * "Exists, and you cannot call it" — distinct from "does not exist", which is
+ * the confusion this whole PR is about.
  *
- * `audience: 'clone'` narrowed only the local additions, so the server's half
- * still advertised `remember`, `send_response` and every other hard denial —
- * a discovery list over-reporting the surface, which is this bug in the
- * reassuring-the-other-way direction. Filtered by `CLONE_DENIED_TOOLS` and
- * nothing more: tools merely outside the clone baseline are promptable, not
- * impossible, and dropping those would under-report all over again.
+ * The two reasons are kept apart rather than merged into one comfortable
+ * sentence. A tool can be missing from a clone's catalog without any policy
+ * having been consulted, and telling the caller "policy denies it" when nothing
+ * was asked would be a confident wrong answer about its own reasoning — a
+ * smaller copy of the bug being fixed.
  */
-function visibleToAudience(name: string, audience: LocalToolAudience): boolean {
-  return audience === 'parent' || !isForbiddenInClone(name);
+function unavailableMessage(opts: {
+  tool: string;
+  where: string;
+  reason: 'policy' | 'audience';
+  audience: LocalToolAudience;
+}): string {
+  const base =
+    opts.reason === 'policy'
+      ? `"${opts.tool}" exists in ${opts.where} but your policy denies it outright — no approval will make this call succeed.`
+      : `"${opts.tool}" exists in ${opts.where} but is not available to a shadow clone.`;
+  return opts.audience === 'clone'
+    ? `${base} Report what you found and let your parent act on it.`
+    : base;
 }
 
 export interface DescribeToolLocalOptions {
@@ -387,6 +408,25 @@ export interface DescribeToolLocalOptions {
   cwd: string;
   /** Ask the Inkwell server the same question. */
   callServer: () => Promise<PcpToolCallResult>;
+  /**
+   * Whether the CALLER is hard-denied this tool — no, and no approval will
+   * change it. Answered by the live policy, not by a static list.
+   *
+   * The static `CLONE_DENIED_TOOLS` was the obvious proxy and the wrong one: a
+   * derived clone policy also inherits its PARENT's denials, so a parent that
+   * denies `read` produces a clone that cannot read while discovery went on
+   * advertising it. Reaching for the list instead of the policy is the same
+   * move that started this PR — trusting a description of the surface over the
+   * surface.
+   *
+   * MUST be backed by `inspectPcpTool`, never `canCallPcpTool`: the latter
+   * spends one-use grants, so merely asking what exists would bill the user for
+   * calls that never happen.
+   *
+   * Omitted means nothing is hidden — the honest default when no policy is at
+   * hand, since inventing denials under-reports exactly like the original bug.
+   */
+  isHardDenied?: (tool: string) => boolean;
 }
 
 /**
@@ -407,33 +447,42 @@ export async function describeToolWithLocalSurface(
 ): Promise<PcpToolCallResult> {
   const name = typeof args.name === 'string' ? args.name : undefined;
   const search = typeof args.search === 'string' ? args.search : undefined;
-  const local = listLocalTools(opts.audience);
+  const denied = (tool: string) => opts.isHardDenied?.(tool) === true;
+  // Two filters, and they answer different questions. `audience` is what this
+  // host ADVERTISES — the same catalog the system prompt renders. `denied` is
+  // what the live policy will actually REFUSE. A tool can be advertised and
+  // denied (a parent that denies `read`), so both have to apply.
+  const local = listLocalTools(opts.audience).filter((entry) => !denied(entry.name));
 
   if (name) {
     const entry = findLocalTool(name, opts.audience);
-    if (entry) {
+    if (entry && !denied(entry.name)) {
       return {
         success: true,
         tool: await describeLocalTool(entry, opts.cwd),
         note: SCOPE_NOTE,
-        scope: scopeFor(opts.audience),
+        scope: scopeFor('entry', Boolean(opts.isHardDenied)),
       };
     }
 
-    // Real here, but not for this caller. Only reachable for a clone, since a
-    // parent's lookup above searches the whole catalog.
-    //
-    // Answered here rather than left to fall through, because the server's
-    // "no tool named bash" is exactly the sentence this PR exists to stop
-    // shipping: it is true of the Inkwell namespace and false of the runtime,
-    // and the caller cannot tell which one it was told.
-    const excluded = findLocalTool(name, 'parent');
-    if (excluded) {
+    // Real, and not callable by this caller. Answered here rather than left to
+    // fall through, because the server's "no tool named bash" is the exact
+    // sentence this PR exists to stop shipping: true of the Inkwell namespace,
+    // false of the runtime, and the caller cannot tell which one it was told.
+    const known = findLocalTool(name, 'parent');
+    if (known) {
       return {
         success: false,
-        error: `"${excluded.name}" exists in this runtime but is not available to a shadow clone. Report what you found and let your parent act on it.`,
-        tool: { name: excluded.name, group: excluded.group, source: 'ink-runtime' },
-        scope: scopeFor(opts.audience),
+        error: unavailableMessage({
+          tool: known.name,
+          where: 'this runtime',
+          // Which check actually excluded it. Guessing here would state a
+          // reason nothing verified.
+          reason: denied(known.name) ? 'policy' : 'audience',
+          audience: opts.audience,
+        }),
+        tool: { name: known.name, group: known.group, source: 'ink-runtime' },
+        scope: scopeFor('entry', Boolean(opts.isHardDenied)),
       };
     }
   }
@@ -443,6 +492,21 @@ export async function describeToolWithLocalSurface(
   if (!payload) return serverResult;
 
   if (name) {
+    // The server HAS it and the caller cannot call it. Handing back the schema
+    // unchanged reads as an invitation, and the refusal arrives one call later.
+    if (payload.success !== false && denied(name)) {
+      return {
+        success: false,
+        error: unavailableMessage({
+          tool: name,
+          where: 'the Inkwell server',
+          reason: 'policy',
+          audience: opts.audience,
+        }),
+        scope: scopeFor('entry', true),
+      };
+    }
+
     // The server said no and this runtime has no such tool either — so the
     // answer stands. Offer the local near-misses anyway: a caller guessing
     // `shell` or `run_command` is looking for `bash`.
@@ -457,7 +521,7 @@ export async function describeToolWithLocalSurface(
         ...payload,
         didYouMean: [...existing, ...suggestions],
         note: SCOPE_NOTE,
-        scope: scopeFor(opts.audience),
+        scope: scopeFor('entry', Boolean(opts.isHardDenied)),
       };
     }
     return serverResult;
@@ -478,7 +542,7 @@ export async function describeToolWithLocalSurface(
       }));
     const serverMatches = (payload.tools as unknown[]).filter((tool) => {
       const toolName = (tool as { name?: unknown })?.name;
-      return typeof toolName !== 'string' || visibleToAudience(toolName, opts.audience);
+      return typeof toolName !== 'string' || !denied(toolName);
     });
     if (matches.length === 0 && serverMatches.length === (payload.tools as unknown[]).length) {
       return serverResult;
@@ -490,15 +554,13 @@ export async function describeToolWithLocalSurface(
       tools,
       hint: 'Call describe_tool with `name` to get the full parameter schema for one of these.',
       note: SCOPE_NOTE,
-      scope: scopeFor(opts.audience),
+      scope: scopeFor('entry', Boolean(opts.isHardDenied)),
     };
   }
 
   if (!Array.isArray(payload.tools)) return serverResult;
   const runtimeTools = local.map((entry) => entry.name);
-  const serverTools = (payload.tools as string[]).filter((toolName) =>
-    visibleToAudience(toolName, opts.audience)
-  );
+  const serverTools = (payload.tools as string[]).filter((toolName) => !denied(toolName));
   const tools = [...serverTools, ...runtimeTools].sort((a, b) => a.localeCompare(b));
   return {
     ...payload,
@@ -506,6 +568,6 @@ export async function describeToolWithLocalSurface(
     tools,
     runtimeTools,
     note: SCOPE_NOTE,
-    scope: scopeFor(opts.audience),
+    scope: scopeFor('list', Boolean(opts.isHardDenied)),
   };
 }

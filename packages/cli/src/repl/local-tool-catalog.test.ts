@@ -8,7 +8,9 @@ import {
   renderLocalToolGroup,
 } from './local-tool-catalog.js';
 import { buildLocalToolInstruction } from '../commands/chat.js';
-import { isForbiddenInClone } from './clone-policy.js';
+import { deriveClonePolicy, isForbiddenInClone } from './clone-policy.js';
+import { ToolPolicyState } from './tool-policy.js';
+import { applyProfile } from './tool-profiles.js';
 import { isClientLocalTool } from './context-tools.js';
 import { isPiTool } from './pi-tools.js';
 import type { PcpToolCallResult } from '../lib/pcp-client.js';
@@ -232,6 +234,103 @@ describe('describeToolWithLocalSurface', () => {
     expect(parsed.error).not.toContain('No tool named');
   });
 
+  it('hides what the POLICY denies, not what a static list happens to name', async () => {
+    // Lumen's round-2 finding. CLONE_DENIED_TOOLS was the obvious proxy and
+    // the wrong one: a derived clone policy also inherits the PARENT's
+    // denials, so a parent denying `read` and `recall` yields a clone that can
+    // call neither while discovery went on advertising both. Neither name is
+    // in CLONE_DENIED_TOOLS — that is the whole point of the case.
+    const parent = new ToolPolicyState('backend', { persist: false });
+    parent.denyTool('read');
+    parent.denyTool('recall');
+    const { policy } = deriveClonePolicy(parent);
+
+    const parsed = payloadOf(
+      await describeToolWithLocalSurface(
+        {},
+        {
+          audience: 'clone',
+          cwd: '/work',
+          isHardDenied: (tool) => {
+            const decision = policy.inspectPcpTool(tool);
+            return !decision.allowed && !decision.promptable;
+          },
+          callServer: async () =>
+            serverPayload({ success: true, count: 2, tools: ['recall', 'list_tasks'] }),
+        }
+      )
+    );
+
+    expect(parsed.tools).not.toContain('read');
+    expect(parsed.tools).not.toContain('recall');
+    expect(parsed.tools).toContain('list_tasks');
+    expect(parsed.tools).toContain('grep');
+  });
+
+  it('never spends a grant to answer what exists', async () => {
+    // The predicate MUST be inspectPcpTool, never canCallPcpTool: the latter
+    // decrements one-use grants, so merely asking what exists would bill the
+    // user for calls that never happen — on the one call an agent makes
+    // precisely when it is unsure.
+    //
+    // Two earlier versions of this test proved nothing. The first read
+    // `policy.snapshotScope(...)`, a method that does not exist, so `?.` made
+    // it undefined and the assertion compared [] to []. The second granted a
+    // DENIED tool, and a denial short-circuits before grants are consulted, so
+    // the consuming path passed too. This one is built on the observed
+    // mechanics: a granted promptable tool inspects as
+    // `{allowed: true, wouldConsumeGrant: true}` until something spends it,
+    // and then as `{allowed: false, promptable: true}`.
+    const policy = new ToolPolicyState('backend', { persist: false });
+    applyProfile(policy, 'safe');
+    policy.grantTool('send_response', 1);
+    expect(policy.inspectPcpTool('send_response').wouldConsumeGrant).toBe(true);
+
+    await describeToolWithLocalSurface(
+      {},
+      {
+        audience: 'parent',
+        cwd: '/work',
+        isHardDenied: (tool) => {
+          const decision = policy.inspectPcpTool(tool);
+          return !decision.allowed && !decision.promptable;
+        },
+        callServer: async () =>
+          serverPayload({ success: true, count: 2, tools: ['recall', 'send_response'] }),
+      }
+    );
+
+    // Still unspent. A consuming predicate leaves this false and allowed:false.
+    const after = policy.inspectPcpTool('send_response');
+    expect(after.allowed).toBe(true);
+    expect(after.wouldConsumeGrant).toBe(true);
+  });
+
+  it('refuses a hard-denied server tool instead of handing back its schema', async () => {
+    // The server HAS remember. Returning its schema reads as an invitation and
+    // the refusal arrives one call later.
+    const parsed = payloadOf(
+      await describeToolWithLocalSurface(
+        { name: 'remember' },
+        {
+          audience: 'clone',
+          cwd: '/work',
+          isHardDenied: (tool) => tool === 'remember',
+          callServer: async () =>
+            serverPayload({
+              success: true,
+              tool: { name: 'remember', description: 'Save to memory.', parameters: {} },
+            }),
+        }
+      )
+    );
+
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toContain('exists in the Inkwell server');
+    expect(parsed.error).toContain('denies it outright');
+    expect(parsed.tool).toBeUndefined();
+  });
+
   it('does not advertise server tools a clone is hard-denied', async () => {
     // audience:'clone' narrowed only the local additions, so the server's half
     // still offered every write-side tool the executor refuses. A discovery
@@ -242,6 +341,14 @@ describe('describeToolWithLocalSurface', () => {
         {
           audience: 'clone',
           cwd: '/work',
+          // The REAL derived clone policy, not a stand-in for it. That
+          // substitution is what round 2 was about.
+          isHardDenied: (tool) => {
+            const decision = deriveClonePolicy(
+              new ToolPolicyState('backend', { persist: false })
+            ).policy.inspectPcpTool(tool);
+            return !decision.allowed && !decision.promptable;
+          },
           callServer: async () =>
             serverPayload({
               success: true,
@@ -257,7 +364,7 @@ describe('describeToolWithLocalSurface', () => {
     expect(parsed.tools).not.toContain('remember');
     expect(parsed.tools).not.toContain('send_response');
     expect(parsed.count).toBe(parsed.tools.length);
-    expect(parsed.scope).toContain('Tools a shadow clone may not call are omitted');
+    expect(parsed.scope).toContain('denies outright are omitted');
   });
 
   it('replaces the server-only scope instead of contradicting itself', async () => {
