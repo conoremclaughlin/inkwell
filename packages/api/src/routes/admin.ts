@@ -51,7 +51,11 @@ import { applyGraphBlockedBy } from '../data/task-graph-read-model';
 import { isLeaseStale, type StudioLease } from '../services/studio-lease.service';
 import { ThreadKeyService } from '../services/thread-key/thread-key.service';
 import { parseThreadKey } from '../services/thread-key/parser';
-import { mergeThreadSpines, missingThreadKeys } from '../services/thread-key/thread-spines';
+import {
+  aggregateStudioHistory,
+  mergeThreadSpines,
+  missingThreadKeys,
+} from '../services/thread-key/thread-spines';
 import { activityBus } from '../services/events/activity-bus';
 import type { Activity } from '../data/repositories/activity-stream.repository';
 import {
@@ -6800,44 +6804,32 @@ async function loadThreadStudioHistory(
     lastEvent: string;
   }>
 > {
+  // Query-level filter mirrors aggregateStudioHistory's occupancy set —
+  // conflict/overflow rows would otherwise eat into the row cap without
+  // ever qualifying a studio (and `conflict` marks studios that REFUSED
+  // the thread; including them fabricated history — Lumen, PR #547 r1).
   const { data: leaseEvents, error: leaseEventsError } = await supabase
     .from('studio_lease_events')
     .select('studio_id, agent_id, event, created_at')
     .eq('user_id', userId)
     .eq('thread_key', threadKey)
+    .in('event', ['acquired', 'released', 'expired', 'reclaimed'])
     .order('created_at', { ascending: false })
     .limit(200);
   if (leaseEventsError) {
     throw new Error(`Failed to load studio lease history: ${leaseEventsError.message}`);
   }
 
-  interface StudioHistoryEntry {
-    studioId: string;
-    agents: Set<string>;
-    firstAt: string;
-    lastAt: string;
-    lastEvent: string;
-  }
-  const historyByStudio = new Map<string, StudioHistoryEntry>();
-  // Rows arrive newest-first: the first row seen per studio carries the
-  // latest event; later rows only extend firstAt backward.
-  for (const ev of leaseEvents || []) {
-    const entry = historyByStudio.get(ev.studio_id);
-    if (!entry) {
-      historyByStudio.set(ev.studio_id, {
-        studioId: ev.studio_id,
-        agents: new Set(ev.agent_id ? [ev.agent_id] : []),
-        firstAt: ev.created_at,
-        lastAt: ev.created_at,
-        lastEvent: ev.event,
-      });
-    } else {
-      if (ev.agent_id) entry.agents.add(ev.agent_id);
-      entry.firstAt = ev.created_at;
-    }
-  }
+  const historyEntries = aggregateStudioHistory(
+    (leaseEvents || []).map((ev) => ({
+      studioId: ev.studio_id,
+      agentId: ev.agent_id ?? null,
+      event: ev.event,
+      createdAt: ev.created_at,
+    }))
+  );
 
-  const historyStudioIds = [...historyByStudio.keys()];
+  const historyStudioIds = historyEntries.map((entry) => entry.studioId);
   const studioMetaById = new Map<string, { slug: string | null; branch: string; status: string }>();
   if (historyStudioIds.length > 0) {
     // Includes cleaned studios deliberately — that is the whole point.
@@ -6853,21 +6845,19 @@ async function loadThreadStudioHistory(
     }
   }
 
-  return [...historyByStudio.values()]
-    .map((entry) => {
-      const meta = studioMetaById.get(entry.studioId);
-      return {
-        studioId: entry.studioId,
-        slug: meta?.slug ?? null,
-        branch: meta?.branch ?? null,
-        status: meta?.status ?? 'deleted',
-        agents: [...entry.agents].sort(),
-        firstAt: entry.firstAt,
-        lastAt: entry.lastAt,
-        lastEvent: entry.lastEvent,
-      };
-    })
-    .sort((a, b) => Date.parse(b.lastAt) - Date.parse(a.lastAt));
+  return historyEntries.map((entry) => {
+    const meta = studioMetaById.get(entry.studioId);
+    return {
+      studioId: entry.studioId,
+      slug: meta?.slug ?? null,
+      branch: meta?.branch ?? null,
+      status: meta?.status ?? 'deleted',
+      agents: entry.agents,
+      firstAt: entry.firstAt,
+      lastAt: entry.lastAt,
+      lastEvent: entry.lastEvent,
+    };
+  });
 }
 
 /**

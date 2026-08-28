@@ -1,11 +1,13 @@
 import { describe, it, expect } from 'vitest';
 import {
+  aggregateStudioHistory,
   mergeThreadSpines,
   missingThreadKeys,
   type SpineGroupRow,
   type SpineSessionRow,
   type SpineStudioRow,
   type SpineThreadRow,
+  type StudioLeaseEventRow,
 } from './thread-spines';
 
 const at = (h: number) => new Date(Date.UTC(2026, 7, 25, h)).toISOString();
@@ -211,6 +213,50 @@ describe('lastActivityAt vs studio heartbeats', () => {
       parse: noParse,
     });
     expect(spines[0].lastActivityAt).toBe(at(4));
+  });
+});
+
+describe('aggregateStudioHistory', () => {
+  const ev = (over: Partial<StudioLeaseEventRow>): StudioLeaseEventRow => ({
+    studioId: 'st-a',
+    agentId: 'lumen',
+    event: 'acquired',
+    createdAt: at(5),
+    ...over,
+  });
+
+  it('a conflict-then-diversion never fabricates history for the refusing studio', () => {
+    // The thread was refused by st-busy (conflict row) and diverted to
+    // st-overflow, which it actually occupied. Only the occupied studio
+    // is history — a conflict-only studio never appears.
+    const entries = aggregateStudioHistory([
+      ev({ studioId: 'st-overflow', event: 'released', createdAt: at(8) }),
+      ev({ studioId: 'st-overflow', event: 'acquired', createdAt: at(6) }),
+      ev({ studioId: 'st-overflow', event: 'overflow', createdAt: at(6) }),
+      ev({ studioId: 'st-busy', event: 'conflict', createdAt: at(5) }),
+    ]);
+
+    expect(entries.map((e) => e.studioId)).toEqual(['st-overflow']);
+    expect(entries[0].firstAt).toBe(at(6));
+    expect(entries[0].lastAt).toBe(at(8));
+    expect(entries[0].lastEvent).toBe('released');
+  });
+
+  it('overflow announcements alone are not occupancy', () => {
+    expect(aggregateStudioHistory([ev({ event: 'overflow' })])).toEqual([]);
+    expect(aggregateStudioHistory([ev({ event: 'conflict' })])).toEqual([]);
+  });
+
+  it('aggregates agents and orders studios by most recent occupancy, input order irrelevant', () => {
+    const entries = aggregateStudioHistory([
+      ev({ studioId: 'st-a', agentId: 'wren', event: 'acquired', createdAt: at(1) }),
+      ev({ studioId: 'st-b', event: 'expired', createdAt: at(9) }),
+      ev({ studioId: 'st-a', agentId: 'lumen', event: 'released', createdAt: at(3) }),
+    ]);
+
+    expect(entries.map((e) => e.studioId)).toEqual(['st-b', 'st-a']);
+    expect(entries[1].agents).toEqual(['lumen', 'wren']);
+    expect(entries[1].lastEvent).toBe('released');
   });
 });
 

@@ -46,23 +46,29 @@ function execFileText(args: string[]): Promise<string | null> {
 }
 
 async function refresh(): Promise<void> {
-  const current = await execFileText(['rev-parse', '--short=12', 'HEAD']);
-  cachedCurrentGitSha = current || null;
+  // Computed entirely in locals and published in one synchronous block at
+  // the end: assigning the sha before awaiting the diff let a read combine
+  // the NEW sha with the PREVIOUS refresh's delta bit — a torn snapshot
+  // that could report a restart verdict belonging to neither state
+  // (Lumen, PR #547 r1). Readers always see a matched (sha, delta) pair.
+  const nextCurrentGitSha = (await execFileText(['rev-parse', '--short=12', 'HEAD'])) || null;
 
-  if (STARTUP_GIT_SHA && cachedCurrentGitSha && STARTUP_GIT_SHA !== cachedCurrentGitSha) {
+  let nextApiDeltaNonEmpty = false;
+  if (STARTUP_GIT_SHA && nextCurrentGitSha && STARTUP_GIT_SHA !== nextCurrentGitSha) {
     const delta = await execFileText([
       'diff',
       '--name-only',
-      `${STARTUP_GIT_SHA}..${cachedCurrentGitSha}`,
+      `${STARTUP_GIT_SHA}..${nextCurrentGitSha}`,
       '--',
       ...API_RELEVANT_PATHS,
     ]);
     // A failed diff (e.g. the startup sha was garbage-collected) fails
     // toward "restart recommended" — never hide a possible real update.
-    cachedApiDeltaNonEmpty = delta === null ? true : delta.length > 0;
-  } else {
-    cachedApiDeltaNonEmpty = false;
+    nextApiDeltaNonEmpty = delta === null ? true : delta.length > 0;
   }
+
+  cachedCurrentGitSha = nextCurrentGitSha;
+  cachedApiDeltaNonEmpty = nextApiDeltaNonEmpty;
 }
 
 /**

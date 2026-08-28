@@ -87,6 +87,43 @@ describe('getRuntimeBuildInfo', () => {
     expect(gitArgs).not.toContain('packages/web');
   });
 
+  it('mid-refresh reads keep the prior snapshot — sha and delta publish together', async () => {
+    mockExecSync.mockReturnValue('shaA');
+
+    // First refresh: head B with an API-relevant delta → updateAvailable.
+    answerExecFile({ 'rev-parse': 'shaB', diff: 'packages/api/src/x.ts' });
+    const { getRuntimeBuildInfo } = await import('./runtime-build-info');
+    getRuntimeBuildInfo(20_000);
+    await flushRefresh();
+    expect(getRuntimeBuildInfo(21_000).updateAvailable).toBe(true);
+
+    // Second refresh: head C, cli-only delta. Hold the diff callback so the
+    // refresh is mid-flight after rev-parse resolved.
+    let releaseDiff: (() => void) | null = null;
+    mockExecFile.mockImplementation((...args: unknown[]) => {
+      const gitArgs = args[1] as string[];
+      const cb = args[args.length - 1] as (err: Error | null, stdout: string) => void;
+      if (gitArgs[0] === 'rev-parse') cb(null, 'shaC');
+      else releaseDiff = () => cb(null, '');
+    });
+    getRuntimeBuildInfo(50_000);
+    await flushRefresh();
+
+    // Refresh is stalled on the diff: a read must still see the COMPLETE
+    // previous snapshot (shaB + true), never shaC paired with B's verdict.
+    const during = getRuntimeBuildInfo(51_000);
+    expect(during.currentGitSha).toBe('shaB');
+    expect(during.updateAvailable).toBe(true);
+
+    expect(releaseDiff).not.toBeNull();
+    releaseDiff!();
+    await flushRefresh();
+
+    const after = getRuntimeBuildInfo(52_000);
+    expect(after.currentGitSha).toBe('shaC');
+    expect(after.updateAvailable).toBe(false);
+  });
+
   it('a failed diff fails toward restart-recommended, never toward hiding an update', async () => {
     mockExecSync.mockReturnValue('abc123def456');
     // rev-parse succeeds with a new sha; diff errors (e.g. startup sha gone).
