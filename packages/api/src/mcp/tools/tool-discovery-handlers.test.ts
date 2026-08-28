@@ -97,6 +97,52 @@ describe('describe_tool', () => {
   });
 });
 
+/**
+ * The registry is complete for what it covers and silent about everything else,
+ * and silence in a discovery list reads as absence. Myra concluded she had no
+ * shell from three not-found errors; asking `describe_tool` — the correct move —
+ * would have confirmed it, because `bash` runs in the CLI and is not registered
+ * here. An incomplete list that states its scope is a different object from one
+ * that does not.
+ */
+describe('describe_tool states what it cannot speak for', () => {
+  it('marks the no-arg listing as the Inkwell namespace, not the callable surface', () => {
+    const result = parse(handleDescribeTool({}, fixtureRegistry()));
+
+    expect(result.scope).toContain('Inkwell MCP tools only');
+    expect(result.scope).toContain('Absence from it is not evidence a tool is unavailable');
+  });
+
+  it('carries the scope on a search that found nothing, where it matters most', () => {
+    // "No match" is the answer most likely to be read as "no such capability".
+    const result = parse(handleDescribeTool({ search: 'shell' }, fixtureRegistry()));
+
+    expect(result.count).toBe(0);
+    expect(result.scope).toContain('Inkwell MCP tools only');
+  });
+
+  it.each(['bash', 'signal_status', 'read', 'spawn_agent'])(
+    'answers "%s" as not-mine rather than not-a-tool',
+    (name) => {
+      const result = parse(handleDescribeTool({ name }, fixtureRegistry()));
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('not an Inkwell MCP tool');
+      expect(result.error).toContain('it is callable');
+      // The sentence that must NOT be there: the one Myra read as confirmation.
+      expect(result.error).not.toContain(`No tool named "${name}"`);
+    }
+  );
+
+  it('still says no to a name nothing serves', () => {
+    const result = parse(handleDescribeTool({ name: 'teleport' }, fixtureRegistry()));
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('No tool named "teleport" in the Inkwell MCP namespace');
+    expect(result.scope).toContain('Inkwell MCP tools only');
+  });
+});
+
 describe('describe_tool against the real registry', () => {
   async function connectedClient() {
     const server = new McpServer({ name: 'test', version: '0.0.0' });

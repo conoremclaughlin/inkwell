@@ -3907,14 +3907,17 @@ tool name costs a round trip.
   schema for one tool, including which fields are required
 - describe_tool({ search: "reminder" }) — find tools by keyword when you know
   what you want to do but not what it is called
-- describe_tool({}) — list every tool name
+- describe_tool({}) — list every Inkwell tool name
 
 Examples:
 - Unsure whether it is runAt or remindAt → describe_tool({ name: "create_reminder" })
 - Want to decline a calendar invite → describe_tool({ search: "calendar" })
 - Got "no tool named X" → describe_tool({ search: "<what you were trying to do>" })
 
-This reflects the live server, so it is never out of date.`,
+This reflects the live Inkwell registry, so it is never out of date about the
+tools it covers. It covers ONLY those: tools your runtime provides in-process —
+a shell, file read/write, turn signalling — are not registered here and will not
+appear, so absence from this list is not evidence a tool is unavailable to you.`,
       inputSchema: describeToolSchema,
     },
     async (args) => {

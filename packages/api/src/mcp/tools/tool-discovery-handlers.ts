@@ -56,6 +56,52 @@ export const describeToolSchema = z
   })
   .strict();
 
+/**
+ * What this registry can and cannot speak for.
+ *
+ * Every name below is an Inkwell MCP tool. A caller's runtime almost always
+ * hosts more — the ink CLI runs `bash`, `read`, `signal_status` and friends
+ * in-process; Claude Code has its own set — and none of them are registered
+ * here, so none of them can appear in this list.
+ *
+ * Saying so is the whole point. A discovery list never invents a tool, so its
+ * silence reads as authoritative absence rather than partial coverage, and an
+ * agent checking a doubt against it gets that doubt confirmed. Myra concluded
+ * she had no shell from three not-found errors; `describe_tool`, the correct
+ * next move, would have agreed with her while she held a working, unsandboxed
+ * `bash`. An incomplete list that admits its scope is a different object from
+ * one that does not.
+ *
+ * The ink runtime merges its own surface into this response before the agent
+ * sees it (packages/cli/src/repl/local-tool-catalog.ts). This note is for every
+ * other client, which cannot.
+ */
+const SCOPE_NOTE =
+  'This lists Inkwell MCP tools only. Your runtime may provide more — a shell, file read/write, turn signalling — that are not registered here and cannot appear in this list. Absence from it is not evidence a tool is unavailable to you.';
+
+/**
+ * Names known to be served by a runtime rather than by this server.
+ *
+ * Recognizing them turns "no such tool" into "not mine, and probably yours",
+ * which is the difference between a caller that stops reaching for a shell and
+ * one that tries it. Not exhaustive by construction — the generic scope note
+ * carries every case this misses.
+ */
+const KNOWN_RUNTIME_TOOLS = new Set([
+  'bash',
+  'read',
+  'edit',
+  'write',
+  'grep',
+  'find',
+  'ls',
+  'signal_status',
+  'list_context',
+  'evict_context',
+  'spawn_agent',
+  'collect_agents',
+]);
+
 function firstLine(description: string | undefined): string {
   if (!description) return '';
   const line = description.split('\n').find((candidate) => candidate.trim().length > 0);
@@ -102,11 +148,18 @@ export function handleDescribeTool(
         })
         .slice(0, 10);
 
+      // "Not an Inkwell tool" and "not a tool" are different answers, and only
+      // the second one tells a caller to stop trying.
+      const runtimeTool = KNOWN_RUNTIME_TOOLS.has(needle);
+
       return mcpResponse(
         {
           success: false,
-          error: `No tool named "${args.name}".`,
+          error: runtimeTool
+            ? `"${args.name}" is not an Inkwell MCP tool. It is a runtime-local tool — if your runtime provides it, it is callable, and this server simply cannot describe it.`
+            : `No tool named "${args.name}" in the Inkwell MCP namespace.`,
           ...(suggestions.length > 0 ? { didYouMean: suggestions } : {}),
+          scope: SCOPE_NOTE,
           hint: 'Call describe_tool with `search` to find a tool by keyword, or with no arguments to list every tool name.',
         },
         true
@@ -138,6 +191,7 @@ export function handleDescribeTool(
       query: args.search,
       count: matches.length,
       tools: matches,
+      scope: SCOPE_NOTE,
       ...(matches.length === 0
         ? { hint: 'No match. Call describe_tool with no arguments to list every tool name.' }
         : {
@@ -150,6 +204,7 @@ export function handleDescribeTool(
     success: true,
     count: tools.length,
     tools: tools.map((tool) => tool.name),
+    scope: SCOPE_NOTE,
     hint: "Call describe_tool with `name` for one tool's parameters, or `search` to filter by keyword.",
   });
 }

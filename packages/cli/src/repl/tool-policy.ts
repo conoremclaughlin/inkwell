@@ -162,6 +162,10 @@ const DEFAULT_POLICY_PATH = join(homedir(), '.ink', 'security', 'tool-policy.jso
 
 export const DEFAULT_SAFE_PCP_TOOLS = new Set<string>([
   'bootstrap',
+  // Asking what exists. Read-only, and the one call an agent makes precisely
+  // when it is unsure — gating it means learning the surface by being refused,
+  // and unattended a promptable tool is denied outright.
+  'describe_tool',
   'get_inbox',
   'list_sessions',
   'get_session',

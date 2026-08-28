@@ -115,6 +115,7 @@ import { registerBuiltinHooks } from '../repl/builtin-hooks.js';
 import { applyProfile, formatProfileList, isValidProfileId } from '../repl/tool-profiles.js';
 import { isPiTool, callPiTool } from '../repl/pi-tools.js';
 import { bareToolName, createLocalToolDispatcher } from '../repl/tool-dispatch.js';
+import { renderLocalToolGroup } from '../repl/local-tool-catalog.js';
 import { ApprovalRequestManager } from '../repl/approval-request.js';
 import { requestToolApproval } from '../repl/approval-api.js';
 import {
@@ -2437,6 +2438,12 @@ async function promptForToolApproval(
  * variant omits the write tools and `spawn_agent` — not as enforcement (the
  * executor refuses them regardless; a text-protocol model can name any tool)
  * but so the clone spends its turns on work it can actually do.
+ *
+ * The three local blocks are RENDERED from `LOCAL_TOOL_CATALOG` rather than
+ * written here, because this text and `describe_tool` are two answers to the
+ * same question and they had already diverged: this said `bash` and
+ * `signal_status` exist, discovery said they did not, and the agent believed
+ * discovery. One source means the next tool added shows up in both or neither.
  */
 export function buildLocalToolInstruction(opts: { audience: 'parent' | 'clone' }): string {
   const forClone = opts.audience === 'clone';
@@ -2456,36 +2463,9 @@ export function buildLocalToolInstruction(opts: { audience: 'parent' | 'clone' }
     ? 'Inkwell tools (server round-trip, read-only for you): recall, get_artifact, list_artifacts, search_artifacts, list_tasks, list_projects, get_session, list_sessions, get_activity, search_links, bootstrap, etc. Write-side tools (remember, send_to_inbox, create_task, …) are unavailable — report findings instead.'
     : 'Inkwell tools (server round-trip): get_inbox, recall, remember, list_tasks, send_response, save_link, create_task, update_session_state, bootstrap, etc.';
 
-  const codingTools = [
-    'Coding tools (in-process, scoped to working directory):',
-    '- read: Read a file. Args: path (string), offset (number, optional), limit (number, optional).',
-    ...(forClone
-      ? []
-      : [
-          '- edit: Edit a file by find-and-replace. Args: path (string), edits (array of {oldText, newText}).',
-          '- write: Create or overwrite a file. Args: path (string), content (string).',
-          '- bash: Execute a shell command. Args: command (string), timeout (number, optional).',
-        ]),
-    '- grep: Search file contents. Args: pattern (string), path (string, optional), include (string, optional).',
-    '- find: Find files by name/pattern. Args: pattern (string), path (string, optional).',
-    '- ls: List directory contents. Args: path (string, optional).',
-  ].join('\n');
-
-  const clientLocal = [
-    'Client-local tools (no server round-trip):',
-    '- list_context: Introspect your context window — see all entries with IDs, token counts, sources, and previews.',
-    '- evict_context: Remove specific entries from your context to reclaim tokens. Args: entryIds (number[]), source (string), or role (string).',
-    '- signal_status: Signal your session status. Args: status ("completed" | "blocked" | "continuing"), reason (string, optional). Use this at the end of your work to tell the runtime whether you are done, blocked on something, or need another turn.',
-  ].join('\n');
-
-  const spawn = [
-    'Delegation:',
-    `- ${SPAWN_AGENT_TOOL}: Fork yourself into up to ${MAX_CLONES_PER_SPAWN} shadow clones for bounded, independent work. Args: tasks (array of {label, prompt}), wait (boolean, optional, default true).`,
-    '  Each clone is you with a blank slate and read-only tools. It works alone and hands back one summary; its intermediate steps never enter your context. That is the point — use it when the reading would cost you more context than the answer is worth, or when two lines of enquiry are independent.',
-    `  ${SPAWN_AGENT_TOOL} must be the ONLY tool call in its turn — a turn mixing it with other calls is refused whole and nothing runs.`,
-    '  With wait:false the clones keep running in the background and you continue immediately; collect them later with collect_agents.',
-    '- collect_agents: Read back what clones produced. Args: ids (string[], optional — omit for all), wait (boolean, optional, default true — block until the requested clones finish).',
-  ].join('\n');
+  const codingTools = renderLocalToolGroup('coding', opts.audience);
+  const clientLocal = renderLocalToolGroup('client-local', opts.audience);
+  const spawn = renderLocalToolGroup('delegation', opts.audience);
 
   return [header, inkwell, '', codingTools, '', clientLocal, ...(forClone ? [] : ['', spawn])].join(
     '\n'
@@ -5284,6 +5264,18 @@ export async function runChat(options: ChatOptions): Promise<void> {
         callPi: callPiTool,
         callPcp: (bare, resolved) => pcp.callTool(bare, resolved),
         resolveCredentials: (args) => resolveCredentialRefs(args, buildResolverEnv()).args,
+        // A clone asking what it can call gets its own narrower surface —
+        // the same one its prompt described, not the parent's.
+        audience: 'clone',
+        // And what its OWN policy will refuse, which is not the same thing:
+        // a derived clone policy inherits the parent's denials on top of the
+        // clone's, so a parent that denies `read` yields a clone that cannot
+        // read. inspectPcpTool, never canCallPcpTool — asking what exists must
+        // not spend the parent's one-use grants.
+        isHardDenied: (tool) => {
+          const decision = opts.policy.inspectPcpTool(bareToolName(tool), runtime.sessionId);
+          return !decision.allowed && !decision.promptable;
+        },
         head: (tool, args) => {
           // Non-nesting is enforced HERE, not by omitting spawn_agent from the
           // clone's prompt: tool calls travel as text, so a model can name any
@@ -5648,6 +5640,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
             );
           }
           return resolvedArgs;
+        },
+        audience: 'parent',
+        isHardDenied: (tool) => {
+          const decision = toolPolicy.inspectPcpTool(bareToolName(tool), runtime.sessionId);
+          return !decision.allowed && !decision.promptable;
         },
         head: (tool, args) => {
           // spawn_agent is NOT a client-local policy bypass. Unlike ledger
