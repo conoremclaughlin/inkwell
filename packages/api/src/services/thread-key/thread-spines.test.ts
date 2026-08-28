@@ -1,11 +1,13 @@
 import { describe, it, expect } from 'vitest';
 import {
+  aggregateStudioHistory,
   mergeThreadSpines,
   missingThreadKeys,
   type SpineGroupRow,
   type SpineSessionRow,
   type SpineStudioRow,
   type SpineThreadRow,
+  type StudioLeaseEventRow,
 } from './thread-spines';
 
 const at = (h: number) => new Date(Date.UTC(2026, 7, 25, h)).toISOString();
@@ -183,6 +185,78 @@ describe('mergeThreadSpines', () => {
 
     expect(spines.map((s) => s.key)).toEqual(['pr:2', 'pr:3', 'pr:1']);
     expect(spines[0].sessions.map((s) => s.id)).toEqual(['s-new', 's-old']);
+  });
+});
+
+describe('lastActivityAt vs studio heartbeats', () => {
+  it('a lease heartbeat never makes an old conversation read as fresh', () => {
+    const spines = mergeThreadSpines({
+      threads: [thread({ updatedAt: at(1) })],
+      sessions: [session({ threadKey: 'pr:531', updatedAt: at(2) })],
+      // Studio row touched moments ago by the lease heartbeat.
+      studios: [studio({ leaseThreadKey: 'pr:531', leaseAgentId: 'wren', updatedAt: at(12) })],
+      groups: [],
+      parse: noParse,
+    });
+
+    expect(spines[0].lastActivityAt).toBe(at(2));
+    // Presence still renders — the studio itself is not hidden.
+    expect(spines[0].studios).toHaveLength(1);
+  });
+
+  it('a key carried only by a studio falls back to the studio timestamp, not the epoch', () => {
+    const spines = mergeThreadSpines({
+      threads: [],
+      sessions: [],
+      studios: [studio({ threadKey: 'spec:fleet', updatedAt: at(4) })],
+      groups: [],
+      parse: noParse,
+    });
+    expect(spines[0].lastActivityAt).toBe(at(4));
+  });
+});
+
+describe('aggregateStudioHistory', () => {
+  const ev = (over: Partial<StudioLeaseEventRow>): StudioLeaseEventRow => ({
+    studioId: 'st-a',
+    agentId: 'lumen',
+    event: 'acquired',
+    createdAt: at(5),
+    ...over,
+  });
+
+  it('a conflict-then-diversion never fabricates history for the refusing studio', () => {
+    // The thread was refused by st-busy (conflict row) and diverted to
+    // st-overflow, which it actually occupied. Only the occupied studio
+    // is history — a conflict-only studio never appears.
+    const entries = aggregateStudioHistory([
+      ev({ studioId: 'st-overflow', event: 'released', createdAt: at(8) }),
+      ev({ studioId: 'st-overflow', event: 'acquired', createdAt: at(6) }),
+      ev({ studioId: 'st-overflow', event: 'overflow', createdAt: at(6) }),
+      ev({ studioId: 'st-busy', event: 'conflict', createdAt: at(5) }),
+    ]);
+
+    expect(entries.map((e) => e.studioId)).toEqual(['st-overflow']);
+    expect(entries[0].firstAt).toBe(at(6));
+    expect(entries[0].lastAt).toBe(at(8));
+    expect(entries[0].lastEvent).toBe('released');
+  });
+
+  it('overflow announcements alone are not occupancy', () => {
+    expect(aggregateStudioHistory([ev({ event: 'overflow' })])).toEqual([]);
+    expect(aggregateStudioHistory([ev({ event: 'conflict' })])).toEqual([]);
+  });
+
+  it('aggregates agents and orders studios by most recent occupancy, input order irrelevant', () => {
+    const entries = aggregateStudioHistory([
+      ev({ studioId: 'st-a', agentId: 'wren', event: 'acquired', createdAt: at(1) }),
+      ev({ studioId: 'st-b', event: 'expired', createdAt: at(9) }),
+      ev({ studioId: 'st-a', agentId: 'lumen', event: 'released', createdAt: at(3) }),
+    ]);
+
+    expect(entries.map((e) => e.studioId)).toEqual(['st-b', 'st-a']);
+    expect(entries[1].agents).toEqual(['lumen', 'wren']);
+    expect(entries[1].lastEvent).toBe('released');
   });
 });
 

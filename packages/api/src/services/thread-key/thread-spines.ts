@@ -172,6 +172,86 @@ export function missingThreadKeys(
   return [...missing];
 }
 
+/**
+ * Lease events that are evidence a session actually occupied the studio for
+ * this key. `conflict` is the opposite — it records a studio that REFUSED
+ * the thread (candidate diverted elsewhere) — and `overflow` merely
+ * announces a spawn; a studio that was really entered gets an `acquired`
+ * row moments later. Building history from anything outside this set
+ * fabricates "work happened here" for studios the thread never touched.
+ */
+const OCCUPANCY_EVENTS = new Set(['acquired', 'released', 'expired', 'reclaimed']);
+
+export interface StudioLeaseEventRow {
+  studioId: string;
+  agentId: string | null;
+  event: string;
+  createdAt: string;
+}
+
+export interface StudioHistoryEntry {
+  studioId: string;
+  agents: string[];
+  firstAt: string;
+  lastAt: string;
+  lastEvent: string;
+}
+
+/**
+ * Aggregate occupancy history per studio from lease-event rows (any order
+ * of arrival; typically newest-first). Non-occupancy rows are ignored
+ * entirely — a studio whose only rows for this key are conflicts does not
+ * appear. Sorted most-recently-active first.
+ */
+export function aggregateStudioHistory(events: StudioLeaseEventRow[]): StudioHistoryEntry[] {
+  interface Working {
+    studioId: string;
+    agents: Set<string>;
+    firstAtMs: number;
+    lastAtMs: number;
+    firstAt: string;
+    lastAt: string;
+    lastEvent: string;
+  }
+  const byStudio = new Map<string, Working>();
+  for (const ev of events) {
+    if (!OCCUPANCY_EVENTS.has(ev.event)) continue;
+    const ms = Date.parse(ev.createdAt);
+    const entry = byStudio.get(ev.studioId);
+    if (!entry) {
+      byStudio.set(ev.studioId, {
+        studioId: ev.studioId,
+        agents: new Set(ev.agentId ? [ev.agentId] : []),
+        firstAtMs: ms,
+        lastAtMs: ms,
+        firstAt: ev.createdAt,
+        lastAt: ev.createdAt,
+        lastEvent: ev.event,
+      });
+      continue;
+    }
+    if (ev.agentId) entry.agents.add(ev.agentId);
+    if (ms < entry.firstAtMs) {
+      entry.firstAtMs = ms;
+      entry.firstAt = ev.createdAt;
+    }
+    if (ms > entry.lastAtMs) {
+      entry.lastAtMs = ms;
+      entry.lastAt = ev.createdAt;
+      entry.lastEvent = ev.event;
+    }
+  }
+  return [...byStudio.values()]
+    .map((w) => ({
+      studioId: w.studioId,
+      agents: [...w.agents].sort(),
+      firstAt: w.firstAt,
+      lastAt: w.lastAt,
+      lastEvent: w.lastEvent,
+    }))
+    .sort((a, b) => Date.parse(b.lastAt) - Date.parse(a.lastAt));
+}
+
 interface WorkingSpine {
   key: string;
   identity: SpineIdentity | null;
@@ -273,7 +353,11 @@ export function mergeThreadSpines(input: MergeThreadSpinesInput): ThreadSpine[] 
         spine.participants.add(st.leaseAgentId);
       }
       spine.sources.add('studio');
-      spine.lastActivityAt = laterIso(spine.lastActivityAt, st.updatedAt);
+      // Deliberately NOT folded into lastActivityAt: studio rows are touched
+      // by lease heartbeats, so a four-day-old conversation whose studio is
+      // merely occupied would read "just now" and every leased key would
+      // crowd the top of the sort. Presence renders in the studios section;
+      // recency belongs to conversation, sessions, and work.
     }
   }
 
@@ -303,16 +387,24 @@ export function mergeThreadSpines(input: MergeThreadSpinesInput): ThreadSpine[] 
             ? { project: parsed.project, type: parsed.type, id: parsed.id, pinned: false }
             : null;
         })();
+      const studios = [...w.studios.values()];
+      // A key carried ONLY by a studio has no real activity signal; fall
+      // back to the studio timestamp rather than reporting the epoch. Any
+      // conversation, session, or work timestamp outranks this.
+      const lastActivityAt =
+        Date.parse(w.lastActivityAt) > 0
+          ? w.lastActivityAt
+          : studios.reduce((max, st) => laterIso(max, st.updatedAt), w.lastActivityAt);
       return {
         key: w.key,
         identity,
         thread: w.thread,
         sessions: w.sessions.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt)),
-        studios: [...w.studios.values()],
+        studios,
         taskGroups: w.taskGroups.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt)),
         participants: [...w.participants].sort(),
         sources: order.filter((s) => w.sources.has(s)),
-        lastActivityAt: w.lastActivityAt,
+        lastActivityAt,
       };
     })
     .sort((a, b) => Date.parse(b.lastActivityAt) - Date.parse(a.lastActivityAt));
