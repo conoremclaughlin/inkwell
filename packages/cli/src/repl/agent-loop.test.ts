@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   buildContinuationBody,
+  extractLocalToolCalls,
   resolveResponseText,
   runAgentLoop,
   type AgentLoopPorts,
@@ -593,5 +594,41 @@ describe('runAgentLoop — final relay at the iteration cap (PR #491 port)', () 
       result: 'spawn_agent must be alone',
       status: 'rejected',
     });
+  });
+});
+
+describe('extractLocalToolCalls namespace stripping', () => {
+  // The two extraction paths must AGREE. The XML variant has stripped since
+  // 2026-08-10; the fence had not, so the older rarer format was the correct
+  // one and the primary path shipped the bug. Asserting them against each
+  // OTHER — rather than against what I believe each does — is what makes this
+  // catch the next divergence instead of encoding today's.
+  it('strips the MCP namespace identically in both formats', () => {
+    const fenced = extractLocalToolCalls(
+      '```ink-tool\n{"tool":"mcp__inkwell__signal_status","args":{"status":"completed"}}\n```'
+    );
+    const variant = extractLocalToolCalls(
+      '<tool_call>{"name":"mcp__inkwell__signal_status","arguments":{"status":"completed"}}</tool_call>'
+    );
+
+    expect(fenced[0].tool).toBe(variant[0].tool);
+    expect(fenced[0].tool).toBe('signal_status');
+    expect(fenced[0].args).toEqual(variant[0].args);
+  });
+
+  it('leaves a foreign namespace intact so the dispatcher can explain it', () => {
+    // Only `mcp__inkwell__` is ours to strip. `mcp__github__list_issues` must
+    // reach the dispatcher whole, or the refusal cannot name the missing server.
+    const calls = extractLocalToolCalls(
+      '```ink-tool\n{"tool":"mcp__github__list_issues","args":{}}\n```'
+    );
+    expect(calls[0].tool).toBe('mcp__github__list_issues');
+  });
+
+  it('leaves a bare name untouched', () => {
+    const calls = extractLocalToolCalls(
+      '```ink-tool\n{"tool":"bash","args":{"command":"ls"}}\n```'
+    );
+    expect(calls[0].tool).toBe('bash');
   });
 });

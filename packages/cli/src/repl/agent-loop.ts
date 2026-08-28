@@ -564,7 +564,21 @@ export function extractLocalToolCalls(responseText: string): LocalToolCall[] {
     if (!block.payload) continue;
     try {
       const parsed = JSON.parse(block.payload) as Record<string, unknown>;
-      const tool = typeof parsed.tool === 'string' ? parsed.tool.trim() : '';
+      // Strip the MCP namespace HERE, not at dispatch. The bare name has to be
+      // canonical for the whole pipeline, because everything downstream of this
+      // point branches on `call.tool`: the client-local policy bypass, the
+      // ToolCallResult the terminal-signal detector reads, ledger exclusion and
+      // friendly formatting. Normalizing only at dispatch fixes execution and
+      // leaves all of those reading `mcp__inkwell__signal_status` — the call
+      // runs, and the loop still never learns the turn was signalled complete.
+      //
+      // The XML-variant path below has stripped since 2026-08-10, for this
+      // exact reason and for this exact agent. The fence — the primary path —
+      // was never given the same treatment, so the older, rarer format was the
+      // correct one. Both paths now agree; a test pins them against each other
+      // rather than against my belief about either.
+      const rawName = typeof parsed.tool === 'string' ? parsed.tool.trim() : '';
+      const tool = rawName.replace(/^mcp__inkwell__/, '');
       if (!tool) continue;
       const args =
         parsed.args && typeof parsed.args === 'object' && !Array.isArray(parsed.args)

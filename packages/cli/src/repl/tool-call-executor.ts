@@ -11,6 +11,7 @@
 import type { ToolPolicyState } from './tool-policy.js';
 import type { PcpToolCallResult } from '../lib/pcp-client.js';
 import { isClientLocalTool } from './context-tools.js';
+import { impossibleCallRefusal } from './tool-dispatch.js';
 
 export interface LocalToolCall {
   tool: string;
@@ -117,6 +118,22 @@ async function executeOneToolCall(
   // context window without permission gates.
   if (isClientLocalTool(call.tool)) {
     return executeTool(call, callTool, deps.signal);
+  }
+
+  // A structurally impossible call — a foreign MCP namespace, or a coding tool
+  // named in the wrong case — is answered before policy,
+  // because there is nothing here to authorize. Nothing runs and nothing is
+  // reached; the only output is a message naming the right spelling.
+  //
+  // Behind policy it was worse than useless: `safe` prompts the human and
+  // spends a grant to approve a call that was never going to execute, and
+  // `minimal` blocks it outright — so the one profile most likely to be
+  // running unattended is the one where the correction never arrives and the
+  // caller keeps reading "blocked" as "the tool is gone".
+
+  const impossible = impossibleCallRefusal(call.tool);
+  if (impossible) {
+    return { tool: call.tool, args: call.args, status: 'executed', result: impossible };
   }
 
   // 1. Check policy — strip MCP namespace prefix for policy lookup
