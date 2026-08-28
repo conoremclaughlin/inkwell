@@ -774,6 +774,52 @@ export type Database = {
           },
         ];
       };
+      artifact_uri_aliases: {
+        Row: {
+          alias_uri: string;
+          artifact_id: string;
+          created_at: string;
+          id: string;
+          user_id: string;
+          workspace_id: string | null;
+        };
+        Insert: {
+          alias_uri: string;
+          artifact_id: string;
+          created_at?: string;
+          id?: string;
+          user_id: string;
+          workspace_id?: string | null;
+        };
+        Update: {
+          alias_uri?: string;
+          artifact_id?: string;
+          created_at?: string;
+          id?: string;
+          user_id?: string;
+          workspace_id?: string | null;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'artifact_uri_aliases_artifact_id_fkey';
+            columns: ['artifact_id'];
+            referencedRelation: 'artifacts';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'artifact_uri_aliases_user_id_fkey';
+            columns: ['user_id'];
+            referencedRelation: 'users';
+            referencedColumns: ['id'];
+          },
+          {
+            foreignKeyName: 'artifact_uri_aliases_workspace_id_fkey';
+            columns: ['workspace_id'];
+            referencedRelation: 'workspaces';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
       artifacts: {
         Row: {
           artifact_type: string;

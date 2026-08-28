@@ -71,8 +71,20 @@ const workspaceScopedUserIdentifierSchema = userIdentifierBaseSchema.extend({
   workspaceId: z.string().uuid().optional().describe('Optional product workspace scope'),
 });
 
+// The Library derives folders from the URI's first path segment, so URIs must
+// follow ink://<namespace>/<path>. All pre-existing artifacts conform (94/94).
+const ARTIFACT_URI_PATTERN = /^ink:\/\/[a-z0-9][a-z0-9-]*(\/[A-Za-z0-9._-]+)+$/;
+const artifactUriSchema = z
+  .string()
+  .regex(
+    ARTIFACT_URI_PATTERN,
+    'Artifact URIs must look like ink://<namespace>/<slug> — lowercase namespace; letters, digits, dot, underscore, hyphen in path segments'
+  );
+
 const createArtifactSchema = workspaceScopedUserIdentifierSchema.extend({
-  uri: z.string().describe('Unique URI for the artifact (e.g., "ink://specs/orchestration")'),
+  uri: artifactUriSchema.describe(
+    'Unique URI for the artifact (e.g., "ink://specs/orchestration"). The first path segment is its Library folder.'
+  ),
   title: z.string().describe('Title of the artifact'),
   content: z.string().describe('Content (typically markdown)'),
   artifactType: z
@@ -117,6 +129,11 @@ const getArtifactSchema = workspaceScopedUserIdentifierSchema.extend({
 const updateArtifactSchema = workspaceScopedUserIdentifierSchema.extend({
   uri: z.string().optional().describe('URI of the artifact to update'),
   artifactId: z.string().uuid().optional().describe('ID of the artifact to update'),
+  newUri: artifactUriSchema
+    .optional()
+    .describe(
+      'Rename/move the artifact to this URI (moving between Library folders = changing the namespace segment). The old URI keeps resolving via an alias.'
+    ),
   title: z.string().optional().describe('New title'),
   content: z.string().optional().describe('New content'),
   baseVersion: z
@@ -337,6 +354,60 @@ function resolveArtifactForUser(
   return query;
 }
 
+type ArtifactRow = Database['public']['Tables']['artifacts']['Row'];
+
+/**
+ * Resolve an artifact by URI or id, falling back to artifact_uri_aliases on a
+ * canonical URI miss — a rename leaves the old URI resolving forever
+ * (spec:library). resolvedViaAlias carries the requested URI when the alias
+ * path was taken, so callers can tell readers the canonical address.
+ */
+async function resolveArtifactRowForUser(
+  supabase: SupabaseClient<Database>,
+  userId: string,
+  workspaceId: string | undefined,
+  params: { uri?: string; artifactId?: string }
+): Promise<{ artifact: ArtifactRow | null; resolvedViaAlias: string | null }> {
+  const { data, error } = await resolveArtifactForUser(
+    supabase,
+    userId,
+    workspaceId,
+    params
+  ).maybeSingle();
+  if (error && error.code !== 'PGRST116') {
+    throw new Error(`Failed to resolve artifact: ${error.message}`);
+  }
+  if (data || !params.uri) {
+    return { artifact: data ?? null, resolvedViaAlias: null };
+  }
+
+  const { data: alias, error: aliasError } = await supabase
+    .from('artifact_uri_aliases')
+    .select('artifact_id')
+    .eq('alias_uri', params.uri)
+    .eq('user_id', userId)
+    .maybeSingle();
+  // A lookup failure is infrastructure, not a miss — surfacing it as
+  // not-found would make renamed artifacts appear absent (round 1, Lumen).
+  if (aliasError) {
+    throw new Error(`Failed to resolve artifact alias: ${aliasError.message}`);
+  }
+  if (!alias) {
+    return { artifact: null, resolvedViaAlias: null };
+  }
+
+  const { data: aliased, error: aliasedError } = await resolveArtifactForUser(
+    supabase,
+    userId,
+    workspaceId,
+    { artifactId: alias.artifact_id }
+  ).maybeSingle();
+  if (aliasedError && aliasedError.code !== 'PGRST116') {
+    throw new Error(`Failed to resolve artifact: ${aliasedError.message}`);
+  }
+  return { artifact: aliased ?? null, resolvedViaAlias: aliased ? params.uri : null };
+}
+
 // ============== Handlers ==============
 
 export async function handleCreateArtifact(args: unknown, dataComposer: DataComposer) {
@@ -395,6 +466,20 @@ export async function handleCreateArtifact(args: unknown, dataComposer: DataComp
 
   if (existing) {
     throw new Error(`Artifact with URI "${uri}" already exists`);
+  }
+
+  // A URI that was left behind by a rename stays reserved: creating there would
+  // silently capture every reader still following the old link. The DB trigger
+  // backstops this check against races.
+  const { data: aliasHit } = await supabase
+    .from('artifact_uri_aliases')
+    .select('artifact_id')
+    .eq('alias_uri', uri)
+    .maybeSingle();
+  if (aliasHit) {
+    throw new Error(
+      `Artifact URI "${uri}" is an alias of an existing artifact (it was renamed). Choose a different URI.`
+    );
   }
 
   const { data: artifact, error } = await supabase
@@ -475,16 +560,12 @@ export async function handleGetArtifact(args: unknown, dataComposer: DataCompose
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
 
   const { uri, artifactId, includeComments = false, commentLimit = 50, workspaceId } = parsed;
-  const query = resolveArtifactForUser(supabase, resolved.user.id, workspaceId, {
-    uri,
-    artifactId,
-  });
-
-  const { data: artifact, error } = await query.maybeSingle();
-
-  if (error && error.code !== 'PGRST116') {
-    throw new Error(`Failed to get artifact: ${error.message}`);
-  }
+  const { artifact, resolvedViaAlias } = await resolveArtifactRowForUser(
+    supabase,
+    resolved.user.id,
+    workspaceId,
+    { uri, artifactId }
+  );
 
   if (!artifact) {
     return {
@@ -626,6 +707,13 @@ export async function handleGetArtifact(args: unknown, dataComposer: DataCompose
         type: 'text' as const,
         text: JSON.stringify({
           success: true,
+          ...(resolvedViaAlias
+            ? {
+                resolvedViaAlias,
+                canonicalUri: artifact.uri,
+                note: `"${resolvedViaAlias}" is a former URI of this artifact; update links to ${artifact.uri}.`,
+              }
+            : {}),
           artifact: {
             id: artifact.id,
             uri: artifact.uri,
@@ -660,6 +748,7 @@ export async function handleUpdateArtifact(args: unknown, dataComposer: DataComp
   const {
     uri,
     artifactId,
+    newUri,
     title,
     content,
     baseVersion,
@@ -691,15 +780,15 @@ export async function handleUpdateArtifact(args: unknown, dataComposer: DataComp
     agentId
   );
 
-  // First, get the current artifact
-  const query = resolveArtifactForUser(supabase, resolved.user.id, workspaceScope, {
-    uri,
-    artifactId,
-  });
+  // First, get the current artifact (alias-aware: renamed URIs keep working)
+  const { artifact: current, resolvedViaAlias } = await resolveArtifactRowForUser(
+    supabase,
+    resolved.user.id,
+    workspaceScope,
+    { uri, artifactId }
+  );
 
-  const { data: current, error: fetchError } = await query.single();
-
-  if (fetchError) {
+  if (!current) {
     throw new Error(`Artifact not found: ${uri || artifactId}`);
   }
 
@@ -717,6 +806,33 @@ export async function handleUpdateArtifact(args: unknown, dataComposer: DataComp
     if (!isCreator && !hasEditorAccess) {
       throw new Error(`Agent ${agentId} does not have permission to edit this artifact`);
     }
+  }
+
+  // Rename: validate the target URI before any write. The DB triggers backstop
+  // every one of these checks against races (spec:library).
+  let renameFrom: string | null = null;
+  let redundantAliasId: string | null = null;
+  if (newUri !== undefined && newUri !== current.uri) {
+    const { data: occupied } = await supabase
+      .from('artifacts')
+      .select('id')
+      .eq('uri', newUri)
+      .maybeSingle();
+    if (occupied) {
+      throw new Error(`Cannot rename: an artifact already exists at "${newUri}"`);
+    }
+    const { data: aliasAtTarget } = await supabase
+      .from('artifact_uri_aliases')
+      .select('id, artifact_id')
+      .eq('alias_uri', newUri)
+      .maybeSingle();
+    if (aliasAtTarget && aliasAtTarget.artifact_id !== current.id) {
+      throw new Error(`Cannot rename: "${newUri}" is an alias of another artifact`);
+    }
+    renameFrom = current.uri;
+    // Renaming back to one of this artifact's own former URIs: the alias there
+    // becomes redundant and is deleted after the rename lands.
+    redundantAliasId = aliasAtTarget?.id ?? null;
   }
 
   // Three-way merge logic when content is being updated and baseVersion is provided
@@ -839,6 +955,7 @@ export async function handleUpdateArtifact(args: unknown, dataComposer: DataComp
     throw new Error('editMode "editors" requires at least one editor');
   }
 
+  if (renameFrom) updates.uri = newUri;
   if (title !== undefined) updates.title = title;
   if (finalContent !== undefined) updates.content = finalContent;
   if (editMode !== undefined || editors !== undefined || collaborators !== undefined) {
@@ -846,6 +963,38 @@ export async function handleUpdateArtifact(args: unknown, dataComposer: DataComp
     updates.collaborators = nextEditors;
   }
   if (tags !== undefined) updates.tags = tags;
+
+  // Reserve the old URI BEFORE the CAS releases it (round 1, Lumen: with
+  // insert-after-update the old URI was capturable between the two
+  // statements — a squatter created at A after the CAS made the alias insert
+  // fail, silently retargeting old links). The trigger permits an alias at
+  // its own target's live URI exactly for this reservation; canonical
+  // resolution wins until the CAS lands, a leftover reservation after a lost
+  // CAS or a crash still points at the artifact that owns the URI, and a
+  // reservation failure aborts the rename before anything has moved.
+  if (renameFrom) {
+    const { error: reserveError } = await supabase.from('artifact_uri_aliases').insert({
+      user_id: resolved.user.id,
+      workspace_id: current.workspace_id,
+      artifact_id: current.id,
+      alias_uri: renameFrom,
+    });
+    if (reserveError) {
+      // A unique violation here should only be our own earlier reservation —
+      // the triggers reject every other combination at our live URI. Verify
+      // rather than assume; anything else aborts with nothing written.
+      const { data: existingReservation, error: reservationLookupError } = await supabase
+        .from('artifact_uri_aliases')
+        .select('artifact_id')
+        .eq('alias_uri', renameFrom)
+        .maybeSingle();
+      if (reservationLookupError || existingReservation?.artifact_id !== current.id) {
+        throw new Error(
+          `Cannot rename: failed to reserve the old URI "${renameFrom}" (${reserveError.message})`
+        );
+      }
+    }
+  }
 
   // CAS (compare-and-swap) guard: only write if version hasn't changed since we read it.
   // This prevents true race conditions where two concurrent writers both pass the
@@ -888,11 +1037,19 @@ export async function handleUpdateArtifact(args: unknown, dataComposer: DataComp
     };
   }
 
+  // Rename-back only: the alias that pointed at the URI we now live at again
+  // is redundant — remove it so resolution has one canonical path.
+  if (renameFrom && redundantAliasId) {
+    await supabase.from('artifact_uri_aliases').delete().eq('id', redundantAliasId);
+  }
+
   // Create history entry for this update
   const changeType = mergePerformed ? 'merge' : 'update';
-  const mergeSummary = mergePerformed
+  const renameNote = renameFrom ? `Renamed ${renameFrom} → ${updated.uri}. ` : '';
+  const baseSummaryText = mergePerformed
     ? `Auto-merged with version ${current.version} (base: ${baseVersion}). ${changeSummary || ''}`
-    : changeSummary || null;
+    : changeSummary || '';
+  const mergeSummary = `${renameNote}${baseSummaryText}`.trim() || null;
 
   await supabase.from('artifact_history').insert({
     artifact_id: current.id,
@@ -943,6 +1100,13 @@ export async function handleUpdateArtifact(args: unknown, dataComposer: DataComp
           previousVersion: current.version,
           mergePerformed,
           ...(mergePerformed ? { mergedFromBase: baseVersion } : {}),
+          ...(renameFrom
+            ? {
+                renamedFrom: renameFrom,
+                note: `The old URI ${renameFrom} keeps resolving via an alias.`,
+              }
+            : {}),
+          ...(resolvedViaAlias ? { resolvedViaAlias, canonicalUri: updated.uri } : {}),
         }),
       },
     ],
@@ -1017,15 +1181,15 @@ export async function handleGetArtifactHistory(args: unknown, dataComposer: Data
 
   const { uri, artifactId, limit = 10, workspaceId } = parsed;
 
-  // First get the artifact to verify ownership
-  const artifactQuery = resolveArtifactForUser(supabase, resolved.user.id, workspaceId, {
-    uri,
-    artifactId,
-  });
+  // First get the artifact to verify ownership (alias-aware)
+  const { artifact, resolvedViaAlias } = await resolveArtifactRowForUser(
+    supabase,
+    resolved.user.id,
+    workspaceId,
+    { uri, artifactId }
+  );
 
-  const { data: artifact, error: artifactError } = await artifactQuery.single();
-
-  if (artifactError) {
+  if (!artifact) {
     throw new Error(`Artifact not found: ${uri || artifactId}`);
   }
 
@@ -1045,6 +1209,7 @@ export async function handleGetArtifactHistory(args: unknown, dataComposer: Data
         type: 'text' as const,
         text: JSON.stringify({
           success: true,
+          ...(resolvedViaAlias ? { resolvedViaAlias, canonicalUri: artifact.uri } : {}),
           artifactId: artifact.id,
           count: history?.length || 0,
           history: (history || []).map((h) => ({
@@ -1090,14 +1255,12 @@ export async function handleAddArtifactComment(args: unknown, dataComposer: Data
   }
   const workspaceScope = workspaceResolution.workspaceId;
 
-  const { data: artifact, error: artifactError } = await resolveArtifactForUser(
-    supabase,
-    resolved.user.id,
-    workspaceScope,
-    { uri, artifactId }
-  ).single();
+  const { artifact } = await resolveArtifactRowForUser(supabase, resolved.user.id, workspaceScope, {
+    uri,
+    artifactId,
+  });
 
-  if (artifactError) {
+  if (!artifact) {
     throw new Error(`Artifact not found: ${uri || artifactId}`);
   }
 
@@ -1195,14 +1358,14 @@ export async function handleListArtifactComments(args: unknown, dataComposer: Da
 
   const { uri, artifactId, limit = 100, workspaceId } = parsed;
 
-  const { data: artifact, error: artifactError } = await resolveArtifactForUser(
+  const { artifact, resolvedViaAlias } = await resolveArtifactRowForUser(
     supabase,
     resolved.user.id,
     workspaceId,
     { uri, artifactId }
-  ).single();
+  );
 
-  if (artifactError) {
+  if (!artifact) {
     throw new Error(`Artifact not found: ${uri || artifactId}`);
   }
 
@@ -1273,6 +1436,7 @@ export async function handleListArtifactComments(args: unknown, dataComposer: Da
         type: 'text' as const,
         text: JSON.stringify({
           success: true,
+          ...(resolvedViaAlias ? { resolvedViaAlias, canonicalUri: artifact.uri } : {}),
           artifactId: artifact.id,
           artifactUri: artifact.uri,
           count: comments?.length || 0,
@@ -1380,14 +1544,14 @@ export const artifactToolDefinitions = [
   {
     name: 'get_artifact',
     description:
-      'Get an artifact by URI or ID. Returns the full content and metadata, with optional comments.',
+      'Get an artifact by URI or ID. Returns the full content and metadata, with optional comments. Renamed URIs keep resolving via aliases — the response then carries resolvedViaAlias plus the canonical URI.',
     schema: getArtifactSchema,
     handler: handleGetArtifact,
   },
   {
     name: 'update_artifact',
     description:
-      'Update an artifact. Supports three-way merge via baseVersion parameter to prevent data loss during concurrent edits. Pass baseVersion (from the version you read) to enable auto-merge.',
+      'Update an artifact. Supports three-way merge via baseVersion parameter to prevent data loss during concurrent edits. Pass baseVersion (from the version you read) to enable auto-merge. Pass newUri to rename/move it between Library folders (the URI namespace) — the old URI keeps resolving via an alias.',
     schema: updateArtifactSchema,
     handler: handleUpdateArtifact,
   },

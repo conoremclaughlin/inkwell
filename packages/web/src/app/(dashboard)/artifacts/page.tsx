@@ -1,7 +1,8 @@
 'use client';
 
+import { useState } from 'react';
 import Link from 'next/link';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import {
   FileText,
@@ -13,8 +14,13 @@ import {
   Users,
   Lock,
   History,
+  Folder,
+  FolderOpen,
+  ChevronDown,
+  ChevronRight,
 } from 'lucide-react';
 import { useApiQuery } from '@/lib/api';
+import { groupByNamespace } from '@/lib/artifacts/namespace';
 import clsx from 'clsx';
 
 interface Artifact {
@@ -97,13 +103,69 @@ function formatRelativeTime(date: string): string {
   return target.toLocaleDateString();
 }
 
-export default function ArtifactsPage() {
+function ArtifactRow({ artifact }: { artifact: Artifact }) {
+  const config = typeConfig[artifact.artifactType] || typeConfig.document;
+  const visConfig = visibilityConfig[artifact.visibility] || visibilityConfig.private;
+  const TypeIcon = config.icon;
+  const VisIcon = visConfig.icon;
+
+  return (
+    <Link
+      href={`/artifacts/${artifact.id}`}
+      className="block rounded-lg border border-gray-200 p-4 hover:border-gray-400 hover:shadow-sm transition-all"
+    >
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+        <div className="flex-1 min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <TypeIcon className={clsx('h-4 w-4 shrink-0', config.color)} />
+            <h3 className="font-semibold text-gray-900">{artifact.title}</h3>
+            <Badge className={clsx('text-xs', config.bgColor, config.color)}>{config.label}</Badge>
+            <Badge variant="outline" className="text-xs">
+              <VisIcon className="h-3 w-3 mr-1" />
+              {visConfig.label}
+            </Badge>
+            <Badge variant="outline" className="text-xs">
+              {artifact.editMode === 'workspace' ? 'Workspace edit' : 'Editors only'}
+            </Badge>
+            <span className="text-xs text-gray-400">v{artifact.version}</span>
+            {artifact.version > 1 && (
+              <span className="text-xs text-blue-500 flex items-center gap-1">
+                <History className="h-3 w-3" />
+                {artifact.version} versions
+              </span>
+            )}
+          </div>
+          <p className="text-sm text-gray-500 mt-1 font-mono break-all">{artifact.uri}</p>
+          {artifact.tags && artifact.tags.length > 0 && (
+            <div className="flex flex-wrap gap-1 mt-2">
+              {artifact.tags.map((tag) => (
+                <Badge key={tag} variant="secondary" className="text-xs">
+                  {tag}
+                </Badge>
+              ))}
+            </div>
+          )}
+        </div>
+        <div className="text-sm text-gray-500 shrink-0 sm:text-right">
+          <div>Updated {formatRelativeTime(artifact.updatedAt)}</div>
+          <div className="text-xs text-gray-400 mt-1">
+            Created {formatRelativeTime(artifact.createdAt)}
+          </div>
+        </div>
+      </div>
+    </Link>
+  );
+}
+
+export default function LibraryPage() {
   const { data, isLoading, error } = useApiQuery<ArtifactsResponse>(
     ['artifacts'],
     '/api/admin/artifacts'
   );
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
 
   const artifacts = data?.artifacts ?? [];
+  const shelves = groupByNamespace(artifacts);
 
   // Stats by type
   const stats = {
@@ -119,9 +181,10 @@ export default function ArtifactsPage() {
     <div>
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-3xl font-bold text-gray-900">Documents</h1>
+          <h1 className="text-3xl font-bold text-gray-900">Library</h1>
           <p className="mt-2 text-gray-600">
-            Shared documents, specs, and designs that AI beings collaborate on.
+            Shared specs, ideas, and documents that AI beings collaborate on — shelved by URI
+            namespace.
           </p>
         </div>
       </div>
@@ -129,7 +192,7 @@ export default function ArtifactsPage() {
       {error && <div className="mt-4 rounded-md bg-red-50 p-4 text-red-800">{error.message}</div>}
 
       {/* Stats */}
-      <div className="grid grid-cols-6 gap-4 mt-6">
+      <div className="grid grid-cols-3 gap-4 mt-6 lg:grid-cols-6">
         {Object.entries(typeConfig).map(([type, config]) => {
           const TypeIcon = config.icon;
           const count = stats[type as keyof typeof stats] || 0;
@@ -152,86 +215,65 @@ export default function ArtifactsPage() {
         </Card>
       </div>
 
-      {/* Documents List */}
-      <Card className="mt-6">
-        <CardHeader>
-          <CardTitle>All Documents</CardTitle>
-          <CardDescription>Sorted by last updated</CardDescription>
-        </CardHeader>
-        <CardContent>
-          {isLoading ? (
+      {/* Shelves */}
+      {isLoading ? (
+        <Card className="mt-6">
+          <CardContent className="py-8">
             <p className="text-gray-500">Loading...</p>
-          ) : artifacts.length === 0 ? (
-            <div className="text-center py-8">
+          </CardContent>
+        </Card>
+      ) : shelves.length === 0 ? (
+        <Card className="mt-6">
+          <CardContent className="py-8">
+            <div className="text-center">
               <FileText className="h-12 w-12 mx-auto text-gray-300 mb-3" />
-              <p className="text-gray-500">No documents yet.</p>
+              <p className="text-gray-500">The Library is empty.</p>
               <p className="text-sm text-gray-400 mt-1">
                 Use the <code className="bg-gray-100 px-1 rounded">create_artifact</code> tool to
-                create one.
+                add the first document.
               </p>
             </div>
-          ) : (
-            <div className="space-y-4">
-              {artifacts.map((artifact) => {
-                const config = typeConfig[artifact.artifactType] || typeConfig.document;
-                const visConfig = visibilityConfig[artifact.visibility] || visibilityConfig.private;
-                const TypeIcon = config.icon;
-                const VisIcon = visConfig.icon;
-
-                return (
-                  <Link
-                    key={artifact.id}
-                    href={`/artifacts/${artifact.id}`}
-                    className="block rounded-lg border border-gray-200 p-4 hover:border-gray-400 hover:shadow-sm transition-all"
-                  >
-                    <div className="flex items-start justify-between">
-                      <div className="flex-1">
-                        <div className="flex items-center gap-2">
-                          <TypeIcon className={clsx('h-4 w-4', config.color)} />
-                          <h3 className="font-semibold text-gray-900">{artifact.title}</h3>
-                          <Badge className={clsx('text-xs', config.bgColor, config.color)}>
-                            {config.label}
-                          </Badge>
-                          <Badge variant="outline" className="text-xs">
-                            <VisIcon className="h-3 w-3 mr-1" />
-                            {visConfig.label}
-                          </Badge>
-                          <Badge variant="outline" className="text-xs">
-                            {artifact.editMode === 'workspace' ? 'Workspace edit' : 'Editors only'}
-                          </Badge>
-                          <span className="text-xs text-gray-400">v{artifact.version}</span>
-                          {artifact.version > 1 && (
-                            <span className="text-xs text-blue-500 flex items-center gap-1">
-                              <History className="h-3 w-3" />
-                              {artifact.version} versions
-                            </span>
-                          )}
-                        </div>
-                        <p className="text-sm text-gray-500 mt-1 font-mono">{artifact.uri}</p>
-                        {artifact.tags && artifact.tags.length > 0 && (
-                          <div className="flex flex-wrap gap-1 mt-2">
-                            {artifact.tags.map((tag) => (
-                              <Badge key={tag} variant="secondary" className="text-xs">
-                                {tag}
-                              </Badge>
-                            ))}
-                          </div>
-                        )}
-                      </div>
-                      <div className="text-right text-sm text-gray-500">
-                        <div>Updated {formatRelativeTime(artifact.updatedAt)}</div>
-                        <div className="text-xs text-gray-400 mt-1">
-                          Created {formatRelativeTime(artifact.createdAt)}
-                        </div>
-                      </div>
+          </CardContent>
+        </Card>
+      ) : (
+        <div className="mt-6 space-y-4">
+          {shelves.map((shelf) => {
+            const isCollapsed = collapsed[shelf.namespace] ?? false;
+            const FolderIcon = isCollapsed ? Folder : FolderOpen;
+            const Chevron = isCollapsed ? ChevronRight : ChevronDown;
+            return (
+              <Card key={shelf.namespace}>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setCollapsed((prev) => ({ ...prev, [shelf.namespace]: !isCollapsed }))
+                  }
+                  className="w-full flex items-center gap-2 px-6 py-4 text-left hover:bg-gray-50 transition-colors rounded-t-lg"
+                >
+                  <Chevron className="h-4 w-4 text-gray-400" />
+                  <FolderIcon className="h-5 w-5 text-amber-600" />
+                  <span className="font-semibold text-gray-900">{shelf.namespace}</span>
+                  <span className="hidden sm:inline text-sm text-gray-400 font-mono">
+                    ink://{shelf.namespace}/
+                  </span>
+                  <Badge variant="secondary" className="ml-auto text-xs">
+                    {shelf.items.length}
+                  </Badge>
+                </button>
+                {!isCollapsed && (
+                  <CardContent className="pt-0">
+                    <div className="space-y-3">
+                      {shelf.items.map((artifact) => (
+                        <ArtifactRow key={artifact.id} artifact={artifact} />
+                      ))}
                     </div>
-                  </Link>
-                );
-              })}
-            </div>
-          )}
-        </CardContent>
-      </Card>
+                  </CardContent>
+                )}
+              </Card>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }
