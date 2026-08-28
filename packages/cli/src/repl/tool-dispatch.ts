@@ -69,17 +69,80 @@ export function bareToolName(tool: string): string {
   return tool.replace(/^mcp__inkwell__/, '');
 }
 
+/**
+ * A tool named for an MCP server this runtime does not host.
+ *
+ * The ink chat loop has no generic MCP client — it reaches exactly two places,
+ * the Inkwell server and in-process coding tools. So `mcp__github__*` is not a
+ * misconfiguration that a token or a config file could fix; there is nothing
+ * here for it to connect to.
+ *
+ * Worth its own branch because the fallthrough's answer — posting the literal
+ * name to Inkwell and relaying `-32602 tool not found` — is indistinguishable
+ * from a typo, and the difference is what the reader should do next. Myra spent
+ * two attempts across two days on `mcp__github__list_issues` before falling
+ * back to searching Gmail, because nothing told her the capability was absent
+ * rather than misspelled.
+ */
+const FOREIGN_MCP_NAMESPACE = /^mcp__([a-z0-9_-]+)__(.+)$/i;
+
+function foreignNamespaceRefusal(tool: string): PcpToolCallResult | null {
+  const match = FOREIGN_MCP_NAMESPACE.exec(tool);
+  if (!match) return null;
+  const [, server, bare] = match;
+  return {
+    content: [
+      {
+        type: 'text',
+        text:
+          `${tool} is not available: this runtime hosts no "${server}" MCP server, ` +
+          `so no configuration or credential will make it resolve.\n\n` +
+          `Reachable from here: Inkwell tools (call them bare — "${bare}", not "${tool}") ` +
+          `and in-process coding tools (read, edit, write, bash, grep, find, ls) ` +
+          `scoped to the working directory.\n\n` +
+          `If you need this capability, say so plainly rather than retrying — ` +
+          `a shell command via bash may cover it, otherwise it needs a human to add it.`,
+      },
+    ],
+    isError: true,
+  } as PcpToolCallResult;
+}
+
 export function createLocalToolDispatcher(deps: LocalToolDispatchDeps): LocalToolDispatcher {
   return async (tool, args, ctx) => {
-    const handled = await deps.head?.(tool, args, ctx);
+    // Normalize ONCE, before anything branches on the name.
+    //
+    // A text-protocol model names tools from memory, and a long-lived session
+    // drifts toward its priors: after weeks on one native session Myra began
+    // emitting `mcp__inkwell__bash` and `mcp__inkwell__signal_status` instead
+    // of the bare names she had been taught. Every branch below used to test
+    // the RAW name, so only the last one — the PCP fallthrough — stripped the
+    // namespace. A namespaced coding tool or ledger tool therefore sailed past
+    // its own handler and was posted to the server, which has no `bash` and no
+    // `signal_status`, and came back `-32602 tool not found`.
+    //
+    // Read literally that error says the tool does not exist, so she concluded
+    // she had no shell and stopped reaching for one — while holding a working,
+    // unsandboxed `bash` she had already run 205 times. Normalizing at the one
+    // chokepoint both hosts share means a future branch cannot reintroduce
+    // this by testing the raw name.
+    const name = bareToolName(tool);
+
+    const handled = await deps.head?.(name, args, ctx);
     if (handled) return handled;
 
-    if (isPiTool(tool)) {
+    if (isPiTool(name)) {
       // ctx.signal, not a captured variable: the executor hands it over per
       // call, and this is the only place either host reaches a Pi tool.
-      return deps.callPi(tool, args, deps.cwd, ctx.signal);
+      return deps.callPi(name, args, deps.cwd, ctx.signal);
     }
 
-    return deps.callPcp(bareToolName(tool), deps.resolveCredentials(args));
+    // After the head and Pi tools, so a host that DOES serve a namespaced name
+    // still wins. `name` is already inkwell-stripped, so anything still
+    // carrying an `mcp__<server>__` prefix names a server we do not host.
+    const foreign = foreignNamespaceRefusal(name);
+    if (foreign) return foreign;
+
+    return deps.callPcp(name, deps.resolveCredentials(args));
   };
 }
