@@ -310,3 +310,40 @@ describe('executeToolCalls', () => {
     });
   });
 });
+
+describe('namespaced and miscased names at the executor boundary', () => {
+  // Lumen, PR #546 review: normalizing only at dispatch fixes execution and
+  // leaves every branch UPSTREAM reading the raw name. These pin the boundary.
+  it('bypasses policy for a client-local tool, and reports it under the bare name', async () => {
+    const deps = makeDeps();
+    const results = await executeToolCalls(
+      [makeCall('signal_status', { status: 'completed' })],
+      deps
+    );
+
+    expect(deps.policy.canCallPcpTool).not.toHaveBeenCalled();
+    expect(results[0].status).toBe('executed');
+    // The result carries the bare name, so terminal-signal detection sees it.
+    expect(results[0].tool).toBe('signal_status');
+  });
+
+  it('answers a miscased coding tool before policy, spending no grant', async () => {
+    // Behind policy, `safe` would prompt a human to approve a call that never
+    // runs, and `minimal` would block the correction from ever arriving.
+    const deps = makeDeps({
+      policy: {
+        canCallPcpTool: vi
+          .fn()
+          .mockReturnValue({ allowed: false, promptable: false, reason: 'blocked' }),
+      } as unknown as ToolCallExecutorDeps['policy'],
+    });
+
+    const results = await executeToolCalls([makeCall('Bash', { command: 'ls' })], deps);
+
+    expect(deps.policy.canCallPcpTool).not.toHaveBeenCalled();
+    expect(deps.promptForApproval).not.toHaveBeenCalled();
+    expect(deps.callTool).not.toHaveBeenCalled();
+    expect(results[0].status).toBe('executed');
+    expect(results[0].result?.content[0].text as string).toContain('"bash"');
+  });
+});

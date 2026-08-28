@@ -89,7 +89,7 @@ const FOREIGN_MCP_NAMESPACE = /^mcp__([a-z0-9_-]+)__(.+)$/i;
 function foreignNamespaceRefusal(tool: string): PcpToolCallResult | null {
   const match = FOREIGN_MCP_NAMESPACE.exec(tool);
   if (!match) return null;
-  const [, server, bare] = match;
+  const [, server] = match;
   return {
     content: [
       {
@@ -97,11 +97,12 @@ function foreignNamespaceRefusal(tool: string): PcpToolCallResult | null {
         text:
           `${tool} is not available: this runtime hosts no "${server}" MCP server, ` +
           `so no configuration or credential will make it resolve.\n\n` +
-          `Reachable from here: Inkwell tools (call them bare — "${bare}", not "${tool}") ` +
+          `Reachable from here: Inkwell tools (called bare, with no "mcp__" prefix) ` +
           `and in-process coding tools (read, edit, write, bash, grep, find, ls) ` +
           `scoped to the working directory.\n\n` +
-          `If you need this capability, say so plainly rather than retrying — ` +
-          `a shell command via bash may cover it, otherwise it needs a human to add it.`,
+          `Do not retry this as a bare name — dropping the prefix does not make a ` +
+          `"${server}" tool into an Inkwell one, and the retry will fail the same way. ` +
+          `A shell command via bash may cover it; otherwise it needs a human to add it.`,
       },
     ],
     isError: true,
@@ -128,7 +129,7 @@ function foreignNamespaceRefusal(tool: string): PcpToolCallResult | null {
  * that made this diagnosable — the Aug 24 regime change was only visible
  * because the miscased calls were logged under the name actually emitted.
  */
-function miscasedPiToolCorrection(tool: string): PcpToolCallResult | null {
+export function miscasedPiToolCorrection(tool: string): PcpToolCallResult | null {
   const lower = tool.toLowerCase();
   if (lower === tool || !isPiTool(lower)) return null;
   return {
