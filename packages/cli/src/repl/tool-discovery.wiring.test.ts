@@ -27,6 +27,7 @@ import { describe, expect, it } from 'vitest';
 import { runAgentLoop, type BackendTurnOutcome, type ToolResultRecord } from './agent-loop.js';
 import { executeToolCalls } from './tool-call-executor.js';
 import { ToolPolicyState } from './tool-policy.js';
+import { deriveClonePolicy, isForbiddenInClone } from './clone-policy.js';
 import { createLocalToolDispatcher } from './tool-dispatch.js';
 import { callPiTool } from './pi-tools.js';
 import { handleClientLocalTool, isClientLocalTool, createSignalSink } from './context-tools.js';
@@ -54,27 +55,37 @@ function serverDescribeTool(args: Record<string, unknown>): PcpToolCallResult {
   return {
     success: true,
     count: 3,
-    tools: ['bootstrap', 'recall', 'send_response'],
+    // Includes tools a clone is hard-denied, so the clone case has
+    // something real to filter. A server list of only-safe names would let a
+    // broken filter pass.
+    tools: ['bootstrap', 'recall', 'remember', 'send_response'],
     scope: 'This lists Inkwell MCP tools only.',
   };
 }
 
 /**
- * One turn, wired the way `chat.ts` wires the parent: a real policy with no
- * human behind it, the real dispatcher, real client-local handling.
+ * One turn, wired the way `chat.ts` wires it: a real policy with no human
+ * behind it, the real dispatcher, real client-local handling.
  *
  * `promptForApproval` returns false on purpose. Nobody is watching — that is
  * Myra's seat, a headless spawn — so anything not already permitted is refused.
  * A discovery call that needs approval fails this harness, which is the point:
  * it is how an agent ends up learning its surface by being told no.
+ *
+ * `audience: 'clone'` takes the CLONE's whole envelope, not just the flag:
+ * a policy from `deriveClonePolicy` and the refusal head `chat.ts` gives one.
+ * Passing the flag alone — which the first version of this file did — is how a
+ * clone-shaped assertion can pass against a parent-shaped session.
  */
 async function runDiscoveryTurn(opts: {
   args?: Record<string, unknown>;
   audience?: LocalToolAudience;
   profile?: ToolProfileId;
 }) {
-  const policy = new ToolPolicyState('backend', { persist: false });
-  if (opts.profile) applyProfile(policy, opts.profile);
+  const parentPolicy = new ToolPolicyState('backend', { persist: false });
+  if (opts.profile) applyProfile(parentPolicy, opts.profile);
+  const isClone = opts.audience === 'clone';
+  const policy = isClone ? deriveClonePolicy(parentPolicy).policy : parentPolicy;
   const ledger = new ContextLedger();
   const continuations: string[] = [];
   const refusals: Array<{ tool: string; status: string }> = [];
@@ -117,10 +128,20 @@ async function runDiscoveryTurn(opts: {
                   : ({ success: true } as PcpToolCallResult),
               resolveCredentials: (args) => args,
               audience: opts.audience ?? 'parent',
-              head: (tool, args) =>
-                isClientLocalTool(tool)
+              // The head chat.ts gives each host, refusal included.
+              head: (tool, args) => {
+                if (isClone && isForbiddenInClone(tool)) {
+                  return {
+                    content: [
+                      { type: 'text', text: `${tool} is not available to a shadow clone.` },
+                    ],
+                    isError: true,
+                  } as PcpToolCallResult;
+                }
+                return isClientLocalTool(tool)
                   ? handleClientLocalTool(tool, args, ledger, createSignalSink())
-                  : null,
+                  : null;
+              },
             }),
             promptForApproval: () => {
               approvalsAsked += 1;
@@ -194,14 +215,32 @@ describe('a turn that asks what it can call', () => {
     expect(seenByModel).not.toContain('No tool named "bash"');
   });
 
-  it('tells a clone the truth about its narrower surface', async () => {
+  it('tells a clone the truth about its narrower surface, server half included', async () => {
     const { continuations } = await runDiscoveryTurn({ audience: 'clone' });
 
     const seenByModel = continuations.join('\n');
     expect(seenByModel).toContain('read');
+    expect(seenByModel).toContain('recall');
     // A clone may not run a shell or fan out; listing them spends its turns on
     // calls the executor will refuse.
     expect(seenByModel).not.toContain('"bash"');
     expect(seenByModel).not.toContain('spawn_agent');
+    // And the same has to hold for the SERVER's half. Narrowing only the local
+    // additions left every hard-denied write tool advertised.
+    expect(seenByModel).not.toContain('send_response');
+    expect(seenByModel).not.toContain('remember');
+  });
+
+  it('tells a clone bash exists rather than that it does not', async () => {
+    const { continuations } = await runDiscoveryTurn({
+      audience: 'clone',
+      args: { name: 'bash' },
+    });
+
+    const seenByModel = continuations.join('\n');
+    expect(seenByModel).toContain('exists in this runtime');
+    expect(seenByModel).toContain('not available to a shadow clone');
+    // The sentence that started all of this, now wrong for a second reason.
+    expect(seenByModel).not.toContain('No tool named');
   });
 });

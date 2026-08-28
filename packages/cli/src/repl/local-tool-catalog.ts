@@ -348,6 +348,40 @@ function parseServerPayload(result: PcpToolCallResult): Record<string, unknown> 
 const SCOPE_NOTE =
   'Names marked ink-runtime run in-process in this CLI and are not registered with the Inkwell server, which is why a server-only listing omits them.';
 
+/**
+ * The scope the MERGED answer has, replacing the server's own.
+ *
+ * The server's `scope` says its list covers Inkwell MCP tools only and that
+ * absence from it proves nothing. True of what it sent; false of what the caller
+ * now holds, which contains `bash`. Carrying it through would have shipped an
+ * object asserting the list cannot contain runtime tools directly above a list
+ * of them — the same defect as the original, in the opposite direction and in
+ * the same field.
+ */
+const MERGED_SCOPE_NOTE =
+  'This list covers both namespaces reachable from this session: Inkwell MCP tools served by the server, and the tools this runtime runs in-process (named under runtimeTools).';
+
+const CLONE_SCOPE_NOTE =
+  'Tools a shadow clone may not call are omitted from this list. Some of what remains still needs the parent to approve it at call time.';
+
+function scopeFor(audience: LocalToolAudience): string {
+  return audience === 'clone' ? `${MERGED_SCOPE_NOTE} ${CLONE_SCOPE_NOTE}` : MERGED_SCOPE_NOTE;
+}
+
+/**
+ * Server names this audience genuinely cannot call.
+ *
+ * `audience: 'clone'` narrowed only the local additions, so the server's half
+ * still advertised `remember`, `send_response` and every other hard denial —
+ * a discovery list over-reporting the surface, which is this bug in the
+ * reassuring-the-other-way direction. Filtered by `CLONE_DENIED_TOOLS` and
+ * nothing more: tools merely outside the clone baseline are promptable, not
+ * impossible, and dropping those would under-report all over again.
+ */
+function visibleToAudience(name: string, audience: LocalToolAudience): boolean {
+  return audience === 'parent' || !isForbiddenInClone(name);
+}
+
 export interface DescribeToolLocalOptions {
   audience: LocalToolAudience;
   cwd: string;
@@ -382,6 +416,24 @@ export async function describeToolWithLocalSurface(
         success: true,
         tool: await describeLocalTool(entry, opts.cwd),
         note: SCOPE_NOTE,
+        scope: scopeFor(opts.audience),
+      };
+    }
+
+    // Real here, but not for this caller. Only reachable for a clone, since a
+    // parent's lookup above searches the whole catalog.
+    //
+    // Answered here rather than left to fall through, because the server's
+    // "no tool named bash" is exactly the sentence this PR exists to stop
+    // shipping: it is true of the Inkwell namespace and false of the runtime,
+    // and the caller cannot tell which one it was told.
+    const excluded = findLocalTool(name, 'parent');
+    if (excluded) {
+      return {
+        success: false,
+        error: `"${excluded.name}" exists in this runtime but is not available to a shadow clone. Report what you found and let your parent act on it.`,
+        tool: { name: excluded.name, group: excluded.group, source: 'ink-runtime' },
+        scope: scopeFor(opts.audience),
       };
     }
   }
@@ -401,7 +453,12 @@ export async function describeToolWithLocalSurface(
         .map((entry) => entry.name);
       if (suggestions.length === 0) return serverResult;
       const existing = Array.isArray(payload.didYouMean) ? (payload.didYouMean as string[]) : [];
-      return { ...payload, didYouMean: [...existing, ...suggestions], note: SCOPE_NOTE };
+      return {
+        ...payload,
+        didYouMean: [...existing, ...suggestions],
+        note: SCOPE_NOTE,
+        scope: scopeFor(opts.audience),
+      };
     }
     return serverResult;
   }
@@ -419,21 +476,36 @@ export async function describeToolWithLocalSurface(
         summary: discoverySummary(entry),
         source: 'ink-runtime' as const,
       }));
-    if (matches.length === 0) return serverResult;
-    const tools = [...(payload.tools as unknown[]), ...matches];
+    const serverMatches = (payload.tools as unknown[]).filter((tool) => {
+      const toolName = (tool as { name?: unknown })?.name;
+      return typeof toolName !== 'string' || visibleToAudience(toolName, opts.audience);
+    });
+    if (matches.length === 0 && serverMatches.length === (payload.tools as unknown[]).length) {
+      return serverResult;
+    }
+    const tools = [...serverMatches, ...matches];
     return {
       ...payload,
       count: tools.length,
       tools,
       hint: 'Call describe_tool with `name` to get the full parameter schema for one of these.',
       note: SCOPE_NOTE,
+      scope: scopeFor(opts.audience),
     };
   }
 
   if (!Array.isArray(payload.tools)) return serverResult;
   const runtimeTools = local.map((entry) => entry.name);
-  const tools = [...(payload.tools as string[]), ...runtimeTools].sort((a, b) =>
-    a.localeCompare(b)
+  const serverTools = (payload.tools as string[]).filter((toolName) =>
+    visibleToAudience(toolName, opts.audience)
   );
-  return { ...payload, count: tools.length, tools, runtimeTools, note: SCOPE_NOTE };
+  const tools = [...serverTools, ...runtimeTools].sort((a, b) => a.localeCompare(b));
+  return {
+    ...payload,
+    count: tools.length,
+    tools,
+    runtimeTools,
+    note: SCOPE_NOTE,
+    scope: scopeFor(opts.audience),
+  };
 }

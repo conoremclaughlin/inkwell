@@ -210,7 +210,11 @@ describe('describeToolWithLocalSurface', () => {
     ]);
   });
 
-  it('does not offer a clone a tool it may not call', async () => {
+  it('tells a clone that bash exists but is not for it, rather than that it does not exist', async () => {
+    // This test previously asserted the server's not-found reached the clone,
+    // which pinned the exact defect the PR is about: "no tool named bash" is
+    // true of the Inkwell namespace and false of this runtime, and the caller
+    // cannot tell which one it was told.
     const callServer = vi.fn(async () =>
       serverPayload({ success: false, error: 'No tool named "bash" in the Inkwell MCP namespace.' })
     );
@@ -221,8 +225,66 @@ describe('describeToolWithLocalSurface', () => {
       )
     );
 
-    expect(callServer).toHaveBeenCalled();
+    expect(callServer).not.toHaveBeenCalled();
     expect(parsed.success).toBe(false);
+    expect(parsed.error).toContain('exists in this runtime');
+    expect(parsed.error).toContain('not available to a shadow clone');
+    expect(parsed.error).not.toContain('No tool named');
+  });
+
+  it('does not advertise server tools a clone is hard-denied', async () => {
+    // audience:'clone' narrowed only the local additions, so the server's half
+    // still offered every write-side tool the executor refuses. A discovery
+    // list over-reporting the surface is the same defect pointed the other way.
+    const parsed = payloadOf(
+      await describeToolWithLocalSurface(
+        {},
+        {
+          audience: 'clone',
+          cwd: '/work',
+          callServer: async () =>
+            serverPayload({
+              success: true,
+              count: 4,
+              tools: ['recall', 'remember', 'send_response', 'list_tasks'],
+            }),
+        }
+      )
+    );
+
+    expect(parsed.tools).toContain('recall');
+    expect(parsed.tools).toContain('list_tasks');
+    expect(parsed.tools).not.toContain('remember');
+    expect(parsed.tools).not.toContain('send_response');
+    expect(parsed.count).toBe(parsed.tools.length);
+    expect(parsed.scope).toContain('Tools a shadow clone may not call are omitted');
+  });
+
+  it('replaces the server-only scope instead of contradicting itself', async () => {
+    // The server's scope says the list cannot contain runtime tools. After the
+    // merge it does, so carrying that sentence through would ship an object
+    // denying its own contents — the original defect in the same field.
+    const parsed = payloadOf(
+      await describeToolWithLocalSurface(
+        {},
+        {
+          audience: 'parent',
+          cwd: '/work',
+          callServer: async () =>
+            serverPayload({
+              success: true,
+              count: 1,
+              tools: ['recall'],
+              scope:
+                'This lists Inkwell MCP tools only. Absence from it is not evidence a tool is unavailable to you.',
+            }),
+        }
+      )
+    );
+
+    expect(parsed.tools).toContain('bash');
+    expect(parsed.scope).not.toContain('Inkwell MCP tools only');
+    expect(parsed.scope).toContain('both namespaces');
   });
 
   it('points a near-miss at the local tool it was reaching for', async () => {
