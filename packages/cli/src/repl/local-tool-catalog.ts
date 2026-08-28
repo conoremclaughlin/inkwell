@@ -297,6 +297,18 @@ export async function describeLocalTool(
   }
 }
 
+/**
+ * Tools the executor runs without consulting policy at all.
+ *
+ * Delegates to the executor's own predicate so the two cannot diverge: if the
+ * exemption ever changes, discovery changes with it. Getting this wrong is not
+ * a cosmetic mismatch — a denied-but-still-running tool that discovery hides is
+ * the original bug exactly, an agent told it lacks something it has.
+ */
+function isPolicyExempt(tool: string): boolean {
+  return isClientLocalTool(tool.trim().toLowerCase());
+}
+
 /** True for any name this runtime serves in-process, whatever the audience. */
 export function isLocalRuntimeTool(name: string): boolean {
   const bare = name.trim().toLowerCase();
@@ -447,7 +459,15 @@ export async function describeToolWithLocalSurface(
 ): Promise<PcpToolCallResult> {
   const name = typeof args.name === 'string' ? args.name : undefined;
   const search = typeof args.search === 'string' ? args.search : undefined;
-  const denied = (tool: string) => opts.isHardDenied?.(tool) === true;
+  // Client-local tools bypass policy AT EXECUTION (tool-call-executor.ts:119) —
+  // they touch only the in-memory ledger, and an SB must be able to inspect and
+  // signal its own turn without a permission gate. So a policy denial does not
+  // stop them running, and hiding them for one would put discovery back out of
+  // step with callability in the original, under-reporting direction.
+  //
+  // Same predicate the executor uses, not a copy of its list. A copy is how the
+  // prompt and discovery came to disagree in the first place.
+  const denied = (tool: string) => !isPolicyExempt(tool) && opts.isHardDenied?.(tool) === true;
   // Two filters, and they answer different questions. `audience` is what this
   // host ADVERTISES — the same catalog the system prompt renders. `denied` is
   // what the live policy will actually REFUSE. A tool can be advertised and

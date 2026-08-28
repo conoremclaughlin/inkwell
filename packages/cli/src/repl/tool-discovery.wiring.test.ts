@@ -81,11 +81,13 @@ async function runDiscoveryTurn(opts: {
   args?: Record<string, unknown>;
   audience?: LocalToolAudience;
   profile?: ToolProfileId;
+  deny?: string[];
 }) {
   const parentPolicy = new ToolPolicyState('backend', { persist: false });
   if (opts.profile) applyProfile(parentPolicy, opts.profile);
   const isClone = opts.audience === 'clone';
   const policy = isClone ? deriveClonePolicy(parentPolicy).policy : parentPolicy;
+  for (const tool of opts.deny ?? []) policy.denyTool(tool);
   const ledger = new ContextLedger();
   const continuations: string[] = [];
   const refusals: Array<{ tool: string; status: string }> = [];
@@ -278,5 +280,54 @@ describe('a turn that asks what it can call', () => {
     const seenByModel = continuations.join('\n');
     expect(seenByModel).toContain('not available to a shadow clone');
     expect(seenByModel).not.toContain('denies it outright');
+  });
+});
+
+/**
+ * Discovery and execution, checked against each other.
+ *
+ * Every earlier round of this PR asserted what I believed each side did. The
+ * defect each time was that the two sides disagreed, which is invisible to any
+ * assertion that only ever looks at one of them. So this drives BOTH through
+ * one policy and requires the answers to match.
+ */
+describe('discovery agrees with what execution will actually do', () => {
+  it('keeps a denied client-local tool discoverable, because it still runs', async () => {
+    // executeOneToolCall returns before the policy check for client-local tools
+    // (tool-call-executor.ts:119), so denying signal_status does not stop it.
+    // Filtering it out of discovery for that denial would hide a tool the agent
+    // demonstrably has — the original bug, rebuilt inside its own fix.
+    const { continuations, result, refusals } = await runDiscoveryTurn({
+      deny: ['signal_status'],
+    });
+
+    // Discovered...
+    expect(continuations.join('\n')).toContain('signal_status');
+    // ...and executed, in the same run, under the same denial. The loop only
+    // stops on `terminal-signal` if signal_status actually ran.
+    expect(result.stopReason).toBe('terminal-signal');
+    expect(refusals).toEqual([]);
+    expect(result.toolResults.find((r) => r.tool === 'signal_status')?.status).toBe('executed');
+  });
+
+  it('describes a denied client-local tool instead of claiming policy blocks it', async () => {
+    const { continuations } = await runDiscoveryTurn({
+      deny: ['signal_status'],
+      args: { name: 'signal_status' },
+    });
+
+    const seenByModel = continuations.join('\n');
+    expect(seenByModel).toContain('completed');
+    expect(seenByModel).not.toContain('denies it outright');
+  });
+
+  it('still hides a denied tool that policy genuinely does stop', async () => {
+    // The exemption is for client-local tools only. `bash` goes through policy,
+    // so a denial there is real and discovery must reflect it.
+    const { continuations } = await runDiscoveryTurn({ deny: ['bash'] });
+
+    const seenByModel = continuations.join('\n');
+    expect(seenByModel).not.toContain('"bash"');
+    expect(seenByModel).toContain('read');
   });
 });

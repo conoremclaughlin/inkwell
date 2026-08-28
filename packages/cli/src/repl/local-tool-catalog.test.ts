@@ -306,6 +306,31 @@ describe('describeToolWithLocalSurface', () => {
     expect(after.wouldConsumeGrant).toBe(true);
   });
 
+  it('does not hide a client-local tool for a denial that cannot stop it', async () => {
+    // The executor runs client-local tools before consulting policy
+    // (tool-call-executor.ts:119), so a denial here is inert. Hiding the tool
+    // for it would make discovery under-report a capability the agent has —
+    // this PR's own bug, rebuilt inside the fix for it.
+    const parsed = payloadOf(
+      await describeToolWithLocalSurface(
+        {},
+        {
+          audience: 'parent',
+          cwd: '/work',
+          isHardDenied: () => true,
+          callServer: async () => serverList(),
+        }
+      )
+    );
+
+    for (const exempt of ['signal_status', 'list_context', 'evict_context']) {
+      expect(parsed.tools, exempt).toContain(exempt);
+    }
+    // Everything policy CAN stop is still correctly hidden.
+    expect(parsed.tools).not.toContain('bash');
+    expect(parsed.tools).not.toContain('recall');
+  });
+
   it('refuses a hard-denied server tool instead of handing back its schema', async () => {
     // The server HAS remember. Returning its schema reads as an invitation and
     // the refusal arrives one call later.
