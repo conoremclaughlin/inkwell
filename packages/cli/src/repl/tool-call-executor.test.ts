@@ -4,6 +4,8 @@ import {
   type LocalToolCall,
   type ToolCallExecutorDeps,
 } from './tool-call-executor.js';
+import { ToolPolicyState } from './tool-policy.js';
+import { applyProfile } from './tool-profiles.js';
 
 function makeDeps(overrides: Partial<ToolCallExecutorDeps> = {}): ToolCallExecutorDeps {
   return {
@@ -345,5 +347,60 @@ describe('namespaced and miscased names at the executor boundary', () => {
     expect(deps.callTool).not.toHaveBeenCalled();
     expect(results[0].status).toBe('executed');
     expect(results[0].result?.content[0].text as string).toContain('"bash"');
+  });
+});
+
+describe('impossible calls under a real minimal profile', () => {
+  // Lumen, PR #546 r2. A mocked policy cannot show this: under `minimal` an
+  // unknown foreign name is a promptable tool, so an unattended session denies
+  // it and the caller is told "User denied tool call". That reads as *permission
+  // refused* when the truth is *the capability does not exist* — and permission
+  // is the one reading that invites the retry. Drive the real ToolPolicyState.
+  function minimalPolicy(): ToolCallExecutorDeps['policy'] {
+    const policy = new ToolPolicyState('backend', { persist: false });
+    applyProfile(policy, 'minimal');
+    return policy as unknown as ToolCallExecutorDeps['policy'];
+  }
+
+  it('explains a foreign MCP namespace instead of denying it', async () => {
+    const deps = makeDeps({
+      policy: minimalPolicy(),
+      promptForApproval: vi.fn().mockResolvedValue(false), // unattended
+    });
+
+    const results = await executeToolCalls([makeCall('mcp__github__list_issues', {})], deps);
+
+    expect(deps.promptForApproval).not.toHaveBeenCalled();
+    expect(deps.callTool).not.toHaveBeenCalled();
+    expect(results[0].status).toBe('executed');
+    const text = results[0].result?.content[0].text as string;
+    expect(text).toContain('no "github" MCP server');
+    expect(text).not.toContain('denied');
+  });
+
+  it('corrects a miscased coding tool instead of blocking it', async () => {
+    const deps = makeDeps({
+      policy: minimalPolicy(),
+      promptForApproval: vi.fn().mockResolvedValue(false),
+    });
+
+    const results = await executeToolCalls([makeCall('Bash', { command: 'ls' })], deps);
+
+    expect(results[0].status).toBe('executed');
+    expect(results[0].result?.content[0].text as string).toContain('"bash"');
+  });
+
+  it('still lets the real policy refuse a tool that genuinely exists', async () => {
+    // The short-circuit must not become a way around policy. `write` is a real
+    // coding tool and minimal denies it — that refusal has to survive.
+    const deps = makeDeps({
+      policy: minimalPolicy(),
+      promptForApproval: vi.fn().mockResolvedValue(false),
+    });
+
+    const results = await executeToolCalls([makeCall('write', { path: 'a.ts' })], deps);
+
+    expect(deps.callTool).not.toHaveBeenCalled();
+    expect(['blocked', 'denied']).toContain(results[0].status);
   });
 });

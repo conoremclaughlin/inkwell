@@ -11,7 +11,7 @@
 import type { ToolPolicyState } from './tool-policy.js';
 import type { PcpToolCallResult } from '../lib/pcp-client.js';
 import { isClientLocalTool } from './context-tools.js';
-import { miscasedPiToolCorrection } from './tool-dispatch.js';
+import { impossibleCallRefusal } from './tool-dispatch.js';
 
 export interface LocalToolCall {
   tool: string;
@@ -120,7 +120,8 @@ async function executeOneToolCall(
     return executeTool(call, callTool, deps.signal);
   }
 
-  // A miscased coding tool — `Bash` for `bash` — is answered before policy,
+  // A structurally impossible call — a foreign MCP namespace, or a coding tool
+  // named in the wrong case — is answered before policy,
   // because there is nothing here to authorize. Nothing runs and nothing is
   // reached; the only output is a message naming the right spelling.
   //
@@ -129,9 +130,10 @@ async function executeOneToolCall(
   // `minimal` blocks it outright — so the one profile most likely to be
   // running unattended is the one where the correction never arrives and the
   // caller keeps reading "blocked" as "the tool is gone".
-  const miscased = miscasedPiToolCorrection(call.tool);
-  if (miscased) {
-    return { tool: call.tool, args: call.args, status: 'executed', result: miscased };
+
+  const impossible = impossibleCallRefusal(call.tool);
+  if (impossible) {
+    return { tool: call.tool, args: call.args, status: 'executed', result: impossible };
   }
 
   // 1. Check policy — strip MCP namespace prefix for policy lookup

@@ -146,6 +146,29 @@ export function miscasedPiToolCorrection(tool: string): PcpToolCallResult | null
   } as PcpToolCallResult;
 }
 
+/**
+ * A call that cannot run here, whatever the policy says.
+ *
+ * Both cases below are structurally impossible rather than unauthorized: a
+ * server this runtime does not host, and a coding tool named in the wrong case.
+ * Neither reaches anything, so there is nothing for policy to authorize — and
+ * putting them behind it actively destroys the explanation. Lumen found this
+ * twice on the same PR, once for each case, which is the tell that they are one
+ * concept and belong at one place rather than two branches that drift apart.
+ *
+ * The damage is worst exactly where it matters most: under `minimal`, an
+ * unknown foreign name is a promptable tool, so an unattended session denies it
+ * and returns "User denied tool call". The caller learns that permission was
+ * refused, when the truth is the capability does not exist — and permission is
+ * the one reading that invites a retry.
+ *
+ * Called before the policy check in the executor, and again in the dispatcher
+ * as a backstop, since the dispatcher is also a callable boundary.
+ */
+export function impossibleCallRefusal(tool: string): PcpToolCallResult | null {
+  return foreignNamespaceRefusal(tool) ?? miscasedPiToolCorrection(tool);
+}
+
 export function createLocalToolDispatcher(deps: LocalToolDispatchDeps): LocalToolDispatcher {
   return async (tool, args, ctx) => {
     // Normalize ONCE, before anything branches on the name.
@@ -175,16 +198,12 @@ export function createLocalToolDispatcher(deps: LocalToolDispatchDeps): LocalToo
       return deps.callPi(name, args, deps.cwd, ctx.signal);
     }
 
-    // After the head and Pi tools, so a host that DOES serve a namespaced name
-    // still wins. `name` is already inkwell-stripped, so anything still
-    // carrying an `mcp__<server>__` prefix names a server we do not host.
-    const foreign = foreignNamespaceRefusal(name);
-    if (foreign) return foreign;
-
-    // Also after the head, so a host that genuinely serves a capitalised name
-    // keeps it. Only reached once nothing else claimed the call.
-    const miscased = miscasedPiToolCorrection(name);
-    if (miscased) return miscased;
+    // After the head and Pi tools, so a host that DOES serve a namespaced or
+    // capitalised name still wins. Only reached once nothing else claimed the
+    // call. The executor answers these before policy; this is the backstop for
+    // callers that reach the dispatcher directly.
+    const impossible = impossibleCallRefusal(name);
+    if (impossible) return impossible;
 
     return deps.callPcp(name, deps.resolveCredentials(args));
   };
