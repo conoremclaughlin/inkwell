@@ -4,6 +4,8 @@ import type { PcpToolCallResult } from '../lib/pcp-client.js';
 
 const ok = (text: string) => ({ content: [{ type: 'text', text }] }) as PcpToolCallResult;
 
+const payloadOf = (result: PcpToolCallResult): any => result;
+
 function makeDeps(overrides: Partial<Parameters<typeof createLocalToolDispatcher>[0]> = {}) {
   const callPi = vi.fn(async () => ok('pi'));
   const callPcp = vi.fn(async () => ok('pcp'));
@@ -186,6 +188,97 @@ describe('createLocalToolDispatcher', () => {
     const { callPcp, deps } = makeDeps({ head: async () => ok('async refusal') });
     expect(await createLocalToolDispatcher(deps)('anything', {}, {})).toEqual(ok('async refusal'));
     expect(callPcp).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Discovery is a tail concern for the same reason cancellation is: the server
+ * can only answer for its own namespace, and BOTH hosts would otherwise ship an
+ * answer that reads as the complete callable surface while omitting every tool
+ * that runs in-process. Myra spent two days believing she had no shell because
+ * `describe_tool` — the thing an agent is told to call when unsure — confirmed
+ * it.
+ */
+describe('createLocalToolDispatcher — describe_tool', () => {
+  /**
+   * What the live server returns today: its own namespace, and only that.
+   *
+   * Shaped as `PcpClient.callTool` hands it back — the payload, already
+   * unwrapped from the MCP envelope. Mocking the envelope instead is how the
+   * first cut of this merge passed here and did nothing in production.
+   */
+  const serverList = (): PcpToolCallResult => ({
+    success: true,
+    count: 2,
+    tools: ['bootstrap', 'recall'],
+    hint: "Call describe_tool with `name` for one tool's parameters, or `search` to filter by keyword.",
+  });
+
+  it('lists the in-process tools alongside the server namespace', async () => {
+    const callPcp = vi.fn(async () => serverList());
+    const dispatch = createLocalToolDispatcher({
+      cwd: '/work',
+      callPi: async () => ok('pi'),
+      callPcp,
+      resolveCredentials: (args) => args,
+    });
+
+    const parsed = payloadOf(await dispatch('describe_tool', {}, {}));
+
+    // The two Myra verified by calling them, and could not find by asking.
+    expect(parsed.tools).toContain('bash');
+    expect(parsed.tools).toContain('signal_status');
+    // The server's own names survive the merge.
+    expect(parsed.tools).toContain('recall');
+    expect(parsed.count).toBe(parsed.tools.length);
+    expect(parsed.runtimeTools).toContain('bash');
+  });
+
+  it('answers for a coding tool without asking the server, which has never heard of it', async () => {
+    const callPcp = vi.fn(async () => serverList());
+    const dispatch = createLocalToolDispatcher({
+      cwd: process.cwd(),
+      callPi: async () => ok('pi'),
+      callPcp,
+      resolveCredentials: (args) => args,
+    });
+
+    const parsed = payloadOf(await dispatch('describe_tool', { name: 'bash' }, {}));
+
+    expect(parsed.success).toBe(true);
+    expect(parsed.tool.name).toBe('bash');
+    expect(parsed.tool.source).toBe('ink-runtime');
+    // Pi's own schema, not a hand-copy of it that can drift.
+    expect(parsed.tool.parameters.properties).toHaveProperty('command');
+    expect(callPcp).not.toHaveBeenCalled();
+  });
+
+  it('narrows the surface for a clone, which genuinely may not run bash', async () => {
+    const dispatch = createLocalToolDispatcher({
+      cwd: '/work',
+      callPi: async () => ok('pi'),
+      callPcp: async () => serverList(),
+      resolveCredentials: (args) => args,
+      audience: 'clone',
+    });
+
+    const parsed = payloadOf(await dispatch('describe_tool', {}, {}));
+
+    expect(parsed.tools).toContain('read');
+    expect(parsed.tools).not.toContain('bash');
+    expect(parsed.tools).not.toContain('spawn_agent');
+  });
+
+  it('leaves a server response it cannot parse exactly as it found it', async () => {
+    const opaque = ok('not json at all');
+    const dispatch = createLocalToolDispatcher({
+      cwd: '/work',
+      callPi: async () => ok('pi'),
+      callPcp: async () => opaque,
+      resolveCredentials: (args) => args,
+    });
+
+    expect(await dispatch('describe_tool', {}, {})).toEqual(opaque);
   });
 });
 

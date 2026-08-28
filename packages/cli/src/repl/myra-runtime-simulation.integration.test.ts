@@ -436,3 +436,64 @@ describe('Myra simulation: Phase 6 — Full Heartbeat Cycle', () => {
     console.log('  Full heartbeat cycle: OK\n');
   });
 });
+
+// ─── Phase 7: Tool Discovery ────────────────────────────────────
+
+/**
+ * The question Myra actually asked, through the path she actually asks it.
+ *
+ * She called `bash` and `signal_status` successfully and `describe_tool`
+ * reported neither, so the correct move — asking what exists — confirmed the
+ * wrong belief that she had no shell. Unit tests pin the merge; only this pins
+ * that the runtime she runs in reaches it, against the registry the live server
+ * really serves.
+ */
+describe('Myra simulation: Phase 7 — Tool Discovery', () => {
+  async function discover(args: Record<string, unknown>) {
+    const pcp = await createPcpClient();
+    const { createLocalToolDispatcher } = await import('./tool-dispatch.js');
+    const { callPiTool } = await import('./pi-tools.js');
+    const dispatch = createLocalToolDispatcher({
+      cwd: process.cwd(),
+      callPi: callPiTool,
+      callPcp: (bare, resolved) => pcp.callTool(bare, resolved),
+      resolveCredentials: (a) => a,
+      audience: 'parent',
+    });
+    // No unwrapping: PcpClient.callTool already parsed the MCP envelope, and
+    // the merge returns the same shape. Reaching for `.content[0].text` here is
+    // what proved the first cut of this fix was inert in production.
+    return (await dispatch('describe_tool', args, {})) as any;
+  }
+
+  it.skipIf(!serverAvailable)('lists the whole callable surface, not half of it', async () => {
+    const parsed = await discover({});
+
+    console.log('\n=== Phase 7: Tool Discovery ===');
+    console.log(`  ${parsed.count} tools, ${parsed.runtimeTools.length} of them in-process`);
+
+    // The server's own registry still arrives whole.
+    expect(parsed.tools).toContain('bootstrap');
+    expect(parsed.tools).toContain('send_response');
+    expect(parsed.count).toBeGreaterThan(150);
+    // And the two she verified by calling and could not find by asking.
+    expect(parsed.tools).toContain('bash');
+    expect(parsed.tools).toContain('signal_status');
+  });
+
+  it.skipIf(!serverAvailable)('describes bash instead of denying it exists', async () => {
+    const parsed = await discover({ name: 'bash' });
+
+    expect(parsed.success).toBe(true);
+    expect(parsed.tool.parameters.properties).toHaveProperty('command');
+    console.log(`  describe_tool(bash) -> ${parsed.tool.description.slice(0, 60)}…`);
+  });
+
+  it.skipIf(!serverAvailable)('still answers for a server tool, unchanged', async () => {
+    // The merge must not cost the thing describe_tool already did well.
+    const parsed = await discover({ name: 'create_reminder' });
+
+    expect(parsed.success).toBe(true);
+    expect(parsed.tool.parameters.properties).toHaveProperty('runAt');
+  });
+});

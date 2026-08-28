@@ -43,6 +43,10 @@ export const CLONE_BASELINE_TOOLS: readonly string[] = [
   'grep',
   'find',
   'ls',
+  // Asking what it can call. A clone that must escalate for this learns its
+  // surface by being refused, which is the failure mode this whole area exists
+  // to remove — and unattended, a promptable tool is denied outright.
+  'describe_tool',
   // PCP introspection. Reading the workspace is the point of a clone.
   'bootstrap',
   'recall',

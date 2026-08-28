@@ -20,6 +20,7 @@
 
 import type { PcpToolCallResult } from '../lib/pcp-client.js';
 import { isPiTool } from './pi-tools.js';
+import { describeToolWithLocalSurface, type LocalToolAudience } from './local-tool-catalog.js';
 
 export interface ToolDispatchContext {
   /** Cancels an in-flight tool. Reaches the tool itself, not just the wait. */
@@ -62,6 +63,12 @@ export interface LocalToolDispatchDeps {
     args: Record<string, unknown>,
     ctx: ToolDispatchContext
   ) => Promise<PcpToolCallResult | null> | PcpToolCallResult | null;
+  /**
+   * Which local surface this host exposes, for `describe_tool`. A clone's is
+   * narrower, and telling it otherwise produces calls that only get refused.
+   * Defaults to the parent's.
+   */
+  audience?: LocalToolAudience;
 }
 
 /** Strip the MCP namespace the model may emit; PcpClient wants bare names. */
@@ -204,6 +211,18 @@ export function createLocalToolDispatcher(deps: LocalToolDispatchDeps): LocalToo
     // callers that reach the dispatcher directly.
     const impossible = impossibleCallRefusal(name);
     if (impossible) return impossible;
+
+    // Discovery is answered HERE, in the tail both hosts share, for the same
+    // reason cancellation is: the server can only speak for its own namespace,
+    // and an answer that omits everything running in-process reads as the
+    // complete surface. See local-tool-catalog.ts.
+    if (name === 'describe_tool') {
+      return describeToolWithLocalSurface(args, {
+        audience: deps.audience ?? 'parent',
+        cwd: deps.cwd,
+        callServer: () => deps.callPcp(name, deps.resolveCredentials(args)),
+      });
+    }
 
     return deps.callPcp(name, deps.resolveCredentials(args));
   };
