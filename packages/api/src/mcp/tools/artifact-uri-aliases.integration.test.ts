@@ -144,13 +144,126 @@ describe.skipIf(!canRun)('artifact URI aliases (DB integration)', () => {
     expect(history?.[0]?.change_summary).toContain(`Renamed ${URI_BORN}`);
   });
 
-  it('trigger: an alias may not shadow a live URI', async () => {
-    const { error } = await client.from('artifact_uri_aliases').insert({
+  it("trigger: an alias may not shadow ANOTHER artifact's live URI — its own is the reservation exception", async () => {
+    const OTHER = `ink://${NS}/other-live`;
+    const { data: other, error: otherError } = await client
+      .from('artifacts')
+      .insert({
+        user_id: INTEGRATION_TEST_USER_ID,
+        workspace_id: workspaceId,
+        uri: OTHER,
+        title: 'Other',
+        content: 'X',
+        artifact_type: 'note',
+        version: 1,
+      })
+      .select('id')
+      .single();
+    expect(otherError).toBeNull();
+
+    try {
+      // Another artifact's live URI: still a shadow, still rejected.
+      const { error } = await client.from('artifact_uri_aliases').insert({
+        user_id: INTEGRATION_TEST_USER_ID,
+        artifact_id: artifactId,
+        alias_uri: OTHER,
+      });
+      expect(error?.message).toMatch(/collides with a live artifact URI/);
+
+      // Its OWN live URI: the reserve-then-move primitive (round 2) — allowed.
+      const { error: reservationError } = await client.from('artifact_uri_aliases').insert({
+        user_id: INTEGRATION_TEST_USER_ID,
+        artifact_id: artifactId,
+        alias_uri: URI_MOVED,
+      });
+      expect(reservationError).toBeNull();
+      await client.from('artifact_uri_aliases').delete().eq('alias_uri', URI_MOVED);
+    } finally {
+      await client.from('artifacts').delete().eq('id', other!.id);
+    }
+  });
+
+  it('capture window closed: with the reservation in place, the old URI is never takeable (round 1 repro)', async () => {
+    const X = `ink://${NS}/window-x`;
+    const Y = `ink://${NS}/window-y`;
+    const { data: w, error: createError } = await client
+      .from('artifacts')
+      .insert({
+        user_id: INTEGRATION_TEST_USER_ID,
+        workspace_id: workspaceId,
+        uri: X,
+        title: 'Window',
+        content: 'X',
+        artifact_type: 'note',
+        version: 1,
+      })
+      .select('id')
+      .single();
+    expect(createError).toBeNull();
+
+    // Step 1 of a rename: reserve X while it is still live.
+    const { error: reserveError } = await client.from('artifact_uri_aliases').insert({
       user_id: INTEGRATION_TEST_USER_ID,
-      artifact_id: artifactId,
-      alias_uri: URI_MOVED, // currently the live canonical URI
+      artifact_id: w!.id,
+      alias_uri: X,
     });
-    expect(error?.message).toMatch(/collides with a live artifact URI/);
+    expect(reserveError).toBeNull();
+
+    // Pre-CAS window: the BEFORE-INSERT trigger fires ahead of the unique
+    // constraint, so the reservation itself already rejects the squatter —
+    // the same shield covers both windows.
+    const { error: squatWhileLive } = await client.from('artifacts').insert({
+      user_id: INTEGRATION_TEST_USER_ID,
+      workspace_id: workspaceId,
+      uri: X,
+      title: 'Squatter',
+      content: 'X',
+      artifact_type: 'note',
+      version: 1,
+    });
+    expect(squatWhileLive?.message).toMatch(/collides with another artifact's alias/);
+
+    // Crash-state read: reservation + live URI resolves canonically, no alias flag.
+    const midRead = JSON.parse(
+      (
+        await handleGetArtifact(
+          { userId: INTEGRATION_TEST_USER_ID, workspaceId, uri: X },
+          dataComposer
+        )
+      ).content[0].text
+    );
+    expect(midRead.success).toBe(true);
+    expect(midRead.artifact.id).toBe(w!.id);
+    expect(midRead.resolvedViaAlias).toBeUndefined();
+
+    // Step 2: the CAS releases X.
+    const { error: moveError } = await client.from('artifacts').update({ uri: Y }).eq('id', w!.id);
+    expect(moveError).toBeNull();
+
+    // Post-CAS window (the round-1 capture): now the ALIAS blocks squatters.
+    const { error: squatAfterMove } = await client.from('artifacts').insert({
+      user_id: INTEGRATION_TEST_USER_ID,
+      workspace_id: workspaceId,
+      uri: X,
+      title: 'Squatter',
+      content: 'X',
+      artifact_type: 'note',
+      version: 1,
+    });
+    expect(squatAfterMove?.message).toMatch(/collides with another artifact's alias/);
+
+    // And X still resolves to W — via the alias this time.
+    const postRead = JSON.parse(
+      (
+        await handleGetArtifact(
+          { userId: INTEGRATION_TEST_USER_ID, workspaceId, uri: X },
+          dataComposer
+        )
+      ).content[0].text
+    );
+    expect(postRead.success).toBe(true);
+    expect(postRead.artifact.id).toBe(w!.id);
+    expect(postRead.resolvedViaAlias).toBe(X);
   });
 
   it('trigger + handler: a left-behind URI is reserved against new artifacts', async () => {

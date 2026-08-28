@@ -114,10 +114,10 @@ function ArtifactRow({ artifact }: { artifact: Artifact }) {
       href={`/artifacts/${artifact.id}`}
       className="block rounded-lg border border-gray-200 p-4 hover:border-gray-400 hover:shadow-sm transition-all"
     >
-      <div className="flex items-start justify-between">
-        <div className="flex-1">
-          <div className="flex items-center gap-2">
-            <TypeIcon className={clsx('h-4 w-4', config.color)} />
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+        <div className="flex-1 min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <TypeIcon className={clsx('h-4 w-4 shrink-0', config.color)} />
             <h3 className="font-semibold text-gray-900">{artifact.title}</h3>
             <Badge className={clsx('text-xs', config.bgColor, config.color)}>{config.label}</Badge>
             <Badge variant="outline" className="text-xs">
@@ -135,7 +135,7 @@ function ArtifactRow({ artifact }: { artifact: Artifact }) {
               </span>
             )}
           </div>
-          <p className="text-sm text-gray-500 mt-1 font-mono">{artifact.uri}</p>
+          <p className="text-sm text-gray-500 mt-1 font-mono break-all">{artifact.uri}</p>
           {artifact.tags && artifact.tags.length > 0 && (
             <div className="flex flex-wrap gap-1 mt-2">
               {artifact.tags.map((tag) => (
@@ -146,7 +146,7 @@ function ArtifactRow({ artifact }: { artifact: Artifact }) {
             </div>
           )}
         </div>
-        <div className="text-right text-sm text-gray-500">
+        <div className="text-sm text-gray-500 shrink-0 sm:text-right">
           <div>Updated {formatRelativeTime(artifact.updatedAt)}</div>
           <div className="text-xs text-gray-400 mt-1">
             Created {formatRelativeTime(artifact.createdAt)}
@@ -192,7 +192,7 @@ export default function LibraryPage() {
       {error && <div className="mt-4 rounded-md bg-red-50 p-4 text-red-800">{error.message}</div>}
 
       {/* Stats */}
-      <div className="grid grid-cols-6 gap-4 mt-6">
+      <div className="grid grid-cols-3 gap-4 mt-6 lg:grid-cols-6">
         {Object.entries(typeConfig).map(([type, config]) => {
           const TypeIcon = config.icon;
           const count = stats[type as keyof typeof stats] || 0;
@@ -253,7 +253,9 @@ export default function LibraryPage() {
                   <Chevron className="h-4 w-4 text-gray-400" />
                   <FolderIcon className="h-5 w-5 text-amber-600" />
                   <span className="font-semibold text-gray-900">{shelf.namespace}</span>
-                  <span className="text-sm text-gray-400 font-mono">ink://{shelf.namespace}/</span>
+                  <span className="hidden sm:inline text-sm text-gray-400 font-mono">
+                    ink://{shelf.namespace}/
+                  </span>
                   <Badge variant="secondary" className="ml-auto text-xs">
                     {shelf.items.length}
                   </Badge>

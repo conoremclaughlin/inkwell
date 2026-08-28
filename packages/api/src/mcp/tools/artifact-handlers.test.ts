@@ -16,6 +16,7 @@ import {
   handleAddArtifactComment,
   handleCreateArtifact,
   handleGetArtifact,
+  handleGetArtifactHistory,
   handleListArtifactComments,
   handleUpdateArtifact,
 } from './artifact-handlers';
@@ -1633,6 +1634,22 @@ describe('Library: rename + URI aliases (spec:library)', () => {
     const historyBuilder = supabase.calls.find((c) => c.table === 'artifact_history')?.builder;
     const historyEntry = (historyBuilder?.insert as ReturnType<typeof vi.fn>).mock.calls[0][0];
     expect(historyEntry.change_summary).toContain(`Renamed ${OLD_URI}`);
+
+    // Round 2 (Lumen): reserve-then-move. The old URI must be aliased BEFORE
+    // the CAS releases it — insert-after-update left a capture window.
+    const reserveIdx = supabase.calls.findIndex(
+      (c) =>
+        c.table === 'artifact_uri_aliases' &&
+        (c.builder.insert as ReturnType<typeof vi.fn>).mock.calls.length > 0
+    );
+    const casIdx = supabase.calls.findIndex(
+      (c) =>
+        c.table === 'artifacts' &&
+        (c.builder.update as ReturnType<typeof vi.fn>).mock.calls.length > 0
+    );
+    expect(reserveIdx).toBeGreaterThan(-1);
+    expect(casIdx).toBeGreaterThan(-1);
+    expect(reserveIdx).toBeLessThan(casIdx);
   });
 
   it('renaming back to a former URI deletes the now-redundant alias before re-aliasing the old uri', async () => {
@@ -1796,5 +1813,227 @@ describe('Library: rename + URI aliases (spec:library)', () => {
         createMockDataComposer(supabase)
       )
     ).rejects.toThrow(/alias of an existing artifact/);
+  });
+});
+
+describe('Library round 2: reservation ordering + alias error contracts', () => {
+  const USER_ID = '00000000-0000-0000-0000-000000000001';
+  const WORKSPACE_ID = '11111111-1111-1111-1111-111111111111';
+  const OLD_URI = 'ink://specs/round-two-old';
+  const NEW_URI = 'ink://library/round-two-new';
+
+  const baseArtifact = {
+    id: 'artifact-r2',
+    uri: OLD_URI,
+    title: 'Round Two',
+    content: 'body',
+    version: 5,
+    metadata: {},
+    collaborators: [],
+    created_by_sb_id: null,
+    edit_mode: 'workspace',
+    workspace_id: WORKSPACE_ID,
+    created_at: '2026-08-01T00:00:00Z',
+    updated_at: '2026-08-01T00:00:00Z',
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    setSessionContext({ userId: USER_ID, workspaceId: WORKSPACE_ID });
+  });
+
+  it('a lost CAS still returns staleWrite — and the reservation it leaves behind is written, never a shadow', async () => {
+    const supabase = createTableAwareSupabaseMock({
+      agent_identities: [
+        { maybeSingle: [{ data: null, error: null }] },
+        { maybeSingle: [{ data: null, error: null }] },
+      ],
+      artifacts: [
+        { maybeSingle: [{ data: baseArtifact, error: null }] },
+        { maybeSingle: [{ data: null, error: null }] },
+        { maybeSingle: [{ data: null, error: null }] }, // CAS lost
+      ],
+      artifact_uri_aliases: [
+        { maybeSingle: [{ data: null, error: null }] },
+        { then: { data: null, error: null } }, // reservation insert
+      ],
+    });
+
+    const result = await handleUpdateArtifact(
+      { userId: USER_ID, uri: OLD_URI, newUri: NEW_URI, agentId: 'wren' },
+      createMockDataComposer(supabase)
+    );
+
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(false);
+    expect(parsed.staleWrite).toBe(true);
+
+    // The reservation was placed before the CAS — a benign self-alias at the
+    // artifact's still-live URI, self-healed by the retry.
+    const reserveBuilder = supabase.calls.find(
+      (c) =>
+        c.table === 'artifact_uri_aliases' &&
+        (c.builder.insert as ReturnType<typeof vi.fn>).mock.calls.length > 0
+    )?.builder;
+    expect((reserveBuilder?.insert as ReturnType<typeof vi.fn>).mock.calls[0][0]).toMatchObject({
+      alias_uri: OLD_URI,
+      artifact_id: 'artifact-r2',
+    });
+    const deleted = supabase.calls.some(
+      (c) =>
+        c.table === 'artifact_uri_aliases' &&
+        (c.builder.delete as ReturnType<typeof vi.fn>).mock.calls.length > 0
+    );
+    expect(deleted).toBe(false);
+  });
+
+  it('a failed reservation whose existing row belongs to this artifact proceeds (retry self-heals)', async () => {
+    const supabase = createTableAwareSupabaseMock({
+      agent_identities: [
+        { maybeSingle: [{ data: null, error: null }] },
+        { maybeSingle: [{ data: null, error: null }] },
+      ],
+      artifacts: [
+        { maybeSingle: [{ data: baseArtifact, error: null }] },
+        { maybeSingle: [{ data: null, error: null }] },
+        { maybeSingle: [{ data: { ...baseArtifact, uri: NEW_URI, version: 6 }, error: null }] },
+      ],
+      artifact_uri_aliases: [
+        { maybeSingle: [{ data: null, error: null }] },
+        {
+          then: {
+            data: null,
+            error: { message: 'duplicate key value violates unique constraint' },
+          },
+        },
+        { maybeSingle: [{ data: { artifact_id: 'artifact-r2' }, error: null }] },
+      ],
+      artifact_history: [{ then: { data: null, error: null } }],
+    });
+
+    const result = await handleUpdateArtifact(
+      { userId: USER_ID, uri: OLD_URI, newUri: NEW_URI, agentId: 'wren' },
+      createMockDataComposer(supabase)
+    );
+
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(true);
+    expect(parsed.renamedFrom).toBe(OLD_URI);
+  });
+
+  it('a failed reservation whose existing row belongs to another artifact aborts before the CAS', async () => {
+    const supabase = createTableAwareSupabaseMock({
+      agent_identities: [
+        { maybeSingle: [{ data: null, error: null }] },
+        { maybeSingle: [{ data: null, error: null }] },
+      ],
+      artifacts: [
+        { maybeSingle: [{ data: baseArtifact, error: null }] },
+        { maybeSingle: [{ data: null, error: null }] },
+      ],
+      artifact_uri_aliases: [
+        { maybeSingle: [{ data: null, error: null }] },
+        {
+          then: {
+            data: null,
+            error: { message: 'duplicate key value violates unique constraint' },
+          },
+        },
+        { maybeSingle: [{ data: { artifact_id: 'someone-else' }, error: null }] },
+      ],
+    });
+
+    await expect(
+      handleUpdateArtifact(
+        { userId: USER_ID, uri: OLD_URI, newUri: NEW_URI, agentId: 'wren' },
+        createMockDataComposer(supabase)
+      )
+    ).rejects.toThrow(/failed to reserve the old URI/);
+
+    const casHappened = supabase.calls.some(
+      (c) =>
+        c.table === 'artifacts' &&
+        (c.builder.update as ReturnType<typeof vi.fn>).mock.calls.length > 0
+    );
+    expect(casHappened).toBe(false);
+  });
+
+  it('an alias LOOKUP failure throws instead of reading as not-found (P2, round 1)', async () => {
+    const supabase = createTableAwareSupabaseMock({
+      artifacts: [{ maybeSingle: [{ data: null, error: null }] }],
+      artifact_uri_aliases: [
+        { maybeSingle: [{ data: null, error: { message: 'schema cache poisoned' } }] },
+      ],
+    });
+
+    await expect(
+      handleGetArtifact({ userId: USER_ID, uri: OLD_URI }, createMockDataComposer(supabase))
+    ).rejects.toThrow(/Failed to resolve artifact alias/);
+  });
+
+  it('get_artifact_history via an alias reports resolvedViaAlias + canonicalUri (P2, round 1)', async () => {
+    const supabase = createTableAwareSupabaseMock({
+      artifacts: [
+        { maybeSingle: [{ data: null, error: null }] },
+        { maybeSingle: [{ data: { ...baseArtifact, uri: NEW_URI }, error: null }] },
+      ],
+      artifact_uri_aliases: [
+        { maybeSingle: [{ data: { artifact_id: 'artifact-r2' }, error: null }] },
+      ],
+      artifact_history: [
+        {
+          then: {
+            data: [
+              {
+                id: 'h1',
+                version: 5,
+                title: 'Round Two',
+                changed_by_sb_id: null,
+                changed_by_user_id: USER_ID,
+                change_type: 'update',
+                change_summary: null,
+                created_at: '2026-08-01T00:00:00Z',
+              },
+            ],
+            error: null,
+          },
+        },
+      ],
+    });
+
+    const result = await handleGetArtifactHistory(
+      { userId: USER_ID, uri: OLD_URI },
+      createMockDataComposer(supabase)
+    );
+
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(true);
+    expect(parsed.resolvedViaAlias).toBe(OLD_URI);
+    expect(parsed.canonicalUri).toBe(NEW_URI);
+    expect(parsed.count).toBe(1);
+  });
+
+  it('list_artifact_comments via an alias reports resolvedViaAlias + canonicalUri (P2, round 1)', async () => {
+    const supabase = createTableAwareSupabaseMock({
+      artifacts: [
+        { maybeSingle: [{ data: null, error: null }] },
+        { maybeSingle: [{ data: { ...baseArtifact, uri: NEW_URI }, error: null }] },
+      ],
+      artifact_uri_aliases: [
+        { maybeSingle: [{ data: { artifact_id: 'artifact-r2' }, error: null }] },
+      ],
+      artifact_comments: [{ then: { data: [], error: null } }],
+    });
+
+    const result = await handleListArtifactComments(
+      { userId: USER_ID, uri: OLD_URI },
+      createMockDataComposer(supabase)
+    );
+
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(true);
+    expect(parsed.resolvedViaAlias).toBe(OLD_URI);
+    expect(parsed.canonicalUri).toBe(NEW_URI);
+    expect(parsed.artifactUri).toBe(NEW_URI);
   });
 });
