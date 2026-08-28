@@ -108,6 +108,43 @@ function foreignNamespaceRefusal(tool: string): PcpToolCallResult | null {
   } as PcpToolCallResult;
 }
 
+/**
+ * A coding tool named in the wrong case — `Bash` for `bash`, `Read` for `read`.
+ *
+ * The names a model reaches for under pressure are its priors, and the priors
+ * here are Claude Code's capitalised ones. Myra called `Bash` seven times and
+ * `Read` four; each fell through to the server, which hosts neither, and came
+ * back "tool not found".
+ *
+ * That is the failure she described from the inside afterwards: three wrong
+ * shapes — `Bash`, the prefixed name, a fenced block — all returned the same
+ * not-found, so the repetitions read as *consistent evidence the tool is gone*
+ * rather than as three different misspellings. An error that cannot distinguish
+ * a wrong convention from an absent capability makes retrying actively harmful,
+ * because each attempt confirms the wrong conclusion.
+ *
+ * Corrected rather than silently accepted, deliberately. Auto-routing `Bash`
+ * would work and teach nothing, and it would hide exactly the convention drift
+ * that made this diagnosable — the Aug 24 regime change was only visible
+ * because the miscased calls were logged under the name actually emitted.
+ */
+function miscasedPiToolCorrection(tool: string): PcpToolCallResult | null {
+  const lower = tool.toLowerCase();
+  if (lower === tool || !isPiTool(lower)) return null;
+  return {
+    content: [
+      {
+        type: 'text',
+        text:
+          `${tool} is not a tool here, but "${lower}" is — coding tools in this ` +
+          `runtime are lowercase. Retry as "${lower}" with the same arguments.\n\n` +
+          `The full set: read, edit, write, bash, grep, find, ls.`,
+      },
+    ],
+    isError: true,
+  } as PcpToolCallResult;
+}
+
 export function createLocalToolDispatcher(deps: LocalToolDispatchDeps): LocalToolDispatcher {
   return async (tool, args, ctx) => {
     // Normalize ONCE, before anything branches on the name.
@@ -142,6 +179,11 @@ export function createLocalToolDispatcher(deps: LocalToolDispatchDeps): LocalToo
     // carrying an `mcp__<server>__` prefix names a server we do not host.
     const foreign = foreignNamespaceRefusal(name);
     if (foreign) return foreign;
+
+    // Also after the head, so a host that genuinely serves a capitalised name
+    // keeps it. Only reached once nothing else claimed the call.
+    const miscased = miscasedPiToolCorrection(name);
+    if (miscased) return miscased;
 
     return deps.callPcp(name, deps.resolveCredentials(args));
   };

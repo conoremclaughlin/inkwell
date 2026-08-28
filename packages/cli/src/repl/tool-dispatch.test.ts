@@ -106,6 +106,42 @@ describe('createLocalToolDispatcher', () => {
     expect(text).toContain('bash');
   });
 
+  // Myra's own account of the failure: `Bash`, the prefixed name, and a fenced
+  // block all returned the same not-found, so three wrong conventions read as
+  // consistent evidence the shell was gone. An error that cannot tell a
+  // miscased name from an absent tool makes retrying confirm the wrong answer.
+  it.each([
+    ['Bash', 'bash'],
+    ['Read', 'read'],
+    ['Write', 'write'],
+    ['Grep', 'grep'],
+    ['LS', 'ls'],
+  ])('corrects miscased %s to %s instead of relaying "not found"', async (emitted, correct) => {
+    const { callPcp, callPi, deps } = makeDeps();
+    const result = await createLocalToolDispatcher(deps)(emitted, { command: 'ls' }, {});
+
+    expect(callPcp).not.toHaveBeenCalled();
+    expect(callPi).not.toHaveBeenCalled();
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text as string).toContain(`"${correct}"`);
+  });
+
+  it('corrects a name that is both namespaced and miscased', async () => {
+    const { callPcp, deps } = makeDeps();
+    const result = await createLocalToolDispatcher(deps)('mcp__inkwell__Bash', {}, {});
+
+    expect(callPcp).not.toHaveBeenCalled();
+    expect(result.content[0].text as string).toContain('"bash"');
+  });
+
+  it('does not "correct" a capitalised name that is not a coding tool', async () => {
+    // ToolSearch and WebSearch are Claude Code tools with no lowercase
+    // equivalent here. The server stays the authority on those.
+    const { callPcp, deps } = makeDeps();
+    await createLocalToolDispatcher(deps)('ToolSearch', {}, {});
+    expect(callPcp).toHaveBeenCalledWith('ToolSearch', { resolved: true });
+  });
+
   it('still sends a bare unknown tool to the server rather than guessing', async () => {
     // Only an `mcp__<server>__` prefix proves the target is foreign. A bare
     // name we do not recognise may simply be an Inkwell tool this build has
