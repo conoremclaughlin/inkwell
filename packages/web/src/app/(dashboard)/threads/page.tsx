@@ -11,6 +11,7 @@ import {
   ChevronLeft,
   GitBranch,
   Hash,
+  History,
   ListTodo,
   MessageSquare,
   MonitorDot,
@@ -92,7 +93,19 @@ interface ThreadsResponse {
   };
 }
 
+interface StudioHistoryItem {
+  studioId: string;
+  slug: string | null;
+  branch: string | null;
+  status: string;
+  agents: string[];
+  firstAt: string;
+  lastAt: string;
+  lastEvent: string;
+}
+
 interface ThreadMessagesResponse {
+  studioHistory?: StudioHistoryItem[];
   thread: {
     threadKey: string;
     title: string | null;
@@ -113,6 +126,50 @@ interface ThreadMessagesResponse {
 }
 
 // ─── Helpers ───
+
+/**
+ * Session→key relations, in words a reader shouldn't have to decode:
+ * "routed here" = this key is the session's immutable routing anchor (where
+ * inbox triggers landed it); "working now" = the session's mutable current
+ * focus; both when they coincide. These are session facts, not studios.
+ */
+const RELATION_LABELS: Record<'anchor' | 'active' | 'both', string> = {
+  anchor: 'routed here',
+  active: 'working now',
+  both: 'routed · working',
+};
+
+const RELATION_TOOLTIP =
+  'Session relation to this key — "routed here": the key this session was originally routed/spawned for; "working now": the session\'s current focus (its activeThreadKey)';
+
+function formatDayLabel(date: string): string {
+  const d = new Date(date);
+  const today = new Date();
+  const startOfDay = (x: Date) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+  const dayDiff = Math.round((startOfDay(today) - startOfDay(d)) / 86400000);
+  if (dayDiff === 0) return 'Today';
+  if (dayDiff === 1) return 'Yesterday';
+  return d.toLocaleDateString(undefined, {
+    weekday: 'short',
+    month: 'short',
+    day: 'numeric',
+    ...(d.getFullYear() !== today.getFullYear() ? { year: 'numeric' } : {}),
+  });
+}
+
+function formatClockTime(date: string): string {
+  return new Date(date).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+}
+
+function sameDay(a: string, b: string): boolean {
+  const da = new Date(a);
+  const db = new Date(b);
+  return (
+    da.getFullYear() === db.getFullYear() &&
+    da.getMonth() === db.getMonth() &&
+    da.getDate() === db.getDate()
+  );
+}
 
 function formatRelativeTime(date: string): string {
   const diffMs = Date.now() - new Date(date).getTime();
@@ -421,10 +478,20 @@ export default function ThreadsPage() {
 // ─── Detail pane ───
 
 function SpineDetail({ spine, onBack }: { spine: ThreadSpine; onBack: () => void }) {
+  // Always fetched — a key nobody ever messaged about can still have studio
+  // history worth showing (the endpoint answers { thread: null } for those).
   const { data: messagesData, isLoading: messagesLoading } = useApiQuery<ThreadMessagesResponse>(
     ['thread-messages', spine.key],
-    `/api/admin/threads/messages?key=${encodeURIComponent(spine.key)}`,
-    { enabled: spine.sources.includes('thread') }
+    `/api/admin/threads/messages?key=${encodeURIComponent(spine.key)}`
+  );
+
+  // History complements the live STUDIOS section rather than repeating it:
+  // only studios no longer in the live feed (closed ephemerals, released
+  // holds) appear here. This is how "which studio did the review happen in"
+  // stays answerable after the reviewer cleans up.
+  const liveStudioIds = new Set(spine.studios.map((st) => st.id));
+  const pastStudios = (messagesData?.studioHistory ?? []).filter(
+    (h) => !liveStudioIds.has(h.studioId)
   );
 
   return (
@@ -443,8 +510,11 @@ function SpineDetail({ spine, onBack }: { spine: ThreadSpine; onBack: () => void
           <span className="font-mono text-sm font-semibold">{spine.key}</span>
           <TypeChip identity={spine.identity} />
           {spine.thread ? (
-            <Badge variant={spine.thread.status === 'open' ? 'default' : 'secondary'}>
-              {spine.thread.status}
+            <Badge
+              variant={spine.thread.status === 'open' ? 'default' : 'secondary'}
+              title="Conversation status — whether this inbox thread is open or closed, not the state of the PR/issue it references"
+            >
+              thread {spine.thread.status}
             </Badge>
           ) : (
             <Badge variant="outline" className="border-amber-500/50 text-amber-600">
@@ -504,11 +574,8 @@ function SpineDetail({ spine, onBack }: { spine: ThreadSpine; onBack: () => void
                 />
                 <span className="font-medium">{s.agentId ?? 'unknown'}</span>
                 {s.phase && <span className="truncate text-muted-foreground">{s.phase}</span>}
-                <span
-                  className="rounded bg-muted px-1 py-0.5 text-[10px]"
-                  title="anchor = routed here at creation · active = current focus"
-                >
-                  {s.relation}
+                <span className="rounded bg-muted px-1 py-0.5 text-[10px]" title={RELATION_TOOLTIP}>
+                  {RELATION_LABELS[s.relation]}
                 </span>
                 <span className="ml-auto shrink-0 text-muted-foreground">
                   {formatRelativeTime(s.updatedAt)}
@@ -541,6 +608,32 @@ function SpineDetail({ spine, onBack }: { spine: ThreadSpine; onBack: () => void
         </section>
       )}
 
+      {pastStudios.length > 0 && (
+        <section>
+          <SectionLabel icon={History} label="Past studios" />
+          <div className="flex flex-col gap-1.5">
+            {pastStudios.map((h) => (
+              <div
+                key={h.studioId}
+                className="flex items-center gap-2 rounded-md border border-dashed px-3 py-2 text-xs opacity-70"
+              >
+                <span className="font-medium">{h.slug ?? h.branch ?? h.studioId.slice(0, 8)}</span>
+                {h.slug && h.branch && (
+                  <span className="truncate font-mono text-muted-foreground">{h.branch}</span>
+                )}
+                <span className="truncate text-muted-foreground">{h.agents.join(' · ')}</span>
+                <span
+                  className="ml-auto shrink-0 rounded bg-muted px-1 py-0.5 text-[10px]"
+                  title={`Last lease event: ${h.lastEvent} · ${new Date(h.lastAt).toLocaleString()}`}
+                >
+                  {h.status === 'cleaned' ? 'closed' : h.lastEvent} · {formatRelativeTime(h.lastAt)}
+                </span>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
       <section>
         <SectionLabel icon={MessageSquare} label="Conversation" />
         {!spine.sources.includes('thread') ? (
@@ -558,20 +651,37 @@ function SpineDetail({ spine, onBack }: { spine: ThreadSpine; onBack: () => void
                 messages.
               </div>
             )}
-            {(messagesData?.messages ?? []).map((m) => (
-              <div key={m.id} className="rounded-md border px-3 py-2">
-                <div className="flex items-center gap-2 text-[10px] text-muted-foreground">
-                  <span className="font-medium text-foreground">{m.senderAgentId}</span>
-                  {m.messageType !== 'message' && (
-                    <span className="rounded bg-muted px-1 py-0.5">{m.messageType}</span>
+            {(messagesData?.messages ?? []).map((m, i, all) => {
+              const prev = i > 0 ? all[i - 1] : null;
+              const newDay = !prev || !sameDay(prev.createdAt, m.createdAt);
+              return (
+                <div key={m.id} className="flex flex-col gap-2">
+                  {newDay && (
+                    <div className="flex items-center gap-2 py-1">
+                      <div className="h-px flex-1 bg-border" />
+                      <span className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                        {formatDayLabel(m.createdAt)}
+                      </span>
+                      <div className="h-px flex-1 bg-border" />
+                    </div>
                   )}
-                  <span className="ml-auto">{formatRelativeTime(m.createdAt)}</span>
+                  <div className="rounded-md border px-3 py-2">
+                    <div className="flex items-center gap-2 text-[10px] text-muted-foreground">
+                      <span className="font-medium text-foreground">{m.senderAgentId}</span>
+                      {m.messageType !== 'message' && (
+                        <span className="rounded bg-muted px-1 py-0.5">{m.messageType}</span>
+                      )}
+                      <span className="ml-auto" title={new Date(m.createdAt).toLocaleString()}>
+                        {formatClockTime(m.createdAt)}
+                      </span>
+                    </div>
+                    <div className="mt-1 whitespace-pre-wrap break-words text-xs leading-relaxed">
+                      {m.content.length > 1200 ? `${m.content.slice(0, 1200)}…` : m.content}
+                    </div>
+                  </div>
                 </div>
-                <div className="mt-1 whitespace-pre-wrap break-words text-xs leading-relaxed">
-                  {m.content.length > 1200 ? `${m.content.slice(0, 1200)}…` : m.content}
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </section>
