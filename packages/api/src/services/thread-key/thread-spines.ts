@@ -273,7 +273,11 @@ export function mergeThreadSpines(input: MergeThreadSpinesInput): ThreadSpine[] 
         spine.participants.add(st.leaseAgentId);
       }
       spine.sources.add('studio');
-      spine.lastActivityAt = laterIso(spine.lastActivityAt, st.updatedAt);
+      // Deliberately NOT folded into lastActivityAt: studio rows are touched
+      // by lease heartbeats, so a four-day-old conversation whose studio is
+      // merely occupied would read "just now" and every leased key would
+      // crowd the top of the sort. Presence renders in the studios section;
+      // recency belongs to conversation, sessions, and work.
     }
   }
 
@@ -303,16 +307,24 @@ export function mergeThreadSpines(input: MergeThreadSpinesInput): ThreadSpine[] 
             ? { project: parsed.project, type: parsed.type, id: parsed.id, pinned: false }
             : null;
         })();
+      const studios = [...w.studios.values()];
+      // A key carried ONLY by a studio has no real activity signal; fall
+      // back to the studio timestamp rather than reporting the epoch. Any
+      // conversation, session, or work timestamp outranks this.
+      const lastActivityAt =
+        Date.parse(w.lastActivityAt) > 0
+          ? w.lastActivityAt
+          : studios.reduce((max, st) => laterIso(max, st.updatedAt), w.lastActivityAt);
       return {
         key: w.key,
         identity,
         thread: w.thread,
         sessions: w.sessions.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt)),
-        studios: [...w.studios.values()],
+        studios,
         taskGroups: w.taskGroups.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt)),
         participants: [...w.participants].sort(),
         sources: order.filter((s) => w.sources.has(s)),
-        lastActivityAt: w.lastActivityAt,
+        lastActivityAt,
       };
     })
     .sort((a, b) => Date.parse(b.lastActivityAt) - Date.parse(a.lastActivityAt));

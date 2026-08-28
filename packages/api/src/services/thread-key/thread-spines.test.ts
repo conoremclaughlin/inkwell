@@ -186,6 +186,34 @@ describe('mergeThreadSpines', () => {
   });
 });
 
+describe('lastActivityAt vs studio heartbeats', () => {
+  it('a lease heartbeat never makes an old conversation read as fresh', () => {
+    const spines = mergeThreadSpines({
+      threads: [thread({ updatedAt: at(1) })],
+      sessions: [session({ threadKey: 'pr:531', updatedAt: at(2) })],
+      // Studio row touched moments ago by the lease heartbeat.
+      studios: [studio({ leaseThreadKey: 'pr:531', leaseAgentId: 'wren', updatedAt: at(12) })],
+      groups: [],
+      parse: noParse,
+    });
+
+    expect(spines[0].lastActivityAt).toBe(at(2));
+    // Presence still renders — the studio itself is not hidden.
+    expect(spines[0].studios).toHaveLength(1);
+  });
+
+  it('a key carried only by a studio falls back to the studio timestamp, not the epoch', () => {
+    const spines = mergeThreadSpines({
+      threads: [],
+      sessions: [],
+      studios: [studio({ threadKey: 'spec:fleet', updatedAt: at(4) })],
+      groups: [],
+      parse: noParse,
+    });
+    expect(spines[0].lastActivityAt).toBe(at(4));
+  });
+});
+
 describe('missingThreadKeys', () => {
   it('collects every carrier key absent from the fetched window, deduped', () => {
     const keys = missingThreadKeys(

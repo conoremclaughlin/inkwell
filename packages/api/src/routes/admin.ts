@@ -6777,12 +6777,107 @@ router.get('/threads', async (req: Request, res: Response) => {
 });
 
 /**
+ * Studio history for one threadKey, from the lease-event audit trail — the
+ * durable record of where the key's work physically happened. Ephemeral
+ * review studios are closed when a thread finishes, which removes them from
+ * the live studios feed; the events outlive the studio, so "which studio
+ * did Lumen review this in?" stays answerable after cleanup. Throws on
+ * query failure (callers' catch handles it).
+ */
+async function loadThreadStudioHistory(
+  supabase: SupabaseClient<Database>,
+  userId: string,
+  threadKey: string
+): Promise<
+  Array<{
+    studioId: string;
+    slug: string | null;
+    branch: string | null;
+    status: string;
+    agents: string[];
+    firstAt: string;
+    lastAt: string;
+    lastEvent: string;
+  }>
+> {
+  const { data: leaseEvents, error: leaseEventsError } = await supabase
+    .from('studio_lease_events')
+    .select('studio_id, agent_id, event, created_at')
+    .eq('user_id', userId)
+    .eq('thread_key', threadKey)
+    .order('created_at', { ascending: false })
+    .limit(200);
+  if (leaseEventsError) {
+    throw new Error(`Failed to load studio lease history: ${leaseEventsError.message}`);
+  }
+
+  interface StudioHistoryEntry {
+    studioId: string;
+    agents: Set<string>;
+    firstAt: string;
+    lastAt: string;
+    lastEvent: string;
+  }
+  const historyByStudio = new Map<string, StudioHistoryEntry>();
+  // Rows arrive newest-first: the first row seen per studio carries the
+  // latest event; later rows only extend firstAt backward.
+  for (const ev of leaseEvents || []) {
+    const entry = historyByStudio.get(ev.studio_id);
+    if (!entry) {
+      historyByStudio.set(ev.studio_id, {
+        studioId: ev.studio_id,
+        agents: new Set(ev.agent_id ? [ev.agent_id] : []),
+        firstAt: ev.created_at,
+        lastAt: ev.created_at,
+        lastEvent: ev.event,
+      });
+    } else {
+      if (ev.agent_id) entry.agents.add(ev.agent_id);
+      entry.firstAt = ev.created_at;
+    }
+  }
+
+  const historyStudioIds = [...historyByStudio.keys()];
+  const studioMetaById = new Map<string, { slug: string | null; branch: string; status: string }>();
+  if (historyStudioIds.length > 0) {
+    // Includes cleaned studios deliberately — that is the whole point.
+    const { data: historyStudios, error: historyStudiosError } = await supabase
+      .from('studios')
+      .select('id, slug, branch, status')
+      .in('id', historyStudioIds);
+    if (historyStudiosError) {
+      throw new Error(`Failed to load studio metadata for history: ${historyStudiosError.message}`);
+    }
+    for (const st of historyStudios || []) {
+      studioMetaById.set(st.id, { slug: st.slug ?? null, branch: st.branch, status: st.status });
+    }
+  }
+
+  return [...historyByStudio.values()]
+    .map((entry) => {
+      const meta = studioMetaById.get(entry.studioId);
+      return {
+        studioId: entry.studioId,
+        slug: meta?.slug ?? null,
+        branch: meta?.branch ?? null,
+        status: meta?.status ?? 'deleted',
+        agents: [...entry.agents].sort(),
+        firstAt: entry.firstAt,
+        lastAt: entry.lastAt,
+        lastEvent: entry.lastEvent,
+      };
+    })
+    .sort((a, b) => Date.parse(b.lastAt) - Date.parse(a.lastAt));
+}
+
+/**
  * GET /api/admin/threads/messages?key=<threadKey>
  *
  * Conversation for one threadKey. The key rides a query param, not a path
  * segment — keys contain colons and slashes. A key with no thread row is a
  * valid answer ({ thread: null }), not a 404: the browse page shows those
- * keys as "no thread yet".
+ * keys as "no thread yet". Studio history rides along in both cases — a
+ * key nobody ever messaged about can still have been worked somewhere.
  */
 router.get('/threads/messages', async (req: Request, res: Response) => {
   try {
@@ -6807,8 +6902,14 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
       res.status(500).json(errorJson('Failed to load thread messages', threadError));
       return;
     }
+    const studioHistory = await loadThreadStudioHistory(
+      supabase as SupabaseClient<Database>,
+      authReq.pcpUserId,
+      key
+    );
+
     if (!thread) {
-      res.json({ thread: null, messages: [] });
+      res.json({ thread: null, messages: [], studioHistory });
       return;
     }
 
@@ -6837,6 +6938,7 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
     const fetched = (messageRows || []).length;
     const total = messagesCount ?? fetched;
     res.json({
+      studioHistory,
       thread: {
         threadKey: thread.thread_key,
         title: thread.title ?? null,
