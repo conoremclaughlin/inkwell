@@ -452,6 +452,7 @@ ENABLE_TELEGRAM=false \
 ENABLE_WHATSAPP=false \
 ENABLE_DISCORD=false \
 ENABLE_GRAPH_SWEEP=false \
+ALERT_STALENESS_SWEEP_SECONDS=0 \
 PCP_PORT_BASE=4001 \
 yarn dev
 
@@ -459,7 +460,9 @@ yarn dev
 PCP_SERVER_URL=http://localhost:4001 ink mission
 ```
 
-**Disable services you aren't testing.** Telegram, WhatsApp, Discord, the heartbeat service, and the workflow-graph sweep (`ENABLE_GRAPH_SWEEP`) should stay `false` on isolated servers — the main server already owns those connections and the sweep's dispatch (both servers share the DB, so two sweeps means duplicate inbox triggers). Only enable them if you're explicitly testing that functionality _and_ you've stopped it on the main server first (e.g., two Telegram listeners will conflict).
+**Disable services you aren't testing.** Telegram, WhatsApp, Discord, the heartbeat service, the workflow-graph sweep (`ENABLE_GRAPH_SWEEP`), and the alert staleness sweep (`ALERT_STALENESS_SWEEP_SECONDS=0`) should stay off on isolated servers — the main server already owns those connections and those sweeps' dispatch (both servers share the DB, so two sweeps means duplicate inbox triggers and duplicate alert notifications). Only enable them if you're explicitly testing that functionality _and_ you've stopped it on the main server first (e.g., two Telegram listeners will conflict).
+
+Note that the alert sweep is **on by default** — unlike `ENABLE_*` flags, omitting `ALERT_STALENESS_SWEEP_SECONDS` runs it every 300s rather than disabling it. A long-running review server that leaves it unset will emit real alert notifications. Only an explicit `0` turns it off.
 
 Port derivation from `PCP_PORT_BASE`:
 

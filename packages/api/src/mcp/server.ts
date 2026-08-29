@@ -28,6 +28,9 @@ import { createChatRouter } from '../routes/chat';
 import { createSessionsRouter } from '../routes/sessions';
 import { sessionEventBus } from '../services/sessions/session-event-bus';
 import { createHookLifecycleRouter } from '../routes/hook-lifecycle';
+import { createAlertsRouter } from '../routes/alerts';
+import { AlertDispatchService } from '../services/alerts/alert-dispatch.service';
+import { startStalenessSweep } from '../services/alerts/alert-sweep';
 import {
   ChannelGateway,
   createChannelGateway,
@@ -71,6 +74,8 @@ export class MCPServer {
   private channelGateway: ChannelGateway | null = null;
   private config: MCPServerConfig;
   private authProvider: PcpAuthProvider;
+  /** Staleness sweep ticker; cleared on shutdown so tests and restarts exit. */
+  private alertSweepTimer: NodeJS.Timeout | null = null;
 
   constructor(dataComposer: DataComposer, config: MCPServerConfig = {}) {
     this.dataComposer = dataComposer;
@@ -1024,6 +1029,13 @@ export class MCPServer {
     app.use('/api/sessions', sessionsRouter);
     logger.info('Session event routes registered at /api/sessions');
 
+    // Alert webhook routes. Registered synchronously and unconditionally —
+    // an alarm path that silently fails to mount is worse than no alarm path,
+    // because the absence is invisible until the outage it was meant to catch.
+    const alertsRouter = createAlertsRouter(this.dataComposer);
+    app.use('/api/alerts', alertsRouter);
+    logger.info('Alert webhook routes registered at /api/alerts');
+
     // Kindle routes (registered below after import)
     import('../routes/kindle.js')
       .then(({ createKindleRouter }) => {
@@ -1091,12 +1103,33 @@ export class MCPServer {
       logger.info(`Graph reconciliation sweep enabled (every ${Math.round(sweepMs / 1000)}s)`);
     }
 
+    this.startAlertStalenessSweep();
+
     // Initialize channel gateway if message handler is configured
     if (this.config.messageHandler) {
       await this.startChannelGateway();
     } else {
       logger.info('ChannelGateway not started (no messageHandler configured)');
     }
+  }
+
+  /**
+   * Schedule the alert staleness sweep.
+   *
+   * Without this the whole liveness half of the alerting schema is inert:
+   * check-ins are stored and GET /sources can *report* a stale verdict when
+   * something asks, but no dead checker ever raises an incident on its own.
+   * A monitor you have to remember to look at is not a monitor (PR #539,
+   * Lumen — sweepStaleSources was written and never scheduled).
+   *
+   * The interval and non-overlap semantics live in alert-sweep.ts so they can
+   * be tested; this is only the wiring.
+   */
+  private startAlertStalenessSweep(): void {
+    this.alertSweepTimer = startStalenessSweep(
+      new AlertDispatchService(this.dataComposer),
+      env.ALERT_STALENESS_SWEEP_SECONDS
+    );
   }
 
   /**
@@ -1183,6 +1216,11 @@ export class MCPServer {
    */
   async shutdown(): Promise<void> {
     logger.info('Shutting down MCP server...');
+
+    if (this.alertSweepTimer) {
+      clearInterval(this.alertSweepTimer);
+      this.alertSweepTimer = null;
+    }
 
     // Stop channel gateway first
     if (this.channelGateway) {
