@@ -504,9 +504,51 @@ export class GraphExecutorService {
           `You are the assignee: review the upstream work and record a verdict with ` +
           `record_gate_verdict(taskId, verdict: 'passed'|'failed', expectedAttempt, expectedGateVersion, ` +
           `evidence for pass / reason for fail). Read the task first (get_task) for the current attempt/version. ` +
-          `For an automated check (CI, GH), claim the gate first with claim_task and pass the claim token.`;
+          `For an automated check (CI, GH), claim the gate first with claim_task and pass the claim token.` +
+          (await this.gateChecklist(node.id));
 
     return this.sendTrigger(userId, group, slug, content, `graph_${kind}_ready`, node.id);
+  }
+
+  /**
+   * The gate's checklist, appended to the message that opens it.
+   *
+   * This is the moment the reminder has to arrive. A checklist stored on the
+   * node is a checklist nobody reads: the assignee is woken by this message
+   * and acts on what it says, so anything the gate wants — screenshots, the
+   * SHA actually reviewed, a pre-registered merge tree — has to be in it.
+   * Requirements are free-form by design (Conor's ruling: checklist, not
+   * bouncer), so this renders whatever the constructor wrote and validates
+   * nothing. A gate with no requirements adds nothing.
+   *
+   * Best-effort: a lookup failure costs the reminder, never the dispatch.
+   */
+  private async gateChecklist(taskId: string): Promise<string> {
+    try {
+      const { data, error } = await this.dataComposer
+        .getClient()
+        .from('tasks')
+        .select('verification')
+        .eq('id', taskId)
+        .maybeSingle();
+      if (error || !data) return '';
+      const requirements = (data.verification as { requirements?: unknown } | null)?.requirements;
+      if (!Array.isArray(requirements) || requirements.length === 0) return '';
+      const lines = requirements
+        .filter((r): r is { label: string; detail?: string } => {
+          return Boolean(r) && typeof (r as { label?: unknown }).label === 'string';
+        })
+        .map((r) => `  [ ] ${r.label}${r.detail ? ` — ${r.detail}` : ''}`);
+      if (lines.length === 0) return '';
+      return (
+        `\n\nThis gate is asking for:\n${lines.join('\n')}\n` +
+        `These are what the gate is FOR, not a schema — record them in your evidence in whatever ` +
+        `shape fits, and say so plainly if one does not apply.`
+      );
+    } catch (err) {
+      logger.debug(`Gate checklist render failed for ${taskId} (non-fatal):`, err);
+      return '';
+    }
   }
 
   private async sendTrigger(
