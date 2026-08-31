@@ -6,6 +6,7 @@
  */
 
 import { z } from 'zod';
+import { isoDateTime } from './schema-primitives.js';
 import { createClient } from '@supabase/supabase-js';
 import type { DataComposer } from '../../data/composer';
 import { resolveUser, type UserIdentifier } from '../../services/user-resolver';
@@ -136,9 +137,7 @@ export const createReminderSchema = z.object({
     .string()
     .optional()
     .describe('Cron expression for recurring reminders (e.g., "0 9 * * *" for daily at 9am)'),
-  runAt: z
-    .string()
-    .datetime()
+  runAt: isoDateTime()
     .optional()
     .describe('Specific time to run (ISO 8601). For one-time reminders.'),
   maxRuns: z
@@ -464,7 +463,7 @@ export const updateReminderSchema = z.object({
     .string()
     .optional()
     .describe('New cron expression (set to null to make one-time)'),
-  nextRunAt: z.string().datetime().optional().describe('Reschedule to specific time'),
+  nextRunAt: isoDateTime().optional().describe('Reschedule to specific time'),
   status: z.enum(['active', 'paused']).optional().describe('Pause or resume the reminder'),
   studioHint: z
     .string()

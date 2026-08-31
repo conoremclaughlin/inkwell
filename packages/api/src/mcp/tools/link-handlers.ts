@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { isoDateTime } from './schema-primitives.js';
 import type { DataComposer } from '../../data/composer';
 import { logger } from '../../utils/logger';
 import { userIdentifierBaseSchema, resolveUserOrThrow } from '../../services/user-resolver';
@@ -15,8 +16,8 @@ export const saveLinkSchema = userIdentifierBaseSchema.extend({
 export const searchLinksSchema = userIdentifierBaseSchema.extend({
   query: z.string().optional(),
   tags: z.array(z.string()).optional(),
-  startDate: z.string().datetime().optional(),
-  endDate: z.string().datetime().optional(),
+  startDate: isoDateTime().optional(),
+  endDate: isoDateTime().optional(),
   limit: z.number().min(1).max(100).default(20),
 });
 
