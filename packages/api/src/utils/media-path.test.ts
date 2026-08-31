@@ -1,5 +1,17 @@
-import { describe, it, expect } from 'vitest';
-import { expandHomePath, isWithinRoots, resolveAllowedMediaPath } from './media-path';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { promises as fsPromises } from 'fs';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import {
+  expandHomePath,
+  isWithinRoots,
+  openVerifiedMedia,
+  resolveAllowedMediaPath,
+} from './media-path';
+
+const execFileAsync = promisify(execFile);
 
 const HOME = '/Users/conor';
 const REPO = '/Users/conor/ws/inkwell';
@@ -67,5 +79,87 @@ describe('expandHomePath', () => {
     expect(expandHomePath('~/.ink/files/a.png', HOME)).toBe('/Users/conor/.ink/files/a.png');
     expect(expandHomePath('/abs/path.png', HOME)).toBe('/abs/path.png');
     expect(expandHomePath('rel/~x/path.png', HOME)).toBe('rel/~x/path.png');
+  });
+});
+
+/**
+ * The descriptor pipeline against REAL files — each rejection case is one
+ * of the validate-then-reopen holes from the PR #551 review, reproduced as
+ * a fixture: hard link to outside content, symlink extension spoof
+ * (png -> html), symlink escape, FIFO, and root-resolution independence.
+ */
+describe('openVerifiedMedia (real filesystem fixtures)', () => {
+  let fixtureBase: string;
+  let root: string;
+  let outside: string;
+  const roots = () => [root];
+
+  const openAt = (requestedPath: string, allowedRoots: string[] = roots()) =>
+    openVerifiedMedia(requestedPath, allowedRoots, '/nonexistent-home', fixtureBase);
+
+  beforeAll(async () => {
+    fixtureBase = await fsPromises.mkdtemp(join(tmpdir(), 'media-path-test-'));
+    root = join(fixtureBase, 'allowed');
+    outside = join(fixtureBase, 'outside');
+    await fsPromises.mkdir(root, { recursive: true });
+    await fsPromises.mkdir(outside, { recursive: true });
+
+    await fsPromises.writeFile(join(root, 'legit.jpeg'), Buffer.from('jpeg-bytes'));
+    await fsPromises.writeFile(join(outside, 'secret.jpeg'), Buffer.from('outside-secret'));
+    await fsPromises.writeFile(join(root, 'payload.html'), '<script>alert(1)</script>');
+
+    // Hard link INSIDE the root to OUTSIDE content: every path-based check
+    // sees an in-root file, but the inode is the outside file's.
+    await fsPromises.link(join(outside, 'secret.jpeg'), join(root, 'leak.jpeg'));
+    // Extension spoof: requested/served name says png, canonical target is HTML.
+    await fsPromises.symlink(join(root, 'payload.html'), join(root, 'preview.png'));
+    // Plain symlink escape to an outside media file.
+    await fsPromises.symlink(join(outside, 'secret.jpeg'), join(root, 'escape.jpeg'));
+  });
+
+  afterAll(async () => {
+    await fsPromises.rm(fixtureBase, { recursive: true, force: true });
+  });
+
+  it('serves a regular in-root file with size and canonical content type', async () => {
+    const media = await openAt(join(root, 'legit.jpeg'));
+    expect(media).not.toBeNull();
+    expect(media!.mediaType).toBe('image');
+    expect(media!.contentType).toBe('image/jpeg');
+    expect(media!.size).toBe(Buffer.from('jpeg-bytes').length);
+    const served = await media!.handle.readFile();
+    expect(served.toString()).toBe('jpeg-bytes');
+    await media!.handle.close();
+  });
+
+  it('refuses a hard link inside the root to outside content (nlink > 1)', async () => {
+    expect(await openAt(join(root, 'leak.jpeg'))).toBeNull();
+  });
+
+  it('refuses the png -> html extension spoof: type comes from the canonical target', async () => {
+    expect(await openAt(join(root, 'preview.png'))).toBeNull();
+  });
+
+  it('refuses a symlink escaping the root even when the target is media', async () => {
+    expect(await openAt(join(root, 'escape.jpeg'))).toBeNull();
+  });
+
+  it('refuses a FIFO with a media name — never opens blocking, never serves a non-file', async () => {
+    const fifoPath = join(root, 'pipe.jpeg');
+    try {
+      await execFileAsync('mkfifo', [fifoPath]);
+    } catch {
+      return; // platform without mkfifo — the guard is still covered by isFile()
+    }
+    expect(await openAt(fifoPath)).toBeNull();
+  });
+
+  it('one missing root never disables the others', async () => {
+    const media = await openAt(join(root, 'legit.jpeg'), [
+      join(fixtureBase, 'does-not-exist'),
+      root,
+    ]);
+    expect(media).not.toBeNull();
+    await media!.handle.close();
   });
 });

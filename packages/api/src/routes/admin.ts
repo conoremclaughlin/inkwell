@@ -57,7 +57,7 @@ import {
   missingThreadKeys,
 } from '../services/thread-key/thread-spines';
 import { groupNodeEvents, type GateEventInput } from '../services/thread-key/graph-evidence';
-import { isWithinRoots, resolveAllowedMediaPath } from '../utils/media-path';
+import { openVerifiedMedia } from '../utils/media-path';
 import { activityBus } from '../services/events/activity-bus';
 import type { Activity } from '../data/repositories/activity-stream.repository';
 import {
@@ -6982,10 +6982,15 @@ router.get('/threads/graph-evidence', async (req: Request, res: Response) => {
     const userId = authReq.pcpUserId;
 
     // All statuses deliberately: a merged PR's group is 'completed' and its
-    // evidence trail is exactly what the viewer exists to show.
+    // evidence trail is exactly what the viewer exists to show. GRAPH
+    // groups only — ordinary linear groups default execution_model and
+    // would render whole task lists as "Evidence" while eating the cap
+    // ahead of the real graph (Lumen, PR #551 r1). Newest first so the
+    // current run survives the cap; reversed below for oldest-first
+    // display within the window.
     const GROUPS_CAP = 10;
     const {
-      data: groupRows,
+      data: cappedGroupRows,
       error: groupsError,
       count: groupsCount,
     } = await supabase
@@ -6995,15 +7000,20 @@ router.get('/threads/graph-evidence', async (req: Request, res: Response) => {
       })
       .eq('user_id', userId)
       .eq('thread_key', key)
-      .order('created_at', { ascending: true })
+      .eq('execution_model', 'graph')
+      .order('created_at', { ascending: false })
       .limit(GROUPS_CAP);
     if (groupsError) {
       logger.error('Failed to load task groups for thread evidence:', groupsError);
       res.status(500).json(errorJson('Failed to load graph evidence', groupsError));
       return;
     }
+    const groupRows = [...(cappedGroupRows ?? [])].reverse();
     if (!groupRows || groupRows.length === 0) {
-      res.json({ groups: [], meta: { groups: { fetched: 0, total: groupsCount ?? 0 } } });
+      res.json({
+        groups: [],
+        meta: { groups: { fetched: 0, total: groupsCount ?? 0, truncated: false } },
+      });
       return;
     }
 
@@ -7159,7 +7169,11 @@ router.get('/threads/graph-evidence', async (req: Request, res: Response) => {
           })),
       })),
       meta: {
-        groups: { fetched: groupRows.length, total: groupsCount ?? groupRows.length },
+        groups: {
+          fetched: groupRows.length,
+          total: groupsCount ?? groupRows.length,
+          truncated: (groupsCount ?? groupRows.length) > GROUPS_CAP,
+        },
         events: {
           fetched: eventRows.length,
           total: eventsTotal,
@@ -7227,52 +7241,34 @@ async function evidenceMediaRoots(): Promise<string[]> {
 router.get('/media', async (req: Request, res: Response) => {
   try {
     const requestedPath = typeof req.query.path === 'string' ? req.query.path : '';
-    const mediaRoots = await evidenceMediaRoots();
-    const resolved = resolveAllowedMediaPath(
+    // One verified descriptor: containment (lexical + canonical), type from
+    // the canonical target, O_NOFOLLOW open, fstat regular-file + nlink=1.
+    // The response streams from that descriptor — never a path re-open
+    // (validate-then-sendFile raced, followed hard links, and served a
+    // png->html symlink as HTML — Lumen, PR #551 r1).
+    const media = await openVerifiedMedia(
       requestedPath,
-      mediaRoots,
+      await evidenceMediaRoots(),
       os.homedir(),
       await getWorkspaceRoot()
     );
-    if (!resolved) {
+    if (!media) {
       res.status(404).json({ error: 'Not found' });
       return;
     }
 
-    let realPath: string;
-    let realRoots: string[];
-    try {
-      realPath = await fs.realpath(resolved.absolutePath);
-      realRoots = await Promise.all(mediaRoots.map((root) => fs.realpath(root)));
-    } catch {
-      res.status(404).json({ error: 'Not found' });
-      return;
-    }
-    if (!isWithinRoots(realPath, realRoots)) {
-      res.status(404).json({ error: 'Not found' });
-      return;
-    }
-    const fileInfo = await fs.stat(realPath);
-    if (!fileInfo.isFile()) {
-      res.status(404).json({ error: 'Not found' });
-      return;
-    }
-
-    // Serve relative to the containing root: dotfiles-denial then applies
-    // only below the root, not to root segments like ".ink" (a whole-path
-    // sendFile 403'd every shared-media file — caught live).
-    const containingRoot = realRoots.find(
-      (root) => realPath === root || realPath.startsWith(root + path.sep)
-    );
-    if (!containingRoot) {
-      res.status(404).json({ error: 'Not found' });
-      return;
-    }
-    res.sendFile(path.relative(containingRoot, realPath), {
-      root: containingRoot,
-      dotfiles: 'deny',
-      headers: { 'Cache-Control': 'private, max-age=300' },
+    res.status(200);
+    res.setHeader('Content-Type', media.contentType);
+    res.setHeader('Content-Length', String(media.size));
+    res.setHeader('Cache-Control', 'private, max-age=300');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    const mediaStream = media.handle.createReadStream(); // closes the handle on end/destroy
+    mediaStream.on('error', (streamError) => {
+      logger.error('Evidence media stream failed:', streamError);
+      res.destroy();
     });
+    res.on('close', () => mediaStream.destroy());
+    mediaStream.pipe(res);
   } catch (error) {
     logger.error('Failed to serve evidence media:', error);
     res.status(500).json(errorJson('Failed to serve media', error));

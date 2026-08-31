@@ -186,7 +186,7 @@ interface EvidenceGroup {
 interface GraphEvidenceResponse {
   groups: EvidenceGroup[];
   meta?: {
-    groups: { fetched: number; total: number };
+    groups: { fetched: number; total: number; truncated?: boolean };
     events?: { fetched: number; total: number; truncated: boolean };
   };
 }
@@ -643,6 +643,13 @@ function SpineDetail({ spine, onBack }: { spine: ThreadSpine; onBack: () => void
                 ))}
               </div>
             ))}
+            {evidenceData?.meta?.groups?.truncated && (
+              <div className="flex items-center gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-600">
+                <AlertTriangle className="h-3 w-3 shrink-0" />
+                Showing the newest {evidenceData.meta.groups.fetched} of{' '}
+                {evidenceData.meta.groups.total} workflow graphs on this key.
+              </div>
+            )}
             {evidenceData?.meta?.events?.truncated && (
               <div className="flex items-center gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-600">
                 <AlertTriangle className="h-3 w-3 shrink-0" />
