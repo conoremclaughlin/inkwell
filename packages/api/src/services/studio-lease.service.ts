@@ -642,6 +642,11 @@ export class StudioLeaseService {
     const { data } = await query.select('id');
     if (!data?.length) return;
 
+    // Same contract as every other successful release/cleaning exit (S1,
+    // Lumen r1 on PR #550): a retired ephemeral must not stay any session's
+    // thread-continuity address.
+    await this.repointSessionsOffEphemeral(req.studioId, req.userId);
+
     logger.warn('[StudioLease] Retired studio with absent worktree', {
       studioId: req.studioId,
       worktreePath,
@@ -1673,7 +1678,13 @@ export class StudioLeaseService {
         continue;
       }
 
-      await this.casLease(row.id, row.user_id, claim, null);
+      // The clear must actually WIN before anything is reported (Lumen r1 on
+      // PR #550): a claim replaced underneath — another worker's fresh claim,
+      // a concurrent acquisition — means this expiry did not happen. Falling
+      // through would repoint sessions, emit an 'expired' event, and count a
+      // release that never cleared.
+      const cleared = await this.casLease(row.id, row.user_id, claim, null);
+      if (!cleared) continue;
       await this.repointSessionsOffEphemeral(row.id, row.user_id);
 
       const heldMs = Date.now() - Date.parse(lease.acquiredAt);

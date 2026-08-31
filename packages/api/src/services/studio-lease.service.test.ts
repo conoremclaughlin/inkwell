@@ -42,6 +42,12 @@ interface FakeHooks {
   /** Fires after each select executes on the named table. */
   afterSelect?: (table: string, count: number) => void;
   /**
+   * Fires BEFORE each update executes on the named table (counted per
+   * table) — the window for interleaving a concurrent write between two
+   * CAS updates, e.g. the sweep's claim and its final clear.
+   */
+  beforeUpdate?: (table: string, count: number) => void;
+  /**
    * Fires inside grant_studio_lease / studio_path_conflict AFTER the
    * pre-lock path read and BEFORE the sibling scan + CAS — the r4 P0-2
    * TOCTOU window. A test mutates rows here to simulate a concurrent
@@ -112,6 +118,11 @@ class FakeQuery {
     if (this.mode === 'insert') {
       this.rows.push({ ...this.payload });
       return [{ ...this.payload }];
+    }
+    if (this.mode === 'update' && this.hooks?.beforeUpdate && this.counters) {
+      const key = `update:${this.table}`;
+      this.counters[key] = (this.counters[key] ?? 0) + 1;
+      this.hooks.beforeUpdate(this.table, this.counters[key]);
     }
     let matched = this.rows.filter((r) => this.filters.every((f) => f(r)));
     if (this.mode === 'update') {
@@ -2369,5 +2380,94 @@ describe('S1: session repoint on ephemeral release (spec v18)', () => {
     await service.releaseBySession('sess-2', { userId: 'u', reason: 'test' });
 
     expect(tables.sessions[2].studio_id).toBe('s-home');
+  });
+});
+
+describe('S1 r1: release/repoint gap regressions (PR #550, Lumen r1)', () => {
+  afterEach(() => resetActiveRuns());
+
+  function retireTables(): Record<string, Row[]> {
+    return {
+      studios: [
+        {
+          id: 's-eph',
+          user_id: 'u',
+          status: 'active',
+          ephemeral: true,
+          expires_at: null,
+          parent_studio_id: 's-home',
+          lease: staleLease({ sessionId: 'sess-gone', threadKey: 'pr:11' }),
+          worktree_path: path.join(tmpdir(), 's1-r1-absent-worktree-xyz'),
+        },
+        {
+          id: 's-home',
+          user_id: 'u',
+          status: 'active',
+          ephemeral: false,
+          expires_at: null,
+          parent_studio_id: null,
+          lease: null,
+          worktree_path: null,
+        },
+      ],
+      sessions: [
+        // Holder gone: row exists, no poll, no open turn.
+        {
+          id: 'sess-gone',
+          user_id: 'u',
+          studio_id: 's-eph',
+          working_dir: null,
+          cli_poll_at: null,
+          cli_turn_at: null,
+        },
+      ],
+      studio_lease_events: [],
+      inbox_threads: [],
+      agent_identities: [],
+    };
+  }
+
+  it('acquire-path retire of an absent-worktree ephemeral repoints its sessions', async () => {
+    const tables = retireTables();
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const result = await service.acquire({
+      studioId: 's-eph',
+      sessionId: 'sess-new',
+      threadKey: 'pr:11',
+      agentId: 'wren',
+      userId: 'u',
+    });
+
+    expect(result.acquired).toBe(false);
+    expect(tables.studios[0].status).toBe('cleaned'); // retired, per round 7
+    // The r1 gap: retire is a successful cleaning exit and must repoint too.
+    expect(tables.sessions[0].studio_id).toBe('s-home');
+  });
+
+  it('a lost final sweep clear reports nothing: no expired count, no repoint, no event', async () => {
+    const tables = retireTables();
+    tables.studios[0].worktree_path = null; // skip the absent-worktree retire branch
+    const thief = freshLease({ sessionId: 'thief', threadKey: 'pr:99' });
+    const service = new StudioLeaseService(
+      makeFakeSupabase(tables, {
+        // studios update #1 is the recovery claim; #2 is the final clear.
+        // Replace the lease in between — the clear's exact-claim CAS must
+        // lose, and a lost clear must report NOTHING.
+        beforeUpdate: (table, count) => {
+          if (table === 'studios' && count === 2) {
+            tables.studios[0].lease = { ...thief };
+          }
+        },
+      })
+    );
+
+    const stats = await service.sweepExpiredLeases();
+
+    expect(stats.expired).toBe(0);
+    expect(tables.sessions[0].studio_id).toBe('s-eph'); // no repoint
+    expect(tables.studio_lease_events.map((e) => e.event)).not.toContain('expired');
+    // The concurrent write survived untouched.
+    expect((tables.studios[0].lease as StudioLease).sessionId).toBe('thief');
   });
 });
