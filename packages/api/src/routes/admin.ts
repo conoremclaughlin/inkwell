@@ -17,6 +17,8 @@ import { env, isDevelopment } from '../config/env';
 import { getHeartbeatProcessingConfig } from '../config/heartbeat-flags';
 import { runWithRequestContext } from '../utils/request-context';
 import { getDataComposer } from '../data/composer';
+import { handleSendToInbox } from '../mcp/tools/inbox-handlers';
+import { getParticipants } from '../mcp/tools/thread-handlers';
 import { notifyPlatformOfApprovalRequest } from '../channels/approval-interceptor';
 
 /**
@@ -111,6 +113,8 @@ type ChannelRouteRow = {
 const ADMIN_ACCESS_TOKEN_LIFETIME_SECONDS = 3600; // 1 hour
 const ADMIN_REFRESH_TOKEN_LIFETIME_DAYS = 90;
 const ADMIN_CLIENT_ID = 'dashboard';
+/** Refresh-token client_id for the native app (packages/mobile). */
+const MOBILE_CLIENT_ID = 'mobile';
 const MCP_CLI_TRANSCRIPT_ROUTE = /^\/sessions(?:\/synced|\/[^/]+\/(?:sync-transcript|transcript))$/;
 const MCP_CLI_APPROVAL_ROUTE = /^\/approval-requests(?:\/[^/]+\/status)?$/;
 const DEFAULT_SESSION_LOG_LIMIT = 50;
@@ -1275,7 +1279,7 @@ router.post('/auth/logout', async (req: Request, res: Response) => {
         .from('mcp_tokens')
         .delete()
         .eq('refresh_token', refreshToken)
-        .eq('client_id', ADMIN_CLIENT_ID);
+        .in('client_id', [ADMIN_CLIENT_ID, MOBILE_CLIENT_ID]);
     }
 
     // Clear cookies regardless (same options used when setting them)
@@ -1289,6 +1293,187 @@ router.post('/auth/logout', async (req: Request, res: Response) => {
     res.clearCookie('pcp-admin-token', { path: '/api/admin' });
     res.clearCookie('pcp-admin-refresh', { path: '/api/admin' });
     res.json({ success: true });
+  }
+});
+
+// =============================================================================
+// Mobile Auth (before auth middleware — these routes MINT credentials)
+// =============================================================================
+
+/**
+ * Token-in-body auth for native clients (packages/mobile).
+ *
+ * The dashboard's auth rides on httpOnly cookies, which React Native's fetch
+ * does not manage reliably. These two routes issue the SAME pcp_admin access
+ * JWT the middleware's Tier 1 already verifies — only the transport differs:
+ * tokens are returned in the response body and the client sends them as
+ * `Authorization: Bearer`. A distinct client_id (MOBILE_CLIENT_ID, declared
+ * with the other auth constants) keeps mobile refresh tokens separately
+ * revocable from dashboard ones.
+ */
+
+/**
+ * Password attempts per (IP, email) window. In-memory is enough: the API is a
+ * single process, and the limiter only needs to blunt online guessing, not
+ * survive restarts.
+ */
+const LOGIN_ATTEMPT_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_ATTEMPT_LIMIT = 10;
+const loginAttempts = new Map<string, { count: number; windowStartedAt: number }>();
+
+function loginRateLimited(ip: string, email: string): boolean {
+  const now = Date.now();
+  // Prune expired windows so the map cannot grow unboundedly under a spray.
+  for (const [key, entry] of loginAttempts) {
+    if (now - entry.windowStartedAt > LOGIN_ATTEMPT_WINDOW_MS) loginAttempts.delete(key);
+  }
+  const key = `${ip}|${email}`;
+  const entry = loginAttempts.get(key);
+  if (!entry || now - entry.windowStartedAt > LOGIN_ATTEMPT_WINDOW_MS) {
+    loginAttempts.set(key, { count: 1, windowStartedAt: now });
+    return false;
+  }
+  entry.count += 1;
+  return entry.count > LOGIN_ATTEMPT_LIMIT;
+}
+
+/**
+ * POST /api/admin/auth/mobile-login
+ * Body: { email, password } → { accessToken, refreshToken, expiresIn, userId, email }
+ *
+ * Verifies credentials against Supabase server-side (the app never holds
+ * Supabase keys), provisions the PCP user if needed (same contract as the
+ * middleware's Tier 3), and returns a pcp_admin access/refresh token pair.
+ */
+router.post('/auth/mobile-login', async (req: Request, res: Response) => {
+  try {
+    const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+    const password = typeof req.body?.password === 'string' ? req.body.password : '';
+    if (!email || !password) {
+      res.status(400).json({ error: 'email and password are required' });
+      return;
+    }
+
+    if (loginRateLimited(req.ip || 'unknown', email)) {
+      res.status(429).json({ error: 'Too many login attempts. Try again later.' });
+      return;
+    }
+
+    // Dedicated throwaway client for the sign-in: signInWithPassword mutates
+    // the client's internal auth state, so it must never run on a shared
+    // instance (see CLAUDE.md "Supabase Client Footgun").
+    const authClient = createClient(env.SUPABASE_URL, env.SUPABASE_PUBLISHABLE_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const { data: signIn, error: signInError } = await authClient.auth.signInWithPassword({
+      email,
+      password,
+    });
+    if (signInError || !signIn.user) {
+      // Same body for wrong-password and unknown-account: no account oracle.
+      res.status(401).json({ error: 'Invalid email or password' });
+      return;
+    }
+
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+
+    // Look up (or provision) the PCP user by email — Tier 3's contract.
+    let { data: pcpUser } = await supabase.from('users').select('id').eq('email', email).single();
+    if (!pcpUser) {
+      const { data: createdUser, error: createUserError } = await supabase
+        .from('users')
+        .insert({ email, last_login_at: new Date().toISOString() })
+        .select('id')
+        .single();
+      if (createUserError) {
+        // Lost an insert race — the row exists now.
+        const { data: racedUser } = await supabase
+          .from('users')
+          .select('id')
+          .eq('email', email)
+          .single();
+        if (!racedUser) {
+          logger.error('Failed to provision PCP user during mobile login', {
+            error: createUserError.message,
+          });
+          res.status(500).json({ error: 'Failed to provision user' });
+          return;
+        }
+        pcpUser = racedUser;
+      } else {
+        pcpUser = createdUser;
+      }
+    } else {
+      await supabase
+        .from('users')
+        .update({ last_login_at: new Date().toISOString() })
+        .eq('id', pcpUser.id);
+    }
+
+    const accessToken = signPcpAccessToken(
+      { type: 'pcp_admin', sub: pcpUser.id, email, scope: 'admin' },
+      ADMIN_ACCESS_TOKEN_LIFETIME_SECONDS
+    );
+    const { refreshToken } = await createRefreshToken(
+      supabase,
+      pcpUser.id,
+      MOBILE_CLIENT_ID,
+      ['admin'],
+      ADMIN_REFRESH_TOKEN_LIFETIME_DAYS
+    );
+
+    res.json({
+      accessToken,
+      refreshToken,
+      expiresIn: ADMIN_ACCESS_TOKEN_LIFETIME_SECONDS,
+      userId: pcpUser.id,
+      email,
+    });
+  } catch (error) {
+    logger.error('Mobile login error:', error);
+    res.status(500).json(errorJson('Login failed', error));
+  }
+});
+
+/**
+ * POST /api/admin/auth/mobile-refresh
+ * Body: { refreshToken } → { accessToken, expiresIn, userId, email }
+ * The refresh token itself is long-lived (90 days) and stays unchanged.
+ */
+router.post('/auth/mobile-refresh', async (req: Request, res: Response) => {
+  try {
+    const refreshToken = typeof req.body?.refreshToken === 'string' ? req.body.refreshToken : '';
+    if (!refreshToken) {
+      res.status(400).json({ error: 'refreshToken is required' });
+      return;
+    }
+
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const result = await exchangeRefreshToken(
+      supabase,
+      refreshToken,
+      MOBILE_CLIENT_ID,
+      'pcp_admin',
+      ADMIN_ACCESS_TOKEN_LIFETIME_SECONDS
+    );
+    if (!result) {
+      res.status(401).json({ error: 'Invalid or expired refresh token' });
+      return;
+    }
+
+    res.json({
+      accessToken: result.accessToken,
+      expiresIn: ADMIN_ACCESS_TOKEN_LIFETIME_SECONDS,
+      userId: result.userId,
+      email: result.email,
+    });
+  } catch (error) {
+    logger.error('Mobile token refresh error:', error);
+    res.status(500).json(errorJson('Token refresh failed', error));
   }
 });
 
@@ -6915,7 +7100,7 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
       count: messagesCount,
     } = await supabase
       .from('inbox_thread_messages')
-      .select('id, sender_agent_id, content, message_type, priority, created_at', {
+      .select('id, sender_agent_id, content, message_type, priority, metadata, created_at', {
         count: 'exact',
       })
       .eq('thread_id', thread.id)
@@ -6946,6 +7131,10 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
           content: m.content,
           messageType: m.message_type,
           priority: m.priority,
+          // Human replies land with sender_agent_id 'unknown' (no agent in the
+          // request context); metadata.sentBy = 'user' is how clients tell a
+          // person's message from a genuinely unattributed one.
+          metadata: (m.metadata as Record<string, unknown> | null) ?? null,
           createdAt: m.created_at,
         }))
         .reverse(),
@@ -6954,6 +7143,100 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
   } catch (error) {
     logger.error('Failed to load thread messages:', error);
     res.status(500).json(errorJson('Failed to load thread messages', error));
+  }
+});
+
+/**
+ * POST /api/admin/threads/reply
+ * Body: { key, content, priority? } → { success, messageId, threadId, triggered }
+ *
+ * A human reply into an existing thread — the dashboard and mobile analogue of
+ * send_to_inbox. Delegates to the SAME handler the MCP tool uses, so trigger
+ * dispatch, session routing, and thread bookkeeping stay one code path. The
+ * admin request context carries no agentId, so the handler classifies the
+ * sender as non-agent ('unknown'); metadata.sentBy = 'user' carries the real
+ * attribution for display.
+ *
+ * Existing threads only: a reply is "into the conversation I'm following".
+ * Creating threads needs recipient selection, which is a different screen and
+ * a different endpoint when it's wanted.
+ */
+router.post('/threads/reply', async (req: Request, res: Response) => {
+  try {
+    const key = typeof req.body?.key === 'string' ? req.body.key.trim() : '';
+    const content = typeof req.body?.content === 'string' ? req.body.content : '';
+    const priority = typeof req.body?.priority === 'string' ? req.body.priority : undefined;
+    if (!key) {
+      res.status(400).json({ error: 'key is required' });
+      return;
+    }
+    if (!content.trim()) {
+      res.status(400).json({ error: 'content is required' });
+      return;
+    }
+    if (content.length > 64 * 1024) {
+      res.status(400).json({ error: 'content exceeds 64KB' });
+      return;
+    }
+
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const authReq = req as AdminAuthRequest;
+
+    const { data: thread, error: threadError } = await supabase
+      .from('inbox_threads')
+      .select('id, thread_key, status')
+      .eq('user_id', authReq.pcpUserId)
+      .eq('thread_key', key)
+      .maybeSingle();
+    if (threadError) {
+      logger.error('Failed to load thread for reply:', threadError);
+      res.status(500).json(errorJson('Failed to send reply', threadError));
+      return;
+    }
+    if (!thread) {
+      res.status(404).json({ error: `No thread with key "${key}"` });
+      return;
+    }
+
+    const dataComposer = await getDataComposer();
+    const participants = await getParticipants(dataComposer.getClient(), thread.id);
+    if (participants.length === 0) {
+      // A thread without participants has nobody to wake; refuse loudly
+      // rather than storing a message no agent will ever see.
+      res.status(409).json({ error: 'Thread has no participants to notify' });
+      return;
+    }
+
+    const result = await handleSendToInbox(
+      {
+        userId: authReq.pcpUserId,
+        threadKey: key,
+        content,
+        recipients: participants,
+        // Human reply: wake everyone who is part of the conversation.
+        triggerAll: true,
+        ...(priority ? { priority } : {}),
+        metadata: { sentBy: 'user', channel: 'admin-api' },
+      },
+      dataComposer
+    );
+
+    const parsed = JSON.parse((result.content[0] as { text: string }).text) as Record<
+      string,
+      unknown
+    >;
+    res.json({
+      success: parsed.success !== false,
+      messageId: parsed.messageId ?? null,
+      threadId: parsed.threadId ?? thread.id,
+      triggered: parsed.triggered ?? null,
+      warning: parsed.warning ?? null,
+    });
+  } catch (error) {
+    logger.error('Failed to send thread reply:', error);
+    res.status(500).json(errorJson('Failed to send reply', error));
   }
 });
 
