@@ -486,6 +486,52 @@ describe('runAgentLoop — refused iterations', () => {
     expect(result.stopReason).toBe('all-refused');
   });
 
+  /**
+   * A failure is not a refusal, and the advice for each is the opposite.
+   *
+   * After #552 an unrecognized failure reaches this body — and was met with
+   * "every one was refused. Do not retry them.", talking the agent out of the
+   * one move that works when a validation error has just named the bad field.
+   */
+  it('tells an agent to fix and retry when the call FAILED, not to give up', () => {
+    const body = buildContinuationBody(
+      [
+        {
+          tool: 'create_reminder',
+          result: 'MCP error -32602: Invalid datetime at runAt',
+          status: 'error',
+        },
+      ],
+      []
+    );
+
+    expect(body).toContain('FAILED rather than being refused');
+    expect(body).toContain('fix it and try again');
+    // The refusal advice must not appear — it is the opposite instruction.
+    expect(body).not.toContain('Do not retry them');
+  });
+
+  it('still tells an agent to stop when every call was genuinely refused', () => {
+    const body = buildContinuationBody([{ tool: 'bash', result: 'denied', status: 'blocked' }], []);
+
+    expect(body).toContain('every one was refused');
+    expect(body).toContain('Do not retry them');
+  });
+
+  it('leads with the failure when refusals and failures are mixed', () => {
+    // Nothing ran either way, but only the failure is actionable.
+    const body = buildContinuationBody(
+      [
+        { tool: 'bash', result: 'denied by policy', status: 'blocked' },
+        { tool: 'send_response', result: 'upstream 502', status: 'error' },
+      ],
+      []
+    );
+
+    expect(body).toContain('FAILED rather than being refused');
+    expect(body).not.toContain('Do not retry them');
+  });
+
   it('does not add the refusal note when something did run', async () => {
     const body = buildContinuationBody(
       [
