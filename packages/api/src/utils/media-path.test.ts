@@ -162,4 +162,54 @@ describe('openVerifiedMedia (real filesystem fixtures)', () => {
     expect(media).not.toBeNull();
     await media!.handle.close();
   });
+
+  it('ancestor swapped for a symlink BETWEEN resolution and open is refused (PR #551 r2)', async () => {
+    // Lumen's deterministic repro: the pre-open checks all pass against the
+    // real tree; the beforeOpen seam then renames the ancestor directory and
+    // plants a symlink to an outside directory holding an identically-named
+    // regular file (nlink 1) — so the open lands on outside content and
+    // fstat alone is satisfied. Only the post-open symlink-free walk, bound
+    // to the opened object's (dev, ino), catches it.
+    const ancestor = join(root, 'nested');
+    const ancestorAside = join(root, 'nested-aside');
+    const outsideDecoy = join(outside, 'decoy-dir');
+    await fsPromises.mkdir(ancestor, { recursive: true });
+    await fsPromises.mkdir(outsideDecoy, { recursive: true });
+    await fsPromises.writeFile(join(ancestor, 'shot.jpeg'), Buffer.from('inside-truth'));
+    await fsPromises.writeFile(join(outsideDecoy, 'shot.jpeg'), Buffer.from('outside-lie'));
+
+    try {
+      const media = await openVerifiedMedia(
+        join(root, 'nested', 'shot.jpeg'),
+        roots(),
+        '/nonexistent-home',
+        fixtureBase,
+        {
+          beforeOpen: async () => {
+            await fsPromises.rename(ancestor, ancestorAside);
+            await fsPromises.symlink(outsideDecoy, ancestor);
+          },
+        }
+      );
+      expect(media).toBeNull();
+    } finally {
+      await fsPromises.rm(ancestor, { recursive: true, force: true });
+      await fsPromises.rm(ancestorAside, { recursive: true, force: true });
+      await fsPromises.rm(outsideDecoy, { recursive: true, force: true });
+    }
+  });
+
+  it('the same nested path serves normally when nothing is swapped', async () => {
+    const ancestor = join(root, 'calm');
+    await fsPromises.mkdir(ancestor, { recursive: true });
+    await fsPromises.writeFile(join(ancestor, 'shot.jpeg'), Buffer.from('calm-bytes'));
+    try {
+      const media = await openAt(join(root, 'calm', 'shot.jpeg'));
+      expect(media).not.toBeNull();
+      expect((await media!.handle.readFile()).toString()).toBe('calm-bytes');
+      await media!.handle.close();
+    } finally {
+      await fsPromises.rm(ancestor, { recursive: true, force: true });
+    }
+  });
 });

@@ -103,6 +103,66 @@ export interface VerifiedMedia {
   size: number;
 }
 
+/** Test-only seam: runs between path resolution and the open, where the
+ *  ancestor-swap race lives. Production callers never pass it. */
+export interface OpenVerifiedMediaTestHooks {
+  beforeOpen?: () => void | Promise<void>;
+}
+
+/**
+ * Post-open containment proof, bound to the OPENED object rather than any
+ * pre-open pathname (Lumen, PR #551 r2: between realpath and open, an
+ * ancestor directory can be renamed and replaced with a symlink to an
+ * outside directory — the opened handle then reads outside content while
+ * every pre-open check and fstat still passes).
+ *
+ * Strictly AFTER the open, walk the canonical path from the trusted root
+ * with lstat: every ancestor must be a real directory (never a symlink),
+ * and the final entry must be a non-symlink regular file whose (dev, ino)
+ * is exactly the held descriptor's, with nlink === 1 at both fstat and
+ * walk time. Why this binds to the object: nlink === 1 means the object
+ * has exactly one name anywhere, and a symlink-free chain from the root
+ * proves that one name lives beneath the root — so the object we already
+ * hold IS root content. An attacker can only satisfy this by physically
+ * moving their file's sole link inside the root, at which point it is
+ * root content by definition and serving it discloses nothing beyond
+ * what root-write access already grants.
+ *
+ * Under non-attack conditions the walk is trivially clean: realpath
+ * output contains no symlinks at resolution time.
+ */
+async function openedObjectIsBeneathRoot(
+  handleDev: number,
+  handleIno: number,
+  canonicalPath: string,
+  containingRoot: string
+): Promise<boolean> {
+  try {
+    const rootInfo = await fsPromises.lstat(containingRoot);
+    if (rootInfo.isSymbolicLink() || !rootInfo.isDirectory()) return false;
+
+    const relativePath = canonicalPath.slice(containingRoot.length + sep.length);
+    const segments = relativePath.split(sep);
+    let walkPath = containingRoot;
+    for (let index = 0; index < segments.length - 1; index += 1) {
+      walkPath = `${walkPath}${sep}${segments[index]}`;
+      const ancestorInfo = await fsPromises.lstat(walkPath);
+      if (ancestorInfo.isSymbolicLink() || !ancestorInfo.isDirectory()) return false;
+    }
+
+    const finalInfo = await fsPromises.lstat(`${walkPath}${sep}${segments[segments.length - 1]}`);
+    return (
+      !finalInfo.isSymbolicLink() &&
+      finalInfo.isFile() &&
+      finalInfo.nlink === 1 &&
+      finalInfo.dev === handleDev &&
+      finalInfo.ino === handleIno
+    );
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Resolve, canonicalize, and open a media file as one verified descriptor.
  * Returns null (serve nothing, reveal nothing) unless every check passes:
@@ -127,7 +187,8 @@ export async function openVerifiedMedia(
   requestedPath: string,
   allowedRoots: string[],
   homeDirectory: string,
-  repoRoot: string
+  repoRoot: string,
+  testHooks?: OpenVerifiedMediaTestHooks
 ): Promise<VerifiedMedia | null> {
   const lexical = resolveAllowedMediaPath(requestedPath, allowedRoots, homeDirectory, repoRoot);
   if (!lexical) return null;
@@ -147,10 +208,16 @@ export async function openVerifiedMedia(
     return null;
   }
   if (!isWithinRoots(canonicalPath, realRoots)) return null;
+  const containingRoot = realRoots.find(
+    (root) => canonicalPath === root || canonicalPath.startsWith(root + sep)
+  );
+  if (!containingRoot || canonicalPath === containingRoot) return null;
 
   const mediaType = mediaTypeForPath(canonicalPath);
   const contentType = contentTypeForCanonicalPath(canonicalPath);
   if (!mediaType || !contentType) return null;
+
+  if (testHooks?.beforeOpen) await testHooks.beforeOpen();
 
   let handle: FileHandle;
   try {
@@ -165,6 +232,20 @@ export async function openVerifiedMedia(
   try {
     const fileInfo = await handle.stat();
     if (!fileInfo.isFile() || fileInfo.nlink !== 1) {
+      await handle.close();
+      return null;
+    }
+    // Containment bound to the opened object: prove the held descriptor's
+    // (dev, ino) is reachable from the trusted root through a symlink-free
+    // chain AFTER the open. An ancestor swapped for a symlink between
+    // realpath and open fails this walk, whatever the fd's own stats say.
+    const beneathRoot = await openedObjectIsBeneathRoot(
+      fileInfo.dev,
+      fileInfo.ino,
+      canonicalPath,
+      containingRoot
+    );
+    if (!beneathRoot) {
       await handle.close();
       return null;
     }
