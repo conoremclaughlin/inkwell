@@ -14,13 +14,18 @@
 export type Row = Record<string, unknown>;
 
 function getCol(row: Row, col: string): unknown {
-  if (col.includes('->>')) {
-    const [base, key] = col.split('->>');
-    const obj = row[base];
-    if (!obj || typeof obj !== 'object') return null;
-    return (obj as Row)[key] ?? null;
+  // Nested JSON paths as PostgREST parses them: base->child->>leaf — any
+  // depth, both arrow forms (the single-level split this replaced silently
+  // resolved `lease->pendingRelease->>requestedAt` to null, which made
+  // exact-state CAS guards match when they must not).
+  const parts = col.split('->');
+  let cur: unknown = row;
+  for (let part of parts) {
+    if (part.startsWith('>')) part = part.slice(1);
+    if (!cur || typeof cur !== 'object') return null;
+    cur = (cur as Record<string, unknown>)[part];
   }
-  return row[col] ?? null;
+  return cur ?? null;
 }
 
 class FakeQuery {
@@ -35,7 +40,20 @@ class FakeQuery {
   ) {}
 
   eq(col: string, val: unknown) {
-    this.filters.push((r) => getCol(r, col) === val);
+    this.filters.push((r) => {
+      const cur = getCol(r, col);
+      // `->` (not `->>`) path filters compare jsonb structurally: PostgREST
+      // casts the filter value to jsonb. Mirror that for object/array values
+      // (the threadKeys exact-set guard) — order-sensitive, like jsonb arrays.
+      if (cur !== null && typeof cur === 'object' && typeof val === 'string') {
+        try {
+          return JSON.stringify(cur) === JSON.stringify(JSON.parse(val));
+        } catch {
+          return false;
+        }
+      }
+      return cur === val;
+    });
     return this;
   }
   is(col: string, val: unknown) {
