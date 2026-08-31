@@ -9,6 +9,7 @@
  */
 
 import { z } from 'zod';
+import { isoDateTime } from './schema-primitives.js';
 import type { DataComposer } from '../../data/composer';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
 import { getEffectiveAgentId } from '../../auth/enforce-identity';
@@ -60,9 +61,7 @@ const getThreadMessagesSchema = userIdentifierBaseSchema.extend({
     .describe(
       'Return the full timeline regardless of read state. Without this (and without an explicit cursor), results fall back to messages newer than the last-read pointer — which hides already-delivered messages from watchers/pollers that manage their own cursor (e.g., ink wait).'
     ),
-  newerThan: z
-    .string()
-    .datetime()
+  newerThan: isoDateTime()
     .optional()
     .describe(
       'Explicit floor: only messages created after this timestamp. Combined with the read-state cursor (the later of the two wins).'

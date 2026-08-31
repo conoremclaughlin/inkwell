@@ -5,6 +5,7 @@
  */
 
 import { z } from 'zod';
+import { isoDateTime } from './schema-primitives.js';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
@@ -509,7 +510,7 @@ export const rememberSchema = userIdentifierBaseSchema.extend({
   salience: salienceSchema.optional().describe('Importance level (default: medium)'),
   topics: topicsSchema.describe('Topics for categorization'),
   metadata: z.record(z.unknown()).optional().describe('Additional metadata'),
-  expiresAt: z.string().datetime().optional().describe('Optional expiration date (ISO 8601)'),
+  expiresAt: isoDateTime().optional().describe('Optional expiration date (ISO 8601)'),
   agentId: z
     .string()
     .optional()
