@@ -363,6 +363,23 @@ export async function runAgentLoop(
       if (reason === 'iteration-cap') {
         relayResults = results;
         ports.ui.printLine(`(tool loop limit reached — ${maxIterations} iterations)`);
+      } else if (reason === 'all-refused' && hasUnseenFailure(results)) {
+        // A call that THREW is not a refusal, and nobody watched it happen.
+        //
+        // `all-refused` covers two different events. A denial or a policy block
+        // was witnessed — the human clicked no, or set the rule — so ending the
+        // turn silently is correct and re-prompting would just nag them. An
+        // `error` was witnessed by nobody: the tool raised, the loop stopped
+        // before buildContinuationBody, and the message died in allToolResults.
+        //
+        // Which one you get depends on turn COMPOSITION, not on the call. The
+        // same create_reminder with the same invalid `runAt` reported a precise
+        // -32602 naming the field when it shared a turn with a success, and
+        // returned nothing at all when it was alone — because one success makes
+        // `hasExecutedTools` true and keeps the loop alive to relay. Myra hit
+        // this three times while deliberately isolating variables one call per
+        // turn, which is exactly the discipline that hides it (2026-08-31).
+        relayResults = results;
       }
       break;
     }
@@ -401,16 +418,20 @@ export async function runAgentLoop(
   // that errored there reads to the agent as delivered, and it exits
   // confidently wrong (the Aug 13 Telegram audio drop). One last round-trip
   // shows them; its output is FINAL — ink-tool blocks in it are not executed
-  // (extraction stops with the loop). Only the cap: a terminal signal means
-  // the agent already knows what it signaled (re-invoking recreates the
-  // multiplied-signal bug), and a refusal ends the turn by design — in the
-  // REPL the human watched it happen, and clones retry via continueOnBlocked.
-  if (
-    stopReason === 'iteration-cap' &&
-    relayResults.length > 0 &&
-    outcome.success &&
-    !input.signal?.aborted
-  ) {
+  // (extraction stops with the loop). A terminal signal is still excluded: the
+  // agent already knows what it signaled, and re-invoking recreates the
+  // multiplied-signal bug.
+  //
+  // The cap is no longer the only way results get stranded. `all-refused`
+  // reached here too whenever the ONLY call in a turn threw, and the original
+  // exclusion rested on an assumption that is false for most of this fleet —
+  // "in the REPL the human watched it happen". Myra is neither a human at a
+  // scrollback nor a clone with continueOnBlocked; a validation error simply
+  // vanished, three times, and read as the tool doing nothing. `relayResults`
+  // is only populated for that case when the iteration actually contains an
+  // `error` (see hasUnseenFailure), so a witnessed denial still ends the turn
+  // quietly and nobody gets nagged for saying no.
+  if (relayResults.length > 0 && outcome.success && !input.signal?.aborted) {
     ports.ui.printEvent('  ⋯ relaying final tool results (no further execution)…');
     const stopRelayWaiting = ports.ui.startWaiting();
     let relay: BackendTurnOutcome;
@@ -678,6 +699,24 @@ export function isTerminalSignalToolResult(result: unknown): boolean {
  *
  * Returns the reason to stop, or null to continue.
  */
+/**
+ * True when an iteration contains a failure the agent has not been told about.
+ *
+ * `error` means the call raised — a validation rejection, a transport failure,
+ * a thrown handler. Nothing displayed it and nothing recorded it anywhere the
+ * agent can read, so a turn that ends here ends with the agent believing it
+ * asked for something and hearing nothing back.
+ *
+ * Denials and blocks are deliberately NOT included: those were authored by
+ * someone who saw them happen, and relaying them re-prompts a human who already
+ * said no.
+ */
+export function hasUnseenFailure(
+  iterationResults: ReadonlyArray<Pick<ToolResultRecord, 'status'>>
+): boolean {
+  return iterationResults.some((r) => r.status === 'error');
+}
+
 export function toolLoopStopReason(
   iterationResults: ReadonlyArray<Pick<ToolResultRecord, 'tool' | 'status' | 'result'>>,
   iteration: number,

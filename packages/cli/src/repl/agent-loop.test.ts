@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   buildContinuationBody,
   extractLocalToolCalls,
+  hasUnseenFailure,
   resolveResponseText,
   runAgentLoop,
   type AgentLoopPorts,
@@ -630,5 +631,108 @@ describe('extractLocalToolCalls namespace stripping', () => {
       '```ink-tool\n{"tool":"bash","args":{"command":"ls"}}\n```'
     );
     expect(calls[0].tool).toBe('bash');
+  });
+});
+
+/**
+ * An error alone in a turn used to vanish (Myra, 2026-08-31).
+ *
+ * She ran the controlled experiment: the SAME create_reminder with the SAME
+ * invalid `runAt` returned a precise `-32602 Invalid datetime, path: ["runAt"]`
+ * when it shared a turn with a call that succeeded, and returned NOTHING AT ALL
+ * when it was the only call. One success makes `hasExecutedTools` true, so the
+ * loop stays alive and relays. Alone, `all-refused` ended the turn before
+ * buildContinuationBody and the message died in allToolResults.
+ *
+ * The failure mode is worst under careful method: she hit it three times while
+ * deliberately isolating one variable per turn, which is precisely the shape
+ * that hides it.
+ */
+describe('runAgentLoop — an error that nobody witnessed', () => {
+  const errored = (tool: string): ToolResultRecord => ({
+    tool,
+    result: 'MCP error -32602: Invalid arguments for create_reminder: Invalid datetime at runAt',
+    status: 'error',
+  });
+  const blocked = (tool: string): ToolResultRecord => ({
+    tool,
+    result: 'Tool is explicitly denied by policy.',
+    status: 'blocked',
+  });
+
+  it('relays a sole failing call to the model instead of ending on silence', async () => {
+    const harness = makePorts(
+      [
+        outcome({ responseText: inkTool('create_reminder') }),
+        outcome({ responseText: 'The reminder was rejected: runAt must be a UTC instant.' }),
+      ],
+      () => [errored('create_reminder')]
+    );
+
+    const result = await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+
+    // The relay turn happened, and it carried the actual validation message —
+    // the thing that existed the whole time and nobody could see.
+    expect(harness.prompts).toHaveLength(2);
+    expect(harness.prompts[1].body).toContain('Invalid datetime');
+    expect(harness.prompts[1].body).toContain('FINAL');
+    // And the agent's answer is the relay's, not a confident silence.
+    expect(result.assistantDisplayText).toContain('rejected');
+  });
+
+  it('is not sensitive to turn composition — the whole bug was that it was', async () => {
+    // Same tool, same error, but sharing the turn with a success. This path
+    // always worked; pinning it stops a fix that only repairs the lonely case.
+    const harness = makePorts(
+      [
+        outcome({
+          responseText: `${inkTool('recall')}
+${inkTool('create_reminder')}`,
+        }),
+        outcome({
+          responseText: `noted
+${inkTool('signal_status')}`,
+        }),
+      ],
+      (calls) =>
+        calls.map((c) =>
+          c.tool === 'create_reminder'
+            ? errored('create_reminder')
+            : c.tool === 'signal_status'
+              ? { tool: c.tool, result: signalResult('completed'), status: 'executed' }
+              : { tool: c.tool, result: 'ok', status: 'executed' }
+        )
+    );
+
+    await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+
+    expect(harness.prompts[1].body).toContain('Invalid datetime');
+  });
+
+  it('still ends quietly on a witnessed refusal, so nobody is nagged for saying no', async () => {
+    const harness = makePorts(
+      [outcome({ responseText: inkTool('bash') }), outcome({ responseText: 'second turn' })],
+      () => [blocked('bash')]
+    );
+
+    await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+
+    // One turn. A denial was authored by someone who saw it happen; relaying it
+    // would re-prompt a human who already declined.
+    expect(harness.prompts).toHaveLength(1);
+  });
+});
+
+describe('hasUnseenFailure', () => {
+  it('counts a thrown call, which nothing displayed', () => {
+    expect(hasUnseenFailure([{ status: 'error' }])).toBe(true);
+  });
+
+  it.each(['blocked', 'denied', 'rejected'])('does not count a witnessed %s', (status) => {
+    expect(hasUnseenFailure([{ status }])).toBe(false);
+  });
+
+  it('does not count a clean iteration', () => {
+    expect(hasUnseenFailure([{ status: 'executed' }, { status: 'approved' }])).toBe(false);
   });
 });
