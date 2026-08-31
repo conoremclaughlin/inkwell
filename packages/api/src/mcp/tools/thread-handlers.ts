@@ -787,18 +787,23 @@ export async function handleCloseThread(args: unknown, dataComposer: DataCompose
   // and skips anything still held.
   try {
     const leases = new StudioLeaseService(supabase);
-    const { released, deferred } = await leases.releaseByThread(resolved.user.id, threadKey, {
-      reason: 'thread-closed',
-    });
+    const { released, deferred, removed } = await leases.releaseByThread(
+      resolved.user.id,
+      threadKey,
+      {
+        reason: 'thread-closed',
+      }
+    );
     const overflow = new StudioOverflowService(dataComposer.repositories.studios, leases);
     const cleaned = await overflow.teardownEphemeralStudiosForThread(resolved.user.id, threadKey, {
       reason: `thread ${threadKey} closed`,
     });
-    if (released || deferred || cleaned) {
+    if (released || deferred || removed || cleaned) {
       logger.info('[StudioLease] Thread close released studios', {
         threadKey,
         leasesReleased: released,
         leasesDeferred: deferred,
+        threadKeysRemoved: removed,
         ephemeralCleaned: cleaned,
       });
     }

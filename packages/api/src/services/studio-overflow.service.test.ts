@@ -846,3 +846,69 @@ describe('StudioOverflowService.teardownEphemeralStudio — fencing', () => {
     }
   });
 });
+
+describe('S2: teardownEphemeralStudiosForThread under multiplexing (spec v18)', () => {
+  function multiplexedStudio(threadKeys: string[]): Studio {
+    const now = new Date().toISOString();
+    return makeStudio({
+      ephemeral: true,
+      threadKey: 'pr:A',
+      lease: {
+        sessionId: 'session-b',
+        threadKey: 'pr:A',
+        threadKeys,
+        agentId: 'wren',
+        acquiredAt: now,
+        heartbeatAt: now,
+      } as unknown as Studio['lease'],
+    });
+  }
+
+  it('skips teardown — and the expires_at pull — while another live key rides the lease', async () => {
+    // The spec-mandated case: ephemeral created for pr:A, session appended
+    // pr:B, pr:A closes. The studio and lease must survive holding pr:B, and
+    // the claim-refusal path's "retry teardown soon" expires_at pull must
+    // never fire against a studio that has to keep living.
+    const update = vi.fn();
+    const studios = {
+      markCleaned: vi.fn(),
+      update,
+      listEphemeralByThread: vi.fn().mockResolvedValue([multiplexedStudio(['pr:A', 'pr:B'])]),
+    } as unknown as StudiosRepository;
+    const claimForTeardown = vi.fn();
+    const leases = { logEvent: vi.fn(), claimForTeardown } as unknown as StudioLeaseService;
+    const service = new StudioOverflowService(studios, leases);
+
+    const closed = await service.teardownEphemeralStudiosForThread('user-1', 'pr:A', {
+      reason: 'thread pr:A closed',
+    });
+
+    expect(closed).toBe(0);
+    expect(claimForTeardown).not.toHaveBeenCalled();
+    expect(update).not.toHaveBeenCalled();
+  });
+
+  it('proceeds to the fenced teardown once the closing key is the last survivor', async () => {
+    const update = vi.fn().mockResolvedValue(makeStudio());
+    const studios = {
+      markCleaned: vi.fn(),
+      update,
+      listEphemeralByThread: vi.fn().mockResolvedValue([multiplexedStudio(['pr:B'])]),
+    } as unknown as StudiosRepository;
+    // Claim refused (live holder) — the point is only that the fenced path
+    // WAS attempted for the survivor key; its own gates still apply.
+    const claimForTeardown = vi.fn().mockResolvedValue(null);
+    const leases = { logEvent: vi.fn(), claimForTeardown } as unknown as StudioLeaseService;
+    const service = new StudioOverflowService(studios, leases);
+
+    const closed = await service.teardownEphemeralStudiosForThread('user-1', 'pr:B', {
+      reason: 'thread pr:B closed',
+    });
+
+    expect(closed).toBe(1);
+    expect(claimForTeardown).toHaveBeenCalledWith('parent-1', 'user-1', {
+      expectedThreadKey: 'pr:B',
+      reason: 'teardown-claim (thread pr:B closed)',
+    });
+  });
+});

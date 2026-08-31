@@ -25,6 +25,7 @@ import {
   captureWorktreeState,
   rescueSucceeded,
   isLeaseStale,
+  leaseThreadKeys,
   LEASE_STALE_MS,
   QUARANTINE_THREAD_KEY,
   type StudioLease,
@@ -82,7 +83,20 @@ class FakeQuery {
   ) {}
 
   eq(col: string, val: unknown) {
-    this.filters.push((r) => getCol(r, col) === val);
+    this.filters.push((r) => {
+      const cur = getCol(r, col);
+      // `->` (not `->>`) path filters compare jsonb structurally: PostgREST
+      // casts the filter value to jsonb. Mirror that for object/array values
+      // (the threadKeys exact-set guard) — order-sensitive, like jsonb arrays.
+      if (cur !== null && typeof cur === 'object' && typeof val === 'string') {
+        try {
+          return JSON.stringify(cur) === JSON.stringify(JSON.parse(val));
+        } catch {
+          return false;
+        }
+      }
+      return cur === val;
+    });
     return this;
   }
 
@@ -1274,7 +1288,7 @@ describe('StudioLeaseService release paths', () => {
       reason: 'thread-closed',
     });
     // session-a (fresh, non-terminal) deferred; session-b (terminal) released.
-    expect(byThread).toEqual({ released: 1, deferred: 1 });
+    expect(byThread).toEqual({ released: 1, deferred: 1, removed: 0 });
     const marked = tables.studios[0].lease as StudioLease;
     expect(marked.sessionId).toBe('session-a');
     expect(marked.pendingRelease?.reason).toBe('thread-closed');
@@ -1288,7 +1302,7 @@ describe('StudioLeaseService release paths', () => {
 
   it('releaseByThread clears every studio the thread holds', async () => {
     const result = await service.releaseByThread('user-1', 'pr:100');
-    expect(result).toEqual({ released: 2, deferred: 0 });
+    expect(result).toEqual({ released: 2, deferred: 0, removed: 0 });
     expect(tables.studios[0].lease).toBeNull();
     expect(tables.studios[1].lease).toBeNull();
   });
@@ -1303,7 +1317,7 @@ describe('StudioLeaseService release paths', () => {
     });
 
     const result = await service.releaseByThread('user-1', 'pr:100', { reason: 'thread-closed' });
-    expect(result).toEqual({ released: 1, deferred: 1 });
+    expect(result).toEqual({ released: 1, deferred: 1, removed: 0 });
     // The live holder keeps its lease — marked, not cleared.
     const marked = tables.studios[0].lease as StudioLease;
     expect(marked.sessionId).toBe('session-a');
@@ -2469,5 +2483,304 @@ describe('S1 r1: release/repoint gap regressions (PR #550, Lumen r1)', () => {
     expect(tables.studio_lease_events.map((e) => e.event)).not.toContain('expired');
     // The concurrent write survived untouched.
     expect((tables.studios[0].lease as StudioLease).sessionId).toBe('thief');
+  });
+});
+
+describe('S2: thread multiplexing on the lease (spec v18)', () => {
+  let tables: Record<string, Row[]>;
+
+  beforeEach(() => {
+    resetActiveRuns();
+    tables = baseTables();
+  });
+
+  afterEach(() => resetActiveRuns());
+
+  const acquireReq = (threadKey: string, sessionId: string) => ({
+    studioId: 'studio-1',
+    sessionId,
+    threadKey,
+    agentId: 'wren',
+    userId: 'user-1',
+    reason: 'route-pattern',
+  });
+
+  const storedLease = () => tables.studios[0].lease as StudioLease;
+
+  it('leaseThreadKeys: scalar fallback for legacy leases, authoritative set otherwise', () => {
+    expect(leaseThreadKeys(freshLease())).toEqual(['pr:100']);
+    expect(leaseThreadKeys(freshLease({ threadKeys: ['pr:100', 'pr:200'] }))).toEqual([
+      'pr:100',
+      'pr:200',
+    ]);
+    // Once the field exists it is authoritative — a removed key must not
+    // resurrect through the scalar.
+    expect(leaseThreadKeys(freshLease({ threadKey: 'pr:A', threadKeys: ['pr:B'] }))).toEqual([
+      'pr:B',
+    ]);
+    expect(leaseThreadKeys(freshLease({ threadKeys: ['a', 'a'] }))).toEqual(['a']);
+  });
+
+  it('same session, new thread — appends the key, bumps the heartbeat, keeps the scalar', async () => {
+    const lease = freshLease({ sessionId: 'session-b', threadKeys: ['pr:100'] });
+    tables.studios[0].lease = lease as unknown as Row;
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    await new Promise((r) => setTimeout(r, 5));
+    const result = await service.acquire(acquireReq('pr:200', 'session-b'));
+
+    expect(result.acquired).toBe(true);
+    expect(storedLease().threadKeys).toEqual(['pr:100', 'pr:200']);
+    expect(storedLease().threadKey).toBe('pr:100'); // first-acquisition telemetry
+    expect(storedLease().sessionId).toBe('session-b');
+    expect(storedLease().acquiredAt).toBe(lease.acquiredAt); // no re-grant
+    expect(storedLease().heartbeatAt).not.toBe(lease.heartbeatAt); // holder's own act
+    const appendEvents = tables.studio_lease_events.filter(
+      (e) => e.event === 'acquired' && e.reason === 'multiplex-append'
+    );
+    expect(appendEvents).toHaveLength(1);
+    expect(appendEvents[0].thread_key).toBe('pr:200');
+  });
+
+  it('a legacy scalar-only lease appends from the scalar', async () => {
+    tables.studios[0].lease = freshLease({ sessionId: 'session-b' }) as unknown as Row;
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const result = await service.acquire(acquireReq('pr:200', 'session-b'));
+    expect(result.acquired).toBe(true);
+    expect(storedLease().threadKeys).toEqual(['pr:100', 'pr:200']);
+  });
+
+  it('an append never erases a stamped pendingRelease', async () => {
+    const pending = { reason: 'thread-closed', requestedAt: new Date().toISOString() };
+    tables.studios[0].lease = freshLease({
+      sessionId: 'session-b',
+      threadKeys: ['pr:100'],
+      pendingRelease: pending,
+    }) as unknown as Row;
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const result = await service.acquire(acquireReq('pr:200', 'session-b'));
+    expect(result.acquired).toBe(true);
+    expect(storedLease().threadKeys).toEqual(['pr:100', 'pr:200']);
+    // Protection is never erased by bookkeeping: the boundary still completes it.
+    expect(storedLease().pendingRelease).toEqual(pending);
+  });
+
+  it('append CAS race: a thief replacing the lease mid-append is refused, never clobbered', async () => {
+    tables.studios[0].lease = freshLease({
+      sessionId: 'session-b',
+      threadKeys: ['pr:100'],
+    }) as unknown as Row;
+    const thief = freshLease({ sessionId: 'thief', threadKey: 'pr:999', threadKeys: ['pr:999'] });
+    const service = new StudioLeaseService(
+      makeFakeSupabase(tables, {
+        beforeUpdate: (table, count) => {
+          if (table === 'studios' && count === 1) {
+            tables.studios[0].lease = thief as unknown as Row;
+          }
+        },
+      })
+    );
+
+    const result = await service.acquire(acquireReq('pr:200', 'session-b'));
+    expect(result.acquired).toBe(false);
+    if (!result.acquired) expect(result.holder?.sessionId).toBe('thief');
+    // The thief's lease survives exactly as written.
+    expect(storedLease().threadKeys).toEqual(['pr:999']);
+  });
+
+  it('re-acquire of a key already in the set grants without duplicating it', async () => {
+    tables.studios[0].lease = freshLease({
+      sessionId: 'session-b',
+      threadKeys: ['pr:100', 'pr:200'],
+    }) as unknown as Row;
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const result = await service.acquire(acquireReq('pr:200', 'session-b'));
+    expect(result.acquired).toBe(true);
+    expect(storedLease().threadKeys).toEqual(['pr:100', 'pr:200']);
+    expect(storedLease().sessionId).toBe('session-b');
+  });
+
+  it('adoption by a successor session on a multiplexed member key carries the whole set', async () => {
+    tables.studios[0].lease = staleLease({
+      sessionId: 'session-dead',
+      threadKeys: ['pr:100', 'pr:200'],
+    }) as unknown as Row;
+    tables.sessions.push({
+      id: 'session-dead',
+      user_id: 'user-1',
+      ended_at: new Date().toISOString(),
+      status: 'completed',
+      cli_attached: false,
+      cli_poll_at: null,
+      cli_turn_at: null,
+    });
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const result = await service.acquire(acquireReq('pr:200', 'session-c'));
+    expect(result.acquired).toBe(true);
+    expect(storedLease().sessionId).toBe('session-c');
+    // The studio still serves both threads; their next messages route to the
+    // successor and pass the gate through the set.
+    expect(storedLease().threadKeys).toEqual(['pr:100', 'pr:200']);
+  });
+
+  it('a fresh foreign multiplexed lease still refuses a non-member thread', async () => {
+    tables.studios[0].lease = freshLease({
+      sessionId: 'session-b',
+      threadKeys: ['pr:100', 'pr:200'],
+    }) as unknown as Row;
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const result = await service.acquire(acquireReq('pr:999', 'session-z'));
+    expect(result.acquired).toBe(false);
+    expect(storedLease().sessionId).toBe('session-b');
+    expect(storedLease().threadKeys).toEqual(['pr:100', 'pr:200']);
+  });
+});
+
+describe('S2: the minimal close invariant (spec v18, Lumen r2)', () => {
+  let tables: Record<string, Row[]>;
+
+  beforeEach(() => {
+    resetActiveRuns();
+    tables = baseTables();
+  });
+
+  afterEach(() => resetActiveRuns());
+
+  const storedLease = () => tables.studios[0].lease as StudioLease | null;
+
+  const liveHolder = () =>
+    registerActiveRun({
+      sessionId: 'session-b',
+      userId: 'user-1',
+      agentId: 'wren',
+      backend: 'claude-code',
+      startedAt: Date.now(),
+    });
+
+  it('closing one multiplexed thread removes only its key — even under a LIVE holder', async () => {
+    tables.studios[0].lease = freshLease({
+      sessionId: 'session-b',
+      threadKey: 'pr:A',
+      threadKeys: ['pr:A', 'pr:B'],
+    }) as unknown as Row;
+    liveHolder();
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const result = await service.releaseByThread('user-1', 'pr:A', { reason: 'thread-closed' });
+    expect(result).toEqual({ released: 0, deferred: 0, removed: 1 });
+    // The lease, the holder, and the worktree all survive for pr:B.
+    expect(storedLease()?.sessionId).toBe('session-b');
+    expect(storedLease()?.threadKeys).toEqual(['pr:B']);
+    expect(storedLease()?.threadKey).toBe('pr:A'); // scalar = telemetry, untouched
+    expect(storedLease()?.pendingRelease).toBeUndefined();
+  });
+
+  it('closing the LAST key with a live holder defers via pendingRelease, never removes to empty', async () => {
+    tables.studios[0].lease = freshLease({
+      sessionId: 'session-b',
+      threadKey: 'pr:A',
+      threadKeys: ['pr:A'],
+    }) as unknown as Row;
+    liveHolder();
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const result = await service.releaseByThread('user-1', 'pr:A', { reason: 'thread-closed' });
+    expect(result).toEqual({ released: 0, deferred: 1, removed: 0 });
+    expect(storedLease()?.threadKeys).toEqual(['pr:A']);
+    expect(storedLease()?.pendingRelease?.reason).toBe('thread-closed');
+  });
+
+  it('closing the LAST surviving key at a real boundary releases the whole lease — even when it is not the scalar', async () => {
+    tables.studios[0].lease = staleLease({
+      sessionId: 'session-b',
+      threadKey: 'pr:A',
+      threadKeys: ['pr:B'],
+    }) as unknown as Row;
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const result = await service.releaseByThread('user-1', 'pr:B', { reason: 'thread-closed' });
+    expect(result).toEqual({ released: 1, deferred: 0, removed: 0 });
+    expect(storedLease()).toBeNull();
+    expect(tables.studio_lease_events.map((e) => e.event)).toContain('released');
+  });
+
+  it('a scalar key already removed from the set no longer matches its lease', async () => {
+    tables.studios[0].lease = staleLease({
+      sessionId: 'session-b',
+      threadKey: 'pr:A',
+      threadKeys: ['pr:B'],
+    }) as unknown as Row;
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const result = await service.releaseByThread('user-1', 'pr:A', { reason: 'thread-closed' });
+    expect(result).toEqual({ released: 0, deferred: 0, removed: 0 });
+    expect(storedLease()?.threadKeys).toEqual(['pr:B']);
+  });
+
+  it("concurrent closes cannot resurrect each other's keys (exact-set CAS guard)", async () => {
+    tables.studios[0].lease = freshLease({
+      sessionId: 'session-b',
+      threadKey: 'pr:A',
+      threadKeys: ['pr:A', 'pr:B'],
+    }) as unknown as Row;
+    liveHolder();
+    const service = new StudioLeaseService(
+      makeFakeSupabase(tables, {
+        beforeUpdate: (table, count) => {
+          if (table === 'studios' && count === 1) {
+            // A concurrent close of pr:B lands between our read and our CAS.
+            const current = tables.studios[0].lease as StudioLease;
+            tables.studios[0].lease = { ...current, threadKeys: ['pr:A'] } as unknown as Row;
+          }
+        },
+      })
+    );
+
+    const result = await service.releaseByThread('user-1', 'pr:A', { reason: 'thread-closed' });
+    // Our stale remove (write ['pr:B']) must LOSE: pr:B was already closed and
+    // must stay closed. The re-read finds pr:A is now the last key, and the
+    // live holder defers it — the honest outcome for that state.
+    expect(storedLease()?.threadKeys).toEqual(['pr:A']);
+    expect(result).toEqual({ released: 0, deferred: 1, removed: 0 });
+    expect(storedLease()?.pendingRelease?.reason).toBe('thread-closed');
+  });
+
+  it('teardown claim is refused while another live key remains', async () => {
+    tables.studios[0].lease = staleLease({
+      sessionId: 'session-b',
+      threadKey: 'pr:A',
+      threadKeys: ['pr:A', 'pr:B'],
+    }) as unknown as Row;
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const claim = await service.claimForTeardown('studio-1', 'user-1', {
+      expectedThreadKey: 'pr:A',
+      reason: 'thread pr:A closed',
+    });
+    expect(claim).toBeNull();
+    expect(storedLease()?.sessionId).toBe('session-b');
+    expect(storedLease()?.threadKeys).toEqual(['pr:A', 'pr:B']);
+  });
+
+  it('teardown claim proceeds once the expected key is the last survivor — even when it is not the scalar', async () => {
+    tables.studios[0].lease = staleLease({
+      sessionId: 'session-b',
+      threadKey: 'pr:A',
+      threadKeys: ['pr:B'],
+    }) as unknown as Row;
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const claim = await service.claimForTeardown('studio-1', 'user-1', {
+      expectedThreadKey: 'pr:B',
+      reason: 'thread pr:B closed',
+    });
+    expect(claim).not.toBeNull();
+    expect(storedLease()?.quarantined).toBe(true);
+    expect(storedLease()?.claimKind).toBe('teardown');
   });
 });

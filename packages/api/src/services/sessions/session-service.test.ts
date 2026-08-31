@@ -6,7 +6,8 @@
  */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { makeFakeSupabase } from './fake-supabase.js';
+import { tmpdir } from 'os';
+import { makeFakeSupabase, type Row } from './fake-supabase.js';
 import { StudioOverflowService } from '../studio-overflow.service.js';
 import { StudioLeaseService } from '../studio-lease.service.js';
 import {
@@ -5083,6 +5084,254 @@ describe('SessionService', () => {
         calls.some((c) => c.method === 'eq' && c.args[0] === 'id' && c.args[1] === 'bridge-studio')
       );
       expect(senderLookup).toBeUndefined();
+    });
+  });
+
+  describe('v18 S2 — same-holder pass-through (sessions conflict, threads multiplex)', () => {
+    /**
+     * The pr:545 incident, both halves:
+     *
+     * ANCHORED replies (recipientSessionId present — thread-history
+     * enrichment) bypass the occupancy gate at tier 3, but withStudioLease's
+     * acquire then met its OWN holder under a different threadKey, hit the
+     * fresh-foreign-refuse rung, and minted an overflow worktree for a
+     * session that was never going to enter it. The same-session append rung
+     * (studio-lease.service resolveOccupied 1.5) kills that.
+     *
+     * UNANCHORED deliveries reach the gate at tiers 5–7; a foreign-thread
+     * conflict whose holder is the thread's HOME session (the durable
+     * participant stamp — origination at send, assignment at dispatch) +
+     * same canonical identity + not terminal now passes through instead of
+     * minting at the gate. (A created candidate can still divert inside
+     * withStudioLease until Stage 3 moves materialization to the spawn
+     * boundary — these tests pin the gate's decision via whether creation
+     * was reached at all.)
+     */
+    function s2Service(mockSupabase: unknown) {
+      return new SessionService(
+        mockRepository,
+        mockContextBuilder,
+        mockClaudeRunner,
+        mockActivityStream,
+        { defaultWorkingDirectory: '/test', mcpConfigPath: '/test/.mcp.json' },
+        mockCodexRunner,
+        mockSupabase as never
+      );
+    }
+
+    type LeaseRow = {
+      sessionId: string;
+      threadKey: string;
+      threadKeys?: string[];
+      agentId: string;
+      sbId?: string | null;
+      acquiredAt: string;
+      heartbeatAt: string;
+    };
+
+    function holderLease(overrides: Partial<LeaseRow> = {}): LeaseRow {
+      const now = new Date().toISOString();
+      return {
+        sessionId: 'holder-session',
+        threadKey: 'pr:other',
+        threadKeys: ['pr:other'],
+        agentId: 'wren',
+        sbId: 'sb-wren',
+        acquiredAt: now,
+        heartbeatAt: now,
+        ...overrides,
+      };
+    }
+
+    function s2Tables(opts: {
+      lease?: LeaseRow;
+      participantSessionId?: string | null;
+    }): Record<string, Row[]> {
+      const now = new Date().toISOString();
+      return {
+        studios: [
+          {
+            id: 'studio-A',
+            user_id: 'user-456',
+            agent_id: 'wren',
+            sb_id: 'sb-wren',
+            status: 'active',
+            route_patterns: ['pr:*'],
+            lease: (opts.lease ?? holderLease()) as unknown as Row,
+            worktree_path: tmpdir(),
+            ephemeral: false,
+            repo_root: '/repos/inkwell',
+          },
+        ],
+        agent_identities: [
+          {
+            id: 'sb-wren',
+            user_id: 'user-456',
+            agent_id: 'wren',
+            workspace_id: 'ws-1',
+            updated_at: now,
+          },
+        ],
+        inbox_threads: [
+          { id: 'thread-1', user_id: 'user-456', thread_key: 'pr:3200', key_type: 'pr' },
+        ],
+        thread_key_types: [
+          {
+            id: 'tkt-pr',
+            user_id: null,
+            type: 'pr',
+            write_intent: 'write',
+            studio_policy: 'provision',
+            description: null,
+            created_at: now,
+            updated_at: now,
+          },
+        ],
+        inbox_thread_participants:
+          opts.participantSessionId === null
+            ? []
+            : [
+                {
+                  thread_id: 'thread-1',
+                  agent_id: 'wren',
+                  session_id: opts.participantSessionId ?? 'holder-session',
+                },
+              ],
+        sessions: [],
+        studio_lease_events: [],
+      };
+    }
+
+    const holderSession = {
+      id: 'holder-session',
+      userId: 'user-456',
+      agentId: 'wren',
+      sbId: 'sb-wren',
+      studioId: 'studio-A',
+      threadKey: 'pr:other',
+      type: 'primary',
+      status: 'active',
+      endedAt: null,
+    };
+
+    it('an anchored reply to the holder session APPENDS the key — no overflow mint (the incident)', async () => {
+      const tables = s2Tables({});
+      mockRepository.findById.mockResolvedValue(holderSession);
+      const overflowSpy = vi.spyOn(StudioOverflowService.prototype, 'ensureOverflowStudio');
+      const service = s2Service(makeFakeSupabase(tables));
+
+      const session = await service.getOrCreateSession('user-456', 'wren', {
+        threadKey: 'pr:3200',
+        recipientSessionId: 'holder-session',
+      });
+
+      expect(session.id).toBe('holder-session');
+      expect(overflowSpy).not.toHaveBeenCalled();
+      expect(mockRepository.create).not.toHaveBeenCalled();
+      const lease = tables.studios[0].lease as LeaseRow;
+      expect(lease.sessionId).toBe('holder-session');
+      expect(lease.threadKeys).toEqual(['pr:other', 'pr:3200']);
+      expect(lease.threadKey).toBe('pr:other'); // scalar = first-acquisition telemetry
+      overflowSpy.mockRestore();
+    });
+
+    it('an unanchored delivery whose holder is the thread HOME passes the gate — routing keeps the studio', async () => {
+      const tables = s2Tables({ participantSessionId: 'holder-session' });
+      mockRepository.findById.mockResolvedValue(holderSession);
+      const overflowSpy = vi
+        .spyOn(StudioOverflowService.prototype, 'ensureOverflowStudio')
+        .mockResolvedValue(null);
+      const service = s2Service(makeFakeSupabase(tables));
+
+      // No anchor and no thread-scoped session yet: the rungs miss and a
+      // candidate is CREATED — bound to studio-A, because the gate passed
+      // through instead of diverting. (The candidate's own acquire then
+      // verifies the conflict and, with overflow unavailable, holds — the
+      // Stage 3 residual. Pre-S2 the gate refused BEFORE creation, so
+      // "creation reached, with the home studio" is the gate's fingerprint.)
+      await expect(
+        service.getOrCreateSession('user-456', 'wren', { threadKey: 'pr:3200' })
+      ).rejects.toMatchObject({ code: 'ROUTING_REFUSED', detail: { reason: 'occupied' } });
+
+      expect(mockRepository.create).toHaveBeenCalledTimes(1);
+      expect(mockRepository.create.mock.calls[0][0]).toMatchObject({ studioId: 'studio-A' });
+      overflowSpy.mockRestore();
+    });
+
+    it('a key already in the multiplex set passes the gate as same-thread — whoever holds it', async () => {
+      // Gate-level set membership (not the pass-through branch): the holder
+      // is a FOREIGN identity, so only the live set can let this through.
+      const tables = s2Tables({
+        lease: holderLease({
+          sessionId: 'foreign-session',
+          sbId: 'sb-else',
+          agentId: 'else',
+          threadKeys: ['pr:other', 'pr:3200'],
+        }),
+        participantSessionId: null,
+      });
+      const overflowSpy = vi
+        .spyOn(StudioOverflowService.prototype, 'ensureOverflowStudio')
+        .mockResolvedValue(null);
+      const service = s2Service(makeFakeSupabase(tables));
+
+      await expect(
+        service.getOrCreateSession('user-456', 'wren', { threadKey: 'pr:3200' })
+      ).rejects.toMatchObject({ code: 'ROUTING_REFUSED' });
+
+      // Creation was reached — the gate treated the member key as same-thread
+      // and kept the studio; the acquire ladder then arbitrated the sessions.
+      expect(mockRepository.create).toHaveBeenCalledTimes(1);
+      expect(mockRepository.create.mock.calls[0][0]).toMatchObject({ studioId: 'studio-A' });
+      overflowSpy.mockRestore();
+    });
+
+    it('every uncertain or failed home proof diverts — never the occupied worktree', async () => {
+      const cases: Array<{
+        name: string;
+        lease?: LeaseRow;
+        participantSessionId?: string | null;
+        holderRow?: typeof holderSession | null;
+      }> = [
+        { name: 'no participant stamp', participantSessionId: null },
+        { name: 'stamp names another session', participantSessionId: 'other-session' },
+        { name: 'lease identity is an imposter', lease: holderLease({ sbId: 'sb-imposter' }) },
+        { name: 'legacy lease carries no identity', lease: holderLease({ sbId: null }) },
+        {
+          name: 'holder session is terminal',
+          holderRow: { ...holderSession, endedAt: new Date().toISOString() },
+        },
+        { name: 'holder session row is missing', holderRow: null },
+      ];
+
+      for (const c of cases) {
+        vi.clearAllMocks();
+        const tables = s2Tables({
+          lease: c.lease,
+          participantSessionId:
+            c.participantSessionId === undefined ? 'holder-session' : c.participantSessionId,
+        });
+        mockRepository.findById.mockResolvedValue(
+          c.holderRow === undefined ? holderSession : c.holderRow
+        );
+        const overflowSpy = vi
+          .spyOn(StudioOverflowService.prototype, 'ensureOverflowStudio')
+          .mockResolvedValue(null);
+        const service = s2Service(makeFakeSupabase(tables));
+
+        await expect(
+          service.getOrCreateSession('user-456', 'wren', { threadKey: 'pr:3200' }),
+          c.name
+        ).rejects.toMatchObject({ code: 'ROUTING_REFUSED', detail: { reason: 'occupied' } });
+
+        // Refused AT THE GATE: no session row was ever created, and the
+        // holder's lease is untouched.
+        expect(mockRepository.create, c.name).not.toHaveBeenCalled();
+        expect(overflowSpy, c.name).toHaveBeenCalled();
+        const lease = tables.studios[0].lease as LeaseRow;
+        expect(lease.threadKeys, c.name).toEqual((c.lease ?? holderLease()).threadKeys);
+        overflowSpy.mockRestore();
+      }
     });
   });
 });

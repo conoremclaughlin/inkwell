@@ -62,6 +62,7 @@ import {
   captureWorktreeState,
   rescueSucceeded,
   parseStudioLease,
+  leaseThreadKeys,
   EPHEMERAL_STUDIO_TTL_MS,
   type StudioLease,
   type WorktreeFinalState,
@@ -799,6 +800,24 @@ export class StudioOverflowService {
       .catch(() => [] as Studio[]);
     let closed = 0;
     for (const studio of studios) {
+      // The minimal close invariant (v18 S2): `studios.thread_key` selected
+      // this candidate, but a lease still multiplexing OTHER live threads
+      // means the studio is still serving them — skip before the claim, so
+      // the claim-refusal path's expires_at pull (a "retry teardown soon"
+      // signal) never fires against a studio that must keep living.
+      // claimForTeardown re-checks the same condition atomically.
+      const lease = parseStudioLease(studio.lease);
+      if (lease && !lease.quarantined) {
+        const others = leaseThreadKeys(lease).filter((k) => k !== threadKey);
+        if (others.length > 0) {
+          logger.info('[StudioOverflow] Teardown skipped — other threads still multiplex lease', {
+            studioId: studio.id,
+            threadKey,
+            remainingThreadKeys: others,
+          });
+          continue;
+        }
+      }
       await this.teardownEphemeralStudio(studio, {
         reason: opts.reason,
         expectedThreadKey: threadKey,
