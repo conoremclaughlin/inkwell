@@ -53,7 +53,8 @@
 import { execFile } from 'child_process';
 import { randomUUID } from 'crypto';
 import { promisify } from 'util';
-import { access } from 'fs/promises';
+import { access, realpath } from 'fs/promises';
+import { sep } from 'path';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { Database, Json } from '../data/supabase/types';
 import { hasActiveRun } from './sessions/active-runs';
@@ -255,6 +256,14 @@ export async function captureWorktreeState(
 }
 
 export class StudioLeaseService {
+  /**
+   * Last-warned multi-hold set per session (S1, spec v18): the multi-hold
+   * warning is advisory telemetry, so it fires once per (session, holder-set)
+   * change instead of on every poll — re-arming when the set shrinks back to
+   * one so a later recurrence logs again.
+   */
+  private lastWarnedHolderSets = new Map<string, string>();
+
   constructor(private supabase: SupabaseClient<Database>) {}
 
   async getLease(
@@ -633,6 +642,11 @@ export class StudioLeaseService {
     const { data } = await query.select('id');
     if (!data?.length) return;
 
+    // Same contract as every other successful release/cleaning exit (S1,
+    // Lumen r1 on PR #550): a retired ephemeral must not stay any session's
+    // thread-continuity address.
+    await this.repointSessionsOffEphemeral(req.studioId, req.userId);
+
     logger.warn('[StudioLease] Retired studio with absent worktree', {
       studioId: req.studioId,
       worktreePath,
@@ -732,7 +746,62 @@ export class StudioLeaseService {
       logger.warn('[StudioLease] finalizeTeardown failed', { studioId, error: error.message });
       return false;
     }
-    return Boolean(data?.length);
+    const finalized = Boolean(data?.length);
+    if (finalized) await this.repointSessionsOffEphemeral(studioId, userId);
+    return finalized;
+  }
+
+  /**
+   * S1 (spec v18): a released or torn-down ephemeral must not remain any
+   * session's address — thread-continuity keeps resolving `sessions.studio_id`
+   * long after the studio stopped serving anyone (the pr:545 orphan was still
+   * its holder's recorded studio five days after the PR merged). Repoint
+   * sessions to the ephemeral's first durable (non-ephemeral, non-cleaned)
+   * ancestor, or NULL when none survives. The `.eq('studio_id', …)` guard is
+   * the CAS: only sessions still pointing at the ephemeral move. Hygiene, not
+   * safety — failures warn and never block the release that already happened.
+   */
+  private async repointSessionsOffEphemeral(studioId: string, userId: string): Promise<void> {
+    try {
+      const { data: studio } = await this.supabase
+        .from('studios')
+        .select('id, ephemeral, parent_studio_id')
+        .eq('id', studioId)
+        .eq('user_id', userId)
+        .maybeSingle();
+      if (studio?.ephemeral !== true) return;
+
+      let ancestorId: string | null = null;
+      const seen = new Set<string>([studioId]);
+      let parentId = (studio.parent_studio_id as string | null) ?? null;
+      while (parentId && !seen.has(parentId)) {
+        seen.add(parentId);
+        const { data: parent } = await this.supabase
+          .from('studios')
+          .select('id, ephemeral, parent_studio_id, status')
+          .eq('id', parentId)
+          .eq('user_id', userId)
+          .maybeSingle();
+        if (!parent) break;
+        if (parent.ephemeral !== true && parent.status !== 'cleaned') {
+          ancestorId = parent.id;
+          break;
+        }
+        parentId = (parent.parent_studio_id as string | null) ?? null;
+      }
+
+      const { error } = await this.supabase
+        .from('sessions')
+        .update({ studio_id: ancestorId })
+        .eq('user_id', userId)
+        .eq('studio_id', studioId);
+      if (error) throw new Error(error.message);
+    } catch (err) {
+      logger.warn('[StudioLease] Failed to repoint sessions off released ephemeral', {
+        studioId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 
   /**
@@ -1046,11 +1115,18 @@ export class StudioLeaseService {
     sessionId: string,
     userId?: string
   ): Promise<
-    Array<{ id: string; user_id: string; lease: StudioLease; worktree_path: string | null }>
+    Array<{
+      id: string;
+      user_id: string;
+      lease: StudioLease;
+      worktree_path: string | null;
+      ephemeral: boolean;
+      expires_at: string | null;
+    }>
   > {
     let query = this.supabase
       .from('studios')
-      .select('id, user_id, lease, worktree_path')
+      .select('id, user_id, lease, worktree_path, ephemeral, expires_at')
       .eq('lease->>sessionId', sessionId);
     if (userId) query = query.eq('user_id', userId);
     const { data } = await query;
@@ -1065,15 +1141,77 @@ export class StudioLeaseService {
         user_id: row.user_id,
         lease,
         worktree_path: row.worktree_path ?? null,
+        ephemeral: row.ephemeral === true,
+        expires_at: (row.expires_at as string | null) ?? null,
       });
     }
     if (held.length > 1) {
-      logger.warn('[StudioLease] Session holds multiple studios — acting on all of them', {
-        sessionId,
-        studioIds: held.map((h) => h.id),
-      });
+      // Advisory telemetry: once per holder-set change, not per poll — an
+      // attached terminal calls this every ~10s and the unchanged multi-hold
+      // was producing ~8.6k identical lines/day (spec v18 S1).
+      const setKey = held
+        .map((h) => h.id)
+        .sort()
+        .join(',');
+      if (this.lastWarnedHolderSets.get(sessionId) !== setKey) {
+        this.lastWarnedHolderSets.set(sessionId, setKey);
+        logger.warn('[StudioLease] Session holds multiple studios — acting on all of them', {
+          sessionId,
+          studioIds: held.map((h) => h.id),
+        });
+      }
+    } else {
+      this.lastWarnedHolderSets.delete(sessionId);
     }
     return held;
+  }
+
+  /**
+   * S1 (spec v18): is this an EXPIRED ephemeral whose holder session is
+   * positively verified to be operating from a different worktree? Only such
+   * a lease may be denied renewal — the poll heartbeat of a terminal that is
+   * not even inside the tree must not manufacture freshness for a studio the
+   * TTL already ended (the pr:545 orphan renewed for five days this way).
+   *
+   * Every uncertain read preserves the lease (fail closed): a durable studio,
+   * an unexpired TTL, a claim/quarantine record, an open turn or in-process
+   * run, a missing session row or working_dir, a canonicalization failure,
+   * and a working_dir inside the studio's tree all report false. This
+   * predicate never authorizes destruction — it only stops synthetic
+   * renewals and lets the sweep stamp pendingRelease, which completes at the
+   * holder's real boundary exactly as v17 requires.
+   */
+  private async isEphemeralHeldElsewhere(
+    row: {
+      ephemeral: boolean;
+      expires_at: string | null;
+      worktree_path: string | null;
+    },
+    lease: StudioLease,
+    userId?: string
+  ): Promise<boolean> {
+    if (!row.ephemeral || !row.worktree_path) return false;
+    if (lease.quarantined || lease.claimKind) return false;
+    const expiresAt = Date.parse(row.expires_at ?? '');
+    if (Number.isNaN(expiresAt) || expiresAt > Date.now()) return false;
+    if (await this.isSessionMidTurn(lease.sessionId, userId)) return false;
+
+    let query = this.supabase.from('sessions').select('working_dir').eq('id', lease.sessionId);
+    if (userId) query = query.eq('user_id', userId);
+    const { data, error } = await query.maybeSingle();
+    if (error || !data?.working_dir) return false;
+
+    let holderDir: string;
+    let studioDir: string;
+    try {
+      [holderDir, studioDir] = await Promise.all([
+        realpath(data.working_dir),
+        realpath(row.worktree_path),
+      ]);
+    } catch {
+      return false;
+    }
+    return holderDir !== studioDir && !holderDir.startsWith(studioDir + sep);
   }
 
   /**
@@ -1085,6 +1223,18 @@ export class StudioLeaseService {
   async renewBySession(sessionId: string, userId?: string): Promise<boolean> {
     let any = false;
     for (const row of await this.studiosHeldBy(sessionId, userId)) {
+      // S1 (spec v18): a verified-elsewhere holder must not keep an expired
+      // ephemeral fresh — this is the first of the two renewal paths, and
+      // the sweep's on-behalf renewal funnels through here too, so one gate
+      // covers both. Uncertainty renews as before.
+      if (await this.isEphemeralHeldElsewhere(row, row.lease, userId ?? row.user_id)) {
+        logger.debug('[StudioLease] Skipping renewal — expired ephemeral held from elsewhere', {
+          studioId: row.id,
+          sessionId,
+          threadKey: row.lease.threadKey,
+        });
+        continue;
+      }
       const renewed: StudioLease = { ...row.lease, heartbeatAt: new Date().toISOString() };
       if (await this.casLease(row.id, row.user_id, row.lease, renewed)) any = true;
     }
@@ -1305,6 +1455,8 @@ export class StudioLeaseService {
     const cleared = await this.casLease(studioId, userId, lease, null);
     if (!cleared) return false;
 
+    await this.repointSessionsOffEphemeral(studioId, userId);
+
     const finalState = worktreePath ? await captureWorktreeState(worktreePath) : undefined;
 
     const heldMs = Date.now() - Date.parse(lease.acquiredAt);
@@ -1390,7 +1542,7 @@ export class StudioLeaseService {
   }> {
     const { data, error } = await this.supabase
       .from('studios')
-      .select('id, user_id, lease, worktree_path')
+      .select('id, user_id, lease, worktree_path, ephemeral, expires_at')
       .not('lease', 'is', null);
     if (error || !data?.length) return { expired: 0, renewed: 0, quarantined: 0, released: 0 };
 
@@ -1433,6 +1585,27 @@ export class StudioLeaseService {
       if (!isLeaseStale(lease)) continue;
 
       if (!lease.quarantined && (await this.isSessionLive(lease.sessionId, row.user_id))) {
+        // S1 (spec v18): the second renewal path. A live holder verifiably
+        // operating elsewhere must not get an expired ephemeral renewed on
+        // its behalf — stamp pendingRelease instead. Protection, never
+        // authorization: completion still happens only at the holder's real
+        // boundary (releaseAtBoundary honors the marker at the next stop
+        // event) or once presence is genuinely lost (canReleaseNow).
+        if (
+          !lease.pendingRelease &&
+          (await this.isEphemeralHeldElsewhere(
+            {
+              ephemeral: row.ephemeral === true,
+              expires_at: row.expires_at ?? null,
+              worktree_path: row.worktree_path,
+            },
+            lease,
+            row.user_id
+          ))
+        ) {
+          await this.markPendingRelease(row.id, row.user_id, lease, 'expired-elsewhere-held');
+          continue;
+        }
         const ok = await this.renewBySession(lease.sessionId, row.user_id);
         if (ok) renewed += 1;
         continue;
@@ -1505,7 +1678,14 @@ export class StudioLeaseService {
         continue;
       }
 
-      await this.casLease(row.id, row.user_id, claim, null);
+      // The clear must actually WIN before anything is reported (Lumen r1 on
+      // PR #550): a claim replaced underneath — another worker's fresh claim,
+      // a concurrent acquisition — means this expiry did not happen. Falling
+      // through would repoint sessions, emit an 'expired' event, and count a
+      // release that never cleared.
+      const cleared = await this.casLease(row.id, row.user_id, claim, null);
+      if (!cleared) continue;
+      await this.repointSessionsOffEphemeral(row.id, row.user_id);
 
       const heldMs = Date.now() - Date.parse(lease.acquiredAt);
       logger.warn('[StudioLease] Lease expired and was released', {
