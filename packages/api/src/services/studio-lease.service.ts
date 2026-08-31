@@ -1452,7 +1452,7 @@ export class StudioLeaseService {
     userId: string,
     threadKey: string,
     opts: { reason?: string } = {}
-  ): Promise<{ released: number; deferred: number; removed: number }> {
+  ): Promise<{ released: number; deferred: number; removed: number; studioIds: string[] }> {
     // Membership is against the LIVE SET, not the scalar (v18 S2): a
     // multiplexed key never appears in `lease->>threadKey`, and a scalar
     // whose key was already removed from the set must not match again.
@@ -1462,7 +1462,7 @@ export class StudioLeaseService {
       .select('id, user_id, lease, worktree_path')
       .eq('user_id', userId)
       .not('lease', 'is', null);
-    if (!data?.length) return { released: 0, deferred: 0, removed: 0 };
+    if (!data?.length) return { released: 0, deferred: 0, removed: 0, studioIds: [] };
 
     let released = 0;
     let deferred = 0;
