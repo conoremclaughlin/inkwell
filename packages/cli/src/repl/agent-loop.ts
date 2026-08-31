@@ -363,22 +363,37 @@ export async function runAgentLoop(
       if (reason === 'iteration-cap') {
         relayResults = results;
         ports.ui.printLine(`(tool loop limit reached — ${maxIterations} iterations)`);
-      } else if (reason === 'all-refused' && hasUnseenFailure(results)) {
+      } else if (hasUnseenFailure(results)) {
         // A call that THREW is not a refusal, and nobody watched it happen.
         //
-        // `all-refused` covers two different events. A denial or a policy block
-        // was witnessed — the human clicked no, or set the rule — so ending the
-        // turn silently is correct and re-prompting would just nag them. An
-        // `error` was witnessed by nobody: the tool raised, the loop stopped
-        // before buildContinuationBody, and the message died in allToolResults.
+        // Deliberately keyed on the RESULTS, not on which stop reason produced
+        // them. Two reasons reach here today and both used to swallow:
         //
-        // Which one you get depends on turn COMPOSITION, not on the call. The
-        // same create_reminder with the same invalid `runAt` reported a precise
-        // -32602 naming the field when it shared a turn with a success, and
-        // returned nothing at all when it was alone — because one success makes
-        // `hasExecutedTools` true and keeps the loop alive to relay. Myra hit
-        // this three times while deliberately isolating variables one call per
-        // turn, which is exactly the discipline that hides it (2026-08-31).
+        //   all-refused    — a lone failing call. A denial or block was
+        //                    witnessed (the human clicked no, or wrote the
+        //                    rule), so ending quietly is right; an `error` was
+        //                    witnessed by nobody. Which one you got depended on
+        //                    turn COMPOSITION, not on the call: the same
+        //                    create_reminder with the same invalid `runAt`
+        //                    reported a precise -32602 alongside a success and
+        //                    returned nothing at all when alone.
+        //
+        //   terminal-signal — the heartbeat shape, and the one that matters
+        //                    most. `send_response: error` +
+        //                    `signal_status(completed): executed` stopped as
+        //                    terminal, relayed nothing, and the agent exited
+        //                    believing it had delivered. That is the Aug 13
+        //                    Telegram audio drop this relay was built for,
+        //                    arriving through the one branch it never covered
+        //                    (Lumen, PR #552).
+        //
+        // Keying on the results rather than the reason also means a stop reason
+        // added later cannot quietly reintroduce this — the same default-to-loud
+        // argument as hasUnseenFailure itself, one level up.
+        //
+        // Terminal semantics are preserved: this only populates the FINAL relay,
+        // whose output is not extracted, so nothing re-executes and no signal is
+        // multiplied.
         relayResults = results;
       }
       break;

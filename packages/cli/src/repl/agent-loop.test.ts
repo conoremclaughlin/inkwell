@@ -757,6 +757,66 @@ describe('hasUnseenFailure', () => {
   });
 });
 
+/**
+ * The heartbeat shape (Lumen, PR #552 review).
+ *
+ * `send_response: error` + `signal_status(completed): executed` in one
+ * iteration stopped as `terminal-signal` — which is checked BEFORE anything
+ * else and never populated relayResults. The agent exited believing it had
+ * delivered. That is the Aug 13 Telegram audio drop the final relay exists to
+ * prevent, arriving through the one branch the relay never covered.
+ *
+ * It is also the most common turn shape in this fleet: work, send_response,
+ * remember, signal_status(completed).
+ */
+describe('runAgentLoop — a terminal signal alongside a failure', () => {
+  it('relays the delivery failure instead of exiting as if it had sent', async () => {
+    const harness = makePorts(
+      [
+        outcome({ responseText: `${inkTool('send_response')}\n${inkTool('signal_status')}` }),
+        outcome({ responseText: 'the Telegram send failed; I have not delivered it' }),
+      ],
+      () => [
+        { tool: 'send_response', result: 'upstream 502 from telegram', status: 'error' },
+        { tool: 'signal_status', result: signalResult('completed'), status: 'executed' },
+      ]
+    );
+
+    const result = await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+
+    // Terminal semantics preserved — this is still a completed turn.
+    expect(result.stopReason).toBe('terminal-signal');
+    // But the failure reached the model.
+    expect(harness.prompts).toHaveLength(2);
+    expect(harness.prompts[1].body).toContain('upstream 502');
+    expect(harness.prompts[1].body).toContain('FINAL');
+    expect(result.assistantDisplayText).toContain('not delivered');
+    // And nothing re-executed: the relay's output is not extracted, so the
+    // signal cannot be multiplied. One iteration of tools, exactly.
+    expect(harness.executed).toHaveLength(1);
+  });
+
+  it('still exits silently when the terminal iteration is clean', async () => {
+    // The 4x-signal_status multiplication guard, unchanged: a completed turn
+    // with nothing wrong must not earn an extra backend round-trip.
+    const harness = makePorts(
+      [
+        outcome({ responseText: inkTool('signal_status') }),
+        outcome({ responseText: 'unreachable' }),
+      ],
+      () => [
+        { tool: 'send_response', result: 'sent', status: 'executed' },
+        { tool: 'signal_status', result: signalResult('completed'), status: 'executed' },
+      ]
+    );
+
+    const result = await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+
+    expect(result.stopReason).toBe('terminal-signal');
+    expect(harness.prompts).toHaveLength(1);
+  });
+});
+
 describe('an unrecognized failure status reaches the model', () => {
   // The same default, driven through the whole loop rather than the predicate:
   // a status invented outside this file must still reach the continuation body.
