@@ -363,6 +363,38 @@ export async function runAgentLoop(
       if (reason === 'iteration-cap') {
         relayResults = results;
         ports.ui.printLine(`(tool loop limit reached — ${maxIterations} iterations)`);
+      } else if (hasUnseenFailure(results)) {
+        // A call that THREW is not a refusal, and nobody watched it happen.
+        //
+        // Deliberately keyed on the RESULTS, not on which stop reason produced
+        // them. Two reasons reach here today and both used to swallow:
+        //
+        //   all-refused    — a lone failing call. A denial or block was
+        //                    witnessed (the human clicked no, or wrote the
+        //                    rule), so ending quietly is right; an `error` was
+        //                    witnessed by nobody. Which one you got depended on
+        //                    turn COMPOSITION, not on the call: the same
+        //                    create_reminder with the same invalid `runAt`
+        //                    reported a precise -32602 alongside a success and
+        //                    returned nothing at all when alone.
+        //
+        //   terminal-signal — the heartbeat shape, and the one that matters
+        //                    most. `send_response: error` +
+        //                    `signal_status(completed): executed` stopped as
+        //                    terminal, relayed nothing, and the agent exited
+        //                    believing it had delivered. That is the Aug 13
+        //                    Telegram audio drop this relay was built for,
+        //                    arriving through the one branch it never covered
+        //                    (Lumen, PR #552).
+        //
+        // Keying on the results rather than the reason also means a stop reason
+        // added later cannot quietly reintroduce this — the same default-to-loud
+        // argument as hasUnseenFailure itself, one level up.
+        //
+        // Terminal semantics are preserved: this only populates the FINAL relay,
+        // whose output is not extracted, so nothing re-executes and no signal is
+        // multiplied.
+        relayResults = results;
       }
       break;
     }
@@ -401,16 +433,20 @@ export async function runAgentLoop(
   // that errored there reads to the agent as delivered, and it exits
   // confidently wrong (the Aug 13 Telegram audio drop). One last round-trip
   // shows them; its output is FINAL — ink-tool blocks in it are not executed
-  // (extraction stops with the loop). Only the cap: a terminal signal means
-  // the agent already knows what it signaled (re-invoking recreates the
-  // multiplied-signal bug), and a refusal ends the turn by design — in the
-  // REPL the human watched it happen, and clones retry via continueOnBlocked.
-  if (
-    stopReason === 'iteration-cap' &&
-    relayResults.length > 0 &&
-    outcome.success &&
-    !input.signal?.aborted
-  ) {
+  // (extraction stops with the loop). A terminal signal is still excluded: the
+  // agent already knows what it signaled, and re-invoking recreates the
+  // multiplied-signal bug.
+  //
+  // The cap is no longer the only way results get stranded. `all-refused`
+  // reached here too whenever the ONLY call in a turn threw, and the original
+  // exclusion rested on an assumption that is false for most of this fleet —
+  // "in the REPL the human watched it happen". Myra is neither a human at a
+  // scrollback nor a clone with continueOnBlocked; a validation error simply
+  // vanished, three times, and read as the tool doing nothing. `relayResults`
+  // is only populated for that case when the iteration actually contains an
+  // `error` (see hasUnseenFailure), so a witnessed denial still ends the turn
+  // quietly and nobody gets nagged for saying no.
+  if (relayResults.length > 0 && outcome.success && !input.signal?.aborted) {
     ports.ui.printEvent('  ⋯ relaying final tool results (no further execution)…');
     const stopRelayWaiting = ports.ui.startWaiting();
     let relay: BackendTurnOutcome;
@@ -678,6 +714,52 @@ export function isTerminalSignalToolResult(result: unknown): boolean {
  *
  * Returns the reason to stop, or null to continue.
  */
+/** An outcome where the call actually ran. Nothing to report as unseen. */
+const RAN_STATUSES: ReadonlySet<string> = new Set(['executed', 'approved']);
+
+/**
+ * Outcomes somebody AUTHORED and watched happen.
+ *
+ * `denied` is a human clicking no. `blocked` is a policy rule someone wrote.
+ * `rejected` is an iteration the screen refused, and the loop already feeds
+ * that reason back on its own path. Relaying these would re-prompt a person
+ * about a decision they just made.
+ */
+const WITNESSED_REFUSAL_STATUSES: ReadonlySet<string> = new Set(['blocked', 'denied', 'rejected']);
+
+/**
+ * True when an iteration contains a failure the agent has not been told about.
+ *
+ * A DENYLIST of authored refusals, not an allowlist of known failures, and the
+ * direction matters more than the contents (Myra, 2026-08-31):
+ *
+ *   an allowlist of failure kinds can only ever be wrong toward SILENCE.
+ *
+ * Listing `error` and relaying only that would repair this bug while leaving
+ * its shape in place: invent `'timeout'` in a transport layer next year and it
+ * inherits the exact defect, discovered — as this one was — by accident, late,
+ * possibly with a consequence attached. Inverting it can only be wrong toward
+ * NOISE: a genuinely new refusal kind relays until someone adds it below, which
+ * is a line of code and a mild annoyance, and it reports itself immediately.
+ *
+ * The asymmetry is not incidental to this codebase; it is the whole subject of
+ * the defect group this fix came from.
+ *
+ * Enumerating refusals is safe in a way enumerating failures is not, because
+ * refusals are *authored*: whoever adds a new one is, by construction, in a
+ * position to know they are adding a refusal and to put it here. Failures are
+ * emergent — a new exception path, a validation layer added in a file that has
+ * nothing to do with this loop — and nobody writing those has read this
+ * predicate. What makes a refusal swallowable is its provenance, not its name.
+ */
+export function hasUnseenFailure(
+  iterationResults: ReadonlyArray<Pick<ToolResultRecord, 'status'>>
+): boolean {
+  return iterationResults.some(
+    (r) => !RAN_STATUSES.has(r.status) && !WITNESSED_REFUSAL_STATUSES.has(r.status)
+  );
+}
+
 export function toolLoopStopReason(
   iterationResults: ReadonlyArray<Pick<ToolResultRecord, 'tool' | 'status' | 'result'>>,
   iteration: number,
