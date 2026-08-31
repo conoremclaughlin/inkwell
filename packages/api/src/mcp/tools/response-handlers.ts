@@ -6,6 +6,7 @@
  */
 
 import { z } from 'zod';
+import { isoDateTime } from './schema-primitives.js';
 import type { DataComposer } from '../../data/composer';
 import type { ChannelType, AgentResponse, ResponseFormat, OutboundMedia } from '../../agent/types';
 import { logger } from '../../utils/logger';
@@ -316,7 +317,7 @@ export const getPendingMessagesSchema = z.object({
     .default('all')
     .describe('Filter by channel (default: all)'),
   limit: z.number().min(1).max(50).optional().default(10).describe('Maximum messages to return'),
-  since: z.string().datetime().optional().describe('Only messages after this timestamp'),
+  since: isoDateTime().optional().describe('Only messages after this timestamp'),
 });
 
 // In-memory message queue for cross-channel visibility

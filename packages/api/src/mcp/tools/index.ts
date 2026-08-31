@@ -1,5 +1,6 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
+import { isoDateTime } from './schema-primitives.js';
 import type { DataComposer } from '../../data/composer';
 import { logger } from '../../utils/logger';
 import { strictifyInputSchema, strictToolArgsEnabled } from './strict-input-schema';
@@ -553,8 +554,8 @@ User can be identified by ONE of:
         ...userIdentifierFields,
         query: z.string().optional().describe('Search query'),
         tags: z.array(z.string()).optional().describe('Filter by tags'),
-        startDate: z.string().datetime().optional().describe('Start date filter'),
-        endDate: z.string().datetime().optional().describe('End date filter'),
+        startDate: isoDateTime().optional().describe('Start date filter'),
+        endDate: isoDateTime().optional().describe('End date filter'),
         limit: z.number().min(1).max(100).default(20).describe('Maximum results to return'),
       },
     },
@@ -1843,7 +1844,7 @@ Optionally set \`ttsVoice\` to choose a voice. Available voices: serena (default
           .optional()
           .default(10)
           .describe('Maximum messages to return'),
-        since: z.string().datetime().optional().describe('Only messages after this timestamp'),
+        since: isoDateTime().optional().describe('Only messages after this timestamp'),
       },
     },
     async (args) => {

@@ -6,7 +6,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { resolveTriggeredAgents } from './thread-handlers';
+import { resolveTriggeredAgents, resolveEffectiveFloor, isLaterInstant } from './thread-handlers';
 
 describe('resolveTriggeredAgents', () => {
   describe('1:1 threads (2 participants)', () => {
@@ -1154,5 +1154,81 @@ describe('handleCloseThread — lease/teardown wiring (v18 S2)', () => {
       releaseSpy.mockRestore();
       teardownSpy.mockRestore();
     }
+  });
+});
+
+/**
+ * Lumen's blocker on PR #554.
+ *
+ * Widening the schemas to accept offsets exposed a floor comparison that was
+ * lexicographic on timestamp strings. It had always been correct in practice
+ * because every timestamp reaching it was UTC, so text order matched time
+ * order — an accident of spelling, not a property of the code.
+ *
+ * My "widening only" claim was true of the validator and false of the system:
+ * I checked Zod against Zod and never asked what the consumers assumed.
+ */
+describe('read floors compare instants, not spellings', () => {
+  const readFloor = '2026-09-01T12:00:00Z';
+
+  it('does not lower the floor for an offset time that only LOOKS later', () => {
+    // 23:00+14:00 is 09:00Z — three hours BEFORE the floor — but sorts after
+    // it as text. Taking it would replay messages the caller already read.
+    const floor = resolveEffectiveFloor({
+      readStateFloor: readFloor,
+      afterTs: null,
+      newerThan: '2026-09-01T23:00:00+14:00',
+    });
+
+    expect(floor).toBe(readFloor);
+  });
+
+  it('does raise the floor for an offset time that genuinely is later', () => {
+    // 08:00-05:00 is 13:00Z, an hour after the floor.
+    const later = '2026-09-01T08:00:00-05:00';
+    const floor = resolveEffectiveFloor({
+      readStateFloor: readFloor,
+      afterTs: null,
+      newerThan: later,
+    });
+
+    expect(floor).toBe(later);
+  });
+
+  it('picks the latest instant across all three sources', () => {
+    expect(
+      resolveEffectiveFloor({
+        readStateFloor: '2026-09-01T12:00:00Z',
+        afterTs: '2026-09-01T09:00:00-04:00', // 13:00Z — the winner
+        newerThan: '2026-09-01T23:00:00+14:00', // 09:00Z
+      })
+    ).toBe('2026-09-01T09:00:00-04:00');
+  });
+
+  it('keeps the existing floor when a value cannot be parsed', () => {
+    // Too high under-delivers and is visible; too low silently replays.
+    expect(
+      resolveEffectiveFloor({
+        readStateFloor: readFloor,
+        afterTs: null,
+        newerThan: 'not a timestamp',
+      })
+    ).toBe(readFloor);
+  });
+
+  it('accepts the Postgres +00:00 spelling as equal to Z', () => {
+    // Both forms reach these floors today: toISOString() gives Z, Supabase
+    // gives +00:00. Neither should displace the other.
+    expect(isLaterInstant('2026-09-01T12:00:00+00:00', '2026-09-01T12:00:00Z')).toBe(false);
+    expect(isLaterInstant('2026-09-01T12:00:00Z', '2026-09-01T12:00:00+00:00')).toBe(false);
+  });
+
+  it('takes any real value over a missing floor', () => {
+    expect(
+      resolveEffectiveFloor({ readStateFloor: null, afterTs: null, newerThan: readFloor })
+    ).toBe(readFloor);
+    expect(resolveEffectiveFloor({ readStateFloor: null, afterTs: null, newerThan: null })).toBe(
+      null
+    );
   });
 });

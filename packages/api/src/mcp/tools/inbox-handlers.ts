@@ -6,6 +6,7 @@
  */
 
 import { z } from 'zod';
+import { isoDateTime } from './schema-primitives.js';
 import type { DataComposer } from '../../data/composer';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
 import { resolveIdentityId, resolveAgentSlug } from '../../auth/resolve-identity';
@@ -105,7 +106,7 @@ const sendToInboxSchema = userIdentifierBaseSchema.extend({
     ),
   relatedArtifactUri: z.string().optional().describe('Related artifact URI'),
   metadata: z.record(z.unknown()).optional().describe('Additional metadata'),
-  expiresAt: z.string().datetime().optional().describe('When this message expires'),
+  expiresAt: isoDateTime().optional().describe('When this message expires'),
   threadKey: z
     .string()
     .optional()
@@ -206,9 +207,7 @@ const getInboxSchema = userIdentifierBaseSchema
       .enum(['message', 'task_request', 'session_resume', 'notification', 'permission_grant'])
       .optional(),
     limit: z.number().min(1).max(200).optional().default(20).describe('Max messages'),
-    since: z
-      .string()
-      .datetime()
+    since: isoDateTime()
       .optional()
       .describe('Only return messages created after this ISO timestamp'),
     threadKey: z
@@ -257,9 +256,7 @@ const updateInboxMessageSchema = userIdentifierBaseSchema.extend({
 
 const markInboxReadSchema = userIdentifierBaseSchema.extend({
   agentId: z.string().describe('Agent ID whose inbox to mark as read'),
-  before: z
-    .string()
-    .datetime()
+  before: isoDateTime()
     .optional()
     .describe(
       'Mark messages as read up to this timestamp (ISO 8601). Defaults to now — marks all current messages as read.'

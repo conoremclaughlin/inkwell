@@ -7,6 +7,7 @@
  */
 
 import { z } from 'zod';
+import { isoDateTime } from './schema-primitives.js';
 import type { DataComposer } from '../../data/composer';
 import { logger } from '../../utils/logger';
 import { getEffectiveAgentId } from '../../auth/enforce-identity';
@@ -128,8 +129,8 @@ export const getActivitySchema = z.object({
     .uuid()
     .optional()
     .describe('Filter by task group — returns the full timeline for a mission'),
-  since: z.string().datetime().optional().describe('Activities after this time (ISO 8601)'),
-  until: z.string().datetime().optional().describe('Activities before this time (ISO 8601)'),
+  since: isoDateTime().optional().describe('Activities after this time (ISO 8601)'),
+  until: isoDateTime().optional().describe('Activities before this time (ISO 8601)'),
   limit: z.number().min(1).max(100).optional().describe('Max results (default: 50)'),
   offset: z.number().min(0).optional().describe('Offset for pagination'),
 });
@@ -142,8 +143,8 @@ export const getConversationHistorySchema = z.object({
   isDm: z.boolean().optional().describe('Filter by DM status'),
   limit: z.number().min(1).max(100).optional().describe('Max messages (default: 50)'),
   offset: z.number().min(0).optional().describe('Offset for pagination'),
-  since: z.string().datetime().optional().describe('Messages after this time'),
-  until: z.string().datetime().optional().describe('Messages before this time'),
+  since: isoDateTime().optional().describe('Messages after this time'),
+  until: isoDateTime().optional().describe('Messages before this time'),
 });
 
 export const getSessionContextSchema = z.object({

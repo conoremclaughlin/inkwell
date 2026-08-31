@@ -9,6 +9,7 @@
  */
 
 import { z } from 'zod';
+import { isoDateTime } from './schema-primitives.js';
 import type { DataComposer } from '../../data/composer';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
 import { getEffectiveAgentId } from '../../auth/enforce-identity';
@@ -33,6 +34,54 @@ const threadTable = (supabase: SupabaseClient, table: string) =>
 // with a floor of the newest 10 so quiet threads still surface context. The
 // per-thread ceiling is the caller's `limit` (plugin passes 50).
 const COLD_START_WINDOW_MS = 48 * 60 * 60 * 1000;
+
+/**
+ * Is `candidate` a later INSTANT than `current`?
+ *
+ * These floors used to be compared as strings, which worked only because every
+ * timestamp reaching them was UTC — `Z` from `toISOString()`, `+00:00` from
+ * Postgres — so lexical order of the date-time prefix happened to match
+ * chronological order. That is an accident of spelling, and it stops holding
+ * the moment a caller may send an offset (PR #554, which widened the schemas to
+ * accept the ISO 8601 they always advertised).
+ *
+ * Concretely: with a read floor of `2026-09-01T12:00:00Z`, a `newerThan` of
+ * `2026-09-01T23:00:00+14:00` is 09:00Z — three hours EARLIER — but sorts
+ * later as text, wins the floor, and lowers it. Already-read messages replay.
+ *
+ * An unparseable value never wins; it cannot be shown to be later, so the
+ * existing floor stands. That is the safe direction here: a floor that is too
+ * high under-delivers and is visible, while a floor that is too low silently
+ * replays what the caller already saw.
+ */
+export function isLaterInstant(candidate: string | null, current: string | null): boolean {
+  if (!candidate) return false;
+  if (!current) return true;
+  const a = Date.parse(candidate);
+  const b = Date.parse(current);
+  if (Number.isNaN(a)) return false;
+  if (Number.isNaN(b)) return true;
+  return a > b;
+}
+
+/**
+ * The effective read floor: the latest of the read-state pointer, the
+ * after-cursor, and an explicit `newerThan`.
+ *
+ * Extracted so the comparison can be tested without a database. The bug it
+ * replaced was one character of operator — `>` on two strings — in a line that
+ * read correctly right up until the input format widened underneath it.
+ */
+export function resolveEffectiveFloor(params: {
+  readStateFloor: string | null;
+  afterTs: string | null;
+  newerThan?: string | null;
+}): string | null {
+  let floor = params.readStateFloor;
+  if (isLaterInstant(params.afterTs, floor)) floor = params.afterTs;
+  if (isLaterInstant(params.newerThan ?? null, floor)) floor = params.newerThan ?? null;
+  return floor;
+}
 const COLD_START_MIN_MESSAGES = 10;
 
 // ============== Schemas ==============
@@ -60,9 +109,7 @@ const getThreadMessagesSchema = userIdentifierBaseSchema.extend({
     .describe(
       'Return the full timeline regardless of read state. Without this (and without an explicit cursor), results fall back to messages newer than the last-read pointer — which hides already-delivered messages from watchers/pollers that manage their own cursor (e.g., ink wait).'
     ),
-  newerThan: z
-    .string()
-    .datetime()
+  newerThan: isoDateTime()
     .optional()
     .describe(
       'Explicit floor: only messages created after this timestamp. Combined with the read-state cursor (the later of the two wins).'
@@ -408,9 +455,7 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
   }
 
   // Effective floor: the latest of read-state floor / after-cursor / newerThan.
-  let floorTs: string | null = readStateFloor;
-  if (afterTs && (!floorTs || afterTs > floorTs)) floorTs = afterTs;
-  if (newerThan && (!floorTs || newerThan > floorTs)) floorTs = newerThan;
+  const floorTs = resolveEffectiveFloor({ readStateFloor, afterTs, newerThan });
 
   const buildQuery = (selectArg: string, head = false) => {
     let q = threadTable(supabase, 'inbox_thread_messages')
@@ -453,7 +498,8 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
     if (guardActive) {
       const guardFloor = new Date(Date.now() - COLD_START_WINDOW_MS).toISOString();
       // Repeated created_at filters AND together — the later floor wins.
-      if (!floorTs || guardFloor > floorTs) {
+      // By instant, not by spelling: see isLaterInstant.
+      if (isLaterInstant(guardFloor, floorTs)) {
         windowed = windowed.gt('created_at', guardFloor);
       }
     }
