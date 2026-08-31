@@ -219,6 +219,61 @@ d('instantiate_graph_template (real DB)', () => {
     expect((gate!.verification as { mode: string }).mode).toBe('approval');
   });
 
+  /**
+   * Cardinality is not existence. A well-formed UUID naming nobody passed
+   * the principal-count check, then failed the FK inside add_graph_nodes —
+   * after the group had been created and converted, leaving the caller with
+   * a graph-mode shell it never asked for. The group count is the assertion
+   * that matters; a refusal alone would not have caught it.
+   */
+  it('refuses a nonexistent principal WITHOUT leaving a group behind', async () => {
+    const before = await groupCount();
+    const refused = parse(
+      await handleInstantiateGraphTemplate(
+        {
+          userId: USER,
+          templateId: 'pr-ship',
+          title: `${MARK} ghost principal`,
+          subject: 'PR #007',
+          // Well-formed, and nobody's.
+          reviewerIdentityId: '00000000-0000-4000-8000-000000000000',
+          includeVisualSignoff: false,
+          start: false,
+        } as never,
+        dataComposer
+      )
+    );
+    expect(refused.success).toBe(false);
+    expect(refused.problems).toEqual([
+      { slug: 'sibling-review', principal: '00000000-0000-4000-8000-000000000000' },
+    ]);
+    expect(await groupCount()).toBe(before);
+  });
+
+  it('refuses a visual principal that is a real identity id but not a real user id', async () => {
+    const before = await groupCount();
+    const refused = parse(
+      await handleInstantiateGraphTemplate(
+        {
+          userId: USER,
+          templateId: 'pr-ship',
+          title: `${MARK} wrong principal table`,
+          subject: 'PR #008',
+          reviewerIdentityId: reviewer,
+          // An agent identity UUID passed where a users.id belongs.
+          visualSignoffUserId: reviewer,
+          start: false,
+        } as never,
+        dataComposer
+      )
+    );
+    expect(refused.success).toBe(false);
+    expect((refused.problems as Array<{ slug: string }>).map((p) => p.slug)).toEqual([
+      'visual-signoff',
+    ]);
+    expect(await groupCount()).toBe(before);
+  });
+
   it('injects a fragment into an existing graph and rewires the downstream node', async () => {
     const built = parse(
       await handleInstantiateGraphTemplate(

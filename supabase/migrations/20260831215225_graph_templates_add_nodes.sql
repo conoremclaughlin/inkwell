@@ -161,10 +161,15 @@ BEGIN
   -- graph containing a gate, and nothing in that graph gates anything
   -- (Lumen, pr:555 blocker 1).
   --
-  -- Compared: task_type, and a gate's principal. NOT the requirements —
-  -- those are a checklist whose wording is expected to drift between
-  -- template versions, and refusing on them would make a reworded template
-  -- unable to re-run.
+  -- Compared: everything that changes what the gate DOES at runtime —
+  -- task_type, the gate's principal, its mode, and its dwell window. Mode
+  -- especially: claim_graph_task refuses an approval gate, so an approval
+  -- gate standing in for an executable `sibling-review` leaves the reviewer
+  -- unable to claim what they were dispatched to (Lumen, pr:555 round 2).
+  --
+  -- NOT compared: the requirements. Those are a checklist whose wording is
+  -- expected to drift between template versions, and refusing on them would
+  -- make a reworded template unable to re-run.
   SELECT jsonb_agg(jsonb_build_object(
            'slug', p.slug, 'problem', conflict.problem,
            'existing', conflict.existing, 'promised', conflict.promised))
@@ -180,17 +185,58 @@ BEGIN
              AND (t.assignee_identity_id IS DISTINCT FROM p.assignee_identity_id
                OR t.assignee_user_id IS DISTINCT FROM p.assignee_user_id)
           THEN 'assignee-differs'
+        WHEN p.task_type = 'verification'
+             AND (t.verification ->> 'mode') IS DISTINCT FROM (p.verification ->> 'mode')
+          THEN 'mode-differs'
+        WHEN p.task_type = 'verification'
+             AND coalesce((t.verification ->> 'notBeforeSeconds')::numeric, 0)
+                 IS DISTINCT FROM
+                 coalesce((p.verification ->> 'notBeforeSeconds')::numeric, 0)
+          THEN 'dwell-differs'
         ELSE NULL
       END AS problem,
-      CASE WHEN t.task_type IS DISTINCT FROM p.task_type THEN t.task_type
-           ELSE coalesce(t.assignee_identity_id, t.assignee_user_id)::text END AS existing,
-      CASE WHEN t.task_type IS DISTINCT FROM p.task_type THEN p.task_type
-           ELSE coalesce(p.assignee_identity_id, p.assignee_user_id)::text END AS promised
+      CASE
+        WHEN t.task_type IS DISTINCT FROM p.task_type THEN t.task_type
+        WHEN t.assignee_identity_id IS DISTINCT FROM p.assignee_identity_id
+          OR t.assignee_user_id IS DISTINCT FROM p.assignee_user_id
+          THEN coalesce(t.assignee_identity_id, t.assignee_user_id)::text
+        WHEN (t.verification ->> 'mode') IS DISTINCT FROM (p.verification ->> 'mode')
+          THEN t.verification ->> 'mode'
+        ELSE coalesce(t.verification ->> 'notBeforeSeconds', '0')
+      END AS existing,
+      CASE
+        WHEN t.task_type IS DISTINCT FROM p.task_type THEN p.task_type
+        WHEN t.assignee_identity_id IS DISTINCT FROM p.assignee_identity_id
+          OR t.assignee_user_id IS DISTINCT FROM p.assignee_user_id
+          THEN coalesce(p.assignee_identity_id, p.assignee_user_id)::text
+        WHEN (t.verification ->> 'mode') IS DISTINCT FROM (p.verification ->> 'mode')
+          THEN p.verification ->> 'mode'
+        ELSE coalesce(p.verification ->> 'notBeforeSeconds', '0')
+      END AS promised
   ) conflict
   WHERE conflict.problem IS NOT NULL;
   IF v_invalid IS NOT NULL THEN
     RETURN jsonb_build_object('success', false, 'reason', 'existing-node-conflict',
       'conflicts', v_invalid);
+  END IF;
+
+  -- A syntactically valid UUID naming nobody would otherwise reach the
+  -- INSERT and raise an FK violation — an exception, not a structured
+  -- refusal, which aborts the caller's transaction and (for a freshly
+  -- created group) strands a graph-mode shell (Lumen, pr:555 round 2).
+  SELECT jsonb_agg(jsonb_build_object(
+           'slug', p.slug, 'problem', 'unknown-principal',
+           'principal', coalesce(p.assignee_identity_id, p.assignee_user_id)))
+  INTO v_invalid
+  FROM _proposed_nodes p
+  WHERE (p.assignee_identity_id IS NOT NULL
+         AND NOT EXISTS (SELECT 1 FROM agent_identities ai
+                         WHERE ai.id = p.assignee_identity_id))
+     OR (p.assignee_user_id IS NOT NULL
+         AND NOT EXISTS (SELECT 1 FROM users u WHERE u.id = p.assignee_user_id));
+  IF v_invalid IS NOT NULL THEN
+    RETURN jsonb_build_object('success', false, 'reason', 'unknown-principal',
+      'invalid', v_invalid);
   END IF;
 
   -- ── Edge resolution, SYMBOLIC — before anything is written ──────────

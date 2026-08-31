@@ -392,6 +392,52 @@ export async function handleInstantiateGraphTemplate(
       );
     }
 
+    // Cardinality is not existence. A well-formed UUID naming nobody passes
+    // the check above, then fails the FK inside add_graph_nodes — an
+    // exception rather than a structured refusal, arriving after the group
+    // has been created and converted, stranding a graph-mode shell (Lumen,
+    // pr:555 round 2). The RPC now refuses this too and is authoritative;
+    // resolving it here is what keeps the shell from existing at all.
+    const client = dataComposer.getClient();
+    const identityIds = [
+      ...new Set(shape.nodes.map((n) => n.assigneeIdentityId).filter(Boolean) as string[]),
+    ];
+    const userIds = [
+      ...new Set(shape.nodes.map((n) => n.assigneeUserId).filter(Boolean) as string[]),
+    ];
+    const [identityRows, userRows] = await Promise.all([
+      identityIds.length
+        ? client.from('agent_identities').select('id').in('id', identityIds)
+        : Promise.resolve({ data: [] as Array<{ id: string }> }),
+      userIds.length
+        ? client.from('users').select('id').in('id', userIds)
+        : Promise.resolve({ data: [] as Array<{ id: string }> }),
+    ]);
+    // The two id spaces stay SEPARATE. Pooling them into one set let an
+    // agent-identity UUID pass as a users.id — which is the confusion most
+    // likely to happen in practice, since both are UUIDs and the parameter
+    // names are one word apart.
+    const knownIdentities = new Set((identityRows.data ?? []).map((r) => r.id));
+    const knownUsers = new Set((userRows.data ?? []).map((r) => r.id));
+    const unknownPrincipals = shape.nodes
+      .filter((n) => {
+        if (n.assigneeIdentityId) return !knownIdentities.has(n.assigneeIdentityId);
+        if (n.assigneeUserId) return !knownUsers.has(n.assigneeUserId);
+        return false;
+      })
+      .map((n) => ({ slug: n.slug, principal: n.assigneeIdentityId ?? n.assigneeUserId }));
+    if (unknownPrincipals.length > 0) {
+      return mcpResponse(
+        {
+          success: false,
+          error:
+            'A gate names a principal that does not exist. reviewerIdentityId must be an agent_identities.id (NEVER an agent slug); visualSignoffUserId must be a users.id.',
+          problems: unknownPrincipals,
+        },
+        true
+      );
+    }
+
     const groups = dataComposer.repositories.taskGroups;
     const actorIdentityId = resolveActorIdentityId();
     const actor = actorIdentityId

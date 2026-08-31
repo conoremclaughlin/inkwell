@@ -565,6 +565,99 @@ d('add_graph_nodes (real DB)', () => {
       expect(refused).toMatchObject({ success: false, reason: 'existing-node-conflict' });
     });
 
+    /**
+     * Round 2: same type, same principal, different runtime semantics.
+     * claim_graph_task REFUSES an approval gate, so an approval gate standing
+     * in for an executable `sibling-review` dispatches a reviewer to a gate
+     * they cannot claim — the shape looks right and the work cannot proceed.
+     */
+    it('refuses when an existing gate has the same principal but a different MODE', async () => {
+      const group = await newGraphGroup('itest round2 mode');
+      await groups.addGraphNodes({
+        userId: USER,
+        taskGroupId: group.id,
+        expectedVersion: group.version,
+        nodes: [
+          {
+            slug: 'sibling-review',
+            type: 'verification',
+            title: 'approval gate wearing the review slug',
+            assigneeIdentityId: reviewer,
+            verification: { mode: 'approval', requirements: [] },
+          },
+        ],
+        edges: [],
+        systemActor: true,
+      });
+
+      const refused = await groups.addGraphNodes({
+        userId: USER,
+        taskGroupId: group.id,
+        expectedVersion: await version(group.id),
+        nodes: prShipNodes(reviewer), // sibling-review is executable here
+        edges: [],
+        systemActor: true,
+      });
+      expect(refused).toMatchObject({ success: false, reason: 'existing-node-conflict' });
+      expect((refused.conflicts as Array<{ problem: string }>)[0].problem).toBe('mode-differs');
+    });
+
+    it('refuses when an existing gate carries a different dwell window', async () => {
+      const group = await newGraphGroup('itest round2 dwell');
+      await groups.addGraphNodes({
+        userId: USER,
+        taskGroupId: group.id,
+        expectedVersion: group.version,
+        nodes: [
+          {
+            slug: 'sibling-review',
+            type: 'verification',
+            title: 'same gate, but it dwells for an hour first',
+            assigneeIdentityId: reviewer,
+            verification: { mode: 'executable', requirements: [], notBeforeSeconds: 3600 },
+          },
+        ],
+        edges: [],
+        systemActor: true,
+      });
+
+      const refused = await groups.addGraphNodes({
+        userId: USER,
+        taskGroupId: group.id,
+        expectedVersion: await version(group.id),
+        nodes: prShipNodes(reviewer), // no dwell
+        edges: [],
+        systemActor: true,
+      });
+      expect(refused).toMatchObject({ success: false, reason: 'existing-node-conflict' });
+      expect((refused.conflicts as Array<{ problem: string }>)[0].problem).toBe('dwell-differs');
+    });
+
+    it('refuses a principal that does not exist, as a reason rather than an FK exception', async () => {
+      const group = await newGraphGroup('itest round2 unknown principal');
+      const ghost = randomUUID();
+      const refused = await groups.addGraphNodes({
+        userId: USER,
+        taskGroupId: group.id,
+        expectedVersion: group.version,
+        nodes: [
+          {
+            slug: 'ghost-gate',
+            type: 'verification',
+            title: 'assigned to nobody at all',
+            assigneeIdentityId: ghost,
+            verification: { mode: 'executable', requirements: [] },
+          },
+        ],
+        edges: [],
+        systemActor: true,
+      });
+      // Before the fix this raised an FK violation, which the repository
+      // rethrows — aborting the caller instead of answering it.
+      expect(refused).toMatchObject({ success: false, reason: 'unknown-principal' });
+      expect(await nodesOf(group.id)).toHaveLength(0);
+    });
+
     it('accepts an existing gate whose checklist wording drifted — that is not a conflict', async () => {
       const group = await newGraphGroup('itest blocker1 wording');
       await groups.addGraphNodes({
