@@ -2830,6 +2830,115 @@ describe('S2: the minimal close invariant (spec v18, Lumen r2)', () => {
     expect(tables.studio_lease_events.map((e) => e.event)).not.toContain('released');
   });
 
+  it('an append that FOLLOWS the marker is never released underneath — the boundary reconciles (Lumen r2)', async () => {
+    // The sequential race exact-state CAS cannot see: close A stamps the
+    // marker successfully; B then arrives and legitimately appends (the
+    // marker is preserved, pinned elsewhere); the holder's non-terminal
+    // boundary fires. Whole-lease completion here would accept B and then
+    // release it underneath. The marker carries its closing thread, so the
+    // boundary completes exactly that thread's exit and the lease lives on.
+    tables.studios[0].lease = freshLease({
+      sessionId: 'session-b',
+      threadKey: 'pr:A',
+      threadKeys: ['pr:A'],
+    }) as unknown as Row;
+    liveHolder();
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const closed = await service.releaseByThread('user-1', 'pr:A', { reason: 'thread-closed' });
+    expect(closed.deferred).toBe(1);
+    expect(storedLease()?.pendingRelease?.threadKey).toBe('pr:A');
+
+    const appended = await service.acquire({
+      studioId: 'studio-1',
+      sessionId: 'session-b',
+      threadKey: 'pr:B',
+      agentId: 'wren',
+      userId: 'user-1',
+      reason: 'route-pattern',
+    });
+    expect(appended.acquired).toBe(true);
+    expect(storedLease()?.threadKeys).toEqual(['pr:A', 'pr:B']);
+    expect(storedLease()?.pendingRelease?.threadKey).toBe('pr:A');
+
+    resetActiveRuns(); // the turn ends — a real stop boundary, session lives
+    const released = await service.releaseAtBoundary('session-b', {
+      userId: 'user-1',
+      sessionTerminal: false,
+      reason: 'run-finalized',
+    });
+
+    expect(released).toBe(false); // reconciled, not released
+    expect(storedLease()?.sessionId).toBe('session-b');
+    expect(storedLease()?.threadKeys).toEqual(['pr:B']); // A exited, B lives
+    expect(storedLease()?.pendingRelease).toBeUndefined();
+    expect(tables.studio_lease_events.map((e) => e.event)).not.toContain('released');
+  });
+
+  it('a thread-scoped marker still completes whole-lease at the boundary when its thread stayed last', async () => {
+    tables.studios[0].lease = freshLease({
+      sessionId: 'session-b',
+      threadKey: 'pr:A',
+      threadKeys: ['pr:A'],
+      pendingRelease: {
+        reason: 'thread-closed',
+        requestedAt: new Date().toISOString(),
+        threadKey: 'pr:A',
+      },
+    }) as unknown as Row;
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const released = await service.releaseAtBoundary('session-b', {
+      userId: 'user-1',
+      sessionTerminal: false,
+      reason: 'run-finalized',
+    });
+    expect(released).toBe(true);
+    expect(storedLease()).toBeNull();
+  });
+
+  it('a TERMINAL boundary releases the whole multiplexed lease — the process left the tree', async () => {
+    tables.studios[0].lease = freshLease({
+      sessionId: 'session-b',
+      threadKey: 'pr:A',
+      threadKeys: ['pr:A', 'pr:B'],
+      pendingRelease: {
+        reason: 'thread-closed',
+        requestedAt: new Date().toISOString(),
+        threadKey: 'pr:A',
+      },
+    }) as unknown as Row;
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const released = await service.releaseAtBoundary('session-b', {
+      userId: 'user-1',
+      sessionTerminal: true,
+      reason: 'session-terminal',
+    });
+    expect(released).toBe(true);
+    expect(storedLease()).toBeNull();
+  });
+
+  it('the sweep completes a thread-scoped marker whole-lease once the holder is provably gone', async () => {
+    // Reconciling for a dead session would leave a dead holder on the tree;
+    // survivors re-acquire vacant on their next message.
+    tables.studios[0].lease = staleLease({
+      sessionId: 'session-b',
+      threadKey: 'pr:A',
+      threadKeys: ['pr:A', 'pr:B'],
+      pendingRelease: {
+        reason: 'thread-closed',
+        requestedAt: new Date().toISOString(),
+        threadKey: 'pr:A',
+      },
+    }) as unknown as Row;
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const stats = await service.sweepExpiredLeases();
+    expect(stats.released).toBe(1);
+    expect(storedLease()).toBeNull();
+  });
+
   it('teardown claim is refused while another live key remains', async () => {
     tables.studios[0].lease = staleLease({
       sessionId: 'session-b',

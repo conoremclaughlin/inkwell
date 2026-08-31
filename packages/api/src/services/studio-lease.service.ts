@@ -102,7 +102,20 @@ export interface StudioLease {
    * (close_thread/close_studio from inside a turn). The run/stop boundary or
    * the sweep completes it once the process has actually left the worktree.
    */
-  pendingRelease?: { reason: string; requestedAt: string };
+  pendingRelease?: {
+    reason: string;
+    requestedAt: string;
+    /**
+     * The closing THREAD that requested this release (v18 S2, Lumen r2).
+     * A thread-close marker authorizes only that thread's exit: an append
+     * that legitimately lands after the stamp but before the boundary must
+     * not be released underneath — the non-terminal boundary reconciles the
+     * marker to a key-removal when other threads have since joined. Absent
+     * on studio-close, sweep-mortality, and legacy markers, which stay
+     * whole-lease.
+     */
+    threadKey?: string;
+  };
 }
 
 /** No heartbeat for this long → the lease is stale and may be reclaimed. */
@@ -230,7 +243,11 @@ export function parseStudioLease(raw: Json | null | undefined): StudioLease | nu
     heldThreadKey: typeof obj.heldThreadKey === 'string' ? obj.heldThreadKey : undefined,
     pendingRelease:
       pending && typeof pending.reason === 'string' && typeof pending.requestedAt === 'string'
-        ? { reason: pending.reason, requestedAt: pending.requestedAt }
+        ? {
+            reason: pending.reason,
+            requestedAt: pending.requestedAt,
+            threadKey: typeof pending.threadKey === 'string' ? pending.threadKey : undefined,
+          }
         : undefined,
   };
 }
@@ -1371,9 +1388,40 @@ export class StudioLeaseService {
     let any = false;
     for (const row of await this.studiosHeldBy(sessionId, opts.userId)) {
       if (!opts.sessionTerminal && !row.lease.pendingRelease) continue;
+      // A NON-terminal boundary completes only what the marker still
+      // justifies (Lumen r2): a thread-scoped marker whose lease has since
+      // multiplexed other threads reconciles to a key-removal — the session
+      // lives, keeps the studio, and only the closed thread exits. A
+      // terminal session's process is gone from the tree, so the whole
+      // lease releases regardless of what the set carries.
+      const marker = row.lease.pendingRelease;
+      if (!opts.sessionTerminal && marker?.threadKey) {
+        const others = leaseThreadKeys(row.lease).filter((k) => k !== marker.threadKey);
+        if (others.length > 0) {
+          const reconciled: StudioLease = {
+            ...row.lease,
+            threadKeys: others,
+            pendingRelease: undefined,
+          };
+          if (await this.casLease(row.id, row.user_id, row.lease, reconciled)) {
+            logger.info(
+              '[StudioLease] Thread-close marker reconciled at boundary — lease survives for remaining threads',
+              {
+                studioId: row.id,
+                sessionId,
+                closedThreadKey: marker.threadKey,
+                remaining: others,
+              }
+            );
+          }
+          // A lost CAS leaves the marker for the next boundary or the sweep.
+          continue;
+        }
+      }
       if (
         await this.releaseStudio(row.id, row.user_id, row.lease, row.worktree_path, {
-          reason: row.lease.pendingRelease?.reason ?? opts.reason,
+          reason: marker?.reason ?? opts.reason,
+          closingThreadKey: marker?.threadKey,
         })
       ) {
         any = true;
@@ -1529,9 +1577,13 @@ export class StudioLeaseService {
         // Same conservative rule as adoption: a fresh non-terminal holder is
         // presumed live (admission gap) — defer, never clear.
         if (!(await this.canReleaseNow(lease, userId))) {
+          // The marker records WHICH thread's close asked (Lumen r2): an
+          // append landing after this stamp is legitimate, and the boundary
+          // must not release it underneath — it reconciles thread-scoped
+          // markers instead of clearing whole-lease.
           const marked: StudioLease = {
             ...lease,
-            pendingRelease: { reason, requestedAt: new Date().toISOString() },
+            pendingRelease: { reason, requestedAt: new Date().toISOString(), threadKey },
           };
           if (await this.casLease(studioId, userId, lease, marked)) {
             logger.info('[StudioLease] Release deferred to holder boundary (pendingRelease)', {
@@ -1754,8 +1806,13 @@ export class StudioLeaseService {
           // pendingRelease deferred (and renewed below) until its next stop
           // boundary or the terminal closes — delayed, never premature.
           if (await this.canReleaseNow(lease, row.user_id)) {
+            // Whole-lease even for a thread-scoped marker: canReleaseNow
+            // means the holder is provably GONE, so the lease serves nobody
+            // — reconciling here would leave a dead session holding a tree.
+            // Multiplexed survivors re-acquire vacant on their next message.
             const ok = await this.releaseStudio(row.id, row.user_id, lease, row.worktree_path, {
               reason: lease.pendingRelease.reason,
+              closingThreadKey: lease.pendingRelease.threadKey,
             });
             if (ok) released += 1;
             continue;
