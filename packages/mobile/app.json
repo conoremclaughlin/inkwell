@@ -1,0 +1,23 @@
+{
+  "expo": {
+    "name": "Inkwell",
+    "slug": "inkwell",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "backgroundColor": "#0b0e14",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.inkwell.mobile"
+    },
+    "android": {
+      "package": "com.inkwell.mobile",
+      "predictiveBackGestureEnabled": false
+    },
+    "plugins": ["expo-secure-store"],
+    "extra": {
+      "//productionApiUrl": "API base URL for release builds, which have no Metro host to autodiscover from. Dev builds ignore this. Set before shipping — until then release builds fall back to loopback and surface an error.",
+      "productionApiUrl": null
+    }
+  }
+}

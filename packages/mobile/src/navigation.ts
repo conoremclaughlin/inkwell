@@ -1,0 +1,25 @@
+import type { NavigatorScreenParams } from '@react-navigation/native';
+
+export type TabParamList = {
+  Threads: undefined;
+  Fleet: undefined;
+};
+
+/**
+ * Thread and Settings are stack routes above the tabs: a thread is a place
+ * you drill into from the list (or arrive at cold from a notification later),
+ * and Settings is reachable from every tab's header rather than spending a
+ * permanent tab on it.
+ */
+export type RootStackParamList = {
+  Tabs: NavigatorScreenParams<TabParamList>;
+  Thread: { threadKey: string; title?: string };
+  Settings: undefined;
+};
+
+declare global {
+  // eslint-disable-next-line @typescript-eslint/no-namespace
+  namespace ReactNavigation {
+    interface RootParamList extends RootStackParamList {}
+  }
+}
