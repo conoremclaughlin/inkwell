@@ -27,6 +27,7 @@ import type { Database, Json } from '../data/supabase/types';
 import { handleSendToInbox } from '../mcp/tools/inbox-handlers';
 import { resolveAgentSlug } from '../auth/resolve-identity';
 import { StudioLeaseService } from './studio-lease.service';
+import { renderGateChecklistBlock } from './graph-templates/types';
 import { logger } from '../utils/logger';
 
 export interface GraphNodeRef {
@@ -511,15 +512,10 @@ export class GraphExecutorService {
   }
 
   /**
-   * The gate's checklist, appended to the message that opens it.
-   *
-   * This is the moment the reminder has to arrive. A checklist stored on the
-   * node is a checklist nobody reads: the assignee is woken by this message
-   * and acts on what it says, so anything the gate wants — screenshots, the
-   * SHA actually reviewed, a pre-registered merge tree — has to be in it.
-   * Requirements are free-form by design (Conor's ruling: checklist, not
-   * bouncer), so this renders whatever the constructor wrote and validates
-   * nothing. A gate with no requirements adds nothing.
+   * The gate's checklist, appended to the message that opens it. Rendering
+   * lives in graph-templates (renderGateChecklistBlock); this is only the
+   * lookup. Requirements are free-form by design — checklist, not bouncer —
+   * so nothing here validates them.
    *
    * Best-effort: a lookup failure costs the reminder, never the dispatch.
    */
@@ -532,19 +528,7 @@ export class GraphExecutorService {
         .eq('id', taskId)
         .maybeSingle();
       if (error || !data) return '';
-      const requirements = (data.verification as { requirements?: unknown } | null)?.requirements;
-      if (!Array.isArray(requirements) || requirements.length === 0) return '';
-      const lines = requirements
-        .filter((r): r is { label: string; detail?: string } => {
-          return Boolean(r) && typeof (r as { label?: unknown }).label === 'string';
-        })
-        .map((r) => `  [ ] ${r.label}${r.detail ? ` — ${r.detail}` : ''}`);
-      if (lines.length === 0) return '';
-      return (
-        `\n\nThis gate is asking for:\n${lines.join('\n')}\n` +
-        `These are what the gate is FOR, not a schema — record them in your evidence in whatever ` +
-        `shape fits, and say so plainly if one does not apply.`
-      );
+      return renderGateChecklistBlock(data.verification);
     } catch (err) {
       logger.debug(`Gate checklist render failed for ${taskId} (non-fatal):`, err);
       return '';

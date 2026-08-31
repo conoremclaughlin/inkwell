@@ -426,12 +426,16 @@ export async function handleInstantiateGraphTemplate(
       );
     }
 
-    // A new group needs execution started; an existing one is already
-    // running, and addGraphNodes' own evaluation dispatches what it opened.
+    // A new group needs execution started — unless the caller asked to
+    // author it without waking anyone, in which case nothing is dispatched
+    // at all. An existing group is already running, so what this call just
+    // opened is dispatched now.
     let started: unknown = null;
-    if (created && args.start !== false) {
-      const executor = new GraphExecutorService(dataComposer);
-      started = await executor.startGroup(resolved.user.id, current.id);
+    if (created) {
+      if (args.start !== false) {
+        const executor = new GraphExecutorService(dataComposer);
+        started = await executor.startGroup(resolved.user.id, current.id);
+      }
     } else {
       await dispatchAfterMutation(dataComposer, resolved.user.id, current.id, result.evaluation);
     }

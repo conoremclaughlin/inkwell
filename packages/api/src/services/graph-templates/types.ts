@@ -107,3 +107,33 @@ export function renderRequirementChecklist(requirements: GateRequirement[]): str
   });
   return `This gate is asking for:\n${lines.join('\n')}`;
 }
+
+/**
+ * The block appended to the message that OPENS a gate — the moment the
+ * reminder has to arrive. A checklist stored on a node is a checklist nobody
+ * reads: the assignee is woken by that message and acts on what it says, so
+ * whatever the gate wants has to be in it.
+ *
+ * Takes the raw `verification` JSONB because a gate may have been authored by
+ * hand, by an older constructor, or by a template that has since changed
+ * shape — anything unrecognisable is skipped rather than allowed to break a
+ * dispatch. Returns '' when there is nothing to say.
+ */
+export function renderGateChecklistBlock(verification: unknown): string {
+  const requirements = (verification as { requirements?: unknown } | null | undefined)
+    ?.requirements;
+  if (!Array.isArray(requirements)) return '';
+  const usable = requirements.filter(
+    (requirement): requirement is GateRequirement =>
+      Boolean(requirement) &&
+      typeof (requirement as { label?: unknown }).label === 'string' &&
+      (requirement as { label: string }).label.trim() !== ''
+  );
+  const checklist = renderRequirementChecklist(usable);
+  if (!checklist) return '';
+  return (
+    `\n\n${checklist}\n` +
+    'These are what the gate is FOR, not a schema — record them in your evidence in ' +
+    'whatever shape fits, and say so plainly if one does not apply.'
+  );
+}

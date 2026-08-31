@@ -15,7 +15,7 @@ import {
   specShipTemplate,
   visualSignoffTemplate,
 } from './templates';
-import { renderRequirementChecklist } from './types';
+import { renderGateChecklistBlock, renderRequirementChecklist } from './types';
 import type { GraphShape } from './types';
 
 const REVIEWER = '8d48d86c-656a-4219-8c21-9eed9fc13601';
@@ -215,5 +215,60 @@ describe('renderRequirementChecklist', () => {
 
   it('renders nothing for a gate with no requirements', () => {
     expect(renderRequirementChecklist([])).toBe('');
+  });
+});
+
+/**
+ * The reminder has to survive the trip from a constructor, through JSONB, to
+ * the message that wakes the assignee. These cases are what that block sees
+ * in practice: hand-authored gates, gates from an older constructor, and the
+ * template's own output.
+ */
+describe('renderGateChecklistBlock', () => {
+  it("carries the template's checklist into the gate-open message", () => {
+    const gate = bySlug(
+      prShipTemplate.build({ subject: 'PR #551', reviewerIdentityId: REVIEWER }),
+      'sibling-review'
+    );
+    const block = renderGateChecklistBlock(gate.verification);
+    for (const requirement of gate.verification!.requirements) {
+      expect(block).toContain(requirement.label);
+    }
+    // The reader is told these are a checklist, not a schema — the whole
+    // point of the ruling this feature is built on.
+    expect(block).toContain('not a schema');
+  });
+
+  it('adds nothing when there is nothing to say', () => {
+    expect(renderGateChecklistBlock(null)).toBe('');
+    expect(renderGateChecklistBlock(undefined)).toBe('');
+    expect(renderGateChecklistBlock({})).toBe('');
+    expect(renderGateChecklistBlock({ requirements: [] })).toBe('');
+    // A gate authored before requirements existed, or by hand.
+    expect(renderGateChecklistBlock({ mode: 'approval', notBeforeSeconds: 60 })).toBe('');
+  });
+
+  it('skips malformed entries rather than breaking the dispatch', () => {
+    const block = renderGateChecklistBlock({
+      requirements: [
+        null,
+        'a bare string',
+        { detail: 'no label' },
+        { label: '  ' },
+        { label: 'ok' },
+      ],
+    });
+    expect(block).toContain('[ ] ok');
+    expect(block).not.toContain('a bare string');
+    expect(block).not.toContain('no label');
+    expect(block.match(/\[ \]/g)).toHaveLength(1);
+  });
+
+  it('renders nothing when every entry is malformed', () => {
+    expect(renderGateChecklistBlock({ requirements: [null, 42, { nope: true }] })).toBe('');
+  });
+
+  it('tolerates requirements that are not an array at all', () => {
+    expect(renderGateChecklistBlock({ requirements: 'see the PR' })).toBe('');
   });
 });
