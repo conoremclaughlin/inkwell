@@ -888,12 +888,19 @@ describe('S2: teardownEphemeralStudiosForThread under multiplexing (spec v18)', 
     expect(update).not.toHaveBeenCalled();
   });
 
-  it('proceeds to the fenced teardown once the closing key is the last survivor', async () => {
+  it('proceeds to the fenced teardown when the closing key is the created-for thread', async () => {
+    // The pre-multiplex lifecycle: built for pr:B, only ever served pr:B —
+    // the created-for query legitimately finds it.
     const update = vi.fn().mockResolvedValue(makeStudio());
+    const created = makeStudio({ ephemeral: true, threadKey: 'pr:B', lease: null });
     const studios = {
       markCleaned: vi.fn(),
       update,
-      listEphemeralByThread: vi.fn().mockResolvedValue([multiplexedStudio(['pr:B'])]),
+      listEphemeralByThread: vi
+        .fn()
+        .mockImplementation(async (_userId: string, threadKey: string) =>
+          threadKey === 'pr:B' ? [created] : []
+        ),
     } as unknown as StudiosRepository;
     // Claim refused (live holder) — the point is only that the fenced path
     // WAS attempted for the survivor key; its own gates still apply.
@@ -910,5 +917,75 @@ describe('S2: teardownEphemeralStudiosForThread under multiplexing (spec v18)', 
       expectedThreadKey: 'pr:B',
       reason: 'teardown-claim (thread pr:B closed)',
     });
+  });
+
+  it('a created-for-A ephemeral is found through the close candidates when B closes last (Lumen r1 P1-2)', async () => {
+    // Production shape: studios.thread_key = 'pr:A' (created-for), lease
+    // already released by releaseByThread — the created-for query for pr:B
+    // returns NOTHING, and nothing on the row remembers pr:B. Discovery has
+    // to come from the close path handing over the studios whose lease the
+    // thread actually rode.
+    const createdForA = makeStudio({ ephemeral: true, threadKey: 'pr:A', lease: null });
+    const listEphemeralByThread = vi
+      .fn()
+      .mockImplementation(async (_userId: string, threadKey: string) =>
+        threadKey === 'pr:A' ? [createdForA] : []
+      );
+    const findById = vi
+      .fn()
+      .mockImplementation(async (id: string) => (id === 'parent-1' ? createdForA : null));
+    const studios = {
+      markCleaned: vi.fn(),
+      update: vi.fn().mockResolvedValue(createdForA),
+      listEphemeralByThread,
+      findById,
+    } as unknown as StudiosRepository;
+    const claimForTeardown = vi.fn().mockResolvedValue(null);
+    const leases = { logEvent: vi.fn(), claimForTeardown } as unknown as StudioLeaseService;
+    const service = new StudioOverflowService(studios, leases);
+
+    // Without candidates: invisible — this IS the P1-2 gap, pinned.
+    const withoutCandidates = await service.teardownEphemeralStudiosForThread('user-1', 'pr:B', {
+      reason: 'thread pr:B closed',
+    });
+    expect(withoutCandidates).toBe(0);
+    expect(claimForTeardown).not.toHaveBeenCalled();
+
+    // With the close path's candidates: discovered and fenced-torn-down.
+    const closed = await service.teardownEphemeralStudiosForThread('user-1', 'pr:B', {
+      reason: 'thread pr:B closed',
+      candidateStudioIds: ['parent-1'],
+    });
+    expect(closed).toBe(1);
+    expect(claimForTeardown).toHaveBeenCalledWith('parent-1', 'user-1', {
+      expectedThreadKey: 'pr:B',
+      reason: 'teardown-claim (thread pr:B closed)',
+    });
+  });
+
+  it('candidate ids never widen scope: foreign or durable studios are ignored', async () => {
+    const foreign = makeStudio({ id: 'foreign-1', ephemeral: true, userId: 'user-2', lease: null });
+    const durable = makeStudio({ id: 'durable-1', ephemeral: false, lease: null });
+    const findById = vi
+      .fn()
+      .mockImplementation(async (id: string) =>
+        id === 'foreign-1' ? foreign : id === 'durable-1' ? durable : null
+      );
+    const studios = {
+      markCleaned: vi.fn(),
+      update: vi.fn(),
+      listEphemeralByThread: vi.fn().mockResolvedValue([]),
+      findById,
+    } as unknown as StudiosRepository;
+    const claimForTeardown = vi.fn();
+    const leases = { logEvent: vi.fn(), claimForTeardown } as unknown as StudioLeaseService;
+    const service = new StudioOverflowService(studios, leases);
+
+    const closed = await service.teardownEphemeralStudiosForThread('user-1', 'pr:B', {
+      reason: 'thread pr:B closed',
+      candidateStudioIds: ['foreign-1', 'durable-1', 'missing-1'],
+    });
+    expect(closed).toBe(0);
+    expect(claimForTeardown).not.toHaveBeenCalled();
   });
 });

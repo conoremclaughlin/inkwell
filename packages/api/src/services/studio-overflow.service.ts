@@ -793,11 +793,32 @@ export class StudioOverflowService {
   async teardownEphemeralStudiosForThread(
     userId: string,
     threadKey: string,
-    opts: { reason: string }
+    opts: {
+      reason: string;
+      /**
+       * Studios whose lease this thread actually rode, from releaseByThread
+       * (v18 S2, Lumen r1 P1-2). `studios.thread_key` is the CREATED-FOR
+       * thread and the last live key need not be it — an ephemeral built for
+       * A whose final surviving thread was B is invisible to the created-for
+       * query once its lease is released, and nothing else on the row
+       * remembers B. The close path passes what it just learned instead.
+       */
+      candidateStudioIds?: string[];
+    }
   ): Promise<number> {
-    const studios = await this.studios
+    const byThread = await this.studios
       .listEphemeralByThread(userId, threadKey)
       .catch(() => [] as Studio[]);
+    const seen = new Set(byThread.map((s) => s.id));
+    const studios = [...byThread];
+    for (const id of opts.candidateStudioIds ?? []) {
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const studio = await this.studios.findById(id).catch(() => null);
+      // Ownership boundary: a candidate id never widens scope past this
+      // user's own ephemerals.
+      if (studio && studio.ephemeral && studio.userId === userId) studios.push(studio);
+    }
     let closed = 0;
     for (const studio of studios) {
       // The minimal close invariant (v18 S2): `studios.thread_key` selected

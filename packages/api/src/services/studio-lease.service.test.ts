@@ -1288,7 +1288,12 @@ describe('StudioLeaseService release paths', () => {
       reason: 'thread-closed',
     });
     // session-a (fresh, non-terminal) deferred; session-b (terminal) released.
-    expect(byThread).toEqual({ released: 1, deferred: 1, removed: 0 });
+    expect(byThread).toEqual({
+      released: 1,
+      deferred: 1,
+      removed: 0,
+      studioIds: ['studio-1', 'studio-2'],
+    });
     const marked = tables.studios[0].lease as StudioLease;
     expect(marked.sessionId).toBe('session-a');
     expect(marked.pendingRelease?.reason).toBe('thread-closed');
@@ -1302,7 +1307,12 @@ describe('StudioLeaseService release paths', () => {
 
   it('releaseByThread clears every studio the thread holds', async () => {
     const result = await service.releaseByThread('user-1', 'pr:100');
-    expect(result).toEqual({ released: 2, deferred: 0, removed: 0 });
+    expect(result).toEqual({
+      released: 2,
+      deferred: 0,
+      removed: 0,
+      studioIds: ['studio-1', 'studio-2'],
+    });
     expect(tables.studios[0].lease).toBeNull();
     expect(tables.studios[1].lease).toBeNull();
   });
@@ -1317,7 +1327,12 @@ describe('StudioLeaseService release paths', () => {
     });
 
     const result = await service.releaseByThread('user-1', 'pr:100', { reason: 'thread-closed' });
-    expect(result).toEqual({ released: 1, deferred: 1, removed: 0 });
+    expect(result).toEqual({
+      released: 1,
+      deferred: 1,
+      removed: 0,
+      studioIds: ['studio-1', 'studio-2'],
+    });
     // The live holder keeps its lease — marked, not cleared.
     const marked = tables.studios[0].lease as StudioLease;
     expect(marked.sessionId).toBe('session-a');
@@ -2672,7 +2687,7 @@ describe('S2: the minimal close invariant (spec v18, Lumen r2)', () => {
     const service = new StudioLeaseService(makeFakeSupabase(tables));
 
     const result = await service.releaseByThread('user-1', 'pr:A', { reason: 'thread-closed' });
-    expect(result).toEqual({ released: 0, deferred: 0, removed: 1 });
+    expect(result).toEqual({ released: 0, deferred: 0, removed: 1, studioIds: ['studio-1'] });
     // The lease, the holder, and the worktree all survive for pr:B.
     expect(storedLease()?.sessionId).toBe('session-b');
     expect(storedLease()?.threadKeys).toEqual(['pr:B']);
@@ -2690,7 +2705,7 @@ describe('S2: the minimal close invariant (spec v18, Lumen r2)', () => {
     const service = new StudioLeaseService(makeFakeSupabase(tables));
 
     const result = await service.releaseByThread('user-1', 'pr:A', { reason: 'thread-closed' });
-    expect(result).toEqual({ released: 0, deferred: 1, removed: 0 });
+    expect(result).toEqual({ released: 0, deferred: 1, removed: 0, studioIds: ['studio-1'] });
     expect(storedLease()?.threadKeys).toEqual(['pr:A']);
     expect(storedLease()?.pendingRelease?.reason).toBe('thread-closed');
   });
@@ -2704,7 +2719,7 @@ describe('S2: the minimal close invariant (spec v18, Lumen r2)', () => {
     const service = new StudioLeaseService(makeFakeSupabase(tables));
 
     const result = await service.releaseByThread('user-1', 'pr:B', { reason: 'thread-closed' });
-    expect(result).toEqual({ released: 1, deferred: 0, removed: 0 });
+    expect(result).toEqual({ released: 1, deferred: 0, removed: 0, studioIds: ['studio-1'] });
     expect(storedLease()).toBeNull();
     expect(tables.studio_lease_events.map((e) => e.event)).toContain('released');
   });
@@ -2718,7 +2733,7 @@ describe('S2: the minimal close invariant (spec v18, Lumen r2)', () => {
     const service = new StudioLeaseService(makeFakeSupabase(tables));
 
     const result = await service.releaseByThread('user-1', 'pr:A', { reason: 'thread-closed' });
-    expect(result).toEqual({ released: 0, deferred: 0, removed: 0 });
+    expect(result).toEqual({ released: 0, deferred: 0, removed: 0, studioIds: [] });
     expect(storedLease()?.threadKeys).toEqual(['pr:B']);
   });
 
@@ -2746,8 +2761,73 @@ describe('S2: the minimal close invariant (spec v18, Lumen r2)', () => {
     // must stay closed. The re-read finds pr:A is now the last key, and the
     // live holder defers it — the honest outcome for that state.
     expect(storedLease()?.threadKeys).toEqual(['pr:A']);
-    expect(result).toEqual({ released: 0, deferred: 1, removed: 0 });
+    expect(result).toEqual({ released: 0, deferred: 1, removed: 0, studioIds: ['studio-1'] });
     expect(storedLease()?.pendingRelease?.reason).toBe('thread-closed');
+  });
+
+  it('a last-key close racing an APPEND re-decides — the appended thread is never deferred to death (Lumen r1 P1-1)', async () => {
+    // Close A reads [A] and decides "last"; the live holder appends B before
+    // the stamp lands. A blindly-retried whole-lease pendingRelease would
+    // stamp [A,B] and clear live B at the holder's next boundary. The stamp
+    // is a single exact-state CAS: it loses, the re-read sees [A,B], and the
+    // close correctly demotes itself to a key-remove.
+    tables.studios[0].lease = freshLease({
+      sessionId: 'session-b',
+      threadKey: 'pr:A',
+      threadKeys: ['pr:A'],
+    }) as unknown as Row;
+    liveHolder();
+    const service = new StudioLeaseService(
+      makeFakeSupabase(tables, {
+        beforeUpdate: (table, count) => {
+          if (table === 'studios' && count === 1) {
+            const current = tables.studios[0].lease as StudioLease;
+            tables.studios[0].lease = {
+              ...current,
+              threadKeys: ['pr:A', 'pr:B'],
+              heartbeatAt: new Date(Date.now() + 5).toISOString(),
+            } as unknown as Row;
+          }
+        },
+      })
+    );
+
+    const result = await service.releaseByThread('user-1', 'pr:A', { reason: 'thread-closed' });
+    expect(result).toEqual({ released: 0, deferred: 0, removed: 1, studioIds: ['studio-1'] });
+    expect(storedLease()?.threadKeys).toEqual(['pr:B']);
+    // The whole lease was NOT marked for release — B lives on undisturbed.
+    expect(storedLease()?.pendingRelease).toBeUndefined();
+  });
+
+  it('a last-key RELEASE racing an APPEND re-decides — closed A never strands in the set (Lumen r1 P1-1)', async () => {
+    // Same race on the not-live path: the clear CAS loses to the append.
+    // Returning 'none' here would leave closed A riding the lease forever;
+    // the re-read demotes the close to a key-remove instead.
+    tables.studios[0].lease = staleLease({
+      sessionId: 'session-b',
+      threadKey: 'pr:A',
+      threadKeys: ['pr:A'],
+    }) as unknown as Row;
+    const service = new StudioLeaseService(
+      makeFakeSupabase(tables, {
+        beforeUpdate: (table, count) => {
+          if (table === 'studios' && count === 1) {
+            const current = tables.studios[0].lease as StudioLease;
+            tables.studios[0].lease = {
+              ...current,
+              threadKeys: ['pr:A', 'pr:B'],
+              heartbeatAt: new Date().toISOString(),
+            } as unknown as Row;
+          }
+        },
+      })
+    );
+
+    const result = await service.releaseByThread('user-1', 'pr:A', { reason: 'thread-closed' });
+    expect(result).toEqual({ released: 0, deferred: 0, removed: 1, studioIds: ['studio-1'] });
+    expect(storedLease()?.sessionId).toBe('session-b'); // lease survives for B
+    expect(storedLease()?.threadKeys).toEqual(['pr:B']); // A is gone, not stranded
+    expect(tables.studio_lease_events.map((e) => e.event)).not.toContain('released');
   });
 
   it('teardown claim is refused while another live key remains', async () => {

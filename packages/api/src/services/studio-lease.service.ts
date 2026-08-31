@@ -1467,10 +1467,17 @@ export class StudioLeaseService {
     let released = 0;
     let deferred = 0;
     let removed = 0;
+    // Every studio whose lease the thread rode, whatever the outcome — the
+    // caller feeds these to ephemeral teardown as candidates, because after a
+    // whole-lease release nothing on the row remembers the closing thread
+    // (`studios.thread_key` is the CREATED-FOR thread, and the last live key
+    // need not be it — Lumen r1 P1-2).
+    const studioIds: string[] = [];
     for (const row of data) {
       const initial = parseStudioLease(row.lease);
       if (!initial || initial.quarantined) continue;
       if (!leaseThreadKeys(initial).includes(threadKey)) continue;
+      studioIds.push(row.id);
       const outcome = await this.releaseThreadFromLease(
         row.id,
         row.user_id,
@@ -1483,7 +1490,7 @@ export class StudioLeaseService {
       else if (outcome === 'deferred') deferred += 1;
       else if (outcome === 'removed') removed += 1;
     }
-    return { released, deferred, removed };
+    return { released, deferred, removed, studioIds };
   }
 
   /**
@@ -1511,29 +1518,49 @@ export class StudioLeaseService {
       const remaining = leaseThreadKeys(lease).filter((k) => k !== threadKey);
 
       if (remaining.length === 0) {
-        // Last key — the whole-lease paths carry their own retry semantics.
+        // Last key — but "last" is only true until proven by a winning CAS.
+        // An append racing this close turns [A] into [A,B] between our read
+        // and our write; a whole-lease stamp or clear that retried blindly
+        // from the NEW state would defer live B to death at the holder's
+        // boundary, and a plain failure would strand closed A in the set
+        // (Lumen r1 P1-1). So both transitions here are SINGLE exact-state
+        // CASes — a loss falls through to the re-read, which re-decides the
+        // branch from what actually won.
         // Same conservative rule as adoption: a fresh non-terminal holder is
         // presumed live (admission gap) — defer, never clear.
         if (!(await this.canReleaseNow(lease, userId))) {
-          const marked = await this.markPendingRelease(studioId, userId, lease, reason);
-          return marked ? 'deferred' : 'none';
+          const marked: StudioLease = {
+            ...lease,
+            pendingRelease: { reason, requestedAt: new Date().toISOString() },
+          };
+          if (await this.casLease(studioId, userId, lease, marked)) {
+            logger.info('[StudioLease] Release deferred to holder boundary (pendingRelease)', {
+              studioId,
+              sessionId: lease.sessionId,
+              reason,
+            });
+            return 'deferred';
+          }
+        } else if (
+          await this.releaseStudio(studioId, userId, lease, worktreePath, {
+            reason,
+            closingThreadKey: threadKey,
+          })
+        ) {
+          return 'released';
         }
-        const ok = await this.releaseStudio(studioId, userId, lease, worktreePath, {
-          reason,
-          closingThreadKey: threadKey,
-        });
-        return ok ? 'released' : 'none';
-      }
-
-      const trimmed: StudioLease = { ...lease, threadKeys: remaining };
-      if (await this.casLease(studioId, userId, lease, trimmed)) {
-        logger.info('[StudioLease] Thread key removed from multiplexed lease', {
-          studioId,
-          sessionId: lease.sessionId,
-          threadKey,
-          remaining,
-        });
-        return 'removed';
+        // Lost the CAS — fall through to re-read and re-decide.
+      } else {
+        const trimmed: StudioLease = { ...lease, threadKeys: remaining };
+        if (await this.casLease(studioId, userId, lease, trimmed)) {
+          logger.info('[StudioLease] Thread key removed from multiplexed lease', {
+            studioId,
+            sessionId: lease.sessionId,
+            threadKey,
+            remaining,
+          });
+          return 'removed';
+        }
       }
 
       const reread = await this.getLease(studioId, userId);
