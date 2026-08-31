@@ -7228,7 +7228,11 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
       unknown
     >;
     res.json({
-      success: parsed.success !== false,
+      // The handler folds trigger-routing outcomes into its own `success`,
+      // so a stored message with a failed wake reads as failure there. For
+      // this route success means what the person asked: "is my reply in the
+      // thread" — the messageId is the proof.
+      success: parsed.messageId != null || parsed.success !== false,
       messageId: parsed.messageId ?? null,
       threadId: parsed.threadId ?? thread.id,
       triggered: parsed.triggered ?? null,

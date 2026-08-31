@@ -189,6 +189,24 @@ describe('POST /threads/reply', () => {
     expect(args.metadata).toMatchObject({ sentBy: 'user' });
   });
 
+  it('reports success when the message stored even if every trigger failed', async () => {
+    // The inbox handler folds trigger outcomes into its `success`; a user
+    // whose reply IS in the thread must not be told the send failed just
+    // because a wake bounced. Observed live: fresh user, both participants'
+    // triggers failed, message stored — handler said success:false.
+    mockThreadLookup({ id: 'thread-1', thread_key: 'pr:545', status: 'open' });
+    mockGetParticipants.mockResolvedValue(['wren']);
+    mockHandleSendToInbox.mockResolvedValue(
+      sendToInboxResult({ success: false, messageId: 'msg-10', threadId: 'thread-1' })
+    );
+
+    const res = createRes();
+    await reply(createReq({ key: 'pr:545', content: 'stored but not woken' }), res);
+
+    expect(res._status).toBe(200);
+    expect(res._json).toMatchObject({ success: true, messageId: 'msg-10' });
+  });
+
   it('surfaces the handler failure instead of claiming success', async () => {
     mockThreadLookup({ id: 'thread-1', thread_key: 'pr:545', status: 'open' });
     mockGetParticipants.mockResolvedValue(['wren']);
