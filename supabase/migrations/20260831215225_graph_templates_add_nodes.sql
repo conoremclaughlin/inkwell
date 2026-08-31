@@ -154,6 +154,45 @@ BEGIN
       'slugs', v_invalid);
   END IF;
 
+  -- An EXISTING slug is reused, never rewritten — so it has to be the node
+  -- the template is promising. Without this, a work node happening to be
+  -- called 'sibling-review' silently stands in for the gate: the call
+  -- succeeds, the revision records pr-ship with a config hash describing a
+  -- graph containing a gate, and nothing in that graph gates anything
+  -- (Lumen, pr:555 blocker 1).
+  --
+  -- Compared: task_type, and a gate's principal. NOT the requirements —
+  -- those are a checklist whose wording is expected to drift between
+  -- template versions, and refusing on them would make a reworded template
+  -- unable to re-run.
+  SELECT jsonb_agg(jsonb_build_object(
+           'slug', p.slug, 'problem', conflict.problem,
+           'existing', conflict.existing, 'promised', conflict.promised))
+  INTO v_invalid
+  FROM _proposed_nodes p
+  JOIN tasks t ON t.task_group_id = p_task_group_id AND t.user_id = p_user_id
+               AND t.node_slug = p.slug
+  CROSS JOIN LATERAL (
+    SELECT
+      CASE
+        WHEN t.task_type IS DISTINCT FROM p.task_type THEN 'type-differs'
+        WHEN p.task_type = 'verification'
+             AND (t.assignee_identity_id IS DISTINCT FROM p.assignee_identity_id
+               OR t.assignee_user_id IS DISTINCT FROM p.assignee_user_id)
+          THEN 'assignee-differs'
+        ELSE NULL
+      END AS problem,
+      CASE WHEN t.task_type IS DISTINCT FROM p.task_type THEN t.task_type
+           ELSE coalesce(t.assignee_identity_id, t.assignee_user_id)::text END AS existing,
+      CASE WHEN t.task_type IS DISTINCT FROM p.task_type THEN p.task_type
+           ELSE coalesce(p.assignee_identity_id, p.assignee_user_id)::text END AS promised
+  ) conflict
+  WHERE conflict.problem IS NOT NULL;
+  IF v_invalid IS NOT NULL THEN
+    RETURN jsonb_build_object('success', false, 'reason', 'existing-node-conflict',
+      'conflicts', v_invalid);
+  END IF;
+
   -- ── Edge resolution, SYMBOLIC — before anything is written ──────────
   --
   -- Validation runs to completion before the first INSERT. A structured
@@ -165,19 +204,42 @@ BEGIN
   -- its node_slug, falling back to its UUID for rows authored before slugs.
   -- Proposed nodes join the key space unwritten, so an edge may reference a
   -- node this very call is about to create.
+  -- Keys are NAMESPACED. An earlier cut keyed existing rows on
+  -- coalesce(node_slug, id::text), which put slugs and UUIDs in one
+  -- namespace: a proposed slug spelled like a slugless legacy node's UUID
+  -- was suppressed as "already present", so validation reasoned about the
+  -- old node while the write loop created a new one (Lumen, pr:555
+  -- blocker 4). Disjoint prefixes make that collision unrepresentable.
   DROP TABLE IF EXISTS _node_keys;
   CREATE TEMP TABLE _node_keys ON COMMIT DROP AS
-  SELECT coalesce(t.node_slug, t.id::text) AS key, t.id, t.task_type, t.gate_state
+  SELECT
+    CASE WHEN t.node_slug IS NOT NULL THEN 'slug:' || t.node_slug
+         ELSE 'id:' || t.id::text END AS key,
+    t.id, t.task_type, t.gate_state
   FROM tasks t
   WHERE t.task_group_id = p_task_group_id AND t.user_id = p_user_id;
 
+  -- Existence is decided on node_slug against the real table, never on the
+  -- key space, so a UUID-shaped slug is still a slug.
   INSERT INTO _node_keys (key, id, task_type, gate_state)
-  SELECT p.slug, NULL, p.task_type, NULL
+  SELECT 'slug:' || p.slug, NULL, p.task_type, NULL
   FROM _proposed_nodes p
-  WHERE NOT EXISTS (SELECT 1 FROM _node_keys k WHERE k.key = p.slug);
+  WHERE NOT EXISTS (
+    SELECT 1 FROM tasks t
+    WHERE t.task_group_id = p_task_group_id AND t.user_id = p_user_id
+      AND t.node_slug = p.slug);
 
-  -- A reference resolves as a slug first: a slug is scoped to this group, a
-  -- UUID that happens to spell one is not this group's business.
+  -- A reference resolves by SLUG first, then by the node's actual id.
+  -- Matching the id on the column rather than on an 'id:' key is what keeps
+  -- a slugged node addressable by UUID: its key is 'slug:<slug>', so a key
+  -- comparison alone would have made every slugged node unreferenceable by
+  -- id — a regression the apply_task_graph parity tests caught immediately,
+  -- since those address every endpoint by UUID.
+  --
+  -- A proposed node has a NULL id, so it can never be hit by the id branch:
+  -- you cannot reference a node that does not exist yet by a UUID it does
+  -- not have. Slug-first also settles the pathological case: if a new node's
+  -- slug spells an existing node's UUID, that string means the new node.
   DROP TABLE IF EXISTS _resolved_edges;
   CREATE TEMP TABLE _resolved_edges ON COMMIT DROP AS
   SELECT DISTINCT e ->> 'from' AS from_ref, e ->> 'to' AS to_ref,
@@ -185,13 +247,13 @@ BEGIN
   FROM jsonb_array_elements(coalesce(p_edges, '[]'::jsonb)) e
   LEFT JOIN LATERAL (
     SELECT k.key FROM _node_keys k
-    WHERE k.key = e ->> 'from' OR k.id::text = e ->> 'from'
-    ORDER BY (k.key = e ->> 'from') DESC LIMIT 1
+    WHERE k.key = 'slug:' || (e ->> 'from') OR k.id::text = e ->> 'from'
+    ORDER BY (k.key = 'slug:' || (e ->> 'from')) DESC LIMIT 1
   ) fk ON true
   LEFT JOIN LATERAL (
     SELECT k.key FROM _node_keys k
-    WHERE k.key = e ->> 'to' OR k.id::text = e ->> 'to'
-    ORDER BY (k.key = e ->> 'to') DESC LIMIT 1
+    WHERE k.key = 'slug:' || (e ->> 'to') OR k.id::text = e ->> 'to'
+    ORDER BY (k.key = 'slug:' || (e ->> 'to')) DESC LIMIT 1
   ) tk ON true;
 
   SELECT jsonb_agg(jsonb_build_object('from', from_ref, 'to', to_ref,
@@ -213,7 +275,11 @@ BEGIN
   CREATE TEMP TABLE _union_edges ON COMMIT DROP AS
   SELECT from_key, to_key FROM _resolved_edges
   UNION
-  SELECT coalesce(fs.node_slug, fs.id::text), coalesce(ts.node_slug, ts.id::text)
+  SELECT
+    CASE WHEN fs.node_slug IS NOT NULL THEN 'slug:' || fs.node_slug
+         ELSE 'id:' || fs.id::text END,
+    CASE WHEN ts.node_slug IS NOT NULL THEN 'slug:' || ts.node_slug
+         ELSE 'id:' || ts.id::text END
   FROM task_edges te
   JOIN tasks fs ON fs.id = te.from_task
   JOIN tasks ts ON ts.id = te.to_task
@@ -289,7 +355,7 @@ BEGIN
       v_next_order, coalesce(p_constructor, 'graph-template')
     ) RETURNING id INTO v_new_id;
 
-    UPDATE _node_keys SET id = v_new_id WHERE key = v_node.slug;
+    UPDATE _node_keys SET id = v_new_id WHERE key = 'slug:' || v_node.slug;
     v_next_order := v_next_order + 1;
     v_nodes_added := v_nodes_added || jsonb_build_object(
       'slug', v_node.slug, 'id', v_new_id, 'type', v_node.task_type,
@@ -311,6 +377,28 @@ BEGIN
   JOIN _node_keys t ON t.key = n.to_key;
 
   -- ── Version, revision, fresh windows ──────────────────────────────────
+  --
+  -- A call that added no node and no edge changed nothing, so it must not
+  -- bump the version or append a revision: doing so invalidates a concurrent
+  -- holder's CAS and writes a revision row describing no change. This is the
+  -- one place the two mutation paths deliberately DIVERGE — apply_task_graph
+  -- bumps unconditionally, and matching that would be duplicating debt
+  -- rather than honouring a contract (Lumen, pr:555 blocker 5).
+  --
+  -- Readiness is still evaluated. Nothing about the graph moved, but time
+  -- may have (a dwelling gate can have become eligible), and evaluation is
+  -- idempotent — the sweep would do the same.
+  IF jsonb_array_length(v_nodes_added) = 0 AND jsonb_array_length(v_edges_added) = 0 THEN
+    IF v_group.status = 'active' THEN
+      v_eval := _graph_evaluate_group(p_user_id, p_task_group_id);
+    END IF;
+    RETURN jsonb_build_object('success', true, 'noop', true,
+      'graphVersion', v_current_version,
+      'nodesAdded', v_nodes_added, 'nodesExisting', v_nodes_existing,
+      'edgesAdded', v_edges_added, 'resetGates', '[]'::jsonb,
+      'evaluation', v_eval, 'evaluationDeferred', v_group.status <> 'active');
+  END IF;
+
   v_new_version := v_current_version + 1;
   UPDATE task_groups SET graph_version = v_new_version WHERE id = p_task_group_id;
 
@@ -368,7 +456,8 @@ BEGIN
     v_eval := _graph_evaluate_group(p_user_id, p_task_group_id);
   END IF;
 
-  RETURN jsonb_build_object('success', true, 'graphVersion', v_new_version,
+  RETURN jsonb_build_object('success', true, 'noop', false,
+    'graphVersion', v_new_version,
     'nodesAdded', v_nodes_added, 'nodesExisting', v_nodes_existing,
     'edgesAdded', v_edges_added, 'resetGates', v_reset,
     'evaluation', v_eval, 'evaluationDeferred', v_group.status <> 'active');

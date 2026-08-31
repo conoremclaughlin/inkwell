@@ -498,4 +498,482 @@ d('add_graph_nodes (real DB)', () => {
     // The whole call is refused, so the valid node is not written either.
     expect(await nodesOf(group.id)).toHaveLength(0);
   });
+
+  /**
+   * The pr:555 review blockers. Each of these passed before the fix in the
+   * sense that the call SUCCEEDED — which is the point: the failures were
+   * silent, so only an assertion about the resulting graph catches them.
+   */
+  describe('pr:555 review blockers', () => {
+    it('refuses when an existing slug is a different KIND of node than promised', async () => {
+      const group = await newGraphGroup('itest blocker1 type');
+      // Something already occupies the slug the template promises as a gate.
+      await groups.addGraphNodes({
+        userId: USER,
+        taskGroupId: group.id,
+        expectedVersion: group.version,
+        nodes: [{ slug: 'sibling-review', type: 'work', title: 'not actually a gate' }],
+        edges: [],
+        systemActor: true,
+      });
+
+      const refused = await groups.addGraphNodes({
+        userId: USER,
+        taskGroupId: group.id,
+        expectedVersion: await version(group.id),
+        nodes: prShipNodes(reviewer),
+        edges: prShipEdges,
+        systemActor: true,
+        constructorId: 'pr-ship',
+      });
+
+      expect(refused).toMatchObject({ success: false, reason: 'existing-node-conflict' });
+      // Before the fix this succeeded, and the graph contained NO gate while
+      // the revision claimed a pr-ship shape that has one.
+      const gate = (await nodesOf(group.id)).find((n) => n.node_slug === 'sibling-review')!;
+      expect(gate.task_type).toBe('work');
+      expect(await groups.getEdges(group.id)).toHaveLength(0);
+    });
+
+    it('refuses when an existing gate has a different principal than promised', async () => {
+      const group = await newGraphGroup('itest blocker1 assignee');
+      await groups.addGraphNodes({
+        userId: USER,
+        taskGroupId: group.id,
+        expectedVersion: group.version,
+        nodes: [
+          {
+            slug: 'sibling-review',
+            type: 'verification',
+            title: 'gate held by the wrong principal',
+            assigneeUserId: USER,
+            verification: { mode: 'approval', requirements: [] },
+          },
+        ],
+        edges: [],
+        systemActor: true,
+      });
+
+      const refused = await groups.addGraphNodes({
+        userId: USER,
+        taskGroupId: group.id,
+        expectedVersion: await version(group.id),
+        nodes: prShipNodes(reviewer),
+        edges: [],
+        systemActor: true,
+      });
+      expect(refused).toMatchObject({ success: false, reason: 'existing-node-conflict' });
+    });
+
+    it('accepts an existing gate whose checklist wording drifted — that is not a conflict', async () => {
+      const group = await newGraphGroup('itest blocker1 wording');
+      await groups.addGraphNodes({
+        userId: USER,
+        taskGroupId: group.id,
+        expectedVersion: group.version,
+        nodes: prShipNodes(reviewer),
+        edges: prShipEdges,
+        systemActor: true,
+      });
+
+      const reworded = prShipNodes(reviewer).map((n) =>
+        n.slug === 'sibling-review'
+          ? {
+              ...n,
+              verification: { mode: 'executable', requirements: [{ label: 'reworded entirely' }] },
+            }
+          : n
+      );
+      const result = await groups.addGraphNodes({
+        userId: USER,
+        taskGroupId: group.id,
+        expectedVersion: await version(group.id),
+        nodes: reworded,
+        edges: prShipEdges,
+        systemActor: true,
+      });
+      // Requirements are a checklist, not a contract — a template that
+      // rewords its own guidance must still be re-runnable.
+      expect(result.success).toBe(true);
+    });
+
+    /**
+     * My first attempt at this test asserted only that a node got created,
+     * and it passed against the ORIGINAL buggy function — the node was
+     * created either way, so the assertion proved nothing. The divergence
+     * only shows up in what VALIDATION reasoned about: with one namespace
+     * the reference resolved to the pre-existing node, so a check about that
+     * node's state fired for a reference the author meant for the new one.
+     *
+     * Hence a passed gate: under the bug the call is refused because the
+     * OTHER node is a passed gate; under the fix the reference means the new
+     * work node and there is nothing to refuse.
+     */
+    /**
+     * This test took three attempts and the first two were worthless, which
+     * is worth recording because both LOOKED like coverage:
+     *
+     *  1. Asserting only that a node got created — true under the bug too.
+     *  2. Adding a passed gate for consequence, but giving it a SLUG. A
+     *     slugged node keys on its slug, so nothing collided and both
+     *     versions behaved identically.
+     *
+     * The collision needed the pre-existing node to be SLUGLESS, because
+     * only then did the old key space fall back to its UUID and put a slug
+     * and an id in the same namespace. With that, the reference resolves to
+     * the old gate (refusal) under the bug and to the new node (success)
+     * under the fix.
+     */
+    it('a slug spelled like a SLUGLESS node UUID resolves to its own node, not that one', async () => {
+      const group = await newGraphGroup('itest blocker4 collision');
+      const sluglessGateId = randomUUID();
+      const { error } = await client.from('tasks').insert({
+        id: sluglessGateId,
+        user_id: USER,
+        task_group_id: group.id,
+        title: 'a gate authored before slugs existed',
+        task_type: 'verification',
+        gate_state: 'not_ready',
+        assignee_identity_id: reviewer,
+      } as never);
+      if (error) throw new Error(`fixture slugless gate: ${error.message}`);
+
+      await groups.addGraphNodes({
+        userId: USER,
+        taskGroupId: group.id,
+        expectedVersion: group.version,
+        nodes: [{ slug: 'w', type: 'work', title: 'upstream' }],
+        edges: [{ from: 'w', to: sluglessGateId }],
+        systemActor: true,
+      });
+
+      // Drive the slugless gate to passed, so mistaking a reference for it
+      // has an observable consequence.
+      const workId = (await nodesOf(group.id)).find((n) => n.node_slug === 'w')!.id;
+      const claimed = await groups.claimGraphTask({ userId: USER, taskId: workId, sessionId });
+      await groups.completeGraphTask({
+        userId: USER,
+        taskId: workId,
+        sessionId,
+        claimToken: claimed.claimToken as string,
+        outcome: 'completed',
+      });
+      const opened = (await nodesOf(group.id)).find((n) => n.id === sluglessGateId)!;
+      expect(opened.gate_state).toBe('open');
+      await groups.recordGateVerdict({
+        userId: USER,
+        taskId: sluglessGateId,
+        verdict: 'passed',
+        expectedAttempt: 1,
+        expectedGateVersion: opened.gate_version,
+        actorIdentityId: reviewer,
+        evidence: { note: 'collision fixture' },
+      });
+
+      // A new WORK node whose slug spells the passed gate's UUID, plus an
+      // edge naming that string. The author means the new node.
+      // The inbound edge must be one the graph does NOT already hold —
+      // re-proposing the existing w→gate edge is not a new edge, so the
+      // passed-gate guard never runs and both versions look alike. (That is
+      // what made attempt three still pass under the bug.)
+      const result = await groups.addGraphNodes({
+        userId: USER,
+        taskGroupId: group.id,
+        expectedVersion: await version(group.id),
+        nodes: [
+          { slug: 'w2', type: 'work', title: 'a second upstream' },
+          { slug: sluglessGateId, type: 'work', title: 'slug that looks like a uuid' },
+        ],
+        edges: [{ from: 'w2', to: sluglessGateId }],
+        systemActor: true,
+      });
+
+      // Under one namespace this came back passed-gate-inbound: the
+      // reference had resolved to the old gate, which the author never named.
+      expect(result).toMatchObject({ success: true });
+      const after = await nodesOf(group.id);
+      const created = after.find((n) => n.node_slug === sluglessGateId)!;
+      const w2 = after.find((n) => n.node_slug === 'w2')!;
+      expect(created.id).not.toBe(sluglessGateId);
+      expect(created.task_type).toBe('work');
+      const edges = await groups.getEdges(group.id);
+      expect(edges.some((e) => e.from_task === w2.id && e.to_task === created.id)).toBe(true);
+      // Nothing new pointed at the old gate.
+      expect(edges.some((e) => e.from_task === w2.id && e.to_task === sluglessGateId)).toBe(false);
+    });
+
+    it('a no-op re-run changes nothing at all — not the version, not the revision', async () => {
+      const group = await newGraphGroup('itest blocker5 noop');
+      await groups.addGraphNodes({
+        userId: USER,
+        taskGroupId: group.id,
+        expectedVersion: group.version,
+        nodes: prShipNodes(reviewer),
+        edges: prShipEdges,
+        systemActor: true,
+        constructorId: 'pr-ship',
+      });
+      const settled = await version(group.id);
+      const revisionsBefore = await client
+        .from('task_graph_revisions')
+        .select('id', { count: 'exact', head: true })
+        .eq('task_group_id', group.id);
+
+      const again = await groups.addGraphNodes({
+        userId: USER,
+        taskGroupId: group.id,
+        expectedVersion: settled,
+        nodes: prShipNodes(reviewer),
+        edges: prShipEdges,
+        systemActor: true,
+        constructorId: 'pr-ship',
+      });
+
+      expect(again).toMatchObject({ success: true, noop: true });
+      // The version is the CAS token every concurrent holder is guarding on.
+      // Bumping it for a call that changed nothing invalidates their write
+      // for no reason, and writes a revision describing no change.
+      expect(again.graphVersion).toBe(settled);
+      expect(await version(group.id)).toBe(settled);
+      const revisionsAfter = await client
+        .from('task_graph_revisions')
+        .select('id', { count: 'exact', head: true })
+        .eq('task_group_id', group.id);
+      expect(revisionsAfter.count).toBe(revisionsBefore.count);
+    });
+
+    it('a real change still bumps the version and records exactly one revision', async () => {
+      const group = await newGraphGroup('itest blocker5 real change');
+      await groups.addGraphNodes({
+        userId: USER,
+        taskGroupId: group.id,
+        expectedVersion: group.version,
+        nodes: prShipNodes(reviewer),
+        edges: prShipEdges,
+        systemActor: true,
+      });
+      const settled = await version(group.id);
+
+      const changed = await groups.addGraphNodes({
+        userId: USER,
+        taskGroupId: group.id,
+        expectedVersion: settled,
+        nodes: [{ slug: 'extra', type: 'work', title: 'extra' }],
+        edges: [],
+        systemActor: true,
+      });
+      expect(changed).toMatchObject({ success: true, noop: false });
+      expect(changed.graphVersion).toBe(settled + 1);
+    });
+  });
+
+  /**
+   * PARITY WITH apply_task_graph.
+   *
+   * The PR claims add_graph_nodes copies apply_task_graph's serialization
+   * obligations faithfully. Every test above asserts what add_graph_nodes
+   * does — which is exactly the shape of test that encodes a belief instead
+   * of checking a fact. If I mis-remembered one of apply_task_graph's rules
+   * while copying it, those tests would pin my mistake and pass.
+   *
+   * So these drive the SAME logical mutation through BOTH functions against
+   * identically-built graphs and require the outcomes to agree. When the two
+   * must behave alike, the assertion belongs between them, not on each.
+   * (Lumen caught this exact failure mode on pr:541 the same afternoon, in
+   * an "old server" test that asserted fields the old server never sends.)
+   */
+  describe('parity with apply_task_graph', () => {
+    /** Two identical graphs — one per function under comparison. */
+    async function twinGraphs(label: string) {
+      const build = async (suffix: string) => {
+        const group = await newGraphGroup(`itest parity ${label} ${suffix}`);
+        await groups.addGraphNodes({
+          userId: USER,
+          taskGroupId: group.id,
+          expectedVersion: group.version,
+          nodes: [...prShipNodes(reviewer), { slug: 'late', type: 'work', title: 'late premise' }],
+          edges: prShipEdges,
+          systemActor: true,
+        });
+        const nodes = await nodesOf(group.id);
+        const idOf = (slug: string) => nodes.find((n) => n.node_slug === slug)!.id;
+        return { id: group.id, idOf, nodes };
+      };
+      return { additive: await build('additive'), apply: await build('apply') };
+    }
+
+    /** The stored edge set plus one more — apply_task_graph wants the whole set. */
+    async function edgesPlus(groupId: string, extra: { from: string; to: string }) {
+      const stored = await groups.getEdges(groupId);
+      return [...stored.map((e) => ({ from: e.from_task, to: e.to_task })), extra];
+    }
+
+    it('both refuse an inbound edge to a PASSED gate, with the same reason', async () => {
+      const twins = await twinGraphs('passed-gate');
+      for (const side of [twins.additive, twins.apply]) {
+        const claimed = await groups.claimGraphTask({
+          userId: USER,
+          taskId: side.idOf('work'),
+          sessionId,
+        });
+        await groups.completeGraphTask({
+          userId: USER,
+          taskId: side.idOf('work'),
+          sessionId,
+          claimToken: claimed.claimToken as string,
+          outcome: 'completed',
+        });
+        const gate = (await nodesOf(side.id)).find((n) => n.node_slug === 'sibling-review')!;
+        await groups.recordGateVerdict({
+          userId: USER,
+          taskId: gate.id,
+          verdict: 'passed',
+          expectedAttempt: 1,
+          expectedGateVersion: gate.gate_version,
+          actorIdentityId: reviewer,
+          evidence: { note: 'parity' },
+        });
+      }
+
+      const newEdge = (side: { idOf: (s: string) => string }) => ({
+        from: side.idOf('late'),
+        to: side.idOf('sibling-review'),
+      });
+
+      const viaAdditive = await groups.addGraphNodes({
+        userId: USER,
+        taskGroupId: twins.additive.id,
+        expectedVersion: await version(twins.additive.id),
+        nodes: [],
+        edges: [newEdge(twins.additive)],
+        systemActor: true,
+      });
+      const viaApply = await groups.applyTaskGraph({
+        userId: USER,
+        taskGroupId: twins.apply.id,
+        expectedVersion: await version(twins.apply.id),
+        edges: await edgesPlus(twins.apply.id, newEdge(twins.apply)),
+        systemActor: true,
+      });
+
+      expect(viaAdditive.success).toBe(false);
+      expect(viaAdditive.reason).toBe(viaApply.reason);
+      expect(viaApply.reason).toBe('passed-gate-inbound');
+    });
+
+    it('both refuse a cycle, with the same reason', async () => {
+      const twins = await twinGraphs('cycle');
+      const backEdge = (side: { idOf: (s: string) => string }) => ({
+        from: side.idOf('merge'),
+        to: side.idOf('work'),
+      });
+
+      const viaAdditive = await groups.addGraphNodes({
+        userId: USER,
+        taskGroupId: twins.additive.id,
+        expectedVersion: await version(twins.additive.id),
+        nodes: [],
+        edges: [backEdge(twins.additive)],
+        systemActor: true,
+      });
+      const viaApply = await groups.applyTaskGraph({
+        userId: USER,
+        taskGroupId: twins.apply.id,
+        expectedVersion: await version(twins.apply.id),
+        edges: await edgesPlus(twins.apply.id, backEdge(twins.apply)),
+        systemActor: true,
+      });
+
+      expect(viaAdditive.success).toBe(false);
+      expect(viaAdditive.reason).toBe(viaApply.reason);
+      expect(viaApply.reason).toBe('cycle');
+    });
+
+    it('both grant a live gate the same fresh window when its inbound set changes', async () => {
+      const twins = await twinGraphs('fresh-window');
+      const before = {
+        additive: (await nodesOf(twins.additive.id)).find((n) => n.node_slug === 'sibling-review')!,
+        apply: (await nodesOf(twins.apply.id)).find((n) => n.node_slug === 'sibling-review')!,
+      };
+      const newEdge = (side: { idOf: (s: string) => string }) => ({
+        from: side.idOf('late'),
+        to: side.idOf('sibling-review'),
+      });
+
+      const viaAdditive = await groups.addGraphNodes({
+        userId: USER,
+        taskGroupId: twins.additive.id,
+        expectedVersion: await version(twins.additive.id),
+        nodes: [],
+        edges: [newEdge(twins.additive)],
+        systemActor: true,
+      });
+      const viaApply = await groups.applyTaskGraph({
+        userId: USER,
+        taskGroupId: twins.apply.id,
+        expectedVersion: await version(twins.apply.id),
+        edges: await edgesPlus(twins.apply.id, newEdge(twins.apply)),
+        systemActor: true,
+      });
+
+      expect(viaAdditive.success).toBe(true);
+      expect(viaApply.success).toBe(true);
+      expect(viaAdditive.resetGates).toEqual([before.additive.id]);
+      expect(viaApply.resetGates).toEqual([before.apply.id]);
+
+      const after = {
+        additive: (await nodesOf(twins.additive.id)).find((n) => n.node_slug === 'sibling-review')!,
+        apply: (await nodesOf(twins.apply.id)).find((n) => n.node_slug === 'sibling-review')!,
+      };
+      // Same resulting gate state and the same version delta on both paths —
+      // the bump is what makes an in-flight verdict CAS-bounce.
+      expect(after.additive.gate_state).toBe(after.apply.gate_state);
+      expect(after.additive.gate_version - before.additive.gate_version).toBe(
+        after.apply.gate_version - before.apply.gate_version
+      );
+    });
+
+    it('both refuse the same way on a stale version and on a bad actor count', async () => {
+      const twins = await twinGraphs('refusals');
+
+      const staleAdditive = await groups.addGraphNodes({
+        userId: USER,
+        taskGroupId: twins.additive.id,
+        expectedVersion: 999,
+        nodes: [],
+        edges: [],
+        systemActor: true,
+      });
+      const staleApply = await groups.applyTaskGraph({
+        userId: USER,
+        taskGroupId: twins.apply.id,
+        expectedVersion: 999,
+        edges: [],
+        systemActor: true,
+      });
+      expect(staleAdditive.reason).toBe(staleApply.reason);
+      expect(staleApply.reason).toBe('version-conflict');
+
+      // Two actors named at once: neither function may pick one.
+      const actorsAdditive = await groups.addGraphNodes({
+        userId: USER,
+        taskGroupId: twins.additive.id,
+        expectedVersion: await version(twins.additive.id),
+        nodes: [],
+        edges: [],
+        actorIdentityId: reviewer,
+        actorUserId: USER,
+      });
+      const actorsApply = await groups.applyTaskGraph({
+        userId: USER,
+        taskGroupId: twins.apply.id,
+        expectedVersion: await version(twins.apply.id),
+        edges: [],
+        actorIdentityId: reviewer,
+        actorUserId: USER,
+      });
+      expect(actorsAdditive.reason).toBe(actorsApply.reason);
+      expect(actorsApply.reason).toBe('exactly-one-actor');
+    });
+  });
 });

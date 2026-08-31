@@ -314,7 +314,9 @@ export const instantiateGraphTemplateSchema = z.object({
     .boolean()
     .optional()
     .default(true)
-    .describe('Start execution after building (new groups only)'),
+    .describe(
+      'Start execution after building (new groups only). false authors the graph PAUSED, which is what actually keeps the reconciliation sweep from dispatching it — call start_graph_execution when you want it to run.'
+    ),
 });
 
 /**
@@ -362,6 +364,34 @@ export async function handleInstantiateGraphTemplate(
       return mcpResponse({ success: false, error: 'Template emitted no nodes' }, true);
     }
 
+    // Preflight BEFORE any write. add_graph_nodes validates the same things
+    // and is authoritative, but it only runs after the group exists — so a
+    // gate missing its principal (the caller forgot reviewerIdentityId) used
+    // to be discovered one transaction too late, leaving an empty graph-mode
+    // shell behind on refusal (Lumen, pr:555 blocker 3).
+    const shapeProblems = shape.nodes.flatMap((node) => {
+      if (node.type !== 'verification') return [];
+      const principals = [node.assigneeIdentityId, node.assigneeUserId].filter(Boolean).length;
+      if (principals === 1) return [];
+      return [
+        {
+          slug: node.slug,
+          problem: principals === 0 ? 'gate-has-no-principal' : 'gate-has-two-principals',
+        },
+      ];
+    });
+    if (shapeProblems.length > 0) {
+      return mcpResponse(
+        {
+          success: false,
+          error:
+            'Template emitted a gate without exactly one principal. Pass reviewerIdentityId (an agent_identities.id) and, for a visual gate, exactly one of visualSignoffUserId / visualSignoffIdentityId.',
+          problems: shapeProblems,
+        },
+        true
+      );
+    }
+
     const groups = dataComposer.repositories.taskGroups;
     const actorIdentityId = resolveActorIdentityId();
     const actor = actorIdentityId
@@ -381,6 +411,14 @@ export async function handleInstantiateGraphTemplate(
         title: args.title ?? `${template.id}: ${args.subject ?? 'untitled'}`,
         description: template.summary,
         thread_key: args.threadKey,
+        // start:false means author it without waking anyone. An ACTIVE group
+        // is swept — listActiveGraphGroups selects on status='active' — so
+        // leaving it active while skipping startGroup only delayed dispatch
+        // to the next tick rather than preventing it (Lumen, blocker 2).
+        // Paused is the state that actually means "not executing"; the SQL
+        // already defers evaluation for it, and start_graph_execution
+        // activates and sweeps on resume.
+        ...(args.start === false ? { status: 'paused' as const } : {}),
         ...(actorIdentityId ? { sb_id: actorIdentityId } : {}),
       });
       created = true;
