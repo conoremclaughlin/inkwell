@@ -177,11 +177,20 @@ export function buildContinuationBody(
   // Nothing ran. Without saying so, a model reads the results block as ordinary
   // output and either retries the same refused call or writes its answer as if
   // the work had happened.
-  const allRefused =
-    results.length > 0 && !results.some((r) => r.status === 'executed' || r.status === 'approved');
-  const refusalNote = allRefused
-    ? '\n\nNOTE: none of those calls ran — every one was refused. Do not retry them. Work with the tools you do have, and if the task cannot be completed without a refused tool, say so plainly and stop.'
-    : '';
+  //
+  // But WHY nothing ran decides what to say next, and the two answers are
+  // opposites. A refusal is settled: someone denied it or wrote the rule, and
+  // retrying re-asks a question already answered. A failure is not settled at
+  // all — a bad argument, a transient upstream — and correcting it and trying
+  // again is exactly right. Telling a model "every one was refused, do not
+  // retry them" when a validation error named the offending field talks it out
+  // of the one move that would work.
+  const nothingRan = results.length > 0 && !results.some((r) => RAN_STATUSES.has(r.status));
+  const refusalNote = !nothingRan
+    ? ''
+    : hasUnseenFailure(results)
+      ? '\n\nNOTE: none of those calls ran, and at least one FAILED rather than being refused — the error text above says why. A failure is not a refusal: if it names a bad argument or a transient condition, fix it and try again. Do not report the work as done, and do not describe a failure as a refusal.'
+      : '\n\nNOTE: none of those calls ran — every one was refused. Do not retry them. Work with the tools you do have, and if the task cannot be completed without a refused tool, say so plainly and stop.';
 
   return `[Tool results from previous turn]\n${toolResultsSummary}${formatCorrection}${refusalNote}\n\nContinue your response based on these tool results. If you need more tools, emit ink-tool blocks. Otherwise, provide your final answer.`;
 }
