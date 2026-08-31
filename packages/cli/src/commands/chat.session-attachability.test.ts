@@ -3,7 +3,9 @@ import {
   isAttachableSessionSummary,
   listAttachableSessions,
   mergeSessionsWithHistory,
+  sessionNeedsReopen,
 } from './chat.js';
+import type { SessionSummary } from './chat.js';
 
 /**
  * Regression coverage for the picker erasing crashed sessions.
@@ -156,5 +158,68 @@ describe('mergeSessionsWithHistory', () => {
   it('handles either side empty', () => {
     expect(mergeSessionsWithHistory([], [s('a')]).map((x) => x.id)).toEqual(['a']);
     expect(mergeSessionsWithHistory([s('b')], []).map((x) => x.id)).toEqual(['b']);
+  });
+});
+
+/**
+ * The other half of Lumen's P1 (PR #541).
+ *
+ * The server can now reopen a finished session, but only if the CLI asks. The
+ * picker shows history rows precisely so a human can choose one — and choosing
+ * one is the event that makes it not-finished. Anything the picker calls
+ * history must be reopened when picked, or it resumes into a session the
+ * server still considers over: invisible to attachable listing, to active
+ * lookup, and to findByThreadKey, so a trigger can open a second session on
+ * the thread the human is already typing into.
+ */
+describe('sessionNeedsReopen', () => {
+  const base = { id: 's1', status: 'active' } as SessionSummary;
+
+  it.each([
+    ['endedAt set', { ...base, endedAt: '2026-08-30T12:00:00Z' }],
+    ['lifecycle completed', { ...base, lifecycle: 'completed' }],
+    ['phase complete', { ...base, currentPhase: 'complete' }],
+    ['phase complete: with reason', { ...base, currentPhase: 'complete:merged' }],
+    ['status completed', { ...base, status: 'completed' }],
+  ])('requires a reopen for a history row (%s)', (_label, session) => {
+    expect(sessionNeedsReopen(session as SessionSummary)).toBe(true);
+  });
+
+  it.each([
+    ['plain active', base],
+    ['idle', { ...base, lifecycle: 'idle' }],
+    ['crashed but resumable', { ...base, lifecycle: 'failed' }],
+    ['mid-work phase', { ...base, currentPhase: 'implementing' }],
+  ])('does not reopen a live row (%s)', (_label, session) => {
+    expect(sessionNeedsReopen(session as SessionSummary)).toBe(false);
+  });
+
+  /**
+   * The two must stay exact opposites. Defining "needs reopen" as its own list
+   * of terminal markers would drift from the picker's idea of history, and the
+   * drift is silent in the dangerous direction: a row displayed as history but
+   * not reopened looks resumed and is not.
+   */
+  it('is exactly the complement of isAttachableSessionSummary', () => {
+    const candidates: Partial<SessionSummary>[] = [
+      {},
+      { endedAt: '2026-08-30T12:00:00Z' },
+      { lifecycle: 'completed' },
+      { lifecycle: 'failed' },
+      { lifecycle: 'idle' },
+      { currentPhase: 'complete' },
+      { currentPhase: 'complete:done' },
+      { currentPhase: 'reviewing' },
+      { status: 'completed' },
+      { status: 'completed:merged' },
+      { status: 'active' },
+      { status: 'paused' },
+    ];
+    for (const partial of candidates) {
+      const session = { ...base, ...partial } as SessionSummary;
+      expect(sessionNeedsReopen(session), JSON.stringify(partial)).toBe(
+        !isAttachableSessionSummary(session)
+      );
+    }
   });
 });

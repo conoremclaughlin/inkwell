@@ -1552,6 +1552,20 @@ export function isAttachableSessionSummary(session: SessionSummary): boolean {
 }
 
 /**
+ * Does picking this row require an explicit server-side reopen?
+ *
+ * Exactly the rows the picker shows as history — the ones
+ * {@link isAttachableSessionSummary} rejects. Defined as the negation rather
+ * than as its own list of terminal markers, because two lists of "what counts
+ * as finished" would drift, and the drift would be silent: a row shown as
+ * history but not reopened resumes into a session the server still considers
+ * over, which is the exact defect this repairs.
+ */
+export function sessionNeedsReopen(session: SessionSummary): boolean {
+  return !isAttachableSessionSummary(session);
+}
+
+/**
  * Union of the attachable list and full history for the interactive picker.
  *
  * Sessions are chat history — always resumable unless deleted — so the
@@ -3888,6 +3902,31 @@ export async function runChat(options: ChatOptions): Promise<void> {
         if (selected) {
           attachedSessionSummary = selected;
           runtime.sessionId = selected.id;
+          // A human just chose a FINISHED session out of their history, so it
+          // is not finished any more. Sent here, at the selection, because the
+          // selection is what caused it — the previous behaviour leaned on the
+          // next incidental `update_session_state`, and that call sends
+          // `status: 'active'`, which is and always was a server-side no-op.
+          // The row stayed terminal with `ended_at` set while the chat
+          // generated, invisible to attachable listing, active lookup and
+          // findByThreadKey — so a trigger could open a SECOND session on the
+          // thread the human was already typing into (Lumen, PR #541).
+          //
+          // Only the interactive picker reaches this. Auto-attach filters to
+          // attachable rows before choosing, so it can never revive anything,
+          // and the terminal fence automatic routing relies on stays intact.
+          if (sessionNeedsReopen(selected)) {
+            await pcp
+              .callTool('update_session_state', {
+                agentId,
+                sessionId: selected.id,
+                reopen: true,
+                // Idle, not running: they are back at the prompt, and the
+                // on-prompt hook marks running when they actually type.
+                lifecycle: 'idle',
+              })
+              .catch(() => undefined);
+          }
           if (selected.studioId) {
             runtime.studioId = selected.studioId;
           }
