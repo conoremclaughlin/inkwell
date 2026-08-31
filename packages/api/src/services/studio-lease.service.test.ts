@@ -14,7 +14,7 @@
  * against git itself, not a mock.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { mkdtemp, rm, writeFile, readFile } from 'fs/promises';
@@ -30,6 +30,7 @@ import {
   type StudioLease,
 } from './studio-lease.service';
 import { registerActiveRun, resetActiveRuns } from './sessions/active-runs';
+import { logger } from '../utils/logger';
 
 const execFileAsync = promisify(execFile);
 
@@ -2040,5 +2041,333 @@ describe('captureWorktreeState (real git)', () => {
     const state = await captureWorktreeState(path.join(tmpdir(), 'does-not-exist-xyz'));
     expect(state.error).toBeTruthy();
     expect(rescueSucceeded(state)).toBe(false);
+  });
+});
+
+// ── S1 mortality: expired ephemerals held from elsewhere (spec v18) ──
+
+describe('S1: expired ephemeral held from elsewhere (spec v18)', () => {
+  let worktreeDir: string;
+  let elsewhereDir: string;
+
+  beforeEach(async () => {
+    resetActiveRuns();
+    worktreeDir = await mkdtemp(path.join(tmpdir(), 'lease-s1-worktree-'));
+    elsewhereDir = await mkdtemp(path.join(tmpdir(), 'lease-s1-elsewhere-'));
+  });
+
+  afterEach(async () => {
+    resetActiveRuns();
+    await rm(worktreeDir, { recursive: true, force: true });
+    await rm(elsewhereDir, { recursive: true, force: true });
+  });
+
+  const PAST = () => new Date(Date.now() - 60_000).toISOString();
+  const FUTURE = () => new Date(Date.now() + 60 * 60 * 1000).toISOString();
+
+  function cliSession(overrides: Row = {}): Row {
+    return {
+      id: 'sess-cli',
+      user_id: 'u',
+      working_dir: elsewhereDir,
+      cli_attached: true,
+      cli_poll_at: new Date().toISOString(),
+      cli_turn_at: null,
+      ...overrides,
+    };
+  }
+
+  function ephemeralRow(overrides: Row = {}): Row {
+    return {
+      id: 's-eph',
+      user_id: 'u',
+      status: 'active',
+      ephemeral: true,
+      expires_at: PAST(),
+      parent_studio_id: null,
+      lease: freshLease({ sessionId: 'sess-cli', threadKey: 'pr:545' }),
+      worktree_path: worktreeDir,
+      ...overrides,
+    };
+  }
+
+  function homeRow(overrides: Row = {}): Row {
+    return {
+      id: 's-home',
+      user_id: 'u',
+      status: 'active',
+      ephemeral: false,
+      expires_at: null,
+      parent_studio_id: null,
+      lease: freshLease({ sessionId: 'sess-cli', threadKey: 'pr:538' }),
+      worktree_path: elsewhereDir,
+      ...overrides,
+    };
+  }
+
+  function baseTables(studios: Row[], sessions: Row[] = [cliSession()]): Record<string, Row[]> {
+    return {
+      studios,
+      sessions,
+      studio_lease_events: [],
+      inbox_threads: [],
+      agent_identities: [],
+    };
+  }
+
+  it('renewBySession renews the durable home but not the expired elsewhere-held ephemeral', async () => {
+    const eph = ephemeralRow();
+    const home = homeRow();
+    const ephHeartbeatBefore = (eph.lease as StudioLease).heartbeatAt;
+    const homeHeartbeatBefore = (home.lease as StudioLease).heartbeatAt;
+    const tables = baseTables([eph, home]);
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    // Deterministic heartbeat comparison: ensure the clock has moved.
+    await new Promise((r) => setTimeout(r, 5));
+    const any = await service.renewBySession('sess-cli', 'u');
+
+    expect(any).toBe(true); // the home studio still renews
+    expect((tables.studios[1].lease as StudioLease).heartbeatAt).not.toBe(homeHeartbeatBefore);
+    // The orphan's freshness is no longer manufactured.
+    expect((tables.studios[0].lease as StudioLease).heartbeatAt).toBe(ephHeartbeatBefore);
+  });
+
+  it('renewal is preserved on every uncertain read (fail closed)', async () => {
+    const cases: Array<{ name: string; studio: Row; session?: Row }> = [
+      { name: 'TTL not yet expired', studio: ephemeralRow({ expires_at: FUTURE() }) },
+      { name: 'durable studio with a past expires_at', studio: ephemeralRow({ ephemeral: false }) },
+      { name: 'no worktree path', studio: ephemeralRow({ worktree_path: null }) },
+      {
+        name: 'holder working_dir unknown',
+        studio: ephemeralRow(),
+        session: cliSession({ working_dir: null }),
+      },
+      {
+        name: 'holder working_dir unresolvable',
+        studio: ephemeralRow(),
+        session: cliSession({ working_dir: path.join(tmpdir(), 'does-not-exist-s1-xyz') }),
+      },
+      {
+        name: 'holder mid-turn',
+        studio: ephemeralRow(),
+        session: cliSession({ cli_turn_at: new Date().toISOString() }),
+      },
+    ];
+
+    for (const c of cases) {
+      const before = (c.studio.lease as StudioLease).heartbeatAt;
+      const tables = baseTables([c.studio], [c.session ?? cliSession()]);
+      const service = new StudioLeaseService(makeFakeSupabase(tables));
+      await new Promise((r) => setTimeout(r, 2));
+      await service.renewBySession('sess-cli', 'u');
+      expect((tables.studios[0].lease as StudioLease).heartbeatAt, c.name).not.toBe(before);
+    }
+  });
+
+  it('renewal is preserved when the holder is INSIDE the worktree (spawned run)', async () => {
+    const inside = path.join(worktreeDir, 'packages', 'api');
+    await execFileAsync('mkdir', ['-p', inside]);
+    const studio = ephemeralRow();
+    const before = (studio.lease as StudioLease).heartbeatAt;
+    const tables = baseTables([studio], [cliSession({ working_dir: inside })]);
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+    await new Promise((r) => setTimeout(r, 2));
+    await service.renewBySession('sess-cli', 'u');
+    expect((tables.studios[0].lease as StudioLease).heartbeatAt).not.toBe(before);
+  });
+
+  it('sweep stamps pendingRelease on a stale live-holder elsewhere-held ephemeral instead of renewing', async () => {
+    const studio = ephemeralRow({
+      lease: staleLease({ sessionId: 'sess-cli', threadKey: 'pr:545' }),
+    });
+    const before = (studio.lease as StudioLease).heartbeatAt;
+    const tables = baseTables([studio]);
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const stats = await service.sweepExpiredLeases();
+
+    const lease = tables.studios[0].lease as StudioLease;
+    expect(lease.pendingRelease?.reason).toBe('expired-elsewhere-held');
+    expect(lease.heartbeatAt).toBe(before); // no synthetic freshness
+    expect(stats.renewed).toBe(0);
+    expect(stats.expired).toBe(0); // never a direct reclaim while the holder is live
+  });
+
+  it('the stamped orphan releases at the holder next real boundary', async () => {
+    const studio = ephemeralRow({
+      lease: staleLease({
+        sessionId: 'sess-cli',
+        threadKey: 'pr:545',
+        pendingRelease: { reason: 'expired-elsewhere-held', requestedAt: new Date().toISOString() },
+      }),
+    });
+    const tables = baseTables([studio]);
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const released = await service.releaseAtBoundary('sess-cli', {
+      userId: 'u',
+      sessionTerminal: false,
+      reason: 'stop',
+    });
+
+    expect(released).toBe(true);
+    expect(tables.studios[0].lease).toBeNull();
+    expect(tables.studio_lease_events.map((e) => e.event)).toContain('released');
+  });
+
+  it('sweep leaves a live same-directory ephemeral alone even when expired', async () => {
+    // The holder genuinely working inside the tree: expiry must not disturb it.
+    const studio = ephemeralRow({
+      lease: staleLease({ sessionId: 'sess-cli', threadKey: 'pr:545' }),
+    });
+    const tables = baseTables([studio], [cliSession({ working_dir: worktreeDir })]);
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const stats = await service.sweepExpiredLeases();
+
+    const lease = tables.studios[0].lease as StudioLease;
+    expect(lease.pendingRelease).toBeUndefined();
+    expect(stats.renewed).toBe(1); // renewed on the holder's behalf, as before
+  });
+});
+
+describe('S1: multi-hold warn dedupe (spec v18)', () => {
+  afterEach(() => {
+    resetActiveRuns();
+    vi.restoreAllMocks();
+  });
+
+  function twoStudios(): Record<string, Row[]> {
+    return {
+      studios: [
+        {
+          id: 's-a',
+          user_id: 'u',
+          ephemeral: false,
+          expires_at: null,
+          lease: freshLease({ sessionId: 'sess-1', threadKey: 'pr:1' }),
+          worktree_path: null,
+        },
+        {
+          id: 's-b',
+          user_id: 'u',
+          ephemeral: false,
+          expires_at: null,
+          lease: freshLease({ sessionId: 'sess-1', threadKey: 'pr:2' }),
+          worktree_path: null,
+        },
+      ],
+      sessions: [],
+      studio_lease_events: [],
+      inbox_threads: [],
+      agent_identities: [],
+    };
+  }
+
+  it('warns once per holder-set, re-arms when the set shrinks, warns again on regrowth', async () => {
+    const warnSpy = vi.spyOn(logger, 'warn');
+    const tables = twoStudios();
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const multiHoldWarns = () =>
+      warnSpy.mock.calls.filter(([msg]) => String(msg).includes('Session holds multiple studios'))
+        .length;
+
+    await service.renewBySession('sess-1', 'u');
+    await service.renewBySession('sess-1', 'u');
+    await service.renewBySession('sess-1', 'u');
+    expect(multiHoldWarns()).toBe(1); // once per set, not per poll
+
+    // The set shrinks to one — the dedupe re-arms.
+    tables.studios[1].lease = null;
+    await service.renewBySession('sess-1', 'u');
+    expect(multiHoldWarns()).toBe(1);
+
+    // Regrowth is a NEW set and logs again.
+    tables.studios[1].lease = freshLease({ sessionId: 'sess-1', threadKey: 'pr:3' });
+    await service.renewBySession('sess-1', 'u');
+    expect(multiHoldWarns()).toBe(2);
+  });
+});
+
+describe('S1: session repoint on ephemeral release (spec v18)', () => {
+  afterEach(() => resetActiveRuns());
+
+  function repointTables(): Record<string, Row[]> {
+    return {
+      studios: [
+        {
+          id: 's-eph',
+          user_id: 'u',
+          status: 'active',
+          ephemeral: true,
+          expires_at: null,
+          parent_studio_id: 's-mid',
+          lease: freshLease({ sessionId: 'sess-1', threadKey: 'pr:9' }),
+          worktree_path: null,
+        },
+        // An ephemeral ancestor in between: the walk must pass over it.
+        {
+          id: 's-mid',
+          user_id: 'u',
+          status: 'active',
+          ephemeral: true,
+          expires_at: null,
+          parent_studio_id: 's-home',
+          lease: null,
+          worktree_path: null,
+        },
+        {
+          id: 's-home',
+          user_id: 'u',
+          status: 'active',
+          ephemeral: false,
+          expires_at: null,
+          parent_studio_id: null,
+          lease: null,
+          worktree_path: null,
+        },
+      ],
+      sessions: [
+        { id: 'sess-1', user_id: 'u', studio_id: 's-eph', working_dir: null },
+        { id: 'sess-other', user_id: 'u', studio_id: 's-home', working_dir: null },
+      ],
+      studio_lease_events: [],
+      inbox_threads: [],
+      agent_identities: [],
+    };
+  }
+
+  it('releasing an ephemeral repoints its sessions to the first durable ancestor', async () => {
+    const tables = repointTables();
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const released = await service.releaseBySession('sess-1', { userId: 'u', reason: 'test' });
+
+    expect(released).toBe(true);
+    expect(tables.sessions[0].studio_id).toBe('s-home'); // walked past the ephemeral mid
+    expect(tables.sessions[1].studio_id).toBe('s-home'); // untouched (never pointed at s-eph)
+  });
+
+  it('falls back to NULL when no durable ancestor survives', async () => {
+    const tables = repointTables();
+    (tables.studios[2] as Row).status = 'cleaned'; // the durable home is gone
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    await service.releaseBySession('sess-1', { userId: 'u', reason: 'test' });
+
+    expect(tables.sessions[0].studio_id).toBeNull();
+  });
+
+  it('releasing a durable studio never touches session pointers', async () => {
+    const tables = repointTables();
+    tables.studios[2].lease = freshLease({ sessionId: 'sess-2', threadKey: 'pr:10' });
+    tables.sessions.push({ id: 'sess-2', user_id: 'u', studio_id: 's-home', working_dir: null });
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    await service.releaseBySession('sess-2', { userId: 'u', reason: 'test' });
+
+    expect(tables.sessions[2].studio_id).toBe('s-home');
   });
 });
