@@ -54,6 +54,10 @@ import {
   handleReleaseClaim,
   handleRecordGateVerdict,
   handleRetryGate,
+  handleListGraphTemplates,
+  handleInstantiateGraphTemplate,
+  listGraphTemplatesSchema,
+  instantiateGraphTemplateSchema,
   applyTaskGraphSchema,
   convertTaskGroupToGraphSchema,
   getTaskGraphSchema,
@@ -1153,6 +1157,42 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         return await handleApplyTaskGraph(args, dataComposer);
       } catch (error) {
         return graphToolError('apply_task_graph')(error);
+      }
+    }
+  );
+
+  server.registerTool(
+    'list_graph_templates',
+    {
+      description: `List the graph template constructors: whole shapes (pr-ship, spec-ship) that build a workflow from nothing, and injectable fragments (visual-signoff, sibling-review) that splice one obligation into a graph already running.`,
+      inputSchema: listGraphTemplatesSchema,
+    },
+    async () => {
+      try {
+        return await handleListGraphTemplates();
+      } catch (error) {
+        return graphToolError('list_graph_templates')(error);
+      }
+    }
+  );
+
+  server.registerTool(
+    'instantiate_graph_template',
+    {
+      description: `Build a workflow graph from a template. With no taskGroupId it creates the group, converts it to graph mode, writes the nodes and edges, and starts execution — one call for "ship this PR properly". With a taskGroupId it splices the shape into a graph that already exists, which is how you inject a gate when scope grows mid-flight (a PR that started as pure logic and grew an interface: templateId "visual-signoff", after: "work", before: "merge").
+
+Templates encode obligations, not instructions — the work stays one open-ended node; what the graph holds you to is the independent sign-offs around it. Gate requirements are a CHECKLIST the assignee is reminded of when the gate opens, never a server-side validator.
+
+Node authoring is additive and matched by slug, so re-running the same template is a no-op rather than a duplicate. Removing or rewiring edges stays with apply_task_graph.
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: instantiateGraphTemplateSchema,
+    },
+    async (args) => {
+      try {
+        return await handleInstantiateGraphTemplate(args, dataComposer);
+      } catch (error) {
+        return graphToolError('instantiate_graph_template')(error);
       }
     }
   );

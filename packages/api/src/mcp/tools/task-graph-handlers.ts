@@ -13,6 +13,11 @@ import { z } from 'zod';
 import type { DataComposer } from '../../data/composer';
 import { resolveUser, type UserIdentifier } from '../../services/user-resolver';
 import { GraphExecutorService, type GraphEvaluation } from '../../services/graph-executor.service';
+import {
+  configHash,
+  getGraphTemplate,
+  listGraphTemplates,
+} from '../../services/graph-templates/templates';
 import { getRequestContext, getSessionContext } from '../../utils/request-context';
 import { logger } from '../../utils/logger';
 
@@ -239,6 +244,304 @@ export async function handleGetTaskGraph(
   } catch (error) {
     return mcpResponse(
       { success: false, error: error instanceof Error ? error.message : 'get_task_graph failed' },
+      true
+    );
+  }
+}
+
+// ============================================================================
+// TEMPLATES — instantiate a shape, or inject one into a running graph
+// ============================================================================
+
+export const listGraphTemplatesSchema = z.object({});
+
+export async function handleListGraphTemplates(): Promise<McpResponse> {
+  return mcpResponse({ success: true, templates: listGraphTemplates() });
+}
+
+export const instantiateGraphTemplateSchema = z.object({
+  ...userIdentifierSchema.shape,
+  templateId: z
+    .string()
+    .describe('Template to build — list_graph_templates for the registry (e.g. "pr-ship")'),
+  taskGroupId: z
+    .string()
+    .uuid()
+    .optional()
+    .describe(
+      'Existing graph-mode group to add to. Omit to create a new group. Required when injecting a fragment.'
+    ),
+  title: z
+    .string()
+    .optional()
+    .describe('Title for the new group (ignored when taskGroupId is set)'),
+  threadKey: z
+    .string()
+    .optional()
+    .describe('Routing spine for the new group, e.g. "pr:551" (ignored when taskGroupId is set)'),
+  projectId: z.string().uuid().optional().describe('Project for the new group'),
+  subject: z.string().optional().describe('What is being shipped — "PR #551", "spec:foo"'),
+  reviewerIdentityId: z
+    .string()
+    .uuid()
+    .optional()
+    .describe('Sibling reviewer — agent_identities.id, NEVER the agent slug'),
+  visualSignoffUserId: z
+    .string()
+    .uuid()
+    .optional()
+    .describe('Human who signs off on the visuals (approval gate, never claimed)'),
+  visualSignoffIdentityId: z
+    .string()
+    .uuid()
+    .optional()
+    .describe('SB that signs off on the visuals when no human is in the loop'),
+  includeVisualSignoff: z
+    .boolean()
+    .optional()
+    .describe('pr-ship only: drop the visual gate for a change with no user-visible surface'),
+  after: z
+    .string()
+    .optional()
+    .describe('Injection: node slug or task UUID the injected gate depends on'),
+  before: z
+    .string()
+    .optional()
+    .describe('Injection: node slug or task UUID that should now depend on the injected gate'),
+  workTitle: z.string().optional().describe('Override the work node title'),
+  workDescription: z.string().optional().describe('Override the work node description'),
+  start: z
+    .boolean()
+    .optional()
+    .default(true)
+    .describe(
+      'Start execution after building (new groups only). false authors the graph PAUSED, which is what actually keeps the reconciliation sweep from dispatching it — call start_graph_execution when you want it to run.'
+    ),
+});
+
+/**
+ * Build a template's shape and write it into a graph.
+ *
+ * One call for the common case: with no taskGroupId it creates the group,
+ * converts it to graph mode, adds the nodes and edges, and starts execution.
+ * With a taskGroupId it splices the shape into a graph that already exists —
+ * which is how a fragment gets injected when scope grows mid-flight.
+ *
+ * Node authoring is additive, so re-running the same template is a no-op
+ * rather than a duplicate: nodes are matched by slug.
+ */
+export async function handleInstantiateGraphTemplate(
+  args: z.infer<typeof instantiateGraphTemplateSchema>,
+  dataComposer: DataComposer
+): Promise<McpResponse> {
+  try {
+    const resolved = await resolveUser(args as UserIdentifier, dataComposer);
+    if (!resolved) return mcpResponse({ success: false, error: 'User not found' }, true);
+
+    const template = getGraphTemplate(args.templateId);
+    if (!template) {
+      return mcpResponse(
+        {
+          success: false,
+          error: `Unknown template "${args.templateId}"`,
+          available: listGraphTemplates().map((t) => t.id),
+        },
+        true
+      );
+    }
+    if (template.injectable && !args.taskGroupId) {
+      return mcpResponse(
+        {
+          success: false,
+          error: `"${template.id}" is a fragment — pass taskGroupId (and after/before) to splice it into an existing graph`,
+        },
+        true
+      );
+    }
+
+    const shape = template.build(args);
+    if (shape.nodes.length === 0) {
+      return mcpResponse({ success: false, error: 'Template emitted no nodes' }, true);
+    }
+
+    // Preflight BEFORE any write. add_graph_nodes validates the same things
+    // and is authoritative, but it only runs after the group exists — so a
+    // gate missing its principal (the caller forgot reviewerIdentityId) used
+    // to be discovered one transaction too late, leaving an empty graph-mode
+    // shell behind on refusal (Lumen, pr:555 blocker 3).
+    const shapeProblems = shape.nodes.flatMap((node) => {
+      if (node.type !== 'verification') return [];
+      const principals = [node.assigneeIdentityId, node.assigneeUserId].filter(Boolean).length;
+      if (principals === 1) return [];
+      return [
+        {
+          slug: node.slug,
+          problem: principals === 0 ? 'gate-has-no-principal' : 'gate-has-two-principals',
+        },
+      ];
+    });
+    if (shapeProblems.length > 0) {
+      return mcpResponse(
+        {
+          success: false,
+          error:
+            'Template emitted a gate without exactly one principal. Pass reviewerIdentityId (an agent_identities.id) and, for a visual gate, exactly one of visualSignoffUserId / visualSignoffIdentityId.',
+          problems: shapeProblems,
+        },
+        true
+      );
+    }
+
+    // Cardinality is not existence. A well-formed UUID naming nobody passes
+    // the check above, then fails the FK inside add_graph_nodes — an
+    // exception rather than a structured refusal, arriving after the group
+    // has been created and converted, stranding a graph-mode shell (Lumen,
+    // pr:555 round 2). The RPC now refuses this too and is authoritative;
+    // resolving it here is what keeps the shell from existing at all.
+    const client = dataComposer.getClient();
+    const identityIds = [
+      ...new Set(shape.nodes.map((n) => n.assigneeIdentityId).filter(Boolean) as string[]),
+    ];
+    const userIds = [
+      ...new Set(shape.nodes.map((n) => n.assigneeUserId).filter(Boolean) as string[]),
+    ];
+    const [identityRows, userRows] = await Promise.all([
+      identityIds.length
+        ? client.from('agent_identities').select('id').in('id', identityIds)
+        : Promise.resolve({ data: [] as Array<{ id: string }> }),
+      userIds.length
+        ? client.from('users').select('id').in('id', userIds)
+        : Promise.resolve({ data: [] as Array<{ id: string }> }),
+    ]);
+    // The two id spaces stay SEPARATE. Pooling them into one set let an
+    // agent-identity UUID pass as a users.id — which is the confusion most
+    // likely to happen in practice, since both are UUIDs and the parameter
+    // names are one word apart.
+    const knownIdentities = new Set((identityRows.data ?? []).map((r) => r.id));
+    const knownUsers = new Set((userRows.data ?? []).map((r) => r.id));
+    const unknownPrincipals = shape.nodes
+      .filter((n) => {
+        if (n.assigneeIdentityId) return !knownIdentities.has(n.assigneeIdentityId);
+        if (n.assigneeUserId) return !knownUsers.has(n.assigneeUserId);
+        return false;
+      })
+      .map((n) => ({ slug: n.slug, principal: n.assigneeIdentityId ?? n.assigneeUserId }));
+    if (unknownPrincipals.length > 0) {
+      return mcpResponse(
+        {
+          success: false,
+          error:
+            'A gate names a principal that does not exist. reviewerIdentityId must be an agent_identities.id (NEVER an agent slug); visualSignoffUserId must be a users.id.',
+          problems: unknownPrincipals,
+        },
+        true
+      );
+    }
+
+    const groups = dataComposer.repositories.taskGroups;
+    const actorIdentityId = resolveActorIdentityId();
+    const actor = actorIdentityId
+      ? { actorIdentityId }
+      : ({ actorUserId: resolved.user.id } as const);
+
+    // Existing group, or a fresh one converted to graph mode.
+    let group = args.taskGroupId ? await groups.findById(args.taskGroupId) : null;
+    if (args.taskGroupId && (!group || group.user_id !== resolved.user.id)) {
+      return mcpResponse({ success: false, error: 'Task group not found' }, true);
+    }
+    let created = false;
+    if (!group) {
+      group = await groups.create({
+        user_id: resolved.user.id,
+        project_id: args.projectId ?? null,
+        title: args.title ?? `${template.id}: ${args.subject ?? 'untitled'}`,
+        description: template.summary,
+        thread_key: args.threadKey,
+        // start:false means author it without waking anyone. An ACTIVE group
+        // is swept — listActiveGraphGroups selects on status='active' — so
+        // leaving it active while skipping startGroup only delayed dispatch
+        // to the next tick rather than preventing it (Lumen, blocker 2).
+        // Paused is the state that actually means "not executing"; the SQL
+        // already defers evaluation for it, and start_graph_execution
+        // activates and sweeps on resume.
+        ...(args.start === false ? { status: 'paused' as const } : {}),
+        ...(actorIdentityId ? { sb_id: actorIdentityId } : {}),
+      });
+      created = true;
+      const converted = await groups.convertToGraph({
+        userId: resolved.user.id,
+        taskGroupId: group.id,
+        expectedVersion: 0,
+        ...actor,
+      });
+      if (converted.success === false) {
+        return mcpResponse(
+          {
+            success: false,
+            error: 'convert-to-graph failed',
+            detail: converted,
+            groupId: group.id,
+          },
+          true
+        );
+      }
+    }
+
+    // Re-read the version: conversion bumps it, and a concurrent mutation
+    // may have moved it under an existing group.
+    const current = await groups.findById(group.id);
+    if (!current) return mcpResponse({ success: false, error: 'Task group vanished' }, true);
+
+    const result = await groups.addGraphNodes({
+      userId: resolved.user.id,
+      taskGroupId: current.id,
+      expectedVersion: current.graph_version ?? 0,
+      nodes: shape.nodes,
+      edges: shape.edges,
+      constructorId: template.id,
+      constructorVersion: template.version,
+      configHash: configHash(shape),
+      ...actor,
+    });
+    if (result.success === false) {
+      return mcpResponse(
+        { success: false, error: 'add_graph_nodes refused', detail: result, groupId: current.id },
+        true
+      );
+    }
+
+    // A new group needs execution started — unless the caller asked to
+    // author it without waking anyone, in which case nothing is dispatched
+    // at all. An existing group is already running, so what this call just
+    // opened is dispatched now.
+    let started: unknown = null;
+    if (created) {
+      if (args.start !== false) {
+        const executor = new GraphExecutorService(dataComposer);
+        started = await executor.startGroup(resolved.user.id, current.id);
+      }
+    } else {
+      await dispatchAfterMutation(dataComposer, resolved.user.id, current.id, result.evaluation);
+    }
+
+    return mcpResponse({
+      success: true,
+      template: { id: template.id, version: template.version },
+      groupId: current.id,
+      groupCreated: created,
+      threadKey: current.thread_key ?? args.threadKey ?? null,
+      graphVersion: result.graphVersion,
+      nodesAdded: result.nodesAdded,
+      nodesExisting: result.nodesExisting,
+      edgesAdded: result.edgesAdded,
+      started,
+    });
+  } catch (error) {
+    return mcpResponse(
+      {
+        success: false,
+        error: error instanceof Error ? error.message : 'instantiate_graph_template failed',
+      },
       true
     );
   }

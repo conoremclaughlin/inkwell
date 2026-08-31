@@ -27,6 +27,7 @@ import type { Database, Json } from '../data/supabase/types';
 import { handleSendToInbox } from '../mcp/tools/inbox-handlers';
 import { resolveAgentSlug } from '../auth/resolve-identity';
 import { StudioLeaseService } from './studio-lease.service';
+import { renderGateChecklistBlock } from './graph-templates/types';
 import { logger } from '../utils/logger';
 
 export interface GraphNodeRef {
@@ -504,9 +505,34 @@ export class GraphExecutorService {
           `You are the assignee: review the upstream work and record a verdict with ` +
           `record_gate_verdict(taskId, verdict: 'passed'|'failed', expectedAttempt, expectedGateVersion, ` +
           `evidence for pass / reason for fail). Read the task first (get_task) for the current attempt/version. ` +
-          `For an automated check (CI, GH), claim the gate first with claim_task and pass the claim token.`;
+          `For an automated check (CI, GH), claim the gate first with claim_task and pass the claim token.` +
+          (await this.gateChecklist(node.id));
 
     return this.sendTrigger(userId, group, slug, content, `graph_${kind}_ready`, node.id);
+  }
+
+  /**
+   * The gate's checklist, appended to the message that opens it. Rendering
+   * lives in graph-templates (renderGateChecklistBlock); this is only the
+   * lookup. Requirements are free-form by design — checklist, not bouncer —
+   * so nothing here validates them.
+   *
+   * Best-effort: a lookup failure costs the reminder, never the dispatch.
+   */
+  private async gateChecklist(taskId: string): Promise<string> {
+    try {
+      const { data, error } = await this.dataComposer
+        .getClient()
+        .from('tasks')
+        .select('verification')
+        .eq('id', taskId)
+        .maybeSingle();
+      if (error || !data) return '';
+      return renderGateChecklistBlock(data.verification);
+    } catch (err) {
+      logger.debug(`Gate checklist render failed for ${taskId} (non-fatal):`, err);
+      return '';
+    }
   }
 
   private async sendTrigger(
