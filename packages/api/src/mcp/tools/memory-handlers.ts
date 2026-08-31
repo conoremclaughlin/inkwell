@@ -1788,6 +1788,26 @@ export function shouldStampEndedAt(params: { status?: string; lifecycle?: string
  * finished sessions and re-point their threads. Only a caller that means
  * "the user chose this one" may say so, and only the interactive picker does.
  */
+/**
+ * Does this phase/status string mark a session as finished?
+ *
+ * Mirrors the CLI's `isAttachableSessionSummary`, which rejects a row whose
+ * phase is `complete` / `complete:<reason>` or whose status is `completed` /
+ * `completed:<reason>`. Clearing `ended_at` and `lifecycle` while leaving
+ * these set produces a row that is un-ended and still reads as history
+ * everywhere it matters.
+ */
+export function isTerminalPhaseMarker(value: string | null | undefined): boolean {
+  const marker = (value || '').trim().toLowerCase();
+  if (!marker) return false;
+  return (
+    marker === 'complete' ||
+    marker.startsWith('complete:') ||
+    marker === 'completed' ||
+    marker.startsWith('completed:')
+  );
+}
+
 export function shouldClearEndedAt(params: {
   reopen?: boolean;
   status?: string;
@@ -1901,7 +1921,11 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
     !params.workingDir &&
     params.cliAttached === undefined &&
     params.alias === undefined &&
-    params.activeThreadKey === undefined
+    params.activeThreadKey === undefined &&
+    // `reopen: true` is a complete request on its own — it supplies its own
+    // live lifecycle below. Omitting it here rejected the one call that has
+    // nothing else to say (Lumen, PR #541 P2).
+    params.reopen !== true
   ) {
     return {
       content: [
@@ -1911,7 +1935,7 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
             {
               success: false,
               error:
-                'At least one field must be provided (phase, lifecycle, backendSessionId, status, context, workingDir).',
+                'At least one field must be provided (phase, lifecycle, backendSessionId, status, context, workingDir, reopen).',
             },
             null,
             2
@@ -1926,6 +1950,9 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
   // see resolveImplicitSession for why an unscoped fallback is unsafe here.
   const updateCaller = await resolveCaller(dataComposer, user.id, params.agentId);
   let sessionId = params.sessionId;
+  // The row as it stands BEFORE this update. A reopen has to know which
+  // terminal markers are actually set, so it can clear exactly those.
+  let priorSession: Session | null = null;
   if (sessionId) {
     // An explicit id is a target, not an authorization. updateSession() filters
     // on the primary key alone and the repository runs as the service role, so
@@ -1945,6 +1972,7 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
         ],
       };
     }
+    priorSession = target;
   } else {
     const resolved = await resolveImplicitSession(
       dataComposer,
@@ -1967,6 +1995,7 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
       };
     }
     sessionId = resolved.session.id;
+    priorSession = resolved.session;
   }
 
   let beforeSession: Session | null = null;
@@ -2032,10 +2061,30 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
       lifecycle: updates.lifecycle,
     })
   ) {
-    // Clear the fence and restore a live lifecycle in one write, so the row is
-    // never briefly live-with-an-end-date or ended-with-a-live-lifecycle.
+    // Clear EVERY terminal marker in one write, so the row is never briefly
+    // half-reopened — live-with-an-end-date, or un-ended while still phased
+    // complete.
+    //
+    // `ended_at` and `lifecycle` alone are not enough, and that omission was
+    // the bug (Lumen, PR #541). Attachability also reads `current_phase` and
+    // `status`, both of which carry terminal spellings (`complete`,
+    // `complete:<reason>`, `completed`, `completed:<reason>`). A row reopened
+    // without clearing them comes back un-ended and STILL classifies as
+    // history — to the picker, to `list_sessions('attachable')`, and to the
+    // very predicate the CLI uses to decide a reopen was needed. It would
+    // right itself only when some later prompt incidentally overwrote the
+    // phase, which is precisely the "fixed by an unrelated later write" shape
+    // this whole PR exists to remove.
     updates.endedAt = null;
     if (updates.lifecycle === undefined) updates.lifecycle = 'running';
+    if (params.phase === undefined && isTerminalPhaseMarker(priorSession?.currentPhase)) {
+      // Null rather than a substitute phase: the work phase is the agent's to
+      // declare, and inventing one here would report progress nobody made.
+      updates.currentPhase = null;
+    }
+    if (params.status === undefined && isTerminalPhaseMarker(priorSession?.status)) {
+      updates.status = 'active';
+    }
   }
 
   if (params.backendSessionId !== undefined) {
@@ -2110,6 +2159,13 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
       studioId: updated.studioId,
       lifecycle: updated.lifecycle || null,
       currentPhase: updated.currentPhase || null,
+      // The two terminal markers a caller needs to VERIFY a reopen took.
+      // Without them the acknowledgement cannot be checked: a client asserting
+      // "this row is attachable now" reads `endedAt` as undefined and believes
+      // the fence is clear whether or not it is — which turns the check into
+      // another proxy for the thing it was meant to confirm (PR #541).
+      status: updated.status || null,
+      endedAt: updated.endedAt ? updated.endedAt.toISOString() : null,
     },
   };
 

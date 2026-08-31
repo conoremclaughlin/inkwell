@@ -8,7 +8,11 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { shouldStampEndedAt, shouldClearEndedAt } from './memory-handlers.js';
+import {
+  shouldStampEndedAt,
+  shouldClearEndedAt,
+  isTerminalPhaseMarker,
+} from './memory-handlers.js';
 
 describe('shouldStampEndedAt', () => {
   it('stamps on the current lifecycle spelling', () => {
@@ -100,6 +104,56 @@ describe('shouldClearEndedAt', () => {
           expect(stamp && clear, label).toBe(false);
         }
       }
+    }
+  });
+});
+
+/**
+ * A reopen has to clear EVERY terminal marker (Lumen, PR #541 P1).
+ *
+ * Clearing `ended_at` and `lifecycle` alone leaves `current_phase` = complete*
+ * and `status` = completed*, both of which attachability reads. The row comes
+ * back un-ended and STILL classifies as history — to the picker, to
+ * list_sessions('attachable'), and to the very predicate the CLI uses to decide
+ * a reopen was needed. It would right itself only when a later prompt
+ * incidentally overwrote the phase, which is the fixed-by-an-unrelated-write
+ * shape this PR exists to remove.
+ */
+describe('isTerminalPhaseMarker', () => {
+  it.each([
+    'complete',
+    'completed',
+    'complete:merged',
+    'completed:shipped',
+    'COMPLETE',
+    ' complete ',
+  ])('treats %s as terminal', (value) => {
+    expect(isTerminalPhaseMarker(value)).toBe(true);
+  });
+
+  it.each(['implementing', 'reviewing', 'active', 'waiting:review', 'idle', '', null, undefined])(
+    'leaves %s alone',
+    (value) => {
+      expect(isTerminalPhaseMarker(value as string | null | undefined)).toBe(false);
+    }
+  );
+
+  // 'completion' and 'completed-ish' start with the letters but are not the
+  // marker; a bare startsWith would eat them.
+  it('does not match a longer word that merely begins the same way', () => {
+    expect(isTerminalPhaseMarker('completion-review')).toBe(false);
+    expect(isTerminalPhaseMarker('completeness')).toBe(false);
+  });
+
+  /**
+   * The markers this recognises must be exactly the ones the CLI's
+   * isAttachableSessionSummary rejects. If they drift, a reopen clears some
+   * markers and leaves others, and the row is half-reopened — which reads as
+   * resumed and is not.
+   */
+  it('covers every phase/status spelling the CLI treats as finished', () => {
+    for (const marker of ['complete', 'complete:x', 'completed', 'completed:x']) {
+      expect(isTerminalPhaseMarker(marker), marker).toBe(true);
     }
   });
 });

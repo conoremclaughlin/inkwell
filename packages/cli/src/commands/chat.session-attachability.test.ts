@@ -4,6 +4,8 @@ import {
   listAttachableSessions,
   mergeSessionsWithHistory,
   sessionNeedsReopen,
+  reopenSucceeded,
+  reopenSelectedSession,
 } from './chat.js';
 import type { SessionSummary } from './chat.js';
 
@@ -221,5 +223,88 @@ describe('sessionNeedsReopen', () => {
         !isAttachableSessionSummary(session)
       );
     }
+  });
+});
+
+/**
+ * Fail closed on a reopen that did not take (Lumen, PR #541 P1).
+ *
+ * The first version wrapped the call in `.catch(() => undefined)` and carried
+ * on regardless — the same silent-resume-into-a-terminal-row this PR exists to
+ * remove, wearing a different coat. Worse, the interesting failure is not an
+ * exception: a server too old to know `reopen` strips the unknown field,
+ * changes nothing, and answers `success: true`.
+ *
+ * So the POST-STATE is the evidence, not the envelope.
+ */
+describe('reopenSucceeded', () => {
+  const live = { id: 's1', status: 'active', lifecycle: 'idle' } as SessionSummary;
+
+  it('accepts a row that now reads attachable', () => {
+    expect(reopenSucceeded(live).ok).toBe(true);
+  });
+
+  it('rejects a cheerful success that left ended_at set — the old-server case', () => {
+    const outcome = reopenSucceeded({ ...live, endedAt: '2026-08-30T12:00:00Z' } as SessionSummary);
+    expect(outcome.ok).toBe(false);
+    expect(outcome.reason).toContain('ended_at is still set');
+    expect(outcome.reason).toContain('older server');
+  });
+
+  it('rejects a row still phased complete, and names the marker', () => {
+    const outcome = reopenSucceeded({ ...live, currentPhase: 'complete' } as SessionSummary);
+    expect(outcome.ok).toBe(false);
+    expect(outcome.reason).toContain('complete');
+  });
+
+  it('rejects a missing session rather than assuming the best', () => {
+    expect(reopenSucceeded(undefined).ok).toBe(false);
+    expect(reopenSucceeded(null).ok).toBe(false);
+  });
+});
+
+describe('reopenSelectedSession', () => {
+  const okSession = { id: 's1', status: 'active', lifecycle: 'idle' };
+
+  it('sends reopen with an idle lifecycle and confirms the post-state', async () => {
+    const callTool = vi.fn().mockResolvedValue({ success: true, session: okSession });
+
+    const outcome = await reopenSelectedSession({ callTool }, 'wren', 's1');
+
+    expect(outcome.ok).toBe(true);
+    expect(callTool).toHaveBeenCalledWith('update_session_state', {
+      agentId: 'wren',
+      sessionId: 's1',
+      reopen: true,
+      lifecycle: 'idle',
+    });
+  });
+
+  it('fails closed when the server throws', async () => {
+    const callTool = vi.fn().mockRejectedValue(new Error('connection refused'));
+    const outcome = await reopenSelectedSession({ callTool }, 'wren', 's1');
+
+    expect(outcome.ok).toBe(false);
+    expect(outcome.reason).toContain('connection refused');
+  });
+
+  it('fails closed on a structured rejection', async () => {
+    const callTool = vi.fn().mockResolvedValue({ success: false, error: 'not authorized' });
+    const outcome = await reopenSelectedSession({ callTool }, 'wren', 's1');
+
+    expect(outcome.ok).toBe(false);
+    expect(outcome.reason).toContain('not authorized');
+  });
+
+  // The one that matters most, and the one an exception check would miss.
+  it('fails closed when an old server reports success and changes nothing', async () => {
+    const callTool = vi.fn().mockResolvedValue({
+      success: true,
+      session: { ...okSession, endedAt: '2026-08-30T12:00:00Z', lifecycle: 'completed' },
+    });
+
+    const outcome = await reopenSelectedSession({ callTool }, 'wren', 's1');
+
+    expect(outcome.ok).toBe(false);
   });
 });
