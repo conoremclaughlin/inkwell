@@ -1,41 +1,39 @@
 /**
  * Media resolution for the evidence viewer's file endpoint.
  *
- * ## Threat model (read this before adding checks)
+ * ## Scope (read before adding checks here)
  *
- * The untrusted input here is NOT the caller — the endpoint is behind admin
- * auth. It is the PATH, which comes out of evidence JSONB that SBs write
- * autonomously into the gate ledger. The case worth designing against is an
- * agent writing a reference it shouldn't, which then renders in the owner's
- * authenticated dashboard session.
+ * The endpoint is behind admin auth, so the caller is the account owner.
+ * The value worth validating is the PATH, because SBs write it into
+ * evidence JSONB autonomously and it is then fetched by the owner's
+ * dashboard. A mistaken or careless reference should not resolve to
+ * something outside the media directories, and should not be handed back
+ * with a content type that doesn't match what the file actually is.
  *
- * We deliberately do NOT defend against a local actor who can write to the
- * media directories or rename their contents. Anyone with that capability
- * reads the files directly and never involves this endpoint, so hardening
- * that boundary buys nothing and costs real complexity (Conor, 2026-08-31).
- * An earlier revision carried a post-open lstat walk, (dev, ino) binding,
- * an nlink === 1 rule, and a production test seam to make the race
- * testable; all of it was removed as defense against a threat this system
- * does not face — and nlink === 1 additionally refused legitimately
- * hard-linked files.
+ * Isolating co-located processes from each other is explicitly NOT in
+ * scope (Conor, 2026-08-31). Anything able to rearrange these directories
+ * already has the same read access this endpoint would grant, so guarding
+ * that boundary adds complexity without changing what is reachable. An
+ * earlier revision carried extra post-open verification and a link-count
+ * rule for exactly that case; it was removed in dd3a6394, and the
+ * link-count rule was also rejecting ordinary hard-linked files.
  *
- * The durable fix is upstream of this file: media should be referenced by a
- * NAME inside a space the producing agent owns (~/.ink/files/<agentId>/…),
- * not by a filesystem path at all. Then "is this allowed" is a namespace
- * lookup rather than a question about paths. Until evidence is authored
- * that way, this module accepts the paths agents already write and requires
- * them to land inside a known root.
+ * The durable simplification is upstream of this file: media should be
+ * referenced by a NAME inside a space the producing agent owns
+ * (~/.ink/files/<agentId>/…) rather than by filesystem path, turning this
+ * into a namespace lookup. Tracked separately; until evidence is authored
+ * that way, this module accepts the paths agents already write.
  *
  * What remains, and why each part earns its place:
  *
- * - Root containment (lexical, then canonical): an evidence row naming
- *   `~/.ink/files/../../.ssh/id_rsa` must not resolve to a served file.
- * - Canonical-target extension allowlist with an exact Content-Type and
- *   `nosniff`: a file that resolves to HTML must never be served as HTML
- *   into the dashboard's own origin. This is correct content handling, not
- *   adversary defense — it would matter with no attacker at all.
- * - Regular-file check (with a non-blocking open, so the check is
- *   reachable): the endpoint must not hang on a non-file.
+ * - Root containment (lexical, then canonical): a reference must resolve
+ *   inside one of the media directories.
+ * - Canonical-target extension allowlist fixing an exact Content-Type,
+ *   served with `nosniff`: a name ending `.png` whose real target is an
+ *   HTML document must not come back labelled as HTML. This is correct
+ *   content handling and would matter even with no bad input at all.
+ * - Regular-file check, with a non-blocking open so the check is
+ *   reachable: the endpoint must not hang on a non-file.
  */
 
 import { promises as fsPromises, constants as fsConstants } from 'fs';
