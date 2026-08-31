@@ -35,7 +35,7 @@ function errorJson(label: string, error: unknown): Record<string, unknown> {
   return base;
 }
 import crypto from 'crypto';
-import { promises as fs } from 'fs';
+import { existsSync, promises as fs } from 'fs';
 import os from 'os';
 import path from 'path';
 import type { WorkspaceMemberRole } from '../data/repositories/workspaces.repository';
@@ -56,6 +56,8 @@ import {
   mergeThreadSpines,
   missingThreadKeys,
 } from '../services/thread-key/thread-spines';
+import { groupNodeEvents, type GateEventInput } from '../services/thread-key/graph-evidence';
+import { isWithinRoots, resolveAllowedMediaPath } from '../utils/media-path';
 import { activityBus } from '../services/events/activity-bus';
 import type { Activity } from '../data/repositories/activity-stream.repository';
 import {
@@ -6952,6 +6954,312 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
   } catch (error) {
     logger.error('Failed to load thread messages:', error);
     res.status(500).json(errorJson('Failed to load thread messages', error));
+  }
+});
+
+/**
+ * GET /api/admin/threads/graph-evidence?key=<threadKey>
+ *
+ * The evidence trail for a threadKey's workflow graphs, straight from the
+ * gate-event ledger: every group on the key, its nodes, and each node's
+ * events grouped by attempt with evidence classified into display fields
+ * (SHAs, links, chips, inline media). Evidence JSONB is free-form by
+ * design — requirements are a checklist, not a bouncer — so the shaping is
+ * heuristic and shape-tolerant (services/thread-key/graph-evidence.ts).
+ * No groups is a valid answer ({ groups: [] }), not a 404.
+ */
+router.get('/threads/graph-evidence', async (req: Request, res: Response) => {
+  try {
+    const key = typeof req.query.key === 'string' ? req.query.key : '';
+    if (!key) {
+      res.status(400).json({ error: 'key query parameter is required' });
+      return;
+    }
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const authReq = req as AdminAuthRequest;
+    const userId = authReq.pcpUserId;
+
+    // All statuses deliberately: a merged PR's group is 'completed' and its
+    // evidence trail is exactly what the viewer exists to show.
+    const GROUPS_CAP = 10;
+    const {
+      data: groupRows,
+      error: groupsError,
+      count: groupsCount,
+    } = await supabase
+      .from('task_groups')
+      .select('id, title, status, execution_model, execution_phase, created_at', {
+        count: 'exact',
+      })
+      .eq('user_id', userId)
+      .eq('thread_key', key)
+      .order('created_at', { ascending: true })
+      .limit(GROUPS_CAP);
+    if (groupsError) {
+      logger.error('Failed to load task groups for thread evidence:', groupsError);
+      res.status(500).json(errorJson('Failed to load graph evidence', groupsError));
+      return;
+    }
+    if (!groupRows || groupRows.length === 0) {
+      res.json({ groups: [], meta: { groups: { fetched: 0, total: groupsCount ?? 0 } } });
+      return;
+    }
+
+    const groupIds = groupRows.map((group) => group.id);
+    const { data: taskRows, error: tasksError } = await supabase
+      .from('tasks')
+      .select(
+        'id, task_group_id, title, node_slug, task_type, status, outcome, gate_state, gate_attempt, assignee_identity_id, assignee_user_id, created_at'
+      )
+      .eq('user_id', userId)
+      .in('task_group_id', groupIds)
+      .order('created_at', { ascending: true });
+    if (tasksError) {
+      logger.error('Failed to load graph nodes for thread evidence:', tasksError);
+      res.status(500).json(errorJson('Failed to load graph evidence', tasksError));
+      return;
+    }
+    const nodes = taskRows ?? [];
+
+    // Ledger rows for every node, oldest first. Capped and reported — a
+    // pathological group cannot flood the response silently.
+    const EVENTS_CAP = 500;
+    let eventRows: Array<{
+      task_id: string;
+      event: string;
+      attempt: number;
+      gate_version: number;
+      session_id: string | null;
+      actor_identity_id: string | null;
+      actor_user_id: string | null;
+      evidence: unknown;
+      reason: string | null;
+      created_at: string;
+    }> = [];
+    let eventsTotal = 0;
+    if (nodes.length > 0) {
+      const {
+        data: ledgerRows,
+        error: eventsError,
+        count: eventsCount,
+      } = await supabase
+        .from('task_gate_events')
+        .select(
+          'task_id, event, attempt, gate_version, session_id, actor_identity_id, actor_user_id, evidence, reason, created_at',
+          { count: 'exact' }
+        )
+        .eq('user_id', userId)
+        .in(
+          'task_id',
+          nodes.map((node) => node.id)
+        )
+        .order('created_at', { ascending: true })
+        .limit(EVENTS_CAP);
+      if (eventsError) {
+        logger.error('Failed to load gate events for thread evidence:', eventsError);
+        res.status(500).json(errorJson('Failed to load graph evidence', eventsError));
+        return;
+      }
+      eventRows = ledgerRows ?? [];
+      eventsTotal = eventsCount ?? eventRows.length;
+    }
+
+    // Resolve identity UUIDs and claim sessions to agent slugs so the
+    // viewer names people, not UUIDs. Claim lifecycle rows carry only a
+    // session id — the session's agent is the acting agent.
+    const identityIds = new Set<string>();
+    for (const node of nodes) {
+      if (node.assignee_identity_id) identityIds.add(node.assignee_identity_id);
+    }
+    for (const eventRow of eventRows) {
+      if (eventRow.actor_identity_id) identityIds.add(eventRow.actor_identity_id);
+    }
+    const slugByIdentityId = new Map<string, string>();
+    if (identityIds.size > 0) {
+      const { data: identityRows, error: identitiesError } = await supabase
+        .from('agent_identities')
+        .select('id, agent_id')
+        .in('id', [...identityIds]);
+      if (identitiesError) {
+        logger.error('Failed to resolve identities for thread evidence:', identitiesError);
+        res.status(500).json(errorJson('Failed to load graph evidence', identitiesError));
+        return;
+      }
+      for (const identity of identityRows ?? []) {
+        slugByIdentityId.set(identity.id, identity.agent_id);
+      }
+    }
+    const sessionIds = [
+      ...new Set(
+        eventRows.map((eventRow) => eventRow.session_id).filter((id): id is string => !!id)
+      ),
+    ];
+    const agentBySessionId = new Map<string, string>();
+    for (let chunkStart = 0; chunkStart < sessionIds.length; chunkStart += 50) {
+      const { data: sessionRows, error: sessionsError } = await supabase
+        .from('sessions')
+        .select('id, agent_id')
+        .in('id', sessionIds.slice(chunkStart, chunkStart + 50));
+      if (sessionsError) {
+        logger.error('Failed to resolve sessions for thread evidence:', sessionsError);
+        res.status(500).json(errorJson('Failed to load graph evidence', sessionsError));
+        return;
+      }
+      for (const sessionRow of sessionRows ?? []) {
+        if (sessionRow.agent_id) agentBySessionId.set(sessionRow.id, sessionRow.agent_id);
+      }
+    }
+
+    const eventsByTaskId = new Map<string, GateEventInput[]>();
+    for (const eventRow of eventRows) {
+      const shaped: GateEventInput = {
+        event: eventRow.event,
+        attempt: eventRow.attempt,
+        gateVersion: eventRow.gate_version,
+        sessionId: eventRow.session_id,
+        actorAgentSlug:
+          (eventRow.actor_identity_id && slugByIdentityId.get(eventRow.actor_identity_id)) ||
+          (eventRow.session_id && agentBySessionId.get(eventRow.session_id)) ||
+          null,
+        actorIsUser: !!eventRow.actor_user_id,
+        evidence: eventRow.evidence,
+        reason: eventRow.reason,
+        createdAt: eventRow.created_at,
+      };
+      const list = eventsByTaskId.get(eventRow.task_id) ?? [];
+      list.push(shaped);
+      eventsByTaskId.set(eventRow.task_id, list);
+    }
+
+    res.json({
+      groups: groupRows.map((group) => ({
+        id: group.id,
+        title: group.title,
+        status: group.status,
+        executionModel: group.execution_model,
+        executionPhase: group.execution_phase,
+        nodes: nodes
+          .filter((node) => node.task_group_id === group.id)
+          .map((node) => ({
+            id: node.id,
+            title: node.title,
+            nodeSlug: node.node_slug,
+            taskType: node.task_type,
+            status: node.status,
+            outcome: node.outcome,
+            gateState: node.gate_state,
+            gateAttempt: node.gate_attempt,
+            assigneeAgentSlug:
+              (node.assignee_identity_id && slugByIdentityId.get(node.assignee_identity_id)) ||
+              null,
+            assigneeIsUser: !!node.assignee_user_id,
+            attempts: groupNodeEvents(eventsByTaskId.get(node.id) ?? []),
+          })),
+      })),
+      meta: {
+        groups: { fetched: groupRows.length, total: groupsCount ?? groupRows.length },
+        events: {
+          fetched: eventRows.length,
+          total: eventsTotal,
+          truncated: eventsTotal > EVENTS_CAP,
+        },
+      },
+    });
+  } catch (error) {
+    logger.error('Failed to load graph evidence:', error);
+    res.status(500).json(errorJson('Failed to load graph evidence', error));
+  }
+});
+
+/**
+ * The monorepo root, found by walking up to the directory holding
+ * yarn.lock. The server's cwd is packages/api under yarn workspaces, so
+ * cwd-relative "docs/screenshots" would miss the real repo root (caught
+ * live on the preview server). Resolved once at module load — the
+ * documented startup exception to the no-sync-fs rule.
+ */
+function findWorkspaceRoot(startDirectory: string): string {
+  let currentDirectory = startDirectory;
+  for (let depth = 0; depth < 10; depth += 1) {
+    if (existsSync(path.join(currentDirectory, 'yarn.lock'))) return currentDirectory;
+    const parentDirectory = path.dirname(currentDirectory);
+    if (parentDirectory === currentDirectory) break;
+    currentDirectory = parentDirectory;
+  }
+  return startDirectory;
+}
+const WORKSPACE_ROOT = findWorkspaceRoot(process.cwd());
+
+// Roots the evidence media endpoint may serve from: the shared agent media
+// directory and the repo's committed review screenshots. Everything else —
+// including anything a crafted evidence row points at — resolves to null
+// and 404s without confirming existence.
+const EVIDENCE_MEDIA_ROOTS = [
+  path.join(os.homedir(), '.ink', 'files'),
+  path.join(WORKSPACE_ROOT, 'docs', 'screenshots'),
+];
+
+/**
+ * GET /api/admin/media?path=<evidence path>
+ *
+ * Streams a media file referenced by evidence (~, absolute, or
+ * repo-relative), allowlist-contained twice: lexically before touching the
+ * filesystem, then again on the realpath so a symlink inside a root cannot
+ * reach outside it. Extension gates the content type; sendFile streams.
+ */
+router.get('/media', async (req: Request, res: Response) => {
+  try {
+    const requestedPath = typeof req.query.path === 'string' ? req.query.path : '';
+    const resolved = resolveAllowedMediaPath(
+      requestedPath,
+      EVIDENCE_MEDIA_ROOTS,
+      os.homedir(),
+      WORKSPACE_ROOT
+    );
+    if (!resolved) {
+      res.status(404).json({ error: 'Not found' });
+      return;
+    }
+
+    let realPath: string;
+    let realRoots: string[];
+    try {
+      realPath = await fs.realpath(resolved.absolutePath);
+      realRoots = await Promise.all(EVIDENCE_MEDIA_ROOTS.map((root) => fs.realpath(root)));
+    } catch {
+      res.status(404).json({ error: 'Not found' });
+      return;
+    }
+    if (!isWithinRoots(realPath, realRoots)) {
+      res.status(404).json({ error: 'Not found' });
+      return;
+    }
+    const fileInfo = await fs.stat(realPath);
+    if (!fileInfo.isFile()) {
+      res.status(404).json({ error: 'Not found' });
+      return;
+    }
+
+    // Serve relative to the containing root: dotfiles-denial then applies
+    // only below the root, not to root segments like ".ink" (a whole-path
+    // sendFile 403'd every shared-media file — caught live).
+    const containingRoot = realRoots.find(
+      (root) => realPath === root || realPath.startsWith(root + path.sep)
+    );
+    if (!containingRoot) {
+      res.status(404).json({ error: 'Not found' });
+      return;
+    }
+    res.sendFile(path.relative(containingRoot, realPath), {
+      root: containingRoot,
+      dotfiles: 'deny',
+      headers: { 'Cache-Control': 'private, max-age=300' },
+    });
+  } catch (error) {
+    logger.error('Failed to serve evidence media:', error);
+    res.status(500).json(errorJson('Failed to serve media', error));
   }
 });
 
