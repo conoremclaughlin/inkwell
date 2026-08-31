@@ -35,7 +35,7 @@ function errorJson(label: string, error: unknown): Record<string, unknown> {
   return base;
 }
 import crypto from 'crypto';
-import { existsSync, promises as fs } from 'fs';
+import { promises as fs } from 'fs';
 import os from 'os';
 import path from 'path';
 import type { WorkspaceMemberRole } from '../data/repositories/workspaces.repository';
@@ -7177,29 +7177,44 @@ router.get('/threads/graph-evidence', async (req: Request, res: Response) => {
  * The monorepo root, found by walking up to the directory holding
  * yarn.lock. The server's cwd is packages/api under yarn workspaces, so
  * cwd-relative "docs/screenshots" would miss the real repo root (caught
- * live on the preview server). Resolved once at module load — the
- * documented startup exception to the no-sync-fs rule.
+ * live on the preview server). Resolved lazily on the first media request
+ * and memoized — no filesystem work at module load, fully async.
  */
-function findWorkspaceRoot(startDirectory: string): string {
+async function findWorkspaceRoot(startDirectory: string): Promise<string> {
   let currentDirectory = startDirectory;
   for (let depth = 0; depth < 10; depth += 1) {
-    if (existsSync(path.join(currentDirectory, 'yarn.lock'))) return currentDirectory;
+    try {
+      await fs.access(path.join(currentDirectory, 'yarn.lock'));
+      return currentDirectory;
+    } catch {
+      // keep walking up
+    }
     const parentDirectory = path.dirname(currentDirectory);
     if (parentDirectory === currentDirectory) break;
     currentDirectory = parentDirectory;
   }
   return startDirectory;
 }
-const WORKSPACE_ROOT = findWorkspaceRoot(process.cwd());
 
-// Roots the evidence media endpoint may serve from: the shared agent media
-// directory and the repo's committed review screenshots. Everything else —
-// including anything a crafted evidence row points at — resolves to null
-// and 404s without confirming existence.
-const EVIDENCE_MEDIA_ROOTS = [
-  path.join(os.homedir(), '.ink', 'files'),
-  path.join(WORKSPACE_ROOT, 'docs', 'screenshots'),
-];
+let workspaceRootPromise: Promise<string> | null = null;
+function getWorkspaceRoot(): Promise<string> {
+  if (!workspaceRootPromise) workspaceRootPromise = findWorkspaceRoot(process.cwd());
+  return workspaceRootPromise;
+}
+
+/**
+ * Roots the evidence media endpoint may serve from: the shared agent media
+ * directory and the repo's committed review screenshots. Everything else —
+ * including anything a crafted evidence row points at — resolves to null
+ * and 404s without confirming existence.
+ */
+async function evidenceMediaRoots(): Promise<string[]> {
+  const workspaceRoot = await getWorkspaceRoot();
+  return [
+    path.join(os.homedir(), '.ink', 'files'),
+    path.join(workspaceRoot, 'docs', 'screenshots'),
+  ];
+}
 
 /**
  * GET /api/admin/media?path=<evidence path>
@@ -7212,11 +7227,12 @@ const EVIDENCE_MEDIA_ROOTS = [
 router.get('/media', async (req: Request, res: Response) => {
   try {
     const requestedPath = typeof req.query.path === 'string' ? req.query.path : '';
+    const mediaRoots = await evidenceMediaRoots();
     const resolved = resolveAllowedMediaPath(
       requestedPath,
-      EVIDENCE_MEDIA_ROOTS,
+      mediaRoots,
       os.homedir(),
-      WORKSPACE_ROOT
+      await getWorkspaceRoot()
     );
     if (!resolved) {
       res.status(404).json({ error: 'Not found' });
@@ -7227,7 +7243,7 @@ router.get('/media', async (req: Request, res: Response) => {
     let realRoots: string[];
     try {
       realPath = await fs.realpath(resolved.absolutePath);
-      realRoots = await Promise.all(EVIDENCE_MEDIA_ROOTS.map((root) => fs.realpath(root)));
+      realRoots = await Promise.all(mediaRoots.map((root) => fs.realpath(root)));
     } catch {
       res.status(404).json({ error: 'Not found' });
       return;
