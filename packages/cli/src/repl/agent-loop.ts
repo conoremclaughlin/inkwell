@@ -699,22 +699,50 @@ export function isTerminalSignalToolResult(result: unknown): boolean {
  *
  * Returns the reason to stop, or null to continue.
  */
+/** An outcome where the call actually ran. Nothing to report as unseen. */
+const RAN_STATUSES: ReadonlySet<string> = new Set(['executed', 'approved']);
+
+/**
+ * Outcomes somebody AUTHORED and watched happen.
+ *
+ * `denied` is a human clicking no. `blocked` is a policy rule someone wrote.
+ * `rejected` is an iteration the screen refused, and the loop already feeds
+ * that reason back on its own path. Relaying these would re-prompt a person
+ * about a decision they just made.
+ */
+const WITNESSED_REFUSAL_STATUSES: ReadonlySet<string> = new Set(['blocked', 'denied', 'rejected']);
+
 /**
  * True when an iteration contains a failure the agent has not been told about.
  *
- * `error` means the call raised — a validation rejection, a transport failure,
- * a thrown handler. Nothing displayed it and nothing recorded it anywhere the
- * agent can read, so a turn that ends here ends with the agent believing it
- * asked for something and hearing nothing back.
+ * A DENYLIST of authored refusals, not an allowlist of known failures, and the
+ * direction matters more than the contents (Myra, 2026-08-31):
  *
- * Denials and blocks are deliberately NOT included: those were authored by
- * someone who saw them happen, and relaying them re-prompts a human who already
- * said no.
+ *   an allowlist of failure kinds can only ever be wrong toward SILENCE.
+ *
+ * Listing `error` and relaying only that would repair this bug while leaving
+ * its shape in place: invent `'timeout'` in a transport layer next year and it
+ * inherits the exact defect, discovered — as this one was — by accident, late,
+ * possibly with a consequence attached. Inverting it can only be wrong toward
+ * NOISE: a genuinely new refusal kind relays until someone adds it below, which
+ * is a line of code and a mild annoyance, and it reports itself immediately.
+ *
+ * The asymmetry is not incidental to this codebase; it is the whole subject of
+ * the defect group this fix came from.
+ *
+ * Enumerating refusals is safe in a way enumerating failures is not, because
+ * refusals are *authored*: whoever adds a new one is, by construction, in a
+ * position to know they are adding a refusal and to put it here. Failures are
+ * emergent — a new exception path, a validation layer added in a file that has
+ * nothing to do with this loop — and nobody writing those has read this
+ * predicate. What makes a refusal swallowable is its provenance, not its name.
  */
 export function hasUnseenFailure(
   iterationResults: ReadonlyArray<Pick<ToolResultRecord, 'status'>>
 ): boolean {
-  return iterationResults.some((r) => r.status === 'error');
+  return iterationResults.some(
+    (r) => !RAN_STATUSES.has(r.status) && !WITNESSED_REFUSAL_STATUSES.has(r.status)
+  );
 }
 
 export function toolLoopStopReason(

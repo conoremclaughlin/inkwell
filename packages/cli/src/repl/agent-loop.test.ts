@@ -728,11 +728,50 @@ describe('hasUnseenFailure', () => {
     expect(hasUnseenFailure([{ status: 'error' }])).toBe(true);
   });
 
+  // Authored outcomes: someone clicked no, wrote the rule, or the screen
+  // refused the iteration and the loop already fed that reason back.
   it.each(['blocked', 'denied', 'rejected'])('does not count a witnessed %s', (status) => {
     expect(hasUnseenFailure([{ status }])).toBe(false);
   });
 
   it('does not count a clean iteration', () => {
     expect(hasUnseenFailure([{ status: 'executed' }, { status: 'approved' }])).toBe(false);
+  });
+
+  /**
+   * THE DEFAULT — the actual thing under discussion.
+   *
+   * Every other case here tests a status somebody already thought of. This one
+   * tests what happens to a status nobody has defined, which is the only way to
+   * pin the DIRECTION of the predicate rather than its current contents.
+   *
+   * Keyed as `status === 'error'` this fails. As a denylist of authored
+   * refusals it passes, and it keeps passing when a transport layer invents
+   * 'timeout' in 2027 without reading this file. An allowlist of failure kinds
+   * can only ever be wrong toward silence, which is the defect this repairs.
+   */
+  it('treats an unrecognized terminal status as unseen — loud by default', () => {
+    expect(hasUnseenFailure([{ status: 'timeout' }])).toBe(true);
+    expect(hasUnseenFailure([{ status: 'quota-exhausted' }])).toBe(true);
+    expect(hasUnseenFailure([{ status: 'some-status-nobody-has-written-yet' }])).toBe(true);
+  });
+});
+
+describe('an unrecognized failure status reaches the model', () => {
+  // The same default, driven through the whole loop rather than the predicate:
+  // a status invented outside this file must still reach the continuation body.
+  it('relays a terminal status that appears in neither list', async () => {
+    const harness = makePorts(
+      [
+        outcome({ responseText: inkTool('send_response') }),
+        outcome({ responseText: 'the send timed out; retrying next turn' }),
+      ],
+      () => [{ tool: 'send_response', result: 'upstream timed out after 30s', status: 'timeout' }]
+    );
+
+    await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+
+    expect(harness.prompts).toHaveLength(2);
+    expect(harness.prompts[1].body).toContain('upstream timed out');
   });
 });
