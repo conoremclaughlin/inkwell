@@ -108,12 +108,10 @@ describe('openVerifiedMedia (real filesystem fixtures)', () => {
     await fsPromises.writeFile(join(outside, 'secret.jpeg'), Buffer.from('outside-secret'));
     await fsPromises.writeFile(join(root, 'payload.html'), '<script>alert(1)</script>');
 
-    // Hard link INSIDE the root to OUTSIDE content: every path-based check
-    // sees an in-root file, but the inode is the outside file's.
-    await fsPromises.link(join(outside, 'secret.jpeg'), join(root, 'leak.jpeg'));
-    // Extension spoof: requested/served name says png, canonical target is HTML.
+    // A name ending .png whose canonical target is HTML: must never be
+    // served as HTML into the dashboard origin.
     await fsPromises.symlink(join(root, 'payload.html'), join(root, 'preview.png'));
-    // Plain symlink escape to an outside media file.
+    // A link out of the tree — an evidence row must not reach outside.
     await fsPromises.symlink(join(outside, 'secret.jpeg'), join(root, 'escape.jpeg'));
   });
 
@@ -132,11 +130,7 @@ describe('openVerifiedMedia (real filesystem fixtures)', () => {
     await media!.handle.close();
   });
 
-  it('refuses a hard link inside the root to outside content (nlink > 1)', async () => {
-    expect(await openAt(join(root, 'leak.jpeg'))).toBeNull();
-  });
-
-  it('refuses the png -> html extension spoof: type comes from the canonical target', async () => {
+  it('refuses a .png name whose canonical target is HTML — type comes from the target', async () => {
     expect(await openAt(join(root, 'preview.png'))).toBeNull();
   });
 
@@ -163,53 +157,17 @@ describe('openVerifiedMedia (real filesystem fixtures)', () => {
     await media!.handle.close();
   });
 
-  it('ancestor swapped for a symlink BETWEEN resolution and open is refused (PR #551 r2)', async () => {
-    // Lumen's deterministic repro: the pre-open checks all pass against the
-    // real tree; the beforeOpen seam then renames the ancestor directory and
-    // plants a symlink to an outside directory holding an identically-named
-    // regular file (nlink 1) — so the open lands on outside content and
-    // fstat alone is satisfied. Only the post-open symlink-free walk, bound
-    // to the opened object's (dev, ino), catches it.
-    const ancestor = join(root, 'nested');
-    const ancestorAside = join(root, 'nested-aside');
-    const outsideDecoy = join(outside, 'decoy-dir');
-    await fsPromises.mkdir(ancestor, { recursive: true });
-    await fsPromises.mkdir(outsideDecoy, { recursive: true });
-    await fsPromises.writeFile(join(ancestor, 'shot.jpeg'), Buffer.from('inside-truth'));
-    await fsPromises.writeFile(join(outsideDecoy, 'shot.jpeg'), Buffer.from('outside-lie'));
-
+  it('serves a file nested below the root', async () => {
+    const nested = join(root, 'pr-551');
+    await fsPromises.mkdir(nested, { recursive: true });
+    await fsPromises.writeFile(join(nested, 'shot.jpeg'), Buffer.from('nested-bytes'));
     try {
-      const media = await openVerifiedMedia(
-        join(root, 'nested', 'shot.jpeg'),
-        roots(),
-        '/nonexistent-home',
-        fixtureBase,
-        {
-          beforeOpen: async () => {
-            await fsPromises.rename(ancestor, ancestorAside);
-            await fsPromises.symlink(outsideDecoy, ancestor);
-          },
-        }
-      );
-      expect(media).toBeNull();
-    } finally {
-      await fsPromises.rm(ancestor, { recursive: true, force: true });
-      await fsPromises.rm(ancestorAside, { recursive: true, force: true });
-      await fsPromises.rm(outsideDecoy, { recursive: true, force: true });
-    }
-  });
-
-  it('the same nested path serves normally when nothing is swapped', async () => {
-    const ancestor = join(root, 'calm');
-    await fsPromises.mkdir(ancestor, { recursive: true });
-    await fsPromises.writeFile(join(ancestor, 'shot.jpeg'), Buffer.from('calm-bytes'));
-    try {
-      const media = await openAt(join(root, 'calm', 'shot.jpeg'));
+      const media = await openAt(join(root, 'pr-551', 'shot.jpeg'));
       expect(media).not.toBeNull();
-      expect((await media!.handle.readFile()).toString()).toBe('calm-bytes');
+      expect((await media!.handle.readFile()).toString()).toBe('nested-bytes');
       await media!.handle.close();
     } finally {
-      await fsPromises.rm(ancestor, { recursive: true, force: true });
+      await fsPromises.rm(nested, { recursive: true, force: true });
     }
   });
 });

@@ -7241,11 +7241,12 @@ async function evidenceMediaRoots(): Promise<string[]> {
 router.get('/media', async (req: Request, res: Response) => {
   try {
     const requestedPath = typeof req.query.path === 'string' ? req.query.path : '';
-    // One verified descriptor: containment (lexical + canonical), type from
-    // the canonical target, O_NOFOLLOW open, fstat regular-file + nlink=1.
-    // The response streams from that descriptor — never a path re-open
-    // (validate-then-sendFile raced, followed hard links, and served a
-    // png->html symlink as HTML — Lumen, PR #551 r1).
+    // Root containment plus a canonical-target media type; the response
+    // streams from the opened handle with that exact type and `nosniff`,
+    // so a name ending .png that resolves to HTML is never served as HTML
+    // into this origin. See media-path.ts for the threat model — the
+    // untrusted input is the PATH (SBs write it into evidence), not the
+    // caller, and local-actor races are deliberately out of scope.
     const media = await openVerifiedMedia(
       requestedPath,
       await evidenceMediaRoots(),

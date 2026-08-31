@@ -1,22 +1,41 @@
 /**
- * Media path resolution and verified opening for the evidence viewer's
- * file endpoint.
+ * Media resolution for the evidence viewer's file endpoint.
  *
- * Evidence items reference files by the paths agents actually use — a
- * shared-media path (~/.ink/files/...), an absolute path, or a
- * repo-relative screenshot path (docs/screenshots/pr-N/...). The endpoint
- * serves ONLY files that resolve inside an allowlisted root and whose
- * CANONICAL target is a recognized media type; everything else is a 404
- * with no explanation (the response must not confirm what exists outside
- * the roots).
+ * ## Threat model (read this before adding checks)
  *
- * Serving consumes the one descriptor `openVerifiedMedia` validated —
- * never a path re-open. Validate-then-reopen (realpath/stat + sendFile)
- * left three holes (Lumen, PR #551 r1): a swap between validation and
- * open served unvalidated content; a hard link inside a root to outside
- * content passed containment while sharing the outside inode; and
- * `preview.png -> payload.html` passed the requested extension, then the
- * reopened canonical target was served as HTML into the dashboard origin.
+ * The untrusted input here is NOT the caller — the endpoint is behind admin
+ * auth. It is the PATH, which comes out of evidence JSONB that SBs write
+ * autonomously into the gate ledger. The case worth designing against is an
+ * agent writing a reference it shouldn't, which then renders in the owner's
+ * authenticated dashboard session.
+ *
+ * We deliberately do NOT defend against a local actor who can write to the
+ * media directories or rename their contents. Anyone with that capability
+ * reads the files directly and never involves this endpoint, so hardening
+ * that boundary buys nothing and costs real complexity (Conor, 2026-08-31).
+ * An earlier revision carried a post-open lstat walk, (dev, ino) binding,
+ * an nlink === 1 rule, and a production test seam to make the race
+ * testable; all of it was removed as defense against a threat this system
+ * does not face — and nlink === 1 additionally refused legitimately
+ * hard-linked files.
+ *
+ * The durable fix is upstream of this file: media should be referenced by a
+ * NAME inside a space the producing agent owns (~/.ink/files/<agentId>/…),
+ * not by a filesystem path at all. Then "is this allowed" is a namespace
+ * lookup rather than a question about paths. Until evidence is authored
+ * that way, this module accepts the paths agents already write and requires
+ * them to land inside a known root.
+ *
+ * What remains, and why each part earns its place:
+ *
+ * - Root containment (lexical, then canonical): an evidence row naming
+ *   `~/.ink/files/../../.ssh/id_rsa` must not resolve to a served file.
+ * - Canonical-target extension allowlist with an exact Content-Type and
+ *   `nosniff`: a file that resolves to HTML must never be served as HTML
+ *   into the dashboard's own origin. This is correct content handling, not
+ *   adversary defense — it would matter with no attacker at all.
+ * - Regular-file check (with a non-blocking open, so the check is
+ *   reachable): the endpoint must not hang on a non-file.
  */
 
 import { promises as fsPromises, constants as fsConstants } from 'fs';
@@ -66,8 +85,8 @@ export interface ResolvedMediaPath {
  * Lexically resolve a requested evidence path against the allowlist.
  * Returns null (serve nothing) unless the path lands inside an allowed
  * root AND names a recognized media type. Relative paths resolve against
- * the FIRST root that contains the result — in practice the repo-relative
- * screenshot convention — never against the process cwd at large.
+ * the repo root — in practice the committed-screenshot convention — never
+ * against the process cwd at large.
  */
 export function resolveAllowedMediaPath(
   requestedPath: string,
@@ -96,99 +115,32 @@ export function resolveAllowedMediaPath(
 }
 
 export interface VerifiedMedia {
-  /** The one validated descriptor — stream THIS, never re-open the path. */
+  /** Open handle for the response to stream; the caller closes it. */
   handle: FileHandle;
   mediaType: MediaType;
   contentType: string;
   size: number;
 }
 
-/** Test-only seam: runs between path resolution and the open, where the
- *  ancestor-swap race lives. Production callers never pass it. */
-export interface OpenVerifiedMediaTestHooks {
-  beforeOpen?: () => void | Promise<void>;
-}
-
 /**
- * Post-open containment proof, bound to the OPENED object rather than any
- * pre-open pathname (Lumen, PR #551 r2: between realpath and open, an
- * ancestor directory can be renamed and replaced with a symlink to an
- * outside directory — the opened handle then reads outside content while
- * every pre-open check and fstat still passes).
+ * Resolve a requested evidence path and open it for streaming, or return
+ * null (serve nothing, reveal nothing) when any requirement fails:
  *
- * Strictly AFTER the open, walk the canonical path from the trusted root
- * with lstat: every ancestor must be a real directory (never a symlink),
- * and the final entry must be a non-symlink regular file whose (dev, ino)
- * is exactly the held descriptor's, with nlink === 1 at both fstat and
- * walk time. Why this binds to the object: nlink === 1 means the object
- * has exactly one name anywhere, and a symlink-free chain from the root
- * proves that one name lives beneath the root — so the object we already
- * hold IS root content. An attacker can only satisfy this by physically
- * moving their file's sole link inside the root, at which point it is
- * root content by definition and serving it discloses nothing beyond
- * what root-write access already grants.
- *
- * Under non-attack conditions the walk is trivially clean: realpath
- * output contains no symlinks at resolution time.
- */
-async function openedObjectIsBeneathRoot(
-  handleDev: number,
-  handleIno: number,
-  canonicalPath: string,
-  containingRoot: string
-): Promise<boolean> {
-  try {
-    const rootInfo = await fsPromises.lstat(containingRoot);
-    if (rootInfo.isSymbolicLink() || !rootInfo.isDirectory()) return false;
-
-    const relativePath = canonicalPath.slice(containingRoot.length + sep.length);
-    const segments = relativePath.split(sep);
-    let walkPath = containingRoot;
-    for (let index = 0; index < segments.length - 1; index += 1) {
-      walkPath = `${walkPath}${sep}${segments[index]}`;
-      const ancestorInfo = await fsPromises.lstat(walkPath);
-      if (ancestorInfo.isSymbolicLink() || !ancestorInfo.isDirectory()) return false;
-    }
-
-    const finalInfo = await fsPromises.lstat(`${walkPath}${sep}${segments[segments.length - 1]}`);
-    return (
-      !finalInfo.isSymbolicLink() &&
-      finalInfo.isFile() &&
-      finalInfo.nlink === 1 &&
-      finalInfo.dev === handleDev &&
-      finalInfo.ino === handleIno
-    );
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Resolve, canonicalize, and open a media file as one verified descriptor.
- * Returns null (serve nothing, reveal nothing) unless every check passes:
- *
- * 1. Lexical containment of the requested path (resolveAllowedMediaPath).
- * 2. Realpath containment inside a realpathed root — roots resolved
- *    independently, so one missing root never disables the others.
- * 3. Media type and Content-Type from the CANONICAL target's extension —
- *    a `preview.png -> payload.html` symlink is refused here, and can
- *    never be served as HTML.
- * 4. Open with O_NOFOLLOW (a final-component symlink swapped in after
- *    realpath is refused) and O_NONBLOCK (a FIFO cannot hang the open).
- * 5. fstat on the DESCRIPTOR: regular file only, and nlink === 1 — a hard
- *    link inside a root shares its inode with outside content while
- *    passing every path-based check, so multi-link files are refused
- *    outright.
- *
- * The caller streams from the returned handle and closes it. Everything
- * validated and everything served is the same open file description.
+ * 1. The requested path resolves inside an allowed root.
+ * 2. Its canonical target — symlinks followed — is still inside a root.
+ *    Roots resolve independently, so one missing root never disables the
+ *    others.
+ * 3. The CANONICAL target's extension names a known media type, which also
+ *    fixes the Content-Type. A name that says `.png` but resolves to HTML
+ *    is refused here rather than served as HTML.
+ * 4. The opened file is a regular file. The open is non-blocking so this
+ *    check is reachable for things like FIFOs rather than hanging first.
  */
 export async function openVerifiedMedia(
   requestedPath: string,
   allowedRoots: string[],
   homeDirectory: string,
-  repoRoot: string,
-  testHooks?: OpenVerifiedMediaTestHooks
+  repoRoot: string
 ): Promise<VerifiedMedia | null> {
   const lexical = resolveAllowedMediaPath(requestedPath, allowedRoots, homeDirectory, repoRoot);
   if (!lexical) return null;
@@ -208,44 +160,21 @@ export async function openVerifiedMedia(
     return null;
   }
   if (!isWithinRoots(canonicalPath, realRoots)) return null;
-  const containingRoot = realRoots.find(
-    (root) => canonicalPath === root || canonicalPath.startsWith(root + sep)
-  );
-  if (!containingRoot || canonicalPath === containingRoot) return null;
 
   const mediaType = mediaTypeForPath(canonicalPath);
   const contentType = contentTypeForCanonicalPath(canonicalPath);
   if (!mediaType || !contentType) return null;
 
-  if (testHooks?.beforeOpen) await testHooks.beforeOpen();
-
   let handle: FileHandle;
   try {
-    handle = await fsPromises.open(
-      canonicalPath,
-      fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK
-    );
+    handle = await fsPromises.open(canonicalPath, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK);
   } catch {
     return null;
   }
 
   try {
     const fileInfo = await handle.stat();
-    if (!fileInfo.isFile() || fileInfo.nlink !== 1) {
-      await handle.close();
-      return null;
-    }
-    // Containment bound to the opened object: prove the held descriptor's
-    // (dev, ino) is reachable from the trusted root through a symlink-free
-    // chain AFTER the open. An ancestor swapped for a symlink between
-    // realpath and open fails this walk, whatever the fd's own stats say.
-    const beneathRoot = await openedObjectIsBeneathRoot(
-      fileInfo.dev,
-      fileInfo.ino,
-      canonicalPath,
-      containingRoot
-    );
-    if (!beneathRoot) {
+    if (!fileInfo.isFile()) {
       await handle.close();
       return null;
     }
