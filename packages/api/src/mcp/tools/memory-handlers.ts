@@ -751,6 +751,12 @@ export const updateSessionStateSchema = userIdentifierBaseSchema.extend({
     .describe(
       '[Deprecated] Use lifecycle. Kept for backward compat — ignored when lifecycle is set.'
     ),
+  reopen: z
+    .boolean()
+    .optional()
+    .describe(
+      'The user explicitly chose this finished session out of their history and is continuing it: clears ended_at and restores a live lifecycle. Set this ONLY for a human selection — automatic routing and hooks must leave a completed session terminal, since ended_at is the fence that stops a finished thread swallowing its next trigger.'
+    ),
   context: z.string().optional().describe('Brief context of current work state'),
   workingDir: z.string().optional().describe('Working directory'),
   cliAttached: z
@@ -1764,6 +1770,41 @@ export function shouldStampEndedAt(params: { status?: string; lifecycle?: string
   return params.status === 'completed' || params.lifecycle === 'completed';
 }
 
+/**
+ * The other direction: a human picked a finished session out of their history
+ * and is continuing it, so it is not finished any more.
+ *
+ * This exists because `status: 'active'` is — and has always been — a no-op, so
+ * the first turn after selecting a completed row left `ended_at` set and
+ * `lifecycle` terminal while the chat was visibly generating. The row stayed
+ * invisible to `list_sessions(status: 'attachable')`, to active-session lookup,
+ * and to `findByThreadKey`, so a trigger on that thread could open a SECOND
+ * session while the human was typing into the first.
+ *
+ * Deliberately an explicit opt-in rather than "any live lifecycle clears it".
+ * `ended_at` is the terminal fence automatic routing relies on (see
+ * shouldStampEndedAt above, PR #349): if a plain `lifecycle: 'running'` cleared
+ * it, every hook and runner that reports liveness would silently revive
+ * finished sessions and re-point their threads. Only a caller that means
+ * "the user chose this one" may say so, and only the interactive picker does.
+ */
+export function shouldClearEndedAt(params: {
+  reopen?: boolean;
+  status?: string;
+  lifecycle?: string;
+}): boolean {
+  if (params.reopen !== true) return false;
+  // Reopening INTO a terminal state is contradictory; let the completion win
+  // rather than writing a live row with a completed lifecycle. `status` is
+  // checked as well as `lifecycle` because either spelling can carry the
+  // completion — the same reason shouldStampEndedAt checks both. Testing the
+  // two predicates against each other is what surfaced this: `reopen: true`
+  // with the legacy `status: 'completed'` made BOTH true, so which won came
+  // down to branch order rather than to what the caller asked for.
+  if (shouldStampEndedAt({ status: params.status, lifecycle: params.lifecycle })) return false;
+  return params.lifecycle !== 'failed';
+}
+
 function buildPhaseTransitionMemoryContent(params: {
   phase: string;
   note?: string;
@@ -1984,6 +2025,17 @@ export async function handleUpdateSessionState(args: unknown, dataComposer: Data
 
   if (shouldStampEndedAt({ status: params.status, lifecycle: updates.lifecycle })) {
     updates.endedAt = new Date();
+  } else if (
+    shouldClearEndedAt({
+      reopen: params.reopen,
+      status: params.status,
+      lifecycle: updates.lifecycle,
+    })
+  ) {
+    // Clear the fence and restore a live lifecycle in one write, so the row is
+    // never briefly live-with-an-end-date or ended-with-a-live-lifecycle.
+    updates.endedAt = null;
+    if (updates.lifecycle === undefined) updates.lifecycle = 'running';
   }
 
   if (params.backendSessionId !== undefined) {
