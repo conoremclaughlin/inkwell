@@ -578,7 +578,7 @@ export class MCPServer {
 
       await runWithRequestContext(ctx, async () => {
         let transport: StreamableHTTPServerTransport | undefined;
-        let mcpServer: ReturnType<typeof this.createMcpServerInstance> | undefined;
+        let mcpServer: McpServer | undefined;
         try {
           // Stateless: fresh transport per request — no session IDs, no stale sessions
           transport = new StreamableHTTPServerTransport({
