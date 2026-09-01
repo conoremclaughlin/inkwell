@@ -5593,12 +5593,20 @@ describe('SessionService', () => {
       // Routing completed; the turn failed. The trigger handler must be able
       // to tell this apart from a routing failure — it clears the thread's
       // routingHold on admitted outcomes so a stale occupied/no-route marker
-      // does not misdiagnose a runner crash.
-      mockClaudeRunner.run = vi.fn().mockRejectedValue(new Error('runner crashed'));
-      const result = await sessionService.handleMessage(createMockRequest());
+      // does not misdiagnose a runner crash. Both post-admission failure
+      // shapes: the runner RETURNS failure (direct return path), and the
+      // runner THROWS (the catch's tracked flag).
+      mockClaudeRunner.run = vi
+        .fn()
+        .mockResolvedValue(createMockClaudeResult({ success: false, error: 'runner crashed' }));
+      const returned = await sessionService.handleMessage(createMockRequest());
+      expect(returned.success).toBe(false);
+      expect(returned.admitted).toBe(true);
 
-      expect(result.success).toBe(false);
-      expect(result.admitted).toBe(true);
+      mockClaudeRunner.run = vi.fn().mockRejectedValue(new Error('runner exploded'));
+      const threw = await sessionService.handleMessage(createMockRequest());
+      expect(threw.success).toBe(false);
+      expect(threw.admitted).toBe(true);
     });
 
     it('a PRE-admission failure that is not a refusal reports admitted: false — the hold stays', async () => {
