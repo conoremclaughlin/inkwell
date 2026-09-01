@@ -508,6 +508,29 @@ export class TaskGroupsRepository {
    * structured refusal (not-ready / already-claimed / gate-not-open /
    * approval-gate / group-not-active / not-graph-mode).
    */
+  /**
+   * Clear stale graphDispatchedAt stamps so interrupted turns are dispatchable
+   * again on the next sweep.
+   *
+   * Every decision — which groups have provably-finished sessions, which still
+   * look alive, which stamps predate the cutoff — is made inside the RPC, and
+   * the key is removed in place. Doing any of it here would reintroduce the
+   * read-modify-write that PR #559 review rejected: a fresh dispatch landing
+   * mid-round would have its new stamp overwritten by a stale snapshot.
+   */
+  async reconcileGraphDispatchStamps(params: {
+    /** Stamps at or after this instant are the caller's own and are left alone. */
+    staleBefore: string;
+    liveWindowMs?: number;
+  }): Promise<Record<string, unknown>> {
+    const { data, error } = await this.client.rpc('reconcile_graph_dispatch_stamps', {
+      p_stale_before: params.staleBefore,
+      p_live_window_ms: params.liveWindowMs ?? 600_000,
+    });
+    if (error) throw new Error(`reconcile_graph_dispatch_stamps failed: ${error.message}`);
+    return data as Record<string, unknown>;
+  }
+
   async claimGraphTask(params: {
     userId: string;
     taskId: string;

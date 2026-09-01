@@ -175,3 +175,6 @@ packages/api/output/
 packages/cli/.ink/
 packages/cli/.ink/
 *.png
+
+# Studio runtime state (contains identity + operator email — never commit)
+.pcp/

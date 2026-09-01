@@ -99,6 +99,11 @@ export JWT_SECRET="${JWT_SECRET:-${AUTH_JWT_SECRET:-}}"
 export NODE_ENV="test"
 export INK_ALLOW_REMOTE_INTEGRATION_DB="0"
 export INTEGRATION_SUPABASE_WORKDIR="${SUPABASE_WORKDIR}"
+# Direct Postgres URL, for the few tests that need a SECOND connection and so
+# cannot go through PostgREST — concurrency regressions where one transaction
+# must hold a row lock while another statement waits on it. PostgREST gives one
+# transaction per request and cannot express that.
+export INTEGRATION_DB_URL="${DB_URL:-postgresql://postgres:postgres@127.0.0.1:${DB_PORT}/postgres}"
 
 if [[ -z "${SUPABASE_URL}" || -z "${SUPABASE_SECRET_KEY}" || -z "${JWT_SECRET}" ]]; then
   echo "[integration-db] Failed to derive required env vars from supabase status output." >&2
