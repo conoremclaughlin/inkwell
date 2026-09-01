@@ -1527,6 +1527,63 @@ describe('handleSendToInbox — system sender and cross-agent studio routing', (
     expect(parsed.triggered).toContain('wren');
   });
 
+  it('strategy sends carry forceSpawn as a first-class payload field (v18 S3)', async () => {
+    // The trigger handler's delivery decision takes force-spawn as an
+    // explicit input; the mapping from the strategy service's
+    // metadata.strategyTrigger to the field happens HERE, at the send
+    // boundary — not rediscovered downstream.
+    const { getAgentGateway } = await import('../../channels/agent-gateway.js');
+    const mockGateway = (getAgentGateway as ReturnType<typeof vi.fn>)();
+
+    const { getRequestContext, getSessionContext } = await import('../../utils/request-context');
+    vi.mocked(getRequestContext).mockReturnValue(undefined as never);
+    vi.mocked(getSessionContext).mockReturnValue(undefined as never);
+
+    const mockSb = createThreadMockSupabase({ existingThread: undefined });
+    const mockDc = createThreadMockDataComposer(mockSb);
+
+    const result = await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientAgentId: 'wren',
+        senderAgentId: 'system',
+        threadKey: 'strategy:group-1',
+        content: 'Kick off the strategy task',
+        messageType: 'session_resume',
+        trigger: true,
+        metadata: { source: 'strategy_service', strategyTrigger: true, groupId: 'group-1' },
+      },
+      mockDc as never
+    );
+
+    expect(JSON.parse(result.content[0].text).success).toBe(true);
+    expect(mockGateway.dispatchTrigger).toHaveBeenCalledWith(
+      expect.objectContaining({ toAgentId: 'wren', forceSpawn: true })
+    );
+
+    // Contrast: an ordinary send maps NO forceSpawn — inline delivery stays
+    // available for it.
+    vi.mocked(mockGateway.dispatchTrigger).mockClear();
+    await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientAgentId: 'wren',
+        senderAgentId: 'system',
+        threadKey: 'strategy:group-1',
+        content: 'plain message',
+        messageType: 'notification',
+        trigger: true,
+      },
+      mockDc as never
+    );
+    const plainPayload = vi.mocked(mockGateway.dispatchTrigger).mock.calls[0]?.[0] as Record<
+      string,
+      unknown
+    >;
+    expect(plainPayload).toBeDefined();
+    expect(plainPayload.forceSpawn).toBeUndefined();
+  });
+
   it('trigger:false still dispatches a routeOnly assignment and wakes nobody (spec §3a)', async () => {
     const { getAgentGateway } = await import('../../channels/agent-gateway.js');
     const mockGateway = (getAgentGateway as ReturnType<typeof vi.fn>)();

@@ -551,6 +551,8 @@ export class SessionService implements ISessionService {
       sbId?: string | null;
       /** Positively established: no identity row exists — slug is the proof. */
       identityAbsent?: boolean;
+      /** v18 S3: decision-only resolution — never mint an overflow worktree. */
+      planOnly?: boolean;
     }
   ): Promise<StudioRoutingDecision> {
     const leases = this.getLeaseService();
@@ -635,6 +637,39 @@ export class SessionService implements ISessionService {
           policy: 'reuse-only',
         },
       };
+    }
+
+    // v18 S3: plan-time resolution decides, it never provisions. An overflow
+    // that ALREADY exists for this thread is still the placement (the
+    // threadKey reuse rung is studio-scoped, so resolving to the candidate
+    // here would hide the thread's existing overflow session) — but when no
+    // overflow exists, the plan returns the occupied candidate unmodified and
+    // the mint happens at spawn admission (`withStudioLease` diverts when its
+    // acquire meets the same holder). No process, no worktree.
+    if (ctx.planOnly) {
+      const existingOverflow = await this.findExistingOverflow(candidateStudioId, ctx);
+      logger.info('[StudioResolve] Studio leased by another thread (plan) — mint deferred', {
+        studioId: candidateStudioId,
+        tier,
+        threadKey: ctx.threadKey,
+        holderThreadKey: holder.threadKey,
+        holderSessionId: holder.sessionId,
+        existingOverflowId: existingOverflow?.id ?? null,
+      });
+      if (existingOverflow) {
+        return {
+          studioId: existingOverflow.id,
+          tier,
+          occupancyChecked: true,
+          diverted: {
+            from: candidateStudioId,
+            holderThreadKey: holder.threadKey,
+            holderSessionId: holder.sessionId,
+            via: 'overflow',
+          },
+        };
+      }
+      return { studioId: candidateStudioId, tier, occupancyChecked: true };
     }
 
     logger.info('[StudioResolve] Studio leased by another thread; diverting to overflow', {
@@ -795,6 +830,28 @@ export class SessionService implements ISessionService {
     });
   }
 
+  /**
+   * Read-only twin of divertToOverflow (v18 S3): the live overflow studio
+   * this thread would reuse, or null. Same ownership guard, no provisioning
+   * — plan-time routing calls this so placement stays continuous with an
+   * overflow a previous SPAWN built, without ever building one itself.
+   */
+  private async findExistingOverflow(
+    parentStudioId: string,
+    ctx: { userId: string; agentId: string; threadKey?: string }
+  ): Promise<Studio | null> {
+    const overflowService = this.getOverflowService();
+    const studios = this.getStudiosRepo();
+    if (!overflowService || !studios || !ctx.threadKey) return null;
+    const parent = await studios.findById(parentStudioId).catch(() => null);
+    if (!parent || parent.userId !== ctx.userId) return null;
+    return overflowService.findOverflowStudio({
+      userId: ctx.userId,
+      parentStudio: parent,
+      threadKey: ctx.threadKey,
+    });
+  }
+
   private async divertToOverflow(
     parentStudioId: string,
     ctx: { userId: string; agentId: string; threadKey?: string }
@@ -844,10 +901,27 @@ export class SessionService implements ISessionService {
       threadKey?: string;
       writeIntent?: WriteIntent;
       studioPolicy?: StudioPolicy;
+      /** v18 S3: plan resolution — no acquire, no divert, no rebind. */
+      planOnly?: boolean;
     }
   ): Promise<Session> {
     const leases = this.getLeaseService();
     if (!leases || !ctx.threadKey || !session.studioId) return session;
+
+    // v18 S3: a plan answers "which session, where would it run" — it is
+    // never handed to a runner, so it must not mutate lease state (a
+    // routeOnly stamp or an inline deposit to an attached terminal changes
+    // neither placement nor the holder set), and it must not provision. The
+    // spawn path re-resolves WITHOUT planOnly and this gate runs in full:
+    // admission rechecks occupancy and atomically acquires or diverts.
+    if (ctx.planOnly) {
+      logger.debug('[StudioLease] Plan resolution — lease acquisition deferred to spawn', {
+        sessionId: session.id,
+        studioId: session.studioId,
+        threadKey: ctx.threadKey,
+      });
+      return session;
+    }
 
     // Phase 6b: acquisition on INTENT, not arrival. Presence-typed threads
     // bind to the studio without taking the write lease — they run FROM the
@@ -1093,6 +1167,15 @@ export class SessionService implements ISessionService {
       });
     }
 
+    // Admission evidence (v18 S3, Lumen PR #565 r2): whether this message got
+    // PAST routing — session resolved, any required occupancy rechecked and
+    // provisioning/lease acquisition landed. Everything after that point is
+    // backend/delivery, and its failures must stay distinguishable from
+    // routing failures: the trigger handler clears a thread's routingHold on
+    // admitted outcomes even when the turn itself failed, and retains it only
+    // for refusals and truly pre-admission failures.
+    let admitted = false;
+
     try {
       // 1. Get or create session (needed to determine lock key)
       const session = await this.getOrCreateSession(userId, agentId, {
@@ -1107,6 +1190,7 @@ export class SessionService implements ISessionService {
         contactId: metadata?.contactId,
         repoRoot: metadata?.repoRoot,
       });
+      admitted = true;
 
       // Backfill mission linkage now that routing resolved: a check-in that
       // landed in a session bound to a mission thread (e.g. a Telegram reply
@@ -1156,8 +1240,16 @@ export class SessionService implements ISessionService {
           conversationId: request.conversationId,
         });
 
-        // Queue the message and return a promise that resolves when processed
-        return new Promise((resolve, reject) => {
+        // Queue the message and return a promise that resolves when processed.
+        // `return await`, not `return` (Lumen, PR #565 r3): a bare return
+        // hands the promise out of the try block, so a later rejection from
+        // the queue processor bypasses the catch below entirely — the caller
+        // gets a raw throw instead of a structured result, and the admission
+        // evidence (tracked `admitted`, set above: this message's own
+        // resolution already completed) never crosses the boundary. Awaiting
+        // keeps every queued rejection on the same catch path as the direct
+        // one.
+        return await new Promise((resolve, reject) => {
           const queue = this.pendingQueues.get(lockKey) || [];
           queue.push({ request, resolve, reject });
           this.pendingQueues.set(lockKey, queue);
@@ -1176,7 +1268,9 @@ export class SessionService implements ISessionService {
         if (!result.success && result.error) {
           this.flushQueueOnNonRetryableError(lockKey, result.error);
         }
-        return result;
+        // Routing admitted this message whether or not the turn succeeded —
+        // a runner failure here is a backend outcome, not a routing one.
+        return { ...result, admitted: true };
       } finally {
         // 6. Process queued messages or release lock
         await this.processQueueOrReleaseLock(lockKey);
@@ -1193,6 +1287,30 @@ export class SessionService implements ISessionService {
         error: errorText,
       });
 
+      // v18 S3: with provisioning deferred to spawn admission, a routing
+      // refusal can first surface HERE (the spawn path's own resolution)
+      // rather than at the trigger handler's plan call. The refusal must stay
+      // structured across this boundary — the trigger handler stamps a
+      // routing hold from it, and a serialized message string cannot carry
+      // the detail (nor be matched without string-sniffing).
+      if (error instanceof RoutingRefusedError) {
+        return {
+          success: false,
+          sessionId: '',
+          backendSessionId: null,
+          responses: [],
+          sessionStatus: 'failed',
+          compactionTriggered: false,
+          finalTextResponse: undefined,
+          error: errorText,
+          errorCode: 'ROUTING_REFUSED',
+          refusal: { threadKey: error.threadKey, detail: error.detail },
+          // Refusals are pre-admission by construction — withStudioLease
+          // throws before getOrCreateSession returns.
+          admitted: false,
+        };
+      }
+
       return {
         success: false,
         sessionId: '',
@@ -1203,6 +1321,10 @@ export class SessionService implements ISessionService {
         finalTextResponse: undefined,
         error: errorText,
         errorCode: 'INTERNAL_ERROR',
+        // The tracked flag, not a literal: an error thrown AFTER resolution
+        // (a processMessage throw) is a post-admission failure and must not
+        // read as a routing one.
+        admitted,
       };
     }
   }
@@ -1289,7 +1411,9 @@ export class SessionService implements ISessionService {
         );
 
         const result = await this.processMessage(pending.request, session);
-        pending.resolve(result);
+        // Same admission evidence as the direct path: resolution succeeded
+        // just above, so whatever the turn did, routing admitted it.
+        pending.resolve({ ...result, admitted: true });
         // Flush on non-retryable success:false results (e.g. InkRunner session limit)
         if (!result.success && result.error) {
           this.flushQueueOnNonRetryableError(lockKey, result.error);
@@ -2054,6 +2178,23 @@ export class SessionService implements ISessionService {
        * ambiguous across workspaces.
        */
       sbId?: string | null;
+      /**
+       * v18 S3 — plan resolution: answer "which session, and where would it
+       * run" WITHOUT provisioning. No lease is acquired, no overflow worktree
+       * is minted, and refusals still fire (they are decisions, not actions).
+       * The returned session must never be handed to a runner: the spawn path
+       * re-resolves without this flag, and THAT resolution rechecks occupancy
+       * and atomically provisions + acquires. Used by the trigger handler so
+       * routeOnly stamps and inline (CLI-attached) deliveries — dispatches
+       * where no process will run — build nothing.
+       *
+       * One deliberate exception: a caller-repo D1 parent (the agent's
+       * durable home studio on a repo) is still created at plan time. It is
+       * once-per-agent×repo and deferring it would leave a reused session
+       * permanently studioless — not the per-thread ephemeral orphan class
+       * this flag removes.
+       */
+      planOnly?: boolean;
     }
   ): Promise<Session> {
     const type = options?.type || 'primary';
@@ -2176,6 +2317,7 @@ export class SessionService implements ISessionService {
       identityAmbiguous: identity.ambiguous === true,
       identityAbsent: identity.absent === true,
       backend,
+      planOnly: options?.planOnly === true,
     });
     let resolvedStudioId = routing.studioId;
 
@@ -2203,6 +2345,8 @@ export class SessionService implements ISessionService {
       // canonical identity — resolved once, up top, like every tier.
       sbId: identitySbId,
       identityAbsent: identity.absent === true,
+      // v18 S3: plan resolutions decide without provisioning or acquiring.
+      planOnly: options?.planOnly === true,
     };
 
     // Resolve default_session_id from agent identity. When set, threadKey
@@ -2585,6 +2729,8 @@ export class SessionService implements ISessionService {
       identityAmbiguous?: boolean;
       /** No identity row exists at all — only then is a slug match a proof. */
       identityAbsent?: boolean;
+      /** v18 S3: decision-only resolution — the gate never mints overflow. */
+      planOnly?: boolean;
     }
   ): Promise<StudioRoutingDecision> {
     const leaseCtx = {
@@ -2597,6 +2743,8 @@ export class SessionService implements ISessionService {
       // canonical identity — same resolution every tier below uses.
       sbId: options.sbId ?? null,
       identityAbsent: options.identityAbsent === true,
+      // v18 S3: plan-time gates decide; only spawn-time gates provision.
+      planOnly: options.planOnly === true,
     };
 
     // Canonical identity resolved ONCE, up front, and preferred by EVERY tier
