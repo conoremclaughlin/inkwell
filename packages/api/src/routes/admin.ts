@@ -40,6 +40,7 @@ import crypto from 'crypto';
 import { promises as fs } from 'fs';
 import os from 'os';
 import path from 'path';
+import QRCode from 'qrcode';
 import type { WorkspaceMemberRole } from '../data/repositories/workspaces.repository';
 import { slugifyWorkspaceName } from '../utils/workspace-slug';
 import {
@@ -115,6 +116,17 @@ const ADMIN_REFRESH_TOKEN_LIFETIME_DAYS = 90;
 const ADMIN_CLIENT_ID = 'dashboard';
 /** Refresh-token client_id for the native app (packages/mobile). */
 const MOBILE_CLIENT_ID = 'mobile';
+/**
+ * Pairing codes let a phone sign in by scanning a QR the dashboard shows.
+ * They live in mcp_tokens under their own client_id so they can never be
+ * mistaken for (or exchanged as) a refresh token, and they are single-use
+ * with a short life: the code is the credential for those ten minutes.
+ */
+const MOBILE_PAIR_CLIENT_ID = 'mobile-pair';
+const MOBILE_PAIR_CODE_LIFETIME_SECONDS = 10 * 60;
+const MOBILE_PAIR_CODE_LENGTH = 12;
+// 32 symbols, none of 0/O/1/I: a code someone reads off a screen and types.
+const MOBILE_PAIR_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const MCP_CLI_TRANSCRIPT_ROUTE = /^\/sessions(?:\/synced|\/[^/]+\/(?:sync-transcript|transcript))$/;
 const MCP_CLI_APPROVAL_ROUTE = /^\/approval-requests(?:\/[^/]+\/status)?$/;
 const DEFAULT_SESSION_LOG_LIMIT = 50;
@@ -1379,61 +1391,252 @@ router.post('/auth/mobile-login', async (req: Request, res: Response) => {
       auth: { autoRefreshToken: false, persistSession: false },
     });
 
-    // Look up (or provision) the PCP user by email — Tier 3's contract.
-    let { data: pcpUser } = await supabase.from('users').select('id').eq('email', email).single();
+    const pcpUser = await findOrProvisionPcpUserByEmail(supabase, email);
     if (!pcpUser) {
-      const { data: createdUser, error: createUserError } = await supabase
-        .from('users')
-        .insert({ email, last_login_at: new Date().toISOString() })
-        .select('id')
-        .single();
-      if (createUserError) {
-        // Lost an insert race — the row exists now.
-        const { data: racedUser } = await supabase
-          .from('users')
-          .select('id')
-          .eq('email', email)
-          .single();
-        if (!racedUser) {
-          logger.error('Failed to provision PCP user during mobile login', {
-            error: createUserError.message,
-          });
-          res.status(500).json({ error: 'Failed to provision user' });
-          return;
-        }
-        pcpUser = racedUser;
-      } else {
-        pcpUser = createdUser;
-      }
-    } else {
-      await supabase
-        .from('users')
-        .update({ last_login_at: new Date().toISOString() })
-        .eq('id', pcpUser.id);
+      res.status(500).json({ error: 'Failed to provision user' });
+      return;
     }
 
-    const accessToken = signPcpAccessToken(
-      { type: 'pcp_admin', sub: pcpUser.id, email, scope: 'admin' },
-      ADMIN_ACCESS_TOKEN_LIFETIME_SECONDS
-    );
-    const { refreshToken } = await createRefreshToken(
-      supabase,
-      pcpUser.id,
-      MOBILE_CLIENT_ID,
-      ['admin'],
-      ADMIN_REFRESH_TOKEN_LIFETIME_DAYS
-    );
-
-    res.json({
-      accessToken,
-      refreshToken,
-      expiresIn: ADMIN_ACCESS_TOKEN_LIFETIME_SECONDS,
-      userId: pcpUser.id,
-      email,
-    });
+    res.json(await issueMobileTokens(supabase, pcpUser.id, email));
   } catch (error) {
     logger.error('Mobile login error:', error);
     res.status(500).json(errorJson('Login failed', error));
+  }
+});
+
+/**
+ * Look up (or provision) the PCP user for an email Supabase has just
+ * verified — the middleware's Tier 3 contract, shared by every mobile route
+ * that mints credentials so they cannot drift apart.
+ */
+async function findOrProvisionPcpUserByEmail(
+  supabase: SupabaseClient<Database>,
+  email: string
+): Promise<{ id: string } | null> {
+  const nowIso = new Date().toISOString();
+  const { data: existing } = await supabase.from('users').select('id').eq('email', email).single();
+  if (existing) {
+    await supabase.from('users').update({ last_login_at: nowIso }).eq('id', existing.id);
+    return existing;
+  }
+
+  const { data: created, error: createError } = await supabase
+    .from('users')
+    .insert({ email, last_login_at: nowIso })
+    .select('id')
+    .single();
+  if (!createError && created) return created;
+
+  // Lost an insert race — the row exists now.
+  const { data: raced } = await supabase.from('users').select('id').eq('email', email).single();
+  if (raced) return raced;
+
+  logger.error('Failed to provision PCP user for mobile auth', { error: createError?.message });
+  return null;
+}
+
+/** The pcp_admin access/refresh pair every mobile sign-in path returns. */
+async function issueMobileTokens(
+  supabase: SupabaseClient<Database>,
+  userId: string,
+  email: string
+): Promise<{
+  accessToken: string;
+  refreshToken: string;
+  expiresIn: number;
+  userId: string;
+  email: string;
+}> {
+  const accessToken = signPcpAccessToken(
+    { type: 'pcp_admin', sub: userId, email, scope: 'admin' },
+    ADMIN_ACCESS_TOKEN_LIFETIME_SECONDS
+  );
+  const { refreshToken } = await createRefreshToken(
+    supabase,
+    userId,
+    MOBILE_CLIENT_ID,
+    ['admin'],
+    ADMIN_REFRESH_TOKEN_LIFETIME_DAYS
+  );
+  return {
+    accessToken,
+    refreshToken,
+    expiresIn: ADMIN_ACCESS_TOKEN_LIFETIME_SECONDS,
+    userId,
+    email,
+  };
+}
+
+/** Same rules the dashboard's signup form shows as it types. */
+function passwordPolicyProblem(password: string): string | null {
+  if (password.length < 8) return 'Password must be at least 8 characters';
+  if (!/\d/.test(password)) return 'Password must contain a number';
+  if (!/[a-zA-Z]/.test(password)) return 'Password must contain a letter';
+  return null;
+}
+
+/**
+ * POST /api/admin/auth/mobile-signup
+ * Body: { email, password }
+ *   → { confirmationRequired: true, email }                       (check your inbox)
+ *   → { confirmationRequired: false, accessToken, refreshToken, … } (signed in)
+ *
+ * Whether the second shape is possible depends on the Supabase project: with
+ * email confirmation on (the hosted default) the account is inert until the
+ * link is clicked, and the phone should send the user to Sign in afterwards.
+ * An existing account is deliberately indistinguishable from a new one.
+ */
+router.post('/auth/mobile-signup', async (req: Request, res: Response) => {
+  try {
+    const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+    const password = typeof req.body?.password === 'string' ? req.body.password : '';
+    if (!email || !password) {
+      res.status(400).json({ error: 'email and password are required' });
+      return;
+    }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      res.status(400).json({ error: 'A valid email address is required' });
+      return;
+    }
+    const policyProblem = passwordPolicyProblem(password);
+    if (policyProblem) {
+      res.status(400).json({ error: policyProblem });
+      return;
+    }
+
+    // Own bucket: a signup spray must not lock a real user out of login.
+    if (loginRateLimited(req.ip || 'unknown', `signup:${email}`)) {
+      res.status(429).json({ error: 'Too many attempts. Try again later.' });
+      return;
+    }
+
+    // Throwaway client — signUp mutates client auth state like signIn does.
+    const authClient = createClient(env.SUPABASE_URL, env.SUPABASE_PUBLISHABLE_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const { data: signUp, error: signUpError } = await authClient.auth.signUp({ email, password });
+
+    if (signUpError) {
+      // Supabase names an existing account outright when confirmations are
+      // off. Answer as if the signup went through; the phone's copy tells the
+      // user to sign in if they already have an account.
+      if (/already|exists|registered/i.test(signUpError.message)) {
+        res.json({ confirmationRequired: true, email });
+        return;
+      }
+      res.status(400).json({ error: signUpError.message });
+      return;
+    }
+
+    if (!signUp.session) {
+      res.json({ confirmationRequired: true, email });
+      return;
+    }
+
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const pcpUser = await findOrProvisionPcpUserByEmail(supabase, email);
+    if (!pcpUser) {
+      res.status(500).json({ error: 'Failed to provision user' });
+      return;
+    }
+
+    res.json({
+      confirmationRequired: false,
+      ...(await issueMobileTokens(supabase, pcpUser.id, email)),
+    });
+  } catch (error) {
+    logger.error('Mobile signup error:', error);
+    res.status(500).json(errorJson('Signup failed', error));
+  }
+});
+
+// ─── Pairing codes ───
+
+function generatePairingCode(): string {
+  // 32 symbols divide 256 evenly, so a byte mod 32 is unbiased.
+  const bytes = crypto.randomBytes(MOBILE_PAIR_CODE_LENGTH);
+  let code = '';
+  for (let i = 0; i < MOBILE_PAIR_CODE_LENGTH; i += 1) {
+    code += MOBILE_PAIR_CODE_ALPHABET[bytes[i] % MOBILE_PAIR_CODE_ALPHABET.length];
+  }
+  return code;
+}
+
+/** Accepts the code however it was typed: lowercase, with dashes or spaces. */
+function normalizePairingCode(input: string): string {
+  return input.toUpperCase().replace(/[^A-Z2-9]/g, '');
+}
+
+function formatPairingCode(code: string): string {
+  return code.match(/.{1,4}/g)?.join('-') ?? code;
+}
+
+function pairingCodeStorageKey(code: string): string {
+  return `pcp-pair-${code}`;
+}
+
+/**
+ * POST /api/admin/auth/mobile-pair/claim
+ * Body: { code } → same token pair as mobile-login.
+ *
+ * The delete IS the claim: returning the deleted row means that of two
+ * racing claimers exactly one gets tokens, with no read-then-write window.
+ */
+router.post('/auth/mobile-pair/claim', async (req: Request, res: Response) => {
+  try {
+    const code = normalizePairingCode(typeof req.body?.code === 'string' ? req.body.code : '');
+    if (code.length !== MOBILE_PAIR_CODE_LENGTH) {
+      res.status(400).json({ error: 'A pairing code is required' });
+      return;
+    }
+
+    // Per-IP: ten guesses per window against a 60-bit code.
+    if (loginRateLimited(req.ip || 'unknown', 'pair-claim')) {
+      res.status(429).json({ error: 'Too many attempts. Try again later.' });
+      return;
+    }
+
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+
+    const { data: consumed, error: consumeError } = await supabase
+      .from('mcp_tokens')
+      .delete()
+      .eq('refresh_token', pairingCodeStorageKey(code))
+      .eq('client_id', MOBILE_PAIR_CLIENT_ID)
+      .select('user_id, expires_at')
+      .maybeSingle();
+    if (consumeError) {
+      logger.error('Failed to consume pairing code', { error: consumeError.message });
+      res.status(500).json({ error: 'Pairing failed' });
+      return;
+    }
+    if (!consumed || new Date(consumed.expires_at) < new Date()) {
+      res.status(401).json({ error: 'Invalid or expired pairing code' });
+      return;
+    }
+
+    const { data: user } = await supabase
+      .from('users')
+      .select('id, email')
+      .eq('id', consumed.user_id)
+      .single();
+    if (!user?.email) {
+      res.status(401).json({ error: 'Invalid or expired pairing code' });
+      return;
+    }
+    await supabase
+      .from('users')
+      .update({ last_login_at: new Date().toISOString() })
+      .eq('id', user.id);
+
+    res.json(await issueMobileTokens(supabase, user.id, user.email));
+  } catch (error) {
+    logger.error('Mobile pairing claim error:', error);
+    res.status(500).json(errorJson('Pairing failed', error));
   }
 });
 
@@ -1479,6 +1682,101 @@ router.post('/auth/mobile-refresh', async (req: Request, res: Response) => {
 
 // Apply auth middleware to all subsequent routes
 router.use(adminAuthMiddleware);
+
+/**
+ * Where a phone could reach this server: the configured public URL first,
+ * then the host the dashboard itself was reached on, then every LAN address
+ * this machine has. Loopback is never offered — it is the one address that
+ * is guaranteed wrong from another device. The phone probes them in order.
+ */
+function candidateServerUrls(req: Request): string[] {
+  const urls: string[] = [];
+  const add = (url: string) => {
+    const normalized = url.replace(/\/+$/, '');
+    if (!urls.includes(normalized)) urls.push(normalized);
+  };
+  const isLoopback = (hostOrUrl: string) =>
+    /(^|\/\/)(localhost|127\.0\.0\.1|\[::1\]|0\.0\.0\.0)(:|\/|$)/i.test(hostOrUrl);
+
+  if (env.MCP_BASE_URL && !isLoopback(env.MCP_BASE_URL)) add(env.MCP_BASE_URL);
+
+  const forwardedHost = req.get('x-forwarded-host')?.split(',')[0]?.trim();
+  const host = forwardedHost || req.get('host');
+  if (host && !isLoopback(host)) {
+    const proto = req.get('x-forwarded-proto')?.split(',')[0]?.trim() || req.protocol || 'http';
+    add(`${proto}://${host}`);
+  }
+
+  for (const interfaces of Object.values(os.networkInterfaces())) {
+    for (const iface of interfaces ?? []) {
+      if (iface.family === 'IPv4' && !iface.internal) {
+        add(`http://${iface.address}:${env.MCP_HTTP_PORT}`);
+      }
+    }
+  }
+  return urls;
+}
+
+/**
+ * POST /api/admin/auth/mobile-pair
+ * → { code, expiresAt, expiresInSeconds, urls, qrDataUrl }
+ *
+ * Mints a single-use pairing code for the signed-in user and renders the QR
+ * the dashboard shows. The QR payload is `{ ink: 1, c: code, u: urls }` —
+ * the phone claims the code against the first URL that answers /health.
+ */
+router.post('/auth/mobile-pair', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AdminAuthRequest;
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+
+    // Codes nobody scanned would otherwise accumulate; sweep this user's
+    // expired ones on the way in (best effort — a failure here is not ours to
+    // surface).
+    await supabase
+      .from('mcp_tokens')
+      .delete()
+      .eq('user_id', authReq.pcpUserId)
+      .eq('client_id', MOBILE_PAIR_CLIENT_ID)
+      .lt('expires_at', new Date().toISOString());
+
+    const code = generatePairingCode();
+    const expiresAt = new Date(Date.now() + MOBILE_PAIR_CODE_LIFETIME_SECONDS * 1000);
+    const { error: insertError } = await supabase.from('mcp_tokens').insert({
+      user_id: authReq.pcpUserId,
+      client_id: MOBILE_PAIR_CLIENT_ID,
+      refresh_token: pairingCodeStorageKey(code),
+      supabase_refresh_token: null,
+      scopes: ['admin'],
+      expires_at: expiresAt.toISOString(),
+    });
+    if (insertError) {
+      logger.error('Failed to store pairing code', { error: insertError.message });
+      res.status(500).json({ error: 'Failed to create pairing code' });
+      return;
+    }
+
+    const urls = candidateServerUrls(req);
+    const qrDataUrl = await QRCode.toDataURL(JSON.stringify({ ink: 1, c: code, u: urls }), {
+      margin: 1,
+      width: 320,
+      errorCorrectionLevel: 'M',
+    });
+
+    res.json({
+      code: formatPairingCode(code),
+      expiresAt: expiresAt.toISOString(),
+      expiresInSeconds: MOBILE_PAIR_CODE_LIFETIME_SECONDS,
+      urls,
+      qrDataUrl,
+    });
+  } catch (error) {
+    logger.error('Mobile pairing code error:', error);
+    res.status(500).json(errorJson('Failed to create pairing code', error));
+  }
+});
 
 // =============================================================================
 // Workspaces

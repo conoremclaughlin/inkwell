@@ -1,5 +1,6 @@
 /**
- * Mobile auth routes: POST /auth/mobile-login and /auth/mobile-refresh.
+ * Mobile auth routes: POST /auth/mobile-login, /auth/mobile-refresh,
+ * /auth/mobile-signup, and the pairing pair /auth/mobile-pair (+ /claim).
  *
  * These mint the same pcp_admin JWT the middleware's Tier 1 verifies, but
  * return it in the response body instead of cookies — React Native's fetch
@@ -28,11 +29,12 @@ vi.mock('../auth/pcp-tokens', () => ({
 }));
 
 const mockSignInWithPassword = vi.fn();
+const mockSignUp = vi.fn();
 const mockSupabaseFrom = vi.fn();
 
 vi.mock('@supabase/supabase-js', () => ({
   createClient: vi.fn(() => ({
-    auth: { signInWithPassword: mockSignInWithPassword, getUser: vi.fn() },
+    auth: { signInWithPassword: mockSignInWithPassword, signUp: mockSignUp, getUser: vi.fn() },
     from: mockSupabaseFrom,
   })),
 }));
@@ -65,6 +67,7 @@ vi.mock('../utils/request-context', () => ({
   runWithRequestContext: (_context: Record<string, unknown>, fn: () => void) => fn(),
 }));
 
+import QRCode from 'qrcode';
 import router from './admin';
 
 // ---------------------------------------------------------------------------
@@ -82,8 +85,21 @@ function getRouteHandler(method: 'post' | 'get', path: string): Handler {
   return layer.route.stack[layer.route.stack.length - 1].handle;
 }
 
-function createReq(body: Record<string, unknown>, ip = '1.2.3.4'): Request {
-  return { body, ip, headers: {}, cookies: {}, params: {} } as unknown as Request;
+function createReq(
+  body: Record<string, unknown>,
+  ip = '1.2.3.4',
+  extra: Record<string, unknown> = {}
+): Request {
+  return {
+    body,
+    ip,
+    headers: {},
+    cookies: {},
+    params: {},
+    protocol: 'http',
+    get: () => undefined,
+    ...extra,
+  } as unknown as Request;
 }
 
 interface MockResponse extends Response {
@@ -122,6 +138,9 @@ function mockUsersTable(user: Record<string, unknown> | null) {
 
 const login = getRouteHandler('post', '/auth/mobile-login');
 const refresh = getRouteHandler('post', '/auth/mobile-refresh');
+const signup = getRouteHandler('post', '/auth/mobile-signup');
+const pairStart = getRouteHandler('post', '/auth/mobile-pair');
+const pairClaim = getRouteHandler('post', '/auth/mobile-pair/claim');
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -299,5 +318,239 @@ describe('POST /auth/logout', () => {
     // The route must not filter to the dashboard client alone — a mobile
     // logout would then silently leave its 90-day token alive.
     expect(chain.in).toHaveBeenCalledWith('client_id', ['dashboard', 'mobile']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// /auth/mobile-signup
+// ---------------------------------------------------------------------------
+
+describe('POST /auth/mobile-signup', () => {
+  it('enforces the password policy before touching Supabase', async () => {
+    let res = createRes();
+    await signup(createReq({ email: 'new@b.co', password: 'short1' }), res);
+    expect(res._status).toBe(400);
+    expect((res._json as { error: string }).error).toMatch(/8 characters/);
+
+    res = createRes();
+    await signup(createReq({ email: 'new@b.co', password: 'nonumbershere' }), res);
+    expect(res._status).toBe(400);
+    expect((res._json as { error: string }).error).toMatch(/number/);
+
+    res = createRes();
+    await signup(createReq({ email: 'not-an-email', password: 'valid1234' }), res);
+    expect(res._status).toBe(400);
+
+    expect(mockSignUp).not.toHaveBeenCalled();
+  });
+
+  it('asks for email confirmation when Supabase returns no session', async () => {
+    mockSignUp.mockResolvedValue({
+      data: { user: { id: 'sb-new', email: 'new@b.co' }, session: null },
+      error: null,
+    });
+
+    const res = createRes();
+    await signup(createReq({ email: 'New@B.co', password: 'valid1234' }), res);
+
+    expect(res._status).toBe(200);
+    expect(res._json).toEqual({ confirmationRequired: true, email: 'new@b.co' });
+    expect(mockCreateRefreshToken).not.toHaveBeenCalled();
+  });
+
+  it('does not reveal that an account already exists', async () => {
+    mockSignUp.mockResolvedValue({
+      data: { user: null, session: null },
+      error: { message: 'User already registered' },
+    });
+
+    const res = createRes();
+    await signup(createReq({ email: 'old@b.co', password: 'valid1234' }), res);
+
+    // Same shape and status as a brand-new signup.
+    expect(res._status).toBe(200);
+    expect(res._json).toEqual({ confirmationRequired: true, email: 'old@b.co' });
+  });
+
+  it('signs the phone straight in when the project skips confirmation', async () => {
+    mockSignUp.mockResolvedValue({
+      data: { user: { id: 'sb-new', email: 'new@b.co' }, session: { access_token: 'sb' } },
+      error: null,
+    });
+    mockUsersTable({ id: 'pcp-user-9' });
+
+    const res = createRes();
+    await signup(createReq({ email: 'new@b.co', password: 'valid1234' }), res);
+
+    expect(res._status).toBe(200);
+    expect(res._json).toMatchObject({
+      confirmationRequired: false,
+      accessToken: 'signed-access-jwt',
+      refreshToken: 'pcp-rt-fresh',
+      userId: 'pcp-user-9',
+      email: 'new@b.co',
+    });
+    expect(mockCreateRefreshToken).toHaveBeenCalledWith(
+      expect.anything(),
+      'pcp-user-9',
+      'mobile',
+      ['admin'],
+      expect.any(Number)
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// /auth/mobile-pair — issuing a code (authenticated)
+// ---------------------------------------------------------------------------
+
+describe('POST /auth/mobile-pair', () => {
+  it('stores a single-use code under the mobile-pair client and renders the QR', async () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const chain: Record<string, any> = {};
+    chain.delete = vi.fn(() => chain);
+    chain.eq = vi.fn(() => chain);
+    chain.lt = vi.fn(() => Promise.resolve({ error: null }));
+    chain.insert = vi.fn(() => Promise.resolve({ error: null }));
+    mockSupabaseFrom.mockImplementation(() => chain);
+    const qrSpy = vi.spyOn(QRCode, 'toDataURL');
+
+    const res = createRes();
+    await pairStart(
+      createReq({}, '1.2.3.4', {
+        pcpUserId: 'pcp-user-1',
+        get: (name: string) => (name.toLowerCase() === 'host' ? '192.168.1.20:3001' : undefined),
+      }),
+      res
+    );
+
+    expect(res._status).toBe(200);
+    const body = res._json as {
+      code: string;
+      expiresInSeconds: number;
+      urls: string[];
+      qrDataUrl: string;
+    };
+    expect(body.code).toMatch(/^[A-Z2-9]{4}-[A-Z2-9]{4}-[A-Z2-9]{4}$/);
+    expect(body.expiresInSeconds).toBe(600);
+    expect(body.qrDataUrl).toMatch(/^data:image\/png;base64,/);
+    // The dashboard's own host is offered; loopback never is.
+    expect(body.urls).toContain('http://192.168.1.20:3001');
+    expect(body.urls.some((u) => /localhost|127\.0\.0\.1/.test(u))).toBe(false);
+
+    // Stored form: the bare code under its own client_id, ~10 minutes of life.
+    const inserted = chain.insert.mock.calls[0][0] as Record<string, unknown>;
+    expect(inserted).toMatchObject({
+      user_id: 'pcp-user-1',
+      client_id: 'mobile-pair',
+      scopes: ['admin'],
+      refresh_token: `pcp-pair-${body.code.replace(/-/g, '')}`,
+    });
+    const ttlMs = new Date(inserted.expires_at as string).getTime() - Date.now();
+    expect(ttlMs).toBeGreaterThan(9 * 60 * 1000);
+    expect(ttlMs).toBeLessThanOrEqual(10 * 60 * 1000);
+
+    // The QR carries the bare code and the same URL list.
+    const payload = JSON.parse(String(qrSpy.mock.calls[0][0])) as {
+      ink: number;
+      c: string;
+      u: string[];
+    };
+    expect(payload).toEqual({ ink: 1, c: body.code.replace(/-/g, ''), u: body.urls });
+    qrSpy.mockRestore();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// /auth/mobile-pair/claim — redeeming a code (unauthenticated)
+// ---------------------------------------------------------------------------
+
+function mockPairClaim(
+  consumed: { user_id: string; expires_at: string } | null,
+  user: { id: string; email: string } | null = null
+) {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const chain: Record<string, any> = {};
+  chain.delete = vi.fn(() => chain);
+  chain.eq = vi.fn(() => chain);
+  chain.select = vi.fn(() => chain);
+  chain.update = vi.fn(() => chain);
+  chain.maybeSingle = vi.fn(() => Promise.resolve({ data: consumed, error: null }));
+  chain.single = vi.fn(() => Promise.resolve({ data: user, error: null }));
+  mockSupabaseFrom.mockImplementation(() => chain);
+  return chain;
+}
+
+describe('POST /auth/mobile-pair/claim', () => {
+  it('rejects a malformed code without touching the database', async () => {
+    const res = createRes();
+    await pairClaim(createReq({ code: 'abc' }), res);
+    expect(res._status).toBe(400);
+    expect(mockSupabaseFrom).not.toHaveBeenCalled();
+  });
+
+  it('401s when no live code was consumed', async () => {
+    mockPairClaim(null);
+    const res = createRes();
+    await pairClaim(createReq({ code: 'ABCD-EFGH-JKLM' }), res);
+    expect(res._status).toBe(401);
+    expect(res._json).toEqual({ error: 'Invalid or expired pairing code' });
+    expect(mockCreateRefreshToken).not.toHaveBeenCalled();
+  });
+
+  it('401s on an expired code — and it is gone, not retryable', async () => {
+    const chain = mockPairClaim({ user_id: 'pcp-user-1', expires_at: '2020-01-01T00:00:00Z' });
+    const res = createRes();
+    await pairClaim(createReq({ code: 'ABCD-EFGH-JKLM' }), res);
+    expect(res._status).toBe(401);
+    expect(chain.delete).toHaveBeenCalled();
+    expect(mockCreateRefreshToken).not.toHaveBeenCalled();
+  });
+
+  it('consumes the code atomically and issues mobile tokens to its owner', async () => {
+    const future = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+    const chain = mockPairClaim(
+      { user_id: 'pcp-user-1', expires_at: future },
+      { id: 'pcp-user-1', email: 'a@b.co' }
+    );
+
+    const res = createRes();
+    // Typed by hand: lowercase, dashes — must normalise to the stored key.
+    await pairClaim(createReq({ code: 'abcd-efgh jklm' }), res);
+
+    expect(res._status).toBe(200);
+    expect(res._json).toMatchObject({
+      accessToken: 'signed-access-jwt',
+      refreshToken: 'pcp-rt-fresh',
+      userId: 'pcp-user-1',
+      email: 'a@b.co',
+    });
+    // The claim is a filtered delete that returns the row: no lookup-then-
+    // delete window for two phones to both win.
+    expect(chain.delete).toHaveBeenCalled();
+    expect(chain.eq).toHaveBeenCalledWith('refresh_token', 'pcp-pair-ABCDEFGHJKLM');
+    expect(chain.eq).toHaveBeenCalledWith('client_id', 'mobile-pair');
+    expect(mockCreateRefreshToken).toHaveBeenCalledWith(
+      expect.anything(),
+      'pcp-user-1',
+      'mobile',
+      ['admin'],
+      expect.any(Number)
+    );
+  });
+
+  it('rate-limits claims per IP before consulting the database', async () => {
+    mockPairClaim(null);
+    const req = () => createReq({ code: 'ABCD-EFGH-JKLM' }, '8.8.8.8');
+    for (let i = 0; i < 10; i += 1) {
+      await pairClaim(req(), createRes());
+    }
+    mockSupabaseFrom.mockClear();
+
+    const res = createRes();
+    await pairClaim(req(), res);
+
+    expect(res._status).toBe(429);
+    expect(mockSupabaseFrom).not.toHaveBeenCalled();
   });
 });
