@@ -8,12 +8,16 @@
  * afterwards, when it refused to before" — the before/after on real dispatch
  * behaviour, driven through dispatchEvaluation itself.
  *
- * The dangerous direction is the opposite one, and it is what PR #559 review
- * caught: clearing a stamp that belongs to a session which is still alive
- * re-dispatches work someone is already doing. Two guards exist for that and
- * both are pinned here — a live CLI session on the thread vetoes the group,
- * and a stamp newer than the cutoff is never touched. Neither is visible to a
- * mock, because both live in the RPC's SQL.
+ * The dangerous direction is the opposite one, and it is what five rounds of
+ * PR #559 review kept finding: clearing a stamp that belongs to a session
+ * still working re-dispatches what someone is already doing. Four guards exist
+ * for that and each is pinned here — only the RECIPIENT'S live sessions can
+ * veto, only the RECIPIENT'S finished session can vouch and only for stamps it
+ * post-dates, a stamp newer than the cutoff is never touched, and the write
+ * compare-and-sets so a dispatch landing mid-statement is not overwritten.
+ * None of it is visible to a mock, because all of it lives in the RPC's SQL —
+ * and the last one needs a second connection holding a row lock, which is why
+ * this suite talks to Postgres directly in exactly one test.
  *
  * Requires .env.local with SUPABASE_URL + SUPABASE_SECRET_KEY.
  * Skipped automatically when credentials are unavailable.

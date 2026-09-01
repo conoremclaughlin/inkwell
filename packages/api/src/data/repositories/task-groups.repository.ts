@@ -519,7 +519,7 @@ export class TaskGroupsRepository {
    * mid-round would have its new stamp overwritten by a stale snapshot.
    */
   async reconcileGraphDispatchStamps(params: {
-    /** Stamps at or after this instant are the caller's own and are left alone. */
+    /** Stamps at or after this instant are too new to regard as stale, whoever wrote them. */
     staleBefore: string;
     liveWindowMs?: number;
   }): Promise<Record<string, unknown>> {

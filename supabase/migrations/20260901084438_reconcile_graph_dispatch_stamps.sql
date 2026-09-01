@@ -33,11 +33,22 @@
 --      are now scoped to the identity the dispatch actually went to
 --      (tasks.metadata->>'graphDispatchedTo', matching sessions.sb_id).
 --
+--   5. QUALIFYING IS NOT ACTING (r4). Items 2-4 each narrowed WHICH rows
+--      qualify, and none of that touches a row changing AFTER it qualified.
+--      `targets` reads this statement's snapshot; the UPDATE then waits on the
+--      row lock. Matching on id alone it resumed after a concurrent dispatch
+--      committed and deleted a stamp written moments earlier — validated old,
+--      wrote new. The UPDATE now compare-and-sets on the captured stamp and
+--      recipient and rechecks claim and status, so those quals are
+--      re-evaluated against the newly committed version and the row is
+--      skipped.
+--
 -- The rule: a stamp is cleared only when the session that RECEIVED it has
--- finished at or after the stamp was written, and nothing of that recipient's
--- on the thread still looks alive. A stamp with no recorded recipient never
--- qualifies — that fails closed for pre-existing stamps and self-heals on the
--- next dispatch. Every uncertainty keeps the stamp, which costs at most the
+-- finished at or after the stamp was written, nothing of that recipient's on
+-- the thread still looks alive, and the row still carries that same stamp when
+-- the write actually lands. A stamp with no recorded recipient never qualifies
+-- — that fails closed for pre-existing stamps and self-heals on the next
+-- dispatch. Every uncertainty keeps the stamp, which costs at most the
 -- existing 30-minute wait; guessing wrong costs a duplicate dispatch onto live
 -- work.
 
@@ -111,9 +122,17 @@ BEGIN
       AND t.status <> 'completed'
       AND t.metadata ? 'graphDispatchedAt'
       AND st.stamp_at IS NOT NULL
-      -- A stamp at or after p_stale_before belongs to the caller's own run and
-      -- is never stale. This is what makes a concurrent dispatch safe without
-      -- a separate CAS: its stamp is newer than the cutoff and drops out here.
+      -- A stamp at or after p_stale_before is too new to regard as stale, and
+      -- is excluded no matter who wrote it. The cutoff proves RECENCY, not
+      -- provenance: the caller runs this before opening its own intake, so a
+      -- stamp landing in that window came from somewhere else — another API
+      -- process sharing this database, most likely. Excluding it is right
+      -- either way; attributing it is not.
+      --
+      -- This covers a dispatch already COMMITTED and visible when the
+      -- statement took its snapshot. It is not sufficient alone: one still
+      -- uncommitted at snapshot time is invisible here, and the UPDATE's
+      -- compare-and-set below is what catches that.
       AND st.stamp_at < p_stale_before
       -- No recorded recipient, no recovery. Nothing else can be established
       -- about who was supposed to act on it.
