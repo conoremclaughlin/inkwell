@@ -9,17 +9,22 @@ import {
   TextInput,
   View,
 } from 'react-native';
+import { useNavigation } from '@react-navigation/native';
+import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { API_URL_HINT, apiBaseUrl, login } from '../lib/api';
 import { setServerUrlOverride } from '../lib/storage';
+import type { AuthStackParamList } from '../navigation';
 import { colors, spacing, type } from '../ui/theme';
 
 /**
  * Email + password against the same account the dashboard uses. The server
  * URL is exposed here too (not only in Settings) because a physical device
  * that can't reach the API fails AT login — the fix belongs where the
- * failure is.
+ * failure is. Pairing (scan the dashboard's QR) is the zero-setup path and
+ * gets top billing; the form is for when there is no dashboard to hand.
  */
 export function LoginScreen() {
+  const navigation = useNavigation<NativeStackNavigationProp<AuthStackParamList>>();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [serverUrl, setServerUrl] = useState('');
@@ -50,6 +55,16 @@ export function LoginScreen() {
       <View style={styles.card}>
         <Text style={styles.wordmark}>Inkwell</Text>
         <Text style={styles.subtitle}>Your threads, on the go</Text>
+
+        <Pressable
+          onPress={() => navigation.navigate('Connect')}
+          style={({ pressed }) => [styles.pairButton, pressed && { opacity: 0.8 }]}
+          accessibilityRole="button"
+        >
+          <Text style={styles.pairText}>Scan a pairing code</Text>
+          <Text style={styles.pairHint}>From the dashboard’s Mobile page — no typing</Text>
+        </Pressable>
+        <Text style={styles.divider}>or sign in with email</Text>
 
         <TextInput
           style={styles.input}
@@ -109,6 +124,10 @@ export function LoginScreen() {
             <Text style={styles.buttonText}>Sign in</Text>
           )}
         </Pressable>
+
+        <Pressable onPress={() => navigation.navigate('SignUp')} hitSlop={8}>
+          <Text style={styles.link}>New here? Create an account</Text>
+        </Pressable>
       </View>
     </KeyboardAvoidingView>
   );
@@ -137,6 +156,19 @@ const styles = StyleSheet.create({
     paddingHorizontal: spacing.md,
     paddingVertical: spacing.md,
   },
+  pairButton: {
+    backgroundColor: colors.accentDim,
+    borderRadius: 12,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.accent,
+    paddingVertical: spacing.md,
+    alignItems: 'center',
+    gap: 2,
+  },
+  pairText: { ...type.title, color: colors.accentBright },
+  pairHint: { ...type.caption, color: colors.textSecondary },
+  divider: { ...type.caption, color: colors.textMuted, textAlign: 'center' },
+  link: { ...type.body, color: colors.accentBright, textAlign: 'center', marginTop: spacing.sm },
   serverToggle: { ...type.caption, color: colors.textMuted, textAlign: 'center' },
   error: { ...type.body, color: colors.negative, textAlign: 'center' },
   hint: { ...type.caption, color: colors.textSecondary, textAlign: 'center' },

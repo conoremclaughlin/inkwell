@@ -10,12 +10,14 @@ import { QueryClient, QueryClientProvider, focusManager } from '@tanstack/react-
 import { AppState, type AppStateStatus } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
-import type { RootStackParamList, TabParamList } from './src/navigation';
+import type { AuthStackParamList, RootStackParamList, TabParamList } from './src/navigation';
 import { ThreadsScreen } from './src/screens/ThreadsScreen';
 import { ThreadScreen } from './src/screens/ThreadScreen';
 import { FleetScreen } from './src/screens/FleetScreen';
 import { SettingsScreen } from './src/screens/SettingsScreen';
 import { LoginScreen } from './src/screens/LoginScreen';
+import { SignUpScreen } from './src/screens/SignUpScreen';
+import { ConnectScreen } from './src/screens/ConnectScreen';
 import { FleetIcon, SettingsIcon, ThreadsIcon } from './src/components/TabIcons';
 import { getAuthState, loadAuth, subscribeAuth, type AuthState } from './src/lib/auth';
 import { loadPreferences } from './src/lib/storage';
@@ -45,7 +47,16 @@ function useAppStateFocus() {
 }
 
 const Stack = createNativeStackNavigator<RootStackParamList>();
+const AuthStack = createNativeStackNavigator<AuthStackParamList>();
 const Tab = createBottomTabNavigator<TabParamList>();
+
+const stackHeaderOptions = {
+  headerStyle: { backgroundColor: colors.ink },
+  headerShadowVisible: false,
+  headerTintColor: colors.textPrimary,
+  headerTitleStyle: { fontSize: 16 },
+  contentStyle: { backgroundColor: colors.ink },
+} as const;
 
 const navTheme = {
   ...DarkTheme,
@@ -125,15 +136,7 @@ export default function App() {
         <StatusBar style="light" />
         <NavigationContainer theme={navTheme}>
           {auth.refreshToken ? (
-            <Stack.Navigator
-              screenOptions={{
-                headerStyle: { backgroundColor: colors.ink },
-                headerShadowVisible: false,
-                headerTintColor: colors.textPrimary,
-                headerTitleStyle: { fontSize: 16 },
-                contentStyle: { backgroundColor: colors.ink },
-              }}
-            >
+            <Stack.Navigator screenOptions={stackHeaderOptions}>
               <Stack.Screen name="Tabs" component={Tabs} options={{ headerShown: false }} />
               <Stack.Screen
                 name="Thread"
@@ -143,7 +146,23 @@ export default function App() {
               <Stack.Screen name="Settings" component={SettingsScreen} />
             </Stack.Navigator>
           ) : (
-            <LoginScreen />
+            <AuthStack.Navigator screenOptions={stackHeaderOptions}>
+              <AuthStack.Screen
+                name="Login"
+                component={LoginScreen}
+                options={{ headerShown: false }}
+              />
+              <AuthStack.Screen
+                name="SignUp"
+                component={SignUpScreen}
+                options={{ title: 'Create account' }}
+              />
+              <AuthStack.Screen
+                name="Connect"
+                component={ConnectScreen}
+                options={{ title: 'Pair with dashboard' }}
+              />
+            </AuthStack.Navigator>
           )}
         </NavigationContainer>
       </QueryClientProvider>

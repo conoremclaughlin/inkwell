@@ -10,8 +10,14 @@
 import Constants from 'expo-constants';
 import { describeApiUrlProblem, resolveApiUrl, type ResolvedApiUrl } from './resolveApiUrl';
 import { clearAuth, getAuthState, storeLogin, storeRefreshedAccess } from './auth';
-import { getServerUrlOverride, getWorkspaceId, setWorkspaceId } from './storage';
-import type { LoginResponse, RefreshResponse } from './types';
+import { pickReachableUrl, type PairingPayload } from './pairing';
+import {
+  getServerUrlOverride,
+  getWorkspaceId,
+  setServerUrlOverride,
+  setWorkspaceId,
+} from './storage';
+import type { LoginResponse, RefreshResponse, SignupResponse } from './types';
 
 /** Port the PCP API server listens on (PCP_PORT_BASE default). */
 const PCP_API_PORT = 3001;
@@ -160,6 +166,59 @@ export async function login(email: string, password: string): Promise<void> {
   if (!res.ok) throw await parseError(res);
   const body = (await res.json()) as LoginResponse;
   await storeLogin(body);
+}
+
+/** Create an account; signs in immediately when the server says it can. */
+export async function signup(email: string, password: string): Promise<SignupResponse> {
+  const res = await fetch(`${apiBaseUrl()}/api/admin/auth/mobile-signup`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email, password }),
+  });
+  if (!res.ok) throw await parseError(res);
+  const body = (await res.json()) as SignupResponse;
+  if (!body.confirmationRequired) await storeLogin(body);
+  return body;
+}
+
+/** Does a PCP server answer at this base URL? Bounded so a dead LAN address fails fast. */
+export async function probeServer(url: string, timeoutMs = 2500): Promise<boolean> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(`${url}/health`, { signal: controller.signal });
+    return res.ok;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Redeem a pairing code. A scanned QR carries the server's candidate URLs:
+ * the first reachable one becomes the saved server, so pairing configures
+ * the app as well as signing it in. A hand-typed code has no URLs and is
+ * claimed against whatever the app already points at.
+ */
+export async function claimPairingCode(payload: PairingPayload): Promise<void> {
+  if (payload.urls.length > 0) {
+    const url = await pickReachableUrl(payload.urls, (candidate) => probeServer(candidate));
+    if (!url) {
+      throw new ApiError(
+        0,
+        `Couldn't reach the server (tried ${payload.urls.join(', ')}). Is the phone on the same network as your computer?`
+      );
+    }
+    await setServerUrlOverride(url);
+  }
+  const res = await fetch(`${apiBaseUrl()}/api/admin/auth/mobile-pair/claim`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code: payload.code }),
+  });
+  if (!res.ok) throw await parseError(res);
+  await storeLogin((await res.json()) as LoginResponse);
 }
 
 /** Revoke the refresh token server-side, then clear local state regardless. */

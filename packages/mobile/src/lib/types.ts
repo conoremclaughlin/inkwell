@@ -140,6 +140,12 @@ export interface RefreshResponse {
   email: string;
 }
 
+// ─── POST /api/admin/auth/mobile-signup ───
+
+export type SignupResponse =
+  | { confirmationRequired: true; email: string }
+  | ({ confirmationRequired: false } & LoginResponse);
+
 // ─── GET /api/admin/workspaces ───
 
 export interface Workspace {

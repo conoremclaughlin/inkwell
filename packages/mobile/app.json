@@ -14,9 +14,17 @@
       "package": "com.inkwell.mobile",
       "predictiveBackGestureEnabled": false
     },
-    "plugins": ["expo-secure-store"],
+    "plugins": [
+      "expo-secure-store",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Inkwell uses the camera to scan the pairing code shown on your dashboard."
+        }
+      ]
+    ],
     "extra": {
-      "//productionApiUrl": "API base URL for release builds, which have no Metro host to autodiscover from. Dev builds ignore this. Set before shipping — until then release builds fall back to loopback and surface an error.",
+      "//productionApiUrl": "API base URL for release builds, which have no Metro host to autodiscover from. Dev builds ignore this. Set before shipping \u2014 until then release builds fall back to loopback and surface an error.",
       "productionApiUrl": null
     }
   }

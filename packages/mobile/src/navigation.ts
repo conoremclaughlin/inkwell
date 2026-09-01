@@ -1,5 +1,12 @@
 import type { NavigatorScreenParams } from '@react-navigation/native';
 
+/** Signed-out world: three ways in. */
+export type AuthStackParamList = {
+  Login: undefined;
+  SignUp: undefined;
+  Connect: undefined;
+};
+
 export type TabParamList = {
   Threads: undefined;
   Fleet: undefined;
