@@ -241,6 +241,8 @@ export interface StartThreadInput {
   content: string;
   title?: string;
   priority?: 'low' | 'normal' | 'high' | 'urgent';
+  /** Single recipient only: pin the wake to one of their studios ("main" = home). */
+  studioSlug?: string;
 }
 
 export interface StartThreadResponse {

@@ -26,7 +26,7 @@ export type RootStackParamList = {
    * not exist yet (a DM's first message); without it, an unknown key is
    * read-only — replying into nowhere is how typos become threads.
    */
-  Thread: { threadKey: string; title?: string; recipients?: string[] };
+  Thread: { threadKey: string; title?: string; recipients?: string[]; studioSlug?: string };
   Session: { sessionId: string; title?: string };
   NewThread: undefined;
   Settings: undefined;

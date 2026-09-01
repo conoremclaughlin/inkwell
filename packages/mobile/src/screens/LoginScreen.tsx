@@ -32,12 +32,24 @@ export function LoginScreen() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
+  // Persist the server URL as soon as the user is done typing it — Sign up
+  // and Connect are reached from here and must talk to the same server, not
+  // to whatever autodetection picked.
+  const persistServer = async () => {
+    await setServerUrlOverride(serverUrl || null);
+  };
+
+  const go = async (screen: 'SignUp' | 'Connect') => {
+    await persistServer();
+    navigation.navigate(screen);
+  };
+
   const submit = async () => {
     if (busy) return;
     setError(null);
     setBusy(true);
     try {
-      await setServerUrlOverride(serverUrl || null);
+      await persistServer();
       await login(email.trim(), password);
       // Success flips auth state; App.tsx swaps the navigator.
     } catch (e) {
@@ -57,7 +69,7 @@ export function LoginScreen() {
         <Text style={styles.subtitle}>Your threads, on the go</Text>
 
         <Pressable
-          onPress={() => navigation.navigate('Connect')}
+          onPress={() => void go('Connect')}
           style={({ pressed }) => [styles.pairButton, pressed && { opacity: 0.8 }]}
           accessibilityRole="button"
         >
@@ -95,6 +107,7 @@ export function LoginScreen() {
             placeholderTextColor={colors.textMuted}
             value={serverUrl}
             onChangeText={setServerUrl}
+            onEndEditing={() => void persistServer()}
             autoCapitalize="none"
             autoCorrect={false}
             keyboardType="url"
@@ -125,7 +138,7 @@ export function LoginScreen() {
           )}
         </Pressable>
 
-        <Pressable onPress={() => navigation.navigate('SignUp')} hitSlop={8}>
+        <Pressable onPress={() => void go('SignUp')} hitSlop={8}>
           <Text style={styles.link}>New here? Create an account</Text>
         </Pressable>
       </View>

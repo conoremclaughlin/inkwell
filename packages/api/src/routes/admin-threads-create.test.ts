@@ -178,6 +178,37 @@ describe('POST /threads', () => {
     expect(args.metadata).toMatchObject({ sentBy: 'user' });
   });
 
+  it("pins a single-recipient send to a studio by slug, in the handler's single form", async () => {
+    mockThreadLookup(null);
+    mockHandleSendToInbox.mockResolvedValue(
+      sendToInboxResult({ success: true, messageId: 'msg-5', threadId: 'thread-5' })
+    );
+
+    const res = createRes();
+    await create(
+      createReq({ key: 'chat:wren', recipients: ['wren'], content: 'hi', studioSlug: 'main' }),
+      res
+    );
+
+    expect(res._status).toBe(200);
+    const args = mockHandleSendToInbox.mock.calls[0][0] as Record<string, unknown>;
+    expect(args).toMatchObject({ recipientAgentId: 'wren', recipientStudioSlug: 'main' });
+    // The handler refuses a studio on the group form — so the group form
+    // must not be used here.
+    expect(args.recipients).toBeUndefined();
+    expect(args.triggerAll).toBeUndefined();
+  });
+
+  it('refuses a studio slug on a group send', async () => {
+    const res = createRes();
+    await create(
+      createReq({ key: 'pr:1', recipients: ['wren', 'lumen'], content: 'hi', studioSlug: 'main' }),
+      res
+    );
+    expect(res._status).toBe(400);
+    expect(mockHandleSendToInbox).not.toHaveBeenCalled();
+  });
+
   it('continues an existing thread and says so', async () => {
     mockThreadLookup({ id: 'thread-old' });
     mockHandleSendToInbox.mockResolvedValue(

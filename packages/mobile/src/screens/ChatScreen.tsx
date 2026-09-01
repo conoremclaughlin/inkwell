@@ -12,7 +12,12 @@ import { agentColor, colors, spacing, type } from '../ui/theme';
  * session the agent routes it to) carries on across days rather than
  * starting cold every time. The thread is created by the first message, not
  * by opening the row: looking is free.
+ *
+ * DMs pin to the agent's "main" studio: no studio declares a chat:* route
+ * pattern, and an unrouted key is held, not delivered. Home is where you'd
+ * expect to find someone you're just talking to.
  */
+const DM_STUDIO_SLUG = 'main';
 export function dmThreadKey(agentId: string): string {
   return `chat:${agentId}`;
 }
@@ -27,6 +32,7 @@ function AgentRow({ agent }: { agent: Individual }) {
           threadKey: dmThreadKey(agent.agentId),
           title: agent.name,
           recipients: [agent.agentId],
+          studioSlug: DM_STUDIO_SLUG,
         })
       }
       style={({ pressed }) => [styles.row, pressed && { opacity: 0.8 }]}

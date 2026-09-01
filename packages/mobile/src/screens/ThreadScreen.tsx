@@ -25,7 +25,7 @@ type Props = NativeStackScreenProps<RootStackParamList, 'Thread'>;
  * polls without any scroll bookkeeping.
  */
 export function ThreadScreen({ route }: Props) {
-  const { threadKey, title, recipients } = route.params;
+  const { threadKey, title, recipients, studioSlug } = route.params;
   const { data, isLoading, error } = useThreadMessages(threadKey);
   const sendReply = useSendReply(threadKey);
   const startThread = useStartThread();
@@ -59,6 +59,7 @@ export function ThreadScreen({ route }: Props) {
           recipients: recipients as string[],
           content,
           ...(title ? { title } : {}),
+          ...(studioSlug ? { studioSlug } : {}),
         },
         { onSuccess: () => setDraft('') }
       );

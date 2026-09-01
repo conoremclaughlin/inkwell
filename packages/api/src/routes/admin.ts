@@ -7446,7 +7446,7 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
 
 /**
  * POST /api/admin/threads
- * Body: { key, recipients: string[], content, title?, priority? }
+ * Body: { key, recipients: string[], content, title?, priority?, studioSlug? }
  *   → { success, created, messageId, threadId, threadKey }
  *
  * Start a thread from the dashboard or phone — or continue one that already
@@ -7459,6 +7459,11 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
  * title on creation (send_to_inbox stores `subject` there), and every
  * recipient is woken — a first message nobody is woken for is a thread
  * nobody knows exists.
+ *
+ * `studioSlug` (single recipient only — the inbox handler's rule) pins the
+ * wake to one of the agent's studios by slug; "main" is their home studio.
+ * A DM keyed chat:<agent> has no route pattern anywhere, so without this the
+ * message is held rather than delivered.
  */
 router.post('/threads', async (req: Request, res: Response) => {
   try {
@@ -7467,6 +7472,7 @@ router.post('/threads', async (req: Request, res: Response) => {
     const content = typeof req.body?.content === 'string' ? req.body.content.trim() : '';
     const title = typeof req.body?.title === 'string' ? req.body.title.trim() : '';
     const priority = typeof req.body?.priority === 'string' ? req.body.priority : undefined;
+    const studioSlug = typeof req.body?.studioSlug === 'string' ? req.body.studioSlug.trim() : '';
     const recipients = Array.isArray(req.body?.recipients)
       ? (req.body.recipients as unknown[])
           .filter((r): r is string => typeof r === 'string')
@@ -7497,6 +7503,10 @@ router.post('/threads', async (req: Request, res: Response) => {
       res.status(400).json({ error: 'priority must be low, normal, high, or urgent' });
       return;
     }
+    if (studioSlug && (uniqueRecipients.length !== 1 || studioSlug.length > 100)) {
+      res.status(400).json({ error: 'studioSlug applies to a single recipient' });
+      return;
+    }
 
     const dataComposer = await getDataComposer();
     const supabase = dataComposer.getClient();
@@ -7512,8 +7522,11 @@ router.post('/threads', async (req: Request, res: Response) => {
         userId: authReq.pcpUserId,
         threadKey: key,
         content,
-        recipients: uniqueRecipients,
-        triggerAll: true,
+        // A studio-pinned send is the handler's single-recipient form; the
+        // group form (recipients[]) cannot carry a studio.
+        ...(studioSlug
+          ? { recipientAgentId: uniqueRecipients[0], recipientStudioSlug: studioSlug }
+          : { recipients: uniqueRecipients, triggerAll: true }),
         ...(title ? { subject: title } : {}),
         ...(priority ? { priority } : {}),
         metadata: { sentBy: 'user', channel: 'admin-api' },
