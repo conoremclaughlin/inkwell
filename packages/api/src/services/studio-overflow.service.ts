@@ -46,7 +46,8 @@
  * that wins first blocks acquires until the worktree is gone or the claim is
  * cleared. Destruction is additionally gated on a verified rescue, and
  * `cleaned` is recorded only after the worktree is confirmed gone from disk.
- * The branch is always kept — that is where the work lives.
+ * Ephemeral checkouts are DETACHED — no branch is minted at creation; rescue
+ * anchors any otherwise-unreachable commits under `ink-rescue/*`.
  */
 
 import { execFile } from 'child_process';
