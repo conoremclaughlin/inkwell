@@ -360,4 +360,72 @@ d('reconcileInterruptedDispatches (real DB)', () => {
     expect((await metadataOf(good.taskId)).graphDispatchedAt).toBeUndefined();
     expect((await metadataOf(bad.taskId)).graphDispatchedAt).toBe('not-a-timestamp');
   });
+
+  /**
+   * ROUND 2 P1 (Lumen). Requiring merely "some finished session on the thread"
+   * made the evidence thread-wide and permanent: one interrupted session would
+   * authorise clearing every stamp written on that thread forever after. The
+   * gap is real — a freshly dispatched recipient that has not reached
+   * `running` yet does not match `alive`, so its live stamp would be cleared
+   * on the strength of week-old evidence. Evidence must post-date the stamp it
+   * invalidates.
+   */
+  it('ignores a terminal session that finished BEFORE the stamp was written', async () => {
+    const { taskId, threadKey } = await newGraphGroupWithWork('__reconcile_old_evidence');
+    // Interrupted an hour ago...
+    await newSession({
+      thread_key: threadKey,
+      lifecycle: 'idle',
+      status: 'resumable',
+      metadata: {
+        interruptedAt: new Date(Date.now() - 3_600_000).toISOString(),
+        interruptedReason: 'server-shutdown',
+      },
+    });
+    // ...but this dispatch went out just now, to someone who has not started.
+    await stamp(taskId);
+
+    await executor.reconcileInterruptedDispatches(LATER());
+
+    expect((await metadataOf(taskId)).graphDispatchedAt).toBeDefined();
+  });
+
+  /**
+   * ROUND 2 P0 (Lumen). SECURITY DEFINER plus PostgreSQL's default PUBLIC
+   * EXECUTE made this callable through PostgREST by anyone holding the anon or
+   * authenticated role — and it takes no user id at all, so a single call
+   * re-arms dispatches across every user's active graph groups. Asserting the
+   * grant table would be weaker than this: what matters is that a real client
+   * holding the public key is refused.
+   */
+  describe('privileges', () => {
+    const ANON =
+      process.env.SUPABASE_PUBLISHABLE_KEY ||
+      process.env.SUPABASE_ANON_KEY ||
+      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+
+    it.skipIf(!ANON)('refuses a caller holding the public anon key', async () => {
+      const anonClient = createClient<Database>(SUPABASE_URL!, ANON!, {
+        auth: { autoRefreshToken: false, persistSession: false },
+      });
+      const { error } = await anonClient.rpc('reconcile_graph_dispatch_stamps', {
+        p_stale_before: new Date().toISOString(),
+      } as never);
+      expect(error).not.toBeNull();
+    });
+
+    it.skipIf(!ANON)('refuses the anon key on the internal timestamp helper too', async () => {
+      const anonClient = createClient<Database>(SUPABASE_URL!, ANON!, {
+        auth: { autoRefreshToken: false, persistSession: false },
+      });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { error } = await (anonClient as any).rpc('_graph_safe_ts', { p: '2026-01-01' });
+      expect(error).not.toBeNull();
+    });
+
+    it('still allows the service role that the server actually uses', async () => {
+      const result = await executor.reconcileInterruptedDispatches(new Date(0));
+      expect(result.cleared).toBe(0); // epoch cutoff: nothing qualifies, but the call must work
+    });
+  });
 });
