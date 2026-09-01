@@ -23,14 +23,18 @@ function loadConfig(extra: Record<string, unknown> = {}) {
 }
 
 const ORIGINAL = process.env.PCP_PORT_BASE;
+const ORIGINAL_INK = process.env.INK_PORT_BASE;
 
 beforeEach(() => {
   delete process.env.PCP_PORT_BASE;
+  delete process.env.INK_PORT_BASE;
 });
 
 afterEach(() => {
   if (ORIGINAL === undefined) delete process.env.PCP_PORT_BASE;
   else process.env.PCP_PORT_BASE = ORIGINAL;
+  if (ORIGINAL_INK === undefined) delete process.env.INK_PORT_BASE;
+  else process.env.INK_PORT_BASE = ORIGINAL_INK;
   vi.restoreAllMocks();
 });
 
@@ -39,10 +43,33 @@ describe('apiPort', () => {
     expect(loadConfig().extra).toMatchObject({ apiPort: 3001 });
   });
 
-  it('follows PCP_PORT_BASE, which is how isolated servers are launched', () => {
+  it('follows INK_PORT_BASE, the canonical name the server resolves first', () => {
+    process.env.INK_PORT_BASE = '4801';
+    expect((loadConfig().extra as { apiPort: number }).apiPort).toBe(4801);
+  });
+
+  it('still follows PCP_PORT_BASE, kept for backward compatibility', () => {
     process.env.PCP_PORT_BASE = '4801';
     expect((loadConfig().extra as { apiPort: number }).apiPort).toBe(4801);
   });
+
+  // Mirrors packages/api/src/config/env.ts: INK_PORT_BASE ?? PCP_PORT_BASE ?? 3001.
+  // If these two ever disagree the app addresses a different server than the
+  // one that is running, which looks exactly like the server being down.
+  it('prefers INK_PORT_BASE when both are set, matching server precedence', () => {
+    process.env.INK_PORT_BASE = '4801';
+    process.env.PCP_PORT_BASE = '5001';
+    expect((loadConfig().extra as { apiPort: number }).apiPort).toBe(4801);
+  });
+
+  it.each(['', '   ', 'nonsense'])(
+    'falls through to PCP_PORT_BASE when INK_PORT_BASE is %o rather than giving up',
+    (value) => {
+      process.env.INK_PORT_BASE = value;
+      process.env.PCP_PORT_BASE = '5001';
+      expect((loadConfig().extra as { apiPort: number }).apiPort).toBe(5001);
+    }
+  );
 
   it.each(['', '   ', 'abc', '0', '-1', '70000', '80.5'])(
     'falls back to 3001 rather than trusting %o',

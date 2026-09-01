@@ -88,12 +88,12 @@ export function hostnameFrom(raw: string | undefined | null): string | undefined
  *   2. Metro's host — in a dev build the phone is already talking to the dev
  *      machine, and the API is on that same machine at `port`. This makes the
  *      app follow a changing LAN IP with no rebuild and no .env edit.
- *   3. extra.lanHost — the dev machine's address, recorded at bundle time. This
- *      is what saves an on-device build that has no Metro to ask: without it
- *      the only remaining answer is loopback, which on a phone is the phone.
- *   4. extra.productionApiUrl — a real deployment, once dev autodiscovery is
- *      out of the picture.
- *   5. Loopback — last resort. Correct for the iOS simulator, useless on a
+ *   3. extra.lanHost and extra.productionApiUrl, in an order that depends on
+ *      the build: a DEV build prefers the LAN address (it points at the machine
+ *      you are working on), a RELEASE build prefers the configured production
+ *      URL and keeps LAN only as a fallback. Without that flip a shipped build
+ *      would address the laptop that produced it.
+ *   4. Loopback — last resort. Correct for the iOS simulator, useless on a
  *      physical device, which is why callers surface `source` in errors.
  *
  * Metro is checked before the baked LAN address rather than after, so a dev
@@ -111,10 +111,33 @@ export function resolveApiUrl(input: ResolveApiUrlInput): ResolvedApiUrl {
   }
 
   const lan = asTrimmedString(input.lanHost);
-  if (lan) return { url: `http://${lan}:${input.port}`, source: 'lan' };
+  const lanUrl: ResolvedApiUrl | undefined = lan
+    ? { url: `http://${lan}:${input.port}`, source: 'lan' }
+    : undefined;
 
   const production = asTrimmedString(input.productionApiUrl);
-  if (production) return { url: stripTrailingSlash(production), source: 'config' };
+  const productionUrl: ResolvedApiUrl | undefined = production
+    ? { url: stripTrailingSlash(production), source: 'config' }
+    : undefined;
+
+  // The order of these two flips with the build, which is the whole reason
+  // `isDev` is a parameter.
+  //
+  // In development the baked LAN address is the better answer: it points at
+  // the machine you are working on, and a production URL configured for
+  // shipping should not hijack a dev build that merely lost its Metro host.
+  //
+  // In a release build it is the opposite, and getting this wrong is worse
+  // than a wrong port. app.config.js records a LAN address on whatever machine
+  // produced the build, so an unconditional LAN-first order means a shipped
+  // app addresses the builder's laptop and `productionApiUrl` can never take
+  // effect no matter what anyone sets. LAN stays as the fallback for a release
+  // build with no production URL configured — better an address that works on
+  // the office network than loopback, which works nowhere.
+  const preferred = input.isDev ? [lanUrl, productionUrl] : [productionUrl, lanUrl];
+  for (const candidate of preferred) {
+    if (candidate) return candidate;
+  }
 
   return { url: `http://127.0.0.1:${input.port}`, source: 'fallback' };
 }

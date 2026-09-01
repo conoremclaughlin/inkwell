@@ -148,6 +148,37 @@ describe('the baked LAN address', () => {
     expect(resolved.source).toBe('lan');
   });
 
+  // app.config.js records a LAN address on whatever machine produced the build,
+  // so if LAN outranked production unconditionally, a shipped app would address
+  // the builder's laptop and productionApiUrl could never take effect.
+  it('LOSES to productionApiUrl in a release build — a shipped app must not point at a laptop', () => {
+    const resolved = resolveApiUrl({
+      isDev: false,
+      port: 3001,
+      lanHost: '192.168.1.10',
+      productionApiUrl: 'https://api.example.com',
+    });
+    expect(resolved).toEqual({ url: 'https://api.example.com', source: 'config' });
+  });
+
+  it('is still used in a release build when no production URL is configured', () => {
+    const resolved = resolveApiUrl({ isDev: false, port: 3001, lanHost: '192.168.1.10' });
+    expect(resolved).toEqual({ url: 'http://192.168.1.10:3001', source: 'lan' });
+  });
+
+  it('never outranks a live Metro host, in either kind of build', () => {
+    for (const isDev of [true, false]) {
+      const resolved = resolveApiUrl({
+        isDev,
+        port: 3001,
+        metroHostCandidates: ['192.168.86.99:8081'],
+        lanHost: '192.168.1.10',
+        productionApiUrl: 'https://api.example.com',
+      });
+      expect(resolved.source).toBe('metro');
+    }
+  });
+
   it('is skipped when app.config found no address, rather than building a broken URL', () => {
     expect(resolveApiUrl({ ...base, lanHost: null }).source).toBe('fallback');
     expect(resolveApiUrl({ ...base, lanHost: '   ' }).source).toBe('fallback');

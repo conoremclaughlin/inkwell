@@ -14,7 +14,7 @@ const os = require('os');
  * Metro's port (8081) has nothing to do with the API's, and probing a guessed
  * list of ports is both slow and wrong the moment someone picks a new base.
  *
- * But the shell that starts the server already knows the answer. PCP_PORT_BASE
+ * But the shell that starts the server already knows the answer. INK_PORT_BASE
  * is how every isolated server in this repo is launched (see AGENTS.md), and
  * Metro is started from that same environment, so reading it here is a fact
  * rather than a guess. Default 3001 matches the main dev server.
@@ -29,10 +29,28 @@ const os = require('os');
  * still follows a changing DHCP lease without a rebuild.
  */
 
-/** Port the Inkwell API listens on, from the environment that launched Metro. */
+/**
+ * Port the Inkwell API listens on, from the environment that launched Metro.
+ *
+ * Precedence mirrors the server's own resolution in
+ * packages/api/src/config/env.ts — `INK_PORT_BASE ?? PCP_PORT_BASE ?? 3001`.
+ * INK_PORT_BASE is canonical; PCP_PORT_BASE is the backward-compatible name.
+ * Reading only the legacy one meant `INK_PORT_BASE=4801` produced 3001 and the
+ * app quietly addressed the wrong server, so the two must not drift.
+ *
+ * An unusable value falls through to the next source rather than being
+ * accepted: `PCP_PORT_BASE=` (empty) is how a shell unsets an inherited var,
+ * and treating it as 0 would be worse than ignoring it.
+ */
+const PORT_ENV_VARS = ['INK_PORT_BASE', 'PCP_PORT_BASE'];
+const DEFAULT_PORT = 3001;
+
 function apiPort() {
-  const base = Number.parseInt(process.env.PCP_PORT_BASE ?? '', 10);
-  return Number.isInteger(base) && base > 0 && base < 65536 ? base : 3001;
+  for (const name of PORT_ENV_VARS) {
+    const base = Number.parseInt(process.env[name] ?? '', 10);
+    if (Number.isInteger(base) && base > 0 && base < 65536) return base;
+  }
+  return DEFAULT_PORT;
 }
 
 /**
