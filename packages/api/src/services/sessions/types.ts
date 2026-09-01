@@ -43,7 +43,23 @@ export interface MediaAttachment {
  */
 export type SessionType = 'primary' | 'task';
 
-export type SessionLifecycle = 'running' | 'idle' | 'completed' | 'failed';
+/**
+ * `interrupted`: a backend turn was killed mid-flight (server shutdown) and
+ * the session is resumable with its context intact. Distinct from `idle` so
+ * readers can see "work died here" without inspecting metadata; the DB
+ * trigger `strip_interruption_on_running` clears the interruption breadcrumbs
+ * the moment any writer moves the session back to `running`.
+ *
+ * `compacting` has always been written by the CLI lifecycle hooks
+ * (hook-lifecycle.ts VALID_LIFECYCLES); the union simply failed to mention it.
+ */
+export type SessionLifecycle =
+  | 'running'
+  | 'idle'
+  | 'compacting'
+  | 'interrupted'
+  | 'completed'
+  | 'failed';
 
 /** @deprecated Use SessionLifecycle */
 export type SessionStatus = 'active' | 'paused' | 'completed' | 'failed';

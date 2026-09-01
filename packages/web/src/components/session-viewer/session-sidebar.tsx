@@ -43,7 +43,7 @@ const AGENT_COLORS: Record<string, string> = {
 type StatusFilter = 'all' | 'active' | 'completed';
 
 function isActive(s: Session): boolean {
-  return s.lifecycle === 'running' || s.lifecycle === 'idle';
+  return s.lifecycle === 'running' || s.lifecycle === 'idle' || s.lifecycle === 'interrupted';
 }
 
 function isCompleted(s: Session): boolean {
@@ -73,6 +73,7 @@ function statusDot(
     if (phase === 'runtime:generating') return { color: 'bg-blue-500', pulse: true };
     return { color: 'bg-green-500', pulse: true };
   }
+  if (lifecycle === 'interrupted') return { color: 'bg-amber-500', pulse: false };
   if (phase?.startsWith('blocked')) return { color: 'bg-amber-500', pulse: false };
   if (lifecycle === 'idle') return { color: 'bg-green-400', pulse: false };
   return { color: 'bg-gray-400', pulse: false };
@@ -83,6 +84,7 @@ function phaseText(lifecycle: string | null, phase: string | null): string {
     if (phase === 'runtime:generating') return 'generating';
     return phase?.replace('runtime:', '') ?? 'running';
   }
+  if (lifecycle === 'interrupted') return 'interrupted';
   if (phase?.startsWith('blocked')) return phase;
   if (lifecycle === 'idle') return phase ?? 'idle';
   return phase ?? lifecycle ?? '';

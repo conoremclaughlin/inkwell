@@ -50,6 +50,7 @@ function lifecycleColor(lifecycle: string | null, phase: string | null, skin: Sk
 function lifecycleLabel(lifecycle: string | null, phase: string | null): string {
   if (!lifecycle && !phase) return 'offline';
   if (lifecycle === 'running') return phase ?? 'active';
+  if (lifecycle === 'interrupted') return 'interrupted';
   if (lifecycle === 'idle') return phase ?? 'idle';
   return phase ?? lifecycle ?? 'unknown';
 }

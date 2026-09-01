@@ -22,11 +22,14 @@ import {
   closeIntakeAndDrain,
   isIntakeOpen,
   admitStateWrite,
+  markRunnerSettled,
 } from './active-runs.js';
 import {
   interruptActiveRuns,
   isAlreadyTerminal,
   INTERRUPT_REASON,
+  BOOKKEEPING_REASON,
+  formatTurnAge,
 } from './interrupt-active-runs.js';
 import type { ActiveRun } from './active-runs.js';
 
@@ -61,6 +64,21 @@ describe('active-runs registry', () => {
 
   it('ignores a clear for a session it never saw', () => {
     expect(() => clearActiveRun('nope')).not.toThrow();
+    expect(activeRunCount()).toBe(0);
+  });
+
+  it('marks a registered run as runner-settled without clearing it', () => {
+    registerActiveRun(run());
+    expect(listActiveRuns()[0]?.runnerSettledAt).toBeUndefined();
+    markRunnerSettled('sess-1');
+    // Settling is bookkeeping state, not a clear — the run must survive until
+    // its terminal write persists, or shutdown never reports it.
+    expect(activeRunCount()).toBe(1);
+    expect(listActiveRuns()[0]?.runnerSettledAt).toEqual(expect.any(Number));
+  });
+
+  it('ignores a settle for a session it never saw', () => {
+    expect(() => markRunnerSettled('nope')).not.toThrow();
     expect(activeRunCount()).toBe(0);
   });
 });
@@ -101,22 +119,59 @@ describe('registry brackets the persisted running state', () => {
     expect(source.indexOf('throw runnerError', failed)).toBeGreaterThan(clearAfterFailed);
   });
 
-  it('clears only after the post-run lifecycle write on the success path', () => {
-    const postRun = at('const postRunLifecycle');
-    expect(postRun).toBeGreaterThan(-1);
-    expect(source.indexOf('clearActiveRun(', postRun)).toBeGreaterThan(postRun);
+  /**
+   * On the success path, the clear lives inside the onTurnFinalized closure,
+   * which is invoked from exactly two places: the `if (finalized)` block when
+   * the inline write persisted, and retryTurnFinalization's onFinalized once
+   * a background retry lands the same write. Either way the clear is
+   * downstream of a DURABLE terminal write — never of the attempt.
+   */
+  it('clears on the success path only inside the finalized closure', () => {
+    const closure = at('const onTurnFinalized');
+    const inlineGate = source.indexOf('let finalized = false', closure);
+    const clearAt = source.indexOf('clearActiveRun(', closure);
+    expect(closure).toBeGreaterThan(-1);
+    expect(clearAt).toBeGreaterThan(closure);
+    expect(clearAt).toBeLessThan(inlineGate);
+
+    // Between the finalized gate and the guarded invocation, the only
+    // permitted clear is the gone-row one: a deleted session has nothing to
+    // finalize and nothing a shutdown report could truthfully say about it.
+    const invocation = source.indexOf('onTurnFinalized();', inlineGate);
+    expect(invocation).toBeGreaterThan(-1);
+    const span = source.slice(inlineGate, invocation);
+    for (
+      let i = span.indexOf('clearActiveRun(');
+      i >= 0;
+      i = span.indexOf('clearActiveRun(', i + 1)
+    ) {
+      expect(span.slice(Math.max(0, i - 40), i)).toContain("outcome === 'gone'");
+    }
   });
 
-  // ...and only when that write actually happened. An unconditional clear
-  // after a shutdown-refused write drops the run before the snapshot.
-  it('guards the success-path clear on the write having persisted', () => {
-    const postRun = at('const postRunLifecycle');
-    const clearAt = source.indexOf('clearActiveRun(', postRun);
-    expect(source.slice(postRun, clearAt)).toContain('finalized');
-    // Single-statement or block form — either way, the clear sits directly
-    // inside an `if (finalized)` guard (the block also runs the lease
-    // release at the run boundary, PR #492).
-    expect(source.slice(clearAt - 60, clearAt)).toMatch(/if \(finalized\)\s*\{?\s*$/);
+  // ...and the inline invocation only happens when the write actually
+  // persisted. An unconditional invocation after a shutdown-refused write
+  // drops the run before the snapshot.
+  it('guards the inline finalized invocation on the write having persisted', () => {
+    expect(source).toMatch(/if \(finalized\)\s*\{\s*onTurnFinalized\(\);/);
+  });
+
+  // The background retry must hand the SAME closure to the loop, so a late
+  // finalization runs the same boundary steps as an inline one.
+  it('routes the background retry through the same finalized closure', () => {
+    const retryCall = at('retryTurnFinalization({');
+    expect(retryCall).toBeGreaterThan(-1);
+    expect(source.indexOf('onFinalized: onTurnFinalized', retryCall)).toBeGreaterThan(retryCall);
+  });
+
+  // A bookkeeping failure must not masquerade as a turn failure: the catch
+  // around the inline finalize write never rethrows (pr:558 — the rethrow is
+  // what told the sender "Trigger to lumen failed" about a delivered reply).
+  it('does not rethrow from the finalize catch', () => {
+    const catchAt = at('catch (finalizeError)');
+    const blockEnd = source.indexOf('if (finalized)', catchAt);
+    expect(catchAt).toBeGreaterThan(-1);
+    expect(source.slice(catchAt, blockEnd)).not.toContain('throw');
   });
 
   /**
@@ -293,6 +348,7 @@ describe('isAlreadyTerminal', () => {
     [{ lifecycle: 'running', ended_at: '2026-08-13T07:00:00Z' }, true],
     [{ lifecycle: 'running', ended_at: null }, false],
     [{ lifecycle: 'idle', ended_at: null }, false],
+    [{ lifecycle: 'interrupted', ended_at: null }, false],
     [{}, false],
   ])('%o → %s', (row, expected) => {
     expect(isAlreadyTerminal(row)).toBe(expected);
@@ -390,14 +446,18 @@ function makeClient(
 describe('interruptActiveRuns', () => {
   beforeEach(() => resetActiveRuns());
 
-  it('moves the session off running and marks it resumable', async () => {
+  it('moves the session to interrupted and marks it resumable', async () => {
     const { client, sessionUpdates } = makeClient();
     await interruptActiveRuns(client, [run()]);
 
     expect(sessionUpdates).toHaveLength(1);
     expect(sessionUpdates[0]).toMatchObject({
       id: 'sess-1',
-      lifecycle: 'idle',
+      // First-class lifecycle, not idle-with-a-breadcrumb: `ink mission`,
+      // list_sessions and the dashboard all read "work died here" without
+      // inspecting metadata. The strip_interruption_on_running DB trigger
+      // clears the breadcrumbs when any writer resumes the session.
+      lifecycle: 'interrupted',
       status: 'resumable',
     });
   });
@@ -527,7 +587,7 @@ describe('interruptActiveRuns', () => {
       await interruptActiveRuns(client, [run()]);
 
       const content = String(threadMessages[0]!.content);
-      expect(content).toContain('resumable');
+      expect(content).toContain('marked interrupted');
       expect(content).toContain('re-trigger');
     });
   });
@@ -794,5 +854,137 @@ describe('interruptActiveRuns', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+/**
+ * The pr:558 shape (2026-09-01): the turn FINISHED — reply delivered, child
+ * exited — and only the terminal write was lost to a transient DB error. The
+ * run stayed registered for 14 hours, and shutdown then reported a process
+ * "still running" that had exited at 00:23, advising a resume of work that
+ * had already happened. A settled runner changes what shutdown may claim.
+ */
+describe('a run whose runner had settled (finished, unrecorded)', () => {
+  const settledRun = (over: Partial<ActiveRun> = {}) => run({ runnerSettledAt: 5_000, ...over });
+
+  it('moves the row to plain idle — the turn was not interrupted', async () => {
+    const { client, sessionUpdates } = makeClient();
+    await interruptActiveRuns(client, [settledRun()]);
+
+    expect(sessionUpdates).toHaveLength(1);
+    expect(sessionUpdates[0]).toMatchObject({ id: 'sess-1', lifecycle: 'idle' });
+    expect(sessionUpdates[0]).not.toHaveProperty('status');
+  });
+
+  it('records the bookkeeping reason, not the interruption one', async () => {
+    const { client, sessionUpdates } = makeClient();
+    await interruptActiveRuns(client, [settledRun()]);
+
+    const metadata = sessionUpdates[0]?.metadata as Record<string, unknown>;
+    expect(metadata.interruptedReason).toBe(BOOKKEEPING_REASON);
+    expect(metadata.taskDescription).toBe('review #485');
+  });
+
+  it('reports finished-unrecorded', async () => {
+    const { client } = makeClient();
+    const [outcome] = await interruptActiveRuns(client, [settledRun()]);
+    expect(outcome).toMatchObject({ state: 'finished-unrecorded', marked: true });
+  });
+
+  it('says the process had exited and points the reader at the thread', async () => {
+    const { client, threadMessages } = makeClient();
+    await interruptActiveRuns(client, [settledRun()]);
+
+    const content = String(threadMessages[0]!.content);
+    expect(content).toContain('had already finished');
+    expect(content).toContain('check above');
+    expect(content).not.toContain('still running');
+    expect(content).not.toContain('cut short');
+  });
+
+  it('stamps the settled instant into the notice metadata', async () => {
+    const { client, threadMessages } = makeClient();
+    await interruptActiveRuns(client, [settledRun()]);
+
+    const metadata = threadMessages[0]!.metadata as Record<string, unknown>;
+    expect(metadata.runnerSettledAt).toEqual(expect.any(String));
+    expect(metadata.turnStartedAt).toEqual(expect.any(String));
+    expect(metadata.reason).toBe(BOOKKEEPING_REASON);
+  });
+
+  it('downgrades to unknown when the drain timed out', async () => {
+    const { client } = makeClient();
+    const [outcome] = await interruptActiveRuns(client, [settledRun()], 3_000, false);
+    expect(outcome.state).toBe('unknown');
+  });
+});
+
+describe('turn_interrupted activity event', () => {
+  it('logs for an unsettled run — the one turn ending nothing else records', async () => {
+    const { client } = makeClient();
+    const logActivity = vi.fn(async () => ({}));
+    await interruptActiveRuns(client, [run()], 3_000, true, { logActivity });
+
+    expect(logActivity).toHaveBeenCalledTimes(1);
+    expect(logActivity.mock.calls[0]![0]).toMatchObject({
+      agentId: 'lumen',
+      type: 'error',
+      subtype: 'turn_interrupted',
+      sessionId: 'sess-1',
+    });
+  });
+
+  it('logs even for a threadless run — the record does not need an audience', async () => {
+    const { client } = makeClient();
+    const logActivity = vi.fn(async () => ({}));
+    await interruptActiveRuns(client, [run({ threadKey: undefined })], 3_000, true, {
+      logActivity,
+    });
+    expect(logActivity).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not log for a settled run — its completion was already logged', async () => {
+    const { client } = makeClient();
+    const logActivity = vi.fn(async () => ({}));
+    await interruptActiveRuns(client, [run({ runnerSettledAt: 5_000 })], 3_000, true, {
+      logActivity,
+    });
+    expect(logActivity).not.toHaveBeenCalled();
+  });
+
+  it('tolerates a logger that throws — the state fix and notice still land', async () => {
+    const { client, sessionUpdates, threadMessages } = makeClient();
+    const logActivity = vi.fn(async () => {
+      throw new Error('activity stream down');
+    });
+    const [outcome] = await interruptActiveRuns(client, [run()], 3_000, true, { logActivity });
+
+    expect(outcome).toMatchObject({ state: 'interrupted', marked: true, noticed: true });
+    expect(sessionUpdates).toHaveLength(1);
+    expect(threadMessages).toHaveLength(1);
+  });
+});
+
+describe('the interrupted notice carries the turn age', () => {
+  it('says how long the turn had been running', async () => {
+    const { client, threadMessages } = makeClient();
+    await interruptActiveRuns(client, [run({ startedAt: Date.now() - 2 * 3_600_000 })]);
+
+    const content = String(threadMessages[0]!.content);
+    expect(content).toContain('turn started 2h ago');
+  });
+});
+
+describe('formatTurnAge', () => {
+  it.each([
+    [30_000, 'under a minute'],
+    [5 * 60_000, '5m'],
+    [2 * 3_600_000, '2h'],
+    [2 * 3_600_000 + 33 * 60_000, '2h 33m'],
+    [14 * 3_600_000 + 26 * 60_000, '14h 26m'],
+    [-5, 'an unknown time'],
+    [Number.NaN, 'an unknown time'],
+  ])('%d ms → %s', (ms, expected) => {
+    expect(formatTurnAge(ms as number)).toBe(expected);
   });
 });

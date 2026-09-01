@@ -5,9 +5,10 @@
  * Uses dependency injection for clean, isolated tests.
  */
 
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { tmpdir } from 'os';
 import { makeFakeSupabase, type Row } from './fake-supabase.js';
+import { resetActiveRuns, activeRunCount, listActiveRuns } from './active-runs.js';
 import { StudioOverflowService } from '../studio-overflow.service.js';
 import { StudioLeaseService } from '../studio-lease.service.js';
 import {
@@ -210,6 +211,104 @@ describe('SessionService', () => {
       undefined,
       mockInkRunner
     );
+  });
+
+  /**
+   * pr:558 (2026-09-01): the post-run finalization write hit a transient DB
+   * error and the throw rode up through the trigger handler — the sender was
+   * told "Trigger to lumen failed" about a reply that had been delivered 28
+   * minutes earlier, and the unfinalized run sat registered for 14 hours.
+   * These pin the repaired contract: bookkeeping failure is not turn failure.
+   */
+  describe('finalization failure is bookkeeping, not turn failure', () => {
+    const failIdleWrites = (times = Number.POSITIVE_INFINITY) => {
+      let remaining = times;
+      vi.mocked(mockRepository.update).mockImplementation(async (id, updates) => {
+        if ((updates as { lifecycle?: string }).lifecycle === 'idle' && remaining > 0) {
+          remaining -= 1;
+          throw new Error('An unexpected error occurred');
+        }
+        return createMockSession({ id, ...(updates as object) });
+      });
+    };
+
+    beforeEach(() => {
+      vi.useFakeTimers();
+      resetActiveRuns();
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(createMockSession());
+    });
+
+    afterEach(async () => {
+      // Drain any detached retry loop past its budget so it cannot leak into
+      // the next test, then drop the fake clock.
+      await vi.advanceTimersByTimeAsync(31 * 60_000);
+      vi.useRealTimers();
+      resetActiveRuns();
+    });
+
+    it('reports the turn outcome the recipient experienced, not the lost write', async () => {
+      failIdleWrites();
+
+      const result = await sessionService.handleMessage(createMockRequest());
+
+      // This is the exact assertion pr:558 failed: success:false here is what
+      // became the false "Trigger to lumen failed" notice.
+      expect(result.success).toBe(true);
+      expect(result.error).toBeUndefined();
+      expect(result.finalTextResponse).toBe('Hello! How can I help?');
+    });
+
+    it('keeps the run registered (settled) while the write has not landed', async () => {
+      failIdleWrites();
+
+      await sessionService.handleMessage(createMockRequest());
+
+      expect(activeRunCount()).toBe(1);
+      // Settled: shutdown must say "finished, unrecorded", never "still running".
+      expect(listActiveRuns()[0]?.runnerSettledAt).toEqual(expect.any(Number));
+    });
+
+    it('finalizes in the background once the DB recovers, then clears the run', async () => {
+      // Inline write fails, first retry (t+5s) fails, second retry (t+15s) lands.
+      failIdleWrites(2);
+
+      await sessionService.handleMessage(createMockRequest());
+      expect(activeRunCount()).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(20_000);
+
+      expect(activeRunCount()).toBe(0);
+      const idleWrites = vi
+        .mocked(mockRepository.update)
+        .mock.calls.filter(([, u]) => (u as { lifecycle?: string }).lifecycle === 'idle');
+      expect(idleWrites).toHaveLength(3);
+    });
+
+    it('abandons and clears when the session row is gone', async () => {
+      vi.mocked(mockRepository.update).mockImplementation(async (id, updates) => {
+        if ((updates as { lifecycle?: string }).lifecycle === 'idle') {
+          throw new Error(`Session not found: ${id}`);
+        }
+        return createMockSession({ id, ...(updates as object) });
+      });
+
+      await sessionService.handleMessage(createMockRequest());
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      // Nothing to finalize and nothing a shutdown report could say about it.
+      expect(activeRunCount()).toBe(0);
+    });
+
+    it('a run that never finalizes stays registered for the shutdown report', async () => {
+      failIdleWrites();
+
+      await sessionService.handleMessage(createMockRequest());
+      await vi.advanceTimersByTimeAsync(31 * 60_000);
+
+      // Exhausted, not cleared: the row still says running, and the registry
+      // is how shutdown finds out and tells someone.
+      expect(activeRunCount()).toBe(1);
+    });
   });
 
   describe('the identity pin actually reaches the runner', () => {

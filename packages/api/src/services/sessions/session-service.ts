@@ -38,9 +38,11 @@ import { CodexRunner } from './codex-runner.js';
 import {
   registerActiveRun,
   clearActiveRun,
+  markRunnerSettled,
   trackStateWrite,
   admitStateWrite,
 } from './active-runs.js';
+import { retryTurnFinalization } from './finalize-turn.js';
 import { GeminiRunner } from './gemini-runner.js';
 import { AntigravityRunner } from './antigravity-runner.js';
 import { InkRunner } from './ink-runner.js';
@@ -1618,7 +1620,12 @@ export class SessionService implements ISessionService {
         mediaAttachments: mediaAttachments.length > 0 ? mediaAttachments : undefined,
       });
       turnDurationMs = Date.now() - turnStartMs;
+      // The child has exited; only bookkeeping remains. NOT a clear — the run
+      // stays registered until the terminal write lands — but from here a
+      // shutdown report must say "finished, unrecorded", never "still running".
+      markRunnerSettled(session.id);
     } catch (runnerError) {
+      markRunnerSettled(session.id);
       // Runner threw (spawn failure, capacity error, etc.) — mark session as
       // failed, unless shutdown already owns this session's state and would
       // have its interruption record overwritten by this write.
@@ -1740,55 +1747,30 @@ export class SessionService implements ISessionService {
     // metadata blob from a snapshot taken at its own start, finalizing now
     // would overwrite the interruption's lifecycle AND erase its breadcrumb.
     // Shutdown owns the state from here (Lumen, PR #490 round 3).
-    let finalized = false;
-    if (!admitStateWrite(session.id)) {
-      logger.warn('Skipping post-run session write; shutdown already recorded this session', {
-        sessionId: session.id,
-        wouldHaveBeen: postRunLifecycle,
-      });
-    } else if (result.backendSessionId !== session.backendSessionId) {
-      logger.info('Backend session ID linked to PCP session', {
-        pcpSessionId: session.id,
-        backendSessionId: result.backendSessionId,
-        previousBackendSessionId: session.backendSessionId || null,
-        backend: resolvedBackend,
-        agentId: session.agentId,
-      });
-      await trackStateWrite(
-        this.repository.update(session.id, {
-          backendSessionId: result.backendSessionId,
-          messageCount: session.messageCount + 1,
-          backend: resolvedBackend,
-          ...(servedModel ? { model: servedModel } : {}),
-          lifecycle: postRunLifecycle as Session['lifecycle'],
-          cliAttached: false,
-        })
-      );
-      finalized = true;
-    } else {
-      await trackStateWrite(
-        this.repository.update(session.id, {
-          messageCount: session.messageCount + 1,
-          backend: resolvedBackend,
-          ...(servedModel ? { model: servedModel } : {}),
-          lifecycle: postRunLifecycle as Session['lifecycle'],
-          cliAttached: false,
-        })
-      );
-      finalized = true;
-    }
+    // One payload for both the inline attempt and any background retry, so a
+    // retry writes the identical terminal state the first attempt meant to.
+    const finalizeUpdates = {
+      ...(result.backendSessionId !== session.backendSessionId
+        ? { backendSessionId: result.backendSessionId }
+        : {}),
+      messageCount: session.messageCount + 1,
+      backend: resolvedBackend,
+      ...(servedModel ? { model: servedModel } : {}),
+      lifecycle: postRunLifecycle as Session['lifecycle'],
+      cliAttached: false,
+    };
+    const performFinalizeWrite = () =>
+      trackStateWrite(this.repository.update(session.id, finalizeUpdates));
 
-    // Cleared ONLY if a terminal state actually persisted. Clearing after a
-    // refused write would delete this run from the registry while its row
-    // still says `running` — and if shutdown is mid-drain and has not
-    // snapshotted yet, the session vanishes from the report and gets no
-    // notice. Exactly the original zombie, reached through the gate meant to
-    // prevent it (Lumen, PR #490 round 4).
-    //
-    // Staying registered is also right when something throws between
-    // runner.run() and here: the row really is still `running`, so a later
-    // shutdown reporting it as interrupted is the truth.
-    if (finalized) {
+    // Run-boundary steps. Invoked ONLY after the terminal write durably
+    // persisted — inline on the fast path, from the retry loop otherwise.
+    const onTurnFinalized = () => {
+      // Cleared ONLY once a terminal state actually persisted. Clearing after
+      // a refused or failed write would delete this run from the registry
+      // while its row still says `running` — and if shutdown is mid-drain and
+      // has not snapshotted yet, the session vanishes from the report and
+      // gets no notice. Exactly the original zombie, reached through the gate
+      // meant to prevent it (Lumen, PR #490 round 4).
       clearActiveRun(session.id);
       // The run boundary is the real terminal edge for lease release: a
       // release requested mid-turn (end_session from inside the run) was
@@ -1800,8 +1782,10 @@ export class SessionService implements ISessionService {
       // Graph claims are turn-scoped: for a server-spawned session the run
       // IS the turn, so its claims return to the pool at this boundary
       // (spec v10; the sweep remains the crash backstop). Fire-and-forget
-      // with the boundary instant captured HERE, so a delayed release can
-      // never touch claims a later run acquires (Lumen round 3 P1).
+      // with the boundary instant captured HERE — the real finalization
+      // instant, even when finalization lands minutes late — so a delayed
+      // release can never touch claims a later run acquires (Lumen round 3
+      // P1).
       if (this.supabase) {
         const boundaryAt = new Date().toISOString();
         void releaseGraphClaimsForSession(
@@ -1816,6 +1800,63 @@ export class SessionService implements ISessionService {
           });
         });
       }
+    };
+
+    let finalized = false;
+    if (!admitStateWrite(session.id)) {
+      logger.warn('Skipping post-run session write; shutdown already recorded this session', {
+        sessionId: session.id,
+        wouldHaveBeen: postRunLifecycle,
+      });
+    } else {
+      if (result.backendSessionId !== session.backendSessionId) {
+        logger.info('Backend session ID linked to PCP session', {
+          pcpSessionId: session.id,
+          backendSessionId: result.backendSessionId,
+          previousBackendSessionId: session.backendSessionId || null,
+          backend: resolvedBackend,
+          agentId: session.agentId,
+        });
+      }
+      try {
+        await performFinalizeWrite();
+        finalized = true;
+      } catch (finalizeError) {
+        // A failed terminal write is a BOOKKEEPING failure, not a turn
+        // failure. The turn already ran; any reply it produced is already
+        // delivered or already routed below. Throwing here reported exactly
+        // that lie on pr:558: the sender was told "Trigger to lumen failed"
+        // about an LGTM that had landed 28 minutes earlier, and the
+        // unfinalized run then sat registered for 14 hours. The write is
+        // idempotent, so it retries in the background — for longer than the
+        // DB flake that caused it (~24 min observed) — while this turn
+        // reports the outcome the recipient actually experienced.
+        logger.error(
+          'Post-run finalization failed; turn outcome stands, retrying bookkeeping in background',
+          {
+            sessionId: session.id,
+            wouldHaveBeen: postRunLifecycle,
+            error: finalizeError instanceof Error ? finalizeError.message : String(finalizeError),
+          }
+        );
+        void retryTurnFinalization({
+          sessionId: session.id,
+          attempt: performFinalizeWrite,
+          admit: () => admitStateWrite(session.id),
+          onFinalized: onTurnFinalized,
+        }).then((outcome) => {
+          // A gone row has nothing to finalize and nothing a shutdown report
+          // could truthfully say about it.
+          if (outcome === 'gone') clearActiveRun(session.id);
+        });
+      }
+    }
+
+    // Staying registered when the write failed or was refused is deliberate:
+    // the row really does still say `running`, and with the runner settled the
+    // shutdown report reads "finished, unrecorded" rather than "still running".
+    if (finalized) {
+      onTurnFinalized();
     }
 
     // Gated on `finalized` for the same reason the lifecycle write is:

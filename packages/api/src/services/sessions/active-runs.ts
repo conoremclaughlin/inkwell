@@ -47,6 +47,16 @@ export interface ActiveRun {
   /** Who asked for this run; the agent left waiting when it dies. */
   senderAgentId?: string;
   startedAt: number;
+  /**
+   * Set when the runner promise settled — the child process has exited and
+   * only bookkeeping remains. A registered run WITHOUT this is a turn that
+   * dies with the server; a registered run WITH it is a finished turn whose
+   * terminal write has not landed (pr:558, 2026-09-01: a finalization write
+   * lost to a transient DB error left a run registered for 14 hours, and
+   * shutdown then reported a process "still running" that had exited at
+   * 00:23). Shutdown reporting must not conflate the two.
+   */
+  runnerSettledAt?: number;
 }
 
 const active = new Map<string, ActiveRun>();
@@ -82,6 +92,17 @@ export function registerActiveRun(run: ActiveRun): boolean {
  */
 export function clearActiveRun(sessionId: string): void {
   active.delete(sessionId);
+}
+
+/**
+ * Called the moment the runner promise settles (resolve or reject): the child
+ * process is gone; what remains is bookkeeping. Deliberately NOT a clear —
+ * the run must stay registered until its terminal state durably persists —
+ * but it changes what a shutdown may truthfully claim about the run.
+ */
+export function markRunnerSettled(sessionId: string): void {
+  const run = active.get(sessionId);
+  if (run) run.runnerSettledAt = Date.now();
 }
 
 export interface DrainResult {
