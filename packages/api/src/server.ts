@@ -1096,6 +1096,30 @@ When you complete a task_request, mark it as completed using update_inbox_messag
     // ordering cannot be assumed — it has to be expressed in the predicate.
     const routeStartedAt = new Date().toISOString();
 
+    // Whether this dispatch's thread assignment landed — set inside the plan
+    // block, consumed by the terminal clears below.
+    let assignmentLanded = false;
+
+    // MODE-TERMINAL hold clear (Lumen, PR #565 r1). One clear per dispatch,
+    // at the point the delivery mode's outcome is actually decided: routeOnly
+    // after its assignment-complete return, inline after the delivery
+    // decision, spawn only once admission succeeded. Clearing earlier — right
+    // after assignment — advanced routingRecovery to this dispatch's own
+    // routeStartedAt, so an admission refusal stamping with the SAME
+    // generation was refused by the RPC's strict `recovery < attemptStarted`
+    // guard: the previous hold was removed and the promised new one never
+    // landed. Awaited, never detached, so it cannot race the next dispatch's
+    // stamp (PR #514 round 2).
+    const clearHoldAtTerminal = async (): Promise<void> => {
+      if (!payload.threadId || !assignmentLanded) return;
+      await clearRoutingHold(dataComposer!.getClient(), {
+        threadId: payload.threadId,
+        userId,
+        agentId: targetAgentId,
+        routedSince: routeStartedAt,
+      });
+    };
+
     // Refusal trail, shared by the two places a routing refusal can surface
     // (v18 S3): the PLAN resolution below, and — now that provisioning is
     // deferred — the spawn path's own resolution inside handleMessage. A held
@@ -1242,19 +1266,16 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         }
       }
 
-      // A thread that routes successfully is no longer held. Cleared only
-      // AFTER assignment (Lumen, PR #514 round 2): assignment can still
-      // reroute or fail, and clearing before it lands advertises a recovery
-      // that has not happened. Awaited, not detached, so it cannot race the
-      // next dispatch's stamp.
-      if (payload.threadId && !assignmentFailure) {
-        await clearRoutingHold(dataComposer!.getClient(), {
-          threadId: payload.threadId,
-          userId,
-          agentId: targetAgentId,
-          routedSince: routeStartedAt,
-        });
-      }
+      // Assignment landing is recorded here; the hold CLEAR is deferred to
+      // each mode's TERMINAL point (Lumen, PR #565 r1). Clearing right after
+      // assignment advanced routingRecovery to this dispatch's own generation
+      // — so a spawn-admission refusal, stamping with the same routeStartedAt,
+      // was refused by the stamp RPC's strict `recovery < attemptStarted`
+      // guard: the dispatch removed the previous hold and could not leave its
+      // own. Clearing before assignment lands was already wrong (PR #514
+      // round 2: it advertises a recovery that has not happened); clearing
+      // before ADMISSION lands is the same defect one boundary later.
+      assignmentLanded = Boolean(payload.threadId) && !assignmentFailure;
 
       // Routing-only dispatch: assignment IS the entire job — a failed stamp
       // must propagate as a failed trigger (processTrigger returns
@@ -1271,6 +1292,8 @@ When you complete a task_request, mark it as completed using update_inbox_messag
           });
           throw new Error(`routeOnly assignment failed for ${targetAgentId}: ${assignmentFailure}`);
         }
+        // Terminal for routeOnly: assignment is the whole job and it landed.
+        await clearHoldAtTerminal();
         logger.info('[Trigger] routeOnly — assignment complete, no wake', {
           targetAgentId,
           sessionId: deliverySession.id,
@@ -1334,6 +1357,9 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       const delivery = decideDelivery({ forceSpawn, pollRow, attachedRow });
 
       if (delivery.mode === 'inline') {
+        // Terminal for inline: the delivery decision is made and the channel
+        // plugin owns it from here — no admission remains that could refuse.
+        await clearHoldAtTerminal();
         logger.info(
           `[Trigger] CLI-attached (${delivery.source}) — skipping spawn, channel plugin will deliver`,
           {
@@ -1431,6 +1457,13 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       logger.error(`[Trigger] SessionService failed for ${targetAgentId}: ${result.error}`);
       throw new Error(result.error || 'SessionService processing failed');
     }
+
+    // Terminal for spawn: admission actually succeeded — occupancy was
+    // rechecked, provisioning and acquisition landed, a process ran. Only now
+    // is this thread's recovery real. (A refusal above stamped its hold with
+    // routingRecovery untouched by this dispatch, so the stamp's generation
+    // guard passed.)
+    await clearHoldAtTerminal();
 
     // Stamp execution_phase → worker_active now that a session is actually running
     const strategyGroupId =
