@@ -315,6 +315,96 @@ export class GraphExecutorService {
   }
 
   /**
+   * One-shot at startup: a dispatch stamp written by a previous process can
+   * never mean "a turn is running now". The sessions we dispatch to are our
+   * own children and died with us.
+   *
+   * The stamp suppresses re-dispatch for REDISPATCH_INTERVAL_MS (30 minutes).
+   * That is correct while a live session is starting up or working, and wrong
+   * for a turn the server's own death interrupted: the node then waits out the
+   * whole window for a turn that is never coming. On 2026-08-31 four review
+   * threads stalled exactly this way at once, and every one needed a
+   * hand-written re-trigger. The interrupt machinery had already done its job —
+   * it terminalized the sessions and posted notices — but nothing made the work
+   * eligible again.
+   *
+   * Clearing at STARTUP rather than during shutdown is deliberate. Shutdown
+   * runs against a 10s force-exit inside a 3s interrupt budget, so extra DB
+   * work there is most likely to fail exactly when it is most needed; and it
+   * does not run at all when the process is killed hard — the case that most
+   * needs recovering. Startup has neither constraint and covers every death
+   * mode, including SIGKILL and a machine losing power.
+   *
+   * Scoped to UNCLAIMED, unfinished nodes in active graph groups. A claimed
+   * node is not a dispatch candidate in the first place (every ready set in
+   * _graph_evaluate_group filters on `claimed_by_session_id IS NULL`), and
+   * returning those to the pool is the terminal-claim reclaim's job, not this
+   * one. So this can only make eligible what is already waiting on nobody.
+   *
+   * Runs only where the sweep runs: the caller gates both on ENABLE_GRAPH_SWEEP
+   * so an isolated test server sharing the DB never clears the main server's
+   * stamps out from under it.
+   */
+  async reconcileInterruptedDispatches(): Promise<{ groups: number; cleared: number }> {
+    const groups = this.dataComposer.repositories.taskGroups;
+    let active: Array<{ id: string; user_id: string; title: string }>;
+    try {
+      active = await groups.listActiveGraphGroups();
+    } catch (err) {
+      logger.warn('Graph dispatch reconciliation: could not list active graph groups:', err);
+      return { groups: 0, cleared: 0 };
+    }
+    if (active.length === 0) return { groups: 0, cleared: 0 };
+
+    const client = this.dataComposer.getClient();
+    let cleared = 0;
+    try {
+      const { data, error } = await client
+        .from('tasks')
+        .select('id, metadata')
+        .in(
+          'task_group_id',
+          active.map((g) => g.id)
+        )
+        .is('claimed_by_session_id', null)
+        .neq('status', 'completed');
+      if (error) {
+        logger.warn('Graph dispatch reconciliation: could not read graph nodes:', error);
+        return { groups: active.length, cleared: 0 };
+      }
+
+      for (const row of data ?? []) {
+        const meta = (row.metadata || {}) as Record<string, unknown>;
+        // Absence of the key is the whole point — only stamped nodes are
+        // suppressed, so only stamped nodes need clearing.
+        if (!('graphDispatchedAt' in meta)) continue;
+        const next = { ...meta };
+        delete next.graphDispatchedAt;
+        const { error: writeErr } = await client
+          .from('tasks')
+          .update({ metadata: next } as never)
+          .eq('id', row.id);
+        if (writeErr) {
+          logger.warn(`Graph dispatch reconciliation: could not clear ${row.id}:`, writeErr);
+          continue;
+        }
+        cleared++;
+      }
+    } catch (err) {
+      logger.warn('Graph dispatch reconciliation failed (non-fatal):', err);
+      return { groups: active.length, cleared };
+    }
+
+    if (cleared > 0) {
+      logger.info(
+        `Graph dispatch reconciliation: cleared ${cleared} stale dispatch stamp(s) across ` +
+          `${active.length} active graph group(s); those nodes are eligible again on the next sweep`
+      );
+    }
+    return { groups: active.length, cleared };
+  }
+
+  /**
    * Reclaim abandoned claims — the #506 boundary, wired (Lumen round 1 P1).
    * Two paths, both fail-closed:
    *
