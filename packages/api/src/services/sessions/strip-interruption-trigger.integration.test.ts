@@ -1,5 +1,7 @@
 /**
- * strip_interruption_on_running — the DB-level clear-on-resume.
+ * session_running_write — the DB-level running-transition trigger: strips
+ * interruption breadcrumbs on every running write, and rotates the turn
+ * epoch on every ENTRY into running.
  *
  * The invariant "a running session is not interrupted" lives in a trigger
  * because sessions are written through at least two independent paths
@@ -47,7 +49,7 @@ const DB_URL =
     ? 'postgresql://postgres:postgres@127.0.0.1:54322/postgres'
     : undefined);
 
-d('strip_interruption_on_running trigger', () => {
+d('session_running_write trigger', () => {
   const client: SupabaseClient<Database> = createClient(SUPABASE_URL || '', SUPABASE_KEY || '', {
     auth: { autoRefreshToken: false, persistSession: false },
   });
