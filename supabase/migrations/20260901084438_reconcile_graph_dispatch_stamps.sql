@@ -33,11 +33,22 @@
 --      are now scoped to the identity the dispatch actually went to
 --      (tasks.metadata->>'graphDispatchedTo', matching sessions.sb_id).
 --
+--   5. QUALIFYING IS NOT ACTING (r4). Items 2-4 each narrowed WHICH rows
+--      qualify, and none of that touches a row changing AFTER it qualified.
+--      `targets` reads this statement's snapshot; the UPDATE then waits on the
+--      row lock. Matching on id alone it resumed after a concurrent dispatch
+--      committed and deleted a stamp written moments earlier — validated old,
+--      wrote new. The UPDATE now compare-and-sets on the captured stamp and
+--      recipient and rechecks claim and status, so those quals are
+--      re-evaluated against the newly committed version and the row is
+--      skipped.
+--
 -- The rule: a stamp is cleared only when the session that RECEIVED it has
--- finished at or after the stamp was written, and nothing of that recipient's
--- on the thread still looks alive. A stamp with no recorded recipient never
--- qualifies — that fails closed for pre-existing stamps and self-heals on the
--- next dispatch. Every uncertainty keeps the stamp, which costs at most the
+-- finished at or after the stamp was written, nothing of that recipient's on
+-- the thread still looks alive, and the row still carries that same stamp when
+-- the write actually lands. A stamp with no recorded recipient never qualifies
+-- — that fails closed for pre-existing stamps and self-heals on the next
+-- dispatch. Every uncertainty keeps the stamp, which costs at most the
 -- existing 30-minute wait; guessing wrong costs a duplicate dispatch onto live
 -- work.
 
