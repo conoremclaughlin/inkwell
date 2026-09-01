@@ -62,6 +62,7 @@ d('reconcileInterruptedDispatches (real DB)', () => {
   let groups: TaskGroupsRepository;
   let executor: GraphExecutorService;
   let reviewer: string;
+  let other: string;
   const groupIds: string[] = [];
   const sessionIds: string[] = [];
 
@@ -118,24 +119,38 @@ d('reconcileInterruptedDispatches (real DB)', () => {
     return data!.id;
   }
 
-  /** Exactly what the shutdown path leaves behind (interrupt-active-runs.ts). */
-  const interruptedSession = (threadKey: string) =>
+  /**
+   * Exactly what the shutdown path leaves behind (interrupt-active-runs.ts).
+   * `sbId` is who the session belonged to — recovery is scoped to it.
+   */
+  const interruptedSession = (threadKey: string, sbId: string, at: Date = new Date()) =>
     newSession({
       thread_key: threadKey,
+      sb_id: sbId,
       lifecycle: 'idle',
       status: 'resumable',
-      metadata: { interruptedAt: new Date().toISOString(), interruptedReason: 'server-shutdown' },
+      metadata: { interruptedAt: at.toISOString(), interruptedReason: 'server-shutdown' },
     });
 
-  /** Stand in for a dispatch that happened in a process that no longer exists. */
+  /**
+   * Stand in for a dispatch that happened in a process that no longer exists.
+   * Carries the recipient, as the real stampDispatch now does.
+   */
   async function stamp(
     taskId: string,
     extra: Record<string, unknown> = {},
-    at: Date = new Date()
+    at: Date = new Date(),
+    recipient: string | null = reviewer
   ): Promise<void> {
     const { error } = await client
       .from('tasks')
-      .update({ metadata: { ...extra, graphDispatchedAt: at.toISOString() } } as never)
+      .update({
+        metadata: {
+          ...extra,
+          graphDispatchedAt: at.toISOString(),
+          ...(recipient ? { graphDispatchedTo: recipient } : {}),
+        },
+      } as never)
       .eq('id', taskId);
     if (error) throw new Error(`fixture stamp: ${error.message}`);
   }
@@ -172,9 +187,12 @@ d('reconcileInterruptedDispatches (real DB)', () => {
     } as any;
     executor = new GraphExecutorService(composer);
 
-    const { data } = await client.from('agent_identities').select('id').limit(1).maybeSingle();
-    if (!data?.id) throw new Error('fixture: no agent identity');
-    reviewer = data.id;
+    // Two identities: the dispatch recipient, and somebody else on the same
+    // thread. The second one is the whole point of recipient scoping.
+    const { data } = await client.from('agent_identities').select('id').limit(2);
+    if (!data || data.length < 2) throw new Error('fixture: need two agent identities');
+    reviewer = data[0].id;
+    other = data[1].id;
   });
 
   afterAll(async () => {
@@ -193,7 +211,7 @@ d('reconcileInterruptedDispatches (real DB)', () => {
   it('turns a node the sweep was skipping back into one it dispatches', async () => {
     const { groupId, taskId, threadKey } = await newGraphGroupWithWork('__reconcile_redispatch');
     await stamp(taskId);
-    await interruptedSession(threadKey);
+    await interruptedSession(threadKey, reviewer);
 
     const before = await dispatchOnce(groupId, taskId);
     expect(before.skipped).toContain(taskId);
@@ -219,9 +237,10 @@ d('reconcileInterruptedDispatches (real DB)', () => {
     await stamp(taskId);
     // Both present: the turn that died AND a CLI that is still here. Liveness
     // has to win over the evidence of death, or the veto is useless.
-    await interruptedSession(threadKey);
+    await interruptedSession(threadKey, reviewer);
     await newSession({
       thread_key: threadKey,
+      sb_id: reviewer,
       cli_attached: true,
       lifecycle: 'running',
       updated_at: new Date().toISOString(),
@@ -235,8 +254,12 @@ d('reconcileInterruptedDispatches (real DB)', () => {
   it('refuses to clear when a session on the thread polled recently', async () => {
     const { taskId, threadKey } = await newGraphGroupWithWork('__reconcile_cli_poll');
     await stamp(taskId);
-    await interruptedSession(threadKey);
-    await newSession({ thread_key: threadKey, cli_poll_at: new Date().toISOString() });
+    await interruptedSession(threadKey, reviewer);
+    await newSession({
+      thread_key: threadKey,
+      sb_id: reviewer,
+      cli_poll_at: new Date().toISOString(),
+    });
 
     await executor.reconcileInterruptedDispatches(LATER());
 
@@ -251,7 +274,7 @@ d('reconcileInterruptedDispatches (real DB)', () => {
    */
   it('leaves a stamp newer than the cutoff alone', async () => {
     const { taskId, threadKey } = await newGraphGroupWithWork('__reconcile_fresh_stamp');
-    await interruptedSession(threadKey);
+    await interruptedSession(threadKey, reviewer);
     const cutoff = new Date();
     // A dispatch that lands after recovery began.
     await stamp(taskId, {}, new Date(cutoff.getTime() + 5_000));
@@ -281,7 +304,7 @@ d('reconcileInterruptedDispatches (real DB)', () => {
   it('clears only the dispatch stamp and leaves the rest of metadata intact', async () => {
     const { taskId, threadKey } = await newGraphGroupWithWork('__reconcile_metadata');
     await stamp(taskId, { repoRoot: '/somewhere', attempts: 3 });
-    await interruptedSession(threadKey);
+    await interruptedSession(threadKey, reviewer);
 
     await executor.reconcileInterruptedDispatches(LATER());
 
@@ -299,7 +322,7 @@ d('reconcileInterruptedDispatches (real DB)', () => {
   it('leaves a claimed node stamped, however stale the stamp looks', async () => {
     const { taskId, threadKey } = await newGraphGroupWithWork('__reconcile_claimed');
     await stamp(taskId);
-    await interruptedSession(threadKey);
+    await interruptedSession(threadKey, reviewer);
     // Claimed through the real RPC: execution state is executor-owned and the
     // DB refuses a hand-written claimed_by_session_id outright.
     const holder = await newSession({});
@@ -319,7 +342,7 @@ d('reconcileInterruptedDispatches (real DB)', () => {
   it('does not touch a paused group', async () => {
     const { groupId, taskId, threadKey } = await newGraphGroupWithWork('__reconcile_paused');
     await stamp(taskId);
-    await interruptedSession(threadKey);
+    await interruptedSession(threadKey, reviewer);
     await client
       .from('task_groups')
       .update({ status: 'paused' } as never)
@@ -333,7 +356,7 @@ d('reconcileInterruptedDispatches (real DB)', () => {
   it('survives running twice', async () => {
     const { taskId, threadKey } = await newGraphGroupWithWork('__reconcile_idempotent');
     await stamp(taskId);
-    await interruptedSession(threadKey);
+    await interruptedSession(threadKey, reviewer);
 
     const first = await executor.reconcileInterruptedDispatches(LATER());
     expect(first.cleared).toBeGreaterThanOrEqual(1);
@@ -349,11 +372,11 @@ d('reconcileInterruptedDispatches (real DB)', () => {
       .from('tasks')
       .update({ metadata: { graphDispatchedAt: 'not-a-timestamp' } } as never)
       .eq('id', bad.taskId);
-    await interruptedSession(bad.threadKey);
+    await interruptedSession(bad.threadKey, reviewer);
 
     const good = await newGraphGroupWithWork('__reconcile_bad_stamp_neighbour');
     await stamp(good.taskId);
-    await interruptedSession(good.threadKey);
+    await interruptedSession(good.threadKey, reviewer);
 
     await executor.reconcileInterruptedDispatches(LATER());
 
@@ -391,6 +414,75 @@ d('reconcileInterruptedDispatches (real DB)', () => {
   });
 
   /**
+   * ROUND 3 (Lumen). Time-scoping was still not enough: any OTHER agent's
+   * finished session on the thread could vouch for this dispatch. Threads
+   * routinely carry several agents — a work node's owner and a gate's
+   * reviewer share a thread_key — so this is the ordinary case. Evidence is
+   * now scoped to the identity the dispatch actually went to.
+   */
+  it('ignores a terminal session belonging to a DIFFERENT agent', async () => {
+    const { taskId, threadKey } = await newGraphGroupWithWork('__reconcile_other_agent');
+    await stamp(taskId, {}, new Date(), reviewer);
+    // Somebody else's turn on this thread ended, after the dispatch. It says
+    // nothing about whether the recipient is still working.
+    await interruptedSession(threadKey, other);
+
+    await executor.reconcileInterruptedDispatches(LATER());
+
+    expect((await metadataOf(taskId)).graphDispatchedAt).toBeDefined();
+  });
+
+  /**
+   * The mirror: liveness is scoped to the recipient too, so a different
+   * agent being busy on the thread must not keep a dead recipient's dispatch
+   * pinned. Without this, one chatty participant would suppress recovery for
+   * everyone else on the thread.
+   */
+  it('recovers even while a DIFFERENT agent is live on the same thread', async () => {
+    const { taskId, threadKey } = await newGraphGroupWithWork('__reconcile_other_alive');
+    await stamp(taskId, {}, new Date(), reviewer);
+    await interruptedSession(threadKey, reviewer);
+    await newSession({
+      thread_key: threadKey,
+      sb_id: other,
+      cli_attached: true,
+      lifecycle: 'running',
+      updated_at: new Date().toISOString(),
+    });
+
+    await executor.reconcileInterruptedDispatches(LATER());
+
+    expect((await metadataOf(taskId)).graphDispatchedAt).toBeUndefined();
+  });
+
+  /**
+   * Stamps written before graphDispatchedTo existed carry no recipient, so
+   * nothing can be established about who was supposed to act. Fail closed:
+   * they age out through the ordinary 30-minute window instead.
+   */
+  it('never clears a stamp with no recorded recipient', async () => {
+    const { taskId, threadKey } = await newGraphGroupWithWork('__reconcile_no_recipient');
+    await stamp(taskId, {}, new Date(), null);
+    await interruptedSession(threadKey, reviewer);
+
+    await executor.reconcileInterruptedDispatches(LATER());
+
+    expect((await metadataOf(taskId)).graphDispatchedAt).toBeDefined();
+  });
+
+  /** The dispatcher must actually record the recipient, or none of the above works. */
+  it('records the recipient identity when it really dispatches', async () => {
+    const { groupId, taskId } = await newGraphGroupWithWork('__reconcile_stamp_writes_recipient');
+
+    const result = await dispatchOnce(groupId, taskId);
+    expect(result.triggered).toContain(taskId);
+
+    const meta = await metadataOf(taskId);
+    expect(meta.graphDispatchedAt).toBeDefined();
+    expect(meta.graphDispatchedTo).toBe(reviewer); // the group owner, via triggerNode's fallback
+  });
+
+  /**
    * ROUND 2 P0 (Lumen). SECURITY DEFINER plus PostgreSQL's default PUBLIC
    * EXECUTE made this callable through PostgREST by anyone holding the anon or
    * authenticated role — and it takes no user id at all, so a single call
@@ -420,6 +512,28 @@ d('reconcileInterruptedDispatches (real DB)', () => {
       });
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const { error } = await (anonClient as any).rpc('_graph_safe_ts', { p: '2026-01-01' });
+      expect(error).not.toBeNull();
+    });
+
+    /**
+     * #555 revoked add_graph_nodes from PUBLIC and that read as locked down.
+     * It is not: Supabase's default ACLs grant EXECUTE on public functions
+     * explicitly to anon and authenticated, so revoking PUBLIC leaves them
+     * holding it. Measured on a scratch function — CREATE gives anon=true,
+     * REVOKE FROM PUBLIC leaves anon=true, only naming the roles clears it.
+     * This test is the difference between believing it is closed and knowing.
+     */
+    it.skipIf(!ANON)('refuses the anon key on add_graph_nodes too', async () => {
+      const anonClient = createClient<Database>(SUPABASE_URL!, ANON!, {
+        auth: { autoRefreshToken: false, persistSession: false },
+      });
+      const { error } = await anonClient.rpc('add_graph_nodes', {
+        p_user_id: USER,
+        p_task_group_id: randomUUID(),
+        p_expected_version: 0,
+        p_nodes: [],
+        p_edges: [],
+      } as never);
       expect(error).not.toBeNull();
     });
 

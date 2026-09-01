@@ -264,7 +264,11 @@ export class GraphExecutorService {
       const ok = await this.triggerNode(userId, group, node, target.kind);
       if (ok) {
         triggered.push(node.id);
-        await this.stampDispatch(node.id);
+        // Same resolution order triggerNode used to pick the recipient: the
+        // node's assignee identity, else the group owner. A human assignee
+        // never reaches here (triggerNode returns false), so this is always
+        // the agent identity the dispatch actually went to.
+        await this.stampDispatch(node.id, node.assigneeIdentityId ?? group.sb_id ?? null);
       } else {
         skipped.push(node.id);
       }
@@ -650,14 +654,32 @@ export class GraphExecutorService {
     return stamps;
   }
 
-  private async stampDispatch(taskId: string): Promise<void> {
+  /**
+   * Record that this node was dispatched, and TO WHOM.
+   *
+   * `graphDispatchedTo` is the recipient's canonical identity UUID
+   * (agent_identities.id, which is what sessions.sb_id holds). Recovery needs
+   * it: without a recipient, the only way to judge whether a dispatch is dead
+   * is thread-wide, and on a multi-agent thread any other agent's finished
+   * session would vouch for this one's live dispatch (Lumen, PR #559 round 3).
+   * Stamps written before this field existed simply never qualify for
+   * recovery — the RPC requires it — which fails closed and self-heals on the
+   * next dispatch.
+   */
+  private async stampDispatch(taskId: string, recipientIdentityId: string | null): Promise<void> {
     try {
       const client = this.dataComposer.getClient();
       const { data } = await client.from('tasks').select('metadata').eq('id', taskId).maybeSingle();
       const meta = (data?.metadata || {}) as Record<string, unknown>;
       await client
         .from('tasks')
-        .update({ metadata: { ...meta, graphDispatchedAt: new Date().toISOString() } } as never)
+        .update({
+          metadata: {
+            ...meta,
+            graphDispatchedAt: new Date().toISOString(),
+            ...(recipientIdentityId ? { graphDispatchedTo: recipientIdentityId } : {}),
+          },
+        } as never)
         .eq('id', taskId);
     } catch (err) {
       logger.debug(`Graph dispatch stamp failed for ${taskId} (non-fatal):`, err);
