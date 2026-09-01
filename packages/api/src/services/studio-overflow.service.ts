@@ -273,6 +273,24 @@ export class StudioOverflowService {
   }
 
   /**
+   * Read-only half of the overflow ladder (v18 S3): the live studio this
+   * threadKey WOULD reuse, or null. Never creates, revives, or touches a row
+   * — plan-time routing consults this so a thread whose overflow already
+   * exists keeps scoping to it, while a thread with no overflow defers the
+   * mint to spawn admission (`withStudioLease` → `ensureOverflowStudio`).
+   */
+  async findOverflowStudio(opts: {
+    userId: string;
+    parentStudio: Studio;
+    threadKey: string;
+  }): Promise<Studio | null> {
+    const { userId, threadKey } = opts;
+    const parentStudio = await this.resolveDurableAnchor(opts.parentStudio);
+    const states = await this.loadVariantStates(userId, parentStudio, threadKey);
+    return this.firstLiveMatch(states, threadKey);
+  }
+
+  /**
    * Ladder steps 1–2: find or create the ephemeral studio for this threadKey,
    * anchored on the candidate's durable ancestor. Returns null only when
    * every slug candidate collides with an unrelated studio or fails worktree

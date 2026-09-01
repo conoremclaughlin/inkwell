@@ -3,6 +3,7 @@ import {
   checkPollFreshness,
   checkLegacyAttached,
   shouldSkipSpawn,
+  decideDelivery,
   type SessionPollRow,
   type SessionAttachedRow,
 } from './trigger-delivery';
@@ -110,6 +111,51 @@ describe('trigger-delivery', () => {
       // This test verifies the contract: only the routed session matters.
       const result = shouldSkipSpawn(routedSessionPoll, null, NOW);
       expect(result).toEqual({ skip: false, source: null, sessionId: null });
+    });
+  });
+
+  describe('decideDelivery — the delivery-decision step (v18 S3)', () => {
+    it('force-spawn wins over a live CLI — attachment state is never consulted', () => {
+      // A fresh poll AND fresh attachment would both say inline; the explicit
+      // mode overrides. Strategy triggers are self-addressed — inline delivery
+      // would be silently dropped by the channel plugin's self-message filter.
+      const result = decideDelivery({
+        forceSpawn: true,
+        pollRow: freshPollRow('s1'),
+        attachedRow: attachedRow(1_000),
+        now: NOW,
+      });
+      expect(result).toEqual({ mode: 'spawn', forced: true });
+    });
+
+    it('a fresh poll delivers inline with the polling session pinned', () => {
+      const result = decideDelivery({
+        forceSpawn: false,
+        pollRow: freshPollRow('s1'),
+        attachedRow: null,
+        now: NOW,
+      });
+      expect(result).toEqual({ mode: 'inline', source: 'cli_poll_at', sessionId: 's1' });
+    });
+
+    it('a fresh legacy attachment delivers inline without a session pin', () => {
+      const result = decideDelivery({
+        forceSpawn: false,
+        pollRow: null,
+        attachedRow: attachedRow(1_000),
+        now: NOW,
+      });
+      expect(result).toEqual({ mode: 'inline', source: 'cli_attached', sessionId: null });
+    });
+
+    it('no live CLI admits an (unforced) spawn', () => {
+      const result = decideDelivery({
+        forceSpawn: false,
+        pollRow: stalePollRow('s1'),
+        attachedRow: attachedRow(11 * 60_000),
+        now: NOW,
+      });
+      expect(result).toEqual({ mode: 'spawn', forced: false });
     });
   });
 });

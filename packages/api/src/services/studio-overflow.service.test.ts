@@ -235,6 +235,91 @@ describe('StudioOverflowService.ensureOverflowStudio — reuse', () => {
   });
 });
 
+describe('StudioOverflowService.findOverflowStudio — read-only half of the ladder (v18 S3)', () => {
+  it('returns the live matching overflow without creating, reviving, or updating anything', async () => {
+    const worktreePath = await mkdtemp(path.join(tmpdir(), 'overflow-find-'));
+    try {
+      const existing = makeStudio({
+        id: 'eph-1',
+        slug: 'lumen-review--pr-476',
+        ephemeral: true,
+        parentStudioId: 'parent-1',
+        threadKey: 'pr:476',
+        metadata: { overflow: true },
+        worktreePath,
+      });
+      const studios = {
+        findBySlug: vi.fn().mockResolvedValue(existing),
+        create: vi.fn(),
+        update: vi.fn(),
+      } as unknown as StudiosRepository;
+      const leases = { logEvent: vi.fn() } as unknown as StudioLeaseService;
+
+      const service = new StudioOverflowService(studios, leases);
+      const result = await service.findOverflowStudio({
+        userId: 'user-1',
+        parentStudio: makeStudio(),
+        threadKey: 'pr:476',
+      });
+
+      expect(result?.id).toBe('eph-1');
+      expect(studios.create).not.toHaveBeenCalled();
+      expect(studios.update).not.toHaveBeenCalled();
+    } finally {
+      await rm(worktreePath, { recursive: true, force: true });
+    }
+  });
+
+  it('returns null when no overflow exists — plan-time lookups never mint', async () => {
+    const studios = {
+      findBySlug: vi.fn().mockResolvedValue(null),
+      create: vi.fn(),
+      update: vi.fn(),
+    } as unknown as StudiosRepository;
+    const leases = { logEvent: vi.fn() } as unknown as StudioLeaseService;
+
+    const service = new StudioOverflowService(studios, leases);
+    const result = await service.findOverflowStudio({
+      userId: 'user-1',
+      parentStudio: makeStudio(),
+      threadKey: 'pr:476',
+    });
+
+    expect(result).toBeNull();
+    expect(studios.create).not.toHaveBeenCalled();
+    expect(studios.update).not.toHaveBeenCalled();
+  });
+
+  it('skips a matching row whose worktree is gone — finds, never revives (ensure would)', async () => {
+    const existing = makeStudio({
+      id: 'eph-cleaned',
+      slug: 'lumen-review--pr-476',
+      ephemeral: true,
+      parentStudioId: 'parent-1',
+      threadKey: 'pr:476',
+      metadata: { overflow: true },
+      worktreePath: '/nonexistent/worktree/path',
+    });
+    const studios = {
+      findBySlug: vi.fn().mockResolvedValueOnce(existing).mockResolvedValueOnce(null),
+      create: vi.fn(),
+      update: vi.fn(),
+    } as unknown as StudiosRepository;
+    const leases = { logEvent: vi.fn() } as unknown as StudioLeaseService;
+
+    const service = new StudioOverflowService(studios, leases);
+    const result = await service.findOverflowStudio({
+      userId: 'user-1',
+      parentStudio: makeStudio(),
+      threadKey: 'pr:476',
+    });
+
+    expect(result).toBeNull();
+    expect(studios.update).not.toHaveBeenCalled();
+    expect(studios.create).not.toHaveBeenCalled();
+  });
+});
+
 describe('StudioOverflowService.ensureOverflowStudio — durable anchoring', () => {
   // 2026-08-24: `lumen-review--pr-503--pr-503--pr-534--pr-474--pr-535`. Each
   // provisioning was parented on the ephemeral studio the agent's live

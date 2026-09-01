@@ -5334,6 +5334,259 @@ describe('SessionService', () => {
       }
     });
   });
+
+  describe('v18 S3 — plan resolution provisions nothing; spawn admission provisions', () => {
+    /**
+     * The split: PLAN (which session, where would it run — planOnly:true, no
+     * lease, no mint) → DELIVERY DECISION (route-only / inline / spawn) →
+     * SPAWN ADMISSION (handleMessage's own full resolution rechecks occupancy
+     * and atomically provisions + acquires). routeOnly stamps and inline
+     * deliveries run no process, so the S2 residual — a created candidate
+     * minting an overflow worktree inside withStudioLease on a dispatch that
+     * never spawns — dies here.
+     */
+    function s3Service(mockSupabase: unknown) {
+      return new SessionService(
+        mockRepository,
+        mockContextBuilder,
+        mockClaudeRunner,
+        mockActivityStream,
+        { defaultWorkingDirectory: '/test', mcpConfigPath: '/test/.mcp.json' },
+        mockCodexRunner,
+        mockSupabase as never
+      );
+    }
+
+    type LeaseRow = {
+      sessionId: string;
+      threadKey: string;
+      threadKeys?: string[];
+      agentId: string;
+      sbId?: string | null;
+      acquiredAt: string;
+      heartbeatAt: string;
+    };
+
+    function foreignLease(): LeaseRow {
+      const now = new Date().toISOString();
+      return {
+        sessionId: 'foreign-session',
+        threadKey: 'pr:other',
+        threadKeys: ['pr:other'],
+        agentId: 'else',
+        sbId: 'sb-else',
+        acquiredAt: now,
+        heartbeatAt: now,
+      };
+    }
+
+    function s3Tables(
+      opts: { lease?: LeaseRow; studioPolicy?: string } = {}
+    ): Record<string, Row[]> {
+      const now = new Date().toISOString();
+      return {
+        studios: [
+          {
+            id: 'studio-A',
+            user_id: 'user-456',
+            agent_id: 'wren',
+            sb_id: 'sb-wren',
+            status: 'active',
+            route_patterns: ['pr:*'],
+            lease: (opts.lease ?? foreignLease()) as unknown as Row,
+            worktree_path: tmpdir(),
+            ephemeral: false,
+            repo_root: '/repos/inkwell',
+          },
+        ],
+        agent_identities: [
+          {
+            id: 'sb-wren',
+            user_id: 'user-456',
+            agent_id: 'wren',
+            workspace_id: 'ws-1',
+            updated_at: now,
+          },
+        ],
+        inbox_threads: [
+          { id: 'thread-1', user_id: 'user-456', thread_key: 'pr:3200', key_type: 'pr' },
+        ],
+        thread_key_types: [
+          {
+            id: 'tkt-pr',
+            user_id: null,
+            type: 'pr',
+            write_intent: 'write',
+            studio_policy: opts.studioPolicy ?? 'provision',
+            description: null,
+            created_at: now,
+            updated_at: now,
+          },
+        ],
+        inbox_thread_participants: [],
+        sessions: [],
+        studio_lease_events: [],
+      };
+    }
+
+    it('a plan over an occupied studio succeeds WITHOUT minting or taking anything', async () => {
+      // Pre-S3, this exact shape (unanchored, foreign fresh holder, provision
+      // policy) minted an overflow worktree at the gate — for a dispatch that
+      // might deliver inline or only stamp assignment. The plan now binds the
+      // candidate and defers everything: spawn admission diverts if it comes.
+      const tables = s3Tables();
+      const overflowSpy = vi.spyOn(StudioOverflowService.prototype, 'ensureOverflowStudio');
+      const service = s3Service(makeFakeSupabase(tables));
+
+      const session = await service.getOrCreateSession('user-456', 'wren', {
+        threadKey: 'pr:3200',
+        planOnly: true,
+      });
+
+      expect(session.studioId).toBe('studio-A');
+      expect(overflowSpy).not.toHaveBeenCalled();
+      const lease = tables.studios[0].lease as LeaseRow;
+      expect(lease.sessionId).toBe('foreign-session'); // holder untouched
+      expect(lease.threadKeys).toEqual(['pr:other']); // no append, no steal
+      overflowSpy.mockRestore();
+    });
+
+    it('a plan finds the overflow a previous SPAWN built — placement stays continuous', async () => {
+      // findByThreadKey is a studio-scoped FILTER (S2's finding): if the plan
+      // resolved to the occupied candidate while the thread's session lives in
+      // its overflow, the reuse rung would go blind and a duplicate session
+      // would be created. The read-only lookup keeps the scope pointed at the
+      // existing overflow.
+      const tables = s3Tables();
+      const overflowStudio = {
+        id: 'studio-B',
+        userId: 'user-456',
+        agentId: 'wren',
+        ephemeral: true,
+        parentStudioId: 'studio-A',
+        threadKey: 'pr:3200',
+      };
+      const findSpy = vi
+        .spyOn(StudioOverflowService.prototype, 'findOverflowStudio')
+        .mockResolvedValue(overflowStudio as never);
+      const ensureSpy = vi.spyOn(StudioOverflowService.prototype, 'ensureOverflowStudio');
+      const threadSession = createMockSession({
+        id: 'thread-session',
+        agentId: 'wren',
+        studioId: 'studio-B',
+      });
+      const findByThreadKey = vi.fn().mockResolvedValue(threadSession);
+      (mockRepository as unknown as Record<string, unknown>).findByThreadKey = findByThreadKey;
+      const service = s3Service(makeFakeSupabase(tables));
+
+      try {
+        const session = await service.getOrCreateSession('user-456', 'wren', {
+          threadKey: 'pr:3200',
+          planOnly: true,
+        });
+
+        expect(session.id).toBe('thread-session');
+        // The rung was scoped to the FOUND overflow, not the occupied candidate.
+        expect(findByThreadKey).toHaveBeenCalledWith(
+          'user-456',
+          'wren',
+          'pr:3200',
+          'studio-B',
+          undefined,
+          'sb-wren'
+        );
+        expect(ensureSpy).not.toHaveBeenCalled();
+        expect(mockRepository.create).not.toHaveBeenCalled();
+      } finally {
+        delete (mockRepository as unknown as Record<string, unknown>).findByThreadKey;
+        findSpy.mockRestore();
+        ensureSpy.mockRestore();
+      }
+    });
+
+    it('plan-time refusals still fire — a write-typed reuse-only thread holds, it does not plan', async () => {
+      // Refusals are routing DECISIONS, not provisioning actions: deferring
+      // the mint must not turn "this deploy thread has nowhere safe to write"
+      // into a successful plan.
+      const tables = s3Tables({ studioPolicy: 'reuse-only' });
+      const service = s3Service(makeFakeSupabase(tables));
+
+      await expect(
+        service.getOrCreateSession('user-456', 'wren', { threadKey: 'pr:3200', planOnly: true })
+      ).rejects.toMatchObject({
+        code: 'ROUTING_REFUSED',
+        detail: { reason: 'occupied', policy: 'reuse-only' },
+      });
+      expect(mockRepository.create).not.toHaveBeenCalled();
+    });
+
+    it('an anchored plan to the holder session never touches the holder set (inline is a deposit)', async () => {
+      // Contrast with S2's append test: the SAME anchored shape WITH planOnly
+      // leaves the lease alone. Inline delivery rides the session's existing
+      // lease (v17 §5); the multiplex append happens at spawn admission, when
+      // the session actually takes the thread into the tree.
+      const now = new Date().toISOString();
+      const tables = s3Tables({
+        lease: {
+          sessionId: 'holder-session',
+          threadKey: 'pr:other',
+          threadKeys: ['pr:other'],
+          agentId: 'wren',
+          sbId: 'sb-wren',
+          acquiredAt: now,
+          heartbeatAt: now,
+        },
+      });
+      mockRepository.findById = vi.fn().mockResolvedValue(
+        createMockSession({
+          id: 'holder-session',
+          agentId: 'wren',
+          sbId: 'sb-wren',
+          studioId: 'studio-A',
+        })
+      );
+      const overflowSpy = vi.spyOn(StudioOverflowService.prototype, 'ensureOverflowStudio');
+      const service = s3Service(makeFakeSupabase(tables));
+
+      const session = await service.getOrCreateSession('user-456', 'wren', {
+        threadKey: 'pr:3200',
+        recipientSessionId: 'holder-session',
+        planOnly: true,
+      });
+
+      expect(session.id).toBe('holder-session');
+      expect(overflowSpy).not.toHaveBeenCalled();
+      const lease = tables.studios[0].lease as LeaseRow;
+      expect(lease.threadKeys).toEqual(['pr:other']); // NOT appended — plan, not admission
+      overflowSpy.mockRestore();
+    });
+
+    it('handleMessage carries a routing refusal out structured — the trigger handler stamps holds from it', async () => {
+      // With provisioning deferred, spawn admission is where occupancy is
+      // first ENFORCED — so a refusal can surface inside handleMessage. A
+      // serialized message string cannot drive stampRoutingHold; the parts
+      // must survive the boundary.
+      const tables = s3Tables({ studioPolicy: 'reuse-only' });
+      const service = s3Service(makeFakeSupabase(tables));
+
+      const result = await service.handleMessage({
+        userId: 'user-456',
+        agentId: 'wren',
+        channel: 'agent',
+        conversationId: 'trigger:wren:pr:3200',
+        sender: { id: 'lumen', name: 'lumen' },
+        content: 'ping',
+        metadata: { threadKey: 'pr:3200' },
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.errorCode).toBe('ROUTING_REFUSED');
+      expect(result.refusal).toMatchObject({
+        threadKey: 'pr:3200',
+        detail: { reason: 'occupied', policy: 'reuse-only' },
+      });
+    });
+  });
 });
 
 describe('summarizeToolArgs', () => {

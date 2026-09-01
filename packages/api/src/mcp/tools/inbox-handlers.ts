@@ -836,6 +836,10 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
           ...(isAddressedRecipient && !resolvedRecipientStudioId && recipientStudioSlugOrHint
             ? { studioHint: recipientStudioSlugOrHint }
             : {}),
+          // v18 S3: strategy dispatches declare spawn admission explicitly at
+          // the boundary where their intent enters the gateway, instead of the
+          // trigger handler rediscovering it from metadata.
+          ...(rawMeta.strategyTrigger === true ? { forceSpawn: true } : {}),
           ...(Object.keys(rawMeta).length > 0 ? { metadata: rawMeta } : {}),
         };
 
@@ -1028,6 +1032,9 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
       sessionAlias,
       studioId: recipientStudioId,
       studioHint: recipientStudioSlugOrHint,
+      // v18 S3: explicit spawn admission for strategy dispatches (see the
+      // thread-message payload above).
+      ...(metadataRecord.strategyTrigger === true ? { forceSpawn: true } : {}),
       ...(Object.keys(metadataRecord).length > 0 ? { metadata: metadataRecord } : {}),
     };
 
