@@ -4,7 +4,7 @@
  * (7s), the lists amble along at 20s, and everything refetches on focus so
  * returning to the app never shows stale data for long.
  */
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query';
 import { apiFetch } from '../lib/api';
 import { getWorkspaceId, setWorkspaceId } from '../lib/storage';
 import type {
@@ -116,10 +116,14 @@ export function useWorkspaces() {
 }
 
 /**
- * Switching workspace changes the answer to every other query, so the whole
- * cache is dropped rather than invalidated: an invalidated query keeps
- * showing the OLD workspace's data until the refetch lands, which reads as
- * "the switch didn't work" for the second it takes.
+ * Switching workspace changes the answer to every other query, so everything
+ * except the workspace list is RESET — back to its initial state, with active
+ * observers refetching — rather than merely invalidated: an invalidated query
+ * keeps showing the old workspace's data until the refetch lands, which reads
+ * as "the switch didn't work". Not removed, either: evicting a query that a
+ * mounted screen still observes leaves that observer fetching forever
+ * (TanStack Query's documented caveat, and a spinner that never stopped in
+ * the simulator).
  */
 export function useSwitchWorkspace() {
   const queryClient = useQueryClient();
@@ -128,11 +132,16 @@ export function useSwitchWorkspace() {
       if (workspaceId === getWorkspaceId()) return;
       await setWorkspaceId(workspaceId);
     },
-    onSuccess: () => {
-      queryClient.removeQueries({ predicate: (q) => q.queryKey[0] !== 'workspaces' });
-      void queryClient.invalidateQueries({ queryKey: ['workspaces'] });
-    },
+    onSuccess: () => void resetQueriesForWorkspaceSwitch(queryClient),
   });
+}
+
+/** Exported for the test that mounts a real observer across a switch. */
+export async function resetQueriesForWorkspaceSwitch(queryClient: QueryClient): Promise<void> {
+  await Promise.all([
+    queryClient.resetQueries({ predicate: (q) => q.queryKey[0] !== 'workspaces' }),
+    queryClient.invalidateQueries({ queryKey: ['workspaces'] }),
+  ]);
 }
 
 /** The SBs in the selected workspace — the Chat tab's roster. */
