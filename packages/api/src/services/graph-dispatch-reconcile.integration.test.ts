@@ -65,6 +65,7 @@ d('reconcileInterruptedDispatches (real DB)', () => {
   let other: string;
   const groupIds: string[] = [];
   const sessionIds: string[] = [];
+  const createdIdentityIds: string[] = [];
 
   /** A graph-mode group on its own thread, with one unclaimed work node. */
   async function newGraphGroupWithWork(
@@ -189,10 +190,28 @@ d('reconcileInterruptedDispatches (real DB)', () => {
 
     // Two identities: the dispatch recipient, and somebody else on the same
     // thread. The second one is the whole point of recipient scoping.
-    const { data } = await client.from('agent_identities').select('id').limit(2);
-    if (!data || data.length < 2) throw new Error('fixture: need two agent identities');
-    reviewer = data[0].id;
-    other = data[1].id;
+    //
+    // Created rather than borrowed. Selecting two existing rows passed on my
+    // dev database and failed on the seeded harness, which has fewer — a
+    // fixture that depends on ambient data is a fixture that passes for the
+    // wrong reason wherever it happens to find enough of it.
+    const { data } = await client.from('agent_identities').select('id').limit(1).maybeSingle();
+    if (!data?.id) throw new Error('fixture: no agent identity');
+    reviewer = data.id;
+
+    const { data: second, error: sErr } = await client
+      .from('agent_identities')
+      .insert({
+        user_id: USER,
+        agent_id: `itest-other-${randomUUID().slice(0, 8)}`,
+        name: 'reconcile fixture: a different agent',
+        role: 'test',
+      } as never)
+      .select('id')
+      .single();
+    if (sErr) throw new Error(`fixture identity: ${sErr.message}`);
+    other = second!.id;
+    createdIdentityIds.push(other);
   });
 
   afterAll(async () => {
@@ -201,6 +220,9 @@ d('reconcileInterruptedDispatches (real DB)', () => {
       await client.from('task_groups').delete().eq('id', id);
     }
     for (const id of sessionIds) await client.from('sessions').delete().eq('id', id);
+    // After the sessions that reference them.
+    for (const id of createdIdentityIds)
+      await client.from('agent_identities').delete().eq('id', id);
   });
 
   /**
