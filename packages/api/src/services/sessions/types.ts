@@ -283,6 +283,15 @@ export interface SessionResult {
   error?: string;
   errorCode?: string;
   /**
+   * Admission evidence (v18 S3): true when routing completed — session
+   * resolved, occupancy rechecked, any provisioning/lease acquisition landed
+   * — regardless of whether the turn then succeeded. A post-admission
+   * failure is a backend outcome, not a routing one: the trigger handler
+   * clears a thread's routingHold on admitted outcomes even when processing
+   * failed, and retains it only for refusals and pre-admission failures.
+   */
+  admitted?: boolean;
+  /**
    * Present with errorCode 'ROUTING_REFUSED' (v18 S3): the structured refusal
    * from the spawn path's own resolution. Provisioning is deferred to spawn
    * admission, so an occupancy refusal can first surface inside handleMessage

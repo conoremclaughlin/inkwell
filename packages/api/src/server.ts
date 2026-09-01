@@ -27,7 +27,12 @@ import {
   RoutingRefusedError,
   type SessionServiceConfig,
 } from './services/sessions';
-import type { SessionRequest, ChannelResponse, ChannelType } from './services/sessions';
+import type {
+  SessionRequest,
+  SessionResult,
+  ChannelResponse,
+  ChannelType,
+} from './services/sessions';
 import {
   createMCPServer,
   MCPServer,
@@ -1437,7 +1442,19 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       });
     }
 
-    const result = await sessionService!.handleMessage(request);
+    let result: SessionResult;
+    try {
+      result = await sessionService!.handleMessage(request);
+    } catch (err) {
+      // The queued-message path resolves handleMessage's promise AFTER its
+      // try/catch has exited, so a requeued dispatch's admission refusal
+      // arrives here as a raw throw rather than a structured result. Same
+      // trail either way.
+      if (err instanceof RoutingRefusedError) {
+        await refuseAndHold({ threadKey: err.threadKey, detail: err.detail, message: err.message });
+      }
+      throw err;
+    }
 
     if (!result.success) {
       // v18 S3: spawn admission is where occupancy is now first ENFORCED
@@ -1452,6 +1469,16 @@ When you complete a task_request, mark it as completed using update_inbox_messag
           message: result.error || 'routing refused at spawn admission',
         });
         throw new Error(result.error || 'routing refused at spawn admission');
+      }
+
+      // Post-admission failure (Lumen, PR #565 r2): routing completed —
+      // occupancy rechecked, studio provisioned/acquired — and the RUNNER
+      // failed. Clear the hold: leaving an older occupied/no-route marker
+      // standing would misdiagnose a backend failure as a routing one. A
+      // pre-admission failure (admitted false, not a refusal) retains it —
+      // nothing recovered, nothing new to say.
+      if (result.admitted) {
+        await clearHoldAtTerminal();
       }
 
       logger.error(`[Trigger] SessionService failed for ${targetAgentId}: ${result.error}`);

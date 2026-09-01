@@ -1159,6 +1159,15 @@ export class SessionService implements ISessionService {
       });
     }
 
+    // Admission evidence (v18 S3, Lumen PR #565 r2): whether this message got
+    // PAST routing — session resolved, any required occupancy rechecked and
+    // provisioning/lease acquisition landed. Everything after that point is
+    // backend/delivery, and its failures must stay distinguishable from
+    // routing failures: the trigger handler clears a thread's routingHold on
+    // admitted outcomes even when the turn itself failed, and retains it only
+    // for refusals and truly pre-admission failures.
+    let admitted = false;
+
     try {
       // 1. Get or create session (needed to determine lock key)
       const session = await this.getOrCreateSession(userId, agentId, {
@@ -1173,6 +1182,7 @@ export class SessionService implements ISessionService {
         contactId: metadata?.contactId,
         repoRoot: metadata?.repoRoot,
       });
+      admitted = true;
 
       // Backfill mission linkage now that routing resolved: a check-in that
       // landed in a session bound to a mission thread (e.g. a Telegram reply
@@ -1242,7 +1252,9 @@ export class SessionService implements ISessionService {
         if (!result.success && result.error) {
           this.flushQueueOnNonRetryableError(lockKey, result.error);
         }
-        return result;
+        // Routing admitted this message whether or not the turn succeeded —
+        // a runner failure here is a backend outcome, not a routing one.
+        return { ...result, admitted: true };
       } finally {
         // 6. Process queued messages or release lock
         await this.processQueueOrReleaseLock(lockKey);
@@ -1277,6 +1289,9 @@ export class SessionService implements ISessionService {
           error: errorText,
           errorCode: 'ROUTING_REFUSED',
           refusal: { threadKey: error.threadKey, detail: error.detail },
+          // Refusals are pre-admission by construction — withStudioLease
+          // throws before getOrCreateSession returns.
+          admitted: false,
         };
       }
 
@@ -1290,6 +1305,10 @@ export class SessionService implements ISessionService {
         finalTextResponse: undefined,
         error: errorText,
         errorCode: 'INTERNAL_ERROR',
+        // The tracked flag, not a literal: an error thrown AFTER resolution
+        // (a processMessage throw) is a post-admission failure and must not
+        // read as a routing one.
+        admitted,
       };
     }
   }
@@ -1376,7 +1395,9 @@ export class SessionService implements ISessionService {
         );
 
         const result = await this.processMessage(pending.request, session);
-        pending.resolve(result);
+        // Same admission evidence as the direct path: resolution succeeded
+        // just above, so whatever the turn did, routing admitted it.
+        pending.resolve({ ...result, admitted: true });
         // Flush on non-retryable success:false results (e.g. InkRunner session limit)
         if (!result.success && result.error) {
           this.flushQueueOnNonRetryableError(lockKey, result.error);

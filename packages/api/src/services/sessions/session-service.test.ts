@@ -5585,6 +5585,32 @@ describe('SessionService', () => {
         threadKey: 'pr:3200',
         detail: { reason: 'occupied', policy: 'reuse-only' },
       });
+      // Refusals are pre-admission by construction.
+      expect(result.admitted).toBe(false);
+    });
+
+    it('a runner failure AFTER admission still reports admitted: true (r2 — backend ≠ routing)', async () => {
+      // Routing completed; the turn failed. The trigger handler must be able
+      // to tell this apart from a routing failure — it clears the thread's
+      // routingHold on admitted outcomes so a stale occupied/no-route marker
+      // does not misdiagnose a runner crash.
+      mockClaudeRunner.run = vi.fn().mockRejectedValue(new Error('runner crashed'));
+      const result = await sessionService.handleMessage(createMockRequest());
+
+      expect(result.success).toBe(false);
+      expect(result.admitted).toBe(true);
+    });
+
+    it('a PRE-admission failure that is not a refusal reports admitted: false — the hold stays', async () => {
+      // Session creation itself fails — resolution never completes, nothing
+      // was admitted. (getAgentBackend swallows into a fallback, so the
+      // repository is the honest pre-admission failure point.)
+      mockRepository.create = vi.fn().mockRejectedValue(new Error('db down'));
+      const result = await sessionService.handleMessage(createMockRequest());
+
+      expect(result.success).toBe(false);
+      expect(result.errorCode).toBe('INTERNAL_ERROR');
+      expect(result.admitted).toBe(false);
     });
   });
 });
