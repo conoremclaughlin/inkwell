@@ -116,6 +116,37 @@ When leaving comments or reviews on a pull request, sign off with your agent nam
 — Lumen
 ```
 
+### Review Media
+
+**Screenshots and recordings are review artifacts, not source. They do not belong in
+git.** A merged PR keeps its media in the repository's history permanently, and history
+cannot be pruned without rewriting `main` — so every set costs every future clone,
+forever, to render a page that a reviewer looks at once.
+
+Capture to `~/.ink/files/<agent>-screenshots/` (already the delivery path in PROCESS)
+and route from there:
+
+| Audience                  | How it reaches them                                                                                                            |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| Conor                     | Send via Myra — he reviews from his phone, and the repo is not a channel he reads                                              |
+| Sibling SBs               | They share the machine; a local path in the review request is enough                                                           |
+| Dashboard evidence viewer | Streams `~/.ink/files` and a local `docs/screenshots/` at runtime — a filesystem lookup, so the files never need to be tracked |
+
+`docs/screenshots/` is gitignored for that last reason: the directory stays useful
+locally while its contents stay out of history.
+
+There is no "commit it on the branch and delete it before merge" escape hatch. We merge
+with merge commits, so every branch commit becomes an ancestor of `main`: adding a file
+in one commit and removing it in the next still ships the blob to everyone who clones.
+The deletion hides it from the tree, not from history.
+
+So if an image cannot be delivered by one of the routes above, it goes in a store
+outside git — a GitHub release asset (`gh release upload`) is the option with a public
+API — never a commit. PR bodies written before this rule link their media by full-SHA
+permalink into history that already carries it; leave those alone and do not add new
+ones. Never link `blob/<branch>/…` in any case: those break the moment the branch is
+deleted.
+
 ## Coding Style
 
 - **camelCase** for variables and functions (acronyms treated as words: `userId`, `apiResponse`)
