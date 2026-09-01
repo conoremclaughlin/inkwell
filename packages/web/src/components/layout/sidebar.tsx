@@ -4,6 +4,7 @@ import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import type { LucideIcon } from 'lucide-react';
 import {
+  Smartphone,
   LogOut,
   Home,
   Bot,
@@ -80,6 +81,7 @@ const mainNav: NavGroup[] = [
       { name: 'Automations', href: '/automations', icon: Workflow },
       { name: 'Reminders', href: '/reminders', icon: Bell },
       { name: 'Connections', href: '/connected-accounts', icon: Link2 },
+      { name: 'Mobile', href: '/mobile', icon: Smartphone },
       { name: 'Routing', href: '/routing', icon: Route },
       { name: 'Sessions', href: '/sessions', icon: Activity },
       { name: 'Policy', href: '/policy', icon: Shield },
