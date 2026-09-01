@@ -135,12 +135,17 @@ and route from there:
 `docs/screenshots/` is gitignored for that last reason: the directory stays useful
 locally while its contents stay out of history.
 
-If a PR body genuinely needs an inline image for a remote reviewer, commit the file on
-the **branch only**, link it by full-SHA permalink
-(`https://github.com/<owner>/<repo>/raw/<full-sha>/<path>`), and delete it in a
-follow-up commit before merge. The permalink keeps resolving from the retained PR head
-ref, which a default clone does not fetch — so the image renders and `main` stays
-clean. Never link `blob/<branch>/…`: those break the moment the branch is deleted.
+There is no "commit it on the branch and delete it before merge" escape hatch. We merge
+with merge commits, so every branch commit becomes an ancestor of `main`: adding a file
+in one commit and removing it in the next still ships the blob to everyone who clones.
+The deletion hides it from the tree, not from history.
+
+So if an image cannot be delivered by one of the routes above, it goes in a store
+outside git — a GitHub release asset (`gh release upload`) is the option with a public
+API — never a commit. PR bodies written before this rule link their media by full-SHA
+permalink into history that already carries it; leave those alone and do not add new
+ones. Never link `blob/<branch>/…` in any case: those break the moment the branch is
+deleted.
 
 ## Coding Style
 
