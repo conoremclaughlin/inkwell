@@ -331,17 +331,20 @@ describe('StudioOverflowService.ensureOverflowStudio — durable anchoring', () 
     }
   });
 
-  // Transition hazard: legacy chained worktrees keep flat `eph/` branches
-  // checked out, so a post-fix flat mint fails `git worktree add` on
-  // `already used by worktree`. Creation failure must fall through to the
-  // hash variant (fresh slug AND fresh branch), not give up. Real repo so
-  // the primary genuinely fails on the branch and the variant genuinely
-  // succeeds.
-  it('a branch held by a legacy worktree falls through to the hash variant', async () => {
+  // Ephemeral worktrees check out DETACHED (Conor, 2026-09-01): no
+  // `<agent>/eph/*` branch is minted, so a legacy worktree still holding the
+  // old flat branch name is no obstacle at all — the primary variant
+  // succeeds where it used to fail with `already used by worktree` and force
+  // the hash fallback. Real repo so the detached add genuinely runs.
+  it('a legacy eph-branch holder no longer blocks the primary variant — detached checkout', async () => {
     const repoRoot = await makeGitRepo();
     const blocker = path.join(path.dirname(repoRoot), `${path.basename(repoRoot)}--legacy-chain`);
-    const hashSlug = `lumen-review--pr-476-h${slugHash('pr:476')}`;
-    const hashWorktree = ephemeralWorktreePath({ agentId: 'lumen', repoRoot, leaf: hashSlug });
+    const primarySlug = 'lumen-review--pr-476';
+    const primaryWorktree = ephemeralWorktreePath({
+      agentId: 'lumen',
+      repoRoot,
+      leaf: primarySlug,
+    });
     try {
       // The legacy chained studio still has the flat eph/ branch checked out.
       await execFileAsync('git', ['worktree', 'add', '-b', 'lumen/eph/pr-476', blocker, 'main'], {
@@ -353,7 +356,7 @@ describe('StudioOverflowService.ensureOverflowStudio — durable anchoring', () 
         findBySlug: vi.fn().mockResolvedValue(null),
         create: vi.fn().mockImplementation((input: Record<string, unknown>) => {
           createdInputs.push(input);
-          return Promise.resolve(makeStudio({ id: 'new-hash', ...(input as Partial<Studio>) }));
+          return Promise.resolve(makeStudio({ id: 'new-primary', ...(input as Partial<Studio>) }));
         }),
         update: vi.fn(),
       } as unknown as StudiosRepository;
@@ -367,14 +370,25 @@ describe('StudioOverflowService.ensureOverflowStudio — durable anchoring', () 
         threadKey: 'pr:476',
       });
 
-      expect(result?.id).toBe('new-hash');
+      expect(result?.id).toBe('new-primary');
       expect(createdInputs).toHaveLength(1);
-      expect(createdInputs[0].branch).toBe(`lumen/eph/pr-476-h${slugHash('pr:476')}`);
-      expect(String(createdInputs[0].worktreePath)).toContain(hashSlug);
-      // Root paths don't encode the slug, so create() must receive it.
-      expect(createdInputs[0].slug).toBe(hashSlug);
+      // The sentinel, not a branch name: the row records "no branch, cut from main".
+      expect(createdInputs[0].branch).toBe('detached:main');
+      expect(createdInputs[0].slug).toBe(primarySlug);
+      expect(String(createdInputs[0].worktreePath)).toContain(primarySlug);
+
+      // The checkout really is detached, and no new eph branch exists.
+      const { stdout: head } = await execFileAsync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], {
+        cwd: primaryWorktree,
+      });
+      expect(head.trim()).toBe('HEAD');
+      const { stdout: branches } = await execFileAsync('git', ['branch', '--list', 'lumen/eph/*'], {
+        cwd: repoRoot,
+      });
+      // Only the legacy blocker's branch — nothing newly minted.
+      expect(branches.trim().split('\n').filter(Boolean)).toHaveLength(1);
     } finally {
-      await execFileAsync('git', ['worktree', 'remove', '--force', hashWorktree], {
+      await execFileAsync('git', ['worktree', 'remove', '--force', primaryWorktree], {
         cwd: repoRoot,
       }).catch(() => undefined);
       await execFileAsync('git', ['worktree', 'remove', '--force', blocker], {

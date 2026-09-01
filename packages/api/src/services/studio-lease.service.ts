@@ -173,11 +173,19 @@ export type AcquireResult =
 type AcquireOutcome = AcquireResult | { retry: true };
 
 export interface WorktreeFinalState {
+  /** `git rev-parse --abbrev-ref HEAD` — the literal string 'HEAD' when detached. */
   branch?: string;
   commit?: string;
   dirty?: boolean;
   /** Set when a dirty tree was stashed; the stash commit SHA survives stash drops. */
   rescueStashSha?: string;
+  /**
+   * Set when a DETACHED worktree held commits reachable from no branch —
+   * ephemeral studios check out detached, so removing the worktree would have
+   * left those commits dangling for GC. The minted `ink-rescue/*` branch
+   * anchors them.
+   */
+  rescueBranch?: string;
   error?: string;
 }
 
@@ -287,6 +295,30 @@ export async function captureWorktreeState(
         label,
         stashSha: state.rescueStashSha,
       });
+    }
+
+    // Detached worktrees (ephemeral studios) mint no branch, so commits made
+    // there are reachable from nothing once the worktree is removed — GC bait.
+    // Anchor them with an `ink-rescue/*` branch before anyone deletes the
+    // checkout. Named by label + commit so re-rescuing the same HEAD converges
+    // on the same branch instead of erroring; `-f` makes it idempotent.
+    if (opts.rescue && state.branch === 'HEAD' && state.commit) {
+      const { stdout: unreachable } = await execFileAsync(
+        'git',
+        ['rev-list', '-n', '1', 'HEAD', '--not', '--branches'],
+        { cwd: worktreePath }
+      );
+      if (unreachable.trim()) {
+        const safeLabel = (opts.rescueLabel || 'unknown').replace(/[^a-zA-Z0-9_-]+/g, '-');
+        const rescueBranch = `ink-rescue/${safeLabel}-${state.commit.slice(0, 10)}`;
+        await execFileAsync('git', ['branch', '-f', rescueBranch, 'HEAD'], { cwd: worktreePath });
+        state.rescueBranch = rescueBranch;
+        logger.warn('[StudioLease] Rescue branch minted for detached commits', {
+          worktreePath,
+          rescueBranch,
+          commit: state.commit,
+        });
+      }
     }
   } catch (err) {
     state.error = err instanceof Error ? err.message : String(err);
@@ -1744,6 +1776,7 @@ export class StudioLeaseService {
               commit: finalState.commit ?? null,
               dirty: finalState.dirty ?? null,
               rescueStashSha: finalState.rescueStashSha ?? null,
+              rescueBranch: finalState.rescueBranch ?? null,
               releasedAt: new Date().toISOString(),
             },
           } as Json,

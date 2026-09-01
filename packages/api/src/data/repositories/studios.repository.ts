@@ -81,6 +81,8 @@ export interface UpdateStudioInput {
   workType?: WorkType;
   roleTemplate?: string | null;
   worktreePath?: string;
+  /** What the worktree has checked out — `detached:<base>` for ephemeral studios. */
+  branch?: string;
   slug?: string | null;
   defaultProjectId?: string | null;
   metadata?: Json;
@@ -368,6 +370,7 @@ export class StudiosRepository {
     if (input.workType !== undefined) updateData.work_type = input.workType;
     if (input.roleTemplate !== undefined) updateData.role_template = input.roleTemplate;
     if (input.worktreePath !== undefined) updateData.worktree_path = input.worktreePath;
+    if (input.branch !== undefined) updateData.branch = input.branch;
     if (input.slug !== undefined) updateData.slug = input.slug;
     if (input.defaultProjectId !== undefined)
       updateData.default_project_id = input.defaultProjectId;

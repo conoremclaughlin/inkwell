@@ -2082,6 +2082,88 @@ describe('captureWorktreeState (real git)', () => {
     expect(state.error).toBeTruthy();
     expect(rescueSucceeded(state)).toBe(false);
   });
+
+  /**
+   * Ephemeral studios check out DETACHED (no `eph/` branch litter), which
+   * makes commits made there reachable from nothing once the worktree is
+   * removed. Rescue must anchor them — and must NOT mint anything when the
+   * detached HEAD still sits on a branch-reachable commit.
+   */
+  describe('detached worktrees (ephemeral studios)', () => {
+    let worktree: string;
+
+    beforeEach(async () => {
+      worktree = path.join(path.dirname(repoDir), `${path.basename(repoDir)}--detached`);
+      await execFileAsync('git', ['worktree', 'add', '--detach', worktree, 'main'], {
+        cwd: repoDir,
+      });
+    });
+
+    afterEach(async () => {
+      await execFileAsync('git', ['worktree', 'remove', '--force', worktree], {
+        cwd: repoDir,
+      }).catch(() => undefined);
+      await rm(worktree, { recursive: true, force: true }).catch(() => undefined);
+    });
+
+    it('mints no rescue branch when HEAD is still branch-reachable', async () => {
+      const state = await captureWorktreeState(worktree, { rescue: true, rescueLabel: 'pr:2' });
+      expect(state.branch).toBe('HEAD');
+      expect(state.rescueBranch).toBeUndefined();
+      expect(rescueSucceeded(state)).toBe(true);
+    });
+
+    it('anchors detached commits with an ink-rescue branch before the worktree dies', async () => {
+      await writeFile(path.join(worktree, 'work.txt'), 'committed on detached HEAD\n');
+      await execFileAsync('git', ['add', '.'], { cwd: worktree });
+      await execFileAsync('git', ['commit', '-m', 'detached work'], { cwd: worktree });
+
+      const state = await captureWorktreeState(worktree, {
+        rescue: true,
+        rescueLabel: 'teardown:pr-2',
+      });
+
+      expect(state.rescueBranch).toMatch(/^ink-rescue\/teardown-pr-2-[0-9a-f]{10}$/);
+      // The branch anchors exactly the detached HEAD commit.
+      const { stdout: anchored } = await execFileAsync('git', ['rev-parse', state.rescueBranch!], {
+        cwd: repoDir,
+      });
+      expect(anchored.trim()).toBe(state.commit);
+      expect(rescueSucceeded(state)).toBe(true);
+    });
+
+    it('re-rescuing the same HEAD is a clean no-op — the first branch already anchors it', async () => {
+      await writeFile(path.join(worktree, 'work.txt'), 'committed on detached HEAD\n');
+      await execFileAsync('git', ['add', '.'], { cwd: worktree });
+      await execFileAsync('git', ['commit', '-m', 'detached work'], { cwd: worktree });
+
+      const first = await captureWorktreeState(worktree, { rescue: true, rescueLabel: 'x' });
+      expect(first.rescueBranch).toMatch(/^ink-rescue\//);
+
+      // HEAD is now reachable from the minted branch, so the second pass has
+      // nothing left to anchor — no duplicate branches, no error.
+      const second = await captureWorktreeState(worktree, { rescue: true, rescueLabel: 'x' });
+      expect(second.rescueBranch).toBeUndefined();
+      expect(rescueSucceeded(second)).toBe(true);
+      const { stdout: rescues } = await execFileAsync('git', ['branch', '--list', 'ink-rescue/*'], {
+        cwd: repoDir,
+      });
+      expect(rescues.trim().split('\n').filter(Boolean)).toHaveLength(1);
+    });
+
+    it('stash-rescues a dirty detached tree and anchors its commits in one pass', async () => {
+      await writeFile(path.join(worktree, 'work.txt'), 'committed\n');
+      await execFileAsync('git', ['add', '.'], { cwd: worktree });
+      await execFileAsync('git', ['commit', '-m', 'detached work'], { cwd: worktree });
+      await writeFile(path.join(worktree, 'work.txt'), 'and then uncommitted\n');
+
+      const state = await captureWorktreeState(worktree, { rescue: true, rescueLabel: 'pr:3' });
+      expect(state.dirty).toBe(true);
+      expect(state.rescueStashSha).toMatch(/^[0-9a-f]{40}$/);
+      expect(state.rescueBranch).toMatch(/^ink-rescue\//);
+      expect(rescueSucceeded(state)).toBe(true);
+    });
+  });
 });
 
 // ── S1 mortality: expired ephemerals held from elsewhere (spec v18) ──
