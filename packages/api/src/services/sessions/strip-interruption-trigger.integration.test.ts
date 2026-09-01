@@ -36,6 +36,17 @@ const SUPABASE_KEY = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SER
 const d = SUPABASE_URL && SUPABASE_KEY ? describe : describe.skip;
 const USER = INTEGRATION_TEST_USER_ID;
 
+/**
+ * Direct Postgres, for the one test that needs a second connection holding a
+ * row lock — PostgREST gives one transaction per request and cannot express
+ * an in-flight write blocked on ownership changing underneath it.
+ */
+const DB_URL =
+  process.env.INTEGRATION_DB_URL ||
+  (SUPABASE_URL?.includes('127.0.0.1') || SUPABASE_URL?.includes('localhost')
+    ? 'postgresql://postgres:postgres@127.0.0.1:54322/postgres'
+    : undefined);
+
 d('strip_interruption_on_running trigger', () => {
   const client: SupabaseClient<Database> = createClient(SUPABASE_URL || '', SUPABASE_KEY || '', {
     auth: { autoRefreshToken: false, persistSession: false },
@@ -228,5 +239,49 @@ d('strip_interruption_on_running trigger', () => {
       expect(applied?.lifecycle).toBe('idle');
       expect((await readSession(id)).lifecycle).toBe('idle');
     });
+
+    /**
+     * The reason the fence is a CAS and not just the pre-read check: a write
+     * ALREADY IN FLIGHT when ownership changes. The pre-read passes (MVCC
+     * shows the old committed row), the UPDATE blocks on the new owner's row
+     * lock, and when the lock releases Postgres re-evaluates the predicate on
+     * the committed row — epoch rotated, zero rows. Removing the `.eq` on the
+     * epoch leaves this test red and only this test: sequential cases are
+     * masked by the pre-read (found by mutation, round 3).
+     */
+    it.skipIf(!DB_URL)(
+      'holds against a write already in flight when ownership changes',
+      async () => {
+        const { SessionRepository } = await import('./session-repository');
+        const repository = new SessionRepository(client);
+
+        const id = await insertSession({ lifecycle: 'running', metadata: {} });
+        const epoch = (await readSession(id)).metadata.turnEpoch as string;
+
+        const { Client } = await import('pg');
+        const holder = new Client({ connectionString: DB_URL });
+        await holder.connect();
+        try {
+          await holder.query('BEGIN');
+          // The new owner takes over inside the lock-holding transaction:
+          // leaving and re-entering running rotates the epoch via the trigger.
+          await holder.query("UPDATE sessions SET lifecycle = 'idle' WHERE id = $1", [id]);
+          await holder.query("UPDATE sessions SET lifecycle = 'running' WHERE id = $1", [id]);
+
+          // The old owner's finalize starts NOW: its pre-read sees the old
+          // committed row (epoch still its own), then its UPDATE blocks.
+          const inFlight = repository.updateIfTurnEpoch(id, epoch, { lifecycle: 'idle' });
+          await new Promise((r) => setTimeout(r, 500));
+          await holder.query('COMMIT');
+
+          expect(await inFlight).toBeNull();
+        } finally {
+          await holder.end();
+        }
+
+        // The new owner's running state survived the in-flight write.
+        expect((await readSession(id)).lifecycle).toBe('running');
+      }
+    );
   });
 });
