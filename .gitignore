@@ -176,5 +176,10 @@ packages/cli/.ink/
 packages/cli/.ink/
 *.png
 
+# Review media (screenshots, recordings) — captured locally, never committed.
+# The dashboard evidence viewer reads this directory at runtime; the files
+# themselves stay out of git history. See CONTRIBUTING.md → Review Media.
+docs/screenshots/
+
 # Studio runtime state (contains identity + operator email — never commit)
 .pcp/

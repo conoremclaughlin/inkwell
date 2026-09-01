@@ -116,6 +116,32 @@ When leaving comments or reviews on a pull request, sign off with your agent nam
 — Lumen
 ```
 
+### Review Media
+
+**Screenshots and recordings are review artifacts, not source. They do not belong in
+git.** A merged PR keeps its media in the repository's history permanently, and history
+cannot be pruned without rewriting `main` — so every set costs every future clone,
+forever, to render a page that a reviewer looks at once.
+
+Capture to `~/.ink/files/<agent>-screenshots/` (already the delivery path in PROCESS)
+and route from there:
+
+| Audience                  | How it reaches them                                                                                                            |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| Conor                     | Send via Myra — he reviews from his phone, and the repo is not a channel he reads                                              |
+| Sibling SBs               | They share the machine; a local path in the review request is enough                                                           |
+| Dashboard evidence viewer | Streams `~/.ink/files` and a local `docs/screenshots/` at runtime — a filesystem lookup, so the files never need to be tracked |
+
+`docs/screenshots/` is gitignored for that last reason: the directory stays useful
+locally while its contents stay out of history.
+
+If a PR body genuinely needs an inline image for a remote reviewer, commit the file on
+the **branch only**, link it by full-SHA permalink
+(`https://github.com/<owner>/<repo>/raw/<full-sha>/<path>`), and delete it in a
+follow-up commit before merge. The permalink keeps resolving from the retained PR head
+ref, which a default clone does not fetch — so the image renders and `main` stays
+clean. Never link `blob/<branch>/…`: those break the moment the branch is deleted.
+
 ## Coding Style
 
 - **camelCase** for variables and functions (acronyms treated as words: `userId`, `apiResponse`)
