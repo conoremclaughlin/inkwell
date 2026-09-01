@@ -6,8 +6,9 @@ interface IconProps {
 }
 
 /**
- * Hand-drawn tab icons rather than an icon package — three icons don't
- * justify a dependency, and drawing them keeps the stroke weight consistent.
+ * Hand-drawn tab icons rather than an icon package — a handful of icons
+ * don't justify a dependency, and drawing them keeps the stroke weight
+ * consistent.
  */
 
 export function ThreadsIcon({ color, size = 24 }: IconProps) {
@@ -51,6 +52,36 @@ export function SettingsIcon({ color, size = 22 }: IconProps) {
         strokeWidth={1.8}
         strokeLinecap="round"
       />
+    </Svg>
+  );
+}
+
+/** Two overlapping speech bubbles — a conversation with someone. */
+export function ChatIcon({ color, size = 24 }: IconProps) {
+  return (
+    <Svg width={size} height={size} viewBox="0 0 24 24" fill="none">
+      <Path
+        d="M3.5 5.5h11v8H8l-4.5 3.5v-11.5z"
+        stroke={color}
+        strokeWidth={1.8}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <Path
+        d="M17 9.5h3.5v8L17 15h-6.5v-1.5"
+        stroke={color}
+        strokeWidth={1.8}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </Svg>
+  );
+}
+
+export function PlusIcon({ color, size = 22 }: IconProps) {
+  return (
+    <Svg width={size} height={size} viewBox="0 0 24 24" fill="none">
+      <Path d="M12 5v14M5 12h14" stroke={color} strokeWidth={2} strokeLinecap="round" />
     </Svg>
   );
 }

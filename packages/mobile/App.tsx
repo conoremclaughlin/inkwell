@@ -14,12 +14,20 @@ import type { AuthStackParamList, RootStackParamList, TabParamList } from './src
 import { ThreadsScreen } from './src/screens/ThreadsScreen';
 import { ThreadScreen } from './src/screens/ThreadScreen';
 import { FleetScreen } from './src/screens/FleetScreen';
+import { ChatScreen } from './src/screens/ChatScreen';
+import { NewThreadScreen } from './src/screens/NewThreadScreen';
 import { SessionScreen } from './src/screens/SessionScreen';
 import { SettingsScreen } from './src/screens/SettingsScreen';
 import { LoginScreen } from './src/screens/LoginScreen';
 import { SignUpScreen } from './src/screens/SignUpScreen';
 import { ConnectScreen } from './src/screens/ConnectScreen';
-import { FleetIcon, SettingsIcon, ThreadsIcon } from './src/components/TabIcons';
+import {
+  ChatIcon,
+  FleetIcon,
+  PlusIcon,
+  SettingsIcon,
+  ThreadsIcon,
+} from './src/components/TabIcons';
 import { getAuthState, loadAuth, subscribeAuth, type AuthState } from './src/lib/auth';
 import { loadPreferences } from './src/lib/storage';
 import { colors } from './src/ui/theme';
@@ -101,7 +109,36 @@ function Tabs() {
       <Tab.Screen
         name="Threads"
         component={ThreadsScreen}
-        options={{ tabBarIcon: ({ color, size }) => <ThreadsIcon color={color} size={size} /> }}
+        options={{
+          tabBarIcon: ({ color, size }) => <ThreadsIcon color={color} size={size} />,
+          headerRight: () => (
+            <>
+              <Pressable
+                onPress={() => navigation.navigate('NewThread')}
+                hitSlop={12}
+                style={{ paddingHorizontal: 8 }}
+                accessibilityLabel="New thread"
+                accessibilityRole="button"
+              >
+                <PlusIcon color={colors.textSecondary} />
+              </Pressable>
+              <Pressable
+                onPress={() => navigation.navigate('Settings')}
+                hitSlop={12}
+                style={{ paddingHorizontal: 4 }}
+                accessibilityLabel="Settings"
+                accessibilityRole="button"
+              >
+                <SettingsIcon color={colors.textSecondary} />
+              </Pressable>
+            </>
+          ),
+        }}
+      />
+      <Tab.Screen
+        name="Chat"
+        component={ChatScreen}
+        options={{ tabBarIcon: ({ color, size }) => <ChatIcon color={color} size={size} /> }}
       />
       <Tab.Screen
         name="Fleet"
@@ -142,7 +179,12 @@ export default function App() {
               <Stack.Screen
                 name="Thread"
                 component={ThreadScreen}
-                options={({ route }) => ({ title: route.params.threadKey })}
+                options={({ route }) => ({ title: route.params.title ?? route.params.threadKey })}
+              />
+              <Stack.Screen
+                name="NewThread"
+                component={NewThreadScreen}
+                options={{ title: 'New thread' }}
               />
               <Stack.Screen
                 name="Session"

@@ -9,6 +9,7 @@ export type AuthStackParamList = {
 
 export type TabParamList = {
   Threads: undefined;
+  Chat: undefined;
   Fleet: undefined;
 };
 
@@ -20,8 +21,14 @@ export type TabParamList = {
  */
 export type RootStackParamList = {
   Tabs: NavigatorScreenParams<TabParamList>;
-  Thread: { threadKey: string; title?: string };
+  /**
+   * `recipients` makes the screen able to START the thread if the key does
+   * not exist yet (a DM's first message); without it, an unknown key is
+   * read-only — replying into nowhere is how typos become threads.
+   */
+  Thread: { threadKey: string; title?: string; recipients?: string[] };
   Session: { sessionId: string; title?: string };
+  NewThread: undefined;
   Settings: undefined;
 };
 

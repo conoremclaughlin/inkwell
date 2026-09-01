@@ -217,3 +217,37 @@ export interface SessionLogsResponse {
   pagination: { total: number; limit: number; offset: number; hasMore: boolean };
   sources: { cloud: number; synced: number; local: number };
 }
+
+// ─── GET /api/admin/individuals ───
+
+export interface Individual {
+  id: string;
+  agentId: string;
+  name: string;
+  role: string | null;
+  backend: string | null;
+  description: string | null;
+}
+
+export interface IndividualsResponse {
+  individuals: Individual[];
+}
+
+// ─── POST /api/admin/threads ───
+
+export interface StartThreadInput {
+  key: string;
+  recipients: string[];
+  content: string;
+  title?: string;
+  priority?: 'low' | 'normal' | 'high' | 'urgent';
+}
+
+export interface StartThreadResponse {
+  success: boolean;
+  created: boolean;
+  messageId: string | null;
+  threadId: string | null;
+  threadKey: string;
+  warning?: string | null;
+}

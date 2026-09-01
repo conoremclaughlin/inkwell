@@ -12,7 +12,7 @@ import {
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { useHeaderHeight } from '@react-navigation/elements';
 import { MessageBubble } from '../components/MessageBubble';
-import { useSendReply, useThreadMessages } from '../hooks/useInkwell';
+import { useSendReply, useStartThread, useThreadMessages } from '../hooks/useInkwell';
 import type { RootStackParamList } from '../navigation';
 import { colors, spacing, type } from '../ui/theme';
 
@@ -25,9 +25,10 @@ type Props = NativeStackScreenProps<RootStackParamList, 'Thread'>;
  * polls without any scroll bookkeeping.
  */
 export function ThreadScreen({ route }: Props) {
-  const { threadKey } = route.params;
+  const { threadKey, title, recipients } = route.params;
   const { data, isLoading, error } = useThreadMessages(threadKey);
   const sendReply = useSendReply(threadKey);
+  const startThread = useStartThread();
   const [draft, setDraft] = useState('');
   const headerHeight = useHeaderHeight();
 
@@ -35,9 +36,34 @@ export function ThreadScreen({ route }: Props) {
   const inverted = [...messages].reverse();
   const closed = data?.thread?.status === 'closed' || !!data?.thread?.closedAt;
 
+  // The server answers an unknown key with thread: null rather than 404.
+  // With recipients in hand the composer can START it; without, it can't
+  // reply into nowhere.
+  const missing = !isLoading && !error && data != null && data.thread == null;
+  const canStart = missing && !!recipients && recipients.length > 0;
+  const composerDisabled = missing && !canStart;
+  const pending = sendReply.isPending || startThread.isPending;
+  const sendError = sendReply.isError
+    ? (sendReply.error as Error).message
+    : startThread.isError
+      ? (startThread.error as Error).message
+      : null;
+
   const send = () => {
     const content = draft.trim();
-    if (!content || sendReply.isPending) return;
+    if (!content || pending || composerDisabled) return;
+    if (canStart) {
+      startThread.mutate(
+        {
+          key: threadKey,
+          recipients: recipients as string[],
+          content,
+          ...(title ? { title } : {}),
+        },
+        { onSuccess: () => setDraft('') }
+      );
+      return;
+    }
     sendReply.mutate(content, { onSuccess: () => setDraft('') });
   };
 
@@ -56,7 +82,13 @@ export function ThreadScreen({ route }: Props) {
         ListEmptyComponent={
           isLoading ? null : (
             <Text style={styles.empty}>
-              {error ? (error as Error).message : 'No messages in this thread yet.'}
+              {error
+                ? (error as Error).message
+                : canStart
+                  ? `No thread yet. Your first message starts ${threadKey} with ${(recipients as string[]).join(', ')}.`
+                  : missing
+                    ? `There is no thread ${threadKey}.`
+                    : 'No messages in this thread yet.'}
             </Text>
           )
         }
@@ -77,34 +109,40 @@ export function ThreadScreen({ route }: Props) {
         </View>
       ) : null}
 
-      {sendReply.isError ? (
+      {sendError ? (
         <View style={styles.errorBar}>
-          <Text style={styles.errorText}>{(sendReply.error as Error).message}</Text>
+          <Text style={styles.errorText}>{sendError}</Text>
         </View>
       ) : null}
 
       <View style={styles.composer}>
         <TextInput
           style={styles.input}
-          placeholder={`Reply to ${threadKey}…`}
+          placeholder={
+            canStart
+              ? `Message ${title ?? recipients?.join(', ')}…`
+              : composerDisabled
+                ? 'This thread does not exist'
+                : `Reply to ${threadKey}…`
+          }
           placeholderTextColor={colors.textMuted}
           value={draft}
           onChangeText={setDraft}
           multiline
-          editable={!sendReply.isPending}
+          editable={!pending && !composerDisabled}
         />
         <Pressable
           onPress={send}
-          disabled={!draft.trim() || sendReply.isPending}
+          disabled={!draft.trim() || pending || composerDisabled}
           style={({ pressed }) => [
             styles.sendButton,
-            (!draft.trim() || sendReply.isPending) && styles.sendDisabled,
+            (!draft.trim() || pending || composerDisabled) && styles.sendDisabled,
             pressed && { opacity: 0.7 },
           ]}
           accessibilityRole="button"
-          accessibilityLabel="Send reply"
+          accessibilityLabel={canStart ? 'Start thread' : 'Send reply'}
         >
-          <Text style={styles.sendText}>{sendReply.isPending ? '…' : 'Send'}</Text>
+          <Text style={styles.sendText}>{pending ? '…' : canStart ? 'Start' : 'Send'}</Text>
         </Pressable>
       </View>
     </KeyboardAvoidingView>

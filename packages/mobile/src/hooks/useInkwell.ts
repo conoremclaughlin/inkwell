@@ -8,7 +8,10 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { apiFetch } from '../lib/api';
 import { getWorkspaceId, setWorkspaceId } from '../lib/storage';
 import type {
+  IndividualsResponse,
   ReplyResponse,
+  StartThreadInput,
+  StartThreadResponse,
   SessionConversationResponse,
   SessionLogsResponse,
   SessionsResponse,
@@ -128,6 +131,34 @@ export function useSwitchWorkspace() {
     onSuccess: () => {
       queryClient.removeQueries({ predicate: (q) => q.queryKey[0] !== 'workspaces' });
       void queryClient.invalidateQueries({ queryKey: ['workspaces'] });
+    },
+  });
+}
+
+/** The SBs in the selected workspace — the Chat tab's roster. */
+export function useIndividuals() {
+  return useQuery({
+    queryKey: ['individuals'],
+    queryFn: () => apiFetch<IndividualsResponse>('/api/admin/individuals'),
+    staleTime: 60_000,
+  });
+}
+
+/**
+ * Start a thread (or continue one that exists under the key) with explicit
+ * participants. Used for the first message of a DM and for New thread.
+ */
+export function useStartThread() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (input: StartThreadInput) =>
+      apiFetch<StartThreadResponse>('/api/admin/threads', {
+        method: 'POST',
+        body: JSON.stringify(input),
+      }),
+    onSuccess: (result) => {
+      void queryClient.invalidateQueries({ queryKey: ['thread', result.threadKey] });
+      void queryClient.invalidateQueries({ queryKey: ['threads'] });
     },
   });
 }
