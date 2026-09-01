@@ -38,7 +38,7 @@ interface Seen<T> {
 }
 
 /** Subscribe once; record every result; wait for predicates over the log. */
-function record<T>(observer: QueryObserver<T>) {
+function record<T, K extends readonly unknown[]>(observer: QueryObserver<T, Error, T, T, K>) {
   const seen: Seen<T>[] = [];
   const waiters: Array<{ pred: (s: Seen<T>) => boolean; resolve: () => void }> = [];
   const unsubscribe = observer.subscribe((r) => {

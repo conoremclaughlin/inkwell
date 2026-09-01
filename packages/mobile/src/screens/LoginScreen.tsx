@@ -12,7 +12,7 @@ import {
 import { useNavigation } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { API_URL_HINT, apiBaseUrl, login } from '../lib/api';
-import { setServerUrlOverride } from '../lib/storage';
+import { getServerUrlOverride, setServerUrlOverride } from '../lib/storage';
 import type { AuthStackParamList } from '../navigation';
 import { colors, spacing, type } from '../ui/theme';
 
@@ -27,7 +27,9 @@ export function LoginScreen() {
   const navigation = useNavigation<NativeStackNavigationProp<AuthStackParamList>>();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [serverUrl, setServerUrl] = useState('');
+  // Seeded from the saved override: this state is persisted before Sign up
+  // and Connect, and an empty seed would silently clear a URL the user set.
+  const [serverUrl, setServerUrl] = useState(getServerUrlOverride() ?? '');
   const [showServer, setShowServer] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
