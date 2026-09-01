@@ -8,7 +8,13 @@
     "backgroundColor": "#0b0e14",
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.inkwell.mobile"
+      "bundleIdentifier": "com.inkwell.mobile",
+      "infoPlist": {
+        "NSAppTransportSecurity": {
+          "NSAllowsArbitraryLoads": false,
+          "NSAllowsLocalNetworking": true
+        }
+      }
     },
     "android": {
       "package": "com.inkwell.mobile",

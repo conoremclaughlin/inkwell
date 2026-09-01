@@ -26,6 +26,20 @@ describe('parsePairingInput', () => {
     });
   });
 
+  it('puts https candidates before http ones, keeping order within each group', () => {
+    const payload = JSON.stringify({
+      ink: 1,
+      c: 'ABCDEFGHJKLM',
+      u: ['http://10.0.0.2:3001', 'https://a.example', 'http://10.0.0.3:3001', 'https://b.example'],
+    });
+    expect(parsePairingInput(payload)?.urls).toEqual([
+      'https://a.example',
+      'https://b.example',
+      'http://10.0.0.2:3001',
+      'http://10.0.0.3:3001',
+    ]);
+  });
+
   it('accepts a hand-typed code in any casing or grouping, with no URLs', () => {
     expect(parsePairingInput(' abcd-efgh jklm ')).toEqual({ code: 'ABCDEFGHJKLM', urls: [] });
   });

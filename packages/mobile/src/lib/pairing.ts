@@ -26,6 +26,8 @@ export function formatPairingCode(code: string): string {
   return code.match(/.{1,4}/g)?.join('-') ?? code;
 }
 
+const isHttps = (url: string) => /^https:\/\//i.test(url);
+
 function cleanUrls(candidates: unknown): string[] {
   if (!Array.isArray(candidates)) return [];
   const urls: string[] = [];
@@ -34,7 +36,11 @@ function cleanUrls(candidates: unknown): string[] {
     const normalized = candidate.replace(/\/+$/, '');
     if (!urls.includes(normalized)) urls.push(normalized);
   }
-  return urls;
+  // TLS first, whatever order arrived: the claim response is a long-lived
+  // credential, and a reachable https address must never lose to a cleartext
+  // one just because it was listed later. Stable sort keeps the server's
+  // order within each group.
+  return urls.sort((a, b) => Number(isHttps(b)) - Number(isHttps(a)));
 }
 
 /**
