@@ -4,8 +4,10 @@
  *
  * Base URL precedence: a server URL saved in Settings always wins, then the
  * build-time EXPO_PUBLIC_API_URL, then the Metro host (dev builds follow the
- * machine serving the bundle — the PCP server is on that same machine at
- * :3001), then app.json's productionApiUrl, then loopback.
+ * machine serving the bundle — the Inkwell server is on that same machine),
+ * then the LAN address baked in by app.config.js, then productionApiUrl, then
+ * loopback. The port comes from app.config.js in every case, so host and port
+ * are both discovered rather than assumed.
  */
 import Constants from 'expo-constants';
 import { describeApiUrlProblem, resolveApiUrl, type ResolvedApiUrl } from './resolveApiUrl';
@@ -19,8 +21,15 @@ import {
 } from './storage';
 import type { LoginResponse, RefreshResponse, SignupResponse } from './types';
 
-/** Port the PCP API server listens on (PCP_PORT_BASE default). */
-const PCP_API_PORT = 3001;
+/**
+ * Port the Inkwell API listens on.
+ *
+ * app.config.js reads PCP_PORT_BASE on the machine that started Metro and
+ * publishes it here, so an isolated server (4001, 4801, …) is reached without
+ * anyone editing a constant or typing a URL on a phone keyboard. The literal
+ * is only the floor for a config that predates the field.
+ */
+const PCP_API_PORT = Number(Constants.expoConfig?.extra?.apiPort) || 3001;
 
 // Which of these Expo populates depends on the runtime, so try them all rather
 // than trusting one and silently landing on loopback.
@@ -36,6 +45,7 @@ const resolved: ResolvedApiUrl = resolveApiUrl({
     constantsAny.manifest2?.extra?.expoGo?.debuggerHost,
     Constants.linkingUri,
   ],
+  lanHost: Constants.expoConfig?.extra?.lanHost as string | null | undefined,
   productionApiUrl: Constants.expoConfig?.extra?.productionApiUrl as string | undefined,
   isDev: __DEV__,
   port: PCP_API_PORT,

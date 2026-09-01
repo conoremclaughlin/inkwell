@@ -8,6 +8,8 @@ export type ApiUrlSource =
   | 'env'
   /** Derived from the Metro host serving the bundle. */
   | 'metro'
+  /** The dev machine's LAN address, recorded in app config at bundle time. */
+  | 'lan'
   /** Production URL configured in app.json under extra.productionApiUrl. */
   | 'config'
   /** Nothing else applied — loopback, which only works in a simulator. */
@@ -15,7 +17,7 @@ export type ApiUrlSource =
 
 export interface ResolveApiUrlInput {
   /** Raw EXPO_PUBLIC_API_URL, inlined at build time. */
-  explicit?: string;
+  explicit?: unknown;
   /**
    * Candidate strings that might carry the Metro host, tried in order.
    *
@@ -25,11 +27,27 @@ export interface ResolveApiUrlInput {
    * silently falls through to loopback, which is fatal on a physical device.
    */
   metroHostCandidates?: (string | undefined | null)[];
-  /** Production API URL from app config, used only when nothing else applies. */
-  productionApiUrl?: string;
+  /**
+   * The dev machine's LAN IPv4, captured by app.config.js at bundle time.
+   *
+   * Only reachable when the phone is on the same network, so it sits below the
+   * live Metro host — but it is the difference between a working release build
+   * on a device and a loopback URL that can never resolve.
+   */
+  lanHost?: unknown;
+  /**
+   * Production API URL from app config. Typed `unknown` on purpose: app config
+   * is JSON that Expo rewrites on the way through, so this is not guaranteed
+   * to be a string even when app.json says it is.
+   */
+  productionApiUrl?: unknown;
   /** React Native's __DEV__ — false in release builds. */
   isDev: boolean;
-  /** Port the Inkwell API server listens on. */
+  /**
+   * Port the Inkwell API server listens on — from app.config.js, which reads
+   * PCP_PORT_BASE on the machine that started Metro. Not guessable on-device,
+   * which is why it is passed in rather than assumed.
+   */
   port: number;
 }
 
@@ -70,16 +88,21 @@ export function hostnameFrom(raw: string | undefined | null): string | undefined
  *   2. Metro's host — in a dev build the phone is already talking to the dev
  *      machine, and the API is on that same machine at `port`. This makes the
  *      app follow a changing LAN IP with no rebuild and no .env edit.
- *   3. extra.productionApiUrl — release builds have no Metro host, so this is
- *      the sensible default once dev autodiscovery is out of the picture.
- *   4. Loopback — last resort. Correct for the iOS simulator, useless on a
+ *   3. extra.lanHost — the dev machine's address, recorded at bundle time. This
+ *      is what saves an on-device build that has no Metro to ask: without it
+ *      the only remaining answer is loopback, which on a phone is the phone.
+ *   4. extra.productionApiUrl — a real deployment, once dev autodiscovery is
+ *      out of the picture.
+ *   5. Loopback — last resort. Correct for the iOS simulator, useless on a
  *      physical device, which is why callers surface `source` in errors.
  *
- * Metro is checked before the production URL rather than after, so a dev build
- * keeps autodiscovering even when a production URL is configured.
+ * Metro is checked before the baked LAN address rather than after, so a dev
+ * build follows a changing DHCP lease instead of a stale build-time snapshot;
+ * and both are checked before the production URL, so a dev build keeps
+ * autodiscovering even once a production URL is configured.
  */
 export function resolveApiUrl(input: ResolveApiUrlInput): ResolvedApiUrl {
-  const explicit = input.explicit?.trim();
+  const explicit = asTrimmedString(input.explicit);
   if (explicit) return { url: stripTrailingSlash(explicit), source: 'env' };
 
   for (const candidate of input.metroHostCandidates ?? []) {
@@ -87,10 +110,26 @@ export function resolveApiUrl(input: ResolveApiUrlInput): ResolvedApiUrl {
     if (host) return { url: `http://${host}:${input.port}`, source: 'metro' };
   }
 
-  const production = input.productionApiUrl?.trim();
+  const lan = asTrimmedString(input.lanHost);
+  if (lan) return { url: `http://${lan}:${input.port}`, source: 'lan' };
+
+  const production = asTrimmedString(input.productionApiUrl);
   if (production) return { url: stripTrailingSlash(production), source: 'config' };
 
   return { url: `http://127.0.0.1:${input.port}`, source: 'fallback' };
+}
+
+/**
+ * Values reaching here come from app config, which is not type-checked at the
+ * boundary: Expo resolves a JSON `null` in `extra` to `{}`, and `{}?.trim()`
+ * does not short-circuit — it throws. That crashed at module import, which in
+ * a release build means the app dies on launch with no useful message. Anything
+ * that is not a non-empty string is treated as absent.
+ */
+function asTrimmedString(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return trimmed || undefined;
 }
 
 function stripTrailingSlash(url: string): string {
@@ -119,6 +158,9 @@ export function describeApiUrlProblem(
   }
   if (resolved.source === 'metro') {
     return 'Auto-detected from the Metro host. Check the web dev server is running and on the same network.';
+  }
+  if (resolved.source === 'lan') {
+    return "Using the build machine's LAN address, recorded when this build was made. If that machine moved network or changed IP, rebuild or set the server URL in Settings.";
   }
   return undefined;
 }

@@ -119,3 +119,87 @@ describe('describeApiUrlProblem', () => {
     ).toBeUndefined();
   });
 });
+
+describe('the baked LAN address', () => {
+  const base = { isDev: true, port: 3001 };
+
+  it('is used when there is no Metro host — the on-device release case', () => {
+    expect(resolveApiUrl({ ...base, lanHost: '192.168.86.60' })).toEqual({
+      url: 'http://192.168.86.60:3001',
+      source: 'lan',
+    });
+  });
+
+  it('loses to a live Metro host, so a dev build follows a changing DHCP lease', () => {
+    const resolved = resolveApiUrl({
+      ...base,
+      metroHostCandidates: ['192.168.86.99:8081'],
+      lanHost: '192.168.86.60',
+    });
+    expect(resolved).toEqual({ url: 'http://192.168.86.99:3001', source: 'metro' });
+  });
+
+  it('beats productionApiUrl in a dev build, so dev keeps autodiscovering', () => {
+    const resolved = resolveApiUrl({
+      ...base,
+      lanHost: '192.168.86.60',
+      productionApiUrl: 'https://api.example.com',
+    });
+    expect(resolved.source).toBe('lan');
+  });
+
+  it('is skipped when app.config found no address, rather than building a broken URL', () => {
+    expect(resolveApiUrl({ ...base, lanHost: null }).source).toBe('fallback');
+    expect(resolveApiUrl({ ...base, lanHost: '   ' }).source).toBe('fallback');
+  });
+
+  it('carries the discovered port, not a hardcoded one', () => {
+    const resolved = resolveApiUrl({ ...base, port: 4801, lanHost: '192.168.86.60' });
+    expect(resolved.url).toBe('http://192.168.86.60:4801');
+  });
+
+  it('explains itself when the build machine may have moved', () => {
+    const resolved = resolveApiUrl({ ...base, lanHost: '192.168.86.60' });
+    expect(describeApiUrlProblem(resolved, true)).toMatch(/rebuild or set the server URL/i);
+  });
+});
+
+describe('the discovered port reaches every tier', () => {
+  it('applies to the Metro host too', () => {
+    const resolved = resolveApiUrl({
+      isDev: true,
+      port: 4001,
+      metroHostCandidates: ['192.168.86.99:8081'],
+    });
+    expect(resolved.url).toBe('http://192.168.86.99:4001');
+  });
+
+  it('applies to the loopback fallback', () => {
+    expect(resolveApiUrl({ isDev: true, port: 4001 }).url).toBe('http://127.0.0.1:4001');
+  });
+});
+
+describe('config values that are not strings', () => {
+  // Expo resolves `"productionApiUrl": null` in app.json to `{}`. Optional
+  // chaining does not save us there — `{}?.trim()` throws — and the throw
+  // happens at module import, killing the app on launch.
+  it('treats Expo’s {} for a null config value as absent instead of throwing', () => {
+    expect(() =>
+      resolveApiUrl({ isDev: false, port: 3001, productionApiUrl: {} as unknown as string })
+    ).not.toThrow();
+    expect(
+      resolveApiUrl({ isDev: false, port: 3001, productionApiUrl: {} as unknown as string }).source
+    ).toBe('fallback');
+  });
+
+  it.each([{}, [], 42, true, null])('ignores %o in any slot', (value) => {
+    const resolved = resolveApiUrl({
+      isDev: false,
+      port: 3001,
+      explicit: value as unknown as string,
+      lanHost: value as unknown as string,
+      productionApiUrl: value as unknown as string,
+    });
+    expect(resolved).toEqual({ url: 'http://127.0.0.1:3001', source: 'fallback' });
+  });
+});
