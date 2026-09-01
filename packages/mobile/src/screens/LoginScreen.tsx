@@ -113,6 +113,7 @@ export function LoginScreen() {
             autoCapitalize="none"
             autoCorrect={false}
             keyboardType="url"
+            clearButtonMode="while-editing"
           />
         ) : (
           <Pressable onPress={() => setShowServer(true)} hitSlop={8}>

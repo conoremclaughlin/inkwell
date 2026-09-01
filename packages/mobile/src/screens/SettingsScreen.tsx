@@ -99,6 +99,7 @@ export function SettingsScreen() {
           autoCapitalize="none"
           autoCorrect={false}
           keyboardType="url"
+          clearButtonMode="while-editing"
         />
         <Pressable onPress={saveServer} style={styles.saveButton} accessibilityRole="button">
           <Text style={styles.saveText}>{saved ? 'Saved' : 'Save'}</Text>
