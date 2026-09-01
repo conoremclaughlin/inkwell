@@ -352,9 +352,12 @@ export class GraphExecutorService {
    * interchangeable:
    *   - ORDERING: called before dispatch intake opens, so in the normal case
    *     nothing is stamping while it runs.
-   *   - CUTOFF (`staleBefore`): a stamp at or after that instant is the
-   *     caller's own and is not selected. Covers dispatches already committed
-   *     when the statement takes its snapshot.
+   *   - CUTOFF (`staleBefore`): a stamp at or after that instant is too new to
+   *     regard as stale and is not selected, whoever wrote it. It proves
+   *     recency, not provenance — this runs before we open our own intake, so
+   *     such a stamp came from elsewhere, most likely another API process on
+   *     the same database. Covers dispatches already committed when the
+   *     statement takes its snapshot.
    *   - CAS: the UPDATE re-checks the stamp and recipient against the row as
    *     it exists when the write lands. Covers the one the cutoff cannot see —
    *     a dispatch still uncommitted at snapshot time, which commits while the

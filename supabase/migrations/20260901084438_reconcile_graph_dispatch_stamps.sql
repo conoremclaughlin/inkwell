@@ -122,11 +122,17 @@ BEGIN
       AND t.status <> 'completed'
       AND t.metadata ? 'graphDispatchedAt'
       AND st.stamp_at IS NOT NULL
-      -- A stamp at or after p_stale_before belongs to the caller's own run and
-      -- is never stale. This excludes any dispatch already COMMITTED and
-      -- visible when this statement took its snapshot. It is not sufficient on
-      -- its own: a dispatch still uncommitted at snapshot time is invisible
-      -- here, and the UPDATE's compare-and-set below is what catches that one.
+      -- A stamp at or after p_stale_before is too new to regard as stale, and
+      -- is excluded no matter who wrote it. The cutoff proves RECENCY, not
+      -- provenance: the caller runs this before opening its own intake, so a
+      -- stamp landing in that window came from somewhere else — another API
+      -- process sharing this database, most likely. Excluding it is right
+      -- either way; attributing it is not.
+      --
+      -- This covers a dispatch already COMMITTED and visible when the
+      -- statement took its snapshot. It is not sufficient alone: one still
+      -- uncommitted at snapshot time is invisible here, and the UPDATE's
+      -- compare-and-set below is what catches that.
       AND st.stamp_at < p_stale_before
       -- No recorded recipient, no recovery. Nothing else can be established
       -- about who was supposed to act on it.
