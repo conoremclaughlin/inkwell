@@ -4574,6 +4574,13 @@ export type Database = {
         };
         Returns: Json;
       };
+      reconcile_graph_dispatch_stamps: {
+        Args: {
+          p_stale_before: string;
+          p_live_window_ms?: number;
+        };
+        Returns: Json;
+      };
       apply_task_graph: {
         Args: {
           p_user_id: string;

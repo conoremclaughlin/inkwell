@@ -64,6 +64,7 @@ import {
 } from './services/sessions/trigger-delivery';
 import { assignThreadParticipant } from './services/sessions/thread-assignment';
 import { closeIntakeAndDrain } from './services/sessions/active-runs';
+import { GraphExecutorService } from './services/graph-executor.service';
 import { interruptActiveRuns } from './services/sessions/interrupt-active-runs';
 import type { ActivityType } from './data/repositories/activity-stream.repository';
 import { resolveTaskGroupForThreadKey } from './services/task-group-resolver';
@@ -420,6 +421,28 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     },
     messageHandler,
   });
+
+  // Recover dispatch stamps stranded by an interrupted turn BEFORE the
+  // listener accepts anything. Two reasons this is awaited and placed here
+  // rather than alongside the sweep (Lumen, PR #559 review):
+  //   - it must not race dispatch intake. Once we are listening, a trigger can
+  //     stamp a node while recovery is mid-flight.
+  //   - the cutoff below fences that race even so: anything stamped from this
+  //     instant on is left alone, so the two guards are independent.
+  // Gated with the sweep: only the process that owns dispatch may clean up
+  // after it, so an isolated test server on the same DB never touches the
+  // main server's stamps.
+  if (process.env.ENABLE_GRAPH_SWEEP !== 'false') {
+    const cutoff = new Date();
+    const recovered = await new GraphExecutorService(dataComposer).reconcileInterruptedDispatches(
+      cutoff
+    );
+    if (recovered.cleared > 0) {
+      logger.info(
+        `Recovered ${recovered.cleared} interrupted graph dispatch(es) — eligible on the next sweep`
+      );
+    }
+  }
 
   // Force HTTP mode for the PCP server
   const originalTransport = env.MCP_TRANSPORT;

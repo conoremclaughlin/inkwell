@@ -1085,15 +1085,9 @@ export class MCPServer {
     if (process.env.ENABLE_GRAPH_SWEEP !== 'false') {
       const sweepMs = Number(process.env.GRAPH_SWEEP_INTERVAL_MS || 60_000);
       const graphExecutor = new GraphExecutorService(this.dataComposer);
-      // A dispatch stamp that outlived the process that wrote it cannot mean a
-      // turn is in flight — the sessions we dispatch to are our children. Clear
-      // those before the first tick, or an interrupted turn waits out the full
-      // 30-minute re-dispatch window for a turn that is never coming.
-      // Fire-and-forget: the first sweep is a full interval away, and a failure
-      // here must not keep the server from starting.
-      graphExecutor
-        .reconcileInterruptedDispatches()
-        .catch((err) => logger.warn('Graph dispatch reconciliation failed:', err));
+      // Dispatch-stamp recovery for interrupted turns runs in startServer,
+      // awaited BEFORE the listener accepts anything — see the call there for
+      // why it cannot live here (Lumen, PR #559 review).
       setInterval(() => {
         graphExecutor.sweepAll().catch((err) => logger.warn('Graph sweep tick failed:', err));
       }, sweepMs);
