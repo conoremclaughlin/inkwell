@@ -7445,6 +7445,113 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
 });
 
 /**
+ * POST /api/admin/threads
+ * Body: { key, recipients: string[], content, title?, priority? }
+ *   → { success, created, messageId, threadId, threadKey }
+ *
+ * Start a thread from the dashboard or phone — or continue one that already
+ * exists under that key. This is the only admin route that CREATES threads;
+ * /threads/reply deliberately refuses to, because a reply that invents a
+ * thread hides typos. Here the recipients are explicit, so the intent is
+ * unambiguous: "open a conversation with these participants".
+ *
+ * The human is the sender (no senderAgentId), the title becomes the thread's
+ * title on creation (send_to_inbox stores `subject` there), and every
+ * recipient is woken — a first message nobody is woken for is a thread
+ * nobody knows exists.
+ */
+router.post('/threads', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AdminAuthRequest;
+    const key = typeof req.body?.key === 'string' ? req.body.key.trim() : '';
+    const content = typeof req.body?.content === 'string' ? req.body.content.trim() : '';
+    const title = typeof req.body?.title === 'string' ? req.body.title.trim() : '';
+    const priority = typeof req.body?.priority === 'string' ? req.body.priority : undefined;
+    const recipients = Array.isArray(req.body?.recipients)
+      ? (req.body.recipients as unknown[])
+          .filter((r): r is string => typeof r === 'string')
+          .map((r) => r.trim().toLowerCase())
+          .filter((r) => r.length > 0)
+      : [];
+
+    // Grammar: type ":" id, both non-empty (project-prefixed keys have more
+    // segments; the parser sorts that out). Whitespace has no place in a key.
+    if (!/^[^\s:]+:[^\s]+$/.test(key)) {
+      res.status(400).json({ error: 'key must look like <type>:<identifier>, e.g. pr:545' });
+      return;
+    }
+    if (!content) {
+      res.status(400).json({ error: 'content is required' });
+      return;
+    }
+    if (content.length > 64 * 1024) {
+      res.status(400).json({ error: 'content is too long (64KB max)' });
+      return;
+    }
+    const uniqueRecipients = [...new Set(recipients)];
+    if (uniqueRecipients.length === 0 || uniqueRecipients.length > 16) {
+      res.status(400).json({ error: 'recipients must name 1 to 16 agents' });
+      return;
+    }
+    if (priority && !['low', 'normal', 'high', 'urgent'].includes(priority)) {
+      res.status(400).json({ error: 'priority must be low, normal, high, or urgent' });
+      return;
+    }
+
+    const dataComposer = await getDataComposer();
+    const supabase = dataComposer.getClient();
+    const { data: existing } = await supabase
+      .from('inbox_threads')
+      .select('id')
+      .eq('user_id', authReq.pcpUserId)
+      .eq('thread_key', key)
+      .maybeSingle();
+
+    const result = await handleSendToInbox(
+      {
+        userId: authReq.pcpUserId,
+        threadKey: key,
+        content,
+        recipients: uniqueRecipients,
+        triggerAll: true,
+        ...(title ? { subject: title } : {}),
+        ...(priority ? { priority } : {}),
+        metadata: { sentBy: 'user', channel: 'admin-api' },
+      },
+      dataComposer
+    );
+
+    const text = result.content?.[0]?.type === 'text' ? result.content[0].text : '{}';
+    const parsed = JSON.parse(text) as {
+      success?: boolean;
+      error?: string;
+      messageId?: string;
+      threadId?: string;
+      warning?: string;
+    };
+
+    if (parsed.messageId == null && parsed.success === false) {
+      // Nothing was stored: an unknown recipient, a refused key. That is the
+      // caller's mistake to fix, not a server fault.
+      res.status(400).json({ error: parsed.error || 'Could not start the thread' });
+      return;
+    }
+
+    res.json({
+      success: true,
+      created: !existing,
+      messageId: parsed.messageId ?? null,
+      threadId: parsed.threadId ?? existing?.id ?? null,
+      threadKey: key,
+      warning: parsed.warning ?? null,
+    });
+  } catch (error) {
+    logger.error('Failed to start thread:', error);
+    res.status(500).json(errorJson('Failed to start thread', error));
+  }
+});
+
+/**
  * POST /api/admin/threads/reply
  * Body: { key, content, priority? } → { success, messageId, threadId, triggered }
  *
