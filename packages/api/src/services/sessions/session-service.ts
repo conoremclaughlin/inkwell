@@ -1232,8 +1232,16 @@ export class SessionService implements ISessionService {
           conversationId: request.conversationId,
         });
 
-        // Queue the message and return a promise that resolves when processed
-        return new Promise((resolve, reject) => {
+        // Queue the message and return a promise that resolves when processed.
+        // `return await`, not `return` (Lumen, PR #565 r3): a bare return
+        // hands the promise out of the try block, so a later rejection from
+        // the queue processor bypasses the catch below entirely — the caller
+        // gets a raw throw instead of a structured result, and the admission
+        // evidence (tracked `admitted`, set above: this message's own
+        // resolution already completed) never crosses the boundary. Awaiting
+        // keeps every queued rejection on the same catch path as the direct
+        // one.
+        return await new Promise((resolve, reject) => {
           const queue = this.pendingQueues.get(lockKey) || [];
           queue.push({ request, resolve, reject });
           this.pendingQueues.set(lockKey, queue);

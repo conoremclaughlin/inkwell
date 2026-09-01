@@ -2422,6 +2422,12 @@ describe('SessionService', () => {
   // same way. Instead of burning budget processing each one, the
   // queue is flushed immediately. This prevents the 67-message
   // pileup that burned Myra's budget overnight.
+  //
+  // Since PR #565 r3, queued failures RESOLVE with the same structured
+  // failure result as the direct path (handleMessage `return await`s
+  // the queue promise, so rejections ride its catch) — they no longer
+  // reject. The flush semantics are unchanged; only the transport of
+  // the failure to the caller moved.
   // ═══════════════════════════════════════════════════════════════
   describe('Queue flush on non-retryable errors', () => {
     it('should flush remaining queue when a queued message hits a quota error', async () => {
@@ -2456,14 +2462,19 @@ describe('SessionService', () => {
         success: true,
       });
 
-      // Message 2: rejected with quota error (runner threw)
-      expect(results[1].status).toBe('rejected');
-      expect((results[1] as PromiseRejectedResult).reason.message).toContain('session limit');
+      // Message 2: structured failure with the quota error (runner threw;
+      // the rejection rides handleMessage's catch since r3)
+      expect(results[1].status).toBe('fulfilled');
+      const r2 = (results[1] as PromiseFulfilledResult<{ success: boolean; error?: string }>).value;
+      expect(r2.success).toBe(false);
+      expect(r2.error).toContain('session limit');
 
-      // Message 3: rejected with flush error (never processed — queue flushed)
-      expect(results[2].status).toBe('rejected');
-      expect((results[2] as PromiseRejectedResult).reason.message).toContain('Queue flushed');
-      expect((results[2] as PromiseRejectedResult).reason.message).toContain('quota');
+      // Message 3: structured flush failure (never processed — queue flushed)
+      expect(results[2].status).toBe('fulfilled');
+      const r3 = (results[2] as PromiseFulfilledResult<{ success: boolean; error?: string }>).value;
+      expect(r3.success).toBe(false);
+      expect(r3.error).toContain('Queue flushed');
+      expect(r3.error).toContain('quota');
 
       // Runner should only have been called twice (message 1 + message 2),
       // NOT three times — message 3 was flushed without processing
@@ -2494,11 +2505,17 @@ describe('SessionService', () => {
       // Message 1: succeeded
       expect(results[0].status).toBe('fulfilled');
 
-      // Messages 2 and 3: both rejected with capacity error (NOT flushed —
-      // each was attempted individually because capacity errors are retryable)
-      expect(results[1].status).toBe('rejected');
-      expect(results[2].status).toBe('rejected');
-      expect((results[2] as PromiseRejectedResult).reason.message).toContain('high demand');
+      // Messages 2 and 3: both structured failures with the capacity error
+      // (NOT flushed — each was attempted individually because capacity
+      // errors are retryable)
+      expect(results[1].status).toBe('fulfilled');
+      expect((results[1] as PromiseFulfilledResult<{ success: boolean }>).value.success).toBe(
+        false
+      );
+      const capacity = (results[2] as PromiseFulfilledResult<{ success: boolean; error?: string }>)
+        .value;
+      expect(capacity.success).toBe(false);
+      expect(capacity.error).toContain('high demand');
 
       // All 3 calls to runner should have been attempted
       expect(mockClaudeRunner.run).toHaveBeenCalledTimes(3);
@@ -2540,10 +2557,13 @@ describe('SessionService', () => {
         success: false,
       });
 
-      // Message 3: rejected with flush error (queue flushed after message 2's failure)
-      expect(results[2].status).toBe('rejected');
-      expect((results[2] as PromiseRejectedResult).reason.message).toContain('Queue flushed');
-      expect((results[2] as PromiseRejectedResult).reason.message).toContain('quota');
+      // Message 3: structured flush failure (queue flushed after message 2's failure)
+      expect(results[2].status).toBe('fulfilled');
+      const flushed = (results[2] as PromiseFulfilledResult<{ success: boolean; error?: string }>)
+        .value;
+      expect(flushed.success).toBe(false);
+      expect(flushed.error).toContain('Queue flushed');
+      expect(flushed.error).toContain('quota');
 
       // Runner called twice — message 3 was flushed, not processed
       expect(mockClaudeRunner.run).toHaveBeenCalledTimes(2);
@@ -2579,11 +2599,14 @@ describe('SessionService', () => {
         success: false,
       });
 
-      // Messages 2+3: rejected with flush error (queue flushed after message 1's failure)
-      expect(results[1].status).toBe('rejected');
-      expect((results[1] as PromiseRejectedResult).reason.message).toContain('Queue flushed');
-      expect(results[2].status).toBe('rejected');
-      expect((results[2] as PromiseRejectedResult).reason.message).toContain('Queue flushed');
+      // Messages 2+3: structured flush failures (queue flushed after message 1's failure)
+      for (const settled of [results[1], results[2]]) {
+        expect(settled.status).toBe('fulfilled');
+        const value = (settled as PromiseFulfilledResult<{ success: boolean; error?: string }>)
+          .value;
+        expect(value.success).toBe(false);
+        expect(value.error).toContain('Queue flushed');
+      }
 
       // Runner called only once — messages 2+3 were flushed before processing
       expect(mockClaudeRunner.run).toHaveBeenCalledTimes(1);
@@ -2612,8 +2635,10 @@ describe('SessionService', () => {
       // Unknown errors are NOT flushed — each message is processed individually
       expect(mockClaudeRunner.run).toHaveBeenCalledTimes(3);
       expect(results[0].status).toBe('fulfilled');
-      expect(results[1].status).toBe('rejected');
-      expect(results[2].status).toBe('rejected');
+      for (const settled of [results[1], results[2]]) {
+        expect(settled.status).toBe('fulfilled');
+        expect((settled as PromiseFulfilledResult<{ success: boolean }>).value.success).toBe(false);
+      }
     });
   });
 
@@ -5607,6 +5632,45 @@ describe('SessionService', () => {
       const threw = await sessionService.handleMessage(createMockRequest());
       expect(threw.success).toBe(false);
       expect(threw.admitted).toBe(true);
+    });
+
+    it('a QUEUED dispatch whose dequeue throws still reports admitted: true (r3 — the promise escape)', async () => {
+      // `return new Promise(...)` handed the queue promise out of the try
+      // block, so a queue-processor rejection bypassed the catch: the caller
+      // got a raw throw, no structured result, no admission evidence — and
+      // the trigger handler could neither clear nor stamp coherently. With
+      // `return await`, the rejection rides the same tracked-admitted catch
+      // as the direct path. (The pre-admission contrast is the test below:
+      // an un-queued resolution failure reports admitted: false.)
+      const session = createMockSession();
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(session);
+
+      let releaseFirst!: () => void;
+      vi.mocked(mockClaudeRunner.run).mockImplementationOnce(async () => {
+        await new Promise<void>((r) => {
+          releaseFirst = r;
+        });
+        return createMockClaudeResult();
+      });
+
+      const p1 = sessionService.handleMessage(createMockRequest({ content: 'lock holder' }));
+      await new Promise((r) => setTimeout(r, 10));
+      const p2 = sessionService.handleMessage(createMockRequest({ content: 'queued' }));
+      await new Promise((r) => setTimeout(r, 10));
+
+      // The dequeue re-resolution rejects → the queue processor rejects p2.
+      vi.mocked(mockRepository.findByUserAndAgent).mockRejectedValue(
+        new Error('db down at dequeue')
+      );
+      releaseFirst();
+
+      const [r1, r2] = await Promise.all([p1, p2]);
+      expect(r1.success).toBe(true);
+      expect(r2.success).toBe(false);
+      expect(r2.errorCode).toBe('INTERNAL_ERROR');
+      // This message's OWN resolution completed at enqueue time — the
+      // dequeue artifact is not a routing outcome, so the hold clears.
+      expect(r2.admitted).toBe(true);
     });
 
     it('a PRE-admission failure that is not a refusal reports admitted: false — the hold stays', async () => {
