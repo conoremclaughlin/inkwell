@@ -11,6 +11,9 @@ interface PairResponse {
   expiresAt: string;
   expiresInSeconds: number;
   urls: string[];
+  /** True when any advertised URL is plain http — development only. */
+  insecureTransport: boolean;
+  development: boolean;
   qrDataUrl: string;
 }
 
