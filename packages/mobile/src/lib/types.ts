@@ -139,3 +139,21 @@ export interface RefreshResponse {
   userId: string;
   email: string;
 }
+
+// ─── GET /api/admin/workspaces ───
+
+export interface Workspace {
+  id: string;
+  name: string;
+  slug: string | null;
+  type: string | null;
+  role: string | null;
+  description: string | null;
+  archivedAt: string | null;
+}
+
+export interface WorkspacesResponse {
+  currentWorkspaceId: string | null;
+  currentWorkspaceRole: string | null;
+  workspaces: Workspace[];
+}

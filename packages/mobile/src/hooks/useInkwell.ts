@@ -6,11 +6,13 @@
  */
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { apiFetch } from '../lib/api';
+import { getWorkspaceId, setWorkspaceId } from '../lib/storage';
 import type {
   ReplyResponse,
   SessionsResponse,
   ThreadMessagesResponse,
   ThreadsResponse,
+  WorkspacesResponse,
 } from '../lib/types';
 
 const THREAD_LIST_POLL_MS = 20_000;
@@ -58,6 +60,34 @@ export function useSendReply(threadKey: string) {
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['thread', threadKey] });
       void queryClient.invalidateQueries({ queryKey: ['threads'] });
+    },
+  });
+}
+
+export function useWorkspaces() {
+  return useQuery({
+    queryKey: ['workspaces'],
+    queryFn: () => apiFetch<WorkspacesResponse>('/api/admin/workspaces'),
+    staleTime: 60_000,
+  });
+}
+
+/**
+ * Switching workspace changes the answer to every other query, so the whole
+ * cache is dropped rather than invalidated: an invalidated query keeps
+ * showing the OLD workspace's data until the refetch lands, which reads as
+ * "the switch didn't work" for the second it takes.
+ */
+export function useSwitchWorkspace() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (workspaceId: string | null) => {
+      if (workspaceId === getWorkspaceId()) return;
+      await setWorkspaceId(workspaceId);
+    },
+    onSuccess: () => {
+      queryClient.removeQueries({ predicate: (q) => q.queryKey[0] !== 'workspaces' });
+      void queryClient.invalidateQueries({ queryKey: ['workspaces'] });
     },
   });
 }

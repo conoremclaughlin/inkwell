@@ -10,7 +10,7 @@
 import Constants from 'expo-constants';
 import { describeApiUrlProblem, resolveApiUrl, type ResolvedApiUrl } from './resolveApiUrl';
 import { clearAuth, getAuthState, storeLogin, storeRefreshedAccess } from './auth';
-import { getServerUrlOverride } from './storage';
+import { getServerUrlOverride, getWorkspaceId, setWorkspaceId } from './storage';
 import type { LoginResponse, RefreshResponse } from './types';
 
 /** Port the PCP API server listens on (PCP_PORT_BASE default). */
@@ -106,11 +106,15 @@ async function tryRefresh(): Promise<boolean> {
 export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   const attempt = async (): Promise<Response> => {
     const { accessToken } = getAuthState();
+    const workspaceId = getWorkspaceId();
     return fetch(`${apiBaseUrl()}${path}`, {
       ...init,
       headers: {
         'Content-Type': 'application/json',
         ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
+        // Scope every call to the selected workspace; absent means the
+        // server's default (the personal workspace).
+        ...(workspaceId ? { 'x-ink-workspace-id': workspaceId } : {}),
         ...(init?.headers ?? {}),
       },
     });
@@ -127,6 +131,19 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> 
     if (res.status === 401) {
       await clearAuth();
       throw new ApiError(401, 'Session expired — sign in again');
+    }
+  }
+  // A remembered workspace the account can no longer reach (membership
+  // revoked, workspace archived, different account signed in) would otherwise
+  // wedge every screen. The middleware answers 403/404 "Workspace not found…"
+  // for exactly that; fall back to the default workspace and retry once.
+  if ((res.status === 403 || res.status === 404) && getWorkspaceId()) {
+    const err = await parseError(res);
+    if (/workspace not found/i.test(err.message)) {
+      await setWorkspaceId(null);
+      res = await attempt();
+    } else {
+      throw err;
     }
   }
   if (!res.ok) throw await parseError(res);
@@ -160,4 +177,6 @@ export async function logout(): Promise<void> {
     // Offline logout still logs out locally; the 90-day token dies at expiry.
   }
   await clearAuth();
+  // The workspace selection belongs to the account that made it.
+  await setWorkspaceId(null);
 }
