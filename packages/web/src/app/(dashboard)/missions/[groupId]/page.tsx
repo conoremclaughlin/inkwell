@@ -34,6 +34,8 @@ import {
   FileCheck,
 } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import { useApiQuery } from '@/lib/api';
 import { useEventStream, type StreamActivity } from '@/lib/api/use-event-stream';
 import clsx from 'clsx';
@@ -955,7 +957,16 @@ export default function MissionDetailPage() {
             </div>
 
             {group.description && (
-              <p className="text-sm text-muted-foreground mt-1.5">{group.description}</p>
+              <div
+                className="prose prose-sm dark:prose-invert max-w-none mt-1.5 text-muted-foreground
+                  prose-headings:font-semibold prose-headings:mt-4 prose-headings:mb-2
+                  prose-p:my-2 prose-ul:my-2 prose-ol:my-2 prose-li:my-0
+                  prose-p:text-muted-foreground prose-li:text-muted-foreground
+                  prose-code:text-foreground prose-code:before:content-none prose-code:after:content-none
+                  prose-strong:text-foreground"
+              >
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>{group.description}</ReactMarkdown>
+              </div>
             )}
 
             {/* Meta row */}

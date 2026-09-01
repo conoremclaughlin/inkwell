@@ -25,6 +25,7 @@ import {
 import type { AgentResponse, OutboundMedia } from '../agent/types';
 import type { DataComposer } from '../data/composer';
 import { logger } from '../utils/logger';
+import type { Json } from '../data/supabase/types';
 import { env } from '../config/env';
 import { InboundMediaPipeline } from './media-pipeline';
 import { TextToSpeechService } from './text-to-speech';
@@ -799,7 +800,7 @@ export class ChannelGateway extends EventEmitter {
                 platform: 'whatsapp',
                 platformChatId: conversationId,
                 isDm: true,
-                payload: Object.keys(payload).length > 0 ? payload : undefined,
+                payload: Object.keys(payload).length > 0 ? (payload as Json) : undefined,
               });
             } catch (activityError) {
               logger.warn(
@@ -861,7 +862,7 @@ export class ChannelGateway extends EventEmitter {
                 platform: 'discord',
                 platformChatId: conversationId,
                 isDm: true,
-                payload: Object.keys(payload).length > 0 ? payload : undefined,
+                payload: Object.keys(payload).length > 0 ? (payload as Json) : undefined,
               });
             } catch (activityError) {
               logger.warn(
@@ -919,7 +920,7 @@ export class ChannelGateway extends EventEmitter {
                 platform: 'slack',
                 platformChatId: conversationId,
                 isDm: true,
-                payload: Object.keys(payload).length > 0 ? payload : undefined,
+                payload: Object.keys(payload).length > 0 ? (payload as Json) : undefined,
               });
             } catch (activityError) {
               logger.warn(
@@ -1097,7 +1098,7 @@ export class ChannelGateway extends EventEmitter {
           platform: 'telegram',
           platformChatId: conversationId,
           isDm: true, // Will be corrected by context
-          payload: Object.keys(payload).length > 0 ? payload : undefined,
+          payload: Object.keys(payload).length > 0 ? (payload as Json) : undefined,
         });
       } catch (activityError) {
         logger.warn('Failed to log outgoing message to activity stream:', activityError);
