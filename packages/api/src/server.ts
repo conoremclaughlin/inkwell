@@ -27,7 +27,12 @@ import {
   RoutingRefusedError,
   type SessionServiceConfig,
 } from './services/sessions';
-import type { SessionRequest, ChannelResponse, ChannelType } from './services/sessions';
+import type {
+  SessionRequest,
+  SessionResult,
+  ChannelResponse,
+  ChannelType,
+} from './services/sessions';
 import {
   createMCPServer,
   MCPServer,
@@ -58,7 +63,7 @@ import { logger } from './utils/logger';
 import { getUserFromContext } from './utils/request-context';
 import { env } from './config/env';
 import {
-  shouldSkipSpawn,
+  decideDelivery,
   type SessionPollRow,
   type SessionAttachedRow,
 } from './services/sessions/trigger-delivery';
@@ -1096,14 +1101,100 @@ When you complete a task_request, mark it as completed using update_inbox_messag
     // ordering cannot be assumed — it has to be expressed in the predicate.
     const routeStartedAt = new Date().toISOString();
 
-    // Check if the routed session is CLI-attached — if so, queue the message
-    // for the on-prompt hook instead of spawning a new process.
-    // Uses getOrCreateSession to resolve through the SAME routing logic
-    // (recipientSessionId → threadKey → route patterns → studio fallback)
-    // that handleMessage would use. This ensures CLI-attached delivery
-    // respects route patterns, not just the identity workspace.
+    // Whether this dispatch's thread assignment landed — set inside the plan
+    // block, consumed by the terminal clears below.
+    let assignmentLanded = false;
+
+    // MODE-TERMINAL hold clear (Lumen, PR #565 r1). One clear per dispatch,
+    // at the point the delivery mode's outcome is actually decided: routeOnly
+    // after its assignment-complete return, inline after the delivery
+    // decision, spawn only once admission succeeded. Clearing earlier — right
+    // after assignment — advanced routingRecovery to this dispatch's own
+    // routeStartedAt, so an admission refusal stamping with the SAME
+    // generation was refused by the RPC's strict `recovery < attemptStarted`
+    // guard: the previous hold was removed and the promised new one never
+    // landed. Awaited, never detached, so it cannot race the next dispatch's
+    // stamp (PR #514 round 2).
+    const clearHoldAtTerminal = async (): Promise<void> => {
+      if (!payload.threadId || !assignmentLanded) return;
+      await clearRoutingHold(dataComposer!.getClient(), {
+        threadId: payload.threadId,
+        userId,
+        agentId: targetAgentId,
+        routedSince: routeStartedAt,
+      });
+    };
+
+    // Refusal trail, shared by the two places a routing refusal can surface
+    // (v18 S3): the PLAN resolution below, and — now that provisioning is
+    // deferred — the spawn path's own resolution inside handleMessage. A held
+    // message never reached its recipient and nothing else reports that, so
+    // both surfaces must produce the same loud log + inkmail_fail + on-thread
+    // routingHold stamp.
+    const refuseAndHold = async (refusal: {
+      threadKey: string;
+      detail: {
+        triedCallerRepo: boolean;
+        callerRepoRoot?: string;
+        reason?: 'no-route' | 'occupied' | 'ambiguous-identity';
+        occupied?: { studioId: string; holderThreadKey: string };
+      };
+      message: string;
+    }): Promise<void> => {
+      // ERROR, not warn. processTrigger converts the failure into a
+      // success:false FIELD on a 200 response, so no status-code monitoring
+      // sees it — ~/.ink/logs/error.log is the one place an operator looks.
+      logger.error('[Trigger] HELD — routing refused, no session created', {
+        threadKey: refusal.threadKey,
+        targetAgentId,
+        reason: refusal.detail.reason ?? 'no-route',
+        triedCallerRepo: refusal.detail.triedCallerRepo,
+        callerRepoRoot: refusal.detail.callerRepoRoot || null,
+        ...(refusal.detail.occupied ? { occupied: refusal.detail.occupied } : {}),
+        recovery:
+          refusal.detail.reason === 'occupied'
+            ? 'wait for the lease holder to finish, or fix the overflow provisioning failure'
+            : refusal.detail.reason === 'ambiguous-identity'
+              ? 'de-duplicate this agent slug in agent_identities — no route pattern was consulted, so routing config is not the cause'
+              : 'add a route pattern to a studio, pass studioHint, or send from a session bound to the target repo',
+      });
+
+      await logInkmail('inkmail_fail', payload, userId, {
+        error: `routing_held: ${refusal.message}`,
+      });
+
+      // Surface on the thread itself so the hold is visible where the work
+      // is. Goes through the tested routing-hold boundary — this call site
+      // previously drifted out of sync with the RPC signature and every
+      // refusal went unstamped, with a green suite (Lumen, round 4).
+      if (payload.threadId) {
+        await stampRoutingHold(dataComposer!.getClient(), {
+          threadId: payload.threadId,
+          userId,
+          agentId: targetAgentId,
+          attemptStartedAt: routeStartedAt,
+          detail: {
+            triedCallerRepo: refusal.detail.triedCallerRepo,
+            callerRepoRoot: refusal.detail.callerRepoRoot ?? null,
+            reason: refusal.detail.reason,
+            occupied: refusal.detail.occupied ?? null,
+          },
+        });
+      }
+    };
+
+    // PLAN (v18 S3): resolve which session this delivery belongs to — and
+    // where it would run — through the SAME routing logic handleMessage uses
+    // (recipientSessionId → alias → threadKey → route patterns → fallback),
+    // WITHOUT provisioning. planOnly takes no lease and mints no worktree:
+    // a routeOnly stamp and an inline (CLI-attached) delivery run no process,
+    // so building a checkout for them is the orphan-worktree class. Refusals
+    // still fire here — they are routing decisions, not provisioning actions.
+    // Only a delivery that actually admits a spawn provisions, inside
+    // handleMessage's own full resolution below.
     try {
       const routedSession = await sessionService!.getOrCreateSession(userId, targetAgentId, {
+        planOnly: true,
         threadKey: payload.threadKey,
         alias: payload.sessionAlias,
         studioId: payload.studioId,
@@ -1180,19 +1271,16 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         }
       }
 
-      // A thread that routes successfully is no longer held. Cleared only
-      // AFTER assignment (Lumen, PR #514 round 2): assignment can still
-      // reroute or fail, and clearing before it lands advertises a recovery
-      // that has not happened. Awaited, not detached, so it cannot race the
-      // next dispatch's stamp.
-      if (payload.threadId && !assignmentFailure) {
-        await clearRoutingHold(dataComposer!.getClient(), {
-          threadId: payload.threadId,
-          userId,
-          agentId: targetAgentId,
-          routedSince: routeStartedAt,
-        });
-      }
+      // Assignment landing is recorded here; the hold CLEAR is deferred to
+      // each mode's TERMINAL point (Lumen, PR #565 r1). Clearing right after
+      // assignment advanced routingRecovery to this dispatch's own generation
+      // — so a spawn-admission refusal, stamping with the same routeStartedAt,
+      // was refused by the stamp RPC's strict `recovery < attemptStarted`
+      // guard: the dispatch removed the previous hold and could not leave its
+      // own. Clearing before assignment lands was already wrong (PR #514
+      // round 2: it advertises a recovery that has not happened); clearing
+      // before ADMISSION lands is the same defect one boundary later.
+      assignmentLanded = Boolean(payload.threadId) && !assignmentFailure;
 
       // Routing-only dispatch: assignment IS the entire job — a failed stamp
       // must propagate as a failed trigger (processTrigger returns
@@ -1209,6 +1297,8 @@ When you complete a task_request, mark it as completed using update_inbox_messag
           });
           throw new Error(`routeOnly assignment failed for ${targetAgentId}: ${assignmentFailure}`);
         }
+        // Terminal for routeOnly: assignment is the whole job and it landed.
+        await clearHoldAtTerminal();
         logger.info('[Trigger] routeOnly — assignment complete, no wake', {
           targetAgentId,
           sessionId: deliverySession.id,
@@ -1222,14 +1312,9 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         return;
       }
 
-      // Deliver to the assigned session (may differ from routedSession after
-      // a lost claim race).
-      if (deliverySession.id !== routedSession.id) {
-        request.metadata = {
-          ...request.metadata,
-          recipientSessionId: deliverySession.id,
-        };
-      }
+      // Delivery targets the assigned session (may differ from routedSession
+      // after a lost claim race). The spawn branch below stamps it as the
+      // anchor unconditionally.
 
       // Check if the routed session has a CLI actively polling or attached.
       // Only the routed session matters — a different session polling can't
@@ -1266,20 +1351,20 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         attachedRow.cli_attached = false;
       }
 
-      // Strategy triggers (kickoff/watchdog/resume) must always spawn a new
-      // session — they are self-addressed (agent triggers itself) and the
-      // channel plugin's self-message filter silently drops them. Bypassing
-      // shouldSkipSpawn ensures autonomous work actually starts.
-      const isStrategyTrigger =
-        payload.metadata &&
-        typeof payload.metadata.strategyTrigger === 'boolean' &&
-        payload.metadata.strategyTrigger;
+      // DELIVERY DECISION (v18 S3): inline to the live CLI on the routed
+      // session, or admit a spawn. Force-spawn is threaded explicitly —
+      // strategy kickoff/watchdog/resume always need a fresh process (they
+      // are self-addressed and the channel plugin's self-message filter
+      // silently drops them). The metadata form is the legacy carrier;
+      // payload.forceSpawn is the first-class field.
+      const forceSpawn = payload.forceSpawn === true || payload.metadata?.strategyTrigger === true;
 
-      const delivery = isStrategyTrigger
-        ? { skip: false, source: null, sessionId: null }
-        : shouldSkipSpawn(pollRow, attachedRow);
+      const delivery = decideDelivery({ forceSpawn, pollRow, attachedRow });
 
-      if (delivery.skip) {
+      if (delivery.mode === 'inline') {
+        // Terminal for inline: the delivery decision is made and the channel
+        // plugin owns it from here — no admission remains that could refuse.
+        await clearHoldAtTerminal();
         logger.info(
           `[Trigger] CLI-attached (${delivery.source}) — skipping spawn, channel plugin will deliver`,
           {
@@ -1297,62 +1382,31 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         return;
       }
 
-      if (isStrategyTrigger) {
-        logger.info('[Trigger] Strategy trigger — bypassing CLI-attached check, forcing spawn', {
+      if (delivery.forced) {
+        logger.info('[Trigger] Force-spawn — bypassing CLI-attached check', {
           targetAgentId,
           reason: payload.metadata?.reason,
           groupId: payload.metadata?.groupId,
         });
       }
+
+      // SPAWN ADMISSION (v18 S3): anchor the spawn to the planned session so
+      // handleMessage's own full resolution converges deterministically on it
+      // (the anchor rung is authorized + highest priority) — and THAT
+      // resolution, running without planOnly, rechecks occupancy and
+      // atomically provisions + acquires. Previously only a reroute stamped
+      // this, leaving the common case to re-derive the session from scratch.
+      request.metadata = {
+        ...request.metadata,
+        recipientSessionId: deliverySession.id,
+      };
     } catch (err) {
       // Refuse-and-hold (spec §Refusing to route, Phase 3b) is NOT a resolution
       // failure to fall through from — falling through would spawn exactly the
       // wrong-worktree session the refusal exists to prevent. Stop here: no
       // session, no lease, no spawn, and a loud, recoverable trail.
       if (err instanceof RoutingRefusedError) {
-        // ERROR, not warn. A held message never reached its recipient, and
-        // nothing else reports that: the hold lands in thread metadata that no
-        // reader consults, and processTrigger converts the throw into a
-        // success:false FIELD on a 200 response, so no status-code monitoring
-        // sees it either. `warn` kept it out of ~/.ink/logs/error.log, which is
-        // the one place an operator actually looks.
-        logger.error('[Trigger] HELD — routing refused, no session created', {
-          threadKey: err.threadKey,
-          targetAgentId,
-          reason: err.detail.reason ?? 'no-route',
-          triedCallerRepo: err.detail.triedCallerRepo,
-          callerRepoRoot: err.detail.callerRepoRoot || null,
-          ...(err.detail.occupied ? { occupied: err.detail.occupied } : {}),
-          recovery:
-            err.detail.reason === 'occupied'
-              ? 'wait for the lease holder to finish, or fix the overflow provisioning failure'
-              : err.detail.reason === 'ambiguous-identity'
-                ? 'de-duplicate this agent slug in agent_identities — no route pattern was consulted, so routing config is not the cause'
-                : 'add a route pattern to a studio, pass studioHint, or send from a session bound to the target repo',
-        });
-
-        await logInkmail('inkmail_fail', payload, userId, {
-          error: `routing_held: ${err.message}`,
-        });
-
-        // Surface on the thread itself so the hold is visible where the work
-        // is. Goes through the tested routing-hold boundary — this call site
-        // previously drifted out of sync with the RPC signature and every
-        // refusal went unstamped, with a green suite (Lumen, round 4).
-        if (payload.threadId) {
-          await stampRoutingHold(dataComposer!.getClient(), {
-            threadId: payload.threadId,
-            userId,
-            agentId: targetAgentId,
-            attemptStartedAt: routeStartedAt,
-            detail: {
-              triedCallerRepo: err.detail.triedCallerRepo,
-              callerRepoRoot: err.detail.callerRepoRoot ?? null,
-              reason: err.detail.reason,
-              occupied: err.detail.occupied ?? null,
-            },
-          });
-        }
+        await refuseAndHold({ threadKey: err.threadKey, detail: err.detail, message: err.message });
 
         // Rethrow (Lumen, PR #514 round 1). Returning here made the hold
         // report SUCCESS: routeOnly's routingFailures stayed empty, the send
@@ -1388,12 +1442,55 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       });
     }
 
-    const result = await sessionService!.handleMessage(request);
+    let result: SessionResult;
+    try {
+      result = await sessionService!.handleMessage(request);
+    } catch (err) {
+      // The queued-message path resolves handleMessage's promise AFTER its
+      // try/catch has exited, so a requeued dispatch's admission refusal
+      // arrives here as a raw throw rather than a structured result. Same
+      // trail either way.
+      if (err instanceof RoutingRefusedError) {
+        await refuseAndHold({ threadKey: err.threadKey, detail: err.detail, message: err.message });
+      }
+      throw err;
+    }
 
     if (!result.success) {
+      // v18 S3: spawn admission is where occupancy is now first ENFORCED
+      // (plan resolution decides but never provisions), so a refusal can
+      // surface from handleMessage's own resolution. It must leave the same
+      // trail as a plan-time refusal — hold stamp, inkmail_fail, loud log —
+      // not vanish into a generic processing failure.
+      if (result.errorCode === 'ROUTING_REFUSED' && result.refusal) {
+        await refuseAndHold({
+          threadKey: result.refusal.threadKey,
+          detail: result.refusal.detail,
+          message: result.error || 'routing refused at spawn admission',
+        });
+        throw new Error(result.error || 'routing refused at spawn admission');
+      }
+
+      // Post-admission failure (Lumen, PR #565 r2): routing completed —
+      // occupancy rechecked, studio provisioned/acquired — and the RUNNER
+      // failed. Clear the hold: leaving an older occupied/no-route marker
+      // standing would misdiagnose a backend failure as a routing one. A
+      // pre-admission failure (admitted false, not a refusal) retains it —
+      // nothing recovered, nothing new to say.
+      if (result.admitted) {
+        await clearHoldAtTerminal();
+      }
+
       logger.error(`[Trigger] SessionService failed for ${targetAgentId}: ${result.error}`);
       throw new Error(result.error || 'SessionService processing failed');
     }
+
+    // Terminal for spawn: admission actually succeeded — occupancy was
+    // rechecked, provisioning and acquisition landed, a process ran. Only now
+    // is this thread's recovery real. (A refusal above stamped its hold with
+    // routingRecovery untouched by this dispatch, so the stamp's generation
+    // guard passed.)
+    await clearHoldAtTerminal();
 
     // Stamp execution_phase → worker_active now that a session is actually running
     const strategyGroupId =

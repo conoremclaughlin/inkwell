@@ -74,6 +74,15 @@ export interface AgentTriggerPayload {
    */
   routeOnly?: boolean;
   /**
+   * Explicit spawn admission (v18 S3): the caller declares a new process must
+   * run, bypassing inline (CLI-attached) delivery detection. Set for strategy
+   * kickoff/watchdog/resume — self-addressed triggers the channel plugin's
+   * self-message filter would silently drop. Threaded from the payload so the
+   * delivery decision receives the mode explicitly instead of rediscovering
+   * it from attachment state. Ignored when routeOnly is set (no-wake wins).
+   */
+  forceSpawn?: boolean;
+  /**
    * True only when the CALLER explicitly targeted a session/studio
    * (recipientSessionId/sessionAlias/recipientStudioId/recipientStudioSlug
    * passed by the sender) — the deliberate-retarget signal (spec §3b.1).

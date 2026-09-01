@@ -282,6 +282,33 @@ export interface SessionResult {
   // Error info if failed
   error?: string;
   errorCode?: string;
+  /**
+   * Admission evidence (v18 S3): true when routing completed — session
+   * resolved, occupancy rechecked, any provisioning/lease acquisition landed
+   * — regardless of whether the turn then succeeded. A post-admission
+   * failure is a backend outcome, not a routing one: the trigger handler
+   * clears a thread's routingHold on admitted outcomes even when processing
+   * failed, and retains it only for refusals and pre-admission failures.
+   */
+  admitted?: boolean;
+  /**
+   * Present with errorCode 'ROUTING_REFUSED' (v18 S3): the structured refusal
+   * from the spawn path's own resolution. Provisioning is deferred to spawn
+   * admission, so an occupancy refusal can first surface inside handleMessage
+   * — the trigger handler needs the parts to stamp a routing hold, and a
+   * serialized message string cannot carry them.
+   */
+  refusal?: {
+    threadKey: string;
+    detail: {
+      triedCallerRepo: boolean;
+      callerRepoRoot?: string;
+      reason?: 'no-route' | 'occupied' | 'ambiguous-identity';
+      anchor?: 'studio' | 'session';
+      occupied?: { studioId: string; holderThreadKey: string };
+      policy?: 'reuse-only';
+    };
+  };
 }
 
 // ─── Tool Call Tracking ───
@@ -411,6 +438,12 @@ export interface ISessionService {
       studioHint?: string;
       recipientSessionId?: string;
       contactId?: string;
+      /**
+       * v18 S3: plan resolution — decide session + placement without taking a
+       * lease or minting a worktree. The result must not be handed to a
+       * runner; the spawn path re-resolves without this flag.
+       */
+      planOnly?: boolean;
     }
   ): Promise<Session>;
 
