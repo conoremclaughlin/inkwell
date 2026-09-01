@@ -97,7 +97,10 @@ BEGIN
       AND tg.status = 'active'
   ),
   targets AS (
-    SELECT t.id
+    SELECT t.id,
+           -- Captured so the UPDATE can prove the row did not change under it.
+           t.metadata ->> 'graphDispatchedAt' AS stamp_text,
+           t.metadata ->> 'graphDispatchedTo' AS recipient_text
     FROM tasks t
     JOIN g ON g.id = t.task_group_id
     CROSS JOIN LATERAL (
@@ -156,7 +159,21 @@ BEGIN
   updated AS (
     UPDATE tasks t
     SET metadata = t.metadata - 'graphDispatchedAt' - 'graphDispatchedTo'
-    WHERE t.id IN (SELECT id FROM targets)
+    FROM targets tg
+    WHERE t.id = tg.id
+      -- Compare-and-set on the row as it exists AT UPDATE TIME. `targets` is
+      -- evaluated against this statement's snapshot; if a concurrent dispatch
+      -- commits while the UPDATE waits on the row lock, Postgres re-checks
+      -- these quals against the newly committed version, they no longer match
+      -- the captured values, and the row is skipped. Matching on id alone
+      -- would delete that fresh stamp — validated old, wrote new (Lumen, PR
+      -- #559 round 4, reproduced on PG 17.6).
+      AND t.metadata ->> 'graphDispatchedAt' IS NOT DISTINCT FROM tg.stamp_text
+      AND t.metadata ->> 'graphDispatchedTo' IS NOT DISTINCT FROM tg.recipient_text
+      -- Re-checked for the same reason: a claim or completion landing in that
+      -- window means somebody took the work while we waited.
+      AND t.claimed_by_session_id IS NULL
+      AND t.status <> 'completed'
     RETURNING t.id
   )
   SELECT coalesce(jsonb_agg(u.id), '[]'::jsonb) INTO v_cleared FROM updated u;

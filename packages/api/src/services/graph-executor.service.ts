@@ -261,14 +261,14 @@ export class GraphExecutorService {
         }
       }
 
-      const ok = await this.triggerNode(userId, group, node, target.kind);
+      const { ok, recipientIdentityId } = await this.triggerNode(userId, group, node, target.kind);
       if (ok) {
         triggered.push(node.id);
-        // Same resolution order triggerNode used to pick the recipient: the
-        // node's assignee identity, else the group owner. A human assignee
-        // never reaches here (triggerNode returns false), so this is always
-        // the agent identity the dispatch actually went to.
-        await this.stampDispatch(node.id, node.assigneeIdentityId ?? group.sb_id ?? null);
+        // The identity triggerNode ACTUALLY reached, which is not always the
+        // node's assignee — an unresolvable assignee falls back to the group
+        // owner. Recomputing it here would record the wrong recipient in
+        // exactly that case.
+        await this.stampDispatch(node.id, recipientIdentityId);
       } else {
         skipped.push(node.id);
       }
@@ -521,16 +521,26 @@ export class GraphExecutorService {
     });
   }
 
+  /**
+   * Returns WHICH identity the trigger actually went to, not just whether it
+   * went. The two can differ: if the node names an assignee whose slug will
+   * not resolve, dispatch falls back to the group owner. Recovery is scoped to
+   * the recipient recorded on the stamp, so a caller that assumed the node's
+   * assignee would stamp the wrong identity and scope recovery to a session
+   * that was never asked to do anything (Lumen, PR #559 round 4).
+   */
   private async triggerNode(
     userId: string,
     group: TaskGroup,
     node: GraphNodeRef,
     kind: 'work' | 'gate'
-  ): Promise<boolean> {
+  ): Promise<{ ok: boolean; recipientIdentityId: string | null }> {
     const client = this.dataComposer.getClient();
     let slug: string | null = null;
+    let recipientIdentityId: string | null = null;
     if (node.assigneeIdentityId) {
       slug = await resolveAgentSlug(client, node.assigneeIdentityId).catch(() => null);
+      if (slug) recipientIdentityId = node.assigneeIdentityId;
     }
     if (!slug && node.assigneeUserId) {
       // Human assignee: no session to trigger. The activity stream and the
@@ -540,14 +550,15 @@ export class GraphExecutorService {
         taskTitle: node.title,
         assigneeUserId: node.assigneeUserId,
       });
-      return false;
+      return { ok: false, recipientIdentityId: null };
     }
     if (!slug && group.sb_id) {
       slug = await resolveAgentSlug(client, group.sb_id).catch(() => null);
+      if (slug) recipientIdentityId = group.sb_id;
     }
     if (!slug) {
       logger.warn(`Graph dispatch: no resolvable assignee for task ${node.id} (${node.title})`);
-      return false;
+      return { ok: false, recipientIdentityId: null };
     }
 
     const content =
@@ -565,7 +576,8 @@ export class GraphExecutorService {
           `For an automated check (CI, GH), claim the gate first with claim_task and pass the claim token.` +
           (await this.gateChecklist(node.id));
 
-    return this.sendTrigger(userId, group, slug, content, `graph_${kind}_ready`, node.id);
+    const ok = await this.sendTrigger(userId, group, slug, content, `graph_${kind}_ready`, node.id);
+    return { ok, recipientIdentityId };
   }
 
   /**

@@ -30,6 +30,7 @@ import type { Database } from '../data/supabase/types';
 import { TaskGroupsRepository } from '../data/repositories/task-groups.repository';
 import { ActivityStreamRepository } from '../data/repositories/activity-stream.repository';
 import { GraphExecutorService, type GraphEvaluation } from './graph-executor.service';
+import { resolveAgentSlug } from '../auth/resolve-identity';
 
 const projectRoot = resolve(__dirname, '../../../../');
 const envLocalPath = resolve(projectRoot, '.env.local');
@@ -47,6 +48,19 @@ const USER = INTEGRATION_TEST_USER_ID;
 
 /** Far enough ahead that every stamp these tests write counts as stale. */
 const LATER = () => new Date(Date.now() + 60_000);
+
+/**
+ * Direct Postgres, for the one test that needs a second connection holding a
+ * row lock. The harness exports this; locally we derive it from the standard
+ * Supabase dev port so the test still runs instead of quietly skipping — a
+ * concurrency guard nothing exercises is a guard I believe in rather than one
+ * that works.
+ */
+const DB_URL =
+  process.env.INTEGRATION_DB_URL ||
+  (SUPABASE_URL?.includes('127.0.0.1') || SUPABASE_URL?.includes('localhost')
+    ? 'postgresql://postgres:postgres@127.0.0.1:54322/postgres'
+    : undefined);
 
 // Dispatch must not actually wake anyone; what we assert is whether the
 // executor DECIDED to dispatch, which is its return value.
@@ -417,16 +431,10 @@ d('reconcileInterruptedDispatches (real DB)', () => {
    */
   it('ignores a terminal session that finished BEFORE the stamp was written', async () => {
     const { taskId, threadKey } = await newGraphGroupWithWork('__reconcile_old_evidence');
-    // Interrupted an hour ago...
-    await newSession({
-      thread_key: threadKey,
-      lifecycle: 'idle',
-      status: 'resumable',
-      metadata: {
-        interruptedAt: new Date(Date.now() - 3_600_000).toISOString(),
-        interruptedReason: 'server-shutdown',
-      },
-    });
+    // Interrupted an hour ago — and belonging to the RECIPIENT. Without the
+    // sb_id this test passed because the recipient did not match, not because
+    // of the timestamp floor it claims to pin (Lumen, PR #559 round 4).
+    await interruptedSession(threadKey, reviewer, new Date(Date.now() - 3_600_000));
     // ...but this dispatch went out just now, to someone who has not started.
     await stamp(taskId);
 
@@ -502,6 +510,118 @@ d('reconcileInterruptedDispatches (real DB)', () => {
     const meta = await metadataOf(taskId);
     expect(meta.graphDispatchedAt).toBeDefined();
     expect(meta.graphDispatchedTo).toBe(reviewer); // the group owner, via triggerNode's fallback
+  });
+
+  /**
+   * ROUND 4 (Lumen). triggerNode falls back to the group owner when the
+   * node's own assignee will not resolve to a slug. The caller used to
+   * recompute the recipient as `node.assigneeIdentityId ?? group.sb_id`, so in
+   * exactly that case it stamped an identity that was never messaged, and
+   * recovery would then wait on a session nobody had asked for anything.
+   */
+  it('stamps the identity actually reached when the assignee does not resolve', async () => {
+    const { groupId, threadKey: _tk } = await newGraphGroupWithWork('__reconcile_fallback');
+    // A gate can carry an assignee; a work node cannot.
+    const version = Number((await groups.findById(groupId))!.graph_version ?? 1);
+    const added = await groups.addGraphNodes({
+      userId: USER,
+      taskGroupId: groupId,
+      expectedVersion: version,
+      nodes: [
+        {
+          slug: 'gate',
+          type: 'verification',
+          title: 'review it',
+          assigneeIdentityId: other,
+          verification: { mode: 'executable', requirements: [] },
+        },
+      ],
+      edges: [],
+      systemActor: true,
+    });
+    if (added.success !== true) throw new Error(`fixture gate: ${JSON.stringify(added)}`);
+    const { data: gate } = await client
+      .from('tasks')
+      .select('id')
+      .eq('task_group_id', groupId)
+      .eq('node_slug', 'gate')
+      .single();
+
+    // `other` has no resolvable slug; the group owner does.
+    vi.mocked(resolveAgentSlug).mockImplementation(async (_c: unknown, id: string) =>
+      id === other ? null : 'wren'
+    );
+    try {
+      const group = await groups.findById(groupId);
+      const result = await executor.dispatchEvaluation(
+        USER,
+        group!,
+        {
+          readyWork: [],
+          openedGates: [],
+          openGates: [{ id: gate!.id, title: 'review it', assigneeIdentityId: other }],
+          scheduledGates: [],
+          dependencyFailures: [],
+          groupComplete: false,
+          counts: { total: 2, completed: 0, failed: 0, skipped: 0 },
+        } as unknown as GraphEvaluation,
+        { dedupe: true }
+      );
+      expect(result.triggered).toContain(gate!.id);
+
+      const meta = await metadataOf(gate!.id);
+      expect(meta.graphDispatchedTo).toBe(reviewer); // who it reached
+      expect(meta.graphDispatchedTo).not.toBe(other); // not who it named
+    } finally {
+      vi.mocked(resolveAgentSlug).mockResolvedValue('wren');
+    }
+  });
+
+  /**
+   * ROUND 4 (Lumen). The round-1 race survived three rounds of narrowing,
+   * because narrowing WHICH rows qualify does nothing about a row changing
+   * after it qualified. `targets` reads this statement's snapshot; the UPDATE
+   * then waits on the row lock. Matching on id alone, it would resume after
+   * the other transaction commits and delete a stamp written 200ms ago —
+   * validated old, wrote new.
+   *
+   * This needs a genuine second connection: one transaction must hold the row
+   * lock while the reconciliation statement blocks on it. PostgREST gives one
+   * transaction per request and cannot express that, which is the only reason
+   * this suite touches Postgres directly.
+   */
+  it.skipIf(!DB_URL)('does not delete a stamp written while it waited on the row', async () => {
+    const { taskId, threadKey } = await newGraphGroupWithWork('__reconcile_race');
+    const cutoff = new Date();
+    // Qualifies at snapshot time: old stamp, recipient's turn already over.
+    await stamp(taskId, {}, new Date(cutoff.getTime() - 60_000), reviewer);
+    await interruptedSession(threadKey, reviewer);
+
+    const { Client } = await import('pg');
+    const holder = new Client({ connectionString: DB_URL });
+    await holder.connect();
+    try {
+      await holder.query('BEGIN');
+      // A dispatch that lands after reconciliation began: newer than the
+      // cutoff, so it must survive.
+      const fresh = new Date(cutoff.getTime() + 300_000).toISOString();
+      await holder.query('UPDATE tasks SET metadata = $2::jsonb WHERE id = $1', [
+        taskId,
+        JSON.stringify({ graphDispatchedAt: fresh, graphDispatchedTo: reviewer }),
+      ]);
+
+      // Starts, finds the row eligible on the old snapshot, then blocks.
+      const reconciling = executor.reconcileInterruptedDispatches(cutoff);
+      await new Promise((r) => setTimeout(r, 500));
+      await holder.query('COMMIT');
+      await reconciling;
+
+      const meta = await metadataOf(taskId);
+      expect(meta.graphDispatchedAt).toBe(fresh);
+      expect(meta.graphDispatchedTo).toBe(reviewer);
+    } finally {
+      await holder.end();
+    }
   });
 
   /**
