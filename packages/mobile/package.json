@@ -31,7 +31,7 @@
     "android": "expo start --android",
     "ios": "expo start --ios",
     "web": "expo start --web",
-    "test": "vitest run --passWithNoTests",
+    "test": "vitest run",
     "type-check": "tsc --noEmit"
   }
 }
