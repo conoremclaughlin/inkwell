@@ -4558,6 +4558,29 @@ export type Database = {
         };
         Returns: string;
       };
+      add_graph_nodes: {
+        Args: {
+          p_user_id: string;
+          p_task_group_id: string;
+          p_expected_version: number;
+          p_nodes: Json;
+          p_edges: Json;
+          p_actor_identity_id?: string | null;
+          p_actor_user_id?: string | null;
+          p_system_actor?: boolean;
+          p_constructor?: string | null;
+          p_constructor_version?: string | null;
+          p_config_hash?: string | null;
+        };
+        Returns: Json;
+      };
+      reconcile_graph_dispatch_stamps: {
+        Args: {
+          p_stale_before: string;
+          p_live_window_ms?: number;
+        };
+        Returns: Json;
+      };
       apply_task_graph: {
         Args: {
           p_user_id: string;

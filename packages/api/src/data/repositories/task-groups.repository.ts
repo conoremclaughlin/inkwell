@@ -433,6 +433,44 @@ export class TaskGroupsRepository {
   }
 
   /**
+   * Additive node authoring for template constructors: create typed nodes by
+   * node_slug and add edges. Removes neither — rewiring stays with
+   * applyTaskGraph. Nodes whose slug already exists are left untouched, so a
+   * re-run is a no-op rather than a duplicate.
+   */
+  async addGraphNodes(params: {
+    userId: string;
+    taskGroupId: string;
+    expectedVersion: number;
+    /** Template-emitted node specs; shape validated by the RPC, not here. */
+    nodes: unknown[];
+    edges: Array<{ from: string; to: string }>;
+    actorIdentityId?: string;
+    actorUserId?: string;
+    systemActor?: boolean;
+    /** See applyTaskGraph — `constructor` as an object key trips TS. */
+    constructorId?: string;
+    constructorVersion?: string;
+    configHash?: string;
+  }): Promise<Record<string, unknown>> {
+    const { data, error } = await this.client.rpc('add_graph_nodes', {
+      p_user_id: params.userId,
+      p_task_group_id: params.taskGroupId,
+      p_expected_version: params.expectedVersion,
+      p_nodes: params.nodes as Json,
+      p_edges: params.edges,
+      p_actor_identity_id: params.actorIdentityId ?? null,
+      p_actor_user_id: params.actorUserId ?? null,
+      p_system_actor: params.systemActor ?? false,
+      p_constructor: params.constructorId ?? null,
+      p_constructor_version: params.constructorVersion ?? null,
+      p_config_hash: params.configHash ?? null,
+    });
+    if (error) throw new Error(`add_graph_nodes failed: ${error.message}`);
+    return data as Record<string, unknown>;
+  }
+
+  /**
    * Validated linear → graph conversion. Preflight failures come back as
    * {success:false, reason:'preflight-failed', invalid:[...]} and leave the
    * group linear with its blocked_by arrays intact.
@@ -470,6 +508,29 @@ export class TaskGroupsRepository {
    * structured refusal (not-ready / already-claimed / gate-not-open /
    * approval-gate / group-not-active / not-graph-mode).
    */
+  /**
+   * Clear stale graphDispatchedAt stamps so interrupted turns are dispatchable
+   * again on the next sweep.
+   *
+   * Every decision — which groups have provably-finished sessions, which still
+   * look alive, which stamps predate the cutoff — is made inside the RPC, and
+   * the key is removed in place. Doing any of it here would reintroduce the
+   * read-modify-write that PR #559 review rejected: a fresh dispatch landing
+   * mid-round would have its new stamp overwritten by a stale snapshot.
+   */
+  async reconcileGraphDispatchStamps(params: {
+    /** Stamps at or after this instant are the caller's own and are left alone. */
+    staleBefore: string;
+    liveWindowMs?: number;
+  }): Promise<Record<string, unknown>> {
+    const { data, error } = await this.client.rpc('reconcile_graph_dispatch_stamps', {
+      p_stale_before: params.staleBefore,
+      p_live_window_ms: params.liveWindowMs ?? 600_000,
+    });
+    if (error) throw new Error(`reconcile_graph_dispatch_stamps failed: ${error.message}`);
+    return data as Record<string, unknown>;
+  }
+
   async claimGraphTask(params: {
     userId: string;
     taskId: string;

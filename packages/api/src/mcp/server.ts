@@ -1085,6 +1085,9 @@ export class MCPServer {
     if (process.env.ENABLE_GRAPH_SWEEP !== 'false') {
       const sweepMs = Number(process.env.GRAPH_SWEEP_INTERVAL_MS || 60_000);
       const graphExecutor = new GraphExecutorService(this.dataComposer);
+      // Dispatch-stamp recovery for interrupted turns runs in startServer,
+      // awaited BEFORE the listener accepts anything — see the call there for
+      // why it cannot live here (Lumen, PR #559 review).
       setInterval(() => {
         graphExecutor.sweepAll().catch((err) => logger.warn('Graph sweep tick failed:', err));
       }, sweepMs);

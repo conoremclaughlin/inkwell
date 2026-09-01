@@ -49,7 +49,7 @@ import { classifyError } from '@inklabs/shared';
 import { serializeError } from '../../utils/serialize-error.js';
 import { resolveTaskGroupForThreadKey } from '../task-group-resolver.js';
 import { getRunnerFilesDir } from '../sandbox/orchestrator.js';
-import { StudioLeaseService, isLeaseStale } from '../studio-lease.service.js';
+import { StudioLeaseService, isLeaseStale, leaseThreadKeys } from '../studio-lease.service.js';
 import { ThreadKeyService } from '../thread-key/thread-key.service.js';
 import type {
   StudioPolicy,
@@ -539,6 +539,10 @@ export class SessionService implements ISessionService {
       threadKey?: string;
       writeIntent?: WriteIntent;
       studioPolicy?: StudioPolicy;
+      /** Canonical identity UUID of the target agent (v18 S2 pass-through). */
+      sbId?: string | null;
+      /** Positively established: no identity row exists — slug is the proof. */
+      identityAbsent?: boolean;
     }
   ): Promise<StudioRoutingDecision> {
     const leases = this.getLeaseService();
@@ -554,7 +558,32 @@ export class SessionService implements ISessionService {
 
     const current = await leases.getLease(candidateStudioId, ctx.userId);
     const holder = current?.lease;
-    if (!holder || holder.threadKey === ctx.threadKey || isLeaseStale(holder)) {
+    // Same-thread membership is against the LIVE SET (v18 S2): a key that
+    // multiplexed onto this lease passes the gate exactly like the scalar
+    // first-acquirer always has.
+    if (!holder || leaseThreadKeys(holder).includes(ctx.threadKey) || isLeaseStale(holder)) {
+      return { studioId: candidateStudioId, tier, occupancyChecked: true };
+    }
+
+    // Same-holder pass-through (v18 S2 — the incident killer): sessions
+    // conflict over worktrees; threads never do. A fresh foreign-THREAD
+    // lease whose holder is a live session of the same user + canonical
+    // identity AND this thread's home (the durable participant stamp —
+    // written by origination at send time and by assignment at dispatch,
+    // spec inkmail-read-state §3a) is not contention: the reply is heading
+    // to that session, in that worktree. Pass through; acquire()'s
+    // same-session rung appends the key to the lease's multiplex set when
+    // the matched session takes the lease. Every uncertainty — unreadable
+    // stamp, unverifiable identity, terminal session — falls through to
+    // overflow, which is yesterday's behavior.
+    if (await this.holderIsThreadHome(holder, ctx)) {
+      logger.info('[StudioResolve] Same-holder pass-through — thread multiplexes onto holder', {
+        studioId: candidateStudioId,
+        tier,
+        threadKey: ctx.threadKey,
+        holderSessionId: holder.sessionId,
+        holderThreadKey: holder.threadKey,
+      });
       return { studioId: candidateStudioId, tier, occupancyChecked: true };
     }
 
@@ -658,6 +687,104 @@ export class SessionService implements ISessionService {
         occupied: { studioId: candidateStudioId, holderThreadKey: holder.threadKey },
       },
     };
+  }
+
+  /**
+   * Is this lease's holder the incoming thread's HOME session (v18 S2)?
+   * Three proofs, every uncertainty answering no:
+   *
+   * 1. IDENTITY — the holder leased as the same canonical identity
+   *    (`sbId` UUID; the display slug counts only on positively-established
+   *    identity absence, per PR #514). A legacy lease with no sbId is
+   *    unverifiable, not trusted.
+   * 2. HOME — the thread's durable participant stamp
+   *    (`inbox_thread_participants.session_id`, the ONE sanctioned writer's
+   *    field: origination stamps it at send, assignment at dispatch) names
+   *    the holder session. A missing thread row, missing stamp, or read
+   *    error is not a home.
+   * 3. ALIVE — the holder session belongs to this user and is not terminal.
+   *    Lease freshness was already established by the caller; a terminal
+   *    session's leftover lease must divert, not absorb new threads.
+   */
+  private async holderIsThreadHome(
+    holder: { sessionId: string; sbId?: string | null; agentId: string },
+    ctx: {
+      userId: string;
+      agentId: string;
+      threadKey?: string;
+      sbId?: string | null;
+      identityAbsent?: boolean;
+    }
+  ): Promise<boolean> {
+    if (!ctx.threadKey || !this.supabase) return false;
+
+    if (ctx.sbId) {
+      if (holder.sbId !== ctx.sbId) return false;
+    } else if (ctx.identityAbsent === true) {
+      if (holder.agentId !== ctx.agentId) return false;
+    } else {
+      // Identity neither resolved nor positively absent (ambiguous or
+      // unresolved) — nothing to match on. Fail closed.
+      return false;
+    }
+
+    try {
+      const { data: thread, error: threadErr } = await this.supabase
+        .from('inbox_threads')
+        .select('id')
+        .eq('user_id', ctx.userId)
+        .eq('thread_key', ctx.threadKey)
+        .maybeSingle();
+      if (threadErr || !thread) return false;
+
+      const { data: participant, error: partErr } = await this.supabase
+        .from('inbox_thread_participants')
+        .select('session_id')
+        .eq('thread_id', thread.id)
+        .eq('agent_id', ctx.agentId)
+        .maybeSingle();
+      if (partErr || participant?.session_id !== holder.sessionId) return false;
+
+      const session = await this.repository.findById(holder.sessionId);
+      if (!session || session.userId !== ctx.userId) return false;
+      if (session.endedAt || session.status === 'completed') return false;
+      return true;
+    } catch (err) {
+      logger.warn('[StudioResolve] Thread-home lookup failed — treating as not home', {
+        threadKey: ctx.threadKey,
+        holderSessionId: holder.sessionId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return false;
+    }
+  }
+
+  /**
+   * v18 S2 rung telemetry: the pr:545 incident's session match arrived
+   * through a different rung than everyone assumed (`findByThreadKey` is a
+   * studio-scoped FILTER, not a preference), and nothing recorded which one
+   * actually fired. One uniform, grep-able line per resolved delivery —
+   * regression evidence replacing assumed behavior.
+   */
+  private logRungMatch(
+    rung:
+      | 'recipient-session'
+      | 'alias'
+      | 'thread-key'
+      | 'default-session'
+      | 'general-active'
+      | 'created',
+    session: Session,
+    routing: StudioRoutingDecision,
+    threadKey?: string
+  ): void {
+    logger.info('[SessionRouting] Session rung matched', {
+      rung,
+      sessionId: session.id,
+      threadKey: threadKey ?? null,
+      studioId: session.studioId || null,
+      routingTier: routing.tier,
+    });
   }
 
   private async divertToOverflow(
@@ -1966,7 +2093,17 @@ export class SessionService implements ISessionService {
       throw new UnresolvedStudioError(routing.unresolvedNamedStudio, agentId);
     }
 
-    const leaseCtx = { userId, agentId, threadKey: options?.threadKey, writeIntent, studioPolicy };
+    const leaseCtx = {
+      userId,
+      agentId,
+      threadKey: options?.threadKey,
+      writeIntent,
+      studioPolicy,
+      // v18 S2: the occupancy gate's same-holder pass-through matches on
+      // canonical identity — resolved once, up top, like every tier.
+      sbId: identitySbId,
+      identityAbsent: identity.absent === true,
+    };
 
     // Resolve default_session_id from agent identity. When set, threadKey
     // misses route to this session instead of creating new ones.
@@ -1983,12 +2120,7 @@ export class SessionService implements ISessionService {
         // check liveness.
         const recipientSession = await this.repository.findById(authorizedRecipientSessionId);
         if (recipientSession && !recipientSession.endedAt) {
-          logger.debug('Routing to explicit recipientSession', {
-            sessionId: recipientSession.id,
-            threadKey: options?.threadKey,
-            sessionThreadKey: recipientSession.threadKey,
-            studioId: recipientSession.studioId || null,
-          });
+          this.logRungMatch('recipient-session', recipientSession, routing, options?.threadKey);
           return this.withStudioLease(recipientSession, routing, leaseCtx);
         }
       }
@@ -2048,6 +2180,7 @@ export class SessionService implements ISessionService {
             studioId: aliasMatch.studioId || null,
             aliasStudioScope: aliasStudioScope ?? null,
           });
+          this.logRungMatch('alias', aliasMatch, routing, options?.threadKey);
           return this.withStudioLease(aliasMatch, routing, leaseCtx);
         }
         logger.debug('No session found for alias', {
@@ -2079,11 +2212,7 @@ export class SessionService implements ISessionService {
           identitySbId
         );
         if (threadMatch) {
-          logger.debug('Found existing session by threadKey', {
-            sessionId: threadMatch.id,
-            threadKey: options.threadKey,
-            studioId: threadMatch.studioId || null,
-          });
+          this.logRungMatch('thread-key', threadMatch, routing, options.threadKey);
           return this.withStudioLease(threadMatch, routing, leaseCtx);
         }
 
@@ -2092,12 +2221,7 @@ export class SessionService implements ISessionService {
         if (defaultSessionId) {
           const defaultSession = await this.repository.findById(defaultSessionId);
           if (defaultSession && !defaultSession.endedAt) {
-            logger.debug('No thread match; routing to default_session_id', {
-              userId,
-              agentId,
-              threadKey: options.threadKey,
-              defaultSessionId,
-            });
+            this.logRungMatch('default-session', defaultSession, routing, options.threadKey);
             return this.withStudioLease(defaultSession, routing, leaseCtx);
           }
           // The default session ended, so we create — but its studio is still
@@ -2154,11 +2278,7 @@ export class SessionService implements ISessionService {
           : null;
 
         if (existing) {
-          logger.debug('Found existing active session', {
-            sessionId: existing.id,
-            backendSessionId: existing.backendSessionId,
-            studioId: existing.studioId || null,
-          });
+          this.logRungMatch('general-active', existing, routing, options?.threadKey);
           return this.withStudioLease(existing, routing, leaseCtx);
         }
       }
@@ -2332,6 +2452,7 @@ export class SessionService implements ISessionService {
       routingTier: routing.tier,
     });
 
+    this.logRungMatch('created', session, routing, options?.threadKey);
     return this.withStudioLease(session, routing, leaseCtx);
   }
 
@@ -2372,6 +2493,10 @@ export class SessionService implements ISessionService {
       threadKey: options.threadKey,
       writeIntent: options.writeIntent,
       studioPolicy: options.studioPolicy,
+      // v18 S2: the occupancy gate's same-holder pass-through matches on
+      // canonical identity — same resolution every tier below uses.
+      sbId: options.sbId ?? null,
+      identityAbsent: options.identityAbsent === true,
     };
 
     // Canonical identity resolved ONCE, up front, and preferred by EVERY tier

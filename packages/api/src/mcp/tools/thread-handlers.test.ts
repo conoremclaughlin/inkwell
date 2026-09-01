@@ -1099,6 +1099,64 @@ describe('handleGetThreadMessages — cold-start guard (spec §4)', () => {
   });
 });
 
+describe('handleCloseThread — lease/teardown wiring (v18 S2)', () => {
+  it('feeds the studios the lease rode into teardown as candidates (Lumen r1 P1-2)', async () => {
+    // The candidates line is one argument in one call — exactly the kind of
+    // wiring that dies silently behind green unit tests on either side of
+    // it. This drives the real handler and asserts the hand-off.
+    const { handleCloseThread } = await import('./thread-handlers');
+    const { StudioLeaseService } = await import('../../services/studio-lease.service.js');
+    const { StudioOverflowService } = await import('../../services/studio-overflow.service.js');
+    const userResolver = await import('../../services/user-resolver');
+    const { makeFakeSupabase } = await import('../../services/sessions/fake-supabase.js');
+
+    const resolveSpy = vi
+      .spyOn(userResolver, 'resolveUserOrThrow')
+      .mockResolvedValue({ user: { id: 'user-1' } } as never);
+    const releaseSpy = vi
+      .spyOn(StudioLeaseService.prototype, 'releaseByThread')
+      .mockResolvedValue({ released: 0, deferred: 0, removed: 1, studioIds: ['eph-1'] });
+    const teardownSpy = vi
+      .spyOn(StudioOverflowService.prototype, 'teardownEphemeralStudiosForThread')
+      .mockResolvedValue(0);
+
+    const tables = {
+      inbox_threads: [
+        {
+          id: 't1',
+          user_id: 'user-1',
+          thread_key: 'pr:9',
+          status: 'open',
+          created_by_agent_id: 'wren',
+        },
+      ],
+      inbox_thread_participants: [{ thread_id: 't1', agent_id: 'wren' }],
+      inbox_thread_messages: [],
+    };
+    const supabase = makeFakeSupabase(tables);
+    const dataComposer = {
+      getClient: () => supabase,
+      repositories: { studios: {} },
+    } as never;
+
+    try {
+      const result = await handleCloseThread({ threadKey: 'pr:9', agentId: 'wren' }, dataComposer);
+      const payload = JSON.parse((result.content[0] as { text: string }).text);
+      expect(payload.success).toBe(true);
+
+      expect(releaseSpy).toHaveBeenCalledWith('user-1', 'pr:9', { reason: 'thread-closed' });
+      expect(teardownSpy).toHaveBeenCalledWith('user-1', 'pr:9', {
+        reason: 'thread pr:9 closed',
+        candidateStudioIds: ['eph-1'],
+      });
+    } finally {
+      resolveSpy.mockRestore();
+      releaseSpy.mockRestore();
+      teardownSpy.mockRestore();
+    }
+  });
+});
+
 /**
  * Lumen's blocker on PR #554.
  *
