@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { relativeTime, senderName, shortPhase } from './format';
+import { durationLabel, relativeTime, senderName, shortPhase, toolCallLabel } from './format';
 
 const NOW = Date.parse('2026-08-31T20:00:00Z');
 
@@ -39,5 +39,30 @@ describe('shortPhase', () => {
     expect(shortPhase('active:implementing')).toBe('implementing');
     expect(shortPhase('investigating')).toBe('investigating');
     expect(shortPhase(null)).toBeNull();
+  });
+});
+
+describe('toolCallLabel', () => {
+  it('prefers the argument a reader wants and clips long values', () => {
+    expect(toolCallLabel('Read', { file_path: '/repo/a.ts', limit: 10 })).toBe('Read /repo/a.ts');
+    expect(toolCallLabel('Bash', { command: 'yarn   test\n--run', description: 'x' })).toBe(
+      'Bash yarn test --run'
+    );
+    expect(toolCallLabel('Grep', { pattern: 'a'.repeat(100) })).toMatch(/^Grep a{79}…$/);
+  });
+
+  it('falls back to any string argument, then to the bare name', () => {
+    expect(toolCallLabel('Custom', { count: 3, label: 'hello' })).toBe('Custom hello');
+    expect(toolCallLabel('Custom', { count: 3 })).toBe('Custom');
+    expect(toolCallLabel('Custom', null)).toBe('Custom');
+  });
+});
+
+describe('durationLabel', () => {
+  it('formats with the two most significant units', () => {
+    expect(durationLabel('2026-01-01T00:00:00Z', '2026-01-01T00:00:42Z')).toBe('42s');
+    expect(durationLabel('2026-01-01T00:00:00Z', '2026-01-01T00:03:20Z')).toBe('3m 20s');
+    expect(durationLabel('2026-01-01T00:00:00Z', '2026-01-01T02:05:00Z')).toBe('2h 5m');
+    expect(durationLabel('2026-01-01T00:00:00Z', null)).toBe('—');
   });
 });

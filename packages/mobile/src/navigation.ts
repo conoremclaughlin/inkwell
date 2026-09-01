@@ -21,6 +21,7 @@ export type TabParamList = {
 export type RootStackParamList = {
   Tabs: NavigatorScreenParams<TabParamList>;
   Thread: { threadKey: string; title?: string };
+  Session: { sessionId: string; title?: string };
   Settings: undefined;
 };
 

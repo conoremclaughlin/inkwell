@@ -107,8 +107,11 @@ export interface FleetSession {
   context: string | null;
   backend: string | null;
   model: string | null;
+  messageCount: number | null;
   startedAt: string | null;
   updatedAt: string;
+  endedAt: string | null;
+  studio: { id: string; branch: string | null; repoName: string | null } | null;
 }
 
 export interface SessionsResponse {
@@ -162,4 +165,55 @@ export interface WorkspacesResponse {
   currentWorkspaceId: string | null;
   currentWorkspaceRole: string | null;
   workspaces: Workspace[];
+}
+
+// ─── GET /api/admin/sessions/:id/conversation ───
+
+export interface SessionInfo {
+  id: string;
+  agentId: string;
+  agentName: string;
+  backend: string | null;
+  backendSessionId: string | null;
+  lifecycle: string | null;
+  currentPhase: string | null;
+  activeThreadKey: string | null;
+  startedAt: string;
+  updatedAt: string;
+  endedAt: string | null;
+}
+
+export interface SessionConversationResponse {
+  session: SessionInfo;
+  source: 'synced' | 'local' | 'cloud' | 'none';
+  backend: string;
+  transcript: { events: unknown[] } | null;
+  totalEvents: number;
+}
+
+// ─── GET /api/admin/sessions/:id/logs ───
+
+export interface SessionLogItem {
+  id: string;
+  source: 'activity_stream' | 'session_logs' | 'local_transcript' | 'synced_transcript';
+  type: string;
+  role: 'in' | 'out' | 'system';
+  content: string;
+  timestamp: string;
+}
+
+export interface SessionLogsResponse {
+  session: {
+    id: string;
+    agentId: string | null;
+    status: string | null;
+    currentPhase: string | null;
+    backend: string | null;
+    startedAt: string;
+    updatedAt: string;
+    endedAt: string | null;
+  };
+  logs: SessionLogItem[];
+  pagination: { total: number; limit: number; offset: number; hasMore: boolean };
+  sources: { cloud: number; synced: number; local: number };
 }

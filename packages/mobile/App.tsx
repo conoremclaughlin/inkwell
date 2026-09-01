@@ -14,6 +14,7 @@ import type { AuthStackParamList, RootStackParamList, TabParamList } from './src
 import { ThreadsScreen } from './src/screens/ThreadsScreen';
 import { ThreadScreen } from './src/screens/ThreadScreen';
 import { FleetScreen } from './src/screens/FleetScreen';
+import { SessionScreen } from './src/screens/SessionScreen';
 import { SettingsScreen } from './src/screens/SettingsScreen';
 import { LoginScreen } from './src/screens/LoginScreen';
 import { SignUpScreen } from './src/screens/SignUpScreen';
@@ -142,6 +143,11 @@ export default function App() {
                 name="Thread"
                 component={ThreadScreen}
                 options={({ route }) => ({ title: route.params.threadKey })}
+              />
+              <Stack.Screen
+                name="Session"
+                component={SessionScreen}
+                options={({ route }) => ({ title: route.params.title ?? 'Session' })}
               />
               <Stack.Screen name="Settings" component={SettingsScreen} />
             </Stack.Navigator>

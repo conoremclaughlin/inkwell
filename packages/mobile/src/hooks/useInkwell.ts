@@ -9,6 +9,8 @@ import { apiFetch } from '../lib/api';
 import { getWorkspaceId, setWorkspaceId } from '../lib/storage';
 import type {
   ReplyResponse,
+  SessionConversationResponse,
+  SessionLogsResponse,
   SessionsResponse,
   ThreadMessagesResponse,
   ThreadsResponse,
@@ -38,11 +40,49 @@ export function useThreadMessages(threadKey: string) {
   });
 }
 
-export function useSessions() {
+export function useSessions(includeCompleted = false) {
   return useQuery({
-    queryKey: ['sessions'],
-    queryFn: () => apiFetch<SessionsResponse>('/api/admin/sessions'),
-    refetchInterval: FLEET_POLL_MS,
+    queryKey: ['sessions', { includeCompleted }],
+    queryFn: () =>
+      apiFetch<SessionsResponse>(
+        includeCompleted ? '/api/admin/sessions?includeCompleted=true' : '/api/admin/sessions'
+      ),
+    // History changes when a session ends, not second to second.
+    refetchInterval: includeCompleted ? FLEET_POLL_MS * 3 : FLEET_POLL_MS,
+  });
+}
+
+const SESSION_DETAIL_POLL_MS = 10_000;
+
+/**
+ * Raw transcript events for one session. Polled while the session is alive
+ * (the transcript grows), left alone once it has ended. `retry: false`
+ * because a 404 here is the signal to fall back to /logs, not to keep asking.
+ */
+export function useSessionConversation(sessionId: string) {
+  return useQuery({
+    queryKey: ['session-conversation', sessionId],
+    queryFn: () =>
+      apiFetch<SessionConversationResponse>(`/api/admin/sessions/${sessionId}/conversation`),
+    retry: false,
+    refetchInterval: (query) => {
+      const lifecycle = query.state.data?.session.lifecycle;
+      return lifecycle === 'running' || lifecycle === 'idle' || lifecycle === 'compacting'
+        ? SESSION_DETAIL_POLL_MS
+        : false;
+    },
+  });
+}
+
+/** Merged logs — the fallback when no transcript is available for a session. */
+export function useSessionLogs(sessionId: string, enabled: boolean) {
+  return useQuery({
+    queryKey: ['session-logs', sessionId],
+    queryFn: () =>
+      apiFetch<SessionLogsResponse>(
+        `/api/admin/sessions/${sessionId}/logs?limit=200&offset=0&includeLocal=true`
+      ),
+    enabled,
   });
 }
 
