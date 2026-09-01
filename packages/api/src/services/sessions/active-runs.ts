@@ -166,6 +166,26 @@ export function listActiveRuns(): ActiveRun[] {
   return [...active.values()];
 }
 
+/** The registered run for a session, if any — used for the pre-turn handoff. */
+export function getActiveRun(sessionId: string): ActiveRun | undefined {
+  return active.get(sessionId);
+}
+
+/**
+ * Put a previous turn's registration back after a failed takeover.
+ *
+ * A new turn registers (overwriting the previous turn's entry) BEFORE its
+ * `running` write; if that write fails, the new turn never took ownership —
+ * the row still belongs to the previous turn, whose entry is the vehicle for
+ * its background finalization and its shutdown report. Clearing instead of
+ * restoring here recreated the original zombie (Lumen, PR #563 round 3).
+ * Unconditional on intake deliberately: the entry being restored was
+ * registered before intake closed and describes state that still holds.
+ */
+export function restoreActiveRun(run: ActiveRun): void {
+  active.set(run.sessionId, run);
+}
+
 /**
  * Is this server currently executing a turn for the session? Used by the
  * lease sweep to distinguish "long agentic turn, no heartbeat yet" from

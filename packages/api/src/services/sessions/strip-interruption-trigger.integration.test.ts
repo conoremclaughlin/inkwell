@@ -147,4 +147,86 @@ d('strip_interruption_on_running trigger', () => {
     expect(after.metadata).not.toHaveProperty('interruptedAt');
     expect(after.metadata).not.toHaveProperty('interruptedReason');
   });
+
+  /**
+   * Turn-epoch rotation (Lumen, PR #563 round 3): entering `running` takes
+   * ownership, on any write path — the DB assigns the generation, and the
+   * fenced finalize write can only land while it still holds it.
+   */
+  describe('turn epoch', () => {
+    it('is minted when a session enters running, on insert or update', async () => {
+      const born = await readSession(await insertSession({ lifecycle: 'running', metadata: {} }));
+      expect(born.metadata.turnEpoch).toEqual(expect.any(String));
+
+      const idleId = await insertSession({ lifecycle: 'idle', metadata: {} });
+      expect((await readSession(idleId)).metadata).not.toHaveProperty('turnEpoch');
+      await client
+        .from('sessions')
+        .update({ lifecycle: 'running' } as never)
+        .eq('id', idleId);
+      expect((await readSession(idleId)).metadata.turnEpoch).toEqual(expect.any(String));
+    });
+
+    it('rotates on every ENTRY to running and overrides caller candidates', async () => {
+      const id = await insertSession({ lifecycle: 'running', metadata: {} });
+      const first = (await readSession(id)).metadata.turnEpoch;
+
+      await client
+        .from('sessions')
+        .update({ lifecycle: 'idle' } as never)
+        .eq('id', id);
+      // The caller supplies a candidate; the DB's own rotation wins.
+      await client
+        .from('sessions')
+        .update({ lifecycle: 'running', metadata: { turnEpoch: 'caller-candidate' } } as never)
+        .eq('id', id);
+
+      const second = (await readSession(id)).metadata.turnEpoch;
+      expect(second).toEqual(expect.any(String));
+      expect(second).not.toBe(first);
+      expect(second).not.toBe('caller-candidate');
+    });
+
+    it('is preserved across running → running writes — same owner, same series', async () => {
+      const id = await insertSession({ lifecycle: 'running', metadata: {} });
+      const first = (await readSession(id)).metadata.turnEpoch;
+
+      await client
+        .from('sessions')
+        .update({ lifecycle: 'running', metadata: { turnEpoch: first, note: 'prompt 2' } } as never)
+        .eq('id', id);
+
+      expect((await readSession(id)).metadata.turnEpoch).toBe(first);
+    });
+
+    it('fences the real repository finalize: stale epoch matches zero rows', async () => {
+      const { SessionRepository } = await import('./session-repository');
+      const repository = new SessionRepository(client);
+
+      const id = await insertSession({ lifecycle: 'running', metadata: {} });
+      const epoch = (await readSession(id)).metadata.turnEpoch as string;
+
+      // A newer turn takes ownership: leave running, re-enter running.
+      await client
+        .from('sessions')
+        .update({ lifecycle: 'idle' } as never)
+        .eq('id', id);
+      await client
+        .from('sessions')
+        .update({ lifecycle: 'running' } as never)
+        .eq('id', id);
+
+      // The old owner's in-flight finalize must match ZERO rows.
+      const stale = await repository.updateIfTurnEpoch(id, epoch, { lifecycle: 'idle' });
+      expect(stale).toBeNull();
+      const after = await readSession(id);
+      expect(after.lifecycle).toBe('running');
+
+      // The current owner's finalize lands.
+      const current = after.metadata.turnEpoch as string;
+      const applied = await repository.updateIfTurnEpoch(id, current, { lifecycle: 'idle' });
+      expect(applied?.lifecycle).toBe('idle');
+      expect((await readSession(id)).lifecycle).toBe('idle');
+    });
+  });
 });

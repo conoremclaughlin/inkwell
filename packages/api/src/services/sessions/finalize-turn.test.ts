@@ -12,6 +12,7 @@ import {
   isSessionGoneError,
   supersedePendingFinalization,
   hasPendingFinalization,
+  TurnSupersededError,
 } from './finalize-turn.js';
 
 vi.mock('../../utils/logger.js', () => ({
@@ -194,39 +195,27 @@ describe('supersession', () => {
     expect(aFinalized).not.toHaveBeenCalled();
   });
 
-  it('abandons when the row shows another writer took the session (cross-path)', async () => {
-    const attempt = vi.fn(async () => {});
+  it('stands down when the fenced attempt reports the epoch was lost', async () => {
+    // The actual fence is the turn-epoch CAS inside the attempt: an in-flight
+    // write that raced a newer turn's `running` write matches zero rows and
+    // surfaces here. The loop must stop WITHOUT running the boundary steps —
+    // the row, the registration, and the graph claims belong to the new
+    // owner now.
     const onFinalized = vi.fn();
     const promise = retryTurnFinalization({
       sessionId: 'sess-super-3',
-      attempt,
+      attempt: vi.fn(async () => {
+        throw new TurnSupersededError('sess-super-3');
+      }),
       admit: () => true,
       onFinalized,
-      isStale: async () => true,
       sleep: async () => {},
       now: () => 0,
     });
 
     await expect(promise).resolves.toBe('superseded');
-    expect(attempt).not.toHaveBeenCalled();
     expect(onFinalized).not.toHaveBeenCalled();
-  });
-
-  it('an unreadable staleness check falls through to the attempt itself', async () => {
-    // The staleness read failing is indistinguishable from the DB flake being
-    // retried — it must not abandon a finalization the attempt could land.
-    const p = retryTurnFinalization({
-      sessionId: 'sess-super-4',
-      attempt: vi.fn(async () => {}),
-      admit: () => true,
-      onFinalized: vi.fn(),
-      isStale: async () => {
-        throw new Error('fetch failed');
-      },
-      sleep: async () => {},
-      now: () => 0,
-    });
-    await expect(p).resolves.toBe('finalized');
+    expect(hasPendingFinalization('sess-super-3')).toBe(false);
   });
 
   it('clears its pending registration on every exit', async () => {

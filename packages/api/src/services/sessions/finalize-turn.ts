@@ -38,11 +38,12 @@ export type FinalizeTurnOutcome = 'finalized' | 'refused' | 'gone' | 'exhausted'
  * favor of the new turn's, which is the same information-loss as the original
  * abandonment — but with no corruption.
  *
- * In-process is the right scope: turns for one session are serialized by the
- * processing lock in this process, and the ActiveRun registry this protects
- * is per-process by design. The cross-path case (a CLI hook resuming the
- * session through a different repository) is covered by the caller-supplied
- * `isStale` check, which reads the row before each attempt.
+ * The token is only the in-process fast path: it stops WASTED retries. The
+ * actual fence is the turn-epoch CAS inside the attempt itself — the DB
+ * rotates `metadata.turnEpoch` whenever any writer moves the session into
+ * `running`, and the fenced write matches zero rows once ownership changed,
+ * including writes already in flight when the new turn arrived. An attempt
+ * that loses the fence throws TurnSupersededError and the loop stands down.
  */
 const pendingFinalizations = new Map<string, { cancelled: boolean }>();
 
@@ -79,14 +80,6 @@ export interface FinalizeTurnRetryOptions {
   onFinalized: () => void;
   /** The session row no longer exists — retrying cannot help. */
   isGone?: (err: unknown) => boolean;
-  /**
-   * Has another writer taken the session over since this turn ended? Checked
-   * immediately before each attempt. Covers resumes that do not go through
-   * this process's supersede call (CLI lifecycle hooks write `running`
-   * through a different repository). The residual window is one round-trip —
-   * the same doctrine as the interrupt path's read-modify-write.
-   */
-  isStale?: () => Promise<boolean>;
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
   maxTotalMs?: number;
@@ -106,6 +99,17 @@ const defaultSleep = (ms: number) =>
     t.unref();
   });
 
+/**
+ * Thrown by the fenced finalize attempt when the turn-epoch CAS matched zero
+ * rows: a newer turn owns the session. Not an error to retry.
+ */
+export class TurnSupersededError extends Error {
+  constructor(sessionId: string) {
+    super(`Turn finalization superseded: ${sessionId}`);
+    this.name = 'TurnSupersededError';
+  }
+}
+
 /** SessionRepository.update throws this exact prefix when findById returns null. */
 export function isSessionGoneError(err: unknown): boolean {
   return err instanceof Error && err.message.startsWith('Session not found:');
@@ -120,7 +124,6 @@ export async function retryTurnFinalization(
     admit,
     onFinalized,
     isGone = isSessionGoneError,
-    isStale,
     sleep = defaultSleep,
     now = Date.now,
     maxTotalMs = FINALIZE_RETRY_MAX_TOTAL_MS,
@@ -174,23 +177,6 @@ export async function retryTurnFinalization(
       return done('refused');
     }
 
-    if (isStale) {
-      try {
-        if (await isStale()) {
-          logger.warn('Turn finalization superseded outside this process; abandoning', {
-            sessionId,
-            attempts: attemptNo,
-          });
-          return done('superseded');
-        }
-      } catch {
-        // An unreadable row is indistinguishable from the DB flake being
-        // retried — fall through and let the attempt itself decide.
-      }
-    }
-
-    if (token.cancelled) return done('superseded');
-
     try {
       await attempt();
       if (token.cancelled) {
@@ -206,6 +192,15 @@ export async function retryTurnFinalization(
       logger.info('Turn finalization succeeded on retry', { sessionId, attempts: attemptNo });
       return done('finalized');
     } catch (err) {
+      if (err instanceof TurnSupersededError) {
+        // The fenced write matched zero rows: another writer rotated the
+        // epoch. That writer owns the row AND the registry entry now.
+        logger.warn('Turn finalization fenced out by a newer turn; abandoning', {
+          sessionId,
+          attempts: attemptNo,
+        });
+        return done('superseded');
+      }
       if (isGone(err)) {
         logger.error('Turn finalization abandoned; session row is gone', {
           sessionId,

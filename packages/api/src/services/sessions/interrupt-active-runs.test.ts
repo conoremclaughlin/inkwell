@@ -111,10 +111,26 @@ describe('registry brackets the persisted running state', () => {
 
   it('registers before the row is written as running', () => {
     const register = at('registerActiveRun({');
-    const running = at("lifecycle: 'running' }");
+    const running = at("lifecycle: 'running',");
     expect(register).toBeGreaterThan(-1);
     expect(running).toBeGreaterThan(-1);
     expect(register).toBeLessThan(running);
+  });
+
+  // Round 3 (Lumen): superseding BEFORE the running write landed meant a
+  // failed takeover left the row owned by a turn whose recovery was already
+  // cancelled. Ownership transfers only with the durable write.
+  it('supersedes the previous finalization only after the running write', () => {
+    const running = at("lifecycle: 'running',");
+    const supersede = at('supersedePendingFinalization(session.id)');
+    expect(supersede).toBeGreaterThan(running);
+  });
+
+  it('restores the previous registration when the takeover write fails', () => {
+    const catchAt = at('catch (runningWriteError)');
+    const supersede = at('supersedePendingFinalization(session.id)');
+    expect(catchAt).toBeGreaterThan(-1);
+    expect(source.slice(catchAt, supersede)).toContain('restoreActiveRun(previousRun)');
   });
 
   it('clears only after the failed write on the runner-throw path', () => {

@@ -219,25 +219,103 @@ describe('SessionService', () => {
    * error and the throw rode up through the trigger handler — the sender was
    * told "Trigger to lumen failed" about a reply that had been delivered 28
    * minutes earlier, and the unfinalized run sat registered for 14 hours.
-   * These pin the repaired contract: bookkeeping failure is not turn failure.
+   *
+   * Round 3 (Lumen): these run against a STATEFUL repository — a real row
+   * whose metadata merges like the production RMW, and a fenced write that
+   * enforces the turn epoch — because the round-2 state-free mocks hid a
+   * self-defeating staleness check that made the whole retry dead code.
    */
   describe('finalization failure is bookkeeping, not turn failure', () => {
-    const failIdleWrites = (times = Number.POSITIVE_INFINITY) => {
-      let remaining = times;
-      vi.mocked(mockRepository.update).mockImplementation(async (id, updates) => {
-        if ((updates as { lifecycle?: string }).lifecycle === 'idle' && remaining > 0) {
-          remaining -= 1;
-          throw new Error('An unexpected error occurred');
-        }
-        return createMockSession({ id, ...(updates as object) });
-      });
-    };
+    function makeStatefulRepo(initial: Partial<Session> = {}) {
+      let row: Session | null = createMockSession({ metadata: {}, ...initial });
+      const fail = { finalize: 0, running: 0 };
+      // One-shot gate: holds exactly the NEXT fenced write open mid-flight,
+      // between its admission and its epoch evaluation — the Postgres-side
+      // "predicate evaluated at write time" window.
+      let gateOnce: Promise<void> | null = null;
+
+      const merge = (updates: Record<string, unknown>): Session => {
+        const metadata = {
+          ...((row!.metadata as Record<string, unknown>) ?? {}),
+          ...((updates.metadata as Record<string, unknown>) ?? {}),
+        };
+        row = { ...row!, ...updates, metadata } as Session;
+        return row;
+      };
+
+      const repo = {
+        findById: vi.fn(async () => row),
+        findByUserAndAgent: vi.fn(async () => row),
+        findByUser: vi.fn(async () => (row ? [row] : [])),
+        create: vi.fn(async () => row),
+        update: vi.fn(async (id: string, updates: Record<string, unknown>) => {
+          if (!row) throw new Error(`Session not found: ${id}`);
+          if (updates.lifecycle === 'running' && fail.running > 0) {
+            fail.running -= 1;
+            throw new Error('An unexpected error occurred');
+          }
+          return merge(updates);
+        }),
+        updateIfTurnEpoch: vi.fn(
+          async (id: string, epoch: string, updates: Record<string, unknown>) => {
+            if (!row) throw new Error(`Session not found: ${id}`);
+            if (fail.finalize > 0) {
+              fail.finalize -= 1;
+              throw new Error('An unexpected error occurred');
+            }
+            if (gateOnce) {
+              const gate = gateOnce;
+              gateOnce = null;
+              await gate;
+            }
+            if (!row) throw new Error(`Session not found: ${id}`);
+            if ((row.metadata as Record<string, unknown>).turnEpoch !== epoch) return null;
+            return merge(updates);
+          }
+        ),
+        updateTokenUsage: vi.fn(async () => undefined),
+        markCompacted: vi.fn(async () => undefined),
+        tryAcquireCompactionLock: vi.fn(async () => true),
+        releaseCompactionLock: vi.fn(async () => undefined),
+      };
+
+      return {
+        repo: repo as unknown as ISessionRepository,
+        spies: repo,
+        fail,
+        get row() {
+          return row;
+        },
+        deleteRow: () => {
+          row = null;
+        },
+        holdNextFencedWrite: (gate: Promise<void>) => {
+          gateOnce = gate;
+        },
+      };
+    }
+
+    const makeStatefulService = (repo: ISessionRepository) =>
+      new SessionService(
+        repo,
+        mockContextBuilder,
+        mockClaudeRunner,
+        mockActivityStream,
+        {
+          defaultWorkingDirectory: '/test',
+          mcpConfigPath: '/test/.mcp.json',
+          compactionThreshold: 150000,
+        },
+        mockCodexRunner,
+        undefined,
+        undefined,
+        mockInkRunner
+      );
 
     beforeEach(() => {
       vi.useFakeTimers();
       resetActiveRuns();
       resetPendingFinalizations();
-      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(createMockSession());
     });
 
     afterEach(async () => {
@@ -250,9 +328,11 @@ describe('SessionService', () => {
     });
 
     it('reports the turn outcome the recipient experienced, not the lost write', async () => {
-      failIdleWrites();
+      const db = makeStatefulRepo();
+      db.fail.finalize = Number.POSITIVE_INFINITY;
+      const service = makeStatefulService(db.repo);
 
-      const result = await sessionService.handleMessage(createMockRequest());
+      const result = await service.handleMessage(createMockRequest());
 
       // This is the exact assertion pr:558 failed: success:false here is what
       // became the false "Trigger to lumen failed" notice.
@@ -262,40 +342,46 @@ describe('SessionService', () => {
     });
 
     it('keeps the run registered (settled) while the write has not landed', async () => {
-      failIdleWrites();
+      const db = makeStatefulRepo();
+      db.fail.finalize = Number.POSITIVE_INFINITY;
+      const service = makeStatefulService(db.repo);
 
-      await sessionService.handleMessage(createMockRequest());
+      await service.handleMessage(createMockRequest());
 
       expect(activeRunCount()).toBe(1);
       // Settled: shutdown must say "finished, unrecorded", never "still running".
       expect(listActiveRuns()[0]?.runnerSettledAt).toEqual(expect.any(Number));
     });
 
-    it('finalizes in the background once the DB recovers, then clears the run', async () => {
-      // Inline write fails, first retry (t+5s) fails, second retry (t+15s) lands.
-      failIdleWrites(2);
+    /**
+     * The round-3 P1 regression (Lumen): after a failed inline finalize, the
+     * turn's OWN row necessarily still says `running`. A staleness check on
+     * lifecycle classified the owner as superseded and never retried — the
+     * pr:558 fix was dead code behind state-free mocks. The fence is the
+     * turn epoch, which is still OURS here, so the retry MUST write.
+     */
+    it('the retry fires against its own still-running row and finalizes it', async () => {
+      const db = makeStatefulRepo();
+      db.fail.finalize = 1; // inline attempt only
+      const service = makeStatefulService(db.repo);
 
-      await sessionService.handleMessage(createMockRequest());
+      await service.handleMessage(createMockRequest());
+      expect(db.row?.lifecycle).toBe('running');
       expect(activeRunCount()).toBe(1);
 
-      await vi.advanceTimersByTimeAsync(20_000);
+      await vi.advanceTimersByTimeAsync(10_000);
 
+      expect(db.row?.lifecycle).toBe('idle');
       expect(activeRunCount()).toBe(0);
-      const idleWrites = vi
-        .mocked(mockRepository.update)
-        .mock.calls.filter(([, u]) => (u as { lifecycle?: string }).lifecycle === 'idle');
-      expect(idleWrites).toHaveLength(3);
     });
 
     it('abandons and clears when the session row is gone', async () => {
-      vi.mocked(mockRepository.update).mockImplementation(async (id, updates) => {
-        if ((updates as { lifecycle?: string }).lifecycle === 'idle') {
-          throw new Error(`Session not found: ${id}`);
-        }
-        return createMockSession({ id, ...(updates as object) });
-      });
+      const db = makeStatefulRepo();
+      db.fail.finalize = 1;
+      const service = makeStatefulService(db.repo);
 
-      await sessionService.handleMessage(createMockRequest());
+      await service.handleMessage(createMockRequest());
+      db.deleteRow();
       await vi.advanceTimersByTimeAsync(10_000);
 
       // Nothing to finalize and nothing a shutdown report could say about it.
@@ -303,9 +389,11 @@ describe('SessionService', () => {
     });
 
     it('a run that never finalizes stays registered for the shutdown report', async () => {
-      failIdleWrites();
+      const db = makeStatefulRepo();
+      db.fail.finalize = Number.POSITIVE_INFINITY;
+      const service = makeStatefulService(db.repo);
 
-      await sessionService.handleMessage(createMockRequest());
+      await service.handleMessage(createMockRequest());
       await vi.advanceTimersByTimeAsync(31 * 60_000);
 
       // Exhausted, not cleared: the row still says running, and the registry
@@ -314,33 +402,75 @@ describe('SessionService', () => {
     });
 
     /**
-     * The retry loop outlives the processing lock (Lumen, PR #563 P1): turn B
-     * can start while turn A's finalization is still pending. A's late write
-     * must not overwrite B's bookkeeping, clear B's registration, or release
-     * B's boundary — the new turn disowns it at the pre-turn write.
+     * Interleaving X (Lumen round 3): B supersedes A and B's `running` write
+     * then FAILS. Ownership never transferred — A's recovery must survive.
+     * The ordered handoff (supersede only after the running write lands, and
+     * restore A's registration on failure) is what makes this hold.
      */
-    it("a new turn supersedes the previous turn's pending finalization", async () => {
-      // Only turn A's inline finalize fails; anything after succeeds.
-      failIdleWrites(1);
+    it("a failed takeover leaves the previous turn's recovery intact", async () => {
+      const db = makeStatefulRepo();
+      db.fail.finalize = 1; // A's inline finalize fails; its retry is pending
+      const service = makeStatefulService(db.repo);
 
-      await sessionService.handleMessage(createMockRequest()); // turn A — retry pending
+      await service.handleMessage(createMockRequest()); // turn A
       expect(activeRunCount()).toBe(1);
+      const aSettledAt = listActiveRuns()[0]?.runnerSettledAt;
+      expect(aSettledAt).toEqual(expect.any(Number));
 
-      await sessionService.handleMessage(createMockRequest()); // turn B — finalizes inline
+      db.fail.running = 1; // turn B's running write fails
+      const b = await service.handleMessage(createMockRequest());
+      expect(b.success).toBe(false);
+
+      // A's registration is back (settled run, not B's fresh one) …
+      expect(activeRunCount()).toBe(1);
+      expect(listActiveRuns()[0]?.runnerSettledAt).toBe(aSettledAt);
+
+      // … and A's pending finalization was NOT superseded: it lands.
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(db.row?.lifecycle).toBe('idle');
       expect(activeRunCount()).toBe(0);
+    });
 
-      const idleWritesBefore = vi
-        .mocked(mockRepository.update)
-        .mock.calls.filter(([, u]) => (u as { lifecycle?: string }).lifecycle === 'idle').length;
+    /**
+     * Interleaving Y (Lumen round 3): A's fenced write is already in flight
+     * when B takes ownership. No token can stop a write on the wire — the
+     * epoch CAS evaluated at write time is what makes it match zero rows.
+     */
+    it("an in-flight finalize cannot clobber the new turn's state", async () => {
+      const db = makeStatefulRepo();
+      db.fail.finalize = 1; // A's inline attempt fails; retry pending
+      const service = makeStatefulService(db.repo);
 
-      // A's retry would have fired at +5s. Superseded, it must not write.
-      await vi.advanceTimersByTimeAsync(31 * 60_000);
+      await service.handleMessage(createMockRequest()); // turn A
 
-      const idleWritesAfter = vi
-        .mocked(mockRepository.update)
-        .mock.calls.filter(([, u]) => (u as { lifecycle?: string }).lifecycle === 'idle').length;
-      expect(idleWritesAfter).toBe(idleWritesBefore);
-      // And it must not have deleted B's (already-cleared) state either way.
+      // Park A's retry attempt mid-flight, after admission, before the
+      // epoch evaluates.
+      let releaseInFlight!: () => void;
+      db.holdNextFencedWrite(
+        new Promise<void>((resolve) => {
+          releaseInFlight = resolve;
+        })
+      );
+      await vi.advanceTimersByTimeAsync(6_000); // retry enters, parks on the gate
+
+      // Turn B runs to completion while A's write is on the wire.
+      const b = await service.handleMessage(createMockRequest());
+      expect(b.success).toBe(true);
+      expect(db.row?.lifecycle).toBe('idle');
+      expect(activeRunCount()).toBe(0);
+      const epochAfterB = (db.row?.metadata as Record<string, unknown>).turnEpoch;
+
+      // A's write lands — against B's epoch. Zero rows; nothing changes.
+      releaseInFlight();
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      expect(db.row?.lifecycle).toBe('idle');
+      expect((db.row?.metadata as Record<string, unknown>).turnEpoch).toBe(epochAfterB);
+      // Call order: A-inline (failed), A-retry (parked — this one), B-inline.
+      // Results index by call START, so A's in-flight write is slot 1, and it
+      // must have resolved null: zero rows, fence held.
+      const fencedResults = (db.spies.updateIfTurnEpoch as ReturnType<typeof vi.fn>).mock.results;
+      await expect(fencedResults[1]!.value).resolves.toBeNull();
       expect(activeRunCount()).toBe(0);
     });
   });

@@ -484,16 +484,16 @@ export class SessionRepository implements ISessionRepository {
     return mapDbToSession(data);
   }
 
-  async update(
-    id: string,
+  /**
+   * Field mapping + metadata merge shared by update() and updateIfTurnEpoch().
+   * `metadata` is a single JSONB column rebuilt from `current`, which is why
+   * every terminal write needs the turn-epoch fence below: a stale rebuild
+   * replayed late would erase a newer turn's keys.
+   */
+  private buildUpdatePayload(
+    current: Session,
     updates: Omit<Partial<Session>, 'studioId'> & { studioId?: string | null }
-  ): Promise<Session> {
-    // First fetch current session to merge metadata
-    const current = await this.findById(id);
-    if (!current) {
-      throw new Error(`Session not found: ${id}`);
-    }
-
+  ): DbSessionUpdate {
     const dbUpdates: DbSessionUpdate = {};
 
     if (updates.backendSessionId !== undefined) {
@@ -587,6 +587,21 @@ export class SessionRepository implements ISessionRepository {
 
     dbUpdates.metadata = newMetadata;
 
+    return dbUpdates;
+  }
+
+  async update(
+    id: string,
+    updates: Omit<Partial<Session>, 'studioId'> & { studioId?: string | null }
+  ): Promise<Session> {
+    // First fetch current session to merge metadata
+    const current = await this.findById(id);
+    if (!current) {
+      throw new Error(`Session not found: ${id}`);
+    }
+
+    const dbUpdates = this.buildUpdatePayload(current, updates);
+
     const { data, error } = await this.supabase
       .from('sessions')
       .update(dbUpdates)
@@ -600,6 +615,53 @@ export class SessionRepository implements ISessionRepository {
     }
 
     return mapDbToSession(data);
+  }
+
+  /**
+   * The turn-epoch fenced terminal write (Lumen, PR #563 round 3).
+   *
+   * `metadata.turnEpoch` is rotated by the session_running_write DB trigger
+   * every time a session ENTERS `running`, on every write path. Fencing the
+   * update on the epoch this turn captured from its own `running` write means
+   * the predicate is evaluated atomically with the update by Postgres: a
+   * finalize that raced a newer turn's `running` write matches zero rows
+   * instead of clobbering the new turn's state — including writes already in
+   * flight when ownership changed, which no client-side token can stop.
+   *
+   * Returns null when ownership was lost; throws `Session not found:` when
+   * the row is gone (same contract as update(), so isSessionGoneError works).
+   */
+  async updateIfTurnEpoch(
+    id: string,
+    epoch: string,
+    updates: Omit<Partial<Session>, 'studioId'> & { studioId?: string | null }
+  ): Promise<Session | null> {
+    const current = await this.findById(id);
+    if (!current) {
+      throw new Error(`Session not found: ${id}`);
+    }
+    if ((current.metadata as Record<string, unknown> | undefined)?.turnEpoch !== epoch) {
+      return null;
+    }
+
+    const dbUpdates = this.buildUpdatePayload(current, updates);
+
+    const { data, error } = await this.supabase
+      .from('sessions')
+      .update(dbUpdates)
+      .eq('id', id)
+      .eq('metadata->>turnEpoch', epoch)
+      .select();
+
+    if (error) {
+      logger.error('Error applying fenced session update', { id, epoch, error });
+      throw error;
+    }
+    if (!data || data.length === 0) {
+      // Lost between the read and the write — the CAS said no.
+      return null;
+    }
+    return mapDbToSession(data[0]);
   }
 
   async updateTokenUsage(

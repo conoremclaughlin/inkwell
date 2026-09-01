@@ -518,6 +518,20 @@ export interface ISessionRepository {
     updates: Omit<Partial<Session>, 'studioId'> & { studioId?: string | null }
   ): Promise<Session>;
 
+  /**
+   * Turn-epoch fenced terminal write: applies `updates` only while
+   * `metadata.turnEpoch` still equals `epoch` (rotated by the DB whenever a
+   * session enters `running`). Returns null when ownership was lost; throws
+   * `Session not found:` when the row is gone. Optional so legacy mocks keep
+   * working — the real repository always provides it, and the service falls
+   * back to the unfenced update() only for epoch-less legacy turns.
+   */
+  updateIfTurnEpoch?(
+    id: string,
+    epoch: string,
+    updates: Omit<Partial<Session>, 'studioId'> & { studioId?: string | null }
+  ): Promise<Session | null>;
+
   updateTokenUsage(
     id: string,
     usage: {

@@ -38,11 +38,17 @@ import { CodexRunner } from './codex-runner.js';
 import {
   registerActiveRun,
   clearActiveRun,
+  getActiveRun,
+  restoreActiveRun,
   markRunnerSettled,
   trackStateWrite,
   admitStateWrite,
 } from './active-runs.js';
-import { retryTurnFinalization, supersedePendingFinalization } from './finalize-turn.js';
+import {
+  retryTurnFinalization,
+  supersedePendingFinalization,
+  TurnSupersededError,
+} from './finalize-turn.js';
 import { GeminiRunner } from './gemini-runner.js';
 import { AntigravityRunner } from './antigravity-runner.js';
 import { InkRunner } from './ink-runner.js';
@@ -1562,6 +1568,12 @@ export class SessionService implements ISessionService {
     // running" — anything narrower leaves a window where a shutdown sees no
     // active run and walks away from a row that says `running` forever, which
     // is the exact zombie this is here to prevent (Lumen, PR #490 — P1).
+    // Ordered handoff (Lumen, PR #563 round 3): capture whatever registration
+    // a previous turn left behind BEFORE overwriting it. If this turn's
+    // `running` write fails, ownership never transferred — the previous
+    // entry (and the recovery it anchors) must come back.
+    const previousRun = getActiveRun(session.id);
+
     const admitted = registerActiveRun({
       sessionId: session.id,
       userId,
@@ -1580,24 +1592,41 @@ export class SessionService implements ISessionService {
       throw new Error('Server is shutting down; not starting a new backend turn.');
     }
 
-    // This turn owns the session's bookkeeping from here: any background
-    // finalization a PREVIOUS turn still has retrying must stop, or its late
-    // write would overwrite this turn's state, clear this turn's registration,
-    // and release this turn's graph claims (Lumen, PR #563 P1).
-    supersedePendingFinalization(session.id);
-
     // Mark session as running before backend turn. Tracked so the shutdown
     // drain can wait for it: if this write is still in flight when the
     // interruption runs, it would land afterwards and restore `running`.
+    //
+    // The write carries a CANDIDATE turn epoch for environments without the
+    // session_running_write DB trigger; where the trigger exists it rotates
+    // its own on entering `running`, and the RETURNED row is authoritative
+    // either way. This epoch is what fences every later finalize write.
+    let turnEpoch: string | undefined;
     try {
-      await trackStateWrite(this.repository.update(session.id, { lifecycle: 'running' }));
+      const runningSession = await trackStateWrite(
+        this.repository.update(session.id, {
+          lifecycle: 'running',
+          metadata: { turnEpoch: randomUUID() },
+        })
+      );
+      turnEpoch = (runningSession.metadata as Record<string, unknown> | undefined)?.turnEpoch as
+        | string
+        | undefined;
     } catch (runningWriteError) {
-      // The row is not running, so the registration describes nothing. Leaving
-      // it would make shutdown post an interruption notice for a turn that
-      // never started.
-      clearActiveRun(session.id);
+      // This turn never took ownership: the row still belongs to whatever
+      // came before. Restore the previous registration — its background
+      // finalization and shutdown report are still the live recovery — or
+      // clear ours if there was nothing to hand back (Lumen, PR #563 round
+      // 3: supersede-then-fail left the row owned by a turn whose recovery
+      // was already cancelled).
+      if (previousRun) restoreActiveRun(previousRun);
+      else clearActiveRun(session.id);
       throw runningWriteError;
     }
+
+    // Ownership durably transferred — the row carries a fresh epoch, so the
+    // previous turn's fenced finalize can no longer land. Superseding its
+    // loop now only stops wasted retries; the epoch is the actual fence.
+    supersedePendingFinalization(session.id);
 
     // Media flows to backends as file paths, not inline base64. Channel
     // listeners download attachments to ~/.ink/files/<channel>/; the
@@ -1768,8 +1797,20 @@ export class SessionService implements ISessionService {
       lifecycle: postRunLifecycle as Session['lifecycle'],
       cliAttached: false,
     };
-    const performFinalizeWrite = () =>
-      trackStateWrite(this.repository.update(session.id, finalizeUpdates));
+    const performFinalizeWrite = async () => {
+      const fenced = this.repository.updateIfTurnEpoch?.bind(this.repository);
+      if (fenced && turnEpoch) {
+        const updated = await trackStateWrite(fenced(session.id, turnEpoch, finalizeUpdates));
+        if (!updated) throw new TurnSupersededError(session.id);
+        return;
+      }
+      // Epoch-less legacy turn (row written before the trigger deployed) or a
+      // repository without the fenced write. Unfenced, and loud about it.
+      logger.warn('Turn finalize falling back to unfenced write (no turn epoch)', {
+        sessionId: session.id,
+      });
+      await trackStateWrite(this.repository.update(session.id, finalizeUpdates));
+    };
 
     // Run-boundary steps. Invoked ONLY after the terminal write durably
     // persisted — inline on the fast path, from the retry loop otherwise.
@@ -1831,40 +1872,42 @@ export class SessionService implements ISessionService {
         await performFinalizeWrite();
         finalized = true;
       } catch (finalizeError) {
-        // A failed terminal write is a BOOKKEEPING failure, not a turn
-        // failure. The turn already ran; any reply it produced is already
-        // delivered or already routed below. Throwing here reported exactly
-        // that lie on pr:558: the sender was told "Trigger to lumen failed"
-        // about an LGTM that had landed 28 minutes earlier, and the
-        // unfinalized run then sat registered for 14 hours. The write is
-        // idempotent, so it retries in the background — for longer than the
-        // DB flake that caused it (~24 min observed) — while this turn
-        // reports the outcome the recipient actually experienced.
-        logger.error(
-          'Post-run finalization failed; turn outcome stands, retrying bookkeeping in background',
-          {
+        if (finalizeError instanceof TurnSupersededError) {
+          // Fenced out at the inline attempt: a newer writer already rotated
+          // the epoch and owns the row and the registry entry. Nothing to
+          // retry, nothing to clear — those belong to the new owner.
+          logger.warn('Inline turn finalize fenced out by a newer owner', {
             sessionId: session.id,
-            wouldHaveBeen: postRunLifecycle,
-            error: finalizeError instanceof Error ? finalizeError.message : String(finalizeError),
-          }
-        );
-        void retryTurnFinalization({
-          sessionId: session.id,
-          attempt: performFinalizeWrite,
-          admit: () => admitStateWrite(session.id),
-          onFinalized: onTurnFinalized,
-          // Cross-path supersede guard: a CLI hook can move this session back
-          // to `running` without passing through this process's supersede
-          // call. A row that reads running belongs to a newer turn.
-          isStale: async () => {
-            const row = await this.repository.findById(session.id);
-            return row?.lifecycle === 'running';
-          },
-        }).then((outcome) => {
-          // A gone row has nothing to finalize and nothing a shutdown report
-          // could truthfully say about it.
-          if (outcome === 'gone') clearActiveRun(session.id);
-        });
+          });
+        } else {
+          // A failed terminal write is a BOOKKEEPING failure, not a turn
+          // failure. The turn already ran; any reply it produced is already
+          // delivered or already routed below. Throwing here reported exactly
+          // that lie on pr:558: the sender was told "Trigger to lumen failed"
+          // about an LGTM that had landed 28 minutes earlier, and the
+          // unfinalized run then sat registered for 14 hours. The write is
+          // idempotent, so it retries in the background — for longer than the
+          // DB flake that caused it (~24 min observed) — while this turn
+          // reports the outcome the recipient actually experienced.
+          logger.error(
+            'Post-run finalization failed; turn outcome stands, retrying bookkeeping in background',
+            {
+              sessionId: session.id,
+              wouldHaveBeen: postRunLifecycle,
+              error: finalizeError instanceof Error ? finalizeError.message : String(finalizeError),
+            }
+          );
+          void retryTurnFinalization({
+            sessionId: session.id,
+            attempt: performFinalizeWrite,
+            admit: () => admitStateWrite(session.id),
+            onFinalized: onTurnFinalized,
+          }).then((outcome) => {
+            // A gone row has nothing to finalize and nothing a shutdown
+            // report could truthfully say about it.
+            if (outcome === 'gone') clearActiveRun(session.id);
+          });
+        }
       }
     }
 
