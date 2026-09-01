@@ -42,7 +42,7 @@ import {
   trackStateWrite,
   admitStateWrite,
 } from './active-runs.js';
-import { retryTurnFinalization } from './finalize-turn.js';
+import { retryTurnFinalization, supersedePendingFinalization } from './finalize-turn.js';
 import { GeminiRunner } from './gemini-runner.js';
 import { AntigravityRunner } from './antigravity-runner.js';
 import { InkRunner } from './ink-runner.js';
@@ -1580,6 +1580,12 @@ export class SessionService implements ISessionService {
       throw new Error('Server is shutting down; not starting a new backend turn.');
     }
 
+    // This turn owns the session's bookkeeping from here: any background
+    // finalization a PREVIOUS turn still has retrying must stop, or its late
+    // write would overwrite this turn's state, clear this turn's registration,
+    // and release this turn's graph claims (Lumen, PR #563 P1).
+    supersedePendingFinalization(session.id);
+
     // Mark session as running before backend turn. Tracked so the shutdown
     // drain can wait for it: if this write is still in flight when the
     // interruption runs, it would land afterwards and restore `running`.
@@ -1623,9 +1629,12 @@ export class SessionService implements ISessionService {
       // The child has exited; only bookkeeping remains. NOT a clear — the run
       // stays registered until the terminal write lands — but from here a
       // shutdown report must say "finished, unrecorded", never "still running".
-      markRunnerSettled(session.id);
+      // The intended outcome rides along: a success:false result means the
+      // unrecorded terminal state is `failed`, and shutdown must say so
+      // rather than stamping a quiet success (Lumen, PR #563 P1).
+      markRunnerSettled(session.id, result.success ? 'succeeded' : 'failed');
     } catch (runnerError) {
-      markRunnerSettled(session.id);
+      markRunnerSettled(session.id, 'failed');
       // Runner threw (spawn failure, capacity error, etc.) — mark session as
       // failed, unless shutdown already owns this session's state and would
       // have its interruption record overwritten by this write.
@@ -1844,6 +1853,13 @@ export class SessionService implements ISessionService {
           attempt: performFinalizeWrite,
           admit: () => admitStateWrite(session.id),
           onFinalized: onTurnFinalized,
+          // Cross-path supersede guard: a CLI hook can move this session back
+          // to `running` without passing through this process's supersede
+          // call. A row that reads running belongs to a newer turn.
+          isStale: async () => {
+            const row = await this.repository.findById(session.id);
+            return row?.lifecycle === 'running';
+          },
         }).then((outcome) => {
           // A gone row has nothing to finalize and nothing a shutdown report
           // could truthfully say about it.

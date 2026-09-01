@@ -7,7 +7,12 @@
  */
 
 import { describe, it, expect, vi } from 'vitest';
-import { retryTurnFinalization, isSessionGoneError } from './finalize-turn.js';
+import {
+  retryTurnFinalization,
+  isSessionGoneError,
+  supersedePendingFinalization,
+  hasPendingFinalization,
+} from './finalize-turn.js';
 
 vi.mock('../../utils/logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -117,6 +122,123 @@ describe('retryTurnFinalization', () => {
     await expect(promise).resolves.toBe('gone');
     expect(attempt).toHaveBeenCalledTimes(1);
     expect(onFinalized).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * The retry loop outlives the session processing lock, so a NEW turn for the
+ * same session must be able to disown it — otherwise the old turn's late
+ * write overwrites the new turn's state, clears its registration, and
+ * releases its graph claims (Lumen, PR #563 P1).
+ */
+describe('supersession', () => {
+  it('stops as superseded when a new turn disowns the pending loop', async () => {
+    let sleeps = 0;
+    const onFinalized = vi.fn();
+    const promise = retryTurnFinalization({
+      sessionId: 'sess-super-1',
+      attempt: vi.fn(async () => {
+        throw new Error('An unexpected error occurred');
+      }),
+      admit: () => true,
+      onFinalized,
+      sleep: async () => {
+        sleeps += 1;
+        // The new turn arrives while the loop waits out its second delay.
+        if (sleeps === 2) supersedePendingFinalization('sess-super-1');
+      },
+      now: () => 0,
+    });
+
+    await expect(promise).resolves.toBe('superseded');
+    expect(onFinalized).not.toHaveBeenCalled();
+    expect(hasPendingFinalization('sess-super-1')).toBe(false);
+  });
+
+  it('a newer loop for the same session supersedes the older one', async () => {
+    const aFinalized = vi.fn();
+    const bFinalized = vi.fn();
+
+    let releaseA!: () => void;
+    const a = retryTurnFinalization({
+      sessionId: 'sess-super-2',
+      attempt: async () => {
+        throw new Error('An unexpected error occurred');
+      },
+      admit: () => true,
+      onFinalized: aFinalized,
+      // Parked in its first sleep until we release it.
+      sleep: () =>
+        new Promise<void>((resolve) => {
+          releaseA = resolve;
+        }),
+      now: () => 0,
+    });
+    await Promise.resolve(); // let A reach its sleep
+
+    const b = retryTurnFinalization({
+      sessionId: 'sess-super-2',
+      attempt: async () => {},
+      admit: () => true,
+      onFinalized: bFinalized,
+      sleep: async () => {},
+      now: () => 0,
+    });
+
+    await expect(b).resolves.toBe('finalized');
+    expect(bFinalized).toHaveBeenCalledTimes(1);
+
+    releaseA();
+    await expect(a).resolves.toBe('superseded');
+    // A's boundary steps never run — they would clear B's registration.
+    expect(aFinalized).not.toHaveBeenCalled();
+  });
+
+  it('abandons when the row shows another writer took the session (cross-path)', async () => {
+    const attempt = vi.fn(async () => {});
+    const onFinalized = vi.fn();
+    const promise = retryTurnFinalization({
+      sessionId: 'sess-super-3',
+      attempt,
+      admit: () => true,
+      onFinalized,
+      isStale: async () => true,
+      sleep: async () => {},
+      now: () => 0,
+    });
+
+    await expect(promise).resolves.toBe('superseded');
+    expect(attempt).not.toHaveBeenCalled();
+    expect(onFinalized).not.toHaveBeenCalled();
+  });
+
+  it('an unreadable staleness check falls through to the attempt itself', async () => {
+    // The staleness read failing is indistinguishable from the DB flake being
+    // retried — it must not abandon a finalization the attempt could land.
+    const p = retryTurnFinalization({
+      sessionId: 'sess-super-4',
+      attempt: vi.fn(async () => {}),
+      admit: () => true,
+      onFinalized: vi.fn(),
+      isStale: async () => {
+        throw new Error('fetch failed');
+      },
+      sleep: async () => {},
+      now: () => 0,
+    });
+    await expect(p).resolves.toBe('finalized');
+  });
+
+  it('clears its pending registration on every exit', async () => {
+    await retryTurnFinalization({
+      sessionId: 'sess-super-5',
+      attempt: async () => {},
+      admit: () => true,
+      onFinalized: vi.fn(),
+      sleep: async () => {},
+      now: () => 0,
+    });
+    expect(hasPendingFinalization('sess-super-5')).toBe(false);
   });
 });
 

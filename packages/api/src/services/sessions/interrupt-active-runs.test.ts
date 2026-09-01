@@ -70,15 +70,22 @@ describe('active-runs registry', () => {
   it('marks a registered run as runner-settled without clearing it', () => {
     registerActiveRun(run());
     expect(listActiveRuns()[0]?.runnerSettledAt).toBeUndefined();
-    markRunnerSettled('sess-1');
+    markRunnerSettled('sess-1', 'succeeded');
     // Settling is bookkeeping state, not a clear — the run must survive until
     // its terminal write persists, or shutdown never reports it.
     expect(activeRunCount()).toBe(1);
     expect(listActiveRuns()[0]?.runnerSettledAt).toEqual(expect.any(Number));
+    expect(listActiveRuns()[0]?.settledOutcome).toBe('succeeded');
+  });
+
+  it('records a failed settle outcome — a settled run is not necessarily a success', () => {
+    registerActiveRun(run());
+    markRunnerSettled('sess-1', 'failed');
+    expect(listActiveRuns()[0]?.settledOutcome).toBe('failed');
   });
 
   it('ignores a settle for a session it never saw', () => {
-    expect(() => markRunnerSettled('nope')).not.toThrow();
+    expect(() => markRunnerSettled('nope', 'succeeded')).not.toThrow();
     expect(activeRunCount()).toBe(0);
   });
 });
@@ -865,7 +872,8 @@ describe('interruptActiveRuns', () => {
  * had already happened. A settled runner changes what shutdown may claim.
  */
 describe('a run whose runner had settled (finished, unrecorded)', () => {
-  const settledRun = (over: Partial<ActiveRun> = {}) => run({ runnerSettledAt: 5_000, ...over });
+  const settledRun = (over: Partial<ActiveRun> = {}) =>
+    run({ runnerSettledAt: 5_000, settledOutcome: 'succeeded', ...over });
 
   it('moves the row to plain idle — the turn was not interrupted', async () => {
     const { client, sessionUpdates } = makeClient();
@@ -916,6 +924,43 @@ describe('a run whose runner had settled (finished, unrecorded)', () => {
     const { client } = makeClient();
     const [outcome] = await interruptActiveRuns(client, [settledRun()], 3_000, false);
     expect(outcome.state).toBe('unknown');
+  });
+
+  /**
+   * A settled run is not necessarily a success: the runner can return
+   * success:false (or throw) and then have its `failed` write lost the same
+   * way. Mapping every settled run to idle-with-a-success-notice erased the
+   * failure (Lumen, PR #563 P1) — the intended terminal outcome must survive.
+   */
+  describe('whose turn had FAILED before shutdown', () => {
+    const failedRun = (over: Partial<ActiveRun> = {}) =>
+      settledRun({ settledOutcome: 'failed', ...over });
+
+    it('writes the failed lifecycle the turn meant to write', async () => {
+      const { client, sessionUpdates } = makeClient();
+      await interruptActiveRuns(client, [failedRun()]);
+
+      expect(sessionUpdates[0]).toMatchObject({ id: 'sess-1', lifecycle: 'failed' });
+      expect(sessionUpdates[0]).not.toHaveProperty('status');
+    });
+
+    it('says the turn failed instead of pointing at a reply that never existed', async () => {
+      const { client, threadMessages } = makeClient();
+      await interruptActiveRuns(client, [failedRun()]);
+
+      const content = String(threadMessages[0]!.content);
+      expect(content).toContain('had FAILED');
+      expect(content).toContain('starts fresh');
+      expect(content).not.toContain('nothing left to do');
+    });
+
+    it('stamps the settled outcome into the notice metadata', async () => {
+      const { client, threadMessages } = makeClient();
+      await interruptActiveRuns(client, [failedRun()]);
+      expect((threadMessages[0]!.metadata as Record<string, unknown>).settledOutcome).toBe(
+        'failed'
+      );
+    });
   });
 });
 

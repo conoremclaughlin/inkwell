@@ -57,6 +57,14 @@ export interface ActiveRun {
    * 00:23). Shutdown reporting must not conflate the two.
    */
   runnerSettledAt?: number;
+  /**
+   * What the turn's unrecorded terminal state WAS MEANT to be. A settled run
+   * is not necessarily a successful one — a runner can return success:false
+   * or throw and then have its `failed` write lost the same way (Lumen, PR
+   * #563 P1). Shutdown must preserve the intended outcome, not stamp every
+   * settled run as a quiet success.
+   */
+  settledOutcome?: 'succeeded' | 'failed';
 }
 
 const active = new Map<string, ActiveRun>();
@@ -100,9 +108,12 @@ export function clearActiveRun(sessionId: string): void {
  * the run must stay registered until its terminal state durably persists —
  * but it changes what a shutdown may truthfully claim about the run.
  */
-export function markRunnerSettled(sessionId: string): void {
+export function markRunnerSettled(sessionId: string, outcome: 'succeeded' | 'failed'): void {
   const run = active.get(sessionId);
-  if (run) run.runnerSettledAt = Date.now();
+  if (run) {
+    run.runnerSettledAt = Date.now();
+    run.settledOutcome = outcome;
+  }
 }
 
 export interface DrainResult {

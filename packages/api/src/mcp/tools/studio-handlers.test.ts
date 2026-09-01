@@ -19,6 +19,7 @@ import {
 } from 'fs';
 import { tmpdir } from 'os';
 import path from 'path';
+import { fileURLToPath } from 'url';
 
 vi.mock('../../services/user-resolver', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../services/user-resolver')>();
@@ -139,5 +140,46 @@ describe('handleCreateStudio bootstrap source', () => {
     const studioPath = path.join(base, 'repo--direct');
     expect(readFileSync(path.join(studioPath, '.mcp.json'), 'utf-8')).toBe(MAIN_MCP);
     expect(readFileSync(path.join(studioPath, '.env.local'), 'utf-8')).toBe('SOURCE=main\n');
+  });
+});
+
+/**
+ * close_studio must rescue before it destroys (Lumen, PR #563 P1).
+ *
+ * Ephemeral worktrees are detached: a CLEAN tree can hold commits reachable
+ * from no branch, and `git worktree remove` deletes them without complaint.
+ * The rescue behaviour itself (stash + ink-rescue anchoring) is pinned
+ * behaviourally in studio-lease.service.test.ts; what a mock cannot see is
+ * whether close_studio actually CALLS it inside the destructive window — so
+ * the wiring is pinned in source order, the same way the ActiveRun clear
+ * ordering is pinned in interrupt-active-runs.test.ts.
+ */
+describe('close_studio rescues before removal (source order)', () => {
+  const source = readFileSync(
+    path.join(path.dirname(fileURLToPath(import.meta.url)), 'studio-handlers.ts'),
+    'utf-8'
+  );
+  const removalAt = source.indexOf("['worktree', 'remove', '--', studio.worktreePath]");
+
+  it('captures with rescue enabled between the claim check and the removal', () => {
+    const claimCheckAt = source.lastIndexOf('verifyClaim', removalAt);
+    const captureAt = source.lastIndexOf('captureWorktreeState', removalAt);
+    expect(removalAt).toBeGreaterThan(-1);
+    expect(captureAt).toBeGreaterThan(claimCheckAt);
+    // The capture in that window runs with rescue enabled.
+    expect(source.slice(captureAt, removalAt)).toContain('rescue: true');
+  });
+
+  it('fails closed: an unsuccessful rescue aborts with the studio intact', () => {
+    const captureAt = source.lastIndexOf('captureWorktreeState', removalAt);
+    const gate = source.slice(captureAt, removalAt);
+    expect(gate).toContain('rescueSucceeded');
+    expect(gate).toContain('abortKeepingStudioUsable');
+  });
+
+  it('tolerates an already-absent worktree instead of failing its close', () => {
+    const captureAt = source.lastIndexOf('captureWorktreeState', removalAt);
+    const guard = source.slice(source.lastIndexOf('worktreePresent', captureAt), captureAt);
+    expect(guard).toContain('worktreePresent');
   });
 });

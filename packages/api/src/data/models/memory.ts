@@ -102,7 +102,14 @@ export type SessionPhase =
   | 'complete'
   | string;
 
-export type SessionLifecycle = 'running' | 'idle' | 'completed' | 'failed';
+// Keep aligned with services/sessions/types.ts SessionLifecycle.
+export type SessionLifecycle =
+  | 'running'
+  | 'idle'
+  | 'compacting'
+  | 'interrupted'
+  | 'completed'
+  | 'failed';
 
 export interface Session {
   id: string;

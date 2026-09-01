@@ -202,6 +202,13 @@ function noticeContent(
   }
 
   if (outcome.state === 'finished-unrecorded') {
+    if (run.settledOutcome === 'failed') {
+      return (
+        `${head}\n\nThe turn had FAILED before the shutdown, and its failure ` +
+        `was never recorded. The session is now marked failed — a re-trigger ` +
+        `on this thread starts fresh rather than resuming it.`
+      );
+    }
     return (
       `${head}\n\nAny reply it produced should already be on this thread — ` +
       `check above before re-triggering; there may be nothing left to do. The ` +
@@ -227,12 +234,16 @@ function noticeContent(
 async function transitionSession(
   client: any,
   sessionId: string,
-  settled: boolean
+  settled: boolean,
+  settledOutcome?: 'succeeded' | 'failed'
 ): Promise<{ state: InterruptState; marked: boolean }> {
   // A settled runner's turn was not interrupted — only its paperwork was
-  // lost — so the row goes to plain `idle` with a reason that says so. An
+  // lost — so the row gets the terminal state the turn MEANT to write:
+  // `idle` for a success, `failed` for a failure (Lumen, PR #563 P1 —
+  // stamping every settled run as a quiet success erased failures). An
   // unsettled runner's turn dies with the process: `interrupted`, resumable.
   const reason = settled ? BOOKKEEPING_REASON : INTERRUPT_REASON;
+  const settledLifecycle = settledOutcome === 'failed' ? 'failed' : 'idle';
   let metadata: Record<string, unknown>;
 
   try {
@@ -285,7 +296,7 @@ async function transitionSession(
       .from('sessions')
       .update(
         settled
-          ? { lifecycle: 'idle', metadata }
+          ? { lifecycle: settledLifecycle, metadata }
           : { lifecycle: 'interrupted', status: 'resumable', metadata }
       )
       .eq('id', sessionId)
@@ -389,7 +400,12 @@ export async function interruptActiveRuns(
     };
 
     const settled = Boolean(run.runnerSettledAt);
-    const { state, marked } = await transitionSession(client, run.sessionId, settled);
+    const { state, marked } = await transitionSession(
+      client,
+      run.sessionId,
+      settled,
+      run.settledOutcome
+    );
     outcome.marked = marked;
 
     // A drain that timed out means a lifecycle write may still be in flight
@@ -458,6 +474,7 @@ export async function interruptActiveRuns(
           alreadyTerminal: outcome.alreadyTerminal,
           turnStartedAt: new Date(run.startedAt).toISOString(),
           runnerSettledAt: run.runnerSettledAt ? new Date(run.runnerSettledAt).toISOString() : null,
+          settledOutcome: run.settledOutcome ?? null,
         },
       });
       outcome.noticed = result.ok;

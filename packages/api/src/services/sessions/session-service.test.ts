@@ -9,6 +9,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { tmpdir } from 'os';
 import { makeFakeSupabase, type Row } from './fake-supabase.js';
 import { resetActiveRuns, activeRunCount, listActiveRuns } from './active-runs.js';
+import { resetPendingFinalizations } from './finalize-turn.js';
 import { StudioOverflowService } from '../studio-overflow.service.js';
 import { StudioLeaseService } from '../studio-lease.service.js';
 import {
@@ -235,6 +236,7 @@ describe('SessionService', () => {
     beforeEach(() => {
       vi.useFakeTimers();
       resetActiveRuns();
+      resetPendingFinalizations();
       vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(createMockSession());
     });
 
@@ -244,6 +246,7 @@ describe('SessionService', () => {
       await vi.advanceTimersByTimeAsync(31 * 60_000);
       vi.useRealTimers();
       resetActiveRuns();
+      resetPendingFinalizations();
     });
 
     it('reports the turn outcome the recipient experienced, not the lost write', async () => {
@@ -308,6 +311,37 @@ describe('SessionService', () => {
       // Exhausted, not cleared: the row still says running, and the registry
       // is how shutdown finds out and tells someone.
       expect(activeRunCount()).toBe(1);
+    });
+
+    /**
+     * The retry loop outlives the processing lock (Lumen, PR #563 P1): turn B
+     * can start while turn A's finalization is still pending. A's late write
+     * must not overwrite B's bookkeeping, clear B's registration, or release
+     * B's boundary — the new turn disowns it at the pre-turn write.
+     */
+    it("a new turn supersedes the previous turn's pending finalization", async () => {
+      // Only turn A's inline finalize fails; anything after succeeds.
+      failIdleWrites(1);
+
+      await sessionService.handleMessage(createMockRequest()); // turn A — retry pending
+      expect(activeRunCount()).toBe(1);
+
+      await sessionService.handleMessage(createMockRequest()); // turn B — finalizes inline
+      expect(activeRunCount()).toBe(0);
+
+      const idleWritesBefore = vi
+        .mocked(mockRepository.update)
+        .mock.calls.filter(([, u]) => (u as { lifecycle?: string }).lifecycle === 'idle').length;
+
+      // A's retry would have fired at +5s. Superseded, it must not write.
+      await vi.advanceTimersByTimeAsync(31 * 60_000);
+
+      const idleWritesAfter = vi
+        .mocked(mockRepository.update)
+        .mock.calls.filter(([, u]) => (u as { lifecycle?: string }).lifecycle === 'idle').length;
+      expect(idleWritesAfter).toBe(idleWritesBefore);
+      // And it must not have deleted B's (already-cleared) state either way.
+      expect(activeRunCount()).toBe(0);
     });
   });
 
