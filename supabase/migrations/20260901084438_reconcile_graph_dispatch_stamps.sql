@@ -123,8 +123,10 @@ BEGIN
       AND t.metadata ? 'graphDispatchedAt'
       AND st.stamp_at IS NOT NULL
       -- A stamp at or after p_stale_before belongs to the caller's own run and
-      -- is never stale. This is what makes a concurrent dispatch safe without
-      -- a separate CAS: its stamp is newer than the cutoff and drops out here.
+      -- is never stale. This excludes any dispatch already COMMITTED and
+      -- visible when this statement took its snapshot. It is not sufficient on
+      -- its own: a dispatch still uncommitted at snapshot time is invisible
+      -- here, and the UPDATE's compare-and-set below is what catches that one.
       AND st.stamp_at < p_stale_before
       -- No recorded recipient, no recovery. Nothing else can be established
       -- about who was supposed to act on it.

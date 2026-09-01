@@ -423,12 +423,16 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
   });
 
   // Recover dispatch stamps stranded by an interrupted turn BEFORE the
-  // listener accepts anything. Two reasons this is awaited and placed here
-  // rather than alongside the sweep (Lumen, PR #559 review):
-  //   - it must not race dispatch intake. Once we are listening, a trigger can
-  //     stamp a node while recovery is mid-flight.
-  //   - the cutoff below fences that race even so: anything stamped from this
-  //     instant on is left alone, so the two guards are independent.
+  // listener accepts anything (Lumen, PR #559 review). This ordering is the
+  // FIRST of three independent guards against clearing a live dispatch, and
+  // the weakest on its own — it only shrinks the window:
+  //   - here: nothing is stamping while recovery runs, in the normal case.
+  //   - the `cutoff` below: a stamp at or after this instant is not selected,
+  //     which covers a dispatch already committed at snapshot time.
+  //   - a compare-and-set inside the RPC: the write re-checks the stamp
+  //     against the current row, which covers a dispatch that was still
+  //     uncommitted at snapshot time and commits while the statement waits on
+  //     the row lock. The ordering and the cutoff both miss that one.
   // Gated with the sweep: only the process that owns dispatch may clean up
   // after it, so an isolated test server on the same DB never touches the
   // main server's stamps.

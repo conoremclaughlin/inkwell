@@ -338,17 +338,27 @@ export class GraphExecutorService {
    * second API process on the same database fails the same way. So death is
    * never inferred from a restart any more.
    *
-   * All of the deciding happens in the RPC: it requires positive evidence of a
-   * finished session on the group's thread (a shutdown interrupt breadcrumb,
-   * an ended_at, a terminal lifecycle) AND no session on that thread that
-   * still looks alive, and it removes the key in place rather than rewriting
-   * the metadata blob. Every uncertainty keeps the stamp, because keeping one
-   * costs the pre-existing 30-minute wait while clearing one wrongly costs a
-   * duplicate dispatch onto live work.
+   * All of the deciding happens in the RPC. It clears a stamp only when the
+   * RECIPIENT recorded on it (graphDispatchedTo) has a session on the group's
+   * thread that finished at or after that stamp, and none of that recipient's
+   * sessions still looks alive. Scoped to the recipient because a thread
+   * routinely carries several agents, so another agent's finished session
+   * proves nothing about this dispatch. The key is removed in place rather
+   * than by rewriting the metadata blob. Every uncertainty keeps the stamp,
+   * because keeping one costs the pre-existing 30-minute wait while clearing
+   * one wrongly costs a duplicate dispatch onto live work.
    *
-   * Call this BEFORE dispatch intake opens. `staleBefore` is a second fence:
-   * anything stamped from that instant on is treated as the caller's own and
-   * left alone, so a dispatch racing this call keeps its fresh stamp.
+   * Three separate things stop this racing a live dispatch, and they are not
+   * interchangeable:
+   *   - ORDERING: called before dispatch intake opens, so in the normal case
+   *     nothing is stamping while it runs.
+   *   - CUTOFF (`staleBefore`): a stamp at or after that instant is the
+   *     caller's own and is not selected. Covers dispatches already committed
+   *     when the statement takes its snapshot.
+   *   - CAS: the UPDATE re-checks the stamp and recipient against the row as
+   *     it exists when the write lands. Covers the one the cutoff cannot see —
+   *     a dispatch still uncommitted at snapshot time, which commits while the
+   *     statement waits on the row lock.
    */
   async reconcileInterruptedDispatches(
     staleBefore: Date = new Date()
