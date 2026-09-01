@@ -1009,6 +1009,7 @@ describe('POST /auth/logout', () => {
     const deleteChain: Record<string, any> = {};
     deleteChain.delete = vi.fn(() => deleteChain);
     deleteChain.eq = vi.fn(() => deleteChain);
+    deleteChain.in = vi.fn(() => deleteChain);
     mockSupabaseFrom.mockReturnValue(deleteChain);
 
     const req = createMockReq({
@@ -1022,7 +1023,9 @@ describe('POST /auth/logout', () => {
     expect(mockSupabaseFrom).toHaveBeenCalledWith('mcp_tokens');
     expect(deleteChain.delete).toHaveBeenCalled();
     expect(deleteChain.eq).toHaveBeenCalledWith('refresh_token', 'pcp-rt-to-revoke');
-    expect(deleteChain.eq).toHaveBeenCalledWith('client_id', 'dashboard');
+    // Revocation spans BOTH client ids: a refresh token presented at logout
+    // dies whether it was minted for the dashboard or the mobile app.
+    expect(deleteChain.in).toHaveBeenCalledWith('client_id', ['dashboard', 'mobile']);
     expect(res._json).toEqual({ success: true });
   });
 
@@ -1030,6 +1033,7 @@ describe('POST /auth/logout', () => {
     const deleteChain: Record<string, any> = {};
     deleteChain.delete = vi.fn(() => deleteChain);
     deleteChain.eq = vi.fn(() => deleteChain);
+    deleteChain.in = vi.fn(() => deleteChain);
     mockSupabaseFrom.mockReturnValue(deleteChain);
 
     const req = createMockReq({

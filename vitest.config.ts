@@ -25,6 +25,10 @@ export default defineConfig({
       // passing unobserved, which is the same as not having them.
       'packages/web/src/**/*.test.ts',
       'packages/web/src/**/*.test.tsx',
+      // Mobile's tests are the pure modules only (URL resolution, display
+      // formatting) — no React Native imports, so they run in node like
+      // everything else. Screen-level testing happens on a device.
+      'packages/mobile/src/**/*.test.ts',
     ],
     exclude: [
       'node_modules',

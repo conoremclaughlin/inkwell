@@ -17,6 +17,9 @@ import { env, isDevelopment } from '../config/env';
 import { getHeartbeatProcessingConfig } from '../config/heartbeat-flags';
 import { runWithRequestContext } from '../utils/request-context';
 import { getDataComposer } from '../data/composer';
+import { handleSendToInbox } from '../mcp/tools/inbox-handlers';
+import { getParticipants } from '../mcp/tools/thread-handlers';
+import { FixedWindowLimiter } from '../utils/fixed-window-limiter';
 import { notifyPlatformOfApprovalRequest } from '../channels/approval-interceptor';
 
 /**
@@ -38,6 +41,7 @@ import crypto from 'crypto';
 import { promises as fs } from 'fs';
 import os from 'os';
 import path from 'path';
+import QRCode from 'qrcode';
 import type { WorkspaceMemberRole } from '../data/repositories/workspaces.repository';
 import { slugifyWorkspaceName } from '../utils/workspace-slug';
 import {
@@ -111,6 +115,19 @@ type ChannelRouteRow = {
 const ADMIN_ACCESS_TOKEN_LIFETIME_SECONDS = 3600; // 1 hour
 const ADMIN_REFRESH_TOKEN_LIFETIME_DAYS = 90;
 const ADMIN_CLIENT_ID = 'dashboard';
+/** Refresh-token client_id for the native app (packages/mobile). */
+const MOBILE_CLIENT_ID = 'mobile';
+/**
+ * Pairing codes let a phone sign in by scanning a QR the dashboard shows.
+ * They live in mcp_tokens under their own client_id so they can never be
+ * mistaken for (or exchanged as) a refresh token, and they are single-use
+ * with a short life: the code is the credential for those ten minutes.
+ */
+const MOBILE_PAIR_CLIENT_ID = 'mobile-pair';
+const MOBILE_PAIR_CODE_LIFETIME_SECONDS = 10 * 60;
+const MOBILE_PAIR_CODE_LENGTH = 12;
+// 32 symbols, none of 0/O/1/I: a code someone reads off a screen and types.
+const MOBILE_PAIR_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const MCP_CLI_TRANSCRIPT_ROUTE = /^\/sessions(?:\/synced|\/[^/]+\/(?:sync-transcript|transcript))$/;
 const MCP_CLI_APPROVAL_ROUTE = /^\/approval-requests(?:\/[^/]+\/status)?$/;
 const DEFAULT_SESSION_LOG_LIMIT = 50;
@@ -1275,7 +1292,7 @@ router.post('/auth/logout', async (req: Request, res: Response) => {
         .from('mcp_tokens')
         .delete()
         .eq('refresh_token', refreshToken)
-        .eq('client_id', ADMIN_CLIENT_ID);
+        .in('client_id', [ADMIN_CLIENT_ID, MOBILE_CLIENT_ID]);
     }
 
     // Clear cookies regardless (same options used when setting them)
@@ -1292,8 +1309,511 @@ router.post('/auth/logout', async (req: Request, res: Response) => {
   }
 });
 
+// =============================================================================
+// Mobile Auth (before auth middleware — these routes MINT credentials)
+// =============================================================================
+
+/**
+ * Token-in-body auth for native clients (packages/mobile).
+ *
+ * The dashboard's auth rides on httpOnly cookies, which React Native's fetch
+ * does not manage reliably. These two routes issue the SAME pcp_admin access
+ * JWT the middleware's Tier 1 already verifies — only the transport differs:
+ * tokens are returned in the response body and the client sends them as
+ * `Authorization: Bearer`. A distinct client_id (MOBILE_CLIENT_ID, declared
+ * with the other auth constants) keeps mobile refresh tokens separately
+ * revocable from dashboard ones.
+ */
+
+/**
+ * Attempts on the credential routes. Two buckets per attempt: (ip, account)
+ * blunts guessing at one account, and a per-ip ceiling stops one address
+ * from spraying distinct emails to dodge it. Both live in one bounded
+ * limiter (utils/fixed-window-limiter): amortised pruning and a hard cap, so
+ * a spray can neither grow the map without limit nor make each request scan
+ * it. In-memory is enough — one process, and this only needs to blunt online
+ * guessing, not survive restarts.
+ */
+const AUTH_ATTEMPT_WINDOW_MS = 15 * 60 * 1000;
+const AUTH_ATTEMPTS_PER_ACCOUNT = 10;
+const AUTH_ATTEMPTS_PER_IP = 30;
+const PAIR_CLAIMS_PER_IP = 10;
+const authLimiter = new FixedWindowLimiter(AUTH_ATTEMPT_WINDOW_MS);
+
+function loginRateLimited(ip: string, email: string): boolean {
+  // Charge both buckets for every attempt, then decide.
+  const overIp = authLimiter.hit(`ip:${ip}`, AUTH_ATTEMPTS_PER_IP);
+  const overAccount = authLimiter.hit(`acct:${ip}|${email}`, AUTH_ATTEMPTS_PER_ACCOUNT);
+  return overIp || overAccount;
+}
+
+function pairClaimRateLimited(ip: string): boolean {
+  return authLimiter.hit(`pair:${ip}`, PAIR_CLAIMS_PER_IP);
+}
+
+/**
+ * POST /api/admin/auth/mobile-login
+ * Body: { email, password } → { accessToken, refreshToken, expiresIn, userId, email }
+ *
+ * Verifies credentials against Supabase server-side (the app never holds
+ * Supabase keys), provisions the PCP user if needed (same contract as the
+ * middleware's Tier 3), and returns a pcp_admin access/refresh token pair.
+ */
+router.post('/auth/mobile-login', async (req: Request, res: Response) => {
+  try {
+    const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+    const password = typeof req.body?.password === 'string' ? req.body.password : '';
+    if (!email || !password) {
+      res.status(400).json({ error: 'email and password are required' });
+      return;
+    }
+
+    if (loginRateLimited(req.ip || 'unknown', email)) {
+      res.status(429).json({ error: 'Too many login attempts. Try again later.' });
+      return;
+    }
+
+    // Dedicated throwaway client for the sign-in: signInWithPassword mutates
+    // the client's internal auth state, so it must never run on a shared
+    // instance (see CLAUDE.md "Supabase Client Footgun").
+    const authClient = createClient(env.SUPABASE_URL, env.SUPABASE_PUBLISHABLE_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const { data: signIn, error: signInError } = await authClient.auth.signInWithPassword({
+      email,
+      password,
+    });
+    if (signInError || !signIn.user) {
+      // Same body for wrong-password and unknown-account: no account oracle.
+      res.status(401).json({ error: 'Invalid email or password' });
+      return;
+    }
+
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+
+    const pcpUser = await findOrProvisionPcpUserByEmail(supabase, email);
+    if (!pcpUser) {
+      res.status(500).json({ error: 'Failed to provision user' });
+      return;
+    }
+
+    res.json(await issueMobileTokens(supabase, pcpUser.id, email));
+  } catch (error) {
+    logger.error('Mobile login error:', error);
+    res.status(500).json(errorJson('Login failed', error));
+  }
+});
+
+/**
+ * Look up (or provision) the PCP user for an email Supabase has just
+ * verified — the middleware's Tier 3 contract, shared by every mobile route
+ * that mints credentials so they cannot drift apart.
+ */
+async function findOrProvisionPcpUserByEmail(
+  supabase: SupabaseClient<Database>,
+  email: string
+): Promise<{ id: string } | null> {
+  const nowIso = new Date().toISOString();
+  const { data: existing } = await supabase.from('users').select('id').eq('email', email).single();
+  if (existing) {
+    await supabase.from('users').update({ last_login_at: nowIso }).eq('id', existing.id);
+    return existing;
+  }
+
+  const { data: created, error: createError } = await supabase
+    .from('users')
+    .insert({ email, last_login_at: nowIso })
+    .select('id')
+    .single();
+  if (!createError && created) return created;
+
+  // Lost an insert race — the row exists now.
+  const { data: raced } = await supabase.from('users').select('id').eq('email', email).single();
+  if (raced) return raced;
+
+  logger.error('Failed to provision PCP user for mobile auth', { error: createError?.message });
+  return null;
+}
+
+/** The pcp_admin access/refresh pair every mobile sign-in path returns. */
+async function issueMobileTokens(
+  supabase: SupabaseClient<Database>,
+  userId: string,
+  email: string
+): Promise<{
+  accessToken: string;
+  refreshToken: string;
+  expiresIn: number;
+  userId: string;
+  email: string;
+}> {
+  const accessToken = signPcpAccessToken(
+    { type: 'pcp_admin', sub: userId, email, scope: 'admin' },
+    ADMIN_ACCESS_TOKEN_LIFETIME_SECONDS
+  );
+  const { refreshToken } = await createRefreshToken(
+    supabase,
+    userId,
+    MOBILE_CLIENT_ID,
+    ['admin'],
+    ADMIN_REFRESH_TOKEN_LIFETIME_DAYS
+  );
+  return {
+    accessToken,
+    refreshToken,
+    expiresIn: ADMIN_ACCESS_TOKEN_LIFETIME_SECONDS,
+    userId,
+    email,
+  };
+}
+
+/** Same rules the dashboard's signup form shows as it types. */
+function passwordPolicyProblem(password: string): string | null {
+  if (password.length < 8) return 'Password must be at least 8 characters';
+  if (!/\d/.test(password)) return 'Password must contain a number';
+  if (!/[a-zA-Z]/.test(password)) return 'Password must contain a letter';
+  return null;
+}
+
+/**
+ * POST /api/admin/auth/mobile-signup
+ * Body: { email, password }
+ *   → { confirmationRequired: true, email }                       (check your inbox)
+ *   → { confirmationRequired: false, accessToken, refreshToken, … } (signed in)
+ *
+ * Whether the second shape is possible depends on the Supabase project: with
+ * email confirmation on (the hosted default) the account is inert until the
+ * link is clicked, and the phone should send the user to Sign in afterwards.
+ * An existing account is deliberately indistinguishable from a new one.
+ */
+router.post('/auth/mobile-signup', async (req: Request, res: Response) => {
+  try {
+    const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+    const password = typeof req.body?.password === 'string' ? req.body.password : '';
+    if (!email || !password) {
+      res.status(400).json({ error: 'email and password are required' });
+      return;
+    }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      res.status(400).json({ error: 'A valid email address is required' });
+      return;
+    }
+    const policyProblem = passwordPolicyProblem(password);
+    if (policyProblem) {
+      res.status(400).json({ error: policyProblem });
+      return;
+    }
+
+    // Own bucket: a signup spray must not lock a real user out of login.
+    if (loginRateLimited(req.ip || 'unknown', `signup:${email}`)) {
+      res.status(429).json({ error: 'Too many attempts. Try again later.' });
+      return;
+    }
+
+    // Throwaway client — signUp mutates client auth state like signIn does.
+    const authClient = createClient(env.SUPABASE_URL, env.SUPABASE_PUBLISHABLE_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const { data: signUp, error: signUpError } = await authClient.auth.signUp({ email, password });
+
+    if (signUpError) {
+      // Supabase names an existing account outright when confirmations are
+      // off. Answer as if the signup went through; the phone's copy tells the
+      // user to sign in if they already have an account.
+      if (/already|exists|registered/i.test(signUpError.message)) {
+        res.json({ confirmationRequired: true, email });
+        return;
+      }
+      res.status(400).json({ error: signUpError.message });
+      return;
+    }
+
+    if (!signUp.session) {
+      res.json({ confirmationRequired: true, email });
+      return;
+    }
+
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const pcpUser = await findOrProvisionPcpUserByEmail(supabase, email);
+    if (!pcpUser) {
+      res.status(500).json({ error: 'Failed to provision user' });
+      return;
+    }
+
+    res.json({
+      confirmationRequired: false,
+      ...(await issueMobileTokens(supabase, pcpUser.id, email)),
+    });
+  } catch (error) {
+    logger.error('Mobile signup error:', error);
+    res.status(500).json(errorJson('Signup failed', error));
+  }
+});
+
+// ─── Pairing codes ───
+
+function generatePairingCode(): string {
+  // 32 symbols divide 256 evenly, so a byte mod 32 is unbiased.
+  const bytes = crypto.randomBytes(MOBILE_PAIR_CODE_LENGTH);
+  let code = '';
+  for (let i = 0; i < MOBILE_PAIR_CODE_LENGTH; i += 1) {
+    code += MOBILE_PAIR_CODE_ALPHABET[bytes[i] % MOBILE_PAIR_CODE_ALPHABET.length];
+  }
+  return code;
+}
+
+/** Accepts the code however it was typed: lowercase, with dashes or spaces. */
+function normalizePairingCode(input: string): string {
+  return input.toUpperCase().replace(/[^A-Z2-9]/g, '');
+}
+
+function formatPairingCode(code: string): string {
+  return code.match(/.{1,4}/g)?.join('-') ?? code;
+}
+
+function pairingCodeStorageKey(code: string): string {
+  return `pcp-pair-${code}`;
+}
+
+function isLoopbackHost(hostOrUrl: string): boolean {
+  return /(^|\/\/)(localhost|127\.0\.0\.1|\[::1\]|0\.0\.0\.0)(:|\/|$)/i.test(hostOrUrl);
+}
+
+/** TLS-terminated upstream, direct TLS, or a same-machine caller. */
+function requestIsSecureOrLocal(req: Request): boolean {
+  const forwardedProto = req.get('x-forwarded-proto')?.split(',')[0]?.trim().toLowerCase();
+  if (req.secure || forwardedProto === 'https') return true;
+  const host = (req.get('x-forwarded-host') || req.get('host') || '').split(',')[0].trim();
+  return isLoopbackHost(host);
+}
+
+/**
+ * POST /api/admin/auth/mobile-pair/claim
+ * Body: { code } → same token pair as mobile-login.
+ *
+ * The delete IS the claim: returning the deleted row means that of two
+ * racing claimers exactly one gets tokens, with no read-then-write window.
+ */
+router.post('/auth/mobile-pair/claim', async (req: Request, res: Response) => {
+  try {
+    const code = normalizePairingCode(typeof req.body?.code === 'string' ? req.body.code : '');
+    if (code.length !== MOBILE_PAIR_CODE_LENGTH) {
+      res.status(400).json({ error: 'A pairing code is required' });
+      return;
+    }
+
+    // Per-IP: ten guesses per window against a 60-bit code.
+    if (pairClaimRateLimited(req.ip || 'unknown')) {
+      res.status(429).json({ error: 'Too many attempts. Try again later.' });
+      return;
+    }
+
+    // The response is a 90-day admin credential. In production it leaves
+    // this process only over TLS or to this machine — never across a
+    // cleartext LAN hop. (A client that forges x-forwarded-proto only
+    // downgrades its own connection; the header is trusted for exactly that.)
+    if (!isDevelopment() && !requestIsSecureOrLocal(req)) {
+      res.status(403).json({ error: 'Pairing requires HTTPS' });
+      return;
+    }
+
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+
+    const { data: consumed, error: consumeError } = await supabase
+      .from('mcp_tokens')
+      .delete()
+      .eq('refresh_token', pairingCodeStorageKey(code))
+      .eq('client_id', MOBILE_PAIR_CLIENT_ID)
+      .select('user_id, expires_at')
+      .maybeSingle();
+    if (consumeError) {
+      logger.error('Failed to consume pairing code', { error: consumeError.message });
+      res.status(500).json({ error: 'Pairing failed' });
+      return;
+    }
+    if (!consumed || new Date(consumed.expires_at) < new Date()) {
+      res.status(401).json({ error: 'Invalid or expired pairing code' });
+      return;
+    }
+
+    const { data: user } = await supabase
+      .from('users')
+      .select('id, email')
+      .eq('id', consumed.user_id)
+      .single();
+    if (!user?.email) {
+      res.status(401).json({ error: 'Invalid or expired pairing code' });
+      return;
+    }
+    await supabase
+      .from('users')
+      .update({ last_login_at: new Date().toISOString() })
+      .eq('id', user.id);
+
+    res.json(await issueMobileTokens(supabase, user.id, user.email));
+  } catch (error) {
+    logger.error('Mobile pairing claim error:', error);
+    res.status(500).json(errorJson('Pairing failed', error));
+  }
+});
+
+/**
+ * POST /api/admin/auth/mobile-refresh
+ * Body: { refreshToken } → { accessToken, expiresIn, userId, email }
+ * The refresh token itself is long-lived (90 days) and stays unchanged.
+ */
+router.post('/auth/mobile-refresh', async (req: Request, res: Response) => {
+  try {
+    const refreshToken = typeof req.body?.refreshToken === 'string' ? req.body.refreshToken : '';
+    if (!refreshToken) {
+      res.status(400).json({ error: 'refreshToken is required' });
+      return;
+    }
+
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const result = await exchangeRefreshToken(
+      supabase,
+      refreshToken,
+      MOBILE_CLIENT_ID,
+      'pcp_admin',
+      ADMIN_ACCESS_TOKEN_LIFETIME_SECONDS
+    );
+    if (!result) {
+      res.status(401).json({ error: 'Invalid or expired refresh token' });
+      return;
+    }
+
+    res.json({
+      accessToken: result.accessToken,
+      expiresIn: ADMIN_ACCESS_TOKEN_LIFETIME_SECONDS,
+      userId: result.userId,
+      email: result.email,
+    });
+  } catch (error) {
+    logger.error('Mobile token refresh error:', error);
+    res.status(500).json(errorJson('Token refresh failed', error));
+  }
+});
+
 // Apply auth middleware to all subsequent routes
 router.use(adminAuthMiddleware);
+
+/**
+ * Where a phone could reach this server, in the order it should try them.
+ *
+ * Candidates: the configured public URL, the host the dashboard itself was
+ * reached on, every LAN IPv4 address of this machine. Loopback is never
+ * offered — it is the one address guaranteed wrong from another device.
+ *
+ * Production advertises HTTPS only. The claim response carries a 90-day
+ * admin credential, and a cleartext LAN hop is exactly the network path that
+ * could read it. Development keeps the plain-HTTP LAN addresses — that is how
+ * a phone reaches a laptop — and the response says so (`insecureTransport`),
+ * so the dashboard can say so too. TLS candidates sort first either way: a
+ * reachable https address must never lose to a cleartext one.
+ */
+function candidateServerUrls(req: Request): { urls: string[]; insecureTransport: boolean } {
+  const dev = isDevelopment();
+  const isHttps = (url: string) => /^https:\/\//i.test(url);
+  const candidates: string[] = [];
+
+  if (env.MCP_BASE_URL && !isLoopbackHost(env.MCP_BASE_URL)) candidates.push(env.MCP_BASE_URL);
+
+  const forwardedHost = req.get('x-forwarded-host')?.split(',')[0]?.trim();
+  const host = forwardedHost || req.get('host');
+  if (host && !isLoopbackHost(host)) {
+    const proto = req.get('x-forwarded-proto')?.split(',')[0]?.trim() || req.protocol || 'http';
+    candidates.push(`${proto}://${host}`);
+  }
+
+  for (const interfaces of Object.values(os.networkInterfaces())) {
+    for (const iface of interfaces ?? []) {
+      if (iface.family === 'IPv4' && !iface.internal) {
+        candidates.push(`http://${iface.address}:${env.MCP_HTTP_PORT}`);
+      }
+    }
+  }
+
+  const urls: string[] = [];
+  for (const candidate of candidates) {
+    const normalized = candidate.replace(/\/+$/, '');
+    if (!isHttps(normalized) && !dev) continue;
+    if (!urls.includes(normalized)) urls.push(normalized);
+  }
+  urls.sort((a, b) => Number(isHttps(b)) - Number(isHttps(a)));
+  return { urls, insecureTransport: urls.some((url) => !isHttps(url)) };
+}
+
+/**
+ * POST /api/admin/auth/mobile-pair
+ * → { code, expiresAt, expiresInSeconds, urls, qrDataUrl }
+ *
+ * Mints a single-use pairing code for the signed-in user and renders the QR
+ * the dashboard shows. The QR payload is `{ ink: 1, c: code, u: urls }` —
+ * the phone claims the code against the first URL that answers /health.
+ */
+router.post('/auth/mobile-pair', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AdminAuthRequest;
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+
+    // Codes nobody scanned would otherwise accumulate; sweep this user's
+    // expired ones on the way in (best effort — a failure here is not ours to
+    // surface).
+    await supabase
+      .from('mcp_tokens')
+      .delete()
+      .eq('user_id', authReq.pcpUserId)
+      .eq('client_id', MOBILE_PAIR_CLIENT_ID)
+      .lt('expires_at', new Date().toISOString());
+
+    const code = generatePairingCode();
+    const expiresAt = new Date(Date.now() + MOBILE_PAIR_CODE_LIFETIME_SECONDS * 1000);
+    const { error: insertError } = await supabase.from('mcp_tokens').insert({
+      user_id: authReq.pcpUserId,
+      client_id: MOBILE_PAIR_CLIENT_ID,
+      refresh_token: pairingCodeStorageKey(code),
+      supabase_refresh_token: null,
+      scopes: ['admin'],
+      expires_at: expiresAt.toISOString(),
+    });
+    if (insertError) {
+      logger.error('Failed to store pairing code', { error: insertError.message });
+      res.status(500).json({ error: 'Failed to create pairing code' });
+      return;
+    }
+
+    const { urls, insecureTransport } = candidateServerUrls(req);
+    const qrDataUrl = await QRCode.toDataURL(JSON.stringify({ ink: 1, c: code, u: urls }), {
+      margin: 1,
+      width: 320,
+      errorCorrectionLevel: 'M',
+    });
+
+    res.json({
+      code: formatPairingCode(code),
+      expiresAt: expiresAt.toISOString(),
+      expiresInSeconds: MOBILE_PAIR_CODE_LIFETIME_SECONDS,
+      urls,
+      insecureTransport,
+      development: isDevelopment(),
+      qrDataUrl,
+    });
+  } catch (error) {
+    logger.error('Mobile pairing code error:', error);
+    res.status(500).json(errorJson('Failed to create pairing code', error));
+  }
+});
 
 // =============================================================================
 // Workspaces
@@ -6915,7 +7435,7 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
       count: messagesCount,
     } = await supabase
       .from('inbox_thread_messages')
-      .select('id, sender_agent_id, content, message_type, priority, created_at', {
+      .select('id, sender_agent_id, content, message_type, priority, metadata, created_at', {
         count: 'exact',
       })
       .eq('thread_id', thread.id)
@@ -6946,6 +7466,10 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
           content: m.content,
           messageType: m.message_type,
           priority: m.priority,
+          // Human replies land with sender_agent_id 'unknown' (no agent in the
+          // request context); metadata.sentBy = 'user' is how clients tell a
+          // person's message from a genuinely unattributed one.
+          metadata: (m.metadata as Record<string, unknown> | null) ?? null,
           createdAt: m.created_at,
         }))
         .reverse(),
@@ -6954,6 +7478,240 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
   } catch (error) {
     logger.error('Failed to load thread messages:', error);
     res.status(500).json(errorJson('Failed to load thread messages', error));
+  }
+});
+
+/**
+ * POST /api/admin/threads
+ * Body: { key, recipients: string[], content, title?, priority?, studioSlug? }
+ *   → { success, created, messageId, threadId, threadKey }
+ *
+ * Start a thread from the dashboard or phone — or continue one that already
+ * exists under that key. This is the only admin route that CREATES threads;
+ * /threads/reply deliberately refuses to, because a reply that invents a
+ * thread hides typos. Here the recipients are explicit, so the intent is
+ * unambiguous: "open a conversation with these participants".
+ *
+ * The human is the sender (no senderAgentId), the title becomes the thread's
+ * title on creation (send_to_inbox stores `subject` there), and every
+ * recipient is woken — a first message nobody is woken for is a thread
+ * nobody knows exists.
+ *
+ * `studioSlug` (single recipient only — the inbox handler's rule) pins the
+ * wake to one of the agent's studios by slug; "main" is their home studio.
+ * A DM keyed chat:<agent> has no route pattern anywhere, so without this the
+ * message is held rather than delivered.
+ */
+router.post('/threads', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AdminAuthRequest;
+    const key = typeof req.body?.key === 'string' ? req.body.key.trim() : '';
+    const content = typeof req.body?.content === 'string' ? req.body.content.trim() : '';
+    const title = typeof req.body?.title === 'string' ? req.body.title.trim() : '';
+    const priority = typeof req.body?.priority === 'string' ? req.body.priority : undefined;
+    const studioSlug = typeof req.body?.studioSlug === 'string' ? req.body.studioSlug.trim() : '';
+    const recipients = Array.isArray(req.body?.recipients)
+      ? (req.body.recipients as unknown[])
+          .filter((r): r is string => typeof r === 'string')
+          .map((r) => r.trim().toLowerCase())
+          .filter((r) => r.length > 0)
+      : [];
+
+    // Grammar: type ":" id, both non-empty (project-prefixed keys have more
+    // segments; the parser sorts that out). Whitespace has no place in a key.
+    if (!/^[^\s:]+:[^\s]+$/.test(key)) {
+      res.status(400).json({ error: 'key must look like <type>:<identifier>, e.g. pr:545' });
+      return;
+    }
+    if (!content) {
+      res.status(400).json({ error: 'content is required' });
+      return;
+    }
+    if (content.length > 64 * 1024) {
+      res.status(400).json({ error: 'content is too long (64KB max)' });
+      return;
+    }
+    const uniqueRecipients = [...new Set(recipients)];
+    if (uniqueRecipients.length === 0 || uniqueRecipients.length > 16) {
+      res.status(400).json({ error: 'recipients must name 1 to 16 agents' });
+      return;
+    }
+    if (priority && !['low', 'normal', 'high', 'urgent'].includes(priority)) {
+      res.status(400).json({ error: 'priority must be low, normal, high, or urgent' });
+      return;
+    }
+    if (studioSlug && (uniqueRecipients.length !== 1 || studioSlug.length > 100)) {
+      res.status(400).json({ error: 'studioSlug applies to a single recipient' });
+      return;
+    }
+
+    const dataComposer = await getDataComposer();
+    const supabase = dataComposer.getClient();
+    const { data: existing } = await supabase
+      .from('inbox_threads')
+      .select('id')
+      .eq('user_id', authReq.pcpUserId)
+      .eq('thread_key', key)
+      .maybeSingle();
+
+    const result = await handleSendToInbox(
+      {
+        userId: authReq.pcpUserId,
+        threadKey: key,
+        content,
+        // A studio-pinned send is the handler's single-recipient form; the
+        // group form (recipients[]) cannot carry a studio.
+        ...(studioSlug
+          ? { recipientAgentId: uniqueRecipients[0], recipientStudioSlug: studioSlug }
+          : { recipients: uniqueRecipients, triggerAll: true }),
+        ...(title ? { subject: title } : {}),
+        ...(priority ? { priority } : {}),
+        metadata: { sentBy: 'user', channel: 'admin-api' },
+      },
+      dataComposer
+    );
+
+    const text = result.content?.[0]?.type === 'text' ? result.content[0].text : '{}';
+    const parsed = JSON.parse(text) as {
+      success?: boolean;
+      error?: string;
+      messageId?: string;
+      threadId?: string;
+      warning?: string;
+    };
+
+    if (parsed.messageId == null && parsed.success === false) {
+      // Nothing was stored: an unknown recipient, a refused key. That is the
+      // caller's mistake to fix, not a server fault.
+      res.status(400).json({ error: parsed.error || 'Could not start the thread' });
+      return;
+    }
+
+    res.json({
+      success: true,
+      created: !existing,
+      messageId: parsed.messageId ?? null,
+      threadId: parsed.threadId ?? existing?.id ?? null,
+      threadKey: key,
+      warning: parsed.warning ?? null,
+    });
+  } catch (error) {
+    logger.error('Failed to start thread:', error);
+    res.status(500).json(errorJson('Failed to start thread', error));
+  }
+});
+
+/**
+ * POST /api/admin/threads/reply
+ * Body: { key, content, priority? } → { success, messageId, threadId, triggered }
+ *
+ * A human reply into an existing thread — the dashboard and mobile analogue of
+ * send_to_inbox. Delegates to the SAME handler the MCP tool uses, so trigger
+ * dispatch, session routing, and thread bookkeeping stay one code path. The
+ * admin request context carries no agentId, so the handler classifies the
+ * sender as non-agent ('unknown'); metadata.sentBy = 'user' carries the real
+ * attribution for display.
+ *
+ * Existing threads only: a reply is "into the conversation I'm following".
+ * Creating threads needs recipient selection, which is a different screen and
+ * a different endpoint when it's wanted.
+ */
+router.post('/threads/reply', async (req: Request, res: Response) => {
+  try {
+    const key = typeof req.body?.key === 'string' ? req.body.key.trim() : '';
+    const content = typeof req.body?.content === 'string' ? req.body.content : '';
+    const priority = typeof req.body?.priority === 'string' ? req.body.priority : undefined;
+    if (!key) {
+      res.status(400).json({ error: 'key is required' });
+      return;
+    }
+    if (!content.trim()) {
+      res.status(400).json({ error: 'content is required' });
+      return;
+    }
+    if (content.length > 64 * 1024) {
+      res.status(400).json({ error: 'content exceeds 64KB' });
+      return;
+    }
+
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const authReq = req as AdminAuthRequest;
+
+    const { data: thread, error: threadError } = await supabase
+      .from('inbox_threads')
+      .select('id, thread_key, status, closed_at')
+      .eq('user_id', authReq.pcpUserId)
+      .eq('thread_key', key)
+      .maybeSingle();
+    if (threadError) {
+      logger.error('Failed to load thread for reply:', threadError);
+      res.status(500).json(errorJson('Failed to send reply', threadError));
+      return;
+    }
+    if (!thread) {
+      res.status(404).json({ error: `No thread with key "${key}"` });
+      return;
+    }
+    if (thread.status === 'closed' || thread.closed_at) {
+      // The inbox handler refuses closed threads; say so with a status no
+      // client can mistake for delivery.
+      res.status(409).json({ error: `Thread "${key}" is closed and no longer accepts replies` });
+      return;
+    }
+
+    const dataComposer = await getDataComposer();
+    const participants = await getParticipants(dataComposer.getClient(), thread.id);
+    if (participants.length === 0) {
+      // A thread without participants has nobody to wake; refuse loudly
+      // rather than storing a message no agent will ever see.
+      res.status(409).json({ error: 'Thread has no participants to notify' });
+      return;
+    }
+
+    const result = await handleSendToInbox(
+      {
+        userId: authReq.pcpUserId,
+        threadKey: key,
+        content,
+        recipients: participants,
+        // Human reply: wake everyone who is part of the conversation.
+        triggerAll: true,
+        ...(priority ? { priority } : {}),
+        metadata: { sentBy: 'user', channel: 'admin-api' },
+      },
+      dataComposer
+    );
+
+    const parsed = JSON.parse((result.content[0] as { text: string }).text) as Record<
+      string,
+      unknown
+    >;
+    if (parsed.messageId == null) {
+      // Nothing stored — the handler refused (closed thread, unknown
+      // participant, refused key). A 2xx here would let the client clear a
+      // draft that never landed.
+      const reason = typeof parsed.error === 'string' ? parsed.error : 'Reply was not stored';
+      res.status(/closed/i.test(reason) ? 409 : 400).json({ error: reason });
+      return;
+    }
+
+    res.json({
+      // The handler folds trigger-routing outcomes into its own `success`,
+      // and it can come back false when the message stored but a wake
+      // bounced (observed: fresh user, both participants' triggers failed);
+      // this route's success means what the person asked: "is my reply in
+      // the thread" — the messageId is the proof.
+      success: true,
+      messageId: parsed.messageId,
+      threadId: parsed.threadId ?? thread.id,
+      triggered: parsed.triggered ?? null,
+      warning: parsed.warning ?? null,
+    });
+  } catch (error) {
+    logger.error('Failed to send thread reply:', error);
+    res.status(500).json(errorJson('Failed to send reply', error));
   }
 });
 
