@@ -207,6 +207,41 @@ describe('POST /threads/reply', () => {
     expect(res._json).toMatchObject({ success: true, messageId: 'msg-10' });
   });
 
+  it('409s on a closed thread before calling the handler', async () => {
+    mockThreadLookup({ id: 'thread-1', thread_key: 'pr:545', status: 'closed' });
+
+    const res = createRes();
+    await reply(createReq({ key: 'pr:545', content: 'too late?' }), res);
+
+    expect(res._status).toBe(409);
+    expect((res._json as { error: string }).error).toMatch(/closed/);
+    expect(mockHandleSendToInbox).not.toHaveBeenCalled();
+  });
+
+  it('returns a non-2xx when the handler stored nothing — a 200 would clear a draft that never landed', async () => {
+    mockThreadLookup({ id: 'thread-1', thread_key: 'pr:545', status: 'open' });
+    mockGetParticipants.mockResolvedValue(['wren']);
+    mockHandleSendToInbox.mockResolvedValue(
+      sendToInboxResult({
+        success: false,
+        error: 'Thread pr:545 is closed. Cannot send to closed threads.',
+      })
+    );
+
+    let res = createRes();
+    await reply(createReq({ key: 'pr:545', content: 'hello' }), res);
+    expect(res._status).toBe(409);
+    expect((res._json as { error: string }).error).toMatch(/closed/);
+
+    mockHandleSendToInbox.mockResolvedValue(
+      sendToInboxResult({ success: false, error: 'Unknown recipient: nobody' })
+    );
+    res = createRes();
+    await reply(createReq({ key: 'pr:545', content: 'hello' }), res);
+    expect(res._status).toBe(400);
+    expect(res._json).toEqual({ error: 'Unknown recipient: nobody' });
+  });
+
   it('surfaces the handler failure instead of claiming success', async () => {
     mockThreadLookup({ id: 'thread-1', thread_key: 'pr:545', status: 'open' });
     mockGetParticipants.mockResolvedValue(['wren']);

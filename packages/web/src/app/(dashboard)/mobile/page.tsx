@@ -127,16 +127,24 @@ export default function MobilePage() {
                           <li key={url}>{url}</li>
                         ))}
                       </ul>
+                      {pair.data.insecureTransport ? (
+                        <p className="mt-2 rounded-md border border-amber-300 bg-amber-50 p-2 text-xs text-amber-800">
+                          <strong>Development only.</strong> These are plain-HTTP LAN addresses: the
+                          pairing token crosses your network in cleartext. Pair only on a network
+                          you trust. A production server advertises HTTPS only.
+                        </p>
+                      ) : null}
                       <p className="mt-2 text-xs text-muted-foreground">
                         Typed codes use the server the app already points at (Settings on the
-                        phone). A phone on another network needs a public URL — set{' '}
+                        phone). A phone on another network needs a public HTTPS URL — set{' '}
                         <code>MCP_BASE_URL</code> on the server.
                       </p>
                     </div>
                   ) : (
                     <p className="text-xs text-amber-600">
-                      No reachable address to advertise — the phone will need the server URL typed
-                      in its Settings, or set <code>MCP_BASE_URL</code> on the server.
+                      {pair.data.development
+                        ? 'No reachable address to advertise — the phone will need the server URL typed in its Settings.'
+                        : 'No HTTPS address to advertise — a production server only pairs over TLS. Set MCP_BASE_URL to your https URL.'}
                     </p>
                   )}
                   {!expired ? (

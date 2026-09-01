@@ -19,6 +19,7 @@ import { runWithRequestContext } from '../utils/request-context';
 import { getDataComposer } from '../data/composer';
 import { handleSendToInbox } from '../mcp/tools/inbox-handlers';
 import { getParticipants } from '../mcp/tools/thread-handlers';
+import { FixedWindowLimiter } from '../utils/fixed-window-limiter';
 import { notifyPlatformOfApprovalRequest } from '../channels/approval-interceptor';
 
 /**
@@ -1325,28 +1326,29 @@ router.post('/auth/logout', async (req: Request, res: Response) => {
  */
 
 /**
- * Password attempts per (IP, email) window. In-memory is enough: the API is a
- * single process, and the limiter only needs to blunt online guessing, not
- * survive restarts.
+ * Attempts on the credential routes. Two buckets per attempt: (ip, account)
+ * blunts guessing at one account, and a per-ip ceiling stops one address
+ * from spraying distinct emails to dodge it. Both live in one bounded
+ * limiter (utils/fixed-window-limiter): amortised pruning and a hard cap, so
+ * a spray can neither grow the map without limit nor make each request scan
+ * it. In-memory is enough — one process, and this only needs to blunt online
+ * guessing, not survive restarts.
  */
-const LOGIN_ATTEMPT_WINDOW_MS = 15 * 60 * 1000;
-const LOGIN_ATTEMPT_LIMIT = 10;
-const loginAttempts = new Map<string, { count: number; windowStartedAt: number }>();
+const AUTH_ATTEMPT_WINDOW_MS = 15 * 60 * 1000;
+const AUTH_ATTEMPTS_PER_ACCOUNT = 10;
+const AUTH_ATTEMPTS_PER_IP = 30;
+const PAIR_CLAIMS_PER_IP = 10;
+const authLimiter = new FixedWindowLimiter(AUTH_ATTEMPT_WINDOW_MS);
 
 function loginRateLimited(ip: string, email: string): boolean {
-  const now = Date.now();
-  // Prune expired windows so the map cannot grow unboundedly under a spray.
-  for (const [key, entry] of loginAttempts) {
-    if (now - entry.windowStartedAt > LOGIN_ATTEMPT_WINDOW_MS) loginAttempts.delete(key);
-  }
-  const key = `${ip}|${email}`;
-  const entry = loginAttempts.get(key);
-  if (!entry || now - entry.windowStartedAt > LOGIN_ATTEMPT_WINDOW_MS) {
-    loginAttempts.set(key, { count: 1, windowStartedAt: now });
-    return false;
-  }
-  entry.count += 1;
-  return entry.count > LOGIN_ATTEMPT_LIMIT;
+  // Charge both buckets for every attempt, then decide.
+  const overIp = authLimiter.hit(`ip:${ip}`, AUTH_ATTEMPTS_PER_IP);
+  const overAccount = authLimiter.hit(`acct:${ip}|${email}`, AUTH_ATTEMPTS_PER_ACCOUNT);
+  return overIp || overAccount;
+}
+
+function pairClaimRateLimited(ip: string): boolean {
+  return authLimiter.hit(`pair:${ip}`, PAIR_CLAIMS_PER_IP);
 }
 
 /**
@@ -1577,6 +1579,18 @@ function pairingCodeStorageKey(code: string): string {
   return `pcp-pair-${code}`;
 }
 
+function isLoopbackHost(hostOrUrl: string): boolean {
+  return /(^|\/\/)(localhost|127\.0\.0\.1|\[::1\]|0\.0\.0\.0)(:|\/|$)/i.test(hostOrUrl);
+}
+
+/** TLS-terminated upstream, direct TLS, or a same-machine caller. */
+function requestIsSecureOrLocal(req: Request): boolean {
+  const forwardedProto = req.get('x-forwarded-proto')?.split(',')[0]?.trim().toLowerCase();
+  if (req.secure || forwardedProto === 'https') return true;
+  const host = (req.get('x-forwarded-host') || req.get('host') || '').split(',')[0].trim();
+  return isLoopbackHost(host);
+}
+
 /**
  * POST /api/admin/auth/mobile-pair/claim
  * Body: { code } → same token pair as mobile-login.
@@ -1593,8 +1607,17 @@ router.post('/auth/mobile-pair/claim', async (req: Request, res: Response) => {
     }
 
     // Per-IP: ten guesses per window against a 60-bit code.
-    if (loginRateLimited(req.ip || 'unknown', 'pair-claim')) {
+    if (pairClaimRateLimited(req.ip || 'unknown')) {
       res.status(429).json({ error: 'Too many attempts. Try again later.' });
+      return;
+    }
+
+    // The response is a 90-day admin credential. In production it leaves
+    // this process only over TLS or to this machine — never across a
+    // cleartext LAN hop. (A client that forges x-forwarded-proto only
+    // downgrades its own connection; the header is trusted for exactly that.)
+    if (!isDevelopment() && !requestIsSecureOrLocal(req)) {
+      res.status(403).json({ error: 'Pairing requires HTTPS' });
       return;
     }
 
@@ -1684,37 +1707,49 @@ router.post('/auth/mobile-refresh', async (req: Request, res: Response) => {
 router.use(adminAuthMiddleware);
 
 /**
- * Where a phone could reach this server: the configured public URL first,
- * then the host the dashboard itself was reached on, then every LAN address
- * this machine has. Loopback is never offered — it is the one address that
- * is guaranteed wrong from another device. The phone probes them in order.
+ * Where a phone could reach this server, in the order it should try them.
+ *
+ * Candidates: the configured public URL, the host the dashboard itself was
+ * reached on, every LAN IPv4 address of this machine. Loopback is never
+ * offered — it is the one address guaranteed wrong from another device.
+ *
+ * Production advertises HTTPS only. The claim response carries a 90-day
+ * admin credential, and a cleartext LAN hop is exactly the network path that
+ * could read it. Development keeps the plain-HTTP LAN addresses — that is how
+ * a phone reaches a laptop — and the response says so (`insecureTransport`),
+ * so the dashboard can say so too. TLS candidates sort first either way: a
+ * reachable https address must never lose to a cleartext one.
  */
-function candidateServerUrls(req: Request): string[] {
-  const urls: string[] = [];
-  const add = (url: string) => {
-    const normalized = url.replace(/\/+$/, '');
-    if (!urls.includes(normalized)) urls.push(normalized);
-  };
-  const isLoopback = (hostOrUrl: string) =>
-    /(^|\/\/)(localhost|127\.0\.0\.1|\[::1\]|0\.0\.0\.0)(:|\/|$)/i.test(hostOrUrl);
+function candidateServerUrls(req: Request): { urls: string[]; insecureTransport: boolean } {
+  const dev = isDevelopment();
+  const isHttps = (url: string) => /^https:\/\//i.test(url);
+  const candidates: string[] = [];
 
-  if (env.MCP_BASE_URL && !isLoopback(env.MCP_BASE_URL)) add(env.MCP_BASE_URL);
+  if (env.MCP_BASE_URL && !isLoopbackHost(env.MCP_BASE_URL)) candidates.push(env.MCP_BASE_URL);
 
   const forwardedHost = req.get('x-forwarded-host')?.split(',')[0]?.trim();
   const host = forwardedHost || req.get('host');
-  if (host && !isLoopback(host)) {
+  if (host && !isLoopbackHost(host)) {
     const proto = req.get('x-forwarded-proto')?.split(',')[0]?.trim() || req.protocol || 'http';
-    add(`${proto}://${host}`);
+    candidates.push(`${proto}://${host}`);
   }
 
   for (const interfaces of Object.values(os.networkInterfaces())) {
     for (const iface of interfaces ?? []) {
       if (iface.family === 'IPv4' && !iface.internal) {
-        add(`http://${iface.address}:${env.MCP_HTTP_PORT}`);
+        candidates.push(`http://${iface.address}:${env.MCP_HTTP_PORT}`);
       }
     }
   }
-  return urls;
+
+  const urls: string[] = [];
+  for (const candidate of candidates) {
+    const normalized = candidate.replace(/\/+$/, '');
+    if (!isHttps(normalized) && !dev) continue;
+    if (!urls.includes(normalized)) urls.push(normalized);
+  }
+  urls.sort((a, b) => Number(isHttps(b)) - Number(isHttps(a)));
+  return { urls, insecureTransport: urls.some((url) => !isHttps(url)) };
 }
 
 /**
@@ -1758,7 +1793,7 @@ router.post('/auth/mobile-pair', async (req: Request, res: Response) => {
       return;
     }
 
-    const urls = candidateServerUrls(req);
+    const { urls, insecureTransport } = candidateServerUrls(req);
     const qrDataUrl = await QRCode.toDataURL(JSON.stringify({ ink: 1, c: code, u: urls }), {
       margin: 1,
       width: 320,
@@ -1770,6 +1805,8 @@ router.post('/auth/mobile-pair', async (req: Request, res: Response) => {
       expiresAt: expiresAt.toISOString(),
       expiresInSeconds: MOBILE_PAIR_CODE_LIFETIME_SECONDS,
       urls,
+      insecureTransport,
+      development: isDevelopment(),
       qrDataUrl,
     });
   } catch (error) {
@@ -7604,7 +7641,7 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
 
     const { data: thread, error: threadError } = await supabase
       .from('inbox_threads')
-      .select('id, thread_key, status')
+      .select('id, thread_key, status, closed_at')
       .eq('user_id', authReq.pcpUserId)
       .eq('thread_key', key)
       .maybeSingle();
@@ -7615,6 +7652,12 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
     }
     if (!thread) {
       res.status(404).json({ error: `No thread with key "${key}"` });
+      return;
+    }
+    if (thread.status === 'closed' || thread.closed_at) {
+      // The inbox handler refuses closed threads; say so with a status no
+      // client can mistake for delivery.
+      res.status(409).json({ error: `Thread "${key}" is closed and no longer accepts replies` });
       return;
     }
 
@@ -7645,13 +7688,23 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
       string,
       unknown
     >;
+    if (parsed.messageId == null) {
+      // Nothing stored — the handler refused (closed thread, unknown
+      // participant, refused key). A 2xx here would let the client clear a
+      // draft that never landed.
+      const reason = typeof parsed.error === 'string' ? parsed.error : 'Reply was not stored';
+      res.status(/closed/i.test(reason) ? 409 : 400).json({ error: reason });
+      return;
+    }
+
     res.json({
       // The handler folds trigger-routing outcomes into its own `success`,
-      // so a stored message with a failed wake reads as failure there. For
-      // this route success means what the person asked: "is my reply in the
-      // thread" — the messageId is the proof.
-      success: parsed.messageId != null || parsed.success !== false,
-      messageId: parsed.messageId ?? null,
+      // and it can come back false when the message stored but a wake
+      // bounced (observed: fresh user, both participants' triggers failed);
+      // this route's success means what the person asked: "is my reply in
+      // the thread" — the messageId is the proof.
+      success: true,
+      messageId: parsed.messageId,
       threadId: parsed.threadId ?? thread.id,
       triggered: parsed.triggered ?? null,
       warning: parsed.warning ?? null,

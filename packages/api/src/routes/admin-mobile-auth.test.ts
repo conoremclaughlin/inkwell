@@ -47,6 +47,9 @@ vi.mock('../services/oauth', () => ({ getOAuthService: vi.fn(() => ({})) }));
 vi.mock('../mcp/tools/inbox-handlers', () => ({ handleSendToInbox: vi.fn() }));
 vi.mock('../mcp/tools/thread-handlers', () => ({ getParticipants: vi.fn() }));
 
+// Mutable so individual tests can run the routes "in production".
+const envState = vi.hoisted(() => ({ dev: true, mcpBaseUrl: undefined as string | undefined }));
+
 vi.mock('../config/env', () => ({
   env: {
     SUPABASE_URL: 'http://localhost:54321',
@@ -55,9 +58,24 @@ vi.mock('../config/env', () => ({
     JWT_SECRET: 'test-jwt-secret-that-is-at-least-32-characters-long',
     NODE_ENV: 'development',
     MCP_HTTP_PORT: 3001,
+    get MCP_BASE_URL() {
+      return envState.mcpBaseUrl;
+    },
   },
-  isDevelopment: () => true,
+  isDevelopment: () => envState.dev,
 }));
+
+/** Run `fn` with the routes believing they are in production. */
+async function inProduction(fn: () => Promise<void>, mcpBaseUrl?: string) {
+  envState.dev = false;
+  envState.mcpBaseUrl = mcpBaseUrl;
+  try {
+    await fn();
+  } finally {
+    envState.dev = true;
+    envState.mcpBaseUrl = undefined;
+  }
+}
 
 vi.mock('../utils/logger', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -256,6 +274,29 @@ describe('POST /auth/mobile-login', () => {
   });
 });
 
+describe('credential-route limiter', () => {
+  it('caps one IP across DISTINCT emails, not just per account', async () => {
+    mockSignInWithPassword.mockResolvedValue({
+      data: { user: null },
+      error: { message: 'nope' },
+    });
+    // 30 attempts from one address, every one a different email: each
+    // per-account bucket sees a single hit, so only the per-IP ceiling can stop it.
+    for (let i = 0; i < 30; i += 1) {
+      const res = createRes();
+      await login(createReq({ email: `spray-${i}@b.co`, password: 'x' }, '7.7.7.7'), res);
+      expect(res._status, `attempt ${i}`).toBe(401);
+    }
+    mockSignInWithPassword.mockClear();
+
+    const res = createRes();
+    await login(createReq({ email: 'spray-final@b.co', password: 'x' }, '7.7.7.7'), res);
+
+    expect(res._status).toBe(429);
+    expect(mockSignInWithPassword).not.toHaveBeenCalled();
+  });
+});
+
 // ---------------------------------------------------------------------------
 // /auth/mobile-refresh
 // ---------------------------------------------------------------------------
@@ -433,6 +474,8 @@ describe('POST /auth/mobile-pair', () => {
     };
     expect(body.code).toMatch(/^[A-Z2-9]{4}-[A-Z2-9]{4}-[A-Z2-9]{4}$/);
     expect(body.expiresInSeconds).toBe(600);
+    // Development: plain-HTTP LAN addresses are offered, and flagged as such.
+    expect((res._json as { insecureTransport: boolean }).insecureTransport).toBe(true);
     expect(body.qrDataUrl).toMatch(/^data:image\/png;base64,/);
     // The dashboard's own host is offered; loopback never is.
     expect(body.urls).toContain('http://192.168.1.20:3001');
@@ -458,6 +501,72 @@ describe('POST /auth/mobile-pair', () => {
     };
     expect(payload).toEqual({ ink: 1, c: body.code.replace(/-/g, ''), u: body.urls });
     qrSpy.mockRestore();
+  });
+});
+
+describe('POST /auth/mobile-pair in production', () => {
+  function pairChain() {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const chain: Record<string, any> = {};
+    chain.delete = vi.fn(() => chain);
+    chain.eq = vi.fn(() => chain);
+    chain.lt = vi.fn(() => Promise.resolve({ error: null }));
+    chain.insert = vi.fn(() => Promise.resolve({ error: null }));
+    mockSupabaseFrom.mockImplementation(() => chain);
+    return chain;
+  }
+
+  it('advertises HTTPS only — the LAN and a plain-http dashboard host are dropped', async () => {
+    pairChain();
+    await inProduction(async () => {
+      const res = createRes();
+      await pairStart(
+        createReq({}, '1.2.3.4', {
+          pcpUserId: 'pcp-user-1',
+          get: (name: string) => (name.toLowerCase() === 'host' ? '192.168.1.20:3001' : undefined),
+        }),
+        res
+      );
+      expect(res._status).toBe(200);
+      const body = res._json as { urls: string[]; insecureTransport: boolean };
+      // A public https base URL is the only thing worth advertising.
+      expect(body.urls).toEqual(['https://ink.example.com']);
+      expect(body.insecureTransport).toBe(false);
+    }, 'https://ink.example.com/');
+  });
+
+  it('advertises nothing rather than cleartext when no https address exists', async () => {
+    pairChain();
+    await inProduction(async () => {
+      const res = createRes();
+      await pairStart(
+        createReq({}, '1.2.3.4', {
+          pcpUserId: 'pcp-user-1',
+          get: (name: string) => (name.toLowerCase() === 'host' ? '192.168.1.20:3001' : undefined),
+        }),
+        res
+      );
+      expect(res._status).toBe(200);
+      expect((res._json as { urls: string[] }).urls).toEqual([]);
+    });
+  });
+
+  it('puts the TLS candidate first even in development', async () => {
+    pairChain();
+    const res = createRes();
+    await pairStart(
+      createReq({}, '1.2.3.4', {
+        pcpUserId: 'pcp-user-1',
+        get: (name: string) => {
+          if (name.toLowerCase() === 'host') return 'ink.example.com';
+          if (name.toLowerCase() === 'x-forwarded-proto') return 'https';
+          return undefined;
+        },
+      }),
+      res
+    );
+    const body = res._json as { urls: string[] };
+    expect(body.urls[0]).toBe('https://ink.example.com');
   });
 });
 
@@ -537,6 +646,58 @@ describe('POST /auth/mobile-pair/claim', () => {
       ['admin'],
       expect.any(Number)
     );
+  });
+
+  it('in production refuses a cleartext claim from another machine, but not TLS or loopback', async () => {
+    const future = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+    await inProduction(async () => {
+      // Plain http from the LAN: the token would cross the network in the clear.
+      mockPairClaim(
+        { user_id: 'pcp-user-1', expires_at: future },
+        { id: 'pcp-user-1', email: 'a@b.co' }
+      );
+      let res = createRes();
+      await pairClaim(
+        createReq({ code: 'ABCD-EFGH-JKLM' }, '5.5.5.5', {
+          get: (name: string) => (name.toLowerCase() === 'host' ? '192.168.1.20:3001' : undefined),
+        }),
+        res
+      );
+      expect(res._status).toBe(403);
+      expect(mockSupabaseFrom).not.toHaveBeenCalled();
+
+      // TLS-terminated upstream.
+      mockPairClaim(
+        { user_id: 'pcp-user-1', expires_at: future },
+        { id: 'pcp-user-1', email: 'a@b.co' }
+      );
+      res = createRes();
+      await pairClaim(
+        createReq({ code: 'ABCD-EFGH-JKLM' }, '5.5.5.5', {
+          get: (name: string) => {
+            if (name.toLowerCase() === 'host') return 'ink.example.com';
+            if (name.toLowerCase() === 'x-forwarded-proto') return 'https';
+            return undefined;
+          },
+        }),
+        res
+      );
+      expect(res._status).toBe(200);
+
+      // Same machine.
+      mockPairClaim(
+        { user_id: 'pcp-user-1', expires_at: future },
+        { id: 'pcp-user-1', email: 'a@b.co' }
+      );
+      res = createRes();
+      await pairClaim(
+        createReq({ code: 'ABCD-EFGH-JKLM' }, '5.5.5.5', {
+          get: (name: string) => (name.toLowerCase() === 'host' ? 'localhost:3001' : undefined),
+        }),
+        res
+      );
+      expect(res._status).toBe(200);
+    });
   });
 
   it('rate-limits claims per IP before consulting the database', async () => {
