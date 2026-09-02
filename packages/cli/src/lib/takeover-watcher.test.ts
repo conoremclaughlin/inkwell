@@ -363,10 +363,11 @@ describe('scope-end wiring (round 17, reachability)', () => {
       'utf-8'
     );
     const helper = source.indexOf('function startSessionTakeoverWatcher(');
-    const finalize = source.indexOf('finalizeScope: async (turnEpoch, tombstoneAt) => {', helper);
+    const finalize = source.indexOf('finalizeScope: async (turnEpoch) => {', helper);
     const fenced = source.indexOf('turnEpochMissing: true,', finalize);
-    const scopedStone = source.indexOf('scopeTombstoneAt: tombstoneAt', finalize);
-    expect(scopedStone).toBeGreaterThan(finalize);
+    // Round 20: the fence is the GENERATION, not a timestamp.
+    const scopedGen = source.indexOf('scopeGeneration: generation', finalize);
+    expect(scopedGen).toBeGreaterThan(finalize);
     expect(finalize).toBeGreaterThan(helper);
     expect(fenced).toBeGreaterThan(finalize);
     // Every stop is awaited — the boundary is real, not fire-and-forget.
@@ -468,7 +469,7 @@ describe('event-driven ticks and the stop boundary (round 17)', () => {
     releaseClaim!();
     await stopped;
 
-    expect(finalizeScope).toHaveBeenCalledWith('epoch-crash', undefined);
+    expect(finalizeScope).toHaveBeenCalledWith('epoch-crash');
   });
 
   it('a scope that NEVER attempted a claim does not finalize — no tombstone to refuse a successor (round 18)', async () => {
@@ -505,9 +506,7 @@ describe('event-driven ticks and the stop boundary (round 17)', () => {
 
     await watcher.stop();
 
-    // Round 19: the tombstone is SCOPED to our own attempted marker's birth
-    // time — never now(), which could refuse a successor's newer marker.
-    expect(finalizeScope).toHaveBeenCalledWith(undefined, markerAt);
+    expect(finalizeScope).toHaveBeenCalledWith(undefined);
     // Acknowledged boundary → the marker evidence retires with the scope.
     expect(existsSync(p)).toBe(false);
   });
@@ -606,7 +605,11 @@ describe('close-race enforcement and compare-and-delete (round 19)', () => {
   it('a successor generation’s overwrite survives a parked claim’s retirement', async () => {
     let releaseClaim: (() => void) | undefined;
     const claim = vi.fn(() => new Promise<'ok'>((resolve) => (releaseClaim = () => resolve('ok'))));
-    const p = write({ sessionId: 's1', at: new Date().toISOString(), wrapperGeneration: 'gen-a' });
+    const p = takeoverMarkerPath(dir, 'gen-a');
+    writeFileSync(
+      p,
+      JSON.stringify({ sessionId: 's1', at: new Date().toISOString(), wrapperGeneration: 'gen-a' })
+    );
     const watcher = startTakeoverWatcher({
       cwd: dir,
       expectedSessionId: 's1',
@@ -647,5 +650,55 @@ describe('close-race enforcement and compare-and-delete (round 19)', () => {
 
     clearCliTurnEpoch(dir, 's1', { turnEpoch: 'e-b', wrapperGeneration: 'gen-b' });
     expect(readCliTurnEpoch(dir)).toBeNull();
+  });
+});
+
+/**
+ * Round 20 (Lumen): one shared marker path was lossy across coexisting
+ * generations, and read/check/unlink is not an atomic cross-process CAS.
+ * Each generation now owns its file outright.
+ */
+describe('per-generation marker files (round 20)', () => {
+  it('the path is generation-scoped, with the legacy path preserved', () => {
+    expect(takeoverMarkerPath('/w', 'gen-a')).toBe('/w/.ink/pending-takeover.gen-a.json');
+    expect(takeoverMarkerPath('/w')).toBe('/w/.ink/pending-takeover.json');
+  });
+
+  it('two coexisting generations both recover — back-to-back writes lose nothing', async () => {
+    const claimA = vi.fn(async () => 'ok' as const);
+    const claimB = vi.fn(async () => 'ok' as const);
+    const watcherA = startTakeoverWatcher({
+      cwd: dir,
+      expectedSessionId: 's1',
+      generation: 'gen-a',
+      claim: claimA,
+      intervalMs: 60_000,
+    });
+    const watcherB = startTakeoverWatcher({
+      cwd: dir,
+      expectedSessionId: 's1',
+      generation: 'gen-b',
+      claim: claimB,
+      intervalMs: 60_000,
+    });
+
+    // The round-20 repro: A's and B's prompt hooks write back-to-back. With
+    // one shared path the second write erased the first ({a:0, b:1}).
+    const pa = takeoverMarkerPath(dir, 'gen-a');
+    const pb = takeoverMarkerPath(dir, 'gen-b');
+    writeFileSync(pa, JSON.stringify({ sessionId: 's1', at: new Date().toISOString() }));
+    writeFileSync(pb, JSON.stringify({ sessionId: 's1', at: new Date().toISOString() }));
+
+    await vi.waitFor(
+      () => {
+        expect(claimA).toHaveBeenCalledTimes(1);
+        expect(claimB).toHaveBeenCalledTimes(1);
+      },
+      { timeout: 2000 }
+    );
+    expect(existsSync(pa)).toBe(false);
+    expect(existsSync(pb)).toBe(false);
+    await watcherA.stop();
+    await watcherB.stop();
   });
 });

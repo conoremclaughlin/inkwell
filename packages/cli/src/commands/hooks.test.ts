@@ -1386,7 +1386,10 @@ describe('CLI turn-epoch round-trip (round 10)', () => {
     const cleared = source.indexOf('clearCliTurnEpoch(cwd, stopSessionId, {', stop);
     // Round 19: the record must match OUR wrapper generation, and the clear
     // is compare-and-delete on the exact record we sent.
-    const genGuard = source.indexOf('epochRecord.wrapperGeneration === stopGeneration', stop);
+    const genGuard = source.indexOf(
+      '(epochRecord.wrapperGeneration ?? undefined) === (stopGeneration ?? undefined)',
+      stop
+    );
     expect(genGuard).toBeGreaterThan(stop);
     expect(stop).toBeGreaterThan(-1);
     expect(read).toBeGreaterThan(stop);
@@ -1455,10 +1458,10 @@ describe('lease acknowledgement and fail-closed degradation (round 11)', () => {
     expect(loud).toBeGreaterThan(record);
 
     const stop = source.indexOf('async function onStopHandler(');
-    const admit = source.indexOf(
-      '...(stopEpoch ? { turnEpoch: stopEpoch } : { turnEpochMissing: true })',
-      stop
-    );
+    const admit = source.indexOf('turnEpochMissing: true,', stop);
+    // Round 20: the missing admission is SCOPED to our own generation.
+    const admitScope = source.indexOf('scopeGeneration: stopGeneration', stop);
+    expect(admitScope).toBeGreaterThan(stop);
     expect(admit).toBeGreaterThan(stop);
   });
 });
@@ -1470,7 +1473,9 @@ describe('wrapper generation binding (round 18)', () => {
     const { fileURLToPath } = await import('url');
     const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'hooks.ts'), 'utf-8');
 
-    const marker = source.indexOf('const markerPath = pendingTakeoverMarkerPath(cwd);');
+    const marker = source.indexOf(
+      'const markerPath = pendingTakeoverMarkerPath(cwd, process.env.INK_RUNTIME_LINK_ID);'
+    );
     const markerGen = source.indexOf('wrapperGeneration: process.env.INK_RUNTIME_LINK_ID', marker);
     expect(marker).toBeGreaterThan(-1);
     expect(markerGen).toBeGreaterThan(marker);

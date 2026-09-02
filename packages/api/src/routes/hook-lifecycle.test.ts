@@ -555,17 +555,17 @@ describe('hook-lifecycle CLI turn signal', () => {
         expect(call[1]).not.toHaveProperty('cliTurnAt');
         expect(call[1]).not.toHaveProperty('cliTurnStoppedAt');
       }
-      const sessionWrites = recordedUpdates.filter((u) => u.table === 'sessions');
-      expect(sessionWrites).toHaveLength(1);
-      expect(Object.keys(sessionWrites[0]!.payload)).toEqual(['cli_turn_stopped_at']);
+      // Round 20: a generation-less modern stop has no watcher and nothing
+      // parked — it stamps NOTHING (an unscoped fence could refuse a
+      // coexisting generation's reclaim).
+      expect(recordedUpdates.filter((u) => u.table === 'sessions')).toHaveLength(0);
       expect(renew).toHaveBeenCalled();
       await new Promise((r) => setImmediate(r));
       expect(release).not.toHaveBeenCalled();
       expect(releaseGraphClaimsForSession).not.toHaveBeenCalled();
     });
 
-    it('a SCOPED tombstone stamps the attempted marker time, monotonically (round 19)', async () => {
-      const markerAt = '2026-09-02T03:00:00.000Z';
+    it('a scope-end fence stamps the SENDER GENERATION, never a timestamp (round 20)', async () => {
       const resp = await fetch(`${baseUrl}/api/hooks/lifecycle`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: 'Bearer test' },
@@ -574,25 +574,32 @@ describe('hook-lifecycle CLI turn signal', () => {
           lifecycle: 'idle',
           event: 'stop',
           turnEpochMissing: true,
-          scopeTombstoneAt: markerAt,
+          scopeGeneration: 'gen-a',
         }),
       });
       expect(resp.status).toBe(200);
 
       const stamp = recordedUpdates.find(
-        (u) => u.table === 'sessions' && 'cli_turn_stopped_at' in u.payload
+        (u) => u.table === 'sessions' && 'cli_turn_fence_generation' in u.payload
       )!;
-      // Scoped to the wrapper's OWN attempted marker — never now(), which
-      // could postdate and refuse a successor generation's newer marker.
-      expect(stamp.payload.cli_turn_stopped_at).toBe(markerAt);
-      // ...and monotonic: guarded so an existing newer tombstone survives.
-      expect(stamp.eqs).toContainEqual([
-        'or',
-        `cli_turn_stopped_at.is.null,cli_turn_stopped_at.lt.${markerAt}`,
-      ]);
+      expect(stamp).toBeDefined();
+      // The fence refuses exactly gen-a's parked reclaims — a timestamp
+      // cannot distinguish same-millisecond attempts by coexisting
+      // generations, and its equality edge claimed (round 20).
+      expect(stamp.payload).toEqual({ cli_turn_fence_generation: 'gen-a' });
     });
 
-    it('a REFUSED tombstone stamp fails the suppressed stop — never a 200 without the fence (round 18)', async () => {
+    it('a RECLAIM carries its wrapper generation into the claim CAS (round 20)', async () => {
+      await post({
+        lifecycle: 'running',
+        event: 'prompt',
+        reclaimOf: '2026-09-02T03:00:00.000Z',
+        wrapperGeneration: 'gen-a',
+      });
+      expect(rpcCalls[0]![1]).toMatchObject({ p_wrapper_generation: 'gen-a' });
+    });
+
+    it('a REFUSED fence stamp fails the suppressed stop — never a 200 without the fence (rounds 18, 20)', async () => {
       directUpdateError = { message: 'db down' };
 
       const resp = await fetch(`${baseUrl}/api/hooks/lifecycle`, {
@@ -603,6 +610,7 @@ describe('hook-lifecycle CLI turn signal', () => {
           lifecycle: 'idle',
           event: 'stop',
           turnEpochMissing: true,
+          scopeGeneration: 'gen-a',
         }),
       });
 

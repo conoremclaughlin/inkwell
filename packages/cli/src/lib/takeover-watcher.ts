@@ -22,9 +22,20 @@ import { join } from 'path';
 
 export const TAKEOVER_MARKER_MAX_AGE_MS = 10 * 60 * 1000;
 
-/** Mirrors hooks.ts pendingTakeoverMarkerPath — the file is the contract. */
-export function takeoverMarkerPath(cwd: string): string {
-  return join(cwd, '.ink', 'pending-takeover.json');
+/**
+ * Mirrors hooks.ts pendingTakeoverMarkerPath — the file is the contract.
+ * Round 20: the marker is PER WRAPPER GENERATION (`pending-takeover.<gen>.json`)
+ * — one shared path was lossy across coexisting generations, and
+ * read/check/unlink is not an atomic cross-process CAS. Each generation owns
+ * its file outright; the generation-less path remains for legacy hooks and
+ * the claude channel plugin.
+ */
+export function takeoverMarkerPath(cwd: string, generation?: string): string {
+  return join(
+    cwd,
+    '.ink',
+    generation ? `pending-takeover.${generation}.json` : 'pending-takeover.json'
+  );
 }
 
 /**
@@ -218,16 +229,7 @@ export function startTakeoverWatcher(opts: {
    * (the wrapper stamps the stop tombstone so a claim still parked in the
    * server — e.g. behind a timed-out fetch — is refused when it lands).
    */
-  finalizeScope?: (
-    turnEpoch: string | undefined,
-    /**
-     * Round 19: when nothing was claimed, the tombstone must be SCOPED to
-     * this generation's own parked claim — its last attempted marker's
-     * birth time. A now() tombstone would postdate (and wrongly refuse) a
-     * successor generation's newer marker on the same session.
-     */
-    tombstoneAt?: string
-  ) => Promise<void>;
+  finalizeScope?: (turnEpoch: string | undefined) => Promise<void>;
   /** Round 18: this wrapper's generation (runtimeLinkId) — see watchTick. */
   generation?: string;
   intervalMs?: number;
@@ -235,7 +237,7 @@ export function startTakeoverWatcher(opts: {
   /** Round 15: the lease is PERMANENTLY gone — enforce (terminate the backend). */
   onUnprotected?: () => void;
 }): { stop: () => Promise<void> } {
-  const markerPath = takeoverMarkerPath(opts.cwd);
+  const markerPath = takeoverMarkerPath(opts.cwd, opts.generation);
   let stopping = false;
   let inFlight: Promise<void> | null = null;
   // Round 18: whether THIS generation ever reached a claim attempt — the
@@ -244,7 +246,6 @@ export function startTakeoverWatcher(opts: {
   // never claimed must not stamp a tombstone that could refuse a
   // SUCCESSOR wrapper's older-marker reclaim.
   let attemptedClaim = false;
-  let lastAttemptedMarkerAt: string | undefined;
   const tickOnce = async () => {
     try {
       const outcome = await watchTick({
@@ -253,7 +254,6 @@ export function startTakeoverWatcher(opts: {
         expectedGeneration: opts.generation,
         claim: (sessionId, markerAt) => {
           attemptedClaim = true;
-          lastAttemptedMarkerAt = markerAt;
           return opts.claim(sessionId, markerAt);
         },
       });
@@ -282,8 +282,11 @@ export function startTakeoverWatcher(opts: {
   let dirWatcher: import('fs').FSWatcher | undefined;
   try {
     mkdirSync(join(opts.cwd, '.ink'), { recursive: true });
+    const markerName = opts.generation
+      ? `pending-takeover.${opts.generation}.json`
+      : 'pending-takeover.json';
     dirWatcher = watch(join(opts.cwd, '.ink'), (_event, filename) => {
-      if (filename === 'pending-takeover.json') runTick();
+      if (filename === markerName) runTick();
     });
     dirWatcher.unref?.();
   } catch {
@@ -326,10 +329,7 @@ export function startTakeoverWatcher(opts: {
         // wrapper's reclaim of an OLDER marker (round 18).
         if (claimedEpoch !== undefined || attemptedClaim) {
           try {
-            await opts.finalizeScope(
-              claimedEpoch,
-              claimedEpoch === undefined ? lastAttemptedMarkerAt : undefined
-            );
+            await opts.finalizeScope(claimedEpoch);
             finalized = true;
             if (claimedEpoch) {
               clearCliTurnEpoch(opts.cwd, opts.expectedSessionId, {

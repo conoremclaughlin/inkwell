@@ -560,6 +560,52 @@ d('session_running_write trigger', () => {
       }
     });
 
+    it('the generation fence refuses exactly its own generation, and equality no longer claims (round 20)', async () => {
+      const sessionId = await insertSession({ lifecycle: 'running', metadata: {} });
+
+      // 1) Generation fence: stamp gen-a; gen-a's reclaim is refused, a
+      // coexisting gen-b's reclaim (any timestamp, even identical) passes.
+      await client
+        .from('sessions')
+        .update({ cli_turn_fence_generation: 'gen-a' } as never)
+        .eq('id', sessionId);
+      const markerAt = new Date().toISOString();
+      const { data: refusedA } = await client.rpc('claim_turn_epoch', {
+        p_session_id: sessionId,
+        p_set_running: true,
+        p_not_stopped_after: markerAt,
+        p_wrapper_generation: 'gen-a',
+      } as never);
+      expect((refusedA as unknown as { outcome: string }).outcome).toBe('stopped');
+      const { data: allowedB } = await client.rpc('claim_turn_epoch', {
+        p_session_id: sessionId,
+        p_set_running: true,
+        p_not_stopped_after: markerAt,
+        p_wrapper_generation: 'gen-b',
+      } as never);
+      expect((allowedB as unknown as { outcome: string }).outcome).toBe('claimed');
+
+      // 2) Strict timestamp fence: a tombstone EQUAL to the marker's birth
+      // time refuses (the <= edge used to claim); strictly older passes.
+      const stampAt = new Date().toISOString();
+      await client
+        .from('sessions')
+        .update({ cli_turn_stopped_at: stampAt, cli_turn_fence_generation: null } as never)
+        .eq('id', sessionId);
+      const { data: equalRefused } = await client.rpc('claim_turn_epoch', {
+        p_session_id: sessionId,
+        p_set_running: true,
+        p_not_stopped_after: stampAt,
+      } as never);
+      expect((equalRefused as unknown as { outcome: string }).outcome).toBe('stopped');
+      const { data: newerAllowed } = await client.rpc('claim_turn_epoch', {
+        p_session_id: sessionId,
+        p_set_running: true,
+        p_not_stopped_after: new Date(Date.parse(stampAt) + 1000).toISOString(),
+      } as never);
+      expect((newerAllowed as unknown as { outcome: string }).outcome).toBe('claimed');
+    });
+
     it('a PATHLESS studio regrants under the canonical backing class (round 16)', async () => {
       // Round 15 refused every unchanged empty-path regrant (the moved-
       // backing recheck compared '' to NULLIF('','')) and locked the wrong

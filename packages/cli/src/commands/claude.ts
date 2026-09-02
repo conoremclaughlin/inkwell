@@ -3549,7 +3549,7 @@ function startSessionTakeoverWatcher(
     // closed with its FENCED stop (a crashed child sends no stop hook); an
     // unclaimed scope stamps the stop tombstone so a claim still parked in
     // the server is refused when it lands.
-    finalizeScope: async (turnEpoch, tombstoneAt) => {
+    finalizeScope: async (turnEpoch) => {
       await postLifecycle({
         sessionId: pcpSessionId,
         lifecycle: 'idle',
@@ -3558,10 +3558,10 @@ function startSessionTakeoverWatcher(
           ? { turnEpoch }
           : {
               turnEpochMissing: true,
-              // Round 19: scope the tombstone to OUR parked claim's marker
-              // birth time — a now() tombstone could postdate and refuse a
-              // successor generation's newer marker on the same session.
-              ...(tombstoneAt ? { scopeTombstoneAt: tombstoneAt } : {}),
+              // Round 20: the fence is OUR GENERATION — it refuses exactly
+              // this generation's parked reclaims, and no timestamp can
+              // collide a successor into it.
+              ...(generation ? { scopeGeneration: generation } : {}),
             }),
         agentId: 'wrapper-scope-end',
       });
@@ -3580,6 +3580,9 @@ function startSessionTakeoverWatcher(
             lifecycle: 'running',
             event: 'prompt',
             reclaimOf: markerAt,
+            // Round 20: the reclaim carries OUR generation so the DB fence
+            // can refuse it after our own scope end — and only ours.
+            ...(generation ? { wrapperGeneration: generation } : {}),
             // Round 11: the server exact-CAS-touches OUR studio's lease and
             // reports whether it is still held under the reclaimed turn.
             ...(studioId && studioId !== 'main' ? { studioId } : {}),

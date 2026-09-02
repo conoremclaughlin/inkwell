@@ -61,7 +61,8 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         reclaimOf,
         turnEpoch,
         turnEpochMissing,
-        scopeTombstoneAt,
+        scopeGeneration,
+        wrapperGeneration,
       } = req.body as {
         sessionId?: string;
         lifecycle?: string;
@@ -112,13 +113,17 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
          */
         turnEpochMissing?: boolean;
         /**
-         * Round 19: a wrapper scope-end tombstone SCOPED to that wrapper's
-         * own parked claim — its last attempted marker's birth time. The
-         * stamp is monotonic (GREATEST semantics via a guarded update), so
-         * it fences exactly the stale generation's claim without postdating
-         * a successor generation's newer marker.
+         * Round 20: the sender's wrapper generation, for a scope-end fence.
+         * Stamped into cli_turn_fence_generation — it refuses exactly that
+         * generation's parked reclaims, with no timestamp involvement, so a
+         * successor generation is untouched at any clock resolution.
          */
-        scopeTombstoneAt?: string;
+        scopeGeneration?: string;
+        /**
+         * Round 20: a RECLAIM's own wrapper generation — matched against
+         * cli_turn_fence_generation inside the claim's atomic CAS.
+         */
+        wrapperGeneration?: string;
       };
 
       if (!sessionId) {
@@ -267,6 +272,9 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
             ...(reclaimOf ? { p_not_stopped_after: reclaimOf } : {}),
             ...(claimStudioId ? { p_studio_id: claimStudioId } : {}),
             ...(regrant ? { p_regrant: regrant } : {}),
+            ...(typeof wrapperGeneration === 'string' && wrapperGeneration
+              ? { p_wrapper_generation: wrapperGeneration }
+              : {}),
           } as never);
         const verdict = (claimed ?? null) as {
           outcome?: string;
@@ -444,30 +452,31 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         // safe (it only refuses RECLAIMS whose marker predates it; live
         // prompts are unconditional), and without it a claim still parked in
         // the server past the wrapper's scope end would land on a dead turn.
-        // Round 18: the tombstone is the ONLY fence this path provides — a
-        // 200 without it would tell the wrapper its scope end is safe while
-        // a parked claim can still land. A refused stamp fails the request
-        // so the caller keeps its evidence and retries.
-        try {
-          const scoped =
-            typeof scopeTombstoneAt === 'string' && Number.isFinite(Date.parse(scopeTombstoneAt));
-          const stampAt = scoped ? (scopeTombstoneAt as string) : new Date().toISOString();
-          // Monotonic: never move an existing NEWER tombstone backward — a
-          // zero-row match means a later stop already fenced further.
-          const { error: tombstoneError } = await dataComposer
-            .getClient()
-            .from('sessions')
-            .update({ cli_turn_stopped_at: stampAt })
-            .eq('id', sessionId)
-            .or(`cli_turn_stopped_at.is.null,cli_turn_stopped_at.lt.${stampAt}`);
-          if (tombstoneError) throw new Error(tombstoneError.message);
-        } catch (err: unknown) {
-          logger.error('[HookLifecycle] Suppressed-stop tombstone stamp failed', {
-            sessionId,
-            error: err instanceof Error ? err.message : String(err),
-          });
-          res.status(500).json({ success: false, error: 'stop tombstone failed' });
-          return;
+        // Rounds 18–20: the GENERATION fence is the only fence this path
+        // provides — a 200 without it would tell the wrapper its scope end
+        // is safe while its parked claim can still land. The stamp names
+        // the SENDER'S generation, refusing exactly that generation's
+        // reclaims and no one else's (a timestamp cannot distinguish
+        // same-millisecond attempts by coexisting generations, and its
+        // equality edge claimed — round 20). A generation-less modern stop
+        // has no watcher and therefore nothing parked: it stamps nothing.
+        // A refused stamp fails the request so the caller keeps evidence.
+        if (typeof scopeGeneration === 'string' && scopeGeneration) {
+          try {
+            const { error: fenceError } = await dataComposer
+              .getClient()
+              .from('sessions')
+              .update({ cli_turn_fence_generation: scopeGeneration })
+              .eq('id', sessionId);
+            if (fenceError) throw new Error(fenceError.message);
+          } catch (err: unknown) {
+            logger.error('[HookLifecycle] Suppressed-stop generation fence failed', {
+              sessionId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+            res.status(500).json({ success: false, error: 'stop fence failed' });
+            return;
+          }
         }
         try {
           await leaseService.renewBySession(sessionId, session.userId);

@@ -3014,6 +3014,7 @@ export type Database = {
           cli_poll_at: string | null;
           cli_turn_at: string | null;
           cli_turn_stopped_at: string | null;
+          cli_turn_fence_generation: string | null;
           turn_epoch: string | null;
           compacting_since: string | null;
           contact_id: string | null;
@@ -3048,6 +3049,7 @@ export type Database = {
           cli_poll_at?: string | null;
           cli_turn_at?: string | null;
           cli_turn_stopped_at?: string | null;
+          cli_turn_fence_generation?: string | null;
           turn_epoch?: string | null;
           compacting_since?: string | null;
           contact_id?: string | null;
@@ -3082,6 +3084,7 @@ export type Database = {
           cli_poll_at?: string | null;
           cli_turn_at?: string | null;
           cli_turn_stopped_at?: string | null;
+          cli_turn_fence_generation?: string | null;
           turn_epoch?: string | null;
           compacting_since?: string | null;
           contact_id?: string | null;
@@ -4594,6 +4597,7 @@ export type Database = {
           p_not_stopped_after?: string;
           p_studio_id?: string;
           p_regrant?: Json;
+          p_wrapper_generation?: string;
         };
         Returns: Json;
       };

@@ -779,6 +779,8 @@ async function updateRuntimeGenerationState(
      * instead of treating this stop as a legacy unfenced one.
      */
     turnEpochMissing?: boolean;
+    /** Round 20: fences only this generation's parked reclaims at scope end. */
+    scopeGeneration?: string;
     /**
      * Prompt events (round 11): the caller's worktree studio. The server
      * restamps + exact-CAS-touches ITS lease and reports `studioLeaseHeld`;
@@ -815,6 +817,7 @@ async function updateRuntimeGenerationState(
           ...(opts?.headless ? { headless: true } : {}),
           ...(opts?.turnEpoch ? { turnEpoch: opts.turnEpoch } : {}),
           ...(opts?.turnEpochMissing ? { turnEpochMissing: true } : {}),
+          ...(opts?.scopeGeneration ? { scopeGeneration: opts.scopeGeneration } : {}),
           ...(opts?.studioId && opts.studioId !== 'main' ? { studioId: opts.studioId } : {}),
           agentId,
           workingDir: cwd,
@@ -866,9 +869,18 @@ async function updateRuntimeGenerationState(
   return { ok: false };
 }
 
-/** Where the pending-takeover marker lives, shared with the channel plugin. */
-export function pendingTakeoverMarkerPath(cwd: string): string {
-  return join(cwd, '.ink', 'pending-takeover.json');
+/**
+ * Where the pending-takeover marker lives, shared with the channel plugin
+ * and the wrapper watcher. Round 20: PER WRAPPER GENERATION — one shared
+ * path was lossy across coexisting generations. The generation-less path
+ * remains for legacy senders and the claude channel plugin.
+ */
+export function pendingTakeoverMarkerPath(cwd: string, generation?: string): string {
+  return join(
+    cwd,
+    '.ink',
+    generation ? `pending-takeover.${generation}.json` : 'pending-takeover.json'
+  );
 }
 
 /**
@@ -2579,7 +2591,7 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
     handleFailedTakeover(lifecycleBackend, {
       agentId,
       writePendingTakeover: () => {
-        const markerPath = pendingTakeoverMarkerPath(cwd);
+        const markerPath = pendingTakeoverMarkerPath(cwd, process.env.INK_RUNTIME_LINK_ID);
         mkdirSync(dirname(markerPath), { recursive: true });
         writeFileSync(
           markerPath,
@@ -2601,7 +2613,7 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
     // A successful takeover supersedes any marker from an earlier failed
     // prompt — the recovery it described is no longer this generation's.
     try {
-      rmSync(pendingTakeoverMarkerPath(cwd), { force: true });
+      rmSync(pendingTakeoverMarkerPath(cwd, process.env.INK_RUNTIME_LINK_ID), { force: true });
     } catch {
       // Best-effort cleanup.
     }
@@ -2781,7 +2793,9 @@ async function onStopHandler(options?: { backend?: string }): Promise<void> {
   // turn: a marker left behind must not let the channel plugin claim/mark
   // running AFTER the turn finished (PR #563 round 8).
   try {
-    rmSync(pendingTakeoverMarkerPath(cwd), { force: true });
+    // Round 20: only OUR OWN generation's marker — a stale backend's stop
+    // must never delete a successor generation's recovery evidence.
+    rmSync(pendingTakeoverMarkerPath(cwd, process.env.INK_RUNTIME_LINK_ID), { force: true });
   } catch {
     // Best-effort cleanup.
   }
@@ -2822,16 +2836,24 @@ async function onStopHandler(options?: { backend?: string }): Promise<void> {
   // Round 19: the record must belong to OUR session AND OUR wrapper
   // generation — a stale backend's on-stop must not send (and then clear) a
   // successor generation's epoch. Generation-less pairs still match (legacy).
+  // Round 20: EXACT generation match — a legacy (generation-less) stop must
+  // not consume a modern generation's record, nor vice versa. Only a
+  // fully-legacy pair (both sides generation-less) still matches.
   const recordIsOurs =
     Boolean(stopSessionId) &&
     epochRecord != null &&
     epochRecord.sessionId === stopSessionId &&
-    (epochRecord.wrapperGeneration === undefined ||
-      stopGeneration === undefined ||
-      epochRecord.wrapperGeneration === stopGeneration);
+    (epochRecord.wrapperGeneration ?? undefined) === (stopGeneration ?? undefined);
   const stopEpoch = recordIsOurs ? epochRecord?.turnEpoch : undefined;
   await updateRuntimeGenerationState(cwd, config, agentId, 'idle', 'stop', {
-    ...(stopEpoch ? { turnEpoch: stopEpoch } : { turnEpochMissing: true }),
+    ...(stopEpoch
+      ? { turnEpoch: stopEpoch }
+      : {
+          turnEpochMissing: true,
+          // Round 20: fence only OUR generation's parked reclaims — an
+          // unscoped tombstone could refuse a coexisting successor's.
+          ...(stopGeneration ? { scopeGeneration: stopGeneration } : {}),
+        }),
   });
   // Compare-and-delete: only the exact record we sent retires — a record
   // replaced during the awaited request belongs to its replacer.
