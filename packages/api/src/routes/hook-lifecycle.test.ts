@@ -59,8 +59,19 @@ function makeFakeClient() {
       update: () => ({ ...empty }),
       insert: () => ({ ...empty }),
     }),
+    rpc: (...args: unknown[]) => {
+      rpcCalls.push(args);
+      return Promise.resolve(rpcResult());
+    },
   } as never;
 }
+
+/** Recorded rpc invocations across all fake clients (the route re-gets one per request). */
+const rpcCalls: unknown[][] = [];
+let rpcResult: () => { data: unknown; error: { message: string } | null } = () => ({
+  data: 'epoch-1',
+  error: null,
+});
 
 const SESSION_ID = 'a1b2c3d4-0000-4000-8000-000000000001';
 
@@ -103,6 +114,8 @@ describe('hook-lifecycle CLI turn signal', () => {
   beforeEach(() => {
     updateSession.mockClear();
     getSession.mockClear();
+    rpcCalls.length = 0;
+    rpcResult = () => ({ data: 'epoch-1', error: null });
   });
 
   async function post(body: Record<string, unknown>) {
@@ -187,5 +200,39 @@ describe('hook-lifecycle CLI turn signal', () => {
   it('legacy running without an event still opens the turn (protection only extends)', async () => {
     const updates = await post({ lifecycle: 'running' });
     expect(typeof updates.cliTurnAt).toBe('string');
+  });
+
+  /**
+   * Round 4 (PR #563, Lumen): a CLI prompt taking over a session stuck at
+   * `running` is a running → running write with no metadata — the epoch
+   * trigger never fires, and a stale server turn's fenced finalize would
+   * still match and clobber this CLI session. The route must claim a fresh
+   * epoch, atomically, before the lifecycle write.
+   */
+  describe('turn-epoch claim on prompt takeover', () => {
+    it('claims a fresh epoch before the lifecycle write on prompt events', async () => {
+      await post({ lifecycle: 'running', event: 'prompt' });
+      expect(rpcCalls).toHaveLength(1);
+      expect(rpcCalls[0]![0]).toBe('claim_turn_epoch');
+      expect(rpcCalls[0]![1]).toMatchObject({ p_session_id: SESSION_ID });
+    });
+
+    it('does not claim on stop or attach-only requests', async () => {
+      await post({ lifecycle: 'idle', event: 'stop' });
+      await post({ cliAttached: true });
+      expect(rpcCalls).toHaveLength(0);
+    });
+
+    it('fails the prompt visibly when the claim fails — never an unfenced takeover', async () => {
+      rpcResult = () => ({ data: null, error: { message: 'db down' } });
+      const resp = await fetch(`${baseUrl}/api/hooks/lifecycle`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer test' },
+        body: JSON.stringify({ sessionId: SESSION_ID, lifecycle: 'running', event: 'prompt' }),
+      });
+      expect(resp.status).toBe(500);
+      // The lifecycle write never ran: no half-taken session.
+      expect(updateSession).not.toHaveBeenCalled();
+    });
   });
 });

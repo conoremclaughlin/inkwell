@@ -150,6 +150,29 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
       if (isPromptEvent) updates.cliTurnAt = new Date().toISOString();
       if (isStopEvent) updates.cliTurnAt = null;
 
+      // Ownership claim (PR #563 round 4). A CLI prompt taking over a session
+      // whose row is STUCK at `running` is a running → running write — no
+      // lifecycle transition for the epoch trigger to see, and this route
+      // writes no metadata — so a stale server turn's fenced finalize would
+      // still match its old epoch and clobber this CLI session's state.
+      // claim_turn_epoch is one atomic jsonb_set: fresh epoch, no
+      // read-modify-write replay window, and every stale fence goes dark.
+      // Claimed BEFORE the lifecycle write so a failure here fails the whole
+      // prompt visibly instead of leaving an unfenced takeover.
+      if (isPromptEvent) {
+        const { error: claimError } = await dataComposer
+          .getClient()
+          .rpc('claim_turn_epoch', { p_session_id: sessionId } as never);
+        if (claimError) {
+          logger.error('[HookLifecycle] Turn-epoch claim failed; refusing prompt takeover', {
+            sessionId,
+            error: claimError.message,
+          });
+          res.status(500).json({ success: false, error: 'turn-epoch claim failed' });
+          return;
+        }
+      }
+
       const updated = await dataComposer.repositories.memory.updateSession(sessionId, updates);
 
       if (!updated) {

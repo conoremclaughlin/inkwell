@@ -88,6 +88,35 @@ describe('active-runs registry', () => {
     expect(() => markRunnerSettled('nope', 'succeeded')).not.toThrow();
     expect(activeRunCount()).toBe(0);
   });
+
+  /**
+   * Round 4 (Lumen): the clear is compare-and-act on the turn epoch. An old
+   * turn finalizing after a newer turn registered over it must not delete
+   * the newer entry.
+   */
+  describe('epoch-aware clear', () => {
+    it('a stale epoch does not clear a newer registration', () => {
+      registerActiveRun(run({ turnEpoch: 'epoch-b' }));
+      clearActiveRun('sess-1', 'epoch-a');
+      expect(activeRunCount()).toBe(1);
+    });
+
+    it('the owning epoch clears its own entry', () => {
+      registerActiveRun(run({ turnEpoch: 'epoch-a' }));
+      clearActiveRun('sess-1', 'epoch-a');
+      expect(activeRunCount()).toBe(0);
+    });
+
+    it('an epoch-less clear and an epoch-less entry both behave as before', () => {
+      registerActiveRun(run({ turnEpoch: 'epoch-a' }));
+      clearActiveRun('sess-1'); // no epoch: unconditional (shutdown, legacy)
+      expect(activeRunCount()).toBe(0);
+
+      registerActiveRun(run()); // legacy entry without an epoch
+      clearActiveRun('sess-1', 'epoch-b');
+      expect(activeRunCount()).toBe(0);
+    });
+  });
 });
 
 /**
@@ -725,6 +754,57 @@ describe('interruptActiveRuns', () => {
       await interruptActiveRuns(client, [run({ threadKey: undefined })]);
       expect(filters).toContainEqual(['lifecycle', 'running']);
       expect(filters).toContainEqual(['ended_at', null]);
+    });
+
+    // Round 4 (Lumen): an old PROCESS's registry entry must not terminalize a
+    // row a newer owner has taken over — the write is fenced on the epoch the
+    // entry carries.
+    it('fences the terminalizing write on the registered turn epoch', async () => {
+      const filters: Array<[string, unknown]> = [];
+      const client = {
+        from: () => ({
+          select: () => ({
+            eq: () => ({
+              maybeSingle: async () => ({
+                data: { metadata: {}, lifecycle: 'running', ended_at: null },
+                error: null,
+              }),
+            }),
+          }),
+          update: () => {
+            const b = {
+              eq(c: string, v: unknown) {
+                filters.push([c, v]);
+                return b;
+              },
+              is(c: string, v: unknown) {
+                filters.push([c, v]);
+                return b;
+              },
+              select: async () => ({ data: [{ id: 'sess-1' }], error: null }),
+            };
+            return b;
+          },
+        }),
+      };
+
+      await interruptActiveRuns(client, [run({ threadKey: undefined, turnEpoch: 'epoch-a' })]);
+      expect(filters).toContainEqual(['metadata->>turnEpoch', 'epoch-a']);
+    });
+
+    it('classifies an epoch mismatch on the recheck as finalized-elsewhere, not unknown', async () => {
+      // Zero rows because a newer owner rotated the epoch: their running
+      // state is not a contradiction and not ours to report on.
+      const { client, sessionUpdates } = makeClient({ lifecycle: 'running' }, false, {
+        lifecycle: 'running',
+        ended_at: null,
+        metadata: { turnEpoch: 'epoch-new' },
+      });
+      const [outcome] = await interruptActiveRuns(client, [run({ turnEpoch: 'epoch-old' })]);
+
+      expect(outcome.state).toBe('finalized-elsewhere');
+      const wrote = sessionUpdates.find((u) => 'lifecycle' in u);
+      expect(wrote).toBeUndefined();
     });
   });
 

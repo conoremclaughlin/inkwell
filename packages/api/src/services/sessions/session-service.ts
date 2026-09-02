@@ -47,6 +47,7 @@ import {
 import {
   retryTurnFinalization,
   supersedePendingFinalization,
+  hasPendingFinalization,
   TurnSupersededError,
 } from './finalize-turn.js';
 import { GeminiRunner } from './gemini-runner.js';
@@ -1698,6 +1699,13 @@ export class SessionService implements ISessionService {
     // entry (and the recovery it anchors) must come back.
     const previousRun = getActiveRun(session.id);
 
+    // The ownership candidate for THIS turn, minted before anything is
+    // registered or written. The candidate is AUTHORITATIVE (round 4): the DB
+    // trigger only fills an epoch when a running-entering write carries none,
+    // so retrying the running write is idempotent by value, and "did my write
+    // actually land?" is answerable by reading the row and comparing.
+    const turnEpoch = randomUUID();
+
     const admitted = registerActiveRun({
       sessionId: session.id,
       userId,
@@ -1706,6 +1714,7 @@ export class SessionService implements ISessionService {
       threadKey: metadata?.threadKey as string | undefined,
       senderAgentId: request.sender?.id,
       startedAt: Date.now(),
+      turnEpoch,
     });
 
     // Intake closes at the top of shutdown. A turn started now is guaranteed
@@ -1720,37 +1729,91 @@ export class SessionService implements ISessionService {
     // drain can wait for it: if this write is still in flight when the
     // interruption runs, it would land afterwards and restore `running`.
     //
-    // The write carries a CANDIDATE turn epoch for environments without the
-    // session_running_write DB trigger; where the trigger exists it rotates
-    // its own on entering `running`, and the RETURNED row is authoritative
-    // either way. This epoch is what fences every later finalize write.
-    let turnEpoch: string | undefined;
-    try {
-      const runningSession = await trackStateWrite(
-        this.repository.update(session.id, {
-          lifecycle: 'running',
-          metadata: { turnEpoch: randomUUID() },
-        })
-      );
-      turnEpoch = (runningSession.metadata as Record<string, unknown> | undefined)?.turnEpoch as
-        | string
-        | undefined;
-    } catch (runningWriteError) {
-      // This turn never took ownership: the row still belongs to whatever
-      // came before. Restore the previous registration — its background
-      // finalization and shutdown report are still the live recovery — or
-      // clear ours if there was nothing to hand back (Lumen, PR #563 round
-      // 3: supersede-then-fail left the row owned by a turn whose recovery
-      // was already cancelled).
-      if (previousRun) restoreActiveRun(previousRun);
-      else clearActiveRun(session.id);
-      throw runningWriteError;
+    // A rejected promise is NOT a rollback (Lumen, PR #563 round 4): the
+    // write can commit and the response still fail. So a failure retries the
+    // identical write (idempotent — same candidate), and when retries are
+    // exhausted the row is READ: a row running under our candidate means the
+    // takeover happened and the turn proceeds. Only a row that provably does
+    // not carry our candidate hands ownership back.
+    {
+      let tookOwnership = false;
+      let lastError: unknown;
+      for (let attempt = 1; attempt <= 3 && !tookOwnership; attempt += 1) {
+        try {
+          await trackStateWrite(
+            this.repository.update(session.id, {
+              lifecycle: 'running',
+              metadata: { turnEpoch },
+            })
+          );
+          tookOwnership = true;
+        } catch (runningWriteError) {
+          lastError = runningWriteError;
+          logger.warn('Running write failed; retrying takeover idempotently', {
+            sessionId: session.id,
+            attempt,
+            error:
+              runningWriteError instanceof Error
+                ? runningWriteError.message
+                : String(runningWriteError),
+          });
+        }
+      }
+      if (!tookOwnership) {
+        const committed = await this.repository
+          .findById(session.id)
+          .then(
+            (row) =>
+              row?.lifecycle === 'running' &&
+              (row.metadata as Record<string, unknown> | undefined)?.turnEpoch === turnEpoch
+          )
+          .catch(() => false);
+        if (committed) {
+          logger.warn('Running write committed despite rejected responses; proceeding', {
+            sessionId: session.id,
+          });
+          tookOwnership = true;
+        }
+      }
+      if (!tookOwnership) {
+        // This turn never took ownership: the row still belongs to whatever
+        // came before. Restore the previous registration ONLY if its recovery
+        // is still pending — restoring a turn that already finalized would
+        // resurrect a ghost entry for a recorded turn (round 4). Otherwise
+        // clear OUR entry, compare-and-act on our own candidate.
+        if (previousRun && hasPendingFinalization(session.id)) {
+          restoreActiveRun(previousRun);
+        } else {
+          clearActiveRun(session.id, turnEpoch);
+        }
+        throw lastError instanceof Error
+          ? lastError
+          : new Error('Running write failed and the row does not carry this turn');
+      }
     }
 
-    // Ownership durably transferred — the row carries a fresh epoch, so the
-    // previous turn's fenced finalize can no longer land. Superseding its
-    // loop now only stops wasted retries; the epoch is the actual fence.
+    // Ownership durably transferred — the row carries this turn's candidate,
+    // so the previous turn's fenced finalize can no longer land. Superseding
+    // its loop now only stops wasted retries; the epoch is the actual fence.
     supersedePendingFinalization(session.id);
+
+    // Every terminal write for THIS turn goes through the epoch fence: zero
+    // rows means a newer owner holds the row and the write must not land.
+    const writeTerminalFenced = async (
+      updates: Omit<Partial<Session>, 'studioId'> & { studioId?: string | null }
+    ): Promise<void> => {
+      const fenced = this.repository.updateIfTurnEpoch?.bind(this.repository);
+      if (fenced) {
+        const updated = await trackStateWrite(fenced(session.id, turnEpoch, updates));
+        if (!updated) throw new TurnSupersededError(session.id);
+        return;
+      }
+      // Repository without the fenced write (legacy mocks): unfenced, loudly.
+      logger.warn('Terminal write falling back to unfenced update (no fenced repository)', {
+        sessionId: session.id,
+      });
+      await trackStateWrite(this.repository.update(session.id, updates));
+    };
 
     // Media flows to backends as file paths, not inline base64. Channel
     // listeners download attachments to ~/.ink/files/<channel>/; the
@@ -1793,18 +1856,24 @@ export class SessionService implements ISessionService {
       // have its interruption record overwritten by this write.
       let failedWritten = admitStateWrite(session.id);
       if (failedWritten) {
-        await trackStateWrite(this.repository.update(session.id, { lifecycle: 'failed' })).catch(
-          (e) => {
+        // Fenced like every terminal write (round 4): an unfenced failed
+        // write here could land on a newer owner's row.
+        await writeTerminalFenced({ lifecycle: 'failed' }).catch((e) => {
+          failedWritten = false;
+          if (e instanceof TurnSupersededError) {
+            // A newer owner holds the row and the registry entry; both are
+            // theirs to manage. Nothing to write, nothing to clear.
+            logger.warn('Failed-write fenced out by a newer owner', { sessionId: session.id });
+          } else {
             // The row is still `running`. Keeping the registration is the point:
             // this is precisely a session that needs reporting at shutdown, and
             // clearing it here is how the zombie survived round 1.
-            failedWritten = false;
             logger.warn('Failed to set lifecycle=failed after runner crash', {
               sessionId: session.id,
               error: e,
             });
           }
-        );
+        });
       }
       this.activityStream
         .logActivity({
@@ -1834,8 +1903,9 @@ export class SessionService implements ISessionService {
         .catch(() => {});
       // Cleared only if `failed` actually persisted — not in a `finally`
       // around runner.run(). A finally fires while the row still says
-      // `running`, reopening the same window on the way out.
-      if (failedWritten) clearActiveRun(session.id);
+      // `running`, reopening the same window on the way out. Compare-and-act
+      // on our own epoch: a newer registrant's entry is not ours to delete.
+      if (failedWritten) clearActiveRun(session.id, turnEpoch);
       throw runnerError;
     }
 
@@ -1921,20 +1991,7 @@ export class SessionService implements ISessionService {
       lifecycle: postRunLifecycle as Session['lifecycle'],
       cliAttached: false,
     };
-    const performFinalizeWrite = async () => {
-      const fenced = this.repository.updateIfTurnEpoch?.bind(this.repository);
-      if (fenced && turnEpoch) {
-        const updated = await trackStateWrite(fenced(session.id, turnEpoch, finalizeUpdates));
-        if (!updated) throw new TurnSupersededError(session.id);
-        return;
-      }
-      // Epoch-less legacy turn (row written before the trigger deployed) or a
-      // repository without the fenced write. Unfenced, and loud about it.
-      logger.warn('Turn finalize falling back to unfenced write (no turn epoch)', {
-        sessionId: session.id,
-      });
-      await trackStateWrite(this.repository.update(session.id, finalizeUpdates));
-    };
+    const performFinalizeWrite = () => writeTerminalFenced(finalizeUpdates);
 
     // Run-boundary steps. Invoked ONLY after the terminal write durably
     // persisted — inline on the fast path, from the retry loop otherwise.
@@ -1944,8 +2001,10 @@ export class SessionService implements ISessionService {
       // while its row still says `running` — and if shutdown is mid-drain and
       // has not snapshotted yet, the session vanishes from the report and
       // gets no notice. Exactly the original zombie, reached through the gate
-      // meant to prevent it (Lumen, PR #490 round 4).
-      clearActiveRun(session.id);
+      // meant to prevent it (Lumen, PR #490 round 4). Compare-and-act on our
+      // epoch: if a newer turn registered over us while our late write landed
+      // (it can only land while the row was still ours), its entry survives.
+      clearActiveRun(session.id, turnEpoch);
       // The run boundary is the real terminal edge for lease release: a
       // release requested mid-turn (end_session from inside the run) was
       // deferred so no other thread could enter the worktree while this
@@ -2029,7 +2088,7 @@ export class SessionService implements ISessionService {
           }).then((outcome) => {
             // A gone row has nothing to finalize and nothing a shutdown
             // report could truthfully say about it.
-            if (outcome === 'gone') clearActiveRun(session.id);
+            if (outcome === 'gone') clearActiveRun(session.id, turnEpoch);
           });
         }
       }

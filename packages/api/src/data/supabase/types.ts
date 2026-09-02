@@ -4581,6 +4581,12 @@ export type Database = {
         };
         Returns: Json;
       };
+      claim_turn_epoch: {
+        Args: {
+          p_session_id: string;
+        };
+        Returns: string;
+      };
       apply_task_graph: {
         Args: {
           p_user_id: string;

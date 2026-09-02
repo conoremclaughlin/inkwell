@@ -228,11 +228,12 @@ describe('SessionService', () => {
   describe('finalization failure is bookkeeping, not turn failure', () => {
     function makeStatefulRepo(initial: Partial<Session> = {}) {
       let row: Session | null = createMockSession({ metadata: {}, ...initial });
-      const fail = { finalize: 0, running: 0 };
-      // One-shot gate: holds exactly the NEXT fenced write open mid-flight,
-      // between its admission and its epoch evaluation — the Postgres-side
-      // "predicate evaluated at write time" window.
+      const fail = { finalize: 0, running: 0, commitThenRejectRunning: 0 };
+      // One-shot gates: hold exactly the NEXT fenced write (or running write)
+      // open mid-flight — the Postgres-side "in flight when ownership
+      // changes" window.
       let gateOnce: Promise<void> | null = null;
+      let runningGateOnce: Promise<void> | null = null;
 
       const merge = (updates: Record<string, unknown>): Session => {
         const metadata = {
@@ -250,9 +251,23 @@ describe('SessionService', () => {
         create: vi.fn(async () => row),
         update: vi.fn(async (id: string, updates: Record<string, unknown>) => {
           if (!row) throw new Error(`Session not found: ${id}`);
-          if (updates.lifecycle === 'running' && fail.running > 0) {
-            fail.running -= 1;
-            throw new Error('An unexpected error occurred');
+          if (updates.lifecycle === 'running') {
+            if (runningGateOnce) {
+              const gate = runningGateOnce;
+              runningGateOnce = null;
+              await gate;
+            }
+            if (fail.running > 0) {
+              fail.running -= 1;
+              throw new Error('An unexpected error occurred');
+            }
+            if (fail.commitThenRejectRunning > 0) {
+              fail.commitThenRejectRunning -= 1;
+              // The write COMMITS and the response still fails — a rejected
+              // promise is not a rollback (round 4).
+              merge(updates);
+              throw new Error('fetch failed');
+            }
           }
           return merge(updates);
         }),
@@ -291,6 +306,9 @@ describe('SessionService', () => {
         },
         holdNextFencedWrite: (gate: Promise<void>) => {
           gateOnce = gate;
+        },
+        holdNextRunningWrite: (gate: Promise<void>) => {
+          runningGateOnce = gate;
         },
       };
     }
@@ -417,7 +435,7 @@ describe('SessionService', () => {
       const aSettledAt = listActiveRuns()[0]?.runnerSettledAt;
       expect(aSettledAt).toEqual(expect.any(Number));
 
-      db.fail.running = 1; // turn B's running write fails
+      db.fail.running = 3; // turn B's running write fails on every attempt
       const b = await service.handleMessage(createMockRequest());
       expect(b.success).toBe(false);
 
@@ -428,6 +446,86 @@ describe('SessionService', () => {
       // … and A's pending finalization was NOT superseded: it lands.
       await vi.advanceTimersByTimeAsync(10_000);
       expect(db.row?.lifecycle).toBe('idle');
+      expect(activeRunCount()).toBe(0);
+    });
+
+    /**
+     * Round 4 (Lumen): a rejected promise is not a rollback. The running
+     * write can COMMIT and the response still fail — the takeover happened.
+     * Rolling back would cancel A's recovery while B's epoch owns the row
+     * and no B process runs. The reconcile: retry idempotently (same
+     * candidate), then READ — a row running under our candidate means
+     * proceed.
+     */
+    it('a committed-but-rejected running write is reconciled, not rolled back', async () => {
+      const db = makeStatefulRepo();
+      db.fail.commitThenRejectRunning = 3; // every attempt commits, then rejects
+      const service = makeStatefulService(db.repo);
+
+      const result = await service.handleMessage(createMockRequest());
+
+      expect(result.success).toBe(true);
+      expect(db.row?.lifecycle).toBe('idle');
+      expect(activeRunCount()).toBe(0);
+    });
+
+    /**
+     * Round 4 (Lumen): A finalizes while B's takeover write is still in
+     * flight. A's clear must be compare-and-act — deleting by session id
+     * alone would remove B's registration.
+     */
+    it("A finalizing mid-takeover does not clear B's registration (B succeeds)", async () => {
+      const db = makeStatefulRepo();
+      db.fail.finalize = 1; // A's inline finalize fails; retry pending
+      const service = makeStatefulService(db.repo);
+
+      await service.handleMessage(createMockRequest()); // turn A
+      const aSettledAt = listActiveRuns()[0]?.runnerSettledAt;
+
+      // B registers, then parks inside its running write.
+      let releaseB!: () => void;
+      db.holdNextRunningWrite(
+        new Promise<void>((resolve) => {
+          releaseB = resolve;
+        })
+      );
+      const bPromise = service.handleMessage(createMockRequest());
+      await vi.advanceTimersByTimeAsync(0); // let B reach the gate
+
+      // B's entry has replaced A's (fresh, unsettled).
+      expect(activeRunCount()).toBe(1);
+      expect(listActiveRuns()[0]?.runnerSettledAt).toBeUndefined();
+
+      // A's retry fires while B is parked: the row still carries A's epoch,
+      // so A finalizes — and its clear must leave B's entry alone.
+      await vi.advanceTimersByTimeAsync(6_000);
+      expect(db.row?.lifecycle).toBe('idle');
+      expect(activeRunCount()).toBe(1);
+      expect(listActiveRuns()[0]?.runnerSettledAt).toBeUndefined();
+
+      releaseB();
+      const b = await bPromise;
+      expect(b.success).toBe(true);
+      expect(db.row?.lifecycle).toBe('idle');
+      expect(activeRunCount()).toBe(0);
+      void aSettledAt;
+    });
+
+    it('a failed takeover after A already finalized clears rather than resurrecting A', async () => {
+      const db = makeStatefulRepo();
+      db.fail.finalize = 1;
+      const service = makeStatefulService(db.repo);
+
+      await service.handleMessage(createMockRequest()); // turn A, retry pending
+      await vi.advanceTimersByTimeAsync(6_000); // A finalizes
+      expect(activeRunCount()).toBe(0);
+
+      // A ghost of A must not come back when B's takeover fails: A's
+      // finalization is no longer pending, so restore would resurrect a
+      // recorded turn as an unrecorded one (round 4).
+      db.fail.running = 3;
+      const b = await service.handleMessage(createMockRequest());
+      expect(b.success).toBe(false);
       expect(activeRunCount()).toBe(0);
     });
 

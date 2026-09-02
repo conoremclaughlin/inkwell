@@ -65,6 +65,13 @@ export interface ActiveRun {
    * settled run as a quiet success.
    */
   settledOutcome?: 'succeeded' | 'failed';
+  /**
+   * The turn's ownership generation — the candidate this turn wrote with its
+   * `running` write (Lumen, PR #563 round 4). Registry operations and the
+   * shutdown terminalizer compare-and-act on it, so an old turn's boundary
+   * work can never touch a newer turn's entry or row.
+   */
+  turnEpoch?: string;
 }
 
 const active = new Map<string, ActiveRun>();
@@ -97,8 +104,17 @@ export function registerActiveRun(run: ActiveRun): boolean {
  * Called once a turn's terminal state is DURABLY written — not when the runner
  * returns. A row still saying `running` must stay registered, or shutdown will
  * skip the very session that needs reporting.
+ *
+ * With `epoch`, the delete is compare-and-act: it removes the entry only if
+ * the entry still belongs to that turn. An old turn finalizing while a newer
+ * turn has already registered over it must not delete the newer entry
+ * (Lumen, PR #563 round 4). Entries without an epoch (legacy) always match.
  */
-export function clearActiveRun(sessionId: string): void {
+export function clearActiveRun(sessionId: string, epoch?: string): void {
+  if (epoch !== undefined) {
+    const entry = active.get(sessionId);
+    if (entry && entry.turnEpoch !== undefined && entry.turnEpoch !== epoch) return;
+  }
   active.delete(sessionId);
 }
 

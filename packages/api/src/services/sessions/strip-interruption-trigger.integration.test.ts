@@ -180,24 +180,34 @@ d('session_running_write trigger', () => {
       expect((await readSession(idleId)).metadata.turnEpoch).toEqual(expect.any(String));
     });
 
-    it('rotates on every ENTRY to running and overrides caller candidates', async () => {
-      const id = await insertSession({ lifecycle: 'running', metadata: {} });
-      const first = (await readSession(id)).metadata.turnEpoch;
-
-      await client
-        .from('sessions')
-        .update({ lifecycle: 'idle' } as never)
-        .eq('id', id);
-      // The caller supplies a candidate; the DB's own rotation wins.
+    it('a caller candidate is AUTHORITATIVE — the trigger never overrides it', async () => {
+      // Round 4: candidates make takeover writes idempotent by value, which
+      // is what turns a committed-but-rejected running write into a
+      // reconcilable state instead of an unanswerable one.
+      const id = await insertSession({ lifecycle: 'idle', metadata: {} });
       await client
         .from('sessions')
         .update({ lifecycle: 'running', metadata: { turnEpoch: 'caller-candidate' } } as never)
         .eq('id', id);
 
-      const second = (await readSession(id)).metadata.turnEpoch;
-      expect(second).toEqual(expect.any(String));
-      expect(second).not.toBe(first);
-      expect(second).not.toBe('caller-candidate');
+      expect((await readSession(id)).metadata.turnEpoch).toBe('caller-candidate');
+    });
+
+    it('claim_turn_epoch rotates a running → running row atomically', async () => {
+      // The CLI-prompt takeover: no lifecycle transition for the trigger to
+      // see, no metadata in the hook's column-only write. The claim is the
+      // ownership primitive for that path — and it must rotate even though
+      // the row never leaves running.
+      const id = await insertSession({ lifecycle: 'running', metadata: {} });
+      const before = (await readSession(id)).metadata.turnEpoch as string;
+
+      const { data: claimed, error } = await client.rpc('claim_turn_epoch', {
+        p_session_id: id,
+      } as never);
+      expect(error).toBeNull();
+      expect(claimed).toEqual(expect.any(String));
+      expect(claimed).not.toBe(before);
+      expect((await readSession(id)).metadata.turnEpoch).toBe(claimed);
     });
 
     it('is preserved across running → running writes — same owner, same series', async () => {
@@ -219,15 +229,13 @@ d('session_running_write trigger', () => {
       const id = await insertSession({ lifecycle: 'running', metadata: {} });
       const epoch = (await readSession(id)).metadata.turnEpoch as string;
 
-      // A newer turn takes ownership: leave running, re-enter running.
-      await client
-        .from('sessions')
-        .update({ lifecycle: 'idle' } as never)
-        .eq('id', id);
-      await client
-        .from('sessions')
-        .update({ lifecycle: 'running' } as never)
-        .eq('id', id);
+      // A newer owner takes over via the claim primitive — running →
+      // running, the CLI-prompt shape (candidates are never overridden, so
+      // leave/re-enter would preserve the old epoch).
+      const { error: claimError } = await client.rpc('claim_turn_epoch', {
+        p_session_id: id,
+      } as never);
+      expect(claimError).toBeNull();
 
       // The old owner's in-flight finalize must match ZERO rows.
       const stale = await repository.updateIfTurnEpoch(id, epoch, { lifecycle: 'idle' });
@@ -265,10 +273,10 @@ d('session_running_write trigger', () => {
         await holder.connect();
         try {
           await holder.query('BEGIN');
-          // The new owner takes over inside the lock-holding transaction:
-          // leaving and re-entering running rotates the epoch via the trigger.
-          await holder.query("UPDATE sessions SET lifecycle = 'idle' WHERE id = $1", [id]);
-          await holder.query("UPDATE sessions SET lifecycle = 'running' WHERE id = $1", [id]);
+          // The new owner takes over inside the lock-holding transaction via
+          // the claim primitive — a running → running takeover, exactly the
+          // CLI-prompt shape.
+          await holder.query('SELECT public.claim_turn_epoch($1)', [id]);
 
           // The old owner's finalize starts NOW: its pre-read sees the old
           // committed row (epoch still its own), then its UPDATE blocks.

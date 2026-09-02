@@ -235,7 +235,8 @@ async function transitionSession(
   client: any,
   sessionId: string,
   settled: boolean,
-  settledOutcome?: 'succeeded' | 'failed'
+  settledOutcome?: 'succeeded' | 'failed',
+  turnEpoch?: string
 ): Promise<{ state: InterruptState; marked: boolean }> {
   // A settled runner's turn was not interrupted — only its paperwork was
   // lost — so the row gets the terminal state the turn MEANT to write:
@@ -291,8 +292,11 @@ async function transitionSession(
     // update by Postgres, which is what closes the read-then-write race: if
     // the child stamped completion between the read above and this statement,
     // it matches zero rows instead of overwriting a terminal state with a
-    // resumable one.
-    const { data: changed, error } = await client
+    // resumable one. The turn-epoch predicate (round 4) additionally fences
+    // out a stale PROCESS: an old server's registry entry must never
+    // terminalize a row a newer owner — possibly in another process — has
+    // since taken over.
+    let write = client
       .from('sessions')
       .update(
         settled
@@ -301,8 +305,11 @@ async function transitionSession(
       )
       .eq('id', sessionId)
       .eq('lifecycle', 'running')
-      .is('ended_at', null)
-      .select('id');
+      .is('ended_at', null);
+    if (turnEpoch !== undefined) {
+      write = write.eq('metadata->>turnEpoch', turnEpoch);
+    }
+    const { data: changed, error } = await write.select('id');
 
     if (error) {
       logger.error('[Shutdown] Failed to terminalize interrupted session', {
@@ -319,7 +326,7 @@ async function transitionSession(
       // #490 round 3).
       const { data: after, error: recheckError } = await client
         .from('sessions')
-        .select('lifecycle, ended_at')
+        .select('lifecycle, ended_at, metadata')
         .eq('id', sessionId)
         .maybeSingle();
 
@@ -332,6 +339,15 @@ async function transitionSession(
       }
 
       if (after.lifecycle === 'running' && !after.ended_at) {
+        const rowEpoch = ((after.metadata as Record<string, unknown>) || {})['turnEpoch'];
+        if (turnEpoch !== undefined && rowEpoch !== turnEpoch) {
+          // A newer owner — possibly another process — holds the row. Their
+          // state is not ours to touch or to report on (round 4).
+          logger.info('[Shutdown] Session superseded by a newer owner; leaving as-is', {
+            sessionId,
+          });
+          return { state: 'finalized-elsewhere', marked: false };
+        }
         // The predicates should have matched. Something is contradicting us,
         // and guessing which way would be inventing a fact.
         logger.error('[Shutdown] Session still reads running after a zero-row interrupt', {
@@ -404,7 +420,8 @@ export async function interruptActiveRuns(
       client,
       run.sessionId,
       settled,
-      run.settledOutcome
+      run.settledOutcome,
+      run.turnEpoch
     );
     outcome.marked = marked;
 
