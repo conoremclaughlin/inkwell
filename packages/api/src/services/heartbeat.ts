@@ -13,6 +13,7 @@
  */
 
 import * as cron from 'node-cron';
+import { isWithinQuietHours } from './quiet-hours.js';
 import { CronExpressionParser } from 'cron-parser';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { env } from '../config/env.js';
@@ -169,7 +170,16 @@ export async function processHeartbeat(
       // Check if user is in quiet hours
       const isQuiet = await isInQuietHours(reminder.user_id);
       if (isQuiet) {
-        logger.debug(`Skipping reminder ${reminder.id} - user in quiet hours`);
+        // `info`, not `debug`. Debug is not persisted to ~/.ink/logs, so this
+        // deferral left no trace at all: a reminder due at 07:30 and delivered
+        // at 08:06 looked from the outside like scheduler lag, and got
+        // diagnosed as lag twice (2026-08-31, 2026-09-02). One line per held
+        // reminder is cheap, and it is the difference between a deferral you
+        // can see and a mystery you re-derive from tick timings.
+        logger.info('Reminder held — user in quiet hours', {
+          reminderId: reminder.id,
+          dueAt: reminder.next_run_at,
+        });
         stats.skipped++;
         continue;
       }
@@ -239,19 +249,20 @@ async function isInQuietHours(userId: string): Promise<boolean> {
     return false;
   }
 
-  // Simple time comparison (timezone handling can be enhanced)
-  const now = new Date();
-  const currentTime = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
-
-  const quietStart = state.quiet_start;
-  const quietEnd = state.quiet_end;
-
-  // Handle overnight quiet hours (e.g., 23:00 - 08:00)
-  if (quietStart > quietEnd) {
-    return currentTime >= quietStart || currentTime < quietEnd;
-  }
-
-  return currentTime >= quietStart && currentTime < quietEnd;
+  // One predicate, shared with the creation-time warning in reminder-handlers.
+  // If these two ever computed the window separately they would eventually
+  // disagree, and a warning that disagrees with the behaviour it describes is
+  // worse than no warning.
+  //
+  // It also fixes the timezone: this used to read `now.getHours()` — the
+  // SERVER's clock — while selecting the user's `timezone` column and never
+  // using it, under a comment conceding "timezone handling can be enhanced".
+  // Correct only while the server runs on the user's own machine.
+  return isWithinQuietHours(new Date(), {
+    start: state.quiet_start,
+    end: state.quiet_end,
+    timezone: state.timezone,
+  });
 }
 
 /**

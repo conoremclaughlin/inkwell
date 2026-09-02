@@ -6,6 +6,7 @@
  */
 
 import { z } from 'zod';
+import { quietHoursDeferralWarning } from '../../services/quiet-hours.js';
 import { isoDateTime } from './schema-primitives.js';
 import { createClient } from '@supabase/supabase-js';
 import type { DataComposer } from '../../data/composer';
@@ -260,6 +261,34 @@ export async function handleCreateReminder(
       nextRunAt.setMinutes(nextRunAt.getMinutes() + 1);
     }
 
+    // Same predicate the scheduler skips on — see services/quiet-hours.ts. If
+    // the warning computed the window separately the two would drift, and a
+    // warning that disagrees with the behaviour it describes is worse than none.
+    //
+    // Advisory only, and isolated on purpose: creating the reminder must never
+    // fail because the WARNING could not be computed. A lookup that throws, or
+    // a row that isn't there, means we cannot say whether this time will be
+    // honoured — so we say nothing and still create the reminder. The reverse
+    // (refusing to schedule because we couldn't check) would turn a helpful
+    // note into an outage.
+    let quietHoursWarning: ReturnType<typeof quietHoursDeferralWarning> = null;
+    try {
+      const { data: quietState } = await supabase
+        .from('heartbeat_state')
+        .select('quiet_start, quiet_end, timezone')
+        .eq('user_id', resolved.user.id)
+        .maybeSingle();
+      if (quietState) {
+        quietHoursWarning = quietHoursDeferralWarning(nextRunAt, {
+          start: quietState.quiet_start,
+          end: quietState.quiet_end,
+          timezone: quietState.timezone,
+        });
+      }
+    } catch {
+      // Advisory only — see above. Nothing to report and nothing to fail.
+    }
+
     const { data, error } = await supabase
       .from('scheduled_reminders')
       .insert({
@@ -284,6 +313,14 @@ export async function handleCreateReminder(
 
     return mcpResponse({
       success: true,
+      // Say NOW that the time asked for is not the time it will arrive.
+      //
+      // A reminder due inside quiet hours is skipped before it is claimed and
+      // held until the window ends — correct behaviour, but nothing said so, and
+      // the resulting lateness reads as scheduler lag. It cost a near-miss on a
+      // medical fast (2026-09-02): 07:30 asked, 08:06 delivered, against a 09:00
+      // deadline. Creation time is the only moment the caller can still act.
+      ...(quietHoursWarning ? { quietHours: quietHoursWarning } : {}),
       reminder: {
         id: data.id,
         title: data.title,
