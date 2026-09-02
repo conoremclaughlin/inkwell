@@ -38,7 +38,7 @@ import { CodexRunner } from './codex-runner.js';
 import {
   registerActiveRun,
   clearActiveRunIfOwner,
-  blurActiveRunEpoch,
+  widenActiveRunCandidates,
   getActiveRun,
   restoreActiveRun,
   markRunnerSettled,
@@ -1707,6 +1707,11 @@ export class SessionService implements ISessionService {
     // actually land?" is answerable by reading the row and comparing.
     const turnEpoch = randomUUID();
 
+    // Captured once: the boundary's lease release refuses leases RENEWED
+    // after this instant — a queued next turn acquires/renews before the
+    // processing lock, while the row epoch is still ours, and that renewal
+    // is the one signal that the lease has a next tenant (round 7).
+    const turnRegisteredAt = Date.now();
     const admitted = registerActiveRun({
       sessionId: session.id,
       userId,
@@ -1714,7 +1719,7 @@ export class SessionService implements ISessionService {
       backend: resolvedBackend,
       threadKey: metadata?.threadKey as string | undefined,
       senderAgentId: request.sender?.id,
-      startedAt: Date.now(),
+      startedAt: turnRegisteredAt,
       turnEpoch,
     });
 
@@ -1790,14 +1795,19 @@ export class SessionService implements ISessionService {
           // a live actor for whichever epoch the row actually carries —
           // handing back here is what created the zombie.
           //
-          // The registry entry is BLURRED (round 6): with ownership unknown,
-          // pinning our candidate on the entry would make shutdown CAS-miss
-          // the row if the write never committed. An epoch-less entry lets
-          // shutdown terminalize whichever running row the session has.
+          // The registry entry is WIDENED (rounds 6–7): with ownership
+          // unknown, the row's true epoch is one of a known SET — ours or the
+          // previous turn's. Shutdown fences on that set, so it terminalizes
+          // whichever of the two rows exists while a cross-process claimant
+          // outside the set stays untouched.
           logger.error('Running write and reconcile read both failed; proceeding unconfirmed', {
             sessionId: session.id,
           });
-          blurActiveRunEpoch(session.id);
+          widenActiveRunCandidates(
+            session.id,
+            previousRun?.turnEpochCandidates ??
+              (previousRun?.turnEpoch !== undefined ? [previousRun.turnEpoch] : [])
+          );
           tookOwnership = true;
           ownershipConfirmed = false;
         }
@@ -1829,10 +1839,6 @@ export class SessionService implements ISessionService {
         supersedePendingFinalization(session.id);
       }
     }
-
-    // The epoch this turn's registry entry carries — a blurred (unconfirmed)
-    // entry is owned as `undefined`. Every self-clear compares on it.
-    const ownEntryEpoch = () => (ownershipConfirmed ? turnEpoch : undefined);
 
     // Every terminal write for THIS turn goes through the epoch fence: zero
     // rows means a newer owner holds the row and the write must not land.
@@ -1898,9 +1904,16 @@ export class SessionService implements ISessionService {
         await writeTerminalFenced({ lifecycle: 'failed' }).catch((e) => {
           failedWritten = false;
           if (e instanceof TurnSupersededError) {
-            // A newer owner holds the row and the registry entry; both are
-            // theirs to manage. Nothing to write, nothing to clear.
+            // Another owner holds the ROW; this turn's entry stops claiming
+            // liveness the same way the normal-result path does (round 7 —
+            // this branch previously skipped the restore-or-clear and left a
+            // settled stale entry behind).
             logger.warn('Failed-write fenced out by a newer owner', { sessionId: session.id });
+            if (previousRun && hasPendingFinalization(session.id)) {
+              restoreActiveRun(previousRun);
+            } else {
+              clearActiveRunIfOwner(session.id, turnEpoch);
+            }
           } else {
             // The row is still `running`. Keeping the registration is the point:
             // this is precisely a session that needs reporting at shutdown, and
@@ -1942,7 +1955,7 @@ export class SessionService implements ISessionService {
       // around runner.run(). A finally fires while the row still says
       // `running`, reopening the same window on the way out. Compare-and-act
       // on our own epoch: a newer registrant's entry is not ours to delete.
-      if (failedWritten) clearActiveRunIfOwner(session.id, ownEntryEpoch());
+      if (failedWritten) clearActiveRunIfOwner(session.id, turnEpoch);
       throw runnerError;
     }
 
@@ -2041,7 +2054,7 @@ export class SessionService implements ISessionService {
       // meant to prevent it (Lumen, PR #490 round 4). Compare-and-act on our
       // epoch: if a newer turn registered over us while our late write landed
       // (it can only land while the row was still ours), its entry survives.
-      clearActiveRunIfOwner(session.id, ownEntryEpoch());
+      clearActiveRunIfOwner(session.id, turnEpoch);
       // The lease/graph boundary effects are SESSION-wide, so they get the
       // same ownership gate as everything else (Lumen round 5): if a newer
       // turn has taken the row between our fenced write landing and this
@@ -2066,8 +2079,9 @@ export class SessionService implements ISessionService {
         // process was still cd'd into it. Now that the run is durably
         // finished, release if the session ended. Fire-and-forget — release
         // must never delay response routing. Epoch threaded so the helper's
-        // own read refuses a boundary that stopped being ours.
-        void this.releaseLeaseIfSessionTerminal(session.id, turnEpoch);
+        // own read refuses a boundary that stopped being ours, and the turn
+        // start so it refuses leases renewed by a queued NEXT turn.
+        void this.releaseLeaseIfSessionTerminal(session.id, turnEpoch, turnRegisteredAt);
         // Graph claims are turn-scoped: for a server-spawned session the run
         // IS the turn, so its claims return to the pool at this boundary
         // (spec v10; the sweep remains the crash backstop). Fire-and-forget
@@ -2130,7 +2144,7 @@ export class SessionService implements ISessionService {
           if (previousRun && hasPendingFinalization(session.id)) {
             restoreActiveRun(previousRun);
           } else {
-            clearActiveRunIfOwner(session.id, ownEntryEpoch());
+            clearActiveRunIfOwner(session.id, turnEpoch);
           }
         } else {
           // A failed terminal write is a BOOKKEEPING failure, not a turn
@@ -2165,7 +2179,7 @@ export class SessionService implements ISessionService {
               if (outcome === 'superseded' && previousRun && hasPendingFinalization(session.id)) {
                 restoreActiveRun(previousRun);
               } else {
-                clearActiveRunIfOwner(session.id, ownEntryEpoch());
+                clearActiveRunIfOwner(session.id, turnEpoch);
               }
             }
           });
@@ -3954,7 +3968,8 @@ This session will continue with a fresh context after compaction. Your identity,
    */
   private async releaseLeaseIfSessionTerminal(
     sessionId: string,
-    expectedTurnEpoch?: string
+    expectedTurnEpoch?: string,
+    ifNotRenewedSince?: number
   ): Promise<void> {
     const leases = this.getLeaseService();
     if (!leases) return;
@@ -3979,6 +3994,7 @@ This session will continue with a fresh context after compaction. Your identity,
         userId: session.userId,
         sessionTerminal: terminal,
         reason: 'run-terminal',
+        ifNotRenewedSince,
       });
     } catch (err) {
       logger.warn('[StudioLease] Run-boundary release failed', {

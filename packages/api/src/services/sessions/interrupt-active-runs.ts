@@ -111,7 +111,7 @@ async function writeBreadcrumb(
   client: any,
   sessionId: string,
   reason: string,
-  turnEpoch?: string
+  turnEpochs?: string[]
 ): Promise<boolean> {
   const { data: fresh, error: readError } = await client
     .from('sessions')
@@ -140,8 +140,8 @@ async function writeBreadcrumb(
       },
     })
     .eq('id', sessionId);
-  if (turnEpoch !== undefined) {
-    breadcrumbWrite = breadcrumbWrite.eq('turn_epoch', turnEpoch);
+  if (turnEpochs !== undefined) {
+    breadcrumbWrite = breadcrumbWrite.in('turn_epoch', turnEpochs);
   }
   const { data, error } = await breadcrumbWrite.select('id');
 
@@ -247,7 +247,7 @@ async function transitionSession(
   sessionId: string,
   settled: boolean,
   settledOutcome?: 'succeeded' | 'failed',
-  turnEpoch?: string
+  turnEpochs?: string[]
 ): Promise<{ state: InterruptState; marked: boolean }> {
   // A settled runner's turn was not interrupted — only its paperwork was
   // lost — so the row gets the terminal state the turn MEANT to write:
@@ -295,7 +295,7 @@ async function transitionSession(
     if (isAlreadyTerminal(existing)) {
       return {
         state: 'finalized-elsewhere',
-        marked: await writeBreadcrumb(client, sessionId, reason, turnEpoch),
+        marked: await writeBreadcrumb(client, sessionId, reason, turnEpochs),
       };
     }
 
@@ -317,8 +317,11 @@ async function transitionSession(
       .eq('id', sessionId)
       .eq('lifecycle', 'running')
       .is('ended_at', null);
-    if (turnEpoch !== undefined) {
-      write = write.eq('turn_epoch', turnEpoch);
+    if (turnEpochs !== undefined) {
+      // The SET, not a single value (round 7): an unconfirmed takeover's row
+      // carries one of two known epochs; a cross-process claimant outside the
+      // set must never be terminalized by this process's shutdown.
+      write = write.in('turn_epoch', turnEpochs);
     }
     const { data: changed, error } = await write.select('id');
 
@@ -351,7 +354,7 @@ async function transitionSession(
 
       if (after.lifecycle === 'running' && !after.ended_at) {
         const rowEpoch = (after as { turn_epoch?: string | null }).turn_epoch;
-        if (turnEpoch !== undefined && rowEpoch !== turnEpoch) {
+        if (turnEpochs !== undefined && !turnEpochs.includes(rowEpoch as string)) {
           // A newer owner — possibly another process — holds the row. Their
           // state is not ours to touch or to report on (round 4).
           logger.info('[Shutdown] Session superseded by a newer owner; leaving as-is', {
@@ -373,7 +376,7 @@ async function transitionSession(
       });
       return {
         state: 'finalized-elsewhere',
-        marked: await writeBreadcrumb(client, sessionId, reason, turnEpoch),
+        marked: await writeBreadcrumb(client, sessionId, reason, turnEpochs),
       };
     }
 
@@ -427,12 +430,14 @@ export async function interruptActiveRuns(
     };
 
     const settled = Boolean(run.runnerSettledAt);
+    const fenceEpochs =
+      run.turnEpochCandidates ?? (run.turnEpoch !== undefined ? [run.turnEpoch] : undefined);
     const { state, marked } = await transitionSession(
       client,
       run.sessionId,
       settled,
       run.settledOutcome,
-      run.turnEpoch
+      fenceEpochs
     );
     outcome.marked = marked;
 

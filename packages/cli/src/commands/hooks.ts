@@ -82,6 +82,13 @@ interface HookCapabilities {
   };
   supportsCompaction: boolean;
   supportsPromptHook: boolean;
+  /**
+   * The backend's prompt hook can BLOCK the prompt via a non-zero exit
+   * (claude-code's UserPromptSubmit). Backends without this proceed after a
+   * failed turn takeover and rely on the background re-claim to shrink the
+   * stale-epoch window (PR #563 rounds 6–7).
+   */
+  blocksOnFailedTakeover: boolean;
 }
 
 const CLAUDE_CODE: HookCapabilities = {
@@ -97,6 +104,7 @@ const CLAUDE_CODE: HookCapabilities = {
   },
   supportsCompaction: true,
   supportsPromptHook: true,
+  blocksOnFailedTakeover: true,
 };
 
 const CODEX: HookCapabilities = {
@@ -112,6 +120,7 @@ const CODEX: HookCapabilities = {
   },
   supportsCompaction: false,
   supportsPromptHook: true,
+  blocksOnFailedTakeover: false,
 };
 
 const GEMINI: HookCapabilities = {
@@ -131,6 +140,7 @@ const GEMINI: HookCapabilities = {
   },
   supportsCompaction: false,
   supportsPromptHook: true,
+  blocksOnFailedTakeover: false,
 };
 
 interface PcpConfig {
@@ -810,6 +820,67 @@ async function updateRuntimeGenerationState(
     }
   }
   return false;
+}
+
+/**
+ * What happens when an INTERACTIVE prompt's turn takeover fails (task
+ * 0b9bb780, pulled into PR #563; capability-gated in round 7 after the name
+ * comparison bug — 'claude' vs 'claude-code' — made the blocking branch
+ * unreachable and only a behavioural test would have caught it).
+ *
+ * Blocking backends: the prompt is refused outright — running would execute
+ * this turn under a STALE epoch that an old server turn's fenced finalize
+ * can still clobber.
+ *
+ * Non-blocking backends: the prompt cannot be stopped, so the takeover is
+ * RETRIED in the background until it lands. The exposure window is the DB
+ * outage itself — during which the stale turn's own fenced writes are
+ * failing against the same outage; whichever write lands first after
+ * recovery, the epoch fence arbitrates.
+ *
+ * Injectable for tests; onPromptHandler passes the real implementations.
+ */
+export function handleFailedTakeover(
+  backend: Pick<HookCapabilities, 'name' | 'blocksOnFailedTakeover'>,
+  opts: {
+    agentId: string;
+    retryClaim: () => Promise<boolean>;
+    exit?: (code: number) => never;
+    sleep?: (ms: number) => Promise<void>;
+    maxRetryMs?: number;
+  }
+): void {
+  const exit = opts.exit ?? ((code: number) => process.exit(code));
+  if (backend.blocksOnFailedTakeover) {
+    hookLog('on_prompt_takeover_failed_blocking', { agentId: opts.agentId });
+    process.stderr.write(
+      'Inkwell turn takeover failed (server unreachable or claim refused). ' +
+        'Prompt blocked to protect session state — retry in a moment.\n'
+    );
+    exit(2);
+    return;
+  }
+
+  hookLog('on_prompt_takeover_failed_nonblocking', {
+    agentId: opts.agentId,
+    backend: backend.name,
+  });
+  process.stderr.write(
+    'Warning: Inkwell turn takeover failed; this turn starts under a stale epoch. ' +
+      'Re-claiming in the background.\n'
+  );
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms).unref()));
+  const deadline = Date.now() + (opts.maxRetryMs ?? 10 * 60 * 1000);
+  void (async () => {
+    while (Date.now() < deadline) {
+      await sleep(2_000);
+      if (await opts.retryClaim()) {
+        hookLog('on_prompt_takeover_recovered', { agentId: opts.agentId });
+        return;
+      }
+    }
+    hookLog('on_prompt_takeover_never_recovered', { agentId: opts.agentId });
+  })();
 }
 
 export function extractBackendSessionId(
@@ -2456,27 +2527,13 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
     headless: isHeadlessSpawn,
   });
   if (!takeoverOk && !isHeadlessSpawn) {
-    if (lifecycleBackend.name === 'claude') {
-      // Fail CLOSED (task 0b9bb780, pulled in by PR #563 round 6): claude's
-      // UserPromptSubmit hook blocks the prompt on a non-zero exit. Running
-      // anyway would execute this interactive turn under a STALE epoch that
-      // an old server turn's fenced finalize can still clobber.
-      hookLog('on_prompt_takeover_failed_blocking', { agentId });
-      process.stderr.write(
-        'Inkwell turn takeover failed (server unreachable or claim refused). ' +
-          'Prompt blocked to protect session state — retry in a moment.\n'
-      );
-      process.exit(2);
-    }
-    // Backends whose prompt hooks cannot block: proceed, loudly — the
-    // takeover happens on the next successful lifecycle write.
-    hookLog('on_prompt_takeover_failed_nonblocking', {
+    handleFailedTakeover(lifecycleBackend, {
       agentId,
-      backend: lifecycleBackend.name,
+      retryClaim: () =>
+        updateRuntimeGenerationState(cwd, config, agentId, 'running', 'prompt', {
+          headless: false,
+        }),
     });
-    process.stderr.write(
-      'Warning: Inkwell turn takeover failed; this turn runs under a stale epoch.\n'
-    );
   }
 
   // Mark session as CLI-attached (human present at REPL).

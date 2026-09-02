@@ -10,6 +10,7 @@ import { existsSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import {
+  handleFailedTakeover,
   installHooks,
   callPcpTool,
   buildIdentityBlock,
@@ -1269,5 +1270,80 @@ describe('serverAlreadyInjectedContext', () => {
     expect(serverAlreadyInjectedContext({ INK_CONSTITUTION_INJECTED: '0' })).toBe(false);
     expect(serverAlreadyInjectedContext({ INK_CONSTITUTION_INJECTED: 'true' })).toBe(false);
     expect(serverAlreadyInjectedContext({ INK_CONSTITUTION_INJECTED: '' })).toBe(false);
+  });
+});
+
+/**
+ * Round 7 (PR #563, Lumen): the round-6 blocking branch compared against
+ * 'claude' while the backend is NAMED 'claude-code' — it never fired, and
+ * only a behavioural test would have caught it. So: behavioural tests, on
+ * the capability flag, both directions.
+ */
+describe('handleFailedTakeover', () => {
+  it('BLOCKS the prompt on a blocking-capable backend', () => {
+    const exit = vi.fn((code: number): never => {
+      throw new Error(`exit:${code}`);
+    });
+    const retryClaim = vi.fn(async () => true);
+
+    expect(() =>
+      handleFailedTakeover(
+        { name: 'claude-code', blocksOnFailedTakeover: true },
+        { agentId: 'wren', retryClaim, exit: exit as never }
+      )
+    ).toThrow('exit:2');
+    expect(retryClaim).not.toHaveBeenCalled();
+  });
+
+  it('re-claims in the background until it lands on a non-blocking backend', async () => {
+    const exit = vi.fn((code: number): never => {
+      throw new Error(`exit:${code}`);
+    });
+    let attempts = 0;
+    const retryClaim = vi.fn(async () => {
+      attempts += 1;
+      return attempts >= 3;
+    });
+    const sleeps: number[] = [];
+
+    handleFailedTakeover(
+      { name: 'codex', blocksOnFailedTakeover: false },
+      {
+        agentId: 'wren',
+        retryClaim,
+        exit: exit as never,
+        sleep: async (ms) => {
+          sleeps.push(ms);
+        },
+      }
+    );
+    await vi.waitFor(() => expect(retryClaim).toHaveBeenCalledTimes(3));
+    expect(exit).not.toHaveBeenCalled();
+    expect(sleeps.length).toBeGreaterThanOrEqual(3);
+  });
+
+  it('gives up after the retry budget without ever blocking', async () => {
+    let clock = Date.now();
+    const dateSpy = vi.spyOn(Date, 'now').mockImplementation(() => clock);
+    try {
+      const retryClaim = vi.fn(async () => false);
+      handleFailedTakeover(
+        { name: 'gemini', blocksOnFailedTakeover: false },
+        {
+          agentId: 'wren',
+          retryClaim,
+          maxRetryMs: 10_000,
+          sleep: async () => {
+            clock += 3_000;
+          },
+        }
+      );
+      await vi.waitFor(() => expect(retryClaim.mock.calls.length).toBeGreaterThanOrEqual(3));
+      const calls = retryClaim.mock.calls.length;
+      await new Promise((r) => setTimeout(r, 20));
+      expect(retryClaim.mock.calls.length).toBe(calls);
+    } finally {
+      dateSpy.mockRestore();
+    }
   });
 });

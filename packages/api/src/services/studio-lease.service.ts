@@ -1415,10 +1415,35 @@ export class StudioLeaseService {
    */
   async releaseAtBoundary(
     sessionId: string,
-    opts: { userId?: string; sessionTerminal: boolean; reason: string }
+    opts: {
+      userId?: string;
+      sessionTerminal: boolean;
+      reason: string;
+      /**
+       * Refuse leases RENEWED after this instant (epoch ms). The lease's
+       * heartbeat is its generation signal: a queued next turn for the same
+       * session acquires/renews BEFORE the processing lock — before any row
+       * epoch changes — and a boundary from the previous turn must not
+       * release the tenancy that renewal announced (PR #563 round 7). A
+       * lease whose heartbeat predates the calling turn is that turn's own.
+       */
+      ifNotRenewedSince?: number;
+    }
   ): Promise<boolean> {
     let any = false;
     for (const row of await this.studiosHeldBy(sessionId, opts.userId)) {
+      if (
+        opts.ifNotRenewedSince !== undefined &&
+        row.lease.heartbeatAt &&
+        Date.parse(row.lease.heartbeatAt) > opts.ifNotRenewedSince
+      ) {
+        logger.warn('[StudioLease] Boundary release refused; lease renewed after the turn began', {
+          studioId: row.id,
+          sessionId,
+          heartbeatAt: row.lease.heartbeatAt,
+        });
+        continue;
+      }
       if (!opts.sessionTerminal && !row.lease.pendingRelease) continue;
       // A NON-terminal boundary completes only what the marker still
       // justifies (Lumen r2): a thread-scoped marker whose lease has since

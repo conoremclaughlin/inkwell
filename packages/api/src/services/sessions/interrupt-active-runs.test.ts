@@ -16,7 +16,7 @@ import {
   registerActiveRun,
   clearActiveRun,
   clearActiveRunIfOwner,
-  blurActiveRunEpoch,
+  widenActiveRunCandidates,
   listActiveRuns,
   activeRunCount,
   resetActiveRuns,
@@ -109,15 +109,19 @@ describe('active-runs registry', () => {
       expect(activeRunCount()).toBe(0);
     });
 
-    it('a fenced epoch cannot claim a BLURRED entry — only its blurring owner can', () => {
-      // Ownership unknown: the entry carries no epoch so shutdown can
-      // terminalize either candidate row. A DIFFERENT turn's fenced clear
-      // must not delete it; the blurring turn clears with undefined.
+    it('widening records the candidate set while the entry keeps its owner (round 7)', () => {
+      // Ownership unknown: the row's true epoch is one of a known SET, which
+      // shutdown fences on. The entry's own epoch is untouched, so
+      // owner-strict operations behave exactly as for a confirmed turn.
       registerActiveRun(run({ turnEpoch: 'epoch-b' }));
-      blurActiveRunEpoch('sess-1');
-      clearActiveRunIfOwner('sess-1', 'epoch-a');
+      widenActiveRunCandidates('sess-1', ['epoch-a']);
+      const entry = listActiveRuns()[0]!;
+      expect(entry.turnEpoch).toBe('epoch-b');
+      expect([...(entry.turnEpochCandidates ?? [])].sort()).toEqual(['epoch-a', 'epoch-b']);
+
+      clearActiveRunIfOwner('sess-1', 'epoch-a'); // not the owner
       expect(activeRunCount()).toBe(1);
-      clearActiveRunIfOwner('sess-1', undefined);
+      clearActiveRunIfOwner('sess-1', 'epoch-b'); // the owner
       expect(activeRunCount()).toBe(0);
     });
 
@@ -474,6 +478,10 @@ function makeClient(
                 filters.push([col, value]);
                 return builder;
               },
+              in(col: string, value: unknown) {
+                filters.push([col, value]);
+                return builder;
+              },
               is(col: string, value: unknown) {
                 filters.push([col, value]);
                 return builder;
@@ -759,6 +767,10 @@ describe('interruptActiveRuns', () => {
                 filters.push([c, v]);
                 return b;
               },
+              in(c: string, v: unknown) {
+                filters.push([c, v]);
+                return b;
+              },
               is(c: string, v: unknown) {
                 filters.push([c, v]);
                 return b;
@@ -796,6 +808,10 @@ describe('interruptActiveRuns', () => {
                 filters.push([c, v]);
                 return b;
               },
+              in(c: string, v: unknown) {
+                filters.push([c, v]);
+                return b;
+              },
               is(c: string, v: unknown) {
                 filters.push([c, v]);
                 return b;
@@ -808,7 +824,53 @@ describe('interruptActiveRuns', () => {
       };
 
       await interruptActiveRuns(client, [run({ threadKey: undefined, turnEpoch: 'epoch-a' })]);
-      expect(filters).toContainEqual(['turn_epoch', 'epoch-a']);
+      expect(filters).toContainEqual(['turn_epoch', ['epoch-a']]);
+    });
+
+    // Round 7: an UNCONFIRMED takeover's entry carries a candidate SET, and
+    // shutdown fences on the whole set — either of the two possible owners
+    // terminalizes, a cross-process claimant outside the set never does.
+    it('fences on the full candidate set for an unconfirmed takeover', async () => {
+      const filters: Array<[string, unknown]> = [];
+      const client = {
+        from: () => ({
+          select: () => ({
+            eq: () => ({
+              maybeSingle: async () => ({
+                data: { metadata: {}, lifecycle: 'running', ended_at: null },
+                error: null,
+              }),
+            }),
+          }),
+          update: () => {
+            const b = {
+              eq(c: string, v: unknown) {
+                filters.push([c, v]);
+                return b;
+              },
+              in(c: string, v: unknown) {
+                filters.push([c, v]);
+                return b;
+              },
+              is(c: string, v: unknown) {
+                filters.push([c, v]);
+                return b;
+              },
+              select: async () => ({ data: [{ id: 'sess-1' }], error: null }),
+            };
+            return b;
+          },
+        }),
+      };
+
+      await interruptActiveRuns(client, [
+        run({
+          threadKey: undefined,
+          turnEpoch: 'epoch-b',
+          turnEpochCandidates: ['epoch-a', 'epoch-b'],
+        }),
+      ]);
+      expect(filters).toContainEqual(['turn_epoch', ['epoch-a', 'epoch-b']]);
     });
 
     // Round 5 (Lumen): the breadcrumb branches rebuild the whole metadata
@@ -836,6 +898,10 @@ describe('interruptActiveRuns', () => {
                 filters.push([c, v]);
                 return b;
               },
+              in(c: string, v: unknown) {
+                filters.push([c, v]);
+                return b;
+              },
               is(c: string, v: unknown) {
                 filters.push([c, v]);
                 return b;
@@ -851,7 +917,7 @@ describe('interruptActiveRuns', () => {
         run({ threadKey: undefined, turnEpoch: 'epoch-a' }),
       ]);
       expect(outcome.state).toBe('finalized-elsewhere');
-      expect(filters).toContainEqual(['turn_epoch', 'epoch-a']);
+      expect(filters).toContainEqual(['turn_epoch', ['epoch-a']]);
     });
 
     it('classifies an epoch mismatch on the recheck as finalized-elsewhere, not unknown', async () => {

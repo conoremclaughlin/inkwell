@@ -628,6 +628,27 @@ describe('SessionService', () => {
     });
 
     /**
+     * Round 7 (Lumen): the runner-THROW path's fenced-out failed write must
+     * disown the entry the same way the normal-result path does — it
+     * previously skipped the restore-or-clear and left a settled stale
+     * ActiveRun claiming liveness forever.
+     */
+    it('a fenced-out failed write disowns the entry too', async () => {
+      const db = makeStatefulRepo();
+      const service = makeStatefulService(db.repo);
+
+      vi.mocked(mockClaudeRunner.run).mockImplementationOnce(async () => {
+        db.row!.turnEpoch = 'someone-else'; // ownership moves mid-turn
+        throw new Error('runner exploded');
+      });
+
+      const result = await service.handleMessage(createMockRequest());
+      expect(result.success).toBe(false);
+      // No stale settled ghost: the fenced-out turn's entry is gone.
+      expect(activeRunCount()).toBe(0);
+    });
+
+    /**
      * Round 6 (Lumen): the unknown/uncommitted story end-to-end. B cannot
      * confirm ownership, so its entry is BLURRED; A's recovery is not
      * superseded and still lands (the row is A's); B's own fenced writes

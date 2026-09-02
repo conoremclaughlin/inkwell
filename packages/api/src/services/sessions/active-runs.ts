@@ -72,6 +72,16 @@ export interface ActiveRun {
    * work can never touch a newer turn's entry or row.
    */
   turnEpoch?: string;
+  /**
+   * When a takeover could not be CONFIRMED (running write and reconcile read
+   * both failed — round 6), the row's true epoch is one of a known SET: the
+   * previous turn's or ours. Shutdown fences on this set (`IN`, not a blind
+   * write), so a cross-process claimant C outside the set is never clobbered
+   * (round 7 — the earlier epoch-less "blur" made that shutdown unfenced).
+   * `turnEpoch` itself stays the registrant's own candidate, so owner-strict
+   * registry operations are unaffected.
+   */
+  turnEpochCandidates?: string[];
 }
 
 const active = new Map<string, ActiveRun>();
@@ -128,17 +138,18 @@ export function clearActiveRunIfOwner(sessionId: string, epoch: string | undefin
 
 /**
  * Ownership of this entry could not be confirmed (running write AND the
- * reconcile read both failed — round 6). A blurred entry carries no epoch,
- * so shutdown terminalizes whichever running row the session has: both
- * candidate owners are THIS process's turns, and a row left running with
- * nobody reported is the zombie this registry exists to prevent. The cost is
- * that a blurred shutdown write is unfenced against a concurrent cross-
- * process claim — bounded by how rare a double write+read failure is, and
- * logged loudly at the point it happens.
+ * reconcile read both failed — round 6): the row's true epoch is one of a
+ * known SET. Widening records that set — the entry's own epoch plus every
+ * candidate the previous registration carried — so shutdown can fence on it
+ * instead of writing blind (round 7).
  */
-export function blurActiveRunEpoch(sessionId: string): void {
+export function widenActiveRunCandidates(sessionId: string, previousEpochs: string[]): void {
   const entry = active.get(sessionId);
-  if (entry) entry.turnEpoch = undefined;
+  if (!entry) return;
+  const set = new Set<string>(entry.turnEpochCandidates ?? []);
+  if (entry.turnEpoch !== undefined) set.add(entry.turnEpoch);
+  for (const e of previousEpochs) set.add(e);
+  entry.turnEpochCandidates = [...set];
 }
 
 /**
