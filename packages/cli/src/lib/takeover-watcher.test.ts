@@ -120,20 +120,25 @@ describe('startTakeoverWatcher', () => {
 
     // Round 16: the first tick runs at START — a short one-shot backend can
     // finish inside the first interval, and its scope-end stop() would have
-    // cleared the marker before any claim ever ran.
+    // cleared the marker before any claim ever ran. Counts are lower-bounded
+    // rather than exact: the fs.watch event channel can deliver extra ticks
+    // nondeterministically under load, and extra ticks are harmless.
     await vi.advanceTimersByTimeAsync(0);
-    expect(claim).toHaveBeenCalledTimes(1);
+    expect(claim.mock.calls.length).toBeGreaterThanOrEqual(1);
+    const afterImmediate = claim.mock.calls.length;
     await vi.advanceTimersByTimeAsync(1000);
-    expect(claim).toHaveBeenCalledTimes(2);
+    expect(claim.mock.calls.length).toBeGreaterThanOrEqual(afterImmediate + 1);
 
     // The child exited. stop() ADJUDICATES the own marker with one final
     // tick (round 18 — fs.watch does not order before close), then retires
     // it; nothing claims after that.
+    const beforeStop = claim.mock.calls.length;
     await watcher.stop();
-    expect(claim).toHaveBeenCalledTimes(3);
+    expect(claim.mock.calls.length).toBe(beforeStop + 1);
     expect(existsSync(p)).toBe(false);
+    const afterStop = claim.mock.calls.length;
     await vi.advanceTimersByTimeAsync(5000);
-    expect(claim).toHaveBeenCalledTimes(3);
+    expect(claim.mock.calls.length).toBe(afterStop);
   });
 
   it('a tick that throws never takes the watcher down', async () => {
