@@ -792,6 +792,49 @@ describe('interruptActiveRuns', () => {
       expect(filters).toContainEqual(['turn_epoch', 'epoch-a']);
     });
 
+    // Round 5 (Lumen): the breadcrumb branches rebuild the whole metadata
+    // blob — landing one on a row a newer owner holds would erase THEIR
+    // metadata. The write is fenced on the epoch column like everything else.
+    it('fences the already-terminal breadcrumb write on the turn epoch', async () => {
+      const filters: Array<[string, unknown]> = [];
+      const client = {
+        from: () => ({
+          select: () => ({
+            eq: () => ({
+              maybeSingle: async () => ({
+                data: {
+                  metadata: {},
+                  lifecycle: 'completed',
+                  ended_at: '2026-08-13T07:00:00.000Z',
+                },
+                error: null,
+              }),
+            }),
+          }),
+          update: () => {
+            const b = {
+              eq(c: string, v: unknown) {
+                filters.push([c, v]);
+                return b;
+              },
+              is(c: string, v: unknown) {
+                filters.push([c, v]);
+                return b;
+              },
+              select: async () => ({ data: [{ id: 'sess-1' }], error: null }),
+            };
+            return b;
+          },
+        }),
+      };
+
+      const [outcome] = await interruptActiveRuns(client, [
+        run({ threadKey: undefined, turnEpoch: 'epoch-a' }),
+      ]);
+      expect(outcome.state).toBe('finalized-elsewhere');
+      expect(filters).toContainEqual(['turn_epoch', 'epoch-a']);
+    });
+
     it('classifies an epoch mismatch on the recheck as finalized-elsewhere, not unknown', async () => {
       // Zero rows because a newer owner rotated the epoch: their running
       // state is not a contradiction and not ours to report on.
