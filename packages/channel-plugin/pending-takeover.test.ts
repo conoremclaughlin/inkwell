@@ -115,3 +115,17 @@ describe('marker path contract', () => {
     expect(readPendingTakeover('/nonexistent')).toBeNull();
   });
 });
+
+describe('plugin wiring (reachability)', () => {
+  it('the poll loop actually invokes the recovery — not just exports it', async () => {
+    const { readFileSync } = await import('fs');
+    const { join, dirname } = await import('path');
+    const { fileURLToPath } = await import('url');
+    const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'index.ts'), 'utf-8');
+    const poll = source.indexOf('async function pollInbox');
+    const call = source.indexOf('processPendingTakeover({', poll);
+    expect(poll).toBeGreaterThan(-1);
+    expect(call).toBeGreaterThan(poll);
+    expect(source.indexOf('claim: claimPendingTakeover', call)).toBeGreaterThan(call);
+  });
+});
