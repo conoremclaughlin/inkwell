@@ -220,22 +220,51 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         // Round 9: a RECLAIM additionally CASes against the stop tombstone —
         // zero rows means the turn already stopped, and the reclaim must
         // report that distinctly so the caller retires its marker.
-        const { data: claimed, error: claimError } = await dataComposer
-          .getClient()
-          .rpc('claim_turn_epoch', {
+        // Round 12: the claim and the lease protection are ONE atomic
+        // success boundary. The RPC locks the studio row, verifies the
+        // lease still belongs to this session, and only then claims the
+        // epoch + stamps EVERY lease the session holds (round 13) — a lost
+        // lease refuses the WHOLE takeover with nothing committed.
+        const claimStudioId =
+          typeof studioId === 'string' && studioId && studioId !== 'main' ? studioId : undefined;
+        const runClaim = async () =>
+          dataComposer.getClient().rpc('claim_turn_epoch', {
             p_session_id: sessionId,
             p_set_running: true,
             ...(reclaimOf ? { p_not_stopped_after: reclaimOf } : {}),
-            // Round 12: the claim and the lease protection are ONE atomic
-            // success boundary. The RPC locks the studio row, verifies the
-            // lease still belongs to this session, and only then claims the
-            // epoch + stamps the lease — a lost lease refuses the WHOLE
-            // takeover with nothing committed (no stranded running row, no
-            // leaseless turn).
-            ...(typeof studioId === 'string' && studioId && studioId !== 'main'
-              ? { p_studio_id: studioId }
-              : {}),
+            ...(claimStudioId ? { p_studio_id: claimStudioId } : {}),
           } as never);
+
+        let { data: claimed, error: claimError } = await runClaim();
+        let verdict = (claimed ?? null) as { outcome?: string; epoch?: string } | null;
+
+        if (!claimError && verdict?.outcome === 'lease-lost' && claimStudioId) {
+          // Round 13: a lost lease need not end the story — the studio may
+          // simply be VACANT (the predecessor's release completed while this
+          // prompt was in flight). Nonblocking backends will run the turn
+          // regardless, and their marker recovery could only repeat this
+          // claim forever. Reacquire through the validated ladder (it
+          // refuses if any other holder exists), then retry the atomic claim
+          // ONCE — the claim re-verifies ownership under the row lock, so a
+          // steal between the two steps just yields lease-lost again.
+          const reacquired = await leaseService.acquire({
+            studioId: claimStudioId,
+            sessionId,
+            threadKey: session.threadKey ?? `session:${sessionId}`,
+            agentId: agentId ?? session.agentId ?? 'unknown',
+            userId: session.userId,
+            reason: 'cli-prompt-reacquire',
+          });
+          if (reacquired.acquired) {
+            logger.info('[HookLifecycle] Vacant studio reacquired for prompt takeover', {
+              sessionId,
+              studioId: claimStudioId,
+            });
+            ({ data: claimed, error: claimError } = await runClaim());
+            verdict = (claimed ?? null) as { outcome?: string; epoch?: string } | null;
+          }
+        }
+
         if (claimError) {
           logger.error('[HookLifecycle] Turn-epoch claim failed; refusing prompt takeover', {
             sessionId,
@@ -244,7 +273,6 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
           res.status(500).json({ success: false, error: 'turn-epoch claim failed' });
           return;
         }
-        const verdict = (claimed ?? null) as { outcome?: string; epoch?: string } | null;
         if (verdict?.outcome === 'stopped') {
           if (reclaimOf) {
             logger.info('[HookLifecycle] Reclaim refused; the turn already stopped', {
@@ -257,9 +285,10 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
           return;
         }
         if (verdict?.outcome === 'lease-lost') {
-          // A release won: the worktree is no longer this session's. Nothing
-          // was committed — the caller's failed-takeover handling (gate/
-          // block/marker) runs against a CLEAN row.
+          // A release won and the studio is not reacquirable (another holder,
+          // or the ladder refused). Nothing was committed — the caller's
+          // failed-takeover handling (gate/block/marker) runs against a
+          // CLEAN row.
           logger.warn('[HookLifecycle] Prompt takeover refused — lease no longer held', {
             sessionId,
             studioId,
@@ -267,7 +296,20 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
           res.json({ success: true, sessionId, lifecycle, studioLeaseHeld: false });
           return;
         }
-        claimedEpoch = typeof verdict?.epoch === 'string' ? verdict.epoch : undefined;
+        // Round 13: the verdict space is EXHAUSTIVE — claimed with a string
+        // epoch, stopped, or lease-lost. Anything else (legacy function
+        // shape, null data, unknown outcome) is an unrecognized contract and
+        // must fail closed rather than fall through to a success response
+        // that reports held/ownership nothing established.
+        if (verdict?.outcome !== 'claimed' || typeof verdict.epoch !== 'string') {
+          logger.error('[HookLifecycle] Unrecognized claim verdict; refusing prompt takeover', {
+            sessionId,
+            verdict: JSON.stringify(verdict ?? null),
+          });
+          res.status(500).json({ success: false, error: 'unrecognized claim verdict' });
+          return;
+        }
+        claimedEpoch = verdict.epoch;
         // The RPC IS the ownership write — lifecycle and the turn marker
         // landed atomically inside its CAS. Writing them AGAIN below would
         // be a second, UNFENCED ownership write: a stop (idle + tombstone)
@@ -449,12 +491,13 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         // a worktree whose lease is gone. The old fire-and-forget renewal
         // left a window where a 2xx implied protection the lease no longer
         // had.
-        // Round 10: a claimed prompt RESTAMPS the lease with the CLI turn's
-        // epoch — without this, the lease keeps a server predecessor's stamp
-        // and that predecessor's delayed boundary release would still match
-        // it and drop the live CLI turn's lease.
+        // Round 13: the renewal is a PURE HEARTBEAT. Every lease restamp now
+        // happens inside the atomic claim itself (which stamps ALL of the
+        // session's leases) — an application-level restamp here was a rewind
+        // hazard: a delayed turn A's renewal landing after successor B's
+        // claim would stamp B's lease back to A.
         try {
-          await leaseService.renewBySession(sessionId, session.userId, claimedEpoch);
+          await leaseService.renewBySession(sessionId, session.userId);
         } catch (err: unknown) {
           logger.debug('[HookLifecycle] Lease renewal failed (non-fatal)', {
             sessionId,

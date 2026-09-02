@@ -398,10 +398,11 @@ describe('hook-lifecycle CLI turn signal', () => {
       expect('turnEpoch' in headlessBody).toBe(false);
     });
 
-    it('a claimed prompt RESTAMPS its leases — the named studio inside the claim, the rest via renew', async () => {
-      // Round 12: the named studio's stamp happens INSIDE the atomic claim;
-      // renewBySession carries the epoch to any OTHER studios this session
-      // holds. A separate touch would be a second read of settled state.
+    it('a claimed prompt stamps its leases INSIDE the claim — the follow-ups are pure heartbeats', async () => {
+      // Round 13: every restamp happens atomically inside the RPC (which
+      // stamps ALL the session's leases). The application-level renewal is a
+      // heartbeat only — a delayed turn A's renewal landing after successor
+      // B's claim must not be ABLE to stamp anything back to A.
       const renew = vi
         .spyOn(StudioLeaseService.prototype, 'renewBySession')
         .mockResolvedValue(true);
@@ -423,7 +424,9 @@ describe('hook-lifecycle CLI turn signal', () => {
       const body = (await resp.json()) as Record<string, unknown>;
 
       expect(rpcCalls[0]![1]).toMatchObject({ p_studio_id: studioId });
-      expect(renew).toHaveBeenCalledWith(SESSION_ID, 'user-1', 'epoch-1');
+      // No epoch rides into the renewal — the A→B→delayed-A rewind is
+      // structurally impossible when renewals cannot carry a generation.
+      expect(renew).toHaveBeenCalledWith(SESSION_ID, 'user-1');
       expect(touch).not.toHaveBeenCalled();
       expect(body.studioLeaseHeld).toBe(true);
     });
@@ -641,6 +644,91 @@ describe('hook-lifecycle CLI turn signal', () => {
       expect(body.turnEpoch).toBe('epoch-1');
       const ride = recordedUpdates.find((u) => u.table === 'sessions')!;
       expect(ride.eqs).toContainEqual(['turn_epoch', 'epoch-1']);
+    });
+
+    it('an UNRECOGNIZED claim verdict fails closed — never success without ownership (round 13)', async () => {
+      // Legacy string shape, null data, and claimed-without-epoch all mean
+      // the contract broke; falling through would report success/held with
+      // nothing established.
+      for (const data of ['epoch-1', null, { outcome: 'claimed' }, { outcome: 'wat' }]) {
+        rpcResult = () => ({ data, error: null });
+        const resp = await fetch(`${baseUrl}/api/hooks/lifecycle`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer test' },
+          body: JSON.stringify({ sessionId: SESSION_ID, lifecycle: 'running', event: 'prompt' }),
+        });
+        expect(resp.status).toBe(500);
+        expect(updateSession).not.toHaveBeenCalled();
+      }
+    });
+
+    it('a VACANT studio is reacquired and the claim retried once (round 13)', async () => {
+      // The nonblocking-backend recovery: the predecessor's release completed
+      // (lease-lost), but nobody else holds the studio — reacquire through
+      // the validated ladder, then re-run the atomic claim.
+      const acquire = vi.spyOn(StudioLeaseService.prototype, 'acquire').mockResolvedValue({
+        acquired: true,
+        lease: {} as never,
+      });
+      let call = 0;
+      rpcResult = () => {
+        call += 1;
+        return call === 1
+          ? { data: { outcome: 'lease-lost' }, error: null }
+          : { data: { outcome: 'claimed', epoch: 'epoch-re' }, error: null };
+      };
+
+      const studioId = '5bea57f3-6b24-4126-abe4-0d1cc2bd9647';
+      const resp = await fetch(`${baseUrl}/api/hooks/lifecycle`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer test' },
+        body: JSON.stringify({
+          sessionId: SESSION_ID,
+          lifecycle: 'running',
+          event: 'prompt',
+          studioId,
+        }),
+      });
+
+      expect(resp.status).toBe(200);
+      const body = (await resp.json()) as Record<string, unknown>;
+      expect(body.turnEpoch).toBe('epoch-re');
+      expect(body.studioLeaseHeld).toBe(true);
+      expect(rpcCalls).toHaveLength(2);
+      expect(acquire).toHaveBeenCalledWith(
+        expect.objectContaining({
+          studioId,
+          sessionId: SESSION_ID,
+          reason: 'cli-prompt-reacquire',
+        })
+      );
+    });
+
+    it('a HELD-elsewhere studio is not stolen — one claim, refused cleanly', async () => {
+      const acquire = vi.spyOn(StudioLeaseService.prototype, 'acquire').mockResolvedValue({
+        acquired: false,
+        holder: null,
+      });
+      rpcResult = () => ({ data: { outcome: 'lease-lost' }, error: null });
+
+      const resp = await fetch(`${baseUrl}/api/hooks/lifecycle`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer test' },
+        body: JSON.stringify({
+          sessionId: SESSION_ID,
+          lifecycle: 'running',
+          event: 'prompt',
+          studioId: '5bea57f3-6b24-4126-abe4-0d1cc2bd9647',
+        }),
+      });
+
+      expect(resp.status).toBe(200);
+      const body = (await resp.json()) as Record<string, unknown>;
+      expect(body.studioLeaseHeld).toBe(false);
+      expect('turnEpoch' in body).toBe(false);
+      expect(rpcCalls).toHaveLength(1);
+      expect(acquire).toHaveBeenCalled();
+      expect(updateSession).not.toHaveBeenCalled();
     });
 
     it('the fenced STOP fences its ride-alongs on the stop epoch too', async () => {

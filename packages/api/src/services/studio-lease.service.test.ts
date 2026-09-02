@@ -3221,37 +3221,42 @@ describe('R9: lease turn-generation fence (PR #563 round 9)', () => {
     expect(storedLease()?.turnEpoch).toBe('epoch-a');
   });
 
-  it('a CLI claim RESTAMPS the lease through renew and touch (round 10)', async () => {
-    // The CLI takeover path: a server predecessor's stamp must not survive a
-    // claimed prompt, or the predecessor's delayed fenced release still
-    // matches it and drops the live CLI turn's lease.
+  it('renewals and touches are PURE heartbeats — no code path can rewind a stamp (round 13)', async () => {
+    // The A→B→delayed-A rewind: successor B's claim stamped the lease
+    // epoch-b; a DELAYED turn A's renewal and held-touch land afterwards.
+    // Neither carries a generation anymore, so B's stamp survives both —
+    // and B's own fenced boundary still releases while A's still refuses.
     tables.studios[0].lease = freshLease({
       sessionId: 'session-a',
-      turnEpoch: 'epoch-server-a',
+      turnEpoch: 'epoch-b',
     }) as unknown as Row;
     const service = new StudioLeaseService(makeFakeSupabase(tables));
 
-    expect(await service.renewBySession('session-a', 'user-1', 'epoch-cli-b')).toBe(true);
-    expect(storedLease()?.turnEpoch).toBe('epoch-cli-b');
+    expect(await service.renewBySession('session-a', 'user-1')).toBe(true);
+    expect(storedLease()?.turnEpoch).toBe('epoch-b');
+    expect(await service.touchStudioLeaseForSession('studio-1', 'session-a', 'user-1')).toBe(true);
+    expect(storedLease()?.turnEpoch).toBe('epoch-b');
 
-    // ...and the predecessor's fenced boundary now refuses.
+    // Delayed A's fenced boundary refuses B's lease...
     expect(
       await service.releaseAtBoundary('session-a', {
         userId: 'user-1',
         sessionTerminal: true,
         reason: 'run-terminal',
-        expectedTurnEpoch: 'epoch-server-a',
+        expectedTurnEpoch: 'epoch-a',
       })
     ).toBe(false);
     expect(storedLease()).not.toBeNull();
 
+    // ...while B's own releases.
     expect(
-      await service.touchStudioLeaseForSession('studio-1', 'session-a', 'user-1', 'epoch-cli-c')
+      await service.releaseAtBoundary('session-a', {
+        userId: 'user-1',
+        sessionTerminal: true,
+        reason: 'run-terminal',
+        expectedTurnEpoch: 'epoch-b',
+      })
     ).toBe(true);
-    expect(storedLease()?.turnEpoch).toBe('epoch-cli-c');
-
-    // An epoch-less touch (heartbeat) preserves the stamp.
-    expect(await service.touchStudioLeaseForSession('studio-1', 'session-a', 'user-1')).toBe(true);
-    expect(storedLease()?.turnEpoch).toBe('epoch-cli-c');
+    expect(storedLease()).toBeNull();
   });
 });

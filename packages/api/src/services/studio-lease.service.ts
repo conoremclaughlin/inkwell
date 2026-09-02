@@ -470,9 +470,7 @@ export class StudioLeaseService {
   async touchStudioLeaseForSession(
     studioId: string,
     sessionId: string,
-    userId: string,
-    /** Round 10: a claimed CLI prompt restamps the lease's generation — see renewBySession. */
-    turnEpoch?: string
+    userId: string
   ): Promise<boolean> {
     for (let attempt = 1; attempt <= 2; attempt++) {
       const { data, error } = await this.supabase
@@ -497,7 +495,6 @@ export class StudioLeaseService {
       const touched = await this.casLease(studioId, userId, lease, {
         ...lease,
         heartbeatAt: new Date().toISOString(),
-        ...(turnEpoch !== undefined ? { turnEpoch } : {}),
       });
       if (touched) return true;
     }
@@ -1383,13 +1380,13 @@ export class StudioLeaseService {
    * through rescue, not heartbeats. Returns true if any lease was renewed.
    */
   /**
-   * `turnEpoch` (round 10): a CLI prompt claim RESTAMPS the lease with the
-   * claimed epoch — the lease must carry the generation of the turn actually
-   * running, or a server predecessor's delayed fenced release still matches
-   * its own old stamp and drops the live CLI turn's lease. Omitted, the
-   * renewal preserves the existing stamp (heartbeats never change ownership).
+   * A PURE heartbeat — renewals never change any lease's generation (round
+   * 13). The round-10 optional restamp was a rewind hazard: a DELAYED turn's
+   * renewal landing after a successor's claim stamped the lease back to the
+   * old epoch. Restamps happen only inside `claim_turn_epoch`, which stamps
+   * every lease the session holds atomically with the ownership claim.
    */
-  async renewBySession(sessionId: string, userId?: string, turnEpoch?: string): Promise<boolean> {
+  async renewBySession(sessionId: string, userId?: string): Promise<boolean> {
     let any = false;
     for (const row of await this.studiosHeldBy(sessionId, userId)) {
       // S1 (spec v18): a verified-elsewhere holder must not keep an expired
@@ -1404,11 +1401,7 @@ export class StudioLeaseService {
         });
         continue;
       }
-      const renewed: StudioLease = {
-        ...row.lease,
-        heartbeatAt: new Date().toISOString(),
-        ...(turnEpoch !== undefined ? { turnEpoch } : {}),
-      };
+      const renewed: StudioLease = { ...row.lease, heartbeatAt: new Date().toISOString() };
       if (await this.casLease(row.id, row.user_id, row.lease, renewed)) any = true;
     }
     return any;

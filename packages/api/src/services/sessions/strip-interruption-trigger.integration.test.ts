@@ -332,32 +332,53 @@ d('session_running_write trigger', () => {
         } as never);
         expect((stillLost as unknown as { outcome: string }).outcome).toBe('lease-lost');
 
-        // 3) OUR lease → claimed, and the lease carries the fresh epoch +
-        // a heartbeat bump, atomically with the session claim.
+        // 3) OUR lease → claimed, and EVERY lease the session holds carries
+        // the fresh epoch + a heartbeat bump, atomically with the session
+        // claim (round 13: a second, unnamed studio held by the same session
+        // is restamped too — no application-level follow-up exists to
+        // rewind).
         const ours = { ...foreign, sessionId, turnEpoch: 'stale-server-epoch' };
         await client
           .from('studios')
           .update({ lease: ours as never })
           .eq('id', studioId);
-        const { data: won } = await client.rpc('claim_turn_epoch', {
-          p_session_id: sessionId,
-          p_set_running: true,
-          p_studio_id: studioId,
+        const otherStudioId = randomUUID();
+        const { error: otherError } = await client.from('studios').insert({
+          id: otherStudioId,
+          user_id: USER,
+          branch: 'test/claim-atomic-other',
+          repo_root: '/tmp/claim-atomic',
+          worktree_path: `/tmp/claim-atomic-${otherStudioId}`,
+          status: 'active',
+          lease: { ...ours, turnEpoch: 'stale-other-epoch' },
         } as never);
-        const verdict = won as unknown as { outcome: string; epoch: string };
-        expect(verdict.outcome).toBe('claimed');
+        expect(otherError).toBeNull();
 
-        const after = await readSession(sessionId);
-        expect(after.lifecycle).toBe('running');
-        expect(after.turn_epoch).toBe(verdict.epoch);
-        const { data: studioAfter } = await client
-          .from('studios')
-          .select('lease')
-          .eq('id', studioId)
-          .single();
-        const lease = studioAfter!.lease as { turnEpoch?: string; heartbeatAt?: string };
-        expect(lease.turnEpoch).toBe(verdict.epoch);
-        expect(lease.heartbeatAt).not.toBe(ours.heartbeatAt);
+        try {
+          const { data: won } = await client.rpc('claim_turn_epoch', {
+            p_session_id: sessionId,
+            p_set_running: true,
+            p_studio_id: studioId,
+          } as never);
+          const verdict = won as unknown as { outcome: string; epoch: string };
+          expect(verdict.outcome).toBe('claimed');
+
+          const after = await readSession(sessionId);
+          expect(after.lifecycle).toBe('running');
+          expect(after.turn_epoch).toBe(verdict.epoch);
+          for (const sid of [studioId, otherStudioId]) {
+            const { data: studioAfter } = await client
+              .from('studios')
+              .select('lease')
+              .eq('id', sid)
+              .single();
+            const lease = studioAfter!.lease as { turnEpoch?: string; heartbeatAt?: string };
+            expect(lease.turnEpoch).toBe(verdict.epoch);
+            expect(lease.heartbeatAt).not.toBe(ours.heartbeatAt);
+          }
+        } finally {
+          await client.from('studios').delete().eq('id', otherStudioId);
+        }
       } finally {
         await client.from('studios').delete().eq('id', studioId);
       }
