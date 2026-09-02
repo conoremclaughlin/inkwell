@@ -10,7 +10,7 @@
  * to the real stop event or an explicit detach.
  */
 
-import { describe, it, expect, vi, beforeAll, afterAll, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
 import express from 'express';
 import type { Server } from 'http';
 
@@ -22,7 +22,13 @@ vi.mock('../mcp/auth/pcp-auth-provider', () => ({
   },
 }));
 
+vi.mock('../services/graph-executor.service', () => ({
+  releaseGraphClaimsForSession: vi.fn(async () => undefined),
+}));
+
 import { createHookLifecycleRouter } from './hook-lifecycle';
+import { StudioLeaseService } from '../services/studio-lease.service';
+import { releaseGraphClaimsForSession } from '../services/graph-executor.service';
 import type { DataComposer } from '../data/composer';
 
 // Minimal fake supabase for the StudioLeaseService the route constructs —
@@ -141,10 +147,18 @@ describe('hook-lifecycle CLI turn signal', () => {
     expect(getSession).not.toHaveBeenCalled();
   });
 
-  it('the real two-request prompt sequence leaves the turn marker OPEN (round 6)', async () => {
-    // Request 1: the prompt event opens the turn.
-    const promptUpdates = await post({ lifecycle: 'running', event: 'prompt' });
-    expect(typeof promptUpdates.cliTurnAt).toBe('string');
+  it('the real two-request prompt sequence leaves the turn marker OPEN (rounds 6, 10)', async () => {
+    // Request 1: the prompt event opens the turn — INSIDE the claim RPC
+    // (round 10): epoch, lifecycle, and the marker land in ONE statement,
+    // and the route performs no second ownership write that a concurrent
+    // stop could be overwritten by.
+    await post({ lifecycle: 'running', event: 'prompt' });
+    expect(rpcCalls).toHaveLength(1);
+    expect(rpcCalls[0]![1]).toMatchObject({ p_set_running: true });
+    for (const call of updateSession.mock.calls) {
+      expect(call[1]).not.toHaveProperty('lifecycle');
+      expect(call[1]).not.toHaveProperty('cliTurnAt');
+    }
 
     // Request 2: the CLI immediately re-asserts attachment. This must NOT
     // touch the marker the prompt just opened.
@@ -198,8 +212,11 @@ describe('hook-lifecycle CLI turn signal', () => {
   });
 
   it('legacy running without an event still opens the turn (protection only extends)', async () => {
-    const updates = await post({ lifecycle: 'running' });
-    expect(typeof updates.cliTurnAt).toBe('string');
+    // Round 10: the turn opens inside the claim RPC — same single-writer
+    // rule as an explicit prompt event.
+    await post({ lifecycle: 'running' });
+    expect(rpcCalls).toHaveLength(1);
+    expect(rpcCalls[0]![1]).toMatchObject({ p_set_running: true });
   });
 
   /**
@@ -277,8 +294,10 @@ describe('hook-lifecycle CLI turn signal', () => {
       expect(updates.cliTurnAt).toBeNull();
       expect(typeof updates.cliTurnStoppedAt).toBe('string');
       // Non-stop requests never touch it.
-      const promptUpdates = await post({ lifecycle: 'running', event: 'prompt' });
-      expect('cliTurnStoppedAt' in promptUpdates).toBe(false);
+      await post({ lifecycle: 'running', event: 'prompt' });
+      for (const call of updateSession.mock.calls) {
+        if (call[1] !== updates) expect(call[1]).not.toHaveProperty('cliTurnStoppedAt');
+      }
     });
 
     it('fails the prompt visibly when the claim fails — never an unfenced takeover', async () => {
@@ -291,6 +310,98 @@ describe('hook-lifecycle CLI turn signal', () => {
       expect(resp.status).toBe(500);
       // The lifecycle write never ran: no half-taken session.
       expect(updateSession).not.toHaveBeenCalled();
+    });
+  });
+
+  /**
+   * Round 10 (Lumen): the claim RPC is the SINGLE ownership writer, and the
+   * claimed epoch reaches every resource that fences on it — the lease (via
+   * restamp), the CLI (via the response), and the eventual stop's releases.
+   */
+  describe('single-writer claim and epoch threading (round 10)', () => {
+    afterEach(() => {
+      vi.restoreAllMocks();
+      vi.mocked(releaseGraphClaimsForSession).mockClear();
+    });
+
+    it('a claimed prompt performs NO second ownership write — a stop between RPC and route cannot be overwritten', async () => {
+      // workingDir rides along so the follow-up write demonstrably HAPPENS —
+      // just stripped of the fields the RPC already owns.
+      const updates = await post({ lifecycle: 'running', event: 'prompt', workingDir: '/w' });
+      expect(updates).toEqual({ workingDir: '/w' });
+    });
+
+    it('a HEADLESS prompt keeps the plain lifecycle write — the server owns its epoch', async () => {
+      const updates = await post({ lifecycle: 'running', event: 'prompt', headless: true });
+      expect(updates.lifecycle).toBe('running');
+      expect(typeof updates.cliTurnAt).toBe('string');
+      expect(rpcCalls).toHaveLength(0);
+    });
+
+    it('the claimed epoch rides back to the CLI in the response; headless gets none', async () => {
+      const resp = await fetch(`${baseUrl}/api/hooks/lifecycle`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer test' },
+        body: JSON.stringify({ sessionId: SESSION_ID, lifecycle: 'running', event: 'prompt' }),
+      });
+      const body = (await resp.json()) as Record<string, unknown>;
+      expect(body.turnEpoch).toBe('epoch-1');
+
+      const headlessResp = await fetch(`${baseUrl}/api/hooks/lifecycle`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer test' },
+        body: JSON.stringify({
+          sessionId: SESSION_ID,
+          lifecycle: 'running',
+          event: 'prompt',
+          headless: true,
+        }),
+      });
+      const headlessBody = (await headlessResp.json()) as Record<string, unknown>;
+      expect('turnEpoch' in headlessBody).toBe(false);
+    });
+
+    it('a claimed prompt RESTAMPS the lease with the CLI epoch (renew and touch)', async () => {
+      // Without the restamp the lease keeps a server predecessor's stamp,
+      // and that predecessor's delayed fenced release still matches it.
+      const renew = vi
+        .spyOn(StudioLeaseService.prototype, 'renewBySession')
+        .mockResolvedValue(true);
+      const touch = vi
+        .spyOn(StudioLeaseService.prototype, 'touchStudioLeaseForSession')
+        .mockResolvedValue(true);
+
+      const studioId = '5bea57f3-6b24-4126-abe4-0d1cc2bd9647';
+      await post({ lifecycle: 'running', event: 'prompt', studioId });
+
+      expect(renew).toHaveBeenCalledWith(SESSION_ID, 'user-1', 'epoch-1');
+      expect(touch).toHaveBeenCalledWith(studioId, SESSION_ID, 'user-1', 'epoch-1');
+    });
+
+    it('the stop carries the epoch it is ending into BOTH resource releases', async () => {
+      const release = vi
+        .spyOn(StudioLeaseService.prototype, 'releaseAtBoundary')
+        .mockResolvedValue(true);
+
+      await post({ lifecycle: 'idle', event: 'stop', turnEpoch: 'epoch-z' });
+      // The boundary chain is fire-and-forget — let it settle.
+      await vi.waitFor(() => expect(release).toHaveBeenCalled());
+
+      expect(release.mock.calls[0]![1]).toMatchObject({ expectedTurnEpoch: 'epoch-z' });
+      const graphCall = vi.mocked(releaseGraphClaimsForSession).mock.calls.at(-1)!;
+      expect(graphCall[1]).toBe(SESSION_ID);
+      expect(graphCall[4]).toBe('epoch-z');
+    });
+
+    it('a legacy stop without an epoch releases unfenced, as before', async () => {
+      const release = vi
+        .spyOn(StudioLeaseService.prototype, 'releaseAtBoundary')
+        .mockResolvedValue(true);
+
+      await post({ lifecycle: 'idle', event: 'stop' });
+      await vi.waitFor(() => expect(release).toHaveBeenCalled());
+
+      expect(release.mock.calls[0]![1]).toMatchObject({ expectedTurnEpoch: undefined });
     });
   });
 });

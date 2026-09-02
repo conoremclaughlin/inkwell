@@ -1347,3 +1347,58 @@ describe('handleFailedTakeover', () => {
     ).not.toThrow();
   });
 });
+
+/**
+ * Round 10 (Lumen): the stop must identify the epoch it is ending. The
+ * prompt claim's response carries the fresh epoch; the on-prompt hook
+ * persists it (own session only), and the on-stop hook sends it with the
+ * stop event and clears only its own record. The handlers are not exported,
+ * so the threading is pinned in source order; the record helpers themselves
+ * are behaviorally tested in lib/takeover-watcher.test.ts.
+ */
+describe('CLI turn-epoch round-trip (round 10)', () => {
+  const loadSource = async () => {
+    const { readFileSync } = await import('fs');
+    const { dirname, join } = await import('path');
+    const { fileURLToPath } = await import('url');
+    return readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'hooks.ts'), 'utf-8');
+  };
+
+  it('a successful non-headless takeover persists the claimed epoch', async () => {
+    const source = await loadSource();
+    const success = source.indexOf('} else if (takeoverOk && !isHeadlessSpawn) {');
+    const write = source.indexOf('writeCliTurnEpoch(cwd, {', success);
+    const nextFn = source.indexOf('async function', success);
+    expect(success).toBeGreaterThan(-1);
+    expect(write).toBeGreaterThan(success);
+    expect(nextFn === -1 || write < nextFn).toBe(true);
+  });
+
+  it('the stop sends its OWN session record and clears it — foreign records untouched', async () => {
+    const source = await loadSource();
+    const stop = source.indexOf('async function onStopHandler(');
+    const read = source.indexOf('readCliTurnEpoch(cwd)', stop);
+    const scoped = source.indexOf(
+      'epochRecord?.sessionId === stopSessionId ? epochRecord.turnEpoch : undefined',
+      stop
+    );
+    const sent = source.indexOf('turnEpoch: stopEpoch', stop);
+    const cleared = source.indexOf('clearCliTurnEpoch(cwd, stopSessionId)', stop);
+    expect(stop).toBeGreaterThan(-1);
+    expect(read).toBeGreaterThan(stop);
+    expect(scoped).toBeGreaterThan(stop);
+    expect(sent).toBeGreaterThan(scoped);
+    expect(cleared).toBeGreaterThan(sent);
+  });
+
+  it('updateRuntimeGenerationState forwards the stop epoch in the request body', async () => {
+    const source = await loadSource();
+    const fn = source.indexOf('async function updateRuntimeGenerationState(');
+    const body = source.indexOf('...(opts?.turnEpoch ? { turnEpoch: opts.turnEpoch } : {})', fn);
+    const parsed = source.indexOf("typeof body?.turnEpoch === 'string'", fn);
+    expect(fn).toBeGreaterThan(-1);
+    expect(body).toBeGreaterThan(fn);
+    // ...and surfaces the claimed epoch from a 2xx response.
+    expect(parsed).toBeGreaterThan(fn);
+  });
+});

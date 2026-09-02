@@ -3220,4 +3220,38 @@ describe('R9: lease turn-generation fence (PR #563 round 9)', () => {
     expect(await service.renewBySession('session-a', 'user-1')).toBe(true);
     expect(storedLease()?.turnEpoch).toBe('epoch-a');
   });
+
+  it('a CLI claim RESTAMPS the lease through renew and touch (round 10)', async () => {
+    // The CLI takeover path: a server predecessor's stamp must not survive a
+    // claimed prompt, or the predecessor's delayed fenced release still
+    // matches it and drops the live CLI turn's lease.
+    tables.studios[0].lease = freshLease({
+      sessionId: 'session-a',
+      turnEpoch: 'epoch-server-a',
+    }) as unknown as Row;
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    expect(await service.renewBySession('session-a', 'user-1', 'epoch-cli-b')).toBe(true);
+    expect(storedLease()?.turnEpoch).toBe('epoch-cli-b');
+
+    // ...and the predecessor's fenced boundary now refuses.
+    expect(
+      await service.releaseAtBoundary('session-a', {
+        userId: 'user-1',
+        sessionTerminal: true,
+        reason: 'run-terminal',
+        expectedTurnEpoch: 'epoch-server-a',
+      })
+    ).toBe(false);
+    expect(storedLease()).not.toBeNull();
+
+    expect(
+      await service.touchStudioLeaseForSession('studio-1', 'session-a', 'user-1', 'epoch-cli-c')
+    ).toBe(true);
+    expect(storedLease()?.turnEpoch).toBe('epoch-cli-c');
+
+    // An epoch-less touch (heartbeat) preserves the stamp.
+    expect(await service.touchStudioLeaseForSession('studio-1', 'session-a', 'user-1')).toBe(true);
+    expect(storedLease()?.turnEpoch).toBe('epoch-cli-c');
+  });
 });

@@ -7,14 +7,17 @@
  * THIS process — the `ink` wrapper that spawned the backend — is the
  * session's long-lived process, so the watcher lives here: every few seconds
  * it reads the marker the failed on-prompt hook wrote and converts it into a
- * claim. The server CASes the claim against the stop tombstone (reclaimOf),
- * so a claim that loses the race with the turn's stop is refused atomically;
- * both 'ok' and 'stopped' retire the marker. The watcher is stopped (and the
- * marker best-effort cleared) when the backend child exits — the session is
- * over, nothing may claim after it.
+ * claim. Round 10: the watcher is scoped to ITS OWN session — a marker left
+ * by a crashed predecessor for a different session in the same checkout
+ * belongs to that session's consumer, never to this one. The server CASes
+ * the claim against the stop tombstone (reclaimOf), so a claim that loses
+ * the race with the turn's stop is refused atomically; both 'ok' and
+ * 'stopped' retire the marker. The watcher is stopped (and its OWN marker
+ * best-effort cleared) when the backend child exits — the session is over,
+ * nothing may claim after it.
  */
 
-import { readFileSync, rmSync } from 'fs';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 
 export const TAKEOVER_MARKER_MAX_AGE_MS = 10 * 60 * 1000;
@@ -22,6 +25,59 @@ export const TAKEOVER_MARKER_MAX_AGE_MS = 10 * 60 * 1000;
 /** Mirrors hooks.ts pendingTakeoverMarkerPath — the file is the contract. */
 export function takeoverMarkerPath(cwd: string): string {
   return join(cwd, '.ink', 'pending-takeover.json');
+}
+
+/**
+ * The CLI turn-epoch record (PR #563 round 10): a successful prompt claim
+ * returns the fresh epoch, and the stop boundary must identify the epoch it
+ * is ending — the server cannot infer it, because a successor may already
+ * own the row by the time a late stop lands. The on-prompt hook (or the
+ * wrapper watcher, for reclaims) writes this file; the on-stop hook reads
+ * its OWN session's record, sends the epoch with the stop event, and clears
+ * the file. A foreign session's record is never sent or cleared.
+ */
+export function cliTurnEpochPath(cwd: string): string {
+  return join(cwd, '.ink', 'cli-turn-epoch.json');
+}
+
+export interface CliTurnEpochRecord {
+  sessionId?: string;
+  turnEpoch?: string;
+  at?: string;
+}
+
+export function writeCliTurnEpoch(
+  cwd: string,
+  record: { sessionId: string; turnEpoch: string }
+): void {
+  try {
+    mkdirSync(join(cwd, '.ink'), { recursive: true });
+    writeFileSync(
+      cliTurnEpochPath(cwd),
+      JSON.stringify({ ...record, at: new Date().toISOString() })
+    );
+  } catch {
+    // Best-effort: without the record the stop releases unfenced (legacy).
+  }
+}
+
+export function readCliTurnEpoch(cwd: string): CliTurnEpochRecord | null {
+  try {
+    return JSON.parse(readFileSync(cliTurnEpochPath(cwd), 'utf-8')) as CliTurnEpochRecord;
+  } catch {
+    return null;
+  }
+}
+
+/** Clear the record only when it belongs to the given session. */
+export function clearCliTurnEpoch(cwd: string, sessionId: string): void {
+  const record = readCliTurnEpoch(cwd);
+  if (record?.sessionId !== sessionId) return;
+  try {
+    rmSync(cliTurnEpochPath(cwd), { force: true });
+  } catch {
+    // Best-effort.
+  }
 }
 
 interface Marker {
@@ -38,20 +94,28 @@ function readMarker(path: string): Marker | null {
 }
 
 /**
- * One tick: read → judge freshness → claim (server-fenced) → retire.
- * Exported for tests; the interval wrapper below is thin.
+ * One tick: read → judge ownership + freshness → claim (server-fenced) →
+ * retire. Exported for tests; the interval wrapper below is thin.
  */
 export async function watchTick(opts: {
   markerPath: string;
+  /** The wrapper's own session — the ONLY session this watcher may claim for. */
+  expectedSessionId: string;
   claim: (sessionId: string, markerAt: string) => Promise<'ok' | 'stopped' | 'failed'>;
   now?: number;
 }): Promise<'claimed' | 'stopped' | 'skipped' | 'failed'> {
   const marker = readMarker(opts.markerPath);
   if (!marker?.sessionId || !marker.at) return 'skipped';
+  if (marker.sessionId !== opts.expectedSessionId) {
+    // A foreign marker (crashed predecessor, different session in this
+    // checkout) is not ours to claim OR to delete — claiming would re-mark
+    // another session's dead turn as running (round 10).
+    return 'skipped';
+  }
   const at = Date.parse(marker.at);
   const now = opts.now ?? Date.now();
   if (!Number.isFinite(at) || now - at > TAKEOVER_MARKER_MAX_AGE_MS) {
-    // Its turn is long over; a claim now could only mislabel a dead turn.
+    // Our own turn, but long over; a claim now could only mislabel it.
     try {
       rmSync(opts.markerPath, { force: true });
     } catch {
@@ -71,6 +135,7 @@ export async function watchTick(opts: {
 
 export function startTakeoverWatcher(opts: {
   cwd: string;
+  expectedSessionId: string;
   claim: (sessionId: string, markerAt: string) => Promise<'ok' | 'stopped' | 'failed'>;
   intervalMs?: number;
   log?: (outcome: string) => void;
@@ -81,7 +146,11 @@ export function startTakeoverWatcher(opts: {
     if (inFlight) return;
     inFlight = true;
     try {
-      const outcome = await watchTick({ markerPath, claim: opts.claim });
+      const outcome = await watchTick({
+        markerPath,
+        expectedSessionId: opts.expectedSessionId,
+        claim: opts.claim,
+      });
       if (outcome !== 'skipped') opts.log?.(outcome);
     } catch {
       // Never let the watcher take down the wrapper.
@@ -89,18 +158,22 @@ export function startTakeoverWatcher(opts: {
       inFlight = false;
     }
   }, opts.intervalMs ?? 3_000);
-  // Deliberately NOT unref'd in spirit — but the wrapper waits on the child
-  // anyway; unref keeps us from pinning the process if the child exits
-  // without our stop() (belt and braces).
+  // The wrapper waits on the child anyway; unref keeps us from pinning the
+  // process if the child exits without our stop() (belt and braces).
   timer.unref();
 
   return {
     stop: () => {
       clearInterval(timer);
-      try {
-        rmSync(markerPath, { force: true });
-      } catch {
-        // Best-effort final scope-end cleanup.
+      // Scope-end cleanup of OUR OWN marker only — a foreign session's
+      // marker still belongs to its consumer (round 10).
+      const marker = readMarker(markerPath);
+      if (marker?.sessionId === opts.expectedSessionId) {
+        try {
+          rmSync(markerPath, { force: true });
+        } catch {
+          // Best-effort.
+        }
       }
     },
   };

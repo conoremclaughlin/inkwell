@@ -59,6 +59,7 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         studioId,
         headless,
         reclaimOf,
+        turnEpoch,
       } = req.body as {
         sessionId?: string;
         lifecycle?: string;
@@ -91,6 +92,15 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
          * re-mark a finished turn as running.
          */
         reclaimOf?: string;
+        /**
+         * Stop events (round 10): the epoch of the CLI turn that is ending,
+         * round-tripped from the prompt claim's response via the on-prompt
+         * hook's epoch record. The lease boundary fences on it — the server
+         * cannot infer which turn a stop ends, because a successor may
+         * already own the row when a late stop lands. Absent for legacy
+         * senders: their boundary releases unfenced, as before.
+         */
+        turnEpoch?: string;
       };
 
       if (!sessionId) {
@@ -181,6 +191,7 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
       // read-modify-write replay window, and every stale fence goes dark.
       // Claimed BEFORE the lifecycle write so a failure here fails the whole
       // prompt visibly instead of leaving an unfenced takeover.
+      let claimedEpoch: string | undefined;
       if (isPromptEvent && !headless) {
         // Rounds 4–5: claim_turn_epoch(p_set_running) is ONE statement —
         // fresh epoch, lifecycle=running, and the turn marker together. A
@@ -209,13 +220,23 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
           res.status(409).json({ success: false, code: 'stopped' });
           return;
         }
+        claimedEpoch = typeof claimed === 'string' ? claimed : undefined;
+        // The RPC IS the ownership write — lifecycle and the turn marker
+        // landed atomically inside its CAS. Writing them AGAIN below would
+        // be a second, UNFENCED ownership write: a stop (idle + tombstone)
+        // landing between the RPC and that write would be overwritten and
+        // the finished turn re-marked running (round 10). The claim is the
+        // single writer for these fields.
+        delete updates.lifecycle;
+        delete updates.cliTurnAt;
       }
 
-      const updated = await dataComposer.repositories.memory.updateSession(sessionId, updates);
-
-      if (!updated) {
-        res.status(500).json({ success: false, error: 'Failed to update session' });
-        return;
+      if (Object.keys(updates).length > 0) {
+        const updated = await dataComposer.repositories.memory.updateSession(sessionId, updates);
+        if (!updated) {
+          res.status(500).json({ success: false, error: 'Failed to update session' });
+          return;
+        }
       }
 
       // Lease heartbeat and CLI run boundary. Prompt/compact events renew the
@@ -236,11 +257,17 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         // Graph claims are turn-scoped: the CLI stop hook IS the real turn
         // boundary. Independent chain, FIRST — a lease-release error must
         // not skip it (round 3 P1); the helper itself never throws.
+        // Round 10: the stop identifies the epoch it is ending (round-tripped
+        // from the prompt claim). Both resource releases fence on it — a
+        // lease or claim a successor turn has since stamped is not this
+        // stop's to release. Legacy stops without it release unfenced.
+        const stopEpoch = typeof turnEpoch === 'string' ? turnEpoch : undefined;
         void releaseGraphClaimsForSession(
           dataComposer.getClient(),
           sessionId,
           'cli-turn-stopped',
-          boundaryAt
+          boundaryAt,
+          stopEpoch
         ).catch((err: unknown) => {
           logger.warn('[HookLifecycle] CLI-boundary graph claim release failed', {
             sessionId,
@@ -257,6 +284,7 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
             userId: session.userId,
             sessionTerminal: terminal,
             reason: 'cli-turn-stopped',
+            expectedTurnEpoch: stopEpoch,
           });
           if (!released) {
             await leaseService.renewBySession(sessionId, session.userId);
@@ -277,8 +305,12 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         // a worktree whose lease is gone. The old fire-and-forget renewal
         // left a window where a 2xx implied protection the lease no longer
         // had.
+        // Round 10: a claimed prompt RESTAMPS the lease with the CLI turn's
+        // epoch — without this, the lease keeps a server predecessor's stamp
+        // and that predecessor's delayed boundary release would still match
+        // it and drop the live CLI turn's lease.
         try {
-          await leaseService.renewBySession(sessionId, session.userId);
+          await leaseService.renewBySession(sessionId, session.userId, claimedEpoch);
         } catch (err: unknown) {
           logger.debug('[HookLifecycle] Lease renewal failed (non-fatal)', {
             sessionId,
@@ -297,7 +329,8 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         studioLeaseHeld = await leaseService.touchStudioLeaseForSession(
           studioId,
           sessionId,
-          session.userId
+          session.userId,
+          claimedEpoch
         );
       }
 
@@ -307,6 +340,9 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         sessionId,
         lifecycle,
         ...(studioLeaseHeld !== undefined ? { studioLeaseHeld } : {}),
+        // Round 10: the claimed epoch rides back to the CLI so the eventual
+        // stop can identify the turn it is ending.
+        ...(claimedEpoch !== undefined ? { turnEpoch: claimedEpoch } : {}),
       });
     } catch (error) {
       logger.error('[HookLifecycle] Error:', error);

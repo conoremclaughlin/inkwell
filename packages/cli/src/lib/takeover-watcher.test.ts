@@ -42,7 +42,7 @@ describe('watchTick', () => {
     const p = write({ sessionId: 's1', at });
     const claim = vi.fn(async () => 'ok' as const);
 
-    const outcome = await watchTick({ markerPath: p, claim });
+    const outcome = await watchTick({ markerPath: p, expectedSessionId: 's1', claim });
 
     expect(outcome).toBe('claimed');
     // The birth time is what the server CASes against the stop tombstone —
@@ -55,7 +55,7 @@ describe('watchTick', () => {
     const p = write({ sessionId: 's1', at: new Date().toISOString() });
     const claim = vi.fn(async () => 'stopped' as const);
 
-    const outcome = await watchTick({ markerPath: p, claim });
+    const outcome = await watchTick({ markerPath: p, expectedSessionId: 's1', claim });
 
     expect(outcome).toBe('stopped');
     expect(existsSync(p)).toBe(false);
@@ -65,7 +65,7 @@ describe('watchTick', () => {
     const p = write({ sessionId: 's1', at: new Date().toISOString() });
     const claim = vi.fn(async () => 'failed' as const);
 
-    const outcome = await watchTick({ markerPath: p, claim });
+    const outcome = await watchTick({ markerPath: p, expectedSessionId: 's1', claim });
 
     expect(outcome).toBe('failed');
     expect(existsSync(p)).toBe(true);
@@ -73,17 +73,19 @@ describe('watchTick', () => {
 
   it('no marker, or a malformed one, never claims', async () => {
     const claim = vi.fn(async () => 'ok' as const);
-    expect(await watchTick({ markerPath: takeoverMarkerPath(dir), claim })).toBe('skipped');
+    expect(
+      await watchTick({ markerPath: takeoverMarkerPath(dir), expectedSessionId: 's1', claim })
+    ).toBe('skipped');
 
     const p = takeoverMarkerPath(dir);
     writeFileSync(p, 'not json');
-    expect(await watchTick({ markerPath: p, claim })).toBe('skipped');
+    expect(await watchTick({ markerPath: p, expectedSessionId: 's1', claim })).toBe('skipped');
 
     write({ at: new Date().toISOString() }); // no sessionId
-    expect(await watchTick({ markerPath: p, claim })).toBe('skipped');
+    expect(await watchTick({ markerPath: p, expectedSessionId: 's1', claim })).toBe('skipped');
 
     write({ sessionId: 's1' }); // no timestamp — freshness unjudgeable
-    expect(await watchTick({ markerPath: p, claim })).toBe('skipped');
+    expect(await watchTick({ markerPath: p, expectedSessionId: 's1', claim })).toBe('skipped');
 
     expect(claim).not.toHaveBeenCalled();
   });
@@ -96,7 +98,7 @@ describe('watchTick', () => {
     });
     const claim = vi.fn(async () => 'ok' as const);
 
-    const outcome = await watchTick({ markerPath: p, claim, now });
+    const outcome = await watchTick({ markerPath: p, expectedSessionId: 's1', claim, now });
 
     expect(outcome).toBe('skipped');
     expect(claim).not.toHaveBeenCalled();
@@ -109,7 +111,12 @@ describe('startTakeoverWatcher', () => {
     vi.useFakeTimers();
     const p = write({ sessionId: 's1', at: new Date().toISOString() });
     const claim = vi.fn(async () => 'failed' as const); // keep the marker so ticks repeat
-    const watcher = startTakeoverWatcher({ cwd: dir, claim, intervalMs: 1000 });
+    const watcher = startTakeoverWatcher({
+      cwd: dir,
+      expectedSessionId: 's1',
+      claim,
+      intervalMs: 1000,
+    });
 
     await vi.advanceTimersByTimeAsync(1000);
     expect(claim).toHaveBeenCalledTimes(1);
@@ -131,7 +138,12 @@ describe('startTakeoverWatcher', () => {
       .fn<() => Promise<'ok' | 'stopped' | 'failed'>>()
       .mockRejectedValueOnce(new Error('boom'))
       .mockResolvedValue('failed');
-    const watcher = startTakeoverWatcher({ cwd: dir, claim, intervalMs: 1000 });
+    const watcher = startTakeoverWatcher({
+      cwd: dir,
+      expectedSessionId: 's1',
+      claim,
+      intervalMs: 1000,
+    });
 
     await vi.advanceTimersByTimeAsync(1000);
     expect(claim).toHaveBeenCalledTimes(1);
@@ -141,22 +153,107 @@ describe('startTakeoverWatcher', () => {
   });
 });
 
+describe('session scoping (round 10)', () => {
+  it('never claims a FOREIGN marker, and leaves it for its owner', async () => {
+    // A crashed predecessor's marker for a different session in this
+    // checkout: claiming it would re-mark that session's dead turn as
+    // running; deleting it would strand its rightful consumer.
+    const p = write({ sessionId: 'someone-else', at: new Date().toISOString() });
+    const claim = vi.fn(async () => 'ok' as const);
+
+    const outcome = await watchTick({ markerPath: p, expectedSessionId: 's1', claim });
+
+    expect(outcome).toBe('skipped');
+    expect(claim).not.toHaveBeenCalled();
+    expect(existsSync(p)).toBe(true);
+  });
+
+  it('stop() clears only the OWN session marker — a foreign marker survives scope end', () => {
+    vi.useFakeTimers();
+    const claim = vi.fn(async () => 'ok' as const);
+    const watcher = startTakeoverWatcher({
+      cwd: dir,
+      expectedSessionId: 's1',
+      claim,
+      intervalMs: 1000,
+    });
+    const p = write({ sessionId: 'someone-else', at: new Date().toISOString() });
+
+    watcher.stop();
+    expect(existsSync(p)).toBe(true);
+  });
+});
+
+describe('CLI turn-epoch record (round 10)', () => {
+  it('round-trips a claimed epoch, and clears only for the owning session', async () => {
+    const { writeCliTurnEpoch, readCliTurnEpoch, clearCliTurnEpoch, cliTurnEpochPath } =
+      await import('./takeover-watcher.js');
+
+    writeCliTurnEpoch(dir, { sessionId: 's1', turnEpoch: 'epoch-a' });
+    expect(readCliTurnEpoch(dir)).toMatchObject({ sessionId: 's1', turnEpoch: 'epoch-a' });
+
+    // A different session cannot clear s1's record — the stop that ends
+    // s1's turn still needs it.
+    clearCliTurnEpoch(dir, 's2');
+    expect(existsSync(cliTurnEpochPath(dir))).toBe(true);
+
+    clearCliTurnEpoch(dir, 's1');
+    expect(existsSync(cliTurnEpochPath(dir))).toBe(false);
+    expect(readCliTurnEpoch(dir)).toBeNull();
+  });
+});
+
 describe('wrapper wiring (reachability)', () => {
-  it('the codex/gemini spawn path actually starts the watcher and stops it on child close', async () => {
+  const loadClaudeSource = async () => {
     const { readFileSync } = await import('fs');
     const { dirname } = await import('path');
     const { fileURLToPath } = await import('url');
-    const source = readFileSync(
+    return readFileSync(
       join(dirname(fileURLToPath(import.meta.url)), '..', 'commands', 'claude.ts'),
       'utf-8'
     );
-    const gate = source.indexOf("options.backend === 'codex' || options.backend === 'gemini'");
-    const start = source.indexOf('startTakeoverWatcher({', gate);
+  };
+
+  it('the shared helper gates on codex/gemini, scopes to the OWN session, and reclaims with the marker birth time', async () => {
+    const source = await loadClaudeSource();
+    const helper = source.indexOf('function startSessionTakeoverWatcher(');
+    const gate = source.indexOf(
+      "if (backend !== 'codex' && backend !== 'gemini') return undefined;",
+      helper
+    );
+    const scoped = source.indexOf('expectedSessionId: pcpSessionId', helper);
+    const reclaim = source.indexOf('reclaimOf: markerAt', helper);
+    const epoch = source.indexOf('writeCliTurnEpoch(', helper);
+    expect(helper).toBeGreaterThan(-1);
+    expect(gate).toBeGreaterThan(helper);
+    expect(scoped).toBeGreaterThan(helper);
+    expect(reclaim).toBeGreaterThan(helper);
+    // A successful reclaim records the claimed epoch for the stop boundary.
+    expect(epoch).toBeGreaterThan(helper);
+  });
+
+  it('the ONE-SHOT spawn path starts the watcher and stops it on child close', async () => {
+    const source = await loadClaudeSource();
+    const fn = source.indexOf('export async function runClaude(');
+    const next = source.indexOf('export async function runClaudeInteractive(');
+    const start = source.indexOf('startSessionTakeoverWatcher(', fn);
     const stop = source.indexOf('takeoverWatcher?.stop()', start);
-    expect(gate).toBeGreaterThan(-1);
-    expect(start).toBeGreaterThan(gate);
-    // The claim carries the marker birth time as reclaimOf — the tombstone CAS input.
-    expect(source.indexOf('reclaimOf: markerAt', start)).toBeGreaterThan(start);
+    expect(fn).toBeGreaterThan(-1);
+    // Bound the search INSIDE runClaude — round 10 caught the previous pin
+    // matching across function scope.
+    expect(start).toBeGreaterThan(fn);
+    expect(start).toBeLessThan(next);
+    expect(stop).toBeGreaterThan(start);
+    expect(stop).toBeLessThan(next);
+  });
+
+  it('the INTERACTIVE wrapper starts the watcher and stops it before exiting (round 10)', async () => {
+    const source = await loadClaudeSource();
+    const fn = source.indexOf('export async function runClaudeInteractive(');
+    const start = source.indexOf('startSessionTakeoverWatcher(', fn);
+    const stop = source.indexOf('interactiveTakeoverWatcher?.stop()', start);
+    expect(fn).toBeGreaterThan(-1);
+    expect(start).toBeGreaterThan(fn);
     expect(stop).toBeGreaterThan(start);
   });
 });

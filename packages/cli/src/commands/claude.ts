@@ -25,7 +25,7 @@ import { getBackend, resolveAgentId } from '../backends/index.js';
 import { classifyError } from '@inklabs/shared';
 import { getValidAccessToken } from '../auth/tokens.js';
 import { callPcpTool, getPcpServerUrl } from '../lib/pcp-mcp.js';
-import { startTakeoverWatcher } from '../lib/takeover-watcher.js';
+import { startTakeoverWatcher, writeCliTurnEpoch } from '../lib/takeover-watcher.js';
 import { sbDebugLog } from '../lib/sb-debug.js';
 import { divertConsoleLogToStderr, restoreConsoleLog } from '../lib/stdout-purity.js';
 import {
@@ -3496,6 +3496,59 @@ async function ensurePcpSessionContext(
 }
 
 /**
+ * PR #563 rounds 9–10: codex/gemini prompt hooks cannot block and run no
+ * channel plugin, so the `ink` wrapper — the session's long-lived process —
+ * is the pending-takeover marker's consumer. Scoped to the wrapper's OWN
+ * session (round 10: a crashed predecessor's marker for a different session
+ * in this checkout belongs to that session's consumer, never this one). A
+ * successful reclaim persists the claimed epoch so the on-stop hook can
+ * identify the turn it is ending at the lease boundary. Shared by the
+ * one-shot AND interactive spawn paths.
+ */
+function startSessionTakeoverWatcher(
+  backend: string,
+  pcpSessionId: string | undefined
+): { stop: () => void } | undefined {
+  if (backend !== 'codex' && backend !== 'gemini') return undefined;
+  if (!pcpSessionId) return undefined;
+  const cwd = process.cwd();
+  return startTakeoverWatcher({
+    cwd,
+    expectedSessionId: pcpSessionId,
+    claim: async (markerSessionId, markerAt) => {
+      try {
+        const serverUrl = getPcpServerUrl();
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        const token = await getValidAccessToken(serverUrl);
+        if (token) headers.Authorization = `Bearer ${token}`;
+        const resp = await fetch(`${serverUrl}/api/hooks/lifecycle`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            sessionId: markerSessionId,
+            lifecycle: 'running',
+            event: 'prompt',
+            reclaimOf: markerAt,
+          }),
+          signal: AbortSignal.timeout(3000),
+        });
+        if (resp.ok) {
+          const body = (await resp.json().catch(() => null)) as { turnEpoch?: string } | null;
+          if (body?.turnEpoch) {
+            writeCliTurnEpoch(cwd, { sessionId: markerSessionId, turnEpoch: body.turnEpoch });
+          }
+          return 'ok';
+        }
+        if (resp.status === 409) return 'stopped';
+        return 'failed';
+      } catch {
+        return 'failed';
+      }
+    },
+  });
+}
+
+/**
  * Run a backend with a prompt (one-shot mode).
  */
 export async function runClaude(
@@ -3652,36 +3705,7 @@ export async function runClaude(
   // PR #563 round 9: codex/gemini prompt hooks cannot block and run no
   // channel plugin, so THIS wrapper is the marker consumer — the long-lived
   // process that converts a failed takeover's marker into a claim.
-  const takeoverWatcher =
-    options.backend === 'codex' || options.backend === 'gemini'
-      ? startTakeoverWatcher({
-          cwd: process.cwd(),
-          claim: async (markerSessionId, markerAt) => {
-            try {
-              const serverUrl = getPcpServerUrl();
-              const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-              const token = await getValidAccessToken(serverUrl);
-              if (token) headers.Authorization = `Bearer ${token}`;
-              const resp = await fetch(`${serverUrl}/api/hooks/lifecycle`, {
-                method: 'POST',
-                headers,
-                body: JSON.stringify({
-                  sessionId: markerSessionId,
-                  lifecycle: 'running',
-                  event: 'prompt',
-                  reclaimOf: markerAt,
-                }),
-                signal: AbortSignal.timeout(3000),
-              });
-              if (resp.ok) return 'ok';
-              if (resp.status === 409) return 'stopped';
-              return 'failed';
-            } catch {
-              return 'failed';
-            }
-          },
-        })
-      : undefined;
+  const takeoverWatcher = startSessionTakeoverWatcher(options.backend, sessionContext.pcpSessionId);
 
   const child = spawn(prepared.binary, prepared.args, {
     stdio: [prepared.stdinData !== undefined ? 'pipe' : 'inherit', 'pipe', 'pipe'],
@@ -3936,6 +3960,15 @@ export async function runClaudeInteractive(
     });
   };
 
+  // Round 10 (Lumen): the INTERACTIVE wrapper is the primary long-lived
+  // process for codex/gemini — the round-9 watcher was wired only into the
+  // one-shot path. One watcher spans every retry attempt (retries continue
+  // the same session's scope); it is stopped before the wrapper exits.
+  const interactiveTakeoverWatcher = startSessionTakeoverWatcher(
+    options.backend,
+    sessionContext.pcpSessionId
+  );
+
   while (true) {
     const { code, stderrText } = await runAttempt();
     const shouldRetry =
@@ -3971,6 +4004,7 @@ export async function runClaudeInteractive(
       email: pcpConfig?.email,
     });
 
+    interactiveTakeoverWatcher?.stop();
     process.exit(code || 0);
   }
 }

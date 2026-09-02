@@ -470,7 +470,9 @@ export class StudioLeaseService {
   async touchStudioLeaseForSession(
     studioId: string,
     sessionId: string,
-    userId: string
+    userId: string,
+    /** Round 10: a claimed CLI prompt restamps the lease's generation — see renewBySession. */
+    turnEpoch?: string
   ): Promise<boolean> {
     for (let attempt = 1; attempt <= 2; attempt++) {
       const { data, error } = await this.supabase
@@ -495,6 +497,7 @@ export class StudioLeaseService {
       const touched = await this.casLease(studioId, userId, lease, {
         ...lease,
         heartbeatAt: new Date().toISOString(),
+        ...(turnEpoch !== undefined ? { turnEpoch } : {}),
       });
       if (touched) return true;
     }
@@ -1379,7 +1382,14 @@ export class StudioLeaseService {
    * a live process. Never renews a quarantine record — quarantine heals
    * through rescue, not heartbeats. Returns true if any lease was renewed.
    */
-  async renewBySession(sessionId: string, userId?: string): Promise<boolean> {
+  /**
+   * `turnEpoch` (round 10): a CLI prompt claim RESTAMPS the lease with the
+   * claimed epoch — the lease must carry the generation of the turn actually
+   * running, or a server predecessor's delayed fenced release still matches
+   * its own old stamp and drops the live CLI turn's lease. Omitted, the
+   * renewal preserves the existing stamp (heartbeats never change ownership).
+   */
+  async renewBySession(sessionId: string, userId?: string, turnEpoch?: string): Promise<boolean> {
     let any = false;
     for (const row of await this.studiosHeldBy(sessionId, userId)) {
       // S1 (spec v18): a verified-elsewhere holder must not keep an expired
@@ -1394,7 +1404,11 @@ export class StudioLeaseService {
         });
         continue;
       }
-      const renewed: StudioLease = { ...row.lease, heartbeatAt: new Date().toISOString() };
+      const renewed: StudioLease = {
+        ...row.lease,
+        heartbeatAt: new Date().toISOString(),
+        ...(turnEpoch !== undefined ? { turnEpoch } : {}),
+      };
       if (await this.casLease(row.id, row.user_id, row.lease, renewed)) any = true;
     }
     return any;

@@ -34,6 +34,7 @@ import {
   upsertRuntimeSession,
 } from '../session/runtime.js';
 import { sbDebugLog } from '../lib/sb-debug.js';
+import { writeCliTurnEpoch, readCliTurnEpoch, clearCliTurnEpoch } from '../lib/takeover-watcher.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -766,10 +767,16 @@ async function updateRuntimeGenerationState(
      * finalize out of its own turn (PR #563 round 6).
      */
     headless?: boolean;
+    /**
+     * Stop events (round 10): the epoch of the turn this stop is ending,
+     * read back from the record the prompt claim wrote. The server fences
+     * the lease boundary on it.
+     */
+    turnEpoch?: string;
   }
-): Promise<boolean> {
+): Promise<{ ok: boolean; turnEpoch?: string }> {
   const sessionId = resolveActivePcpSessionId(cwd);
-  if (!sessionId) return true; // nothing to take over — vacuously fine
+  if (!sessionId) return { ok: true }; // nothing to take over — vacuously fine
 
   // Three attempts: a prompt event is now a turn-epoch TAKEOVER on the
   // server (claim + lifecycle + marker in one statement), so a swallowed
@@ -792,12 +799,21 @@ async function updateRuntimeGenerationState(
           lifecycle,
           ...(event ? { event } : {}),
           ...(opts?.headless ? { headless: true } : {}),
+          ...(opts?.turnEpoch ? { turnEpoch: opts.turnEpoch } : {}),
           agentId,
           workingDir: cwd,
         }),
         signal: AbortSignal.timeout(5000),
       });
-      if (resp.ok) return true;
+      if (resp.ok) {
+        // Round 10: a claimed prompt's response carries the fresh epoch —
+        // the identity the eventual stop needs to fence its boundary.
+        const body = (await resp.json().catch(() => null)) as { turnEpoch?: string } | null;
+        return {
+          ok: true,
+          ...(typeof body?.turnEpoch === 'string' ? { turnEpoch: body.turnEpoch } : {}),
+        };
+      }
       const body = await resp.text().catch(() => '');
       sbDebugLog('hooks', 'lifecycle_update_failed', {
         sessionId,
@@ -819,7 +835,7 @@ async function updateRuntimeGenerationState(
       await new Promise((r) => setTimeout(r, 250));
     }
   }
-  return false;
+  return { ok: false };
 }
 
 /** Where the pending-takeover marker lives, shared with the channel plugin. */
@@ -2523,9 +2539,10 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
   // declare themselves so the route does not rotate the epoch the server's
   // own pre-turn write already owns (PR #563 round 6).
   const isHeadlessSpawn = isHeadlessSession();
-  const takeoverOk = await updateRuntimeGenerationState(cwd, config, agentId, 'running', 'prompt', {
+  const takeover = await updateRuntimeGenerationState(cwd, config, agentId, 'running', 'prompt', {
     headless: isHeadlessSpawn,
   });
+  const takeoverOk = takeover.ok;
   if (!takeoverOk && !isHeadlessSpawn) {
     handleFailedTakeover(lifecycleBackend, {
       agentId,
@@ -2549,6 +2566,12 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
       rmSync(pendingTakeoverMarkerPath(cwd), { force: true });
     } catch {
       // Best-effort cleanup.
+    }
+    // Round 10: persist the claimed epoch so the on-stop hook can identify
+    // the turn it is ending — the lease boundary fences on it.
+    const claimedSessionId = resolveActivePcpSessionId(cwd);
+    if (takeover.turnEpoch && claimedSessionId) {
+      writeCliTurnEpoch(cwd, { sessionId: claimedSessionId, turnEpoch: takeover.turnEpoch });
     }
   }
 
@@ -2731,8 +2754,19 @@ async function onStopHandler(options?: { backend?: string }): Promise<void> {
     backendSessionId: reconciled.backendSessionId || null,
   });
 
-  // Mark session as idle after each completed backend turn.
-  await updateRuntimeGenerationState(cwd, config, agentId, 'idle', 'stop');
+  // Mark session as idle after each completed backend turn. Round 10: the
+  // stop carries the epoch its prompt claimed (from the epoch record) so the
+  // server's lease boundary can fence on the turn actually ending; the
+  // record is scoped to OUR session — a foreign session's record is neither
+  // sent nor cleared.
+  const stopSessionId = resolveActivePcpSessionId(cwd);
+  const epochRecord = readCliTurnEpoch(cwd);
+  const stopEpoch =
+    stopSessionId && epochRecord?.sessionId === stopSessionId ? epochRecord.turnEpoch : undefined;
+  await updateRuntimeGenerationState(cwd, config, agentId, 'idle', 'stop', {
+    turnEpoch: stopEpoch,
+  });
+  if (stopSessionId) clearCliTurnEpoch(cwd, stopSessionId);
 
   // Increment tool call counter
   const countStr = readRuntimeFile(cwd, 'tool-count');
