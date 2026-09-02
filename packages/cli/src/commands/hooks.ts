@@ -835,6 +835,12 @@ async function updateRuntimeGenerationState(
         // A refused reclaim is authoritative — the turn is over. No retry.
         return { ok: false };
       }
+      if (resp.status === 403) {
+        // Round 24: a cross-tenant/foreign refusal is as PERMANENT as a
+        // lost lease — enforce, never fold into generic failure or retry.
+        sbDebugLog('hooks', 'lifecycle_forbidden', { sessionId, lifecycle, attempt });
+        return { ok: false, leaseLost: true };
+      }
       if (resp.ok) {
         // Round 10: a claimed prompt's response carries the fresh epoch —
         // the identity the eventual stop needs to fence its boundary.

@@ -785,6 +785,57 @@ d('session_running_write trigger', () => {
       expect((await readSession(sessionId)).lifecycle).toBe('completed');
     });
 
+    it('modern attempts are clock-immune, and concurrency converges (round 24)', async () => {
+      const sessionId = await insertSession({ lifecycle: 'idle', metadata: {} });
+
+      // 1) A real-stop tombstone in the FUTURE (extreme skew) must not
+      // refuse a fresh MODERN attempt — modern claims carry no clocks.
+      await client
+        .from('sessions')
+        .update({
+          cli_turn_stopped_at: new Date(Date.now() + 3_600_000).toISOString(),
+        } as never)
+        .eq('id', sessionId);
+      const { data: modern } = await client.rpc('claim_turn_epoch', {
+        p_session_id: sessionId,
+        p_set_running: true,
+        p_not_stopped_after: new Date().toISOString(),
+        p_attempt: 'attempt-skew',
+      } as never);
+      expect((modern as unknown as { outcome: string }).outcome).toBe('claimed');
+      // ...while the same call WITHOUT an attempt (legacy) is refused.
+      const { data: legacy } = await client.rpc('claim_turn_epoch', {
+        p_session_id: sessionId,
+        p_set_running: true,
+        p_not_stopped_after: new Date().toISOString(),
+      } as never);
+      expect((legacy as unknown as { outcome: string }).outcome).toBe('stopped');
+
+      // 2) REAL concurrency: parallel same-attempt pairs must converge on
+      // one epoch (the round-23 EvalPlanQual fold, exercised with actual
+      // simultaneous requests).
+      for (let i = 0; i < 4; i++) {
+        const att = `attempt-conc-${i}`;
+        const [a, b] = await Promise.all([
+          client.rpc('claim_turn_epoch', {
+            p_session_id: sessionId,
+            p_set_running: true,
+            p_attempt: att,
+          } as never),
+          client.rpc('claim_turn_epoch', {
+            p_session_id: sessionId,
+            p_set_running: true,
+            p_attempt: att,
+          } as never),
+        ]);
+        const va = a.data as unknown as { outcome: string; epoch: string };
+        const vb = b.data as unknown as { outcome: string; epoch: string };
+        expect(va.outcome).toBe('claimed');
+        expect(vb.outcome).toBe('claimed');
+        expect(va.epoch).toBe(vb.epoch);
+      }
+    });
+
     it('a PATHLESS studio regrants under the canonical backing class (round 16)', async () => {
       // Round 15 refused every unchanged empty-path regrant (the moved-
       // backing recheck compared '' to NULLIF('','')) and locked the wrong

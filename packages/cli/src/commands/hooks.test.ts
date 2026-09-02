@@ -1574,6 +1574,23 @@ describe('lease-lost enforcement at stop (round 23)', () => {
   });
 });
 
+describe('403 enforcement parity (round 24)', () => {
+  it('a permanent 403 refusal carries the leaseLost verdict — no retry, enforced at stop', async () => {
+    const { readFileSync } = await import('fs');
+    const { dirname, join } = await import('path');
+    const { fileURLToPath } = await import('url');
+    const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'hooks.ts'), 'utf-8');
+    const fn = source.indexOf('async function updateRuntimeGenerationState(');
+    const forbidden = source.indexOf('if (resp.status === 403) {', fn);
+    const verdict = source.indexOf('return { ok: false, leaseLost: true };', forbidden);
+    const okBranch = source.indexOf('if (resp.ok) {', fn);
+    expect(forbidden).toBeGreaterThan(fn);
+    // The permanent refusal returns BEFORE the retry loop can continue.
+    expect(verdict).toBeGreaterThan(forbidden);
+    expect(forbidden).toBeLessThan(okBranch);
+  });
+});
+
 describe('wrapper generation binding (round 18)', () => {
   it('the marker and epoch record both carry INK_RUNTIME_LINK_ID', async () => {
     const { readFileSync } = await import('fs');
