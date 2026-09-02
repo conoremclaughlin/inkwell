@@ -5,9 +5,18 @@
  * Base URL precedence: a server URL saved in Settings always wins, then the
  * build-time EXPO_PUBLIC_API_URL, then the Metro host (dev builds follow the
  * machine serving the bundle — the Inkwell server is on that same machine),
- * then the LAN address baked in by app.config.js, then productionApiUrl, then
- * loopback. The port comes from app.config.js in every case, so host and port
- * are both discovered rather than assumed.
+ * then the LAN address baked in by app.config.js and productionApiUrl, then
+ * loopback.
+ *
+ * Those last two swap with the build: a dev build takes the LAN address first,
+ * a release build takes the configured production URL first and keeps LAN only
+ * as a fallback — otherwise a shipped app addresses the machine that built it.
+ * resolveApiUrl owns that rule; see its doc comment.
+ *
+ * The discovered port applies to the tiers that only supply a HOST — Metro,
+ * the baked LAN address, and loopback. EXPO_PUBLIC_API_URL and
+ * productionApiUrl are full URLs and carry their own ports, which is the point
+ * of setting them.
  */
 import Constants from 'expo-constants';
 import { describeApiUrlProblem, resolveApiUrl, type ResolvedApiUrl } from './resolveApiUrl';
@@ -22,10 +31,12 @@ import {
 import type { LoginResponse, RefreshResponse, SignupResponse } from './types';
 
 /**
- * Port the Inkwell API listens on.
+ * Port the Inkwell API listens on, for the tiers that supply only a host.
  *
- * app.config.js reads PCP_PORT_BASE on the machine that started Metro and
- * publishes it here, so an isolated server (4001, 4801, …) is reached without
+ * app.config.js reads INK_PORT_BASE — falling back to the legacy
+ * PCP_PORT_BASE, matching the server's own resolution in
+ * packages/api/src/config/env.ts — on the machine that started Metro, and
+ * publishes it here. So an isolated server (4001, 4801, …) is reached without
  * anyone editing a constant or typing a URL on a phone keyboard. The literal
  * is only the floor for a config that predates the field.
  */
