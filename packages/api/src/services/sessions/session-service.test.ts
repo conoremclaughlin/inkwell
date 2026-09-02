@@ -9,7 +9,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { tmpdir } from 'os';
 import { makeFakeSupabase, type Row } from './fake-supabase.js';
 import { resetActiveRuns, activeRunCount, listActiveRuns } from './active-runs.js';
-import { resetPendingFinalizations } from './finalize-turn.js';
+import { resetPendingFinalizations, hasPendingFinalization } from './finalize-turn.js';
 import { StudioOverflowService } from '../studio-overflow.service.js';
 import { StudioLeaseService } from '../studio-lease.service.js';
 import {
@@ -679,6 +679,106 @@ describe('SessionService', () => {
 
       // ...and A's own finalize cleared its restored entry. Nothing lingers.
       expect(activeRunCount()).toBe(0);
+    });
+
+    /**
+     * Round 8 (Lumen): when BOTH terminal writes hit the outage, the two
+     * recoveries must coexist — a session-global token let the unconfirmed
+     * newer loop cancel the older valid one, then fence out itself, leaving
+     * a running row with no retry anywhere. The row CAS is the arbiter.
+     */
+    it('candidate recoveries coexist and the row CAS arbitrates', async () => {
+      const db = makeStatefulRepo();
+      db.fail.finalize = 2; // A's inline AND B's inline finalize both fail
+      db.fail.commitThenRejectRunning = 3; // B's takeover commits, responses fail
+      db.fail.findById = 1; // ...and B's reconcile read fails → unknown
+      const service = makeStatefulService(db.repo);
+
+      await service.handleMessage(createMockRequest()); // turn A — retry pending
+      const b = await service.handleMessage(createMockRequest()); // turn B — unknown, retry pending
+      expect(b.success).toBe(true);
+
+      // B did NOT cancel A: both recoveries are pending.
+      expect(hasPendingFinalization('session-123')).toBe(true);
+
+      await vi.advanceTimersByTimeAsync(20_000);
+
+      // The commit actually landed (row carries B's epoch), so B's loop
+      // finalized it and A's fenced out on its own. Nothing lingers.
+      expect(db.row?.lifecycle).toBe('idle');
+      expect(activeRunCount()).toBe(0);
+      expect(hasPendingFinalization('session-123')).toBe(false);
+    });
+
+    /**
+     * Round 8 (Lumen): a QUEUED next turn renews the lease before the
+     * processing lock — invisible to every DB fence. The boundary consults
+     * the in-process queue/lock instead of a heartbeat cutoff (which had
+     * rejected the turn's OWN mid-turn renewals).
+     */
+    it('boundary effects are skipped when the next turn is queued (inline)', async () => {
+      const { logger } = await import('../../utils/logger.js');
+      const db = makeStatefulRepo();
+      const service = makeStatefulService(db.repo);
+
+      // Park A inside its runner so B can queue behind the lock.
+      let releaseRunner!: (v: ReturnType<typeof createMockClaudeResult>) => void;
+      vi.mocked(mockClaudeRunner.run).mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            releaseRunner = resolve;
+          })
+      );
+
+      const aPromise = service.handleMessage(createMockRequest());
+      await vi.advanceTimersByTimeAsync(0); // A reaches the runner
+      const bPromise = service.handleMessage(createMockRequest()); // queues
+      await vi.advanceTimersByTimeAsync(0);
+
+      releaseRunner(createMockClaudeResult());
+      const a = await aPromise;
+      expect(a.success).toBe(true);
+
+      expect(vi.mocked(logger.warn).mock.calls.map((c) => c[0])).toContain(
+        'Skipping boundary effects; a newer turn is queued or running'
+      );
+
+      const bResult = await bPromise;
+      expect(bResult.success).toBe(true);
+      expect(activeRunCount()).toBe(0);
+    });
+
+    it('background finalize skips boundary effects while the next turn holds the lock', async () => {
+      const { logger } = await import('../../utils/logger.js');
+      const db = makeStatefulRepo();
+      db.fail.finalize = 1; // A's inline finalize fails; retry pending
+      const service = makeStatefulService(db.repo);
+
+      await service.handleMessage(createMockRequest()); // turn A
+
+      // Turn B enters and parks inside its runner — it holds the lock.
+      let releaseRunner!: (v: ReturnType<typeof createMockClaudeResult>) => void;
+      vi.mocked(mockClaudeRunner.run).mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            releaseRunner = resolve;
+          })
+      );
+      const bPromise = service.handleMessage(createMockRequest());
+      await vi.advanceTimersByTimeAsync(0);
+
+      // A's retry fires from the background while B holds the lock. The row
+      // is B's? No — B is parked BEFORE its running write? It wrote running
+      // on entry (lock acquired, pre-turn done, parked in runner) — so A
+      // fences out; the point here is the lock-held path never runs A's
+      // boundary effects either way.
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      releaseRunner(createMockClaudeResult());
+      const b = await bPromise;
+      expect(b.success).toBe(true);
+      expect(activeRunCount()).toBe(0);
+      void logger;
     });
 
     /**

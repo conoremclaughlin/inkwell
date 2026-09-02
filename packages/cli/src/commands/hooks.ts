@@ -18,7 +18,7 @@
 
 import { Command } from 'commander';
 import chalk from 'chalk';
-import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, rmSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { execSync } from 'child_process';
@@ -822,6 +822,11 @@ async function updateRuntimeGenerationState(
   return false;
 }
 
+/** Where the pending-takeover marker lives, shared with the channel plugin. */
+export function pendingTakeoverMarkerPath(cwd: string): string {
+  return join(cwd, '.ink', 'pending-takeover.json');
+}
+
 /**
  * What happens when an INTERACTIVE prompt's turn takeover fails (task
  * 0b9bb780, pulled into PR #563; capability-gated in round 7 after the name
@@ -832,11 +837,12 @@ async function updateRuntimeGenerationState(
  * this turn under a STALE epoch that an old server turn's fenced finalize
  * can still clobber.
  *
- * Non-blocking backends: the prompt cannot be stopped, so the takeover is
- * RETRIED in the background until it lands. The exposure window is the DB
- * outage itself — during which the stale turn's own fenced writes are
- * failing against the same outage; whichever write lands first after
- * recovery, the epoch fence arbitrates.
+ * Non-blocking backends: the prompt cannot be stopped, and this hook process
+ * is SHORT-LIVED — an in-process retry timer dies with it (round 8). So the
+ * recovery is a durable MARKER file that the session's long-lived channel
+ * plugin picks up on its poll loop and converts into a claim; the on-stop
+ * hook (and any later successful prompt takeover) deletes the marker, which
+ * scopes the recovery to this prompt generation.
  *
  * Injectable for tests; onPromptHandler passes the real implementations.
  */
@@ -844,10 +850,8 @@ export function handleFailedTakeover(
   backend: Pick<HookCapabilities, 'name' | 'blocksOnFailedTakeover'>,
   opts: {
     agentId: string;
-    retryClaim: () => Promise<boolean>;
+    writePendingTakeover: () => void;
     exit?: (code: number) => never;
-    sleep?: (ms: number) => Promise<void>;
-    maxRetryMs?: number;
   }
 ): void {
   const exit = opts.exit ?? ((code: number) => process.exit(code));
@@ -867,20 +871,16 @@ export function handleFailedTakeover(
   });
   process.stderr.write(
     'Warning: Inkwell turn takeover failed; this turn starts under a stale epoch. ' +
-      'Re-claiming in the background.\n'
+      'A pending-takeover marker was written for the channel plugin to reclaim.\n'
   );
-  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms).unref()));
-  const deadline = Date.now() + (opts.maxRetryMs ?? 10 * 60 * 1000);
-  void (async () => {
-    while (Date.now() < deadline) {
-      await sleep(2_000);
-      if (await opts.retryClaim()) {
-        hookLog('on_prompt_takeover_recovered', { agentId: opts.agentId });
-        return;
-      }
-    }
-    hookLog('on_prompt_takeover_never_recovered', { agentId: opts.agentId });
-  })();
+  try {
+    opts.writePendingTakeover();
+  } catch (err) {
+    hookLog('on_prompt_takeover_marker_failed', {
+      agentId: opts.agentId,
+      error: String(err),
+    });
+  }
 }
 
 export function extractBackendSessionId(
@@ -2529,11 +2529,27 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
   if (!takeoverOk && !isHeadlessSpawn) {
     handleFailedTakeover(lifecycleBackend, {
       agentId,
-      retryClaim: () =>
-        updateRuntimeGenerationState(cwd, config, agentId, 'running', 'prompt', {
-          headless: false,
-        }),
+      writePendingTakeover: () => {
+        const markerPath = pendingTakeoverMarkerPath(cwd);
+        mkdirSync(dirname(markerPath), { recursive: true });
+        writeFileSync(
+          markerPath,
+          JSON.stringify({
+            sessionId: resolveActivePcpSessionId(cwd),
+            agentId,
+            at: new Date().toISOString(),
+          })
+        );
+      },
     });
+  } else if (takeoverOk && !isHeadlessSpawn) {
+    // A successful takeover supersedes any marker from an earlier failed
+    // prompt — the recovery it described is no longer this generation's.
+    try {
+      rmSync(pendingTakeoverMarkerPath(cwd), { force: true });
+    } catch {
+      // Best-effort cleanup.
+    }
   }
 
   // Mark session as CLI-attached (human present at REPL).
@@ -2683,6 +2699,15 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
 async function onStopHandler(options?: { backend?: string }): Promise<void> {
   const stdin = await readStdin();
   const cwd = process.cwd();
+
+  // The prompt-generation scope for a pending-takeover marker ends with the
+  // turn: a marker left behind must not let the channel plugin claim/mark
+  // running AFTER the turn finished (PR #563 round 8).
+  try {
+    rmSync(pendingTakeoverMarkerPath(cwd), { force: true });
+  } catch {
+    // Best-effort cleanup.
+  }
   const lifecycleBackend = resolveLifecycleBackend(cwd, options?.backend);
 
   const config = getPcpConfig();

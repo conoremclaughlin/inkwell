@@ -29,6 +29,7 @@ import { readFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import { createThreadDrainState, drainThreads, drainLegacyInbox } from './poll-core.js';
+import { pendingTakeoverMarkerPath, processPendingTakeover } from './pending-takeover.js';
 import { createLogger, isLogLevel, logFileFor, sweepStaleLogs, type LogLevel } from './logger.js';
 
 // ─── Logging ────────────────────────────────────────────────
@@ -253,6 +254,29 @@ Do NOT ignore channel messages — they are from your teammates and deserve time
 // Thread cursors, dedup, and cold-start skip accounting live in the drain
 // state (poll-core.ts owns the delivery semantics; unit-tested there).
 const drainState = createThreadDrainState();
+
+// Durable turn-takeover recovery (PR #563 round 8): a failed interactive
+// takeover on a non-blocking backend leaves a marker; this long-lived
+// process converts it into a claim. See pending-takeover.ts.
+const takeoverMarkerPath = pendingTakeoverMarkerPath(process.cwd());
+
+async function claimPendingTakeover(): Promise<boolean> {
+  if (!sessionId || !accessToken) return false;
+  try {
+    const resp = await fetch(`${INK_SERVER_URL}/api/hooks/lifecycle`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${accessToken}`,
+      },
+      body: JSON.stringify({ sessionId, lifecycle: 'running', event: 'prompt' }),
+      signal: AbortSignal.timeout(3000),
+    });
+    return resp.ok;
+  } catch {
+    return false;
+  }
+}
 const seenMessageIds = drainState.seenMessageIds; // shared with the legacy loop
 
 async function stampCliPollAt(): Promise<void> {
@@ -312,6 +336,20 @@ async function pollInbox(): Promise<void> {
 
     // Stamp cli_poll_at so the trigger handler knows we're alive
     stampCliPollAt().catch(() => {});
+
+    // Convert any pending-takeover marker into a claim (fire-and-forget:
+    // the marker survives a failed claim and is re-judged next tick).
+    processPendingTakeover({
+      markerPath: takeoverMarkerPath,
+      sessionId,
+      claim: claimPendingTakeover,
+    })
+      .then((outcome) => {
+        if (outcome !== 'skipped') {
+          log('info', `Pending turn takeover: ${outcome}`);
+        }
+      })
+      .catch(() => {});
 
     try {
       // Pointer-based unseen fetch, NOT a wall-clock window (Lumen #504 r2

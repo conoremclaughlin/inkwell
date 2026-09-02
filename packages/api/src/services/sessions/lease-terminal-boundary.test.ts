@@ -243,36 +243,6 @@ describe('terminal-boundary release', () => {
     expect(tables.studios[0].lease).toBeNull();
   });
 
-  it('round 7 (PR #563): refuses a lease renewed after the calling turn began', async () => {
-    const session = makeSession({ turnEpoch: 'owner-epoch' } as never);
-    const { store, repo } = makeMockRepository(session);
-    const tables = leasedTables('session-1'); // heartbeatAt = NOW
-    const service = makeService(repo, tables);
-    const svc = service as unknown as {
-      releaseLeaseIfSessionTerminal(id: string, epoch?: string, since?: number): Promise<void>;
-    };
-
-    registerActiveRun({
-      sessionId: 'session-1',
-      userId: 'user-1',
-      agentId: 'wren',
-      backend: 'claude-code',
-      startedAt: Date.now(),
-    });
-    await service.endSession('session-1', 'ended mid-turn');
-    resetActiveRuns();
-    store.session = { ...store.session, endedAt: new Date() } as Session;
-
-    // The queued NEXT turn renewed the lease (heartbeat is fresh) after this
-    // turn began a minute ago: the boundary is not ours to release.
-    await svc.releaseLeaseIfSessionTerminal('session-1', 'owner-epoch', Date.now() - 60_000);
-    expect(tables.studios[0].lease).not.toBeNull();
-
-    // No renewal since the turn began: the boundary releases.
-    await svc.releaseLeaseIfSessionTerminal('session-1', 'owner-epoch', Date.now() + 1_000);
-    expect(tables.studios[0].lease).toBeNull();
-  });
-
   it('endSession releases immediately when no run is live', async () => {
     const session = makeSession();
     const { repo } = makeMockRepository(session);

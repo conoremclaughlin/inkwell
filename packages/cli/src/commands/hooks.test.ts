@@ -1292,7 +1292,7 @@ describe('handleFailedTakeover', () => {
     expect(() =>
       handleFailedTakeover(getBackendByName('claude-code'), {
         agentId: 'wren',
-        retryClaim: vi.fn(async () => true),
+        writePendingTakeover: vi.fn(),
         exit: exit as never,
       })
     ).toThrow('exit:2');
@@ -1300,70 +1300,50 @@ describe('handleFailedTakeover', () => {
     expect(getBackendByName('gemini').blocksOnFailedTakeover).toBe(false);
   });
 
-  it('BLOCKS the prompt on a blocking-capable backend', () => {
+  it('BLOCKS the prompt on a blocking-capable backend, writing no marker', () => {
     const exit = vi.fn((code: number): never => {
       throw new Error(`exit:${code}`);
     });
-    const retryClaim = vi.fn(async () => true);
+    const writePendingTakeover = vi.fn();
 
     expect(() =>
       handleFailedTakeover(
         { name: 'claude-code', blocksOnFailedTakeover: true },
-        { agentId: 'wren', retryClaim, exit: exit as never }
+        { agentId: 'wren', writePendingTakeover, exit: exit as never }
       )
     ).toThrow('exit:2');
-    expect(retryClaim).not.toHaveBeenCalled();
+    expect(writePendingTakeover).not.toHaveBeenCalled();
   });
 
-  it('re-claims in the background until it lands on a non-blocking backend', async () => {
+  it('writes the durable marker on a non-blocking backend — no in-process timer', () => {
+    // Round 8 (Lumen): this hook process is short-lived; an unref()'d timer
+    // dies with it. The durable artefact is the marker the channel plugin
+    // converts into a claim on its poll loop.
     const exit = vi.fn((code: number): never => {
       throw new Error(`exit:${code}`);
     });
-    let attempts = 0;
-    const retryClaim = vi.fn(async () => {
-      attempts += 1;
-      return attempts >= 3;
-    });
-    const sleeps: number[] = [];
+    const writePendingTakeover = vi.fn();
 
     handleFailedTakeover(
       { name: 'codex', blocksOnFailedTakeover: false },
-      {
-        agentId: 'wren',
-        retryClaim,
-        exit: exit as never,
-        sleep: async (ms) => {
-          sleeps.push(ms);
-        },
-      }
+      { agentId: 'wren', writePendingTakeover, exit: exit as never }
     );
-    await vi.waitFor(() => expect(retryClaim).toHaveBeenCalledTimes(3));
+
     expect(exit).not.toHaveBeenCalled();
-    expect(sleeps.length).toBeGreaterThanOrEqual(3);
+    expect(writePendingTakeover).toHaveBeenCalledTimes(1);
   });
 
-  it('gives up after the retry budget without ever blocking', async () => {
-    let clock = Date.now();
-    const dateSpy = vi.spyOn(Date, 'now').mockImplementation(() => clock);
-    try {
-      const retryClaim = vi.fn(async () => false);
+  it('a marker write failure is swallowed — the prompt itself must not break', () => {
+    expect(() =>
       handleFailedTakeover(
         { name: 'gemini', blocksOnFailedTakeover: false },
         {
           agentId: 'wren',
-          retryClaim,
-          maxRetryMs: 10_000,
-          sleep: async () => {
-            clock += 3_000;
+          writePendingTakeover: () => {
+            throw new Error('disk full');
           },
         }
-      );
-      await vi.waitFor(() => expect(retryClaim.mock.calls.length).toBeGreaterThanOrEqual(3));
-      const calls = retryClaim.mock.calls.length;
-      await new Promise((r) => setTimeout(r, 20));
-      expect(retryClaim.mock.calls.length).toBe(calls);
-    } finally {
-      dateSpy.mockRestore();
-    }
+      )
+    ).not.toThrow();
   });
 });

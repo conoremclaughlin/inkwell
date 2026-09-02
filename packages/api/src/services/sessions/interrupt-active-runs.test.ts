@@ -205,7 +205,7 @@ describe('registry brackets the persisted running state', () => {
     // superseded turn (its row belongs to someone else — round 6), and the
     // inline fence-out. Every one is the strict owner clear, so a newer
     // registrant's entry always survives.
-    const invocation = source.indexOf('onTurnFinalized();', inlineGate);
+    const invocation = source.indexOf('onTurnFinalized(true);', inlineGate);
     expect(invocation).toBeGreaterThan(-1);
     const span = source.slice(inlineGate, invocation);
     for (
@@ -228,7 +228,7 @@ describe('registry brackets the persisted running state', () => {
   // persisted. An unconditional invocation after a shutdown-refused write
   // drops the run before the snapshot.
   it('guards the inline finalized invocation on the write having persisted', () => {
-    expect(source).toMatch(/if \(finalized\)\s*\{\s*onTurnFinalized\(\);/);
+    expect(source).toMatch(/if \(finalized\)\s*\{\s*onTurnFinalized\(true\);/);
   });
 
   // The background retry must hand the SAME closure to the loop, so a late
@@ -236,7 +236,9 @@ describe('registry brackets the persisted running state', () => {
   it('routes the background retry through the same finalized closure', () => {
     const retryCall = at('retryTurnFinalization({');
     expect(retryCall).toBeGreaterThan(-1);
-    expect(source.indexOf('onFinalized: onTurnFinalized', retryCall)).toBeGreaterThan(retryCall);
+    expect(source.indexOf('onFinalized: () => onTurnFinalized(false)', retryCall)).toBeGreaterThan(
+      retryCall
+    );
   });
 
   // A bookkeeping failure must not masquerade as a turn failure: the catch

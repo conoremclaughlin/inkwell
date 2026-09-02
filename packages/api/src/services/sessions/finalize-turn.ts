@@ -45,25 +45,36 @@ export type FinalizeTurnOutcome = 'finalized' | 'refused' | 'gone' | 'exhausted'
  * including writes already in flight when the new turn arrived. An attempt
  * that loses the fence throws TurnSupersededError and the loop stands down.
  */
-const pendingFinalizations = new Map<string, { cancelled: boolean }>();
+// Keyed session → epoch → token (round 8): an UNCONFIRMED takeover's
+// recovery must be able to coexist with the previous turn's — when both
+// terminal writes hit the same outage, whichever loop's CAS matches the row
+// finalizes and the other fences out on its own. A single session-global
+// token made the newer loop cancel the older VALID one unconditionally, and
+// when the newer then fenced out, nothing anywhere retried the older row.
+const pendingFinalizations = new Map<string, Map<string, { cancelled: boolean }>>();
 
+const DEFAULT_EPOCH_KEY = '__default__';
+
+/** Cancel EVERY pending loop for the session — confirmed-ownership takeovers only. */
 export function supersedePendingFinalization(sessionId: string): void {
-  const token = pendingFinalizations.get(sessionId);
-  if (token) {
-    token.cancelled = true;
+  const perEpoch = pendingFinalizations.get(sessionId);
+  if (perEpoch && perEpoch.size > 0) {
+    for (const token of perEpoch.values()) token.cancelled = true;
     pendingFinalizations.delete(sessionId);
     logger.warn('Pending turn finalization superseded by a new turn', { sessionId });
   }
 }
 
-/** Test seam. */
+/** Any recovery pending for the session, under any epoch. */
 export function hasPendingFinalization(sessionId: string): boolean {
-  return pendingFinalizations.has(sessionId);
+  return (pendingFinalizations.get(sessionId)?.size ?? 0) > 0;
 }
 
 /** Test seam: cancel and forget every pending loop. Not used in production. */
 export function resetPendingFinalizations(): void {
-  for (const token of pendingFinalizations.values()) token.cancelled = true;
+  for (const perEpoch of pendingFinalizations.values()) {
+    for (const token of perEpoch.values()) token.cancelled = true;
+  }
   pendingFinalizations.clear();
 }
 
@@ -78,6 +89,18 @@ export interface FinalizeTurnRetryOptions {
   admit: () => boolean;
   /** Run-boundary steps, exactly once, after the write durably persists. */
   onFinalized: () => void;
+  /**
+   * This loop's identity within the session — its turn epoch. Loops with
+   * different keys COEXIST (round 8: unconfirmed candidates arbitrate via
+   * the row CAS, not by cancelling each other).
+   */
+  epochKey?: string;
+  /**
+   * Cancel the session's OTHER pending loops on entry. True for confirmed
+   * ownership (the fence guarantees they can never land); FALSE when the
+   * takeover is unconfirmed — the sibling might be the valid recovery.
+   */
+  supersedeSiblings?: boolean;
   /** The session row no longer exists — retrying cannot help. */
   isGone?: (err: unknown) => boolean;
   sleep?: (ms: number) => Promise<void>;
@@ -131,14 +154,26 @@ export async function retryTurnFinalization(
     maxDelayMs = FINALIZE_RETRY_MAX_DELAY_MS,
   } = options;
 
-  // Registering replaces any older pending loop's token wholesale; the older
-  // loop sees its own token cancelled and stops. One pending finalization per
-  // session, and it is always the newest turn's.
-  supersedePendingFinalization(sessionId);
+  const epochKey = options.epochKey ?? DEFAULT_EPOCH_KEY;
+  const supersedeSiblings = options.supersedeSiblings ?? true;
+  if (supersedeSiblings) {
+    supersedePendingFinalization(sessionId);
+  }
+  let perEpoch = pendingFinalizations.get(sessionId);
+  if (!perEpoch) {
+    perEpoch = new Map();
+    pendingFinalizations.set(sessionId, perEpoch);
+  }
+  // Re-entry under the SAME epoch replaces (and cancels) its own older loop.
+  perEpoch.get(epochKey) && (perEpoch.get(epochKey)!.cancelled = true);
   const token = { cancelled: false };
-  pendingFinalizations.set(sessionId, token);
+  perEpoch.set(epochKey, token);
   const done = (outcome: FinalizeTurnOutcome): FinalizeTurnOutcome => {
-    if (pendingFinalizations.get(sessionId) === token) pendingFinalizations.delete(sessionId);
+    const map = pendingFinalizations.get(sessionId);
+    if (map?.get(epochKey) === token) {
+      map.delete(epochKey);
+      if (map.size === 0) pendingFinalizations.delete(sessionId);
+    }
     return outcome;
   };
 

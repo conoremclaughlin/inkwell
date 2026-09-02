@@ -1707,10 +1707,6 @@ export class SessionService implements ISessionService {
     // actually land?" is answerable by reading the row and comparing.
     const turnEpoch = randomUUID();
 
-    // Captured once: the boundary's lease release refuses leases RENEWED
-    // after this instant — a queued next turn acquires/renews before the
-    // processing lock, while the row epoch is still ours, and that renewal
-    // is the one signal that the lease has a next tenant (round 7).
     const turnRegisteredAt = Date.now();
     const admitted = registerActiveRun({
       sessionId: session.id,
@@ -2044,8 +2040,10 @@ export class SessionService implements ISessionService {
     const performFinalizeWrite = () => writeTerminalFenced(finalizeUpdates);
 
     // Run-boundary steps. Invoked ONLY after the terminal write durably
-    // persisted — inline on the fast path, from the retry loop otherwise.
-    const onTurnFinalized = () => {
+    // persisted — inline on the fast path (invokedInline=true, while this
+    // turn still holds the processing lock), from the retry loop otherwise.
+    const boundaryLockKey = `${agentId}:${session.id}`;
+    const onTurnFinalized = (invokedInline: boolean) => {
       // Cleared ONLY once a terminal state actually persisted. Clearing after
       // a refused or failed write would delete this run from the registry
       // while its row still says `running` — and if shutdown is mid-drain and
@@ -2055,6 +2053,23 @@ export class SessionService implements ISessionService {
       // epoch: if a newer turn registered over us while our late write landed
       // (it can only land while the row was still ours), its entry survives.
       clearActiveRunIfOwner(session.id, turnEpoch);
+      // A QUEUED next turn is invisible to every DB-side fence: it acquires
+      // and renews the lease BEFORE the processing lock, while the row epoch
+      // is still ours (Lumen rounds 7–8 — a heartbeat cutoff rejected our own
+      // mid-turn renewals instead). The queue and the lock are in-process
+      // truth: same-session turns are serialized by this process, so a
+      // non-empty queue (or, from the background path, a lock held by the
+      // next turn) means the boundary belongs to whoever comes next.
+      const queuedNextTurn = (this.pendingQueues.get(boundaryLockKey)?.length ?? 0) > 0;
+      const lockHeldByNextTurn = !invokedInline && this.processingLocks.has(boundaryLockKey);
+      if (queuedNextTurn || lockHeldByNextTurn) {
+        logger.warn('Skipping boundary effects; a newer turn is queued or running', {
+          sessionId: session.id,
+          queuedNextTurn,
+          lockHeldByNextTurn,
+        });
+        return;
+      }
       // The lease/graph boundary effects are SESSION-wide, so they get the
       // same ownership gate as everything else (Lumen round 5): if a newer
       // turn has taken the row between our fenced write landing and this
@@ -2079,9 +2094,8 @@ export class SessionService implements ISessionService {
         // process was still cd'd into it. Now that the run is durably
         // finished, release if the session ended. Fire-and-forget — release
         // must never delay response routing. Epoch threaded so the helper's
-        // own read refuses a boundary that stopped being ours, and the turn
-        // start so it refuses leases renewed by a queued NEXT turn.
-        void this.releaseLeaseIfSessionTerminal(session.id, turnEpoch, turnRegisteredAt);
+        // own read refuses a boundary that stopped being ours.
+        void this.releaseLeaseIfSessionTerminal(session.id, turnEpoch);
         // Graph claims are turn-scoped: for a server-spawned session the run
         // IS the turn, so its claims return to the pool at this boundary
         // (spec v10; the sweep remains the crash backstop). Fire-and-forget
@@ -2168,7 +2182,13 @@ export class SessionService implements ISessionService {
             sessionId: session.id,
             attempt: performFinalizeWrite,
             admit: () => admitStateWrite(session.id),
-            onFinalized: onTurnFinalized,
+            onFinalized: () => onTurnFinalized(false),
+            epochKey: turnEpoch,
+            // An UNCONFIRMED takeover must not cancel the previous turn's
+            // recovery — that loop may be the valid one, and the row CAS is
+            // the arbiter (round 8: cancelling it and then fencing out left
+            // a running row with no retry anywhere).
+            supersedeSiblings: ownershipConfirmed,
           }).then((outcome) => {
             // A gone row has nothing to finalize and nothing a shutdown
             // report could truthfully say about it. A superseded loop is a
@@ -2191,7 +2211,7 @@ export class SessionService implements ISessionService {
     // the row really does still say `running`, and with the runner settled the
     // shutdown report reads "finished, unrecorded" rather than "still running".
     if (finalized) {
-      onTurnFinalized();
+      onTurnFinalized(true);
     }
 
     // Gated on `finalized` for the same reason the lifecycle write is:
@@ -3968,8 +3988,7 @@ This session will continue with a fresh context after compaction. Your identity,
    */
   private async releaseLeaseIfSessionTerminal(
     sessionId: string,
-    expectedTurnEpoch?: string,
-    ifNotRenewedSince?: number
+    expectedTurnEpoch?: string
   ): Promise<void> {
     const leases = this.getLeaseService();
     if (!leases) return;
@@ -3994,7 +4013,6 @@ This session will continue with a fresh context after compaction. Your identity,
         userId: session.userId,
         sessionTerminal: terminal,
         reason: 'run-terminal',
-        ifNotRenewedSince,
       });
     } catch (err) {
       logger.warn('[StudioLease] Run-boundary release failed', {

@@ -218,6 +218,71 @@ describe('supersession', () => {
     expect(hasPendingFinalization('sess-super-3')).toBe(false);
   });
 
+  it('loops under different epoch keys COEXIST when siblings are not superseded', async () => {
+    // Round 8: unconfirmed candidates must not cancel each other — the row
+    // CAS arbitrates. Only a CONFIRMED takeover cancels every sibling.
+    const aFinalized = vi.fn();
+    const bFinalized = vi.fn();
+
+    let releaseA!: () => void;
+    const a = retryTurnFinalization({
+      sessionId: 'sess-coexist',
+      epochKey: 'epoch-a',
+      attempt: async () => {},
+      admit: () => true,
+      onFinalized: aFinalized,
+      sleep: () =>
+        new Promise<void>((resolve) => {
+          releaseA = resolve;
+        }),
+      now: () => 0,
+    });
+    await Promise.resolve();
+
+    const b = retryTurnFinalization({
+      sessionId: 'sess-coexist',
+      epochKey: 'epoch-b',
+      supersedeSiblings: false,
+      attempt: async () => {},
+      admit: () => true,
+      onFinalized: bFinalized,
+      sleep: async () => {},
+      now: () => 0,
+    });
+
+    await expect(b).resolves.toBe('finalized');
+    expect(hasPendingFinalization('sess-coexist')).toBe(true); // A survives B
+
+    releaseA();
+    await expect(a).resolves.toBe('finalized');
+    expect(aFinalized).toHaveBeenCalledTimes(1);
+    expect(bFinalized).toHaveBeenCalledTimes(1);
+    expect(hasPendingFinalization('sess-coexist')).toBe(false);
+  });
+
+  it('a confirmed supersede cancels every sibling, across epoch keys', async () => {
+    let releaseA!: () => void;
+    const a = retryTurnFinalization({
+      sessionId: 'sess-super-all',
+      epochKey: 'epoch-a',
+      attempt: async () => {
+        throw new Error('An unexpected error occurred');
+      },
+      admit: () => true,
+      onFinalized: vi.fn(),
+      sleep: () =>
+        new Promise<void>((resolve) => {
+          releaseA = resolve;
+        }),
+      now: () => 0,
+    });
+    await Promise.resolve();
+
+    supersedePendingFinalization('sess-super-all');
+    releaseA();
+    await expect(a).resolves.toBe('superseded');
+  });
+
   it('clears its pending registration on every exit', async () => {
     await retryTurnFinalization({
       sessionId: 'sess-super-5',
