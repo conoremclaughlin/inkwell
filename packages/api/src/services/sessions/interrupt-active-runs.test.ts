@@ -15,6 +15,8 @@ import { dirname, join } from 'path';
 import {
   registerActiveRun,
   clearActiveRun,
+  clearActiveRunIfOwner,
+  blurActiveRunEpoch,
   listActiveRuns,
   activeRunCount,
   resetActiveRuns,
@@ -94,26 +96,34 @@ describe('active-runs registry', () => {
    * turn finalizing after a newer turn registered over it must not delete
    * the newer entry.
    */
-  describe('epoch-aware clear', () => {
+  describe('owner-strict clear (rounds 4 and 6)', () => {
     it('a stale epoch does not clear a newer registration', () => {
       registerActiveRun(run({ turnEpoch: 'epoch-b' }));
-      clearActiveRun('sess-1', 'epoch-a');
+      clearActiveRunIfOwner('sess-1', 'epoch-a');
       expect(activeRunCount()).toBe(1);
     });
 
     it('the owning epoch clears its own entry', () => {
       registerActiveRun(run({ turnEpoch: 'epoch-a' }));
-      clearActiveRun('sess-1', 'epoch-a');
+      clearActiveRunIfOwner('sess-1', 'epoch-a');
       expect(activeRunCount()).toBe(0);
     });
 
-    it('an epoch-less clear and an epoch-less entry both behave as before', () => {
-      registerActiveRun(run({ turnEpoch: 'epoch-a' }));
-      clearActiveRun('sess-1'); // no epoch: unconditional (shutdown, legacy)
+    it('a fenced epoch cannot claim a BLURRED entry — only its blurring owner can', () => {
+      // Ownership unknown: the entry carries no epoch so shutdown can
+      // terminalize either candidate row. A DIFFERENT turn's fenced clear
+      // must not delete it; the blurring turn clears with undefined.
+      registerActiveRun(run({ turnEpoch: 'epoch-b' }));
+      blurActiveRunEpoch('sess-1');
+      clearActiveRunIfOwner('sess-1', 'epoch-a');
+      expect(activeRunCount()).toBe(1);
+      clearActiveRunIfOwner('sess-1', undefined);
       expect(activeRunCount()).toBe(0);
+    });
 
-      registerActiveRun(run()); // legacy entry without an epoch
-      clearActiveRun('sess-1', 'epoch-b');
+    it('the unconditional clear stays unconditional (shutdown, tests)', () => {
+      registerActiveRun(run({ turnEpoch: 'epoch-a' }));
+      clearActiveRun('sess-1');
       expect(activeRunCount()).toBe(0);
     });
   });
@@ -164,7 +174,7 @@ describe('registry brackets the persisted running state', () => {
 
   it('clears only after the failed write on the runner-throw path', () => {
     const failed = at("lifecycle: 'failed' }");
-    const clearAfterFailed = source.indexOf('clearActiveRun(', failed);
+    const clearAfterFailed = source.indexOf('clearActiveRunIfOwner(', failed);
     expect(failed).toBeGreaterThan(-1);
     expect(clearAfterFailed).toBeGreaterThan(failed);
     // ...and before the rethrow, so the error path does not leak a registration.
@@ -181,24 +191,33 @@ describe('registry brackets the persisted running state', () => {
   it('clears on the success path only inside the finalized closure', () => {
     const closure = at('const onTurnFinalized');
     const inlineGate = source.indexOf('let finalized = false', closure);
-    const clearAt = source.indexOf('clearActiveRun(', closure);
+    const clearAt = source.indexOf('clearActiveRunIfOwner(', closure);
     expect(closure).toBeGreaterThan(-1);
     expect(clearAt).toBeGreaterThan(closure);
     expect(clearAt).toBeLessThan(inlineGate);
 
-    // Between the finalized gate and the guarded invocation, the only
-    // permitted clear is the gone-row one: a deleted session has nothing to
-    // finalize and nothing a shutdown report could truthfully say about it.
+    // Between the finalized gate and the guarded invocation, the permitted
+    // clears are the disowned-outcome ones: a gone row (nothing to report), a
+    // superseded turn (its row belongs to someone else — round 6), and the
+    // inline fence-out. Every one is the strict owner clear, so a newer
+    // registrant's entry always survives.
     const invocation = source.indexOf('onTurnFinalized();', inlineGate);
     expect(invocation).toBeGreaterThan(-1);
     const span = source.slice(inlineGate, invocation);
     for (
-      let i = span.indexOf('clearActiveRun(');
+      let i = span.indexOf('clearActiveRunIfOwner(');
       i >= 0;
-      i = span.indexOf('clearActiveRun(', i + 1)
+      i = span.indexOf('clearActiveRunIfOwner(', i + 1)
     ) {
-      expect(span.slice(Math.max(0, i - 40), i)).toContain("outcome === 'gone'");
+      const context = span.slice(Math.max(0, i - 1600), i);
+      expect(
+        context.includes("outcome === 'gone'") ||
+          context.includes('TurnSupersededError') ||
+          context.includes('superseded')
+      ).toBe(true);
     }
+    // And no unconditional clear sneaks into the window at all.
+    expect(span).not.toMatch(/clearActiveRun\(/);
   });
 
   // ...and the inline invocation only happens when the write actually

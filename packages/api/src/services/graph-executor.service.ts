@@ -85,7 +85,8 @@ export async function releaseGraphClaimsForSession(
   client: SupabaseClient<Database>,
   sessionId: string,
   reason: string,
-  boundaryAt?: string
+  boundaryAt?: string,
+  expectedTurnEpoch?: string
 ): Promise<number> {
   // Turn-generation guard (Lumen round 3 P1): a delayed release from an OLD
   // boundary must never touch a claim the session's NEXT turn acquired.
@@ -94,6 +95,28 @@ export async function releaseGraphClaimsForSession(
   const cutoff = boundaryAt ?? new Date().toISOString();
   let released = 0;
   try {
+    // Epoch scope at the resource (Lumen, PR #563 round 6): checked HERE,
+    // immediately before the claim lookup, not only at the caller — a newer
+    // owner on the row means this boundary's releases are not ours to run.
+    // Combined with the claimed_at cutoff this covers both interleavings: a
+    // parked new turn has no claims yet, and a landed new turn fails this
+    // check. Residual is this read → release window, atop the per-claim
+    // token CAS in release_graph_claim itself.
+    if (expectedTurnEpoch !== undefined) {
+      const { data: sessionRow, error: epochError } = await client
+        .from('sessions')
+        .select('turn_epoch')
+        .eq('id', sessionId)
+        .maybeSingle();
+      if (epochError) {
+        logger.warn(`Graph boundary release: ownership check failed for ${sessionId}:`, epochError);
+        return 0;
+      }
+      if ((sessionRow as { turn_epoch?: string | null } | null)?.turn_epoch !== expectedTurnEpoch) {
+        logger.warn('Graph boundary release skipped; newer turn owns the session', { sessionId });
+        return 0;
+      }
+    }
     const { data: held, error } = await client
       .from('tasks')
       .select('id, user_id, claim_token')

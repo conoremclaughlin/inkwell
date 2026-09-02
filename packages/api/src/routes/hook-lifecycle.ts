@@ -57,6 +57,7 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         cliPollAt,
         alias,
         studioId,
+        headless,
       } = req.body as {
         sessionId?: string;
         lifecycle?: string;
@@ -75,6 +76,13 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         alias?: string;
         /** Caller's worktree studio, for the fenced lease-held report. */
         studioId?: string;
+        /**
+         * Server-spawned turn: the server's pre-turn write already owns the
+         * turn epoch, so a prompt event must NOT claim a fresh one — rotating
+         * here would fence the server's own finalize out of its turn
+         * (PR #563 round 6).
+         */
+        headless?: boolean;
       };
 
       if (!sessionId) {
@@ -159,7 +167,7 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
       // read-modify-write replay window, and every stale fence goes dark.
       // Claimed BEFORE the lifecycle write so a failure here fails the whole
       // prompt visibly instead of leaving an unfenced takeover.
-      if (isPromptEvent) {
+      if (isPromptEvent && !headless) {
         // Rounds 4–5: claim_turn_epoch(p_set_running) is ONE statement —
         // fresh epoch, lifecycle=running, and the turn marker together. A
         // claim can no longer succeed while the lifecycle write fails, which

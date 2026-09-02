@@ -182,6 +182,29 @@ d('session_running_write trigger', () => {
       expect((await readSession(idleId)).turn_epoch).toEqual(expect.any(String));
     });
 
+    it('a reused idle row ROTATES on a lifecycle-only entry — ride-alongs are not claims', async () => {
+      // Round 6 P2: the reused row retains its previous turn's epoch; an
+      // entering write that does not NAME a new epoch arrives with
+      // NEW.turn_epoch = OLD.turn_epoch, and v3's fill-if-absent left the
+      // stale value in place — the previous owner's fence still matched.
+      const id = await insertSession({ lifecycle: 'running', metadata: {} });
+      const stale = (await readSession(id)).turn_epoch as string;
+
+      await client
+        .from('sessions')
+        .update({ lifecycle: 'idle' } as never)
+        .eq('id', id);
+      // Lifecycle-only re-entry: no epoch named.
+      await client
+        .from('sessions')
+        .update({ lifecycle: 'running' } as never)
+        .eq('id', id);
+
+      const rotated = (await readSession(id)).turn_epoch;
+      expect(rotated).toEqual(expect.any(String));
+      expect(rotated).not.toBe(stale);
+    });
+
     it('a caller candidate is AUTHORITATIVE — the trigger never overrides it', async () => {
       // Round 4: candidates make takeover writes idempotent by value, which
       // is what turns a committed-but-rejected running write into a

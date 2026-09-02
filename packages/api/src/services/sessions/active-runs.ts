@@ -105,17 +105,40 @@ export function registerActiveRun(run: ActiveRun): boolean {
  * returns. A row still saying `running` must stay registered, or shutdown will
  * skip the very session that needs reporting.
  *
- * With `epoch`, the delete is compare-and-act: it removes the entry only if
- * the entry still belongs to that turn. An old turn finalizing while a newer
- * turn has already registered over it must not delete the newer entry
- * (Lumen, PR #563 round 4). Entries without an epoch (legacy) always match.
+ * Unconditional. Reserved for shutdown paths and tests; turns clear their
+ * own entry with clearActiveRunIfOwner.
  */
-export function clearActiveRun(sessionId: string, epoch?: string): void {
-  if (epoch !== undefined) {
-    const entry = active.get(sessionId);
-    if (entry && entry.turnEpoch !== undefined && entry.turnEpoch !== epoch) return;
-  }
+export function clearActiveRun(sessionId: string): void {
   active.delete(sessionId);
+}
+
+/**
+ * Compare-and-act delete: removes the entry only when it STRICTLY belongs to
+ * this turn — entry.turnEpoch === epoch, undefined included (a blurred
+ * unknown-ownership entry is owned by the turn that blurred it, and a fenced
+ * epoch must not claim it; Lumen, PR #563 rounds 4 and 6). An old turn
+ * finalizing while a newer turn has registered over it is a no-op here.
+ */
+export function clearActiveRunIfOwner(sessionId: string, epoch: string | undefined): void {
+  const entry = active.get(sessionId);
+  if (!entry) return;
+  if (entry.turnEpoch !== epoch) return;
+  active.delete(sessionId);
+}
+
+/**
+ * Ownership of this entry could not be confirmed (running write AND the
+ * reconcile read both failed — round 6). A blurred entry carries no epoch,
+ * so shutdown terminalizes whichever running row the session has: both
+ * candidate owners are THIS process's turns, and a row left running with
+ * nobody reported is the zombie this registry exists to prevent. The cost is
+ * that a blurred shutdown write is unfenced against a concurrent cross-
+ * process claim — bounded by how rare a double write+read failure is, and
+ * logged loudly at the point it happens.
+ */
+export function blurActiveRunEpoch(sessionId: string): void {
+  const entry = active.get(sessionId);
+  if (entry) entry.turnEpoch = undefined;
 }
 
 /**

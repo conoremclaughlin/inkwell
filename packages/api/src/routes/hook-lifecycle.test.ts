@@ -217,6 +217,14 @@ describe('hook-lifecycle CLI turn signal', () => {
       expect(rpcCalls[0]![1]).toMatchObject({ p_session_id: SESSION_ID, p_set_running: true });
     });
 
+    it('does not claim for a HEADLESS prompt — the server owns that epoch', async () => {
+      // A server-spawned child's own on-prompt hook fires too; claiming here
+      // would rotate the epoch the server's pre-turn write holds and fence
+      // the server's finalize out of its own turn (round 6).
+      await post({ lifecycle: 'running', event: 'prompt', headless: true });
+      expect(rpcCalls).toHaveLength(0);
+    });
+
     it('does not claim on stop or attach-only requests', async () => {
       await post({ lifecycle: 'idle', event: 'stop' });
       await post({ cliAttached: true });

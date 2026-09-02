@@ -603,6 +603,64 @@ describe('SessionService', () => {
     });
 
     /**
+     * Round 6 (Lumen): a fenced-out turn self-clears its own entry — a stale
+     * ActiveRun left registered was a false liveness signal to the lease
+     * sweep and a false shutdown report.
+     */
+    it('a turn fenced out at the inline finalize clears its own entry', async () => {
+      const db = makeStatefulRepo();
+      const service = makeStatefulService(db.repo);
+
+      // Someone else takes the row between the running write and the inline
+      // finalize: rotate the epoch under the turn's feet.
+      const originalRun = vi.mocked(mockClaudeRunner.run).getMockImplementation();
+      vi.mocked(mockClaudeRunner.run).mockImplementationOnce(async (...args) => {
+        db.row!.turnEpoch = 'someone-else';
+        return createMockClaudeResult();
+      });
+
+      const result = await service.handleMessage(createMockRequest());
+      expect(result.success).toBe(true); // the turn's outcome still stands
+
+      // Its entry stopped claiming liveness the moment the fence said no.
+      expect(activeRunCount()).toBe(0);
+      void originalRun;
+    });
+
+    /**
+     * Round 6 (Lumen): the unknown/uncommitted story end-to-end. B cannot
+     * confirm ownership, so its entry is BLURRED; A's recovery is not
+     * superseded and still lands (the row is A's); B's own fenced writes
+     * stand down; and by the end NOBODY's stale entry lingers.
+     */
+    it('an unconfirmed takeover that never committed leaves no stale entry behind', async () => {
+      const db = makeStatefulRepo();
+      db.fail.finalize = 1; // A's inline finalize fails; retry pending
+      const service = makeStatefulService(db.repo);
+
+      await service.handleMessage(createMockRequest()); // turn A
+
+      // Turn B: every running attempt fails WITHOUT committing, and the
+      // reconcile read fails too → unknown → proceed blurred, no supersede.
+      db.fail.running = 3;
+      db.fail.findById = 1;
+      const b = await service.handleMessage(createMockRequest());
+      expect(b.success).toBe(true);
+      // B's inline finalize fenced out (the row is A's) and, because A's
+      // recovery is still pending, RESTORED A's registration rather than
+      // leaving A's running row entry-less for shutdown (round 6).
+      expect(activeRunCount()).toBe(1);
+      expect(listActiveRuns()[0]?.runnerSettledAt).toEqual(expect.any(Number));
+
+      // A's recovery was not superseded: it fires and lands (row is A's).
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(db.row?.lifecycle).toBe('idle');
+
+      // ...and A's own finalize cleared its restored entry. Nothing lingers.
+      expect(activeRunCount()).toBe(0);
+    });
+
+    /**
      * Interleaving Y (Lumen round 3): A's fenced write is already in flight
      * when B takes ownership. No token can stop a write on the wire — the
      * epoch CAS evaluated at write time is what makes it match zero rows.

@@ -747,19 +747,28 @@ async function updateRuntimeGenerationState(
   // on-stop both send 'idle'); the server uses the event to manage the
   // hook-owned CLI turn signal and to run the lease boundary ONLY on the
   // real stop (PR #492).
-  event?: 'prompt' | 'stop' | 'pre-compact' | 'post-compact'
-): Promise<void> {
+  event?: 'prompt' | 'stop' | 'pre-compact' | 'post-compact',
+  opts?: {
+    /**
+     * Server-spawned (headless) turns must say so: the server's pre-turn
+     * write already owns the turn epoch, and an interactive-style prompt
+     * claim from the child's own hook would rotate it and fence the server's
+     * finalize out of its own turn (PR #563 round 6).
+     */
+    headless?: boolean;
+  }
+): Promise<boolean> {
   const sessionId = resolveActivePcpSessionId(cwd);
-  if (!sessionId) return;
+  if (!sessionId) return true; // nothing to take over — vacuously fine
 
-  // Two attempts: hooks cannot gate the backend turn (they are out-of-band
-  // observers), so a missed prompt write leaves the turn invisible — the
-  // lease machinery therefore only ever treats the marker as PROTECTIVE
-  // (an open marker defers releases; its absence never authorizes one).
-  // The retry shrinks the invisibility window against transient blips; a
-  // true fail-closed for claude-code (UserPromptSubmit can block) is
-  // tracked separately (task 0b9bb780).
-  for (let attempt = 1; attempt <= 2; attempt++) {
+  // Three attempts: a prompt event is now a turn-epoch TAKEOVER on the
+  // server (claim + lifecycle + marker in one statement), so a swallowed
+  // failure is no longer just an invisible marker — an interactive prompt
+  // that proceeds unclaimed runs under a stale epoch that an old turn's
+  // fenced finalize can still clobber. The claude-code on-prompt hook
+  // therefore BLOCKS the prompt when this returns false (task 0b9bb780);
+  // backends whose hooks cannot block still proceed, loudly.
+  for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       const serverUrl = getPcpServerUrl();
       const headers: Record<string, string> = { 'Content-Type': 'application/json' };
@@ -772,12 +781,13 @@ async function updateRuntimeGenerationState(
           sessionId,
           lifecycle,
           ...(event ? { event } : {}),
+          ...(opts?.headless ? { headless: true } : {}),
           agentId,
           workingDir: cwd,
         }),
         signal: AbortSignal.timeout(5000),
       });
-      if (resp.ok) return;
+      if (resp.ok) return true;
       const body = await resp.text().catch(() => '');
       sbDebugLog('hooks', 'lifecycle_update_failed', {
         sessionId,
@@ -795,10 +805,11 @@ async function updateRuntimeGenerationState(
         error: String(error),
       });
     }
-    if (attempt === 1) {
+    if (attempt < 3) {
       await new Promise((r) => setTimeout(r, 250));
     }
   }
+  return false;
 }
 
 export function extractBackendSessionId(
@@ -2436,8 +2447,37 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
     backendSessionId: reconciled.backendSessionId || null,
   });
 
-  // Mark session as actively generating at prompt start.
-  await updateRuntimeGenerationState(cwd, config, agentId, 'running', 'prompt');
+  // Mark session as actively generating at prompt start. For INTERACTIVE
+  // prompts this is a turn-epoch TAKEOVER on the server; headless spawns
+  // declare themselves so the route does not rotate the epoch the server's
+  // own pre-turn write already owns (PR #563 round 6).
+  const isHeadlessSpawn = isHeadlessSession();
+  const takeoverOk = await updateRuntimeGenerationState(cwd, config, agentId, 'running', 'prompt', {
+    headless: isHeadlessSpawn,
+  });
+  if (!takeoverOk && !isHeadlessSpawn) {
+    if (lifecycleBackend.name === 'claude') {
+      // Fail CLOSED (task 0b9bb780, pulled in by PR #563 round 6): claude's
+      // UserPromptSubmit hook blocks the prompt on a non-zero exit. Running
+      // anyway would execute this interactive turn under a STALE epoch that
+      // an old server turn's fenced finalize can still clobber.
+      hookLog('on_prompt_takeover_failed_blocking', { agentId });
+      process.stderr.write(
+        'Inkwell turn takeover failed (server unreachable or claim refused). ' +
+          'Prompt blocked to protect session state — retry in a moment.\n'
+      );
+      process.exit(2);
+    }
+    // Backends whose prompt hooks cannot block: proceed, loudly — the
+    // takeover happens on the next successful lifecycle write.
+    hookLog('on_prompt_takeover_failed_nonblocking', {
+      agentId,
+      backend: lifecycleBackend.name,
+    });
+    process.stderr.write(
+      'Warning: Inkwell turn takeover failed; this turn runs under a stale epoch.\n'
+    );
+  }
 
   // Mark session as CLI-attached (human present at REPL).
   // Uses the REST lifecycle endpoint, NOT MCP — cliAttached is a runtime
@@ -2447,7 +2487,6 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
   // IMPORTANT: headless/autonomous spawns set cliAttached=false in INK_CONTEXT.
   // Respect that — unconditionally setting true blocks all future strategy
   // triggers for the session (they see "CLI-attached" and skip spawn).
-  const isHeadlessSpawn = isHeadlessSession();
   if (isHeadlessSpawn && reconciled.pcpSessionId) {
     // Explicitly clear cli_attached for headless spawns. A previous interactive
     // session may have set it to true on this same PCP session; if we just skip,
