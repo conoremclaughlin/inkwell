@@ -98,6 +98,12 @@ function createChainableQueryBuilder(table: string) {
 
   builder.single = vi.fn().mockImplementation(() => Promise.resolve(getNextResult(table)));
 
+  // The quiet-hours advisory reads heartbeat_state with maybeSingle. Without it
+  // the call throws and lands in the advisory's catch, so the response was never
+  // exercised — the warning could have been silently absent and every test would
+  // still have passed (Lumen, PR #568).
+  builder.maybeSingle = vi.fn().mockImplementation(() => Promise.resolve(getNextResult(table)));
+
   builder.then = (resolve: (value: unknown) => void, reject?: (reason: unknown) => void) => {
     const result = getNextResult(table);
     if (result.error && reject) {
@@ -424,5 +430,88 @@ describe('Reminder Handlers', () => {
       expect(parsed.success).toBe(false);
       expect(parsed.error).toContain('Unknown agent');
     });
+  });
+});
+
+/**
+ * The quiet-hours advisory, through the actual handler response (Lumen, P2).
+ *
+ * The predicate has its own suite. What was NOT covered is that create_reminder
+ * puts it on the wire, and that the runAt guard holds — and it could not be,
+ * because the fixture lacked maybeSingle so every call fell into the advisory's
+ * catch. The warning could have been silently absent and every test still green.
+ */
+describe('create_reminder quiet-hours advisory', () => {
+  const REMINDER_ROW = {
+    id: 'r1',
+    title: 'Spravato prep',
+    description: null,
+    sb_id: null,
+    delivery_channel: 'telegram',
+    delivery_target: '726555973',
+    cron_expression: null,
+    next_run_at: '2026-09-02T14:30:00+00:00',
+    studio_hint: null,
+    status: 'active',
+  };
+
+  function primeQuietHours() {
+    // The DB shape: Postgres `time` columns, HH:MM:SS.
+    setQueryResult('heartbeat_state', {
+      quiet_start: '22:00:00',
+      quiet_end: '08:00:00',
+      timezone: 'America/Los_Angeles',
+    });
+  }
+
+  it('returns a quietHours warning for a one-shot inside the window', async () => {
+    primeQuietHours();
+    setQueryResult('scheduled_reminders', REMINDER_ROW);
+
+    const result = await handleCreateReminder(
+      {
+        userId: TEST_USER_ID,
+        title: 'Spravato prep',
+        runAt: '2026-09-02T14:30:00Z', // 07:30 PDT — held
+      } as never,
+      mockDataComposer as never
+    );
+
+    const parsed = parseResponse(result);
+    expect(parsed.success).toBe(true);
+    expect(parsed.quietHours).toBeDefined();
+    expect(parsed.quietHours.deferredTo).toBe('2026-09-02T15:00:00.000Z');
+    expect(parsed.quietHours.message).toContain('Scheduling it earlier does not help');
+  });
+
+  it('says nothing for a one-shot outside the window', async () => {
+    primeQuietHours();
+    setQueryResult('scheduled_reminders', REMINDER_ROW);
+
+    const result = await handleCreateReminder(
+      {
+        userId: TEST_USER_ID,
+        title: 'Afternoon nudge',
+        runAt: '2026-09-02T20:00:00Z', // 13:00 PDT — fine
+      } as never,
+      mockDataComposer as never
+    );
+
+    expect(parseResponse(result).quietHours).toBeUndefined();
+  });
+
+  // The guard I claimed in review and had not enforced.
+  it('says nothing for a cron reminder, even one whose next run lands inside', async () => {
+    primeQuietHours();
+    setQueryResult('scheduled_reminders', { ...REMINDER_ROW, cron_expression: '0 0 * * *' });
+
+    const result = await handleCreateReminder(
+      { userId: TEST_USER_ID, title: 'Nightly', cronExpression: '0 0 * * *' } as never,
+      mockDataComposer as never
+    );
+
+    const parsed = parseResponse(result);
+    expect(parsed.success).toBe(true);
+    expect(parsed.quietHours).toBeUndefined();
   });
 });

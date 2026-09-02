@@ -16,6 +16,7 @@ import {
   localTimeOfDay,
   quietHoursDeferralWarning,
   timeOfDayToMinutes,
+  effectiveTimezone,
 } from './quiet-hours';
 
 /** Myra's operating window, and the one that held the reminder. */
@@ -188,5 +189,77 @@ describe('the real database time shape', () => {
         timezone: 'UTC',
       })
     ).toBe(false);
+  });
+});
+
+/**
+ * DST fall-back (Lumen, PR #568 round 2).
+ *
+ * I replaced the minute walk with 30-minute strides to cut Intl calls. Across a
+ * fall-back the pointwise predicate can go false and then TRUE again inside one
+ * stride, so a coarse sample lands back inside the window and the walk sails
+ * past the real boundary.
+ *
+ * The optimization was also unnecessary — caching the formatter is what cost
+ * the time, not the number of steps.
+ */
+describe('DST fall-back', () => {
+  // Lumen's exact repro. LA falls back 2026-11-01: 01:00–02:00 PDT happens,
+  // then 01:00–02:00 PST happens again.
+  const window = { start: '22:00', end: '01:45', timezone: 'America/Los_Angeles' };
+
+  it('returns the FIRST boundary, not the one after the clocks go back', () => {
+    // Due 01:30 PDT. The window ends at 01:45 PDT = 08:45Z. The coarse walk
+    // sampled 09:00Z — 01:00 PST, quiet again — and ran on to 09:45Z.
+    const deferred = effectiveDeliveryTime(new Date('2026-11-01T08:30:00Z'), window);
+    expect(deferred.toISOString()).toBe('2026-11-01T08:45:00.000Z');
+  });
+
+  it('agrees with the predicate at the boundary it returns', () => {
+    // The property that makes a walk trustworthy: the minute before is inside,
+    // the minute returned is outside. A skipped boundary breaks this.
+    const deferred = effectiveDeliveryTime(new Date('2026-11-01T08:30:00Z'), window);
+    const before = new Date(deferred.getTime() - 60_000);
+    expect(isWithinQuietHours(before, window)).toBe(true);
+    expect(isWithinQuietHours(deferred, window)).toBe(false);
+  });
+
+  it('still finds a boundary across the repeated hour when due before it', () => {
+    // Due 23:00 PDT, well before the fall-back. Same first boundary.
+    const deferred = effectiveDeliveryTime(new Date('2026-11-01T06:00:00Z'), window);
+    expect(deferred.toISOString()).toBe('2026-11-01T08:45:00.000Z');
+  });
+});
+
+/**
+ * An invalid zone must not be reported as if it were used (Lumen, P2).
+ *
+ * set_quiet_hours accepts any string. The formatter silently fell back to UTC
+ * while the warning labelled the message with the zone the user typed — a
+ * warning misreporting its own basis, which is the failure this PR is about.
+ * The cache also grew without bound on arbitrary input.
+ */
+describe('effectiveTimezone', () => {
+  it('passes through a usable zone', () => {
+    expect(effectiveTimezone('America/Los_Angeles')).toBe('America/Los_Angeles');
+    expect(effectiveTimezone('Europe/Berlin')).toBe('Europe/Berlin');
+  });
+
+  it('falls back to UTC for an unusable one', () => {
+    expect(effectiveTimezone('Not/AZone')).toBe('UTC');
+    expect(effectiveTimezone('')).toBe('UTC');
+    expect(effectiveTimezone(null)).toBe('UTC');
+  });
+
+  it('labels the warning with the zone actually used, not the one typed', () => {
+    const warning = quietHoursDeferralWarning(new Date('2026-09-02T23:30:00Z'), {
+      start: '22:00',
+      end: '08:00',
+      timezone: 'Not/AZone',
+    });
+
+    expect(warning).not.toBeNull();
+    expect(warning!.message).toContain('UTC');
+    expect(warning!.message).not.toContain('Not/AZone');
   });
 });

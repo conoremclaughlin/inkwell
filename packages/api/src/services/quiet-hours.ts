@@ -52,25 +52,43 @@ export interface QuietHoursWindow {
  */
 const formatterCache = new Map<string, Intl.DateTimeFormat>();
 
-function formatterFor(timezone: string): Intl.DateTimeFormat {
-  const cached = formatterCache.get(timezone);
-  if (cached) return cached;
-  let formatter: Intl.DateTimeFormat;
+/**
+ * The zone actually used for a window — the configured one if usable, else UTC.
+ *
+ * Two reasons this is a function rather than an inline try/catch.
+ *
+ * `set_quiet_hours` accepts any string, so an invalid zone reaches here. Caching
+ * a formatter under that key would grow the map without bound on arbitrary
+ * input, so unusable zones are never cached — only the canonical fallback is
+ * (Lumen, PR #568).
+ *
+ * And the caller needs to KNOW. The warning previously computed UTC while
+ * labelling the message with the invalid zone the user typed, which is a
+ * warning that misreports its own basis — the failure this whole PR is about.
+ */
+export function effectiveTimezone(timezone?: string | null): string {
+  const zone = (timezone || '').trim() || 'UTC';
+  if (formatterCache.has(zone)) return zone;
   try {
-    formatter = new Intl.DateTimeFormat('en-GB', {
-      timeZone: timezone,
-      hour: '2-digit',
-      minute: '2-digit',
-      hour12: false,
-    });
+    formatterCache.set(
+      zone,
+      new Intl.DateTimeFormat('en-GB', {
+        timeZone: zone,
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false,
+      })
+    );
+    return zone;
   } catch {
-    // An unusable zone falls back to UTC rather than crashing the heartbeat: a
-    // scheduler that dies on a bad config string is worse than one that
-    // mis-times a window.
-    formatter = formatterFor('UTC');
+    // Unusable: fall back to UTC rather than crashing the heartbeat, and do NOT
+    // cache under the bad key.
+    return zone === 'UTC' ? 'UTC' : effectiveTimezone('UTC');
   }
-  formatterCache.set(timezone, formatter);
-  return formatter;
+}
+
+function formatterFor(timezone?: string | null): Intl.DateTimeFormat {
+  return formatterCache.get(effectiveTimezone(timezone))!;
 }
 
 /**
@@ -83,7 +101,7 @@ function formatterFor(timezone: string): Intl.DateTimeFormat {
  * rather than a property of the code.
  */
 export function localTimeOfDay(instant: Date, timezone?: string | null): string {
-  return formatterFor(timezone || 'UTC').format(instant);
+  return formatterFor(timezone).format(instant);
 }
 
 /**
@@ -142,15 +160,20 @@ export function isWithinQuietHours(instant: Date, window: QuietHoursWindow): boo
  * When a reminder due at `instant` would ACTUALLY be delivered.
  *
  * Returns the instant itself when it falls outside quiet hours. Otherwise the
- * moment the scheduler stops skipping it.
+ * first minute the scheduler stops skipping it.
  *
- * Walked rather than computed, because a wall-clock boundary is not a fixed
- * offset: a DST transition inside the window moves it by an hour, and the
- * arithmetic that gets that right is the arithmetic that gets it subtly wrong.
- * Coarse-then-fine so the walk is cheap — 30-minute strides to cross the bulk
- * of the window, then one-minute steps to land exactly on the edge. Worst case
- * is roughly 80 conversions against a cached formatter rather than 1,500
- * against fresh ones (Lumen, PR #568).
+ * A PLAIN minute walk, deliberately. I replaced it with 30-minute strides to
+ * cut Intl calls, and that is unsound: across a DST fall-back the pointwise
+ * predicate can go false and then TRUE again inside one stride, so a coarse
+ * sample lands back inside the window and the walk sails past the real
+ * boundary. Lumen's repro — LA, 22:00–01:45, due 2026-11-01T08:30Z — returned
+ * the SECOND 01:45 (09:45Z) instead of the first (08:45Z), an hour late.
+ *
+ * The optimization was also unnecessary: caching the formatter is what actually
+ * cost the 44ms, and with the cache all 1,500 worst-case conversions run in
+ * ~1–2ms. Stepping one minute at a time is definitionally correct — it cannot
+ * skip a boundary it never steps over — and now cheap. Correct and cheap beats
+ * clever.
  *
  * Minute-accurate rather than tick-accurate: delivery lands on the first
  * scheduler tick at or after this, so real arrival is this value plus up to one
@@ -159,26 +182,14 @@ export function isWithinQuietHours(instant: Date, window: QuietHoursWindow): boo
 export function effectiveDeliveryTime(instant: Date, window: QuietHoursWindow): Date {
   if (!isWithinQuietHours(instant, window)) return instant;
 
-  const COARSE_MS = 30 * 60_000;
-  const cursor = new Date(instant.getTime());
-  let lastInside = new Date(instant.getTime());
-
   // Bounded by 25 hours: a window spans at most a day, and the bound means a
   // malformed config can never spin.
-  for (let i = 0; i < (25 * 60) / 30; i += 1) {
-    cursor.setTime(cursor.getTime() + COARSE_MS);
-    if (!isWithinQuietHours(cursor, window)) break;
-    lastInside.setTime(cursor.getTime());
+  const cursor = new Date(instant.getTime());
+  for (let i = 0; i < 25 * 60; i += 1) {
+    cursor.setTime(cursor.getTime() + 60_000);
+    if (!isWithinQuietHours(cursor, window)) return cursor;
   }
-  if (isWithinQuietHours(cursor, window)) return instant;
-
-  // Refine: step forward a minute at a time from the last known-inside point.
-  const fine = new Date(lastInside.getTime());
-  for (let i = 0; i <= 30; i += 1) {
-    fine.setTime(fine.getTime() + 60_000);
-    if (!isWithinQuietHours(fine, window)) return fine;
-  }
-  return cursor;
+  return instant;
 }
 
 /**
@@ -196,7 +207,8 @@ export function quietHoursDeferralWarning(
   if (!isWithinQuietHours(runAt, window)) return null;
 
   const deferred = effectiveDeliveryTime(runAt, window);
-  const zone = window.timezone || 'UTC';
+  // The zone actually used, not the one typed — see effectiveTimezone.
+  const zone = effectiveTimezone(window.timezone);
   const asked = localTimeOfDay(runAt, zone);
   const actual = localTimeOfDay(deferred, zone);
 
