@@ -1317,8 +1317,8 @@ describe('handleFailedTakeover', () => {
 
   it('writes the durable marker on a non-blocking backend — no in-process timer', () => {
     // Round 8 (Lumen): this hook process is short-lived; an unref()'d timer
-    // dies with it. The durable artefact is the marker the channel plugin
-    // converts into a claim on its poll loop.
+    // dies with it. The durable artefact is the marker the ink wrapper's
+    // takeover watcher converts into a claim.
     const exit = vi.fn((code: number): never => {
       throw new Error(`exit:${code}`);
     });

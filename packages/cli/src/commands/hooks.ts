@@ -889,10 +889,12 @@ async function updateRuntimeGenerationState(
 }
 
 /**
- * Where the pending-takeover marker lives, shared with the channel plugin
- * and the wrapper watcher. Round 20: PER WRAPPER GENERATION — one shared
- * path was lossy across coexisting generations. The generation-less path
- * remains for legacy senders and the claude channel plugin.
+ * Where the pending-takeover marker lives, shared with the wrapper watcher
+ * and the on-stop adjudication. Round 20: PER WRAPPER GENERATION — one
+ * shared path was lossy across coexisting generations. The generation-less
+ * path remains for legacy wrapperless senders, whose own stop hook
+ * adjudicates it (round 26: the channel-plugin claimant was removed as
+ * unreachable — markers come only from codex/gemini, which run no plugin).
  */
 export function pendingTakeoverMarkerPath(cwd: string, generation?: string): string {
   return join(
@@ -914,9 +916,9 @@ export function pendingTakeoverMarkerPath(cwd: string, generation?: string): str
  *
  * Non-blocking backends: the prompt cannot be stopped, and this hook process
  * is SHORT-LIVED — an in-process retry timer dies with it (round 8). So the
- * recovery is a durable MARKER file that the session's long-lived channel
- * plugin picks up on its poll loop and converts into a claim; the on-stop
- * hook (and any later successful prompt takeover) deletes the marker, which
+ * recovery is a durable MARKER file that the session's long-lived `ink`
+ * wrapper watches and converts into a claim (takeover-watcher.ts); the
+ * on-stop hook adjudicates any marker still standing at the boundary, which
  * scopes the recovery to this prompt generation.
  *
  * Injectable for tests; onPromptHandler passes the real implementations.
@@ -946,7 +948,7 @@ export function handleFailedTakeover(
   });
   process.stderr.write(
     'Warning: Inkwell turn takeover failed; this turn starts under a stale epoch. ' +
-      'A pending-takeover marker was written for the channel plugin to reclaim.\n'
+      'A pending-takeover marker was written for the ink wrapper to reclaim.\n'
   );
   try {
     opts.writePendingTakeover();

@@ -29,7 +29,6 @@ import { readFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import { createThreadDrainState, drainThreads, drainLegacyInbox } from './poll-core.js';
-import { pendingTakeoverMarkerPath, processPendingTakeover } from './pending-takeover.js';
 import { createLogger, isLogLevel, logFileFor, sweepStaleLogs, type LogLevel } from './logger.js';
 
 // ─── Logging ────────────────────────────────────────────────
@@ -255,46 +254,14 @@ Do NOT ignore channel messages — they are from your teammates and deserve time
 // state (poll-core.ts owns the delivery semantics; unit-tested there).
 const drainState = createThreadDrainState();
 
-// Durable turn-takeover recovery (PR #563 round 8): a failed interactive
-// takeover on a non-blocking backend leaves a marker; this long-lived
-// process converts it into a claim. See pending-takeover.ts.
-const takeoverMarkerPath = pendingTakeoverMarkerPath(process.cwd());
-
-async function claimPendingTakeover(
-  markerAt: string | undefined,
-  attemptId: string | undefined
-): Promise<'ok' | 'stopped' | 'failed'> {
-  if (!sessionId || !accessToken) return 'failed';
-  try {
-    const resp = await fetch(`${INK_SERVER_URL}/api/hooks/lifecycle`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${accessToken}`,
-      },
-      // reclaimOf CASes the claim against the server-side stop tombstone
-      // (PR #563 round 9). Round 25: the marker's attempt token rides in
-      // (clock-free fencing — the wall-clock fallback remains only for
-      // genuinely tokenless legacy markers), and the studio does too, so
-      // this recovery passes the lease/revocation boundary like every
-      // other claimant.
-      body: JSON.stringify({
-        sessionId,
-        lifecycle: 'running',
-        event: 'prompt',
-        ...(markerAt ? { reclaimOf: markerAt } : {}),
-        ...(attemptId ? { attemptId } : {}),
-        ...(studioId && studioId !== 'main' ? { studioId } : {}),
-      }),
-      signal: AbortSignal.timeout(3000),
-    });
-    if (resp.ok) return 'ok';
-    if (resp.status === 409) return 'stopped';
-    return 'failed';
-  } catch {
-    return 'failed';
-  }
-}
+// NO takeover claimant here (PR #563 round 26). Pending-takeover markers are
+// written only by backends whose prompt hooks cannot block (codex, gemini) —
+// and those sessions run no channel plugin, while this plugin's own backend
+// (claude-code) blocks the prompt instead of writing a marker. The markers'
+// real consumers are the ink wrapper's takeover watcher and the on-stop
+// hook's adjudication (packages/cli). The round-8 claimant that lived here
+// was unreachable and, being a partial reimplementation of the boundary,
+// drifted from it — it was removed rather than patched again.
 const seenMessageIds = drainState.seenMessageIds; // shared with the legacy loop
 
 async function stampCliPollAt(): Promise<void> {
@@ -354,20 +321,6 @@ async function pollInbox(): Promise<void> {
 
     // Stamp cli_poll_at so the trigger handler knows we're alive
     stampCliPollAt().catch(() => {});
-
-    // Convert any pending-takeover marker into a claim (fire-and-forget:
-    // the marker survives a failed claim and is re-judged next tick).
-    processPendingTakeover({
-      markerPath: takeoverMarkerPath,
-      sessionId,
-      claim: claimPendingTakeover,
-    })
-      .then((outcome) => {
-        if (outcome !== 'skipped') {
-          log('info', `Pending turn takeover: ${outcome}`);
-        }
-      })
-      .catch(() => {});
 
     try {
       // Pointer-based unseen fetch, NOT a wall-clock window (Lumen #504 r2

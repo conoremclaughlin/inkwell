@@ -27,8 +27,8 @@ export const TAKEOVER_MARKER_MAX_AGE_MS = 10 * 60 * 1000;
  * Round 20: the marker is PER WRAPPER GENERATION (`pending-takeover.<gen>.json`)
  * — one shared path was lossy across coexisting generations, and
  * read/check/unlink is not an atomic cross-process CAS. Each generation owns
- * its file outright; the generation-less path remains for legacy hooks and
- * the claude channel plugin.
+ * its file outright; the generation-less path remains for legacy wrapperless
+ * hooks (round 26: the channel-plugin claimant was removed as unreachable).
  */
 export function takeoverMarkerPath(cwd: string, generation?: string): string {
   return join(
