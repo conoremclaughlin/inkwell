@@ -227,43 +227,40 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         // lease refuses the WHOLE takeover with nothing committed.
         const claimStudioId =
           typeof studioId === 'string' && studioId && studioId !== 'main' ? studioId : undefined;
-        const runClaim = async () =>
-          dataComposer.getClient().rpc('claim_turn_epoch', {
+        // Round 14: the round-13 application-level reacquire is GONE — its
+        // vacancy check, grant, and claim were three separate commits, and
+        // every seam between them was a boundary failure (revoked studios
+        // reacquired under closed threads, the release's repoint racing the
+        // grant, a stopped retry stranding a fresh lease). The regrant now
+        // rides INTO the claim: one RPC, one studio row lock, one
+        // transaction. The RPC installs it only when the studio is vacant
+        // AND eligible — acquirable status, unexpired, the thread not
+        // closed (revocation-aware), no sibling row holding the same
+        // checkout — and only AFTER the tombstone CAS passes, so a stopped
+        // reclaim grants nothing.
+        const regrant = claimStudioId
+          ? {
+              sessionId,
+              threadKey: session.threadKey ?? `session:${sessionId}`,
+              threadKeys: [session.threadKey ?? `session:${sessionId}`],
+              agentId: agentId ?? session.agentId ?? 'unknown',
+              reason: 'cli-prompt-regrant',
+            }
+          : undefined;
+        const { data: claimed, error: claimError } = await dataComposer
+          .getClient()
+          .rpc('claim_turn_epoch', {
             p_session_id: sessionId,
             p_set_running: true,
             ...(reclaimOf ? { p_not_stopped_after: reclaimOf } : {}),
             ...(claimStudioId ? { p_studio_id: claimStudioId } : {}),
+            ...(regrant ? { p_regrant: regrant } : {}),
           } as never);
-
-        let { data: claimed, error: claimError } = await runClaim();
-        let verdict = (claimed ?? null) as { outcome?: string; epoch?: string } | null;
-
-        if (!claimError && verdict?.outcome === 'lease-lost' && claimStudioId) {
-          // Round 13: a lost lease need not end the story — the studio may
-          // simply be VACANT (the predecessor's release completed while this
-          // prompt was in flight). Nonblocking backends will run the turn
-          // regardless, and their marker recovery could only repeat this
-          // claim forever. Reacquire through the validated ladder (it
-          // refuses if any other holder exists), then retry the atomic claim
-          // ONCE — the claim re-verifies ownership under the row lock, so a
-          // steal between the two steps just yields lease-lost again.
-          const reacquired = await leaseService.acquire({
-            studioId: claimStudioId,
-            sessionId,
-            threadKey: session.threadKey ?? `session:${sessionId}`,
-            agentId: agentId ?? session.agentId ?? 'unknown',
-            userId: session.userId,
-            reason: 'cli-prompt-reacquire',
-          });
-          if (reacquired.acquired) {
-            logger.info('[HookLifecycle] Vacant studio reacquired for prompt takeover', {
-              sessionId,
-              studioId: claimStudioId,
-            });
-            ({ data: claimed, error: claimError } = await runClaim());
-            verdict = (claimed ?? null) as { outcome?: string; epoch?: string } | null;
-          }
-        }
+        const verdict = (claimed ?? null) as {
+          outcome?: string;
+          epoch?: string;
+          regranted?: boolean;
+        } | null;
 
         if (claimError) {
           logger.error('[HookLifecycle] Turn-epoch claim failed; refusing prompt takeover', {
@@ -285,10 +282,11 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
           return;
         }
         if (verdict?.outcome === 'lease-lost') {
-          // A release won and the studio is not reacquirable (another holder,
-          // or the ladder refused). Nothing was committed — the caller's
-          // failed-takeover handling (gate/block/marker) runs against a
-          // CLEAN row.
+          // The lease is gone and the RPC's regrant eligibility refused:
+          // another holder, a closed thread (deliberate revocation), an
+          // expired or retired studio, or a sibling row on the checkout.
+          // Nothing was committed — the caller's failed-takeover handling
+          // (gate/block/marker) runs against a CLEAN row.
           logger.warn('[HookLifecycle] Prompt takeover refused — lease no longer held', {
             sessionId,
             studioId,

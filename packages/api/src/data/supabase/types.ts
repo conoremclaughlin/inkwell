@@ -4593,8 +4593,16 @@ export type Database = {
           p_set_running?: boolean;
           p_not_stopped_after?: string;
           p_studio_id?: string;
+          p_regrant?: Json;
         };
         Returns: Json;
+      };
+      repoint_sessions_off_ephemeral: {
+        Args: {
+          p_studio_id: string;
+          p_user_id: string;
+        };
+        Returns: number;
       };
       apply_task_graph: {
         Args: {

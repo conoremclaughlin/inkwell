@@ -662,21 +662,17 @@ describe('hook-lifecycle CLI turn signal', () => {
       }
     });
 
-    it('a VACANT studio is reacquired and the claim retried once (round 13)', async () => {
-      // The nonblocking-backend recovery: the predecessor's release completed
-      // (lease-lost), but nobody else holds the studio — reacquire through
-      // the validated ladder, then re-run the atomic claim.
-      const acquire = vi.spyOn(StudioLeaseService.prototype, 'acquire').mockResolvedValue({
-        acquired: true,
-        lease: {} as never,
+    it('the regrant rides INTO the claim — one RPC, one lock, one transaction (round 14)', async () => {
+      // Round 13's app-level reacquire was three separate commits and every
+      // seam was a boundary failure. Now the vacancy check, eligibility
+      // (thread not closed, studio acquirable, no sibling holder), grant,
+      // epoch claim, and session binding are the RPC's single transaction —
+      // the route only OFFERS the lease to install.
+      const acquire = vi.spyOn(StudioLeaseService.prototype, 'acquire');
+      rpcResult = () => ({
+        data: { outcome: 'claimed', epoch: 'epoch-re', regranted: true },
+        error: null,
       });
-      let call = 0;
-      rpcResult = () => {
-        call += 1;
-        return call === 1
-          ? { data: { outcome: 'lease-lost' }, error: null }
-          : { data: { outcome: 'claimed', epoch: 'epoch-re' }, error: null };
-      };
 
       const studioId = '5bea57f3-6b24-4126-abe4-0d1cc2bd9647';
       const resp = await fetch(`${baseUrl}/api/hooks/lifecycle`, {
@@ -694,21 +690,19 @@ describe('hook-lifecycle CLI turn signal', () => {
       const body = (await resp.json()) as Record<string, unknown>;
       expect(body.turnEpoch).toBe('epoch-re');
       expect(body.studioLeaseHeld).toBe(true);
-      expect(rpcCalls).toHaveLength(2);
-      expect(acquire).toHaveBeenCalledWith(
-        expect.objectContaining({
-          studioId,
-          sessionId: SESSION_ID,
-          reason: 'cli-prompt-reacquire',
-        })
-      );
+      expect(rpcCalls).toHaveLength(1);
+      const args = rpcCalls[0]![1] as Record<string, unknown>;
+      expect(args.p_studio_id).toBe(studioId);
+      expect(args.p_regrant).toMatchObject({
+        sessionId: SESSION_ID,
+        reason: 'cli-prompt-regrant',
+      });
+      // No application-level acquire remains — the seams are gone.
+      expect(acquire).not.toHaveBeenCalled();
     });
 
-    it('a HELD-elsewhere studio is not stolen — one claim, refused cleanly', async () => {
-      const acquire = vi.spyOn(StudioLeaseService.prototype, 'acquire').mockResolvedValue({
-        acquired: false,
-        holder: null,
-      });
+    it('an INELIGIBLE vacancy (revoked thread, sibling holder, retired studio) refuses cleanly', async () => {
+      const acquire = vi.spyOn(StudioLeaseService.prototype, 'acquire');
       rpcResult = () => ({ data: { outcome: 'lease-lost' }, error: null });
 
       const resp = await fetch(`${baseUrl}/api/hooks/lifecycle`, {
@@ -727,7 +721,7 @@ describe('hook-lifecycle CLI turn signal', () => {
       expect(body.studioLeaseHeld).toBe(false);
       expect('turnEpoch' in body).toBe(false);
       expect(rpcCalls).toHaveLength(1);
-      expect(acquire).toHaveBeenCalled();
+      expect(acquire).not.toHaveBeenCalled();
       expect(updateSession).not.toHaveBeenCalled();
     });
 

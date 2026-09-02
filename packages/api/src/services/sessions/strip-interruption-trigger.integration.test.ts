@@ -384,6 +384,134 @@ d('session_running_write trigger', () => {
       }
     });
 
+    it('the regrant is revocation-aware and grants nothing to a stopped reclaim (round 14)', async () => {
+      const sessionId = await insertSession({ lifecycle: 'idle', metadata: {} });
+      const studioId = randomUUID();
+      const threadKey = `test:regrant-${studioId.slice(0, 8)}`;
+      const { error: studioError } = await client.from('studios').insert({
+        id: studioId,
+        user_id: USER,
+        branch: 'test/regrant',
+        repo_root: '/tmp/regrant',
+        worktree_path: `/tmp/regrant-${studioId}`,
+        status: 'active',
+        ephemeral: true,
+        lease: null,
+      } as never);
+      expect(studioError).toBeNull();
+      const regrant = {
+        sessionId,
+        threadKey,
+        threadKeys: [threadKey],
+        agentId: 'wren',
+        reason: 'cli-prompt-regrant',
+      };
+
+      try {
+        // 1) STOPPED beats the regrant: a reclaim whose marker predates the
+        // stop tombstone gets 'stopped' and the studio stays VACANT — no
+        // lease held by a dead turn (the round-14 watcher sequence).
+        const stoppedAt = new Date().toISOString();
+        await client
+          .from('sessions')
+          .update({ cli_turn_stopped_at: stoppedAt } as never)
+          .eq('id', sessionId);
+        const { data: refused } = await client.rpc('claim_turn_epoch', {
+          p_session_id: sessionId,
+          p_set_running: true,
+          p_not_stopped_after: new Date(Date.parse(stoppedAt) - 60_000).toISOString(),
+          p_studio_id: studioId,
+          p_regrant: regrant,
+        } as never);
+        expect((refused as unknown as { outcome: string }).outcome).toBe('stopped');
+        const { data: afterStopped } = await client
+          .from('studios')
+          .select('lease')
+          .eq('id', studioId)
+          .single();
+        expect(afterStopped!.lease).toBeNull();
+
+        // 2) A CLOSED thread is a revocation — vacancy is not authorization.
+        const { error: threadError } = await client.from('inbox_threads').insert({
+          user_id: USER,
+          thread_key: threadKey,
+          created_by_agent_id: 'wren',
+          status: 'closed',
+        } as never);
+        expect(threadError).toBeNull();
+        const { data: revoked } = await client.rpc('claim_turn_epoch', {
+          p_session_id: sessionId,
+          p_set_running: true,
+          p_studio_id: studioId,
+          p_regrant: regrant,
+        } as never);
+        expect((revoked as unknown as { outcome: string }).outcome).toBe('lease-lost');
+        await client.from('inbox_threads').delete().eq('user_id', USER).eq('thread_key', threadKey);
+
+        // 3) ELIGIBLE vacancy: claimed + regranted, the lease installed with
+        // the fresh epoch, and the session re-bound to the studio in the
+        // SAME transaction.
+        const { data: won } = await client.rpc('claim_turn_epoch', {
+          p_session_id: sessionId,
+          p_set_running: true,
+          p_studio_id: studioId,
+          p_regrant: regrant,
+        } as never);
+        const verdict = won as unknown as { outcome: string; epoch: string; regranted: boolean };
+        expect(verdict.outcome).toBe('claimed');
+        expect(verdict.regranted).toBe(true);
+        const { data: studioAfter } = await client
+          .from('studios')
+          .select('lease')
+          .eq('id', studioId)
+          .single();
+        const lease = studioAfter!.lease as { sessionId?: string; turnEpoch?: string };
+        expect(lease.sessionId).toBe(sessionId);
+        expect(lease.turnEpoch).toBe(verdict.epoch);
+        const { data: sessionAfter } = await client
+          .from('sessions')
+          .select('studio_id')
+          .eq('id', sessionId)
+          .single();
+        expect(sessionAfter!.studio_id).toBe(studioId);
+
+        // 4) The locked repoint SKIPS a re-leased studio: the release's
+        // clear → repoint gap can no longer point a regranted session off
+        // its own studio.
+        const { data: skipped } = await client.rpc('repoint_sessions_off_ephemeral', {
+          p_studio_id: studioId,
+          p_user_id: USER,
+        } as never);
+        expect(skipped).toBe(0);
+        const { data: stillBound } = await client
+          .from('sessions')
+          .select('studio_id')
+          .eq('id', sessionId)
+          .single();
+        expect(stillBound!.studio_id).toBe(studioId);
+
+        // 5) ...and repoints a genuinely vacated one.
+        await client
+          .from('studios')
+          .update({ lease: null } as never)
+          .eq('id', studioId);
+        const { data: repointed } = await client.rpc('repoint_sessions_off_ephemeral', {
+          p_studio_id: studioId,
+          p_user_id: USER,
+        } as never);
+        expect(repointed).toBe(1);
+        const { data: unbound } = await client
+          .from('sessions')
+          .select('studio_id')
+          .eq('id', sessionId)
+          .single();
+        expect(unbound!.studio_id).toBeNull();
+      } finally {
+        await client.from('inbox_threads').delete().eq('user_id', USER).eq('thread_key', threadKey);
+        await client.from('studios').delete().eq('id', studioId);
+      }
+    });
+
     it('claim_turn_epoch rotates a running → running row atomically', async () => {
       // The CLI-prompt takeover: no lifecycle transition for the trigger to
       // see, no metadata in the hook's column-only write. The claim is the

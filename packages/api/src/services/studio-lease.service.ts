@@ -874,38 +874,17 @@ export class StudioLeaseService {
    */
   private async repointSessionsOffEphemeral(studioId: string, userId: string): Promise<void> {
     try {
-      const { data: studio } = await this.supabase
-        .from('studios')
-        .select('id, ephemeral, parent_studio_id')
-        .eq('id', studioId)
-        .eq('user_id', userId)
-        .maybeSingle();
-      if (studio?.ephemeral !== true) return;
-
-      let ancestorId: string | null = null;
-      const seen = new Set<string>([studioId]);
-      let parentId = (studio.parent_studio_id as string | null) ?? null;
-      while (parentId && !seen.has(parentId)) {
-        seen.add(parentId);
-        const { data: parent } = await this.supabase
-          .from('studios')
-          .select('id, ephemeral, parent_studio_id, status')
-          .eq('id', parentId)
-          .eq('user_id', userId)
-          .maybeSingle();
-        if (!parent) break;
-        if (parent.ephemeral !== true && parent.status !== 'cleaned') {
-          ancestorId = parent.id;
-          break;
-        }
-        parentId = (parent.parent_studio_id as string | null) ?? null;
-      }
-
-      const { error } = await this.supabase
-        .from('sessions')
-        .update({ studio_id: ancestorId })
-        .eq('user_id', userId)
-        .eq('studio_id', studioId);
+      // One RPC, serialized on the studio row lock (PR #563 round 14): the
+      // release's clear → repoint gap used to admit a reacquire+claim in
+      // between, which this unfenced repoint then pointed off its own
+      // studio. The SQL function takes the studio FOR UPDATE — the same
+      // lock claim_turn_epoch's regrant holds — and repoints ONLY while the
+      // lease is still NULL, so whichever side commits second sees the
+      // other's state.
+      const { error } = await this.supabase.rpc('repoint_sessions_off_ephemeral', {
+        p_studio_id: studioId,
+        p_user_id: userId,
+      } as never);
       if (error) throw new Error(error.message);
     } catch (err) {
       logger.warn('[StudioLease] Failed to repoint sessions off released ephemeral', {

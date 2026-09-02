@@ -255,6 +255,35 @@ function makeFakeSupabase(tables: Record<string, Row[]>, hooks?: FakeHooks) {
             : { data: { conflict: false }, error: null };
         }
 
+        if (fn === 'repoint_sessions_off_ephemeral') {
+          // Mirrors the SQL: FOR UPDATE on the studio; repoint ONLY while
+          // the lease is still NULL (a regrant that won the lock keeps its
+          // sessions bound); ancestor walk skips ephemerals and cleaned rows.
+          if (!target || target.ephemeral !== true) return { data: 0, error: null };
+          if (target.lease != null) return { data: 0, error: null };
+          let ancestorId: string | null = null;
+          const seen = new Set<string>([String(target.id)]);
+          let parentId = (target.parent_studio_id as string | null) ?? null;
+          while (parentId && !seen.has(parentId)) {
+            seen.add(parentId);
+            const parent = studios.find((r) => r.id === parentId && r.user_id === args.p_user_id);
+            if (!parent) break;
+            if (parent.ephemeral !== true && parent.status !== 'cleaned') {
+              ancestorId = String(parent.id);
+              break;
+            }
+            parentId = (parent.parent_studio_id as string | null) ?? null;
+          }
+          let count = 0;
+          for (const sess of tables['sessions'] ?? []) {
+            if (sess.user_id === args.p_user_id && sess.studio_id === args.p_studio_id) {
+              sess.studio_id = ancestorId;
+              count += 1;
+            }
+          }
+          return { data: count, error: null };
+        }
+
         if (fn !== 'grant_studio_lease') {
           return { data: null, error: { message: `no fake for rpc ${fn}` } };
         }
