@@ -351,6 +351,30 @@ describe('reclaim wiring round 11 (reachability)', () => {
   });
 });
 
+describe('scope-end wiring (round 17, reachability)', () => {
+  it('the wrapper finalizes scope with a fenced stop (or tombstone) and AWAITS stop() everywhere', async () => {
+    const { readFileSync } = await import('fs');
+    const { dirname } = await import('path');
+    const { fileURLToPath } = await import('url');
+    const source = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), '..', 'commands', 'claude.ts'),
+      'utf-8'
+    );
+    const helper = source.indexOf('function startSessionTakeoverWatcher(');
+    const finalize = source.indexOf('finalizeScope: async (turnEpoch) => {', helper);
+    const fenced = source.indexOf(
+      '...(turnEpoch ? { turnEpoch } : { turnEpochMissing: true })',
+      finalize
+    );
+    expect(finalize).toBeGreaterThan(helper);
+    expect(fenced).toBeGreaterThan(finalize);
+    // Every stop is awaited — the boundary is real, not fire-and-forget.
+    expect(source.indexOf('await takeoverWatcher?.stop()')).toBeGreaterThan(-1);
+    expect(source).not.toContain('\n    takeoverWatcher?.stop();');
+    expect(source.indexOf('await interactiveTakeoverWatcher?.stop()')).toBeGreaterThan(-1);
+  });
+});
+
 describe('permanent refusal enforcement (round 15)', () => {
   it("an 'unprotected' verdict retires the marker and fires the enforcement hook", async () => {
     vi.useFakeTimers();
@@ -382,5 +406,97 @@ describe('permanent refusal enforcement (round 15)', () => {
 
     expect(outcome).toBe('unprotected');
     expect(existsSync(p)).toBe(false);
+  });
+});
+
+/**
+ * Round 17 (Lumen): the marker is written by the backend's prompt hook AFTER
+ * spawn, so a purely timed first tick could not see it and a short one-shot
+ * kept its 3s escape; and stop() could not fence a claim already in flight.
+ * The watcher now ticks on the marker FILE event, and stop() is an async
+ * boundary: it awaits the in-flight tick, closes a claimed turn with its
+ * fenced stop, and stamps the tombstone when nothing was claimed.
+ */
+describe('event-driven ticks and the stop boundary (round 17)', () => {
+  it('a marker written AFTER start triggers a claim without waiting for the interval', async () => {
+    const claim = vi.fn(async () => 'ok' as const);
+    const watcher = startTakeoverWatcher({
+      cwd: dir,
+      expectedSessionId: 's1',
+      claim,
+      intervalMs: 60_000, // the interval alone could never fire in this test
+    });
+
+    // Production ordering: the watcher exists BEFORE the marker (the prompt
+    // hook writes it after spawn).
+    await new Promise((r) => setTimeout(r, 20));
+    expect(claim).not.toHaveBeenCalled();
+    write({ sessionId: 's1', at: new Date().toISOString() });
+
+    await vi.waitFor(() => expect(claim).toHaveBeenCalledTimes(1), { timeout: 2000 });
+    await watcher.stop();
+  });
+
+  it('stop() AWAITS the in-flight claim and closes the claimed turn with its epoch', async () => {
+    const { writeCliTurnEpoch } = await import('./takeover-watcher.js');
+    let releaseClaim: (() => void) | undefined;
+    const claim = vi.fn(
+      () =>
+        new Promise<'ok'>((resolve) => {
+          releaseClaim = () => {
+            // The claim commits and records its epoch BEFORE resolving —
+            // exactly what the real callback does on a 2xx.
+            writeCliTurnEpoch(dir, { sessionId: 's1', turnEpoch: 'epoch-crash' });
+            resolve('ok');
+          };
+        })
+    );
+    const finalizeScope = vi.fn(async () => undefined);
+    write({ sessionId: 's1', at: new Date().toISOString() });
+    const watcher = startTakeoverWatcher({
+      cwd: dir,
+      expectedSessionId: 's1',
+      claim,
+      finalizeScope,
+      intervalMs: 60_000,
+    });
+    await vi.waitFor(() => expect(claim).toHaveBeenCalled(), { timeout: 2000 });
+
+    // The child crashes: stop() must not race past the parked claim.
+    const stopped = watcher.stop();
+    releaseClaim!();
+    await stopped;
+
+    expect(finalizeScope).toHaveBeenCalledWith('epoch-crash');
+  });
+
+  it('an UNCLAIMED scope finalizes with undefined — the tombstone path', async () => {
+    const finalizeScope = vi.fn(async () => undefined);
+    const watcher = startTakeoverWatcher({
+      cwd: dir,
+      expectedSessionId: 's1',
+      claim: vi.fn(async () => 'ok' as const),
+      finalizeScope,
+      intervalMs: 60_000,
+    });
+
+    await watcher.stop();
+
+    expect(finalizeScope).toHaveBeenCalledWith(undefined);
+  });
+
+  it('no new tick starts after stop() begins', async () => {
+    const claim = vi.fn(async () => 'failed' as const);
+    const watcher = startTakeoverWatcher({
+      cwd: dir,
+      expectedSessionId: 's1',
+      claim,
+      intervalMs: 60_000,
+    });
+    await watcher.stop();
+
+    write({ sessionId: 's1', at: new Date().toISOString() });
+    await new Promise((r) => setTimeout(r, 60));
+    expect(claim).not.toHaveBeenCalled();
   });
 });

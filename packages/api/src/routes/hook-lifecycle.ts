@@ -431,6 +431,22 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         // cannot prove which turn this stop ends — destructive boundary
         // effects are suppressed entirely. The lease keeps its heartbeat so
         // nothing rots while the sweep/detach boundary sorts the session out.
+        // Round 17: the stop TOMBSTONE is still stamped — it is monotonically
+        // safe (it only refuses RECLAIMS whose marker predates it; live
+        // prompts are unconditional), and without it a claim still parked in
+        // the server past the wrapper's scope end would land on a dead turn.
+        try {
+          await dataComposer
+            .getClient()
+            .from('sessions')
+            .update({ cli_turn_stopped_at: new Date().toISOString() })
+            .eq('id', sessionId);
+        } catch (err: unknown) {
+          logger.warn('[HookLifecycle] Suppressed-stop tombstone stamp failed', {
+            sessionId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
         try {
           await leaseService.renewBySession(sessionId, session.userId);
         } catch (err: unknown) {

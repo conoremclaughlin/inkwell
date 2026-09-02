@@ -3520,10 +3520,35 @@ function startSessionTakeoverWatcher(
   if (backend !== 'codex' && backend !== 'gemini') return undefined;
   if (!pcpSessionId) return undefined;
   const cwd = process.cwd();
+  const postLifecycle = async (body: Record<string, unknown>) => {
+    const serverUrl = getPcpServerUrl();
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    const token = await getValidAccessToken(serverUrl);
+    if (token) headers.Authorization = `Bearer ${token}`;
+    await fetch(`${serverUrl}/api/hooks/lifecycle`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(3000),
+    });
+  };
   return startTakeoverWatcher({
     cwd,
     expectedSessionId: pcpSessionId,
     onUnprotected,
+    // Round 17: scope end is a real boundary. A turn this watcher claimed is
+    // closed with its FENCED stop (a crashed child sends no stop hook); an
+    // unclaimed scope stamps the stop tombstone so a claim still parked in
+    // the server is refused when it lands.
+    finalizeScope: async (turnEpoch) => {
+      await postLifecycle({
+        sessionId: pcpSessionId,
+        lifecycle: 'idle',
+        event: 'stop',
+        ...(turnEpoch ? { turnEpoch } : { turnEpochMissing: true }),
+        agentId: 'wrapper-scope-end',
+      });
+    },
     claim: async (markerSessionId, markerAt) => {
       try {
         const serverUrl = getPcpServerUrl();
@@ -3773,7 +3798,7 @@ export async function runClaude(
   });
 
   child.on('close', async (code) => {
-    takeoverWatcher?.stop();
+    await takeoverWatcher?.stop();
     ensureCleanup();
     if (stdoutLineBuffer.trim()) {
       const parsedSessionId = parseSessionIdFromJsonLine(stdoutLineBuffer.trim());
@@ -4027,7 +4052,7 @@ export async function runClaudeInteractive(
     // Round 16: an enforced termination (SIGTERM closes with code=null)
     // must neither retry with a fresh backend session nor exit 0.
     if (interactiveEnforced) {
-      interactiveTakeoverWatcher?.stop();
+      await interactiveTakeoverWatcher?.stop();
       process.exit(1);
     }
     const shouldRetry =
@@ -4063,7 +4088,7 @@ export async function runClaudeInteractive(
       email: pcpConfig?.email,
     });
 
-    interactiveTakeoverWatcher?.stop();
+    await interactiveTakeoverWatcher?.stop();
     process.exit(code || 0);
   }
 }

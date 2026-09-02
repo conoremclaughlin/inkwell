@@ -541,13 +541,17 @@ describe('hook-lifecycle CLI turn signal', () => {
       expect(resp.status).toBe(200);
       const body = (await resp.json()) as Record<string, unknown>;
       expect(body.suppressed).toBe(true);
-      // No ownership write anywhere: not via the repository, not direct.
+      // No ownership write anywhere: not via the repository, not direct —
+      // EXCEPT the stop tombstone (round 17), which is monotonically safe
+      // and refuses server-parked reclaims landing on this dead turn.
       for (const call of updateSession.mock.calls) {
         expect(call[1]).not.toHaveProperty('lifecycle');
         expect(call[1]).not.toHaveProperty('cliTurnAt');
         expect(call[1]).not.toHaveProperty('cliTurnStoppedAt');
       }
-      expect(recordedUpdates.filter((u) => u.table === 'sessions')).toHaveLength(0);
+      const sessionWrites = recordedUpdates.filter((u) => u.table === 'sessions');
+      expect(sessionWrites).toHaveLength(1);
+      expect(Object.keys(sessionWrites[0]!.payload)).toEqual(['cli_turn_stopped_at']);
       expect(renew).toHaveBeenCalled();
       await new Promise((r) => setImmediate(r));
       expect(release).not.toHaveBeenCalled();
