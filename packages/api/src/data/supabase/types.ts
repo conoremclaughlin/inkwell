@@ -3013,6 +3013,7 @@ export type Database = {
           cli_attached: boolean | null;
           cli_poll_at: string | null;
           cli_turn_at: string | null;
+          cli_turn_stopped_at: string | null;
           turn_epoch: string | null;
           compacting_since: string | null;
           contact_id: string | null;
@@ -3046,6 +3047,7 @@ export type Database = {
           cli_attached?: boolean | null;
           cli_poll_at?: string | null;
           cli_turn_at?: string | null;
+          cli_turn_stopped_at?: string | null;
           turn_epoch?: string | null;
           compacting_since?: string | null;
           contact_id?: string | null;
@@ -3079,6 +3081,7 @@ export type Database = {
           cli_attached?: boolean | null;
           cli_poll_at?: string | null;
           cli_turn_at?: string | null;
+          cli_turn_stopped_at?: string | null;
           turn_epoch?: string | null;
           compacting_since?: string | null;
           contact_id?: string | null;
@@ -4588,6 +4591,7 @@ export type Database = {
         Args: {
           p_session_id: string;
           p_set_running?: boolean;
+          p_not_stopped_after?: string;
         };
         Returns: string;
       };

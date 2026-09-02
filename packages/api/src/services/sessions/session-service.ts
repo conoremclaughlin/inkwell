@@ -40,7 +40,7 @@ import {
   clearActiveRunIfOwner,
   widenActiveRunCandidates,
   getActiveRun,
-  restoreActiveRun,
+  restoreActiveRunIfCurrent,
   markRunnerSettled,
   trackStateWrite,
   admitStateWrite,
@@ -48,7 +48,7 @@ import {
 import {
   retryTurnFinalization,
   supersedePendingFinalization,
-  hasPendingFinalization,
+  hasPendingFinalizationFor,
   TurnSupersededError,
 } from './finalize-turn.js';
 import { GeminiRunner } from './gemini-runner.js';
@@ -150,6 +150,15 @@ interface PendingMessage {
   request: SessionRequest;
   resolve: (result: SessionResult) => void;
   reject: (error: Error) => void;
+  /**
+   * The turn-epoch candidate minted at this message's handleMessage entry
+   * (PR #563 round 9). Its PRE-QUEUE session resolution already stamped this
+   * value onto any lease it acquired, so the dequeue-time resolution and the
+   * turn itself must run under the SAME candidate — reminting at dequeue
+   * would orphan the stamp and the boundary fence would refuse the wrong
+   * releases.
+   */
+  turnEpochCandidate: string;
 }
 
 // ── Route pattern matching (spec:trigger-studio-routing) ──
@@ -905,6 +914,8 @@ export class SessionService implements ISessionService {
       studioPolicy?: StudioPolicy;
       /** v18 S3: plan resolution — no acquire, no divert, no rebind. */
       planOnly?: boolean;
+      /** Round 9: stamped onto acquired leases as the turn's generation. */
+      turnEpochCandidate?: string;
     }
   ): Promise<Session> {
     const leases = this.getLeaseService();
@@ -955,6 +966,7 @@ export class SessionService implements ISessionService {
         agentId: ctx.agentId,
         userId: ctx.userId,
         reason: routing.tier,
+        turnEpoch: ctx.turnEpochCandidate,
       });
       if (result.acquired) return session;
 
@@ -1005,6 +1017,7 @@ export class SessionService implements ISessionService {
           agentId: ctx.agentId,
           userId: ctx.userId,
           reason: `overflow:${routing.tier}`,
+          turnEpoch: ctx.turnEpochCandidate,
         });
         if (overflowAcquire.acquired) {
           const updated = await this.repository.update(session.id, { studioId: overflow.id });
@@ -1178,6 +1191,13 @@ export class SessionService implements ISessionService {
     // for refusals and truly pre-admission failures.
     let admitted = false;
 
+    // The turn's epoch candidate is minted HERE, before routing (PR #563
+    // round 9): routing acquires studio leases, and the lease stamp must be
+    // the same value the turn later submits as its running-write epoch —
+    // that identity is what lets a predecessor's boundary recognize "this
+    // lease now belongs to a successor turn" and refuse the release.
+    const turnEpochCandidate = randomUUID();
+
     try {
       // 1. Get or create session (needed to determine lock key)
       const session = await this.getOrCreateSession(userId, agentId, {
@@ -1191,6 +1211,7 @@ export class SessionService implements ISessionService {
         recipientSessionId: metadata?.recipientSessionId,
         contactId: metadata?.contactId,
         repoRoot: metadata?.repoRoot,
+        turnEpochCandidate,
       });
       admitted = true;
 
@@ -1253,7 +1274,7 @@ export class SessionService implements ISessionService {
         // one.
         return await new Promise((resolve, reject) => {
           const queue = this.pendingQueues.get(lockKey) || [];
-          queue.push({ request, resolve, reject });
+          queue.push({ request, resolve, reject, turnEpochCandidate });
           this.pendingQueues.set(lockKey, queue);
         });
       }
@@ -1263,7 +1284,7 @@ export class SessionService implements ISessionService {
       logger.debug('Acquired processing lock', { lockKey });
 
       try {
-        const result = await this.processMessage(request, session);
+        const result = await this.processMessage(request, session, turnEpochCandidate);
         // If the initial lock-holder failed with a non-retryable error,
         // flush queued messages before processQueueOrReleaseLock runs —
         // every queued message would fail the same way.
@@ -1409,10 +1430,17 @@ export class SessionService implements ISessionService {
             studioId: pending.request.metadata?.studioId,
             studioHint: pending.request.metadata?.studioHint,
             recipientSessionId: pending.request.metadata?.recipientSessionId,
+            // The candidate minted at THIS message's handleMessage entry —
+            // its pre-queue resolution already stamped leases with it.
+            turnEpochCandidate: pending.turnEpochCandidate,
           }
         );
 
-        const result = await this.processMessage(pending.request, session);
+        const result = await this.processMessage(
+          pending.request,
+          session,
+          pending.turnEpochCandidate
+        );
         // Same admission evidence as the direct path: resolution succeeded
         // just above, so whatever the turn did, routing admitted it.
         pending.resolve({ ...result, admitted: true });
@@ -1486,7 +1514,11 @@ export class SessionService implements ISessionService {
    * Process a message with an already-acquired lock.
    * This is the core message processing logic, separated from locking.
    */
-  private async processMessage(request: SessionRequest, session: Session): Promise<SessionResult> {
+  private async processMessage(
+    request: SessionRequest,
+    session: Session,
+    turnEpochCandidate?: string
+  ): Promise<SessionResult> {
     const { userId, agentId, metadata } = request;
 
     // 1. Build context for the agent
@@ -1705,7 +1737,11 @@ export class SessionService implements ISessionService {
     // trigger only fills an epoch when a running-entering write carries none,
     // so retrying the running write is idempotent by value, and "did my write
     // actually land?" is answerable by reading the row and comparing.
-    const turnEpoch = randomUUID();
+    // Round 9: handleMessage mints it BEFORE routing and threads it here, so
+    // the leases routing stamped and the epoch this turn runs under are the
+    // same value — the boundary fence depends on that identity. The local
+    // mint survives only for direct callers (tests, internal retries).
+    const turnEpoch = turnEpochCandidate ?? randomUUID();
 
     const turnRegisteredAt = Date.now();
     const admitted = registerActiveRun({
@@ -1814,9 +1850,13 @@ export class SessionService implements ISessionService {
         // is still pending — restoring a turn that already finalized would
         // resurrect a ghost entry for a recorded turn (round 4). Otherwise
         // clear OUR entry, compare-and-act on our own candidate.
-        if (previousRun && hasPendingFinalization(session.id)) {
-          restoreActiveRun(previousRun);
-        } else {
+        if (
+          !(
+            previousRun?.turnEpoch !== undefined &&
+            hasPendingFinalizationFor(session.id, previousRun.turnEpoch) &&
+            restoreActiveRunIfCurrent(previousRun, turnEpoch)
+          )
+        ) {
           clearActiveRunIfOwner(session.id, turnEpoch);
         }
         throw lastError instanceof Error
@@ -1905,9 +1945,13 @@ export class SessionService implements ISessionService {
             // this branch previously skipped the restore-or-clear and left a
             // settled stale entry behind).
             logger.warn('Failed-write fenced out by a newer owner', { sessionId: session.id });
-            if (previousRun && hasPendingFinalization(session.id)) {
-              restoreActiveRun(previousRun);
-            } else {
+            if (
+              !(
+                previousRun?.turnEpoch !== undefined &&
+                hasPendingFinalizationFor(session.id, previousRun.turnEpoch) &&
+                restoreActiveRunIfCurrent(previousRun, turnEpoch)
+              )
+            ) {
               clearActiveRunIfOwner(session.id, turnEpoch);
             }
           } else {
@@ -2155,9 +2199,13 @@ export class SessionService implements ISessionService {
           // turn's recovery is still pending, its registration comes back —
           // otherwise a fenced-out unconfirmed takeover would leave the
           // still-running previous row with no entry for shutdown to find.
-          if (previousRun && hasPendingFinalization(session.id)) {
-            restoreActiveRun(previousRun);
-          } else {
+          if (
+            !(
+              previousRun?.turnEpoch !== undefined &&
+              hasPendingFinalizationFor(session.id, previousRun.turnEpoch) &&
+              restoreActiveRunIfCurrent(previousRun, turnEpoch)
+            )
+          ) {
             clearActiveRunIfOwner(session.id, turnEpoch);
           }
         } else {
@@ -2196,9 +2244,14 @@ export class SessionService implements ISessionService {
             // claiming liveness too (round 6) — strictly, so a newer
             // registrant's entry survives.
             if (outcome === 'gone' || outcome === 'superseded') {
-              if (outcome === 'superseded' && previousRun && hasPendingFinalization(session.id)) {
-                restoreActiveRun(previousRun);
-              } else {
+              if (
+                !(
+                  outcome === 'superseded' &&
+                  previousRun?.turnEpoch !== undefined &&
+                  hasPendingFinalizationFor(session.id, previousRun.turnEpoch) &&
+                  restoreActiveRunIfCurrent(previousRun, turnEpoch)
+                )
+              ) {
                 clearActiveRunIfOwner(session.id, turnEpoch);
               }
             }
@@ -2367,6 +2420,15 @@ export class SessionService implements ISessionService {
        * this flag removes.
        */
       planOnly?: boolean;
+      /**
+       * Turn-epoch candidate of the message this resolution admits (PR #563
+       * round 9). Routing stamps it onto any lease it acquires so the lease
+       * carries the GENERATION of its acquiring turn — the boundary of an
+       * earlier turn on the same session then refuses to release it. Absent
+       * on plan resolutions and legacy callers; leases acquired without it
+       * stay unfenced (released as before).
+       */
+      turnEpochCandidate?: string;
     }
   ): Promise<Session> {
     const type = options?.type || 'primary';
@@ -2519,6 +2581,8 @@ export class SessionService implements ISessionService {
       identityAbsent: identity.absent === true,
       // v18 S3: plan resolutions decide without provisioning or acquiring.
       planOnly: options?.planOnly === true,
+      // Round 9: leases acquired by this resolution carry the turn's epoch.
+      turnEpochCandidate: options?.turnEpochCandidate,
     };
 
     // Resolve default_session_id from agent identity. When set, threadKey
@@ -3998,8 +4062,11 @@ This session will continue with a fresh context after compaction. Your identity,
       // Epoch scope at the resource (Lumen, PR #563 round 6): the same read
       // that establishes terminality also establishes ownership. A newer
       // owner on the row means this boundary is theirs — releasing here
-      // could drop a lease the new turn holds. Residual is this read →
-      // releaseAtBoundary window, atop the lease service's own CAS guards.
+      // could drop a lease the new turn holds. The session-row check alone
+      // left a residual (round 9): a successor mints its candidate and
+      // stamps the LEASE during routing, before its running-write touches
+      // the row — so the epoch is also carried into releaseAtBoundary,
+      // where each lease's own stamp is compared under the release CAS.
       if (expectedTurnEpoch !== undefined && session.turnEpoch !== expectedTurnEpoch) {
         logger.warn('[StudioLease] Skipping run-boundary release; newer turn owns the session', {
           sessionId,
@@ -4013,6 +4080,7 @@ This session will continue with a fresh context after compaction. Your identity,
         userId: session.userId,
         sessionTerminal: terminal,
         reason: 'run-terminal',
+        expectedTurnEpoch,
       });
     } catch (err) {
       logger.warn('[StudioLease] Run-boundary release failed', {

@@ -25,6 +25,7 @@ import { getBackend, resolveAgentId } from '../backends/index.js';
 import { classifyError } from '@inklabs/shared';
 import { getValidAccessToken } from '../auth/tokens.js';
 import { callPcpTool, getPcpServerUrl } from '../lib/pcp-mcp.js';
+import { startTakeoverWatcher } from '../lib/takeover-watcher.js';
 import { sbDebugLog } from '../lib/sb-debug.js';
 import { divertConsoleLogToStderr, restoreConsoleLog } from '../lib/stdout-purity.js';
 import {
@@ -3648,6 +3649,40 @@ export async function runClaude(
 
   // Adapters that pass the prompt via stdin (Claude — avoids argv E2BIG on
   // large prompts) need a piped stdin we write to; otherwise inherit the TTY.
+  // PR #563 round 9: codex/gemini prompt hooks cannot block and run no
+  // channel plugin, so THIS wrapper is the marker consumer — the long-lived
+  // process that converts a failed takeover's marker into a claim.
+  const takeoverWatcher =
+    options.backend === 'codex' || options.backend === 'gemini'
+      ? startTakeoverWatcher({
+          cwd: process.cwd(),
+          claim: async (markerSessionId, markerAt) => {
+            try {
+              const serverUrl = getPcpServerUrl();
+              const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+              const token = await getValidAccessToken(serverUrl);
+              if (token) headers.Authorization = `Bearer ${token}`;
+              const resp = await fetch(`${serverUrl}/api/hooks/lifecycle`, {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({
+                  sessionId: markerSessionId,
+                  lifecycle: 'running',
+                  event: 'prompt',
+                  reclaimOf: markerAt,
+                }),
+                signal: AbortSignal.timeout(3000),
+              });
+              if (resp.ok) return 'ok';
+              if (resp.status === 409) return 'stopped';
+              return 'failed';
+            } catch {
+              return 'failed';
+            }
+          },
+        })
+      : undefined;
+
   const child = spawn(prepared.binary, prepared.args, {
     stdio: [prepared.stdinData !== undefined ? 'pipe' : 'inherit', 'pipe', 'pipe'],
     env: {
@@ -3677,6 +3712,7 @@ export async function runClaude(
   });
 
   child.on('close', async (code) => {
+    takeoverWatcher?.stop();
     ensureCleanup();
     if (stdoutLineBuffer.trim()) {
       const parsedSessionId = parseSessionIdFromJsonLine(stdoutLineBuffer.trim());

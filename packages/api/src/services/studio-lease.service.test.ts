@@ -3055,3 +3055,169 @@ describe('S2: the minimal close invariant (spec v18, Lumen r2)', () => {
     expect(storedLease()?.claimKind).toBe('teardown');
   });
 });
+
+describe('R9: lease turn-generation fence (PR #563 round 9)', () => {
+  // The scenario this closes: turn A's boundary checks the SESSION row's
+  // epoch, passes, and then releases — but successor turn B stamped the
+  // LEASE during routing, before B's running-write touched the session row.
+  // The lease itself now carries its acquiring turn's epoch, and the
+  // boundary compares against it under the release CAS.
+  let tables: Record<string, Row[]>;
+
+  beforeEach(() => {
+    resetActiveRuns();
+    tables = baseTables();
+  });
+
+  afterEach(() => resetActiveRuns());
+
+  const storedLease = () => tables.studios[0].lease as StudioLease | null;
+  const acquireReq = (overrides: Record<string, unknown> = {}) => ({
+    studioId: 'studio-1',
+    sessionId: 'session-b',
+    threadKey: 'pr:100',
+    agentId: 'wren',
+    userId: 'user-1',
+    reason: 'route-pattern',
+    ...overrides,
+  });
+
+  it('a fresh grant stamps the acquiring turn’s epoch', async () => {
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+    const result = await service.acquire(acquireReq({ turnEpoch: 'epoch-a' }));
+    expect(result.acquired).toBe(true);
+    expect(storedLease()?.turnEpoch).toBe('epoch-a');
+  });
+
+  it('a successor turn’s same-session re-acquire RESTAMPS the lease (append and same-thread rung)', async () => {
+    // Turn A holds; turn B on the SAME session multiplexes a new thread —
+    // the lease now belongs to B's generation and A's boundary must see it.
+    tables.studios[0].lease = freshLease({
+      sessionId: 'session-b',
+      threadKeys: ['pr:100'],
+      turnEpoch: 'epoch-a',
+    }) as unknown as Row;
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const appended = await service.acquire(
+      acquireReq({ threadKey: 'pr:200', turnEpoch: 'epoch-b' })
+    );
+    expect(appended.acquired).toBe(true);
+    expect(storedLease()?.turnEpoch).toBe('epoch-b');
+
+    // Same thread again (heartbeat-bump rung) — the newest turn still wins
+    // the stamp, and an epoch-less re-acquire carries the stamp forward.
+    const rebumped = await service.acquire(acquireReq({ turnEpoch: 'epoch-c' }));
+    expect(rebumped.acquired).toBe(true);
+    expect(storedLease()?.turnEpoch).toBe('epoch-c');
+
+    const unfenced = await service.acquire(acquireReq());
+    expect(unfenced.acquired).toBe(true);
+    expect(storedLease()?.turnEpoch).toBe('epoch-c');
+  });
+
+  it('releaseAtBoundary refuses a lease stamped by a DIFFERENT turn', async () => {
+    tables.studios[0].lease = freshLease({
+      sessionId: 'session-a',
+      turnEpoch: 'epoch-b',
+    }) as unknown as Row;
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const released = await service.releaseAtBoundary('session-a', {
+      userId: 'user-1',
+      sessionTerminal: true,
+      reason: 'run-terminal',
+      expectedTurnEpoch: 'epoch-a',
+    });
+
+    expect(released).toBe(false);
+    expect(storedLease()?.turnEpoch).toBe('epoch-b');
+  });
+
+  it('releases its own stamp; unstamped leases and unfenced boundaries keep legacy behavior', async () => {
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    // Own stamp → releases.
+    tables.studios[0].lease = freshLease({
+      sessionId: 'session-a',
+      turnEpoch: 'epoch-a',
+    }) as unknown as Row;
+    expect(
+      await service.releaseAtBoundary('session-a', {
+        userId: 'user-1',
+        sessionTerminal: true,
+        reason: 'run-terminal',
+        expectedTurnEpoch: 'epoch-a',
+      })
+    ).toBe(true);
+    expect(storedLease()).toBeNull();
+
+    // Unstamped lease (pre-round-9, CLI-claimed) under a fenced boundary →
+    // releases; there is no generation to compare.
+    tables.studios[0].lease = freshLease({ sessionId: 'session-a' }) as unknown as Row;
+    expect(
+      await service.releaseAtBoundary('session-a', {
+        userId: 'user-1',
+        sessionTerminal: true,
+        reason: 'run-terminal',
+        expectedTurnEpoch: 'epoch-a',
+      })
+    ).toBe(true);
+    expect(storedLease()).toBeNull();
+
+    // Stamped lease under an UNfenced boundary (legacy caller) → releases.
+    tables.studios[0].lease = freshLease({
+      sessionId: 'session-a',
+      turnEpoch: 'epoch-b',
+    }) as unknown as Row;
+    expect(
+      await service.releaseAtBoundary('session-a', {
+        userId: 'user-1',
+        sessionTerminal: true,
+        reason: 'run-terminal',
+      })
+    ).toBe(true);
+    expect(storedLease()).toBeNull();
+  });
+
+  it('the release CAS loses to a re-acquire interleaved after the boundary’s read — even in the same millisecond', async () => {
+    // heartbeatAt inequality usually catches the interleaving; this pins the
+    // casLease turnEpoch guard for the same-ms collision where it does not.
+    const lease = freshLease({ sessionId: 'session-a', turnEpoch: 'epoch-a' });
+    tables.studios[0].lease = lease as unknown as Row;
+    const service = new StudioLeaseService(
+      makeFakeSupabase(tables, {
+        beforeUpdate: (table, count) => {
+          if (table === 'studios' && count === 1) {
+            // Successor re-acquire lands between read and CAS: same
+            // heartbeatAt (same-ms), new epoch.
+            tables.studios[0].lease = { ...lease, turnEpoch: 'epoch-b' } as unknown as Row;
+          }
+        },
+      })
+    );
+
+    const released = await service.releaseAtBoundary('session-a', {
+      userId: 'user-1',
+      sessionTerminal: true,
+      reason: 'run-terminal',
+      expectedTurnEpoch: 'epoch-a',
+    });
+
+    expect(released).toBe(false);
+    expect(storedLease()?.turnEpoch).toBe('epoch-b');
+  });
+
+  it('renewals carry the stamp forward (parser round-trip)', async () => {
+    // Every rewrite serializes the PARSED lease — a field the parser drops
+    // is a field every renewal silently erases.
+    tables.studios[0].lease = freshLease({
+      sessionId: 'session-a',
+      turnEpoch: 'epoch-a',
+    }) as unknown as Row;
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    expect(await service.renewBySession('session-a', 'user-1')).toBe(true);
+    expect(storedLease()?.turnEpoch).toBe('epoch-a');
+  });
+});

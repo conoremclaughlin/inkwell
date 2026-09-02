@@ -70,6 +70,15 @@ export function hasPendingFinalization(sessionId: string): boolean {
   return (pendingFinalizations.get(sessionId)?.size ?? 0) > 0;
 }
 
+/**
+ * Is a recovery pending under THIS exact epoch? Restore decisions must be
+ * owner-scoped (round 9): "some epoch is pending" may be a newer turn's
+ * loop, not the one being considered for restoration.
+ */
+export function hasPendingFinalizationFor(sessionId: string, epochKey: string): boolean {
+  return pendingFinalizations.get(sessionId)?.has(epochKey) ?? false;
+}
+
 /** Test seam: cancel and forget every pending loop. Not used in production. */
 export function resetPendingFinalizations(): void {
   for (const perEpoch of pendingFinalizations.values()) {

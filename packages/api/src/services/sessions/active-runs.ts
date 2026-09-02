@@ -222,18 +222,18 @@ export function getActiveRun(sessionId: string): ActiveRun | undefined {
 }
 
 /**
- * Put a previous turn's registration back after a failed takeover.
- *
- * A new turn registers (overwriting the previous turn's entry) BEFORE its
- * `running` write; if that write fails, the new turn never took ownership —
- * the row still belongs to the previous turn, whose entry is the vehicle for
- * its background finalization and its shutdown report. Clearing instead of
- * restoring here recreated the original zombie (Lumen, PR #563 round 3).
+ * Put a previous turn's registration back after a failed takeover — but only
+ * while the CURRENT entry still belongs to the restoring turn (round 9: B,
+ * woken late, must not overwrite the entry a newer C has since registered;
+ * "some recovery is pending" says nothing about WHOSE slot this is).
  * Unconditional on intake deliberately: the entry being restored was
  * registered before intake closed and describes state that still holds.
  */
-export function restoreActiveRun(run: ActiveRun): void {
+export function restoreActiveRunIfCurrent(run: ActiveRun, expectedCurrentEpoch: string): boolean {
+  const entry = active.get(run.sessionId);
+  if (!entry || entry.turnEpoch !== expectedCurrentEpoch) return false;
   active.set(run.sessionId, run);
+  return true;
 }
 
 /**

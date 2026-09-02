@@ -85,6 +85,16 @@ export interface StudioLease {
   /** Routing tier that assigned the studio (visibility: "why is someone grabbing it"). */
   reason?: string;
   /**
+   * Turn-epoch candidate of the TURN that last acquired/renewed this lease
+   * (PR #563 round 9). Routing acquires before the turn's running-write, so
+   * the session row's epoch alone cannot fence the lease: a successor turn's
+   * acquire between a predecessor's epoch check and its release would be
+   * clobbered. The boundary refuses to release a lease stamped by a
+   * DIFFERENT turn (releaseAtBoundary.expectedTurnEpoch); unstamped leases
+   * (pre-round-9, CLI-claimed turns) release as before.
+   */
+  turnEpoch?: string;
+  /**
    * Durable quarantine / destructive claim: the worktree is being recovered
    * or torn down. Non-vacant and non-adoptable. For claims, sessionId is a
    * unique random token — ownership is unforgeable and fresh claims cannot
@@ -158,6 +168,8 @@ export interface AcquireRequest {
   userId: string;
   /** Routing tier / provenance, recorded on the lease and the event. */
   reason?: string;
+  /** Turn-epoch candidate of the acquiring turn — stamped onto the lease. */
+  turnEpoch?: string;
 }
 
 export type AcquireResult =
@@ -244,6 +256,7 @@ export function parseStudioLease(raw: Json | null | undefined): StudioLease | nu
     acquiredAt: typeof obj.acquiredAt === 'string' ? obj.acquiredAt : '',
     heartbeatAt: typeof obj.heartbeatAt === 'string' ? obj.heartbeatAt : '',
     reason: typeof obj.reason === 'string' ? obj.reason : undefined,
+    turnEpoch: typeof obj.turnEpoch === 'string' ? obj.turnEpoch : undefined,
     quarantined: obj.quarantined === true,
     claimKind:
       obj.claimKind === 'recovery' || obj.claimKind === 'teardown' ? obj.claimKind : undefined,
@@ -573,6 +586,7 @@ export class StudioLeaseService {
         acquiredAt: now,
         heartbeatAt: now,
         reason: req.reason,
+        turnEpoch: req.turnEpoch,
       };
 
       const holder = current?.lease ?? null;
@@ -805,6 +819,15 @@ export class StudioLeaseService {
     query = from.threadKeys
       ? query.eq('lease->threadKeys', JSON.stringify(from.threadKeys))
       : query.is('lease->threadKeys', null);
+    // turnEpoch (round 9) is the THIRD such mutation: a successor turn's
+    // same-session re-acquire restamps the epoch while sessionId and
+    // acquiredAt stay put — heartbeatAt inequality usually catches it, but
+    // two writes in the same millisecond collide there. Guarding the exact
+    // epoch read makes the boundary's release CAS lose to any interleaved
+    // re-acquire, whatever the clock did.
+    query = from.turnEpoch
+      ? query.eq('lease->>turnEpoch', from.turnEpoch)
+      : query.is('lease->turnEpoch', null);
     if (opts.requireAcquirableStatus) {
       query = query.in('status', StudioLeaseService.ACQUIRABLE_STATUSES);
     }
@@ -1114,6 +1137,7 @@ export class StudioLeaseService {
           threadKeys: [...live, req.threadKey],
           heartbeatAt: now,
           reason: req.reason ?? holder.reason,
+          turnEpoch: req.turnEpoch ?? holder.turnEpoch,
         };
         if (!(await this.casLease(req.studioId, req.userId, holder, appended))) {
           // Lost the CAS — hand control back to acquire()'s validated ladder.
@@ -1186,6 +1210,7 @@ export class StudioLeaseService {
         sbId: lease.sbId ?? holder.sbId,
         heartbeatAt: now,
         reason: req.reason ?? holder.reason,
+        turnEpoch: req.turnEpoch ?? holder.turnEpoch,
       };
       const won = await this.grantLease(req, adopted, holder);
       if (won.outcome === 'granted') {
@@ -1415,11 +1440,40 @@ export class StudioLeaseService {
    */
   async releaseAtBoundary(
     sessionId: string,
-    opts: { userId?: string; sessionTerminal: boolean; reason: string }
+    opts: {
+      userId?: string;
+      sessionTerminal: boolean;
+      reason: string;
+      /**
+       * Turn epoch of the boundary asking to release (PR #563 round 9). A
+       * lease STAMPED by a different turn belongs to that turn — a successor
+       * on the same session re-acquired between this boundary's session-row
+       * epoch check and now, and releasing would strand the successor's
+       * worktree claim. Refusal is per-row; unstamped leases release as
+       * before. The exact-prior casLease inside releaseStudio closes the
+       * remaining read→CAS window: a re-acquire after this check changes the
+       * lease bytes and the release CAS loses.
+       */
+      expectedTurnEpoch?: string;
+    }
   ): Promise<boolean> {
     let any = false;
     for (const row of await this.studiosHeldBy(sessionId, opts.userId)) {
       if (!opts.sessionTerminal && !row.lease.pendingRelease) continue;
+      if (
+        opts.expectedTurnEpoch !== undefined &&
+        row.lease.turnEpoch !== undefined &&
+        row.lease.turnEpoch !== opts.expectedTurnEpoch
+      ) {
+        logger.warn('[StudioLease] Boundary release refused — lease re-acquired by a newer turn', {
+          studioId: row.id,
+          sessionId,
+          leaseTurnEpoch: row.lease.turnEpoch,
+          boundaryTurnEpoch: opts.expectedTurnEpoch,
+          reason: opts.reason,
+        });
+        continue;
+      }
       // A NON-terminal boundary completes only what the marker still
       // justifies (Lumen r2): a thread-scoped marker whose lease has since
       // multiplexed other threads reconciles to a key-removal — the session

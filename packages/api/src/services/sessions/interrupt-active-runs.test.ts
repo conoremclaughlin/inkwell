@@ -16,6 +16,7 @@ import {
   registerActiveRun,
   clearActiveRun,
   clearActiveRunIfOwner,
+  restoreActiveRunIfCurrent,
   widenActiveRunCandidates,
   listActiveRuns,
   activeRunCount,
@@ -131,6 +132,37 @@ describe('active-runs registry', () => {
       expect(activeRunCount()).toBe(0);
     });
   });
+
+  /**
+   * Round 9 (Lumen): the restore after a failed takeover is compare-and-
+   * restore. B (failed, woken late) may put A's run back only while the
+   * registry still holds B's OWN entry — if a newer C registered over B in
+   * the meantime, restoring A would clobber C's live registration with a
+   * stale run.
+   */
+  describe('compare-and-restore (round 9)', () => {
+    const runA = () => run({ turnEpoch: 'epoch-a' });
+
+    it('restores while the slot still belongs to the restoring turn', () => {
+      registerActiveRun(runA());
+      registerActiveRun(run({ turnEpoch: 'epoch-b' })); // B takes over
+      expect(restoreActiveRunIfCurrent(runA(), 'epoch-b')).toBe(true);
+      expect(listActiveRuns()[0]?.turnEpoch).toBe('epoch-a');
+    });
+
+    it('refuses when a newer turn has since registered over the slot', () => {
+      registerActiveRun(runA());
+      registerActiveRun(run({ turnEpoch: 'epoch-b' })); // B takes over
+      registerActiveRun(run({ turnEpoch: 'epoch-c' })); // C registers before B wakes
+      expect(restoreActiveRunIfCurrent(runA(), 'epoch-b')).toBe(false);
+      expect(listActiveRuns()[0]?.turnEpoch).toBe('epoch-c');
+    });
+
+    it('refuses when the slot is empty — nothing to hand back through', () => {
+      expect(restoreActiveRunIfCurrent(runA(), 'epoch-b')).toBe(false);
+      expect(activeRunCount()).toBe(0);
+    });
+  });
 });
 
 /**
@@ -169,11 +201,20 @@ describe('registry brackets the persisted running state', () => {
     expect(supersede).toBeGreaterThan(running);
   });
 
-  it('restores the previous registration when the takeover write fails', () => {
+  it('restores the previous registration when the takeover write fails — but only into its OWN slot', () => {
+    // Round 9 (Lumen): the restore is conditional twice over. The pending
+    // check must name the PREVIOUS turn's epoch (any-recovery-pending said
+    // nothing about whose), and the write-back must compare-and-restore on
+    // the restoring turn's own registry entry — B, woken late, must never
+    // overwrite the entry a newer C has since registered.
     const catchAt = at('catch (runningWriteError)');
     const supersede = at('supersedePendingFinalization(session.id)');
     expect(catchAt).toBeGreaterThan(-1);
-    expect(source.slice(catchAt, supersede)).toContain('restoreActiveRun(previousRun)');
+    const block = source.slice(catchAt, supersede);
+    expect(block).toContain('hasPendingFinalizationFor(session.id, previousRun.turnEpoch)');
+    expect(block).toContain('restoreActiveRunIfCurrent(previousRun, turnEpoch)');
+    // The fallback stays owner-scoped: our candidate, never a blind clear.
+    expect(block).toContain('clearActiveRunIfOwner(session.id, turnEpoch)');
   });
 
   it('clears only after the failed write on the runner-throw path', () => {
@@ -1257,5 +1298,73 @@ describe('formatTurnAge', () => {
     [Number.NaN, 'an unknown time'],
   ])('%d ms → %s', (ms, expected) => {
     expect(formatTurnAge(ms as number)).toBe(expected);
+  });
+});
+
+/**
+ * Round 9 (Lumen, PR #563): ONE candidate per message, minted before routing.
+ * Routing stamps it onto every lease it acquires and the turn runs under the
+ * same value — that identity is what lets a predecessor's boundary recognize
+ * a successor's lease and refuse the release. The threading crosses three
+ * closures (handleMessage → getOrCreateSession → withStudioLease →
+ * processMessage) plus the queue, so the invariant is pinned in source order.
+ */
+describe('turn-epoch candidate threading (round 9)', () => {
+  const source = readFileSync(
+    join(dirname(fileURLToPath(import.meta.url)), 'session-service.ts'),
+    'utf-8'
+  );
+
+  it('handleMessage mints the candidate BEFORE routing and threads it into both consumers', () => {
+    const handle = source.indexOf('async handleMessage(');
+    const mint = source.indexOf('const turnEpochCandidate = randomUUID();', handle);
+    const routed = source.indexOf('turnEpochCandidate,', mint);
+    const processed = source.indexOf(
+      'this.processMessage(request, session, turnEpochCandidate)',
+      mint
+    );
+    expect(handle).toBeGreaterThan(-1);
+    expect(mint).toBeGreaterThan(handle);
+    expect(routed).toBeGreaterThan(mint); // into getOrCreateSession options
+    expect(processed).toBeGreaterThan(mint); // and into the turn itself
+  });
+
+  it('a QUEUED message keeps ITS candidate — dequeue re-routes and runs under the same value', () => {
+    // The pre-queue resolution already stamped leases with this candidate;
+    // reminting at dequeue would orphan those stamps.
+    const queued = source.indexOf('queue.push({ request, resolve, reject, turnEpochCandidate })');
+    const dequeueRoute = source.indexOf('turnEpochCandidate: pending.turnEpochCandidate');
+    const dequeueRun = source.indexOf('pending.turnEpochCandidate\n        )');
+    expect(queued).toBeGreaterThan(-1);
+    expect(dequeueRoute).toBeGreaterThan(-1);
+    expect(dequeueRun).toBeGreaterThan(dequeueRoute);
+  });
+
+  it('BOTH lease acquisitions in withStudioLease stamp the candidate', () => {
+    const gate = source.indexOf('private async withStudioLease(');
+    const first = source.indexOf('turnEpoch: ctx.turnEpochCandidate', gate);
+    const second = source.indexOf('turnEpoch: ctx.turnEpochCandidate', first + 1);
+    expect(gate).toBeGreaterThan(-1);
+    expect(first).toBeGreaterThan(gate); // the routed studio
+    expect(second).toBeGreaterThan(first); // the overflow divert
+  });
+
+  it('processMessage runs under the threaded candidate, minting only as a direct-caller fallback', () => {
+    const process = source.indexOf('private async processMessage(');
+    const epoch = source.indexOf('const turnEpoch = turnEpochCandidate ?? randomUUID();', process);
+    expect(process).toBeGreaterThan(-1);
+    expect(epoch).toBeGreaterThan(process);
+  });
+
+  it('the boundary carries its epoch into releaseAtBoundary — the lease-level fence input', () => {
+    const boundary = source.indexOf('async releaseLeaseIfSessionTerminal(');
+    const release = source.indexOf('releaseAtBoundary(sessionId, {', boundary);
+    const fenced = source.indexOf('expectedTurnEpoch,', release);
+    const close = source.indexOf('});', release);
+    expect(boundary).toBeGreaterThan(-1);
+    expect(release).toBeGreaterThan(boundary);
+    // The epoch is INSIDE the releaseAtBoundary opts, not merely nearby.
+    expect(fenced).toBeGreaterThan(release);
+    expect(fenced).toBeLessThan(close);
   });
 });

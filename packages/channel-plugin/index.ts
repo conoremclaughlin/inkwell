@@ -260,8 +260,10 @@ const drainState = createThreadDrainState();
 // process converts it into a claim. See pending-takeover.ts.
 const takeoverMarkerPath = pendingTakeoverMarkerPath(process.cwd());
 
-async function claimPendingTakeover(): Promise<boolean> {
-  if (!sessionId || !accessToken) return false;
+async function claimPendingTakeover(
+  markerAt: string | undefined
+): Promise<'ok' | 'stopped' | 'failed'> {
+  if (!sessionId || !accessToken) return 'failed';
   try {
     const resp = await fetch(`${INK_SERVER_URL}/api/hooks/lifecycle`, {
       method: 'POST',
@@ -269,12 +271,22 @@ async function claimPendingTakeover(): Promise<boolean> {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${accessToken}`,
       },
-      body: JSON.stringify({ sessionId, lifecycle: 'running', event: 'prompt' }),
+      // reclaimOf CASes the claim against the server-side stop tombstone
+      // (PR #563 round 9): a stop newer than the marker refuses atomically,
+      // so a parked reclaim can never re-mark a finished turn as running.
+      body: JSON.stringify({
+        sessionId,
+        lifecycle: 'running',
+        event: 'prompt',
+        ...(markerAt ? { reclaimOf: markerAt } : {}),
+      }),
       signal: AbortSignal.timeout(3000),
     });
-    return resp.ok;
+    if (resp.ok) return 'ok';
+    if (resp.status === 409) return 'stopped';
+    return 'failed';
   } catch {
-    return false;
+    return 'failed';
   }
 }
 const seenMessageIds = drainState.seenMessageIds; // shared with the legacy loop

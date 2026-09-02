@@ -56,16 +56,17 @@ export function shouldReclaim(
 
 /**
  * One poll-tick's worth of recovery: read → decide → claim → clear.
- * The claim callback POSTs the lifecycle prompt event (the atomic
- * epoch+lifecycle+marker takeover on the server). The marker is removed only
- * after a SUCCESSFUL claim, so a transient failure retries next tick.
+ * The claim callback POSTs the lifecycle prompt event carrying the marker's
+ * birth time; the server CASes it against the stop tombstone (round 9), so
+ * 'stopped' is an authoritative answer — the turn is over and the marker
+ * retires. Only a transient failure leaves the marker for the next tick.
  */
 export async function processPendingTakeover(opts: {
   markerPath: string;
   sessionId: string | undefined;
-  claim: () => Promise<boolean>;
+  claim: (markerAt: string | undefined) => Promise<'ok' | 'stopped' | 'failed'>;
   now?: number;
-}): Promise<'claimed' | 'skipped' | 'failed'> {
+}): Promise<'claimed' | 'stopped' | 'skipped' | 'failed'> {
   const marker = readPendingTakeover(opts.markerPath);
   if (!shouldReclaim(marker, opts.sessionId, opts.now)) {
     // A stale or foreign marker is not ours to keep around when it names our
@@ -79,11 +80,12 @@ export async function processPendingTakeover(opts: {
     }
     return 'skipped';
   }
-  if (!(await opts.claim())) return 'failed';
+  const verdict = await opts.claim(marker?.at);
+  if (verdict === 'failed') return 'failed';
   try {
     rmSync(opts.markerPath, { force: true });
   } catch {
     // The stop hook also deletes; a leftover file is re-judged next tick.
   }
-  return 'claimed';
+  return verdict === 'ok' ? 'claimed' : 'stopped';
 }

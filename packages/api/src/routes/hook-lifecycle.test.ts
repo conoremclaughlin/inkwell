@@ -231,6 +231,56 @@ describe('hook-lifecycle CLI turn signal', () => {
       expect(rpcCalls).toHaveLength(0);
     });
 
+    /**
+     * Round 9 (PR #563, Lumen): the marker reclaim raced the stop event — a
+     * parked claim could land after the stop and re-mark a finished turn as
+     * running. The reclaim now carries the marker's birth time and the RPC
+     * CASes it against the stop tombstone; a refused reclaim is a 409 the
+     * caller treats as "turn over, retire the marker".
+     */
+    it('a RECLAIM threads the marker birth time into the tombstone CAS', async () => {
+      const markerAt = '2026-09-01T12:00:00.000Z';
+      await post({ lifecycle: 'running', event: 'prompt', reclaimOf: markerAt });
+      expect(rpcCalls).toHaveLength(1);
+      expect(rpcCalls[0]![1]).toMatchObject({
+        p_session_id: SESSION_ID,
+        p_set_running: true,
+        p_not_stopped_after: markerAt,
+      });
+      // An ordinary prompt claim stays unconditional — no tombstone predicate.
+      rpcCalls.length = 0;
+      await post({ lifecycle: 'running', event: 'prompt' });
+      expect(rpcCalls[0]![1]).not.toHaveProperty('p_not_stopped_after');
+    });
+
+    it("a reclaim the tombstone refuses is a 409 'stopped', and the lifecycle never writes", async () => {
+      rpcResult = () => ({ data: null, error: null }); // zero rows matched the CAS
+      const resp = await fetch(`${baseUrl}/api/hooks/lifecycle`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer test' },
+        body: JSON.stringify({
+          sessionId: SESSION_ID,
+          lifecycle: 'running',
+          event: 'prompt',
+          reclaimOf: '2026-09-01T12:00:00.000Z',
+        }),
+      });
+      expect(resp.status).toBe(409);
+      const body = (await resp.json()) as Record<string, unknown>;
+      expect(body.code).toBe('stopped');
+      // The dead turn is never re-marked running.
+      expect(updateSession).not.toHaveBeenCalled();
+    });
+
+    it('the stop event stamps the tombstone the reclaim CAS reads', async () => {
+      const updates = await post({ lifecycle: 'idle', event: 'stop' });
+      expect(updates.cliTurnAt).toBeNull();
+      expect(typeof updates.cliTurnStoppedAt).toBe('string');
+      // Non-stop requests never touch it.
+      const promptUpdates = await post({ lifecycle: 'running', event: 'prompt' });
+      expect('cliTurnStoppedAt' in promptUpdates).toBe(false);
+    });
+
     it('fails the prompt visibly when the claim fails — never an unfenced takeover', async () => {
       rpcResult = () => ({ data: null, error: { message: 'db down' } });
       const resp = await fetch(`${baseUrl}/api/hooks/lifecycle`, {

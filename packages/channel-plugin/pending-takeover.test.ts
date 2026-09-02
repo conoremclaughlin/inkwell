@@ -50,13 +50,29 @@ describe('shouldReclaim', () => {
 
 describe('processPendingTakeover', () => {
   it('claims a fresh own-session marker and consumes it', async () => {
-    const p = write({ sessionId: 's1', at: new Date().toISOString() });
-    const claim = vi.fn(async () => true);
+    const at = new Date().toISOString();
+    const p = write({ sessionId: 's1', at });
+    const claim = vi.fn(async () => 'ok' as const);
 
     const outcome = await processPendingTakeover({ markerPath: p, sessionId: 's1', claim });
 
     expect(outcome).toBe('claimed');
-    expect(claim).toHaveBeenCalledTimes(1);
+    // The marker's birth time rides into the claim — the server CASes it
+    // against the stop tombstone.
+    expect(claim).toHaveBeenCalledWith(at);
+    expect(existsSync(p)).toBe(false);
+  });
+
+  it("a server 'stopped' verdict retires the marker without claiming a dead turn", async () => {
+    // The parked-claim race Lumen reproduced (round 9): the claim reached
+    // the server AFTER a stop. The tombstone CAS refuses it atomically; the
+    // plugin's job is just to retire the marker so nothing retries.
+    const p = write({ sessionId: 's1', at: new Date().toISOString() });
+    const claim = vi.fn(async () => 'stopped' as const);
+
+    const outcome = await processPendingTakeover({ markerPath: p, sessionId: 's1', claim });
+
+    expect(outcome).toBe('stopped');
     expect(existsSync(p)).toBe(false);
   });
 
@@ -65,7 +81,7 @@ describe('processPendingTakeover', () => {
     // tick reads it, so the claim never fires and the finished turn is never
     // re-marked running.
     const p = pendingTakeoverMarkerPath(dir);
-    const claim = vi.fn(async () => true);
+    const claim = vi.fn(async () => 'ok' as const);
 
     const outcome = await processPendingTakeover({ markerPath: p, sessionId: 's1', claim });
 
@@ -75,7 +91,7 @@ describe('processPendingTakeover', () => {
 
   it('leaves the marker in place when the claim fails, for the next tick', async () => {
     const p = write({ sessionId: 's1', at: new Date().toISOString() });
-    const claim = vi.fn(async () => false);
+    const claim = vi.fn(async () => 'failed' as const);
 
     const outcome = await processPendingTakeover({ markerPath: p, sessionId: 's1', claim });
 
@@ -85,7 +101,7 @@ describe('processPendingTakeover', () => {
 
   it('never claims a foreign marker, and leaves it for its owner', async () => {
     const p = write({ sessionId: 'someone-else', at: new Date().toISOString() });
-    const claim = vi.fn(async () => true);
+    const claim = vi.fn(async () => 'ok' as const);
 
     const outcome = await processPendingTakeover({ markerPath: p, sessionId: 's1', claim });
 
@@ -99,7 +115,7 @@ describe('processPendingTakeover', () => {
       sessionId: 's1',
       at: new Date(Date.now() - MARKER_MAX_AGE_MS - 60_000).toISOString(),
     });
-    const claim = vi.fn(async () => true);
+    const claim = vi.fn(async () => 'ok' as const);
 
     const outcome = await processPendingTakeover({ markerPath: p, sessionId: 's1', claim });
 

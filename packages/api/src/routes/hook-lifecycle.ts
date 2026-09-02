@@ -58,6 +58,7 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         alias,
         studioId,
         headless,
+        reclaimOf,
       } = req.body as {
         sessionId?: string;
         lifecycle?: string;
@@ -83,6 +84,13 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
          * (PR #563 round 6).
          */
         headless?: boolean;
+        /**
+         * Marker-reclaim (round 9): the pending-takeover marker's birth time.
+         * The claim is CASed against the stop tombstone — a stop newer than
+         * this refuses the claim atomically, so a parked reclaim can never
+         * re-mark a finished turn as running.
+         */
+        reclaimOf?: string;
       };
 
       if (!sessionId) {
@@ -131,6 +139,7 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         cliAttached?: boolean;
         cliPollAt?: string;
         cliTurnAt?: string | null;
+        cliTurnStoppedAt?: string | null;
         alias?: string | null;
       } = {};
       if (lifecycle) updates.lifecycle = lifecycle;
@@ -156,7 +165,12 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
       const isPromptEvent = event === 'prompt' || (!event && lifecycle === 'running');
       const isStopEvent = event === 'stop';
       if (isPromptEvent) updates.cliTurnAt = new Date().toISOString();
-      if (isStopEvent) updates.cliTurnAt = null;
+      if (isStopEvent) {
+        updates.cliTurnAt = null;
+        // The stop tombstone (round 9): the atomic revocation record every
+        // later marker-reclaim CASes against.
+        updates.cliTurnStoppedAt = new Date().toISOString();
+      }
 
       // Ownership claim (PR #563 round 4). A CLI prompt taking over a session
       // whose row is STUCK at `running` is a running → running write — no
@@ -172,15 +186,27 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         // fresh epoch, lifecycle=running, and the turn marker together. A
         // claim can no longer succeed while the lifecycle write fails, which
         // would have stolen ownership with no running state behind it.
-        const { error: claimError } = await dataComposer
+        // Round 9: a RECLAIM additionally CASes against the stop tombstone —
+        // zero rows means the turn already stopped, and the reclaim must
+        // report that distinctly so the caller retires its marker.
+        const { data: claimed, error: claimError } = await dataComposer
           .getClient()
-          .rpc('claim_turn_epoch', { p_session_id: sessionId, p_set_running: true } as never);
+          .rpc('claim_turn_epoch', {
+            p_session_id: sessionId,
+            p_set_running: true,
+            ...(reclaimOf ? { p_not_stopped_after: reclaimOf } : {}),
+          } as never);
         if (claimError) {
           logger.error('[HookLifecycle] Turn-epoch claim failed; refusing prompt takeover', {
             sessionId,
             error: claimError.message,
           });
           res.status(500).json({ success: false, error: 'turn-epoch claim failed' });
+          return;
+        }
+        if (reclaimOf && !claimed) {
+          logger.info('[HookLifecycle] Reclaim refused; the turn already stopped', { sessionId });
+          res.status(409).json({ success: false, code: 'stopped' });
           return;
         }
       }
