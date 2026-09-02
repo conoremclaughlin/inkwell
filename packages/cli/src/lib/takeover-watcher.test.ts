@@ -640,6 +640,11 @@ describe('close-race enforcement and compare-and-delete (round 19)', () => {
     clearCliTurnEpoch(dir, 's1', { turnEpoch: 'e-a', wrapperGeneration: 'gen-a' });
     expect(readCliTurnEpoch(dir)).toMatchObject({ turnEpoch: 'e-b' });
 
+    // The EPOCH check binds independently of the generation check: same
+    // generation, replaced epoch → still refused.
+    clearCliTurnEpoch(dir, 's1', { turnEpoch: 'e-a', wrapperGeneration: 'gen-b' });
+    expect(readCliTurnEpoch(dir)).toMatchObject({ turnEpoch: 'e-b' });
+
     clearCliTurnEpoch(dir, 's1', { turnEpoch: 'e-b', wrapperGeneration: 'gen-b' });
     expect(readCliTurnEpoch(dir)).toBeNull();
   });
