@@ -45,8 +45,10 @@ export interface ResolveApiUrlInput {
   isDev: boolean;
   /**
    * Port the Inkwell API server listens on — from app.config.js, which reads
-   * PCP_PORT_BASE on the machine that started Metro. Not guessable on-device,
-   * which is why it is passed in rather than assumed.
+   * INK_PORT_BASE (falling back to the legacy PCP_PORT_BASE) on the machine
+   * that started Metro, mirroring the server's own resolution in
+   * packages/api/src/config/env.ts. Not guessable on-device, which is why it
+   * is passed in rather than assumed.
    */
   port: number;
 }
