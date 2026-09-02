@@ -239,6 +239,46 @@ d('session_running_write trigger', () => {
       expect(after!.cli_turn_at).toEqual(expect.any(String));
     });
 
+    it('the stop tombstone refuses a stale reclaim in the same statement (round 9)', async () => {
+      // The parked-claim race: marker written → stop lands → the reclaim
+      // arrives late. Client-side ordering cannot close it; the refusal has
+      // to be CASed with the claim. A reclaim carries its marker's birth
+      // time — older than the stop means the turn it reclaims is over.
+      const id = await insertSession({ lifecycle: 'running', metadata: {} });
+      const stoppedAt = new Date().toISOString();
+      await client
+        .from('sessions')
+        .update({ cli_turn_stopped_at: stoppedAt } as never)
+        .eq('id', id);
+
+      const before = (await readSession(id)).turn_epoch;
+      const staleMarker = new Date(Date.parse(stoppedAt) - 60_000).toISOString();
+      const { data: refused, error } = await client.rpc('claim_turn_epoch', {
+        p_session_id: id,
+        p_set_running: true,
+        p_not_stopped_after: staleMarker,
+      } as never);
+      expect(error).toBeNull();
+      expect(refused).toBeNull(); // zero rows — no epoch, no takeover
+      expect((await readSession(id)).turn_epoch).toBe(before);
+
+      // A marker born AFTER the stop is a newer prompt generation — claims.
+      const freshMarker = new Date(Date.parse(stoppedAt) + 60_000).toISOString();
+      const { data: claimed } = await client.rpc('claim_turn_epoch', {
+        p_session_id: id,
+        p_set_running: true,
+        p_not_stopped_after: freshMarker,
+      } as never);
+      expect(claimed).toEqual(expect.any(String));
+
+      // An ordinary prompt claim (no marker) stays unconditional.
+      const { data: unconditional } = await client.rpc('claim_turn_epoch', {
+        p_session_id: id,
+        p_set_running: true,
+      } as never);
+      expect(unconditional).toEqual(expect.any(String));
+    });
+
     it('claim_turn_epoch rotates a running → running row atomically', async () => {
       // The CLI-prompt takeover: no lifecycle transition for the trigger to
       // see, no metadata in the hook's column-only write. The claim is the
