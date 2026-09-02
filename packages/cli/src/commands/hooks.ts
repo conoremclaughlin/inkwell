@@ -2852,6 +2852,10 @@ async function onStopHandler(options?: { backend?: string }): Promise<void> {
       attemptId?: string;
     };
     if (rawMarker.sessionId && rawMarker.sessionId === stopSessionId && rawMarker.at) {
+      // Round 22: the adjudicating reclaim names our STUDIO — without it
+      // the claim skips the lease/revocation boundary entirely, and a
+      // short turn whose lease was revoked would be accepted at stop.
+      const { studioId: stopStudioId } = getIdentitySessionContext(cwd);
       const reclaim = await updateRuntimeGenerationState(
         cwd,
         config,
@@ -2861,6 +2865,7 @@ async function onStopHandler(options?: { backend?: string }): Promise<void> {
         {
           reclaimOf: rawMarker.at,
           ...(rawMarker.attemptId ? { attemptId: rawMarker.attemptId } : {}),
+          studioId: stopStudioId,
         }
       );
       if (reclaim.ok && reclaim.turnEpoch) {
@@ -2869,7 +2874,8 @@ async function onStopHandler(options?: { backend?: string }): Promise<void> {
         abandonedAttempts.push(rawMarker.attemptId);
       }
     }
-    rmSync(ownMarkerPath, { force: true });
+    // Round 22: the marker is NOT deleted here — evidence survives until
+    // the terminal stop below is ACKNOWLEDGED.
   } catch {
     // No marker (the normal case) or unreadable — nothing to adjudicate.
   }
@@ -2886,7 +2892,7 @@ async function onStopHandler(options?: { backend?: string }): Promise<void> {
     epochRecord.sessionId === stopSessionId &&
     (epochRecord.wrapperGeneration ?? undefined) === (stopGeneration ?? undefined);
   const stopEpoch = adjudicatedEpoch ?? (recordIsOurs ? epochRecord?.turnEpoch : undefined);
-  await updateRuntimeGenerationState(cwd, config, agentId, 'idle', 'stop', {
+  const stopResult = await updateRuntimeGenerationState(cwd, config, agentId, 'idle', 'stop', {
     ...(stopEpoch
       ? { turnEpoch: stopEpoch }
       : {
@@ -2895,12 +2901,42 @@ async function onStopHandler(options?: { backend?: string }): Promise<void> {
           fenceAttempts: abandonedAttempts,
         }),
   });
-  // Compare-and-delete: only the exact record we sent retires — a record
-  // replaced during the awaited request belongs to its replacer.
-  if (stopSessionId && recordIsOurs && epochRecord != null) {
-    clearCliTurnEpoch(cwd, stopSessionId, {
-      turnEpoch: epochRecord.turnEpoch,
-      wrapperGeneration: epochRecord.wrapperGeneration,
+  if (stopResult.ok) {
+    // The boundary is ACKNOWLEDGED: local evidence retires with it.
+    try {
+      rmSync(ownMarkerPath, { force: true });
+    } catch {
+      // Best-effort.
+    }
+    // Compare-and-delete: only the exact record we sent retires — a record
+    // replaced during the awaited request belongs to its replacer.
+    if (stopSessionId && recordIsOurs && epochRecord != null) {
+      clearCliTurnEpoch(cwd, stopSessionId, {
+        turnEpoch: epochRecord.turnEpoch,
+        wrapperGeneration: epochRecord.wrapperGeneration,
+      });
+    }
+  } else {
+    // Round 22: the stop was NOT acknowledged. A reclaim may have COMMITTED
+    // (row running under adjudicatedEpoch) — persist the epoch record so a
+    // later actor (the wrapper's scope-end finalize, the next stop) can
+    // close it, and keep the marker as evidence. Never delete what the
+    // server has not confirmed.
+    if (adjudicatedEpoch && stopSessionId) {
+      writeCliTurnEpoch(cwd, {
+        sessionId: stopSessionId,
+        turnEpoch: adjudicatedEpoch,
+        ...(stopGeneration ? { wrapperGeneration: stopGeneration } : {}),
+      });
+    }
+    hookLog('on_stop_unacknowledged', {
+      agentId,
+      sessionId: stopSessionId ?? null,
+      adjudicatedEpoch: adjudicatedEpoch ?? null,
+    });
+    sbDebugLog('hooks', 'stop_unacknowledged', {
+      sessionId: stopSessionId,
+      adjudicatedEpoch,
     });
   }
 

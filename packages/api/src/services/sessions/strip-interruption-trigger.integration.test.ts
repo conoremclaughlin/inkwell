@@ -630,6 +630,89 @@ d('session_running_write trigger', () => {
       expect((newerAllowed as unknown as { outcome: string }).outcome).toBe('claimed');
     });
 
+    it('attempt claims are IDEMPOTENT and the fence RECONCILES committed ones (round 22)', async () => {
+      const sessionId = await insertSession({ lifecycle: 'idle', metadata: {} });
+      const markerAt = new Date().toISOString();
+
+      // 1) First claim commits and records the attempt → epoch binding.
+      const { data: first } = await client.rpc('claim_turn_epoch', {
+        p_session_id: sessionId,
+        p_set_running: true,
+        p_not_stopped_after: markerAt,
+        p_attempt: 'attempt-i',
+      } as never);
+      const v1 = first as unknown as { outcome: string; epoch: string };
+      expect(v1.outcome).toBe('claimed');
+
+      // 2) A REPLAY of the same attempt returns the SAME epoch — no
+      // rotation (the round-22 duplicate-claim repro).
+      const { data: replay } = await client.rpc('claim_turn_epoch', {
+        p_session_id: sessionId,
+        p_set_running: true,
+        p_not_stopped_after: markerAt,
+        p_attempt: 'attempt-i',
+      } as never);
+      const v2 = replay as unknown as { outcome: string; epoch: string };
+      expect(v2.outcome).toBe('claimed');
+      expect(v2.epoch).toBe(v1.epoch);
+      expect((await readSession(sessionId)).turn_epoch).toBe(v1.epoch);
+
+      // 3) Commit-then-response-loss: the caller abandons the attempt and
+      // fences it — the fence RECONCILES, closing the committed turn (idle,
+      // marker cleared, tombstone) instead of stranding it running.
+      await client.rpc('fence_turn_attempts', {
+        p_session_id: sessionId,
+        p_attempts: ['attempt-i'],
+      } as never);
+      const { data: closedRow } = await client
+        .from('sessions')
+        .select('lifecycle, cli_turn_at, cli_turn_stopped_at, turn_epoch')
+        .eq('id', sessionId)
+        .single();
+      expect(closedRow!.lifecycle).toBe('idle');
+      expect(closedRow!.cli_turn_at).toBeNull();
+      expect(closedRow!.cli_turn_stopped_at).toEqual(expect.any(String));
+
+      // 4) The fenced attempt's replay is now refused — consumed, not
+      // rotatable.
+      const { data: afterFence } = await client.rpc('claim_turn_epoch', {
+        p_session_id: sessionId,
+        p_set_running: true,
+        p_not_stopped_after: markerAt,
+        p_attempt: 'attempt-i',
+      } as never);
+      expect((afterFence as unknown as { outcome: string }).outcome).toBe('stopped');
+
+      // 5) A replay whose epoch was SUPERSEDED reports stopped, never a
+      // silent re-claim: new attempt claims (rotates), then the old
+      // attempt's replay is refused.
+      const { data: fresh } = await client.rpc('claim_turn_epoch', {
+        p_session_id: sessionId,
+        p_set_running: true,
+        p_attempt: 'attempt-j',
+      } as never);
+      expect((fresh as unknown as { outcome: string }).outcome).toBe('claimed');
+      // attempt-i is fenced; use a THIRD attempt claimed then superseded:
+      const { data: third } = await client.rpc('claim_turn_epoch', {
+        p_session_id: sessionId,
+        p_set_running: true,
+        p_attempt: 'attempt-k',
+      } as never);
+      expect((third as unknown as { outcome: string }).outcome).toBe('claimed');
+      const { data: fourth } = await client.rpc('claim_turn_epoch', {
+        p_session_id: sessionId,
+        p_set_running: true,
+        p_attempt: 'attempt-l',
+      } as never);
+      expect((fourth as unknown as { outcome: string }).outcome).toBe('claimed');
+      const { data: staleReplay } = await client.rpc('claim_turn_epoch', {
+        p_session_id: sessionId,
+        p_set_running: true,
+        p_attempt: 'attempt-k',
+      } as never);
+      expect((staleReplay as unknown as { outcome: string }).outcome).toBe('stopped');
+    });
+
     it('a PATHLESS studio regrants under the canonical backing class (round 16)', async () => {
       // Round 15 refused every unchanged empty-path regrant (the moved-
       // backing recheck compared '' to NULLIF('','')) and locked the wrong

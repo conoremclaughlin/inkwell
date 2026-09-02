@@ -1521,6 +1521,39 @@ describe('stop-time marker adjudication (round 21)', () => {
   });
 });
 
+describe('acknowledged stops and lease-bounded adjudication (round 22)', () => {
+  const loadSource = async () => {
+    const { readFileSync } = await import('fs');
+    const { dirname, join } = await import('path');
+    const { fileURLToPath } = await import('url');
+    return readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'hooks.ts'), 'utf-8');
+  };
+
+  it('the adjudicating reclaim names the STUDIO — the lease boundary applies at stop too', async () => {
+    const source = await loadSource();
+    const stop = source.indexOf('async function onStopHandler(');
+    const studio = source.indexOf('studioId: stopStudioId', stop);
+    expect(studio).toBeGreaterThan(stop);
+  });
+
+  it('local evidence is deleted only after the stop is ACKNOWLEDGED', async () => {
+    const source = await loadSource();
+    const stop = source.indexOf('async function onStopHandler(');
+    const result = source.indexOf('const stopResult = await updateRuntimeGenerationState', stop);
+    const ackBranch = source.indexOf('if (stopResult.ok) {', result);
+    const unlink = source.indexOf('rmSync(ownMarkerPath, { force: true });', ackBranch);
+    const persist = source.indexOf('writeCliTurnEpoch(cwd, {', ackBranch);
+    expect(result).toBeGreaterThan(stop);
+    expect(ackBranch).toBeGreaterThan(result);
+    // The unlink lives INSIDE the acknowledged branch...
+    expect(unlink).toBeGreaterThan(ackBranch);
+    // ...and an unacknowledged stop PERSISTS the committed epoch instead.
+    expect(persist).toBeGreaterThan(ackBranch);
+    // No unlink of the own marker anywhere before the stop result exists.
+    expect(source.slice(stop, result).includes('rmSync(ownMarkerPath')).toBe(false);
+  });
+});
+
 describe('wrapper generation binding (round 18)', () => {
   it('the marker and epoch record both carry INK_RUNTIME_LINK_ID', async () => {
     const { readFileSync } = await import('fs');
