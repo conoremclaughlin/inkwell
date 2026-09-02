@@ -33,6 +33,7 @@ import {
   setCurrentRuntimeSession,
   upsertRuntimeSession,
 } from '../session/runtime.js';
+import { randomUUID } from 'crypto';
 import { sbDebugLog } from '../lib/sb-debug.js';
 import { writeCliTurnEpoch, readCliTurnEpoch, clearCliTurnEpoch } from '../lib/takeover-watcher.js';
 
@@ -779,8 +780,12 @@ async function updateRuntimeGenerationState(
      * instead of treating this stop as a legacy unfenced one.
      */
     turnEpochMissing?: boolean;
-    /** Round 20: fences only this generation's parked reclaims at scope end. */
-    scopeGeneration?: string;
+    /** Round 21: attempt tokens this stop abandons — appended to the fence. */
+    fenceAttempts?: string[];
+    /** Round 21: adjudicating reclaim — the marker's birth time (tombstone CAS). */
+    reclaimOf?: string;
+    /** Round 21: adjudicating reclaim — the marker's attempt token. */
+    attemptId?: string;
     /**
      * Prompt events (round 11): the caller's worktree studio. The server
      * restamps + exact-CAS-touches ITS lease and reports `studioLeaseHeld`;
@@ -817,13 +822,19 @@ async function updateRuntimeGenerationState(
           ...(opts?.headless ? { headless: true } : {}),
           ...(opts?.turnEpoch ? { turnEpoch: opts.turnEpoch } : {}),
           ...(opts?.turnEpochMissing ? { turnEpochMissing: true } : {}),
-          ...(opts?.scopeGeneration ? { scopeGeneration: opts.scopeGeneration } : {}),
+          ...(opts?.fenceAttempts ? { fenceAttempts: opts.fenceAttempts } : {}),
+          ...(opts?.reclaimOf ? { reclaimOf: opts.reclaimOf } : {}),
+          ...(opts?.attemptId ? { attemptId: opts.attemptId } : {}),
           ...(opts?.studioId && opts.studioId !== 'main' ? { studioId: opts.studioId } : {}),
           agentId,
           workingDir: cwd,
         }),
         signal: AbortSignal.timeout(5000),
       });
+      if (resp.status === 409) {
+        // A refused reclaim is authoritative — the turn is over. No retry.
+        return { ok: false };
+      }
       if (resp.ok) {
         // Round 10: a claimed prompt's response carries the fresh epoch —
         // the identity the eventual stop needs to fence its boundary.
@@ -2599,6 +2610,9 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
             sessionId: resolveActivePcpSessionId(cwd),
             agentId,
             at: new Date().toISOString(),
+            // Round 21: a FRESH attempt token — the fence is per attempt,
+            // so abandoning this one never refuses a later prompt.
+            attemptId: randomUUID(),
             // Round 18: bind the marker to the wrapper that spawned this
             // backend — a stale wrapper on the same session must neither
             // claim nor retire a successor's marker.
@@ -2789,16 +2803,6 @@ async function onStopHandler(options?: { backend?: string }): Promise<void> {
   const stdin = await readStdin();
   const cwd = process.cwd();
 
-  // The prompt-generation scope for a pending-takeover marker ends with the
-  // turn: a marker left behind must not let the channel plugin claim/mark
-  // running AFTER the turn finished (PR #563 round 8).
-  try {
-    // Round 20: only OUR OWN generation's marker — a stale backend's stop
-    // must never delete a successor generation's recovery evidence.
-    rmSync(pendingTakeoverMarkerPath(cwd, process.env.INK_RUNTIME_LINK_ID), { force: true });
-  } catch {
-    // Best-effort cleanup.
-  }
   const lifecycleBackend = resolveLifecycleBackend(cwd, options?.backend);
 
   const config = getPcpConfig();
@@ -2832,6 +2836,43 @@ async function onStopHandler(options?: { backend?: string }): Promise<void> {
   // unfenced (fail closed on degraded local state).
   const stopSessionId = resolveActivePcpSessionId(cwd);
   const stopGeneration = process.env.INK_RUNTIME_LINK_ID;
+  // Round 21: ADJUDICATE our own marker HERE, synchronously — fs.watch
+  // delivery is lossy under load and a short turn can end before any
+  // watcher tick, but this hook CAN await. A marker still standing means
+  // the prompt's takeover failed and was never reclaimed: reclaim it now
+  // (the claim's fences arbitrate) and close the turn with the fresh
+  // epoch; a refused attempt is handed to the fence instead.
+  const ownMarkerPath = pendingTakeoverMarkerPath(cwd, stopGeneration);
+  let adjudicatedEpoch: string | undefined;
+  const abandonedAttempts: string[] = [];
+  try {
+    const rawMarker = JSON.parse(readFileSync(ownMarkerPath, 'utf-8')) as {
+      sessionId?: string;
+      at?: string;
+      attemptId?: string;
+    };
+    if (rawMarker.sessionId && rawMarker.sessionId === stopSessionId && rawMarker.at) {
+      const reclaim = await updateRuntimeGenerationState(
+        cwd,
+        config,
+        agentId,
+        'running',
+        'prompt',
+        {
+          reclaimOf: rawMarker.at,
+          ...(rawMarker.attemptId ? { attemptId: rawMarker.attemptId } : {}),
+        }
+      );
+      if (reclaim.ok && reclaim.turnEpoch) {
+        adjudicatedEpoch = reclaim.turnEpoch;
+      } else if (rawMarker.attemptId) {
+        abandonedAttempts.push(rawMarker.attemptId);
+      }
+    }
+    rmSync(ownMarkerPath, { force: true });
+  } catch {
+    // No marker (the normal case) or unreadable — nothing to adjudicate.
+  }
   const epochRecord = readCliTurnEpoch(cwd);
   // Round 19: the record must belong to OUR session AND OUR wrapper
   // generation — a stale backend's on-stop must not send (and then clear) a
@@ -2844,15 +2885,14 @@ async function onStopHandler(options?: { backend?: string }): Promise<void> {
     epochRecord != null &&
     epochRecord.sessionId === stopSessionId &&
     (epochRecord.wrapperGeneration ?? undefined) === (stopGeneration ?? undefined);
-  const stopEpoch = recordIsOurs ? epochRecord?.turnEpoch : undefined;
+  const stopEpoch = adjudicatedEpoch ?? (recordIsOurs ? epochRecord?.turnEpoch : undefined);
   await updateRuntimeGenerationState(cwd, config, agentId, 'idle', 'stop', {
     ...(stopEpoch
       ? { turnEpoch: stopEpoch }
       : {
           turnEpochMissing: true,
-          // Round 20: fence only OUR generation's parked reclaims — an
-          // unscoped tombstone could refuse a coexisting successor's.
-          ...(stopGeneration ? { scopeGeneration: stopGeneration } : {}),
+          // Round 21: fence exactly the attempts this stop abandons.
+          fenceAttempts: abandonedAttempts,
         }),
   });
   // Compare-and-delete: only the exact record we sent retires — a record

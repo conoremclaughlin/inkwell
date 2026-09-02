@@ -560,37 +560,61 @@ d('session_running_write trigger', () => {
       }
     });
 
-    it('the generation fence refuses exactly its own generation, and equality no longer claims (round 20)', async () => {
+    it('the attempt fence preserves every abandoned attempt; legacy tails fence separately (round 21)', async () => {
       const sessionId = await insertSession({ lifecycle: 'running', metadata: {} });
-
-      // 1) Generation fence: stamp gen-a; gen-a's reclaim is refused, a
-      // coexisting gen-b's reclaim (any timestamp, even identical) passes.
-      await client
-        .from('sessions')
-        .update({ cli_turn_fence_generation: 'gen-a' } as never)
-        .eq('id', sessionId);
       const markerAt = new Date().toISOString();
-      const { data: refusedA } = await client.rpc('claim_turn_epoch', {
-        p_session_id: sessionId,
-        p_set_running: true,
-        p_not_stopped_after: markerAt,
-        p_wrapper_generation: 'gen-a',
-      } as never);
-      expect((refusedA as unknown as { outcome: string }).outcome).toBe('stopped');
-      const { data: allowedB } = await client.rpc('claim_turn_epoch', {
-        p_session_id: sessionId,
-        p_set_running: true,
-        p_not_stopped_after: markerAt,
-        p_wrapper_generation: 'gen-b',
-      } as never);
-      expect((allowedB as unknown as { outcome: string }).outcome).toBe('claimed');
 
-      // 2) Strict timestamp fence: a tombstone EQUAL to the marker's birth
-      // time refuses (the <= edge used to claim); strictly older passes.
+      // 1) Append-preserving: fence attempt-a, then attempt-b — BOTH stay
+      // refused (the scalar generation fence lost A on B's overwrite), and
+      // an unfenced attempt-c claims even with identical timestamps.
+      await client.rpc('fence_turn_attempts', {
+        p_session_id: sessionId,
+        p_attempts: ['attempt-a'],
+      } as never);
+      await client.rpc('fence_turn_attempts', {
+        p_session_id: sessionId,
+        p_attempts: ['attempt-b'],
+      } as never);
+      for (const fenced of ['attempt-a', 'attempt-b']) {
+        const { data } = await client.rpc('claim_turn_epoch', {
+          p_session_id: sessionId,
+          p_set_running: true,
+          p_not_stopped_after: markerAt,
+          p_attempt: fenced,
+        } as never);
+        expect((data as unknown as { outcome: string }).outcome).toBe('stopped');
+      }
+      const { data: fresh } = await client.rpc('claim_turn_epoch', {
+        p_session_id: sessionId,
+        p_set_running: true,
+        p_not_stopped_after: markerAt,
+        p_attempt: 'attempt-c',
+      } as never);
+      expect((fresh as unknown as { outcome: string }).outcome).toBe('claimed');
+
+      // 2) Legacy attempt-less reclaims are fenced by the missing-stop
+      // stamp (which fence_turn_attempts also lands) — a marker predating
+      // it refuses, a strictly newer one claims. Modern claims skip that
+      // column entirely (attempt-c above claimed despite the stamp).
+      const { data: legacyOld } = await client.rpc('claim_turn_epoch', {
+        p_session_id: sessionId,
+        p_set_running: true,
+        p_not_stopped_after: markerAt,
+      } as never);
+      expect((legacyOld as unknown as { outcome: string }).outcome).toBe('stopped');
+      const { data: legacyNew } = await client.rpc('claim_turn_epoch', {
+        p_session_id: sessionId,
+        p_set_running: true,
+        p_not_stopped_after: new Date(Date.now() + 60_000).toISOString(),
+      } as never);
+      expect((legacyNew as unknown as { outcome: string }).outcome).toBe('claimed');
+
+      // 3) The REAL-stop timestamp fence: equality refuses, strictly newer
+      // claims (the <= edge used to claim — round 20).
       const stampAt = new Date().toISOString();
       await client
         .from('sessions')
-        .update({ cli_turn_stopped_at: stampAt, cli_turn_fence_generation: null } as never)
+        .update({ cli_turn_stopped_at: stampAt } as never)
         .eq('id', sessionId);
       const { data: equalRefused } = await client.rpc('claim_turn_epoch', {
         p_session_id: sessionId,
@@ -601,7 +625,7 @@ d('session_running_write trigger', () => {
       const { data: newerAllowed } = await client.rpc('claim_turn_epoch', {
         p_session_id: sessionId,
         p_set_running: true,
-        p_not_stopped_after: new Date(Date.parse(stampAt) + 1000).toISOString(),
+        p_not_stopped_after: new Date(Date.parse(stampAt) + 60_000).toISOString(),
       } as never);
       expect((newerAllowed as unknown as { outcome: string }).outcome).toBe('claimed');
     });

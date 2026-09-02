@@ -3549,7 +3549,7 @@ function startSessionTakeoverWatcher(
     // closed with its FENCED stop (a crashed child sends no stop hook); an
     // unclaimed scope stamps the stop tombstone so a claim still parked in
     // the server is refused when it lands.
-    finalizeScope: async (turnEpoch) => {
+    finalizeScope: async (turnEpoch, fenceAttempts) => {
       await postLifecycle({
         sessionId: pcpSessionId,
         lifecycle: 'idle',
@@ -3558,15 +3558,15 @@ function startSessionTakeoverWatcher(
           ? { turnEpoch }
           : {
               turnEpochMissing: true,
-              // Round 20: the fence is OUR GENERATION — it refuses exactly
-              // this generation's parked reclaims, and no timestamp can
-              // collide a successor into it.
-              ...(generation ? { scopeGeneration: generation } : {}),
+              // Round 21: fence exactly the attempts THIS scope tried —
+              // appended server-side, so every abandoned attempt stays
+              // fenced and no later prompt is ever refused.
+              fenceAttempts,
             }),
         agentId: 'wrapper-scope-end',
       });
     },
-    claim: async (markerSessionId, markerAt) => {
+    claim: async (markerSessionId, markerAt, attemptId) => {
       try {
         const serverUrl = getPcpServerUrl();
         const headers: Record<string, string> = { 'Content-Type': 'application/json' };
@@ -3580,9 +3580,10 @@ function startSessionTakeoverWatcher(
             lifecycle: 'running',
             event: 'prompt',
             reclaimOf: markerAt,
-            // Round 20: the reclaim carries OUR generation so the DB fence
-            // can refuse it after our own scope end — and only ours.
-            ...(generation ? { wrapperGeneration: generation } : {}),
+            // Round 21: the reclaim carries its ATTEMPT token so the DB
+            // fence can refuse exactly this attempt after scope end — and
+            // never a later prompt of the same wrapper.
+            ...(attemptId ? { attemptId } : {}),
             // Round 11: the server exact-CAS-touches OUR studio's lease and
             // reports whether it is still held under the reclaimed turn.
             ...(studioId && studioId !== 'main' ? { studioId } : {}),

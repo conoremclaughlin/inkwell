@@ -61,8 +61,8 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         reclaimOf,
         turnEpoch,
         turnEpochMissing,
-        scopeGeneration,
-        wrapperGeneration,
+        fenceAttempts,
+        attemptId,
       } = req.body as {
         sessionId?: string;
         lifecycle?: string;
@@ -113,17 +113,19 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
          */
         turnEpochMissing?: boolean;
         /**
-         * Round 20: the sender's wrapper generation, for a scope-end fence.
-         * Stamped into cli_turn_fence_generation — it refuses exactly that
-         * generation's parked reclaims, with no timestamp involvement, so a
-         * successor generation is untouched at any clock resolution.
+         * Round 21: the ATTEMPT tokens a scope end abandons — appended to
+         * cli_turn_fenced_attempts (every still-possible attempt is
+         * preserved; a scalar fence lost earlier scopes on overwrite). The
+         * missing-stop stamp lands alongside, fencing legacy attempt-less
+         * reclaims.
          */
-        scopeGeneration?: string;
+        fenceAttempts?: string[];
         /**
-         * Round 20: a RECLAIM's own wrapper generation — matched against
-         * cli_turn_fence_generation inside the claim's atomic CAS.
+         * Round 21: a RECLAIM's own attempt token (the marker's attemptId) —
+         * refused inside the claim's atomic CAS iff already fenced. Fresh
+         * per prompt, so one abandoned attempt never refuses a later one.
          */
-        wrapperGeneration?: string;
+        attemptId?: string;
       };
 
       if (!sessionId) {
@@ -272,9 +274,7 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
             ...(reclaimOf ? { p_not_stopped_after: reclaimOf } : {}),
             ...(claimStudioId ? { p_studio_id: claimStudioId } : {}),
             ...(regrant ? { p_regrant: regrant } : {}),
-            ...(typeof wrapperGeneration === 'string' && wrapperGeneration
-              ? { p_wrapper_generation: wrapperGeneration }
-              : {}),
+            ...(typeof attemptId === 'string' && attemptId ? { p_attempt: attemptId } : {}),
           } as never);
         const verdict = (claimed ?? null) as {
           outcome?: string;
@@ -452,31 +452,29 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         // safe (it only refuses RECLAIMS whose marker predates it; live
         // prompts are unconditional), and without it a claim still parked in
         // the server past the wrapper's scope end would land on a dead turn.
-        // Rounds 18–20: the GENERATION fence is the only fence this path
-        // provides — a 200 without it would tell the wrapper its scope end
-        // is safe while its parked claim can still land. The stamp names
-        // the SENDER'S generation, refusing exactly that generation's
-        // reclaims and no one else's (a timestamp cannot distinguish
-        // same-millisecond attempts by coexisting generations, and its
-        // equality edge claimed — round 20). A generation-less modern stop
-        // has no watcher and therefore nothing parked: it stamps nothing.
-        // A refused stamp fails the request so the caller keeps evidence.
-        if (typeof scopeGeneration === 'string' && scopeGeneration) {
-          try {
-            const { error: fenceError } = await dataComposer
-              .getClient()
-              .from('sessions')
-              .update({ cli_turn_fence_generation: scopeGeneration })
-              .eq('id', sessionId);
-            if (fenceError) throw new Error(fenceError.message);
-          } catch (err: unknown) {
-            logger.error('[HookLifecycle] Suppressed-stop generation fence failed', {
-              sessionId,
-              error: err instanceof Error ? err.message : String(err),
-            });
-            res.status(500).json({ success: false, error: 'stop fence failed' });
-            return;
-          }
+        // Rounds 18–21: the ATTEMPT fence is the only fence this path
+        // provides — a 200 without it would tell the caller its scope end
+        // is safe while a parked claim can still land. The abandoned
+        // attempts are APPENDED (every still-possible attempt preserved),
+        // and the missing-stop stamp lands alongside, fencing legacy
+        // attempt-less reclaim tails (the channel plugin's). A refused
+        // stamp fails the request so the caller keeps evidence.
+        try {
+          const attempts = Array.isArray(fenceAttempts)
+            ? fenceAttempts.filter((a): a is string => typeof a === 'string' && a.length > 0)
+            : [];
+          const { error: fenceError } = await dataComposer.getClient().rpc('fence_turn_attempts', {
+            p_session_id: sessionId,
+            p_attempts: attempts,
+          } as never);
+          if (fenceError) throw new Error(fenceError.message);
+        } catch (err: unknown) {
+          logger.error('[HookLifecycle] Suppressed-stop attempt fence failed', {
+            sessionId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          res.status(500).json({ success: false, error: 'stop fence failed' });
+          return;
         }
         try {
           await leaseService.renewBySession(sessionId, session.userId);

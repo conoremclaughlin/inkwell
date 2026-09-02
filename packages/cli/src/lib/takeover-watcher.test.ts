@@ -47,7 +47,7 @@ describe('watchTick', () => {
     expect(outcome).toBe('claimed');
     // The birth time is what the server CASes against the stop tombstone —
     // a claim without it would be unconditional.
-    expect(claim).toHaveBeenCalledWith('s1', at);
+    expect(claim).toHaveBeenCalledWith('s1', at, undefined);
     expect(existsSync(p)).toBe(false);
   });
 
@@ -368,11 +368,11 @@ describe('scope-end wiring (round 17, reachability)', () => {
       'utf-8'
     );
     const helper = source.indexOf('function startSessionTakeoverWatcher(');
-    const finalize = source.indexOf('finalizeScope: async (turnEpoch) => {', helper);
+    const finalize = source.indexOf('finalizeScope: async (turnEpoch, fenceAttempts) => {', helper);
     const fenced = source.indexOf('turnEpochMissing: true,', finalize);
     // Round 20: the fence is the GENERATION, not a timestamp.
-    const scopedGen = source.indexOf('scopeGeneration: generation', finalize);
-    expect(scopedGen).toBeGreaterThan(finalize);
+    const scopedAttempts = source.indexOf('fenceAttempts,', finalize);
+    expect(scopedAttempts).toBeGreaterThan(finalize);
     expect(finalize).toBeGreaterThan(helper);
     expect(fenced).toBeGreaterThan(finalize);
     // Every stop is awaited — the boundary is real, not fire-and-forget.
@@ -474,7 +474,7 @@ describe('event-driven ticks and the stop boundary (round 17)', () => {
     releaseClaim!();
     await stopped;
 
-    expect(finalizeScope).toHaveBeenCalledWith('epoch-crash');
+    expect(finalizeScope).toHaveBeenCalledWith('epoch-crash', []);
   });
 
   it('a scope that NEVER attempted a claim does not finalize — no tombstone to refuse a successor (round 18)', async () => {
@@ -499,7 +499,7 @@ describe('event-driven ticks and the stop boundary (round 17)', () => {
     const finalizeScope = vi.fn(async () => undefined);
     const claim = vi.fn(async () => 'failed' as const);
     const markerAt = new Date().toISOString();
-    const p = write({ sessionId: 's1', at: markerAt });
+    const p = write({ sessionId: 's1', at: markerAt, attemptId: 'attempt-x' });
     const watcher = startTakeoverWatcher({
       cwd: dir,
       expectedSessionId: 's1',
@@ -511,7 +511,8 @@ describe('event-driven ticks and the stop boundary (round 17)', () => {
 
     await watcher.stop();
 
-    expect(finalizeScope).toHaveBeenCalledWith(undefined);
+    // Round 21: the abandoned ATTEMPT rides into the fence.
+    expect(finalizeScope).toHaveBeenCalledWith(undefined, ['attempt-x']);
     // Acknowledged boundary → the marker evidence retires with the scope.
     expect(existsSync(p)).toBe(false);
   });
@@ -672,19 +673,22 @@ describe('per-generation marker files (round 20)', () => {
   it('two coexisting generations both recover — back-to-back writes lose nothing', async () => {
     const claimA = vi.fn(async () => 'ok' as const);
     const claimB = vi.fn(async () => 'ok' as const);
+    // A short polling interval backs up fs.watch — event delivery is lossy
+    // under load (round 21 P1-4), and the fallback cadence is exactly what
+    // covers it in production too.
     const watcherA = startTakeoverWatcher({
       cwd: dir,
       expectedSessionId: 's1',
       generation: 'gen-a',
       claim: claimA,
-      intervalMs: 60_000,
+      intervalMs: 100,
     });
     const watcherB = startTakeoverWatcher({
       cwd: dir,
       expectedSessionId: 's1',
       generation: 'gen-b',
       claim: claimB,
-      intervalMs: 60_000,
+      intervalMs: 100,
     });
 
     // The round-20 repro: A's and B's prompt hooks write back-to-back. With

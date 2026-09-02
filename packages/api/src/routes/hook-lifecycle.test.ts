@@ -565,7 +565,7 @@ describe('hook-lifecycle CLI turn signal', () => {
       expect(releaseGraphClaimsForSession).not.toHaveBeenCalled();
     });
 
-    it('a scope-end fence stamps the SENDER GENERATION, never a timestamp (round 20)', async () => {
+    it('a scope-end fence APPENDS the abandoned attempts, never a timestamp or scalar (round 21)', async () => {
       const resp = await fetch(`${baseUrl}/api/hooks/lifecycle`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: 'Bearer test' },
@@ -574,33 +574,51 @@ describe('hook-lifecycle CLI turn signal', () => {
           lifecycle: 'idle',
           event: 'stop',
           turnEpochMissing: true,
-          scopeGeneration: 'gen-a',
+          fenceAttempts: ['attempt-1', 'attempt-2'],
         }),
       });
       expect(resp.status).toBe(200);
 
-      const stamp = recordedUpdates.find(
-        (u) => u.table === 'sessions' && 'cli_turn_fence_generation' in u.payload
-      )!;
-      expect(stamp).toBeDefined();
-      // The fence refuses exactly gen-a's parked reclaims — a timestamp
-      // cannot distinguish same-millisecond attempts by coexisting
-      // generations, and its equality edge claimed (round 20).
-      expect(stamp.payload).toEqual({ cli_turn_fence_generation: 'gen-a' });
+      const fence = rpcCalls.find((c) => c[0] === 'fence_turn_attempts')!;
+      expect(fence).toBeDefined();
+      expect(fence[1]).toMatchObject({
+        p_session_id: SESSION_ID,
+        p_attempts: ['attempt-1', 'attempt-2'],
+      });
     });
 
-    it('a RECLAIM carries its wrapper generation into the claim CAS (round 20)', async () => {
+    it('a missing stop with NO attempts still stamps the legacy fence (round 21)', async () => {
+      // The channel plugin's attempt-less reclaim tail is fenced by the
+      // missing-stop stamp inside fence_turn_attempts — the RPC must be
+      // called even with an empty list.
+      const resp = await fetch(`${baseUrl}/api/hooks/lifecycle`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer test' },
+        body: JSON.stringify({
+          sessionId: SESSION_ID,
+          lifecycle: 'idle',
+          event: 'stop',
+          turnEpochMissing: true,
+        }),
+      });
+      expect(resp.status).toBe(200);
+      const fence = rpcCalls.find((c) => c[0] === 'fence_turn_attempts')!;
+      expect(fence).toBeDefined();
+      expect(fence[1]).toMatchObject({ p_attempts: [] });
+    });
+
+    it('a RECLAIM carries its ATTEMPT token into the claim CAS (round 21)', async () => {
       await post({
         lifecycle: 'running',
         event: 'prompt',
         reclaimOf: '2026-09-02T03:00:00.000Z',
-        wrapperGeneration: 'gen-a',
+        attemptId: 'attempt-1',
       });
-      expect(rpcCalls[0]![1]).toMatchObject({ p_wrapper_generation: 'gen-a' });
+      expect(rpcCalls[0]![1]).toMatchObject({ p_attempt: 'attempt-1' });
     });
 
-    it('a REFUSED fence stamp fails the suppressed stop — never a 200 without the fence (rounds 18, 20)', async () => {
-      directUpdateError = { message: 'db down' };
+    it('a REFUSED fence stamp fails the suppressed stop — never a 200 without the fence (rounds 18, 21)', async () => {
+      rpcResult = () => ({ data: null, error: { message: 'db down' } });
 
       const resp = await fetch(`${baseUrl}/api/hooks/lifecycle`, {
         method: 'POST',
@@ -610,7 +628,7 @@ describe('hook-lifecycle CLI turn signal', () => {
           lifecycle: 'idle',
           event: 'stop',
           turnEpochMissing: true,
-          scopeGeneration: 'gen-a',
+          fenceAttempts: ['attempt-1'],
         }),
       });
 

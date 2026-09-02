@@ -1379,7 +1379,7 @@ describe('CLI turn-epoch round-trip (round 10)', () => {
     const stop = source.indexOf('async function onStopHandler(');
     const read = source.indexOf('readCliTurnEpoch(cwd)', stop);
     const scoped = source.indexOf(
-      'const stopEpoch = recordIsOurs ? epochRecord?.turnEpoch : undefined;',
+      'const stopEpoch = adjudicatedEpoch ?? (recordIsOurs ? epochRecord?.turnEpoch : undefined);',
       stop
     );
     const sent = source.indexOf('turnEpoch: stopEpoch', stop);
@@ -1460,9 +1460,64 @@ describe('lease acknowledgement and fail-closed degradation (round 11)', () => {
     const stop = source.indexOf('async function onStopHandler(');
     const admit = source.indexOf('turnEpochMissing: true,', stop);
     // Round 20: the missing admission is SCOPED to our own generation.
-    const admitScope = source.indexOf('scopeGeneration: stopGeneration', stop);
+    const admitScope = source.indexOf('fenceAttempts: abandonedAttempts', stop);
     expect(admitScope).toBeGreaterThan(stop);
     expect(admit).toBeGreaterThan(stop);
+  });
+});
+
+describe('stop-time marker adjudication (round 21)', () => {
+  it('the stop RECLAIMS a standing own marker before closing, and fences a refused attempt', async () => {
+    const { readFileSync } = await import('fs');
+    const { dirname, join } = await import('path');
+    const { fileURLToPath } = await import('url');
+    const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'hooks.ts'), 'utf-8');
+    const stop = source.indexOf('async function onStopHandler(');
+    // The adjudication: read own marker → reclaim with its birth time and
+    // attempt token → claimed epoch closes the turn; refused attempt joins
+    // the fence. This is what closes the short-turn escape — fs.watch is
+    // lossy and this hook CAN await.
+    const adjudicate = source.indexOf(
+      'const ownMarkerPath = pendingTakeoverMarkerPath(cwd, stopGeneration);',
+      stop
+    );
+    const reclaim = source.indexOf('reclaimOf: rawMarker.at', adjudicate);
+    const attempt = source.indexOf('attemptId: rawMarker.attemptId', adjudicate);
+    const use = source.indexOf('adjudicatedEpoch = reclaim.turnEpoch', adjudicate);
+    const fence = source.indexOf('abandonedAttempts.push(rawMarker.attemptId)', adjudicate);
+    expect(adjudicate).toBeGreaterThan(stop);
+    expect(reclaim).toBeGreaterThan(adjudicate);
+    expect(attempt).toBeGreaterThan(adjudicate);
+    expect(use).toBeGreaterThan(adjudicate);
+    expect(fence).toBeGreaterThan(adjudicate);
+    // No blind early unlink remains before the adjudication.
+    const early = source.slice(stop, adjudicate);
+    expect(early.includes('rmSync(pendingTakeoverMarkerPath')).toBe(false);
+  });
+
+  it('the marker carries a fresh attempt token', async () => {
+    const { readFileSync } = await import('fs');
+    const { dirname, join } = await import('path');
+    const { fileURLToPath } = await import('url');
+    const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'hooks.ts'), 'utf-8');
+    const marker = source.indexOf(
+      'const markerPath = pendingTakeoverMarkerPath(cwd, process.env.INK_RUNTIME_LINK_ID);'
+    );
+    const token = source.indexOf('attemptId: randomUUID()', marker);
+    expect(marker).toBeGreaterThan(-1);
+    expect(token).toBeGreaterThan(marker);
+  });
+
+  it('a 409 reclaim refusal never retries', async () => {
+    const { readFileSync } = await import('fs');
+    const { dirname, join } = await import('path');
+    const { fileURLToPath } = await import('url');
+    const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'hooks.ts'), 'utf-8');
+    const fn = source.indexOf('async function updateRuntimeGenerationState(');
+    const refuse = source.indexOf('if (resp.status === 409) {', fn);
+    const okBranch = source.indexOf('if (resp.ok) {', fn);
+    expect(refuse).toBeGreaterThan(fn);
+    expect(refuse).toBeLessThan(okBranch);
   });
 });
 

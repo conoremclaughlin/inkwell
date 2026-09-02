@@ -3015,6 +3015,8 @@ export type Database = {
           cli_turn_at: string | null;
           cli_turn_stopped_at: string | null;
           cli_turn_fence_generation: string | null;
+          cli_turn_fenced_attempts: Json;
+          cli_turn_missing_stop_at: string | null;
           turn_epoch: string | null;
           compacting_since: string | null;
           contact_id: string | null;
@@ -3050,6 +3052,8 @@ export type Database = {
           cli_turn_at?: string | null;
           cli_turn_stopped_at?: string | null;
           cli_turn_fence_generation?: string | null;
+          cli_turn_fenced_attempts?: Json;
+          cli_turn_missing_stop_at?: string | null;
           turn_epoch?: string | null;
           compacting_since?: string | null;
           contact_id?: string | null;
@@ -3085,6 +3089,8 @@ export type Database = {
           cli_turn_at?: string | null;
           cli_turn_stopped_at?: string | null;
           cli_turn_fence_generation?: string | null;
+          cli_turn_fenced_attempts?: Json;
+          cli_turn_missing_stop_at?: string | null;
           turn_epoch?: string | null;
           compacting_since?: string | null;
           contact_id?: string | null;
@@ -4597,9 +4603,16 @@ export type Database = {
           p_not_stopped_after?: string;
           p_studio_id?: string;
           p_regrant?: Json;
-          p_wrapper_generation?: string;
+          p_attempt?: string;
         };
         Returns: Json;
+      };
+      fence_turn_attempts: {
+        Args: {
+          p_session_id: string;
+          p_attempts: Json;
+        };
+        Returns: undefined;
       };
       repoint_sessions_off_ephemeral: {
         Args: {

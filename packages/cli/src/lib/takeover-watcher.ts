@@ -121,6 +121,13 @@ interface Marker {
   sessionId?: string | null;
   at?: string;
   /**
+   * Round 21: a FRESH token per marker/prompt. The fence is per attempt —
+   * abandoning one attempt never refuses a later prompt of the same
+   * wrapper, and every abandoned attempt stays fenced (appended, not
+   * overwritten).
+   */
+  attemptId?: string;
+  /**
    * Round 18: the WRAPPER GENERATION (runtimeLinkId) of the backend process
    * whose prompt hook wrote this marker — the hook reads it from the
    * INK_RUNTIME_LINK_ID env the wrapper set on spawn. Two wrappers can serve
@@ -156,7 +163,8 @@ export async function watchTick(opts: {
   expectedGeneration?: string;
   claim: (
     sessionId: string,
-    markerAt: string
+    markerAt: string,
+    attemptId?: string
   ) => Promise<'ok' | 'stopped' | 'unprotected' | 'failed'>;
   now?: number;
 }): Promise<'claimed' | 'stopped' | 'unprotected' | 'skipped' | 'failed'> {
@@ -188,7 +196,7 @@ export async function watchTick(opts: {
     }
     return 'skipped';
   }
-  const verdict = await opts.claim(marker.sessionId, marker.at);
+  const verdict = await opts.claim(marker.sessionId, marker.at, marker.attemptId);
   if (verdict === 'failed') return 'failed';
   // Round 19: COMPARE-and-delete. A successor generation can overwrite the
   // shared marker path while our claim is parked — deleting blindly would
@@ -219,17 +227,19 @@ export function startTakeoverWatcher(opts: {
   expectedSessionId: string;
   claim: (
     sessionId: string,
-    markerAt: string
+    markerAt: string,
+    attemptId?: string
   ) => Promise<'ok' | 'stopped' | 'unprotected' | 'failed'>;
   /**
-   * Round 17: the scope-end boundary. Called from stop() AFTER any in-flight
-   * tick settles: with the claimed epoch when this watcher's claim committed
-   * (the wrapper closes the turn with a FENCED stop — a crashed child sends
-   * no stop hook of its own), or with undefined when nothing was claimed
-   * (the wrapper stamps the stop tombstone so a claim still parked in the
-   * server — e.g. behind a timed-out fetch — is refused when it lands).
+   * Rounds 17–21: the scope-end boundary. Called from stop() AFTER any
+   * in-flight tick settles: with the claimed epoch when this watcher's
+   * claim committed (the wrapper closes the turn with a FENCED stop — a
+   * crashed child sends no stop hook of its own), or with undefined plus
+   * the ATTEMPT TOKENS this scope tried — the server appends them to the
+   * fence so a claim still parked (e.g. behind a timed-out fetch) is
+   * refused when it lands, without ever refusing a different attempt.
    */
-  finalizeScope?: (turnEpoch: string | undefined) => Promise<void>;
+  finalizeScope?: (turnEpoch: string | undefined, fenceAttempts: string[]) => Promise<void>;
   /** Round 18: this wrapper's generation (runtimeLinkId) — see watchTick. */
   generation?: string;
   intervalMs?: number;
@@ -246,15 +256,17 @@ export function startTakeoverWatcher(opts: {
   // never claimed must not stamp a tombstone that could refuse a
   // SUCCESSOR wrapper's older-marker reclaim.
   let attemptedClaim = false;
+  const attemptedIds = new Set<string>();
   const tickOnce = async () => {
     try {
       const outcome = await watchTick({
         markerPath,
         expectedSessionId: opts.expectedSessionId,
         expectedGeneration: opts.generation,
-        claim: (sessionId, markerAt) => {
+        claim: (sessionId, markerAt, attemptId) => {
           attemptedClaim = true;
-          return opts.claim(sessionId, markerAt);
+          if (attemptId) attemptedIds.add(attemptId);
+          return opts.claim(sessionId, markerAt, attemptId);
         },
       });
       if (outcome !== 'skipped') opts.log?.(outcome);
@@ -329,7 +341,10 @@ export function startTakeoverWatcher(opts: {
         // wrapper's reclaim of an OLDER marker (round 18).
         if (claimedEpoch !== undefined || attemptedClaim) {
           try {
-            await opts.finalizeScope(claimedEpoch);
+            await opts.finalizeScope(
+              claimedEpoch,
+              claimedEpoch === undefined ? [...attemptedIds] : []
+            );
             finalized = true;
             if (claimedEpoch) {
               clearCliTurnEpoch(opts.cwd, opts.expectedSessionId, {
