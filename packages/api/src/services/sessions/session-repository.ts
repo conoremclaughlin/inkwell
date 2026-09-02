@@ -135,6 +135,7 @@ function mapDbToSession(row: DbSession): Session {
     type: (metadata.type as SessionType) || 'primary',
     lifecycle: (row.lifecycle as SessionLifecycle) || 'idle',
     status: (row.status as SessionStatus) || 'active',
+    turnEpoch: (row as unknown as { turn_epoch?: string | null }).turn_epoch ?? null,
 
     taskDescription: metadata.taskDescription as string | undefined,
     parentSessionId: metadata.parentSessionId as string | undefined,
@@ -538,6 +539,10 @@ export class SessionRepository implements ISessionRepository {
       dbUpdates.cli_attached = updates.cliAttached;
     }
 
+    if (updates.turnEpoch !== undefined) {
+      (dbUpdates as Record<string, unknown>).turn_epoch = updates.turnEpoch;
+    }
+
     if (updates.alias !== undefined) {
       (dbUpdates as Record<string, unknown>).alias = updates.alias || null;
     }
@@ -620,7 +625,7 @@ export class SessionRepository implements ISessionRepository {
   /**
    * The turn-epoch fenced terminal write (Lumen, PR #563 round 3).
    *
-   * `metadata.turnEpoch` is rotated by the session_running_write DB trigger
+   * The `turn_epoch` COLUMN is rotated by the session_running_write DB trigger
    * every time a session ENTERS `running`, on every write path. Fencing the
    * update on the epoch this turn captured from its own `running` write means
    * the predicate is evaluated atomically with the update by Postgres: a
@@ -640,7 +645,7 @@ export class SessionRepository implements ISessionRepository {
     if (!current) {
       throw new Error(`Session not found: ${id}`);
     }
-    if ((current.metadata as Record<string, unknown> | undefined)?.turnEpoch !== epoch) {
+    if (current.turnEpoch !== epoch) {
       return null;
     }
 
@@ -650,7 +655,7 @@ export class SessionRepository implements ISessionRepository {
       .from('sessions')
       .update(dbUpdates)
       .eq('id', id)
-      .eq('metadata->>turnEpoch', epoch)
+      .eq('turn_epoch', epoch)
       .select();
 
     if (error) {

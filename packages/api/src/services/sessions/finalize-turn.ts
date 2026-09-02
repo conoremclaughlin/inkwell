@@ -40,7 +40,7 @@ export type FinalizeTurnOutcome = 'finalized' | 'refused' | 'gone' | 'exhausted'
  *
  * The token is only the in-process fast path: it stops WASTED retries. The
  * actual fence is the turn-epoch CAS inside the attempt itself — the DB
- * rotates `metadata.turnEpoch` whenever any writer moves the session into
+ * rotates the `turn_epoch` column whenever any writer moves the session into
  * `running`, and the fenced write matches zero rows once ownership changed,
  * including writes already in flight when the new turn arrived. An attempt
  * that loses the fence throws TurnSupersededError and the loop stands down.

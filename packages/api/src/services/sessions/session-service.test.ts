@@ -228,12 +228,13 @@ describe('SessionService', () => {
   describe('finalization failure is bookkeeping, not turn failure', () => {
     function makeStatefulRepo(initial: Partial<Session> = {}) {
       let row: Session | null = createMockSession({ metadata: {}, ...initial });
-      const fail = { finalize: 0, running: 0, commitThenRejectRunning: 0 };
+      const fail = { finalize: 0, running: 0, commitThenRejectRunning: 0, findById: 0 };
       // One-shot gates: hold exactly the NEXT fenced write (or running write)
       // open mid-flight — the Postgres-side "in flight when ownership
       // changes" window.
       let gateOnce: Promise<void> | null = null;
       let runningGateOnce: Promise<void> | null = null;
+      let findGateOnce: Promise<void> | null = null;
 
       const merge = (updates: Record<string, unknown>): Session => {
         const metadata = {
@@ -245,7 +246,18 @@ describe('SessionService', () => {
       };
 
       const repo = {
-        findById: vi.fn(async () => row),
+        findById: vi.fn(async () => {
+          if (findGateOnce) {
+            const gate = findGateOnce;
+            findGateOnce = null;
+            await gate;
+          }
+          if (fail.findById > 0) {
+            fail.findById -= 1;
+            throw new Error('fetch failed');
+          }
+          return row;
+        }),
         findByUserAndAgent: vi.fn(async () => row),
         findByUser: vi.fn(async () => (row ? [row] : [])),
         create: vi.fn(async () => row),
@@ -284,7 +296,7 @@ describe('SessionService', () => {
               await gate;
             }
             if (!row) throw new Error(`Session not found: ${id}`);
-            if ((row.metadata as Record<string, unknown>).turnEpoch !== epoch) return null;
+            if ((row as { turnEpoch?: string | null }).turnEpoch !== epoch) return null;
             return merge(updates);
           }
         ),
@@ -309,6 +321,9 @@ describe('SessionService', () => {
         },
         holdNextRunningWrite: (gate: Promise<void>) => {
           runningGateOnce = gate;
+        },
+        holdNextFindById: (gate: Promise<void>) => {
+          findGateOnce = gate;
         },
       };
     }
@@ -530,6 +545,64 @@ describe('SessionService', () => {
     });
 
     /**
+     * Round 5 (Lumen): an unreadable reconcile is NOT 'not committed'.
+     * Handing the session back while our committed epoch owns the row left a
+     * zombie no actor would ever recover. On unknown: proceed, and let the
+     * fence arbitrate — which also means the previous turn's recovery is NOT
+     * superseded on unconfirmed ownership.
+     */
+    it('proceeds unconfirmed when the takeover cannot be verified either way', async () => {
+      const db = makeStatefulRepo();
+      db.fail.commitThenRejectRunning = 3; // commits, but every response fails
+      db.fail.findById = 1; // ...and the reconcile read fails too
+      const service = makeStatefulService(db.repo);
+
+      const result = await service.handleMessage(createMockRequest());
+
+      // The write actually committed, so the fence lets our terminal write
+      // land and the turn completes normally.
+      expect(result.success).toBe(true);
+      expect(db.row?.lifecycle).toBe('idle');
+      expect(activeRunCount()).toBe(0);
+    });
+
+    /**
+     * Round 5 (Lumen): the lease/graph boundary effects are session-wide —
+     * they get the same ownership gate as the registry clear. A's late
+     * boundary must not run once B owns the row.
+     */
+    it('skips boundary effects when a newer turn owns the session', async () => {
+      const { logger } = await import('../../utils/logger.js');
+      const db = makeStatefulRepo();
+      db.fail.finalize = 1; // A's inline finalize fails; retry pending
+      const service = makeStatefulService(db.repo);
+
+      await service.handleMessage(createMockRequest()); // turn A
+
+      // Park A's post-finalize ownership read, so B can land in between.
+      let releaseBoundaryRead!: () => void;
+      const advance = vi.advanceTimersByTimeAsync(6_000); // A's retry finalizes
+      await Promise.resolve();
+      db.holdNextFindById(
+        new Promise<void>((resolve) => {
+          releaseBoundaryRead = resolve;
+        })
+      );
+      await advance;
+
+      // B takes over and completes while A's boundary read is parked.
+      const b = await service.handleMessage(createMockRequest());
+      expect(b.success).toBe(true);
+
+      releaseBoundaryRead();
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(vi.mocked(logger.warn).mock.calls.map((c) => c[0])).toContain(
+        'Skipping boundary effects; a newer turn owns the session'
+      );
+    });
+
+    /**
      * Interleaving Y (Lumen round 3): A's fenced write is already in flight
      * when B takes ownership. No token can stop a write on the wire — the
      * epoch CAS evaluated at write time is what makes it match zero rows.
@@ -556,14 +629,14 @@ describe('SessionService', () => {
       expect(b.success).toBe(true);
       expect(db.row?.lifecycle).toBe('idle');
       expect(activeRunCount()).toBe(0);
-      const epochAfterB = (db.row?.metadata as Record<string, unknown>).turnEpoch;
+      const epochAfterB = db.row?.turnEpoch;
 
       // A's write lands — against B's epoch. Zero rows; nothing changes.
       releaseInFlight();
       await vi.advanceTimersByTimeAsync(1_000);
 
       expect(db.row?.lifecycle).toBe('idle');
-      expect((db.row?.metadata as Record<string, unknown>).turnEpoch).toBe(epochAfterB);
+      expect(db.row?.turnEpoch).toBe(epochAfterB);
       // Call order: A-inline (failed), A-retry (parked — this one), B-inline.
       // Results index by call START, so A's in-flight write is slot 1, and it
       // must have resolved null: zero rows, fence held.
@@ -1537,8 +1610,10 @@ describe('SessionService', () => {
       expect(result.success).toBe(true);
       // Token usage should still be recorded
       expect(mockRepository.updateTokenUsage).toHaveBeenCalled();
-      // But compaction should NOT be triggered — native backends manage their own context
-      expect(mockRepository.findById).not.toHaveBeenCalled();
+      // But compaction should NOT be triggered — native backends manage their
+      // own context. Asserted directly on the compaction lock: findById is no
+      // longer a usable proxy, since the post-finalize boundary ownership
+      // gate legitimately reads the session once (PR #563 round 5).
       expect(mockRepository.tryAcquireCompactionLock).not.toHaveBeenCalled();
     });
 

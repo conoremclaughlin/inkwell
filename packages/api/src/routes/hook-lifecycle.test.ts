@@ -214,7 +214,7 @@ describe('hook-lifecycle CLI turn signal', () => {
       await post({ lifecycle: 'running', event: 'prompt' });
       expect(rpcCalls).toHaveLength(1);
       expect(rpcCalls[0]![0]).toBe('claim_turn_epoch');
-      expect(rpcCalls[0]![1]).toMatchObject({ p_session_id: SESSION_ID });
+      expect(rpcCalls[0]![1]).toMatchObject({ p_session_id: SESSION_ID, p_set_running: true });
     });
 
     it('does not claim on stop or attach-only requests', async () => {

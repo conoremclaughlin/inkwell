@@ -107,7 +107,12 @@ export interface InterruptOutcome {
  * error, so an unchecked write on a missing session would be reported as
  * successful bookkeeping that never happened.
  */
-async function writeBreadcrumb(client: any, sessionId: string, reason: string): Promise<boolean> {
+async function writeBreadcrumb(
+  client: any,
+  sessionId: string,
+  reason: string,
+  turnEpoch?: string
+): Promise<boolean> {
   const { data: fresh, error: readError } = await client
     .from('sessions')
     .select('metadata')
@@ -122,7 +127,10 @@ async function writeBreadcrumb(client: any, sessionId: string, reason: string): 
     return false;
   }
 
-  const { data, error } = await client
+  // Fenced like every other per-turn write (round 5): this rebuilds the
+  // whole metadata blob, and landing it on a row a newer owner holds would
+  // erase THEIR metadata. Zero rows → not marked, honestly.
+  let breadcrumbWrite = client
     .from('sessions')
     .update({
       metadata: {
@@ -131,8 +139,11 @@ async function writeBreadcrumb(client: any, sessionId: string, reason: string): 
         interruptedReason: reason,
       },
     })
-    .eq('id', sessionId)
-    .select('id');
+    .eq('id', sessionId);
+  if (turnEpoch !== undefined) {
+    breadcrumbWrite = breadcrumbWrite.eq('turn_epoch', turnEpoch);
+  }
+  const { data, error } = await breadcrumbWrite.select('id');
 
   if (error) {
     logger.error('[Shutdown] Failed to record interruption breadcrumb', {
@@ -284,7 +295,7 @@ async function transitionSession(
     if (isAlreadyTerminal(existing)) {
       return {
         state: 'finalized-elsewhere',
-        marked: await writeBreadcrumb(client, sessionId, reason),
+        marked: await writeBreadcrumb(client, sessionId, reason, turnEpoch),
       };
     }
 
@@ -307,7 +318,7 @@ async function transitionSession(
       .eq('lifecycle', 'running')
       .is('ended_at', null);
     if (turnEpoch !== undefined) {
-      write = write.eq('metadata->>turnEpoch', turnEpoch);
+      write = write.eq('turn_epoch', turnEpoch);
     }
     const { data: changed, error } = await write.select('id');
 
@@ -326,7 +337,7 @@ async function transitionSession(
       // #490 round 3).
       const { data: after, error: recheckError } = await client
         .from('sessions')
-        .select('lifecycle, ended_at, metadata')
+        .select('lifecycle, ended_at, turn_epoch')
         .eq('id', sessionId)
         .maybeSingle();
 
@@ -339,7 +350,7 @@ async function transitionSession(
       }
 
       if (after.lifecycle === 'running' && !after.ended_at) {
-        const rowEpoch = ((after.metadata as Record<string, unknown>) || {})['turnEpoch'];
+        const rowEpoch = (after as { turn_epoch?: string | null }).turn_epoch;
         if (turnEpoch !== undefined && rowEpoch !== turnEpoch) {
           // A newer owner — possibly another process — holds the row. Their
           // state is not ours to touch or to report on (round 4).
@@ -362,7 +373,7 @@ async function transitionSession(
       });
       return {
         state: 'finalized-elsewhere',
-        marked: await writeBreadcrumb(client, sessionId, reason),
+        marked: await writeBreadcrumb(client, sessionId, reason, turnEpoch),
       };
     }
 

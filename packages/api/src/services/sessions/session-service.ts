@@ -1743,7 +1743,7 @@ export class SessionService implements ISessionService {
           await trackStateWrite(
             this.repository.update(session.id, {
               lifecycle: 'running',
-              metadata: { turnEpoch },
+              turnEpoch,
             })
           );
           tookOwnership = true;
@@ -1759,25 +1759,44 @@ export class SessionService implements ISessionService {
           });
         }
       }
+      let ownershipConfirmed = tookOwnership;
       if (!tookOwnership) {
-        const committed = await this.repository
+        // Reconcile by reading: 'committed' and 'not-committed' are answers;
+        // an unreadable row is NOT 'not-committed' (Lumen round 5 — mapping
+        // read failure to false handed the session back while B's committed
+        // epoch owned the row, and nothing anywhere would ever run for it).
+        const verdict = await this.repository
           .findById(session.id)
-          .then(
-            (row) =>
-              row?.lifecycle === 'running' &&
-              (row.metadata as Record<string, unknown> | undefined)?.turnEpoch === turnEpoch
+          .then((row) =>
+            row?.lifecycle === 'running' && row.turnEpoch === turnEpoch
+              ? ('committed' as const)
+              : ('not-committed' as const)
           )
-          .catch(() => false);
-        if (committed) {
+          .catch(() => 'unknown' as const);
+
+        if (verdict === 'committed') {
           logger.warn('Running write committed despite rejected responses; proceeding', {
             sessionId: session.id,
           });
           tookOwnership = true;
+          ownershipConfirmed = true;
+        } else if (verdict === 'unknown') {
+          // Proceed WITHOUT superseding: the epoch fence arbitrates. If our
+          // write committed, the previous turn's next fenced attempt matches
+          // zero rows and stands down on its own; if it did not, our own
+          // terminal writes are the ones that fence out. Either way there is
+          // a live actor for whichever epoch the row actually carries —
+          // handing back here is what created the zombie.
+          logger.error('Running write and reconcile read both failed; proceeding unconfirmed', {
+            sessionId: session.id,
+          });
+          tookOwnership = true;
+          ownershipConfirmed = false;
         }
       }
       if (!tookOwnership) {
-        // This turn never took ownership: the row still belongs to whatever
-        // came before. Restore the previous registration ONLY if its recovery
+        // The row provably does not carry this turn: ownership never
+        // transferred. Restore the previous registration ONLY if its recovery
         // is still pending — restoring a turn that already finalized would
         // resurrect a ghost entry for a recorded turn (round 4). Otherwise
         // clear OUR entry, compare-and-act on our own candidate.
@@ -1790,12 +1809,18 @@ export class SessionService implements ISessionService {
           ? lastError
           : new Error('Running write failed and the row does not carry this turn');
       }
-    }
 
-    // Ownership durably transferred — the row carries this turn's candidate,
-    // so the previous turn's fenced finalize can no longer land. Superseding
-    // its loop now only stops wasted retries; the epoch is the actual fence.
-    supersedePendingFinalization(session.id);
+      // Superseding is reserved for CONFIRMED ownership. On an unconfirmed
+      // takeover the previous turn's recovery stays alive and the fence
+      // decides which of the two writers the row still belongs to.
+      if (ownershipConfirmed) {
+        // Ownership durably transferred — the row carries this turn's
+        // candidate, so the previous turn's fenced finalize can no longer
+        // land. Superseding its loop now only stops wasted retries; the
+        // epoch is the actual fence.
+        supersedePendingFinalization(session.id);
+      }
+    }
 
     // Every terminal write for THIS turn goes through the epoch fence: zero
     // rows means a newer owner holds the row and the write must not land.
@@ -2005,34 +2030,53 @@ export class SessionService implements ISessionService {
       // epoch: if a newer turn registered over us while our late write landed
       // (it can only land while the row was still ours), its entry survives.
       clearActiveRun(session.id, turnEpoch);
-      // The run boundary is the real terminal edge for lease release: a
-      // release requested mid-turn (end_session from inside the run) was
-      // deferred so no other thread could enter the worktree while this
-      // process was still cd'd into it. Now that the run is durably finished,
-      // release if the session ended. Fire-and-forget — release must never
-      // delay response routing.
-      void this.releaseLeaseIfSessionTerminal(session.id);
-      // Graph claims are turn-scoped: for a server-spawned session the run
-      // IS the turn, so its claims return to the pool at this boundary
-      // (spec v10; the sweep remains the crash backstop). Fire-and-forget
-      // with the boundary instant captured HERE — the real finalization
-      // instant, even when finalization lands minutes late — so a delayed
-      // release can never touch claims a later run acquires (Lumen round 3
-      // P1).
-      if (this.supabase) {
-        const boundaryAt = new Date().toISOString();
-        void releaseGraphClaimsForSession(
-          this.supabase,
-          session.id,
-          'run-completed',
-          boundaryAt
-        ).catch((err: unknown) => {
-          logger.warn('Graph boundary release failed at run completion', {
+      // The lease/graph boundary effects are SESSION-wide, so they get the
+      // same ownership gate as everything else (Lumen round 5): if a newer
+      // turn has taken the row between our fenced write landing and this
+      // callback running, these boundaries are the new turn's to run, not
+      // ours — a late release here could drop a lease or claims the new turn
+      // already holds. One read; the residual is the round-trip, and both
+      // helpers additionally scope by instant/terminality on their own.
+      void (async () => {
+        const stillOurs = await this.repository
+          .findById(session.id)
+          .then((row) => row?.turnEpoch === turnEpoch)
+          .catch(() => false);
+        if (!stillOurs) {
+          logger.warn('Skipping boundary effects; a newer turn owns the session', {
             sessionId: session.id,
-            error: err instanceof Error ? err.message : String(err),
           });
-        });
-      }
+          return;
+        }
+        // The run boundary is the real terminal edge for lease release: a
+        // release requested mid-turn (end_session from inside the run) was
+        // deferred so no other thread could enter the worktree while this
+        // process was still cd'd into it. Now that the run is durably
+        // finished, release if the session ended. Fire-and-forget — release
+        // must never delay response routing.
+        void this.releaseLeaseIfSessionTerminal(session.id);
+        // Graph claims are turn-scoped: for a server-spawned session the run
+        // IS the turn, so its claims return to the pool at this boundary
+        // (spec v10; the sweep remains the crash backstop). Fire-and-forget
+        // with the boundary instant captured HERE — the real finalization
+        // instant, even when finalization lands minutes late — so a delayed
+        // release can never touch claims a later run acquires (Lumen round 3
+        // P1).
+        if (this.supabase) {
+          const boundaryAt = new Date().toISOString();
+          void releaseGraphClaimsForSession(
+            this.supabase,
+            session.id,
+            'run-completed',
+            boundaryAt
+          ).catch((err: unknown) => {
+            logger.warn('Graph boundary release failed at run completion', {
+              sessionId: session.id,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          });
+        }
+      })();
     };
 
     let finalized = false;

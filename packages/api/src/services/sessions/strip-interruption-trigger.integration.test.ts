@@ -73,12 +73,14 @@ d('session_running_write trigger', () => {
     return id;
   }
 
-  async function readSession(
-    id: string
-  ): Promise<{ lifecycle: string | null; metadata: Record<string, unknown> }> {
+  async function readSession(id: string): Promise<{
+    lifecycle: string | null;
+    metadata: Record<string, unknown>;
+    turn_epoch: string | null;
+  }> {
     const { data, error } = await client
       .from('sessions')
-      .select('lifecycle, metadata')
+      .select('lifecycle, metadata, turn_epoch')
       .eq('id', id)
       .single();
     expect(error).toBeNull();
@@ -169,15 +171,15 @@ d('session_running_write trigger', () => {
   describe('turn epoch', () => {
     it('is minted when a session enters running, on insert or update', async () => {
       const born = await readSession(await insertSession({ lifecycle: 'running', metadata: {} }));
-      expect(born.metadata.turnEpoch).toEqual(expect.any(String));
+      expect(born.turn_epoch).toEqual(expect.any(String));
 
       const idleId = await insertSession({ lifecycle: 'idle', metadata: {} });
-      expect((await readSession(idleId)).metadata).not.toHaveProperty('turnEpoch');
+      expect((await readSession(idleId)).turn_epoch).toBeNull();
       await client
         .from('sessions')
         .update({ lifecycle: 'running' } as never)
         .eq('id', idleId);
-      expect((await readSession(idleId)).metadata.turnEpoch).toEqual(expect.any(String));
+      expect((await readSession(idleId)).turn_epoch).toEqual(expect.any(String));
     });
 
     it('a caller candidate is AUTHORITATIVE — the trigger never overrides it', async () => {
@@ -187,10 +189,31 @@ d('session_running_write trigger', () => {
       const id = await insertSession({ lifecycle: 'idle', metadata: {} });
       await client
         .from('sessions')
-        .update({ lifecycle: 'running', metadata: { turnEpoch: 'caller-candidate' } } as never)
+        .update({ lifecycle: 'running', turn_epoch: 'caller-candidate' } as never)
         .eq('id', id);
 
-      expect((await readSession(id)).metadata.turnEpoch).toBe('caller-candidate');
+      expect((await readSession(id)).turn_epoch).toBe('caller-candidate');
+    });
+
+    it('claim with p_set_running takes over atomically: epoch + lifecycle + marker', async () => {
+      // Round 5: a claim must not be able to succeed while the lifecycle
+      // write fails — ownership, running state, and the CLI turn marker move
+      // in ONE statement.
+      const id = await insertSession({ lifecycle: 'idle', metadata: {} });
+      const { data: claimed, error } = await client.rpc('claim_turn_epoch', {
+        p_session_id: id,
+        p_set_running: true,
+      } as never);
+      expect(error).toBeNull();
+
+      const { data: after } = await client
+        .from('sessions')
+        .select('lifecycle, turn_epoch, cli_turn_at')
+        .eq('id', id)
+        .single();
+      expect(after!.lifecycle).toBe('running');
+      expect(after!.turn_epoch).toBe(claimed);
+      expect(after!.cli_turn_at).toEqual(expect.any(String));
     });
 
     it('claim_turn_epoch rotates a running → running row atomically', async () => {
@@ -199,7 +222,7 @@ d('session_running_write trigger', () => {
       // ownership primitive for that path — and it must rotate even though
       // the row never leaves running.
       const id = await insertSession({ lifecycle: 'running', metadata: {} });
-      const before = (await readSession(id)).metadata.turnEpoch as string;
+      const before = (await readSession(id)).turn_epoch as string;
 
       const { data: claimed, error } = await client.rpc('claim_turn_epoch', {
         p_session_id: id,
@@ -207,19 +230,19 @@ d('session_running_write trigger', () => {
       expect(error).toBeNull();
       expect(claimed).toEqual(expect.any(String));
       expect(claimed).not.toBe(before);
-      expect((await readSession(id)).metadata.turnEpoch).toBe(claimed);
+      expect((await readSession(id)).turn_epoch).toBe(claimed);
     });
 
     it('is preserved across running → running writes — same owner, same series', async () => {
       const id = await insertSession({ lifecycle: 'running', metadata: {} });
-      const first = (await readSession(id)).metadata.turnEpoch;
+      const first = (await readSession(id)).turn_epoch;
 
       await client
         .from('sessions')
-        .update({ lifecycle: 'running', metadata: { turnEpoch: first, note: 'prompt 2' } } as never)
+        .update({ lifecycle: 'running', metadata: { note: 'prompt 2' } } as never)
         .eq('id', id);
 
-      expect((await readSession(id)).metadata.turnEpoch).toBe(first);
+      expect((await readSession(id)).turn_epoch).toBe(first);
     });
 
     it('fences the real repository finalize: stale epoch matches zero rows', async () => {
@@ -227,7 +250,7 @@ d('session_running_write trigger', () => {
       const repository = new SessionRepository(client);
 
       const id = await insertSession({ lifecycle: 'running', metadata: {} });
-      const epoch = (await readSession(id)).metadata.turnEpoch as string;
+      const epoch = (await readSession(id)).turn_epoch as string;
 
       // A newer owner takes over via the claim primitive — running →
       // running, the CLI-prompt shape (candidates are never overridden, so
@@ -244,7 +267,7 @@ d('session_running_write trigger', () => {
       expect(after.lifecycle).toBe('running');
 
       // The current owner's finalize lands.
-      const current = after.metadata.turnEpoch as string;
+      const current = after.turn_epoch as string;
       const applied = await repository.updateIfTurnEpoch(id, current, { lifecycle: 'idle' });
       expect(applied?.lifecycle).toBe('idle');
       expect((await readSession(id)).lifecycle).toBe('idle');
@@ -266,7 +289,7 @@ d('session_running_write trigger', () => {
         const repository = new SessionRepository(client);
 
         const id = await insertSession({ lifecycle: 'running', metadata: {} });
-        const epoch = (await readSession(id)).metadata.turnEpoch as string;
+        const epoch = (await readSession(id)).turn_epoch as string;
 
         const { Client } = await import('pg');
         const holder = new Client({ connectionString: DB_URL });

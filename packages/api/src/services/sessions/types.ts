@@ -182,6 +182,15 @@ export interface Session {
   // Whether a CLI process with a channel plugin is attached to this session
   cliAttached?: boolean;
 
+  /**
+   * Ownership generation for the current turn (PR #563 rounds 3–5). A real
+   * COLUMN, not metadata: read-modify-write metadata rebuilds must never be
+   * able to replay a stale epoch over a newer owner. Rotated by the caller's
+   * candidate on takeover (trigger fills only when absent) or by the
+   * claim_turn_epoch RPC; every terminal write CASes on it.
+   */
+  turnEpoch?: string | null;
+
   // Flexible metadata
   metadata: Record<string, unknown>;
 }
@@ -553,7 +562,7 @@ export interface ISessionRepository {
 
   /**
    * Turn-epoch fenced terminal write: applies `updates` only while
-   * `metadata.turnEpoch` still equals `epoch` (rotated by the DB whenever a
+   * `turn_epoch` still equals `epoch` (a real column — rotated whenever a
    * session enters `running`). Returns null when ownership was lost; throws
    * `Session not found:` when the row is gone. Optional so legacy mocks keep
    * working — the real repository always provides it, and the service falls

@@ -160,9 +160,13 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
       // Claimed BEFORE the lifecycle write so a failure here fails the whole
       // prompt visibly instead of leaving an unfenced takeover.
       if (isPromptEvent) {
+        // Rounds 4–5: claim_turn_epoch(p_set_running) is ONE statement —
+        // fresh epoch, lifecycle=running, and the turn marker together. A
+        // claim can no longer succeed while the lifecycle write fails, which
+        // would have stolen ownership with no running state behind it.
         const { error: claimError } = await dataComposer
           .getClient()
-          .rpc('claim_turn_epoch', { p_session_id: sessionId } as never);
+          .rpc('claim_turn_epoch', { p_session_id: sessionId, p_set_running: true } as never);
         if (claimError) {
           logger.error('[HookLifecycle] Turn-epoch claim failed; refusing prompt takeover', {
             sessionId,

@@ -789,7 +789,7 @@ describe('interruptActiveRuns', () => {
       };
 
       await interruptActiveRuns(client, [run({ threadKey: undefined, turnEpoch: 'epoch-a' })]);
-      expect(filters).toContainEqual(['metadata->>turnEpoch', 'epoch-a']);
+      expect(filters).toContainEqual(['turn_epoch', 'epoch-a']);
     });
 
     it('classifies an epoch mismatch on the recheck as finalized-elsewhere, not unknown', async () => {
