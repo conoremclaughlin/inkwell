@@ -1532,8 +1532,12 @@ describe('acknowledged stops and lease-bounded adjudication (round 22)', () => {
   it('the adjudicating reclaim names the STUDIO — the lease boundary applies at stop too', async () => {
     const source = await loadSource();
     const stop = source.indexOf('async function onStopHandler(');
-    const studio = source.indexOf('studioId: stopStudioId', stop);
-    expect(studio).toBeGreaterThan(stop);
+    // The destructure alone is not the fence — the studio must be PASSED
+    // into the reclaim (the second occurrence, inside the opts object).
+    const destructure = source.indexOf('studioId: stopStudioId', stop);
+    const passed = source.indexOf('studioId: stopStudioId', destructure + 1);
+    expect(destructure).toBeGreaterThan(stop);
+    expect(passed).toBeGreaterThan(destructure);
   });
 
   it('local evidence is deleted only after the stop is ACKNOWLEDGED', async () => {
