@@ -49,15 +49,20 @@ export interface CliTurnEpochRecord {
 export function writeCliTurnEpoch(
   cwd: string,
   record: { sessionId: string; turnEpoch: string }
-): void {
+): boolean {
   try {
     mkdirSync(join(cwd, '.ink'), { recursive: true });
     writeFileSync(
       cliTurnEpochPath(cwd),
       JSON.stringify({ ...record, at: new Date().toISOString() })
     );
+    return true;
   } catch {
-    // Best-effort: without the record the stop releases unfenced (legacy).
+    // Round 11: NOT silently best-effort — the caller must know. A lost
+    // record does not downgrade to legacy behavior: the modern stop sends
+    // `turnEpochMissing` and the server suppresses destructive boundary
+    // effects (fail closed) instead of releasing unfenced.
+    return false;
   }
 }
 

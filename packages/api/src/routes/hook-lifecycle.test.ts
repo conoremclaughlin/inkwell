@@ -32,38 +32,64 @@ import { releaseGraphClaimsForSession } from '../services/graph-executor.service
 import type { DataComposer } from '../data/composer';
 
 // Minimal fake supabase for the StudioLeaseService the route constructs —
-// empty tables make lease renewals/releases clean no-ops.
+// empty tables make lease renewals/releases clean no-ops. Direct table
+// UPDATEs (the round-11 fenced stop CAS) are recorded with their filters and
+// resolve with a matched row unless a test flips `fencedUpdateMatches`.
+interface RecordedUpdate {
+  table: string;
+  payload: Record<string, unknown>;
+  eqs: Array<[string, unknown]>;
+}
+const recordedUpdates: RecordedUpdate[] = [];
+let fencedUpdateMatches = true;
+
 function makeFakeClient() {
-  const empty = {
-    eq() {
-      return this;
-    },
-    is() {
-      return this;
-    },
-    not() {
-      return this;
-    },
-    limit() {
-      return this;
-    },
-    order() {
-      return this;
-    },
-    select() {
-      return this;
-    },
-    maybeSingle: () => Promise.resolve({ data: null, error: null }),
-    single: () => Promise.resolve({ data: null, error: { code: 'PGRST116', message: 'none' } }),
-    then<T>(resolve: (v: { data: never[]; error: null }) => T) {
-      return Promise.resolve({ data: [] as never[], error: null }).then(resolve);
-    },
+  const chain = (table: string, mode: 'select' | 'update' | 'insert', payload?: unknown) => {
+    const eqs: Array<[string, unknown]> = [];
+    const obj = {
+      eq(col: string, val: unknown) {
+        eqs.push([col, val]);
+        return obj;
+      },
+      is() {
+        return obj;
+      },
+      not() {
+        return obj;
+      },
+      limit() {
+        return obj;
+      },
+      order() {
+        return obj;
+      },
+      select() {
+        return obj;
+      },
+      maybeSingle: () => Promise.resolve({ data: null, error: null }),
+      single: () => Promise.resolve({ data: null, error: { code: 'PGRST116', message: 'none' } }),
+      then<T>(resolve: (v: { data: unknown; error: null }) => T) {
+        if (mode === 'update') {
+          recordedUpdates.push({
+            table,
+            payload: (payload ?? {}) as Record<string, unknown>,
+            eqs,
+          });
+          return Promise.resolve({
+            data: fencedUpdateMatches ? [{ id: SESSION_ID }] : [],
+            error: null,
+          }).then(resolve);
+        }
+        return Promise.resolve({ data: [] as never[], error: null }).then(resolve);
+      },
+    };
+    return obj;
   };
   return {
-    from: () => ({
-      select: () => ({ ...empty }),
-      update: () => ({ ...empty }),
-      insert: () => ({ ...empty }),
+    from: (table: string) => ({
+      select: () => chain(table, 'select'),
+      update: (payload: unknown) => chain(table, 'update', payload),
+      insert: () => chain(table, 'insert'),
     }),
     rpc: (...args: unknown[]) => {
       rpcCalls.push(args);
@@ -122,6 +148,8 @@ describe('hook-lifecycle CLI turn signal', () => {
     getSession.mockClear();
     rpcCalls.length = 0;
     rpcResult = () => ({ data: 'epoch-1', error: null });
+    recordedUpdates.length = 0;
+    fencedUpdateMatches = true;
   });
 
   async function post(body: Record<string, unknown>) {
@@ -402,6 +430,136 @@ describe('hook-lifecycle CLI turn signal', () => {
       await vi.waitFor(() => expect(release).toHaveBeenCalled());
 
       expect(release.mock.calls[0]![1]).toMatchObject({ expectedTurnEpoch: undefined });
+    });
+  });
+
+  /**
+   * Round 11 (Lumen): the stop's OWN row write is epoch-fenced (one CAS for
+   * idle + marker + tombstone), a stale stop is a reported no-op, a modern
+   * stop with a lost record fails closed, and ride-along bookkeeping can
+   * never turn a committed claim into a failure.
+   */
+  describe('fenced stop and fail-closed degradation (round 11)', () => {
+    afterEach(() => {
+      vi.restoreAllMocks();
+      vi.mocked(releaseGraphClaimsForSession).mockClear();
+    });
+
+    it('a modern stop lands idle + marker clear + tombstone in ONE epoch-CASed statement', async () => {
+      await post({ lifecycle: 'idle', event: 'stop', turnEpoch: 'epoch-z' });
+
+      const fenced = recordedUpdates.find(
+        (u) => u.table === 'sessions' && u.payload.lifecycle === 'idle'
+      )!;
+      expect(fenced).toBeDefined();
+      expect(fenced.payload.cli_turn_at).toBeNull();
+      expect(typeof fenced.payload.cli_turn_stopped_at).toBe('string');
+      expect(fenced.eqs).toContainEqual(['id', SESSION_ID]);
+      expect(fenced.eqs).toContainEqual(['turn_epoch', 'epoch-z']);
+      // The repository path never writes the ownership fields for a modern stop.
+      for (const call of updateSession.mock.calls) {
+        expect(call[1]).not.toHaveProperty('lifecycle');
+        expect(call[1]).not.toHaveProperty('cliTurnAt');
+        expect(call[1]).not.toHaveProperty('cliTurnStoppedAt');
+      }
+    });
+
+    it('a STALE stop (successor owns the row) writes nothing and releases nothing', async () => {
+      // The A-stop-after-B-claim interleaving: B claimed a fresh epoch, A's
+      // late stop must not mark B idle, clear B's marker, stamp a tombstone
+      // over B, or release B's resources.
+      fencedUpdateMatches = false;
+      const release = vi
+        .spyOn(StudioLeaseService.prototype, 'releaseAtBoundary')
+        .mockResolvedValue(true);
+
+      const resp = await fetch(`${baseUrl}/api/hooks/lifecycle`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer test' },
+        body: JSON.stringify({
+          sessionId: SESSION_ID,
+          lifecycle: 'idle',
+          event: 'stop',
+          turnEpoch: 'epoch-a',
+          workingDir: '/w',
+        }),
+      });
+
+      expect(resp.status).toBe(200);
+      const body = (await resp.json()) as Record<string, unknown>;
+      expect(body.stale).toBe(true);
+      expect(updateSession).not.toHaveBeenCalled();
+      await new Promise((r) => setImmediate(r));
+      expect(release).not.toHaveBeenCalled();
+      expect(releaseGraphClaimsForSession).not.toHaveBeenCalled();
+    });
+
+    it('a modern stop with a LOST record fails closed: no row write, no releases, heartbeat only', async () => {
+      const release = vi
+        .spyOn(StudioLeaseService.prototype, 'releaseAtBoundary')
+        .mockResolvedValue(true);
+      const renew = vi
+        .spyOn(StudioLeaseService.prototype, 'renewBySession')
+        .mockResolvedValue(true);
+
+      const resp = await fetch(`${baseUrl}/api/hooks/lifecycle`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer test' },
+        body: JSON.stringify({
+          sessionId: SESSION_ID,
+          lifecycle: 'idle',
+          event: 'stop',
+          turnEpochMissing: true,
+        }),
+      });
+
+      expect(resp.status).toBe(200);
+      const body = (await resp.json()) as Record<string, unknown>;
+      expect(body.suppressed).toBe(true);
+      // No ownership write anywhere: not via the repository, not direct.
+      for (const call of updateSession.mock.calls) {
+        expect(call[1]).not.toHaveProperty('lifecycle');
+        expect(call[1]).not.toHaveProperty('cliTurnAt');
+        expect(call[1]).not.toHaveProperty('cliTurnStoppedAt');
+      }
+      expect(recordedUpdates.filter((u) => u.table === 'sessions')).toHaveLength(0);
+      expect(renew).toHaveBeenCalled();
+      await new Promise((r) => setImmediate(r));
+      expect(release).not.toHaveBeenCalled();
+      expect(releaseGraphClaimsForSession).not.toHaveBeenCalled();
+    });
+
+    it('ride-along failure after a COMMITTED claim reports the claim, not a failure', async () => {
+      // The 500 would make Claude block a prompt whose ownership already
+      // transferred — row running, no process (the P1-3 zombie).
+      updateSession.mockRejectedValueOnce(new Error('db flake'));
+
+      const resp = await fetch(`${baseUrl}/api/hooks/lifecycle`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer test' },
+        body: JSON.stringify({
+          sessionId: SESSION_ID,
+          lifecycle: 'running',
+          event: 'prompt',
+          workingDir: '/w',
+        }),
+      });
+
+      expect(resp.status).toBe(200);
+      const body = (await resp.json()) as Record<string, unknown>;
+      expect(body.turnEpoch).toBe('epoch-1');
+    });
+
+    it('the same failure WITHOUT a committed claim still fails the request', async () => {
+      updateSession.mockResolvedValueOnce(null as never);
+
+      const resp = await fetch(`${baseUrl}/api/hooks/lifecycle`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer test' },
+        body: JSON.stringify({ sessionId: SESSION_ID, cliAttached: true }),
+      });
+
+      expect(resp.status).toBe(500);
     });
   });
 });

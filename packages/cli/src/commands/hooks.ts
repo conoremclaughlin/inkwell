@@ -773,6 +773,20 @@ async function updateRuntimeGenerationState(
      * the lease boundary on it.
      */
     turnEpoch?: string;
+    /**
+     * Stop events (round 11): modern sender, but the epoch record is gone —
+     * the server fails closed (suppresses destructive boundary releases)
+     * instead of treating this stop as a legacy unfenced one.
+     */
+    turnEpochMissing?: boolean;
+    /**
+     * Prompt events (round 11): the caller's worktree studio. The server
+     * restamps + exact-CAS-touches ITS lease and reports `studioLeaseHeld`;
+     * false means a concurrent release won — the takeover is UNACKNOWLEDGED
+     * and this function reports ok:false without retrying (the lease is
+     * gone, not flaky).
+     */
+    studioId?: string;
   }
 ): Promise<{ ok: boolean; turnEpoch?: string }> {
   const sessionId = resolveActivePcpSessionId(cwd);
@@ -800,6 +814,8 @@ async function updateRuntimeGenerationState(
           ...(event ? { event } : {}),
           ...(opts?.headless ? { headless: true } : {}),
           ...(opts?.turnEpoch ? { turnEpoch: opts.turnEpoch } : {}),
+          ...(opts?.turnEpochMissing ? { turnEpochMissing: true } : {}),
+          ...(opts?.studioId && opts.studioId !== 'main' ? { studioId: opts.studioId } : {}),
           agentId,
           workingDir: cwd,
         }),
@@ -808,7 +824,19 @@ async function updateRuntimeGenerationState(
       if (resp.ok) {
         // Round 10: a claimed prompt's response carries the fresh epoch —
         // the identity the eventual stop needs to fence its boundary.
-        const body = (await resp.json().catch(() => null)) as { turnEpoch?: string } | null;
+        const body = (await resp.json().catch(() => null)) as {
+          turnEpoch?: string;
+          studioLeaseHeld?: boolean;
+        } | null;
+        // Round 11: a 2xx whose lease report says NOT HELD is an
+        // unacknowledged takeover — a concurrent release won the exact-CAS
+        // race. No retry: the lease is gone, not flaky; the caller's
+        // failed-takeover handling (block, or marker for the watcher) is the
+        // recovery path.
+        if (body?.studioLeaseHeld === false) {
+          sbDebugLog('hooks', 'lifecycle_lease_not_held', { sessionId, lifecycle, attempt });
+          return { ok: false };
+        }
         return {
           ok: true,
           ...(typeof body?.turnEpoch === 'string' ? { turnEpoch: body.turnEpoch } : {}),
@@ -2539,8 +2567,12 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
   // declare themselves so the route does not rotate the epoch the server's
   // own pre-turn write already owns (PR #563 round 6).
   const isHeadlessSpawn = isHeadlessSession();
+  // Round 11: name our studio so the server exact-CAS-touches ITS lease and
+  // the response's held report covers the worktree this prompt runs in.
+  const { studioId: promptStudioId } = getIdentitySessionContext(cwd);
   const takeover = await updateRuntimeGenerationState(cwd, config, agentId, 'running', 'prompt', {
     headless: isHeadlessSpawn,
+    studioId: promptStudioId,
   });
   const takeoverOk = takeover.ok;
   if (!takeoverOk && !isHeadlessSpawn) {
@@ -2571,7 +2603,20 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
     // the turn it is ending — the lease boundary fences on it.
     const claimedSessionId = resolveActivePcpSessionId(cwd);
     if (takeover.turnEpoch && claimedSessionId) {
-      writeCliTurnEpoch(cwd, { sessionId: claimedSessionId, turnEpoch: takeover.turnEpoch });
+      const recorded = writeCliTurnEpoch(cwd, {
+        sessionId: claimedSessionId,
+        turnEpoch: takeover.turnEpoch,
+      });
+      if (!recorded) {
+        // Round 11: a lost record is LOUD, not silent. Safety does not
+        // depend on this write — the modern on-stop sends `turnEpochMissing`
+        // when no record exists and the server fails closed (suppresses
+        // destructive boundary releases). Blocking here instead would strand
+        // the row running under the committed claim with no process behind
+        // it — the exact zombie class this PR removes.
+        hookLog('on_prompt_epoch_record_failed', { agentId, sessionId: claimedSessionId });
+        sbDebugLog('hooks', 'epoch_record_write_failed', { sessionId: claimedSessionId });
+      }
     }
   }
 
@@ -2758,13 +2803,16 @@ async function onStopHandler(options?: { backend?: string }): Promise<void> {
   // stop carries the epoch its prompt claimed (from the epoch record) so the
   // server's lease boundary can fence on the turn actually ending; the
   // record is scoped to OUR session — a foreign session's record is neither
-  // sent nor cleared.
+  // sent nor cleared. Round 11: a modern stop with NO record admits it
+  // (`turnEpochMissing`) rather than masquerading as a legacy sender — the
+  // server suppresses destructive boundary releases instead of running them
+  // unfenced (fail closed on degraded local state).
   const stopSessionId = resolveActivePcpSessionId(cwd);
   const epochRecord = readCliTurnEpoch(cwd);
   const stopEpoch =
     stopSessionId && epochRecord?.sessionId === stopSessionId ? epochRecord.turnEpoch : undefined;
   await updateRuntimeGenerationState(cwd, config, agentId, 'idle', 'stop', {
-    turnEpoch: stopEpoch,
+    ...(stopEpoch ? { turnEpoch: stopEpoch } : { turnEpochMissing: true }),
   });
   if (stopSessionId) clearCliTurnEpoch(cwd, stopSessionId);
 

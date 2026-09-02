@@ -257,3 +257,40 @@ describe('wrapper wiring (reachability)', () => {
     expect(stop).toBeGreaterThan(start);
   });
 });
+
+describe('epoch record failure is reported (round 11)', () => {
+  it('returns false when the record cannot be written — the caller must know', async () => {
+    const { writeCliTurnEpoch } = await import('./takeover-watcher.js');
+    // `.ink` exists as a FILE, so mkdir/write must fail — the ENOSPC/
+    // permission class, reproduced portably.
+    const broken = mkdtempSync(join(tmpdir(), 'takeover-broken-'));
+    rmSync(join(broken, '.ink'), { recursive: true, force: true });
+    writeFileSync(join(broken, '.ink'), 'not a directory');
+
+    expect(writeCliTurnEpoch(broken, { sessionId: 's1', turnEpoch: 'e' })).toBe(false);
+    expect(writeCliTurnEpoch(dir, { sessionId: 's1', turnEpoch: 'e' })).toBe(true);
+    rmSync(broken, { recursive: true, force: true });
+  });
+});
+
+describe('reclaim wiring round 11 (reachability)', () => {
+  it('the wrapper claim carries the studio and refuses an unheld lease report', async () => {
+    const { readFileSync } = await import('fs');
+    const { dirname } = await import('path');
+    const { fileURLToPath } = await import('url');
+    const source = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), '..', 'commands', 'claude.ts'),
+      'utf-8'
+    );
+    const helper = source.indexOf('function startSessionTakeoverWatcher(');
+    const studio = source.indexOf(
+      "...(studioId && studioId !== 'main' ? { studioId } : {})",
+      helper
+    );
+    const unheld = source.indexOf("if (body?.studioLeaseHeld === false) return 'failed';", helper);
+    expect(helper).toBeGreaterThan(-1);
+    expect(studio).toBeGreaterThan(helper);
+    // NOT HELD keeps the marker: recovery stays active, bounded by its age.
+    expect(unheld).toBeGreaterThan(helper);
+  });
+});

@@ -1402,3 +1402,59 @@ describe('CLI turn-epoch round-trip (round 10)', () => {
     expect(parsed).toBeGreaterThan(fn);
   });
 });
+
+/**
+ * Round 11 (Lumen): the prompt names its studio and treats a NOT-HELD lease
+ * report as an unacknowledged takeover (no retry — the lease is gone, not
+ * flaky); a lost epoch record is loud and the stop admits it instead of
+ * downgrading to legacy unfenced behavior.
+ */
+describe('lease acknowledgement and fail-closed degradation (round 11)', () => {
+  const loadSource = async () => {
+    const { readFileSync } = await import('fs');
+    const { dirname, join } = await import('path');
+    const { fileURLToPath } = await import('url');
+    return readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'hooks.ts'), 'utf-8');
+  };
+
+  it('the prompt carries the studio for the exact-CAS held report', async () => {
+    const source = await loadSource();
+    const prompt = source.indexOf('async function onPromptHandler(');
+    const resolved = source.indexOf(
+      'const { studioId: promptStudioId } = getIdentitySessionContext(cwd);',
+      prompt
+    );
+    const sent = source.indexOf('studioId: promptStudioId', resolved);
+    expect(prompt).toBeGreaterThan(-1);
+    expect(resolved).toBeGreaterThan(prompt);
+    expect(sent).toBeGreaterThan(resolved);
+  });
+
+  it('a NOT-HELD lease report is ok:false with NO retry — inside the update loop', async () => {
+    const source = await loadSource();
+    const fn = source.indexOf('async function updateRuntimeGenerationState(');
+    const check = source.indexOf('if (body?.studioLeaseHeld === false) {', fn);
+    const refuse = source.indexOf('return { ok: false };', check);
+    const okReturn = source.indexOf('ok: true,', check);
+    expect(fn).toBeGreaterThan(-1);
+    expect(check).toBeGreaterThan(fn);
+    // The refusal comes BEFORE the success return — a 2xx alone never wins.
+    expect(refuse).toBeGreaterThan(check);
+    expect(refuse).toBeLessThan(okReturn);
+  });
+
+  it('a lost epoch record is loud at prompt, and the stop admits it (fail closed downstream)', async () => {
+    const source = await loadSource();
+    const record = source.indexOf('const recorded = writeCliTurnEpoch(cwd, {');
+    const loud = source.indexOf("hookLog('on_prompt_epoch_record_failed'", record);
+    expect(record).toBeGreaterThan(-1);
+    expect(loud).toBeGreaterThan(record);
+
+    const stop = source.indexOf('async function onStopHandler(');
+    const admit = source.indexOf(
+      '...(stopEpoch ? { turnEpoch: stopEpoch } : { turnEpochMissing: true })',
+      stop
+    );
+    expect(admit).toBeGreaterThan(stop);
+  });
+});

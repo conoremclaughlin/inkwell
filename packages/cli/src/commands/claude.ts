@@ -3507,7 +3507,8 @@ async function ensurePcpSessionContext(
  */
 function startSessionTakeoverWatcher(
   backend: string,
-  pcpSessionId: string | undefined
+  pcpSessionId: string | undefined,
+  studioId?: string
 ): { stop: () => void } | undefined {
   if (backend !== 'codex' && backend !== 'gemini') return undefined;
   if (!pcpSessionId) return undefined;
@@ -3529,11 +3530,21 @@ function startSessionTakeoverWatcher(
             lifecycle: 'running',
             event: 'prompt',
             reclaimOf: markerAt,
+            // Round 11: the server exact-CAS-touches OUR studio's lease and
+            // reports whether it is still held under the reclaimed turn.
+            ...(studioId && studioId !== 'main' ? { studioId } : {}),
           }),
           signal: AbortSignal.timeout(3000),
         });
         if (resp.ok) {
-          const body = (await resp.json().catch(() => null)) as { turnEpoch?: string } | null;
+          const body = (await resp.json().catch(() => null)) as {
+            turnEpoch?: string;
+            studioLeaseHeld?: boolean;
+          } | null;
+          // Round 11: a reclaim whose lease report says NOT HELD is not a
+          // completed recovery — keep the marker so recovery stays active
+          // (bounded by the marker's age).
+          if (body?.studioLeaseHeld === false) return 'failed';
           if (body?.turnEpoch) {
             writeCliTurnEpoch(cwd, { sessionId: markerSessionId, turnEpoch: body.turnEpoch });
           }
@@ -3705,7 +3716,11 @@ export async function runClaude(
   // PR #563 round 9: codex/gemini prompt hooks cannot block and run no
   // channel plugin, so THIS wrapper is the marker consumer — the long-lived
   // process that converts a failed takeover's marker into a claim.
-  const takeoverWatcher = startSessionTakeoverWatcher(options.backend, sessionContext.pcpSessionId);
+  const takeoverWatcher = startSessionTakeoverWatcher(
+    options.backend,
+    sessionContext.pcpSessionId,
+    studioId
+  );
 
   const child = spawn(prepared.binary, prepared.args, {
     stdio: [prepared.stdinData !== undefined ? 'pipe' : 'inherit', 'pipe', 'pipe'],
@@ -3966,7 +3981,8 @@ export async function runClaudeInteractive(
   // the same session's scope); it is stopped before the wrapper exits.
   const interactiveTakeoverWatcher = startSessionTakeoverWatcher(
     options.backend,
-    sessionContext.pcpSessionId
+    sessionContext.pcpSessionId,
+    studioId
   );
 
   while (true) {
