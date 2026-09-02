@@ -226,6 +226,15 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
             p_session_id: sessionId,
             p_set_running: true,
             ...(reclaimOf ? { p_not_stopped_after: reclaimOf } : {}),
+            // Round 12: the claim and the lease protection are ONE atomic
+            // success boundary. The RPC locks the studio row, verifies the
+            // lease still belongs to this session, and only then claims the
+            // epoch + stamps the lease — a lost lease refuses the WHOLE
+            // takeover with nothing committed (no stranded running row, no
+            // leaseless turn).
+            ...(typeof studioId === 'string' && studioId && studioId !== 'main'
+              ? { p_studio_id: studioId }
+              : {}),
           } as never);
         if (claimError) {
           logger.error('[HookLifecycle] Turn-epoch claim failed; refusing prompt takeover', {
@@ -235,12 +244,30 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
           res.status(500).json({ success: false, error: 'turn-epoch claim failed' });
           return;
         }
-        if (reclaimOf && !claimed) {
-          logger.info('[HookLifecycle] Reclaim refused; the turn already stopped', { sessionId });
-          res.status(409).json({ success: false, code: 'stopped' });
+        const verdict = (claimed ?? null) as { outcome?: string; epoch?: string } | null;
+        if (verdict?.outcome === 'stopped') {
+          if (reclaimOf) {
+            logger.info('[HookLifecycle] Reclaim refused; the turn already stopped', {
+              sessionId,
+            });
+            res.status(409).json({ success: false, code: 'stopped' });
+            return;
+          }
+          res.status(500).json({ success: false, error: 'turn-epoch claim matched no session' });
           return;
         }
-        claimedEpoch = typeof claimed === 'string' ? claimed : undefined;
+        if (verdict?.outcome === 'lease-lost') {
+          // A release won: the worktree is no longer this session's. Nothing
+          // was committed — the caller's failed-takeover handling (gate/
+          // block/marker) runs against a CLEAN row.
+          logger.warn('[HookLifecycle] Prompt takeover refused — lease no longer held', {
+            sessionId,
+            studioId,
+          });
+          res.json({ success: true, sessionId, lifecycle, studioLeaseHeld: false });
+          return;
+        }
+        claimedEpoch = typeof verdict?.epoch === 'string' ? verdict.epoch : undefined;
         // The RPC IS the ownership write — lifecycle and the turn marker
         // landed atomically inside its CAS. Writing them AGAIN below would
         // be a second, UNFENCED ownership write: a stop (idle + tombstone)
@@ -288,29 +315,52 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
       if (Object.keys(updates).length > 0) {
         // Ride-along bookkeeping (workingDir, attachment, alias). After a
         // COMMITTED ownership write — a claimed prompt, or a fenced stop that
-        // matched — its failure must not report the takeover/stop as failed
-        // (round 11): the row already carries the truth, and a 500 here makes
-        // gated callers block a turn whose claim landed, stranding the row
-        // running with no process.
-        const ownershipCommitted = claimedEpoch !== undefined || stopEpoch !== undefined;
-        try {
+        // matched — two rules (rounds 11–12):
+        //   * failure must not report the takeover/stop as failed: the row
+        //     already carries the truth, and a 500 makes gated callers block
+        //     a turn whose claim landed, stranding the row running.
+        //   * the write itself is FENCED on the committed epoch: a late A
+        //     ride-along landing after successor B's claim would otherwise
+        //     overwrite B's working_dir — which isEphemeralHeldElsewhere()
+        //     reads to decide lease renewal/teardown. Zero rows = stale
+        //     no-op.
+        const committedEpoch = claimedEpoch ?? stopEpoch;
+        if (committedEpoch !== undefined) {
+          const fencedRideAlong: Record<string, unknown> = {};
+          if (updates.workingDir !== undefined) fencedRideAlong.working_dir = updates.workingDir;
+          if (updates.cliAttached !== undefined) fencedRideAlong.cli_attached = updates.cliAttached;
+          if (updates.cliPollAt !== undefined) fencedRideAlong.cli_poll_at = updates.cliPollAt;
+          if (updates.alias !== undefined) fencedRideAlong.alias = updates.alias;
+          if (updates.cliTurnAt !== undefined) fencedRideAlong.cli_turn_at = updates.cliTurnAt;
+          if (Object.keys(fencedRideAlong).length > 0) {
+            try {
+              const { data: rideRows, error: rideError } = await dataComposer
+                .getClient()
+                .from('sessions')
+                .update(fencedRideAlong)
+                .eq('id', sessionId)
+                .eq('turn_epoch', committedEpoch)
+                .select('id');
+              if (rideError) throw new Error(rideError.message);
+              if (!rideRows || rideRows.length === 0) {
+                logger.info('[HookLifecycle] Ride-along skipped — a successor owns the row', {
+                  sessionId,
+                });
+              }
+            } catch (rideAlongError) {
+              logger.warn('[HookLifecycle] Ride-along update failed after a committed claim/stop', {
+                sessionId,
+                error:
+                  rideAlongError instanceof Error ? rideAlongError.message : String(rideAlongError),
+              });
+            }
+          }
+        } else {
           const updated = await dataComposer.repositories.memory.updateSession(sessionId, updates);
-          if (!updated && !ownershipCommitted) {
+          if (!updated) {
             res.status(500).json({ success: false, error: 'Failed to update session' });
             return;
           }
-          if (!updated && ownershipCommitted) {
-            logger.warn('[HookLifecycle] Ride-along update failed after a committed claim/stop', {
-              sessionId,
-            });
-          }
-        } catch (rideAlongError) {
-          if (!ownershipCommitted) throw rideAlongError;
-          logger.warn('[HookLifecycle] Ride-along update threw after a committed claim/stop', {
-            sessionId,
-            error:
-              rideAlongError instanceof Error ? rideAlongError.message : String(rideAlongError),
-          });
         }
       }
 
@@ -420,12 +470,21 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
       // studioless senders — nothing to fence there.
       let studioLeaseHeld: boolean | undefined;
       if (isPromptEvent && typeof studioId === 'string' && studioId && studioId !== 'main') {
-        studioLeaseHeld = await leaseService.touchStudioLeaseForSession(
-          studioId,
-          sessionId,
-          session.userId,
-          claimedEpoch
-        );
+        if (claimedEpoch !== undefined) {
+          // Round 12: the claim RPC already verified, locked, and stamped
+          // this studio's lease atomically with the epoch claim — reaching
+          // here means HELD by construction. A separate touch would be a
+          // second read of state the claim just settled.
+          studioLeaseHeld = true;
+        } else {
+          // Headless prompts (server-owned epoch): the exact-CAS touch is
+          // still the fenced held report.
+          studioLeaseHeld = await leaseService.touchStudioLeaseForSession(
+            studioId,
+            sessionId,
+            session.userId
+          );
+        }
       }
 
       logger.debug('[HookLifecycle] Updated', { sessionId, lifecycle, agentId });

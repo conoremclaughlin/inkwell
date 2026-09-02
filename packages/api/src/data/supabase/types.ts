@@ -4592,8 +4592,9 @@ export type Database = {
           p_session_id: string;
           p_set_running?: boolean;
           p_not_stopped_after?: string;
+          p_studio_id?: string;
         };
-        Returns: string;
+        Returns: Json;
       };
       apply_task_graph: {
         Args: {

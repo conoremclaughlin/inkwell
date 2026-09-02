@@ -101,7 +101,7 @@ function makeFakeClient() {
 /** Recorded rpc invocations across all fake clients (the route re-gets one per request). */
 const rpcCalls: unknown[][] = [];
 let rpcResult: () => { data: unknown; error: { message: string } | null } = () => ({
-  data: 'epoch-1',
+  data: { outcome: 'claimed', epoch: 'epoch-1' },
   error: null,
 });
 
@@ -147,7 +147,7 @@ describe('hook-lifecycle CLI turn signal', () => {
     updateSession.mockClear();
     getSession.mockClear();
     rpcCalls.length = 0;
-    rpcResult = () => ({ data: 'epoch-1', error: null });
+    rpcResult = () => ({ data: { outcome: 'claimed', epoch: 'epoch-1' }, error: null });
     recordedUpdates.length = 0;
     fencedUpdateMatches = true;
   });
@@ -195,9 +195,10 @@ describe('hook-lifecycle CLI turn signal', () => {
   });
 
   it('a prompt with a worktree studio gets the fenced lease-held report', async () => {
-    // The fake supabase holds no studios — the truthful answer is NOT HELD,
-    // which the gated caller treats as unacknowledged (no turn under a
-    // released lease). The field exists exactly when a fence is meaningful.
+    // Round 12: the claim RPC verifies + stamps the lease atomically with
+    // the epoch claim, so a CLAIMED outcome is held by construction — and
+    // the studio rides INTO the claim so the verification is the same
+    // transaction, not a later read.
     const resp = await fetch(`${baseUrl}/api/hooks/lifecycle`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: 'Bearer test' },
@@ -210,7 +211,10 @@ describe('hook-lifecycle CLI turn signal', () => {
     });
     expect(resp.status).toBe(200);
     const body = (await resp.json()) as Record<string, unknown>;
-    expect(body.studioLeaseHeld).toBe(false);
+    expect(body.studioLeaseHeld).toBe(true);
+    expect(rpcCalls[0]![1]).toMatchObject({
+      p_studio_id: '5bea57f3-6b24-4126-abe4-0d1cc2bd9647',
+    });
 
     // No studioId (main/studioless senders): the field is absent, never a veto.
     const resp2 = await fetch(`${baseUrl}/api/hooks/lifecycle`, {
@@ -299,7 +303,7 @@ describe('hook-lifecycle CLI turn signal', () => {
     });
 
     it("a reclaim the tombstone refuses is a 409 'stopped', and the lifecycle never writes", async () => {
-      rpcResult = () => ({ data: null, error: null }); // zero rows matched the CAS
+      rpcResult = () => ({ data: { outcome: 'stopped' }, error: null }); // tombstone CAS refused
       const resp = await fetch(`${baseUrl}/api/hooks/lifecycle`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: 'Bearer test' },
@@ -354,9 +358,14 @@ describe('hook-lifecycle CLI turn signal', () => {
 
     it('a claimed prompt performs NO second ownership write — a stop between RPC and route cannot be overwritten', async () => {
       // workingDir rides along so the follow-up write demonstrably HAPPENS —
-      // just stripped of the fields the RPC already owns.
-      const updates = await post({ lifecycle: 'running', event: 'prompt', workingDir: '/w' });
-      expect(updates).toEqual({ workingDir: '/w' });
+      // fenced on the committed epoch (round 12) and stripped of the fields
+      // the RPC already owns; the unfenced repository path is never used.
+      await post({ lifecycle: 'running', event: 'prompt', workingDir: '/w' });
+      expect(updateSession).not.toHaveBeenCalled();
+      const ride = recordedUpdates.find((u) => u.table === 'sessions')!;
+      expect(ride).toBeDefined();
+      expect(ride.payload).toEqual({ working_dir: '/w' });
+      expect(ride.eqs).toContainEqual(['turn_epoch', 'epoch-1']);
     });
 
     it('a HEADLESS prompt keeps the plain lifecycle write — the server owns its epoch', async () => {
@@ -389,9 +398,10 @@ describe('hook-lifecycle CLI turn signal', () => {
       expect('turnEpoch' in headlessBody).toBe(false);
     });
 
-    it('a claimed prompt RESTAMPS the lease with the CLI epoch (renew and touch)', async () => {
-      // Without the restamp the lease keeps a server predecessor's stamp,
-      // and that predecessor's delayed fenced release still matches it.
+    it('a claimed prompt RESTAMPS its leases — the named studio inside the claim, the rest via renew', async () => {
+      // Round 12: the named studio's stamp happens INSIDE the atomic claim;
+      // renewBySession carries the epoch to any OTHER studios this session
+      // holds. A separate touch would be a second read of settled state.
       const renew = vi
         .spyOn(StudioLeaseService.prototype, 'renewBySession')
         .mockResolvedValue(true);
@@ -400,10 +410,22 @@ describe('hook-lifecycle CLI turn signal', () => {
         .mockResolvedValue(true);
 
       const studioId = '5bea57f3-6b24-4126-abe4-0d1cc2bd9647';
-      await post({ lifecycle: 'running', event: 'prompt', studioId });
+      const resp = await fetch(`${baseUrl}/api/hooks/lifecycle`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer test' },
+        body: JSON.stringify({
+          sessionId: SESSION_ID,
+          lifecycle: 'running',
+          event: 'prompt',
+          studioId,
+        }),
+      });
+      const body = (await resp.json()) as Record<string, unknown>;
 
+      expect(rpcCalls[0]![1]).toMatchObject({ p_studio_id: studioId });
       expect(renew).toHaveBeenCalledWith(SESSION_ID, 'user-1', 'epoch-1');
-      expect(touch).toHaveBeenCalledWith(studioId, SESSION_ID, 'user-1', 'epoch-1');
+      expect(touch).not.toHaveBeenCalled();
+      expect(body.studioLeaseHeld).toBe(true);
     });
 
     it('the stop carries the epoch it is ending into BOTH resource releases', async () => {
@@ -560,6 +582,76 @@ describe('hook-lifecycle CLI turn signal', () => {
       });
 
       expect(resp.status).toBe(500);
+    });
+  });
+
+  /**
+   * Round 12 (Lumen): claim + lease protection are ONE atomic success
+   * boundary — a lost lease refuses the whole takeover with NOTHING
+   * committed — and ride-alongs are fenced on the committed epoch so a late
+   * turn can never overwrite a successor's working_dir.
+   */
+  describe('atomic claim boundary (round 12)', () => {
+    it('a LOST lease refuses the takeover with nothing committed', async () => {
+      // The release-wins ordering: the RPC's studio lock saw the lease gone
+      // and refused BEFORE claiming. No running row, no open marker, no
+      // epoch — the caller's failed-takeover handling runs against a clean
+      // row.
+      rpcResult = () => ({ data: { outcome: 'lease-lost' }, error: null });
+
+      const resp = await fetch(`${baseUrl}/api/hooks/lifecycle`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer test' },
+        body: JSON.stringify({
+          sessionId: SESSION_ID,
+          lifecycle: 'running',
+          event: 'prompt',
+          studioId: '5bea57f3-6b24-4126-abe4-0d1cc2bd9647',
+          workingDir: '/w',
+        }),
+      });
+
+      expect(resp.status).toBe(200);
+      const body = (await resp.json()) as Record<string, unknown>;
+      expect(body.studioLeaseHeld).toBe(false);
+      expect('turnEpoch' in body).toBe(false);
+      // Nothing landed: no repository write, no direct write.
+      expect(updateSession).not.toHaveBeenCalled();
+      expect(recordedUpdates.filter((u) => u.table === 'sessions')).toHaveLength(0);
+    });
+
+    it('a STALE fenced ride-along is a tolerated no-op — the claim still reports success', async () => {
+      // Successor B claimed between A's claim and A's ride-along: the fenced
+      // write matches zero rows and B's working_dir survives.
+      fencedUpdateMatches = false;
+
+      const resp = await fetch(`${baseUrl}/api/hooks/lifecycle`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer test' },
+        body: JSON.stringify({
+          sessionId: SESSION_ID,
+          lifecycle: 'running',
+          event: 'prompt',
+          workingDir: '/w',
+        }),
+      });
+
+      expect(resp.status).toBe(200);
+      const body = (await resp.json()) as Record<string, unknown>;
+      expect(body.turnEpoch).toBe('epoch-1');
+      const ride = recordedUpdates.find((u) => u.table === 'sessions')!;
+      expect(ride.eqs).toContainEqual(['turn_epoch', 'epoch-1']);
+    });
+
+    it('the fenced STOP fences its ride-alongs on the stop epoch too', async () => {
+      await post({ lifecycle: 'idle', event: 'stop', turnEpoch: 'epoch-z', workingDir: '/w' });
+
+      expect(updateSession).not.toHaveBeenCalled();
+      const ride = recordedUpdates.find(
+        (u) => u.table === 'sessions' && 'working_dir' in u.payload
+      )!;
+      expect(ride).toBeDefined();
+      expect(ride.eqs).toContainEqual(['turn_epoch', 'epoch-z']);
     });
   });
 });

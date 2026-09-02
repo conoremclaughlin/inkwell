@@ -228,6 +228,8 @@ d('session_running_write trigger', () => {
         p_set_running: true,
       } as never);
       expect(error).toBeNull();
+      const verdict = claimed as unknown as { outcome: string; epoch: string };
+      expect(verdict.outcome).toBe('claimed');
 
       const { data: after } = await client
         .from('sessions')
@@ -235,7 +237,7 @@ d('session_running_write trigger', () => {
         .eq('id', id)
         .single();
       expect(after!.lifecycle).toBe('running');
-      expect(after!.turn_epoch).toBe(claimed);
+      expect(after!.turn_epoch).toBe(verdict.epoch);
       expect(after!.cli_turn_at).toEqual(expect.any(String));
     });
 
@@ -259,7 +261,7 @@ d('session_running_write trigger', () => {
         p_not_stopped_after: staleMarker,
       } as never);
       expect(error).toBeNull();
-      expect(refused).toBeNull(); // zero rows — no epoch, no takeover
+      expect((refused as unknown as { outcome: string }).outcome).toBe('stopped');
       expect((await readSession(id)).turn_epoch).toBe(before);
 
       // A marker born AFTER the stop is a newer prompt generation — claims.
@@ -269,14 +271,96 @@ d('session_running_write trigger', () => {
         p_set_running: true,
         p_not_stopped_after: freshMarker,
       } as never);
-      expect(claimed).toEqual(expect.any(String));
+      expect((claimed as unknown as { outcome: string }).outcome).toBe('claimed');
 
       // An ordinary prompt claim (no marker) stays unconditional.
       const { data: unconditional } = await client.rpc('claim_turn_epoch', {
         p_session_id: id,
         p_set_running: true,
       } as never);
-      expect(unconditional).toEqual(expect.any(String));
+      expect((unconditional as unknown as { outcome: string }).outcome).toBe('claimed');
+    });
+
+    it('the claim and the lease stamp are ONE atomic boundary (round 12)', async () => {
+      // The release-wins ordering: a claim naming a studio whose lease is
+      // gone (or foreign) refuses with NOTHING committed — no running row,
+      // no open marker, no rotated epoch. A held lease is verified under the
+      // studio row lock and stamped with the fresh epoch in the same
+      // transaction.
+      const sessionId = await insertSession({ lifecycle: 'idle', metadata: {} });
+      const before = await readSession(sessionId);
+      const studioId = randomUUID();
+      const { error: studioError } = await client.from('studios').insert({
+        id: studioId,
+        user_id: USER,
+        branch: 'test/claim-atomic',
+        repo_root: '/tmp/claim-atomic',
+        worktree_path: `/tmp/claim-atomic-${studioId}`,
+        status: 'active',
+        lease: null,
+      } as never);
+      expect(studioError).toBeNull();
+
+      try {
+        // 1) No lease at all → lease-lost, session untouched.
+        const { data: lost } = await client.rpc('claim_turn_epoch', {
+          p_session_id: sessionId,
+          p_set_running: true,
+          p_studio_id: studioId,
+        } as never);
+        expect((lost as unknown as { outcome: string }).outcome).toBe('lease-lost');
+        const untouched = await readSession(sessionId);
+        expect(untouched.lifecycle).toBe(before.lifecycle);
+        expect(untouched.turn_epoch).toBe(before.turn_epoch);
+
+        // 2) FOREIGN lease → lease-lost, lease untouched.
+        const foreign = {
+          sessionId: randomUUID(),
+          threadKey: 'pr:1',
+          agentId: 'wren',
+          acquiredAt: new Date().toISOString(),
+          heartbeatAt: new Date().toISOString(),
+        };
+        await client
+          .from('studios')
+          .update({ lease: foreign as never })
+          .eq('id', studioId);
+        const { data: stillLost } = await client.rpc('claim_turn_epoch', {
+          p_session_id: sessionId,
+          p_set_running: true,
+          p_studio_id: studioId,
+        } as never);
+        expect((stillLost as unknown as { outcome: string }).outcome).toBe('lease-lost');
+
+        // 3) OUR lease → claimed, and the lease carries the fresh epoch +
+        // a heartbeat bump, atomically with the session claim.
+        const ours = { ...foreign, sessionId, turnEpoch: 'stale-server-epoch' };
+        await client
+          .from('studios')
+          .update({ lease: ours as never })
+          .eq('id', studioId);
+        const { data: won } = await client.rpc('claim_turn_epoch', {
+          p_session_id: sessionId,
+          p_set_running: true,
+          p_studio_id: studioId,
+        } as never);
+        const verdict = won as unknown as { outcome: string; epoch: string };
+        expect(verdict.outcome).toBe('claimed');
+
+        const after = await readSession(sessionId);
+        expect(after.lifecycle).toBe('running');
+        expect(after.turn_epoch).toBe(verdict.epoch);
+        const { data: studioAfter } = await client
+          .from('studios')
+          .select('lease')
+          .eq('id', studioId)
+          .single();
+        const lease = studioAfter!.lease as { turnEpoch?: string; heartbeatAt?: string };
+        expect(lease.turnEpoch).toBe(verdict.epoch);
+        expect(lease.heartbeatAt).not.toBe(ours.heartbeatAt);
+      } finally {
+        await client.from('studios').delete().eq('id', studioId);
+      }
     });
 
     it('claim_turn_epoch rotates a running → running row atomically', async () => {
@@ -291,9 +375,11 @@ d('session_running_write trigger', () => {
         p_session_id: id,
       } as never);
       expect(error).toBeNull();
-      expect(claimed).toEqual(expect.any(String));
-      expect(claimed).not.toBe(before);
-      expect((await readSession(id)).turn_epoch).toBe(claimed);
+      const verdict = claimed as unknown as { outcome: string; epoch: string };
+      expect(verdict.outcome).toBe('claimed');
+      expect(verdict.epoch).toEqual(expect.any(String));
+      expect(verdict.epoch).not.toBe(before);
+      expect((await readSession(id)).turn_epoch).toBe(verdict.epoch);
     });
 
     it('is preserved across running → running writes — same owner, same series', async () => {
