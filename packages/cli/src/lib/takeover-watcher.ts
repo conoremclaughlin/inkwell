@@ -106,9 +106,12 @@ export async function watchTick(opts: {
   markerPath: string;
   /** The wrapper's own session — the ONLY session this watcher may claim for. */
   expectedSessionId: string;
-  claim: (sessionId: string, markerAt: string) => Promise<'ok' | 'stopped' | 'failed'>;
+  claim: (
+    sessionId: string,
+    markerAt: string
+  ) => Promise<'ok' | 'stopped' | 'unprotected' | 'failed'>;
   now?: number;
-}): Promise<'claimed' | 'stopped' | 'skipped' | 'failed'> {
+}): Promise<'claimed' | 'stopped' | 'unprotected' | 'skipped' | 'failed'> {
   const marker = readMarker(opts.markerPath);
   if (!marker?.sessionId || !marker.at) return 'skipped';
   if (marker.sessionId !== opts.expectedSessionId) {
@@ -135,15 +138,25 @@ export async function watchTick(opts: {
   } catch {
     // The stop hook also deletes; re-judged next tick if it survives.
   }
+  // 'unprotected' (round 15): the server refused the lease PERMANENTLY —
+  // revoked thread, expired/retired studio, or another holder. Recovery can
+  // never converge, so the marker retires and the WRAPPER must enforce
+  // (terminate the backend rather than knowingly run in a revoked worktree).
+  if (verdict === 'unprotected') return 'unprotected';
   return verdict === 'ok' ? 'claimed' : 'stopped';
 }
 
 export function startTakeoverWatcher(opts: {
   cwd: string;
   expectedSessionId: string;
-  claim: (sessionId: string, markerAt: string) => Promise<'ok' | 'stopped' | 'failed'>;
+  claim: (
+    sessionId: string,
+    markerAt: string
+  ) => Promise<'ok' | 'stopped' | 'unprotected' | 'failed'>;
   intervalMs?: number;
   log?: (outcome: string) => void;
+  /** Round 15: the lease is PERMANENTLY gone — enforce (terminate the backend). */
+  onUnprotected?: () => void;
 }): { stop: () => void } {
   const markerPath = takeoverMarkerPath(opts.cwd);
   let inFlight = false;
@@ -157,6 +170,7 @@ export function startTakeoverWatcher(opts: {
         claim: opts.claim,
       });
       if (outcome !== 'skipped') opts.log?.(outcome);
+      if (outcome === 'unprotected') opts.onUnprotected?.();
     } catch {
       // Never let the watcher take down the wrapper.
     } finally {

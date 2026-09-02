@@ -287,10 +287,69 @@ describe('reclaim wiring round 11 (reachability)', () => {
       "...(studioId && studioId !== 'main' ? { studioId } : {})",
       helper
     );
-    const unheld = source.indexOf("if (body?.studioLeaseHeld === false) return 'failed';", helper);
+    const unheld = source.indexOf(
+      "if (body?.studioLeaseHeld === false) return 'unprotected';",
+      helper
+    );
     expect(helper).toBeGreaterThan(-1);
     expect(studio).toBeGreaterThan(helper);
-    // NOT HELD keeps the marker: recovery stays active, bounded by its age.
+    // Round 15: NOT HELD is a PERMANENT refusal — it surfaces as
+    // 'unprotected', which retires the marker and triggers enforcement.
     expect(unheld).toBeGreaterThan(helper);
+  });
+
+  it('a permanent refusal terminates the backend at BOTH spawn sites (round 15)', async () => {
+    const { readFileSync } = await import('fs');
+    const { dirname } = await import('path');
+    const { fileURLToPath } = await import('url');
+    const source = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), '..', 'commands', 'claude.ts'),
+      'utf-8'
+    );
+    const helper = source.indexOf('function startSessionTakeoverWatcher(');
+    const forward = source.indexOf('onUnprotected,', helper);
+    expect(forward).toBeGreaterThan(helper);
+
+    const oneShot = source.indexOf('export async function runClaude(');
+    const oneShotKill = source.indexOf('takeoverChild?.kill', oneShot);
+    const interactive = source.indexOf('export async function runClaudeInteractive(');
+    const interactiveKill = source.indexOf('interactiveChild?.kill', interactive);
+    expect(oneShotKill).toBeGreaterThan(oneShot);
+    expect(oneShotKill).toBeLessThan(interactive);
+    expect(interactiveKill).toBeGreaterThan(interactive);
+  });
+});
+
+describe('permanent refusal enforcement (round 15)', () => {
+  it("an 'unprotected' verdict retires the marker and fires the enforcement hook", async () => {
+    vi.useFakeTimers();
+    const p = write({ sessionId: 's1', at: new Date().toISOString() });
+    const claim = vi.fn(async () => 'unprotected' as const);
+    const onUnprotected = vi.fn();
+    const watcher = startTakeoverWatcher({
+      cwd: dir,
+      expectedSessionId: 's1',
+      claim,
+      intervalMs: 1000,
+      onUnprotected,
+    });
+
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(onUnprotected).toHaveBeenCalledTimes(1);
+    // The marker retired — recovery cannot converge, so no retry loop.
+    expect(existsSync(p)).toBe(false);
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(claim).toHaveBeenCalledTimes(1);
+    watcher.stop();
+  });
+
+  it("watchTick reports 'unprotected' distinctly and consumes the marker", async () => {
+    const p = write({ sessionId: 's1', at: new Date().toISOString() });
+    const claim = vi.fn(async () => 'unprotected' as const);
+
+    const outcome = await watchTick({ markerPath: p, expectedSessionId: 's1', claim });
+
+    expect(outcome).toBe('unprotected');
+    expect(existsSync(p)).toBe(false);
   });
 });

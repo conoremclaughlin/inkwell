@@ -512,6 +512,108 @@ d('session_running_write trigger', () => {
       }
     });
 
+    it('a cross-tenant claim is FORBIDDEN with nothing modified (round 15 P0)', async () => {
+      // An authenticated caller's own session naming ANOTHER user's vacant
+      // studio must not install a lease across tenants — the service role
+      // bypasses RLS, so the boundary lives in the claim itself.
+      const sessionId = await insertSession({ lifecycle: 'idle', metadata: {} });
+      const before = await readSession(sessionId);
+      const otherUserId = randomUUID();
+      const studioId = randomUUID();
+      const { error: userError } = await client.from('users').insert({
+        id: otherUserId,
+        email: `pcp-test-${otherUserId.slice(0, 8)}@example.invalid`,
+      } as never);
+      expect(userError).toBeNull();
+      const { error: studioError } = await client.from('studios').insert({
+        id: studioId,
+        user_id: otherUserId,
+        branch: 'test/cross-tenant',
+        repo_root: '/tmp/cross-tenant',
+        worktree_path: `/tmp/cross-tenant-${studioId}`,
+        status: 'active',
+        lease: null,
+      } as never);
+      expect(studioError).toBeNull();
+
+      try {
+        const { data } = await client.rpc('claim_turn_epoch', {
+          p_session_id: sessionId,
+          p_set_running: true,
+          p_studio_id: studioId,
+          p_regrant: { sessionId, threadKey: 'test:cross', agentId: 'wren' },
+        } as never);
+        expect((data as unknown as { outcome: string }).outcome).toBe('forbidden');
+
+        const untouched = await readSession(sessionId);
+        expect(untouched.lifecycle).toBe(before.lifecycle);
+        expect(untouched.turn_epoch).toBe(before.turn_epoch);
+        const { data: studioAfter } = await client
+          .from('studios')
+          .select('lease')
+          .eq('id', studioId)
+          .single();
+        expect(studioAfter!.lease).toBeNull();
+      } finally {
+        await client.from('studios').delete().eq('id', studioId);
+        await client.from('users').delete().eq('id', otherUserId);
+      }
+    });
+
+    it('the regrant sibling scan compares NORMALIZED checkout paths (round 15)', async () => {
+      // Two rows naming the same tree with different raw spellings: the
+      // sibling's held lease must refuse the regrant, exactly as
+      // grant_studio_lease's advisory-locked scan would.
+      const sessionId = await insertSession({ lifecycle: 'idle', metadata: {} });
+      const studioId = randomUUID();
+      const siblingId = randomUUID();
+      const base = `/tmp/norm-${studioId.slice(0, 8)}`;
+      const { error: e1 } = await client.from('studios').insert({
+        id: studioId,
+        user_id: USER,
+        branch: 'test/norm-a',
+        repo_root: base,
+        worktree_path: base,
+        status: 'active',
+        lease: null,
+      } as never);
+      expect(e1).toBeNull();
+      const { error: e2 } = await client.from('studios').insert({
+        id: siblingId,
+        user_id: USER,
+        branch: 'test/norm-b',
+        repo_root: base,
+        worktree_path: `${base}/`,
+        status: 'active',
+        lease: {
+          sessionId: randomUUID(),
+          threadKey: 'pr:sibling',
+          agentId: 'lumen',
+          acquiredAt: new Date().toISOString(),
+          heartbeatAt: new Date().toISOString(),
+        },
+      } as never);
+      expect(e2).toBeNull();
+
+      try {
+        const { data } = await client.rpc('claim_turn_epoch', {
+          p_session_id: sessionId,
+          p_set_running: true,
+          p_studio_id: studioId,
+          p_regrant: { sessionId, threadKey: 'test:norm', agentId: 'wren' },
+        } as never);
+        expect((data as unknown as { outcome: string }).outcome).toBe('lease-lost');
+        const { data: after } = await client
+          .from('studios')
+          .select('lease')
+          .eq('id', studioId)
+          .single();
+        expect(after!.lease).toBeNull();
+      } finally {
+        await client.from('studios').delete().in('id', [studioId, siblingId]);
+      }
+    });
+
     it('claim_turn_epoch rotates a running → running row atomically', async () => {
       // The CLI-prompt takeover: no lifecycle transition for the trigger to
       // see, no metadata in the hook's column-only write. The claim is the

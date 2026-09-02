@@ -3508,7 +3508,14 @@ async function ensurePcpSessionContext(
 function startSessionTakeoverWatcher(
   backend: string,
   pcpSessionId: string | undefined,
-  studioId?: string
+  studioId?: string,
+  /**
+   * Round 15: a PERMANENT lease refusal (revoked thread, retired studio,
+   * another holder) can never converge through the marker — the wrapper is
+   * the only enforcement point for backends whose hooks cannot block, so it
+   * terminates the backend rather than knowingly run in a revoked worktree.
+   */
+  onUnprotected?: () => void
 ): { stop: () => void } | undefined {
   if (backend !== 'codex' && backend !== 'gemini') return undefined;
   if (!pcpSessionId) return undefined;
@@ -3516,6 +3523,7 @@ function startSessionTakeoverWatcher(
   return startTakeoverWatcher({
     cwd,
     expectedSessionId: pcpSessionId,
+    onUnprotected,
     claim: async (markerSessionId, markerAt) => {
       try {
         const serverUrl = getPcpServerUrl();
@@ -3544,7 +3552,7 @@ function startSessionTakeoverWatcher(
           // Round 11: a reclaim whose lease report says NOT HELD is not a
           // completed recovery — keep the marker so recovery stays active
           // (bounded by the marker's age).
-          if (body?.studioLeaseHeld === false) return 'failed';
+          if (body?.studioLeaseHeld === false) return 'unprotected';
           if (body?.turnEpoch) {
             writeCliTurnEpoch(cwd, { sessionId: markerSessionId, turnEpoch: body.turnEpoch });
           }
@@ -3716,10 +3724,19 @@ export async function runClaude(
   // PR #563 round 9: codex/gemini prompt hooks cannot block and run no
   // channel plugin, so THIS wrapper is the marker consumer — the long-lived
   // process that converts a failed takeover's marker into a claim.
+  let takeoverChild: ReturnType<typeof spawn> | undefined;
   const takeoverWatcher = startSessionTakeoverWatcher(
     options.backend,
     sessionContext.pcpSessionId,
-    studioId
+    studioId,
+    () => {
+      console.error(
+        chalk.red(
+          '\nThis worktree\u2019s lease is permanently gone (thread closed or studio revoked). Terminating the backend to protect the checkout.'
+        )
+      );
+      takeoverChild?.kill('SIGTERM');
+    }
   );
 
   const child = spawn(prepared.binary, prepared.args, {
@@ -3734,6 +3751,7 @@ export async function runClaude(
       ...(runtimeLinkId ? { INK_RUNTIME_LINK_ID: runtimeLinkId } : {}),
     },
   });
+  takeoverChild = child;
 
   if (prepared.stdinData !== undefined && child.stdin) {
     child.stdin.on('error', () => {});
@@ -3930,6 +3948,7 @@ export async function runClaudeInteractive(
           ...(runtimeLinkId ? { INK_RUNTIME_LINK_ID: runtimeLinkId } : {}),
         },
       });
+      interactiveChild = child;
 
       child.stderr?.on('data', (chunk) => {
         const text = chunk.toString();
@@ -3979,10 +3998,19 @@ export async function runClaudeInteractive(
   // process for codex/gemini — the round-9 watcher was wired only into the
   // one-shot path. One watcher spans every retry attempt (retries continue
   // the same session's scope); it is stopped before the wrapper exits.
+  let interactiveChild: ReturnType<typeof spawn> | undefined;
   const interactiveTakeoverWatcher = startSessionTakeoverWatcher(
     options.backend,
     sessionContext.pcpSessionId,
-    studioId
+    studioId,
+    () => {
+      console.error(
+        chalk.red(
+          '\nThis worktree\u2019s lease is permanently gone (thread closed or studio revoked). Terminating the backend to protect the checkout.'
+        )
+      );
+      interactiveChild?.kill('SIGTERM');
+    }
   );
 
   while (true) {

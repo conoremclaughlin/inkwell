@@ -646,6 +646,44 @@ describe('hook-lifecycle CLI turn signal', () => {
       expect(ride.eqs).toContainEqual(['turn_epoch', 'epoch-1']);
     });
 
+    it('a cross-tenant claim is a 403, never a lease report (round 15 P0)', async () => {
+      rpcResult = () => ({ data: { outcome: 'forbidden' }, error: null });
+
+      const resp = await fetch(`${baseUrl}/api/hooks/lifecycle`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer test' },
+        body: JSON.stringify({
+          sessionId: SESSION_ID,
+          lifecycle: 'running',
+          event: 'prompt',
+          studioId: '5bea57f3-6b24-4126-abe4-0d1cc2bd9647',
+        }),
+      });
+
+      expect(resp.status).toBe(403);
+      expect(updateSession).not.toHaveBeenCalled();
+    });
+
+    it('the regrant carries the canonical identity UUID from the session row (round 15)', async () => {
+      getSession.mockResolvedValueOnce({
+        id: SESSION_ID,
+        userId: 'user-1',
+        endedAt: null,
+        status: 'active',
+        lifecycle: 'idle',
+        sbId: 'sb-uuid-1',
+      } as never);
+
+      await post({
+        lifecycle: 'running',
+        event: 'prompt',
+        studioId: '5bea57f3-6b24-4126-abe4-0d1cc2bd9647',
+      });
+
+      const args = rpcCalls[0]![1] as Record<string, unknown>;
+      expect(args.p_regrant).toMatchObject({ sbId: 'sb-uuid-1' });
+    });
+
     it('an UNRECOGNIZED claim verdict fails closed — never success without ownership (round 13)', async () => {
       // Legacy string shape, null data, and claimed-without-epoch all mean
       // the contract broke; falling through would report success/held with

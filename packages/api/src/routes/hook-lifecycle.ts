@@ -244,6 +244,9 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
               threadKey: session.threadKey ?? `session:${sessionId}`,
               threadKeys: [session.threadKey ?? `session:${sessionId}`],
               agentId: agentId ?? session.agentId ?? 'unknown',
+              // Round 15: the canonical identity UUID, from the SESSION row
+              // (server-trusted) — never just the ambiguous slug.
+              ...(session.sbId ? { sbId: session.sbId } : {}),
               reason: 'cli-prompt-regrant',
             }
           : undefined;
@@ -261,6 +264,15 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
           epoch?: string;
           regranted?: boolean;
         } | null;
+
+        if (!claimError && verdict?.outcome === 'forbidden') {
+          // Round 15 P0: the studio belongs to a DIFFERENT user than the
+          // session. The RPC refused before touching anything; surface it as
+          // an authorization failure, never a lease report.
+          logger.error('[HookLifecycle] Cross-tenant claim refused', { sessionId, studioId });
+          res.status(403).json({ success: false, error: 'studio does not belong to this user' });
+          return;
+        }
 
         if (claimError) {
           logger.error('[HookLifecycle] Turn-epoch claim failed; refusing prompt takeover', {
