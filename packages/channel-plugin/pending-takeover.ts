@@ -19,6 +19,8 @@ export interface PendingTakeoverMarker {
   sessionId?: string | null;
   agentId?: string;
   at?: string;
+  /** Round 25: the marker's fresh attempt token — clock-free fencing. */
+  attemptId?: string;
 }
 
 export const MARKER_MAX_AGE_MS = 10 * 60 * 1000;
@@ -64,7 +66,10 @@ export function shouldReclaim(
 export async function processPendingTakeover(opts: {
   markerPath: string;
   sessionId: string | undefined;
-  claim: (markerAt: string | undefined) => Promise<'ok' | 'stopped' | 'failed'>;
+  claim: (
+    markerAt: string | undefined,
+    attemptId: string | undefined
+  ) => Promise<'ok' | 'stopped' | 'failed'>;
   now?: number;
 }): Promise<'claimed' | 'stopped' | 'skipped' | 'failed'> {
   const marker = readPendingTakeover(opts.markerPath);
@@ -80,7 +85,7 @@ export async function processPendingTakeover(opts: {
     }
     return 'skipped';
   }
-  const verdict = await opts.claim(marker?.at);
+  const verdict = await opts.claim(marker?.at, marker?.attemptId);
   if (verdict === 'failed') return 'failed';
   try {
     rmSync(opts.markerPath, { force: true });

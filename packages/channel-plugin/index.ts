@@ -261,7 +261,8 @@ const drainState = createThreadDrainState();
 const takeoverMarkerPath = pendingTakeoverMarkerPath(process.cwd());
 
 async function claimPendingTakeover(
-  markerAt: string | undefined
+  markerAt: string | undefined,
+  attemptId: string | undefined
 ): Promise<'ok' | 'stopped' | 'failed'> {
   if (!sessionId || !accessToken) return 'failed';
   try {
@@ -272,13 +273,18 @@ async function claimPendingTakeover(
         Authorization: `Bearer ${accessToken}`,
       },
       // reclaimOf CASes the claim against the server-side stop tombstone
-      // (PR #563 round 9): a stop newer than the marker refuses atomically,
-      // so a parked reclaim can never re-mark a finished turn as running.
+      // (PR #563 round 9). Round 25: the marker's attempt token rides in
+      // (clock-free fencing — the wall-clock fallback remains only for
+      // genuinely tokenless legacy markers), and the studio does too, so
+      // this recovery passes the lease/revocation boundary like every
+      // other claimant.
       body: JSON.stringify({
         sessionId,
         lifecycle: 'running',
         event: 'prompt',
         ...(markerAt ? { reclaimOf: markerAt } : {}),
+        ...(attemptId ? { attemptId } : {}),
+        ...(studioId && studioId !== 'main' ? { studioId } : {}),
       }),
       signal: AbortSignal.timeout(3000),
     });

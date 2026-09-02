@@ -51,15 +51,16 @@ describe('shouldReclaim', () => {
 describe('processPendingTakeover', () => {
   it('claims a fresh own-session marker and consumes it', async () => {
     const at = new Date().toISOString();
-    const p = write({ sessionId: 's1', at });
+    const p = write({ sessionId: 's1', at, attemptId: 'attempt-p' });
     const claim = vi.fn(async () => 'ok' as const);
 
     const outcome = await processPendingTakeover({ markerPath: p, sessionId: 's1', claim });
 
     expect(outcome).toBe('claimed');
-    // The marker's birth time rides into the claim — the server CASes it
-    // against the stop tombstone.
-    expect(claim).toHaveBeenCalledWith(at);
+    // The marker's birth time AND attempt token ride into the claim
+    // (round 25) — the token is the clock-free fence; the timestamp
+    // fallback survives only for genuinely tokenless legacy markers.
+    expect(claim).toHaveBeenCalledWith(at, 'attempt-p');
     expect(existsSync(p)).toBe(false);
   });
 
@@ -143,5 +144,23 @@ describe('plugin wiring (reachability)', () => {
     expect(poll).toBeGreaterThan(-1);
     expect(call).toBeGreaterThan(poll);
     expect(source.indexOf('claim: claimPendingTakeover', call)).toBeGreaterThan(call);
+  });
+});
+
+describe('reclaim wiring round 25 (reachability)', () => {
+  it('the plugin claim carries attemptId and studioId to the boundary', async () => {
+    const { readFileSync } = await import('fs');
+    const { join, dirname } = await import('path');
+    const { fileURLToPath } = await import('url');
+    const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'index.ts'), 'utf-8');
+    const claim = source.indexOf('async function claimPendingTakeover(');
+    const attempt = source.indexOf('...(attemptId ? { attemptId } : {})', claim);
+    const studio = source.indexOf(
+      "...(studioId && studioId !== 'main' ? { studioId } : {})",
+      claim
+    );
+    expect(claim).toBeGreaterThan(-1);
+    expect(attempt).toBeGreaterThan(claim);
+    expect(studio).toBeGreaterThan(claim);
   });
 });
