@@ -459,21 +459,69 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         // and the missing-stop stamp lands alongside, fencing legacy
         // attempt-less reclaim tails (the channel plugin's). A refused
         // stamp fails the request so the caller keeps evidence.
+        let reconciledEpoch: string | undefined;
         try {
           const attempts = Array.isArray(fenceAttempts)
             ? fenceAttempts.filter((a): a is string => typeof a === 'string' && a.length > 0)
             : [];
-          const { error: fenceError } = await dataComposer.getClient().rpc('fence_turn_attempts', {
-            p_session_id: sessionId,
-            p_attempts: attempts,
-          } as never);
+          const { data: closed, error: fenceError } = await dataComposer
+            .getClient()
+            .rpc('fence_turn_attempts', {
+              p_session_id: sessionId,
+              p_attempts: attempts,
+            } as never);
           if (fenceError) throw new Error(fenceError.message);
+          reconciledEpoch = typeof closed === 'string' && closed ? closed : undefined;
         } catch (err: unknown) {
           logger.error('[HookLifecycle] Suppressed-stop attempt fence failed', {
             sessionId,
             error: err instanceof Error ? err.message : String(err),
           });
           res.status(500).json({ success: false, error: 'stop fence failed' });
+          return;
+        }
+        if (reconciledEpoch !== undefined) {
+          // Round 23: the fence RECONCILED a committed-but-abandoned claim —
+          // its turn just ended here, so the REAL boundary chain runs,
+          // fenced on the closed epoch, exactly like a fenced stop. Row-only
+          // reconciliation would have left graph claims held and a
+          // pendingRelease un-completed while renewing the lease.
+          const boundaryAt = new Date().toISOString();
+          void releaseGraphClaimsForSession(
+            dataComposer.getClient(),
+            sessionId,
+            'cli-turn-stopped',
+            boundaryAt,
+            reconciledEpoch
+          ).catch((err: unknown) => {
+            logger.warn('[HookLifecycle] Reconciled-stop graph release failed', {
+              sessionId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          });
+          const closedEpoch = reconciledEpoch;
+          void (async () => {
+            const postUpdate = await dataComposer.repositories.memory.getSession(sessionId);
+            const terminal =
+              Boolean(postUpdate?.endedAt) ||
+              postUpdate?.status === 'completed' ||
+              postUpdate?.lifecycle === 'completed';
+            const released = await leaseService.releaseAtBoundary(sessionId, {
+              userId: session.userId,
+              sessionTerminal: terminal,
+              reason: 'cli-turn-stopped',
+              expectedTurnEpoch: closedEpoch,
+            });
+            if (!released) {
+              await leaseService.renewBySession(sessionId, session.userId);
+            }
+          })().catch((err: unknown) => {
+            logger.warn('[HookLifecycle] Reconciled-stop lease release failed', {
+              sessionId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          });
+          res.json({ success: true, sessionId, lifecycle, reconciled: true });
           return;
         }
         try {

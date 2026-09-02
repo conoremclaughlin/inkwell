@@ -587,6 +587,41 @@ describe('hook-lifecycle CLI turn signal', () => {
       });
     });
 
+    it('a RECONCILED fence runs the REAL boundary chain on the closed epoch (round 23)', async () => {
+      // The fence closed a committed-but-abandoned claim: graph + lease
+      // releases run fenced on that epoch — row-only reconciliation left
+      // graph claims held and pendingRelease un-completed while renewing.
+      rpcResult = () => ({ data: 'epoch-r', error: null });
+      const release = vi
+        .spyOn(StudioLeaseService.prototype, 'releaseAtBoundary')
+        .mockResolvedValue(true);
+      const renew = vi
+        .spyOn(StudioLeaseService.prototype, 'renewBySession')
+        .mockResolvedValue(true);
+
+      const resp = await fetch(`${baseUrl}/api/hooks/lifecycle`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer test' },
+        body: JSON.stringify({
+          sessionId: SESSION_ID,
+          lifecycle: 'idle',
+          event: 'stop',
+          turnEpochMissing: true,
+          fenceAttempts: ['attempt-1'],
+        }),
+      });
+
+      expect(resp.status).toBe(200);
+      const body = (await resp.json()) as Record<string, unknown>;
+      expect(body.reconciled).toBe(true);
+      await vi.waitFor(() => expect(release).toHaveBeenCalled());
+      expect(release.mock.calls[0]![1]).toMatchObject({ expectedTurnEpoch: 'epoch-r' });
+      const graphCall = vi.mocked(releaseGraphClaimsForSession).mock.calls.at(-1)!;
+      expect(graphCall[4]).toBe('epoch-r');
+      // Released → no renew-only fallback ran on the reconciled path.
+      expect(renew).not.toHaveBeenCalled();
+    });
+
     it('a missing stop with NO attempts still stamps the legacy fence (round 21)', async () => {
       // The channel plugin's attempt-less reclaim tail is fenced by the
       // missing-stop stamp inside fence_turn_attempts — the RPC must be

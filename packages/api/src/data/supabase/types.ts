@@ -4615,7 +4615,7 @@ export type Database = {
           p_session_id: string;
           p_attempts: Json;
         };
-        Returns: undefined;
+        Returns: string;
       };
       repoint_sessions_off_ephemeral: {
         Args: {

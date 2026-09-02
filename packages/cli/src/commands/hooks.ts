@@ -795,7 +795,7 @@ async function updateRuntimeGenerationState(
      */
     studioId?: string;
   }
-): Promise<{ ok: boolean; turnEpoch?: string }> {
+): Promise<{ ok: boolean; turnEpoch?: string; leaseLost?: boolean }> {
   const sessionId = resolveActivePcpSessionId(cwd);
   if (!sessionId) return { ok: true }; // nothing to take over — vacuously fine
 
@@ -849,7 +849,9 @@ async function updateRuntimeGenerationState(
         // recovery path.
         if (body?.studioLeaseHeld === false) {
           sbDebugLog('hooks', 'lifecycle_lease_not_held', { sessionId, lifecycle, attempt });
-          return { ok: false };
+          // Round 23: a lost lease is a distinct verdict — the caller must
+          // ENFORCE it (non-zero exit), not fold it into generic failure.
+          return { ok: false, leaseLost: true };
         }
         return {
           ok: true,
@@ -2844,6 +2846,7 @@ async function onStopHandler(options?: { backend?: string }): Promise<void> {
   // epoch; a refused attempt is handed to the fence instead.
   const ownMarkerPath = pendingTakeoverMarkerPath(cwd, stopGeneration);
   let adjudicatedEpoch: string | undefined;
+  let adjudicationLeaseLost = false;
   const abandonedAttempts: string[] = [];
   try {
     const rawMarker = JSON.parse(readFileSync(ownMarkerPath, 'utf-8')) as {
@@ -2870,8 +2873,9 @@ async function onStopHandler(options?: { backend?: string }): Promise<void> {
       );
       if (reclaim.ok && reclaim.turnEpoch) {
         adjudicatedEpoch = reclaim.turnEpoch;
-      } else if (rawMarker.attemptId) {
-        abandonedAttempts.push(rawMarker.attemptId);
+      } else {
+        if (rawMarker.attemptId) abandonedAttempts.push(rawMarker.attemptId);
+        if (reclaim.leaseLost) adjudicationLeaseLost = true;
       }
     }
     // Round 22: the marker is NOT deleted here — evidence survives until
@@ -2938,6 +2942,16 @@ async function onStopHandler(options?: { backend?: string }): Promise<void> {
       sessionId: stopSessionId,
       adjudicatedEpoch,
     });
+  }
+  if (adjudicationLeaseLost) {
+    // Round 23: the turn ran in a worktree whose lease was REVOKED — the
+    // fence has retired the attempt, but the failure must be ENFORCED, not
+    // absorbed: a clean exit here would report a corrupted-context turn as
+    // success.
+    console.error(
+      'ink: this turn ran without its worktree lease (revoked or lost); reporting failure.'
+    );
+    process.exitCode = 1;
   }
 
   // Increment tool call counter

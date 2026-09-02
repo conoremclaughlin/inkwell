@@ -713,6 +713,76 @@ d('session_running_write trigger', () => {
       expect((staleReplay as unknown as { outcome: string }).outcome).toBe('stopped');
     });
 
+    it('replays are concurrent-safe in effect and never resurrect (round 23)', async () => {
+      const sessionId = await insertSession({ lifecycle: 'idle', metadata: {} });
+
+      // 1) Claim, then verify the fence RETURNS the epoch it closes.
+      const { data: first } = await client.rpc('claim_turn_epoch', {
+        p_session_id: sessionId,
+        p_set_running: true,
+        p_attempt: 'attempt-r',
+      } as never);
+      const v1 = first as unknown as { outcome: string; epoch: string };
+      expect(v1.outcome).toBe('claimed');
+
+      // 2) A replay while RUNNING returns the same epoch (idempotent, no
+      // trigger rotation — the row write never leaves/enters running).
+      const { data: replay } = await client.rpc('claim_turn_epoch', {
+        p_session_id: sessionId,
+        p_set_running: true,
+        p_attempt: 'attempt-r',
+      } as never);
+      expect((replay as unknown as { epoch: string }).epoch).toBe(v1.epoch);
+      expect((await readSession(sessionId)).turn_epoch).toBe(v1.epoch);
+
+      // 3) The turn ends WITHOUT a tombstone (a server-style finalize:
+      // lifecycle idle, epoch preserved) — the replay must NOT resurrect.
+      await client
+        .from('sessions')
+        .update({ lifecycle: 'idle' } as never)
+        .eq('id', sessionId);
+      const { data: dead } = await client.rpc('claim_turn_epoch', {
+        p_session_id: sessionId,
+        p_set_running: true,
+        p_attempt: 'attempt-r',
+      } as never);
+      expect((dead as unknown as { outcome: string }).outcome).toBe('stopped');
+      const after = await readSession(sessionId);
+      expect(after.lifecycle).toBe('idle');
+      expect(after.turn_epoch).toBe(v1.epoch); // no trigger rotation either
+
+      // 4) The fence returns the epoch it closes — and ONLY for a running
+      // row: a completed row keeps its lifecycle and returns NULL.
+      const { data: fresh } = await client.rpc('claim_turn_epoch', {
+        p_session_id: sessionId,
+        p_set_running: true,
+        p_attempt: 'attempt-s',
+      } as never);
+      const v2 = fresh as unknown as { epoch: string };
+      const { data: closed } = await client.rpc('fence_turn_attempts', {
+        p_session_id: sessionId,
+        p_attempts: ['attempt-s'],
+      } as never);
+      expect(closed).toBe(v2.epoch);
+
+      const { data: third } = await client.rpc('claim_turn_epoch', {
+        p_session_id: sessionId,
+        p_set_running: true,
+        p_attempt: 'attempt-t',
+      } as never);
+      expect((third as unknown as { outcome: string }).outcome).toBe('claimed');
+      await client
+        .from('sessions')
+        .update({ lifecycle: 'completed' } as never)
+        .eq('id', sessionId);
+      const { data: notClosed } = await client.rpc('fence_turn_attempts', {
+        p_session_id: sessionId,
+        p_attempts: ['attempt-t'],
+      } as never);
+      expect(notClosed).toBeNull();
+      expect((await readSession(sessionId)).lifecycle).toBe('completed');
+    });
+
     it('a PATHLESS studio regrants under the canonical backing class (round 16)', async () => {
       // Round 15 refused every unchanged empty-path regrant (the moved-
       // backing recheck compared '' to NULLIF('','')) and locked the wrong

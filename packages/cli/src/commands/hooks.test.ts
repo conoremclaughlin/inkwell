@@ -1441,7 +1441,7 @@ describe('lease acknowledgement and fail-closed degradation (round 11)', () => {
     const source = await loadSource();
     const fn = source.indexOf('async function updateRuntimeGenerationState(');
     const check = source.indexOf('if (body?.studioLeaseHeld === false) {', fn);
-    const refuse = source.indexOf('return { ok: false };', check);
+    const refuse = source.indexOf('return { ok: false, leaseLost: true };', check);
     const okReturn = source.indexOf('ok: true,', check);
     expect(fn).toBeGreaterThan(-1);
     expect(check).toBeGreaterThan(fn);
@@ -1555,6 +1555,22 @@ describe('acknowledged stops and lease-bounded adjudication (round 22)', () => {
     expect(persist).toBeGreaterThan(ackBranch);
     // No unlink of the own marker anywhere before the stop result exists.
     expect(source.slice(stop, result).includes('rmSync(ownMarkerPath')).toBe(false);
+  });
+});
+
+describe('lease-lost enforcement at stop (round 23)', () => {
+  it('a revoked-lease adjudication forces a non-zero exit', async () => {
+    const { readFileSync } = await import('fs');
+    const { dirname, join } = await import('path');
+    const { fileURLToPath } = await import('url');
+    const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'hooks.ts'), 'utf-8');
+    const stop = source.indexOf('async function onStopHandler(');
+    const flag = source.indexOf('if (reclaim.leaseLost) adjudicationLeaseLost = true;', stop);
+    const enforce = source.indexOf('if (adjudicationLeaseLost) {', stop);
+    const exitCode = source.indexOf('process.exitCode = 1;', enforce);
+    expect(flag).toBeGreaterThan(stop);
+    expect(enforce).toBeGreaterThan(flag);
+    expect(exitCode).toBeGreaterThan(enforce);
   });
 });
 
