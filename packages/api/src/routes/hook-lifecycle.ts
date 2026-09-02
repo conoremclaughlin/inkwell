@@ -61,6 +61,7 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         reclaimOf,
         turnEpoch,
         turnEpochMissing,
+        scopeTombstoneAt,
       } = req.body as {
         sessionId?: string;
         lifecycle?: string;
@@ -110,6 +111,14 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
          * detach boundary recover the session instead.
          */
         turnEpochMissing?: boolean;
+        /**
+         * Round 19: a wrapper scope-end tombstone SCOPED to that wrapper's
+         * own parked claim — its last attempted marker's birth time. The
+         * stamp is monotonic (GREATEST semantics via a guarded update), so
+         * it fences exactly the stale generation's claim without postdating
+         * a successor generation's newer marker.
+         */
+        scopeTombstoneAt?: string;
       };
 
       if (!sessionId) {
@@ -440,11 +449,17 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         // a parked claim can still land. A refused stamp fails the request
         // so the caller keeps its evidence and retries.
         try {
+          const scoped =
+            typeof scopeTombstoneAt === 'string' && Number.isFinite(Date.parse(scopeTombstoneAt));
+          const stampAt = scoped ? (scopeTombstoneAt as string) : new Date().toISOString();
+          // Monotonic: never move an existing NEWER tombstone backward — a
+          // zero-row match means a later stop already fenced further.
           const { error: tombstoneError } = await dataComposer
             .getClient()
             .from('sessions')
-            .update({ cli_turn_stopped_at: new Date().toISOString() })
-            .eq('id', sessionId);
+            .update({ cli_turn_stopped_at: stampAt })
+            .eq('id', sessionId)
+            .or(`cli_turn_stopped_at.is.null,cli_turn_stopped_at.lt.${stampAt}`);
           if (tombstoneError) throw new Error(tombstoneError.message);
         } catch (err: unknown) {
           logger.error('[HookLifecycle] Suppressed-stop tombstone stamp failed', {

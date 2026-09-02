@@ -55,6 +55,10 @@ function makeFakeClient() {
       is() {
         return obj;
       },
+      or(expr: string) {
+        eqs.push(['or', expr]);
+        return obj;
+      },
       not() {
         return obj;
       },
@@ -558,6 +562,34 @@ describe('hook-lifecycle CLI turn signal', () => {
       await new Promise((r) => setImmediate(r));
       expect(release).not.toHaveBeenCalled();
       expect(releaseGraphClaimsForSession).not.toHaveBeenCalled();
+    });
+
+    it('a SCOPED tombstone stamps the attempted marker time, monotonically (round 19)', async () => {
+      const markerAt = '2026-09-02T03:00:00.000Z';
+      const resp = await fetch(`${baseUrl}/api/hooks/lifecycle`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer test' },
+        body: JSON.stringify({
+          sessionId: SESSION_ID,
+          lifecycle: 'idle',
+          event: 'stop',
+          turnEpochMissing: true,
+          scopeTombstoneAt: markerAt,
+        }),
+      });
+      expect(resp.status).toBe(200);
+
+      const stamp = recordedUpdates.find(
+        (u) => u.table === 'sessions' && 'cli_turn_stopped_at' in u.payload
+      )!;
+      // Scoped to the wrapper's OWN attempted marker — never now(), which
+      // could postdate and refuse a successor generation's newer marker.
+      expect(stamp.payload.cli_turn_stopped_at).toBe(markerAt);
+      // ...and monotonic: guarded so an existing newer tombstone survives.
+      expect(stamp.eqs).toContainEqual([
+        'or',
+        `cli_turn_stopped_at.is.null,cli_turn_stopped_at.lt.${markerAt}`,
+      ]);
     });
 
     it('a REFUSED tombstone stamp fails the suppressed stop — never a 200 without the fence (round 18)', async () => {

@@ -3549,12 +3549,20 @@ function startSessionTakeoverWatcher(
     // closed with its FENCED stop (a crashed child sends no stop hook); an
     // unclaimed scope stamps the stop tombstone so a claim still parked in
     // the server is refused when it lands.
-    finalizeScope: async (turnEpoch) => {
+    finalizeScope: async (turnEpoch, tombstoneAt) => {
       await postLifecycle({
         sessionId: pcpSessionId,
         lifecycle: 'idle',
         event: 'stop',
-        ...(turnEpoch ? { turnEpoch } : { turnEpochMissing: true }),
+        ...(turnEpoch
+          ? { turnEpoch }
+          : {
+              turnEpochMissing: true,
+              // Round 19: scope the tombstone to OUR parked claim's marker
+              // birth time — a now() tombstone could postdate and refuse a
+              // successor generation's newer marker on the same session.
+              ...(tombstoneAt ? { scopeTombstoneAt: tombstoneAt } : {}),
+            }),
         agentId: 'wrapper-scope-end',
       });
     },
@@ -4104,6 +4112,8 @@ export async function runClaudeInteractive(
     });
 
     await interactiveTakeoverWatcher?.stop();
+    // Round 19: the adjudication tick inside stop() can enforce — re-check.
+    if (interactiveEnforced) process.exit(1);
     process.exit(code || 0);
   }
 }

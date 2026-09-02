@@ -10,7 +10,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, writeFileSync, rmSync, existsSync, mkdirSync } from 'fs';
+import { mkdtempSync, writeFileSync, rmSync, existsSync, mkdirSync, readFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import {
@@ -363,11 +363,10 @@ describe('scope-end wiring (round 17, reachability)', () => {
       'utf-8'
     );
     const helper = source.indexOf('function startSessionTakeoverWatcher(');
-    const finalize = source.indexOf('finalizeScope: async (turnEpoch) => {', helper);
-    const fenced = source.indexOf(
-      '...(turnEpoch ? { turnEpoch } : { turnEpochMissing: true })',
-      finalize
-    );
+    const finalize = source.indexOf('finalizeScope: async (turnEpoch, tombstoneAt) => {', helper);
+    const fenced = source.indexOf('turnEpochMissing: true,', finalize);
+    const scopedStone = source.indexOf('scopeTombstoneAt: tombstoneAt', finalize);
+    expect(scopedStone).toBeGreaterThan(finalize);
     expect(finalize).toBeGreaterThan(helper);
     expect(fenced).toBeGreaterThan(finalize);
     // Every stop is awaited — the boundary is real, not fire-and-forget.
@@ -469,7 +468,7 @@ describe('event-driven ticks and the stop boundary (round 17)', () => {
     releaseClaim!();
     await stopped;
 
-    expect(finalizeScope).toHaveBeenCalledWith('epoch-crash');
+    expect(finalizeScope).toHaveBeenCalledWith('epoch-crash', undefined);
   });
 
   it('a scope that NEVER attempted a claim does not finalize — no tombstone to refuse a successor (round 18)', async () => {
@@ -493,7 +492,8 @@ describe('event-driven ticks and the stop boundary (round 17)', () => {
   it('an ATTEMPTED-but-unclaimed scope finalizes with undefined — the tombstone path', async () => {
     const finalizeScope = vi.fn(async () => undefined);
     const claim = vi.fn(async () => 'failed' as const);
-    const p = write({ sessionId: 's1', at: new Date().toISOString() });
+    const markerAt = new Date().toISOString();
+    const p = write({ sessionId: 's1', at: markerAt });
     const watcher = startTakeoverWatcher({
       cwd: dir,
       expectedSessionId: 's1',
@@ -505,7 +505,9 @@ describe('event-driven ticks and the stop boundary (round 17)', () => {
 
     await watcher.stop();
 
-    expect(finalizeScope).toHaveBeenCalledWith(undefined);
+    // Round 19: the tombstone is SCOPED to our own attempted marker's birth
+    // time — never now(), which could refuse a successor's newer marker.
+    expect(finalizeScope).toHaveBeenCalledWith(undefined, markerAt);
     // Acknowledged boundary → the marker evidence retires with the scope.
     expect(existsSync(p)).toBe(false);
   });
@@ -572,5 +574,73 @@ describe('event-driven ticks and the stop boundary (round 17)', () => {
     write({ sessionId: 's1', at: new Date().toISOString() });
     await new Promise((r) => setTimeout(r, 60));
     expect(claim).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Round 19 (Lumen): four close-race refinements — adjudication ENFORCES,
+ * marker retirement is compare-and-delete, the scope tombstone is scoped to
+ * the attempted marker's birth time, and the epoch record clear is
+ * compare-and-delete too.
+ */
+describe('close-race enforcement and compare-and-delete (round 19)', () => {
+  it('a permanent refusal at ADJUDICATION still enforces', async () => {
+    const claim = vi.fn(async () => 'unprotected' as const);
+    const onUnprotected = vi.fn();
+    const watcher = startTakeoverWatcher({
+      cwd: dir,
+      expectedSessionId: 's1',
+      claim,
+      onUnprotected,
+      intervalMs: 60_000,
+    });
+    // The marker lands exactly at close — only the adjudication tick sees it.
+    write({ sessionId: 's1', at: new Date().toISOString() });
+
+    await watcher.stop();
+
+    expect(claim).toHaveBeenCalledTimes(1);
+    expect(onUnprotected).toHaveBeenCalledTimes(1);
+  });
+
+  it('a successor generation’s overwrite survives a parked claim’s retirement', async () => {
+    let releaseClaim: (() => void) | undefined;
+    const claim = vi.fn(() => new Promise<'ok'>((resolve) => (releaseClaim = () => resolve('ok'))));
+    const p = write({ sessionId: 's1', at: new Date().toISOString(), wrapperGeneration: 'gen-a' });
+    const watcher = startTakeoverWatcher({
+      cwd: dir,
+      expectedSessionId: 's1',
+      generation: 'gen-a',
+      claim,
+      intervalMs: 60_000,
+    });
+    await vi.waitFor(() => expect(claim).toHaveBeenCalled(), { timeout: 2000 });
+
+    // Gen-B's backend overwrites the shared marker path while A's claim is
+    // parked. A's retirement must not delete B's marker.
+    const bMarker = { sessionId: 's1', at: new Date().toISOString(), wrapperGeneration: 'gen-b' };
+    writeFileSync(p, JSON.stringify(bMarker));
+    releaseClaim!();
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(existsSync(p)).toBe(true);
+    expect(JSON.parse(readFileSync(p, 'utf-8'))).toMatchObject({ wrapperGeneration: 'gen-b' });
+    await watcher.stop();
+    // ...and stop() leaves the foreign-generation marker alone too.
+    expect(existsSync(p)).toBe(true);
+  });
+
+  it('clearCliTurnEpoch is compare-and-delete', async () => {
+    const { writeCliTurnEpoch, readCliTurnEpoch, clearCliTurnEpoch } =
+      await import('./takeover-watcher.js');
+    writeCliTurnEpoch(dir, { sessionId: 's1', turnEpoch: 'e-b', wrapperGeneration: 'gen-b' });
+
+    // A stale reader expecting ITS epoch/generation must not delete the
+    // replacement.
+    clearCliTurnEpoch(dir, 's1', { turnEpoch: 'e-a', wrapperGeneration: 'gen-a' });
+    expect(readCliTurnEpoch(dir)).toMatchObject({ turnEpoch: 'e-b' });
+
+    clearCliTurnEpoch(dir, 's1', { turnEpoch: 'e-b', wrapperGeneration: 'gen-b' });
+    expect(readCliTurnEpoch(dir)).toBeNull();
   });
 });

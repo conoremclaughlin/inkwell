@@ -1379,11 +1379,15 @@ describe('CLI turn-epoch round-trip (round 10)', () => {
     const stop = source.indexOf('async function onStopHandler(');
     const read = source.indexOf('readCliTurnEpoch(cwd)', stop);
     const scoped = source.indexOf(
-      'epochRecord?.sessionId === stopSessionId ? epochRecord.turnEpoch : undefined',
+      'const stopEpoch = recordIsOurs ? epochRecord?.turnEpoch : undefined;',
       stop
     );
     const sent = source.indexOf('turnEpoch: stopEpoch', stop);
-    const cleared = source.indexOf('clearCliTurnEpoch(cwd, stopSessionId)', stop);
+    const cleared = source.indexOf('clearCliTurnEpoch(cwd, stopSessionId, {', stop);
+    // Round 19: the record must match OUR wrapper generation, and the clear
+    // is compare-and-delete on the exact record we sent.
+    const genGuard = source.indexOf('epochRecord.wrapperGeneration === stopGeneration', stop);
+    expect(genGuard).toBeGreaterThan(stop);
     expect(stop).toBeGreaterThan(-1);
     expect(read).toBeGreaterThan(stop);
     expect(scoped).toBeGreaterThan(stop);

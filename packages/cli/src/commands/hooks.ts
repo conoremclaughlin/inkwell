@@ -2817,13 +2817,30 @@ async function onStopHandler(options?: { backend?: string }): Promise<void> {
   // server suppresses destructive boundary releases instead of running them
   // unfenced (fail closed on degraded local state).
   const stopSessionId = resolveActivePcpSessionId(cwd);
+  const stopGeneration = process.env.INK_RUNTIME_LINK_ID;
   const epochRecord = readCliTurnEpoch(cwd);
-  const stopEpoch =
-    stopSessionId && epochRecord?.sessionId === stopSessionId ? epochRecord.turnEpoch : undefined;
+  // Round 19: the record must belong to OUR session AND OUR wrapper
+  // generation — a stale backend's on-stop must not send (and then clear) a
+  // successor generation's epoch. Generation-less pairs still match (legacy).
+  const recordIsOurs =
+    Boolean(stopSessionId) &&
+    epochRecord != null &&
+    epochRecord.sessionId === stopSessionId &&
+    (epochRecord.wrapperGeneration === undefined ||
+      stopGeneration === undefined ||
+      epochRecord.wrapperGeneration === stopGeneration);
+  const stopEpoch = recordIsOurs ? epochRecord?.turnEpoch : undefined;
   await updateRuntimeGenerationState(cwd, config, agentId, 'idle', 'stop', {
     ...(stopEpoch ? { turnEpoch: stopEpoch } : { turnEpochMissing: true }),
   });
-  if (stopSessionId) clearCliTurnEpoch(cwd, stopSessionId);
+  // Compare-and-delete: only the exact record we sent retires — a record
+  // replaced during the awaited request belongs to its replacer.
+  if (stopSessionId && recordIsOurs && epochRecord != null) {
+    clearCliTurnEpoch(cwd, stopSessionId, {
+      turnEpoch: epochRecord.turnEpoch,
+      wrapperGeneration: epochRecord.wrapperGeneration,
+    });
+  }
 
   // Increment tool call counter
   const countStr = readRuntimeFile(cwd, 'tool-count');

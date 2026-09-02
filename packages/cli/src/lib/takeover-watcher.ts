@@ -76,10 +76,29 @@ export function readCliTurnEpoch(cwd: string): CliTurnEpochRecord | null {
   }
 }
 
-/** Clear the record only when it belongs to the given session. */
-export function clearCliTurnEpoch(cwd: string, sessionId: string): void {
+/**
+ * Clear the record only when it belongs to the given session — and, when
+ * `expected` fields are provided, only when they still match (round 19:
+ * compare-and-delete; a record replaced by a successor generation during an
+ * awaited request must not be deleted by the stale reader).
+ */
+export function clearCliTurnEpoch(
+  cwd: string,
+  sessionId: string,
+  expected?: { turnEpoch?: string; wrapperGeneration?: string }
+): void {
   const record = readCliTurnEpoch(cwd);
   if (record?.sessionId !== sessionId) return;
+  if (expected?.turnEpoch !== undefined && record.turnEpoch !== expected.turnEpoch) return;
+  if (
+    expected !== undefined &&
+    'wrapperGeneration' in expected &&
+    (record.wrapperGeneration ?? undefined) !== (expected.wrapperGeneration ?? undefined) &&
+    record.wrapperGeneration !== undefined &&
+    expected.wrapperGeneration !== undefined
+  ) {
+    return;
+  }
   try {
     rmSync(cliTurnEpochPath(cwd), { force: true });
   } catch {
@@ -160,10 +179,21 @@ export async function watchTick(opts: {
   }
   const verdict = await opts.claim(marker.sessionId, marker.at);
   if (verdict === 'failed') return 'failed';
-  try {
-    rmSync(opts.markerPath, { force: true });
-  } catch {
-    // The stop hook also deletes; re-judged next tick if it survives.
+  // Round 19: COMPARE-and-delete. A successor generation can overwrite the
+  // shared marker path while our claim is parked — deleting blindly would
+  // erase ITS marker. Only the exact marker we adjudicated retires.
+  const current = readMarker(opts.markerPath);
+  if (
+    current &&
+    current.sessionId === marker.sessionId &&
+    current.at === marker.at &&
+    current.wrapperGeneration === marker.wrapperGeneration
+  ) {
+    try {
+      rmSync(opts.markerPath, { force: true });
+    } catch {
+      // The stop hook also deletes; re-judged next tick if it survives.
+    }
   }
   // 'unprotected' (round 15): the server refused the lease PERMANENTLY —
   // revoked thread, expired/retired studio, or another holder. Recovery can
@@ -188,7 +218,16 @@ export function startTakeoverWatcher(opts: {
    * (the wrapper stamps the stop tombstone so a claim still parked in the
    * server — e.g. behind a timed-out fetch — is refused when it lands).
    */
-  finalizeScope?: (turnEpoch: string | undefined) => Promise<void>;
+  finalizeScope?: (
+    turnEpoch: string | undefined,
+    /**
+     * Round 19: when nothing was claimed, the tombstone must be SCOPED to
+     * this generation's own parked claim — its last attempted marker's
+     * birth time. A now() tombstone would postdate (and wrongly refuse) a
+     * successor generation's newer marker on the same session.
+     */
+    tombstoneAt?: string
+  ) => Promise<void>;
   /** Round 18: this wrapper's generation (runtimeLinkId) — see watchTick. */
   generation?: string;
   intervalMs?: number;
@@ -205,7 +244,8 @@ export function startTakeoverWatcher(opts: {
   // never claimed must not stamp a tombstone that could refuse a
   // SUCCESSOR wrapper's older-marker reclaim.
   let attemptedClaim = false;
-  const tickOnce = async (bypassStopping: boolean) => {
+  let lastAttemptedMarkerAt: string | undefined;
+  const tickOnce = async () => {
     try {
       const outcome = await watchTick({
         markerPath,
@@ -213,11 +253,15 @@ export function startTakeoverWatcher(opts: {
         expectedGeneration: opts.generation,
         claim: (sessionId, markerAt) => {
           attemptedClaim = true;
+          lastAttemptedMarkerAt = markerAt;
           return opts.claim(sessionId, markerAt);
         },
       });
       if (outcome !== 'skipped') opts.log?.(outcome);
-      if (outcome === 'unprotected' && !bypassStopping) opts.onUnprotected?.();
+      // Round 19: enforcement fires from the ADJUDICATION tick too — a
+      // close-race permanent refusal must still flip the enforcement flag
+      // so the wrapper exits non-zero (killing an exited child is a no-op).
+      if (outcome === 'unprotected') opts.onUnprotected?.();
     } catch {
       // Never let the watcher take down the wrapper.
     } finally {
@@ -226,7 +270,7 @@ export function startTakeoverWatcher(opts: {
   };
   const runTick = () => {
     if (stopping || inFlight) return;
-    inFlight = tickOnce(false);
+    inFlight = tickOnce();
   };
   // Round 16: the FIRST tick runs immediately (a marker may predate us).
   runTick();
@@ -267,7 +311,7 @@ export function startTakeoverWatcher(opts: {
         // Best-effort.
       }
       if (inFlight) await inFlight;
-      await tickOnce(true);
+      await tickOnce();
       let finalized = !opts.finalizeScope;
       if (opts.finalizeScope) {
         const record = readCliTurnEpoch(opts.cwd);
@@ -282,9 +326,17 @@ export function startTakeoverWatcher(opts: {
         // wrapper's reclaim of an OLDER marker (round 18).
         if (claimedEpoch !== undefined || attemptedClaim) {
           try {
-            await opts.finalizeScope(claimedEpoch);
+            await opts.finalizeScope(
+              claimedEpoch,
+              claimedEpoch === undefined ? lastAttemptedMarkerAt : undefined
+            );
             finalized = true;
-            if (claimedEpoch) clearCliTurnEpoch(opts.cwd, opts.expectedSessionId);
+            if (claimedEpoch) {
+              clearCliTurnEpoch(opts.cwd, opts.expectedSessionId, {
+                turnEpoch: claimedEpoch,
+                wrapperGeneration: opts.generation,
+              });
+            }
           } catch {
             // The boundary write was NOT acknowledged: keep the record and
             // the marker as evidence; the sweep and the detach boundary
