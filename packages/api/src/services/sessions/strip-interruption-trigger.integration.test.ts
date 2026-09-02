@@ -560,6 +560,72 @@ d('session_running_write trigger', () => {
       }
     });
 
+    it('a PATHLESS studio regrants under the canonical backing class (round 16)', async () => {
+      // Round 15 refused every unchanged empty-path regrant (the moved-
+      // backing recheck compared '' to NULLIF('','')) and locked the wrong
+      // class. A vacant eligible pathless studio must claim + regrant; a
+      // pathless SIBLING holding a lease must refuse (one shared
+      // defaultWorkingDirectory class per user, like the canonical grant).
+      const sessionId = await insertSession({ lifecycle: 'idle', metadata: {} });
+      const studioId = randomUUID();
+      const siblingId = randomUUID();
+      const { error: e1 } = await client.from('studios').insert({
+        id: studioId,
+        user_id: USER,
+        branch: 'test/pathless-a',
+        repo_root: '/tmp/pathless',
+        worktree_path: '',
+        status: 'active',
+        lease: null,
+      } as never);
+      expect(e1).toBeNull();
+
+      try {
+        const { data: won } = await client.rpc('claim_turn_epoch', {
+          p_session_id: sessionId,
+          p_set_running: true,
+          p_studio_id: studioId,
+          p_regrant: { sessionId, threadKey: 'test:pathless', agentId: 'wren' },
+        } as never);
+        const verdict = won as unknown as { outcome: string; regranted: boolean };
+        expect(verdict.outcome).toBe('claimed');
+        expect(verdict.regranted).toBe(true);
+
+        // Vacate, add a pathless sibling with a lease — the shared class is
+        // occupied, so the regrant refuses.
+        await client
+          .from('studios')
+          .update({ lease: null } as never)
+          .eq('id', studioId);
+        const { error: e2 } = await client.from('studios').insert({
+          id: siblingId,
+          user_id: USER,
+          branch: 'test/pathless-b',
+          repo_root: '/tmp/pathless',
+          worktree_path: '',
+          status: 'active',
+          lease: {
+            sessionId: randomUUID(),
+            threadKey: 'pr:pathless-sibling',
+            agentId: 'lumen',
+            acquiredAt: new Date().toISOString(),
+            heartbeatAt: new Date().toISOString(),
+          },
+        } as never);
+        expect(e2).toBeNull();
+
+        const { data: refused } = await client.rpc('claim_turn_epoch', {
+          p_session_id: sessionId,
+          p_set_running: true,
+          p_studio_id: studioId,
+          p_regrant: { sessionId, threadKey: 'test:pathless', agentId: 'wren' },
+        } as never);
+        expect((refused as unknown as { outcome: string }).outcome).toBe('lease-lost');
+      } finally {
+        await client.from('studios').delete().in('id', [studioId, siblingId]);
+      }
+    });
+
     it('the regrant sibling scan compares NORMALIZED checkout paths (round 15)', async () => {
       // Two rows naming the same tree with different raw spellings: the
       // sibling's held lease must refuse the regrant, exactly as

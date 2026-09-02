@@ -107,7 +107,7 @@ describe('watchTick', () => {
 });
 
 describe('startTakeoverWatcher', () => {
-  it('ticks on the interval, and stop() ends the scope and clears the marker', async () => {
+  it('ticks IMMEDIATELY, then on the interval; stop() ends the scope and clears the marker', async () => {
     vi.useFakeTimers();
     const p = write({ sessionId: 's1', at: new Date().toISOString() });
     const claim = vi.fn(async () => 'failed' as const); // keep the marker so ticks repeat
@@ -118,7 +118,10 @@ describe('startTakeoverWatcher', () => {
       intervalMs: 1000,
     });
 
-    await vi.advanceTimersByTimeAsync(1000);
+    // Round 16: the first tick runs at START — a short one-shot backend can
+    // finish inside the first interval, and its scope-end stop() would have
+    // cleared the marker before any claim ever ran.
+    await vi.advanceTimersByTimeAsync(0);
     expect(claim).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(1000);
     expect(claim).toHaveBeenCalledTimes(2);
@@ -145,7 +148,7 @@ describe('startTakeoverWatcher', () => {
       intervalMs: 1000,
     });
 
-    await vi.advanceTimersByTimeAsync(1000);
+    await vi.advanceTimersByTimeAsync(0); // immediate tick throws
     expect(claim).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(1000);
     expect(claim).toHaveBeenCalledTimes(2);
@@ -298,6 +301,34 @@ describe('reclaim wiring round 11 (reachability)', () => {
     expect(unheld).toBeGreaterThan(helper);
   });
 
+  it('a cross-tenant 403 maps to unprotected, and enforcement carries a non-zero exit (round 16)', async () => {
+    const { readFileSync } = await import('fs');
+    const { dirname } = await import('path');
+    const { fileURLToPath } = await import('url');
+    const source = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), '..', 'commands', 'claude.ts'),
+      'utf-8'
+    );
+    const helper = source.indexOf('function startSessionTakeoverWatcher(');
+    expect(
+      source.indexOf("if (resp.status === 403) return 'unprotected';", helper)
+    ).toBeGreaterThan(helper);
+
+    // Enforcement must not exit 0 (SIGTERM closes with code=null) nor retry.
+    const oneShot = source.indexOf('export async function runClaude(');
+    const interactive = source.indexOf('export async function runClaudeInteractive(');
+    const oneShotExit = source.indexOf('if (takeoverEnforced) process.exit(1);', oneShot);
+    expect(oneShotExit).toBeGreaterThan(oneShot);
+    expect(oneShotExit).toBeLessThan(interactive);
+    const interactiveGuard = source.indexOf('if (interactiveEnforced) {', interactive);
+    const interactiveExit = source.indexOf('process.exit(1);', interactiveGuard);
+    const retryBranch = source.indexOf('const shouldRetry =', interactive);
+    expect(interactiveGuard).toBeGreaterThan(interactive);
+    expect(interactiveExit).toBeGreaterThan(interactiveGuard);
+    // The enforcement check precedes the retry decision — no fresh-session retry.
+    expect(interactiveGuard).toBeLessThan(retryBranch);
+  });
+
   it('a permanent refusal terminates the backend at BOTH spawn sites (round 15)', async () => {
     const { readFileSync } = await import('fs');
     const { dirname } = await import('path');
@@ -334,7 +365,7 @@ describe('permanent refusal enforcement (round 15)', () => {
       onUnprotected,
     });
 
-    await vi.advanceTimersByTimeAsync(1000);
+    await vi.advanceTimersByTimeAsync(0); // the immediate tick enforces
     expect(onUnprotected).toHaveBeenCalledTimes(1);
     // The marker retired — recovery cannot converge, so no retry loop.
     expect(existsSync(p)).toBe(false);

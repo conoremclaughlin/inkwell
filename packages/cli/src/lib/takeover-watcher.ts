@@ -160,7 +160,7 @@ export function startTakeoverWatcher(opts: {
 }): { stop: () => void } {
   const markerPath = takeoverMarkerPath(opts.cwd);
   let inFlight = false;
-  const timer = setInterval(async () => {
+  const runTick = async () => {
     if (inFlight) return;
     inFlight = true;
     try {
@@ -176,7 +176,12 @@ export function startTakeoverWatcher(opts: {
     } finally {
       inFlight = false;
     }
-  }, opts.intervalMs ?? 3_000);
+  };
+  // Round 16: the FIRST tick runs immediately — a short one-shot backend
+  // can finish inside the first interval, and its scope-end stop() would
+  // clear the marker before any claim or enforcement ever ran.
+  void runTick();
+  const timer = setInterval(runTick, opts.intervalMs ?? 3_000);
   // The wrapper waits on the child anyway; unref keeps us from pinning the
   // process if the child exits without our stop() (belt and braces).
   timer.unref();

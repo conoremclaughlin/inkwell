@@ -3549,9 +3549,8 @@ function startSessionTakeoverWatcher(
             turnEpoch?: string;
             studioLeaseHeld?: boolean;
           } | null;
-          // Round 11: a reclaim whose lease report says NOT HELD is not a
-          // completed recovery — keep the marker so recovery stays active
-          // (bounded by the marker's age).
+          // Round 15: NOT HELD is a permanent refusal — surface it so the
+          // wrapper enforces instead of looping.
           if (body?.studioLeaseHeld === false) return 'unprotected';
           if (body?.turnEpoch) {
             writeCliTurnEpoch(cwd, { sessionId: markerSessionId, turnEpoch: body.turnEpoch });
@@ -3559,6 +3558,9 @@ function startSessionTakeoverWatcher(
           return 'ok';
         }
         if (resp.status === 409) return 'stopped';
+        // Round 16: a cross-tenant 403 is as permanent as a lost lease —
+        // retrying can never converge, so enforce rather than loop.
+        if (resp.status === 403) return 'unprotected';
         return 'failed';
       } catch {
         return 'failed';
@@ -3725,11 +3727,13 @@ export async function runClaude(
   // channel plugin, so THIS wrapper is the marker consumer — the long-lived
   // process that converts a failed takeover's marker into a claim.
   let takeoverChild: ReturnType<typeof spawn> | undefined;
+  let takeoverEnforced = false;
   const takeoverWatcher = startSessionTakeoverWatcher(
     options.backend,
     sessionContext.pcpSessionId,
     studioId,
     () => {
+      takeoverEnforced = true;
       console.error(
         chalk.red(
           '\nThis worktree\u2019s lease is permanently gone (thread closed or studio revoked). Terminating the backend to protect the checkout.'
@@ -3799,6 +3803,9 @@ export async function runClaude(
     });
     await finalizeExecution(code ?? null);
 
+    // Round 16: an enforced termination (SIGTERM closes with code=null)
+    // must not exit 0 — the turn was killed to protect the checkout.
+    if (takeoverEnforced) process.exit(1);
     if (code !== 0) process.exit(code || 1);
   });
 
@@ -3999,11 +4006,13 @@ export async function runClaudeInteractive(
   // one-shot path. One watcher spans every retry attempt (retries continue
   // the same session's scope); it is stopped before the wrapper exits.
   let interactiveChild: ReturnType<typeof spawn> | undefined;
+  let interactiveEnforced = false;
   const interactiveTakeoverWatcher = startSessionTakeoverWatcher(
     options.backend,
     sessionContext.pcpSessionId,
     studioId,
     () => {
+      interactiveEnforced = true;
       console.error(
         chalk.red(
           '\nThis worktree\u2019s lease is permanently gone (thread closed or studio revoked). Terminating the backend to protect the checkout.'
@@ -4015,6 +4024,12 @@ export async function runClaudeInteractive(
 
   while (true) {
     const { code, stderrText } = await runAttempt();
+    // Round 16: an enforced termination (SIGTERM closes with code=null)
+    // must neither retry with a fresh backend session nor exit 0.
+    if (interactiveEnforced) {
+      interactiveTakeoverWatcher?.stop();
+      process.exit(1);
+    }
     const shouldRetry =
       attempt < maxAttempts &&
       shouldRetryWithFreshBackendSession({
