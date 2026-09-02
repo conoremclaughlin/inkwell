@@ -1458,3 +1458,22 @@ describe('lease acknowledgement and fail-closed degradation (round 11)', () => {
     expect(admit).toBeGreaterThan(stop);
   });
 });
+
+describe('wrapper generation binding (round 18)', () => {
+  it('the marker and epoch record both carry INK_RUNTIME_LINK_ID', async () => {
+    const { readFileSync } = await import('fs');
+    const { dirname, join } = await import('path');
+    const { fileURLToPath } = await import('url');
+    const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'hooks.ts'), 'utf-8');
+
+    const marker = source.indexOf('const markerPath = pendingTakeoverMarkerPath(cwd);');
+    const markerGen = source.indexOf('wrapperGeneration: process.env.INK_RUNTIME_LINK_ID', marker);
+    expect(marker).toBeGreaterThan(-1);
+    expect(markerGen).toBeGreaterThan(marker);
+
+    const record = source.indexOf('const recorded = writeCliTurnEpoch(cwd, {');
+    const recordGen = source.indexOf('wrapperGeneration: process.env.INK_RUNTIME_LINK_ID', record);
+    expect(record).toBeGreaterThan(-1);
+    expect(recordGen).toBeGreaterThan(record);
+  });
+});

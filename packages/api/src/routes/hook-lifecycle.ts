@@ -435,17 +435,24 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         // safe (it only refuses RECLAIMS whose marker predates it; live
         // prompts are unconditional), and without it a claim still parked in
         // the server past the wrapper's scope end would land on a dead turn.
+        // Round 18: the tombstone is the ONLY fence this path provides — a
+        // 200 without it would tell the wrapper its scope end is safe while
+        // a parked claim can still land. A refused stamp fails the request
+        // so the caller keeps its evidence and retries.
         try {
-          await dataComposer
+          const { error: tombstoneError } = await dataComposer
             .getClient()
             .from('sessions')
             .update({ cli_turn_stopped_at: new Date().toISOString() })
             .eq('id', sessionId);
+          if (tombstoneError) throw new Error(tombstoneError.message);
         } catch (err: unknown) {
-          logger.warn('[HookLifecycle] Suppressed-stop tombstone stamp failed', {
+          logger.error('[HookLifecycle] Suppressed-stop tombstone stamp failed', {
             sessionId,
             error: err instanceof Error ? err.message : String(err),
           });
+          res.status(500).json({ success: false, error: 'stop tombstone failed' });
+          return;
         }
         try {
           await leaseService.renewBySession(sessionId, session.userId);

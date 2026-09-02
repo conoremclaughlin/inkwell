@@ -2587,6 +2587,12 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
             sessionId: resolveActivePcpSessionId(cwd),
             agentId,
             at: new Date().toISOString(),
+            // Round 18: bind the marker to the wrapper that spawned this
+            // backend — a stale wrapper on the same session must neither
+            // claim nor retire a successor's marker.
+            ...(process.env.INK_RUNTIME_LINK_ID
+              ? { wrapperGeneration: process.env.INK_RUNTIME_LINK_ID }
+              : {}),
           })
         );
       },
@@ -2606,6 +2612,9 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
       const recorded = writeCliTurnEpoch(cwd, {
         sessionId: claimedSessionId,
         turnEpoch: takeover.turnEpoch,
+        ...(process.env.INK_RUNTIME_LINK_ID
+          ? { wrapperGeneration: process.env.INK_RUNTIME_LINK_ID }
+          : {}),
       });
       if (!recorded) {
         // Round 11: a lost record is LOUD, not silent. Safety does not

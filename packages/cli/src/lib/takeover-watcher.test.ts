@@ -126,12 +126,14 @@ describe('startTakeoverWatcher', () => {
     await vi.advanceTimersByTimeAsync(1000);
     expect(claim).toHaveBeenCalledTimes(2);
 
-    // The child exited: nothing may claim after the session's process is
-    // gone, and the marker (this generation's scope) goes with it.
-    watcher.stop();
+    // The child exited. stop() ADJUDICATES the own marker with one final
+    // tick (round 18 — fs.watch does not order before close), then retires
+    // it; nothing claims after that.
+    await watcher.stop();
+    expect(claim).toHaveBeenCalledTimes(3);
     expect(existsSync(p)).toBe(false);
     await vi.advanceTimersByTimeAsync(5000);
-    expect(claim).toHaveBeenCalledTimes(2);
+    expect(claim).toHaveBeenCalledTimes(3);
   });
 
   it('a tick that throws never takes the watcher down', async () => {
@@ -470,7 +472,10 @@ describe('event-driven ticks and the stop boundary (round 17)', () => {
     expect(finalizeScope).toHaveBeenCalledWith('epoch-crash');
   });
 
-  it('an UNCLAIMED scope finalizes with undefined — the tombstone path', async () => {
+  it('a scope that NEVER attempted a claim does not finalize — no tombstone to refuse a successor (round 18)', async () => {
+    // A stale wrapper that never saw a marker has nothing parked in the
+    // server; a scope-end tombstone from it could wrongly refuse a
+    // successor wrapper's reclaim of an older marker.
     const finalizeScope = vi.fn(async () => undefined);
     const watcher = startTakeoverWatcher({
       cwd: dir,
@@ -482,7 +487,76 @@ describe('event-driven ticks and the stop boundary (round 17)', () => {
 
     await watcher.stop();
 
+    expect(finalizeScope).not.toHaveBeenCalled();
+  });
+
+  it('an ATTEMPTED-but-unclaimed scope finalizes with undefined — the tombstone path', async () => {
+    const finalizeScope = vi.fn(async () => undefined);
+    const claim = vi.fn(async () => 'failed' as const);
+    const p = write({ sessionId: 's1', at: new Date().toISOString() });
+    const watcher = startTakeoverWatcher({
+      cwd: dir,
+      expectedSessionId: 's1',
+      claim,
+      finalizeScope,
+      intervalMs: 60_000,
+    });
+    await vi.waitFor(() => expect(claim).toHaveBeenCalled(), { timeout: 2000 });
+
+    await watcher.stop();
+
     expect(finalizeScope).toHaveBeenCalledWith(undefined);
+    // Acknowledged boundary → the marker evidence retires with the scope.
+    expect(existsSync(p)).toBe(false);
+  });
+
+  it('an UNACKNOWLEDGED finalization keeps the evidence (round 18)', async () => {
+    const finalizeScope = vi.fn(async () => {
+      throw new Error('boundary write refused: 500');
+    });
+    const claim = vi.fn(async () => 'failed' as const);
+    const p = write({ sessionId: 's1', at: new Date().toISOString() });
+    const watcher = startTakeoverWatcher({
+      cwd: dir,
+      expectedSessionId: 's1',
+      claim,
+      finalizeScope,
+      intervalMs: 60_000,
+    });
+    await vi.waitFor(() => expect(claim).toHaveBeenCalled(), { timeout: 2000 });
+
+    await watcher.stop();
+
+    expect(finalizeScope).toHaveBeenCalled();
+    // The fence did not land: marker survives for the sweep/detach path.
+    expect(existsSync(p)).toBe(true);
+  });
+
+  it('a stale generation neither claims nor retires a successor generation\u2019s marker (round 18)', async () => {
+    const claim = vi.fn(async () => 'ok' as const);
+    const finalizeScope = vi.fn(async () => undefined);
+    const watcher = startTakeoverWatcher({
+      cwd: dir,
+      expectedSessionId: 's1',
+      generation: 'gen-a',
+      claim,
+      finalizeScope,
+      intervalMs: 60_000,
+    });
+    // The SUCCESSOR wrapper's backend wrote this marker.
+    const p = write({
+      sessionId: 's1',
+      at: new Date().toISOString(),
+      wrapperGeneration: 'gen-b',
+    });
+
+    await new Promise((r) => setTimeout(r, 60));
+    await watcher.stop();
+
+    expect(claim).not.toHaveBeenCalled();
+    // Never attempted → no tombstone that could refuse gen-b's reclaim.
+    expect(finalizeScope).not.toHaveBeenCalled();
+    expect(existsSync(p)).toBe(true);
   });
 
   it('no new tick starts after stop() begins', async () => {

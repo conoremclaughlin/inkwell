@@ -3509,6 +3509,10 @@ function startSessionTakeoverWatcher(
   backend: string,
   pcpSessionId: string | undefined,
   studioId?: string,
+  /** Round 18: this wrapper's generation (runtimeLinkId) — markers, records,
+   * and scope finalization bind to it so a stale wrapper can neither consume
+   * nor tombstone a successor's turn on the same session. */
+  generation?: string,
   /**
    * Round 15: a PERMANENT lease refusal (revoked thread, retired studio,
    * another holder) can never converge through the marker — the wrapper is
@@ -3525,16 +3529,21 @@ function startSessionTakeoverWatcher(
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     const token = await getValidAccessToken(serverUrl);
     if (token) headers.Authorization = `Bearer ${token}`;
-    await fetch(`${serverUrl}/api/hooks/lifecycle`, {
+    const resp = await fetch(`${serverUrl}/api/hooks/lifecycle`, {
       method: 'POST',
       headers,
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(3000),
     });
+    // Round 18: a boundary write is only a boundary if it was ACKNOWLEDGED —
+    // a 4xx/5xx means the fence did not land, and the caller must keep its
+    // evidence rather than delete it.
+    if (!resp.ok) throw new Error(`lifecycle boundary write refused: ${resp.status}`);
   };
   return startTakeoverWatcher({
     cwd,
     expectedSessionId: pcpSessionId,
+    generation,
     onUnprotected,
     // Round 17: scope end is a real boundary. A turn this watcher claimed is
     // closed with its FENCED stop (a crashed child sends no stop hook); an
@@ -3578,7 +3587,11 @@ function startSessionTakeoverWatcher(
           // wrapper enforces instead of looping.
           if (body?.studioLeaseHeld === false) return 'unprotected';
           if (body?.turnEpoch) {
-            writeCliTurnEpoch(cwd, { sessionId: markerSessionId, turnEpoch: body.turnEpoch });
+            writeCliTurnEpoch(cwd, {
+              sessionId: markerSessionId,
+              turnEpoch: body.turnEpoch,
+              ...(generation ? { wrapperGeneration: generation } : {}),
+            });
           }
           return 'ok';
         }
@@ -3757,6 +3770,7 @@ export async function runClaude(
     options.backend,
     sessionContext.pcpSessionId,
     studioId,
+    runtimeLinkId,
     () => {
       takeoverEnforced = true;
       console.error(
@@ -4036,6 +4050,7 @@ export async function runClaudeInteractive(
     options.backend,
     sessionContext.pcpSessionId,
     studioId,
+    runtimeLinkId,
     () => {
       interactiveEnforced = true;
       console.error(

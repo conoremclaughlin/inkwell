@@ -42,6 +42,7 @@ interface RecordedUpdate {
 }
 const recordedUpdates: RecordedUpdate[] = [];
 let fencedUpdateMatches = true;
+let directUpdateError: { message: string } | null = null;
 
 function makeFakeClient() {
   const chain = (table: string, mode: 'select' | 'update' | 'insert', payload?: unknown) => {
@@ -76,9 +77,9 @@ function makeFakeClient() {
             eqs,
           });
           return Promise.resolve({
-            data: fencedUpdateMatches ? [{ id: SESSION_ID }] : [],
-            error: null,
-          }).then(resolve);
+            data: directUpdateError ? null : fencedUpdateMatches ? [{ id: SESSION_ID }] : [],
+            error: directUpdateError,
+          }).then(resolve as never);
         }
         return Promise.resolve({ data: [] as never[], error: null }).then(resolve);
       },
@@ -150,6 +151,7 @@ describe('hook-lifecycle CLI turn signal', () => {
     rpcResult = () => ({ data: { outcome: 'claimed', epoch: 'epoch-1' }, error: null });
     recordedUpdates.length = 0;
     fencedUpdateMatches = true;
+    directUpdateError = null;
   });
 
   async function post(body: Record<string, unknown>) {
@@ -556,6 +558,23 @@ describe('hook-lifecycle CLI turn signal', () => {
       await new Promise((r) => setImmediate(r));
       expect(release).not.toHaveBeenCalled();
       expect(releaseGraphClaimsForSession).not.toHaveBeenCalled();
+    });
+
+    it('a REFUSED tombstone stamp fails the suppressed stop — never a 200 without the fence (round 18)', async () => {
+      directUpdateError = { message: 'db down' };
+
+      const resp = await fetch(`${baseUrl}/api/hooks/lifecycle`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer test' },
+        body: JSON.stringify({
+          sessionId: SESSION_ID,
+          lifecycle: 'idle',
+          event: 'stop',
+          turnEpochMissing: true,
+        }),
+      });
+
+      expect(resp.status).toBe(500);
     });
 
     it('ride-along failure after a COMMITTED claim reports the claim, not a failure', async () => {

@@ -44,11 +44,13 @@ export interface CliTurnEpochRecord {
   sessionId?: string;
   turnEpoch?: string;
   at?: string;
+  /** Round 18: which wrapper generation claimed this epoch — see Marker. */
+  wrapperGeneration?: string;
 }
 
 export function writeCliTurnEpoch(
   cwd: string,
-  record: { sessionId: string; turnEpoch: string }
+  record: { sessionId: string; turnEpoch: string; wrapperGeneration?: string }
 ): boolean {
   try {
     mkdirSync(join(cwd, '.ink'), { recursive: true });
@@ -88,6 +90,15 @@ export function clearCliTurnEpoch(cwd: string, sessionId: string): void {
 interface Marker {
   sessionId?: string | null;
   at?: string;
+  /**
+   * Round 18: the WRAPPER GENERATION (runtimeLinkId) of the backend process
+   * whose prompt hook wrote this marker — the hook reads it from the
+   * INK_RUNTIME_LINK_ID env the wrapper set on spawn. Two wrappers can serve
+   * one session across restarts; a marker belongs to exactly one of them,
+   * and a stale wrapper must neither claim nor retire a successor's.
+   * Absent on legacy markers (older hooks): matched by session alone.
+   */
+  wrapperGeneration?: string;
 }
 
 function readMarker(path: string): Marker | null {
@@ -106,6 +117,13 @@ export async function watchTick(opts: {
   markerPath: string;
   /** The wrapper's own session — the ONLY session this watcher may claim for. */
   expectedSessionId: string;
+  /**
+   * Round 18: the wrapper's OWN generation. A marker stamped with a
+   * DIFFERENT generation belongs to another wrapper serving the same
+   * session (a successor after restart) — neither claimed nor retired here.
+   * Generation-less markers (legacy hooks) match by session alone.
+   */
+  expectedGeneration?: string;
   claim: (
     sessionId: string,
     markerAt: string
@@ -118,6 +136,15 @@ export async function watchTick(opts: {
     // A foreign marker (crashed predecessor, different session in this
     // checkout) is not ours to claim OR to delete — claiming would re-mark
     // another session's dead turn as running (round 10).
+    return 'skipped';
+  }
+  if (
+    opts.expectedGeneration !== undefined &&
+    marker.wrapperGeneration !== undefined &&
+    marker.wrapperGeneration !== opts.expectedGeneration
+  ) {
+    // Same session, DIFFERENT wrapper generation: a successor's marker is
+    // its own wrapper's to adjudicate (round 18).
     return 'skipped';
   }
   const at = Date.parse(marker.at);
@@ -162,6 +189,8 @@ export function startTakeoverWatcher(opts: {
    * server — e.g. behind a timed-out fetch — is refused when it lands).
    */
   finalizeScope?: (turnEpoch: string | undefined) => Promise<void>;
+  /** Round 18: this wrapper's generation (runtimeLinkId) — see watchTick. */
+  generation?: string;
   intervalMs?: number;
   log?: (outcome: string) => void;
   /** Round 15: the lease is PERMANENTLY gone — enforce (terminate the backend). */
@@ -170,23 +199,34 @@ export function startTakeoverWatcher(opts: {
   const markerPath = takeoverMarkerPath(opts.cwd);
   let stopping = false;
   let inFlight: Promise<void> | null = null;
+  // Round 18: whether THIS generation ever reached a claim attempt — the
+  // only case where a claim can be parked in the server, and therefore the
+  // only case where a scope-end tombstone is justified. A wrapper that
+  // never claimed must not stamp a tombstone that could refuse a
+  // SUCCESSOR wrapper's older-marker reclaim.
+  let attemptedClaim = false;
+  const tickOnce = async (bypassStopping: boolean) => {
+    try {
+      const outcome = await watchTick({
+        markerPath,
+        expectedSessionId: opts.expectedSessionId,
+        expectedGeneration: opts.generation,
+        claim: (sessionId, markerAt) => {
+          attemptedClaim = true;
+          return opts.claim(sessionId, markerAt);
+        },
+      });
+      if (outcome !== 'skipped') opts.log?.(outcome);
+      if (outcome === 'unprotected' && !bypassStopping) opts.onUnprotected?.();
+    } catch {
+      // Never let the watcher take down the wrapper.
+    } finally {
+      inFlight = null;
+    }
+  };
   const runTick = () => {
     if (stopping || inFlight) return;
-    inFlight = (async () => {
-      try {
-        const outcome = await watchTick({
-          markerPath,
-          expectedSessionId: opts.expectedSessionId,
-          claim: opts.claim,
-        });
-        if (outcome !== 'skipped') opts.log?.(outcome);
-        if (outcome === 'unprotected') opts.onUnprotected?.();
-      } catch {
-        // Never let the watcher take down the wrapper.
-      } finally {
-        inFlight = null;
-      }
-    })();
+    inFlight = tickOnce(false);
   };
   // Round 16: the FIRST tick runs immediately (a marker may predate us).
   runTick();
@@ -212,11 +252,13 @@ export function startTakeoverWatcher(opts: {
 
   return {
     stop: async () => {
-      // Round 17: stop() is a real boundary. New ticks are refused, the
-      // in-flight one is AWAITED (its claim commits and records its epoch
-      // before we read), and the scope is finalized: a claimed turn is
-      // closed with its fenced stop; an unclaimed scope stamps the stop
-      // tombstone so a server-parked claim is refused when it lands.
+      // Rounds 17–18: stop() is a real boundary. New ticks are refused, the
+      // in-flight one is AWAITED, then the OWN marker is ADJUDICATED with
+      // one final tick — fs.watch delivery does not order before child
+      // close, so a marker written moments before the exit may never have
+      // been seen. A claim that lands here is immediately closed by the
+      // fenced finalization below. Evidence (record, marker) is deleted
+      // only AFTER the boundary write is acknowledged.
       stopping = true;
       clearInterval(timer);
       try {
@@ -225,21 +267,42 @@ export function startTakeoverWatcher(opts: {
         // Best-effort.
       }
       if (inFlight) await inFlight;
+      await tickOnce(true);
+      let finalized = !opts.finalizeScope;
       if (opts.finalizeScope) {
         const record = readCliTurnEpoch(opts.cwd);
-        const claimedEpoch =
-          record?.sessionId === opts.expectedSessionId ? record.turnEpoch : undefined;
-        try {
-          await opts.finalizeScope(claimedEpoch);
-          if (claimedEpoch) clearCliTurnEpoch(opts.cwd, opts.expectedSessionId);
-        } catch {
-          // Best-effort: the sweep and the detach boundary back this up.
+        const ownRecord =
+          record?.sessionId === opts.expectedSessionId &&
+          (opts.generation === undefined ||
+            record.wrapperGeneration === undefined ||
+            record.wrapperGeneration === opts.generation);
+        const claimedEpoch = ownRecord ? record?.turnEpoch : undefined;
+        // A generation that never attempted a claim has nothing parked in
+        // the server — and its tombstone could wrongly refuse a successor
+        // wrapper's reclaim of an OLDER marker (round 18).
+        if (claimedEpoch !== undefined || attemptedClaim) {
+          try {
+            await opts.finalizeScope(claimedEpoch);
+            finalized = true;
+            if (claimedEpoch) clearCliTurnEpoch(opts.cwd, opts.expectedSessionId);
+          } catch {
+            // The boundary write was NOT acknowledged: keep the record and
+            // the marker as evidence; the sweep and the detach boundary
+            // back this up (round 18 — never delete unacknowledged).
+          }
+        } else {
+          finalized = true;
         }
       }
-      // Scope-end cleanup of OUR OWN marker only — a foreign session's
-      // marker still belongs to its consumer (round 10).
+      if (!finalized) return;
+      // Scope-end cleanup of OUR OWN marker (session AND generation) only.
       const marker = readMarker(markerPath);
-      if (marker?.sessionId === opts.expectedSessionId) {
+      if (
+        marker?.sessionId === opts.expectedSessionId &&
+        (opts.generation === undefined ||
+          marker.wrapperGeneration === undefined ||
+          marker.wrapperGeneration === opts.generation)
+      ) {
         try {
           rmSync(markerPath, { force: true });
         } catch {
