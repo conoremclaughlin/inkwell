@@ -167,7 +167,7 @@ function detectBackend(cwd: string): HookCapabilities {
   return CLAUDE_CODE; // default
 }
 
-function getBackendByName(name: string): HookCapabilities {
+export function getBackendByName(name: string): HookCapabilities {
   switch (name.toLowerCase()) {
     case 'claude':
     case 'claude-code':
