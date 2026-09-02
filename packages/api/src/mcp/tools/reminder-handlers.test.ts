@@ -442,6 +442,16 @@ describe('Reminder Handlers', () => {
  * catch. The warning could have been silently absent and every test still green.
  */
 describe('create_reminder quiet-hours advisory', () => {
+  // Its own reset. This suite sits outside the parent describe, so the parent's
+  // beforeEach never applied and shared queues, builders and call history leaked
+  // in and between these tests (Lumen, PR #568 round 3).
+  beforeEach(() => {
+    vi.clearAllMocks();
+    queryResultQueues.clear();
+    tableBuilders.clear();
+    eqCalls.length = 0;
+  });
+
   const REMINDER_ROW = {
     id: 'r1',
     title: 'Spravato prep',
@@ -500,8 +510,21 @@ describe('create_reminder quiet-hours advisory', () => {
     expect(parseResponse(result).quietHours).toBeUndefined();
   });
 
-  // The guard I claimed in review and had not enforced.
-  it('says nothing for a cron reminder, even one whose next run lands inside', async () => {
+  /**
+   * The guard I claimed in review before enforcing — now asserted on the guard
+   * itself rather than on a downstream symptom.
+   *
+   * The first version checked only that no warning came back, which passes in
+   * CI for the wrong reason: `0 0 * * *` resolves through a server-LOCAL
+   * calculator, so under TZ=UTC the next run is 00:00Z = 17:00 PDT, outside the
+   * LA window. Lumen mutated the guard to `if (true)`, ran under TZ=UTC, and it
+   * still passed. My own red-check had only ever run in my own timezone —
+   * "verified red" is not a property of a test on its own.
+   *
+   * Asserting that heartbeat_state is never consulted is environment-free: it
+   * is true of the guard regardless of what time the calculator lands on.
+   */
+  it('never even looks up quiet hours for a cron reminder', async () => {
     primeQuietHours();
     setQueryResult('scheduled_reminders', { ...REMINDER_ROW, cron_expression: '0 0 * * *' });
 
@@ -510,8 +533,32 @@ describe('create_reminder quiet-hours advisory', () => {
       mockDataComposer as never
     );
 
-    const parsed = parseResponse(result);
-    expect(parsed.success).toBe(true);
-    expect(parsed.quietHours).toBeUndefined();
+    expect(parseResponse(result).success).toBe(true);
+    expect(mockSupabase.from).not.toHaveBeenCalledWith('heartbeat_state');
+    expect(eqCalls.some((c) => c.table === 'heartbeat_state')).toBe(false);
+  });
+
+  it('never looks up quiet hours for the default no-schedule path either', async () => {
+    primeQuietHours();
+    setQueryResult('scheduled_reminders', REMINDER_ROW);
+
+    await handleCreateReminder(
+      { userId: TEST_USER_ID, title: 'Whenever' } as never,
+      mockDataComposer as never
+    );
+
+    expect(mockSupabase.from).not.toHaveBeenCalledWith('heartbeat_state');
+  });
+
+  it('DOES look it up for a one-shot — the control for the two above', async () => {
+    primeQuietHours();
+    setQueryResult('scheduled_reminders', REMINDER_ROW);
+
+    await handleCreateReminder(
+      { userId: TEST_USER_ID, title: 'Prep', runAt: '2026-09-02T14:30:00Z' } as never,
+      mockDataComposer as never
+    );
+
+    expect(mockSupabase.from).toHaveBeenCalledWith('heartbeat_state');
   });
 });
