@@ -11,6 +11,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import {
   handleFailedTakeover,
+  getBackendByName,
   installHooks,
   callPcpTool,
   buildIdentityBlock,
@@ -1280,6 +1281,25 @@ describe('serverAlreadyInjectedContext', () => {
  * the capability flag, both directions.
  */
 describe('handleFailedTakeover', () => {
+  it('the REAL claude-code capability blocks — not an inline stand-in', () => {
+    // Round 7 meta-lesson: the first behavioural tests used inline capability
+    // objects, so flipping the real constant's flag kept everything green —
+    // the same unbound-wiring shape as the name-comparison bug they were
+    // written to prevent. This one goes through the actual registry.
+    const exit = vi.fn((code: number): never => {
+      throw new Error(`exit:${code}`);
+    });
+    expect(() =>
+      handleFailedTakeover(getBackendByName('claude-code'), {
+        agentId: 'wren',
+        retryClaim: vi.fn(async () => true),
+        exit: exit as never,
+      })
+    ).toThrow('exit:2');
+    expect(getBackendByName('codex').blocksOnFailedTakeover).toBe(false);
+    expect(getBackendByName('gemini').blocksOnFailedTakeover).toBe(false);
+  });
+
   it('BLOCKS the prompt on a blocking-capable backend', () => {
     const exit = vi.fn((code: number): never => {
       throw new Error(`exit:${code}`);
