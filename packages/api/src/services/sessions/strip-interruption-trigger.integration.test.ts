@@ -596,10 +596,12 @@ d('session_running_write trigger', () => {
       // stamp (which fence_turn_attempts also lands) — a marker predating
       // it refuses, a strictly newer one claims. Modern claims skip that
       // column entirely (attempt-c above claimed despite the stamp).
+      // A clearly-past marker (clock-skew safe: the fence stamped DB now(),
+      // which may differ from the local clock by more than test elapsed).
       const { data: legacyOld } = await client.rpc('claim_turn_epoch', {
         p_session_id: sessionId,
         p_set_running: true,
-        p_not_stopped_after: markerAt,
+        p_not_stopped_after: new Date(Date.now() - 60_000).toISOString(),
       } as never);
       expect((legacyOld as unknown as { outcome: string }).outcome).toBe('stopped');
       const { data: legacyNew } = await client.rpc('claim_turn_epoch', {
