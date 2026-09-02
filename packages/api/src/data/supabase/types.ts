@@ -3013,6 +3013,12 @@ export type Database = {
           cli_attached: boolean | null;
           cli_poll_at: string | null;
           cli_turn_at: string | null;
+          cli_turn_stopped_at: string | null;
+          cli_turn_fence_generation: string | null;
+          cli_turn_fenced_attempts: Json;
+          cli_turn_attempt_claims: Json;
+          cli_turn_missing_stop_at: string | null;
+          turn_epoch: string | null;
           compacting_since: string | null;
           contact_id: string | null;
           context: string | null;
@@ -3045,6 +3051,12 @@ export type Database = {
           cli_attached?: boolean | null;
           cli_poll_at?: string | null;
           cli_turn_at?: string | null;
+          cli_turn_stopped_at?: string | null;
+          cli_turn_fence_generation?: string | null;
+          cli_turn_fenced_attempts?: Json;
+          cli_turn_attempt_claims?: Json;
+          cli_turn_missing_stop_at?: string | null;
+          turn_epoch?: string | null;
           compacting_since?: string | null;
           contact_id?: string | null;
           context?: string | null;
@@ -3077,6 +3089,12 @@ export type Database = {
           cli_attached?: boolean | null;
           cli_poll_at?: string | null;
           cli_turn_at?: string | null;
+          cli_turn_stopped_at?: string | null;
+          cli_turn_fence_generation?: string | null;
+          cli_turn_fenced_attempts?: Json;
+          cli_turn_attempt_claims?: Json;
+          cli_turn_missing_stop_at?: string | null;
+          turn_epoch?: string | null;
           compacting_since?: string | null;
           contact_id?: string | null;
           context?: string | null;
@@ -4580,6 +4598,31 @@ export type Database = {
           p_live_window_ms?: number;
         };
         Returns: Json;
+      };
+      claim_turn_epoch: {
+        Args: {
+          p_session_id: string;
+          p_set_running?: boolean;
+          p_not_stopped_after?: string;
+          p_studio_id?: string;
+          p_regrant?: Json;
+          p_attempt?: string;
+        };
+        Returns: Json;
+      };
+      fence_turn_attempts: {
+        Args: {
+          p_session_id: string;
+          p_attempts: Json;
+        };
+        Returns: string;
+      };
+      repoint_sessions_off_ephemeral: {
+        Args: {
+          p_studio_id: string;
+          p_user_id: string;
+        };
+        Returns: number;
       };
       apply_task_graph: {
         Args: {

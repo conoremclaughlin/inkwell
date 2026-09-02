@@ -37,10 +37,20 @@ import { ClaudeRunner, buildIdentityPrompt } from './claude-runner.js';
 import { CodexRunner } from './codex-runner.js';
 import {
   registerActiveRun,
-  clearActiveRun,
+  clearActiveRunIfOwner,
+  widenActiveRunCandidates,
+  getActiveRun,
+  restoreActiveRunIfCurrent,
+  markRunnerSettled,
   trackStateWrite,
   admitStateWrite,
 } from './active-runs.js';
+import {
+  retryTurnFinalization,
+  supersedePendingFinalization,
+  hasPendingFinalizationFor,
+  TurnSupersededError,
+} from './finalize-turn.js';
 import { GeminiRunner } from './gemini-runner.js';
 import { AntigravityRunner } from './antigravity-runner.js';
 import { InkRunner } from './ink-runner.js';
@@ -140,6 +150,15 @@ interface PendingMessage {
   request: SessionRequest;
   resolve: (result: SessionResult) => void;
   reject: (error: Error) => void;
+  /**
+   * The turn-epoch candidate minted at this message's handleMessage entry
+   * (PR #563 round 9). Its PRE-QUEUE session resolution already stamped this
+   * value onto any lease it acquired, so the dequeue-time resolution and the
+   * turn itself must run under the SAME candidate — reminting at dequeue
+   * would orphan the stamp and the boundary fence would refuse the wrong
+   * releases.
+   */
+  turnEpochCandidate: string;
 }
 
 // ── Route pattern matching (spec:trigger-studio-routing) ──
@@ -895,6 +914,8 @@ export class SessionService implements ISessionService {
       studioPolicy?: StudioPolicy;
       /** v18 S3: plan resolution — no acquire, no divert, no rebind. */
       planOnly?: boolean;
+      /** Round 9: stamped onto acquired leases as the turn's generation. */
+      turnEpochCandidate?: string;
     }
   ): Promise<Session> {
     const leases = this.getLeaseService();
@@ -945,6 +966,7 @@ export class SessionService implements ISessionService {
         agentId: ctx.agentId,
         userId: ctx.userId,
         reason: routing.tier,
+        turnEpoch: ctx.turnEpochCandidate,
       });
       if (result.acquired) return session;
 
@@ -995,6 +1017,7 @@ export class SessionService implements ISessionService {
           agentId: ctx.agentId,
           userId: ctx.userId,
           reason: `overflow:${routing.tier}`,
+          turnEpoch: ctx.turnEpochCandidate,
         });
         if (overflowAcquire.acquired) {
           const updated = await this.repository.update(session.id, { studioId: overflow.id });
@@ -1168,6 +1191,13 @@ export class SessionService implements ISessionService {
     // for refusals and truly pre-admission failures.
     let admitted = false;
 
+    // The turn's epoch candidate is minted HERE, before routing (PR #563
+    // round 9): routing acquires studio leases, and the lease stamp must be
+    // the same value the turn later submits as its running-write epoch —
+    // that identity is what lets a predecessor's boundary recognize "this
+    // lease now belongs to a successor turn" and refuse the release.
+    const turnEpochCandidate = randomUUID();
+
     try {
       // 1. Get or create session (needed to determine lock key)
       const session = await this.getOrCreateSession(userId, agentId, {
@@ -1181,6 +1211,7 @@ export class SessionService implements ISessionService {
         recipientSessionId: metadata?.recipientSessionId,
         contactId: metadata?.contactId,
         repoRoot: metadata?.repoRoot,
+        turnEpochCandidate,
       });
       admitted = true;
 
@@ -1243,7 +1274,7 @@ export class SessionService implements ISessionService {
         // one.
         return await new Promise((resolve, reject) => {
           const queue = this.pendingQueues.get(lockKey) || [];
-          queue.push({ request, resolve, reject });
+          queue.push({ request, resolve, reject, turnEpochCandidate });
           this.pendingQueues.set(lockKey, queue);
         });
       }
@@ -1253,7 +1284,7 @@ export class SessionService implements ISessionService {
       logger.debug('Acquired processing lock', { lockKey });
 
       try {
-        const result = await this.processMessage(request, session);
+        const result = await this.processMessage(request, session, turnEpochCandidate);
         // If the initial lock-holder failed with a non-retryable error,
         // flush queued messages before processQueueOrReleaseLock runs —
         // every queued message would fail the same way.
@@ -1399,10 +1430,17 @@ export class SessionService implements ISessionService {
             studioId: pending.request.metadata?.studioId,
             studioHint: pending.request.metadata?.studioHint,
             recipientSessionId: pending.request.metadata?.recipientSessionId,
+            // The candidate minted at THIS message's handleMessage entry —
+            // its pre-queue resolution already stamped leases with it.
+            turnEpochCandidate: pending.turnEpochCandidate,
           }
         );
 
-        const result = await this.processMessage(pending.request, session);
+        const result = await this.processMessage(
+          pending.request,
+          session,
+          pending.turnEpochCandidate
+        );
         // Same admission evidence as the direct path: resolution succeeded
         // just above, so whatever the turn did, routing admitted it.
         pending.resolve({ ...result, admitted: true });
@@ -1476,7 +1514,11 @@ export class SessionService implements ISessionService {
    * Process a message with an already-acquired lock.
    * This is the core message processing logic, separated from locking.
    */
-  private async processMessage(request: SessionRequest, session: Session): Promise<SessionResult> {
+  private async processMessage(
+    request: SessionRequest,
+    session: Session,
+    turnEpochCandidate?: string
+  ): Promise<SessionResult> {
     const { userId, agentId, metadata } = request;
 
     // 1. Build context for the agent
@@ -1684,6 +1726,24 @@ export class SessionService implements ISessionService {
     // running" — anything narrower leaves a window where a shutdown sees no
     // active run and walks away from a row that says `running` forever, which
     // is the exact zombie this is here to prevent (Lumen, PR #490 — P1).
+    // Ordered handoff (Lumen, PR #563 round 3): capture whatever registration
+    // a previous turn left behind BEFORE overwriting it. If this turn's
+    // `running` write fails, ownership never transferred — the previous
+    // entry (and the recovery it anchors) must come back.
+    const previousRun = getActiveRun(session.id);
+
+    // The ownership candidate for THIS turn, minted before anything is
+    // registered or written. The candidate is AUTHORITATIVE (round 4): the DB
+    // trigger only fills an epoch when a running-entering write carries none,
+    // so retrying the running write is idempotent by value, and "did my write
+    // actually land?" is answerable by reading the row and comparing.
+    // Round 9: handleMessage mints it BEFORE routing and threads it here, so
+    // the leases routing stamped and the epoch this turn runs under are the
+    // same value — the boundary fence depends on that identity. The local
+    // mint survives only for direct callers (tests, internal retries).
+    const turnEpoch = turnEpochCandidate ?? randomUUID();
+
+    const turnRegisteredAt = Date.now();
     const admitted = registerActiveRun({
       sessionId: session.id,
       userId,
@@ -1691,7 +1751,8 @@ export class SessionService implements ISessionService {
       backend: resolvedBackend,
       threadKey: metadata?.threadKey as string | undefined,
       senderAgentId: request.sender?.id,
-      startedAt: Date.now(),
+      startedAt: turnRegisteredAt,
+      turnEpoch,
     });
 
     // Intake closes at the top of shutdown. A turn started now is guaranteed
@@ -1705,15 +1766,133 @@ export class SessionService implements ISessionService {
     // Mark session as running before backend turn. Tracked so the shutdown
     // drain can wait for it: if this write is still in flight when the
     // interruption runs, it would land afterwards and restore `running`.
-    try {
-      await trackStateWrite(this.repository.update(session.id, { lifecycle: 'running' }));
-    } catch (runningWriteError) {
-      // The row is not running, so the registration describes nothing. Leaving
-      // it would make shutdown post an interruption notice for a turn that
-      // never started.
-      clearActiveRun(session.id);
-      throw runningWriteError;
+    //
+    // A rejected promise is NOT a rollback (Lumen, PR #563 round 4): the
+    // write can commit and the response still fail. So a failure retries the
+    // identical write (idempotent — same candidate), and when retries are
+    // exhausted the row is READ: a row running under our candidate means the
+    // takeover happened and the turn proceeds. Only a row that provably does
+    // not carry our candidate hands ownership back.
+    let ownershipConfirmed = true;
+    {
+      let tookOwnership = false;
+      let lastError: unknown;
+      for (let attempt = 1; attempt <= 3 && !tookOwnership; attempt += 1) {
+        try {
+          await trackStateWrite(
+            this.repository.update(session.id, {
+              lifecycle: 'running',
+              turnEpoch,
+            })
+          );
+          tookOwnership = true;
+        } catch (runningWriteError) {
+          lastError = runningWriteError;
+          logger.warn('Running write failed; retrying takeover idempotently', {
+            sessionId: session.id,
+            attempt,
+            error:
+              runningWriteError instanceof Error
+                ? runningWriteError.message
+                : String(runningWriteError),
+          });
+        }
+      }
+      ownershipConfirmed = tookOwnership;
+      if (!tookOwnership) {
+        // Reconcile by reading: 'committed' and 'not-committed' are answers;
+        // an unreadable row is NOT 'not-committed' (Lumen round 5 — mapping
+        // read failure to false handed the session back while B's committed
+        // epoch owned the row, and nothing anywhere would ever run for it).
+        const verdict = await this.repository
+          .findById(session.id)
+          .then((row) =>
+            row?.lifecycle === 'running' && row.turnEpoch === turnEpoch
+              ? ('committed' as const)
+              : ('not-committed' as const)
+          )
+          .catch(() => 'unknown' as const);
+
+        if (verdict === 'committed') {
+          logger.warn('Running write committed despite rejected responses; proceeding', {
+            sessionId: session.id,
+          });
+          tookOwnership = true;
+          ownershipConfirmed = true;
+        } else if (verdict === 'unknown') {
+          // Proceed WITHOUT superseding: the epoch fence arbitrates. If our
+          // write committed, the previous turn's next fenced attempt matches
+          // zero rows and stands down on its own; if it did not, our own
+          // terminal writes are the ones that fence out. Either way there is
+          // a live actor for whichever epoch the row actually carries —
+          // handing back here is what created the zombie.
+          //
+          // The registry entry is WIDENED (rounds 6–7): with ownership
+          // unknown, the row's true epoch is one of a known SET — ours or the
+          // previous turn's. Shutdown fences on that set, so it terminalizes
+          // whichever of the two rows exists while a cross-process claimant
+          // outside the set stays untouched.
+          logger.error('Running write and reconcile read both failed; proceeding unconfirmed', {
+            sessionId: session.id,
+          });
+          widenActiveRunCandidates(
+            session.id,
+            previousRun?.turnEpochCandidates ??
+              (previousRun?.turnEpoch !== undefined ? [previousRun.turnEpoch] : [])
+          );
+          tookOwnership = true;
+          ownershipConfirmed = false;
+        }
+      }
+      if (!tookOwnership) {
+        // The row provably does not carry this turn: ownership never
+        // transferred. Restore the previous registration ONLY if its recovery
+        // is still pending — restoring a turn that already finalized would
+        // resurrect a ghost entry for a recorded turn (round 4). Otherwise
+        // clear OUR entry, compare-and-act on our own candidate.
+        if (
+          !(
+            previousRun?.turnEpoch !== undefined &&
+            hasPendingFinalizationFor(session.id, previousRun.turnEpoch) &&
+            restoreActiveRunIfCurrent(previousRun, turnEpoch)
+          )
+        ) {
+          clearActiveRunIfOwner(session.id, turnEpoch);
+        }
+        throw lastError instanceof Error
+          ? lastError
+          : new Error('Running write failed and the row does not carry this turn');
+      }
+
+      // Superseding is reserved for CONFIRMED ownership. On an unconfirmed
+      // takeover the previous turn's recovery stays alive and the fence
+      // decides which of the two writers the row still belongs to.
+      if (ownershipConfirmed) {
+        // Ownership durably transferred — the row carries this turn's
+        // candidate, so the previous turn's fenced finalize can no longer
+        // land. Superseding its loop now only stops wasted retries; the
+        // epoch is the actual fence.
+        supersedePendingFinalization(session.id);
+      }
     }
+
+    // Every terminal write for THIS turn goes through the epoch fence: zero
+    // rows means a newer owner holds the row and the write must not land.
+    const writeTerminalFenced = async (
+      updates: Omit<Partial<Session>, 'studioId'> & { studioId?: string | null }
+    ): Promise<void> => {
+      const fenced = this.repository.updateIfTurnEpoch?.bind(this.repository);
+      if (fenced) {
+        const updated = await trackStateWrite(fenced(session.id, turnEpoch, updates));
+        if (!updated) throw new TurnSupersededError(session.id);
+        return;
+      }
+      // Repository without the fenced write (legacy mocks): unfenced, loudly.
+      logger.warn('Terminal write falling back to unfenced update (no fenced repository)', {
+        sessionId: session.id,
+      });
+      await trackStateWrite(this.repository.update(session.id, updates));
+    };
 
     // Media flows to backends as file paths, not inline base64. Channel
     // listeners download attachments to ~/.ink/files/<channel>/; the
@@ -1742,24 +1921,49 @@ export class SessionService implements ISessionService {
         mediaAttachments: mediaAttachments.length > 0 ? mediaAttachments : undefined,
       });
       turnDurationMs = Date.now() - turnStartMs;
+      // The child has exited; only bookkeeping remains. NOT a clear — the run
+      // stays registered until the terminal write lands — but from here a
+      // shutdown report must say "finished, unrecorded", never "still running".
+      // The intended outcome rides along: a success:false result means the
+      // unrecorded terminal state is `failed`, and shutdown must say so
+      // rather than stamping a quiet success (Lumen, PR #563 P1).
+      markRunnerSettled(session.id, result.success ? 'succeeded' : 'failed');
     } catch (runnerError) {
+      markRunnerSettled(session.id, 'failed');
       // Runner threw (spawn failure, capacity error, etc.) — mark session as
       // failed, unless shutdown already owns this session's state and would
       // have its interruption record overwritten by this write.
       let failedWritten = admitStateWrite(session.id);
       if (failedWritten) {
-        await trackStateWrite(this.repository.update(session.id, { lifecycle: 'failed' })).catch(
-          (e) => {
+        // Fenced like every terminal write (round 4): an unfenced failed
+        // write here could land on a newer owner's row.
+        await writeTerminalFenced({ lifecycle: 'failed' }).catch((e) => {
+          failedWritten = false;
+          if (e instanceof TurnSupersededError) {
+            // Another owner holds the ROW; this turn's entry stops claiming
+            // liveness the same way the normal-result path does (round 7 —
+            // this branch previously skipped the restore-or-clear and left a
+            // settled stale entry behind).
+            logger.warn('Failed-write fenced out by a newer owner', { sessionId: session.id });
+            if (
+              !(
+                previousRun?.turnEpoch !== undefined &&
+                hasPendingFinalizationFor(session.id, previousRun.turnEpoch) &&
+                restoreActiveRunIfCurrent(previousRun, turnEpoch)
+              )
+            ) {
+              clearActiveRunIfOwner(session.id, turnEpoch);
+            }
+          } else {
             // The row is still `running`. Keeping the registration is the point:
             // this is precisely a session that needs reporting at shutdown, and
             // clearing it here is how the zombie survived round 1.
-            failedWritten = false;
             logger.warn('Failed to set lifecycle=failed after runner crash', {
               sessionId: session.id,
               error: e,
             });
           }
-        );
+        });
       }
       this.activityStream
         .logActivity({
@@ -1789,8 +1993,9 @@ export class SessionService implements ISessionService {
         .catch(() => {});
       // Cleared only if `failed` actually persisted — not in a `finally`
       // around runner.run(). A finally fires while the row still says
-      // `running`, reopening the same window on the way out.
-      if (failedWritten) clearActiveRun(session.id);
+      // `running`, reopening the same window on the way out. Compare-and-act
+      // on our own epoch: a newer registrant's entry is not ours to delete.
+      if (failedWritten) clearActiveRunIfOwner(session.id, turnEpoch);
       throw runnerError;
     }
 
@@ -1864,82 +2069,202 @@ export class SessionService implements ISessionService {
     // metadata blob from a snapshot taken at its own start, finalizing now
     // would overwrite the interruption's lifecycle AND erase its breadcrumb.
     // Shutdown owns the state from here (Lumen, PR #490 round 3).
+    // One payload for both the inline attempt and any background retry, so a
+    // retry writes the identical terminal state the first attempt meant to.
+    const finalizeUpdates = {
+      ...(result.backendSessionId !== session.backendSessionId
+        ? { backendSessionId: result.backendSessionId }
+        : {}),
+      messageCount: session.messageCount + 1,
+      backend: resolvedBackend,
+      ...(servedModel ? { model: servedModel } : {}),
+      lifecycle: postRunLifecycle as Session['lifecycle'],
+      cliAttached: false,
+    };
+    const performFinalizeWrite = () => writeTerminalFenced(finalizeUpdates);
+
+    // Run-boundary steps. Invoked ONLY after the terminal write durably
+    // persisted — inline on the fast path (invokedInline=true, while this
+    // turn still holds the processing lock), from the retry loop otherwise.
+    const boundaryLockKey = `${agentId}:${session.id}`;
+    const onTurnFinalized = (invokedInline: boolean) => {
+      // Cleared ONLY once a terminal state actually persisted. Clearing after
+      // a refused or failed write would delete this run from the registry
+      // while its row still says `running` — and if shutdown is mid-drain and
+      // has not snapshotted yet, the session vanishes from the report and
+      // gets no notice. Exactly the original zombie, reached through the gate
+      // meant to prevent it (Lumen, PR #490 round 4). Compare-and-act on our
+      // epoch: if a newer turn registered over us while our late write landed
+      // (it can only land while the row was still ours), its entry survives.
+      clearActiveRunIfOwner(session.id, turnEpoch);
+      // A QUEUED next turn is invisible to every DB-side fence: it acquires
+      // and renews the lease BEFORE the processing lock, while the row epoch
+      // is still ours (Lumen rounds 7–8 — a heartbeat cutoff rejected our own
+      // mid-turn renewals instead). The queue and the lock are in-process
+      // truth: same-session turns are serialized by this process, so a
+      // non-empty queue (or, from the background path, a lock held by the
+      // next turn) means the boundary belongs to whoever comes next.
+      const queuedNextTurn = (this.pendingQueues.get(boundaryLockKey)?.length ?? 0) > 0;
+      const lockHeldByNextTurn = !invokedInline && this.processingLocks.has(boundaryLockKey);
+      if (queuedNextTurn || lockHeldByNextTurn) {
+        logger.warn('Skipping boundary effects; a newer turn is queued or running', {
+          sessionId: session.id,
+          queuedNextTurn,
+          lockHeldByNextTurn,
+        });
+        return;
+      }
+      // The lease/graph boundary effects are SESSION-wide, so they get the
+      // same ownership gate as everything else (Lumen round 5): if a newer
+      // turn has taken the row between our fenced write landing and this
+      // callback running, these boundaries are the new turn's to run, not
+      // ours — a late release here could drop a lease or claims the new turn
+      // already holds. One read; the residual is the round-trip, and both
+      // helpers additionally scope by instant/terminality on their own.
+      void (async () => {
+        const stillOurs = await this.repository
+          .findById(session.id)
+          .then((row) => row?.turnEpoch === turnEpoch)
+          .catch(() => false);
+        if (!stillOurs) {
+          logger.warn('Skipping boundary effects; a newer turn owns the session', {
+            sessionId: session.id,
+          });
+          return;
+        }
+        // The run boundary is the real terminal edge for lease release: a
+        // release requested mid-turn (end_session from inside the run) was
+        // deferred so no other thread could enter the worktree while this
+        // process was still cd'd into it. Now that the run is durably
+        // finished, release if the session ended. Fire-and-forget — release
+        // must never delay response routing. Epoch threaded so the helper's
+        // own read refuses a boundary that stopped being ours.
+        void this.releaseLeaseIfSessionTerminal(session.id, turnEpoch);
+        // Graph claims are turn-scoped: for a server-spawned session the run
+        // IS the turn, so its claims return to the pool at this boundary
+        // (spec v10; the sweep remains the crash backstop). Fire-and-forget
+        // with the boundary instant captured HERE — the real finalization
+        // instant, even when finalization lands minutes late — so a delayed
+        // release can never touch claims a later run acquires (Lumen round 3
+        // P1).
+        if (this.supabase) {
+          const boundaryAt = new Date().toISOString();
+          void releaseGraphClaimsForSession(
+            this.supabase,
+            session.id,
+            'run-completed',
+            boundaryAt,
+            turnEpoch
+          ).catch((err: unknown) => {
+            logger.warn('Graph boundary release failed at run completion', {
+              sessionId: session.id,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          });
+        }
+      })();
+    };
+
     let finalized = false;
     if (!admitStateWrite(session.id)) {
       logger.warn('Skipping post-run session write; shutdown already recorded this session', {
         sessionId: session.id,
         wouldHaveBeen: postRunLifecycle,
       });
-    } else if (result.backendSessionId !== session.backendSessionId) {
-      logger.info('Backend session ID linked to PCP session', {
-        pcpSessionId: session.id,
-        backendSessionId: result.backendSessionId,
-        previousBackendSessionId: session.backendSessionId || null,
-        backend: resolvedBackend,
-        agentId: session.agentId,
-      });
-      await trackStateWrite(
-        this.repository.update(session.id, {
-          backendSessionId: result.backendSessionId,
-          messageCount: session.messageCount + 1,
-          backend: resolvedBackend,
-          ...(servedModel ? { model: servedModel } : {}),
-          lifecycle: postRunLifecycle as Session['lifecycle'],
-          cliAttached: false,
-        })
-      );
-      finalized = true;
     } else {
-      await trackStateWrite(
-        this.repository.update(session.id, {
-          messageCount: session.messageCount + 1,
+      if (result.backendSessionId !== session.backendSessionId) {
+        logger.info('Backend session ID linked to PCP session', {
+          pcpSessionId: session.id,
+          backendSessionId: result.backendSessionId,
+          previousBackendSessionId: session.backendSessionId || null,
           backend: resolvedBackend,
-          ...(servedModel ? { model: servedModel } : {}),
-          lifecycle: postRunLifecycle as Session['lifecycle'],
-          cliAttached: false,
-        })
-      );
-      finalized = true;
-    }
-
-    // Cleared ONLY if a terminal state actually persisted. Clearing after a
-    // refused write would delete this run from the registry while its row
-    // still says `running` — and if shutdown is mid-drain and has not
-    // snapshotted yet, the session vanishes from the report and gets no
-    // notice. Exactly the original zombie, reached through the gate meant to
-    // prevent it (Lumen, PR #490 round 4).
-    //
-    // Staying registered is also right when something throws between
-    // runner.run() and here: the row really is still `running`, so a later
-    // shutdown reporting it as interrupted is the truth.
-    if (finalized) {
-      clearActiveRun(session.id);
-      // The run boundary is the real terminal edge for lease release: a
-      // release requested mid-turn (end_session from inside the run) was
-      // deferred so no other thread could enter the worktree while this
-      // process was still cd'd into it. Now that the run is durably finished,
-      // release if the session ended. Fire-and-forget — release must never
-      // delay response routing.
-      void this.releaseLeaseIfSessionTerminal(session.id);
-      // Graph claims are turn-scoped: for a server-spawned session the run
-      // IS the turn, so its claims return to the pool at this boundary
-      // (spec v10; the sweep remains the crash backstop). Fire-and-forget
-      // with the boundary instant captured HERE, so a delayed release can
-      // never touch claims a later run acquires (Lumen round 3 P1).
-      if (this.supabase) {
-        const boundaryAt = new Date().toISOString();
-        void releaseGraphClaimsForSession(
-          this.supabase,
-          session.id,
-          'run-completed',
-          boundaryAt
-        ).catch((err: unknown) => {
-          logger.warn('Graph boundary release failed at run completion', {
-            sessionId: session.id,
-            error: err instanceof Error ? err.message : String(err),
-          });
+          agentId: session.agentId,
         });
       }
+      try {
+        await performFinalizeWrite();
+        finalized = true;
+      } catch (finalizeError) {
+        if (finalizeError instanceof TurnSupersededError) {
+          // Fenced out at the inline attempt: another owner holds the ROW.
+          // Our own entry is done claiming liveness — self-clear it, strictly
+          // (round 6: a fenced-out turn that kept its entry registered was a
+          // false liveness signal to the lease sweep and a false shutdown
+          // report). If a newer turn registered over us, the strict compare
+          // no-ops and their entry stands.
+          logger.warn('Inline turn finalize fenced out by a newer owner', {
+            sessionId: session.id,
+          });
+          // Symmetric with the failed-takeover handback: if the PREVIOUS
+          // turn's recovery is still pending, its registration comes back —
+          // otherwise a fenced-out unconfirmed takeover would leave the
+          // still-running previous row with no entry for shutdown to find.
+          if (
+            !(
+              previousRun?.turnEpoch !== undefined &&
+              hasPendingFinalizationFor(session.id, previousRun.turnEpoch) &&
+              restoreActiveRunIfCurrent(previousRun, turnEpoch)
+            )
+          ) {
+            clearActiveRunIfOwner(session.id, turnEpoch);
+          }
+        } else {
+          // A failed terminal write is a BOOKKEEPING failure, not a turn
+          // failure. The turn already ran; any reply it produced is already
+          // delivered or already routed below. Throwing here reported exactly
+          // that lie on pr:558: the sender was told "Trigger to lumen failed"
+          // about an LGTM that had landed 28 minutes earlier, and the
+          // unfinalized run then sat registered for 14 hours. The write is
+          // idempotent, so it retries in the background — for longer than the
+          // DB flake that caused it (~24 min observed) — while this turn
+          // reports the outcome the recipient actually experienced.
+          logger.error(
+            'Post-run finalization failed; turn outcome stands, retrying bookkeeping in background',
+            {
+              sessionId: session.id,
+              wouldHaveBeen: postRunLifecycle,
+              error: finalizeError instanceof Error ? finalizeError.message : String(finalizeError),
+            }
+          );
+          void retryTurnFinalization({
+            sessionId: session.id,
+            attempt: performFinalizeWrite,
+            admit: () => admitStateWrite(session.id),
+            onFinalized: () => onTurnFinalized(false),
+            epochKey: turnEpoch,
+            // An UNCONFIRMED takeover must not cancel the previous turn's
+            // recovery — that loop may be the valid one, and the row CAS is
+            // the arbiter (round 8: cancelling it and then fencing out left
+            // a running row with no retry anywhere).
+            supersedeSiblings: ownershipConfirmed,
+          }).then((outcome) => {
+            // A gone row has nothing to finalize and nothing a shutdown
+            // report could truthfully say about it. A superseded loop is a
+            // turn whose row belongs to someone else: its own entry stops
+            // claiming liveness too (round 6) — strictly, so a newer
+            // registrant's entry survives.
+            if (outcome === 'gone' || outcome === 'superseded') {
+              if (
+                !(
+                  outcome === 'superseded' &&
+                  previousRun?.turnEpoch !== undefined &&
+                  hasPendingFinalizationFor(session.id, previousRun.turnEpoch) &&
+                  restoreActiveRunIfCurrent(previousRun, turnEpoch)
+                )
+              ) {
+                clearActiveRunIfOwner(session.id, turnEpoch);
+              }
+            }
+          });
+        }
+      }
+    }
+
+    // Staying registered when the write failed or was refused is deliberate:
+    // the row really does still say `running`, and with the runner settled the
+    // shutdown report reads "finished, unrecorded" rather than "still running".
+    if (finalized) {
+      onTurnFinalized(true);
     }
 
     // Gated on `finalized` for the same reason the lifecycle write is:
@@ -2095,6 +2420,15 @@ export class SessionService implements ISessionService {
        * this flag removes.
        */
       planOnly?: boolean;
+      /**
+       * Turn-epoch candidate of the message this resolution admits (PR #563
+       * round 9). Routing stamps it onto any lease it acquires so the lease
+       * carries the GENERATION of its acquiring turn — the boundary of an
+       * earlier turn on the same session then refuses to release it. Absent
+       * on plan resolutions and legacy callers; leases acquired without it
+       * stay unfenced (released as before).
+       */
+      turnEpochCandidate?: string;
     }
   ): Promise<Session> {
     const type = options?.type || 'primary';
@@ -2247,6 +2581,8 @@ export class SessionService implements ISessionService {
       identityAbsent: identity.absent === true,
       // v18 S3: plan resolutions decide without provisioning or acquiring.
       planOnly: options?.planOnly === true,
+      // Round 9: leases acquired by this resolution carry the turn's epoch.
+      turnEpochCandidate: options?.turnEpochCandidate,
     };
 
     // Resolve default_session_id from agent identity. When set, threadKey
@@ -3714,12 +4050,29 @@ This session will continue with a fresh context after compaction. Your identity,
    * deferred then happens now — at the moment the process actually left the
    * worktree.
    */
-  private async releaseLeaseIfSessionTerminal(sessionId: string): Promise<void> {
+  private async releaseLeaseIfSessionTerminal(
+    sessionId: string,
+    expectedTurnEpoch?: string
+  ): Promise<void> {
     const leases = this.getLeaseService();
     if (!leases) return;
     try {
       const session = await this.repository.findById(sessionId);
       if (!session) return;
+      // Epoch scope at the resource (Lumen, PR #563 round 6): the same read
+      // that establishes terminality also establishes ownership. A newer
+      // owner on the row means this boundary is theirs — releasing here
+      // could drop a lease the new turn holds. The session-row check alone
+      // left a residual (round 9): a successor mints its candidate and
+      // stamps the LEASE during routing, before its running-write touches
+      // the row — so the epoch is also carried into releaseAtBoundary,
+      // where each lease's own stamp is compared under the release CAS.
+      if (expectedTurnEpoch !== undefined && session.turnEpoch !== expectedTurnEpoch) {
+        logger.warn('[StudioLease] Skipping run-boundary release; newer turn owns the session', {
+          sessionId,
+        });
+        return;
+      }
       const terminal = Boolean(session.endedAt) || session.status === 'completed';
       // releaseAtBoundary also completes pendingRelease markers — a
       // close_thread/close_studio issued mid-turn deferred to this moment.
@@ -3727,6 +4080,7 @@ This session will continue with a fresh context after compaction. Your identity,
         userId: session.userId,
         sessionTerminal: terminal,
         reason: 'run-terminal',
+        expectedTurnEpoch,
       });
     } catch (err) {
       logger.warn('[StudioLease] Run-boundary release failed', {

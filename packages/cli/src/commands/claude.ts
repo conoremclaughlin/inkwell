@@ -25,6 +25,7 @@ import { getBackend, resolveAgentId } from '../backends/index.js';
 import { classifyError } from '@inklabs/shared';
 import { getValidAccessToken } from '../auth/tokens.js';
 import { callPcpTool, getPcpServerUrl } from '../lib/pcp-mcp.js';
+import { startTakeoverWatcher, writeCliTurnEpoch } from '../lib/takeover-watcher.js';
 import { sbDebugLog } from '../lib/sb-debug.js';
 import { divertConsoleLogToStderr, restoreConsoleLog } from '../lib/stdout-purity.js';
 import {
@@ -3495,6 +3496,130 @@ async function ensurePcpSessionContext(
 }
 
 /**
+ * PR #563 rounds 9–10: codex/gemini prompt hooks cannot block and run no
+ * channel plugin, so the `ink` wrapper — the session's long-lived process —
+ * is the pending-takeover marker's consumer. Scoped to the wrapper's OWN
+ * session (round 10: a crashed predecessor's marker for a different session
+ * in this checkout belongs to that session's consumer, never this one). A
+ * successful reclaim persists the claimed epoch so the on-stop hook can
+ * identify the turn it is ending at the lease boundary. Shared by the
+ * one-shot AND interactive spawn paths.
+ */
+function startSessionTakeoverWatcher(
+  backend: string,
+  pcpSessionId: string | undefined,
+  studioId?: string,
+  /** Round 18: this wrapper's generation (runtimeLinkId) — markers, records,
+   * and scope finalization bind to it so a stale wrapper can neither consume
+   * nor tombstone a successor's turn on the same session. */
+  generation?: string,
+  /**
+   * Round 15: a PERMANENT lease refusal (revoked thread, retired studio,
+   * another holder) can never converge through the marker — the wrapper is
+   * the only enforcement point for backends whose hooks cannot block, so it
+   * terminates the backend rather than knowingly run in a revoked worktree.
+   */
+  onUnprotected?: () => void
+): { stop: () => void } | undefined {
+  if (backend !== 'codex' && backend !== 'gemini') return undefined;
+  if (!pcpSessionId) return undefined;
+  const cwd = process.cwd();
+  const postLifecycle = async (body: Record<string, unknown>) => {
+    const serverUrl = getPcpServerUrl();
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    const token = await getValidAccessToken(serverUrl);
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const resp = await fetch(`${serverUrl}/api/hooks/lifecycle`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(3000),
+    });
+    // Round 18: a boundary write is only a boundary if it was ACKNOWLEDGED —
+    // a 4xx/5xx means the fence did not land, and the caller must keep its
+    // evidence rather than delete it.
+    if (!resp.ok) throw new Error(`lifecycle boundary write refused: ${resp.status}`);
+  };
+  return startTakeoverWatcher({
+    cwd,
+    expectedSessionId: pcpSessionId,
+    generation,
+    onUnprotected,
+    // Round 17: scope end is a real boundary. A turn this watcher claimed is
+    // closed with its FENCED stop (a crashed child sends no stop hook); an
+    // unclaimed scope stamps the stop tombstone so a claim still parked in
+    // the server is refused when it lands.
+    finalizeScope: async (turnEpoch, fenceAttempts) => {
+      await postLifecycle({
+        sessionId: pcpSessionId,
+        lifecycle: 'idle',
+        event: 'stop',
+        ...(turnEpoch
+          ? { turnEpoch }
+          : {
+              turnEpochMissing: true,
+              // Round 21: fence exactly the attempts THIS scope tried —
+              // appended server-side, so every abandoned attempt stays
+              // fenced and no later prompt is ever refused.
+              fenceAttempts,
+            }),
+        agentId: 'wrapper-scope-end',
+      });
+    },
+    claim: async (markerSessionId, markerAt, attemptId) => {
+      try {
+        const serverUrl = getPcpServerUrl();
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        const token = await getValidAccessToken(serverUrl);
+        if (token) headers.Authorization = `Bearer ${token}`;
+        const resp = await fetch(`${serverUrl}/api/hooks/lifecycle`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            sessionId: markerSessionId,
+            lifecycle: 'running',
+            event: 'prompt',
+            reclaimOf: markerAt,
+            // Round 21: the reclaim carries its ATTEMPT token so the DB
+            // fence can refuse exactly this attempt after scope end — and
+            // never a later prompt of the same wrapper.
+            ...(attemptId ? { attemptId } : {}),
+            // Round 11: the server exact-CAS-touches OUR studio's lease and
+            // reports whether it is still held under the reclaimed turn.
+            ...(studioId && studioId !== 'main' ? { studioId } : {}),
+          }),
+          signal: AbortSignal.timeout(3000),
+        });
+        if (resp.ok) {
+          const body = (await resp.json().catch(() => null)) as {
+            turnEpoch?: string;
+            studioLeaseHeld?: boolean;
+          } | null;
+          // Round 15: NOT HELD is a permanent refusal — surface it so the
+          // wrapper enforces instead of looping.
+          if (body?.studioLeaseHeld === false) return 'unprotected';
+          if (body?.turnEpoch) {
+            writeCliTurnEpoch(cwd, {
+              sessionId: markerSessionId,
+              turnEpoch: body.turnEpoch,
+              ...(generation ? { wrapperGeneration: generation } : {}),
+            });
+          }
+          return 'ok';
+        }
+        if (resp.status === 409) return 'stopped';
+        // Round 16: a cross-tenant 403 is as permanent as a lost lease —
+        // retrying can never converge, so enforce rather than loop.
+        if (resp.status === 403) return 'unprotected';
+        return 'failed';
+      } catch {
+        return 'failed';
+      }
+    },
+  });
+}
+
+/**
  * Run a backend with a prompt (one-shot mode).
  */
 export async function runClaude(
@@ -3648,6 +3773,27 @@ export async function runClaude(
 
   // Adapters that pass the prompt via stdin (Claude — avoids argv E2BIG on
   // large prompts) need a piped stdin we write to; otherwise inherit the TTY.
+  // PR #563 round 9: codex/gemini prompt hooks cannot block and run no
+  // channel plugin, so THIS wrapper is the marker consumer — the long-lived
+  // process that converts a failed takeover's marker into a claim.
+  let takeoverChild: ReturnType<typeof spawn> | undefined;
+  let takeoverEnforced = false;
+  const takeoverWatcher = startSessionTakeoverWatcher(
+    options.backend,
+    sessionContext.pcpSessionId,
+    studioId,
+    runtimeLinkId,
+    () => {
+      takeoverEnforced = true;
+      console.error(
+        chalk.red(
+          '\nThis worktree\u2019s lease is permanently gone (thread closed or studio revoked). Terminating the backend to protect the checkout.'
+        )
+      );
+      takeoverChild?.kill('SIGTERM');
+    }
+  );
+
   const child = spawn(prepared.binary, prepared.args, {
     stdio: [prepared.stdinData !== undefined ? 'pipe' : 'inherit', 'pipe', 'pipe'],
     env: {
@@ -3660,6 +3806,7 @@ export async function runClaude(
       ...(runtimeLinkId ? { INK_RUNTIME_LINK_ID: runtimeLinkId } : {}),
     },
   });
+  takeoverChild = child;
 
   if (prepared.stdinData !== undefined && child.stdin) {
     child.stdin.on('error', () => {});
@@ -3677,6 +3824,7 @@ export async function runClaude(
   });
 
   child.on('close', async (code) => {
+    await takeoverWatcher?.stop();
     ensureCleanup();
     if (stdoutLineBuffer.trim()) {
       const parsedSessionId = parseSessionIdFromJsonLine(stdoutLineBuffer.trim());
@@ -3706,6 +3854,9 @@ export async function runClaude(
     });
     await finalizeExecution(code ?? null);
 
+    // Round 16: an enforced termination (SIGTERM closes with code=null)
+    // must not exit 0 — the turn was killed to protect the checkout.
+    if (takeoverEnforced) process.exit(1);
     if (code !== 0) process.exit(code || 1);
   });
 
@@ -3855,6 +4006,7 @@ export async function runClaudeInteractive(
           ...(runtimeLinkId ? { INK_RUNTIME_LINK_ID: runtimeLinkId } : {}),
         },
       });
+      interactiveChild = child;
 
       child.stderr?.on('data', (chunk) => {
         const text = chunk.toString();
@@ -3900,8 +4052,36 @@ export async function runClaudeInteractive(
     });
   };
 
+  // Round 10 (Lumen): the INTERACTIVE wrapper is the primary long-lived
+  // process for codex/gemini — the round-9 watcher was wired only into the
+  // one-shot path. One watcher spans every retry attempt (retries continue
+  // the same session's scope); it is stopped before the wrapper exits.
+  let interactiveChild: ReturnType<typeof spawn> | undefined;
+  let interactiveEnforced = false;
+  const interactiveTakeoverWatcher = startSessionTakeoverWatcher(
+    options.backend,
+    sessionContext.pcpSessionId,
+    studioId,
+    runtimeLinkId,
+    () => {
+      interactiveEnforced = true;
+      console.error(
+        chalk.red(
+          '\nThis worktree\u2019s lease is permanently gone (thread closed or studio revoked). Terminating the backend to protect the checkout.'
+        )
+      );
+      interactiveChild?.kill('SIGTERM');
+    }
+  );
+
   while (true) {
     const { code, stderrText } = await runAttempt();
+    // Round 16: an enforced termination (SIGTERM closes with code=null)
+    // must neither retry with a fresh backend session nor exit 0.
+    if (interactiveEnforced) {
+      await interactiveTakeoverWatcher?.stop();
+      process.exit(1);
+    }
     const shouldRetry =
       attempt < maxAttempts &&
       shouldRetryWithFreshBackendSession({
@@ -3935,6 +4115,9 @@ export async function runClaudeInteractive(
       email: pcpConfig?.email,
     });
 
+    await interactiveTakeoverWatcher?.stop();
+    // Round 19: the adjudication tick inside stop() can enforce — re-check.
+    if (interactiveEnforced) process.exit(1);
     process.exit(code || 0);
   }
 }

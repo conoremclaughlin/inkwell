@@ -15,6 +15,9 @@ import { dirname, join } from 'path';
 import {
   registerActiveRun,
   clearActiveRun,
+  clearActiveRunIfOwner,
+  restoreActiveRunIfCurrent,
+  widenActiveRunCandidates,
   listActiveRuns,
   activeRunCount,
   resetActiveRuns,
@@ -22,11 +25,14 @@ import {
   closeIntakeAndDrain,
   isIntakeOpen,
   admitStateWrite,
+  markRunnerSettled,
 } from './active-runs.js';
 import {
   interruptActiveRuns,
   isAlreadyTerminal,
   INTERRUPT_REASON,
+  BOOKKEEPING_REASON,
+  formatTurnAge,
 } from './interrupt-active-runs.js';
 import type { ActiveRun } from './active-runs.js';
 
@@ -63,6 +69,100 @@ describe('active-runs registry', () => {
     expect(() => clearActiveRun('nope')).not.toThrow();
     expect(activeRunCount()).toBe(0);
   });
+
+  it('marks a registered run as runner-settled without clearing it', () => {
+    registerActiveRun(run());
+    expect(listActiveRuns()[0]?.runnerSettledAt).toBeUndefined();
+    markRunnerSettled('sess-1', 'succeeded');
+    // Settling is bookkeeping state, not a clear — the run must survive until
+    // its terminal write persists, or shutdown never reports it.
+    expect(activeRunCount()).toBe(1);
+    expect(listActiveRuns()[0]?.runnerSettledAt).toEqual(expect.any(Number));
+    expect(listActiveRuns()[0]?.settledOutcome).toBe('succeeded');
+  });
+
+  it('records a failed settle outcome — a settled run is not necessarily a success', () => {
+    registerActiveRun(run());
+    markRunnerSettled('sess-1', 'failed');
+    expect(listActiveRuns()[0]?.settledOutcome).toBe('failed');
+  });
+
+  it('ignores a settle for a session it never saw', () => {
+    expect(() => markRunnerSettled('nope', 'succeeded')).not.toThrow();
+    expect(activeRunCount()).toBe(0);
+  });
+
+  /**
+   * Round 4 (Lumen): the clear is compare-and-act on the turn epoch. An old
+   * turn finalizing after a newer turn registered over it must not delete
+   * the newer entry.
+   */
+  describe('owner-strict clear (rounds 4 and 6)', () => {
+    it('a stale epoch does not clear a newer registration', () => {
+      registerActiveRun(run({ turnEpoch: 'epoch-b' }));
+      clearActiveRunIfOwner('sess-1', 'epoch-a');
+      expect(activeRunCount()).toBe(1);
+    });
+
+    it('the owning epoch clears its own entry', () => {
+      registerActiveRun(run({ turnEpoch: 'epoch-a' }));
+      clearActiveRunIfOwner('sess-1', 'epoch-a');
+      expect(activeRunCount()).toBe(0);
+    });
+
+    it('widening records the candidate set while the entry keeps its owner (round 7)', () => {
+      // Ownership unknown: the row's true epoch is one of a known SET, which
+      // shutdown fences on. The entry's own epoch is untouched, so
+      // owner-strict operations behave exactly as for a confirmed turn.
+      registerActiveRun(run({ turnEpoch: 'epoch-b' }));
+      widenActiveRunCandidates('sess-1', ['epoch-a']);
+      const entry = listActiveRuns()[0]!;
+      expect(entry.turnEpoch).toBe('epoch-b');
+      expect([...(entry.turnEpochCandidates ?? [])].sort()).toEqual(['epoch-a', 'epoch-b']);
+
+      clearActiveRunIfOwner('sess-1', 'epoch-a'); // not the owner
+      expect(activeRunCount()).toBe(1);
+      clearActiveRunIfOwner('sess-1', 'epoch-b'); // the owner
+      expect(activeRunCount()).toBe(0);
+    });
+
+    it('the unconditional clear stays unconditional (shutdown, tests)', () => {
+      registerActiveRun(run({ turnEpoch: 'epoch-a' }));
+      clearActiveRun('sess-1');
+      expect(activeRunCount()).toBe(0);
+    });
+  });
+
+  /**
+   * Round 9 (Lumen): the restore after a failed takeover is compare-and-
+   * restore. B (failed, woken late) may put A's run back only while the
+   * registry still holds B's OWN entry — if a newer C registered over B in
+   * the meantime, restoring A would clobber C's live registration with a
+   * stale run.
+   */
+  describe('compare-and-restore (round 9)', () => {
+    const runA = () => run({ turnEpoch: 'epoch-a' });
+
+    it('restores while the slot still belongs to the restoring turn', () => {
+      registerActiveRun(runA());
+      registerActiveRun(run({ turnEpoch: 'epoch-b' })); // B takes over
+      expect(restoreActiveRunIfCurrent(runA(), 'epoch-b')).toBe(true);
+      expect(listActiveRuns()[0]?.turnEpoch).toBe('epoch-a');
+    });
+
+    it('refuses when a newer turn has since registered over the slot', () => {
+      registerActiveRun(runA());
+      registerActiveRun(run({ turnEpoch: 'epoch-b' })); // B takes over
+      registerActiveRun(run({ turnEpoch: 'epoch-c' })); // C registers before B wakes
+      expect(restoreActiveRunIfCurrent(runA(), 'epoch-b')).toBe(false);
+      expect(listActiveRuns()[0]?.turnEpoch).toBe('epoch-c');
+    });
+
+    it('refuses when the slot is empty — nothing to hand back through', () => {
+      expect(restoreActiveRunIfCurrent(runA(), 'epoch-b')).toBe(false);
+      expect(activeRunCount()).toBe(0);
+    });
+  });
 });
 
 /**
@@ -86,37 +186,110 @@ describe('registry brackets the persisted running state', () => {
 
   it('registers before the row is written as running', () => {
     const register = at('registerActiveRun({');
-    const running = at("lifecycle: 'running' }");
+    const running = at("lifecycle: 'running',");
     expect(register).toBeGreaterThan(-1);
     expect(running).toBeGreaterThan(-1);
     expect(register).toBeLessThan(running);
   });
 
+  // Round 3 (Lumen): superseding BEFORE the running write landed meant a
+  // failed takeover left the row owned by a turn whose recovery was already
+  // cancelled. Ownership transfers only with the durable write.
+  it('supersedes the previous finalization only after the running write', () => {
+    const running = at("lifecycle: 'running',");
+    const supersede = at('supersedePendingFinalization(session.id)');
+    expect(supersede).toBeGreaterThan(running);
+  });
+
+  it('restores the previous registration when the takeover write fails — but only into its OWN slot', () => {
+    // Round 9 (Lumen): the restore is conditional twice over. The pending
+    // check must name the PREVIOUS turn's epoch (any-recovery-pending said
+    // nothing about whose), and the write-back must compare-and-restore on
+    // the restoring turn's own registry entry — B, woken late, must never
+    // overwrite the entry a newer C has since registered.
+    const catchAt = at('catch (runningWriteError)');
+    const supersede = at('supersedePendingFinalization(session.id)');
+    expect(catchAt).toBeGreaterThan(-1);
+    const block = source.slice(catchAt, supersede);
+    expect(block).toContain('hasPendingFinalizationFor(session.id, previousRun.turnEpoch)');
+    expect(block).toContain('restoreActiveRunIfCurrent(previousRun, turnEpoch)');
+    // The fallback stays owner-scoped: our candidate, never a blind clear.
+    expect(block).toContain('clearActiveRunIfOwner(session.id, turnEpoch)');
+  });
+
   it('clears only after the failed write on the runner-throw path', () => {
     const failed = at("lifecycle: 'failed' }");
-    const clearAfterFailed = source.indexOf('clearActiveRun(', failed);
+    const clearAfterFailed = source.indexOf('clearActiveRunIfOwner(', failed);
     expect(failed).toBeGreaterThan(-1);
     expect(clearAfterFailed).toBeGreaterThan(failed);
     // ...and before the rethrow, so the error path does not leak a registration.
     expect(source.indexOf('throw runnerError', failed)).toBeGreaterThan(clearAfterFailed);
   });
 
-  it('clears only after the post-run lifecycle write on the success path', () => {
-    const postRun = at('const postRunLifecycle');
-    expect(postRun).toBeGreaterThan(-1);
-    expect(source.indexOf('clearActiveRun(', postRun)).toBeGreaterThan(postRun);
+  /**
+   * On the success path, the clear lives inside the onTurnFinalized closure,
+   * which is invoked from exactly two places: the `if (finalized)` block when
+   * the inline write persisted, and retryTurnFinalization's onFinalized once
+   * a background retry lands the same write. Either way the clear is
+   * downstream of a DURABLE terminal write — never of the attempt.
+   */
+  it('clears on the success path only inside the finalized closure', () => {
+    const closure = at('const onTurnFinalized');
+    const inlineGate = source.indexOf('let finalized = false', closure);
+    const clearAt = source.indexOf('clearActiveRunIfOwner(', closure);
+    expect(closure).toBeGreaterThan(-1);
+    expect(clearAt).toBeGreaterThan(closure);
+    expect(clearAt).toBeLessThan(inlineGate);
+
+    // Between the finalized gate and the guarded invocation, the permitted
+    // clears are the disowned-outcome ones: a gone row (nothing to report), a
+    // superseded turn (its row belongs to someone else — round 6), and the
+    // inline fence-out. Every one is the strict owner clear, so a newer
+    // registrant's entry always survives.
+    const invocation = source.indexOf('onTurnFinalized(true);', inlineGate);
+    expect(invocation).toBeGreaterThan(-1);
+    const span = source.slice(inlineGate, invocation);
+    for (
+      let i = span.indexOf('clearActiveRunIfOwner(');
+      i >= 0;
+      i = span.indexOf('clearActiveRunIfOwner(', i + 1)
+    ) {
+      const context = span.slice(Math.max(0, i - 1600), i);
+      expect(
+        context.includes("outcome === 'gone'") ||
+          context.includes('TurnSupersededError') ||
+          context.includes('superseded')
+      ).toBe(true);
+    }
+    // And no unconditional clear sneaks into the window at all.
+    expect(span).not.toMatch(/clearActiveRun\(/);
   });
 
-  // ...and only when that write actually happened. An unconditional clear
-  // after a shutdown-refused write drops the run before the snapshot.
-  it('guards the success-path clear on the write having persisted', () => {
-    const postRun = at('const postRunLifecycle');
-    const clearAt = source.indexOf('clearActiveRun(', postRun);
-    expect(source.slice(postRun, clearAt)).toContain('finalized');
-    // Single-statement or block form — either way, the clear sits directly
-    // inside an `if (finalized)` guard (the block also runs the lease
-    // release at the run boundary, PR #492).
-    expect(source.slice(clearAt - 60, clearAt)).toMatch(/if \(finalized\)\s*\{?\s*$/);
+  // ...and the inline invocation only happens when the write actually
+  // persisted. An unconditional invocation after a shutdown-refused write
+  // drops the run before the snapshot.
+  it('guards the inline finalized invocation on the write having persisted', () => {
+    expect(source).toMatch(/if \(finalized\)\s*\{\s*onTurnFinalized\(true\);/);
+  });
+
+  // The background retry must hand the SAME closure to the loop, so a late
+  // finalization runs the same boundary steps as an inline one.
+  it('routes the background retry through the same finalized closure', () => {
+    const retryCall = at('retryTurnFinalization({');
+    expect(retryCall).toBeGreaterThan(-1);
+    expect(source.indexOf('onFinalized: () => onTurnFinalized(false)', retryCall)).toBeGreaterThan(
+      retryCall
+    );
+  });
+
+  // A bookkeeping failure must not masquerade as a turn failure: the catch
+  // around the inline finalize write never rethrows (pr:558 — the rethrow is
+  // what told the sender "Trigger to lumen failed" about a delivered reply).
+  it('does not rethrow from the finalize catch', () => {
+    const catchAt = at('catch (finalizeError)');
+    const blockEnd = source.indexOf('if (finalized)', catchAt);
+    expect(catchAt).toBeGreaterThan(-1);
+    expect(source.slice(catchAt, blockEnd)).not.toContain('throw');
   });
 
   /**
@@ -293,6 +466,7 @@ describe('isAlreadyTerminal', () => {
     [{ lifecycle: 'running', ended_at: '2026-08-13T07:00:00Z' }, true],
     [{ lifecycle: 'running', ended_at: null }, false],
     [{ lifecycle: 'idle', ended_at: null }, false],
+    [{ lifecycle: 'interrupted', ended_at: null }, false],
     [{}, false],
   ])('%o → %s', (row, expected) => {
     expect(isAlreadyTerminal(row)).toBe(expected);
@@ -347,6 +521,10 @@ function makeClient(
                 filters.push([col, value]);
                 return builder;
               },
+              in(col: string, value: unknown) {
+                filters.push([col, value]);
+                return builder;
+              },
               is(col: string, value: unknown) {
                 filters.push([col, value]);
                 return builder;
@@ -390,14 +568,18 @@ function makeClient(
 describe('interruptActiveRuns', () => {
   beforeEach(() => resetActiveRuns());
 
-  it('moves the session off running and marks it resumable', async () => {
+  it('moves the session to interrupted and marks it resumable', async () => {
     const { client, sessionUpdates } = makeClient();
     await interruptActiveRuns(client, [run()]);
 
     expect(sessionUpdates).toHaveLength(1);
     expect(sessionUpdates[0]).toMatchObject({
       id: 'sess-1',
-      lifecycle: 'idle',
+      // First-class lifecycle, not idle-with-a-breadcrumb: `ink mission`,
+      // list_sessions and the dashboard all read "work died here" without
+      // inspecting metadata. The strip_interruption_on_running DB trigger
+      // clears the breadcrumbs when any writer resumes the session.
+      lifecycle: 'interrupted',
       status: 'resumable',
     });
   });
@@ -527,7 +709,7 @@ describe('interruptActiveRuns', () => {
       await interruptActiveRuns(client, [run()]);
 
       const content = String(threadMessages[0]!.content);
-      expect(content).toContain('resumable');
+      expect(content).toContain('marked interrupted');
       expect(content).toContain('re-trigger');
     });
   });
@@ -628,6 +810,10 @@ describe('interruptActiveRuns', () => {
                 filters.push([c, v]);
                 return b;
               },
+              in(c: string, v: unknown) {
+                filters.push([c, v]);
+                return b;
+              },
               is(c: string, v: unknown) {
                 filters.push([c, v]);
                 return b;
@@ -642,6 +828,154 @@ describe('interruptActiveRuns', () => {
       await interruptActiveRuns(client, [run({ threadKey: undefined })]);
       expect(filters).toContainEqual(['lifecycle', 'running']);
       expect(filters).toContainEqual(['ended_at', null]);
+    });
+
+    // Round 4 (Lumen): an old PROCESS's registry entry must not terminalize a
+    // row a newer owner has taken over — the write is fenced on the epoch the
+    // entry carries.
+    it('fences the terminalizing write on the registered turn epoch', async () => {
+      const filters: Array<[string, unknown]> = [];
+      const client = {
+        from: () => ({
+          select: () => ({
+            eq: () => ({
+              maybeSingle: async () => ({
+                data: { metadata: {}, lifecycle: 'running', ended_at: null },
+                error: null,
+              }),
+            }),
+          }),
+          update: () => {
+            const b = {
+              eq(c: string, v: unknown) {
+                filters.push([c, v]);
+                return b;
+              },
+              in(c: string, v: unknown) {
+                filters.push([c, v]);
+                return b;
+              },
+              is(c: string, v: unknown) {
+                filters.push([c, v]);
+                return b;
+              },
+              select: async () => ({ data: [{ id: 'sess-1' }], error: null }),
+            };
+            return b;
+          },
+        }),
+      };
+
+      await interruptActiveRuns(client, [run({ threadKey: undefined, turnEpoch: 'epoch-a' })]);
+      expect(filters).toContainEqual(['turn_epoch', ['epoch-a']]);
+    });
+
+    // Round 7: an UNCONFIRMED takeover's entry carries a candidate SET, and
+    // shutdown fences on the whole set — either of the two possible owners
+    // terminalizes, a cross-process claimant outside the set never does.
+    it('fences on the full candidate set for an unconfirmed takeover', async () => {
+      const filters: Array<[string, unknown]> = [];
+      const client = {
+        from: () => ({
+          select: () => ({
+            eq: () => ({
+              maybeSingle: async () => ({
+                data: { metadata: {}, lifecycle: 'running', ended_at: null },
+                error: null,
+              }),
+            }),
+          }),
+          update: () => {
+            const b = {
+              eq(c: string, v: unknown) {
+                filters.push([c, v]);
+                return b;
+              },
+              in(c: string, v: unknown) {
+                filters.push([c, v]);
+                return b;
+              },
+              is(c: string, v: unknown) {
+                filters.push([c, v]);
+                return b;
+              },
+              select: async () => ({ data: [{ id: 'sess-1' }], error: null }),
+            };
+            return b;
+          },
+        }),
+      };
+
+      await interruptActiveRuns(client, [
+        run({
+          threadKey: undefined,
+          turnEpoch: 'epoch-b',
+          turnEpochCandidates: ['epoch-a', 'epoch-b'],
+        }),
+      ]);
+      expect(filters).toContainEqual(['turn_epoch', ['epoch-a', 'epoch-b']]);
+    });
+
+    // Round 5 (Lumen): the breadcrumb branches rebuild the whole metadata
+    // blob — landing one on a row a newer owner holds would erase THEIR
+    // metadata. The write is fenced on the epoch column like everything else.
+    it('fences the already-terminal breadcrumb write on the turn epoch', async () => {
+      const filters: Array<[string, unknown]> = [];
+      const client = {
+        from: () => ({
+          select: () => ({
+            eq: () => ({
+              maybeSingle: async () => ({
+                data: {
+                  metadata: {},
+                  lifecycle: 'completed',
+                  ended_at: '2026-08-13T07:00:00.000Z',
+                },
+                error: null,
+              }),
+            }),
+          }),
+          update: () => {
+            const b = {
+              eq(c: string, v: unknown) {
+                filters.push([c, v]);
+                return b;
+              },
+              in(c: string, v: unknown) {
+                filters.push([c, v]);
+                return b;
+              },
+              is(c: string, v: unknown) {
+                filters.push([c, v]);
+                return b;
+              },
+              select: async () => ({ data: [{ id: 'sess-1' }], error: null }),
+            };
+            return b;
+          },
+        }),
+      };
+
+      const [outcome] = await interruptActiveRuns(client, [
+        run({ threadKey: undefined, turnEpoch: 'epoch-a' }),
+      ]);
+      expect(outcome.state).toBe('finalized-elsewhere');
+      expect(filters).toContainEqual(['turn_epoch', ['epoch-a']]);
+    });
+
+    it('classifies an epoch mismatch on the recheck as finalized-elsewhere, not unknown', async () => {
+      // Zero rows because a newer owner rotated the epoch: their running
+      // state is not a contradiction and not ours to report on.
+      const { client, sessionUpdates } = makeClient({ lifecycle: 'running' }, false, {
+        lifecycle: 'running',
+        ended_at: null,
+        metadata: { turnEpoch: 'epoch-new' },
+      });
+      const [outcome] = await interruptActiveRuns(client, [run({ turnEpoch: 'epoch-old' })]);
+
+      expect(outcome.state).toBe('finalized-elsewhere');
+      const wrote = sessionUpdates.find((u) => 'lifecycle' in u);
+      expect(wrote).toBeUndefined();
     });
   });
 
@@ -794,5 +1128,243 @@ describe('interruptActiveRuns', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+/**
+ * The pr:558 shape (2026-09-01): the turn FINISHED — reply delivered, child
+ * exited — and only the terminal write was lost to a transient DB error. The
+ * run stayed registered for 14 hours, and shutdown then reported a process
+ * "still running" that had exited at 00:23, advising a resume of work that
+ * had already happened. A settled runner changes what shutdown may claim.
+ */
+describe('a run whose runner had settled (finished, unrecorded)', () => {
+  const settledRun = (over: Partial<ActiveRun> = {}) =>
+    run({ runnerSettledAt: 5_000, settledOutcome: 'succeeded', ...over });
+
+  it('moves the row to plain idle — the turn was not interrupted', async () => {
+    const { client, sessionUpdates } = makeClient();
+    await interruptActiveRuns(client, [settledRun()]);
+
+    expect(sessionUpdates).toHaveLength(1);
+    expect(sessionUpdates[0]).toMatchObject({ id: 'sess-1', lifecycle: 'idle' });
+    expect(sessionUpdates[0]).not.toHaveProperty('status');
+  });
+
+  it('records the bookkeeping reason, not the interruption one', async () => {
+    const { client, sessionUpdates } = makeClient();
+    await interruptActiveRuns(client, [settledRun()]);
+
+    const metadata = sessionUpdates[0]?.metadata as Record<string, unknown>;
+    expect(metadata.interruptedReason).toBe(BOOKKEEPING_REASON);
+    expect(metadata.taskDescription).toBe('review #485');
+  });
+
+  it('reports finished-unrecorded', async () => {
+    const { client } = makeClient();
+    const [outcome] = await interruptActiveRuns(client, [settledRun()]);
+    expect(outcome).toMatchObject({ state: 'finished-unrecorded', marked: true });
+  });
+
+  it('says the process had exited and points the reader at the thread', async () => {
+    const { client, threadMessages } = makeClient();
+    await interruptActiveRuns(client, [settledRun()]);
+
+    const content = String(threadMessages[0]!.content);
+    expect(content).toContain('had already finished');
+    expect(content).toContain('check above');
+    expect(content).not.toContain('still running');
+    expect(content).not.toContain('cut short');
+  });
+
+  it('stamps the settled instant into the notice metadata', async () => {
+    const { client, threadMessages } = makeClient();
+    await interruptActiveRuns(client, [settledRun()]);
+
+    const metadata = threadMessages[0]!.metadata as Record<string, unknown>;
+    expect(metadata.runnerSettledAt).toEqual(expect.any(String));
+    expect(metadata.turnStartedAt).toEqual(expect.any(String));
+    expect(metadata.reason).toBe(BOOKKEEPING_REASON);
+  });
+
+  it('downgrades to unknown when the drain timed out', async () => {
+    const { client } = makeClient();
+    const [outcome] = await interruptActiveRuns(client, [settledRun()], 3_000, false);
+    expect(outcome.state).toBe('unknown');
+  });
+
+  /**
+   * A settled run is not necessarily a success: the runner can return
+   * success:false (or throw) and then have its `failed` write lost the same
+   * way. Mapping every settled run to idle-with-a-success-notice erased the
+   * failure (Lumen, PR #563 P1) — the intended terminal outcome must survive.
+   */
+  describe('whose turn had FAILED before shutdown', () => {
+    const failedRun = (over: Partial<ActiveRun> = {}) =>
+      settledRun({ settledOutcome: 'failed', ...over });
+
+    it('writes the failed lifecycle the turn meant to write', async () => {
+      const { client, sessionUpdates } = makeClient();
+      await interruptActiveRuns(client, [failedRun()]);
+
+      expect(sessionUpdates[0]).toMatchObject({ id: 'sess-1', lifecycle: 'failed' });
+      expect(sessionUpdates[0]).not.toHaveProperty('status');
+    });
+
+    it('says the turn failed instead of pointing at a reply that never existed', async () => {
+      const { client, threadMessages } = makeClient();
+      await interruptActiveRuns(client, [failedRun()]);
+
+      const content = String(threadMessages[0]!.content);
+      expect(content).toContain('had FAILED');
+      expect(content).toContain('starts fresh');
+      expect(content).not.toContain('nothing left to do');
+    });
+
+    it('stamps the settled outcome into the notice metadata', async () => {
+      const { client, threadMessages } = makeClient();
+      await interruptActiveRuns(client, [failedRun()]);
+      expect((threadMessages[0]!.metadata as Record<string, unknown>).settledOutcome).toBe(
+        'failed'
+      );
+    });
+  });
+});
+
+describe('turn_interrupted activity event', () => {
+  it('logs for an unsettled run — the one turn ending nothing else records', async () => {
+    const { client } = makeClient();
+    const logActivity = vi.fn(async () => ({}));
+    await interruptActiveRuns(client, [run()], 3_000, true, { logActivity });
+
+    expect(logActivity).toHaveBeenCalledTimes(1);
+    expect(logActivity.mock.calls[0]![0]).toMatchObject({
+      agentId: 'lumen',
+      type: 'error',
+      subtype: 'turn_interrupted',
+      sessionId: 'sess-1',
+    });
+  });
+
+  it('logs even for a threadless run — the record does not need an audience', async () => {
+    const { client } = makeClient();
+    const logActivity = vi.fn(async () => ({}));
+    await interruptActiveRuns(client, [run({ threadKey: undefined })], 3_000, true, {
+      logActivity,
+    });
+    expect(logActivity).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not log for a settled run — its completion was already logged', async () => {
+    const { client } = makeClient();
+    const logActivity = vi.fn(async () => ({}));
+    await interruptActiveRuns(client, [run({ runnerSettledAt: 5_000 })], 3_000, true, {
+      logActivity,
+    });
+    expect(logActivity).not.toHaveBeenCalled();
+  });
+
+  it('tolerates a logger that throws — the state fix and notice still land', async () => {
+    const { client, sessionUpdates, threadMessages } = makeClient();
+    const logActivity = vi.fn(async () => {
+      throw new Error('activity stream down');
+    });
+    const [outcome] = await interruptActiveRuns(client, [run()], 3_000, true, { logActivity });
+
+    expect(outcome).toMatchObject({ state: 'interrupted', marked: true, noticed: true });
+    expect(sessionUpdates).toHaveLength(1);
+    expect(threadMessages).toHaveLength(1);
+  });
+});
+
+describe('the interrupted notice carries the turn age', () => {
+  it('says how long the turn had been running', async () => {
+    const { client, threadMessages } = makeClient();
+    await interruptActiveRuns(client, [run({ startedAt: Date.now() - 2 * 3_600_000 })]);
+
+    const content = String(threadMessages[0]!.content);
+    expect(content).toContain('turn started 2h ago');
+  });
+});
+
+describe('formatTurnAge', () => {
+  it.each([
+    [30_000, 'under a minute'],
+    [5 * 60_000, '5m'],
+    [2 * 3_600_000, '2h'],
+    [2 * 3_600_000 + 33 * 60_000, '2h 33m'],
+    [14 * 3_600_000 + 26 * 60_000, '14h 26m'],
+    [-5, 'an unknown time'],
+    [Number.NaN, 'an unknown time'],
+  ])('%d ms → %s', (ms, expected) => {
+    expect(formatTurnAge(ms as number)).toBe(expected);
+  });
+});
+
+/**
+ * Round 9 (Lumen, PR #563): ONE candidate per message, minted before routing.
+ * Routing stamps it onto every lease it acquires and the turn runs under the
+ * same value — that identity is what lets a predecessor's boundary recognize
+ * a successor's lease and refuse the release. The threading crosses three
+ * closures (handleMessage → getOrCreateSession → withStudioLease →
+ * processMessage) plus the queue, so the invariant is pinned in source order.
+ */
+describe('turn-epoch candidate threading (round 9)', () => {
+  const source = readFileSync(
+    join(dirname(fileURLToPath(import.meta.url)), 'session-service.ts'),
+    'utf-8'
+  );
+
+  it('handleMessage mints the candidate BEFORE routing and threads it into both consumers', () => {
+    const handle = source.indexOf('async handleMessage(');
+    const mint = source.indexOf('const turnEpochCandidate = randomUUID();', handle);
+    const routed = source.indexOf('turnEpochCandidate,', mint);
+    const processed = source.indexOf(
+      'this.processMessage(request, session, turnEpochCandidate)',
+      mint
+    );
+    expect(handle).toBeGreaterThan(-1);
+    expect(mint).toBeGreaterThan(handle);
+    expect(routed).toBeGreaterThan(mint); // into getOrCreateSession options
+    expect(processed).toBeGreaterThan(mint); // and into the turn itself
+  });
+
+  it('a QUEUED message keeps ITS candidate — dequeue re-routes and runs under the same value', () => {
+    // The pre-queue resolution already stamped leases with this candidate;
+    // reminting at dequeue would orphan those stamps.
+    const queued = source.indexOf('queue.push({ request, resolve, reject, turnEpochCandidate })');
+    const dequeueRoute = source.indexOf('turnEpochCandidate: pending.turnEpochCandidate');
+    const dequeueRun = source.indexOf('pending.turnEpochCandidate\n        )');
+    expect(queued).toBeGreaterThan(-1);
+    expect(dequeueRoute).toBeGreaterThan(-1);
+    expect(dequeueRun).toBeGreaterThan(dequeueRoute);
+  });
+
+  it('BOTH lease acquisitions in withStudioLease stamp the candidate', () => {
+    const gate = source.indexOf('private async withStudioLease(');
+    const first = source.indexOf('turnEpoch: ctx.turnEpochCandidate', gate);
+    const second = source.indexOf('turnEpoch: ctx.turnEpochCandidate', first + 1);
+    expect(gate).toBeGreaterThan(-1);
+    expect(first).toBeGreaterThan(gate); // the routed studio
+    expect(second).toBeGreaterThan(first); // the overflow divert
+  });
+
+  it('processMessage runs under the threaded candidate, minting only as a direct-caller fallback', () => {
+    const process = source.indexOf('private async processMessage(');
+    const epoch = source.indexOf('const turnEpoch = turnEpochCandidate ?? randomUUID();', process);
+    expect(process).toBeGreaterThan(-1);
+    expect(epoch).toBeGreaterThan(process);
+  });
+
+  it('the boundary carries its epoch into releaseAtBoundary — the lease-level fence input', () => {
+    const boundary = source.indexOf('async releaseLeaseIfSessionTerminal(');
+    const release = source.indexOf('releaseAtBoundary(sessionId, {', boundary);
+    const fenced = source.indexOf('expectedTurnEpoch,', release);
+    const close = source.indexOf('});', release);
+    expect(boundary).toBeGreaterThan(-1);
+    expect(release).toBeGreaterThan(boundary);
+    // The epoch is INSIDE the releaseAtBoundary opts, not merely nearby.
+    expect(fenced).toBeGreaterThan(release);
+    expect(fenced).toBeLessThan(close);
   });
 });

@@ -10,6 +10,8 @@ import { existsSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import {
+  handleFailedTakeover,
+  getBackendByName,
   installHooks,
   callPcpTool,
   buildIdentityBlock,
@@ -1269,5 +1271,343 @@ describe('serverAlreadyInjectedContext', () => {
     expect(serverAlreadyInjectedContext({ INK_CONSTITUTION_INJECTED: '0' })).toBe(false);
     expect(serverAlreadyInjectedContext({ INK_CONSTITUTION_INJECTED: 'true' })).toBe(false);
     expect(serverAlreadyInjectedContext({ INK_CONSTITUTION_INJECTED: '' })).toBe(false);
+  });
+});
+
+/**
+ * Round 7 (PR #563, Lumen): the round-6 blocking branch compared against
+ * 'claude' while the backend is NAMED 'claude-code' — it never fired, and
+ * only a behavioural test would have caught it. So: behavioural tests, on
+ * the capability flag, both directions.
+ */
+describe('handleFailedTakeover', () => {
+  it('the REAL claude-code capability blocks — not an inline stand-in', () => {
+    // Round 7 meta-lesson: the first behavioural tests used inline capability
+    // objects, so flipping the real constant's flag kept everything green —
+    // the same unbound-wiring shape as the name-comparison bug they were
+    // written to prevent. This one goes through the actual registry.
+    const exit = vi.fn((code: number): never => {
+      throw new Error(`exit:${code}`);
+    });
+    expect(() =>
+      handleFailedTakeover(getBackendByName('claude-code'), {
+        agentId: 'wren',
+        writePendingTakeover: vi.fn(),
+        exit: exit as never,
+      })
+    ).toThrow('exit:2');
+    expect(getBackendByName('codex').blocksOnFailedTakeover).toBe(false);
+    expect(getBackendByName('gemini').blocksOnFailedTakeover).toBe(false);
+  });
+
+  it('BLOCKS the prompt on a blocking-capable backend, writing no marker', () => {
+    const exit = vi.fn((code: number): never => {
+      throw new Error(`exit:${code}`);
+    });
+    const writePendingTakeover = vi.fn();
+
+    expect(() =>
+      handleFailedTakeover(
+        { name: 'claude-code', blocksOnFailedTakeover: true },
+        { agentId: 'wren', writePendingTakeover, exit: exit as never }
+      )
+    ).toThrow('exit:2');
+    expect(writePendingTakeover).not.toHaveBeenCalled();
+  });
+
+  it('writes the durable marker on a non-blocking backend — no in-process timer', () => {
+    // Round 8 (Lumen): this hook process is short-lived; an unref()'d timer
+    // dies with it. The durable artefact is the marker the ink wrapper's
+    // takeover watcher converts into a claim.
+    const exit = vi.fn((code: number): never => {
+      throw new Error(`exit:${code}`);
+    });
+    const writePendingTakeover = vi.fn();
+
+    handleFailedTakeover(
+      { name: 'codex', blocksOnFailedTakeover: false },
+      { agentId: 'wren', writePendingTakeover, exit: exit as never }
+    );
+
+    expect(exit).not.toHaveBeenCalled();
+    expect(writePendingTakeover).toHaveBeenCalledTimes(1);
+  });
+
+  it('a marker write failure is swallowed — the prompt itself must not break', () => {
+    expect(() =>
+      handleFailedTakeover(
+        { name: 'gemini', blocksOnFailedTakeover: false },
+        {
+          agentId: 'wren',
+          writePendingTakeover: () => {
+            throw new Error('disk full');
+          },
+        }
+      )
+    ).not.toThrow();
+  });
+});
+
+/**
+ * Round 10 (Lumen): the stop must identify the epoch it is ending. The
+ * prompt claim's response carries the fresh epoch; the on-prompt hook
+ * persists it (own session only), and the on-stop hook sends it with the
+ * stop event and clears only its own record. The handlers are not exported,
+ * so the threading is pinned in source order; the record helpers themselves
+ * are behaviorally tested in lib/takeover-watcher.test.ts.
+ */
+describe('CLI turn-epoch round-trip (round 10)', () => {
+  const loadSource = async () => {
+    const { readFileSync } = await import('fs');
+    const { dirname, join } = await import('path');
+    const { fileURLToPath } = await import('url');
+    return readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'hooks.ts'), 'utf-8');
+  };
+
+  it('a successful non-headless takeover persists the claimed epoch', async () => {
+    const source = await loadSource();
+    const success = source.indexOf('} else if (takeoverOk && !isHeadlessSpawn) {');
+    const write = source.indexOf('writeCliTurnEpoch(cwd, {', success);
+    const nextFn = source.indexOf('async function', success);
+    expect(success).toBeGreaterThan(-1);
+    expect(write).toBeGreaterThan(success);
+    expect(nextFn === -1 || write < nextFn).toBe(true);
+  });
+
+  it('the stop sends its OWN session record and clears it — foreign records untouched', async () => {
+    const source = await loadSource();
+    const stop = source.indexOf('async function onStopHandler(');
+    const read = source.indexOf('readCliTurnEpoch(cwd)', stop);
+    const scoped = source.indexOf(
+      'const stopEpoch = adjudicatedEpoch ?? (recordIsOurs ? epochRecord?.turnEpoch : undefined);',
+      stop
+    );
+    const sent = source.indexOf('turnEpoch: stopEpoch', stop);
+    const cleared = source.indexOf('clearCliTurnEpoch(cwd, stopSessionId, {', stop);
+    // Round 19: the record must match OUR wrapper generation, and the clear
+    // is compare-and-delete on the exact record we sent.
+    const genGuard = source.indexOf(
+      '(epochRecord.wrapperGeneration ?? undefined) === (stopGeneration ?? undefined)',
+      stop
+    );
+    expect(genGuard).toBeGreaterThan(stop);
+    expect(stop).toBeGreaterThan(-1);
+    expect(read).toBeGreaterThan(stop);
+    expect(scoped).toBeGreaterThan(stop);
+    expect(sent).toBeGreaterThan(scoped);
+    expect(cleared).toBeGreaterThan(sent);
+  });
+
+  it('updateRuntimeGenerationState forwards the stop epoch in the request body', async () => {
+    const source = await loadSource();
+    const fn = source.indexOf('async function updateRuntimeGenerationState(');
+    const body = source.indexOf('...(opts?.turnEpoch ? { turnEpoch: opts.turnEpoch } : {})', fn);
+    const parsed = source.indexOf("typeof body?.turnEpoch === 'string'", fn);
+    expect(fn).toBeGreaterThan(-1);
+    expect(body).toBeGreaterThan(fn);
+    // ...and surfaces the claimed epoch from a 2xx response.
+    expect(parsed).toBeGreaterThan(fn);
+  });
+});
+
+/**
+ * Round 11 (Lumen): the prompt names its studio and treats a NOT-HELD lease
+ * report as an unacknowledged takeover (no retry — the lease is gone, not
+ * flaky); a lost epoch record is loud and the stop admits it instead of
+ * downgrading to legacy unfenced behavior.
+ */
+describe('lease acknowledgement and fail-closed degradation (round 11)', () => {
+  const loadSource = async () => {
+    const { readFileSync } = await import('fs');
+    const { dirname, join } = await import('path');
+    const { fileURLToPath } = await import('url');
+    return readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'hooks.ts'), 'utf-8');
+  };
+
+  it('the prompt carries the studio for the exact-CAS held report', async () => {
+    const source = await loadSource();
+    const prompt = source.indexOf('async function onPromptHandler(');
+    const resolved = source.indexOf(
+      'const { studioId: promptStudioId } = getIdentitySessionContext(cwd);',
+      prompt
+    );
+    const sent = source.indexOf('studioId: promptStudioId', resolved);
+    expect(prompt).toBeGreaterThan(-1);
+    expect(resolved).toBeGreaterThan(prompt);
+    expect(sent).toBeGreaterThan(resolved);
+  });
+
+  it('a NOT-HELD lease report is ok:false with NO retry — inside the update loop', async () => {
+    const source = await loadSource();
+    const fn = source.indexOf('async function updateRuntimeGenerationState(');
+    const check = source.indexOf('if (body?.studioLeaseHeld === false) {', fn);
+    const refuse = source.indexOf('return { ok: false, leaseLost: true };', check);
+    const okReturn = source.indexOf('ok: true,', check);
+    expect(fn).toBeGreaterThan(-1);
+    expect(check).toBeGreaterThan(fn);
+    // The refusal comes BEFORE the success return — a 2xx alone never wins.
+    expect(refuse).toBeGreaterThan(check);
+    expect(refuse).toBeLessThan(okReturn);
+  });
+
+  it('a lost epoch record is loud at prompt, and the stop admits it (fail closed downstream)', async () => {
+    const source = await loadSource();
+    const record = source.indexOf('const recorded = writeCliTurnEpoch(cwd, {');
+    const loud = source.indexOf("hookLog('on_prompt_epoch_record_failed'", record);
+    expect(record).toBeGreaterThan(-1);
+    expect(loud).toBeGreaterThan(record);
+
+    const stop = source.indexOf('async function onStopHandler(');
+    const admit = source.indexOf('turnEpochMissing: true,', stop);
+    // Round 20: the missing admission is SCOPED to our own generation.
+    const admitScope = source.indexOf('fenceAttempts: abandonedAttempts', stop);
+    expect(admitScope).toBeGreaterThan(stop);
+    expect(admit).toBeGreaterThan(stop);
+  });
+});
+
+describe('stop-time marker adjudication (round 21)', () => {
+  it('the stop RECLAIMS a standing own marker before closing, and fences a refused attempt', async () => {
+    const { readFileSync } = await import('fs');
+    const { dirname, join } = await import('path');
+    const { fileURLToPath } = await import('url');
+    const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'hooks.ts'), 'utf-8');
+    const stop = source.indexOf('async function onStopHandler(');
+    // The adjudication: read own marker → reclaim with its birth time and
+    // attempt token → claimed epoch closes the turn; refused attempt joins
+    // the fence. This is what closes the short-turn escape — fs.watch is
+    // lossy and this hook CAN await.
+    const adjudicate = source.indexOf(
+      'const ownMarkerPath = pendingTakeoverMarkerPath(cwd, stopGeneration);',
+      stop
+    );
+    const reclaim = source.indexOf('reclaimOf: rawMarker.at', adjudicate);
+    const attempt = source.indexOf('attemptId: rawMarker.attemptId', adjudicate);
+    const use = source.indexOf('adjudicatedEpoch = reclaim.turnEpoch', adjudicate);
+    const fence = source.indexOf('abandonedAttempts.push(rawMarker.attemptId)', adjudicate);
+    expect(adjudicate).toBeGreaterThan(stop);
+    expect(reclaim).toBeGreaterThan(adjudicate);
+    expect(attempt).toBeGreaterThan(adjudicate);
+    expect(use).toBeGreaterThan(adjudicate);
+    expect(fence).toBeGreaterThan(adjudicate);
+    // No blind early unlink remains before the adjudication.
+    const early = source.slice(stop, adjudicate);
+    expect(early.includes('rmSync(pendingTakeoverMarkerPath')).toBe(false);
+  });
+
+  it('the marker carries a fresh attempt token', async () => {
+    const { readFileSync } = await import('fs');
+    const { dirname, join } = await import('path');
+    const { fileURLToPath } = await import('url');
+    const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'hooks.ts'), 'utf-8');
+    const marker = source.indexOf(
+      'const markerPath = pendingTakeoverMarkerPath(cwd, process.env.INK_RUNTIME_LINK_ID);'
+    );
+    const token = source.indexOf('attemptId: randomUUID()', marker);
+    expect(marker).toBeGreaterThan(-1);
+    expect(token).toBeGreaterThan(marker);
+  });
+
+  it('a 409 reclaim refusal never retries', async () => {
+    const { readFileSync } = await import('fs');
+    const { dirname, join } = await import('path');
+    const { fileURLToPath } = await import('url');
+    const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'hooks.ts'), 'utf-8');
+    const fn = source.indexOf('async function updateRuntimeGenerationState(');
+    const refuse = source.indexOf('if (resp.status === 409) {', fn);
+    const okBranch = source.indexOf('if (resp.ok) {', fn);
+    expect(refuse).toBeGreaterThan(fn);
+    expect(refuse).toBeLessThan(okBranch);
+  });
+});
+
+describe('acknowledged stops and lease-bounded adjudication (round 22)', () => {
+  const loadSource = async () => {
+    const { readFileSync } = await import('fs');
+    const { dirname, join } = await import('path');
+    const { fileURLToPath } = await import('url');
+    return readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'hooks.ts'), 'utf-8');
+  };
+
+  it('the adjudicating reclaim names the STUDIO — the lease boundary applies at stop too', async () => {
+    const source = await loadSource();
+    const stop = source.indexOf('async function onStopHandler(');
+    // The destructure alone is not the fence — the studio must be PASSED
+    // into the reclaim (the second occurrence, inside the opts object).
+    const destructure = source.indexOf('studioId: stopStudioId', stop);
+    const passed = source.indexOf('studioId: stopStudioId', destructure + 1);
+    expect(destructure).toBeGreaterThan(stop);
+    expect(passed).toBeGreaterThan(destructure);
+  });
+
+  it('local evidence is deleted only after the stop is ACKNOWLEDGED', async () => {
+    const source = await loadSource();
+    const stop = source.indexOf('async function onStopHandler(');
+    const result = source.indexOf('const stopResult = await updateRuntimeGenerationState', stop);
+    const ackBranch = source.indexOf('if (stopResult.ok) {', result);
+    const unlink = source.indexOf('rmSync(ownMarkerPath, { force: true });', ackBranch);
+    const persist = source.indexOf('writeCliTurnEpoch(cwd, {', ackBranch);
+    expect(result).toBeGreaterThan(stop);
+    expect(ackBranch).toBeGreaterThan(result);
+    // The unlink lives INSIDE the acknowledged branch...
+    expect(unlink).toBeGreaterThan(ackBranch);
+    // ...and an unacknowledged stop PERSISTS the committed epoch instead.
+    expect(persist).toBeGreaterThan(ackBranch);
+    // No unlink of the own marker anywhere before the stop result exists.
+    expect(source.slice(stop, result).includes('rmSync(ownMarkerPath')).toBe(false);
+  });
+});
+
+describe('lease-lost enforcement at stop (round 23)', () => {
+  it('a revoked-lease adjudication forces a non-zero exit', async () => {
+    const { readFileSync } = await import('fs');
+    const { dirname, join } = await import('path');
+    const { fileURLToPath } = await import('url');
+    const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'hooks.ts'), 'utf-8');
+    const stop = source.indexOf('async function onStopHandler(');
+    const flag = source.indexOf('if (reclaim.leaseLost) adjudicationLeaseLost = true;', stop);
+    const enforce = source.indexOf('if (adjudicationLeaseLost) {', stop);
+    const exitCode = source.indexOf('process.exitCode = 1;', enforce);
+    expect(flag).toBeGreaterThan(stop);
+    expect(enforce).toBeGreaterThan(flag);
+    expect(exitCode).toBeGreaterThan(enforce);
+  });
+});
+
+describe('403 enforcement parity (round 24)', () => {
+  it('a permanent 403 refusal carries the leaseLost verdict — no retry, enforced at stop', async () => {
+    const { readFileSync } = await import('fs');
+    const { dirname, join } = await import('path');
+    const { fileURLToPath } = await import('url');
+    const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'hooks.ts'), 'utf-8');
+    const fn = source.indexOf('async function updateRuntimeGenerationState(');
+    const forbidden = source.indexOf('if (resp.status === 403) {', fn);
+    const verdict = source.indexOf('return { ok: false, leaseLost: true };', forbidden);
+    const okBranch = source.indexOf('if (resp.ok) {', fn);
+    expect(forbidden).toBeGreaterThan(fn);
+    // The permanent refusal returns BEFORE the retry loop can continue.
+    expect(verdict).toBeGreaterThan(forbidden);
+    expect(forbidden).toBeLessThan(okBranch);
+  });
+});
+
+describe('wrapper generation binding (round 18)', () => {
+  it('the marker and epoch record both carry INK_RUNTIME_LINK_ID', async () => {
+    const { readFileSync } = await import('fs');
+    const { dirname, join } = await import('path');
+    const { fileURLToPath } = await import('url');
+    const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'hooks.ts'), 'utf-8');
+
+    const marker = source.indexOf(
+      'const markerPath = pendingTakeoverMarkerPath(cwd, process.env.INK_RUNTIME_LINK_ID);'
+    );
+    const markerGen = source.indexOf('wrapperGeneration: process.env.INK_RUNTIME_LINK_ID', marker);
+    expect(marker).toBeGreaterThan(-1);
+    expect(markerGen).toBeGreaterThan(marker);
+
+    const record = source.indexOf('const recorded = writeCliTurnEpoch(cwd, {');
+    const recordGen = source.indexOf('wrapperGeneration: process.env.INK_RUNTIME_LINK_ID', record);
+    expect(record).toBeGreaterThan(-1);
+    expect(recordGen).toBeGreaterThan(record);
   });
 });

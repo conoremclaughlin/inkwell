@@ -255,6 +255,35 @@ function makeFakeSupabase(tables: Record<string, Row[]>, hooks?: FakeHooks) {
             : { data: { conflict: false }, error: null };
         }
 
+        if (fn === 'repoint_sessions_off_ephemeral') {
+          // Mirrors the SQL: FOR UPDATE on the studio; repoint ONLY while
+          // the lease is still NULL (a regrant that won the lock keeps its
+          // sessions bound); ancestor walk skips ephemerals and cleaned rows.
+          if (!target || target.ephemeral !== true) return { data: 0, error: null };
+          if (target.lease != null) return { data: 0, error: null };
+          let ancestorId: string | null = null;
+          const seen = new Set<string>([String(target.id)]);
+          let parentId = (target.parent_studio_id as string | null) ?? null;
+          while (parentId && !seen.has(parentId)) {
+            seen.add(parentId);
+            const parent = studios.find((r) => r.id === parentId && r.user_id === args.p_user_id);
+            if (!parent) break;
+            if (parent.ephemeral !== true && parent.status !== 'cleaned') {
+              ancestorId = String(parent.id);
+              break;
+            }
+            parentId = (parent.parent_studio_id as string | null) ?? null;
+          }
+          let count = 0;
+          for (const sess of tables['sessions'] ?? []) {
+            if (sess.user_id === args.p_user_id && sess.studio_id === args.p_studio_id) {
+              sess.studio_id = ancestorId;
+              count += 1;
+            }
+          }
+          return { data: count, error: null };
+        }
+
         if (fn !== 'grant_studio_lease') {
           return { data: null, error: { message: `no fake for rpc ${fn}` } };
         }
@@ -2082,6 +2111,88 @@ describe('captureWorktreeState (real git)', () => {
     expect(state.error).toBeTruthy();
     expect(rescueSucceeded(state)).toBe(false);
   });
+
+  /**
+   * Ephemeral studios check out DETACHED (no `eph/` branch litter), which
+   * makes commits made there reachable from nothing once the worktree is
+   * removed. Rescue must anchor them — and must NOT mint anything when the
+   * detached HEAD still sits on a branch-reachable commit.
+   */
+  describe('detached worktrees (ephemeral studios)', () => {
+    let worktree: string;
+
+    beforeEach(async () => {
+      worktree = path.join(path.dirname(repoDir), `${path.basename(repoDir)}--detached`);
+      await execFileAsync('git', ['worktree', 'add', '--detach', worktree, 'main'], {
+        cwd: repoDir,
+      });
+    });
+
+    afterEach(async () => {
+      await execFileAsync('git', ['worktree', 'remove', '--force', worktree], {
+        cwd: repoDir,
+      }).catch(() => undefined);
+      await rm(worktree, { recursive: true, force: true }).catch(() => undefined);
+    });
+
+    it('mints no rescue branch when HEAD is still branch-reachable', async () => {
+      const state = await captureWorktreeState(worktree, { rescue: true, rescueLabel: 'pr:2' });
+      expect(state.branch).toBe('HEAD');
+      expect(state.rescueBranch).toBeUndefined();
+      expect(rescueSucceeded(state)).toBe(true);
+    });
+
+    it('anchors detached commits with an ink-rescue branch before the worktree dies', async () => {
+      await writeFile(path.join(worktree, 'work.txt'), 'committed on detached HEAD\n');
+      await execFileAsync('git', ['add', '.'], { cwd: worktree });
+      await execFileAsync('git', ['commit', '-m', 'detached work'], { cwd: worktree });
+
+      const state = await captureWorktreeState(worktree, {
+        rescue: true,
+        rescueLabel: 'teardown:pr-2',
+      });
+
+      expect(state.rescueBranch).toMatch(/^ink-rescue\/teardown-pr-2-[0-9a-f]{10}$/);
+      // The branch anchors exactly the detached HEAD commit.
+      const { stdout: anchored } = await execFileAsync('git', ['rev-parse', state.rescueBranch!], {
+        cwd: repoDir,
+      });
+      expect(anchored.trim()).toBe(state.commit);
+      expect(rescueSucceeded(state)).toBe(true);
+    });
+
+    it('re-rescuing the same HEAD is a clean no-op — the first branch already anchors it', async () => {
+      await writeFile(path.join(worktree, 'work.txt'), 'committed on detached HEAD\n');
+      await execFileAsync('git', ['add', '.'], { cwd: worktree });
+      await execFileAsync('git', ['commit', '-m', 'detached work'], { cwd: worktree });
+
+      const first = await captureWorktreeState(worktree, { rescue: true, rescueLabel: 'x' });
+      expect(first.rescueBranch).toMatch(/^ink-rescue\//);
+
+      // HEAD is now reachable from the minted branch, so the second pass has
+      // nothing left to anchor — no duplicate branches, no error.
+      const second = await captureWorktreeState(worktree, { rescue: true, rescueLabel: 'x' });
+      expect(second.rescueBranch).toBeUndefined();
+      expect(rescueSucceeded(second)).toBe(true);
+      const { stdout: rescues } = await execFileAsync('git', ['branch', '--list', 'ink-rescue/*'], {
+        cwd: repoDir,
+      });
+      expect(rescues.trim().split('\n').filter(Boolean)).toHaveLength(1);
+    });
+
+    it('stash-rescues a dirty detached tree and anchors its commits in one pass', async () => {
+      await writeFile(path.join(worktree, 'work.txt'), 'committed\n');
+      await execFileAsync('git', ['add', '.'], { cwd: worktree });
+      await execFileAsync('git', ['commit', '-m', 'detached work'], { cwd: worktree });
+      await writeFile(path.join(worktree, 'work.txt'), 'and then uncommitted\n');
+
+      const state = await captureWorktreeState(worktree, { rescue: true, rescueLabel: 'pr:3' });
+      expect(state.dirty).toBe(true);
+      expect(state.rescueStashSha).toMatch(/^[0-9a-f]{40}$/);
+      expect(state.rescueBranch).toMatch(/^ink-rescue\//);
+      expect(rescueSucceeded(state)).toBe(true);
+    });
+  });
 });
 
 // ── S1 mortality: expired ephemerals held from elsewhere (spec v18) ──
@@ -2971,5 +3082,210 @@ describe('S2: the minimal close invariant (spec v18, Lumen r2)', () => {
     expect(claim).not.toBeNull();
     expect(storedLease()?.quarantined).toBe(true);
     expect(storedLease()?.claimKind).toBe('teardown');
+  });
+});
+
+describe('R9: lease turn-generation fence (PR #563 round 9)', () => {
+  // The scenario this closes: turn A's boundary checks the SESSION row's
+  // epoch, passes, and then releases — but successor turn B stamped the
+  // LEASE during routing, before B's running-write touched the session row.
+  // The lease itself now carries its acquiring turn's epoch, and the
+  // boundary compares against it under the release CAS.
+  let tables: Record<string, Row[]>;
+
+  beforeEach(() => {
+    resetActiveRuns();
+    tables = baseTables();
+  });
+
+  afterEach(() => resetActiveRuns());
+
+  const storedLease = () => tables.studios[0].lease as StudioLease | null;
+  const acquireReq = (overrides: Record<string, unknown> = {}) => ({
+    studioId: 'studio-1',
+    sessionId: 'session-b',
+    threadKey: 'pr:100',
+    agentId: 'wren',
+    userId: 'user-1',
+    reason: 'route-pattern',
+    ...overrides,
+  });
+
+  it('a fresh grant stamps the acquiring turn’s epoch', async () => {
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+    const result = await service.acquire(acquireReq({ turnEpoch: 'epoch-a' }));
+    expect(result.acquired).toBe(true);
+    expect(storedLease()?.turnEpoch).toBe('epoch-a');
+  });
+
+  it('a successor turn’s same-session re-acquire RESTAMPS the lease (append and same-thread rung)', async () => {
+    // Turn A holds; turn B on the SAME session multiplexes a new thread —
+    // the lease now belongs to B's generation and A's boundary must see it.
+    tables.studios[0].lease = freshLease({
+      sessionId: 'session-b',
+      threadKeys: ['pr:100'],
+      turnEpoch: 'epoch-a',
+    }) as unknown as Row;
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const appended = await service.acquire(
+      acquireReq({ threadKey: 'pr:200', turnEpoch: 'epoch-b' })
+    );
+    expect(appended.acquired).toBe(true);
+    expect(storedLease()?.turnEpoch).toBe('epoch-b');
+
+    // Same thread again (heartbeat-bump rung) — the newest turn still wins
+    // the stamp, and an epoch-less re-acquire carries the stamp forward.
+    const rebumped = await service.acquire(acquireReq({ turnEpoch: 'epoch-c' }));
+    expect(rebumped.acquired).toBe(true);
+    expect(storedLease()?.turnEpoch).toBe('epoch-c');
+
+    const unfenced = await service.acquire(acquireReq());
+    expect(unfenced.acquired).toBe(true);
+    expect(storedLease()?.turnEpoch).toBe('epoch-c');
+  });
+
+  it('releaseAtBoundary refuses a lease stamped by a DIFFERENT turn', async () => {
+    tables.studios[0].lease = freshLease({
+      sessionId: 'session-a',
+      turnEpoch: 'epoch-b',
+    }) as unknown as Row;
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    const released = await service.releaseAtBoundary('session-a', {
+      userId: 'user-1',
+      sessionTerminal: true,
+      reason: 'run-terminal',
+      expectedTurnEpoch: 'epoch-a',
+    });
+
+    expect(released).toBe(false);
+    expect(storedLease()?.turnEpoch).toBe('epoch-b');
+  });
+
+  it('releases its own stamp; unstamped leases and unfenced boundaries keep legacy behavior', async () => {
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    // Own stamp → releases.
+    tables.studios[0].lease = freshLease({
+      sessionId: 'session-a',
+      turnEpoch: 'epoch-a',
+    }) as unknown as Row;
+    expect(
+      await service.releaseAtBoundary('session-a', {
+        userId: 'user-1',
+        sessionTerminal: true,
+        reason: 'run-terminal',
+        expectedTurnEpoch: 'epoch-a',
+      })
+    ).toBe(true);
+    expect(storedLease()).toBeNull();
+
+    // Unstamped lease (pre-round-9, CLI-claimed) under a fenced boundary →
+    // releases; there is no generation to compare.
+    tables.studios[0].lease = freshLease({ sessionId: 'session-a' }) as unknown as Row;
+    expect(
+      await service.releaseAtBoundary('session-a', {
+        userId: 'user-1',
+        sessionTerminal: true,
+        reason: 'run-terminal',
+        expectedTurnEpoch: 'epoch-a',
+      })
+    ).toBe(true);
+    expect(storedLease()).toBeNull();
+
+    // Stamped lease under an UNfenced boundary (legacy caller) → releases.
+    tables.studios[0].lease = freshLease({
+      sessionId: 'session-a',
+      turnEpoch: 'epoch-b',
+    }) as unknown as Row;
+    expect(
+      await service.releaseAtBoundary('session-a', {
+        userId: 'user-1',
+        sessionTerminal: true,
+        reason: 'run-terminal',
+      })
+    ).toBe(true);
+    expect(storedLease()).toBeNull();
+  });
+
+  it('the release CAS loses to a re-acquire interleaved after the boundary’s read — even in the same millisecond', async () => {
+    // heartbeatAt inequality usually catches the interleaving; this pins the
+    // casLease turnEpoch guard for the same-ms collision where it does not.
+    const lease = freshLease({ sessionId: 'session-a', turnEpoch: 'epoch-a' });
+    tables.studios[0].lease = lease as unknown as Row;
+    const service = new StudioLeaseService(
+      makeFakeSupabase(tables, {
+        beforeUpdate: (table, count) => {
+          if (table === 'studios' && count === 1) {
+            // Successor re-acquire lands between read and CAS: same
+            // heartbeatAt (same-ms), new epoch.
+            tables.studios[0].lease = { ...lease, turnEpoch: 'epoch-b' } as unknown as Row;
+          }
+        },
+      })
+    );
+
+    const released = await service.releaseAtBoundary('session-a', {
+      userId: 'user-1',
+      sessionTerminal: true,
+      reason: 'run-terminal',
+      expectedTurnEpoch: 'epoch-a',
+    });
+
+    expect(released).toBe(false);
+    expect(storedLease()?.turnEpoch).toBe('epoch-b');
+  });
+
+  it('renewals carry the stamp forward (parser round-trip)', async () => {
+    // Every rewrite serializes the PARSED lease — a field the parser drops
+    // is a field every renewal silently erases.
+    tables.studios[0].lease = freshLease({
+      sessionId: 'session-a',
+      turnEpoch: 'epoch-a',
+    }) as unknown as Row;
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    expect(await service.renewBySession('session-a', 'user-1')).toBe(true);
+    expect(storedLease()?.turnEpoch).toBe('epoch-a');
+  });
+
+  it('renewals and touches are PURE heartbeats — no code path can rewind a stamp (round 13)', async () => {
+    // The A→B→delayed-A rewind: successor B's claim stamped the lease
+    // epoch-b; a DELAYED turn A's renewal and held-touch land afterwards.
+    // Neither carries a generation anymore, so B's stamp survives both —
+    // and B's own fenced boundary still releases while A's still refuses.
+    tables.studios[0].lease = freshLease({
+      sessionId: 'session-a',
+      turnEpoch: 'epoch-b',
+    }) as unknown as Row;
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+
+    expect(await service.renewBySession('session-a', 'user-1')).toBe(true);
+    expect(storedLease()?.turnEpoch).toBe('epoch-b');
+    expect(await service.touchStudioLeaseForSession('studio-1', 'session-a', 'user-1')).toBe(true);
+    expect(storedLease()?.turnEpoch).toBe('epoch-b');
+
+    // Delayed A's fenced boundary refuses B's lease...
+    expect(
+      await service.releaseAtBoundary('session-a', {
+        userId: 'user-1',
+        sessionTerminal: true,
+        reason: 'run-terminal',
+        expectedTurnEpoch: 'epoch-a',
+      })
+    ).toBe(false);
+    expect(storedLease()).not.toBeNull();
+
+    // ...while B's own releases.
+    expect(
+      await service.releaseAtBoundary('session-a', {
+        userId: 'user-1',
+        sessionTerminal: true,
+        reason: 'run-terminal',
+        expectedTurnEpoch: 'epoch-b',
+      })
+    ).toBe(true);
+    expect(storedLease()).toBeNull();
   });
 });

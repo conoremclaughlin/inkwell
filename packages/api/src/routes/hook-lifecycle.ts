@@ -57,6 +57,12 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         cliPollAt,
         alias,
         studioId,
+        headless,
+        reclaimOf,
+        turnEpoch,
+        turnEpochMissing,
+        fenceAttempts,
+        attemptId,
       } = req.body as {
         sessionId?: string;
         lifecycle?: string;
@@ -75,6 +81,51 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         alias?: string;
         /** Caller's worktree studio, for the fenced lease-held report. */
         studioId?: string;
+        /**
+         * Server-spawned turn: the server's pre-turn write already owns the
+         * turn epoch, so a prompt event must NOT claim a fresh one — rotating
+         * here would fence the server's own finalize out of its turn
+         * (PR #563 round 6).
+         */
+        headless?: boolean;
+        /**
+         * Marker-reclaim (round 9): the pending-takeover marker's birth time.
+         * The claim is CASed against the stop tombstone — a stop newer than
+         * this refuses the claim atomically, so a parked reclaim can never
+         * re-mark a finished turn as running.
+         */
+        reclaimOf?: string;
+        /**
+         * Stop events (round 10): the epoch of the CLI turn that is ending,
+         * round-tripped from the prompt claim's response via the on-prompt
+         * hook's epoch record. The lease boundary fences on it — the server
+         * cannot infer which turn a stop ends, because a successor may
+         * already own the row when a late stop lands. Absent for legacy
+         * senders: their boundary releases unfenced, as before.
+         */
+        turnEpoch?: string;
+        /**
+         * Round 11: a MODERN stop whose epoch record is unavailable (local
+         * write failed, record lost). Distinguishes "legacy sender" from
+         * "epoch expected but missing" — the latter FAILS CLOSED: no row
+         * stop-write, no destructive boundary releases; the sweep and the
+         * detach boundary recover the session instead.
+         */
+        turnEpochMissing?: boolean;
+        /**
+         * Round 21: the ATTEMPT tokens a scope end abandons — appended to
+         * cli_turn_fenced_attempts (every still-possible attempt is
+         * preserved; a scalar fence lost earlier scopes on overwrite). The
+         * missing-stop stamp lands alongside, fencing legacy attempt-less
+         * reclaims.
+         */
+        fenceAttempts?: string[];
+        /**
+         * Round 21: a RECLAIM's own attempt token (the marker's attemptId) —
+         * refused inside the claim's atomic CAS iff already fenced. Fresh
+         * per prompt, so one abandoned attempt never refuses a later one.
+         */
+        attemptId?: string;
       };
 
       if (!sessionId) {
@@ -123,6 +174,7 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         cliAttached?: boolean;
         cliPollAt?: string;
         cliTurnAt?: string | null;
+        cliTurnStoppedAt?: string | null;
         alias?: string | null;
       } = {};
       if (lifecycle) updates.lifecycle = lifecycle;
@@ -147,14 +199,238 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
       if (cliAttached === false) updates.cliTurnAt = null;
       const isPromptEvent = event === 'prompt' || (!event && lifecycle === 'running');
       const isStopEvent = event === 'stop';
+      // Round 11: a modern stop names the epoch it is ending, or admits the
+      // record is missing. Only a LEGACY stop (neither field) still performs
+      // the unfenced idle + marker-clear + tombstone write below — modern
+      // stops go through the epoch CAS, and a modern stop with a lost record
+      // writes nothing (fail closed; the detach boundary and sweep recover).
+      const stopEpoch = isStopEvent && typeof turnEpoch === 'string' ? turnEpoch : undefined;
+      const stopEpochMissing = isStopEvent && !stopEpoch && turnEpochMissing === true;
       if (isPromptEvent) updates.cliTurnAt = new Date().toISOString();
-      if (isStopEvent) updates.cliTurnAt = null;
+      if (isStopEvent && !stopEpoch && !stopEpochMissing) {
+        updates.cliTurnAt = null;
+        // The stop tombstone (round 9): the atomic revocation record every
+        // later marker-reclaim CASes against.
+        updates.cliTurnStoppedAt = new Date().toISOString();
+      }
+      if (stopEpoch || stopEpochMissing) {
+        // Modern stops never write lifecycle through the unfenced path.
+        delete updates.lifecycle;
+      }
 
-      const updated = await dataComposer.repositories.memory.updateSession(sessionId, updates);
+      // Ownership claim (PR #563 round 4). A CLI prompt taking over a session
+      // whose row is STUCK at `running` is a running → running write — no
+      // lifecycle transition for the epoch trigger to see, and this route
+      // writes no metadata — so a stale server turn's fenced finalize would
+      // still match its old epoch and clobber this CLI session's state.
+      // claim_turn_epoch is one atomic jsonb_set: fresh epoch, no
+      // read-modify-write replay window, and every stale fence goes dark.
+      // Claimed BEFORE the lifecycle write so a failure here fails the whole
+      // prompt visibly instead of leaving an unfenced takeover.
+      let claimedEpoch: string | undefined;
+      if (isPromptEvent && !headless) {
+        // Rounds 4–5: claim_turn_epoch(p_set_running) is ONE statement —
+        // fresh epoch, lifecycle=running, and the turn marker together. A
+        // claim can no longer succeed while the lifecycle write fails, which
+        // would have stolen ownership with no running state behind it.
+        // Round 9: a RECLAIM additionally CASes against the stop tombstone —
+        // zero rows means the turn already stopped, and the reclaim must
+        // report that distinctly so the caller retires its marker.
+        // Round 12: the claim and the lease protection are ONE atomic
+        // success boundary. The RPC locks the studio row, verifies the
+        // lease still belongs to this session, and only then claims the
+        // epoch + stamps EVERY lease the session holds (round 13) — a lost
+        // lease refuses the WHOLE takeover with nothing committed.
+        const claimStudioId =
+          typeof studioId === 'string' && studioId && studioId !== 'main' ? studioId : undefined;
+        // Round 14: the round-13 application-level reacquire is GONE — its
+        // vacancy check, grant, and claim were three separate commits, and
+        // every seam between them was a boundary failure (revoked studios
+        // reacquired under closed threads, the release's repoint racing the
+        // grant, a stopped retry stranding a fresh lease). The regrant now
+        // rides INTO the claim: one RPC, one studio row lock, one
+        // transaction. The RPC installs it only when the studio is vacant
+        // AND eligible — acquirable status, unexpired, the thread not
+        // closed (revocation-aware), no sibling row holding the same
+        // checkout — and only AFTER the tombstone CAS passes, so a stopped
+        // reclaim grants nothing.
+        const regrant = claimStudioId
+          ? {
+              sessionId,
+              threadKey: session.threadKey ?? `session:${sessionId}`,
+              threadKeys: [session.threadKey ?? `session:${sessionId}`],
+              agentId: agentId ?? session.agentId ?? 'unknown',
+              // Round 15: the canonical identity UUID, from the SESSION row
+              // (server-trusted) — never just the ambiguous slug.
+              ...(session.sbId ? { sbId: session.sbId } : {}),
+              reason: 'cli-prompt-regrant',
+            }
+          : undefined;
+        const { data: claimed, error: claimError } = await dataComposer
+          .getClient()
+          .rpc('claim_turn_epoch', {
+            p_session_id: sessionId,
+            p_set_running: true,
+            ...(reclaimOf ? { p_not_stopped_after: reclaimOf } : {}),
+            ...(claimStudioId ? { p_studio_id: claimStudioId } : {}),
+            ...(regrant ? { p_regrant: regrant } : {}),
+            ...(typeof attemptId === 'string' && attemptId ? { p_attempt: attemptId } : {}),
+          } as never);
+        const verdict = (claimed ?? null) as {
+          outcome?: string;
+          epoch?: string;
+          regranted?: boolean;
+        } | null;
 
-      if (!updated) {
-        res.status(500).json({ success: false, error: 'Failed to update session' });
-        return;
+        if (!claimError && verdict?.outcome === 'forbidden') {
+          // Round 15 P0: the studio belongs to a DIFFERENT user than the
+          // session. The RPC refused before touching anything; surface it as
+          // an authorization failure, never a lease report.
+          logger.error('[HookLifecycle] Cross-tenant claim refused', { sessionId, studioId });
+          res.status(403).json({ success: false, error: 'studio does not belong to this user' });
+          return;
+        }
+
+        if (claimError) {
+          logger.error('[HookLifecycle] Turn-epoch claim failed; refusing prompt takeover', {
+            sessionId,
+            error: claimError.message,
+          });
+          res.status(500).json({ success: false, error: 'turn-epoch claim failed' });
+          return;
+        }
+        if (verdict?.outcome === 'stopped') {
+          if (reclaimOf) {
+            logger.info('[HookLifecycle] Reclaim refused; the turn already stopped', {
+              sessionId,
+            });
+            res.status(409).json({ success: false, code: 'stopped' });
+            return;
+          }
+          res.status(500).json({ success: false, error: 'turn-epoch claim matched no session' });
+          return;
+        }
+        if (verdict?.outcome === 'lease-lost') {
+          // The lease is gone and the RPC's regrant eligibility refused:
+          // another holder, a closed thread (deliberate revocation), an
+          // expired or retired studio, or a sibling row on the checkout.
+          // Nothing was committed — the caller's failed-takeover handling
+          // (gate/block/marker) runs against a CLEAN row.
+          logger.warn('[HookLifecycle] Prompt takeover refused — lease no longer held', {
+            sessionId,
+            studioId,
+          });
+          res.json({ success: true, sessionId, lifecycle, studioLeaseHeld: false });
+          return;
+        }
+        // Round 13: the verdict space is EXHAUSTIVE — claimed with a string
+        // epoch, stopped, or lease-lost. Anything else (legacy function
+        // shape, null data, unknown outcome) is an unrecognized contract and
+        // must fail closed rather than fall through to a success response
+        // that reports held/ownership nothing established.
+        if (verdict?.outcome !== 'claimed' || typeof verdict.epoch !== 'string') {
+          logger.error('[HookLifecycle] Unrecognized claim verdict; refusing prompt takeover', {
+            sessionId,
+            verdict: JSON.stringify(verdict ?? null),
+          });
+          res.status(500).json({ success: false, error: 'unrecognized claim verdict' });
+          return;
+        }
+        claimedEpoch = verdict.epoch;
+        // The RPC IS the ownership write — lifecycle and the turn marker
+        // landed atomically inside its CAS. Writing them AGAIN below would
+        // be a second, UNFENCED ownership write: a stop (idle + tombstone)
+        // landing between the RPC and that write would be overwritten and
+        // the finished turn re-marked running (round 10). The claim is the
+        // single writer for these fields.
+        delete updates.lifecycle;
+        delete updates.cliTurnAt;
+      }
+
+      // Modern stop (round 11): idle + marker clear + tombstone land in ONE
+      // epoch-fenced statement. Zero rows means a successor turn owns the
+      // row — this stop is LATE, and writing anything (or releasing any
+      // resource) would clobber the successor. Report stale and do nothing.
+      if (stopEpoch) {
+        const { data: stoppedRows, error: stopError } = await dataComposer
+          .getClient()
+          .from('sessions')
+          .update({
+            lifecycle: 'idle',
+            cli_turn_at: null,
+            cli_turn_stopped_at: new Date().toISOString(),
+          })
+          .eq('id', sessionId)
+          .eq('turn_epoch', stopEpoch)
+          .select('id');
+        if (stopError) {
+          logger.error('[HookLifecycle] Fenced stop write failed', {
+            sessionId,
+            error: stopError.message,
+          });
+          res.status(500).json({ success: false, error: 'stop write failed' });
+          return;
+        }
+        if (!stoppedRows || stoppedRows.length === 0) {
+          logger.info('[HookLifecycle] Stale stop — a successor turn owns the session', {
+            sessionId,
+            stopEpoch,
+          });
+          res.json({ success: true, sessionId, lifecycle, stale: true });
+          return;
+        }
+      }
+
+      if (Object.keys(updates).length > 0) {
+        // Ride-along bookkeeping (workingDir, attachment, alias). After a
+        // COMMITTED ownership write — a claimed prompt, or a fenced stop that
+        // matched — two rules (rounds 11–12):
+        //   * failure must not report the takeover/stop as failed: the row
+        //     already carries the truth, and a 500 makes gated callers block
+        //     a turn whose claim landed, stranding the row running.
+        //   * the write itself is FENCED on the committed epoch: a late A
+        //     ride-along landing after successor B's claim would otherwise
+        //     overwrite B's working_dir — which isEphemeralHeldElsewhere()
+        //     reads to decide lease renewal/teardown. Zero rows = stale
+        //     no-op.
+        const committedEpoch = claimedEpoch ?? stopEpoch;
+        if (committedEpoch !== undefined) {
+          const fencedRideAlong: Record<string, unknown> = {};
+          if (updates.workingDir !== undefined) fencedRideAlong.working_dir = updates.workingDir;
+          if (updates.cliAttached !== undefined) fencedRideAlong.cli_attached = updates.cliAttached;
+          if (updates.cliPollAt !== undefined) fencedRideAlong.cli_poll_at = updates.cliPollAt;
+          if (updates.alias !== undefined) fencedRideAlong.alias = updates.alias;
+          if (updates.cliTurnAt !== undefined) fencedRideAlong.cli_turn_at = updates.cliTurnAt;
+          if (Object.keys(fencedRideAlong).length > 0) {
+            try {
+              const { data: rideRows, error: rideError } = await dataComposer
+                .getClient()
+                .from('sessions')
+                .update(fencedRideAlong)
+                .eq('id', sessionId)
+                .eq('turn_epoch', committedEpoch)
+                .select('id');
+              if (rideError) throw new Error(rideError.message);
+              if (!rideRows || rideRows.length === 0) {
+                logger.info('[HookLifecycle] Ride-along skipped — a successor owns the row', {
+                  sessionId,
+                });
+              }
+            } catch (rideAlongError) {
+              logger.warn('[HookLifecycle] Ride-along update failed after a committed claim/stop', {
+                sessionId,
+                error:
+                  rideAlongError instanceof Error ? rideAlongError.message : String(rideAlongError),
+              });
+            }
+          }
+        } else {
+          const updated = await dataComposer.repositories.memory.updateSession(sessionId, updates);
+          if (!updated) {
+            res.status(500).json({ success: false, error: 'Failed to update session' });
+            return;
+          }
+        }
       }
 
       // Lease heartbeat and CLI run boundary. Prompt/compact events renew the
@@ -167,6 +443,102 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
       // and renews only if nothing was released — release and renewal must
       // never race each other's heartbeat CAS. Fire-and-forget: never delays
       // the hook response.
+      if (isStopEvent && stopEpochMissing) {
+        // Round 11, FAIL CLOSED: a modern sender whose epoch record is gone
+        // cannot prove which turn this stop ends — destructive boundary
+        // effects are suppressed entirely. The lease keeps its heartbeat so
+        // nothing rots while the sweep/detach boundary sorts the session out.
+        // Round 17: the stop TOMBSTONE is still stamped — it is monotonically
+        // safe (it only refuses RECLAIMS whose marker predates it; live
+        // prompts are unconditional), and without it a claim still parked in
+        // the server past the wrapper's scope end would land on a dead turn.
+        // Rounds 18–21: the ATTEMPT fence is the only fence this path
+        // provides — a 200 without it would tell the caller its scope end
+        // is safe while a parked claim can still land. The abandoned
+        // attempts are APPENDED (every still-possible attempt preserved),
+        // and the missing-stop stamp lands alongside, fencing legacy
+        // attempt-less reclaim tails (the channel plugin's). A refused
+        // stamp fails the request so the caller keeps evidence.
+        let reconciledEpoch: string | undefined;
+        try {
+          const attempts = Array.isArray(fenceAttempts)
+            ? fenceAttempts.filter((a): a is string => typeof a === 'string' && a.length > 0)
+            : [];
+          const { data: closed, error: fenceError } = await dataComposer
+            .getClient()
+            .rpc('fence_turn_attempts', {
+              p_session_id: sessionId,
+              p_attempts: attempts,
+            } as never);
+          if (fenceError) throw new Error(fenceError.message);
+          reconciledEpoch = typeof closed === 'string' && closed ? closed : undefined;
+        } catch (err: unknown) {
+          logger.error('[HookLifecycle] Suppressed-stop attempt fence failed', {
+            sessionId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          res.status(500).json({ success: false, error: 'stop fence failed' });
+          return;
+        }
+        if (reconciledEpoch !== undefined) {
+          // Round 23: the fence RECONCILED a committed-but-abandoned claim —
+          // its turn just ended here, so the REAL boundary chain runs,
+          // fenced on the closed epoch, exactly like a fenced stop. Row-only
+          // reconciliation would have left graph claims held and a
+          // pendingRelease un-completed while renewing the lease.
+          const boundaryAt = new Date().toISOString();
+          void releaseGraphClaimsForSession(
+            dataComposer.getClient(),
+            sessionId,
+            'cli-turn-stopped',
+            boundaryAt,
+            reconciledEpoch
+          ).catch((err: unknown) => {
+            logger.warn('[HookLifecycle] Reconciled-stop graph release failed', {
+              sessionId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          });
+          const closedEpoch = reconciledEpoch;
+          void (async () => {
+            const postUpdate = await dataComposer.repositories.memory.getSession(sessionId);
+            const terminal =
+              Boolean(postUpdate?.endedAt) ||
+              postUpdate?.status === 'completed' ||
+              postUpdate?.lifecycle === 'completed';
+            const released = await leaseService.releaseAtBoundary(sessionId, {
+              userId: session.userId,
+              sessionTerminal: terminal,
+              reason: 'cli-turn-stopped',
+              expectedTurnEpoch: closedEpoch,
+            });
+            if (!released) {
+              await leaseService.renewBySession(sessionId, session.userId);
+            }
+          })().catch((err: unknown) => {
+            logger.warn('[HookLifecycle] Reconciled-stop lease release failed', {
+              sessionId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          });
+          res.json({ success: true, sessionId, lifecycle, reconciled: true });
+          return;
+        }
+        try {
+          await leaseService.renewBySession(sessionId, session.userId);
+        } catch (err: unknown) {
+          logger.debug('[HookLifecycle] Suppressed-stop renewal failed (non-fatal)', {
+            sessionId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+        logger.warn('[HookLifecycle] Stop without epoch record — boundary releases suppressed', {
+          sessionId,
+        });
+        res.json({ success: true, sessionId, lifecycle, suppressed: true });
+        return;
+      }
+
       if (isStopEvent) {
         // Captured synchronously at the boundary: the release helper only
         // touches claims from BEFORE this instant, so a delayed release can
@@ -175,11 +547,16 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         // Graph claims are turn-scoped: the CLI stop hook IS the real turn
         // boundary. Independent chain, FIRST — a lease-release error must
         // not skip it (round 3 P1); the helper itself never throws.
+        // Round 10: the stop identifies the epoch it is ending (round-tripped
+        // from the prompt claim). Both resource releases fence on it — a
+        // lease or claim a successor turn has since stamped is not this
+        // stop's to release. Legacy stops without it release unfenced.
         void releaseGraphClaimsForSession(
           dataComposer.getClient(),
           sessionId,
           'cli-turn-stopped',
-          boundaryAt
+          boundaryAt,
+          stopEpoch
         ).catch((err: unknown) => {
           logger.warn('[HookLifecycle] CLI-boundary graph claim release failed', {
             sessionId,
@@ -196,6 +573,7 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
             userId: session.userId,
             sessionTerminal: terminal,
             reason: 'cli-turn-stopped',
+            expectedTurnEpoch: stopEpoch,
           });
           if (!released) {
             await leaseService.renewBySession(sessionId, session.userId);
@@ -216,6 +594,11 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         // a worktree whose lease is gone. The old fire-and-forget renewal
         // left a window where a 2xx implied protection the lease no longer
         // had.
+        // Round 13: the renewal is a PURE HEARTBEAT. Every lease restamp now
+        // happens inside the atomic claim itself (which stamps ALL of the
+        // session's leases) — an application-level restamp here was a rewind
+        // hazard: a delayed turn A's renewal landing after successor B's
+        // claim would stamp B's lease back to A.
         try {
           await leaseService.renewBySession(sessionId, session.userId);
         } catch (err: unknown) {
@@ -233,11 +616,21 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
       // studioless senders — nothing to fence there.
       let studioLeaseHeld: boolean | undefined;
       if (isPromptEvent && typeof studioId === 'string' && studioId && studioId !== 'main') {
-        studioLeaseHeld = await leaseService.touchStudioLeaseForSession(
-          studioId,
-          sessionId,
-          session.userId
-        );
+        if (claimedEpoch !== undefined) {
+          // Round 12: the claim RPC already verified, locked, and stamped
+          // this studio's lease atomically with the epoch claim — reaching
+          // here means HELD by construction. A separate touch would be a
+          // second read of state the claim just settled.
+          studioLeaseHeld = true;
+        } else {
+          // Headless prompts (server-owned epoch): the exact-CAS touch is
+          // still the fenced held report.
+          studioLeaseHeld = await leaseService.touchStudioLeaseForSession(
+            studioId,
+            sessionId,
+            session.userId
+          );
+        }
       }
 
       logger.debug('[HookLifecycle] Updated', { sessionId, lifecycle, agentId });
@@ -246,6 +639,9 @@ export function createHookLifecycleRouter(dataComposer: DataComposer): Router {
         sessionId,
         lifecycle,
         ...(studioLeaseHeld !== undefined ? { studioLeaseHeld } : {}),
+        // Round 10: the claimed epoch rides back to the CLI so the eventual
+        // stop can identify the turn it is ending.
+        ...(claimedEpoch !== undefined ? { turnEpoch: claimedEpoch } : {}),
       });
     } catch (error) {
       logger.error('[HookLifecycle] Error:', error);

@@ -1843,11 +1843,23 @@ async function shutdown(): Promise<void> {
       // `drained` is passed through rather than swallowed: if a lifecycle
       // write was still outstanding, whatever we record here may be
       // contradicted a moment later, and the notice has to say so.
-      await interruptActiveRuns(dataComposer.getClient(), interrupted, undefined, drained).catch(
-        (err) => {
-          logger.error('Interruption bookkeeping failed', { error: err });
-        }
-      );
+      const composer = dataComposer;
+      await interruptActiveRuns(composer.getClient(), interrupted, undefined, drained, {
+        // The activity stream is the durable per-turn history; the
+        // interruption is the one turn ending nothing else logs.
+        logActivity: (entry) =>
+          composer.repositories.activityStream.logActivity({
+            userId: entry.userId,
+            agentId: entry.agentId,
+            type: entry.type as ActivityType,
+            subtype: entry.subtype,
+            content: entry.content,
+            sessionId: entry.sessionId,
+            payload: entry.payload as never,
+          }),
+      }).catch((err) => {
+        logger.error('Interruption bookkeeping failed', { error: err });
+      });
     }
 
     // Stop heartbeat cron job (logs internally)

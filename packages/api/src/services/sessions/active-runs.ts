@@ -47,6 +47,41 @@ export interface ActiveRun {
   /** Who asked for this run; the agent left waiting when it dies. */
   senderAgentId?: string;
   startedAt: number;
+  /**
+   * Set when the runner promise settled — the child process has exited and
+   * only bookkeeping remains. A registered run WITHOUT this is a turn that
+   * dies with the server; a registered run WITH it is a finished turn whose
+   * terminal write has not landed (pr:558, 2026-09-01: a finalization write
+   * lost to a transient DB error left a run registered for 14 hours, and
+   * shutdown then reported a process "still running" that had exited at
+   * 00:23). Shutdown reporting must not conflate the two.
+   */
+  runnerSettledAt?: number;
+  /**
+   * What the turn's unrecorded terminal state WAS MEANT to be. A settled run
+   * is not necessarily a successful one — a runner can return success:false
+   * or throw and then have its `failed` write lost the same way (Lumen, PR
+   * #563 P1). Shutdown must preserve the intended outcome, not stamp every
+   * settled run as a quiet success.
+   */
+  settledOutcome?: 'succeeded' | 'failed';
+  /**
+   * The turn's ownership generation — the candidate this turn wrote with its
+   * `running` write (Lumen, PR #563 round 4). Registry operations and the
+   * shutdown terminalizer compare-and-act on it, so an old turn's boundary
+   * work can never touch a newer turn's entry or row.
+   */
+  turnEpoch?: string;
+  /**
+   * When a takeover could not be CONFIRMED (running write and reconcile read
+   * both failed — round 6), the row's true epoch is one of a known SET: the
+   * previous turn's or ours. Shutdown fences on this set (`IN`, not a blind
+   * write), so a cross-process claimant C outside the set is never clobbered
+   * (round 7 — the earlier epoch-less "blur" made that shutdown unfenced).
+   * `turnEpoch` itself stays the registrant's own candidate, so owner-strict
+   * registry operations are unaffected.
+   */
+  turnEpochCandidates?: string[];
 }
 
 const active = new Map<string, ActiveRun>();
@@ -79,9 +114,56 @@ export function registerActiveRun(run: ActiveRun): boolean {
  * Called once a turn's terminal state is DURABLY written — not when the runner
  * returns. A row still saying `running` must stay registered, or shutdown will
  * skip the very session that needs reporting.
+ *
+ * Unconditional. Reserved for shutdown paths and tests; turns clear their
+ * own entry with clearActiveRunIfOwner.
  */
 export function clearActiveRun(sessionId: string): void {
   active.delete(sessionId);
+}
+
+/**
+ * Compare-and-act delete: removes the entry only when it STRICTLY belongs to
+ * this turn — entry.turnEpoch === epoch, undefined included (a blurred
+ * unknown-ownership entry is owned by the turn that blurred it, and a fenced
+ * epoch must not claim it; Lumen, PR #563 rounds 4 and 6). An old turn
+ * finalizing while a newer turn has registered over it is a no-op here.
+ */
+export function clearActiveRunIfOwner(sessionId: string, epoch: string | undefined): void {
+  const entry = active.get(sessionId);
+  if (!entry) return;
+  if (entry.turnEpoch !== epoch) return;
+  active.delete(sessionId);
+}
+
+/**
+ * Ownership of this entry could not be confirmed (running write AND the
+ * reconcile read both failed — round 6): the row's true epoch is one of a
+ * known SET. Widening records that set — the entry's own epoch plus every
+ * candidate the previous registration carried — so shutdown can fence on it
+ * instead of writing blind (round 7).
+ */
+export function widenActiveRunCandidates(sessionId: string, previousEpochs: string[]): void {
+  const entry = active.get(sessionId);
+  if (!entry) return;
+  const set = new Set<string>(entry.turnEpochCandidates ?? []);
+  if (entry.turnEpoch !== undefined) set.add(entry.turnEpoch);
+  for (const e of previousEpochs) set.add(e);
+  entry.turnEpochCandidates = [...set];
+}
+
+/**
+ * Called the moment the runner promise settles (resolve or reject): the child
+ * process is gone; what remains is bookkeeping. Deliberately NOT a clear —
+ * the run must stay registered until its terminal state durably persists —
+ * but it changes what a shutdown may truthfully claim about the run.
+ */
+export function markRunnerSettled(sessionId: string, outcome: 'succeeded' | 'failed'): void {
+  const run = active.get(sessionId);
+  if (run) {
+    run.runnerSettledAt = Date.now();
+    run.settledOutcome = outcome;
+  }
 }
 
 export interface DrainResult {
@@ -132,6 +214,26 @@ export function trackStateWrite<T>(promise: Promise<T>): Promise<T> {
 
 export function listActiveRuns(): ActiveRun[] {
   return [...active.values()];
+}
+
+/** The registered run for a session, if any — used for the pre-turn handoff. */
+export function getActiveRun(sessionId: string): ActiveRun | undefined {
+  return active.get(sessionId);
+}
+
+/**
+ * Put a previous turn's registration back after a failed takeover — but only
+ * while the CURRENT entry still belongs to the restoring turn (round 9: B,
+ * woken late, must not overwrite the entry a newer C has since registered;
+ * "some recovery is pending" says nothing about WHOSE slot this is).
+ * Unconditional on intake deliberately: the entry being restored was
+ * registered before intake closed and describes state that still holds.
+ */
+export function restoreActiveRunIfCurrent(run: ActiveRun, expectedCurrentEpoch: string): boolean {
+  const entry = active.get(run.sessionId);
+  if (!entry || entry.turnEpoch !== expectedCurrentEpoch) return false;
+  active.set(run.sessionId, run);
+  return true;
 }
 
 /**

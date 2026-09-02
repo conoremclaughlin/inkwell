@@ -63,6 +63,7 @@ function phaseColor(phase: string | null, lifecycle: string | null): string {
     if (phase === 'runtime:generating') return 'bg-blue-100 text-blue-700';
     return 'bg-green-100 text-green-700';
   }
+  if (lifecycle === 'interrupted') return 'bg-amber-100 text-amber-700';
   if (phase?.startsWith('blocked')) return 'bg-amber-100 text-amber-700';
   if (lifecycle === 'idle') return 'bg-green-100 text-green-700';
   return 'bg-gray-100 text-gray-600';
@@ -73,6 +74,7 @@ function phaseLabel(phase: string | null, lifecycle: string | null): string {
     if (phase === 'runtime:generating') return 'Generating';
     return phase ?? 'Running';
   }
+  if (lifecycle === 'interrupted') return 'Interrupted';
   if (lifecycle === 'idle') return phase ?? 'Idle';
   if (lifecycle === 'completed') return 'Completed';
   return phase ?? lifecycle ?? 'unknown';

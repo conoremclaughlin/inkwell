@@ -690,6 +690,65 @@ d('workflow graph executor (real DB)', () => {
     }
   });
 
+  it('round 6 (PR #563): the boundary release refuses when a newer turn owns the session', async () => {
+    const { releaseGraphClaimsForSession } = await import('../services/graph-executor.service');
+    const gE = randomUUID();
+    const node = randomUUID();
+    await client
+      .from('task_groups')
+      .insert([{ id: gE, user_id: USER, title: 'exec-itest epoch-boundary' }]);
+    await client
+      .from('tasks')
+      .insert([
+        { id: node, user_id: USER, task_group_id: gE, title: 'node', task_type: 'work' },
+      ] as never);
+    await groups.convertToGraph({
+      userId: USER,
+      taskGroupId: gE,
+      expectedVersion: 0,
+      systemActor: true,
+    });
+
+    try {
+      await client
+        .from('sessions')
+        .update({ turn_epoch: 'owner-epoch' } as never)
+        .eq('id', sess1);
+      const claim = await groups.claimGraphTask({ userId: USER, taskId: node, sessionId: sess1 });
+      expect(claim.success).toBe(true);
+
+      // A stale owner's boundary — even with a CURRENT cutoff — is refused
+      // at the resource: the epoch check runs inside the helper.
+      const refused = await releaseGraphClaimsForSession(
+        client,
+        sess1,
+        'stale-owner-boundary',
+        new Date().toISOString(),
+        'stale-epoch'
+      );
+      expect(refused).toBe(0);
+      const { data: stillClaimed } = await client
+        .from('tasks')
+        .select('claimed_by_session_id')
+        .eq('id', node)
+        .single();
+      expect(stillClaimed?.claimed_by_session_id).toBe(sess1);
+
+      // The current owner's boundary releases.
+      const released = await releaseGraphClaimsForSession(
+        client,
+        sess1,
+        'owner-boundary',
+        new Date().toISOString(),
+        'owner-epoch'
+      );
+      expect(released).toBe(1);
+    } finally {
+      await client.from('tasks').delete().eq('id', node);
+      await client.from('task_groups').delete().eq('id', gE);
+    }
+  });
+
   it('P1 regression: mutating an OPEN gate’s inbound set resets it — fresh window, stale verdicts bounce, cut reopens in-transaction', async () => {
     const g4 = randomUUID();
     const m1 = randomUUID();

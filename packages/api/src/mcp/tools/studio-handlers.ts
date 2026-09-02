@@ -20,7 +20,12 @@ import { logger } from '../../utils/logger';
 import { bootstrapStudio } from '@inklabs/shared';
 import { ensureStudioSettings } from '../../services/studio-settings';
 import { resolveMainStudio } from '../../services/sessions/session-service';
-import { StudioLeaseService } from '../../services/studio-lease.service';
+import {
+  StudioLeaseService,
+  captureWorktreeState,
+  rescueSucceeded,
+  worktreePresent,
+} from '../../services/studio-lease.service';
 
 // ============== Helpers ==============
 
@@ -650,6 +655,26 @@ export async function handleCloseStudio(args: unknown, dataComposer: DataCompose
     if (!(await leaseService.verifyClaim(studioId, closingUser.id, claim))) {
       return errorResponse(`Studio ${studioId} teardown claim was lost; aborting close.`);
     }
+
+    // Rescue BEFORE removal, fail closed (Lumen, PR #563 P1). Ephemeral
+    // worktrees are detached: a CLEAN tree can still hold commits reachable
+    // from no branch, and `git worktree remove` deletes them without
+    // complaint — captureWorktreeState anchors those under ink-rescue/* and
+    // stashes anything dirty. A failed rescue aborts with the studio intact.
+    // An absent worktree has nothing to rescue: its capture error is not a
+    // failed rescue, and the removal below already tolerates it.
+    if (await worktreePresent(studio.worktreePath)) {
+      const rescue = await captureWorktreeState(studio.worktreePath, {
+        rescue: true,
+        rescueLabel: `close:${studio.slug || studioId}`,
+      });
+      if (!rescueSucceeded(rescue)) {
+        return abortKeepingStudioUsable(
+          `Studio ${studioId} close aborted: work rescue failed (${rescue.error || 'unknown'}); worktree untouched.`
+        );
+      }
+    }
+
     try {
       await execFileAsync('git', ['worktree', 'remove', '--', studio.worktreePath], {
         cwd: studio.repoRoot,

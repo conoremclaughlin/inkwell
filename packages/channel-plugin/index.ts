@@ -253,6 +253,15 @@ Do NOT ignore channel messages — they are from your teammates and deserve time
 // Thread cursors, dedup, and cold-start skip accounting live in the drain
 // state (poll-core.ts owns the delivery semantics; unit-tested there).
 const drainState = createThreadDrainState();
+
+// NO takeover claimant here (PR #563 round 26). Pending-takeover markers are
+// written only by backends whose prompt hooks cannot block (codex, gemini) —
+// and those sessions run no channel plugin, while this plugin's own backend
+// (claude-code) blocks the prompt instead of writing a marker. The markers'
+// real consumers are the ink wrapper's takeover watcher and the on-stop
+// hook's adjudication (packages/cli). The round-8 claimant that lived here
+// was unreachable and, being a partial reimplementation of the boundary,
+// drifted from it — it was removed rather than patched again.
 const seenMessageIds = drainState.seenMessageIds; // shared with the legacy loop
 
 async function stampCliPollAt(): Promise<void> {

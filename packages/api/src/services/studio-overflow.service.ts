@@ -46,7 +46,8 @@
  * that wins first blocks acquires until the worktree is gone or the claim is
  * cleared. Destruction is additionally gated on a verified rescue, and
  * `cleaned` is recorded only after the worktree is confirmed gone from disk.
- * The branch is always kept — that is where the work lives.
+ * Ephemeral checkouts are DETACHED — no branch is minted at creation; rescue
+ * anchors any otherwise-unreachable commits under `ink-rescue/*`.
  */
 
 import { execFile } from 'child_process';
@@ -105,7 +106,6 @@ export function overflowSlug(parentStudio: Studio, threadKey: string, variant?: 
 /** One slug variant's preflight result for a given (parent, threadKey). */
 interface OverflowVariantState {
   slug: string;
-  branchTail: string;
   existing: Studio | null;
   matches: boolean;
 }
@@ -188,7 +188,6 @@ export class StudioOverflowService {
     const states: OverflowVariantState[] = [];
     for (const variant of variants) {
       const slug = overflowSlug(parentStudio, threadKey, variant);
-      const branchTail = variant ? `${threadSlug(threadKey)}-h${variant}` : threadSlug(threadKey);
       const existing = await this.studios.findBySlug(userId, slug).catch(() => null);
       const matches = existing ? this.matchesOverflow(existing, parentStudio, threadKey) : false;
       if (existing && !matches) {
@@ -199,7 +198,7 @@ export class StudioOverflowService {
           collidingStudioId: existing.id,
         });
       }
-      states.push({ slug, branchTail, existing, matches });
+      states.push({ slug, existing, matches });
     }
     return states;
   }
@@ -320,7 +319,7 @@ export class StudioOverflowService {
       const { existing } = s;
       if (existing && !s.matches) continue;
 
-      const created = await this.createWorktree(parentStudio, s.slug, agentId, s.branchTail, {
+      const created = await this.createWorktree(parentStudio, s.slug, {
         worktreePath: ephemeralWorktreePath({
           agentId,
           repoRoot: parentStudio.repoRoot,
@@ -336,6 +335,10 @@ export class StudioOverflowService {
           const revived = await this.studios.update(existing.id, {
             status: 'active',
             worktreePath: created.worktreePath,
+            // The row may carry a legacy `<agent>/eph/*` branch name from
+            // before detached checkouts; the fresh worktree is detached, and
+            // the column must describe THIS checkout, not the old one.
+            branch: created.branch,
             purpose: `Overflow studio for ${threadKey} (parent ${parentStudio.slug || parentStudio.id} was leased)`,
             cleanedAt: null,
             // Clearing archived_at is not cosmetic: a row revived from
@@ -507,7 +510,7 @@ export class StudioOverflowService {
       baseBranch: seed?.baseBranch || 'main',
     } as Studio;
 
-    const created = await this.createWorktree(parentLike, slug, agentId, agentId, {
+    const created = await this.createWorktree(parentLike, slug, {
       branch: `${agentId}/studio/${agentId}`,
     });
     if (!created) return null;
@@ -550,8 +553,6 @@ export class StudioOverflowService {
   private async createWorktree(
     parentStudio: Studio,
     slug: string,
-    agentId: string,
-    branchTail: string,
     opts?: { branch?: string; worktreePath?: string }
   ): Promise<{ worktreePath: string; branch: string } | null> {
     const mainRoot = parentStudio.repoRoot;
@@ -561,42 +562,75 @@ export class StudioOverflowService {
     const worktreePath =
       opts?.worktreePath ??
       path.join(path.dirname(mainRoot), `${path.basename(mainRoot)}--${slug}`);
-    // Parent studios pass an explicit branch: `eph/` names a temporary
-    // worktree, and a durable home studio is not one.
-    const branch = opts?.branch || `${agentId}/eph/${branchTail}`;
     const baseBranch = parentStudio.baseBranch || 'main';
 
-    try {
-      await execFileAsync('git', ['worktree', 'add', '-b', branch, worktreePath, baseBranch], {
-        cwd: mainRoot,
-      });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      // Branch may survive a previous teardown (branches are kept on close —
-      // they hold the work). Retry attached to the existing branch.
-      if (message.includes('already exists')) {
-        try {
-          await execFileAsync('git', ['worktree', 'add', worktreePath, branch], {
-            cwd: mainRoot,
-          });
-        } catch (retryErr) {
-          logger.error('[StudioOverflow] Worktree creation failed (existing-branch retry)', {
+    if (opts?.branch) {
+      // Durable studios (the D1 parent, home studios) carry a real branch —
+      // they are working checkouts in their own right.
+      const branch = opts.branch;
+      try {
+        await execFileAsync('git', ['worktree', 'add', '-b', branch, worktreePath, baseBranch], {
+          cwd: mainRoot,
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        // The branch may survive a previous teardown. Retry attached to it.
+        if (message.includes('already exists')) {
+          try {
+            await execFileAsync('git', ['worktree', 'add', worktreePath, branch], {
+              cwd: mainRoot,
+            });
+          } catch (retryErr) {
+            logger.error('[StudioOverflow] Worktree creation failed (existing-branch retry)', {
+              branch,
+              worktreePath,
+              error: retryErr instanceof Error ? retryErr.message : String(retryErr),
+            });
+            return null;
+          }
+        } else {
+          logger.error('[StudioOverflow] Worktree creation failed', {
             branch,
             worktreePath,
-            error: retryErr instanceof Error ? retryErr.message : String(retryErr),
+            error: message,
           });
           return null;
         }
-      } else {
-        logger.error('[StudioOverflow] Worktree creation failed', {
-          branch,
-          worktreePath,
-          error: message,
-        });
-        return null;
       }
+      return this.finishWorktreeSetup(mainRoot, worktreePath, branch);
     }
 
+    // Ephemeral studios check out DETACHED (Conor, 2026-09-01): review and
+    // overflow worktrees rarely commit, and every `<agent>/eph/<tail>` branch
+    // they minted outlived its teardown as litter — dozens of dead branches,
+    // plus creation failures whenever a legacy worktree still held the name.
+    // Detached HEAD has no name to collide with. Work is not losable: a dirty
+    // tree is stash-rescued at teardown, and captureWorktreeState mints an
+    // `ink-rescue/` branch when detached commits would otherwise be
+    // unreachable.
+    try {
+      await execFileAsync('git', ['worktree', 'add', '--detach', worktreePath, baseBranch], {
+        cwd: mainRoot,
+      });
+    } catch (err) {
+      logger.error('[StudioOverflow] Detached worktree creation failed', {
+        worktreePath,
+        baseBranch,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return null;
+    }
+    // The studios row's branch column records what is checked out; this
+    // sentinel says "no branch, cut from <base>" and can never collide with
+    // branch-based routing lookups.
+    return this.finishWorktreeSetup(mainRoot, worktreePath, `detached:${baseBranch}`);
+  }
+
+  private async finishWorktreeSetup(
+    mainRoot: string,
+    worktreePath: string,
+    branch: string
+  ): Promise<{ worktreePath: string; branch: string }> {
     const pkgJson = await access(path.join(worktreePath, 'package.json'))
       .then(() => true)
       .catch(() => false);
@@ -627,7 +661,8 @@ export class StudioOverflowService {
   /**
    * Close an ephemeral studio when its work unit completes: claim the studio
    * against concurrent acquires, rescue anything dirty (safe ref), remove the
-   * worktree, keep the branch, mark cleaned.
+   * worktree, mark cleaned. (Ephemeral worktrees are detached, so there is no
+   * branch to keep; rescue mints `ink-rescue/*` only when commits exist.)
    *
    * SAFETY (PR #492 rounds 1–2):
    *   - Destruction only proceeds after `claimForTeardown` wins an atomic

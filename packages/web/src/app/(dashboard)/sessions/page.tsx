@@ -153,6 +153,15 @@ function getSessionState(session: Session): {
     };
   }
 
+  if (lifecycle === 'interrupted') {
+    return {
+      label: 'Interrupted',
+      cardClass: 'border-amber-200 bg-amber-50/50 dark:border-amber-800 dark:bg-amber-900/20',
+      badgeClass: 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400',
+      phaseClass: 'text-amber-700 dark:text-amber-400',
+    };
+  }
+
   if (lifecycle === 'idle') {
     return {
       label: 'Idle',

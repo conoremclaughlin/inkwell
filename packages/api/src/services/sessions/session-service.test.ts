@@ -5,9 +5,11 @@
  * Uses dependency injection for clean, isolated tests.
  */
 
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { tmpdir } from 'os';
 import { makeFakeSupabase, type Row } from './fake-supabase.js';
+import { resetActiveRuns, activeRunCount, listActiveRuns } from './active-runs.js';
+import { resetPendingFinalizations, hasPendingFinalization } from './finalize-turn.js';
 import { StudioOverflowService } from '../studio-overflow.service.js';
 import { StudioLeaseService } from '../studio-lease.service.js';
 import {
@@ -210,6 +212,617 @@ describe('SessionService', () => {
       undefined,
       mockInkRunner
     );
+  });
+
+  /**
+   * pr:558 (2026-09-01): the post-run finalization write hit a transient DB
+   * error and the throw rode up through the trigger handler — the sender was
+   * told "Trigger to lumen failed" about a reply that had been delivered 28
+   * minutes earlier, and the unfinalized run sat registered for 14 hours.
+   *
+   * Round 3 (Lumen): these run against a STATEFUL repository — a real row
+   * whose metadata merges like the production RMW, and a fenced write that
+   * enforces the turn epoch — because the round-2 state-free mocks hid a
+   * self-defeating staleness check that made the whole retry dead code.
+   */
+  describe('finalization failure is bookkeeping, not turn failure', () => {
+    function makeStatefulRepo(initial: Partial<Session> = {}) {
+      let row: Session | null = createMockSession({ metadata: {}, ...initial });
+      const fail = { finalize: 0, running: 0, commitThenRejectRunning: 0, findById: 0 };
+      // One-shot gates: hold exactly the NEXT fenced write (or running write)
+      // open mid-flight — the Postgres-side "in flight when ownership
+      // changes" window.
+      let gateOnce: Promise<void> | null = null;
+      let runningGateOnce: Promise<void> | null = null;
+      let findGateOnce: Promise<void> | null = null;
+
+      const merge = (updates: Record<string, unknown>): Session => {
+        const metadata = {
+          ...((row!.metadata as Record<string, unknown>) ?? {}),
+          ...((updates.metadata as Record<string, unknown>) ?? {}),
+        };
+        row = { ...row!, ...updates, metadata } as Session;
+        return row;
+      };
+
+      const repo = {
+        findById: vi.fn(async () => {
+          if (findGateOnce) {
+            const gate = findGateOnce;
+            findGateOnce = null;
+            await gate;
+          }
+          if (fail.findById > 0) {
+            fail.findById -= 1;
+            throw new Error('fetch failed');
+          }
+          return row;
+        }),
+        findByUserAndAgent: vi.fn(async () => row),
+        findByUser: vi.fn(async () => (row ? [row] : [])),
+        create: vi.fn(async () => row),
+        update: vi.fn(async (id: string, updates: Record<string, unknown>) => {
+          if (!row) throw new Error(`Session not found: ${id}`);
+          if (updates.lifecycle === 'running') {
+            if (runningGateOnce) {
+              const gate = runningGateOnce;
+              runningGateOnce = null;
+              await gate;
+            }
+            if (fail.running > 0) {
+              fail.running -= 1;
+              throw new Error('An unexpected error occurred');
+            }
+            if (fail.commitThenRejectRunning > 0) {
+              fail.commitThenRejectRunning -= 1;
+              // The write COMMITS and the response still fails — a rejected
+              // promise is not a rollback (round 4).
+              merge(updates);
+              throw new Error('fetch failed');
+            }
+          }
+          return merge(updates);
+        }),
+        updateIfTurnEpoch: vi.fn(
+          async (id: string, epoch: string, updates: Record<string, unknown>) => {
+            if (!row) throw new Error(`Session not found: ${id}`);
+            if (fail.finalize > 0) {
+              fail.finalize -= 1;
+              throw new Error('An unexpected error occurred');
+            }
+            if (gateOnce) {
+              const gate = gateOnce;
+              gateOnce = null;
+              await gate;
+            }
+            if (!row) throw new Error(`Session not found: ${id}`);
+            if ((row as { turnEpoch?: string | null }).turnEpoch !== epoch) return null;
+            return merge(updates);
+          }
+        ),
+        updateTokenUsage: vi.fn(async () => undefined),
+        markCompacted: vi.fn(async () => undefined),
+        tryAcquireCompactionLock: vi.fn(async () => true),
+        releaseCompactionLock: vi.fn(async () => undefined),
+      };
+
+      return {
+        repo: repo as unknown as ISessionRepository,
+        spies: repo,
+        fail,
+        get row() {
+          return row;
+        },
+        deleteRow: () => {
+          row = null;
+        },
+        holdNextFencedWrite: (gate: Promise<void>) => {
+          gateOnce = gate;
+        },
+        holdNextRunningWrite: (gate: Promise<void>) => {
+          runningGateOnce = gate;
+        },
+        holdNextFindById: (gate: Promise<void>) => {
+          findGateOnce = gate;
+        },
+      };
+    }
+
+    const makeStatefulService = (repo: ISessionRepository) =>
+      new SessionService(
+        repo,
+        mockContextBuilder,
+        mockClaudeRunner,
+        mockActivityStream,
+        {
+          defaultWorkingDirectory: '/test',
+          mcpConfigPath: '/test/.mcp.json',
+          compactionThreshold: 150000,
+        },
+        mockCodexRunner,
+        undefined,
+        undefined,
+        mockInkRunner
+      );
+
+    beforeEach(() => {
+      vi.useFakeTimers();
+      resetActiveRuns();
+      resetPendingFinalizations();
+    });
+
+    afterEach(async () => {
+      // Drain any detached retry loop past its budget so it cannot leak into
+      // the next test, then drop the fake clock.
+      await vi.advanceTimersByTimeAsync(31 * 60_000);
+      vi.useRealTimers();
+      resetActiveRuns();
+      resetPendingFinalizations();
+    });
+
+    it('reports the turn outcome the recipient experienced, not the lost write', async () => {
+      const db = makeStatefulRepo();
+      db.fail.finalize = Number.POSITIVE_INFINITY;
+      const service = makeStatefulService(db.repo);
+
+      const result = await service.handleMessage(createMockRequest());
+
+      // This is the exact assertion pr:558 failed: success:false here is what
+      // became the false "Trigger to lumen failed" notice.
+      expect(result.success).toBe(true);
+      expect(result.error).toBeUndefined();
+      expect(result.finalTextResponse).toBe('Hello! How can I help?');
+    });
+
+    it('keeps the run registered (settled) while the write has not landed', async () => {
+      const db = makeStatefulRepo();
+      db.fail.finalize = Number.POSITIVE_INFINITY;
+      const service = makeStatefulService(db.repo);
+
+      await service.handleMessage(createMockRequest());
+
+      expect(activeRunCount()).toBe(1);
+      // Settled: shutdown must say "finished, unrecorded", never "still running".
+      expect(listActiveRuns()[0]?.runnerSettledAt).toEqual(expect.any(Number));
+    });
+
+    /**
+     * The round-3 P1 regression (Lumen): after a failed inline finalize, the
+     * turn's OWN row necessarily still says `running`. A staleness check on
+     * lifecycle classified the owner as superseded and never retried — the
+     * pr:558 fix was dead code behind state-free mocks. The fence is the
+     * turn epoch, which is still OURS here, so the retry MUST write.
+     */
+    it('the retry fires against its own still-running row and finalizes it', async () => {
+      const db = makeStatefulRepo();
+      db.fail.finalize = 1; // inline attempt only
+      const service = makeStatefulService(db.repo);
+
+      await service.handleMessage(createMockRequest());
+      expect(db.row?.lifecycle).toBe('running');
+      expect(activeRunCount()).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      expect(db.row?.lifecycle).toBe('idle');
+      expect(activeRunCount()).toBe(0);
+    });
+
+    it('abandons and clears when the session row is gone', async () => {
+      const db = makeStatefulRepo();
+      db.fail.finalize = 1;
+      const service = makeStatefulService(db.repo);
+
+      await service.handleMessage(createMockRequest());
+      db.deleteRow();
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      // Nothing to finalize and nothing a shutdown report could say about it.
+      expect(activeRunCount()).toBe(0);
+    });
+
+    it('a run that never finalizes stays registered for the shutdown report', async () => {
+      const db = makeStatefulRepo();
+      db.fail.finalize = Number.POSITIVE_INFINITY;
+      const service = makeStatefulService(db.repo);
+
+      await service.handleMessage(createMockRequest());
+      await vi.advanceTimersByTimeAsync(31 * 60_000);
+
+      // Exhausted, not cleared: the row still says running, and the registry
+      // is how shutdown finds out and tells someone.
+      expect(activeRunCount()).toBe(1);
+    });
+
+    /**
+     * Interleaving X (Lumen round 3): B supersedes A and B's `running` write
+     * then FAILS. Ownership never transferred — A's recovery must survive.
+     * The ordered handoff (supersede only after the running write lands, and
+     * restore A's registration on failure) is what makes this hold.
+     */
+    it("a failed takeover leaves the previous turn's recovery intact", async () => {
+      const db = makeStatefulRepo();
+      db.fail.finalize = 1; // A's inline finalize fails; its retry is pending
+      const service = makeStatefulService(db.repo);
+
+      await service.handleMessage(createMockRequest()); // turn A
+      expect(activeRunCount()).toBe(1);
+      const aSettledAt = listActiveRuns()[0]?.runnerSettledAt;
+      expect(aSettledAt).toEqual(expect.any(Number));
+
+      db.fail.running = 3; // turn B's running write fails on every attempt
+      const b = await service.handleMessage(createMockRequest());
+      expect(b.success).toBe(false);
+
+      // A's registration is back (settled run, not B's fresh one) …
+      expect(activeRunCount()).toBe(1);
+      expect(listActiveRuns()[0]?.runnerSettledAt).toBe(aSettledAt);
+
+      // … and A's pending finalization was NOT superseded: it lands.
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(db.row?.lifecycle).toBe('idle');
+      expect(activeRunCount()).toBe(0);
+    });
+
+    /**
+     * Round 4 (Lumen): a rejected promise is not a rollback. The running
+     * write can COMMIT and the response still fail — the takeover happened.
+     * Rolling back would cancel A's recovery while B's epoch owns the row
+     * and no B process runs. The reconcile: retry idempotently (same
+     * candidate), then READ — a row running under our candidate means
+     * proceed.
+     */
+    it('a committed-but-rejected running write is reconciled, not rolled back', async () => {
+      const db = makeStatefulRepo();
+      db.fail.commitThenRejectRunning = 3; // every attempt commits, then rejects
+      const service = makeStatefulService(db.repo);
+
+      const result = await service.handleMessage(createMockRequest());
+
+      expect(result.success).toBe(true);
+      expect(db.row?.lifecycle).toBe('idle');
+      expect(activeRunCount()).toBe(0);
+    });
+
+    /**
+     * Round 4 (Lumen): A finalizes while B's takeover write is still in
+     * flight. A's clear must be compare-and-act — deleting by session id
+     * alone would remove B's registration.
+     */
+    it("A finalizing mid-takeover does not clear B's registration (B succeeds)", async () => {
+      const db = makeStatefulRepo();
+      db.fail.finalize = 1; // A's inline finalize fails; retry pending
+      const service = makeStatefulService(db.repo);
+
+      await service.handleMessage(createMockRequest()); // turn A
+      const aSettledAt = listActiveRuns()[0]?.runnerSettledAt;
+
+      // B registers, then parks inside its running write.
+      let releaseB!: () => void;
+      db.holdNextRunningWrite(
+        new Promise<void>((resolve) => {
+          releaseB = resolve;
+        })
+      );
+      const bPromise = service.handleMessage(createMockRequest());
+      await vi.advanceTimersByTimeAsync(0); // let B reach the gate
+
+      // B's entry has replaced A's (fresh, unsettled).
+      expect(activeRunCount()).toBe(1);
+      expect(listActiveRuns()[0]?.runnerSettledAt).toBeUndefined();
+
+      // A's retry fires while B is parked: the row still carries A's epoch,
+      // so A finalizes — and its clear must leave B's entry alone.
+      await vi.advanceTimersByTimeAsync(6_000);
+      expect(db.row?.lifecycle).toBe('idle');
+      expect(activeRunCount()).toBe(1);
+      expect(listActiveRuns()[0]?.runnerSettledAt).toBeUndefined();
+
+      releaseB();
+      const b = await bPromise;
+      expect(b.success).toBe(true);
+      expect(db.row?.lifecycle).toBe('idle');
+      expect(activeRunCount()).toBe(0);
+      void aSettledAt;
+    });
+
+    it('a failed takeover after A already finalized clears rather than resurrecting A', async () => {
+      const db = makeStatefulRepo();
+      db.fail.finalize = 1;
+      const service = makeStatefulService(db.repo);
+
+      await service.handleMessage(createMockRequest()); // turn A, retry pending
+      await vi.advanceTimersByTimeAsync(6_000); // A finalizes
+      expect(activeRunCount()).toBe(0);
+
+      // A ghost of A must not come back when B's takeover fails: A's
+      // finalization is no longer pending, so restore would resurrect a
+      // recorded turn as an unrecorded one (round 4).
+      db.fail.running = 3;
+      const b = await service.handleMessage(createMockRequest());
+      expect(b.success).toBe(false);
+      expect(activeRunCount()).toBe(0);
+    });
+
+    /**
+     * Round 5 (Lumen): an unreadable reconcile is NOT 'not committed'.
+     * Handing the session back while our committed epoch owns the row left a
+     * zombie no actor would ever recover. On unknown: proceed, and let the
+     * fence arbitrate — which also means the previous turn's recovery is NOT
+     * superseded on unconfirmed ownership.
+     */
+    it('proceeds unconfirmed when the takeover cannot be verified either way', async () => {
+      const db = makeStatefulRepo();
+      db.fail.commitThenRejectRunning = 3; // commits, but every response fails
+      db.fail.findById = 1; // ...and the reconcile read fails too
+      const service = makeStatefulService(db.repo);
+
+      const result = await service.handleMessage(createMockRequest());
+
+      // The write actually committed, so the fence lets our terminal write
+      // land and the turn completes normally.
+      expect(result.success).toBe(true);
+      expect(db.row?.lifecycle).toBe('idle');
+      expect(activeRunCount()).toBe(0);
+    });
+
+    /**
+     * Round 5 (Lumen): the lease/graph boundary effects are session-wide —
+     * they get the same ownership gate as the registry clear. A's late
+     * boundary must not run once B owns the row.
+     */
+    it('skips boundary effects when a newer turn owns the session', async () => {
+      const { logger } = await import('../../utils/logger.js');
+      const db = makeStatefulRepo();
+      db.fail.finalize = 1; // A's inline finalize fails; retry pending
+      const service = makeStatefulService(db.repo);
+
+      await service.handleMessage(createMockRequest()); // turn A
+
+      // Park A's post-finalize ownership read, so B can land in between.
+      let releaseBoundaryRead!: () => void;
+      const advance = vi.advanceTimersByTimeAsync(6_000); // A's retry finalizes
+      await Promise.resolve();
+      db.holdNextFindById(
+        new Promise<void>((resolve) => {
+          releaseBoundaryRead = resolve;
+        })
+      );
+      await advance;
+
+      // B takes over and completes while A's boundary read is parked.
+      const b = await service.handleMessage(createMockRequest());
+      expect(b.success).toBe(true);
+
+      releaseBoundaryRead();
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(vi.mocked(logger.warn).mock.calls.map((c) => c[0])).toContain(
+        'Skipping boundary effects; a newer turn owns the session'
+      );
+    });
+
+    /**
+     * Round 6 (Lumen): a fenced-out turn self-clears its own entry — a stale
+     * ActiveRun left registered was a false liveness signal to the lease
+     * sweep and a false shutdown report.
+     */
+    it('a turn fenced out at the inline finalize clears its own entry', async () => {
+      const db = makeStatefulRepo();
+      const service = makeStatefulService(db.repo);
+
+      // Someone else takes the row between the running write and the inline
+      // finalize: rotate the epoch under the turn's feet.
+      const originalRun = vi.mocked(mockClaudeRunner.run).getMockImplementation();
+      vi.mocked(mockClaudeRunner.run).mockImplementationOnce(async (...args) => {
+        db.row!.turnEpoch = 'someone-else';
+        return createMockClaudeResult();
+      });
+
+      const result = await service.handleMessage(createMockRequest());
+      expect(result.success).toBe(true); // the turn's outcome still stands
+
+      // Its entry stopped claiming liveness the moment the fence said no.
+      expect(activeRunCount()).toBe(0);
+      void originalRun;
+    });
+
+    /**
+     * Round 7 (Lumen): the runner-THROW path's fenced-out failed write must
+     * disown the entry the same way the normal-result path does — it
+     * previously skipped the restore-or-clear and left a settled stale
+     * ActiveRun claiming liveness forever.
+     */
+    it('a fenced-out failed write disowns the entry too', async () => {
+      const db = makeStatefulRepo();
+      const service = makeStatefulService(db.repo);
+
+      vi.mocked(mockClaudeRunner.run).mockImplementationOnce(async () => {
+        db.row!.turnEpoch = 'someone-else'; // ownership moves mid-turn
+        throw new Error('runner exploded');
+      });
+
+      const result = await service.handleMessage(createMockRequest());
+      expect(result.success).toBe(false);
+      // No stale settled ghost: the fenced-out turn's entry is gone.
+      expect(activeRunCount()).toBe(0);
+    });
+
+    /**
+     * Round 6 (Lumen): the unknown/uncommitted story end-to-end. B cannot
+     * confirm ownership, so its entry is BLURRED; A's recovery is not
+     * superseded and still lands (the row is A's); B's own fenced writes
+     * stand down; and by the end NOBODY's stale entry lingers.
+     */
+    it('an unconfirmed takeover that never committed leaves no stale entry behind', async () => {
+      const db = makeStatefulRepo();
+      db.fail.finalize = 1; // A's inline finalize fails; retry pending
+      const service = makeStatefulService(db.repo);
+
+      await service.handleMessage(createMockRequest()); // turn A
+
+      // Turn B: every running attempt fails WITHOUT committing, and the
+      // reconcile read fails too → unknown → proceed blurred, no supersede.
+      db.fail.running = 3;
+      db.fail.findById = 1;
+      const b = await service.handleMessage(createMockRequest());
+      expect(b.success).toBe(true);
+      // B's inline finalize fenced out (the row is A's) and, because A's
+      // recovery is still pending, RESTORED A's registration rather than
+      // leaving A's running row entry-less for shutdown (round 6).
+      expect(activeRunCount()).toBe(1);
+      expect(listActiveRuns()[0]?.runnerSettledAt).toEqual(expect.any(Number));
+
+      // A's recovery was not superseded: it fires and lands (row is A's).
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(db.row?.lifecycle).toBe('idle');
+
+      // ...and A's own finalize cleared its restored entry. Nothing lingers.
+      expect(activeRunCount()).toBe(0);
+    });
+
+    /**
+     * Round 8 (Lumen): when BOTH terminal writes hit the outage, the two
+     * recoveries must coexist — a session-global token let the unconfirmed
+     * newer loop cancel the older valid one, then fence out itself, leaving
+     * a running row with no retry anywhere. The row CAS is the arbiter.
+     */
+    it('candidate recoveries coexist and the row CAS arbitrates', async () => {
+      const db = makeStatefulRepo();
+      db.fail.finalize = 2; // A's inline AND B's inline finalize both fail
+      db.fail.commitThenRejectRunning = 3; // B's takeover commits, responses fail
+      db.fail.findById = 1; // ...and B's reconcile read fails → unknown
+      const service = makeStatefulService(db.repo);
+
+      await service.handleMessage(createMockRequest()); // turn A — retry pending
+      const b = await service.handleMessage(createMockRequest()); // turn B — unknown, retry pending
+      expect(b.success).toBe(true);
+
+      // B did NOT cancel A: both recoveries are pending.
+      expect(hasPendingFinalization('session-123')).toBe(true);
+
+      await vi.advanceTimersByTimeAsync(20_000);
+
+      // The commit actually landed (row carries B's epoch), so B's loop
+      // finalized it and A's fenced out on its own. Nothing lingers.
+      expect(db.row?.lifecycle).toBe('idle');
+      expect(activeRunCount()).toBe(0);
+      expect(hasPendingFinalization('session-123')).toBe(false);
+    });
+
+    /**
+     * Round 8 (Lumen): a QUEUED next turn renews the lease before the
+     * processing lock — invisible to every DB fence. The boundary consults
+     * the in-process queue/lock instead of a heartbeat cutoff (which had
+     * rejected the turn's OWN mid-turn renewals).
+     */
+    it('boundary effects are skipped when the next turn is queued (inline)', async () => {
+      const { logger } = await import('../../utils/logger.js');
+      const db = makeStatefulRepo();
+      const service = makeStatefulService(db.repo);
+
+      // Park A inside its runner so B can queue behind the lock.
+      let releaseRunner!: (v: ReturnType<typeof createMockClaudeResult>) => void;
+      vi.mocked(mockClaudeRunner.run).mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            releaseRunner = resolve;
+          })
+      );
+
+      const aPromise = service.handleMessage(createMockRequest());
+      await vi.advanceTimersByTimeAsync(0); // A reaches the runner
+      const bPromise = service.handleMessage(createMockRequest()); // queues
+      await vi.advanceTimersByTimeAsync(0);
+
+      releaseRunner(createMockClaudeResult());
+      const a = await aPromise;
+      expect(a.success).toBe(true);
+
+      expect(vi.mocked(logger.warn).mock.calls.map((c) => c[0])).toContain(
+        'Skipping boundary effects; a newer turn is queued or running'
+      );
+
+      const bResult = await bPromise;
+      expect(bResult.success).toBe(true);
+      expect(activeRunCount()).toBe(0);
+    });
+
+    it('background finalize skips boundary effects while the next turn holds the lock', async () => {
+      const { logger } = await import('../../utils/logger.js');
+      const db = makeStatefulRepo();
+      db.fail.finalize = 1; // A's inline finalize fails; retry pending
+      const service = makeStatefulService(db.repo);
+
+      await service.handleMessage(createMockRequest()); // turn A
+
+      // Turn B enters and parks inside its runner — it holds the lock.
+      let releaseRunner!: (v: ReturnType<typeof createMockClaudeResult>) => void;
+      vi.mocked(mockClaudeRunner.run).mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            releaseRunner = resolve;
+          })
+      );
+      const bPromise = service.handleMessage(createMockRequest());
+      await vi.advanceTimersByTimeAsync(0);
+
+      // A's retry fires from the background while B holds the lock. The row
+      // is B's? No — B is parked BEFORE its running write? It wrote running
+      // on entry (lock acquired, pre-turn done, parked in runner) — so A
+      // fences out; the point here is the lock-held path never runs A's
+      // boundary effects either way.
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      releaseRunner(createMockClaudeResult());
+      const b = await bPromise;
+      expect(b.success).toBe(true);
+      expect(activeRunCount()).toBe(0);
+      void logger;
+    });
+
+    /**
+     * Interleaving Y (Lumen round 3): A's fenced write is already in flight
+     * when B takes ownership. No token can stop a write on the wire — the
+     * epoch CAS evaluated at write time is what makes it match zero rows.
+     */
+    it("an in-flight finalize cannot clobber the new turn's state", async () => {
+      const db = makeStatefulRepo();
+      db.fail.finalize = 1; // A's inline attempt fails; retry pending
+      const service = makeStatefulService(db.repo);
+
+      await service.handleMessage(createMockRequest()); // turn A
+
+      // Park A's retry attempt mid-flight, after admission, before the
+      // epoch evaluates.
+      let releaseInFlight!: () => void;
+      db.holdNextFencedWrite(
+        new Promise<void>((resolve) => {
+          releaseInFlight = resolve;
+        })
+      );
+      await vi.advanceTimersByTimeAsync(6_000); // retry enters, parks on the gate
+
+      // Turn B runs to completion while A's write is on the wire.
+      const b = await service.handleMessage(createMockRequest());
+      expect(b.success).toBe(true);
+      expect(db.row?.lifecycle).toBe('idle');
+      expect(activeRunCount()).toBe(0);
+      const epochAfterB = db.row?.turnEpoch;
+
+      // A's write lands — against B's epoch. Zero rows; nothing changes.
+      releaseInFlight();
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      expect(db.row?.lifecycle).toBe('idle');
+      expect(db.row?.turnEpoch).toBe(epochAfterB);
+      // Call order: A-inline (failed), A-retry (parked — this one), B-inline.
+      // Results index by call START, so A's in-flight write is slot 1, and it
+      // must have resolved null: zero rows, fence held.
+      const fencedResults = (db.spies.updateIfTurnEpoch as ReturnType<typeof vi.fn>).mock.results;
+      await expect(fencedResults[1]!.value).resolves.toBeNull();
+      expect(activeRunCount()).toBe(0);
+    });
   });
 
   describe('the identity pin actually reaches the runner', () => {
@@ -1176,8 +1789,10 @@ describe('SessionService', () => {
       expect(result.success).toBe(true);
       // Token usage should still be recorded
       expect(mockRepository.updateTokenUsage).toHaveBeenCalled();
-      // But compaction should NOT be triggered — native backends manage their own context
-      expect(mockRepository.findById).not.toHaveBeenCalled();
+      // But compaction should NOT be triggered — native backends manage their
+      // own context. Asserted directly on the compaction lock: findById is no
+      // longer a usable proxy, since the post-finalize boundary ownership
+      // gate legitimately reads the session once (PR #563 round 5).
       expect(mockRepository.tryAcquireCompactionLock).not.toHaveBeenCalled();
     });
 

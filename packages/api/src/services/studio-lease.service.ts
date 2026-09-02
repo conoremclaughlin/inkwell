@@ -85,6 +85,16 @@ export interface StudioLease {
   /** Routing tier that assigned the studio (visibility: "why is someone grabbing it"). */
   reason?: string;
   /**
+   * Turn-epoch candidate of the TURN that last acquired/renewed this lease
+   * (PR #563 round 9). Routing acquires before the turn's running-write, so
+   * the session row's epoch alone cannot fence the lease: a successor turn's
+   * acquire between a predecessor's epoch check and its release would be
+   * clobbered. The boundary refuses to release a lease stamped by a
+   * DIFFERENT turn (releaseAtBoundary.expectedTurnEpoch); unstamped leases
+   * (pre-round-9, CLI-claimed turns) release as before.
+   */
+  turnEpoch?: string;
+  /**
    * Durable quarantine / destructive claim: the worktree is being recovered
    * or torn down. Non-vacant and non-adoptable. For claims, sessionId is a
    * unique random token — ownership is unforgeable and fresh claims cannot
@@ -158,6 +168,8 @@ export interface AcquireRequest {
   userId: string;
   /** Routing tier / provenance, recorded on the lease and the event. */
   reason?: string;
+  /** Turn-epoch candidate of the acquiring turn — stamped onto the lease. */
+  turnEpoch?: string;
 }
 
 export type AcquireResult =
@@ -173,11 +185,19 @@ export type AcquireResult =
 type AcquireOutcome = AcquireResult | { retry: true };
 
 export interface WorktreeFinalState {
+  /** `git rev-parse --abbrev-ref HEAD` — the literal string 'HEAD' when detached. */
   branch?: string;
   commit?: string;
   dirty?: boolean;
   /** Set when a dirty tree was stashed; the stash commit SHA survives stash drops. */
   rescueStashSha?: string;
+  /**
+   * Set when a DETACHED worktree held commits reachable from no branch —
+   * ephemeral studios check out detached, so removing the worktree would have
+   * left those commits dangling for GC. The minted `ink-rescue/*` branch
+   * anchors them.
+   */
+  rescueBranch?: string;
   error?: string;
 }
 
@@ -236,6 +256,7 @@ export function parseStudioLease(raw: Json | null | undefined): StudioLease | nu
     acquiredAt: typeof obj.acquiredAt === 'string' ? obj.acquiredAt : '',
     heartbeatAt: typeof obj.heartbeatAt === 'string' ? obj.heartbeatAt : '',
     reason: typeof obj.reason === 'string' ? obj.reason : undefined,
+    turnEpoch: typeof obj.turnEpoch === 'string' ? obj.turnEpoch : undefined,
     quarantined: obj.quarantined === true,
     claimKind:
       obj.claimKind === 'recovery' || obj.claimKind === 'teardown' ? obj.claimKind : undefined,
@@ -287,6 +308,30 @@ export async function captureWorktreeState(
         label,
         stashSha: state.rescueStashSha,
       });
+    }
+
+    // Detached worktrees (ephemeral studios) mint no branch, so commits made
+    // there are reachable from nothing once the worktree is removed — GC bait.
+    // Anchor them with an `ink-rescue/*` branch before anyone deletes the
+    // checkout. Named by label + commit so re-rescuing the same HEAD converges
+    // on the same branch instead of erroring; `-f` makes it idempotent.
+    if (opts.rescue && state.branch === 'HEAD' && state.commit) {
+      const { stdout: unreachable } = await execFileAsync(
+        'git',
+        ['rev-list', '-n', '1', 'HEAD', '--not', '--branches'],
+        { cwd: worktreePath }
+      );
+      if (unreachable.trim()) {
+        const safeLabel = (opts.rescueLabel || 'unknown').replace(/[^a-zA-Z0-9_-]+/g, '-');
+        const rescueBranch = `ink-rescue/${safeLabel}-${state.commit.slice(0, 10)}`;
+        await execFileAsync('git', ['branch', '-f', rescueBranch, 'HEAD'], { cwd: worktreePath });
+        state.rescueBranch = rescueBranch;
+        logger.warn('[StudioLease] Rescue branch minted for detached commits', {
+          worktreePath,
+          rescueBranch,
+          commit: state.commit,
+        });
+      }
     }
   } catch (err) {
     state.error = err instanceof Error ? err.message : String(err);
@@ -541,6 +586,7 @@ export class StudioLeaseService {
         acquiredAt: now,
         heartbeatAt: now,
         reason: req.reason,
+        turnEpoch: req.turnEpoch,
       };
 
       const holder = current?.lease ?? null;
@@ -773,6 +819,15 @@ export class StudioLeaseService {
     query = from.threadKeys
       ? query.eq('lease->threadKeys', JSON.stringify(from.threadKeys))
       : query.is('lease->threadKeys', null);
+    // turnEpoch (round 9) is the THIRD such mutation: a successor turn's
+    // same-session re-acquire restamps the epoch while sessionId and
+    // acquiredAt stay put — heartbeatAt inequality usually catches it, but
+    // two writes in the same millisecond collide there. Guarding the exact
+    // epoch read makes the boundary's release CAS lose to any interleaved
+    // re-acquire, whatever the clock did.
+    query = from.turnEpoch
+      ? query.eq('lease->>turnEpoch', from.turnEpoch)
+      : query.is('lease->turnEpoch', null);
     if (opts.requireAcquirableStatus) {
       query = query.in('status', StudioLeaseService.ACQUIRABLE_STATUSES);
     }
@@ -819,38 +874,17 @@ export class StudioLeaseService {
    */
   private async repointSessionsOffEphemeral(studioId: string, userId: string): Promise<void> {
     try {
-      const { data: studio } = await this.supabase
-        .from('studios')
-        .select('id, ephemeral, parent_studio_id')
-        .eq('id', studioId)
-        .eq('user_id', userId)
-        .maybeSingle();
-      if (studio?.ephemeral !== true) return;
-
-      let ancestorId: string | null = null;
-      const seen = new Set<string>([studioId]);
-      let parentId = (studio.parent_studio_id as string | null) ?? null;
-      while (parentId && !seen.has(parentId)) {
-        seen.add(parentId);
-        const { data: parent } = await this.supabase
-          .from('studios')
-          .select('id, ephemeral, parent_studio_id, status')
-          .eq('id', parentId)
-          .eq('user_id', userId)
-          .maybeSingle();
-        if (!parent) break;
-        if (parent.ephemeral !== true && parent.status !== 'cleaned') {
-          ancestorId = parent.id;
-          break;
-        }
-        parentId = (parent.parent_studio_id as string | null) ?? null;
-      }
-
-      const { error } = await this.supabase
-        .from('sessions')
-        .update({ studio_id: ancestorId })
-        .eq('user_id', userId)
-        .eq('studio_id', studioId);
+      // One RPC, serialized on the studio row lock (PR #563 round 14): the
+      // release's clear → repoint gap used to admit a reacquire+claim in
+      // between, which this unfenced repoint then pointed off its own
+      // studio. The SQL function takes the studio FOR UPDATE — the same
+      // lock claim_turn_epoch's regrant holds — and repoints ONLY while the
+      // lease is still NULL, so whichever side commits second sees the
+      // other's state.
+      const { error } = await this.supabase.rpc('repoint_sessions_off_ephemeral', {
+        p_studio_id: studioId,
+        p_user_id: userId,
+      } as never);
       if (error) throw new Error(error.message);
     } catch (err) {
       logger.warn('[StudioLease] Failed to repoint sessions off released ephemeral', {
@@ -1082,6 +1116,7 @@ export class StudioLeaseService {
           threadKeys: [...live, req.threadKey],
           heartbeatAt: now,
           reason: req.reason ?? holder.reason,
+          turnEpoch: req.turnEpoch ?? holder.turnEpoch,
         };
         if (!(await this.casLease(req.studioId, req.userId, holder, appended))) {
           // Lost the CAS — hand control back to acquire()'s validated ladder.
@@ -1154,6 +1189,7 @@ export class StudioLeaseService {
         sbId: lease.sbId ?? holder.sbId,
         heartbeatAt: now,
         reason: req.reason ?? holder.reason,
+        turnEpoch: req.turnEpoch ?? holder.turnEpoch,
       };
       const won = await this.grantLease(req, adopted, holder);
       if (won.outcome === 'granted') {
@@ -1322,6 +1358,13 @@ export class StudioLeaseService {
    * a live process. Never renews a quarantine record — quarantine heals
    * through rescue, not heartbeats. Returns true if any lease was renewed.
    */
+  /**
+   * A PURE heartbeat — renewals never change any lease's generation (round
+   * 13). The round-10 optional restamp was a rewind hazard: a DELAYED turn's
+   * renewal landing after a successor's claim stamped the lease back to the
+   * old epoch. Restamps happen only inside `claim_turn_epoch`, which stamps
+   * every lease the session holds atomically with the ownership claim.
+   */
   async renewBySession(sessionId: string, userId?: string): Promise<boolean> {
     let any = false;
     for (const row of await this.studiosHeldBy(sessionId, userId)) {
@@ -1383,11 +1426,40 @@ export class StudioLeaseService {
    */
   async releaseAtBoundary(
     sessionId: string,
-    opts: { userId?: string; sessionTerminal: boolean; reason: string }
+    opts: {
+      userId?: string;
+      sessionTerminal: boolean;
+      reason: string;
+      /**
+       * Turn epoch of the boundary asking to release (PR #563 round 9). A
+       * lease STAMPED by a different turn belongs to that turn — a successor
+       * on the same session re-acquired between this boundary's session-row
+       * epoch check and now, and releasing would strand the successor's
+       * worktree claim. Refusal is per-row; unstamped leases release as
+       * before. The exact-prior casLease inside releaseStudio closes the
+       * remaining read→CAS window: a re-acquire after this check changes the
+       * lease bytes and the release CAS loses.
+       */
+      expectedTurnEpoch?: string;
+    }
   ): Promise<boolean> {
     let any = false;
     for (const row of await this.studiosHeldBy(sessionId, opts.userId)) {
       if (!opts.sessionTerminal && !row.lease.pendingRelease) continue;
+      if (
+        opts.expectedTurnEpoch !== undefined &&
+        row.lease.turnEpoch !== undefined &&
+        row.lease.turnEpoch !== opts.expectedTurnEpoch
+      ) {
+        logger.warn('[StudioLease] Boundary release refused — lease re-acquired by a newer turn', {
+          studioId: row.id,
+          sessionId,
+          leaseTurnEpoch: row.lease.turnEpoch,
+          boundaryTurnEpoch: opts.expectedTurnEpoch,
+          reason: opts.reason,
+        });
+        continue;
+      }
       // A NON-terminal boundary completes only what the marker still
       // justifies (Lumen r2): a thread-scoped marker whose lease has since
       // multiplexed other threads reconciles to a key-removal — the session
@@ -1744,6 +1816,7 @@ export class StudioLeaseService {
               commit: finalState.commit ?? null,
               dirty: finalState.dirty ?? null,
               rescueStashSha: finalState.rescueStashSha ?? null,
+              rescueBranch: finalState.rescueBranch ?? null,
               releasedAt: new Date().toISOString(),
             },
           } as Json,

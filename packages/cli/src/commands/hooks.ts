@@ -18,7 +18,7 @@
 
 import { Command } from 'commander';
 import chalk from 'chalk';
-import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, rmSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { execSync } from 'child_process';
@@ -33,7 +33,9 @@ import {
   setCurrentRuntimeSession,
   upsertRuntimeSession,
 } from '../session/runtime.js';
+import { randomUUID } from 'crypto';
 import { sbDebugLog } from '../lib/sb-debug.js';
+import { writeCliTurnEpoch, readCliTurnEpoch, clearCliTurnEpoch } from '../lib/takeover-watcher.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -82,6 +84,13 @@ interface HookCapabilities {
   };
   supportsCompaction: boolean;
   supportsPromptHook: boolean;
+  /**
+   * The backend's prompt hook can BLOCK the prompt via a non-zero exit
+   * (claude-code's UserPromptSubmit). Backends without this proceed after a
+   * failed turn takeover and rely on the background re-claim to shrink the
+   * stale-epoch window (PR #563 rounds 6–7).
+   */
+  blocksOnFailedTakeover: boolean;
 }
 
 const CLAUDE_CODE: HookCapabilities = {
@@ -97,6 +106,7 @@ const CLAUDE_CODE: HookCapabilities = {
   },
   supportsCompaction: true,
   supportsPromptHook: true,
+  blocksOnFailedTakeover: true,
 };
 
 const CODEX: HookCapabilities = {
@@ -112,6 +122,7 @@ const CODEX: HookCapabilities = {
   },
   supportsCompaction: false,
   supportsPromptHook: true,
+  blocksOnFailedTakeover: false,
 };
 
 const GEMINI: HookCapabilities = {
@@ -131,6 +142,7 @@ const GEMINI: HookCapabilities = {
   },
   supportsCompaction: false,
   supportsPromptHook: true,
+  blocksOnFailedTakeover: false,
 };
 
 interface PcpConfig {
@@ -157,7 +169,7 @@ function detectBackend(cwd: string): HookCapabilities {
   return CLAUDE_CODE; // default
 }
 
-function getBackendByName(name: string): HookCapabilities {
+export function getBackendByName(name: string): HookCapabilities {
   switch (name.toLowerCase()) {
     case 'claude':
     case 'claude-code':
@@ -747,19 +759,54 @@ async function updateRuntimeGenerationState(
   // on-stop both send 'idle'); the server uses the event to manage the
   // hook-owned CLI turn signal and to run the lease boundary ONLY on the
   // real stop (PR #492).
-  event?: 'prompt' | 'stop' | 'pre-compact' | 'post-compact'
-): Promise<void> {
+  event?: 'prompt' | 'stop' | 'pre-compact' | 'post-compact',
+  opts?: {
+    /**
+     * Server-spawned (headless) turns must say so: the server's pre-turn
+     * write already owns the turn epoch, and an interactive-style prompt
+     * claim from the child's own hook would rotate it and fence the server's
+     * finalize out of its own turn (PR #563 round 6).
+     */
+    headless?: boolean;
+    /**
+     * Stop events (round 10): the epoch of the turn this stop is ending,
+     * read back from the record the prompt claim wrote. The server fences
+     * the lease boundary on it.
+     */
+    turnEpoch?: string;
+    /**
+     * Stop events (round 11): modern sender, but the epoch record is gone —
+     * the server fails closed (suppresses destructive boundary releases)
+     * instead of treating this stop as a legacy unfenced one.
+     */
+    turnEpochMissing?: boolean;
+    /** Round 21: attempt tokens this stop abandons — appended to the fence. */
+    fenceAttempts?: string[];
+    /** Round 21: adjudicating reclaim — the marker's birth time (tombstone CAS). */
+    reclaimOf?: string;
+    /** Round 21: adjudicating reclaim — the marker's attempt token. */
+    attemptId?: string;
+    /**
+     * Prompt events (round 11): the caller's worktree studio. The server
+     * restamps + exact-CAS-touches ITS lease and reports `studioLeaseHeld`;
+     * false means a concurrent release won — the takeover is UNACKNOWLEDGED
+     * and this function reports ok:false without retrying (the lease is
+     * gone, not flaky).
+     */
+    studioId?: string;
+  }
+): Promise<{ ok: boolean; turnEpoch?: string; leaseLost?: boolean }> {
   const sessionId = resolveActivePcpSessionId(cwd);
-  if (!sessionId) return;
+  if (!sessionId) return { ok: true }; // nothing to take over — vacuously fine
 
-  // Two attempts: hooks cannot gate the backend turn (they are out-of-band
-  // observers), so a missed prompt write leaves the turn invisible — the
-  // lease machinery therefore only ever treats the marker as PROTECTIVE
-  // (an open marker defers releases; its absence never authorizes one).
-  // The retry shrinks the invisibility window against transient blips; a
-  // true fail-closed for claude-code (UserPromptSubmit can block) is
-  // tracked separately (task 0b9bb780).
-  for (let attempt = 1; attempt <= 2; attempt++) {
+  // Three attempts: a prompt event is now a turn-epoch TAKEOVER on the
+  // server (claim + lifecycle + marker in one statement), so a swallowed
+  // failure is no longer just an invisible marker — an interactive prompt
+  // that proceeds unclaimed runs under a stale epoch that an old turn's
+  // fenced finalize can still clobber. The claude-code on-prompt hook
+  // therefore BLOCKS the prompt when this returns false (task 0b9bb780);
+  // backends whose hooks cannot block still proceed, loudly.
+  for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       const serverUrl = getPcpServerUrl();
       const headers: Record<string, string> = { 'Content-Type': 'application/json' };
@@ -772,12 +819,51 @@ async function updateRuntimeGenerationState(
           sessionId,
           lifecycle,
           ...(event ? { event } : {}),
+          ...(opts?.headless ? { headless: true } : {}),
+          ...(opts?.turnEpoch ? { turnEpoch: opts.turnEpoch } : {}),
+          ...(opts?.turnEpochMissing ? { turnEpochMissing: true } : {}),
+          ...(opts?.fenceAttempts ? { fenceAttempts: opts.fenceAttempts } : {}),
+          ...(opts?.reclaimOf ? { reclaimOf: opts.reclaimOf } : {}),
+          ...(opts?.attemptId ? { attemptId: opts.attemptId } : {}),
+          ...(opts?.studioId && opts.studioId !== 'main' ? { studioId: opts.studioId } : {}),
           agentId,
           workingDir: cwd,
         }),
         signal: AbortSignal.timeout(5000),
       });
-      if (resp.ok) return;
+      if (resp.status === 409) {
+        // A refused reclaim is authoritative — the turn is over. No retry.
+        return { ok: false };
+      }
+      if (resp.status === 403) {
+        // Round 24: a cross-tenant/foreign refusal is as PERMANENT as a
+        // lost lease — enforce, never fold into generic failure or retry.
+        sbDebugLog('hooks', 'lifecycle_forbidden', { sessionId, lifecycle, attempt });
+        return { ok: false, leaseLost: true };
+      }
+      if (resp.ok) {
+        // Round 10: a claimed prompt's response carries the fresh epoch —
+        // the identity the eventual stop needs to fence its boundary.
+        const body = (await resp.json().catch(() => null)) as {
+          turnEpoch?: string;
+          studioLeaseHeld?: boolean;
+        } | null;
+        // Round 11: a 2xx whose lease report says NOT HELD is an
+        // unacknowledged takeover — a concurrent release won the exact-CAS
+        // race. No retry: the lease is gone, not flaky; the caller's
+        // failed-takeover handling (block, or marker for the watcher) is the
+        // recovery path.
+        if (body?.studioLeaseHeld === false) {
+          sbDebugLog('hooks', 'lifecycle_lease_not_held', { sessionId, lifecycle, attempt });
+          // Round 23: a lost lease is a distinct verdict — the caller must
+          // ENFORCE it (non-zero exit), not fold it into generic failure.
+          return { ok: false, leaseLost: true };
+        }
+        return {
+          ok: true,
+          ...(typeof body?.turnEpoch === 'string' ? { turnEpoch: body.turnEpoch } : {}),
+        };
+      }
       const body = await resp.text().catch(() => '');
       sbDebugLog('hooks', 'lifecycle_update_failed', {
         sessionId,
@@ -795,9 +881,82 @@ async function updateRuntimeGenerationState(
         error: String(error),
       });
     }
-    if (attempt === 1) {
+    if (attempt < 3) {
       await new Promise((r) => setTimeout(r, 250));
     }
+  }
+  return { ok: false };
+}
+
+/**
+ * Where the pending-takeover marker lives, shared with the wrapper watcher
+ * and the on-stop adjudication. Round 20: PER WRAPPER GENERATION — one
+ * shared path was lossy across coexisting generations. The generation-less
+ * path remains for legacy wrapperless senders, whose own stop hook
+ * adjudicates it (round 26: the channel-plugin claimant was removed as
+ * unreachable — markers come only from codex/gemini, which run no plugin).
+ */
+export function pendingTakeoverMarkerPath(cwd: string, generation?: string): string {
+  return join(
+    cwd,
+    '.ink',
+    generation ? `pending-takeover.${generation}.json` : 'pending-takeover.json'
+  );
+}
+
+/**
+ * What happens when an INTERACTIVE prompt's turn takeover fails (task
+ * 0b9bb780, pulled into PR #563; capability-gated in round 7 after the name
+ * comparison bug — 'claude' vs 'claude-code' — made the blocking branch
+ * unreachable and only a behavioural test would have caught it).
+ *
+ * Blocking backends: the prompt is refused outright — running would execute
+ * this turn under a STALE epoch that an old server turn's fenced finalize
+ * can still clobber.
+ *
+ * Non-blocking backends: the prompt cannot be stopped, and this hook process
+ * is SHORT-LIVED — an in-process retry timer dies with it (round 8). So the
+ * recovery is a durable MARKER file that the session's long-lived `ink`
+ * wrapper watches and converts into a claim (takeover-watcher.ts); the
+ * on-stop hook adjudicates any marker still standing at the boundary, which
+ * scopes the recovery to this prompt generation.
+ *
+ * Injectable for tests; onPromptHandler passes the real implementations.
+ */
+export function handleFailedTakeover(
+  backend: Pick<HookCapabilities, 'name' | 'blocksOnFailedTakeover'>,
+  opts: {
+    agentId: string;
+    writePendingTakeover: () => void;
+    exit?: (code: number) => never;
+  }
+): void {
+  const exit = opts.exit ?? ((code: number) => process.exit(code));
+  if (backend.blocksOnFailedTakeover) {
+    hookLog('on_prompt_takeover_failed_blocking', { agentId: opts.agentId });
+    process.stderr.write(
+      'Inkwell turn takeover failed (server unreachable or claim refused). ' +
+        'Prompt blocked to protect session state — retry in a moment.\n'
+    );
+    exit(2);
+    return;
+  }
+
+  hookLog('on_prompt_takeover_failed_nonblocking', {
+    agentId: opts.agentId,
+    backend: backend.name,
+  });
+  process.stderr.write(
+    'Warning: Inkwell turn takeover failed; this turn starts under a stale epoch. ' +
+      'A pending-takeover marker was written for the ink wrapper to reclaim.\n'
+  );
+  try {
+    opts.writePendingTakeover();
+  } catch (err) {
+    hookLog('on_prompt_takeover_marker_failed', {
+      agentId: opts.agentId,
+      error: String(err),
+    });
   }
 }
 
@@ -2436,8 +2595,75 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
     backendSessionId: reconciled.backendSessionId || null,
   });
 
-  // Mark session as actively generating at prompt start.
-  await updateRuntimeGenerationState(cwd, config, agentId, 'running', 'prompt');
+  // Mark session as actively generating at prompt start. For INTERACTIVE
+  // prompts this is a turn-epoch TAKEOVER on the server; headless spawns
+  // declare themselves so the route does not rotate the epoch the server's
+  // own pre-turn write already owns (PR #563 round 6).
+  const isHeadlessSpawn = isHeadlessSession();
+  // Round 11: name our studio so the server exact-CAS-touches ITS lease and
+  // the response's held report covers the worktree this prompt runs in.
+  const { studioId: promptStudioId } = getIdentitySessionContext(cwd);
+  const takeover = await updateRuntimeGenerationState(cwd, config, agentId, 'running', 'prompt', {
+    headless: isHeadlessSpawn,
+    studioId: promptStudioId,
+  });
+  const takeoverOk = takeover.ok;
+  if (!takeoverOk && !isHeadlessSpawn) {
+    handleFailedTakeover(lifecycleBackend, {
+      agentId,
+      writePendingTakeover: () => {
+        const markerPath = pendingTakeoverMarkerPath(cwd, process.env.INK_RUNTIME_LINK_ID);
+        mkdirSync(dirname(markerPath), { recursive: true });
+        writeFileSync(
+          markerPath,
+          JSON.stringify({
+            sessionId: resolveActivePcpSessionId(cwd),
+            agentId,
+            at: new Date().toISOString(),
+            // Round 21: a FRESH attempt token — the fence is per attempt,
+            // so abandoning this one never refuses a later prompt.
+            attemptId: randomUUID(),
+            // Round 18: bind the marker to the wrapper that spawned this
+            // backend — a stale wrapper on the same session must neither
+            // claim nor retire a successor's marker.
+            ...(process.env.INK_RUNTIME_LINK_ID
+              ? { wrapperGeneration: process.env.INK_RUNTIME_LINK_ID }
+              : {}),
+          })
+        );
+      },
+    });
+  } else if (takeoverOk && !isHeadlessSpawn) {
+    // A successful takeover supersedes any marker from an earlier failed
+    // prompt — the recovery it described is no longer this generation's.
+    try {
+      rmSync(pendingTakeoverMarkerPath(cwd, process.env.INK_RUNTIME_LINK_ID), { force: true });
+    } catch {
+      // Best-effort cleanup.
+    }
+    // Round 10: persist the claimed epoch so the on-stop hook can identify
+    // the turn it is ending — the lease boundary fences on it.
+    const claimedSessionId = resolveActivePcpSessionId(cwd);
+    if (takeover.turnEpoch && claimedSessionId) {
+      const recorded = writeCliTurnEpoch(cwd, {
+        sessionId: claimedSessionId,
+        turnEpoch: takeover.turnEpoch,
+        ...(process.env.INK_RUNTIME_LINK_ID
+          ? { wrapperGeneration: process.env.INK_RUNTIME_LINK_ID }
+          : {}),
+      });
+      if (!recorded) {
+        // Round 11: a lost record is LOUD, not silent. Safety does not
+        // depend on this write — the modern on-stop sends `turnEpochMissing`
+        // when no record exists and the server fails closed (suppresses
+        // destructive boundary releases). Blocking here instead would strand
+        // the row running under the committed claim with no process behind
+        // it — the exact zombie class this PR removes.
+        hookLog('on_prompt_epoch_record_failed', { agentId, sessionId: claimedSessionId });
+        sbDebugLog('hooks', 'epoch_record_write_failed', { sessionId: claimedSessionId });
+      }
+    }
+  }
 
   // Mark session as CLI-attached (human present at REPL).
   // Uses the REST lifecycle endpoint, NOT MCP — cliAttached is a runtime
@@ -2447,7 +2673,6 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
   // IMPORTANT: headless/autonomous spawns set cliAttached=false in INK_CONTEXT.
   // Respect that — unconditionally setting true blocks all future strategy
   // triggers for the session (they see "CLI-attached" and skip spawn).
-  const isHeadlessSpawn = isHeadlessSession();
   if (isHeadlessSpawn && reconciled.pcpSessionId) {
     // Explicitly clear cli_attached for headless spawns. A previous interactive
     // session may have set it to true on this same PCP session; if we just skip,
@@ -2587,6 +2812,7 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
 async function onStopHandler(options?: { backend?: string }): Promise<void> {
   const stdin = await readStdin();
   const cwd = process.cwd();
+
   const lifecycleBackend = resolveLifecycleBackend(cwd, options?.backend);
 
   const config = getPcpConfig();
@@ -2610,8 +2836,131 @@ async function onStopHandler(options?: { backend?: string }): Promise<void> {
     backendSessionId: reconciled.backendSessionId || null,
   });
 
-  // Mark session as idle after each completed backend turn.
-  await updateRuntimeGenerationState(cwd, config, agentId, 'idle', 'stop');
+  // Mark session as idle after each completed backend turn. Round 10: the
+  // stop carries the epoch its prompt claimed (from the epoch record) so the
+  // server's lease boundary can fence on the turn actually ending; the
+  // record is scoped to OUR session — a foreign session's record is neither
+  // sent nor cleared. Round 11: a modern stop with NO record admits it
+  // (`turnEpochMissing`) rather than masquerading as a legacy sender — the
+  // server suppresses destructive boundary releases instead of running them
+  // unfenced (fail closed on degraded local state).
+  const stopSessionId = resolveActivePcpSessionId(cwd);
+  const stopGeneration = process.env.INK_RUNTIME_LINK_ID;
+  // Round 21: ADJUDICATE our own marker HERE, synchronously — fs.watch
+  // delivery is lossy under load and a short turn can end before any
+  // watcher tick, but this hook CAN await. A marker still standing means
+  // the prompt's takeover failed and was never reclaimed: reclaim it now
+  // (the claim's fences arbitrate) and close the turn with the fresh
+  // epoch; a refused attempt is handed to the fence instead.
+  const ownMarkerPath = pendingTakeoverMarkerPath(cwd, stopGeneration);
+  let adjudicatedEpoch: string | undefined;
+  let adjudicationLeaseLost = false;
+  const abandonedAttempts: string[] = [];
+  try {
+    const rawMarker = JSON.parse(readFileSync(ownMarkerPath, 'utf-8')) as {
+      sessionId?: string;
+      at?: string;
+      attemptId?: string;
+    };
+    if (rawMarker.sessionId && rawMarker.sessionId === stopSessionId && rawMarker.at) {
+      // Round 22: the adjudicating reclaim names our STUDIO — without it
+      // the claim skips the lease/revocation boundary entirely, and a
+      // short turn whose lease was revoked would be accepted at stop.
+      const { studioId: stopStudioId } = getIdentitySessionContext(cwd);
+      const reclaim = await updateRuntimeGenerationState(
+        cwd,
+        config,
+        agentId,
+        'running',
+        'prompt',
+        {
+          reclaimOf: rawMarker.at,
+          ...(rawMarker.attemptId ? { attemptId: rawMarker.attemptId } : {}),
+          studioId: stopStudioId,
+        }
+      );
+      if (reclaim.ok && reclaim.turnEpoch) {
+        adjudicatedEpoch = reclaim.turnEpoch;
+      } else {
+        if (rawMarker.attemptId) abandonedAttempts.push(rawMarker.attemptId);
+        if (reclaim.leaseLost) adjudicationLeaseLost = true;
+      }
+    }
+    // Round 22: the marker is NOT deleted here — evidence survives until
+    // the terminal stop below is ACKNOWLEDGED.
+  } catch {
+    // No marker (the normal case) or unreadable — nothing to adjudicate.
+  }
+  const epochRecord = readCliTurnEpoch(cwd);
+  // Round 19: the record must belong to OUR session AND OUR wrapper
+  // generation — a stale backend's on-stop must not send (and then clear) a
+  // successor generation's epoch. Generation-less pairs still match (legacy).
+  // Round 20: EXACT generation match — a legacy (generation-less) stop must
+  // not consume a modern generation's record, nor vice versa. Only a
+  // fully-legacy pair (both sides generation-less) still matches.
+  const recordIsOurs =
+    Boolean(stopSessionId) &&
+    epochRecord != null &&
+    epochRecord.sessionId === stopSessionId &&
+    (epochRecord.wrapperGeneration ?? undefined) === (stopGeneration ?? undefined);
+  const stopEpoch = adjudicatedEpoch ?? (recordIsOurs ? epochRecord?.turnEpoch : undefined);
+  const stopResult = await updateRuntimeGenerationState(cwd, config, agentId, 'idle', 'stop', {
+    ...(stopEpoch
+      ? { turnEpoch: stopEpoch }
+      : {
+          turnEpochMissing: true,
+          // Round 21: fence exactly the attempts this stop abandons.
+          fenceAttempts: abandonedAttempts,
+        }),
+  });
+  if (stopResult.ok) {
+    // The boundary is ACKNOWLEDGED: local evidence retires with it.
+    try {
+      rmSync(ownMarkerPath, { force: true });
+    } catch {
+      // Best-effort.
+    }
+    // Compare-and-delete: only the exact record we sent retires — a record
+    // replaced during the awaited request belongs to its replacer.
+    if (stopSessionId && recordIsOurs && epochRecord != null) {
+      clearCliTurnEpoch(cwd, stopSessionId, {
+        turnEpoch: epochRecord.turnEpoch,
+        wrapperGeneration: epochRecord.wrapperGeneration,
+      });
+    }
+  } else {
+    // Round 22: the stop was NOT acknowledged. A reclaim may have COMMITTED
+    // (row running under adjudicatedEpoch) — persist the epoch record so a
+    // later actor (the wrapper's scope-end finalize, the next stop) can
+    // close it, and keep the marker as evidence. Never delete what the
+    // server has not confirmed.
+    if (adjudicatedEpoch && stopSessionId) {
+      writeCliTurnEpoch(cwd, {
+        sessionId: stopSessionId,
+        turnEpoch: adjudicatedEpoch,
+        ...(stopGeneration ? { wrapperGeneration: stopGeneration } : {}),
+      });
+    }
+    hookLog('on_stop_unacknowledged', {
+      agentId,
+      sessionId: stopSessionId ?? null,
+      adjudicatedEpoch: adjudicatedEpoch ?? null,
+    });
+    sbDebugLog('hooks', 'stop_unacknowledged', {
+      sessionId: stopSessionId,
+      adjudicatedEpoch,
+    });
+  }
+  if (adjudicationLeaseLost) {
+    // Round 23: the turn ran in a worktree whose lease was REVOKED — the
+    // fence has retired the attempt, but the failure must be ENFORCED, not
+    // absorbed: a clean exit here would report a corrupted-context turn as
+    // success.
+    console.error(
+      'ink: this turn ran without its worktree lease (revoked or lost); reporting failure.'
+    );
+    process.exitCode = 1;
+  }
 
   // Increment tool call counter
   const countStr = readRuntimeFile(cwd, 'tool-count');

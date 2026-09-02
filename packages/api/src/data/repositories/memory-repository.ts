@@ -1564,6 +1564,7 @@ export class MemoryRepository {
       cliAttached?: boolean;
       cliPollAt?: string;
       cliTurnAt?: string | null;
+      cliTurnStoppedAt?: string | null;
       alias?: string | null;
       activeThreadKey?: string | null;
       endedAt?: Date | null;
@@ -1600,6 +1601,9 @@ export class MemoryRepository {
     }
     if (updates.cliTurnAt !== undefined) {
       (dbUpdates as Record<string, unknown>).cli_turn_at = updates.cliTurnAt;
+    }
+    if (updates.cliTurnStoppedAt !== undefined) {
+      (dbUpdates as Record<string, unknown>).cli_turn_stopped_at = updates.cliTurnStoppedAt;
     }
     if (updates.alias !== undefined) {
       (dbUpdates as Record<string, unknown>).alias = updates.alias;

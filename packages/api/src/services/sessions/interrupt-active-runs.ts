@@ -28,10 +28,24 @@ import type { ActiveRun } from './active-runs.js';
 export const INTERRUPT_REASON = 'server-shutdown';
 
 /**
+ * Reason recorded when the turn had FINISHED before shutdown and only its
+ * terminal write was lost (pr:558: a finalization write lost to a transient
+ * DB error left the row `running` for 14 hours). The turn itself was not
+ * interrupted, so it gets its own reason string; the breadcrumb keys stay the
+ * same so the strip_interruption_on_running trigger clears both alike.
+ */
+export const BOOKKEEPING_REASON = 'server-shutdown-after-turn';
+
+/**
  * What we were able to establish about the session, which decides what the
  * notice is allowed to promise.
  *
- * - `interrupted` — the row was running and we moved it to idle/resumable.
+ * - `interrupted` — the row was running, the child process was still alive,
+ *   and we moved the row to lifecycle `interrupted` (resumable).
+ * - `finished-unrecorded` — the runner had already settled (child exited);
+ *   only the terminal write was missing, so the row moves to plain `idle`.
+ *   The turn's reply, if any, is already wherever it was sent — the notice
+ *   must not advise resuming work that already happened (pr:558).
  * - `finalized-elsewhere` — it left `running` under its own power before we
  *   got there. That covers a child's own `completed`/`failed`, and equally a
  *   normal finalizer writing `idle`. Named for what we observed rather than
@@ -42,7 +56,22 @@ export const INTERRUPT_REASON = 'server-shutdown';
  *   Deliberately NOT folded into the above: asserting a session finished when
  *   we could not tell is its own false statement.
  */
-export type InterruptState = 'interrupted' | 'finalized-elsewhere' | 'unknown';
+export type InterruptState =
+  | 'interrupted'
+  | 'finished-unrecorded'
+  | 'finalized-elsewhere'
+  | 'unknown';
+
+/** Human-scale duration for the notice: "42m", "14h 33m". */
+export function formatTurnAge(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return 'an unknown time';
+  if (ms < 60_000) return 'under a minute';
+  const minutes = Math.round(ms / 60_000);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  const rem = minutes % 60;
+  return rem > 0 ? `${hours}h ${rem}m` : `${hours}h`;
+}
 
 export interface InterruptOutcome {
   sessionId: string;
@@ -78,7 +107,12 @@ export interface InterruptOutcome {
  * error, so an unchecked write on a missing session would be reported as
  * successful bookkeeping that never happened.
  */
-async function writeBreadcrumb(client: any, sessionId: string): Promise<boolean> {
+async function writeBreadcrumb(
+  client: any,
+  sessionId: string,
+  reason: string,
+  turnEpochs?: string[]
+): Promise<boolean> {
   const { data: fresh, error: readError } = await client
     .from('sessions')
     .select('metadata')
@@ -93,17 +127,23 @@ async function writeBreadcrumb(client: any, sessionId: string): Promise<boolean>
     return false;
   }
 
-  const { data, error } = await client
+  // Fenced like every other per-turn write (round 5): this rebuilds the
+  // whole metadata blob, and landing it on a row a newer owner holds would
+  // erase THEIR metadata. Zero rows → not marked, honestly.
+  let breadcrumbWrite = client
     .from('sessions')
     .update({
       metadata: {
         ...((fresh.metadata as Record<string, unknown>) || {}),
         interruptedAt: new Date().toISOString(),
-        interruptedReason: INTERRUPT_REASON,
+        interruptedReason: reason,
       },
     })
-    .eq('id', sessionId)
-    .select('id');
+    .eq('id', sessionId);
+  if (turnEpochs !== undefined) {
+    breadcrumbWrite = breadcrumbWrite.in('turn_epoch', turnEpochs);
+  }
+  const { data, error } = await breadcrumbWrite.select('id');
 
   if (error) {
     logger.error('[Shutdown] Failed to record interruption breadcrumb', {
@@ -136,11 +176,24 @@ export function isAlreadyTerminal(row: {
   return row.lifecycle === 'completed' || row.lifecycle === 'failed' || Boolean(row.ended_at);
 }
 
-function noticeContent(run: ActiveRun, outcome: InterruptOutcome): string {
+function noticeContent(
+  run: ActiveRun,
+  outcome: InterruptOutcome,
+  now: number = Date.now()
+): string {
   const thread = run.threadKey ? ` on \`${run.threadKey}\`` : '';
-  const head =
-    `⚠️ ${run.agentId}'s turn${thread} was cut short — the Inkwell server shut ` +
-    `down while the ${run.backend} process was still running.`;
+  const age = formatTurnAge(now - run.startedAt);
+
+  // A settled runner means the child EXITED before shutdown — the head must
+  // not claim a process was running, whatever else we failed to establish
+  // (pr:558: a 14-hour-old finished turn was reported as "still running").
+  const head = run.runnerSettledAt
+    ? `⚠️ ${run.agentId}'s turn${thread} had already finished when the Inkwell ` +
+      `server shut down — the ${run.backend} process had exited, but its ` +
+      `completion was never recorded.`
+    : `⚠️ ${run.agentId}'s turn${thread} was cut short — the Inkwell server shut ` +
+      `down while the ${run.backend} process was still running (turn started ` +
+      `${age} ago).`;
 
   // Each branch promises only what the state it left behind can deliver.
   if (outcome.state === 'unknown') {
@@ -159,9 +212,25 @@ function noticeContent(run: ActiveRun, outcome: InterruptOutcome): string {
     );
   }
 
+  if (outcome.state === 'finished-unrecorded') {
+    if (run.settledOutcome === 'failed') {
+      return (
+        `${head}\n\nThe turn had FAILED before the shutdown, and its failure ` +
+        `was never recorded. The session is now marked failed — a re-trigger ` +
+        `on this thread starts fresh rather than resuming it.`
+      );
+    }
+    return (
+      `${head}\n\nAny reply it produced should already be on this thread — ` +
+      `check above before re-triggering; there may be nothing left to do. The ` +
+      `session is idle and usable as-is.`
+    );
+  }
+
   return (
-    `${head}\n\nNo reply was produced. The session is resumable and keeps its ` +
-    `context — re-trigger the thread to pick it up from where it stopped.`
+    `${head}\n\nNo reply was produced. The session is marked interrupted and ` +
+    `keeps its context — re-trigger the thread to pick it up from where it ` +
+    `stopped.`
   );
 }
 
@@ -175,8 +244,18 @@ function noticeContent(run: ActiveRun, outcome: InterruptOutcome): string {
  */
 async function transitionSession(
   client: any,
-  sessionId: string
+  sessionId: string,
+  settled: boolean,
+  settledOutcome?: 'succeeded' | 'failed',
+  turnEpochs?: string[]
 ): Promise<{ state: InterruptState; marked: boolean }> {
+  // A settled runner's turn was not interrupted — only its paperwork was
+  // lost — so the row gets the terminal state the turn MEANT to write:
+  // `idle` for a success, `failed` for a failure (Lumen, PR #563 P1 —
+  // stamping every settled run as a quiet success erased failures). An
+  // unsettled runner's turn dies with the process: `interrupted`, resumable.
+  const reason = settled ? BOOKKEEPING_REASON : INTERRUPT_REASON;
+  const settledLifecycle = settledOutcome === 'failed' ? 'failed' : 'idle';
   let metadata: Record<string, unknown>;
 
   try {
@@ -205,7 +284,7 @@ async function transitionSession(
     metadata = {
       ...((existing?.metadata as Record<string, unknown>) || {}),
       interruptedAt: new Date().toISOString(),
-      interruptedReason: INTERRUPT_REASON,
+      interruptedReason: reason,
     };
 
     if (!existing) {
@@ -216,7 +295,7 @@ async function transitionSession(
     if (isAlreadyTerminal(existing)) {
       return {
         state: 'finalized-elsewhere',
-        marked: await writeBreadcrumb(client, sessionId),
+        marked: await writeBreadcrumb(client, sessionId, reason, turnEpochs),
       };
     }
 
@@ -224,14 +303,27 @@ async function transitionSession(
     // update by Postgres, which is what closes the read-then-write race: if
     // the child stamped completion between the read above and this statement,
     // it matches zero rows instead of overwriting a terminal state with a
-    // resumable one.
-    const { data: changed, error } = await client
+    // resumable one. The turn-epoch predicate (round 4) additionally fences
+    // out a stale PROCESS: an old server's registry entry must never
+    // terminalize a row a newer owner — possibly in another process — has
+    // since taken over.
+    let write = client
       .from('sessions')
-      .update({ lifecycle: 'idle', status: 'resumable', metadata })
+      .update(
+        settled
+          ? { lifecycle: settledLifecycle, metadata }
+          : { lifecycle: 'interrupted', status: 'resumable', metadata }
+      )
       .eq('id', sessionId)
       .eq('lifecycle', 'running')
-      .is('ended_at', null)
-      .select('id');
+      .is('ended_at', null);
+    if (turnEpochs !== undefined) {
+      // The SET, not a single value (round 7): an unconfirmed takeover's row
+      // carries one of two known epochs; a cross-process claimant outside the
+      // set must never be terminalized by this process's shutdown.
+      write = write.in('turn_epoch', turnEpochs);
+    }
+    const { data: changed, error } = await write.select('id');
 
     if (error) {
       logger.error('[Shutdown] Failed to terminalize interrupted session', {
@@ -248,7 +340,7 @@ async function transitionSession(
       // #490 round 3).
       const { data: after, error: recheckError } = await client
         .from('sessions')
-        .select('lifecycle, ended_at')
+        .select('lifecycle, ended_at, turn_epoch')
         .eq('id', sessionId)
         .maybeSingle();
 
@@ -261,6 +353,15 @@ async function transitionSession(
       }
 
       if (after.lifecycle === 'running' && !after.ended_at) {
+        const rowEpoch = (after as { turn_epoch?: string | null }).turn_epoch;
+        if (turnEpochs !== undefined && !turnEpochs.includes(rowEpoch as string)) {
+          // A newer owner — possibly another process — holds the row. Their
+          // state is not ours to touch or to report on (round 4).
+          logger.info('[Shutdown] Session superseded by a newer owner; leaving as-is', {
+            sessionId,
+          });
+          return { state: 'finalized-elsewhere', marked: false };
+        }
         // The predicates should have matched. Something is contradicting us,
         // and guessing which way would be inventing a fact.
         logger.error('[Shutdown] Session still reads running after a zero-row interrupt', {
@@ -275,11 +376,11 @@ async function transitionSession(
       });
       return {
         state: 'finalized-elsewhere',
-        marked: await writeBreadcrumb(client, sessionId),
+        marked: await writeBreadcrumb(client, sessionId, reason, turnEpochs),
       };
     }
 
-    return { state: 'interrupted', marked: true };
+    return { state: settled ? 'finished-unrecorded' : 'interrupted', marked: true };
   } catch (err) {
     logger.error('[Shutdown] Error terminalizing interrupted session', {
       sessionId,
@@ -295,11 +396,22 @@ async function transitionSession(
  *   finish well inside that or the work it is trying to record is lost to the
  *   very thing it exists to report.
  */
+export interface InterruptActivityEntry {
+  userId: string;
+  agentId: string;
+  type: string;
+  subtype: string;
+  content: string;
+  sessionId: string;
+  payload: Record<string, unknown>;
+}
+
 export async function interruptActiveRuns(
   client: any,
   runs: ActiveRun[],
   timeoutMs = 3_000,
-  drained = true
+  drained = true,
+  opts: { logActivity?: (entry: InterruptActivityEntry) => Promise<unknown> } = {}
 ): Promise<InterruptOutcome[]> {
   if (runs.length === 0) return [];
 
@@ -317,7 +429,16 @@ export async function interruptActiveRuns(
       alreadyTerminal: false,
     };
 
-    const { state, marked } = await transitionSession(client, run.sessionId);
+    const settled = Boolean(run.runnerSettledAt);
+    const fenceEpochs =
+      run.turnEpochCandidates ?? (run.turnEpoch !== undefined ? [run.turnEpoch] : undefined);
+    const { state, marked } = await transitionSession(
+      client,
+      run.sessionId,
+      settled,
+      run.settledOutcome,
+      fenceEpochs
+    );
     outcome.marked = marked;
 
     // A drain that timed out means a lifecycle write may still be in flight
@@ -326,8 +447,42 @@ export async function interruptActiveRuns(
     // moment later, so the honest report is 'unknown' (Lumen, PR #490 round
     // 3). A session that had already left `running` is unaffected: we did not
     // write its lifecycle either way.
-    outcome.state = !drained && state === 'interrupted' ? 'unknown' : state;
+    outcome.state =
+      !drained && (state === 'interrupted' || state === 'finished-unrecorded') ? 'unknown' : state;
     outcome.alreadyTerminal = outcome.state === 'finalized-elsewhere';
+
+    // The durable per-turn history lives in the activity stream (agent_spawn
+    // at start, agent_complete/error at end); an interruption is the one turn
+    // ending nothing logs, so record it here. Keyed on the runner NOT having
+    // settled — a settled run's completion was already logged when the runner
+    // returned — and independent of the row-write outcome above: the child
+    // dying with the server is a fact regardless of what we managed to write.
+    if (!settled && opts.logActivity) {
+      try {
+        await opts.logActivity({
+          userId: run.userId,
+          agentId: run.agentId,
+          type: 'error',
+          subtype: 'turn_interrupted',
+          content: `Backend turn interrupted by server shutdown (${run.backend}${
+            run.threadKey ? `, ${run.threadKey}` : ''
+          })`,
+          sessionId: run.sessionId,
+          payload: {
+            backend: run.backend,
+            threadKey: run.threadKey ?? null,
+            turnStartedAt: new Date(run.startedAt).toISOString(),
+            reason: INTERRUPT_REASON,
+            state: outcome.state,
+          },
+        });
+      } catch (err) {
+        logger.warn('[Shutdown] Failed to log turn_interrupted activity', {
+          sessionId: run.sessionId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
 
     // No thread means no addressable audience — a bare trigger has no sender
     // to post back to. The logs in transitionSession are the record there.
@@ -345,11 +500,14 @@ export async function interruptActiveRuns(
         content: noticeContent(run, outcome),
         metadata: {
           kind: 'session_interrupted',
-          reason: INTERRUPT_REASON,
+          reason: settled ? BOOKKEEPING_REASON : INTERRUPT_REASON,
           sessionId: run.sessionId,
           backend: run.backend,
           state: outcome.state,
           alreadyTerminal: outcome.alreadyTerminal,
+          turnStartedAt: new Date(run.startedAt).toISOString(),
+          runnerSettledAt: run.runnerSettledAt ? new Date(run.runnerSettledAt).toISOString() : null,
+          settledOutcome: run.settledOutcome ?? null,
         },
       });
       outcome.noticed = result.ok;
