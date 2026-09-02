@@ -15,6 +15,7 @@ import {
   isWithinQuietHours,
   localTimeOfDay,
   quietHoursDeferralWarning,
+  timeOfDayToMinutes,
 } from './quiet-hours';
 
 /** Myra's operating window, and the one that held the reminder. */
@@ -122,5 +123,70 @@ describe('quietHoursDeferralWarning', () => {
 
   it('is silent when no quiet hours are configured', () => {
     expect(quietHoursDeferralWarning(new Date('2026-09-02T14:30:00Z'), {})).toBeNull();
+  });
+});
+
+/**
+ * The shape the DATABASE actually returns (Lumen, PR #568 P1).
+ *
+ * `heartbeat_state.quiet_start/quiet_end` are Postgres `time`, serialized as
+ * `HH:MM:SS`. The wall clock is `HH:MM`. Compared as strings,
+ * `'08:00' < '08:00:00'` is TRUE — a shorter string is a prefix and therefore
+ * lesser — so the window stayed shut one extra minute and the warning reported
+ * an 08:01 boundary for an 08:00 window.
+ *
+ * Which is the same defect this PR repairs: two representations of a time,
+ * compared as if they were one. Fixed by comparing numbers instead, so the
+ * category cannot recur.
+ */
+describe('the real database time shape', () => {
+  const dbShape = { start: '22:00:00', end: '08:00:00', timezone: 'America/Los_Angeles' };
+
+  it('parses both shapes to the same minute', () => {
+    expect(timeOfDayToMinutes('08:00')).toBe(480);
+    expect(timeOfDayToMinutes('08:00:00')).toBe(480);
+    expect(timeOfDayToMinutes('08:00:59')).toBe(480);
+    expect(timeOfDayToMinutes('22:30:00')).toBe(1350);
+  });
+
+  it.each([
+    ['', 'empty'],
+    ['8am', 'prose'],
+    ['25:00', 'hour out of range'],
+    ['08:99', 'minute out of range'],
+    [null, 'null'],
+  ])('rejects %s (%s)', (value) => {
+    expect(timeOfDayToMinutes(value as string | null)).toBeNull();
+  });
+
+  it('releases exactly AT the boundary, not a minute after', () => {
+    // 15:00Z = 08:00 PDT. The string comparison held this shut until 08:01.
+    expect(isWithinQuietHours(new Date('2026-09-02T15:00:00Z'), dbShape)).toBe(false);
+    expect(isWithinQuietHours(new Date('2026-09-02T14:59:00Z'), dbShape)).toBe(true);
+  });
+
+  it('reports the boundary the operator configured, to the minute', () => {
+    const warning = quietHoursDeferralWarning(new Date('2026-09-02T14:30:00Z'), dbShape);
+    // Was 15:01Z on the reviewed head, against the real row shape.
+    expect(warning!.deferredTo).toBe('2026-09-02T15:00:00.000Z');
+  });
+
+  it('behaves identically whichever shape the column returns', () => {
+    const withSeconds = { start: '22:00:00', end: '08:00:00', timezone: 'UTC' };
+    const without = { start: '22:00', end: '08:00', timezone: 'UTC' };
+    for (const iso of ['2026-09-02T07:59:00Z', '2026-09-02T08:00:00Z', '2026-09-02T22:00:00Z']) {
+      const t = new Date(iso);
+      expect(isWithinQuietHours(t, withSeconds), iso).toBe(isWithinQuietHours(t, without));
+    }
+  });
+
+  it('still reads equal bounds as no quiet hours in the DB shape', () => {
+    expect(
+      isWithinQuietHours(new Date('2026-09-02T14:30:00Z'), {
+        start: '08:00:00',
+        end: '08:00:00',
+        timezone: 'UTC',
+      })
+    ).toBe(false);
   });
 });

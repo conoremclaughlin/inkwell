@@ -44,22 +44,75 @@ export interface QuietHoursWindow {
  * heartbeat, because a scheduler that dies on a bad config string is a worse
  * failure than one that mis-times a quiet window.
  */
-export function localTimeOfDay(instant: Date, timezone?: string | null): string {
+/**
+ * Intl formatters are expensive to construct and safe to reuse. The minute-walk
+ * below can ask for hundreds of conversions in one request, and building a
+ * formatter each time cost ~44ms warm / ~115ms cold on a synchronous request
+ * path (Lumen, PR #568).
+ */
+const formatterCache = new Map<string, Intl.DateTimeFormat>();
+
+function formatterFor(timezone: string): Intl.DateTimeFormat {
+  const cached = formatterCache.get(timezone);
+  if (cached) return cached;
+  let formatter: Intl.DateTimeFormat;
   try {
-    return new Intl.DateTimeFormat('en-GB', {
-      timeZone: timezone || 'UTC',
+    formatter = new Intl.DateTimeFormat('en-GB', {
+      timeZone: timezone,
       hour: '2-digit',
       minute: '2-digit',
       hour12: false,
-    }).format(instant);
+    });
   } catch {
-    return new Intl.DateTimeFormat('en-GB', {
-      timeZone: 'UTC',
-      hour: '2-digit',
-      minute: '2-digit',
-      hour12: false,
-    }).format(instant);
+    // An unusable zone falls back to UTC rather than crashing the heartbeat: a
+    // scheduler that dies on a bad config string is worse than one that
+    // mis-times a window.
+    formatter = formatterFor('UTC');
   }
+  formatterCache.set(timezone, formatter);
+  return formatter;
+}
+
+/**
+ * Local wall-clock "HH:MM" for an instant, in a specific zone.
+ *
+ * The bug this replaces read `now.getHours()` — the SERVER's clock — while
+ * selecting the user's `timezone` column and never using it, under a comment
+ * admitting "timezone handling can be enhanced". Harmless only for as long as
+ * the server runs on the user's own machine, which is a deployment accident
+ * rather than a property of the code.
+ */
+export function localTimeOfDay(instant: Date, timezone?: string | null): string {
+  return formatterFor(timezone || 'UTC').format(instant);
+}
+
+/**
+ * "HH:MM" or "HH:MM:SS" → minutes since midnight, or null if unparseable.
+ *
+ * Comparison is numeric because these two values arrive in DIFFERENT SHAPES and
+ * always have. `heartbeat_state.quiet_start/quiet_end` are Postgres `time`,
+ * which serializes as `HH:MM:SS`; the wall clock computed above is `HH:MM`.
+ * Compared as strings, `'08:00' < '08:00:00'` is TRUE — a shorter string is a
+ * prefix and therefore lesser — so the window stayed shut for one extra minute
+ * and the warning reported an 08:01 boundary for an 08:00 window (Lumen,
+ * PR #568, reproduced against the real row shape).
+ *
+ * Worth stating plainly: the defect this whole PR repairs came from comparing
+ * two representations of a time. I then repaired it by comparing two
+ * representations of a time. Numbers remove the category.
+ */
+export function timeOfDayToMinutes(value: string | null | undefined): number | null {
+  const trimmed = (value || '').trim();
+  if (!trimmed) return null;
+  const match = /^(\d{1,2}):(\d{2})(?::(\d{2}))?$/.exec(trimmed);
+  if (!match) return null;
+  const hours = Number.parseInt(match[1]!, 10);
+  const minutes = Number.parseInt(match[2]!, 10);
+  if (hours > 23 || minutes > 59) return null;
+  // Seconds are deliberately discarded rather than rounded: the scheduler ticks
+  // in minutes, so a boundary of 08:00:30 and one of 08:00:00 are the same
+  // boundary in practice, and rounding would move it.
+  return hours * 60 + minutes;
 }
 
 /**
@@ -69,14 +122,18 @@ export function localTimeOfDay(instant: Date, timezone?: string | null): string 
  * normal case and the one every real config here uses.
  */
 export function isWithinQuietHours(instant: Date, window: QuietHoursWindow): boolean {
-  const start = (window.start || '').trim();
-  const end = (window.end || '').trim();
-  if (!start || !end) return false;
-
-  const now = localTimeOfDay(instant, window.timezone);
+  const start = timeOfDayToMinutes(window.start);
+  const end = timeOfDayToMinutes(window.end);
+  if (start === null || end === null) return false;
   // Equal bounds would otherwise mean "always quiet" via the wrap branch, which
-  // silently mutes every reminder forever. Read it as "no quiet hours".
+  // silently mutes every reminder forever.
   if (start === end) return false;
+
+  const now = timeOfDayToMinutes(localTimeOfDay(instant, window.timezone));
+  if (now === null) return false;
+
+  // Overnight windows (start > end, e.g. 22:00-08:00) wrap midnight, which is
+  // the normal case and the one every real config here uses.
   if (start > end) return now >= start || now < end;
   return now >= start && now < end;
 }
@@ -85,29 +142,43 @@ export function isWithinQuietHours(instant: Date, window: QuietHoursWindow): boo
  * When a reminder due at `instant` would ACTUALLY be delivered.
  *
  * Returns the instant itself when it falls outside quiet hours. Otherwise the
- * next occurrence of the window's end — the moment the scheduler stops skipping
- * it. Callers use this to tell a human what they are really scheduling.
+ * moment the scheduler stops skipping it.
+ *
+ * Walked rather than computed, because a wall-clock boundary is not a fixed
+ * offset: a DST transition inside the window moves it by an hour, and the
+ * arithmetic that gets that right is the arithmetic that gets it subtly wrong.
+ * Coarse-then-fine so the walk is cheap — 30-minute strides to cross the bulk
+ * of the window, then one-minute steps to land exactly on the edge. Worst case
+ * is roughly 80 conversions against a cached formatter rather than 1,500
+ * against fresh ones (Lumen, PR #568).
  *
  * Minute-accurate rather than tick-accurate: delivery lands on the first
- * scheduler tick at or after the boundary, so the real arrival is this value
- * plus up to one tick interval.
+ * scheduler tick at or after this, so real arrival is this value plus up to one
+ * tick interval.
  */
 export function effectiveDeliveryTime(instant: Date, window: QuietHoursWindow): Date {
   if (!isWithinQuietHours(instant, window)) return instant;
 
-  const end = (window.end || '').trim();
-  const [endHour, endMinute] = end.split(':').map((part) => Number.parseInt(part, 10));
-  if (!Number.isFinite(endHour) || !Number.isFinite(endMinute)) return instant;
-
-  // Walk forward a minute at a time from the due instant to the first minute
-  // outside the window. Bounded by 25 hours: a window can span at most a day,
-  // and the bound means a malformed config can never spin.
+  const COARSE_MS = 30 * 60_000;
   const cursor = new Date(instant.getTime());
-  for (let i = 0; i < 25 * 60; i += 1) {
-    cursor.setTime(cursor.getTime() + 60_000);
-    if (!isWithinQuietHours(cursor, window)) return cursor;
+  let lastInside = new Date(instant.getTime());
+
+  // Bounded by 25 hours: a window spans at most a day, and the bound means a
+  // malformed config can never spin.
+  for (let i = 0; i < (25 * 60) / 30; i += 1) {
+    cursor.setTime(cursor.getTime() + COARSE_MS);
+    if (!isWithinQuietHours(cursor, window)) break;
+    lastInside.setTime(cursor.getTime());
   }
-  return instant;
+  if (isWithinQuietHours(cursor, window)) return instant;
+
+  // Refine: step forward a minute at a time from the last known-inside point.
+  const fine = new Date(lastInside.getTime());
+  for (let i = 0; i <= 30; i += 1) {
+    fine.setTime(fine.getTime() + 60_000);
+    if (!isWithinQuietHours(fine, window)) return fine;
+  }
+  return cursor;
 }
 
 /**

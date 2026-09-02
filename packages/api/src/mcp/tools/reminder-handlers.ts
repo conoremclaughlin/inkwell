@@ -271,22 +271,37 @@ export async function handleCreateReminder(
     // honoured — so we say nothing and still create the reminder. The reverse
     // (refusing to schedule because we couldn't check) would turn a helpful
     // note into an outage.
+    //
+    // ONE-SHOTS ONLY, and enforced rather than merely described. I claimed this
+    // scope in review and did not guard it: the block ran for cron and for the
+    // default 1-minute path too. That is wrong twice over — a recurring
+    // reminder's SECOND firing is not the one computed here, so the warning
+    // would describe a time that is not the schedule; and calculateNextRun is a
+    // local pattern-switch that silently returns "tomorrow, same time" for any
+    // expression it does not recognise, so the advisory could be derived from a
+    // next-run this server never actually intends (Lumen, PR #568).
+    //
+    // Cron reminders that fire into the window are still held silently. That is
+    // a known gap, not an oversight — recurring semantics need their own answer
+    // about which occurrence to warn on.
     let quietHoursWarning: ReturnType<typeof quietHoursDeferralWarning> = null;
-    try {
-      const { data: quietState } = await supabase
-        .from('heartbeat_state')
-        .select('quiet_start, quiet_end, timezone')
-        .eq('user_id', resolved.user.id)
-        .maybeSingle();
-      if (quietState) {
-        quietHoursWarning = quietHoursDeferralWarning(nextRunAt, {
-          start: quietState.quiet_start,
-          end: quietState.quiet_end,
-          timezone: quietState.timezone,
-        });
+    if (args.runAt) {
+      try {
+        const { data: quietState } = await supabase
+          .from('heartbeat_state')
+          .select('quiet_start, quiet_end, timezone')
+          .eq('user_id', resolved.user.id)
+          .maybeSingle();
+        if (quietState) {
+          quietHoursWarning = quietHoursDeferralWarning(nextRunAt, {
+            start: quietState.quiet_start,
+            end: quietState.quiet_end,
+            timezone: quietState.timezone,
+          });
+        }
+      } catch {
+        // Advisory only — see above. Nothing to report and nothing to fail.
       }
-    } catch {
-      // Advisory only — see above. Nothing to report and nothing to fail.
     }
 
     const { data, error } = await supabase
