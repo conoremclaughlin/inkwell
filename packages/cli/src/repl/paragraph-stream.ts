@@ -69,9 +69,10 @@ export interface StreamedLine {
  *   next line, so an unlabeled paragraph can never sit under someone else's
  *   message.
  * - **Dedupe**: `completeMessage()` records the full message text (the parser
- *   emits ONE text event per assistant message, equal to what final-response
- *   extraction uses), so `shouldSkipFinal()` is an exact comparison — a
- *   multi-text-block message never reprints.
+ *   emits one text event per assistant stream event; a later text block of the
+ *   SAME message arrives flagged `continuesMessage` and is appended), so
+ *   `shouldSkipFinal()` is an exact comparison against what final-response
+ *   extraction uses — a multi-text-block message never reprints.
  * - **Display transform**: every emitted line passes through the transform
  *   (e.g. stripLocalToolBlocks in local routing) — held tool fences are
  *   stripped, and a line that strips to nothing is not emitted.
@@ -111,7 +112,7 @@ export class StreamedTurnRenderer {
    * support), emits the whole message so streaming still lands at message
    * granularity.
    */
-  completeMessage(fullText: string): StreamedLine[] {
+  completeMessage(fullText: string, opts?: { continuesMessage?: boolean }): StreamedLine[] {
     const tail = this.buffer.flush();
     const lines =
       tail !== null
@@ -119,7 +120,7 @@ export class StreamedTurnRenderer {
         : this.sawDeltaThisMessage
           ? []
           : this.emitAll([fullText.trim()]);
-    this.lastMessageText = fullText;
+    this.lastMessageText = opts?.continuesMessage ? this.lastMessageText + fullText : fullText;
     this.sawDeltaThisMessage = false;
     return lines;
   }

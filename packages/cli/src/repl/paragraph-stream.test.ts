@@ -92,6 +92,19 @@ describe('StreamedTurnRenderer', () => {
     expect(r.shouldSkipFinal('OneTwo')).toBe(true);
   });
 
+  it('a continued message (text → thinking → text) dedupes against the whole message (#569)', () => {
+    // The parser emits the second text block of the same assistant message
+    // flagged `continuesMessage`; final-response extraction concatenates the
+    // blocks, so the dedupe comparison must too.
+    const r = new StreamedTurnRenderer();
+    r.pushDelta('One');
+    r.completeMessage('One');
+    r.pushDelta('Two');
+    r.completeMessage('Two', { continuesMessage: true });
+    expect(r.shouldSkipFinal('OneTwo')).toBe(true);
+    expect(r.shouldSkipFinal('Two')).toBe(false);
+  });
+
   it('renders the whole message when no deltas arrived (block-level fallback)', () => {
     const r = new StreamedTurnRenderer();
     const lines = r.completeMessage('Full message.\n\nTwo paragraphs.');
