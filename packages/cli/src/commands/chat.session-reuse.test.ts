@@ -24,8 +24,15 @@ import {
   decideContinuationSession,
   MID_TURN_RESEED_OWN_OUTPUT_MAX_CHARS,
   MID_TURN_RESEED_MAX_CHARS,
+  spawnDialogueText,
 } from './chat.js';
 import { MAX_RELAY_BYTES } from '../repl/agent-loop.js';
+import { ImitationPreviewGuard } from '../repl/preview-guard.js';
+import {
+  findImitatedToolResults,
+  isPotentialImitationPrefix,
+  MAX_RELAY_CHARS,
+} from '../repl/agent-loop.js';
 import { ContextLedger } from '../repl/context-ledger.js';
 
 /**
@@ -972,12 +979,45 @@ describe('buildMidTurnReseedBody — the rebuilt session remembers this turn (#5
     expect(buildMidTurnReseedBody([assistant('   '), runtime('')])).toBe('');
   });
 
-  it('keeps the TAIL of a very long dialogue and says what was elided', () => {
-    const long = 'a'.repeat(MID_TURN_RESEED_MAX_CHARS + 500) + 'TAIL';
-    const out = buildMidTurnReseedBody([assistant(long)]);
-    expect(out).toContain('[earlier turn dialogue elided]');
-    expect(out).toContain('TAIL');
-    expect(out.length).toBeLessThan(MID_TURN_RESEED_MAX_CHARS + 1500);
+  it('REGRESSION (Lumen, round 2): the final continuation is never cut; earlier entries are elided whole', () => {
+    const results =
+      '[Tool results from previous turn]\nTool evict_context (executed): ' +
+      JSON.stringify({ evicted: 3000, note: 'x'.repeat(2_000) });
+    const out = buildMidTurnReseedBody([
+      assistant('a'.repeat(MID_TURN_RESEED_MAX_CHARS)),
+      runtime(
+        '[Tool results from previous turn]\nTool list_context (executed): {"totalEntries":3500}'
+      ),
+      assistant('Now evicting.'),
+      runtime(results),
+    ]);
+    expect(out).toContain(results);
+    expect(out).toContain('INK RUNTIME:\nINK RUNTIME:'.slice(0, 0) + 'Now evicting.');
+    expect(out).toContain('"totalEntries":3500');
+    expect(out).toContain('[earlier turn dialogue elided: 1 entry]');
+    expect(out).not.toContain('a'.repeat(100));
+  });
+
+  it('a final continuation larger than the whole budget is still delivered whole', () => {
+    const huge =
+      '[Tool results from previous turn]\nTool get_email (executed): ' +
+      'b'.repeat(MID_TURN_RESEED_MAX_CHARS + 5_000);
+    const out = buildMidTurnReseedBody([assistant('Fetching.'), runtime(huge)]);
+    expect(out).toContain(huge);
+    expect(out).toContain('[earlier turn dialogue elided: 1 entry]');
+  });
+
+  it('spawnDialogueText retracts a recorded prefix once a later block confirms the frame (Lumen, round 2)', () => {
+    // Block 1 ends in a line that could still be a header; block 2 confirms it.
+    const guard = new ImitationPreviewGuard(findImitatedToolResults, isPotentialImitationPrefix);
+    let said = '';
+    said += 'Looking.\nuser';
+    const first = guard.onBlock('Looking.\nuser');
+    expect(spawnDialogueText(said, first)).toBe('Looking.\nuser');
+    said += '[Tool results from previous turn]\nTool x (executed): {}';
+    const second = guard.onBlock('[Tool results from previous turn]\nTool x (executed): {}');
+    expect(second.imitationDiscarded).toBe(true);
+    expect(spawnDialogueText(said, second)).toBe('Looking.\n');
   });
 });
 

@@ -3015,13 +3015,32 @@ export function buildMidTurnReseedBody(dialogue: readonly ReseedDialogueEntry[])
       if (!text) return '';
       return entry.role === 'assistant' ? `YOU:\n${text}` : `INK RUNTIME:\n${text}`;
     })
-    .filter(Boolean)
-    .join('\n\n');
-  if (!rendered) return '';
-  const shown =
-    rendered.length > MID_TURN_RESEED_MAX_CHARS
-      ? `…[earlier turn dialogue elided]\n${rendered.slice(-MID_TURN_RESEED_MAX_CHARS)}`
-      : rendered;
+    .filter(Boolean);
+  if (rendered.length === 0) return '';
+  // The LAST entry is the continuation the model is about to receive — the
+  // real tool results of the iteration that just ran. It is never cut: a
+  // budget applied to the joined text sliced through it and silently dropped
+  // results and role framing (Lumen, PR #577 round 2). The budget applies to
+  // the dialogue BEFORE it, whole entries from the most recent backwards;
+  // what does not fit is elided, and the elision says how much.
+  const last = rendered[rendered.length - 1]!;
+  const earlier = rendered.slice(0, -1);
+  let budget = MID_TURN_RESEED_MAX_CHARS - last.length;
+  const kept: string[] = [];
+  for (let i = earlier.length - 1; i >= 0; i -= 1) {
+    const entry = earlier[i]!;
+    if (entry.length + 2 > budget) break;
+    kept.unshift(entry);
+    budget -= entry.length + 2;
+  }
+  const elided = earlier.length - kept.length;
+  const shown = [
+    ...(elided > 0
+      ? [`…[earlier turn dialogue elided: ${elided} ${elided === 1 ? 'entry' : 'entries'}]`]
+      : []),
+    ...kept,
+    last,
+  ].join('\n\n');
   return [
     '[This turn so far]',
     'The provider session was re-seeded mid-turn after a context change on the ink side. This is the turn up to this point: what you wrote, and what the ink runtime sent back. The ink-tool blocks in your own output were already executed and their results appear below in order — do not repeat those calls. Continue from the end of it.',
@@ -3029,6 +3048,19 @@ export function buildMidTurnReseedBody(dialogue: readonly ReseedDialogueEntry[])
     shown,
     '---',
   ].join('\n');
+}
+
+/**
+ * What this spawn has said, as the reseed dialogue records it: everything up
+ * to the frame the guard found, or everything so far. Called on every block
+ * with the spawn's UNCUT text, so a frame confirmed in block N retracts what
+ * block N-1 had recorded (`Looking.\nuser` becomes `Looking.\n`).
+ */
+export function spawnDialogueText(
+  spawnSaid: string,
+  guarded: { imitationDiscarded: boolean; frameIndex?: number }
+): string {
+  return guarded.imitationDiscarded ? spawnSaid.slice(0, guarded.frameIndex ?? 0) : spawnSaid;
 }
 
 export function buildPromptEnvelope(
@@ -3712,10 +3744,19 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // first iteration's results while the note claimed they followed.
   let turnDialogue: ReseedDialogueEntry[] = [];
   let turnDialogueMuted = false;
+  // This spawn's assistant text, UNCUT, and the dialogue entry it is written
+  // to. One entry per spawn, rewritten as blocks arrive: a line kept from an
+  // earlier block (`Looking.\nuser`) is retracted when a later block reveals
+  // it was the start of a frame — a per-block cut could not take back what
+  // it had already recorded (Lumen, PR #577 round 2).
+  let spawnSaid = '';
+  let spawnEntryIndex = -1;
   const beginSpawn = (): void => {
     streamRenderer.beginSpawn();
     previewGuard.beginSpawn();
     turnDialogueMuted = false;
+    spawnSaid = '';
+    spawnEntryIndex = -1;
   };
   /**
    * The spawn's stream ended: render whatever the renderer was holding, and
@@ -3872,9 +3913,16 @@ export async function runChat(options: ChatOptions): Promise<void> {
         });
       }
       if (!turnDialogueMuted) {
-        // The same cut the guard applied to this block, in block coordinates.
-        const said = evt.text.slice(0, guarded.blockKeep);
-        if (said.trim()) turnDialogue.push({ role: 'assistant', text: said });
+        spawnSaid += evt.text;
+        const said = spawnDialogueText(spawnSaid, guarded);
+        if (spawnEntryIndex === -1) {
+          if (said.trim()) {
+            turnDialogue.push({ role: 'assistant', text: said });
+            spawnEntryIndex = turnDialogue.length - 1;
+          }
+        } else {
+          turnDialogue[spawnEntryIndex] = { role: 'assistant', text: said };
+        }
         if (guarded.imitationDiscarded) turnDialogueMuted = true;
       }
       renderStreamedLines(

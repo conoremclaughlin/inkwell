@@ -42,7 +42,13 @@ export class ImitationPreviewGuard {
    * characters of THIS block precede the cut (`blockKeep`: the block's own
    * length when there is no frame), for a host that also records the block.
    */
-  onBlock(text: string): { publish: string; imitationDiscarded: boolean; blockKeep: number } {
+  onBlock(text: string): {
+    publish: string;
+    imitationDiscarded: boolean;
+    blockKeep: number;
+    /** Where the frame begins, in spawn coordinates — present only when one was found. */
+    frameIndex?: number;
+  } {
     if (this.cut) return { publish: '', imitationDiscarded: true, blockKeep: 0 };
     const blockStart = this.spawnText.length;
     this.spawnText += text;
@@ -55,6 +61,7 @@ export class ImitationPreviewGuard {
         publish: frame.index > from ? this.spawnText.slice(from, frame.index) : '',
         imitationDiscarded: true,
         blockKeep: Math.max(0, frame.index - blockStart),
+        frameIndex: frame.index,
       };
     }
     const blockKeep = text.length;

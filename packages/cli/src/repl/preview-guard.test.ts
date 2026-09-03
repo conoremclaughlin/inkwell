@@ -92,6 +92,13 @@ describe('ImitationPreviewGuard', () => {
     expect(g.onBlock('after').blockKeep).toBe(0);
   });
 
+  it('reports where the frame begins, in spawn coordinates, so a host can retract what it recorded', () => {
+    const g = make();
+    expect(g.onBlock('Looking.\nuser').frameIndex).toBeUndefined();
+    const b = g.onBlock('[Tool results from previous turn]\nTool x (executed): {}');
+    expect(b.frameIndex).toBe('Looking.\n'.length);
+  });
+
   it('a frame that begins inside the held line publishes nothing of it', () => {
     const g = make();
     const a = g.onBlock('Looking.\nuser');
