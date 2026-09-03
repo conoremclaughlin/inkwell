@@ -31,6 +31,23 @@ export interface AutoEvictSelection {
   tokens: number;
   /** Distinct tool names, in first-seen order, for the tombstone. */
   tools: string[];
+  /** The subset of `tools` that mutate something — their results are receipts. */
+  writes: string[];
+}
+
+/**
+ * A tool whose result is a RECEIPT for something that happened — a message
+ * sent, a memory written, a file changed. Clearing the receipt is fine;
+ * inviting the model to "re-run" it is not (Lumen, PR #584): a repeated
+ * send_response duplicates a message, a repeated remember duplicates a
+ * memory. Judged by name, conservatively: anything that is not plainly a
+ * read counts as a write.
+ */
+const READ_ONLY_TOOL_RE =
+  /^(?:list|get|search|recall|read|grep|find|ls|describe|bootstrap|query|fetch|download|check|view|show|preview|count|resolve|inspect|detect)(?:_|$)|_(?:status|history|summary|summaries)$/;
+
+export function isWriteSideTool(tool: string): boolean {
+  return !READ_ONLY_TOOL_RE.test(tool.toLowerCase());
 }
 
 /** `local tool <name> -> …` — an executed result, as the REPL records it. */
@@ -82,15 +99,30 @@ export function selectConsumedToolResults(
     if (name && !tools.includes(name)) tools.push(name);
   }
   if (ids.length === 0 || tokens < minTokens) return null;
-  return { ids, tokens, tools };
+  return { ids, tokens, tools, writes: tools.filter(isWriteSideTool) };
 }
 
-/** The one line left where the results were. */
+/**
+ * The one line left where the results were. It must not invite a repeat of
+ * a write: the receipt is gone, the effect is not.
+ */
 export function autoEvictTombstone(selection: AutoEvictSelection, keepRecentTurns: number): string {
-  const named = selection.tools.length > 0 ? ` (${selection.tools.join(', ')})` : '';
+  const reads = selection.tools.filter((t) => !selection.writes.includes(t));
+  const parts: string[] = [];
+  if (selection.writes.length > 0) {
+    parts.push(
+      `the receipts of write calls (${selection.writes.join(', ')}) — those calls ALREADY HAPPENED; do not repeat them`
+    );
+  }
+  if (reads.length > 0) {
+    parts.push(
+      `the results of read calls (${reads.join(', ')}) — re-run one only if you need its data again`
+    );
+  }
   return (
-    `[${selection.ids.length} earlier tool results${named}, ~${selection.tokens.toLocaleString()} tokens, ` +
-    `were cleared from context automatically after they had been consumed — results older than ${keepRecentTurns} turns are cleared once they outgrow the threshold. ` +
-    'The transcript holds every one; re-run a tool if you need its data again.]'
+    `[${selection.ids.length} earlier tool results, ~${selection.tokens.toLocaleString()} tokens, ` +
+    `were cleared from context automatically after they had been consumed (results older than ${keepRecentTurns} turns are cleared once they outgrow the threshold): ` +
+    parts.join('; ') +
+    '. The session transcript holds every one of them.]'
   );
 }

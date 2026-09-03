@@ -1012,6 +1012,17 @@ export function hydrateLedgerFromTranscript(
       }
       continue;
     }
+    if (type === 'context_note' && typeof event.content === 'string') {
+      // A runtime notice that belongs in the window — today the auto-evict
+      // tombstone. Replayed as the system entry it was live, so a reattached
+      // process knows why earlier tool results are missing (PR #584).
+      const source = typeof event.source === 'string' ? event.source : 'context-note';
+      const entry = ledger.addEntry('system', event.content, source, eid);
+      hydratedEntryIds.push(entry.id);
+      loaded += 1;
+      continue;
+    }
+
     if (type === 'system_turn' && typeof event.content === 'string') {
       // Synthetic turn input (heartbeat trigger, continuation prompt, etc.)
       const label = typeof event.label === 'string' ? event.label : 'system';
@@ -7424,10 +7435,21 @@ export async function runChat(options: ChatOptions): Promise<void> {
             preview: e.content.slice(0, 100),
           }))
         );
+        // The tombstone is persisted as its own event so a reattached process
+        // gets the notice too — tool results are not reconstructed into the
+        // ledger on replay, and without this the gap had no explanation
+        // (Lumen, PR #584).
+        const tombstone = autoEvictTombstone(sweep, AUTO_EVICT_KEEP_RECENT_TURNS);
+        const noteEid = appendTranscript(runtime.transcriptPath, {
+          type: 'context_note',
+          source: AUTO_EVICT_TOMBSTONE_SOURCE,
+          content: tombstone,
+        });
         ledger.addEntry(
           'system',
-          autoEvictTombstone(sweep, AUTO_EVICT_KEEP_RECENT_TURNS),
-          AUTO_EVICT_TOMBSTONE_SOURCE
+          tombstone,
+          AUTO_EVICT_TOMBSTONE_SOURCE,
+          typeof noteEid === 'number' ? noteEid : undefined
         );
         printEvent(
           chalk.dim(

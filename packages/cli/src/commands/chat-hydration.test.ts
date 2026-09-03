@@ -518,6 +518,41 @@ describe('hydrateLedgerFromTranscript — the provider sample survives a process
   });
 });
 
+describe('hydrateLedgerFromTranscript — a persisted context note survives reattach (PR #584)', () => {
+  let dir: string;
+  let transcriptPath: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'ink-note-test-'));
+    transcriptPath = join(dir, 'session-test.jsonl');
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('replays the auto-evict tombstone as the system entry it was live', () => {
+    writeFileSync(
+      transcriptPath,
+      [
+        { eid: 1, type: 'user', content: 'hello' },
+        { eid: 2, type: 'assistant', content: 'hi', backend: 'claude' },
+        {
+          eid: 3,
+          type: 'context_note',
+          source: 'auto-evict',
+          content: '[3 earlier tool results were cleared … those calls ALREADY HAPPENED]',
+        },
+      ]
+        .map((e) => JSON.stringify(e))
+        .join('\n') + '\n'
+    );
+    const ledger = new ContextLedger();
+    hydrateLedgerFromTranscript(ledger, transcriptPath);
+    const note = ledger.listEntries().find((e) => e.source === 'auto-evict');
+    expect(note?.content).toContain('ALREADY HAPPENED');
+    expect(note?.eid).toBe(3);
+  });
+});
+
 describe('hydrateLedgerFromTranscript — context_evict events', () => {
   let dir: string;
   let transcriptPath: string;

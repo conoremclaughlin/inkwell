@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { ContextLedger } from './context-ledger.js';
 import {
   autoEvictTombstone,
+  isWriteSideTool,
   selectConsumedToolResults,
   LOCAL_TOOL_RESULT_SOURCE,
 } from './auto-evict.js';
@@ -82,5 +83,56 @@ describe('selectConsumedToolResults', () => {
     expect(pick!.tools).toEqual(['bash', 'send_email']);
     expect(autoEvictTombstone(pick!, 2)).toContain('bash, send_email');
     expect(autoEvictTombstone(pick!, 2)).toContain('transcript holds every one');
+  });
+});
+
+describe('the tombstone never invites a repeated write (Lumen, PR #584)', () => {
+  it.each([
+    'send_response',
+    'remember',
+    'update_memory',
+    'create_task',
+    'send_email',
+    'write',
+    'bash',
+    'evict_context',
+  ])('%s is write-side', (tool) => {
+    expect(isWriteSideTool(tool)).toBe(true);
+  });
+  it.each([
+    'list_emails',
+    'get_email',
+    'recall',
+    'search_links',
+    'read',
+    'grep',
+    'list_context',
+    'get_session',
+    'bootstrap',
+  ])('%s is read-side', (tool) => {
+    expect(isWriteSideTool(tool)).toBe(false);
+  });
+
+  it('says writes already happened and must not be repeated; reads may be re-run', () => {
+    const ledger = new ContextLedger();
+    ledger.addEntry('system', 'local tool send_response -> {"ok":true}', LOCAL_TOOL_RESULT_SOURCE);
+    ledger.addEntry(
+      'system',
+      'local tool list_emails -> {"count":2}' + 'x'.repeat(2_000),
+      LOCAL_TOOL_RESULT_SOURCE
+    );
+    turn(ledger, 0, 0);
+    turn(ledger, 1, 0);
+    const pick = selectConsumedToolResults(ledger.listEntries(), {
+      keepRecentTurns: 1,
+      minTokens: 1,
+    });
+    expect(pick!.writes).toEqual(['send_response']);
+    const note = autoEvictTombstone(pick!, 2);
+    expect(note).toContain('send_response');
+    expect(note).toContain('ALREADY HAPPENED');
+    expect(note).toContain('do not repeat');
+    expect(note).toContain('list_emails');
+    expect(note).not.toMatch(/re-run (a tool|one)[^.]*send_response/);
   });
 });
