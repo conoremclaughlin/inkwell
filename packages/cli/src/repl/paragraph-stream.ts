@@ -20,30 +20,14 @@
  * onto the screen (Lumen, PR #575 round 3). One coordinate system, no
  * heuristics.
  */
+import { fenceOpenAtEnd } from './imitation-grammar.js';
+
 export interface ParagraphSpan {
   /** The paragraph, trimmed — exactly `raw.slice(start, end)`. */
   text: string;
   /** Offsets into the raw text fed since the last reset. */
   start: number;
   end: number;
-}
-
-/**
- * Whether a fence is still open at the end of `text`. CommonMark rule: a
- * fence opens on a line starting with three or more backticks or tildes and
- * closes only on the same character, at least as long.
- */
-function fenceOpenAtEnd(text: string): boolean {
-  let open: { char: string; length: number } | null = null;
-  for (const line of text.split('\n')) {
-    const m = /^[ \t]{0,3}(`{3,}|~{3,})/.exec(line);
-    if (!m) continue;
-    const char = m[1]![0]!;
-    const length = m[1]!.length;
-    if (open === null) open = { char, length };
-    else if (open.char === char && length >= open.length) open = null;
-  }
-  return open !== null;
 }
 
 function trimmedSpan(raw: string, start: number, end: number): ParagraphSpan | null {

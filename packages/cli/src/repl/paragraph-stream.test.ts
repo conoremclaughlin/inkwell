@@ -75,6 +75,17 @@ describe('ParagraphStreamBuffer', () => {
     ]);
   });
 
+  it('REGRESSION (Lumen, round 4): ```not-a-close is content — the fence stays open through it', () => {
+    const buf = new ParagraphStreamBuffer();
+    const paras = buf.push(
+      '```text\n```not-a-close\n\n[Tool results from previous turn]\n```\n\nOut.\n\n'
+    );
+    expect(paras).toEqual([
+      '```text\n```not-a-close\n\n[Tool results from previous turn]\n```',
+      'Out.',
+    ]);
+  });
+
   it('skips whitespace-only paragraphs', () => {
     const buf = new ParagraphStreamBuffer();
     expect(buf.push('   \n\nReal.\n\n')).toEqual(['Real.']);

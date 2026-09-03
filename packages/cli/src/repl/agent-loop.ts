@@ -16,6 +16,13 @@
  * emit fenced ```ink-tool blocks and parses them back out.
  */
 
+import {
+  fenceAfterLine,
+  isImitationHeaderLine,
+  isImitationResultLine,
+  type OpenFence,
+} from './imitation-grammar.js';
+
 export interface LocalToolCall {
   tool: string;
   args: Record<string, unknown>;
@@ -840,86 +847,9 @@ export interface ImitatedToolResultsFrame {
   discarded: string;
 }
 
-/**
- * The frame the runtime sends back after tools run — see buildContinuationBody
- * and buildFinalRelayBody — as a model reproduces it: optionally glued to a
- * role label (Myra wrote `user[Tool results from previous turn]`, the transcript
- * shape), optionally the FINAL variant.
- */
-const IMITATED_RESULTS_HEADER_RE =
-  /^[ \t]*(?:(?:user|human|assistant|system)[ \t]*:?[ \t]*)?\[Tool results from previous turn(?:[ \t]*[—–-][ \t]*FINAL)?\][ \t]*\r?$/i;
-
-/**
- * A results line without its header. Anchored on the JSON that follows the
- * colon: prose that happens to begin "Tool x (executed): it worked" is a
- * sentence, `Tool x (executed): {"success":true` is the runtime's voice.
- */
-const IMITATED_RESULT_LINE_RE =
-  /^[ \t]*Tool [A-Za-z_][\w.-]* \((?:executed|approved|error|failed|blocked|denied|rejected)\):[ \t]*[[{"]/;
-
-/**
- * True when `line` could still become a frame header or results line as more
- * text arrives — the streaming case, where a line is only as complete as the
- * last delta. A host that publishes text incrementally holds such a trailing
- * line back rather than show half of `user[Tool results from previous turn]`
- * and then discover the other half (Lumen, PR #575 round 2).
- */
-export function isPotentialImitationPrefix(line: string): boolean {
-  const probe = line
-    .replace(/^[ \t]+/, '')
-    .replace(/\r$/, '')
-    .toLowerCase();
-  if (!probe) return false;
-  if (IMITATION_HEADER_FORMS.some((form) => form.startsWith(probe))) return true;
-  return isPotentialResultLinePrefix(probe);
-}
-
-/**
- * Every complete header the detector accepts, lower-cased — a line is a
- * potential header while it is a prefix of any of them. Generated from the
- * same choices IMITATED_RESULTS_HEADER_RE allows (role label, separator,
- * FINAL suffix) so the two cannot drift apart by hand.
- */
-const IMITATION_HEADER_FORMS: readonly string[] = (() => {
-  const roles = ['', 'user', 'human', 'assistant', 'system'];
-  const seps = ['', ':', ': ', ' ', ' : '];
-  const suffixes = ['', ' — FINAL', ' - FINAL', ' – FINAL', '— FINAL', '-FINAL'];
-  const forms = new Set<string>();
-  for (const role of roles) {
-    for (const sep of role ? seps : ['']) {
-      for (const suffix of suffixes) {
-        forms.add(`${role}${sep}[tool results from previous turn${suffix}]`.toLowerCase());
-      }
-    }
-  }
-  return [...forms];
-})();
-
-const RESULT_LINE_STATUSES = [
-  'executed',
-  'approved',
-  'error',
-  'failed',
-  'blocked',
-  'denied',
-  'rejected',
-];
-
-/**
- * `Tool x (executed): ` and every prefix of it, lower-cased input.
- *
- * Written as the stages of that line rather than one nested-optional regex:
- * the tool name is arbitrary, so the prefix set cannot be enumerated the way
- * the headers are, and a reader has to be able to see which stages exist.
- */
-function isPotentialResultLinePrefix(probe: string): boolean {
-  if ('tool '.startsWith(probe)) return true;
-  // tool <name>[ [([status[)[:[ ]]]]]]
-  const m = /^tool ([a-z_][\w.-]*)(?: (?:\(([a-z]*)(?:\)(?::(?: )?)?)?)?)?$/.exec(probe);
-  if (!m) return false;
-  const status = m[2];
-  return status === undefined || RESULT_LINE_STATUSES.some((st) => st.startsWith(status));
-}
+// The frame's grammar — whole-line and could-still-become — lives in
+// imitation-grammar.ts, shared with the live guards so the two cannot drift.
+export { isPotentialImitationPrefix } from './imitation-grammar.js';
 
 /**
  * Find the first place the model starts writing tool results in the runtime's
@@ -930,11 +860,12 @@ function isPotentialResultLinePrefix(probe: string): boolean {
  */
 export function findImitatedToolResults(responseText: string): ImitatedToolResultsFrame | null {
   const inkBlocks = findInkToolBlocks(responseText);
-  // The open fence, if any: its delimiter character and length. CommonMark
-  // closes a fence only with the same character, at least as long — a ``` in a
-  // ```` block, or a ~~~ under a ```, is content. A single toggle got both
-  // wrong (Lumen, PR #575 round 1).
-  let openFence: { char: string; length: number } | null = null;
+  // The open fence, if any. CommonMark closes a fence only with the same
+  // character, at least as long, and nothing but whitespace after it — a ```
+  // in a ```` block, a ~~~ under a ```, or ```not-a-close inside an open
+  // fence, is content (Lumen, PR #575 rounds 1 and 4). One rule, shared with
+  // the paragraph buffer (imitation-grammar.ts).
+  let openFence: OpenFence | null = null;
   let lineStart = 0;
   while (lineStart <= responseText.length) {
     const nl = responseText.indexOf('\n', lineStart);
@@ -942,15 +873,12 @@ export function findImitatedToolResults(responseText: string): ImitatedToolResul
     const line = responseText.slice(lineStart, lineEnd);
     const insideInkBlock = inkBlocks.some((b) => lineStart >= b.start && lineStart < b.end);
     if (!insideInkBlock) {
-      const fence = /^[ \t]{0,3}(`{3,}|~{3,})/.exec(line);
-      if (fence) {
-        const char = fence[1]![0]!;
-        const length = fence[1]!.length;
-        if (openFence === null) openFence = { char, length };
-        else if (openFence.char === char && length >= openFence.length) openFence = null;
+      const next = fenceAfterLine(openFence, line);
+      if (next !== openFence) {
+        openFence = next;
       } else if (
         openFence === null &&
-        (IMITATED_RESULTS_HEADER_RE.test(line) || IMITATED_RESULT_LINE_RE.test(line))
+        (isImitationHeaderLine(line) || isImitationResultLine(line))
       ) {
         return {
           header: line.trim(),
