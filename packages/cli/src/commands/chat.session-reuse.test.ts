@@ -23,6 +23,7 @@ import {
   buildMidTurnReseedBody,
   decideContinuationSession,
   MID_TURN_RESEED_OWN_OUTPUT_MAX_CHARS,
+  MID_TURN_RESEED_MAX_CHARS,
 } from './chat.js';
 import { MAX_RELAY_BYTES } from '../repl/agent-loop.js';
 import { ContextLedger } from '../repl/context-ledger.js';
@@ -916,34 +917,67 @@ describe('decideContinuationSession (the real function runTurnForLoop calls) —
   });
 });
 
-describe('buildMidTurnReseedBody — the rebuilt session remembers its own half of the turn (#572)', () => {
-  it("carries the model's own output before the continuation", () => {
+describe('buildMidTurnReseedBody — the rebuilt session remembers this turn (#572; ordered — Lumen, PR #577)', () => {
+  const assistant = (text: string) => ({ role: 'assistant' as const, text });
+  const runtime = (text: string) => ({ role: 'runtime' as const, text });
+
+  it("carries the model's own output and the continuation it was about to receive", () => {
     const body =
       '[Tool results from previous turn]\nTool evict_context (executed): {"evicted":3000}';
-    const out = buildMidTurnReseedBody(
-      [
-        'Clearing old heartbeat chatter.\n\n```ink-tool\n{"tool":"evict_context","args":{"source":"heartbeat"}}\n```',
-      ],
-      body
-    );
-    expect(out.startsWith('[Your own output so far this turn]')).toBe(true);
+    const out = buildMidTurnReseedBody([
+      assistant(
+        'Clearing old heartbeat chatter.\n\n```ink-tool\n{"tool":"evict_context","args":{"source":"heartbeat"}}\n```'
+      ),
+      runtime(body),
+    ]);
+    expect(out.startsWith('[This turn so far]')).toBe(true);
     expect(out).toContain('"tool":"evict_context"');
     expect(out).toContain('already executed');
-    expect(out.endsWith(body)).toBe(true);
-    expect(out.indexOf('evict_context","args"')).toBeLessThan(out.indexOf(body));
+    expect(out.indexOf('evict_context","args"')).toBeLessThan(out.indexOf('"evicted":3000'));
   });
 
-  it('is the bare body when the model has said nothing yet', () => {
-    expect(buildMidTurnReseedBody([], 'body')).toBe('body');
-    expect(buildMidTurnReseedBody(['  ', ''], 'body')).toBe('body');
+  it("REGRESSION (Lumen, PR #577): an earlier iteration's results survive, in order", () => {
+    // Iteration 1 calls list_context, iteration 2 calls evict_context. The
+    // assistant-only record lost the list_context RESULT entirely — it is
+    // client-local, so the ledger never held it either — while the note
+    // claimed the results followed.
+    const out = buildMidTurnReseedBody([
+      assistant(
+        'Checking what is in my window.\n```ink-tool\n{"tool":"list_context","args":{}}\n```'
+      ),
+      runtime(
+        '[Tool results from previous turn]\nTool list_context (executed): {"totalEntries":3500}'
+      ),
+      assistant(
+        'Heartbeat chatter dominates.\n```ink-tool\n{"tool":"evict_context","args":{}}\n```'
+      ),
+      runtime('[Tool results from previous turn]\nTool evict_context (executed): {"evicted":3000}'),
+    ]);
+    const order = [
+      '"tool":"list_context"',
+      '"totalEntries":3500',
+      '"tool":"evict_context"',
+      '"evicted":3000',
+    ].map((needle) => out.indexOf(needle));
+    expect(order.every((i) => i > -1)).toBe(true);
+    expect([...order].sort((a, b) => a - b)).toEqual(order);
+    // Each side is attributed, so the model can tell its own words from the
+    // runtime's — the whole subject of #569.
+    expect(out).toContain('YOU:');
+    expect(out).toContain('INK RUNTIME:');
   });
 
-  it('keeps the TAIL of very long output and says what was elided', () => {
-    const long = 'a'.repeat(MID_TURN_RESEED_OWN_OUTPUT_MAX_CHARS + 500) + 'TAIL';
-    const out = buildMidTurnReseedBody([long], 'body');
-    expect(out).toContain('[earlier output elided]');
+  it('is empty when the turn has said nothing yet', () => {
+    expect(buildMidTurnReseedBody([])).toBe('');
+    expect(buildMidTurnReseedBody([assistant('   '), runtime('')])).toBe('');
+  });
+
+  it('keeps the TAIL of a very long dialogue and says what was elided', () => {
+    const long = 'a'.repeat(MID_TURN_RESEED_MAX_CHARS + 500) + 'TAIL';
+    const out = buildMidTurnReseedBody([assistant(long)]);
+    expect(out).toContain('[earlier turn dialogue elided]');
     expect(out).toContain('TAIL');
-    expect(out.length).toBeLessThan(MID_TURN_RESEED_OWN_OUTPUT_MAX_CHARS + 1000);
+    expect(out.length).toBeLessThan(MID_TURN_RESEED_MAX_CHARS + 1500);
   });
 });
 

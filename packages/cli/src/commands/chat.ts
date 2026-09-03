@@ -2982,38 +2982,52 @@ export function decideContinuationSession(
   return { mode: 'seed', id: mint() };
 }
 
-/** Ceiling on the model's own in-turn output carried into a mid-turn reseed. */
-export const MID_TURN_RESEED_OWN_OUTPUT_MAX_CHARS = 30_000;
+/** Ceiling on the transient dialogue carried into a mid-turn reseed. */
+export const MID_TURN_RESEED_MAX_CHARS = 30_000;
 
 /**
- * The latest-message body for a mid-turn reseed: the model's own output so
- * far this turn, then the continuation it was about to receive.
+ * One side of the transient dialogue a mid-turn reseed replays: what the
+ * model said, or what the runtime said back.
+ */
+export interface ReseedDialogueEntry {
+  role: 'assistant' | 'runtime';
+  text: string;
+}
+
+/**
+ * The latest-message body for a mid-turn reseed: this turn's dialogue so far,
+ * in order, ending with the continuation the model was about to receive.
  *
  * A rebuilt envelope carries the ledger — the user's message, tool-result
- * previews — but not what the model itself said and asked for before the
- * roll. Without it the reseeded session has no memory of its own half of the
- * turn: Myra attributed her own evictions to automatic pruning and re-issued
- * calls that had already run (#572). Imitated frames have already been cut
- * from `ownOutputSoFar` by the host.
+ * previews — but not the turn in progress. Assistant text alone was not
+ * enough either (Lumen, PR #577): ordinary tool results survive in the ledger
+ * only as 500-char previews placed BEFORE the requests that earned them, and
+ * client-local results (list_context, evict_context) are deliberately not in
+ * the ledger at all — so a two-iteration turn lost the first iteration's
+ * results while the note claimed they followed. Replaying the ordered
+ * dialogue is what keeps the reseeded session from re-issuing calls that
+ * already ran (#572). Imitated frames are already cut by the host.
  */
-export function buildMidTurnReseedBody(ownOutputSoFar: readonly string[], body: string): string {
-  const own = ownOutputSoFar
-    .map((t) => t.trim())
+export function buildMidTurnReseedBody(dialogue: readonly ReseedDialogueEntry[]): string {
+  const rendered = dialogue
+    .map((entry) => {
+      const text = entry.text.trim();
+      if (!text) return '';
+      return entry.role === 'assistant' ? `YOU:\n${text}` : `INK RUNTIME:\n${text}`;
+    })
     .filter(Boolean)
     .join('\n\n');
-  if (!own) return body;
+  if (!rendered) return '';
   const shown =
-    own.length > MID_TURN_RESEED_OWN_OUTPUT_MAX_CHARS
-      ? `…[earlier output elided]\n${own.slice(-MID_TURN_RESEED_OWN_OUTPUT_MAX_CHARS)}`
-      : own;
+    rendered.length > MID_TURN_RESEED_MAX_CHARS
+      ? `…[earlier turn dialogue elided]\n${rendered.slice(-MID_TURN_RESEED_MAX_CHARS)}`
+      : rendered;
   return [
-    '[Your own output so far this turn]',
-    'The provider session was re-seeded mid-turn after a context change on the ink side. This is what you wrote before that point; the ink-tool blocks in it were already executed and their results follow below. Do not repeat those calls.',
+    '[This turn so far]',
+    'The provider session was re-seeded mid-turn after a context change on the ink side. This is the turn up to this point: what you wrote, and what the ink runtime sent back. The ink-tool blocks in your own output were already executed and their results appear below in order — do not repeat those calls. Continue from the end of it.',
     '---',
     shown,
     '---',
-    '',
-    body,
   ].join('\n');
 }
 
@@ -3688,12 +3702,20 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // what a mid-turn reseed hands back so the rebuilt session remembers its
   // own half of the turn (buildMidTurnReseedBody, #572). Reset per turn;
   // muted from an imitated frame to the next spawn, like the renderer.
-  let turnOwnOutput: string[] = [];
-  let turnOwnOutputMuted = false;
+  // This turn's dialogue with the runtime, in order: what the model said, and
+  // each continuation the runtime sent back. A mid-turn reseed replays it so
+  // the rebuilt session remembers its own half of the turn — assistant text
+  // alone was not enough (Lumen, PR #577): ordinary tool results survive in
+  // the ledger only as 500-char previews placed BEFORE the requests that
+  // earned them, and client-local results (list_context, evict_context) are
+  // deliberately not in the ledger at all, so a two-iteration turn lost the
+  // first iteration's results while the note claimed they followed.
+  let turnDialogue: ReseedDialogueEntry[] = [];
+  let turnDialogueMuted = false;
   const beginSpawn = (): void => {
     streamRenderer.beginSpawn();
     previewGuard.beginSpawn();
-    turnOwnOutputMuted = false;
+    turnDialogueMuted = false;
   };
   /**
    * The spawn's stream ended: render whatever the renderer was holding, and
@@ -3849,10 +3871,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
           ...(guarded.imitationDiscarded ? { imitationDiscarded: true } : {}),
         });
       }
-      if (!turnOwnOutputMuted) {
+      if (!turnDialogueMuted) {
         // The same cut the guard applied to this block, in block coordinates.
-        turnOwnOutput.push(evt.text.slice(0, guarded.blockKeep));
-        if (guarded.imitationDiscarded) turnOwnOutputMuted = true;
+        const said = evt.text.slice(0, guarded.blockKeep);
+        if (said.trim()) turnDialogue.push({ role: 'assistant', text: said });
+        if (guarded.imitationDiscarded) turnDialogueMuted = true;
       }
       renderStreamedLines(
         streamRenderer.completeMessage(evt.text, { continuesMessage: evt.continuesMessage })
@@ -6251,8 +6274,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
   ) => {
     if (!raw.trim()) return;
     streamRenderer.reset();
-    turnOwnOutput = [];
-    turnOwnOutputMuted = false;
+    turnDialogue = [];
+    turnDialogueMuted = false;
     // Attach pending files to this turn — append the block so the backend
     // sees the paths inline with the message that delivered them. The media
     // list rides the same turn (injected as prompt content by adapters that
@@ -6843,7 +6866,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
         sessionArgs = { backendSessionId: decision.id };
       } else if (decision.mode === 'seed') {
         activeBackendSessionId = decision.id;
-        activeBackendSessionShape = currentEnvelopeShape;
+        // Recomputed HERE, not the pre-spawn snapshot: the opening spawn's
+        // model init may have changed the budget (applyDetectedModel), and
+        // the envelope built below uses the new one. Recording the stale
+        // shape made the NEXT turn roll this session again — the very
+        // fragmentation this fix exists to stop (Lumen, PR #577).
+        activeBackendSessionShape = envelopeShapeKey(runtime);
         appendTranscript(runtime.transcriptPath, {
           type: 'backend_session',
           id: decision.id,
@@ -6857,12 +6885,16 @@ export async function runChat(options: ChatOptions): Promise<void> {
           agentId,
           runtime,
           ledger,
-          buildMidTurnReseedBody(turnOwnOutput, body)
+          buildMidTurnReseedBody([...turnDialogue, { role: 'runtime', text: body }])
         );
         sessionArgs = { backendSessionSeedId: decision.id };
       } else {
         continuationPrompt = buildPromptEnvelope(agentId, runtime, ledger, body);
       }
+
+      // Recorded for a later reseed in this same turn; the seed above already
+      // rendered this body itself.
+      turnDialogue.push({ role: 'runtime', text: body });
 
       beginSpawn();
       const ledgerIdBeforeSpawn = maxLedgerId();
