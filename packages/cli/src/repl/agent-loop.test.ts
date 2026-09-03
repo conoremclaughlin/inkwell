@@ -3,6 +3,7 @@ import {
   buildContinuationBody,
   buildFinalRelayBody,
   reconcileSelection,
+  snapshotCalls,
   extractLocalToolCalls,
   hasUnseenFailure,
   resolveResponseText,
@@ -981,6 +982,94 @@ describe('reconcileSelection', () => {
     const out = reconcileSelection(emitted, emitted);
     expect(out.dropped).toHaveLength(0);
     expect(out.unmatched).toBe(0);
+  });
+});
+
+/**
+ * Round six, all Lumen's: the screen holds the same objects reconciliation
+ * compares against, and two notes still described `reached` as `ran`.
+ */
+describe('a screen that edits calls in place', () => {
+  it('snapshots args so an in-place edit cannot hide', () => {
+    const original: LocalToolCall[] = [{ tool: 'save', args: { id: 1 }, raw: '' }];
+    const snap = snapshotCalls(original);
+    (original[0]!.args as { id: number }).id = 2;
+    // The snapshot still describes what was ASKED for.
+    expect(snap[0]!.args).toEqual({ id: 1 });
+  });
+
+  /**
+   * The repro. A host mutates `all[0].args.id` from 1 to 2 and returns the same
+   * array. The altered write executes. Comparing live objects, the call matched
+   * ITSELF and nothing was reported.
+   */
+  it('reports an in-place rewrite as unreconcilable rather than fine', async () => {
+    const harness = makePorts([
+      outcome({ stdout: inkTool('save', { id: 1 }) }),
+      outcome({ stdout: 'done' }),
+    ]);
+    harness.ports.tools.screen = (all) => {
+      for (const c of all) {
+        if (c.tool === 'save') (c.args as { id: number }).id = 2;
+      }
+      return { calls: all };
+    };
+
+    await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+
+    // It ran with id 2, which is not what was asked for.
+    expect((harness.executed[0]![0]!.args as { id: number }).id).toBe(2);
+    const continuation = harness.prompts[1]!.body;
+    expect(continuation).toContain('CANNOT tell you which');
+    expect(continuation).toContain('rewrote or substituted');
+  });
+});
+
+describe('the notes never call `reached` `ran`', () => {
+  const c = (tool: string): LocalToolCall => ({ tool, args: {}, raw: '' });
+
+  /**
+   * `reached` counts calls that got to the runner, whatever became of them
+   * there. Saying "5 ran" next to five `blocked` results is a flat
+   * contradiction — the same defect as round two, recurring in the branch I
+   * wrote for round five.
+   */
+  it('does not claim blocked calls ran, even alongside a substitution', () => {
+    const blocked: ToolResultRecord[] = ['a', 'b'].map((t) => ({
+      tool: t,
+      result: 'denied by policy',
+      status: 'blocked',
+    }));
+    const body = buildContinuationBody(blocked, [c('a'), c('b')], {
+      emitted: 3,
+      reached: 2,
+      dropped: [c('gone')],
+      unmatched: 1,
+    });
+
+    expect(body).toContain('none of those calls ran');
+    expect(body).toContain('reached the tool runner');
+    expect(body).not.toMatch(/\d+ ran\b/);
+  });
+
+  /**
+   * FINAL was reporting only the unmatched count, discarding the totals and the
+   * ambiguous remainder — so an 8-emitted / 5-reached turn ended saying almost
+   * nothing about the other seven.
+   */
+  it('keeps the totals and the ambiguous remainder in the final relay', () => {
+    const body = buildFinalRelayBody([{ tool: 'm1', result: 'ok', status: 'executed' }], {
+      emitted: 8,
+      reached: 5,
+      dropped: [c('m5'), c('m6'), c('m7'), c('m8')],
+      unmatched: 1,
+    });
+
+    expect(body).toContain('NOT RECONCILED');
+    expect(body).toContain('you emitted 8 tool calls');
+    expect(body).toContain('5 reached the tool runner');
+    expect(body).toContain('Up to 4 of your calls');
+    expect(body).not.toMatch(/\d+ of the calls that ran/);
   });
 });
 

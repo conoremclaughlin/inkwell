@@ -68,6 +68,26 @@ export interface SelectionOutcome {
   unmatched: number;
 }
 
+/**
+ * An immutable record of what the model asked for, taken BEFORE the screen
+ * sees it.
+ *
+ * `screen(extracted)` is handed the live objects, so a host that edits one in
+ * place — `all[0].args.id = 2` — changes the very thing reconciliation compares
+ * against. The altered write executes and the call matches ITSELF, so nothing
+ * is reported (Lumen, PR #573 round 6). Comparing against a snapshot makes the
+ * edit visible: the emitted call no longer matches anything selected, and the
+ * altered one matches nothing emitted, so the turn is correctly reported as
+ * unreconcilable rather than silently fine.
+ *
+ * Snapshotting rather than freezing: freezing would throw inside a host doing
+ * something previously tolerated, and turning a silent defect into a crash is
+ * not the trade this PR is making.
+ */
+export function snapshotCalls(calls: ReadonlyArray<LocalToolCall>): LocalToolCall[] {
+  return calls.map((c) => ({ ...c, args: structuredClone(c.args) }));
+}
+
 /** Same request? Compared by content so a rebuilt object still matches. */
 function sameCall(a: LocalToolCall, b: LocalToolCall): boolean {
   return a.tool === b.tool && JSON.stringify(a.args) === JSON.stringify(b.args);
@@ -318,11 +338,13 @@ export function buildContinuationBody(
   const { emitted, reached, dropped, unmatched } = selection;
   const droppedNote =
     unmatched > 0
-      ? `\n\nNOTE: you emitted ${emitted} tool calls and ${reached} ran, but ${unmatched} of those ` +
-        `do not correspond to anything you asked for — the host rewrote or substituted calls. ` +
-        `The runtime therefore CANNOT tell you which of yours ran, and one of your calls may have ` +
-        `executed in altered form. Do not guess and do not re-emit blindly: read back the current ` +
-        `state and act on what you find. Re-running a write that already succeeded is not safe.`
+      ? `\n\nNOTE: you emitted ${emitted} tool calls and ${reached} reached the tool runner — their ` +
+        `outcomes are above, and some of those may themselves have been refused or failed. ` +
+        `But ${unmatched} of them do not correspond to anything you asked for: the host rewrote or ` +
+        `substituted calls. The runtime therefore CANNOT tell you which of yours reached the runner. ` +
+        `Up to ${dropped.length} of your calls did not run at all, or ran in altered form. ` +
+        `Do not guess and do not re-emit blindly: read back the current state and act on what you ` +
+        `find. Re-running a write that already succeeded is not safe.`
       : dropped.length === 0
         ? ''
         : `\n\nNOTE: you emitted ${emitted} tool calls. ${reached} reached the tool runner — their ` +
@@ -364,9 +386,11 @@ export function buildFinalRelayBody(
   const { dropped, unmatched } = selection;
   const droppedNote =
     unmatched > 0
-      ? `\n\nNOT RECONCILED — ${unmatched} of the calls that ran do not correspond to anything you ` +
-        `emitted, so the runtime cannot tell you which of yours ran. The loop has ended. Say that ` +
-        `plainly rather than reporting the work as done.`
+      ? `\n\nNOT RECONCILED — you emitted ${selection.emitted} tool calls and ${selection.reached} ` +
+        `reached the tool runner, but ${unmatched} of those do not correspond to anything you ` +
+        `emitted, so the runtime cannot tell you which of yours reached it. Up to ` +
+        `${dropped.length} of your calls did not run at all, or ran in altered form. The loop has ` +
+        `ended. Say that plainly rather than reporting the work as done.`
       : dropped.length === 0
         ? ''
         : `\n\nNOT EXECUTED — these calls were emitted but never ran, and the loop has now ended: ${dropped
@@ -454,6 +478,8 @@ export async function runAgentLoop(
 
     const extracted =
       input.toolRouting === 'local' ? extractLocalToolCalls(responseText) : ([] as LocalToolCall[]);
+    // Taken before `screen` can touch these objects — see snapshotCalls.
+    const emittedSnapshot = snapshotCalls(extracted);
 
     // Screening sees every call the model emitted, before the per-iteration cap
     // discards any — a rule about what may accompany what cannot be enforced on
@@ -517,10 +543,10 @@ export async function runAgentLoop(
     // What ran versus what was asked for. Reconciled, not inferred — see
     // SelectionOutcome for why three rounds of identity heuristics were the
     // wrong shape of answer.
-    const selection = reconcileSelection(extracted, calls);
+    const selection = reconcileSelection(emittedSnapshot, calls);
     if (selection.unmatched > 0) {
       ports.ui.printEvent(
-        `  ⋯ ${selection.unmatched} of ${selection.reached} executed calls do not match anything emitted — which of the model's calls ran is not determinable`
+        `  ⋯ ${selection.unmatched} of ${selection.reached} calls that reached the runner match nothing emitted — which of the model's calls reached it is not determinable`
       );
     } else if (selection.dropped.length > 0) {
       ports.ui.printEvent(
