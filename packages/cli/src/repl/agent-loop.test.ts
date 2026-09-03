@@ -939,6 +939,66 @@ describe('silently dropped tool calls (the per-iteration cap)', () => {
   });
 
   /**
+   * Naming is only safe while the names are right (Myra's own correction to her
+   * own argument, 3 Sep 2026).
+   *
+   * The identity filter is a reference comparison. A host `screen` that rebuilds
+   * its call objects matches nothing, so every emitted call looks dropped —
+   * including the ones that ran. She argued naming beats counting, then attached
+   * the precondition: a false "create_reminder did not run" is WORSE than a
+   * count, because it is a positive instruction to re-run a write that
+   * succeeded, in the runtime's own voice. #553's do-not-retry problem with the
+   * sign flipped.
+   */
+  describe('when call identity cannot be trusted', () => {
+    it('gives the count and refuses to name, rather than naming wrongly', () => {
+      // Identity says "all 3 dropped"; arithmetic says only 1 did. They
+      // disagree, so the names are not describing this event.
+      const body = buildContinuationBody([ran('a'), ran('b')], [call('a'), call('b')], [], 1);
+
+      expect(body).toContain('CANNOT TELL YOU WHICH');
+      expect(body).toContain('3 tool calls');
+      expect(body).toContain('only 2 ran');
+      expect(body).toContain('read back the current state');
+      // The whole point: it must not assert a name it cannot stand behind.
+      expect(body).not.toMatch(/NOT executed and had no effect/);
+    });
+
+    it('never names a call that actually ran, even with a rebuilding screen', async () => {
+      const emitted = ['m1', 'm2', 'm3', 'm4', 'm5', 'm6', 'm7'];
+      const harness = makePorts([
+        outcome({ stdout: emitted.map((t) => inkTool(t)).join('\n') }),
+        outcome({ stdout: 'done' }),
+      ]);
+      // A screen that truncates correctly but returns NEW objects — the exact
+      // shape that defeats a reference comparison.
+      harness.ports.tools.screen = (all) => ({
+        calls: all.slice(0, 5).map((c) => ({ ...c })),
+      });
+
+      await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+
+      const continuation = harness.prompts[1]!.body;
+      // Two ran and two did not; a naive identity filter would name all seven.
+      expect(continuation).toContain('CANNOT TELL YOU WHICH');
+      for (const tool of ['m1', 'm2', 'm3', 'm4', 'm5']) {
+        expect(continuation).not.toContain(`effect: ${tool}`);
+      }
+      // The count still has to be right and still has to be stated.
+      expect(continuation).toContain('7 tool calls');
+      expect(continuation).toContain('only 5 ran');
+      expect(harness.events.join('\n')).toContain('not determinable');
+    });
+
+    it('final relay refuses to name for the same reason', () => {
+      const body = buildFinalRelayBody([ran('a')], [], 2);
+      expect(body).toContain('NOT EXECUTED');
+      expect(body).toContain('cannot identify which');
+      expect(body).toContain('2 emitted calls');
+    });
+  });
+
+  /**
    * Myra's measurement, end to end: 8 emitted -> 5 executed, and the three that
    * did not run are named back to the model. Written against the constant
    * rather than the literal 5 — the defect is the silence, not the number.
