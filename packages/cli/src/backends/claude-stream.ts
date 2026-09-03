@@ -33,7 +33,7 @@ interface ClaudeStreamMessage {
   errors?: unknown[];
   result?: unknown;
   usage?: Record<string, unknown>;
-  message?: { content?: ClaudeContentBlock[] };
+  message?: { id?: string; content?: ClaudeContentBlock[] };
   session_id?: string;
   /** Model id serving the session (`system`/`init` event). */
   model?: string;
@@ -108,8 +108,20 @@ function toUsage(u: Record<string, unknown>): BackendTokenUsage {
 
 export class ClaudeStreamParser implements BackendStreamParser {
   private buffer = '';
-  /** Last non-empty assistant text — the real final response when `result` is empty. */
+  /**
+   * Text of the assistant message currently being assembled — the real final
+   * response when `result` is empty or partial.
+   *
+   * Claude Code streams ONE `assistant` event per content block, all sharing
+   * the API message's `message.id`. A response shaped text → thinking → text
+   * therefore arrives as three events, and treating each as "the" assistant
+   * message kept only the last block: an ink-tool fence in the first block was
+   * never extracted, so the call silently never ran (Myra, 2026-09-02 9 PM —
+   * the list_emails that "vanished"; #569). Blocks of the same message
+   * accumulate here; a new message id starts over.
+   */
   private lastAssistantText = '';
+  private lastAssistantMessageId: string | undefined;
 
   push(chunk: string): BackendTurnEvent[] {
     this.buffer += chunk;
@@ -144,12 +156,12 @@ export class ClaudeStreamParser implements BackendStreamParser {
       case 'assistant': {
         const content = ev.message?.content;
         if (!Array.isArray(content)) break;
-        // ONE message-level text event per assistant message: all text blocks
-        // concatenated, matching exactly what final-response extraction uses
-        // (lastAssistantText) — so consumers can dedupe streamed output
-        // against the final text by simple equality. Emitted before the
-        // message's tool-use events (text blocks precede tool_use in
-        // practice, so display order is preserved).
+        // ONE text event per assistant stream event: its text blocks
+        // concatenated, emitted before the event's tool-use events (text
+        // blocks precede tool_use in practice, so display order is preserved).
+        // A later text block of the SAME message (after a thinking block) is
+        // flagged `continuesMessage` so consumers deduping against the final
+        // text append rather than replace.
         let text = '';
         const toolUses: BackendTurnEvent[] = [];
         for (const block of content) {
@@ -160,8 +172,14 @@ export class ClaudeStreamParser implements BackendStreamParser {
           }
         }
         if (text) {
-          out.push({ kind: 'text', text });
-          this.lastAssistantText = text;
+          const messageId = typeof ev.message?.id === 'string' ? ev.message.id : undefined;
+          const continuesMessage =
+            messageId !== undefined &&
+            messageId === this.lastAssistantMessageId &&
+            this.lastAssistantText.length > 0;
+          out.push({ kind: 'text', text, ...(continuesMessage ? { continuesMessage } : {}) });
+          this.lastAssistantText = continuesMessage ? this.lastAssistantText + text : text;
+          this.lastAssistantMessageId = messageId;
         }
         out.push(...toolUses);
         break;
@@ -186,10 +204,28 @@ export class ClaudeStreamParser implements BackendStreamParser {
           Array.isArray(ev.errors) &&
           ev.errors.some((e) => typeof e === 'string' && e.includes(NO_SESSION_MARKER));
         // `result` text is usually empty in stream-json; the real answer is the
-        // last assistant text. Prefer a non-empty `result`, else fall back.
+        // last assistant text. Prefer a non-empty `result`, else fall back —
+        // EXCEPT when a SUCCESSFUL `result` is only the final text block of
+        // the assembled multi-block message (Claude Code reports per block):
+        // the blocks before it must not be discarded, which is where the tool
+        // fence lives.
         const resultText = typeof ev.result === 'string' && ev.result ? ev.result : undefined;
         const modelUsage = toModelUsage((ev as Record<string, unknown>).modelUsage);
-        const text = resultText ?? (this.lastAssistantText || undefined);
+        const assembled = this.lastAssistantText || undefined;
+        // Any error subtype's result wins unconditionally: that text is the
+        // diagnosis. And only a SUFFIX qualifies as the partial shape — an
+        // `includes` test let assistant prose that merely mentioned the
+        // result's words replace it (Lumen, PR #575 round 1).
+        const resultIsError = typeof ev.subtype === 'string' && ev.subtype !== 'success';
+        const text =
+          resultText === undefined
+            ? assembled
+            : !resultIsError &&
+                assembled !== undefined &&
+                assembled.length > resultText.length &&
+                assembled.endsWith(resultText)
+              ? assembled
+              : resultText;
         out.push({
           kind: 'result',
           text,

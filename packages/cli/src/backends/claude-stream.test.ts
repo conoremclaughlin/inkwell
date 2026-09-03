@@ -357,3 +357,84 @@ describe('modelUsage from a real captured result line', () => {
     expect(result!.usage!.modelUsage).toBeUndefined();
   });
 });
+
+describe('one assistant message streamed as several events (#569)', () => {
+  // Claude Code emits one `assistant` event per content block; every block of
+  // one API response shares `message.id`. A text → thinking → text response is
+  // three events. Keeping only the last one lost the ink-tool fence in the
+  // first (Myra, 2026-09-02 9 PM: the list_emails that never ran).
+  const block = (id: string, blocks: unknown[]) => ({
+    type: 'assistant',
+    message: { id, content: blocks },
+  });
+
+  it('REGRESSION: result text is the concatenation of every text block of the message', () => {
+    const p = new ClaudeStreamParser();
+    const evs = [
+      ...p.push(
+        line(
+          block('msg_1', [
+            { type: 'text', text: '```ink-tool\n{"tool":"list_emails","args":{}}\n```\n' },
+          ])
+        )
+      ),
+      ...p.push(line(block('msg_1', [{ type: 'thinking', thinking: 'hm' }]))),
+      ...p.push(line(block('msg_1', [{ type: 'text', text: 'This changes things.' }]))),
+    ];
+    expect(evs).toEqual([
+      { kind: 'text', text: '```ink-tool\n{"tool":"list_emails","args":{}}\n```\n' },
+      { kind: 'text', text: 'This changes things.', continuesMessage: true },
+    ]);
+    const [r] = p.push(line({ type: 'result', result: '' }));
+    expect(r?.kind === 'result' && r.text).toBe(
+      '```ink-tool\n{"tool":"list_emails","args":{}}\n```\nThis changes things.'
+    );
+  });
+
+  it('a `result` that is only the last block does not discard the blocks before it', () => {
+    const p = new ClaudeStreamParser();
+    p.push(line(block('msg_1', [{ type: 'text', text: 'first block. ' }])));
+    p.push(line(block('msg_1', [{ type: 'text', text: 'last block.' }])));
+    const [r] = p.push(line({ type: 'result', result: 'last block.' }));
+    expect(r?.kind === 'result' && r.text).toBe('first block. last block.');
+  });
+
+  it('an error result wins unconditionally, even when the assistant text ends with it (Lumen P2)', () => {
+    const p = new ClaudeStreamParser();
+    p.push(line(block('msg_1', [{ type: 'text', text: 'Intro: ' }])));
+    p.push(line(block('msg_1', [{ type: 'text', text: 'Rate limited' }])));
+    const [r] = p.push(
+      line({ type: 'result', subtype: 'error_during_execution', result: 'Rate limited' })
+    );
+    expect(r?.kind === 'result' && r.text).toBe('Rate limited');
+  });
+
+  it('a successful result the assistant text merely CONTAINS is not the partial shape — result wins', () => {
+    const p = new ClaudeStreamParser();
+    p.push(line(block('msg_1', [{ type: 'text', text: 'Intro: Rate limited; retrying.' }])));
+    const [r] = p.push(line({ type: 'result', subtype: 'success', result: 'Rate limited' }));
+    expect(r?.kind === 'result' && r.text).toBe('Rate limited');
+  });
+
+  it('a new message id starts over — the text after a native tool round is the answer', () => {
+    const p = new ClaudeStreamParser();
+    p.push(line(block('msg_1', [{ type: 'text', text: 'Checking.' }])));
+    p.push(line(block('msg_1', [{ type: 'tool_use', id: 't1', name: 'x', input: {} }])));
+    p.push(line(userToolResult));
+    const evs = p.push(line(block('msg_2', [{ type: 'text', text: 'Done.' }])));
+    expect(evs).toEqual([{ kind: 'text', text: 'Done.' }]);
+    const [r] = p.push(line({ type: 'result', result: '' }));
+    expect(r?.kind === 'result' && r.text).toBe('Done.');
+  });
+
+  it('events without a message id never chain', () => {
+    const p = new ClaudeStreamParser();
+    p.push(line({ type: 'assistant', message: { content: [{ type: 'text', text: 'a' }] } }));
+    const evs = p.push(
+      line({ type: 'assistant', message: { content: [{ type: 'text', text: 'b' }] } })
+    );
+    expect(evs).toEqual([{ kind: 'text', text: 'b' }]);
+    const [r] = p.push(line({ type: 'result', result: '' }));
+    expect(r?.kind === 'result' && r.text).toBe('b');
+  });
+});

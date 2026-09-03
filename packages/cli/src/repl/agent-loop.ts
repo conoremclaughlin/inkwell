@@ -16,6 +16,13 @@
  * emit fenced ```ink-tool blocks and parses them back out.
  */
 
+import {
+  fenceAfterLine,
+  isImitationHeaderLine,
+  isImitationResultLine,
+  type OpenFence,
+} from './imitation-grammar.js';
+
 export interface LocalToolCall {
   tool: string;
   args: Record<string, unknown>;
@@ -236,7 +243,48 @@ export interface AgentLoopPorts {
   /** Parent-only observability (Ctrl+T inspector). Clones omit this entirely. */
   observe?: {
     recordToolCall(call: ToolResultRecord): void;
+    /**
+     * The model broke the text-tool protocol and the loop repaired the turn.
+     * The host persists the whole record (the discarded text included) — a
+     * 200-char preview was enough to *detect* the 2026-09-02 fabrication but
+     * not to prove what the agent had acted on.
+     */
+    recordProtocolViolation?(violation: ProtocolViolation): void;
   };
+}
+
+/**
+ * The model wrote the runtime's part of the conversation.
+ *
+ * Under text-form tool calling nothing structural stops generation at the
+ * fence — no stop_reason, no role boundary. A model deep in a long session can
+ * keep going and produce the frame the runtime would have sent next
+ * (`[Tool results from previous turn]` + `Tool x (executed): {...}` +
+ * "Continue your response…"), with results interpolated from every real one it
+ * has seen, then act on them. Myra did exactly this on 2026-09-02 — four
+ * "vanished" emails that never existed (#569). Native tool use cannot fail this
+ * way; LangChain-era ReAct did, and fixed it with stop sequences. The stream
+ * parser cannot stop the model mid-generation, so the loop discards the
+ * imitation instead and tells the model what happened.
+ */
+export interface ProtocolViolation {
+  kind: 'imitated-tool-results';
+  iteration: number;
+  /** `relay` when it appeared in the final relay's output, which is never extracted anyway. */
+  phase: 'turn' | 'relay';
+  /** The line that opened the imitation, as written. */
+  header: string;
+  /** Everything from the frame on. Discarded, never executed, never displayed. */
+  discarded: string;
+  /**
+   * True once a corrective runtime message was sent AFTER this violation, so
+   * the model has been told the results it wrote were not real. False means
+   * the provider-native session still holds the fabrication with nothing said
+   * about it — a host must not resume that session (the next heartbeat would
+   * inherit the fake evidence as history); roll it and reseed from the ledger,
+   * which only ever held the sanitized text.
+   */
+  corrected: boolean;
 }
 
 /** Raw result of one backend turn, as the host reports it back to the loop. */
@@ -282,7 +330,8 @@ export function buildContinuationBody(
     reached: results.length,
     dropped: [],
     unmatched: 0,
-  }
+  },
+  opts: { imitatedToolResults?: boolean } = {}
 ): string {
   const toolResultsSummary = results
     .map((r) => {
@@ -354,7 +403,34 @@ export function buildContinuationBody(
           `At most ${MAX_TOOL_CALLS_PER_ITERATION} calls run per iteration, in the order you emit them. ` +
           `Re-emit the ones you still need — they did not happen. Do not report them as done.`;
 
-  return `[Tool results from previous turn]\n${toolResultsSummary}${formatCorrection}${refusalNote}${droppedNote}\n\nContinue your response based on these tool results. If you need more tools, emit ink-tool blocks. Otherwise, provide your final answer.`;
+  // The model wrote a results frame of its own after its fences. Say so HERE,
+  // alongside the real results, so the correction and the evidence that the
+  // runtime actually answered arrive together — the same reasoning as the
+  // format note above. Without it the model has no way to tell its fabricated
+  // results from these.
+  const protocolNote = opts.imitatedToolResults ? `\n\n${IMITATED_RESULTS_PROTOCOL_NOTE}` : '';
+
+  return `[Tool results from previous turn]\n${toolResultsSummary}${formatCorrection}${refusalNote}${droppedNote}${protocolNote}\n\nContinue your response based on these tool results. If you need more tools, emit ink-tool blocks. Otherwise, provide your final answer.`;
+}
+
+const IMITATED_RESULTS_PROTOCOL_NOTE =
+  'PROTOCOL NOTE: your previous response continued past its ink-tool block(s) and wrote a "[Tool results from previous turn]" section itself. Only the ink runtime writes tool results. Everything you wrote from that line on was discarded — not executed, not shown to anyone — and the results above are the only real ones. After emitting ink-tool blocks, END your response and wait for this message.';
+
+/**
+ * The correction fed back when the model wrote a results frame with NO
+ * ink-tool block before it: nothing ran, so there are no real results to
+ * relay, only the fact that the ones it wrote are not real.
+ */
+export function buildProtocolCorrectionBody(opts: { final?: boolean } = {}): string {
+  return (
+    '[Runtime protocol correction]\n' +
+    'Your previous response contained a "[Tool results from previous turn]" section that you wrote yourself. ' +
+    'The results you wrote are not real: only the ink runtime writes tool results, in a message that follows your response, ' +
+    'and everything from that line on was discarded — not executed, not shown to anyone.\n\n' +
+    (opts.final
+      ? 'The tool loop has ended; no further tool calls will be executed this turn. Provide your final answer without the results you wrote.'
+      : 'If you need a tool, emit the ink-tool block and END your response. Otherwise, provide your final answer.')
+  );
 }
 
 /**
@@ -372,7 +448,8 @@ export function buildFinalRelayBody(
     reached: results.length,
     dropped: [],
     unmatched: 0,
-  }
+  },
+  opts: { imitatedToolResults?: boolean } = {}
 ): string {
   const toolResultsSummary = results
     .map((r) => {
@@ -398,8 +475,9 @@ export function buildFinalRelayBody(
             .join(', ')}. They had no effect. Say so rather than reporting them as done.`;
 
   const summary = results.length > 0 ? toolResultsSummary : '(no tool results from this iteration)';
+  const protocolNote = opts.imitatedToolResults ? `\n\n${IMITATED_RESULTS_PROTOCOL_NOTE}` : '';
   return (
-    `[Tool results from previous turn — FINAL]\n${summary}${droppedNote}\n\n` +
+    `[Tool results from previous turn — FINAL]\n${summary}${droppedNote}${protocolNote}\n\n` +
     'The tool loop has ended; no further tool calls will be executed this turn. ' +
     'Review these results and provide your final answer. If a call above failed, ' +
     'say so plainly instead of reporting the work as done.'
@@ -411,6 +489,12 @@ export interface AgentLoopInput {
   prompt: string;
   /** Local tool routing off (`backend`) means the loop never extracts calls. */
   toolRouting: 'backend' | 'local';
+  /**
+   * Tool iterations allowed. Every cap check follows the first request, so a
+   * value below one behaves as one: the model's first request always runs.
+   * The final relay and the protocol-correction rounds are not iterations
+   * and are never withheld by this — they answer what already happened.
+   */
   maxIterations?: number;
   signal?: AbortSignal;
   /**
@@ -440,8 +524,82 @@ export async function runAgentLoop(
 ): Promise<AgentLoopResult> {
   const maxIterations = input.maxIterations ?? DEFAULT_MAX_TOOL_LOOP_ITERATIONS;
   const allToolResults: ToolResultRecord[] = [];
+  const protocolViolations: ProtocolViolation[] = [];
+  // Violations the model has not yet been told about. Every corrective body
+  // the loop sends answers the ones pending at that moment — and they count
+  // as corrected only once the backend has ACCEPTED that body: a correction
+  // built and never delivered corrects nothing, and reporting it would leave
+  // the host resuming a session that still holds the fabrication unremarked
+  // (Lumen, PR #575 round 2). Whatever is left when the loop ends gets one
+  // final correction; if even that fails or comes back imitated, the host
+  // learns it (`corrected: false`) and rolls the native session. Detection
+  // alone was not enough (round 1): only the ordinary continuation spoke up,
+  // so a screened rejection, an all-refused or terminal-signal stop, or the
+  // final relay left the fabrication in the provider's transcript.
+  let awaitingCorrection: ProtocolViolation[] = [];
+  let inFlightCorrection: ProtocolViolation[] = [];
+  /** Build the body that answers everything pending; `settleCorrection` decides whether it counted. */
+  const correcting = <T>(build: (imitated: boolean) => T): T => {
+    inFlightCorrection = awaitingCorrection;
+    awaitingCorrection = [];
+    return build(inFlightCorrection.length > 0);
+  };
+  const settleCorrection = (delivered: BackendTurnOutcome): void => {
+    if (delivered.success) {
+      for (const v of inFlightCorrection) v.corrected = true;
+    } else {
+      awaitingCorrection.unshift(...inFlightCorrection);
+    }
+    inFlightCorrection = [];
+  };
 
   let iteration = 0;
+
+  // Cut the model's output at the first imitated results frame, before
+  // anything is extracted from it. Fences BEFORE the frame are the model's
+  // real requests and still run; everything from the frame on is fabricated
+  // evidence plus whatever the model decided in light of it, and none of that
+  // may execute or reach a reader.
+  const noteImitation = (
+    text: string,
+    phase: ProtocolViolation['phase']
+  ): ImitatedToolResultsFrame | null => {
+    if (input.toolRouting !== 'local') return null;
+    const imitation = findImitatedToolResults(text);
+    if (!imitation) return null;
+    const violation: ProtocolViolation = {
+      kind: 'imitated-tool-results',
+      iteration,
+      phase,
+      header: imitation.header,
+      discarded: imitation.discarded,
+      corrected: false,
+    };
+    protocolViolations.push(violation);
+    awaitingCorrection.push(violation);
+    ports.observe?.recordProtocolViolation?.(violation);
+    ports.ui.printEvent(
+      `  ⚠ model wrote its own tool results — ${imitation.discarded.length} chars discarded, not executed`
+    );
+    return imitation;
+  };
+  const discardImitatedResults = (
+    text: string,
+    phase: ProtocolViolation['phase']
+  ): { text: string; imitation: ImitatedToolResultsFrame | null } => {
+    const imitation = noteImitation(text, phase);
+    return imitation
+      ? { text: text.slice(0, imitation.index).trimEnd(), imitation }
+      : { text, imitation: null };
+  };
+  // A FAILED spawn can still have produced assistant text, and that text can
+  // still be an imitation. The loop keeps the last successful text as its
+  // answer, so nothing is cut here — but the violation is recorded, and
+  // since no correction follows a failure it stays uncorrected: the host
+  // fails closed and rolls the session.
+  const noteImitationInFailedOutcome = (failed: BackendTurnOutcome): void => {
+    if (failed.responseText) noteImitation(failed.responseText, 'turn');
+  };
 
   // Fail fast. A turn cancelled before it started must not spend a backend
   // invocation proving it — the opening spawn is the single most expensive
@@ -454,6 +612,7 @@ export async function runAgentLoop(
       iterations: 0,
       success: false,
       stopReason: 'aborted',
+      protocolViolations: [],
     };
   }
 
@@ -466,6 +625,16 @@ export async function runAgentLoop(
   let responseText = resolveResponseText(outcome);
   let calls: LocalToolCall[] = [];
   let stopReason: AgentLoopStopReason = 'no-tools';
+  // A failed opening spawn is a failed turn, whatever text it left behind:
+  // nothing in it is screened, executed, or corrected — a tool it asked for
+  // must not run on the say-so of a process that died, and a correction it
+  // earned would only mark the session clean. Any imitation in that text is
+  // recorded, uncorrected, so the host fails closed and rolls the session
+  // (Lumen, PR #575 round 3). The text itself is still cut for display.
+  if (!outcome.success) {
+    responseText = discardImitatedResults(responseText, 'turn').text;
+    stopReason = 'backend-failure';
+  }
   // Set only where an EXECUTED iteration is itself what reaches the cap.
   // Tracking "the last results seen" as ambient state relays the wrong thing:
   // a screen rejection at the cap would replay the previous iteration's
@@ -473,8 +642,10 @@ export async function runAgentLoop(
   // The one payload the FINAL relay may send. Null means nothing is stranded.
   let stranded: StrandedIteration | null = null;
 
-  for (;;) {
-    responseText = resolveResponseText(outcome);
+  while (outcome.success) {
+    const sanitized = discardImitatedResults(resolveResponseText(outcome), 'turn');
+    responseText = sanitized.text;
+    const imitation = sanitized.imitation;
 
     const extracted =
       input.toolRouting === 'local' ? extractLocalToolCalls(responseText) : ([] as LocalToolCall[]);
@@ -521,15 +692,24 @@ export async function runAgentLoop(
 
       const stopWaitingAfterRejection = ports.ui.startWaiting();
       try {
-        outcome = await ports.backend.runTurn(buildContinuationBody([record], extracted), {
-          iteration,
-          isContinuation: true,
-          signal: input.signal,
-        });
+        outcome = await ports.backend.runTurn(
+          correcting((imitated) =>
+            buildContinuationBody([record], extracted, undefined, {
+              imitatedToolResults: imitated,
+            })
+          ),
+          {
+            iteration,
+            isContinuation: true,
+            signal: input.signal,
+          }
+        );
       } finally {
         stopWaitingAfterRejection();
       }
+      settleCorrection(outcome);
       if (!outcome.success) {
+        noteImitationInFailedOutcome(outcome);
         stopReason = 'backend-failure';
         break;
       }
@@ -555,6 +735,57 @@ export async function runAgentLoop(
     }
 
     if (calls.length === 0) {
+      // A results frame with no request before it: the model skipped straight
+      // to inventing the answer. Left alone, the truncated preamble would ship
+      // as the reply and the model would carry on believing what it wrote. One
+      // correction round, counted as an iteration so it cannot spin.
+      //
+      // "No request" is judged on what the model EMITTED, not on what the
+      // screen selected: `calls` is empty whenever the screen selects nothing,
+      // including from real requests. Treating that as "no preceding block"
+      // sent the correction alone, never named the dropped calls, and recorded
+      // a violation that was factually wrong (Lumen, PR #575 round 7). With
+      // requests emitted, this falls through to the stranded path below, and
+      // the final relay carries both the NOT EXECUTED evidence and the
+      // protocol note.
+      if (imitation && selection.emitted === 0 && !input.signal?.aborted) {
+        iteration++;
+        const record: ToolResultRecord = {
+          tool: 'protocol',
+          result: 'imitated tool results with no preceding ink-tool block; discarded',
+          status: 'rejected',
+        };
+        allToolResults.push(record);
+        // The charge lands BEFORE the correction's response can run anything
+        // — same shape as a screened rejection at the cap. With the budget
+        // gone, the final correction below still tells the model; its output
+        // is never extracted.
+        if (iteration >= maxIterations) {
+          stopReason = 'iteration-cap';
+          ports.ui.printLine(`(tool loop limit reached — ${maxIterations} iterations)`);
+          break;
+        }
+        const stopWaitingAfterCorrection = ports.ui.startWaiting();
+        try {
+          outcome = await ports.backend.runTurn(
+            correcting(() => buildProtocolCorrectionBody()),
+            {
+              iteration,
+              isContinuation: true,
+              signal: input.signal,
+            }
+          );
+        } finally {
+          stopWaitingAfterCorrection();
+        }
+        settleCorrection(outcome);
+        if (!outcome.success) {
+          noteImitationInFailedOutcome(outcome);
+          stopReason = 'backend-failure';
+          break;
+        }
+        continue;
+      }
       stopReason = 'no-tools';
       // A screen may ACCEPT an iteration and then select nothing from it
       // (Lumen, PR #573 round 4). The effect is identical to rejecting it whole
@@ -651,14 +882,20 @@ export async function runAgentLoop(
 
     const stopWaiting = ports.ui.startWaiting();
     try {
-      outcome = await ports.backend.runTurn(buildContinuationBody(results, calls, selection), {
-        iteration,
-        isContinuation: true,
-        signal: input.signal,
-      });
+      outcome = await ports.backend.runTurn(
+        correcting((imitated) =>
+          buildContinuationBody(results, calls, selection, { imitatedToolResults: imitated })
+        ),
+        {
+          iteration,
+          isContinuation: true,
+          signal: input.signal,
+        }
+      );
     } finally {
       stopWaiting();
     }
+    settleCorrection(outcome);
 
     if (!outcome.success) {
       // Deliberately do NOT re-resolve responseText here. It still holds the
@@ -666,6 +903,7 @@ export async function runAgentLoop(
       // writes to the ledger. Overwriting it with the failed spawn's stderr
       // would publish backend diagnostics as the assistant's answer — and the
       // host already reports stderr separately from `lastRunResult`.
+      noteImitationInFailedOutcome(outcome);
       stopReason = 'backend-failure';
       break;
     }
@@ -718,28 +956,59 @@ export async function runAgentLoop(
       stranded.selection.unmatched > 0 ||
       stopReason === 'iteration-cap' ||
       hasUnseenFailure(stranded.results));
-  if (relayWorthy && outcome.success && !input.signal?.aborted) {
-    ports.ui.printEvent('  ⋯ relaying final tool results (no further execution)…');
+  //
+  // A protocol break the loop stopped on before any continuation could answer
+  // it — a fabricated frame beside a terminal signal, an all-refused
+  // iteration, the cap — is relayed the same way, with or without stranded
+  // results: the model must hear that what it wrote was not real BEFORE its
+  // native session is resumed for the next turn. The relay's own output can
+  // imitate too; it gets one more correction, and if that also comes back
+  // imitated the violation stays `corrected: false` for the host to act on.
+  const runFinalRound = async (body: string): Promise<boolean> => {
     const stopRelayWaiting = ports.ui.startWaiting();
     let relay: BackendTurnOutcome;
     try {
-      relay = await ports.backend.runTurn(
-        buildFinalRelayBody(stranded!.results, stranded!.selection),
-        {
-          iteration,
-          isContinuation: true,
-          signal: input.signal,
-        }
-      );
+      relay = await ports.backend.runTurn(body, {
+        iteration,
+        isContinuation: true,
+        signal: input.signal,
+      });
     } finally {
       stopRelayWaiting();
     }
+    settleCorrection(relay);
     if (relay.success) {
       outcome = relay;
-      responseText = resolveResponseText(relay);
+      // Nothing in the relay is extracted, but its text is what gets displayed
+      // and written to the ledger — an imitation there is still fabricated
+      // evidence and still must not reach a reader.
+      responseText = discardImitatedResults(resolveResponseText(relay), 'relay').text;
+    } else {
+      // A failed relay keeps the last successful text — the results are still
+      // in allToolResults for the host's own reporting.
+      noteImitationInFailedOutcome(relay);
     }
-    // A failed relay keeps the last successful text — the results are still
-    // in allToolResults for the host's own reporting.
+    return relay.success;
+  };
+  if ((relayWorthy || awaitingCorrection.length > 0) && outcome.success && !input.signal?.aborted) {
+    ports.ui.printEvent(
+      relayWorthy
+        ? '  ⋯ relaying final tool results (no further execution)…'
+        : '  ⋯ correcting the protocol break (no further execution)…'
+    );
+    const delivered = await runFinalRound(
+      correcting((imitated) =>
+        relayWorthy
+          ? buildFinalRelayBody(stranded!.results, stranded!.selection, {
+              imitatedToolResults: imitated,
+            })
+          : buildProtocolCorrectionBody({ final: true })
+      )
+    );
+    if (delivered && awaitingCorrection.length > 0 && !input.signal?.aborted) {
+      ports.ui.printEvent('  ⋯ correcting the protocol break again (no further execution)…');
+      await runFinalRound(correcting(() => buildProtocolCorrectionBody({ final: true })));
+    }
   }
 
   // An aborted turn (SIGINT kills the child) exits >=128 and has no usable text.
@@ -780,11 +1049,15 @@ export async function runAgentLoop(
     // about whether the turn achieved anything.
     success: outcome.success && !aborted,
     stopReason: finalStopReason,
+    protocolViolations,
   };
 }
 
 export interface AgentLoopResult {
-  /** Raw backend text of the final turn, tool blocks included. */
+  /**
+   * Backend text of the final turn, tool blocks included — minus any imitated
+   * results frame, which lives in `protocolViolations` instead.
+   */
   responseText: string;
   /** Display text with tool blocks stripped — what a clone hands back as its summary. */
   assistantDisplayText: string;
@@ -792,6 +1065,8 @@ export interface AgentLoopResult {
   iterations: number;
   success: boolean;
   stopReason: AgentLoopStopReason;
+  /** Every protocol break the loop repaired this turn, in order. Empty on a clean turn. */
+  protocolViolations: ProtocolViolation[];
 }
 
 /**
@@ -831,6 +1106,61 @@ interface InkToolBlock {
   end: number;
   /** The payload between the fences (the JSON value when scanned). */
   payload: string;
+}
+
+export interface ImitatedToolResultsFrame {
+  /** The line that opened the imitation, as written. */
+  header: string;
+  /** Offset in the response text where the imitation begins. */
+  index: number;
+  /** Everything from the frame on. */
+  discarded: string;
+}
+
+// The frame's grammar — whole-line and could-still-become — lives in
+// imitation-grammar.ts, shared with the live guards so the two cannot drift.
+export { isPotentialImitationPrefix } from './imitation-grammar.js';
+
+/**
+ * Find the first place the model starts writing tool results in the runtime's
+ * own frame (see ProtocolViolation). Line-anchored, and blind inside fenced
+ * code (backtick or tilde, any length) — an ink-tool payload or a quoted code
+ * block may legitimately contain the header; the imitation that matters is
+ * the one written as if it were the next message.
+ */
+export function findImitatedToolResults(responseText: string): ImitatedToolResultsFrame | null {
+  const inkBlocks = findInkToolBlocks(responseText);
+  // The open fence, if any. CommonMark closes a fence only with the same
+  // character, at least as long, and nothing but whitespace after it — a ```
+  // in a ```` block, a ~~~ under a ```, or ```not-a-close inside an open
+  // fence, is content (Lumen, PR #575 rounds 1 and 4). One rule, shared with
+  // the paragraph buffer (imitation-grammar.ts).
+  let openFence: OpenFence | null = null;
+  let lineStart = 0;
+  while (lineStart <= responseText.length) {
+    const nl = responseText.indexOf('\n', lineStart);
+    const lineEnd = nl === -1 ? responseText.length : nl;
+    const line = responseText.slice(lineStart, lineEnd);
+    const insideInkBlock = inkBlocks.some((b) => lineStart >= b.start && lineStart < b.end);
+    if (!insideInkBlock) {
+      const next = fenceAfterLine(openFence, line);
+      if (next !== openFence) {
+        openFence = next;
+      } else if (
+        openFence === null &&
+        (isImitationHeaderLine(line) || isImitationResultLine(line))
+      ) {
+        return {
+          header: line.trim(),
+          index: lineStart,
+          discarded: responseText.slice(lineStart),
+        };
+      }
+    }
+    if (nl === -1) break;
+    lineStart = nl + 1;
+  }
+  return null;
 }
 
 /**
