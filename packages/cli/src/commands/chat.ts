@@ -69,6 +69,7 @@ import {
   estimateTokens,
   type LedgerReplayMeta,
   type LedgerRole,
+  DEFAULT_CHARS_PER_TOKEN,
 } from '../repl/context-ledger.js';
 import {
   resolveModelContextWindow as resolveBackendTokenWindow,
@@ -170,6 +171,7 @@ import {
   type BackendTurnOutcome,
   type LocalToolCall,
   type ToolResultRecord,
+  MAX_RELAY_CHARS,
 } from '../repl/agent-loop.js';
 // Re-exported for callers (and tests) that have always imported these from
 // chat.js. The implementations moved to ../repl/agent-loop.js so the turn
@@ -2775,6 +2777,32 @@ function applyBudgetForWindow(runtime: ChatRuntime, window: number): void {
       to: runtime.maxContextTokens,
     });
   }
+}
+
+/** Share of the remaining window one relay may spend; the rest is the model's reply and the next turn. */
+export const RELAY_HEADROOM_SHARE = 0.5;
+/** Never starve a relay entirely — a stub per result still names the tools and statuses. */
+export const MIN_RELAY_BUDGET_CHARS = 8_000;
+
+/**
+ * How many characters of tool results the next relay may carry, from the
+ * window's live headroom: what the budget leaves after the identity context
+ * and the ledger, times RELAY_HEADROOM_SHARE, in characters — clamped between
+ * MIN_RELAY_BUDGET_CHARS and MAX_RELAY_CHARS. A static ceiling was only safe
+ * while the window had that much room; after the pre-turn compaction check a
+ * 128K/200K window may not (Lumen, PR #576 round 2).
+ */
+export function relayBudgetChars(
+  runtime: Pick<ChatRuntime, 'maxContextTokens' | 'bootstrapContext'>,
+  ledger: Pick<ContextLedger, 'totalTokens'>
+): number {
+  const bootstrapReserve = runtime.bootstrapContext ? estimateTokens(runtime.bootstrapContext) : 0;
+  const remainingTokens = Math.max(
+    0,
+    runtime.maxContextTokens - bootstrapReserve - ledger.totalTokens()
+  );
+  const chars = Math.floor(remainingTokens * DEFAULT_CHARS_PER_TOKEN * RELAY_HEADROOM_SHARE);
+  return Math.min(MAX_RELAY_CHARS, Math.max(MIN_RELAY_BUDGET_CHARS, chars));
 }
 
 export function buildPromptEnvelope(
@@ -6439,7 +6467,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
     let loopResult: AgentLoopResult;
     try {
       loopResult = await runAgentLoop(
-        { prompt, toolRouting: runtime.toolRouting, signal: turnAbort.signal },
+        {
+          prompt,
+          toolRouting: runtime.toolRouting,
+          signal: turnAbort.signal,
+          relayBudgetChars: () => relayBudgetChars(runtime, ledger),
+        },
         {
           ui: {
             printLine: (text) => printLine(chalk.dim(text)),

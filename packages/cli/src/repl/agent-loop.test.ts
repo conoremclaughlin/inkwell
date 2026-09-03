@@ -14,8 +14,6 @@ import {
   type AgentLoopPorts,
   type BackendTurnOutcome,
   MAX_RELAY_CHARS,
-  MAX_TOOL_CALLS_PER_ITERATION,
-  MIN_RELAY_CHARS_PER_RESULT,
   type LocalToolCall,
   type ProtocolViolation,
   type ToolResultRecord,
@@ -1453,6 +1451,31 @@ describe('a failed opening spawn is a failed turn (Lumen, round 3)', () => {
   });
 });
 
+describe('runAgentLoop — the relay budget is asked of the host per iteration (Lumen, PR #576)', () => {
+  it('shapes the continuation to the budget the host reports', async () => {
+    let asked = 0;
+    const harness = makePorts(
+      [outcome({ responseText: inkTool('list_context') }), outcome({ responseText: 'done' })],
+      (calls) =>
+        calls.map((c) => ({ tool: c.tool, result: 'z'.repeat(100_000), status: 'executed' }))
+    );
+    await runAgentLoop(
+      {
+        prompt: 'go',
+        toolRouting: 'local',
+        relayBudgetChars: () => {
+          asked += 1;
+          return 9_000;
+        },
+      },
+      harness.ports
+    );
+    expect(asked).toBe(1);
+    expect(harness.prompts[1].body.length).toBeLessThanOrEqual(9_000 + 800);
+    expect(harness.prompts[1].body).toContain('[ink: result truncated');
+  });
+});
+
 describe('buildContinuationBody — protocol note', () => {
   it('names the imitation only when asked', () => {
     const results: ToolResultRecord[] = [{ tool: 'x', result: 'ok', status: 'executed' }];
@@ -2091,18 +2114,32 @@ describe('relay size ceiling (#571; aggregate — Lumen, PR #576)', () => {
     expect(body.match(/\[ink: result truncated/g)).toHaveLength(results.length);
   });
 
-  it('every result keeps a readable slice however many there are', () => {
-    const results = Array.from({ length: 20 }, (_, i) => ({
+  it('REGRESSION (Lumen, round 2): the ceiling holds however many results there are', () => {
+    // A per-result floor let twelve results compose a message twice the
+    // advertised ceiling. Now the budget is the invariant; slices shrink.
+    for (const n of [1, 5, 12, 50]) {
+      const results = Array.from({ length: n }, (_, i) => ({
+        tool: `t${i}`,
+        result: huge(MAX_RELAY_CHARS),
+        status: 'executed',
+      }));
+      const body = buildContinuationBody(results, []);
+      expect(body.length, `${n} results`).toBeLessThanOrEqual(MAX_RELAY_CHARS + 400);
+      for (let i = 0; i < n; i++) expect(body).toContain(`Tool t${i} (executed):`);
+    }
+  });
+
+  it('a caller-supplied budget bounds the message and reaches the final relay too', () => {
+    const results = Array.from({ length: 3 }, (_, i) => ({
       tool: `t${i}`,
-      result: huge(MAX_RELAY_CHARS),
+      result: huge(50_000),
       status: 'executed',
     }));
-    const body = buildContinuationBody(results, []);
-    // The floor binds here, so the message may exceed the nominal budget —
-    // deliberately: a stub per result would be worse than a long message.
-    for (let i = 0; i < results.length; i++) {
-      expect(body).toContain(`Tool t${i} (executed): ${huge(MIN_RELAY_CHARS_PER_RESULT)}`);
-    }
+    const cont = buildContinuationBody(results, [], undefined, { budgetChars: 12_000 });
+    expect(cont.length).toBeLessThanOrEqual(12_000 + 400);
+    const relay = buildFinalRelayBody(results, undefined, { budgetChars: 12_000 });
+    expect(relay.length).toBeLessThanOrEqual(12_000 + 600);
+    for (let i = 0; i < 3; i++) expect(cont).toContain(`Tool t${i} (executed):`);
   });
 
   it('applies the same aggregate ceiling to the final relay', () => {

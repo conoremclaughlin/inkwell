@@ -334,17 +334,30 @@ export function resolveResponseText(outcome: BackendTurnOutcome): string {
 export const MAX_RELAY_CHARS = 200_000;
 
 /**
- * The smallest slice any one result is guaranteed, however many there are.
- * At the per-iteration cap of five calls the share is 40K each; this floor
- * only binds if that cap ever rises, and it keeps a tenth result readable
- * rather than reducing it to a stub.
+ * Per-result overhead the renderer reserves out of the budget: the header
+ * line and, when a result is cut, the truncation note. Reserved up front so
+ * the ceiling holds however many results share it — a floor per result
+ * (round 1) let twelve results compose a message twice the ceiling while the
+ * constant advertised it (Lumen, PR #576 round 2).
  */
-export const MIN_RELAY_CHARS_PER_RESULT = 20_000;
+const RELAY_RESULT_OVERHEAD_CHARS = 320;
 
-function renderToolResults(results: ReadonlyArray<ToolResultRecord>): string {
+/**
+ * Render an iteration's results into at most `budgetChars` characters. The
+ * budget is divided evenly; a result that fits keeps its slack for nobody —
+ * simplicity over packing — and a result that does not is cut with a note
+ * naming its full size. With many results the slice per result shrinks to a
+ * stub; the header still names the tool and the status, and the whole
+ * payload is in the transcript. The invariant is the ceiling, not the slice.
+ */
+function renderToolResults(
+  results: ReadonlyArray<ToolResultRecord>,
+  budgetChars: number = MAX_RELAY_CHARS
+): string {
+  const n = Math.max(1, results.length);
   const share = Math.max(
-    MIN_RELAY_CHARS_PER_RESULT,
-    Math.floor(MAX_RELAY_CHARS / Math.max(1, results.length))
+    0,
+    Math.floor((Math.max(0, budgetChars) - n * RELAY_RESULT_OVERHEAD_CHARS) / n)
   );
   return results.map((r) => renderToolResult(r, share)).join('\n\n');
 }
@@ -374,9 +387,9 @@ export function buildContinuationBody(
     dropped: [],
     unmatched: 0,
   },
-  opts: { imitatedToolResults?: boolean } = {}
+  opts: { imitatedToolResults?: boolean; budgetChars?: number } = {}
 ): string {
-  const toolResultsSummary = renderToolResults(results);
+  const toolResultsSummary = renderToolResults(results, opts.budgetChars);
 
   const formatCorrection = calls.some((c) => c.variantFormat)
     ? '\n\nFORMAT NOTE: your tool calls used <tool_call> XML — the ink runtime executed them this time, but the ONLY supported format is a fenced block:\n```ink-tool\n{"tool":"<name>","args":{...}}\n```\nUse ink-tool fences (bare tool names, no mcp__inkwell__ prefix) from now on.'
@@ -487,9 +500,9 @@ export function buildFinalRelayBody(
     dropped: [],
     unmatched: 0,
   },
-  opts: { imitatedToolResults?: boolean } = {}
+  opts: { imitatedToolResults?: boolean; budgetChars?: number } = {}
 ): string {
-  const toolResultsSummary = renderToolResults(results);
+  const toolResultsSummary = renderToolResults(results, opts.budgetChars);
   // Undelivered calls have to be named here too. This body ends the turn, so a
   // call the cap discarded on the final iteration will never get another
   // chance — and an agent that is not told exits reporting work it never did.
@@ -530,6 +543,14 @@ export interface AgentLoopInput {
    */
   maxIterations?: number;
   signal?: AbortSignal;
+  /**
+   * How many characters of tool results the next relay may carry, asked
+   * per iteration. A static ceiling is only safe while the window has that
+   * much room: after the pre-turn compaction check a 128K/200K window may
+   * hold far less (Lumen, PR #576 round 2). The host answers from its live
+   * headroom; absent, MAX_RELAY_CHARS applies.
+   */
+  relayBudgetChars?: () => number;
   /**
    * Tell the agent when every call in an iteration was refused, and let it try
    * again, instead of ending the turn.
@@ -729,6 +750,7 @@ export async function runAgentLoop(
           correcting((imitated) =>
             buildContinuationBody([record], extracted, undefined, {
               imitatedToolResults: imitated,
+              budgetChars: input.relayBudgetChars?.(),
             })
           ),
           {
@@ -917,7 +939,10 @@ export async function runAgentLoop(
     try {
       outcome = await ports.backend.runTurn(
         correcting((imitated) =>
-          buildContinuationBody(results, calls, selection, { imitatedToolResults: imitated })
+          buildContinuationBody(results, calls, selection, {
+            imitatedToolResults: imitated,
+            budgetChars: input.relayBudgetChars?.(),
+          })
         ),
         {
           iteration,
@@ -1034,6 +1059,7 @@ export async function runAgentLoop(
         relayWorthy
           ? buildFinalRelayBody(stranded!.results, stranded!.selection, {
               imitatedToolResults: imitated,
+              budgetChars: input.relayBudgetChars?.(),
             })
           : buildProtocolCorrectionBody({ final: true })
       )

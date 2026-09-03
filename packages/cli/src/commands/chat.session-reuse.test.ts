@@ -10,7 +10,10 @@ import {
   findLastBackendSession,
   findLastDetectedModel,
   isResumeFailedNoSession,
+  relayBudgetChars,
+  MIN_RELAY_BUDGET_CHARS,
 } from './chat.js';
+import { MAX_RELAY_CHARS } from '../repl/agent-loop.js';
 import { ContextLedger } from '../repl/context-ledger.js';
 
 /**
@@ -726,5 +729,31 @@ describe('one-turn process recovery sequence — detection outlives the seed (PR
         '\n'
     );
     expect(findLastBackendSession(transcriptPath)?.id).toBe('reseeded-at-850k');
+  });
+});
+
+describe('relayBudgetChars — the relay budget follows the live headroom (Lumen, PR #576)', () => {
+  const ledgerWith = (tokens: number) => ({ totalTokens: () => tokens });
+
+  it('a roomy 1M window gets the full static ceiling', () => {
+    expect(
+      relayBudgetChars({ maxContextTokens: 1_000_000, bootstrapContext: '' }, ledgerWith(300_000))
+    ).toBe(MAX_RELAY_CHARS);
+  });
+
+  it('a 128K window most of the way to its budget gets far less than the ceiling', () => {
+    const budget = relayBudgetChars(
+      { maxContextTokens: 128_000, bootstrapContext: 'x'.repeat(40_000) },
+      ledgerWith(90_000)
+    );
+    // 128K − 10K bootstrap − 90K ledger = 28K tokens; half of that in chars.
+    expect(budget).toBe(28_000 * 4 * 0.5);
+    expect(budget).toBeLessThan(MAX_RELAY_CHARS);
+  });
+
+  it('never starves a relay: a window past its budget still gets the minimum', () => {
+    expect(
+      relayBudgetChars({ maxContextTokens: 128_000, bootstrapContext: '' }, ledgerWith(200_000))
+    ).toBe(MIN_RELAY_BUDGET_CHARS);
   });
 });
