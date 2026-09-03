@@ -513,3 +513,73 @@ describe('compact_context', () => {
     });
   });
 });
+
+// ─── refs: the durable address (#570) ───────────────────────────
+
+describe('entry refs — hash-addressed, stable across reattach and eviction (#570)', () => {
+  it('list_context hands out a ref per entry, and evict_context takes refs', () => {
+    const ledger = new ContextLedger();
+    ledger.addEntry('inbox', 'keep me', 'inkmail');
+    ledger.addEntry('inbox', 'evict me', 'inkmail');
+    const listed = parseResult(handleClientLocalTool('list_context', {}, ledger));
+    const target = listed.entries.find((e: { preview: string }) => e.preview === 'evict me');
+    expect(target.ref).toMatch(/^sha1:[0-9a-f]{16}$/);
+    const evicted = parseResult(
+      handleClientLocalTool('evict_context', { refs: [target.ref] }, ledger)
+    );
+    expect(evicted.evicted).toBe(1);
+    expect(evicted.removedPreviews[0].ref).toBe(target.ref);
+    expect(ledger.listEntries().map((e) => e.content)).toEqual(['keep me']);
+  });
+
+  it('REGRESSION (Myra): a ref captured before an eviction still names the same content, never a neighbour', () => {
+    const ledger = new ContextLedger();
+    for (let i = 0; i < 6; i++) ledger.addEntry('inbox', `message ${i}`, 'inkmail');
+    const listed = parseResult(handleClientLocalTool('list_context', {}, ledger));
+    const refOf3 = listed.entries[3].ref;
+    // An earlier eviction shifts everything positionally…
+    handleClientLocalTool(
+      'evict_context',
+      { entryIds: [listed.entries[0].id, listed.entries[1].id] },
+      ledger
+    );
+    // …but the ref still points at "message 3".
+    const evicted = parseResult(handleClientLocalTool('evict_context', { refs: [refOf3] }, ledger));
+    expect(evicted.removedPreviews.map((p: { preview: string }) => p.preview)).toEqual([
+      'message 3',
+    ]);
+    expect(ledger.listEntries().map((e) => e.content)).toEqual([
+      'message 2',
+      'message 4',
+      'message 5',
+    ]);
+  });
+
+  it('a ref survives reattach — a fresh ledger with the same content resolves it', () => {
+    const before = new ContextLedger();
+    before.addEntry('system', 'bootstrap blob', 'bootstrap');
+    before.addEntry('inbox', 'a message', 'inkmail');
+    const ref = parseResult(handleClientLocalTool('list_context', {}, before)).entries[1].ref;
+    // Reattach: ids restart, content replays.
+    const after = new ContextLedger();
+    after.addEntry('system', 'unrelated new entry', 'repl');
+    after.addEntry('system', 'bootstrap blob', 'bootstrap');
+    after.addEntry('inbox', 'a message', 'inkmail');
+    const evicted = parseResult(handleClientLocalTool('evict_context', { refs: [ref] }, after));
+    expect(evicted.evicted).toBe(1);
+    expect(after.listEntries().map((e) => e.content)).toEqual([
+      'unrelated new entry',
+      'bootstrap blob',
+    ]);
+  });
+
+  it('an unknown ref evicts nothing and says so', () => {
+    const ledger = new ContextLedger();
+    ledger.addEntry('user', 'hello');
+    const evicted = parseResult(
+      handleClientLocalTool('evict_context', { refs: ['sha1:0000000000000000'] }, ledger)
+    );
+    expect(evicted.evicted).toBe(0);
+    expect(ledger.listEntries()).toHaveLength(1);
+  });
+});

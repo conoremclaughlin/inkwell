@@ -324,8 +324,14 @@ function handleListContext(
                 note: `${remaining} more matching entries not shown — page with offset ${offset + page.length}, narrow with source/role/minTokens, or sort by "largest" to find what is worth evicting. Evicting by source or role does not require listing the entries.`,
               }
             : {}),
+          // `ref` is the durable address: a content hash that survives
+          // reattach and eviction. `id` is this process's ordinal and is
+          // renumbered on reattach — a link or an evict captured against an
+          // id can resolve to DIFFERENT content later, which reads as
+          // correct (Myra, 2026-09-03; #570). Address by ref.
           entries: page.map((e) => ({
             id: e.id,
+            ref: e.ref,
             role: e.role,
             source: e.source,
             tokens: e.approxTokens,
@@ -348,11 +354,14 @@ function handleEvictContext(
   ledger: ContextLedger,
   hooks: EvictionHooks
 ): PcpToolCallResult {
+  const refs = Array.isArray(args.refs)
+    ? (args.refs as unknown[]).filter((r): r is string => typeof r === 'string')
+    : undefined;
   const entryIds = args.entryIds as number[] | undefined;
   const source = args.source as string | undefined;
   const role = args.role as string | undefined;
 
-  if (!entryIds && !source && !role) {
+  if (!refs && !entryIds && !source && !role) {
     return {
       content: [
         {
@@ -360,7 +369,7 @@ function handleEvictContext(
           text: JSON.stringify({
             success: false,
             error:
-              'Provide at least one filter: entryIds (number[]), source (string), or role (string)',
+              'Provide at least one filter: refs (string[] — the ref values from list_context), entryIds (number[]), source (string), or role (string)',
           }),
         },
       ],
@@ -370,7 +379,13 @@ function handleEvictContext(
 
   let result: LedgerEvictResult;
 
-  if (entryIds && Array.isArray(entryIds)) {
+  if (refs) {
+    // Hash-addressed: the durable handle list_context hands out. Resolved
+    // against the live ledger at this moment, so a ref captured before an
+    // earlier eviction still names the same content or nothing at all —
+    // never a neighbour that inherited its position.
+    result = ledger.evictEntries(ledger.findEntriesByRefs(refs.map((hash) => ({ hash }))));
+  } else if (entryIds && Array.isArray(entryIds)) {
     result = ledger.evictEntries(entryIds);
   } else if (source) {
     result = ledger.evictBySource(source);
@@ -419,6 +434,7 @@ function handleEvictContext(
           totalAfter: result.totalAfter,
           removedPreviews: previews.map((e) => ({
             id: e.id,
+            ref: entryRefHash(e.role, e.content),
             role: e.role,
             source: e.source,
             tokens: e.approxTokens,

@@ -134,11 +134,18 @@ export const LOCAL_TOOL_CATALOG: readonly LocalToolEntry[] = [
   {
     name: 'evict_context',
     group: 'client-local',
-    summary: 'Remove specific entries from your context to reclaim tokens.',
-    args: 'entryIds (number[]), source (string), or role (string)',
+    summary:
+      "Remove specific entries from your context to reclaim tokens. Address entries by ref (the durable content hash list_context shows); ids are this process's ordinals and renumber on reattach.",
+    args: 'refs (string[]), entryIds (number[]), source (string), or role (string)',
     parameters: {
       type: 'object',
       properties: {
+        refs: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'Entry refs (content hashes from list_context) to evict — the durable address.',
+        },
         entryIds: { type: 'array', items: { type: 'number' }, description: 'Entry IDs to evict.' },
         source: { type: 'string', description: 'Evict every entry from this source.' },
         role: { type: 'string', description: 'Evict every entry with this role.' },

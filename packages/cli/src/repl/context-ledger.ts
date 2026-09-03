@@ -417,6 +417,8 @@ export class ContextLedger {
    */
   public summarizeEntries(): Array<{
     id: number;
+    /** Durable, content-addressed handle — see entryRefHash. */
+    ref: string;
     role: LedgerRole;
     source?: string;
     approxTokens: number;
@@ -425,6 +427,7 @@ export class ContextLedger {
   }> {
     return this.entries.map((e) => ({
       id: e.id,
+      ref: entryRefHash(e.role, e.content),
       role: e.role,
       source: e.source,
       approxTokens: e.approxTokens,
