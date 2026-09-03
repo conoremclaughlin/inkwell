@@ -49,11 +49,80 @@ export function decideChannelForward(input: {
   if (input.hadExplicitResponse) return { action: 'explicit-response' };
   if (!input.success) return { action: 'nothing-delivered', reason: 'run-failed' };
 
-  // Whitespace-only is not a reply. Forwarding it would satisfy the check and
-  // still deliver nothing a reader can use, which is the failure wearing a
-  // success badge.
-  const text = input.finalTextResponse?.trim();
-  if (!text) return { action: 'nothing-delivered', reason: 'no-final-text' };
+  // Whitespace-only is not a reply: forwarding it satisfies a truthiness check
+  // and still delivers nothing a reader can use — the failure wearing a success
+  // badge.
+  //
+  // But trim only DETECTS that; it must not be what gets sent. Leading
+  // indentation is load-bearing in Markdown — a fenced block, a nested list —
+  // and trimming the forwarded value would silently reformat the agent's answer
+  // (Lumen, PR #580). Detect on the trimmed copy, forward the original.
+  const text = input.finalTextResponse;
+  if (!text || !text.trim()) return { action: 'nothing-delivered', reason: 'no-final-text' };
 
   return { action: 'auto-forward', content: text };
+}
+
+/**
+ * Carry out a decision: log it at the level it deserves and release the
+ * conversation.
+ *
+ * Split from `server.ts` because the pure decision above stays green even if
+ * the caller reverts to the old single-branch code or downgrades the warning
+ * (Lumen, PR #580). A test can only prove the SERVER does the right thing if
+ * the server's own step is reachable from a test, so it lives here and
+ * `server.ts` is a thin call.
+ *
+ * The log level is part of the contract, not a detail: `nothing-delivered` at
+ * debug is invisible, because debug is not persisted to ~/.ink/logs. That is
+ * how a turn that reached nobody left no trace at all.
+ */
+export interface ChannelForwardEffects {
+  info(message: string, meta: Record<string, unknown>): void;
+  warn(message: string, meta: Record<string, unknown>): void;
+  debug(message: string, meta: Record<string, unknown>): void;
+  release(payload?: { content: string; format: 'markdown' }): Promise<void>;
+}
+
+export async function applyChannelForward(
+  decision: ChannelForwardDecision,
+  context: {
+    channel: string;
+    conversationId: string;
+    hadExplicitResponse: boolean;
+    runSucceeded: boolean;
+    finalTextLength: number;
+  },
+  effects: ChannelForwardEffects
+): Promise<void> {
+  const { channel, conversationId } = context;
+
+  if (decision.action === 'auto-forward') {
+    effects.info('Auto-routing text response (no explicit send_response called)', {
+      channel,
+      conversationId,
+      responseLength: decision.content.length,
+    });
+    await effects.release({ content: decision.content, format: 'markdown' });
+    return;
+  }
+
+  if (decision.action === 'nothing-delivered') {
+    effects.warn('Nothing delivered to the user for this turn', {
+      channel,
+      conversationId,
+      reason: decision.reason,
+      hadExplicitResponse: context.hadExplicitResponse,
+      runSucceeded: context.runSucceeded,
+      finalTextLength: context.finalTextLength,
+    });
+  } else {
+    effects.debug('Explicit send_response detected, skipping auto-forward', {
+      channel,
+      conversationId,
+      hadExplicitResponse: context.hadExplicitResponse,
+    });
+  }
+
+  await effects.release();
 }

@@ -237,9 +237,6 @@ export async function handleSendResponse(
       media: args.media as OutboundMedia[] | undefined,
     };
 
-    // Mark this conversation as having received an explicit response
-    markExplicitResponse(args.channel, args.conversationId);
-
     // Try local callback first (when running in same process as session host)
     let callbackResult: ResponseResult | void = undefined;
     if (globalResponseCallback) {
@@ -277,6 +274,20 @@ export async function handleSendResponse(
         );
       }
     }
+
+    // Mark AFTER the send has actually succeeded, never before.
+    //
+    // This used to run before the callback/HTTP attempt, so a send that threw,
+    // returned a non-ok status, or hit the no-routing early return still left
+    // the conversation marked as answered. The server then read that mark,
+    // concluded an explicit response had been delivered, and suppressed BOTH
+    // the auto-forward fallback and the warning that says nothing was
+    // delivered — so a failed send became a silent one (Lumen, PR #580).
+    //
+    // Every path between here and the top either threw into the catch or
+    // returned early, so reaching this line is the only proof of delivery we
+    // have.
+    markExplicitResponse(args.channel, args.conversationId);
 
     const result: Record<string, unknown> = {
       success: true,
