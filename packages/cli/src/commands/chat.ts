@@ -5383,8 +5383,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
           })
           .then((outcome) => outcome.approved),
       onResult: (result) => {
-        const resultJson =
-          result.result === undefined ? undefined : JSON.stringify(result.result).slice(0, 20_000);
+        // WHOLE, not a 20K slice: a truncated relay tells the agent the full
+        // payload survives in this session's transcript, and for a clone this
+        // file IS that transcript (Lumen, PR #576). A promise about durable
+        // detail has to hold for the caller reading it, not just the parent.
+        const resultJson = result.result === undefined ? undefined : JSON.stringify(result.result);
         appendTranscript(opts.transcriptPath, {
           type: 'clone_tool_call',
           tool: result.tool,

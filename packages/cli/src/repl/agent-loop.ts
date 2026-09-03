@@ -319,27 +319,44 @@ export function resolveResponseText(outcome: BackendTurnOutcome): string {
  * while the results prove the runtime heard it — so the drift does not reinforce.
  */
 /**
- * Ceiling on ONE tool result as relayed to the model, in characters.
+ * Ceiling on ONE relayed message — all of an iteration's results together.
  *
  * Every result here is injected verbatim into the model's next prompt, and
  * for a resumed provider session it stays in that session for good. A single
  * list_context result of 797K characters (~400K tokens) went in whole and
  * became the largest thing in the window it was describing (Myra,
- * 2026-09-02; #571). Tools that can legitimately return a lot — a long spec,
- * a big file — fit comfortably under this; nothing a model can act on in one
- * turn does not. The full payload is always in the session ledger.
+ * 2026-09-02; #571). Capping each result separately was not enough: an
+ * iteration may legally run five calls, so five capped results composed a
+ * 1,001,129-character continuation — past the small-window budget and close
+ * to macOS ARG_MAX (Lumen, PR #576 round 1). The budget is on the MESSAGE;
+ * the results share it.
  */
-export const MAX_TOOL_RESULT_CHARS = 200_000;
+export const MAX_RELAY_CHARS = 200_000;
 
-function renderToolResult(r: ToolResultRecord): string {
+/**
+ * The smallest slice any one result is guaranteed, however many there are.
+ * At the per-iteration cap of five calls the share is 40K each; this floor
+ * only binds if that cap ever rises, and it keeps a tenth result readable
+ * rather than reducing it to a stub.
+ */
+export const MIN_RELAY_CHARS_PER_RESULT = 20_000;
+
+function renderToolResults(results: ReadonlyArray<ToolResultRecord>): string {
+  const share = Math.max(
+    MIN_RELAY_CHARS_PER_RESULT,
+    Math.floor(MAX_RELAY_CHARS / Math.max(1, results.length))
+  );
+  return results.map((r) => renderToolResult(r, share)).join('\n\n');
+}
+
+function renderToolResult(r: ToolResultRecord, maxChars: number): string {
   const resultStr = typeof r.result === 'string' ? r.result : JSON.stringify(r.result);
   if (resultStr === undefined) return `Tool ${r.tool} (${r.status}): undefined`;
-  if (resultStr.length <= MAX_TOOL_RESULT_CHARS)
-    return `Tool ${r.tool} (${r.status}): ${resultStr}`;
+  if (resultStr.length <= maxChars) return `Tool ${r.tool} (${r.status}): ${resultStr}`;
   return (
-    `Tool ${r.tool} (${r.status}): ${resultStr.slice(0, MAX_TOOL_RESULT_CHARS)}\n` +
+    `Tool ${r.tool} (${r.status}): ${resultStr.slice(0, maxChars)}\n` +
     `…[ink: result truncated — ${resultStr.length.toLocaleString()} chars total, ` +
-    `${MAX_TOOL_RESULT_CHARS.toLocaleString()} shown; the full payload is in the session ledger. ` +
+    `${maxChars.toLocaleString()} shown; the full payload is in this session's transcript. ` +
     'Ask for less next time (page, filter, or narrow the query).]'
   );
 }
@@ -359,7 +376,7 @@ export function buildContinuationBody(
   },
   opts: { imitatedToolResults?: boolean } = {}
 ): string {
-  const toolResultsSummary = results.map(renderToolResult).join('\n\n');
+  const toolResultsSummary = renderToolResults(results);
 
   const formatCorrection = calls.some((c) => c.variantFormat)
     ? '\n\nFORMAT NOTE: your tool calls used <tool_call> XML — the ink runtime executed them this time, but the ONLY supported format is a fenced block:\n```ink-tool\n{"tool":"<name>","args":{...}}\n```\nUse ink-tool fences (bare tool names, no mcp__inkwell__ prefix) from now on.'
@@ -472,7 +489,7 @@ export function buildFinalRelayBody(
   },
   opts: { imitatedToolResults?: boolean } = {}
 ): string {
-  const toolResultsSummary = results.map(renderToolResult).join('\n\n');
+  const toolResultsSummary = renderToolResults(results);
   // Undelivered calls have to be named here too. This body ends the turn, so a
   // call the cap discarded on the final iteration will never get another
   // chance — and an agent that is not told exits reporting work it never did.

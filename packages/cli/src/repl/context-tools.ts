@@ -135,6 +135,15 @@ export function handleClientLocalTool(
 
 /** Entries per page unless the caller asks otherwise. */
 export const LIST_CONTEXT_DEFAULT_LIMIT = 50;
+/**
+ * Bookmarks listed in detail. Unbounded, they recreate the payload explosion
+ * through a second array — 3,500 bookmarks with 84-char labels returned
+ * 460,458 characters while the entry page was only 50 (Lumen, PR #576) — and
+ * the relay cap then cuts the JSON mid-document. The COUNT is always exact.
+ */
+export const LIST_CONTEXT_BOOKMARK_LIMIT = 20;
+/** Labels are agent-supplied; one long label must not blow the page either. */
+const BOOKMARK_LABEL_MAX_CHARS = 120;
 /** Ceiling on a single page, whatever the caller asks. */
 export const LIST_CONTEXT_MAX_LIMIT = 200;
 
@@ -201,9 +210,18 @@ function handleListContext(
           totalEntries: all.length,
           totalTokens,
           bySource,
-          bookmarks: bookmarks.map((b) => ({
+          bookmarkCount: bookmarks.length,
+          ...(bookmarks.length > LIST_CONTEXT_BOOKMARK_LIMIT
+            ? { bookmarksNotShown: bookmarks.length - LIST_CONTEXT_BOOKMARK_LIMIT }
+            : {}),
+          // The most recent ones: an older bookmark is the least likely to be
+          // what a caller is about to act on, and the count above is exact.
+          bookmarks: bookmarks.slice(-LIST_CONTEXT_BOOKMARK_LIMIT).map((b) => ({
             id: b.id,
-            label: b.label,
+            label:
+              typeof b.label === 'string' && b.label.length > BOOKMARK_LABEL_MAX_CHARS
+                ? b.label.slice(0, BOOKMARK_LABEL_MAX_CHARS) + '…'
+                : b.label,
             entryIndex: b.entryIndex,
           })),
           page: {

@@ -5,6 +5,7 @@ import {
   handleClientLocalTool,
   CLIENT_LOCAL_TOOLS,
   EVICT_CONTEXT_PREVIEW_LIMIT,
+  LIST_CONTEXT_BOOKMARK_LIMIT,
   LIST_CONTEXT_DEFAULT_LIMIT,
   LIST_CONTEXT_MAX_LIMIT,
 } from './context-tools.js';
@@ -273,6 +274,34 @@ describe('handleClientLocalTool: list_context paging', () => {
       handleClientLocalTool('list_context', { sort: 'newest', limit: 1 }, ledger)
     );
     expect(newest.entries[0].preview).toContain('entry 199 ');
+  });
+
+  it('REGRESSION (Lumen, PR #576): many bookmarks cannot re-explode the payload', () => {
+    const ledger = new ContextLedger();
+    for (let i = 0; i < 3500; i++) {
+      ledger.addEntry('inbox', `message ${i}`, 'inkmail');
+      ledger.createBookmark(`bookmark ${i} ${'y'.repeat(84)}`);
+    }
+    const result = handleClientLocalTool('list_context', {}, ledger)!;
+    const text = (result.content as Array<{ text: string }>)[0].text;
+    const parsed = JSON.parse(text);
+
+    expect(parsed.bookmarkCount).toBe(3500);
+    expect(parsed.bookmarks).toHaveLength(LIST_CONTEXT_BOOKMARK_LIMIT);
+    expect(parsed.bookmarksNotShown).toBe(3500 - LIST_CONTEXT_BOOKMARK_LIMIT);
+    // The whole result still parses as one document — the relay cap must
+    // never have to cut it mid-JSON.
+    expect(text.length).toBeLessThan(20_000);
+    expect(() => JSON.parse(text)).not.toThrow();
+  });
+
+  it('truncates a long bookmark label and keeps the most recent bookmarks', () => {
+    const ledger = new ContextLedger();
+    ledger.addEntry('user', 'hi');
+    for (let i = 0; i < 25; i++) ledger.createBookmark(`b${i} ${'z'.repeat(500)}`);
+    const parsed = parseResult(handleClientLocalTool('list_context', {}, ledger));
+    expect(parsed.bookmarks[parsed.bookmarks.length - 1].label.startsWith('b24 ')).toBe(true);
+    for (const b of parsed.bookmarks) expect(b.label.length).toBeLessThanOrEqual(121);
   });
 
   it('no note when everything fits', () => {

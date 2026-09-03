@@ -13,7 +13,9 @@ import {
   MAX_TOOL_CALLS_PER_ITERATION,
   type AgentLoopPorts,
   type BackendTurnOutcome,
-  MAX_TOOL_RESULT_CHARS,
+  MAX_RELAY_CHARS,
+  MAX_TOOL_CALLS_PER_ITERATION,
+  MIN_RELAY_CHARS_PER_RESULT,
   type LocalToolCall,
   type ProtocolViolation,
   type ToolResultRecord,
@@ -2058,25 +2060,68 @@ describe('silently dropped tool calls (the per-iteration cap)', () => {
   });
 });
 
-describe('buildContinuationBody — result size ceiling (#571)', () => {
+describe('relay size ceiling (#571; aggregate — Lumen, PR #576)', () => {
+  const huge = (n: number) => 'x'.repeat(n);
+
   it('truncates one oversized result and says so; small ones pass whole', () => {
-    const huge = 'x'.repeat(MAX_TOOL_RESULT_CHARS + 5000);
     const body = buildContinuationBody(
       [
-        { tool: 'list_context', result: huge, status: 'executed' },
+        { tool: 'list_context', result: huge(MAX_RELAY_CHARS + 5000), status: 'executed' },
         { tool: 'signal_status', result: 'ok', status: 'executed' },
       ],
       []
     );
     expect(body).toContain('Tool signal_status (executed): ok');
     expect(body).toContain('[ink: result truncated');
-    expect(body.length).toBeLessThan(MAX_TOOL_RESULT_CHARS + 1000);
+    expect(body.length).toBeLessThan(MAX_RELAY_CHARS + 2000);
   });
 
-  it('applies the same ceiling to the final relay', () => {
-    const huge = { data: 'y'.repeat(MAX_TOOL_RESULT_CHARS + 1) };
-    const body = buildFinalRelayBody([{ tool: 'get_artifact', result: huge, status: 'executed' }]);
+  it('REGRESSION: five oversized results compose ONE bounded message, not five caps', () => {
+    // Five independently capped results built a 1,001,129-char continuation —
+    // past the small-window budget and close to ARG_MAX (Lumen, PR #576).
+    const results = Array.from({ length: MAX_TOOL_CALLS_PER_ITERATION }, (_, i) => ({
+      tool: `t${i}`,
+      result: huge(MAX_RELAY_CHARS + 1),
+      status: 'executed',
+    }));
+    const body = buildContinuationBody(results, []);
+    expect(body.length).toBeLessThan(MAX_RELAY_CHARS + 5000);
+    // Every result is still present and still says it was cut.
+    for (let i = 0; i < results.length; i++) expect(body).toContain(`Tool t${i} (executed):`);
+    expect(body.match(/\[ink: result truncated/g)).toHaveLength(results.length);
+  });
+
+  it('every result keeps a readable slice however many there are', () => {
+    const results = Array.from({ length: 20 }, (_, i) => ({
+      tool: `t${i}`,
+      result: huge(MAX_RELAY_CHARS),
+      status: 'executed',
+    }));
+    const body = buildContinuationBody(results, []);
+    // The floor binds here, so the message may exceed the nominal budget —
+    // deliberately: a stub per result would be worse than a long message.
+    for (let i = 0; i < results.length; i++) {
+      expect(body).toContain(`Tool t${i} (executed): ${huge(MIN_RELAY_CHARS_PER_RESULT)}`);
+    }
+  });
+
+  it('applies the same aggregate ceiling to the final relay', () => {
+    const results = Array.from({ length: MAX_TOOL_CALLS_PER_ITERATION }, (_, i) => ({
+      tool: `t${i}`,
+      result: { data: huge(MAX_RELAY_CHARS) },
+      status: 'executed',
+    }));
+    const body = buildFinalRelayBody(results);
     expect(body).toContain('[ink: result truncated');
-    expect(body.length).toBeLessThan(MAX_TOOL_RESULT_CHARS + 1000);
+    expect(body.length).toBeLessThan(MAX_RELAY_CHARS + 5000);
+  });
+
+  it('the truncation note names the transcript — the durable copy every caller has', () => {
+    const body = buildContinuationBody(
+      [{ tool: 'read', result: huge(MAX_RELAY_CHARS + 1), status: 'executed' }],
+      []
+    );
+    expect(body).toContain("session's transcript");
+    expect(body).not.toContain('session ledger');
   });
 });
