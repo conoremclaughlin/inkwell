@@ -107,6 +107,7 @@ import {
   createSignalSink,
   isClientLocalTool,
   handleClientLocalTool,
+  globalSignalSink,
   type SignalSink,
   getLastSignal,
   clearLastSignal,
@@ -5715,9 +5716,19 @@ export async function runChat(options: ChatOptions): Promise<void> {
           if (bareToolName(tool) === COLLECT_AGENTS_TOOL) {
             return runCollectAgents(args);
           }
-          // Client-local tools (context management) are handled in-process
+          // Client-local tools (context management) are handled in-process.
+          // An eviction's persistent refs arrive on the hook, not in the
+          // result the model reads — see EvictionHooks (#571).
           if (isClientLocalTool(tool)) {
-            return handleClientLocalTool(tool, args, ledger);
+            return handleClientLocalTool(tool, args, ledger, globalSignalSink, {
+              onEvict: (eviction) =>
+                recordEviction(
+                  'sb',
+                  compactForLedger(JSON.stringify(eviction.args ?? {}), 200),
+                  eviction.tokensFreed,
+                  eviction.refs
+                ),
+            });
           }
           return null;
         },
@@ -5762,30 +5773,13 @@ export async function runChat(options: ChatOptions): Promise<void> {
             const content = (r?.content as Array<{ text: string }> | undefined)?.[0]?.text;
             if (content) {
               const parsed = JSON.parse(content);
+              // The eviction itself was persisted from the onEvict hook at
+              // execution time (recordEviction); this is display only.
               printEvent(
                 chalk.dim(
                   `  🗑 evicted ${parsed.evicted} entries (${parsed.tokensFreed} tok freed, ${parsed.totalAfter} tok remaining)`
                 )
               );
-              // Persist the eviction so it survives reattach — without this,
-              // hydration replays the raw events and evicted entries resurrect
-              if (parsed.success && Array.isArray(parsed.evictRefs) && parsed.evicted > 0) {
-                const refs = parsed.evictRefs as Array<Record<string, unknown>>;
-                recordEviction(
-                  'sb',
-                  compactForLedger(JSON.stringify(result.args ?? {}), 200),
-                  typeof parsed.tokensFreed === 'number' ? parsed.tokensFreed : 0,
-                  refs
-                    .filter((ref) => typeof ref.hash === 'string')
-                    .map((ref) => ({
-                      ...(typeof ref.eid === 'number' ? { eid: ref.eid } : {}),
-                      hash: ref.hash as string,
-                      role: (ref.role as LedgerRole) || 'system',
-                      source: typeof ref.source === 'string' ? ref.source : undefined,
-                      preview: typeof ref.preview === 'string' ? ref.preview : '',
-                    }))
-                );
-              }
             }
           } else if (result.tool === 'list_context') {
             const r = result.result as Record<string, unknown> | undefined;

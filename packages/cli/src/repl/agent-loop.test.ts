@@ -13,6 +13,7 @@ import {
   MAX_TOOL_CALLS_PER_ITERATION,
   type AgentLoopPorts,
   type BackendTurnOutcome,
+  MAX_TOOL_RESULT_CHARS,
   type LocalToolCall,
   type ProtocolViolation,
   type ToolResultRecord,
@@ -2054,5 +2055,28 @@ describe('silently dropped tool calls (the per-iteration cap)', () => {
     expect(harness.executed[0]).toHaveLength(emitted.length);
     expect(harness.prompts[1]!.body).not.toContain('reached the tool runner');
     expect(harness.events.join('\n')).not.toContain('not run');
+  });
+});
+
+describe('buildContinuationBody — result size ceiling (#571)', () => {
+  it('truncates one oversized result and says so; small ones pass whole', () => {
+    const huge = 'x'.repeat(MAX_TOOL_RESULT_CHARS + 5000);
+    const body = buildContinuationBody(
+      [
+        { tool: 'list_context', result: huge, status: 'executed' },
+        { tool: 'signal_status', result: 'ok', status: 'executed' },
+      ],
+      []
+    );
+    expect(body).toContain('Tool signal_status (executed): ok');
+    expect(body).toContain('[ink: result truncated');
+    expect(body.length).toBeLessThan(MAX_TOOL_RESULT_CHARS + 1000);
+  });
+
+  it('applies the same ceiling to the final relay', () => {
+    const huge = { data: 'y'.repeat(MAX_TOOL_RESULT_CHARS + 1) };
+    const body = buildFinalRelayBody([{ tool: 'get_artifact', result: huge, status: 'executed' }]);
+    expect(body).toContain('[ink: result truncated');
+    expect(body.length).toBeLessThan(MAX_TOOL_RESULT_CHARS + 1000);
   });
 });

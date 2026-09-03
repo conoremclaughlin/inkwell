@@ -318,6 +318,32 @@ export function resolveResponseText(outcome: BackendTurnOutcome): string {
  * executed anyway (see extractLocalToolCalls), but the format is corrected HERE,
  * while the results prove the runtime heard it — so the drift does not reinforce.
  */
+/**
+ * Ceiling on ONE tool result as relayed to the model, in characters.
+ *
+ * Every result here is injected verbatim into the model's next prompt, and
+ * for a resumed provider session it stays in that session for good. A single
+ * list_context result of 797K characters (~400K tokens) went in whole and
+ * became the largest thing in the window it was describing (Myra,
+ * 2026-09-02; #571). Tools that can legitimately return a lot — a long spec,
+ * a big file — fit comfortably under this; nothing a model can act on in one
+ * turn does not. The full payload is always in the session ledger.
+ */
+export const MAX_TOOL_RESULT_CHARS = 200_000;
+
+function renderToolResult(r: ToolResultRecord): string {
+  const resultStr = typeof r.result === 'string' ? r.result : JSON.stringify(r.result);
+  if (resultStr === undefined) return `Tool ${r.tool} (${r.status}): undefined`;
+  if (resultStr.length <= MAX_TOOL_RESULT_CHARS)
+    return `Tool ${r.tool} (${r.status}): ${resultStr}`;
+  return (
+    `Tool ${r.tool} (${r.status}): ${resultStr.slice(0, MAX_TOOL_RESULT_CHARS)}\n` +
+    `…[ink: result truncated — ${resultStr.length.toLocaleString()} chars total, ` +
+    `${MAX_TOOL_RESULT_CHARS.toLocaleString()} shown; the full payload is in the session ledger. ` +
+    'Ask for less next time (page, filter, or narrow the query).]'
+  );
+}
+
 export function buildContinuationBody(
   results: ReadonlyArray<ToolResultRecord>,
   calls: ReadonlyArray<LocalToolCall>,
@@ -333,12 +359,7 @@ export function buildContinuationBody(
   },
   opts: { imitatedToolResults?: boolean } = {}
 ): string {
-  const toolResultsSummary = results
-    .map((r) => {
-      const resultStr = typeof r.result === 'string' ? r.result : JSON.stringify(r.result);
-      return `Tool ${r.tool} (${r.status}): ${resultStr}`;
-    })
-    .join('\n\n');
+  const toolResultsSummary = results.map(renderToolResult).join('\n\n');
 
   const formatCorrection = calls.some((c) => c.variantFormat)
     ? '\n\nFORMAT NOTE: your tool calls used <tool_call> XML — the ink runtime executed them this time, but the ONLY supported format is a fenced block:\n```ink-tool\n{"tool":"<name>","args":{...}}\n```\nUse ink-tool fences (bare tool names, no mcp__inkwell__ prefix) from now on.'
@@ -451,12 +472,7 @@ export function buildFinalRelayBody(
   },
   opts: { imitatedToolResults?: boolean } = {}
 ): string {
-  const toolResultsSummary = results
-    .map((r) => {
-      const resultStr = typeof r.result === 'string' ? r.result : JSON.stringify(r.result);
-      return `Tool ${r.tool} (${r.status}): ${resultStr}`;
-    })
-    .join('\n\n');
+  const toolResultsSummary = results.map(renderToolResult).join('\n\n');
   // Undelivered calls have to be named here too. This body ends the turn, so a
   // call the cap discarded on the final iteration will never get another
   // chance — and an agent that is not told exits reporting work it never did.
