@@ -2956,6 +2956,67 @@ export function relayBudgetBytes(
   return Math.min(MAX_RELAY_BYTES, Math.max(MIN_RELAY_BUDGET_BYTES, bytes));
 }
 
+/**
+ * How a tool-loop continuation reaches the provider.
+ *
+ * `resume`: the live native session holds the history — send the delta only.
+ * `seed`: the session was rolled MID-TURN (an eviction, a trim, a budget
+ * change, an uncorrected protocol break) — mint a fresh id, send the full
+ * envelope, and persist the id so later continuations and the next turn
+ * resume it. Before this existed the rolled continuation spawned UNSEEDED:
+ * every further continuation re-packed the whole window into yet another
+ * unresumable session — five fresh provider sessions in seven minutes,
+ * 280–520K cache-creation tokens each (Myra, 2026-09-02; #572).
+ * `stateless`: the backend cannot resume at all — full envelope every time.
+ *
+ * Pure, and called by runTurnForLoop itself, so the test pins the decision
+ * the runtime makes rather than a mirror of it.
+ */
+export function decideContinuationSession(
+  canReuse: boolean,
+  activeId: string | undefined,
+  mint: () => string
+): { mode: 'resume'; id: string } | { mode: 'seed'; id: string } | { mode: 'stateless' } {
+  if (!canReuse) return { mode: 'stateless' };
+  if (activeId !== undefined) return { mode: 'resume', id: activeId };
+  return { mode: 'seed', id: mint() };
+}
+
+/** Ceiling on the model's own in-turn output carried into a mid-turn reseed. */
+export const MID_TURN_RESEED_OWN_OUTPUT_MAX_CHARS = 30_000;
+
+/**
+ * The latest-message body for a mid-turn reseed: the model's own output so
+ * far this turn, then the continuation it was about to receive.
+ *
+ * A rebuilt envelope carries the ledger — the user's message, tool-result
+ * previews — but not what the model itself said and asked for before the
+ * roll. Without it the reseeded session has no memory of its own half of the
+ * turn: Myra attributed her own evictions to automatic pruning and re-issued
+ * calls that had already run (#572). Imitated frames have already been cut
+ * from `ownOutputSoFar` by the host.
+ */
+export function buildMidTurnReseedBody(ownOutputSoFar: readonly string[], body: string): string {
+  const own = ownOutputSoFar
+    .map((t) => t.trim())
+    .filter(Boolean)
+    .join('\n\n');
+  if (!own) return body;
+  const shown =
+    own.length > MID_TURN_RESEED_OWN_OUTPUT_MAX_CHARS
+      ? `…[earlier output elided]\n${own.slice(-MID_TURN_RESEED_OWN_OUTPUT_MAX_CHARS)}`
+      : own;
+  return [
+    '[Your own output so far this turn]',
+    'The provider session was re-seeded mid-turn after a context change on the ink side. This is what you wrote before that point; the ink-tool blocks in it were already executed and their results follow below. Do not repeat those calls.',
+    '---',
+    shown,
+    '---',
+    '',
+    body,
+  ].join('\n');
+}
+
 export function buildPromptEnvelope(
   agentId: string,
   runtime: ChatRuntime,
@@ -3623,9 +3684,16 @@ export async function runChat(options: ChatOptions): Promise<void> {
     (text) => (runtime.toolRouting === 'local' ? findImitatedToolResults(text) : null),
     (line) => runtime.toolRouting === 'local' && isPotentialImitationPrefix(line)
   );
+  // The model's own output this turn, spawn by spawn, imitated frames cut —
+  // what a mid-turn reseed hands back so the rebuilt session remembers its
+  // own half of the turn (buildMidTurnReseedBody, #572). Reset per turn;
+  // muted from an imitated frame to the next spawn, like the renderer.
+  let turnOwnOutput: string[] = [];
+  let turnOwnOutputMuted = false;
   const beginSpawn = (): void => {
     streamRenderer.beginSpawn();
     previewGuard.beginSpawn();
+    turnOwnOutputMuted = false;
   };
   /**
    * The spawn's stream ended: render whatever the renderer was holding, and
@@ -3780,6 +3848,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
           preview: compactForLedger(guarded.publish, 200),
           ...(guarded.imitationDiscarded ? { imitationDiscarded: true } : {}),
         });
+      }
+      if (!turnOwnOutputMuted) {
+        // The same cut the guard applied to this block, in block coordinates.
+        turnOwnOutput.push(evt.text.slice(0, guarded.blockKeep));
+        if (guarded.imitationDiscarded) turnOwnOutputMuted = true;
       }
       renderStreamedLines(
         streamRenderer.completeMessage(evt.text, { continuesMessage: evt.continuesMessage })
@@ -6178,6 +6251,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
   ) => {
     if (!raw.trim()) return;
     streamRenderer.reset();
+    turnOwnOutput = [];
+    turnOwnOutputMuted = false;
     // Attach pending files to this turn — append the block so the backend
     // sees the paths inline with the message that delivered them. The media
     // list rides the same turn (injected as prompt content by adapters that
@@ -6752,12 +6827,42 @@ export async function runChat(options: ChatOptions): Promise<void> {
       // ── Continuation ──
       // When resuming the same Claude session the model already holds the full
       // transcript + tool instructions from the seeded turn, so send ONLY the
-      // delta. Otherwise (stateless backends) re-pack the full envelope so the
-      // fresh spawn has the context it needs.
-      const continuationPrompt =
-        canReuseBackendSession && activeBackendSessionId
-          ? body
-          : buildPromptEnvelope(agentId, runtime, ledger, body);
+      // delta. When the session was rolled mid-turn, SEED a fresh one now —
+      // full envelope, the model's own output so far, and a persisted id so
+      // the rest of this turn and the next resume it (#572). Stateless
+      // backends re-pack the full envelope every time.
+      const decision = decideContinuationSession(
+        canReuseBackendSession,
+        activeBackendSessionId,
+        randomUUID
+      );
+      let continuationPrompt: string;
+      let sessionArgs: { backendSessionId?: string; backendSessionSeedId?: string } = {};
+      if (decision.mode === 'resume') {
+        continuationPrompt = body;
+        sessionArgs = { backendSessionId: decision.id };
+      } else if (decision.mode === 'seed') {
+        activeBackendSessionId = decision.id;
+        activeBackendSessionShape = currentEnvelopeShape;
+        appendTranscript(runtime.transcriptPath, {
+          type: 'backend_session',
+          id: decision.id,
+          routing: runtime.toolRouting,
+          reason: 'mid-turn-roll',
+        });
+        printEvent(
+          chalk.dim('  ⛁ provider session rolled mid-turn — re-seeding a fresh native session')
+        );
+        continuationPrompt = buildPromptEnvelope(
+          agentId,
+          runtime,
+          ledger,
+          buildMidTurnReseedBody(turnOwnOutput, body)
+        );
+        sessionArgs = { backendSessionSeedId: decision.id };
+      } else {
+        continuationPrompt = buildPromptEnvelope(agentId, runtime, ledger, body);
+      }
 
       beginSpawn();
       const ledgerIdBeforeSpawn = maxLedgerId();

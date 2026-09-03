@@ -20,6 +20,9 @@ import {
   LEDGER_ENTRY_FRAME_BYTES,
   CLONE_HISTORY_SEPARATOR,
   CONTEXT_MUTATING_TOOLS,
+  buildMidTurnReseedBody,
+  decideContinuationSession,
+  MID_TURN_RESEED_OWN_OUTPUT_MAX_CHARS,
 } from './chat.js';
 import { MAX_RELAY_BYTES } from '../repl/agent-loop.js';
 import { ContextLedger } from '../repl/context-ledger.js';
@@ -872,5 +875,96 @@ describe("occupancyTokens — what the session holds after a reply, by the provi
     expect(occupancyTokens('claude', undefined)).toBeUndefined();
     expect(occupancyTokens('claude', { outputTokens: 5 })).toBeUndefined();
     expect(occupancyTokens('gemini', { outputTokens: 5 })).toBeUndefined();
+  });
+});
+
+describe('decideContinuationSession (the real function runTurnForLoop calls) — #572', () => {
+  const minter = () => {
+    let i = 0;
+    return () => `N${++i}`;
+  };
+
+  it('resumes the live session with the delta', () => {
+    expect(decideContinuationSession(true, 'S1', minter())).toEqual({ mode: 'resume', id: 'S1' });
+  });
+
+  it('REGRESSION: a session rolled mid-turn is SEEDED, not spawned unseeded', () => {
+    // Before: the rolled continuation went out with neither seed nor resume id,
+    // so it was unresumable and every later continuation re-packed the window
+    // into another fresh session (five in seven minutes).
+    const d = decideContinuationSession(true, undefined, minter());
+    expect(d).toEqual({ mode: 'seed', id: 'N1' });
+  });
+
+  it('a stateless backend never seeds or resumes', () => {
+    expect(decideContinuationSession(false, 'S1', minter())).toEqual({ mode: 'stateless' });
+    expect(decideContinuationSession(false, undefined, minter())).toEqual({ mode: 'stateless' });
+  });
+
+  it('eviction mid-turn: one reseed, then every later continuation resumes the SAME id', () => {
+    const mint = minter();
+    let active: string | undefined = 'S1';
+    // The eviction rolled it (recordEviction clears the live id).
+    active = undefined;
+    const first = decideContinuationSession(true, active, mint);
+    expect(first.mode).toBe('seed');
+    if (first.mode === 'seed') active = first.id;
+    const second = decideContinuationSession(true, active, mint);
+    const third = decideContinuationSession(true, active, mint);
+    expect(second).toEqual({ mode: 'resume', id: 'N1' });
+    expect(third).toEqual({ mode: 'resume', id: 'N1' });
+  });
+});
+
+describe('buildMidTurnReseedBody — the rebuilt session remembers its own half of the turn (#572)', () => {
+  it("carries the model's own output before the continuation", () => {
+    const body =
+      '[Tool results from previous turn]\nTool evict_context (executed): {"evicted":3000}';
+    const out = buildMidTurnReseedBody(
+      [
+        'Clearing old heartbeat chatter.\n\n```ink-tool\n{"tool":"evict_context","args":{"source":"heartbeat"}}\n```',
+      ],
+      body
+    );
+    expect(out.startsWith('[Your own output so far this turn]')).toBe(true);
+    expect(out).toContain('"tool":"evict_context"');
+    expect(out).toContain('already executed');
+    expect(out.endsWith(body)).toBe(true);
+    expect(out.indexOf('evict_context","args"')).toBeLessThan(out.indexOf(body));
+  });
+
+  it('is the bare body when the model has said nothing yet', () => {
+    expect(buildMidTurnReseedBody([], 'body')).toBe('body');
+    expect(buildMidTurnReseedBody(['  ', ''], 'body')).toBe('body');
+  });
+
+  it('keeps the TAIL of very long output and says what was elided', () => {
+    const long = 'a'.repeat(MID_TURN_RESEED_OWN_OUTPUT_MAX_CHARS + 500) + 'TAIL';
+    const out = buildMidTurnReseedBody([long], 'body');
+    expect(out).toContain('[earlier output elided]');
+    expect(out).toContain('TAIL');
+    expect(out.length).toBeLessThan(MID_TURN_RESEED_OWN_OUTPUT_MAX_CHARS + 1000);
+  });
+});
+
+describe('findLastBackendSession — a mid-turn reseed marker is recovered like any seed (#572)', () => {
+  it('recovers the mid-turn id so the next process resumes it', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sb-transcript-'));
+    const path = join(dir, 't.jsonl');
+    writeFileSync(
+      path,
+      [
+        { type: 'backend_session', id: 'before', routing: 'local' },
+        { type: 'context_evict', actor: 'sb', refs: [] },
+        { type: 'backend_session', id: 'mid-turn', routing: 'local', reason: 'mid-turn-roll' },
+      ]
+        .map((e) => JSON.stringify(e))
+        .join('\n') + '\n'
+    );
+    try {
+      expect(findLastBackendSession(path)).toEqual({ id: 'mid-turn', routing: 'local' });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

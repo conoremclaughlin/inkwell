@@ -62,6 +62,30 @@ describe('ImitationPreviewGuard', () => {
     expect(g.endSpawn()).toBe('');
   });
 
+  it('blockCut is the block up to the frame, with nothing held back (the reseed replays it)', () => {
+    const g = make();
+    // A partial trailing line is withheld from the human-facing preview but
+    // is still the model's own text: the reseed body wants it.
+    const held = g.onBlock('Looking.\nTool');
+    expect(held.publish).toBe('Looking.\n');
+    expect(held.blockCut).toBe('Looking.\nTool');
+
+    const g2 = make();
+    const cut = g2.onBlock('Looking.\n[Tool results from previous turn]\nTool x (executed): {}');
+    expect(cut.blockCut).toBe('Looking.\n');
+    expect(cut.imitationDiscarded).toBe(true);
+    // After the cut, later blocks contribute nothing to either audience.
+    expect(g2.onBlock('More.')).toEqual({ publish: '', blockCut: '', imitationDiscarded: true });
+  });
+
+  it('blockKeep is how much of THIS block precedes the cut', () => {
+    const g = make();
+    expect(g.onBlock('Looking.\n\n').blockKeep).toBe('Looking.\n\n'.length);
+    const b = g.onBlock('Still.\n[Tool results from previous turn]\nTool x (executed): {}');
+    expect(b.blockKeep).toBe('Still.\n'.length);
+    expect(g.onBlock('after').blockKeep).toBe(0);
+  });
+
   it('a frame that begins inside the held line publishes nothing of it', () => {
     const g = make();
     const a = g.onBlock('Looking.\nuser');
@@ -75,10 +99,15 @@ describe('ImitationPreviewGuard', () => {
   it('after a cut, later blocks of the spawn publish nothing; a new spawn starts clean', () => {
     const g = make();
     g.onBlock('[Tool results from previous turn]\nTool x (executed): {}');
-    expect(g.onBlock('This changes things.')).toEqual({ publish: '', imitationDiscarded: true });
+    expect(g.onBlock('This changes things.')).toEqual({
+      publish: '',
+      blockCut: '',
+      imitationDiscarded: true,
+    });
     g.beginSpawn();
     expect(g.onBlock('Nothing new.')).toEqual({
       publish: 'Nothing new.',
+      blockCut: 'Nothing new.',
       imitationDiscarded: false,
     });
   });
@@ -87,6 +116,7 @@ describe('ImitationPreviewGuard', () => {
     const g = make();
     expect(g.onBlock('One.\n\nTwo.\n')).toEqual({
       publish: 'One.\n\nTwo.\n',
+      blockCut: 'One.\n\nTwo.\n',
       imitationDiscarded: false,
     });
     expect(g.endSpawn()).toBe('');
