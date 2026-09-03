@@ -12,6 +12,7 @@ import { describe, it, expect } from 'vitest';
 import {
   applyChannelForward,
   decideChannelForward,
+  hasDeliveryEvidence,
   type ChannelForwardDecision,
 } from './channel-forward';
 
@@ -179,5 +180,52 @@ describe('applyChannelForward', () => {
     expect(calls.debug).toHaveLength(1);
     expect(calls.warn).toHaveLength(0);
     expect(released).toEqual([undefined]);
+  });
+});
+
+/**
+ * A resolved transport call is not a delivered message (Lumen, PR #580 r2).
+ *
+ * The schema accepts `content: z.string()` with no minimum, so a blank body
+ * with no media resolves happily and sends nothing; a media-only send can come
+ * back with `mediaSent: 0`, every attachment failed, and still resolve. Both
+ * used to mark the conversation answered, which suppressed the fallback AND the
+ * nothing-delivered warning — the most complete failure available was the one
+ * least likely to be reported.
+ */
+describe('hasDeliveryEvidence', () => {
+  it('accepts nonblank text as proof on its own', () => {
+    expect(hasDeliveryEvidence({ content: 'the answer', mediaRequested: 0 })).toBe(true);
+  });
+
+  it.each([
+    ['empty', ''],
+    ['spaces', '   '],
+    ['newlines', '\n\n'],
+  ])('rejects %s text with no media', (_label, content) => {
+    expect(hasDeliveryEvidence({ content, mediaRequested: 0 })).toBe(false);
+  });
+
+  it('rejects a media-only send where every attachment failed', () => {
+    // The Slack case: callback resolved, mediaSent 0.
+    expect(hasDeliveryEvidence({ content: '', mediaRequested: 3, mediaSent: 0 })).toBe(false);
+  });
+
+  it('accepts a media-only send when the gateway counted deliveries', () => {
+    expect(hasDeliveryEvidence({ content: '', mediaRequested: 3, mediaSent: 2 })).toBe(true);
+  });
+
+  /**
+   * The HTTP transport reports no per-item counters, so an accepted request is
+   * the only evidence there is. Weaker than a count, kept deliberately rather
+   * than failing every media-only send through that path.
+   */
+  it('falls back to "media was requested" when no counter exists', () => {
+    expect(hasDeliveryEvidence({ content: '', mediaRequested: 1 })).toBe(true);
+    expect(hasDeliveryEvidence({ content: '', mediaRequested: 0 })).toBe(false);
+  });
+
+  it('counts text even when media all failed', () => {
+    expect(hasDeliveryEvidence({ content: 'here', mediaRequested: 2, mediaSent: 0 })).toBe(true);
   });
 });

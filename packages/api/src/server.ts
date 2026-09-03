@@ -48,11 +48,7 @@ import {
 } from './services/heartbeat';
 import { StrategyService } from './services/strategy.service';
 import { getOrchestrator } from './services/sandbox/index.js';
-import {
-  setResponseCallback,
-  hasExplicitResponse,
-  clearExplicitResponse,
-} from './mcp/tools/response-handlers';
+import { setResponseCallback, consumeExplicitResponse } from './mcp/tools/response-handlers';
 import { getAgentGateway, type AgentTriggerPayload } from './channels/agent-gateway';
 import { storedTriggerMedia } from './channels/agent-media';
 import { resolveRouteAgentId } from './services/routing/resolve-route';
@@ -372,7 +368,10 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       channel === 'slack';
     if (isExternalChannel && channelGateway) {
       // Check if send_response was called via MCP (tracked in response-handlers)
-      const hadExplicitResponse = hasExplicitResponse(channel, conversationId);
+      // Reads AND clears. releaseConversation below drains a pending next turn
+      // synchronously, and a marker still standing then is read by that nested
+      // turn as its own delivery (Lumen, PR #580 r2). One call, no window.
+      const hadExplicitResponse = consumeExplicitResponse(channel, conversationId);
 
       // Captured so the deferred release closure keeps the non-null narrowing
       // from the enclosing guard.
@@ -400,8 +399,6 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
             gateway.releaseConversation(channel as GatewayChannel, conversationId, payload),
         }
       );
-
-      clearExplicitResponse(channel, conversationId);
     }
 
     if (!result.success) {

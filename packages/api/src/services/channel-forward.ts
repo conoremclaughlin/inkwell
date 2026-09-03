@@ -126,3 +126,37 @@ export async function applyChannelForward(
 
   await effects.release();
 }
+
+/**
+ * Did anything actually reach the user?
+ *
+ * `send_response` used to report success, and mark the conversation answered,
+ * as soon as the transport call resolved. Resolving is not delivering. The
+ * schema accepts `content: z.string()` with no minimum, so a blank body with no
+ * media resolves happily and sends nothing; and a media-only Slack send can
+ * come back with `mediaSent: 0`, every attachment having failed, while the
+ * callback resolves normally (Lumen, PR #580 r2).
+ *
+ * Both cases then set the marker, which suppressed the auto-forward fallback
+ * AND the nothing-delivered warning — so the most complete failure available,
+ * a send where literally nothing arrived, was the one least likely to be
+ * reported.
+ *
+ * Evidence, in order of strength:
+ *   nonblank text      -> the body itself went out
+ *   mediaSent > 0      -> the gateway counted attachments delivered
+ *   media requested    -> weakest: the HTTP transport reports no per-item
+ *                         counters, so an accepted request is all there is.
+ *                         Kept deliberately rather than failing every
+ *                         media-only send through that path.
+ */
+export function hasDeliveryEvidence(input: {
+  content: string;
+  mediaRequested: number;
+  /** Undefined when the transport reports no per-item counters. */
+  mediaSent?: number;
+}): boolean {
+  if (input.content.trim().length > 0) return true;
+  if (input.mediaSent !== undefined) return input.mediaSent > 0;
+  return input.mediaRequested > 0;
+}

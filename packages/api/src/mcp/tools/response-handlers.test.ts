@@ -16,6 +16,7 @@ import {
   handleSendResponse,
   hasExplicitResponse,
   clearExplicitResponse,
+  consumeExplicitResponse,
   setResponseCallback,
 } from './response-handlers';
 
@@ -159,5 +160,103 @@ describe('handleSendResponse — the explicit-response marker', () => {
 
     expect(JSON.parse(res.content[0]!.text).success).toBe(false);
     expect(hasExplicitResponse('discord', conversationId)).toBe(false);
+  });
+});
+
+/**
+ * The marker must not survive into a nested turn, and must not be set when
+ * nothing was delivered (Lumen, PR #580 r2).
+ */
+describe('handleSendResponse — delivery evidence', () => {
+  const conversationId = 'conv-evidence-test';
+  const composer = {} as unknown as Parameters<typeof handleSendResponse>[1];
+
+  beforeEach(() => clearExplicitResponse('telegram', conversationId));
+  afterEach(() => {
+    setResponseCallback(null as unknown as Parameters<typeof setResponseCallback>[0]);
+    clearExplicitResponse('telegram', conversationId);
+  });
+
+  it('does NOT mark a blank body with no media', async () => {
+    setResponseCallback(async () => undefined);
+    const res = await handleSendResponse(
+      { channel: 'telegram', conversationId, content: '   ' } as Parameters<
+        typeof handleSendResponse
+      >[0],
+      composer
+    );
+
+    expect(JSON.parse(res.content[0]!.text).success).toBe(false);
+    expect(hasExplicitResponse('telegram', conversationId)).toBe(false);
+  });
+
+  it('does NOT mark a media-only send where every attachment failed', async () => {
+    setResponseCallback(async () => ({ mediaSent: 0, mediaFailed: 2 }));
+    const res = await handleSendResponse(
+      {
+        channel: 'telegram',
+        conversationId,
+        content: '',
+        media: [
+          { type: 'image', path: '/a.png' },
+          { type: 'image', path: '/b.png' },
+        ],
+      } as unknown as Parameters<typeof handleSendResponse>[0],
+      composer
+    );
+
+    expect(JSON.parse(res.content[0]!.text).success).toBe(false);
+    expect(hasExplicitResponse('telegram', conversationId)).toBe(false);
+  });
+
+  it('marks a media-only send the gateway counted as delivered', async () => {
+    setResponseCallback(async () => ({ mediaSent: 1 }));
+    const res = await handleSendResponse(
+      {
+        channel: 'telegram',
+        conversationId,
+        content: '',
+        media: [{ type: 'image', path: '/a.png' }],
+      } as unknown as Parameters<typeof handleSendResponse>[0],
+      composer
+    );
+
+    expect(JSON.parse(res.content[0]!.text).success).toBe(true);
+    expect(hasExplicitResponse('telegram', conversationId)).toBe(true);
+  });
+});
+
+/**
+ * The marker is consumed by the read, so a nested turn cannot inherit it.
+ *
+ * `releaseConversation` drains a pending next turn synchronously. With a
+ * separate check-then-clear, that nested turn ran while the previous turn's
+ * marker was still standing and read it as its own delivery — suppressing its
+ * fallback and its warning (Lumen, PR #580 r2). Reordering two lines would fix
+ * today's instance and leave the hazard; consuming on read removes it.
+ */
+describe('consumeExplicitResponse', () => {
+  const conversationId = 'conv-consume-test';
+  afterEach(() => clearExplicitResponse('telegram', conversationId));
+
+  it('reports the marker once and clears it in the same call', async () => {
+    setResponseCallback(async () => undefined);
+    await handleSendResponse(
+      { channel: 'telegram', conversationId, content: 'delivered' } as Parameters<
+        typeof handleSendResponse
+      >[0],
+      {} as unknown as Parameters<typeof handleSendResponse>[1]
+    );
+    setResponseCallback(null as unknown as Parameters<typeof setResponseCallback>[0]);
+
+    expect(consumeExplicitResponse('telegram', conversationId)).toBe(true);
+    // The nested turn that release() drains sees a clean slate, so its own
+    // fallback and warning are free to fire.
+    expect(consumeExplicitResponse('telegram', conversationId)).toBe(false);
+    expect(hasExplicitResponse('telegram', conversationId)).toBe(false);
+  });
+
+  it('is false for a conversation that never answered', () => {
+    expect(consumeExplicitResponse('telegram', 'never-used')).toBe(false);
   });
 });

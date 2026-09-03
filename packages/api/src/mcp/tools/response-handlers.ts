@@ -10,6 +10,7 @@ import { isoDateTime } from './schema-primitives.js';
 import type { DataComposer } from '../../data/composer';
 import type { ChannelType, AgentResponse, ResponseFormat, OutboundMedia } from '../../agent/types';
 import { logger } from '../../utils/logger';
+import { hasDeliveryEvidence } from '../../services/channel-forward.js';
 import { getPinnedAgentId, getRequestContext } from '../../utils/request-context';
 
 // Response result returned by the callback (optional — void is still accepted)
@@ -65,6 +66,26 @@ export function hasExplicitResponse(channel: string, conversationId: string): bo
 export function clearExplicitResponse(channel: string, conversationId: string): void {
   const key = `${channel}:${conversationId}`;
   explicitResponseTracker.delete(key);
+}
+
+/**
+ * Read the marker and clear it in ONE step.
+ *
+ * The two-call form — check, then act, then clear — has an ordering hazard that
+ * is easy to reintroduce and hard to see: `releaseConversation` drains a pending
+ * next turn SYNCHRONOUSLY, so a marker still standing at that moment is read by
+ * the nested turn as its own delivery, suppressing that turn's fallback and its
+ * warning (Lumen, PR #580 r2).
+ *
+ * Reordering two lines fixes today's instance and leaves the hazard. Making the
+ * read consume the marker removes it: there is no window because there is no
+ * interval. Callers cannot get the order wrong when there is only one call.
+ */
+export function consumeExplicitResponse(channel: string, conversationId: string): boolean {
+  const key = `${channel}:${conversationId}`;
+  const had = explicitResponseTracker.has(key);
+  explicitResponseTracker.delete(key);
+  return had;
 }
 
 /**
@@ -287,6 +308,37 @@ export async function handleSendResponse(
     // Every path between here and the top either threw into the catch or
     // returned early, so reaching this line is the only proof of delivery we
     // have.
+    // ...and only when something actually reached the user. A resolved
+    // transport call is not proof: a blank body with no media, or a media-only
+    // send where every attachment failed, both resolve normally while
+    // delivering nothing (Lumen, PR #580 r2). Marking those would suppress the
+    // fallback and the warning for the most complete failure there is.
+    if (
+      !hasDeliveryEvidence({
+        content: args.content,
+        mediaRequested: args.media?.length ?? 0,
+        mediaSent: callbackResult?.mediaSent,
+      })
+    ) {
+      logger.warn('send_response delivered nothing', {
+        channel: args.channel,
+        conversationId: args.conversationId,
+        contentLength: args.content.trim().length,
+        mediaRequested: args.media?.length ?? 0,
+        mediaSent: callbackResult?.mediaSent,
+      });
+      return mcpResponse(
+        {
+          success: false,
+          error:
+            'Nothing was delivered: the message body was blank and no media was sent. The user received nothing.',
+          channel: args.channel,
+          conversationId: args.conversationId,
+        },
+        true
+      );
+    }
+
     markExplicitResponse(args.channel, args.conversationId);
 
     const result: Record<string, unknown> = {
