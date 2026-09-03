@@ -109,13 +109,28 @@ export async function runCompaction(
       const chunk = oldest
         .map((e) => `${e.role.toUpperCase()}${e.source ? ` [${e.source}]` : ''}: ${e.content}`)
         .join('\n\n');
-      const result = await deps.summarize(chunk, req.signal);
-      // Recorded on EVERY outcome — an aborted or failed summarizer still spent
-      // its tokens (Lumen, PR #578).
-      deps.recordUsage(result.usage);
-      if (req.signal?.aborted) failure = 'cancelled';
-      else if (!result.text.trim()) failure = result.error || 'empty summary';
-      else summaryText = result.text.trim();
+      // The dependency can REJECT, not just answer with an error: spawn
+      // preparation, stream finalization, cleanup. Outside a catch that
+      // escaped to the tool executor for an agent and out of the pre-turn
+      // budget check for the system — no "pass your own summary", no hard
+      // trim (Lumen, PR #578 round 4). A rejection is a failure like any
+      // other here, on the same actor split.
+      let result: SummarizerResult | undefined;
+      try {
+        result = await deps.summarize(chunk, req.signal);
+      } catch (error) {
+        failure = error instanceof Error ? error.message : String(error);
+      }
+      if (result !== undefined) {
+        // Recorded on EVERY outcome — an aborted or failed summarizer still
+        // spent its tokens (Lumen, PR #578).
+        deps.recordUsage(result.usage);
+        if (req.signal?.aborted) failure = 'cancelled';
+        else if (!result.text.trim()) failure = result.error || 'empty summary';
+        else summaryText = result.text.trim();
+      } else if (req.signal?.aborted) {
+        failure = 'cancelled';
+      }
     }
     if (failure !== undefined) {
       if (req.actor === 'sb' || req.signal?.aborted || !deps.hardTrim) {

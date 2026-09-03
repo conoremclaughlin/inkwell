@@ -4874,7 +4874,6 @@ export async function runChat(options: ChatOptions): Promise<void> {
     if (compactionInFlight) return { ok: false, error: 'a compaction is already in progress' };
     compactionInFlight = true;
     try {
-      const before = ledger.totalTokens();
       const outcome = await runCompaction(opts, {
         ledger,
         keepRecentDefault: AUTO_COMPACT_KEEP_RECENT_ENTRIES,
@@ -4929,7 +4928,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
         // now out of the context window (replaced by the summary).
         printEvent(
           renderContextCutoff(
-            `compacted ${outcome.removed} entries · ${formatTokenCount(before)} → ${formatTokenCount(outcome.totalAfter)} tok (freed ${formatTokenCount(outcome.freedTokens)})`
+            // Live pre-mutation total, as the result reports it — the
+            // wrapper's own pre-await snapshot showed "10K → 11K (freed 1K)"
+            // when entries arrived during summarization (Lumen, PR #578 round 4).
+            `compacted ${outcome.removed} entries · ${formatTokenCount(outcome.before)} → ${formatTokenCount(outcome.totalAfter)} tok (freed ${formatTokenCount(outcome.freedTokens)})`
           )
         );
         // ink just rolled the ledger — roll the provider session too so the

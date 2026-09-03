@@ -123,6 +123,28 @@ describe('runCompaction', () => {
     if (!s.ok) expect(s.hardTrimmed).toBe(3);
   });
 
+  it('REGRESSION (Lumen, round 4): a summarizer that REJECTS is a failure on the same actor split', async () => {
+    const rejecting = async () => {
+      throw new Error('spawn exploded');
+    };
+    const agent = deps(ledgerOf(13), { summarize: rejecting });
+    const a = await runCompaction({ reason: 'test', actor: 'sb' }, agent);
+    expect(a.ok).toBe(false);
+    if (!a.ok) {
+      expect(a.error).toContain('spawn exploded');
+      expect(a.error).toContain('pass your own summary');
+    }
+    expect(agent.persisted).toHaveLength(0);
+    expect(agent.ledger.listEntries()).toHaveLength(13);
+
+    const hardTrim = vi.fn(async () => ({ removed: 2 }));
+    const system = deps(ledgerOf(13), { summarize: rejecting, hardTrim });
+    const s = await runCompaction({ reason: 'auto', actor: 'system' }, system);
+    expect(s.ok).toBe(false);
+    expect(hardTrim).toHaveBeenCalledTimes(1);
+    if (!s.ok) expect(s.hardTrimmed).toBe(2);
+  });
+
   it('a marker that cannot be persisted leaves the ledger unchanged and says so', async () => {
     const ledger = ledgerOf(13);
     const snapshot = ledger.listEntries().map((e) => e.content);
