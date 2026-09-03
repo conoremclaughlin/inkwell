@@ -614,11 +614,25 @@ describe('runAgentLoop — final relay at the iteration cap (PR #491 port)', () 
     expect(result.responseText).not.toContain('relay boom');
   });
 
-  it('does NOT relay when a screen rejection is what reached the cap', async () => {
+  /**
+   * Was: "does NOT relay when a screen rejection is what reached the cap".
+   *
+   * That exclusion existed because the relay could not be trusted to carry the
+   * right thing — its own comment said a third turn "would relay iteration 1's
+   * already-seen results and bury iteration 2's refusal". True of a payload
+   * assembled from variables that drifted; false now that one object is
+   * captured per iteration (Lumen, PR #573 round 3).
+   *
+   * And the exclusion had a cost, which is the failure this PR is about: when
+   * the cap fires inside the rejection branch it breaks BEFORE the
+   * continuation, so the model was never told its calls were refused. It
+   * emitted spawn_agent + read, got neither, and the turn ended in silence.
+   */
+  it('relays the REFUSAL that reached the cap — not an earlier iteration', async () => {
     const harness = makePorts([
       outcome({ responseText: `t1 ${inkTool('send_response', { content: 'hi' })}` }),
       outcome({ responseText: `t2 ${inkTool('spawn_agent')}\n${inkTool('read')}` }),
-      outcome({ responseText: 'should never be requested' }),
+      outcome({ responseText: 'final answer' }),
     ]);
     // Iteration 1 passes the screen and executes; iteration 2 is refused whole,
     // and that refusal is what hits the cap.
@@ -632,10 +646,13 @@ describe('runAgentLoop — final relay at the iteration cap (PR #491 port)', () 
     );
 
     expect(result.stopReason).toBe('iteration-cap');
-    // Opening turn + 1 continuation. A third turn would relay iteration 1's
-    // already-seen results and bury iteration 2's refusal.
-    expect(harness.prompts).toHaveLength(2);
-    expect(harness.prompts.some((p) => p.body.includes('FINAL'))).toBe(false);
+    expect(harness.prompts).toHaveLength(3);
+    const relay = harness.prompts[2]!.body;
+    expect(relay).toContain('FINAL');
+    // What actually stopped the loop.
+    expect(relay).toContain('spawn_agent must be alone');
+    // NOT iteration 1's already-delivered work.
+    expect(relay).not.toContain('send_response');
     expect(harness.executed).toHaveLength(1);
     // The refusal is what ended the turn, and it is on the record.
     expect(result.toolResults.at(-1)).toEqual({
@@ -983,6 +1000,107 @@ describe('silently dropped tool calls (the per-iteration cap)', () => {
       await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
       // No drops, no failures — the agent knows what it signaled. One prompt.
       expect(harness.prompts).toHaveLength(1);
+    });
+  });
+
+  /**
+   * Round three, both Lumen's: the relay payload was assembled from variables
+   * that could describe different iterations at the same moment.
+   */
+  describe('the relay payload describes ONE iteration', () => {
+    /**
+     * A clean terminal signal with capped calls opened the relay on the drop
+     * count while the results variable was still empty — so the body announced
+     * "no tool results" and withheld the five outcomes that existed.
+     */
+    it('carries the results alongside the drops, not instead of them', async () => {
+      const emitted = ['m1', 'm2', 'm3', 'm4', 'signal_status', 'm6', 'm7', 'm8'];
+      const harness = makePorts(
+        [
+          outcome({ stdout: emitted.map((t) => inkTool(t)).join('\n') }),
+          outcome({ stdout: 'final answer' }),
+        ],
+        (calls) =>
+          calls.map((c) => ({
+            tool: c.tool,
+            result: c.tool === 'signal_status' ? signalResult('completed') : 'ok',
+            status: 'executed',
+          }))
+      );
+
+      await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+
+      const relay = harness.prompts[1]!.body;
+      // The drops, as before.
+      for (const tool of ['m6', 'm7', 'm8']) expect(relay).toContain(tool);
+      // AND the outcomes that actually happened, which were being withheld.
+      for (const tool of ['m1', 'm2', 'm3', 'm4']) expect(relay).toContain(`Tool ${tool}`);
+      expect(relay).not.toContain('no tool results');
+    });
+
+    /**
+     * The clear-on-delivery step, which the rejection repro does NOT cover —
+     * that one passes even with the clear removed, because the rejection branch
+     * overwrites the payload with its own. Found by mutating the clear and
+     * watching every test stay green.
+     *
+     * Here nothing overwrites it: iteration 1's drops are delivered by its
+     * continuation, then iteration 2 emits no tools at all and the loop ends.
+     * Without the clear, the stale payload opens the relay and re-delivers
+     * drops the model has already acted on.
+     */
+    it('does not relay drops after a later iteration ends cleanly', async () => {
+      const first = ['m1', 'm2', 'm3', 'm4', 'm5', 'm6', 'm7', 'm8'];
+      const harness = makePorts([
+        outcome({ stdout: first.map((t) => inkTool(t)).join('\n') }),
+        outcome({ stdout: 'all done, no more tools needed' }),
+        outcome({ stdout: 'should never be requested' }),
+      ]);
+
+      const result = await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+
+      expect(result.stopReason).toBe('no-tools');
+      // Iteration 1's continuation reported the drops...
+      expect(harness.prompts[1]!.body).toContain('m6');
+      // ...and that is the end of it. No FINAL relay repeating them.
+      expect(harness.prompts).toHaveLength(2);
+      expect(harness.prompts.some((pr) => pr.body.includes('FINAL'))).toBe(false);
+    });
+
+    /**
+     * Iteration 1 drops m6-m8 and REPORTS them in its continuation. Iteration 2
+     * then stops on a screen rejection. Nothing reset the drop counters, so the
+     * stale count opened the relay and re-delivered drops the model had already
+     * seen, in place of the rejection that stopped the loop.
+     */
+    it('does not re-deliver drops a continuation already reported', async () => {
+      const first = ['m1', 'm2', 'm3', 'm4', 'm5', 'm6', 'm7', 'm8'];
+      const harness = makePorts([
+        outcome({ stdout: first.map((t) => inkTool(t)).join('\n') }),
+        outcome({ stdout: `t2 ${inkTool('spawn_agent')}\n${inkTool('read')}` }),
+        outcome({ stdout: 'final answer' }),
+      ]);
+      let screened = 0;
+      harness.ports.tools.screen = (all) =>
+        screened++ === 0
+          ? { calls: all.slice(0, MAX_TOOL_CALLS_PER_ITERATION) }
+          : { rejected: 'spawn_agent must be alone' };
+
+      const result = await runAgentLoop(
+        { prompt: 'go', toolRouting: 'local', maxIterations: 2 },
+        harness.ports
+      );
+
+      expect(result.stopReason).toBe('iteration-cap');
+      // Iteration 1's continuation is where the drops belong.
+      expect(harness.prompts[1]!.body).toContain('m6');
+
+      const relay = harness.prompts[2]!.body;
+      expect(relay).toContain('FINAL');
+      // The refusal that actually stopped the loop...
+      expect(relay).toContain('spawn_agent must be alone');
+      // ...and NOT iteration 1's already-delivered drops.
+      for (const tool of ['m6', 'm7', 'm8']) expect(relay).not.toContain(tool);
     });
   });
 

@@ -33,6 +33,32 @@ export interface ToolResultRecord {
 }
 
 /**
+ * Everything ONE iteration produced, captured together.
+ *
+ * The FINAL relay used to assemble itself from three variables that were
+ * updated at different places and could describe different iterations at the
+ * same moment (Lumen, PR #573 round 3). Two ways that went wrong, both real:
+ *
+ *   - A clean terminal signal with capped calls opened the relay on
+ *     `lastNotRunCount` while `relayResults` was still empty, so the body
+ *     announced "no tool results" and withheld the five outcomes that existed.
+ *   - Iteration 1 dropped m6-m8 and REPORTED them in its continuation; then
+ *     iteration 2 stopped on a screen rejection. Nothing reset the drop
+ *     counters, so the stale count opened the relay, re-delivered iteration
+ *     1's already-seen drops, and omitted the rejection that actually stopped
+ *     the loop.
+ *
+ * One object, written at the moment the iteration exists and cleared the
+ * moment a continuation delivers it, cannot disagree with itself.
+ */
+interface StrandedIteration {
+  results: ToolResultRecord[];
+  /** Known by identity not to have run; empty when identity is unreliable. */
+  dropped: LocalToolCall[];
+  notRunCount: number;
+}
+
+/**
  * Why a turn's tool loop stopped. Today the loop's exit is implicit; naming it
  * lets a caller distinguish "the agent finished" from "we ran out of budget",
  * which a shadow clone must report back to its parent.
@@ -352,9 +378,8 @@ export async function runAgentLoop(
   // Tracking "the last results seen" as ambient state relays the wrong thing:
   // a screen rejection at the cap would replay the previous iteration's
   // already-seen results and omit the refusal that actually ended the loop.
-  let relayResults: ToolResultRecord[] = [];
-  let lastDropped: LocalToolCall[] = [];
-  let lastNotRunCount = 0;
+  // The one payload the FINAL relay may send. Null means nothing is stranded.
+  let stranded: StrandedIteration | null = null;
 
   for (;;) {
     responseText = resolveResponseText(outcome);
@@ -381,6 +406,10 @@ export async function runAgentLoop(
       };
       allToolResults.push(record);
       ports.ui.printEvent(`  ⋯ iteration refused — ${screened.rejected}`);
+      // A refusal is this iteration's entire output. Captured here so that if
+      // the cap fires below, the relay carries the rejection that stopped the
+      // loop rather than a previous iteration's leftovers.
+      stranded = { results: [record], dropped: [], notRunCount: 0 };
 
       if (iteration >= maxIterations) {
         stopReason = 'iteration-cap';
@@ -407,6 +436,8 @@ export async function runAgentLoop(
         stopReason = 'backend-failure';
         break;
       }
+      // The continuation carried the refusal; nothing is stranded.
+      stranded = null;
       continue;
     }
 
@@ -431,11 +462,6 @@ export async function runAgentLoop(
     const droppedByIdentity = extracted.filter((c) => !calls.includes(c));
     const identityReliable = droppedByIdentity.length === notRunCount;
     const dropped = identityReliable ? droppedByIdentity : [];
-    // Mirrored outward so the FINAL relay can carry it too: a turn that ends at
-    // the iteration cap with calls still undelivered would otherwise exit
-    // silently, which is the same swallow one level up.
-    lastDropped = dropped;
-    lastNotRunCount = notRunCount;
     if (notRunCount > 0) {
       const which = identityReliable
         ? `: ${dropped.map((c) => c.tool).join(', ')}`
@@ -453,6 +479,9 @@ export async function runAgentLoop(
     const results = await ports.tools.execute(calls, { iteration, signal: input.signal });
     allToolResults.push(...results);
     for (const r of results) ports.observe?.recordToolCall(r);
+    // Results and drops together, from the same iteration, at the one moment
+    // both are known. Every exit below inherits exactly this.
+    stranded = { results, dropped, notRunCount };
 
     iteration++;
 
@@ -475,7 +504,6 @@ export async function runAgentLoop(
     if (reason && !retryAfterRefusal) {
       stopReason = reason;
       if (reason === 'iteration-cap') {
-        relayResults = results;
         ports.ui.printLine(`(tool loop limit reached — ${maxIterations} iterations)`);
       } else if (hasUnseenFailure(results)) {
         // A call that THREW is not a refusal, and nobody watched it happen.
@@ -508,7 +536,11 @@ export async function runAgentLoop(
         // Terminal semantics are preserved: this only populates the FINAL relay,
         // whose output is not extracted, so nothing re-executes and no signal is
         // multiplied.
-        relayResults = results;
+        //
+        // The capture itself now happens once, above, the moment the iteration
+        // completes. What survives here is only the POLICY question of whether
+        // this stop deserves a relay — answered at the gate against that one
+        // payload rather than by writing to a second variable from here.
       }
       break;
     }
@@ -543,6 +575,10 @@ export async function runAgentLoop(
       stopReason = 'backend-failure';
       break;
     }
+    // Delivered: this iteration's results AND its drops both went out in the
+    // continuation, so none of it is stranded. Clearing here is what stops a
+    // later iteration from re-reporting it.
+    stranded = null;
   }
 
   // FINAL RELAY (PR #491 port): the loop exited at the iteration cap, so the
@@ -564,12 +600,17 @@ export async function runAgentLoop(
   // `error` (see hasUnseenFailure), so a witnessed denial still ends the turn
   // quietly and nobody gets nagged for saying no.
   // Stranded DROPS open this gate too, not just stranded results (Lumen,
-  // PR #573 round 2). `lastNotRunCount` was mirrored outward so the relay could
-  // carry it, but the gate still asked only about results — so the clean repro
-  // (signal_status completing in position five, four ordinary calls above it,
-  // three capped below) produced a single backend prompt and silently stranded
-  // the three. Every result was `executed`, so hasUnseenFailure was false and
-  // relayResults stayed empty: the mirroring was real and the door was shut.
+  // PR #573 round 2): the clean repro — signal_status completing in position
+  // five, four ordinary calls above it, three capped below — produced a single
+  // backend prompt and silently stranded the three. Every result was
+  // `executed`, so hasUnseenFailure was false and nothing else opened the door.
+  //
+  // The PAYLOAD is `stranded`, captured whole per iteration; this decides only
+  // WHETHER to send it (round 3). Reading both from one object is what stops
+  // the relay describing two different iterations at once — announcing "no tool
+  // results" next to a drop count, or re-delivering an earlier iteration's
+  // already-reported drops in place of the rejection that actually stopped the
+  // loop.
   //
   // Same default-to-loud argument as hasUnseenFailure one level up — key on
   // the FACTS of the iteration, not on the stop reason, so a reason added later
@@ -577,14 +618,18 @@ export async function runAgentLoop(
   // relay's output is not extracted, so nothing re-executes and no signal is
   // multiplied. The agent knows what it signaled; it does not know what the cap
   // ate underneath the signal.
-  const strandedDrops = lastNotRunCount > 0;
-  if ((relayResults.length > 0 || strandedDrops) && outcome.success && !input.signal?.aborted) {
+  const relayWorthy =
+    stranded !== null &&
+    (stranded.notRunCount > 0 ||
+      stopReason === 'iteration-cap' ||
+      hasUnseenFailure(stranded.results));
+  if (relayWorthy && outcome.success && !input.signal?.aborted) {
     ports.ui.printEvent('  ⋯ relaying final tool results (no further execution)…');
     const stopRelayWaiting = ports.ui.startWaiting();
     let relay: BackendTurnOutcome;
     try {
       relay = await ports.backend.runTurn(
-        buildFinalRelayBody(relayResults, lastDropped, lastNotRunCount),
+        buildFinalRelayBody(stranded!.results, stranded!.dropped, stranded!.notRunCount),
         {
           iteration,
           isContinuation: true,
