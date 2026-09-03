@@ -126,19 +126,9 @@ function walk(pieces: Piece[], text: string, i: number, prefix: boolean): boolea
   if ('ws' in piece) {
     let j = i;
     while (j < text.length && isWs(text[j])) j += 1;
-    // When the next piece is a literal that cannot begin with whitespace, only
-    // the whole run can precede it — one position to try, not every split.
-    // Backtracking is kept for the cases that need it (a following choice or
-    // run); the grammar never places two runs side by side.
-    const next = rest[0];
-    if (
-      next !== undefined &&
-      'literal' in next &&
-      next.literal.length > 0 &&
-      !isWs(next.literal[0])
-    ) {
-      return walk(rest, text, j, prefix);
-    }
+    // Longest run first, then shorter — a following choice may want the space.
+    // Linear in the run: the grammar never places two runs side by side, and
+    // a literal fails in one comparison, so each split costs O(1).
     for (let k = j; k >= i; k -= 1) if (walk(rest, text, k, prefix)) return true;
     return false;
   }
