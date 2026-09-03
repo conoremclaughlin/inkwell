@@ -305,6 +305,9 @@ export class InkRunner implements IRunner {
     if (config.model) {
       args.push('--model', config.model);
     }
+    if (config.effort) {
+      args.push('--effort', config.effort);
+    }
 
     // Turn backstop only — the real limit is the CLI's token budget
     // (200K default), which auto-compacts the transcript when approached.

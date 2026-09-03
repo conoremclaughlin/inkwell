@@ -346,6 +346,9 @@ export class ClaudeRunner implements IRunner {
     if (config.model) {
       args.push('--model', config.model);
     }
+    if (config.effort) {
+      args.push('--effort', config.effort);
+    }
 
     // MCP config — use --strict-mcp-config so the injected temp file
     // (with auth headers) takes exclusive precedence over the workspace

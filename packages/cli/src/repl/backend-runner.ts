@@ -17,6 +17,8 @@ export interface BackendRunRequest {
   backend: string;
   agentId: string;
   model?: string;
+  /** Reasoning effort for the spawn (claude: low | medium | high | xhigh | max). */
+  effort?: string;
   prompt: string;
   verbose?: boolean;
   passthroughArgs?: string[];
@@ -109,6 +111,7 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
   const prepared = adapter.prepare({
     agentId: request.agentId,
     model: request.model,
+    effort: request.effort,
     prompt: request.prompt,
     promptParts,
     passthroughArgs: request.passthroughArgs || [],

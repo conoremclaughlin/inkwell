@@ -227,14 +227,32 @@ export function resolveRuntimeModel(options: {
   return pin || fleetDefault;
 }
 
+/** Effort levels the claude CLI accepts (`claude --effort <level>`). */
+export const RUNTIME_EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
+export type RuntimeEffort = (typeof RUNTIME_EFFORT_LEVELS)[number];
+
 export function parseRuntimeConfig(metadata: unknown): {
   maxTurns?: number;
   toolRouting: 'backend' | 'local';
   model?: string;
+  effort?: RuntimeEffort;
+  /**
+   * An effort the operator set that the CLI would reject, dropped so the SB
+   * still spawns. Reported rather than swallowed: a silent fallback lets the
+   * operator believe an explicit setting is active when it is not (Lumen,
+   * PR #579).
+   */
+  effortRejected?: string;
 } {
   const meta = (metadata ?? {}) as Record<string, unknown>;
   const rc = (meta.runtimeConfig ?? {}) as Record<string, unknown>;
-  const out: { maxTurns?: number; toolRouting: 'backend' | 'local'; model?: string } = {
+  const out: {
+    maxTurns?: number;
+    toolRouting: 'backend' | 'local';
+    model?: string;
+    effort?: RuntimeEffort;
+    effortRejected?: string;
+  } = {
     toolRouting: 'local',
   };
   if (typeof rc.maxTurns === 'number' && Number.isFinite(rc.maxTurns)) {
@@ -249,6 +267,19 @@ export function parseRuntimeConfig(metadata: unknown): {
   // model-not-found error on the next spawn.
   if (typeof rc.model === 'string' && rc.model.trim()) {
     out.model = rc.model.trim();
+  }
+  // Per-SB reasoning effort (Myra on xhigh while the fleet default is the
+  // provider's). Validated against the levels the claude CLI accepts, lower-
+  // cased; anything else is dropped rather than passed through to fail the
+  // spawn. Set by the operator: `UPDATE agent_identities SET metadata =
+  // jsonb_set(metadata, '{runtimeConfig,effort}', '"xhigh"')`.
+  if (rc.effort !== undefined && rc.effort !== null) {
+    const effort = typeof rc.effort === 'string' ? rc.effort.trim().toLowerCase() : '';
+    if ((RUNTIME_EFFORT_LEVELS as readonly string[]).includes(effort)) {
+      out.effort = effort as RuntimeEffort;
+    } else {
+      out.effortRejected = String(rc.effort);
+    }
   }
   return out;
 }
@@ -1565,6 +1596,7 @@ export class SessionService implements ISessionService {
     // 'local' (ink-owned, provider withheld) and maxTurns stays default.
     let runtimeMaxTurns: number | undefined;
     let runtimeToolRouting: 'backend' | 'local' = 'local';
+    let runtimeEffort: RuntimeEffort | undefined;
     if (this.supabase) {
       // SB-level default from agent_identities
       const { data: identity } = session.sbId
@@ -1579,6 +1611,15 @@ export class SessionService implements ISessionService {
       const parsed = parseRuntimeConfig(identity?.metadata);
       runtimeMaxTurns = parsed.maxTurns;
       runtimeToolRouting = parsed.toolRouting;
+      runtimeEffort = parsed.effort;
+      if (parsed.effortRejected !== undefined) {
+        logger.warn('[RuntimeConfig] Ignoring invalid effort — the provider default applies', {
+          agentId: session.agentId,
+          sbId: session.sbId,
+          effort: parsed.effortRejected,
+          accepted: RUNTIME_EFFORT_LEVELS,
+        });
+      }
       // Per-SB model pin beats the global env default (DEFAULT_CLAUDE_MODEL
       // et al.) — lets one SB run a different model than the fleet without a
       // server restart (dashboard/DB-tunable, like maxTurns).
@@ -1632,6 +1673,7 @@ export class SessionService implements ISessionService {
         }
       ),
       ...(runtimeModel ? { model: runtimeModel } : {}),
+      ...(runtimeEffort ? { effort: runtimeEffort } : {}),
       ...(pcpAccessToken ? { pcpAccessToken } : {}),
       pcpSessionId: session.id,
       agentId,

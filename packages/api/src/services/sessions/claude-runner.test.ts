@@ -388,3 +388,23 @@ describe('ClaudeRunner — resume does not re-inject context', () => {
     }
   });
 });
+
+describe('ClaudeRunner.buildArgs — effort (task 7ea6cdf7)', () => {
+  it('forwards --effort to the claude CLI when configured, and never otherwise', () => {
+    const runner = new ClaudeRunner();
+    const withEffort = (runner as any).buildArgs('session-eff', false, {
+      workingDirectory: '/tmp',
+      mcpConfigPath: '/tmp/.mcp.json',
+      effort: 'xhigh',
+    });
+    const idx = withEffort.indexOf('--effort');
+    expect(idx).toBeGreaterThan(-1);
+    expect(withEffort[idx + 1]).toBe('xhigh');
+
+    const without = (runner as any).buildArgs('session-eff2', false, {
+      workingDirectory: '/tmp',
+      mcpConfigPath: '/tmp/.mcp.json',
+    });
+    expect(without).not.toContain('--effort');
+  });
+});

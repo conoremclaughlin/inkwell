@@ -233,6 +233,11 @@ export class ClaudeAdapter implements BackendAdapter {
     if (config.model) {
       args.push('--model', config.model);
     }
+    // Effort: per-SB from the identity's runtimeConfig, threaded through
+    // `ink chat --effort`; absent leaves the CLI's own/user-level setting.
+    if (config.effort) {
+      args.push('--effort', config.effort);
+    }
 
     // Identity (inline text, no temp file needed)
     args.push('--append-system-prompt', identityPrompt);
