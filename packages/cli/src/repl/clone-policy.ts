@@ -94,6 +94,10 @@ export const CLONE_BASELINE_TOOLS: readonly string[] = [
  * damage the parent would never see.
  */
 export const CLONE_DENIED_TOOLS: readonly string[] = [
+  // A clone's ledger is a throwaway; there is no provider session of its own
+  // to re-seed from a summary. The handler refuses it too — the prompt just
+  // does not offer it.
+  'compact_context',
   // Memory belongs to the original. Clones hand work back; the parent decides
   // what was worth remembering. Spec decision #5 — enforced, not conventional.
   'remember',

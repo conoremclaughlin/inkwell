@@ -146,6 +146,28 @@ export const LOCAL_TOOL_CATALOG: readonly LocalToolEntry[] = [
     },
   },
   {
+    name: 'compact_context',
+    group: 'client-local',
+    summary:
+      'Compact your context window: everything but the most recent entries is replaced by a summary, and the provider session is re-seeded from it.',
+    args: 'summary (string, optional — your own brief of what matters; omit to have the runtime summarize), keepRecent (number, optional, default 12)',
+    note: 'Prefer writing the summary yourself: you know which decisions, identifiers and open threads matter. Compaction is lossy — remember anything that must outlive the session first.',
+    parameters: {
+      type: 'object',
+      properties: {
+        summary: {
+          type: 'string',
+          description:
+            'Your own continuation brief: decisions and why, work done and in progress, key facts, open questions, identifiers. Omit to have the runtime summarize.',
+        },
+        keepRecent: {
+          type: 'number',
+          description: 'Recent entries kept verbatim after the summary (default 12, max 200).',
+        },
+      },
+    },
+  },
+  {
     name: 'signal_status',
     group: 'client-local',
     summary: 'Signal your session status.',

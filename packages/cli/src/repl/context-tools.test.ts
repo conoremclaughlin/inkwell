@@ -3,7 +3,10 @@ import { ContextLedger } from './context-ledger.js';
 import {
   isClientLocalTool,
   handleClientLocalTool,
+  parseCompactContextArgs,
   CLIENT_LOCAL_TOOLS,
+  COMPACT_CONTEXT_MAX_KEEP_RECENT,
+  COMPACT_CONTEXT_SUMMARY_MAX_CHARS,
   EVICT_CONTEXT_PREVIEW_LIMIT,
   LIST_CONTEXT_BOOKMARK_LIMIT,
   LIST_CONTEXT_DEFAULT_LIMIT,
@@ -448,5 +451,58 @@ describe('eviction affects prompt transcript', () => {
 
     const transcript = ledger.buildPromptTranscript();
     expect(transcript).toBe('');
+  });
+});
+
+// ─── compact_context (task 609b1833) ────────────────────────────
+
+describe('compact_context', () => {
+  it('is client-local: policy bypass, never forwarded to the server, never persisted into the ledger', () => {
+    expect(isClientLocalTool('compact_context')).toBe(true);
+  });
+
+  it('is refused by the generic handler — only the REPL host can compact', () => {
+    const ledger = new ContextLedger();
+    ledger.addEntry('user', 'hello');
+    const result = handleClientLocalTool('compact_context', { summary: 'x' }, ledger);
+    expect(result?.isError).toBe(true);
+    expect(parseResult(result).error).toContain('not available');
+    expect(ledger.listEntries()).toHaveLength(1);
+  });
+
+  describe('parseCompactContextArgs', () => {
+    it('accepts an agent-written summary and a keepRecent', () => {
+      expect(parseCompactContextArgs({ summary: '  the brief  ', keepRecent: 4.7 })).toEqual({
+        summary: 'the brief',
+        keepRecent: 4,
+      });
+    });
+
+    it('accepts nothing — the runtime summarizes with its default tail', () => {
+      expect(parseCompactContextArgs({})).toEqual({});
+    });
+
+    it('rejects an empty or oversized summary and a bad keepRecent', () => {
+      expect(parseCompactContextArgs({ summary: '   ' })).toMatchObject({
+        error: expect.stringContaining('empty'),
+      });
+      expect(parseCompactContextArgs({ summary: 42 })).toMatchObject({
+        error: expect.stringContaining('string'),
+      });
+      expect(
+        parseCompactContextArgs({ summary: 'x'.repeat(COMPACT_CONTEXT_SUMMARY_MAX_CHARS + 1) })
+      ).toMatchObject({ error: expect.stringContaining('ceiling') });
+      expect(parseCompactContextArgs({ keepRecent: -1 })).toMatchObject({
+        error: expect.stringContaining('non-negative'),
+      });
+      expect(parseCompactContextArgs({ keepRecent: 'many' })).toMatchObject({
+        error: expect.stringContaining('non-negative'),
+      });
+      expect(
+        parseCompactContextArgs({ keepRecent: COMPACT_CONTEXT_MAX_KEEP_RECENT + 1 })
+      ).toMatchObject({
+        error: expect.stringContaining('at most'),
+      });
+    });
   });
 });

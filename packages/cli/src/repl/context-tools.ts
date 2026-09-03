@@ -74,7 +74,12 @@ export function clearLastSignal(): void {
 }
 
 /** Tool names that are handled client-locally, not forwarded to PCP */
-export const CLIENT_LOCAL_TOOLS = new Set(['list_context', 'evict_context', 'signal_status']);
+export const CLIENT_LOCAL_TOOLS = new Set([
+  'list_context',
+  'evict_context',
+  'compact_context',
+  'signal_status',
+]);
 
 export function isClientLocalTool(toolName: string): boolean {
   return CLIENT_LOCAL_TOOLS.has(toolName);
@@ -124,11 +129,80 @@ export function handleClientLocalTool(
       return handleListContext(args, ledger);
     case 'evict_context':
       return handleEvictContext(args, ledger, hooks);
+    case 'compact_context':
+      // Compaction needs the host: a summarizer turn, the transcript event,
+      // and the provider-session roll. The REPL intercepts this name before
+      // reaching here; anywhere else (a shadow clone's throwaway ledger) it
+      // is honestly unavailable rather than silently a no-op.
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              success: false,
+              error:
+                'compact_context is not available in this context (a shadow clone cannot compact; report what you found and let your parent act on it).',
+            }),
+          },
+        ],
+        isError: true,
+      };
     case 'signal_status':
       return handleSignalStatus(args, signalSink);
     default:
       return null;
   }
+}
+
+// ─── compact_context ────────────────────────────────────────────
+
+/** Ceiling on an agent-written compaction summary. */
+export const COMPACT_CONTEXT_SUMMARY_MAX_CHARS = 20_000;
+/** Ceiling on the protected recent tail an agent may ask to keep verbatim. */
+export const COMPACT_CONTEXT_MAX_KEEP_RECENT = 200;
+
+export interface CompactContextArgs {
+  /** The agent's own brief. Absent means the runtime summarizes. */
+  summary?: string;
+  /** Entries kept verbatim after the summary. Absent means the runtime default. */
+  keepRecent?: number;
+}
+
+/**
+ * Validate a `compact_context` call. Pure, so the shape the runtime accepts
+ * is testable without the host.
+ *
+ * The agent writing its own summary is the preferred path — it knows which
+ * decisions, identifiers and open threads matter, and it costs no summarizer
+ * turn. Omitting it asks the runtime to summarize the oldest entries the
+ * same way auto-compaction does.
+ */
+export function parseCompactContextArgs(
+  args: Record<string, unknown>
+): CompactContextArgs | { error: string } {
+  const out: CompactContextArgs = {};
+  if (args.summary !== undefined) {
+    if (typeof args.summary !== 'string') return { error: 'summary must be a string' };
+    const summary = args.summary.trim();
+    if (!summary) return { error: 'summary is empty — omit it to have the runtime summarize' };
+    if (summary.length > COMPACT_CONTEXT_SUMMARY_MAX_CHARS) {
+      return {
+        error: `summary is ${summary.length} chars; the ceiling is ${COMPACT_CONTEXT_SUMMARY_MAX_CHARS} — a compaction summary should be a dense brief, not the transcript`,
+      };
+    }
+    out.summary = summary;
+  }
+  if (args.keepRecent !== undefined) {
+    const n = args.keepRecent;
+    if (typeof n !== 'number' || !Number.isFinite(n) || n < 0) {
+      return { error: 'keepRecent must be a non-negative number' };
+    }
+    if (n > COMPACT_CONTEXT_MAX_KEEP_RECENT) {
+      return { error: `keepRecent must be at most ${COMPACT_CONTEXT_MAX_KEEP_RECENT}` };
+    }
+    out.keepRecent = Math.floor(n);
+  }
+  return out;
 }
 
 // ─── list_context ───────────────────────────────────────────────

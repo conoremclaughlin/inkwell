@@ -113,6 +113,7 @@ import {
   isClientLocalTool,
   handleClientLocalTool,
   globalSignalSink,
+  parseCompactContextArgs,
   type SignalSink,
   getLastSignal,
   clearLastSignal,
@@ -4859,6 +4860,159 @@ export async function runChat(options: ChatOptions): Promise<void> {
       '</conversation>',
     ].join('\n');
 
+  /**
+   * Compact the ledger NOW: replace everything but the most recent entries
+   * with a summary, write the `compaction` event, roll the provider session.
+   *
+   * Two callers. Auto-compaction (below) reaches it over the budget threshold
+   * with the runtime summarizing. An agent reaches it through the
+   * `compact_context` tool, usually with its OWN summary — the one thing a
+   * long-lived SB could not do for itself (Myra, 2026-09-03: "TECHNICALLY she
+   * could self-compact just using eviction after writing a summary"; task
+   * 609b1833). Returns what happened so the tool can report it; never
+   * hard-trims on an agent's behalf — a failed summarizer turn is an error
+   * the agent can answer by writing the summary itself.
+   */
+  const compactContextNow = async (opts: {
+    reason: string;
+    actor: 'system' | 'sb';
+    summaryText?: string;
+    keepRecent?: number;
+  }): Promise<
+    | {
+        ok: true;
+        removed: number;
+        removedTokens: number;
+        summaryTokens: number;
+        before: number;
+        totalAfter: number;
+      }
+    | { ok: false; error: string }
+  > => {
+    if (compactionInFlight) return { ok: false, error: 'a compaction is already in progress' };
+    const keepRecent = opts.keepRecent ?? AUTO_COMPACT_KEEP_RECENT_ENTRIES;
+    const entries = ledger.listEntries();
+    const cutoff = Math.max(0, entries.length - keepRecent);
+    if (cutoff === 0) {
+      return {
+        ok: false,
+        error: `nothing to compact — only the protected recent tail remains (${entries.length} entries, keepRecent ${keepRecent})`,
+      };
+    }
+
+    compactionInFlight = true;
+    let changed = false;
+    try {
+      const oldest = entries.slice(0, cutoff);
+      const before = ledger.totalTokens();
+      printEvent(
+        chalk.yellow(
+          `  ⛁ Context at ${formatTokenCount(before)} tok — compacting ${oldest.length} entries (${opts.reason})`
+        )
+      );
+
+      try {
+        let summaryText = opts.summaryText?.trim() ?? '';
+        if (!summaryText) {
+          const chunk = oldest
+            .map((e) => `${e.role.toUpperCase()}${e.source ? ` [${e.source}]` : ''}: ${e.content}`)
+            .join('\n\n');
+          const turn = await runBackendTurn({
+            backend: runtime.backend,
+            agentId,
+            model: runtime.model,
+            effort: runtime.effort,
+            prompt: buildCompactionPrompt(chunk),
+            // Compaction is a backend turn like any other, so it goes through
+            // adapter.prepare() and would otherwise regenerate the default
+            // identity prompt — handing a nascent SB "You are nascent, call
+            // bootstrap" the moment its first conversation grew long enough to
+            // compact (Lumen, PR #485 — finding 2).
+            systemPromptOverride: runtime.systemPromptOverride,
+            // Summarization is governed like any other turn: token-flow (idle)
+            // is the reaper, with the 4h runaway backstop. An explicit
+            // --backend-timeout-seconds still caps it, floored at 5 min —
+            // summarizing a large chunk outlives short overrides.
+            timeoutMs: runtime.backendTurnTimeoutMs
+              ? Math.max(runtime.backendTurnTimeoutMs, 5 * 60 * 1000)
+              : undefined,
+            idleTimeoutMs: runtime.backendIdleTimeoutMs,
+            stream: true,
+          });
+          summaryText = turn.success ? (turn.responseText ?? turn.stdout).trim() : '';
+          if (!summaryText) {
+            throw new Error(turn.stderr.trim().slice(0, 200) || `exit code ${turn.exitCode}`);
+          }
+        }
+
+        const summary = `[Conversation summary — compacted ${oldest.length} earlier entries${
+          opts.actor === 'sb' ? ', written by the agent' : ''
+        }]\n${summaryText}`;
+        const result = ledger.compactToSummary(summary, keepRecent);
+        changed = true;
+        // The compaction event is the COMPLETE new start state: summary plus
+        // the verbatim recent tail. The tail's original events precede this
+        // marker in the file, so hydration must get the tail from here —
+        // otherwise reattach would keep only the summary and lose the
+        // protected recent entries the live session still has.
+        const keptEntries = keptEntriesForCompaction(ledger);
+        appendTranscript(runtime.transcriptPath, {
+          type: 'compaction',
+          reason: opts.reason,
+          actor: opts.actor,
+          summary,
+          keptEntries,
+          removedCount: result.removedEntries.length,
+          removedTokens: result.removedTokens,
+          summaryTokens: result.summaryTokens,
+          totalAfter: result.totalAfter,
+        });
+        // Cutoff divider: everything above this line in the scrollback is
+        // now out of the context window (replaced by the summary).
+        printEvent(
+          renderContextCutoff(
+            `compacted ${result.removedEntries.length} entries · ${formatTokenCount(before)} → ${formatTokenCount(result.totalAfter)} tok`
+          )
+        );
+        return {
+          ok: true,
+          removed: result.removedEntries.length,
+          removedTokens: result.removedTokens,
+          summaryTokens: result.summaryTokens,
+          before,
+          totalAfter: result.totalAfter,
+        };
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        if (opts.actor === 'sb') {
+          printEvent(chalk.yellow(`  ⛁ Compaction failed (${msg})`));
+          return { ok: false, error: `summarization failed (${msg}) — pass your own summary` };
+        }
+        printEvent(chalk.yellow(`  ⛁ Compaction summarization failed (${msg}) — hard-trimming`));
+        const trimmed = await trimContextToPercent(
+          DEFAULT_TRIM_TARGET_PCT,
+          `${opts.reason} (compaction fallback)`
+        );
+        return {
+          ok: false,
+          error: `summarization failed (${msg}); hard-trimmed ${trimmed.removed} entries instead`,
+        };
+      }
+    } finally {
+      compactionInFlight = false;
+      if (changed) {
+        // ink just rolled the ledger — roll the provider session too so the
+        // next spawn seeds a fresh native session with the summary (we compact
+        // before the provider ever would). Mid-turn, the next continuation
+        // re-seeds (decideContinuationSession). Unconditional on backend: for
+        // non-claude these are already undefined.
+        activeBackendSessionId = undefined;
+        activeBackendSessionShape = undefined;
+      }
+    }
+  };
+
+  // ── Token-budget auto-compaction ──
   const maybeCompactContext = async (reason: string): Promise<void> => {
     if (compactionInFlight) return;
     const bootstrapReserve = runtime.bootstrapContext
@@ -4885,91 +5039,44 @@ export async function runChat(options: ChatOptions): Promise<void> {
       return;
     }
 
-    const entries = ledger.listEntries();
-    const cutoff = Math.max(0, entries.length - AUTO_COMPACT_KEEP_RECENT_ENTRIES);
-    if (cutoff === 0) return; // only the protected tail remains — nothing to compact
+    await compactContextNow({
+      reason: `${reason}; > ${formatTokenCount(threshold)} threshold`,
+      actor: 'system',
+    });
+  };
 
-    compactionInFlight = true;
-    try {
-      const oldest = entries.slice(0, cutoff);
-      const chunk = oldest
-        .map((e) => `${e.role.toUpperCase()}${e.source ? ` [${e.source}]` : ''}: ${e.content}`)
-        .join('\n\n');
-      const before = ledger.totalTokens();
-      printEvent(
-        chalk.yellow(
-          `  ⛁ Context at ${formatTokenCount(before)} tok (> ${formatTokenCount(threshold)} threshold) — compacting (${reason})`
-        )
-      );
-
-      try {
-        const turn = await runBackendTurn({
-          backend: runtime.backend,
-          agentId,
-          model: runtime.model,
-          effort: runtime.effort,
-          prompt: buildCompactionPrompt(chunk),
-          // Compaction is a backend turn like any other, so it goes through
-          // adapter.prepare() and would otherwise regenerate the default
-          // identity prompt — handing a nascent SB "You are nascent, call
-          // bootstrap" the moment its first conversation grew long enough to
-          // compact (Lumen, PR #485 — finding 2).
-          systemPromptOverride: runtime.systemPromptOverride,
-          // Summarization is governed like any other turn: token-flow (idle)
-          // is the reaper, with the 4h runaway backstop. An explicit
-          // --backend-timeout-seconds still caps it, floored at 5 min —
-          // summarizing a large chunk outlives short overrides.
-          timeoutMs: runtime.backendTurnTimeoutMs
-            ? Math.max(runtime.backendTurnTimeoutMs, 5 * 60 * 1000)
-            : undefined,
-          idleTimeoutMs: runtime.backendIdleTimeoutMs,
-          stream: true,
-        });
-        const summaryText = turn.success ? (turn.responseText ?? turn.stdout).trim() : '';
-        if (!summaryText) {
-          throw new Error(turn.stderr.trim().slice(0, 200) || `exit code ${turn.exitCode}`);
-        }
-
-        const summary = `[Conversation summary — compacted ${oldest.length} earlier entries]\n${summaryText}`;
-        const result = ledger.compactToSummary(summary, AUTO_COMPACT_KEEP_RECENT_ENTRIES);
-        // The compaction event is the COMPLETE new start state: summary plus
-        // the verbatim recent tail. The tail's original events precede this
-        // marker in the file, so hydration must get the tail from here —
-        // otherwise reattach would keep only the summary and lose the
-        // protected recent entries the live session still has.
-        const keptEntries = keptEntriesForCompaction(ledger);
-        appendTranscript(runtime.transcriptPath, {
-          type: 'compaction',
-          reason,
-          summary,
-          keptEntries,
-          removedCount: result.removedEntries.length,
-          removedTokens: result.removedTokens,
-          summaryTokens: result.summaryTokens,
-          totalAfter: result.totalAfter,
-        });
-        // Cutoff divider: everything above this line in the scrollback is
-        // now out of the context window (replaced by the summary).
-        printEvent(
-          renderContextCutoff(
-            `compacted ${result.removedEntries.length} entries · ${formatTokenCount(before)} → ${formatTokenCount(result.totalAfter)} tok`
-          )
-        );
-      } catch (error) {
-        const msg = error instanceof Error ? error.message : String(error);
-        printEvent(chalk.yellow(`  ⛁ Compaction summarization failed (${msg}) — hard-trimming`));
-        await trimContextToPercent(DEFAULT_TRIM_TARGET_PCT, `${reason} (compaction fallback)`);
-      }
-    } finally {
-      compactionInFlight = false;
-      // ink just rolled the ledger — roll the provider session too so the next
-      // turn seeds a fresh native session with the summary (we compact before
-      // the provider ever would). No-op when nothing was compacted: the early
-      // returns above never reach this block. Unconditional: for non-claude
-      // these are already undefined.
-      activeBackendSessionId = undefined;
-      activeBackendSessionShape = undefined;
-    }
+  /**
+   * `compact_context` — the agent compacting its own window.
+   *
+   * Runs inside a tool iteration: the ledger rolls here, the continuation the
+   * loop sends next re-seeds the provider session from the compacted ledger
+   * (with the real tool results and the agent's own output so far), and the
+   * agent carries on from its summary. Its result is client-local, so it is
+   * never persisted back into the ledger it just compacted.
+   */
+  const runSbCompaction = async (args: Record<string, unknown>): Promise<PcpToolCallResult> => {
+    const asResult = (payload: Record<string, unknown>, isError = false): PcpToolCallResult => ({
+      content: [{ type: 'text', text: JSON.stringify(payload) }],
+      ...(isError ? { isError: true } : {}),
+    });
+    const parsed = parseCompactContextArgs(args);
+    if ('error' in parsed) return asResult({ success: false, error: parsed.error }, true);
+    const outcome = await compactContextNow({
+      reason: parsed.summary ? 'agent: own summary' : 'agent: runtime summary',
+      actor: 'sb',
+      summaryText: parsed.summary,
+      keepRecent: parsed.keepRecent,
+    });
+    if (!outcome.ok) return asResult({ success: false, error: outcome.error }, true);
+    return asResult({
+      success: true,
+      compacted: outcome.removed,
+      tokensFreed: outcome.before - outcome.totalAfter,
+      summaryTokens: outcome.summaryTokens,
+      totalAfter: outcome.totalAfter,
+      keptRecent: parsed.keepRecent ?? AUTO_COMPACT_KEEP_RECENT_ENTRIES,
+      note: 'Your context now starts from the summary; the provider session is re-seeded from it on the next spawn. Continue from here.',
+    });
   };
 
   // Poll gates (PR #385): interval ticks skip while a poll is in flight;
@@ -6155,6 +6262,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
             }
             if (bareToolName(tool) === COLLECT_AGENTS_TOOL) {
               return runCollectAgents(args);
+            }
+            // The agent compacting its own window needs the host (summarizer
+            // turn, transcript event, provider-session roll) — answered here,
+            // before the generic client-local handler refuses it.
+            if (bareToolName(tool) === 'compact_context') {
+              return runSbCompaction(args);
             }
             // Client-local tools (context management) are handled in-process.
             // An eviction's persistent refs arrive on the hook, not in the
