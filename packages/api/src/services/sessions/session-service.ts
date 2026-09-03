@@ -236,6 +236,13 @@ export function parseRuntimeConfig(metadata: unknown): {
   toolRouting: 'backend' | 'local';
   model?: string;
   effort?: RuntimeEffort;
+  /**
+   * An effort the operator set that the CLI would reject, dropped so the SB
+   * still spawns. Reported rather than swallowed: a silent fallback lets the
+   * operator believe an explicit setting is active when it is not (Lumen,
+   * PR #579).
+   */
+  effortRejected?: string;
 } {
   const meta = (metadata ?? {}) as Record<string, unknown>;
   const rc = (meta.runtimeConfig ?? {}) as Record<string, unknown>;
@@ -244,6 +251,7 @@ export function parseRuntimeConfig(metadata: unknown): {
     toolRouting: 'backend' | 'local';
     model?: string;
     effort?: RuntimeEffort;
+    effortRejected?: string;
   } = {
     toolRouting: 'local',
   };
@@ -265,10 +273,12 @@ export function parseRuntimeConfig(metadata: unknown): {
   // cased; anything else is dropped rather than passed through to fail the
   // spawn. Set by the operator: `UPDATE agent_identities SET metadata =
   // jsonb_set(metadata, '{runtimeConfig,effort}', '"xhigh"')`.
-  if (typeof rc.effort === 'string') {
-    const effort = rc.effort.trim().toLowerCase();
+  if (rc.effort !== undefined && rc.effort !== null) {
+    const effort = typeof rc.effort === 'string' ? rc.effort.trim().toLowerCase() : '';
     if ((RUNTIME_EFFORT_LEVELS as readonly string[]).includes(effort)) {
       out.effort = effort as RuntimeEffort;
+    } else {
+      out.effortRejected = String(rc.effort);
     }
   }
   return out;
@@ -1602,6 +1612,14 @@ export class SessionService implements ISessionService {
       runtimeMaxTurns = parsed.maxTurns;
       runtimeToolRouting = parsed.toolRouting;
       runtimeEffort = parsed.effort;
+      if (parsed.effortRejected !== undefined) {
+        logger.warn('[RuntimeConfig] Ignoring invalid effort — the provider default applies', {
+          agentId: session.agentId,
+          sbId: session.sbId,
+          effort: parsed.effortRejected,
+          accepted: RUNTIME_EFFORT_LEVELS,
+        });
+      }
       // Per-SB model pin beats the global env default (DEFAULT_CLAUDE_MODEL
       // et al.) — lets one SB run a different model than the fleet without a
       // server restart (dashboard/DB-tunable, like maxTurns).

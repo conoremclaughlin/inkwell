@@ -898,6 +898,31 @@ describe('SessionService', () => {
       expect(call[1].config.effort).toBe('xhigh');
     });
 
+    it('warns, naming the value, when an invalid effort is dropped (Lumen, PR #579)', async () => {
+      const { logger } = await import('../../utils/logger.js');
+      vi.mocked(logger.warn).mockClear();
+      const service = serviceWithIdentity(
+        { runtimeConfig: { effort: 'ultra' } },
+        { defaultModel: 'claude-fable-5' }
+      );
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(
+        createMockSession({ sbId: 'sb-1' } as never)
+      );
+
+      await service.handleMessage(createMockRequest());
+
+      const warned = vi
+        .mocked(logger.warn)
+        .mock.calls.find(([msg]) => typeof msg === 'string' && msg.includes('invalid effort'));
+      expect(warned).toBeDefined();
+      expect(warned![1]).toMatchObject({ effort: 'ultra' });
+      const call = vi.mocked(mockClaudeRunner.run).mock.calls[0] as unknown as [
+        string,
+        { config: { effort?: string } },
+      ];
+      expect(call[1].config.effort).toBeUndefined();
+    });
+
     it('sends no effort when the identity sets none — the provider default applies', async () => {
       const service = serviceWithIdentity(
         { runtimeConfig: {} },
@@ -6482,12 +6507,20 @@ describe('parseRuntimeConfig (per-SB dashboard settings → spawn flags)', () =>
     }
   });
 
-  it('drops an effort the CLI would reject rather than failing the spawn with it', () => {
+  it('drops an effort the CLI would reject rather than failing the spawn with it — and says so', () => {
     expect(parseRuntimeConfig({ runtimeConfig: { effort: 'ultra' } })).toEqual({
       toolRouting: 'local',
+      effortRejected: 'ultra',
     });
-    expect(parseRuntimeConfig({ runtimeConfig: { effort: 3 } })).toEqual({ toolRouting: 'local' });
-    expect(parseRuntimeConfig({ runtimeConfig: { effort: '' } })).toEqual({ toolRouting: 'local' });
+    expect(parseRuntimeConfig({ runtimeConfig: { effort: 3 } })).toEqual({
+      toolRouting: 'local',
+      effortRejected: '3',
+    });
+    expect(parseRuntimeConfig({ runtimeConfig: { effort: '' } })).toEqual({
+      toolRouting: 'local',
+      effortRejected: '',
+    });
+    expect(parseRuntimeConfig({ runtimeConfig: {} }).effortRejected).toBeUndefined();
   });
 
   it('passes through a per-SB model pin, trimmed', () => {
