@@ -233,12 +233,12 @@ export function buildContinuationBody(
     notRun === 0
       ? ''
       : dropped.length === notRun
-        ? `\n\nNOTE: you emitted ${results.length + notRun} tool calls and only ${results.length} ran. ` +
-          `These were NOT executed and had no effect: ${dropped.map((c) => c.tool).join(', ')}. ` +
+        ? `\n\nNOTE: you emitted ${results.length + notRun} tool calls. ${results.length} reached the tool runner — their outcomes are above, and some of those may themselves have been refused or failed. ` +
+          `The remaining ${notRun} never reached it at all and had no effect: ${dropped.map((c) => c.tool).join(', ')}. ` +
           `At most ${MAX_TOOL_CALLS_PER_ITERATION} calls run per iteration, in the order you emit them. ` +
           `Re-emit the ones you still need — they did not happen. Do not report them as done.`
-        : `\n\nNOTE: you emitted ${results.length + notRun} tool calls and only ${results.length} ran. ` +
-          `${notRun} were NOT executed, but the runtime CANNOT TELL YOU WHICH — do not guess. ` +
+        : `\n\nNOTE: you emitted ${results.length + notRun} tool calls. ${results.length} reached the tool runner — their outcomes are above, and some of those may themselves have been refused or failed. ` +
+          `The remaining ${notRun} never reached it at all, but the runtime CANNOT TELL YOU WHICH — do not guess. ` +
           `At most ${MAX_TOOL_CALLS_PER_ITERATION} calls run per iteration, in the order you emit them. ` +
           `Before re-emitting anything, read back the current state and act on what you find: ` +
           `re-running a write that already succeeded is not safe. Do not report the missing calls as done either.`;
@@ -279,8 +279,9 @@ export function buildFinalRelayBody(
             .map((c) => c.tool)
             .join(', ')}. They had no effect. Say so rather than reporting them as done.`
         : `\n\nNOT EXECUTED — ${notRun} emitted calls never ran and the loop has now ended, but the runtime cannot identify which. Do not guess, and do not report them as done: say plainly that some calls did not execute and name what you are unsure of.`;
+  const summary = results.length > 0 ? toolResultsSummary : '(no tool results from this iteration)';
   return (
-    `[Tool results from previous turn — FINAL]\n${toolResultsSummary}${droppedNote}\n\n` +
+    `[Tool results from previous turn — FINAL]\n${summary}${droppedNote}\n\n` +
     'The tool loop has ended; no further tool calls will be executed this turn. ' +
     'Review these results and provide your final answer. If a call above failed, ' +
     'say so plainly instead of reporting the work as done.'
@@ -562,7 +563,22 @@ export async function runAgentLoop(
   // is only populated for that case when the iteration actually contains an
   // `error` (see hasUnseenFailure), so a witnessed denial still ends the turn
   // quietly and nobody gets nagged for saying no.
-  if (relayResults.length > 0 && outcome.success && !input.signal?.aborted) {
+  // Stranded DROPS open this gate too, not just stranded results (Lumen,
+  // PR #573 round 2). `lastNotRunCount` was mirrored outward so the relay could
+  // carry it, but the gate still asked only about results — so the clean repro
+  // (signal_status completing in position five, four ordinary calls above it,
+  // three capped below) produced a single backend prompt and silently stranded
+  // the three. Every result was `executed`, so hasUnseenFailure was false and
+  // relayResults stayed empty: the mirroring was real and the door was shut.
+  //
+  // Same default-to-loud argument as hasUnseenFailure one level up — key on
+  // the FACTS of the iteration, not on the stop reason, so a reason added later
+  // cannot quietly reintroduce the silence. Terminal semantics still hold: the
+  // relay's output is not extracted, so nothing re-executes and no signal is
+  // multiplied. The agent knows what it signaled; it does not know what the cap
+  // ate underneath the signal.
+  const strandedDrops = lastNotRunCount > 0;
+  if ((relayResults.length > 0 || strandedDrops) && outcome.success && !input.signal?.aborted) {
     ports.ui.printEvent('  ⋯ relaying final tool results (no further execution)…');
     const stopRelayWaiting = ports.ui.startWaiting();
     let relay: BackendTurnOutcome;

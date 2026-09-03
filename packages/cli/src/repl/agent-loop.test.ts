@@ -911,7 +911,7 @@ describe('silently dropped tool calls (the per-iteration cap)', () => {
       expect(body).toContain('c, d');
       // Both sides of the gap: what was asked for and what happened.
       expect(body).toContain('4 tool calls');
-      expect(body).toContain('only 2 ran');
+      expect(body).toContain('2 reached the tool runner');
       expect(body).toContain('Do not report them as done');
     });
 
@@ -921,8 +921,8 @@ describe('silently dropped tool calls (the per-iteration cap)', () => {
      */
     it('says nothing about drops when nothing was dropped', () => {
       const body = buildContinuationBody([ran('a')], [call('a')]);
-      expect(body).not.toContain('NOT executed');
-      expect(body).not.toMatch(/only \d+ ran/);
+      expect(body).not.toContain('never reached it at all');
+      expect(body).not.toContain('reached the tool runner');
     });
   });
 
@@ -935,6 +935,81 @@ describe('silently dropped tool calls (the per-iteration cap)', () => {
 
     it('stays quiet when every call ran', () => {
       expect(buildFinalRelayBody([ran('a')])).not.toContain('NOT EXECUTED');
+    });
+  });
+
+  /**
+   * Round two, both Lumen's (PR #573).
+   */
+  describe('stranded drops at the end of a turn', () => {
+    /**
+     * P1. `lastNotRunCount` was mirrored outward so the final relay could carry
+     * it — but the gate still asked only about stranded RESULTS. With a clean
+     * terminal signal every result is `executed`, so hasUnseenFailure is false,
+     * relayResults stays empty, and the door the mirroring was built for never
+     * opens. The capped calls vanish under the signal.
+     */
+    it('relays the drops when a terminal signal ends the turn', async () => {
+      const emitted = ['m1', 'm2', 'm3', 'm4', 'signal_status', 'm6', 'm7', 'm8'];
+      const harness = makePorts(
+        [
+          outcome({ stdout: emitted.map((t) => inkTool(t)).join('\n') }),
+          outcome({ stdout: 'final answer' }),
+        ],
+        (calls) =>
+          calls.map((c) => ({
+            tool: c.tool,
+            result: c.tool === 'signal_status' ? signalResult('completed') : 'ok',
+            status: 'executed',
+          }))
+      );
+
+      const result = await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+
+      expect(result.stopReason).toBe('terminal-signal');
+      // The turn ends, but not before the agent is told what the cap ate.
+      expect(harness.prompts).toHaveLength(2);
+      const relay = harness.prompts[1]!.body;
+      expect(relay).toContain('NOT EXECUTED');
+      for (const tool of ['m6', 'm7', 'm8']) expect(relay).toContain(tool);
+    });
+
+    it('still stays quiet on a terminal signal with nothing stranded', async () => {
+      const harness = makePorts(
+        [outcome({ stdout: inkTool('signal_status') }), outcome({ stdout: 'unreachable' })],
+        () => [{ tool: 'signal_status', result: signalResult('completed'), status: 'executed' }]
+      );
+
+      await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+      // No drops, no failures — the agent knows what it signaled. One prompt.
+      expect(harness.prompts).toHaveLength(1);
+    });
+  });
+
+  /**
+   * P2. The count proves how many calls REACHED the runner, not how many
+   * executed. Five blocked results plus three capped calls previously said both
+   * "none of those calls ran" and "only 5 ran" in the same body.
+   */
+  describe('the count does not claim execution it cannot prove', () => {
+    it('does not contradict the all-refused note', () => {
+      const blocked: ToolResultRecord[] = ['a', 'b', 'c', 'd', 'e'].map((t) => ({
+        tool: t,
+        result: 'denied by policy',
+        status: 'blocked',
+      }));
+      const body = buildContinuationBody(
+        blocked,
+        blocked.map((r) => call(r.tool)),
+        [call('f'), call('g'), call('h')]
+      );
+
+      // Both statements have to be able to coexist without lying.
+      expect(body).toContain('none of those calls ran');
+      expect(body).not.toContain('only 5 ran');
+      expect(body).toContain('reached the tool runner');
+      expect(body).toContain('never reached it at all');
+      expect(body).toContain('f, g, h');
     });
   });
 
@@ -958,7 +1033,7 @@ describe('silently dropped tool calls (the per-iteration cap)', () => {
 
       expect(body).toContain('CANNOT TELL YOU WHICH');
       expect(body).toContain('3 tool calls');
-      expect(body).toContain('only 2 ran');
+      expect(body).toContain('2 reached the tool runner');
       expect(body).toContain('read back the current state');
       // The whole point: it must not assert a name it cannot stand behind.
       expect(body).not.toMatch(/NOT executed and had no effect/);
@@ -986,7 +1061,7 @@ describe('silently dropped tool calls (the per-iteration cap)', () => {
       }
       // The count still has to be right and still has to be stated.
       expect(continuation).toContain('7 tool calls');
-      expect(continuation).toContain('only 5 ran');
+      expect(continuation).toContain('5 reached the tool runner');
       expect(harness.events.join('\n')).toContain('not determinable');
     });
 
@@ -1022,7 +1097,7 @@ describe('silently dropped tool calls (the per-iteration cap)', () => {
     const continuation = harness.prompts[1]!.body;
     for (const tool of skipped) expect(continuation).toContain(tool);
     expect(continuation).toContain(`${emitted.length} tool calls`);
-    expect(continuation).toContain(`only ${honored.length} ran`);
+    expect(continuation).toContain(`${honored.length} reached the tool runner`);
 
     // And a human watching the terminal sees it too.
     expect(harness.events.join('\n')).toContain('not run');
@@ -1042,7 +1117,7 @@ describe('silently dropped tool calls (the per-iteration cap)', () => {
     await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
 
     expect(harness.executed[0]).toHaveLength(emitted.length);
-    expect(harness.prompts[1]!.body).not.toMatch(/only \d+ ran/);
+    expect(harness.prompts[1]!.body).not.toContain('reached the tool runner');
     expect(harness.events.join('\n')).not.toContain('not run');
   });
 });
