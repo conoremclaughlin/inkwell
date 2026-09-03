@@ -161,6 +161,7 @@ import { formatContextLines, type ContextSections } from '../repl/ink/context-vi
 import {
   MAX_TOOL_CALLS_PER_ITERATION,
   findImitatedToolResults,
+  isPotentialImitationPrefix,
   runAgentLoop,
   stripLocalToolBlocks,
   type AgentLoopResult,
@@ -3430,6 +3431,18 @@ export async function runChat(options: ChatOptions): Promise<void> {
     }
   );
 
+  // Everything the backend streamed in the current spawn, for the observer
+  // preview's cut (see the text handler below). Reset per spawn.
+  let spawnBackendText = '';
+  const beginSpawn = (): void => {
+    streamRenderer.beginSpawn();
+    spawnBackendText = '';
+  };
+  /** The spawn's stream ended: render whatever the renderer was holding. */
+  const endSpawn = (): void => {
+    renderStreamedLines(streamRenderer.endSpawn());
+  };
+
   const renderStreamedLines = (lines: StreamedLine[]): void => {
     if (!inkRepl) return; // legacy readline path keeps the buffered final render
     for (const line of lines) {
@@ -3556,13 +3569,27 @@ export async function runChat(options: ChatOptions): Promise<void> {
     } else if (evt.kind === 'text' && evt.text.trim()) {
       // This preview is mirrored live to observers. Under local routing the
       // loop discards everything from an imitated results frame on; so does
-      // the preview. The full text is in the protocol_violation entry the
-      // loop records — nothing is lost, only not republished.
-      const frame = runtime.toolRouting === 'local' ? findImitatedToolResults(evt.text) : null;
+      // the preview — judged against the whole spawn so far, not this block
+      // alone, and holding back a trailing line that could still become a
+      // header (a frame split across blocks; Lumen, PR #575 round 2). The
+      // full text is in the protocol_violation entry the loop records —
+      // nothing is lost, only not republished.
+      const blockStart = spawnBackendText.length;
+      spawnBackendText += evt.text;
+      const frame =
+        runtime.toolRouting === 'local' ? findImitatedToolResults(spawnBackendText) : null;
+      const cutInBlock = frame ? Math.max(0, frame.index - blockStart) : evt.text.length;
+      let shown = evt.text.slice(0, cutInBlock);
+      if (runtime.toolRouting === 'local') {
+        const lastLineStart = shown.lastIndexOf('\n') + 1;
+        if (isPotentialImitationPrefix(shown.slice(lastLineStart))) {
+          shown = shown.slice(0, lastLineStart);
+        }
+      }
       appendTranscript(runtime.transcriptPath, {
         type: 'backend_text',
-        preview: compactForLedger(frame ? evt.text.slice(0, frame.index) : evt.text, 200),
-        ...(frame ? { imitationDiscarded: true } : {}),
+        preview: compactForLedger(shown, 200),
+        ...(frame && frame.index < spawnBackendText.length ? { imitationDiscarded: true } : {}),
       });
       renderStreamedLines(
         streamRenderer.completeMessage(evt.text, { continuesMessage: evt.continuesMessage })
@@ -6184,7 +6211,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       ctx: { isContinuation: boolean }
     ): Promise<BackendTurnOutcome> => {
       if (!ctx.isContinuation) {
-        streamRenderer.beginSpawn();
+        beginSpawn();
         const turn = startBackendTurn({
           backend: runtime.backend,
           agentId,
@@ -6218,6 +6245,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           turnDurationSeconds = Math.max(0, Math.round((Date.now() - turnStartedAt) / 1000));
           stopWaiting();
         });
+        endSpawn();
         // Recorded here, not after the reseed branch: a failed resume that
         // reported usage still spent those tokens, and the retry below
         // REASSIGNS runResult — recording once at the end would silently drop
@@ -6251,7 +6279,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
               '  ⛁ provider session not found on resume — re-seeding a fresh native session'
             )
           );
-          streamRenderer.beginSpawn();
+          beginSpawn();
           const reseedTurn = startBackendTurn({
             backend: runtime.backend,
             agentId,
@@ -6276,6 +6304,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           runResult = await reseedTurn.result.finally(() => {
             currentTurnAbort = null;
           });
+          endSpawn();
           recordRunUsage(runResult.usage);
         }
 
@@ -6358,7 +6387,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           ? body
           : buildPromptEnvelope(agentId, runtime, ledger, body);
 
-      streamRenderer.beginSpawn();
+      beginSpawn();
       const contTurn = startBackendTurn({
         backend: runtime.backend,
         agentId,
@@ -6388,6 +6417,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       const contResult = await contTurn.result.finally(() => {
         currentTurnAbort = null;
       });
+      endSpawn();
 
       lastRunResult = contResult;
       recordRunUsage(contResult.usage);

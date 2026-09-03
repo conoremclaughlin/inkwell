@@ -61,18 +61,18 @@ export interface StreamedLine {
 /**
  * Turn-scoped state machine for live paragraph rendering.
  *
- * Owns the three correctness properties the TUI needs (Lumen review, PR #457):
+ * Owns the correctness properties the TUI needs (Lumen review, PR #457):
  * - **Attribution**: the first streamed line of a turn gets the agent header;
  *   later lines are continuations ONLY while nothing else has touched the
  *   scrollback — `noteInterleave()` (called when a queued user/system echo or
  *   any other writer lands between paragraphs) forces a fresh header on the
  *   next line, so an unlabeled paragraph can never sit under someone else's
  *   message.
- * - **Dedupe**: `completeMessage()` records the full message text (the parser
- *   emits one text event per assistant stream event; a later text block of the
- *   SAME message arrives flagged `continuesMessage` and is appended), so
- *   `shouldSkipFinal()` is an exact comparison against what final-response
- *   extraction uses — a multi-text-block message never reprints.
+ * - **Dedupe**: `completeMessage()` records the message text (a later text
+ *   block of the SAME message arrives flagged `continuesMessage` and is
+ *   appended), cut like the loop cuts it, so `shouldSkipFinal()` is an exact
+ *   comparison against what final-response extraction uses — a multi-block
+ *   message never reprints.
  * - **Display transform**: every emitted line passes through the transform
  *   (e.g. stripLocalToolBlocks in local routing) — held tool fences are
  *   stripped, and a line that strips to nothing is not emitted.
@@ -80,18 +80,28 @@ export interface StreamedLine {
  *   imitated results frame on (agent-loop `findImitatedToolResults`), but the
  *   loop only sees the text after the spawn ends — the live stream had already
  *   put the fabricated results on screen (Lumen, PR #575 round 1). The same
- *   detector runs here on every paragraph before it is emitted: the prefix
- *   before the frame renders, the rest is muted until the host announces the
- *   next backend spawn (`beginSpawn()`), and the recorded message text is the
- *   cut text so the final dedupe still matches.
+ *   detector runs here, over the WHOLE spawn's text so far — never one
+ *   paragraph in isolation, whose fence context and line boundaries are not
+ *   the message's (round 2). Text before the cut renders; from the cut on is
+ *   muted until the host announces the next spawn (`beginSpawn()`). An
+ *   incomplete paragraph is held across text-block boundaries and released by
+ *   `endSpawn()`, so a header split across blocks is judged whole.
  */
 export class StreamedTurnRenderer {
   private buffer = new ParagraphStreamBuffer();
   private headerShown = false;
-  private sawDeltaThisMessage = false;
+  private sawDeltaThisBlock = false;
   private streamedVisible = false;
-  private lastMessageText = '';
+  /** Everything streamed in the current spawn, uncut — the guard's subject. */
+  private spawnText = '';
+  /** Offset into `spawnText` up to which paragraphs have been emitted. */
+  private emitCursor = 0;
+  /** Text of the current block (deltas, or the completed block when none). */
+  private blockText = '';
+  /** The current assistant message, uncut, across its continued blocks. */
+  private messageText = '';
   private muted = false;
+  private lastMessageText = '';
 
   constructor(
     private readonly transform: (text: string) => string = (t) => t,
@@ -100,21 +110,38 @@ export class StreamedTurnRenderer {
 
   /** Start of a new turn — drop all state. */
   reset(): void {
-    this.buffer.reset();
+    this.beginSpawn();
     this.headerShown = false;
-    this.sawDeltaThisMessage = false;
     this.streamedVisible = false;
     this.lastMessageText = '';
-    this.muted = false;
   }
 
   /**
    * A new backend spawn began (initial, reseed, or tool-loop continuation).
    * Whatever the previous spawn wrote past an imitated frame no longer applies:
-   * the loop has discarded it and answered with the real results.
+   * the loop has discarded it and answered with the real results. Anything
+   * still buffered from the previous spawn is dropped — call `endSpawn()`
+   * first to render it.
    */
   beginSpawn(): void {
+    this.buffer.reset();
+    this.sawDeltaThisBlock = false;
+    this.spawnText = '';
+    this.emitCursor = 0;
+    this.blockText = '';
+    this.messageText = '';
     this.muted = false;
+  }
+
+  /**
+   * The spawn's stream has ended: release the held tail. Called by the host
+   * once the backend turn resolves, so the last paragraph of a spawn — the
+   * only one that can still be a half-written frame — is judged with the
+   * whole spawn's text in view.
+   */
+  endSpawn(): StreamedLine[] {
+    const tail = this.buffer.flush();
+    return tail !== null ? this.emitAll([tail]) : [];
   }
 
   /** Another writer appended to the scrollback — next line re-renders the header. */
@@ -124,43 +151,35 @@ export class StreamedTurnRenderer {
 
   /** Feed a text delta; returns lines to append now. */
   pushDelta(text: string): StreamedLine[] {
-    this.sawDeltaThisMessage = true;
+    this.sawDeltaThisBlock = true;
+    this.blockText += text;
+    this.spawnText += text;
     return this.emitAll(this.buffer.push(text));
   }
 
   /**
-   * The assistant message completed with this full text. Flushes the buffered
-   * tail; when no deltas arrived at all (backend without partial-message
-   * support), emits the whole message so streaming still lands at message
-   * granularity.
+   * A text block completed with this full text. When no deltas arrived for it
+   * (backend without partial-message support), the block is fed as one delta
+   * so streaming still lands at paragraph granularity. The buffered tail is
+   * NOT flushed here — a block boundary is not a message boundary — it waits
+   * for `endSpawn()`.
    */
   completeMessage(fullText: string, opts?: { continuesMessage?: boolean }): StreamedLine[] {
-    const tail = this.buffer.flush();
-    const lines =
-      tail !== null
-        ? this.emitAll([tail])
-        : this.sawDeltaThisMessage
-          ? []
-          : this.emitAll([fullText.trim()]);
+    let lines: StreamedLine[] = [];
+    if (!this.sawDeltaThisBlock) {
+      this.blockText = fullText;
+      this.spawnText += fullText;
+      lines = this.emitAll(this.buffer.push(fullText));
+    }
     // Recorded CUT, like the loop's final text, so shouldSkipFinal compares
-    // like with like — the frame is not part of the message anyone sees. Once
-    // a frame has cut this message, a later block of it (after thinking) is
-    // past the cut as well: the loop's assembled text drops it whole.
-    // (`muted` was set by emitAll, which has seen every paragraph of it.)
-    this.lastMessageText = this.cutAtFrame(
-      opts?.continuesMessage
-        ? this.muted
-          ? this.lastMessageText
-          : this.lastMessageText + fullText
-        : fullText
-    );
-    this.sawDeltaThisMessage = false;
+    // like with like. The cut is found on the UNCUT message as a whole — a
+    // frame split across blocks is found once its halves meet, and a
+    // legitimate prefix of the block that introduced it survives.
+    this.messageText = opts?.continuesMessage ? this.messageText + this.blockText : this.blockText;
+    this.lastMessageText = this.cutAtFrame(this.messageText);
+    this.blockText = '';
+    this.sawDeltaThisBlock = false;
     return lines;
-  }
-
-  private cutAtFrame(text: string): string {
-    const frame = this.options.guard?.(text);
-    return frame ? text.slice(0, frame.index).trimEnd() : text;
   }
 
   /**
@@ -174,23 +193,49 @@ export class StreamedTurnRenderer {
     return finalDisplayText.trim() === this.transform(this.lastMessageText).trim();
   }
 
+  private cutAtFrame(text: string): string {
+    const frame = this.options.guard?.(text);
+    return frame ? text.slice(0, frame.index).trimEnd() : text;
+  }
+
+  /** Where `para` sits in `spawnText`, searching forward from the emit cursor. */
+  private locate(para: string): number {
+    const exact = this.spawnText.indexOf(para, this.emitCursor);
+    if (exact !== -1) return exact;
+    // The buffer normalizes 3+ newlines inside a held fence to two; find the
+    // paragraph by its head instead.
+    const head = this.spawnText.indexOf(para.slice(0, 40), this.emitCursor);
+    return head !== -1 ? head : this.emitCursor;
+  }
+
   private emitAll(paragraphs: string[]): StreamedLine[] {
     const lines: StreamedLine[] = [];
     for (const para of paragraphs) {
       if (this.muted) break;
+      const start = this.locate(para);
+      const end = start + para.length;
+      // Judged against the whole spawn so far: fence context and line
+      // boundaries are the message's, not this paragraph's.
+      const frame = this.options.guard?.(this.spawnText) ?? null;
       let text = para;
-      const frame = this.options.guard?.(para);
-      if (frame) {
+      if (frame && frame.index <= start) {
+        this.muted = true;
+        break;
+      }
+      if (frame && frame.index < end) {
         // The prefix is the model's own words (a fence, a sentence); from the
         // frame on it is the runtime's voice, faked. Nothing after it renders.
-        text = para.slice(0, frame.index).trimEnd();
+        text = this.spawnText.slice(start, frame.index).trimEnd();
         this.muted = true;
       }
+      this.emitCursor = end;
       const display = this.transform(text).trim();
-      if (!display) continue;
-      lines.push({ text: display, continuation: this.headerShown });
-      this.headerShown = true;
-      this.streamedVisible = true;
+      if (display) {
+        lines.push({ text: display, continuation: this.headerShown });
+        this.headerShown = true;
+        this.streamedVisible = true;
+      }
+      if (this.muted) break;
     }
     return lines;
   }
@@ -199,9 +244,10 @@ export class StreamedTurnRenderer {
 export interface StreamedTurnRendererOptions {
   /**
    * Where the model starts writing the runtime's part of the conversation —
-   * agent-loop `findImitatedToolResults`, under local tool routing. Returns the
-   * offset to cut at, or null. Omit for backend routing, where native tool use
-   * makes the shape impossible.
+   * agent-loop `findImitatedToolResults`, under local tool routing. Called
+   * with the whole spawn's text so far; returns the offset to cut at, or
+   * null. Omit for backend routing, where native tool use makes the shape
+   * impossible.
    */
   guard?: (text: string) => { index: number } | null;
 }

@@ -296,6 +296,12 @@ export interface AgentLoopInput {
   prompt: string;
   /** Local tool routing off (`backend`) means the loop never extracts calls. */
   toolRouting: 'backend' | 'local';
+  /**
+   * Tool iterations allowed. Every cap check follows the first request, so a
+   * value below one behaves as one: the model's first request always runs.
+   * The final relay and the protocol-correction rounds are not iterations
+   * and are never withheld by this — they answer what already happened.
+   */
   maxIterations?: number;
   signal?: AbortSignal;
   /**
@@ -327,23 +333,31 @@ export async function runAgentLoop(
   const allToolResults: ToolResultRecord[] = [];
   const protocolViolations: ProtocolViolation[] = [];
   // Violations the model has not yet been told about. Every corrective body
-  // the loop sends marks them corrected; whatever is left when the loop ends
-  // gets one final correction, and if even that comes back imitated the host
+  // the loop sends answers the ones pending at that moment — and they count
+  // as corrected only once the backend has ACCEPTED that body: a correction
+  // built and never delivered corrects nothing, and reporting it would leave
+  // the host resuming a session that still holds the fabrication unremarked
+  // (Lumen, PR #575 round 2). Whatever is left when the loop ends gets one
+  // final correction; if even that fails or comes back imitated, the host
   // learns it (`corrected: false`) and rolls the native session. Detection
-  // alone was not enough (Lumen, PR #575 round 1): the only path that spoke
-  // up was the ordinary continuation, so a screened rejection, an all-refused
-  // or terminal-signal stop, or the final relay left the fabrication in the
-  // provider's transcript unremarked — and the next heartbeat resumes it.
+  // alone was not enough (round 1): only the ordinary continuation spoke up,
+  // so a screened rejection, an all-refused or terminal-signal stop, or the
+  // final relay left the fabrication in the provider's transcript.
   let awaitingCorrection: ProtocolViolation[] = [];
-  const markCorrected = (): void => {
-    for (const v of awaitingCorrection) v.corrected = true;
-    awaitingCorrection = [];
-  };
-  /** Build the body that answers `awaitingCorrection`, then account for it. */
+  let inFlightCorrection: ProtocolViolation[] = [];
+  /** Build the body that answers everything pending; `settleCorrection` decides whether it counted. */
   const correcting = <T>(build: (imitated: boolean) => T): T => {
-    const body = build(awaitingCorrection.length > 0);
-    markCorrected();
-    return body;
+    inFlightCorrection = awaitingCorrection;
+    awaitingCorrection = [];
+    return build(inFlightCorrection.length > 0);
+  };
+  const settleCorrection = (delivered: BackendTurnOutcome): void => {
+    if (delivered.success) {
+      for (const v of inFlightCorrection) v.corrected = true;
+    } else {
+      awaitingCorrection.unshift(...inFlightCorrection);
+    }
+    inFlightCorrection = [];
   };
 
   let iteration = 0;
@@ -353,13 +367,13 @@ export async function runAgentLoop(
   // real requests and still run; everything from the frame on is fabricated
   // evidence plus whatever the model decided in light of it, and none of that
   // may execute or reach a reader.
-  const discardImitatedResults = (
+  const noteImitation = (
     text: string,
     phase: ProtocolViolation['phase']
-  ): { text: string; imitation: ImitatedToolResultsFrame | null } => {
-    if (input.toolRouting !== 'local') return { text, imitation: null };
+  ): ImitatedToolResultsFrame | null => {
+    if (input.toolRouting !== 'local') return null;
     const imitation = findImitatedToolResults(text);
-    if (!imitation) return { text, imitation: null };
+    if (!imitation) return null;
     const violation: ProtocolViolation = {
       kind: 'imitated-tool-results',
       iteration,
@@ -374,7 +388,24 @@ export async function runAgentLoop(
     ports.ui.printEvent(
       `  ⚠ model wrote its own tool results — ${imitation.discarded.length} chars discarded, not executed`
     );
-    return { text: text.slice(0, imitation.index).trimEnd(), imitation };
+    return imitation;
+  };
+  const discardImitatedResults = (
+    text: string,
+    phase: ProtocolViolation['phase']
+  ): { text: string; imitation: ImitatedToolResultsFrame | null } => {
+    const imitation = noteImitation(text, phase);
+    return imitation
+      ? { text: text.slice(0, imitation.index).trimEnd(), imitation }
+      : { text, imitation: null };
+  };
+  // A FAILED spawn can still have produced assistant text, and that text can
+  // still be an imitation. The loop keeps the last successful text as its
+  // answer, so nothing is cut here — but the violation is recorded, and
+  // since no correction follows a failure it stays uncorrected: the host
+  // fails closed and rolls the session.
+  const noteImitationInFailedOutcome = (failed: BackendTurnOutcome): void => {
+    if (failed.responseText) noteImitation(failed.responseText, 'turn');
   };
 
   // Fail fast. A turn cancelled before it started must not spend a backend
@@ -461,7 +492,9 @@ export async function runAgentLoop(
       } finally {
         stopWaitingAfterRejection();
       }
+      settleCorrection(outcome);
       if (!outcome.success) {
+        noteImitationInFailedOutcome(outcome);
         stopReason = 'backend-failure';
         break;
       }
@@ -505,7 +538,9 @@ export async function runAgentLoop(
         } finally {
           stopWaitingAfterCorrection();
         }
+        settleCorrection(outcome);
         if (!outcome.success) {
+          noteImitationInFailedOutcome(outcome);
           stopReason = 'backend-failure';
           break;
         }
@@ -600,6 +635,7 @@ export async function runAgentLoop(
     } finally {
       stopWaiting();
     }
+    settleCorrection(outcome);
 
     if (!outcome.success) {
       // Deliberately do NOT re-resolve responseText here. It still holds the
@@ -607,6 +643,7 @@ export async function runAgentLoop(
       // writes to the ledger. Overwriting it with the failed spawn's stderr
       // would publish backend diagnostics as the assistant's answer — and the
       // host already reports stderr separately from `lastRunResult`.
+      noteImitationInFailedOutcome(outcome);
       stopReason = 'backend-failure';
       break;
     }
@@ -638,7 +675,7 @@ export async function runAgentLoop(
   // native session is resumed for the next turn. The relay's own output can
   // imitate too; it gets one more correction, and if that also comes back
   // imitated the violation stays `corrected: false` for the host to act on.
-  const runFinalRound = async (body: string): Promise<void> => {
+  const runFinalRound = async (body: string): Promise<boolean> => {
     const stopRelayWaiting = ports.ui.startWaiting();
     let relay: BackendTurnOutcome;
     try {
@@ -650,15 +687,19 @@ export async function runAgentLoop(
     } finally {
       stopRelayWaiting();
     }
+    settleCorrection(relay);
     if (relay.success) {
       outcome = relay;
       // Nothing in the relay is extracted, but its text is what gets displayed
       // and written to the ledger — an imitation there is still fabricated
       // evidence and still must not reach a reader.
       responseText = discardImitatedResults(resolveResponseText(relay), 'relay').text;
+    } else {
+      // A failed relay keeps the last successful text — the results are still
+      // in allToolResults for the host's own reporting.
+      noteImitationInFailedOutcome(relay);
     }
-    // A failed relay keeps the last successful text — the results are still
-    // in allToolResults for the host's own reporting.
+    return relay.success;
   };
   if (
     (relayResults.length > 0 || awaitingCorrection.length > 0) &&
@@ -670,14 +711,14 @@ export async function runAgentLoop(
         ? '  ⋯ relaying final tool results (no further execution)…'
         : '  ⋯ correcting the protocol break (no further execution)…'
     );
-    await runFinalRound(
+    const delivered = await runFinalRound(
       correcting((imitated) =>
         relayResults.length > 0
           ? buildFinalRelayBody(relayResults, { imitatedToolResults: imitated })
           : buildProtocolCorrectionBody({ final: true })
       )
     );
-    if (awaitingCorrection.length > 0 && outcome.success && !input.signal?.aborted) {
+    if (delivered && awaitingCorrection.length > 0 && !input.signal?.aborted) {
       ports.ui.printEvent('  ⋯ correcting the protocol break again (no further execution)…');
       await runFinalRound(correcting(() => buildProtocolCorrectionBody({ final: true })));
     }
@@ -805,6 +846,21 @@ const IMITATED_RESULTS_HEADER_RE =
  */
 const IMITATED_RESULT_LINE_RE =
   /^[ \t]*Tool [A-Za-z_][\w.-]* \((?:executed|approved|error|failed|blocked|denied|rejected)\):[ \t]*[[{"]/;
+
+/**
+ * True when `line` could still become a frame header or results line as more
+ * text arrives — the streaming case, where a line is only as complete as the
+ * last delta. A host that publishes text incrementally holds such a trailing
+ * line back rather than show half of `user[Tool results from previous turn]`
+ * and then discover the other half (Lumen, PR #575 round 2).
+ */
+export function isPotentialImitationPrefix(line: string): boolean {
+  const bare = line.replace(/^[ \t]*(?:(?:user|human|assistant|system)[ \t]*:?[ \t]*)?/i, '');
+  if (!bare) return false;
+  const header = '[tool results from previous turn';
+  if (header.startsWith(bare.toLowerCase().replace(/[ \t]*\r?$/, ''))) return true;
+  return /^[ \t]*Tool(?: [A-Za-z_][\w.-]*(?: \((?:[a-z]*\)?:?)?)?)?[ \t]*$/.test(line);
+}
 
 /**
  * Find the first place the model starts writing tool results in the runtime's

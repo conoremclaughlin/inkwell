@@ -4,6 +4,7 @@ import {
   extractLocalToolCalls,
   findImitatedToolResults,
   hasUnseenFailure,
+  isPotentialImitationPrefix,
   resolveResponseText,
   runAgentLoop,
   type AgentLoopPorts,
@@ -1207,6 +1208,89 @@ describe('runAgentLoop — the model writes its own tool results (#569)', () => 
     const result = await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
     expect(result.protocolViolations).toEqual([]);
     expect(harness.prompts[1].body).not.toContain('PROTOCOL NOTE');
+  });
+});
+
+describe('a correction counts only once the backend accepted it (Lumen, round 2)', () => {
+  it('a failed continuation leaves the violation uncorrected — the host must roll the session', async () => {
+    const harness = makePorts([
+      outcome({ responseText: MYRA_TURN }),
+      outcome({ success: false, stderr: 'ECONNRESET', exitCode: 1 }),
+    ]);
+    const result = await runAgentLoop({ prompt: 'heartbeat', toolRouting: 'local' }, harness.ports);
+    expect(result.stopReason).toBe('backend-failure');
+    expect(harness.prompts[1].body).toContain('PROTOCOL NOTE');
+    expect(result.protocolViolations).toHaveLength(1);
+    expect(result.protocolViolations[0].corrected).toBe(false);
+  });
+
+  it('a failed final correction leaves it uncorrected too', async () => {
+    const harness = makePorts(
+      [
+        outcome({ responseText: `Looking.\n\n${MYRA_BLOCK_1}` }),
+        outcome({ success: false, stderr: 'boom', exitCode: 1 }),
+      ],
+      () => [{ tool: 'list_emails', result: 'ok', status: 'blocked' }]
+    );
+    const result = await runAgentLoop({ prompt: 'heartbeat', toolRouting: 'local' }, harness.ports);
+    expect(harness.prompts).toHaveLength(2);
+    expect(result.protocolViolations[0].corrected).toBe(false);
+  });
+
+  it('a FAILED spawn whose text still imitates records the violation', async () => {
+    const harness = makePorts([
+      outcome({ responseText: inkTool('x') }),
+      outcome({
+        success: false,
+        exitCode: 1,
+        stderr: 'reaped',
+        responseText: 'Partial.\n\n[Tool results from previous turn]\nTool x (executed): {}',
+      }),
+    ]);
+    const result = await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+    expect(result.stopReason).toBe('backend-failure');
+    expect(result.protocolViolations).toHaveLength(1);
+    expect(result.protocolViolations[0].corrected).toBe(false);
+    // The loop's answer is still the last SUCCESSFUL text, not the failed spawn's.
+    expect(result.responseText).toBe(inkTool('x'));
+  });
+
+  it('maxIterations: 0 behaves as 1 — the first request always runs (final rounds are not iterations)', async () => {
+    const harness = makePorts([
+      outcome({ responseText: inkTool('x') }),
+      outcome({ responseText: 'done' }),
+    ]);
+    const result = await runAgentLoop(
+      { prompt: 'go', toolRouting: 'local', maxIterations: 0 },
+      harness.ports
+    );
+    expect(harness.executed).toHaveLength(1);
+    expect(result.iterations).toBe(1);
+    expect(result.stopReason).toBe('iteration-cap');
+  });
+});
+
+describe('isPotentialImitationPrefix', () => {
+  it.each([
+    'user[Tool results from ',
+    '[Tool results from previous turn',
+    'Human: [Tool',
+    'Tool',
+    'Tool list_emails',
+    'Tool list_emails (exec',
+    'Tool list_emails (executed):',
+  ])('holds back %j', (line) => {
+    expect(isPotentialImitationPrefix(line)).toBe(true);
+  });
+
+  it.each([
+    '',
+    'Looking.',
+    'Tools I used:',
+    '[Tool results are back]',
+    'Tool list_emails ran fine',
+  ])('lets %j through', (line) => {
+    expect(isPotentialImitationPrefix(line)).toBe(false);
   });
 });
 
