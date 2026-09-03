@@ -739,7 +739,16 @@ export async function runAgentLoop(
       // to inventing the answer. Left alone, the truncated preamble would ship
       // as the reply and the model would carry on believing what it wrote. One
       // correction round, counted as an iteration so it cannot spin.
-      if (imitation && !input.signal?.aborted) {
+      //
+      // "No request" is judged on what the model EMITTED, not on what the
+      // screen selected: `calls` is empty whenever the screen selects nothing,
+      // including from real requests. Treating that as "no preceding block"
+      // sent the correction alone, never named the dropped calls, and recorded
+      // a violation that was factually wrong (Lumen, PR #575 round 7). With
+      // requests emitted, this falls through to the stranded path below, and
+      // the final relay carries both the NOT EXECUTED evidence and the
+      // protocol note.
+      if (imitation && selection.emitted === 0 && !input.signal?.aborted) {
         iteration++;
         const record: ToolResultRecord = {
           tool: 'protocol',
