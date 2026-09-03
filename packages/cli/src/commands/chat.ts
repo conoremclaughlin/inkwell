@@ -2457,6 +2457,8 @@ export function buildLocalToolInstruction(opts: { audience: 'parent' | 'clone' }
     '',
     'Do NOT use ToolSearch, mcp__inkwell__*, or native MCP tool calling — those will not work in this runtime. Only the fenced block format above will execute tools. You can emit multiple ink-tool blocks in one response.',
     '',
+    'After emitting your ink-tool block(s), END your response and wait. The ink runtime executes the calls and sends the real results back in a following message that begins "[Tool results from previous turn]". NEVER write that section yourself: only the runtime writes tool results, anything you write after your fences is discarded unread, and results you compose are not real, however plausible they look.',
+    '',
   ].join('\n');
 
   const inkwell = forClone
@@ -3546,7 +3548,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
         type: 'backend_text',
         preview: compactForLedger(evt.text, 200),
       });
-      renderStreamedLines(streamRenderer.completeMessage(evt.text));
+      renderStreamedLines(
+        streamRenderer.completeMessage(evt.text, { continuesMessage: evt.continuesMessage })
+      );
     } else if (evt.kind === 'model') {
       // Recorded unconditionally: an event that merely CONFIRMS the requested
       // model is still this run's evidence of what served it, even though the
@@ -6433,6 +6437,21 @@ export async function runChat(options: ChatOptions): Promise<void> {
               if (recentToolCalls.length > 100) {
                 recentToolCalls.splice(0, recentToolCalls.length - 100);
               }
+            },
+            // The discarded text is persisted WHOLE. A backend_text preview
+            // (200 chars) was enough to detect the 2026-09-02 fabrication after
+            // the fact, and not enough to reconstruct what the agent had acted
+            // on without the provider's transcript (#569).
+            recordProtocolViolation: (violation) => {
+              appendTranscript(runtime.transcriptPath, {
+                type: 'protocol_violation',
+                kind: violation.kind,
+                phase: violation.phase,
+                iteration: violation.iteration,
+                header: violation.header,
+                discardedChars: violation.discarded.length,
+                discarded: violation.discarded,
+              });
             },
           },
         }

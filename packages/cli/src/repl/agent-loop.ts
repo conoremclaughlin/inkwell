@@ -125,7 +125,39 @@ export interface AgentLoopPorts {
   /** Parent-only observability (Ctrl+T inspector). Clones omit this entirely. */
   observe?: {
     recordToolCall(call: ToolResultRecord): void;
+    /**
+     * The model broke the text-tool protocol and the loop repaired the turn.
+     * The host persists the whole record (the discarded text included) — a
+     * 200-char preview was enough to *detect* the 2026-09-02 fabrication but
+     * not to prove what the agent had acted on.
+     */
+    recordProtocolViolation?(violation: ProtocolViolation): void;
   };
+}
+
+/**
+ * The model wrote the runtime's part of the conversation.
+ *
+ * Under text-form tool calling nothing structural stops generation at the
+ * fence — no stop_reason, no role boundary. A model deep in a long session can
+ * keep going and produce the frame the runtime would have sent next
+ * (`[Tool results from previous turn]` + `Tool x (executed): {...}` +
+ * "Continue your response…"), with results interpolated from every real one it
+ * has seen, then act on them. Myra did exactly this on 2026-09-02 — four
+ * "vanished" emails that never existed (#569). Native tool use cannot fail this
+ * way; LangChain-era ReAct did, and fixed it with stop sequences. The stream
+ * parser cannot stop the model mid-generation, so the loop discards the
+ * imitation instead and tells the model what happened.
+ */
+export interface ProtocolViolation {
+  kind: 'imitated-tool-results';
+  iteration: number;
+  /** `relay` when it appeared in the final relay's output, which is never extracted anyway. */
+  phase: 'turn' | 'relay';
+  /** The line that opened the imitation, as written. */
+  header: string;
+  /** Everything from the frame on. Discarded, never executed, never displayed. */
+  discarded: string;
 }
 
 /** Raw result of one backend turn, as the host reports it back to the loop. */
@@ -161,7 +193,8 @@ export function resolveResponseText(outcome: BackendTurnOutcome): string {
  */
 export function buildContinuationBody(
   results: ReadonlyArray<ToolResultRecord>,
-  calls: ReadonlyArray<LocalToolCall>
+  calls: ReadonlyArray<LocalToolCall>,
+  opts: { imitatedToolResults?: boolean } = {}
 ): string {
   const toolResultsSummary = results
     .map((r) => {
@@ -192,7 +225,33 @@ export function buildContinuationBody(
       ? '\n\nNOTE: none of those calls ran, and at least one FAILED rather than being refused — the error text above says why. A failure is not a refusal: if it names a bad argument or a transient condition, fix it and try again. Do not report the work as done, and do not describe a failure as a refusal.'
       : '\n\nNOTE: none of those calls ran — every one was refused. Do not retry them. Work with the tools you do have, and if the task cannot be completed without a refused tool, say so plainly and stop.';
 
-  return `[Tool results from previous turn]\n${toolResultsSummary}${formatCorrection}${refusalNote}\n\nContinue your response based on these tool results. If you need more tools, emit ink-tool blocks. Otherwise, provide your final answer.`;
+  // The model wrote a results frame of its own after its fences. Say so HERE,
+  // alongside the real results, so the correction and the evidence that the
+  // runtime actually answered arrive together — the same reasoning as the
+  // format note above. Without it the model has no way to tell its fabricated
+  // results from these.
+  const protocolNote = opts.imitatedToolResults ? `\n\n${IMITATED_RESULTS_PROTOCOL_NOTE}` : '';
+
+  return `[Tool results from previous turn]\n${toolResultsSummary}${formatCorrection}${refusalNote}${protocolNote}\n\nContinue your response based on these tool results. If you need more tools, emit ink-tool blocks. Otherwise, provide your final answer.`;
+}
+
+const IMITATED_RESULTS_PROTOCOL_NOTE =
+  'PROTOCOL NOTE: your previous response continued past its ink-tool block(s) and wrote a "[Tool results from previous turn]" section itself. Only the ink runtime writes tool results. Everything you wrote from that line on was discarded — not executed, not shown to anyone — and the results above are the only real ones. After emitting ink-tool blocks, END your response and wait for this message.';
+
+/**
+ * The correction fed back when the model wrote a results frame with NO
+ * ink-tool block before it: nothing ran, so there are no real results to
+ * relay, only the fact that the ones it wrote are not real.
+ */
+export function buildProtocolCorrectionBody(): string {
+  return (
+    '[Runtime protocol correction]\n' +
+    'Your previous response contained a "[Tool results from previous turn]" section that you wrote yourself. ' +
+    'No ink-tool block preceded it, so NO tool ran and the results you wrote are not real. ' +
+    'Everything from that line on was discarded and not shown to anyone. ' +
+    'Only the ink runtime writes tool results, in a message that follows your response.\n\n' +
+    'If you need a tool, emit the ink-tool block and END your response. Otherwise, provide your final answer.'
+  );
 }
 
 /**
@@ -252,8 +311,36 @@ export async function runAgentLoop(
 ): Promise<AgentLoopResult> {
   const maxIterations = input.maxIterations ?? DEFAULT_MAX_TOOL_LOOP_ITERATIONS;
   const allToolResults: ToolResultRecord[] = [];
+  const protocolViolations: ProtocolViolation[] = [];
 
   let iteration = 0;
+
+  // Cut the model's output at the first imitated results frame, before
+  // anything is extracted from it. Fences BEFORE the frame are the model's
+  // real requests and still run; everything from the frame on is fabricated
+  // evidence plus whatever the model decided in light of it, and none of that
+  // may execute or reach a reader.
+  const discardImitatedResults = (
+    text: string,
+    phase: ProtocolViolation['phase']
+  ): { text: string; imitation: ImitatedToolResultsFrame | null } => {
+    if (input.toolRouting !== 'local') return { text, imitation: null };
+    const imitation = findImitatedToolResults(text);
+    if (!imitation) return { text, imitation: null };
+    const violation: ProtocolViolation = {
+      kind: 'imitated-tool-results',
+      iteration,
+      phase,
+      header: imitation.header,
+      discarded: imitation.discarded,
+    };
+    protocolViolations.push(violation);
+    ports.observe?.recordProtocolViolation?.(violation);
+    ports.ui.printEvent(
+      `  ⚠ model wrote its own tool results — ${imitation.discarded.length} chars discarded, not executed`
+    );
+    return { text: text.slice(0, imitation.index).trimEnd(), imitation };
+  };
 
   // Fail fast. A turn cancelled before it started must not spend a backend
   // invocation proving it — the opening spawn is the single most expensive
@@ -266,6 +353,7 @@ export async function runAgentLoop(
       iterations: 0,
       success: false,
       stopReason: 'aborted',
+      protocolViolations: [],
     };
   }
 
@@ -285,7 +373,9 @@ export async function runAgentLoop(
   let relayResults: ToolResultRecord[] = [];
 
   for (;;) {
-    responseText = resolveResponseText(outcome);
+    const sanitized = discardImitatedResults(resolveResponseText(outcome), 'turn');
+    responseText = sanitized.text;
+    const imitation = sanitized.imitation;
 
     const extracted =
       input.toolRouting === 'local' ? extractLocalToolCalls(responseText) : ([] as LocalToolCall[]);
@@ -341,6 +431,34 @@ export async function runAgentLoop(
     calls = screened.calls;
 
     if (calls.length === 0) {
+      // A results frame with no request before it: the model skipped straight
+      // to inventing the answer. Left alone, the truncated preamble would ship
+      // as the reply and the model would carry on believing what it wrote. One
+      // correction round, counted as an iteration so it cannot spin.
+      if (imitation && iteration < maxIterations && !input.signal?.aborted) {
+        iteration++;
+        const record: ToolResultRecord = {
+          tool: 'protocol',
+          result: 'imitated tool results with no preceding ink-tool block; discarded',
+          status: 'rejected',
+        };
+        allToolResults.push(record);
+        const stopWaitingAfterCorrection = ports.ui.startWaiting();
+        try {
+          outcome = await ports.backend.runTurn(buildProtocolCorrectionBody(), {
+            iteration,
+            isContinuation: true,
+            signal: input.signal,
+          });
+        } finally {
+          stopWaitingAfterCorrection();
+        }
+        if (!outcome.success) {
+          stopReason = 'backend-failure';
+          break;
+        }
+        continue;
+      }
       stopReason = 'no-tools';
       break;
     }
@@ -417,11 +535,14 @@ export async function runAgentLoop(
 
     const stopWaiting = ports.ui.startWaiting();
     try {
-      outcome = await ports.backend.runTurn(buildContinuationBody(results, calls), {
-        iteration,
-        isContinuation: true,
-        signal: input.signal,
-      });
+      outcome = await ports.backend.runTurn(
+        buildContinuationBody(results, calls, { imitatedToolResults: imitation !== null }),
+        {
+          iteration,
+          isContinuation: true,
+          signal: input.signal,
+        }
+      );
     } finally {
       stopWaiting();
     }
@@ -470,7 +591,10 @@ export async function runAgentLoop(
     }
     if (relay.success) {
       outcome = relay;
-      responseText = resolveResponseText(relay);
+      // Nothing in the relay is extracted, but its text is what gets displayed
+      // and written to the ledger — an imitation there is still fabricated
+      // evidence and still must not reach a reader.
+      responseText = discardImitatedResults(resolveResponseText(relay), 'relay').text;
     }
     // A failed relay keeps the last successful text — the results are still
     // in allToolResults for the host's own reporting.
@@ -514,11 +638,15 @@ export async function runAgentLoop(
     // about whether the turn achieved anything.
     success: outcome.success && !aborted,
     stopReason: finalStopReason,
+    protocolViolations,
   };
 }
 
 export interface AgentLoopResult {
-  /** Raw backend text of the final turn, tool blocks included. */
+  /**
+   * Backend text of the final turn, tool blocks included — minus any imitated
+   * results frame, which lives in `protocolViolations` instead.
+   */
   responseText: string;
   /** Display text with tool blocks stripped — what a clone hands back as its summary. */
   assistantDisplayText: string;
@@ -526,6 +654,8 @@ export interface AgentLoopResult {
   iterations: number;
   success: boolean;
   stopReason: AgentLoopStopReason;
+  /** Every protocol break the loop repaired this turn, in order. Empty on a clean turn. */
+  protocolViolations: ProtocolViolation[];
 }
 
 /**
@@ -565,6 +695,68 @@ interface InkToolBlock {
   end: number;
   /** The payload between the fences (the JSON value when scanned). */
   payload: string;
+}
+
+export interface ImitatedToolResultsFrame {
+  /** The line that opened the imitation, as written. */
+  header: string;
+  /** Offset in the response text where the imitation begins. */
+  index: number;
+  /** Everything from the frame on. */
+  discarded: string;
+}
+
+/**
+ * The frame the runtime sends back after tools run — see buildContinuationBody
+ * and buildFinalRelayBody — as a model reproduces it: optionally glued to a
+ * role label (Myra wrote `user[Tool results from previous turn]`, the transcript
+ * shape), optionally the FINAL variant.
+ */
+const IMITATED_RESULTS_HEADER_RE =
+  /^[ \t]*(?:(?:user|human|assistant|system)[ \t]*:?[ \t]*)?\[Tool results from previous turn(?:[ \t]*[—–-][ \t]*FINAL)?\][ \t]*\r?$/i;
+
+/**
+ * A results line without its header. Anchored on the JSON that follows the
+ * colon: prose that happens to begin "Tool x (executed): it worked" is a
+ * sentence, `Tool x (executed): {"success":true` is the runtime's voice.
+ */
+const IMITATED_RESULT_LINE_RE =
+  /^[ \t]*Tool [A-Za-z_][\w.-]* \((?:executed|approved|error|failed|blocked|denied|rejected)\):[ \t]*[[{"]/;
+
+/**
+ * Find the first place the model starts writing tool results in the runtime's
+ * own frame (see ProtocolViolation). Line-anchored, and blind inside fenced
+ * code — an ink-tool payload or a quoted code block may legitimately contain
+ * the header; the imitation that matters is the one written as if it were the
+ * next message.
+ */
+export function findImitatedToolResults(responseText: string): ImitatedToolResultsFrame | null {
+  const inkBlocks = findInkToolBlocks(responseText);
+  let inCodeFence = false;
+  let lineStart = 0;
+  while (lineStart <= responseText.length) {
+    const nl = responseText.indexOf('\n', lineStart);
+    const lineEnd = nl === -1 ? responseText.length : nl;
+    const line = responseText.slice(lineStart, lineEnd);
+    const insideInkBlock = inkBlocks.some((b) => lineStart >= b.start && lineStart < b.end);
+    if (!insideInkBlock) {
+      if (/^[ \t]*```/.test(line)) {
+        inCodeFence = !inCodeFence;
+      } else if (
+        !inCodeFence &&
+        (IMITATED_RESULTS_HEADER_RE.test(line) || IMITATED_RESULT_LINE_RE.test(line))
+      ) {
+        return {
+          header: line.trim(),
+          index: lineStart,
+          discarded: responseText.slice(lineStart),
+        };
+      }
+    }
+    if (nl === -1) break;
+    lineStart = nl + 1;
+  }
+  return null;
 }
 
 /**
