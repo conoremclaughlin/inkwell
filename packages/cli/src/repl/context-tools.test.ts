@@ -5,6 +5,7 @@ import {
   handleClientLocalTool,
   parseCompactContextArgs,
   compactionShrinks,
+  effectiveContextTokens,
   CLIENT_LOCAL_TOOLS,
   COMPACT_CONTEXT_MAX_KEEP_RECENT,
   COMPACT_CONTEXT_SUMMARY_MAX_CHARS,
@@ -594,5 +595,54 @@ describe('entry refs — hash-addressed, stable across reattach and eviction (#5
     );
     expect(evicted.evicted).toBe(0);
     expect(ledger.listEntries()).toHaveLength(1);
+  });
+});
+
+// ─── provider-measured accounting (task 9cf538a2) ───────────────
+
+describe("list_context — the provider's measurement beside the estimate", () => {
+  it('reports both numbers and reasons with the larger', () => {
+    const ledger = new ContextLedger();
+    for (let i = 0; i < 20; i++) ledger.addEntry('inbox', 'x'.repeat(400), 'inkmail');
+    const estimate = ledger.totalTokens();
+    const parsed = parseResult(
+      handleClientLocalTool('list_context', {}, ledger, undefined, {
+        providerUsage: () => ({
+          contextTokens: 541_000,
+          inputTokens: 1_000,
+          cacheReadTokens: 540_000,
+          model: 'claude-opus-5',
+          measuredAt: '2026-09-03T00:00:00.000Z',
+        }),
+      })
+    );
+    expect(parsed.totalTokens).toBe(estimate);
+    expect(parsed.effectiveTokens).toBe(541_000);
+    expect(parsed.providerMeasured.contextTokens).toBe(541_000);
+    expect(parsed.providerMeasured.model).toBe('claude-opus-5');
+    expect(parsed.accountingNote).toContain('541,000');
+    expect(parsed.accountingNote).toContain('effectiveTokens');
+  });
+
+  it('no note when the two agree, and no measurement fields when there is none', () => {
+    const ledger = new ContextLedger();
+    for (let i = 0; i < 20; i++) ledger.addEntry('inbox', 'x'.repeat(400), 'inkmail');
+    const estimate = ledger.totalTokens();
+    const close = parseResult(
+      handleClientLocalTool('list_context', {}, ledger, undefined, {
+        providerUsage: () => ({ contextTokens: Math.round(estimate * 1.1) }),
+      })
+    );
+    expect(close.accountingNote).toBeUndefined();
+    expect(close.effectiveTokens).toBe(Math.round(estimate * 1.1));
+    const none = parseResult(handleClientLocalTool('list_context', {}, ledger));
+    expect(none.providerMeasured).toBeUndefined();
+    expect(none.effectiveTokens).toBe(estimate);
+  });
+
+  it('effectiveContextTokens is the larger of the two, or the estimate alone', () => {
+    expect(effectiveContextTokens(297_000, { contextTokens: 541_000 })).toBe(541_000);
+    expect(effectiveContextTokens(297_000, { contextTokens: 100_000 })).toBe(297_000);
+    expect(effectiveContextTokens(297_000, undefined)).toBe(297_000);
   });
 });

@@ -119,6 +119,8 @@ import {
   handleClientLocalTool,
   globalSignalSink,
   parseCompactContextArgs,
+  effectiveContextTokens,
+  type ProviderContextMeasurement,
   type SignalSink,
   getLastSignal,
   clearLastSignal,
@@ -4038,6 +4040,25 @@ export async function runChat(options: ChatOptions): Promise<void> {
   let sessionsCacheAt = 0;
   let activitySince = new Date(Date.now() - 5 * 60 * 1000).toISOString();
   let lastBackendUsage: BackendTokenUsage | undefined;
+  let lastBackendUsageAt: string | undefined;
+  /** The provider's last measurement of the context it was handed (task 9cf538a2). */
+  const providerContextMeasurement = (): ProviderContextMeasurement | undefined => {
+    const u = lastBackendUsage;
+    if (!u) return undefined;
+    const contextTokens =
+      (u.inputTokens ?? 0) + (u.cacheReadTokens ?? 0) + (u.cacheWriteTokens ?? 0);
+    if (contextTokens <= 0) return undefined;
+    return {
+      contextTokens,
+      ...(u.inputTokens !== undefined ? { inputTokens: u.inputTokens } : {}),
+      ...(u.cacheReadTokens !== undefined ? { cacheReadTokens: u.cacheReadTokens } : {}),
+      ...(u.cacheWriteTokens !== undefined ? { cacheWriteTokens: u.cacheWriteTokens } : {}),
+      ...(runtime.detectedModel || runtime.model
+        ? { model: runtime.detectedModel || runtime.model }
+        : {}),
+      ...(lastBackendUsageAt ? { measuredAt: lastBackendUsageAt } : {}),
+    };
+  };
   let lastDelegation: DelegationState | undefined;
   let forceQuitAfterTurn = false;
   let readyForAutoRun = false;
@@ -4956,7 +4977,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
       : 0;
     const effectiveBudget = Math.max(1, runtime.maxContextTokens - bootstrapReserve);
     const threshold = Math.floor(effectiveBudget * AUTO_COMPACT_THRESHOLD_PCT);
-    if (ledger.totalTokens() <= threshold) return;
+    // Judged on the larger of ink's estimate and the provider's own measurement
+    // of the last request: a 300K estimate over a 541K window never compacted
+    // (Myra, 2026-09-03; task 9cf538a2).
+    if (effectiveContextTokens(ledger.totalTokens(), providerContextMeasurement()) <= threshold) {
+      return;
+    }
 
     // Claude reports its model on the first turn's init event, which may
     // RAISE the budget (1M-window models). Until that arrives — legacy
@@ -6214,6 +6240,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
             // result the model reads — see EvictionHooks (#571).
             if (isClientLocalTool(tool)) {
               return handleClientLocalTool(tool, args, ledger, globalSignalSink, {
+                providerUsage: () => providerContextMeasurement(),
                 onEvict: (eviction) =>
                   recordEviction(
                     'sb',
@@ -7194,6 +7221,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       });
     }
     lastBackendUsage = runResult.usage;
+    lastBackendUsageAt = new Date().toISOString();
 
     // ── Fire turn_end hooks (passive recall, etc.) ──
     hookTurnCount++;

@@ -111,6 +111,39 @@ export interface EvictionHooks {
     tokensFreed: number;
     refs: EvictRef[];
   }): void;
+  /**
+   * What the provider last reported it was asked to read: the window as
+   * BILLED, not as estimated. The ledger's totals are a characters-per-token
+   * guess over what ink packed; a resumed native session also carries what
+   * the provider itself accumulated. Myra's list_context said 297K of 300K
+   * while the API said 541K (task 9cf538a2). Both numbers are shown; the
+   * larger is the one the model actually occupies.
+   */
+  providerUsage?(): ProviderContextMeasurement | undefined;
+}
+
+export interface ProviderContextMeasurement {
+  /** input + cache read + cache write of the last provider request — the context it was handed. */
+  contextTokens: number;
+  inputTokens?: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  model?: string;
+  /** When that request happened (ISO). */
+  measuredAt?: string;
+}
+
+/**
+ * The context size to reason with: the provider's own measurement when it is
+ * larger than the estimate (it counts what the estimate cannot see — the
+ * identity envelope, the native session's own accumulation), else the
+ * estimate. Pure so the budget check and the tool agree.
+ */
+export function effectiveContextTokens(
+  estimatedTokens: number,
+  measured: ProviderContextMeasurement | undefined
+): number {
+  return Math.max(estimatedTokens, measured?.contextTokens ?? 0);
 }
 
 /**
@@ -126,7 +159,7 @@ export function handleClientLocalTool(
 ): PcpToolCallResult | null {
   switch (tool) {
     case 'list_context':
-      return handleListContext(args, ledger);
+      return handleListContext(args, ledger, hooks);
     case 'evict_context':
       return handleEvictContext(args, ledger, hooks);
     case 'compact_context':
@@ -251,10 +284,14 @@ function intArg(value: unknown, fallback: number, min: number, max: number): num
  */
 function handleListContext(
   args: Record<string, unknown>,
-  ledger: ContextLedger
+  ledger: ContextLedger,
+  hooks: EvictionHooks = {}
 ): PcpToolCallResult {
   const all = ledger.summarizeEntries();
   const totalTokens = ledger.totalTokens();
+  const measured = hooks.providerUsage?.();
+  const effectiveTokens = effectiveContextTokens(totalTokens, measured);
+  const divergent = measured !== undefined && measured.contextTokens > totalTokens * 1.25;
   const bookmarks = ledger.listBookmarks();
 
   // Group by source for a quick breakdown — over EVERYTHING, not the page.
@@ -292,7 +329,16 @@ function handleListContext(
         text: JSON.stringify({
           success: true,
           totalEntries: all.length,
+          /** ink's estimate of what it packed (chars ÷ 4). */
           totalTokens,
+          /** The number to reason with: the larger of the estimate and the provider's measurement. */
+          effectiveTokens,
+          ...(measured !== undefined ? { providerMeasured: measured } : {}),
+          ...(divergent
+            ? {
+                accountingNote: `The provider last read ~${measured!.contextTokens.toLocaleString()} tokens of context; ink's estimate of the ledger is ~${totalTokens.toLocaleString()}. The larger number is the window you occupy: the estimate cannot see the identity envelope or what the native session accumulated. Budget against effectiveTokens.`,
+              }
+            : {}),
           bySource,
           bookmarkCount: bookmarks.length,
           ...(bookmarks.length > LIST_CONTEXT_BOOKMARK_LIMIT
