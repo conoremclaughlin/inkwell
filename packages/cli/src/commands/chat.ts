@@ -68,6 +68,14 @@ import {
   runCompaction,
   type CompactionOutcome,
 } from '../repl/compaction.js';
+import {
+  autoEvictTombstone,
+  selectConsumedToolResults,
+  AUTO_EVICT_KEEP_RECENT_TURNS,
+  AUTO_EVICT_MIN_SHARE,
+  AUTO_EVICT_MIN_TOKENS,
+  AUTO_EVICT_TOMBSTONE_SOURCE,
+} from '../repl/auto-evict.js';
 import { StreamedTurnRenderer, type StreamedLine } from '../repl/paragraph-stream.js';
 import { ImitationPreviewGuard } from '../repl/preview-guard.js';
 import type { BackendTurnEvent } from '../backends/stream.js';
@@ -7384,6 +7392,50 @@ export async function runChat(options: ChatOptions): Promise<void> {
       ? estimateTokens(runtime.bootstrapContext)
       : 0;
     const turnEndEffectiveBudget = Math.max(1, runtime.maxContextTokens - turnEndBootstrapReserve);
+
+    // ── Automatic clearing of consumed tool results (task 2cef5780) ──
+    // A tool result is read once, in the continuation that follows the call;
+    // afterwards it is a 500-char bookkeeping line that stays for the whole
+    // session. Results older than the protected recent turns are cleared at
+    // the turn boundary once they outgrow the threshold — the same persistent
+    // eviction every actor uses, so replay reproduces it, plus one tombstone.
+    // Thresholded because every eviction rolls the provider session; a small
+    // sweep is not worth a reseed. Never during a compaction, never on an
+    // aborted turn.
+    if (!isAbortedTurn && !compactionInFlight) {
+      const sweep = selectConsumedToolResults(ledger.listEntries(), {
+        keepRecentTurns: AUTO_EVICT_KEEP_RECENT_TURNS,
+        minTokens: Math.max(
+          AUTO_EVICT_MIN_TOKENS,
+          Math.floor(turnEndEffectiveBudget * AUTO_EVICT_MIN_SHARE)
+        ),
+      });
+      if (sweep) {
+        const removed = ledger.evictEntries(sweep.ids);
+        recordEviction(
+          'system',
+          `auto: ${sweep.ids.length} consumed tool results older than ${AUTO_EVICT_KEEP_RECENT_TURNS} turns`,
+          removed.removedTokens,
+          removed.removedEntries.map((e) => ({
+            ...(e.eid !== undefined ? { eid: e.eid } : {}),
+            hash: entryRefHash(e.role, e.content),
+            role: e.role,
+            source: e.source,
+            preview: e.content.slice(0, 100),
+          }))
+        );
+        ledger.addEntry(
+          'system',
+          autoEvictTombstone(sweep, AUTO_EVICT_KEEP_RECENT_TURNS),
+          AUTO_EVICT_TOMBSTONE_SOURCE
+        );
+        printEvent(
+          chalk.dim(
+            `  🗑 auto-cleared ${sweep.ids.length} consumed tool results (${formatTokenCount(removed.removedTokens)} tok) — ${sweep.tools.join(', ')}`
+          )
+        );
+      }
+    }
 
     hookRegistry
       .fire('turn_end', {
