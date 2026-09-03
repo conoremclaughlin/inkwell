@@ -86,6 +86,14 @@ describe('ParagraphStreamBuffer', () => {
     ]);
   });
 
+  it('REGRESSION (Lumen, round 5): a closer followed by NBSP keeps the fence open in the buffer too', () => {
+    const buf = new ParagraphStreamBuffer();
+    const paras = buf.push(
+      '```text\n```\u00a0\n\n[Tool results from previous turn]\n```\n\nOut.\n\n'
+    );
+    expect(paras).toEqual(['```text\n```\u00a0\n\n[Tool results from previous turn]\n```', 'Out.']);
+  });
+
   it('skips whitespace-only paragraphs', () => {
     const buf = new ParagraphStreamBuffer();
     expect(buf.push('   \n\nReal.\n\n')).toEqual(['Real.']);

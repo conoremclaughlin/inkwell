@@ -52,11 +52,13 @@ const HEADER: Piece[] = [
   {
     choice: [
       [],
+      // Role, then either `[ws]:[ws]` or `[ws]` — never two whitespace runs
+      // side by side: adjacent variable-width runs made the walker retry
+      // every split of one run, quadratic on a model-controlled line
+      // (Lumen, PR #575 round 5).
       [
         { choice: ROLES.map((r) => [{ literal: r }]) },
-        { ws: true },
-        { choice: [[], [{ literal: ':' }]] },
-        { ws: true },
+        { choice: [[{ ws: true }, { literal: ':' }, { ws: true }], [{ ws: true }]] },
       ],
     ],
   },
@@ -124,7 +126,19 @@ function walk(pieces: Piece[], text: string, i: number, prefix: boolean): boolea
   if ('ws' in piece) {
     let j = i;
     while (j < text.length && isWs(text[j])) j += 1;
-    // Longest run first, then shorter — the next piece may want the space.
+    // When the next piece is a literal that cannot begin with whitespace, only
+    // the whole run can precede it — one position to try, not every split.
+    // Backtracking is kept for the cases that need it (a following choice or
+    // run); the grammar never places two runs side by side.
+    const next = rest[0];
+    if (
+      next !== undefined &&
+      'literal' in next &&
+      next.literal.length > 0 &&
+      !isWs(next.literal[0])
+    ) {
+      return walk(rest, text, j, prefix);
+    }
     for (let k = j; k >= i; k -= 1) if (walk(rest, text, k, prefix)) return true;
     return false;
   }
@@ -189,7 +203,10 @@ export function fenceAfterLine(open: OpenFence | null, line: string): OpenFence 
     if (char === '`' && after.includes('`')) return null;
     return { char, length };
   }
-  if (open.char === char && length >= open.length && after.trim() === '') return null;
+  // Only spaces and tabs may follow a closer. `trim()` would also eat NBSP,
+  // vertical tab and form feed, which CommonMark treats as content — the
+  // fence stays open through them (Lumen, PR #575 round 5).
+  if (open.char === char && length >= open.length && /^[ \t]*$/.test(after)) return null;
   return open;
 }
 
