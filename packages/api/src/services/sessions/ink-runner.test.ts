@@ -86,6 +86,24 @@ describe('InkRunner', () => {
       expect(args).toContain('claude-sonnet-4-20250514');
     });
 
+    it('includes --effort when specified, and never otherwise (task 7ea6cdf7)', () => {
+      const runner = new InkRunner();
+      const withEffort = (runner as any).buildArgs('session-eff', {
+        workingDirectory: '/tmp',
+        agentId: 'myra',
+        effort: 'xhigh',
+      });
+      const idx = withEffort.indexOf('--effort');
+      expect(idx).toBeGreaterThan(-1);
+      expect(withEffort[idx + 1]).toBe('xhigh');
+
+      const without = (runner as any).buildArgs('session-eff2', {
+        workingDirectory: '/tmp',
+        agentId: 'myra',
+      });
+      expect(without).not.toContain('--effort');
+    });
+
     it('omits --agent when agentId is not provided', () => {
       const runner = new InkRunner();
       const args = (runner as any).buildArgs('session-000', {

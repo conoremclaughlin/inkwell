@@ -90,6 +90,37 @@ describe('ClaudeAdapter prepare — tool routing', () => {
     }
   });
 
+  it('threads a per-SB effort to the claude CLI, and sends none when unset (task 7ea6cdf7)', () => {
+    const adapter = new ClaudeAdapter();
+    const withEffort = adapter.prepare({
+      agentId: 'myra',
+      prompt: 'hello',
+      promptParts: ['hello'],
+      passthroughArgs: [],
+      toolRouting: 'local',
+      effort: 'xhigh',
+    });
+    try {
+      const idx = withEffort.args.indexOf('--effort');
+      expect(idx).toBeGreaterThan(-1);
+      expect(withEffort.args[idx + 1]).toBe('xhigh');
+    } finally {
+      withEffort.cleanup();
+    }
+    const without = adapter.prepare({
+      agentId: 'myra',
+      prompt: 'hello',
+      promptParts: ['hello'],
+      passthroughArgs: [],
+      toolRouting: 'local',
+    });
+    try {
+      expect(without.args).not.toContain('--effort');
+    } finally {
+      without.cleanup();
+    }
+  });
+
   it('local routing exposes native Read ONLY for attachment-bearing sessions (named exception)', () => {
     // The multimodal render path: --attach-file media is read natively
     // (images cannot flow through ink-block tools). This is a documented
