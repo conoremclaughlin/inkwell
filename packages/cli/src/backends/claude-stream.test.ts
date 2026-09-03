@@ -438,3 +438,24 @@ describe('one assistant message streamed as several events (#569)', () => {
     expect(r?.kind === 'result' && r.text).toBe('b');
   });
 });
+
+describe('result usage carries the context the request was handed (Lumen, PR #583)', () => {
+  it('sums input, cache read and cache write at the adapter boundary', () => {
+    const parser = new ClaudeStreamParser();
+    const events = parser.push(
+      JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        result: '',
+        usage: {
+          input_tokens: 1_000,
+          output_tokens: 10,
+          cache_read_input_tokens: 500_000,
+          cache_creation_input_tokens: 40_000,
+        },
+      }) + '\n'
+    );
+    const result = events.find((e) => e.kind === 'result');
+    expect(result?.kind === 'result' && result.usage?.contextTokens).toBe(541_000);
+  });
+});

@@ -14,7 +14,11 @@
  * real stream) and mislabels usage fields.
  */
 
-import type { BackendTokenUsage, BackendModelUsage } from '../repl/token-usage.js';
+import {
+  providerContextTokens,
+  type BackendTokenUsage,
+  type BackendModelUsage,
+} from '../repl/token-usage.js';
 import type { BackendStreamParser, BackendTurnEvent } from './stream.js';
 
 interface ClaudeContentBlock {
@@ -91,6 +95,11 @@ function toUsage(u: Record<string, unknown>): BackendTokenUsage {
   const outputTokens = num(u.output_tokens);
   const cacheReadTokens = num(u.cache_read_input_tokens);
   const cacheWriteTokens = num(u.cache_creation_input_tokens);
+  const contextTokens = providerContextTokens('claude', {
+    inputTokens,
+    cacheReadTokens,
+    cacheWriteTokens,
+  });
   return {
     backend: 'claude',
     source: 'json',
@@ -98,6 +107,7 @@ function toUsage(u: Record<string, unknown>): BackendTokenUsage {
     outputTokens,
     cacheReadTokens,
     cacheWriteTokens,
+    ...(contextTokens !== undefined ? { contextTokens } : {}),
     totalTokens:
       inputTokens !== undefined && outputTokens !== undefined
         ? inputTokens + outputTokens

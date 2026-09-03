@@ -123,7 +123,10 @@ export interface EvictionHooks {
 }
 
 export interface ProviderContextMeasurement {
-  /** input + cache read + cache write of the last provider request — the context it was handed. */
+  /**
+   * The context the last provider request was handed — normalized per backend
+   * at the adapter boundary (BackendTokenUsage.contextTokens), never summed here.
+   */
   contextTokens: number;
   inputTokens?: number;
   cacheReadTokens?: number;
