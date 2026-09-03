@@ -324,13 +324,13 @@ function handleListContext(
                 note: `${remaining} more matching entries not shown — page with offset ${offset + page.length}, narrow with source/role/minTokens, or sort by "largest" to find what is worth evicting. Evicting by source or role does not require listing the entries.`,
               }
             : {}),
-          // `ref` is the durable address: a content hash that survives
-          // reattach and eviction. `id` is this process's ordinal and is
-          // renumbered on reattach — a link or an evict captured against an
-          // id can resolve to DIFFERENT content later, which reads as
-          // correct (Myra, 2026-09-03; #570). Address by ref.
+          // `ref` is the address: a content hash that survives reattach and
+          // eviction. The process ordinal is deliberately NOT shown — it
+          // renumbers on reattach, so a link or an evict captured against it
+          // could resolve to DIFFERENT content later, which reads as correct
+          // (Myra, 2026-09-03; #570). `entryIds` stays accepted for callers
+          // that still hold one.
           entries: page.map((e) => ({
-            id: e.id,
             ref: e.ref,
             role: e.role,
             source: e.source,
@@ -433,7 +433,6 @@ function handleEvictContext(
           tokensFreed: result.removedTokens,
           totalAfter: result.totalAfter,
           removedPreviews: previews.map((e) => ({
-            id: e.id,
             ref: entryRefHash(e.role, e.content),
             role: e.role,
             source: e.source,

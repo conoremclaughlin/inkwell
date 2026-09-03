@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { ContextLedger, estimateTokens } from './context-ledger.js';
+import { entryRefHash, ContextLedger, estimateTokens } from './context-ledger.js';
 
 describe('ContextLedger', () => {
   it('estimates tokens from content length', () => {
@@ -170,6 +170,26 @@ describe('ContextLedger', () => {
       expect(summary[0].preview).toBe('a short message');
       expect(summary[1].preview.length).toBeLessThanOrEqual(123); // 120 + "..."
       expect(summary[1].source).toBe('ink-tool');
+    });
+  });
+
+  describe('findEntriesByRefs — a hash beside an eid is enforced (Lumen, PR #582)', () => {
+    it('REGRESSION: two entries sharing an eid; a ref with eid+hash selects only the hashed one', () => {
+      const ledger = new ContextLedger();
+      const target = ledger.addEntry('inbox', 'target', 'inkmail', 7);
+      const neighbour = ledger.addEntry('inbox', 'neighbour', 'inkmail', 7);
+      const ids = ledger.findEntriesByRefs([{ eid: 7, hash: entryRefHash('inbox', 'target') }]);
+      expect(ids).toEqual([target.id]);
+      expect(ids).not.toContain(neighbour.id);
+    });
+
+    it('an eid-only ref (legacy) still matches every entry with that eid; a hash-only ref matches by content', () => {
+      const ledger = new ContextLedger();
+      const a = ledger.addEntry('inbox', 'a', 'inkmail', 7);
+      const b = ledger.addEntry('inbox', 'b', 'inkmail', 7);
+      const c = ledger.addEntry('user', 'c');
+      expect(ledger.findEntriesByRefs([{ eid: 7 }]).sort()).toEqual([a.id, b.id].sort());
+      expect(ledger.findEntriesByRefs([{ hash: entryRefHash('user', 'c') }])).toEqual([c.id]);
     });
   });
 

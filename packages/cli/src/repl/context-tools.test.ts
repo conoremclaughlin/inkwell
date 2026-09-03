@@ -517,6 +517,19 @@ describe('compact_context', () => {
 // ─── refs: the durable address (#570) ───────────────────────────
 
 describe('entry refs — hash-addressed, stable across reattach and eviction (#570)', () => {
+  it('the model-facing payloads carry refs and no process ordinal (Lumen, PR #582)', () => {
+    const ledger = new ContextLedger();
+    ledger.addEntry('inbox', 'a', 'inkmail');
+    const listed = parseResult(handleClientLocalTool('list_context', {}, ledger));
+    expect(listed.entries[0].id).toBeUndefined();
+    expect(listed.entries[0].ref).toMatch(/^sha1:/);
+    const evicted = parseResult(
+      handleClientLocalTool('evict_context', { refs: [listed.entries[0].ref] }, ledger)
+    );
+    expect(evicted.removedPreviews[0].id).toBeUndefined();
+    expect(evicted.removedPreviews[0].ref).toBe(listed.entries[0].ref);
+  });
+
   it('list_context hands out a ref per entry, and evict_context takes refs', () => {
     const ledger = new ContextLedger();
     ledger.addEntry('inbox', 'keep me', 'inkmail');
@@ -540,7 +553,7 @@ describe('entry refs — hash-addressed, stable across reattach and eviction (#5
     // An earlier eviction shifts everything positionally…
     handleClientLocalTool(
       'evict_context',
-      { entryIds: [listed.entries[0].id, listed.entries[1].id] },
+      { refs: [listed.entries[0].ref, listed.entries[1].ref] },
       ledger
     );
     // …but the ref still points at "message 3".

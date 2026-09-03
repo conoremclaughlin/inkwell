@@ -392,6 +392,43 @@ describe('hydrateLedgerFromTranscript — compaction events', () => {
   });
 });
 
+describe('hydrateLedgerFromTranscript — a hash-selected eviction replays as itself (Lumen, PR #582)', () => {
+  let dir: string;
+  let transcriptPath: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'ink-evict-ref-test-'));
+    transcriptPath = join(dir, 'session-test.jsonl');
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('REGRESSION: two hydrated entries share an eid; the persisted eid+hash ref evicts only the hashed one', () => {
+    // A compaction's kept tail and a later event can both hydrate with the
+    // same eid. The SB evicted `target` by ref; the hook persisted
+    // { eid, hash }. Replay must not take `neighbour` with it.
+    writeFileSync(
+      transcriptPath,
+      [
+        { eid: 7, type: 'user', content: 'target' },
+        { eid: 7, type: 'user', content: 'neighbour' },
+        {
+          eid: 8,
+          type: 'context_evict',
+          actor: 'sb',
+          reason: 'by ref',
+          refs: [{ eid: 7, hash: entryRefHash('user', 'target') }],
+        },
+      ]
+        .map((e) => JSON.stringify(e))
+        .join('\n') + '\n'
+    );
+    const ledger = new ContextLedger();
+    hydrateLedgerFromTranscript(ledger, transcriptPath);
+    expect(ledger.listEntries().map((e) => e.content)).toEqual(['neighbour']);
+  });
+});
+
 describe('hydrateLedgerFromTranscript — context_evict events', () => {
   let dir: string;
   let transcriptPath: string;

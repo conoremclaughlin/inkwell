@@ -125,15 +125,30 @@ export class ContextLedger {
    * live entries — identical role+content duplicates match together).
    */
   public findEntriesByRefs(refs: Array<{ eid?: number; hash?: string }>): number[] {
-    const eids = new Set(refs.map((r) => r.eid).filter((v): v is number => typeof v === 'number'));
-    const hashes = new Set(
-      refs.filter((r) => r.eid === undefined && typeof r.hash === 'string').map((r) => r.hash)
+    // Three kinds of ref, three rules. A ref that carries a hash ENFORCES it:
+    // an eid can name two different entries (a compaction's kept tail and a
+    // later event both hydrate with it), so matching by eid alone whenever
+    // one was present turned a hash-selected eviction back into an eid
+    // eviction on replay — the neighbour went with the target (Lumen, PR
+    // #582). Eid-only refs keep their legacy behaviour; hash-only refs match
+    // by content wherever it sits.
+    const eidOnly = new Set(
+      refs.filter((r) => typeof r.eid === 'number' && typeof r.hash !== 'string').map((r) => r.eid!)
     );
+    const hashOnly = new Set(
+      refs
+        .filter((r) => typeof r.eid !== 'number' && typeof r.hash === 'string')
+        .map((r) => r.hash!)
+    );
+    const both = refs.filter((r) => typeof r.eid === 'number' && typeof r.hash === 'string');
     const ids: number[] = [];
     for (const entry of this.entries) {
-      if (entry.eid !== undefined && eids.has(entry.eid)) {
+      const hash = entryRefHash(entry.role, entry.content);
+      if (entry.eid !== undefined && eidOnly.has(entry.eid)) {
         ids.push(entry.id);
-      } else if (hashes.size > 0 && hashes.has(entryRefHash(entry.role, entry.content))) {
+      } else if (hashOnly.has(hash)) {
+        ids.push(entry.id);
+      } else if (both.some((r) => r.eid === entry.eid && r.hash === hash)) {
         ids.push(entry.id);
       }
     }
