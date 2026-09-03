@@ -63,6 +63,11 @@ import {
   type BackendRunResult,
   type BackendRunRequest,
 } from '../repl/backend-runner.js';
+import {
+  buildCompactionPrompt,
+  runCompaction,
+  type CompactionOutcome,
+} from '../repl/compaction.js';
 import { StreamedTurnRenderer, type StreamedLine } from '../repl/paragraph-stream.js';
 import { ImitationPreviewGuard } from '../repl/preview-guard.js';
 import type { BackendTurnEvent } from '../backends/stream.js';
@@ -114,7 +119,6 @@ import {
   handleClientLocalTool,
   globalSignalSink,
   parseCompactContextArgs,
-  compactionShrinks,
   type SignalSink,
   getLastSignal,
   clearLastSignal,
@@ -4848,19 +4852,6 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // fails, fall back to a hard trim so the turn can still proceed.
   let compactionInFlight = false;
 
-  const buildCompactionPrompt = (chunk: string): string =>
-    [
-      'You are compacting a conversation transcript into a dense continuation brief.',
-      'Summarize the conversation below, preserving: decisions and their rationale,',
-      'completed and in-progress work, key facts and constraints, open questions,',
-      'commitments made, and any identifiers (PR numbers, session IDs, file paths, URLs).',
-      'Write compact bullet points. Output ONLY the summary — no preamble.',
-      '',
-      '<conversation>',
-      chunk,
-      '</conversation>',
-    ].join('\n');
-
   /**
    * Compact the ledger NOW: replace everything but the most recent entries
    * with a summary, write the `compaction` event, roll the provider session.
@@ -4868,11 +4859,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
    * Two callers. Auto-compaction (below) reaches it over the budget threshold
    * with the runtime summarizing. An agent reaches it through the
    * `compact_context` tool, usually with its OWN summary — the one thing a
-   * long-lived SB could not do for itself (Myra, 2026-09-03: "TECHNICALLY she
-   * could self-compact just using eviction after writing a summary"; task
-   * 609b1833). Returns what happened so the tool can report it; never
-   * hard-trims on an agent's behalf — a failed summarizer turn is an error
-   * the agent can answer by writing the summary itself.
+   * long-lived SB could not do for itself (task 609b1833). The policy is
+   * `runCompaction` (repl/compaction.ts); this binds the summarizer spawn, the
+   * transcript, the usage counters and the session roll to it.
    */
   const compactContextNow = async (opts: {
     reason: string;
@@ -4881,59 +4870,17 @@ export async function runChat(options: ChatOptions): Promise<void> {
     keepRecent?: number;
     /** The turn's cancellation — aborts a running summarizer spawn. */
     signal?: AbortSignal;
-  }): Promise<
-    | {
-        ok: true;
-        removed: number;
-        removedTokens: number;
-        summaryTokens: number;
-        before: number;
-        totalAfter: number;
-      }
-    | { ok: false; error: string }
-  > => {
+  }): Promise<CompactionOutcome> => {
     if (compactionInFlight) return { ok: false, error: 'a compaction is already in progress' };
-    const keepRecent = opts.keepRecent ?? AUTO_COMPACT_KEEP_RECENT_ENTRIES;
-    const entries = ledger.listEntries();
-    const cutoff = Math.max(0, entries.length - keepRecent);
-    if (cutoff === 0) {
-      return {
-        ok: false,
-        error: `nothing to compact — only the protected recent tail remains (${entries.length} entries, keepRecent ${keepRecent})`,
-      };
-    }
-
     compactionInFlight = true;
-    let changed = false;
     try {
-      // The set to summarize is fixed HERE, by id. The ledger keeps moving
-      // while a summarizer runs (inbox and activity polling append), and a
-      // compaction by count after the await removed whatever was oldest by
-      // then — a protected tail entry the summarizer never saw (Lumen, PR
-      // #578). The removed set is exactly the summarized set; anything
-      // appended meanwhile survives.
-      const oldest = entries.slice(0, cutoff);
-      const oldestIds = oldest.map((e) => e.id);
-      const oldestIdSet = new Set(oldestIds);
-      const removedTokens = oldest.reduce((sum, e) => sum + e.approxTokens, 0);
       const before = ledger.totalTokens();
-      printEvent(
-        chalk.yellow(
-          `  ⛁ Context at ${formatTokenCount(before)} tok — compacting ${oldest.length} entries (${opts.reason})`
-        )
-      );
-
-      let summaryText = opts.summaryText?.trim() ?? '';
-      if (!summaryText) {
-        try {
-          if (opts.signal?.aborted) throw new Error('cancelled');
-          const chunk = oldest
-            .map((e) => `${e.role.toUpperCase()}${e.source ? ` [${e.source}]` : ''}: ${e.content}`)
-            .join('\n\n');
+      const outcome = await runCompaction(opts, {
+        ledger,
+        keepRecentDefault: AUTO_COMPACT_KEEP_RECENT_ENTRIES,
+        summarize: async (chunk, signal) => {
           // A handle, not a bare promise: the turn's Ctrl+C reaches this
-          // spawn (it used to run on to its idle timeout), and its usage is
-          // recorded on EVERY outcome — self-compaction tokens are spent
-          // tokens (Lumen, PR #578).
+          // spawn (it used to run on to its idle timeout).
           const summarizer = startBackendTurn({
             backend: runtime.backend,
             agentId,
@@ -4957,121 +4904,45 @@ export async function runChat(options: ChatOptions): Promise<void> {
             stream: true,
           });
           const onAbort = (): void => summarizer.abort();
-          opts.signal?.addEventListener('abort', onAbort, { once: true });
+          signal?.addEventListener('abort', onAbort, { once: true });
           let turn: BackendRunResult;
           try {
             turn = await summarizer.result;
           } finally {
-            opts.signal?.removeEventListener('abort', onAbort);
+            signal?.removeEventListener('abort', onAbort);
           }
-          recordRunUsage(turn.usage);
-          if (opts.signal?.aborted) throw new Error('cancelled');
-          summaryText = turn.success ? (turn.responseText ?? turn.stdout).trim() : '';
-          if (!summaryText) {
-            throw new Error(turn.stderr.trim().slice(0, 200) || `exit code ${turn.exitCode}`);
-          }
-        } catch (error) {
-          const msg = error instanceof Error ? error.message : String(error);
-          if (opts.actor === 'sb' || opts.signal?.aborted) {
-            printEvent(chalk.yellow(`  ⛁ Compaction failed (${msg})`));
-            return { ok: false, error: `summarization failed (${msg}) — pass your own summary` };
-          }
-          printEvent(chalk.yellow(`  ⛁ Compaction summarization failed (${msg}) — hard-trimming`));
-          const trimmed = await trimContextToPercent(
-            DEFAULT_TRIM_TARGET_PCT,
-            `${opts.reason} (compaction fallback)`
-          );
           return {
-            ok: false,
-            error: `summarization failed (${msg}); hard-trimmed ${trimmed.removed} entries instead`,
+            text: turn.success ? (turn.responseText ?? turn.stdout) : '',
+            usage: turn.usage,
+            error: turn.success
+              ? undefined
+              : turn.stderr.trim().slice(0, 200) || `exit code ${turn.exitCode}`,
           };
-        }
-      }
-
-      const summary = `[Conversation summary — compacted ${oldest.length} earlier entries${
-        opts.actor === 'sb' ? ', written by the agent' : ''
-      }]\n${summaryText}`;
-      const summaryTokens = estimateTokens(summary);
-      // A compaction must shrink the window. A "summary" larger than what it
-      // replaces is a rewrite that grows the context and rolls the provider
-      // session for nothing (Lumen, PR #578).
-      if (!compactionShrinks(removedTokens, summaryTokens)) {
+        },
+        persist: (event) => appendTranscript(runtime.transcriptPath, event),
+        recordUsage: recordRunUsage,
+        hardTrim: (reason) => trimContextToPercent(DEFAULT_TRIM_TARGET_PCT, reason),
+        log: (line) => printEvent(chalk.yellow(`  ⛁ ${line}`)),
+      });
+      if (outcome.ok) {
+        // Cutoff divider: everything above this line in the scrollback is
+        // now out of the context window (replaced by the summary).
         printEvent(
-          chalk.yellow('  ⛁ Compaction refused — the summary is not smaller than what it replaces')
+          renderContextCutoff(
+            `compacted ${outcome.removed} entries · ${formatTokenCount(before)} → ${formatTokenCount(outcome.totalAfter)} tok (freed ${formatTokenCount(outcome.freedTokens)})`
+          )
         );
-        return {
-          ok: false,
-          error: `refused: the summary (~${summaryTokens} tok) is not smaller than the ${oldest.length} entries it would replace (~${removedTokens} tok) — write a denser summary, or keep fewer recent entries so more is replaced`,
-        };
-      }
-
-      // The durable marker goes FIRST. The compaction event is the COMPLETE
-      // new start state — summary plus the verbatim tail — so it is projected
-      // from the live ledger without touching it; only once it is on disk
-      // does the in-memory ledger change. The other order left a live ledger
-      // compacted, a provider session rolled, and no event to survive
-      // reattach when the append failed (Lumen, PR #578).
-      const live = ledger.listEntries();
-      const removedNow = live.filter((e) => oldestIdSet.has(e.id));
-      const keptNow = live.filter((e) => !oldestIdSet.has(e.id));
-      const removedTokensNow = removedNow.reduce((sum, e) => sum + e.approxTokens, 0);
-      const totalAfter = keptNow.reduce((sum, e) => sum + e.approxTokens, 0) + summaryTokens;
-      try {
-        appendTranscript(runtime.transcriptPath, {
-          type: 'compaction',
-          reason: opts.reason,
-          actor: opts.actor,
-          summary,
-          keptEntries: keptNow.map((e) => ({
-            role: e.role,
-            content: e.content,
-            source: e.source,
-            ...(e.eid !== undefined ? { eid: e.eid } : {}),
-            ...(e.replay !== undefined ? { replay: e.replay } : {}),
-          })),
-          removedCount: removedNow.length,
-          removedTokens: removedTokensNow,
-          summaryTokens,
-          totalAfter,
-        });
-      } catch (error) {
-        const msg = error instanceof Error ? error.message : String(error);
-        printEvent(
-          chalk.yellow(`  ⛁ Compaction marker could not be persisted (${msg}) — context unchanged`)
-        );
-        return {
-          ok: false,
-          error: `could not persist the compaction marker (${msg}); the context was left unchanged`,
-        };
-      }
-      const result = ledger.compactEntriesToSummary(oldestIds, summary);
-      changed = true;
-      // Cutoff divider: everything above this line in the scrollback is
-      // now out of the context window (replaced by the summary).
-      printEvent(
-        renderContextCutoff(
-          `compacted ${result.removedEntries.length} entries · ${formatTokenCount(before)} → ${formatTokenCount(result.totalAfter)} tok`
-        )
-      );
-      return {
-        ok: true,
-        removed: result.removedEntries.length,
-        removedTokens: result.removedTokens,
-        summaryTokens: result.summaryTokens,
-        before,
-        totalAfter: result.totalAfter,
-      };
-    } finally {
-      compactionInFlight = false;
-      if (changed) {
         // ink just rolled the ledger — roll the provider session too so the
         // next spawn seeds a fresh native session with the summary (we compact
         // before the provider ever would). Mid-turn, the next continuation
-        // re-seeds (decideContinuationSession). Unconditional on backend: for
-        // non-claude these are already undefined.
+        // re-seeds (decideContinuationSession). Only when the ledger actually
+        // changed: a refusal or a failed marker leaves the session alone.
         activeBackendSessionId = undefined;
         activeBackendSessionShape = undefined;
       }
+      return outcome;
+    } finally {
+      compactionInFlight = false;
     }
   };
 
@@ -5138,7 +5009,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     return asResult({
       success: true,
       compacted: outcome.removed,
-      tokensFreed: outcome.before - outcome.totalAfter,
+      tokensFreed: outcome.freedTokens,
       summaryTokens: outcome.summaryTokens,
       totalAfter: outcome.totalAfter,
       keptRecent: parsed.keepRecent ?? AUTO_COMPACT_KEEP_RECENT_ENTRIES,
