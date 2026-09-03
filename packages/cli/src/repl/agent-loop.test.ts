@@ -1,10 +1,14 @@
 import { describe, it, expect } from 'vitest';
 import {
   buildContinuationBody,
+  buildFinalRelayBody,
+  reconcileSelection,
+  snapshotCalls,
   extractLocalToolCalls,
   hasUnseenFailure,
   resolveResponseText,
   runAgentLoop,
+  MAX_TOOL_CALLS_PER_ITERATION,
   type AgentLoopPorts,
   type BackendTurnOutcome,
   type LocalToolCall,
@@ -612,11 +616,25 @@ describe('runAgentLoop — final relay at the iteration cap (PR #491 port)', () 
     expect(result.responseText).not.toContain('relay boom');
   });
 
-  it('does NOT relay when a screen rejection is what reached the cap', async () => {
+  /**
+   * Was: "does NOT relay when a screen rejection is what reached the cap".
+   *
+   * That exclusion existed because the relay could not be trusted to carry the
+   * right thing — its own comment said a third turn "would relay iteration 1's
+   * already-seen results and bury iteration 2's refusal". True of a payload
+   * assembled from variables that drifted; false now that one object is
+   * captured per iteration (Lumen, PR #573 round 3).
+   *
+   * And the exclusion had a cost, which is the failure this PR is about: when
+   * the cap fires inside the rejection branch it breaks BEFORE the
+   * continuation, so the model was never told its calls were refused. It
+   * emitted spawn_agent + read, got neither, and the turn ended in silence.
+   */
+  it('relays the REFUSAL that reached the cap — not an earlier iteration', async () => {
     const harness = makePorts([
       outcome({ responseText: `t1 ${inkTool('send_response', { content: 'hi' })}` }),
       outcome({ responseText: `t2 ${inkTool('spawn_agent')}\n${inkTool('read')}` }),
-      outcome({ responseText: 'should never be requested' }),
+      outcome({ responseText: 'final answer' }),
     ]);
     // Iteration 1 passes the screen and executes; iteration 2 is refused whole,
     // and that refusal is what hits the cap.
@@ -630,10 +648,13 @@ describe('runAgentLoop — final relay at the iteration cap (PR #491 port)', () 
     );
 
     expect(result.stopReason).toBe('iteration-cap');
-    // Opening turn + 1 continuation. A third turn would relay iteration 1's
-    // already-seen results and bury iteration 2's refusal.
-    expect(harness.prompts).toHaveLength(2);
-    expect(harness.prompts.some((p) => p.body.includes('FINAL'))).toBe(false);
+    expect(harness.prompts).toHaveLength(3);
+    const relay = harness.prompts[2]!.body;
+    expect(relay).toContain('FINAL');
+    // What actually stopped the loop.
+    expect(relay).toContain('spawn_agent must be alone');
+    // NOT iteration 1's already-delivered work.
+    expect(relay).not.toContain('send_response');
     expect(harness.executed).toHaveLength(1);
     // The refusal is what ended the turn, and it is on the record.
     expect(result.toolResults.at(-1)).toEqual({
@@ -879,5 +900,600 @@ describe('an unrecognized failure status reaches the model', () => {
 
     expect(harness.prompts).toHaveLength(2);
     expect(harness.prompts[1].body).toContain('upstream timed out');
+  });
+});
+
+/**
+ * The per-iteration cap discarded calls in silence (Myra, 3 Sep 2026).
+ *
+ * She emitted 8 update_memory calls; 5 ran. The results block that came back
+ * listed only the survivors, with no count and no gap — well-formed, internally
+ * consistent, and describing less work than she had asked for. The 3 that
+ * vanished were downgrading critical-salience memories asserting a security
+ * compromise that had not happened. She caught it only by reading back.
+ *
+ * Her framing, and the reason these tests assert shape rather than the number:
+ * "The dropped calls were indistinguishable from calls never made."
+ */
+/**
+ * The reconciliation, tested as itself rather than through a turn.
+ *
+ * Three rounds of identity heuristics were wrong three different ways before
+ * this replaced them (Lumen, PR #573 rounds 2-5). Testing the function directly
+ * is the point: the previous versions were only ever exercised through a loop,
+ * where each new hole needed a new end-to-end scenario to expose it.
+ */
+describe('reconcileSelection', () => {
+  const c = (tool: string, args: Record<string, unknown> = {}): LocalToolCall => ({
+    tool,
+    args,
+    raw: '',
+  });
+
+  it('reports the tail the cap discarded', () => {
+    const emitted = [c('a'), c('b'), c('d')];
+    const out = reconcileSelection(emitted, emitted.slice(0, 2));
+    expect(out.dropped.map((x) => x.tool)).toEqual(['d']);
+    expect(out.unmatched).toBe(0);
+    expect(out.emitted).toBe(3);
+    expect(out.reached).toBe(2);
+  });
+
+  it('sees through rebuilt objects', () => {
+    const emitted = [c('a'), c('b'), c('d')];
+    const out = reconcileSelection(
+      emitted,
+      emitted.slice(0, 2).map((x) => ({ ...x }))
+    );
+    expect(out.dropped.map((x) => x.tool)).toEqual(['d']);
+    expect(out.unmatched).toBe(0);
+  });
+
+  it('flags a call that ran but was never emitted', () => {
+    const out = reconcileSelection([c('a'), c('b')], [c('a'), c('substituted')]);
+    expect(out.unmatched).toBe(1);
+  });
+
+  it('distinguishes duplicates by consuming each match once', () => {
+    // Two identical emissions, one selected: exactly one is dropped. A
+    // non-consuming match would say neither.
+    const out = reconcileSelection([c('save'), c('save')], [c('save')]);
+    expect(out.dropped).toHaveLength(1);
+    expect(out.unmatched).toBe(0);
+  });
+
+  it('separates calls that differ only by arguments', () => {
+    const out = reconcileSelection(
+      [c('save', { id: 1 }), c('save', { id: 2 })],
+      [c('save', { id: 1 })]
+    );
+    expect(out.dropped).toHaveLength(1);
+    expect(out.dropped[0]!.args).toEqual({ id: 2 });
+  });
+
+  it('treats an empty selection as everything dropped', () => {
+    const out = reconcileSelection([c('a'), c('b')], []);
+    expect(out.dropped).toHaveLength(2);
+    expect(out.unmatched).toBe(0);
+  });
+
+  it('says nothing about a turn where everything ran', () => {
+    const emitted = [c('a'), c('b')];
+    const out = reconcileSelection(emitted, emitted);
+    expect(out.dropped).toHaveLength(0);
+    expect(out.unmatched).toBe(0);
+  });
+});
+
+/**
+ * Round six, all Lumen's: the screen holds the same objects reconciliation
+ * compares against, and two notes still described `reached` as `ran`.
+ */
+describe('a screen that edits calls in place', () => {
+  it('snapshots args so an in-place edit cannot hide', () => {
+    const original: LocalToolCall[] = [{ tool: 'save', args: { id: 1 }, raw: '' }];
+    const snap = snapshotCalls(original);
+    (original[0]!.args as { id: number }).id = 2;
+    // The snapshot still describes what was ASKED for.
+    expect(snap[0]!.args).toEqual({ id: 1 });
+  });
+
+  /**
+   * The repro. A host mutates `all[0].args.id` from 1 to 2 and returns the same
+   * array. The altered write executes. Comparing live objects, the call matched
+   * ITSELF and nothing was reported.
+   */
+  it('reports an in-place rewrite as unreconcilable rather than fine', async () => {
+    const harness = makePorts([
+      outcome({ stdout: inkTool('save', { id: 1 }) }),
+      outcome({ stdout: 'done' }),
+    ]);
+    harness.ports.tools.screen = (all) => {
+      for (const c of all) {
+        if (c.tool === 'save') (c.args as { id: number }).id = 2;
+      }
+      return { calls: all };
+    };
+
+    await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+
+    // It ran with id 2, which is not what was asked for.
+    expect((harness.executed[0]![0]!.args as { id: number }).id).toBe(2);
+    const continuation = harness.prompts[1]!.body;
+    expect(continuation).toContain('CANNOT tell you which');
+    expect(continuation).toContain('rewrote or substituted');
+  });
+});
+
+describe('the notes never call `reached` `ran`', () => {
+  const c = (tool: string): LocalToolCall => ({ tool, args: {}, raw: '' });
+
+  /**
+   * `reached` counts calls that got to the runner, whatever became of them
+   * there. Saying "5 ran" next to five `blocked` results is a flat
+   * contradiction — the same defect as round two, recurring in the branch I
+   * wrote for round five.
+   */
+  it('does not claim blocked calls ran, even alongside a substitution', () => {
+    const blocked: ToolResultRecord[] = ['a', 'b'].map((t) => ({
+      tool: t,
+      result: 'denied by policy',
+      status: 'blocked',
+    }));
+    const body = buildContinuationBody(blocked, [c('a'), c('b')], {
+      emitted: 3,
+      reached: 2,
+      dropped: [c('gone')],
+      unmatched: 1,
+    });
+
+    expect(body).toContain('none of those calls ran');
+    expect(body).toContain('reached the tool runner');
+    expect(body).not.toMatch(/\d+ ran\b/);
+  });
+
+  /**
+   * FINAL was reporting only the unmatched count, discarding the totals and the
+   * ambiguous remainder — so an 8-emitted / 5-reached turn ended saying almost
+   * nothing about the other seven.
+   */
+  it('keeps the totals and the ambiguous remainder in the final relay', () => {
+    const body = buildFinalRelayBody([{ tool: 'm1', result: 'ok', status: 'executed' }], {
+      emitted: 8,
+      reached: 5,
+      dropped: [c('m5'), c('m6'), c('m7'), c('m8')],
+      unmatched: 1,
+    });
+
+    expect(body).toContain('NOT RECONCILED');
+    expect(body).toContain('you emitted 8 tool calls');
+    expect(body).toContain('5 reached the tool runner');
+    expect(body).toContain('Up to 4 of your calls');
+    expect(body).not.toMatch(/\d+ of the calls that ran/);
+  });
+});
+
+describe('silently dropped tool calls (the per-iteration cap)', () => {
+  const call = (tool: string): LocalToolCall => ({ tool, args: {}, raw: '' });
+  const sel = (o: Partial<ReturnType<typeof reconcileSelection>> = {}) => ({
+    emitted: 0,
+    reached: 0,
+    dropped: [] as LocalToolCall[],
+    unmatched: 0,
+    ...o,
+  });
+  const ran = (tool: string): ToolResultRecord => ({ tool, result: 'ok', status: 'executed' });
+
+  describe('buildContinuationBody', () => {
+    it('names the calls that did not run, and both counts', () => {
+      const body = buildContinuationBody(
+        [ran('a'), ran('b')],
+        [call('a'), call('b')],
+        sel({ emitted: 4, reached: 2, dropped: [call('c'), call('d')] })
+      );
+
+      expect(body).toContain('c, d');
+      // Both sides of the gap: what was asked for and what happened.
+      expect(body).toContain('4 tool calls');
+      expect(body).toContain('2 reached the tool runner');
+      expect(body).toContain('Do not report them as done');
+    });
+
+    /**
+     * The control. Without it, a body that ALWAYS warned would pass the test
+     * above while telling every turn its calls were dropped.
+     */
+    it('says nothing about drops when nothing was dropped', () => {
+      const body = buildContinuationBody([ran('a')], [call('a')]);
+      expect(body).not.toContain('never reached it at all');
+      expect(body).not.toContain('reached the tool runner');
+    });
+  });
+
+  describe('buildFinalRelayBody', () => {
+    it('names undelivered calls when the loop is ending', () => {
+      const body = buildFinalRelayBody(
+        [ran('a')],
+        sel({ emitted: 2, reached: 1, dropped: [call('late')] })
+      );
+      expect(body).toContain('NOT EXECUTED');
+      expect(body).toContain('late');
+    });
+
+    it('stays quiet when every call ran', () => {
+      expect(buildFinalRelayBody([ran('a')])).not.toContain('NOT EXECUTED');
+    });
+  });
+
+  /**
+   * Round two, both Lumen's (PR #573).
+   */
+  describe('stranded drops at the end of a turn', () => {
+    /**
+     * P1. `lastNotRunCount` was mirrored outward so the final relay could carry
+     * it — but the gate still asked only about stranded RESULTS. With a clean
+     * terminal signal every result is `executed`, so hasUnseenFailure is false,
+     * relayResults stays empty, and the door the mirroring was built for never
+     * opens. The capped calls vanish under the signal.
+     */
+    it('relays the drops when a terminal signal ends the turn', async () => {
+      const emitted = ['m1', 'm2', 'm3', 'm4', 'signal_status', 'm6', 'm7', 'm8'];
+      const harness = makePorts(
+        [
+          outcome({ stdout: emitted.map((t) => inkTool(t)).join('\n') }),
+          outcome({ stdout: 'final answer' }),
+        ],
+        (calls) =>
+          calls.map((c) => ({
+            tool: c.tool,
+            result: c.tool === 'signal_status' ? signalResult('completed') : 'ok',
+            status: 'executed',
+          }))
+      );
+
+      const result = await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+
+      expect(result.stopReason).toBe('terminal-signal');
+      // The turn ends, but not before the agent is told what the cap ate.
+      expect(harness.prompts).toHaveLength(2);
+      const relay = harness.prompts[1]!.body;
+      expect(relay).toContain('NOT EXECUTED');
+      for (const tool of ['m6', 'm7', 'm8']) expect(relay).toContain(tool);
+    });
+
+    it('still stays quiet on a terminal signal with nothing stranded', async () => {
+      const harness = makePorts(
+        [outcome({ stdout: inkTool('signal_status') }), outcome({ stdout: 'unreachable' })],
+        () => [{ tool: 'signal_status', result: signalResult('completed'), status: 'executed' }]
+      );
+
+      await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+      // No drops, no failures — the agent knows what it signaled. One prompt.
+      expect(harness.prompts).toHaveLength(1);
+    });
+  });
+
+  /**
+   * Round three, both Lumen's: the relay payload was assembled from variables
+   * that could describe different iterations at the same moment.
+   */
+  describe('the relay payload describes ONE iteration', () => {
+    /**
+     * A clean terminal signal with capped calls opened the relay on the drop
+     * count while the results variable was still empty — so the body announced
+     * "no tool results" and withheld the five outcomes that existed.
+     */
+    it('carries the results alongside the drops, not instead of them', async () => {
+      const emitted = ['m1', 'm2', 'm3', 'm4', 'signal_status', 'm6', 'm7', 'm8'];
+      const harness = makePorts(
+        [
+          outcome({ stdout: emitted.map((t) => inkTool(t)).join('\n') }),
+          outcome({ stdout: 'final answer' }),
+        ],
+        (calls) =>
+          calls.map((c) => ({
+            tool: c.tool,
+            result: c.tool === 'signal_status' ? signalResult('completed') : 'ok',
+            status: 'executed',
+          }))
+      );
+
+      await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+
+      const relay = harness.prompts[1]!.body;
+      // The drops, as before.
+      for (const tool of ['m6', 'm7', 'm8']) expect(relay).toContain(tool);
+      // AND the outcomes that actually happened, which were being withheld.
+      for (const tool of ['m1', 'm2', 'm3', 'm4']) expect(relay).toContain(`Tool ${tool}`);
+      expect(relay).not.toContain('no tool results');
+    });
+
+    /**
+     * A screen that ACCEPTS the iteration and selects nothing from it (Lumen,
+     * PR #573 round 4). Nothing runs, exactly as with a rejection, but no
+     * reason is produced — and the `calls.length === 0` break is upstream of
+     * where the payload is normally built, so the model heard nothing at all.
+     */
+    it('relays an empty screen selection instead of ending the turn quietly', async () => {
+      const harness = makePorts([
+        outcome({ stdout: `${inkTool('save_memory')}\n${inkTool('create_reminder')}` }),
+        outcome({ stdout: 'final answer' }),
+      ]);
+      harness.ports.tools.screen = () => ({ calls: [] });
+
+      const result = await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+
+      expect(result.stopReason).toBe('no-tools');
+      expect(harness.executed).toHaveLength(0);
+      // Was: one prompt and a UI event nobody downstream can read.
+      expect(harness.prompts).toHaveLength(2);
+      const relay = harness.prompts[1]!.body;
+      expect(relay).toContain('NOT EXECUTED');
+      expect(relay).toContain('save_memory');
+      expect(relay).toContain('create_reminder');
+    });
+
+    /**
+     * The control that keeps the above from becoming "always relay": a model
+     * that simply stopped asking for tools must still end in one turn.
+     */
+    it('stays quiet when the model emitted no tools at all', async () => {
+      const harness = makePorts([outcome({ stdout: 'just an answer' })]);
+      harness.ports.tools.screen = () => ({ calls: [] });
+
+      const result = await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+
+      expect(result.stopReason).toBe('no-tools');
+      expect(harness.prompts).toHaveLength(1);
+    });
+
+    /**
+     * The clear-on-delivery step, which the rejection repro does NOT cover —
+     * that one passes even with the clear removed, because the rejection branch
+     * overwrites the payload with its own. Found by mutating the clear and
+     * watching every test stay green.
+     *
+     * Here nothing overwrites it: iteration 1's drops are delivered by its
+     * continuation, then iteration 2 emits no tools at all and the loop ends.
+     * Without the clear, the stale payload opens the relay and re-delivers
+     * drops the model has already acted on.
+     */
+    it('does not relay drops after a later iteration ends cleanly', async () => {
+      const first = ['m1', 'm2', 'm3', 'm4', 'm5', 'm6', 'm7', 'm8'];
+      const harness = makePorts([
+        outcome({ stdout: first.map((t) => inkTool(t)).join('\n') }),
+        outcome({ stdout: 'all done, no more tools needed' }),
+        outcome({ stdout: 'should never be requested' }),
+      ]);
+
+      const result = await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+
+      expect(result.stopReason).toBe('no-tools');
+      // Iteration 1's continuation reported the drops...
+      expect(harness.prompts[1]!.body).toContain('m6');
+      // ...and that is the end of it. No FINAL relay repeating them.
+      expect(harness.prompts).toHaveLength(2);
+      expect(harness.prompts.some((pr) => pr.body.includes('FINAL'))).toBe(false);
+    });
+
+    /**
+     * Iteration 1 drops m6-m8 and REPORTS them in its continuation. Iteration 2
+     * then stops on a screen rejection. Nothing reset the drop counters, so the
+     * stale count opened the relay and re-delivered drops the model had already
+     * seen, in place of the rejection that stopped the loop.
+     */
+    it('does not re-deliver drops a continuation already reported', async () => {
+      const first = ['m1', 'm2', 'm3', 'm4', 'm5', 'm6', 'm7', 'm8'];
+      const harness = makePorts([
+        outcome({ stdout: first.map((t) => inkTool(t)).join('\n') }),
+        outcome({ stdout: `t2 ${inkTool('spawn_agent')}\n${inkTool('read')}` }),
+        outcome({ stdout: 'final answer' }),
+      ]);
+      let screened = 0;
+      harness.ports.tools.screen = (all) =>
+        screened++ === 0
+          ? { calls: all.slice(0, MAX_TOOL_CALLS_PER_ITERATION) }
+          : { rejected: 'spawn_agent must be alone' };
+
+      const result = await runAgentLoop(
+        { prompt: 'go', toolRouting: 'local', maxIterations: 2 },
+        harness.ports
+      );
+
+      expect(result.stopReason).toBe('iteration-cap');
+      // Iteration 1's continuation is where the drops belong.
+      expect(harness.prompts[1]!.body).toContain('m6');
+
+      const relay = harness.prompts[2]!.body;
+      expect(relay).toContain('FINAL');
+      // The refusal that actually stopped the loop...
+      expect(relay).toContain('spawn_agent must be alone');
+      // ...and NOT iteration 1's already-delivered drops.
+      for (const tool of ['m6', 'm7', 'm8']) expect(relay).not.toContain(tool);
+    });
+  });
+
+  /**
+   * P2. The count proves how many calls REACHED the runner, not how many
+   * executed. Five blocked results plus three capped calls previously said both
+   * "none of those calls ran" and "only 5 ran" in the same body.
+   */
+  describe('the count does not claim execution it cannot prove', () => {
+    it('does not contradict the all-refused note', () => {
+      const blocked: ToolResultRecord[] = ['a', 'b', 'c', 'd', 'e'].map((t) => ({
+        tool: t,
+        result: 'denied by policy',
+        status: 'blocked',
+      }));
+      const body = buildContinuationBody(
+        blocked,
+        blocked.map((r) => call(r.tool)),
+        sel({ emitted: 8, reached: 5, dropped: [call('f'), call('g'), call('h')] })
+      );
+
+      // Both statements have to be able to coexist without lying.
+      expect(body).toContain('none of those calls ran');
+      expect(body).not.toContain('only 5 ran');
+      expect(body).toContain('reached the tool runner');
+      expect(body).toContain('never reached it at all');
+      expect(body).toContain('f, g, h');
+    });
+  });
+
+  /**
+   * Naming is only safe while the names are right (Myra's own correction to her
+   * own argument, 3 Sep 2026).
+   *
+   * The identity filter is a reference comparison. A host `screen` that rebuilds
+   * its call objects matches nothing, so every emitted call looks dropped —
+   * including the ones that ran. She argued naming beats counting, then attached
+   * the precondition: a false "create_reminder did not run" is WORSE than a
+   * count, because it is a positive instruction to re-run a write that
+   * succeeded, in the runtime's own voice. #553's do-not-retry problem with the
+   * sign flipped.
+   */
+  describe('when call identity cannot be trusted', () => {
+    it('gives the count and refuses to name, rather than naming wrongly', () => {
+      // Something ran that maps to nothing emitted, so an unmatched selection
+      // may be a REWRITE of a dropped one — which of the model's calls ran is
+      // genuinely unknowable.
+      const body = buildContinuationBody(
+        [ran('a'), ran('b')],
+        [call('a'), call('b')],
+        sel({ emitted: 3, reached: 2, dropped: [call('unrunnable_widget')], unmatched: 1 })
+      );
+
+      expect(body).toContain('CANNOT tell you which');
+      expect(body).toContain('you emitted 3 tool calls');
+      expect(body).toContain('read back the current');
+      // The whole point: it must not assert a name it cannot stand behind.
+      expect(body).not.toContain('never reached it at all');
+      expect(body).not.toContain('unrunnable_widget');
+    });
+
+    it('matches rebuilt objects by content and names the real drops', async () => {
+      const emitted = ['m1', 'm2', 'm3', 'm4', 'm5', 'm6', 'm7'];
+      const harness = makePorts([
+        outcome({ stdout: emitted.map((t) => inkTool(t)).join('\n') }),
+        outcome({ stdout: 'done' }),
+      ]);
+      // Truncates correctly but returns NEW objects — the shape that defeated
+      // reference equality. Content matching sees through it.
+      harness.ports.tools.screen = (all) => ({
+        calls: all.slice(0, 5).map((c) => ({ ...c })),
+      });
+
+      await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+
+      const continuation = harness.prompts[1]!.body;
+      // The two that genuinely did not run, named — better than the previous
+      // behaviour, which gave up and reported a bare count.
+      expect(continuation).toContain('m6, m7');
+      expect(continuation).toContain('you emitted 7 tool calls');
+      expect(continuation).toContain('5 reached the tool runner');
+      // And never a call that ran.
+      expect(continuation).not.toContain('CANNOT tell you which');
+    });
+
+    /**
+     * Lumen's round-five repro (P1). A screen returning one original reference
+     * and two rebuilds — `[all[0], {...all[1]}, {...all[2]}]` — executed all
+     * three, and the previous predicate announced `b, c` never ran and told the
+     * model to re-emit them. Two completed writes, re-run on the runtime's say-so.
+     */
+    it('says nothing when a partially-rebuilt selection ran everything', async () => {
+      const harness = makePorts([
+        outcome({ stdout: [inkTool('a'), inkTool('b'), inkTool('c')].join('\n') }),
+        outcome({ stdout: 'done' }),
+      ]);
+      harness.ports.tools.screen = (all) =>
+        all.length === 0 ? { calls: [] } : { calls: [all[0]!, { ...all[1]! }, { ...all[2]! }] };
+
+      await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+
+      expect(harness.executed[0]).toHaveLength(3);
+      const continuation = harness.prompts[1]!.body;
+      expect(continuation).not.toContain('never reached it at all');
+      expect(continuation).not.toContain('CANNOT tell you which');
+      expect(harness.events.join('\n')).not.toContain('not run');
+    });
+
+    /**
+     * A true substitution is indistinguishable from a rewrite of a dropped
+     * call, so the runtime must not name — the honest answer is the one that
+     * does not instruct a re-run of something that may have executed.
+     */
+    it('refuses to name when something ran that was never emitted', async () => {
+      const harness = makePorts([
+        outcome({ stdout: [inkTool('a'), inkTool('b'), inkTool('vanishes')].join('\n') }),
+        outcome({ stdout: 'done' }),
+      ]);
+      harness.ports.tools.screen = (all) =>
+        all.length === 0
+          ? { calls: [] }
+          : { calls: [all[0]!, all[1]!, { tool: 'substituted', args: {}, raw: '' }] };
+
+      await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+
+      const continuation = harness.prompts[1]!.body;
+      expect(continuation).toContain('CANNOT tell you which');
+      expect(continuation).toContain('you emitted 3 tool calls');
+      expect(continuation).not.toContain('never reached it at all');
+      expect(harness.events.join('\n')).toContain('not determinable');
+    });
+
+    it('final relay refuses to name for the same reason', () => {
+      const body = buildFinalRelayBody([ran('a')], sel({ emitted: 3, reached: 1, unmatched: 2 }));
+      expect(body).toContain('NOT RECONCILED');
+      expect(body).toContain('cannot tell you which');
+    });
+  });
+
+  /**
+   * Myra's measurement, end to end: 8 emitted -> 5 executed, and the three that
+   * did not run are named back to the model. Written against the constant
+   * rather than the literal 5 — the defect is the silence, not the number.
+   */
+  it('executes up to the cap and tells the model which calls it dropped', async () => {
+    const emitted = ['m1', 'm2', 'm3', 'm4', 'm5', 'm6', 'm7', 'm8'];
+    const harness = makePorts([
+      outcome({ stdout: emitted.map((t) => inkTool(t)).join('\n') }),
+      outcome({ stdout: 'done' }),
+    ]);
+
+    await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+
+    const honored = emitted.slice(0, MAX_TOOL_CALLS_PER_ITERATION);
+    const skipped = emitted.slice(MAX_TOOL_CALLS_PER_ITERATION);
+
+    expect(harness.executed[0]!.map((c) => c.tool)).toEqual(honored);
+
+    // The point: the continuation must name what did NOT run. Before this, the
+    // model saw five results and no indication three calls had been discarded.
+    const continuation = harness.prompts[1]!.body;
+    for (const tool of skipped) expect(continuation).toContain(tool);
+    expect(continuation).toContain(`${emitted.length} tool calls`);
+    expect(continuation).toContain(`${honored.length} reached the tool runner`);
+
+    // And a human watching the terminal sees it too.
+    expect(harness.events.join('\n')).toContain('not run');
+  });
+
+  /**
+   * Her second sample, which is the control: 4 emitted, 4 executed, and no
+   * note. A warning that fires on every turn is its own kind of lie.
+   */
+  it('says nothing when every emitted call fits under the cap', async () => {
+    const emitted = ['m1', 'm2', 'm3', 'm4'].slice(0, MAX_TOOL_CALLS_PER_ITERATION);
+    const harness = makePorts([
+      outcome({ stdout: emitted.map((t) => inkTool(t)).join('\n') }),
+      outcome({ stdout: 'done' }),
+    ]);
+
+    await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+
+    expect(harness.executed[0]).toHaveLength(emitted.length);
+    expect(harness.prompts[1]!.body).not.toContain('reached the tool runner');
+    expect(harness.events.join('\n')).not.toContain('not run');
   });
 });

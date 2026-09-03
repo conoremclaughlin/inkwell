@@ -33,6 +33,114 @@ export interface ToolResultRecord {
 }
 
 /**
+ * What the screen actually selected, reconciled against what the model emitted.
+ *
+ * Three rounds of review went into inferring this from object identity, and
+ * every inference grew a new hole (Lumen, PR #573 rounds 2-5). Reference
+ * equality said "dropped" for calls a screen had merely rebuilt; the fix for
+ * that missed substitutions; the fix for THAT named `b, c` as never-run when a
+ * screen returned `[all[0], {...all[1]}, {...all[2]}]` and all three ran. The
+ * pattern was the tell: the same predicate wrong three different ways is a
+ * design that cannot answer the question, not a predicate needing a fourth
+ * patch.
+ *
+ * So stop inferring provenance and RECONCILE. Each selected call is matched to
+ * a distinct emitted call by content, which survives `{...c}` because a spread
+ * copies tool and args. Consuming the match handles duplicates. What is left
+ * over on each side is then a fact rather than a guess:
+ *
+ *   - emitted calls with no match  -> provably did not run
+ *   - selected calls with no match -> the screen ran something the model never
+ *     asked for, and an unmatched selection may be a REWRITE of an unmatched
+ *     emission, so which of the model's calls ran is genuinely unknowable
+ *
+ * `dropped` is trustworthy exactly when `unmatched` is zero. That is a proof,
+ * not a heuristic, and it is why the counts below can never disagree.
+ */
+export interface SelectionOutcome {
+  /** How many calls the model emitted. */
+  emitted: number;
+  /** How many the runtime ran. */
+  reached: number;
+  /** Emitted calls proven not to have run. Meaningful only when unmatched is 0. */
+  dropped: LocalToolCall[];
+  /** Ran but matches nothing emitted — the screen substituted or rewrote. */
+  unmatched: number;
+}
+
+/**
+ * An immutable record of what the model asked for, taken BEFORE the screen
+ * sees it.
+ *
+ * `screen(extracted)` is handed the live objects, so a host that edits one in
+ * place — `all[0].args.id = 2` — changes the very thing reconciliation compares
+ * against. The altered write executes and the call matches ITSELF, so nothing
+ * is reported (Lumen, PR #573 round 6). Comparing against a snapshot makes the
+ * edit visible: the emitted call no longer matches anything selected, and the
+ * altered one matches nothing emitted, so the turn is correctly reported as
+ * unreconcilable rather than silently fine.
+ *
+ * Snapshotting rather than freezing: freezing would throw inside a host doing
+ * something previously tolerated, and turning a silent defect into a crash is
+ * not the trade this PR is making.
+ */
+export function snapshotCalls(calls: ReadonlyArray<LocalToolCall>): LocalToolCall[] {
+  return calls.map((c) => ({ ...c, args: structuredClone(c.args) }));
+}
+
+/** Same request? Compared by content so a rebuilt object still matches. */
+function sameCall(a: LocalToolCall, b: LocalToolCall): boolean {
+  return a.tool === b.tool && JSON.stringify(a.args) === JSON.stringify(b.args);
+}
+
+/**
+ * Match what ran against what was asked for. Exported so the reconciliation can
+ * be tested as itself rather than through a turn.
+ */
+export function reconcileSelection(
+  extracted: ReadonlyArray<LocalToolCall>,
+  selected: ReadonlyArray<LocalToolCall>
+): SelectionOutcome {
+  const remaining = [...selected];
+  const dropped: LocalToolCall[] = [];
+  for (const call of extracted) {
+    const at = remaining.findIndex((c) => c === call || sameCall(c, call));
+    if (at === -1) dropped.push(call);
+    else remaining.splice(at, 1);
+  }
+  return {
+    emitted: extracted.length,
+    reached: selected.length,
+    dropped,
+    unmatched: remaining.length,
+  };
+}
+
+/**
+ * Everything ONE iteration produced, captured together.
+ *
+ * The FINAL relay used to assemble itself from three variables that were
+ * updated at different places and could describe different iterations at the
+ * same moment (Lumen, PR #573 round 3). Two ways that went wrong, both real:
+ *
+ *   - A clean terminal signal with capped calls opened the relay on
+ *     `lastNotRunCount` while `relayResults` was still empty, so the body
+ *     announced "no tool results" and withheld the five outcomes that existed.
+ *   - Iteration 1 dropped m6-m8 and REPORTED them in its continuation; then
+ *     iteration 2 stopped on a screen rejection. Nothing reset the drop
+ *     counters, so the stale count opened the relay, re-delivered iteration
+ *     1's already-seen drops, and omitted the rejection that actually stopped
+ *     the loop.
+ *
+ * One object, written at the moment the iteration exists and cleared the
+ * moment a continuation delivers it, cannot disagree with itself.
+ */
+interface StrandedIteration {
+  results: ToolResultRecord[];
+  selection: SelectionOutcome;
+}
+
+/**
  * Why a turn's tool loop stopped. Today the loop's exit is implicit; naming it
  * lets a caller distinguish "the agent finished" from "we ran out of budget",
  * which a shadow clone must report back to its parent.
@@ -97,7 +205,10 @@ export interface AgentLoopPorts {
      * Runs pre-truncation on purpose: a rule like "spawn_agent must be alone"
      * checked after `.slice()` could be evaded by a spawn in sixth position.
      * Returning a refusal rejects the iteration whole — no call runs — and the
-     * reason is fed back so the model can correct rather than guess.
+     * reason is fed back so the model can correct rather than guess. PREFER
+     * that over `{ calls: [] }`: selecting nothing also runs nothing, but says
+     * why to no one. It is relayed as an unexplained drop rather than silently
+     * ending the turn, which is honest but much less useful than a reason.
      *
      * Omit to accept every iteration and simply truncate.
      */
@@ -161,7 +272,17 @@ export function resolveResponseText(outcome: BackendTurnOutcome): string {
  */
 export function buildContinuationBody(
   results: ReadonlyArray<ToolResultRecord>,
-  calls: ReadonlyArray<LocalToolCall>
+  calls: ReadonlyArray<LocalToolCall>,
+  /**
+   * What ran versus what was asked for. Omit when there is nothing to report;
+   * the default describes a turn where every emitted call ran.
+   */
+  selection: SelectionOutcome = {
+    emitted: results.length,
+    reached: results.length,
+    dropped: [],
+    unmatched: 0,
+  }
 ): string {
   const toolResultsSummary = results
     .map((r) => {
@@ -192,7 +313,48 @@ export function buildContinuationBody(
       ? '\n\nNOTE: none of those calls ran, and at least one FAILED rather than being refused — the error text above says why. A failure is not a refusal: if it names a bad argument or a transient condition, fix it and try again. Do not report the work as done, and do not describe a failure as a refusal.'
       : '\n\nNOTE: none of those calls ran — every one was refused. Do not retry them. Work with the tools you do have, and if the task cannot be completed without a refused tool, say so plainly and stop.';
 
-  return `[Tool results from previous turn]\n${toolResultsSummary}${formatCorrection}${refusalNote}\n\nContinue your response based on these tool results. If you need more tools, emit ink-tool blocks. Otherwise, provide your final answer.`;
+  // A capped call is indistinguishable from a call never made unless we say so.
+  //
+  // MAX_TOOL_CALLS_PER_ITERATION silently discarded everything past the fifth,
+  // in emission order, and the results block that came back listed only the
+  // survivors — with no count, no gap, nothing to compare against. A model has
+  // no way to notice: the block it reads is well-formed and internally
+  // consistent, it simply describes less work than was asked for.
+  //
+  // Myra emitted 8 update_memory calls; 5 ran. The 3 that vanished were the
+  // ones downgrading critical-salience memories asserting a security compromise
+  // that had not happened, and she only caught it because she read back rather
+  // than trusting the turn.
+  //
+  // Naming beats counting — "3 were dropped" invites a guess, and a wrong guess
+  // re-runs a write that already succeeded. But naming is only safe while the
+  // names are RIGHT, which is Myra's own correction to that argument: a false
+  // "create_reminder did not run" is a positive instruction to redo a completed
+  // write, in the runtime's voice, which the reader cannot contradict.
+  //
+  // So the three states below are the three things that can actually be known,
+  // and the counts are coherent by construction: when the selection reconciles,
+  // emitted === reached + dropped.length exactly.
+  const { emitted, reached, dropped, unmatched } = selection;
+  const droppedNote =
+    unmatched > 0
+      ? `\n\nNOTE: you emitted ${emitted} tool calls and ${reached} reached the tool runner — their ` +
+        `outcomes are above, and some of those may themselves have been refused or failed. ` +
+        `But ${unmatched} of them do not correspond to anything you asked for: the host rewrote or ` +
+        `substituted calls. The runtime therefore CANNOT tell you which of yours reached the runner. ` +
+        `Up to ${dropped.length} of your calls did not run at all, or ran in altered form. ` +
+        `Do not guess and do not re-emit blindly: read back the current state and act on what you ` +
+        `find. Re-running a write that already succeeded is not safe.`
+      : dropped.length === 0
+        ? ''
+        : `\n\nNOTE: you emitted ${emitted} tool calls. ${reached} reached the tool runner — their ` +
+          `outcomes are above, and some of those may themselves have been refused or failed. ` +
+          `The remaining ${dropped.length} never reached it at all and had no effect: ` +
+          `${dropped.map((c) => c.tool).join(', ')}. ` +
+          `At most ${MAX_TOOL_CALLS_PER_ITERATION} calls run per iteration, in the order you emit them. ` +
+          `Re-emit the ones you still need — they did not happen. Do not report them as done.`;
+
+  return `[Tool results from previous turn]\n${toolResultsSummary}${formatCorrection}${refusalNote}${droppedNote}\n\nContinue your response based on these tool results. If you need more tools, emit ink-tool blocks. Otherwise, provide your final answer.`;
 }
 
 /**
@@ -203,15 +365,41 @@ export function buildContinuationBody(
  * confidently wrong (the Aug 13 Telegram audio drop; PR #491). The relay's
  * output is final: its ink-tool blocks are NOT executed.
  */
-export function buildFinalRelayBody(results: ReadonlyArray<ToolResultRecord>): string {
+export function buildFinalRelayBody(
+  results: ReadonlyArray<ToolResultRecord>,
+  selection: SelectionOutcome = {
+    emitted: results.length,
+    reached: results.length,
+    dropped: [],
+    unmatched: 0,
+  }
+): string {
   const toolResultsSummary = results
     .map((r) => {
       const resultStr = typeof r.result === 'string' ? r.result : JSON.stringify(r.result);
       return `Tool ${r.tool} (${r.status}): ${resultStr}`;
     })
     .join('\n\n');
+  // Undelivered calls have to be named here too. This body ends the turn, so a
+  // call the cap discarded on the final iteration will never get another
+  // chance — and an agent that is not told exits reporting work it never did.
+  const { dropped, unmatched } = selection;
+  const droppedNote =
+    unmatched > 0
+      ? `\n\nNOT RECONCILED — you emitted ${selection.emitted} tool calls and ${selection.reached} ` +
+        `reached the tool runner, but ${unmatched} of those do not correspond to anything you ` +
+        `emitted, so the runtime cannot tell you which of yours reached it. Up to ` +
+        `${dropped.length} of your calls did not run at all, or ran in altered form. The loop has ` +
+        `ended. Say that plainly rather than reporting the work as done.`
+      : dropped.length === 0
+        ? ''
+        : `\n\nNOT EXECUTED — these calls were emitted but never ran, and the loop has now ended: ${dropped
+            .map((c) => c.tool)
+            .join(', ')}. They had no effect. Say so rather than reporting them as done.`;
+
+  const summary = results.length > 0 ? toolResultsSummary : '(no tool results from this iteration)';
   return (
-    `[Tool results from previous turn — FINAL]\n${toolResultsSummary}\n\n` +
+    `[Tool results from previous turn — FINAL]\n${summary}${droppedNote}\n\n` +
     'The tool loop has ended; no further tool calls will be executed this turn. ' +
     'Review these results and provide your final answer. If a call above failed, ' +
     'say so plainly instead of reporting the work as done.'
@@ -282,13 +470,16 @@ export async function runAgentLoop(
   // Tracking "the last results seen" as ambient state relays the wrong thing:
   // a screen rejection at the cap would replay the previous iteration's
   // already-seen results and omit the refusal that actually ended the loop.
-  let relayResults: ToolResultRecord[] = [];
+  // The one payload the FINAL relay may send. Null means nothing is stranded.
+  let stranded: StrandedIteration | null = null;
 
   for (;;) {
     responseText = resolveResponseText(outcome);
 
     const extracted =
       input.toolRouting === 'local' ? extractLocalToolCalls(responseText) : ([] as LocalToolCall[]);
+    // Taken before `screen` can touch these objects — see snapshotCalls.
+    const emittedSnapshot = snapshotCalls(extracted);
 
     // Screening sees every call the model emitted, before the per-iteration cap
     // discards any — a rule about what may accompany what cannot be enforced on
@@ -309,6 +500,13 @@ export async function runAgentLoop(
       };
       allToolResults.push(record);
       ports.ui.printEvent(`  ⋯ iteration refused — ${screened.rejected}`);
+      // A refusal is this iteration's entire output. Captured here so that if
+      // the cap fires below, the relay carries the rejection that stopped the
+      // loop rather than a previous iteration's leftovers.
+      stranded = {
+        results: [record],
+        selection: { emitted: 0, reached: 0, dropped: [], unmatched: 0 },
+      };
 
       if (iteration >= maxIterations) {
         stopReason = 'iteration-cap';
@@ -335,19 +533,52 @@ export async function runAgentLoop(
         stopReason = 'backend-failure';
         break;
       }
+      // The continuation carried the refusal; nothing is stranded.
+      stranded = null;
       continue;
     }
 
     calls = screened.calls;
 
+    // What ran versus what was asked for. Reconciled, not inferred — see
+    // SelectionOutcome for why three rounds of identity heuristics were the
+    // wrong shape of answer.
+    const selection = reconcileSelection(emittedSnapshot, calls);
+    if (selection.unmatched > 0) {
+      ports.ui.printEvent(
+        `  ⋯ ${selection.unmatched} of ${selection.reached} calls that reached the runner match nothing emitted — which of the model's calls reached it is not determinable`
+      );
+    } else if (selection.dropped.length > 0) {
+      ports.ui.printEvent(
+        `  ⋯ ${selection.dropped.length} of ${selection.emitted} tool calls not run (cap ${MAX_TOOL_CALLS_PER_ITERATION}/iteration): ${selection.dropped.map((c) => c.tool).join(', ')}`
+      );
+    }
+
     if (calls.length === 0) {
       stopReason = 'no-tools';
+      // A screen may ACCEPT an iteration and then select nothing from it
+      // (Lumen, PR #573 round 4). The effect is identical to rejecting it whole
+      // — nothing runs — but it arrives without a reason, and this break is
+      // upstream of where `stranded` is normally built, so the turn ended with
+      // a UI event and nothing said to the model at all. Two emitted writes,
+      // one backend prompt, `no-tools`, silence.
+      //
+      // Captured rather than forbidden. Requiring `{ rejected }` here would
+      // turn a host's questionable-but-honest return into a crash, and this PR
+      // is about making loss audible, not about adding ways to fail. The relay
+      // reports zero results and names what never ran, which is exactly true.
+      if (selection.dropped.length > 0 || selection.unmatched > 0) {
+        stranded = { results: [], selection };
+      }
       break;
     }
 
     const results = await ports.tools.execute(calls, { iteration, signal: input.signal });
     allToolResults.push(...results);
     for (const r of results) ports.observe?.recordToolCall(r);
+    // Results and drops together, from the same iteration, at the one moment
+    // both are known. Every exit below inherits exactly this.
+    stranded = { results, selection };
 
     iteration++;
 
@@ -370,7 +601,6 @@ export async function runAgentLoop(
     if (reason && !retryAfterRefusal) {
       stopReason = reason;
       if (reason === 'iteration-cap') {
-        relayResults = results;
         ports.ui.printLine(`(tool loop limit reached — ${maxIterations} iterations)`);
       } else if (hasUnseenFailure(results)) {
         // A call that THREW is not a refusal, and nobody watched it happen.
@@ -403,7 +633,11 @@ export async function runAgentLoop(
         // Terminal semantics are preserved: this only populates the FINAL relay,
         // whose output is not extracted, so nothing re-executes and no signal is
         // multiplied.
-        relayResults = results;
+        //
+        // The capture itself now happens once, above, the moment the iteration
+        // completes. What survives here is only the POLICY question of whether
+        // this stop deserves a relay — answered at the gate against that one
+        // payload rather than by writing to a second variable from here.
       }
       break;
     }
@@ -417,7 +651,7 @@ export async function runAgentLoop(
 
     const stopWaiting = ports.ui.startWaiting();
     try {
-      outcome = await ports.backend.runTurn(buildContinuationBody(results, calls), {
+      outcome = await ports.backend.runTurn(buildContinuationBody(results, calls, selection), {
         iteration,
         isContinuation: true,
         signal: input.signal,
@@ -435,6 +669,10 @@ export async function runAgentLoop(
       stopReason = 'backend-failure';
       break;
     }
+    // Delivered: this iteration's results AND its drops both went out in the
+    // continuation, so none of it is stranded. Clearing here is what stops a
+    // later iteration from re-reporting it.
+    stranded = null;
   }
 
   // FINAL RELAY (PR #491 port): the loop exited at the iteration cap, so the
@@ -455,16 +693,44 @@ export async function runAgentLoop(
   // is only populated for that case when the iteration actually contains an
   // `error` (see hasUnseenFailure), so a witnessed denial still ends the turn
   // quietly and nobody gets nagged for saying no.
-  if (relayResults.length > 0 && outcome.success && !input.signal?.aborted) {
+  // Stranded DROPS open this gate too, not just stranded results (Lumen,
+  // PR #573 round 2): the clean repro — signal_status completing in position
+  // five, four ordinary calls above it, three capped below — produced a single
+  // backend prompt and silently stranded the three. Every result was
+  // `executed`, so hasUnseenFailure was false and nothing else opened the door.
+  //
+  // The PAYLOAD is `stranded`, captured whole per iteration; this decides only
+  // WHETHER to send it (round 3). Reading both from one object is what stops
+  // the relay describing two different iterations at once — announcing "no tool
+  // results" next to a drop count, or re-delivering an earlier iteration's
+  // already-reported drops in place of the rejection that actually stopped the
+  // loop.
+  //
+  // Same default-to-loud argument as hasUnseenFailure one level up — key on
+  // the FACTS of the iteration, not on the stop reason, so a reason added later
+  // cannot quietly reintroduce the silence. Terminal semantics still hold: the
+  // relay's output is not extracted, so nothing re-executes and no signal is
+  // multiplied. The agent knows what it signaled; it does not know what the cap
+  // ate underneath the signal.
+  const relayWorthy =
+    stranded !== null &&
+    (stranded.selection.dropped.length > 0 ||
+      stranded.selection.unmatched > 0 ||
+      stopReason === 'iteration-cap' ||
+      hasUnseenFailure(stranded.results));
+  if (relayWorthy && outcome.success && !input.signal?.aborted) {
     ports.ui.printEvent('  ⋯ relaying final tool results (no further execution)…');
     const stopRelayWaiting = ports.ui.startWaiting();
     let relay: BackendTurnOutcome;
     try {
-      relay = await ports.backend.runTurn(buildFinalRelayBody(relayResults), {
-        iteration,
-        isContinuation: true,
-        signal: input.signal,
-      });
+      relay = await ports.backend.runTurn(
+        buildFinalRelayBody(stranded!.results, stranded!.selection),
+        {
+          iteration,
+          isContinuation: true,
+          signal: input.signal,
+        }
+      );
     } finally {
       stopRelayWaiting();
     }
