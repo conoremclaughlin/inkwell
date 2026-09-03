@@ -6,47 +6,110 @@
  * accumulate until a blank-line boundary completes a paragraph, which is then
  * emitted as its own scrollback line.
  *
- * Fence-aware: a ``` code fence (markdown or ```ink-tool blocks in local tool
- * routing) is never split across paragraphs — content is held until the fence
- * closes, so a tool-call block always lands as ONE unit that the caller can
- * strip or render whole. An unclosed fence is resolved by flush() at block end.
+ * Fence-aware: a fenced code block (backtick or tilde, any length — the same
+ * rule the imitation detector uses; markdown or ```ink-tool blocks in local
+ * tool routing) is never split across paragraphs — content is held until the
+ * fence closes, so a tool-call block always lands as ONE unit that the caller
+ * can strip or render whole. An unclosed fence is resolved by flush().
+ *
+ * Every paragraph is reported as a SPAN of the raw text fed since reset —
+ * exact offsets, text taken verbatim from the raw. Nothing is normalized:
+ * an earlier version collapsed blank-line runs inside a held fence, and a
+ * consumer mapping the normalized paragraph back onto raw offsets by length
+ * ended up with the wrong end — past which a fabricated results frame slipped
+ * onto the screen (Lumen, PR #575 round 3). One coordinate system, no
+ * heuristics.
  */
+export interface ParagraphSpan {
+  /** The paragraph, trimmed — exactly `raw.slice(start, end)`. */
+  text: string;
+  /** Offsets into the raw text fed since the last reset. */
+  start: number;
+  end: number;
+}
+
+/**
+ * Whether a fence is still open at the end of `text`. CommonMark rule: a
+ * fence opens on a line starting with three or more backticks or tildes and
+ * closes only on the same character, at least as long.
+ */
+function fenceOpenAtEnd(text: string): boolean {
+  let open: { char: string; length: number } | null = null;
+  for (const line of text.split('\n')) {
+    const m = /^[ \t]{0,3}(`{3,}|~{3,})/.exec(line);
+    if (!m) continue;
+    const char = m[1]![0]!;
+    const length = m[1]!.length;
+    if (open === null) open = { char, length };
+    else if (open.char === char && length >= open.length) open = null;
+  }
+  return open !== null;
+}
+
+function trimmedSpan(raw: string, start: number, end: number): ParagraphSpan | null {
+  let s = start;
+  let e = end;
+  while (s < e && /\s/.test(raw[s]!)) s += 1;
+  while (e > s && /\s/.test(raw[e - 1]!)) e -= 1;
+  if (s >= e) return null;
+  return { text: raw.slice(s, e), start: s, end: e };
+}
+
 export class ParagraphStreamBuffer {
-  private buffer = '';
+  private raw = '';
+  /** Where the paragraph under construction begins. */
+  private paraStart = 0;
+  /** Where the next blank-line scan resumes (past boundaries already judged). */
+  private scanFrom = 0;
+
+  /** Feed a delta; returns the paragraphs completed by this chunk (text only). */
+  push(delta: string): string[] {
+    return this.pushSpans(delta).map((span) => span.text);
+  }
 
   /**
-   * Feed a delta; returns paragraphs completed by this chunk (trimmed,
-   * non-empty). Content inside an open ``` fence stays buffered.
+   * Feed a delta; returns the paragraphs completed by this chunk as spans of
+   * the raw text. Content inside an open fence stays buffered.
    */
-  push(delta: string): string[] {
-    this.buffer += delta;
-    const parts = this.buffer.split(/\n{2,}/);
-    const tail = parts.pop() ?? ''; // incomplete paragraph — stays buffered
-    const out: string[] = [];
-    let held = '';
-    for (const part of parts) {
-      held = held ? `${held}\n\n${part}` : part;
-      const fences = (held.match(/```/g) || []).length;
-      if (fences % 2 === 0) {
-        const para = held.trim();
-        if (para) out.push(para);
-        held = '';
+  pushSpans(delta: string): ParagraphSpan[] {
+    this.raw += delta;
+    const out: ParagraphSpan[] = [];
+    const boundary = /\n{2,}/g;
+    boundary.lastIndex = this.scanFrom;
+    let m: RegExpExecArray | null;
+    while ((m = boundary.exec(this.raw))) {
+      const boundaryEnd = m.index + m[0].length;
+      if (fenceOpenAtEnd(this.raw.slice(this.paraStart, m.index))) {
+        // Inside a fence: this blank run is content, not a boundary.
+        this.scanFrom = boundaryEnd;
+        continue;
       }
+      const span = trimmedSpan(this.raw, this.paraStart, m.index);
+      if (span) out.push(span);
+      this.paraStart = boundaryEnd;
+      this.scanFrom = boundaryEnd;
     }
-    this.buffer = held ? `${held}\n\n${tail}` : tail;
     return out;
   }
 
-  /** Flush the buffered tail (end of a text block or turn); null when empty. */
+  /** Flush the buffered tail (end of the spawn); null when empty. */
   flush(): string | null {
-    const tail = this.buffer.trim();
-    this.buffer = '';
-    return tail || null;
+    return this.flushSpan()?.text ?? null;
   }
 
-  /** Drop any buffered content (start of a new turn). */
+  flushSpan(): ParagraphSpan | null {
+    const span = trimmedSpan(this.raw, this.paraStart, this.raw.length);
+    // Offsets stay valid for the caller: the raw is retained until reset().
+    this.paraStart = this.raw.length;
+    this.scanFrom = this.raw.length;
+    return span;
+  }
+
+  /** Drop any buffered content (start of a new spawn/turn). Offsets restart at 0. */
   reset(): void {
-    this.buffer = '';
+    this.raw = '';
+    this.paraStart = 0;
+    this.scanFrom = 0;
   }
 }
 
@@ -92,10 +155,12 @@ export class StreamedTurnRenderer {
   private headerShown = false;
   private sawDeltaThisBlock = false;
   private streamedVisible = false;
-  /** Everything streamed in the current spawn, uncut — the guard's subject. */
+  /**
+   * Everything streamed in the current spawn, uncut — the guard's subject.
+   * Fed exactly what the paragraph buffer is fed, and reset with it, so the
+   * buffer's spans are offsets into this string.
+   */
   private spawnText = '';
-  /** Offset into `spawnText` up to which paragraphs have been emitted. */
-  private emitCursor = 0;
   /** Text of the current block (deltas, or the completed block when none). */
   private blockText = '';
   /** The current assistant message, uncut, across its continued blocks. */
@@ -127,7 +192,6 @@ export class StreamedTurnRenderer {
     this.buffer.reset();
     this.sawDeltaThisBlock = false;
     this.spawnText = '';
-    this.emitCursor = 0;
     this.blockText = '';
     this.messageText = '';
     this.muted = false;
@@ -140,7 +204,7 @@ export class StreamedTurnRenderer {
    * whole spawn's text in view.
    */
   endSpawn(): StreamedLine[] {
-    const tail = this.buffer.flush();
+    const tail = this.buffer.flushSpan();
     return tail !== null ? this.emitAll([tail]) : [];
   }
 
@@ -154,7 +218,7 @@ export class StreamedTurnRenderer {
     this.sawDeltaThisBlock = true;
     this.blockText += text;
     this.spawnText += text;
-    return this.emitAll(this.buffer.push(text));
+    return this.emitAll(this.buffer.pushSpans(text));
   }
 
   /**
@@ -169,7 +233,7 @@ export class StreamedTurnRenderer {
     if (!this.sawDeltaThisBlock) {
       this.blockText = fullText;
       this.spawnText += fullText;
-      lines = this.emitAll(this.buffer.push(fullText));
+      lines = this.emitAll(this.buffer.pushSpans(fullText));
     }
     // Recorded CUT, like the loop's final text, so shouldSkipFinal compares
     // like with like. The cut is found on the UNCUT message as a whole — a
@@ -198,37 +262,25 @@ export class StreamedTurnRenderer {
     return frame ? text.slice(0, frame.index).trimEnd() : text;
   }
 
-  /** Where `para` sits in `spawnText`, searching forward from the emit cursor. */
-  private locate(para: string): number {
-    const exact = this.spawnText.indexOf(para, this.emitCursor);
-    if (exact !== -1) return exact;
-    // The buffer normalizes 3+ newlines inside a held fence to two; find the
-    // paragraph by its head instead.
-    const head = this.spawnText.indexOf(para.slice(0, 40), this.emitCursor);
-    return head !== -1 ? head : this.emitCursor;
-  }
-
-  private emitAll(paragraphs: string[]): StreamedLine[] {
+  private emitAll(spans: ParagraphSpan[]): StreamedLine[] {
     const lines: StreamedLine[] = [];
-    for (const para of paragraphs) {
+    for (const span of spans) {
       if (this.muted) break;
-      const start = this.locate(para);
-      const end = start + para.length;
-      // Judged against the whole spawn so far: fence context and line
-      // boundaries are the message's, not this paragraph's.
+      // Judged against the whole spawn so far, in the buffer's own offsets:
+      // fence context and line boundaries are the message's, and the cut
+      // lands where the detector says, not where a length heuristic guessed.
       const frame = this.options.guard?.(this.spawnText) ?? null;
-      let text = para;
-      if (frame && frame.index <= start) {
+      let text = span.text;
+      if (frame && frame.index <= span.start) {
         this.muted = true;
         break;
       }
-      if (frame && frame.index < end) {
+      if (frame && frame.index < span.end) {
         // The prefix is the model's own words (a fence, a sentence); from the
         // frame on it is the runtime's voice, faked. Nothing after it renders.
-        text = this.spawnText.slice(start, frame.index).trimEnd();
+        text = this.spawnText.slice(span.start, frame.index).trimEnd();
         this.muted = true;
       }
-      this.emitCursor = end;
       const display = this.transform(text).trim();
       if (display) {
         lines.push({ text: display, continuation: this.headerShown });

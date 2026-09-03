@@ -59,6 +59,7 @@ import {
 } from '../lib/backend-auth.js';
 import { startBackendTurn, runBackendTurn, type BackendRunResult } from '../repl/backend-runner.js';
 import { StreamedTurnRenderer, type StreamedLine } from '../repl/paragraph-stream.js';
+import { ImitationPreviewGuard } from '../repl/preview-guard.js';
 import type { BackendTurnEvent } from '../backends/stream.js';
 import type { TurnMedia } from '../backends/types.js';
 import { startSessionEventStream, type SessionEvent } from '../repl/session-event-stream.js';
@@ -3431,16 +3432,30 @@ export async function runChat(options: ChatOptions): Promise<void> {
     }
   );
 
-  // Everything the backend streamed in the current spawn, for the observer
-  // preview's cut (see the text handler below). Reset per spawn.
-  let spawnBackendText = '';
+  // The observer-facing preview is guarded like the screen: cut at an
+  // imitated frame judged over the whole spawn, with a trailing line that
+  // could still become one held across blocks (preview-guard.ts).
+  const previewGuard = new ImitationPreviewGuard(
+    (text) => (runtime.toolRouting === 'local' ? findImitatedToolResults(text) : null),
+    (line) => runtime.toolRouting === 'local' && isPotentialImitationPrefix(line)
+  );
   const beginSpawn = (): void => {
     streamRenderer.beginSpawn();
-    spawnBackendText = '';
+    previewGuard.beginSpawn();
   };
-  /** The spawn's stream ended: render whatever the renderer was holding. */
+  /**
+   * The spawn's stream ended: render whatever the renderer was holding, and
+   * publish a preview line the guard held that never became a frame.
+   */
   const endSpawn = (): void => {
     renderStreamedLines(streamRenderer.endSpawn());
+    const held = previewGuard.endSpawn();
+    if (held.trim()) {
+      appendTranscript(runtime.transcriptPath, {
+        type: 'backend_text',
+        preview: compactForLedger(held, 200),
+      });
+    }
   };
 
   const renderStreamedLines = (lines: StreamedLine[]): void => {
@@ -3574,23 +3589,14 @@ export async function runChat(options: ChatOptions): Promise<void> {
       // header (a frame split across blocks; Lumen, PR #575 round 2). The
       // full text is in the protocol_violation entry the loop records —
       // nothing is lost, only not republished.
-      const blockStart = spawnBackendText.length;
-      spawnBackendText += evt.text;
-      const frame =
-        runtime.toolRouting === 'local' ? findImitatedToolResults(spawnBackendText) : null;
-      const cutInBlock = frame ? Math.max(0, frame.index - blockStart) : evt.text.length;
-      let shown = evt.text.slice(0, cutInBlock);
-      if (runtime.toolRouting === 'local') {
-        const lastLineStart = shown.lastIndexOf('\n') + 1;
-        if (isPotentialImitationPrefix(shown.slice(lastLineStart))) {
-          shown = shown.slice(0, lastLineStart);
-        }
+      const guarded = previewGuard.onBlock(evt.text);
+      if (guarded.publish.trim() || guarded.imitationDiscarded) {
+        appendTranscript(runtime.transcriptPath, {
+          type: 'backend_text',
+          preview: compactForLedger(guarded.publish, 200),
+          ...(guarded.imitationDiscarded ? { imitationDiscarded: true } : {}),
+        });
       }
-      appendTranscript(runtime.transcriptPath, {
-        type: 'backend_text',
-        preview: compactForLedger(shown, 200),
-        ...(frame && frame.index < spawnBackendText.length ? { imitationDiscarded: true } : {}),
-      });
       renderStreamedLines(
         streamRenderer.completeMessage(evt.text, { continuesMessage: evt.continuesMessage })
       );

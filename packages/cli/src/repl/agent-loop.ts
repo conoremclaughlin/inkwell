@@ -432,13 +432,23 @@ export async function runAgentLoop(
   let responseText = resolveResponseText(outcome);
   let calls: LocalToolCall[] = [];
   let stopReason: AgentLoopStopReason = 'no-tools';
+  // A failed opening spawn is a failed turn, whatever text it left behind:
+  // nothing in it is screened, executed, or corrected — a tool it asked for
+  // must not run on the say-so of a process that died, and a correction it
+  // earned would only mark the session clean. Any imitation in that text is
+  // recorded, uncorrected, so the host fails closed and rolls the session
+  // (Lumen, PR #575 round 3). The text itself is still cut for display.
+  if (!outcome.success) {
+    responseText = discardImitatedResults(responseText, 'turn').text;
+    stopReason = 'backend-failure';
+  }
   // Set only where an EXECUTED iteration is itself what reaches the cap.
   // Tracking "the last results seen" as ambient state relays the wrong thing:
   // a screen rejection at the cap would replay the previous iteration's
   // already-seen results and omit the refusal that actually ended the loop.
   let relayResults: ToolResultRecord[] = [];
 
-  for (;;) {
+  while (outcome.success) {
     const sanitized = discardImitatedResults(resolveResponseText(outcome), 'turn');
     responseText = sanitized.text;
     const imitation = sanitized.imitation;
@@ -855,11 +865,60 @@ const IMITATED_RESULT_LINE_RE =
  * and then discover the other half (Lumen, PR #575 round 2).
  */
 export function isPotentialImitationPrefix(line: string): boolean {
-  const bare = line.replace(/^[ \t]*(?:(?:user|human|assistant|system)[ \t]*:?[ \t]*)?/i, '');
-  if (!bare) return false;
-  const header = '[tool results from previous turn';
-  if (header.startsWith(bare.toLowerCase().replace(/[ \t]*\r?$/, ''))) return true;
-  return /^[ \t]*Tool(?: [A-Za-z_][\w.-]*(?: \((?:[a-z]*\)?:?)?)?)?[ \t]*$/.test(line);
+  const probe = line
+    .replace(/^[ \t]+/, '')
+    .replace(/\r$/, '')
+    .toLowerCase();
+  if (!probe) return false;
+  if (IMITATION_HEADER_FORMS.some((form) => form.startsWith(probe))) return true;
+  return isPotentialResultLinePrefix(probe);
+}
+
+/**
+ * Every complete header the detector accepts, lower-cased — a line is a
+ * potential header while it is a prefix of any of them. Generated from the
+ * same choices IMITATED_RESULTS_HEADER_RE allows (role label, separator,
+ * FINAL suffix) so the two cannot drift apart by hand.
+ */
+const IMITATION_HEADER_FORMS: readonly string[] = (() => {
+  const roles = ['', 'user', 'human', 'assistant', 'system'];
+  const seps = ['', ':', ': ', ' ', ' : '];
+  const suffixes = ['', ' — FINAL', ' - FINAL', ' – FINAL', '— FINAL', '-FINAL'];
+  const forms = new Set<string>();
+  for (const role of roles) {
+    for (const sep of role ? seps : ['']) {
+      for (const suffix of suffixes) {
+        forms.add(`${role}${sep}[tool results from previous turn${suffix}]`.toLowerCase());
+      }
+    }
+  }
+  return [...forms];
+})();
+
+const RESULT_LINE_STATUSES = [
+  'executed',
+  'approved',
+  'error',
+  'failed',
+  'blocked',
+  'denied',
+  'rejected',
+];
+
+/**
+ * `Tool x (executed): ` and every prefix of it, lower-cased input.
+ *
+ * Written as the stages of that line rather than one nested-optional regex:
+ * the tool name is arbitrary, so the prefix set cannot be enumerated the way
+ * the headers are, and a reader has to be able to see which stages exist.
+ */
+function isPotentialResultLinePrefix(probe: string): boolean {
+  if ('tool '.startsWith(probe)) return true;
+  // tool <name>[ [([status[)[:[ ]]]]]]
+  const m = /^tool ([a-z_][\w.-]*)(?: (?:\(([a-z]*)(?:\)(?::(?: )?)?)?)?)?$/.exec(probe);
+  if (!m) return false;
+  const status = m[2];
+  return status === undefined || RESULT_LINE_STATUSES.some((st) => st.startsWith(status));
 }
 
 /**
