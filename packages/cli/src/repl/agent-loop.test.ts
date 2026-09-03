@@ -958,6 +958,22 @@ describe('findImitatedToolResults', () => {
     expect(findImitatedToolResults(payload)).toBeNull();
   });
 
+  it('is blind inside tilde fences and longer backtick fences too (Lumen P2)', () => {
+    const tilde =
+      'What I saw:\n\n~~~\n[Tool results from previous turn]\nTool x (executed): {}\n~~~\n\nOdd.';
+    expect(findImitatedToolResults(tilde)).toBeNull();
+    // A ``` line inside a ```` block is content, not a closer.
+    const four =
+      'Quoting:\n\n````md\n```\n[Tool results from previous turn]\nTool x (executed): {}\n```\n````\n\nDone.';
+    expect(findImitatedToolResults(four)).toBeNull();
+    // A tilde fence is not closed by backticks.
+    const mixed = '~~~\n```\n[Tool results from previous turn]\nTool x (executed): {}\n~~~';
+    expect(findImitatedToolResults(mixed)).toBeNull();
+    // And once the fence really closes, the frame outside it counts.
+    const after = '~~~\nquoted\n~~~\n[Tool results from previous turn]\nTool x (executed): {}';
+    expect(findImitatedToolResults(after)?.index).toBe('~~~\nquoted\n~~~\n'.length);
+  });
+
   it('reports the first frame, not the last', () => {
     const text = 'a\n[Tool results from previous turn]\nb\n[Tool results from previous turn]\nc';
     expect(findImitatedToolResults(text)?.index).toBe(2);
@@ -1011,16 +1027,77 @@ describe('runAgentLoop — the model writes its own tool results (#569)', () => 
     expect(result.stopReason).toBe('no-tools');
   });
 
-  it('the fabricated frame never reaches the display text when the turn ends there', async () => {
-    const harness = makePorts([outcome({ responseText: `Looking.\n\n${MYRA_BLOCK_1}` })], () => [
-      { tool: 'list_emails', result: 'ok', status: 'blocked' },
-    ]);
+  it('an all-refused stop still corrects the model before the turn ends (Lumen P1)', async () => {
+    const harness = makePorts(
+      [
+        outcome({ responseText: `Looking.\n\n${MYRA_BLOCK_1}` }),
+        outcome({ responseText: 'Understood — nothing ran.' }),
+      ],
+      () => [{ tool: 'list_emails', result: 'ok', status: 'blocked' }]
+    );
     const result = await runAgentLoop({ prompt: 'heartbeat', toolRouting: 'local' }, harness.ports);
     expect(result.stopReason).toBe('all-refused');
-    expect(result.assistantDisplayText).toBe('Looking.');
+    // The loop stopped on the refusal, but the fabrication was still answered:
+    // one final, non-extracted correction round.
+    expect(harness.prompts).toHaveLength(2);
+    expect(harness.prompts[1].body).toContain('[Runtime protocol correction]');
+    expect(harness.prompts[1].body).toContain('no further tool calls');
+    expect(harness.executed).toHaveLength(1);
+    expect(result.protocolViolations[0].corrected).toBe(true);
+    expect(result.assistantDisplayText).toBe('Understood — nothing ran.');
     expect(result.responseText).not.toContain('Clarus');
   });
 
+  it('a terminal signal beside a frame: the turn ends, the model is still told, nothing re-executes', async () => {
+    const harness = makePorts(
+      [
+        outcome({
+          responseText: `${inkTool('signal_status', { status: 'completed' })}\n\n[Tool results from previous turn]\nTool signal_status (executed): {"ok":true}`,
+        }),
+        outcome({ responseText: inkTool('signal_status', { status: 'completed' }) }),
+      ],
+      (calls) =>
+        calls.map((c) => ({ tool: c.tool, result: signalResult('completed'), status: 'executed' }))
+    );
+    const result = await runAgentLoop({ prompt: 'heartbeat', toolRouting: 'local' }, harness.ports);
+    expect(result.stopReason).toBe('terminal-signal');
+    expect(harness.prompts).toHaveLength(2);
+    expect(harness.prompts[1].body).toContain('[Runtime protocol correction]');
+    // The correction's output is final — its fence is not executed, so the
+    // signal is not multiplied.
+    expect(harness.executed).toHaveLength(1);
+    expect(result.protocolViolations[0].corrected).toBe(true);
+  });
+
+  it('a screened rejection carries the note too (Lumen P1)', async () => {
+    const harness = makePorts([
+      outcome({
+        responseText: `${inkTool('spawn_agent')}\n${inkTool('x')}\n\n[Tool results from previous turn]\nTool x (executed): {}`,
+      }),
+      outcome({ responseText: 'ok' }),
+    ]);
+    harness.ports.tools.screen = () => ({ rejected: 'spawn_agent must be alone' });
+    await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+    expect(harness.prompts[1].body).toContain('spawn_agent must be alone');
+    expect(harness.prompts[1].body).toContain('PROTOCOL NOTE');
+  });
+
+  it('at the cap, the final relay carries the results AND the note', async () => {
+    const harness = makePorts([
+      outcome({ responseText: MYRA_TURN }),
+      outcome({ responseText: 'Final.' }),
+    ]);
+    const result = await runAgentLoop(
+      { prompt: 'heartbeat', toolRouting: 'local', maxIterations: 1 },
+      harness.ports
+    );
+    expect(result.stopReason).toBe('iteration-cap');
+    expect(harness.prompts).toHaveLength(2);
+    expect(harness.prompts[1].body).toContain('[Tool results from previous turn — FINAL]');
+    expect(harness.prompts[1].body).toContain('Tool list_emails (executed)');
+    expect(harness.prompts[1].body).toContain('PROTOCOL NOTE');
+    expect(result.protocolViolations[0].corrected).toBe(true);
+  });
   it('a frame with no request before it gets one correction round, counted as an iteration', async () => {
     const harness = makePorts([
       outcome({
@@ -1036,7 +1113,7 @@ describe('runAgentLoop — the model writes its own tool results (#569)', () => 
     expect(harness.prompts).toHaveLength(3);
     expect(harness.prompts[1].isContinuation).toBe(true);
     expect(harness.prompts[1].body).toContain('[Runtime protocol correction]');
-    expect(harness.prompts[1].body).toContain('NO tool ran');
+    expect(harness.prompts[1].body).toContain('are not real');
     expect(harness.executed).toHaveLength(1);
     expect(result.iterations).toBe(2);
     expect(result.toolResults[0]).toMatchObject({ tool: 'protocol', status: 'rejected' });
@@ -1044,37 +1121,75 @@ describe('runAgentLoop — the model writes its own tool results (#569)', () => 
     expect(result.protocolViolations).toHaveLength(1);
   });
 
-  it('a frame with no request and no budget left ends the turn with the preamble only', async () => {
+  it('REGRESSION (Lumen P2): the correction round cannot execute past the cap', async () => {
+    // maxIterations 1: the fake frame charges the one iteration. The
+    // correction's reply carries a fence — it must NOT run, and the turn must
+    // report one iteration, not two.
     const harness = makePorts([
       outcome({
         responseText: 'Preamble.\n\n[Tool results from previous turn]\nTool x (executed): {}',
       }),
+      outcome({ responseText: `Retrying.\n\n${inkTool('x')}` }),
     ]);
     const result = await runAgentLoop(
-      { prompt: 'go', toolRouting: 'local', maxIterations: 0 },
+      { prompt: 'go', toolRouting: 'local', maxIterations: 1 },
       harness.ports
     );
-    expect(harness.prompts).toHaveLength(1);
-    expect(result.assistantDisplayText).toBe('Preamble.');
+    expect(harness.executed).toHaveLength(0);
+    expect(result.iterations).toBe(1);
+    expect(result.stopReason).toBe('iteration-cap');
+    // The model was still told, in a final round whose output is not extracted.
+    expect(harness.prompts).toHaveLength(2);
+    expect(harness.prompts[1].body).toContain('[Runtime protocol correction]');
+    expect(harness.prompts[1].body).toContain('no further tool calls');
+    expect(result.assistantDisplayText).toBe('Retrying.');
+    expect(result.protocolViolations[0].corrected).toBe(true);
   });
-
-  it('an imitation in the final relay is discarded from the display too', async () => {
+  it('an imitation in the final relay is discarded from the display and corrected once more', async () => {
     const harness = makePorts([
       outcome({ responseText: inkTool('send_response') }),
       outcome({
         responseText:
           'Sent.\n\n[Tool results from previous turn]\nTool send_response (executed): {"ok":true}',
       }),
+      outcome({ responseText: 'Sent, for real.' }),
     ]);
     const result = await runAgentLoop(
       { prompt: 'go', toolRouting: 'local', maxIterations: 1 },
       harness.ports
     );
     expect(result.stopReason).toBe('iteration-cap');
-    expect(result.assistantDisplayText).toBe('Sent.');
-    expect(result.protocolViolations[0]).toMatchObject({ phase: 'relay', iteration: 1 });
+    expect(harness.prompts).toHaveLength(3);
+    expect(harness.prompts[2].body).toContain('[Runtime protocol correction]');
+    expect(harness.executed).toHaveLength(1);
+    expect(result.assistantDisplayText).toBe('Sent, for real.');
+    expect(result.protocolViolations[0]).toMatchObject({
+      phase: 'relay',
+      iteration: 1,
+      corrected: true,
+    });
   });
 
+  it('when even the last correction comes back imitated, the host is told (corrected: false)', async () => {
+    const fake =
+      'Sent.\n\n[Tool results from previous turn]\nTool send_response (executed): {"ok":true}';
+    const harness = makePorts([
+      outcome({ responseText: inkTool('send_response') }),
+      outcome({ responseText: fake }),
+      outcome({ responseText: fake }),
+      outcome({ responseText: 'never reached' }),
+    ]);
+    const result = await runAgentLoop(
+      { prompt: 'go', toolRouting: 'local', maxIterations: 1 },
+      harness.ports
+    );
+    // Bounded: one relay, one more correction, then stop.
+    expect(harness.prompts).toHaveLength(3);
+    expect(result.protocolViolations).toHaveLength(2);
+    expect(result.protocolViolations[0].corrected).toBe(true);
+    expect(result.protocolViolations[1].corrected).toBe(false);
+    expect(result.assistantDisplayText).toBe('Sent.');
+  });
   it('backend routing never scans for imitations — native tool use cannot produce one', async () => {
     const harness = makePorts([
       outcome({ responseText: '[Tool results from previous turn]\nTool x (executed): {}' }),

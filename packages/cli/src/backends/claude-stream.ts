@@ -205,20 +205,25 @@ export class ClaudeStreamParser implements BackendStreamParser {
           ev.errors.some((e) => typeof e === 'string' && e.includes(NO_SESSION_MARKER));
         // `result` text is usually empty in stream-json; the real answer is the
         // last assistant text. Prefer a non-empty `result`, else fall back —
-        // EXCEPT when the assembled message is a strict superset of it: a
-        // `result` that is only the final text block of a multi-block message
-        // (Claude Code reports per block) must not discard the blocks before
-        // it, which is where the tool fence lives. A `result` that disagrees
-        // outright (an error subtype's message) still wins.
+        // EXCEPT when a SUCCESSFUL `result` is only the final text block of
+        // the assembled multi-block message (Claude Code reports per block):
+        // the blocks before it must not be discarded, which is where the tool
+        // fence lives.
         const resultText = typeof ev.result === 'string' && ev.result ? ev.result : undefined;
         const modelUsage = toModelUsage((ev as Record<string, unknown>).modelUsage);
         const assembled = this.lastAssistantText || undefined;
+        // Any error subtype's result wins unconditionally: that text is the
+        // diagnosis. And only a SUFFIX qualifies as the partial shape — an
+        // `includes` test let assistant prose that merely mentioned the
+        // result's words replace it (Lumen, PR #575 round 1).
+        const resultIsError = typeof ev.subtype === 'string' && ev.subtype !== 'success';
         const text =
           resultText === undefined
             ? assembled
-            : assembled !== undefined &&
+            : !resultIsError &&
+                assembled !== undefined &&
                 assembled.length > resultText.length &&
-                assembled.includes(resultText)
+                assembled.endsWith(resultText)
               ? assembled
               : resultText;
         out.push({

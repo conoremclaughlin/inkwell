@@ -158,6 +158,15 @@ export interface ProtocolViolation {
   header: string;
   /** Everything from the frame on. Discarded, never executed, never displayed. */
   discarded: string;
+  /**
+   * True once a corrective runtime message was sent AFTER this violation, so
+   * the model has been told the results it wrote were not real. False means
+   * the provider-native session still holds the fabrication with nothing said
+   * about it — a host must not resume that session (the next heartbeat would
+   * inherit the fake evidence as history); roll it and reseed from the ledger,
+   * which only ever held the sanitized text.
+   */
+  corrected: boolean;
 }
 
 /** Raw result of one backend turn, as the host reports it back to the loop. */
@@ -243,14 +252,15 @@ const IMITATED_RESULTS_PROTOCOL_NOTE =
  * ink-tool block before it: nothing ran, so there are no real results to
  * relay, only the fact that the ones it wrote are not real.
  */
-export function buildProtocolCorrectionBody(): string {
+export function buildProtocolCorrectionBody(opts: { final?: boolean } = {}): string {
   return (
     '[Runtime protocol correction]\n' +
     'Your previous response contained a "[Tool results from previous turn]" section that you wrote yourself. ' +
-    'No ink-tool block preceded it, so NO tool ran and the results you wrote are not real. ' +
-    'Everything from that line on was discarded and not shown to anyone. ' +
-    'Only the ink runtime writes tool results, in a message that follows your response.\n\n' +
-    'If you need a tool, emit the ink-tool block and END your response. Otherwise, provide your final answer.'
+    'The results you wrote are not real: only the ink runtime writes tool results, in a message that follows your response, ' +
+    'and everything from that line on was discarded — not executed, not shown to anyone.\n\n' +
+    (opts.final
+      ? 'The tool loop has ended; no further tool calls will be executed this turn. Provide your final answer without the results you wrote.'
+      : 'If you need a tool, emit the ink-tool block and END your response. Otherwise, provide your final answer.')
   );
 }
 
@@ -262,15 +272,19 @@ export function buildProtocolCorrectionBody(): string {
  * confidently wrong (the Aug 13 Telegram audio drop; PR #491). The relay's
  * output is final: its ink-tool blocks are NOT executed.
  */
-export function buildFinalRelayBody(results: ReadonlyArray<ToolResultRecord>): string {
+export function buildFinalRelayBody(
+  results: ReadonlyArray<ToolResultRecord>,
+  opts: { imitatedToolResults?: boolean } = {}
+): string {
   const toolResultsSummary = results
     .map((r) => {
       const resultStr = typeof r.result === 'string' ? r.result : JSON.stringify(r.result);
       return `Tool ${r.tool} (${r.status}): ${resultStr}`;
     })
     .join('\n\n');
+  const protocolNote = opts.imitatedToolResults ? `\n\n${IMITATED_RESULTS_PROTOCOL_NOTE}` : '';
   return (
-    `[Tool results from previous turn — FINAL]\n${toolResultsSummary}\n\n` +
+    `[Tool results from previous turn — FINAL]\n${toolResultsSummary}${protocolNote}\n\n` +
     'The tool loop has ended; no further tool calls will be executed this turn. ' +
     'Review these results and provide your final answer. If a call above failed, ' +
     'say so plainly instead of reporting the work as done.'
@@ -312,6 +326,25 @@ export async function runAgentLoop(
   const maxIterations = input.maxIterations ?? DEFAULT_MAX_TOOL_LOOP_ITERATIONS;
   const allToolResults: ToolResultRecord[] = [];
   const protocolViolations: ProtocolViolation[] = [];
+  // Violations the model has not yet been told about. Every corrective body
+  // the loop sends marks them corrected; whatever is left when the loop ends
+  // gets one final correction, and if even that comes back imitated the host
+  // learns it (`corrected: false`) and rolls the native session. Detection
+  // alone was not enough (Lumen, PR #575 round 1): the only path that spoke
+  // up was the ordinary continuation, so a screened rejection, an all-refused
+  // or terminal-signal stop, or the final relay left the fabrication in the
+  // provider's transcript unremarked — and the next heartbeat resumes it.
+  let awaitingCorrection: ProtocolViolation[] = [];
+  const markCorrected = (): void => {
+    for (const v of awaitingCorrection) v.corrected = true;
+    awaitingCorrection = [];
+  };
+  /** Build the body that answers `awaitingCorrection`, then account for it. */
+  const correcting = <T>(build: (imitated: boolean) => T): T => {
+    const body = build(awaitingCorrection.length > 0);
+    markCorrected();
+    return body;
+  };
 
   let iteration = 0;
 
@@ -333,8 +366,10 @@ export async function runAgentLoop(
       phase,
       header: imitation.header,
       discarded: imitation.discarded,
+      corrected: false,
     };
     protocolViolations.push(violation);
+    awaitingCorrection.push(violation);
     ports.observe?.recordProtocolViolation?.(violation);
     ports.ui.printEvent(
       `  ⚠ model wrote its own tool results — ${imitation.discarded.length} chars discarded, not executed`
@@ -413,11 +448,16 @@ export async function runAgentLoop(
 
       const stopWaitingAfterRejection = ports.ui.startWaiting();
       try {
-        outcome = await ports.backend.runTurn(buildContinuationBody([record], extracted), {
-          iteration,
-          isContinuation: true,
-          signal: input.signal,
-        });
+        outcome = await ports.backend.runTurn(
+          correcting((imitated) =>
+            buildContinuationBody([record], extracted, { imitatedToolResults: imitated })
+          ),
+          {
+            iteration,
+            isContinuation: true,
+            signal: input.signal,
+          }
+        );
       } finally {
         stopWaitingAfterRejection();
       }
@@ -435,7 +475,7 @@ export async function runAgentLoop(
       // to inventing the answer. Left alone, the truncated preamble would ship
       // as the reply and the model would carry on believing what it wrote. One
       // correction round, counted as an iteration so it cannot spin.
-      if (imitation && iteration < maxIterations && !input.signal?.aborted) {
+      if (imitation && !input.signal?.aborted) {
         iteration++;
         const record: ToolResultRecord = {
           tool: 'protocol',
@@ -443,13 +483,25 @@ export async function runAgentLoop(
           status: 'rejected',
         };
         allToolResults.push(record);
+        // The charge lands BEFORE the correction's response can run anything
+        // — same shape as a screened rejection at the cap. With the budget
+        // gone, the final correction below still tells the model; its output
+        // is never extracted.
+        if (iteration >= maxIterations) {
+          stopReason = 'iteration-cap';
+          ports.ui.printLine(`(tool loop limit reached — ${maxIterations} iterations)`);
+          break;
+        }
         const stopWaitingAfterCorrection = ports.ui.startWaiting();
         try {
-          outcome = await ports.backend.runTurn(buildProtocolCorrectionBody(), {
-            iteration,
-            isContinuation: true,
-            signal: input.signal,
-          });
+          outcome = await ports.backend.runTurn(
+            correcting(() => buildProtocolCorrectionBody()),
+            {
+              iteration,
+              isContinuation: true,
+              signal: input.signal,
+            }
+          );
         } finally {
           stopWaitingAfterCorrection();
         }
@@ -536,7 +588,9 @@ export async function runAgentLoop(
     const stopWaiting = ports.ui.startWaiting();
     try {
       outcome = await ports.backend.runTurn(
-        buildContinuationBody(results, calls, { imitatedToolResults: imitation !== null }),
+        correcting((imitated) =>
+          buildContinuationBody(results, calls, { imitatedToolResults: imitated })
+        ),
         {
           iteration,
           isContinuation: true,
@@ -576,12 +630,19 @@ export async function runAgentLoop(
   // is only populated for that case when the iteration actually contains an
   // `error` (see hasUnseenFailure), so a witnessed denial still ends the turn
   // quietly and nobody gets nagged for saying no.
-  if (relayResults.length > 0 && outcome.success && !input.signal?.aborted) {
-    ports.ui.printEvent('  ⋯ relaying final tool results (no further execution)…');
+  //
+  // A protocol break the loop stopped on before any continuation could answer
+  // it — a fabricated frame beside a terminal signal, an all-refused
+  // iteration, the cap — is relayed the same way, with or without stranded
+  // results: the model must hear that what it wrote was not real BEFORE its
+  // native session is resumed for the next turn. The relay's own output can
+  // imitate too; it gets one more correction, and if that also comes back
+  // imitated the violation stays `corrected: false` for the host to act on.
+  const runFinalRound = async (body: string): Promise<void> => {
     const stopRelayWaiting = ports.ui.startWaiting();
     let relay: BackendTurnOutcome;
     try {
-      relay = await ports.backend.runTurn(buildFinalRelayBody(relayResults), {
+      relay = await ports.backend.runTurn(body, {
         iteration,
         isContinuation: true,
         signal: input.signal,
@@ -598,6 +659,28 @@ export async function runAgentLoop(
     }
     // A failed relay keeps the last successful text — the results are still
     // in allToolResults for the host's own reporting.
+  };
+  if (
+    (relayResults.length > 0 || awaitingCorrection.length > 0) &&
+    outcome.success &&
+    !input.signal?.aborted
+  ) {
+    ports.ui.printEvent(
+      relayResults.length > 0
+        ? '  ⋯ relaying final tool results (no further execution)…'
+        : '  ⋯ correcting the protocol break (no further execution)…'
+    );
+    await runFinalRound(
+      correcting((imitated) =>
+        relayResults.length > 0
+          ? buildFinalRelayBody(relayResults, { imitatedToolResults: imitated })
+          : buildProtocolCorrectionBody({ final: true })
+      )
+    );
+    if (awaitingCorrection.length > 0 && outcome.success && !input.signal?.aborted) {
+      ports.ui.printEvent('  ⋯ correcting the protocol break again (no further execution)…');
+      await runFinalRound(correcting(() => buildProtocolCorrectionBody({ final: true })));
+    }
   }
 
   // An aborted turn (SIGINT kills the child) exits >=128 and has no usable text.
@@ -726,13 +809,17 @@ const IMITATED_RESULT_LINE_RE =
 /**
  * Find the first place the model starts writing tool results in the runtime's
  * own frame (see ProtocolViolation). Line-anchored, and blind inside fenced
- * code — an ink-tool payload or a quoted code block may legitimately contain
- * the header; the imitation that matters is the one written as if it were the
- * next message.
+ * code (backtick or tilde, any length) — an ink-tool payload or a quoted code
+ * block may legitimately contain the header; the imitation that matters is
+ * the one written as if it were the next message.
  */
 export function findImitatedToolResults(responseText: string): ImitatedToolResultsFrame | null {
   const inkBlocks = findInkToolBlocks(responseText);
-  let inCodeFence = false;
+  // The open fence, if any: its delimiter character and length. CommonMark
+  // closes a fence only with the same character, at least as long — a ``` in a
+  // ```` block, or a ~~~ under a ```, is content. A single toggle got both
+  // wrong (Lumen, PR #575 round 1).
+  let openFence: { char: string; length: number } | null = null;
   let lineStart = 0;
   while (lineStart <= responseText.length) {
     const nl = responseText.indexOf('\n', lineStart);
@@ -740,10 +827,14 @@ export function findImitatedToolResults(responseText: string): ImitatedToolResul
     const line = responseText.slice(lineStart, lineEnd);
     const insideInkBlock = inkBlocks.some((b) => lineStart >= b.start && lineStart < b.end);
     if (!insideInkBlock) {
-      if (/^[ \t]*```/.test(line)) {
-        inCodeFence = !inCodeFence;
+      const fence = /^[ \t]{0,3}(`{3,}|~{3,})/.exec(line);
+      if (fence) {
+        const char = fence[1]![0]!;
+        const length = fence[1]!.length;
+        if (openFence === null) openFence = { char, length };
+        else if (openFence.char === char && length >= openFence.length) openFence = null;
       } else if (
-        !inCodeFence &&
+        openFence === null &&
         (IMITATED_RESULTS_HEADER_RE.test(line) || IMITATED_RESULT_LINE_RE.test(line))
       ) {
         return {

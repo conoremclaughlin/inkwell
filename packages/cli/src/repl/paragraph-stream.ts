@@ -76,6 +76,14 @@ export interface StreamedLine {
  * - **Display transform**: every emitted line passes through the transform
  *   (e.g. stripLocalToolBlocks in local routing) — held tool fences are
  *   stripped, and a line that strips to nothing is not emitted.
+ * - **Guard**: under local tool routing the loop discards everything from an
+ *   imitated results frame on (agent-loop `findImitatedToolResults`), but the
+ *   loop only sees the text after the spawn ends — the live stream had already
+ *   put the fabricated results on screen (Lumen, PR #575 round 1). The same
+ *   detector runs here on every paragraph before it is emitted: the prefix
+ *   before the frame renders, the rest is muted until the host announces the
+ *   next backend spawn (`beginSpawn()`), and the recorded message text is the
+ *   cut text so the final dedupe still matches.
  */
 export class StreamedTurnRenderer {
   private buffer = new ParagraphStreamBuffer();
@@ -83,8 +91,12 @@ export class StreamedTurnRenderer {
   private sawDeltaThisMessage = false;
   private streamedVisible = false;
   private lastMessageText = '';
+  private muted = false;
 
-  constructor(private readonly transform: (text: string) => string = (t) => t) {}
+  constructor(
+    private readonly transform: (text: string) => string = (t) => t,
+    private readonly options: StreamedTurnRendererOptions = {}
+  ) {}
 
   /** Start of a new turn — drop all state. */
   reset(): void {
@@ -93,6 +105,16 @@ export class StreamedTurnRenderer {
     this.sawDeltaThisMessage = false;
     this.streamedVisible = false;
     this.lastMessageText = '';
+    this.muted = false;
+  }
+
+  /**
+   * A new backend spawn began (initial, reseed, or tool-loop continuation).
+   * Whatever the previous spawn wrote past an imitated frame no longer applies:
+   * the loop has discarded it and answered with the real results.
+   */
+  beginSpawn(): void {
+    this.muted = false;
   }
 
   /** Another writer appended to the scrollback — next line re-renders the header. */
@@ -120,9 +142,25 @@ export class StreamedTurnRenderer {
         : this.sawDeltaThisMessage
           ? []
           : this.emitAll([fullText.trim()]);
-    this.lastMessageText = opts?.continuesMessage ? this.lastMessageText + fullText : fullText;
+    // Recorded CUT, like the loop's final text, so shouldSkipFinal compares
+    // like with like — the frame is not part of the message anyone sees. Once
+    // a frame has cut this message, a later block of it (after thinking) is
+    // past the cut as well: the loop's assembled text drops it whole.
+    // (`muted` was set by emitAll, which has seen every paragraph of it.)
+    this.lastMessageText = this.cutAtFrame(
+      opts?.continuesMessage
+        ? this.muted
+          ? this.lastMessageText
+          : this.lastMessageText + fullText
+        : fullText
+    );
     this.sawDeltaThisMessage = false;
     return lines;
+  }
+
+  private cutAtFrame(text: string): string {
+    const frame = this.options.guard?.(text);
+    return frame ? text.slice(0, frame.index).trimEnd() : text;
   }
 
   /**
@@ -139,7 +177,16 @@ export class StreamedTurnRenderer {
   private emitAll(paragraphs: string[]): StreamedLine[] {
     const lines: StreamedLine[] = [];
     for (const para of paragraphs) {
-      const display = this.transform(para).trim();
+      if (this.muted) break;
+      let text = para;
+      const frame = this.options.guard?.(para);
+      if (frame) {
+        // The prefix is the model's own words (a fence, a sentence); from the
+        // frame on it is the runtime's voice, faked. Nothing after it renders.
+        text = para.slice(0, frame.index).trimEnd();
+        this.muted = true;
+      }
+      const display = this.transform(text).trim();
       if (!display) continue;
       lines.push({ text: display, continuation: this.headerShown });
       this.headerShown = true;
@@ -147,4 +194,14 @@ export class StreamedTurnRenderer {
     }
     return lines;
   }
+}
+
+export interface StreamedTurnRendererOptions {
+  /**
+   * Where the model starts writing the runtime's part of the conversation —
+   * agent-loop `findImitatedToolResults`, under local tool routing. Returns the
+   * offset to cut at, or null. Omit for backend routing, where native tool use
+   * makes the shape impossible.
+   */
+  guard?: (text: string) => { index: number } | null;
 }

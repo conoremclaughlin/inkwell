@@ -399,11 +399,20 @@ describe('one assistant message streamed as several events (#569)', () => {
     expect(r?.kind === 'result' && r.text).toBe('first block. last block.');
   });
 
-  it('a `result` that disagrees outright still wins (error subtypes carry their own text)', () => {
+  it('an error result wins unconditionally, even when the assistant text ends with it (Lumen P2)', () => {
     const p = new ClaudeStreamParser();
-    p.push(line(block('msg_1', [{ type: 'text', text: 'first block. ' }])));
-    p.push(line(block('msg_1', [{ type: 'text', text: 'last block.' }])));
-    const [r] = p.push(line({ type: 'result', subtype: 'error', result: 'Rate limited' }));
+    p.push(line(block('msg_1', [{ type: 'text', text: 'Intro: ' }])));
+    p.push(line(block('msg_1', [{ type: 'text', text: 'Rate limited' }])));
+    const [r] = p.push(
+      line({ type: 'result', subtype: 'error_during_execution', result: 'Rate limited' })
+    );
+    expect(r?.kind === 'result' && r.text).toBe('Rate limited');
+  });
+
+  it('a successful result the assistant text merely CONTAINS is not the partial shape — result wins', () => {
+    const p = new ClaudeStreamParser();
+    p.push(line(block('msg_1', [{ type: 'text', text: 'Intro: Rate limited; retrying.' }])));
+    const [r] = p.push(line({ type: 'result', subtype: 'success', result: 'Rate limited' }));
     expect(r?.kind === 'result' && r.text).toBe('Rate limited');
   });
 

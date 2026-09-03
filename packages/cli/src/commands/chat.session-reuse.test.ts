@@ -253,6 +253,34 @@ describe('findLastBackendSession (cross-process recovery)', () => {
     expect(findLastBackendSession(path)).toBeUndefined();
   });
 
+  it('a backend_session_invalidated AFTER the last seed clears the candidate (uncorrected fabrication)', () => {
+    // The loop could not tell the model its fabricated tool results were fake
+    // (#569); the host rolled the native session so the next turn reseeds
+    // from the ledger. A later process must not recover the poisoned id.
+    const path = writeTranscript([
+      { type: 'backend_session', id: 'poisoned' },
+      {
+        type: 'backend_session_invalidated',
+        id: 'poisoned',
+        reason: 'uncorrected-protocol-violation',
+      },
+    ]);
+    expect(findLastBackendSession(path)).toBeUndefined();
+  });
+
+  it('a seed AFTER an invalidation is the live session (re-established)', () => {
+    const path = writeTranscript([
+      { type: 'backend_session', id: 'poisoned' },
+      {
+        type: 'backend_session_invalidated',
+        id: 'poisoned',
+        reason: 'uncorrected-protocol-violation',
+      },
+      { type: 'backend_session', id: 'clean' },
+    ]);
+    expect(findLastBackendSession(path)?.id).toBe('clean');
+  });
+
   it('a seed AFTER an eviction is the live session (re-established)', () => {
     const path = writeTranscript([
       { type: 'backend_session', id: 'old' },

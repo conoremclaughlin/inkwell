@@ -160,6 +160,7 @@ import {
 import { formatContextLines, type ContextSections } from '../repl/ink/context-viewer.js';
 import {
   MAX_TOOL_CALLS_PER_ITERATION,
+  findImitatedToolResults,
   runAgentLoop,
   stripLocalToolBlocks,
   type AgentLoopResult,
@@ -2631,13 +2632,16 @@ export function findLastBackendSession(
       event.type === 'compaction' ||
       event.type === 'context_evict' ||
       event.type === 'context_trim' ||
-      event.type === 'context_budget_changed'
+      event.type === 'context_budget_changed' ||
+      event.type === 'backend_session_invalidated'
     ) {
       // A context-boundary mutation rolled the provider session — including a
       // PACKING-WIDTH change from model detection: a session seeded at the
       // old budget holds only that slice of history and must not be resumed
-      // at the new one (Lumen, PR #477 round 3). Abandon any prior id — a
-      // backend_session marker after this point re-establishes it.
+      // at the new one (Lumen, PR #477 round 3). So did an explicit
+      // invalidation (a native session left holding uncorrected fabricated
+      // tool results, #569). Abandon any prior id — a backend_session marker
+      // after this point re-establishes it.
       found = undefined;
     }
   }
@@ -3416,8 +3420,14 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // dedupes against the streamed message so nothing prints twice. Local tool
   // routing: ```ink-tool blocks arrive as one held unit and are stripped
   // before display. All state lives in StreamedTurnRenderer (unit-tested).
-  const streamRenderer = new StreamedTurnRenderer((text) =>
-    runtime.toolRouting === 'local' ? stripLocalToolBlocks(text) : text
+  const streamRenderer = new StreamedTurnRenderer(
+    (text) => (runtime.toolRouting === 'local' ? stripLocalToolBlocks(text) : text),
+    {
+      // Same detector the loop cuts with, applied live — otherwise the
+      // fabricated frame is on screen (and in the observer feed) before the
+      // loop ever sees the finished text (#569; Lumen, PR #575 round 1).
+      guard: (text) => (runtime.toolRouting === 'local' ? findImitatedToolResults(text) : null),
+    }
   );
 
   const renderStreamedLines = (lines: StreamedLine[]): void => {
@@ -3544,9 +3554,15 @@ export async function runChat(options: ChatOptions): Promise<void> {
     } else if (evt.kind === 'text-delta') {
       renderStreamedLines(streamRenderer.pushDelta(evt.text));
     } else if (evt.kind === 'text' && evt.text.trim()) {
+      // This preview is mirrored live to observers. Under local routing the
+      // loop discards everything from an imitated results frame on; so does
+      // the preview. The full text is in the protocol_violation entry the
+      // loop records — nothing is lost, only not republished.
+      const frame = runtime.toolRouting === 'local' ? findImitatedToolResults(evt.text) : null;
       appendTranscript(runtime.transcriptPath, {
         type: 'backend_text',
-        preview: compactForLedger(evt.text, 200),
+        preview: compactForLedger(frame ? evt.text.slice(0, frame.index) : evt.text, 200),
+        ...(frame ? { imitationDiscarded: true } : {}),
       });
       renderStreamedLines(
         streamRenderer.completeMessage(evt.text, { continuesMessage: evt.continuesMessage })
@@ -6168,6 +6184,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       ctx: { isContinuation: boolean }
     ): Promise<BackendTurnOutcome> => {
       if (!ctx.isContinuation) {
+        streamRenderer.beginSpawn();
         const turn = startBackendTurn({
           backend: runtime.backend,
           agentId,
@@ -6234,6 +6251,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
               '  ⛁ provider session not found on resume — re-seeding a fresh native session'
             )
           );
+          streamRenderer.beginSpawn();
           const reseedTurn = startBackendTurn({
             backend: runtime.backend,
             agentId,
@@ -6340,6 +6358,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           ? body
           : buildPromptEnvelope(agentId, runtime, ledger, body);
 
+      streamRenderer.beginSpawn();
       const contTurn = startBackendTurn({
         backend: runtime.backend,
         agentId,
@@ -6466,6 +6485,26 @@ export async function runChat(options: ChatOptions): Promise<void> {
     const allToolResults = loopResult.toolResults;
     const isAbortedTurn = loopResult.stopReason === 'aborted';
     const assistantDisplayText = loopResult.assistantDisplayText;
+
+    // The loop tells the model when it has written fake results; when it
+    // could not (the correction itself came back imitated, or the backend
+    // failed before one could be sent), the native session still holds the
+    // fabrication unremarked. Resuming it would hand the next turn fake
+    // evidence as history. Roll it — the next turn reseeds from the ledger,
+    // which only ever held the sanitized text. The marker keeps a later
+    // process from recovering the poisoned id (findLastBackendSession).
+    if (loopResult.protocolViolations.some((v) => !v.corrected) && activeBackendSessionId) {
+      appendTranscript(runtime.transcriptPath, {
+        type: 'backend_session_invalidated',
+        id: activeBackendSessionId,
+        reason: 'uncorrected-protocol-violation',
+      });
+      activeBackendSessionId = undefined;
+      activeBackendSessionShape = undefined;
+      printEvent(
+        chalk.yellow('  ⛁ provider session rolled — an imitated results frame went uncorrected')
+      );
+    }
 
     if (isAbortedTurn) {
       appendTranscript(runtime.transcriptPath, {
