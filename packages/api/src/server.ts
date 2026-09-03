@@ -60,6 +60,7 @@ import { resolveAgentFromMention } from './services/routing/resolve-mention';
 import { getHeartbeatProcessingConfig } from './config/heartbeat-flags';
 import { classifyError } from '@inklabs/shared';
 import { logger } from './utils/logger';
+import { decideChannelForward } from './services/channel-forward.js';
 import { getUserFromContext } from './utils/request-context';
 import { env } from './config/env';
 import {
@@ -373,24 +374,45 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       // Check if send_response was called via MCP (tracked in response-handlers)
       const hadExplicitResponse = hasExplicitResponse(channel, conversationId);
 
-      if (!hadExplicitResponse && result.finalTextResponse && result.success) {
+      const forward = decideChannelForward({
+        hadExplicitResponse,
+        success: result.success,
+        finalTextResponse: result.finalTextResponse,
+      });
+
+      if (forward.action === 'auto-forward') {
         // Auto-route Claude's text response back to the originating channel
         logger.info('Auto-routing text response (no explicit send_response called)', {
           channel,
           conversationId,
-          responseLength: result.finalTextResponse.length,
+          responseLength: forward.content.length,
         });
         await channelGateway.releaseConversation(channel as GatewayChannel, conversationId, {
-          content: result.finalTextResponse,
+          content: forward.content,
           format: 'markdown',
         });
       } else {
-        // Just release the conversation (and process any pending messages)
-        logger.debug('Explicit send_response detected, skipping auto-forward', {
-          channel,
-          conversationId,
-          hadExplicitResponse,
-        });
+        if (forward.action === 'nothing-delivered') {
+          // WARN, not debug: the user asked something and received nothing, and
+          // the documented fallback did not fire. Debug is not persisted to
+          // ~/.ink/logs, so this used to leave no trace at all — and the line
+          // that did exist claimed an explicit send_response had been detected,
+          // which is false in exactly this case.
+          logger.warn('Nothing delivered to the user for this turn', {
+            channel,
+            conversationId,
+            reason: forward.reason,
+            hadExplicitResponse,
+            runSucceeded: result.success,
+            finalTextLength: result.finalTextResponse?.length ?? 0,
+          });
+        } else {
+          logger.debug('Explicit send_response detected, skipping auto-forward', {
+            channel,
+            conversationId,
+            hadExplicitResponse,
+          });
+        }
         await channelGateway.releaseConversation(channel as GatewayChannel, conversationId);
       }
 
