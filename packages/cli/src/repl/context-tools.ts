@@ -161,6 +161,16 @@ export const COMPACT_CONTEXT_SUMMARY_MAX_CHARS = 20_000;
 /** Ceiling on the protected recent tail an agent may ask to keep verbatim. */
 export const COMPACT_CONTEXT_MAX_KEEP_RECENT = 200;
 
+/**
+ * A compaction must leave the window smaller than it found it. An agent may
+ * replace one tiny entry with a 20K-character "summary" and be told it
+ * compacted; the provider session would then roll for a rewrite that grew
+ * the context (Lumen, PR #578). Refused, and the refusal says by how much.
+ */
+export function compactionShrinks(removedTokens: number, summaryTokens: number): boolean {
+  return summaryTokens < removedTokens;
+}
+
 export interface CompactContextArgs {
   /** The agent's own brief. Absent means the runtime summarizes. */
   summary?: string;

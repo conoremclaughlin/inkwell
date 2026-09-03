@@ -1542,10 +1542,29 @@ const WITNESSED_REFUSAL_STATUSES: ReadonlySet<string> = new Set(['blocked', 'den
  * predicate. What makes a refusal swallowable is its provenance, not its name.
  */
 export function hasUnseenFailure(
-  iterationResults: ReadonlyArray<Pick<ToolResultRecord, 'status'>>
+  iterationResults: ReadonlyArray<Pick<ToolResultRecord, 'status' | 'result'>>
 ): boolean {
   return iterationResults.some(
-    (r) => !RAN_STATUSES.has(r.status) && !WITNESSED_REFUSAL_STATUSES.has(r.status)
+    (r) =>
+      (!RAN_STATUSES.has(r.status) && !WITNESSED_REFUSAL_STATUSES.has(r.status)) ||
+      (RAN_STATUSES.has(r.status) && isErrorPayload(r.result))
+  );
+}
+
+/**
+ * A tool that RAN and answered with a declared error (`isError: true` in the
+ * MCP-shaped result). The executor labels such a call `executed` — the
+ * process did run — so by status alone it reads as success. A compact_context
+ * that refused, or a server tool's validation error, beside a terminal
+ * signal_status in the same iteration was therefore stopped on the signal
+ * and never relayed: the agent exited believing the work had happened
+ * (Lumen, PR #578). The payload is the evidence; the status is not enough.
+ */
+export function isErrorPayload(result: unknown): boolean {
+  return (
+    typeof result === 'object' &&
+    result !== null &&
+    (result as { isError?: unknown }).isError === true
   );
 }
 

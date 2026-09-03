@@ -114,6 +114,7 @@ import {
   handleClientLocalTool,
   globalSignalSink,
   parseCompactContextArgs,
+  compactionShrinks,
   type SignalSink,
   getLastSignal,
   clearLastSignal,
@@ -4878,6 +4879,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
     actor: 'system' | 'sb';
     summaryText?: string;
     keepRecent?: number;
+    /** The turn's cancellation — aborts a running summarizer spawn. */
+    signal?: AbortSignal;
   }): Promise<
     | {
         ok: true;
@@ -4903,7 +4906,16 @@ export async function runChat(options: ChatOptions): Promise<void> {
     compactionInFlight = true;
     let changed = false;
     try {
+      // The set to summarize is fixed HERE, by id. The ledger keeps moving
+      // while a summarizer runs (inbox and activity polling append), and a
+      // compaction by count after the await removed whatever was oldest by
+      // then — a protected tail entry the summarizer never saw (Lumen, PR
+      // #578). The removed set is exactly the summarized set; anything
+      // appended meanwhile survives.
       const oldest = entries.slice(0, cutoff);
+      const oldestIds = oldest.map((e) => e.id);
+      const oldestIdSet = new Set(oldestIds);
+      const removedTokens = oldest.reduce((sum, e) => sum + e.approxTokens, 0);
       const before = ledger.totalTokens();
       printEvent(
         chalk.yellow(
@@ -4911,13 +4923,18 @@ export async function runChat(options: ChatOptions): Promise<void> {
         )
       );
 
-      try {
-        let summaryText = opts.summaryText?.trim() ?? '';
-        if (!summaryText) {
+      let summaryText = opts.summaryText?.trim() ?? '';
+      if (!summaryText) {
+        try {
+          if (opts.signal?.aborted) throw new Error('cancelled');
           const chunk = oldest
             .map((e) => `${e.role.toUpperCase()}${e.source ? ` [${e.source}]` : ''}: ${e.content}`)
             .join('\n\n');
-          const turn = await runBackendTurn({
+          // A handle, not a bare promise: the turn's Ctrl+C reaches this
+          // spawn (it used to run on to its idle timeout), and its usage is
+          // recorded on EVERY outcome — self-compaction tokens are spent
+          // tokens (Lumen, PR #578).
+          const summarizer = startBackendTurn({
             backend: runtime.backend,
             agentId,
             model: runtime.model,
@@ -4939,65 +4956,111 @@ export async function runChat(options: ChatOptions): Promise<void> {
             idleTimeoutMs: runtime.backendIdleTimeoutMs,
             stream: true,
           });
+          const onAbort = (): void => summarizer.abort();
+          opts.signal?.addEventListener('abort', onAbort, { once: true });
+          let turn: BackendRunResult;
+          try {
+            turn = await summarizer.result;
+          } finally {
+            opts.signal?.removeEventListener('abort', onAbort);
+          }
+          recordRunUsage(turn.usage);
+          if (opts.signal?.aborted) throw new Error('cancelled');
           summaryText = turn.success ? (turn.responseText ?? turn.stdout).trim() : '';
           if (!summaryText) {
             throw new Error(turn.stderr.trim().slice(0, 200) || `exit code ${turn.exitCode}`);
           }
+        } catch (error) {
+          const msg = error instanceof Error ? error.message : String(error);
+          if (opts.actor === 'sb' || opts.signal?.aborted) {
+            printEvent(chalk.yellow(`  ⛁ Compaction failed (${msg})`));
+            return { ok: false, error: `summarization failed (${msg}) — pass your own summary` };
+          }
+          printEvent(chalk.yellow(`  ⛁ Compaction summarization failed (${msg}) — hard-trimming`));
+          const trimmed = await trimContextToPercent(
+            DEFAULT_TRIM_TARGET_PCT,
+            `${opts.reason} (compaction fallback)`
+          );
+          return {
+            ok: false,
+            error: `summarization failed (${msg}); hard-trimmed ${trimmed.removed} entries instead`,
+          };
         }
+      }
 
-        const summary = `[Conversation summary — compacted ${oldest.length} earlier entries${
-          opts.actor === 'sb' ? ', written by the agent' : ''
-        }]\n${summaryText}`;
-        const result = ledger.compactToSummary(summary, keepRecent);
-        changed = true;
-        // The compaction event is the COMPLETE new start state: summary plus
-        // the verbatim recent tail. The tail's original events precede this
-        // marker in the file, so hydration must get the tail from here —
-        // otherwise reattach would keep only the summary and lose the
-        // protected recent entries the live session still has.
-        const keptEntries = keptEntriesForCompaction(ledger);
+      const summary = `[Conversation summary — compacted ${oldest.length} earlier entries${
+        opts.actor === 'sb' ? ', written by the agent' : ''
+      }]\n${summaryText}`;
+      const summaryTokens = estimateTokens(summary);
+      // A compaction must shrink the window. A "summary" larger than what it
+      // replaces is a rewrite that grows the context and rolls the provider
+      // session for nothing (Lumen, PR #578).
+      if (!compactionShrinks(removedTokens, summaryTokens)) {
+        printEvent(
+          chalk.yellow('  ⛁ Compaction refused — the summary is not smaller than what it replaces')
+        );
+        return {
+          ok: false,
+          error: `refused: the summary (~${summaryTokens} tok) is not smaller than the ${oldest.length} entries it would replace (~${removedTokens} tok) — write a denser summary, or keep fewer recent entries so more is replaced`,
+        };
+      }
+
+      // The durable marker goes FIRST. The compaction event is the COMPLETE
+      // new start state — summary plus the verbatim tail — so it is projected
+      // from the live ledger without touching it; only once it is on disk
+      // does the in-memory ledger change. The other order left a live ledger
+      // compacted, a provider session rolled, and no event to survive
+      // reattach when the append failed (Lumen, PR #578).
+      const live = ledger.listEntries();
+      const removedNow = live.filter((e) => oldestIdSet.has(e.id));
+      const keptNow = live.filter((e) => !oldestIdSet.has(e.id));
+      const removedTokensNow = removedNow.reduce((sum, e) => sum + e.approxTokens, 0);
+      const totalAfter = keptNow.reduce((sum, e) => sum + e.approxTokens, 0) + summaryTokens;
+      try {
         appendTranscript(runtime.transcriptPath, {
           type: 'compaction',
           reason: opts.reason,
           actor: opts.actor,
           summary,
-          keptEntries,
-          removedCount: result.removedEntries.length,
-          removedTokens: result.removedTokens,
-          summaryTokens: result.summaryTokens,
-          totalAfter: result.totalAfter,
+          keptEntries: keptNow.map((e) => ({
+            role: e.role,
+            content: e.content,
+            source: e.source,
+            ...(e.eid !== undefined ? { eid: e.eid } : {}),
+            ...(e.replay !== undefined ? { replay: e.replay } : {}),
+          })),
+          removedCount: removedNow.length,
+          removedTokens: removedTokensNow,
+          summaryTokens,
+          totalAfter,
         });
-        // Cutoff divider: everything above this line in the scrollback is
-        // now out of the context window (replaced by the summary).
-        printEvent(
-          renderContextCutoff(
-            `compacted ${result.removedEntries.length} entries · ${formatTokenCount(before)} → ${formatTokenCount(result.totalAfter)} tok`
-          )
-        );
-        return {
-          ok: true,
-          removed: result.removedEntries.length,
-          removedTokens: result.removedTokens,
-          summaryTokens: result.summaryTokens,
-          before,
-          totalAfter: result.totalAfter,
-        };
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
-        if (opts.actor === 'sb') {
-          printEvent(chalk.yellow(`  ⛁ Compaction failed (${msg})`));
-          return { ok: false, error: `summarization failed (${msg}) — pass your own summary` };
-        }
-        printEvent(chalk.yellow(`  ⛁ Compaction summarization failed (${msg}) — hard-trimming`));
-        const trimmed = await trimContextToPercent(
-          DEFAULT_TRIM_TARGET_PCT,
-          `${opts.reason} (compaction fallback)`
+        printEvent(
+          chalk.yellow(`  ⛁ Compaction marker could not be persisted (${msg}) — context unchanged`)
         );
         return {
           ok: false,
-          error: `summarization failed (${msg}); hard-trimmed ${trimmed.removed} entries instead`,
+          error: `could not persist the compaction marker (${msg}); the context was left unchanged`,
         };
       }
+      const result = ledger.compactEntriesToSummary(oldestIds, summary);
+      changed = true;
+      // Cutoff divider: everything above this line in the scrollback is
+      // now out of the context window (replaced by the summary).
+      printEvent(
+        renderContextCutoff(
+          `compacted ${result.removedEntries.length} entries · ${formatTokenCount(before)} → ${formatTokenCount(result.totalAfter)} tok`
+        )
+      );
+      return {
+        ok: true,
+        removed: result.removedEntries.length,
+        removedTokens: result.removedTokens,
+        summaryTokens: result.summaryTokens,
+        before,
+        totalAfter: result.totalAfter,
+      };
     } finally {
       compactionInFlight = false;
       if (changed) {
@@ -5054,7 +5117,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
    * agent carries on from its summary. Its result is client-local, so it is
    * never persisted back into the ledger it just compacted.
    */
-  const runSbCompaction = async (args: Record<string, unknown>): Promise<PcpToolCallResult> => {
+  const runSbCompaction = async (
+    args: Record<string, unknown>,
+    ctx?: { signal?: AbortSignal }
+  ): Promise<PcpToolCallResult> => {
     const asResult = (payload: Record<string, unknown>, isError = false): PcpToolCallResult => ({
       content: [{ type: 'text', text: JSON.stringify(payload) }],
       ...(isError ? { isError: true } : {}),
@@ -5066,6 +5132,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       actor: 'sb',
       summaryText: parsed.summary,
       keepRecent: parsed.keepRecent,
+      signal: ctx?.signal,
     });
     if (!outcome.ok) return asResult({ success: false, error: outcome.error }, true);
     return asResult({
@@ -6253,7 +6320,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
             const decision = toolPolicy.inspectPcpTool(bareToolName(tool), runtime.sessionId);
             return !decision.allowed && !decision.promptable;
           },
-          head: (tool, args) => {
+          head: (tool, args, ctx) => {
             // spawn_agent is NOT a client-local policy bypass. Unlike ledger
             // tools it costs backend time and fans out authority, so it reaches
             // here only after executeToolCalls has cleared it through policy.
@@ -6267,7 +6334,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
             // turn, transcript event, provider-session roll) — answered here,
             // before the generic client-local handler refuses it.
             if (bareToolName(tool) === 'compact_context') {
-              return runSbCompaction(args);
+              return runSbCompaction(args, ctx);
             }
             // Client-local tools (context management) are handled in-process.
             // An eviction's persistent refs arrive on the hook, not in the

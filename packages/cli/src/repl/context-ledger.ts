@@ -301,6 +301,61 @@ export class ContextLedger {
   }
 
   /**
+   * Replace EXACTLY these entries with one summary entry, wherever they now
+   * sit. The summary takes the place of the first of them; everything else —
+   * including entries appended after the caller chose the set — survives in
+   * order.
+   *
+   * compactToSummary recomputes its cutoff from the live ledger, so a caller
+   * that snapshots the oldest entries, awaits a summarizer, and then compacts
+   * by COUNT removes whatever is oldest at that moment: an entry appended
+   * during the await pushed a protected tail entry into the removed set even
+   * though the summarizer never saw it (Lumen, PR #578). Compacting by id
+   * makes the removed set the summarized set, whatever happened meanwhile.
+   */
+  public compactEntriesToSummary(
+    entryIds: readonly number[],
+    summary: string,
+    source = 'compaction'
+  ): LedgerCompactResult {
+    const idSet = new Set(entryIds);
+    const removedEntries = this.entries.filter((entry) => idSet.has(entry.id));
+    const removedTokens = removedEntries.reduce((sum, entry) => sum + entry.approxTokens, 0);
+    const survivors = this.entries.filter((entry) => !idSet.has(entry.id));
+    const firstRemovedIndex = this.entries.findIndex((entry) => idSet.has(entry.id));
+    const insertAt =
+      firstRemovedIndex === -1
+        ? 0
+        : this.entries.slice(0, firstRemovedIndex).filter((entry) => !idSet.has(entry.id)).length;
+
+    const summaryEntry: LedgerEntry = {
+      id: this.entrySeq++,
+      role: 'system',
+      content: summary,
+      source,
+      createdAt: new Date().toISOString(),
+      approxTokens: estimateTokens(summary),
+    };
+
+    const before = this.entries;
+    const after = [...survivors.slice(0, insertAt), summaryEntry, ...survivors.slice(insertAt)];
+    // Bookmarks on removed entries are gone; survivors follow their entry.
+    this.bookmarks = this.bookmarks.flatMap((bookmark) => {
+      const target = before[bookmark.entryIndex];
+      if (!target || idSet.has(target.id)) return [];
+      return [{ ...bookmark, entryIndex: after.indexOf(target) }];
+    });
+    this.entries = after;
+
+    return {
+      removedEntries,
+      removedTokens,
+      summaryTokens: summaryEntry.approxTokens,
+      totalAfter: this.totalTokens(),
+    };
+  }
+
+  /**
    * Evict specific entries by ID. Unlike eject (positional) or trim (oldest-first),
    * this removes arbitrary entries — enabling the SB to surgically drop irrelevant
    * context while preserving everything else.

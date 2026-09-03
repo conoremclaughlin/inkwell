@@ -4,6 +4,7 @@ import {
   isClientLocalTool,
   handleClientLocalTool,
   parseCompactContextArgs,
+  compactionShrinks,
   CLIENT_LOCAL_TOOLS,
   COMPACT_CONTEXT_MAX_KEEP_RECENT,
   COMPACT_CONTEXT_SUMMARY_MAX_CHARS,
@@ -468,6 +469,12 @@ describe('compact_context', () => {
     expect(result?.isError).toBe(true);
     expect(parseResult(result).error).toContain('not available');
     expect(ledger.listEntries()).toHaveLength(1);
+  });
+
+  it('compactionShrinks refuses a summary that is not smaller than what it replaces (Lumen, PR #578)', () => {
+    expect(compactionShrinks(13, 5012)).toBe(false);
+    expect(compactionShrinks(100, 100)).toBe(false);
+    expect(compactionShrinks(100, 99)).toBe(true);
   });
 
   describe('parseCompactContextArgs', () => {
