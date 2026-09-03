@@ -123,7 +123,10 @@ export interface AgentLoopPorts {
      * Runs pre-truncation on purpose: a rule like "spawn_agent must be alone"
      * checked after `.slice()` could be evaded by a spawn in sixth position.
      * Returning a refusal rejects the iteration whole — no call runs — and the
-     * reason is fed back so the model can correct rather than guess.
+     * reason is fed back so the model can correct rather than guess. PREFER
+     * that over `{ calls: [] }`: selecting nothing also runs nothing, but says
+     * why to no one. It is relayed as an unexplained drop rather than silently
+     * ending the turn, which is honest but much less useful than a reason.
      *
      * Omit to accept every iteration and simply truncate.
      */
@@ -191,7 +194,16 @@ export function buildContinuationBody(
   /** Calls known BY IDENTITY not to have run. Empty when identity is unreliable. */
   dropped: ReadonlyArray<LocalToolCall> = [],
   /** How many did not run, which is knowable even when naming them is not. */
-  notRunCount: number = dropped.length
+  notRunCount: number = dropped.length,
+  /**
+   * How many the model actually emitted. Defaults to results + notRun, which is
+   * right whenever the executed calls are a subset of the emitted ones — the
+   * normal case. It is NOT right when a screen substitutes a call, because then
+   * a result exists that was never emitted and the sum overcounts. The loop
+   * knows the real figure, so it passes it rather than letting the note state a
+   * total it cannot derive.
+   */
+  emittedCount: number = results.length + notRunCount
 ): string {
   const toolResultsSummary = results
     .map((r) => {
@@ -259,11 +271,11 @@ export function buildContinuationBody(
     notRun === 0
       ? ''
       : dropped.length === notRun
-        ? `\n\nNOTE: you emitted ${results.length + notRun} tool calls. ${results.length} reached the tool runner — their outcomes are above, and some of those may themselves have been refused or failed. ` +
+        ? `\n\nNOTE: you emitted ${emittedCount} tool calls. ${results.length} reached the tool runner — their outcomes are above, and some of those may themselves have been refused or failed. ` +
           `The remaining ${notRun} never reached it at all and had no effect: ${dropped.map((c) => c.tool).join(', ')}. ` +
           `At most ${MAX_TOOL_CALLS_PER_ITERATION} calls run per iteration, in the order you emit them. ` +
           `Re-emit the ones you still need — they did not happen. Do not report them as done.`
-        : `\n\nNOTE: you emitted ${results.length + notRun} tool calls. ${results.length} reached the tool runner — their outcomes are above, and some of those may themselves have been refused or failed. ` +
+        : `\n\nNOTE: you emitted ${emittedCount} tool calls. ${results.length} reached the tool runner — their outcomes are above, and some of those may themselves have been refused or failed. ` +
           `The remaining ${notRun} never reached it at all, but the runtime CANNOT TELL YOU WHICH — do not guess. ` +
           `At most ${MAX_TOOL_CALLS_PER_ITERATION} calls run per iteration, in the order you emit them. ` +
           `Before re-emitting anything, read back the current state and act on what you find: ` +
@@ -455,13 +467,23 @@ export async function runAgentLoop(
     // that in fact ran. That is worse than saying nothing: it instructs the
     // model to re-run writes that already succeeded.
     //
-    // The two views have to agree. `notRunCount` is arithmetic and always
-    // holds; the identity list must account for exactly that many, or it is
-    // not describing the same event and we do not trust its names.
-    const notRunCount = Math.max(0, extracted.length - calls.length);
+    // Identity is meaningless in exactly one situation: NOTHING matched even
+    // though calls were selected. That is the rebuilt-objects case, and there
+    // the arithmetic is the only thing left to trust.
+    //
+    // Everywhere else identity is better than arithmetic, including two cases
+    // arithmetic gets wrong on its own:
+    //   - an empty accepted selection — calls is [], nothing COULD match, and
+    //     every extracted call genuinely did not run, so naming them is right;
+    //   - a screen that SUBSTITUTES a call (returns one not extracted). Counts
+    //     then balance while a real call vanished, so a count-only rule reports
+    //     nothing at all. Identity still sees it.
     const droppedByIdentity = extracted.filter((c) => !calls.includes(c));
-    const identityReliable = droppedByIdentity.length === notRunCount;
+    const identityReliable = !(droppedByIdentity.length === extracted.length && calls.length > 0);
     const dropped = identityReliable ? droppedByIdentity : [];
+    const notRunCount = identityReliable
+      ? dropped.length
+      : Math.max(0, extracted.length - calls.length);
     if (notRunCount > 0) {
       const which = identityReliable
         ? `: ${dropped.map((c) => c.tool).join(', ')}`
@@ -473,6 +495,20 @@ export async function runAgentLoop(
 
     if (calls.length === 0) {
       stopReason = 'no-tools';
+      // A screen may ACCEPT an iteration and then select nothing from it
+      // (Lumen, PR #573 round 4). The effect is identical to rejecting it whole
+      // — nothing runs — but it arrives without a reason, and this break is
+      // upstream of where `stranded` is normally built, so the turn ended with
+      // a UI event and nothing said to the model at all. Two emitted writes,
+      // one backend prompt, `no-tools`, silence.
+      //
+      // Captured rather than forbidden. Requiring `{ rejected }` here would
+      // turn a host's questionable-but-honest return into a crash, and this PR
+      // is about making loss audible, not about adding ways to fail. The relay
+      // reports zero results and names what never ran, which is exactly true.
+      if (notRunCount > 0) {
+        stranded = { results: [], dropped, notRunCount };
+      }
       break;
     }
 
@@ -555,7 +591,7 @@ export async function runAgentLoop(
     const stopWaiting = ports.ui.startWaiting();
     try {
       outcome = await ports.backend.runTurn(
-        buildContinuationBody(results, calls, dropped, notRunCount),
+        buildContinuationBody(results, calls, dropped, notRunCount, extracted.length),
         {
           iteration,
           isContinuation: true,

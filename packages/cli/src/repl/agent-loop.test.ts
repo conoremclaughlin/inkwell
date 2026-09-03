@@ -1039,6 +1039,45 @@ describe('silently dropped tool calls (the per-iteration cap)', () => {
     });
 
     /**
+     * A screen that ACCEPTS the iteration and selects nothing from it (Lumen,
+     * PR #573 round 4). Nothing runs, exactly as with a rejection, but no
+     * reason is produced — and the `calls.length === 0` break is upstream of
+     * where the payload is normally built, so the model heard nothing at all.
+     */
+    it('relays an empty screen selection instead of ending the turn quietly', async () => {
+      const harness = makePorts([
+        outcome({ stdout: `${inkTool('save_memory')}\n${inkTool('create_reminder')}` }),
+        outcome({ stdout: 'final answer' }),
+      ]);
+      harness.ports.tools.screen = () => ({ calls: [] });
+
+      const result = await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+
+      expect(result.stopReason).toBe('no-tools');
+      expect(harness.executed).toHaveLength(0);
+      // Was: one prompt and a UI event nobody downstream can read.
+      expect(harness.prompts).toHaveLength(2);
+      const relay = harness.prompts[1]!.body;
+      expect(relay).toContain('NOT EXECUTED');
+      expect(relay).toContain('save_memory');
+      expect(relay).toContain('create_reminder');
+    });
+
+    /**
+     * The control that keeps the above from becoming "always relay": a model
+     * that simply stopped asking for tools must still end in one turn.
+     */
+    it('stays quiet when the model emitted no tools at all', async () => {
+      const harness = makePorts([outcome({ stdout: 'just an answer' })]);
+      harness.ports.tools.screen = () => ({ calls: [] });
+
+      const result = await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+
+      expect(result.stopReason).toBe('no-tools');
+      expect(harness.prompts).toHaveLength(1);
+    });
+
+    /**
      * The clear-on-delivery step, which the rejection repro does NOT cover —
      * that one passes even with the clear removed, because the rejection branch
      * overwrites the payload with its own. Found by mutating the clear and
@@ -1181,6 +1220,35 @@ describe('silently dropped tool calls (the per-iteration cap)', () => {
       expect(continuation).toContain('7 tool calls');
       expect(continuation).toContain('5 reached the tool runner');
       expect(harness.events.join('\n')).toContain('not determinable');
+    });
+
+    /**
+     * Not raised in review — found by asking which other screens defeat the
+     * check. A screen that SUBSTITUTES a call returns as many as it received,
+     * so arithmetic balances and a count-only rule reports nothing, while a
+     * real emitted call never ran. Identity still sees it, so identity is
+     * trusted whenever anything matched at all.
+     */
+    it('catches a substituted call, which the counts alone cannot', async () => {
+      const harness = makePorts([
+        outcome({
+          stdout: [inkTool('a'), inkTool('b'), inkTool('vanishes')].join('\n'),
+        }),
+        outcome({ stdout: 'done' }),
+      ]);
+      harness.ports.tools.screen = (all) =>
+        all.length === 0
+          ? { calls: [] }
+          : { calls: [all[0]!, all[1]!, { tool: 'substituted', args: {}, raw: '' }] };
+
+      await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+
+      const continuation = harness.prompts[1]!.body;
+      // Three emitted, three selected — the counts say nothing is missing.
+      expect(continuation).toContain('vanishes');
+      expect(continuation).toContain('never reached it at all');
+      // And the emitted total is the real one: three, not results + dropped.
+      expect(continuation).toContain('you emitted 3 tool calls');
     });
 
     it('final relay refuses to name for the same reason', () => {
