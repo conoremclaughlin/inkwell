@@ -1,10 +1,12 @@
 import { describe, it, expect } from 'vitest';
 import {
   buildContinuationBody,
+  buildFinalRelayBody,
   extractLocalToolCalls,
   hasUnseenFailure,
   resolveResponseText,
   runAgentLoop,
+  MAX_TOOL_CALLS_PER_ITERATION,
   type AgentLoopPorts,
   type BackendTurnOutcome,
   type LocalToolCall,
@@ -879,5 +881,108 @@ describe('an unrecognized failure status reaches the model', () => {
 
     expect(harness.prompts).toHaveLength(2);
     expect(harness.prompts[1].body).toContain('upstream timed out');
+  });
+});
+
+/**
+ * The per-iteration cap discarded calls in silence (Myra, 3 Sep 2026).
+ *
+ * She emitted 8 update_memory calls; 5 ran. The results block that came back
+ * listed only the survivors, with no count and no gap — well-formed, internally
+ * consistent, and describing less work than she had asked for. The 3 that
+ * vanished were downgrading critical-salience memories asserting a security
+ * compromise that had not happened. She caught it only by reading back.
+ *
+ * Her framing, and the reason these tests assert shape rather than the number:
+ * "The dropped calls were indistinguishable from calls never made."
+ */
+describe('silently dropped tool calls (the per-iteration cap)', () => {
+  const call = (tool: string): LocalToolCall => ({ tool, args: {} });
+  const ran = (tool: string): ToolResultRecord => ({ tool, result: 'ok', status: 'executed' });
+
+  describe('buildContinuationBody', () => {
+    it('names the calls that did not run, and both counts', () => {
+      const body = buildContinuationBody(
+        [ran('a'), ran('b')],
+        [call('a'), call('b')],
+        [call('c'), call('d')]
+      );
+
+      expect(body).toContain('c, d');
+      // Both sides of the gap: what was asked for and what happened.
+      expect(body).toContain('4 tool calls');
+      expect(body).toContain('only 2 ran');
+      expect(body).toContain('Do not report them as done');
+    });
+
+    /**
+     * The control. Without it, a body that ALWAYS warned would pass the test
+     * above while telling every turn its calls were dropped.
+     */
+    it('says nothing about drops when nothing was dropped', () => {
+      const body = buildContinuationBody([ran('a')], [call('a')]);
+      expect(body).not.toContain('NOT executed');
+      expect(body).not.toMatch(/only \d+ ran/);
+    });
+  });
+
+  describe('buildFinalRelayBody', () => {
+    it('names undelivered calls when the loop is ending', () => {
+      const body = buildFinalRelayBody([ran('a')], [call('late')]);
+      expect(body).toContain('NOT EXECUTED');
+      expect(body).toContain('late');
+    });
+
+    it('stays quiet when every call ran', () => {
+      expect(buildFinalRelayBody([ran('a')])).not.toContain('NOT EXECUTED');
+    });
+  });
+
+  /**
+   * Myra's measurement, end to end: 8 emitted -> 5 executed, and the three that
+   * did not run are named back to the model. Written against the constant
+   * rather than the literal 5 — the defect is the silence, not the number.
+   */
+  it('executes up to the cap and tells the model which calls it dropped', async () => {
+    const emitted = ['m1', 'm2', 'm3', 'm4', 'm5', 'm6', 'm7', 'm8'];
+    const harness = makePorts([
+      outcome({ stdout: emitted.map((t) => inkTool(t)).join('\n') }),
+      outcome({ stdout: 'done' }),
+    ]);
+
+    await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+
+    const honored = emitted.slice(0, MAX_TOOL_CALLS_PER_ITERATION);
+    const skipped = emitted.slice(MAX_TOOL_CALLS_PER_ITERATION);
+
+    expect(harness.executed[0]!.map((c) => c.tool)).toEqual(honored);
+
+    // The point: the continuation must name what did NOT run. Before this, the
+    // model saw five results and no indication three calls had been discarded.
+    const continuation = harness.prompts[1]!.body;
+    for (const tool of skipped) expect(continuation).toContain(tool);
+    expect(continuation).toContain(`${emitted.length} tool calls`);
+    expect(continuation).toContain(`only ${honored.length} ran`);
+
+    // And a human watching the terminal sees it too.
+    expect(harness.events.join('\n')).toContain('not run');
+  });
+
+  /**
+   * Her second sample, which is the control: 4 emitted, 4 executed, and no
+   * note. A warning that fires on every turn is its own kind of lie.
+   */
+  it('says nothing when every emitted call fits under the cap', async () => {
+    const emitted = ['m1', 'm2', 'm3', 'm4'].slice(0, MAX_TOOL_CALLS_PER_ITERATION);
+    const harness = makePorts([
+      outcome({ stdout: emitted.map((t) => inkTool(t)).join('\n') }),
+      outcome({ stdout: 'done' }),
+    ]);
+
+    await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+
+    expect(harness.executed[0]).toHaveLength(emitted.length);
+    expect(harness.prompts[1]!.body).not.toMatch(/only \d+ ran/);
+    expect(harness.events.join('\n')).not.toContain('not run');
   });
 });

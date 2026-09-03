@@ -161,7 +161,8 @@ export function resolveResponseText(outcome: BackendTurnOutcome): string {
  */
 export function buildContinuationBody(
   results: ReadonlyArray<ToolResultRecord>,
-  calls: ReadonlyArray<LocalToolCall>
+  calls: ReadonlyArray<LocalToolCall>,
+  dropped: ReadonlyArray<LocalToolCall> = []
 ): string {
   const toolResultsSummary = results
     .map((r) => {
@@ -192,7 +193,34 @@ export function buildContinuationBody(
       ? '\n\nNOTE: none of those calls ran, and at least one FAILED rather than being refused — the error text above says why. A failure is not a refusal: if it names a bad argument or a transient condition, fix it and try again. Do not report the work as done, and do not describe a failure as a refusal.'
       : '\n\nNOTE: none of those calls ran — every one was refused. Do not retry them. Work with the tools you do have, and if the task cannot be completed without a refused tool, say so plainly and stop.';
 
-  return `[Tool results from previous turn]\n${toolResultsSummary}${formatCorrection}${refusalNote}\n\nContinue your response based on these tool results. If you need more tools, emit ink-tool blocks. Otherwise, provide your final answer.`;
+  // A capped call is indistinguishable from a call never made unless we say so.
+  //
+  // MAX_TOOL_CALLS_PER_ITERATION silently discarded everything past the fifth,
+  // in emission order, and the results block that came back listed only the
+  // survivors — with no count, no gap, nothing to compare against. A model has
+  // no way to notice: the block it reads is well-formed and internally
+  // consistent, it simply describes less work than was asked for.
+  //
+  // Myra emitted 8 update_memory calls; 5 ran. The 3 that vanished were the
+  // ones downgrading critical-salience memories asserting a security compromise
+  // that had not happened, and she only caught it because she read back rather
+  // than trusting the turn. Had she trusted it she would have reported all
+  // eight done and left a false compromise claim at critical salience for a
+  // future session to recall as fact. Silent drops land behind the work you
+  // already believe you finished, which is precisely where nobody looks.
+  //
+  // Naming them matters as much as counting them: "3 were dropped" invites a
+  // guess about which, and a model that guesses wrong re-runs a write that
+  // already succeeded.
+  const droppedNote =
+    dropped.length > 0
+      ? `\n\nNOTE: you emitted ${results.length + dropped.length} tool calls and only ${results.length} ran. ` +
+        `These were NOT executed and had no effect: ${dropped.map((c) => c.tool).join(', ')}. ` +
+        `At most ${MAX_TOOL_CALLS_PER_ITERATION} calls run per iteration, in the order you emit them. ` +
+        `Re-emit the ones you still need — they did not happen. Do not report them as done.`
+      : '';
+
+  return `[Tool results from previous turn]\n${toolResultsSummary}${formatCorrection}${refusalNote}${droppedNote}\n\nContinue your response based on these tool results. If you need more tools, emit ink-tool blocks. Otherwise, provide your final answer.`;
 }
 
 /**
@@ -203,15 +231,27 @@ export function buildContinuationBody(
  * confidently wrong (the Aug 13 Telegram audio drop; PR #491). The relay's
  * output is final: its ink-tool blocks are NOT executed.
  */
-export function buildFinalRelayBody(results: ReadonlyArray<ToolResultRecord>): string {
+export function buildFinalRelayBody(
+  results: ReadonlyArray<ToolResultRecord>,
+  dropped: ReadonlyArray<LocalToolCall> = []
+): string {
   const toolResultsSummary = results
     .map((r) => {
       const resultStr = typeof r.result === 'string' ? r.result : JSON.stringify(r.result);
       return `Tool ${r.tool} (${r.status}): ${resultStr}`;
     })
     .join('\n\n');
+  // Undelivered calls have to be named here too. This body ends the turn, so a
+  // call the cap discarded on the final iteration will never get another
+  // chance — and an agent that is not told exits reporting work it never did.
+  const droppedNote =
+    dropped.length > 0
+      ? `\n\nNOT EXECUTED — these calls were emitted but never ran, and the loop has now ended: ${dropped
+          .map((c) => c.tool)
+          .join(', ')}. They had no effect. Say so rather than reporting them as done.`
+      : '';
   return (
-    `[Tool results from previous turn — FINAL]\n${toolResultsSummary}\n\n` +
+    `[Tool results from previous turn — FINAL]\n${toolResultsSummary}${droppedNote}\n\n` +
     'The tool loop has ended; no further tool calls will be executed this turn. ' +
     'Review these results and provide your final answer. If a call above failed, ' +
     'say so plainly instead of reporting the work as done.'
@@ -283,6 +323,7 @@ export async function runAgentLoop(
   // a screen rejection at the cap would replay the previous iteration's
   // already-seen results and omit the refusal that actually ended the loop.
   let relayResults: ToolResultRecord[] = [];
+  let lastDropped: LocalToolCall[] = [];
 
   for (;;) {
     responseText = resolveResponseText(outcome);
@@ -339,6 +380,21 @@ export async function runAgentLoop(
     }
 
     calls = screened.calls;
+
+    // Whatever the model emitted that is not going to run — whether the default
+    // cap discarded it or a host `screen` did. Computed by identity rather than
+    // by count so the note can NAME the calls, and so it stays honest if a
+    // screen reorders rather than truncates.
+    const dropped = extracted.filter((c) => !calls.includes(c));
+    // Mirrored outward so the FINAL relay can carry it too: a turn that ends at
+    // the iteration cap with calls still undelivered would otherwise exit
+    // silently, which is the same swallow one level up.
+    lastDropped = dropped;
+    if (dropped.length > 0) {
+      ports.ui.printEvent(
+        `  ⋯ ${dropped.length} of ${extracted.length} tool calls not run (cap ${MAX_TOOL_CALLS_PER_ITERATION}/iteration): ${dropped.map((c) => c.tool).join(', ')}`
+      );
+    }
 
     if (calls.length === 0) {
       stopReason = 'no-tools';
@@ -417,7 +473,7 @@ export async function runAgentLoop(
 
     const stopWaiting = ports.ui.startWaiting();
     try {
-      outcome = await ports.backend.runTurn(buildContinuationBody(results, calls), {
+      outcome = await ports.backend.runTurn(buildContinuationBody(results, calls, dropped), {
         iteration,
         isContinuation: true,
         signal: input.signal,
@@ -460,7 +516,7 @@ export async function runAgentLoop(
     const stopRelayWaiting = ports.ui.startWaiting();
     let relay: BackendTurnOutcome;
     try {
-      relay = await ports.backend.runTurn(buildFinalRelayBody(relayResults), {
+      relay = await ports.backend.runTurn(buildFinalRelayBody(relayResults, lastDropped), {
         iteration,
         isContinuation: true,
         signal: input.signal,
