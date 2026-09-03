@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   buildContinuationBody,
   buildFinalRelayBody,
+  reconcileSelection,
   extractLocalToolCalls,
   hasUnseenFailure,
   resolveResponseText,
@@ -913,8 +914,85 @@ describe('an unrecognized failure status reaches the model', () => {
  * Her framing, and the reason these tests assert shape rather than the number:
  * "The dropped calls were indistinguishable from calls never made."
  */
+/**
+ * The reconciliation, tested as itself rather than through a turn.
+ *
+ * Three rounds of identity heuristics were wrong three different ways before
+ * this replaced them (Lumen, PR #573 rounds 2-5). Testing the function directly
+ * is the point: the previous versions were only ever exercised through a loop,
+ * where each new hole needed a new end-to-end scenario to expose it.
+ */
+describe('reconcileSelection', () => {
+  const c = (tool: string, args: Record<string, unknown> = {}): LocalToolCall => ({
+    tool,
+    args,
+    raw: '',
+  });
+
+  it('reports the tail the cap discarded', () => {
+    const emitted = [c('a'), c('b'), c('d')];
+    const out = reconcileSelection(emitted, emitted.slice(0, 2));
+    expect(out.dropped.map((x) => x.tool)).toEqual(['d']);
+    expect(out.unmatched).toBe(0);
+    expect(out.emitted).toBe(3);
+    expect(out.reached).toBe(2);
+  });
+
+  it('sees through rebuilt objects', () => {
+    const emitted = [c('a'), c('b'), c('d')];
+    const out = reconcileSelection(
+      emitted,
+      emitted.slice(0, 2).map((x) => ({ ...x }))
+    );
+    expect(out.dropped.map((x) => x.tool)).toEqual(['d']);
+    expect(out.unmatched).toBe(0);
+  });
+
+  it('flags a call that ran but was never emitted', () => {
+    const out = reconcileSelection([c('a'), c('b')], [c('a'), c('substituted')]);
+    expect(out.unmatched).toBe(1);
+  });
+
+  it('distinguishes duplicates by consuming each match once', () => {
+    // Two identical emissions, one selected: exactly one is dropped. A
+    // non-consuming match would say neither.
+    const out = reconcileSelection([c('save'), c('save')], [c('save')]);
+    expect(out.dropped).toHaveLength(1);
+    expect(out.unmatched).toBe(0);
+  });
+
+  it('separates calls that differ only by arguments', () => {
+    const out = reconcileSelection(
+      [c('save', { id: 1 }), c('save', { id: 2 })],
+      [c('save', { id: 1 })]
+    );
+    expect(out.dropped).toHaveLength(1);
+    expect(out.dropped[0]!.args).toEqual({ id: 2 });
+  });
+
+  it('treats an empty selection as everything dropped', () => {
+    const out = reconcileSelection([c('a'), c('b')], []);
+    expect(out.dropped).toHaveLength(2);
+    expect(out.unmatched).toBe(0);
+  });
+
+  it('says nothing about a turn where everything ran', () => {
+    const emitted = [c('a'), c('b')];
+    const out = reconcileSelection(emitted, emitted);
+    expect(out.dropped).toHaveLength(0);
+    expect(out.unmatched).toBe(0);
+  });
+});
+
 describe('silently dropped tool calls (the per-iteration cap)', () => {
-  const call = (tool: string): LocalToolCall => ({ tool, args: {} });
+  const call = (tool: string): LocalToolCall => ({ tool, args: {}, raw: '' });
+  const sel = (o: Partial<ReturnType<typeof reconcileSelection>> = {}) => ({
+    emitted: 0,
+    reached: 0,
+    dropped: [] as LocalToolCall[],
+    unmatched: 0,
+    ...o,
+  });
   const ran = (tool: string): ToolResultRecord => ({ tool, result: 'ok', status: 'executed' });
 
   describe('buildContinuationBody', () => {
@@ -922,7 +1000,7 @@ describe('silently dropped tool calls (the per-iteration cap)', () => {
       const body = buildContinuationBody(
         [ran('a'), ran('b')],
         [call('a'), call('b')],
-        [call('c'), call('d')]
+        sel({ emitted: 4, reached: 2, dropped: [call('c'), call('d')] })
       );
 
       expect(body).toContain('c, d');
@@ -945,7 +1023,10 @@ describe('silently dropped tool calls (the per-iteration cap)', () => {
 
   describe('buildFinalRelayBody', () => {
     it('names undelivered calls when the loop is ending', () => {
-      const body = buildFinalRelayBody([ran('a')], [call('late')]);
+      const body = buildFinalRelayBody(
+        [ran('a')],
+        sel({ emitted: 2, reached: 1, dropped: [call('late')] })
+      );
       expect(body).toContain('NOT EXECUTED');
       expect(body).toContain('late');
     });
@@ -1158,7 +1239,7 @@ describe('silently dropped tool calls (the per-iteration cap)', () => {
       const body = buildContinuationBody(
         blocked,
         blocked.map((r) => call(r.tool)),
-        [call('f'), call('g'), call('h')]
+        sel({ emitted: 8, reached: 5, dropped: [call('f'), call('g'), call('h')] })
       );
 
       // Both statements have to be able to coexist without lying.
@@ -1184,26 +1265,31 @@ describe('silently dropped tool calls (the per-iteration cap)', () => {
    */
   describe('when call identity cannot be trusted', () => {
     it('gives the count and refuses to name, rather than naming wrongly', () => {
-      // Identity says "all 3 dropped"; arithmetic says only 1 did. They
-      // disagree, so the names are not describing this event.
-      const body = buildContinuationBody([ran('a'), ran('b')], [call('a'), call('b')], [], 1);
+      // Something ran that maps to nothing emitted, so an unmatched selection
+      // may be a REWRITE of a dropped one — which of the model's calls ran is
+      // genuinely unknowable.
+      const body = buildContinuationBody(
+        [ran('a'), ran('b')],
+        [call('a'), call('b')],
+        sel({ emitted: 3, reached: 2, dropped: [call('unrunnable_widget')], unmatched: 1 })
+      );
 
-      expect(body).toContain('CANNOT TELL YOU WHICH');
-      expect(body).toContain('3 tool calls');
-      expect(body).toContain('2 reached the tool runner');
-      expect(body).toContain('read back the current state');
+      expect(body).toContain('CANNOT tell you which');
+      expect(body).toContain('you emitted 3 tool calls');
+      expect(body).toContain('read back the current');
       // The whole point: it must not assert a name it cannot stand behind.
-      expect(body).not.toMatch(/NOT executed and had no effect/);
+      expect(body).not.toContain('never reached it at all');
+      expect(body).not.toContain('unrunnable_widget');
     });
 
-    it('never names a call that actually ran, even with a rebuilding screen', async () => {
+    it('matches rebuilt objects by content and names the real drops', async () => {
       const emitted = ['m1', 'm2', 'm3', 'm4', 'm5', 'm6', 'm7'];
       const harness = makePorts([
         outcome({ stdout: emitted.map((t) => inkTool(t)).join('\n') }),
         outcome({ stdout: 'done' }),
       ]);
-      // A screen that truncates correctly but returns NEW objects — the exact
-      // shape that defeats a reference comparison.
+      // Truncates correctly but returns NEW objects — the shape that defeated
+      // reference equality. Content matching sees through it.
       harness.ports.tools.screen = (all) => ({
         calls: all.slice(0, 5).map((c) => ({ ...c })),
       });
@@ -1211,29 +1297,46 @@ describe('silently dropped tool calls (the per-iteration cap)', () => {
       await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
 
       const continuation = harness.prompts[1]!.body;
-      // Two ran and two did not; a naive identity filter would name all seven.
-      expect(continuation).toContain('CANNOT TELL YOU WHICH');
-      for (const tool of ['m1', 'm2', 'm3', 'm4', 'm5']) {
-        expect(continuation).not.toContain(`effect: ${tool}`);
-      }
-      // The count still has to be right and still has to be stated.
-      expect(continuation).toContain('7 tool calls');
+      // The two that genuinely did not run, named — better than the previous
+      // behaviour, which gave up and reported a bare count.
+      expect(continuation).toContain('m6, m7');
+      expect(continuation).toContain('you emitted 7 tool calls');
       expect(continuation).toContain('5 reached the tool runner');
-      expect(harness.events.join('\n')).toContain('not determinable');
+      // And never a call that ran.
+      expect(continuation).not.toContain('CANNOT tell you which');
     });
 
     /**
-     * Not raised in review — found by asking which other screens defeat the
-     * check. A screen that SUBSTITUTES a call returns as many as it received,
-     * so arithmetic balances and a count-only rule reports nothing, while a
-     * real emitted call never ran. Identity still sees it, so identity is
-     * trusted whenever anything matched at all.
+     * Lumen's round-five repro (P1). A screen returning one original reference
+     * and two rebuilds — `[all[0], {...all[1]}, {...all[2]}]` — executed all
+     * three, and the previous predicate announced `b, c` never ran and told the
+     * model to re-emit them. Two completed writes, re-run on the runtime's say-so.
      */
-    it('catches a substituted call, which the counts alone cannot', async () => {
+    it('says nothing when a partially-rebuilt selection ran everything', async () => {
       const harness = makePorts([
-        outcome({
-          stdout: [inkTool('a'), inkTool('b'), inkTool('vanishes')].join('\n'),
-        }),
+        outcome({ stdout: [inkTool('a'), inkTool('b'), inkTool('c')].join('\n') }),
+        outcome({ stdout: 'done' }),
+      ]);
+      harness.ports.tools.screen = (all) =>
+        all.length === 0 ? { calls: [] } : { calls: [all[0]!, { ...all[1]! }, { ...all[2]! }] };
+
+      await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+
+      expect(harness.executed[0]).toHaveLength(3);
+      const continuation = harness.prompts[1]!.body;
+      expect(continuation).not.toContain('never reached it at all');
+      expect(continuation).not.toContain('CANNOT tell you which');
+      expect(harness.events.join('\n')).not.toContain('not run');
+    });
+
+    /**
+     * A true substitution is indistinguishable from a rewrite of a dropped
+     * call, so the runtime must not name — the honest answer is the one that
+     * does not instruct a re-run of something that may have executed.
+     */
+    it('refuses to name when something ran that was never emitted', async () => {
+      const harness = makePorts([
+        outcome({ stdout: [inkTool('a'), inkTool('b'), inkTool('vanishes')].join('\n') }),
         outcome({ stdout: 'done' }),
       ]);
       harness.ports.tools.screen = (all) =>
@@ -1244,18 +1347,16 @@ describe('silently dropped tool calls (the per-iteration cap)', () => {
       await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
 
       const continuation = harness.prompts[1]!.body;
-      // Three emitted, three selected — the counts say nothing is missing.
-      expect(continuation).toContain('vanishes');
-      expect(continuation).toContain('never reached it at all');
-      // And the emitted total is the real one: three, not results + dropped.
+      expect(continuation).toContain('CANNOT tell you which');
       expect(continuation).toContain('you emitted 3 tool calls');
+      expect(continuation).not.toContain('never reached it at all');
+      expect(harness.events.join('\n')).toContain('not determinable');
     });
 
     it('final relay refuses to name for the same reason', () => {
-      const body = buildFinalRelayBody([ran('a')], [], 2);
-      expect(body).toContain('NOT EXECUTED');
-      expect(body).toContain('cannot identify which');
-      expect(body).toContain('2 emitted calls');
+      const body = buildFinalRelayBody([ran('a')], sel({ emitted: 3, reached: 1, unmatched: 2 }));
+      expect(body).toContain('NOT RECONCILED');
+      expect(body).toContain('cannot tell you which');
     });
   });
 

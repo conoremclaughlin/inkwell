@@ -33,6 +33,70 @@ export interface ToolResultRecord {
 }
 
 /**
+ * What the screen actually selected, reconciled against what the model emitted.
+ *
+ * Three rounds of review went into inferring this from object identity, and
+ * every inference grew a new hole (Lumen, PR #573 rounds 2-5). Reference
+ * equality said "dropped" for calls a screen had merely rebuilt; the fix for
+ * that missed substitutions; the fix for THAT named `b, c` as never-run when a
+ * screen returned `[all[0], {...all[1]}, {...all[2]}]` and all three ran. The
+ * pattern was the tell: the same predicate wrong three different ways is a
+ * design that cannot answer the question, not a predicate needing a fourth
+ * patch.
+ *
+ * So stop inferring provenance and RECONCILE. Each selected call is matched to
+ * a distinct emitted call by content, which survives `{...c}` because a spread
+ * copies tool and args. Consuming the match handles duplicates. What is left
+ * over on each side is then a fact rather than a guess:
+ *
+ *   - emitted calls with no match  -> provably did not run
+ *   - selected calls with no match -> the screen ran something the model never
+ *     asked for, and an unmatched selection may be a REWRITE of an unmatched
+ *     emission, so which of the model's calls ran is genuinely unknowable
+ *
+ * `dropped` is trustworthy exactly when `unmatched` is zero. That is a proof,
+ * not a heuristic, and it is why the counts below can never disagree.
+ */
+export interface SelectionOutcome {
+  /** How many calls the model emitted. */
+  emitted: number;
+  /** How many the runtime ran. */
+  reached: number;
+  /** Emitted calls proven not to have run. Meaningful only when unmatched is 0. */
+  dropped: LocalToolCall[];
+  /** Ran but matches nothing emitted — the screen substituted or rewrote. */
+  unmatched: number;
+}
+
+/** Same request? Compared by content so a rebuilt object still matches. */
+function sameCall(a: LocalToolCall, b: LocalToolCall): boolean {
+  return a.tool === b.tool && JSON.stringify(a.args) === JSON.stringify(b.args);
+}
+
+/**
+ * Match what ran against what was asked for. Exported so the reconciliation can
+ * be tested as itself rather than through a turn.
+ */
+export function reconcileSelection(
+  extracted: ReadonlyArray<LocalToolCall>,
+  selected: ReadonlyArray<LocalToolCall>
+): SelectionOutcome {
+  const remaining = [...selected];
+  const dropped: LocalToolCall[] = [];
+  for (const call of extracted) {
+    const at = remaining.findIndex((c) => c === call || sameCall(c, call));
+    if (at === -1) dropped.push(call);
+    else remaining.splice(at, 1);
+  }
+  return {
+    emitted: extracted.length,
+    reached: selected.length,
+    dropped,
+    unmatched: remaining.length,
+  };
+}
+
+/**
  * Everything ONE iteration produced, captured together.
  *
  * The FINAL relay used to assemble itself from three variables that were
@@ -53,9 +117,7 @@ export interface ToolResultRecord {
  */
 interface StrandedIteration {
   results: ToolResultRecord[];
-  /** Known by identity not to have run; empty when identity is unreliable. */
-  dropped: LocalToolCall[];
-  notRunCount: number;
+  selection: SelectionOutcome;
 }
 
 /**
@@ -191,19 +253,16 @@ export function resolveResponseText(outcome: BackendTurnOutcome): string {
 export function buildContinuationBody(
   results: ReadonlyArray<ToolResultRecord>,
   calls: ReadonlyArray<LocalToolCall>,
-  /** Calls known BY IDENTITY not to have run. Empty when identity is unreliable. */
-  dropped: ReadonlyArray<LocalToolCall> = [],
-  /** How many did not run, which is knowable even when naming them is not. */
-  notRunCount: number = dropped.length,
   /**
-   * How many the model actually emitted. Defaults to results + notRun, which is
-   * right whenever the executed calls are a subset of the emitted ones — the
-   * normal case. It is NOT right when a screen substitutes a call, because then
-   * a result exists that was never emitted and the sum overcounts. The loop
-   * knows the real figure, so it passes it rather than letting the note state a
-   * total it cannot derive.
+   * What ran versus what was asked for. Omit when there is nothing to report;
+   * the default describes a turn where every emitted call ran.
    */
-  emittedCount: number = results.length + notRunCount
+  selection: SelectionOutcome = {
+    emitted: results.length,
+    reached: results.length,
+    dropped: [],
+    unmatched: 0,
+  }
 ): string {
   const toolResultsSummary = results
     .map((r) => {
@@ -245,41 +304,33 @@ export function buildContinuationBody(
   // Myra emitted 8 update_memory calls; 5 ran. The 3 that vanished were the
   // ones downgrading critical-salience memories asserting a security compromise
   // that had not happened, and she only caught it because she read back rather
-  // than trusting the turn. Had she trusted it she would have reported all
-  // eight done and left a false compromise claim at critical salience for a
-  // future session to recall as fact. Silent drops land behind the work you
-  // already believe you finished, which is precisely where nobody looks.
+  // than trusting the turn.
   //
-  // Naming them matters as much as counting them: "3 were dropped" invites a
-  // guess about which, and a model that guesses wrong re-runs a write that
-  // already succeeded.
+  // Naming beats counting — "3 were dropped" invites a guess, and a wrong guess
+  // re-runs a write that already succeeded. But naming is only safe while the
+  // names are RIGHT, which is Myra's own correction to that argument: a false
+  // "create_reminder did not run" is a positive instruction to redo a completed
+  // write, in the runtime's voice, which the reader cannot contradict.
   //
-  // BUT that argument assumes the names are RIGHT, and naming is only safe
-  // while they are. Myra, who made the argument, attached the precondition
-  // afterwards: a false "create_reminder did not run" is not merely as bad as
-  // a count, it is worse. A count of zero says nothing and sends her looking;
-  // a wrong name is a positive instruction to re-run a write that succeeded,
-  // delivered in the runtime's own voice, which the reader has no standing to
-  // contradict. That is #553's do-not-retry problem with its sign flipped — a
-  // confident wrong statement beats silence only while it is right.
-  //
-  // So `notRunCount` is the count the caller can always vouch for, and
-  // `dropped` is populated only when identity was verifiable. When they
-  // disagree we say the number and admit we cannot name it.
-  const notRun = Math.max(notRunCount, dropped.length);
+  // So the three states below are the three things that can actually be known,
+  // and the counts are coherent by construction: when the selection reconciles,
+  // emitted === reached + dropped.length exactly.
+  const { emitted, reached, dropped, unmatched } = selection;
   const droppedNote =
-    notRun === 0
-      ? ''
-      : dropped.length === notRun
-        ? `\n\nNOTE: you emitted ${emittedCount} tool calls. ${results.length} reached the tool runner — their outcomes are above, and some of those may themselves have been refused or failed. ` +
-          `The remaining ${notRun} never reached it at all and had no effect: ${dropped.map((c) => c.tool).join(', ')}. ` +
+    unmatched > 0
+      ? `\n\nNOTE: you emitted ${emitted} tool calls and ${reached} ran, but ${unmatched} of those ` +
+        `do not correspond to anything you asked for — the host rewrote or substituted calls. ` +
+        `The runtime therefore CANNOT tell you which of yours ran, and one of your calls may have ` +
+        `executed in altered form. Do not guess and do not re-emit blindly: read back the current ` +
+        `state and act on what you find. Re-running a write that already succeeded is not safe.`
+      : dropped.length === 0
+        ? ''
+        : `\n\nNOTE: you emitted ${emitted} tool calls. ${reached} reached the tool runner — their ` +
+          `outcomes are above, and some of those may themselves have been refused or failed. ` +
+          `The remaining ${dropped.length} never reached it at all and had no effect: ` +
+          `${dropped.map((c) => c.tool).join(', ')}. ` +
           `At most ${MAX_TOOL_CALLS_PER_ITERATION} calls run per iteration, in the order you emit them. ` +
-          `Re-emit the ones you still need — they did not happen. Do not report them as done.`
-        : `\n\nNOTE: you emitted ${emittedCount} tool calls. ${results.length} reached the tool runner — their outcomes are above, and some of those may themselves have been refused or failed. ` +
-          `The remaining ${notRun} never reached it at all, but the runtime CANNOT TELL YOU WHICH — do not guess. ` +
-          `At most ${MAX_TOOL_CALLS_PER_ITERATION} calls run per iteration, in the order you emit them. ` +
-          `Before re-emitting anything, read back the current state and act on what you find: ` +
-          `re-running a write that already succeeded is not safe. Do not report the missing calls as done either.`;
+          `Re-emit the ones you still need — they did not happen. Do not report them as done.`;
 
   return `[Tool results from previous turn]\n${toolResultsSummary}${formatCorrection}${refusalNote}${droppedNote}\n\nContinue your response based on these tool results. If you need more tools, emit ink-tool blocks. Otherwise, provide your final answer.`;
 }
@@ -294,10 +345,12 @@ export function buildContinuationBody(
  */
 export function buildFinalRelayBody(
   results: ReadonlyArray<ToolResultRecord>,
-  /** Calls known BY IDENTITY not to have run. Empty when identity is unreliable. */
-  dropped: ReadonlyArray<LocalToolCall> = [],
-  /** How many did not run, which is knowable even when naming them is not. */
-  notRunCount: number = dropped.length
+  selection: SelectionOutcome = {
+    emitted: results.length,
+    reached: results.length,
+    dropped: [],
+    unmatched: 0,
+  }
 ): string {
   const toolResultsSummary = results
     .map((r) => {
@@ -308,15 +361,18 @@ export function buildFinalRelayBody(
   // Undelivered calls have to be named here too. This body ends the turn, so a
   // call the cap discarded on the final iteration will never get another
   // chance — and an agent that is not told exits reporting work it never did.
-  const notRun = Math.max(notRunCount, dropped.length);
+  const { dropped, unmatched } = selection;
   const droppedNote =
-    notRun === 0
-      ? ''
-      : dropped.length === notRun
-        ? `\n\nNOT EXECUTED — these calls were emitted but never ran, and the loop has now ended: ${dropped
+    unmatched > 0
+      ? `\n\nNOT RECONCILED — ${unmatched} of the calls that ran do not correspond to anything you ` +
+        `emitted, so the runtime cannot tell you which of yours ran. The loop has ended. Say that ` +
+        `plainly rather than reporting the work as done.`
+      : dropped.length === 0
+        ? ''
+        : `\n\nNOT EXECUTED — these calls were emitted but never ran, and the loop has now ended: ${dropped
             .map((c) => c.tool)
-            .join(', ')}. They had no effect. Say so rather than reporting them as done.`
-        : `\n\nNOT EXECUTED — ${notRun} emitted calls never ran and the loop has now ended, but the runtime cannot identify which. Do not guess, and do not report them as done: say plainly that some calls did not execute and name what you are unsure of.`;
+            .join(', ')}. They had no effect. Say so rather than reporting them as done.`;
+
   const summary = results.length > 0 ? toolResultsSummary : '(no tool results from this iteration)';
   return (
     `[Tool results from previous turn — FINAL]\n${summary}${droppedNote}\n\n` +
@@ -421,7 +477,10 @@ export async function runAgentLoop(
       // A refusal is this iteration's entire output. Captured here so that if
       // the cap fires below, the relay carries the rejection that stopped the
       // loop rather than a previous iteration's leftovers.
-      stranded = { results: [record], dropped: [], notRunCount: 0 };
+      stranded = {
+        results: [record],
+        selection: { emitted: 0, reached: 0, dropped: [], unmatched: 0 },
+      };
 
       if (iteration >= maxIterations) {
         stopReason = 'iteration-cap';
@@ -455,41 +514,17 @@ export async function runAgentLoop(
 
     calls = screened.calls;
 
-    // Whatever the model emitted that is not going to run — whether the default
-    // cap discarded it or a host `screen` did. Computed by identity rather than
-    // by count so the note can NAME the calls, and so it stays honest if a
-    // screen reorders rather than truncates.
-    //
-    // Identity is a reference comparison, and it is only trustworthy while the
-    // screen passes the SAME objects through. The default path does (`slice`
-    // preserves references), but a host that rebuilds its call objects would
-    // match nothing and make every emitted call look dropped — naming calls
-    // that in fact ran. That is worse than saying nothing: it instructs the
-    // model to re-run writes that already succeeded.
-    //
-    // Identity is meaningless in exactly one situation: NOTHING matched even
-    // though calls were selected. That is the rebuilt-objects case, and there
-    // the arithmetic is the only thing left to trust.
-    //
-    // Everywhere else identity is better than arithmetic, including two cases
-    // arithmetic gets wrong on its own:
-    //   - an empty accepted selection — calls is [], nothing COULD match, and
-    //     every extracted call genuinely did not run, so naming them is right;
-    //   - a screen that SUBSTITUTES a call (returns one not extracted). Counts
-    //     then balance while a real call vanished, so a count-only rule reports
-    //     nothing at all. Identity still sees it.
-    const droppedByIdentity = extracted.filter((c) => !calls.includes(c));
-    const identityReliable = !(droppedByIdentity.length === extracted.length && calls.length > 0);
-    const dropped = identityReliable ? droppedByIdentity : [];
-    const notRunCount = identityReliable
-      ? dropped.length
-      : Math.max(0, extracted.length - calls.length);
-    if (notRunCount > 0) {
-      const which = identityReliable
-        ? `: ${dropped.map((c) => c.tool).join(', ')}`
-        : ' (which ones is not determinable — screen did not preserve call identity)';
+    // What ran versus what was asked for. Reconciled, not inferred — see
+    // SelectionOutcome for why three rounds of identity heuristics were the
+    // wrong shape of answer.
+    const selection = reconcileSelection(extracted, calls);
+    if (selection.unmatched > 0) {
       ports.ui.printEvent(
-        `  ⋯ ${notRunCount} of ${extracted.length} tool calls not run (cap ${MAX_TOOL_CALLS_PER_ITERATION}/iteration)${which}`
+        `  ⋯ ${selection.unmatched} of ${selection.reached} executed calls do not match anything emitted — which of the model's calls ran is not determinable`
+      );
+    } else if (selection.dropped.length > 0) {
+      ports.ui.printEvent(
+        `  ⋯ ${selection.dropped.length} of ${selection.emitted} tool calls not run (cap ${MAX_TOOL_CALLS_PER_ITERATION}/iteration): ${selection.dropped.map((c) => c.tool).join(', ')}`
       );
     }
 
@@ -506,8 +541,8 @@ export async function runAgentLoop(
       // turn a host's questionable-but-honest return into a crash, and this PR
       // is about making loss audible, not about adding ways to fail. The relay
       // reports zero results and names what never ran, which is exactly true.
-      if (notRunCount > 0) {
-        stranded = { results: [], dropped, notRunCount };
+      if (selection.dropped.length > 0 || selection.unmatched > 0) {
+        stranded = { results: [], selection };
       }
       break;
     }
@@ -517,7 +552,7 @@ export async function runAgentLoop(
     for (const r of results) ports.observe?.recordToolCall(r);
     // Results and drops together, from the same iteration, at the one moment
     // both are known. Every exit below inherits exactly this.
-    stranded = { results, dropped, notRunCount };
+    stranded = { results, selection };
 
     iteration++;
 
@@ -590,14 +625,11 @@ export async function runAgentLoop(
 
     const stopWaiting = ports.ui.startWaiting();
     try {
-      outcome = await ports.backend.runTurn(
-        buildContinuationBody(results, calls, dropped, notRunCount, extracted.length),
-        {
-          iteration,
-          isContinuation: true,
-          signal: input.signal,
-        }
-      );
+      outcome = await ports.backend.runTurn(buildContinuationBody(results, calls, selection), {
+        iteration,
+        isContinuation: true,
+        signal: input.signal,
+      });
     } finally {
       stopWaiting();
     }
@@ -656,7 +688,8 @@ export async function runAgentLoop(
   // ate underneath the signal.
   const relayWorthy =
     stranded !== null &&
-    (stranded.notRunCount > 0 ||
+    (stranded.selection.dropped.length > 0 ||
+      stranded.selection.unmatched > 0 ||
       stopReason === 'iteration-cap' ||
       hasUnseenFailure(stranded.results));
   if (relayWorthy && outcome.success && !input.signal?.aborted) {
@@ -665,7 +698,7 @@ export async function runAgentLoop(
     let relay: BackendTurnOutcome;
     try {
       relay = await ports.backend.runTurn(
-        buildFinalRelayBody(stranded!.results, stranded!.dropped, stranded!.notRunCount),
+        buildFinalRelayBody(stranded!.results, stranded!.selection),
         {
           iteration,
           isContinuation: true,
