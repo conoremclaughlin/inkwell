@@ -647,6 +647,13 @@ export interface ClaudeRunnerConfig {
   workingDirectory: string;
   mcpConfigPath: string;
   model?: string;
+  /**
+   * Reasoning effort for the spawn (claude: low | medium | high | xhigh |
+   * max). Per-SB from agent_identities.metadata.runtimeConfig.effort;
+   * absent means the provider's own default (or the operator's user-level
+   * setting) applies.
+   */
+  effort?: string;
   systemPrompt?: string;
   appendSystemPrompt?: string;
   pcpAccessToken?: string;

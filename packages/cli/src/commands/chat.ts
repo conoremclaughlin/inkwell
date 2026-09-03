@@ -189,6 +189,7 @@ type ChatOptions = {
   agent?: string;
   backend?: string;
   model?: string;
+  effort?: string;
   systemPromptFile?: string;
   toolRouting?: string;
   ui?: string;
@@ -268,6 +269,8 @@ function readSystemPromptFile(path?: string): string | undefined {
 interface ChatRuntime {
   backend: string;
   model?: string;
+  /** Reasoning effort for every backend spawn (claude: low | medium | high | xhigh | max). */
+  effort?: string;
   /**
    * Replaces the generated identity prompt for every backend turn in this
    * session. Set by --system-prompt-file; see BackendConfig.
@@ -2958,6 +2961,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
   const runtime: ChatRuntime = {
     backend: initialBackend,
     model: options.model,
+    effort: options.effort,
     verbose: options.verbose ?? false,
     toolMode:
       options.tools === 'off' ? 'off' : options.tools === 'privileged' ? 'privileged' : 'backend',
@@ -4468,6 +4472,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           backend: runtime.backend,
           agentId,
           model: runtime.model,
+          effort: runtime.effort,
           prompt: buildCompactionPrompt(chunk),
           // Compaction is a backend turn like any other, so it goes through
           // adapter.prepare() and would otherwise regenerate the default
@@ -5063,6 +5068,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         backend: cloneBackend,
         agentId,
         model: cloneModel,
+        effort: runtime.effort,
         prompt,
         verbose: false,
         passthroughArgs: clonePassthrough,
@@ -6168,6 +6174,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           backend: runtime.backend,
           agentId,
           model: runtime.model,
+          effort: runtime.effort,
           prompt: body,
           verbose: runtime.verbose,
           passthroughArgs,
@@ -6234,6 +6241,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
             backend: runtime.backend,
             agentId,
             model: runtime.model,
+            effort: runtime.effort,
             prompt: buildPromptEnvelope(agentId, runtime, ledger, raw),
             verbose: runtime.verbose,
             passthroughArgs,
@@ -6340,6 +6348,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         backend: runtime.backend,
         agentId,
         model: runtime.model,
+        effort: runtime.effort,
         prompt: continuationPrompt,
         verbose: runtime.verbose,
         passthroughArgs,
@@ -8559,6 +8568,10 @@ export function registerChatCommand(program: Command): void {
       .option('-a, --agent <id>', 'Agent identity to use')
       .option('-b, --backend <name>', 'Backend: claude, codex, gemini', 'claude')
       .option('-m, --model <model>', 'Model override for backend')
+      .option(
+        '--effort <level>',
+        'Reasoning effort for the backend (claude: low | medium | high | xhigh | max)'
+      )
       .option(
         '--system-prompt-file <path>',
         'Replace the generated identity prompt with this file (used by `ink awaken`)'

@@ -880,6 +880,42 @@ describe('SessionService', () => {
       expect(modelPassedToRunner()).toBe('claude-opus-5');
     });
 
+    it('passes a pinned effort through to the runner config (task 7ea6cdf7)', async () => {
+      const service = serviceWithIdentity(
+        { runtimeConfig: { model: 'claude-opus-5', effort: 'xhigh' } },
+        { defaultModel: 'claude-fable-5' }
+      );
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(
+        createMockSession({ sbId: 'sb-1' } as never)
+      );
+
+      await service.handleMessage(createMockRequest());
+
+      const call = vi.mocked(mockClaudeRunner.run).mock.calls[0] as unknown as [
+        string,
+        { config: { effort?: string } },
+      ];
+      expect(call[1].config.effort).toBe('xhigh');
+    });
+
+    it('sends no effort when the identity sets none — the provider default applies', async () => {
+      const service = serviceWithIdentity(
+        { runtimeConfig: {} },
+        { defaultModel: 'claude-fable-5' }
+      );
+      vi.mocked(mockRepository.findByUserAndAgent).mockResolvedValue(
+        createMockSession({ sbId: 'sb-1' } as never)
+      );
+
+      await service.handleMessage(createMockRequest());
+
+      const call = vi.mocked(mockClaudeRunner.run).mock.calls[0] as unknown as [
+        string,
+        { config: { effort?: string } },
+      ];
+      expect(call[1].config.effort).toBeUndefined();
+    });
+
     it('passes the fleet default when the identity pins nothing', async () => {
       const service = serviceWithIdentity(
         { runtimeConfig: {} },
@@ -6430,6 +6466,28 @@ describe('parseRuntimeConfig (per-SB dashboard settings → spawn flags)', () =>
     expect(parseRuntimeConfig({ runtimeConfig: { toolRouting: 'local' } })).toEqual({
       toolRouting: 'local',
     });
+  });
+
+  it('passes through a per-SB effort, validated against the levels claude accepts', () => {
+    expect(parseRuntimeConfig({ runtimeConfig: { effort: 'xhigh' } })).toEqual({
+      toolRouting: 'local',
+      effort: 'xhigh',
+    });
+    expect(parseRuntimeConfig({ runtimeConfig: { effort: ' High ' } })).toEqual({
+      toolRouting: 'local',
+      effort: 'high',
+    });
+    for (const level of ['low', 'medium', 'high', 'xhigh', 'max']) {
+      expect(parseRuntimeConfig({ runtimeConfig: { effort: level } }).effort).toBe(level);
+    }
+  });
+
+  it('drops an effort the CLI would reject rather than failing the spawn with it', () => {
+    expect(parseRuntimeConfig({ runtimeConfig: { effort: 'ultra' } })).toEqual({
+      toolRouting: 'local',
+    });
+    expect(parseRuntimeConfig({ runtimeConfig: { effort: 3 } })).toEqual({ toolRouting: 'local' });
+    expect(parseRuntimeConfig({ runtimeConfig: { effort: '' } })).toEqual({ toolRouting: 'local' });
   });
 
   it('passes through a per-SB model pin, trimmed', () => {
