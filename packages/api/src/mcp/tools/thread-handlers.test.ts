@@ -966,6 +966,87 @@ describe('handleGetThreadMessages — cold-start guard (spec §4)', () => {
     expect(parsed.messageCount).toBe(25);
   });
 
+  /**
+   * An oldest-first read with a limit cuts the NEWEST messages, and said so
+   * nowhere (Myra, 3 Sep 2026).
+   *
+   * She called this with fullHistory: true and limit 5 on a 34-message thread
+   * and received five messages from six days earlier — not the message she had
+   * just been triggered about. The view was coherent, plausible and stale. She
+   * caught it only because she knew a specific message had to be present.
+   *
+   * Her framing, and the reason this needed a fix rather than a doc note:
+   * "zero prompts a retry, stale content does not."
+   */
+  describe('oldest-first truncation cuts the NEWEST messages', () => {
+    // Age descending so array order is chronological: m-0 oldest, m-33 newest.
+    const chronological = (n: number) =>
+      Array.from({ length: n }, (_, i) => guardMsg(`m-${i}`, 100 - i));
+
+    it('reports what it cut, and says which end', async () => {
+      const parsed = await callGuard(createGuardMockSupabase(chronological(34)), {
+        fullHistory: true,
+        limit: 5,
+      });
+
+      // Myra's exact result: the START of the thread, not the recent part.
+      expect(parsed.messageCount).toBe(5);
+      expect((parsed.messages as Array<{ id: string }>).map((m) => m.id)).toEqual([
+        'm-0',
+        'm-1',
+        'm-2',
+        'm-3',
+        'm-4',
+      ]);
+
+      // The part that was missing entirely.
+      expect(parsed.skippedNewerCount).toBe(29);
+      expect(parsed.truncatedFrom).toBe('newest');
+      expect(parsed.truncationWarning).toContain('OLDEST');
+      expect(parsed.truncationWarning).toContain('latestN');
+    });
+
+    /**
+     * fullHistory bypasses the READ-STATE floor, not `limit` — which defaults
+     * to 50. On a longer thread it silently returns the oldest 50, so the
+     * "unbounded" tier is only correct below the default.
+     */
+    it('fires on plain fullHistory when the thread is longer than the default limit', async () => {
+      const parsed = await callGuard(createGuardMockSupabase(chronological(60)), {
+        fullHistory: true,
+      });
+      expect(parsed.messageCount).toBe(50);
+      expect(parsed.skippedNewerCount).toBe(10);
+    });
+
+    /**
+     * The control. Without it, a response that always warned would pass every
+     * assertion above while telling each caller its view was stale.
+     */
+    it('stays silent when nothing was cut', async () => {
+      const parsed = await callGuard(createGuardMockSupabase(chronological(12)), {
+        fullHistory: true,
+        limit: 50,
+      });
+      expect(parsed.messageCount).toBe(12);
+      expect(parsed.skippedNewerCount).toBeUndefined();
+      expect(parsed.truncatedFrom).toBeUndefined();
+      expect(parsed.truncationWarning).toBeUndefined();
+    });
+
+    /**
+     * The newest-first path cuts the other end and must keep using its own
+     * field — otherwise a caller cannot tell which half it is missing.
+     */
+    it('does not confuse the two directions', async () => {
+      const parsed = await callGuard(createGuardMockSupabase(chronological(20)), {
+        latestN: 5,
+      });
+      expect(parsed.skippedOlderCount).toBe(15);
+      expect(parsed.skippedNewerCount).toBeUndefined();
+    });
+  });
+
   it('latestN returns the newest N with visible skip accounting (no channelPoll)', async () => {
     const rows = Array.from({ length: 20 }, (_, i) => guardMsg(`m-${i}`, 1 + i));
     const parsed = await callGuard(createGuardMockSupabase(rows, { joinedAt: null }), {
