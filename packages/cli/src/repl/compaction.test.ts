@@ -141,17 +141,18 @@ describe('runCompaction', () => {
 
   it('persists the complete new start state BEFORE mutating the ledger', async () => {
     const ledger = ledgerOf(13);
-    let lengthAtPersist = -1;
+    let firstAtPersist = '';
     const events: Record<string, unknown>[] = [];
     const d = deps(ledger, {
       persist: (e) => {
-        lengthAtPersist = ledger.listEntries().length;
+        // The ledger is still the OLD state while the marker is written.
+        firstAtPersist = ledger.listEntries()[0]!.content;
         events.push(e);
       },
     });
     const out = await runCompaction({ reason: 'test', actor: 'sb', summaryText: 'brief' }, d);
     expect(out.ok).toBe(true);
-    expect(lengthAtPersist).toBe(13);
+    expect(firstAtPersist).toContain('entry 0');
     expect(ledger.listEntries()).toHaveLength(13); // 13 − 1 + summary
     expect(ledger.listEntries()[0]!.content).toContain('written by the agent');
     expect(events[0]).toMatchObject({ type: 'compaction', actor: 'sb', removedCount: 1 });
