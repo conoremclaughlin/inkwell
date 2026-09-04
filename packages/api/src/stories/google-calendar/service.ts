@@ -48,6 +48,72 @@ function bareDateToRfc3339(date: string, timezone: string): string {
   return `${date}T00:00:00${offset}`;
 }
 
+/**
+ * The RFC3339 instant that makes `endDate` INCLUSIVE.
+ *
+ * Google's `timeMax` is exclusive, and `endDate` was passed straight through
+ * `bareDateToRfc3339` — which resolves a bare date to midnight at the START of
+ * that day. So every range silently dropped its final day, and the same-day
+ * case (`start === end`) produced a zero-width window that returned nothing.
+ *
+ * It was filed for eleven days as "same-day queries return empty", because
+ * "what's on today" is the query anyone makes most and that is where it gets
+ * met. Same-day is only the degenerate case. The real defect cost Conor two
+ * Spravato appointments — Mon 14 and Wed 16 September — invisible from 25
+ * August to 4 September, and a false story built on their absence: that the
+ * series had been reshuffled, when the far edge of every window was simply
+ * being cut off (Myra, 2026-09-04).
+ *
+ * A bare `endDate` therefore advances one calendar day before conversion, so
+ * the window ends at midnight after it.
+ *
+ * The advance is done in UTC deliberately, and NOT because local-day arithmetic
+ * would be wrong here — I first wrote that it was, and mutating `setUTCDate(+1)`
+ * to `+ 24h` failed to break a single test, because a UTC day is always 24
+ * hours and the two are identical. The real reason is division of labour: doing
+ * the arithmetic on a bare date in UTC means DST cannot reach it at all, and
+ * the entire zone question is delegated to bareDateToRfc3339, which resolves a
+ * bare date to the correct offset FOR THAT DAY. That is where the DST
+ * correctness lives, and it is why the tests below assert offsets (-08:00 after
+ * the November fall-back, -07:00 after the March spring-forward) rather than
+ * asserting an arithmetic style.
+ *
+ * A full timestamp is passed through untouched. Someone who wrote an instant
+ * meant that instant, and silently extending it would be a second defect in the
+ * opposite direction.
+ */
+export function inclusiveEndToRfc3339(endDate: string, timezone: string): string {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(endDate)) return endDate;
+
+  // UTC arithmetic on the bare date: this only advances the calendar day, and
+  // the zone conversion is left entirely to bareDateToRfc3339.
+  const next = new Date(`${endDate}T00:00:00Z`);
+  next.setUTCDate(next.getUTCDate() + 1);
+  const nextBare = next.toISOString().slice(0, 10);
+
+  return bareDateToRfc3339(nextBare, timezone);
+}
+
+/**
+ * Both bounds of a query window, together.
+ *
+ * Returned as a pair so the asymmetry is testable: the START is the instant the
+ * first day begins, the END is the instant the day AFTER the last one begins.
+ * A fix that shifted the whole window by a day would satisfy any same-day test
+ * while quietly dropping the first day instead of the last — so the property
+ * that matters is the relationship between the two, not either alone.
+ */
+export function calendarWindow(
+  startDate: string,
+  endDate: string,
+  timezone: string
+): { timeMin: string; timeMax: string } {
+  return {
+    timeMin: bareDateToRfc3339(startDate, timezone),
+    timeMax: inclusiveEndToRfc3339(endDate, timezone),
+  };
+}
+
 export class GoogleCalendarService {
   private oauthService = getOAuthService();
 
@@ -117,8 +183,7 @@ export class GoogleCalendarService {
 
     const response = await calendar.events.list({
       calendarId,
-      timeMin: bareDateToRfc3339(startDate, timezone),
-      timeMax: bareDateToRfc3339(endDate, timezone),
+      ...calendarWindow(startDate, endDate, timezone),
       maxResults,
       q: query,
       singleEvents,
