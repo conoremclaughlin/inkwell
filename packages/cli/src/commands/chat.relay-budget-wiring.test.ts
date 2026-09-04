@@ -18,9 +18,7 @@ const loopCalls = [...source.matchAll(/await runAgentLoop\(\s*\{([\s\S]*?)\n\s*\
   (m) => m[1]!
 );
 const noteSpawn = source.slice(
-  source.indexOf(
-    'const noteSpawn = (result: BackendRunResult, ledgerIdBeforeSpawn: number): void => {'
-  ),
+  source.indexOf('const noteSpawn = ('),
   source.indexOf('/** The continuation spawn')
 );
 
@@ -33,13 +31,13 @@ describe('runAgentLoop hosts and their relay budgets', () => {
     for (const input of loopCalls) expect(input).toContain('relayBudgetBytes: () =>');
   });
 
-  it("each host hands its budget an occupancy from the provider's reports — native: the last occupancy; stateless: the last prompt plus the rendered bytes of entries added since (Lumen, rounds 6–11)", () => {
+  it("each host hands its budget an occupancy from the provider's reports — native: the last occupancy; stateless: the last prompt plus the rendered bytes of entries added since, within its generation (Lumen, rounds 6–13)", () => {
     const parent = loopCalls.find((c) => c.includes('relayOccupancy()'))!;
     const clone = loopCalls.find((c) => c.includes('cloneOccupancyTokens'))!;
     expect(parent).toBeDefined();
     expect(clone).toBeDefined();
     expect(source).toMatch(
-      /const relayOccupancy = \(\): number \| undefined => \{\s*if \(nativeSession\(\)\) return loopOccupancyTokens;\s*if \(statelessPromptTokens === undefined\) return undefined;\s*const addedBytes = ledger\s*\.listEntries\(\)\s*\.filter\(\(e\) => e\.id > ledgerMaxIdAtReport\)\s*\.reduce\(\(n, e\) => n \+ ledgerEntryPromptBytes\(e\), 0\);\s*return statelessPromptTokens \+ addedBytes;/
+      /const relayOccupancy = \(\): number \| undefined => \{\s*if \(nativeSession\(\)\) return loopOccupancyTokens;\s*if \(statelessPromptTokens === undefined\) return undefined;[\s\S]*?if \(statelessGenerationAtReport !== contextGeneration\) return undefined;\s*const addedBytes = ledger\s*\.listEntries\(\)\s*\.filter\(\(e\) => e\.id > ledgerMaxIdAtReport\)\s*\.reduce\(\(n, e\) => n \+ ledgerEntryPromptBytes\(e\), 0\);\s*return statelessPromptTokens \+ addedBytes;/
     );
     // Never a net total: an eviction of older entries cannot hide an addition.
     expect(source).not.toMatch(/ledger\.totalTokens\(\) - ledgerTokensAtReport/);
@@ -60,20 +58,20 @@ describe('runAgentLoop hosts and their relay budgets', () => {
     expect(source).toContain('const cloneMaxContextTokens = runtime.maxContextTokens;');
   });
 
-  it('a native spawn that reported nothing leaves the window UNKNOWN; a stateless one records the prompt count and the high-water id captured BEFORE the spawn (Lumen, rounds 7–12)', () => {
-    expect(source).toContain('noteSpawn(runResult, ledgerIdBeforeSpawn);');
-    expect(source).toContain('noteSpawn(contResult, ledgerIdBeforeSpawn);');
+  it('a native spawn that reported nothing leaves the window UNKNOWN; a stateless one records the prompt count, the high-water id and the generation captured BEFORE the spawn (Lumen, rounds 7–13)', () => {
+    expect(source).toContain('noteSpawn(runResult, ledgerIdBeforeSpawn, generationBeforeSpawn);');
+    expect(source).toContain('noteSpawn(contResult, ledgerIdBeforeSpawn, generationBeforeSpawn);');
     expect(noteSpawn).toMatch(
       /if \(nativeSession\(\)\) \{\s*loopOccupancyTokens = occupancyTokens\(runtime\.backend, result\.usage\);\s*return;\s*\}/
     );
     expect(noteSpawn).toMatch(
-      /statelessPromptTokens = promptTokensOf\(runtime\.backend, result\.usage\);[\s\S]*?ledgerMaxIdAtReport = ledgerIdBeforeSpawn;/
+      /statelessPromptTokens = promptTokensOf\(runtime\.backend, result\.usage\);[\s\S]*?ledgerMaxIdAtReport = ledgerIdBeforeSpawn;\s*statelessGenerationAtReport = generationBeforeSpawn;/
     );
     // Captured with request construction, before the awaited spawn — both paths.
     const initialCapture = source.indexOf('const ledgerIdBeforeSpawn = maxLedgerId();');
     const initialSpawn = source.indexOf('const turn = startBackendTurn({', initialCapture);
     expect(initialCapture).toBeGreaterThan(0);
-    expect(initialSpawn - initialCapture).toBeLessThan(120);
+    expect(initialSpawn - initialCapture).toBeLessThan(200);
     const contCapture = source.indexOf(
       'const ledgerIdBeforeSpawn = maxLedgerId();',
       initialCapture + 1
@@ -82,7 +80,7 @@ describe('runAgentLoop hosts and their relay budgets', () => {
       'const contTurn = startBackendTurn(continuationRequest(continuationPrompt));'
     );
     expect(contCapture).toBeGreaterThan(0);
-    expect(contSpawn - contCapture).toBeLessThan(120);
+    expect(contSpawn - contCapture).toBeLessThan(200);
     expect(contSpawn).toBeGreaterThan(contCapture);
     expect(source).not.toMatch(/ResidentBytes/);
     expect(source).toMatch(
@@ -94,9 +92,32 @@ describe('runAgentLoop hosts and their relay budgets', () => {
     expect(source).toMatch(/join\(CLONE_HISTORY_SEPARATOR\)/);
   });
 
-  it('a context-mutating local tool drops the stateless count to unknown until the next report (Lumen, round 12)', () => {
+  it('a session-wide context generation is bumped BEFORE any mutating call runs — parent or clone — and stateless counts are trusted only within their generation (Lumen, round 13)', () => {
     expect(source).toMatch(
-      /if \(CONTEXT_MUTATING_TOOLS\.has\(bareToolName\(result\.tool\)\)\) \{\s*statelessPromptTokens = undefined;\s*\}/
+      /const bumpContextGenerationFor = \(\s*calls: ReadonlyArray<\{ tool: string \}>\s*\): void => \{\s*if \(\s*calls\.some\(\(c\) => CONTEXT_MUTATING_TOOLS\.has\(bareToolName\(c\.tool\)\)\)\s*\)\s*contextGeneration \+= 1;/
     );
+    // Bumped ahead of execution in BOTH executors.
+    const firstBump = source.indexOf('bumpContextGenerationFor(calls);');
+    expect(firstBump).toBeGreaterThan(0);
+    expect(source.indexOf('executeToolCalls(', firstBump)).toBeGreaterThan(firstBump);
+    expect((source.match(/bumpContextGenerationFor\(calls\);/g) ?? []).length).toBe(2);
+    // Captured with request construction, before each spawn; stored at the report.
+    expect(source).toMatch(
+      /const generationBeforeSpawn = contextGeneration;\s*(?:beginSpawn\(\);\s*)?const turn = startBackendTurn\(\{/
+    );
+    expect(source).toMatch(
+      /const generationBeforeSpawn = contextGeneration;\s*const contTurn = startBackendTurn\(continuationRequest\(continuationPrompt\)\);/
+    );
+    expect(source).toMatch(
+      /const generationBeforeSpawn = contextGeneration;\s*const turn = startBackendTurn\(cloneRequest\(prompt, sessionArgs\)\);/
+    );
+    expect(source).toMatch(
+      /if \(statelessGenerationAtReport !== contextGeneration\) return undefined;/
+    );
+    expect(source).toMatch(
+      /cloneCanReuseSession \|\| cloneGenerationAtReport === contextGeneration\s*\? cloneOccupancyTokens\s*: undefined/
+    );
+    // The per-result invalidation is gone: the generation is the one mechanism.
+    expect(source).not.toMatch(/statelessPromptTokens = undefined;\s*\}\s*iterationResults\.push/);
   });
 });
