@@ -103,8 +103,13 @@ let isShuttingDown = false;
 /**
  * Route responses through the ChannelGateway.
  * This is called after SessionService processes a message and returns responses.
+ *
+ * `actingAgentId` is the SB whose session produced these responses. Runners
+ * build ChannelResponse objects by parsing transcript output and mostly cannot
+ * attribute them, so without a stamp here every routed message fell back to the
+ * channel's default SB. A response that already names its author keeps it.
  */
-async function routeResponses(responses: ChannelResponse[]): Promise<void> {
+async function routeResponses(responses: ChannelResponse[], actingAgentId?: string): Promise<void> {
   if (!channelGateway) {
     logger.warn('Cannot route responses - ChannelGateway not initialized');
     return;
@@ -112,7 +117,10 @@ async function routeResponses(responses: ChannelResponse[]): Promise<void> {
 
   for (const response of responses) {
     try {
-      await channelGateway.sendResponse(response);
+      await channelGateway.sendResponse({
+        ...response,
+        agentId: response.agentId ?? actingAgentId,
+      });
       logger.info(`Response routed to ${response.channel}:${response.conversationId}`, {
         contentLength: response.content.length,
       });
@@ -155,7 +163,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     mcpConfigPath,
     compactionEnabled: env.SERVER_COMPACTION_ENABLED,
     compactionThreshold: config.compactionThreshold || env.COMPACTION_THRESHOLD || 150000,
-    responseHandler: async (responses) => routeResponses(responses),
+    responseHandler: async (responses, actingAgentId) => routeResponses(responses, actingAgentId),
     ...(env.DEFAULT_CLAUDE_MODEL ? { defaultModel: env.DEFAULT_CLAUDE_MODEL } : {}),
     ...(env.DEFAULT_CODEX_MODEL ? { defaultCodexModel: env.DEFAULT_CODEX_MODEL } : {}),
     ...(env.DEFAULT_GEMINI_MODEL ? { defaultGeminiModel: env.DEFAULT_GEMINI_MODEL } : {}),
@@ -359,7 +367,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
 
     // Route any explicit send_response calls
     if (result.responses && result.responses.length > 0) {
-      await routeResponses(result.responses);
+      await routeResponses(result.responses, routedAgentId);
     }
 
     // For external channels (telegram/whatsapp), ensure the conversation is released
@@ -383,6 +391,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
         await channelGateway.releaseConversation(channel as GatewayChannel, conversationId, {
           content: result.finalTextResponse,
           format: 'markdown',
+          agentId: routedAgentId,
         });
       } else {
         // Just release the conversation (and process any pending messages)
@@ -686,7 +695,7 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
 
       // Route any responses
       if (result.responses && result.responses.length > 0) {
-        await routeResponses(result.responses);
+        await routeResponses(result.responses, reminderAgentId);
       }
 
       return result.success;
@@ -1519,7 +1528,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
     // should NOT emit trigger:error or send a "Trigger failed" notification.
     try {
       if (result.responses && result.responses.length > 0) {
-        await routeResponses(result.responses);
+        await routeResponses(result.responses, targetAgentId);
       }
     } catch (routeErr) {
       logger.error(

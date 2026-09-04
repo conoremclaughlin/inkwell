@@ -873,6 +873,110 @@ describe('Activity Stream Integration', () => {
       );
     });
 
+    it('credits the SB that authored the response, not the channel default', async () => {
+      // The bug this pins: agentId used to be the literal 'myra' on every
+      // Telegram send, so the column was constant rather than occasionally
+      // wrong — it looked like attribution while carrying no information.
+      // All 1259 message_out rows in production read 'myra' for this reason.
+      mockFindByPlatformId.mockResolvedValueOnce({ id: 'resolved-user-uuid' });
+
+      gateway.setMessageHandler(vi.fn().mockResolvedValue(undefined));
+      const forwardToHandler = (gateway as any).forwardToHandler.bind(gateway);
+      await forwardToHandler('telegram', '778001', { id: 'sender456' }, 'Incoming', {
+        chatType: 'direct',
+      });
+
+      (gateway as any).telegramListener = { sendMessage: vi.fn().mockResolvedValue(undefined) };
+      mockLogMessage.mockClear();
+
+      await gateway.sendResponse({
+        channel: 'telegram',
+        conversationId: '778001',
+        content: 'Wren speaking, not Myra',
+        agentId: 'wren',
+      });
+
+      expect(mockLogMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ agentId: 'wren', direction: 'out', platform: 'telegram' })
+      );
+    });
+
+    it('falls back to the channel default SB when no author is known', async () => {
+      // A channel-initiated send has no acting agent. Falling back is correct;
+      // inventing an author would be worse than a known-imprecise default.
+      mockFindByPlatformId.mockResolvedValueOnce({ id: 'resolved-user-uuid' });
+
+      gateway.setMessageHandler(vi.fn().mockResolvedValue(undefined));
+      const forwardToHandler = (gateway as any).forwardToHandler.bind(gateway);
+      await forwardToHandler('telegram', '778002', { id: 'sender456' }, 'Incoming', {
+        chatType: 'direct',
+      });
+
+      (gateway as any).telegramListener = { sendMessage: vi.fn().mockResolvedValue(undefined) };
+      mockLogMessage.mockClear();
+
+      await gateway.sendResponse({
+        channel: 'telegram',
+        conversationId: '778002',
+        content: 'No author supplied',
+      });
+
+      expect(mockLogMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ agentId: 'myra', direction: 'out' })
+      );
+    });
+
+    it('credits the acting SB on the auto-forwarded response, not the channel default', async () => {
+      // The auto-forward path (server.ts: no explicit send_response was called,
+      // so the turn's finalTextResponse is released through the gateway) built
+      // its AgentResponse from scratch and never carried an author. So the one
+      // path that fires when an SB *doesn't* call send_response — the common
+      // case for a plain conversational reply — was still credited to Myra.
+      // The explicit-send_response tests above passed throughout, which is why
+      // this needed its own regression.
+      mockFindByPlatformId.mockResolvedValueOnce({ id: 'resolved-user-uuid' });
+
+      gateway.setMessageHandler(vi.fn().mockResolvedValue(undefined));
+      const forwardToHandler = (gateway as any).forwardToHandler.bind(gateway);
+      await forwardToHandler('telegram', '778003', { id: 'sender456' }, 'Incoming', {
+        chatType: 'direct',
+      });
+
+      (gateway as any).telegramListener = { sendMessage: vi.fn().mockResolvedValue(undefined) };
+      mockLogMessage.mockClear();
+
+      await gateway.releaseConversation('telegram', '778003', {
+        content: 'Auto-forwarded final text',
+        format: 'markdown',
+        agentId: 'wren',
+      });
+
+      expect(mockLogMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ agentId: 'wren', direction: 'out', platform: 'telegram' })
+      );
+    });
+
+    it('falls back to the channel default when the auto-forward has no known author', async () => {
+      mockFindByPlatformId.mockResolvedValueOnce({ id: 'resolved-user-uuid' });
+
+      gateway.setMessageHandler(vi.fn().mockResolvedValue(undefined));
+      const forwardToHandler = (gateway as any).forwardToHandler.bind(gateway);
+      await forwardToHandler('telegram', '778004', { id: 'sender456' }, 'Incoming', {
+        chatType: 'direct',
+      });
+
+      (gateway as any).telegramListener = { sendMessage: vi.fn().mockResolvedValue(undefined) };
+      mockLogMessage.mockClear();
+
+      await gateway.releaseConversation('telegram', '778004', {
+        content: 'Auto-forwarded with no author',
+      });
+
+      expect(mockLogMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ agentId: 'myra', direction: 'out' })
+      );
+    });
+
     it('should not log outgoing message when userId is not in conversationUserMap', async () => {
       (gateway as any).telegramListener = {
         sendMessage: vi.fn().mockResolvedValue(undefined),

@@ -1919,7 +1919,10 @@ describe('SessionService', () => {
         }
       );
 
-      const session = createMockSession({ backendSessionId: 'claude-abc' });
+      // Deliberately NOT the default 'myra': that is the value the attribution
+      // bug produced on every channel, so asserting it here would pass whether
+      // the session's agent flows through or the router falls back.
+      const session = createMockSession({ backendSessionId: 'claude-abc', agentId: 'wren' });
       vi.mocked(mockRepository.findById).mockResolvedValue(session);
       vi.mocked(mockRepository.tryAcquireCompactionLock).mockResolvedValue(true);
 
@@ -1937,8 +1940,9 @@ describe('SessionService', () => {
 
       await serviceWithHandler.triggerCompaction('session-123');
 
-      // Phase 1: Compaction responses should be routed
-      expect(mockResponseHandler).toHaveBeenCalledWith(compactionResponses);
+      // Phase 1: Compaction responses should be routed, credited to the SB
+      // whose session is compacting.
+      expect(mockResponseHandler).toHaveBeenCalledWith(compactionResponses, 'wren');
       // Phase 2: Session should be marked as compacted after responses routed
       expect(mockRepository.markCompacted).toHaveBeenCalledWith('session-123', 'claude-abc');
     });

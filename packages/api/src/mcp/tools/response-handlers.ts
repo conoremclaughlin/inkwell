@@ -227,6 +227,12 @@ export async function handleSendResponse(
       if (resolvedVoice) metadata.ttsVoice = resolvedVoice;
     }
 
+    // The acting SB was already resolved for voice selection; carry it through
+    // so the activity stream can record who actually spoke instead of a
+    // per-channel literal.
+    const reqCtx = getRequestContext();
+    const authorAgentId = reqCtx?.agentId || getPinnedAgentId() || undefined;
+
     const response: AgentResponse = {
       channel: args.channel as ChannelType,
       conversationId: args.conversationId,
@@ -235,6 +241,7 @@ export async function handleSendResponse(
       replyToMessageId: args.replyToMessageId,
       metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
       media: args.media as OutboundMedia[] | undefined,
+      agentId: authorAgentId,
     };
 
     // Mark this conversation as having received an explicit response
@@ -257,6 +264,13 @@ export async function handleSendResponse(
             conversationId: args.conversationId,
             content: args.content,
             media: args.media,
+            // The author is resolved above and set on `response`, but this
+            // branch serializes a fresh body rather than sending that object —
+            // so the fallback silently dropped attribution while the local
+            // callback path preserved it. The receiver (Myra's send endpoint)
+            // lives outside this repo; a receiver that ignores the field is
+            // unaffected, one that reads it gets the real author.
+            agentId: authorAgentId,
           }),
         });
 

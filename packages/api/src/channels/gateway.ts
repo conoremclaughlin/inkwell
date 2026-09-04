@@ -691,6 +691,14 @@ export class ChannelGateway extends EventEmitter {
   async sendResponse(response: AgentResponse): Promise<ResponseResult | void> {
     const { channel, conversationId, content, format, replyToMessageId, media } = response;
 
+    // Who to credit in the activity stream. Prefer the SB that actually
+    // authored the response; fall back to the channel's default SB only when
+    // the author is genuinely unknown (a channel-initiated send). Previously
+    // this was a hardcoded literal per channel, which made the column
+    // constant — every outbound Telegram message read as Myra no matter who
+    // wrote it, and Slack wrote a non-existent 'slack' agent.
+    const authorFor = (channelDefault: string): string => response.agentId || channelDefault;
+
     // Stop typing indicator when sending response
     this.stopTypingIndicator(conversationId);
 
@@ -711,19 +719,31 @@ export class ChannelGateway extends EventEmitter {
         }
         if (await this.trySendTelegramVoiceReply(response)) {
           if (this.includeTextAfterVoiceReply) {
-            await this.sendTelegramMessage(conversationId, content, { format, replyToMessageId });
+            await this.sendTelegramMessage(conversationId, content, {
+              format,
+              replyToMessageId,
+              authorAgentId: response.agentId,
+            });
           } else {
-            await this.logOutgoingTelegram(conversationId, content);
+            await this.logOutgoingTelegram(conversationId, content, undefined, response.agentId);
           }
           break;
         }
 
         // Send text first (if any meaningful content), then media
         if (content && (!media || media.length === 0)) {
-          await this.sendTelegramMessage(conversationId, content, { format, replyToMessageId });
+          await this.sendTelegramMessage(conversationId, content, {
+            format,
+            replyToMessageId,
+            authorAgentId: response.agentId,
+          });
         } else if (media && media.length > 0) {
           if (content) {
-            await this.sendTelegramMessage(conversationId, content, { format, replyToMessageId });
+            await this.sendTelegramMessage(conversationId, content, {
+              format,
+              replyToMessageId,
+              authorAgentId: response.agentId,
+            });
           }
           mediaResult = await this.sendMediaAttachments('telegram', conversationId, media, {
             replyToMessageId,
@@ -734,7 +754,8 @@ export class ChannelGateway extends EventEmitter {
             content
               ? `[+${media.length} media attachment(s)] sent=${mediaResult.sent} failed=${mediaResult.failed}`
               : `[${media.length} media attachment(s)] sent=${mediaResult.sent} failed=${mediaResult.failed}`,
-            media
+            media,
+            response.agentId
           );
           if (mediaResult.failed > 0 && mediaResult.sent === 0) {
             throw new Error(
@@ -794,7 +815,7 @@ export class ChannelGateway extends EventEmitter {
               }
               await this.dataComposer.repositories.activityStream.logMessage({
                 userId,
-                agentId: 'myra',
+                agentId: authorFor('myra'),
                 direction: 'out',
                 content: logContent,
                 platform: 'whatsapp',
@@ -856,7 +877,7 @@ export class ChannelGateway extends EventEmitter {
               }
               await this.dataComposer.repositories.activityStream.logMessage({
                 userId,
-                agentId: 'benson',
+                agentId: authorFor('benson'),
                 direction: 'out',
                 content: logContent,
                 platform: 'discord',
@@ -914,7 +935,7 @@ export class ChannelGateway extends EventEmitter {
               }
               await this.dataComposer.repositories.activityStream.logMessage({
                 userId,
-                agentId: 'slack',
+                agentId: authorFor('benson'),
                 direction: 'out',
                 content: logContent,
                 platform: 'slack',
@@ -1004,7 +1025,7 @@ export class ChannelGateway extends EventEmitter {
   async releaseConversation(
     channel: GatewayChannel,
     conversationId: string,
-    autoResponse?: { content: string; format?: 'text' | 'markdown' }
+    autoResponse?: { content: string; format?: 'text' | 'markdown'; agentId?: string }
   ): Promise<void> {
     const key = this.getBufferKey(channel, conversationId);
 
@@ -1020,6 +1041,11 @@ export class ChannelGateway extends EventEmitter {
           conversationId,
           content: autoResponse.content,
           format: autoResponse.format,
+          // The auto-forward fires precisely when the SB did NOT call
+          // send_response, so this is the only place the author can come
+          // from. Dropping it credited every conversational reply to the
+          // channel's default SB.
+          agentId: autoResponse.agentId,
         });
       } catch (error) {
         logger.error(`Failed to send auto-response for ${key}:`, error);
@@ -1040,7 +1066,7 @@ export class ChannelGateway extends EventEmitter {
   private async sendTelegramMessage(
     conversationId: string,
     content: string,
-    options?: { format?: string; replyToMessageId?: string }
+    options?: { format?: string; replyToMessageId?: string; authorAgentId?: string }
   ): Promise<void> {
     if (!this.telegramListener) return;
 
@@ -1067,13 +1093,15 @@ export class ChannelGateway extends EventEmitter {
       parseMode,
     });
 
-    await this.logOutgoingTelegram(conversationId, content);
+    await this.logOutgoingTelegram(conversationId, content, undefined, options?.authorAgentId);
   }
 
   private async logOutgoingTelegram(
     conversationId: string,
     content: string,
-    media?: OutboundMedia[]
+    media?: OutboundMedia[],
+    /** SB that authored this send; falls back to the channel's default SB. */
+    authorAgentId?: string
   ): Promise<void> {
     // Log outgoing message to activity stream
     const userId = await this.resolveUserIdForConversation('telegram', conversationId);
@@ -1092,7 +1120,7 @@ export class ChannelGateway extends EventEmitter {
         }
         await this.dataComposer.repositories.activityStream.logMessage({
           userId,
-          agentId: 'myra',
+          agentId: authorAgentId || 'myra',
           direction: 'out',
           content,
           platform: 'telegram',
