@@ -25,6 +25,7 @@ import {
   MID_TURN_RESEED_OWN_OUTPUT_MAX_CHARS,
   MID_TURN_RESEED_MAX_CHARS,
   spawnDialogueText,
+  continuationSpawnArgs,
 } from './chat.js';
 import { MAX_RELAY_BYTES } from '../repl/agent-loop.js';
 import { ImitationPreviewGuard } from '../repl/preview-guard.js';
@@ -1040,5 +1041,27 @@ describe('findLastBackendSession — a mid-turn reseed marker is recovered like 
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('continuationSpawnArgs — the session argument a continuation spawn carries (Lumen, PR #577 final pass)', () => {
+  it('a resume carries backendSessionId and never re-delivers media', () => {
+    expect(continuationSpawnArgs({ mode: 'resume', id: 'S1' }, true)).toEqual({
+      sessionArgs: { backendSessionId: 'S1' },
+      deliverMedia: false,
+    });
+  });
+  it('a mid-turn seed carries backendSessionSeedId — never backendSessionId — and re-delivers the media it has', () => {
+    expect(continuationSpawnArgs({ mode: 'seed', id: 'N1' }, true)).toEqual({
+      sessionArgs: { backendSessionSeedId: 'N1' },
+      deliverMedia: true,
+    });
+    expect(continuationSpawnArgs({ mode: 'seed', id: 'N1' }, false).deliverMedia).toBe(false);
+  });
+  it('a stateless spawn carries neither', () => {
+    expect(continuationSpawnArgs({ mode: 'stateless' }, true)).toEqual({
+      sessionArgs: {},
+      deliverMedia: false,
+    });
   });
 });
