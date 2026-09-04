@@ -6936,7 +6936,6 @@ export async function runChat(options: ChatOptions): Promise<void> {
       lastRunResult = contResult;
       recordRunUsage(contResult.usage);
       sampleProviderContext(contResult.usage);
-      loopResidentChars += continuationPrompt.length + (contResult.responseText ?? '').length;
       // The BODY, not the packed prompt: a stateless provider re-packs the
       // ledger and bootstrap into every continuation, and counting that
       // again double-counted what the budget already subtracts (Lumen, PR
