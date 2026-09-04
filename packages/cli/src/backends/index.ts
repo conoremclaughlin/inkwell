@@ -20,10 +20,38 @@ const BACKENDS: Record<string, () => BackendAdapter> = {
 
 export const BACKEND_NAMES = Object.keys(BACKENDS);
 
+/**
+ * Backends that still resolve but are DEPRECATED FOR NOW, with the reason.
+ * gemini: the Gemini CLI now requires an enterprise plan, so it is not a
+ * backend an Inkling can rely on; Antigravity is the Google surface that
+ * matters (Conor, 2026-09-03). The adapter stays so old transcripts and
+ * configs keep working; selecting it warns once per process.
+ */
+export const DEPRECATED_BACKENDS: Readonly<Record<string, string>> = {
+  gemini:
+    'the Gemini CLI backend is deprecated for now — the Gemini CLI requires an enterprise plan; use claude or codex (Antigravity is the Google surface that matters)',
+};
+
+export function deprecatedBackendReason(name: string): string | undefined {
+  // Own properties only: an ordinary object indexed by arbitrary input would
+  // hand back inherited keys — `toString` a function, `__proto__` an object
+  // (Lumen, PR #585).
+  return Object.prototype.hasOwnProperty.call(DEPRECATED_BACKENDS, name)
+    ? DEPRECATED_BACKENDS[name]
+    : undefined;
+}
+
+const warnedDeprecated = new Set<string>();
+
 export function getBackend(name: string): BackendAdapter {
   const factory = BACKENDS[name];
   if (!factory) {
     throw new Error(`Unknown backend: ${name}. Available: ${BACKEND_NAMES.join(', ')}`);
+  }
+  const reason = deprecatedBackendReason(name);
+  if (reason && !warnedDeprecated.has(name)) {
+    warnedDeprecated.add(name);
+    process.stderr.write(`[ink] backend "${name}": ${reason}\n`);
   }
   return factory();
 }

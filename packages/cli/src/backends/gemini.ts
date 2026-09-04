@@ -1,4 +1,9 @@
 /**
+ * DEPRECATED FOR NOW — see DEPRECATED_BACKENDS in ./index.ts. The Gemini CLI
+ * requires an enterprise plan; the adapter is kept so existing transcripts and
+ * configs still resolve, and selecting it warns once per process.
+ */
+/**
  * Gemini CLI Backend Adapter
  *
  * Identity injection via GEMINI_SYSTEM_MD=<tmpfile> env var
