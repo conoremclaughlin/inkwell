@@ -208,7 +208,18 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
  * the byte bound: envelope, system prompt, tool instructions and media alike
  * (Lumen, PR #576 round 7).
  */
-export function measurePreparedPromptBytes(request: BackendRunRequest): number {
+/**
+ * Image tokens follow pixel dimensions, not compressed bytes: a 2048×2048
+ * lossless WebP is 220 bytes and ~3,000 tokens at high detail (Lumen, PR
+ * #576 round 9). Every attached file counts at least this many bytes at the
+ * one-token-per-byte bound — above the documented high-detail maxima.
+ */
+export const MEDIA_TOKEN_RESERVE_BYTES = 4_000;
+
+export function measurePreparedPromptBytes(
+  request: BackendRunRequest,
+  cwd: string = process.cwd()
+): number {
   const adapter = getBackend(request.backend);
   const promptParts = request.backend === 'codex' ? ['exec', request.prompt] : [request.prompt];
   const prepared = adapter.prepare({
@@ -233,20 +244,27 @@ export function measurePreparedPromptBytes(request: BackendRunRequest): number {
     // those whole. Their bytes count too (Lumen, PR #576 round 8); media is
     // counted by file size, which overstates image tokens and is therefore
     // the safe direction.
-    const fileBytes = [
-      ...(prepared.promptFiles ?? []),
-      ...(request.media ?? []).map((m) => m.path),
-    ].reduce((n, f) => {
+    const size = (f: string): number => {
       try {
-        return n + statSync(f).size;
+        return statSync(f).size;
       } catch {
-        return n;
+        return 0;
       }
-    }, 0);
+    };
+    const promptFileBytes = (prepared.promptFiles ?? []).reduce((n, f) => n + size(f), 0);
+    const mediaBytes = (request.media ?? []).reduce(
+      (n, m) => n + Math.max(size(m.path), MEDIA_TOKEN_RESERVE_BYTES),
+      0
+    );
+    // What the CLI discovers on its own from cwd — AGENTS.md / GEMINI.md, tool
+    // schemas — never appears in argv or stdin but reaches the model.
+    const hidden = adapter.hiddenContextBytes?.(cwd)?.bytes ?? 0;
     return (
       prepared.args.reduce((n, a) => n + Buffer.byteLength(a, 'utf8'), 0) +
       Buffer.byteLength(prepared.stdinData ?? '', 'utf8') +
-      fileBytes
+      promptFileBytes +
+      mediaBytes +
+      hidden
     );
   } finally {
     prepared.cleanup();

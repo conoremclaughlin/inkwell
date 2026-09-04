@@ -108,7 +108,26 @@ export interface PreparedBackend {
   promptFiles?: string[];
 }
 
+/**
+ * Instruction files a CLI discovers on its own from the working directory —
+ * Codex reads AGENTS.md from the repo root down to cwd (capped at its
+ * project_doc_max_bytes, 32 KiB by default), Gemini reads GEMINI.md the same
+ * way — plus the tool schemas it registers. None of that is in the prepared
+ * argv or stdin, yet all of it reaches the model (Lumen, PR #576 round 9).
+ */
+export interface HiddenContextEstimate {
+  bytes: number;
+  /** What was counted, for the log. */
+  detail: string;
+}
+
 export interface BackendAdapter {
+  /**
+   * Context the CLI adds by itself from `cwd` (discovered instruction files,
+   * tool schemas), in bytes at the one-token-per-byte bound. Adapters that
+   * discover nothing may omit it.
+   */
+  hiddenContextBytes?(cwd: string): HiddenContextEstimate;
   readonly name: string;
   readonly binary: string;
 
