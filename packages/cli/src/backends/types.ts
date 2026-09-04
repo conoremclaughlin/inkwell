@@ -98,6 +98,14 @@ export interface PreparedBackend {
    * prompt from args.
    */
   stdinData?: string;
+  /**
+   * Files the backend will READ as prompt context — an identity or
+   * instructions file written for this spawn, referenced from argv by path.
+   * Their bytes are part of what the spawn hands the model even though argv
+   * carries only the path (Lumen, PR #576 round 8); the relay-budget measurer
+   * counts them. Removed by `cleanup`.
+   */
+  promptFiles?: string[];
 }
 
 export interface BackendAdapter {

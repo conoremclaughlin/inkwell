@@ -2,6 +2,7 @@ import { spawnBackend } from '@inklabs/shared';
 import { getBackend } from '../backends/index.js';
 import type { BackendTurnEvent } from '../backends/stream.js';
 import type { TurnMedia } from '../backends/types.js';
+import { statSync } from 'fs';
 import { extractBackendTokenUsage, type BackendTokenUsage } from './token-usage.js';
 
 /**
@@ -227,9 +228,25 @@ export function measurePreparedPromptBytes(request: BackendRunRequest): number {
     deliverMedia: request.deliverMedia,
   });
   try {
+    // argv and stdin carry paths for what the adapter wrote to files — an
+    // identity/instructions file, attached media — and the backend reads
+    // those whole. Their bytes count too (Lumen, PR #576 round 8); media is
+    // counted by file size, which overstates image tokens and is therefore
+    // the safe direction.
+    const fileBytes = [
+      ...(prepared.promptFiles ?? []),
+      ...(request.media ?? []).map((m) => m.path),
+    ].reduce((n, f) => {
+      try {
+        return n + statSync(f).size;
+      } catch {
+        return n;
+      }
+    }, 0);
     return (
       prepared.args.reduce((n, a) => n + Buffer.byteLength(a, 'utf8'), 0) +
-      Buffer.byteLength(prepared.stdinData ?? '', 'utf8')
+      Buffer.byteLength(prepared.stdinData ?? '', 'utf8') +
+      fileBytes
     );
   } finally {
     prepared.cleanup();

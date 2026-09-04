@@ -172,6 +172,7 @@ export class GeminiAdapter implements BackendAdapter {
         ...(settings ? { GEMINI_CLI_SYSTEM_SETTINGS_PATH: settings.path } : {}),
       },
       cleanup,
+      promptFiles: [promptFile],
     };
   }
 }

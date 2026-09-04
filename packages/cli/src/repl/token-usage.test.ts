@@ -82,6 +82,33 @@ describe('Gemini usage fields (Lumen, PR #576 round 6)', () => {
     expect(usage?.totalTokens).toBe(92_500);
   });
 
+  it("REGRESSION (Lumen, round 8): OpenAI's reasoning is inside output — a synthesized total never adds it again", () => {
+    const usage = extractBackendTokenUsage(
+      'codex',
+      JSON.stringify({
+        usage: {
+          input_tokens: 1_000,
+          output_tokens: 500,
+          output_tokens_details: { reasoning_tokens: 200 },
+        },
+      }),
+      ''
+    );
+    expect(usage?.reasoningTokens).toBe(200);
+    expect(usage?.totalTokens).toBe(1_500);
+  });
+
+  it('REGRESSION (Lumen, round 8): a Gemini text summary with a thoughts label adds them to the total', () => {
+    const usage = extractBackendTokenUsage(
+      'gemini',
+      'prompt tokens: 90000, candidate tokens: 500, thoughts tokens: 2000',
+      ''
+    );
+    expect(usage?.source).toBe('text');
+    expect(usage?.reasoningTokens).toBe(2_000);
+    expect(usage?.totalTokens).toBe(92_500);
+  });
+
   it('thoughtsTokenCount and totalTokenCount are normalized', () => {
     const usage = extractBackendTokenUsage(
       'gemini',

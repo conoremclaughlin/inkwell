@@ -163,6 +163,7 @@ export class CodexAdapter implements BackendAdapter {
         ...(config.studioId ? { INK_STUDIO_ID: config.studioId } : {}),
       },
       cleanup,
+      promptFiles: [promptFile],
     };
   }
 }
