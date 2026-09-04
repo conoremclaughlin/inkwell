@@ -13,8 +13,6 @@ import { homedir } from 'os';
 import { createIdentityPromptFile } from './identity.js';
 import { encodeContextToken } from '@inklabs/shared';
 import type { BackendAdapter, BackendConfig, PreparedBackend } from './types.js';
-import { discoveredInstructionBytes, TOOL_SCHEMA_RESERVE_BYTES } from './discovered-context.js';
-import type { HiddenContextEstimate } from './types.js';
 
 /**
  * PCP headers to inject as env_http_headers on the "inkwell" MCP server.
@@ -37,22 +35,6 @@ const PCP_ENV_HEADERS: Array<{ header: string; envVar: string }> = [
 ];
 
 export class CodexAdapter implements BackendAdapter {
-  /** Codex's default project_doc_max_bytes: AGENTS.md is read up to this much. */
-  static readonly PROJECT_DOC_MAX_BYTES = 32 * 1024;
-
-  /**
-   * What Codex adds by itself: AGENTS.md from the repo root down to cwd
-   * (capped as Codex caps it) plus the schemas of the tools it registers —
-   * none of it visible in the prepared argv/stdin (Lumen, PR #576 round 9).
-   */
-  hiddenContextBytes(cwd: string): HiddenContextEstimate {
-    const docs = discoveredInstructionBytes(cwd, 'AGENTS.md', CodexAdapter.PROJECT_DOC_MAX_BYTES);
-    return {
-      bytes: docs.bytes + TOOL_SCHEMA_RESERVE_BYTES,
-      detail: `${docs.detail}; tool schemas reserve ${TOOL_SCHEMA_RESERVE_BYTES.toLocaleString()}`,
-    };
-  }
-
   readonly name = 'codex';
   readonly binary = 'codex';
   // Prompt rides argv (`codex exec <prompt>`) — bounded by OS ARG_MAX.
@@ -181,7 +163,6 @@ export class CodexAdapter implements BackendAdapter {
         ...(config.studioId ? { INK_STUDIO_ID: config.studioId } : {}),
       },
       cleanup,
-      promptFiles: [promptFile],
     };
   }
 }

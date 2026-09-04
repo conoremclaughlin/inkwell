@@ -14,8 +14,6 @@ import { tmpdir, homedir } from 'os';
 import { createIdentityPromptFile } from './identity.js';
 import { encodeContextToken } from '@inklabs/shared';
 import type { BackendAdapter, BackendConfig, PreparedBackend } from './types.js';
-import { discoveredInstructionBytes, TOOL_SCHEMA_RESERVE_BYTES } from './discovered-context.js';
-import type { HiddenContextEstimate } from './types.js';
 
 /**
  * Build a temp Gemini settings.json that merges Inkwell auth + session headers
@@ -88,15 +86,6 @@ function buildGeminiSettings(
 }
 
 export class GeminiAdapter implements BackendAdapter {
-  /** GEMINI.md from the repo root down to cwd (uncapped), plus tool schemas. */
-  hiddenContextBytes(cwd: string): HiddenContextEstimate {
-    const docs = discoveredInstructionBytes(cwd, 'GEMINI.md');
-    return {
-      bytes: docs.bytes + TOOL_SCHEMA_RESERVE_BYTES,
-      detail: `${docs.detail}; tool schemas reserve ${TOOL_SCHEMA_RESERVE_BYTES.toLocaleString()}`,
-    };
-  }
-
   readonly name = 'gemini';
   readonly binary = 'gemini';
   // Prompt rides argv (`-p <prompt>`) — bounded by OS ARG_MAX.
@@ -183,7 +172,6 @@ export class GeminiAdapter implements BackendAdapter {
         ...(settings ? { GEMINI_CLI_SYSTEM_SETTINGS_PATH: settings.path } : {}),
       },
       cleanup,
-      promptFiles: [promptFile],
     };
   }
 }

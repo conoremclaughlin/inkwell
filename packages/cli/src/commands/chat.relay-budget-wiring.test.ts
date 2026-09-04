@@ -31,19 +31,18 @@ describe('runAgentLoop hosts and their relay budgets', () => {
     for (const input of loopCalls) expect(input).toContain('relayBudgetBytes: () =>');
   });
 
-  it('each host hands its budget an occupancy: the report for a native session, the whole prepared spawn for a stateless one (Lumen, rounds 6–7)', () => {
+  it("each host hands its budget an occupancy from the provider's reports — native: the last occupancy; stateless: the last prompt plus ledger growth (Lumen, rounds 6–10)", () => {
     const parent = loopCalls.find((c) => c.includes('relayOccupancy()'))!;
     const clone = loopCalls.find((c) => c.includes('cloneOccupancyTokens'))!;
     expect(parent).toBeDefined();
+    expect(clone).toBeDefined();
     expect(source).toMatch(
-      /const relayOccupancy = \(\): number \| undefined =>\s*nativeSession\(\)\s*\? loopOccupancyTokens\s*: measurePreparedPromptBytes\(\s*continuationRequest\(buildPromptEnvelope\(agentId, runtime, ledger, ''\)\)\s*\);/
+      /const relayOccupancy = \(\): number \| undefined => \{\s*if \(nativeSession\(\)\) return loopOccupancyTokens;\s*if \(statelessPromptTokens === undefined\) return undefined;\s*const grownTokens = Math\.max\(0, ledger\.totalTokens\(\) - ledgerTokensAtReport\);\s*return statelessPromptTokens \+ grownTokens \* DEFAULT_CHARS_PER_TOKEN;/
     );
-    expect(clone).toMatch(
-      /measurePreparedPromptBytes\(\s*cloneRequest\(\[\.\.\.cloneHistory, ''\]\.join/
-    );
+    expect(source).not.toMatch(/measurePreparedPromptBytes|hiddenContextBytes|MEDIA_TOKEN_RESERVE/);
   });
 
-  it('the continuation spawn and the measurement share one request shape', () => {
+  it('the continuation and clone spawns go through their request builders', () => {
     expect(source).toContain(
       'const contTurn = startBackendTurn(continuationRequest(continuationPrompt));'
     );
@@ -57,15 +56,21 @@ describe('runAgentLoop hosts and their relay budgets', () => {
     expect(source).toContain('const cloneMaxContextTokens = runtime.maxContextTokens;');
   });
 
-  it('a native spawn that reported nothing leaves the window UNKNOWN — no stale checkpoint, no visible-text top-up (Lumen, round 7)', () => {
+  it('a native spawn that reported nothing leaves the window UNKNOWN; a stateless one records the prompt count and the ledger size (Lumen, rounds 7–10)', () => {
     expect(source).toContain('noteSpawn(runResult);');
     expect(source).toContain('noteSpawn(contResult);');
     expect(noteSpawn).toMatch(
-      /if \(!nativeSession\(\)\) return;\s*loopOccupancyTokens = occupancyTokens\(runtime\.backend, result\.usage\);/
+      /if \(nativeSession\(\)\) \{\s*loopOccupancyTokens = occupancyTokens\(runtime\.backend, result\.usage\);\s*return;\s*\}/
+    );
+    expect(noteSpawn).toMatch(
+      /statelessPromptTokens = promptTokensOf\(runtime\.backend, result\.usage\);\s*ledgerTokensAtReport = ledger\.totalTokens\(\);/
     );
     expect(source).not.toMatch(/ResidentBytes/);
     expect(source).toMatch(
-      /if \(cloneCanReuseSession\)\s*cloneOccupancyTokens = occupancyTokens\(cloneBackend, result\.usage\);/
+      /cloneOccupancyTokens = cloneCanReuseSession\s*\?\s*occupancyTokens\(cloneBackend, result\.usage\)/
+    );
+    expect(source).toMatch(
+      /const prompt = promptTokensOf\(cloneBackend, result\.usage\);\s*return prompt === undefined \? undefined : prompt \+ utf8Bytes\(text\);/
     );
   });
 });

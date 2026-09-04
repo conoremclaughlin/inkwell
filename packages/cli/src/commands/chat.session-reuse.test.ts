@@ -15,6 +15,7 @@ import {
   RELAY_BYTES_PER_TOKEN,
   RELAY_HEADROOM_SHARE,
   occupancyTokens,
+  promptTokensOf,
 } from './chat.js';
 import { MAX_RELAY_BYTES } from '../repl/agent-loop.js';
 import { ContextLedger } from '../repl/context-ledger.js';
@@ -776,6 +777,26 @@ describe('relayBudgetBytes — the relay budget follows the live headroom (Lumen
 
   it('never starves a relay: a window past its budget still gets the minimum — the documented exception', () => {
     expect(relayBudgetBytes(runtime, 200_000)).toBe(MIN_RELAY_BUDGET_BYTES);
+  });
+});
+
+describe("promptTokensOf — the provider's own count of what it was handed (Lumen, PR #576 round 10)", () => {
+  it('Anthropic: input + cache read + cache write; the reply is not included', () => {
+    expect(
+      promptTokensOf('claude', {
+        inputTokens: 1_000,
+        cacheReadTokens: 100_000,
+        cacheWriteTokens: 5_000,
+      })
+    ).toBe(106_000);
+  });
+  it('OpenAI/Gemini: the prompt count alone — cache already inside it, reply and reasoning never', () => {
+    expect(promptTokensOf('codex', { inputTokens: 90_000, cacheReadTokens: 80_000 })).toBe(90_000);
+    expect(promptTokensOf('gemini', { inputTokens: 90_000 })).toBe(90_000);
+  });
+  it('undefined without a prompt count', () => {
+    expect(promptTokensOf('codex', undefined)).toBeUndefined();
+    expect(promptTokensOf('codex', {})).toBeUndefined();
   });
 });
 

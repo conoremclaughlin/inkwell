@@ -61,7 +61,6 @@ import {
   startBackendTurn,
   runBackendTurn,
   type BackendRunResult,
-  measurePreparedPromptBytes,
   type BackendRunRequest,
 } from '../repl/backend-runner.js';
 import { StreamedTurnRenderer, type StreamedLine } from '../repl/paragraph-stream.js';
@@ -76,6 +75,7 @@ import {
   type LedgerReplayMeta,
   type LedgerRole,
 } from '../repl/context-ledger.js';
+import { DEFAULT_CHARS_PER_TOKEN } from '../repl/context-ledger.js';
 import {
   resolveModelContextWindow as resolveBackendTokenWindow,
   contextBudgetForWindow as defaultContextBudget,
@@ -2849,6 +2849,29 @@ export function occupancyTokens(
 }
 
 /**
+ * The PROMPT part of a report — what the provider counted as handed to the
+ * model, discovered instruction files, tool schemas and media included — per
+ * backend accounting: input + cache parts for Anthropic, input alone for
+ * OpenAI/Gemini (whose input already includes the cache). A stateless
+ * parent's next envelope is this plus what the ledger grew since; the reply
+ * is not re-sent and is not counted (Lumen, PR #576 rounds 5–10).
+ */
+export function promptTokensOf(
+  backend: string,
+  usage: Pick<BackendTokenUsage, 'inputTokens' | 'cacheReadTokens' | 'cacheWriteTokens'> | undefined
+): number | undefined {
+  if (!usage) return undefined;
+  const name = backend.toLowerCase();
+  if (name === 'claude' || name === 'anthropic') {
+    const parts = [usage.inputTokens, usage.cacheReadTokens, usage.cacheWriteTokens].filter(
+      (n): n is number => n !== undefined
+    );
+    return parts.length ? parts.reduce((a, b) => a + b, 0) : undefined;
+  }
+  return usage.inputTokens;
+}
+
+/**
  * How many UTF-8 bytes the next relay message may be, from the window's live
  * headroom: the window minus what it holds, times RELAY_HEADROOM_SHARE, at
  * RELAY_BYTES_PER_TOKEN — clamped between MIN_RELAY_BUDGET_BYTES and
@@ -2858,10 +2881,12 @@ export function occupancyTokens(
  * session the provider's own count after the last reply — and NOTHING once a
  * later spawn reported no usage, because hidden thinking that was never
  * reported cannot be recovered from visible text (Lumen, PR #576 round 7);
- * for a stateless parent the UTF-8 bytes of exactly what the next spawn will
- * hand the backend — the prepared argv and stdin, system prompt, tool
- * instructions and media included — measured at budget time. With no
- * occupancy the relay gets the floor.
+ * for a stateless parent the previous request's PROMPT tokens as the provider
+ * counted them (system prompt, discovered instruction files, tool schemas and
+ * media included — nothing ink could measure from outside bounds those; Lumen,
+ * PR #576 rounds 7–10) plus what the ledger grew since that report, at the
+ * byte bound; the previous body is inside that count and is not re-sent, which
+ * is slack in the safe direction. With no occupancy the relay gets the floor.
  *
  * The bound is exact for the relay string. The floor is the one deliberate
  * exception: at exhausted headroom the model still receives a
@@ -5262,9 +5287,15 @@ export async function runChat(options: ChatOptions): Promise<void> {
       // window. Either way this is what the next relay must fit beside.
       // A native clone session: the report covers everything so far; a spawn
       // that reported nothing leaves it unknown (the floor) until the next
-      // report. A stateless clone is measured at budget time from exactly
-      // what its next spawn would send.
-      if (cloneCanReuseSession) cloneOccupancyTokens = occupancyTokens(cloneBackend, result.usage);
+      // report. A stateless clone re-packs its history: the report's prompt
+      // covered the history and body sent, and the reply now joins the
+      // history, so it is added at the byte bound.
+      cloneOccupancyTokens = cloneCanReuseSession
+        ? occupancyTokens(cloneBackend, result.usage)
+        : (() => {
+            const prompt = promptTokensOf(cloneBackend, result.usage);
+            return prompt === undefined ? undefined : prompt + utf8Bytes(text);
+          })();
       if (!cloneCanReuseSession && text.trim()) cloneHistory.push(text.trim());
       appendTranscript(record.transcriptPath, {
         type: 'backend_turn',
@@ -5317,14 +5348,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           // holds. Without this it took the static 200K default (Lumen, PR
           // #576 round 3).
           relayBudgetBytes: () =>
-            relayBudgetBytes(
-              { maxContextTokens: cloneMaxContextTokens },
-              cloneCanReuseSession
-                ? cloneOccupancyTokens
-                : measurePreparedPromptBytes(
-                    cloneRequest([...cloneHistory, ''].join('\n\n---\n\n'))
-                  )
-            ),
+            relayBudgetBytes({ maxContextTokens: cloneMaxContextTokens }, cloneOccupancyTokens),
         },
         {
           ui: {
@@ -6355,19 +6379,28 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // received. The relay budget shrinks by it, or each iteration re-grants
     // the same allowance while the window fills (Lumen, PR #576 round 3).
     let loopOccupancyTokens: number | undefined;
+    // A stateless parent: the last report's prompt tokens and the ledger size
+    // it was taken at, so growth since is added at the byte bound.
+    let statelessPromptTokens: number | undefined;
+    let ledgerTokensAtReport = 0;
     const nativeSession = (): boolean => Boolean(canReuseBackendSession && activeBackendSessionId);
     /**
-     * After each spawn of a NATIVE session: the provider's own occupancy when
-     * it reported one — it then covers everything sent and received so far,
-     * hidden thinking included. A spawn that reported nothing leaves the
-     * window UNKNOWN until the next report: what it added cannot be recovered
-     * from visible text, so the relay falls to the floor rather than trust a
-     * stale checkpoint (Lumen, PR #576 rounds 5–7). A stateless parent is
-     * measured directly (relayOccupancy below).
+     * After each spawn. NATIVE session: the provider's own occupancy when it
+     * reported one — everything sent and received so far, hidden thinking
+     * included — else UNKNOWN until the next report (what an unreported spawn
+     * added cannot be recovered from visible text). STATELESS parent: the
+     * report's prompt tokens — the provider's own count of the envelope, with
+     * discovered files, tool schemas and media inside it — and the ledger
+     * size at that moment; the reply is not re-sent and is not counted
+     * (Lumen, PR #576 rounds 5–10).
      */
     const noteSpawn = (result: BackendRunResult): void => {
-      if (!nativeSession()) return;
-      loopOccupancyTokens = occupancyTokens(runtime.backend, result.usage);
+      if (nativeSession()) {
+        loopOccupancyTokens = occupancyTokens(runtime.backend, result.usage);
+        return;
+      }
+      statelessPromptTokens = promptTokensOf(runtime.backend, result.usage);
+      ledgerTokensAtReport = ledger.totalTokens();
     };
     /** The continuation spawn's request; the budget measures the same shape. */
     const continuationRequest = (prompt: string): BackendRunRequest => ({
@@ -6397,18 +6430,15 @@ export async function runChat(options: ChatOptions): Promise<void> {
     });
     /**
      * What the window holds for the next relay — see relayBudgetBytes. A
-     * stateless parent's is the bytes of exactly what its next spawn would
-     * hand the backend, prepared and cleaned up without spawning: the
-     * envelope of the ledger PLUS the adapter's system prompt, tool
-     * instructions and media (a 30K-character system override measured
-     * 3,602 by the envelope alone; Lumen, PR #576 round 7).
+     * stateless parent's next envelope is the last report's prompt plus the
+     * ledger's growth since, at the byte bound (chars as bytes).
      */
-    const relayOccupancy = (): number | undefined =>
-      nativeSession()
-        ? loopOccupancyTokens
-        : measurePreparedPromptBytes(
-            continuationRequest(buildPromptEnvelope(agentId, runtime, ledger, ''))
-          );
+    const relayOccupancy = (): number | undefined => {
+      if (nativeSession()) return loopOccupancyTokens;
+      if (statelessPromptTokens === undefined) return undefined;
+      const grownTokens = Math.max(0, ledger.totalTokens() - ledgerTokensAtReport);
+      return statelessPromptTokens + grownTokens * DEFAULT_CHARS_PER_TOKEN;
+    };
 
     const runTurnForLoop = async (
       body: string,
