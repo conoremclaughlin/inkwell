@@ -2201,9 +2201,12 @@ describe('REGRESSION (Lumen, PR #576 round 3): the ceiling holds even when the f
     const body = buildContinuationBody(results, [], undefined, { budgetBytes: 40 });
     expect(Buffer.byteLength(body)).toBeLessThanOrEqual(40);
     expect(body.endsWith(RELAY_CUT_MARKER)).toBe(true);
-    // Below the marker itself, the marker is all that survives: the floor.
+    // Below the marker's own size, the marker cut to the budget — the caller's
+    // cap is never exceeded (Lumen, round 5).
     const tiny = buildContinuationBody(results, [], undefined, { budgetBytes: 5 });
-    expect(tiny).toBe(RELAY_CUT_MARKER);
+    expect(Buffer.byteLength(tiny)).toBeLessThanOrEqual(5);
+    expect(RELAY_CUT_MARKER.startsWith(tiny)).toBe(true);
+    expect(tiny.length).toBeGreaterThan(0);
   });
 
   it('a results block that fits is untouched — no note, every result whole', () => {
@@ -2239,8 +2242,9 @@ describe('REGRESSION (Lumen, PR #576 round 4): the cap covers the COMPLETE relay
     expect(bytes(cont)).toBeLessThanOrEqual(8_000);
     const relay = buildFinalRelayBody(results, selection, { budgetBytes: 8_000 });
     expect(bytes(relay)).toBeLessThanOrEqual(8_000);
-    // The dropped list names a bounded few and counts the rest.
-    expect(cont).toContain(`and ${45 - MAX_NAMED_DROPPED} more`);
+    // The dropped list names a bounded few (by count AND bytes) and counts the rest.
+    expect(cont).toMatch(/and \d+ more/);
+    expect(cont).not.toContain('n'.repeat(100));
   });
 
   it('the default ceiling is on the whole message too', () => {
@@ -2264,5 +2268,55 @@ describe('REGRESSION (Lumen, PR #576 round 4): the cap covers the COMPLETE relay
       // Round-tripping through UTF-8 is lossless only when no surrogate was split.
       expect(Buffer.from(body, 'utf8').toString('utf8')).toBe(body);
     }
+  });
+});
+
+describe('REGRESSION (Lumen, PR #576 round 5): names are bounded in bytes, not only in count', () => {
+  const huge = (n: number): string => 'x'.repeat(n);
+  const bytes = (text: string): number => Buffer.byteLength(text, 'utf8');
+
+  it('nine 1,000-character dropped names at the 4K floor leave the result block and the tail intact', () => {
+    const results = [{ tool: 't0', result: huge(2_000), status: 'executed' }];
+    const dropped = Array.from({ length: 9 }, (_, i) => ({
+      tool: `${'n'.repeat(1_000)}_${i}`,
+      args: {},
+      raw: '',
+    }));
+    const selection = { emitted: 10, reached: 1, dropped, unmatched: 0 };
+    for (const build of [
+      () => buildContinuationBody(results, [], selection, { budgetBytes: 4_000 }),
+      () => buildFinalRelayBody(results, selection, { budgetBytes: 4_000 }),
+    ]) {
+      const body = build();
+      expect(bytes(body)).toBeLessThanOrEqual(4_000);
+      expect(body).toContain('Tool t0 (executed):');
+      expect(body).toMatch(/and \d+ more/);
+      expect(body).toMatch(/final answer\.?$|reporting the work as done\.$/);
+    }
+  });
+
+  it('the dropped list is bounded in BYTES: nine 62-byte names name seven and count two', () => {
+    // Each name cuts to 48 bytes + an ellipsis (51 bytes); 51 + 6 × 53 = 369
+    // fits MAX_DROPPED_LIST_BYTES (400), an eighth would not.
+    const dropped = Array.from({ length: 9 }, (_, i) => ({
+      tool: `${'n'.repeat(60)}_${i}`,
+      args: {},
+      raw: '',
+    }));
+    const selection = { emitted: 10, reached: 1, dropped, unmatched: 0 };
+    const body = buildContinuationBody(
+      [{ tool: 't0', result: 'ok', status: 'executed' }],
+      [],
+      selection
+    );
+    expect(body).toContain('and 2 more');
+    expect(body).not.toContain('and 1 more');
+  });
+
+  it('a note names a long tool by a bounded prefix', () => {
+    const results = [{ tool: 'a'.repeat(500), result: huge(50_000), status: 'executed' }];
+    const body = buildContinuationBody(results, [], undefined, { budgetBytes: 600 });
+    expect(bytes(body)).toBeLessThanOrEqual(600);
+    expect(body).not.toContain('a'.repeat(200));
   });
 });

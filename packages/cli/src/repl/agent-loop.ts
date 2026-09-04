@@ -376,15 +376,28 @@ export function cutUtf8(text: string, maxBytes: number): string {
  */
 export const RELAY_CUT_MARKER = '…[ink: cut]';
 
-/** `text` within `budget` bytes, ending in the note or, failing that, the marker. */
+/**
+ * `text` within `budget` bytes, ending in the note or, failing that, the
+ * marker. The minimum-budget contract: below the marker's own size, what
+ * comes back is the marker cut to the budget — the caller's cap is never
+ * exceeded, and what survives is still recognisably a cut, not content
+ * (Lumen, PR #576 round 5).
+ */
 function cutWithMarker(text: string, budget: number, note: string): string {
+  if (budget < utf8Bytes(RELAY_CUT_MARKER)) return cutUtf8(RELAY_CUT_MARKER, budget);
   const tail = utf8Bytes(note) < budget ? note : RELAY_CUT_MARKER;
   return cutUtf8(text, Math.max(0, budget - utf8Bytes(tail))) + tail;
 }
 
+/** A tool name for a note: cut to MAX_NAME_BYTES, with an ellipsis when cut. */
+function shortName(name: string): string {
+  const cut = cutUtf8(name, MAX_NAME_BYTES);
+  return cut.length < name.length ? `${cut}…` : cut;
+}
+
 function cutNote(budget: number, results: ReadonlyArray<ToolResultRecord>): string {
   const tools = Array.from(new Set(results.map((r) => r.tool)));
-  const named = tools.slice(0, 5).join(', ') + (tools.length > 5 ? ', …' : '');
+  const named = tools.slice(0, 5).map(shortName).join(', ') + (tools.length > 5 ? ', …' : '');
   return (
     `\n…[ink: relay cut at its ${budget.toLocaleString()}-byte budget — ` +
     `${results.length} results (${named}); every payload is in this session's transcript.]`
@@ -417,11 +430,12 @@ function renderToolResults(
 
 function renderToolResult(r: ToolResultRecord, maxBytes: number): string {
   const resultStr = typeof r.result === 'string' ? r.result : JSON.stringify(r.result);
-  if (resultStr === undefined) return `Tool ${r.tool} (${r.status}): undefined`;
+  const tool = shortName(r.tool);
+  if (resultStr === undefined) return `Tool ${tool} (${r.status}): undefined`;
   const size = utf8Bytes(resultStr);
-  if (size <= maxBytes) return `Tool ${r.tool} (${r.status}): ${resultStr}`;
+  if (size <= maxBytes) return `Tool ${tool} (${r.status}): ${resultStr}`;
   return (
-    `Tool ${r.tool} (${r.status}): ${cutUtf8(resultStr, maxBytes)}\n` +
+    `Tool ${tool} (${r.status}): ${cutUtf8(resultStr, maxBytes)}\n` +
     `…[ink: result truncated — ${size.toLocaleString()} bytes total, ` +
     `${maxBytes.toLocaleString()} shown; the full payload is in this session's transcript. ` +
     'Ask for less next time (page, filter, or narrow the query).]'
@@ -430,16 +444,30 @@ function renderToolResult(r: ToolResultRecord, maxBytes: number): string {
 
 /** At most this many dropped-call names are listed; the rest are counted. */
 export const MAX_NAMED_DROPPED = 8;
+/** A name in a note is cut here; nine 1,000-byte names erased a 4K relay (Lumen, round 5). */
+export const MAX_NAME_BYTES = 48;
+/** The whole dropped-name list is bounded in bytes too, not only in count. */
+export const MAX_DROPPED_LIST_BYTES = 400;
 
 /**
- * Dropped calls by name, bounded: 45 dropped calls with 400-character names
- * were 18K of framing on their own (Lumen, PR #576 round 4). Naming beats
- * counting only while the names fit.
+ * Dropped calls by name, bounded in count AND bytes: 45 dropped calls with
+ * 400-character names were 18K of framing on their own (Lumen, PR #576
+ * round 4), and bounding the count alone let nine 1,000-character names
+ * erase the result block at the floor (round 5). Naming beats counting only
+ * while the names fit.
  */
 function listDropped(dropped: ReadonlyArray<{ tool: string }>): string {
-  const names = dropped.slice(0, MAX_NAMED_DROPPED).map((c) => c.tool);
+  const names: string[] = [];
+  let bytes = 0;
+  for (const call of dropped.slice(0, MAX_NAMED_DROPPED)) {
+    const name = shortName(call.tool);
+    const cost = utf8Bytes(name) + (names.length > 0 ? 2 : 0);
+    if (bytes + cost > MAX_DROPPED_LIST_BYTES) break;
+    names.push(name);
+    bytes += cost;
+  }
   const more = dropped.length - names.length;
-  return names.join(', ') + (more > 0 ? `, and ${more} more` : '');
+  return names.join(', ') + (more > 0 ? `${names.length > 0 ? ', ' : ''}and ${more} more` : '');
 }
 
 /**

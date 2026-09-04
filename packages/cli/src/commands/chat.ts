@@ -70,6 +70,7 @@ import {
   type LedgerReplayMeta,
   type LedgerRole,
 } from '../repl/context-ledger.js';
+import { DEFAULT_CHARS_PER_TOKEN } from '../repl/context-ledger.js';
 import {
   resolveModelContextWindow as resolveBackendTokenWindow,
   contextBudgetForWindow as defaultContextBudget,
@@ -2801,28 +2802,70 @@ export const MIN_RELAY_BUDGET_BYTES = 4_000;
 const utf8Bytes = (text: string): number => Buffer.byteLength(text, 'utf8');
 
 /**
+ * What the provider's session holds after a reply, by its own accounting:
+ * the prompt it was handed (input + cache parts for Anthropic, whose cache
+ * fields are disjoint from input; input alone for OpenAI/Gemini, whose input
+ * already includes the cache) plus the reply it produced — including hidden
+ * thinking, which no byte count of the visible text could see (Lumen, PR
+ * #576 round 5). Undefined when the backend reported nothing usable.
+ */
+export function occupancyTokens(
+  backend: string,
+  usage:
+    | Pick<
+        BackendTokenUsage,
+        'inputTokens' | 'cacheReadTokens' | 'cacheWriteTokens' | 'outputTokens'
+      >
+    | undefined
+): number | undefined {
+  if (!usage) return undefined;
+  const summedCache = backend.toLowerCase() === 'claude' || backend.toLowerCase() === 'anthropic';
+  const prompt = summedCache
+    ? [usage.inputTokens, usage.cacheReadTokens, usage.cacheWriteTokens].filter(
+        (n): n is number => n !== undefined
+      )
+    : usage.inputTokens !== undefined
+      ? [usage.inputTokens]
+      : [];
+  if (prompt.length === 0) return undefined;
+  return prompt.reduce((a, b) => a + b, 0) + (usage.outputTokens ?? 0);
+}
+
+/**
  * How many UTF-8 bytes the next relay message may be, from the window's live
- * headroom: what the budget leaves after the identity context, the ledger,
- * and what this turn's loop has already put in the provider's context
- * (`residentBytes` — continuation bodies and intermediate replies, which
- * reach the ledger only after the loop returns; counted at the same
- * one-token-per-byte bound), times RELAY_HEADROOM_SHARE, at
+ * headroom: the window minus what it holds, times RELAY_HEADROOM_SHARE, at
  * RELAY_BYTES_PER_TOKEN — clamped between MIN_RELAY_BUDGET_BYTES and
- * MAX_RELAY_BYTES. A static ceiling was only safe while the window had that
- * much room; after the pre-turn compaction check a 128K/200K window may not
- * (Lumen, PR #576 rounds 2–4).
+ * MAX_RELAY_BYTES.
+ *
+ * What it holds is `occupancyTokens` — the provider's own count after the
+ * last reply — when the backend reported one, plus `residentBytes` sent or
+ * received since that report (native sessions only; a stateless parent
+ * re-packs from the ledger, so nothing accumulates), at one token per byte.
+ * Without a report, the fallback is the packed prompt's own bytes at the
+ * same bound: identity context plus the ledger, which for any real session
+ * means the floor. A backend that reports nothing gets no benefit of the
+ * doubt.
+ *
+ * The bound is exact for the relay string. The floor is the one deliberate
+ * exception: at exhausted headroom the model still receives a
+ * MIN_RELAY_BUDGET_BYTES receipt of what ran, because a silent loop is worse
+ * than a small overrun; the pre-turn compaction threshold is what keeps
+ * headroom from reaching zero (Lumen, PR #576 rounds 2–5).
  */
 export function relayBudgetBytes(
   runtime: Pick<ChatRuntime, 'maxContextTokens' | 'bootstrapContext'>,
   ledger: Pick<ContextLedger, 'totalTokens'>,
-  residentBytes = 0
+  residentBytes = 0,
+  occupancyTokens?: number
 ): number {
-  const bootstrapReserve = runtime.bootstrapContext ? estimateTokens(runtime.bootstrapContext) : 0;
+  const packedPromptBytes =
+    utf8Bytes(runtime.bootstrapContext ?? '') + ledger.totalTokens() * DEFAULT_CHARS_PER_TOKEN;
+  const occupied =
+    occupancyTokens !== undefined
+      ? Math.max(0, occupancyTokens)
+      : Math.ceil(packedPromptBytes / RELAY_BYTES_PER_TOKEN);
   const residentTokens = Math.ceil(Math.max(0, residentBytes) / RELAY_BYTES_PER_TOKEN);
-  const remainingTokens = Math.max(
-    0,
-    runtime.maxContextTokens - bootstrapReserve - ledger.totalTokens() - residentTokens
-  );
+  const remainingTokens = Math.max(0, runtime.maxContextTokens - occupied - residentTokens);
   const bytes = Math.floor(remainingTokens * RELAY_BYTES_PER_TOKEN * RELAY_HEADROOM_SHARE);
   return Math.min(MAX_RELAY_BYTES, Math.max(MIN_RELAY_BUDGET_BYTES, bytes));
 }
@@ -5153,6 +5196,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     const cloneSignal = createSignalSink();
     /** What the clone's window holds beyond its ledger — see relayBudgetBytes. */
     let cloneResidentBytes = 0;
+    let cloneOccupancyTokens: number | undefined;
 
     const cloneRunTurn = async (
       body: string,
@@ -5203,9 +5247,15 @@ export async function runChat(options: ChatOptions): Promise<void> {
       // A native session accumulates every body and reply; a stateless one
       // re-packs its history into each prompt, so the latest prompt IS the
       // window. Either way this is what the next relay must fit beside.
-      cloneResidentBytes = cloneCanReuseSession
-        ? cloneResidentBytes + utf8Bytes(prompt) + utf8Bytes(text)
-        : utf8Bytes(prompt) + utf8Bytes(text);
+      const cloneOccupancy = occupancyTokens(cloneBackend, result.usage);
+      if (cloneOccupancy !== undefined) {
+        cloneOccupancyTokens = cloneOccupancy;
+        cloneResidentBytes = 0;
+      } else {
+        cloneResidentBytes = cloneCanReuseSession
+          ? cloneResidentBytes + utf8Bytes(prompt) + utf8Bytes(text)
+          : utf8Bytes(prompt) + utf8Bytes(text);
+      }
       if (!cloneCanReuseSession && text.trim()) cloneHistory.push(text.trim());
       appendTranscript(record.transcriptPath, {
         type: 'backend_turn',
@@ -5261,7 +5311,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
             relayBudgetBytes(
               { maxContextTokens: cloneMaxContextTokens, bootstrapContext: cloneIdentityPrompt },
               cloneLedgerFor(record.transcriptPath),
-              cloneResidentBytes
+              cloneResidentBytes,
+              cloneOccupancyTokens
             ),
         },
         {
@@ -6293,6 +6344,25 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // received. The relay budget shrinks by it, or each iteration re-grants
     // the same allowance while the window fills (Lumen, PR #576 round 3).
     let loopResidentBytes = 0;
+    let loopOccupancyTokens: number | undefined;
+    /**
+     * After each spawn: the provider's own occupancy when it reported one —
+     * it then covers everything sent and received so far, hidden thinking
+     * included — else, for a native session only, the body and the reply
+     * are new to the window. A stateless parent re-packs from the ledger
+     * each time, so nothing accumulates (Lumen, PR #576 round 5).
+     */
+    const noteSpawn = (body: string, result: BackendRunResult): void => {
+      const occupancy = occupancyTokens(runtime.backend, result.usage);
+      if (occupancy !== undefined) {
+        loopOccupancyTokens = occupancy;
+        loopResidentBytes = 0;
+        return;
+      }
+      if (canReuseBackendSession && activeBackendSessionId) {
+        loopResidentBytes += utf8Bytes(body) + utf8Bytes(result.responseText ?? '');
+      }
+    };
 
     const runTurnForLoop = async (
       body: string,
@@ -6464,7 +6534,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         }
 
         lastRunResult = runResult;
-        loopResidentBytes += utf8Bytes(runResult.responseText ?? '');
+        noteSpawn(body, runResult);
         return runResult;
       }
 
@@ -6513,11 +6583,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
       lastRunResult = contResult;
       recordRunUsage(contResult.usage);
-      // The BODY, not the packed prompt: a stateless provider re-packs the
-      // ledger and bootstrap into every continuation, and counting that
-      // again double-counted what the budget already subtracts (Lumen, PR
-      // #576 round 4). What is new to the window is the body and the reply.
-      loopResidentBytes += utf8Bytes(body) + utf8Bytes(contResult.responseText ?? '');
+      noteSpawn(body, contResult);
       return contResult;
     };
 
@@ -6528,7 +6594,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
           prompt,
           toolRouting: runtime.toolRouting,
           signal: turnAbort.signal,
-          relayBudgetBytes: () => relayBudgetBytes(runtime, ledger, loopResidentBytes),
+          relayBudgetBytes: () =>
+            relayBudgetBytes(runtime, ledger, loopResidentBytes, loopOccupancyTokens),
         },
         {
           ui: {
