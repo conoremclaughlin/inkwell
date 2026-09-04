@@ -19,6 +19,7 @@ import {
   ledgerEntryPromptBytes,
   LEDGER_ENTRY_FRAME_BYTES,
   CLONE_HISTORY_SEPARATOR,
+  CONTEXT_MUTATING_TOOLS,
 } from './chat.js';
 import { MAX_RELAY_BYTES } from '../repl/agent-loop.js';
 import { ContextLedger } from '../repl/context-ledger.js';
@@ -780,6 +781,15 @@ describe('relayBudgetBytes — the relay budget follows the live headroom (Lumen
 
   it('never starves a relay: a window past its budget still gets the minimum — the documented exception', () => {
     expect(relayBudgetBytes(runtime, 200_000)).toBe(MIN_RELAY_BUDGET_BYTES);
+  });
+});
+
+describe('CONTEXT_MUTATING_TOOLS — what can change a discovered context between fresh spawns (Lumen, PR #576 round 12)', () => {
+  it('names the writers and the shell, never the reads', () => {
+    for (const t of ['write', 'edit', 'multi_edit', 'apply_patch', 'bash'])
+      expect(CONTEXT_MUTATING_TOOLS.has(t)).toBe(true);
+    for (const t of ['read', 'grep', 'find', 'ls', 'list_context'])
+      expect(CONTEXT_MUTATING_TOOLS.has(t)).toBe(false);
   });
 });
 

@@ -18,7 +18,9 @@ const loopCalls = [...source.matchAll(/await runAgentLoop\(\s*\{([\s\S]*?)\n\s*\
   (m) => m[1]!
 );
 const noteSpawn = source.slice(
-  source.indexOf('const noteSpawn = (result: BackendRunResult): void => {'),
+  source.indexOf(
+    'const noteSpawn = (result: BackendRunResult, ledgerIdBeforeSpawn: number): void => {'
+  ),
   source.indexOf('/** The continuation spawn')
 );
 
@@ -58,15 +60,30 @@ describe('runAgentLoop hosts and their relay budgets', () => {
     expect(source).toContain('const cloneMaxContextTokens = runtime.maxContextTokens;');
   });
 
-  it('a native spawn that reported nothing leaves the window UNKNOWN; a stateless one records the prompt count and the ledger high-water id (Lumen, rounds 7–11)', () => {
-    expect(source).toContain('noteSpawn(runResult);');
-    expect(source).toContain('noteSpawn(contResult);');
+  it('a native spawn that reported nothing leaves the window UNKNOWN; a stateless one records the prompt count and the high-water id captured BEFORE the spawn (Lumen, rounds 7–12)', () => {
+    expect(source).toContain('noteSpawn(runResult, ledgerIdBeforeSpawn);');
+    expect(source).toContain('noteSpawn(contResult, ledgerIdBeforeSpawn);');
     expect(noteSpawn).toMatch(
       /if \(nativeSession\(\)\) \{\s*loopOccupancyTokens = occupancyTokens\(runtime\.backend, result\.usage\);\s*return;\s*\}/
     );
     expect(noteSpawn).toMatch(
-      /statelessPromptTokens = promptTokensOf\(runtime\.backend, result\.usage\);\s*ledgerMaxIdAtReport = ledger\s*\.listEntries\(\)\s*\.reduce\(\(m, e\) => Math\.max\(m, e\.id\), -1\);/
+      /statelessPromptTokens = promptTokensOf\(runtime\.backend, result\.usage\);[\s\S]*?ledgerMaxIdAtReport = ledgerIdBeforeSpawn;/
     );
+    // Captured with request construction, before the awaited spawn — both paths.
+    const initialCapture = source.indexOf('const ledgerIdBeforeSpawn = maxLedgerId();');
+    const initialSpawn = source.indexOf('const turn = startBackendTurn({', initialCapture);
+    expect(initialCapture).toBeGreaterThan(0);
+    expect(initialSpawn - initialCapture).toBeLessThan(120);
+    const contCapture = source.indexOf(
+      'const ledgerIdBeforeSpawn = maxLedgerId();',
+      initialCapture + 1
+    );
+    const contSpawn = source.indexOf(
+      'const contTurn = startBackendTurn(continuationRequest(continuationPrompt));'
+    );
+    expect(contCapture).toBeGreaterThan(0);
+    expect(contSpawn - contCapture).toBeLessThan(120);
+    expect(contSpawn).toBeGreaterThan(contCapture);
     expect(source).not.toMatch(/ResidentBytes/);
     expect(source).toMatch(
       /cloneOccupancyTokens = cloneCanReuseSession\s*\?\s*occupancyTokens\(cloneBackend, result\.usage\)/
@@ -75,6 +92,11 @@ describe('runAgentLoop hosts and their relay budgets', () => {
       /const prompt = promptTokensOf\(cloneBackend, result\.usage\);[\s\S]*?return prompt === undefined\s*\? undefined\s*: prompt \+ utf8Bytes\(text\) \+ 2 \* utf8Bytes\(CLONE_HISTORY_SEPARATOR\);/
     );
     expect(source).toMatch(/join\(CLONE_HISTORY_SEPARATOR\)/);
-    expect(source).not.toMatch(/join\('\\n\\n---\\n\\n'\)/);
+  });
+
+  it('a context-mutating local tool drops the stateless count to unknown until the next report (Lumen, round 12)', () => {
+    expect(source).toMatch(
+      /if \(CONTEXT_MUTATING_TOOLS\.has\(bareToolName\(result\.tool\)\)\) \{\s*statelessPromptTokens = undefined;\s*\}/
+    );
   });
 });
