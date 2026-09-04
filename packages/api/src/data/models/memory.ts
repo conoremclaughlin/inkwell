@@ -74,6 +74,7 @@ export type MemorySearchChunkType =
   | 'content';
 export type MemoryHybridChunkStrategy = 'default' | 'content-only' | 'derived-only' | 'multi-view';
 export type MemorySemanticQueryStrategy = 'single' | 'parallel-content-entity';
+export type MemorySemanticIndex = 'runtime-configured' | 'memory-single-vector' | 'memory-chunks';
 
 export interface MemorySearchOptions {
   recallMode?: 'auto' | 'text' | 'semantic' | 'hybrid';
@@ -88,6 +89,12 @@ export interface MemorySearchOptions {
   contactId?: string; // Filter by contact for per-sender isolation
   semanticChunkTypes?: MemorySearchChunkType[];
   semanticQueryStrategy?: MemorySemanticQueryStrategy;
+  /**
+   * Selects the physical semantic index explicitly. The default preserves production behavior:
+   * use the runtime setting and fall back to the single memory vector if chunk recall fails.
+   * Benchmark callers can force one index so an ablation never silently changes retrieval paths.
+   */
+  semanticIndex?: MemorySemanticIndex;
   hybridChunkStrategy?: MemoryHybridChunkStrategy;
   applyChunkTypeBoosts?: boolean;
   applyMultiViewBoost?: boolean;

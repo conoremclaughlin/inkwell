@@ -1903,6 +1903,105 @@ describe('MemoryRepository', () => {
       expect(results[0].id).toBe('mem-sem-legacy');
     });
 
+    it('can force the single memory vector even when chunk recall is enabled', async () => {
+      const rpc = vi.fn().mockResolvedValue({ data: [], error: null });
+      (mockSupabase as any).rpc = rpc;
+      (repo as any).embeddingRouter = {
+        embedQuery: vi.fn().mockResolvedValue({
+          vector: [0.1, 0.2, 0.3],
+          provider: 'ollama',
+          model: 'mxbai-embed-large',
+          dimensions: 1024,
+        }),
+        getRuntimeConfig: vi.fn().mockReturnValue({
+          enabled: true,
+          provider: 'ollama',
+          model: 'mxbai-embed-large',
+          dimensions: 1024,
+          queryThreshold: 0.2,
+          matchCountMultiplier: 5,
+          chunkedRecallEnabled: true,
+        }),
+      };
+
+      await repo.recall('user-456', 'semantic query', {
+        recallMode: 'semantic',
+        semanticIndex: 'memory-single-vector',
+      });
+
+      expect(rpc).toHaveBeenCalledTimes(1);
+      expect(rpc).toHaveBeenCalledWith('match_memories', expect.anything());
+    });
+
+    it('fails forced single-vector recall instead of counting an RPC failure as no match', async () => {
+      const rpc = vi.fn().mockResolvedValue({
+        data: null,
+        error: { message: 'upstream unavailable' },
+      });
+      (mockSupabase as any).rpc = rpc;
+      (repo as any).embeddingRouter = {
+        embedQuery: vi.fn().mockResolvedValue({
+          vector: [0.1, 0.2, 0.3],
+          provider: 'ollama',
+          model: 'mxbai-embed-large',
+          dimensions: 1024,
+        }),
+        getRuntimeConfig: vi.fn().mockReturnValue({
+          enabled: true,
+          provider: 'ollama',
+          model: 'mxbai-embed-large',
+          dimensions: 1024,
+          queryThreshold: 0.2,
+          matchCountMultiplier: 5,
+          chunkedRecallEnabled: false,
+        }),
+      };
+
+      await expect(
+        repo.recall('user-456', 'semantic query', {
+          recallMode: 'semantic',
+          semanticIndex: 'memory-single-vector',
+        })
+      ).rejects.toThrow('Forced memory-single-vector semantic recall failed: upstream unavailable');
+
+      expect(rpc).toHaveBeenCalledTimes(1);
+    });
+
+    it('can force chunk recall without silently falling back to a different index', async () => {
+      const rpc = vi.fn().mockResolvedValue({
+        data: null,
+        error: { message: 'statement timeout' },
+      });
+      (mockSupabase as any).rpc = rpc;
+      (repo as any).embeddingRouter = {
+        embedQuery: vi.fn().mockResolvedValue({
+          vector: [0.1, 0.2, 0.3],
+          provider: 'ollama',
+          model: 'mxbai-embed-large',
+          dimensions: 1024,
+        }),
+        getRuntimeConfig: vi.fn().mockReturnValue({
+          enabled: true,
+          provider: 'ollama',
+          model: 'mxbai-embed-large',
+          dimensions: 1024,
+          queryThreshold: 0.2,
+          matchCountMultiplier: 5,
+          chunkedRecallEnabled: false,
+        }),
+      };
+
+      await expect(
+        repo.recall('user-456', 'semantic query', {
+          recallMode: 'semantic',
+          semanticIndex: 'memory-chunks',
+        })
+      ).rejects.toThrow('Forced memory-chunks semantic recall failed: statement timeout');
+
+      expect(rpc).toHaveBeenCalledTimes(1);
+      expect(rpc).toHaveBeenCalledWith('match_memory_embedding_chunks', expect.anything());
+    });
+
     it('skips RPC when query embedding dimensions do not match schema dimensions', async () => {
       const rpc = vi.fn();
       (mockSupabase as any).rpc = rpc;

@@ -842,7 +842,18 @@ export class MemoryRepository {
     chunkTypes?: MemoryChunkType[]
   ): Promise<RecallCandidate[] | null> {
     const queryEmbedding = await this.embeddingRouter.embedQuery(query);
-    if (!queryEmbedding) return null;
+    const forcedSemanticIndex =
+      options.semanticIndex && options.semanticIndex !== 'runtime-configured'
+        ? options.semanticIndex
+        : null;
+    if (!queryEmbedding) {
+      if (forcedSemanticIndex) {
+        throw new Error(
+          `Semantic index ${forcedSemanticIndex} was requested but query embedding failed`
+        );
+      }
+      return null;
+    }
 
     const config = this.embeddingRouter.getRuntimeConfig();
     if (queryEmbedding.dimensions !== config.dimensions) {
@@ -852,10 +863,19 @@ export class MemoryRepository {
         embeddingDimensions: queryEmbedding.dimensions,
         expectedDimensions: config.dimensions,
       });
+      if (forcedSemanticIndex) {
+        throw new Error(
+          `Semantic index ${forcedSemanticIndex} was requested but query embedding dimensions ` +
+            `${queryEmbedding.dimensions} do not match ${config.dimensions}`
+        );
+      }
       return null;
     }
 
-    if (!config.chunkedRecallEnabled) {
+    if (
+      options.semanticIndex === 'memory-single-vector' ||
+      (options.semanticIndex !== 'memory-chunks' && !config.chunkedRecallEnabled)
+    ) {
       return this.tryLegacySemanticRecallCandidates(userId, options, limit, offset, queryEmbedding);
     }
 
@@ -882,6 +902,9 @@ export class MemoryRepository {
     const { data, error } = await rpcClient.rpc('match_memory_embedding_chunks', rpcArgs);
 
     if (error) {
+      if (options.semanticIndex === 'memory-chunks') {
+        throw new Error(`Forced memory-chunks semantic recall failed: ${error.message}`);
+      }
       logger.warn(
         'Chunked semantic memory recall failed, falling back to legacy memory embeddings',
         {
@@ -893,6 +916,7 @@ export class MemoryRepository {
 
     const rows = (data || []) as SemanticChunkMatchRow[];
     if (rows.length === 0) {
+      if (options.semanticIndex === 'memory-chunks') return [];
       return this.tryLegacySemanticRecallCandidates(userId, options, limit, offset, queryEmbedding);
     }
 
@@ -980,9 +1004,10 @@ export class MemoryRepository {
     const { data, error } = await rpcClient.rpc('match_memories', rpcArgs);
 
     if (error) {
-      logger.warn('Legacy semantic memory recall failed, falling back to text recall', {
-        error: error.message,
-      });
+      if (options.semanticIndex === 'memory-single-vector') {
+        throw new Error(`Forced memory-single-vector semantic recall failed: ${error.message}`);
+      }
+      logger.warn('Memory-level semantic recall failed', { error: error.message });
       return null;
     }
 
