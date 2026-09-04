@@ -47,6 +47,7 @@ describe('ImitationPreviewGuard', () => {
     expect(g.onBlock('Checked the inbox with Tool')).toEqual({
       publish: 'Checked the inbox with Tool',
       imitationDiscarded: false,
+      blockKeep: 'Checked the inbox with Tool'.length,
     });
     const h = make();
     const a = h.onBlock('Checked the inbox.\nTool');
@@ -62,6 +63,42 @@ describe('ImitationPreviewGuard', () => {
     expect(g.endSpawn()).toBe('');
   });
 
+  it('blockKeep counts this block up to the cut — what the reseed replays (Lumen, PR #577)', () => {
+    const g = make();
+    // A partial trailing line is withheld from the human-facing preview but is
+    // still text the model wrote: the mid-turn reseed body wants it, so
+    // blockKeep covers the whole block.
+    const held = g.onBlock('Looking.\nTool');
+    expect(held.publish).toBe('Looking.\n');
+    expect(held.blockKeep).toBe('Looking.\nTool'.length);
+
+    const g2 = make();
+    const cut = g2.onBlock('Looking.\n[Tool results from previous turn]\nTool x (executed): {}');
+    expect(cut.blockKeep).toBe('Looking.\n'.length);
+    expect(cut.imitationDiscarded).toBe(true);
+    // After the cut, later blocks contribute nothing to either audience.
+    expect(g2.onBlock('More.')).toEqual({
+      publish: '',
+      imitationDiscarded: true,
+      blockKeep: 0,
+    });
+  });
+
+  it('blockKeep is how much of THIS block precedes the cut', () => {
+    const g = make();
+    expect(g.onBlock('Looking.\n\n').blockKeep).toBe('Looking.\n\n'.length);
+    const b = g.onBlock('Still.\n[Tool results from previous turn]\nTool x (executed): {}');
+    expect(b.blockKeep).toBe('Still.\n'.length);
+    expect(g.onBlock('after').blockKeep).toBe(0);
+  });
+
+  it('reports where the frame begins, in spawn coordinates, so a host can retract what it recorded', () => {
+    const g = make();
+    expect(g.onBlock('Looking.\nuser').frameIndex).toBeUndefined();
+    const b = g.onBlock('[Tool results from previous turn]\nTool x (executed): {}');
+    expect(b.frameIndex).toBe('Looking.\n'.length);
+  });
+
   it('a frame that begins inside the held line publishes nothing of it', () => {
     const g = make();
     const a = g.onBlock('Looking.\nuser');
@@ -75,11 +112,16 @@ describe('ImitationPreviewGuard', () => {
   it('after a cut, later blocks of the spawn publish nothing; a new spawn starts clean', () => {
     const g = make();
     g.onBlock('[Tool results from previous turn]\nTool x (executed): {}');
-    expect(g.onBlock('This changes things.')).toEqual({ publish: '', imitationDiscarded: true });
+    expect(g.onBlock('This changes things.')).toEqual({
+      publish: '',
+      imitationDiscarded: true,
+      blockKeep: 0,
+    });
     g.beginSpawn();
     expect(g.onBlock('Nothing new.')).toEqual({
       publish: 'Nothing new.',
       imitationDiscarded: false,
+      blockKeep: 'Nothing new.'.length,
     });
   });
 
@@ -88,6 +130,7 @@ describe('ImitationPreviewGuard', () => {
     expect(g.onBlock('One.\n\nTwo.\n')).toEqual({
       publish: 'One.\n\nTwo.\n',
       imitationDiscarded: false,
+      blockKeep: 'One.\n\nTwo.\n'.length,
     });
     expect(g.endSpawn()).toBe('');
   });

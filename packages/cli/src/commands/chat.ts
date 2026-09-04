@@ -2956,6 +2956,139 @@ export function relayBudgetBytes(
   return Math.min(MAX_RELAY_BYTES, Math.max(MIN_RELAY_BUDGET_BYTES, bytes));
 }
 
+/**
+ * How a tool-loop continuation reaches the provider.
+ *
+ * `resume`: the live native session holds the history — send the delta only.
+ * `seed`: the session was rolled MID-TURN (an eviction, a trim, a budget
+ * change, an uncorrected protocol break) — mint a fresh id, send the full
+ * envelope, and persist the id so later continuations and the next turn
+ * resume it. Before this existed the rolled continuation spawned UNSEEDED:
+ * every further continuation re-packed the whole window into yet another
+ * unresumable session — five fresh provider sessions in seven minutes,
+ * 280–520K cache-creation tokens each (Myra, 2026-09-02; #572).
+ * `stateless`: the backend cannot resume at all — full envelope every time.
+ *
+ * Pure, and called by runTurnForLoop itself, so the test pins the decision
+ * the runtime makes rather than a mirror of it.
+ */
+export function decideContinuationSession(
+  canReuse: boolean,
+  activeId: string | undefined,
+  mint: () => string
+): { mode: 'resume'; id: string } | { mode: 'seed'; id: string } | { mode: 'stateless' } {
+  if (!canReuse) return { mode: 'stateless' };
+  if (activeId !== undefined) return { mode: 'resume', id: activeId };
+  return { mode: 'seed', id: mint() };
+}
+
+/** Ceiling on the transient dialogue carried into a mid-turn reseed. */
+export const MID_TURN_RESEED_MAX_CHARS = 30_000;
+
+/**
+ * One side of the transient dialogue a mid-turn reseed replays: what the
+ * model said, or what the runtime said back.
+ */
+export interface ReseedDialogueEntry {
+  role: 'assistant' | 'runtime';
+  text: string;
+}
+
+/**
+ * The latest-message body for a mid-turn reseed: this turn's dialogue so far,
+ * in order, ending with the continuation the model was about to receive.
+ *
+ * A rebuilt envelope carries the ledger — the user's message, tool-result
+ * previews — but not the turn in progress. Assistant text alone was not
+ * enough either (Lumen, PR #577): ordinary tool results survive in the ledger
+ * only as 500-char previews placed BEFORE the requests that earned them, and
+ * client-local results (list_context, evict_context) are deliberately not in
+ * the ledger at all — so a two-iteration turn lost the first iteration's
+ * results while the note claimed they followed. Replaying the ordered
+ * dialogue is what keeps the reseeded session from re-issuing calls that
+ * already ran (#572). Imitated frames are already cut by the host.
+ */
+/** The provider-session argument a continuation spawn carries, plus whether media is (re)delivered. */
+export interface ContinuationSpawnArgs {
+  sessionArgs: { backendSessionId?: string; backendSessionSeedId?: string };
+  deliverMedia: boolean;
+}
+
+/**
+ * What the continuation spawn must say about its session, from the decision:
+ * a resume carries `backendSessionId`; a mid-turn SEED carries
+ * `backendSessionSeedId` and re-delivers the turn's media (the fresh native
+ * session has never seen it); a stateless spawn carries neither. Kept apart
+ * from the request builder so the call path can be tested — the builder once
+ * derived the argument from the live id and sent a freshly minted seed as a
+ * resume of a session that did not exist (Lumen, PR #577 final pass).
+ */
+export function continuationSpawnArgs(
+  decision: ReturnType<typeof decideContinuationSession>,
+  hasMedia: boolean
+): ContinuationSpawnArgs {
+  if (decision.mode === 'resume')
+    return { sessionArgs: { backendSessionId: decision.id }, deliverMedia: false };
+  if (decision.mode === 'seed')
+    return { sessionArgs: { backendSessionSeedId: decision.id }, deliverMedia: hasMedia };
+  return { sessionArgs: {}, deliverMedia: false };
+}
+
+export function buildMidTurnReseedBody(dialogue: readonly ReseedDialogueEntry[]): string {
+  const rendered = dialogue
+    .map((entry) => {
+      const text = entry.text.trim();
+      if (!text) return '';
+      return entry.role === 'assistant' ? `YOU:\n${text}` : `INK RUNTIME:\n${text}`;
+    })
+    .filter(Boolean);
+  if (rendered.length === 0) return '';
+  // The LAST entry is the continuation the model is about to receive — the
+  // real tool results of the iteration that just ran. It is never cut: a
+  // budget applied to the joined text sliced through it and silently dropped
+  // results and role framing (Lumen, PR #577 round 2). The budget applies to
+  // the dialogue BEFORE it, whole entries from the most recent backwards;
+  // what does not fit is elided, and the elision says how much.
+  const last = rendered[rendered.length - 1]!;
+  const earlier = rendered.slice(0, -1);
+  let budget = MID_TURN_RESEED_MAX_CHARS - last.length;
+  const kept: string[] = [];
+  for (let i = earlier.length - 1; i >= 0; i -= 1) {
+    const entry = earlier[i]!;
+    if (entry.length + 2 > budget) break;
+    kept.unshift(entry);
+    budget -= entry.length + 2;
+  }
+  const elided = earlier.length - kept.length;
+  const shown = [
+    ...(elided > 0
+      ? [`…[earlier turn dialogue elided: ${elided} ${elided === 1 ? 'entry' : 'entries'}]`]
+      : []),
+    ...kept,
+    last,
+  ].join('\n\n');
+  return [
+    '[This turn so far]',
+    'The provider session was re-seeded mid-turn after a context change on the ink side. This is the turn up to this point: what you wrote, and what the ink runtime sent back. The ink-tool blocks in your own output were already executed and their results appear below in order — do not repeat those calls. Continue from the end of it.',
+    '---',
+    shown,
+    '---',
+  ].join('\n');
+}
+
+/**
+ * What this spawn has said, as the reseed dialogue records it: everything up
+ * to the frame the guard found, or everything so far. Called on every block
+ * with the spawn's UNCUT text, so a frame confirmed in block N retracts what
+ * block N-1 had recorded (`Looking.\nuser` becomes `Looking.\n`).
+ */
+export function spawnDialogueText(
+  spawnSaid: string,
+  guarded: { imitationDiscarded: boolean; frameIndex?: number }
+): string {
+  return guarded.imitationDiscarded ? spawnSaid.slice(0, guarded.frameIndex ?? 0) : spawnSaid;
+}
+
 export function buildPromptEnvelope(
   agentId: string,
   runtime: ChatRuntime,
@@ -3623,9 +3756,33 @@ export async function runChat(options: ChatOptions): Promise<void> {
     (text) => (runtime.toolRouting === 'local' ? findImitatedToolResults(text) : null),
     (line) => runtime.toolRouting === 'local' && isPotentialImitationPrefix(line)
   );
+  // The model's own output this turn, spawn by spawn, imitated frames cut —
+  // what a mid-turn reseed hands back so the rebuilt session remembers its
+  // own half of the turn (buildMidTurnReseedBody, #572). Reset per turn;
+  // muted from an imitated frame to the next spawn, like the renderer.
+  // This turn's dialogue with the runtime, in order: what the model said, and
+  // each continuation the runtime sent back. A mid-turn reseed replays it so
+  // the rebuilt session remembers its own half of the turn — assistant text
+  // alone was not enough (Lumen, PR #577): ordinary tool results survive in
+  // the ledger only as 500-char previews placed BEFORE the requests that
+  // earned them, and client-local results (list_context, evict_context) are
+  // deliberately not in the ledger at all, so a two-iteration turn lost the
+  // first iteration's results while the note claimed they followed.
+  let turnDialogue: ReseedDialogueEntry[] = [];
+  let turnDialogueMuted = false;
+  // This spawn's assistant text, UNCUT, and the dialogue entry it is written
+  // to. One entry per spawn, rewritten as blocks arrive: a line kept from an
+  // earlier block (`Looking.\nuser`) is retracted when a later block reveals
+  // it was the start of a frame — a per-block cut could not take back what
+  // it had already recorded (Lumen, PR #577 round 2).
+  let spawnSaid = '';
+  let spawnEntryIndex = -1;
   const beginSpawn = (): void => {
     streamRenderer.beginSpawn();
     previewGuard.beginSpawn();
+    turnDialogueMuted = false;
+    spawnSaid = '';
+    spawnEntryIndex = -1;
   };
   /**
    * The spawn's stream ended: render whatever the renderer was holding, and
@@ -3780,6 +3937,19 @@ export async function runChat(options: ChatOptions): Promise<void> {
           preview: compactForLedger(guarded.publish, 200),
           ...(guarded.imitationDiscarded ? { imitationDiscarded: true } : {}),
         });
+      }
+      if (!turnDialogueMuted) {
+        spawnSaid += evt.text;
+        const said = spawnDialogueText(spawnSaid, guarded);
+        if (spawnEntryIndex === -1) {
+          if (said.trim()) {
+            turnDialogue.push({ role: 'assistant', text: said });
+            spawnEntryIndex = turnDialogue.length - 1;
+          }
+        } else {
+          turnDialogue[spawnEntryIndex] = { role: 'assistant', text: said };
+        }
+        if (guarded.imitationDiscarded) turnDialogueMuted = true;
       }
       renderStreamedLines(
         streamRenderer.completeMessage(evt.text, { continuesMessage: evt.continuesMessage })
@@ -6178,6 +6348,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
   ) => {
     if (!raw.trim()) return;
     streamRenderer.reset();
+    turnDialogue = [];
+    turnDialogueMuted = false;
     // Attach pending files to this turn — append the block so the backend
     // sees the paths inline with the message that delivered them. The media
     // list rides the same turn (injected as prompt content by adapters that
@@ -6527,7 +6699,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
       statelessGenerationAtReport = generationBeforeSpawn;
     };
     /** The continuation spawn's request; the budget measures the same shape. */
-    const continuationRequest = (prompt: string): BackendRunRequest => ({
+    const continuationRequest = (
+      prompt: string,
+      spawn: ContinuationSpawnArgs = { sessionArgs: {}, deliverMedia: false }
+    ): BackendRunRequest => ({
       backend: runtime.backend,
       agentId,
       model: runtime.model,
@@ -6542,15 +6717,17 @@ export async function runChat(options: ChatOptions): Promise<void> {
       onEvent: handleBackendEvent,
       attachmentDirs: sessionAttachmentDirs.length > 0 ? sessionAttachmentDirs : undefined,
       toolRouting: runtime.toolRouting,
-      // Same logical turn — media rides along (WITHOUT deliverMedia) so the
-      // adapter's boundary disposition (--tools gate) cannot flap between the
-      // delivery spawn and tool-loop continuations, while the resumed provider
-      // session is never re-fed images it already holds. Stateless adapters
-      // re-attach from `media` regardless.
+      // Same logical turn — media rides along so the adapter's boundary
+      // disposition (--tools gate) cannot flap between the delivery spawn and
+      // tool-loop continuations. A RESUME never re-delivers it (the session
+      // holds it); a mid-turn SEED must (the fresh session has never seen it);
+      // stateless adapters re-attach from `media` regardless.
       media: turnMedia.length > 0 ? turnMedia : undefined,
-      // Resume the live provider session so this round-trip appends to the
-      // same Claude thread instead of re-piping the whole window.
-      ...(activeBackendSessionId ? { backendSessionId: activeBackendSessionId } : {}),
+      ...(spawn.deliverMedia ? { deliverMedia: true } : {}),
+      // The session argument is the DECISION's, never derived from the live id:
+      // a seed assigns the minted id before spawning, and deriving from it sent
+      // a resume of a session that did not exist yet (Lumen, PR #577).
+      ...spawn.sessionArgs,
     });
     /**
      * What the window holds for the next relay — see relayBudgetBytes. A
@@ -6752,17 +6929,58 @@ export async function runChat(options: ChatOptions): Promise<void> {
       // ── Continuation ──
       // When resuming the same Claude session the model already holds the full
       // transcript + tool instructions from the seeded turn, so send ONLY the
-      // delta. Otherwise (stateless backends) re-pack the full envelope so the
-      // fresh spawn has the context it needs.
-      const continuationPrompt =
-        canReuseBackendSession && activeBackendSessionId
-          ? body
-          : buildPromptEnvelope(agentId, runtime, ledger, body);
+      // delta. When the session was rolled mid-turn, SEED a fresh one now —
+      // full envelope, the model's own output so far, and a persisted id so
+      // the rest of this turn and the next resume it (#572). Stateless
+      // backends re-pack the full envelope every time.
+      const decision = decideContinuationSession(
+        canReuseBackendSession,
+        activeBackendSessionId,
+        randomUUID
+      );
+      let continuationPrompt: string;
+      if (decision.mode === 'resume') {
+        continuationPrompt = body;
+      } else if (decision.mode === 'seed') {
+        activeBackendSessionId = decision.id;
+        // Recomputed HERE, not the pre-spawn snapshot: the opening spawn's
+        // model init may have changed the budget (applyDetectedModel), and
+        // the envelope built below uses the new one. Recording the stale
+        // shape made the NEXT turn roll this session again — the very
+        // fragmentation this fix exists to stop (Lumen, PR #577).
+        activeBackendSessionShape = envelopeShapeKey(runtime);
+        appendTranscript(runtime.transcriptPath, {
+          type: 'backend_session',
+          id: decision.id,
+          routing: runtime.toolRouting,
+          reason: 'mid-turn-roll',
+        });
+        printEvent(
+          chalk.dim('  ⛁ provider session rolled mid-turn — re-seeding a fresh native session')
+        );
+        continuationPrompt = buildPromptEnvelope(
+          agentId,
+          runtime,
+          ledger,
+          buildMidTurnReseedBody([...turnDialogue, { role: 'runtime', text: body }])
+        );
+      } else {
+        continuationPrompt = buildPromptEnvelope(agentId, runtime, ledger, body);
+      }
+
+      // Recorded for a later reseed in this same turn; the seed above already
+      // rendered this body itself.
+      turnDialogue.push({ role: 'runtime', text: body });
 
       beginSpawn();
       const ledgerIdBeforeSpawn = maxLedgerId();
       const generationBeforeSpawn = contextGeneration;
-      const contTurn = startBackendTurn(continuationRequest(continuationPrompt));
+      const contTurn = startBackendTurn(
+        continuationRequest(
+          continuationPrompt,
+          continuationSpawnArgs(decision, turnMedia.length > 0)
+        )
+      );
       currentTurnAbort = contTurn.abort;
 
       const contResult = await contTurn.result.finally(() => {

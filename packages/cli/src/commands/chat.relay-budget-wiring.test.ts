@@ -44,11 +44,18 @@ describe('runAgentLoop hosts and their relay budgets', () => {
     expect(source).not.toMatch(/measurePreparedPromptBytes|hiddenContextBytes|MEDIA_TOKEN_RESERVE/);
   });
 
-  it('the continuation and clone spawns go through their request builders', () => {
-    expect(source).toContain(
-      'const contTurn = startBackendTurn(continuationRequest(continuationPrompt));'
+  it("the continuation spawn goes through the request builder WITH the decision's session args and delivery (Lumen, PR #577 final pass)", () => {
+    expect(source).toMatch(
+      /const contTurn = startBackendTurn\(\s*continuationRequest\(\s*continuationPrompt,\s*continuationSpawnArgs\(decision, turnMedia\.length > 0\)\s*\)\s*\);/
     );
     expect(source).toContain('const turn = startBackendTurn(cloneRequest(prompt, sessionArgs));');
+    const builder = source.slice(
+      source.indexOf('const continuationRequest = ('),
+      source.indexOf('/**\n     * What the window holds for the next relay')
+    );
+    expect(builder).toContain('...spawn.sessionArgs,');
+    expect(builder).toMatch(/\.\.\.\(spawn\.deliverMedia \? \{ deliverMedia: true \} : \{\}\),/);
+    expect(builder).not.toContain('backendSessionId: activeBackendSessionId');
   });
 
   it("the clone's window is frozen at spawn — never the parent's mutable runtime (Lumen, round 4)", () => {
@@ -76,12 +83,12 @@ describe('runAgentLoop hosts and their relay budgets', () => {
       'const ledgerIdBeforeSpawn = maxLedgerId();',
       initialCapture + 1
     );
-    const contSpawn = source.indexOf(
-      'const contTurn = startBackendTurn(continuationRequest(continuationPrompt));'
+    const contSpawn = source.search(
+      /const contTurn = startBackendTurn\(\s*continuationRequest\(\s*continuationPrompt,\s*continuationSpawnArgs\(decision, turnMedia\.length > 0\)\s*\)\s*\);/
     );
     expect(contCapture).toBeGreaterThan(0);
-    expect(contSpawn - contCapture).toBeLessThan(200);
     expect(contSpawn).toBeGreaterThan(contCapture);
+    expect(contSpawn - contCapture).toBeLessThan(200);
     expect(source).not.toMatch(/ResidentBytes/);
     expect(source).toMatch(
       /cloneOccupancyTokens = cloneCanReuseSession\s*\?\s*occupancyTokens\(cloneBackend, result\.usage\)/
@@ -96,23 +103,20 @@ describe('runAgentLoop hosts and their relay budgets', () => {
     expect(source).toMatch(
       /const beginContextMutationFor = \(\s*calls: ReadonlyArray<\{ tool: string \}>\s*\): \(\(\) => void\) => \{\s*if \(!calls\.some\(\(c\) => CONTEXT_MUTATING_TOOLS\.has\(bareToolName\(c\.tool\)\)\)\) return \(\) => \{\};\s*contextGeneration \+= 1;\s*mutationsInFlight \+= 1;\s*return \(\) => \{\s*mutationsInFlight -= 1;\s*contextGeneration \+= 1;\s*\};/
     );
-    // Both executors: begin before executeToolCalls, settle in finally.
     const wraps =
       source.match(
         /const settleContextMutation = beginContextMutationFor\(calls\);\s*try \{\s*await executeToolCalls\([\s\S]*?\} finally \{\s*settleContextMutation\(\);\s*\}/g
       ) ?? [];
     expect(wraps).toHaveLength(2);
-    // Captured with request construction, before each spawn; stored at the report.
     expect(source).toMatch(
       /const generationBeforeSpawn = contextGeneration;\s*(?:beginSpawn\(\);\s*)?const turn = startBackendTurn\(\{/
     );
     expect(source).toMatch(
-      /const generationBeforeSpawn = contextGeneration;\s*const contTurn = startBackendTurn\(continuationRequest\(continuationPrompt\)\);/
+      /const generationBeforeSpawn = contextGeneration;\s*const contTurn = startBackendTurn\(\s*continuationRequest\(\s*continuationPrompt,\s*continuationSpawnArgs\(decision, turnMedia\.length > 0\)\s*\)\s*\);/
     );
     expect(source).toMatch(
       /const generationBeforeSpawn = contextGeneration;\s*const turn = startBackendTurn\(cloneRequest\(prompt, sessionArgs\)\);/
     );
-    // Rejected while in flight or after a bump — parent and clone.
     expect(source).toMatch(
       /if \(mutationsInFlight > 0 \|\| statelessGenerationAtReport !== contextGeneration\) \{\s*return undefined;/
     );

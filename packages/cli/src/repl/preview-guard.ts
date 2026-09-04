@@ -37,11 +37,19 @@ export class ImitationPreviewGuard {
 
   /**
    * A text block completed. Returns what may be published for it now — the
-   * held tail of the previous block included — and whether a frame was found
-   * (from this block on, nothing more is published this spawn).
+   * held tail of the previous block included — whether a frame was found
+   * (from this block on, nothing more is published this spawn), and how many
+   * characters of THIS block precede the cut (`blockKeep`: the block's own
+   * length when there is no frame), for a host that also records the block.
    */
-  onBlock(text: string): { publish: string; imitationDiscarded: boolean } {
-    if (this.cut) return { publish: '', imitationDiscarded: true };
+  onBlock(text: string): {
+    publish: string;
+    imitationDiscarded: boolean;
+    blockKeep: number;
+    /** Where the frame begins, in spawn coordinates — present only when one was found. */
+    frameIndex?: number;
+  } {
+    if (this.cut) return { publish: '', imitationDiscarded: true, blockKeep: 0 };
     const blockStart = this.spawnText.length;
     this.spawnText += text;
     const from = this.pendingStart ?? blockStart;
@@ -52,21 +60,28 @@ export class ImitationPreviewGuard {
       return {
         publish: frame.index > from ? this.spawnText.slice(from, frame.index) : '',
         imitationDiscarded: true,
+        blockKeep: Math.max(0, frame.index - blockStart),
+        frameIndex: frame.index,
       };
     }
+    const blockKeep = text.length;
     const lastLineStart = this.spawnText.lastIndexOf('\n', this.spawnText.length - 1) + 1;
     const tail = this.spawnText.slice(Math.max(lastLineStart, from));
     if (lastLineStart >= from && this.isPotentialPrefix(tail)) {
       this.pendingStart = lastLineStart;
-      return { publish: this.spawnText.slice(from, lastLineStart), imitationDiscarded: false };
+      return {
+        publish: this.spawnText.slice(from, lastLineStart),
+        imitationDiscarded: false,
+        blockKeep,
+      };
     }
     if (lastLineStart < from && this.isPotentialPrefix(this.spawnText.slice(from))) {
       // The whole publishable range is one line that could still be a header.
       this.pendingStart = from;
-      return { publish: '', imitationDiscarded: false };
+      return { publish: '', imitationDiscarded: false, blockKeep };
     }
     this.pendingStart = null;
-    return { publish: this.spawnText.slice(from), imitationDiscarded: false };
+    return { publish: this.spawnText.slice(from), imitationDiscarded: false, blockKeep };
   }
 
   /** The spawn ended: a held line that never became a frame is ordinary text. */

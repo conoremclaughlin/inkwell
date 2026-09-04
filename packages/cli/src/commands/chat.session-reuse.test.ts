@@ -20,8 +20,20 @@ import {
   LEDGER_ENTRY_FRAME_BYTES,
   CLONE_HISTORY_SEPARATOR,
   CONTEXT_MUTATING_TOOLS,
+  buildMidTurnReseedBody,
+  decideContinuationSession,
+  MID_TURN_RESEED_OWN_OUTPUT_MAX_CHARS,
+  MID_TURN_RESEED_MAX_CHARS,
+  spawnDialogueText,
+  continuationSpawnArgs,
 } from './chat.js';
 import { MAX_RELAY_BYTES } from '../repl/agent-loop.js';
+import { ImitationPreviewGuard } from '../repl/preview-guard.js';
+import {
+  findImitatedToolResults,
+  isPotentialImitationPrefix,
+  MAX_RELAY_CHARS,
+} from '../repl/agent-loop.js';
 import { ContextLedger } from '../repl/context-ledger.js';
 
 /**
@@ -872,5 +884,184 @@ describe("occupancyTokens — what the session holds after a reply, by the provi
     expect(occupancyTokens('claude', undefined)).toBeUndefined();
     expect(occupancyTokens('claude', { outputTokens: 5 })).toBeUndefined();
     expect(occupancyTokens('gemini', { outputTokens: 5 })).toBeUndefined();
+  });
+});
+
+describe('decideContinuationSession (the real function runTurnForLoop calls) — #572', () => {
+  const minter = () => {
+    let i = 0;
+    return () => `N${++i}`;
+  };
+
+  it('resumes the live session with the delta', () => {
+    expect(decideContinuationSession(true, 'S1', minter())).toEqual({ mode: 'resume', id: 'S1' });
+  });
+
+  it('REGRESSION: a session rolled mid-turn is SEEDED, not spawned unseeded', () => {
+    // Before: the rolled continuation went out with neither seed nor resume id,
+    // so it was unresumable and every later continuation re-packed the window
+    // into another fresh session (five in seven minutes).
+    const d = decideContinuationSession(true, undefined, minter());
+    expect(d).toEqual({ mode: 'seed', id: 'N1' });
+  });
+
+  it('a stateless backend never seeds or resumes', () => {
+    expect(decideContinuationSession(false, 'S1', minter())).toEqual({ mode: 'stateless' });
+    expect(decideContinuationSession(false, undefined, minter())).toEqual({ mode: 'stateless' });
+  });
+
+  it('eviction mid-turn: one reseed, then every later continuation resumes the SAME id', () => {
+    const mint = minter();
+    let active: string | undefined = 'S1';
+    // The eviction rolled it (recordEviction clears the live id).
+    active = undefined;
+    const first = decideContinuationSession(true, active, mint);
+    expect(first.mode).toBe('seed');
+    if (first.mode === 'seed') active = first.id;
+    const second = decideContinuationSession(true, active, mint);
+    const third = decideContinuationSession(true, active, mint);
+    expect(second).toEqual({ mode: 'resume', id: 'N1' });
+    expect(third).toEqual({ mode: 'resume', id: 'N1' });
+  });
+});
+
+describe('buildMidTurnReseedBody — the rebuilt session remembers this turn (#572; ordered — Lumen, PR #577)', () => {
+  const assistant = (text: string) => ({ role: 'assistant' as const, text });
+  const runtime = (text: string) => ({ role: 'runtime' as const, text });
+
+  it("carries the model's own output and the continuation it was about to receive", () => {
+    const body =
+      '[Tool results from previous turn]\nTool evict_context (executed): {"evicted":3000}';
+    const out = buildMidTurnReseedBody([
+      assistant(
+        'Clearing old heartbeat chatter.\n\n```ink-tool\n{"tool":"evict_context","args":{"source":"heartbeat"}}\n```'
+      ),
+      runtime(body),
+    ]);
+    expect(out.startsWith('[This turn so far]')).toBe(true);
+    expect(out).toContain('"tool":"evict_context"');
+    expect(out).toContain('already executed');
+    expect(out.indexOf('evict_context","args"')).toBeLessThan(out.indexOf('"evicted":3000'));
+  });
+
+  it("REGRESSION (Lumen, PR #577): an earlier iteration's results survive, in order", () => {
+    // Iteration 1 calls list_context, iteration 2 calls evict_context. The
+    // assistant-only record lost the list_context RESULT entirely — it is
+    // client-local, so the ledger never held it either — while the note
+    // claimed the results followed.
+    const out = buildMidTurnReseedBody([
+      assistant(
+        'Checking what is in my window.\n```ink-tool\n{"tool":"list_context","args":{}}\n```'
+      ),
+      runtime(
+        '[Tool results from previous turn]\nTool list_context (executed): {"totalEntries":3500}'
+      ),
+      assistant(
+        'Heartbeat chatter dominates.\n```ink-tool\n{"tool":"evict_context","args":{}}\n```'
+      ),
+      runtime('[Tool results from previous turn]\nTool evict_context (executed): {"evicted":3000}'),
+    ]);
+    const order = [
+      '"tool":"list_context"',
+      '"totalEntries":3500',
+      '"tool":"evict_context"',
+      '"evicted":3000',
+    ].map((needle) => out.indexOf(needle));
+    expect(order.every((i) => i > -1)).toBe(true);
+    expect([...order].sort((a, b) => a - b)).toEqual(order);
+    // Each side is attributed, so the model can tell its own words from the
+    // runtime's — the whole subject of #569.
+    expect(out).toContain('YOU:');
+    expect(out).toContain('INK RUNTIME:');
+  });
+
+  it('is empty when the turn has said nothing yet', () => {
+    expect(buildMidTurnReseedBody([])).toBe('');
+    expect(buildMidTurnReseedBody([assistant('   '), runtime('')])).toBe('');
+  });
+
+  it('REGRESSION (Lumen, round 2): the final continuation is never cut; earlier entries are elided whole', () => {
+    const results =
+      '[Tool results from previous turn]\nTool evict_context (executed): ' +
+      JSON.stringify({ evicted: 3000, note: 'x'.repeat(2_000) });
+    const out = buildMidTurnReseedBody([
+      assistant('a'.repeat(MID_TURN_RESEED_MAX_CHARS)),
+      runtime(
+        '[Tool results from previous turn]\nTool list_context (executed): {"totalEntries":3500}'
+      ),
+      assistant('Now evicting.'),
+      runtime(results),
+    ]);
+    expect(out).toContain(results);
+    expect(out).toContain('INK RUNTIME:\nINK RUNTIME:'.slice(0, 0) + 'Now evicting.');
+    expect(out).toContain('"totalEntries":3500');
+    expect(out).toContain('[earlier turn dialogue elided: 1 entry]');
+    expect(out).not.toContain('a'.repeat(100));
+  });
+
+  it('a final continuation larger than the whole budget is still delivered whole', () => {
+    const huge =
+      '[Tool results from previous turn]\nTool get_email (executed): ' +
+      'b'.repeat(MID_TURN_RESEED_MAX_CHARS + 5_000);
+    const out = buildMidTurnReseedBody([assistant('Fetching.'), runtime(huge)]);
+    expect(out).toContain(huge);
+    expect(out).toContain('[earlier turn dialogue elided: 1 entry]');
+  });
+
+  it('spawnDialogueText retracts a recorded prefix once a later block confirms the frame (Lumen, round 2)', () => {
+    // Block 1 ends in a line that could still be a header; block 2 confirms it.
+    const guard = new ImitationPreviewGuard(findImitatedToolResults, isPotentialImitationPrefix);
+    let said = '';
+    said += 'Looking.\nuser';
+    const first = guard.onBlock('Looking.\nuser');
+    expect(spawnDialogueText(said, first)).toBe('Looking.\nuser');
+    said += '[Tool results from previous turn]\nTool x (executed): {}';
+    const second = guard.onBlock('[Tool results from previous turn]\nTool x (executed): {}');
+    expect(second.imitationDiscarded).toBe(true);
+    expect(spawnDialogueText(said, second)).toBe('Looking.\n');
+  });
+});
+
+describe('findLastBackendSession — a mid-turn reseed marker is recovered like any seed (#572)', () => {
+  it('recovers the mid-turn id so the next process resumes it', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sb-transcript-'));
+    const path = join(dir, 't.jsonl');
+    writeFileSync(
+      path,
+      [
+        { type: 'backend_session', id: 'before', routing: 'local' },
+        { type: 'context_evict', actor: 'sb', refs: [] },
+        { type: 'backend_session', id: 'mid-turn', routing: 'local', reason: 'mid-turn-roll' },
+      ]
+        .map((e) => JSON.stringify(e))
+        .join('\n') + '\n'
+    );
+    try {
+      expect(findLastBackendSession(path)).toEqual({ id: 'mid-turn', routing: 'local' });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('continuationSpawnArgs — the session argument a continuation spawn carries (Lumen, PR #577 final pass)', () => {
+  it('a resume carries backendSessionId and never re-delivers media', () => {
+    expect(continuationSpawnArgs({ mode: 'resume', id: 'S1' }, true)).toEqual({
+      sessionArgs: { backendSessionId: 'S1' },
+      deliverMedia: false,
+    });
+  });
+  it('a mid-turn seed carries backendSessionSeedId — never backendSessionId — and re-delivers the media it has', () => {
+    expect(continuationSpawnArgs({ mode: 'seed', id: 'N1' }, true)).toEqual({
+      sessionArgs: { backendSessionSeedId: 'N1' },
+      deliverMedia: true,
+    });
+    expect(continuationSpawnArgs({ mode: 'seed', id: 'N1' }, false).deliverMedia).toBe(false);
+  });
+  it('a stateless spawn carries neither', () => {
+    expect(continuationSpawnArgs({ mode: 'stateless' }, true)).toEqual({
+      sessionArgs: {},
+      deliverMedia: false,
+    });
   });
 });
