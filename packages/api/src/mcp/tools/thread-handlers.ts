@@ -97,7 +97,16 @@ const agentIdSchema = z.string().min(1).max(64);
 const getThreadMessagesSchema = userIdentifierBaseSchema.extend({
   threadKey: threadKeySchema,
   agentId: z.string().describe('Agent ID requesting access (must be a participant)'),
-  limit: z.number().int().min(1).max(200).optional().default(50),
+  limit: z
+    .number()
+    .int()
+    .min(1)
+    .max(200)
+    .optional()
+    .default(50)
+    .describe(
+      'Max messages to return. Cuts from the NEWEST end on oldest-first reads (the default and fullHistory paths) — so a limit below the thread length gives you the START of the thread, not the recent part. skippedNewerCount and truncationWarning report it. Use latestN to cut from the older end instead.'
+    ),
   beforeMessageId: z.string().uuid().optional().describe('Cursor: get messages before this ID'),
   afterMessageId: z.string().uuid().optional().describe('Cursor: get messages after this ID'),
   includeSystemEvents: z.boolean().optional().default(true),
@@ -107,7 +116,7 @@ const getThreadMessagesSchema = userIdentifierBaseSchema.extend({
     .optional()
     .default(false)
     .describe(
-      'Return the full timeline regardless of read state. Without this (and without an explicit cursor), results fall back to messages newer than the last-read pointer — which hides already-delivered messages from watchers/pollers that manage their own cursor (e.g., ink wait).'
+      'Return the full timeline regardless of read state. Without this (and without an explicit cursor), results fall back to messages newer than the last-read pointer — which hides already-delivered messages from watchers/pollers that manage their own cursor (e.g., ink wait). NOTE: this bypasses the read-state floor, not `limit`. On a thread longer than `limit` (default 50) you get the OLDEST that many, i.e. the start of the thread rather than the recent part — check skippedNewerCount, and pass latestN if you want the newest.'
     ),
   newerThan: isoDateTime()
     .optional()
@@ -478,8 +487,25 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
 
   let messages: Record<string, unknown>[] | null = null;
   let skippedOlderCount = 0;
+  let skippedNewerCount = 0;
 
   if (!newestFirst) {
+    // This branch reads OLDEST-first, so a limit smaller than the thread cuts
+    // the NEWEST messages — the opposite end from the guard below, and the
+    // dangerous direction. `fullHistory: true` with a limit lands here: the
+    // caller asked for the whole timeline, got the front of it, and nothing
+    // said so. Myra called it with limit 5 on a 34-message thread and received
+    // five messages from six days earlier — a coherent, plausible, entirely
+    // stale view of a thread whose recent half was the point. She noticed only
+    // because she knew a specific message had to be there.
+    //
+    // Zero results prompt a retry. Stale results do not. So count here for the
+    // same reason the guard branch counts: truncation must be visible, and
+    // visible from whichever end it happened at.
+    const { count: totalMatching, error: countErr } = await buildQuery('id', true);
+    if (countErr) {
+      throw new Error(`Failed to count thread messages: ${countErr.message}`);
+    }
     const { data, error } = await buildQuery('*')
       .order('created_at', { ascending: true })
       .limit(effectiveLimit);
@@ -487,6 +513,7 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
       throw new Error(`Failed to get thread messages: ${error.message}`);
     }
     messages = data;
+    skippedNewerCount = Math.max(0, (totalMatching ?? data?.length ?? 0) - (data?.length ?? 0));
   } else {
     // Count everything past the floor so truncation is visible, not silent.
     const { count: totalMatching, error: countErr } = await buildQuery('id', true);
@@ -615,10 +642,28 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
           status: thread.status,
           createdBy: thread.created_by_agent_id,
           participants,
+          // Messages RETURNED, not messages in the thread. A caller reading
+          // this as the thread's size concludes an active thread is empty.
           messageCount: messages?.length || 0,
           // Truncation is visible, never silent: how many older matching
           // messages were cut by the cold-start guard or latestN window.
           ...(skippedOlderCount > 0 ? { skippedOlderCount } : {}),
+          // ...and how many NEWER ones were cut by an oldest-first limit. Said
+          // in prose as well as a number because the number alone reads like
+          // ordinary pagination, and the consequence — you are looking at the
+          // wrong end of the thread — is what the caller needs to act on.
+          ...(skippedNewerCount > 0
+            ? {
+                skippedNewerCount,
+                truncatedFrom: 'newest' as const,
+                // Deliberately NOT `warning`: the advanceFailed block below
+                // sets that key and is spread after this one, so sharing it
+                // would let one warning silently delete the other.
+                truncationWarning:
+                  `Returned the OLDEST ${messages?.length || 0} messages; the ${skippedNewerCount} NEWEST were cut, ` +
+                  `so anything recent is missing. Omit \`limit\` for the whole timeline, or pass \`latestN\` to get the newest instead.`,
+              }
+            : {}),
           ...(guardActive ? { coldStartGuard: true } : {}),
           // Checked write surfaced to the caller (spec §5): messages were
           // returned, but the read-pointer advance did NOT persist — read
