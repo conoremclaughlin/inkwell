@@ -1661,6 +1661,98 @@ export function isAttachableSessionSummary(session: SessionSummary): boolean {
 }
 
 /**
+ * Does picking this row require an explicit server-side reopen?
+ *
+ * Exactly the rows the picker shows as history — the ones
+ * {@link isAttachableSessionSummary} rejects. Defined as the negation rather
+ * than as its own list of terminal markers, because two lists of "what counts
+ * as finished" would drift, and the drift would be silent: a row shown as
+ * history but not reopened resumes into a session the server still considers
+ * over, which is the exact defect this repairs.
+ */
+export function sessionNeedsReopen(session: SessionSummary): boolean {
+  return !isAttachableSessionSummary(session);
+}
+
+export interface ReopenOutcome {
+  ok: boolean;
+  reason?: string;
+}
+
+/**
+ * Decide whether a reopen actually took, from the row the server sent back.
+ *
+ * Pure so the decision can be tested without a server, and separate from the
+ * call so the thing being judged is the POST-STATE rather than the response
+ * envelope. `success: true` proves only that the request was accepted — a
+ * server that has never heard of `reopen` strips the unknown field, updates
+ * nothing, and answers exactly that way. The only evidence that counts is a
+ * row which now reads attachable.
+ */
+export function reopenSucceeded(session: SessionSummary | null | undefined): ReopenOutcome {
+  if (!session) return { ok: false, reason: 'the server returned no session' };
+  if (!isAttachableSessionSummary(session)) {
+    // Name the marker still set — "it did not work" sends the reader hunting,
+    // and the usual cause is a server predating the reopen field.
+    const stuck = session.endedAt
+      ? 'ended_at is still set'
+      : session.lifecycle === 'completed'
+        ? "lifecycle is still 'completed'"
+        : `phase/status still reads ${session.currentPhase || session.status}`;
+    return { ok: false, reason: `${stuck} (an older server may not support reopen)` };
+  }
+  return { ok: true };
+}
+
+/**
+ * Ask the server to reopen a finished session, and verify it did.
+ */
+export async function reopenSelectedSession(
+  pcp: { callTool: (tool: string, args: Record<string, unknown>) => Promise<unknown> },
+  agentId: string,
+  sessionId: string
+): Promise<ReopenOutcome> {
+  let raw: unknown;
+  try {
+    raw = await pcp.callTool('update_session_state', {
+      agentId,
+      sessionId,
+      reopen: true,
+      // Idle, not running: they are back at the prompt, and the on-prompt hook
+      // marks running when they actually type.
+      lifecycle: 'idle',
+    });
+  } catch (err) {
+    return { ok: false, reason: err instanceof Error ? err.message : String(err) };
+  }
+
+  const payload = raw as { success?: boolean; error?: string; session?: SessionSummary } | null;
+  if (payload?.success === false) {
+    return { ok: false, reason: payload.error || 'the server rejected the reopen' };
+  }
+  return reopenSucceeded(payload?.session);
+}
+
+/**
+ * Union of the attachable list and full history for the interactive picker.
+ *
+ * Sessions are chat history — always resumable unless deleted — so the
+ * picker shows finished ones too. The two lists stay separate fetches so a
+ * flood of completed rows can never push a live session past the history
+ * call's row limit (the limit-before-filter defect from PR #532 r2):
+ * attachable rows are guaranteed a seat first, history fills in around them.
+ * Auto-attach paths keep using the attachable list alone — a non-interactive
+ * launch should never silently resume a finished session.
+ */
+export function mergeSessionsWithHistory(
+  attachable: SessionSummary[],
+  history: SessionSummary[]
+): SessionSummary[] {
+  const seen = new Set(attachable.map((session) => session.id));
+  return [...attachable, ...history.filter((session) => !seen.has(session.id))];
+}
+
+/**
  * List the sessions this agent could attach to.
  *
  * Asks for `status: 'attachable'` so the server excludes finished sessions
@@ -3538,13 +3630,24 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // so the JSON stays machine-parseable, and before the TUI so a TTY-less
   // invocation exits instead of blocking on stdin forever.
   if (options.sessionCandidates || options.sessionCandidatesJson) {
-    const sessionsResult = await listAttachableSessions(pcp, {
-      agentId,
-      backend: 'ink',
-      limit: 50,
-    });
+    const [sessionsResult, historyResult] = await Promise.all([
+      listAttachableSessions(pcp, {
+        agentId,
+        backend: 'ink',
+        limit: 50,
+      }),
+      pcp
+        .callTool('list_sessions', { agentId, backend: 'ink', limit: 50 })
+        .catch(() => null) as Promise<Record<string, unknown> | null>,
+    ]);
     const attachable = extractSessionSummaries(sessionsResult).filter(isAttachableSessionSummary);
-    const sessions = filterSessionsByPolicy(attachable, runtime, agentId, toolPolicy, 'attach');
+    const sessions = filterSessionsByPolicy(
+      mergeSessionsWithHistory(attachable, extractSessionSummaries(historyResult)),
+      runtime,
+      agentId,
+      toolPolicy,
+      'attach'
+    );
     const candidates = sessions.map((session) => ({
       type: 'pcp' as const,
       id: session.id,
@@ -3555,6 +3658,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       threadKey: session.threadKey || null,
       studioName: session.studioName || null,
       startedAt: session.startedAt || null,
+      attachable: isAttachableSessionSummary(session),
     }));
     if (options.sessionCandidatesJson) {
       restoreConsoleLog();
@@ -3585,7 +3689,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         console.log(`  ${bits.join('  ·  ')}`);
       }
       if (candidates.length === 0) {
-        console.log(chalk.dim('  (no attachable ink sessions)'));
+        console.log(chalk.dim('  (no ink sessions)'));
       }
     }
     return;
@@ -4319,13 +4423,21 @@ export async function runChat(options: ChatOptions): Promise<void> {
     !options.attachLatest &&
     !runtime.threadKey
   ) {
-    const sessionsResult = await listAttachableSessions(pcp, {
-      agentId,
-      backend: 'ink',
-      limit: 50,
-    });
+    const [sessionsResult, historyResult] = await Promise.all([
+      listAttachableSessions(pcp, {
+        agentId,
+        backend: 'ink',
+        limit: 50,
+      }),
+      pcp
+        .callTool('list_sessions', { agentId, backend: 'ink', limit: 50 })
+        .catch(() => null) as Promise<Record<string, unknown> | null>,
+    ]);
+    const attachableSessions = extractSessionSummaries(sessionsResult).filter(
+      isAttachableSessionSummary
+    );
     const sessions = filterSessionsByPolicy(
-      extractSessionSummaries(sessionsResult).filter(isAttachableSessionSummary),
+      mergeSessionsWithHistory(attachableSessions, extractSessionSummaries(historyResult)),
       runtime,
       agentId,
       toolPolicy,
@@ -4379,6 +4491,47 @@ export async function runChat(options: ChatOptions): Promise<void> {
         if (selected) {
           attachedSessionSummary = selected;
           runtime.sessionId = selected.id;
+          // A human just chose a FINISHED session out of their history, so it
+          // is not finished any more. Sent here, at the selection, because the
+          // selection is what caused it — the previous behaviour leaned on the
+          // next incidental `update_session_state`, and that call sends
+          // `status: 'active'`, which is and always was a server-side no-op.
+          // The row stayed terminal with `ended_at` set while the chat
+          // generated, invisible to attachable listing, active lookup and
+          // findByThreadKey — so a trigger could open a SECOND session on the
+          // thread the human was already typing into (Lumen, PR #541).
+          //
+          // Only the interactive picker reaches this. Auto-attach filters to
+          // attachable rows before choosing, so it can never revive anything,
+          // and the terminal fence automatic routing relies on stays intact.
+          if (sessionNeedsReopen(selected)) {
+            // FAIL CLOSED. The previous version swallowed everything with
+            // `.catch(() => undefined)` and carried on, which is the failure
+            // this PR exists to remove wearing a different coat: a reopen that
+            // errors, or that lands on a server too old to know the flag and
+            // returns a cheerful success without doing anything, would leave
+            // the human typing into a session the server still considers over
+            // — the exact silent resume-into-a-terminal-row we started from.
+            //
+            // So the RESULT is checked, not the absence of an exception, and
+            // the post-state is checked rather than the acknowledgement: an old
+            // server ignoring an unknown field still answers `success: true`.
+            // Only a row that actually comes back attachable counts.
+            const reopened = await reopenSelectedSession(pcp, agentId, selected.id);
+            if (!reopened.ok) {
+              console.log(
+                chalk.yellow(
+                  `Could not reopen session ${selected.id.slice(0, 8)} — ${reopened.reason}`
+                )
+              );
+              console.log(
+                chalk.dim(
+                  '  Not attaching: the server still lists it as finished, so a trigger could open a second session on this thread.'
+                )
+              );
+              return;
+            }
+          }
           if (selected.studioId) {
             runtime.studioId = selected.studioId;
           }
@@ -4395,8 +4548,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
       }
       // picked === null means "New session" — fall through to create one
     } else {
-      // Non-interactive or no sessions — auto-attach to latest (existing behavior)
-      const selected = pickLatestSession(sessions, undefined, { studioId: runtime.studioId });
+      // Non-interactive or no sessions — auto-attach to latest. Filters back
+      // to attachable: history rows are for the human picker; a headless
+      // launch must not silently resume a finished session.
+      const selected = pickLatestSession(sessions.filter(isAttachableSessionSummary), undefined, {
+        studioId: runtime.studioId,
+      });
       if (selected) {
         attachedSessionSummary = selected;
         runtime.sessionId = selected.id;
