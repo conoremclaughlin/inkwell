@@ -48,11 +48,7 @@ import {
 } from './services/heartbeat';
 import { StrategyService } from './services/strategy.service';
 import { getOrchestrator } from './services/sandbox/index.js';
-import {
-  setResponseCallback,
-  hasExplicitResponse,
-  clearExplicitResponse,
-} from './mcp/tools/response-handlers';
+import { setResponseCallback, consumeExplicitResponse } from './mcp/tools/response-handlers';
 import { getAgentGateway, type AgentTriggerPayload } from './channels/agent-gateway';
 import { storedTriggerMedia } from './channels/agent-media';
 import { resolveRouteAgentId } from './services/routing/resolve-route';
@@ -60,6 +56,7 @@ import { resolveAgentFromMention } from './services/routing/resolve-mention';
 import { getHeartbeatProcessingConfig } from './config/heartbeat-flags';
 import { classifyError } from '@inklabs/shared';
 import { logger } from './utils/logger';
+import { decideChannelForward, applyChannelForward } from './services/channel-forward.js';
 import { getUserFromContext } from './utils/request-context';
 import { env } from './config/env';
 import {
@@ -371,30 +368,37 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       channel === 'slack';
     if (isExternalChannel && channelGateway) {
       // Check if send_response was called via MCP (tracked in response-handlers)
-      const hadExplicitResponse = hasExplicitResponse(channel, conversationId);
+      // Reads AND clears. releaseConversation below drains a pending next turn
+      // synchronously, and a marker still standing then is read by that nested
+      // turn as its own delivery (Lumen, PR #580 r2). One call, no window.
+      const hadExplicitResponse = consumeExplicitResponse(channel, conversationId);
 
-      if (!hadExplicitResponse && result.finalTextResponse && result.success) {
-        // Auto-route Claude's text response back to the originating channel
-        logger.info('Auto-routing text response (no explicit send_response called)', {
-          channel,
-          conversationId,
-          responseLength: result.finalTextResponse.length,
-        });
-        await channelGateway.releaseConversation(channel as GatewayChannel, conversationId, {
-          content: result.finalTextResponse,
-          format: 'markdown',
-        });
-      } else {
-        // Just release the conversation (and process any pending messages)
-        logger.debug('Explicit send_response detected, skipping auto-forward', {
+      // Captured so the deferred release closure keeps the non-null narrowing
+      // from the enclosing guard.
+      const gateway = channelGateway;
+      const forward = decideChannelForward({
+        hadExplicitResponse,
+        success: result.success,
+        finalTextResponse: result.finalTextResponse,
+      });
+
+      await applyChannelForward(
+        forward,
+        {
           channel,
           conversationId,
           hadExplicitResponse,
-        });
-        await channelGateway.releaseConversation(channel as GatewayChannel, conversationId);
-      }
-
-      clearExplicitResponse(channel, conversationId);
+          runSucceeded: result.success,
+          finalTextLength: result.finalTextResponse?.length ?? 0,
+        },
+        {
+          info: (m, meta) => logger.info(m, meta),
+          warn: (m, meta) => logger.warn(m, meta),
+          debug: (m, meta) => logger.debug(m, meta),
+          release: (payload) =>
+            gateway.releaseConversation(channel as GatewayChannel, conversationId, payload),
+        }
+      );
     }
 
     if (!result.success) {
