@@ -200,6 +200,13 @@ export function startBackendTurn(request: BackendRunRequest): BackendTurnHandle 
   };
 }
 
+/**
+ * The UTF-8 bytes of exactly what a spawn would hand the backend — every
+ * argv element plus stdin — prepared through the adapter and cleaned up
+ * without spawning. This is what a stateless parent's next request costs at
+ * the byte bound: envelope, system prompt, tool instructions and media alike
+ * (Lumen, PR #576 round 7).
+ */
 export async function runBackendTurn(request: BackendRunRequest): Promise<BackendRunResult> {
   return startBackendTurn(request).result;
 }

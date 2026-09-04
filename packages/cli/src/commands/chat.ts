@@ -57,7 +57,12 @@ import {
   runBackendInteractiveLogin,
   type BackendAuthBackend,
 } from '../lib/backend-auth.js';
-import { startBackendTurn, runBackendTurn, type BackendRunResult } from '../repl/backend-runner.js';
+import {
+  startBackendTurn,
+  runBackendTurn,
+  type BackendRunResult,
+  type BackendRunRequest,
+} from '../repl/backend-runner.js';
 import { StreamedTurnRenderer, type StreamedLine } from '../repl/paragraph-stream.js';
 import { ImitationPreviewGuard } from '../repl/preview-guard.js';
 import type { BackendTurnEvent } from '../backends/stream.js';
@@ -107,6 +112,7 @@ import {
   createSignalSink,
   isClientLocalTool,
   handleClientLocalTool,
+  globalSignalSink,
   type SignalSink,
   getLastSignal,
   clearLastSignal,
@@ -169,6 +175,7 @@ import {
   type BackendTurnOutcome,
   type LocalToolCall,
   type ToolResultRecord,
+  MAX_RELAY_BYTES,
 } from '../repl/agent-loop.js';
 // Re-exported for callers (and tests) that have always imported these from
 // chat.js. The implementations moved to ../repl/agent-loop.js so the turn
@@ -2776,6 +2783,179 @@ function applyBudgetForWindow(runtime: ChatRuntime, window: number): void {
   }
 }
 
+/** Share of the remaining window one relay may spend; the rest is the model's reply and the next turn. */
+export const RELAY_HEADROOM_SHARE = 0.5;
+/**
+ * Bytes per token to assume when converting headroom into a relay budget —
+ * and the reason budgets are in UTF-8 BYTES at all. No text tokenizes to
+ * more tokens than its UTF-8 bytes (byte-level BPE bottoms out at one token
+ * per byte), so 1 byte/token is a bound for any script; a chars-per-token
+ * heuristic is not — the incident's JSON measured ~1.9 chars/token, and the
+ * half-headroom promise failed below 0.75 UTF-16 chars/token (Lumen, PR #576
+ * rounds 3–4). For ASCII JSON this is about twice as conservative as needed;
+ * the payloads are in the transcript, and safety is the point.
+ */
+export const RELAY_BYTES_PER_TOKEN = 1;
+/**
+ * The floor a relay gets when the window has no headroom left: enough for a
+ * stub per result that still names the tool and status, so the model is never
+ * blind to what ran — at most 4K tokens, at the byte bound.
+ */
+export const MIN_RELAY_BUDGET_BYTES = 4_000;
+
+const utf8Bytes = (text: string): number => Buffer.byteLength(text, 'utf8');
+
+/**
+ * What the provider's session holds after a reply, by its own accounting:
+ * the prompt it was handed (input + cache parts for Anthropic, whose cache
+ * fields are disjoint from input; input alone for OpenAI/Gemini, whose input
+ * already includes the cache) plus the reply it produced — including hidden
+ * thinking, which no byte count of the visible text could see (Lumen, PR
+ * #576 round 5). Undefined when the backend reported nothing usable.
+ */
+export function occupancyTokens(
+  backend: string,
+  usage:
+    | Pick<
+        BackendTokenUsage,
+        | 'inputTokens'
+        | 'cacheReadTokens'
+        | 'cacheWriteTokens'
+        | 'outputTokens'
+        | 'totalTokens'
+        | 'reasoningTokens'
+      >
+    | undefined
+): number | undefined {
+  if (!usage) return undefined;
+  const name = backend.toLowerCase();
+  if (name === 'claude' || name === 'anthropic') {
+    // Anthropic's cache fields are disjoint from input; its total is input +
+    // output only, so the parts are summed here.
+    const prompt = [usage.inputTokens, usage.cacheReadTokens, usage.cacheWriteTokens].filter(
+      (n): n is number => n !== undefined
+    );
+    if (prompt.length === 0) return undefined;
+    return prompt.reduce((a, b) => a + b, 0) + (usage.outputTokens ?? 0);
+  }
+  // OpenAI and Gemini: the reported total already includes the cached prompt
+  // and hidden reasoning (Gemini's thoughtsTokenCount is part of
+  // totalTokenCount); without a total, prompt + output + reasoning (Lumen,
+  // PR #576 round 6).
+  if (usage.totalTokens !== undefined) return usage.totalTokens;
+  if (usage.inputTokens === undefined) return undefined;
+  return usage.inputTokens + (usage.outputTokens ?? 0) + (usage.reasoningTokens ?? 0);
+}
+
+/**
+ * The PROMPT part of a report — what the provider counted as handed to the
+ * model, discovered instruction files, tool schemas and media included — per
+ * backend accounting: input + cache parts for Anthropic, input alone for
+ * OpenAI/Gemini (whose input already includes the cache). A stateless
+ * parent's next envelope is this plus what the ledger grew since; the reply
+ * is not re-sent and is not counted (Lumen, PR #576 rounds 5–10).
+ */
+export function promptTokensOf(
+  backend: string,
+  usage: Pick<BackendTokenUsage, 'inputTokens' | 'cacheReadTokens' | 'cacheWriteTokens'> | undefined
+): number | undefined {
+  if (!usage) return undefined;
+  const name = backend.toLowerCase();
+  if (name === 'claude' || name === 'anthropic') {
+    const parts = [usage.inputTokens, usage.cacheReadTokens, usage.cacheWriteTokens].filter(
+      (n): n is number => n !== undefined
+    );
+    return parts.length ? parts.reduce((a, b) => a + b, 0) : undefined;
+  }
+  return usage.inputTokens;
+}
+
+/**
+ * The bytes a ledger entry costs once rendered into a stateless envelope —
+ * its content, role and source in UTF-8, plus a per-entry allowance for the
+ * framing the envelope adds around them. An over-approximation on purpose:
+ * a tokens × 4 estimate charged 500 for a 1,483-byte Han entry and omitted
+ * the framing entirely (Lumen, PR #576 round 11).
+ */
+export const LEDGER_ENTRY_FRAME_BYTES = 64;
+export function ledgerEntryPromptBytes(entry: {
+  role: string;
+  content: string;
+  source?: string;
+}): number {
+  return (
+    utf8Bytes(entry.content) +
+    utf8Bytes(entry.role) +
+    utf8Bytes(entry.source ?? '') +
+    LEDGER_ENTRY_FRAME_BYTES
+  );
+}
+
+/** What a stateless clone joins its history with; two ride along every new turn. */
+export const CLONE_HISTORY_SEPARATOR = '\n\n---\n\n';
+
+/**
+ * Local tools after which a stateless provider's next fresh spawn may see a
+ * DIFFERENT discovered context: a write or edit can change AGENTS.md, a shell
+ * can change anything. The previous report's prompt count then no longer
+ * describes the next envelope, so the stateless count is dropped to unknown
+ * (the floor) until the next report (Lumen, PR #576 round 12).
+ */
+export const CONTEXT_MUTATING_TOOLS: ReadonlySet<string> = new Set([
+  'write',
+  'edit',
+  'multi_edit',
+  'apply_patch',
+  'bash',
+]);
+
+/**
+ * How many UTF-8 bytes the next relay message may be, from the window's live
+ * headroom: the window minus what it holds, times RELAY_HEADROOM_SHARE, at
+ * RELAY_BYTES_PER_TOKEN — clamped between MIN_RELAY_BUDGET_BYTES and
+ * MAX_RELAY_BYTES.
+ *
+ * What it holds is `occupancyTokens`, which the host supplies: for a native
+ * session the provider's own count after the last reply — and NOTHING once a
+ * later spawn reported no usage, because hidden thinking that was never
+ * reported cannot be recovered from visible text (Lumen, PR #576 round 7);
+ * for a stateless parent the previous request's PROMPT tokens as the provider
+ * counted them (system prompt, discovered instruction files, tool schemas and
+ * media included — nothing ink could measure from outside bounds those; Lumen,
+ * PR #576 rounds 7–10) plus the exact rendered bytes of every ledger entry
+ * added after that report and still present (by entry id — an eviction of
+ * older entries can never net an addition away); the previous body is inside
+ * the count and is not re-sent, which is slack in the safe direction. With no
+ * occupancy the relay gets the floor.
+ *
+ * The one named assumption for a stateless parent: what the provider
+ * discovers on its own (instruction files, tool schemas) is the same on the
+ * next spawn as on the reported one. Ink drops the count to unknown whenever
+ * the session-wide context generation moved since the report — any parent or
+ * clone call of CONTEXT_MUTATING_TOOLS bumps it before running and again when
+ * it settles, and no count is trusted while one is in flight, so an error after
+ * a side effect and a spawn overlapping the mutation both count; drift caused
+ * OUTSIDE this process — another
+ * process editing AGENTS.md between spawns — is not detected and is accepted
+ * as the limit of what the runtime can know (Lumen, PR #576 rounds 12–13).
+ *
+ * The bound is exact for the relay string. The floor is the one deliberate
+ * exception: at exhausted headroom the model still receives a
+ * MIN_RELAY_BUDGET_BYTES receipt of what ran, because a silent loop is worse
+ * than a small overrun; the pre-turn compaction threshold is what keeps
+ * headroom from reaching zero (Lumen, PR #576 rounds 2–7).
+ */
+export function relayBudgetBytes(
+  runtime: Pick<ChatRuntime, 'maxContextTokens'>,
+  occupancyTokens?: number
+): number {
+  const occupied =
+    occupancyTokens !== undefined ? Math.max(0, occupancyTokens) : runtime.maxContextTokens;
+  const remainingTokens = Math.max(0, runtime.maxContextTokens - occupied);
+  const bytes = Math.floor(remainingTokens * RELAY_BYTES_PER_TOKEN * RELAY_HEADROOM_SHARE);
+  return Math.min(MAX_RELAY_BYTES, Math.max(MIN_RELAY_BUDGET_BYTES, bytes));
+}
+
 export function buildPromptEnvelope(
   agentId: string,
   runtime: ChatRuntime,
@@ -3989,6 +4169,38 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // resumed native session would be stale, so runUserTurn invalidates and
   // reseeds. Subsumes the backend check (backend is part of the shape).
   let activeBackendSessionShape: string | undefined;
+  // The stateless parent budget state, per turn (reset at turn start): the
+  // last report's prompt count and the ledger high-water id it was taken
+  // against. Held here, not in the turn, because the local-tool executor
+  // that invalidates it is declared before the turn (PR #576 round 12).
+  let statelessPromptTokens: number | undefined;
+  let ledgerMaxIdAtReport = -1;
+  /**
+   * The session-wide CONTEXT GENERATION: bumped before any local tool that can
+   * change what a stateless provider discovers on its next fresh spawn runs —
+   * by the parent or by any clone, and before execution so an error after a
+   * side effect still counts. A stateless count is trusted only while the
+   * generation it was reported in is the current one (Lumen, PR #576 round 13).
+   */
+  let contextGeneration = 0;
+  let statelessGenerationAtReport = 0;
+  /**
+   * Mutations still running. A stateless spawn that starts and returns while
+   * one is in flight would record the post-start generation and trust it after
+   * the mutation lands, so occupancy is rejected while any is in flight and the
+   * generation advances AGAIN on settlement (Lumen, PR #576 round 14).
+   */
+  let mutationsInFlight = 0;
+  /** Returns the settle callback the caller must run in `finally`. */
+  const beginContextMutationFor = (calls: ReadonlyArray<{ tool: string }>): (() => void) => {
+    if (!calls.some((c) => CONTEXT_MUTATING_TOOLS.has(bareToolName(c.tool)))) return () => {};
+    contextGeneration += 1;
+    mutationsInFlight += 1;
+    return () => {
+      mutationsInFlight -= 1;
+      contextGeneration += 1;
+    };
+  };
 
   let historyHydration: HistoryHydrationResult | null = null;
   if (attachedToExistingSession && existingTranscript) {
@@ -5068,6 +5280,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
     const cloneBackend = runtime.backend;
     const cloneModel = runtime.model;
     const cloneRouting = runtime.toolRouting;
+    // Frozen with the rest of the clone's shape: its budget must describe
+    // the window IT was spawned into, not whatever the parent switches to
+    // while it runs (Lumen, PR #576 round 4).
+    const cloneMaxContextTokens = runtime.maxContextTokens;
     /**
      * Only Claude actually honours a seeded provider session — the parent host
      * gates on exactly this (`canReuseBackendSession`). Codex and Gemini ignore
@@ -5095,6 +5311,28 @@ export async function runChat(options: ChatOptions): Promise<void> {
     let cloneToolCalls = 0;
     // This clone's own signal state — never the parent's global.
     const cloneSignal = createSignalSink();
+    /** What the clone's window holds beyond its ledger — see relayBudgetBytes. */
+    let cloneOccupancyTokens: number | undefined;
+    let cloneGenerationAtReport = 0;
+    /** The clone spawn's request; the budget measures the same shape. */
+    const cloneRequest = (
+      prompt: string,
+      sessionArgs: Record<string, string> = {}
+    ): BackendRunRequest => ({
+      backend: cloneBackend,
+      agentId,
+      model: cloneModel,
+      effort: runtime.effort,
+      prompt,
+      verbose: false,
+      passthroughArgs: clonePassthrough,
+      systemPromptOverride: runtime.systemPromptOverride,
+      timeoutMs: runtime.backendTurnTimeoutMs,
+      idleTimeoutMs: runtime.backendIdleTimeoutMs,
+      stream: true,
+      toolRouting: cloneRouting,
+      ...sessionArgs,
+    });
 
     const cloneRunTurn = async (
       body: string,
@@ -5114,24 +5352,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
       const prompt =
         cloneCanReuseSession || !turnCtx.isContinuation
           ? body
-          : [...cloneHistory, body].join('\n\n---\n\n');
+          : [...cloneHistory, body].join(CLONE_HISTORY_SEPARATOR);
       if (!cloneCanReuseSession) cloneHistory.push(body);
 
-      const turn = startBackendTurn({
-        backend: cloneBackend,
-        agentId,
-        model: cloneModel,
-        effort: runtime.effort,
-        prompt,
-        verbose: false,
-        passthroughArgs: clonePassthrough,
-        systemPromptOverride: runtime.systemPromptOverride,
-        timeoutMs: runtime.backendTurnTimeoutMs,
-        idleTimeoutMs: runtime.backendIdleTimeoutMs,
-        stream: true,
-        toolRouting: cloneRouting,
-        ...sessionArgs,
-      });
+      const generationBeforeSpawn = contextGeneration;
+      const turn = startBackendTurn(cloneRequest(prompt, sessionArgs));
 
       // Ctrl+C on the parent turn kills the clone's child too, not just the
       // parent's — otherwise a cancelled turn leaves backends running.
@@ -5142,6 +5367,25 @@ export async function runChat(options: ChatOptions): Promise<void> {
         ctx.signal?.removeEventListener('abort', onAbort)
       );
       const text = result.responseText ?? result.stdout;
+      // A native session accumulates every body and reply; a stateless one
+      // re-packs its history into each prompt, so the latest prompt IS the
+      // window. Either way this is what the next relay must fit beside.
+      // A native clone session: the report covers everything so far; a spawn
+      // that reported nothing leaves it unknown (the floor) until the next
+      // report. A stateless clone re-packs its history: the report's prompt
+      // covered the history and body sent, and the reply now joins the
+      // history, so it is added at the byte bound.
+      cloneOccupancyTokens = cloneCanReuseSession
+        ? occupancyTokens(cloneBackend, result.usage)
+        : (() => {
+            const prompt = promptTokensOf(cloneBackend, result.usage);
+            // The reply joins the history with a separator on each side of
+            // the next body (Lumen, PR #576 round 11).
+            return prompt === undefined
+              ? undefined
+              : prompt + utf8Bytes(text) + 2 * utf8Bytes(CLONE_HISTORY_SEPARATOR);
+          })();
+      cloneGenerationAtReport = generationBeforeSpawn;
       if (!cloneCanReuseSession && text.trim()) cloneHistory.push(text.trim());
       appendTranscript(record.transcriptPath, {
         type: 'backend_turn',
@@ -5188,6 +5432,22 @@ export async function runChat(options: ChatOptions): Promise<void> {
           // Nobody is watching a clone's scrollback, so a refusal it is not told
           // about becomes silent abandonment of the task.
           continueOnBlocked: true,
+          // The clone's window is its own: the same model window, its identity
+          // prompt in place of the parent's bootstrap, its own ledger of
+          // local-tool summaries, and what its session (or re-packed history)
+          // holds. Without this it took the static 200K default (Lumen, PR
+          // #576 round 3).
+          relayBudgetBytes: () =>
+            relayBudgetBytes(
+              { maxContextTokens: cloneMaxContextTokens },
+              // A stateless clone's count is trusted only within the generation
+              // it was reported in — its own mutators and a concurrent parent's
+              // both bump it (Lumen, PR #576 round 13).
+              cloneCanReuseSession ||
+                (mutationsInFlight === 0 && cloneGenerationAtReport === contextGeneration)
+                ? cloneOccupancyTokens
+                : undefined
+            ),
         },
         {
           ui: {
@@ -5314,99 +5574,108 @@ export async function runChat(options: ChatOptions): Promise<void> {
     }
   ): Promise<ToolResultRecord[]> => {
     const results: ToolResultRecord[] = [];
-    await executeToolCalls(calls, {
-      policy: opts.policy,
-      sessionId: runtime.sessionId,
-      signal: opts.signal,
-      callTool: createLocalToolDispatcher({
-        cwd: process.cwd(),
-        callPi: callPiTool,
-        callPcp: (bare, resolved) => pcp.callTool(bare, resolved),
-        resolveCredentials: (args) => resolveCredentialRefs(args, buildResolverEnv()).args,
-        // A clone asking what it can call gets its own narrower surface —
-        // the same one its prompt described, not the parent's.
-        audience: 'clone',
-        // And what its OWN policy will refuse, which is not the same thing:
-        // a derived clone policy inherits the parent's denials on top of the
-        // clone's, so a parent that denies `read` yields a clone that cannot
-        // read. inspectPcpTool, never canCallPcpTool — asking what exists must
-        // not spend the parent's one-use grants.
-        isHardDenied: (tool) => {
-          const decision = opts.policy.inspectPcpTool(bareToolName(tool), runtime.sessionId);
-          return !decision.allowed && !decision.promptable;
-        },
-        head: (tool, args) => {
-          // Non-nesting is enforced HERE, not by omitting spawn_agent from the
-          // clone's prompt: tool calls travel as text, so a model can name any
-          // tool it likes regardless of what it was told.
-          if (isForbiddenInClone(tool)) {
-            return {
-              content: [
-                {
-                  type: 'text',
-                  text: `${tool} is not available to a shadow clone. Report what you found and let your parent act on it.`,
-                },
-              ],
-              isError: true,
-            } as PcpToolCallResult;
-          }
-          if (isClientLocalTool(tool)) {
-            // A throwaway ledger AND a private signal sink. The sink is the
-            // load-bearing half: `signal_status` otherwise writes the module
-            // global that runChat reads to decide whether the whole
-            // non-interactive run completed — and every clone is instructed to
-            // signal when it finishes. A clone would end its parent's run, and
-            // concurrent clones would race for the same slot.
-            return handleClientLocalTool(
+    const settleContextMutation = beginContextMutationFor(calls);
+    try {
+      await executeToolCalls(calls, {
+        policy: opts.policy,
+        sessionId: runtime.sessionId,
+        signal: opts.signal,
+        callTool: createLocalToolDispatcher({
+          cwd: process.cwd(),
+          callPi: callPiTool,
+          callPcp: (bare, resolved) => pcp.callTool(bare, resolved),
+          resolveCredentials: (args) => resolveCredentialRefs(args, buildResolverEnv()).args,
+          // A clone asking what it can call gets its own narrower surface —
+          // the same one its prompt described, not the parent's.
+          audience: 'clone',
+          // And what its OWN policy will refuse, which is not the same thing:
+          // a derived clone policy inherits the parent's denials on top of the
+          // clone's, so a parent that denies `read` yields a clone that cannot
+          // read. inspectPcpTool, never canCallPcpTool — asking what exists must
+          // not spend the parent's one-use grants.
+          isHardDenied: (tool) => {
+            const decision = opts.policy.inspectPcpTool(bareToolName(tool), runtime.sessionId);
+            return !decision.allowed && !decision.promptable;
+          },
+          head: (tool, args) => {
+            // Non-nesting is enforced HERE, not by omitting spawn_agent from the
+            // clone's prompt: tool calls travel as text, so a model can name any
+            // tool it likes regardless of what it was told.
+            if (isForbiddenInClone(tool)) {
+              return {
+                content: [
+                  {
+                    type: 'text',
+                    text: `${tool} is not available to a shadow clone. Report what you found and let your parent act on it.`,
+                  },
+                ],
+                isError: true,
+              } as PcpToolCallResult;
+            }
+            if (isClientLocalTool(tool)) {
+              // A throwaway ledger AND a private signal sink. The sink is the
+              // load-bearing half: `signal_status` otherwise writes the module
+              // global that runChat reads to decide whether the whole
+              // non-interactive run completed — and every clone is instructed to
+              // signal when it finishes. A clone would end its parent's run, and
+              // concurrent clones would race for the same slot.
+              return handleClientLocalTool(
+                tool,
+                args,
+                cloneLedgerFor(opts.transcriptPath),
+                opts.signalSink
+              );
+            }
+            return null;
+          },
+        }),
+        promptForApproval: (tool, reason, args) =>
+          approvalCoordinator
+            .request({
               tool,
-              args,
-              cloneLedgerFor(opts.transcriptPath),
-              opts.signalSink
-            );
-          }
-          return null;
+              args: args ?? {},
+              reason,
+              sessionId: runtime.sessionId,
+              origin: opts.origin,
+              signal: opts.signal,
+              // The clone's own policy: what gets re-checked, and what a grant
+              // applies to. The parent stays untouched.
+              policy: opts.policy,
+            })
+            .then((outcome) => outcome.approved),
+        onResult: (result) => {
+          // WHOLE, not a 20K slice: a truncated relay tells the agent the full
+          // payload survives in this session's transcript, and for a clone this
+          // file IS that transcript (Lumen, PR #576). A promise about durable
+          // detail has to hold for the caller reading it, not just the parent.
+          const resultJson =
+            result.result === undefined ? undefined : JSON.stringify(result.result);
+          appendTranscript(opts.transcriptPath, {
+            type: 'clone_tool_call',
+            tool: result.tool,
+            args: result.args,
+            status: result.status,
+            reason: result.reason,
+            error: result.error,
+            // The payload, not just the verdict. /clones <id> and the truncation
+            // note both promise the working detail survives on disk.
+            result: resultJson,
+          });
+          results.push({
+            tool: result.tool,
+            // A thrown tool reports through `error`, a refused one through
+            // `reason` — they are different fields. Reading only `reason` feeds
+            // the clone `Tool read (error): undefined`, which tells it nothing
+            // about what went wrong and invites a blind retry.
+            result: describeCloneToolResult(result),
+            status: result.status,
+            args: result.args,
+          });
         },
-      }),
-      promptForApproval: (tool, reason, args) =>
-        approvalCoordinator
-          .request({
-            tool,
-            args: args ?? {},
-            reason,
-            sessionId: runtime.sessionId,
-            origin: opts.origin,
-            signal: opts.signal,
-            // The clone's own policy: what gets re-checked, and what a grant
-            // applies to. The parent stays untouched.
-            policy: opts.policy,
-          })
-          .then((outcome) => outcome.approved),
-      onResult: (result) => {
-        const resultJson =
-          result.result === undefined ? undefined : JSON.stringify(result.result).slice(0, 20_000);
-        appendTranscript(opts.transcriptPath, {
-          type: 'clone_tool_call',
-          tool: result.tool,
-          args: result.args,
-          status: result.status,
-          reason: result.reason,
-          error: result.error,
-          // The payload, not just the verdict. /clones <id> and the truncation
-          // note both promise the working detail survives on disk.
-          result: resultJson,
-        });
-        results.push({
-          tool: result.tool,
-          // A thrown tool reports through `error`, a refused one through
-          // `reason` — they are different fields. Reading only `reason` feeds
-          // the clone `Tool read (error): undefined`, which tells it nothing
-          // about what went wrong and invites a blind retry.
-          result: describeCloneToolResult(result),
-          status: result.status,
-          args: result.args,
-        });
-      },
-    });
+      });
+    } finally {
+      settleContextMutation();
+    }
     return results;
   };
 
@@ -5677,226 +5946,228 @@ export async function runChat(options: ChatOptions): Promise<void> {
     const approvalOrigin: ApprovalOriginInfo = ctx?.origin ?? { origin: 'parent' };
     const abortSignal = ctx?.signal;
     const iterationResults: ToolResultRecord[] = [];
-    await executeToolCalls(calls, {
-      policy: toolPolicy,
-      signal: abortSignal,
-      callTool: createLocalToolDispatcher({
-        cwd: process.cwd(),
-        callPi: callPiTool,
-        callPcp: (bare, resolved) => pcp.callTool(bare, resolved),
-        // Resolve credential references ($VAR / ${VAR}) in tool args. The LLM
-        // emits references; actual values are injected at the execution layer
-        // so credentials never enter transcripts or context.
-        resolveCredentials: (args) => {
-          const { args: resolvedArgs, resolutions } = resolveCredentialRefs(
-            args,
-            buildResolverEnv()
-          );
-          if (resolutions.length > 0 && runtime.verbose) {
-            const refs = resolutions.map((r) => `${r.name} at ${r.path}`).join(', ');
-            printLine(
-              chalk.dim(`credential-resolver: resolved ${resolutions.length} ref(s): ${refs}`)
+    const settleContextMutation = beginContextMutationFor(calls);
+    try {
+      await executeToolCalls(calls, {
+        policy: toolPolicy,
+        signal: abortSignal,
+        callTool: createLocalToolDispatcher({
+          cwd: process.cwd(),
+          callPi: callPiTool,
+          callPcp: (bare, resolved) => pcp.callTool(bare, resolved),
+          // Resolve credential references ($VAR / ${VAR}) in tool args. The LLM
+          // emits references; actual values are injected at the execution layer
+          // so credentials never enter transcripts or context.
+          resolveCredentials: (args) => {
+            const { args: resolvedArgs, resolutions } = resolveCredentialRefs(
+              args,
+              buildResolverEnv()
             );
-          }
-          return resolvedArgs;
-        },
-        audience: 'parent',
-        isHardDenied: (tool) => {
-          const decision = toolPolicy.inspectPcpTool(bareToolName(tool), runtime.sessionId);
-          return !decision.allowed && !decision.promptable;
-        },
-        head: (tool, args) => {
-          // spawn_agent is NOT a client-local policy bypass. Unlike ledger
-          // tools it costs backend time and fans out authority, so it reaches
-          // here only after executeToolCalls has cleared it through policy.
-          if (bareToolName(tool) === SPAWN_AGENT_TOOL) {
-            return runSpawnAgent(args, { signal: abortSignal });
-          }
-          if (bareToolName(tool) === COLLECT_AGENTS_TOOL) {
-            return runCollectAgents(args);
-          }
-          // Client-local tools (context management) are handled in-process
-          if (isClientLocalTool(tool)) {
-            return handleClientLocalTool(tool, args, ledger);
-          }
-          return null;
-        },
-      }),
-      sessionId: runtime.sessionId,
-      promptForApproval: (tool, reason, args) =>
-        approvalCoordinator
-          .request({
-            tool,
-            args: args ?? {},
-            reason,
-            sessionId: runtime.sessionId,
-            origin: approvalOrigin,
-            signal: abortSignal,
-          })
-          .then((outcome) => outcome.approved),
-      onResult: (result: ToolCallResult) => {
-        if (result.status === 'blocked' || result.status === 'denied') {
-          const msg = `Local tool ${result.status} (${result.tool}): ${result.reason}`;
-          printEvent(
-            chalk.yellow(`🛠 ${agentId} · ${result.tool} (${result.status}) — ${result.reason}`)
-          );
-          appendTranscript(runtime.transcriptPath, {
-            type: 'local_tool_call',
-            tool: result.tool,
-            args: result.args,
-            status: result.status,
-            reason: result.reason,
-          });
-          ledger.addEntry('system', compactForLedger(msg, 400), 'local-tool');
-          iterationResults.push({
-            tool: result.tool,
-            result: result.reason,
-            status: result.status,
-          });
-        } else if (result.status === 'executed' || result.status === 'approved') {
-          const resultJson = JSON.stringify(result.result);
-
-          // Format context-management and signal tools with friendly output
-          if (result.tool === 'evict_context') {
-            const r = result.result as Record<string, unknown> | undefined;
-            const content = (r?.content as Array<{ text: string }> | undefined)?.[0]?.text;
-            if (content) {
-              const parsed = JSON.parse(content);
-              printEvent(
-                chalk.dim(
-                  `  🗑 evicted ${parsed.evicted} entries (${parsed.tokensFreed} tok freed, ${parsed.totalAfter} tok remaining)`
-                )
+            if (resolutions.length > 0 && runtime.verbose) {
+              const refs = resolutions.map((r) => `${r.name} at ${r.path}`).join(', ');
+              printLine(
+                chalk.dim(`credential-resolver: resolved ${resolutions.length} ref(s): ${refs}`)
               );
-              // Persist the eviction so it survives reattach — without this,
-              // hydration replays the raw events and evicted entries resurrect
-              if (parsed.success && Array.isArray(parsed.evictRefs) && parsed.evicted > 0) {
-                const refs = parsed.evictRefs as Array<Record<string, unknown>>;
-                recordEviction(
-                  'sb',
-                  compactForLedger(JSON.stringify(result.args ?? {}), 200),
-                  typeof parsed.tokensFreed === 'number' ? parsed.tokensFreed : 0,
-                  refs
-                    .filter((ref) => typeof ref.hash === 'string')
-                    .map((ref) => ({
-                      ...(typeof ref.eid === 'number' ? { eid: ref.eid } : {}),
-                      hash: ref.hash as string,
-                      role: (ref.role as LedgerRole) || 'system',
-                      source: typeof ref.source === 'string' ? ref.source : undefined,
-                      preview: typeof ref.preview === 'string' ? ref.preview : '',
-                    }))
+            }
+            return resolvedArgs;
+          },
+          audience: 'parent',
+          isHardDenied: (tool) => {
+            const decision = toolPolicy.inspectPcpTool(bareToolName(tool), runtime.sessionId);
+            return !decision.allowed && !decision.promptable;
+          },
+          head: (tool, args) => {
+            // spawn_agent is NOT a client-local policy bypass. Unlike ledger
+            // tools it costs backend time and fans out authority, so it reaches
+            // here only after executeToolCalls has cleared it through policy.
+            if (bareToolName(tool) === SPAWN_AGENT_TOOL) {
+              return runSpawnAgent(args, { signal: abortSignal });
+            }
+            if (bareToolName(tool) === COLLECT_AGENTS_TOOL) {
+              return runCollectAgents(args);
+            }
+            // Client-local tools (context management) are handled in-process.
+            // An eviction's persistent refs arrive on the hook, not in the
+            // result the model reads — see EvictionHooks (#571).
+            if (isClientLocalTool(tool)) {
+              return handleClientLocalTool(tool, args, ledger, globalSignalSink, {
+                onEvict: (eviction) =>
+                  recordEviction(
+                    'sb',
+                    compactForLedger(JSON.stringify(eviction.args ?? {}), 200),
+                    eviction.tokensFreed,
+                    eviction.refs
+                  ),
+              });
+            }
+            return null;
+          },
+        }),
+        sessionId: runtime.sessionId,
+        promptForApproval: (tool, reason, args) =>
+          approvalCoordinator
+            .request({
+              tool,
+              args: args ?? {},
+              reason,
+              sessionId: runtime.sessionId,
+              origin: approvalOrigin,
+              signal: abortSignal,
+            })
+            .then((outcome) => outcome.approved),
+        onResult: (result: ToolCallResult) => {
+          if (result.status === 'blocked' || result.status === 'denied') {
+            const msg = `Local tool ${result.status} (${result.tool}): ${result.reason}`;
+            printEvent(
+              chalk.yellow(`🛠 ${agentId} · ${result.tool} (${result.status}) — ${result.reason}`)
+            );
+            appendTranscript(runtime.transcriptPath, {
+              type: 'local_tool_call',
+              tool: result.tool,
+              args: result.args,
+              status: result.status,
+              reason: result.reason,
+            });
+            ledger.addEntry('system', compactForLedger(msg, 400), 'local-tool');
+            iterationResults.push({
+              tool: result.tool,
+              result: result.reason,
+              status: result.status,
+            });
+          } else if (result.status === 'executed' || result.status === 'approved') {
+            const resultJson = JSON.stringify(result.result);
+
+            // Format context-management and signal tools with friendly output
+            if (result.tool === 'evict_context') {
+              const r = result.result as Record<string, unknown> | undefined;
+              const content = (r?.content as Array<{ text: string }> | undefined)?.[0]?.text;
+              if (content) {
+                const parsed = JSON.parse(content);
+                // The eviction itself was persisted from the onEvict hook at
+                // execution time (recordEviction); this is display only.
+                printEvent(
+                  chalk.dim(
+                    `  🗑 evicted ${parsed.evicted} entries (${parsed.tokensFreed} tok freed, ${parsed.totalAfter} tok remaining)`
+                  )
                 );
               }
-            }
-          } else if (result.tool === 'list_context') {
-            const r = result.result as Record<string, unknown> | undefined;
-            const content = (r?.content as Array<{ text: string }> | undefined)?.[0]?.text;
-            if (content) {
-              const parsed = JSON.parse(content);
-              const sources = parsed.bySource
-                ? Object.entries(
-                    parsed.bySource as Record<string, { count: number; tokens: number }>
+            } else if (result.tool === 'list_context') {
+              const r = result.result as Record<string, unknown> | undefined;
+              const content = (r?.content as Array<{ text: string }> | undefined)?.[0]?.text;
+              if (content) {
+                const parsed = JSON.parse(content);
+                const sources = parsed.bySource
+                  ? Object.entries(
+                      parsed.bySource as Record<string, { count: number; tokens: number }>
+                    )
+                      .map(([src, { count, tokens }]) => `${src}(${count}/${tokens}t)`)
+                      .join(' ')
+                  : '';
+                printEvent(
+                  chalk.dim(
+                    `📋 ${agentId} · list_context — ${parsed.totalEntries} entries, ~${parsed.totalTokens} tok${
+                      sources ? ` · ${sources}` : ''
+                    }`
                   )
-                    .map(([src, { count, tokens }]) => `${src}(${count}/${tokens}t)`)
-                    .join(' ')
-                : '';
+                );
+              }
+            } else if (result.tool === 'signal_status') {
+              const r = result.result as Record<string, unknown> | undefined;
+              const content = (r?.content as Array<{ text: string }> | undefined)?.[0]?.text;
+              if (content) {
+                const parsed = JSON.parse(content);
+                const signal = parsed.signal as { status: string; reason?: string } | undefined;
+                if (signal) {
+                  const icon =
+                    signal.status === 'completed'
+                      ? '✅'
+                      : signal.status === 'blocked'
+                        ? '🚫'
+                        : '➡️';
+                  printEvent(
+                    chalk.dim(
+                      `  ${icon} signal: ${signal.status}${signal.reason ? ` — ${signal.reason}` : ''}`
+                    )
+                  );
+                }
+              }
+            } else {
+              // One dim line, attributed to the agent, result truncated —
+              // the Ctrl+T inspector holds a 2KB result slice per call and
+              // the transcript keeps the complete payload.
+              const resultPreview = compactForLedger(resultJson, 160);
               printEvent(
                 chalk.dim(
-                  `📋 ${agentId} · list_context — ${parsed.totalEntries} entries, ~${parsed.totalTokens} tok${
-                    sources ? ` · ${sources}` : ''
+                  `🛠 ${agentId} · ${result.tool} (${result.status})${
+                    resultPreview ? ` — ${resultPreview}` : ''
                   }`
                 )
               );
             }
-          } else if (result.tool === 'signal_status') {
-            const r = result.result as Record<string, unknown> | undefined;
-            const content = (r?.content as Array<{ text: string }> | undefined)?.[0]?.text;
-            if (content) {
-              const parsed = JSON.parse(content);
-              const signal = parsed.signal as { status: string; reason?: string } | undefined;
-              if (signal) {
-                const icon =
-                  signal.status === 'completed' ? '✅' : signal.status === 'blocked' ? '🚫' : '➡️';
-                printEvent(
-                  chalk.dim(
-                    `  ${icon} signal: ${signal.status}${signal.reason ? ` — ${signal.reason}` : ''}`
-                  )
-                );
-              }
+            appendTranscript(runtime.transcriptPath, {
+              type: 'local_tool_call',
+              tool: result.tool,
+              args: result.args,
+              status: result.status,
+              result: result.result,
+            });
+            // Context-management tools (list_context, evict_context) must NOT
+            // persist their results back into the ledger — doing so pollutes the
+            // context they're managing and reintroduces evicted content.
+            //
+            // spawn_agent and collect_agents are excluded for the same reason
+            // from the other direction: they write their OWN dedicated handoff
+            // entry, so the generic append would duplicate every clone summary
+            // and undo the one-entry-per-fan-out guarantee that justifies clones
+            // at all.
+            if (!isClientLocalTool(result.tool) && !isCloneHandoffTool(result.tool)) {
+              ledger.addEntry(
+                'system',
+                compactForLedger(`local tool ${result.tool} -> ${resultJson}`, 500),
+                'local-tool'
+              );
             }
-          } else {
-            // One dim line, attributed to the agent, result truncated —
-            // the Ctrl+T inspector holds a 2KB result slice per call and
-            // the transcript keeps the complete payload.
-            const resultPreview = compactForLedger(resultJson, 160);
+            iterationResults.push({
+              tool: result.tool,
+              result: result.result,
+              status: result.status,
+              args: result.args,
+            });
+          } else if (result.status === 'error') {
+            const msg = `Local tool error (${result.tool}): ${result.error}`;
             printEvent(
-              chalk.dim(
-                `🛠 ${agentId} · ${result.tool} (${result.status})${
-                  resultPreview ? ` — ${resultPreview}` : ''
-                }`
+              chalk.red(
+                `🛠 ${agentId} · ${result.tool} (error) — ${compactForLedger(String(result.error), 160)}`
               )
             );
+            appendTranscript(runtime.transcriptPath, {
+              type: 'local_tool_call',
+              tool: result.tool,
+              args: result.args,
+              status: 'error',
+              error: result.error,
+            });
+            ledger.addEntry('system', compactForLedger(msg, 400), 'local-tool');
+            iterationResults.push({ tool: result.tool, result: result.error, status: 'error' });
           }
-          appendTranscript(runtime.transcriptPath, {
-            type: 'local_tool_call',
-            tool: result.tool,
-            args: result.args,
-            status: result.status,
-            result: result.result,
-          });
-          // Context-management tools (list_context, evict_context) must NOT
-          // persist their results back into the ledger — doing so pollutes the
-          // context they're managing and reintroduces evicted content.
-          //
-          // spawn_agent and collect_agents are excluded for the same reason
-          // from the other direction: they write their OWN dedicated handoff
-          // entry, so the generic append would duplicate every clone summary
-          // and undo the one-entry-per-fan-out guarantee that justifies clones
-          // at all.
-          if (!isClientLocalTool(result.tool) && !isCloneHandoffTool(result.tool)) {
-            ledger.addEntry(
-              'system',
-              compactForLedger(`local tool ${result.tool} -> ${resultJson}`, 500),
-              'local-tool'
-            );
-          }
-          iterationResults.push({
-            tool: result.tool,
-            result: result.result,
-            status: result.status,
-            args: result.args,
-          });
-        } else if (result.status === 'error') {
-          const msg = `Local tool error (${result.tool}): ${result.error}`;
-          printEvent(
-            chalk.red(
-              `🛠 ${agentId} · ${result.tool} (error) — ${compactForLedger(String(result.error), 160)}`
-            )
-          );
-          appendTranscript(runtime.transcriptPath, {
-            type: 'local_tool_call',
-            tool: result.tool,
-            args: result.args,
-            status: 'error',
-            error: result.error,
-          });
-          ledger.addEntry('system', compactForLedger(msg, 400), 'local-tool');
-          iterationResults.push({ tool: result.tool, result: result.error, status: 'error' });
-        }
 
-        // Headless liveness + progress: one compact NDJSON line per tool as
-        // it completes. Input is capped and results are omitted (can be large
-        // or sensitive). send_response is intentionally NOT streamed here —
-        // that tool already routes server-side, so re-emitting it as a
-        // response line would risk double delivery.
-        const streamArgs = result.args ? JSON.stringify(result.args) : '';
-        emitStreamEvent({
-          type: 'tool_call',
-          toolName: result.tool,
-          status: result.status,
-          ...(streamArgs && streamArgs.length <= 2000 ? { input: result.args } : {}),
-        });
-      },
-    });
+          // Headless liveness + progress: one compact NDJSON line per tool as
+          // it completes. Input is capped and results are omitted (can be large
+          // or sensitive). send_response is intentionally NOT streamed here —
+          // that tool already routes server-side, so re-emitting it as a
+          // response line would risk double delivery.
+          const streamArgs = result.args ? JSON.stringify(result.args) : '';
+          emitStreamEvent({
+            type: 'tool_call',
+            toolName: result.tool,
+            status: result.status,
+            ...(streamArgs && streamArgs.length <= 2000 ? { input: result.args } : {}),
+          });
+        },
+      });
+    } finally {
+      settleContextMutation();
+    }
     return iterationResults;
   };
 
@@ -6217,12 +6488,98 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // flags, SIGINT/abort wiring, debug + activity logging. A shadow clone
     // supplies a far simpler runTurn and shares the loop unchanged.
     let lastRunResult!: BackendRunResult;
+    // What this turn's loop has already put in the provider's context that the
+    // ledger cannot see yet: every continuation body sent and every reply
+    // received. The relay budget shrinks by it, or each iteration re-grants
+    // the same allowance while the window fills (Lumen, PR #576 round 3).
+    let loopOccupancyTokens: number | undefined;
+    // A stateless parent: the last report's prompt tokens and the highest
+    // ledger entry id at that moment, so every entry added since is charged at
+    // its rendered bytes — by id, never as a net total an eviction could hide.
+    statelessPromptTokens = undefined;
+    ledgerMaxIdAtReport = -1;
+    const maxLedgerId = (): number => ledger.listEntries().reduce((m, e) => Math.max(m, e.id), -1);
+    const nativeSession = (): boolean => Boolean(canReuseBackendSession && activeBackendSessionId);
+    /**
+     * After each spawn. NATIVE session: the provider's own occupancy when it
+     * reported one — everything sent and received so far, hidden thinking
+     * included — else UNKNOWN until the next report (what an unreported spawn
+     * added cannot be recovered from visible text). STATELESS parent: the
+     * report's prompt tokens — the provider's own count of the envelope, with
+     * discovered files, tool schemas and media inside it — and the ledger
+     * size at that moment; the reply is not re-sent and is not counted
+     * (Lumen, PR #576 rounds 5–10).
+     */
+    const noteSpawn = (
+      result: BackendRunResult,
+      ledgerIdBeforeSpawn: number,
+      generationBeforeSpawn: number
+    ): void => {
+      if (nativeSession()) {
+        loopOccupancyTokens = occupancyTokens(runtime.backend, result.usage);
+        return;
+      }
+      statelessPromptTokens = promptTokensOf(runtime.backend, result.usage);
+      // The high-water id from BEFORE the spawn: an entry polled in while the
+      // backend ran (inbox, activity) is absent from the reported prompt and
+      // must be charged, not marked covered (Lumen, PR #576 round 12).
+      ledgerMaxIdAtReport = ledgerIdBeforeSpawn;
+      statelessGenerationAtReport = generationBeforeSpawn;
+    };
+    /** The continuation spawn's request; the budget measures the same shape. */
+    const continuationRequest = (prompt: string): BackendRunRequest => ({
+      backend: runtime.backend,
+      agentId,
+      model: runtime.model,
+      effort: runtime.effort,
+      prompt,
+      verbose: runtime.verbose,
+      passthroughArgs,
+      systemPromptOverride: runtime.systemPromptOverride,
+      timeoutMs: runtime.backendTurnTimeoutMs,
+      idleTimeoutMs: runtime.backendIdleTimeoutMs,
+      stream: true,
+      onEvent: handleBackendEvent,
+      attachmentDirs: sessionAttachmentDirs.length > 0 ? sessionAttachmentDirs : undefined,
+      toolRouting: runtime.toolRouting,
+      // Same logical turn — media rides along (WITHOUT deliverMedia) so the
+      // adapter's boundary disposition (--tools gate) cannot flap between the
+      // delivery spawn and tool-loop continuations, while the resumed provider
+      // session is never re-fed images it already holds. Stateless adapters
+      // re-attach from `media` regardless.
+      media: turnMedia.length > 0 ? turnMedia : undefined,
+      // Resume the live provider session so this round-trip appends to the
+      // same Claude thread instead of re-piping the whole window.
+      ...(activeBackendSessionId ? { backendSessionId: activeBackendSessionId } : {}),
+    });
+    /**
+     * What the window holds for the next relay — see relayBudgetBytes. A
+     * stateless parent's next envelope is the last report's prompt plus the
+     * rendered bytes of every entry added to the ledger since (by id).
+     */
+    const relayOccupancy = (): number | undefined => {
+      if (nativeSession()) return loopOccupancyTokens;
+      if (statelessPromptTokens === undefined) return undefined;
+      // A mutator ran since the report, or is still running (parent or
+      // clone): the next fresh spawn may discover a different context —
+      // unknown, the floor.
+      if (mutationsInFlight > 0 || statelessGenerationAtReport !== contextGeneration) {
+        return undefined;
+      }
+      const addedBytes = ledger
+        .listEntries()
+        .filter((e) => e.id > ledgerMaxIdAtReport)
+        .reduce((n, e) => n + ledgerEntryPromptBytes(e), 0);
+      return statelessPromptTokens + addedBytes;
+    };
 
     const runTurnForLoop = async (
       body: string,
       ctx: { isContinuation: boolean }
     ): Promise<BackendTurnOutcome> => {
       if (!ctx.isContinuation) {
+        const ledgerIdBeforeSpawn = maxLedgerId();
+        const generationBeforeSpawn = contextGeneration;
         beginSpawn();
         const turn = startBackendTurn({
           backend: runtime.backend,
@@ -6388,6 +6745,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         }
 
         lastRunResult = runResult;
+        noteSpawn(runResult, ledgerIdBeforeSpawn, generationBeforeSpawn);
         return runResult;
       }
 
@@ -6402,31 +6760,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
           : buildPromptEnvelope(agentId, runtime, ledger, body);
 
       beginSpawn();
-      const contTurn = startBackendTurn({
-        backend: runtime.backend,
-        agentId,
-        model: runtime.model,
-        effort: runtime.effort,
-        prompt: continuationPrompt,
-        verbose: runtime.verbose,
-        passthroughArgs,
-        systemPromptOverride: runtime.systemPromptOverride,
-        timeoutMs: runtime.backendTurnTimeoutMs,
-        idleTimeoutMs: runtime.backendIdleTimeoutMs,
-        stream: true,
-        onEvent: handleBackendEvent,
-        attachmentDirs: sessionAttachmentDirs.length > 0 ? sessionAttachmentDirs : undefined,
-        toolRouting: runtime.toolRouting,
-        // Same logical turn — media rides along (WITHOUT deliverMedia) so the
-        // adapter's boundary disposition (--tools gate) cannot flap between the
-        // delivery spawn and tool-loop continuations, while the resumed provider
-        // session is never re-fed images it already holds. Stateless adapters
-        // re-attach from `media` regardless.
-        media: turnMedia.length > 0 ? turnMedia : undefined,
-        // Resume the live provider session so this round-trip appends to the
-        // same Claude thread instead of re-piping the whole window.
-        ...(activeBackendSessionId ? { backendSessionId: activeBackendSessionId } : {}),
-      });
+      const ledgerIdBeforeSpawn = maxLedgerId();
+      const generationBeforeSpawn = contextGeneration;
+      const contTurn = startBackendTurn(continuationRequest(continuationPrompt));
       currentTurnAbort = contTurn.abort;
 
       const contResult = await contTurn.result.finally(() => {
@@ -6436,13 +6772,19 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
       lastRunResult = contResult;
       recordRunUsage(contResult.usage);
+      noteSpawn(contResult, ledgerIdBeforeSpawn, generationBeforeSpawn);
       return contResult;
     };
 
     let loopResult: AgentLoopResult;
     try {
       loopResult = await runAgentLoop(
-        { prompt, toolRouting: runtime.toolRouting, signal: turnAbort.signal },
+        {
+          prompt,
+          toolRouting: runtime.toolRouting,
+          signal: turnAbort.signal,
+          relayBudgetBytes: () => relayBudgetBytes(runtime, relayOccupancy()),
+        },
         {
           ui: {
             printLine: (text) => printLine(chalk.dim(text)),

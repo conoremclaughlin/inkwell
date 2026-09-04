@@ -13,9 +13,12 @@ import {
   MAX_TOOL_CALLS_PER_ITERATION,
   type AgentLoopPorts,
   type BackendTurnOutcome,
+  MAX_RELAY_BYTES,
   type LocalToolCall,
   type ProtocolViolation,
   type ToolResultRecord,
+  RELAY_CUT_MARKER,
+  MAX_NAMED_DROPPED,
 } from './agent-loop.js';
 
 /**
@@ -1450,6 +1453,31 @@ describe('a failed opening spawn is a failed turn (Lumen, round 3)', () => {
   });
 });
 
+describe('runAgentLoop — the relay budget is asked of the host per iteration (Lumen, PR #576)', () => {
+  it('shapes the continuation to the budget the host reports', async () => {
+    let asked = 0;
+    const harness = makePorts(
+      [outcome({ responseText: inkTool('list_context') }), outcome({ responseText: 'done' })],
+      (calls) =>
+        calls.map((c) => ({ tool: c.tool, result: 'z'.repeat(100_000), status: 'executed' }))
+    );
+    await runAgentLoop(
+      {
+        prompt: 'go',
+        toolRouting: 'local',
+        relayBudgetBytes: () => {
+          asked += 1;
+          return 9_000;
+        },
+      },
+      harness.ports
+    );
+    expect(asked).toBe(1);
+    expect(harness.prompts[1].body.length).toBeLessThanOrEqual(9_000 + 800);
+    expect(harness.prompts[1].body).toContain('[ink: result truncated');
+  });
+});
+
 describe('buildContinuationBody — protocol note', () => {
   it('names the imitation only when asked', () => {
     const results: ToolResultRecord[] = [{ tool: 'x', result: 'ok', status: 'executed' }];
@@ -2054,5 +2082,241 @@ describe('silently dropped tool calls (the per-iteration cap)', () => {
     expect(harness.executed[0]).toHaveLength(emitted.length);
     expect(harness.prompts[1]!.body).not.toContain('reached the tool runner');
     expect(harness.events.join('\n')).not.toContain('not run');
+  });
+});
+
+describe('relay size ceiling (#571; aggregate — Lumen, PR #576)', () => {
+  const huge = (n: number) => 'x'.repeat(n);
+
+  it('truncates one oversized result and says so; small ones pass whole', () => {
+    const body = buildContinuationBody(
+      [
+        { tool: 'list_context', result: huge(MAX_RELAY_BYTES + 5000), status: 'executed' },
+        { tool: 'signal_status', result: 'ok', status: 'executed' },
+      ],
+      []
+    );
+    expect(body).toContain('Tool signal_status (executed): ok');
+    expect(body).toContain('[ink: result truncated');
+    expect(body.length).toBeLessThan(MAX_RELAY_BYTES + 2000);
+  });
+
+  it('REGRESSION: five oversized results compose ONE bounded message, not five caps', () => {
+    // Five independently capped results built a 1,001,129-char continuation —
+    // past the small-window budget and close to ARG_MAX (Lumen, PR #576).
+    const results = Array.from({ length: MAX_TOOL_CALLS_PER_ITERATION }, (_, i) => ({
+      tool: `t${i}`,
+      result: huge(MAX_RELAY_BYTES + 1),
+      status: 'executed',
+    }));
+    const body = buildContinuationBody(results, []);
+    expect(body.length).toBeLessThanOrEqual(MAX_RELAY_BYTES);
+    // Every result is still present and still says it was cut.
+    for (let i = 0; i < results.length; i++) expect(body).toContain(`Tool t${i} (executed):`);
+    expect(body.match(/\[ink: result truncated/g)).toHaveLength(results.length);
+  });
+
+  it('REGRESSION (Lumen, round 2): the ceiling holds however many results there are', () => {
+    // A per-result floor let twelve results compose a message twice the
+    // advertised ceiling. Now the budget is the invariant; slices shrink.
+    for (const n of [1, 5, 12, 50]) {
+      const results = Array.from({ length: n }, (_, i) => ({
+        tool: `t${i}`,
+        result: huge(MAX_RELAY_BYTES),
+        status: 'executed',
+      }));
+      const body = buildContinuationBody(results, []);
+      expect(body.length, `${n} results`).toBeLessThanOrEqual(MAX_RELAY_BYTES);
+      for (let i = 0; i < n; i++) expect(body).toContain(`Tool t${i} (executed):`);
+    }
+  });
+
+  it('a caller-supplied budget bounds the message and reaches the final relay too', () => {
+    const results = Array.from({ length: 3 }, (_, i) => ({
+      tool: `t${i}`,
+      result: huge(50_000),
+      status: 'executed',
+    }));
+    const cont = buildContinuationBody(results, [], undefined, { budgetBytes: 12_000 });
+    expect(cont.length).toBeLessThanOrEqual(12_000);
+    const relay = buildFinalRelayBody(results, undefined, { budgetBytes: 12_000 });
+    expect(relay.length).toBeLessThanOrEqual(12_000);
+    for (let i = 0; i < 3; i++) expect(cont).toContain(`Tool t${i} (executed):`);
+  });
+
+  it('applies the same aggregate ceiling to the final relay', () => {
+    const results = Array.from({ length: MAX_TOOL_CALLS_PER_ITERATION }, (_, i) => ({
+      tool: `t${i}`,
+      result: { data: huge(MAX_RELAY_BYTES) },
+      status: 'executed',
+    }));
+    const body = buildFinalRelayBody(results);
+    expect(body).toContain('[ink: result truncated');
+    expect(body.length).toBeLessThanOrEqual(MAX_RELAY_BYTES);
+  });
+
+  it('the truncation note names the transcript — the durable copy every caller has', () => {
+    const body = buildContinuationBody(
+      [{ tool: 'read', result: huge(MAX_RELAY_BYTES + 1), status: 'executed' }],
+      []
+    );
+    expect(body).toContain("session's transcript");
+    expect(body).not.toContain('session ledger');
+  });
+});
+
+describe('REGRESSION (Lumen, PR #576 round 3): the ceiling holds even when the framing alone outgrows it', () => {
+  const huge = (n: number): string => 'x'.repeat(n);
+  it.each([50, 100])(
+    '%i oversized results under an 8K budget render at most 8K (+ the fixed frame)',
+    (n) => {
+      const results = Array.from({ length: n }, (_, i) => ({
+        tool: `t${i}`,
+        result: huge(20_000),
+        status: 'executed',
+      }));
+      const body = buildContinuationBody(results, [], undefined, { budgetBytes: 8_000 });
+      // 50 rendered 9,659 chars and 100 rendered 19,159 on the previous head.
+      expect(body.length).toBeLessThanOrEqual(8_000);
+      // The note reports the results block's share — the budget minus the frame.
+      expect(body).toMatch(/\[ink: relay cut at its [\d,]+-byte budget/);
+      expect(body).toContain(`${n} results`);
+      const relay = buildFinalRelayBody(results, undefined, { budgetBytes: 8_000 });
+      expect(relay.length).toBeLessThanOrEqual(8_000);
+    }
+  );
+
+  it('long tool names cannot push the framing past the budget either', () => {
+    const results = Array.from({ length: 5 }, (_, i) => ({
+      tool: `an_extremely_long_tool_name_${'x'.repeat(400)}_${i}`,
+      result: huge(20_000),
+      status: 'executed',
+    }));
+    const body = buildContinuationBody(results, [], undefined, { budgetBytes: 1_000 });
+    expect(body.length).toBeLessThanOrEqual(1_000);
+  });
+
+  it('a budget too small for even the note ends in the marker — never a bare prefix (Lumen, round 4)', () => {
+    const results = [{ tool: 'read', result: huge(5_000), status: 'executed' }];
+    const body = buildContinuationBody(results, [], undefined, { budgetBytes: 40 });
+    expect(Buffer.byteLength(body)).toBeLessThanOrEqual(40);
+    expect(body.endsWith(RELAY_CUT_MARKER)).toBe(true);
+    // Below the marker's own size, the marker cut to the budget — the caller's
+    // cap is never exceeded (Lumen, round 5).
+    const tiny = buildContinuationBody(results, [], undefined, { budgetBytes: 5 });
+    expect(Buffer.byteLength(tiny)).toBeLessThanOrEqual(5);
+    expect(RELAY_CUT_MARKER.startsWith(tiny)).toBe(true);
+    expect(tiny.length).toBeGreaterThan(0);
+  });
+
+  it('a results block that fits is untouched — no note, every result whole', () => {
+    const results = Array.from({ length: 3 }, (_, i) => ({
+      tool: `t${i}`,
+      result: { ok: i },
+      status: 'executed',
+    }));
+    const body = buildContinuationBody(results, [], undefined, { budgetBytes: 8_000 });
+    expect(body).not.toContain('[ink: relay cut');
+    for (let i = 0; i < 3; i++) expect(body).toContain(`Tool t${i} (executed): {"ok":${i}}`);
+  });
+});
+
+describe('REGRESSION (Lumen, PR #576 round 4): the cap covers the COMPLETE relay, in bytes', () => {
+  const huge = (n: number): string => 'x'.repeat(n);
+  const bytes = (text: string): number => Buffer.byteLength(text, 'utf8');
+
+  it('five results and 45 dropped 400-character names fit an 8K budget in both builders', () => {
+    const results = Array.from({ length: 5 }, (_, i) => ({
+      tool: `t${i}`,
+      result: huge(20_000),
+      status: 'executed',
+    }));
+    const dropped = Array.from({ length: 45 }, (_, i) => ({
+      tool: `dropped_${'n'.repeat(400)}_${i}`,
+      args: {},
+      raw: '',
+    }));
+    const selection = { emitted: 50, reached: 5, dropped, unmatched: 0 };
+    // 26,972 and 26,840 chars on the previous head.
+    const cont = buildContinuationBody(results, [], selection, { budgetBytes: 8_000 });
+    expect(bytes(cont)).toBeLessThanOrEqual(8_000);
+    const relay = buildFinalRelayBody(results, selection, { budgetBytes: 8_000 });
+    expect(bytes(relay)).toBeLessThanOrEqual(8_000);
+    // The dropped list names a bounded few (by count AND bytes) and counts the rest.
+    expect(cont).toMatch(/and \d+ more/);
+    expect(cont).not.toContain('n'.repeat(100));
+  });
+
+  it('the default ceiling is on the whole message too', () => {
+    const results = Array.from({ length: 5 }, (_, i) => ({
+      tool: `t${i}`,
+      result: huge(MAX_RELAY_BYTES),
+      status: 'executed',
+    }));
+    expect(bytes(buildContinuationBody(results, []))).toBeLessThanOrEqual(MAX_RELAY_BYTES);
+    expect(bytes(buildFinalRelayBody(results))).toBeLessThanOrEqual(MAX_RELAY_BYTES);
+  });
+
+  it('non-ASCII payloads are cut by bytes, never through a code point', () => {
+    const results = [
+      { tool: 'cjk', result: '漢字'.repeat(4_000), status: 'executed' },
+      { tool: 'emoji', result: '🙂'.repeat(4_000), status: 'executed' },
+    ];
+    for (const budget of [8_000, 1_000, 300]) {
+      const body = buildContinuationBody(results, [], undefined, { budgetBytes: budget });
+      expect(bytes(body), `budget ${budget}`).toBeLessThanOrEqual(budget);
+      // Round-tripping through UTF-8 is lossless only when no surrogate was split.
+      expect(Buffer.from(body, 'utf8').toString('utf8')).toBe(body);
+    }
+  });
+});
+
+describe('REGRESSION (Lumen, PR #576 round 5): names are bounded in bytes, not only in count', () => {
+  const huge = (n: number): string => 'x'.repeat(n);
+  const bytes = (text: string): number => Buffer.byteLength(text, 'utf8');
+
+  it('nine 1,000-character dropped names at the 4K floor leave the result block and the tail intact', () => {
+    const results = [{ tool: 't0', result: huge(2_000), status: 'executed' }];
+    const dropped = Array.from({ length: 9 }, (_, i) => ({
+      tool: `${'n'.repeat(1_000)}_${i}`,
+      args: {},
+      raw: '',
+    }));
+    const selection = { emitted: 10, reached: 1, dropped, unmatched: 0 };
+    for (const build of [
+      () => buildContinuationBody(results, [], selection, { budgetBytes: 4_000 }),
+      () => buildFinalRelayBody(results, selection, { budgetBytes: 4_000 }),
+    ]) {
+      const body = build();
+      expect(bytes(body)).toBeLessThanOrEqual(4_000);
+      expect(body).toContain('Tool t0 (executed):');
+      expect(body).toMatch(/and \d+ more/);
+      expect(body).toMatch(/final answer\.?$|reporting the work as done\.$/);
+    }
+  });
+
+  it('the dropped list is bounded in BYTES: nine 62-byte names name seven and count two', () => {
+    // Each name cuts to 48 bytes + an ellipsis (51 bytes); 51 + 6 × 53 = 369
+    // fits MAX_DROPPED_LIST_BYTES (400), an eighth would not.
+    const dropped = Array.from({ length: 9 }, (_, i) => ({
+      tool: `${'n'.repeat(60)}_${i}`,
+      args: {},
+      raw: '',
+    }));
+    const selection = { emitted: 10, reached: 1, dropped, unmatched: 0 };
+    const body = buildContinuationBody(
+      [{ tool: 't0', result: 'ok', status: 'executed' }],
+      [],
+      selection
+    );
+    expect(body).toContain('and 2 more');
+    expect(body).not.toContain('and 1 more');
+  });
+
+  it('a note names a long tool by a bounded prefix', () => {
+    const results = [{ tool: 'a'.repeat(500), result: huge(50_000), status: 'executed' }];
+    const body = buildContinuationBody(results, [], undefined, { budgetBytes: 600 });
+    expect(bytes(body)).toBeLessThanOrEqual(600);
+    expect(body).not.toContain('a'.repeat(200));
   });
 });

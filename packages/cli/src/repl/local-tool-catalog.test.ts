@@ -123,7 +123,7 @@ describe('the prompt and the catalog describe the same surface', () => {
     expect(renderLocalToolGroup('client-local', 'parent')).toBe(
       [
         'Client-local tools (no server round-trip):',
-        '- list_context: Introspect your context window — see all entries with IDs, token counts, sources, and previews.',
+        '- list_context: Introspect your context window — totals and a per-source breakdown for everything, plus ONE page of entries (IDs, token counts, sources, previews). Filter by source/role/minTokens or sort by "largest" to find what is worth evicting; evicting by source or role needs no listing. Args: limit (number, default 50, max 200), offset (number), source (string), role (string), minTokens (number), sort ("oldest" | "newest" | "largest") — all optional.',
         '- evict_context: Remove specific entries from your context to reclaim tokens. Args: entryIds (number[]), source (string), or role (string).',
         '- signal_status: Signal your session status. Args: status ("completed" | "blocked" | "continuing"), reason (string, optional). Use this at the end of your work to tell the runtime whether you are done, blocked on something, or need another turn.',
       ].join('\n')

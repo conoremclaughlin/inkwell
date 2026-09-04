@@ -10,7 +10,18 @@ import {
   findLastBackendSession,
   findLastDetectedModel,
   isResumeFailedNoSession,
+  relayBudgetBytes,
+  MIN_RELAY_BUDGET_BYTES,
+  RELAY_BYTES_PER_TOKEN,
+  RELAY_HEADROOM_SHARE,
+  occupancyTokens,
+  promptTokensOf,
+  ledgerEntryPromptBytes,
+  LEDGER_ENTRY_FRAME_BYTES,
+  CLONE_HISTORY_SEPARATOR,
+  CONTEXT_MUTATING_TOOLS,
 } from './chat.js';
+import { MAX_RELAY_BYTES } from '../repl/agent-loop.js';
 import { ContextLedger } from '../repl/context-ledger.js';
 
 /**
@@ -726,5 +737,140 @@ describe('one-turn process recovery sequence — detection outlives the seed (PR
         '\n'
     );
     expect(findLastBackendSession(transcriptPath)?.id).toBe('reseeded-at-850k');
+  });
+});
+
+describe('relayBudgetBytes — the relay budget follows the live headroom (Lumen, PR #576)', () => {
+  const runtime = { maxContextTokens: 128_000 };
+
+  it('a roomy 1M window gets the full static ceiling', () => {
+    expect(relayBudgetBytes({ maxContextTokens: 1_000_000 }, 300_000)).toBe(MAX_RELAY_BYTES);
+  });
+
+  it('a 128K window most of the way to its budget gets far less than the ceiling', () => {
+    // 128K − 100K occupied = 28K tokens; half of that, in bytes.
+    const budget = relayBudgetBytes(runtime, 100_000);
+    expect(budget).toBe(28_000 * RELAY_BYTES_PER_TOKEN * RELAY_HEADROOM_SHARE);
+    expect(budget).toBeLessThan(MAX_RELAY_BYTES);
+  });
+
+  it("REGRESSION (Lumen, round 5): the provider's own occupancy is what the window holds — not an estimate", () => {
+    expect(relayBudgetBytes(runtime, 118_000)).toBe(
+      Math.floor(10_000 * RELAY_BYTES_PER_TOKEN * RELAY_HEADROOM_SHARE)
+    );
+    expect(relayBudgetBytes(runtime, 118_000)).toBeLessThan(relayBudgetBytes(runtime, 100_000));
+  });
+
+  it('REGRESSION (Lumen, rounds 6–7): with NO occupancy nothing is assumed recoverable — the floor, whatever the window', () => {
+    expect(relayBudgetBytes(runtime)).toBe(MIN_RELAY_BUDGET_BYTES);
+    expect(relayBudgetBytes({ maxContextTokens: 1_000_000 })).toBe(MIN_RELAY_BUDGET_BYTES);
+  });
+
+  it('a stateless parent hands in the bytes of its whole prepared spawn as the occupancy', () => {
+    expect(relayBudgetBytes({ maxContextTokens: 400_000 }, 183_624)).toBe(
+      Math.floor((400_000 - 183_624) * RELAY_BYTES_PER_TOKEN * RELAY_HEADROOM_SHARE)
+    );
+  });
+
+  it('REGRESSION (Lumen, rounds 3–4): the relay costs at most half the headroom for ANY script', () => {
+    expect(RELAY_BYTES_PER_TOKEN).toBe(1);
+    expect(relayBudgetBytes(runtime, 100_000) / RELAY_BYTES_PER_TOKEN).toBeLessThanOrEqual(
+      28_000 * RELAY_HEADROOM_SHARE
+    );
+  });
+
+  it('never starves a relay: a window past its budget still gets the minimum — the documented exception', () => {
+    expect(relayBudgetBytes(runtime, 200_000)).toBe(MIN_RELAY_BUDGET_BYTES);
+  });
+});
+
+describe('CONTEXT_MUTATING_TOOLS — what can change a discovered context between fresh spawns (Lumen, PR #576 round 12)', () => {
+  it('names the writers and the shell, never the reads', () => {
+    for (const t of ['write', 'edit', 'multi_edit', 'apply_patch', 'bash'])
+      expect(CONTEXT_MUTATING_TOOLS.has(t)).toBe(true);
+    for (const t of ['read', 'grep', 'find', 'ls', 'list_context'])
+      expect(CONTEXT_MUTATING_TOOLS.has(t)).toBe(false);
+  });
+});
+
+describe('ledgerEntryPromptBytes — an added entry at its rendered bytes (Lumen, PR #576 round 11)', () => {
+  it('charges UTF-8 bytes of content, role and source plus the framing allowance — never chars ÷ 4', () => {
+    const han = { role: 'user', content: '漢'.repeat(500), source: 'repl-history' };
+    // 500 Han chars are 1,500 bytes; a tokens × 4 estimate charged 500.
+    expect(ledgerEntryPromptBytes(han)).toBe(1_500 + 4 + 12 + LEDGER_ENTRY_FRAME_BYTES);
+    expect(ledgerEntryPromptBytes(han)).toBeGreaterThan(1_483);
+    expect(ledgerEntryPromptBytes({ role: 'assistant', content: 'ok' })).toBe(
+      2 + 9 + LEDGER_ENTRY_FRAME_BYTES
+    );
+  });
+  it('the clone history separator is the 7-byte join the clone actually uses', () => {
+    expect(Buffer.byteLength(CLONE_HISTORY_SEPARATOR)).toBe(7);
+  });
+});
+
+describe("promptTokensOf — the provider's own count of what it was handed (Lumen, PR #576 round 10)", () => {
+  it('Anthropic: input + cache read + cache write; the reply is not included', () => {
+    expect(
+      promptTokensOf('claude', {
+        inputTokens: 1_000,
+        cacheReadTokens: 100_000,
+        cacheWriteTokens: 5_000,
+      })
+    ).toBe(106_000);
+  });
+  it('OpenAI/Gemini: the prompt count alone — cache already inside it, reply and reasoning never', () => {
+    expect(promptTokensOf('codex', { inputTokens: 90_000, cacheReadTokens: 80_000 })).toBe(90_000);
+    expect(promptTokensOf('gemini', { inputTokens: 90_000 })).toBe(90_000);
+  });
+  it('undefined without a prompt count', () => {
+    expect(promptTokensOf('codex', undefined)).toBeUndefined();
+    expect(promptTokensOf('codex', {})).toBeUndefined();
+  });
+});
+
+describe("occupancyTokens — what the session holds after a reply, by the provider's own accounting", () => {
+  it('Anthropic: input + cache read + cache write + output', () => {
+    expect(
+      occupancyTokens('claude', {
+        inputTokens: 1_000,
+        cacheReadTokens: 100_000,
+        cacheWriteTokens: 5_000,
+        outputTokens: 2_000,
+      })
+    ).toBe(108_000);
+  });
+  it('REGRESSION (Lumen, round 6): Gemini — totalTokenCount includes thoughts; the total wins', () => {
+    // The total is authoritative even when the parts do not add up to it
+    // (a provider may count more than it itemizes).
+    expect(
+      occupancyTokens('gemini', {
+        inputTokens: 90_000,
+        outputTokens: 500,
+        reasoningTokens: 2_000,
+        totalTokens: 93_000,
+      })
+    ).toBe(93_000);
+    // Without a total: prompt + output + reasoning, never prompt + output alone.
+    expect(
+      occupancyTokens('gemini', { inputTokens: 90_000, outputTokens: 500, reasoningTokens: 2_000 })
+    ).toBe(92_500);
+  });
+  it('OpenAI: total_tokens (prompt + completion incl. reasoning), else the parts; cache never double-counted', () => {
+    expect(
+      occupancyTokens('codex', {
+        inputTokens: 90_000,
+        cacheReadTokens: 80_000,
+        outputTokens: 500,
+        totalTokens: 91_000,
+      })
+    ).toBe(91_000);
+    expect(
+      occupancyTokens('codex', { inputTokens: 90_000, cacheReadTokens: 80_000, outputTokens: 500 })
+    ).toBe(90_500);
+  });
+  it('undefined without a usable prompt count', () => {
+    expect(occupancyTokens('claude', undefined)).toBeUndefined();
+    expect(occupancyTokens('claude', { outputTokens: 5 })).toBeUndefined();
+    expect(occupancyTokens('gemini', { outputTokens: 5 })).toBeUndefined();
   });
 });

@@ -125,7 +125,12 @@ describe('every backend turn forwards the override', () => {
     return found;
   };
 
-  const sites = [...callSites('startBackendTurn'), ...callSites('runBackendTurn')];
+  const sites = [
+    ...callSites('startBackendTurn'),
+    ...callSites('runBackendTurn'),
+    // Request builders shared by a spawn and the relay-budget measurer.
+    ...callSites('BackendRunRequest => '),
+  ];
 
   it('finds the call sites at all (guards against the scan silently matching nothing)', () => {
     expect(sites.length).toBeGreaterThanOrEqual(4);

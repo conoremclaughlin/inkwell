@@ -72,7 +72,11 @@ function pick(...values: Array<unknown>): number | undefined {
 function normalizeUsageObject(
   obj: Record<string, unknown>
 ): Omit<BackendTokenUsage, 'backend' | 'source'> | null {
-  const usageCandidate = (obj.usage as Record<string, unknown> | undefined) || obj;
+  // Gemini nests its counts under usageMetadata (Lumen, PR #576 round 7).
+  const usageCandidate =
+    (obj.usage as Record<string, unknown> | undefined) ||
+    (obj.usageMetadata as Record<string, unknown> | undefined) ||
+    obj;
 
   const inputTokens = pick(
     usageCandidate.input_tokens,
@@ -94,7 +98,12 @@ function normalizeUsageObject(
     (usageCandidate.completion as Record<string, unknown> | undefined)?.tokens
   );
 
-  const totalTokens = pick(usageCandidate.total_tokens, usageCandidate.totalTokens);
+  // Gemini reports totalTokenCount (prompt + candidates + thoughts).
+  const totalTokens = pick(
+    usageCandidate.total_tokens,
+    usageCandidate.totalTokens,
+    usageCandidate.totalTokenCount
+  );
 
   const cacheReadTokens = pick(
     usageCandidate.cache_read_tokens,
@@ -111,9 +120,14 @@ function normalizeUsageObject(
     (usageCandidate.cache as Record<string, unknown> | undefined)?.write_tokens
   );
 
+  // Gemini counts thoughts APART from candidates; OpenAI's reasoning_tokens
+  // are already inside output_tokens. Only the former adds to a synthesized
+  // total (Lumen, PR #576 round 8).
+  const separateThoughts = toNumber(usageCandidate.thoughtsTokenCount);
   const reasoningTokens = pick(
     usageCandidate.reasoning_tokens,
     usageCandidate.reasoningTokens,
+    usageCandidate.thoughtsTokenCount,
     (usageCandidate.output_tokens_details as Record<string, unknown> | undefined)?.reasoning_tokens
   );
 
@@ -131,11 +145,13 @@ function normalizeUsageObject(
   return {
     inputTokens,
     outputTokens,
+    // A synthesized total keeps hidden reasoning — dropping it under-counts
+    // the window by exactly the part the model does not show.
     totalTokens:
       totalTokens !== undefined
         ? totalTokens
         : inputTokens !== undefined && outputTokens !== undefined
-          ? inputTokens + outputTokens
+          ? inputTokens + outputTokens + (separateThoughts ?? 0)
           : undefined,
     cacheReadTokens,
     cacheWriteTokens,
@@ -183,13 +199,16 @@ function parseTextUsage(text: string): Omit<BackendTokenUsage, 'backend' | 'sour
     /(?:cache\s*write\s*tokens?)\s*[:=]\s*([\d.,]+(?:\s*[kKmM])?)/i
   );
   const reasoningMatch = text.match(/(?:reasoning\s*tokens?)\s*[:=]\s*([\d.,]+(?:\s*[kKmM])?)/i);
+  // Gemini's text summaries label thoughts apart from candidates; they add.
+  const thoughtsMatch = text.match(/(?:thoughts?\s*tokens?)\s*[:=]\s*([\d.,]+(?:\s*[kKmM])?)/i);
 
   const inputTokens = pick(inputMatch?.[1]);
   const outputTokens = pick(outputMatch?.[1]);
   const totalTokens = pick(totalMatch?.[1]);
   const cacheReadTokens = pick(cacheReadMatch?.[1]);
   const cacheWriteTokens = pick(cacheWriteMatch?.[1]);
-  const reasoningTokens = pick(reasoningMatch?.[1]);
+  const reasoningTokens = pick(reasoningMatch?.[1], thoughtsMatch?.[1]);
+  const separateThoughts = pick(thoughtsMatch?.[1]);
 
   if (
     inputTokens === undefined &&
@@ -209,7 +228,7 @@ function parseTextUsage(text: string): Omit<BackendTokenUsage, 'backend' | 'sour
       totalTokens !== undefined
         ? totalTokens
         : inputTokens !== undefined && outputTokens !== undefined
-          ? inputTokens + outputTokens
+          ? inputTokens + outputTokens + (separateThoughts ?? 0)
           : undefined,
     cacheReadTokens,
     cacheWriteTokens,

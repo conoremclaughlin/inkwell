@@ -16,7 +16,10 @@ const chatSource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'c
 /** The object literal passed to each spawn call, by balanced braces. */
 function spawnCallArgs(source: string): Array<{ at: number; literal: string }> {
   const out: Array<{ at: number; literal: string }> = [];
-  const re = /\b(?:startBackendTurn|runBackendTurn)\(\{/g;
+  // A spawn's request may be built by a named builder (continuationRequest,
+  // cloneRequest) that the budget measurer shares — those literals are spawn
+  // sites too.
+  const re = /\b(?:startBackendTurn|runBackendTurn)\(\{|: BackendRunRequest => \(\{/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(source))) {
     const open = m.index + m[0].length - 1;

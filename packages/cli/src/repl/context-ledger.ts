@@ -84,7 +84,7 @@ export interface PromptBuildOptions {
   includeSources?: boolean;
 }
 
-const DEFAULT_CHARS_PER_TOKEN = 4;
+export const DEFAULT_CHARS_PER_TOKEN = 4;
 
 export function estimateTokens(text: string): number {
   const normalized = text.trim();

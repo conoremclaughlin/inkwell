@@ -1,6 +1,14 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { ContextLedger } from './context-ledger.js';
-import { isClientLocalTool, handleClientLocalTool, CLIENT_LOCAL_TOOLS } from './context-tools.js';
+import {
+  isClientLocalTool,
+  handleClientLocalTool,
+  CLIENT_LOCAL_TOOLS,
+  EVICT_CONTEXT_PREVIEW_LIMIT,
+  LIST_CONTEXT_BOOKMARK_LIMIT,
+  LIST_CONTEXT_DEFAULT_LIMIT,
+  LIST_CONTEXT_MAX_LIMIT,
+} from './context-tools.js';
 import type { PcpToolCallResult } from '../lib/pcp-client.js';
 
 /** Extract parsed JSON from a tool call result */
@@ -194,6 +202,156 @@ describe('handleClientLocalTool: evict_context', () => {
 
     expect(parsed.evicted).toBe(15);
     expect(parsed.removedPreviews).toHaveLength(10); // capped
+  });
+});
+
+// ─── list_context is a page, not the window (#571) ──────────────
+
+describe('handleClientLocalTool: list_context paging', () => {
+  function bigLedger(n: number): ContextLedger {
+    const ledger = new ContextLedger();
+    for (let i = 0; i < n; i++) {
+      const source = i % 3 === 0 ? 'heartbeat' : i % 3 === 1 ? 'local-tool' : 'inkmail';
+      ledger.addEntry(
+        i % 4 === 0 ? 'inbox' : 'system',
+        `entry ${i} ${'x'.repeat((i % 7) * 40)}`,
+        source
+      );
+    }
+    return ledger;
+  }
+
+  it('REGRESSION: never returns the whole window — one page, totals still complete', () => {
+    const ledger = bigLedger(3500);
+    const parsed = parseResult(handleClientLocalTool('list_context', {}, ledger));
+    expect(parsed.totalEntries).toBe(3500);
+    expect(parsed.entries).toHaveLength(LIST_CONTEXT_DEFAULT_LIMIT);
+    expect(parsed.page).toMatchObject({ matched: 3500, offset: 0, returned: 50, remaining: 3450 });
+    expect(parsed.note).toContain('3450 more');
+    expect(parsed.bySource.heartbeat.count).toBe(1167);
+    // The result the model reads stays small however large the window is.
+    const text = (
+      handleClientLocalTool('list_context', {}, ledger)!.content as Array<{ text: string }>
+    )[0].text;
+    expect(text.length).toBeLessThan(20_000);
+  });
+
+  it('pages with offset and caps limit', () => {
+    const ledger = bigLedger(500);
+    const p2 = parseResult(
+      handleClientLocalTool('list_context', { offset: 50, limit: 25 }, ledger)
+    );
+    expect(p2.entries[0].preview).toContain('entry 50 ');
+    expect(p2.entries).toHaveLength(25);
+    const capped = parseResult(handleClientLocalTool('list_context', { limit: 10_000 }, ledger));
+    expect(capped.entries).toHaveLength(LIST_CONTEXT_MAX_LIMIT);
+    expect(capped.page.limit).toBe(LIST_CONTEXT_MAX_LIMIT);
+  });
+
+  it('filters by source, role and minimum size', () => {
+    const ledger = bigLedger(300);
+    const bySource = parseResult(
+      handleClientLocalTool('list_context', { source: 'inkmail' }, ledger)
+    );
+    expect(bySource.page.matched).toBe(100);
+    expect(bySource.entries.every((e: { source: string }) => e.source === 'inkmail')).toBe(true);
+    const byRole = parseResult(handleClientLocalTool('list_context', { role: 'inbox' }, ledger));
+    expect(byRole.page.matched).toBe(75);
+    const big = parseResult(handleClientLocalTool('list_context', { minTokens: 50 }, ledger));
+    expect(big.entries.every((e: { tokens: number }) => e.tokens >= 50)).toBe(true);
+    expect(big.page.matched).toBeLessThan(300);
+    expect(big.page.matched).toBeGreaterThan(0);
+  });
+
+  it('sorts largest-first so the model can find what is worth evicting', () => {
+    const ledger = bigLedger(200);
+    const parsed = parseResult(
+      handleClientLocalTool('list_context', { sort: 'largest', limit: 5 }, ledger)
+    );
+    const tokens = parsed.entries.map((e: { tokens: number }) => e.tokens);
+    expect([...tokens].sort((a, b) => b - a)).toEqual(tokens);
+    const newest = parseResult(
+      handleClientLocalTool('list_context', { sort: 'newest', limit: 1 }, ledger)
+    );
+    expect(newest.entries[0].preview).toContain('entry 199 ');
+  });
+
+  it('REGRESSION (Lumen, PR #576): many bookmarks cannot re-explode the payload', () => {
+    const ledger = new ContextLedger();
+    for (let i = 0; i < 3500; i++) {
+      ledger.addEntry('inbox', `message ${i}`, 'inkmail');
+      ledger.createBookmark(`bookmark ${i} ${'y'.repeat(84)}`);
+    }
+    const result = handleClientLocalTool('list_context', {}, ledger)!;
+    const text = (result.content as Array<{ text: string }>)[0].text;
+    const parsed = JSON.parse(text);
+
+    expect(parsed.bookmarkCount).toBe(3500);
+    expect(parsed.bookmarks).toHaveLength(LIST_CONTEXT_BOOKMARK_LIMIT);
+    expect(parsed.bookmarksNotShown).toBe(3500 - LIST_CONTEXT_BOOKMARK_LIMIT);
+    // The whole result still parses as one document — the relay cap must
+    // never have to cut it mid-JSON.
+    expect(text.length).toBeLessThan(20_000);
+    expect(() => JSON.parse(text)).not.toThrow();
+  });
+
+  it('truncates a long bookmark label and keeps the most recent bookmarks', () => {
+    const ledger = new ContextLedger();
+    ledger.addEntry('user', 'hi');
+    for (let i = 0; i < 25; i++) ledger.createBookmark(`b${i} ${'z'.repeat(500)}`);
+    const parsed = parseResult(handleClientLocalTool('list_context', {}, ledger));
+    expect(parsed.bookmarks[parsed.bookmarks.length - 1].label.startsWith('b24 ')).toBe(true);
+    for (const b of parsed.bookmarks) expect(b.label.length).toBeLessThanOrEqual(121);
+  });
+
+  it('no note when everything fits', () => {
+    const ledger = new ContextLedger();
+    ledger.addEntry('user', 'hi');
+    const parsed = parseResult(handleClientLocalTool('list_context', {}, ledger));
+    expect(parsed.note).toBeUndefined();
+    expect(parsed.page.remaining).toBe(0);
+  });
+});
+
+// ─── evict_context: refs go to the runtime, not the model (#571) ──
+
+describe('handleClientLocalTool: evict_context refs', () => {
+  it('REGRESSION: the model-facing result carries no evictRefs; the hook carries every one', () => {
+    const ledger = new ContextLedger();
+    for (let i = 0; i < 3000; i++) ledger.addEntry('inbox', `message ${i}`, 'inkmail');
+    const hook = vi.fn();
+    const result = handleClientLocalTool('evict_context', { role: 'inbox' }, ledger, undefined, {
+      onEvict: hook,
+    });
+    const text = (result!.content as Array<{ text: string }>)[0].text;
+    const parsed = JSON.parse(text);
+
+    expect(parsed.evicted).toBe(3000);
+    expect(parsed.removedPreviews).toHaveLength(EVICT_CONTEXT_PREVIEW_LIMIT);
+    expect(parsed.removedNotShown).toBe(2990);
+    expect(parsed.evictRefs).toBeUndefined();
+    expect(text.length).toBeLessThan(3_000);
+
+    expect(hook).toHaveBeenCalledTimes(1);
+    const eviction = hook.mock.calls[0][0];
+    expect(eviction.args).toEqual({ role: 'inbox' });
+    expect(eviction.refs).toHaveLength(3000);
+    expect(eviction.refs[0]).toMatchObject({
+      role: 'inbox',
+      source: 'inkmail',
+      hash: expect.any(String),
+    });
+    expect(eviction.tokensFreed).toBe(parsed.tokensFreed);
+  });
+
+  it('no hook call when nothing was evicted', () => {
+    const ledger = new ContextLedger();
+    ledger.addEntry('user', 'hello');
+    const hook = vi.fn();
+    handleClientLocalTool('evict_context', { entryIds: [999] }, ledger, undefined, {
+      onEvict: hook,
+    });
+    expect(hook).not.toHaveBeenCalled();
   });
 });
 

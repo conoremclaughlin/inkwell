@@ -113,8 +113,23 @@ export const LOCAL_TOOL_CATALOG: readonly LocalToolEntry[] = [
     name: 'list_context',
     group: 'client-local',
     summary:
-      'Introspect your context window — see all entries with IDs, token counts, sources, and previews.',
-    parameters: { type: 'object', properties: {} },
+      'Introspect your context window — totals and a per-source breakdown for everything, plus ONE page of entries (IDs, token counts, sources, previews). Filter by source/role/minTokens or sort by "largest" to find what is worth evicting; evicting by source or role needs no listing.',
+    args: 'limit (number, default 50, max 200), offset (number), source (string), role (string), minTokens (number), sort ("oldest" | "newest" | "largest") — all optional',
+    parameters: {
+      type: 'object',
+      properties: {
+        limit: { type: 'number', description: 'Entries per page (default 50, max 200).' },
+        offset: { type: 'number', description: 'Skip this many matching entries.' },
+        source: { type: 'string', description: 'Only entries from this source.' },
+        role: { type: 'string', description: 'Only entries with this role.' },
+        minTokens: { type: 'number', description: 'Only entries at least this large.' },
+        sort: {
+          type: 'string',
+          enum: ['oldest', 'newest', 'largest'],
+          description: 'Page order (default oldest).',
+        },
+      },
+    },
   },
   {
     name: 'evict_context',
