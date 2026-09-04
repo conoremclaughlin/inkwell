@@ -61,6 +61,9 @@ describe('chat.ts provider-sample wiring', () => {
       source.indexOf('const providerContextMeasurement = (')
     );
     expect(sampler).toContain("type: 'provider_sample'");
+    // A report with no usable measurement is persisted as a tombstone too,
+    // so replay cannot resurrect the sample it hid live (Lumen, round 3).
+    expect(sampler).toMatch(/\{ type: 'provider_sample', at, \.\.\.scope, unknown: true \}/);
     expect(source).toContain('if (hydrated.providerSample) {');
   });
 

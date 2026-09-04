@@ -3969,19 +3969,28 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // Persisted so the NEXT process — a one-turn Myra run exits right after
     // this — budgets against it on its first pre-turn check instead of
     // flying blind until its own spawn reports (Lumen, PR #583 round 2).
-    if (usage.contextTokens !== undefined && usage.contextTokens > 0) {
-      appendTranscript(runtime.transcriptPath, {
-        type: 'provider_sample',
-        at,
-        ...scope,
-        contextTokens: usage.contextTokens,
-        ...(usage.inputTokens !== undefined ? { inputTokens: usage.inputTokens } : {}),
-        ...(usage.cacheReadTokens !== undefined ? { cacheReadTokens: usage.cacheReadTokens } : {}),
-        ...(usage.cacheWriteTokens !== undefined
-          ? { cacheWriteTokens: usage.cacheWriteTokens }
-          : {}),
-      });
-    }
+    // A report with no usable measurement is persisted too, as a tombstone:
+    // live it hides the previous sample, and replay must not resurrect it
+    // (Lumen, round 3).
+    const parts = usage.contextParts;
+    appendTranscript(
+      runtime.transcriptPath,
+      usage.contextTokens !== undefined && usage.contextTokens > 0
+        ? {
+            type: 'provider_sample',
+            at,
+            ...scope,
+            contextTokens: usage.contextTokens,
+            ...(parts?.inputTokens !== undefined ? { inputTokens: parts.inputTokens } : {}),
+            ...(parts?.cacheReadTokens !== undefined
+              ? { cacheReadTokens: parts.cacheReadTokens }
+              : {}),
+            ...(parts?.cacheWriteTokens !== undefined
+              ? { cacheWriteTokens: parts.cacheWriteTokens }
+              : {}),
+          }
+        : { type: 'provider_sample', at, ...scope, unknown: true }
+    );
   };
   const providerContextMeasurement = (): ProviderContextMeasurement | undefined =>
     providerSample.measurement(providerScope());
@@ -4324,9 +4333,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
           backend: s.scope.backend,
           source: 'json',
           contextTokens: s.contextTokens,
-          ...(s.inputTokens !== undefined ? { inputTokens: s.inputTokens } : {}),
-          ...(s.cacheReadTokens !== undefined ? { cacheReadTokens: s.cacheReadTokens } : {}),
-          ...(s.cacheWriteTokens !== undefined ? { cacheWriteTokens: s.cacheWriteTokens } : {}),
+          contextParts: {
+            ...(s.inputTokens !== undefined ? { inputTokens: s.inputTokens } : {}),
+            ...(s.cacheReadTokens !== undefined ? { cacheReadTokens: s.cacheReadTokens } : {}),
+            ...(s.cacheWriteTokens !== undefined ? { cacheWriteTokens: s.cacheWriteTokens } : {}),
+          },
         },
         s.scope,
         s.at

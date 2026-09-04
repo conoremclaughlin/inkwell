@@ -157,6 +157,7 @@ describe('providerContextTokens — the context a request was handed, per backen
     );
     expect(usage?.cacheReadTokens).toBe(100_000);
     expect(usage?.contextTokens).toBe(120_000);
+    expect(usage?.contextParts).toEqual({ inputTokens: 120_000, cacheReadTokens: 100_000 });
   });
 
   it('Gemini promptTokenCount already includes the cache', () => {

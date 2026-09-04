@@ -439,36 +439,54 @@ describe('one assistant message streamed as several events (#569)', () => {
   });
 });
 
-describe('result usage carries the context the request was handed (Lumen, PR #583)', () => {
-  it('sums input, cache read and cache write at the adapter boundary', () => {
+describe('result usage carries the context the FINAL request was handed (Lumen, PR #583 rounds 1–3)', () => {
+  const result = (usage: Record<string, unknown>) =>
+    JSON.stringify({ type: 'result', subtype: 'success', result: '', usage }) + '\n';
+  const assistant = (usage: Record<string, unknown>, extra: Record<string, unknown> = {}) =>
+    JSON.stringify({
+      type: 'assistant',
+      message: { id: 'm1', usage, content: [{ type: 'text', text: 'hi' }] },
+      ...extra,
+    }) + '\n';
+  const usageOf = (events: BackendTurnEvent[]) => {
+    const r = events.find((e) => e.kind === 'result');
+    return r?.kind === 'result' ? r.usage : undefined;
+  };
+
+  it("the newest top-level assistant message's usage is the request window, summed at the adapter boundary", () => {
     const parser = new ClaudeStreamParser();
-    const events = parser.push(
-      JSON.stringify({
-        type: 'result',
-        subtype: 'success',
-        result: '',
-        usage: {
+    const events = [
+      ...parser.push(
+        assistant({
+          input_tokens: 1_000,
+          cache_read_input_tokens: 500_000,
+          cache_creation_input_tokens: 40_000,
+          output_tokens: 10,
+        })
+      ),
+      ...parser.push(
+        result({
           input_tokens: 1_000,
           output_tokens: 10,
           cache_read_input_tokens: 500_000,
           cache_creation_input_tokens: 40_000,
-        },
-      }) + '\n'
-    );
-    const result = events.find((e) => e.kind === 'result');
-    expect(result?.kind === 'result' && result.usage?.contextTokens).toBe(541_000);
+        })
+      ),
+    ];
+    const u = usageOf(events);
+    expect(u?.contextTokens).toBe(541_000);
+    expect(u?.contextParts).toEqual({
+      inputTokens: 1_000,
+      cacheReadTokens: 500_000,
+      cacheWriteTokens: 40_000,
+    });
   });
-});
 
-describe('contextTokens comes from the FINAL iteration, not the run aggregate (Lumen, PR #583 round 2)', () => {
-  it('a multi-iteration result reports the last request window; the sums stay for cost', () => {
+  it('a multi-iteration result reports the last EXECUTOR request; the top-level sums stay for cost', () => {
     const parser = new ClaudeStreamParser();
-    const events = parser.push(
-      JSON.stringify({
-        type: 'result',
-        subtype: 'success',
-        result: '',
-        usage: {
+    const u = usageOf(
+      parser.push(
+        result({
           input_tokens: 150,
           output_tokens: 40,
           cache_read_input_tokens: 50_000,
@@ -489,32 +507,81 @@ describe('contextTokens comes from the FINAL iteration, not the run aggregate (L
               type: 'message',
             },
           ],
-        },
-      }) + '\n'
+        })
+      )
     );
-    const result = events.find((e) => e.kind === 'result');
-    expect(result?.kind).toBe('result');
-    if (result?.kind !== 'result') return;
-    expect(result.usage?.contextTokens).toBe(31_050);
-    expect(result.usage?.inputTokens).toBe(150);
-    expect(result.usage?.cacheReadTokens).toBe(50_000);
+    expect(u?.contextTokens).toBe(31_050);
+    // The parts are the final request's — they SUM to the total (round 3).
+    expect(u?.contextParts).toEqual({
+      inputTokens: 50,
+      cacheReadTokens: 30_000,
+      cacheWriteTokens: 1_000,
+    });
+    expect(u?.inputTokens).toBe(150);
+    expect(u?.cacheReadTokens).toBe(50_000);
   });
 
-  it('falls back to the top-level fields when iterations are absent or unreadable', () => {
+  it('REGRESSION (Lumen, round 3): an advisor_message at the end is a foreign window — the last message entry wins', () => {
     const parser = new ClaudeStreamParser();
-    const events = parser.push(
-      JSON.stringify({
-        type: 'result',
-        subtype: 'success',
-        result: '',
-        usage: {
-          input_tokens: 1_000,
-          cache_read_input_tokens: 500_000,
-          iterations: [{ type: 'message' }],
-        },
-      }) + '\n'
+    const u = usageOf(
+      parser.push(
+        result({
+          input_tokens: 999,
+          iterations: [
+            {
+              input_tokens: 100,
+              cache_read_input_tokens: 20_000,
+              cache_creation_input_tokens: 5_000,
+              type: 'message',
+            },
+            {
+              input_tokens: 7,
+              cache_read_input_tokens: 900_000,
+              cache_creation_input_tokens: 0,
+              type: 'advisor_message',
+            },
+          ],
+        })
+      )
     );
-    const result = events.find((e) => e.kind === 'result');
-    expect(result?.kind === 'result' && result.usage?.contextTokens).toBe(501_000);
+    expect(u?.contextTokens).toBe(25_100);
+  });
+
+  it.each([
+    [
+      'an empty iterations array',
+      { input_tokens: 1_000, cache_read_input_tokens: 500_000, iterations: [] },
+    ],
+    ['no iterations at all', { input_tokens: 1_000, cache_read_input_tokens: 500_000 }],
+    ['only unreadable entries', { input_tokens: 1_000, iterations: [{ type: 'message' }] }],
+    [
+      'only advisor entries',
+      { input_tokens: 1_000, iterations: [{ type: 'advisor_message', input_tokens: 5 }] },
+    ],
+  ])(
+    'REGRESSION (Lumen, round 3): with %s and no per-request usage the window is UNKNOWN — never the aggregate',
+    (_w, usage) => {
+      const parser = new ClaudeStreamParser();
+      const u = usageOf(parser.push(result(usage)));
+      expect(u).toBeDefined();
+      expect(u?.contextTokens).toBeUndefined();
+      expect(u?.contextParts).toBeUndefined();
+      expect(u?.inputTokens).toBe(1_000);
+    }
+  );
+
+  it("a subagent's assistant events (parent_tool_use_id) never become this session's window", () => {
+    const parser = new ClaudeStreamParser();
+    const events = [
+      ...parser.push(assistant({ input_tokens: 10, cache_read_input_tokens: 40_000 })),
+      ...parser.push(
+        assistant(
+          { input_tokens: 5, cache_read_input_tokens: 900_000 },
+          { parent_tool_use_id: 'tu_1' }
+        )
+      ),
+      ...parser.push(result({ input_tokens: 15, cache_read_input_tokens: 940_000 })),
+    ];
+    expect(usageOf(events)?.contextTokens).toBe(40_010);
   });
 });

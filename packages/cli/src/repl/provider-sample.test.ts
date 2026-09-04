@@ -10,10 +10,12 @@ const scope: ProviderSampleScope = {
 const usage = {
   backend: 'claude',
   source: 'json' as const,
-  inputTokens: 1_000,
-  cacheReadTokens: 500_000,
-  cacheWriteTokens: 40_000,
+  // The run's aggregate — NOT the parts of the final request below.
+  inputTokens: 5_000,
+  cacheReadTokens: 900_000,
+  cacheWriteTokens: 90_000,
   contextTokens: 541_000,
+  contextParts: { inputTokens: 1_000, cacheReadTokens: 500_000, cacheWriteTokens: 40_000 },
 };
 
 describe('ProviderSampleTracker — a measurement is only good for the window it measured (Lumen, PR #583)', () => {
@@ -27,6 +29,20 @@ describe('ProviderSampleTracker — a measurement is only good for the window it
       cacheWriteTokens: 40_000,
       model: 'claude-opus-5',
       measuredAt: '2026-09-03T20:00:00.000Z',
+    });
+  });
+
+  it("REGRESSION (Lumen, round 3): the breakdown is the final request's parts, which sum to the total — never the aggregate", () => {
+    const t = new ProviderSampleTracker();
+    t.record(usage, scope);
+    const m = t.measurement(scope)!;
+    expect(m.inputTokens! + m.cacheReadTokens! + m.cacheWriteTokens!).toBe(m.contextTokens);
+    const noParts = new ProviderSampleTracker();
+    noParts.record({ ...usage, contextParts: undefined }, scope);
+    expect(noParts.measurement(scope)).toEqual({
+      contextTokens: 541_000,
+      model: 'claude-opus-5',
+      measuredAt: expect.any(String),
     });
   });
 

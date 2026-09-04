@@ -1,3 +1,9 @@
+export interface ContextParts {
+  inputTokens?: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+}
+
 export interface BackendTokenUsage {
   backend: string;
   inputTokens?: number;
@@ -14,6 +20,12 @@ export interface BackendTokenUsage {
    * cacheReadTokens there would double-count (Lumen, PR #583 finding 2).
    */
   contextTokens?: number;
+  /**
+   * The parts `contextTokens` was computed from — the FINAL request's own
+   * input / cache read / cache write. Kept apart from the top-level fields,
+   * which for an agent run are the run's aggregate (Lumen, PR #583 round 3).
+   */
+  contextParts?: ContextParts;
   source: 'json' | 'text';
   /**
    * Per-model breakdown as the backend reported it, keyed exactly as reported.
@@ -282,8 +294,14 @@ export function extractBackendTokenUsage(
       })();
   if (!parsed) return undefined;
 
-  const contextTokens = providerContextTokens(backend, parsed);
-  return contextTokens === undefined ? parsed : { ...parsed, contextTokens };
+  // A buffered report is one usage object, so its parts are the request's.
+  const parts: ContextParts = {
+    ...(parsed.inputTokens !== undefined ? { inputTokens: parsed.inputTokens } : {}),
+    ...(parsed.cacheReadTokens !== undefined ? { cacheReadTokens: parsed.cacheReadTokens } : {}),
+    ...(parsed.cacheWriteTokens !== undefined ? { cacheWriteTokens: parsed.cacheWriteTokens } : {}),
+  };
+  const contextTokens = providerContextTokens(backend, parts);
+  return contextTokens === undefined ? parsed : { ...parsed, contextTokens, contextParts: parts };
 }
 
 export function formatBackendTokenUsage(usage: BackendTokenUsage): string {

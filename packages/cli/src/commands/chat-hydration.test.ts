@@ -488,6 +488,24 @@ describe('hydrateLedgerFromTranscript — the provider sample survives a process
     ).toBeUndefined();
   });
 
+  it('REGRESSION (Lumen, round 3): a newer report with no usable measurement is a tombstone — valid → unknown → nothing', () => {
+    write([
+      sample,
+      {
+        type: 'provider_sample',
+        at: '2026-09-03T20:01:00.000Z',
+        backend: 'claude',
+        model: 'claude-opus-5',
+        backendSessionId: 'sess-1',
+        envelopeShape: 'shape-a',
+        unknown: true,
+      },
+    ]);
+    expect(
+      hydrateLedgerFromTranscript(new ContextLedger(), transcriptPath).providerSample
+    ).toBeUndefined();
+  });
+
   it('a later sample replaces an earlier one; a malformed one is ignored', () => {
     write([sample, { ...sample, contextTokens: 600_000 }]);
     expect(

@@ -66,12 +66,17 @@ export class ProviderSampleTracker {
     if (!s || !sameProviderScope(s.scope, scope)) return undefined;
     const contextTokens = s.usage.contextTokens;
     if (contextTokens === undefined || contextTokens <= 0) return undefined;
-    const u = s.usage;
+    // The FINAL request's parts, never the run's aggregate top-level fields:
+    // a breakdown that does not sum to the total is a contradiction (Lumen,
+    // PR #583 round 3). Without per-request parts, only the total is shown.
+    const parts = s.usage.contextParts;
     return {
       contextTokens,
-      ...(u.inputTokens !== undefined ? { inputTokens: u.inputTokens } : {}),
-      ...(u.cacheReadTokens !== undefined ? { cacheReadTokens: u.cacheReadTokens } : {}),
-      ...(u.cacheWriteTokens !== undefined ? { cacheWriteTokens: u.cacheWriteTokens } : {}),
+      ...(parts?.inputTokens !== undefined ? { inputTokens: parts.inputTokens } : {}),
+      ...(parts?.cacheReadTokens !== undefined ? { cacheReadTokens: parts.cacheReadTokens } : {}),
+      ...(parts?.cacheWriteTokens !== undefined
+        ? { cacheWriteTokens: parts.cacheWriteTokens }
+        : {}),
       ...(s.scope.model ? { model: s.scope.model } : {}),
       measuredAt: s.at,
     };
