@@ -12,6 +12,12 @@ describe('deprecated backends (Conor, 2026-09-03: Gemini CLI needs an enterprise
     expect(Object.keys(DEPRECATED_BACKENDS)).toEqual(['gemini']);
   });
 
+  it('REGRESSION (Lumen): inherited keys are not reasons', () => {
+    for (const name of ['toString', '__proto__', 'constructor', 'hasOwnProperty']) {
+      expect(deprecatedBackendReason(name)).toBeUndefined();
+    }
+  });
+
   it('still resolves the adapter, warning once per process on stderr', () => {
     const write = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     expect(getBackend('gemini')).toBeDefined();

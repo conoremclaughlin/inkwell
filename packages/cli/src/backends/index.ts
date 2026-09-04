@@ -33,7 +33,12 @@ export const DEPRECATED_BACKENDS: Readonly<Record<string, string>> = {
 };
 
 export function deprecatedBackendReason(name: string): string | undefined {
-  return DEPRECATED_BACKENDS[name];
+  // Own properties only: an ordinary object indexed by arbitrary input would
+  // hand back inherited keys — `toString` a function, `__proto__` an object
+  // (Lumen, PR #585).
+  return Object.prototype.hasOwnProperty.call(DEPRECATED_BACKENDS, name)
+    ? DEPRECATED_BACKENDS[name]
+    : undefined;
 }
 
 const warnedDeprecated = new Set<string>();
