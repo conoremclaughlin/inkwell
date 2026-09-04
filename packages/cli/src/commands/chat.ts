@@ -3077,6 +3077,32 @@ export interface ReseedDialogueEntry {
  * dialogue is what keeps the reseeded session from re-issuing calls that
  * already ran (#572). Imitated frames are already cut by the host.
  */
+/** The provider-session argument a continuation spawn carries, plus whether media is (re)delivered. */
+export interface ContinuationSpawnArgs {
+  sessionArgs: { backendSessionId?: string; backendSessionSeedId?: string };
+  deliverMedia: boolean;
+}
+
+/**
+ * What the continuation spawn must say about its session, from the decision:
+ * a resume carries `backendSessionId`; a mid-turn SEED carries
+ * `backendSessionSeedId` and re-delivers the turn's media (the fresh native
+ * session has never seen it); a stateless spawn carries neither. Kept apart
+ * from the request builder so the call path can be tested — the builder once
+ * derived the argument from the live id and sent a freshly minted seed as a
+ * resume of a session that did not exist (Lumen, PR #577 final pass).
+ */
+export function continuationSpawnArgs(
+  decision: ReturnType<typeof decideContinuationSession>,
+  hasMedia: boolean
+): ContinuationSpawnArgs {
+  if (decision.mode === 'resume')
+    return { sessionArgs: { backendSessionId: decision.id }, deliverMedia: false };
+  if (decision.mode === 'seed')
+    return { sessionArgs: { backendSessionSeedId: decision.id }, deliverMedia: hasMedia };
+  return { sessionArgs: {}, deliverMedia: false };
+}
+
 export function buildMidTurnReseedBody(dialogue: readonly ReseedDialogueEntry[]): string {
   const rendered = dialogue
     .map((entry) => {
@@ -6913,7 +6939,10 @@ export async function runChat(options: ChatOptions): Promise<void> {
       statelessGenerationAtReport = generationBeforeSpawn;
     };
     /** The continuation spawn's request; the budget measures the same shape. */
-    const continuationRequest = (prompt: string): BackendRunRequest => ({
+    const continuationRequest = (
+      prompt: string,
+      spawn: ContinuationSpawnArgs = { sessionArgs: {}, deliverMedia: false }
+    ): BackendRunRequest => ({
       backend: runtime.backend,
       agentId,
       model: runtime.model,
@@ -6928,15 +6957,17 @@ export async function runChat(options: ChatOptions): Promise<void> {
       onEvent: handleBackendEvent,
       attachmentDirs: sessionAttachmentDirs.length > 0 ? sessionAttachmentDirs : undefined,
       toolRouting: runtime.toolRouting,
-      // Same logical turn — media rides along (WITHOUT deliverMedia) so the
-      // adapter's boundary disposition (--tools gate) cannot flap between the
-      // delivery spawn and tool-loop continuations, while the resumed provider
-      // session is never re-fed images it already holds. Stateless adapters
-      // re-attach from `media` regardless.
+      // Same logical turn — media rides along so the adapter's boundary
+      // disposition (--tools gate) cannot flap between the delivery spawn and
+      // tool-loop continuations. A RESUME never re-delivers it (the session
+      // holds it); a mid-turn SEED must (the fresh session has never seen it);
+      // stateless adapters re-attach from `media` regardless.
       media: turnMedia.length > 0 ? turnMedia : undefined,
-      // Resume the live provider session so this round-trip appends to the
-      // same Claude thread instead of re-piping the whole window.
-      ...(activeBackendSessionId ? { backendSessionId: activeBackendSessionId } : {}),
+      ...(spawn.deliverMedia ? { deliverMedia: true } : {}),
+      // The session argument is the DECISION's, never derived from the live id:
+      // a seed assigns the minted id before spawning, and deriving from it sent
+      // a resume of a session that did not exist yet (Lumen, PR #577).
+      ...spawn.sessionArgs,
     });
     /**
      * What the window holds for the next relay — see relayBudgetBytes. A
@@ -7150,10 +7181,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
         randomUUID
       );
       let continuationPrompt: string;
-      let sessionArgs: { backendSessionId?: string; backendSessionSeedId?: string } = {};
       if (decision.mode === 'resume') {
         continuationPrompt = body;
-        sessionArgs = { backendSessionId: decision.id };
       } else if (decision.mode === 'seed') {
         activeBackendSessionId = decision.id;
         // Recomputed HERE, not the pre-spawn snapshot: the opening spawn's
@@ -7177,7 +7206,6 @@ export async function runChat(options: ChatOptions): Promise<void> {
           ledger,
           buildMidTurnReseedBody([...turnDialogue, { role: 'runtime', text: body }])
         );
-        sessionArgs = { backendSessionSeedId: decision.id };
       } else {
         continuationPrompt = buildPromptEnvelope(agentId, runtime, ledger, body);
       }
@@ -7189,7 +7217,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
       beginSpawn();
       const ledgerIdBeforeSpawn = maxLedgerId();
       const generationBeforeSpawn = contextGeneration;
-      const contTurn = startBackendTurn(continuationRequest(continuationPrompt));
+      const contTurn = startBackendTurn(
+        continuationRequest(
+          continuationPrompt,
+          continuationSpawnArgs(decision, turnMedia.length > 0)
+        )
+      );
       currentTurnAbort = contTurn.abort;
 
       const contResult = await contTurn.result.finally(() => {
