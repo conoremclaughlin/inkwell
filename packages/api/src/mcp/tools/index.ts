@@ -1531,7 +1531,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   server.registerTool(
     'update_task_group',
     {
-      description: `Update a task group — change its status (active/paused/completed/cancelled), title, description, priority, tags, metadata, thread key, or owner. Use this to close a group when its work ships (status: completed) or is abandoned (status: cancelled), or to reassign ownership.
+      description: `Update a task group — change its status (active/paused/completed/cancelled), title, description, priority, tags, metadata, thread key, owner, or project. Use this to close a group when its work ships (status: completed) or is abandoned (status: cancelled), to reassign ownership, or to re-home the group under a different project via \`projectId\` (pass null to detach) — no need to recreate the group.
 
 Pass \`closedReason\` as a shorthand to record why a group was closed — it's stored under \`metadata.closed_reason\`.
 

@@ -1564,6 +1564,14 @@ export const updateTaskGroupSchema = z.object({
     .nullable()
     .optional()
     .describe('Cap on autonomous sessions spent on this group'),
+  projectId: z
+    .string()
+    .uuid()
+    .nullable()
+    .optional()
+    .describe(
+      'Re-home this group under a different project. Pass a project UUID to move it, or null to detach. The project must belong to the caller. Omit to leave unchanged.'
+    ),
 });
 
 export async function handleUpdateTaskGroup(
@@ -1632,6 +1640,20 @@ export async function handleUpdateTaskGroup(
       nextSbId = args.sbId;
     }
 
+    // Re-home the group under a different project. Service-role DB access
+    // bypasses RLS, so a target project UUID must be validated against the
+    // caller before it's written — mirrors create's check. `undefined` means
+    // "don't touch"; `null` means "detach" and is allowed without a lookup.
+    if (typeof args.projectId === 'string') {
+      const project = await dataComposer.repositories.projects.findById(args.projectId);
+      if (!project) {
+        return mcpResponse({ success: false, error: 'Project not found' }, true);
+      }
+      if (project.user_id !== resolved.user.id) {
+        return mcpResponse({ success: false, error: 'Project does not belong to this user' }, true);
+      }
+    }
+
     const updated = await dataComposer.repositories.taskGroups.update(args.groupId, {
       title: args.title,
       description: args.description,
@@ -1646,6 +1668,7 @@ export async function handleUpdateTaskGroup(
       sb_id: nextSbId,
       autonomous: args.autonomous,
       max_sessions: args.maxSessions,
+      project_id: args.projectId,
     });
 
     return mcpResponse({
