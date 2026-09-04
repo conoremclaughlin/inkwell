@@ -331,7 +331,7 @@ export function resolveResponseText(outcome: BackendTurnOutcome): string {
  * to macOS ARG_MAX (Lumen, PR #576 round 1). The budget is on the MESSAGE;
  * the results share it.
  */
-export const MAX_RELAY_CHARS = 200_000;
+export const MAX_RELAY_BYTES = 200_000;
 
 /**
  * Per-result overhead the renderer reserves out of the budget: the header
@@ -340,10 +340,59 @@ export const MAX_RELAY_CHARS = 200_000;
  * (round 1) let twelve results compose a message twice the ceiling while the
  * constant advertised it (Lumen, PR #576 round 2).
  */
-const RELAY_RESULT_OVERHEAD_CHARS = 320;
+const RELAY_RESULT_OVERHEAD_BYTES = 320;
 
 /**
- * Render an iteration's results into at most `budgetChars` characters. The
+ * Render an iteration's results into at most `budgetBytes` characters. The
+ * budget is divided evenly; a result that fits keeps its slack for nobody —
+ * simplicity over packing — and a result that does not is cut with a note
+ * naming its full size. With many results the slice per result shrinks to a
+ * stub; the header still names the tool and the status, and the whole
+ * payload is in the transcript. The invariant is the ceiling, not the slice.
+ */
+const utf8Bytes = (text: string): number => Buffer.byteLength(text, 'utf8');
+
+/** The longest prefix of `text` within `maxBytes` of UTF-8, never splitting a code point. */
+export function cutUtf8(text: string, maxBytes: number): string {
+  if (maxBytes <= 0) return '';
+  if (utf8Bytes(text) <= maxBytes) return text;
+  let lo = 0;
+  let hi = text.length;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (utf8Bytes(text.slice(0, mid)) <= maxBytes) lo = mid;
+    else hi = mid - 1;
+  }
+  let cut = text.slice(0, lo);
+  const last = cut.charCodeAt(cut.length - 1);
+  if (last >= 0xd800 && last <= 0xdbff) cut = cut.slice(0, -1);
+  return cut;
+}
+
+/**
+ * What a cut relay ends with when even the explanatory note will not fit.
+ * A marker ALWAYS survives — a bare prefix with nothing to say it was cut
+ * reads as a complete message (Lumen, PR #576 round 4).
+ */
+export const RELAY_CUT_MARKER = '…[ink: cut]';
+
+/** `text` within `budget` bytes, ending in the note or, failing that, the marker. */
+function cutWithMarker(text: string, budget: number, note: string): string {
+  const tail = utf8Bytes(note) < budget ? note : RELAY_CUT_MARKER;
+  return cutUtf8(text, Math.max(0, budget - utf8Bytes(tail))) + tail;
+}
+
+function cutNote(budget: number, results: ReadonlyArray<ToolResultRecord>): string {
+  const tools = Array.from(new Set(results.map((r) => r.tool)));
+  const named = tools.slice(0, 5).join(', ') + (tools.length > 5 ? ', …' : '');
+  return (
+    `\n…[ink: relay cut at its ${budget.toLocaleString()}-byte budget — ` +
+    `${results.length} results (${named}); every payload is in this session's transcript.]`
+  );
+}
+
+/**
+ * Render an iteration's results into at most `budgetBytes` of UTF-8. The
  * budget is divided evenly; a result that fits keeps its slack for nobody —
  * simplicity over packing — and a result that does not is cut with a note
  * naming its full size. With many results the slice per result shrinks to a
@@ -352,44 +401,69 @@ const RELAY_RESULT_OVERHEAD_CHARS = 320;
  */
 function renderToolResults(
   results: ReadonlyArray<ToolResultRecord>,
-  budgetChars: number = MAX_RELAY_CHARS
+  budgetBytes: number = MAX_RELAY_BYTES
 ): string {
-  const budget = Math.max(0, Math.floor(budgetChars));
+  const budget = Math.max(0, Math.floor(budgetBytes));
   const n = Math.max(1, results.length);
-  const share = Math.max(0, Math.floor((budget - n * RELAY_RESULT_OVERHEAD_CHARS) / n));
+  const share = Math.max(0, Math.floor((budget - n * RELAY_RESULT_OVERHEAD_BYTES) / n));
   const composed = results.map((r) => renderToolResult(r, share)).join('\n\n');
-  if (composed.length <= budget) return composed;
+  if (utf8Bytes(composed) <= budget) return composed;
   // The framing alone outgrew the budget — many results, long tool names, a
   // budget below the per-result reserve. The ceiling is the invariant, not
   // the framing: cut at the budget and say what was lost (Lumen, PR #576
   // round 3 — 50 oversized results at 8K rendered 9,659 chars).
-  return cutAtBudget(composed, budget, results);
+  return cutWithMarker(composed, budget, cutNote(budget, results));
 }
 
-function cutAtBudget(
-  composed: string,
-  budget: number,
-  results: ReadonlyArray<ToolResultRecord>
-): string {
-  const tools = Array.from(new Set(results.map((r) => r.tool)));
-  const named = tools.slice(0, 5).join(', ') + (tools.length > 5 ? ', …' : '');
-  const note =
-    `\n…[ink: relay cut at its ${budget.toLocaleString()}-character budget — ` +
-    `${results.length} results (${named}); every payload is in this session's transcript.]`;
-  if (note.length >= budget) return composed.slice(0, budget);
-  return composed.slice(0, budget - note.length) + note;
-}
-
-function renderToolResult(r: ToolResultRecord, maxChars: number): string {
+function renderToolResult(r: ToolResultRecord, maxBytes: number): string {
   const resultStr = typeof r.result === 'string' ? r.result : JSON.stringify(r.result);
   if (resultStr === undefined) return `Tool ${r.tool} (${r.status}): undefined`;
-  if (resultStr.length <= maxChars) return `Tool ${r.tool} (${r.status}): ${resultStr}`;
+  const size = utf8Bytes(resultStr);
+  if (size <= maxBytes) return `Tool ${r.tool} (${r.status}): ${resultStr}`;
   return (
-    `Tool ${r.tool} (${r.status}): ${resultStr.slice(0, maxChars)}\n` +
-    `…[ink: result truncated — ${resultStr.length.toLocaleString()} chars total, ` +
-    `${maxChars.toLocaleString()} shown; the full payload is in this session's transcript. ` +
+    `Tool ${r.tool} (${r.status}): ${cutUtf8(resultStr, maxBytes)}\n` +
+    `…[ink: result truncated — ${size.toLocaleString()} bytes total, ` +
+    `${maxBytes.toLocaleString()} shown; the full payload is in this session's transcript. ` +
     'Ask for less next time (page, filter, or narrow the query).]'
   );
+}
+
+/** At most this many dropped-call names are listed; the rest are counted. */
+export const MAX_NAMED_DROPPED = 8;
+
+/**
+ * Dropped calls by name, bounded: 45 dropped calls with 400-character names
+ * were 18K of framing on their own (Lumen, PR #576 round 4). Naming beats
+ * counting only while the names fit.
+ */
+function listDropped(dropped: ReadonlyArray<{ tool: string }>): string {
+  const names = dropped.slice(0, MAX_NAMED_DROPPED).map((c) => c.tool);
+  const more = dropped.length - names.length;
+  return names.join(', ') + (more > 0 ? `, and ${more} more` : '');
+}
+
+/**
+ * The whole relay within the budget: the frame (header, notes, instructions)
+ * is sized first, the results get what remains, and if the frame alone is
+ * over the budget the message is cut with a marker. The invariant is on the
+ * MESSAGE the provider receives, not on one block of it (Lumen, PR #576
+ * round 4 — five results and 45 dropped names produced 26,972 chars under
+ * an 8K budget with only the results block capped).
+ */
+function fitRelay(
+  head: string,
+  results: ReadonlyArray<ToolResultRecord>,
+  tail: string,
+  budgetBytes: number | undefined,
+  emptyText = ''
+): string {
+  const budget = Math.max(0, Math.floor(budgetBytes ?? MAX_RELAY_BYTES));
+  const frame = utf8Bytes(head) + utf8Bytes(tail);
+  const block =
+    results.length > 0 ? renderToolResults(results, Math.max(0, budget - frame)) : emptyText;
+  const body = head + block + tail;
+  if (utf8Bytes(body) <= budget) return body;
+  return cutWithMarker(body, budget, cutNote(budget, results));
 }
 
 export function buildContinuationBody(
@@ -405,10 +479,8 @@ export function buildContinuationBody(
     dropped: [],
     unmatched: 0,
   },
-  opts: { imitatedToolResults?: boolean; budgetChars?: number } = {}
+  opts: { imitatedToolResults?: boolean; budgetBytes?: number } = {}
 ): string {
-  const toolResultsSummary = renderToolResults(results, opts.budgetChars);
-
   const formatCorrection = calls.some((c) => c.variantFormat)
     ? '\n\nFORMAT NOTE: your tool calls used <tool_call> XML — the ink runtime executed them this time, but the ONLY supported format is a fenced block:\n```ink-tool\n{"tool":"<name>","args":{...}}\n```\nUse ink-tool fences (bare tool names, no mcp__inkwell__ prefix) from now on.'
     : '';
@@ -468,7 +540,7 @@ export function buildContinuationBody(
         : `\n\nNOTE: you emitted ${emitted} tool calls. ${reached} reached the tool runner — their ` +
           `outcomes are above, and some of those may themselves have been refused or failed. ` +
           `The remaining ${dropped.length} never reached it at all and had no effect: ` +
-          `${dropped.map((c) => c.tool).join(', ')}. ` +
+          `${listDropped(dropped)}. ` +
           `At most ${MAX_TOOL_CALLS_PER_ITERATION} calls run per iteration, in the order you emit them. ` +
           `Re-emit the ones you still need — they did not happen. Do not report them as done.`;
 
@@ -479,7 +551,12 @@ export function buildContinuationBody(
   // results from these.
   const protocolNote = opts.imitatedToolResults ? `\n\n${IMITATED_RESULTS_PROTOCOL_NOTE}` : '';
 
-  return `[Tool results from previous turn]\n${toolResultsSummary}${formatCorrection}${refusalNote}${droppedNote}${protocolNote}\n\nContinue your response based on these tool results. If you need more tools, emit ink-tool blocks. Otherwise, provide your final answer.`;
+  return fitRelay(
+    '[Tool results from previous turn]\n',
+    results,
+    `${formatCorrection}${refusalNote}${droppedNote}${protocolNote}\n\nContinue your response based on these tool results. If you need more tools, emit ink-tool blocks. Otherwise, provide your final answer.`,
+    opts.budgetBytes
+  );
 }
 
 const IMITATED_RESULTS_PROTOCOL_NOTE =
@@ -518,9 +595,8 @@ export function buildFinalRelayBody(
     dropped: [],
     unmatched: 0,
   },
-  opts: { imitatedToolResults?: boolean; budgetChars?: number } = {}
+  opts: { imitatedToolResults?: boolean; budgetBytes?: number } = {}
 ): string {
-  const toolResultsSummary = renderToolResults(results, opts.budgetChars);
   // Undelivered calls have to be named here too. This body ends the turn, so a
   // call the cap discarded on the final iteration will never get another
   // chance — and an agent that is not told exits reporting work it never did.
@@ -534,17 +610,18 @@ export function buildFinalRelayBody(
         `ended. Say that plainly rather than reporting the work as done.`
       : dropped.length === 0
         ? ''
-        : `\n\nNOT EXECUTED — these calls were emitted but never ran, and the loop has now ended: ${dropped
-            .map((c) => c.tool)
-            .join(', ')}. They had no effect. Say so rather than reporting them as done.`;
+        : `\n\nNOT EXECUTED — these calls were emitted but never ran, and the loop has now ended: ${listDropped(dropped)}. They had no effect. Say so rather than reporting them as done.`;
 
-  const summary = results.length > 0 ? toolResultsSummary : '(no tool results from this iteration)';
   const protocolNote = opts.imitatedToolResults ? `\n\n${IMITATED_RESULTS_PROTOCOL_NOTE}` : '';
-  return (
-    `[Tool results from previous turn — FINAL]\n${summary}${droppedNote}${protocolNote}\n\n` +
-    'The tool loop has ended; no further tool calls will be executed this turn. ' +
-    'Review these results and provide your final answer. If a call above failed, ' +
-    'say so plainly instead of reporting the work as done.'
+  return fitRelay(
+    '[Tool results from previous turn — FINAL]\n',
+    results,
+    `${droppedNote}${protocolNote}\n\n` +
+      'The tool loop has ended; no further tool calls will be executed this turn. ' +
+      'Review these results and provide your final answer. If a call above failed, ' +
+      'say so plainly instead of reporting the work as done.',
+    opts.budgetBytes,
+    '(no tool results from this iteration)'
   );
 }
 
@@ -562,13 +639,15 @@ export interface AgentLoopInput {
   maxIterations?: number;
   signal?: AbortSignal;
   /**
-   * How many characters of tool results the next relay may carry, asked
-   * per iteration. A static ceiling is only safe while the window has that
-   * much room: after the pre-turn compaction check a 128K/200K window may
-   * hold far less (Lumen, PR #576 round 2). The host answers from its live
-   * headroom; absent, MAX_RELAY_CHARS applies.
+   * How many UTF-8 bytes the next relay MESSAGE may be, asked per iteration.
+   * Bytes, because no text tokenizes to more tokens than its UTF-8 bytes —
+   * a chars-per-token heuristic is not a bound for arbitrary scripts. A
+   * static ceiling is only safe while the window has that much room: after
+   * the pre-turn compaction check a 128K/200K window may hold far less
+   * (Lumen, PR #576 rounds 2–4). The host answers from its live headroom;
+   * absent, MAX_RELAY_BYTES applies.
    */
-  relayBudgetChars?: () => number;
+  relayBudgetBytes?: () => number;
   /**
    * Tell the agent when every call in an iteration was refused, and let it try
    * again, instead of ending the turn.
@@ -768,7 +847,7 @@ export async function runAgentLoop(
           correcting((imitated) =>
             buildContinuationBody([record], extracted, undefined, {
               imitatedToolResults: imitated,
-              budgetChars: input.relayBudgetChars?.(),
+              budgetBytes: input.relayBudgetBytes?.(),
             })
           ),
           {
@@ -959,7 +1038,7 @@ export async function runAgentLoop(
         correcting((imitated) =>
           buildContinuationBody(results, calls, selection, {
             imitatedToolResults: imitated,
-            budgetChars: input.relayBudgetChars?.(),
+            budgetBytes: input.relayBudgetBytes?.(),
           })
         ),
         {
@@ -1077,7 +1156,7 @@ export async function runAgentLoop(
         relayWorthy
           ? buildFinalRelayBody(stranded!.results, stranded!.selection, {
               imitatedToolResults: imitated,
-              budgetChars: input.relayBudgetChars?.(),
+              budgetBytes: input.relayBudgetBytes?.(),
             })
           : buildProtocolCorrectionBody({ final: true })
       )

@@ -10,12 +10,12 @@ import {
   findLastBackendSession,
   findLastDetectedModel,
   isResumeFailedNoSession,
-  relayBudgetChars,
-  MIN_RELAY_BUDGET_CHARS,
-  RELAY_CHARS_PER_TOKEN,
+  relayBudgetBytes,
+  MIN_RELAY_BUDGET_BYTES,
+  RELAY_BYTES_PER_TOKEN,
   RELAY_HEADROOM_SHARE,
 } from './chat.js';
-import { MAX_RELAY_CHARS } from '../repl/agent-loop.js';
+import { MAX_RELAY_BYTES } from '../repl/agent-loop.js';
 import { ContextLedger } from '../repl/context-ledger.js';
 
 /**
@@ -734,53 +734,47 @@ describe('one-turn process recovery sequence — detection outlives the seed (PR
   });
 });
 
-describe('relayBudgetChars — the relay budget follows the live headroom (Lumen, PR #576)', () => {
+describe('relayBudgetBytes — the relay budget follows the live headroom (Lumen, PR #576)', () => {
   const ledgerWith = (tokens: number) => ({ totalTokens: () => tokens });
+  const runtime = { maxContextTokens: 128_000, bootstrapContext: 'x'.repeat(40_000) };
 
   it('a roomy 1M window gets the full static ceiling', () => {
     expect(
-      relayBudgetChars({ maxContextTokens: 1_000_000, bootstrapContext: '' }, ledgerWith(300_000))
-    ).toBe(MAX_RELAY_CHARS);
+      relayBudgetBytes({ maxContextTokens: 1_000_000, bootstrapContext: '' }, ledgerWith(300_000))
+    ).toBe(MAX_RELAY_BYTES);
   });
 
   it('a 128K window most of the way to its budget gets far less than the ceiling', () => {
-    const budget = relayBudgetChars(
-      { maxContextTokens: 128_000, bootstrapContext: 'x'.repeat(40_000) },
-      ledgerWith(90_000)
-    );
-    // 128K − 10K bootstrap − 90K ledger = 28K tokens; half of that, at the
-    // conservative density, in chars.
-    expect(budget).toBe(28_000 * RELAY_CHARS_PER_TOKEN * RELAY_HEADROOM_SHARE);
-    expect(budget).toBeLessThan(MAX_RELAY_CHARS);
+    // 128K − 10K bootstrap − 90K ledger = 28K tokens; half of that, in bytes.
+    const budget = relayBudgetBytes(runtime, ledgerWith(90_000));
+    expect(budget).toBe(28_000 * RELAY_BYTES_PER_TOKEN * RELAY_HEADROOM_SHARE);
+    expect(budget).toBeLessThan(MAX_RELAY_BYTES);
   });
 
-  it('REGRESSION (Lumen, round 3): at the incident density the relay costs at most half the headroom', () => {
+  it('REGRESSION (Lumen, rounds 3–4): the relay costs at most half the headroom for ANY script', () => {
+    // No text tokenizes to more tokens than its UTF-8 bytes, so a budget in
+    // bytes at one token per byte is a bound — where 4 chars/token (the
+    // ledger heuristic) failed at the incident's ~1.9 and 1.5 chars/token
+    // failed below 0.75 UTF-16 chars/token.
+    expect(RELAY_BYTES_PER_TOKEN).toBe(1);
     const remaining = 28_000;
-    const budget = relayBudgetChars(
-      { maxContextTokens: 128_000, bootstrapContext: 'x'.repeat(40_000) },
-      ledgerWith(90_000)
-    );
-    // The prose heuristic (4 chars/token × 0.5) granted 56K chars, which at
-    // the measured ~1.9 chars/token cost ~29.5K tokens — more than all of it.
-    const costAtIncidentDensity = budget / 1.9;
-    expect(costAtIncidentDensity).toBeLessThanOrEqual(remaining * RELAY_HEADROOM_SHARE);
-    expect(RELAY_CHARS_PER_TOKEN).toBeLessThan(1.9);
+    const budget = relayBudgetBytes(runtime, ledgerWith(90_000));
+    const worstCaseTokens = budget / RELAY_BYTES_PER_TOKEN;
+    expect(worstCaseTokens).toBeLessThanOrEqual(remaining * RELAY_HEADROOM_SHARE);
   });
 
   it('REGRESSION (Lumen, round 3): what the loop already sent and received shrinks the next allowance', () => {
-    const runtime = { maxContextTokens: 128_000, bootstrapContext: 'x'.repeat(40_000) };
-    const fresh = relayBudgetChars(runtime, ledgerWith(90_000));
-    // 15K resident chars ≈ 10K tokens at the conservative density: 28K → 18K remaining.
-    const later = relayBudgetChars(runtime, ledgerWith(90_000), 15_000);
+    const fresh = relayBudgetBytes(runtime, ledgerWith(90_000));
+    // 15K resident bytes count as 15K tokens at the bound: 28K → 13K remaining.
+    const later = relayBudgetBytes(runtime, ledgerWith(90_000), 15_000);
     expect(later).toBeLessThan(fresh);
-    expect(later).toBe(Math.floor(18_000 * RELAY_CHARS_PER_TOKEN * RELAY_HEADROOM_SHARE));
-    // Enough resident traffic exhausts the headroom down to the floor.
-    expect(relayBudgetChars(runtime, ledgerWith(90_000), 60_000)).toBe(MIN_RELAY_BUDGET_CHARS);
+    expect(later).toBe(Math.floor(13_000 * RELAY_BYTES_PER_TOKEN * RELAY_HEADROOM_SHARE));
+    expect(relayBudgetBytes(runtime, ledgerWith(90_000), 60_000)).toBe(MIN_RELAY_BUDGET_BYTES);
   });
 
   it('never starves a relay: a window past its budget still gets the minimum', () => {
     expect(
-      relayBudgetChars({ maxContextTokens: 128_000, bootstrapContext: '' }, ledgerWith(200_000))
-    ).toBe(MIN_RELAY_BUDGET_CHARS);
+      relayBudgetBytes({ maxContextTokens: 128_000, bootstrapContext: '' }, ledgerWith(200_000))
+    ).toBe(MIN_RELAY_BUDGET_BYTES);
   });
 });
