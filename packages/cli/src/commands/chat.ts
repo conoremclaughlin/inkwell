@@ -2932,8 +2932,10 @@ export const CONTEXT_MUTATING_TOOLS: ReadonlySet<string> = new Set([
  * discovers on its own (instruction files, tool schemas) is the same on the
  * next spawn as on the reported one. Ink drops the count to unknown whenever
  * the session-wide context generation moved since the report — any parent or
- * clone call of CONTEXT_MUTATING_TOOLS bumps it before running, so an error
- * after a side effect counts too; drift caused OUTSIDE this process — another
+ * clone call of CONTEXT_MUTATING_TOOLS bumps it before running and again when
+ * it settles, and no count is trusted while one is in flight, so an error after
+ * a side effect and a spawn overlapping the mutation both count; drift caused
+ * OUTSIDE this process — another
  * process editing AGENTS.md between spawns — is not detected and is accepted
  * as the limit of what the runtime can know (Lumen, PR #576 rounds 12–13).
  *
@@ -4182,8 +4184,22 @@ export async function runChat(options: ChatOptions): Promise<void> {
    */
   let contextGeneration = 0;
   let statelessGenerationAtReport = 0;
-  const bumpContextGenerationFor = (calls: ReadonlyArray<{ tool: string }>): void => {
-    if (calls.some((c) => CONTEXT_MUTATING_TOOLS.has(bareToolName(c.tool)))) contextGeneration += 1;
+  /**
+   * Mutations still running. A stateless spawn that starts and returns while
+   * one is in flight would record the post-start generation and trust it after
+   * the mutation lands, so occupancy is rejected while any is in flight and the
+   * generation advances AGAIN on settlement (Lumen, PR #576 round 14).
+   */
+  let mutationsInFlight = 0;
+  /** Returns the settle callback the caller must run in `finally`. */
+  const beginContextMutationFor = (calls: ReadonlyArray<{ tool: string }>): (() => void) => {
+    if (!calls.some((c) => CONTEXT_MUTATING_TOOLS.has(bareToolName(c.tool)))) return () => {};
+    contextGeneration += 1;
+    mutationsInFlight += 1;
+    return () => {
+      mutationsInFlight -= 1;
+      contextGeneration += 1;
+    };
   };
 
   let historyHydration: HistoryHydrationResult | null = null;
@@ -5427,7 +5443,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
               // A stateless clone's count is trusted only within the generation
               // it was reported in — its own mutators and a concurrent parent's
               // both bump it (Lumen, PR #576 round 13).
-              cloneCanReuseSession || cloneGenerationAtReport === contextGeneration
+              cloneCanReuseSession ||
+                (mutationsInFlight === 0 && cloneGenerationAtReport === contextGeneration)
                 ? cloneOccupancyTokens
                 : undefined
             ),
@@ -5557,103 +5574,108 @@ export async function runChat(options: ChatOptions): Promise<void> {
     }
   ): Promise<ToolResultRecord[]> => {
     const results: ToolResultRecord[] = [];
-    bumpContextGenerationFor(calls);
-    await executeToolCalls(calls, {
-      policy: opts.policy,
-      sessionId: runtime.sessionId,
-      signal: opts.signal,
-      callTool: createLocalToolDispatcher({
-        cwd: process.cwd(),
-        callPi: callPiTool,
-        callPcp: (bare, resolved) => pcp.callTool(bare, resolved),
-        resolveCredentials: (args) => resolveCredentialRefs(args, buildResolverEnv()).args,
-        // A clone asking what it can call gets its own narrower surface —
-        // the same one its prompt described, not the parent's.
-        audience: 'clone',
-        // And what its OWN policy will refuse, which is not the same thing:
-        // a derived clone policy inherits the parent's denials on top of the
-        // clone's, so a parent that denies `read` yields a clone that cannot
-        // read. inspectPcpTool, never canCallPcpTool — asking what exists must
-        // not spend the parent's one-use grants.
-        isHardDenied: (tool) => {
-          const decision = opts.policy.inspectPcpTool(bareToolName(tool), runtime.sessionId);
-          return !decision.allowed && !decision.promptable;
-        },
-        head: (tool, args) => {
-          // Non-nesting is enforced HERE, not by omitting spawn_agent from the
-          // clone's prompt: tool calls travel as text, so a model can name any
-          // tool it likes regardless of what it was told.
-          if (isForbiddenInClone(tool)) {
-            return {
-              content: [
-                {
-                  type: 'text',
-                  text: `${tool} is not available to a shadow clone. Report what you found and let your parent act on it.`,
-                },
-              ],
-              isError: true,
-            } as PcpToolCallResult;
-          }
-          if (isClientLocalTool(tool)) {
-            // A throwaway ledger AND a private signal sink. The sink is the
-            // load-bearing half: `signal_status` otherwise writes the module
-            // global that runChat reads to decide whether the whole
-            // non-interactive run completed — and every clone is instructed to
-            // signal when it finishes. A clone would end its parent's run, and
-            // concurrent clones would race for the same slot.
-            return handleClientLocalTool(
+    const settleContextMutation = beginContextMutationFor(calls);
+    try {
+      await executeToolCalls(calls, {
+        policy: opts.policy,
+        sessionId: runtime.sessionId,
+        signal: opts.signal,
+        callTool: createLocalToolDispatcher({
+          cwd: process.cwd(),
+          callPi: callPiTool,
+          callPcp: (bare, resolved) => pcp.callTool(bare, resolved),
+          resolveCredentials: (args) => resolveCredentialRefs(args, buildResolverEnv()).args,
+          // A clone asking what it can call gets its own narrower surface —
+          // the same one its prompt described, not the parent's.
+          audience: 'clone',
+          // And what its OWN policy will refuse, which is not the same thing:
+          // a derived clone policy inherits the parent's denials on top of the
+          // clone's, so a parent that denies `read` yields a clone that cannot
+          // read. inspectPcpTool, never canCallPcpTool — asking what exists must
+          // not spend the parent's one-use grants.
+          isHardDenied: (tool) => {
+            const decision = opts.policy.inspectPcpTool(bareToolName(tool), runtime.sessionId);
+            return !decision.allowed && !decision.promptable;
+          },
+          head: (tool, args) => {
+            // Non-nesting is enforced HERE, not by omitting spawn_agent from the
+            // clone's prompt: tool calls travel as text, so a model can name any
+            // tool it likes regardless of what it was told.
+            if (isForbiddenInClone(tool)) {
+              return {
+                content: [
+                  {
+                    type: 'text',
+                    text: `${tool} is not available to a shadow clone. Report what you found and let your parent act on it.`,
+                  },
+                ],
+                isError: true,
+              } as PcpToolCallResult;
+            }
+            if (isClientLocalTool(tool)) {
+              // A throwaway ledger AND a private signal sink. The sink is the
+              // load-bearing half: `signal_status` otherwise writes the module
+              // global that runChat reads to decide whether the whole
+              // non-interactive run completed — and every clone is instructed to
+              // signal when it finishes. A clone would end its parent's run, and
+              // concurrent clones would race for the same slot.
+              return handleClientLocalTool(
+                tool,
+                args,
+                cloneLedgerFor(opts.transcriptPath),
+                opts.signalSink
+              );
+            }
+            return null;
+          },
+        }),
+        promptForApproval: (tool, reason, args) =>
+          approvalCoordinator
+            .request({
               tool,
-              args,
-              cloneLedgerFor(opts.transcriptPath),
-              opts.signalSink
-            );
-          }
-          return null;
+              args: args ?? {},
+              reason,
+              sessionId: runtime.sessionId,
+              origin: opts.origin,
+              signal: opts.signal,
+              // The clone's own policy: what gets re-checked, and what a grant
+              // applies to. The parent stays untouched.
+              policy: opts.policy,
+            })
+            .then((outcome) => outcome.approved),
+        onResult: (result) => {
+          // WHOLE, not a 20K slice: a truncated relay tells the agent the full
+          // payload survives in this session's transcript, and for a clone this
+          // file IS that transcript (Lumen, PR #576). A promise about durable
+          // detail has to hold for the caller reading it, not just the parent.
+          const resultJson =
+            result.result === undefined ? undefined : JSON.stringify(result.result);
+          appendTranscript(opts.transcriptPath, {
+            type: 'clone_tool_call',
+            tool: result.tool,
+            args: result.args,
+            status: result.status,
+            reason: result.reason,
+            error: result.error,
+            // The payload, not just the verdict. /clones <id> and the truncation
+            // note both promise the working detail survives on disk.
+            result: resultJson,
+          });
+          results.push({
+            tool: result.tool,
+            // A thrown tool reports through `error`, a refused one through
+            // `reason` — they are different fields. Reading only `reason` feeds
+            // the clone `Tool read (error): undefined`, which tells it nothing
+            // about what went wrong and invites a blind retry.
+            result: describeCloneToolResult(result),
+            status: result.status,
+            args: result.args,
+          });
         },
-      }),
-      promptForApproval: (tool, reason, args) =>
-        approvalCoordinator
-          .request({
-            tool,
-            args: args ?? {},
-            reason,
-            sessionId: runtime.sessionId,
-            origin: opts.origin,
-            signal: opts.signal,
-            // The clone's own policy: what gets re-checked, and what a grant
-            // applies to. The parent stays untouched.
-            policy: opts.policy,
-          })
-          .then((outcome) => outcome.approved),
-      onResult: (result) => {
-        // WHOLE, not a 20K slice: a truncated relay tells the agent the full
-        // payload survives in this session's transcript, and for a clone this
-        // file IS that transcript (Lumen, PR #576). A promise about durable
-        // detail has to hold for the caller reading it, not just the parent.
-        const resultJson = result.result === undefined ? undefined : JSON.stringify(result.result);
-        appendTranscript(opts.transcriptPath, {
-          type: 'clone_tool_call',
-          tool: result.tool,
-          args: result.args,
-          status: result.status,
-          reason: result.reason,
-          error: result.error,
-          // The payload, not just the verdict. /clones <id> and the truncation
-          // note both promise the working detail survives on disk.
-          result: resultJson,
-        });
-        results.push({
-          tool: result.tool,
-          // A thrown tool reports through `error`, a refused one through
-          // `reason` — they are different fields. Reading only `reason` feeds
-          // the clone `Tool read (error): undefined`, which tells it nothing
-          // about what went wrong and invites a blind retry.
-          result: describeCloneToolResult(result),
-          status: result.status,
-          args: result.args,
-        });
-      },
-    });
+      });
+    } finally {
+      settleContextMutation();
+    }
     return results;
   };
 
@@ -5924,220 +5946,228 @@ export async function runChat(options: ChatOptions): Promise<void> {
     const approvalOrigin: ApprovalOriginInfo = ctx?.origin ?? { origin: 'parent' };
     const abortSignal = ctx?.signal;
     const iterationResults: ToolResultRecord[] = [];
-    bumpContextGenerationFor(calls);
-    await executeToolCalls(calls, {
-      policy: toolPolicy,
-      signal: abortSignal,
-      callTool: createLocalToolDispatcher({
-        cwd: process.cwd(),
-        callPi: callPiTool,
-        callPcp: (bare, resolved) => pcp.callTool(bare, resolved),
-        // Resolve credential references ($VAR / ${VAR}) in tool args. The LLM
-        // emits references; actual values are injected at the execution layer
-        // so credentials never enter transcripts or context.
-        resolveCredentials: (args) => {
-          const { args: resolvedArgs, resolutions } = resolveCredentialRefs(
-            args,
-            buildResolverEnv()
-          );
-          if (resolutions.length > 0 && runtime.verbose) {
-            const refs = resolutions.map((r) => `${r.name} at ${r.path}`).join(', ');
-            printLine(
-              chalk.dim(`credential-resolver: resolved ${resolutions.length} ref(s): ${refs}`)
+    const settleContextMutation = beginContextMutationFor(calls);
+    try {
+      await executeToolCalls(calls, {
+        policy: toolPolicy,
+        signal: abortSignal,
+        callTool: createLocalToolDispatcher({
+          cwd: process.cwd(),
+          callPi: callPiTool,
+          callPcp: (bare, resolved) => pcp.callTool(bare, resolved),
+          // Resolve credential references ($VAR / ${VAR}) in tool args. The LLM
+          // emits references; actual values are injected at the execution layer
+          // so credentials never enter transcripts or context.
+          resolveCredentials: (args) => {
+            const { args: resolvedArgs, resolutions } = resolveCredentialRefs(
+              args,
+              buildResolverEnv()
             );
-          }
-          return resolvedArgs;
-        },
-        audience: 'parent',
-        isHardDenied: (tool) => {
-          const decision = toolPolicy.inspectPcpTool(bareToolName(tool), runtime.sessionId);
-          return !decision.allowed && !decision.promptable;
-        },
-        head: (tool, args) => {
-          // spawn_agent is NOT a client-local policy bypass. Unlike ledger
-          // tools it costs backend time and fans out authority, so it reaches
-          // here only after executeToolCalls has cleared it through policy.
-          if (bareToolName(tool) === SPAWN_AGENT_TOOL) {
-            return runSpawnAgent(args, { signal: abortSignal });
-          }
-          if (bareToolName(tool) === COLLECT_AGENTS_TOOL) {
-            return runCollectAgents(args);
-          }
-          // Client-local tools (context management) are handled in-process.
-          // An eviction's persistent refs arrive on the hook, not in the
-          // result the model reads — see EvictionHooks (#571).
-          if (isClientLocalTool(tool)) {
-            return handleClientLocalTool(tool, args, ledger, globalSignalSink, {
-              onEvict: (eviction) =>
-                recordEviction(
-                  'sb',
-                  compactForLedger(JSON.stringify(eviction.args ?? {}), 200),
-                  eviction.tokensFreed,
-                  eviction.refs
-                ),
-            });
-          }
-          return null;
-        },
-      }),
-      sessionId: runtime.sessionId,
-      promptForApproval: (tool, reason, args) =>
-        approvalCoordinator
-          .request({
-            tool,
-            args: args ?? {},
-            reason,
-            sessionId: runtime.sessionId,
-            origin: approvalOrigin,
-            signal: abortSignal,
-          })
-          .then((outcome) => outcome.approved),
-      onResult: (result: ToolCallResult) => {
-        if (result.status === 'blocked' || result.status === 'denied') {
-          const msg = `Local tool ${result.status} (${result.tool}): ${result.reason}`;
-          printEvent(
-            chalk.yellow(`🛠 ${agentId} · ${result.tool} (${result.status}) — ${result.reason}`)
-          );
-          appendTranscript(runtime.transcriptPath, {
-            type: 'local_tool_call',
-            tool: result.tool,
-            args: result.args,
-            status: result.status,
-            reason: result.reason,
-          });
-          ledger.addEntry('system', compactForLedger(msg, 400), 'local-tool');
-          iterationResults.push({
-            tool: result.tool,
-            result: result.reason,
-            status: result.status,
-          });
-        } else if (result.status === 'executed' || result.status === 'approved') {
-          const resultJson = JSON.stringify(result.result);
-
-          // Format context-management and signal tools with friendly output
-          if (result.tool === 'evict_context') {
-            const r = result.result as Record<string, unknown> | undefined;
-            const content = (r?.content as Array<{ text: string }> | undefined)?.[0]?.text;
-            if (content) {
-              const parsed = JSON.parse(content);
-              // The eviction itself was persisted from the onEvict hook at
-              // execution time (recordEviction); this is display only.
-              printEvent(
-                chalk.dim(
-                  `  🗑 evicted ${parsed.evicted} entries (${parsed.tokensFreed} tok freed, ${parsed.totalAfter} tok remaining)`
-                )
+            if (resolutions.length > 0 && runtime.verbose) {
+              const refs = resolutions.map((r) => `${r.name} at ${r.path}`).join(', ');
+              printLine(
+                chalk.dim(`credential-resolver: resolved ${resolutions.length} ref(s): ${refs}`)
               );
             }
-          } else if (result.tool === 'list_context') {
-            const r = result.result as Record<string, unknown> | undefined;
-            const content = (r?.content as Array<{ text: string }> | undefined)?.[0]?.text;
-            if (content) {
-              const parsed = JSON.parse(content);
-              const sources = parsed.bySource
-                ? Object.entries(
-                    parsed.bySource as Record<string, { count: number; tokens: number }>
+            return resolvedArgs;
+          },
+          audience: 'parent',
+          isHardDenied: (tool) => {
+            const decision = toolPolicy.inspectPcpTool(bareToolName(tool), runtime.sessionId);
+            return !decision.allowed && !decision.promptable;
+          },
+          head: (tool, args) => {
+            // spawn_agent is NOT a client-local policy bypass. Unlike ledger
+            // tools it costs backend time and fans out authority, so it reaches
+            // here only after executeToolCalls has cleared it through policy.
+            if (bareToolName(tool) === SPAWN_AGENT_TOOL) {
+              return runSpawnAgent(args, { signal: abortSignal });
+            }
+            if (bareToolName(tool) === COLLECT_AGENTS_TOOL) {
+              return runCollectAgents(args);
+            }
+            // Client-local tools (context management) are handled in-process.
+            // An eviction's persistent refs arrive on the hook, not in the
+            // result the model reads — see EvictionHooks (#571).
+            if (isClientLocalTool(tool)) {
+              return handleClientLocalTool(tool, args, ledger, globalSignalSink, {
+                onEvict: (eviction) =>
+                  recordEviction(
+                    'sb',
+                    compactForLedger(JSON.stringify(eviction.args ?? {}), 200),
+                    eviction.tokensFreed,
+                    eviction.refs
+                  ),
+              });
+            }
+            return null;
+          },
+        }),
+        sessionId: runtime.sessionId,
+        promptForApproval: (tool, reason, args) =>
+          approvalCoordinator
+            .request({
+              tool,
+              args: args ?? {},
+              reason,
+              sessionId: runtime.sessionId,
+              origin: approvalOrigin,
+              signal: abortSignal,
+            })
+            .then((outcome) => outcome.approved),
+        onResult: (result: ToolCallResult) => {
+          if (result.status === 'blocked' || result.status === 'denied') {
+            const msg = `Local tool ${result.status} (${result.tool}): ${result.reason}`;
+            printEvent(
+              chalk.yellow(`🛠 ${agentId} · ${result.tool} (${result.status}) — ${result.reason}`)
+            );
+            appendTranscript(runtime.transcriptPath, {
+              type: 'local_tool_call',
+              tool: result.tool,
+              args: result.args,
+              status: result.status,
+              reason: result.reason,
+            });
+            ledger.addEntry('system', compactForLedger(msg, 400), 'local-tool');
+            iterationResults.push({
+              tool: result.tool,
+              result: result.reason,
+              status: result.status,
+            });
+          } else if (result.status === 'executed' || result.status === 'approved') {
+            const resultJson = JSON.stringify(result.result);
+
+            // Format context-management and signal tools with friendly output
+            if (result.tool === 'evict_context') {
+              const r = result.result as Record<string, unknown> | undefined;
+              const content = (r?.content as Array<{ text: string }> | undefined)?.[0]?.text;
+              if (content) {
+                const parsed = JSON.parse(content);
+                // The eviction itself was persisted from the onEvict hook at
+                // execution time (recordEviction); this is display only.
+                printEvent(
+                  chalk.dim(
+                    `  🗑 evicted ${parsed.evicted} entries (${parsed.tokensFreed} tok freed, ${parsed.totalAfter} tok remaining)`
                   )
-                    .map(([src, { count, tokens }]) => `${src}(${count}/${tokens}t)`)
-                    .join(' ')
-                : '';
+                );
+              }
+            } else if (result.tool === 'list_context') {
+              const r = result.result as Record<string, unknown> | undefined;
+              const content = (r?.content as Array<{ text: string }> | undefined)?.[0]?.text;
+              if (content) {
+                const parsed = JSON.parse(content);
+                const sources = parsed.bySource
+                  ? Object.entries(
+                      parsed.bySource as Record<string, { count: number; tokens: number }>
+                    )
+                      .map(([src, { count, tokens }]) => `${src}(${count}/${tokens}t)`)
+                      .join(' ')
+                  : '';
+                printEvent(
+                  chalk.dim(
+                    `📋 ${agentId} · list_context — ${parsed.totalEntries} entries, ~${parsed.totalTokens} tok${
+                      sources ? ` · ${sources}` : ''
+                    }`
+                  )
+                );
+              }
+            } else if (result.tool === 'signal_status') {
+              const r = result.result as Record<string, unknown> | undefined;
+              const content = (r?.content as Array<{ text: string }> | undefined)?.[0]?.text;
+              if (content) {
+                const parsed = JSON.parse(content);
+                const signal = parsed.signal as { status: string; reason?: string } | undefined;
+                if (signal) {
+                  const icon =
+                    signal.status === 'completed'
+                      ? '✅'
+                      : signal.status === 'blocked'
+                        ? '🚫'
+                        : '➡️';
+                  printEvent(
+                    chalk.dim(
+                      `  ${icon} signal: ${signal.status}${signal.reason ? ` — ${signal.reason}` : ''}`
+                    )
+                  );
+                }
+              }
+            } else {
+              // One dim line, attributed to the agent, result truncated —
+              // the Ctrl+T inspector holds a 2KB result slice per call and
+              // the transcript keeps the complete payload.
+              const resultPreview = compactForLedger(resultJson, 160);
               printEvent(
                 chalk.dim(
-                  `📋 ${agentId} · list_context — ${parsed.totalEntries} entries, ~${parsed.totalTokens} tok${
-                    sources ? ` · ${sources}` : ''
+                  `🛠 ${agentId} · ${result.tool} (${result.status})${
+                    resultPreview ? ` — ${resultPreview}` : ''
                   }`
                 )
               );
             }
-          } else if (result.tool === 'signal_status') {
-            const r = result.result as Record<string, unknown> | undefined;
-            const content = (r?.content as Array<{ text: string }> | undefined)?.[0]?.text;
-            if (content) {
-              const parsed = JSON.parse(content);
-              const signal = parsed.signal as { status: string; reason?: string } | undefined;
-              if (signal) {
-                const icon =
-                  signal.status === 'completed' ? '✅' : signal.status === 'blocked' ? '🚫' : '➡️';
-                printEvent(
-                  chalk.dim(
-                    `  ${icon} signal: ${signal.status}${signal.reason ? ` — ${signal.reason}` : ''}`
-                  )
-                );
-              }
+            appendTranscript(runtime.transcriptPath, {
+              type: 'local_tool_call',
+              tool: result.tool,
+              args: result.args,
+              status: result.status,
+              result: result.result,
+            });
+            // Context-management tools (list_context, evict_context) must NOT
+            // persist their results back into the ledger — doing so pollutes the
+            // context they're managing and reintroduces evicted content.
+            //
+            // spawn_agent and collect_agents are excluded for the same reason
+            // from the other direction: they write their OWN dedicated handoff
+            // entry, so the generic append would duplicate every clone summary
+            // and undo the one-entry-per-fan-out guarantee that justifies clones
+            // at all.
+            if (!isClientLocalTool(result.tool) && !isCloneHandoffTool(result.tool)) {
+              ledger.addEntry(
+                'system',
+                compactForLedger(`local tool ${result.tool} -> ${resultJson}`, 500),
+                'local-tool'
+              );
             }
-          } else {
-            // One dim line, attributed to the agent, result truncated —
-            // the Ctrl+T inspector holds a 2KB result slice per call and
-            // the transcript keeps the complete payload.
-            const resultPreview = compactForLedger(resultJson, 160);
+            iterationResults.push({
+              tool: result.tool,
+              result: result.result,
+              status: result.status,
+              args: result.args,
+            });
+          } else if (result.status === 'error') {
+            const msg = `Local tool error (${result.tool}): ${result.error}`;
             printEvent(
-              chalk.dim(
-                `🛠 ${agentId} · ${result.tool} (${result.status})${
-                  resultPreview ? ` — ${resultPreview}` : ''
-                }`
+              chalk.red(
+                `🛠 ${agentId} · ${result.tool} (error) — ${compactForLedger(String(result.error), 160)}`
               )
             );
+            appendTranscript(runtime.transcriptPath, {
+              type: 'local_tool_call',
+              tool: result.tool,
+              args: result.args,
+              status: 'error',
+              error: result.error,
+            });
+            ledger.addEntry('system', compactForLedger(msg, 400), 'local-tool');
+            iterationResults.push({ tool: result.tool, result: result.error, status: 'error' });
           }
-          appendTranscript(runtime.transcriptPath, {
-            type: 'local_tool_call',
-            tool: result.tool,
-            args: result.args,
-            status: result.status,
-            result: result.result,
-          });
-          // Context-management tools (list_context, evict_context) must NOT
-          // persist their results back into the ledger — doing so pollutes the
-          // context they're managing and reintroduces evicted content.
-          //
-          // spawn_agent and collect_agents are excluded for the same reason
-          // from the other direction: they write their OWN dedicated handoff
-          // entry, so the generic append would duplicate every clone summary
-          // and undo the one-entry-per-fan-out guarantee that justifies clones
-          // at all.
-          if (!isClientLocalTool(result.tool) && !isCloneHandoffTool(result.tool)) {
-            ledger.addEntry(
-              'system',
-              compactForLedger(`local tool ${result.tool} -> ${resultJson}`, 500),
-              'local-tool'
-            );
-          }
-          iterationResults.push({
-            tool: result.tool,
-            result: result.result,
-            status: result.status,
-            args: result.args,
-          });
-        } else if (result.status === 'error') {
-          const msg = `Local tool error (${result.tool}): ${result.error}`;
-          printEvent(
-            chalk.red(
-              `🛠 ${agentId} · ${result.tool} (error) — ${compactForLedger(String(result.error), 160)}`
-            )
-          );
-          appendTranscript(runtime.transcriptPath, {
-            type: 'local_tool_call',
-            tool: result.tool,
-            args: result.args,
-            status: 'error',
-            error: result.error,
-          });
-          ledger.addEntry('system', compactForLedger(msg, 400), 'local-tool');
-          iterationResults.push({ tool: result.tool, result: result.error, status: 'error' });
-        }
 
-        // Headless liveness + progress: one compact NDJSON line per tool as
-        // it completes. Input is capped and results are omitted (can be large
-        // or sensitive). send_response is intentionally NOT streamed here —
-        // that tool already routes server-side, so re-emitting it as a
-        // response line would risk double delivery.
-        const streamArgs = result.args ? JSON.stringify(result.args) : '';
-        emitStreamEvent({
-          type: 'tool_call',
-          toolName: result.tool,
-          status: result.status,
-          ...(streamArgs && streamArgs.length <= 2000 ? { input: result.args } : {}),
-        });
-      },
-    });
+          // Headless liveness + progress: one compact NDJSON line per tool as
+          // it completes. Input is capped and results are omitted (can be large
+          // or sensitive). send_response is intentionally NOT streamed here —
+          // that tool already routes server-side, so re-emitting it as a
+          // response line would risk double delivery.
+          const streamArgs = result.args ? JSON.stringify(result.args) : '';
+          emitStreamEvent({
+            type: 'tool_call',
+            toolName: result.tool,
+            status: result.status,
+            ...(streamArgs && streamArgs.length <= 2000 ? { input: result.args } : {}),
+          });
+        },
+      });
+    } finally {
+      settleContextMutation();
+    }
     return iterationResults;
   };
 
@@ -6530,9 +6560,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
     const relayOccupancy = (): number | undefined => {
       if (nativeSession()) return loopOccupancyTokens;
       if (statelessPromptTokens === undefined) return undefined;
-      // A mutator ran since the report (parent or clone): the next fresh
-      // spawn may discover a different context — unknown, the floor.
-      if (statelessGenerationAtReport !== contextGeneration) return undefined;
+      // A mutator ran since the report, or is still running (parent or
+      // clone): the next fresh spawn may discover a different context —
+      // unknown, the floor.
+      if (mutationsInFlight > 0 || statelessGenerationAtReport !== contextGeneration) {
+        return undefined;
+      }
       const addedBytes = ledger
         .listEntries()
         .filter((e) => e.id > ledgerMaxIdAtReport)

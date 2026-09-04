@@ -37,7 +37,7 @@ describe('runAgentLoop hosts and their relay budgets', () => {
     expect(parent).toBeDefined();
     expect(clone).toBeDefined();
     expect(source).toMatch(
-      /const relayOccupancy = \(\): number \| undefined => \{\s*if \(nativeSession\(\)\) return loopOccupancyTokens;\s*if \(statelessPromptTokens === undefined\) return undefined;[\s\S]*?if \(statelessGenerationAtReport !== contextGeneration\) return undefined;\s*const addedBytes = ledger\s*\.listEntries\(\)\s*\.filter\(\(e\) => e\.id > ledgerMaxIdAtReport\)\s*\.reduce\(\(n, e\) => n \+ ledgerEntryPromptBytes\(e\), 0\);\s*return statelessPromptTokens \+ addedBytes;/
+      /const relayOccupancy = \(\): number \| undefined => \{\s*if \(nativeSession\(\)\) return loopOccupancyTokens;\s*if \(statelessPromptTokens === undefined\) return undefined;[\s\S]*?if \(mutationsInFlight > 0 \|\| statelessGenerationAtReport !== contextGeneration\) \{\s*return undefined;\s*\}\s*const addedBytes = ledger\s*\.listEntries\(\)\s*\.filter\(\(e\) => e\.id > ledgerMaxIdAtReport\)\s*\.reduce\(\(n, e\) => n \+ ledgerEntryPromptBytes\(e\), 0\);\s*return statelessPromptTokens \+ addedBytes;/
     );
     // Never a net total: an eviction of older entries cannot hide an addition.
     expect(source).not.toMatch(/ledger\.totalTokens\(\) - ledgerTokensAtReport/);
@@ -92,15 +92,16 @@ describe('runAgentLoop hosts and their relay budgets', () => {
     expect(source).toMatch(/join\(CLONE_HISTORY_SEPARATOR\)/);
   });
 
-  it('a session-wide context generation is bumped BEFORE any mutating call runs — parent or clone — and stateless counts are trusted only within their generation (Lumen, round 13)', () => {
+  it('a session-wide context generation covers the whole mutation lifetime — bumped before a mutating call runs and again when it settles, in both executors, with no count trusted while one is in flight (Lumen, rounds 13–14)', () => {
     expect(source).toMatch(
-      /const bumpContextGenerationFor = \(\s*calls: ReadonlyArray<\{ tool: string \}>\s*\): void => \{\s*if \(\s*calls\.some\(\(c\) => CONTEXT_MUTATING_TOOLS\.has\(bareToolName\(c\.tool\)\)\)\s*\)\s*contextGeneration \+= 1;/
+      /const beginContextMutationFor = \(\s*calls: ReadonlyArray<\{ tool: string \}>\s*\): \(\(\) => void\) => \{\s*if \(!calls\.some\(\(c\) => CONTEXT_MUTATING_TOOLS\.has\(bareToolName\(c\.tool\)\)\)\) return \(\) => \{\};\s*contextGeneration \+= 1;\s*mutationsInFlight \+= 1;\s*return \(\) => \{\s*mutationsInFlight -= 1;\s*contextGeneration \+= 1;\s*\};/
     );
-    // Bumped ahead of execution in BOTH executors.
-    const firstBump = source.indexOf('bumpContextGenerationFor(calls);');
-    expect(firstBump).toBeGreaterThan(0);
-    expect(source.indexOf('executeToolCalls(', firstBump)).toBeGreaterThan(firstBump);
-    expect((source.match(/bumpContextGenerationFor\(calls\);/g) ?? []).length).toBe(2);
+    // Both executors: begin before executeToolCalls, settle in finally.
+    const wraps =
+      source.match(
+        /const settleContextMutation = beginContextMutationFor\(calls\);\s*try \{\s*await executeToolCalls\([\s\S]*?\} finally \{\s*settleContextMutation\(\);\s*\}/g
+      ) ?? [];
+    expect(wraps).toHaveLength(2);
     // Captured with request construction, before each spawn; stored at the report.
     expect(source).toMatch(
       /const generationBeforeSpawn = contextGeneration;\s*(?:beginSpawn\(\);\s*)?const turn = startBackendTurn\(\{/
@@ -111,13 +112,13 @@ describe('runAgentLoop hosts and their relay budgets', () => {
     expect(source).toMatch(
       /const generationBeforeSpawn = contextGeneration;\s*const turn = startBackendTurn\(cloneRequest\(prompt, sessionArgs\)\);/
     );
+    // Rejected while in flight or after a bump — parent and clone.
     expect(source).toMatch(
-      /if \(statelessGenerationAtReport !== contextGeneration\) return undefined;/
+      /if \(mutationsInFlight > 0 \|\| statelessGenerationAtReport !== contextGeneration\) \{\s*return undefined;/
     );
     expect(source).toMatch(
-      /cloneCanReuseSession \|\| cloneGenerationAtReport === contextGeneration\s*\? cloneOccupancyTokens\s*: undefined/
+      /cloneCanReuseSession \|\|\s*\(mutationsInFlight === 0 && cloneGenerationAtReport === contextGeneration\)\s*\? cloneOccupancyTokens\s*: undefined/
     );
-    // The per-result invalidation is gone: the generation is the one mechanism.
     expect(source).not.toMatch(/statelessPromptTokens = undefined;\s*\}\s*iterationResults\.push/);
   });
 });
