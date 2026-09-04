@@ -65,6 +65,23 @@ describe('formatBackendTokenUsage', () => {
 });
 
 describe('Gemini usage fields (Lumen, PR #576 round 6)', () => {
+  it('usageMetadata nesting is read, and a synthesized total keeps the thoughts (Lumen, round 7)', () => {
+    const usage = extractBackendTokenUsage(
+      'gemini',
+      JSON.stringify({
+        usageMetadata: {
+          promptTokenCount: 90_000,
+          candidatesTokenCount: 500,
+          thoughtsTokenCount: 2_000,
+        },
+      }),
+      ''
+    );
+    expect(usage?.inputTokens).toBe(90_000);
+    expect(usage?.reasoningTokens).toBe(2_000);
+    expect(usage?.totalTokens).toBe(92_500);
+  });
+
   it('thoughtsTokenCount and totalTokenCount are normalized', () => {
     const usage = extractBackendTokenUsage(
       'gemini',

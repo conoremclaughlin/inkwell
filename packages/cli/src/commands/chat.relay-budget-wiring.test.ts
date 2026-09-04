@@ -18,8 +18,8 @@ const loopCalls = [...source.matchAll(/await runAgentLoop\(\s*\{([\s\S]*?)\n\s*\
   (m) => m[1]!
 );
 const noteSpawn = source.slice(
-  source.indexOf('const noteSpawn = (body: string, result: BackendRunResult): void => {'),
-  source.indexOf('const runTurnForLoop = async (')
+  source.indexOf('const noteSpawn = (result: BackendRunResult): void => {'),
+  source.indexOf('/** The continuation spawn')
 );
 
 describe('runAgentLoop hosts and their relay budgets', () => {
@@ -31,47 +31,41 @@ describe('runAgentLoop hosts and their relay budgets', () => {
     for (const input of loopCalls) expect(input).toContain('relayBudgetBytes: () =>');
   });
 
-  it('each host hands its budget an occupancy: the report for a native session, the packed envelope bytes for a stateless one (Lumen, round 6)', () => {
-    const parent = loopCalls.find((c) => c.includes('loopResidentBytes'))!;
-    const clone = loopCalls.find((c) => c.includes('cloneResidentBytes'))!;
-    expect(parent).toContain('relayOccupancy()');
+  it('each host hands its budget an occupancy: the report for a native session, the whole prepared spawn for a stateless one (Lumen, rounds 6–7)', () => {
+    const parent = loopCalls.find((c) => c.includes('relayOccupancy()'))!;
+    const clone = loopCalls.find((c) => c.includes('cloneOccupancyTokens'))!;
+    expect(parent).toBeDefined();
     expect(source).toMatch(
-      /const relayOccupancy = \(\): number \| undefined =>\s*nativeSession\(\)\s*\? loopOccupancyTokens\s*: utf8Bytes\(buildPromptEnvelope\(agentId, runtime, ledger, ''\)\);/
+      /const relayOccupancy = \(\): number \| undefined =>\s*nativeSession\(\)\s*\? loopOccupancyTokens\s*: measurePreparedPromptBytes\(\s*continuationRequest\(buildPromptEnvelope\(agentId, runtime, ledger, ''\)\)\s*\);/
     );
-    expect(clone).toContain('cloneOccupancyTokens');
-    expect(clone).toMatch(/utf8Bytes\(cloneIdentityPrompt\) \+ utf8Bytes\(cloneHistory\.join/);
+    expect(clone).toMatch(
+      /measurePreparedPromptBytes\(\s*cloneRequest\(\[\.\.\.cloneHistory, ''\]\.join/
+    );
+  });
+
+  it('the continuation spawn and the measurement share one request shape', () => {
+    expect(source).toContain(
+      'const contTurn = startBackendTurn(continuationRequest(continuationPrompt));'
+    );
+    expect(source).toContain('const turn = startBackendTurn(cloneRequest(prompt, sessionArgs));');
   });
 
   it("the clone's window is frozen at spawn — never the parent's mutable runtime (Lumen, round 4)", () => {
-    const clone = loopCalls.find((c) => c.includes('cloneResidentBytes'))!;
+    const clone = loopCalls.find((c) => c.includes('cloneOccupancyTokens'))!;
     expect(clone).toContain('maxContextTokens: cloneMaxContextTokens');
-    expect(clone).toContain('cloneIdentityPrompt');
     expect(clone).not.toContain('runtime.maxContextTokens');
-    expect(clone).not.toContain('runtime.systemPromptOverride');
     expect(source).toContain('const cloneMaxContextTokens = runtime.maxContextTokens;');
   });
 
-  it('every parent spawn result is noted, and a provider report resets resident traffic (Lumen, round 5)', () => {
-    expect(source).toContain('noteSpawn(body, runResult);');
-    expect(source).toContain('noteSpawn(body, contResult);');
-    expect(noteSpawn).toContain(
-      'const occupancy = occupancyTokens(runtime.backend, result.usage);'
-    );
-    expect(noteSpawn).toMatch(/loopOccupancyTokens = occupancy;\s*loopResidentBytes = 0;/);
-  });
-
-  it("a stateless parent never carries a dead process's report or accumulates — it leaves noteSpawn at once (Lumen, rounds 5–6)", () => {
-    expect(noteSpawn).toMatch(/if \(!nativeSession\(\)\) return;/);
+  it('a native spawn that reported nothing leaves the window UNKNOWN — no stale checkpoint, no visible-text top-up (Lumen, round 7)', () => {
+    expect(source).toContain('noteSpawn(runResult);');
+    expect(source).toContain('noteSpawn(contResult);');
     expect(noteSpawn).toMatch(
-      /loopResidentBytes \+= utf8Bytes\(body\) \+ utf8Bytes\(result\.responseText \?\? ''\);/
+      /if \(!nativeSession\(\)\) return;\s*loopOccupancyTokens = occupancyTokens\(runtime\.backend, result\.usage\);/
     );
-    expect(source).not.toMatch(/loopResidentBytes \+= [^;]*continuationPrompt/);
-  });
-
-  it('the clone records a report or accumulates only for a native session; a stateless one is measured at budget time', () => {
+    expect(source).not.toMatch(/ResidentBytes/);
     expect(source).toMatch(
-      /if \(cloneCanReuseSession\) \{[\s\S]*?cloneOccupancyTokens = cloneOccupancy;\s*cloneResidentBytes = 0;/
+      /if \(cloneCanReuseSession\)\s*cloneOccupancyTokens = occupancyTokens\(cloneBackend, result\.usage\);/
     );
-    expect(source).toMatch(/cloneResidentBytes \+= utf8Bytes\(prompt\) \+ utf8Bytes\(text\);/);
   });
 });

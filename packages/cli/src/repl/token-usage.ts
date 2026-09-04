@@ -72,7 +72,11 @@ function pick(...values: Array<unknown>): number | undefined {
 function normalizeUsageObject(
   obj: Record<string, unknown>
 ): Omit<BackendTokenUsage, 'backend' | 'source'> | null {
-  const usageCandidate = (obj.usage as Record<string, unknown> | undefined) || obj;
+  // Gemini nests its counts under usageMetadata (Lumen, PR #576 round 7).
+  const usageCandidate =
+    (obj.usage as Record<string, unknown> | undefined) ||
+    (obj.usageMetadata as Record<string, unknown> | undefined) ||
+    obj;
 
   const inputTokens = pick(
     usageCandidate.input_tokens,
@@ -137,11 +141,13 @@ function normalizeUsageObject(
   return {
     inputTokens,
     outputTokens,
+    // A synthesized total keeps hidden reasoning — dropping it under-counts
+    // the window by exactly the part the model does not show.
     totalTokens:
       totalTokens !== undefined
         ? totalTokens
         : inputTokens !== undefined && outputTokens !== undefined
-          ? inputTokens + outputTokens
+          ? inputTokens + outputTokens + (reasoningTokens ?? 0)
           : undefined,
     cacheReadTokens,
     cacheWriteTokens,

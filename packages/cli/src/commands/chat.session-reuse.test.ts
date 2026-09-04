@@ -737,55 +737,45 @@ describe('one-turn process recovery sequence — detection outlives the seed (PR
 
 describe('relayBudgetBytes — the relay budget follows the live headroom (Lumen, PR #576)', () => {
   const runtime = { maxContextTokens: 128_000 };
-  const occupancy = 100_000;
 
   it('a roomy 1M window gets the full static ceiling', () => {
-    expect(relayBudgetBytes({ maxContextTokens: 1_000_000 }, 0, 300_000)).toBe(MAX_RELAY_BYTES);
+    expect(relayBudgetBytes({ maxContextTokens: 1_000_000 }, 300_000)).toBe(MAX_RELAY_BYTES);
   });
 
   it('a 128K window most of the way to its budget gets far less than the ceiling', () => {
     // 128K − 100K occupied = 28K tokens; half of that, in bytes.
-    const budget = relayBudgetBytes(runtime, 0, occupancy);
+    const budget = relayBudgetBytes(runtime, 100_000);
     expect(budget).toBe(28_000 * RELAY_BYTES_PER_TOKEN * RELAY_HEADROOM_SHARE);
     expect(budget).toBeLessThan(MAX_RELAY_BYTES);
   });
 
   it("REGRESSION (Lumen, round 5): the provider's own occupancy is what the window holds — not an estimate", () => {
-    const measured = relayBudgetBytes(runtime, 0, 118_000);
-    expect(measured).toBe(Math.floor(10_000 * RELAY_BYTES_PER_TOKEN * RELAY_HEADROOM_SHARE));
-    expect(measured).toBeLessThan(relayBudgetBytes(runtime, 0, 100_000));
+    expect(relayBudgetBytes(runtime, 118_000)).toBe(
+      Math.floor(10_000 * RELAY_BYTES_PER_TOKEN * RELAY_HEADROOM_SHARE)
+    );
+    expect(relayBudgetBytes(runtime, 118_000)).toBeLessThan(relayBudgetBytes(runtime, 100_000));
   });
 
-  it('REGRESSION (Lumen, round 6): with NO occupancy nothing is assumed recoverable — the floor, whatever the ledger', () => {
-    // A chars-per-token estimate of a 30K-character CJK ledger counted 30,000
-    // against a 183,624-byte envelope and granted 49K on a 128K window.
+  it('REGRESSION (Lumen, rounds 6–7): with NO occupancy nothing is assumed recoverable — the floor, whatever the window', () => {
     expect(relayBudgetBytes(runtime)).toBe(MIN_RELAY_BUDGET_BYTES);
     expect(relayBudgetBytes({ maxContextTokens: 1_000_000 })).toBe(MIN_RELAY_BUDGET_BYTES);
   });
 
-  it('a stateless parent hands in its packed envelope bytes as the occupancy — exact for what it will send', () => {
-    // 183,624 bytes of envelope on a 400K window: budgeted from real bytes.
-    expect(relayBudgetBytes({ maxContextTokens: 400_000 }, 0, 183_624)).toBe(
+  it('a stateless parent hands in the bytes of its whole prepared spawn as the occupancy', () => {
+    expect(relayBudgetBytes({ maxContextTokens: 400_000 }, 183_624)).toBe(
       Math.floor((400_000 - 183_624) * RELAY_BYTES_PER_TOKEN * RELAY_HEADROOM_SHARE)
     );
   });
 
   it('REGRESSION (Lumen, rounds 3–4): the relay costs at most half the headroom for ANY script', () => {
     expect(RELAY_BYTES_PER_TOKEN).toBe(1);
-    const budget = relayBudgetBytes(runtime, 0, occupancy);
-    expect(budget / RELAY_BYTES_PER_TOKEN).toBeLessThanOrEqual(28_000 * RELAY_HEADROOM_SHARE);
-  });
-
-  it('REGRESSION (Lumen, round 3): what a native session sent and received since the last report shrinks the next allowance', () => {
-    const fresh = relayBudgetBytes(runtime, 0, occupancy);
-    const later = relayBudgetBytes(runtime, 15_000, occupancy);
-    expect(later).toBeLessThan(fresh);
-    expect(later).toBe(Math.floor(13_000 * RELAY_BYTES_PER_TOKEN * RELAY_HEADROOM_SHARE));
-    expect(relayBudgetBytes(runtime, 60_000, occupancy)).toBe(MIN_RELAY_BUDGET_BYTES);
+    expect(relayBudgetBytes(runtime, 100_000) / RELAY_BYTES_PER_TOKEN).toBeLessThanOrEqual(
+      28_000 * RELAY_HEADROOM_SHARE
+    );
   });
 
   it('never starves a relay: a window past its budget still gets the minimum — the documented exception', () => {
-    expect(relayBudgetBytes(runtime, 0, 200_000)).toBe(MIN_RELAY_BUDGET_BYTES);
+    expect(relayBudgetBytes(runtime, 200_000)).toBe(MIN_RELAY_BUDGET_BYTES);
   });
 });
 
