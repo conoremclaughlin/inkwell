@@ -2999,10 +2999,12 @@ export const CONTEXT_MUTATING_TOOLS: ReadonlySet<string> = new Set([
  *
  * The one named assumption for a stateless parent: what the provider
  * discovers on its own (instruction files, tool schemas) is the same on the
- * next spawn as on the reported one. Ink drops the count to unknown after any
- * of its own CONTEXT_MUTATING_TOOLS; drift caused OUTSIDE this process — another
+ * next spawn as on the reported one. Ink drops the count to unknown whenever
+ * the session-wide context generation moved since the report — any parent or
+ * clone call of CONTEXT_MUTATING_TOOLS bumps it before running, so an error
+ * after a side effect counts too; drift caused OUTSIDE this process — another
  * process editing AGENTS.md between spawns — is not detected and is accepted
- * as the limit of what the runtime can know (Lumen, PR #576 round 12).
+ * as the limit of what the runtime can know (Lumen, PR #576 rounds 12–13).
  *
  * The bound is exact for the relay string. The floor is the one deliberate
  * exception: at exhausted headroom the model still receives a
@@ -4433,6 +4435,18 @@ export async function runChat(options: ChatOptions): Promise<void> {
   let statelessPromptTokens: number | undefined;
   let ledgerMaxIdAtReport = -1;
   /**
+   * The session-wide CONTEXT GENERATION: bumped before any local tool that can
+   * change what a stateless provider discovers on its next fresh spawn runs —
+   * by the parent or by any clone, and before execution so an error after a
+   * side effect still counts. A stateless count is trusted only while the
+   * generation it was reported in is the current one (Lumen, PR #576 round 13).
+   */
+  let contextGeneration = 0;
+  let statelessGenerationAtReport = 0;
+  const bumpContextGenerationFor = (calls: ReadonlyArray<{ tool: string }>): void => {
+    if (calls.some((c) => CONTEXT_MUTATING_TOOLS.has(bareToolName(c.tool)))) contextGeneration += 1;
+  };
+  /**
    * Drop the native session so the next spawn seeds a fresh one from the
    * ledger. The marker keeps a later process from recovering the dropped id
    * (findLastBackendSession); the provider sample goes with it — it measured
@@ -5658,6 +5672,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     const cloneSignal = createSignalSink();
     /** What the clone's window holds beyond its ledger — see relayBudgetBytes. */
     let cloneOccupancyTokens: number | undefined;
+    let cloneGenerationAtReport = 0;
     /** The clone spawn's request; the budget measures the same shape. */
     const cloneRequest = (
       prompt: string,
@@ -5699,6 +5714,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           : [...cloneHistory, body].join(CLONE_HISTORY_SEPARATOR);
       if (!cloneCanReuseSession) cloneHistory.push(body);
 
+      const generationBeforeSpawn = contextGeneration;
       const turn = startBackendTurn(cloneRequest(prompt, sessionArgs));
 
       // Ctrl+C on the parent turn kills the clone's child too, not just the
@@ -5728,6 +5744,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
               ? undefined
               : prompt + utf8Bytes(text) + 2 * utf8Bytes(CLONE_HISTORY_SEPARATOR);
           })();
+      cloneGenerationAtReport = generationBeforeSpawn;
       if (!cloneCanReuseSession && text.trim()) cloneHistory.push(text.trim());
       appendTranscript(record.transcriptPath, {
         type: 'backend_turn',
@@ -5782,7 +5799,15 @@ export async function runChat(options: ChatOptions): Promise<void> {
           // holds. Without this it took the static 200K default (Lumen, PR
           // #576 round 3).
           relayBudgetBytes: () =>
-            relayBudgetBytes({ maxContextTokens: cloneMaxContextTokens }, cloneOccupancyTokens),
+            relayBudgetBytes(
+              { maxContextTokens: cloneMaxContextTokens },
+              // A stateless clone's count is trusted only within the generation
+              // it was reported in — its own mutators and a concurrent parent's
+              // both bump it (Lumen, PR #576 round 13).
+              cloneCanReuseSession || cloneGenerationAtReport === contextGeneration
+                ? cloneOccupancyTokens
+                : undefined
+            ),
         },
         {
           ui: {
@@ -5909,6 +5934,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     }
   ): Promise<ToolResultRecord[]> => {
     const results: ToolResultRecord[] = [];
+    bumpContextGenerationFor(calls);
     await executeToolCalls(calls, {
       policy: opts.policy,
       sessionId: runtime.sessionId,
@@ -6275,6 +6301,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     const approvalOrigin: ApprovalOriginInfo = ctx?.origin ?? { origin: 'parent' };
     const abortSignal = ctx?.signal;
     const iterationResults: ToolResultRecord[] = [];
+    bumpContextGenerationFor(calls);
     await executeToolCalls(calls, {
       policy: toolPolicy,
       signal: abortSignal,
@@ -6456,12 +6483,6 @@ export async function runChat(options: ChatOptions): Promise<void> {
               compactForLedger(`local tool ${result.tool} -> ${resultJson}`, 500),
               'local-tool'
             );
-          }
-          // A write, edit or shell may have changed what a stateless provider
-          // discovers on its next fresh spawn: the previous prompt count no
-          // longer describes it (Lumen, PR #576 round 12).
-          if (CONTEXT_MUTATING_TOOLS.has(bareToolName(result.tool))) {
-            statelessPromptTokens = undefined;
           }
           iterationResults.push({
             tool: result.tool,
@@ -6845,7 +6866,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
      * size at that moment; the reply is not re-sent and is not counted
      * (Lumen, PR #576 rounds 5–10).
      */
-    const noteSpawn = (result: BackendRunResult, ledgerIdBeforeSpawn: number): void => {
+    const noteSpawn = (
+      result: BackendRunResult,
+      ledgerIdBeforeSpawn: number,
+      generationBeforeSpawn: number
+    ): void => {
       if (nativeSession()) {
         loopOccupancyTokens = occupancyTokens(runtime.backend, result.usage);
         return;
@@ -6855,6 +6880,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       // backend ran (inbox, activity) is absent from the reported prompt and
       // must be charged, not marked covered (Lumen, PR #576 round 12).
       ledgerMaxIdAtReport = ledgerIdBeforeSpawn;
+      statelessGenerationAtReport = generationBeforeSpawn;
     };
     /** The continuation spawn's request; the budget measures the same shape. */
     const continuationRequest = (prompt: string): BackendRunRequest => ({
@@ -6890,6 +6916,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
     const relayOccupancy = (): number | undefined => {
       if (nativeSession()) return loopOccupancyTokens;
       if (statelessPromptTokens === undefined) return undefined;
+      // A mutator ran since the report (parent or clone): the next fresh
+      // spawn may discover a different context — unknown, the floor.
+      if (statelessGenerationAtReport !== contextGeneration) return undefined;
       const addedBytes = ledger
         .listEntries()
         .filter((e) => e.id > ledgerMaxIdAtReport)
@@ -6903,6 +6932,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
     ): Promise<BackendTurnOutcome> => {
       if (!ctx.isContinuation) {
         const ledgerIdBeforeSpawn = maxLedgerId();
+        const generationBeforeSpawn = contextGeneration;
         beginSpawn();
         const turn = startBackendTurn({
           backend: runtime.backend,
@@ -7070,7 +7100,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         }
 
         lastRunResult = runResult;
-        noteSpawn(runResult, ledgerIdBeforeSpawn);
+        noteSpawn(runResult, ledgerIdBeforeSpawn, generationBeforeSpawn);
         return runResult;
       }
 
@@ -7125,6 +7155,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
       beginSpawn();
       const ledgerIdBeforeSpawn = maxLedgerId();
+      const generationBeforeSpawn = contextGeneration;
       const contTurn = startBackendTurn(continuationRequest(continuationPrompt));
       currentTurnAbort = contTurn.abort;
 
@@ -7136,7 +7167,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       lastRunResult = contResult;
       recordRunUsage(contResult.usage);
       sampleProviderContext(contResult.usage);
-      noteSpawn(contResult, ledgerIdBeforeSpawn);
+      noteSpawn(contResult, ledgerIdBeforeSpawn, generationBeforeSpawn);
       return contResult;
     };
 
