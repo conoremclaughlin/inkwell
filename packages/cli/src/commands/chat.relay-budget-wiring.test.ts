@@ -31,14 +31,16 @@ describe('runAgentLoop hosts and their relay budgets', () => {
     for (const input of loopCalls) expect(input).toContain('relayBudgetBytes: () =>');
   });
 
-  it("each host hands its budget an occupancy from the provider's reports — native: the last occupancy; stateless: the last prompt plus ledger growth (Lumen, rounds 6–10)", () => {
+  it("each host hands its budget an occupancy from the provider's reports — native: the last occupancy; stateless: the last prompt plus the rendered bytes of entries added since (Lumen, rounds 6–11)", () => {
     const parent = loopCalls.find((c) => c.includes('relayOccupancy()'))!;
     const clone = loopCalls.find((c) => c.includes('cloneOccupancyTokens'))!;
     expect(parent).toBeDefined();
     expect(clone).toBeDefined();
     expect(source).toMatch(
-      /const relayOccupancy = \(\): number \| undefined => \{\s*if \(nativeSession\(\)\) return loopOccupancyTokens;\s*if \(statelessPromptTokens === undefined\) return undefined;\s*const grownTokens = Math\.max\(0, ledger\.totalTokens\(\) - ledgerTokensAtReport\);\s*return statelessPromptTokens \+ grownTokens \* DEFAULT_CHARS_PER_TOKEN;/
+      /const relayOccupancy = \(\): number \| undefined => \{\s*if \(nativeSession\(\)\) return loopOccupancyTokens;\s*if \(statelessPromptTokens === undefined\) return undefined;\s*const addedBytes = ledger\s*\.listEntries\(\)\s*\.filter\(\(e\) => e\.id > ledgerMaxIdAtReport\)\s*\.reduce\(\(n, e\) => n \+ ledgerEntryPromptBytes\(e\), 0\);\s*return statelessPromptTokens \+ addedBytes;/
     );
+    // Never a net total: an eviction of older entries cannot hide an addition.
+    expect(source).not.toMatch(/ledger\.totalTokens\(\) - ledgerTokensAtReport/);
     expect(source).not.toMatch(/measurePreparedPromptBytes|hiddenContextBytes|MEDIA_TOKEN_RESERVE/);
   });
 
@@ -56,21 +58,23 @@ describe('runAgentLoop hosts and their relay budgets', () => {
     expect(source).toContain('const cloneMaxContextTokens = runtime.maxContextTokens;');
   });
 
-  it('a native spawn that reported nothing leaves the window UNKNOWN; a stateless one records the prompt count and the ledger size (Lumen, rounds 7–10)', () => {
+  it('a native spawn that reported nothing leaves the window UNKNOWN; a stateless one records the prompt count and the ledger high-water id (Lumen, rounds 7–11)', () => {
     expect(source).toContain('noteSpawn(runResult);');
     expect(source).toContain('noteSpawn(contResult);');
     expect(noteSpawn).toMatch(
       /if \(nativeSession\(\)\) \{\s*loopOccupancyTokens = occupancyTokens\(runtime\.backend, result\.usage\);\s*return;\s*\}/
     );
     expect(noteSpawn).toMatch(
-      /statelessPromptTokens = promptTokensOf\(runtime\.backend, result\.usage\);\s*ledgerTokensAtReport = ledger\.totalTokens\(\);/
+      /statelessPromptTokens = promptTokensOf\(runtime\.backend, result\.usage\);\s*ledgerMaxIdAtReport = ledger\s*\.listEntries\(\)\s*\.reduce\(\(m, e\) => Math\.max\(m, e\.id\), -1\);/
     );
     expect(source).not.toMatch(/ResidentBytes/);
     expect(source).toMatch(
       /cloneOccupancyTokens = cloneCanReuseSession\s*\?\s*occupancyTokens\(cloneBackend, result\.usage\)/
     );
     expect(source).toMatch(
-      /const prompt = promptTokensOf\(cloneBackend, result\.usage\);\s*return prompt === undefined \? undefined : prompt \+ utf8Bytes\(text\);/
+      /const prompt = promptTokensOf\(cloneBackend, result\.usage\);[\s\S]*?return prompt === undefined\s*\? undefined\s*: prompt \+ utf8Bytes\(text\) \+ 2 \* utf8Bytes\(CLONE_HISTORY_SEPARATOR\);/
     );
+    expect(source).toMatch(/join\(CLONE_HISTORY_SEPARATOR\)/);
+    expect(source).not.toMatch(/join\('\\n\\n---\\n\\n'\)/);
   });
 });

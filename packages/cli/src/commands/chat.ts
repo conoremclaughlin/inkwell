@@ -75,7 +75,6 @@ import {
   type LedgerReplayMeta,
   type LedgerRole,
 } from '../repl/context-ledger.js';
-import { DEFAULT_CHARS_PER_TOKEN } from '../repl/context-ledger.js';
 import {
   resolveModelContextWindow as resolveBackendTokenWindow,
   contextBudgetForWindow as defaultContextBudget,
@@ -2872,6 +2871,30 @@ export function promptTokensOf(
 }
 
 /**
+ * The bytes a ledger entry costs once rendered into a stateless envelope —
+ * its content, role and source in UTF-8, plus a per-entry allowance for the
+ * framing the envelope adds around them. An over-approximation on purpose:
+ * a tokens × 4 estimate charged 500 for a 1,483-byte Han entry and omitted
+ * the framing entirely (Lumen, PR #576 round 11).
+ */
+export const LEDGER_ENTRY_FRAME_BYTES = 64;
+export function ledgerEntryPromptBytes(entry: {
+  role: string;
+  content: string;
+  source?: string;
+}): number {
+  return (
+    utf8Bytes(entry.content) +
+    utf8Bytes(entry.role) +
+    utf8Bytes(entry.source ?? '') +
+    LEDGER_ENTRY_FRAME_BYTES
+  );
+}
+
+/** What a stateless clone joins its history with; two ride along every new turn. */
+export const CLONE_HISTORY_SEPARATOR = '\n\n---\n\n';
+
+/**
  * How many UTF-8 bytes the next relay message may be, from the window's live
  * headroom: the window minus what it holds, times RELAY_HEADROOM_SHARE, at
  * RELAY_BYTES_PER_TOKEN — clamped between MIN_RELAY_BUDGET_BYTES and
@@ -2884,9 +2907,11 @@ export function promptTokensOf(
  * for a stateless parent the previous request's PROMPT tokens as the provider
  * counted them (system prompt, discovered instruction files, tool schemas and
  * media included — nothing ink could measure from outside bounds those; Lumen,
- * PR #576 rounds 7–10) plus what the ledger grew since that report, at the
- * byte bound; the previous body is inside that count and is not re-sent, which
- * is slack in the safe direction. With no occupancy the relay gets the floor.
+ * PR #576 rounds 7–10) plus the exact rendered bytes of every ledger entry
+ * added after that report and still present (by entry id — an eviction of
+ * older entries can never net an addition away); the previous body is inside
+ * the count and is not re-sent, which is slack in the safe direction. With no
+ * occupancy the relay gets the floor.
  *
  * The bound is exact for the relay string. The floor is the one deliberate
  * exception: at exhausted headroom the model still receives a
@@ -5268,7 +5293,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       const prompt =
         cloneCanReuseSession || !turnCtx.isContinuation
           ? body
-          : [...cloneHistory, body].join('\n\n---\n\n');
+          : [...cloneHistory, body].join(CLONE_HISTORY_SEPARATOR);
       if (!cloneCanReuseSession) cloneHistory.push(body);
 
       const turn = startBackendTurn(cloneRequest(prompt, sessionArgs));
@@ -5294,7 +5319,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
         ? occupancyTokens(cloneBackend, result.usage)
         : (() => {
             const prompt = promptTokensOf(cloneBackend, result.usage);
-            return prompt === undefined ? undefined : prompt + utf8Bytes(text);
+            // The reply joins the history with a separator on each side of
+            // the next body (Lumen, PR #576 round 11).
+            return prompt === undefined
+              ? undefined
+              : prompt + utf8Bytes(text) + 2 * utf8Bytes(CLONE_HISTORY_SEPARATOR);
           })();
       if (!cloneCanReuseSession && text.trim()) cloneHistory.push(text.trim());
       appendTranscript(record.transcriptPath, {
@@ -6379,10 +6408,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // received. The relay budget shrinks by it, or each iteration re-grants
     // the same allowance while the window fills (Lumen, PR #576 round 3).
     let loopOccupancyTokens: number | undefined;
-    // A stateless parent: the last report's prompt tokens and the ledger size
-    // it was taken at, so growth since is added at the byte bound.
+    // A stateless parent: the last report's prompt tokens and the highest
+    // ledger entry id at that moment, so every entry added since is charged at
+    // its rendered bytes — by id, never as a net total an eviction could hide.
     let statelessPromptTokens: number | undefined;
-    let ledgerTokensAtReport = 0;
+    let ledgerMaxIdAtReport = -1;
     const nativeSession = (): boolean => Boolean(canReuseBackendSession && activeBackendSessionId);
     /**
      * After each spawn. NATIVE session: the provider's own occupancy when it
@@ -6400,7 +6430,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         return;
       }
       statelessPromptTokens = promptTokensOf(runtime.backend, result.usage);
-      ledgerTokensAtReport = ledger.totalTokens();
+      ledgerMaxIdAtReport = ledger.listEntries().reduce((m, e) => Math.max(m, e.id), -1);
     };
     /** The continuation spawn's request; the budget measures the same shape. */
     const continuationRequest = (prompt: string): BackendRunRequest => ({
@@ -6431,13 +6461,16 @@ export async function runChat(options: ChatOptions): Promise<void> {
     /**
      * What the window holds for the next relay — see relayBudgetBytes. A
      * stateless parent's next envelope is the last report's prompt plus the
-     * ledger's growth since, at the byte bound (chars as bytes).
+     * rendered bytes of every entry added to the ledger since (by id).
      */
     const relayOccupancy = (): number | undefined => {
       if (nativeSession()) return loopOccupancyTokens;
       if (statelessPromptTokens === undefined) return undefined;
-      const grownTokens = Math.max(0, ledger.totalTokens() - ledgerTokensAtReport);
-      return statelessPromptTokens + grownTokens * DEFAULT_CHARS_PER_TOKEN;
+      const addedBytes = ledger
+        .listEntries()
+        .filter((e) => e.id > ledgerMaxIdAtReport)
+        .reduce((n, e) => n + ledgerEntryPromptBytes(e), 0);
+      return statelessPromptTokens + addedBytes;
     };
 
     const runTurnForLoop = async (

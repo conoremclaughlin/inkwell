@@ -16,6 +16,9 @@ import {
   RELAY_HEADROOM_SHARE,
   occupancyTokens,
   promptTokensOf,
+  ledgerEntryPromptBytes,
+  LEDGER_ENTRY_FRAME_BYTES,
+  CLONE_HISTORY_SEPARATOR,
 } from './chat.js';
 import { MAX_RELAY_BYTES } from '../repl/agent-loop.js';
 import { ContextLedger } from '../repl/context-ledger.js';
@@ -777,6 +780,21 @@ describe('relayBudgetBytes — the relay budget follows the live headroom (Lumen
 
   it('never starves a relay: a window past its budget still gets the minimum — the documented exception', () => {
     expect(relayBudgetBytes(runtime, 200_000)).toBe(MIN_RELAY_BUDGET_BYTES);
+  });
+});
+
+describe('ledgerEntryPromptBytes — an added entry at its rendered bytes (Lumen, PR #576 round 11)', () => {
+  it('charges UTF-8 bytes of content, role and source plus the framing allowance — never chars ÷ 4', () => {
+    const han = { role: 'user', content: '漢'.repeat(500), source: 'repl-history' };
+    // 500 Han chars are 1,500 bytes; a tokens × 4 estimate charged 500.
+    expect(ledgerEntryPromptBytes(han)).toBe(1_500 + 4 + 12 + LEDGER_ENTRY_FRAME_BYTES);
+    expect(ledgerEntryPromptBytes(han)).toBeGreaterThan(1_483);
+    expect(ledgerEntryPromptBytes({ role: 'assistant', content: 'ok' })).toBe(
+      2 + 9 + LEDGER_ENTRY_FRAME_BYTES
+    );
+  });
+  it('the clone history separator is the 7-byte join the clone actually uses', () => {
+    expect(Buffer.byteLength(CLONE_HISTORY_SEPARATOR)).toBe(7);
   });
 });
 
