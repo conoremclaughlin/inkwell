@@ -14,7 +14,12 @@
  * real stream) and mislabels usage fields.
  */
 
-import type { BackendTokenUsage, BackendModelUsage } from '../repl/token-usage.js';
+import {
+  providerContextTokens,
+  type BackendTokenUsage,
+  type BackendModelUsage,
+  type ContextParts,
+} from '../repl/token-usage.js';
 import type { BackendStreamParser, BackendTurnEvent } from './stream.js';
 
 interface ClaudeContentBlock {
@@ -33,7 +38,9 @@ interface ClaudeStreamMessage {
   errors?: unknown[];
   result?: unknown;
   usage?: Record<string, unknown>;
-  message?: { id?: string; content?: ClaudeContentBlock[] };
+  message?: { id?: string; content?: ClaudeContentBlock[]; usage?: Record<string, unknown> };
+  /** Set on events that belong to a subagent's context, not this session's. */
+  parent_tool_use_id?: string | null;
   session_id?: string;
   /** Model id serving the session (`system`/`init` event). */
   model?: string;
@@ -85,12 +92,61 @@ function toModelUsage(raw: unknown): Record<string, BackendModelUsage> | undefin
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
-/** Map Claude's `result.usage` object to BackendTokenUsage with the REAL field names. */
-function toUsage(u: Record<string, unknown>): BackendTokenUsage {
+/** One request's prompt parts, from a usage object with Claude's field names. */
+function requestParts(u: Record<string, unknown>): ContextParts | undefined {
+  const parts = {
+    inputTokens: num(u.input_tokens),
+    cacheReadTokens: num(u.cache_read_input_tokens),
+    cacheWriteTokens: num(u.cache_creation_input_tokens),
+  };
+  if (Object.values(parts).every((v) => v === undefined)) return undefined;
+  return {
+    ...(parts.inputTokens !== undefined ? { inputTokens: parts.inputTokens } : {}),
+    ...(parts.cacheReadTokens !== undefined ? { cacheReadTokens: parts.cacheReadTokens } : {}),
+    ...(parts.cacheWriteTokens !== undefined ? { cacheWriteTokens: parts.cacheWriteTokens } : {}),
+  };
+}
+
+/**
+ * The last EXECUTOR request in `result.usage.iterations`: searched backward
+ * for a readable `type: "message"` entry. The array can end with a foreign
+ * window — an `advisor_message` — and a failed run can leave it empty, so
+ * the raw last entry is not it and there is no fallback (Lumen, PR #583
+ * round 3; anthropics/claude-code#53065).
+ */
+function lastMessageIteration(raw: unknown): ContextParts | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  for (let i = raw.length - 1; i >= 0; i -= 1) {
+    const entry = raw[i];
+    if (!entry || typeof entry !== 'object') continue;
+    const e = entry as Record<string, unknown>;
+    if (e.type !== 'message') continue;
+    const parts = requestParts(e);
+    if (parts) return parts;
+  }
+  return undefined;
+}
+
+/**
+ * Map Claude's `result.usage` object to BackendTokenUsage with the REAL field
+ * names. The top-level fields are the agent run's AGGREGATE — one CLI spawn
+ * may make several native tool/model iterations and they sum — and stay for
+ * cost. The window the FINAL request was handed comes only from a
+ * per-request sample: the newest top-level assistant message's usage
+ * (`lastRequest`), else the last executor iteration; with neither, it is
+ * UNKNOWN — the aggregate is never a stand-in for enforcement (Lumen, PR
+ * #583 rounds 2–3).
+ */
+function toUsage(u: Record<string, unknown>, lastRequest?: ContextParts): BackendTokenUsage {
   const inputTokens = num(u.input_tokens);
   const outputTokens = num(u.output_tokens);
   const cacheReadTokens = num(u.cache_read_input_tokens);
   const cacheWriteTokens = num(u.cache_creation_input_tokens);
+  // ONE decision: a per-request sample, or nothing. No aggregate fallback.
+  const request = lastRequest ?? lastMessageIteration(u.iterations);
+  const window = request
+    ? { contextTokens: providerContextTokens('claude', request), contextParts: request }
+    : undefined;
   return {
     backend: 'claude',
     source: 'json',
@@ -98,6 +154,7 @@ function toUsage(u: Record<string, unknown>): BackendTokenUsage {
     outputTokens,
     cacheReadTokens,
     cacheWriteTokens,
+    ...(window?.contextTokens !== undefined ? window : {}),
     totalTokens:
       inputTokens !== undefined && outputTokens !== undefined
         ? inputTokens + outputTokens
@@ -122,6 +179,14 @@ export class ClaudeStreamParser implements BackendStreamParser {
    */
   private lastAssistantText = '';
   private lastAssistantMessageId: string | undefined;
+  /**
+   * The newest top-level assistant message's own usage — one API request,
+   * so its input + cache parts are the context that request was handed.
+   * Subagent events (`parent_tool_use_id`) describe a different context and
+   * are skipped, as claude-runner does (Lumen, PR #583 round 3).
+   */
+  private lastRequestUsage: ContextParts | undefined;
+  private lastRequestMessageId: string | undefined;
 
   push(chunk: string): BackendTurnEvent[] {
     this.buffer += chunk;
@@ -154,6 +219,25 @@ export class ClaudeStreamParser implements BackendStreamParser {
 
     switch (ev.type) {
       case 'assistant': {
+        if (!ev.parent_tool_use_id) {
+          const messageId = typeof ev.message?.id === 'string' ? ev.message.id : undefined;
+          const parts =
+            ev.message?.usage && typeof ev.message.usage === 'object'
+              ? requestParts(ev.message.usage)
+              : undefined;
+          if (parts) {
+            this.lastRequestUsage = parts;
+            this.lastRequestMessageId = messageId;
+          } else if (messageId === undefined || messageId !== this.lastRequestMessageId) {
+            // A NEWER message that reported nothing usable: the previous
+            // message's measurement no longer describes the window, and
+            // keeping it would suppress the iteration fallback and the honest
+            // "unknown" (Lumen, PR #583 round 5). A later block of the SAME
+            // message keeps what that message already reported.
+            this.lastRequestUsage = undefined;
+            this.lastRequestMessageId = messageId;
+          }
+        }
         const content = ev.message?.content;
         if (!Array.isArray(content)) break;
         // ONE text event per assistant stream event: its text blocks
@@ -230,7 +314,7 @@ export class ClaudeStreamParser implements BackendStreamParser {
           kind: 'result',
           text,
           usage: ev.usage
-            ? { ...toUsage(ev.usage), ...(modelUsage ? { modelUsage } : {}) }
+            ? { ...toUsage(ev.usage, this.lastRequestUsage), ...(modelUsage ? { modelUsage } : {}) }
             : undefined,
           resumeFailedNoSession: resumeFailedNoSession || undefined,
         });

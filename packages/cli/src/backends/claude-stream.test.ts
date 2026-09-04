@@ -438,3 +438,202 @@ describe('one assistant message streamed as several events (#569)', () => {
     expect(r?.kind === 'result' && r.text).toBe('b');
   });
 });
+
+describe('result usage carries the context the FINAL request was handed (Lumen, PR #583 rounds 1–3)', () => {
+  const result = (usage: Record<string, unknown>) =>
+    JSON.stringify({ type: 'result', subtype: 'success', result: '', usage }) + '\n';
+  const assistant = (usage: Record<string, unknown>, extra: Record<string, unknown> = {}) =>
+    JSON.stringify({
+      type: 'assistant',
+      message: { id: 'm1', usage, content: [{ type: 'text', text: 'hi' }] },
+      ...extra,
+    }) + '\n';
+  const usageOf = (events: BackendTurnEvent[]) => {
+    const r = events.find((e) => e.kind === 'result');
+    return r?.kind === 'result' ? r.usage : undefined;
+  };
+
+  it("the newest top-level assistant message's usage is the request window, summed at the adapter boundary", () => {
+    const parser = new ClaudeStreamParser();
+    const events = [
+      ...parser.push(
+        assistant({
+          input_tokens: 1_000,
+          cache_read_input_tokens: 500_000,
+          cache_creation_input_tokens: 40_000,
+          output_tokens: 10,
+        })
+      ),
+      ...parser.push(
+        result({
+          input_tokens: 1_000,
+          output_tokens: 10,
+          cache_read_input_tokens: 500_000,
+          cache_creation_input_tokens: 40_000,
+        })
+      ),
+    ];
+    const u = usageOf(events);
+    expect(u?.contextTokens).toBe(541_000);
+    expect(u?.contextParts).toEqual({
+      inputTokens: 1_000,
+      cacheReadTokens: 500_000,
+      cacheWriteTokens: 40_000,
+    });
+  });
+
+  it('a multi-iteration result reports the last EXECUTOR request; the top-level sums stay for cost', () => {
+    const parser = new ClaudeStreamParser();
+    const u = usageOf(
+      parser.push(
+        result({
+          input_tokens: 150,
+          output_tokens: 40,
+          cache_read_input_tokens: 50_000,
+          cache_creation_input_tokens: 6_000,
+          iterations: [
+            {
+              input_tokens: 100,
+              output_tokens: 20,
+              cache_read_input_tokens: 20_000,
+              cache_creation_input_tokens: 5_000,
+              type: 'message',
+            },
+            {
+              input_tokens: 50,
+              output_tokens: 20,
+              cache_read_input_tokens: 30_000,
+              cache_creation_input_tokens: 1_000,
+              type: 'message',
+            },
+          ],
+        })
+      )
+    );
+    expect(u?.contextTokens).toBe(31_050);
+    // The parts are the final request's — they SUM to the total (round 3).
+    expect(u?.contextParts).toEqual({
+      inputTokens: 50,
+      cacheReadTokens: 30_000,
+      cacheWriteTokens: 1_000,
+    });
+    expect(u?.inputTokens).toBe(150);
+    expect(u?.cacheReadTokens).toBe(50_000);
+  });
+
+  it('REGRESSION (Lumen, round 3): an advisor_message at the end is a foreign window — the last message entry wins', () => {
+    const parser = new ClaudeStreamParser();
+    const u = usageOf(
+      parser.push(
+        result({
+          input_tokens: 999,
+          iterations: [
+            {
+              input_tokens: 100,
+              cache_read_input_tokens: 20_000,
+              cache_creation_input_tokens: 5_000,
+              type: 'message',
+            },
+            {
+              input_tokens: 7,
+              cache_read_input_tokens: 900_000,
+              cache_creation_input_tokens: 0,
+              type: 'advisor_message',
+            },
+          ],
+        })
+      )
+    );
+    expect(u?.contextTokens).toBe(25_100);
+  });
+
+  it.each([
+    [
+      'an empty iterations array',
+      { input_tokens: 1_000, cache_read_input_tokens: 500_000, iterations: [] },
+    ],
+    ['no iterations at all', { input_tokens: 1_000, cache_read_input_tokens: 500_000 }],
+    ['only unreadable entries', { input_tokens: 1_000, iterations: [{ type: 'message' }] }],
+    [
+      'only advisor entries',
+      { input_tokens: 1_000, iterations: [{ type: 'advisor_message', input_tokens: 5 }] },
+    ],
+  ])(
+    'REGRESSION (Lumen, round 3): with %s and no per-request usage the window is UNKNOWN — never the aggregate',
+    (_w, usage) => {
+      const parser = new ClaudeStreamParser();
+      const u = usageOf(parser.push(result(usage)));
+      expect(u).toBeDefined();
+      expect(u?.contextTokens).toBeUndefined();
+      expect(u?.contextParts).toBeUndefined();
+      expect(u?.inputTokens).toBe(1_000);
+    }
+  );
+
+  it('REGRESSION (Lumen, round 5): a NEWER message with no usable usage resets the window — no inheritance', () => {
+    const parser = new ClaudeStreamParser();
+    const m2 = (extra: Record<string, unknown>) =>
+      JSON.stringify({
+        type: 'assistant',
+        message: { id: 'm2', content: [{ type: 'text', text: 'more' }], ...extra },
+      }) + '\n';
+    // No usage at all on the newer message → unknown, not m1's 40,010.
+    const a = new ClaudeStreamParser();
+    const gone = [
+      ...a.push(assistant({ input_tokens: 10, cache_read_input_tokens: 40_000 })),
+      ...a.push(m2({})),
+      ...a.push(result({ input_tokens: 15, cache_read_input_tokens: 940_000 })),
+    ];
+    expect(usageOf(gone)?.contextTokens).toBeUndefined();
+    // Unreadable usage on the newer message → the same.
+    const unreadable = [
+      ...parser.push(assistant({ input_tokens: 10, cache_read_input_tokens: 40_000 })),
+      ...parser.push(m2({ usage: { foo: 'bar' } })),
+      ...parser.push(result({ input_tokens: 15 })),
+    ];
+    expect(usageOf(unreadable)?.contextTokens).toBeUndefined();
+    // …and the iteration fallback is no longer suppressed by the stale sample.
+    const b = new ClaudeStreamParser();
+    const viaIterations = [
+      ...b.push(assistant({ input_tokens: 10, cache_read_input_tokens: 40_000 })),
+      ...b.push(m2({})),
+      ...b.push(
+        result({
+          input_tokens: 15,
+          iterations: [{ type: 'message', input_tokens: 5, cache_read_input_tokens: 70_000 }],
+        })
+      ),
+    ];
+    expect(usageOf(viaIterations)?.contextTokens).toBe(70_005);
+  });
+
+  it('a later block of the SAME message keeps what that message reported', () => {
+    const parser = new ClaudeStreamParser();
+    const events = [
+      ...parser.push(assistant({ input_tokens: 10, cache_read_input_tokens: 40_000 })),
+      ...parser.push(
+        JSON.stringify({
+          type: 'assistant',
+          message: { id: 'm1', content: [{ type: 'text', text: 'again' }] },
+        }) + '\n'
+      ),
+      ...parser.push(result({ input_tokens: 15 })),
+    ];
+    expect(usageOf(events)?.contextTokens).toBe(40_010);
+  });
+
+  it("a subagent's assistant events (parent_tool_use_id) never become this session's window", () => {
+    const parser = new ClaudeStreamParser();
+    const events = [
+      ...parser.push(assistant({ input_tokens: 10, cache_read_input_tokens: 40_000 })),
+      ...parser.push(
+        assistant(
+          { input_tokens: 5, cache_read_input_tokens: 900_000 },
+          { parent_tool_use_id: 'tu_1' }
+        )
+      ),
+      ...parser.push(result({ input_tokens: 15, cache_read_input_tokens: 940_000 })),
+    ];
+    expect(usageOf(events)?.contextTokens).toBe(40_010);
+  });
+});

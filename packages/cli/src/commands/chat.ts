@@ -63,6 +63,20 @@ import {
   type BackendRunResult,
   type BackendRunRequest,
 } from '../repl/backend-runner.js';
+import {
+  buildCompactionPrompt,
+  runCompaction,
+  type CompactionOutcome,
+} from '../repl/compaction.js';
+import {
+  autoEvictTombstone,
+  selectConsumedToolResults,
+  AUTO_EVICT_KEEP_RECENT_TURNS,
+  AUTO_EVICT_MIN_SHARE,
+  AUTO_EVICT_MIN_TOKENS,
+  AUTO_EVICT_TOMBSTONE_SOURCE,
+} from '../repl/auto-evict.js';
+import { localToolLedgerLine } from '../repl/auto-evict.js';
 import { StreamedTurnRenderer, type StreamedLine } from '../repl/paragraph-stream.js';
 import { ImitationPreviewGuard } from '../repl/preview-guard.js';
 import type { BackendTurnEvent } from '../backends/stream.js';
@@ -113,10 +127,14 @@ import {
   isClientLocalTool,
   handleClientLocalTool,
   globalSignalSink,
+  parseCompactContextArgs,
+  type ProviderContextMeasurement,
   type SignalSink,
   getLastSignal,
   clearLastSignal,
 } from '../repl/context-tools.js';
+import { ProviderSampleTracker, type ProviderSampleScope } from '../repl/provider-sample.js';
+import { assessContextPressure } from '../repl/context-pressure.js';
 import { SbHookRegistry } from '../repl/hook-registry.js';
 import { registerBuiltinHooks } from '../repl/builtin-hooks.js';
 import { applyProfile, formatProfileList, isValidProfileId } from '../repl/tool-profiles.js';
@@ -692,6 +710,44 @@ function getSessionTranscriptMetadata(sessionId: string): SessionTranscriptMetad
 }
 
 // Exported for tests — verifies compaction events rehydrate summary + kept tail
+/** A `provider_sample` transcript event, as the next process replays it. */
+export interface PersistedProviderSample {
+  at: string;
+  scope: ProviderSampleScope;
+  contextTokens: number;
+  inputTokens?: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+}
+
+export function readProviderSampleEvent(
+  event: Record<string, unknown>
+): PersistedProviderSample | undefined {
+  const str = (k: string): string | undefined =>
+    typeof event[k] === 'string' ? (event[k] as string) : undefined;
+  const n = (k: string): number | undefined =>
+    typeof event[k] === 'number' && Number.isFinite(event[k] as number)
+      ? (event[k] as number)
+      : undefined;
+  const contextTokens = n('contextTokens');
+  const backend = str('backend');
+  const at = str('at');
+  if (contextTokens === undefined || contextTokens <= 0 || !backend || !at) return undefined;
+  return {
+    at,
+    scope: {
+      backend,
+      model: str('model'),
+      backendSessionId: str('backendSessionId'),
+      envelopeShape: str('envelopeShape'),
+    },
+    contextTokens,
+    inputTokens: n('inputTokens'),
+    cacheReadTokens: n('cacheReadTokens'),
+    cacheWriteTokens: n('cacheWriteTokens'),
+  };
+}
+
 export function hydrateLedgerFromTranscript(
   ledger: ContextLedger,
   transcriptPath: string,
@@ -710,12 +766,19 @@ export function hydrateLedgerFromTranscript(
   toolCalls: Array<{ tool: string; status: string; at: string; args?: string; result?: string }>;
   /** Highest event id seen — seeds the append counter so new eids continue */
   maxEid: number;
+  /**
+   * The provider's last measurement, when no context-boundary mutation
+   * followed it — so a new process budgets against it from its first
+   * pre-turn check (Lumen, PR #583 round 2).
+   */
+  providerSample?: PersistedProviderSample;
 } {
   const events = readTranscriptEvents(transcriptPath);
   let loaded = 0;
   let messageCount = 0;
   let compactionCollapsed = false;
   let maxEid = 0;
+  let providerSample: PersistedProviderSample | undefined;
   const preview: HistoryHydrationResult['tailPreview'] = [];
   const seenInboxIds = new Set<string>();
   const seenActivityIds = new Set<string>();
@@ -749,6 +812,20 @@ export function hydrateLedgerFromTranscript(
     const type = typeof event.type === 'string' ? event.type : '';
     const eid = typeof event.eid === 'number' ? event.eid : undefined;
     if (eid !== undefined && eid > maxEid) maxEid = eid;
+    if (type === 'provider_sample') {
+      providerSample = readProviderSampleEvent(event);
+      continue;
+    }
+    if (
+      type === 'context_evict' ||
+      type === 'context_trim' ||
+      type === 'compaction' ||
+      type === 'context_budget_changed' ||
+      type === 'backend_session_invalidated'
+    ) {
+      // The window it measured is gone — live, the same mutations clear it.
+      providerSample = undefined;
+    }
     if (type === 'context_evict' && Array.isArray(event.refs)) {
       // Apply the eviction exactly as it happened live: remove matching
       // entries that exist at this point in the replay. Entries appended
@@ -936,6 +1013,17 @@ export function hydrateLedgerFromTranscript(
       }
       continue;
     }
+    if (type === 'context_note' && typeof event.content === 'string') {
+      // A runtime notice that belongs in the window — today the auto-evict
+      // tombstone. Replayed as the system entry it was live, so a reattached
+      // process knows why earlier tool results are missing (PR #584).
+      const source = typeof event.source === 'string' ? event.source : 'context-note';
+      const entry = ledger.addEntry('system', event.content, source, eid);
+      hydratedEntryIds.push(entry.id);
+      loaded += 1;
+      continue;
+    }
+
     if (type === 'system_turn' && typeof event.content === 'string') {
       // Synthetic turn input (heartbeat trigger, continuation prompt, etc.)
       const label = typeof event.label === 'string' ? event.label : 'system';
@@ -1115,6 +1203,7 @@ export function hydrateLedgerFromTranscript(
     evictedEntries,
     toolCalls,
     maxEid,
+    ...(providerSample ? { providerSample } : {}),
   };
 }
 
@@ -1316,6 +1405,12 @@ const INTERNAL_SYSTEM_SOURCES = new Set([
   'auto-run',
   'hook-history',
   'bootstrap',
+  // The auto-evict tombstone (and a context note's fallback source): a
+  // runtime notice for the model, never a visible system message — through
+  // a compaction's kept tail as well as by direct replay (Lumen, PR #584
+  // round 3).
+  AUTO_EVICT_TOMBSTONE_SOURCE,
+  'context-note',
 ]);
 
 function compactForHistoryPreview(
@@ -4031,7 +4126,55 @@ export async function runChat(options: ChatOptions): Promise<void> {
   let sessionsCache: SessionSummary[] = [];
   let sessionsCacheAt = 0;
   let activitySince = new Date(Date.now() - 5 * 60 * 1000).toISOString();
-  let lastBackendUsage: BackendTokenUsage | undefined;
+  /**
+   * The provider's own measurement of the last request, scoped to the native
+   * session / model / envelope it measured (Lumen, PR #583 finding 4) and
+   * taken where each spawn's result lands — before the loop runs that turn's
+   * tools, so a list_context in the same turn already sees it (finding 1).
+   */
+  const providerSample = new ProviderSampleTracker();
+  const providerScope = (): ProviderSampleScope => ({
+    backend: runtime.backend,
+    model: runtime.detectedModel || runtime.model,
+    backendSessionId: activeBackendSessionId,
+    // The LIVE envelope, not the session's adopted baseline: a stateless
+    // provider never has a baseline, so its samples outlived every envelope
+    // change (Lumen, PR #583 round 2).
+    envelopeShape: envelopeShapeKey(runtime),
+  });
+  const sampleProviderContext = (usage: BackendTokenUsage | undefined): void => {
+    if (!usage) return;
+    const scope = providerScope();
+    const at = new Date().toISOString();
+    providerSample.record(usage, scope, at);
+    // Persisted so the NEXT process — a one-turn Myra run exits right after
+    // this — budgets against it on its first pre-turn check instead of
+    // flying blind until its own spawn reports (Lumen, PR #583 round 2).
+    // A report with no usable measurement is persisted too, as a tombstone:
+    // live it hides the previous sample, and replay must not resurrect it
+    // (Lumen, round 3).
+    const parts = usage.contextParts;
+    appendTranscript(
+      runtime.transcriptPath,
+      usage.contextTokens !== undefined && usage.contextTokens > 0
+        ? {
+            type: 'provider_sample',
+            at,
+            ...scope,
+            contextTokens: usage.contextTokens,
+            ...(parts?.inputTokens !== undefined ? { inputTokens: parts.inputTokens } : {}),
+            ...(parts?.cacheReadTokens !== undefined
+              ? { cacheReadTokens: parts.cacheReadTokens }
+              : {}),
+            ...(parts?.cacheWriteTokens !== undefined
+              ? { cacheWriteTokens: parts.cacheWriteTokens }
+              : {}),
+          }
+        : { type: 'provider_sample', at, ...scope, unknown: true }
+    );
+  };
+  const providerContextMeasurement = (): ProviderContextMeasurement | undefined =>
+    providerSample.measurement(providerScope());
   let lastDelegation: DelegationState | undefined;
   let forceQuitAfterTurn = false;
   let readyForAutoRun = false;
@@ -4371,10 +4514,48 @@ export async function runChat(options: ChatOptions): Promise<void> {
       contextGeneration += 1;
     };
   };
+  /**
+   * Drop the native session so the next spawn seeds a fresh one from the
+   * ledger. The marker keeps a later process from recovering the dropped id
+   * (findLastBackendSession); the provider sample goes with it — it measured
+   * a window that no longer exists.
+   */
+  const rollProviderSession = (reason: string, note: string): void => {
+    if (activeBackendSessionId !== undefined) {
+      appendTranscript(runtime.transcriptPath, {
+        type: 'backend_session_invalidated',
+        id: activeBackendSessionId,
+        reason,
+      });
+    }
+    activeBackendSessionId = undefined;
+    activeBackendSessionShape = undefined;
+    providerSample.clear();
+    printEvent(chalk.yellow(`  ⛁ provider session rolled — ${note}`));
+  };
 
   let historyHydration: HistoryHydrationResult | null = null;
   if (attachedToExistingSession && existingTranscript) {
     const hydrated = hydrateLedgerFromTranscript(ledger, existingTranscript, agentId);
+    if (hydrated.providerSample) {
+      // Replayed under the scope it was taken in; measurement() decides
+      // whether that is still the live window.
+      const s = hydrated.providerSample;
+      providerSample.record(
+        {
+          backend: s.scope.backend,
+          source: 'json',
+          contextTokens: s.contextTokens,
+          contextParts: {
+            ...(s.inputTokens !== undefined ? { inputTokens: s.inputTokens } : {}),
+            ...(s.cacheReadTokens !== undefined ? { cacheReadTokens: s.cacheReadTokens } : {}),
+            ...(s.cacheWriteTokens !== undefined ? { cacheWriteTokens: s.cacheWriteTokens } : {}),
+          },
+        },
+        s.scope,
+        s.at
+      );
+    }
     // Recover the provider-reported model persisted by the prior process
     // BEFORE any budget enforcement runs: a reattached large transcript must
     // be judged against the session's REAL window, not the conservative
@@ -4795,6 +4976,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // recovery on the matching markers.
     activeBackendSessionId = undefined;
     activeBackendSessionShape = undefined;
+    // A stateless provider re-packs the ledger on every spawn, so a reading
+    // taken before the eviction describes a window that no longer exists —
+    // and its scope (no session id) would otherwise still match (Lumen, PR
+    // #583 round 2). Trims route through here too.
+    providerSample.clear();
   };
 
   const trimContextToPercent = async (
@@ -4846,19 +5032,104 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // fails, fall back to a hard trim so the turn can still proceed.
   let compactionInFlight = false;
 
-  const buildCompactionPrompt = (chunk: string): string =>
-    [
-      'You are compacting a conversation transcript into a dense continuation brief.',
-      'Summarize the conversation below, preserving: decisions and their rationale,',
-      'completed and in-progress work, key facts and constraints, open questions,',
-      'commitments made, and any identifiers (PR numbers, session IDs, file paths, URLs).',
-      'Write compact bullet points. Output ONLY the summary — no preamble.',
-      '',
-      '<conversation>',
-      chunk,
-      '</conversation>',
-    ].join('\n');
+  /**
+   * Compact the ledger NOW: replace everything but the most recent entries
+   * with a summary, write the `compaction` event, roll the provider session.
+   *
+   * Two callers. Auto-compaction (below) reaches it over the budget threshold
+   * with the runtime summarizing. An agent reaches it through the
+   * `compact_context` tool, usually with its OWN summary — the one thing a
+   * long-lived SB could not do for itself (task 609b1833). The policy is
+   * `runCompaction` (repl/compaction.ts); this binds the summarizer spawn, the
+   * transcript, the usage counters and the session roll to it.
+   */
+  const compactContextNow = async (opts: {
+    reason: string;
+    actor: 'system' | 'sb';
+    summaryText?: string;
+    keepRecent?: number;
+    /** The turn's cancellation — aborts a running summarizer spawn. */
+    signal?: AbortSignal;
+  }): Promise<CompactionOutcome> => {
+    if (compactionInFlight) return { ok: false, error: 'a compaction is already in progress' };
+    compactionInFlight = true;
+    try {
+      const outcome = await runCompaction(opts, {
+        ledger,
+        keepRecentDefault: AUTO_COMPACT_KEEP_RECENT_ENTRIES,
+        summarize: async (chunk, signal) => {
+          // A handle, not a bare promise: the turn's Ctrl+C reaches this
+          // spawn (it used to run on to its idle timeout).
+          const summarizer = startBackendTurn({
+            backend: runtime.backend,
+            agentId,
+            model: runtime.model,
+            effort: runtime.effort,
+            prompt: buildCompactionPrompt(chunk),
+            // Compaction is a backend turn like any other, so it goes through
+            // adapter.prepare() and would otherwise regenerate the default
+            // identity prompt — handing a nascent SB "You are nascent, call
+            // bootstrap" the moment its first conversation grew long enough to
+            // compact (Lumen, PR #485 — finding 2).
+            systemPromptOverride: runtime.systemPromptOverride,
+            // Summarization is governed like any other turn: token-flow (idle)
+            // is the reaper, with the 4h runaway backstop. An explicit
+            // --backend-timeout-seconds still caps it, floored at 5 min —
+            // summarizing a large chunk outlives short overrides.
+            timeoutMs: runtime.backendTurnTimeoutMs
+              ? Math.max(runtime.backendTurnTimeoutMs, 5 * 60 * 1000)
+              : undefined,
+            idleTimeoutMs: runtime.backendIdleTimeoutMs,
+            stream: true,
+          });
+          const onAbort = (): void => summarizer.abort();
+          signal?.addEventListener('abort', onAbort, { once: true });
+          let turn: BackendRunResult;
+          try {
+            turn = await summarizer.result;
+          } finally {
+            signal?.removeEventListener('abort', onAbort);
+          }
+          return {
+            text: turn.success ? (turn.responseText ?? turn.stdout) : '',
+            usage: turn.usage,
+            error: turn.success
+              ? undefined
+              : turn.stderr.trim().slice(0, 200) || `exit code ${turn.exitCode}`,
+          };
+        },
+        persist: (event) => appendTranscript(runtime.transcriptPath, event),
+        recordUsage: recordRunUsage,
+        hardTrim: (reason) => trimContextToPercent(DEFAULT_TRIM_TARGET_PCT, reason),
+        log: (line) => printEvent(chalk.yellow(`  ⛁ ${line}`)),
+      });
+      if (outcome.ok) {
+        // Cutoff divider: everything above this line in the scrollback is
+        // now out of the context window (replaced by the summary).
+        printEvent(
+          renderContextCutoff(
+            // Live pre-mutation total, as the result reports it — the
+            // wrapper's own pre-await snapshot showed "10K → 11K (freed 1K)"
+            // when entries arrived during summarization (Lumen, PR #578 round 4).
+            `compacted ${outcome.removed} entries · ${formatTokenCount(outcome.before)} → ${formatTokenCount(outcome.totalAfter)} tok (freed ${formatTokenCount(outcome.freedTokens)})`
+          )
+        );
+        // ink just rolled the ledger — roll the provider session too so the
+        // next spawn seeds a fresh native session with the summary (we compact
+        // before the provider ever would). Mid-turn, the next continuation
+        // re-seeds (decideContinuationSession). Only when the ledger actually
+        // changed: a refusal or a failed marker leaves the session alone.
+        activeBackendSessionId = undefined;
+        activeBackendSessionShape = undefined;
+        providerSample.clear();
+      }
+      return outcome;
+    } finally {
+      compactionInFlight = false;
+    }
+  };
 
+  // ── Token-budget auto-compaction ──
   const maybeCompactContext = async (reason: string): Promise<void> => {
     if (compactionInFlight) return;
     const bootstrapReserve = runtime.bootstrapContext
@@ -4866,7 +5137,27 @@ export async function runChat(options: ChatOptions): Promise<void> {
       : 0;
     const effectiveBudget = Math.max(1, runtime.maxContextTokens - bootstrapReserve);
     const threshold = Math.floor(effectiveBudget * AUTO_COMPACT_THRESHOLD_PCT);
-    if (ledger.totalTokens() <= threshold) return;
+    // Two yardsticks (Lumen, PR #583 finding 3): ink's estimate covers the
+    // ledger and is judged against its allowance; the provider's count covers
+    // the whole request and is judged against the full window. A 300K
+    // estimate over a 541K window never compacted (Myra, 2026-09-03; task
+    // 9cf538a2).
+    const pressure = assessContextPressure({
+      ledgerTokens: ledger.totalTokens(),
+      ledgerThreshold: threshold,
+      providerTokens: providerContextMeasurement()?.contextTokens,
+      providerThreshold: Math.floor(runtime.maxContextTokens * AUTO_COMPACT_THRESHOLD_PCT),
+      hasProviderSession: activeBackendSessionId !== undefined,
+      format: formatTokenCount,
+    });
+    if (pressure.action === 'none') return;
+    if (pressure.action === 'reseed') {
+      // The ledger is within its allowance; the excess is what the native
+      // session accumulated and the ledger no longer holds. Compacting would
+      // destroy history that is not the problem — roll the session instead.
+      rollProviderSession('provider-context-over-budget', pressure.reason);
+      return;
+    }
 
     // Claude reports its model on the first turn's init event, which may
     // RAISE the budget (1M-window models). Until that arrives — legacy
@@ -4885,91 +5176,57 @@ export async function runChat(options: ChatOptions): Promise<void> {
       return;
     }
 
-    const entries = ledger.listEntries();
-    const cutoff = Math.max(0, entries.length - AUTO_COMPACT_KEEP_RECENT_ENTRIES);
-    if (cutoff === 0) return; // only the protected tail remains — nothing to compact
-
-    compactionInFlight = true;
-    try {
-      const oldest = entries.slice(0, cutoff);
-      const chunk = oldest
-        .map((e) => `${e.role.toUpperCase()}${e.source ? ` [${e.source}]` : ''}: ${e.content}`)
-        .join('\n\n');
-      const before = ledger.totalTokens();
-      printEvent(
-        chalk.yellow(
-          `  ⛁ Context at ${formatTokenCount(before)} tok (> ${formatTokenCount(threshold)} threshold) — compacting (${reason})`
-        )
+    const outcome = await compactContextNow({
+      reason: `${reason}; ${pressure.reason}`,
+      actor: 'system',
+    });
+    // A compaction that could not shrink the ledger (a protected tail, a
+    // summarizer failure) must still roll a native session the provider says
+    // is over the window, or the next spawn resumes the same oversize session.
+    if (!outcome.ok && pressure.providerOver && activeBackendSessionId !== undefined) {
+      rollProviderSession(
+        'provider-context-over-budget',
+        `compaction did not shrink the ledger; ${pressure.reason}`
       );
-
-      try {
-        const turn = await runBackendTurn({
-          backend: runtime.backend,
-          agentId,
-          model: runtime.model,
-          effort: runtime.effort,
-          prompt: buildCompactionPrompt(chunk),
-          // Compaction is a backend turn like any other, so it goes through
-          // adapter.prepare() and would otherwise regenerate the default
-          // identity prompt — handing a nascent SB "You are nascent, call
-          // bootstrap" the moment its first conversation grew long enough to
-          // compact (Lumen, PR #485 — finding 2).
-          systemPromptOverride: runtime.systemPromptOverride,
-          // Summarization is governed like any other turn: token-flow (idle)
-          // is the reaper, with the 4h runaway backstop. An explicit
-          // --backend-timeout-seconds still caps it, floored at 5 min —
-          // summarizing a large chunk outlives short overrides.
-          timeoutMs: runtime.backendTurnTimeoutMs
-            ? Math.max(runtime.backendTurnTimeoutMs, 5 * 60 * 1000)
-            : undefined,
-          idleTimeoutMs: runtime.backendIdleTimeoutMs,
-          stream: true,
-        });
-        const summaryText = turn.success ? (turn.responseText ?? turn.stdout).trim() : '';
-        if (!summaryText) {
-          throw new Error(turn.stderr.trim().slice(0, 200) || `exit code ${turn.exitCode}`);
-        }
-
-        const summary = `[Conversation summary — compacted ${oldest.length} earlier entries]\n${summaryText}`;
-        const result = ledger.compactToSummary(summary, AUTO_COMPACT_KEEP_RECENT_ENTRIES);
-        // The compaction event is the COMPLETE new start state: summary plus
-        // the verbatim recent tail. The tail's original events precede this
-        // marker in the file, so hydration must get the tail from here —
-        // otherwise reattach would keep only the summary and lose the
-        // protected recent entries the live session still has.
-        const keptEntries = keptEntriesForCompaction(ledger);
-        appendTranscript(runtime.transcriptPath, {
-          type: 'compaction',
-          reason,
-          summary,
-          keptEntries,
-          removedCount: result.removedEntries.length,
-          removedTokens: result.removedTokens,
-          summaryTokens: result.summaryTokens,
-          totalAfter: result.totalAfter,
-        });
-        // Cutoff divider: everything above this line in the scrollback is
-        // now out of the context window (replaced by the summary).
-        printEvent(
-          renderContextCutoff(
-            `compacted ${result.removedEntries.length} entries · ${formatTokenCount(before)} → ${formatTokenCount(result.totalAfter)} tok`
-          )
-        );
-      } catch (error) {
-        const msg = error instanceof Error ? error.message : String(error);
-        printEvent(chalk.yellow(`  ⛁ Compaction summarization failed (${msg}) — hard-trimming`));
-        await trimContextToPercent(DEFAULT_TRIM_TARGET_PCT, `${reason} (compaction fallback)`);
-      }
-    } finally {
-      compactionInFlight = false;
-      // ink just rolled the ledger — roll the provider session too so the next
-      // turn seeds a fresh native session with the summary (we compact before
-      // the provider ever would). No-op when nothing was compacted: the early
-      // returns above never reach this block. Unconditional: for non-claude
-      // these are already undefined.
-      activeBackendSessionId = undefined;
-      activeBackendSessionShape = undefined;
     }
+  };
+
+  /**
+   * `compact_context` — the agent compacting its own window.
+   *
+   * Runs inside a tool iteration: the ledger rolls here, the continuation the
+   * loop sends next re-seeds the provider session from the compacted ledger
+   * (with the real tool results and the agent's own output so far), and the
+   * agent carries on from its summary. Its result is client-local, so it is
+   * never persisted back into the ledger it just compacted.
+   */
+  const runSbCompaction = async (
+    args: Record<string, unknown>,
+    ctx?: { signal?: AbortSignal }
+  ): Promise<PcpToolCallResult> => {
+    const asResult = (payload: Record<string, unknown>, isError = false): PcpToolCallResult => ({
+      content: [{ type: 'text', text: JSON.stringify(payload) }],
+      ...(isError ? { isError: true } : {}),
+    });
+    const parsed = parseCompactContextArgs(args);
+    if ('error' in parsed) return asResult({ success: false, error: parsed.error }, true);
+    const outcome = await compactContextNow({
+      reason: parsed.summary ? 'agent: own summary' : 'agent: runtime summary',
+      actor: 'sb',
+      summaryText: parsed.summary,
+      keepRecent: parsed.keepRecent,
+      signal: ctx?.signal,
+    });
+    if (!outcome.ok) return asResult({ success: false, error: outcome.error }, true);
+    return asResult({
+      success: true,
+      compacted: outcome.removed,
+      tokensFreed: outcome.freedTokens,
+      summaryTokens: outcome.summaryTokens,
+      totalAfter: outcome.totalAfter,
+      keptRecent: parsed.keepRecent ?? AUTO_COMPACT_KEEP_RECENT_ENTRIES,
+      note: 'Your context now starts from the summary; the provider session is re-seeded from it on the next spawn. Continue from here.',
+    });
   };
 
   // Poll gates (PR #385): interval ticks skip while a poll is in flight;
@@ -5568,6 +5825,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
         responseText: text,
         ...(result.stderr?.trim() ? { stderr: result.stderr.slice(0, 4000) } : {}),
       });
+      // Cost is the session's; the WINDOW is the clone's own. Its usage never
+      // becomes the parent's provider sample.
       if (result.usage) recordRunUsage(result.usage);
       return {
         success: result.success,
@@ -6146,7 +6405,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
             const decision = toolPolicy.inspectPcpTool(bareToolName(tool), runtime.sessionId);
             return !decision.allowed && !decision.promptable;
           },
-          head: (tool, args) => {
+          head: (tool, args, ctx) => {
             // spawn_agent is NOT a client-local policy bypass. Unlike ledger
             // tools it costs backend time and fans out authority, so it reaches
             // here only after executeToolCalls has cleared it through policy.
@@ -6156,11 +6415,18 @@ export async function runChat(options: ChatOptions): Promise<void> {
             if (bareToolName(tool) === COLLECT_AGENTS_TOOL) {
               return runCollectAgents(args);
             }
+            // The agent compacting its own window needs the host (summarizer
+            // turn, transcript event, provider-session roll) — answered here,
+            // before the generic client-local handler refuses it.
+            if (bareToolName(tool) === 'compact_context') {
+              return runSbCompaction(args, ctx);
+            }
             // Client-local tools (context management) are handled in-process.
             // An eviction's persistent refs arrive on the hook, not in the
             // result the model reads — see EvictionHooks (#571).
             if (isClientLocalTool(tool)) {
               return handleClientLocalTool(tool, args, ledger, globalSignalSink, {
+                providerUsage: () => providerContextMeasurement(),
                 onEvict: (eviction) =>
                   recordEviction(
                     'sb',
@@ -6293,7 +6559,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
             if (!isClientLocalTool(result.tool) && !isCloneHandoffTool(result.tool)) {
               ledger.addEntry(
                 'system',
-                compactForLedger(`local tool ${result.tool} -> ${resultJson}`, 500),
+                // A resolved failure is recorded as one (Lumen, PR #584 round 4).
+                compactForLedger(localToolLedgerLine(result.tool, result.result, resultJson), 500),
                 'local-tool'
               );
             }
@@ -6798,6 +7065,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         // REASSIGNS runResult — recording once at the end would silently drop
         // the first attempt (Lumen, PR #494 round 3).
         recordRunUsage(runResult.usage);
+        sampleProviderContext(runResult.usage);
 
         // If a resumed turn failed because the provider session vanished (jsonl
         // cleaned up / different machine), drop the live id so the NEXT turn seeds
@@ -6854,6 +7122,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           });
           endSpawn();
           recordRunUsage(runResult.usage);
+          sampleProviderContext(runResult.usage);
         }
 
         sbDebugLog(
@@ -6990,6 +7259,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
       lastRunResult = contResult;
       recordRunUsage(contResult.usage);
+      sampleProviderContext(contResult.usage);
       noteSpawn(contResult, ledgerIdBeforeSpawn, generationBeforeSpawn);
       return contResult;
     };
@@ -7099,15 +7369,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // which only ever held the sanitized text. The marker keeps a later
     // process from recovering the poisoned id (findLastBackendSession).
     if (loopResult.protocolViolations.some((v) => !v.corrected) && activeBackendSessionId) {
-      appendTranscript(runtime.transcriptPath, {
-        type: 'backend_session_invalidated',
-        id: activeBackendSessionId,
-        reason: 'uncorrected-protocol-violation',
-      });
-      activeBackendSessionId = undefined;
-      activeBackendSessionShape = undefined;
-      printEvent(
-        chalk.yellow('  ⛁ provider session rolled — an imitated results frame went uncorrected')
+      rollProviderSession(
+        'uncorrected-protocol-violation',
+        'an imitated results frame went uncorrected'
       );
     }
 
@@ -7140,7 +7404,6 @@ export async function runChat(options: ChatOptions): Promise<void> {
         usage: runResult.usage || null,
       });
     }
-    lastBackendUsage = runResult.usage;
 
     // ── Fire turn_end hooks (passive recall, etc.) ──
     hookTurnCount++;
@@ -7148,6 +7411,61 @@ export async function runChat(options: ChatOptions): Promise<void> {
       ? estimateTokens(runtime.bootstrapContext)
       : 0;
     const turnEndEffectiveBudget = Math.max(1, runtime.maxContextTokens - turnEndBootstrapReserve);
+
+    // ── Automatic clearing of consumed tool results (task 2cef5780) ──
+    // A tool result is read once, in the continuation that follows the call;
+    // afterwards it is a 500-char bookkeeping line that stays for the whole
+    // session. Results older than the protected recent turns are cleared at
+    // the turn boundary once they outgrow the threshold — the same persistent
+    // eviction every actor uses, so replay reproduces it, plus one tombstone.
+    // Thresholded because every eviction rolls the provider session; a small
+    // sweep is not worth a reseed. Never during a compaction, never on an
+    // aborted turn.
+    if (!isAbortedTurn && !compactionInFlight) {
+      const sweep = selectConsumedToolResults(ledger.listEntries(), {
+        keepRecentTurns: AUTO_EVICT_KEEP_RECENT_TURNS,
+        minTokens: Math.max(
+          AUTO_EVICT_MIN_TOKENS,
+          Math.floor(turnEndEffectiveBudget * AUTO_EVICT_MIN_SHARE)
+        ),
+      });
+      if (sweep) {
+        const removed = ledger.evictEntries(sweep.ids);
+        recordEviction(
+          'system',
+          `auto: ${sweep.ids.length} consumed tool results older than ${AUTO_EVICT_KEEP_RECENT_TURNS} turns`,
+          removed.removedTokens,
+          removed.removedEntries.map((e) => ({
+            ...(e.eid !== undefined ? { eid: e.eid } : {}),
+            hash: entryRefHash(e.role, e.content),
+            role: e.role,
+            source: e.source,
+            preview: e.content.slice(0, 100),
+          }))
+        );
+        // The tombstone is persisted as its own event so a reattached process
+        // gets the notice too — tool results are not reconstructed into the
+        // ledger on replay, and without this the gap had no explanation
+        // (Lumen, PR #584).
+        const tombstone = autoEvictTombstone(sweep, AUTO_EVICT_KEEP_RECENT_TURNS);
+        const noteEid = appendTranscript(runtime.transcriptPath, {
+          type: 'context_note',
+          source: AUTO_EVICT_TOMBSTONE_SOURCE,
+          content: tombstone,
+        });
+        ledger.addEntry(
+          'system',
+          tombstone,
+          AUTO_EVICT_TOMBSTONE_SOURCE,
+          typeof noteEid === 'number' ? noteEid : undefined
+        );
+        printEvent(
+          chalk.dim(
+            `  🗑 auto-cleared ${sweep.ids.length} consumed tool results (${formatTokenCount(removed.removedTokens)} tok) — ${sweep.tools.join(', ')}`
+          )
+        );
+      }
+    }
 
     hookRegistry
       .fire('turn_end', {
@@ -9153,7 +9471,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
             ledger,
             runtime.maxContextTokens,
             lastUsageTotal,
-            lastBackendUsage,
+            providerSample.latest()?.usage,
             runtime.backendTokenWindow
           );
           lastUsageTotal = usage.total;

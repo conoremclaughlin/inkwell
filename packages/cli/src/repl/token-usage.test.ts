@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { extractBackendTokenUsage, formatBackendTokenUsage } from './token-usage.js';
+import {
+  extractBackendTokenUsage,
+  formatBackendTokenUsage,
+  providerContextTokens,
+} from './token-usage.js';
 
 describe('extractBackendTokenUsage', () => {
   it('parses JSON usage payloads', () => {
@@ -125,5 +129,64 @@ describe('Gemini usage fields (Lumen, PR #576 round 6)', () => {
     expect(usage?.inputTokens).toBe(90_000);
     expect(usage?.reasoningTokens).toBe(2_000);
     expect(usage?.totalTokens).toBe(92_500);
+  });
+});
+
+describe('providerContextTokens — the context a request was handed, per backend (Lumen, PR #583)', () => {
+  it('Anthropic reports cache reads and writes DISJOINT from input, so they sum', () => {
+    expect(
+      providerContextTokens('claude', {
+        inputTokens: 1_000,
+        cacheReadTokens: 500_000,
+        cacheWriteTokens: 40_000,
+      })
+    ).toBe(541_000);
+  });
+
+  it('OpenAI input_tokens already includes cached_tokens — never double-counted', () => {
+    const usage = extractBackendTokenUsage(
+      'codex',
+      JSON.stringify({
+        usage: {
+          input_tokens: 120_000,
+          output_tokens: 300,
+          prompt_tokens_details: { cached_tokens: 100_000 },
+        },
+      }),
+      ''
+    );
+    expect(usage?.cacheReadTokens).toBe(100_000);
+    expect(usage?.contextTokens).toBe(120_000);
+    expect(usage?.contextParts).toEqual({ inputTokens: 120_000, cacheReadTokens: 100_000 });
+  });
+
+  it('Gemini promptTokenCount already includes the cache', () => {
+    const usage = extractBackendTokenUsage(
+      'gemini',
+      JSON.stringify({ usage: { promptTokenCount: 90_000, candidatesTokenCount: 50 } }),
+      ''
+    );
+    expect(usage?.contextTokens).toBe(90_000);
+  });
+
+  it('a Claude report parsed from stdout sums the same way the stream parser does', () => {
+    const usage = extractBackendTokenUsage(
+      'claude',
+      JSON.stringify({
+        usage: {
+          input_tokens: 1_000,
+          output_tokens: 10,
+          cache_read_tokens: 500_000,
+          cache_write_tokens: 40_000,
+        },
+      }),
+      ''
+    );
+    expect(usage?.contextTokens).toBe(541_000);
+  });
+
+  it('is absent when nothing about the input was reported', () => {
+    expect(providerContextTokens('claude', {})).toBeUndefined();
+    expect(providerContextTokens('codex', { cacheReadTokens: 5 })).toBeUndefined();
   });
 });

@@ -125,15 +125,30 @@ export class ContextLedger {
    * live entries — identical role+content duplicates match together).
    */
   public findEntriesByRefs(refs: Array<{ eid?: number; hash?: string }>): number[] {
-    const eids = new Set(refs.map((r) => r.eid).filter((v): v is number => typeof v === 'number'));
-    const hashes = new Set(
-      refs.filter((r) => r.eid === undefined && typeof r.hash === 'string').map((r) => r.hash)
+    // Three kinds of ref, three rules. A ref that carries a hash ENFORCES it:
+    // an eid can name two different entries (a compaction's kept tail and a
+    // later event both hydrate with it), so matching by eid alone whenever
+    // one was present turned a hash-selected eviction back into an eid
+    // eviction on replay — the neighbour went with the target (Lumen, PR
+    // #582). Eid-only refs keep their legacy behaviour; hash-only refs match
+    // by content wherever it sits.
+    const eidOnly = new Set(
+      refs.filter((r) => typeof r.eid === 'number' && typeof r.hash !== 'string').map((r) => r.eid!)
     );
+    const hashOnly = new Set(
+      refs
+        .filter((r) => typeof r.eid !== 'number' && typeof r.hash === 'string')
+        .map((r) => r.hash!)
+    );
+    const both = refs.filter((r) => typeof r.eid === 'number' && typeof r.hash === 'string');
     const ids: number[] = [];
     for (const entry of this.entries) {
-      if (entry.eid !== undefined && eids.has(entry.eid)) {
+      const hash = entryRefHash(entry.role, entry.content);
+      if (entry.eid !== undefined && eidOnly.has(entry.eid)) {
         ids.push(entry.id);
-      } else if (hashes.size > 0 && hashes.has(entryRefHash(entry.role, entry.content))) {
+      } else if (hashOnly.has(hash)) {
+        ids.push(entry.id);
+      } else if (both.some((r) => r.eid === entry.eid && r.hash === hash)) {
         ids.push(entry.id);
       }
     }
@@ -301,6 +316,61 @@ export class ContextLedger {
   }
 
   /**
+   * Replace EXACTLY these entries with one summary entry, wherever they now
+   * sit. The summary takes the place of the first of them; everything else —
+   * including entries appended after the caller chose the set — survives in
+   * order.
+   *
+   * compactToSummary recomputes its cutoff from the live ledger, so a caller
+   * that snapshots the oldest entries, awaits a summarizer, and then compacts
+   * by COUNT removes whatever is oldest at that moment: an entry appended
+   * during the await pushed a protected tail entry into the removed set even
+   * though the summarizer never saw it (Lumen, PR #578). Compacting by id
+   * makes the removed set the summarized set, whatever happened meanwhile.
+   */
+  public compactEntriesToSummary(
+    entryIds: readonly number[],
+    summary: string,
+    source = 'compaction'
+  ): LedgerCompactResult {
+    const idSet = new Set(entryIds);
+    const removedEntries = this.entries.filter((entry) => idSet.has(entry.id));
+    const removedTokens = removedEntries.reduce((sum, entry) => sum + entry.approxTokens, 0);
+    const survivors = this.entries.filter((entry) => !idSet.has(entry.id));
+    const firstRemovedIndex = this.entries.findIndex((entry) => idSet.has(entry.id));
+    const insertAt =
+      firstRemovedIndex === -1
+        ? 0
+        : this.entries.slice(0, firstRemovedIndex).filter((entry) => !idSet.has(entry.id)).length;
+
+    const summaryEntry: LedgerEntry = {
+      id: this.entrySeq++,
+      role: 'system',
+      content: summary,
+      source,
+      createdAt: new Date().toISOString(),
+      approxTokens: estimateTokens(summary),
+    };
+
+    const before = this.entries;
+    const after = [...survivors.slice(0, insertAt), summaryEntry, ...survivors.slice(insertAt)];
+    // Bookmarks on removed entries are gone; survivors follow their entry.
+    this.bookmarks = this.bookmarks.flatMap((bookmark) => {
+      const target = before[bookmark.entryIndex];
+      if (!target || idSet.has(target.id)) return [];
+      return [{ ...bookmark, entryIndex: after.indexOf(target) }];
+    });
+    this.entries = after;
+
+    return {
+      removedEntries,
+      removedTokens,
+      summaryTokens: summaryEntry.approxTokens,
+      totalAfter: this.totalTokens(),
+    };
+  }
+
+  /**
    * Evict specific entries by ID. Unlike eject (positional) or trim (oldest-first),
    * this removes arbitrary entries — enabling the SB to surgically drop irrelevant
    * context while preserving everything else.
@@ -362,6 +432,8 @@ export class ContextLedger {
    */
   public summarizeEntries(): Array<{
     id: number;
+    /** Durable, content-addressed handle — see entryRefHash. */
+    ref: string;
     role: LedgerRole;
     source?: string;
     approxTokens: number;
@@ -370,6 +442,7 @@ export class ContextLedger {
   }> {
     return this.entries.map((e) => ({
       id: e.id,
+      ref: entryRefHash(e.role, e.content),
       role: e.role,
       source: e.source,
       approxTokens: e.approxTokens,

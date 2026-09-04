@@ -74,7 +74,12 @@ export function clearLastSignal(): void {
 }
 
 /** Tool names that are handled client-locally, not forwarded to PCP */
-export const CLIENT_LOCAL_TOOLS = new Set(['list_context', 'evict_context', 'signal_status']);
+export const CLIENT_LOCAL_TOOLS = new Set([
+  'list_context',
+  'evict_context',
+  'compact_context',
+  'signal_status',
+]);
 
 export function isClientLocalTool(toolName: string): boolean {
   return CLIENT_LOCAL_TOOLS.has(toolName);
@@ -106,6 +111,42 @@ export interface EvictionHooks {
     tokensFreed: number;
     refs: EvictRef[];
   }): void;
+  /**
+   * What the provider last reported it was asked to read: the window as
+   * BILLED, not as estimated. The ledger's totals are a characters-per-token
+   * guess over what ink packed; a resumed native session also carries what
+   * the provider itself accumulated. Myra's list_context said 297K of 300K
+   * while the API said 541K (task 9cf538a2). Both numbers are shown; the
+   * larger is the one the model actually occupies.
+   */
+  providerUsage?(): ProviderContextMeasurement | undefined;
+}
+
+export interface ProviderContextMeasurement {
+  /**
+   * The context the last provider request was handed — normalized per backend
+   * at the adapter boundary (BackendTokenUsage.contextTokens), never summed here.
+   */
+  contextTokens: number;
+  inputTokens?: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  model?: string;
+  /** When that request happened (ISO). */
+  measuredAt?: string;
+}
+
+/**
+ * The context size to reason with: the provider's own measurement when it is
+ * larger than the estimate (it counts what the estimate cannot see — the
+ * identity envelope, the native session's own accumulation), else the
+ * estimate. Pure so the budget check and the tool agree.
+ */
+export function effectiveContextTokens(
+  estimatedTokens: number,
+  measured: ProviderContextMeasurement | undefined
+): number {
+  return Math.max(estimatedTokens, measured?.contextTokens ?? 0);
 }
 
 /**
@@ -121,14 +162,93 @@ export function handleClientLocalTool(
 ): PcpToolCallResult | null {
   switch (tool) {
     case 'list_context':
-      return handleListContext(args, ledger);
+      return handleListContext(args, ledger, hooks);
     case 'evict_context':
       return handleEvictContext(args, ledger, hooks);
+    case 'compact_context':
+      // Compaction needs the host: a summarizer turn, the transcript event,
+      // and the provider-session roll. The REPL intercepts this name before
+      // reaching here; anywhere else (a shadow clone's throwaway ledger) it
+      // is honestly unavailable rather than silently a no-op.
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              success: false,
+              error:
+                'compact_context is not available in this context (a shadow clone cannot compact; report what you found and let your parent act on it).',
+            }),
+          },
+        ],
+        isError: true,
+      };
     case 'signal_status':
       return handleSignalStatus(args, signalSink);
     default:
       return null;
   }
+}
+
+// ─── compact_context ────────────────────────────────────────────
+
+/** Ceiling on an agent-written compaction summary. */
+export const COMPACT_CONTEXT_SUMMARY_MAX_CHARS = 20_000;
+/** Ceiling on the protected recent tail an agent may ask to keep verbatim. */
+export const COMPACT_CONTEXT_MAX_KEEP_RECENT = 200;
+
+/**
+ * A compaction must leave the window smaller than it found it. An agent may
+ * replace one tiny entry with a 20K-character "summary" and be told it
+ * compacted; the provider session would then roll for a rewrite that grew
+ * the context (Lumen, PR #578). Refused, and the refusal says by how much.
+ */
+export function compactionShrinks(removedTokens: number, summaryTokens: number): boolean {
+  return summaryTokens < removedTokens;
+}
+
+export interface CompactContextArgs {
+  /** The agent's own brief. Absent means the runtime summarizes. */
+  summary?: string;
+  /** Entries kept verbatim after the summary. Absent means the runtime default. */
+  keepRecent?: number;
+}
+
+/**
+ * Validate a `compact_context` call. Pure, so the shape the runtime accepts
+ * is testable without the host.
+ *
+ * The agent writing its own summary is the preferred path — it knows which
+ * decisions, identifiers and open threads matter, and it costs no summarizer
+ * turn. Omitting it asks the runtime to summarize the oldest entries the
+ * same way auto-compaction does.
+ */
+export function parseCompactContextArgs(
+  args: Record<string, unknown>
+): CompactContextArgs | { error: string } {
+  const out: CompactContextArgs = {};
+  if (args.summary !== undefined) {
+    if (typeof args.summary !== 'string') return { error: 'summary must be a string' };
+    const summary = args.summary.trim();
+    if (!summary) return { error: 'summary is empty — omit it to have the runtime summarize' };
+    if (summary.length > COMPACT_CONTEXT_SUMMARY_MAX_CHARS) {
+      return {
+        error: `summary is ${summary.length} chars; the ceiling is ${COMPACT_CONTEXT_SUMMARY_MAX_CHARS} — a compaction summary should be a dense brief, not the transcript`,
+      };
+    }
+    out.summary = summary;
+  }
+  if (args.keepRecent !== undefined) {
+    const n = args.keepRecent;
+    if (typeof n !== 'number' || !Number.isFinite(n) || n < 0) {
+      return { error: 'keepRecent must be a non-negative number' };
+    }
+    if (n > COMPACT_CONTEXT_MAX_KEEP_RECENT) {
+      return { error: `keepRecent must be at most ${COMPACT_CONTEXT_MAX_KEEP_RECENT}` };
+    }
+    out.keepRecent = Math.floor(n);
+  }
+  return out;
 }
 
 // ─── list_context ───────────────────────────────────────────────
@@ -167,10 +287,14 @@ function intArg(value: unknown, fallback: number, min: number, max: number): num
  */
 function handleListContext(
   args: Record<string, unknown>,
-  ledger: ContextLedger
+  ledger: ContextLedger,
+  hooks: EvictionHooks = {}
 ): PcpToolCallResult {
   const all = ledger.summarizeEntries();
   const totalTokens = ledger.totalTokens();
+  const measured = hooks.providerUsage?.();
+  const effectiveTokens = effectiveContextTokens(totalTokens, measured);
+  const divergent = measured !== undefined && measured.contextTokens > totalTokens * 1.25;
   const bookmarks = ledger.listBookmarks();
 
   // Group by source for a quick breakdown — over EVERYTHING, not the page.
@@ -208,7 +332,16 @@ function handleListContext(
         text: JSON.stringify({
           success: true,
           totalEntries: all.length,
+          /** ink's estimate of what it packed (chars ÷ 4). */
           totalTokens,
+          /** The number to reason with: the larger of the estimate and the provider's measurement. */
+          effectiveTokens,
+          ...(measured !== undefined ? { providerMeasured: measured } : {}),
+          ...(divergent
+            ? {
+                accountingNote: `The provider last read ~${measured!.contextTokens.toLocaleString()} tokens of context; ink's estimate of the ledger is ~${totalTokens.toLocaleString()}. The larger number is the window you occupy: the estimate cannot see the identity envelope or what the native session accumulated. Budget against effectiveTokens.`,
+              }
+            : {}),
           bySource,
           bookmarkCount: bookmarks.length,
           ...(bookmarks.length > LIST_CONTEXT_BOOKMARK_LIMIT
@@ -240,8 +373,14 @@ function handleListContext(
                 note: `${remaining} more matching entries not shown — page with offset ${offset + page.length}, narrow with source/role/minTokens, or sort by "largest" to find what is worth evicting. Evicting by source or role does not require listing the entries.`,
               }
             : {}),
+          // `ref` is the address: a content hash that survives reattach and
+          // eviction. The process ordinal is deliberately NOT shown — it
+          // renumbers on reattach, so a link or an evict captured against it
+          // could resolve to DIFFERENT content later, which reads as correct
+          // (Myra, 2026-09-03; #570). `entryIds` stays accepted for callers
+          // that still hold one.
           entries: page.map((e) => ({
-            id: e.id,
+            ref: e.ref,
             role: e.role,
             source: e.source,
             tokens: e.approxTokens,
@@ -264,11 +403,14 @@ function handleEvictContext(
   ledger: ContextLedger,
   hooks: EvictionHooks
 ): PcpToolCallResult {
+  const refs = Array.isArray(args.refs)
+    ? (args.refs as unknown[]).filter((r): r is string => typeof r === 'string')
+    : undefined;
   const entryIds = args.entryIds as number[] | undefined;
   const source = args.source as string | undefined;
   const role = args.role as string | undefined;
 
-  if (!entryIds && !source && !role) {
+  if (!refs && !entryIds && !source && !role) {
     return {
       content: [
         {
@@ -276,7 +418,7 @@ function handleEvictContext(
           text: JSON.stringify({
             success: false,
             error:
-              'Provide at least one filter: entryIds (number[]), source (string), or role (string)',
+              'Provide at least one filter: refs (string[] — the ref values from list_context), entryIds (number[]), source (string), or role (string)',
           }),
         },
       ],
@@ -286,7 +428,13 @@ function handleEvictContext(
 
   let result: LedgerEvictResult;
 
-  if (entryIds && Array.isArray(entryIds)) {
+  if (refs) {
+    // Hash-addressed: the durable handle list_context hands out. Resolved
+    // against the live ledger at this moment, so a ref captured before an
+    // earlier eviction still names the same content or nothing at all —
+    // never a neighbour that inherited its position.
+    result = ledger.evictEntries(ledger.findEntriesByRefs(refs.map((hash) => ({ hash }))));
+  } else if (entryIds && Array.isArray(entryIds)) {
     result = ledger.evictEntries(entryIds);
   } else if (source) {
     result = ledger.evictBySource(source);
@@ -334,7 +482,7 @@ function handleEvictContext(
           tokensFreed: result.removedTokens,
           totalAfter: result.totalAfter,
           removedPreviews: previews.map((e) => ({
-            id: e.id,
+            ref: entryRefHash(e.role, e.content),
             role: e.role,
             source: e.source,
             tokens: e.approxTokens,

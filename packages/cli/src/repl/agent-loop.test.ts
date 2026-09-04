@@ -7,6 +7,7 @@ import {
   extractLocalToolCalls,
   findImitatedToolResults,
   hasUnseenFailure,
+  isErrorPayload,
   isPotentialImitationPrefix,
   resolveResponseText,
   runAgentLoop,
@@ -1475,6 +1476,45 @@ describe('runAgentLoop — the relay budget is asked of the host per iteration (
     expect(asked).toBe(1);
     expect(harness.prompts[1].body.length).toBeLessThanOrEqual(9_000 + 800);
     expect(harness.prompts[1].body).toContain('[ink: result truncated');
+  });
+});
+
+describe('a declared error beside a terminal signal (Lumen, PR #578)', () => {
+  const errorResult = {
+    content: [{ type: 'text', text: '{"success":false,"error":"nothing to compact"}' }],
+    isError: true,
+  };
+
+  it('hasUnseenFailure sees an executed result whose payload declares an error', () => {
+    expect(hasUnseenFailure([{ status: 'executed', result: errorResult }])).toBe(true);
+    expect(hasUnseenFailure([{ status: 'executed', result: { content: [] } }])).toBe(false);
+    expect(isErrorPayload(errorResult)).toBe(true);
+    expect(isErrorPayload('plain string')).toBe(false);
+  });
+
+  it('REGRESSION: compact_context refused + signal_status(completed) in one iteration still reaches the model', async () => {
+    const harness = makePorts(
+      [
+        outcome({
+          responseText: `${inkTool('compact_context', { summary: 'x' })}\n${inkTool('signal_status', { status: 'completed' })}`,
+        }),
+        outcome({ responseText: 'Understood — compaction was refused.' }),
+      ],
+      (calls) =>
+        calls.map((c) =>
+          c.tool === 'compact_context'
+            ? { tool: c.tool, result: errorResult, status: 'executed' }
+            : { tool: c.tool, result: signalResult('completed'), status: 'executed' }
+        )
+    );
+    const result = await runAgentLoop({ prompt: 'go', toolRouting: 'local' }, harness.ports);
+    expect(result.stopReason).toBe('terminal-signal');
+    // The terminal stop still wins, but the refusal is relayed in a final,
+    // non-extracted round instead of vanishing behind the signal.
+    expect(harness.prompts).toHaveLength(2);
+    expect(harness.prompts[1].body).toContain('[Tool results from previous turn — FINAL]');
+    expect(harness.prompts[1].body).toContain('nothing to compact');
+    expect(harness.executed).toHaveLength(1);
   });
 });
 

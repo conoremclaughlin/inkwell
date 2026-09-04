@@ -1,3 +1,9 @@
+export interface ContextParts {
+  inputTokens?: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+}
+
 export interface BackendTokenUsage {
   backend: string;
   inputTokens?: number;
@@ -6,6 +12,20 @@ export interface BackendTokenUsage {
   cacheReadTokens?: number;
   cacheWriteTokens?: number;
   reasoningTokens?: number;
+  /**
+   * The context this request was handed, normalized per backend at the
+   * adapter boundary. Anthropic bills input, cache reads and cache writes as
+   * three disjoint parts of one prompt, so they sum; OpenAI's input_tokens and
+   * Gemini's promptTokenCount already include their cached portion, so adding
+   * cacheReadTokens there would double-count (Lumen, PR #583 finding 2).
+   */
+  contextTokens?: number;
+  /**
+   * The parts `contextTokens` was computed from — the FINAL request's own
+   * input / cache read / cache write. Kept apart from the top-level fields,
+   * which for an agent run are the run's aggregate (Lumen, PR #583 round 3).
+   */
+  contextParts?: ContextParts;
   source: 'json' | 'text';
   /**
    * Per-model breakdown as the backend reported it, keyed exactly as reported.
@@ -236,6 +256,27 @@ function parseTextUsage(text: string): Omit<BackendTokenUsage, 'backend' | 'sour
   };
 }
 
+/** Backends whose prompt caching is reported as parts DISJOINT from input. */
+const SUMMED_CACHE_BACKENDS = new Set(['claude', 'anthropic']);
+
+/**
+ * The context a request was handed, per that backend's own accounting.
+ * Anthropic: input + cache read + cache write (disjoint parts of one prompt).
+ * Everyone else (OpenAI, Gemini): input already includes the cached portion.
+ */
+export function providerContextTokens(
+  backend: string,
+  usage: Pick<BackendTokenUsage, 'inputTokens' | 'cacheReadTokens' | 'cacheWriteTokens'>
+): number | undefined {
+  if (SUMMED_CACHE_BACKENDS.has(backend.toLowerCase())) {
+    const parts = [usage.inputTokens, usage.cacheReadTokens, usage.cacheWriteTokens].filter(
+      (n): n is number => n !== undefined
+    );
+    return parts.length > 0 ? parts.reduce((a, b) => a + b, 0) : undefined;
+  }
+  return usage.inputTokens;
+}
+
 export function extractBackendTokenUsage(
   backend: string,
   stdout: string,
@@ -245,24 +286,22 @@ export function extractBackendTokenUsage(
   if (!combined) return undefined;
 
   const jsonUsage = parseJsonUsage(combined);
-  if (jsonUsage) {
-    return {
-      backend,
-      source: 'json',
-      ...jsonUsage,
-    };
-  }
+  const parsed: BackendTokenUsage | undefined = jsonUsage
+    ? { backend, source: 'json', ...jsonUsage }
+    : (() => {
+        const textUsage = parseTextUsage(combined);
+        return textUsage ? { backend, source: 'text', ...textUsage } : undefined;
+      })();
+  if (!parsed) return undefined;
 
-  const textUsage = parseTextUsage(combined);
-  if (textUsage) {
-    return {
-      backend,
-      source: 'text',
-      ...textUsage,
-    };
-  }
-
-  return undefined;
+  // A buffered report is one usage object, so its parts are the request's.
+  const parts: ContextParts = {
+    ...(parsed.inputTokens !== undefined ? { inputTokens: parsed.inputTokens } : {}),
+    ...(parsed.cacheReadTokens !== undefined ? { cacheReadTokens: parsed.cacheReadTokens } : {}),
+    ...(parsed.cacheWriteTokens !== undefined ? { cacheWriteTokens: parsed.cacheWriteTokens } : {}),
+  };
+  const contextTokens = providerContextTokens(backend, parts);
+  return contextTokens === undefined ? parsed : { ...parsed, contextTokens, contextParts: parts };
 }
 
 export function formatBackendTokenUsage(usage: BackendTokenUsage): string {

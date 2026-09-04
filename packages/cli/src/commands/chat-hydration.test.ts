@@ -392,6 +392,202 @@ describe('hydrateLedgerFromTranscript — compaction events', () => {
   });
 });
 
+describe('hydrateLedgerFromTranscript — a hash-selected eviction replays as itself (Lumen, PR #582)', () => {
+  let dir: string;
+  let transcriptPath: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'ink-evict-ref-test-'));
+    transcriptPath = join(dir, 'session-test.jsonl');
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('REGRESSION: two hydrated entries share an eid; the persisted eid+hash ref evicts only the hashed one', () => {
+    // A compaction's kept tail and a later event can both hydrate with the
+    // same eid. The SB evicted `target` by ref; the hook persisted
+    // { eid, hash }. Replay must not take `neighbour` with it.
+    writeFileSync(
+      transcriptPath,
+      [
+        { eid: 7, type: 'user', content: 'target' },
+        { eid: 7, type: 'user', content: 'neighbour' },
+        {
+          eid: 8,
+          type: 'context_evict',
+          actor: 'sb',
+          reason: 'by ref',
+          refs: [{ eid: 7, hash: entryRefHash('user', 'target') }],
+        },
+      ]
+        .map((e) => JSON.stringify(e))
+        .join('\n') + '\n'
+    );
+    const ledger = new ContextLedger();
+    hydrateLedgerFromTranscript(ledger, transcriptPath);
+    expect(ledger.listEntries().map((e) => e.content)).toEqual(['neighbour']);
+  });
+});
+
+describe('hydrateLedgerFromTranscript — the provider sample survives a process boundary (Lumen, PR #583 round 2)', () => {
+  let dir: string;
+  let transcriptPath: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'ink-sample-test-'));
+    transcriptPath = join(dir, 'session-test.jsonl');
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const write = (events: Array<Record<string, unknown>>) =>
+    writeFileSync(transcriptPath, events.map((e) => JSON.stringify(e)).join('\n') + '\n');
+  const sample = {
+    type: 'provider_sample',
+    at: '2026-09-03T20:00:00.000Z',
+    backend: 'claude',
+    model: 'claude-opus-5',
+    backendSessionId: 'sess-1',
+    envelopeShape: 'shape-a',
+    contextTokens: 541_000,
+    inputTokens: 1_000,
+    cacheReadTokens: 500_000,
+    cacheWriteTokens: 40_000,
+  };
+
+  it('replays the last sample under the scope it was taken in', () => {
+    write([
+      { type: 'user', content: 'hi' },
+      sample,
+      { type: 'assistant', content: 'ok', backend: 'claude' },
+    ]);
+    const result = hydrateLedgerFromTranscript(new ContextLedger(), transcriptPath);
+    expect(result.providerSample).toEqual({
+      at: '2026-09-03T20:00:00.000Z',
+      scope: {
+        backend: 'claude',
+        model: 'claude-opus-5',
+        backendSessionId: 'sess-1',
+        envelopeShape: 'shape-a',
+      },
+      contextTokens: 541_000,
+      inputTokens: 1_000,
+      cacheReadTokens: 500_000,
+      cacheWriteTokens: 40_000,
+    });
+  });
+
+  it.each([
+    ['context_evict', { type: 'context_evict', refs: [] }],
+    ['context_trim', { type: 'context_trim', reason: 'x' }],
+    ['compaction', { type: 'compaction', summary: 's', keptEntries: [] }],
+    ['backend_session_invalidated', { type: 'backend_session_invalidated', id: 'sess-1' }],
+  ])('a %s after the sample drops it — the window it measured is gone', (_t, event) => {
+    write([sample, event]);
+    expect(
+      hydrateLedgerFromTranscript(new ContextLedger(), transcriptPath).providerSample
+    ).toBeUndefined();
+  });
+
+  it('REGRESSION (Lumen, round 3): a newer report with no usable measurement is a tombstone — valid → unknown → nothing', () => {
+    write([
+      sample,
+      {
+        type: 'provider_sample',
+        at: '2026-09-03T20:01:00.000Z',
+        backend: 'claude',
+        model: 'claude-opus-5',
+        backendSessionId: 'sess-1',
+        envelopeShape: 'shape-a',
+        unknown: true,
+      },
+    ]);
+    expect(
+      hydrateLedgerFromTranscript(new ContextLedger(), transcriptPath).providerSample
+    ).toBeUndefined();
+  });
+
+  it('a later sample replaces an earlier one; a malformed one is ignored', () => {
+    write([sample, { ...sample, contextTokens: 600_000 }]);
+    expect(
+      hydrateLedgerFromTranscript(new ContextLedger(), transcriptPath).providerSample?.contextTokens
+    ).toBe(600_000);
+    write([{ type: 'provider_sample', backend: 'claude' }]);
+    expect(
+      hydrateLedgerFromTranscript(new ContextLedger(), transcriptPath).providerSample
+    ).toBeUndefined();
+  });
+});
+
+describe('hydrateLedgerFromTranscript — a persisted context note survives reattach (PR #584)', () => {
+  let dir: string;
+  let transcriptPath: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'ink-note-test-'));
+    transcriptPath = join(dir, 'session-test.jsonl');
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('stays hidden from the replay preview when it rides a compaction kept tail (Lumen, round 3)', () => {
+    writeFileSync(
+      transcriptPath,
+      [
+        { eid: 1, type: 'user', content: 'q' },
+        {
+          eid: 2,
+          type: 'compaction',
+          summary: 'the summary',
+          keptEntries: [
+            {
+              role: 'system',
+              content:
+                '[2 earlier tool results were cleared … write calls that RAN (send_response)]',
+              source: 'auto-evict',
+            },
+            { role: 'assistant', content: 'kept answer', source: 'claude' },
+          ],
+        },
+      ]
+        .map((e) => JSON.stringify(e))
+        .join('\n') + '\n'
+    );
+    const ledger = new ContextLedger();
+    const result = hydrateLedgerFromTranscript(ledger, transcriptPath);
+    // In the window (the model needs it) …
+    expect(ledger.listEntries().some((e) => e.source === 'auto-evict')).toBe(true);
+    // … but never a visible system message in the scrollback replay — the
+    // same classification a direct replay gets.
+    expect(result.tailPreview.some((p) => p.content.includes('tool results were cleared'))).toBe(
+      false
+    );
+    expect(result.tailPreview.some((p) => p.content.includes('kept answer'))).toBe(true);
+  });
+
+  it('replays the auto-evict tombstone as the system entry it was live', () => {
+    writeFileSync(
+      transcriptPath,
+      [
+        { eid: 1, type: 'user', content: 'hello' },
+        { eid: 2, type: 'assistant', content: 'hi', backend: 'claude' },
+        {
+          eid: 3,
+          type: 'context_note',
+          source: 'auto-evict',
+          content: '[3 earlier tool results were cleared … those calls ALREADY HAPPENED]',
+        },
+      ]
+        .map((e) => JSON.stringify(e))
+        .join('\n') + '\n'
+    );
+    const ledger = new ContextLedger();
+    hydrateLedgerFromTranscript(ledger, transcriptPath);
+    const note = ledger.listEntries().find((e) => e.source === 'auto-evict');
+    expect(note?.content).toContain('ALREADY HAPPENED');
+    expect(note?.eid).toBe(3);
+  });
+});
+
 describe('hydrateLedgerFromTranscript — context_evict events', () => {
   let dir: string;
   let transcriptPath: string;
