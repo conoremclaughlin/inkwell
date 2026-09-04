@@ -1,8 +1,13 @@
+import { readFileSync } from 'fs';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
 import { describe, it, expect } from 'vitest';
 import { ContextLedger } from './context-ledger.js';
 import {
   autoEvictTombstone,
+  isSemanticFailure,
   isWriteSideTool,
+  localToolLedgerLine,
   selectConsumedToolResults,
   LOCAL_TOOL_RESULT_SOURCE,
 } from './auto-evict.js';
@@ -97,6 +102,9 @@ describe('the tombstone never claims a write happened when it did not, and never
     'update_memory',
     'create_task',
     'send_email',
+    'edit',
+    'write',
+    'bash',
     'evict_context',
     'compact_context',
     'signal_status',
@@ -121,6 +129,11 @@ describe('the tombstone never claims a write happened when it did not, and never
     'get_session',
     'bootstrap',
     'mcp__inkwell__list_emails',
+    // Pi's in-process coding reads (Lumen, round 4).
+    'read',
+    'grep',
+    'find',
+    'ls',
   ])('%s is read-side', (tool) => {
     expect(isWriteSideTool(tool)).toBe(false);
   });
@@ -168,5 +181,70 @@ describe('the tombstone never claims a write happened when it did not, and never
     expect(note).not.toMatch(/send_email[^;]*(stand|do not repeat)/);
     expect(note).not.toMatch(/remember[^;]*(stand|do not repeat)/);
     expect(note).not.toContain('ALREADY HAPPENED');
+  });
+});
+
+describe('a resolved failure is never a receipt (Lumen, PR #584 round 4)', () => {
+  it.each([
+    [{ success: false, error: 'Myra send failed' }, true],
+    [{ isError: true, content: [] }, true],
+    [{ success: true }, false],
+    [{ ok: true, id: 'x' }, false],
+    ['plain text', false],
+    [undefined, false],
+  ])('isSemanticFailure(%j) → %s', (payload, expected) => {
+    expect(isSemanticFailure(payload)).toBe(expected);
+  });
+
+  it('records the failure AS a failure at the ledger boundary', () => {
+    expect(
+      localToolLedgerLine(
+        'send_response',
+        { success: false, error: 'x' },
+        '{"success":false,"error":"x"}'
+      )
+    ).toBe('Local tool failed (send_response): {"success":false,"error":"x"}');
+    expect(localToolLedgerLine('send_response', { success: true }, '{"success":true}')).toBe(
+      'local tool send_response -> {"success":true}'
+    );
+  });
+
+  it("classifies Lumen's exact production shape as failed — even in the legacy executed line", () => {
+    const ledger = new ContextLedger();
+    ledger.addEntry(
+      'system',
+      'local tool send_response -> {"success":false,"error":"Myra send failed"}',
+      LOCAL_TOOL_RESULT_SOURCE
+    );
+    ledger.addEntry(
+      'system',
+      'Local tool failed (send_email): {"isError":true}',
+      LOCAL_TOOL_RESULT_SOURCE
+    );
+    ledger.addEntry(
+      'system',
+      'local tool remember -> {"success":true,"id":"m1"}' + 'x'.repeat(2_000),
+      LOCAL_TOOL_RESULT_SOURCE
+    );
+    turn(ledger, 0, 0);
+    turn(ledger, 1, 0);
+    const pick = selectConsumedToolResults(ledger.listEntries(), {
+      keepRecentTurns: 1,
+      minTokens: 1,
+    })!;
+    expect(pick.failed).toEqual(['send_response', 'send_email']);
+    expect(pick.receipts).toEqual(['remember']);
+    const note = autoEvictTombstone(pick, 2);
+    expect(note).not.toMatch(/send_response[^;]*(stand|do not repeat)/);
+    expect(note).toMatch(/ERRORED \(send_response, send_email\)/);
+  });
+
+  it('the recorder in chat.ts goes through localToolLedgerLine', () => {
+    const source = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), '..', 'commands', 'chat.ts'),
+      'utf8'
+    );
+    expect(source).toContain('localToolLedgerLine(result.tool, result.result, resultJson)');
+    expect(source).not.toContain('`local tool ${result.tool} -> ${resultJson}`');
   });
 });

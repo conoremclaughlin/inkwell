@@ -54,6 +54,11 @@ export const READ_ONLY_TOOLS: ReadonlySet<string> = new Set([
   // ink-local
   'list_context',
   'describe_tool',
+  // Pi's in-process coding reads (edit, write and bash stay write-side).
+  'read',
+  'grep',
+  'find',
+  'ls',
   // memory & context
   'bootstrap',
   'recall',
@@ -143,7 +148,38 @@ export function isWriteSideTool(tool: string): boolean {
 /** `local tool <name> -> …` — an executed result, as the REPL records it. */
 const TOOL_NAME_RE = /^local tool ([A-Za-z_][\w.-]*) ->/;
 /** `Local tool error|blocked|denied (<name>): …` — a refused or failed one. */
-const OUTCOME_RE = /^Local tool (error|blocked|denied) \(([A-Za-z_][\w.-]*)\)/;
+const OUTCOME_RE = /^Local tool (error|failed|blocked|denied) \(([A-Za-z_][\w.-]*)\)/;
+/**
+ * A resolved payload that says it failed, in an entry recorded in the
+ * executed shape — legacy lines, or a handler whose failure the recorder did
+ * not know. Checked on the payload head so a value that merely mentions the
+ * words deep inside cannot flip a receipt.
+ */
+const PAYLOAD_FAILURE_RE =
+  /^local tool [A-Za-z_][\w.-]* -> \{[^{}]{0,120}"(?:success":\s*false|isError":\s*true)/;
+
+/**
+ * A handler that RESOLVED with a failure in its payload did not do what the
+ * call asked: the runtime marks any resolved call `executed`, but many
+ * handlers answer `{success:false,…}` or `isError:true` — a send_response
+ * whose delivery failed, impossibleCallRefusal (Lumen, PR #584 round 4).
+ */
+export function isSemanticFailure(result: unknown): boolean {
+  if (!result || typeof result !== 'object') return false;
+  const r = result as { isError?: unknown; success?: unknown };
+  return r.isError === true || r.success === false;
+}
+
+/**
+ * The ledger line for an executed local tool. A resolved failure is recorded
+ * AS a failure at the boundary, so the sweep's outcome classes (and anything
+ * else reading the ledger) never mistake it for a receipt.
+ */
+export function localToolLedgerLine(tool: string, result: unknown, resultJson: string): string {
+  return isSemanticFailure(result)
+    ? `Local tool failed (${tool}): ${resultJson}`
+    : `local tool ${tool} -> ${resultJson}`;
+}
 
 /**
  * Pick the consumed tool results to clear: `local-tool` entries that sit
@@ -200,8 +236,8 @@ export function selectConsumedToolResults(
     if (!name) continue;
     add(tools, name);
     if (!isWriteSideTool(name)) add(reads, name);
-    else if (!outcome) add(receipts, name);
-    else if (outcome[1] === 'error') add(failed, name);
+    else if (!outcome) add(PAYLOAD_FAILURE_RE.test(e.content) ? failed : receipts, name);
+    else if (outcome[1] === 'error' || outcome[1] === 'failed') add(failed, name);
     else add(refused, name);
   }
   if (ids.length === 0 || tokens < minTokens) return null;

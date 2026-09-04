@@ -76,6 +76,7 @@ import {
   AUTO_EVICT_MIN_TOKENS,
   AUTO_EVICT_TOMBSTONE_SOURCE,
 } from '../repl/auto-evict.js';
+import { localToolLedgerLine } from '../repl/auto-evict.js';
 import { StreamedTurnRenderer, type StreamedLine } from '../repl/paragraph-stream.js';
 import { ImitationPreviewGuard } from '../repl/preview-guard.js';
 import type { BackendTurnEvent } from '../backends/stream.js';
@@ -6558,7 +6559,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
             if (!isClientLocalTool(result.tool) && !isCloneHandoffTool(result.tool)) {
               ledger.addEntry(
                 'system',
-                compactForLedger(`local tool ${result.tool} -> ${resultJson}`, 500),
+                // A resolved failure is recorded as one (Lumen, PR #584 round 4).
+                compactForLedger(localToolLedgerLine(result.tool, result.result, resultJson), 500),
                 'local-tool'
               );
             }
