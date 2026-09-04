@@ -69,7 +69,6 @@ import {
   estimateTokens,
   type LedgerReplayMeta,
   type LedgerRole,
-  DEFAULT_CHARS_PER_TOKEN,
 } from '../repl/context-ledger.js';
 import {
   resolveModelContextWindow as resolveBackendTokenWindow,
@@ -2781,27 +2780,44 @@ function applyBudgetForWindow(runtime: ChatRuntime, window: number): void {
 
 /** Share of the remaining window one relay may spend; the rest is the model's reply and the next turn. */
 export const RELAY_HEADROOM_SHARE = 0.5;
-/** Never starve a relay entirely — a stub per result still names the tools and statuses. */
-export const MIN_RELAY_BUDGET_CHARS = 8_000;
+/**
+ * Characters per token to assume for RELAYED TOOL RESULTS. The ledger's prose
+ * heuristic (4) is optimistic for JSON: the incident's list_context payload
+ * tokenized at ~1.9 chars/token, so a "half the headroom" relay converted at 4
+ * cost more than all of it (Lumen, PR #576 round 3). 1.5 is below anything
+ * measured, so the share holds for any real payload.
+ */
+export const RELAY_CHARS_PER_TOKEN = 1.5;
+/**
+ * The floor a relay gets when the window has no headroom left: enough for a
+ * stub per result that still names the tool and status, so the model is never
+ * blind to what ran — ~2.7K tokens at the conservative density.
+ */
+export const MIN_RELAY_BUDGET_CHARS = 4_000;
 
 /**
  * How many characters of tool results the next relay may carry, from the
- * window's live headroom: what the budget leaves after the identity context
- * and the ledger, times RELAY_HEADROOM_SHARE, in characters — clamped between
+ * window's live headroom: what the budget leaves after the identity context,
+ * the ledger, and what this turn's loop has already put in the provider's
+ * context (`residentChars` — continuation bodies and intermediate replies,
+ * which reach the ledger only after the loop returns), times
+ * RELAY_HEADROOM_SHARE, converted at RELAY_CHARS_PER_TOKEN — clamped between
  * MIN_RELAY_BUDGET_CHARS and MAX_RELAY_CHARS. A static ceiling was only safe
  * while the window had that much room; after the pre-turn compaction check a
- * 128K/200K window may not (Lumen, PR #576 round 2).
+ * 128K/200K window may not (Lumen, PR #576 rounds 2–3).
  */
 export function relayBudgetChars(
   runtime: Pick<ChatRuntime, 'maxContextTokens' | 'bootstrapContext'>,
-  ledger: Pick<ContextLedger, 'totalTokens'>
+  ledger: Pick<ContextLedger, 'totalTokens'>,
+  residentChars = 0
 ): number {
   const bootstrapReserve = runtime.bootstrapContext ? estimateTokens(runtime.bootstrapContext) : 0;
+  const residentTokens = Math.ceil(Math.max(0, residentChars) / RELAY_CHARS_PER_TOKEN);
   const remainingTokens = Math.max(
     0,
-    runtime.maxContextTokens - bootstrapReserve - ledger.totalTokens()
+    runtime.maxContextTokens - bootstrapReserve - ledger.totalTokens() - residentTokens
   );
-  const chars = Math.floor(remainingTokens * DEFAULT_CHARS_PER_TOKEN * RELAY_HEADROOM_SHARE);
+  const chars = Math.floor(remainingTokens * RELAY_CHARS_PER_TOKEN * RELAY_HEADROOM_SHARE);
   return Math.min(MAX_RELAY_CHARS, Math.max(MIN_RELAY_BUDGET_CHARS, chars));
 }
 
@@ -5124,6 +5140,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
     let cloneToolCalls = 0;
     // This clone's own signal state — never the parent's global.
     const cloneSignal = createSignalSink();
+    /** What the clone's window holds beyond its ledger — see relayBudgetChars. */
+    let cloneResidentChars = 0;
 
     const cloneRunTurn = async (
       body: string,
@@ -5171,6 +5189,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
         ctx.signal?.removeEventListener('abort', onAbort)
       );
       const text = result.responseText ?? result.stdout;
+      // A native session accumulates every body and reply; a stateless one
+      // re-packs its history into each prompt, so the latest prompt IS the
+      // window. Either way this is what the next relay must fit beside.
+      cloneResidentChars = cloneCanReuseSession
+        ? cloneResidentChars + prompt.length + text.length
+        : prompt.length + text.length;
       if (!cloneCanReuseSession && text.trim()) cloneHistory.push(text.trim());
       appendTranscript(record.transcriptPath, {
         type: 'backend_turn',
@@ -5217,6 +5241,20 @@ export async function runChat(options: ChatOptions): Promise<void> {
           // Nobody is watching a clone's scrollback, so a refusal it is not told
           // about becomes silent abandonment of the task.
           continueOnBlocked: true,
+          // The clone's window is its own: the same model window, its identity
+          // prompt in place of the parent's bootstrap, its own ledger of
+          // local-tool summaries, and what its session (or re-packed history)
+          // holds. Without this it took the static 200K default (Lumen, PR
+          // #576 round 3).
+          relayBudgetChars: () =>
+            relayBudgetChars(
+              {
+                maxContextTokens: runtime.maxContextTokens,
+                bootstrapContext: runtime.systemPromptOverride || '',
+              },
+              cloneLedgerFor(record.transcriptPath),
+              cloneResidentChars
+            ),
         },
         {
           ui: {
@@ -6242,6 +6280,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // flags, SIGINT/abort wiring, debug + activity logging. A shadow clone
     // supplies a far simpler runTurn and shares the loop unchanged.
     let lastRunResult!: BackendRunResult;
+    // What this turn's loop has already put in the provider's context that the
+    // ledger cannot see yet: every continuation body sent and every reply
+    // received. The relay budget shrinks by it, or each iteration re-grants
+    // the same allowance while the window fills (Lumen, PR #576 round 3).
+    let loopResidentChars = 0;
 
     const runTurnForLoop = async (
       body: string,
@@ -6413,6 +6456,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         }
 
         lastRunResult = runResult;
+        loopResidentChars += (runResult.responseText ?? '').length;
         return runResult;
       }
 
@@ -6461,6 +6505,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
       lastRunResult = contResult;
       recordRunUsage(contResult.usage);
+      loopResidentChars += continuationPrompt.length + (contResult.responseText ?? '').length;
       return contResult;
     };
 
@@ -6471,7 +6516,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           prompt,
           toolRouting: runtime.toolRouting,
           signal: turnAbort.signal,
-          relayBudgetChars: () => relayBudgetChars(runtime, ledger),
+          relayBudgetChars: () => relayBudgetChars(runtime, ledger, loopResidentChars),
         },
         {
           ui: {

@@ -354,12 +354,30 @@ function renderToolResults(
   results: ReadonlyArray<ToolResultRecord>,
   budgetChars: number = MAX_RELAY_CHARS
 ): string {
+  const budget = Math.max(0, Math.floor(budgetChars));
   const n = Math.max(1, results.length);
-  const share = Math.max(
-    0,
-    Math.floor((Math.max(0, budgetChars) - n * RELAY_RESULT_OVERHEAD_CHARS) / n)
-  );
-  return results.map((r) => renderToolResult(r, share)).join('\n\n');
+  const share = Math.max(0, Math.floor((budget - n * RELAY_RESULT_OVERHEAD_CHARS) / n));
+  const composed = results.map((r) => renderToolResult(r, share)).join('\n\n');
+  if (composed.length <= budget) return composed;
+  // The framing alone outgrew the budget — many results, long tool names, a
+  // budget below the per-result reserve. The ceiling is the invariant, not
+  // the framing: cut at the budget and say what was lost (Lumen, PR #576
+  // round 3 — 50 oversized results at 8K rendered 9,659 chars).
+  return cutAtBudget(composed, budget, results);
+}
+
+function cutAtBudget(
+  composed: string,
+  budget: number,
+  results: ReadonlyArray<ToolResultRecord>
+): string {
+  const tools = Array.from(new Set(results.map((r) => r.tool)));
+  const named = tools.slice(0, 5).join(', ') + (tools.length > 5 ? ', …' : '');
+  const note =
+    `\n…[ink: relay cut at its ${budget.toLocaleString()}-character budget — ` +
+    `${results.length} results (${named}); every payload is in this session's transcript.]`;
+  if (note.length >= budget) return composed.slice(0, budget);
+  return composed.slice(0, budget - note.length) + note;
 }
 
 function renderToolResult(r: ToolResultRecord, maxChars: number): string {

@@ -2162,3 +2162,51 @@ describe('relay size ceiling (#571; aggregate — Lumen, PR #576)', () => {
     expect(body).not.toContain('session ledger');
   });
 });
+
+describe('REGRESSION (Lumen, PR #576 round 3): the ceiling holds even when the framing alone outgrows it', () => {
+  const huge = (n: number): string => 'x'.repeat(n);
+  it.each([50, 100])(
+    '%i oversized results under an 8K budget render at most 8K (+ the fixed frame)',
+    (n) => {
+      const results = Array.from({ length: n }, (_, i) => ({
+        tool: `t${i}`,
+        result: huge(20_000),
+        status: 'executed',
+      }));
+      const body = buildContinuationBody(results, [], undefined, { budgetChars: 8_000 });
+      // 50 rendered 9,659 chars and 100 rendered 19,159 on the previous head.
+      expect(body.length).toBeLessThanOrEqual(8_000 + 400);
+      expect(body).toContain('[ink: relay cut at its 8,000-character budget');
+      expect(body).toContain(`${n} results`);
+      const relay = buildFinalRelayBody(results, undefined, { budgetChars: 8_000 });
+      expect(relay.length).toBeLessThanOrEqual(8_000 + 600);
+    }
+  );
+
+  it('long tool names cannot push the framing past the budget either', () => {
+    const results = Array.from({ length: 5 }, (_, i) => ({
+      tool: `an_extremely_long_tool_name_${'x'.repeat(400)}_${i}`,
+      result: huge(20_000),
+      status: 'executed',
+    }));
+    const body = buildContinuationBody(results, [], undefined, { budgetChars: 1_000 });
+    expect(body.length).toBeLessThanOrEqual(1_000 + 400);
+  });
+
+  it('a budget too small for even the note still never exceeds itself', () => {
+    const results = [{ tool: 'read', result: huge(5_000), status: 'executed' }];
+    const body = buildContinuationBody(results, [], undefined, { budgetChars: 40 });
+    expect(body.length).toBeLessThanOrEqual(40 + 400);
+  });
+
+  it('a results block that fits is untouched — no note, every result whole', () => {
+    const results = Array.from({ length: 3 }, (_, i) => ({
+      tool: `t${i}`,
+      result: { ok: i },
+      status: 'executed',
+    }));
+    const body = buildContinuationBody(results, [], undefined, { budgetChars: 8_000 });
+    expect(body).not.toContain('[ink: relay cut');
+    for (let i = 0; i < 3; i++) expect(body).toContain(`Tool t${i} (executed): {"ok":${i}}`);
+  });
+});
