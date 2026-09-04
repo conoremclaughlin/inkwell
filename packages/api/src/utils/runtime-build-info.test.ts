@@ -17,6 +17,12 @@ function answerExecFile(responses: Record<string, string>) {
     const gitArgs = args[1] as string[];
     const cb = args[args.length - 1] as (err: Error | null, stdout: string) => void;
     const sub = gitArgs[0];
+    // rev-list is asked twice — overall, then API-relevant — so allow the
+    // fixture to distinguish them by whether a pathspec was supplied.
+    if (sub === 'rev-list') {
+      const key = gitArgs.includes('--') ? 'rev-list:api' : 'rev-list';
+      if (key in responses) return cb(null, responses[key]);
+    }
     if (sub in responses) cb(null, responses[sub]);
     else cb(new Error(`unexpected git ${sub}`), '');
   });
@@ -91,7 +97,12 @@ describe('getRuntimeBuildInfo', () => {
     mockExecSync.mockReturnValue('shaA');
 
     // First refresh: head B with an API-relevant delta → updateAvailable.
-    answerExecFile({ 'rev-parse': 'shaB', diff: 'packages/api/src/x.ts' });
+    answerExecFile({
+      'rev-parse': 'shaB',
+      diff: 'packages/api/src/x.ts',
+      'rev-list': '4',
+      'rev-list:api': '1',
+    });
     const { getRuntimeBuildInfo } = await import('./runtime-build-info');
     getRuntimeBuildInfo(20_000);
     await flushRefresh();
@@ -103,8 +114,12 @@ describe('getRuntimeBuildInfo', () => {
     mockExecFile.mockImplementation((...args: unknown[]) => {
       const gitArgs = args[1] as string[];
       const cb = args[args.length - 1] as (err: Error | null, stdout: string) => void;
-      if (gitArgs[0] === 'rev-parse') cb(null, 'shaC');
-      else releaseDiff = () => cb(null, '');
+      // Stall the DIFF specifically. Matching "anything that isn't rev-parse"
+      // silently re-bound this to a later call once the refresh grew more
+      // steps, and the release then freed the wrong one.
+      if (gitArgs[0] === 'diff') releaseDiff = () => cb(null, '');
+      else if (gitArgs[0] === 'rev-parse') cb(null, 'shaC');
+      else cb(null, '0');
     });
     getRuntimeBuildInfo(50_000);
     await flushRefresh();
@@ -114,6 +129,10 @@ describe('getRuntimeBuildInfo', () => {
     const during = getRuntimeBuildInfo(51_000);
     expect(during.currentGitSha).toBe('shaB');
     expect(during.updateAvailable).toBe(true);
+    // The distance fields publish in the same block, so they must be the
+    // PREVIOUS refresh's values too — never shaC's sha beside stale counts.
+    expect(during.behindOriginCount).toBe(4);
+    expect(during.apiBehindOriginCount).toBe(1);
 
     expect(releaseDiff).not.toBeNull();
     releaseDiff!();
@@ -122,6 +141,7 @@ describe('getRuntimeBuildInfo', () => {
     const after = getRuntimeBuildInfo(52_000);
     expect(after.currentGitSha).toBe('shaC');
     expect(after.updateAvailable).toBe(false);
+    expect(after.behindOriginCount).toBe(0);
   });
 
   it('a failed diff fails toward restart-recommended, never toward hiding an update', async () => {
@@ -145,5 +165,160 @@ describe('getRuntimeBuildInfo', () => {
     const info = getRuntimeBuildInfo(20_000);
 
     expect(info.processManager).toBe('pm2');
+  });
+});
+
+/**
+ * How far the CHECKOUT trails origin — the question `updateAvailable` cannot
+ * answer.
+ *
+ * It compares the startup sha to the local HEAD, so it means "did the tree move
+ * under me, do I need a restart". On 2026-09-04 the deployed tree sat 75
+ * commits behind origin/main, 2 of them touching the API, twenty hours after a
+ * fix was merged for it — and /health reported `updateAvailable: false` in
+ * perfect good faith. Myra's classification: two questions, one signal, and the
+ * unanswered one fails toward reassurance.
+ */
+describe('getRuntimeBuildInfo — distance from origin', () => {
+  beforeEach(() => {
+    vi.resetModules();
+    vi.clearAllMocks();
+    delete process.env.pm_id;
+  });
+
+  it('reports the checkout as behind even when no restart is needed', async () => {
+    mockExecSync.mockReturnValue('abc123def456');
+    answerExecFile({
+      'rev-parse': 'abc123def456', // HEAD unmoved since startup
+      diff: '',
+      'rev-list': '75',
+      'rev-list:api': '2',
+    });
+
+    const { getRuntimeBuildInfo } = await import('./runtime-build-info');
+    getRuntimeBuildInfo(20_000);
+    await flushRefresh();
+    const info = getRuntimeBuildInfo(40_000);
+
+    // The old signal is correct and says nothing is wrong...
+    expect(info.updateAvailable).toBe(false);
+    // ...while the checkout is missing 75 commits, 2 of them ours.
+    expect(info.behindOriginCount).toBe(75);
+    expect(info.apiBehindOriginCount).toBe(2);
+    expect(info.behindOriginApi).toBe(true);
+  });
+
+  it('reports a current checkout as verified, not merely quiet', async () => {
+    mockExecSync.mockReturnValue('abc123def456');
+    answerExecFile({
+      'rev-parse': 'abc123def456',
+      diff: '',
+      'rev-list': '0',
+      'rev-list:api': '0',
+    });
+
+    const { getRuntimeBuildInfo } = await import('./runtime-build-info');
+    getRuntimeBuildInfo(20_000);
+    await flushRefresh();
+    const info = getRuntimeBuildInfo(40_000);
+
+    expect(info.behindOriginCount).toBe(0);
+    expect(info.behindOriginApi).toBe(false);
+  });
+
+  /**
+   * THE ROW-ONE ASSERTION. Unknown must not read as up-to-date. A checkout with
+   * no upstream, or a git failure, has to leave the count null so a caller can
+   * tell "verified current" from "could not tell".
+   */
+  it('leaves the count NULL when it cannot be determined', async () => {
+    mockExecSync.mockReturnValue('abc123def456');
+    // No upstream configured: rev-parse @{upstream} fails.
+    mockExecFile.mockImplementation((...args: unknown[]) => {
+      const gitArgs = args[1] as string[];
+      const cb = args[args.length - 1] as (err: Error | null, stdout: string) => void;
+      if (gitArgs.includes('@{upstream}')) return cb(new Error('no upstream'), '');
+      if (gitArgs[0] === 'rev-parse') return cb(null, 'abc123def456');
+      return cb(null, '');
+    });
+
+    const { getRuntimeBuildInfo } = await import('./runtime-build-info');
+    getRuntimeBuildInfo(20_000);
+    await flushRefresh();
+    const info = getRuntimeBuildInfo(40_000);
+
+    expect(info.behindOriginCount).toBeNull();
+    expect(info.apiBehindOriginCount).toBeNull();
+    // Never true on an unknown — but a reader must consult the count rather
+    // than trusting this alone.
+    expect(info.behindOriginApi).toBe(false);
+    expect(info.upstreamRef).toBeNull();
+  });
+
+  /**
+   * The guard I wrote most deliberately and had not pinned: the upstream
+   * RESOLVES but rev-list fails. Found by mutating `return null` to `return 0`
+   * and watching every test stay green — the null-vs-unknown test above kills
+   * the upstream lookup, so countRevs never ran.
+   *
+   * Zero means "verified up to date". Failing into it is precisely the calm
+   * wrong answer this field exists to remove.
+   */
+  it('returns NULL, never 0, when rev-list itself fails', async () => {
+    mockExecSync.mockReturnValue('abc123def456');
+    mockExecFile.mockImplementation((...args: unknown[]) => {
+      const gitArgs = args[1] as string[];
+      const cb = args[args.length - 1] as (err: Error | null, stdout: string) => void;
+      if (gitArgs.includes('@{upstream}')) return cb(null, 'origin/main');
+      if (gitArgs[0] === 'rev-parse') return cb(null, 'abc123def456');
+      if (gitArgs[0] === 'rev-list') return cb(new Error('bad revision'), '');
+      return cb(null, '');
+    });
+
+    const { getRuntimeBuildInfo } = await import('./runtime-build-info');
+    getRuntimeBuildInfo(20_000);
+    await flushRefresh();
+    const info = getRuntimeBuildInfo(40_000);
+
+    // The upstream was found, so this is not the "no upstream" path.
+    expect(info.upstreamRef).toBe('origin/main');
+    expect(info.behindOriginCount).toBeNull();
+    expect(info.apiBehindOriginCount).toBeNull();
+    expect(info.behindOriginApi).toBe(false);
+  });
+
+  it('returns NULL when rev-list emits something unparseable', async () => {
+    mockExecSync.mockReturnValue('abc123def456');
+    answerExecFile({
+      'rev-parse': 'origin/main',
+      diff: '',
+      'rev-list': 'not-a-number',
+      'rev-list:api': '',
+    });
+
+    const { getRuntimeBuildInfo } = await import('./runtime-build-info');
+    getRuntimeBuildInfo(20_000);
+    await flushRefresh();
+    expect(getRuntimeBuildInfo(40_000).behindOriginCount).toBeNull();
+  });
+
+  it('measures against the tracked upstream, not a hardcoded main', async () => {
+    mockExecSync.mockReturnValue('abc123def456');
+    answerExecFile({
+      'rev-parse': 'origin/release-2',
+      diff: '',
+      'rev-list': '3',
+      'rev-list:api': '0',
+    });
+
+    const { getRuntimeBuildInfo } = await import('./runtime-build-info');
+    getRuntimeBuildInfo(20_000);
+    await flushRefresh();
+    const info = getRuntimeBuildInfo(40_000);
+
+    expect(info.upstreamRef).toBe('origin/release-2');
+    // Behind by three, but none of them ours: no restart urgency.
+    expect(info.behindOriginCount).toBe(3);
+    expect(info.behindOriginApi).toBe(false);
   });
 });
