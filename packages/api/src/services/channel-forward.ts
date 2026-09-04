@@ -117,7 +117,7 @@ export async function applyChannelForward(
       finalTextLength: context.finalTextLength,
     });
   } else {
-    effects.debug('Explicit send_response detected, skipping auto-forward', {
+    effects.debug('Explicit delivery marker present, skipping auto-forward', {
       channel,
       conversationId,
       hadExplicitResponse: context.hadExplicitResponse,

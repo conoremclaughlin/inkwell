@@ -26,8 +26,15 @@ export type ResponseCallback = (response: AgentResponse) => Promise<ResponseResu
 // Global response callback - set by the session host
 let globalResponseCallback: ResponseCallback | null = null;
 
-// Track which conversations have received explicit responses via send_response
-// Key: "channel:conversationId", Value: timestamp of last response
+// Best-effort delivery marker, keyed per CONVERSATION — "channel:conversationId"
+// — not per turn. The value is a timestamp for debugging only; nothing reads it.
+//
+// The distinction matters and is easy to lose: a marker says *someone* delivered
+// on this conversation, not that the turn now reading it is the turn that sent.
+// Two turns on the same conversation share one key, so a reader cannot tell its
+// own delivery from a concurrent one. Consuming on read (below) stops a marker
+// being seen twice; it does not establish who it belonged to. Real turn
+// ownership needs a per-turn identity and is tracked separately.
 const explicitResponseTracker: Map<string, number> = new Map();
 
 /**
@@ -46,29 +53,6 @@ export function getResponseCallback(): ResponseCallback | null {
 }
 
 /**
- * Check if a conversation has received an explicit send_response during this
- * turn. Turn-scoped, not time-windowed — ink turns can run for many minutes,
- * so a fixed time window would miss early responses. Call clearExplicitResponse
- * after the auto-forward decision to reset for the next turn.
- */
-export function hasExplicitResponse(channel: string, conversationId: string): boolean {
-  const key = `${channel}:${conversationId}`;
-  return explicitResponseTracker.has(key);
-}
-
-/**
- * Clear explicit response tracking for a conversation (call after the
- * auto-forward decision in server.ts). No time-based sweep — the map is
- * naturally bounded (one entry per active conversation) and each turn
- * clears its own key. Stale entries from error paths are overwritten on
- * the next message to the same conversation.
- */
-export function clearExplicitResponse(channel: string, conversationId: string): void {
-  const key = `${channel}:${conversationId}`;
-  explicitResponseTracker.delete(key);
-}
-
-/**
  * Read the marker and clear it in ONE step.
  *
  * The two-call form — check, then act, then clear — has an ordering hazard that
@@ -80,6 +64,14 @@ export function clearExplicitResponse(channel: string, conversationId: string): 
  * Reordering two lines fixes today's instance and leaves the hazard. Making the
  * read consume the marker removes it: there is no window because there is no
  * interval. Callers cannot get the order wrong when there is only one call.
+ *
+ * What this does NOT do: establish that the marker belonged to the calling turn.
+ * The key is the conversation, so a same-conversation turn that delivered while
+ * this one was queued leaves a marker this call will happily consume and read as
+ * its own. Consuming bounds the damage to one reader; it does not identify the
+ * writer. Treat the result as "this conversation was answered recently," never
+ * as "this turn answered." Turn ownership is deliberately out of scope here —
+ * it needs a per-turn identity threaded to the runner, which is its own change.
  */
 export function consumeExplicitResponse(channel: string, conversationId: string): boolean {
   const key = `${channel}:${conversationId}`;
@@ -89,9 +81,12 @@ export function consumeExplicitResponse(channel: string, conversationId: string)
 }
 
 /**
- * Mark a conversation as having received an explicit response. No cleanup
- * here — concurrent turns' markers must not be swept mid-turn. Cleanup
- * happens in clearExplicitResponse after the auto-forward decision.
+ * Mark a conversation as having received an explicit response. Only called once
+ * delivery evidence exists — a send that threw, or that carried nothing, must
+ * leave the conversation looking unanswered so the fallback can still fire.
+ *
+ * No sweep here: the map holds one entry per active conversation, and the entry
+ * is removed by whoever consumes it after the auto-forward decision.
  */
 function markExplicitResponse(channel: string, conversationId: string): void {
   const key = `${channel}:${conversationId}`;

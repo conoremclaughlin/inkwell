@@ -14,8 +14,6 @@ import {
   outboundMediaEntrySchema,
   inferMediaTypeFromPath,
   handleSendResponse,
-  hasExplicitResponse,
-  clearExplicitResponse,
   consumeExplicitResponse,
   setResponseCallback,
 } from './response-handlers';
@@ -121,18 +119,18 @@ describe('handleSendResponse — the explicit-response marker', () => {
     );
 
   beforeEach(() => {
-    clearExplicitResponse('telegram', conversationId);
+    consumeExplicitResponse('telegram', conversationId);
   });
 
   afterEach(() => {
     setResponseCallback(null as unknown as Parameters<typeof setResponseCallback>[0]);
-    clearExplicitResponse('telegram', conversationId);
+    consumeExplicitResponse('telegram', conversationId);
   });
 
   it('marks the conversation when the send succeeds', async () => {
     setResponseCallback(async () => undefined);
     await send('delivered');
-    expect(hasExplicitResponse('telegram', conversationId)).toBe(true);
+    expect(consumeExplicitResponse('telegram', conversationId)).toBe(true);
   });
 
   it('does NOT mark when the send throws', async () => {
@@ -144,7 +142,7 @@ describe('handleSendResponse — the explicit-response marker', () => {
     expect(JSON.parse(res.content[0]!.text).success).toBe(false);
     // The whole point: the server must still see this turn as undelivered, so
     // the fallback can fire or the warning can be raised.
-    expect(hasExplicitResponse('telegram', conversationId)).toBe(false);
+    expect(consumeExplicitResponse('telegram', conversationId)).toBe(false);
   });
 
   it('does NOT mark when the channel has no routing', async () => {
@@ -159,7 +157,7 @@ describe('handleSendResponse — the explicit-response marker', () => {
     );
 
     expect(JSON.parse(res.content[0]!.text).success).toBe(false);
-    expect(hasExplicitResponse('discord', conversationId)).toBe(false);
+    expect(consumeExplicitResponse('discord', conversationId)).toBe(false);
   });
 });
 
@@ -171,10 +169,10 @@ describe('handleSendResponse — delivery evidence', () => {
   const conversationId = 'conv-evidence-test';
   const composer = {} as unknown as Parameters<typeof handleSendResponse>[1];
 
-  beforeEach(() => clearExplicitResponse('telegram', conversationId));
+  beforeEach(() => consumeExplicitResponse('telegram', conversationId));
   afterEach(() => {
     setResponseCallback(null as unknown as Parameters<typeof setResponseCallback>[0]);
-    clearExplicitResponse('telegram', conversationId);
+    consumeExplicitResponse('telegram', conversationId);
   });
 
   it('does NOT mark a blank body with no media', async () => {
@@ -187,7 +185,7 @@ describe('handleSendResponse — delivery evidence', () => {
     );
 
     expect(JSON.parse(res.content[0]!.text).success).toBe(false);
-    expect(hasExplicitResponse('telegram', conversationId)).toBe(false);
+    expect(consumeExplicitResponse('telegram', conversationId)).toBe(false);
   });
 
   it('does NOT mark a media-only send where every attachment failed', async () => {
@@ -206,7 +204,7 @@ describe('handleSendResponse — delivery evidence', () => {
     );
 
     expect(JSON.parse(res.content[0]!.text).success).toBe(false);
-    expect(hasExplicitResponse('telegram', conversationId)).toBe(false);
+    expect(consumeExplicitResponse('telegram', conversationId)).toBe(false);
   });
 
   it('marks a media-only send the gateway counted as delivered', async () => {
@@ -222,7 +220,7 @@ describe('handleSendResponse — delivery evidence', () => {
     );
 
     expect(JSON.parse(res.content[0]!.text).success).toBe(true);
-    expect(hasExplicitResponse('telegram', conversationId)).toBe(true);
+    expect(consumeExplicitResponse('telegram', conversationId)).toBe(true);
   });
 });
 
@@ -237,7 +235,7 @@ describe('handleSendResponse — delivery evidence', () => {
  */
 describe('consumeExplicitResponse', () => {
   const conversationId = 'conv-consume-test';
-  afterEach(() => clearExplicitResponse('telegram', conversationId));
+  afterEach(() => consumeExplicitResponse('telegram', conversationId));
 
   it('reports the marker once and clears it in the same call', async () => {
     setResponseCallback(async () => undefined);
@@ -253,7 +251,7 @@ describe('consumeExplicitResponse', () => {
     // The nested turn that release() drains sees a clean slate, so its own
     // fallback and warning are free to fire.
     expect(consumeExplicitResponse('telegram', conversationId)).toBe(false);
-    expect(hasExplicitResponse('telegram', conversationId)).toBe(false);
+    expect(consumeExplicitResponse('telegram', conversationId)).toBe(false);
   });
 
   it('is false for a conversation that never answered', () => {
