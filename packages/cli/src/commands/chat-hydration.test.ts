@@ -429,6 +429,77 @@ describe('hydrateLedgerFromTranscript — a hash-selected eviction replays as it
   });
 });
 
+describe('hydrateLedgerFromTranscript — the provider sample survives a process boundary (Lumen, PR #583 round 2)', () => {
+  let dir: string;
+  let transcriptPath: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'ink-sample-test-'));
+    transcriptPath = join(dir, 'session-test.jsonl');
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const write = (events: Array<Record<string, unknown>>) =>
+    writeFileSync(transcriptPath, events.map((e) => JSON.stringify(e)).join('\n') + '\n');
+  const sample = {
+    type: 'provider_sample',
+    at: '2026-09-03T20:00:00.000Z',
+    backend: 'claude',
+    model: 'claude-opus-5',
+    backendSessionId: 'sess-1',
+    envelopeShape: 'shape-a',
+    contextTokens: 541_000,
+    inputTokens: 1_000,
+    cacheReadTokens: 500_000,
+    cacheWriteTokens: 40_000,
+  };
+
+  it('replays the last sample under the scope it was taken in', () => {
+    write([
+      { type: 'user', content: 'hi' },
+      sample,
+      { type: 'assistant', content: 'ok', backend: 'claude' },
+    ]);
+    const result = hydrateLedgerFromTranscript(new ContextLedger(), transcriptPath);
+    expect(result.providerSample).toEqual({
+      at: '2026-09-03T20:00:00.000Z',
+      scope: {
+        backend: 'claude',
+        model: 'claude-opus-5',
+        backendSessionId: 'sess-1',
+        envelopeShape: 'shape-a',
+      },
+      contextTokens: 541_000,
+      inputTokens: 1_000,
+      cacheReadTokens: 500_000,
+      cacheWriteTokens: 40_000,
+    });
+  });
+
+  it.each([
+    ['context_evict', { type: 'context_evict', refs: [] }],
+    ['context_trim', { type: 'context_trim', reason: 'x' }],
+    ['compaction', { type: 'compaction', summary: 's', keptEntries: [] }],
+    ['backend_session_invalidated', { type: 'backend_session_invalidated', id: 'sess-1' }],
+  ])('a %s after the sample drops it — the window it measured is gone', (_t, event) => {
+    write([sample, event]);
+    expect(
+      hydrateLedgerFromTranscript(new ContextLedger(), transcriptPath).providerSample
+    ).toBeUndefined();
+  });
+
+  it('a later sample replaces an earlier one; a malformed one is ignored', () => {
+    write([sample, { ...sample, contextTokens: 600_000 }]);
+    expect(
+      hydrateLedgerFromTranscript(new ContextLedger(), transcriptPath).providerSample?.contextTokens
+    ).toBe(600_000);
+    write([{ type: 'provider_sample', backend: 'claude' }]);
+    expect(
+      hydrateLedgerFromTranscript(new ContextLedger(), transcriptPath).providerSample
+    ).toBeUndefined();
+  });
+});
+
 describe('hydrateLedgerFromTranscript — context_evict events', () => {
   let dir: string;
   let transcriptPath: string;

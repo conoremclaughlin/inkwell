@@ -459,3 +459,62 @@ describe('result usage carries the context the request was handed (Lumen, PR #58
     expect(result?.kind === 'result' && result.usage?.contextTokens).toBe(541_000);
   });
 });
+
+describe('contextTokens comes from the FINAL iteration, not the run aggregate (Lumen, PR #583 round 2)', () => {
+  it('a multi-iteration result reports the last request window; the sums stay for cost', () => {
+    const parser = new ClaudeStreamParser();
+    const events = parser.push(
+      JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        result: '',
+        usage: {
+          input_tokens: 150,
+          output_tokens: 40,
+          cache_read_input_tokens: 50_000,
+          cache_creation_input_tokens: 6_000,
+          iterations: [
+            {
+              input_tokens: 100,
+              output_tokens: 20,
+              cache_read_input_tokens: 20_000,
+              cache_creation_input_tokens: 5_000,
+              type: 'message',
+            },
+            {
+              input_tokens: 50,
+              output_tokens: 20,
+              cache_read_input_tokens: 30_000,
+              cache_creation_input_tokens: 1_000,
+              type: 'message',
+            },
+          ],
+        },
+      }) + '\n'
+    );
+    const result = events.find((e) => e.kind === 'result');
+    expect(result?.kind).toBe('result');
+    if (result?.kind !== 'result') return;
+    expect(result.usage?.contextTokens).toBe(31_050);
+    expect(result.usage?.inputTokens).toBe(150);
+    expect(result.usage?.cacheReadTokens).toBe(50_000);
+  });
+
+  it('falls back to the top-level fields when iterations are absent or unreadable', () => {
+    const parser = new ClaudeStreamParser();
+    const events = parser.push(
+      JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        result: '',
+        usage: {
+          input_tokens: 1_000,
+          cache_read_input_tokens: 500_000,
+          iterations: [{ type: 'message' }],
+        },
+      }) + '\n'
+    );
+    const result = events.find((e) => e.kind === 'result');
+    expect(result?.kind === 'result' && result.usage?.contextTokens).toBe(501_000);
+  });
+});

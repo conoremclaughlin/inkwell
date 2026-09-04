@@ -696,6 +696,44 @@ function getSessionTranscriptMetadata(sessionId: string): SessionTranscriptMetad
 }
 
 // Exported for tests — verifies compaction events rehydrate summary + kept tail
+/** A `provider_sample` transcript event, as the next process replays it. */
+export interface PersistedProviderSample {
+  at: string;
+  scope: ProviderSampleScope;
+  contextTokens: number;
+  inputTokens?: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+}
+
+export function readProviderSampleEvent(
+  event: Record<string, unknown>
+): PersistedProviderSample | undefined {
+  const str = (k: string): string | undefined =>
+    typeof event[k] === 'string' ? (event[k] as string) : undefined;
+  const n = (k: string): number | undefined =>
+    typeof event[k] === 'number' && Number.isFinite(event[k] as number)
+      ? (event[k] as number)
+      : undefined;
+  const contextTokens = n('contextTokens');
+  const backend = str('backend');
+  const at = str('at');
+  if (contextTokens === undefined || contextTokens <= 0 || !backend || !at) return undefined;
+  return {
+    at,
+    scope: {
+      backend,
+      model: str('model'),
+      backendSessionId: str('backendSessionId'),
+      envelopeShape: str('envelopeShape'),
+    },
+    contextTokens,
+    inputTokens: n('inputTokens'),
+    cacheReadTokens: n('cacheReadTokens'),
+    cacheWriteTokens: n('cacheWriteTokens'),
+  };
+}
+
 export function hydrateLedgerFromTranscript(
   ledger: ContextLedger,
   transcriptPath: string,
@@ -714,12 +752,19 @@ export function hydrateLedgerFromTranscript(
   toolCalls: Array<{ tool: string; status: string; at: string; args?: string; result?: string }>;
   /** Highest event id seen — seeds the append counter so new eids continue */
   maxEid: number;
+  /**
+   * The provider's last measurement, when no context-boundary mutation
+   * followed it — so a new process budgets against it from its first
+   * pre-turn check (Lumen, PR #583 round 2).
+   */
+  providerSample?: PersistedProviderSample;
 } {
   const events = readTranscriptEvents(transcriptPath);
   let loaded = 0;
   let messageCount = 0;
   let compactionCollapsed = false;
   let maxEid = 0;
+  let providerSample: PersistedProviderSample | undefined;
   const preview: HistoryHydrationResult['tailPreview'] = [];
   const seenInboxIds = new Set<string>();
   const seenActivityIds = new Set<string>();
@@ -753,6 +798,20 @@ export function hydrateLedgerFromTranscript(
     const type = typeof event.type === 'string' ? event.type : '';
     const eid = typeof event.eid === 'number' ? event.eid : undefined;
     if (eid !== undefined && eid > maxEid) maxEid = eid;
+    if (type === 'provider_sample') {
+      providerSample = readProviderSampleEvent(event);
+      continue;
+    }
+    if (
+      type === 'context_evict' ||
+      type === 'context_trim' ||
+      type === 'compaction' ||
+      type === 'context_budget_changed' ||
+      type === 'backend_session_invalidated'
+    ) {
+      // The window it measured is gone — live, the same mutations clear it.
+      providerSample = undefined;
+    }
     if (type === 'context_evict' && Array.isArray(event.refs)) {
       // Apply the eviction exactly as it happened live: remove matching
       // entries that exist at this point in the replay. Entries appended
@@ -1119,6 +1178,7 @@ export function hydrateLedgerFromTranscript(
     evictedEntries,
     toolCalls,
     maxEid,
+    ...(providerSample ? { providerSample } : {}),
   };
 }
 
@@ -3896,10 +3956,32 @@ export async function runChat(options: ChatOptions): Promise<void> {
     backend: runtime.backend,
     model: runtime.detectedModel || runtime.model,
     backendSessionId: activeBackendSessionId,
-    envelopeShape: activeBackendSessionShape,
+    // The LIVE envelope, not the session's adopted baseline: a stateless
+    // provider never has a baseline, so its samples outlived every envelope
+    // change (Lumen, PR #583 round 2).
+    envelopeShape: envelopeShapeKey(runtime),
   });
   const sampleProviderContext = (usage: BackendTokenUsage | undefined): void => {
-    providerSample.record(usage, providerScope());
+    if (!usage) return;
+    const scope = providerScope();
+    const at = new Date().toISOString();
+    providerSample.record(usage, scope, at);
+    // Persisted so the NEXT process — a one-turn Myra run exits right after
+    // this — budgets against it on its first pre-turn check instead of
+    // flying blind until its own spawn reports (Lumen, PR #583 round 2).
+    if (usage.contextTokens !== undefined && usage.contextTokens > 0) {
+      appendTranscript(runtime.transcriptPath, {
+        type: 'provider_sample',
+        at,
+        ...scope,
+        contextTokens: usage.contextTokens,
+        ...(usage.inputTokens !== undefined ? { inputTokens: usage.inputTokens } : {}),
+        ...(usage.cacheReadTokens !== undefined ? { cacheReadTokens: usage.cacheReadTokens } : {}),
+        ...(usage.cacheWriteTokens !== undefined
+          ? { cacheWriteTokens: usage.cacheWriteTokens }
+          : {}),
+      });
+    }
   };
   const providerContextMeasurement = (): ProviderContextMeasurement | undefined =>
     providerSample.measurement(providerScope());
@@ -4233,6 +4315,23 @@ export async function runChat(options: ChatOptions): Promise<void> {
   let historyHydration: HistoryHydrationResult | null = null;
   if (attachedToExistingSession && existingTranscript) {
     const hydrated = hydrateLedgerFromTranscript(ledger, existingTranscript, agentId);
+    if (hydrated.providerSample) {
+      // Replayed under the scope it was taken in; measurement() decides
+      // whether that is still the live window.
+      const s = hydrated.providerSample;
+      providerSample.record(
+        {
+          backend: s.scope.backend,
+          source: 'json',
+          contextTokens: s.contextTokens,
+          ...(s.inputTokens !== undefined ? { inputTokens: s.inputTokens } : {}),
+          ...(s.cacheReadTokens !== undefined ? { cacheReadTokens: s.cacheReadTokens } : {}),
+          ...(s.cacheWriteTokens !== undefined ? { cacheWriteTokens: s.cacheWriteTokens } : {}),
+        },
+        s.scope,
+        s.at
+      );
+    }
     // Recover the provider-reported model persisted by the prior process
     // BEFORE any budget enforcement runs: a reattached large transcript must
     // be judged against the session's REAL window, not the conservative
@@ -4653,6 +4752,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // recovery on the matching markers.
     activeBackendSessionId = undefined;
     activeBackendSessionShape = undefined;
+    // A stateless provider re-packs the ledger on every spawn, so a reading
+    // taken before the eviction describes a window that no longer exists —
+    // and its scope (no session id) would otherwise still match (Lumen, PR
+    // #583 round 2). Trims route through here too.
+    providerSample.clear();
   };
 
   const trimContextToPercent = async (
@@ -6831,8 +6935,8 @@ export async function runChat(options: ChatOptions): Promise<void> {
 
       lastRunResult = contResult;
       recordRunUsage(contResult.usage);
-      loopResidentChars += continuationPrompt.length + (contResult.responseText ?? '').length;
       sampleProviderContext(contResult.usage);
+      loopResidentChars += continuationPrompt.length + (contResult.responseText ?? '').length;
       // The BODY, not the packed prompt: a stateless provider re-packs the
       // ledger and bootstrap into every continuation, and counting that
       // again double-counted what the budget already subtracts (Lumen, PR

@@ -89,17 +89,40 @@ function toModelUsage(raw: unknown): Record<string, BackendModelUsage> | undefin
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
+/**
+ * The last entry of `result.usage.iterations` — the request the run ended
+ * on — as the three prompt parts, or undefined when the array is absent or
+ * unreadable.
+ */
+function lastIteration(
+  raw: unknown
+): { inputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number } | undefined {
+  if (!Array.isArray(raw) || raw.length === 0) return undefined;
+  const last = raw[raw.length - 1];
+  if (!last || typeof last !== 'object') return undefined;
+  const e = last as Record<string, unknown>;
+  const fields = {
+    inputTokens: num(e.input_tokens),
+    cacheReadTokens: num(e.cache_read_input_tokens),
+    cacheWriteTokens: num(e.cache_creation_input_tokens),
+  };
+  return Object.values(fields).every((v) => v === undefined) ? undefined : fields;
+}
+
 /** Map Claude's `result.usage` object to BackendTokenUsage with the REAL field names. */
 function toUsage(u: Record<string, unknown>): BackendTokenUsage {
   const inputTokens = num(u.input_tokens);
   const outputTokens = num(u.output_tokens);
   const cacheReadTokens = num(u.cache_read_input_tokens);
   const cacheWriteTokens = num(u.cache_creation_input_tokens);
-  const contextTokens = providerContextTokens('claude', {
-    inputTokens,
-    cacheReadTokens,
-    cacheWriteTokens,
-  });
+  // `result.usage` is the agent run's AGGREGATE: one CLI spawn may make
+  // several native tool/model iterations and the top-level fields sum them.
+  // The window the FINAL request was handed is the last `iterations` entry
+  // (Lumen, PR #583 round 2); the sum stays for cost.
+  const contextTokens = providerContextTokens(
+    'claude',
+    lastIteration(u.iterations) ?? { inputTokens, cacheReadTokens, cacheWriteTokens }
+  );
   return {
     backend: 'claude',
     source: 'json',

@@ -46,6 +46,32 @@ describe('chat.ts provider-sample wiring', () => {
     );
   });
 
+  it('the sample is scoped to the LIVE envelope key, so stateless providers are scoped too', () => {
+    const scope = source.slice(
+      source.indexOf('const providerScope = ('),
+      source.indexOf('const sampleProviderContext = (')
+    );
+    expect(scope).toContain('envelopeShape: envelopeShapeKey(runtime)');
+    expect(scope).not.toContain('activeBackendSessionShape');
+  });
+
+  it('every sample is persisted, and the next process replays it', () => {
+    const sampler = source.slice(
+      source.indexOf('const sampleProviderContext = ('),
+      source.indexOf('const providerContextMeasurement = (')
+    );
+    expect(sampler).toContain("type: 'provider_sample'");
+    expect(source).toContain('if (hydrated.providerSample) {');
+  });
+
+  it('an eviction (and so a trim) drops the sample', () => {
+    const eviction = source.slice(
+      source.indexOf('const recordEviction = ('),
+      source.indexOf('const trimContextToPercent = async (')
+    );
+    expect(eviction).toContain('providerSample.clear();');
+  });
+
   it('every path that rolls the session also drops the sample it measured', () => {
     const helper = source.slice(
       source.indexOf('const rollProviderSession = '),
