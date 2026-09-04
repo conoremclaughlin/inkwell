@@ -57,7 +57,13 @@ import {
   runBackendInteractiveLogin,
   type BackendAuthBackend,
 } from '../lib/backend-auth.js';
-import { startBackendTurn, runBackendTurn, type BackendRunResult } from '../repl/backend-runner.js';
+import {
+  startBackendTurn,
+  runBackendTurn,
+  type BackendRunResult,
+  measurePreparedPromptBytes,
+  type BackendRunRequest,
+} from '../repl/backend-runner.js';
 import {
   buildCompactionPrompt,
   runCompaction,
@@ -2918,31 +2924,27 @@ export function occupancyTokens(
  * MAX_RELAY_BYTES.
  *
  * What it holds is `occupancyTokens`, which the host supplies: for a native
- * session the provider's own count after the last reply, plus `residentBytes`
- * sent or received since that report at one token per byte; for a stateless
- * parent the UTF-8 bytes of the envelope it is about to re-pack, measured
- * directly (a report from the previous, now-dead process would count a body
- * and reply that are never re-sent). With NO occupancy — a native session
- * whose backend reported nothing — nothing is assumed recoverable and the
- * relay gets the floor: a chars-per-token estimate of the ledger was neither
- * the packed bytes nor the hidden native state (Lumen, PR #576 round 6:
- * a 30K-character CJK ledger counted 30,000 against a 183,624-byte envelope).
+ * session the provider's own count after the last reply — and NOTHING once a
+ * later spawn reported no usage, because hidden thinking that was never
+ * reported cannot be recovered from visible text (Lumen, PR #576 round 7);
+ * for a stateless parent the UTF-8 bytes of exactly what the next spawn will
+ * hand the backend — the prepared argv and stdin, system prompt, tool
+ * instructions and media included — measured at budget time. With no
+ * occupancy the relay gets the floor.
  *
  * The bound is exact for the relay string. The floor is the one deliberate
  * exception: at exhausted headroom the model still receives a
  * MIN_RELAY_BUDGET_BYTES receipt of what ran, because a silent loop is worse
  * than a small overrun; the pre-turn compaction threshold is what keeps
- * headroom from reaching zero (Lumen, PR #576 rounds 2–6).
+ * headroom from reaching zero (Lumen, PR #576 rounds 2–7).
  */
 export function relayBudgetBytes(
   runtime: Pick<ChatRuntime, 'maxContextTokens'>,
-  residentBytes = 0,
   occupancyTokens?: number
 ): number {
   const occupied =
     occupancyTokens !== undefined ? Math.max(0, occupancyTokens) : runtime.maxContextTokens;
-  const residentTokens = Math.ceil(Math.max(0, residentBytes) / RELAY_BYTES_PER_TOKEN);
-  const remainingTokens = Math.max(0, runtime.maxContextTokens - occupied - residentTokens);
+  const remainingTokens = Math.max(0, runtime.maxContextTokens - occupied);
   const bytes = Math.floor(remainingTokens * RELAY_BYTES_PER_TOKEN * RELAY_HEADROOM_SHARE);
   return Math.min(MAX_RELAY_BYTES, Math.max(MIN_RELAY_BUDGET_BYTES, bytes));
 }
@@ -5549,7 +5551,6 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // the window IT was spawned into, not whatever the parent switches to
     // while it runs (Lumen, PR #576 round 4).
     const cloneMaxContextTokens = runtime.maxContextTokens;
-    const cloneIdentityPrompt = runtime.systemPromptOverride || '';
     /**
      * Only Claude actually honours a seeded provider session — the parent host
      * gates on exactly this (`canReuseBackendSession`). Codex and Gemini ignore
@@ -5578,8 +5579,26 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // This clone's own signal state — never the parent's global.
     const cloneSignal = createSignalSink();
     /** What the clone's window holds beyond its ledger — see relayBudgetBytes. */
-    let cloneResidentBytes = 0;
     let cloneOccupancyTokens: number | undefined;
+    /** The clone spawn's request; the budget measures the same shape. */
+    const cloneRequest = (
+      prompt: string,
+      sessionArgs: Record<string, string> = {}
+    ): BackendRunRequest => ({
+      backend: cloneBackend,
+      agentId,
+      model: cloneModel,
+      effort: runtime.effort,
+      prompt,
+      verbose: false,
+      passthroughArgs: clonePassthrough,
+      systemPromptOverride: runtime.systemPromptOverride,
+      timeoutMs: runtime.backendTurnTimeoutMs,
+      idleTimeoutMs: runtime.backendIdleTimeoutMs,
+      stream: true,
+      toolRouting: cloneRouting,
+      ...sessionArgs,
+    });
 
     const cloneRunTurn = async (
       body: string,
@@ -5602,21 +5621,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           : [...cloneHistory, body].join('\n\n---\n\n');
       if (!cloneCanReuseSession) cloneHistory.push(body);
 
-      const turn = startBackendTurn({
-        backend: cloneBackend,
-        agentId,
-        model: cloneModel,
-        effort: runtime.effort,
-        prompt,
-        verbose: false,
-        passthroughArgs: clonePassthrough,
-        systemPromptOverride: runtime.systemPromptOverride,
-        timeoutMs: runtime.backendTurnTimeoutMs,
-        idleTimeoutMs: runtime.backendIdleTimeoutMs,
-        stream: true,
-        toolRouting: cloneRouting,
-        ...sessionArgs,
-      });
+      const turn = startBackendTurn(cloneRequest(prompt, sessionArgs));
 
       // Ctrl+C on the parent turn kills the clone's child too, not just the
       // parent's — otherwise a cancelled turn leaves backends running.
@@ -5630,18 +5635,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
       // A native session accumulates every body and reply; a stateless one
       // re-packs its history into each prompt, so the latest prompt IS the
       // window. Either way this is what the next relay must fit beside.
-      if (cloneCanReuseSession) {
-        // A native clone session: the report covers everything so far; else
-        // the body and reply are new to it. A stateless clone re-packs its
-        // history, measured directly at budget time.
-        const cloneOccupancy = occupancyTokens(cloneBackend, result.usage);
-        if (cloneOccupancy !== undefined) {
-          cloneOccupancyTokens = cloneOccupancy;
-          cloneResidentBytes = 0;
-        } else {
-          cloneResidentBytes += utf8Bytes(prompt) + utf8Bytes(text);
-        }
-      }
+      // A native clone session: the report covers everything so far; a spawn
+      // that reported nothing leaves it unknown (the floor) until the next
+      // report. A stateless clone is measured at budget time from exactly
+      // what its next spawn would send.
+      if (cloneCanReuseSession) cloneOccupancyTokens = occupancyTokens(cloneBackend, result.usage);
       if (!cloneCanReuseSession && text.trim()) cloneHistory.push(text.trim());
       appendTranscript(record.transcriptPath, {
         type: 'backend_turn',
@@ -5698,10 +5696,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
           relayBudgetBytes: () =>
             relayBudgetBytes(
               { maxContextTokens: cloneMaxContextTokens },
-              cloneResidentBytes,
               cloneCanReuseSession
                 ? cloneOccupancyTokens
-                : utf8Bytes(cloneIdentityPrompt) + utf8Bytes(cloneHistory.join('\n\n---\n\n'))
+                : measurePreparedPromptBytes(
+                    cloneRequest([...cloneHistory, ''].join('\n\n---\n\n'))
+                  )
             ),
         },
         {
@@ -6741,32 +6740,61 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // ledger cannot see yet: every continuation body sent and every reply
     // received. The relay budget shrinks by it, or each iteration re-grants
     // the same allowance while the window fills (Lumen, PR #576 round 3).
-    let loopResidentBytes = 0;
     let loopOccupancyTokens: number | undefined;
     const nativeSession = (): boolean => Boolean(canReuseBackendSession && activeBackendSessionId);
     /**
      * After each spawn of a NATIVE session: the provider's own occupancy when
      * it reported one — it then covers everything sent and received so far,
-     * hidden thinking included — else the body and the reply are new to the
-     * window. A stateless parent measures its next packed envelope directly
-     * (relayOccupancy below): the process that reported is dead, and its body
-     * and reply are never re-sent (Lumen, PR #576 rounds 5–6).
+     * hidden thinking included. A spawn that reported nothing leaves the
+     * window UNKNOWN until the next report: what it added cannot be recovered
+     * from visible text, so the relay falls to the floor rather than trust a
+     * stale checkpoint (Lumen, PR #576 rounds 5–7). A stateless parent is
+     * measured directly (relayOccupancy below).
      */
-    const noteSpawn = (body: string, result: BackendRunResult): void => {
+    const noteSpawn = (result: BackendRunResult): void => {
       if (!nativeSession()) return;
-      const occupancy = occupancyTokens(runtime.backend, result.usage);
-      if (occupancy !== undefined) {
-        loopOccupancyTokens = occupancy;
-        loopResidentBytes = 0;
-        return;
-      }
-      loopResidentBytes += utf8Bytes(body) + utf8Bytes(result.responseText ?? '');
+      loopOccupancyTokens = occupancyTokens(runtime.backend, result.usage);
     };
-    /** What the window holds for the next relay — see relayBudgetBytes. */
+    /** The continuation spawn's request; the budget measures the same shape. */
+    const continuationRequest = (prompt: string): BackendRunRequest => ({
+      backend: runtime.backend,
+      agentId,
+      model: runtime.model,
+      effort: runtime.effort,
+      prompt,
+      verbose: runtime.verbose,
+      passthroughArgs,
+      systemPromptOverride: runtime.systemPromptOverride,
+      timeoutMs: runtime.backendTurnTimeoutMs,
+      idleTimeoutMs: runtime.backendIdleTimeoutMs,
+      stream: true,
+      onEvent: handleBackendEvent,
+      attachmentDirs: sessionAttachmentDirs.length > 0 ? sessionAttachmentDirs : undefined,
+      toolRouting: runtime.toolRouting,
+      // Same logical turn — media rides along (WITHOUT deliverMedia) so the
+      // adapter's boundary disposition (--tools gate) cannot flap between the
+      // delivery spawn and tool-loop continuations, while the resumed provider
+      // session is never re-fed images it already holds. Stateless adapters
+      // re-attach from `media` regardless.
+      media: turnMedia.length > 0 ? turnMedia : undefined,
+      // Resume the live provider session so this round-trip appends to the
+      // same Claude thread instead of re-piping the whole window.
+      ...(activeBackendSessionId ? { backendSessionId: activeBackendSessionId } : {}),
+    });
+    /**
+     * What the window holds for the next relay — see relayBudgetBytes. A
+     * stateless parent's is the bytes of exactly what its next spawn would
+     * hand the backend, prepared and cleaned up without spawning: the
+     * envelope of the ledger PLUS the adapter's system prompt, tool
+     * instructions and media (a 30K-character system override measured
+     * 3,602 by the envelope alone; Lumen, PR #576 round 7).
+     */
     const relayOccupancy = (): number | undefined =>
       nativeSession()
         ? loopOccupancyTokens
-        : utf8Bytes(buildPromptEnvelope(agentId, runtime, ledger, ''));
+        : measurePreparedPromptBytes(
+            continuationRequest(buildPromptEnvelope(agentId, runtime, ledger, ''))
+          );
 
     const runTurnForLoop = async (
       body: string,
@@ -6940,7 +6968,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         }
 
         lastRunResult = runResult;
-        noteSpawn(body, runResult);
+        noteSpawn(runResult);
         return runResult;
       }
 
@@ -6994,37 +7022,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       turnDialogue.push({ role: 'runtime', text: body });
 
       beginSpawn();
-      const contTurn = startBackendTurn({
-        backend: runtime.backend,
-        agentId,
-        model: runtime.model,
-        effort: runtime.effort,
-        prompt: continuationPrompt,
-        verbose: runtime.verbose,
-        passthroughArgs,
-        systemPromptOverride: runtime.systemPromptOverride,
-        timeoutMs: runtime.backendTurnTimeoutMs,
-        idleTimeoutMs: runtime.backendIdleTimeoutMs,
-        stream: true,
-        onEvent: handleBackendEvent,
-        attachmentDirs: sessionAttachmentDirs.length > 0 ? sessionAttachmentDirs : undefined,
-        toolRouting: runtime.toolRouting,
-        // Same logical turn — media rides along (WITHOUT deliverMedia) so the
-        // adapter's boundary disposition (--tools gate) cannot flap between the
-        // delivery spawn and tool-loop continuations, while the resumed provider
-        // session is never re-fed images it already holds. Stateless adapters
-        // re-attach from `media` regardless.
-        media: turnMedia.length > 0 ? turnMedia : undefined,
-        // A mid-turn SEED is a delivery spawn by definition: the replacement
-        // native session has never seen this turn's images, and local routing
-        // withholds native Read, so without this the model cannot reach the
-        // attachment at all (Lumen, PR #577). Resume still omits it.
-        ...(turnMedia.length > 0 && decision.mode === 'seed' ? { deliverMedia: true } : {}),
-        // Resume the live provider session so this round-trip appends to the
-        // same Claude thread instead of re-piping the whole window — or seed
-        // the replacement when it was rolled mid-turn.
-        ...sessionArgs,
-      });
+      const contTurn = startBackendTurn(continuationRequest(continuationPrompt));
       currentTurnAbort = contTurn.abort;
 
       const contResult = await contTurn.result.finally(() => {
@@ -7035,7 +7033,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       lastRunResult = contResult;
       recordRunUsage(contResult.usage);
       sampleProviderContext(contResult.usage);
-      noteSpawn(body, contResult);
+      noteSpawn(contResult);
       return contResult;
     };
 
@@ -7046,7 +7044,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           prompt,
           toolRouting: runtime.toolRouting,
           signal: turnAbort.signal,
-          relayBudgetBytes: () => relayBudgetBytes(runtime, loopResidentBytes, relayOccupancy()),
+          relayBudgetBytes: () => relayBudgetBytes(runtime, relayOccupancy()),
         },
         {
           ui: {
