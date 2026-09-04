@@ -142,8 +142,11 @@ function toUsage(u: Record<string, unknown>, lastRequest?: ContextParts): Backen
   const outputTokens = num(u.output_tokens);
   const cacheReadTokens = num(u.cache_read_input_tokens);
   const cacheWriteTokens = num(u.cache_creation_input_tokens);
+  // ONE decision: a per-request sample, or nothing. No aggregate fallback.
   const request = lastRequest ?? lastMessageIteration(u.iterations);
-  const contextTokens = request ? providerContextTokens('claude', request) : undefined;
+  const window = request
+    ? { contextTokens: providerContextTokens('claude', request), contextParts: request }
+    : undefined;
   return {
     backend: 'claude',
     source: 'json',
@@ -151,7 +154,7 @@ function toUsage(u: Record<string, unknown>, lastRequest?: ContextParts): Backen
     outputTokens,
     cacheReadTokens,
     cacheWriteTokens,
-    ...(contextTokens !== undefined && request ? { contextTokens, contextParts: request } : {}),
+    ...(window?.contextTokens !== undefined ? window : {}),
     totalTokens:
       inputTokens !== undefined && outputTokens !== undefined
         ? inputTokens + outputTokens
