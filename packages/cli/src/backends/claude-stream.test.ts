@@ -570,6 +570,58 @@ describe('result usage carries the context the FINAL request was handed (Lumen, 
     }
   );
 
+  it('REGRESSION (Lumen, round 5): a NEWER message with no usable usage resets the window — no inheritance', () => {
+    const parser = new ClaudeStreamParser();
+    const m2 = (extra: Record<string, unknown>) =>
+      JSON.stringify({
+        type: 'assistant',
+        message: { id: 'm2', content: [{ type: 'text', text: 'more' }], ...extra },
+      }) + '\n';
+    // No usage at all on the newer message → unknown, not m1's 40,010.
+    const a = new ClaudeStreamParser();
+    const gone = [
+      ...a.push(assistant({ input_tokens: 10, cache_read_input_tokens: 40_000 })),
+      ...a.push(m2({})),
+      ...a.push(result({ input_tokens: 15, cache_read_input_tokens: 940_000 })),
+    ];
+    expect(usageOf(gone)?.contextTokens).toBeUndefined();
+    // Unreadable usage on the newer message → the same.
+    const unreadable = [
+      ...parser.push(assistant({ input_tokens: 10, cache_read_input_tokens: 40_000 })),
+      ...parser.push(m2({ usage: { foo: 'bar' } })),
+      ...parser.push(result({ input_tokens: 15 })),
+    ];
+    expect(usageOf(unreadable)?.contextTokens).toBeUndefined();
+    // …and the iteration fallback is no longer suppressed by the stale sample.
+    const b = new ClaudeStreamParser();
+    const viaIterations = [
+      ...b.push(assistant({ input_tokens: 10, cache_read_input_tokens: 40_000 })),
+      ...b.push(m2({})),
+      ...b.push(
+        result({
+          input_tokens: 15,
+          iterations: [{ type: 'message', input_tokens: 5, cache_read_input_tokens: 70_000 }],
+        })
+      ),
+    ];
+    expect(usageOf(viaIterations)?.contextTokens).toBe(70_005);
+  });
+
+  it('a later block of the SAME message keeps what that message reported', () => {
+    const parser = new ClaudeStreamParser();
+    const events = [
+      ...parser.push(assistant({ input_tokens: 10, cache_read_input_tokens: 40_000 })),
+      ...parser.push(
+        JSON.stringify({
+          type: 'assistant',
+          message: { id: 'm1', content: [{ type: 'text', text: 'again' }] },
+        }) + '\n'
+      ),
+      ...parser.push(result({ input_tokens: 15 })),
+    ];
+    expect(usageOf(events)?.contextTokens).toBe(40_010);
+  });
+
   it("a subagent's assistant events (parent_tool_use_id) never become this session's window", () => {
     const parser = new ClaudeStreamParser();
     const events = [

@@ -186,6 +186,7 @@ export class ClaudeStreamParser implements BackendStreamParser {
    * are skipped, as claude-runner does (Lumen, PR #583 round 3).
    */
   private lastRequestUsage: ContextParts | undefined;
+  private lastRequestMessageId: string | undefined;
 
   push(chunk: string): BackendTurnEvent[] {
     this.buffer += chunk;
@@ -218,9 +219,24 @@ export class ClaudeStreamParser implements BackendStreamParser {
 
     switch (ev.type) {
       case 'assistant': {
-        if (!ev.parent_tool_use_id && ev.message?.usage && typeof ev.message.usage === 'object') {
-          const parts = requestParts(ev.message.usage);
-          if (parts) this.lastRequestUsage = parts;
+        if (!ev.parent_tool_use_id) {
+          const messageId = typeof ev.message?.id === 'string' ? ev.message.id : undefined;
+          const parts =
+            ev.message?.usage && typeof ev.message.usage === 'object'
+              ? requestParts(ev.message.usage)
+              : undefined;
+          if (parts) {
+            this.lastRequestUsage = parts;
+            this.lastRequestMessageId = messageId;
+          } else if (messageId === undefined || messageId !== this.lastRequestMessageId) {
+            // A NEWER message that reported nothing usable: the previous
+            // message's measurement no longer describes the window, and
+            // keeping it would suppress the iteration fallback and the honest
+            // "unknown" (Lumen, PR #583 round 5). A later block of the SAME
+            // message keeps what that message already reported.
+            this.lastRequestUsage = undefined;
+            this.lastRequestMessageId = messageId;
+          }
         }
         const content = ev.message?.content;
         if (!Array.isArray(content)) break;
