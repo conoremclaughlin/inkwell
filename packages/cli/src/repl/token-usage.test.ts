@@ -16,7 +16,8 @@ describe('extractBackendTokenUsage', () => {
   });
 
   it('parses text usage payloads with suffixes', () => {
-    const stderr = 'Input tokens: 1.2k\nOutput tokens: 450\nTotal tokens: 1.65k\nCache read tokens: 300';
+    const stderr =
+      'Input tokens: 1.2k\nOutput tokens: 450\nTotal tokens: 1.65k\nCache read tokens: 300';
     const usage = extractBackendTokenUsage('claude', '', stderr);
 
     expect(usage).toMatchObject({
@@ -60,5 +61,25 @@ describe('formatBackendTokenUsage', () => {
     expect(formatted).toContain('in 1,000');
     expect(formatted).toContain('out 200');
     expect(formatted).toContain('total 1,200');
+  });
+});
+
+describe('Gemini usage fields (Lumen, PR #576 round 6)', () => {
+  it('thoughtsTokenCount and totalTokenCount are normalized', () => {
+    const usage = extractBackendTokenUsage(
+      'gemini',
+      JSON.stringify({
+        usage: {
+          promptTokenCount: 90_000,
+          candidatesTokenCount: 500,
+          thoughtsTokenCount: 2_000,
+          totalTokenCount: 92_500,
+        },
+      }),
+      ''
+    );
+    expect(usage?.inputTokens).toBe(90_000);
+    expect(usage?.reasoningTokens).toBe(2_000);
+    expect(usage?.totalTokens).toBe(92_500);
   });
 });

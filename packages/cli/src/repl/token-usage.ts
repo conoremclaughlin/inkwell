@@ -94,7 +94,12 @@ function normalizeUsageObject(
     (usageCandidate.completion as Record<string, unknown> | undefined)?.tokens
   );
 
-  const totalTokens = pick(usageCandidate.total_tokens, usageCandidate.totalTokens);
+  // Gemini reports totalTokenCount (prompt + candidates + thoughts).
+  const totalTokens = pick(
+    usageCandidate.total_tokens,
+    usageCandidate.totalTokens,
+    usageCandidate.totalTokenCount
+  );
 
   const cacheReadTokens = pick(
     usageCandidate.cache_read_tokens,
@@ -114,6 +119,7 @@ function normalizeUsageObject(
   const reasoningTokens = pick(
     usageCandidate.reasoning_tokens,
     usageCandidate.reasoningTokens,
+    usageCandidate.thoughtsTokenCount,
     (usageCandidate.output_tokens_details as Record<string, unknown> | undefined)?.reasoning_tokens
   );
 

@@ -736,76 +736,56 @@ describe('one-turn process recovery sequence — detection outlives the seed (PR
 });
 
 describe('relayBudgetBytes — the relay budget follows the live headroom (Lumen, PR #576)', () => {
-  const ledgerWith = (tokens: number) => ({ totalTokens: () => tokens });
-  const runtime = { maxContextTokens: 128_000, bootstrapContext: 'x'.repeat(40_000) };
-  // What the provider would report for that window: 10K identity + 90K ledger.
+  const runtime = { maxContextTokens: 128_000 };
   const occupancy = 100_000;
 
   it('a roomy 1M window gets the full static ceiling', () => {
-    expect(
-      relayBudgetBytes(
-        { maxContextTokens: 1_000_000, bootstrapContext: '' },
-        ledgerWith(300_000),
-        0,
-        300_000
-      )
-    ).toBe(MAX_RELAY_BYTES);
+    expect(relayBudgetBytes({ maxContextTokens: 1_000_000 }, 0, 300_000)).toBe(MAX_RELAY_BYTES);
   });
 
   it('a 128K window most of the way to its budget gets far less than the ceiling', () => {
     // 128K − 100K occupied = 28K tokens; half of that, in bytes.
-    const budget = relayBudgetBytes(runtime, ledgerWith(90_000), 0, occupancy);
+    const budget = relayBudgetBytes(runtime, 0, occupancy);
     expect(budget).toBe(28_000 * RELAY_BYTES_PER_TOKEN * RELAY_HEADROOM_SHARE);
     expect(budget).toBeLessThan(MAX_RELAY_BYTES);
   });
 
   it("REGRESSION (Lumen, round 5): the provider's own occupancy is what the window holds — not an estimate", () => {
-    // The estimate would say 100K; the provider says 118K (hidden thinking,
-    // cache writes the estimate cannot see). The provider wins.
-    const estimated = relayBudgetBytes(runtime, ledgerWith(90_000), 0, 100_000);
-    const measured = relayBudgetBytes(runtime, ledgerWith(90_000), 0, 118_000);
+    const measured = relayBudgetBytes(runtime, 0, 118_000);
     expect(measured).toBe(Math.floor(10_000 * RELAY_BYTES_PER_TOKEN * RELAY_HEADROOM_SHARE));
-    expect(measured).toBeLessThan(estimated);
+    expect(measured).toBeLessThan(relayBudgetBytes(runtime, 0, 100_000));
   });
 
-  it('REGRESSION (Lumen, round 5): without a provider report the packed prompt is assumed at the byte bound — the floor', () => {
-    // 40K bootstrap bytes + 90K tokens × 4 chars ≈ 400K bytes ≥ the 128K window.
-    expect(relayBudgetBytes(runtime, ledgerWith(90_000))).toBe(MIN_RELAY_BUDGET_BYTES);
-    // A small prompt without a report still gets a real budget.
-    const tiny = relayBudgetBytes(
-      { maxContextTokens: 128_000, bootstrapContext: '' },
-      ledgerWith(2_000)
+  it('REGRESSION (Lumen, round 6): with NO occupancy nothing is assumed recoverable — the floor, whatever the ledger', () => {
+    // A chars-per-token estimate of a 30K-character CJK ledger counted 30,000
+    // against a 183,624-byte envelope and granted 49K on a 128K window.
+    expect(relayBudgetBytes(runtime)).toBe(MIN_RELAY_BUDGET_BYTES);
+    expect(relayBudgetBytes({ maxContextTokens: 1_000_000 })).toBe(MIN_RELAY_BUDGET_BYTES);
+  });
+
+  it('a stateless parent hands in its packed envelope bytes as the occupancy — exact for what it will send', () => {
+    // 183,624 bytes of envelope on a 400K window: budgeted from real bytes.
+    expect(relayBudgetBytes({ maxContextTokens: 400_000 }, 0, 183_624)).toBe(
+      Math.floor((400_000 - 183_624) * RELAY_BYTES_PER_TOKEN * RELAY_HEADROOM_SHARE)
     );
-    expect(tiny).toBe(Math.floor((128_000 - 8_000) * RELAY_BYTES_PER_TOKEN * RELAY_HEADROOM_SHARE));
   });
 
   it('REGRESSION (Lumen, rounds 3–4): the relay costs at most half the headroom for ANY script', () => {
     expect(RELAY_BYTES_PER_TOKEN).toBe(1);
-    const remaining = 28_000;
-    const budget = relayBudgetBytes(runtime, ledgerWith(90_000), 0, occupancy);
-    expect(budget / RELAY_BYTES_PER_TOKEN).toBeLessThanOrEqual(remaining * RELAY_HEADROOM_SHARE);
+    const budget = relayBudgetBytes(runtime, 0, occupancy);
+    expect(budget / RELAY_BYTES_PER_TOKEN).toBeLessThanOrEqual(28_000 * RELAY_HEADROOM_SHARE);
   });
 
   it('REGRESSION (Lumen, round 3): what a native session sent and received since the last report shrinks the next allowance', () => {
-    const fresh = relayBudgetBytes(runtime, ledgerWith(90_000), 0, occupancy);
-    // 15K resident bytes count as 15K tokens at the bound: 28K → 13K remaining.
-    const later = relayBudgetBytes(runtime, ledgerWith(90_000), 15_000, occupancy);
+    const fresh = relayBudgetBytes(runtime, 0, occupancy);
+    const later = relayBudgetBytes(runtime, 15_000, occupancy);
     expect(later).toBeLessThan(fresh);
     expect(later).toBe(Math.floor(13_000 * RELAY_BYTES_PER_TOKEN * RELAY_HEADROOM_SHARE));
-    expect(relayBudgetBytes(runtime, ledgerWith(90_000), 60_000, occupancy)).toBe(
-      MIN_RELAY_BUDGET_BYTES
-    );
+    expect(relayBudgetBytes(runtime, 60_000, occupancy)).toBe(MIN_RELAY_BUDGET_BYTES);
   });
 
   it('never starves a relay: a window past its budget still gets the minimum — the documented exception', () => {
-    expect(
-      relayBudgetBytes(
-        { maxContextTokens: 128_000, bootstrapContext: '' },
-        ledgerWith(200_000),
-        0,
-        200_000
-      )
-    ).toBe(MIN_RELAY_BUDGET_BYTES);
+    expect(relayBudgetBytes(runtime, 0, 200_000)).toBe(MIN_RELAY_BUDGET_BYTES);
   });
 });
 
@@ -820,7 +800,31 @@ describe("occupancyTokens — what the session holds after a reply, by the provi
       })
     ).toBe(108_000);
   });
-  it('OpenAI/Gemini: input already includes the cache; plus output', () => {
+  it('REGRESSION (Lumen, round 6): Gemini — totalTokenCount includes thoughts; the total wins', () => {
+    // The total is authoritative even when the parts do not add up to it
+    // (a provider may count more than it itemizes).
+    expect(
+      occupancyTokens('gemini', {
+        inputTokens: 90_000,
+        outputTokens: 500,
+        reasoningTokens: 2_000,
+        totalTokens: 93_000,
+      })
+    ).toBe(93_000);
+    // Without a total: prompt + output + reasoning, never prompt + output alone.
+    expect(
+      occupancyTokens('gemini', { inputTokens: 90_000, outputTokens: 500, reasoningTokens: 2_000 })
+    ).toBe(92_500);
+  });
+  it('OpenAI: total_tokens (prompt + completion incl. reasoning), else the parts; cache never double-counted', () => {
+    expect(
+      occupancyTokens('codex', {
+        inputTokens: 90_000,
+        cacheReadTokens: 80_000,
+        outputTokens: 500,
+        totalTokens: 91_000,
+      })
+    ).toBe(91_000);
     expect(
       occupancyTokens('codex', { inputTokens: 90_000, cacheReadTokens: 80_000, outputTokens: 500 })
     ).toBe(90_500);
@@ -828,5 +832,6 @@ describe("occupancyTokens — what the session holds after a reply, by the provi
   it('undefined without a usable prompt count', () => {
     expect(occupancyTokens('claude', undefined)).toBeUndefined();
     expect(occupancyTokens('claude', { outputTokens: 5 })).toBeUndefined();
+    expect(occupancyTokens('gemini', { outputTokens: 5 })).toBeUndefined();
   });
 });

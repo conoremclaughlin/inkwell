@@ -70,7 +70,6 @@ import {
   type LedgerReplayMeta,
   type LedgerRole,
 } from '../repl/context-ledger.js';
-import { DEFAULT_CHARS_PER_TOKEN } from '../repl/context-ledger.js';
 import {
   resolveModelContextWindow as resolveBackendTokenWindow,
   contextBudgetForWindow as defaultContextBudget,
@@ -2814,21 +2813,33 @@ export function occupancyTokens(
   usage:
     | Pick<
         BackendTokenUsage,
-        'inputTokens' | 'cacheReadTokens' | 'cacheWriteTokens' | 'outputTokens'
+        | 'inputTokens'
+        | 'cacheReadTokens'
+        | 'cacheWriteTokens'
+        | 'outputTokens'
+        | 'totalTokens'
+        | 'reasoningTokens'
       >
     | undefined
 ): number | undefined {
   if (!usage) return undefined;
-  const summedCache = backend.toLowerCase() === 'claude' || backend.toLowerCase() === 'anthropic';
-  const prompt = summedCache
-    ? [usage.inputTokens, usage.cacheReadTokens, usage.cacheWriteTokens].filter(
-        (n): n is number => n !== undefined
-      )
-    : usage.inputTokens !== undefined
-      ? [usage.inputTokens]
-      : [];
-  if (prompt.length === 0) return undefined;
-  return prompt.reduce((a, b) => a + b, 0) + (usage.outputTokens ?? 0);
+  const name = backend.toLowerCase();
+  if (name === 'claude' || name === 'anthropic') {
+    // Anthropic's cache fields are disjoint from input; its total is input +
+    // output only, so the parts are summed here.
+    const prompt = [usage.inputTokens, usage.cacheReadTokens, usage.cacheWriteTokens].filter(
+      (n): n is number => n !== undefined
+    );
+    if (prompt.length === 0) return undefined;
+    return prompt.reduce((a, b) => a + b, 0) + (usage.outputTokens ?? 0);
+  }
+  // OpenAI and Gemini: the reported total already includes the cached prompt
+  // and hidden reasoning (Gemini's thoughtsTokenCount is part of
+  // totalTokenCount); without a total, prompt + output + reasoning (Lumen,
+  // PR #576 round 6).
+  if (usage.totalTokens !== undefined) return usage.totalTokens;
+  if (usage.inputTokens === undefined) return undefined;
+  return usage.inputTokens + (usage.outputTokens ?? 0) + (usage.reasoningTokens ?? 0);
 }
 
 /**
@@ -2837,33 +2848,30 @@ export function occupancyTokens(
  * RELAY_BYTES_PER_TOKEN — clamped between MIN_RELAY_BUDGET_BYTES and
  * MAX_RELAY_BYTES.
  *
- * What it holds is `occupancyTokens` — the provider's own count after the
- * last reply — when the backend reported one, plus `residentBytes` sent or
- * received since that report (native sessions only; a stateless parent
- * re-packs from the ledger, so nothing accumulates), at one token per byte.
- * Without a report, the fallback is the packed prompt's own bytes at the
- * same bound: identity context plus the ledger, which for any real session
- * means the floor. A backend that reports nothing gets no benefit of the
- * doubt.
+ * What it holds is `occupancyTokens`, which the host supplies: for a native
+ * session the provider's own count after the last reply, plus `residentBytes`
+ * sent or received since that report at one token per byte; for a stateless
+ * parent the UTF-8 bytes of the envelope it is about to re-pack, measured
+ * directly (a report from the previous, now-dead process would count a body
+ * and reply that are never re-sent). With NO occupancy — a native session
+ * whose backend reported nothing — nothing is assumed recoverable and the
+ * relay gets the floor: a chars-per-token estimate of the ledger was neither
+ * the packed bytes nor the hidden native state (Lumen, PR #576 round 6:
+ * a 30K-character CJK ledger counted 30,000 against a 183,624-byte envelope).
  *
  * The bound is exact for the relay string. The floor is the one deliberate
  * exception: at exhausted headroom the model still receives a
  * MIN_RELAY_BUDGET_BYTES receipt of what ran, because a silent loop is worse
  * than a small overrun; the pre-turn compaction threshold is what keeps
- * headroom from reaching zero (Lumen, PR #576 rounds 2–5).
+ * headroom from reaching zero (Lumen, PR #576 rounds 2–6).
  */
 export function relayBudgetBytes(
-  runtime: Pick<ChatRuntime, 'maxContextTokens' | 'bootstrapContext'>,
-  ledger: Pick<ContextLedger, 'totalTokens'>,
+  runtime: Pick<ChatRuntime, 'maxContextTokens'>,
   residentBytes = 0,
   occupancyTokens?: number
 ): number {
-  const packedPromptBytes =
-    utf8Bytes(runtime.bootstrapContext ?? '') + ledger.totalTokens() * DEFAULT_CHARS_PER_TOKEN;
   const occupied =
-    occupancyTokens !== undefined
-      ? Math.max(0, occupancyTokens)
-      : Math.ceil(packedPromptBytes / RELAY_BYTES_PER_TOKEN);
+    occupancyTokens !== undefined ? Math.max(0, occupancyTokens) : runtime.maxContextTokens;
   const residentTokens = Math.ceil(Math.max(0, residentBytes) / RELAY_BYTES_PER_TOKEN);
   const remainingTokens = Math.max(0, runtime.maxContextTokens - occupied - residentTokens);
   const bytes = Math.floor(remainingTokens * RELAY_BYTES_PER_TOKEN * RELAY_HEADROOM_SHARE);
@@ -5247,14 +5255,17 @@ export async function runChat(options: ChatOptions): Promise<void> {
       // A native session accumulates every body and reply; a stateless one
       // re-packs its history into each prompt, so the latest prompt IS the
       // window. Either way this is what the next relay must fit beside.
-      const cloneOccupancy = occupancyTokens(cloneBackend, result.usage);
-      if (cloneOccupancy !== undefined) {
-        cloneOccupancyTokens = cloneOccupancy;
-        cloneResidentBytes = 0;
-      } else {
-        cloneResidentBytes = cloneCanReuseSession
-          ? cloneResidentBytes + utf8Bytes(prompt) + utf8Bytes(text)
-          : utf8Bytes(prompt) + utf8Bytes(text);
+      if (cloneCanReuseSession) {
+        // A native clone session: the report covers everything so far; else
+        // the body and reply are new to it. A stateless clone re-packs its
+        // history, measured directly at budget time.
+        const cloneOccupancy = occupancyTokens(cloneBackend, result.usage);
+        if (cloneOccupancy !== undefined) {
+          cloneOccupancyTokens = cloneOccupancy;
+          cloneResidentBytes = 0;
+        } else {
+          cloneResidentBytes += utf8Bytes(prompt) + utf8Bytes(text);
+        }
       }
       if (!cloneCanReuseSession && text.trim()) cloneHistory.push(text.trim());
       appendTranscript(record.transcriptPath, {
@@ -5309,10 +5320,11 @@ export async function runChat(options: ChatOptions): Promise<void> {
           // #576 round 3).
           relayBudgetBytes: () =>
             relayBudgetBytes(
-              { maxContextTokens: cloneMaxContextTokens, bootstrapContext: cloneIdentityPrompt },
-              cloneLedgerFor(record.transcriptPath),
+              { maxContextTokens: cloneMaxContextTokens },
               cloneResidentBytes,
-              cloneOccupancyTokens
+              cloneCanReuseSession
+                ? cloneOccupancyTokens
+                : utf8Bytes(cloneIdentityPrompt) + utf8Bytes(cloneHistory.join('\n\n---\n\n'))
             ),
         },
         {
@@ -6345,24 +6357,30 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // the same allowance while the window fills (Lumen, PR #576 round 3).
     let loopResidentBytes = 0;
     let loopOccupancyTokens: number | undefined;
+    const nativeSession = (): boolean => Boolean(canReuseBackendSession && activeBackendSessionId);
     /**
-     * After each spawn: the provider's own occupancy when it reported one —
-     * it then covers everything sent and received so far, hidden thinking
-     * included — else, for a native session only, the body and the reply
-     * are new to the window. A stateless parent re-packs from the ledger
-     * each time, so nothing accumulates (Lumen, PR #576 round 5).
+     * After each spawn of a NATIVE session: the provider's own occupancy when
+     * it reported one — it then covers everything sent and received so far,
+     * hidden thinking included — else the body and the reply are new to the
+     * window. A stateless parent measures its next packed envelope directly
+     * (relayOccupancy below): the process that reported is dead, and its body
+     * and reply are never re-sent (Lumen, PR #576 rounds 5–6).
      */
     const noteSpawn = (body: string, result: BackendRunResult): void => {
+      if (!nativeSession()) return;
       const occupancy = occupancyTokens(runtime.backend, result.usage);
       if (occupancy !== undefined) {
         loopOccupancyTokens = occupancy;
         loopResidentBytes = 0;
         return;
       }
-      if (canReuseBackendSession && activeBackendSessionId) {
-        loopResidentBytes += utf8Bytes(body) + utf8Bytes(result.responseText ?? '');
-      }
+      loopResidentBytes += utf8Bytes(body) + utf8Bytes(result.responseText ?? '');
     };
+    /** What the window holds for the next relay — see relayBudgetBytes. */
+    const relayOccupancy = (): number | undefined =>
+      nativeSession()
+        ? loopOccupancyTokens
+        : utf8Bytes(buildPromptEnvelope(agentId, runtime, ledger, ''));
 
     const runTurnForLoop = async (
       body: string,
@@ -6594,8 +6612,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
           prompt,
           toolRouting: runtime.toolRouting,
           signal: turnAbort.signal,
-          relayBudgetBytes: () =>
-            relayBudgetBytes(runtime, ledger, loopResidentBytes, loopOccupancyTokens),
+          relayBudgetBytes: () => relayBudgetBytes(runtime, loopResidentBytes, relayOccupancy()),
         },
         {
           ui: {
