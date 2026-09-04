@@ -2964,6 +2964,21 @@ export function ledgerEntryPromptBytes(entry: {
 export const CLONE_HISTORY_SEPARATOR = '\n\n---\n\n';
 
 /**
+ * Local tools after which a stateless provider's next fresh spawn may see a
+ * DIFFERENT discovered context: a write or edit can change AGENTS.md, a shell
+ * can change anything. The previous report's prompt count then no longer
+ * describes the next envelope, so the stateless count is dropped to unknown
+ * (the floor) until the next report (Lumen, PR #576 round 12).
+ */
+export const CONTEXT_MUTATING_TOOLS: ReadonlySet<string> = new Set([
+  'write',
+  'edit',
+  'multi_edit',
+  'apply_patch',
+  'bash',
+]);
+
+/**
  * How many UTF-8 bytes the next relay message may be, from the window's live
  * headroom: the window minus what it holds, times RELAY_HEADROOM_SHARE, at
  * RELAY_BYTES_PER_TOKEN — clamped between MIN_RELAY_BUDGET_BYTES and
@@ -2981,6 +2996,13 @@ export const CLONE_HISTORY_SEPARATOR = '\n\n---\n\n';
  * older entries can never net an addition away); the previous body is inside
  * the count and is not re-sent, which is slack in the safe direction. With no
  * occupancy the relay gets the floor.
+ *
+ * The one named assumption for a stateless parent: what the provider
+ * discovers on its own (instruction files, tool schemas) is the same on the
+ * next spawn as on the reported one. Ink drops the count to unknown after any
+ * of its own CONTEXT_MUTATING_TOOLS; drift caused OUTSIDE this process — another
+ * process editing AGENTS.md between spawns — is not detected and is accepted
+ * as the limit of what the runtime can know (Lumen, PR #576 round 12).
  *
  * The bound is exact for the relay string. The floor is the one deliberate
  * exception: at exhausted headroom the model still receives a
@@ -4404,6 +4426,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
   // resumed native session would be stale, so runUserTurn invalidates and
   // reseeds. Subsumes the backend check (backend is part of the shape).
   let activeBackendSessionShape: string | undefined;
+  // The stateless parent budget state, per turn (reset at turn start): the
+  // last report's prompt count and the ledger high-water id it was taken
+  // against. Held here, not in the turn, because the local-tool executor
+  // that invalidates it is declared before the turn (PR #576 round 12).
+  let statelessPromptTokens: number | undefined;
+  let ledgerMaxIdAtReport = -1;
   /**
    * Drop the native session so the next spawn seeds a fresh one from the
    * ledger. The marker keeps a later process from recovering the dropped id
@@ -6429,6 +6457,12 @@ export async function runChat(options: ChatOptions): Promise<void> {
               'local-tool'
             );
           }
+          // A write, edit or shell may have changed what a stateless provider
+          // discovers on its next fresh spawn: the previous prompt count no
+          // longer describes it (Lumen, PR #576 round 12).
+          if (CONTEXT_MUTATING_TOOLS.has(bareToolName(result.tool))) {
+            statelessPromptTokens = undefined;
+          }
           iterationResults.push({
             tool: result.tool,
             result: result.result,
@@ -6797,8 +6831,9 @@ export async function runChat(options: ChatOptions): Promise<void> {
     // A stateless parent: the last report's prompt tokens and the highest
     // ledger entry id at that moment, so every entry added since is charged at
     // its rendered bytes — by id, never as a net total an eviction could hide.
-    let statelessPromptTokens: number | undefined;
-    let ledgerMaxIdAtReport = -1;
+    statelessPromptTokens = undefined;
+    ledgerMaxIdAtReport = -1;
+    const maxLedgerId = (): number => ledger.listEntries().reduce((m, e) => Math.max(m, e.id), -1);
     const nativeSession = (): boolean => Boolean(canReuseBackendSession && activeBackendSessionId);
     /**
      * After each spawn. NATIVE session: the provider's own occupancy when it
@@ -6810,13 +6845,16 @@ export async function runChat(options: ChatOptions): Promise<void> {
      * size at that moment; the reply is not re-sent and is not counted
      * (Lumen, PR #576 rounds 5–10).
      */
-    const noteSpawn = (result: BackendRunResult): void => {
+    const noteSpawn = (result: BackendRunResult, ledgerIdBeforeSpawn: number): void => {
       if (nativeSession()) {
         loopOccupancyTokens = occupancyTokens(runtime.backend, result.usage);
         return;
       }
       statelessPromptTokens = promptTokensOf(runtime.backend, result.usage);
-      ledgerMaxIdAtReport = ledger.listEntries().reduce((m, e) => Math.max(m, e.id), -1);
+      // The high-water id from BEFORE the spawn: an entry polled in while the
+      // backend ran (inbox, activity) is absent from the reported prompt and
+      // must be charged, not marked covered (Lumen, PR #576 round 12).
+      ledgerMaxIdAtReport = ledgerIdBeforeSpawn;
     };
     /** The continuation spawn's request; the budget measures the same shape. */
     const continuationRequest = (prompt: string): BackendRunRequest => ({
@@ -6864,6 +6902,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       ctx: { isContinuation: boolean }
     ): Promise<BackendTurnOutcome> => {
       if (!ctx.isContinuation) {
+        const ledgerIdBeforeSpawn = maxLedgerId();
         beginSpawn();
         const turn = startBackendTurn({
           backend: runtime.backend,
@@ -7031,7 +7070,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
         }
 
         lastRunResult = runResult;
-        noteSpawn(runResult);
+        noteSpawn(runResult, ledgerIdBeforeSpawn);
         return runResult;
       }
 
@@ -7085,6 +7124,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       turnDialogue.push({ role: 'runtime', text: body });
 
       beginSpawn();
+      const ledgerIdBeforeSpawn = maxLedgerId();
       const contTurn = startBackendTurn(continuationRequest(continuationPrompt));
       currentTurnAbort = contTurn.abort;
 
@@ -7096,7 +7136,7 @@ export async function runChat(options: ChatOptions): Promise<void> {
       lastRunResult = contResult;
       recordRunUsage(contResult.usage);
       sampleProviderContext(contResult.usage);
-      noteSpawn(contResult);
+      noteSpawn(contResult, ledgerIdBeforeSpawn);
       return contResult;
     };
 
