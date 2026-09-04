@@ -1404,6 +1404,12 @@ const INTERNAL_SYSTEM_SOURCES = new Set([
   'auto-run',
   'hook-history',
   'bootstrap',
+  // The auto-evict tombstone (and a context note's fallback source): a
+  // runtime notice for the model, never a visible system message — through
+  // a compaction's kept tail as well as by direct replay (Lumen, PR #584
+  // round 3).
+  AUTO_EVICT_TOMBSTONE_SOURCE,
+  'context-note',
 ]);
 
 function compactForHistoryPreview(

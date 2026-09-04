@@ -529,6 +529,41 @@ describe('hydrateLedgerFromTranscript — a persisted context note survives reat
     rmSync(dir, { recursive: true, force: true });
   });
 
+  it('stays hidden from the replay preview when it rides a compaction kept tail (Lumen, round 3)', () => {
+    writeFileSync(
+      transcriptPath,
+      [
+        { eid: 1, type: 'user', content: 'q' },
+        {
+          eid: 2,
+          type: 'compaction',
+          summary: 'the summary',
+          keptEntries: [
+            {
+              role: 'system',
+              content:
+                '[2 earlier tool results were cleared … write calls that RAN (send_response)]',
+              source: 'auto-evict',
+            },
+            { role: 'assistant', content: 'kept answer', source: 'claude' },
+          ],
+        },
+      ]
+        .map((e) => JSON.stringify(e))
+        .join('\n') + '\n'
+    );
+    const ledger = new ContextLedger();
+    const result = hydrateLedgerFromTranscript(ledger, transcriptPath);
+    // In the window (the model needs it) …
+    expect(ledger.listEntries().some((e) => e.source === 'auto-evict')).toBe(true);
+    // … but never a visible system message in the scrollback replay — the
+    // same classification a direct replay gets.
+    expect(result.tailPreview.some((p) => p.content.includes('tool results were cleared'))).toBe(
+      false
+    );
+    expect(result.tailPreview.some((p) => p.content.includes('kept answer'))).toBe(true);
+  });
+
   it('replays the auto-evict tombstone as the system entry it was live', () => {
     writeFileSync(
       transcriptPath,

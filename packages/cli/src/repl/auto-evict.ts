@@ -29,31 +29,121 @@ export const AUTO_EVICT_MIN_SHARE = 0.05;
 export interface AutoEvictSelection {
   ids: number[];
   tokens: number;
-  /** Distinct tool names, in first-seen order, for the tombstone. */
+  /** Distinct tool names, in first-seen order. */
   tools: string[];
-  /** The subset of `tools` that mutate something — their results are receipts. */
-  writes: string[];
+  /** Write-side calls whose result says they RAN: the effect stands. */
+  receipts: string[];
+  /** Write-side calls the runtime refused (blocked/denied): they did NOT happen. */
+  refused: string[];
+  /** Write-side calls that errored: whether the effect committed is unknown. */
+  failed: string[];
+  /** Read-side calls, by the audited set below: safe to re-run. */
+  reads: string[];
 }
 
 /**
- * A tool whose result is a RECEIPT for something that happened — a message
- * sent, a memory written, a file changed. Clearing the receipt is fine;
- * inviting the model to "re-run" it is not (Lumen, PR #584): a repeated
- * send_response duplicates a message, a repeated remember duplicates a
- * memory. Judged by name, conservatively: anything that is not plainly a
- * read counts as a write.
+ * The tools whose results are pure reads — re-running one changes nothing.
+ * An EXACT, audited set, not a name grammar: `get_thread_messages` advances
+ * the recipient's durable read pointer and `download_*` write files under
+ * ~/.ink/files, and both looked like reads by prefix (Lumen, PR #584 round
+ * 3). Anything not listed here — a new tool, a `*_status` — is treated as a
+ * write, the only safe default. The classification decides WORDING only; it
+ * never decides what is cleared.
  */
-const READ_ONLY_TOOL_RE =
-  /^(?:list|get|search|recall|read|grep|find|ls|describe|bootstrap|query|fetch|download|check|view|show|preview|count|resolve|inspect|detect)(?:_|$)|_(?:status|history|summary|summaries)$/;
+export const READ_ONLY_TOOLS: ReadonlySet<string> = new Set([
+  // ink-local
+  'list_context',
+  'describe_tool',
+  // memory & context
+  'bootstrap',
+  'recall',
+  'get_context',
+  'get_memory_history',
+  'get_user_history',
+  'get_chat_context',
+  'get_conversation_history',
+  // mail & calendar & drive (reads only — download_* write files)
+  'list_emails',
+  'get_email',
+  'list_email_labels',
+  'list_calendars',
+  'list_calendar_events',
+  'get_calendar_event',
+  'list_drive_files',
+  'get_drive_file',
+  'get_document',
+  'get_spreadsheet',
+  'get_sheet_values',
+  // links, tasks, projects, reminders
+  'search_links',
+  'list_tasks',
+  'list_task_groups',
+  'get_task_stats',
+  'get_task_graph',
+  'list_graph_templates',
+  'list_projects',
+  'get_project',
+  'list_reminders',
+  'get_reminder_history',
+  // artifacts & skills
+  'list_artifacts',
+  'get_artifact',
+  'get_artifact_history',
+  'search_artifacts',
+  'list_artifact_comments',
+  'list_skills',
+  'get_skill',
+  // sessions, studios, identity, workspace
+  'list_sessions',
+  'get_session',
+  'get_session_context',
+  'list_studios',
+  'get_studio',
+  'get_identity',
+  'get_identity_history',
+  'get_team_constitution',
+  'get_user_identity',
+  'get_user_identity_history',
+  'get_timezone',
+  'list_identities',
+  'list_registered_agents',
+  'get_agent_status',
+  'get_agent_summaries',
+  'get_activity',
+  'get_activity_summary',
+  'list_workspaces',
+  'get_workspace',
+  'list_threads',
+  'list_thread_key_types',
+  'get_integration_health',
+  'get_cache_stats',
+  'get_strategy_status',
+  'list_permissions',
+  'get_user_permissions',
+  'query_audit_log',
+  // mini-app reads
+  'query_mini_app_records',
+  'get_mini_app_record',
+  'get_mini_app_balance',
+  'list_mini_app_balances',
+  'get_mini_app_debts',
+]);
+
+/** `mcp__inkwell__list_emails` → `list_emails`; a bare name is unchanged. */
+function bareToolName(tool: string): string {
+  const name = tool.trim().toLowerCase();
+  const idx = name.lastIndexOf('__');
+  return idx >= 0 ? name.slice(idx + 2) : name;
+}
 
 export function isWriteSideTool(tool: string): boolean {
-  return !READ_ONLY_TOOL_RE.test(tool.toLowerCase());
+  return !READ_ONLY_TOOLS.has(bareToolName(tool));
 }
 
 /** `local tool <name> -> …` — an executed result, as the REPL records it. */
 const TOOL_NAME_RE = /^local tool ([A-Za-z_][\w.-]*) ->/;
 /** `Local tool error|blocked|denied (<name>): …` — a refused or failed one. */
-const OUTCOME_RE = /^Local tool (?:error|blocked|denied) \(([A-Za-z_][\w.-]*)\)/;
+const OUTCOME_RE = /^Local tool (error|blocked|denied) \(([A-Za-z_][\w.-]*)\)/;
 
 /**
  * Pick the consumed tool results to clear: `local-tool` entries that sit
@@ -89,34 +179,62 @@ export function selectConsumedToolResults(
 
   const ids: number[] = [];
   const tools: string[] = [];
+  const receipts: string[] = [];
+  const refused: string[] = [];
+  const failed: string[] = [];
+  const reads: string[] = [];
+  const add = (list: string[], name: string): void => {
+    if (!list.includes(name)) list.push(name);
+  };
   let tokens = 0;
   for (let i = 0; i < boundary; i += 1) {
     const e = entries[i]!;
     if (e.source !== LOCAL_TOOL_RESULT_SOURCE) continue;
     ids.push(e.id);
     tokens += e.approxTokens;
-    const name = OUTCOME_RE.exec(e.content)?.[1] ?? TOOL_NAME_RE.exec(e.content)?.[1];
-    if (name && !tools.includes(name)) tools.push(name);
+    // Outcome classes are kept apart: a refused or errored write is not a
+    // receipt, and telling the model it "already happened" would make it
+    // decline a retry the task still needs (Lumen, PR #584 round 3).
+    const outcome = OUTCOME_RE.exec(e.content);
+    const name = outcome?.[2] ?? TOOL_NAME_RE.exec(e.content)?.[1];
+    if (!name) continue;
+    add(tools, name);
+    if (!isWriteSideTool(name)) add(reads, name);
+    else if (!outcome) add(receipts, name);
+    else if (outcome[1] === 'error') add(failed, name);
+    else add(refused, name);
   }
   if (ids.length === 0 || tokens < minTokens) return null;
-  return { ids, tokens, tools, writes: tools.filter(isWriteSideTool) };
+  return { ids, tokens, tools, receipts, refused, failed, reads };
 }
 
 /**
- * The one line left where the results were. It must not invite a repeat of
- * a write: the receipt is gone, the effect is not.
+ * The one line left where the results were. It never claims success for a
+ * call that did not run, and never invites a repeat of one that did: a
+ * receipt is gone, its effect is not; a refusal did nothing; an error may
+ * have done either.
  */
 export function autoEvictTombstone(selection: AutoEvictSelection, keepRecentTurns: number): string {
-  const reads = selection.tools.filter((t) => !selection.writes.includes(t));
   const parts: string[] = [];
-  if (selection.writes.length > 0) {
+  if (selection.receipts.length > 0) {
     parts.push(
-      `the receipts of write calls (${selection.writes.join(', ')}) — those calls ALREADY HAPPENED; do not repeat them`
+      `write calls that RAN (${selection.receipts.join(', ')}) — their effects stand; do not repeat them. ` +
+        'If you need what one returned (an id, a confirmation), read the current state back with a read tool instead of re-issuing the write'
     );
   }
-  if (reads.length > 0) {
+  if (selection.refused.length > 0) {
     parts.push(
-      `the results of read calls (${reads.join(', ')}) — re-run one only if you need its data again`
+      `write calls the runtime REFUSED (${selection.refused.join(', ')}) — they did not happen; retry only if the task still needs them`
+    );
+  }
+  if (selection.failed.length > 0) {
+    parts.push(
+      `write calls that ERRORED (${selection.failed.join(', ')}) — whether the effect committed is unknown; read the current state back before retrying`
+    );
+  }
+  if (selection.reads.length > 0) {
+    parts.push(
+      `read calls (${selection.reads.join(', ')}) — re-run one only if you need its data again`
     );
   }
   return (

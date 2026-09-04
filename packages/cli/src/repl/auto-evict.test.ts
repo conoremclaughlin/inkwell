@@ -66,7 +66,7 @@ describe('selectConsumedToolResults', () => {
     ).toBeNull();
   });
 
-  it('names refused and failed outcomes by their tool too', () => {
+  it('names refused and failed outcomes by their tool too — each under its own class', () => {
     const ledger = new ContextLedger();
     ledger.addEntry('system', 'Local tool blocked (bash): policy', LOCAL_TOOL_RESULT_SOURCE);
     ledger.addEntry(
@@ -81,21 +81,34 @@ describe('selectConsumedToolResults', () => {
       minTokens: 1,
     });
     expect(pick!.tools).toEqual(['bash', 'send_email']);
-    expect(autoEvictTombstone(pick!, 2)).toContain('bash, send_email');
-    expect(autoEvictTombstone(pick!, 2)).toContain('transcript holds every one');
+    expect(pick!.refused).toEqual(['bash']);
+    expect(pick!.failed).toEqual(['send_email']);
+    expect(pick!.receipts).toEqual([]);
+    const note = autoEvictTombstone(pick!, 2);
+    expect(note).toContain('REFUSED (bash)');
+    expect(note).toContain('ERRORED (send_email)');
   });
 });
 
-describe('the tombstone never invites a repeated write (Lumen, PR #584)', () => {
+describe('the tombstone never claims a write happened when it did not, and never invites a repeat of one that did (Lumen, PR #584 rounds 2–3)', () => {
   it.each([
     'send_response',
     'remember',
     'update_memory',
     'create_task',
     'send_email',
-    'write',
-    'bash',
     'evict_context',
+    'compact_context',
+    'signal_status',
+    'spawn_agent',
+    // Look like reads by name, are not (Lumen, round 3).
+    'get_thread_messages',
+    'download_email_attachment',
+    'download_drive_file',
+    // Unknown names default to write.
+    'resolve_thing',
+    'foo_status',
+    'mcp__inkwell__send_response',
   ])('%s is write-side', (tool) => {
     expect(isWriteSideTool(tool)).toBe(true);
   });
@@ -104,18 +117,23 @@ describe('the tombstone never invites a repeated write (Lumen, PR #584)', () => 
     'get_email',
     'recall',
     'search_links',
-    'read',
-    'grep',
     'list_context',
     'get_session',
     'bootstrap',
+    'mcp__inkwell__list_emails',
   ])('%s is read-side', (tool) => {
     expect(isWriteSideTool(tool)).toBe(false);
   });
 
-  it('says writes already happened and must not be repeated; reads may be re-run', () => {
+  const sweep = () => {
     const ledger = new ContextLedger();
     ledger.addEntry('system', 'local tool send_response -> {"ok":true}', LOCAL_TOOL_RESULT_SOURCE);
+    ledger.addEntry(
+      'system',
+      'Local tool denied (send_email): not allowed',
+      LOCAL_TOOL_RESULT_SOURCE
+    );
+    ledger.addEntry('system', 'Local tool error (remember): timeout', LOCAL_TOOL_RESULT_SOURCE);
     ledger.addEntry(
       'system',
       'local tool list_emails -> {"count":2}' + 'x'.repeat(2_000),
@@ -123,16 +141,32 @@ describe('the tombstone never invites a repeated write (Lumen, PR #584)', () => 
     );
     turn(ledger, 0, 0);
     turn(ledger, 1, 0);
-    const pick = selectConsumedToolResults(ledger.listEntries(), {
-      keepRecentTurns: 1,
-      minTokens: 1,
-    });
-    expect(pick!.writes).toEqual(['send_response']);
-    const note = autoEvictTombstone(pick!, 2);
-    expect(note).toContain('send_response');
-    expect(note).toContain('ALREADY HAPPENED');
-    expect(note).toContain('do not repeat');
-    expect(note).toContain('list_emails');
-    expect(note).not.toMatch(/re-run (a tool|one)[^.]*send_response/);
+    return selectConsumedToolResults(ledger.listEntries(), { keepRecentTurns: 1, minTokens: 1 })!;
+  };
+
+  it('keeps the outcome classes apart', () => {
+    const pick = sweep();
+    expect(pick.receipts).toEqual(['send_response']);
+    expect(pick.refused).toEqual(['send_email']);
+    expect(pick.failed).toEqual(['remember']);
+    expect(pick.reads).toEqual(['list_emails']);
+    expect(pick.tools).toEqual(['send_response', 'send_email', 'remember', 'list_emails']);
+  });
+
+  it('says what ran stands (read back, do not re-issue); what was refused did not happen; what errored is unknown', () => {
+    const note = autoEvictTombstone(sweep(), 2);
+    expect(note).toMatch(
+      /write calls that RAN \(send_response\) — their effects stand; do not repeat them/
+    );
+    expect(note).toContain(
+      'read the current state back with a read tool instead of re-issuing the write'
+    );
+    expect(note).toMatch(/REFUSED \(send_email\) — they did not happen/);
+    expect(note).toMatch(/ERRORED \(remember\) — whether the effect committed is unknown/);
+    expect(note).toMatch(/read calls \(list_emails\) — re-run one only if you need its data again/);
+    // Never: a refused or errored call declared done.
+    expect(note).not.toMatch(/send_email[^;]*(stand|do not repeat)/);
+    expect(note).not.toMatch(/remember[^;]*(stand|do not repeat)/);
+    expect(note).not.toContain('ALREADY HAPPENED');
   });
 });
