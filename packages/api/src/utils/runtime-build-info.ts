@@ -34,6 +34,13 @@ const STARTUP_GIT_SHA = resolveGitShaSync();
 
 let cachedCurrentGitSha: string | null = STARTUP_GIT_SHA;
 let cachedApiDeltaNonEmpty = false;
+/**
+ * How far this CHECKOUT trails its upstream. Null means undeterminable, which
+ * is deliberately distinct from zero — see the note on getRuntimeBuildInfo.
+ */
+let cachedUpstreamRef: string | null = null;
+let cachedBehindOrigin: number | null = null;
+let cachedApiBehindOrigin: number | null = null;
 let cachedAtMs = 0;
 let refreshInFlight: Promise<void> | null = null;
 
@@ -67,8 +74,56 @@ async function refresh(): Promise<void> {
     nextApiDeltaNonEmpty = delta === null ? true : delta.length > 0;
   }
 
+  // How far the CHECKOUT trails origin — a different question from the one
+  // above, and the one nobody was asking.
+  //
+  // `updateAvailable` compares the startup sha to the local HEAD, so it answers
+  // "did the tree move under me, do I need a restart". It cannot answer "is
+  // this checkout behind origin", and on 2026-09-04 that gap read as calm: the
+  // deployed tree sat 75 commits behind origin/main with 2 of them touching the
+  // API, twenty hours after a fix was merged for it, and /health reported
+  // updateAvailable: false in perfect good faith. Two questions, one signal,
+  // and the unanswered one failed toward reassurance.
+  //
+  // Read from the remote-tracking ref, never by fetching: a health endpoint
+  // must not do network I/O. That makes the count only as fresh as the last
+  // fetch, which is why `originFetchedAt` is reported alongside it — a number
+  // whose staleness is undisclosed is its own calm wrong answer.
+  //
+  // Compared against the tracked upstream rather than a hardcoded origin/main,
+  // so a deployment running a release branch is measured against its own
+  // branch instead of being told it is behind by everything on main.
+  const upstream = await execFileText([
+    'rev-parse',
+    '--abbrev-ref',
+    '--symbolic-full-name',
+    '@{upstream}',
+  ]);
+  let nextBehind: number | null = null;
+  let nextApiBehind: number | null = null;
+  if (upstream) {
+    nextBehind = await countRevs([`HEAD..${upstream}`]);
+    nextApiBehind = await countRevs([`HEAD..${upstream}`, '--', ...API_RELEVANT_PATHS]);
+  }
+
   cachedCurrentGitSha = nextCurrentGitSha;
   cachedApiDeltaNonEmpty = nextApiDeltaNonEmpty;
+  cachedUpstreamRef = upstream;
+  cachedBehindOrigin = nextBehind;
+  cachedApiBehindOrigin = nextApiBehind;
+}
+
+/**
+ * `git rev-list --count`, or null when it cannot be determined.
+ *
+ * Null rather than 0 on failure, always. Zero means "verified up to date" and
+ * failing into it is the exact shape of defect this field exists to remove.
+ */
+async function countRevs(args: string[]): Promise<number | null> {
+  const raw = await execFileText(['rev-list', '--count', ...args]);
+  if (raw === null) return null;
+  const n = Number.parseInt(raw.trim(), 10);
+  return Number.isNaN(n) ? null : n;
 }
 
 /**
@@ -100,6 +155,22 @@ export function getRuntimeBuildInfo(nowMs = Date.now()) {
     currentGitSha: cachedCurrentGitSha,
     updateAvailable,
     requiresRestart: updateAvailable,
+    /** The upstream compared against, e.g. "origin/main". Null if untracked. */
+    upstreamRef: cachedUpstreamRef,
+    /**
+     * Commits on the upstream that this checkout does not have, as of the last
+     * fetch. NULL MEANS UNKNOWN, not up to date.
+     */
+    behindOriginCount: cachedBehindOrigin,
+    /** Of those, the ones touching this server's own inputs. Null = unknown. */
+    apiBehindOriginCount: cachedApiBehindOrigin,
+    /**
+     * True only when we can SHOW the checkout is missing API-relevant commits.
+     * An unknown count leaves this false, so callers must read the count to
+     * tell "verified current" from "could not tell" — the distinction the old
+     * single boolean erased.
+     */
+    behindOriginApi: cachedApiBehindOrigin !== null && cachedApiBehindOrigin > 0,
     processManager: process.env.pm_id ? 'pm2' : 'direct',
   };
 }
