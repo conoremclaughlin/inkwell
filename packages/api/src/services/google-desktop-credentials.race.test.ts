@@ -98,3 +98,40 @@ describe('Lumen review: atomic replacement while reading', () => {
     await expect(store.getAccessToken(fresh)).resolves.toBe('new-access');
   });
 });
+
+describe('a record describes one generation: its mtime belongs to the bytes it parsed', () => {
+  it("never pairs old bytes with the new file's mtime across an atomic rename", async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'lumen-google-race-'));
+    dirs.push(dir);
+    const path = join(dir, 'me@example.com.json');
+    const credential = (refresh_token: string) =>
+      JSON.stringify({
+        type: 'authorized_user',
+        email: 'me@example.com',
+        client_id: 'client',
+        client_secret: 'secret',
+        refresh_token,
+        scopes: [],
+      });
+    const oldTime = new Date('2026-09-08T12:00:00Z');
+    const newTime = new Date('2026-09-08T12:01:00Z');
+    await writeFile(path, credential('old'));
+    await utimes(path, oldTime, oldTime);
+    race.replace = async () => {
+      const tempPath = path + '.tmp';
+      await writeFile(tempPath, credential('new'));
+      await utimes(tempPath, newTime, newTime);
+      await rename(tempPath, path);
+    };
+
+    const store = new DesktopGoogleCredentialStore({ dir, fetchImpl: vi.fn() });
+    const record = (await store.findForEmail('me@example.com')).record!;
+
+    // Whichever generation the listing saw, its metadata must be that
+    // generation's. With one open handle the seam cannot fire and both are
+    // "old"; with separate readFile/stat the seam fires between them and the
+    // record would claim the NEW mtime for the OLD bytes.
+    const expectedMtime = record.credential.refresh_token === 'old' ? oldTime : newTime;
+    expect(new Date(record.mtimeMs).toISOString()).toBe(expectedMtime.toISOString());
+  });
+});
