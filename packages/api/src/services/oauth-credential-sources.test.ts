@@ -167,7 +167,7 @@ describe('getValidAccessToken — source order and binding', () => {
     const { svc, fetchImpl } = service(['cloud', 'desktop'], desktopDir('other@example.com'));
 
     await expect(svc.getValidAccessToken(USER_ID, 'google')).rejects.toThrow(
-      'No active google account found'
+      /^No active google account found$/
     );
     expect(fetchImpl).not.toHaveBeenCalled();
 
@@ -187,7 +187,7 @@ describe('getValidAccessToken — source order and binding', () => {
     const { svc, fetchImpl } = service(['cloud', 'desktop'], desktopDir(EMAIL));
 
     await expect(svc.getValidAccessToken(USER_ID, 'google')).rejects.toThrow(
-      'No active google account found'
+      /^No active google account found$/
     );
     expect(fetchImpl).not.toHaveBeenCalled();
   });
@@ -237,7 +237,7 @@ describe('getValidAccessToken — source order and binding', () => {
     const { svc, fetchImpl } = service(['cloud', 'desktop'], desktopDir(EMAIL));
 
     await expect(svc.getValidAccessToken(USER_ID, 'github')).rejects.toThrow(
-      'No active github account found'
+      /^No active github account found$/
     );
     expect(fetchImpl).not.toHaveBeenCalled();
     expect(tablesTouched()).toEqual(['connected_accounts']);
