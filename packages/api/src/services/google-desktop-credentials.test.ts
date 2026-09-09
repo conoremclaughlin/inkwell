@@ -6,7 +6,7 @@
  * refusals stick to a file until it changes while transient failures do not.
  */
 
-import { mkdtempSync, rmSync, utimesSync, writeFileSync } from 'fs';
+import { chmodSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -80,7 +80,7 @@ function storeIn(dir: string, fetchImpl: ReturnType<typeof vi.fn>, clock = { now
 describe('list and findForEmail — what is bound to whom', () => {
   it('reports an absent directory as empty without complaint', async () => {
     const store = storeIn(join(tempDir(), 'absent'), vi.fn());
-    expect(await store.list()).toEqual([]);
+    expect(await store.list()).toEqual({ records: [], error: null });
     expect(logger.warn).not.toHaveBeenCalled();
   });
 
@@ -94,7 +94,8 @@ describe('list and findForEmail — what is bound to whom', () => {
     writeFileSync(join(dir, 'broken.json'), JSON.stringify({ type: 'authorized_user' }));
     writeCredential(dir, 'me@example.com');
 
-    const records = await storeIn(dir, vi.fn()).list();
+    const { records, error } = await storeIn(dir, vi.fn()).list();
+    expect(error).toBeNull();
 
     expect(records.map((r) => r.email)).toEqual(['me@example.com']);
     expect(records[0].scopes).toEqual(['https://www.googleapis.com/auth/gmail.readonly']);
@@ -111,10 +112,10 @@ describe('list and findForEmail — what is bound to whom', () => {
     writeCredential(dir, 'me@example.com');
     const store = storeIn(dir, vi.fn());
 
-    expect((await store.findForEmail('Me@EXAMPLE.com'))?.email).toBe('me@example.com');
-    expect(await store.findForEmail('other@example.com')).toBeNull();
-    expect(await store.findForEmail(null)).toBeNull();
-    expect(await store.findForEmail('  ')).toBeNull();
+    expect((await store.findForEmail('Me@EXAMPLE.com')).record?.email).toBe('me@example.com');
+    expect((await store.findForEmail('other@example.com')).record).toBeNull();
+    expect((await store.findForEmail(null)).record).toBeNull();
+    expect((await store.findForEmail('  ')).record).toBeNull();
   });
 });
 
@@ -128,7 +129,7 @@ describe("getAccessToken and inspect — inspect describes getAccessToken's deci
       .mockResolvedValueOnce(granted('access-2'));
     const clock = { now: T0 };
     const store = storeIn(dir, fetchImpl, clock);
-    const record = (await store.findForEmail('me@example.com'))!;
+    const record = (await store.findForEmail('me@example.com')).record!;
 
     expect(store.inspect(record).state).toBe('refresh_required');
 
@@ -153,7 +154,7 @@ describe("getAccessToken and inspect — inspect describes getAccessToken's deci
     expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
 
-  it('remembers a permanent refusal against the file until the file changes', async () => {
+  it('remembers a permanent refusal against the token until a re-login writes a new one', async () => {
     const dir = tempDir();
     const path = writeCredential(dir, 'me@example.com', new Date(T0 - 60_000));
     const invalidGrant =
@@ -163,7 +164,7 @@ describe("getAccessToken and inspect — inspect describes getAccessToken's deci
       .mockResolvedValueOnce(refused(400, invalidGrant))
       .mockResolvedValueOnce(granted());
     const store = storeIn(dir, fetchImpl);
-    const record = (await store.findForEmail('me@example.com'))!;
+    const record = (await store.findForEmail('me@example.com')).record!;
 
     await expect(store.getAccessToken(record)).rejects.toThrow(/invalid_grant/);
     await expect(store.getAccessToken(record)).rejects.toThrow(path);
@@ -172,9 +173,9 @@ describe("getAccessToken and inspect — inspect describes getAccessToken's deci
     expect(verdict.state).toBe('unusable');
     expect(verdict.reason).toContain('invalid_grant');
 
-    // A new login rewrites the file: the refusal no longer applies.
-    writeCredential(dir, 'me@example.com', new Date(T0 + 60_000));
-    const rewritten = (await store.findForEmail('me@example.com'))!;
+    // A new login writes a new refresh token: the refusal no longer applies.
+    writeCredential(dir, 'me@example.com', new Date(T0 + 60_000), { refresh_token: 'rt-new' });
+    const rewritten = (await store.findForEmail('me@example.com')).record!;
     expect(store.inspect(rewritten).state).toBe('refresh_required');
     expect(await store.getAccessToken(rewritten)).toBe('access-1');
     expect(fetchImpl).toHaveBeenCalledTimes(2);
@@ -189,7 +190,7 @@ describe("getAccessToken and inspect — inspect describes getAccessToken's deci
       .mockRejectedValueOnce(new Error('ECONNRESET'))
       .mockResolvedValueOnce(granted());
     const store = storeIn(dir, fetchImpl);
-    const record = (await store.findForEmail('me@example.com'))!;
+    const record = (await store.findForEmail('me@example.com')).record!;
 
     await expect(store.getAccessToken(record)).rejects.toThrow(/503/);
     expect(store.inspect(record).state).toBe('refresh_required');
@@ -199,7 +200,7 @@ describe("getAccessToken and inspect — inspect describes getAccessToken's deci
     expect(fetchImpl).toHaveBeenCalledTimes(3);
   });
 
-  it('drops a cached token when the file is rewritten', async () => {
+  it('drops a cached token when a re-login rewrites the file', async () => {
     const dir = tempDir();
     writeCredential(dir, 'me@example.com', new Date(T0 - 60_000));
     const fetchImpl = vi
@@ -207,12 +208,65 @@ describe("getAccessToken and inspect — inspect describes getAccessToken's deci
       .mockResolvedValueOnce(granted('access-1'))
       .mockResolvedValueOnce(granted('access-2'));
     const store = storeIn(dir, fetchImpl);
-    const before = (await store.findForEmail('me@example.com'))!;
+    const before = (await store.findForEmail('me@example.com')).record!;
     expect(await store.getAccessToken(before)).toBe('access-1');
 
-    writeCredential(dir, 'me@example.com', new Date(T0 + 60_000));
-    const after = (await store.findForEmail('me@example.com'))!;
+    writeCredential(dir, 'me@example.com', new Date(T0 + 60_000), { refresh_token: 'rt-new' });
+    const after = (await store.findForEmail('me@example.com')).record!;
     expect(store.inspect(after).state).toBe('refresh_required');
     expect(await store.getAccessToken(after)).toBe('access-2');
+  });
+});
+
+describe('generations — keyed on the bytes, never the clock (Lumen, PR #588)', () => {
+  it('keeps refusing the same token when only its timestamp moves, and tries new bytes even with the old timestamp', async () => {
+    const dir = tempDir();
+    const path = writeCredential(dir, 'me@example.com', new Date(T0 - 60_000));
+    const invalidGrant = '{"error":"invalid_grant","error_description":"expired"}';
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(refused(400, invalidGrant))
+      .mockResolvedValueOnce(granted());
+    const store = storeIn(dir, fetchImpl);
+    const first = (await store.findForEmail('me@example.com')).record!;
+    await expect(store.getAccessToken(first)).rejects.toThrow(/invalid_grant/);
+
+    // Touched, not re-logged-in: same bytes, later mtime — still the refused token.
+    utimesSync(path, new Date(T0 + 60_000), new Date(T0 + 60_000));
+    const touched = (await store.findForEmail('me@example.com')).record!;
+    expect(touched.mtimeMs).not.toBe(first.mtimeMs);
+    expect(touched.generation).toBe(first.generation);
+    expect(store.inspect(touched).state).toBe('unusable');
+    await expect(store.getAccessToken(touched)).rejects.toThrow(/invalid_grant/);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+
+    // Re-logged-in with a clock that went backwards: new bytes, old mtime — tried afresh.
+    writeCredential(dir, 'me@example.com', new Date(T0 - 60_000), { refresh_token: 'rt-new' });
+    const relogged = (await store.findForEmail('me@example.com')).record!;
+    expect(relogged.mtimeMs).toBe(first.mtimeMs);
+    expect(relogged.generation).not.toBe(first.generation);
+    expect(store.inspect(relogged).state).toBe('refresh_required');
+    expect(await store.getAccessToken(relogged)).toBe('access-1');
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('storage that cannot be read', () => {
+  it('reports an error instead of an empty listing', async () => {
+    if (typeof process.getuid === 'function' && process.getuid() === 0) return; // root ignores modes
+    const dir = tempDir();
+    writeCredential(dir, 'me@example.com');
+    chmodSync(dir, 0o000);
+    try {
+      const store = storeIn(dir, vi.fn());
+      const listing = await store.list();
+      expect(listing.records).toEqual([]);
+      expect(listing.error).toMatch(/Could not read/);
+      const found = await store.findForEmail('me@example.com');
+      expect(found.record).toBeNull();
+      expect(found.error).toMatch(/Could not read/);
+    } finally {
+      chmodSync(dir, 0o700);
+    }
   });
 });

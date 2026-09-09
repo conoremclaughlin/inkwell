@@ -4546,7 +4546,7 @@ router.get('/connected-accounts', async (req: Request, res: Response) => {
     const credentialSources = oauthService.getCredentialSources();
     const desktop = credentialSources.includes('desktop')
       ? await oauthService.describeDesktopCredentials(authReq.pcpUserId)
-      : { dir: null, email: null, credentials: [] };
+      : { dir: null, email: null, error: null, credentials: [] };
     const desktopUsable = desktop.credentials.some((c) => c.state !== 'unusable');
 
     // Get supported providers and their configuration status
@@ -4560,6 +4560,7 @@ router.get('/connected-accounts', async (req: Request, res: Response) => {
 
     res.json({
       credentialSources,
+      desktopCredentialsError: desktop.error,
       desktopCredentials: desktop.credentials.map((c) => ({
         provider: 'google',
         email: c.email,

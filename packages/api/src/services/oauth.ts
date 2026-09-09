@@ -161,35 +161,39 @@ class OAuthService {
 
   /**
    * The email a desktop credential must carry to be used for this user. A
-   * lookup failure yields null — no email, no binding, no token — because
-   * guessing here would hand one person's mailbox to another.
+   * lookup FAILURE is reported as such and never cached: for access it binds
+   * nothing (guessing would hand one person's mailbox to another), and for
+   * health it must read as "could not look", not "nothing there" (Lumen, PR
+   * #588). A successful lookup — including a user with no email — is cached.
    */
-  private async lookupUserEmail(userId: string): Promise<string | null> {
+  private async lookupUserEmail(
+    userId: string
+  ): Promise<{ email: string | null; error: string | null }> {
     const cached = this.userEmails.get(userId);
-    if (cached && Date.now() - cached.at < USER_EMAIL_CACHE_MS) return cached.email;
-    let email: string | null = null;
+    if (cached && Date.now() - cached.at < USER_EMAIL_CACHE_MS) {
+      return { email: cached.email, error: null };
+    }
+    let failure: string;
     try {
       const { data, error } = await this.supabase
         .from('users')
         .select('email')
         .eq('id', userId)
         .maybeSingle();
-      if (error) {
-        logger.warn('Could not resolve user email for desktop Google credential binding', {
-          userId,
-          error: error.message,
-        });
-      } else {
-        email = (data?.email as string | null | undefined) ?? null;
+      if (!error) {
+        const email = (data?.email as string | null | undefined) ?? null;
+        this.userEmails.set(userId, { email, at: Date.now() });
+        return { email, error: null };
       }
+      failure = error.message;
     } catch (err) {
-      logger.warn('Could not resolve user email for desktop Google credential binding', {
-        userId,
-        error: err instanceof Error ? err.message : String(err),
-      });
+      failure = err instanceof Error ? err.message : String(err);
     }
-    this.userEmails.set(userId, { email, at: Date.now() });
-    return email;
+    logger.warn('Could not resolve user email for desktop Google credential binding', {
+      userId,
+      error: failure,
+    });
+    return { email: null, error: `Could not resolve the user's email: ${failure}` };
   }
 
   private resolveWorkspaceId(workspaceId?: string | null): string | null | undefined {
@@ -601,20 +605,26 @@ class OAuthService {
 
   /** The desktop file bound to this user, described in the same vocabulary as the cloud row. */
   private async inspectDesktopAccountHealth(userId: string): Promise<ProviderAccountHealth> {
-    const email = await this.lookupUserEmail(userId);
-    const record = await this.desktopStore.findForEmail(email);
+    const blank: Omit<ProviderAccountHealth, 'state' | 'source' | 'reason'> = {
+      accountStatus: null,
+      lastError: null,
+      expiresAt: null,
+      lastUsedAt: null,
+      observedAt: null,
+    };
+    const lookup = await this.lookupUserEmail(userId);
+    if (lookup.error) return { ...blank, state: 'unknown', source: null, reason: lookup.error };
+    const found = await this.desktopStore.findForEmail(lookup.email);
+    if (found.error) return { ...blank, state: 'unknown', source: null, reason: found.error };
+    const record = found.record;
     if (!record) {
       return {
+        ...blank,
         state: 'missing',
         source: null,
-        accountStatus: null,
-        reason: email
-          ? `No desktop Google credential for ${email} in ${this.desktopStore.dir}`
+        reason: lookup.email
+          ? `No desktop Google credential for ${lookup.email} in ${this.desktopStore.dir}`
           : 'No desktop Google credential can be bound: the user has no email',
-        lastError: null,
-        expiresAt: null,
-        lastUsedAt: null,
-        observedAt: null,
       };
     }
     const verdict = this.desktopStore.inspect(record);
@@ -766,15 +776,21 @@ class OAuthService {
     throw new Error(`No usable ${provider} credential — ${failures.join('; ')}`);
   }
 
-  /** The desktop file bound to this user, as a token — or why not. A null reason means nothing was bound. */
+  /**
+   * The desktop file bound to this user, as a token — or why not. A null reason
+   * means nothing was bound; a failed lookup or unreadable storage binds
+   * nothing too (fail closed) and is logged rather than named here, because
+   * naming it would change the message users without a desktop file see.
+   */
   private async getDesktopAccessToken(
     userId: string
   ): Promise<{ token: string } | { token: null; reason: string | null }> {
-    const email = await this.lookupUserEmail(userId);
-    const record = await this.desktopStore.findForEmail(email);
-    if (!record) return { token: null, reason: null };
+    const lookup = await this.lookupUserEmail(userId);
+    if (lookup.error) return { token: null, reason: null };
+    const found = await this.desktopStore.findForEmail(lookup.email);
+    if (found.error || !found.record) return { token: null, reason: null };
     try {
-      return { token: await this.desktopStore.getAccessToken(record) };
+      return { token: await this.desktopStore.getAccessToken(found.record) };
     } catch (err) {
       return { token: null, reason: err instanceof Error ? err.message : String(err) };
     }
@@ -787,6 +803,8 @@ class OAuthService {
   async describeDesktopCredentials(userId: string): Promise<{
     dir: string;
     email: string | null;
+    /** Why the listing could not be trusted, when it could not (lookup or storage failure). */
+    error: string | null;
     credentials: Array<{
       email: string;
       path: string;
@@ -797,8 +815,12 @@ class OAuthService {
       expiresAt: string | null;
     }>;
   }> {
-    const email = await this.lookupUserEmail(userId);
-    const record = await this.desktopStore.findForEmail(email);
+    const lookup = await this.lookupUserEmail(userId);
+    if (lookup.error) {
+      return { dir: this.desktopStore.dir, email: null, error: lookup.error, credentials: [] };
+    }
+    const found = await this.desktopStore.findForEmail(lookup.email);
+    const record = found.record;
     const credentials = record
       ? [
           {
@@ -810,7 +832,7 @@ class OAuthService {
           },
         ]
       : [];
-    return { dir: this.desktopStore.dir, email, credentials };
+    return { dir: this.desktopStore.dir, email: lookup.email, error: found.error, credentials };
   }
 
   private async getCloudAccessToken(
@@ -847,6 +869,22 @@ class OAuthService {
     // Shared with inspectAccountHealth so the health verdict describes the same
     // decision this call actually makes.
     const refreshToken = pendingRefreshToken(account.expires_at, account.refresh_token);
+
+    if (!refreshToken) {
+      // Nothing to refresh with. A stored token past its expiry is not a
+      // token — handing it back would fail at the provider AND stop the next
+      // credential source from being tried, while inspectAccountHealth calls
+      // this row unusable (Lumen, PR #588). Mark it so the dashboard agrees.
+      const expiry = account.expires_at ? new Date(account.expires_at).getTime() : null;
+      if (expiry !== null && !Number.isNaN(expiry) && expiry <= Date.now()) {
+        const reason = 'Access token expired and no refresh token is stored';
+        await this.supabase
+          .from('connected_accounts')
+          .update({ status: 'expired', last_error: reason, updated_at: new Date().toISOString() })
+          .eq('id', account.id);
+        return { token: null, reason };
+      }
+    }
 
     if (refreshToken) {
       logger.info(`Refreshing ${provider} token for user ${userId}`);

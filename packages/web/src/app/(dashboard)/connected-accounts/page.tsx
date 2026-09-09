@@ -591,14 +591,16 @@ export default function ConnectedAccountsPage() {
                         : 'border-yellow-200 bg-yellow-50/50'
                     )}
                   >
-                    <div className="flex items-start justify-between">
-                      <div className="flex items-start gap-4">
-                        <div className="p-3 rounded-full bg-white border text-gray-600">
+                    <div className="flex items-start justify-between min-w-0">
+                      <div className="flex items-start gap-4 min-w-0">
+                        <div className="p-3 rounded-full bg-white border text-gray-600 shrink-0">
                           <Laptop className="h-5 w-5" />
                         </div>
-                        <div>
-                          <div className="flex items-center gap-2">
-                            <h3 className="font-medium text-gray-900">{credential.email}</h3>
+                        <div className="min-w-0 flex-1">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <h3 className="font-medium text-gray-900 break-all">
+                              {credential.email}
+                            </h3>
                             <Badge
                               className={clsx(
                                 'text-xs',
@@ -622,14 +624,14 @@ export default function ConnectedAccountsPage() {
                               <> · tried {credentialSources.join(' → ')}</>
                             )}
                           </p>
-                          <div className="flex items-center gap-4 mt-2 text-xs text-gray-500">
+                          <div className="flex flex-wrap items-center gap-x-4 gap-y-1 mt-2 text-xs text-gray-500 min-w-0">
                             <span>{credential.scopes.length} scopes</span>
                             {credential.obtainedAt && (
                               <span>
                                 Signed in {new Date(credential.obtainedAt).toLocaleDateString()}
                               </span>
                             )}
-                            <span className="truncate" title={credential.path}>
+                            <span className="block w-full truncate" title={credential.path}>
                               {credential.path}
                             </span>
                           </div>

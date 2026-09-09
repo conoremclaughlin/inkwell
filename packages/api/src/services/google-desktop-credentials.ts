@@ -16,7 +16,8 @@
  * Nothing here blocks the event loop — all file access is fs/promises.
  */
 
-import { readdir, readFile, stat } from 'fs/promises';
+import { createHash } from 'crypto';
+import { open, readdir } from 'fs/promises';
 import { homedir } from 'os';
 import { join } from 'path';
 import {
@@ -35,9 +36,25 @@ export interface DesktopCredentialRecord {
   email: string;
   scopes: string[];
   obtainedAt: string | null;
-  /** File modification time — a re-login rewrites the file and resets any refusal. */
+  /** Modification time of the bytes that were parsed — for display only. */
   mtimeMs: number;
+  /**
+   * Digest of the bytes that were parsed. Cached tokens and refusals are keyed
+   * on THIS, not on mtime: a re-login is a new generation whatever its
+   * timestamp says, and the same bytes touched again are still the same
+   * refused token (Lumen, PR #588: read and stat taken separately could pair
+   * old bytes with a new mtime across an atomic rename, pinning the old
+   * refusal to the new login).
+   */
+  generation: string;
   credential: DesktopGoogleCredential;
+}
+
+/** A listing that says whether it could be trusted — an unreadable directory is not an empty one. */
+export interface DesktopCredentialListing {
+  records: DesktopCredentialRecord[];
+  /** Why the directory could not be read, when it could not. */
+  error: string | null;
 }
 
 /**
@@ -59,12 +76,12 @@ export interface DesktopCredentialVerdict {
 interface CachedAccessToken {
   accessToken: string;
   expiresAt: number;
-  mtimeMs: number;
+  generation: string;
 }
 
 interface Refusal {
   reason: string;
-  mtimeMs: number;
+  generation: string;
 }
 
 export interface DesktopGoogleCredentialStoreOptions {
@@ -91,22 +108,22 @@ export class DesktopGoogleCredentialStore {
   /**
    * Every well-formed credential file in the directory, sorted by name. A
    * malformed file is logged and skipped rather than failing the whole listing —
-   * one bad file must not take down the good ones beside it.
+   * one bad file must not take down the good ones beside it. A directory that
+   * does not exist is an empty listing; one that cannot be READ is reported as
+   * such, because "nothing is there" and "I could not look" are different
+   * claims (Lumen, PR #588).
    */
-  async list(): Promise<DesktopCredentialRecord[]> {
+  async list(): Promise<DesktopCredentialListing> {
     const dir = this.dir;
     let names: string[];
     try {
       names = await readdir(dir);
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
-      if (code !== 'ENOENT' && code !== 'ENOTDIR') {
-        logger.warn('Could not read desktop Google credentials directory', {
-          dir,
-          error: err instanceof Error ? err.message : String(err),
-        });
-      }
-      return [];
+      if (code === 'ENOENT' || code === 'ENOTDIR') return { records: [], error: null };
+      const error = err instanceof Error ? err.message : String(err);
+      logger.warn('Could not read desktop Google credentials directory', { dir, error });
+      return { records: [], error: `Could not read ${dir}: ${error}` };
     }
 
     const records: DesktopCredentialRecord[] = [];
@@ -114,7 +131,20 @@ export class DesktopGoogleCredentialStore {
       if (!name.endsWith('.json') || name === DESKTOP_CLIENT_FILENAME) continue;
       const path = join(dir, name);
       try {
-        const [raw, info] = await Promise.all([readFile(path, 'utf-8'), stat(path)]);
+        // Content and metadata come from ONE open handle, i.e. one inode. An
+        // atomic re-login (write temp, rename over) swaps the directory entry
+        // but not what this handle points at, so the bytes parsed here and
+        // the mtime beside them always describe the same generation.
+        const handle = await open(path, 'r');
+        let raw: string;
+        let mtimeMs: number;
+        try {
+          const [content, info] = await Promise.all([handle.readFile('utf-8'), handle.stat()]);
+          raw = content;
+          mtimeMs = info.mtimeMs;
+        } finally {
+          await handle.close();
+        }
         const parsed = parseDesktopGoogleCredential(JSON.parse(raw));
         if (!parsed.ok) {
           logger.warn('Ignoring malformed desktop Google credential', {
@@ -128,7 +158,8 @@ export class DesktopGoogleCredentialStore {
           email: parsed.value.email,
           scopes: parsed.value.scopes,
           obtainedAt: parsed.value.obtained_at ?? null,
-          mtimeMs: info.mtimeMs,
+          mtimeMs,
+          generation: createHash('sha256').update(raw).digest('hex'),
           credential: parsed.value,
         });
       } catch (err) {
@@ -138,16 +169,24 @@ export class DesktopGoogleCredentialStore {
         });
       }
     }
-    return records;
+    return { records, error: null };
   }
 
-  /** The file bound to this email, or null. Matching is case-insensitive. */
-  async findForEmail(email: string | null | undefined): Promise<DesktopCredentialRecord | null> {
-    if (!email) return null;
+  /**
+   * The file bound to this email, or null — and whether the answer can be
+   * trusted. Matching is case-insensitive.
+   */
+  async findForEmail(
+    email: string | null | undefined
+  ): Promise<{ record: DesktopCredentialRecord | null; error: string | null }> {
+    if (!email) return { record: null, error: null };
     const wanted = normalizeGoogleEmail(email);
-    if (!wanted) return null;
-    const records = await this.list();
-    return records.find((record) => record.email === wanted) ?? null;
+    if (!wanted) return { record: null, error: null };
+    const listing = await this.list();
+    return {
+      record: listing.records.find((record) => record.email === wanted) ?? null,
+      error: listing.error,
+    };
   }
 
   /**
@@ -156,14 +195,14 @@ export class DesktopGoogleCredentialStore {
    */
   inspect(record: DesktopCredentialRecord): DesktopCredentialVerdict {
     const refusal = this.refusals.get(record.path);
-    if (refusal && refusal.mtimeMs === record.mtimeMs) {
+    if (refusal && refusal.generation === record.generation) {
       return { state: 'unusable', reason: refusal.reason, expiresAt: null };
     }
     const cached = this.tokens.get(record.path);
     const expiresAt = cached ? new Date(cached.expiresAt).toISOString() : null;
     if (
       cached &&
-      cached.mtimeMs === record.mtimeMs &&
+      cached.generation === record.generation &&
       cached.expiresAt - this.now() > TOKEN_REFRESH_WINDOW_MS
     ) {
       return { state: 'active', reason: null, expiresAt };
@@ -179,9 +218,9 @@ export class DesktopGoogleCredentialStore {
    * A usable access token for this file, refreshing through Google's token
    * endpoint with the file's own client when the cached one is inside the
    * refresh window. A permanent refusal (invalid_grant, invalid_client) is
-   * remembered against the file's mtime so every later call fails fast with the
-   * same reason instead of asking Google again; a re-login rewrites the file and
-   * clears it. Network failures are not remembered — they are not evidence
+   * remembered against the parsed bytes' generation so every later call fails
+   * fast with the same reason instead of asking Google again; a re-login is a
+   * new generation and is tried afresh. Network failures are not remembered — they are not evidence
    * about the credential.
    */
   async getAccessToken(record: DesktopCredentialRecord): Promise<string> {
@@ -223,7 +262,7 @@ export class DesktopGoogleCredentialStore {
       // seven-day expiry lands here) and 401 invalid_client are permanent for
       // this file. Anything else is Google's problem for the moment.
       if (response.status === 400 || response.status === 401) {
-        this.refusals.set(record.path, { reason, mtimeMs: record.mtimeMs });
+        this.refusals.set(record.path, { reason, generation: record.generation });
         this.tokens.delete(record.path);
       }
       logger.warn('Desktop Google credential refresh failed', {
@@ -241,7 +280,7 @@ export class DesktopGoogleCredentialStore {
     this.tokens.set(record.path, {
       accessToken: data.access_token,
       expiresAt,
-      mtimeMs: record.mtimeMs,
+      generation: record.generation,
     });
     this.refusals.delete(record.path);
     logger.info('Refreshed desktop Google credential', { path: record.path, email: record.email });

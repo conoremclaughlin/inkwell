@@ -7,7 +7,7 @@
  * would use; and the scope list is the one the CLI consents to.
  */
 
-import { mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -190,6 +190,18 @@ describe('getValidAccessToken — source order and binding', () => {
       /^No active google account found$/
     );
     expect(fetchImpl).not.toHaveBeenCalled();
+
+    // Lumen (PR #588): the failed lookup is not "nothing connected" — health
+    // must say it could not look. Failures are never cached, so the next call
+    // asks again.
+    tables({
+      users: [{ maybeSingle: [{ data: null, error: { message: 'connection reset' } }] }],
+      connected_accounts: [{ then: { data: [], error: null } }],
+    });
+    const health = await svc.inspectAccountHealth(USER_ID, 'google');
+    expect(health).toMatchObject({ state: 'unknown', source: null });
+    expect(health.reason).toMatch(/connection reset/);
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 
   it('names both sources when both had a credential and both failed', async () => {
@@ -284,5 +296,73 @@ describe('inspectAccountHealth — the verdict follows the call', () => {
     expect(described.email).toBe(EMAIL);
     expect(described.credentials.map((c) => c.email)).toEqual([EMAIL]);
     expect(described.credentials[0].state).toBe('refresh_required');
+    expect(described.error).toBeNull();
+  });
+});
+
+describe('Lumen review (PR #588): fallback and unknown state', () => {
+  it('uses desktop when the active cloud row has an expired token and cannot refresh', async () => {
+    const row = cloudRow({ expires_at: '2026-09-08T11:00:00.000Z', refresh_token: null });
+    tables({
+      users: [userWithEmail],
+      connected_accounts: [
+        { then: { data: [row], error: null } },
+        { maybeSingle: [{ data: row, error: null }] },
+        cloudUpdateAck,
+      ],
+    });
+    const { svc } = service(['cloud', 'desktop'], desktopDir(EMAIL));
+
+    expect(await svc.inspectAccountHealth(USER_ID, 'google')).toMatchObject({
+      state: 'refresh_required',
+      source: 'desktop',
+    });
+    expect(await svc.getValidAccessToken(USER_ID, 'google')).toBe('access-desktop');
+  });
+
+  it('marks that expired, refresh-less cloud row so the dashboard agrees with the verdict', async () => {
+    const row = cloudRow({ expires_at: '2026-09-08T11:00:00.000Z', refresh_token: null });
+    const mock = tables({
+      connected_accounts: [{ maybeSingle: [{ data: row, error: null }] }, cloudUpdateAck],
+    });
+    const { svc } = service(['cloud'], desktopDir());
+
+    await expect(svc.getValidAccessToken(USER_ID, 'google')).rejects.toThrow(
+      /^Access token expired and no refresh token is stored$/
+    );
+    const update = mock.calls.find(
+      (c) =>
+        c.table === 'connected_accounts' &&
+        (c.builder.update as ReturnType<typeof vi.fn>).mock.calls.length > 0
+    );
+    expect(update).toBeDefined();
+    expect((update!.builder.update as ReturnType<typeof vi.fn>).mock.calls[0][0]).toMatchObject({
+      status: 'expired',
+      last_error: 'Access token expired and no refresh token is stored',
+    });
+  });
+
+  it('reads unreadable desktop storage as unknown in health and binds nothing for access', async () => {
+    if (typeof process.getuid === 'function' && process.getuid() === 0) return; // root ignores modes
+    const dir = desktopDir(EMAIL);
+    chmodSync(dir, 0o000);
+    try {
+      tables({
+        users: [userWithEmail],
+        connected_accounts: [{ then: { data: [], error: null } }, noCloudRow],
+      });
+      const { svc, fetchImpl } = service(['cloud', 'desktop'], dir);
+
+      const health = await svc.inspectAccountHealth(USER_ID, 'google');
+      expect(health).toMatchObject({ state: 'unknown', source: null });
+      expect(health.reason).toMatch(/Could not read/);
+
+      await expect(svc.getValidAccessToken(USER_ID, 'google')).rejects.toThrow(
+        /^No active google account found$/
+      );
+      expect(fetchImpl).not.toHaveBeenCalled();
+    } finally {
+      chmodSync(dir, 0o700);
+    }
   });
 });
