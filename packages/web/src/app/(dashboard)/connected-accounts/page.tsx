@@ -26,6 +26,7 @@ import {
   User,
   Shield,
   FolderOpen,
+  Laptop,
 } from 'lucide-react';
 import { useApiQuery, useApiDelete, apiGet, apiPost } from '@/lib/api';
 import { useQueryClient } from '@tanstack/react-query';
@@ -52,9 +53,23 @@ interface Provider {
   connected: boolean;
 }
 
+/** A desktop login (`ink google login` on the server host) bound to this user by email. */
+interface DesktopCredential {
+  provider: string;
+  email: string;
+  path: string;
+  scopes: string[];
+  obtainedAt: string | null;
+  state: 'active' | 'refresh_required' | 'unusable';
+  reason: string | null;
+  expiresAt: string | null;
+}
+
 interface ConnectedAccountsResponse {
   accounts: ConnectedAccount[];
   providers: Provider[];
+  credentialSources?: string[];
+  desktopCredentials?: DesktopCredential[];
 }
 
 interface RequiredScopesResponse {
@@ -250,6 +265,8 @@ export default function ConnectedAccountsPage() {
 
   const accounts = data?.accounts ?? [];
   const providers = data?.providers ?? [];
+  const desktopCredentials = data?.desktopCredentials ?? [];
+  const credentialSources = data?.credentialSources ?? [];
 
   // Handle OAuth popup callback
   const handleOAuthMessage = useCallback(
@@ -560,19 +577,85 @@ export default function ConnectedAccountsPage() {
                 );
               })}
 
+              {/* Desktop credentials — files on the server host, read-only here */}
+              {desktopCredentials.map((credential) => {
+                const usable = credential.state !== 'unusable';
+                return (
+                  <div
+                    key={credential.path}
+                    className={clsx(
+                      'rounded-lg border p-4',
+                      usable
+                        ? 'border-green-200 bg-green-50/30'
+                        : 'border-yellow-200 bg-yellow-50/50'
+                    )}
+                  >
+                    <div className="flex items-start justify-between">
+                      <div className="flex items-start gap-4">
+                        <div className="p-3 rounded-full bg-white border text-gray-600">
+                          <Laptop className="h-5 w-5" />
+                        </div>
+                        <div>
+                          <div className="flex items-center gap-2">
+                            <h3 className="font-medium text-gray-900">{credential.email}</h3>
+                            <Badge
+                              className={clsx(
+                                'text-xs',
+                                usable
+                                  ? 'bg-green-100 text-green-700'
+                                  : 'bg-yellow-100 text-yellow-700'
+                              )}
+                            >
+                              {usable ? (
+                                <CheckCircle className="mr-1 h-3 w-3" />
+                              ) : (
+                                <AlertCircle className="mr-1 h-3 w-3" />
+                              )}
+                              {usable ? 'Desktop login' : 'Desktop login needs re-login'}
+                            </Badge>
+                          </div>
+                          <p className="text-sm text-gray-500">
+                            Google, from <code className="text-xs">ink google login</code> on the
+                            server host
+                            {credentialSources.length > 0 && (
+                              <> · tried {credentialSources.join(' → ')}</>
+                            )}
+                          </p>
+                          <div className="flex items-center gap-4 mt-2 text-xs text-gray-500">
+                            <span>{credential.scopes.length} scopes</span>
+                            {credential.obtainedAt && (
+                              <span>
+                                Signed in {new Date(credential.obtainedAt).toLocaleDateString()}
+                              </span>
+                            )}
+                            <span className="truncate" title={credential.path}>
+                              {credential.path}
+                            </span>
+                          </div>
+                          {!usable && credential.reason && (
+                            <p className="mt-2 text-xs text-yellow-700">{credential.reason}</p>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+
               {/* Divider if both sections have content */}
-              {accounts.length > 0 && availableProviders.length > 0 && (
-                <div className="relative py-2">
-                  <div className="absolute inset-0 flex items-center">
-                    <div className="w-full border-t border-gray-200" />
+              {(accounts.length > 0 || desktopCredentials.length > 0) &&
+                availableProviders.length > 0 && (
+                  <div className="relative py-2">
+                    <div className="absolute inset-0 flex items-center">
+                      <div className="w-full border-t border-gray-200" />
+                    </div>
+                    <div className="relative flex justify-center">
+                      <span className="bg-white px-3 text-xs text-gray-500">
+                        Available to connect
+                      </span>
+                    </div>
                   </div>
-                  <div className="relative flex justify-center">
-                    <span className="bg-white px-3 text-xs text-gray-500">
-                      Available to connect
-                    </span>
-                  </div>
-                </div>
-              )}
+                )}
 
               {/* Available Providers */}
               {availableProviders.map((provider) => {
@@ -618,15 +701,17 @@ export default function ConnectedAccountsPage() {
               })}
 
               {/* Empty state */}
-              {accounts.length === 0 && availableProviders.length === 0 && (
-                <div className="text-center py-8">
-                  <Link2Off className="h-12 w-12 mx-auto text-gray-300 mb-3" />
-                  <p className="text-gray-500">No integrations available.</p>
-                  <p className="text-sm text-gray-400 mt-1">
-                    Configure OAuth credentials in your environment to enable integrations.
-                  </p>
-                </div>
-              )}
+              {accounts.length === 0 &&
+                desktopCredentials.length === 0 &&
+                availableProviders.length === 0 && (
+                  <div className="text-center py-8">
+                    <Link2Off className="h-12 w-12 mx-auto text-gray-300 mb-3" />
+                    <p className="text-gray-500">No integrations available.</p>
+                    <p className="text-sm text-gray-400 mt-1">
+                      Configure OAuth credentials in your environment to enable integrations.
+                    </p>
+                  </div>
+                )}
             </div>
           )}
         </CardContent>

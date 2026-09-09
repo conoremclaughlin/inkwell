@@ -43,6 +43,7 @@ vi.mock('../../services/oauth', () => ({
 /** The account state Conor's Google row was actually in during the outage. */
 const EXPIRED_GOOGLE: ProviderAccountHealth = {
   state: 'unusable',
+  source: 'cloud',
   accountStatus: 'expired',
   reason: 'No active google account found (stored status: expired)',
   lastError: 'Failed to refresh google token',
@@ -53,6 +54,7 @@ const EXPIRED_GOOGLE: ProviderAccountHealth = {
 
 const ACTIVE_GOOGLE: ProviderAccountHealth = {
   state: 'active',
+  source: 'cloud',
   accountStatus: 'active',
   reason: null,
   lastError: null,
@@ -64,6 +66,7 @@ const ACTIVE_GOOGLE: ProviderAccountHealth = {
 /** Stored status is still 'active', but the next call has to refresh first. */
 const REFRESHING_GOOGLE: ProviderAccountHealth = {
   state: 'refresh_required',
+  source: 'cloud',
   accountStatus: 'active',
   reason:
     'Access token expires at 2026-08-15T17:02:00.000Z; the next call must refresh it first, and that refresh may fail',
@@ -76,6 +79,7 @@ const REFRESHING_GOOGLE: ProviderAccountHealth = {
 /** The account table could not be read at all. */
 const UNKNOWN_GOOGLE: ProviderAccountHealth = {
   state: 'unknown',
+  source: null,
   accountStatus: null,
   reason: 'Could not read account state: connection reset',
   lastError: null,
@@ -464,6 +468,7 @@ describe('handleGetIntegrationHealth — account health is not service health', 
   it('reports a genuinely unconnected provider as not_configured', async () => {
     inspectAccountHealth.mockResolvedValue({
       state: 'missing',
+      source: null,
       accountStatus: null,
       reason: 'No google account has been connected',
       lastError: null,
@@ -647,5 +652,42 @@ describe('handleUpdateIntegrationHealth — last_healthy_at retention', () => {
     expect(written.last_healthy_at).toBe('2026-08-15T17:00:00.000Z');
     // No pre-read needed on the healthy path.
     expect(mock.calls).toHaveLength(1);
+  });
+});
+
+describe('handleGetIntegrationHealth — which credential source the verdict is about', () => {
+  it('passes the source through so "the desktop file is serving" is visible, not inferred', async () => {
+    inspectAccountHealth.mockResolvedValue({ ...ACTIVE_GOOGLE, source: 'desktop' });
+    const { composer } = composerFor({
+      integration_health: [{ then: { data: [], error: null } }],
+    });
+
+    const body = parse(await handleGetIntegrationHealth({ userId: USER_ID }, composer));
+    const gmail = serviceIn(body, 'google_gmail');
+
+    expect(gmail.accountHealth).toBe('ok');
+    expect(gmail.accountSource).toBe('desktop');
+  });
+
+  it('reports a null source when nothing is connected anywhere', async () => {
+    inspectAccountHealth.mockResolvedValue({
+      state: 'missing',
+      source: null,
+      accountStatus: null,
+      reason: 'No google account has been connected',
+      lastError: null,
+      expiresAt: null,
+      lastUsedAt: null,
+      observedAt: null,
+    });
+    const { composer } = composerFor({
+      integration_health: [{ then: { data: [], error: null } }],
+    });
+
+    const body = parse(await handleGetIntegrationHealth({ userId: USER_ID }, composer));
+    const gmail = serviceIn(body, 'google_gmail');
+
+    expect(gmail.status).toBe('not_configured');
+    expect(gmail.accountSource).toBeNull();
   });
 });
