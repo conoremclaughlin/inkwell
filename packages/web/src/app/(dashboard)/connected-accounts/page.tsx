@@ -263,10 +263,11 @@ export default function ConnectedAccountsPage() {
 
   const disconnectMutation = useApiDelete<{ success: boolean }>('/api/admin/connected-accounts');
 
-  const accounts = data?.accounts ?? [];
-  const providers = data?.providers ?? [];
-  const desktopCredentials = data?.desktopCredentials ?? [];
-  const credentialSources = data?.credentialSources ?? [];
+  const response = data as ConnectedAccountsResponse | undefined;
+  const accounts = response?.accounts ?? [];
+  const providers = response?.providers ?? [];
+  const desktopCredentials = response?.desktopCredentials ?? [];
+  const credentialSources = response?.credentialSources ?? [];
 
   // Handle OAuth popup callback
   const handleOAuthMessage = useCallback(

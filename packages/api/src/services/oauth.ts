@@ -818,6 +818,12 @@ class OAuthService {
     provider: string,
     resolvedWorkspaceId: string | null | undefined
   ): Promise<{ token: string; reason?: undefined } | { token: null; reason: string }> {
+    interface CloudAccountRow {
+      id: string;
+      access_token: string;
+      refresh_token: string | null;
+      expires_at: string | null;
+    }
     let query = this.supabase
       .from('connected_accounts')
       .select('*')
@@ -831,12 +837,10 @@ class OAuthService {
       query = query.eq('workspace_id', resolvedWorkspaceId);
     }
 
-    const { data: account, error } = await query
-      .order('updated_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
+    const result = await query.order('updated_at', { ascending: false }).limit(1).maybeSingle();
+    const account = result.data as CloudAccountRow | null;
 
-    if (error || !account) {
+    if (result.error || !account) {
       return { token: null, reason: `No active ${provider} account found` };
     }
 
@@ -889,7 +893,7 @@ class OAuthService {
       .update({ last_used_at: new Date().toISOString() })
       .eq('id', account.id);
 
-    return { token: account.access_token as string };
+    return { token: account.access_token };
   }
 
   /**
