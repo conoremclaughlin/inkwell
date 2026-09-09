@@ -34,9 +34,18 @@ const SEVEN_DAY_NOTE =
   '"Testing", Google expires this login after 7 days. Publish the app (Audience → Publish app → ' +
   'Confirm; no verification needed) and log in once more to make it permanent.';
 
-async function loginCommand(options: { client?: string; browser: boolean }): Promise<void> {
+export async function loginCommand(options: { client?: string; browser: boolean }): Promise<void> {
   const dir = desktopCredentialsDir();
-  const loaded = loadDesktopOAuthClient(dir, options.client);
+  // A missing or wrong client file is the FIRST thing a new user hits; it
+  // must read as instructions, not a stack trace.
+  let loaded: ReturnType<typeof loadDesktopOAuthClient>;
+  try {
+    loaded = loadDesktopOAuthClient(dir, options.client);
+  } catch (err) {
+    console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+    process.exitCode = 1;
+    return;
+  }
   if (loaded.imported) console.log(chalk.dim(`Saved OAuth client to ${loaded.path}`));
 
   const spinner = ora(
@@ -81,7 +90,7 @@ async function loginCommand(options: { client?: string; browser: boolean }): Pro
   }
 }
 
-async function statusCommand(options: { check?: boolean }): Promise<void> {
+export async function statusCommand(options: { check?: boolean }): Promise<void> {
   const dir = desktopCredentialsDir();
   const { credentials, malformed } = listDesktopCredentials(dir);
   console.log(chalk.dim(`Desktop Google credentials in ${dir}`));
@@ -125,7 +134,7 @@ async function statusCommand(options: { check?: boolean }): Promise<void> {
   }
 }
 
-function logoutCommand(email: string): void {
+export function logoutCommand(email: string): void {
   const dir = desktopCredentialsDir();
   if (removeDesktopCredential(dir, email)) {
     console.log(`Removed the stored login for ${email}.`);
