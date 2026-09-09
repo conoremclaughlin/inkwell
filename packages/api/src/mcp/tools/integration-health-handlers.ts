@@ -261,6 +261,9 @@ export async function handleGetIntegrationHealth(args: unknown, dataComposer: Da
     const accountState = accountHealthOf(live);
     const account = {
       accountHealth: accountState,
+      // Which credential the verdict is about: the dashboard connection
+      // (`cloud`) or a desktop file from `ink google login` (`desktop`).
+      accountSource: live.source,
       accountStatus: live.accountStatus,
       accountReason: live.reason,
       accountObservedAt: live.observedAt,

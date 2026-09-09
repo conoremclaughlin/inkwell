@@ -4540,14 +4540,37 @@ router.get('/connected-accounts', async (req: Request, res: Response) => {
       authReq.pcpWorkspaceId
     );
 
+    // Desktop credentials (`ink google login` on the server host) bound to this
+    // user by email. They count as a connection: the server will use one when
+    // the cloud row cannot serve, or first when configured that way.
+    const credentialSources = oauthService.getCredentialSources();
+    const desktop = credentialSources.includes('desktop')
+      ? await oauthService.describeDesktopCredentials(authReq.pcpUserId)
+      : { dir: null, email: null, error: null, credentials: [] };
+    const desktopUsable = desktop.credentials.some((c) => c.state !== 'unusable');
+
     // Get supported providers and their configuration status
     const providers = oauthService.getSupportedProviders().map((provider) => ({
       name: provider,
       configured: oauthService.isProviderConfigured(provider),
-      connected: accounts.some((a) => a.provider === provider && a.status === 'active'),
+      connected:
+        accounts.some((a) => a.provider === provider && a.status === 'active') ||
+        (provider === 'google' && desktopUsable),
     }));
 
     res.json({
+      credentialSources,
+      desktopCredentialsError: desktop.error,
+      desktopCredentials: desktop.credentials.map((c) => ({
+        provider: 'google',
+        email: c.email,
+        path: c.path,
+        scopes: c.scopes,
+        obtainedAt: c.obtainedAt,
+        state: c.state,
+        reason: c.reason,
+        expiresAt: c.expiresAt,
+      })),
       accounts: accounts.map((a) => ({
         id: a.id,
         provider: a.provider,

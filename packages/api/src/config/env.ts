@@ -166,6 +166,12 @@ const envSchema = z.object({
   GOOGLE_CLIENT_ID: optionalString,
   GOOGLE_CLIENT_SECRET: optionalString,
   OAUTH_REDIRECT_BASE_URL: optionalUrl, // OAuth callback URL - can be origin only (http://localhost:3001) or full URL (http://localhost:3001/api/admin/oauth/google/callback)
+  // Which Google credential sources the server tries, in order: `cloud` (the
+  // connected_accounts row from the dashboard OAuth flow) and/or `desktop`
+  // (authorized_user files written by `ink google login`). Default: cloud,desktop.
+  GOOGLE_CREDENTIAL_SOURCES: optionalString,
+  // Where desktop credential files live. Default: ~/.ink/google
+  INK_GOOGLE_CREDENTIALS_DIR: optionalString,
 
   // Embeddings
   MEMORY_EMBEDDINGS_ENABLED: z
