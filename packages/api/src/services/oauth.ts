@@ -845,6 +845,8 @@ class OAuthService {
       access_token: string;
       refresh_token: string | null;
       expires_at: string | null;
+      /** The row version every write below is guarded on. */
+      updated_at: string;
     }
     let query = this.supabase
       .from('connected_accounts')
@@ -878,10 +880,14 @@ class OAuthService {
       const expiry = account.expires_at ? new Date(account.expires_at).getTime() : null;
       if (expiry !== null && !Number.isNaN(expiry) && expiry <= Date.now()) {
         const reason = 'Access token expired and no refresh token is stored';
+        // Guarded on the snapshot's version: a reconnect that landed on this
+        // row between the read and this write must not be marked expired
+        // with a stale reason (Lumen, PR #588 round 3).
         await this.supabase
           .from('connected_accounts')
           .update({ status: 'expired', last_error: reason, updated_at: new Date().toISOString() })
-          .eq('id', account.id);
+          .eq('id', account.id)
+          .eq('updated_at', account.updated_at);
         return { token: null, reason };
       }
     }
@@ -897,6 +903,8 @@ class OAuthService {
           ? new Date(Date.now() + tokens.expiresIn * 1000).toISOString()
           : null;
 
+        // Same guard: a reconnect that raced this refresh keeps its own
+        // tokens; the refreshed token is still good for this call.
         await this.supabase
           .from('connected_accounts')
           .update({
@@ -907,7 +915,8 @@ class OAuthService {
             last_error: null,
             updated_at: new Date().toISOString(),
           })
-          .eq('id', account.id);
+          .eq('id', account.id)
+          .eq('updated_at', account.updated_at);
 
         return { token: tokens.accessToken };
       } catch (err) {
@@ -919,7 +928,8 @@ class OAuthService {
             last_error: err instanceof Error ? err.message : 'Token refresh failed',
             updated_at: new Date().toISOString(),
           })
-          .eq('id', account.id);
+          .eq('id', account.id)
+          .eq('updated_at', account.updated_at);
 
         return { token: null, reason: `Failed to refresh ${provider} token` };
       }

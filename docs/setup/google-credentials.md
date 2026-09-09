@@ -93,5 +93,12 @@ cloud row expired but the desktop file is serving" is visible rather than
 inferred.
 
 A refusal from Google (`invalid_grant`, `invalid_client`) is remembered against
-the file's modification time: later calls fail fast with the same reason until
-the file is rewritten by a new login. Network failures are not remembered.
+a digest of the file's bytes: later calls fail fast with the same reason until a
+new login writes a new refresh token, and touching the file without changing it
+changes nothing. Network failures are not remembered. The server reads each
+file's content and metadata through one open handle, so an atomic re-login
+(temp file + rename) can never pair old bytes with a new timestamp.
+
+A credential file the server cannot read or parse is not "no file": the binding
+for that user is reported as unknown (with a count, never other people's
+filenames), while a readable file bound to a different user keeps working.

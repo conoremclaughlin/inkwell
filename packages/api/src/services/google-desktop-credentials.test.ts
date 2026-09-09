@@ -80,7 +80,7 @@ function storeIn(dir: string, fetchImpl: ReturnType<typeof vi.fn>, clock = { now
 describe('list and findForEmail — what is bound to whom', () => {
   it('reports an absent directory as empty without complaint', async () => {
     const store = storeIn(join(tempDir(), 'absent'), vi.fn());
-    expect(await store.list()).toEqual({ records: [], error: null });
+    expect(await store.list()).toEqual({ records: [], error: null, unreadable: 0 });
     expect(logger.warn).not.toHaveBeenCalled();
   });
 
@@ -94,8 +94,9 @@ describe('list and findForEmail — what is bound to whom', () => {
     writeFileSync(join(dir, 'broken.json'), JSON.stringify({ type: 'authorized_user' }));
     writeCredential(dir, 'me@example.com');
 
-    const { records, error } = await storeIn(dir, vi.fn()).list();
+    const { records, error, unreadable } = await storeIn(dir, vi.fn()).list();
     expect(error).toBeNull();
+    expect(unreadable).toBe(1);
 
     expect(records.map((r) => r.email)).toEqual(['me@example.com']);
     expect(records[0].scopes).toEqual(['https://www.googleapis.com/auth/gmail.readonly']);
@@ -267,6 +268,47 @@ describe('storage that cannot be read', () => {
       expect(found.error).toMatch(/Could not read/);
     } finally {
       chmodSync(dir, 0o700);
+    }
+  });
+});
+
+describe('a binding is only "missing" when every candidate could be read (Lumen, PR #588 round 3)', () => {
+  it('reports an unreadable bound file as an unestablished binding, without naming files', async () => {
+    if (typeof process.getuid === 'function' && process.getuid() === 0) return; // root ignores modes
+    const dir = tempDir();
+    const mine = writeCredential(dir, 'me@example.com');
+    writeCredential(dir, 'other@example.com');
+    chmodSync(mine, 0o000);
+    try {
+      const store = storeIn(dir, vi.fn());
+      const found = await store.findForEmail('me@example.com');
+      expect(found.record).toBeNull();
+      expect(found.error).toMatch(/1 credential file\(s\) .* could not be read or parsed/);
+      expect(found.error).not.toContain('other@example.com');
+      expect(found.error).not.toContain('me@example.com.json');
+    } finally {
+      chmodSync(mine, 0o600);
+    }
+  });
+
+  it("does not take down a readable bound file because someone else's file is bad", async () => {
+    if (typeof process.getuid === 'function' && process.getuid() === 0) return;
+    const dir = tempDir();
+    writeCredential(dir, 'me@example.com');
+    const theirs = writeCredential(dir, 'other@example.com');
+    chmodSync(theirs, 0o000);
+    try {
+      const store = storeIn(dir, vi.fn());
+      const found = await store.findForEmail('me@example.com');
+      expect(found.record?.email).toBe('me@example.com');
+      expect(found.error).toBeNull();
+      // And a third party with no file at all cannot be told "no file": one
+      // candidate could not be read.
+      const nobody = await store.findForEmail('nobody@example.com');
+      expect(nobody.record).toBeNull();
+      expect(nobody.error).toMatch(/could not be read or parsed/);
+    } finally {
+      chmodSync(theirs, 0o600);
     }
   });
 });

@@ -55,6 +55,12 @@ export interface DesktopCredentialListing {
   records: DesktopCredentialRecord[];
   /** Why the directory could not be read, when it could not. */
   error: string | null;
+  /**
+   * Candidate files that could not be read or parsed. Each is a binding this
+   * listing could not establish or rule out (Lumen, PR #588 round 3): a file
+   * the operator can see but the server cannot open is not "no file".
+   */
+  unreadable: number;
 }
 
 /**
@@ -120,13 +126,15 @@ export class DesktopGoogleCredentialStore {
       names = await readdir(dir);
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
-      if (code === 'ENOENT' || code === 'ENOTDIR') return { records: [], error: null };
+      if (code === 'ENOENT' || code === 'ENOTDIR')
+        return { records: [], error: null, unreadable: 0 };
       const error = err instanceof Error ? err.message : String(err);
       logger.warn('Could not read desktop Google credentials directory', { dir, error });
-      return { records: [], error: `Could not read ${dir}: ${error}` };
+      return { records: [], error: `Could not read ${dir}: ${error}`, unreadable: 0 };
     }
 
     const records: DesktopCredentialRecord[] = [];
+    let unreadable = 0;
     for (const name of names.sort()) {
       if (!name.endsWith('.json') || name === DESKTOP_CLIENT_FILENAME) continue;
       const path = join(dir, name);
@@ -151,6 +159,7 @@ export class DesktopGoogleCredentialStore {
             path,
             reason: parsed.reason,
           });
+          unreadable += 1;
           continue;
         }
         records.push({
@@ -167,14 +176,22 @@ export class DesktopGoogleCredentialStore {
           path,
           error: err instanceof Error ? err.message : String(err),
         });
+        unreadable += 1;
       }
     }
-    return { records, error: null };
+    return { records, error: null, unreadable };
   }
 
   /**
    * The file bound to this email, or null — and whether the answer can be
    * trusted. Matching is case-insensitive.
+   *
+   * A readable file bound to the email is the answer even if other files in
+   * the directory are bad — one person's broken file must not take down
+   * another's login. But "no file for this email" is only an answer when every
+   * candidate could be read: otherwise the binding is unestablished, and the
+   * error says how many files were unreadable without naming them (they may
+   * belong to other people).
    */
   async findForEmail(
     email: string | null | undefined
@@ -183,10 +200,18 @@ export class DesktopGoogleCredentialStore {
     const wanted = normalizeGoogleEmail(email);
     if (!wanted) return { record: null, error: null };
     const listing = await this.list();
-    return {
-      record: listing.records.find((record) => record.email === wanted) ?? null,
-      error: listing.error,
-    };
+    if (listing.error) return { record: null, error: listing.error };
+    const record = listing.records.find((candidate) => candidate.email === wanted) ?? null;
+    if (record) return { record, error: null };
+    if (listing.unreadable > 0) {
+      return {
+        record: null,
+        error:
+          `${listing.unreadable} credential file(s) in ${this.dir} could not be read or parsed, ` +
+          `so no binding for ${wanted} could be established`,
+      };
+    }
+    return { record: null, error: null };
   }
 
   /**

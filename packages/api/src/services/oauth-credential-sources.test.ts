@@ -366,3 +366,133 @@ describe('Lumen review (PR #588): fallback and unknown state', () => {
     }
   });
 });
+
+/**
+ * A row that another writer replaces between this service's read and its
+ * write — the OAuth callback saving a fresh login to the same id. Writes must
+ * be guarded on the version they observed. (Lumen, PR #588 round 3.)
+ */
+function racingCloudRow(old: Record<string, unknown>, replacement: Record<string, unknown>) {
+  const live: Record<string, unknown> = { ...old };
+  from.mockImplementation(() => {
+    const filters: Array<[string, unknown]> = [];
+    let patch: Record<string, unknown> | null = null;
+    const builder: Record<string, unknown> = {
+      select: () => builder,
+      eq: (key: string, value: unknown) => {
+        filters.push([key, value]);
+        return builder;
+      },
+      is: (key: string, value: unknown) => {
+        filters.push([key, value]);
+        return builder;
+      },
+      order: () => builder,
+      limit: () => builder,
+      maybeSingle: async () => {
+        // The read has produced the old snapshot; before its consumer's write
+        // arrives, the callback saves a new login to that id.
+        Object.assign(live, replacement);
+        return { data: { ...old }, error: null };
+      },
+      update: (value: Record<string, unknown>) => {
+        patch = value;
+        return builder;
+      },
+      then: (resolve: (value: { data: null; error: null }) => unknown) => {
+        if (patch && filters.every(([key, value]) => live[key] === value))
+          Object.assign(live, patch);
+        return Promise.resolve(resolve({ data: null, error: null }));
+      },
+    };
+    return builder;
+  });
+  return live;
+}
+
+const RECONNECTED = {
+  access_token: 'new-cloud',
+  refresh_token: 'new-refresh',
+  expires_at: '2026-09-09T12:00:00.000Z',
+  updated_at: NOW.toISOString(),
+  status: 'active',
+  last_error: null,
+};
+
+describe('Lumen review round 3 (PR #588): incomplete reads and concurrent cloud reconnect', () => {
+  it('reports unknown when the directory is readable but the bound credential file is not', async () => {
+    if (typeof process.getuid === 'function' && process.getuid() === 0) return;
+    const dir = desktopDir(EMAIL);
+    const file = join(dir, `${EMAIL}.json`);
+    chmodSync(file, 0o000);
+    try {
+      tables({
+        users: [userWithEmail],
+        connected_accounts: [{ then: { data: [], error: null } }],
+      });
+      const { svc, fetchImpl } = service(['cloud', 'desktop'], dir);
+      const health = await svc.inspectAccountHealth(USER_ID, 'google');
+      expect(health).toMatchObject({ state: 'unknown', source: null });
+      expect(health.reason).toMatch(/could not be read or parsed/);
+      expect(fetchImpl).not.toHaveBeenCalled();
+    } finally {
+      chmodSync(file, 0o600);
+    }
+  });
+
+  it('does not expire a newly reconnected row based on a stale no-refresh-token read', async () => {
+    const live = racingCloudRow(
+      cloudRow({ expires_at: '2026-09-08T11:00:00.000Z', refresh_token: null }),
+      RECONNECTED
+    );
+    const { svc } = service(['cloud'], desktopDir());
+    await svc.getValidAccessToken(USER_ID, 'google').catch(() => undefined);
+    expect(live).toMatchObject({
+      status: 'active',
+      access_token: 'new-cloud',
+      refresh_token: 'new-refresh',
+      last_error: null,
+    });
+  });
+
+  it('does not expire a newly reconnected row when a stale refresh token is refused', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 400,
+        text: async () => '{"error":"invalid_grant"}',
+      })
+    );
+    const live = racingCloudRow(cloudRow({ expires_at: '2026-09-08T12:02:00.000Z' }), RECONNECTED);
+    const { svc } = service(['cloud'], desktopDir());
+    await expect(svc.getValidAccessToken(USER_ID, 'google')).rejects.toThrow(
+      /^Failed to refresh google token$/
+    );
+    expect(live).toMatchObject({
+      status: 'active',
+      refresh_token: 'new-refresh',
+      last_error: null,
+    });
+  });
+
+  it('does not overwrite a newly reconnected row with a refresh of the old token', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          access_token: 'refreshed-old',
+          token_type: 'Bearer',
+          expires_in: 3600,
+        }),
+      })
+    );
+    const live = racingCloudRow(cloudRow({ expires_at: '2026-09-08T12:02:00.000Z' }), RECONNECTED);
+    const { svc } = service(['cloud'], desktopDir());
+    // The refreshed token is still good for THIS call…
+    expect(await svc.getValidAccessToken(USER_ID, 'google')).toBe('refreshed-old');
+    // …but the row keeps the login that arrived in between.
+    expect(live).toMatchObject({ access_token: 'new-cloud', refresh_token: 'new-refresh' });
+  });
+});
