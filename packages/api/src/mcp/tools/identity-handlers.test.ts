@@ -34,9 +34,9 @@ function createMockDataComposer(mockSupabase: MockSupabaseClient) {
 
 /**
  * Wire the three queries handleSaveIdentity makes, in order: derive the
- * agent's workspace, read its existing row, then upsert.
+ * agent's workspace, read its existing row, then write it.
  *
- * The first two are plain awaits returning ROW ARRAYS; only the upsert uses
+ * The first two are plain awaits returning ROW ARRAYS; only the write uses
  * .single(). Getting that shape right in the mock is the whole point — the
  * previous mock answered every query with the same single object, so a handler
  * that inserted a duplicate row instead of updating the existing one was
@@ -59,6 +59,19 @@ function mockSaveIdentityQueries(
     data: options.saved ?? null,
     error: options.saveError ?? null,
   });
+}
+
+/**
+ * The row handleSaveIdentity actually wrote, from whichever verb it used —
+ * update() for an existing identity, insert() for a new one. It no longer
+ * upserts: ON CONFLICT could not arbitrate on a nullable workspace_id.
+ */
+function writtenIdentityRow(mockSupabase: MockSupabaseClient) {
+  const update = (mockSupabase._queryBuilder.update as ReturnType<typeof vi.fn>).mock.calls[0];
+  const insert = (mockSupabase._queryBuilder.insert as ReturnType<typeof vi.fn>).mock.calls[0];
+  const call = update ?? insert;
+  if (!call) throw new Error('handleSaveIdentity wrote nothing');
+  return call[0];
 }
 
 describe('Identity Handlers', () => {
@@ -188,7 +201,7 @@ describe('Identity Handlers', () => {
     });
 
     it('should throw on database error', async () => {
-      // Reads succeed (no existing row); the upsert fails.
+      // Reads succeed (no existing row); the write fails.
       mockSaveIdentityQueries(mockSupabase, {
         existing: null,
         saveError: { message: 'Database error' },
@@ -245,9 +258,7 @@ describe('Identity Handlers', () => {
           mockDataComposer as never
         );
 
-        const upsertCall = (mockSupabase._queryBuilder.upsert as ReturnType<typeof vi.fn>).mock
-          .calls[0];
-        const upsertData = upsertCall[0];
+        const upsertData = writtenIdentityRow(mockSupabase);
 
         expect(upsertData.soul).toBe(existingRecord.soul);
         expect(upsertData.heartbeat).toBe(existingRecord.heartbeat);
@@ -274,8 +285,7 @@ describe('Identity Handlers', () => {
           mockDataComposer as never
         );
 
-        const upsertData = (mockSupabase._queryBuilder.upsert as ReturnType<typeof vi.fn>).mock
-          .calls[0][0];
+        const upsertData = writtenIdentityRow(mockSupabase);
 
         expect(upsertData.soul).toBe(newSoul);
         expect(upsertData.heartbeat).toBe(existingRecord.heartbeat);
@@ -297,8 +307,7 @@ describe('Identity Handlers', () => {
           mockDataComposer as never
         );
 
-        const upsertData = (mockSupabase._queryBuilder.upsert as ReturnType<typeof vi.fn>).mock
-          .calls[0][0];
+        const upsertData = writtenIdentityRow(mockSupabase);
 
         expect(upsertData.heartbeat).toBe(newHeartbeat);
         expect(upsertData.soul).toBe(existingRecord.soul);
@@ -320,8 +329,7 @@ describe('Identity Handlers', () => {
           mockDataComposer as never
         );
 
-        const upsertData = (mockSupabase._queryBuilder.upsert as ReturnType<typeof vi.fn>).mock
-          .calls[0][0];
+        const upsertData = writtenIdentityRow(mockSupabase);
 
         expect(upsertData.soul).toBeNull();
         expect(upsertData.heartbeat).toBeNull();
@@ -341,8 +349,7 @@ describe('Identity Handlers', () => {
           mockDataComposer as never
         );
 
-        const upsertData = (mockSupabase._queryBuilder.upsert as ReturnType<typeof vi.fn>).mock
-          .calls[0][0];
+        const upsertData = writtenIdentityRow(mockSupabase);
 
         expect(upsertData.name).toBe('Myra Updated');
         expect(upsertData.soul).toBe(existingRecord.soul);

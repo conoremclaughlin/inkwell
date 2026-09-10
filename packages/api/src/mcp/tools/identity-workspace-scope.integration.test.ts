@@ -148,6 +148,39 @@ describe('save_identity workspace scoping (integration)', () => {
     expect(rows[0].soul).toBe('soul v1');
   });
 
+  it('updates an agent whose only row is workspace-unscoped', async () => {
+    // Legitimately unscoped agents exist — the canonical `echo` integration
+    // fixture is one. Under the upsert this was unsaveable in BOTH directions:
+    // arbitration on (user_id, workspace_id, agent_id) could not match the NULL
+    // row, so it tried to INSERT, and the insert then lost to the partial
+    // unique index on (user_id, agent_id) WHERE workspace_id IS NULL. The
+    // caller got a raw Postgres constraint name.
+    const { data: seeded, error } = await supabase
+      .from('agent_identities')
+      .insert({
+        user_id: userId,
+        agent_id: AGENT,
+        workspace_id: null,
+        name: 'Echo',
+        role: 'Integration fixture',
+        soul: 'unscoped soul v1',
+      })
+      .select('id, version')
+      .single();
+    if (error) throw new Error(`Failed to seed unscoped identity: ${error.message}`);
+
+    await handleSaveIdentity(
+      { userId, agentId: AGENT, name: 'Echo', role: 'Integration fixture', soul: 'soul v2' },
+      dataComposer
+    );
+
+    const rows = await rowsForAgent();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].id).toBe(seeded.id);
+    expect(rows[0].soul).toBe('soul v2');
+    expect(rows[0].version).toBeGreaterThan(seeded.version);
+  });
+
   it('creates exactly one row when the agent has no identity at all', async () => {
     const result = parse(
       await handleSaveIdentity(

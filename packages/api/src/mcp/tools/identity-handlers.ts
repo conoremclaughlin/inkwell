@@ -333,8 +333,8 @@ export async function handleSaveIdentity(args: unknown, dataComposer: DataCompos
 
   const existing = existingLookup.kind === 'found' ? existingLookup.row : null;
 
-  // Build upsert object, preserving existing values for omitted fields
-  const upsertData: TablesInsert<'agent_identities'> = {
+  // Build the row, preserving existing values for omitted fields
+  const identityData: TablesInsert<'agent_identities'> = {
     user_id: user.id,
     agent_id: agentId,
     name,
@@ -362,14 +362,25 @@ export async function handleSaveIdentity(args: unknown, dataComposer: DataCompos
     ...(effectiveWorkspaceId ? { workspace_id: effectiveWorkspaceId } : {}),
   };
 
-  // Use upsert to handle both create and update
-  const { data, error } = await supabase
-    .from('agent_identities')
-    .upsert(upsertData, {
-      onConflict: 'user_id,workspace_id,agent_id',
-    })
-    .select()
-    .single();
+  // We already know whether the row exists and exactly which one it is, so
+  // write it directly rather than asking ON CONFLICT to re-derive that from an
+  // index. No column list can make arbitration work here while workspace_id is
+  // nullable: a NULL never matches, so the upsert's only options were "update
+  // the row I meant" or "insert a duplicate", and it silently chose the second.
+  //
+  // An agent whose only row is workspace-unscoped could not be saved at all —
+  // the insert lost to the partial unique index on (user_id, agent_id) WHERE
+  // workspace_id IS NULL and surfaced a raw constraint name. That path updates
+  // now. Versioning and history are unaffected: the BEFORE UPDATE trigger
+  // archives the old row and increments version.
+  const { data, error } = existing
+    ? await supabase
+        .from('agent_identities')
+        .update(identityData)
+        .eq('id', existing.id)
+        .select()
+        .single()
+    : await supabase.from('agent_identities').insert(identityData).select().single();
 
   if (error) {
     logger.error('Failed to save identity', { error, agentId });
