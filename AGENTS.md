@@ -119,6 +119,17 @@ Inkwell uses Supabase (PostgreSQL) as its database. There are **two access paths
 
 5. **Never expose the service role key to the client.** It lives in `.env.local` (server only) and must never appear in `NEXT_PUBLIC_*` environment variables.
 
+### Local dashboard test account
+
+A shared SB account exists for local dashboard and auth-flow testing. Its credentials live in `.env.local` (gitignored, present in every worktree) as:
+
+```
+SB_TEST_EMAIL
+SB_TEST_PASSWORD
+```
+
+Use it whenever an SB needs to sign in to the dashboard or exercise the login path. **Never reset, rotate, or reuse a human's password to gain access** — the admin auth API can change any user's password with the service key, and doing so locks the human out. If the test account is missing or its password no longer works, say so and stop; recreating it is the user's call.
+
 ### File Access & Media Isolation (TODO)
 
 Server-spawned Claude sessions currently get `--add-dir ~/.ink/files` for media access (Telegram downloads, Gmail attachments, etc.). This is a shared directory — **all SBs can read all SBs' files**. Future work should consider:
