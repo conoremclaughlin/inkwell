@@ -477,24 +477,43 @@ export async function ensureDefaultReminders(params: {
       }
     }
 
-    // Idempotency: ONE daily check-in per agent, not per identity row. Sep 10
-    // 2026 (Myra): an unscoped twin row (version 1) was handed in as `sbId`,
-    // so a check scoped to that row looked for a reminder bound to something
-    // seconds old, found none by construction, and minted a duplicate of the
-    // agent's real check-in. Ask about every identity row the agent has.
-    const { data: identityRows } = await supabase
+    // Idempotency: one daily check-in per SB. Sep 10 2026 (Myra): an unscoped
+    // twin row (version 1) was handed in as `sbId`, so a check scoped to that
+    // row looked for a reminder bound to something seconds old, found none by
+    // construction, and minted a duplicate of the agent's real check-in.
+    //
+    // "Related" rows are: this row; any UNSCOPED row of the same agent (a
+    // twin, or a legacy row this one supersedes); and, when this row is itself
+    // unscoped, every row of the agent, because a twin shadows them all.
+    // Scoped siblings in other workspaces are distinct SBs and keep their own
+    // check-in (Lumen, PR #595).
+    const { data: identityRows, error: identityError } = await supabase
       .from('agent_identities')
-      .select('id')
+      .select('id, workspace_id')
       .eq('user_id', params.userId)
       .eq('agent_id', params.agentId);
-    const agentIdentityIds = Array.from(
-      new Set([params.sbId, ...(identityRows ?? []).map((row) => row.id)])
-    );
+    if (identityError) {
+      // Fail closed: without the candidate set we cannot prove there is no
+      // check-in, and a duplicate reports to no one (Lumen, PR #595).
+      logger.warn('ensureDefaultReminders: identity lookup failed, skipping seed', {
+        agentId: params.agentId,
+        sbId: params.sbId,
+        error: identityError.message,
+      });
+      return;
+    }
+    const agentRows = identityRows ?? [];
+    const thisRow = agentRows.find((row) => row.id === params.sbId);
+    const relatedIds =
+      !thisRow || !thisRow.workspace_id
+        ? agentRows.map((row) => row.id)
+        : agentRows.filter((row) => !row.workspace_id).map((row) => row.id);
+    const candidateIds = Array.from(new Set([params.sbId, ...relatedIds]));
     const { data: existing } = await supabase
       .from('scheduled_reminders')
       .select('id, sb_id')
       .eq('user_id', params.userId)
-      .in('sb_id', agentIdentityIds)
+      .in('sb_id', candidateIds)
       .in('status', ['active', 'paused'])
       .filter('metadata->>reminderType', 'eq', 'daily-checkin')
       .limit(1);

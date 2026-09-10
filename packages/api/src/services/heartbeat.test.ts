@@ -438,8 +438,11 @@ describe('Heartbeat Service', () => {
     });
 
     it("should skip when the check-in is bound to the agent's OTHER identity row (Sep 10: an unscoped twin handed in as sbId)", async () => {
-      // The agent has two identity rows; the real one already has a check-in.
-      setQueryResult('agent_identities', [{ id: 'identity-real' }, { id: 'identity-twin' }]);
+      // The agent has a scoped real row with a check-in, and an UNSCOPED twin.
+      setQueryResult('agent_identities', [
+        { id: 'identity-real', workspace_id: 'ws-personal' },
+        { id: 'identity-twin', workspace_id: null },
+      ]);
       setQueryResult('scheduled_reminders', [{ id: 'existing-rem', sb_id: 'identity-real' }]);
 
       await ensureDefaultReminders({
@@ -457,6 +460,32 @@ describe('Heartbeat Service', () => {
       expect(reminders.in).toHaveBeenCalledWith(
         'sb_id',
         expect.arrayContaining(['identity-real', 'identity-twin'])
+      );
+    });
+
+    it('a scoped sibling in ANOTHER workspace is a distinct SB and gets its own check-in (PR #595, Lumen)', async () => {
+      // Same slug in two workspaces; A already has a check-in; B is being seeded.
+      setQueryResult('agent_identities', [
+        { id: 'identity-a', workspace_id: 'ws-a' },
+        { id: 'identity-b', workspace_id: 'ws-b' },
+      ]);
+      setQueryResult('scheduled_reminders', []); // nothing bound to B (or to an unscoped row)
+      setQueryResult('users', { timezone: null });
+      setQueryResult('scheduled_reminders', { id: 'rem-b' });
+
+      await ensureDefaultReminders({
+        userId: TEST_USER_ID,
+        sbId: 'identity-b',
+        agentId: 'myra',
+        deliveryChannel: 'telegram',
+        deliveryTarget: '123456789',
+      });
+
+      const reminders = tableBuilders.get('scheduled_reminders')!;
+      // The candidate set is B alone — A's check-in must not suppress B's.
+      expect(reminders.in).toHaveBeenCalledWith('sb_id', ['identity-b']);
+      expect(reminders.insert).toHaveBeenCalledWith(
+        expect.objectContaining({ sb_id: 'identity-b' })
       );
     });
 
