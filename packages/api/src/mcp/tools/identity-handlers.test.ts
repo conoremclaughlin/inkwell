@@ -32,6 +32,35 @@ function createMockDataComposer(mockSupabase: MockSupabaseClient) {
   };
 }
 
+/**
+ * Wire the three queries handleSaveIdentity makes, in order: derive the
+ * agent's workspace, read its existing row, then upsert.
+ *
+ * The first two are plain awaits returning ROW ARRAYS; only the upsert uses
+ * .single(). Getting that shape right in the mock is the whole point — the
+ * previous mock answered every query with the same single object, so a handler
+ * that inserted a duplicate row instead of updating the existing one was
+ * indistinguishable from one that worked.
+ */
+function mockSaveIdentityQueries(
+  mockSupabase: MockSupabaseClient,
+  options: {
+    existing?: Record<string, unknown> | null;
+    saved?: unknown;
+    saveError?: { message: string } | null;
+  }
+) {
+  const rows = options.existing ? [options.existing] : [];
+  mockSupabase._setResultQueue([
+    { data: rows }, // deriveWorkspaceIdFromAgent
+    { data: rows }, // lookupIdentityRow (existing record)
+  ]);
+  mockSupabase._queryBuilder.single = vi.fn().mockResolvedValue({
+    data: options.saved ?? null,
+    error: options.saveError ?? null,
+  });
+}
+
 describe('Identity Handlers', () => {
   let mockSupabase: MockSupabaseClient;
   let mockDataComposer: ReturnType<typeof createMockDataComposer>;
@@ -60,7 +89,7 @@ describe('Identity Handlers', () => {
         updated_at: '2026-01-27T12:00:00Z',
       };
 
-      mockSupabase._setReturnData(mockIdentityRow);
+      mockSaveIdentityQueries(mockSupabase, { saved: mockIdentityRow });
 
       const result = await handleSaveIdentity(
         {
@@ -104,7 +133,7 @@ describe('Identity Handlers', () => {
         updated_at: '2026-01-27T12:00:00Z',
       };
 
-      mockSupabase._setReturnData(mockIdentityRow);
+      mockSaveIdentityQueries(mockSupabase, { saved: mockIdentityRow });
 
       const result = await handleSaveIdentity(
         {
@@ -140,7 +169,7 @@ describe('Identity Handlers', () => {
         updated_at: '2026-01-27T13:00:00Z',
       };
 
-      mockSupabase._setReturnData(mockIdentityRow);
+      mockSaveIdentityQueries(mockSupabase, { saved: mockIdentityRow });
 
       const result = await handleSaveIdentity(
         {
@@ -159,14 +188,10 @@ describe('Identity Handlers', () => {
     });
 
     it('should throw on database error', async () => {
-      // First call (fetch existing) succeeds, second call (upsert) fails
-      let callCount = 0;
-      mockSupabase._queryBuilder.single = vi.fn().mockImplementation(() => {
-        callCount++;
-        if (callCount === 1) {
-          return Promise.resolve({ data: null, error: null });
-        }
-        return Promise.resolve({ data: null, error: { message: 'Database error' } });
+      // Reads succeed (no existing row); the upsert fails.
+      mockSaveIdentityQueries(mockSupabase, {
+        existing: null,
+        saveError: { message: 'Database error' },
       });
 
       await expect(
@@ -208,14 +233,7 @@ describe('Identity Handlers', () => {
       };
 
       it('should preserve soul and heartbeat when not provided in update', async () => {
-        let callCount = 0;
-        mockSupabase._queryBuilder.single = vi.fn().mockImplementation(() => {
-          callCount++;
-          if (callCount === 1) {
-            return Promise.resolve({ data: existingRecord, error: null });
-          }
-          return Promise.resolve({ data: savedResult, error: null });
-        });
+        mockSaveIdentityQueries(mockSupabase, { existing: existingRecord, saved: savedResult });
 
         await handleSaveIdentity(
           {
@@ -241,14 +259,7 @@ describe('Identity Handlers', () => {
       });
 
       it('should update soul when explicitly provided without wiping heartbeat', async () => {
-        let callCount = 0;
-        mockSupabase._queryBuilder.single = vi.fn().mockImplementation(() => {
-          callCount++;
-          if (callCount === 1) {
-            return Promise.resolve({ data: existingRecord, error: null });
-          }
-          return Promise.resolve({ data: savedResult, error: null });
-        });
+        mockSaveIdentityQueries(mockSupabase, { existing: existingRecord, saved: savedResult });
 
         const newSoul = '# SOUL.md\n\nUpdated soul content';
 
@@ -271,14 +282,7 @@ describe('Identity Handlers', () => {
       });
 
       it('should update heartbeat when explicitly provided without wiping soul', async () => {
-        let callCount = 0;
-        mockSupabase._queryBuilder.single = vi.fn().mockImplementation(() => {
-          callCount++;
-          if (callCount === 1) {
-            return Promise.resolve({ data: existingRecord, error: null });
-          }
-          return Promise.resolve({ data: savedResult, error: null });
-        });
+        mockSaveIdentityQueries(mockSupabase, { existing: existingRecord, saved: savedResult });
 
         const newHeartbeat = '# HEARTBEAT.md\n\nUpdated heartbeat';
 
@@ -301,13 +305,9 @@ describe('Identity Handlers', () => {
       });
 
       it('should default optional fields to null/empty when no existing record', async () => {
-        let callCount = 0;
-        mockSupabase._queryBuilder.single = vi.fn().mockImplementation(() => {
-          callCount++;
-          if (callCount === 1) {
-            return Promise.resolve({ data: null, error: { code: 'PGRST116' } });
-          }
-          return Promise.resolve({ data: { ...savedResult, version: 1 }, error: null });
+        mockSaveIdentityQueries(mockSupabase, {
+          existing: null,
+          saved: { ...savedResult, version: 1 },
         });
 
         await handleSaveIdentity(
@@ -329,14 +329,7 @@ describe('Identity Handlers', () => {
       });
 
       it('should preserve all optional fields when only updating name', async () => {
-        let callCount = 0;
-        mockSupabase._queryBuilder.single = vi.fn().mockImplementation(() => {
-          callCount++;
-          if (callCount === 1) {
-            return Promise.resolve({ data: existingRecord, error: null });
-          }
-          return Promise.resolve({ data: savedResult, error: null });
-        });
+        mockSaveIdentityQueries(mockSupabase, { existing: existingRecord, saved: savedResult });
 
         await handleSaveIdentity(
           {
@@ -381,7 +374,7 @@ describe('Identity Handlers', () => {
         updated_at: '2026-01-27T12:00:00Z',
       };
 
-      mockSupabase._setReturnData(mockIdentityRow);
+      mockSupabase._setArrayData([mockIdentityRow]);
 
       const result = await handleGetIdentity(
         { userId: 'user-123', agentId: 'wren' },
@@ -414,7 +407,7 @@ describe('Identity Handlers', () => {
         updated_at: '2026-01-27T13:00:00Z',
       };
 
-      mockSupabase._setReturnData(mockIdentityRow);
+      mockSupabase._setArrayData([mockIdentityRow]);
 
       const result = await handleGetIdentity(
         { userId: 'user-123', agentId: 'wren' },
@@ -428,7 +421,8 @@ describe('Identity Handlers', () => {
     });
 
     it('should return not found when identity does not exist', async () => {
-      mockSupabase._setReturnData(null, { code: 'PGRST116' });
+      // Zero rows, not an error. PGRST116 used to mean both "none" and "many".
+      mockSupabase._setArrayData([]);
 
       const result = await handleGetIdentity(
         { userId: 'user-123', agentId: 'nonexistent' },

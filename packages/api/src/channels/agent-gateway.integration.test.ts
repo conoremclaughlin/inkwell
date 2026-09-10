@@ -61,10 +61,15 @@ describe('AgentGateway Integration (database-driven)', () => {
 
   describe('agent validation via database', () => {
     it('should find echo agent in agent_identities table', async () => {
+      // Scope by user: an agent slug is only unique within a user (and
+      // workspace). Any real deployment has an `echo` per user, so an
+      // unscoped .single() here raises PGRST116 and reports the fixture as
+      // missing — the same unscoped-lookup defect this suite exists to catch.
       const { data } = await dataComposer
         .getClient()
         .from('agent_identities')
         .select('agent_id, name, role')
+        .eq('user_id', testUserId)
         .eq('agent_id', 'echo')
         .single();
 
