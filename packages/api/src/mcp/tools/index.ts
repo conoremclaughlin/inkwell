@@ -13,13 +13,7 @@ import {
 // Import all tool handlers
 import { handleSaveLink, handleSearchLinks, handleTagLink } from './link-handlers';
 
-import {
-  handleSaveContext,
-  handleGetContext,
-  handleSaveProject,
-  handleListProjects,
-  handleGetProject,
-} from './context-handlers';
+import { handleSaveProject, handleListProjects, handleGetProject } from './context-handlers';
 
 import {
   handleCreateTask,
@@ -607,90 +601,6 @@ User can be identified by ONE of:
         return await handleTagLink(args, dataComposer);
       } catch (error) {
         logger.error('Error in tag_link:', error);
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: JSON.stringify({
-                success: false,
-                error: error instanceof Error ? error.message : 'Unknown error',
-              }),
-            },
-          ],
-          isError: true,
-        };
-      }
-    }
-  );
-
-  // =====================================================
-  // CONTEXT TOOLS
-  // =====================================================
-
-  // Register save_context tool
-  server.registerTool(
-    'save_context',
-    {
-      description: `Save or update a context summary. Context types:
-- user: Information about the user (name, preferences, expertise)
-- assistant: Information about the AI's role and relationship with user
-- project: Project-specific context (use save_project for full project data)
-- session: Current session context
-- relationship: The ongoing relationship between user and assistant
-
-User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: {
-        ...userIdentifierFields,
-        contextType: z
-          .enum(['user', 'assistant', 'project', 'session', 'relationship'])
-          .describe('Type of context'),
-        contextKey: z.string().optional().describe('Optional key for sub-context'),
-        summary: z.string().describe('The summarized context to save'),
-        metadata: z.record(z.unknown()).optional().describe('Additional metadata'),
-      },
-    },
-    async (args) => {
-      try {
-        return await handleSaveContext(args, dataComposer);
-      } catch (error) {
-        logger.error('Error in save_context:', error);
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: JSON.stringify({
-                success: false,
-                error: error instanceof Error ? error.message : 'Unknown error',
-              }),
-            },
-          ],
-          isError: true,
-        };
-      }
-    }
-  );
-
-  // Register get_context tool
-  server.registerTool(
-    'get_context',
-    {
-      description: `Retrieve saved context summaries. Can filter by type and key.
-
-User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: {
-        ...userIdentifierFields,
-        contextType: z
-          .enum(['user', 'assistant', 'project', 'session', 'relationship'])
-          .optional()
-          .describe('Filter by type'),
-        contextKey: z.string().optional().describe('Filter by key'),
-      },
-    },
-    async (args) => {
-      try {
-        return await handleGetContext(args, dataComposer);
-      } catch (error) {
-        logger.error('Error in get_context:', error);
         return {
           content: [
             {
@@ -2559,8 +2469,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
 
 Returns:
 - Identity Files: shared values/user/process docs and agent-specific identity docs from ~/.ink
-- Identity Core: user profile, assistant role, relationship context from DB
-- Active Context: current projects, session context, project-specific context
+- Active Context: current projects and focus
 - Active Session: current session if any
 - Recent Memories: high-salience memories (filtered by agent if provided)
 

@@ -183,7 +183,7 @@ Identity is resolved from: system prompt override → `$AGENT_ID` env var → `.
 | ------------------------ | ------------------------------------------------------------------- |
 | **Bootstrap & Sessions** | `bootstrap`, `update_session_state`, `get_session`, `list_sessions` |
 | **Memory**               | `remember`, `recall`, `forget`, `update_memory`, history/restore    |
-| **Context & Projects**   | `save_context`, `get_context`, `save_project`                       |
+| **Projects**             | `save_project`, `list_projects`, `get_project`                      |
 | **Communication**        | `send_response`, `send_to_inbox`, `trigger_agent`                   |
 | **Data**                 | `save_link`, `create_task`, `create_reminder`, calendar, email      |
 | **Identity**             | `save_identity`, `get_identity`, permissions, audit log             |

@@ -547,11 +547,6 @@ The MCP server exposes 60+ tools. Key categories:
 - `get_user_history` - See recent changes (updates/deletes)
 - `restore_memory` - Rollback to a previous version
 
-### Context
-
-- `save_context` - Save context summaries (user, assistant, relationship, project)
-- `get_context` - Retrieve context
-
 ### Projects
 
 - `save_project` - Create/update a project
