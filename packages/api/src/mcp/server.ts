@@ -36,6 +36,7 @@ import {
 } from '../channels/gateway';
 import { runWithRequestContext, tokenIdentityContext } from '../utils/request-context';
 import { resolveWorkspaceContextForRequest } from '../utils/workspace-scope';
+import { deriveWorkspaceIdFromAgent } from '../utils/agent-workspace';
 import { getRuntimeBuildInfo } from '../utils/runtime-build-info';
 import { PcpAuthProvider } from './auth/pcp-auth-provider';
 import { signPcpAccessToken } from '../auth/pcp-tokens';
@@ -263,43 +264,13 @@ export class MCPServer {
     userId: string,
     agentId: string
   ): Promise<string | null> {
-    // TODO(lumen): Deduplicate this with the artifact-handler variant in a
-    // shared helper that can choose ambiguous-workspace behavior (warn/throw).
-    const { data, error } = await this.dataComposer
-      .getClient()
-      .from('agent_identities')
-      .select('workspace_id')
-      .eq('user_id', userId)
-      .eq('agent_id', agentId);
-
-    if (error) {
-      logger.warn('Failed to derive workspace from agent identity in MCP request context', {
-        userId,
-        agentId,
-        error: error.message,
-      });
-      return null;
-    }
-
-    const workspaceIds = Array.from(
-      new Set(
-        (data || [])
-          .map((row) => row.workspace_id)
-          .filter((workspaceId): workspaceId is string => typeof workspaceId === 'string')
-      )
-    );
-
-    if (workspaceIds.length === 1) return workspaceIds[0];
-
-    if (workspaceIds.length > 1) {
-      logger.warn('Ambiguous workspace mapping for agent identity in MCP request context', {
-        userId,
-        agentId,
-        workspaceCount: workspaceIds.length,
-      });
-    }
-
-    return null;
+    return deriveWorkspaceIdFromAgent({
+      supabase: this.dataComposer.getClient(),
+      userId,
+      agentId,
+      onAmbiguous: 'warn',
+      origin: 'mcp-request-context',
+    });
   }
 
   private async resolveWorkspaceContextForMcpRequest(

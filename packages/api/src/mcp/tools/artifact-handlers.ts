@@ -19,6 +19,7 @@ import { getEffectiveAgentId } from '../../auth/enforce-identity';
 import type { Database, Json } from '../../data/supabase/types';
 import { mergeWithContext } from '../../utils/request-context';
 import { resolveWorkspaceScopeForWrite } from '../../utils/workspace-scope';
+import { deriveWorkspaceIdFromAgent as deriveWorkspaceIdFromAgentShared } from '../../utils/agent-workspace';
 import { EmbeddingRouter } from '../../services/embeddings/router';
 import { formatVectorLiteral } from '../../services/embeddings/memory-chunks';
 
@@ -238,40 +239,14 @@ async function deriveWorkspaceIdFromAgent(
   userId: string,
   agentId: string
 ): Promise<string | null> {
-  // TODO(lumen): Deduplicate with MCPServer.deriveWorkspaceIdFromAgent in
-  // server.ts via a shared helper; keep strict throw-on-ambiguous behavior
-  // here for write-path safety.
-  const { data, error } = await supabase
-    .from('agent_identities')
-    .select('workspace_id')
-    .eq('user_id', userId)
-    .eq('agent_id', agentId);
-
-  if (error) {
-    logger.warn('Failed to derive workspace from agent identity', {
-      userId,
-      agentId,
-      error: error.message,
-    });
-    return null;
-  }
-
-  const workspaceIds = Array.from(
-    new Set(
-      (data || [])
-        .map((row) => row.workspace_id)
-        .filter((workspaceId): workspaceId is string => typeof workspaceId === 'string')
-    )
-  );
-
-  if (workspaceIds.length === 1) return workspaceIds[0];
-  if (workspaceIds.length > 1) {
-    throw new Error(
-      `Workspace is ambiguous for agent "${agentId}". Provide workspaceId or X-PCP-Workspace-Id.`
-    );
-  }
-
-  return null;
+  // Strict throw-on-ambiguous: this is a write path.
+  return deriveWorkspaceIdFromAgentShared({
+    supabase,
+    userId,
+    agentId,
+    onAmbiguous: 'throw',
+    origin: 'artifact-write',
+  });
 }
 
 async function resolveIdentityForAgent(
