@@ -477,21 +477,38 @@ export async function ensureDefaultReminders(params: {
       }
     }
 
-    // Idempotency: check if a daily-checkin already exists for this identity
-    const { data: existing } = await supabase
-      .from('scheduled_reminders')
+    // Idempotency: ONE daily check-in per agent, not per identity row. Sep 10
+    // 2026 (Myra): an unscoped twin row (version 1) was handed in as `sbId`,
+    // so a check scoped to that row looked for a reminder bound to something
+    // seconds old, found none by construction, and minted a duplicate of the
+    // agent's real check-in. Ask about every identity row the agent has.
+    const { data: identityRows } = await supabase
+      .from('agent_identities')
       .select('id')
       .eq('user_id', params.userId)
-      .eq('sb_id', params.sbId)
+      .eq('agent_id', params.agentId);
+    const agentIdentityIds = Array.from(
+      new Set([params.sbId, ...(identityRows ?? []).map((row) => row.id)])
+    );
+    const { data: existing } = await supabase
+      .from('scheduled_reminders')
+      .select('id, sb_id')
+      .eq('user_id', params.userId)
+      .in('sb_id', agentIdentityIds)
       .in('status', ['active', 'paused'])
       .filter('metadata->>reminderType', 'eq', 'daily-checkin')
       .limit(1);
 
     if (existing && existing.length > 0) {
-      logger.debug('ensureDefaultReminders: daily-checkin already exists, skipping', {
-        sbId: params.sbId,
-        existingReminderId: existing[0].id,
-      });
+      logger.debug(
+        'ensureDefaultReminders: daily-checkin already exists for this agent, skipping',
+        {
+          sbId: params.sbId,
+          agentId: params.agentId,
+          existingReminderId: existing[0].id,
+          boundTo: existing[0].sb_id,
+        }
+      );
       return;
     }
 

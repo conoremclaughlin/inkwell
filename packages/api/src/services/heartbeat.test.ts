@@ -437,6 +437,29 @@ describe('Heartbeat Service', () => {
       expect(builder.insert).not.toHaveBeenCalled();
     });
 
+    it("should skip when the check-in is bound to the agent's OTHER identity row (Sep 10: an unscoped twin handed in as sbId)", async () => {
+      // The agent has two identity rows; the real one already has a check-in.
+      setQueryResult('agent_identities', [{ id: 'identity-real' }, { id: 'identity-twin' }]);
+      setQueryResult('scheduled_reminders', [{ id: 'existing-rem', sb_id: 'identity-real' }]);
+
+      await ensureDefaultReminders({
+        userId: TEST_USER_ID,
+        sbId: 'identity-twin',
+        agentId: 'myra',
+        deliveryChannel: 'telegram',
+        deliveryTarget: '123456789',
+      });
+
+      const reminders = tableBuilders.get('scheduled_reminders')!;
+      expect(reminders.insert).not.toHaveBeenCalled();
+      // The guard asked about every identity row of the agent, not just the new one.
+      expect(tableBuilders.get('agent_identities')!.eq).toHaveBeenCalledWith('agent_id', 'myra');
+      expect(reminders.in).toHaveBeenCalledWith(
+        'sb_id',
+        expect.arrayContaining(['identity-real', 'identity-twin'])
+      );
+    });
+
     it('should resolve delivery channel from user when not pre-resolved', async () => {
       // User lookup returns telegram_id
       setQueryResult('users', { telegram_id: '987654321', whatsapp_id: null });
