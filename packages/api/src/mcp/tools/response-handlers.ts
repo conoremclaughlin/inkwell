@@ -243,6 +243,14 @@ export async function handleSendResponse(
       if (resolvedVoice) metadata.ttsVoice = resolvedVoice;
     }
 
+    // Stamp the sending session here, at the tool boundary, where the request
+    // context is unambiguously this call's. On 2026-09-10 Conor received the
+    // same Thursday digest twice and neither `message_out` row said who sent
+    // it — both carried session_id null, as 69 of 69 outbound rows did that
+    // week — so the duplicate could only be attributed by reading a sibling's
+    // session context field and inferring.
+    const senderCtx = getRequestContext();
+
     const response: AgentResponse = {
       channel: args.channel as ChannelType,
       conversationId: args.conversationId,
@@ -251,6 +259,7 @@ export async function handleSendResponse(
       replyToMessageId: args.replyToMessageId,
       metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
       media: args.media as OutboundMedia[] | undefined,
+      sessionId: senderCtx?.tokenSessionId ?? senderCtx?.sessionId,
     };
 
     // Try local callback first (when running in same process as session host)

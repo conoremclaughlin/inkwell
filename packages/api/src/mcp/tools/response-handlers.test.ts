@@ -17,6 +17,7 @@ import {
   consumeExplicitResponse,
   setResponseCallback,
 } from './response-handlers';
+import { runWithRequestContext } from '../../utils/request-context';
 
 describe('inferMediaTypeFromPath', () => {
   it('classifies common extensions', () => {
@@ -256,5 +257,80 @@ describe('consumeExplicitResponse', () => {
 
   it('is false for a conversation that never answered', () => {
     expect(consumeExplicitResponse('telegram', 'never-used')).toBe(false);
+  });
+});
+
+describe('handleSendResponse — sender session attribution', () => {
+  /**
+   * Regression coverage for the 2026-09-10 duplicate-digest incident.
+   *
+   * Conor received the same Thursday digest twice, ten minutes apart, from two
+   * concurrently-live myra sessions. Neither `message_out` activity row said
+   * who sent it — every outbound row carried `session_id` null (69 of 69 that
+   * week) — so the sender could only be identified by reading a sibling's
+   * session `context` field and inferring from it.
+   *
+   * The gateway stamps whatever `AgentResponse.sessionId` it is handed, so the
+   * property that matters is pinned here, at the boundary where the request
+   * context is unambiguously this call's.
+   */
+  const conversationId = 'conv-session-attribution';
+  const composer = {} as unknown as Parameters<typeof handleSendResponse>[1];
+
+  let captured: { sessionId?: string } | undefined;
+
+  beforeEach(() => {
+    captured = undefined;
+    consumeExplicitResponse('telegram', conversationId);
+    setResponseCallback((async (response: { sessionId?: string }) => {
+      captured = response;
+      return undefined;
+    }) as unknown as Parameters<typeof setResponseCallback>[0]);
+  });
+
+  afterEach(() => {
+    setResponseCallback(null as unknown as Parameters<typeof setResponseCallback>[0]);
+    consumeExplicitResponse('telegram', conversationId);
+  });
+
+  const send = () =>
+    handleSendResponse(
+      {
+        channel: 'telegram',
+        conversationId,
+        content: 'Thursday digest',
+      } as Parameters<typeof handleSendResponse>[0],
+      composer
+    );
+
+  it('stamps the sending session onto the outgoing response', async () => {
+    const sessionId = '64e1eb49-6229-4e4c-a9fd-08f1b6bd6848';
+    await runWithRequestContext({ sessionId } as never, async () => {
+      await send();
+    });
+
+    // Without this the row is anonymous and a duplicate cannot be attributed.
+    expect(captured?.sessionId).toBe(sessionId);
+  });
+
+  it('prefers the signed token session over the caller-asserted header', async () => {
+    // The header form is a caller-composed assertion; the token claim is
+    // authenticated. Same precedence the memory handlers use.
+    const tokenSessionId = '88b728cb-45aa-4830-90d3-20007aa521bc';
+    await runWithRequestContext(
+      { sessionId: 'header-asserted-session', tokenSessionId } as never,
+      async () => {
+        await send();
+      }
+    );
+
+    expect(captured?.sessionId).toBe(tokenSessionId);
+  });
+
+  it('leaves the session undefined when there is no request context', async () => {
+    // Heartbeat and other sessionless sends must still go out — they log null,
+    // exactly as before. Absent attribution is acceptable; wrong is not.
+    await send();
+    expect(captured?.sessionId).toBeUndefined();
   });
 });
