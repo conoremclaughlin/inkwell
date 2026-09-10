@@ -14,6 +14,8 @@ import { logger } from '../../utils/logger';
 import { getEffectiveAgentId } from '../../auth/enforce-identity';
 import { userIdentifierBaseSchema, resolveUserOrThrow } from '../../services/user-resolver';
 import { ensureDefaultReminders } from '../../services/heartbeat';
+import { deriveWorkspaceIdFromAgent } from '../../utils/agent-workspace';
+import { resolveWorkspaceScopeForWrite } from '../../utils/workspace-scope';
 
 // =====================================================
 // SCHEMAS
@@ -186,6 +188,77 @@ function withWorkspaceFilter<T>(query: T, workspaceId?: string): T {
   return (query as { eq: (column: string, value: string) => T }).eq('workspace_id', workspaceId);
 }
 
+/** One identity row, or a reason there isn't exactly one. */
+type IdentityLookup<Row> =
+  | { kind: 'found'; row: Row }
+  | { kind: 'absent' }
+  | { kind: 'ambiguous'; rows: Row[] }
+  | { kind: 'unreadable'; message: string };
+
+/**
+ * Look up the single identity row for (user, agent[, workspace]).
+ *
+ * Deliberately not `.single()`. PostgREST raises PGRST116 for BOTH "0 rows" and
+ * ">1 rows", so a duplicated slug surfaced to callers as "No identity found for
+ * agent: myra" while two rows sat in the table — which sent one investigation
+ * after a routing bug that did not exist. Whatever a caller does with the
+ * answer, it must be able to tell nothing-there from too-many.
+ */
+async function lookupIdentityRow<Row extends { id: string; workspace_id: string | null }>(
+  query: PromiseLike<{ data: Row[] | null; error: { message: string } | null }>
+): Promise<IdentityLookup<Row>> {
+  const { data, error } = await query;
+  if (error) return { kind: 'unreadable', message: error.message };
+  if (!data?.length) return { kind: 'absent' };
+  if (data.length > 1) return { kind: 'ambiguous', rows: data };
+  return { kind: 'found', row: data[0] };
+}
+
+/** Name the offending rows, so the next reader does not have to open psql. */
+function describeAmbiguousRows(rows: Array<{ id: string; workspace_id: string | null }>): string {
+  return rows.map((row) => `${row.id} (workspace ${row.workspace_id ?? 'NULL'})`).join(', ');
+}
+
+/**
+ * The workspace a save_identity write should land in.
+ *
+ * Workspace scope is server-derived (AGENTS.md), so a caller omitting
+ * workspaceId means "resolve it for me" — it must never be taken as "write
+ * NULL". Writing NULL is precisely what minted the orphan rows: the upsert
+ * arbitrates on (user_id, workspace_id, agent_id), and in Postgres NULL is
+ * distinct from every value including NULL, so a NULL-workspace insert can
+ * never match the agent's existing scoped row. ON CONFLICT then finds no
+ * conflict and INSERTs a second identity beside the real one — version 1, new
+ * uuid, reported to the caller as "Identity created" while their real identity
+ * still sits at version 12.
+ *
+ * Returns null only when the agent genuinely has no workspace anywhere, which
+ * is a legitimate first-ever identity creation.
+ */
+async function resolveWorkspaceForIdentityWrite(
+  supabase: ReturnType<DataComposer['getClient']>,
+  userId: string,
+  agentId: string,
+  explicitWorkspaceId?: string
+): Promise<string | null> {
+  const resolved = await resolveWorkspaceScopeForWrite({
+    rawArgs: {},
+    explicitWorkspaceId,
+    agentId,
+    deriveWorkspaceIdFromAgent: (slug) =>
+      deriveWorkspaceIdFromAgent({
+        supabase,
+        userId,
+        agentId: slug,
+        // A write must not guess between two workspaces.
+        onAmbiguous: 'throw',
+        origin: 'save_identity',
+      }),
+  });
+
+  return resolved?.workspaceId ?? null;
+}
+
 /**
  * Write identity to file system
  */
@@ -230,11 +303,35 @@ export async function handleSaveIdentity(args: unknown, dataComposer: DataCompos
   // Enforce identity: pinned agents can only modify their own identity
   const agentId = getEffectiveAgentId(params.agentId) ?? params.agentId;
 
-  // Fetch existing record so omitted optional fields are preserved
-  const { data: existing } = await withWorkspaceFilter(
-    supabase.from('agent_identities').select('*').eq('user_id', user.id).eq('agent_id', agentId),
-    workspaceId
-  ).single();
+  // Resolve the workspace BEFORE reading or writing. An omitted workspaceId is
+  // a request to resolve, never a licence to write NULL — see
+  // resolveWorkspaceForIdentityWrite for what NULL does to the upsert.
+  const effectiveWorkspaceId =
+    (await resolveWorkspaceForIdentityWrite(supabase, user.id, agentId, workspaceId)) ?? undefined;
+
+  // Fetch existing record so omitted optional fields are preserved.
+  const existingLookup = await lookupIdentityRow(
+    withWorkspaceFilter(
+      supabase.from('agent_identities').select('*').eq('user_id', user.id).eq('agent_id', agentId),
+      effectiveWorkspaceId
+    )
+  );
+
+  // Preserving fields from a row we could not read would silently blank
+  // description/soul/heartbeat back to defaults, so refuse instead of guessing.
+  if (existingLookup.kind === 'unreadable') {
+    throw new Error(
+      `Failed to save identity: could not read the existing identity for "${agentId}": ${existingLookup.message}`
+    );
+  }
+  if (existingLookup.kind === 'ambiguous') {
+    throw new Error(
+      `Failed to save identity: agent "${agentId}" resolves to ${existingLookup.rows.length} identity rows — ` +
+        `${describeAmbiguousRows(existingLookup.rows)}. Refusing to write; repair the duplicate first.`
+    );
+  }
+
+  const existing = existingLookup.kind === 'found' ? existingLookup.row : null;
 
   // Build upsert object, preserving existing values for omitted fields
   const upsertData: TablesInsert<'agent_identities'> = {
@@ -260,7 +357,9 @@ export async function handleSaveIdentity(args: unknown, dataComposer: DataCompos
     tts_config: (ttsConfig !== undefined
       ? ttsConfig
       : (existing?.tts_config ?? null)) as unknown as Json,
-    ...(workspaceId ? { workspace_id: workspaceId } : {}),
+    // Pin the row we actually read. Omitting this key leaves workspace_id NULL,
+    // which the upsert's arbiter index can never match — that is the orphan.
+    ...(effectiveWorkspaceId ? { workspace_id: effectiveWorkspaceId } : {}),
   };
 
   // Use upsert to handle both create and update
@@ -343,38 +442,95 @@ export async function handleGetIdentity(args: unknown, dataComposer: DataCompose
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
   const supabase = dataComposer.getClient();
 
-  let identityQuery = supabase
-    .from('agent_identities')
-    .select('*')
-    .eq('user_id', user.id)
-    .eq('agent_id', params.agentId);
+  const lookup = await lookupIdentityRow(
+    withWorkspaceFilter(
+      supabase
+        .from('agent_identities')
+        .select('*')
+        .eq('user_id', user.id)
+        .eq('agent_id', params.agentId),
+      params.workspaceId
+    )
+  );
 
-  identityQuery = withWorkspaceFilter(identityQuery, params.workspaceId);
-  const { data, error } = await identityQuery.single();
-
-  if (error) {
-    if (error.code === 'PGRST116') {
-      return {
-        content: [
-          {
-            type: 'text' as const,
-            text: JSON.stringify(
-              {
-                success: false,
-                message: `No identity found for agent: ${params.agentId}`,
-                user: { id: user.id, resolvedBy },
-                identity: null,
-              },
-              null,
-              2
-            ),
-          },
-        ],
-      };
-    }
-    logger.error('Failed to get identity', { error, agentId: params.agentId });
-    throw new Error(`Failed to get identity: ${error.message}`);
+  if (lookup.kind === 'unreadable') {
+    logger.error('Failed to get identity', {
+      error: lookup.message,
+      agentId: params.agentId,
+    });
+    throw new Error(`Failed to get identity: ${lookup.message}`);
   }
+
+  /** Set when we served a real row that had an orphan sitting beside it. */
+  let warning: string | undefined;
+  let resolved = lookup.kind === 'found' ? lookup.row : null;
+
+  if (lookup.kind === 'ambiguous' && !params.workspaceId) {
+    // A workspace_id of NULL is not a legitimate identity — it is residue from
+    // the upsert defect this file's save path now prevents. When exactly one
+    // row carries a real workspace, that row IS the agent's identity. Serve it.
+    // Refusing here would be technically pure and would leave a live agent with
+    // no soul and no heartbeat over a row nothing should have written.
+    const scoped = lookup.rows.filter((row) => row.workspace_id !== null);
+    if (scoped.length === 1) {
+      resolved = scoped[0];
+      const orphans = lookup.rows.filter((row) => row.workspace_id === null);
+      warning =
+        `Served the workspace-scoped identity (${scoped[0].id}); ` +
+        `${orphans.length} workspace-unscoped orphan row(s) also exist for "${params.agentId}" ` +
+        `— ${describeAmbiguousRows(orphans)}. These should be repaired.`;
+      logger.warn('Orphaned identity row alongside a scoped one; served the scoped row', {
+        agentId: params.agentId,
+        servedId: scoped[0].id,
+        orphanIds: orphans.map((row) => row.id),
+      });
+    }
+  }
+
+  if (!resolved) {
+    // Two rows is not zero rows. Reporting "not found" for a duplicate is what
+    // made this class of bug cost two agents a night in the wrong subsystem.
+    const isAmbiguous = lookup.kind === 'ambiguous';
+    const message = isAmbiguous
+      ? `Ambiguous identity for agent "${params.agentId}": ${lookup.rows.length} rows — ` +
+        `${describeAmbiguousRows(lookup.rows)}. Pass workspaceId to disambiguate, or repair the duplicate.`
+      : `No identity found for agent: ${params.agentId}`;
+
+    if (isAmbiguous) {
+      logger.warn('Ambiguous identity slug on get_identity', {
+        agentId: params.agentId,
+        rowCount: lookup.rows.length,
+        rowIds: lookup.rows.map((row) => row.id),
+      });
+    }
+
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: JSON.stringify(
+            {
+              success: false,
+              reason: isAmbiguous ? 'ambiguous' : 'absent',
+              message,
+              ...(isAmbiguous && {
+                candidates: lookup.rows.map((row) => ({
+                  id: row.id,
+                  workspaceId: row.workspace_id,
+                })),
+              }),
+              user: { id: user.id, resolvedBy },
+              identity: null,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+
+  const data = resolved;
 
   // Single-file response: return just the requested document
   if (params.file) {
@@ -408,6 +564,7 @@ export async function handleGetIdentity(args: unknown, dataComposer: DataCompose
               file: params.file,
               content: fileContent,
               version: data.version,
+              ...(warning && { warning }),
             },
             null,
             2
@@ -425,6 +582,7 @@ export async function handleGetIdentity(args: unknown, dataComposer: DataCompose
         text: JSON.stringify(
           {
             success: true,
+            ...(warning && { warning }),
             user: { id: user.id, resolvedBy },
             identity: {
               id: data.id,
