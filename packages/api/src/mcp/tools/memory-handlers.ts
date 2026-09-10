@@ -875,21 +875,46 @@ export async function handleRemember(args: unknown, dataComposer: DataComposer) 
   const agentId = getEffectiveAgentId(params.agentId);
 
   // Attach a session ID to the memory metadata for traceability. An explicit
-  // sessionId from the caller wins: it knows which session it is, whereas the
-  // lookup below infers "the active one" and can land on a sibling session in
-  // parallel worktrees. Never require a session — memories are too important
-  // to lose.
+  // sessionId from the caller wins: it knows which session it is.
+  //
+  // Otherwise resolve it the same way every other session-targeting tool does,
+  // which prefers the session the caller is ACTUALLY RUNNING IN (per the signed
+  // token / `x-ink-context`) over any lookup. This handler used to call
+  // `getActiveSession(user.id, agentId, studioScope)` directly — the unscoped
+  // recency lookup described at `resolveImplicitSession`, which returns "the
+  // most recently started open session" for the identity and so deterministically
+  // loses to any newer sibling row.
+  //
+  // That is not hypothetical. On 2026-09-10 routing created myra session
+  // d1d105ec with no process behind it (backend_session_id null, every token
+  // counter 0, lifecycle 'running'). As the newest myra row it captured EVERY
+  // subsequent remember() call — 0 of that day's memories reached her live
+  // session — while `update_session_state`, already on the resolver below, kept
+  // writing to the right one from the same agent in the same minute.
+  //
+  // Attribution failure must never cost a memory, so unlike its peers this
+  // handler does not fail closed: an unresolved session saves with no sessionId
+  // rather than throwing. Absent provenance is recoverable; wrong provenance
+  // silently corrupts the record.
   let sessionId: string | undefined = params.sessionId;
   if (!sessionId) {
     try {
-      const activeSession = await dataComposer.repositories.memory.getActiveSession(
-        user.id,
-        agentId,
-        studioScope
-      );
-      sessionId = activeSession?.id;
-    } catch {
-      // Session lookup failed — save the memory anyway
+      const caller = await resolveCaller(dataComposer, user.id, params.agentId);
+      const resolved = await resolveImplicitSession(dataComposer, user.id, caller, studioScope);
+      sessionId = resolved.session?.id;
+      if (!resolved.session) {
+        logger.warn('Saving memory without session attribution', {
+          agentId: agentId || 'none',
+          reason: resolved.reason,
+          candidateCount: resolved.candidateCount,
+        });
+      }
+    } catch (error) {
+      // Session lookup failed — save the memory anyway, unattributed.
+      logger.warn('Session resolution threw while saving a memory', {
+        agentId: agentId || 'none',
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 
