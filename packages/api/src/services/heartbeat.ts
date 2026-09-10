@@ -477,21 +477,74 @@ export async function ensureDefaultReminders(params: {
       }
     }
 
-    // Idempotency: check if a daily-checkin already exists for this identity
+    // Idempotency: one daily check-in per SB. Sep 10 2026 (Myra): an unscoped
+    // twin row (version 1) was handed in as `sbId`, so a check scoped to that
+    // row looked for a reminder bound to something seconds old, found none by
+    // construction, and minted a duplicate of the agent's real check-in.
+    //
+    // "Related" rows are: this row; any UNSCOPED row of the same agent (a
+    // twin, or a legacy row this one supersedes); and, when this row is itself
+    // unscoped, every row of the agent, because a twin shadows them all.
+    // Scoped siblings in other workspaces are distinct SBs and keep their own
+    // check-in (Lumen, PR #595).
+    const { data: identityRows, error: identityError } = await supabase
+      .from('agent_identities')
+      .select('id, workspace_id')
+      .eq('user_id', params.userId)
+      .eq('agent_id', params.agentId);
+    if (identityError) {
+      // Fail closed: without the candidate set we cannot prove there is no
+      // check-in, and a duplicate reports to no one (Lumen, PR #595).
+      logger.warn('ensureDefaultReminders: identity lookup failed, skipping seed', {
+        agentId: params.agentId,
+        sbId: params.sbId,
+        error: identityError.message,
+      });
+      return;
+    }
+    const agentRows = identityRows ?? [];
+    const thisRow = agentRows.find((row) => row.id === params.sbId);
+    const scopedRows = agentRows.filter((row) => Boolean(row.workspace_id));
+    const unscopedIds = agentRows.filter((row) => !row.workspace_id).map((row) => row.id);
+    let relatedIds: string[];
+    if (thisRow?.workspace_id) {
+      // A scoped SB. An unscoped row can only be ITS twin when it is the only
+      // scoped candidate; with siblings in other workspaces, whose twin it is
+      // cannot be known here, so the SB is judged on its own UUID (Lumen).
+      relatedIds = scopedRows.length === 1 ? unscopedIds : [];
+    } else if (scopedRows.length > 1) {
+      // An unscoped row alongside several scoped SBs: the same ambiguity the
+      // identity resolver refuses. Seeding on a guess could either duplicate
+      // or suppress a real check-in, so skip and say so.
+      logger.warn(
+        'ensureDefaultReminders: unscoped identity with several scoped siblings — ambiguous, skipping seed',
+        { agentId: params.agentId, sbId: params.sbId, scopedRows: scopedRows.length }
+      );
+      return;
+    } else {
+      // Unscoped (or not yet visible): a twin shadows the single scoped row.
+      relatedIds = agentRows.map((row) => row.id);
+    }
+    const candidateIds = Array.from(new Set([params.sbId, ...relatedIds]));
     const { data: existing } = await supabase
       .from('scheduled_reminders')
-      .select('id')
+      .select('id, sb_id')
       .eq('user_id', params.userId)
-      .eq('sb_id', params.sbId)
+      .in('sb_id', candidateIds)
       .in('status', ['active', 'paused'])
       .filter('metadata->>reminderType', 'eq', 'daily-checkin')
       .limit(1);
 
     if (existing && existing.length > 0) {
-      logger.debug('ensureDefaultReminders: daily-checkin already exists, skipping', {
-        sbId: params.sbId,
-        existingReminderId: existing[0].id,
-      });
+      logger.debug(
+        'ensureDefaultReminders: daily-checkin already exists for this agent, skipping',
+        {
+          sbId: params.sbId,
+          agentId: params.agentId,
+          existingReminderId: existing[0].id,
+          boundTo: existing[0].sb_id,
+        }
+      );
       return;
     }
 

@@ -9,11 +9,17 @@ import { writeFileSync, mkdirSync, existsSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import type { DataComposer } from '../../data/composer';
-import type { Json, TablesInsert } from '../../data/supabase/types';
+import type { Json, Tables, TablesInsert } from '../../data/supabase/types';
 import { logger } from '../../utils/logger';
+import {
+  withWorkspaceFilter,
+  pickWorkspaceScopedRow,
+  WorkspaceRowAmbiguityError,
+} from './workspace-scoped-row';
 import { getEffectiveAgentId } from '../../auth/enforce-identity';
 import { userIdentifierBaseSchema, resolveUserOrThrow } from '../../services/user-resolver';
 import { ensureDefaultReminders } from '../../services/heartbeat';
+import { resolveWorkspaceScopeForWrite } from '../../utils/workspace-scope';
 
 // =====================================================
 // SCHEMAS
@@ -181,9 +187,83 @@ function generateIdentityMarkdown(identity: {
   return lines.join('\n');
 }
 
-function withWorkspaceFilter<T>(query: T, workspaceId?: string): T {
-  if (!workspaceId) return query;
-  return (query as { eq: (column: string, value: string) => T }).eq('workspace_id', workspaceId);
+type AgentIdentityRow = Tables<'agent_identities'>;
+
+/**
+ * The one agent_identities row for (user, agent[, workspace]). Reads EVERY row
+ * for the key — there are at most a handful — so "found two" is never
+ * reported as "not found", and a truncated page can never hide a second
+ * scoped row behind an unscoped twin (Lumen, PR #595 P1: limit(2) returned
+ * [NULL, A] out of {NULL, A, B} and A was taken as unique).
+ */
+async function findAgentIdentityRow(
+  supabase: ReturnType<DataComposer['getClient']>,
+  userId: string,
+  agentId: string,
+  workspaceId?: string
+): Promise<AgentIdentityRow | null> {
+  let query = supabase
+    .from('agent_identities')
+    .select('*')
+    .eq('user_id', userId)
+    .eq('agent_id', agentId);
+  query = withWorkspaceFilter(query, workspaceId);
+  const { data, error } = await query;
+  if (error) {
+    if (error.code === 'PGRST116') return null;
+    throw new Error(`Failed to read identity: ${error.message}`);
+  }
+  return pickWorkspaceScopedRow<AgentIdentityRow>(data, `agent "${agentId}"`);
+}
+
+/**
+ * Workspace scope for identity reads and writes. The request context set by
+ * the CLI hooks / server entry (header, or derived from the caller's own
+ * identity) is authoritative — a caller can never address another workspace
+ * by passing workspaceId. The explicit argument is only a fallback for
+ * callers with no request context (scripts, tests).
+ */
+async function resolveIdentityScope(
+  args: unknown,
+  explicitWorkspaceId: string | undefined,
+  agentId: string | undefined,
+  deriveWorkspaceIdFromAgent?: (agentId: string) => Promise<string | null>
+): Promise<string | undefined> {
+  const scope = await resolveWorkspaceScopeForWrite({
+    rawArgs: (args ?? {}) as Record<string, unknown>,
+    explicitWorkspaceId,
+    agentId,
+    deriveWorkspaceIdFromAgent,
+  });
+  if (scope && explicitWorkspaceId && scope.workspaceId !== explicitWorkspaceId) {
+    logger.warn('[Identity] Ignoring workspaceId argument; request scope is authoritative', {
+      agentId,
+      requested: explicitWorkspaceId,
+      scope: scope.workspaceId,
+      source: scope.source,
+    });
+  }
+  return scope?.workspaceId;
+}
+
+function identityUnresolvedResponse(
+  message: string,
+  user: { id: string },
+  resolvedBy: string,
+  extra: Record<string, unknown>
+) {
+  return {
+    content: [
+      {
+        type: 'text' as const,
+        text: JSON.stringify(
+          { success: false, message, user: { id: user.id, resolvedBy }, ...extra },
+          null,
+          2
+        ),
+      },
+    ],
+  };
 }
 
 /**
@@ -230,14 +310,36 @@ export async function handleSaveIdentity(args: unknown, dataComposer: DataCompos
   // Enforce identity: pinned agents can only modify their own identity
   const agentId = getEffectiveAgentId(params.agentId) ?? params.agentId;
 
-  // Fetch existing record so omitted optional fields are preserved
-  const { data: existing } = await withWorkspaceFilter(
-    supabase.from('agent_identities').select('*').eq('user_id', user.id).eq('agent_id', agentId),
-    workspaceId
-  ).single();
+  // Scope precedence (Sep 10 incident): the request's header/derived
+  // workspace, else the workspace the SB's existing identity already lives in,
+  // else the explicit argument. Only a first-ever save can be unscoped.
+  let preloaded: AgentIdentityRow | null | undefined;
+  let preloadAmbiguity: WorkspaceRowAmbiguityError | null = null;
+  const workspaceScope = await resolveIdentityScope(args, workspaceId, agentId, async (id) => {
+    try {
+      preloaded = await findAgentIdentityRow(supabase, user.id, id);
+      return preloaded?.workspace_id ?? null;
+    } catch (err) {
+      // Two scoped rows and no scope yet: nothing to derive. Let the explicit
+      // argument decide (Lumen, PR #595 P2) — and if there is none either,
+      // the ambiguity is the right answer, raised below.
+      if (!(err instanceof WorkspaceRowAmbiguityError)) throw err;
+      preloadAmbiguity = err;
+      return null;
+    }
+  });
+  if (workspaceScope === undefined && preloadAmbiguity) throw preloadAmbiguity;
 
-  // Build upsert object, preserving existing values for omitted fields
-  const upsertData: TablesInsert<'agent_identities'> = {
+  // The existing row, so omitted optional fields are preserved and the write
+  // is an UPDATE of that row. Reuse the preloaded row only when the resolved
+  // scope is the one it lives in; otherwise look it up under the scope.
+  const existing =
+    preloaded !== undefined && (preloaded?.workspace_id ?? undefined) === workspaceScope
+      ? preloaded
+      : await findAgentIdentityRow(supabase, user.id, agentId, workspaceScope);
+
+  // Build the row, preserving existing values for omitted fields
+  const identityFields: TablesInsert<'agent_identities'> = {
     user_id: user.id,
     agent_id: agentId,
     name,
@@ -260,17 +362,22 @@ export async function handleSaveIdentity(args: unknown, dataComposer: DataCompos
     tts_config: (ttsConfig !== undefined
       ? ttsConfig
       : (existing?.tts_config ?? null)) as unknown as Json,
-    ...(workspaceId ? { workspace_id: workspaceId } : {}),
+    // Sep 10 incident: the scope must ALWAYS be explicit. Omitting it dropped
+    // the existing row's workspace, the (user, workspace, agent) conflict
+    // target never matched on NULL, and the upsert inserted an unscoped twin.
+    workspace_id: workspaceScope ?? existing?.workspace_id ?? null,
   };
 
-  // Use upsert to handle both create and update
-  const { data, error } = await supabase
-    .from('agent_identities')
-    .upsert(upsertData, {
-      onConflict: 'user_id,workspace_id,agent_id',
-    })
-    .select()
-    .single();
+  // Update the row we found by its id; only a first save inserts. An upsert
+  // keyed on a NULL-able column cannot express "update the existing row".
+  const { data, error } = existing
+    ? await supabase
+        .from('agent_identities')
+        .update(identityFields)
+        .eq('id', existing.id)
+        .select()
+        .single()
+    : await supabase.from('agent_identities').insert(identityFields).select().single();
 
   if (error) {
     logger.error('Failed to save identity', { error, agentId });
@@ -343,37 +450,33 @@ export async function handleGetIdentity(args: unknown, dataComposer: DataCompose
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
   const supabase = dataComposer.getClient();
 
-  let identityQuery = supabase
-    .from('agent_identities')
-    .select('*')
-    .eq('user_id', user.id)
-    .eq('agent_id', params.agentId);
-
-  identityQuery = withWorkspaceFilter(identityQuery, params.workspaceId);
-  const { data, error } = await identityQuery.single();
-
-  if (error) {
-    if (error.code === 'PGRST116') {
-      return {
-        content: [
-          {
-            type: 'text' as const,
-            text: JSON.stringify(
-              {
-                success: false,
-                message: `No identity found for agent: ${params.agentId}`,
-                user: { id: user.id, resolvedBy },
-                identity: null,
-              },
-              null,
-              2
-            ),
-          },
-        ],
-      };
+  let data: AgentIdentityRow | null;
+  try {
+    data = await findAgentIdentityRow(
+      supabase,
+      user.id,
+      params.agentId,
+      await resolveIdentityScope(args, params.workspaceId, params.agentId)
+    );
+  } catch (err) {
+    if (err instanceof WorkspaceRowAmbiguityError) {
+      return identityUnresolvedResponse(err.message, user, resolvedBy, {
+        identity: null,
+        ambiguous: true,
+        rowCount: err.rowCount,
+      });
     }
-    logger.error('Failed to get identity', { error, agentId: params.agentId });
-    throw new Error(`Failed to get identity: ${error.message}`);
+    logger.error('Failed to get identity', { error: err, agentId: params.agentId });
+    throw err;
+  }
+
+  if (!data) {
+    return identityUnresolvedResponse(
+      `No identity found for agent: ${params.agentId}`,
+      user,
+      resolvedBy,
+      { identity: null }
+    );
   }
 
   // Single-file response: return just the requested document
@@ -506,15 +609,21 @@ export async function handleGetIdentityHistory(args: unknown, dataComposer: Data
   const supabase = dataComposer.getClient();
   const limit = params.limit || 10;
 
-  // First get the current identity to get its ID
-  let currentQuery = supabase
-    .from('agent_identities')
-    .select('id')
-    .eq('user_id', user.id)
-    .eq('agent_id', params.agentId);
-
-  currentQuery = withWorkspaceFilter(currentQuery, params.workspaceId);
-  const { data: current } = await currentQuery.single();
+  // First resolve the current identity to get its ID (ambiguity is reported
+  // as such, never as "not found")
+  let current: AgentIdentityRow | null = null;
+  let unresolved: string | null = null;
+  try {
+    current = await findAgentIdentityRow(
+      supabase,
+      user.id,
+      params.agentId,
+      await resolveIdentityScope(args, params.workspaceId, params.agentId)
+    );
+  } catch (err) {
+    if (!(err instanceof WorkspaceRowAmbiguityError)) throw err;
+    unresolved = err.message;
+  }
 
   if (!current) {
     return {
@@ -524,7 +633,7 @@ export async function handleGetIdentityHistory(args: unknown, dataComposer: Data
           text: JSON.stringify(
             {
               success: false,
-              message: `No identity found for agent: ${params.agentId}`,
+              message: unresolved ?? `No identity found for agent: ${params.agentId}`,
               user: { id: user.id, resolvedBy },
               history: [],
             },
@@ -591,15 +700,13 @@ export async function handleRestoreIdentity(args: unknown, dataComposer: DataCom
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
   const supabase = dataComposer.getClient();
 
-  // First get the current identity
-  let currentQuery = supabase
-    .from('agent_identities')
-    .select('id')
-    .eq('user_id', user.id)
-    .eq('agent_id', params.agentId);
-
-  currentQuery = withWorkspaceFilter(currentQuery, params.workspaceId);
-  const { data: current } = await currentQuery.single();
+  // First resolve the current identity (an ambiguity throws with its count)
+  const current = await findAgentIdentityRow(
+    supabase,
+    user.id,
+    params.agentId,
+    await resolveIdentityScope(args, params.workspaceId, params.agentId)
+  );
 
   if (!current) {
     throw new Error(`No identity found for agent: ${params.agentId}`);
@@ -764,13 +871,8 @@ export async function handleChooseName(args: unknown, dataComposer: DataComposer
 
   const agentId = params.name.toLowerCase().replace(/[^a-z0-9-]/g, '');
 
-  // Check if this identity already exists
-  const { data: existing } = await supabase
-    .from('agent_identities')
-    .select('agent_id, name, version')
-    .eq('user_id', user.id)
-    .eq('agent_id', agentId)
-    .single();
+  // Check if this identity already exists (an ambiguity throws with its count)
+  const existing = await findAgentIdentityRow(supabase, user.id, agentId);
 
   if (existing) {
     return {
@@ -823,6 +925,8 @@ export async function handleChooseName(args: unknown, dataComposer: DataComposer
     soul: params.soul || null,
     heartbeat: null,
     backend: backend || null,
+    // A new SB belongs to the workspace it is awakened in (header-derived).
+    workspace_id: (await resolveIdentityScope(args, undefined, agentId)) ?? null,
   };
 
   const { data, error } = await supabase
