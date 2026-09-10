@@ -6,7 +6,6 @@ import { LinksRepository } from './repositories/links.repository';
 import { NotesRepository } from './repositories/notes.repository';
 import { RemindersRepository } from './repositories/reminders.repository';
 import { ConversationsRepository } from './repositories/conversations.repository';
-import { ContextRepository } from './repositories/context.repository';
 import { ProjectsRepository } from './repositories/projects.repository';
 import { SessionFocusRepository } from './repositories/session-focus.repository';
 import { ProjectTasksRepository } from './repositories/project-tasks.repository';
@@ -29,7 +28,6 @@ export class DataComposer {
     notes: NotesRepository;
     reminders: RemindersRepository;
     conversations: ConversationsRepository;
-    context: ContextRepository;
     projects: ProjectsRepository;
     sessionFocus: SessionFocusRepository;
     tasks: ProjectTasksRepository;
@@ -53,7 +51,6 @@ export class DataComposer {
       notes: new NotesRepository(supabaseClient),
       reminders: new RemindersRepository(supabaseClient),
       conversations: new ConversationsRepository(supabaseClient),
-      context: new ContextRepository(supabaseClient),
       projects: new ProjectsRepository(supabaseClient),
       sessionFocus: new SessionFocusRepository(supabaseClient),
       tasks: new ProjectTasksRepository(supabaseClient),

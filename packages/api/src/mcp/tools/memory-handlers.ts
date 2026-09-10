@@ -2391,7 +2391,6 @@ export async function handleRestoreMemory(args: unknown, dataComposer: DataCompo
  *
  * Returns:
  * - Constitution: values, user, process (shared) + identity, heartbeat, soul (per-agent)
- * - Identity Core: user, assistant, relationship context from DB
  * - Active Context: current projects, focus, recent high-salience memories
  * - Active Session: current session info if any
  */
@@ -2470,57 +2469,47 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
   // Fetch all context in parallel (including timezone and skills)
   const cloudSkillsService = getCloudSkillsService(dataComposer.getClient());
 
-  const [
-    contexts,
-    projects,
-    focus,
-    activeSessions,
-    dbIdentity,
-    userTimezone,
-    userSkills,
-    siblingIdentities,
-  ] = await Promise.all([
-    // Identity Core: all context summaries
-    dataComposer.repositories.context.findAllByUser(user.id),
-    // Active projects
-    dataComposer.repositories.projects.findAllByUser(user.id, 'active'),
-    // Current focus
-    dataComposer.repositories.sessionFocus.findLatestByUser(user.id),
-    // All active sessions (filter by agentId if provided) — client picks the right one
-    dataComposer.repositories.memory.getActiveSessions(user.id, agentId),
-    // Database identity (for cloud agents, includes metadata, heartbeat, soul)
-    agentId
-      ? dataComposer
-          .getClient()
-          .from('agent_identities')
-          .select('*')
-          .eq('user_id', user.id)
-          .eq('agent_id', agentId)
-          .single()
-          .then(({ data }) => data)
-      : Promise.resolve(null),
-    // User timezone for timestamp conversion
-    dataComposer
-      .getClient()
-      .from('users')
-      .select('timezone')
-      .eq('id', user.id)
-      .single()
-      .then(({ data }) => data?.timezone || 'UTC'),
-    // User's installed skills (local + cloud merged)
-    cloudSkillsService.loadUserSkills(user.id).catch((err) => {
-      logger.warn('Failed to load user skills:', err);
-      return [];
-    }),
-    // Live sibling identities — structural facts for all agents under this user.
-    // Agents cross-reference this with their personal `relationships` notes.
-    supabase
-      .from('agent_identities')
-      .select('agent_id, name, role, backend, session_scope, capabilities, description')
-      .eq('user_id', user.id)
-      .order('created_at', { ascending: true })
-      .then(({ data }) => data || []),
-  ]);
+  const [projects, focus, activeSessions, dbIdentity, userTimezone, userSkills, siblingIdentities] =
+    await Promise.all([
+      // Active projects
+      dataComposer.repositories.projects.findAllByUser(user.id, 'active'),
+      // Current focus
+      dataComposer.repositories.sessionFocus.findLatestByUser(user.id),
+      // All active sessions (filter by agentId if provided) — client picks the right one
+      dataComposer.repositories.memory.getActiveSessions(user.id, agentId),
+      // Database identity (for cloud agents, includes metadata, heartbeat, soul)
+      agentId
+        ? dataComposer
+            .getClient()
+            .from('agent_identities')
+            .select('*')
+            .eq('user_id', user.id)
+            .eq('agent_id', agentId)
+            .single()
+            .then(({ data }) => data)
+        : Promise.resolve(null),
+      // User timezone for timestamp conversion
+      dataComposer
+        .getClient()
+        .from('users')
+        .select('timezone')
+        .eq('id', user.id)
+        .single()
+        .then(({ data }) => data?.timezone || 'UTC'),
+      // User's installed skills (local + cloud merged)
+      cloudSkillsService.loadUserSkills(user.id).catch((err) => {
+        logger.warn('Failed to load user skills:', err);
+        return [];
+      }),
+      // Live sibling identities — structural facts for all agents under this user.
+      // Agents cross-reference this with their personal `relationships` notes.
+      supabase
+        .from('agent_identities')
+        .select('agent_id, name, role, backend, session_scope, capabilities, description')
+        .eq('user_id', user.id)
+        .order('created_at', { ascending: true })
+        .then(({ data }) => data || []),
+    ]);
 
   // Ensure the caller's own session is always in the activeSessions list.
   // getActiveSessions is capped to 10 by started_at — a long-running session
@@ -2606,15 +2595,6 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
         .order('updated_at', { ascending: false })
         .limit(1)
         .maybeSingle();
-
-  // Organize contexts by type
-  const identityCore = {
-    user: contexts.find((c) => c.context_type === 'user' && !c.context_key),
-    assistant: contexts.find((c) => c.context_type === 'assistant' && !c.context_key),
-    relationship: contexts.find((c) => c.context_type === 'relationship' && !c.context_key),
-  };
-
-  const projectContexts = contexts.filter((c) => c.context_type === 'project');
 
   // Compute reflection status from identity metadata
   const identityMetadata = dbIdentity?.metadata as Record<string, unknown> | null;
@@ -2723,7 +2703,6 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
 
   logger.info(`Bootstrap loaded for user ${user.id}`, {
     agentId: agentId || 'none',
-    contextCount: contexts.length,
     projectCount: projects.length,
     memoryCount: knowledgeMemories.length,
     knowledgeSummaryChars: knowledgeSummary.length,
@@ -2768,25 +2747,6 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
             // Constitution (merged: Supabase priority, local fallback)
             identityFiles: mergedIdentity,
 
-            // Tier 1: Identity Core from DB
-            identityCore: {
-              user: identityCore.user
-                ? { summary: identityCore.user.summary, metadata: identityCore.user.metadata }
-                : null,
-              assistant: identityCore.assistant
-                ? {
-                    summary: identityCore.assistant.summary,
-                    metadata: identityCore.assistant.metadata,
-                  }
-                : null,
-              relationship: identityCore.relationship
-                ? {
-                    summary: identityCore.relationship.summary,
-                    metadata: identityCore.relationship.metadata,
-                  }
-                : null,
-            },
-
             // Tier 2: Active Context
             activeContext: {
               projects: projects.map((p) => ({
@@ -2796,10 +2756,6 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
                 status: p.status,
                 techStack: p.tech_stack,
                 goals: p.goals,
-              })),
-              projectContexts: projectContexts.map((c) => ({
-                key: c.context_key,
-                summary: c.summary,
               })),
               focus: focus
                 ? {
