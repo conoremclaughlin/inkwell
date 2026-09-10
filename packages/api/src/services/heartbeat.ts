@@ -504,10 +504,27 @@ export async function ensureDefaultReminders(params: {
     }
     const agentRows = identityRows ?? [];
     const thisRow = agentRows.find((row) => row.id === params.sbId);
-    const relatedIds =
-      !thisRow || !thisRow.workspace_id
-        ? agentRows.map((row) => row.id)
-        : agentRows.filter((row) => !row.workspace_id).map((row) => row.id);
+    const scopedRows = agentRows.filter((row) => Boolean(row.workspace_id));
+    const unscopedIds = agentRows.filter((row) => !row.workspace_id).map((row) => row.id);
+    let relatedIds: string[];
+    if (thisRow?.workspace_id) {
+      // A scoped SB. An unscoped row can only be ITS twin when it is the only
+      // scoped candidate; with siblings in other workspaces, whose twin it is
+      // cannot be known here, so the SB is judged on its own UUID (Lumen).
+      relatedIds = scopedRows.length === 1 ? unscopedIds : [];
+    } else if (scopedRows.length > 1) {
+      // An unscoped row alongside several scoped SBs: the same ambiguity the
+      // identity resolver refuses. Seeding on a guess could either duplicate
+      // or suppress a real check-in, so skip and say so.
+      logger.warn(
+        'ensureDefaultReminders: unscoped identity with several scoped siblings — ambiguous, skipping seed',
+        { agentId: params.agentId, sbId: params.sbId, scopedRows: scopedRows.length }
+      );
+      return;
+    } else {
+      // Unscoped (or not yet visible): a twin shadows the single scoped row.
+      relatedIds = agentRows.map((row) => row.id);
+    }
     const candidateIds = Array.from(new Set([params.sbId, ...relatedIds]));
     const { data: existing } = await supabase
       .from('scheduled_reminders')

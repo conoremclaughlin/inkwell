@@ -489,6 +489,51 @@ describe('Heartbeat Service', () => {
       );
     });
 
+    it("a scoped sibling is judged on its own UUID even when an unscoped twin holds a reminder (PR #595, Lumen's sixth check)", async () => {
+      // A (scoped) + an unscoped twin with a paused reminder + new scoped B.
+      setQueryResult('agent_identities', [
+        { id: 'identity-a', workspace_id: 'ws-a' },
+        { id: 'identity-twin', workspace_id: null },
+        { id: 'identity-b', workspace_id: 'ws-b' },
+      ]);
+      setQueryResult('scheduled_reminders', []); // nothing bound to B itself
+      setQueryResult('users', { timezone: null });
+      setQueryResult('scheduled_reminders', { id: 'rem-b' });
+
+      await ensureDefaultReminders({
+        userId: TEST_USER_ID,
+        sbId: 'identity-b',
+        agentId: 'myra',
+        deliveryChannel: 'telegram',
+        deliveryTarget: '123456789',
+      });
+
+      const reminders = tableBuilders.get('scheduled_reminders')!;
+      expect(reminders.in).toHaveBeenCalledWith('sb_id', ['identity-b']);
+      expect(reminders.insert).toHaveBeenCalledWith(
+        expect.objectContaining({ sb_id: 'identity-b' })
+      );
+    });
+
+    it('an unscoped row among several scoped siblings is ambiguous: skip seeding, do not guess', async () => {
+      setQueryResult('agent_identities', [
+        { id: 'identity-a', workspace_id: 'ws-a' },
+        { id: 'identity-b', workspace_id: 'ws-b' },
+        { id: 'identity-twin', workspace_id: null },
+      ]);
+
+      await ensureDefaultReminders({
+        userId: TEST_USER_ID,
+        sbId: 'identity-twin',
+        agentId: 'myra',
+        deliveryChannel: 'telegram',
+        deliveryTarget: '123456789',
+      });
+
+      // The guard returned before touching scheduled_reminders at all.
+      expect(tableBuilders.get('scheduled_reminders')).toBeUndefined();
+    });
+
     it('should resolve delivery channel from user when not pre-resolved', async () => {
       // User lookup returns telegram_id
       setQueryResult('users', { telegram_id: '987654321', whatsapp_id: null });
