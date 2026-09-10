@@ -8,7 +8,8 @@
  * two". The August duplicates for wren and echo had the same shape.
  *
  * Two rules, applied everywhere a lookup may be unscoped:
- *   - read up to TWO rows and decide explicitly, never `.single()`;
+ *   - read EVERY row for the key and decide explicitly — never `.single()`,
+ *     and never a truncated page (a limit can hide a second scoped row);
  *   - when a scoped row and an unscoped twin both match, the scoped row is
  *     the identity and the twin is the accident — prefer it and log. Two
  *     scoped rows with no scope given is a real ambiguity: say so, name the
@@ -36,7 +37,8 @@ export class WorkspaceRowAmbiguityError extends Error {
 /**
  * Pick the one row an (optionally unscoped) lookup should mean.
  * 0 rows → null. 1 row → it. 2+ rows → the single workspace-scoped row when
- * exactly one exists; otherwise throw WorkspaceRowAmbiguityError.
+ * exactly one exists; otherwise throw WorkspaceRowAmbiguityError. The caller
+ * must pass the COMPLETE candidate set — uniqueness is decided here.
  * Accepts an array (PostgREST) or a bare object (single-row clients/mocks).
  */
 export function pickWorkspaceScopedRow<T extends { workspace_id: string | null }>(

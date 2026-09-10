@@ -190,8 +190,11 @@ function generateIdentityMarkdown(identity: {
 type AgentIdentityRow = Tables<'agent_identities'>;
 
 /**
- * The one agent_identities row for (user, agent[, workspace]). Reads two rows
- * so "found two" is never reported as "not found" — see workspace-scoped-row.
+ * The one agent_identities row for (user, agent[, workspace]). Reads EVERY row
+ * for the key — there are at most a handful — so "found two" is never
+ * reported as "not found", and a truncated page can never hide a second
+ * scoped row behind an unscoped twin (Lumen, PR #595 P1: limit(2) returned
+ * [NULL, A] out of {NULL, A, B} and A was taken as unique).
  */
 async function findAgentIdentityRow(
   supabase: ReturnType<DataComposer['getClient']>,
@@ -205,7 +208,7 @@ async function findAgentIdentityRow(
     .eq('user_id', userId)
     .eq('agent_id', agentId);
   query = withWorkspaceFilter(query, workspaceId);
-  const { data, error } = await query.limit(2);
+  const { data, error } = await query;
   if (error) {
     if (error.code === 'PGRST116') return null;
     throw new Error(`Failed to read identity: ${error.message}`);
@@ -311,16 +314,27 @@ export async function handleSaveIdentity(args: unknown, dataComposer: DataCompos
   // workspace, else the workspace the SB's existing identity already lives in,
   // else the explicit argument. Only a first-ever save can be unscoped.
   let preloaded: AgentIdentityRow | null | undefined;
+  let preloadAmbiguity: WorkspaceRowAmbiguityError | null = null;
   const workspaceScope = await resolveIdentityScope(args, workspaceId, agentId, async (id) => {
-    preloaded = await findAgentIdentityRow(supabase, user.id, id);
-    return preloaded?.workspace_id ?? null;
+    try {
+      preloaded = await findAgentIdentityRow(supabase, user.id, id);
+      return preloaded?.workspace_id ?? null;
+    } catch (err) {
+      // Two scoped rows and no scope yet: nothing to derive. Let the explicit
+      // argument decide (Lumen, PR #595 P2) — and if there is none either,
+      // the ambiguity is the right answer, raised below.
+      if (!(err instanceof WorkspaceRowAmbiguityError)) throw err;
+      preloadAmbiguity = err;
+      return null;
+    }
   });
+  if (workspaceScope === undefined && preloadAmbiguity) throw preloadAmbiguity;
 
   // The existing row, so omitted optional fields are preserved and the write
-  // is an UPDATE of that row. Through the ambiguity-safe resolver: an unscoped
-  // twin must never make this lookup fail and turn the save into an insert.
+  // is an UPDATE of that row. Reuse the preloaded row only when the resolved
+  // scope is the one it lives in; otherwise look it up under the scope.
   const existing =
-    preloaded !== undefined
+    preloaded !== undefined && (preloaded?.workspace_id ?? undefined) === workspaceScope
       ? preloaded
       : await findAgentIdentityRow(supabase, user.id, agentId, workspaceScope);
 

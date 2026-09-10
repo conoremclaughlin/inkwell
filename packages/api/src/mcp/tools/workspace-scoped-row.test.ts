@@ -40,6 +40,18 @@ describe('pickWorkspaceScopedRow', () => {
     expect(e.message).not.toContain('No identity found');
   });
 
+  it('an unscoped twin plus TWO scoped rows is an ambiguity, not "prefer the first scoped one" (PR #595 P1)', () => {
+    const twin: Row = { id: 'twin', workspace_id: null };
+    const a: Row = { id: 'a', workspace_id: 'ws-a' };
+    const b: Row = { id: 'b', workspace_id: 'ws-b' };
+    expect(() => pickWorkspaceScopedRow<Row>([twin, a, b], 'x')).toThrow(
+      WorkspaceRowAmbiguityError
+    );
+    expect(() => pickWorkspaceScopedRow<Row>([a, twin, b], 'x')).toThrow(
+      WorkspaceRowAmbiguityError
+    );
+  });
+
   it('two unscoped rows is also an ambiguity (the partial index should prevent it, but never guess)', () => {
     const a: Row = { id: 'a', workspace_id: null };
     const b: Row = { id: 'b', workspace_id: null };

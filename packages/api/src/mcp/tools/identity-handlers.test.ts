@@ -981,6 +981,58 @@ describe('Identity Handlers', () => {
       expect(parsed.message).not.toContain('No identity found');
     });
 
+    it('the resolver reads the whole candidate set — it never asks the database for a truncated page (PR #595 P1)', async () => {
+      mockSupabase._setArrayData([unscopedTwin, scopedRow]);
+      await handleGetIdentity({ userId: 'user-123', agentId: 'myra' }, mockDataComposer as never);
+      const qb = mockSupabase._queryBuilder as unknown as Record<string, ReturnType<typeof vi.fn>>;
+      expect(qb.limit).not.toHaveBeenCalled();
+    });
+
+    it('two scoped rows + an explicit workspaceId and no request scope: the argument decides, the save updates that row (PR #595 P2)', async () => {
+      const rowA = { ...scopedRow, id: 'identity-a', workspace_id: 'ws-a' };
+      const rowB = { ...scopedRow, id: 'identity-b', workspace_id: 'ws-b' };
+      mockSupabase._queueReturnData([rowA, rowB]); // unscoped preload → ambiguous → no derivation
+      mockSupabase._queueReturnData([rowB]); // scoped lookup under the explicit ws-b
+      mockSupabase._queueReturnData({ ...rowB, version: 13 }); // update
+
+      const result = await handleSaveIdentity(
+        {
+          userId: 'user-123',
+          agentId: 'myra',
+          name: 'Myra',
+          role: 'Front-line AI being',
+          workspaceId: 'ws-b',
+          soul: 'B v13',
+        },
+        mockDataComposer as never
+      );
+
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.success).toBe(true);
+      const qb = mockSupabase._queryBuilder as unknown as Record<string, ReturnType<typeof vi.fn>>;
+      expect(qb.update).toHaveBeenCalledWith(
+        expect.objectContaining({ workspace_id: 'ws-b', soul: 'B v13' })
+      );
+      expect(qb.eq).toHaveBeenCalledWith('id', 'identity-b');
+      expect(qb.insert).not.toHaveBeenCalled();
+    });
+
+    it('two scoped rows, no explicit workspaceId, no request scope: the save refuses with the ambiguity, it does not insert', async () => {
+      const rowA = { ...scopedRow, id: 'identity-a', workspace_id: 'ws-a' };
+      const rowB = { ...scopedRow, id: 'identity-b', workspace_id: 'ws-b' };
+      mockSupabase._queueReturnData([rowA, rowB]);
+
+      await expect(
+        handleSaveIdentity(
+          { userId: 'user-123', agentId: 'myra', name: 'Myra', role: 'Front-line AI being' },
+          mockDataComposer as never
+        )
+      ).rejects.toThrow('Multiple rows found');
+      const qb = mockSupabase._queryBuilder as unknown as Record<string, ReturnType<typeof vi.fn>>;
+      expect(qb.insert).not.toHaveBeenCalled();
+      expect(qb.update).not.toHaveBeenCalled();
+    });
+
     it('history resolves the current row through the twin, instead of an empty history', async () => {
       mockSupabase._setArrayData([unscopedTwin, scopedRow]);
 

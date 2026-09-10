@@ -167,7 +167,7 @@ export async function handleSaveUserIdentity(args: unknown, dataComposer: DataCo
   // this lookup fail and turn an update into a duplicate insert.
   let existingQuery = supabase.from('user_identity').select('*').eq('user_id', user.id);
   existingQuery = withWorkspaceFilter(existingQuery, workspaceId);
-  const { data: existingRows, error: existingError } = await existingQuery.limit(2);
+  const { data: existingRows, error: existingError } = await existingQuery;
   if (existingError && existingError.code !== 'PGRST116') {
     throw new Error(`Failed to read user identity: ${existingError.message}`);
   }
