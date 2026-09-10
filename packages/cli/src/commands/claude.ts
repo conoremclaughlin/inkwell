@@ -3498,7 +3498,9 @@ async function ensurePcpSessionContext(
 /**
  * PR #563 rounds 9–10: codex/gemini prompt hooks cannot block and run no
  * channel plugin, so the `ink` wrapper — the session's long-lived process —
- * is the pending-takeover marker's consumer. Scoped to the wrapper's OWN
+ * is the pending-takeover marker's consumer. claude-code joined once its
+ * prompt hook went fail-open (it warns instead of refusing the prompt): a
+ * marker with no consumer is the round-8 bug, so the gate opens with it. Scoped to the wrapper's OWN
  * session (round 10: a crashed predecessor's marker for a different session
  * in this checkout belongs to that session's consumer, never this one). A
  * successful reclaim persists the claimed epoch so the on-stop hook can
@@ -3521,7 +3523,7 @@ function startSessionTakeoverWatcher(
    */
   onUnprotected?: () => void
 ): { stop: () => void } | undefined {
-  if (backend !== 'codex' && backend !== 'gemini') return undefined;
+  if (backend !== 'codex' && backend !== 'gemini' && backend !== 'claude') return undefined;
   if (!pcpSessionId) return undefined;
   const cwd = process.cwd();
   const postLifecycle = async (body: Record<string, unknown>) => {
@@ -4064,6 +4066,19 @@ export async function runClaudeInteractive(
     studioId,
     runtimeLinkId,
     () => {
+      if (options.backend === 'claude') {
+        // Claude Code's prompt hook is fail-open, so a permanent refusal
+        // reaches a human sitting at the terminal. Warn and keep going:
+        // each later prompt's hook re-warns the SB in-context, and the
+        // human decides. Terminating an attached session would be a harsher
+        // outcome than the prompt block this replaced.
+        console.error(
+          chalk.yellow(
+            '\nInkwell: this worktree\u2019s studio lease is held elsewhere or revoked. Prompts still run, but turn state may not be attributed to this session until the lease is reclaimed.'
+          )
+        );
+        return;
+      }
       interactiveEnforced = true;
       console.error(
         chalk.red(

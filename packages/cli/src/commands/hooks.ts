@@ -85,10 +85,13 @@ interface HookCapabilities {
   supportsCompaction: boolean;
   supportsPromptHook: boolean;
   /**
-   * The backend's prompt hook can BLOCK the prompt via a non-zero exit
-   * (claude-code's UserPromptSubmit). Backends without this proceed after a
-   * failed turn takeover and rely on the background re-claim to shrink the
-   * stale-epoch window (PR #563 rounds 6–7).
+   * Whether a FAILED turn takeover refuses the prompt outright (non-zero
+   * exit from the prompt hook). Only claude-code's UserPromptSubmit can
+   * block at all, and it no longer does: with many studios per user, "lease
+   * held elsewhere" is routine, and refusing the prompt froze attached
+   * humans out of their own sessions. Every shipped backend now proceeds
+   * after a failed takeover, warns the SB in-context, and relies on the
+   * `ink` wrapper's marker watcher to re-claim (PR #563 rounds 6–10).
    */
   blocksOnFailedTakeover: boolean;
 }
@@ -106,7 +109,8 @@ const CLAUDE_CODE: HookCapabilities = {
   },
   supportsCompaction: true,
   supportsPromptHook: true,
-  blocksOnFailedTakeover: true,
+  // Fail-open: warn the SB and let the prompt run (see HookCapabilities).
+  blocksOnFailedTakeover: false,
 };
 
 const CODEX: HookCapabilities = {
@@ -910,16 +914,20 @@ export function pendingTakeoverMarkerPath(cwd: string, generation?: string): str
  * comparison bug — 'claude' vs 'claude-code' — made the blocking branch
  * unreachable and only a behavioural test would have caught it).
  *
- * Blocking backends: the prompt is refused outright — running would execute
- * this turn under a STALE epoch that an old server turn's fenced finalize
- * can still clobber.
+ * Blocking backends (none shipped today): the prompt is refused outright —
+ * running would execute this turn under a STALE epoch that an old server
+ * turn's fenced finalize can still clobber. Kept for a backend that opts in.
  *
- * Non-blocking backends: the prompt cannot be stopped, and this hook process
- * is SHORT-LIVED — an in-process retry timer dies with it (round 8). So the
+ * Non-blocking backends (all three): the prompt runs. This hook process is
+ * SHORT-LIVED — an in-process retry timer dies with it (round 8) — so the
  * recovery is a durable MARKER file that the session's long-lived `ink`
  * wrapper watches and converts into a claim (takeover-watcher.ts); the
  * on-stop hook adjudicates any marker still standing at the boundary, which
- * scopes the recovery to this prompt generation.
+ * scopes the recovery to this prompt generation. The SB is told on STDOUT —
+ * a prompt hook's stdout is injected into the model's context, stderr is
+ * only seen by a human at the terminal — and the message names the cause,
+ * because "lease held elsewhere" and "server unreachable" call for
+ * different responses.
  *
  * Injectable for tests; onPromptHandler passes the real implementations.
  */
@@ -928,6 +936,8 @@ export function handleFailedTakeover(
   opts: {
     agentId: string;
     writePendingTakeover: () => void;
+    /** The server answered and reported the studio lease is NOT held. */
+    leaseLost?: boolean;
     exit?: (code: number) => never;
   }
 ): void {
@@ -945,10 +955,23 @@ export function handleFailedTakeover(
   hookLog('on_prompt_takeover_failed_nonblocking', {
     agentId: opts.agentId,
     backend: backend.name,
+    leaseLost: opts.leaseLost === true,
   });
+  const cause = opts.leaseLost
+    ? "this worktree's studio lease is held elsewhere or was revoked"
+    : 'the Inkwell server was unreachable or refused the claim';
   process.stderr.write(
-    'Warning: Inkwell turn takeover failed; this turn starts under a stale epoch. ' +
+    `Warning: Inkwell turn takeover failed (${cause}); this turn starts under a stale epoch. ` +
       'A pending-takeover marker was written for the ink wrapper to reclaim.\n'
+  );
+  process.stdout.write(
+    '\n<ink-warning>\n' +
+      `Inkwell turn takeover FAILED for this prompt: ${cause}. ` +
+      'The prompt is running anyway under a stale turn epoch, so session state, inbox routing ' +
+      'and lease-bound writes may not be attributed to this turn until the ink wrapper reclaims it. ' +
+      'Tell the user if this persists across prompts. Do not work around it by resetting ' +
+      'credentials, forcing leases, or restarting the server.\n' +
+      '</ink-warning>\n'
   );
   try {
     opts.writePendingTakeover();
@@ -2611,6 +2634,7 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
   if (!takeoverOk && !isHeadlessSpawn) {
     handleFailedTakeover(lifecycleBackend, {
       agentId,
+      leaseLost: 'leaseLost' in takeover && takeover.leaseLost === true,
       writePendingTakeover: () => {
         const markerPath = pendingTakeoverMarkerPath(cwd, process.env.INK_RUNTIME_LINK_ID);
         mkdirSync(dirname(markerPath), { recursive: true });

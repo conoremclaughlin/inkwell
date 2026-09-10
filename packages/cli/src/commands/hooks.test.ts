@@ -1281,23 +1281,64 @@ describe('serverAlreadyInjectedContext', () => {
  * the capability flag, both directions.
  */
 describe('handleFailedTakeover', () => {
-  it('the REAL claude-code capability blocks — not an inline stand-in', () => {
+  it('the REAL claude-code capability is fail-open — not an inline stand-in', () => {
     // Round 7 meta-lesson: the first behavioural tests used inline capability
     // objects, so flipping the real constant's flag kept everything green —
     // the same unbound-wiring shape as the name-comparison bug they were
     // written to prevent. This one goes through the actual registry.
+    //
+    // Fail-open (Sep 2026): claude-code no longer refuses the prompt. With
+    // many studios per user, "lease held elsewhere" is routine, and the block
+    // froze attached humans out of their own sessions.
     const exit = vi.fn((code: number): never => {
       throw new Error(`exit:${code}`);
     });
-    expect(() =>
+    const writePendingTakeover = vi.fn();
+    const out = vi.spyOn(process.stdout, 'write').mockImplementation((() => true) as never);
+    const err = vi.spyOn(process.stderr, 'write').mockImplementation((() => true) as never);
+    try {
       handleFailedTakeover(getBackendByName('claude-code'), {
         agentId: 'wren',
-        writePendingTakeover: vi.fn(),
+        writePendingTakeover,
         exit: exit as never,
-      })
-    ).toThrow('exit:2');
+      });
+    } finally {
+      out.mockRestore();
+      err.mockRestore();
+    }
+    expect(exit).not.toHaveBeenCalled();
+    expect(writePendingTakeover).toHaveBeenCalledTimes(1);
+    expect(getBackendByName('claude-code').blocksOnFailedTakeover).toBe(false);
     expect(getBackendByName('codex').blocksOnFailedTakeover).toBe(false);
     expect(getBackendByName('gemini').blocksOnFailedTakeover).toBe(false);
+  });
+
+  it('a non-blocking failure warns the SB on STDOUT (injected context) and names the cause', () => {
+    const chunks: string[] = [];
+    const out = vi.spyOn(process.stdout, 'write').mockImplementation(((chunk: unknown) => {
+      chunks.push(String(chunk));
+      return true;
+    }) as never);
+    const err = vi.spyOn(process.stderr, 'write').mockImplementation((() => true) as never);
+    try {
+      handleFailedTakeover(
+        { name: 'claude-code', blocksOnFailedTakeover: false },
+        { agentId: 'wren', writePendingTakeover: vi.fn(), leaseLost: true }
+      );
+      handleFailedTakeover(
+        { name: 'claude-code', blocksOnFailedTakeover: false },
+        { agentId: 'wren', writePendingTakeover: vi.fn() }
+      );
+    } finally {
+      out.mockRestore();
+      err.mockRestore();
+    }
+    expect(chunks).toHaveLength(2);
+    expect(chunks[0]).toContain('<ink-warning>');
+    expect(chunks[0]).toContain('held elsewhere');
+    expect(chunks[0]).not.toContain('unreachable');
+    expect(chunks[1]).toContain('unreachable');
+    expect(chunks[1]).not.toContain('held elsewhere');
   });
 
   it('BLOCKS the prompt on a blocking-capable backend, writing no marker', () => {

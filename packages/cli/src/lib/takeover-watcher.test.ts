@@ -224,11 +224,11 @@ describe('wrapper wiring (reachability)', () => {
     );
   };
 
-  it('the shared helper gates on codex/gemini, scopes to the OWN session, and reclaims with the marker birth time', async () => {
+  it('the shared helper gates on codex/gemini/claude, scopes to the OWN session, and reclaims with the marker birth time', async () => {
     const source = await loadClaudeSource();
     const helper = source.indexOf('function startSessionTakeoverWatcher(');
     const gate = source.indexOf(
-      "if (backend !== 'codex' && backend !== 'gemini') return undefined;",
+      "if (backend !== 'codex' && backend !== 'gemini' && backend !== 'claude') return undefined;",
       helper
     );
     const scoped = source.indexOf('expectedSessionId: pcpSessionId', helper);
@@ -355,6 +355,31 @@ describe('reclaim wiring round 11 (reachability)', () => {
     expect(oneShotKill).toBeGreaterThan(oneShot);
     expect(oneShotKill).toBeLessThan(interactive);
     expect(interactiveKill).toBeGreaterThan(interactive);
+  });
+});
+
+describe('fail-open claude-code (reachability)', () => {
+  it('the INTERACTIVE wrapper warns on a permanent refusal for claude and never reaches the kill', async () => {
+    const { readFileSync } = await import('fs');
+    const { dirname } = await import('path');
+    const { fileURLToPath } = await import('url');
+    const source = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), '..', 'commands', 'claude.ts'),
+      'utf-8'
+    );
+    const interactive = source.indexOf('export async function runClaudeInteractive(');
+    const start = source.indexOf('startSessionTakeoverWatcher(', interactive);
+    const guard = source.indexOf("if (options.backend === 'claude') {", start);
+    const earlyReturn = source.indexOf('return;', guard);
+    const enforced = source.indexOf('interactiveEnforced = true;', start);
+    const kill = source.indexOf('interactiveChild?.kill', start);
+    expect(guard).toBeGreaterThan(start);
+    // The claude branch returns BEFORE the enforcement flag and the kill —
+    // codex/gemini keep round-15 termination; an attached claude session
+    // is warned, not ended.
+    expect(earlyReturn).toBeGreaterThan(guard);
+    expect(earlyReturn).toBeLessThan(enforced);
+    expect(enforced).toBeLessThan(kill);
   });
 });
 
