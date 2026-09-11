@@ -7,9 +7,9 @@
  */
 
 import { mkdir, readFile, writeFile, rm, lstat } from 'fs/promises';
-import { existsSync } from 'fs';
-import { join, dirname } from 'path';
+import { join } from 'path';
 import { logger } from '../utils/logger';
+import { resolveInkCli, inkCliCommand } from './ink-cli';
 
 const CLAUDE_SETTINGS_REL = '.claude/settings.local.json';
 
@@ -57,35 +57,21 @@ interface ClaudeSettings {
 }
 
 /**
- * Resolve the `ink` CLI binary path for hook commands.
- * Checks well-known locations; falls back to bare `ink` (relies on PATH).
+ * The command prefix generated hooks use to reach `ink`: this checkout's own
+ * CLI build (or INK_CLI_PATH), never the global `~/.ink/bin/ink` link, which
+ * points at whichever checkout the OB last chose. A checkout with no build
+ * falls back to bare `ink`, resolved on the PATH of whoever runs the hook.
  */
-function resolveInkBinaryPath(worktreePath: string): string {
-  // 1. Global install location (symlinked by `yarn workspace @personal-context/cli install:cli`)
-  const globalPath = join(process.env.HOME || '~', '.local', 'bin', 'ink');
-  if (existsSync(globalPath)) return globalPath;
-
-  // 2. Main worktree node_modules (for PM2/server environments)
-  //    The main worktree is typically the parent dir without the `--slug` suffix
-  const base = dirname(worktreePath);
-  const mainName = worktreePath
-    .split('/')
-    .pop()
-    ?.replace(/--[^/]+$/, '');
-  if (mainName) {
-    const mainBin = join(base, mainName, 'node_modules', '.bin', 'ink');
-    if (existsSync(mainBin)) return mainBin;
-  }
-
-  // 3. Bare fallback
-  return 'ink';
+function inkHookCommand(): string {
+  const cli = resolveInkCli();
+  return cli ? inkCliCommand(cli) : 'ink';
 }
 
 /**
  * Build Claude Code lifecycle hooks that mirror `ink hooks install --claude-code`.
  */
-function buildHooks(inkPath: string): Record<string, unknown> {
-  const cmd = (hookName: string) => `${inkPath} hooks ${hookName} --backend claude-code`;
+function buildHooks(inkCommand: string): Record<string, unknown> {
+  const cmd = (hookName: string) => `${inkCommand} hooks ${hookName} --backend claude-code`;
 
   return {
     PreCompact: [{ hooks: [{ type: 'command', command: cmd('pre-compact') }] }],
@@ -139,7 +125,7 @@ export async function ensureStudioSettings(worktreePath: string): Promise<boolea
     return false;
   }
 
-  const inkPath = resolveInkBinaryPath(worktreePath);
+  const inkCommand = inkHookCommand();
 
   const settings: ClaudeSettings = {
     ...existing,
@@ -147,7 +133,7 @@ export async function ensureStudioSettings(worktreePath: string): Promise<boolea
       allow: DEFAULT_ALLOW_RULES,
       deny: DEFAULT_DENY_RULES,
     },
-    hooks: existing.hooks || buildHooks(inkPath),
+    hooks: existing.hooks || buildHooks(inkCommand),
     enableAllProjectMcpServers: existing.enableAllProjectMcpServers ?? true,
   };
 

@@ -650,6 +650,7 @@ Optional:
 - `SENTRY_DSN` - Error tracking (optional)
 - `SERVER_COMPACTION_ENABLED` - `true` to let the server rotate claude-code sessions at the compaction threshold (default `false`: Claude Code auto-compacts natively via `--autocompact`)
 - `COMPACTION_THRESHOLD` - context-token threshold for the server-side trigger when enabled (default 150000)
+- `INK_CLI_PATH` - absolute path of the ink CLI the server invokes for hooks and chat loops. Default: this checkout's `packages/cli/dist/cli.js`, run through node. The server never uses the global `~/.ink/bin/ink` link.
 
 ## Testing
 
