@@ -117,7 +117,7 @@ fi
 # variable. That is exactly how this job stayed red from June to August 2026
 # without anyone being able to read the cause off the log. Probe once, here.
 echo "[integration-db] Verifying the derived key has service-role access..."
-PROBE_STATUS="$(curl -s -o /dev/null -w '%{http_code}' \
+PROBE_STATUS="$(curl -s --max-time 10 -o /dev/null -w '%{http_code}' \
   -H "apikey: ${SUPABASE_SECRET_KEY}" \
   -H "Authorization: Bearer ${SUPABASE_SECRET_KEY}" \
   "${SUPABASE_URL}/rest/v1/users?select=id&limit=1" || echo "000")"
@@ -137,10 +137,16 @@ fi
 # One 200 proved the key. `db reset` also makes PostgREST reload its schema
 # cache, and the gateway can still answer a request badly for a moment after
 # that; ask for three clean answers a second apart before starting the suite.
+# Bounded by wall-clock, not by attempts, and each request carries its own
+# transfer cap: an accepted connection that never answers must not hold the
+# job hostage (Lumen, #601 review — a stalled server held the attempt-bounded
+# version for the full stall).
 echo "[integration-db] Waiting for the REST gateway to answer steadily..."
 STEADY=0
-for _ in $(seq 1 20); do
-  CODE="$(curl -s -o /dev/null -w '%{http_code}' \
+CODE="000"
+SETTLE_DEADLINE=$((SECONDS + 20))
+while (( SECONDS < SETTLE_DEADLINE )); do
+  CODE="$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' \
     -H "apikey: ${SUPABASE_SECRET_KEY}" \
     -H "Authorization: Bearer ${SUPABASE_SECRET_KEY}" \
     "${SUPABASE_URL}/rest/v1/users?select=id&limit=1" || echo "000")"
@@ -149,7 +155,7 @@ for _ in $(seq 1 20); do
   sleep 1
 done
 if [[ "${STEADY}" -lt 3 ]]; then
-  echo "[integration-db] REST gateway never answered three times in a row (last HTTP ${CODE}); continuing anyway." >&2
+  echo "[integration-db] REST gateway did not answer three times in a row within 20s (last HTTP ${CODE}); continuing anyway." >&2
 fi
 
 # When a suite fails, the vitest output shows the symptom — a repository call
