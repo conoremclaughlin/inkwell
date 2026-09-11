@@ -224,11 +224,11 @@ describe('wrapper wiring (reachability)', () => {
     );
   };
 
-  it('the shared helper gates on codex/gemini, scopes to the OWN session, and reclaims with the marker birth time', async () => {
+  it('the shared helper gates on codex/gemini/claude, scopes to the OWN session, and reclaims with the marker birth time', async () => {
     const source = await loadClaudeSource();
     const helper = source.indexOf('function startSessionTakeoverWatcher(');
     const gate = source.indexOf(
-      "if (backend !== 'codex' && backend !== 'gemini') return undefined;",
+      "if (backend !== 'codex' && backend !== 'gemini' && backend !== 'claude') return undefined;",
       helper
     );
     const scoped = source.indexOf('expectedSessionId: pcpSessionId', helper);
@@ -308,7 +308,7 @@ describe('reclaim wiring round 11 (reachability)', () => {
     expect(unheld).toBeGreaterThan(helper);
   });
 
-  it('a cross-tenant 403 maps to unprotected, and enforcement carries a non-zero exit (round 16)', async () => {
+  it('a cross-tenant 403 maps to unprotected; ONE-SHOT enforcement carries a non-zero exit (round 16), the attached wrapper never enforces (PR #590)', async () => {
     const { readFileSync } = await import('fs');
     const { dirname } = await import('path');
     const { fileURLToPath } = await import('url');
@@ -321,22 +321,18 @@ describe('reclaim wiring round 11 (reachability)', () => {
       source.indexOf("if (resp.status === 403) return 'unprotected';", helper)
     ).toBeGreaterThan(helper);
 
-    // Enforcement must not exit 0 (SIGTERM closes with code=null) nor retry.
+    // One-shot enforcement must not exit 0 (SIGTERM closes with code=null).
     const oneShot = source.indexOf('export async function runClaude(');
     const interactive = source.indexOf('export async function runClaudeInteractive(');
     const oneShotExit = source.indexOf('if (takeoverEnforced) process.exit(1);', oneShot);
     expect(oneShotExit).toBeGreaterThan(oneShot);
     expect(oneShotExit).toBeLessThan(interactive);
-    const interactiveGuard = source.indexOf('if (interactiveEnforced) {', interactive);
-    const interactiveExit = source.indexOf('process.exit(1);', interactiveGuard);
-    const retryBranch = source.indexOf('const shouldRetry =', interactive);
-    expect(interactiveGuard).toBeGreaterThan(interactive);
-    expect(interactiveExit).toBeGreaterThan(interactiveGuard);
-    // The enforcement check precedes the retry decision — no fresh-session retry.
-    expect(interactiveGuard).toBeLessThan(retryBranch);
+    // PR #590: the attached wrapper has no enforcement state at all — a
+    // permanent refusal is a warning to the human, not a non-zero exit.
+    expect(source.indexOf('interactiveEnforced', interactive)).toBe(-1);
   });
 
-  it('a permanent refusal terminates the backend at BOTH spawn sites (round 15)', async () => {
+  it('a permanent refusal terminates a ONE-SHOT backend (round 15) and only WARNS an attached one (PR #590)', async () => {
     const { readFileSync } = await import('fs');
     const { dirname } = await import('path');
     const { fileURLToPath } = await import('url');
@@ -351,10 +347,40 @@ describe('reclaim wiring round 11 (reachability)', () => {
     const oneShot = source.indexOf('export async function runClaude(');
     const oneShotKill = source.indexOf('takeoverChild?.kill', oneShot);
     const interactive = source.indexOf('export async function runClaudeInteractive(');
-    const interactiveKill = source.indexOf('interactiveChild?.kill', interactive);
     expect(oneShotKill).toBeGreaterThan(oneShot);
     expect(oneShotKill).toBeLessThan(interactive);
-    expect(interactiveKill).toBeGreaterThan(interactive);
+    expect(source.indexOf('interactiveChild', interactive)).toBe(-1);
+  });
+});
+
+describe('attached sessions are warned, never terminated (PR #590, reachability)', () => {
+  it('the INTERACTIVE wrapper warns the human on a permanent refusal for EVERY backend and has no kill path', async () => {
+    const { readFileSync } = await import('fs');
+    const { dirname } = await import('path');
+    const { fileURLToPath } = await import('url');
+    const source = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), '..', 'commands', 'claude.ts'),
+      'utf-8'
+    );
+    const interactive = source.indexOf('export async function runClaudeInteractive(');
+    const start = source.indexOf('startSessionTakeoverWatcher(', interactive);
+    const loop = source.indexOf('while (true) {', start);
+    const warning = source.indexOf('Prompts still run', start);
+    expect(start).toBeGreaterThan(interactive);
+    // The warning sits inside the watcher's onUnprotected callback, before
+    // the attempt loop, and is not gated on the backend — the policy is one
+    // sentence for claude, codex and gemini alike.
+    expect(warning).toBeGreaterThan(start);
+    expect(warning).toBeLessThan(loop);
+    // indexOf is -1 when the text never appears again — also the wanted outcome.
+    const absentBeforeLoop = (needle: string) => {
+      const at = source.indexOf(needle, start);
+      return at === -1 || at > loop;
+    };
+    expect(absentBeforeLoop("options.backend === 'claude'")).toBe(true);
+    // No enforcement state, no SIGTERM, no non-zero exit for an attached human.
+    expect(source.indexOf('interactiveEnforced', interactive)).toBe(-1);
+    expect(absentBeforeLoop("kill('SIGTERM')")).toBe(true);
   });
 });
 

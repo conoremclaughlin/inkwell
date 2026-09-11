@@ -21,7 +21,9 @@ import {
   loadApprovalSet,
   matchesApprovalSet,
   isHeadlessSession,
+  updateRuntimeGenerationState,
 } from './hooks.js';
+import type { TakeoverFailureReason } from './hooks.js';
 
 const TEST_DIR = join(tmpdir(), 'ink-hooks-test-' + Date.now());
 
@@ -1280,71 +1282,186 @@ describe('serverAlreadyInjectedContext', () => {
  * only a behavioural test would have caught it. So: behavioural tests, on
  * the capability flag, both directions.
  */
-describe('handleFailedTakeover', () => {
-  it('the REAL claude-code capability blocks — not an inline stand-in', () => {
-    // Round 7 meta-lesson: the first behavioural tests used inline capability
-    // objects, so flipping the real constant's flag kept everything green —
-    // the same unbound-wiring shape as the name-comparison bug they were
-    // written to prevent. This one goes through the actual registry.
-    const exit = vi.fn((code: number): never => {
+describe('handleFailedTakeover (PR #590: the prompt is never refused)', () => {
+  const REASONS: Array<TakeoverFailureReason | undefined> = [
+    undefined,
+    'unavailable',
+    'refused',
+    'forbidden',
+    'lease-not-held',
+  ];
+  let exit: ReturnType<typeof vi.spyOn>;
+  let out: ReturnType<typeof vi.spyOn>;
+  let err: ReturnType<typeof vi.spyOn>;
+  let chunks: string[];
+
+  beforeEach(() => {
+    chunks = [];
+    exit = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
       throw new Error(`exit:${code}`);
-    });
-    expect(() =>
-      handleFailedTakeover(getBackendByName('claude-code'), {
-        agentId: 'wren',
-        writePendingTakeover: vi.fn(),
-        exit: exit as never,
-      })
-    ).toThrow('exit:2');
-    expect(getBackendByName('codex').blocksOnFailedTakeover).toBe(false);
-    expect(getBackendByName('gemini').blocksOnFailedTakeover).toBe(false);
+    }) as never);
+    out = vi.spyOn(process.stdout, 'write').mockImplementation(((chunk: unknown) => {
+      chunks.push(String(chunk));
+      return true;
+    }) as never);
+    err = vi.spyOn(process.stderr, 'write').mockImplementation((() => true) as never);
   });
 
-  it('BLOCKS the prompt on a blocking-capable backend, writing no marker', () => {
-    const exit = vi.fn((code: number): never => {
-      throw new Error(`exit:${code}`);
-    });
-    const writePendingTakeover = vi.fn();
-
-    expect(() =>
-      handleFailedTakeover(
-        { name: 'claude-code', blocksOnFailedTakeover: true },
-        { agentId: 'wren', writePendingTakeover, exit: exit as never }
-      )
-    ).toThrow('exit:2');
-    expect(writePendingTakeover).not.toHaveBeenCalled();
+  afterEach(() => {
+    exit.mockRestore();
+    out.mockRestore();
+    err.mockRestore();
   });
 
-  it('writes the durable marker on a non-blocking backend — no in-process timer', () => {
-    // Round 8 (Lumen): this hook process is short-lived; an unref()'d timer
-    // dies with it. The durable artefact is the marker the ink wrapper's
-    // takeover watcher converts into a claim.
-    const exit = vi.fn((code: number): never => {
-      throw new Error(`exit:${code}`);
-    });
-    const writePendingTakeover = vi.fn();
-
-    handleFailedTakeover(
-      { name: 'codex', blocksOnFailedTakeover: false },
-      { agentId: 'wren', writePendingTakeover, exit: exit as never }
-    );
-
+  it('never exits and always writes the marker — every REAL backend, every reason', () => {
+    // Round 7 meta-lesson: go through the actual registry, not inline
+    // stand-ins. There is no per-backend knob any more — the policy is one
+    // sentence — and the old `blocksOnFailedTakeover` flag must not creep back.
+    for (const name of ['claude-code', 'codex', 'gemini']) {
+      const backend = getBackendByName(name);
+      expect(backend).not.toHaveProperty('blocksOnFailedTakeover');
+      for (const reason of REASONS) {
+        const writePendingTakeover = vi.fn();
+        handleFailedTakeover(backend, { agentId: 'wren', writePendingTakeover, reason });
+        expect(writePendingTakeover).toHaveBeenCalledTimes(1);
+      }
+    }
     expect(exit).not.toHaveBeenCalled();
-    expect(writePendingTakeover).toHaveBeenCalledTimes(1);
+  });
+
+  it('the STDOUT warning names each cause and states possession honestly', () => {
+    const backend = getBackendByName('claude-code');
+    const warn = (reason?: TakeoverFailureReason) => {
+      chunks = [];
+      handleFailedTakeover(backend, { agentId: 'wren', writePendingTakeover: vi.fn(), reason });
+      expect(chunks).toHaveLength(1);
+      expect(chunks[0]).toContain('<ink-warning>');
+      expect(chunks[0]).toContain('confirm that this session should take over the studio');
+      return chunks[0];
+    };
+    const lost = warn('lease-not-held');
+    expect(lost).toContain('held by another session or was revoked');
+    expect(lost).toContain('does NOT hold the studio lease');
+    const forbidden = warn('forbidden');
+    expect(forbidden).toContain('belongs to another user or tenant');
+    expect(forbidden).toContain('does NOT hold the studio lease');
+    // A 409 and an unreachable server say nothing about the lease — the
+    // warning must not claim it is lost.
+    const refused = warn('refused');
+    expect(refused).toContain('already stopped');
+    expect(refused).toContain('could not confirm');
+    expect(refused).not.toContain('does NOT hold');
+    const unavailable = warn('unavailable');
+    expect(unavailable).toContain('could not be reached');
+    expect(unavailable).toContain('could not confirm');
+    // Unclassified reads as unavailable — never as a lost lease.
+    expect(warn(undefined)).toContain('could not be reached');
+  });
+
+  it('promises a background retry ONLY when an ink wrapper generation owns this backend', () => {
+    const backend = getBackendByName('claude-code');
+    handleFailedTakeover(backend, {
+      agentId: 'wren',
+      writePendingTakeover: vi.fn(),
+      reason: 'lease-not-held',
+      wrapperGeneration: 'gen-1',
+    });
+    handleFailedTakeover(backend, {
+      agentId: 'wren',
+      writePendingTakeover: vi.fn(),
+      reason: 'lease-not-held',
+    });
+    expect(chunks).toHaveLength(2);
+    expect(chunks[0]).toContain('ink wrapper is retrying the claim in the background');
+    expect(chunks[0]).not.toContain('No background retry');
+    // Wrapperless (plain `claude` with installed hooks): no watcher exists,
+    // so the warning must not promise one — the on-stop hook is the only
+    // adjudication, once, at the turn boundary (Lumen, #590 review).
+    expect(chunks[1]).toContain('No background retry runs for this launch');
+    expect(chunks[1]).toContain('retried once when this turn ends');
+    expect(chunks[1]).not.toContain('retrying the claim in the background');
   });
 
   it('a marker write failure is swallowed — the prompt itself must not break', () => {
     expect(() =>
-      handleFailedTakeover(
-        { name: 'gemini', blocksOnFailedTakeover: false },
-        {
-          agentId: 'wren',
-          writePendingTakeover: () => {
-            throw new Error('disk full');
-          },
-        }
-      )
+      handleFailedTakeover(getBackendByName('gemini'), {
+        agentId: 'wren',
+        writePendingTakeover: () => {
+          throw new Error('disk full');
+        },
+      })
     ).not.toThrow();
+    expect(exit).not.toHaveBeenCalled();
+  });
+});
+
+describe('updateRuntimeGenerationState classifies a failed prompt takeover (PR #590)', () => {
+  let fetchSpy: ReturnType<typeof vi.fn>;
+  let savedSessionId: string | undefined;
+
+  beforeEach(() => {
+    fetchSpy = vi.fn();
+    vi.stubGlobal('fetch', fetchSpy);
+    mockedGetValidAccessToken.mockReset();
+    mockedGetValidAccessToken.mockResolvedValue('token');
+    savedSessionId = process.env.INK_SESSION_ID;
+    process.env.INK_SESSION_ID = '11111111-1111-4111-8111-111111111111';
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    if (savedSessionId === undefined) delete process.env.INK_SESSION_ID;
+    else process.env.INK_SESSION_ID = savedSessionId;
+  });
+
+  const takeover = () =>
+    updateRuntimeGenerationState(TEST_DIR, null, 'wren', 'running', 'prompt', {
+      studioId: '22222222-2222-4222-8222-222222222222',
+    });
+
+  it('HTTP 409 (turn already stopped) is `refused` — authoritative, one attempt, no lease verdict', async () => {
+    fetchSpy.mockResolvedValue(new Response('', { status: 409 }));
+    await expect(takeover()).resolves.toEqual({ ok: false, reason: 'refused' });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('HTTP 403 is `forbidden` AND a lost lease — permanent, one attempt', async () => {
+    fetchSpy.mockResolvedValue(new Response('', { status: 403 }));
+    await expect(takeover()).resolves.toEqual({
+      ok: false,
+      leaseLost: true,
+      reason: 'forbidden',
+    });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('2xx with studioLeaseHeld:false is `lease-not-held` AND a lost lease — no retry', async () => {
+    fetchSpy.mockResolvedValue(mockJsonResponse({ success: true, studioLeaseHeld: false }));
+    await expect(takeover()).resolves.toEqual({
+      ok: false,
+      leaseLost: true,
+      reason: 'lease-not-held',
+    });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('a transport failure on every attempt is `unavailable` — three attempts, no lease verdict', async () => {
+    fetchSpy.mockRejectedValue(new Error('ECONNREFUSED'));
+    await expect(takeover()).resolves.toEqual({ ok: false, reason: 'unavailable' });
+    expect(fetchSpy).toHaveBeenCalledTimes(3);
+  });
+
+  it('an unclassified non-2xx is `unavailable` too — not a lost lease', async () => {
+    fetchSpy.mockResolvedValue(new Response('boom', { status: 500 }));
+    await expect(takeover()).resolves.toEqual({ ok: false, reason: 'unavailable' });
+    expect(fetchSpy).toHaveBeenCalledTimes(3);
+  });
+
+  it('a claimed prompt carries the fresh epoch and no reason', async () => {
+    fetchSpy.mockResolvedValue(
+      mockJsonResponse({ success: true, turnEpoch: 'epoch-1', studioLeaseHeld: true })
+    );
+    await expect(takeover()).resolves.toEqual({ ok: true, turnEpoch: 'epoch-1' });
   });
 });
 
@@ -1441,7 +1558,10 @@ describe('lease acknowledgement and fail-closed degradation (round 11)', () => {
     const source = await loadSource();
     const fn = source.indexOf('async function updateRuntimeGenerationState(');
     const check = source.indexOf('if (body?.studioLeaseHeld === false) {', fn);
-    const refuse = source.indexOf('return { ok: false, leaseLost: true };', check);
+    const refuse = source.indexOf(
+      "return { ok: false, leaseLost: true, reason: 'lease-not-held' };",
+      check
+    );
     const okReturn = source.indexOf('ok: true,', check);
     expect(fn).toBeGreaterThan(-1);
     expect(check).toBeGreaterThan(fn);
@@ -1582,7 +1702,10 @@ describe('403 enforcement parity (round 24)', () => {
     const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'hooks.ts'), 'utf-8');
     const fn = source.indexOf('async function updateRuntimeGenerationState(');
     const forbidden = source.indexOf('if (resp.status === 403) {', fn);
-    const verdict = source.indexOf('return { ok: false, leaseLost: true };', forbidden);
+    const verdict = source.indexOf(
+      "return { ok: false, leaseLost: true, reason: 'forbidden' };",
+      forbidden
+    );
     const okBranch = source.indexOf('if (resp.ok) {', fn);
     expect(forbidden).toBeGreaterThan(fn);
     // The permanent refusal returns BEFORE the retry loop can continue.
