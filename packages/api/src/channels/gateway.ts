@@ -1021,7 +1021,7 @@ export class ChannelGateway extends EventEmitter {
   async releaseConversation(
     channel: GatewayChannel,
     conversationId: string,
-    autoResponse?: { content: string; format?: 'text' | 'markdown' }
+    autoResponse?: { content: string; format?: 'text' | 'markdown'; sessionId?: string }
   ): Promise<void> {
     const key = this.getBufferKey(channel, conversationId);
 
@@ -1037,6 +1037,7 @@ export class ChannelGateway extends EventEmitter {
           conversationId,
           content: autoResponse.content,
           format: autoResponse.format,
+          sessionId: autoResponse.sessionId,
         });
       } catch (error) {
         logger.error(`Failed to send auto-response for ${key}:`, error);

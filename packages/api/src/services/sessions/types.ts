@@ -263,6 +263,13 @@ export interface ChannelResponse {
   metadata?: Record<string, unknown>;
   /** Media attachments (images, videos, documents) to send alongside text */
   media?: import('../../agent/types').OutboundMedia[];
+  /**
+   * The session that produced this response — stamped onto the `message_out`
+   * activity row by the gateway. Runners that synthesise responses from backend
+   * output leave it unset; the server fills it from the turn's session before
+   * routing (see attributeResponses).
+   */
+  sessionId?: string;
 }
 
 export interface SessionResult {
