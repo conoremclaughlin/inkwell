@@ -246,6 +246,7 @@ describe('create_studio / adopt_studio provenance', () => {
       routePatterns: ['pr:*'],
       status: 'active',
       agentId: 'wren',
+      userId: '00000000-0000-0000-0000-000000000001',
     };
     const findById = vi.fn(async () => existing);
     const linkSession = vi.fn(async (id: string, sessionId: string) => ({
@@ -268,7 +269,7 @@ describe('create_studio / adopt_studio provenance', () => {
         memory: { getSession },
       },
     } as unknown as DataComposer;
-    return { dc, create, update, logActivity, findById, linkSession, getSession };
+    return { dc, create, update, logActivity, findById, linkSession, getSession, existing };
   }
 
   beforeEach(() => {
@@ -279,7 +280,12 @@ describe('create_studio / adopt_studio provenance', () => {
     git('commit --allow-empty -m init', repoRoot);
     acquireMock.mockClear().mockResolvedValue({ acquired: true, lease: {} });
     callerMock.mockClear().mockResolvedValue({ agentId: 'wren', sbId: 'sb-1' });
-    implicitMock.mockClear().mockResolvedValue({ session: { id: 'sess-1' }, via: 'context' });
+    // The resolver only ever returns the caller's own session; the row carries
+    // its identity, which the handler now verifies before using it.
+    implicitMock.mockClear().mockResolvedValue({
+      session: { id: 'sess-1', agentId: 'wren', sbId: 'sb-1' },
+      via: 'context',
+    });
     findOrCreateThreadMock.mockClear().mockResolvedValue({ id: 'thread-1', isNew: true });
     assignMock.mockClear().mockResolvedValue({
       sessionId: 'sess-1',
@@ -504,6 +510,214 @@ describe('create_studio / adopt_studio provenance', () => {
     expect(payload.error).toContain('belongs to another identity');
     expect(linkSession).not.toHaveBeenCalled();
     expect(acquireMock).not.toHaveBeenCalled();
+    expect(logActivity).not.toHaveBeenCalled();
+  });
+
+  it('an agentId that is not the authenticated identity is refused before any side effect (Lumen, PR #605 r2)', async () => {
+    // Lumen's credential, typed as wren, naming Lumen's OWN valid session:
+    // session authorization passes, and without the acting-identity check
+    // wren's thread home would be stamped with Lumen's session under wren's name.
+    callerMock.mockResolvedValue({
+      agentId: 'lumen',
+      sbId: 'sb-lumen',
+      agentBound: true,
+      contactId: null,
+    });
+    const { dc, create, logActivity, getSession } = composer();
+    const result = await handleCreateStudio(
+      {
+        agentId: 'wren',
+        repoRoot,
+        slug: 'claimed',
+        baseBranch: 'main',
+        skipGitOperations: true,
+        sessionId: SESSION,
+        threadKey: 'pr:13',
+      },
+      dc
+    );
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.success).toBe(false);
+    expect(payload.error).toContain('not the authenticated identity (lumen)');
+    expect(getSession).not.toHaveBeenCalled();
+    expect(create).not.toHaveBeenCalled();
+    expect(acquireMock).not.toHaveBeenCalled();
+    expect(assignMock).not.toHaveBeenCalled();
+    expect(logActivity).not.toHaveBeenCalled();
+  });
+
+  it('adopt_studio refuses an agentId that is not the authenticated identity', async () => {
+    callerMock.mockResolvedValue({
+      agentId: 'lumen',
+      sbId: 'sb-lumen',
+      agentBound: true,
+      contactId: null,
+    });
+    const { dc, linkSession, logActivity, getSession } = composer();
+    const result = await handleAdoptStudio(
+      { agentId: 'wren', sessionId: SESSION, studioId: STUDIO, threadKey: 'pr:13' },
+      dc
+    );
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.success).toBe(false);
+    expect(payload.error).toContain('not the authenticated identity (lumen)');
+    expect(getSession).not.toHaveBeenCalled();
+    expect(linkSession).not.toHaveBeenCalled();
+    expect(acquireMock).not.toHaveBeenCalled();
+    expect(assignMock).not.toHaveBeenCalled();
+    expect(logActivity).not.toHaveBeenCalled();
+  });
+
+  it("a user token acting as wren may not name another agent's session as the creator (explicit mismatch)", async () => {
+    // Same-user authorization passes for a user token; the session is still
+    // lumen's, and the thread home would be written under wren's key.
+    callerMock.mockResolvedValue({ agentId: 'wren', agentBound: false });
+    const { dc, create, logActivity, getSession } = composer();
+    getSession.mockResolvedValue({
+      id: SESSION,
+      userId: '00000000-0000-0000-0000-000000000001',
+      agentId: 'lumen',
+      sbId: 'sb-lumen',
+      contactId: undefined,
+    });
+    const result = await handleCreateStudio(
+      {
+        agentId: 'wren',
+        repoRoot,
+        slug: 'mismatch',
+        baseBranch: 'main',
+        skipGitOperations: true,
+        sessionId: SESSION,
+        threadKey: 'pr:14',
+      },
+      dc
+    );
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.success).toBe(false);
+    expect(payload.error).toContain('belongs to agent lumen, not wren');
+    expect(getSession).toHaveBeenCalledWith(SESSION);
+    expect(create).not.toHaveBeenCalled();
+    expect(acquireMock).not.toHaveBeenCalled();
+    expect(assignMock).not.toHaveBeenCalled();
+    expect(logActivity).not.toHaveBeenCalled();
+  });
+
+  it('adopt_studio: the same explicit mismatch is refused before linking', async () => {
+    callerMock.mockResolvedValue({ agentId: 'wren', agentBound: false });
+    const { dc, linkSession, logActivity, getSession } = composer();
+    getSession.mockResolvedValue({
+      id: SESSION,
+      userId: '00000000-0000-0000-0000-000000000001',
+      agentId: 'lumen',
+      sbId: 'sb-lumen',
+      contactId: undefined,
+    });
+    const result = await handleAdoptStudio(
+      { agentId: 'wren', sessionId: SESSION, studioId: STUDIO, threadKey: 'pr:14' },
+      dc
+    );
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.success).toBe(false);
+    expect(payload.error).toContain('belongs to agent lumen, not wren');
+    expect(linkSession).not.toHaveBeenCalled();
+    expect(acquireMock).not.toHaveBeenCalled();
+    expect(assignMock).not.toHaveBeenCalled();
+    expect(logActivity).not.toHaveBeenCalled();
+  });
+
+  it("an implicit session that is not the acting identity's is not used: no creator session, lease, or home, and the response says why", async () => {
+    callerMock.mockResolvedValue({ agentId: 'wren', agentBound: false });
+    implicitMock.mockResolvedValue({
+      session: { id: 'sess-lumen', agentId: 'lumen', sbId: 'sb-lumen' },
+      via: 'context',
+    });
+    const { dc, create, logActivity } = composer();
+    const result = await handleCreateStudio(
+      {
+        agentId: 'wren',
+        repoRoot,
+        slug: 'ambient',
+        baseBranch: 'main',
+        skipGitOperations: true,
+        threadKey: 'pr:15',
+      },
+      dc
+    );
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.success).toBe(true);
+    expect(payload.provenance.sessionId).toBeNull();
+    expect(payload.provenance.sessionReason).toContain('identity-mismatch');
+    expect(payload.provenance.sessionReason).toContain('belongs to agent lumen, not wren');
+    expect(payload.warnings.join('\n')).toContain('identity-mismatch');
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(create.mock.calls[0][0]).toMatchObject({ agentId: 'wren' });
+    expect(create.mock.calls[0][0].sessionId).toBeUndefined();
+    expect(acquireMock).not.toHaveBeenCalled();
+    expect(assignMock).not.toHaveBeenCalled();
+    expect(logActivity).toHaveBeenCalledTimes(1);
+    expect(logActivity.mock.calls[0][0]).toMatchObject({ agentId: 'wren' });
+    expect(logActivity.mock.calls[0][0].sessionId).toBeUndefined();
+  });
+
+  it('the canonical id decides when both sides carry one: same slug, other identity, no creator session', async () => {
+    // "wren" in another workspace is a different identity wearing the same name.
+    callerMock.mockResolvedValue({
+      agentId: 'wren',
+      sbId: 'sb-1',
+      agentBound: true,
+      contactId: null,
+    });
+    implicitMock.mockResolvedValue({
+      session: { id: 'sess-twin', agentId: 'wren', sbId: 'sb-twin' },
+      via: 'lookup',
+    });
+    const { dc, create } = composer();
+    const result = await handleCreateStudio(
+      {
+        agentId: 'wren',
+        repoRoot,
+        slug: 'twin',
+        baseBranch: 'main',
+        skipGitOperations: true,
+        threadKey: 'pr:17',
+      },
+      dc
+    );
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.success).toBe(true);
+    expect(payload.provenance.sessionId).toBeNull();
+    expect(payload.provenance.sessionReason).toContain('belongs to another identity (sb-twin)');
+    expect(create.mock.calls[0][0].sessionId).toBeUndefined();
+    expect(acquireMock).not.toHaveBeenCalled();
+    expect(assignMock).not.toHaveBeenCalled();
+  });
+
+  it("adopt_studio refuses another agent's studio before linking, leasing, or logging", async () => {
+    const { dc, findById, linkSession, logActivity, existing } = composer();
+    findById.mockResolvedValue({ ...existing, agentId: 'lumen' });
+    const result = await handleAdoptStudio(
+      { agentId: 'wren', sessionId: SESSION, studioId: STUDIO, threadKey: 'pr:16' },
+      dc
+    );
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.success).toBe(false);
+    expect(payload.error).toContain('belongs to lumen, not wren');
+    expect(linkSession).not.toHaveBeenCalled();
+    expect(acquireMock).not.toHaveBeenCalled();
+    expect(logActivity).not.toHaveBeenCalled();
+  });
+
+  it("adopt_studio does not confirm another user's studio exists", async () => {
+    const { dc, findById, linkSession, logActivity, existing } = composer();
+    findById.mockResolvedValue({ ...existing, userId: '00000000-0000-0000-0000-000000000002' });
+    const result = await handleAdoptStudio(
+      { agentId: 'wren', sessionId: SESSION, studioId: STUDIO, threadKey: 'pr:16' },
+      dc
+    );
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.success).toBe(false);
+    expect(payload.error).toBe('Studio not found');
+    expect(linkSession).not.toHaveBeenCalled();
     expect(logActivity).not.toHaveBeenCalled();
   });
 

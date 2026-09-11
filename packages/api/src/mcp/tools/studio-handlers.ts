@@ -291,6 +291,65 @@ async function authorizeExplicitSession(
   return { ok: true, session };
 }
 
+/**
+ * The identity a studio operation acts as: the name the studio row, the lease,
+ * the thread home and the log line all carry.
+ */
+interface ActingIdentity {
+  agentId: string;
+  sbId?: string;
+}
+
+const CREATOR_SESSION_RULE =
+  "a studio's session must be the acting identity's own: it becomes the lease " +
+  'holder and the thread home, both keyed by that identity';
+
+/**
+ * Who this call acts as. For an agent-bound caller that is the credential's
+ * identity and nothing else: the typed `agentId` is a claim, and a claim that
+ * disagrees with the credential is refused rather than reconciled. Authorizing
+ * the session proved the caller may act on it, not that the typed name is who
+ * acted — a Lumen request typed as wren, naming Lumen's own valid session,
+ * would otherwise stamp wren's thread home with Lumen's session (Lumen,
+ * PR #605 round 2). A user or admin token acts as the agent it names (a human
+ * provisioning ground for an SB); there `sessionIdentityMismatch` is what
+ * keeps the name honest.
+ */
+function resolveActingIdentity(
+  caller: CallerIdentity,
+  requestedAgentId: string,
+  toolName: string
+): { ok: true; actor: ActingIdentity } | { ok: false; error: string } {
+  if (caller.agentBound && caller.agentId && caller.agentId !== requestedAgentId) {
+    return {
+      ok: false,
+      error:
+        `${toolName}: agentId ${requestedAgentId} is not the authenticated identity (${caller.agentId}). ` +
+        'An agent creates or adopts a studio as itself; provisioning ground for another ' +
+        'agent is a user/admin operation.',
+    };
+  }
+  return { ok: true, actor: { agentId: caller.agentId ?? requestedAgentId, sbId: caller.sbId } };
+}
+
+/**
+ * Why `session` cannot stand in for `actor`, or null when it can. Authorization
+ * asks whether the caller may touch the row; this asks whether the row IS the
+ * acting identity, because the participant stamp is keyed by the agent slug and
+ * the lease names its holder. The canonical id decides whenever both sides
+ * carry one; the slug is compared always, since it is the key the stamp is
+ * written under.
+ */
+function sessionIdentityMismatch(session: Session, actor: ActingIdentity): string | null {
+  if (actor.sbId && session.sbId && session.sbId !== actor.sbId) {
+    return `session ${session.id} belongs to another identity (${session.sbId}), not ${actor.agentId}`;
+  }
+  if (session.agentId !== actor.agentId) {
+    return `session ${session.id} belongs to agent ${session.agentId ?? '(none)'}, not ${actor.agentId}`;
+  }
+  return null;
+}
+
 // The thread tables are not in the generated Supabase types (see inbox-handlers).
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const participantTable = (supabase: ReturnType<DataComposer['getClient']>) =>
@@ -551,10 +610,17 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
   } = parsed;
 
   // Who is creating this, from the signed request context — never from what
-  // the caller typed. An explicit sessionId still wins (a human linking a
-  // studio to a known session); otherwise the session the caller runs in, if
-  // it can be identified unambiguously. Never guessed (Lumen, #596).
+  // the caller typed: the typed agentId must be the authenticated identity.
+  // An explicit sessionId still wins (a human linking a studio to a known
+  // session); otherwise the session the caller runs in, if it can be
+  // identified unambiguously. Never guessed (Lumen, #596). Either way the
+  // session must be the acting identity's own before it becomes the creator.
   const caller = await resolveCaller(dataComposer, resolved.user.id, agentId);
+  const acting = resolveActingIdentity(caller, agentId, 'create_studio');
+  if (!acting.ok) return errorResponse(acting.error);
+  const { actor } = acting;
+  let creatorSessionId: string | undefined;
+  let creatorSessionReason: string | undefined;
   if (sessionId) {
     const authorized = await authorizeExplicitSession(
       dataComposer,
@@ -564,18 +630,27 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
       'create_studio'
     );
     if (!authorized.ok) return errorResponse(authorized.error);
-  }
-  let creatorSessionId: string | undefined = sessionId;
-  let creatorSessionReason: string | undefined;
-  if (!creatorSessionId) {
+    const mismatch = sessionIdentityMismatch(authorized.session, actor);
+    if (mismatch) return errorResponse(`create_studio: ${mismatch}. ${CREATOR_SESSION_RULE}.`);
+    creatorSessionId = sessionId;
+  } else {
     const implicit = await resolveImplicitSession(
       dataComposer,
       resolved.user.id,
       caller,
       undefined
     );
-    if (implicit.session) creatorSessionId = implicit.session.id;
-    else creatorSessionReason = implicit.reason;
+    if (!implicit.session) {
+      creatorSessionReason = implicit.reason;
+    } else {
+      // The ambient session is a hint about where the caller runs, not a
+      // target they named: when it is not the acting identity's own, the
+      // studio is still made — without a creator session, lease, or thread
+      // home — and the response says why.
+      const mismatch = sessionIdentityMismatch(implicit.session, actor);
+      if (mismatch) creatorSessionReason = `identity-mismatch: ${mismatch}`;
+      else creatorSessionId = implicit.session.id;
+    }
   }
   // Thread-scoped ground is temporary by default; a home studio is not.
   const ephemeral = durable === undefined ? Boolean(threadKey) : !durable;
@@ -593,7 +668,7 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
 
   // Derive branch name and worktree path (sibling of the main repo root)
   const abbrev = WORK_TYPE_ABBREV[workType] || 'other';
-  const branch = `${agentId}/${abbrev}/${slug}`;
+  const branch = `${actor.agentId}/${abbrev}/${slug}`;
   const worktreePath = path.join(path.dirname(mainRoot), `${path.basename(mainRoot)}--${slug}`);
 
   // Perform git operations if not skipped
@@ -660,7 +735,7 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
   try {
     studio = await dataComposer.repositories.studios.create({
       userId: resolved.user.id,
-      agentId,
+      agentId: actor.agentId,
       sessionId: creatorSessionId,
       repoRoot: mainRoot,
       worktreePath,
@@ -698,8 +773,8 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
   const provenance = await recordStudioProvenance(dataComposer, {
     studio,
     userId: resolved.user.id,
-    agentId,
-    sbId: caller.sbId ?? undefined,
+    agentId: actor.agentId,
+    sbId: actor.sbId,
     sessionId: creatorSessionId,
     sessionReason: creatorSessionReason,
     threadKey,
@@ -710,7 +785,7 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
     studioId: studio.id,
     branch,
     worktreePath,
-    agentId,
+    agentId: actor.agentId,
     sessionId: creatorSessionId ?? null,
     threadKey: threadKey ?? null,
     ephemeral,
@@ -1162,8 +1237,11 @@ export async function handleAdoptStudio(args: unknown, dataComposer: DataCompose
 
   const { agentId, sessionId, routePatterns, threadKey } = parsed;
   const studiosRepo = dataComposer.repositories.studios;
-  const scope = { userId: user.id, agentId };
   const caller = await resolveCaller(dataComposer, user.id, agentId);
+  const acting = resolveActingIdentity(caller, agentId, 'adopt_studio');
+  if (!acting.ok) return errorResponse(acting.error);
+  const { actor } = acting;
+  const scope = { userId: user.id, agentId: actor.agentId };
   const authorized = await authorizeExplicitSession(
     dataComposer,
     user.id,
@@ -1172,6 +1250,8 @@ export async function handleAdoptStudio(args: unknown, dataComposer: DataCompose
     'adopt_studio'
   );
   if (!authorized.ok) return errorResponse(authorized.error);
+  const mismatch = sessionIdentityMismatch(authorized.session, actor);
+  if (mismatch) return errorResponse(`adopt_studio: ${mismatch}. ${CREATOR_SESSION_RULE}.`);
 
   // Find studio by ID, branch, or path
   let studio = null;
@@ -1187,6 +1267,20 @@ export async function handleAdoptStudio(args: unknown, dataComposer: DataCompose
 
   if (!studio) {
     return errorResponse('Studio not found');
+  }
+  // Own ground only. findById is not scoped, so the row is checked here: a
+  // studio of another user is not confirmed to exist, and a studio of another
+  // agent is refused by name — adopting it would link, lease and log it under
+  // an identity that never owned it (Lumen, PR #605 round 2). A studio with no
+  // agent on record is unowned and stays adoptable.
+  if (studio.userId !== user.id) {
+    return errorResponse('Studio not found');
+  }
+  if (studio.agentId && studio.agentId !== actor.agentId) {
+    return errorResponse(
+      `Studio ${studio.id} belongs to ${studio.agentId}, not ${actor.agentId}. adopt_studio ` +
+        'takes over your own ground; moving a studio between agents is a user/admin operation.'
+    );
   }
 
   // Ensure settings exist in the worktree (may be first time adopting an old studio)
@@ -1212,8 +1306,8 @@ export async function handleAdoptStudio(args: unknown, dataComposer: DataCompose
   const provenance = await recordStudioProvenance(dataComposer, {
     studio: updated,
     userId: user.id,
-    agentId,
-    sbId: caller.sbId ?? undefined,
+    agentId: actor.agentId,
+    sbId: actor.sbId,
     sessionId,
     threadKey,
     purpose: updated.purpose ?? undefined,
@@ -1221,14 +1315,14 @@ export async function handleAdoptStudio(args: unknown, dataComposer: DataCompose
   });
   logger.info('Studio adopted', {
     studioId: updated.id,
-    agentId,
+    agentId: actor.agentId,
     sessionId,
     threadKey: threadKey ?? null,
     lease: provenance.lease,
   });
 
   return successResponse({
-    message: `Studio adopted by ${agentId} and linked to session ${sessionId}`,
+    message: `Studio adopted by ${actor.agentId} and linked to session ${sessionId}`,
     provenance: { sessionId, logged: provenance.logged },
     lease: provenance.lease,
     routing: provenance.routing,
