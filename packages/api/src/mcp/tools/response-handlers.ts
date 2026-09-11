@@ -12,6 +12,7 @@ import type { ChannelType, AgentResponse, ResponseFormat, OutboundMedia } from '
 import { logger } from '../../utils/logger';
 import { hasDeliveryEvidence } from '../../services/channel-forward.js';
 import { getPinnedAgentId, getRequestContext } from '../../utils/request-context';
+import { resolveAttributedSession } from './caller-identity';
 
 // Response result returned by the callback (optional — void is still accepted)
 export interface ResponseResult {
@@ -246,6 +247,31 @@ export async function handleSendResponse(
       if (resolvedVoice) metadata.ttsVoice = resolvedVoice;
     }
 
+    // Stamp the sending session at the tool boundary, where the request
+    // context is unambiguously this call's. On 2026-09-10 Conor received the
+    // same Thursday digest twice and neither `message_out` row said who sent
+    // it — both carried session_id null, as 69 of 69 outbound rows did that
+    // week — so the duplicate could only be attributed by reading a sibling's
+    // session context field and inferring.
+    //
+    // The context names a session in two forms: the signed token claim, and
+    // the unsigned `x-ink-context` assertion for tokens that predate the claim.
+    // Neither is stamped bare. resolveAttributedSession loads the row and
+    // authorizes it for this caller — same user always; same identity and
+    // contact scope for an agent-bound token — exactly as the session tools do,
+    // and yields nothing on any failure. Stamping the raw header let a legacy
+    // agent token write another user's session onto the activity row, and a
+    // nonexistent id failed the insert AFTER delivery, leaving no outgoing row
+    // at all (Lumen, #596). Delivery never depends on attribution.
+    const attribution = await resolveAttributedSession(_dataComposer);
+    if (attribution.sessionId === undefined) {
+      logger.debug('send_response: no session attribution for this outgoing message', {
+        channel: args.channel,
+        conversationId: args.conversationId,
+        reason: attribution.reason,
+      });
+    }
+
     const response: AgentResponse = {
       channel: args.channel as ChannelType,
       conversationId: args.conversationId,
@@ -254,6 +280,7 @@ export async function handleSendResponse(
       replyToMessageId: args.replyToMessageId,
       metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
       media: args.media as OutboundMedia[] | undefined,
+      sessionId: attribution.sessionId,
     };
 
     // Try local callback first (when running in same process as session host)
@@ -268,11 +295,18 @@ export async function handleSendResponse(
         const httpResponse = await fetch(MYRA_SEND_ENDPOINT, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
+          // The validated session travels with the payload. Nothing in this
+          // repository serves the receiving end (no route handles
+          // /api/admin/send and nothing listens on the Myra port), so the
+          // receiver — wherever it lives — must treat this as a cross-process
+          // assertion and re-validate it the way resolveAttributedSession
+          // does before stamping anything.
           body: JSON.stringify({
             channel: args.channel,
             conversationId: args.conversationId,
             content: args.content,
             media: args.media,
+            sessionId: attribution.sessionId,
           }),
         });
 

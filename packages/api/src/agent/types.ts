@@ -154,6 +154,18 @@ export interface AgentResponse {
   metadata?: Record<string, unknown>;
   /** Optional media attachments to send alongside or instead of text */
   media?: OutboundMedia[];
+  /**
+   * The session that produced this response, stamped onto the `message_out`
+   * activity row so an outgoing message can be traced back to its sender.
+   *
+   * Threaded explicitly rather than read from ambient context inside the
+   * gateway: the gateway is a long-lived singleton shared by inbound
+   * processing, triggers and heartbeats, and a leaked async context would
+   * stamp the WRONG session — the failure mode this field exists to expose.
+   * Undefined on paths with no session (heartbeat sends), which logs null as
+   * before.
+   */
+  sessionId?: string;
 }
 
 /**

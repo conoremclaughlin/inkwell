@@ -1938,7 +1938,9 @@ describe('SessionService', () => {
       await serviceWithHandler.triggerCompaction('session-123');
 
       // Phase 1: Compaction responses should be routed
-      expect(mockResponseHandler).toHaveBeenCalledWith(compactionResponses);
+      // The compaction turn's session rides along so the routed replies are
+      // attributed to it, not logged anonymous (PR #596).
+      expect(mockResponseHandler).toHaveBeenCalledWith(compactionResponses, 'session-123');
       // Phase 2: Session should be marked as compacted after responses routed
       expect(mockRepository.markCompacted).toHaveBeenCalledWith('session-123', 'claude-abc');
     });

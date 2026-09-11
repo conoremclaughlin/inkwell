@@ -77,11 +77,23 @@ export function decideChannelForward(input: {
  * debug is invisible, because debug is not persisted to ~/.ink/logs. That is
  * how a turn that reached nobody left no trace at all.
  */
+/** What the gateway sends when the runtime auto-forwards the final text. */
+export interface ChannelForwardPayload {
+  content: string;
+  format: 'markdown';
+  /**
+   * The turn's session, so the auto-forwarded `message_out` row is attributed
+   * like an explicit send_response would be. Absent only when the caller has
+   * no session for the turn.
+   */
+  sessionId?: string;
+}
+
 export interface ChannelForwardEffects {
   info(message: string, meta: Record<string, unknown>): void;
   warn(message: string, meta: Record<string, unknown>): void;
   debug(message: string, meta: Record<string, unknown>): void;
-  release(payload?: { content: string; format: 'markdown' }): Promise<void>;
+  release(payload?: ChannelForwardPayload): Promise<void>;
 }
 
 export async function applyChannelForward(
@@ -92,6 +104,8 @@ export async function applyChannelForward(
     hadExplicitResponse: boolean;
     runSucceeded: boolean;
     finalTextLength: number;
+    /** The session that ran the turn; carried onto the auto-forward payload. */
+    sessionId?: string;
   },
   effects: ChannelForwardEffects
 ): Promise<void> {
@@ -103,7 +117,11 @@ export async function applyChannelForward(
       conversationId,
       responseLength: decision.content.length,
     });
-    await effects.release({ content: decision.content, format: 'markdown' });
+    await effects.release({
+      content: decision.content,
+      format: 'markdown',
+      ...(context.sessionId ? { sessionId: context.sessionId } : {}),
+    });
     return;
   }
 
@@ -159,4 +177,24 @@ export function hasDeliveryEvidence(input: {
   if (input.content.trim().length > 0) return true;
   if (input.mediaSent !== undefined) return input.mediaSent > 0;
   return input.mediaRequested > 0;
+}
+
+/**
+ * Give every response the turn's session unless it already names one.
+ *
+ * `send_response` calls made from inside the request stamp their own validated
+ * session at the tool boundary. Responses a runner synthesises from backend
+ * output (the antigravity runner extracts them from tool events) carry none,
+ * and routed as-is they logged `session_id` null — the same anonymous
+ * `message_out` row #596 set out to remove, on a different path. The turn's
+ * session is the right answer for those: it is the session that produced the
+ * text. A session a response already carries is never overridden; it came from
+ * a validated boundary and this function did not validate anything.
+ */
+export function attributeResponses<T extends { sessionId?: string }>(
+  responses: T[],
+  sessionId: string | undefined
+): T[] {
+  if (!sessionId) return responses;
+  return responses.map((response) => (response.sessionId ? response : { ...response, sessionId }));
 }

@@ -56,7 +56,11 @@ import { resolveAgentFromMention } from './services/routing/resolve-mention';
 import { getHeartbeatProcessingConfig } from './config/heartbeat-flags';
 import { classifyError } from '@inklabs/shared';
 import { logger } from './utils/logger';
-import { decideChannelForward, applyChannelForward } from './services/channel-forward.js';
+import {
+  decideChannelForward,
+  applyChannelForward,
+  attributeResponses,
+} from './services/channel-forward.js';
 import { getUserFromContext } from './utils/request-context';
 import { env } from './config/env';
 import {
@@ -101,13 +105,15 @@ let isShuttingDown = false;
  * Route responses through the ChannelGateway.
  * This is called after SessionService processes a message and returns responses.
  */
-async function routeResponses(responses: ChannelResponse[]): Promise<void> {
+async function routeResponses(responses: ChannelResponse[], sessionId?: string): Promise<void> {
   if (!channelGateway) {
     logger.warn('Cannot route responses - ChannelGateway not initialized');
     return;
   }
 
-  for (const response of responses) {
+  // Responses a runner synthesised from backend output carry no session;
+  // the turn's session is theirs. See attributeResponses.
+  for (const response of attributeResponses(responses, sessionId)) {
     try {
       await channelGateway.sendResponse(response);
       logger.info(`Response routed to ${response.channel}:${response.conversationId}`, {
@@ -152,7 +158,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     mcpConfigPath,
     compactionEnabled: env.SERVER_COMPACTION_ENABLED,
     compactionThreshold: config.compactionThreshold || env.COMPACTION_THRESHOLD || 150000,
-    responseHandler: async (responses) => routeResponses(responses),
+    responseHandler: async (responses, sessionId) => routeResponses(responses, sessionId),
     ...(env.DEFAULT_CLAUDE_MODEL ? { defaultModel: env.DEFAULT_CLAUDE_MODEL } : {}),
     ...(env.DEFAULT_CODEX_MODEL ? { defaultCodexModel: env.DEFAULT_CODEX_MODEL } : {}),
     ...(env.DEFAULT_GEMINI_MODEL ? { defaultGeminiModel: env.DEFAULT_GEMINI_MODEL } : {}),
@@ -356,7 +362,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
 
     // Route any explicit send_response calls
     if (result.responses && result.responses.length > 0) {
-      await routeResponses(result.responses);
+      await routeResponses(result.responses, result.sessionId);
     }
 
     // For external channels (telegram/whatsapp), ensure the conversation is released
@@ -390,6 +396,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
           hadExplicitResponse,
           runSucceeded: result.success,
           finalTextLength: result.finalTextResponse?.length ?? 0,
+          sessionId: result.sessionId,
         },
         {
           info: (m, meta) => logger.info(m, meta),
@@ -690,7 +697,7 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
 
       // Route any responses
       if (result.responses && result.responses.length > 0) {
-        await routeResponses(result.responses);
+        await routeResponses(result.responses, result.sessionId);
       }
 
       return result.success;
@@ -1523,7 +1530,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
     // should NOT emit trigger:error or send a "Trigger failed" notification.
     try {
       if (result.responses && result.responses.length > 0) {
-        await routeResponses(result.responses);
+        await routeResponses(result.responses, result.sessionId);
       }
     } catch (routeErr) {
       logger.error(

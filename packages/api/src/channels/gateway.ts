@@ -689,7 +689,8 @@ export class ChannelGateway extends EventEmitter {
    * Called by the response callback or directly
    */
   async sendResponse(response: AgentResponse): Promise<ResponseResult | void> {
-    const { channel, conversationId, content, format, replyToMessageId, media } = response;
+    const { channel, conversationId, content, format, replyToMessageId, media, sessionId } =
+      response;
 
     // Stop typing indicator when sending response
     this.stopTypingIndicator(conversationId);
@@ -711,19 +712,31 @@ export class ChannelGateway extends EventEmitter {
         }
         if (await this.trySendTelegramVoiceReply(response)) {
           if (this.includeTextAfterVoiceReply) {
-            await this.sendTelegramMessage(conversationId, content, { format, replyToMessageId });
+            await this.sendTelegramMessage(conversationId, content, {
+              format,
+              replyToMessageId,
+              sessionId,
+            });
           } else {
-            await this.logOutgoingTelegram(conversationId, content);
+            await this.logOutgoingTelegram(conversationId, content, undefined, sessionId);
           }
           break;
         }
 
         // Send text first (if any meaningful content), then media
         if (content && (!media || media.length === 0)) {
-          await this.sendTelegramMessage(conversationId, content, { format, replyToMessageId });
+          await this.sendTelegramMessage(conversationId, content, {
+            format,
+            replyToMessageId,
+            sessionId,
+          });
         } else if (media && media.length > 0) {
           if (content) {
-            await this.sendTelegramMessage(conversationId, content, { format, replyToMessageId });
+            await this.sendTelegramMessage(conversationId, content, {
+              format,
+              replyToMessageId,
+              sessionId,
+            });
           }
           mediaResult = await this.sendMediaAttachments('telegram', conversationId, media, {
             replyToMessageId,
@@ -734,7 +747,8 @@ export class ChannelGateway extends EventEmitter {
             content
               ? `[+${media.length} media attachment(s)] sent=${mediaResult.sent} failed=${mediaResult.failed}`
               : `[${media.length} media attachment(s)] sent=${mediaResult.sent} failed=${mediaResult.failed}`,
-            media
+            media,
+            sessionId
           );
           if (mediaResult.failed > 0 && mediaResult.sent === 0) {
             throw new Error(
@@ -797,6 +811,7 @@ export class ChannelGateway extends EventEmitter {
                 agentId: 'myra',
                 direction: 'out',
                 content: logContent,
+                sessionId,
                 platform: 'whatsapp',
                 platformChatId: conversationId,
                 isDm: true,
@@ -859,6 +874,7 @@ export class ChannelGateway extends EventEmitter {
                 agentId: 'benson',
                 direction: 'out',
                 content: logContent,
+                sessionId,
                 platform: 'discord',
                 platformChatId: conversationId,
                 isDm: true,
@@ -917,6 +933,7 @@ export class ChannelGateway extends EventEmitter {
                 agentId: 'slack',
                 direction: 'out',
                 content: logContent,
+                sessionId,
                 platform: 'slack',
                 platformChatId: conversationId,
                 isDm: true,
@@ -1004,7 +1021,7 @@ export class ChannelGateway extends EventEmitter {
   async releaseConversation(
     channel: GatewayChannel,
     conversationId: string,
-    autoResponse?: { content: string; format?: 'text' | 'markdown' }
+    autoResponse?: { content: string; format?: 'text' | 'markdown'; sessionId?: string }
   ): Promise<void> {
     const key = this.getBufferKey(channel, conversationId);
 
@@ -1020,6 +1037,7 @@ export class ChannelGateway extends EventEmitter {
           conversationId,
           content: autoResponse.content,
           format: autoResponse.format,
+          sessionId: autoResponse.sessionId,
         });
       } catch (error) {
         logger.error(`Failed to send auto-response for ${key}:`, error);
@@ -1040,7 +1058,7 @@ export class ChannelGateway extends EventEmitter {
   private async sendTelegramMessage(
     conversationId: string,
     content: string,
-    options?: { format?: string; replyToMessageId?: string }
+    options?: { format?: string; replyToMessageId?: string; sessionId?: string }
   ): Promise<void> {
     if (!this.telegramListener) return;
 
@@ -1067,13 +1085,14 @@ export class ChannelGateway extends EventEmitter {
       parseMode,
     });
 
-    await this.logOutgoingTelegram(conversationId, content);
+    await this.logOutgoingTelegram(conversationId, content, undefined, options?.sessionId);
   }
 
   private async logOutgoingTelegram(
     conversationId: string,
     content: string,
-    media?: OutboundMedia[]
+    media?: OutboundMedia[],
+    sessionId?: string
   ): Promise<void> {
     // Log outgoing message to activity stream
     const userId = await this.resolveUserIdForConversation('telegram', conversationId);
@@ -1095,6 +1114,7 @@ export class ChannelGateway extends EventEmitter {
           agentId: 'myra',
           direction: 'out',
           content,
+          sessionId,
           platform: 'telegram',
           platformChatId: conversationId,
           isDm: true, // Will be corrected by context

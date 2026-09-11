@@ -11,9 +11,11 @@
 import { describe, it, expect } from 'vitest';
 import {
   applyChannelForward,
+  attributeResponses,
   decideChannelForward,
   hasDeliveryEvidence,
   type ChannelForwardDecision,
+  type ChannelForwardPayload,
 } from './channel-forward';
 
 describe('decideChannelForward', () => {
@@ -120,7 +122,7 @@ describe('decideChannelForward', () => {
 describe('applyChannelForward', () => {
   function spyEffects() {
     const calls = { info: [] as unknown[][], warn: [] as unknown[][], debug: [] as unknown[][] };
-    const released: Array<{ content: string; format: 'markdown' } | undefined> = [];
+    const released: Array<ChannelForwardPayload | undefined> = [];
     return {
       calls,
       released,
@@ -128,7 +130,7 @@ describe('applyChannelForward', () => {
         info: (m: string, meta: Record<string, unknown>) => calls.info.push([m, meta]),
         warn: (m: string, meta: Record<string, unknown>) => calls.warn.push([m, meta]),
         debug: (m: string, meta: Record<string, unknown>) => calls.debug.push([m, meta]),
-        release: async (p?: { content: string; format: 'markdown' }) => {
+        release: async (p?: ChannelForwardPayload) => {
           released.push(p);
         },
       },
@@ -149,6 +151,20 @@ describe('applyChannelForward', () => {
     expect(released).toEqual([{ content: 'the answer', format: 'markdown' }]);
     expect(calls.info).toHaveLength(1);
     expect(calls.warn).toHaveLength(0);
+  });
+
+  it("carries the turn's session on the auto-forward payload", async () => {
+    // An auto-forwarded reply is a message_out row like any other; without the
+    // session it is the anonymous row #596 set out to remove, on another path.
+    const { fx, released } = spyEffects();
+    await applyChannelForward(
+      { action: 'auto-forward', content: 'the answer' },
+      { ...ctx, sessionId: 'session-of-the-turn' },
+      fx
+    );
+    expect(released).toEqual([
+      { content: 'the answer', format: 'markdown', sessionId: 'session-of-the-turn' },
+    ]);
   });
 
   /**
@@ -227,5 +243,29 @@ describe('hasDeliveryEvidence', () => {
 
   it('counts text even when media all failed', () => {
     expect(hasDeliveryEvidence({ content: 'here', mediaRequested: 2, mediaSent: 0 })).toBe(true);
+  });
+});
+
+describe('attributeResponses', () => {
+  const reply = { channel: 'telegram', conversationId: '1', content: 'hi' };
+
+  it("stamps the turn's session on responses that carry none", () => {
+    expect(attributeResponses([reply, { ...reply, content: 'again' }], 'turn-session')).toEqual([
+      { ...reply, sessionId: 'turn-session' },
+      { ...reply, content: 'again', sessionId: 'turn-session' },
+    ]);
+  });
+
+  it('never overrides a session a response already carries', () => {
+    // A stamped response came through a boundary that validated its session;
+    // this function validated nothing and must not second-guess it.
+    const stamped = { ...reply, sessionId: 'validated-at-the-tool' };
+    expect(attributeResponses([stamped], 'turn-session')).toEqual([stamped]);
+  });
+
+  it('leaves responses untouched when the turn has no session', () => {
+    const responses = [reply];
+    expect(attributeResponses(responses, undefined)).toBe(responses);
+    expect(responses[0]).not.toHaveProperty('sessionId');
   });
 });
