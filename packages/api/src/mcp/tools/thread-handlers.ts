@@ -478,6 +478,11 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
 
   let messages: Record<string, unknown>[] | null = null;
   let skippedOlderCount = 0;
+  // How many messages the read-state floor withheld. Only computed when the
+  // answer would otherwise be a bare empty list — see below.
+  let hiddenByReadState = 0;
+  // Set when the oldest-first page filled exactly and more messages matched.
+  let truncatedNewer = 0;
 
   if (!newestFirst) {
     const { data, error } = await buildQuery('*')
@@ -487,6 +492,38 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
       throw new Error(`Failed to get thread messages: ${error.message}`);
     }
     messages = data;
+
+    // An empty result has two completely different meanings — "this thread has
+    // nothing in it" and "you have already been given all of this" — and the
+    // response said exactly the same thing for both.
+    //
+    // On 2026-09-11 a trigger woke a session with "Fetch the thread using
+    // get_thread_messages(threadKey: ...)". Between the spawn and that call,
+    // the session's OWN channel plugin pushed the same message inline and
+    // acked it (poll-core.ts) — a correct ack, after a real render. So the
+    // instructed fetch returned [], correctly by its own rules, and read as an
+    // empty thread. The recipient went to Postgres to find a message that had
+    // been delivered to it a second earlier.
+    //
+    // Two delivery paths share one pointer and there is no ordering between
+    // them. Whichever loses must at least be able to say what happened, so
+    // count what the floor withheld. Costs a query only in the ambiguous case.
+    if (readStateFloor && (messages?.length ?? 0) === 0) {
+      let unfiltered = threadTable(supabase, 'inbox_thread_messages')
+        .select('id', { count: 'exact', head: true })
+        .eq('thread_id', thread.id);
+      if (!includeSystemEvents) unfiltered = unfiltered.neq('message_type', 'system');
+      if (beforeTs) unfiltered = unfiltered.lt('created_at', beforeTs);
+      const { count } = await unfiltered;
+      hiddenByReadState = count ?? 0;
+    } else if ((messages?.length ?? 0) === effectiveLimit) {
+      // The page filled exactly, so newer messages may exist past it. This
+      // branch is oldest-first, so a truncated page silently hands back the
+      // WRONG END of the thread — the caller asked what is going on and got
+      // the beginning of the conversation.
+      const { count } = await buildQuery('id', true);
+      truncatedNewer = Math.max(0, (count ?? 0) - effectiveLimit);
+    }
   } else {
     // Count everything past the floor so truncation is visible, not silent.
     const { count: totalMatching, error: countErr } = await buildQuery('id', true);
@@ -620,6 +657,27 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
           // messages were cut by the cold-start guard or latestN window.
           ...(skippedOlderCount > 0 ? { skippedOlderCount } : {}),
           ...(guardActive ? { coldStartGuard: true } : {}),
+          // Empty because already-read, NOT because the thread is empty.
+          ...(hiddenByReadState > 0
+            ? {
+                hiddenByReadState,
+                hint:
+                  `No messages are newer than your read pointer, but this thread has ` +
+                  `${hiddenByReadState}. They may already have been delivered to you by ` +
+                  `another path (an inline channel push acks on render). Pass ` +
+                  `fullHistory: true with latestN to see them.`,
+              }
+            : {}),
+          // The page filled and this branch is oldest-first, so what came back
+          // is the START of the thread, not the latest of it.
+          ...(truncatedNewer > 0
+            ? {
+                truncatedNewerCount: truncatedNewer,
+                hint:
+                  `Returned the OLDEST ${effectiveLimit} messages; ${truncatedNewer} newer ` +
+                  `ones were cut. Pass latestN to get the most recent instead.`,
+              }
+            : {}),
           // Checked write surfaced to the caller (spec §5): messages were
           // returned, but the read-pointer advance did NOT persist — read
           // state is stale and messages may re-deliver.

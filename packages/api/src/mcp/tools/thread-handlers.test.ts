@@ -1232,3 +1232,83 @@ describe('read floors compare instants, not spellings', () => {
     );
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════
+// An empty result must say WHY it is empty (2026-09-11)
+//
+// A trigger woke a session with "Fetch the thread using
+// get_thread_messages(threadKey: ...)". Between the spawn and that call the
+// session's own channel plugin pushed the same message inline and acked it —
+// a correct ack, after a real render. So the instructed fetch returned [],
+// correctly by its own rules, and read as an empty thread. The recipient went
+// to Postgres to find a message delivered to it a second earlier.
+//
+// Two delivery paths share one read pointer with no ordering between them.
+// Whichever loses has to be able to say what happened.
+// ═══════════════════════════════════════════════════════════════════
+describe('handleGetThreadMessages — empty vs already-consumed', () => {
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    // An earlier test spyOn's this module member, which survives into here;
+    // clearAllMocks then strips its implementation and the handler sees an
+    // undefined user. Re-establish it rather than depend on ordering.
+    const userResolver = await import('../../services/user-resolver');
+    vi.mocked(userResolver.resolveUserOrThrow).mockResolvedValue({
+      user: { id: 'user-123' },
+      resolvedBy: 'userId',
+    } as never);
+  });
+
+  it('reports how many messages the read pointer withheld', async () => {
+    const rows = [guardMsg('m-1', 5), guardMsg('m-2', 4), guardMsg('m-3', 3)];
+    // Pointer past everything — exactly what an ack on render leaves behind.
+    const parsed = await callGuard(createGuardMockSupabase(rows, { lastReadAt: hoursAgo(1) }));
+
+    expect(parsed.messageCount).toBe(0);
+    expect(parsed.hiddenByReadState).toBe(3);
+    expect(parsed.hint).toContain('fullHistory');
+  });
+
+  it('leaves a genuinely empty thread plainly empty', async () => {
+    // The control: the fix must not make every empty thread look consumed.
+    const parsed = await callGuard(createGuardMockSupabase([], { lastReadAt: hoursAgo(1) }));
+
+    expect(parsed.messageCount).toBe(0);
+    expect(parsed.hiddenByReadState).toBeUndefined();
+    expect(parsed.hint).toBeUndefined();
+  });
+
+  it('says nothing extra when the floor actually returns messages', async () => {
+    const rows = [guardMsg('old', 10), guardMsg('fresh', 1)];
+    const parsed = await callGuard(createGuardMockSupabase(rows, { lastReadAt: hoursAgo(5) }));
+
+    expect(parsed.messageCount).toBe(1);
+    expect(parsed.hiddenByReadState).toBeUndefined();
+  });
+
+  it('flags an oldest-first page that filled and cut the newest messages', async () => {
+    // Myra's separate trap: fullHistory with a limit below the thread size
+    // returns the START of the conversation, silently, which is the wrong end
+    // of a thread you are catching up on.
+    const rows = Array.from({ length: 60 }, (_, i) => guardMsg(`m-${i}`, 100 - i));
+    const parsed = await callGuard(createGuardMockSupabase(rows), {
+      fullHistory: true,
+      limit: 50,
+    });
+
+    expect(parsed.messageCount).toBe(50);
+    expect(parsed.truncatedNewerCount).toBe(10);
+    expect(parsed.hint).toContain('latestN');
+  });
+
+  it('does not flag truncation when the whole thread fits', async () => {
+    const rows = Array.from({ length: 10 }, (_, i) => guardMsg(`m-${i}`, 50 - i));
+    const parsed = await callGuard(createGuardMockSupabase(rows), {
+      fullHistory: true,
+      limit: 50,
+    });
+
+    expect(parsed.messageCount).toBe(10);
+    expect(parsed.truncatedNewerCount).toBeUndefined();
+  });
+});
