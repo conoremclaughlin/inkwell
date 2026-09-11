@@ -36,7 +36,27 @@ vi.mock('../utils/logger', () => ({
 }));
 
 vi.mock('./tools', () => ({
-  registerAllTools: vi.fn(),
+  registerAllTools: vi.fn((server: any, _data: unknown, options: any) => {
+    // One probe tool: reports the request context seen before and after an
+    // await, plus which catalog this instance was built for.
+    server.registerTool('echo_request_context', {}, async () => {
+      const { getRequestContext } = await import('../utils/request-context');
+      const before = getRequestContext();
+      await new Promise((resolve) => setTimeout(resolve, 15));
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              before,
+              after: getRequestContext(),
+              runtimeCatalog: options?.includeInternalLifecycleTools,
+            }),
+          },
+        ],
+      };
+    });
+  }),
   setMiniAppsRegistry: vi.fn(),
   setTelegramListener: vi.fn(),
 }));
@@ -84,7 +104,10 @@ vi.mock('../utils/request-context', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../utils/request-context')>();
   return {
     ...actual,
-    runWithRequestContext: vi.fn((_ctx: unknown, fn: () => unknown) => fn()),
+    // The REAL AsyncLocalStorage runner, spied on so call counts still work.
+    // A no-op stand-in would hide exactly the failure this file must catch:
+    // request context not reaching the SDK's per-request server instance.
+    runWithRequestContext: vi.fn(actual.runWithRequestContext),
   };
 });
 
@@ -343,6 +366,51 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     });
     expect(bare.status).toBe(200);
     expect((parseSSEResult(bare.body) as any).result.protocolVersion).toBe('2025-11-25');
+  });
+
+  it('keeps each request\u2019s identity, session and catalog through real AsyncLocalStorage, concurrently, in both eras', async () => {
+    // Lumen's #598 review: the factory runs inside runWithRequestContext, and
+    // the SDK's per-request dispatch must preserve that store across awaits
+    // and never leak it between concurrent exchanges. Twelve interleaved
+    // clients, alternating modern/legacy negotiation and agent/runtime
+    // catalogs, each authenticated as a different user.
+    if (serverUnavailableError) return;
+    const { Client, StreamableHTTPClientTransport } = await import('@modelcontextprotocol/client');
+    mockVerifyAccessToken.mockImplementation(async (auth: string) => ({
+      userId: auth.slice('Bearer '.length),
+      email: 'test@example.com',
+    }));
+    const check = async (i: number) => {
+      const mode = i % 2 === 0 ? 'auto' : 'legacy';
+      const runtime = i % 3 === 0;
+      const transport = new StreamableHTTPClientTransport(new URL(`${baseUrl}/mcp`), {
+        requestInit: {
+          headers: {
+            Authorization: `Bearer user-${i}`,
+            'x-ink-session-id': `session-${i}`,
+            'x-ink-caller-profile': runtime ? 'runtime' : 'agent',
+          },
+        },
+      });
+      const client = new Client(
+        { name: 'als-probe', version: '0.0.0' },
+        { versionNegotiation: { mode } }
+      );
+      try {
+        await client.connect(transport);
+        const result: any = await client.callTool({ name: 'echo_request_context', arguments: {} });
+        expect(result.isError).not.toBe(true);
+        const payload = JSON.parse(result.content[0].text);
+        expect(payload.before.userId).toBe(`user-${i}`);
+        expect(payload.before.sessionId).toBe(`session-${i}`);
+        expect(payload.before.callerProfile).toBe(runtime ? 'runtime' : 'agent');
+        expect(payload.after).toEqual(payload.before);
+        expect(payload.runtimeCatalog).toBe(runtime);
+      } finally {
+        await client.close();
+      }
+    };
+    await Promise.all(Array.from({ length: 12 }, (_, i) => check(i)));
   });
 
   it('should challenge unauthenticated initialize requests when OAuth is required', async () => {
