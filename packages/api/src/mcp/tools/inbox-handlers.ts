@@ -791,6 +791,38 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
               error: err instanceof Error ? err.message : String(err),
             });
           }
+          // Still nothing: the thread may have a HOME for this agent that no
+          // message of theirs established — a studio created FOR the thread binds
+          // its creator here (create_studio threadKey). The stamp is written only by
+          // the sanctioned assignment writer, and the trigger handler still
+          // verifies the session is alive before delivering, so this is a hint to
+          // resolution, never an overwrite.
+          if (!resolvedRecipientSessionId) {
+            try {
+              const { data: participant } = await threadTable(supabase, 'inbox_thread_participants')
+                .select('session_id')
+                .eq('thread_id', thread.id)
+                .eq('agent_id', toAgentId)
+                .maybeSingle();
+              if (participant?.session_id && typeof participant.session_id === 'string') {
+                resolvedRecipientSessionId = participant.session_id;
+                logger.debug(
+                  '[ThreadTrigger] Auto-resolved recipientSessionId from the participant stamp',
+                  {
+                    threadKey,
+                    toAgentId,
+                    recipientSessionId: resolvedRecipientSessionId,
+                  }
+                );
+              }
+            } catch (err) {
+              logger.warn('[ThreadTrigger] Failed to read the participant stamp', {
+                threadKey,
+                toAgentId,
+                error: err instanceof Error ? err.message : String(err),
+              });
+            }
+          }
         }
 
         // Targeted studio routing: propagate studioId/Hint to the trigger
@@ -1101,7 +1133,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
 /**
  * Find or create a thread. Returns the thread row with an `isNew` flag.
  */
-async function findOrCreateThread(
+export async function findOrCreateThread(
   supabase: ReturnType<DataComposer['getClient']>,
   opts: {
     userId: string;

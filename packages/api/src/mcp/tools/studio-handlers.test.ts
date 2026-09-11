@@ -38,10 +38,23 @@ vi.mock('../../services/studio-settings', () => ({
 // Defaults let the pre-existing bootstrap tests run unchanged: a caller with
 // no identifiable session, and a lease that grants. The provenance suite
 // below overrides per test.
-const { acquireMock, implicitMock, callerMock } = vi.hoisted(() => ({
-  acquireMock: vi.fn(async () => ({ acquired: true, lease: {} })),
-  implicitMock: vi.fn(async () => ({ session: null, reason: 'no-session' })),
-  callerMock: vi.fn(async () => ({ agentId: 'wren', sbId: undefined })),
+const { acquireMock, implicitMock, callerMock, findOrCreateThreadMock, assignMock } = vi.hoisted(
+  () => ({
+    acquireMock: vi.fn(async () => ({ acquired: true, lease: {} })),
+    implicitMock: vi.fn(async () => ({ session: null, reason: 'no-session' })),
+    callerMock: vi.fn(async () => ({ agentId: 'wren', sbId: undefined })),
+    findOrCreateThreadMock: vi.fn(async () => ({ id: 'thread-1', isNew: true })),
+    assignMock: vi.fn(async () => ({
+      sessionId: 'sess-1',
+      rerouted: false,
+      boundVia: 'explicit-anchor',
+      stampPersisted: true,
+    })),
+  })
+);
+vi.mock('./inbox-handlers', () => ({ findOrCreateThread: findOrCreateThreadMock }));
+vi.mock('../../services/sessions/thread-assignment', () => ({
+  assignThreadParticipant: assignMock,
 }));
 vi.mock('./memory-handlers', () => ({
   resolveCaller: callerMock,
@@ -239,15 +252,23 @@ describe('create_studio / adopt_studio provenance', () => {
       ...existing,
       sessionId,
     }));
+    const getSession = vi.fn(async (id: string) => ({
+      id,
+      userId: '00000000-0000-0000-0000-000000000001',
+      agentId: 'wren',
+      sbId: 'sb-1',
+      contactId: undefined,
+    }));
     const dc = {
       getClient: () => ({}),
       repositories: {
         studios: { create, update, findById, linkSession },
         projects: { findById: vi.fn() },
         activityStream: { logActivity },
+        memory: { getSession },
       },
     } as unknown as DataComposer;
-    return { dc, create, update, logActivity, findById, linkSession };
+    return { dc, create, update, logActivity, findById, linkSession, getSession };
   }
 
   beforeEach(() => {
@@ -259,6 +280,13 @@ describe('create_studio / adopt_studio provenance', () => {
     acquireMock.mockClear().mockResolvedValue({ acquired: true, lease: {} });
     callerMock.mockClear().mockResolvedValue({ agentId: 'wren', sbId: 'sb-1' });
     implicitMock.mockClear().mockResolvedValue({ session: { id: 'sess-1' }, via: 'context' });
+    findOrCreateThreadMock.mockClear().mockResolvedValue({ id: 'thread-1', isNew: true });
+    assignMock.mockClear().mockResolvedValue({
+      sessionId: 'sess-1',
+      rerouted: false,
+      boundVia: 'explicit-anchor',
+      stampPersisted: true,
+    });
   });
 
   afterEach(() => {
@@ -322,6 +350,161 @@ describe('create_studio / adopt_studio provenance', () => {
     expect(payload.lease).toEqual({ acquired: true, threadKey: 'pr:600' });
     expect(payload.ephemeral).toBe(true);
     expect(payload.provenance).toMatchObject({ sessionId: 'sess-1', logged: true });
+    // Delivery: the thread gets a home — this agent's participant row points at
+    // the creator's session, through the sanctioned writer, as an explicit anchor.
+    expect(findOrCreateThreadMock).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        threadKey: 'pr:600',
+        creatorAgentId: 'wren',
+        participants: ['wren'],
+      })
+    );
+    expect(assignMock).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        threadId: 'thread-1',
+        agentId: 'wren',
+        candidateSessionId: 'sess-1',
+        explicitAnchor: true,
+        source: 'create_studio',
+      })
+    );
+    expect(payload.routing).toEqual({
+      threadKey: 'pr:600',
+      patternInstalled: true,
+      home: {
+        threadId: 'thread-1',
+        threadCreated: true,
+        sessionId: 'sess-1',
+        boundVia: 'explicit-anchor',
+        persisted: true,
+      },
+    });
+    expect(payload.warnings).toEqual([]);
+    expect(entry.payload.routing).toMatchObject({
+      patternInstalled: true,
+      home: { sessionId: 'sess-1' },
+    });
+  });
+
+  it('a route-pattern failure is surfaced, not hidden behind success (Lumen, PR #605 P2)', async () => {
+    const { dc, update, logActivity } = composer();
+    update.mockRejectedValue(new Error('route update failed'));
+    const result = await handleCreateStudio(
+      {
+        agentId: 'wren',
+        repoRoot,
+        slug: 'noroute',
+        baseBranch: 'main',
+        skipGitOperations: true,
+        threadKey: 'pr:9',
+      },
+      dc
+    );
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.success).toBe(true); // the studio exists
+    expect(payload.routing).toMatchObject({
+      threadKey: 'pr:9',
+      patternInstalled: false,
+      patternError: 'route update failed',
+    });
+    expect(payload.warnings).toEqual(
+      expect.arrayContaining([expect.stringContaining('route pattern for pr:9 was NOT installed')])
+    );
+    expect(logActivity.mock.calls[0][0].payload.routing).toMatchObject({
+      patternInstalled: false,
+      patternError: 'route update failed',
+    });
+  });
+
+  it('a home-binding failure is surfaced too', async () => {
+    assignMock.mockRejectedValue(new Error('participant stamp failed'));
+    const { dc } = composer();
+    const result = await handleCreateStudio(
+      {
+        agentId: 'wren',
+        repoRoot,
+        slug: 'nohome',
+        baseBranch: 'main',
+        skipGitOperations: true,
+        threadKey: 'pr:10',
+      },
+      dc
+    );
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.routing).toMatchObject({
+      patternInstalled: true,
+      home: null,
+      homeError: 'participant stamp failed',
+    });
+    expect(payload.warnings).toEqual(
+      expect.arrayContaining([expect.stringContaining('thread home for pr:10 was NOT bound')])
+    );
+  });
+
+  it("an explicit sessionId that is not the caller's is refused before any side effect (Lumen, PR #605 P1)", async () => {
+    callerMock.mockResolvedValue({
+      agentId: 'wren',
+      sbId: 'sb-1',
+      agentBound: true,
+      contactId: null,
+    });
+    const { dc, create, logActivity, getSession } = composer();
+    getSession.mockResolvedValue({
+      id: SESSION,
+      userId: '00000000-0000-0000-0000-000000000001',
+      agentId: 'lumen',
+      sbId: 'other-sb',
+      contactId: undefined,
+    });
+    const result = await handleCreateStudio(
+      {
+        agentId: 'wren',
+        repoRoot,
+        slug: 'foreign',
+        baseBranch: 'main',
+        skipGitOperations: true,
+        sessionId: SESSION,
+        threadKey: 'pr:11',
+      },
+      dc
+    );
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.success).toBe(false);
+    expect(payload.error).toContain('belongs to another identity');
+    expect(getSession).toHaveBeenCalledWith(SESSION);
+    expect(create).not.toHaveBeenCalled();
+    expect(acquireMock).not.toHaveBeenCalled();
+    expect(logActivity).not.toHaveBeenCalled();
+    expect(assignMock).not.toHaveBeenCalled();
+  });
+
+  it('adopt_studio refuses a foreign sessionId before linking, leasing, or logging', async () => {
+    callerMock.mockResolvedValue({
+      agentId: 'wren',
+      sbId: 'sb-1',
+      agentBound: true,
+      contactId: null,
+    });
+    const { dc, linkSession, logActivity, getSession } = composer();
+    getSession.mockResolvedValue({
+      id: SESSION,
+      userId: '00000000-0000-0000-0000-000000000001',
+      agentId: 'lumen',
+      sbId: 'other-sb',
+      contactId: undefined,
+    });
+    const result = await handleAdoptStudio(
+      { agentId: 'wren', sessionId: SESSION, studioId: STUDIO, threadKey: 'pr:12' },
+      dc
+    );
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.success).toBe(false);
+    expect(payload.error).toContain('belongs to another identity');
+    expect(linkSession).not.toHaveBeenCalled();
+    expect(acquireMock).not.toHaveBeenCalled();
+    expect(logActivity).not.toHaveBeenCalled();
   });
 
   it('without a threadKey: a durable home studio, leased to the session itself, still logged', async () => {
