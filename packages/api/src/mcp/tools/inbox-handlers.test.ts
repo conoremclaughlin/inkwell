@@ -521,6 +521,8 @@ function createThreadMockSupabase(
     existingThread?: { id: string };
     recipientPriorMessage?: { metadata: Record<string, unknown> } | null;
     threadMessageId?: string;
+    /** The session_id already stamped on the recipient's participant row (a thread home). */
+    participantSessionId?: string | null;
   } = {}
 ) {
   const threadId = options.existingThread?.id || 'thread-999';
@@ -558,7 +560,7 @@ function createThreadMockSupabase(
       eq: vi.fn().mockReturnValue({
         eq: vi.fn().mockReturnValue({
           maybeSingle: vi.fn().mockResolvedValue({
-            data: { agent_id: 'existing', session_id: null },
+            data: { agent_id: 'existing', session_id: options.participantSessionId ?? null },
             error: null,
           }),
         }),
@@ -2492,5 +2494,87 @@ describe('handleGetInbox — channelPoll thread paging via get_unread_thread_can
     // poller sees an explicit incomplete signal and withholds drain proof.
     expect(parsed.channelPollIncomplete).toBe(true);
     expect(parsed.warning).toContain('channel_poll_incomplete');
+  });
+});
+
+// =====================================================
+// THREAD HOME → RECIPIENT SESSION (studio-model piece 1, PR #605)
+// =====================================================
+
+describe('handleSendToInbox — a thread home resolves the recipient session before routing', () => {
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    const { findThread, getParticipants, resolveTriggeredAgents } =
+      await import('./thread-handlers.js');
+    vi.mocked(findThread).mockResolvedValue({
+      id: 'thread-home',
+      thread_key: 'pr:600',
+      created_by_agent_id: 'wren',
+    } as never);
+    vi.mocked(getParticipants).mockResolvedValue(['wren', 'lumen']);
+    vi.mocked(resolveTriggeredAgents).mockReturnValue(['wren']);
+  });
+
+  it('uses the participant stamp when the recipient has never written on the thread', async () => {
+    // create_studio(threadKey) bound this thread's home to the creator's
+    // session before any message existed. The first reply must resolve to
+    // that session — otherwise routing plans a fresh session in the new
+    // studio and admission meets the creator's lease as a foreign holder
+    // (Lumen, PR #605 P2).
+    const { getAgentGateway } = await import('../../channels/agent-gateway.js');
+    const mockGateway = (getAgentGateway as ReturnType<typeof vi.fn>)();
+    const { getRequestContext, getSessionContext } = await import('../../utils/request-context');
+    vi.mocked(getRequestContext).mockReturnValue({ sessionId: 'lumen-session' } as never);
+    vi.mocked(getSessionContext).mockReturnValue(undefined as never);
+    const mockSb = createThreadMockSupabase({
+      existingThread: { id: 'thread-home' },
+      recipientPriorMessage: null,
+      participantSessionId: 'creator-sess',
+    });
+    const mockDc = createThreadMockDataComposer(mockSb);
+
+    const result = await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientAgentId: 'wren',
+        senderAgentId: 'lumen',
+        threadKey: 'pr:600',
+        content: 'first reply on the thread',
+        trigger: true,
+      },
+      mockDc as never
+    );
+    expect(JSON.parse(result.content[0].text).success).toBe(true);
+    expect(mockGateway.dispatchTrigger).toHaveBeenCalledWith(
+      expect.objectContaining({ toAgentId: 'wren', recipientSessionId: 'creator-sess' })
+    );
+  });
+
+  it('prefers thread history over the stamp when the recipient has written', async () => {
+    const { getAgentGateway } = await import('../../channels/agent-gateway.js');
+    const mockGateway = (getAgentGateway as ReturnType<typeof vi.fn>)();
+    const { getRequestContext, getSessionContext } = await import('../../utils/request-context');
+    vi.mocked(getRequestContext).mockReturnValue({ sessionId: 'lumen-session' } as never);
+    vi.mocked(getSessionContext).mockReturnValue(undefined as never);
+    const mockSb = createThreadMockSupabase({
+      existingThread: { id: 'thread-home' },
+      recipientPriorMessage: { metadata: { pcp: { sender: { sessionId: 'history-sess' } } } },
+      participantSessionId: 'creator-sess',
+    });
+    const mockDc = createThreadMockDataComposer(mockSb);
+    await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientAgentId: 'wren',
+        senderAgentId: 'lumen',
+        threadKey: 'pr:600',
+        content: 'a later reply',
+        trigger: true,
+      },
+      mockDc as never
+    );
+    expect(mockGateway.dispatchTrigger).toHaveBeenCalledWith(
+      expect.objectContaining({ toAgentId: 'wren', recipientSessionId: 'history-sess' })
+    );
   });
 });

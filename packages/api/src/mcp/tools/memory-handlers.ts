@@ -104,9 +104,9 @@ function resolveStudioScope(rawStudioId: string | undefined): string | null | un
 }
 
 /** Why an implicit session lookup came back empty — shapes the error the caller sees. */
-type ImplicitSessionFailure = 'no-agent-identity' | 'no-session' | 'ambiguous';
+export type ImplicitSessionFailure = 'no-agent-identity' | 'no-session' | 'ambiguous';
 
-type ImplicitSessionResult =
+export type ImplicitSessionResult =
   | { session: Session; via: 'context' | 'lookup' }
   | { session: null; reason: ImplicitSessionFailure; candidateCount?: number };
 
@@ -128,7 +128,7 @@ type ImplicitSessionResult =
  * contact-scoped session to it. That matches resolveObservePermission, which
  * already denies contact sessions to agents outright.
  */
-async function resolveCaller(
+export async function resolveCaller(
   _dataComposer: DataComposer,
   _userId: string,
   explicitAgentId?: string
@@ -175,7 +175,7 @@ function unauthorizedSessionError(toolName: string): string {
  * Returns `no-agent-identity` when the caller cannot be identified. Callers MUST
  * fail closed on that: an unscoped query is what caused the cross-agent write.
  */
-async function resolveImplicitSession(
+export async function resolveImplicitSession(
   dataComposer: DataComposer,
   userId: string,
   caller: CallerIdentity,

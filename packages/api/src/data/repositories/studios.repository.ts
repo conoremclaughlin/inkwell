@@ -75,6 +75,8 @@ export interface CreateStudioInput {
 }
 
 export interface UpdateStudioInput {
+  /** Provenance / candidate selection: the thread this studio is for. */
+  threadKey?: string | null;
   status?: StudioStatus;
   sessionId?: string | null;
   purpose?: string;
@@ -375,6 +377,7 @@ export class StudiosRepository {
     if (input.defaultProjectId !== undefined)
       updateData.default_project_id = input.defaultProjectId;
     if (input.metadata !== undefined) updateData.metadata = input.metadata;
+    if (input.threadKey !== undefined) updateData.thread_key = input.threadKey;
     if (input.archivedAt !== undefined) updateData.archived_at = input.archivedAt;
     if (input.cleanedAt !== undefined) updateData.cleaned_at = input.cleanedAt;
     if (input.expiresAt !== undefined) updateData.expires_at = input.expiresAt;
