@@ -115,6 +115,29 @@ export function stopHeartbeatService(): void {
 }
 
 /**
+ * What a delivery attempt actually did.
+ *
+ * A bare boolean was the whole reporting surface until 2026-09-11, and it is
+ * why eight consecutive failed heartbeats produced exactly as much noise as
+ * zero: the callback knew the backend was logged out, `false` could not carry
+ * that, and the recorded reason was the literal string
+ * "Delivery callback returned false". The error is the only part of a failed
+ * beat worth keeping — carry it.
+ */
+export interface HeartbeatDeliveryOutcome {
+  delivered: boolean;
+  /** The failure as the delivery path saw it. Recorded and escalated verbatim. */
+  error?: string;
+}
+
+/** Callbacks may still return a bare boolean; it means "no detail available". */
+export type HeartbeatDeliverResult = boolean | HeartbeatDeliveryOutcome;
+
+function normalizeDeliveryOutcome(result: HeartbeatDeliverResult): HeartbeatDeliveryOutcome {
+  return typeof result === 'boolean' ? { delivered: result } : result;
+}
+
+/**
  * Process heartbeat - query due reminders and deliver via callback.
  *
  * The `deliver` callback is how the caller wakes the agent. Typically this
@@ -123,9 +146,16 @@ export function stopHeartbeatService(): void {
  *
  * If no callback is provided, reminders are still queried and logged
  * but not delivered (useful for dry runs or external HTTP triggers).
+ *
+ * `onFailure` is the escalation hook. Heartbeats never enter the agent
+ * gateway — `deliverReminderViaSession` calls sessionService.handleMessage()
+ * directly — so the `trigger:error` → `[TriggerFailure]` machinery that
+ * reports every OTHER kind of failed delivery has no path to a failed beat.
+ * This is that path.
  */
 export async function processHeartbeat(
-  deliver?: (reminder: DueReminder) => Promise<boolean>
+  deliver?: (reminder: DueReminder) => Promise<HeartbeatDeliverResult>,
+  onFailure?: (reminder: DueReminder, error: string) => Promise<void>
 ): Promise<{
   processed: number;
   delivered: number;
@@ -204,33 +234,75 @@ export async function processHeartbeat(
       }
 
       // Deliver via caller-provided callback
-      let delivered = false;
+      let outcome: HeartbeatDeliveryOutcome = { delivered: false };
       if (deliver) {
-        delivered = await deliver(reminder);
+        outcome = normalizeDeliveryOutcome(await deliver(reminder));
       } else {
         logger.warn(`No deliver callback for reminder ${reminder.id} - skipping`);
+        outcome = { delivered: false, error: 'no deliver callback registered' };
       }
 
-      if (delivered) {
+      if (outcome.delivered) {
         stats.delivered++;
         await recordDeliveryAttempt(reminder.id, 'delivered');
       } else {
         stats.failed++;
-        await recordDeliveryAttempt(reminder.id, 'failed', 'Delivery callback returned false');
+        const reason = outcome.error || 'delivery reported failure with no detail';
+        // error, not info. A beat that did not run is the monitor failing,
+        // and it belongs in error.log where a failing monitor is looked for.
+        logger.error('[Heartbeat] Delivery FAILED', {
+          reminderId: reminder.id,
+          title: reminder.title,
+          sbId: reminder.sb_id,
+          deliveryChannel: reminder.delivery_channel,
+          error: reason,
+        });
+        await recordDeliveryAttempt(reminder.id, 'failed', reason);
+        await escalate(reminder, reason, onFailure);
       }
     } catch (error) {
       logger.error(`Failed to process reminder ${reminder.id}:`, error);
       stats.failed++;
-      await recordDeliveryAttempt(
-        reminder.id,
-        'failed',
-        error instanceof Error ? error.message : 'Unknown error'
-      );
+      const reason = error instanceof Error ? error.message : 'Unknown error';
+      await recordDeliveryAttempt(reminder.id, 'failed', reason);
+      // A throw is exactly as silent as a false return — escalate both.
+      await escalate(reminder, reason, onFailure);
     }
   }
 
-  logger.info('Heartbeat processing complete', stats);
+  // A tick with failures is not a routine completion. Logging the whole run at
+  // info was the last place the twelve-hour outage could have surfaced and
+  // did not.
+  if (stats.failed > 0) {
+    logger.error('Heartbeat processing complete WITH FAILURES', stats);
+  } else {
+    logger.info('Heartbeat processing complete', stats);
+  }
   return stats;
+}
+
+/**
+ * Report a failed beat to whoever can act on it.
+ *
+ * Never throws: escalation runs inside the per-reminder catch, and an
+ * escalation that breaks the loop would take the remaining reminders down
+ * with it — turning one silent failure into several.
+ */
+async function escalate(
+  reminder: DueReminder,
+  reason: string,
+  onFailure?: (reminder: DueReminder, error: string) => Promise<void>
+): Promise<void> {
+  if (!onFailure) return;
+  try {
+    await onFailure(reminder, reason);
+  } catch (err) {
+    logger.error('[Heartbeat] Escalation itself failed', {
+      reminderId: reminder.id,
+      originalError: reason,
+      escalationError: err instanceof Error ? err.message : String(err),
+    });
+  }
 }
 
 /**

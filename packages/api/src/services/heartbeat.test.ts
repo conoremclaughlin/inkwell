@@ -860,4 +860,120 @@ describe('Heartbeat Service', () => {
       expect(stats.skipped).toBe(1);
     });
   });
+
+  // ═══════════════════════════════════════════════════════════════
+  // Failure reporting (2026-09-11)
+  //
+  // Eight of nine of Myra's heartbeats failed over twelve hours and
+  // produced exactly as much noise as zero failures. Two reasons, both
+  // covered here: the real error could not survive a boolean return, and
+  // nothing was notified because heartbeats never enter the agent gateway
+  // where the `[TriggerFailure]` escalation lives.
+  // ═══════════════════════════════════════════════════════════════
+  describe('processHeartbeat - failure is loud', () => {
+    const AUTH_ERROR = 'Backend claude is not authenticated (not logged in)';
+
+    it('records the delivery error verbatim instead of a generic reason', async () => {
+      initHeartbeatService({ enableLocalCron: false });
+
+      setQueryResult('scheduled_reminders', [makeDueReminder()]);
+
+      const stats = await processHeartbeat(
+        vi.fn().mockResolvedValue({ delivered: false, error: AUTH_ERROR })
+      );
+
+      expect(stats.failed).toBe(1);
+      const historyBuilder = tableBuilders.get('reminder_history')!;
+      expect(historyBuilder.insert).toHaveBeenCalledWith(
+        expect.objectContaining({ reminder_id: 'rem-001', error_message: AUTH_ERROR })
+      );
+    });
+
+    it('escalates a failed beat with the real error', async () => {
+      initHeartbeatService({ enableLocalCron: false });
+
+      setQueryResult('scheduled_reminders', [makeDueReminder()]);
+
+      const onFailure = vi.fn().mockResolvedValue(undefined);
+      await processHeartbeat(
+        vi.fn().mockResolvedValue({ delivered: false, error: AUTH_ERROR }),
+        onFailure
+      );
+
+      expect(onFailure).toHaveBeenCalledTimes(1);
+      expect(onFailure).toHaveBeenCalledWith(
+        expect.objectContaining({ id: 'rem-001' }),
+        AUTH_ERROR
+      );
+    });
+
+    it('escalates when the deliver callback throws', async () => {
+      initHeartbeatService({ enableLocalCron: false });
+
+      setQueryResult('scheduled_reminders', [makeDueReminder()]);
+
+      const onFailure = vi.fn().mockResolvedValue(undefined);
+      await processHeartbeat(vi.fn().mockRejectedValue(new Error('spawn ENOENT')), onFailure);
+
+      expect(onFailure).toHaveBeenCalledWith(
+        expect.objectContaining({ id: 'rem-001' }),
+        'spawn ENOENT'
+      );
+    });
+
+    it('does not escalate a delivered beat', async () => {
+      initHeartbeatService({ enableLocalCron: false });
+
+      setQueryResult('scheduled_reminders', [makeDueReminder()]);
+      setQueryResult('scheduled_reminders', [{ id: 'rem-001' }]); // claim CAS win
+
+      const onFailure = vi.fn().mockResolvedValue(undefined);
+      const stats = await processHeartbeat(
+        vi.fn().mockResolvedValue({ delivered: true }),
+        onFailure
+      );
+
+      expect(stats.delivered).toBe(1);
+      expect(onFailure).not.toHaveBeenCalled();
+    });
+
+    it('still accepts a bare boolean, and says the detail is missing', async () => {
+      initHeartbeatService({ enableLocalCron: false });
+
+      setQueryResult('scheduled_reminders', [makeDueReminder()]);
+
+      const onFailure = vi.fn().mockResolvedValue(undefined);
+      const stats = await processHeartbeat(vi.fn().mockResolvedValue(false), onFailure);
+
+      expect(stats.failed).toBe(1);
+      // The reason must not be the old placeholder, and must not be empty —
+      // it has to say that no detail was available.
+      const reason = onFailure.mock.calls[0][1] as string;
+      expect(reason).not.toBe('Delivery callback returned false');
+      expect(reason).toMatch(/no detail/i);
+    });
+
+    it('keeps processing later reminders when escalation itself throws', async () => {
+      initHeartbeatService({ enableLocalCron: false });
+
+      setQueryResult('scheduled_reminders', [
+        makeDueReminder({ id: 'rem-001' }),
+        makeDueReminder({ id: 'rem-002' }),
+      ]); // select due
+      // One claim result per reminder — the CAS wins on exactly one row.
+      setQueryResult('scheduled_reminders', [{ id: 'rem-001' }]);
+      setQueryResult('scheduled_reminders', [{ id: 'rem-002' }]);
+
+      const deliver = vi.fn().mockResolvedValue({ delivered: false, error: AUTH_ERROR });
+      const onFailure = vi.fn().mockRejectedValue(new Error('inbox insert failed'));
+
+      const stats = await processHeartbeat(deliver, onFailure);
+
+      // Both reminders were attempted — a broken escalation must not take the
+      // rest of the tick down with it.
+      expect(deliver).toHaveBeenCalledTimes(2);
+      expect(onFailure).toHaveBeenCalledTimes(2);
+      expect(stats.failed).toBe(2);
+    });
+  });
 });
