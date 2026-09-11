@@ -118,6 +118,9 @@ import {
 // ─── Helpers ───
 const TEST_USER_ID = '00000000-0000-0000-0000-000000000001';
 
+/** The escalation context of the first beat to reach a destination in a run. */
+const FIRST_FOR_DESTINATION = { destinationAlreadyAlerted: false };
+
 function makeDueReminder(overrides: Record<string, unknown> = {}) {
   return {
     id: 'rem-001',
@@ -904,7 +907,8 @@ describe('Heartbeat Service', () => {
       expect(onFailure).toHaveBeenCalledWith(
         expect.objectContaining({ id: 'rem-001' }),
         AUTH_ERROR,
-        1
+        1,
+        FIRST_FOR_DESTINATION
       );
     });
 
@@ -919,7 +923,8 @@ describe('Heartbeat Service', () => {
       expect(onFailure).toHaveBeenCalledWith(
         expect.objectContaining({ id: 'rem-001' }),
         'spawn ENOENT',
-        1
+        1,
+        FIRST_FOR_DESTINATION
       );
     });
 
@@ -1006,6 +1011,85 @@ describe('Heartbeat Service', () => {
       setQueryResult('reminder_history', { id: 'hist-001' });
     }
 
+    /**
+     * Myra's two active beats: different reminders, one SB, one Telegram chat,
+     * and cron expressions that collide at 16:00Z every day. Reported by her
+     * on 2026-09-11 against this branch.
+     */
+    function makeCollidingBeats() {
+      return [
+        makeDueReminder({ id: 'rem-hourly', sb_id: 'sb-myra', cron_expression: '0 * * * *' }),
+        makeDueReminder({ id: 'rem-daily', sb_id: 'sb-myra', cron_expression: '0 9 * * *' }),
+      ];
+    }
+
+    it('tells only the first of two colliding beats to alert the destination', async () => {
+      initHeartbeatService({ enableLocalCron: false });
+
+      setQueryResult('scheduled_reminders', makeCollidingBeats());
+      // Both beats win their claim CAS, then both fail on the same backend.
+      setQueryResult('scheduled_reminders', [{ id: 'rem-hourly' }]);
+      setQueryResult('scheduled_reminders', [{ id: 'rem-daily' }]);
+
+      const onFailure = vi.fn().mockResolvedValue(undefined);
+      await processHeartbeat(
+        vi.fn().mockResolvedValue({ status: 'failed', error: AUTH_ERROR }),
+        onFailure
+      );
+
+      // Both still escalate — the durable inbox row is per-beat and both
+      // monitors genuinely stopped. It is the unsolicited message to the human
+      // that collapses, and the flag is what collapses it.
+      expect(onFailure).toHaveBeenCalledTimes(2);
+      expect(onFailure.mock.calls[0][3]).toEqual({ destinationAlreadyAlerted: false });
+      expect(onFailure.mock.calls[1][3]).toEqual({ destinationAlreadyAlerted: true });
+    });
+
+    it('does not collapse beats that reach different destinations', async () => {
+      initHeartbeatService({ enableLocalCron: false });
+
+      // Same SB, same channel, different chat — two people to tell, so the
+      // second is not a duplicate of the first.
+      setQueryResult('scheduled_reminders', [
+        makeDueReminder({ id: 'rem-a', sb_id: 'sb-myra', delivery_target: 'chat-1' }),
+        makeDueReminder({ id: 'rem-b', sb_id: 'sb-myra', delivery_target: 'chat-2' }),
+      ]);
+      setQueryResult('scheduled_reminders', [{ id: 'rem-a' }]);
+      setQueryResult('scheduled_reminders', [{ id: 'rem-b' }]);
+
+      const onFailure = vi.fn().mockResolvedValue(undefined);
+      await processHeartbeat(
+        vi.fn().mockResolvedValue({ status: 'failed', error: AUTH_ERROR }),
+        onFailure
+      );
+
+      expect(onFailure).toHaveBeenCalledTimes(2);
+      expect(onFailure.mock.calls[0][3]).toEqual({ destinationAlreadyAlerted: false });
+      expect(onFailure.mock.calls[1][3]).toEqual({ destinationAlreadyAlerted: false });
+    });
+
+    it('leaves beats with no owning SB to dedupe on their own streak', async () => {
+      initHeartbeatService({ enableLocalCron: false });
+
+      // No sb_id means no destination key, so nothing is claimed and nothing
+      // is suppressed — two ownerless beats must not silence each other.
+      setQueryResult('scheduled_reminders', [
+        makeDueReminder({ id: 'rem-a', sb_id: null }),
+        makeDueReminder({ id: 'rem-b', sb_id: null }),
+      ]);
+      setQueryResult('scheduled_reminders', [{ id: 'rem-a' }]);
+      setQueryResult('scheduled_reminders', [{ id: 'rem-b' }]);
+
+      const onFailure = vi.fn().mockResolvedValue(undefined);
+      await processHeartbeat(
+        vi.fn().mockResolvedValue({ status: 'failed', error: AUTH_ERROR }),
+        onFailure
+      );
+
+      expect(onFailure.mock.calls[0][3]).toEqual({ destinationAlreadyAlerted: false });
+      expect(onFailure.mock.calls[1][3]).toEqual({ destinationAlreadyAlerted: false });
+    });
+
     it('derives the consecutive count from history, not from process memory', async () => {
       initHeartbeatService({ enableLocalCron: false });
 
@@ -1023,7 +1107,8 @@ describe('Heartbeat Service', () => {
       expect(onFailure).toHaveBeenCalledWith(
         expect.objectContaining({ id: 'rem-001' }),
         AUTH_ERROR,
-        4
+        4,
+        FIRST_FOR_DESTINATION
       );
     });
 
@@ -1041,7 +1126,12 @@ describe('Heartbeat Service', () => {
         onFailure
       );
 
-      expect(onFailure).toHaveBeenCalledWith(expect.anything(), AUTH_ERROR, 2);
+      expect(onFailure).toHaveBeenCalledWith(
+        expect.anything(),
+        AUTH_ERROR,
+        2,
+        FIRST_FOR_DESTINATION
+      );
     });
 
     it('announces recovery when a beat lands after failures', async () => {
@@ -1059,7 +1149,11 @@ describe('Heartbeat Service', () => {
       );
 
       expect(stats.delivered).toBe(1);
-      expect(onRecovery).toHaveBeenCalledWith(expect.objectContaining({ id: 'rem-001' }), 2);
+      expect(onRecovery).toHaveBeenCalledWith(
+        expect.objectContaining({ id: 'rem-001' }),
+        2,
+        FIRST_FOR_DESTINATION
+      );
     });
 
     it('does not announce recovery when the beat was never failing', async () => {
@@ -1160,7 +1254,12 @@ describe('Heartbeat Service', () => {
 
       // Unknown streak fails toward alerting, never toward silence.
       expect(stats.failed).toBe(1);
-      expect(onFailure).toHaveBeenCalledWith(expect.anything(), AUTH_ERROR, 1);
+      expect(onFailure).toHaveBeenCalledWith(
+        expect.anything(),
+        AUTH_ERROR,
+        1,
+        FIRST_FOR_DESTINATION
+      );
     });
   });
 });

@@ -38,11 +38,26 @@
  * resolution is its own kind of noise — it leaves the human holding a failure
  * notice, having to ask the SB whether it is back, and if it is not back it
  * cannot answer.
+ *
+ * "Per outage" means per SB, not per beat, and that distinction is load-bearing
+ * because the streak backing it is per-REMINDER. An SB owning several beats
+ * fails them all from one logged-out backend, each with its own streak of 1 —
+ * so each clears the streak guard and each alerts. Myra has two active beats
+ * whose crons collide at 16:00Z daily, delivering to the same Telegram chat:
+ * one cause, two alarms, in the same second. She found it on 2026-09-11, and
+ * `destinationAlreadyAlerted` is the answer — the first beat to reach a given
+ * SB+channel+address speaks for the rest of that run, on both edges. The inbox
+ * copy stays per-beat, because there the detail is the point.
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { Database } from '../data/supabase/types.js';
-import type { DueReminder } from './heartbeat.js';
+import type {
+  DueReminder,
+  HeartbeatEscalationContext,
+  HeartbeatFailureHook,
+  HeartbeatRecoveryHook,
+} from './heartbeat.js';
 import type { ChannelResponse, ChannelType } from './sessions/types.js';
 import { classifyError } from '@inklabs/shared';
 import { logger } from '../utils/logger.js';
@@ -72,8 +87,8 @@ export interface HeartbeatEscalationDeps {
 }
 
 export interface HeartbeatEscalation {
-  onFailure: (reminder: DueReminder, error: string, consecutive: number) => Promise<void>;
-  onRecovery: (reminder: DueReminder, failedBeats: number) => Promise<void>;
+  onFailure: HeartbeatFailureHook;
+  onRecovery: HeartbeatRecoveryHook;
 }
 
 export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): HeartbeatEscalation {
@@ -135,7 +150,8 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
   const onFailure = async (
     reminder: DueReminder,
     error: string,
-    consecutive: number
+    consecutive: number,
+    context: HeartbeatEscalationContext
   ): Promise<void> => {
     const failedAgentId = await resolveFailedAgentId(reminder);
     const classification = classifyError({ errorText: error });
@@ -180,6 +196,21 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
       return;
     }
 
+    // Two guards, two different duplicates. The one above catches the SAME beat
+    // failing again; this one catches a DIFFERENT beat of the same SB failing
+    // from the same cause. Both of Myra's active beats are due at 16:00Z, so a
+    // logged-out backend fails them in one tick, each on its own first failure
+    // with its own streak of 1 — and without this, both alert.
+    if (context.destinationAlreadyAlerted) {
+      logger.warn('[Heartbeat] Sibling beat already alerted this destination — inbox only', {
+        reminderId: reminder.id,
+        agentId: failedAgentId,
+        channel: reminder.delivery_channel,
+        category: classification.category,
+      });
+      return;
+    }
+
     const alert = await alertOwnerDirectly(
       reminder,
       `⚠️ Heartbeat FAILED: "${reminder.title}"\n\n` +
@@ -199,7 +230,23 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
     });
   };
 
-  const onRecovery = async (reminder: DueReminder, failedBeats: number): Promise<void> => {
+  const onRecovery = async (
+    reminder: DueReminder,
+    failedBeats: number,
+    context: HeartbeatEscalationContext
+  ): Promise<void> => {
+    // Same collapse on the way out. One "back up" per destination per run —
+    // otherwise the two beats that alerted together also clear together, and
+    // the fix for duplicate alarms ships duplicate all-clears.
+    if (context.destinationAlreadyAlerted) {
+      logger.info('[Heartbeat] Sibling beat already announced recovery — staying quiet', {
+        reminderId: reminder.id,
+        channel: reminder.delivery_channel,
+        failedBeats,
+      });
+      return;
+    }
+
     const alert = await alertOwnerDirectly(
       reminder,
       `✅ Heartbeat recovered: "${reminder.title}"\n\n` +

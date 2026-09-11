@@ -54,6 +54,38 @@ interface HeartbeatConfig {
  */
 const FAILURE_STREAK_LOOKBACK = 50;
 
+/**
+ * The `reminder_history` column the streak sorts by.
+ *
+ * Exported so the integration tier can run the sort against the real table
+ * rather than a mock. A mocked `order()` returns the builder for ANY string,
+ * so the unit tier cannot tell a real column from a typo — and a typo here is
+ * silent and total: PostgREST fails the sort with 42703, the catch turns that
+ * into a streak of 0, every failed beat then reads as its own first, and the
+ * result is an alert on EVERY beat and an all-clear on none. Shipped exactly
+ * that way on this branch until Myra's report sent me back to the schema.
+ */
+export const FAILURE_STREAK_ORDER_COLUMN = 'triggered_at';
+
+/**
+ * Who an outage alert would reach: a given SB, on a given channel, at a given
+ * address. `null` when the beat has no owning SB, which leaves it to dedupe on
+ * its own streak alone.
+ *
+ * The failure streak is per-REMINDER, but the failures worth alerting on are
+ * per-BACKEND: a logged-out backend fails every beat its SB owns, each with an
+ * independent streak of 1, so each alerts. Myra owns two active beats whose
+ * crons collide at 16:00Z daily — one cause, two alerts, two counts, landing in
+ * the same Telegram chat in the same second. She found it on 2026-09-11.
+ *
+ * Collapsing on this key holds the module's promise — two messages per outage,
+ * not two per beat — for every beat that shares a destination.
+ */
+function alertDestination(reminder: DueReminder): string | null {
+  if (!reminder.sb_id) return null;
+  return `${reminder.sb_id}|${reminder.delivery_channel}|${reminder.delivery_target}`;
+}
+
 // Singleton state
 let cronTask: ReturnType<typeof cron.schedule> | null = null;
 let supabase: SupabaseClient<Database> | null = null;
@@ -148,6 +180,31 @@ export type HeartbeatDeliveryOutcome =
 /** Callbacks may still return a bare boolean; it means "no detail available". */
 export type HeartbeatDeliverResult = boolean | HeartbeatDeliveryOutcome;
 
+/**
+ * What else this run already said to the same place.
+ *
+ * `destinationAlreadyAlerted` means a sibling beat — same SB, same channel,
+ * same address — has already produced this run's outage alert or all-clear.
+ * The durable per-reminder record is still written either way; it is only the
+ * unsolicited message to the human that collapses.
+ */
+export interface HeartbeatEscalationContext {
+  destinationAlreadyAlerted: boolean;
+}
+
+export type HeartbeatFailureHook = (
+  reminder: DueReminder,
+  error: string,
+  consecutive: number,
+  context: HeartbeatEscalationContext
+) => Promise<void>;
+
+export type HeartbeatRecoveryHook = (
+  reminder: DueReminder,
+  failedBeats: number,
+  context: HeartbeatEscalationContext
+) => Promise<void>;
+
 function normalizeDeliveryOutcome(result: HeartbeatDeliverResult): HeartbeatDeliveryOutcome {
   if (typeof result !== 'boolean') return result;
   return result ? { status: 'delivered' } : { status: 'failed' };
@@ -182,8 +239,8 @@ function normalizeDeliveryOutcome(result: HeartbeatDeliverResult): HeartbeatDeli
  */
 export async function processHeartbeat(
   deliver?: (reminder: DueReminder) => Promise<HeartbeatDeliverResult>,
-  onFailure?: (reminder: DueReminder, error: string, consecutive: number) => Promise<void>,
-  onRecovery?: (reminder: DueReminder, failedBeats: number) => Promise<void>
+  onFailure?: HeartbeatFailureHook,
+  onRecovery?: HeartbeatRecoveryHook
 ): Promise<{
   processed: number;
   delivered: number;
@@ -219,6 +276,24 @@ export async function processHeartbeat(
   }
 
   logger.info(`Found ${dueReminders.length} due reminders`);
+
+  // Destinations already told about an outage — or an all-clear — in THIS run.
+  // Scoped to the run rather than to a clock window because "the same tick" is
+  // exactly the collision being collapsed, and a duration would be a guess
+  // about how long a tick takes. Beats far enough apart to land in different
+  // runs still alert separately, and their own durable streak is what stops
+  // them repeating.
+  const alertedThisRun = new Set<string>();
+  const recoveredThisRun = new Set<string>();
+
+  /** Records the destination and reports whether it had already been told. */
+  const claimDestination = (seen: Set<string>, reminder: DueReminder): boolean => {
+    const destination = alertDestination(reminder);
+    if (!destination) return false;
+    if (seen.has(destination)) return true;
+    seen.add(destination);
+    return false;
+  };
 
   // Process each reminder
   for (const reminder of dueReminders as DueReminder[]) {
@@ -280,7 +355,12 @@ export async function processHeartbeat(
         stats.delivered++;
         await recordDeliveryAttempt(reminder.id, 'delivered');
         if (priorFailures > 0) {
-          await announceRecovery(reminder, priorFailures, onRecovery);
+          await announceRecovery(
+            reminder,
+            priorFailures,
+            onRecovery,
+            claimDestination(recoveredThisRun, reminder)
+          );
         }
       } else if (outcome.status === 'skipped') {
         // Deliberate no-op — a self-cancelling watchdog on a finished group,
@@ -305,7 +385,13 @@ export async function processHeartbeat(
           error: reason,
         });
         await recordDeliveryAttempt(reminder.id, 'failed', reason);
-        await escalate(reminder, reason, priorFailures + 1, onFailure);
+        await escalate(
+          reminder,
+          reason,
+          priorFailures + 1,
+          onFailure,
+          claimDestination(alertedThisRun, reminder)
+        );
       }
     } catch (error) {
       logger.error(`Failed to process reminder ${reminder.id}:`, error);
@@ -314,7 +400,13 @@ export async function processHeartbeat(
       const priorFailures = await consecutiveFailureCount(reminder.id);
       await recordDeliveryAttempt(reminder.id, 'failed', reason);
       // A throw is exactly as silent as a false return — escalate both.
-      await escalate(reminder, reason, priorFailures + 1, onFailure);
+      await escalate(
+        reminder,
+        reason,
+        priorFailures + 1,
+        onFailure,
+        claimDestination(alertedThisRun, reminder)
+      );
     }
   }
 
@@ -340,11 +432,12 @@ async function escalate(
   reminder: DueReminder,
   reason: string,
   consecutive: number,
-  onFailure?: (reminder: DueReminder, error: string, consecutive: number) => Promise<void>
+  onFailure?: HeartbeatFailureHook,
+  destinationAlreadyAlerted = false
 ): Promise<void> {
   if (!onFailure) return;
   try {
-    await onFailure(reminder, reason, consecutive);
+    await onFailure(reminder, reason, consecutive, { destinationAlreadyAlerted });
   } catch (err) {
     logger.error('[Heartbeat] Escalation itself failed', {
       reminderId: reminder.id,
@@ -364,7 +457,8 @@ async function escalate(
 async function announceRecovery(
   reminder: DueReminder,
   failedBeats: number,
-  onRecovery?: (reminder: DueReminder, failedBeats: number) => Promise<void>
+  onRecovery?: HeartbeatRecoveryHook,
+  destinationAlreadyAlerted = false
 ): Promise<void> {
   logger.info('[Heartbeat] Recovered after failures', {
     reminderId: reminder.id,
@@ -373,7 +467,7 @@ async function announceRecovery(
   });
   if (!onRecovery) return;
   try {
-    await onRecovery(reminder, failedBeats);
+    await onRecovery(reminder, failedBeats, { destinationAlreadyAlerted });
   } catch (err) {
     logger.error('[Heartbeat] Recovery notice itself failed', {
       reminderId: reminder.id,
@@ -409,7 +503,7 @@ async function consecutiveFailureCount(reminderId: string): Promise<number> {
       .select('status')
       .eq('reminder_id', reminderId)
       .in('status', ['delivered', 'failed'])
-      .order('created_at', { ascending: false })
+      .order(FAILURE_STREAK_ORDER_COLUMN, { ascending: false })
       .limit(FAILURE_STREAK_LOOKBACK);
 
     if (error) {

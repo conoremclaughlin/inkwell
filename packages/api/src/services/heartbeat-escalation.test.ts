@@ -17,6 +17,9 @@ vi.mock('../utils/logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
+/** The escalation context of the first beat to reach a destination in a run. */
+const FIRST_FOR_DESTINATION = { destinationAlreadyAlerted: false };
+
 const AUTH_ERROR = 'Backend claude is not authenticated (not logged in)';
 
 function makeReminder(overrides: Partial<DueReminder> = {}): DueReminder {
@@ -79,7 +82,7 @@ describe('heartbeat escalation', () => {
         defaultAgentId: 'myra',
       });
 
-      await onFailure(makeReminder(), AUTH_ERROR, 1);
+      await onFailure(makeReminder(), AUTH_ERROR, 1, FIRST_FOR_DESTINATION);
 
       expect(insert).toHaveBeenCalledTimes(1);
       expect(sendToChannel).toHaveBeenCalledTimes(1);
@@ -103,7 +106,8 @@ describe('heartbeat escalation', () => {
       await onFailure(
         makeReminder({ delivery_channel: 'discord', delivery_target: 'chan-42' }),
         AUTH_ERROR,
-        1
+        1,
+        FIRST_FOR_DESTINATION
       );
 
       expect(sendToChannel.mock.calls[0][0]).toMatchObject({
@@ -123,7 +127,8 @@ describe('heartbeat escalation', () => {
       await onFailure(
         makeReminder({ delivery_channel: 'heartbeat', delivery_target: null }),
         AUTH_ERROR,
-        1
+        1,
+        FIRST_FOR_DESTINATION
       );
 
       // A notice sent there would land right back in the broken path. The
@@ -141,7 +146,9 @@ describe('heartbeat escalation', () => {
         defaultAgentId: 'myra',
       });
 
-      await expect(onFailure(makeReminder(), AUTH_ERROR, 1)).resolves.toBeUndefined();
+      await expect(
+        onFailure(makeReminder(), AUTH_ERROR, 1, FIRST_FOR_DESTINATION)
+      ).resolves.toBeUndefined();
       expect(insert).toHaveBeenCalledTimes(1);
     });
   });
@@ -155,7 +162,7 @@ describe('heartbeat escalation', () => {
         defaultAgentId: 'myra',
       });
 
-      await onFailure(makeReminder(), AUTH_ERROR, 1);
+      await onFailure(makeReminder(), AUTH_ERROR, 1, FIRST_FOR_DESTINATION);
       expect(sendToChannel).toHaveBeenCalledTimes(1);
     });
 
@@ -168,7 +175,7 @@ describe('heartbeat escalation', () => {
       });
 
       for (const consecutive of [2, 3, 4, 5, 6, 7, 8]) {
-        await onFailure(makeReminder(), AUTH_ERROR, consecutive);
+        await onFailure(makeReminder(), AUTH_ERROR, consecutive, FIRST_FOR_DESTINATION);
       }
 
       // Myra's twelve hours: eight failures, one alert (sent on beat 1), and
@@ -185,7 +192,7 @@ describe('heartbeat escalation', () => {
         defaultAgentId: 'myra',
       });
 
-      await onRecovery(makeReminder(), 8);
+      await onRecovery(makeReminder(), 8, FIRST_FOR_DESTINATION);
 
       expect(sendToChannel).toHaveBeenCalledTimes(1);
       const sent = sendToChannel.mock.calls[0][0];
@@ -203,7 +210,7 @@ describe('heartbeat escalation', () => {
         defaultAgentId: 'myra',
       });
 
-      await expect(onRecovery(makeReminder(), 3)).resolves.toBeUndefined();
+      await expect(onRecovery(makeReminder(), 3, FIRST_FOR_DESTINATION)).resolves.toBeUndefined();
     });
   });
 
@@ -221,7 +228,9 @@ describe('heartbeat escalation', () => {
         defaultAgentId: 'myra',
       });
 
-      await expect(onFailure(makeReminder(), AUTH_ERROR, 1)).rejects.toThrow(/permission denied/);
+      await expect(onFailure(makeReminder(), AUTH_ERROR, 1, FIRST_FOR_DESTINATION)).rejects.toThrow(
+        /permission denied/
+      );
     });
 
     it('does not report an alert as sent when the inbox write failed', async () => {
@@ -234,7 +243,9 @@ describe('heartbeat escalation', () => {
         defaultAgentId: 'myra',
       });
 
-      await expect(onFailure(makeReminder(), AUTH_ERROR, 1)).rejects.toThrow();
+      await expect(
+        onFailure(makeReminder(), AUTH_ERROR, 1, FIRST_FOR_DESTINATION)
+      ).rejects.toThrow();
       // It failed before reaching the channel — processHeartbeat's guarded
       // wrapper logs it rather than the escalation claiming success.
       expect(sendToChannel).not.toHaveBeenCalled();
@@ -250,7 +261,7 @@ describe('heartbeat escalation', () => {
         defaultAgentId: 'fallback-agent',
       });
 
-      await onFailure(makeReminder(), AUTH_ERROR, 1);
+      await onFailure(makeReminder(), AUTH_ERROR, 1, FIRST_FOR_DESTINATION);
 
       expect(insert).toHaveBeenCalledWith(
         expect.objectContaining({ recipient_agent_id: 'myra', recipient_user_id: 'user-1' })
@@ -265,7 +276,7 @@ describe('heartbeat escalation', () => {
         defaultAgentId: 'fallback-agent',
       });
 
-      await onFailure(makeReminder({ sb_id: null }), AUTH_ERROR, 1);
+      await onFailure(makeReminder({ sb_id: null }), AUTH_ERROR, 1, FIRST_FOR_DESTINATION);
 
       expect(insert).toHaveBeenCalledWith(
         expect.objectContaining({ recipient_agent_id: 'fallback-agent' })
@@ -280,10 +291,10 @@ describe('heartbeat escalation', () => {
         defaultAgentId: 'myra',
       });
 
-      await onFailure(makeReminder(), AUTH_ERROR, 1);
+      await onFailure(makeReminder(), AUTH_ERROR, 1, FIRST_FOR_DESTINATION);
       expect(insert).toHaveBeenLastCalledWith(expect.objectContaining({ priority: 'high' }));
 
-      await onFailure(makeReminder(), AUTH_ERROR, 3);
+      await onFailure(makeReminder(), AUTH_ERROR, 3, FIRST_FOR_DESTINATION);
       expect(insert).toHaveBeenLastCalledWith(expect.objectContaining({ priority: 'urgent' }));
     });
 
@@ -295,12 +306,66 @@ describe('heartbeat escalation', () => {
         defaultAgentId: 'myra',
       });
 
-      await onFailure(makeReminder(), AUTH_ERROR, 2);
+      await onFailure(makeReminder(), AUTH_ERROR, 2, FIRST_FOR_DESTINATION);
 
       const row = insert.mock.calls[0][0] as { content: string; subject: string };
       expect(row.content).toContain(AUTH_ERROR);
       expect(row.content).not.toContain('Delivery callback returned false');
       expect(row.subject).toContain('2x');
+    });
+  });
+
+  /**
+   * The second half of Myra's finding. `heartbeat.ts` decides WHICH beat owns
+   * the destination this run; these assert what the escalation does once told.
+   */
+  describe('sibling beats sharing one destination', () => {
+    const ALREADY_ALERTED = { destinationAlreadyAlerted: true };
+
+    it('writes the inbox row but sends no second outage alert', async () => {
+      const { client, insert } = makeClient();
+      const { onFailure } = createHeartbeatEscalation({
+        client,
+        sendToChannel,
+        defaultAgentId: 'myra',
+      });
+
+      await onFailure(makeReminder(), AUTH_ERROR, 1, ALREADY_ALERTED);
+
+      // Durable record kept: this beat did stop, and its own failure is worth
+      // finding later. Only the duplicate Telegram message is dropped.
+      expect(insert).toHaveBeenCalledTimes(1);
+      expect(sendToChannel).not.toHaveBeenCalled();
+    });
+
+    it('sends no second all-clear either', async () => {
+      const { client } = makeClient();
+      const { onRecovery } = createHeartbeatEscalation({
+        client,
+        sendToChannel,
+        defaultAgentId: 'myra',
+      });
+
+      await onRecovery(makeReminder(), 8, ALREADY_ALERTED);
+
+      // Otherwise the beats that alarmed in pairs also clear in pairs, and the
+      // fix for duplicate alarms ships duplicate all-clears.
+      expect(sendToChannel).not.toHaveBeenCalled();
+    });
+
+    it('still alerts when this beat is the first to the destination', async () => {
+      const { client } = makeClient();
+      const { onFailure } = createHeartbeatEscalation({
+        client,
+        sendToChannel,
+        defaultAgentId: 'myra',
+      });
+
+      await onFailure(makeReminder(), AUTH_ERROR, 1, FIRST_FOR_DESTINATION);
+
+      // The guard must not be able to silence the alert that matters — this is
+      // the case the whole module exists for.
+      expect(sendToChannel).toHaveBeenCalledTimes(1);
     });
   });
 });
