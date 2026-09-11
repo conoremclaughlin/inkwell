@@ -34,6 +34,7 @@ import { randomUUID } from 'crypto';
 import { INTEGRATION_TEST_USER_ID } from '../test/integration-fixtures';
 import { StudiosRepository, type Studio } from '../data/repositories/studios.repository';
 import { StudioOverflowService } from './studio-overflow.service';
+import * as keyedLock from '../utils/keyed-lock';
 import type { StudioLeaseService } from './studio-lease.service';
 
 const execFileAsync = promisify(execFile);
@@ -252,6 +253,93 @@ describe.skipIf(!available)('overflow studio live-uniqueness (integration)', () 
       .eq('thread_key', threadKey)
       .in('status', ['active', 'idle']);
     expect(liveRows).toHaveLength(1);
+  });
+
+  it('concurrent worktree creations in one repository all succeed — git locks are serialized', async () => {
+    // Two concurrent `git worktree add` calls in one repository fail each
+    // other on git's own locks (index.lock, .git/worktrees/<name>). Six at
+    // once, all must land: the service serializes the git step per repo.
+    const leases = { logEvent: vi.fn() } as unknown as StudioLeaseService;
+    const service = new StudioOverflowService(repo, leases);
+    const create = (
+      service as unknown as {
+        createWorktree: (
+          p: Studio,
+          slug: string,
+          o: { worktreePath: string }
+        ) => Promise<{ worktreePath: string } | null>;
+      }
+    ).createWorktree.bind(service);
+    const slugs = Array.from({ length: 6 }, (_, i) => `concurrent-${RUN}-${i}`);
+    const lockSpy = vi.spyOn(keyedLock, 'withKeyedLock');
+    try {
+      const results = await Promise.all(
+        slugs.map((slug) => create(parent, slug, { worktreePath: path.join(studiosRoot, slug) }))
+      );
+      expect(results.filter((r) => r !== null)).toHaveLength(6);
+      // Git's lock collisions are probabilistic — a fast machine can survive
+      // six unserialized adds — so also pin that every add went through the
+      // per-repository lock, which is what makes CI's contention safe.
+      expect(lockSpy).toHaveBeenCalledTimes(6);
+      for (const [key] of lockSpy.mock.calls) {
+        expect(key).toBe(`git-worktree:${parent.repoRoot}`);
+      }
+    } finally {
+      lockSpy.mockRestore();
+    }
+  });
+
+  it('a call whose every worktree creation fails still converges on a live winner', async () => {
+    // CI, 2026-09-11 (#601 attempt 1): the race loser's three `git worktree
+    // add` attempts all failed on the winner's git locks and the winner's
+    // path, and the service returned null — a held message in production.
+    // The exhausted path must re-read for the winner before failing closed.
+    const threadKey = `pr:it-exhausted-${RUN}`;
+    const leases = { logEvent: vi.fn() } as unknown as StudioLeaseService;
+    const service = new StudioOverflowService(repo, leases);
+    const agentId = `it-agent-${RUN}`;
+
+    const winner = await service.ensureOverflowStudio({
+      userId: USER,
+      agentId,
+      parentStudio: parent,
+      threadKey,
+    });
+    expect(winner).not.toBeNull();
+
+    // A second caller whose stale preflight saw no live studio and whose
+    // every git step then fails (the CI shape) — forced by making creation
+    // fail, and by hiding the winner from its preflight read.
+    const proto = StudioOverflowService.prototype as unknown as {
+      createWorktree: (...args: unknown[]) => Promise<unknown>;
+      firstLiveMatch: (...args: unknown[]) => Promise<unknown>;
+    };
+    const originalFirstLive = proto.firstLiveMatch;
+    let preflightReads = 0;
+    const liveSpy = vi
+      .spyOn(proto, 'firstLiveMatch')
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      .mockImplementation(async function (this: unknown, ...args: any[]) {
+        preflightReads += 1;
+        // First read is the step-1 reuse preflight: pretend the winner is not
+        // there yet (the loser's stale view). Later reads see the truth.
+        if (preflightReads === 1) return null;
+        return originalFirstLive.apply(this, args);
+      });
+    const createSpy = vi.spyOn(proto, 'createWorktree').mockResolvedValue(null);
+    try {
+      const loser = await service.ensureOverflowStudio({
+        userId: USER,
+        agentId,
+        parentStudio: parent,
+        threadKey,
+      });
+      expect(createSpy).toHaveBeenCalled();
+      expect(loser?.id).toBe(winner!.id);
+    } finally {
+      createSpy.mockRestore();
+      liveSpy.mockRestore();
+    }
   });
 
   it('two concurrent ensureOverflowStudio calls leave exactly one live studio', async () => {
