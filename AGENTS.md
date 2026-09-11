@@ -497,7 +497,7 @@ A deploy, a merged CLI fix, a build that looks stale, or "the fix should reach t
 ```bash
 # From your studio (create one with: ink studio create <name> --branch <branch> --agent <you>)
 yarn workspace @inklabs/cli build
-./packages/cli/dist/cli.js <subcommand>
+node ./packages/cli/dist/cli.js <subcommand>
 ```
 
 The global link stays where it was. Your studio's build is for you to exercise, not for every other session on the machine to run.
