@@ -25,6 +25,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { getDataComposer, type DataComposer } from '../../data/composer';
 import { ensureEchoIntegrationFixture } from '../../test/integration-fixtures';
 import { handleRemember } from './memory-handlers';
+import { runWithRequestContext } from '../../utils/request-context';
 
 /** Unique per run so parallel suites on the shared fixture user cannot collide. */
 const AGENT = `attr-test-${Date.now().toString(36)}`;
@@ -200,6 +201,47 @@ describe('Memory session attribution', () => {
     // An explicit sessionId is the caller asserting which session it is, and
     // must beat any lookup — including one that would have found the phantom.
     const parsed = await remember({ sessionId: liveSessionId });
+
+    expect(parsed.memory.sessionId).toBe(liveSessionId);
+    expect(await readMemorySession(parsed.memory.id)).toBe(liveSessionId);
+  });
+
+  it('attributes a user-token call that omits agentId to the ambient session it runs in', async () => {
+    // Lumen's #596 probe against the real rows. The normal local auth shape: a
+    // user bearer, ctx.agentId enriched from the ambient session, no signed
+    // session claim, and no agentId on the call. The effective identity is
+    // still this agent, so attribution must land on the session the caller is
+    // in — and never on the phantom, which is newer.
+    const result = await runWithRequestContext(
+      { userId: testUserId, agentId: AGENT, sessionId: liveSessionId },
+      () =>
+        handleRemember({ userId: testUserId, content: 'ambient attribution probe' }, dataComposer)
+    );
+    const parsed = JSON.parse(result.content[0].text);
+    createdMemoryIds.push(parsed.memory.id);
+
+    expect(parsed.success).toBe(true);
+    expect(parsed.memory.sessionId).toBe(liveSessionId);
+    expect(await readMemorySession(parsed.memory.id)).toBe(liveSessionId);
+  });
+
+  it('attributes to the signed token session even when the header names the phantom', async () => {
+    // An agent-bound token whose signed claim is the live session while the
+    // unsigned header asserts the phantom. The claim wins; the header is
+    // never loaded.
+    const result = await runWithRequestContext(
+      {
+        userId: testUserId,
+        agentId: AGENT,
+        agentTokenBound: true,
+        tokenAgentId: AGENT,
+        tokenSessionId: liveSessionId,
+        sessionId: phantomSessionId,
+      },
+      () => handleRemember({ userId: testUserId, content: 'signed claim probe' }, dataComposer)
+    );
+    const parsed = JSON.parse(result.content[0].text);
+    createdMemoryIds.push(parsed.memory.id);
 
     expect(parsed.memory.sessionId).toBe(liveSessionId);
     expect(await readMemorySession(parsed.memory.id)).toBe(liveSessionId);

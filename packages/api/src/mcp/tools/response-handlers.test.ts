@@ -8,7 +8,7 @@
  * {type, path|url} objects with the type inferred from the extension.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   sendResponseSchema,
   outboundMediaEntrySchema,
@@ -272,18 +272,65 @@ describe('handleSendResponse — sender session attribution', () => {
    *
    * The gateway stamps whatever `AgentResponse.sessionId` it is handed, so the
    * property that matters is pinned here, at the boundary where the request
-   * context is unambiguously this call's.
+   * context is unambiguously this call's — and where the session it names is
+   * loaded and authorized before it is stamped. The first version of this fix
+   * stamped the unsigned header bare, which let a legacy agent token name any
+   * session at all (Lumen, #596).
    */
   const conversationId = 'conv-session-attribution';
-  const composer = {} as unknown as Parameters<typeof handleSendResponse>[1];
+  const ownSession = '64e1eb49-6229-4e4c-a9fd-08f1b6bd6848';
+  const foreignUserSession = '88b728cb-45aa-4830-90d3-20007aa521bc';
+  const peerIdentitySession = 'd1d105ec-8f1a-4e62-9a1b-0c5a7a2f1e10';
+  const contactSession = '0a731a19-2c4e-4b7d-8f3a-9e6d5c4b3a21';
+  const sbId = 'sb-myra';
+  const rows: Record<string, object> = {
+    [ownSession]: { id: ownSession, userId: 'owner', agentId: 'myra', sbId },
+    [foreignUserSession]: {
+      id: foreignUserSession,
+      userId: 'someone-else',
+      agentId: 'wren',
+      sbId: 'sb-wren',
+    },
+    [peerIdentitySession]: {
+      id: peerIdentitySession,
+      userId: 'owner',
+      agentId: 'wren',
+      sbId: 'sb-wren',
+    },
+    [contactSession]: {
+      id: contactSession,
+      userId: 'owner',
+      agentId: 'myra',
+      sbId,
+      contactId: 'contact-b',
+    },
+  };
+  const getSession = vi.fn(async (id: string) => rows[id] ?? null);
+  const composer = {
+    repositories: { memory: { getSession } },
+  } as unknown as Parameters<typeof handleSendResponse>[1];
+
+  /** An SB's own token: signed identity, no signed session claim. */
+  const boundMyra = {
+    userId: 'owner',
+    agentId: 'myra',
+    sbId,
+    agentTokenBound: true,
+    tokenAgentId: 'myra',
+    tokenSbId: sbId,
+  };
 
   let captured: { sessionId?: string } | undefined;
+  let delivered = 0;
 
   beforeEach(() => {
     captured = undefined;
+    delivered = 0;
+    getSession.mockClear();
     consumeExplicitResponse('telegram', conversationId);
     setResponseCallback((async (response: { sessionId?: string }) => {
       captured = response;
+      delivered += 1;
       return undefined;
     }) as unknown as Parameters<typeof setResponseCallback>[0]);
   });
@@ -291,6 +338,7 @@ describe('handleSendResponse — sender session attribution', () => {
   afterEach(() => {
     setResponseCallback(null as unknown as Parameters<typeof setResponseCallback>[0]);
     consumeExplicitResponse('telegram', conversationId);
+    vi.unstubAllGlobals();
   });
 
   const send = () =>
@@ -303,34 +351,107 @@ describe('handleSendResponse — sender session attribution', () => {
       composer
     );
 
-  it('stamps the sending session onto the outgoing response', async () => {
-    const sessionId = '64e1eb49-6229-4e4c-a9fd-08f1b6bd6848';
-    await runWithRequestContext({ sessionId } as never, async () => {
-      await send();
-    });
+  const sendIn = (ctx: Parameters<typeof runWithRequestContext>[0]) =>
+    runWithRequestContext(ctx, () => send());
 
+  it('stamps the signed token session after loading and authorizing it', async () => {
+    const res = await sendIn({ ...boundMyra, tokenSessionId: ownSession });
+    expect(JSON.parse(res.content[0].text).success).toBe(true);
     // Without this the row is anonymous and a duplicate cannot be attributed.
-    expect(captured?.sessionId).toBe(sessionId);
+    expect(captured?.sessionId).toBe(ownSession);
+    expect(getSession).toHaveBeenCalledWith(ownSession);
+  });
+
+  it("stamps a header-asserted session for a user token when it is the same user's", async () => {
+    await sendIn({ userId: 'owner', agentId: 'myra', sbId, sessionId: ownSession });
+    expect(captured?.sessionId).toBe(ownSession);
   });
 
   it('prefers the signed token session over the caller-asserted header', async () => {
     // The header form is a caller-composed assertion; the token claim is
-    // authenticated. Same precedence the memory handlers use.
-    const tokenSessionId = '88b728cb-45aa-4830-90d3-20007aa521bc';
-    await runWithRequestContext(
-      { sessionId: 'header-asserted-session', tokenSessionId } as never,
-      async () => {
-        await send();
-      }
-    );
+    // authenticated. Same precedence the memory handlers use — and the header
+    // session is never even loaded.
+    await sendIn({ ...boundMyra, sessionId: foreignUserSession, tokenSessionId: ownSession });
+    expect(captured?.sessionId).toBe(ownSession);
+    expect(getSession).toHaveBeenCalledTimes(1);
+    expect(getSession).toHaveBeenCalledWith(ownSession);
+  });
 
-    expect(captured?.sessionId).toBe(tokenSessionId);
+  it("refuses another user's session named by the unsigned header, and still delivers", async () => {
+    // Lumen's probe: an agent-bound caller whose header names a session owned
+    // by someone else. The activity FK checks existence, not ownership; this
+    // boundary has to.
+    const res = await sendIn({ ...boundMyra, sessionId: foreignUserSession });
+    expect(delivered).toBe(1);
+    expect(JSON.parse(res.content[0].text).success).toBe(true);
+    expect(captured?.sessionId).toBeUndefined();
+  });
+
+  it('refuses a same-user session of another identity for an agent-bound caller', async () => {
+    await sendIn({ ...boundMyra, sessionId: peerIdentitySession });
+    expect(delivered).toBe(1);
+    expect(captured?.sessionId).toBeUndefined();
+  });
+
+  it('refuses a session in another contact scope for an agent-bound caller', async () => {
+    await sendIn({ ...boundMyra, sessionId: contactSession });
+    expect(delivered).toBe(1);
+    expect(captured?.sessionId).toBeUndefined();
+  });
+
+  it('omits attribution when the named session does not exist, and still delivers', async () => {
+    // A nonexistent id used to fail the activity insert AFTER the message had
+    // gone out, leaving no outgoing row at all.
+    await sendIn({ ...boundMyra, tokenSessionId: 'f0f0f0f0-0000-4000-8000-000000000000' });
+    expect(delivered).toBe(1);
+    expect(captured?.sessionId).toBeUndefined();
+  });
+
+  it('omits attribution when the session lookup throws, and still delivers', async () => {
+    getSession.mockRejectedValueOnce(new Error('db down'));
+    await sendIn({ ...boundMyra, tokenSessionId: ownSession });
+    expect(delivered).toBe(1);
+    expect(captured?.sessionId).toBeUndefined();
   });
 
   it('leaves the session undefined when there is no request context', async () => {
     // Heartbeat and other sessionless sends must still go out — they log null,
     // exactly as before. Absent attribution is acceptable; wrong is not.
     await send();
+    expect(delivered).toBe(1);
     expect(captured?.sessionId).toBeUndefined();
+    expect(getSession).not.toHaveBeenCalled();
+  });
+
+  describe('HTTP fallback (no local callback)', () => {
+    let fetchMock: ReturnType<typeof vi.fn>;
+
+    beforeEach(() => {
+      setResponseCallback(null as unknown as Parameters<typeof setResponseCallback>[0]);
+      fetchMock = vi.fn().mockResolvedValue({ ok: true });
+      vi.stubGlobal('fetch', fetchMock);
+    });
+
+    const body = () => JSON.parse((fetchMock.mock.calls[0]![1] as { body: string }).body);
+
+    it('carries the validated sending session in the payload', async () => {
+      // Lumen's probe: an external-process send_response with a signed session
+      // claim. This branch exists for exactly that caller, and it used to
+      // rebuild the payload from args and drop the session.
+      await sendIn({ userId: 'owner', agentId: 'myra', tokenSessionId: ownSession });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(body()).toEqual({
+        channel: 'telegram',
+        conversationId,
+        content: 'Thursday digest',
+        sessionId: ownSession,
+      });
+    });
+
+    it("sends no session when the header names another user's session", async () => {
+      await sendIn({ ...boundMyra, sessionId: foreignUserSession });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(body()).not.toHaveProperty('sessionId');
+    });
   });
 });
