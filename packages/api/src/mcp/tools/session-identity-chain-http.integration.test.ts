@@ -273,11 +273,15 @@ describe('Session Identity Chain — HTTP Integration', () => {
   });
 
   it('should reject requests without auth', async () => {
+    // Both accept types: the transport (1.x and v2 alike) answers 406 to a
+    // POST that does not accept text/event-stream, before auth is even
+    // considered. In CI MCP_REQUIRE_OAUTH defaults to true and the 401 fired
+    // first, which hid that this request never tested auth at all locally.
     const response = await fetch(`${baseUrl}/mcp`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Accept: 'application/json',
+        Accept: 'application/json, text/event-stream',
       },
       body: JSON.stringify({
         jsonrpc: '2.0',
