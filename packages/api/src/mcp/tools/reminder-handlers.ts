@@ -19,7 +19,7 @@ import type { Database } from '../../data/supabase/types';
 const userIdentifierSchema = z.object({
   userId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('User UUID — usually unnecessary, auto-resolved from OAuth token'),
   email: z
@@ -123,7 +123,7 @@ export const createReminderSchema = z.object({
     .describe('Agent that should handle this reminder (e.g., "myra", "lumen"). Resolved to sb_id.'),
   sbId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('Direct identity UUID from agent_identities. Takes precedence over agentId.'),
   deliveryChannel: z
@@ -507,7 +507,7 @@ export async function handleListReminders(
 
 export const updateReminderSchema = z.object({
   ...userIdentifierSchema.shape,
-  reminderId: z.string().uuid().describe('Reminder ID to update'),
+  reminderId: z.string().guid().describe('Reminder ID to update'),
   title: z.string().min(1).max(500).optional(),
   description: z.string().optional(),
   agentId: z.string().optional().describe('Reassign to a different agent (e.g., "myra")'),
@@ -619,7 +619,7 @@ export async function handleUpdateReminder(
 
 export const cancelReminderSchema = z.object({
   ...userIdentifierSchema.shape,
-  reminderId: z.string().uuid().describe('Reminder ID to cancel'),
+  reminderId: z.string().guid().describe('Reminder ID to cancel'),
 });
 
 export async function handleCancelReminder(
@@ -685,7 +685,7 @@ export async function handleCancelReminder(
 
 export const getReminderHistorySchema = z.object({
   ...userIdentifierSchema.shape,
-  reminderId: z.string().uuid().describe('Reminder ID to get history for'),
+  reminderId: z.string().guid().describe('Reminder ID to get history for'),
   limit: z.number().min(1).max(100).optional().default(20),
 });
 

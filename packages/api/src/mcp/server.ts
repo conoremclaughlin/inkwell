@@ -1,6 +1,6 @@
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { toNodeHandler } from '@modelcontextprotocol/node';
+import { StdioServerTransport } from '@modelcontextprotocol/server/stdio';
+import { createMcpHandler, McpServer } from '@modelcontextprotocol/server';
 import express from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
@@ -58,6 +58,8 @@ export class MCPServer {
   private server: McpServer;
   private dataComposer: DataComposer;
   private httpServer: Server | null = null;
+  /** The SDK v2 HTTP handler behind POST /mcp; closed on shutdown. */
+  private mcpHttpHandler: ReturnType<typeof createMcpHandler> | null = null;
 
   private miniApps: Map<string, LoadedMiniApp> = new Map();
   private miniAppsInfo: Array<{
@@ -408,10 +410,34 @@ export class MCPServer {
 
     // ============================================================================
     // Streamable HTTP MCP endpoint (stateless)
-    // Each request gets a fresh transport — no session tracking, no stale sessions.
-    // Handles: POST (tool calls + initialize), GET (explicit 405 when no SSE stream
-    // is offered), DELETE (no-op)
+    // One SDK v2 handler serves the endpoint: clients that negotiate the
+    // 2026-07-28 revision (Claude Code 2.1.267+) get the modern per-request
+    // path; 2025-era clients get stateless serving from the SAME factory, so
+    // both eras expose identical tools. Every exchange builds a fresh server
+    // instance — no session tracking, no stale sessions. The factory reads
+    // the caller profile from the request it is serving; identity reaches the
+    // tool handlers through runWithRequestContext, which the SDK's
+    // per-request dispatch preserves (AsyncLocalStorage, verified live).
+    // Handles: POST (tool calls + initialize), GET (explicit 405 when no SSE
+    // stream is offered), DELETE (no-op)
     // ============================================================================
+    const callerProfileFromHeader = (value: string | null | undefined): 'agent' | 'runtime' =>
+      value?.trim().toLowerCase() === 'runtime' ? 'runtime' : 'agent';
+    const mcpHandler = createMcpHandler(
+      (mcpContext) =>
+        this.createMcpServerInstance(
+          callerProfileFromHeader(mcpContext.requestInfo?.headers.get('x-ink-caller-profile'))
+        ),
+      {
+        legacy: 'stateless',
+        onerror: (error) => logger.error('MCP handler error:', error),
+      }
+    );
+    this.mcpHttpHandler = mcpHandler;
+    const mcpNodeHandler = toNodeHandler(mcpHandler, {
+      onerror: (error) => logger.error('MCP request adapter error:', error),
+    });
+
     const handleMcpRequest = async (req: express.Request, res: express.Response) => {
       const authHeader = req.headers.authorization;
       let userData = await this.authProvider.verifyAccessToken(authHeader);
@@ -507,9 +533,7 @@ export class MCPServer {
           sbId: effectiveIdentity.sbId,
         });
       }
-      const callerProfileHeader = req.header('x-ink-caller-profile')?.trim().toLowerCase();
-      const callerProfile: 'agent' | 'runtime' =
-        callerProfileHeader === 'runtime' ? 'runtime' : 'agent';
+      const callerProfile = callerProfileFromHeader(req.header('x-ink-caller-profile'));
       const sessionIdHeader = contextToken?.sessionId || req.header('x-ink-session-id')?.trim();
       // ── Studio scope (worktree-level) ──
       // studioId and workspaceId are DIFFERENT concepts. Never conflate them.
@@ -577,17 +601,10 @@ export class MCPServer {
       }
 
       await runWithRequestContext(ctx, async () => {
-        let transport: StreamableHTTPServerTransport | undefined;
-        let mcpServer: McpServer | undefined;
         try {
-          // Stateless: fresh transport per request — no session IDs, no stale sessions
-          transport = new StreamableHTTPServerTransport({
-            sessionIdGenerator: undefined,
-          });
-          mcpServer = this.createMcpServerInstance(callerProfile);
-
-          await mcpServer.connect(transport);
-          await transport.handleRequest(req, res);
+          // The handler builds a fresh instance from the factory for this one
+          // exchange (modern or legacy era), serves it, and closes it.
+          await mcpNodeHandler(req, res, req.body);
         } catch (error) {
           logger.error('Error handling MCP request:', error);
           if (!res.headersSent) {
@@ -595,13 +612,6 @@ export class MCPServer {
               jsonrpc: '2.0',
               error: { code: -32603, message: 'Internal server error' },
               id: null,
-            });
-          }
-        } finally {
-          if (transport) transport.onclose = undefined;
-          if (mcpServer) {
-            mcpServer.close().catch((err) => {
-              logger.debug('Error closing stateless MCP server instance', { error: err });
             });
           }
         }
@@ -1198,6 +1208,16 @@ export class MCPServer {
       await this.server.close();
     } catch (error) {
       logger.warn('Error closing primary MCP server:', error);
+    }
+
+    if (this.mcpHttpHandler) {
+      // Abort in-flight modern exchanges and close their per-request instances.
+      try {
+        await this.mcpHttpHandler.close();
+      } catch (error) {
+        logger.warn('Error closing MCP HTTP handler:', error);
+      }
+      this.mcpHttpHandler = null;
     }
 
     if (this.httpServer) {

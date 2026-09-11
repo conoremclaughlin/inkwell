@@ -27,7 +27,7 @@ export const DUE_DATE_DESCRIPTION =
 const userIdentifierSchema = z.object({
   userId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('User UUID — usually unnecessary, auto-resolved from OAuth token'),
   email: z
@@ -51,8 +51,8 @@ const userIdentifierSchema = z.object({
 
 export const createTaskSchema = z.object({
   ...userIdentifierSchema.shape,
-  projectId: z.string().uuid().optional().describe('Project ID to add the task to'),
-  taskGroupId: z.string().uuid().optional().describe('Task group ID to add the task to'),
+  projectId: z.string().guid().optional().describe('Project ID to add the task to'),
+  taskGroupId: z.string().guid().optional().describe('Task group ID to add the task to'),
   taskOrder: z.number().int().min(0).optional().describe('Order within the task group (0-based)'),
   title: z.string().min(1).max(500).describe('Task title'),
   description: z.string().optional().describe('Detailed task description'),
@@ -199,8 +199,8 @@ export async function handleCreateTask(
 
 export const listTasksSchema = z.object({
   ...userIdentifierSchema.shape,
-  projectId: z.string().uuid().optional().describe('Filter by project'),
-  groupId: z.string().uuid().optional().describe('Filter by task group'),
+  projectId: z.string().guid().optional().describe('Filter by project'),
+  groupId: z.string().guid().optional().describe('Filter by task group'),
   status: z.enum(['pending', 'in_progress', 'completed', 'blocked']).optional(),
   activeOnly: z.boolean().optional().default(false).describe('Only show pending/in_progress tasks'),
   limit: z.number().optional().default(50),
@@ -290,7 +290,7 @@ export async function handleListTasks(
 
 export const updateTaskSchema = z.object({
   ...userIdentifierSchema.shape,
-  taskId: z.string().uuid().describe('Task ID to update'),
+  taskId: z.string().guid().describe('Task ID to update'),
   title: z.string().min(1).max(500).optional(),
   description: z.string().optional(),
   status: z.enum(['pending', 'in_progress', 'completed', 'blocked']).optional(),
@@ -435,7 +435,7 @@ export async function handleUpdateTask(
 
 export const completeTaskSchema = z.object({
   ...userIdentifierSchema.shape,
-  taskId: z.string().uuid().describe('Task ID to mark as completed'),
+  taskId: z.string().guid().describe('Task ID to mark as completed'),
   summary: z
     .string()
     .max(2000)
@@ -445,14 +445,14 @@ export const completeTaskSchema = z.object({
     ),
   claimToken: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe(
       'Required for tasks in graph-mode groups: the claim token returned by claim_task. Graph completion refuses without a valid claim.'
     ),
   sessionId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe(
       'Claim-holding session for graph-mode tasks — usually unnecessary, resolved from session context. Must match the claiming session.'
@@ -692,7 +692,7 @@ const taskOutcomeSchema = z.enum(['completed', 'skipped', 'blocked', 'failed']);
 
 export const closeTaskSchema = z.object({
   ...userIdentifierSchema.shape,
-  taskId: z.string().uuid().describe('Task ID to close'),
+  taskId: z.string().guid().describe('Task ID to close'),
   outcome: taskOutcomeSchema.describe(
     'Outcome: completed (done), skipped (not needed), blocked (cannot proceed), failed (attempted but failed)'
   ),
@@ -704,12 +704,12 @@ export const closeTaskSchema = z.object({
     .describe('Brief summary of what happened (shown in mission feed)'),
   claimToken: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('Required for tasks in graph-mode groups: the claim token from claim_task'),
   sessionId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('Claim-holding session for graph-mode tasks — usually resolved from context'),
 });
@@ -853,7 +853,7 @@ export async function handleCloseTask(
 
 export const getTaskStatsSchema = z.object({
   ...userIdentifierSchema.shape,
-  projectId: z.string().uuid().describe('Project ID to get stats for'),
+  projectId: z.string().guid().describe('Project ID to get stats for'),
 });
 
 export async function handleGetTaskStats(
@@ -903,9 +903,9 @@ export async function handleGetTaskStats(
 
 export const addTaskCommentSchema = z.object({
   ...userIdentifierSchema.shape,
-  taskId: z.string().uuid().describe('Task ID to comment on'),
+  taskId: z.string().guid().describe('Task ID to comment on'),
   content: z.string().min(1).max(5000).describe('Comment content'),
-  parentCommentId: z.string().uuid().optional().describe('Parent comment ID for threaded replies'),
+  parentCommentId: z.string().guid().optional().describe('Parent comment ID for threaded replies'),
   agentId: z.string().optional().describe('Agent ID for identity attribution'),
 });
 
@@ -1034,7 +1034,7 @@ export async function handleAddTaskComment(
 
 export const addTaskGroupCommentSchema = z.object({
   ...userIdentifierSchema.shape,
-  groupId: z.string().uuid().describe('Task group ID to comment on'),
+  groupId: z.string().guid().describe('Task group ID to comment on'),
   content: z.string().min(1).max(5000).describe('Comment content'),
   commentType: z
     .enum(['comment', 'conclusion', 'status_change'])
@@ -1149,7 +1149,7 @@ export async function handleAddTaskGroupComment(
 
 export const listTaskGroupCommentsSchema = z.object({
   ...userIdentifierSchema.shape,
-  groupId: z.string().uuid().describe('Task group ID to list comments for'),
+  groupId: z.string().guid().describe('Task group ID to list comments for'),
   commentType: z
     .enum(['comment', 'conclusion', 'status_change'])
     .optional()
@@ -1230,7 +1230,7 @@ const taskGroupOutcomeSchema = z.enum(['completed', 'partial', 'abandoned', 'fai
 
 export const closeTaskGroupSchema = z.object({
   ...userIdentifierSchema.shape,
-  groupId: z.string().uuid().describe('Task group ID to close'),
+  groupId: z.string().guid().describe('Task group ID to close'),
   outcome: taskGroupOutcomeSchema.describe(
     'Outcome: completed (all done), partial (some done), abandoned (gave up), failed (critical failure)'
   ),
@@ -1388,7 +1388,7 @@ export const createTaskGroupSchema = z.object({
   ...userIdentifierSchema.shape,
   title: z.string().min(1).max(500).describe('Task group title'),
   description: z.string().optional().describe('Detailed description / strategy'),
-  projectId: z.string().uuid().optional().describe('Optional project scope'),
+  projectId: z.string().guid().optional().describe('Optional project scope'),
   priority: taskGroupPriorityEnum.optional().default('normal'),
   status: taskGroupStatusEnum.optional().default('active'),
   tags: z.array(z.string()).optional(),
@@ -1411,7 +1411,7 @@ export const createTaskGroupSchema = z.object({
     .optional()
     .describe('Expected deliverable type (spec, pr, report, proposal)'),
   outputStatus: taskGroupOutputStatusEnum.optional(),
-  metadata: z.record(z.unknown()).optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
   agentId: z
     .string()
     .optional()
@@ -1521,14 +1521,14 @@ export async function handleCreateTaskGroup(
 
 export const updateTaskGroupSchema = z.object({
   ...userIdentifierSchema.shape,
-  groupId: z.string().uuid().describe('Task group UUID to update'),
+  groupId: z.string().guid().describe('Task group UUID to update'),
   title: z.string().min(1).max(500).optional(),
   description: z.string().nullable().optional(),
   status: taskGroupStatusEnum.optional().describe('active | paused | completed | cancelled'),
   priority: taskGroupPriorityEnum.optional(),
   tags: z.array(z.string()).optional(),
   metadata: z
-    .record(z.unknown())
+    .record(z.string(), z.unknown())
     .optional()
     .describe(
       'Metadata object. When provided with mergeMetadata=true (default), keys are merged into existing metadata; otherwise metadata is replaced.'
@@ -1552,7 +1552,7 @@ export const updateTaskGroupSchema = z.object({
   threadKey: z.string().nullable().optional(),
   sbId: z
     .string()
-    .uuid()
+    .guid()
     .nullable()
     .optional()
     .describe('Agent identity UUID. Pass null to clear.'),
@@ -1691,12 +1691,12 @@ export const listTaskGroupsSchema = z.object({
     .describe(
       'Filter by one or more statuses: active, paused, completed, cancelled. Omit or pass empty array to include all statuses.'
     ),
-  projectId: z.string().uuid().optional().describe('Filter by project UUID'),
+  projectId: z.string().guid().optional().describe('Filter by project UUID'),
   projectName: z
     .string()
     .optional()
     .describe('Filter by project name (exact match). Alternative to projectId.'),
-  sbId: z.string().uuid().optional().describe('Filter by agent identity UUID'),
+  sbId: z.string().guid().optional().describe('Filter by agent identity UUID'),
   autonomousOnly: z.boolean().optional().default(false).describe('Only autonomous groups'),
   includeTaskCounts: z
     .boolean()

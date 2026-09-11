@@ -50,7 +50,7 @@ export const chooseNameSchema = userIdentifierBaseSchema.extend({
 });
 
 export const saveIdentitySchema = userIdentifierBaseSchema.extend({
-  workspaceId: z.string().uuid().optional().describe('Optional product workspace scope'),
+  workspaceId: z.string().guid().optional().describe('Optional product workspace scope'),
   agentId: z
     .string()
     .describe('Unique identifier for the AI being (e.g., "wren", "benson", "myra")'),
@@ -59,11 +59,11 @@ export const saveIdentitySchema = userIdentifierBaseSchema.extend({
   description: z.string().optional().describe("Extended description of the agent's nature"),
   values: z.array(z.string()).optional().describe('Core values this agent holds'),
   relationships: z
-    .record(z.string())
+    .record(z.string(), z.string())
     .optional()
     .describe('Map of agentId to relationship description'),
   capabilities: z.array(z.string()).optional().describe('What this agent can do'),
-  metadata: z.record(z.unknown()).optional().describe('Additional flexible data'),
+  metadata: z.record(z.string(), z.unknown()).optional().describe('Additional flexible data'),
   heartbeat: z
     .string()
     .optional()
@@ -79,7 +79,7 @@ export const saveIdentitySchema = userIdentifierBaseSchema.extend({
         .optional()
         .describe('Default voice name used when no model-specific override matches'),
       voices: z
-        .record(z.string())
+        .record(z.string(), z.string())
         .optional()
         .describe(
           'Model-specific voice overrides keyed by model ID (e.g., "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit": "vivian")'
@@ -94,7 +94,7 @@ export const saveIdentitySchema = userIdentifierBaseSchema.extend({
 });
 
 export const getIdentitySchema = userIdentifierBaseSchema.extend({
-  workspaceId: z.string().uuid().optional().describe('Optional product workspace scope'),
+  workspaceId: z.string().guid().optional().describe('Optional product workspace scope'),
   agentId: z.string().describe('Agent identifier to look up'),
   file: z
     .enum(['heartbeat', 'soul', 'values', 'identity'])
@@ -103,17 +103,17 @@ export const getIdentitySchema = userIdentifierBaseSchema.extend({
 });
 
 export const listIdentitiesSchema = userIdentifierBaseSchema.extend({
-  workspaceId: z.string().uuid().optional().describe('Optional product workspace scope'),
+  workspaceId: z.string().guid().optional().describe('Optional product workspace scope'),
 });
 
 export const getIdentityHistorySchema = userIdentifierBaseSchema.extend({
-  workspaceId: z.string().uuid().optional().describe('Optional product workspace scope'),
+  workspaceId: z.string().guid().optional().describe('Optional product workspace scope'),
   agentId: z.string().describe('Agent identifier to get history for'),
   limit: z.number().min(1).max(50).optional().describe('Max history entries (default: 10)'),
 });
 
 export const restoreIdentitySchema = userIdentifierBaseSchema.extend({
-  workspaceId: z.string().uuid().optional().describe('Optional product workspace scope'),
+  workspaceId: z.string().guid().optional().describe('Optional product workspace scope'),
   agentId: z.string().describe('Agent identifier to restore'),
   version: z.number().describe('Version number to restore to'),
 });
@@ -791,7 +791,7 @@ export async function handleRestoreIdentity(args: unknown, dataComposer: DataCom
 // =====================================================
 
 export const meetFamilySchema = userIdentifierBaseSchema.extend({
-  workspaceId: z.string().uuid().optional().describe('Optional product workspace scope'),
+  workspaceId: z.string().guid().optional().describe('Optional product workspace scope'),
 });
 
 export async function handleMeetFamily(args: unknown, dataComposer: DataComposer) {

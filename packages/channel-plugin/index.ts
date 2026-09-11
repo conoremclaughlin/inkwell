@@ -22,9 +22,8 @@
  *   INK_PLUGIN_LOG_MAX_BYTES — rotate the log past this size (default: 10485760)
  *   INK_PLUGIN_LOG_RETENTION_DAYS — sweep dead processes' logs older than this (default: 7)
  */
-
-import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { StdioServerTransport } from '@modelcontextprotocol/server/stdio';
+import { Server } from '@modelcontextprotocol/server';
 import { readFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';

@@ -78,7 +78,7 @@ export const updateIntegrationHealthSchema = userIdentifierBaseSchema.extend({
     .describe('Structured error code (e.g., "oauth_expired", "rate_limited")'),
   errorMessage: z.string().optional().describe('Human-readable error description'),
   agentId: z.string().optional().describe('Which SB is reporting this'),
-  metadata: z.record(z.unknown()).optional().describe('Additional context'),
+  metadata: z.record(z.string(), z.unknown()).optional().describe('Additional context'),
 });
 
 export const getIntegrationHealthSchema = userIdentifierBaseSchema.extend({
