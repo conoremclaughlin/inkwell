@@ -308,7 +308,7 @@ describe('reclaim wiring round 11 (reachability)', () => {
     expect(unheld).toBeGreaterThan(helper);
   });
 
-  it('a cross-tenant 403 maps to unprotected, and enforcement carries a non-zero exit (round 16)', async () => {
+  it('a cross-tenant 403 maps to unprotected; ONE-SHOT enforcement carries a non-zero exit (round 16), the attached wrapper never enforces (PR #590)', async () => {
     const { readFileSync } = await import('fs');
     const { dirname } = await import('path');
     const { fileURLToPath } = await import('url');
@@ -321,22 +321,18 @@ describe('reclaim wiring round 11 (reachability)', () => {
       source.indexOf("if (resp.status === 403) return 'unprotected';", helper)
     ).toBeGreaterThan(helper);
 
-    // Enforcement must not exit 0 (SIGTERM closes with code=null) nor retry.
+    // One-shot enforcement must not exit 0 (SIGTERM closes with code=null).
     const oneShot = source.indexOf('export async function runClaude(');
     const interactive = source.indexOf('export async function runClaudeInteractive(');
     const oneShotExit = source.indexOf('if (takeoverEnforced) process.exit(1);', oneShot);
     expect(oneShotExit).toBeGreaterThan(oneShot);
     expect(oneShotExit).toBeLessThan(interactive);
-    const interactiveGuard = source.indexOf('if (interactiveEnforced) {', interactive);
-    const interactiveExit = source.indexOf('process.exit(1);', interactiveGuard);
-    const retryBranch = source.indexOf('const shouldRetry =', interactive);
-    expect(interactiveGuard).toBeGreaterThan(interactive);
-    expect(interactiveExit).toBeGreaterThan(interactiveGuard);
-    // The enforcement check precedes the retry decision — no fresh-session retry.
-    expect(interactiveGuard).toBeLessThan(retryBranch);
+    // PR #590: the attached wrapper has no enforcement state at all — a
+    // permanent refusal is a warning to the human, not a non-zero exit.
+    expect(source.indexOf('interactiveEnforced', interactive)).toBe(-1);
   });
 
-  it('a permanent refusal terminates the backend at BOTH spawn sites (round 15)', async () => {
+  it('a permanent refusal terminates a ONE-SHOT backend (round 15) and only WARNS an attached one (PR #590)', async () => {
     const { readFileSync } = await import('fs');
     const { dirname } = await import('path');
     const { fileURLToPath } = await import('url');
@@ -351,15 +347,14 @@ describe('reclaim wiring round 11 (reachability)', () => {
     const oneShot = source.indexOf('export async function runClaude(');
     const oneShotKill = source.indexOf('takeoverChild?.kill', oneShot);
     const interactive = source.indexOf('export async function runClaudeInteractive(');
-    const interactiveKill = source.indexOf('interactiveChild?.kill', interactive);
     expect(oneShotKill).toBeGreaterThan(oneShot);
     expect(oneShotKill).toBeLessThan(interactive);
-    expect(interactiveKill).toBeGreaterThan(interactive);
+    expect(source.indexOf('interactiveChild', interactive)).toBe(-1);
   });
 });
 
-describe('fail-open claude-code (reachability)', () => {
-  it('the INTERACTIVE wrapper warns on a permanent refusal for claude and never reaches the kill', async () => {
+describe('attached sessions are warned, never terminated (PR #590, reachability)', () => {
+  it('the INTERACTIVE wrapper warns the human on a permanent refusal for EVERY backend and has no kill path', async () => {
     const { readFileSync } = await import('fs');
     const { dirname } = await import('path');
     const { fileURLToPath } = await import('url');
@@ -369,17 +364,23 @@ describe('fail-open claude-code (reachability)', () => {
     );
     const interactive = source.indexOf('export async function runClaudeInteractive(');
     const start = source.indexOf('startSessionTakeoverWatcher(', interactive);
-    const guard = source.indexOf("if (options.backend === 'claude') {", start);
-    const earlyReturn = source.indexOf('return;', guard);
-    const enforced = source.indexOf('interactiveEnforced = true;', start);
-    const kill = source.indexOf('interactiveChild?.kill', start);
-    expect(guard).toBeGreaterThan(start);
-    // The claude branch returns BEFORE the enforcement flag and the kill —
-    // codex/gemini keep round-15 termination; an attached claude session
-    // is warned, not ended.
-    expect(earlyReturn).toBeGreaterThan(guard);
-    expect(earlyReturn).toBeLessThan(enforced);
-    expect(enforced).toBeLessThan(kill);
+    const loop = source.indexOf('while (true) {', start);
+    const warning = source.indexOf('Prompts still run', start);
+    expect(start).toBeGreaterThan(interactive);
+    // The warning sits inside the watcher's onUnprotected callback, before
+    // the attempt loop, and is not gated on the backend — the policy is one
+    // sentence for claude, codex and gemini alike.
+    expect(warning).toBeGreaterThan(start);
+    expect(warning).toBeLessThan(loop);
+    // indexOf is -1 when the text never appears again — also the wanted outcome.
+    const absentBeforeLoop = (needle: string) => {
+      const at = source.indexOf(needle, start);
+      return at === -1 || at > loop;
+    };
+    expect(absentBeforeLoop("options.backend === 'claude'")).toBe(true);
+    // No enforcement state, no SIGTERM, no non-zero exit for an attached human.
+    expect(source.indexOf('interactiveEnforced', interactive)).toBe(-1);
+    expect(absentBeforeLoop("kill('SIGTERM')")).toBe(true);
   });
 });
 

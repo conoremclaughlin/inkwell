@@ -4008,7 +4008,6 @@ export async function runClaudeInteractive(
           ...(runtimeLinkId ? { INK_RUNTIME_LINK_ID: runtimeLinkId } : {}),
         },
       });
-      interactiveChild = child;
 
       child.stderr?.on('data', (chunk) => {
         const text = chunk.toString();
@@ -4058,45 +4057,32 @@ export async function runClaudeInteractive(
   // process for codex/gemini — the round-9 watcher was wired only into the
   // one-shot path. One watcher spans every retry attempt (retries continue
   // the same session's scope); it is stopped before the wrapper exits.
-  let interactiveChild: ReturnType<typeof spawn> | undefined;
-  let interactiveEnforced = false;
   const interactiveTakeoverWatcher = startSessionTakeoverWatcher(
     options.backend,
     sessionContext.pcpSessionId,
     studioId,
     runtimeLinkId,
     () => {
-      if (options.backend === 'claude') {
-        // Claude Code's prompt hook is fail-open, so a permanent refusal
-        // reaches a human sitting at the terminal. Warn and keep going:
-        // each later prompt's hook re-warns the SB in-context, and the
-        // human decides. Terminating an attached session would be a harsher
-        // outcome than the prompt block this replaced.
-        console.error(
-          chalk.yellow(
-            '\nInkwell: this worktree\u2019s studio lease is held elsewhere or revoked. Prompts still run, but turn state may not be attributed to this session until the lease is reclaimed.'
-          )
-        );
-        return;
-      }
-      interactiveEnforced = true;
+      // PR #590: an ATTACHED session is warned, never terminated — for every
+      // backend. A permanent refusal here reaches a human sitting at the
+      // terminal; killing their session to protect the checkout is a harsher
+      // outcome than the prompt block this policy replaced. Each later
+      // prompt's hook re-warns the SB in-context, and the human decides.
+      // One-shot runs (runClaude) keep round-15 termination — nobody is
+      // there to steer them.
       console.error(
-        chalk.red(
-          '\nThis worktree\u2019s lease is permanently gone (thread closed or studio revoked). Terminating the backend to protect the checkout.'
+        chalk.yellow(
+          '\nInkwell: this worktree\u2019s studio lease is held by another session or was revoked. ' +
+            'Prompts still run, but edits here are not fenced against whoever holds the lease; the SB is ' +
+            'warned on every prompt until the lease is reclaimed. Close the other session or wait for its ' +
+            'lease to lapse before changing files here.'
         )
       );
-      interactiveChild?.kill('SIGTERM');
     }
   );
 
   while (true) {
     const { code, stderrText } = await runAttempt();
-    // Round 16: an enforced termination (SIGTERM closes with code=null)
-    // must neither retry with a fresh backend session nor exit 0.
-    if (interactiveEnforced) {
-      await interactiveTakeoverWatcher?.stop();
-      process.exit(1);
-    }
     const shouldRetry =
       attempt < maxAttempts &&
       shouldRetryWithFreshBackendSession({
@@ -4131,8 +4117,6 @@ export async function runClaudeInteractive(
     });
 
     await interactiveTakeoverWatcher?.stop();
-    // Round 19: the adjudication tick inside stop() can enforce — re-check.
-    if (interactiveEnforced) process.exit(1);
     process.exit(code || 0);
   }
 }
