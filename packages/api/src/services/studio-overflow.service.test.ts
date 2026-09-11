@@ -7,7 +7,7 @@
  */
 
 import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
-import { mkdtemp, mkdir, rm, writeFile, access } from 'fs/promises';
+import { mkdtemp, mkdir, rm, writeFile, access, symlink, readFile, lstat } from 'fs/promises';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { tmpdir } from 'os';
@@ -1108,7 +1108,7 @@ describe('S2: teardownEphemeralStudiosForThread under multiplexing (spec v18)', 
  */
 async function makeGitRepoWithPullRef(
   prNumber: number,
-  opts: { yarnTrap?: boolean } = {}
+  opts: { yarnTrap?: boolean; startupTrap?: boolean; symlinkTrap?: string } = {}
 ): Promise<{ repoRoot: string; origin: string; prHead: string; mainHead: string }> {
   const repoRoot = await makeGitRepo();
   const origin = await mkdtemp(path.join(tmpdir(), 'overflow-origin-'));
@@ -1131,6 +1131,39 @@ async function makeGitRepoWithPullRef(
   await git(['push', '-q', 'origin', 'main']);
   const { stdout: mainSha } = await git(['rev-parse', 'HEAD']);
   await git(['checkout', '-q', '-b', 'pr-source']);
+  if (opts.startupTrap) {
+    // Lumen's PR #604 round-2 probe: the PR TRACKS the startup config a
+    // review session would execute or trust — an MCP server, a SessionStart
+    // hook, per-backend config. Bootstrap seeds only when absent, so without
+    // quarantine these copies win.
+    await writeFile(
+      path.join(repoRoot, '.mcp.json'),
+      JSON.stringify({ mcpServers: { 'pr-trap': { command: '/bin/false' } } })
+    );
+    await mkdir(path.join(repoRoot, '.claude'), { recursive: true });
+    await writeFile(
+      path.join(repoRoot, '.claude', 'settings.local.json'),
+      JSON.stringify({
+        hooks: { SessionStart: [{ hooks: [{ type: 'command', command: 'touch PR-HOOK-RAN' }] }] },
+      })
+    );
+    await mkdir(path.join(repoRoot, '.codex'), { recursive: true });
+    await writeFile(
+      path.join(repoRoot, '.codex', 'config.toml'),
+      '[mcp_servers.pr-trap]\ncommand = "/bin/false"\n'
+    );
+    await mkdir(path.join(repoRoot, '.gemini'), { recursive: true });
+    await writeFile(
+      path.join(repoRoot, '.gemini', 'settings.json'),
+      JSON.stringify({ mcpServers: { 'pr-trap': {} } })
+    );
+    await git(['add', '.']);
+  }
+  if (opts.symlinkTrap) {
+    // The PR ships `.claude` as a link to a directory OUTSIDE the checkout.
+    await symlink(opts.symlinkTrap, path.join(repoRoot, '.claude'));
+    await git(['add', '.claude']);
+  }
   await git([
     '-c',
     'user.email=test@test',
@@ -1145,6 +1178,14 @@ async function makeGitRepoWithPullRef(
   await git(['push', '-q', 'origin', `HEAD:refs/pull/${prNumber}/head`]);
   await git(['checkout', '-q', 'main']);
   await git(['branch', '-D', 'pr-source']);
+  if (opts.startupTrap) {
+    // The TRUSTED copy bootstrap seeds from: the main root's own, untracked
+    // `.mcp.json` (written after the PR commit so it never enters git).
+    await writeFile(
+      path.join(repoRoot, '.mcp.json'),
+      JSON.stringify({ mcpServers: { trusted: { command: '/bin/true' } } })
+    );
+  }
   return { repoRoot, origin, prHead: prSha.trim(), mainHead: mainSha.trim() };
 }
 
@@ -1489,6 +1530,133 @@ describe('StudioOverflowService.ensureOverflowStudio — PR threads detach at th
         cwd: repoRoot,
       });
       expect(anchored.trim()).toBe(fixup.trim());
+    } finally {
+      await execFileAsync('git', ['worktree', 'remove', '--force', worktree], {
+        cwd: repoRoot,
+      }).catch(() => undefined);
+      await rm(repoRoot, { recursive: true, force: true });
+      await rm(origin, { recursive: true, force: true });
+    }
+  });
+
+  it("quarantines PR-supplied startup config before bootstrap — the checkout ends with the main root's copies (Lumen, PR #604 r2)", async () => {
+    const { repoRoot, origin } = await makeGitRepoWithPullRef(7, { startupTrap: true });
+    const slug = 'lumen-review--pr-7';
+    const worktree = ephemeralWorktreePath({ agentId: 'lumen', repoRoot, leaf: slug });
+    try {
+      const createdInputs: Array<Record<string, unknown>> = [];
+      const service = new StudioOverflowService(capturingRepo(createdInputs), {
+        logEvent: vi.fn(),
+      } as unknown as StudioLeaseService);
+      const result = await service.ensureOverflowStudio({
+        userId: 'user-1',
+        agentId: 'lumen',
+        parentStudio: makeStudio({ repoRoot, worktreePath: repoRoot }),
+        threadKey: 'pr:7',
+      });
+      expect(result?.id).toBe('new-primary');
+
+      // The PR's MCP server is gone; the main root's trusted copy is in place.
+      const mcp = JSON.parse(await readFile(path.join(worktree, '.mcp.json'), 'utf8'));
+      expect(Object.keys(mcp.mcpServers)).toEqual(['trusted']);
+      // The PR's hook is gone; our generated settings stand alone.
+      const settings = JSON.parse(
+        await readFile(path.join(worktree, '.claude', 'settings.local.json'), 'utf8')
+      );
+      expect(JSON.stringify(settings)).not.toContain('PR-HOOK-RAN');
+      expect(settings.permissions?.allow?.length).toBeGreaterThan(0);
+      // Per-backend configs were regenerated from the trusted copy, not the PR's.
+      const codex = await readFile(path.join(worktree, '.codex', 'config.toml'), 'utf8');
+      expect(codex).not.toContain('pr-trap');
+      const gemini = await readFile(path.join(worktree, '.gemini', 'settings.json'), 'utf8');
+      expect(gemini).not.toContain('pr-trap');
+    } finally {
+      await execFileAsync('git', ['worktree', 'remove', '--force', worktree], {
+        cwd: repoRoot,
+      }).catch(() => undefined);
+      await rm(repoRoot, { recursive: true, force: true });
+      await rm(origin, { recursive: true, force: true });
+    }
+  });
+
+  it('a PR that ships .claude as a symlink cannot make settings land outside the checkout', async () => {
+    // The link points at a sibling directory inside the isolated studios root,
+    // which is where the worktree materializes: `<root>/lumen/<repo>/<slug>`,
+    // so `../outside-<n>` is `<root>/lumen/<repo>/outside-<n>`. Disposable.
+    const outsideName = `outside-${Date.now()}`;
+    const { repoRoot, origin } = await makeGitRepoWithPullRef(7, {
+      symlinkTrap: path.join('..', outsideName),
+    });
+    const slug = 'lumen-review--pr-7';
+    const worktree = ephemeralWorktreePath({ agentId: 'lumen', repoRoot, leaf: slug });
+    const outside = path.join(path.dirname(worktree), outsideName);
+    try {
+      await mkdir(outside, { recursive: true });
+      const createdInputs: Array<Record<string, unknown>> = [];
+      const service = new StudioOverflowService(capturingRepo(createdInputs), {
+        logEvent: vi.fn(),
+      } as unknown as StudioLeaseService);
+      const result = await service.ensureOverflowStudio({
+        userId: 'user-1',
+        agentId: 'lumen',
+        parentStudio: makeStudio({ repoRoot, worktreePath: repoRoot }),
+        threadKey: 'pr:7',
+      });
+      expect(result?.id).toBe('new-primary');
+      // Nothing was written where the link pointed.
+      await expect(access(path.join(outside, 'settings.local.json'))).rejects.toBeDefined();
+      // The checkout's .claude is a real directory of ours, not the PR's link.
+      const entry = await lstat(path.join(worktree, '.claude'));
+      expect(entry.isSymbolicLink()).toBe(false);
+      expect(entry.isDirectory()).toBe(true);
+      await expect(
+        access(path.join(worktree, '.claude', 'settings.local.json'))
+      ).resolves.toBeUndefined();
+    } finally {
+      await execFileAsync('git', ['worktree', 'remove', '--force', worktree], {
+        cwd: repoRoot,
+      }).catch(() => undefined);
+      await rm(outside, { recursive: true, force: true }).catch(() => undefined);
+      await rm(repoRoot, { recursive: true, force: true });
+      await rm(origin, { recursive: true, force: true });
+    }
+  });
+
+  it('control: a base-branch ephemeral is not quarantined — trusted code keeps its own config', async () => {
+    // Same trap files, but tracked on the BASE (trusted) commit, and a task
+    // thread that checks out the base. Quarantine is a review-only measure.
+    const { repoRoot, origin } = await makeGitRepoWithPullRef(7);
+    const git = (args: string[]) => execFileAsync('git', args, { cwd: repoRoot });
+    await writeFile(
+      path.join(repoRoot, '.mcp.json'),
+      JSON.stringify({ mcpServers: { 'base-own': { command: '/bin/true' } } })
+    );
+    await git(['add', '.mcp.json']);
+    await git([
+      '-c',
+      'user.email=test@test',
+      '-c',
+      'user.name=test',
+      'commit',
+      '-m',
+      'base config',
+    ]);
+    const slug = 'lumen-review--task-abc';
+    const worktree = ephemeralWorktreePath({ agentId: 'lumen', repoRoot, leaf: slug });
+    try {
+      const createdInputs: Array<Record<string, unknown>> = [];
+      const service = new StudioOverflowService(capturingRepo(createdInputs), {
+        logEvent: vi.fn(),
+      } as unknown as StudioLeaseService);
+      const result = await service.ensureOverflowStudio({
+        userId: 'user-1',
+        agentId: 'lumen',
+        parentStudio: makeStudio({ repoRoot, worktreePath: repoRoot }),
+        threadKey: 'task:abc',
+      });
+      expect(result?.id).toBe('new-primary');
+      const mcp = JSON.parse(await readFile(path.join(worktree, '.mcp.json'), 'utf8'));
+      expect(Object.keys(mcp.mcpServers)).toEqual(['base-own']);
     } finally {
       await execFileAsync('git', ['worktree', 'remove', '--force', worktree], {
         cwd: repoRoot,

@@ -56,7 +56,7 @@
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import path from 'path';
-import { access } from 'fs/promises';
+import { access, lstat, rm } from 'fs/promises';
 import { bootstrapStudio } from '@inklabs/shared';
 import type { StudiosRepository, Studio } from '../data/repositories/studios.repository';
 import { ephemeralWorktreePath } from './studio-paths';
@@ -153,6 +153,43 @@ export interface DetachedCheckout {
   ref: string;
   /** The commit HEAD sat on when the worktree was created. */
   commit: string;
+}
+
+/**
+ * Startup configuration a checkout can ship and a spawn would execute or
+ * trust before any reviewer has looked: MCP server commands, hooks,
+ * environment, per-backend config. Bootstrap seeds these only when absent
+ * and the settings writer merges what it finds, which is right for a durable
+ * studio a person customised and wrong for an unreviewed PR head — there the
+ * PR's copy would win (Lumen, PR #604 round 2). A PR can also ship any of
+ * them as a symlink pointing outside the checkout.
+ */
+export const UNTRUSTED_STARTUP_CONFIG_PATHS = [
+  '.mcp.json',
+  '.env.local',
+  '.claude',
+  '.codex',
+  '.gemini',
+] as const;
+
+/**
+ * Remove every PR-supplied startup-config path from a review checkout, by its
+ * own name and never following links, so bootstrap then seeds trusted copies
+ * from the main root and the settings writer starts from nothing. Returns
+ * what was removed. Throws when a removal fails; the caller fails closed.
+ */
+export async function quarantineUntrustedStartupConfig(worktreePath: string): Promise<string[]> {
+  const removed: string[] = [];
+  for (const rel of UNTRUSTED_STARTUP_CONFIG_PATHS) {
+    const target = path.join(worktreePath, rel);
+    // lstat: a symlink counts as present whether or not its target exists.
+    const entry = await lstat(target).catch(() => null);
+    if (!entry) continue;
+    // rm on a symlink removes the link itself, never what it points at.
+    await rm(target, { recursive: true, force: true });
+    removed.push(rel);
+  }
+  return removed;
 }
 
 interface WorktreeCreation {
@@ -812,6 +849,37 @@ export class StudioOverflowService {
         });
       }
     );
+    if (opts?.detachAt) {
+      // Unreviewed code gets no say in how its review session starts. Whatever
+      // the PR shipped under these names is removed before bootstrap seeds
+      // the trusted copies (see UNTRUSTED_STARTUP_CONFIG_PATHS). Fail closed:
+      // a checkout we could not sanitise is torn down, and the message is
+      // held rather than spawned against PR-controlled startup config.
+      let quarantined: string[];
+      try {
+        quarantined = await quarantineUntrustedStartupConfig(worktreePath);
+      } catch (err) {
+        logger.error('[StudioOverflow] Could not quarantine PR-supplied startup config; refusing', {
+          worktreePath,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        await execFileAsync('git', ['worktree', 'remove', '--force', worktreePath], {
+          cwd: mainRoot,
+        }).catch(() => undefined);
+        return null;
+      }
+      if (quarantined.length > 0) {
+        // Said plainly for whoever reads the tree later: this is a sanitized
+        // runtime checkout, not a byte-for-byte working tree of the pinned
+        // commit. The PR's own versions stay inspectable with
+        // `git show <commit>:<path>`. This runs at creation only — a reused
+        // reviewer tree is never reset or edited (Lumen, PR #604).
+        logger.warn(
+          '[StudioOverflow] Sanitized runtime checkout: PR-supplied startup config removed before bootstrap (inspect with `git show <pin>:<path>`)',
+          { worktreePath, pin: commit, removed: quarantined }
+        );
+      }
+    }
     // The studios row's branch column records what is checked out; this
     // sentinel says "no branch, cut from <ref>" and can never collide with
     // branch-based routing lookups.
