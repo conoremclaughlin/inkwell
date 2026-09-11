@@ -134,7 +134,50 @@ if [[ "${PROBE_STATUS}" != "200" ]]; then
   exit 1
 fi
 
+# One 200 proved the key. `db reset` also makes PostgREST reload its schema
+# cache, and the gateway can still answer a request badly for a moment after
+# that; ask for three clean answers a second apart before starting the suite.
+echo "[integration-db] Waiting for the REST gateway to answer steadily..."
+STEADY=0
+for _ in $(seq 1 20); do
+  CODE="$(curl -s -o /dev/null -w '%{http_code}' \
+    -H "apikey: ${SUPABASE_SECRET_KEY}" \
+    -H "Authorization: Bearer ${SUPABASE_SECRET_KEY}" \
+    "${SUPABASE_URL}/rest/v1/users?select=id&limit=1" || echo "000")"
+  if [[ "${CODE}" == "200" ]]; then STEADY=$((STEADY + 1)); else STEADY=0; fi
+  if [[ "${STEADY}" -ge 3 ]]; then break; fi
+  sleep 1
+done
+if [[ "${STEADY}" -lt 3 ]]; then
+  echo "[integration-db] REST gateway never answered three times in a row (last HTTP ${CODE}); continuing anyway." >&2
+fi
+
+# When a suite fails, the vitest output shows the symptom — a repository call
+# answered "An invalid response was received from the upstream server" — and
+# nothing about the cause, because that sentence is Kong's, standing in for
+# whatever PostgREST or Postgres did. Two CI failures on 2026-09-11 were
+# exactly this (one advance_agent_inbox_read_pointer RPC, one task_groups
+# update), both green on rerun and neither reproducible locally. Dump the
+# stack's own logs before the trap tears it down, so the next blip can be
+# read off the job log instead of guessed at.
+dump_stack_diagnostics() {
+  echo "[integration-db] ❌ Suite failed — dumping isolated stack diagnostics (project ${PROJECT_ID})."
+  echo "[integration-db] --- containers ---"
+  docker ps -a --filter "name=${PROJECT_ID}" --format '{{.Names}}\t{{.Status}}' 2>/dev/null || true
+  echo "[integration-db] --- resource snapshot ---"
+  docker stats --no-stream --format '{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}' 2>/dev/null | grep "${PROJECT_ID}" || true
+  if command -v free >/dev/null 2>&1; then free -m || true; fi
+  for name in $(docker ps -a --filter "name=${PROJECT_ID}" --format '{{.Names}}' 2>/dev/null | grep -E '_(rest|kong|db)_' || true); do
+    echo "[integration-db] --- docker logs --tail 150 ${name} ---"
+    docker logs --tail 150 "${name}" 2>&1 || true
+  done
+  echo "[integration-db] --- end of diagnostics ---"
+}
+
 echo "[integration-db] Running API DB integration suite against ${SUPABASE_URL}"
-yarn --cwd "${ROOT_DIR}" workspace @inklabs/api test:integration:db
+if ! yarn --cwd "${ROOT_DIR}" workspace @inklabs/api test:integration:db; then
+  dump_stack_diagnostics
+  exit 1
+fi
 
 echo "[integration-db] ✅ Integration DB tests passed."
