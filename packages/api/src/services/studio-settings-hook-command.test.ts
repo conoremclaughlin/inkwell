@@ -63,7 +63,7 @@ describe('ensureStudioSettings — hook command', () => {
     expect(commands).toHaveLength(6);
     for (const command of commands) {
       expect(command).toMatch(
-        /^node \/srv\/checkout\/packages\/cli\/dist\/cli\.js hooks [a-z-]+ --backend claude-code$/
+        /^node \/srv\/checkout\/packages\/cli\/dist\/cli\.js hooks [a-z-]+ --backend claude-code # ink-managed$/
       );
     }
     expect(commands.map((c) => c.split(' hooks ')[1].split(' ')[0]).sort()).toEqual([
@@ -99,7 +99,7 @@ describe('ensureStudioSettings — hook command', () => {
 
     expect(commands).toHaveLength(6);
     for (const command of commands) {
-      expect(command).toMatch(/^ink hooks [a-z-]+ --backend claude-code$/);
+      expect(command).toMatch(/^ink hooks [a-z-]+ --backend claude-code # ink-managed$/);
       expect(command).not.toContain('.local/bin');
       expect(command).not.toContain('.ink/bin');
     }

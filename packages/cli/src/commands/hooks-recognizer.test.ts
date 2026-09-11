@@ -71,6 +71,46 @@ describe('isPcpHookCommand', () => {
     expect(isPcpHookCommand('ink-lumen hooks on-stop --backend codex')).toBe(true);
   });
 
+  it('accepts any launcher when the line carries the managed marker the server writes', () => {
+    expect(
+      isPcpHookCommand('/opt/tools/launch-ink hooks on-prompt --backend claude-code # ink-managed')
+    ).toBe(true);
+    expect(
+      isPcpHookCommand(
+        'node /opt/tools/entry.mjs hooks on-tool-approval --backend claude-code # ink-managed'
+      )
+    ).toBe(true);
+    expect(
+      isPcpHookCommand(
+        'node "/Users/o b/tools/entry.mjs" hooks on-stop --backend claude-code # ink-managed'
+      )
+    ).toBe(true);
+  });
+
+  it('does not let the marker stand in for the managed grammar', () => {
+    expect(isPcpHookCommand('custom-tool audit # ink-managed')).toBe(false);
+    expect(isPcpHookCommand('/opt/tools/launch-ink hooks # ink-managed')).toBe(false);
+    expect(
+      isPcpHookCommand(
+        '/opt/tools/launch-ink hooks on-prompt --backend claude-code # ink-managed-by-me'
+      )
+    ).toBe(false);
+    expect(
+      isPcpHookCommand('/opt/tools/launch-ink # ink-managed hooks on-prompt --backend claude-code')
+    ).toBe(false);
+  });
+
+  it('preserves an unrelated CLI that merely shares the command shape', () => {
+    expect(
+      isPcpHookCommand('node /opt/project/scripts/cli.js hooks audit --backend claude-code')
+    ).toBe(false);
+    expect(
+      isPcpHookCommand(
+        '/usr/local/bin/node /opt/project/scripts/cli.js hooks on-prompt --backend claude-code'
+      )
+    ).toBe(false);
+  });
+
   it('rejects hooks that are not ours', () => {
     expect(isPcpHookCommand(undefined)).toBe(false);
     expect(isPcpHookCommand('')).toBe(false);

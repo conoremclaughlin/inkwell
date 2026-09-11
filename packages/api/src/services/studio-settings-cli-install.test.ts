@@ -81,6 +81,48 @@ describe('server-generated hooks → ink hooks install', () => {
     expect(installHooks(worktree).result).toBe('installed');
   });
 
+  it('round-trips an INK_CLI_PATH executable whose name looks nothing like ink', async () => {
+    resolveInkCliMock.mockReturnValue({
+      path: '/opt/tools/launch-ink',
+      source: 'env',
+      script: false,
+    });
+    expect(await ensureStudioSettings(worktree)).toBe(true);
+
+    for (const command of hookCommands((await readSettings(worktree)).hooks)) {
+      expect(isPcpHookCommand(command), command).toBe(true);
+    }
+    expect(installHooks(worktree).result).toBe('installed');
+  });
+
+  it('round-trips an INK_CLI_PATH script that is not packages/cli/dist/cli.js', async () => {
+    resolveInkCliMock.mockReturnValue({
+      path: '/opt/tools/entry.mjs',
+      source: 'env',
+      script: true,
+    });
+    expect(await ensureStudioSettings(worktree)).toBe(true);
+
+    expect(installHooks(worktree).result).toBe('installed');
+  });
+
+  it('control: an unrelated CLI with the same command shape is preserved, not deleted', async () => {
+    resolveInkCliMock.mockReturnValue({
+      path: '/srv/checkout/packages/cli/dist/cli.js',
+      source: 'checkout',
+      script: true,
+    });
+    expect(await ensureStudioSettings(worktree)).toBe(true);
+
+    const custom = 'node /opt/project/scripts/cli.js hooks audit --backend claude-code';
+    const settings = await readSettings(worktree);
+    settings.hooks.PreToolUse.push({ hooks: [{ type: 'command', command: custom }] });
+    await writeFile(join(worktree, SETTINGS), JSON.stringify(settings, null, 2) + '\n');
+
+    expect(installHooks(worktree).result).toBe('conflict');
+    expect(hookCommands((await readSettings(worktree)).hooks)).toContain(custom);
+  });
+
   it('control: a genuinely custom hook next to the generated ones still conflicts', async () => {
     resolveInkCliMock.mockReturnValue({
       path: '/srv/checkout/packages/cli/dist/cli.js',

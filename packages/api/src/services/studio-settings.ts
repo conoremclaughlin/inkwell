@@ -68,10 +68,21 @@ function inkHookCommand(): string {
 }
 
 /**
+ * Trailing shell comment that tells `ink hooks install` a hook line is ours.
+ * The CLI recognizes its own lines by the launcher's shape, but the launcher
+ * here may be an arbitrary INK_CLI_PATH, so every line the server writes
+ * carries the marker. Must match MANAGED_HOOK_MARKER in
+ * packages/cli/src/commands/hooks.ts; studio-settings-cli-install.test.ts
+ * runs the real installer on this generator's output to pin the two.
+ */
+const MANAGED_HOOK_MARKER = '# ink-managed';
+
+/**
  * Build Claude Code lifecycle hooks that mirror `ink hooks install --claude-code`.
  */
 function buildHooks(inkCommand: string): Record<string, unknown> {
-  const cmd = (hookName: string) => `${inkCommand} hooks ${hookName} --backend claude-code`;
+  const cmd = (hookName: string) =>
+    `${inkCommand} hooks ${hookName} --backend claude-code ${MANAGED_HOOK_MARKER}`;
 
   return {
     PreCompact: [{ hooks: [{ type: 'command', command: cmd('pre-compact') }] }],
