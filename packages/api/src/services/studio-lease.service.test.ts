@@ -23,6 +23,7 @@ import path from 'path';
 import {
   StudioLeaseService,
   captureWorktreeState,
+  writeCheckoutPin,
   rescueSucceeded,
   isLeaseStale,
   leaseThreadKeys,
@@ -2178,6 +2179,95 @@ describe('captureWorktreeState (real git)', () => {
         cwd: repoDir,
       });
       expect(rescues.trim().split('\n').filter(Boolean)).toHaveLength(1);
+    });
+
+    it('leaves a pinned fetched PR head alone, but anchors work committed on top of it', async () => {
+      // The shape a PR review leaves behind: HEAD detached at a commit that
+      // no local branch reaches, published only as origin/pr/9, with the
+      // checkout pin recorded in the worktree's gitdir at creation.
+      const git = (...args: string[]) => execFileAsync('git', args, { cwd: repoDir });
+      await git('checkout', '-q', '-b', 'pr-source');
+      await git('commit', '--allow-empty', '-m', 'pr head');
+      const { stdout: prSha } = await git('rev-parse', 'HEAD');
+      await git('update-ref', 'refs/remotes/origin/pr/9', prSha.trim());
+      await git('checkout', '-q', 'main');
+      await git('branch', '-D', 'pr-source');
+      const prWorktree = path.join(path.dirname(repoDir), `${path.basename(repoDir)}--pr9`);
+      await git('worktree', 'add', '--detach', prWorktree, 'refs/remotes/origin/pr/9');
+      try {
+        await writeCheckoutPin(prWorktree, {
+          commit: prSha.trim(),
+          ref: 'refs/remotes/origin/pr/9',
+        });
+        const state = await captureWorktreeState(prWorktree, { rescue: true, rescueLabel: 'pr:9' });
+        expect(state.commit).toBe(prSha.trim());
+        // Nothing to anchor: that commit is the review's own input.
+        expect(state.rescueBranch).toBeUndefined();
+        expect(rescueSucceeded(state)).toBe(true);
+
+        // A commit made during the review is new work and IS anchored.
+        await execFileAsync('git', ['commit', '--allow-empty', '-m', 'review fixup'], {
+          cwd: prWorktree,
+        });
+        const after = await captureWorktreeState(prWorktree, { rescue: true, rescueLabel: 'pr:9' });
+        expect(after.rescueBranch).toMatch(/^ink-rescue\/pr-9-[0-9a-f]{10}$/);
+      } finally {
+        await execFileAsync('git', ['worktree', 'remove', '--force', prWorktree], {
+          cwd: repoDir,
+        }).catch(() => undefined);
+      }
+    });
+
+    it("a stale remote-tracking branch does not make a reviewer's own commits safe (Lumen, PR #604 P2)", async () => {
+      // The reviewer commits C on the detached checkout and pushes it to
+      // review-fix; someone else deletes that remote branch. Locally,
+      // origin/review-fix still names C until the next prune. C must be
+      // rescued anyway — the remote no longer has it.
+      await writeFile(path.join(worktree, 'work.txt'), 'reviewer work\n');
+      await execFileAsync('git', ['add', '.'], { cwd: worktree });
+      await execFileAsync('git', ['commit', '-m', 'C'], { cwd: worktree });
+      const { stdout: c } = await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: worktree });
+      await execFileAsync('git', ['update-ref', 'refs/remotes/origin/review-fix', c.trim()], {
+        cwd: repoDir,
+      });
+
+      const state = await captureWorktreeState(worktree, { rescue: true, rescueLabel: 'pr:2' });
+      expect(state.rescueBranch).toMatch(/^ink-rescue\/pr-2-/);
+      const { stdout: anchored } = await execFileAsync('git', ['rev-parse', state.rescueBranch!], {
+        cwd: repoDir,
+      });
+      expect(anchored.trim()).toBe(c.trim());
+    });
+
+    it('a reviewer who fetched forward to a newer tip of the pinned ref is still on known input', async () => {
+      // Pinned at A with ref origin/pr/9; the PR is force-updated to B and
+      // the reviewer checks B out. B is not the pinned commit, but it is the
+      // current tip of the pinned ref — fetched input, not rescue-worthy work.
+      const git = (...args: string[]) => execFileAsync('git', args, { cwd: repoDir });
+      await git('checkout', '-q', '-b', 'pr-source');
+      await git('commit', '--allow-empty', '-m', 'A');
+      const { stdout: a } = await git('rev-parse', 'HEAD');
+      await git('update-ref', 'refs/remotes/origin/pr/9', a.trim());
+      await git('commit', '--allow-empty', '-m', 'B');
+      const { stdout: b } = await git('rev-parse', 'HEAD');
+      await git('checkout', '-q', 'main');
+      await git('branch', '-D', 'pr-source');
+      const prWorktree = path.join(path.dirname(repoDir), `${path.basename(repoDir)}--pr9b`);
+      await git('worktree', 'add', '--detach', prWorktree, a.trim());
+      try {
+        await writeCheckoutPin(prWorktree, { commit: a.trim(), ref: 'refs/remotes/origin/pr/9' });
+        // The PR moves; the reviewer follows it.
+        await git('update-ref', 'refs/remotes/origin/pr/9', b.trim());
+        await execFileAsync('git', ['checkout', '-q', '--detach', b.trim()], { cwd: prWorktree });
+        const state = await captureWorktreeState(prWorktree, { rescue: true, rescueLabel: 'pr:9' });
+        expect(state.commit).toBe(b.trim());
+        expect(state.rescueBranch).toBeUndefined();
+        expect(rescueSucceeded(state)).toBe(true);
+      } finally {
+        await execFileAsync('git', ['worktree', 'remove', '--force', prWorktree], {
+          cwd: repoDir,
+        }).catch(() => undefined);
+      }
     });
 
     it('stash-rescues a dirty detached tree and anchors its commits in one pass', async () => {

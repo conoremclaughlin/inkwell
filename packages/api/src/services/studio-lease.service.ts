@@ -51,9 +51,10 @@
  */
 
 import { execFile } from 'child_process';
+import path from 'path';
 import { randomUUID } from 'crypto';
 import { promisify } from 'util';
-import { access, realpath } from 'fs/promises';
+import { access, realpath, readFile, writeFile } from 'fs/promises';
 import { sep } from 'path';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { Database, Json } from '../data/supabase/types';
@@ -274,14 +275,75 @@ export function parseStudioLease(raw: Json | null | undefined): StudioLease | nu
 }
 
 /**
+ * The checkout pin: what a detached worktree was created FROM, recorded in
+ * the worktree's own gitdir (`.git/worktrees/<name>/ink-checkout-pin.json`)
+ * so it travels with the checkout and dies with it.
+ *
+ * Why a file in the gitdir rather than a studio column: every rescue site
+ * (teardown, close_studio, dead-holder reclaim, the expiry sweep) captures
+ * from a PATH, and several never load the studio row. The pin has to be
+ * where the capture already is.
+ *
+ * `commit` is what HEAD sat on at creation. `ref` names the fetched review
+ * input (`refs/remotes/origin/pr/<n>`) when there was one, so a reviewer
+ * who fetches forward and checks out a newer PR head is still standing on
+ * known fetched input, not on rescue-worthy work. Nothing else is exempt: a
+ * stale remote-tracking branch for some OTHER ref does not make a reviewer's
+ * own commits safe (Lumen, PR #604 P2).
+ */
+export const CHECKOUT_PIN_FILE = 'ink-checkout-pin.json';
+
+export interface CheckoutPin {
+  commit: string;
+  ref?: string;
+}
+
+async function worktreeGitDir(worktreePath: string): Promise<string> {
+  const { stdout } = await execFileAsync('git', ['rev-parse', '--git-dir'], { cwd: worktreePath });
+  return path.resolve(worktreePath, stdout.trim());
+}
+
+export async function writeCheckoutPin(worktreePath: string, pin: CheckoutPin): Promise<void> {
+  const gitDir = await worktreeGitDir(worktreePath);
+  await writeFile(path.join(gitDir, CHECKOUT_PIN_FILE), JSON.stringify(pin), 'utf8');
+}
+
+/** Null when there is no pin or it is unreadable — never throws. */
+export async function readCheckoutPin(worktreePath: string): Promise<CheckoutPin | null> {
+  try {
+    const gitDir = await worktreeGitDir(worktreePath);
+    const raw = await readFile(path.join(gitDir, CHECKOUT_PIN_FILE), 'utf8');
+    const parsed = JSON.parse(raw) as Partial<CheckoutPin>;
+    if (typeof parsed.commit !== 'string' || !/^[0-9a-f]{40}$/.test(parsed.commit)) return null;
+    return typeof parsed.ref === 'string' && /^refs\/[A-Za-z0-9._/-]+$/.test(parsed.ref)
+      ? { commit: parsed.commit, ref: parsed.ref }
+      : { commit: parsed.commit };
+  } catch {
+    return null;
+  }
+}
+
+/** True when `git rev-parse --verify` resolves the name to a commit. */
+async function commitish(worktreePath: string, name: string): Promise<boolean> {
+  return execFileAsync('git', ['rev-parse', '--verify', '--quiet', `${name}^{commit}`], {
+    cwd: worktreePath,
+  })
+    .then(() => true)
+    .catch(() => false);
+}
+
+/**
  * Capture the state of a worktree, taking the safe ref Conor asked for:
  * branch + HEAD always; a stash (with its commit SHA) when the tree is dirty
  * and `rescue` is set. Never throws — a git failure is recorded in the result
  * and callers decide whether it blocks (teardown, reclaim) or not (bookkeeping).
+ *
+ * `knownBases`: extra commits or refs the caller knows are safe elsewhere;
+ * they are excluded from the detached-commit rescue alongside the checkout pin.
  */
 export async function captureWorktreeState(
   worktreePath: string,
-  opts: { rescue?: boolean; rescueLabel?: string } = {}
+  opts: { rescue?: boolean; rescueLabel?: string; knownBases?: string[] } = {}
 ): Promise<WorktreeFinalState> {
   const state: WorktreeFinalState = {};
   try {
@@ -315,10 +377,24 @@ export async function captureWorktreeState(
     // Anchor them with an `ink-rescue/*` branch before anyone deletes the
     // checkout. Named by label + commit so re-rescuing the same HEAD converges
     // on the same branch instead of erroring; `-f` makes it idempotent.
+    //
+    // What is NOT rescued: the commit the checkout was created from and the
+    // specific fetched review ref it came from (the checkout pin), plus any
+    // `knownBases` the caller supplies. A PR review's own commits already
+    // live on the remote; rescuing them would mint a branch per review. The
+    // exemption is exactly that narrow. `--remotes` as a whole is not safe: a
+    // stale remote-tracking branch can still name a commit the remote has
+    // since deleted, and that commit may be the reviewer's own work (Lumen,
+    // PR #604 P2). Names that no longer resolve are simply not exempt.
     if (opts.rescue && state.branch === 'HEAD' && state.commit) {
+      const exemptions = ['--branches'];
+      const pin = await readCheckoutPin(worktreePath);
+      for (const name of [...(opts.knownBases ?? []), pin?.commit, pin?.ref]) {
+        if (name && (await commitish(worktreePath, name))) exemptions.push(name);
+      }
       const { stdout: unreachable } = await execFileAsync(
         'git',
-        ['rev-list', '-n', '1', 'HEAD', '--not', '--branches'],
+        ['rev-list', '-n', '1', 'HEAD', '--not', ...exemptions],
         { cwd: worktreePath }
       );
       if (unreachable.trim()) {

@@ -6,7 +6,7 @@
  * net before Claude Code spawn.
  */
 
-import { mkdir, readFile, writeFile, rm } from 'fs/promises';
+import { mkdir, readFile, writeFile, rm, lstat } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { logger } from '../utils/logger';
@@ -107,6 +107,20 @@ function buildHooks(inkPath: string): Record<string, unknown> {
  */
 export async function ensureStudioSettings(worktreePath: string): Promise<boolean> {
   const settingsPath = join(worktreePath, CLAUDE_SETTINGS_REL);
+
+  // Never write through a link. A checkout can ship `.claude`, or the settings
+  // file itself, as a symlink to anywhere; merging and writing would then land
+  // outside the worktree (Lumen, PR #604). lstat sees the link, not its target.
+  for (const candidate of [join(worktreePath, '.claude'), settingsPath]) {
+    const entry = await lstat(candidate).catch(() => null);
+    if (entry?.isSymbolicLink()) {
+      logger.warn('Refusing to write studio settings through a symlink', {
+        worktreePath,
+        path: candidate,
+      });
+      return false;
+    }
+  }
 
   let existing: ClaudeSettings = {};
   try {
