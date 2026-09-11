@@ -64,6 +64,7 @@ import { ensureStudioSettings } from './studio-settings';
 import {
   StudioLeaseService,
   captureWorktreeState,
+  writeCheckoutPin,
   rescueSucceeded,
   parseStudioLease,
   leaseThreadKeys,
@@ -725,7 +726,9 @@ export class StudioOverflowService {
           return null;
         }
       }
-      return this.finishWorktreeSetup(mainRoot, worktreePath, branch);
+      return this.finishWorktreeSetup(mainRoot, worktreePath, branch, undefined, {
+        installDependencies: true,
+      });
     }
 
     // Ephemeral studios check out DETACHED (Conor, 2026-09-01): review and
@@ -743,21 +746,30 @@ export class StudioOverflowService {
     // Where to detach: the PR head for a PR thread, when it can be fetched.
     // A failed fetch (no `origin`, not GitHub, offline, PR gone) is not fatal
     // — the review still gets a detached worktree, just at the base branch,
-    // exactly as before; the warning says which. Serialized like the add:
-    // concurrent fetches of one refspec would fight over the ref lock.
+    // exactly as before; the warning says which. The fetch takes its own
+    // per-repo lock (two fetches of one refspec would fight over the ref
+    // lock) — not the worktree-add lock, so a slow fetch never blocks
+    // unrelated adds (Lumen, PR #604). The add then targets the resolved SHA.
     let target = baseBranch;
     let label = baseBranch;
+    let pinRef: string | undefined;
     if (opts?.detachAt) {
       const pr = opts.detachAt;
       try {
-        await withKeyedLock(`git-worktree:${mainRoot}`, () =>
+        await withKeyedLock(`git-fetch:${mainRoot}`, () =>
           execFileAsync('git', ['fetch', '--no-tags', '--quiet', 'origin', pr.fetchRefspec], {
             cwd: mainRoot,
             timeout: 60_000,
           })
         );
-        target = pr.localRef;
+        const { stdout: sha } = await execFileAsync(
+          'git',
+          ['rev-parse', '--verify', `${pr.localRef}^{commit}`],
+          { cwd: mainRoot }
+        );
+        target = sha.trim();
         label = pr.label;
+        pinRef = pr.localRef;
       } catch (err) {
         logger.warn('[StudioOverflow] PR head fetch failed; detaching at the base branch instead', {
           worktreePath,
@@ -783,30 +795,59 @@ export class StudioOverflowService {
       return null;
     }
     // Pin what HEAD sat on: reuse never resets a checkout, so "which commit
-    // did this review start from" has to be recorded, not re-derived.
+    // did this review start from" has to be recorded, not re-derived. The
+    // pin lives in the worktree's gitdir (see writeCheckoutPin) because every
+    // rescue site captures from the path, and the row copy is for humans.
     const { stdout: pinned } = await execFileAsync('git', ['rev-parse', 'HEAD'], {
       cwd: worktreePath,
     });
+    const commit = pinned.trim();
+    await writeCheckoutPin(worktreePath, pinRef ? { commit, ref: pinRef } : { commit }).catch(
+      (err) => {
+        // Over-rescue is the safe failure: without the pin, teardown anchors
+        // the fetched head under ink-rescue/* rather than losing anything.
+        logger.warn('[StudioOverflow] Could not record the checkout pin', {
+          worktreePath,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    );
     // The studios row's branch column records what is checked out; this
     // sentinel says "no branch, cut from <ref>" and can never collide with
     // branch-based routing lookups.
-    return this.finishWorktreeSetup(mainRoot, worktreePath, `detached:${label}`, {
-      mode: 'detached',
-      ref: label,
-      commit: pinned.trim(),
-    });
+    return this.finishWorktreeSetup(
+      mainRoot,
+      worktreePath,
+      `detached:${label}`,
+      { mode: 'detached', ref: label, commit },
+      // A PR thread's checkout is unreviewed code. Installing dependencies
+      // there runs it: Yarn honours a repo-controlled `yarnPath`, so the PR
+      // chooses the binary `yarn install` executes, in this server process,
+      // before any reviewer has looked (Lumen, PR #604 P1 — proven with a
+      // harmless marker). Skipping lifecycle scripts would not help; the
+      // package manager itself is the payload. The reviewer installs
+      // deliberately, or not at all. Applies whether or not the fetch
+      // succeeded: the thread, not the fallback, is what makes it a review.
+      { installDependencies: !opts?.detachAt }
+    );
   }
 
   private async finishWorktreeSetup(
     mainRoot: string,
     worktreePath: string,
     branch: string,
-    checkout?: DetachedCheckout
+    checkout: DetachedCheckout | undefined,
+    setup: { installDependencies: boolean }
   ): Promise<WorktreeCreation> {
     const pkgJson = await access(path.join(worktreePath, 'package.json'))
       .then(() => true)
       .catch(() => false);
-    if (pkgJson) {
+    if (pkgJson && !setup.installDependencies) {
+      logger.info(
+        '[StudioOverflow] Dependency install skipped — unreviewed checkout; run it deliberately',
+        { worktreePath }
+      );
+    } else if (pkgJson) {
       await execFileAsync('yarn', ['install'], { cwd: worktreePath, timeout: 120_000 }).catch(
         (err) => {
           logger.warn('[StudioOverflow] yarn install failed (non-fatal)', {

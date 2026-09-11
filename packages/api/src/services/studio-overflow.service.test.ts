@@ -7,7 +7,7 @@
  */
 
 import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
-import { mkdtemp, mkdir, rm } from 'fs/promises';
+import { mkdtemp, mkdir, rm, writeFile, access } from 'fs/promises';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { tmpdir } from 'os';
@@ -35,6 +35,7 @@ import {
 } from './studio-overflow.service';
 import type { Studio, StudiosRepository } from '../data/repositories/studios.repository';
 import type { StudioLeaseService, StudioLease } from './studio-lease.service';
+import { readCheckoutPin } from './studio-lease.service';
 import { ephemeralWorktreePath } from './studio-paths';
 
 // Every ephemeral mint in this file materializes under an isolated root —
@@ -1106,11 +1107,25 @@ describe('S2: teardownEphemeralStudiosForThread under multiplexing (spec v18)', 
  * convention), and the branch is deleted locally.
  */
 async function makeGitRepoWithPullRef(
-  prNumber: number
+  prNumber: number,
+  opts: { yarnTrap?: boolean } = {}
 ): Promise<{ repoRoot: string; origin: string; prHead: string; mainHead: string }> {
   const repoRoot = await makeGitRepo();
   const origin = await mkdtemp(path.join(tmpdir(), 'overflow-origin-'));
   const git = (args: string[], cwd = repoRoot) => execFileAsync('git', args, { cwd });
+  if (opts.yarnTrap) {
+    // Lumen's PR #604 probe: the repo's own Yarn config decides which binary
+    // `yarn install` runs. The trap "binary" only writes a marker into the
+    // worktree, so a test can SEE whether the package manager executed.
+    await writeFile(path.join(repoRoot, 'package.json'), '{"name":"trap","private":true}\n');
+    await writeFile(path.join(repoRoot, '.yarnrc.yml'), 'yarnPath: ./fake-yarn.cjs\n');
+    await writeFile(
+      path.join(repoRoot, 'fake-yarn.cjs'),
+      "require('fs').writeFileSync(require('path').join(process.cwd(), 'PR-CODE-RAN.marker'), 'ran');\n"
+    );
+    await git(['add', '.']);
+    await git(['-c', 'user.email=test@test', '-c', 'user.name=test', 'commit', '-m', 'yarn trap']);
+  }
   await git(['init', '--bare', '-b', 'main'], origin);
   await git(['remote', 'add', 'origin', origin]);
   await git(['push', '-q', 'origin', 'main']);
@@ -1220,6 +1235,11 @@ describe('StudioOverflowService.ensureOverflowStudio — PR threads detach at th
         { cwd: repoRoot }
       );
       expect(tracking.trim()).toBe(prHead);
+      // The checkout pin travels with the worktree, in its own gitdir.
+      await expect(readCheckoutPin(worktree)).resolves.toEqual({
+        commit: prHead,
+        ref: 'refs/remotes/origin/pr/7',
+      });
     } finally {
       await execFileAsync('git', ['worktree', 'remove', '--force', worktree], {
         cwd: repoRoot,
@@ -1259,6 +1279,8 @@ describe('StudioOverflowService.ensureOverflowStudio — PR threads detach at th
         cwd: repoRoot,
       });
       expect(branches.split('\n').filter((l) => l.trim()).length).toBe(1);
+      // Pinned to what it actually checked out — no ref, since none was fetched.
+      await expect(readCheckoutPin(worktree)).resolves.toEqual({ commit: mainHead });
     } finally {
       await execFileAsync('git', ['worktree', 'remove', '--force', worktree], {
         cwd: repoRoot,
@@ -1322,6 +1344,151 @@ describe('StudioOverflowService.ensureOverflowStudio — PR threads detach at th
         note: 'keep me',
         checkout: { mode: 'detached', ref: 'origin/pr/7', commit: prHead },
       });
+    } finally {
+      await execFileAsync('git', ['worktree', 'remove', '--force', worktree], {
+        cwd: repoRoot,
+      }).catch(() => undefined);
+      await rm(repoRoot, { recursive: true, force: true });
+      await rm(origin, { recursive: true, force: true });
+    }
+  });
+
+  it('never runs the package manager on an unreviewed PR head — the PR chooses the binary via yarnPath (Lumen, PR #604 P1)', async () => {
+    const { repoRoot, origin } = await makeGitRepoWithPullRef(7, { yarnTrap: true });
+    const slug = 'lumen-review--pr-7';
+    const worktree = ephemeralWorktreePath({ agentId: 'lumen', repoRoot, leaf: slug });
+    try {
+      const createdInputs: Array<Record<string, unknown>> = [];
+      const service = new StudioOverflowService(capturingRepo(createdInputs), {
+        logEvent: vi.fn(),
+      } as unknown as StudioLeaseService);
+      const result = await service.ensureOverflowStudio({
+        userId: 'user-1',
+        agentId: 'lumen',
+        parentStudio: makeStudio({ repoRoot, worktreePath: repoRoot }),
+        threadKey: 'pr:7',
+      });
+      expect(result?.id).toBe('new-primary');
+      const present = (p: string) =>
+        access(p)
+          .then(() => true)
+          .catch(() => false);
+      expect(await present(path.join(worktree, 'package.json'))).toBe(true);
+      expect(await present(path.join(worktree, 'PR-CODE-RAN.marker'))).toBe(false);
+      expect(await present(path.join(worktree, 'node_modules'))).toBe(false);
+    } finally {
+      await execFileAsync('git', ['worktree', 'remove', '--force', worktree], {
+        cwd: repoRoot,
+      }).catch(() => undefined);
+      await rm(repoRoot, { recursive: true, force: true });
+      await rm(origin, { recursive: true, force: true });
+    }
+  });
+
+  it('control: the same trap fires for a non-PR ephemeral at the base, so the test can see execution', async () => {
+    const { repoRoot, origin } = await makeGitRepoWithPullRef(7, { yarnTrap: true });
+    const slug = 'lumen-review--task-abc';
+    const worktree = ephemeralWorktreePath({ agentId: 'lumen', repoRoot, leaf: slug });
+    try {
+      const createdInputs: Array<Record<string, unknown>> = [];
+      const service = new StudioOverflowService(capturingRepo(createdInputs), {
+        logEvent: vi.fn(),
+      } as unknown as StudioLeaseService);
+      const result = await service.ensureOverflowStudio({
+        userId: 'user-1',
+        agentId: 'lumen',
+        parentStudio: makeStudio({ repoRoot, worktreePath: repoRoot }),
+        threadKey: 'task:abc',
+      });
+      expect(result?.id).toBe('new-primary');
+      await expect(access(path.join(worktree, 'PR-CODE-RAN.marker'))).resolves.toBeUndefined();
+    } finally {
+      await execFileAsync('git', ['worktree', 'remove', '--force', worktree], {
+        cwd: repoRoot,
+      }).catch(() => undefined);
+      await rm(repoRoot, { recursive: true, force: true });
+      await rm(origin, { recursive: true, force: true });
+    }
+  });
+
+  it('teardown rescues only what the reviewer added on top of the fetched head', async () => {
+    const { repoRoot, origin } = await makeGitRepoWithPullRef(7);
+    const slug = 'lumen-review--pr-7';
+    const worktree = ephemeralWorktreePath({ agentId: 'lumen', repoRoot, leaf: slug });
+    const parent = makeStudio({ repoRoot, worktreePath: repoRoot });
+    try {
+      const createdInputs: Array<Record<string, unknown>> = [];
+      const studios = {
+        findById: vi.fn(),
+        findBySlug: vi.fn().mockResolvedValue(null),
+        create: vi.fn().mockImplementation((input: Record<string, unknown>) => {
+          createdInputs.push(input);
+          return Promise.resolve(makeStudio({ id: 'new-primary', ...(input as Partial<Studio>) }));
+        }),
+        update: vi.fn(),
+        markCleaned: vi.fn().mockResolvedValue(undefined),
+      } as unknown as StudiosRepository;
+      const leases = {
+        logEvent: vi.fn(),
+        claimForTeardown: vi.fn().mockResolvedValue(makeTeardownClaim()),
+        verifyClaim: vi.fn().mockResolvedValue(true),
+        clearTeardownClaim: vi.fn().mockResolvedValue(true),
+        finalizeTeardown: vi.fn().mockResolvedValue(true),
+      } as unknown as StudioLeaseService;
+      const service = new StudioOverflowService(studios, leases);
+      const ensure = () =>
+        service.ensureOverflowStudio({
+          userId: 'user-1',
+          agentId: 'lumen',
+          parentStudio: parent,
+          threadKey: 'pr:7',
+        });
+      const rescues = async () => {
+        const { stdout } = await execFileAsync('git', ['branch', '--list', 'ink-rescue/*'], {
+          cwd: repoRoot,
+        });
+        return stdout
+          .split('\n')
+          .map((l) => l.replace(/^\*?\s*/, '').trim())
+          .filter(Boolean);
+      };
+
+      // Pass 1: an untouched review — teardown removes the worktree and mints nothing.
+      const first = await ensure();
+      await service.teardownEphemeralStudio(first!, { reason: 'thread pr:7 closed' });
+      expect(
+        await access(worktree)
+          .then(() => true)
+          .catch(() => false)
+      ).toBe(false);
+      expect(await rescues()).toEqual([]);
+
+      // Pass 2: the reviewer commits on top — teardown anchors exactly that.
+      const second = await ensure();
+      await execFileAsync(
+        'git',
+        [
+          '-c',
+          'user.email=test@test',
+          '-c',
+          'user.name=test',
+          'commit',
+          '--allow-empty',
+          '-m',
+          'review fixup',
+        ],
+        { cwd: worktree }
+      );
+      const { stdout: fixup } = await execFileAsync('git', ['rev-parse', 'HEAD'], {
+        cwd: worktree,
+      });
+      await service.teardownEphemeralStudio(second!, { reason: 'thread pr:7 closed' });
+      const names = await rescues();
+      expect(names).toHaveLength(1);
+      const { stdout: anchored } = await execFileAsync('git', ['rev-parse', names[0]], {
+        cwd: repoRoot,
+      });
+      expect(anchored.trim()).toBe(fixup.trim());
     } finally {
       await execFileAsync('git', ['worktree', 'remove', '--force', worktree], {
         cwd: repoRoot,
