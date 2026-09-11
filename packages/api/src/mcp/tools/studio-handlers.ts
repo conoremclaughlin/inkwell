@@ -75,14 +75,14 @@ const createStudioSchema = userIdentifierBaseSchema.extend({
     .describe('Type of work being done in this studio'),
   purpose: z.string().optional().describe('Human-readable description of what this studio is for'),
   baseBranch: z.string().optional().default('main').describe('Branch to base the new worktree on'),
-  sessionId: z.string().uuid().optional().describe('Session ID to link to this studio'),
+  sessionId: z.string().guid().optional().describe('Session ID to link to this studio'),
   roleTemplate: z
     .string()
     .optional()
     .describe('Role template name used when creating the studio (e.g., "reviewer", "builder")'),
   defaultProjectId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('Default project ID for task groups created in this studio'),
   skipGitOperations: z
@@ -107,7 +107,7 @@ const listStudiosSchema = userIdentifierBaseSchema.extend({
 });
 
 const getStudioSchema = userIdentifierBaseSchema.extend({
-  studioId: z.string().uuid().optional().describe('Studio UUID'),
+  studioId: z.string().guid().optional().describe('Studio UUID'),
   branch: z.string().optional().describe('Branch name to look up'),
   path: z.string().optional().describe('Worktree path to look up'),
   agentId: z
@@ -117,21 +117,21 @@ const getStudioSchema = userIdentifierBaseSchema.extend({
 });
 
 const updateStudioSchema = userIdentifierBaseSchema.extend({
-  studioId: z.string().uuid().describe('Studio UUID to update'),
+  studioId: z.string().guid().describe('Studio UUID to update'),
   agentId: z.string().describe('Agent ID making the update'),
   status: z.enum(['active', 'idle', 'archived']).optional().describe('New studio status'),
   purpose: z.string().optional().describe('Updated purpose description'),
   roleTemplate: z.string().optional().describe('Role template name to set'),
   worktreePath: z.string().optional().describe('Updated worktree path (after rename/move)'),
   slug: z.string().optional().describe('Updated studio slug'),
-  sessionId: z.string().uuid().optional().describe('Session ID to link'),
+  sessionId: z.string().guid().optional().describe('Session ID to link'),
   unlinkSession: z
     .boolean()
     .optional()
     .describe('If true, unlink the current session and set status to idle'),
   defaultProjectId: z
     .string()
-    .uuid()
+    .guid()
     .nullable()
     .optional()
     .describe('Default project ID for task groups created in this studio. Set to null to clear.'),
@@ -147,7 +147,7 @@ const updateStudioSchema = userIdentifierBaseSchema.extend({
 });
 
 const closeStudioSchema = userIdentifierBaseSchema.extend({
-  studioId: z.string().uuid().describe('Studio UUID to close'),
+  studioId: z.string().guid().describe('Studio UUID to close'),
   agentId: z.string().describe('Agent ID closing the studio'),
   removeWorktree: z
     .boolean()
@@ -163,8 +163,8 @@ const closeStudioSchema = userIdentifierBaseSchema.extend({
 
 const adoptStudioSchema = userIdentifierBaseSchema.extend({
   agentId: z.string().describe('Agent ID adopting the studio'),
-  sessionId: z.string().uuid().describe('Session ID to link to the studio'),
-  studioId: z.string().uuid().optional().describe('Studio UUID to adopt'),
+  sessionId: z.string().guid().describe('Session ID to link to the studio'),
+  studioId: z.string().guid().optional().describe('Studio UUID to adopt'),
   branch: z.string().optional().describe('Branch name to look up the studio'),
   worktreePath: z.string().optional().describe('Worktree path to look up the studio'),
   routePatterns: z

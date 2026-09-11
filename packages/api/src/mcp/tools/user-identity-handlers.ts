@@ -18,7 +18,7 @@ import { resolveUserOrThrow } from '../../services/user-resolver';
 const userIdentifierFields = {
   userId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('User UUID — usually unnecessary, auto-resolved from OAuth token'),
   email: z
@@ -35,7 +35,7 @@ const userIdentifierFields = {
     .enum(['telegram', 'whatsapp', 'discord'])
     .optional()
     .describe('Platform name — only needed for platform-based user lookup'),
-  workspaceId: z.string().uuid().optional().describe('Optional product workspace scope'),
+  workspaceId: z.string().guid().optional().describe('Optional product workspace scope'),
 };
 
 // =====================================================

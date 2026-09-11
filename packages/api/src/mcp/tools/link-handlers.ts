@@ -22,7 +22,7 @@ export const searchLinksSchema = userIdentifierBaseSchema.extend({
 });
 
 export const tagLinkSchema = userIdentifierBaseSchema.extend({
-  linkId: z.string().uuid(),
+  linkId: z.string().guid(),
   addTags: z.array(z.string()).optional(),
   removeTags: z.array(z.string()).optional(),
 });

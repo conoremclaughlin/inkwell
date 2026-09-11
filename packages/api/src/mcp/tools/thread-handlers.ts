@@ -98,8 +98,8 @@ const getThreadMessagesSchema = userIdentifierBaseSchema.extend({
   threadKey: threadKeySchema,
   agentId: z.string().describe('Agent ID requesting access (must be a participant)'),
   limit: z.number().int().min(1).max(200).optional().default(50),
-  beforeMessageId: z.string().uuid().optional().describe('Cursor: get messages before this ID'),
-  afterMessageId: z.string().uuid().optional().describe('Cursor: get messages after this ID'),
+  beforeMessageId: z.string().guid().optional().describe('Cursor: get messages before this ID'),
+  afterMessageId: z.string().guid().optional().describe('Cursor: get messages after this ID'),
   includeSystemEvents: z.boolean().optional().default(true),
   markRead: z.boolean().optional().default(true),
   fullHistory: z
@@ -138,7 +138,7 @@ const addThreadParticipantSchema = userIdentifierBaseSchema.extend({
   addedByAgentId: agentIdSchema.optional(),
   reason: z.string().max(500).optional(),
   triggerNewParticipant: z.boolean().optional().default(true),
-  metadata: z.record(z.unknown()).optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
 });
 
 const closeThreadSchema = userIdentifierBaseSchema.extend({
@@ -157,7 +157,7 @@ const markThreadReadSchema = userIdentifierBaseSchema.extend({
   agentId: agentIdSchema.describe('Agent ID marking the thread as read'),
   throughMessageId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe(
       'Exact-id acknowledgement (spec inkmail-read-state §1): advance the read pointer through THIS message only — the last one actually delivered — instead of the whole thread. Used by delivery consumers (channel plugin) to ack after successful injection.'

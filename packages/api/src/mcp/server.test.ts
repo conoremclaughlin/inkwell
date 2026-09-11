@@ -300,6 +300,51 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     expect(result.result.protocolVersion).toBe('2025-03-26');
   });
 
+  it('serves protocol 2026-07-28 to a v2 client and still serves 2025-era clients', async () => {
+    // The production symptom behind the SDK v2 migration: Claude Code offers
+    // 2026-07-28 and the 1.x transport answered every follow-up request with
+    // 400 "Unsupported protocol version". The modern revision rides on the
+    // client's envelope probe, so it is pinned through a real client rather
+    // than a hand-built initialize; the bare initialize below is the legacy
+    // leg, which must keep answering from the same tool registry.
+    if (serverUnavailableError) return;
+    const { Client, StreamableHTTPClientTransport } = await import('@modelcontextprotocol/client');
+    const connect = async (mode: 'auto' | 'legacy') => {
+      const transport = new StreamableHTTPClientTransport(new URL(`${baseUrl}/mcp`));
+      // 'auto' is what a 2026 client does: probe the modern revision, fall
+      // back to the 2025 handshake. 'legacy' (the SDK default) is a 2025 client.
+      const client = new Client(
+        { name: 'v2-test-client', version: '0.0.0' },
+        { versionNegotiation: { mode } }
+      );
+      await client.connect(transport);
+      const negotiated = transport.protocolVersion;
+      const serverName = client.getServerVersion()?.name;
+      const tools = await client.listTools();
+      await client.close();
+      return { negotiated, toolCount: tools.tools.length, serverName };
+    };
+
+    const modern = await connect('auto');
+    expect(modern.negotiated).toBe('2026-07-28');
+    expect(modern.serverName).toBe('inkwell');
+
+    const legacy = await connect('legacy');
+    expect(legacy.negotiated).toBe('2025-11-25');
+    // Same factory behind both eras: the catalogs cannot differ. (This file
+    // mocks registerAllTools, so the registry's size is asserted elsewhere.)
+    expect(legacy.toolCount).toBe(modern.toolCount);
+
+    // A bare 2025-style initialize naming the modern revision is legacy
+    // traffic (no envelope): it is answered, not refused with a 400.
+    const bare = await mcpPost(baseUrl, {
+      ...INITIALIZE_REQUEST,
+      params: { ...INITIALIZE_REQUEST.params, protocolVersion: '2026-07-28' },
+    });
+    expect(bare.status).toBe(200);
+    expect((parseSSEResult(bare.body) as any).result.protocolVersion).toBe('2025-11-25');
+  });
+
   it('should challenge unauthenticated initialize requests when OAuth is required', async () => {
     if (serverUnavailableError) return;
     (env as any).MCP_REQUIRE_OAUTH = true;

@@ -74,12 +74,12 @@ const sendToInboxSchema = userIdentifierBaseSchema.extend({
     .describe('Message priority'),
   recipientSessionId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('Recipient session ID to resume/route to (preferred)'),
   recipientStudioId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('Recipient studio ID hint for session routing'),
   recipientStudioSlug: z
@@ -105,7 +105,7 @@ const sendToInboxSchema = userIdentifierBaseSchema.extend({
       'Target a recipient session by alias (e.g., "main", "review"). The recipient agent must have an active session with this alias.'
     ),
   relatedArtifactUri: z.string().optional().describe('Related artifact URI'),
-  metadata: z.record(z.unknown()).optional().describe('Additional metadata'),
+  metadata: z.record(z.string(), z.unknown()).optional().describe('Additional metadata'),
   expiresAt: isoDateTime().optional().describe('When this message expires'),
   threadKey: z
     .string()
@@ -249,7 +249,7 @@ const getInboxSchema = userIdentifierBaseSchema
   .strict();
 
 const updateInboxMessageSchema = userIdentifierBaseSchema.extend({
-  messageId: z.string().uuid().describe('Message ID to update'),
+  messageId: z.string().guid().describe('Message ID to update'),
   agentId: z.string().describe('Agent ID making the update (must be recipient)'),
   status: z.enum(['read', 'acknowledged', 'completed']).describe('New status'),
 });
@@ -263,7 +263,7 @@ const markInboxReadSchema = userIdentifierBaseSchema.extend({
     ),
   throughMessageId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe(
       'Exact-id acknowledgement: advance the pointer through this specific message. ' +
