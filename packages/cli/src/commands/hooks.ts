@@ -1334,13 +1334,6 @@ const CODEX_HOOKS_END_MARKER = '# ink-managed:hooks:end';
 // Back-compat with earlier Codex hook marker format.
 const CODEX_LEGACY_HOOKS_START_MARKER = '# ink-managed';
 const CODEX_LEGACY_HOOKS_END_MARKER = '# end ink-managed';
-const PCP_HOOK_SIGNATURES = [
-  'hooks on-session-start',
-  'hooks on-stop',
-  'hooks on-prompt',
-  'hooks pre-compact',
-  'hooks post-compact',
-];
 
 function shellQuote(value: string): string {
   if (/^[A-Za-z0-9_./:@%+=,-]+$/.test(value)) return value;
@@ -1385,11 +1378,80 @@ function resolveSbBinaryPath(cwd: string): string {
   return 'ink';
 }
 
-/** Check if a hook command is Inkwell-managed (handles both bare `ink` and absolute paths) */
-function isPcpHookCommand(cmd: string | undefined): boolean {
+/**
+ * Split a shell command line into words, honoring single quotes, double
+ * quotes, and backslash escapes. Enough to find the launcher and the hook
+ * name in a managed hook line, whichever writer produced it: this CLI
+ * (`'/nvm/bin/node' '/x/cli.js' hooks on-prompt ...`) or the server's studio
+ * settings generator (`node "/x y/cli.js" hooks on-prompt ...`).
+ */
+function splitShellWords(line: string): string[] {
+  const words: string[] = [];
+  let current = '';
+  let inWord = false;
+  let quote: '"' | "'" | null = null;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (quote === "'") {
+      if (ch === "'") quote = null;
+      else current += ch;
+      continue;
+    }
+    if (quote === '"') {
+      if (ch === '"') quote = null;
+      else if (ch === '\\' && i + 1 < line.length && '"\\$`'.includes(line[i + 1]))
+        current += line[++i];
+      else current += ch;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      inWord = true;
+      continue;
+    }
+    if (ch === '\\' && i + 1 < line.length) {
+      current += line[++i];
+      inWord = true;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (inWord) {
+        words.push(current);
+        current = '';
+        inWord = false;
+      }
+      continue;
+    }
+    current += ch;
+    inWord = true;
+  }
+  if (inWord) words.push(current);
+  return words;
+}
+
+const NODE_LAUNCHER = /(?:^|\/)node(?:\.exe)?$/i;
+const CLI_ENTRY_SCRIPT = /\/cli\.(?:[cm]?js|ts)$/i;
+
+/**
+ * Whether a hook command is Inkwell-managed. Recognition is by shape, not by
+ * hook name: an ink entrypoint (bare `ink`, a path to it, or a node binary
+ * followed by the CLI's cli.js), then `hooks`, then a hook name. Two writers
+ * produce these lines — `ink hooks install` and the server's studio settings
+ * generator — and a hook name known to one but not the other must never read
+ * as a conflict on the next install.
+ */
+export function isPcpHookCommand(cmd: string | undefined): boolean {
   if (!cmd) return false;
+  const words = splitShellWords(cmd);
+  const at = words.indexOf('hooks');
+  if (at < 1) return false;
+  const hookName = words[at + 1];
+  if (!hookName || !/^[a-z][a-z0-9-]*$/.test(hookName)) return false;
+  const launcher = words[at - 1];
+  if (looksLikeSbEntrypoint(launcher)) return true;
+  const interpreter = at >= 2 ? words[at - 2] : undefined;
   return (
-    /\bink hooks\b/.test(cmd) || PCP_HOOK_SIGNATURES.some((signature) => cmd.includes(signature))
+    interpreter !== undefined && NODE_LAUNCHER.test(interpreter) && CLI_ENTRY_SCRIPT.test(launcher)
   );
 }
 

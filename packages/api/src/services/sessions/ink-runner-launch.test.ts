@@ -95,8 +95,10 @@ describe('InkRunner launch command', () => {
     expect(args[0]).toBe(CLI);
     expect(args.slice(-2)).toEqual(['--message', 'hello']);
     expect(resolveBinaryPathMock).not.toHaveBeenCalled();
-    // The child's PATH is built from the node binary that actually runs, so
-    // nested `#!/usr/bin/env node` shebangs resolve to the same runtime.
+    // The child's PATH is built from the node binary that actually runs.
+    // buildSpawnPath only prepends that directory when PATH lacks it, so a
+    // PATH that already lists another node earlier still wins for nested
+    // `#!/usr/bin/env node` shebangs (existing limitation, unchanged here).
     expect(buildSpawnPathMock).toHaveBeenCalledWith(process.execPath);
     expect(options.env.PATH).toBe(`${process.execPath}:dir:/usr/bin`);
   });
