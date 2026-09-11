@@ -393,7 +393,7 @@ personal-context-protocol/
 
 ## Key Technologies
 
-- **Runtime**: Node.js 18+, TypeScript
+- **Runtime**: Node.js 22 (`.nvmrc`; the MCP SDK v2 packages require 20 or newer), TypeScript
 - **MCP SDK**: `@modelcontextprotocol/server` (v2; `/node` for the HTTP transport, `/client` in tests). Protocol revision 2026-07-28; the legacy `@modelcontextprotocol/sdk` 1.x line stopped at 2025-11-25
 - **Database**: Supabase (PostgreSQL + pgvector)
 - **Frontend**: Next.js, React, Tailwind CSS

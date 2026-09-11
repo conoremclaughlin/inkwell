@@ -253,7 +253,7 @@ Notes:
 
 ## Key Technologies
 
-- **Runtime**: Node.js 18+, TypeScript, Yarn 4 workspaces
+- **Runtime**: Node.js 22 (`.nvmrc`; 20 is the floor set by the MCP SDK v2 packages), TypeScript, Yarn 4 workspaces
 - **MCP SDK**: `@modelcontextprotocol/server` (v2) with `@modelcontextprotocol/node` for the HTTP transport
 - **Database**: Supabase (PostgreSQL + pgvector)
 - **Messaging**: Telegraf (Telegram), Baileys (WhatsApp)
