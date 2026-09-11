@@ -363,15 +363,21 @@ describe.skipIf(!available)('overflow studio live-uniqueness (integration)', () 
     const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
+    let setupEntered!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      setupEntered = resolve;
+    });
     const spy = vi
       .spyOn(proto, 'finishWorktreeSetup')
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       .mockImplementation(async function (this: unknown, ...args: any[]) {
         setupArrivals += 1;
+        setupEntered();
         await gate;
         return originalSetup.apply(this, args);
       });
 
+    let calls: Array<Promise<Studio | null>> = [];
     try {
       const ensure = () =>
         service.ensureOverflowStudio({
@@ -380,7 +386,12 @@ describe.skipIf(!available)('overflow studio live-uniqueness (integration)', () 
           parentStudio: parent,
           threadKey,
         });
-      const calls = [ensure(), ensure(), ensure()];
+      calls = [ensure(), ensure(), ensure()];
+
+      // Open the negative window only once the winner is actually held in
+      // setup: on a loaded runner its preflight and git step may take longer
+      // than the window, and the check must not pass or fail for that reason.
+      await entered;
 
       // With the winner held in setup, no call may settle — settling now
       // means a rival rushed past the winner and answered without its row.
@@ -416,6 +427,9 @@ describe.skipIf(!available)('overflow studio live-uniqueness (integration)', () 
       studioIds.push(winner.id);
     } finally {
       release();
+      // Drain whatever was started, so a failed assertion leaves no ensure
+      // still running against a restored spy.
+      await Promise.allSettled(calls);
       spy.mockRestore();
     }
   }, 30_000);
