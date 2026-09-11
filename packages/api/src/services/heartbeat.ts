@@ -46,6 +46,14 @@ interface HeartbeatConfig {
   onHeartbeat?: () => Promise<void>;
 }
 
+/**
+ * How far back to look when measuring a failure streak. Only the leading run
+ * of failures is counted, so this is a ceiling on the reported number, not a
+ * window that can hide one: any outage longer than this still reports as
+ * "at least this many" and has long since alerted on its first beat.
+ */
+const FAILURE_STREAK_LOOKBACK = 50;
+
 // Singleton state
 let cronTask: ReturnType<typeof cron.schedule> | null = null;
 let supabase: SupabaseClient<Database> | null = null;
@@ -123,18 +131,26 @@ export function stopHeartbeatService(): void {
  * that, and the recorded reason was the literal string
  * "Delivery callback returned false". The error is the only part of a failed
  * beat worth keeping — carry it.
+ *
+ * Three states, not two. `false` conflated "the beat did not run" with "there
+ * was deliberately nothing to do" — a strategy watchdog cancels itself when its
+ * group completes and returns false, which is correct behaviour and used to
+ * read as an outage. A skipped beat is not a failure: it does not escalate, it
+ * does not alert, and it does not touch the failure streak.
  */
-export interface HeartbeatDeliveryOutcome {
-  delivered: boolean;
+export type HeartbeatDeliveryOutcome =
+  | { status: 'delivered' }
   /** The failure as the delivery path saw it. Recorded and escalated verbatim. */
-  error?: string;
-}
+  | { status: 'failed'; error?: string }
+  /** A deliberate no-op. Recorded for the trail, reported to nobody. */
+  | { status: 'skipped'; reason: string };
 
 /** Callbacks may still return a bare boolean; it means "no detail available". */
 export type HeartbeatDeliverResult = boolean | HeartbeatDeliveryOutcome;
 
 function normalizeDeliveryOutcome(result: HeartbeatDeliverResult): HeartbeatDeliveryOutcome {
-  return typeof result === 'boolean' ? { delivered: result } : result;
+  if (typeof result !== 'boolean') return result;
+  return result ? { status: 'delivered' } : { status: 'failed' };
 }
 
 /**
@@ -152,10 +168,22 @@ function normalizeDeliveryOutcome(result: HeartbeatDeliverResult): HeartbeatDeli
  * directly — so the `trigger:error` → `[TriggerFailure]` machinery that
  * reports every OTHER kind of failed delivery has no path to a failed beat.
  * This is that path.
+ *
+ * `onRecovery` is its other half. An alert with no resolution is its own kind
+ * of noise: the human is left holding a failure notice and has to ask the SB
+ * whether it is back — and if it is not back, it cannot answer. So an outage
+ * is exactly two messages, one at each edge.
+ *
+ * Both hooks receive the consecutive-failure count, derived from
+ * `reminder_history` rather than process memory. It has to be durable: it is
+ * the deduplication key for the direct alert, and a process-local counter
+ * would re-alert on every server restart — which is precisely when a monitor
+ * is most likely to be failing.
  */
 export async function processHeartbeat(
   deliver?: (reminder: DueReminder) => Promise<HeartbeatDeliverResult>,
-  onFailure?: (reminder: DueReminder, error: string) => Promise<void>
+  onFailure?: (reminder: DueReminder, error: string, consecutive: number) => Promise<void>,
+  onRecovery?: (reminder: DueReminder, failedBeats: number) => Promise<void>
 ): Promise<{
   processed: number;
   delivered: number;
@@ -234,17 +262,36 @@ export async function processHeartbeat(
       }
 
       // Deliver via caller-provided callback
-      let outcome: HeartbeatDeliveryOutcome = { delivered: false };
+      let outcome: HeartbeatDeliveryOutcome;
       if (deliver) {
         outcome = normalizeDeliveryOutcome(await deliver(reminder));
       } else {
         logger.warn(`No deliver callback for reminder ${reminder.id} - skipping`);
-        outcome = { delivered: false, error: 'no deliver callback registered' };
+        outcome = { status: 'failed', error: 'no deliver callback registered' };
       }
 
-      if (outcome.delivered) {
+      // Read the streak BEFORE recording this attempt, so it describes the run
+      // of beats leading up to now. Recording first would make every failure
+      // look like at least its own predecessor.
+      const priorFailures =
+        outcome.status === 'skipped' ? 0 : await consecutiveFailureCount(reminder.id);
+
+      if (outcome.status === 'delivered') {
         stats.delivered++;
         await recordDeliveryAttempt(reminder.id, 'delivered');
+        if (priorFailures > 0) {
+          await announceRecovery(reminder, priorFailures, onRecovery);
+        }
+      } else if (outcome.status === 'skipped') {
+        // Deliberate no-op — a self-cancelling watchdog on a finished group,
+        // not a monitor that stopped working. Recorded, never escalated.
+        logger.info('[Heartbeat] Delivery skipped (no action needed)', {
+          reminderId: reminder.id,
+          title: reminder.title,
+          reason: outcome.reason,
+        });
+        stats.skipped++;
+        await recordDeliveryAttempt(reminder.id, 'skipped', outcome.reason);
       } else {
         stats.failed++;
         const reason = outcome.error || 'delivery reported failure with no detail';
@@ -258,15 +305,16 @@ export async function processHeartbeat(
           error: reason,
         });
         await recordDeliveryAttempt(reminder.id, 'failed', reason);
-        await escalate(reminder, reason, onFailure);
+        await escalate(reminder, reason, priorFailures + 1, onFailure);
       }
     } catch (error) {
       logger.error(`Failed to process reminder ${reminder.id}:`, error);
       stats.failed++;
       const reason = error instanceof Error ? error.message : 'Unknown error';
+      const priorFailures = await consecutiveFailureCount(reminder.id);
       await recordDeliveryAttempt(reminder.id, 'failed', reason);
       // A throw is exactly as silent as a false return — escalate both.
-      await escalate(reminder, reason, onFailure);
+      await escalate(reminder, reason, priorFailures + 1, onFailure);
     }
   }
 
@@ -291,17 +339,101 @@ export async function processHeartbeat(
 async function escalate(
   reminder: DueReminder,
   reason: string,
-  onFailure?: (reminder: DueReminder, error: string) => Promise<void>
+  consecutive: number,
+  onFailure?: (reminder: DueReminder, error: string, consecutive: number) => Promise<void>
 ): Promise<void> {
   if (!onFailure) return;
   try {
-    await onFailure(reminder, reason);
+    await onFailure(reminder, reason, consecutive);
   } catch (err) {
     logger.error('[Heartbeat] Escalation itself failed', {
       reminderId: reminder.id,
       originalError: reason,
       escalationError: err instanceof Error ? err.message : String(err),
     });
+  }
+}
+
+/**
+ * Report that a beat is running again, closing out an earlier outage alert.
+ *
+ * Same never-throws contract as `escalate`: a recovery notice that breaks the
+ * loop would stop the remaining reminders from being delivered, which is a
+ * worse outcome than a missing all-clear.
+ */
+async function announceRecovery(
+  reminder: DueReminder,
+  failedBeats: number,
+  onRecovery?: (reminder: DueReminder, failedBeats: number) => Promise<void>
+): Promise<void> {
+  logger.info('[Heartbeat] Recovered after failures', {
+    reminderId: reminder.id,
+    title: reminder.title,
+    failedBeats,
+  });
+  if (!onRecovery) return;
+  try {
+    await onRecovery(reminder, failedBeats);
+  } catch (err) {
+    logger.error('[Heartbeat] Recovery notice itself failed', {
+      reminderId: reminder.id,
+      failedBeats,
+      recoveryError: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+/**
+ * How many beats in a row have failed, counting back from the most recent.
+ *
+ * Derived from `reminder_history` rather than held in memory, because this
+ * number is the deduplication key for the direct outage alert. A process-local
+ * counter resets on restart, and a server restart is exactly the moment a
+ * monitor is most likely to be broken — so an in-memory streak would re-alert
+ * on every bounce and go quiet on the one that mattered.
+ *
+ * `skipped` and `pending` rows are excluded rather than treated as successes:
+ * a watchdog that self-cancels mid-outage has not fixed anything, and should
+ * not read as a recovery.
+ */
+async function consecutiveFailureCount(reminderId: string): Promise<number> {
+  if (!supabase) return 0;
+
+  // Never let the streak lookup take down the beat it is describing, whether
+  // it resolves with an error (PostgREST's usual shape) or throws (a transport
+  // failure). An unknown streak reports as zero, which fails toward alerting
+  // rather than toward silence — silence is the bug this path exists to fix.
+  try {
+    const { data, error } = await supabase
+      .from('reminder_history')
+      .select('status')
+      .eq('reminder_id', reminderId)
+      .in('status', ['delivered', 'failed'])
+      .order('created_at', { ascending: false })
+      .limit(FAILURE_STREAK_LOOKBACK);
+
+    if (error) {
+      logger.warn('[Heartbeat] Could not read failure streak', {
+        reminderId,
+        error: error.message,
+      });
+      return 0;
+    }
+
+    if (!Array.isArray(data)) return 0;
+
+    let streak = 0;
+    for (const row of data as { status: string }[]) {
+      if (row?.status !== 'failed') break;
+      streak++;
+    }
+    return streak;
+  } catch (err) {
+    logger.warn('[Heartbeat] Failure streak lookup threw', {
+      reminderId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return 0;
   }
 }
 

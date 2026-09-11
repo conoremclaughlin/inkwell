@@ -879,7 +879,7 @@ describe('Heartbeat Service', () => {
       setQueryResult('scheduled_reminders', [makeDueReminder()]);
 
       const stats = await processHeartbeat(
-        vi.fn().mockResolvedValue({ delivered: false, error: AUTH_ERROR })
+        vi.fn().mockResolvedValue({ status: 'failed', error: AUTH_ERROR })
       );
 
       expect(stats.failed).toBe(1);
@@ -896,14 +896,15 @@ describe('Heartbeat Service', () => {
 
       const onFailure = vi.fn().mockResolvedValue(undefined);
       await processHeartbeat(
-        vi.fn().mockResolvedValue({ delivered: false, error: AUTH_ERROR }),
+        vi.fn().mockResolvedValue({ status: 'failed', error: AUTH_ERROR }),
         onFailure
       );
 
       expect(onFailure).toHaveBeenCalledTimes(1);
       expect(onFailure).toHaveBeenCalledWith(
         expect.objectContaining({ id: 'rem-001' }),
-        AUTH_ERROR
+        AUTH_ERROR,
+        1
       );
     });
 
@@ -917,7 +918,8 @@ describe('Heartbeat Service', () => {
 
       expect(onFailure).toHaveBeenCalledWith(
         expect.objectContaining({ id: 'rem-001' }),
-        'spawn ENOENT'
+        'spawn ENOENT',
+        1
       );
     });
 
@@ -929,7 +931,7 @@ describe('Heartbeat Service', () => {
 
       const onFailure = vi.fn().mockResolvedValue(undefined);
       const stats = await processHeartbeat(
-        vi.fn().mockResolvedValue({ delivered: true }),
+        vi.fn().mockResolvedValue({ status: 'delivered' }),
         onFailure
       );
 
@@ -964,7 +966,7 @@ describe('Heartbeat Service', () => {
       setQueryResult('scheduled_reminders', [{ id: 'rem-001' }]);
       setQueryResult('scheduled_reminders', [{ id: 'rem-002' }]);
 
-      const deliver = vi.fn().mockResolvedValue({ delivered: false, error: AUTH_ERROR });
+      const deliver = vi.fn().mockResolvedValue({ status: 'failed', error: AUTH_ERROR });
       const onFailure = vi.fn().mockRejectedValue(new Error('inbox insert failed'));
 
       const stats = await processHeartbeat(deliver, onFailure);
@@ -974,6 +976,191 @@ describe('Heartbeat Service', () => {
       expect(deliver).toHaveBeenCalledTimes(2);
       expect(onFailure).toHaveBeenCalledTimes(2);
       expect(stats.failed).toBe(2);
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════════
+  // Failure streak, recovery, and deliberate no-ops (round two, 2026-09-11)
+  //
+  // Lumen's review of #606: the streak was a process-local counter, so a
+  // restart reset it — and it is the deduplication key for the direct outage
+  // alert. And a strategy watchdog that stands down on a completed group used
+  // to return `false`, which would have paged a human every time a task group
+  // finished.
+  // ═══════════════════════════════════════════════════════════════
+  describe('processHeartbeat - streak, recovery, and skips', () => {
+    const AUTH_ERROR = 'Backend claude is not authenticated (not logged in)';
+
+    /**
+     * Queue the two reminder_history round-trips one beat makes: the streak
+     * SELECT, then the attempt INSERT. Clears the blanket default queued in
+     * beforeEach first — it sits at the head of the FIFO and would otherwise
+     * answer the SELECT with a non-array, making every streak read as zero.
+     */
+    function queueHistory(priorStatuses: string[]) {
+      queryResultQueues.delete('reminder_history');
+      setQueryResult(
+        'reminder_history',
+        priorStatuses.map((status) => ({ status }))
+      );
+      setQueryResult('reminder_history', { id: 'hist-001' });
+    }
+
+    it('derives the consecutive count from history, not from process memory', async () => {
+      initHeartbeatService({ enableLocalCron: false });
+
+      setQueryResult('scheduled_reminders', [makeDueReminder()]);
+      // Three failures already on the record, newest first. This process has
+      // never seen them — an in-memory counter would report 1.
+      queueHistory(['failed', 'failed', 'failed', 'delivered']);
+
+      const onFailure = vi.fn().mockResolvedValue(undefined);
+      await processHeartbeat(
+        vi.fn().mockResolvedValue({ status: 'failed', error: AUTH_ERROR }),
+        onFailure
+      );
+
+      expect(onFailure).toHaveBeenCalledWith(
+        expect.objectContaining({ id: 'rem-001' }),
+        AUTH_ERROR,
+        4
+      );
+    });
+
+    it('stops counting at the last delivered beat', async () => {
+      initHeartbeatService({ enableLocalCron: false });
+
+      setQueryResult('scheduled_reminders', [makeDueReminder()]);
+      // One recent failure, then a success, then older failures that belong to
+      // a previous, already-closed outage.
+      queueHistory(['failed', 'delivered', 'failed', 'failed']);
+
+      const onFailure = vi.fn().mockResolvedValue(undefined);
+      await processHeartbeat(
+        vi.fn().mockResolvedValue({ status: 'failed', error: AUTH_ERROR }),
+        onFailure
+      );
+
+      expect(onFailure).toHaveBeenCalledWith(expect.anything(), AUTH_ERROR, 2);
+    });
+
+    it('announces recovery when a beat lands after failures', async () => {
+      initHeartbeatService({ enableLocalCron: false });
+
+      setQueryResult('scheduled_reminders', [makeDueReminder()]);
+      setQueryResult('scheduled_reminders', [{ id: 'rem-001' }]); // claim CAS win
+      queueHistory(['failed', 'failed']);
+
+      const onRecovery = vi.fn().mockResolvedValue(undefined);
+      const stats = await processHeartbeat(
+        vi.fn().mockResolvedValue({ status: 'delivered' }),
+        vi.fn(),
+        onRecovery
+      );
+
+      expect(stats.delivered).toBe(1);
+      expect(onRecovery).toHaveBeenCalledWith(expect.objectContaining({ id: 'rem-001' }), 2);
+    });
+
+    it('does not announce recovery when the beat was never failing', async () => {
+      initHeartbeatService({ enableLocalCron: false });
+
+      setQueryResult('scheduled_reminders', [makeDueReminder()]);
+      setQueryResult('scheduled_reminders', [{ id: 'rem-001' }]);
+      queueHistory(['delivered', 'delivered']);
+
+      const onRecovery = vi.fn().mockResolvedValue(undefined);
+      await processHeartbeat(
+        vi.fn().mockResolvedValue({ status: 'delivered' }),
+        vi.fn(),
+        onRecovery
+      );
+
+      expect(onRecovery).not.toHaveBeenCalled();
+    });
+
+    it('keeps the tick alive when the recovery notice throws', async () => {
+      initHeartbeatService({ enableLocalCron: false });
+
+      setQueryResult('scheduled_reminders', [makeDueReminder()]);
+      setQueryResult('scheduled_reminders', [{ id: 'rem-001' }]);
+      queueHistory(['failed']);
+
+      const onRecovery = vi.fn().mockRejectedValue(new Error('telegram unreachable'));
+      const stats = await processHeartbeat(
+        vi.fn().mockResolvedValue({ status: 'delivered' }),
+        vi.fn(),
+        onRecovery
+      );
+
+      // The beat delivered. A failed all-clear must not retroactively turn a
+      // working beat into a failed one.
+      expect(onRecovery).toHaveBeenCalled();
+      expect(stats.delivered).toBe(1);
+      expect(stats.failed).toBe(0);
+    });
+
+    // The watchdog case Lumen reproduced: a completed/paused/cancelled group
+    // makes the watchdog stand down, which is correct behaviour and must not
+    // raise an outage alert.
+    it('does NOT escalate or count a skipped beat', async () => {
+      initHeartbeatService({ enableLocalCron: false });
+
+      setQueryResult('scheduled_reminders', [makeDueReminder()]);
+      setQueryResult('scheduled_reminders', [{ id: 'rem-001' }]);
+
+      const onFailure = vi.fn().mockResolvedValue(undefined);
+      const onRecovery = vi.fn().mockResolvedValue(undefined);
+      const stats = await processHeartbeat(
+        vi.fn().mockResolvedValue({ status: 'skipped', reason: 'group already completed' }),
+        onFailure,
+        onRecovery
+      );
+
+      expect(onFailure).not.toHaveBeenCalled();
+      expect(onRecovery).not.toHaveBeenCalled();
+      expect(stats.failed).toBe(0);
+      expect(stats.delivered).toBe(0);
+      expect(stats.skipped).toBe(1);
+    });
+
+    it('records a skipped beat as skipped, with its reason, not as a failure', async () => {
+      initHeartbeatService({ enableLocalCron: false });
+
+      setQueryResult('scheduled_reminders', [makeDueReminder()]);
+      setQueryResult('scheduled_reminders', [{ id: 'rem-001' }]);
+
+      await processHeartbeat(
+        vi.fn().mockResolvedValue({ status: 'skipped', reason: 'group already completed' })
+      );
+
+      const historyBuilder = tableBuilders.get('reminder_history')!;
+      expect(historyBuilder.insert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          reminder_id: 'rem-001',
+          status: 'skipped',
+          error_message: 'group already completed',
+        })
+      );
+    });
+
+    it('treats an unreadable streak as zero rather than failing the beat', async () => {
+      initHeartbeatService({ enableLocalCron: false });
+
+      setQueryResult('scheduled_reminders', [makeDueReminder()]);
+      queryResultQueues.delete('reminder_history');
+      setQueryResult('reminder_history', null, { message: 'permission denied' });
+      setQueryResult('reminder_history', { id: 'hist-001' });
+
+      const onFailure = vi.fn().mockResolvedValue(undefined);
+      const stats = await processHeartbeat(
+        vi.fn().mockResolvedValue({ status: 'failed', error: AUTH_ERROR }),
+        onFailure
+      );
+
+      // Unknown streak fails toward alerting, never toward silence.
+      expect(stats.failed).toBe(1);
+      expect(onFailure).toHaveBeenCalledWith(expect.anything(), AUTH_ERROR, 1);
     });
   });
 });
