@@ -502,7 +502,7 @@ node ./packages/cli/dist/cli.js <subcommand>
 
 The global link stays where it was. Your studio's build is for you to exercise, not for every other session on the machine to run.
 
-**If the server or a hook reaches for `ink` without saying which checkout it means, that is a code problem, not a reason to relink.** `resolveInkBinaryPath` in `packages/api/src/services/studio-settings.ts` tries the global link first, and the ink runner resolves `ink` from `PATH`. Close that kind of gap in code — an explicit env var, or the server resolving its own checkout's `packages/cli` relative to itself — and open a PR for it.
+**The server never uses the global link.** For the hooks it writes and the chat loops it spawns, it resolves its own checkout's `packages/cli/dist/cli.js` (see `packages/api/src/services/ink-cli.ts`), runs it through node, and takes `INK_CLI_PATH` as an explicit override. A checkout with no CLI build falls back to `ink` on PATH with a one-time warning; build it with `yarn workspace @inklabs/cli build`. A new call site that reaches for `ink` without going through that resolver is a code problem, not a reason to relink: route it through `resolveInkCli` and open a PR.
 
 ## Supabase Project ID
 
@@ -674,6 +674,7 @@ Optional:
 - `SENTRY_DSN` - Error tracking (optional)
 - `SERVER_COMPACTION_ENABLED` - `true` to let the server rotate claude-code sessions at the compaction threshold (default `false`: Claude Code auto-compacts natively via `--autocompact`)
 - `COMPACTION_THRESHOLD` - context-token threshold for the server-side trigger when enabled (default 150000)
+- `INK_CLI_PATH` - absolute path of the ink CLI the server invokes for hooks and chat loops. Default: this checkout's `packages/cli/dist/cli.js`, run through node. The server never uses the global `~/.ink/bin/ink` link.
 
 ## Testing
 

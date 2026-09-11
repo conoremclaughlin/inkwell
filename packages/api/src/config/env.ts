@@ -172,6 +172,10 @@ const envSchema = z.object({
   GOOGLE_CREDENTIAL_SOURCES: optionalString,
   // Where desktop credential files live. Default: ~/.ink/google
   INK_GOOGLE_CREDENTIALS_DIR: optionalString,
+  // Absolute path of the ink CLI the server invokes for hooks and chat loops.
+  // Default: this checkout's packages/cli/dist/cli.js. The server never uses
+  // the global ~/.ink/bin/ink link (services/ink-cli.ts).
+  INK_CLI_PATH: optionalString,
 
   // Embeddings
   MEMORY_EMBEDDINGS_ENABLED: z

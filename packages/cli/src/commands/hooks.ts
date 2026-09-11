@@ -1334,13 +1334,6 @@ const CODEX_HOOKS_END_MARKER = '# ink-managed:hooks:end';
 // Back-compat with earlier Codex hook marker format.
 const CODEX_LEGACY_HOOKS_START_MARKER = '# ink-managed';
 const CODEX_LEGACY_HOOKS_END_MARKER = '# end ink-managed';
-const PCP_HOOK_SIGNATURES = [
-  'hooks on-session-start',
-  'hooks on-stop',
-  'hooks on-prompt',
-  'hooks pre-compact',
-  'hooks post-compact',
-];
 
 function shellQuote(value: string): string {
   if (/^[A-Za-z0-9_./:@%+=,-]+$/.test(value)) return value;
@@ -1385,12 +1378,91 @@ function resolveSbBinaryPath(cwd: string): string {
   return 'ink';
 }
 
-/** Check if a hook command is Inkwell-managed (handles both bare `ink` and absolute paths) */
-function isPcpHookCommand(cmd: string | undefined): boolean {
+/**
+ * Split a shell command line into words, honoring single quotes, double
+ * quotes, backslash escapes, and a trailing comment. Enough to find the launcher and the hook
+ * name in a managed hook line, whichever writer produced it: this CLI
+ * (`'/nvm/bin/node' '/x/cli.js' hooks on-prompt ...`) or the server's studio
+ * settings generator (`node "/x y/cli.js" hooks on-prompt ...`).
+ */
+function splitShellWords(line: string): string[] {
+  const words: string[] = [];
+  let current = '';
+  let inWord = false;
+  let quote: '"' | "'" | null = null;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (quote === "'") {
+      if (ch === "'") quote = null;
+      else current += ch;
+      continue;
+    }
+    if (quote === '"') {
+      if (ch === '"') quote = null;
+      else if (ch === '\\' && i + 1 < line.length && '"\\$`'.includes(line[i + 1]))
+        current += line[++i];
+      else current += ch;
+      continue;
+    }
+    if (ch === '#' && !inWord) break; // unquoted # at a word start: the rest is a comment
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      inWord = true;
+      continue;
+    }
+    if (ch === '\\' && i + 1 < line.length) {
+      current += line[++i];
+      inWord = true;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (inWord) {
+        words.push(current);
+        current = '';
+        inWord = false;
+      }
+      continue;
+    }
+    current += ch;
+    inWord = true;
+  }
+  if (inWord) words.push(current);
+  return words;
+}
+
+/**
+ * Trailing shell comment that marks a hook line as Inkwell-managed. Hook
+ * commands run through a shell, so the comment is invisible to the CLI. The
+ * server's studio settings generator writes the same marker
+ * (packages/api/src/services/studio-settings.ts); the cross-package install
+ * test pins the two copies to each other.
+ */
+const MANAGED_HOOK_MARKER = '# ink-managed';
+const MANAGED_HOOK_MARKER_RE = /\s#\s?ink-managed\s*$/;
+
+/**
+ * Whether a hook command is Inkwell-managed. The line must have the managed
+ * grammar — a launcher, then `hooks`, then a hook name — and then either:
+ *
+ *   - the launcher is a known ink entrypoint by shape (bare `ink`, a path to
+ *     it, or the CLI's own cli.js), which is what `ink hooks install` writes
+ *     and what older servers wrote; or
+ *   - the line ends with the managed marker, which the server writes for
+ *     every hook because its launcher may be an arbitrary INK_CLI_PATH.
+ *
+ * No hook-name list: a hook either writer adds later must not read as a
+ * conflict. No generic launcher rule: an unrelated CLI that happens to be
+ * called cli.js, or to have a `hooks` subcommand, is someone else's and must
+ * survive an install untouched.
+ */
+export function isPcpHookCommand(cmd: string | undefined): boolean {
   if (!cmd) return false;
-  return (
-    /\bink hooks\b/.test(cmd) || PCP_HOOK_SIGNATURES.some((signature) => cmd.includes(signature))
-  );
+  const words = splitShellWords(cmd);
+  const at = words.indexOf('hooks');
+  if (at < 1) return false;
+  const hookName = words[at + 1];
+  if (!hookName || !/^[a-z][a-z0-9-]*$/.test(hookName)) return false;
+  return MANAGED_HOOK_MARKER_RE.test(cmd) || looksLikeSbEntrypoint(words[at - 1]);
 }
 
 type InstallResult = 'installed' | 'already-installed' | 'conflict';
@@ -1408,6 +1480,11 @@ function buildManagedHookCommand(sbPath: string, hookName: string, backendName: 
   return `${sbPath} hooks ${hookName} --backend ${backendName}`;
 }
 
+/** Claude Code hook line: the managed command plus the marker the recognizer keys on. */
+function buildClaudeCodeHookCommand(sbPath: string, hookName: string): string {
+  return `${buildManagedHookCommand(sbPath, hookName, CLAUDE_CODE.name)} ${MANAGED_HOOK_MARKER}`;
+}
+
 function formatHookHint(backendName: string, hookName: string): string {
   return `ink hooks ${hookName} --backend ${backendName}`;
 }
@@ -1420,7 +1497,7 @@ function buildClaudeCodeHooks(sbPath: string): Record<string, unknown> {
           hooks: [
             {
               type: 'command',
-              command: buildManagedHookCommand(sbPath, 'pre-compact', CLAUDE_CODE.name),
+              command: buildClaudeCodeHookCommand(sbPath, 'pre-compact'),
             },
           ],
         },
@@ -1431,7 +1508,7 @@ function buildClaudeCodeHooks(sbPath: string): Record<string, unknown> {
           hooks: [
             {
               type: 'command',
-              command: buildManagedHookCommand(sbPath, 'post-compact', CLAUDE_CODE.name),
+              command: buildClaudeCodeHookCommand(sbPath, 'post-compact'),
             },
           ],
         },
@@ -1440,7 +1517,7 @@ function buildClaudeCodeHooks(sbPath: string): Record<string, unknown> {
           hooks: [
             {
               type: 'command',
-              command: buildManagedHookCommand(sbPath, 'on-session-start', CLAUDE_CODE.name),
+              command: buildClaudeCodeHookCommand(sbPath, 'on-session-start'),
             },
           ],
         },
@@ -1450,7 +1527,7 @@ function buildClaudeCodeHooks(sbPath: string): Record<string, unknown> {
           hooks: [
             {
               type: 'command',
-              command: buildManagedHookCommand(sbPath, 'on-tool-approval', CLAUDE_CODE.name),
+              command: buildClaudeCodeHookCommand(sbPath, 'on-tool-approval'),
             },
           ],
         },
@@ -1460,7 +1537,7 @@ function buildClaudeCodeHooks(sbPath: string): Record<string, unknown> {
           hooks: [
             {
               type: 'command',
-              command: buildManagedHookCommand(sbPath, 'on-prompt', CLAUDE_CODE.name),
+              command: buildClaudeCodeHookCommand(sbPath, 'on-prompt'),
             },
           ],
         },
@@ -1470,7 +1547,7 @@ function buildClaudeCodeHooks(sbPath: string): Record<string, unknown> {
           hooks: [
             {
               type: 'command',
-              command: buildManagedHookCommand(sbPath, 'on-stop', CLAUDE_CODE.name),
+              command: buildClaudeCodeHookCommand(sbPath, 'on-stop'),
             },
           ],
         },
