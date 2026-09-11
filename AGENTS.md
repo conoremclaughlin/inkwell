@@ -454,29 +454,35 @@ yarn logs:ink:errors       # Errors only
 
 **Never kill or restart the main dev server.** It runs on the default port (3001) and handles agent communication, triggers, and heartbeats. Disrupting it breaks other SBs' active sessions.
 
-To test API or MCP changes without affecting the main server, run a **separate instance** on a different port using `PCP_PORT_BASE`:
+To test API or MCP changes without affecting the main server, run a **separate instance** on a different port using `INK_PORT_BASE`:
 
 ```bash
 # Isolated test server — disable services the main server already handles
-ENABLE_HEARTBEAT_SERVICE=false \
+ENABLE_HEARTBEATS=false \
 ENABLE_TELEGRAM=false \
 ENABLE_WHATSAPP=false \
 ENABLE_DISCORD=false \
 ENABLE_GRAPH_SWEEP=false \
-PCP_PORT_BASE=4001 \
+INK_PORT_BASE=4001 \
 yarn dev
 
 # Point the CLI at your test server
 PCP_SERVER_URL=http://localhost:4001 ink mission
 ```
 
+**Use `INK_PORT_BASE`, not `PCP_PORT_BASE`.** The resolution is `INK_PORT_BASE || PCP_PORT_BASE` (`scripts/dev-concurrently.mjs`), and `INK_PORT_BASE=3001` is exported in the inherited shell environment on this machine — so an explicit `PCP_PORT_BASE=4001` is silently discarded and the "isolated" server starts on the main server's port.
+
 **Disable services you aren't testing.** Telegram, WhatsApp, Discord, the heartbeat service, and the workflow-graph sweep (`ENABLE_GRAPH_SWEEP`) should stay `false` on isolated servers — the main server already owns those connections and the sweep's dispatch (both servers share the DB, so two sweeps means duplicate inbox triggers). Only enable them if you're explicitly testing that functionality _and_ you've stopped it on the main server first (e.g., two Telegram listeners will conflict).
 
-Port derivation from `PCP_PORT_BASE`:
+**Heartbeats specifically.** Any of `ENABLE_HEARTBEATS`, `ENABLE_REMINDERS`, or `ENABLE_HEARTBEAT_SERVICE` set to a false-like value (`false`, `0`, `off`, `no`) disables reminder processing. A server started from a git worktree also auto-disables, and needs one of those set to `true` to opt back in.
 
-- **MCP/API**: `PCP_PORT_BASE` (e.g., 4001)
-- **Web**: `PCP_PORT_BASE + 1` (e.g., 4002)
-- **Myra**: `PCP_PORT_BASE + 2` (e.g., 4003)
+Both of those paths failed silently until 2026-09-11, so it is worth knowing why. `ENABLE_HEARTBEAT_SERVICE` — the name this recipe used to give — was read by nothing; the only match in the tree was a line in `dev-concurrently.mjs` that printed it. The worktree auto-disable checked `.git` in `process.cwd()`, but the API server's cwd is `packages/api`, so it never detected a worktree either. A second server ran from a worktree for thirteen hours racing the main server to claim Myra's hourly reminders, killing roughly half her heartbeats by spawning her into a checkout with a five-month-old `ink` build. Both mechanisms work now; the recipe above is the one the code actually reads.
+
+Port derivation from `INK_PORT_BASE`:
+
+- **MCP/API**: `INK_PORT_BASE` (e.g., 4001)
+- **Web**: `INK_PORT_BASE + 1` (e.g., 4002)
+- **Myra**: `INK_PORT_BASE + 2` (e.g., 4003)
 
 Both servers share the same Supabase database, so data changes are visible to both. The main server stays untouched on 3001.
 
