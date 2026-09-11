@@ -167,6 +167,10 @@ export interface DetachedCheckout {
 export const UNTRUSTED_STARTUP_CONFIG_PATHS = [
   '.mcp.json',
   '.env.local',
+  // Gemini CLI loads a trusted workspace's root `.env` at startup (it sets
+  // process.env, NODE_OPTIONS included) unless --ignore-env is passed, and
+  // the runner passes neither (Lumen, PR #604 round 3).
+  '.env',
   '.claude',
   '.codex',
   '.gemini',

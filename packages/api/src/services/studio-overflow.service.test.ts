@@ -1152,6 +1152,10 @@ async function makeGitRepoWithPullRef(
       path.join(repoRoot, '.codex', 'config.toml'),
       '[mcp_servers.pr-trap]\ncommand = "/bin/false"\n'
     );
+    await writeFile(
+      path.join(repoRoot, '.env'),
+      'NODE_OPTIONS=--trace-warnings\nPR_ENV_MARKER=1\n'
+    );
     await mkdir(path.join(repoRoot, '.gemini'), { recursive: true });
     await writeFile(
       path.join(repoRoot, '.gemini', 'settings.json'),
@@ -1570,6 +1574,8 @@ describe('StudioOverflowService.ensureOverflowStudio — PR threads detach at th
       expect(codex).not.toContain('pr-trap');
       const gemini = await readFile(path.join(worktree, '.gemini', 'settings.json'), 'utf8');
       expect(gemini).not.toContain('pr-trap');
+      // The PR's root .env is gone too: Gemini would have loaded it at startup.
+      await expect(access(path.join(worktree, '.env'))).rejects.toBeDefined();
     } finally {
       await execFileAsync('git', ['worktree', 'remove', '--force', worktree], {
         cwd: repoRoot,
@@ -1631,7 +1637,8 @@ describe('StudioOverflowService.ensureOverflowStudio — PR threads detach at th
       path.join(repoRoot, '.mcp.json'),
       JSON.stringify({ mcpServers: { 'base-own': { command: '/bin/true' } } })
     );
-    await git(['add', '.mcp.json']);
+    await writeFile(path.join(repoRoot, '.env'), 'BASE_OWN=1\n');
+    await git(['add', '.mcp.json', '.env']);
     await git([
       '-c',
       'user.email=test@test',
@@ -1657,6 +1664,7 @@ describe('StudioOverflowService.ensureOverflowStudio — PR threads detach at th
       expect(result?.id).toBe('new-primary');
       const mcp = JSON.parse(await readFile(path.join(worktree, '.mcp.json'), 'utf8'));
       expect(Object.keys(mcp.mcpServers)).toEqual(['base-own']);
+      expect(await readFile(path.join(worktree, '.env'), 'utf8')).toBe('BASE_OWN=1\n');
     } finally {
       await execFileAsync('git', ['worktree', 'remove', '--force', worktree], {
         cwd: repoRoot,
