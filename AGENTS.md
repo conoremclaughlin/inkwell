@@ -454,10 +454,16 @@ yarn logs:ink:errors       # Errors only
 
 **Never kill or restart the main dev server.** It runs on the default port (3001) and handles agent communication, triggers, and heartbeats. Disrupting it breaks other SBs' active sessions.
 
+**Never let a second server process heartbeats or reminders.** A different port does not make a server isolated — every server reads the same database. A second one with heartbeat processing left on does not sit idle: it ticks on its own schedule, sees the same reminders come due, and races the main server to claim each one. Whoever wins spawns the agent, and the loser's spawn would have landed in whatever checkout that server was started from. Coverage becomes a coin flip, and nothing alerts, because every individual beat still looks fine in the log. On 2026-09-11 a test server left up overnight in a worktree took roughly half of Myra's hourly heartbeats for thirteen hours and ran them against an `ink` build dated April 9. We have flags for exactly this — set them.
+
+**Stop your test server when you're done with it.** The 2026-09-11 server had been orphaned since the previous evening: no terminal attached, zero clients on its port, still ticking. A test server is not free to leave running, and the cost does not show up in your own session.
+
 To test API or MCP changes without affecting the main server, run a **separate instance** on a different port using `INK_PORT_BASE`:
 
 ```bash
-# Isolated test server — disable services the main server already handles
+# Isolated test server — disable services the main server already owns.
+# ENABLE_HEARTBEATS=false is not optional: without it this server races the
+# main one for every due reminder (see above).
 ENABLE_HEARTBEATS=false \
 ENABLE_TELEGRAM=false \
 ENABLE_WHATSAPP=false \
@@ -476,7 +482,9 @@ PCP_SERVER_URL=http://localhost:4001 ink mission
 
 **Heartbeats specifically.** Any of `ENABLE_HEARTBEATS`, `ENABLE_REMINDERS`, or `ENABLE_HEARTBEAT_SERVICE` set to a false-like value (`false`, `0`, `off`, `no`) disables reminder processing. A server started from a git worktree also auto-disables, and needs one of those set to `true` to opt back in.
 
-Both of those paths failed silently until 2026-09-11, so it is worth knowing why. `ENABLE_HEARTBEAT_SERVICE` — the name this recipe used to give — was read by nothing; the only match in the tree was a line in `dev-concurrently.mjs` that printed it. The worktree auto-disable checked `.git` in `process.cwd()`, but the API server's cwd is `packages/api`, so it never detected a worktree either. A second server ran from a worktree for thirteen hours racing the main server to claim Myra's hourly reminders, killing roughly half her heartbeats by spawning her into a checkout with a five-month-old `ink` build. Both mechanisms work now; the recipe above is the one the code actually reads.
+**Verify it rather than assume it.** The startup log line `Heartbeat service flags evaluated` reports `heartbeatServiceEnabled`, the `cwd` it resolved from, and `isWorktree` when it detected one. Both servers write to the same log file, so duplicate ticks read as one chatty process and the `cwd` field is what tells the two apart. If you want the direct check, `grep 'Heartbeat tick' ~/.ink/logs/combined.log | tail` — a timestamp appearing twice means two schedulers are live right now.
+
+Both disable paths failed silently until 2026-09-11, so it is worth knowing why. `ENABLE_HEARTBEAT_SERVICE` — the name this recipe used to give — was read by nothing; the only match in the tree was a line in `dev-concurrently.mjs` that printed it. The worktree auto-disable checked `.git` in `process.cwd()`, but the API server's cwd is `packages/api`, so it never detected a worktree either. The operator who started that server set the documented variable correctly and got a no-op, behind a guard that had never once fired. Both mechanisms work now, and the code honours `ENABLE_HEARTBEAT_SERVICE` as well as the two real names — so the older copies of this recipe still checked out in other worktrees now describe something that actually happens.
 
 Port derivation from `INK_PORT_BASE`:
 
