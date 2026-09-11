@@ -18,7 +18,7 @@
 
 import { execFile } from 'child_process';
 import { access } from 'fs/promises';
-import { delimiter, dirname, isAbsolute } from 'path';
+import { delimiter, dirname, isAbsolute, join, parse } from 'path';
 import { promisify } from 'util';
 import { logger } from '../../utils/logger.js';
 
@@ -33,6 +33,49 @@ const resolvedPaths = new Map<string, CacheEntry>();
 
 /** How long to cache a failed resolution before retrying (5 minutes). */
 const FAILURE_CACHE_TTL_MS = 5 * 60 * 1000;
+
+/**
+ * Binaries this repository ships itself.
+ *
+ * For a third-party CLI (`claude`, `codex`, `gemini`) the ambient PATH is the
+ * right answer — there is one install and the user owns it. For a binary we
+ * BUILD, it is the wrong answer twice over: it depends on whatever PATH the
+ * server happened to inherit, and the result is cached process-wide, so one
+ * bad answer pins every subsequent spawn until restart.
+ *
+ * On 2026-09-11 that is exactly what happened. `which ink` resolved to
+ * personal-context-protocol--wren/node_modules/.bin/ink — a build dated
+ * 2026-04-09 that predates `--require-bootstrap` — and the server pushes that
+ * flag unconditionally. Commander rejected it, exit 1, and Myra's 07:00
+ * heartbeat died in 633ms. Eleven worktrees on that machine each carry a
+ * node_modules/.bin/ink; eight were stale. Any of them was reachable.
+ *
+ * The server's own checkout is the only defensible answer: it is the build
+ * that ships with the code doing the spawning, so their flags agree by
+ * construction.
+ */
+const FIRST_PARTY_BINARIES = new Set(['ink']);
+
+/**
+ * Every `<ancestor>/node_modules/.bin/<binary>` from this module outward.
+ *
+ * Walking up from __dirname rather than process.cwd() is the point — cwd is
+ * ambient state and can be any studio, while __dirname is where the running
+ * server's code actually lives. Nearest ancestor wins.
+ */
+function workspaceBinCandidates(binary: string): string[] {
+  const candidates: string[] = [];
+  const { root } = parse(__dirname);
+  let dir = __dirname;
+  while (true) {
+    candidates.push(join(dir, 'node_modules', '.bin', binary));
+    if (dir === root) break;
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return candidates;
+}
 
 /**
  * Verify that a resolved path actually exists on disk.
@@ -72,6 +115,25 @@ export async function resolveBinaryPath(binary: string): Promise<string> {
       logger.info(`Retrying resolution for ${binary} (failure cache expired)`);
       resolvedPaths.delete(binary);
     }
+  }
+
+  // 0. First-party binaries resolve against the server's own checkout, never
+  //    the ambient PATH. Deterministic, and immune to sibling worktrees.
+  if (FIRST_PARTY_BINARIES.has(binary)) {
+    for (const candidate of workspaceBinCandidates(binary)) {
+      if (await pathExists(candidate)) {
+        resolvedPaths.set(binary, { path: candidate, timestamp: Date.now() });
+        logger.info(`Resolved ${binary} from the server's own workspace: ${candidate}`);
+        return candidate;
+      }
+    }
+    // Falling through to PATH means this checkout has no build of its own
+    // binary. That is recoverable but it is also how a stale sibling gets
+    // picked, so say so rather than resolving quietly.
+    logger.warn(
+      `${binary} is first-party but absent from this server's workspace — ` +
+        `falling back to PATH, which may resolve a stale build from another worktree.`
+    );
   }
 
   // 1. Try current process PATH
