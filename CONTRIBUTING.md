@@ -254,7 +254,7 @@ Notes:
 ## Key Technologies
 
 - **Runtime**: Node.js 18+, TypeScript, Yarn 4 workspaces
-- **MCP SDK**: `@modelcontextprotocol/sdk`
+- **MCP SDK**: `@modelcontextprotocol/server` (v2) with `@modelcontextprotocol/node` for the HTTP transport
 - **Database**: Supabase (PostgreSQL + pgvector)
 - **Messaging**: Telegraf (Telegram), Baileys (WhatsApp)
 - **CLI**: Commander.js, Ink (React for CLI)
