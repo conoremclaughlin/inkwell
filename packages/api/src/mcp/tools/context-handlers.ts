@@ -35,7 +35,7 @@ export const listProjectsSchema = userIdentifierBaseSchema.extend({
 
 export const getProjectSchema = userIdentifierBaseSchema.extend({
   name: z.string().optional().describe('Project name'),
-  projectId: z.string().uuid().optional().describe('Project UUID'),
+  projectId: z.string().guid().optional().describe('Project UUID'),
 });
 
 export async function handleSaveProject(args: unknown, dataComposer: DataComposer) {
@@ -208,9 +208,12 @@ export async function handleGetProject(args: unknown, dataComposer: DataComposer
 export const setFocusSchema = userIdentifierBaseSchema.extend({
   sessionId: z.string().optional().describe('Claude Code or channel session ID'),
   projectName: z.string().optional().describe('Name of the project to focus on'),
-  projectId: z.string().uuid().optional().describe('UUID of the project to focus on'),
+  projectId: z.string().guid().optional().describe('UUID of the project to focus on'),
   focusSummary: z.string().optional().describe('What we are currently working on'),
-  contextSnapshot: z.record(z.unknown()).optional().describe('Snapshot of relevant context'),
+  contextSnapshot: z
+    .record(z.string(), z.unknown())
+    .optional()
+    .describe('Snapshot of relevant context'),
 });
 
 export const getFocusSchema = userIdentifierBaseSchema.extend({

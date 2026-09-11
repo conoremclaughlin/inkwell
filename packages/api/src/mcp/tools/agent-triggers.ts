@@ -55,7 +55,7 @@ export const triggerAgentSchema = z.object({
     .describe('Thread key for session routing on the recipient side (e.g., "pr:32")'),
   studioId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('Optional explicit studio ID for the target agent session'),
   studioHint: z
@@ -66,11 +66,11 @@ export const triggerAgentSchema = z.object({
     ),
   recipientSessionId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('Optional recipient session ID to inherit studio scope from'),
   metadata: z
-    .record(z.unknown())
+    .record(z.string(), z.unknown())
     .optional()
     .describe('Additional context to pass to the target agent'),
 });

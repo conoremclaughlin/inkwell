@@ -68,7 +68,7 @@ async function tryEmbedArtifact(
 // ============== Schemas ==============
 
 const workspaceScopedUserIdentifierSchema = userIdentifierBaseSchema.extend({
-  workspaceId: z.string().uuid().optional().describe('Optional product workspace scope'),
+  workspaceId: z.string().guid().optional().describe('Optional product workspace scope'),
 });
 
 // The Library derives folders from the URI's first path segment, so URIs must
@@ -106,12 +106,12 @@ const createArtifactSchema = workspaceScopedUserIdentifierSchema.extend({
     .default('private')
     .describe('Visibility level'),
   tags: z.array(z.string()).optional().describe('Tags for categorization'),
-  metadata: z.record(z.unknown()).optional().describe('Additional metadata'),
+  metadata: z.record(z.string(), z.unknown()).optional().describe('Additional metadata'),
 });
 
 const getArtifactSchema = workspaceScopedUserIdentifierSchema.extend({
   uri: z.string().optional().describe('URI of the artifact'),
-  artifactId: z.string().uuid().optional().describe('ID of the artifact'),
+  artifactId: z.string().guid().optional().describe('ID of the artifact'),
   includeComments: z
     .boolean()
     .optional()
@@ -128,7 +128,7 @@ const getArtifactSchema = workspaceScopedUserIdentifierSchema.extend({
 
 const updateArtifactSchema = workspaceScopedUserIdentifierSchema.extend({
   uri: z.string().optional().describe('URI of the artifact to update'),
-  artifactId: z.string().uuid().optional().describe('ID of the artifact to update'),
+  artifactId: z.string().guid().optional().describe('ID of the artifact to update'),
   newUri: artifactUriSchema
     .optional()
     .describe(
@@ -161,26 +161,26 @@ const listArtifactsSchema = workspaceScopedUserIdentifierSchema.extend({
 
 const getArtifactHistorySchema = workspaceScopedUserIdentifierSchema.extend({
   uri: z.string().optional().describe('URI of the artifact'),
-  artifactId: z.string().uuid().optional().describe('ID of the artifact'),
+  artifactId: z.string().guid().optional().describe('ID of the artifact'),
   limit: z.number().min(1).max(50).optional().default(10).describe('Max history entries'),
 });
 
 const addArtifactCommentSchema = workspaceScopedUserIdentifierSchema.extend({
   uri: z.string().optional().describe('URI of the artifact'),
-  artifactId: z.string().uuid().optional().describe('ID of the artifact'),
+  artifactId: z.string().guid().optional().describe('ID of the artifact'),
   content: z.string().min(1).describe('Comment text'),
   agentId: z.string().optional().describe('Agent authoring the comment'),
   parentCommentId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('Optional parent comment ID for threading'),
-  metadata: z.record(z.unknown()).optional().describe('Additional metadata'),
+  metadata: z.record(z.string(), z.unknown()).optional().describe('Additional metadata'),
 });
 
 const listArtifactCommentsSchema = workspaceScopedUserIdentifierSchema.extend({
   uri: z.string().optional().describe('URI of the artifact'),
-  artifactId: z.string().uuid().optional().describe('ID of the artifact'),
+  artifactId: z.string().guid().optional().describe('ID of the artifact'),
   limit: z.number().min(1).max(200).optional().default(100).describe('Max comments to return'),
 });
 

@@ -509,7 +509,7 @@ export const rememberSchema = userIdentifierBaseSchema.extend({
     ),
   salience: salienceSchema.optional().describe('Importance level (default: medium)'),
   topics: topicsSchema.describe('Topics for categorization'),
-  metadata: z.record(z.unknown()).optional().describe('Additional metadata'),
+  metadata: z.record(z.string(), z.unknown()).optional().describe('Additional metadata'),
   expiresAt: isoDateTime().optional().describe('Optional expiration date (ISO 8601)'),
   agentId: z
     .string()
@@ -517,7 +517,7 @@ export const rememberSchema = userIdentifierBaseSchema.extend({
     .describe('Which AI being created this memory (e.g., "wren", "benson"). Null = shared memory.'),
   contactId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe(
       'Contact ID for per-sender memory scoping. Auto-inherited from session context when available. Null = owner/system memory.'
@@ -534,7 +534,7 @@ export const rememberSchema = userIdentifierBaseSchema.extend({
   // heuristic that can resolve to a sibling session in parallel worktrees.
   sessionId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe(
       'Session to attribute this memory to. Takes precedence over the server-side active-session lookup; omit to let the server infer it.'
@@ -568,7 +568,7 @@ export const recallSchema = userIdentifierBaseSchema.extend({
     .describe('Include shared memories (agentId=null) when filtering by agentId (default: true)'),
   contactId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe(
       'Filter by contact ID for per-sender memory isolation. When set, only returns memories scoped to this contact.'
@@ -576,14 +576,14 @@ export const recallSchema = userIdentifierBaseSchema.extend({
 });
 
 export const forgetSchema = userIdentifierBaseSchema.extend({
-  memoryId: z.string().uuid().describe('ID of the memory to forget'),
+  memoryId: z.string().guid().describe('ID of the memory to forget'),
 });
 
 export const updateMemorySchema = userIdentifierBaseSchema.extend({
-  memoryId: z.string().uuid().describe('ID of the memory to update'),
+  memoryId: z.string().guid().describe('ID of the memory to update'),
   salience: salienceSchema.optional().describe('New salience level'),
   topics: topicsSchema.describe('New topics'),
-  metadata: z.record(z.unknown()).optional().describe('Additional metadata to merge'),
+  metadata: z.record(z.string(), z.unknown()).optional().describe('Additional metadata to merge'),
 });
 
 // ==============================================// SESSION TOOLS
@@ -591,7 +591,7 @@ export const updateMemorySchema = userIdentifierBaseSchema.extend({
 export const startSessionSchema = userIdentifierBaseSchema.extend({
   sessionId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe(
       'Optional PCP session UUID to use when creating a new session. Useful for client-generated canonical IDs.'
@@ -619,12 +619,12 @@ export const startSessionSchema = userIdentifierBaseSchema.extend({
   model: z.string().optional().describe('Model identifier (e.g., "opus-4-6", "sonnet", "o3")'),
   contactId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe(
       'Contact ID for per-sender session isolation. When set, the session is scoped to this contact.'
     ),
-  metadata: z.record(z.unknown()).optional().describe('Additional session metadata'),
+  metadata: z.record(z.string(), z.unknown()).optional().describe('Additional session metadata'),
   repoRoot: z
     .string()
     .optional()
@@ -640,7 +640,7 @@ export const startSessionSchema = userIdentifierBaseSchema.extend({
 export const endSessionSchema = userIdentifierBaseSchema.extend({
   sessionId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('Session ID (uses active session if not provided)'),
   agentId: z
@@ -657,7 +657,7 @@ export const endSessionSchema = userIdentifierBaseSchema.extend({
 export const getSessionSchema = userIdentifierBaseSchema.extend({
   sessionId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('Session ID (returns active session if not provided)'),
   agentId: z
@@ -707,7 +707,7 @@ export const listSessionsSchema = userIdentifierBaseSchema.extend({
 export const updateSessionStateSchema = userIdentifierBaseSchema.extend({
   sessionId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe(
       'Session ID (uses active session if not provided). Most reliable way to target a specific session.'
@@ -775,7 +775,7 @@ export const updateSessionStateSchema = userIdentifierBaseSchema.extend({
 // ==============================================// MEMORY HISTORY SCHEMAS
 // ==============================================
 export const getMemoryHistorySchema = userIdentifierBaseSchema.extend({
-  memoryId: z.string().uuid().describe('ID of the memory to get history for'),
+  memoryId: z.string().guid().describe('ID of the memory to get history for'),
 });
 
 export const getUserHistorySchema = userIdentifierBaseSchema.extend({
@@ -784,7 +784,7 @@ export const getUserHistorySchema = userIdentifierBaseSchema.extend({
 });
 
 export const restoreMemorySchema = userIdentifierBaseSchema.extend({
-  historyId: z.string().uuid().describe('ID of the history entry to restore from'),
+  historyId: z.string().guid().describe('ID of the history entry to restore from'),
 });
 
 // ==============================================// BOOTSTRAP SCHEMA
@@ -792,7 +792,7 @@ export const restoreMemorySchema = userIdentifierBaseSchema.extend({
 export const bootstrapSchema = userIdentifierBaseSchema.extend({
   workspaceId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('Optional product workspace scope for shared document resolution'),
   includeRecentMemories: z
@@ -842,7 +842,7 @@ export const bootstrapSchema = userIdentifierBaseSchema.extend({
 export const compactSessionSchema = userIdentifierBaseSchema.extend({
   sessionId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('Session ID to compact (uses active session if not provided)'),
   agentId: z
@@ -1021,7 +1021,7 @@ export const curateRecallSchema = userIdentifierBaseSchema.extend({
   accepted: z
     .array(
       z.object({
-        memoryId: z.string().uuid(),
+        memoryId: z.string().guid(),
         semanticScore: z.number().optional(),
         textScore: z.number().optional(),
         finalScore: z.number().optional(),
@@ -1033,7 +1033,7 @@ export const curateRecallSchema = userIdentifierBaseSchema.extend({
   dismissed: z
     .array(
       z.object({
-        memoryId: z.string().uuid(),
+        memoryId: z.string().guid(),
         semanticScore: z.number().optional(),
         textScore: z.number().optional(),
         finalScore: z.number().optional(),
@@ -1043,7 +1043,7 @@ export const curateRecallSchema = userIdentifierBaseSchema.extend({
     .default([])
     .describe('Memories the SB found irrelevant — will be evicted from context'),
   agentId: z.string().optional().describe('Agent identity (e.g., "wren")'),
-  sessionId: z.string().uuid().optional().describe('Current session ID for attribution'),
+  sessionId: z.string().guid().optional().describe('Current session ID for attribution'),
 });
 
 export async function handleCurateRecall(args: unknown, dataComposer: DataComposer) {

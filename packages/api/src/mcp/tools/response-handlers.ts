@@ -196,7 +196,10 @@ export const sendResponseSchema = z.object({
     .describe(
       'Override voice for TTS synthesis. Only used when voiceReply is true. Omit to use the agent default from tts_config.'
     ),
-  metadata: z.record(z.unknown()).optional().describe('Additional channel-specific metadata'),
+  metadata: z
+    .record(z.string(), z.unknown())
+    .optional()
+    .describe('Additional channel-specific metadata'),
   media: z
     .array(outboundMediaEntrySchema)
     .optional()
