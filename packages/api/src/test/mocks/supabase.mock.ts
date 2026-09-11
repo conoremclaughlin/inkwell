@@ -11,11 +11,20 @@ export function createMockSupabaseClient() {
   let resolveData: unknown = null;
   let resolveError: unknown = null;
 
+  // Ordered results: a test can queue what each successive read/write
+  // resolves to (consumed by BOTH `.single()` and a direct `await`), so a
+  // handler that performs several round-trips is sequenced explicitly
+  // instead of every call sharing one value. Falls back to the shared value.
+  const queued: Array<{ data: unknown; error: unknown }> = [];
+
   // Create a thenable result for await
-  const createResult = () => ({
-    data: resolveData,
-    error: resolveError,
-  });
+  const createResult = () =>
+    queued.length > 0
+      ? (queued.shift() as { data: unknown; error: unknown })
+      : {
+          data: resolveData,
+          error: resolveError,
+        };
 
   // Create a chainable mock - all methods return the mock itself
   const queryBuilder: Record<string, unknown> = {};
@@ -57,8 +66,11 @@ export function createMockSupabaseClient() {
 
   // Make queryBuilder thenable for direct await (for queries without .single())
   queryBuilder.then = (resolve: (value: { data: unknown; error: unknown }) => void) => {
-    resolve(createResult());
-    return Promise.resolve(createResult());
+    // Evaluate ONCE per await: with queued results, a second evaluation
+    // would silently consume the next test step's result.
+    const result = createResult();
+    resolve(result);
+    return Promise.resolve(result);
   };
 
   return {
@@ -78,10 +90,16 @@ export function createMockSupabaseClient() {
       resolveError = error;
     },
 
+    // Queue the result of the NEXT round-trip (single() or direct await), in call order
+    _queueReturnData: (data: unknown, error: unknown = null) => {
+      queued.push({ data, error });
+    },
+
     // Reset all mocks
     _reset: () => {
       resolveData = null;
       resolveError = null;
+      queued.length = 0;
       vi.clearAllMocks();
     },
   };

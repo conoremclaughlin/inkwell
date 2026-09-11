@@ -437,6 +437,103 @@ describe('Heartbeat Service', () => {
       expect(builder.insert).not.toHaveBeenCalled();
     });
 
+    it("should skip when the check-in is bound to the agent's OTHER identity row (Sep 10: an unscoped twin handed in as sbId)", async () => {
+      // The agent has a scoped real row with a check-in, and an UNSCOPED twin.
+      setQueryResult('agent_identities', [
+        { id: 'identity-real', workspace_id: 'ws-personal' },
+        { id: 'identity-twin', workspace_id: null },
+      ]);
+      setQueryResult('scheduled_reminders', [{ id: 'existing-rem', sb_id: 'identity-real' }]);
+
+      await ensureDefaultReminders({
+        userId: TEST_USER_ID,
+        sbId: 'identity-twin',
+        agentId: 'myra',
+        deliveryChannel: 'telegram',
+        deliveryTarget: '123456789',
+      });
+
+      const reminders = tableBuilders.get('scheduled_reminders')!;
+      expect(reminders.insert).not.toHaveBeenCalled();
+      // The guard asked about every identity row of the agent, not just the new one.
+      expect(tableBuilders.get('agent_identities')!.eq).toHaveBeenCalledWith('agent_id', 'myra');
+      expect(reminders.in).toHaveBeenCalledWith(
+        'sb_id',
+        expect.arrayContaining(['identity-real', 'identity-twin'])
+      );
+    });
+
+    it('a scoped sibling in ANOTHER workspace is a distinct SB and gets its own check-in (PR #595, Lumen)', async () => {
+      // Same slug in two workspaces; A already has a check-in; B is being seeded.
+      setQueryResult('agent_identities', [
+        { id: 'identity-a', workspace_id: 'ws-a' },
+        { id: 'identity-b', workspace_id: 'ws-b' },
+      ]);
+      setQueryResult('scheduled_reminders', []); // nothing bound to B (or to an unscoped row)
+      setQueryResult('users', { timezone: null });
+      setQueryResult('scheduled_reminders', { id: 'rem-b' });
+
+      await ensureDefaultReminders({
+        userId: TEST_USER_ID,
+        sbId: 'identity-b',
+        agentId: 'myra',
+        deliveryChannel: 'telegram',
+        deliveryTarget: '123456789',
+      });
+
+      const reminders = tableBuilders.get('scheduled_reminders')!;
+      // The candidate set is B alone — A's check-in must not suppress B's.
+      expect(reminders.in).toHaveBeenCalledWith('sb_id', ['identity-b']);
+      expect(reminders.insert).toHaveBeenCalledWith(
+        expect.objectContaining({ sb_id: 'identity-b' })
+      );
+    });
+
+    it("a scoped sibling is judged on its own UUID even when an unscoped twin holds a reminder (PR #595, Lumen's sixth check)", async () => {
+      // A (scoped) + an unscoped twin with a paused reminder + new scoped B.
+      setQueryResult('agent_identities', [
+        { id: 'identity-a', workspace_id: 'ws-a' },
+        { id: 'identity-twin', workspace_id: null },
+        { id: 'identity-b', workspace_id: 'ws-b' },
+      ]);
+      setQueryResult('scheduled_reminders', []); // nothing bound to B itself
+      setQueryResult('users', { timezone: null });
+      setQueryResult('scheduled_reminders', { id: 'rem-b' });
+
+      await ensureDefaultReminders({
+        userId: TEST_USER_ID,
+        sbId: 'identity-b',
+        agentId: 'myra',
+        deliveryChannel: 'telegram',
+        deliveryTarget: '123456789',
+      });
+
+      const reminders = tableBuilders.get('scheduled_reminders')!;
+      expect(reminders.in).toHaveBeenCalledWith('sb_id', ['identity-b']);
+      expect(reminders.insert).toHaveBeenCalledWith(
+        expect.objectContaining({ sb_id: 'identity-b' })
+      );
+    });
+
+    it('an unscoped row among several scoped siblings is ambiguous: skip seeding, do not guess', async () => {
+      setQueryResult('agent_identities', [
+        { id: 'identity-a', workspace_id: 'ws-a' },
+        { id: 'identity-b', workspace_id: 'ws-b' },
+        { id: 'identity-twin', workspace_id: null },
+      ]);
+
+      await ensureDefaultReminders({
+        userId: TEST_USER_ID,
+        sbId: 'identity-twin',
+        agentId: 'myra',
+        deliveryChannel: 'telegram',
+        deliveryTarget: '123456789',
+      });
+
+      // The guard returned before touching scheduled_reminders at all.
+      expect(tableBuilders.get('scheduled_reminders')).toBeUndefined();
+    });
+
     it('should resolve delivery channel from user when not pre-resolved', async () => {
       // User lookup returns telegram_id
       setQueryResult('users', { telegram_id: '987654321', whatsapp_id: null });

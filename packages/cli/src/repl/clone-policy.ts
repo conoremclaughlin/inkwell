@@ -50,7 +50,6 @@ export const CLONE_BASELINE_TOOLS: readonly string[] = [
   // PCP introspection. Reading the workspace is the point of a clone.
   'bootstrap',
   'recall',
-  'get_context',
   'get_artifact',
   'list_artifacts',
   'search_artifacts',
@@ -104,7 +103,6 @@ export const CLONE_DENIED_TOOLS: readonly string[] = [
   'forget',
   'update_memory',
   'restore_memory',
-  'save_context',
   'save_project',
   'save_identity',
   'save_user_identity',
