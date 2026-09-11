@@ -297,7 +297,10 @@ async function authorizeExplicitSession(
  */
 interface ActingIdentity {
   agentId: string;
+  /** Canonical identity UUID from the credential; absent on a user/admin token. */
   sbId?: string;
+  /** True when the identity comes from an agent credential, not a user/admin token acting as a named agent. */
+  agentBound: boolean;
 }
 
 const CREATOR_SESSION_RULE =
@@ -329,7 +332,14 @@ function resolveActingIdentity(
         'agent is a user/admin operation.',
     };
   }
-  return { ok: true, actor: { agentId: caller.agentId ?? requestedAgentId, sbId: caller.sbId } };
+  return {
+    ok: true,
+    actor: {
+      agentId: caller.agentId ?? requestedAgentId,
+      sbId: caller.sbId,
+      agentBound: caller.agentBound,
+    },
+  };
 }
 
 /**
@@ -346,6 +356,35 @@ function sessionIdentityMismatch(session: Session, actor: ActingIdentity): strin
   }
   if (session.agentId !== actor.agentId) {
     return `session ${session.id} belongs to agent ${session.agentId ?? '(none)'}, not ${actor.agentId}`;
+  }
+  return null;
+}
+
+/**
+ * Why `studio` is not `actor`'s own ground, or null when it is. The canonical
+ * id is the owner whenever the row carries one: two identities can share the
+ * slug "lumen" across workspaces, and ground owned by one must not be taken
+ * over by the other (Lumen, PR #605 round 3). A canonical owner is matched
+ * only by a canonical caller — an agent credential without a canonical claim
+ * cannot adopt a studio that names one. A user or admin token acts for the
+ * user, who owns every studio of theirs; the slug is the only name it carries,
+ * so the slug is what it is held to. A studio with nothing on record is
+ * unowned and stays adoptable.
+ */
+function studioOwnershipMismatch(
+  studio: { id: string; agentId: string | null; sbId: string | null },
+  actor: ActingIdentity
+): string | null {
+  if (studio.sbId && actor.agentBound) {
+    if (actor.sbId === studio.sbId) return null;
+    const owner = studio.agentId ?? 'another agent';
+    const caller = actor.sbId
+      ? `${actor.agentId} (${actor.sbId})`
+      : `${actor.agentId} (no canonical identity on this credential)`;
+    return `Studio ${studio.id} belongs to identity ${studio.sbId} (${owner}), not to ${caller}`;
+  }
+  if (studio.agentId && studio.agentId !== actor.agentId) {
+    return `Studio ${studio.id} belongs to ${studio.agentId}, not ${actor.agentId}`;
   }
   return null;
 }
@@ -498,6 +537,7 @@ async function recordStudioProvenance(
         sessionId,
         threadKey: leaseKey,
         agentId,
+        sbId: opts.sbId,
         userId,
         reason: via,
       });
@@ -736,6 +776,7 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
     studio = await dataComposer.repositories.studios.create({
       userId: resolved.user.id,
       agentId: actor.agentId,
+      sbId: actor.sbId,
       sessionId: creatorSessionId,
       repoRoot: mainRoot,
       worktreePath,
@@ -1270,16 +1311,17 @@ export async function handleAdoptStudio(args: unknown, dataComposer: DataCompose
   }
   // Own ground only. findById is not scoped, so the row is checked here: a
   // studio of another user is not confirmed to exist, and a studio of another
-  // agent is refused by name — adopting it would link, lease and log it under
-  // an identity that never owned it (Lumen, PR #605 round 2). A studio with no
-  // agent on record is unowned and stays adoptable.
+  // identity is refused — by canonical id when the row carries one, by slug
+  // otherwise — because adopting it would link, lease and log it under an
+  // identity that never owned it (Lumen, PR #605 rounds 2 and 3).
   if (studio.userId !== user.id) {
     return errorResponse('Studio not found');
   }
-  if (studio.agentId && studio.agentId !== actor.agentId) {
+  const ownership = studioOwnershipMismatch(studio, actor);
+  if (ownership) {
     return errorResponse(
-      `Studio ${studio.id} belongs to ${studio.agentId}, not ${actor.agentId}. adopt_studio ` +
-        'takes over your own ground; moving a studio between agents is a user/admin operation.'
+      `${ownership}. adopt_studio takes over your own ground; moving a studio between ` +
+        'identities is a user/admin operation.'
     );
   }
 

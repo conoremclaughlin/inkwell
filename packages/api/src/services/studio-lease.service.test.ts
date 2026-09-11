@@ -405,6 +405,27 @@ describe('StudioLeaseService.acquire', () => {
     expect(tables.studio_lease_events[0].event).toBe('acquired');
   });
 
+  it('names the canonical id the caller verified, and resolves the slug only when none is given (PR #605 r3)', async () => {
+    // Slug resolution would answer sb-from-slug; a caller that already holds
+    // the credential's id passes it, and the lease names that identity.
+    tables.agent_identities.push({
+      id: 'sb-from-slug',
+      user_id: 'user-1',
+      agent_id: 'wren',
+      workspace_id: 'ws',
+      updated_at: '2026-09-01T00:00:00Z',
+    });
+    const given = await service.acquire({ ...req, sbId: 'sb-verified' });
+    expect(given.acquired).toBe(true);
+    expect((tables.studios[0].lease as StudioLease).sbId).toBe('sb-verified');
+    expect(tables.studio_lease_events.at(-1)?.sb_id).toBe('sb-verified');
+
+    tables.studios[0].lease = null;
+    const resolved = await service.acquire(req);
+    expect(resolved.acquired).toBe(true);
+    expect((tables.studios[0].lease as StudioLease).sbId).toBe('sb-from-slug');
+  });
+
   it('refuses a VACANT row when a sibling row holds the same tree — ANY thread (6b r2)', async () => {
     // Several studio rows can name one checkout. A sibling lease conflicts
     // with NO exceptions: not for thread (a thread is not one writer — two

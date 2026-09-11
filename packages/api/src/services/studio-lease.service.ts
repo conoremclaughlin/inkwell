@@ -166,6 +166,14 @@ export interface AcquireRequest {
   sessionId: string;
   threadKey: string;
   agentId: string;
+  /**
+   * Canonical identity of the acquirer (agent_identities.id) when the caller
+   * has already verified it — a studio handler acting on a signed credential
+   * passes the credential's id, and the lease then names the identity that
+   * acted. When absent it is resolved from the slug, which picks the newest of
+   * same-named identities (Lumen, PR #605 round 3).
+   */
+  sbId?: string | null;
   userId: string;
   /** Routing tier / provenance, recorded on the lease and the event. */
   reason?: string;
@@ -638,7 +646,8 @@ export class StudioLeaseService {
    * authorizes a mutation.
    */
   async acquire(req: AcquireRequest): Promise<AcquireResult> {
-    const sbId = await this.resolveSbId(req.userId, req.agentId);
+    const sbId =
+      req.sbId !== undefined ? req.sbId : await this.resolveSbId(req.userId, req.agentId);
 
     // Bounded validate→grant ladder. EVERY authoritative read passes through
     // refuseUngrantable() before any grant path runs, and a lost CAS

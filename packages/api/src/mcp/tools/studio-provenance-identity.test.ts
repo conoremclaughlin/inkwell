@@ -17,6 +17,7 @@ import { tmpdir } from 'os';
 import path from 'path';
 import { handleCreateStudio, handleAdoptStudio } from './studio-handlers';
 import { runWithRequestContext } from '../../utils/request-context';
+import { StudiosRepository } from '../../data/repositories/studios.repository';
 import { makeFakeSupabase, type Row } from '../../services/sessions/fake-supabase';
 
 vi.mock('../../services/studio-settings', () => ({ ensureStudioSettings: vi.fn() }));
@@ -177,7 +178,7 @@ function setup() {
   };
   const stampOf = (agentId: string) =>
     tables.inbox_thread_participants.find((r) => r.agent_id === agentId)?.session_id;
-  return { repoRoot, dc, create, update, linkSession, logActivity, tables, stampOf };
+  return { repoRoot, dc, create, update, linkSession, logActivity, tables, stampOf, supabase };
 }
 
 afterEach(() => {
@@ -249,5 +250,113 @@ describe("the acting identity is the credential's, not the typed agentId (Lumen,
       sbId: SB,
       sessionId: OWN,
     });
+  });
+});
+
+/**
+ * Lumen's round-3 probe, inverted. Two identities wear the slug "lumen"; the
+ * twin is newer, so resolving the slug answers the twin. The credential names
+ * SB. Everything a studio operation writes must name SB, and ground owned by
+ * the twin is not the caller's to adopt. Real StudiosRepository and real lease
+ * acquire over the fake Supabase — nothing between the handler and the rows
+ * is mocked.
+ */
+describe('the canonical identity the credential carries is the one written (Lumen, PR #605 r3)', () => {
+  const TWIN = '77777777-7777-4777-8777-777777777777';
+
+  function withRealStudios(f: ReturnType<typeof setup>) {
+    const older = f.tables.agent_identities.find((r) => r.id === SB);
+    if (older) older.updated_at = '2026-09-01T00:00:00Z';
+    f.tables.agent_identities.push({
+      id: TWIN,
+      user_id: USER,
+      agent_id: 'lumen',
+      workspace_id: 'other-workspace',
+      updated_at: '2026-09-02T00:00:00Z',
+    });
+    // The fake table has no generated defaults; supply them at the boundary.
+    const rawFrom = f.supabase.from.bind(f.supabase);
+    f.supabase.from = ((table: string) => {
+      const builder = rawFrom(table);
+      if (table !== 'studios') return builder;
+      return {
+        ...builder,
+        insert: (row: Row) =>
+          builder.insert({
+            ...row,
+            id: STUDIO,
+            status: 'active',
+            lease: null,
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+          }),
+      };
+    }) as typeof f.supabase.from;
+    f.dc.repositories.studios = new StudiosRepository(f.supabase as never) as never;
+    const worktreePath = path.join(path.dirname(f.repoRoot), 'repo--probe');
+    mkdirSync(worktreePath);
+    return worktreePath;
+  }
+
+  it("create writes the credential's id on the row and the lease, not the newer same-slug identity", async () => {
+    const f = setup();
+    withRealStudios(f);
+    const result = await runWithRequestContext(lumenContext, () =>
+      handleCreateStudio(
+        {
+          agentId: 'lumen',
+          repoRoot: f.repoRoot,
+          slug: 'probe',
+          skipGitOperations: true,
+          sessionId: OWN,
+          threadKey: 'pr:probe',
+        },
+        f.dc as never
+      )
+    );
+    expect(JSON.parse(result.content[0].text)).toMatchObject({
+      success: true,
+      lease: { acquired: true },
+    });
+    const row = f.tables.studios.find((r) => r.id === STUDIO);
+    expect(row?.sb_id).toBe(SB);
+    expect(row?.session_id).toBe(OWN);
+    expect(row?.lease).toMatchObject({ sbId: SB, sessionId: OWN, agentId: 'lumen' });
+    expect(f.logActivity).toHaveBeenCalledWith(
+      expect.objectContaining({ agentId: 'lumen', sbId: SB, sessionId: OWN })
+    );
+  });
+
+  it('adopt refuses ground owned by the same-slug twin before linking, leasing, or logging', async () => {
+    const f = setup();
+    const worktreePath = withRealStudios(f);
+    f.tables.studios.push({
+      id: STUDIO,
+      user_id: USER,
+      agent_id: 'lumen',
+      sb_id: TWIN,
+      session_id: null,
+      worktree_path: worktreePath,
+      repo_root: f.repoRoot,
+      branch: 'lumen/feat/probe',
+      status: 'active',
+      route_patterns: [],
+      lease: null,
+    });
+    const result = await runWithRequestContext(lumenContext, () =>
+      handleAdoptStudio(
+        { agentId: 'lumen', studioId: STUDIO, sessionId: OWN, threadKey: 'pr:probe' },
+        f.dc as never
+      )
+    );
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.success).toBe(false);
+    expect(payload.error).toContain(`belongs to identity ${TWIN} (lumen), not to lumen (${SB})`);
+    const row = f.tables.studios.find((r) => r.id === STUDIO);
+    expect(row?.session_id).toBeNull();
+    expect(row?.lease).toBeNull();
+    expect(row?.route_patterns).toEqual([]);
+    expect(f.stampOf('lumen')).toBeNull();
+    expect(f.logActivity).not.toHaveBeenCalled();
   });
 });

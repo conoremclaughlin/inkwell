@@ -707,6 +707,96 @@ describe('create_studio / adopt_studio provenance', () => {
     expect(logActivity).not.toHaveBeenCalled();
   });
 
+  it("create carries the credential's canonical id onto the studio row and into the lease (Lumen, PR #605 r3)", async () => {
+    callerMock.mockResolvedValue({
+      agentId: 'wren',
+      sbId: 'sb-1',
+      agentBound: true,
+      contactId: null,
+    });
+    const { dc, create } = composer();
+    const result = await handleCreateStudio(
+      {
+        agentId: 'wren',
+        repoRoot,
+        slug: 'canon',
+        baseBranch: 'main',
+        skipGitOperations: true,
+        sessionId: SESSION,
+        threadKey: 'pr:18',
+      },
+      dc
+    );
+    expect(JSON.parse(result.content[0].text).success).toBe(true);
+    expect(create.mock.calls[0][0]).toMatchObject({ agentId: 'wren', sbId: 'sb-1' });
+    expect(acquireMock).toHaveBeenCalledWith(
+      expect.objectContaining({ agentId: 'wren', sbId: 'sb-1', sessionId: SESSION })
+    );
+  });
+
+  it('adopt_studio refuses ground owned by another identity wearing the same slug', async () => {
+    callerMock.mockResolvedValue({
+      agentId: 'wren',
+      sbId: 'sb-1',
+      agentBound: true,
+      contactId: null,
+    });
+    const { dc, findById, linkSession, logActivity, existing } = composer();
+    findById.mockResolvedValue({ ...existing, agentId: 'wren', sbId: 'sb-twin' });
+    const result = await handleAdoptStudio(
+      { agentId: 'wren', sessionId: SESSION, studioId: STUDIO, threadKey: 'pr:19' },
+      dc
+    );
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.success).toBe(false);
+    expect(payload.error).toContain('belongs to identity sb-twin (wren), not to wren (sb-1)');
+    expect(linkSession).not.toHaveBeenCalled();
+    expect(acquireMock).not.toHaveBeenCalled();
+    expect(logActivity).not.toHaveBeenCalled();
+  });
+
+  it('a canonical owner is matched only by a canonical caller: a credential without one cannot adopt, even when the row names no slug', async () => {
+    callerMock.mockResolvedValue({
+      agentId: 'wren',
+      sbId: undefined,
+      agentBound: true,
+      contactId: null,
+    });
+    const { dc, findById, linkSession, existing, getSession } = composer();
+    getSession.mockResolvedValue({
+      id: SESSION,
+      userId: '00000000-0000-0000-0000-000000000001',
+      agentId: 'wren',
+      sbId: undefined,
+      contactId: undefined,
+    });
+    findById.mockResolvedValue({ ...existing, agentId: null, sbId: 'sb-1' });
+    const result = await handleAdoptStudio(
+      { agentId: 'wren', sessionId: SESSION, studioId: STUDIO, threadKey: 'pr:19' },
+      dc
+    );
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.success).toBe(false);
+    expect(payload.error).toContain('belongs to identity sb-1 (another agent)');
+    expect(payload.error).toContain('no canonical identity on this credential');
+    expect(linkSession).not.toHaveBeenCalled();
+    expect(acquireMock).not.toHaveBeenCalled();
+  });
+
+  it("a user token is held to the slug: it may adopt the user's own studio whichever canonical id the row carries", async () => {
+    callerMock.mockResolvedValue({ agentId: 'wren', agentBound: false });
+    const { dc, findById, linkSession, existing } = composer();
+    findById.mockResolvedValue({ ...existing, agentId: 'wren', sbId: 'sb-twin' });
+    const result = await handleAdoptStudio(
+      { agentId: 'wren', sessionId: SESSION, studioId: STUDIO, threadKey: 'pr:20' },
+      dc
+    );
+    expect(JSON.parse(result.content[0].text).success).toBe(true);
+    expect(linkSession).toHaveBeenCalledWith(STUDIO, SESSION);
+    // No canonical claim to carry: the lease resolves the slug as before.
+    expect(acquireMock).toHaveBeenCalledWith(expect.objectContaining({ sbId: undefined }));
+  });
+
   it("adopt_studio does not confirm another user's studio exists", async () => {
     const { dc, findById, linkSession, logActivity, existing } = composer();
     findById.mockResolvedValue({ ...existing, userId: '00000000-0000-0000-0000-000000000002' });
