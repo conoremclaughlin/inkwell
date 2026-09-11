@@ -44,24 +44,32 @@ const FAILURE_CACHE_TTL_MS = 5 * 60 * 1000;
  * bad answer is reused by every subsequent spawn.
  *
  * How long it is reused for is NOT "until restart" — an earlier version of this
- * comment said so and Myra disproved it from the activity stream: one process
- * spawned a stale `ink` at 14:00Z and a good one at 15:00Z with no restart in
- * between. The cache revalidates (see `resolveBinaryPath`), so an entry survives
- * only while its path still exists. That is weaker than it sounds, because a
- * stale build is a real file that passes the check — it is wrong, not missing.
- * So the reuse window is unbounded in practice and bounded by nothing we
- * control, which is the reason to not depend on PATH here at all.
+ * comment said so, and it was wrong. The cache revalidates (see
+ * `resolveBinaryPath`), so an entry survives only while its path still exists.
+ * That is weaker than it sounds, because a stale build is a real file that
+ * passes the check — it is wrong, not missing. The reuse window is bounded by
+ * nothing we control, which is the reason not to depend on PATH here at all.
  *
- * On 2026-09-11 that is exactly what happened. `which ink` resolved to
- * personal-context-protocol--wren/node_modules/.bin/ink — a build dated
- * 2026-04-09 that predates `--require-bootstrap` — and the server pushes that
- * flag unconditionally. Commander rejected it, exit 1, and Myra's 07:00
- * heartbeat died in 633ms. Eleven worktrees on that machine each carry a
- * node_modules/.bin/ink; eight were stale. Any of them was reachable.
+ * WHAT THIS DOES NOT FIX, because two earlier versions of this comment claimed
+ * otherwise and the claim is load-bearing for anyone reading it later. Myra's
+ * heartbeats died on 2026-09-11 with `unknown option '--require-bootstrap'`,
+ * spawned against an `ink` dated 2026-04-09 in personal-context-protocol--wren.
+ * That was NOT `which` reaching into a sibling worktree. There were two API
+ * servers on the same database, and the second one was RUNNING FROM that
+ * worktree — so it spawned from its own directory, correctly, and its own
+ * directory held a five-month-old build. Resolving against the server's own
+ * checkout, which is what this file now does, would have picked exactly the
+ * same stale binary: `workspaceBinCandidates` walks up from `__dirname`, and
+ * for that server `__dirname` was inside the worktree too. The fix for the
+ * outage is stopping a worktree server from claiming reminders at all (#609).
  *
- * The server's own checkout is the only defensible answer: it is the build
- * that ships with the code doing the spawning, so their flags agree by
- * construction.
+ * This change stands on its own terms regardless: a binary we build should not
+ * resolve through ambient PATH, where the answer depends on whatever shell
+ * environment the server inherited. Eleven worktrees on that machine each carry
+ * a node_modules/.bin/ink and eight were stale — any of them reachable by a
+ * PATH lookup, on some future day with a different cause. The server's own
+ * checkout is the defensible answer because it is the build that ships with the
+ * code doing the spawning, so their flags agree by construction.
  */
 const FIRST_PARTY_BINARIES = new Set(['ink']);
 
