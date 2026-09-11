@@ -181,7 +181,8 @@ describe('StudioOverflowService.ensureOverflowStudio — reuse', () => {
     const findBySlug = vi
       .fn()
       .mockResolvedValueOnce(collider) // primary slug → unrelated studio
-      .mockResolvedValueOnce(null); // hash variant → free
+      .mockResolvedValueOnce(null) // hash variant → free
+      .mockResolvedValue(null); // the exhausted reread asks again; still free
     const studios = {
       findBySlug,
       create: vi.fn(),
@@ -201,7 +202,9 @@ describe('StudioOverflowService.ensureOverflowStudio — reuse', () => {
     });
 
     expect(result).toBeNull();
-    expect(findBySlug).toHaveBeenCalledTimes(2);
+    // Two reads for the candidate walk, two more for the exhausted reread
+    // that looks for a rival's published row before failing closed.
+    expect(findBySlug).toHaveBeenCalledTimes(4);
     expect(studios.update).not.toHaveBeenCalled();
   });
 
@@ -214,7 +217,11 @@ describe('StudioOverflowService.ensureOverflowStudio — reuse', () => {
       threadKey: 'pr:9999',
       metadata: { overflow: true },
     });
-    const findBySlug = vi.fn().mockResolvedValueOnce(otherThreads).mockResolvedValueOnce(null);
+    const findBySlug = vi
+      .fn()
+      .mockResolvedValueOnce(otherThreads)
+      .mockResolvedValueOnce(null)
+      .mockResolvedValue(null); // the exhausted reread asks again; still free
     const studios = {
       findBySlug,
       create: vi.fn(),

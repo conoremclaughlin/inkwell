@@ -304,7 +304,25 @@ export class StudioOverflowService {
   }): Promise<Studio | null> {
     const { userId, agentId, threadKey } = opts;
     const parentStudio = await this.resolveDurableAnchor(opts.parentStudio);
+    // Same-thread ensures in this process take turns END TO END — preflight,
+    // worktree, setup (up to the dependency install), row — so the second
+    // arrival finds the first's row at preflight and reuses it. Racing them
+    // through git and rereading is not enough: the git lock is short and the
+    // row is published only after setup, so an exhausted loser could reread
+    // before the winner existed and hold the message (Lumen, #603). Arrivals
+    // from another process are still arbitrated by the live-ownership unique
+    // index on the insert.
+    return withKeyedLock(`overflow-ensure:${userId}:${parentStudio.id}:${threadKey}`, () =>
+      this.ensureOverflowStudioExclusive(userId, agentId, parentStudio, threadKey)
+    );
+  }
 
+  private async ensureOverflowStudioExclusive(
+    userId: string,
+    agentId: string,
+    parentStudio: Studio,
+    threadKey: string
+  ): Promise<Studio | null> {
     const states = await this.loadVariantStates(userId, parentStudio, threadKey);
 
     // Step 1 — reuse: a live matching row on ANY variant wins outright.
@@ -420,11 +438,13 @@ export class StudioOverflowService {
       }
     }
 
-    // Every candidate failed for THIS call. The commonest reason is that a
-    // concurrent ensure for the same thread won meanwhile — its worktree took
-    // the path we tried, its git locks failed ours — and it now owns a live
-    // row. Hand that row back: null here is not "no studio", it is a held
-    // message (see convergeOnRaceWinner). Genuine exhaustion still yields null.
+    // Every candidate failed for THIS call. Same-process rivals never reach
+    // here for that reason (they queue on the ensure lock above), but a rival
+    // in ANOTHER process may have won meanwhile — its worktree took the path
+    // we tried, its git locks failed ours — and published a live row. Hand it
+    // back if it is there: null here is not "no studio", it is a held message
+    // (see convergeOnRaceWinner). This is best effort, not a cross-process
+    // convergence guarantee; genuine exhaustion still yields null.
     const lateWinner = await this.firstLiveMatch(
       await this.loadVariantStates(userId, parentStudio, threadKey),
       threadKey

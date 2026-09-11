@@ -342,31 +342,34 @@ describe.skipIf(!available)('overflow studio live-uniqueness (integration)', () 
     }
   });
 
-  it('two concurrent ensureOverflowStudio calls leave exactly one live studio', async () => {
+  it('concurrent ensureOverflowStudio calls converge on one studio — later arrivals wait for the in-flight winner', async () => {
+    // Lumen, #603: the winner publishes its row only AFTER finishWorktreeSetup
+    // (up to the dependency install). A rival that raced it through git and
+    // exhausted its candidates in that window rereads before any row exists
+    // and returns null — a held message. So same-thread ensures are serialized
+    // end to end in-process: the gate holds the winner in setup, the other two
+    // must not settle (nor reach setup) until it is released, and then all
+    // three hand back the one live row.
     const threadKey = `pr:it-ensure-${RUN}`;
     const leases = { logEvent: vi.fn() } as unknown as StudioLeaseService;
     const service = new StudioOverflowService(repo, leases);
 
-    // Rendezvous seam: both calls must finish the variant preflight (reach
-    // worktree creation) before either is allowed to create — the exact
-    // interleaving of the r2 repro.
     const proto = StudioOverflowService.prototype as unknown as {
-      createWorktree: (...args: unknown[]) => Promise<unknown>;
+      finishWorktreeSetup: (...args: unknown[]) => Promise<unknown>;
     };
-    const original = proto.createWorktree;
-    let arrivals = 0;
+    const originalSetup = proto.finishWorktreeSetup;
+    let setupArrivals = 0;
     let release!: () => void;
-    const barrier = new Promise<void>((resolve) => {
+    const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
     const spy = vi
-      .spyOn(proto, 'createWorktree')
+      .spyOn(proto, 'finishWorktreeSetup')
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       .mockImplementation(async function (this: unknown, ...args: any[]) {
-        arrivals += 1;
-        if (arrivals === 2) release();
-        await barrier;
-        return original.apply(this, args);
+        setupArrivals += 1;
+        await gate;
+        return originalSetup.apply(this, args);
       });
 
     try {
@@ -377,7 +380,19 @@ describe.skipIf(!available)('overflow studio live-uniqueness (integration)', () 
           parentStudio: parent,
           threadKey,
         });
-      const results = await Promise.all([ensure(), ensure()]);
+      const calls = [ensure(), ensure(), ensure()];
+
+      // With the winner held in setup, no call may settle — settling now
+      // means a rival rushed past the winner and answered without its row.
+      const settledEarly = await Promise.race([
+        Promise.race(calls.map((c, i) => c.then(() => `call ${i} settled`))),
+        new Promise<string>((resolve) => setTimeout(() => resolve('none'), 400)),
+      ]);
+      expect(settledEarly).toBe('none');
+      expect(setupArrivals).toBe(1);
+
+      release();
+      const results = await Promise.all(calls);
 
       // Liveness is asked for the way every runtime path asks it (r3).
       const { data: liveRows } = await client
@@ -387,25 +402,20 @@ describe.skipIf(!available)('overflow studio live-uniqueness (integration)', () 
         .eq('thread_key', threadKey)
         .in('status', ['active', 'idle']);
       expect(liveRows).toHaveLength(1);
-
-      // spec v8: the mint materialized under the canonical root, and the row
-      // carries a real slug even though the path no longer encodes one.
       const winner = (liveRows as Array<{ id: string; slug: string; worktree_path: string }>)[0];
       expect(winner.worktree_path.startsWith(studiosRoot)).toBe(true);
       expect(winner.slug).toBeTruthy();
 
-      // r3: BOTH calls get the winner. The loser used to return null, and
-      // since neither divertToOverflow call site retries, that null became
-      // `tier: 'refused'` and a HELD message — the correctness fix silently
-      // reintroducing symptom #3 of the bug this PR fixes. Asserting
-      // "at most one non-null" would pass on that regression; this does not.
+      // r3: EVERY call gets the winner. A null here is `tier: 'refused'` and a
+      // HELD message at both divertToOverflow call sites (neither retries).
       const returned = results.filter((r): r is Studio => r !== null);
-      expect(returned).toHaveLength(2);
-      for (const studio of returned) {
-        expect(studio.id).toBe((liveRows as Array<{ id: string }>)[0].id);
-      }
-      studioIds.push((liveRows as Array<{ id: string }>)[0].id);
+      expect(returned).toHaveLength(3);
+      for (const studio of returned) expect(studio.id).toBe(winner.id);
+      // Only the winner ever built a worktree; the others reused its row.
+      expect(setupArrivals).toBe(1);
+      studioIds.push(winner.id);
     } finally {
+      release();
       spy.mockRestore();
     }
   }, 30_000);
