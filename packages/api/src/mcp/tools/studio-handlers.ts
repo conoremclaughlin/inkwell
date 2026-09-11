@@ -15,13 +15,16 @@ import { access } from 'fs/promises';
 
 const execFileAsync = promisify(execFile);
 import type { DataComposer } from '../../data/composer';
+import type { Json } from '../../data/supabase/types';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
 import { logger } from '../../utils/logger';
 import { bootstrapStudio } from '@inklabs/shared';
 import { ensureStudioSettings } from '../../services/studio-settings';
 import { resolveMainStudio } from '../../services/sessions/session-service';
+import { resolveCaller, resolveImplicitSession } from './memory-handlers';
 import {
   StudioLeaseService,
+  EPHEMERAL_STUDIO_TTL_MS,
   captureWorktreeState,
   rescueSucceeded,
   worktreePresent,
@@ -76,6 +79,19 @@ const createStudioSchema = userIdentifierBaseSchema.extend({
   purpose: z.string().optional().describe('Human-readable description of what this studio is for'),
   baseBranch: z.string().optional().default('main').describe('Branch to base the new worktree on'),
   sessionId: z.string().guid().optional().describe('Session ID to link to this studio'),
+  threadKey: z
+    .string()
+    .max(200)
+    .optional()
+    .describe(
+      'The thread this studio is for (e.g. "pr:600"). Recorded on the studio, added as an exact route pattern so that thread routes here, and seeded into the creator session\'s lease so replies converge on the creator. Implies an ephemeral studio (72-hour expiry) unless durable is true.'
+    ),
+  durable: z
+    .boolean()
+    .optional()
+    .describe(
+      'Keep the studio past the ephemeral expiry. Defaults to true without a threadKey (a home studio) and false with one (thread-scoped ground).'
+    ),
   roleTemplate: z
     .string()
     .optional()
@@ -171,6 +187,13 @@ const adoptStudioSchema = userIdentifierBaseSchema.extend({
     .array(z.string().max(200))
     .optional()
     .describe('ThreadKey glob patterns this studio handles. Sets initial patterns on adoption.'),
+  threadKey: z
+    .string()
+    .max(200)
+    .optional()
+    .describe(
+      "The thread this studio is for. Recorded on the studio, added as an exact route pattern, and seeded into the adopting session's lease."
+    ),
 });
 
 // ============== Helpers ==============
@@ -198,6 +221,150 @@ function errorResponse(error: string) {
   };
 }
 
+// ============== Provenance ==============
+
+type StudioProvenanceVia = 'create_studio' | 'adopt_studio';
+
+interface LeaseSummary {
+  acquired: boolean;
+  threadKey: string;
+  holder?: { sessionId: string; threadKey: string } | null;
+}
+
+/**
+ * Who made (or took over) this studio, and why — written to the activity log,
+ * where the rest of what we do is already recorded (Conor, studio-model piece 1).
+ * It rides the existing `state_change` type with a `studio_created` /
+ * `studio_adopted` subtype: the column is a database enum, and a new value
+ * would cost a migration for a label.
+ *
+ * Plus the two things a thread-scoped studio needs to actually receive its
+ * thread: an exact route pattern, so routing picks this studio for that key,
+ * and the creator's lease seeded with the key, so the occupancy gate passes
+ * replies straight through to the creator's session. Owning ground never
+ * moves the session: the lease names the session, the session stays where it
+ * runs (Lumen, studio-model review).
+ *
+ * Everything here runs after the studio row exists and is best-effort: a
+ * studio without a lease or a log line is still a studio, and the response
+ * says exactly which parts landed.
+ */
+async function recordStudioProvenance(
+  dataComposer: DataComposer,
+  opts: {
+    studio: {
+      id: string;
+      slug: string | null;
+      worktreePath: string;
+      branch: string;
+      routePatterns?: string[] | null;
+      ephemeral?: boolean;
+      expiresAt?: string | null;
+    };
+    userId: string;
+    agentId: string;
+    sbId?: string;
+    sessionId?: string;
+    sessionReason?: string;
+    threadKey?: string;
+    purpose?: string;
+    via: StudioProvenanceVia;
+  }
+): Promise<{ lease: LeaseSummary | null; routePatterns: string[] | null; logged: boolean }> {
+  const { studio, userId, agentId, sessionId, threadKey, via } = opts;
+  let routePatterns: string[] | null = null;
+  let lease: LeaseSummary | null = null;
+  let logged = false;
+
+  if (threadKey) {
+    const existing = studio.routePatterns ?? [];
+    routePatterns = existing.includes(threadKey) ? existing : [...existing, threadKey];
+    try {
+      await dataComposer.repositories.studios.update(studio.id, { threadKey, routePatterns });
+    } catch (err) {
+      logger.warn('Studio provenance: could not record threadKey / route pattern', {
+        studioId: studio.id,
+        threadKey,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      routePatterns = null;
+    }
+  }
+
+  if (sessionId) {
+    // Thread-scoped ground is leased for its thread; a home studio is leased
+    // to the session itself, the shape durable session-held studios already use.
+    const leaseKey = threadKey ?? `session:${sessionId}`;
+    try {
+      const outcome = await new StudioLeaseService(dataComposer.getClient()).acquire({
+        studioId: studio.id,
+        sessionId,
+        threadKey: leaseKey,
+        agentId,
+        userId,
+        reason: via,
+      });
+      lease = outcome.acquired
+        ? { acquired: true, threadKey: leaseKey }
+        : {
+            acquired: false,
+            threadKey: leaseKey,
+            holder: outcome.holder
+              ? { sessionId: outcome.holder.sessionId, threadKey: outcome.holder.threadKey }
+              : null,
+          };
+    } catch (err) {
+      logger.warn('Studio provenance: lease acquisition failed', {
+        studioId: studio.id,
+        sessionId,
+        threadKey: leaseKey,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  const verb = via === 'create_studio' ? 'Created' : 'Adopted';
+  const name = studio.slug || path.basename(studio.worktreePath);
+  const content =
+    `${verb} studio ${name}` +
+    (threadKey ? ` for ${threadKey}` : '') +
+    (opts.purpose ? `: ${opts.purpose}` : '');
+  try {
+    await dataComposer.repositories.activityStream.logActivity({
+      userId,
+      agentId,
+      sbId: opts.sbId,
+      sessionId,
+      type: 'state_change',
+      subtype: via === 'create_studio' ? 'studio_created' : 'studio_adopted',
+      content,
+      payload: {
+        via,
+        studioId: studio.id,
+        slug: studio.slug ?? null,
+        worktreePath: studio.worktreePath,
+        branch: studio.branch,
+        threadKey: threadKey ?? null,
+        ephemeral: studio.ephemeral ?? null,
+        expiresAt: studio.expiresAt ?? null,
+        sessionId: sessionId ?? null,
+        sessionReason: opts.sessionReason ?? null,
+        lease: lease as unknown as Json,
+        routePatterns,
+      },
+    });
+    logged = true;
+  } catch (err) {
+    logger.warn('Studio provenance: activity log write failed', {
+      studioId: studio.id,
+      via,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+
+  return { lease, routePatterns, logged };
+}
+
 // ============== Handlers ==============
 
 export async function handleCreateStudio(args: unknown, dataComposer: DataComposer) {
@@ -212,10 +379,33 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
     purpose,
     baseBranch = 'main',
     sessionId,
+    threadKey,
+    durable,
     roleTemplate,
     defaultProjectId,
     skipGitOperations = false,
   } = parsed;
+
+  // Who is creating this, from the signed request context — never from what
+  // the caller typed. An explicit sessionId still wins (a human linking a
+  // studio to a known session); otherwise the session the caller runs in, if
+  // it can be identified unambiguously. Never guessed (Lumen, #596).
+  const caller = await resolveCaller(dataComposer, resolved.user.id, agentId);
+  let creatorSessionId: string | undefined = sessionId;
+  let creatorSessionReason: string | undefined;
+  if (!creatorSessionId) {
+    const implicit = await resolveImplicitSession(
+      dataComposer,
+      resolved.user.id,
+      caller,
+      undefined
+    );
+    if (implicit.session) creatorSessionId = implicit.session.id;
+    else creatorSessionReason = implicit.reason;
+  }
+  // Thread-scoped ground is temporary by default; a home studio is not.
+  const ephemeral = durable === undefined ? Boolean(threadKey) : !durable;
+  const expiresAt = ephemeral ? new Date(Date.now() + EPHEMERAL_STUDIO_TTL_MS).toISOString() : null;
 
   if (defaultProjectId) {
     const project = await dataComposer.repositories.projects.findById(defaultProjectId);
@@ -297,7 +487,7 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
     studio = await dataComposer.repositories.studios.create({
       userId: resolved.user.id,
       agentId,
-      sessionId,
+      sessionId: creatorSessionId,
       repoRoot: mainRoot,
       worktreePath,
       branch,
@@ -306,6 +496,10 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
       workType,
       roleTemplate,
       defaultProjectId,
+      threadKey: threadKey ?? null,
+      ephemeral,
+      expiresAt,
+      metadata: { createdVia: 'create_studio', createdBySessionId: creatorSessionId ?? null },
     });
   } catch (dbError) {
     // If DB insert fails but git succeeded, attempt cleanup
@@ -327,15 +521,39 @@ export async function handleCreateStudio(args: unknown, dataComposer: DataCompos
     return errorResponse(`Failed to save studio record: ${errorMessage}`);
   }
 
+  const provenance = await recordStudioProvenance(dataComposer, {
+    studio,
+    userId: resolved.user.id,
+    agentId,
+    sbId: caller.sbId ?? undefined,
+    sessionId: creatorSessionId,
+    sessionReason: creatorSessionReason,
+    threadKey,
+    purpose,
+    via: 'create_studio',
+  });
   logger.info('Studio created', {
     studioId: studio.id,
     branch,
     worktreePath,
     agentId,
+    sessionId: creatorSessionId ?? null,
+    threadKey: threadKey ?? null,
+    ephemeral,
+    lease: provenance.lease,
   });
 
   return successResponse({
     message: `Studio created at ${worktreePath}`,
+    provenance: {
+      sessionId: creatorSessionId ?? null,
+      sessionReason: creatorSessionReason ?? null,
+      logged: provenance.logged,
+    },
+    lease: provenance.lease,
+    threadKey: threadKey ?? null,
+    ephemeral,
+    expiresAt,
     studio: {
       id: studio.id,
       studioId: studio.id,
@@ -766,7 +984,7 @@ export async function handleAdoptStudio(args: unknown, dataComposer: DataCompose
   const parsed = adoptStudioSchema.parse(args);
   const { user } = await resolveUserOrThrow(parsed, dataComposer);
 
-  const { agentId, sessionId, routePatterns } = parsed;
+  const { agentId, sessionId, routePatterns, threadKey } = parsed;
   const studiosRepo = dataComposer.repositories.studios;
   const scope = { userId: user.id, agentId };
 
@@ -804,14 +1022,32 @@ export async function handleAdoptStudio(args: unknown, dataComposer: DataCompose
     updated = await studiosRepo.update(studio.id, { routePatterns });
   }
 
+  const caller = await resolveCaller(dataComposer, user.id, agentId);
+  // Adoption takes the lease only when nobody else holds it: acquire refuses a
+  // live foreign holder, and the response reports who that is.
+  const provenance = await recordStudioProvenance(dataComposer, {
+    studio: updated,
+    userId: user.id,
+    agentId,
+    sbId: caller.sbId ?? undefined,
+    sessionId,
+    threadKey,
+    purpose: updated.purpose ?? undefined,
+    via: 'adopt_studio',
+  });
   logger.info('Studio adopted', {
     studioId: updated.id,
     agentId,
     sessionId,
+    threadKey: threadKey ?? null,
+    lease: provenance.lease,
   });
 
   return successResponse({
     message: `Studio adopted by ${agentId} and linked to session ${sessionId}`,
+    provenance: { sessionId, logged: provenance.logged },
+    lease: provenance.lease,
+    threadKey: threadKey ?? null,
     studio: {
       id: updated.id,
       studioId: updated.id,
