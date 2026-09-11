@@ -69,6 +69,7 @@ import {
   type WorktreeFinalState,
 } from './studio-lease.service';
 import { logger } from '../utils/logger';
+import { withKeyedLock } from '../utils/keyed-lock';
 
 const execFileAsync = promisify(execFile);
 
@@ -303,7 +304,25 @@ export class StudioOverflowService {
   }): Promise<Studio | null> {
     const { userId, agentId, threadKey } = opts;
     const parentStudio = await this.resolveDurableAnchor(opts.parentStudio);
+    // Same-thread ensures in this process take turns END TO END — preflight,
+    // worktree, setup (up to the dependency install), row — so the second
+    // arrival finds the first's row at preflight and reuses it. Racing them
+    // through git and rereading is not enough: the git lock is short and the
+    // row is published only after setup, so an exhausted loser could reread
+    // before the winner existed and hold the message (Lumen, #603). Arrivals
+    // from another process are still arbitrated by the live-ownership unique
+    // index on the insert.
+    return withKeyedLock(`overflow-ensure:${userId}:${parentStudio.id}:${threadKey}`, () =>
+      this.ensureOverflowStudioExclusive(userId, agentId, parentStudio, threadKey)
+    );
+  }
 
+  private async ensureOverflowStudioExclusive(
+    userId: string,
+    agentId: string,
+    parentStudio: Studio,
+    threadKey: string
+  ): Promise<Studio | null> {
     const states = await this.loadVariantStates(userId, parentStudio, threadKey);
 
     // Step 1 — reuse: a live matching row on ANY variant wins outright.
@@ -417,6 +436,29 @@ export class StudioOverflowService {
         }).catch(() => undefined);
         return this.convergeOnRaceWinner(userId, parentStudio, threadKey);
       }
+    }
+
+    // Every candidate failed for THIS call. Same-process rivals never reach
+    // here for that reason (they queue on the ensure lock above), but a rival
+    // in ANOTHER process may have won meanwhile — its worktree took the path
+    // we tried, its git locks failed ours — and published a live row. Hand it
+    // back if it is there: null here is not "no studio", it is a held message
+    // (see convergeOnRaceWinner). This is best effort, not a cross-process
+    // convergence guarantee; genuine exhaustion still yields null.
+    const lateWinner = await this.firstLiveMatch(
+      await this.loadVariantStates(userId, parentStudio, threadKey),
+      threadKey
+    );
+    if (lateWinner) {
+      logger.info(
+        '[StudioOverflow] Every slug candidate failed, but a concurrent ensure won; converged',
+        {
+          threadKey,
+          studioId: lateWinner.id,
+          slug: lateWinner.slug,
+        }
+      );
+      return lateWinner;
     }
 
     logger.error(
@@ -569,17 +611,21 @@ export class StudioOverflowService {
       // they are working checkouts in their own right.
       const branch = opts.branch;
       try {
-        await execFileAsync('git', ['worktree', 'add', '-b', branch, worktreePath, baseBranch], {
-          cwd: mainRoot,
-        });
+        await withKeyedLock(`git-worktree:${mainRoot}`, () =>
+          execFileAsync('git', ['worktree', 'add', '-b', branch, worktreePath, baseBranch], {
+            cwd: mainRoot,
+          })
+        );
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         // The branch may survive a previous teardown. Retry attached to it.
         if (message.includes('already exists')) {
           try {
-            await execFileAsync('git', ['worktree', 'add', worktreePath, branch], {
-              cwd: mainRoot,
-            });
+            await withKeyedLock(`git-worktree:${mainRoot}`, () =>
+              execFileAsync('git', ['worktree', 'add', worktreePath, branch], {
+                cwd: mainRoot,
+              })
+            );
           } catch (retryErr) {
             logger.error('[StudioOverflow] Worktree creation failed (existing-branch retry)', {
               branch,
@@ -608,10 +654,16 @@ export class StudioOverflowService {
     // tree is stash-rescued at teardown, and captureWorktreeState mints an
     // `ink-rescue/` branch when detached commits would otherwise be
     // unreachable.
+    // Serialized per repository: `git worktree add` takes repository-level
+    // locks, and two concurrent ensures for one thread run this at the same
+    // time (see utils/keyed-lock). Concurrency is still arbitrated where it
+    // belongs — the live-ownership unique index on the row insert.
     try {
-      await execFileAsync('git', ['worktree', 'add', '--detach', worktreePath, baseBranch], {
-        cwd: mainRoot,
-      });
+      await withKeyedLock(`git-worktree:${mainRoot}`, () =>
+        execFileAsync('git', ['worktree', 'add', '--detach', worktreePath, baseBranch], {
+          cwd: mainRoot,
+        })
+      );
     } catch (err) {
       logger.error('[StudioOverflow] Detached worktree creation failed', {
         worktreePath,
