@@ -438,7 +438,7 @@ yarn install
 # Development server (with hot reload)
 yarn dev
 
-# Build for production
+# Build for production (also re-points the global ink link — see "The Global ink CLI Link")
 yarn build
 
 # Type checking
@@ -479,6 +479,30 @@ Port derivation from `PCP_PORT_BASE`:
 - **Myra**: `PCP_PORT_BASE + 2` (e.g., 4003)
 
 Both servers share the same Supabase database, so data changes are visible to both. The main server stays untouched on 3001.
+
+## The Global `ink` CLI Link (IMPORTANT)
+
+`~/.ink/bin/ink` (compat alias: `~/.local/bin/ink`) is a symlink to **one** checkout's `packages/cli/dist/cli.js`. Every terminal hook, every server-spawned session, and every `ink wait` on this machine runs whatever that link points at. Which checkout it points at is the OB's decision, not yours.
+
+**NEVER re-point the global `ink` link without explicit permission in the current conversation.** All of these re-point it:
+
+- `yarn workspace @inklabs/cli install:cli` — links to the checkout you run it from
+- root `yarn build` — runs `install:cli` as its last step
+- `ln -s` or editing the symlink by hand
+
+A deploy, a merged CLI fix, a build that looks stale, or "the fix should reach terminals" is not permission. Ask, name the checkout you would point it at, and wait for a yes. Permission for one relink does not carry over to the next.
+
+**To test a CLI change, build it where it lives and call that build directly:**
+
+```bash
+# From your studio (create one with: ink studio create <name> --branch <branch> --agent <you>)
+yarn workspace @inklabs/cli build
+./packages/cli/dist/cli.js <subcommand>
+```
+
+The global link stays where it was. Your studio's build is for you to exercise, not for every other session on the machine to run.
+
+**If the server or a hook reaches for `ink` without saying which checkout it means, that is a code problem, not a reason to relink.** `resolveInkBinaryPath` in `packages/api/src/services/studio-settings.ts` tries the global link first, and the ink runner resolves `ink` from `PATH`. Close that kind of gap in code — an explicit env var, or the server resolving its own checkout's `packages/cli` relative to itself — and open a PR for it.
 
 ## Supabase Project ID
 
