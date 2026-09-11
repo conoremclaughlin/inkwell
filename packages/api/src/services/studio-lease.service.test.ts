@@ -2180,6 +2180,38 @@ describe('captureWorktreeState (real git)', () => {
       expect(rescues.trim().split('\n').filter(Boolean)).toHaveLength(1);
     });
 
+    it('leaves a fetched PR head alone — a remote-tracking ref already reaches it — but anchors work on top', async () => {
+      // The shape a PR review leaves behind: HEAD detached at a commit that
+      // no local branch reaches, published only as origin/pr/9.
+      const git = (...args: string[]) => execFileAsync('git', args, { cwd: repoDir });
+      await git('checkout', '-q', '-b', 'pr-source');
+      await git('commit', '--allow-empty', '-m', 'pr head');
+      const { stdout: prSha } = await git('rev-parse', 'HEAD');
+      await git('update-ref', 'refs/remotes/origin/pr/9', prSha.trim());
+      await git('checkout', '-q', 'main');
+      await git('branch', '-D', 'pr-source');
+      const prWorktree = path.join(path.dirname(repoDir), `${path.basename(repoDir)}--pr9`);
+      await git('worktree', 'add', '--detach', prWorktree, 'refs/remotes/origin/pr/9');
+      try {
+        const state = await captureWorktreeState(prWorktree, { rescue: true, rescueLabel: 'pr:9' });
+        expect(state.commit).toBe(prSha.trim());
+        // Nothing to anchor: those commits live on the remote.
+        expect(state.rescueBranch).toBeUndefined();
+        expect(rescueSucceeded(state)).toBe(true);
+
+        // A commit made during the review is new work and IS anchored.
+        await execFileAsync('git', ['commit', '--allow-empty', '-m', 'review fixup'], {
+          cwd: prWorktree,
+        });
+        const after = await captureWorktreeState(prWorktree, { rescue: true, rescueLabel: 'pr:9' });
+        expect(after.rescueBranch).toMatch(/^ink-rescue\/pr-9-[0-9a-f]{10}$/);
+      } finally {
+        await execFileAsync('git', ['worktree', 'remove', '--force', prWorktree], {
+          cwd: repoDir,
+        }).catch(() => undefined);
+      }
+    });
+
     it('stash-rescues a dirty detached tree and anchors its commits in one pass', async () => {
       await writeFile(path.join(worktree, 'work.txt'), 'committed\n');
       await execFileAsync('git', ['add', '.'], { cwd: worktree });

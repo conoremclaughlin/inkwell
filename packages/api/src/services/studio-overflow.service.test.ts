@@ -31,6 +31,7 @@ import {
   slugHash,
   overflowSlug,
   StudioOverflowService,
+  pullRequestDetachTarget,
 } from './studio-overflow.service';
 import type { Studio, StudiosRepository } from '../data/repositories/studios.repository';
 import type { StudioLeaseService, StudioLease } from './studio-lease.service';
@@ -1093,5 +1094,240 @@ describe('S2: teardownEphemeralStudiosForThread under multiplexing (spec v18)', 
     });
     expect(closed).toBe(0);
     expect(claimForTeardown).not.toHaveBeenCalled();
+  });
+});
+
+// ── PR threads detach at the PR head (studio-model, piece 2) ──
+
+/**
+ * A repo whose `origin` is a bare clone holding a PR head that NO local branch
+ * reaches — the shape of reviewing someone else's PR. The PR commit is made on
+ * a throwaway branch, published to origin as `refs/pull/<n>/head` (GitHub's
+ * convention), and the branch is deleted locally.
+ */
+async function makeGitRepoWithPullRef(
+  prNumber: number
+): Promise<{ repoRoot: string; origin: string; prHead: string; mainHead: string }> {
+  const repoRoot = await makeGitRepo();
+  const origin = await mkdtemp(path.join(tmpdir(), 'overflow-origin-'));
+  const git = (args: string[], cwd = repoRoot) => execFileAsync('git', args, { cwd });
+  await git(['init', '--bare', '-b', 'main'], origin);
+  await git(['remote', 'add', 'origin', origin]);
+  await git(['push', '-q', 'origin', 'main']);
+  const { stdout: mainSha } = await git(['rev-parse', 'HEAD']);
+  await git(['checkout', '-q', '-b', 'pr-source']);
+  await git([
+    '-c',
+    'user.email=test@test',
+    '-c',
+    'user.name=test',
+    'commit',
+    '--allow-empty',
+    '-m',
+    `pr ${prNumber} head`,
+  ]);
+  const { stdout: prSha } = await git(['rev-parse', 'HEAD']);
+  await git(['push', '-q', 'origin', `HEAD:refs/pull/${prNumber}/head`]);
+  await git(['checkout', '-q', 'main']);
+  await git(['branch', '-D', 'pr-source']);
+  return { repoRoot, origin, prHead: prSha.trim(), mainHead: mainSha.trim() };
+}
+
+describe('pullRequestDetachTarget', () => {
+  it('names the GitHub pull ref for a pr thread, with or without a project prefix', () => {
+    expect(pullRequestDetachTarget('pr:591')).toEqual({
+      number: 591,
+      fetchRefspec: '+refs/pull/591/head:refs/remotes/origin/pr/591',
+      localRef: 'refs/remotes/origin/pr/591',
+      label: 'origin/pr/591',
+    });
+    expect(pullRequestDetachTarget('inktrade:pr:42')?.localRef).toBe('refs/remotes/origin/pr/42');
+  });
+
+  it('is null for every other thread shape — those detach at the base branch', () => {
+    for (const key of [
+      'task:abc',
+      'branch:wren/feat/x',
+      'spec:studio-model',
+      'pr:abc',
+      'pr:',
+      'pr',
+    ]) {
+      expect(pullRequestDetachTarget(key)).toBeNull();
+    }
+  });
+});
+
+describe('StudioOverflowService.ensureOverflowStudio — PR threads detach at the PR head', () => {
+  function capturingRepo(createdInputs: Array<Record<string, unknown>>) {
+    return {
+      findById: vi.fn(),
+      findBySlug: vi.fn().mockResolvedValue(null),
+      create: vi.fn().mockImplementation((input: Record<string, unknown>) => {
+        createdInputs.push(input);
+        return Promise.resolve(makeStudio({ id: 'new-primary', ...(input as Partial<Studio>) }));
+      }),
+      update: vi.fn(),
+    } as unknown as StudiosRepository;
+  }
+
+  it('checks out the PR head, pins the commit on the row, and mints no branch', async () => {
+    const { repoRoot, origin, prHead } = await makeGitRepoWithPullRef(7);
+    const slug = 'lumen-review--pr-7';
+    const worktree = ephemeralWorktreePath({ agentId: 'lumen', repoRoot, leaf: slug });
+    try {
+      const createdInputs: Array<Record<string, unknown>> = [];
+      const service = new StudioOverflowService(capturingRepo(createdInputs), {
+        logEvent: vi.fn(),
+      } as unknown as StudioLeaseService);
+
+      const result = await service.ensureOverflowStudio({
+        userId: 'user-1',
+        agentId: 'lumen',
+        parentStudio: makeStudio({ repoRoot, worktreePath: repoRoot }),
+        threadKey: 'pr:7',
+      });
+
+      expect(result?.id).toBe('new-primary');
+      expect(createdInputs).toHaveLength(1);
+      expect(createdInputs[0].branch).toBe('detached:origin/pr/7');
+      expect(createdInputs[0].metadata).toEqual({
+        overflow: true,
+        checkout: { mode: 'detached', ref: 'origin/pr/7', commit: prHead },
+      });
+
+      // The worktree really sits on the PR's commit, detached.
+      const { stdout: head } = await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: worktree });
+      expect(head.trim()).toBe(prHead);
+      const { stdout: abbrev } = await execFileAsync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], {
+        cwd: worktree,
+      });
+      expect(abbrev.trim()).toBe('HEAD');
+      // No branch was created anywhere — only main exists.
+      const { stdout: branches } = await execFileAsync('git', ['branch', '--list'], {
+        cwd: repoRoot,
+      });
+      expect(
+        branches
+          .split('\n')
+          .map((line) => line.replace(/^\*?\s*/, '').trim())
+          .filter(Boolean)
+      ).toEqual(['main']);
+      // The fetched head lives under a remote-tracking ref, not a branch.
+      const { stdout: tracking } = await execFileAsync(
+        'git',
+        ['rev-parse', 'refs/remotes/origin/pr/7'],
+        { cwd: repoRoot }
+      );
+      expect(tracking.trim()).toBe(prHead);
+    } finally {
+      await execFileAsync('git', ['worktree', 'remove', '--force', worktree], {
+        cwd: repoRoot,
+      }).catch(() => undefined);
+      await rm(repoRoot, { recursive: true, force: true });
+      await rm(origin, { recursive: true, force: true });
+    }
+  });
+
+  it('falls back to the base branch when the PR ref cannot be fetched — still detached, still no branch', async () => {
+    const { repoRoot, origin, mainHead } = await makeGitRepoWithPullRef(7);
+    const slug = 'lumen-review--pr-404';
+    const worktree = ephemeralWorktreePath({ agentId: 'lumen', repoRoot, leaf: slug });
+    try {
+      const createdInputs: Array<Record<string, unknown>> = [];
+      const service = new StudioOverflowService(capturingRepo(createdInputs), {
+        logEvent: vi.fn(),
+      } as unknown as StudioLeaseService);
+
+      // origin exists, but no PR 404 does.
+      const result = await service.ensureOverflowStudio({
+        userId: 'user-1',
+        agentId: 'lumen',
+        parentStudio: makeStudio({ repoRoot, worktreePath: repoRoot }),
+        threadKey: 'pr:404',
+      });
+
+      expect(result?.id).toBe('new-primary');
+      expect(createdInputs[0].branch).toBe('detached:main');
+      expect(createdInputs[0].metadata).toEqual({
+        overflow: true,
+        checkout: { mode: 'detached', ref: 'main', commit: mainHead },
+      });
+      const { stdout: head } = await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: worktree });
+      expect(head.trim()).toBe(mainHead);
+      const { stdout: branches } = await execFileAsync('git', ['branch', '--list'], {
+        cwd: repoRoot,
+      });
+      expect(branches.split('\n').filter((l) => l.trim()).length).toBe(1);
+    } finally {
+      await execFileAsync('git', ['worktree', 'remove', '--force', worktree], {
+        cwd: repoRoot,
+      }).catch(() => undefined);
+      await rm(repoRoot, { recursive: true, force: true });
+      await rm(origin, { recursive: true, force: true });
+    }
+  });
+
+  it('a revived row gets the fresh checkout pin merged into its existing metadata', async () => {
+    const { repoRoot, origin, prHead } = await makeGitRepoWithPullRef(7);
+    const parent = makeStudio({ repoRoot, worktreePath: repoRoot });
+    const slug = overflowSlug(parent, 'pr:7');
+    const worktree = ephemeralWorktreePath({ agentId: 'lumen', repoRoot, leaf: slug });
+    try {
+      // A cleaned row for this exact (parent, thread): its worktree is gone,
+      // so the ensure revives it rather than inserting beside it.
+      const stale = makeStudio({
+        id: 'stale-row',
+        slug,
+        threadKey: 'pr:7',
+        parentStudioId: parent.id,
+        ephemeral: true,
+        status: 'cleaned' as Studio['status'],
+        cleanedAt: '2026-09-01T00:00:00.000Z',
+        worktreePath: path.join(repoRoot, 'gone'),
+        branch: 'lumen/eph/pr-7',
+        metadata: { overflow: true, note: 'keep me' },
+      });
+      const updates: Array<Record<string, unknown>> = [];
+      const studios = {
+        findById: vi.fn(),
+        findBySlug: vi
+          .fn()
+          .mockImplementation((_userId: string, s: string) =>
+            Promise.resolve(s === slug ? stale : null)
+          ),
+        create: vi.fn(),
+        update: vi.fn().mockImplementation((id: string, input: Record<string, unknown>) => {
+          updates.push(input);
+          return Promise.resolve(makeStudio({ ...stale, ...(input as Partial<Studio>), id }));
+        }),
+      } as unknown as StudiosRepository;
+      const service = new StudioOverflowService(studios, {
+        logEvent: vi.fn(),
+      } as unknown as StudioLeaseService);
+
+      const revived = await service.ensureOverflowStudio({
+        userId: 'user-1',
+        agentId: 'lumen',
+        parentStudio: parent,
+        threadKey: 'pr:7',
+      });
+
+      expect(revived?.id).toBe('stale-row');
+      expect(studios.create).not.toHaveBeenCalled();
+      expect(updates).toHaveLength(1);
+      expect(updates[0].branch).toBe('detached:origin/pr/7');
+      expect(updates[0].metadata).toEqual({
+        overflow: true,
+        note: 'keep me',
+        checkout: { mode: 'detached', ref: 'origin/pr/7', commit: prHead },
+      });
+    } finally {
+      await execFileAsync('git', ['worktree', 'remove', '--force', worktree], {
+        cwd: repoRoot,
+      }).catch(() => undefined);
+      await rm(repoRoot, { recursive: true, force: true });
+      await rm(origin, { recursive: true, force: true });
+    }
   });
 });

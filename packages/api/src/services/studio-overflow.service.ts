@@ -47,7 +47,10 @@
  * cleared. Destruction is additionally gated on a verified rescue, and
  * `cleaned` is recorded only after the worktree is confirmed gone from disk.
  * Ephemeral checkouts are DETACHED — no branch is minted at creation; rescue
- * anchors any otherwise-unreachable commits under `ink-rescue/*`.
+ * anchors any otherwise-unreachable commits under `ink-rescue/*`. A PR thread
+ * detaches at the PR's own head (fetched from `refs/pull/<n>/head`), so the
+ * reviewer lands on the code under review; every other thread detaches at the
+ * base branch. See `pullRequestDetachTarget`.
  */
 
 import { execFile } from 'child_process';
@@ -102,6 +105,73 @@ export function overflowSlug(parentStudio: Studio, threadKey: string, variant?: 
   const parentSlug = parentStudio.slug || path.basename(parentStudio.worktreePath) || 'studio';
   const tail = variant ? `${threadSlug(threadKey)}-h${variant}` : threadSlug(threadKey);
   return `${parentSlug}--${tail}`;
+}
+
+/**
+ * Where a PR thread's worktree should be detached: the PR's current head.
+ *
+ * GitHub publishes every PR's head at `refs/pull/<n>/head`, whatever branch it
+ * came from and whoever owns it. We fetch it into a remote-tracking ref — not
+ * a branch, so nothing is minted or littered — and detach the worktree there.
+ * Commits reachable from a remote-tracking ref already live on the remote, so
+ * the teardown rescue (`captureWorktreeState`) leaves them alone.
+ *
+ * Grammar: `pr:<n>` or `<project>:pr:<n>`; only the trailing two segments
+ * matter, so no project-slug lookup is needed here. A mis-detection costs one
+ * failed fetch and falls back to the base branch — never a wrong checkout.
+ */
+export interface PullRequestDetachTarget {
+  number: number;
+  /** `git fetch origin <fetchRefspec>` */
+  fetchRefspec: string;
+  /** The ref to detach at once fetched. */
+  localRef: string;
+  /** Short form recorded on the studio row (`detached:<label>`). */
+  label: string;
+}
+
+export function pullRequestDetachTarget(threadKey: string): PullRequestDetachTarget | null {
+  const segments = threadKey.split(':');
+  if (segments.length < 2 || segments.length > 3) return null;
+  const type = segments[segments.length - 2];
+  const id = segments[segments.length - 1];
+  if (type !== 'pr' || !/^\d+$/.test(id)) return null;
+  const number = Number(id);
+  return {
+    number,
+    fetchRefspec: `+refs/pull/${number}/head:refs/remotes/origin/pr/${number}`,
+    localRef: `refs/remotes/origin/pr/${number}`,
+    label: `origin/pr/${number}`,
+  };
+}
+
+/** What a detached checkout is pinned to — recorded in `studios.metadata.checkout`. */
+export interface DetachedCheckout {
+  mode: 'detached';
+  /** `origin/pr/<n>` or the base branch name. */
+  ref: string;
+  /** The commit HEAD sat on when the worktree was created. */
+  commit: string;
+}
+
+interface WorktreeCreation {
+  worktreePath: string;
+  /** Real branch for durable studios; `detached:<ref>` sentinel for ephemerals. */
+  branch: string;
+  checkout?: DetachedCheckout;
+}
+
+/** Studio metadata with the checkout pin merged in (prior keys preserved). */
+function withCheckoutMetadata(
+  prior: Studio['metadata'] | Record<string, unknown> | null | undefined,
+  checkout: DetachedCheckout | undefined
+): Record<string, unknown> {
+  const base =
+    prior && typeof prior === 'object' && !Array.isArray(prior)
+      ? { ...(prior as Record<string, unknown>) }
+      : {};
+  if (checkout) base.checkout = checkout;
+  return base;
 }
 
 /** One slug variant's preflight result for a given (parent, threadKey). */
@@ -334,6 +404,8 @@ export class StudioOverflowService {
     // the next variant (fresh slug AND fresh branch name): the usual cause
     // is the `eph/` branch being checked out by another worktree, e.g. a
     // legacy chained studio from before durable anchoring.
+    // A PR thread's checkout lands on the PR head; anything else on the base.
+    const detachAt = pullRequestDetachTarget(threadKey) ?? undefined;
     for (const s of states) {
       const { existing } = s;
       if (existing && !s.matches) continue;
@@ -344,6 +416,7 @@ export class StudioOverflowService {
           repoRoot: parentStudio.repoRoot,
           leaf: s.slug,
         }),
+        detachAt,
       });
       if (!created) continue;
 
@@ -358,6 +431,11 @@ export class StudioOverflowService {
             // before detached checkouts; the fresh worktree is detached, and
             // the column must describe THIS checkout, not the old one.
             branch: created.branch,
+            // Same reason for the pin: it describes THIS checkout.
+            metadata: withCheckoutMetadata(
+              existing.metadata,
+              created.checkout
+            ) as Studio['metadata'],
             purpose: `Overflow studio for ${threadKey} (parent ${parentStudio.slug || parentStudio.id} was leased)`,
             cleanedAt: null,
             // Clearing archived_at is not cosmetic: a row revived from
@@ -406,7 +484,10 @@ export class StudioOverflowService {
           parentStudioId: parentStudio.id,
           threadKey,
           expiresAt: new Date(Date.now() + EPHEMERAL_STUDIO_TTL_MS).toISOString(),
-          metadata: { overflow: true },
+          metadata: withCheckoutMetadata(
+            { overflow: true },
+            created.checkout
+          ) as Studio['metadata'],
           // Root-based paths don't encode the slug — pass it explicitly or
           // the derived fallback is null and reuse-by-slug silently breaks.
           slug: s.slug,
@@ -421,6 +502,7 @@ export class StudioOverflowService {
           studioId: studio.id,
           slug: s.slug,
           worktreePath: created.worktreePath,
+          checkout: created.checkout ?? null,
         });
         return studio;
       } catch (err) {
@@ -595,8 +677,8 @@ export class StudioOverflowService {
   private async createWorktree(
     parentStudio: Studio,
     slug: string,
-    opts?: { branch?: string; worktreePath?: string }
-  ): Promise<{ worktreePath: string; branch: string } | null> {
+    opts?: { branch?: string; worktreePath?: string; detachAt?: PullRequestDetachTarget }
+  ): Promise<WorktreeCreation | null> {
     const mainRoot = parentStudio.repoRoot;
     // Ephemeral callers pass the canonical-root path; the durable D1 parent
     // omits it and keeps the legacy sibling-of-repo location. `git worktree
@@ -658,31 +740,69 @@ export class StudioOverflowService {
     // locks, and two concurrent ensures for one thread run this at the same
     // time (see utils/keyed-lock). Concurrency is still arbitrated where it
     // belongs — the live-ownership unique index on the row insert.
+    // Where to detach: the PR head for a PR thread, when it can be fetched.
+    // A failed fetch (no `origin`, not GitHub, offline, PR gone) is not fatal
+    // — the review still gets a detached worktree, just at the base branch,
+    // exactly as before; the warning says which. Serialized like the add:
+    // concurrent fetches of one refspec would fight over the ref lock.
+    let target = baseBranch;
+    let label = baseBranch;
+    if (opts?.detachAt) {
+      const pr = opts.detachAt;
+      try {
+        await withKeyedLock(`git-worktree:${mainRoot}`, () =>
+          execFileAsync('git', ['fetch', '--no-tags', '--quiet', 'origin', pr.fetchRefspec], {
+            cwd: mainRoot,
+            timeout: 60_000,
+          })
+        );
+        target = pr.localRef;
+        label = pr.label;
+      } catch (err) {
+        logger.warn('[StudioOverflow] PR head fetch failed; detaching at the base branch instead', {
+          worktreePath,
+          fetchRefspec: pr.fetchRefspec,
+          baseBranch,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
     try {
       await withKeyedLock(`git-worktree:${mainRoot}`, () =>
-        execFileAsync('git', ['worktree', 'add', '--detach', worktreePath, baseBranch], {
+        execFileAsync('git', ['worktree', 'add', '--detach', worktreePath, target], {
           cwd: mainRoot,
         })
       );
     } catch (err) {
       logger.error('[StudioOverflow] Detached worktree creation failed', {
         worktreePath,
-        baseBranch,
+        target,
         error: err instanceof Error ? err.message : String(err),
       });
       return null;
     }
+    // Pin what HEAD sat on: reuse never resets a checkout, so "which commit
+    // did this review start from" has to be recorded, not re-derived.
+    const { stdout: pinned } = await execFileAsync('git', ['rev-parse', 'HEAD'], {
+      cwd: worktreePath,
+    });
     // The studios row's branch column records what is checked out; this
-    // sentinel says "no branch, cut from <base>" and can never collide with
+    // sentinel says "no branch, cut from <ref>" and can never collide with
     // branch-based routing lookups.
-    return this.finishWorktreeSetup(mainRoot, worktreePath, `detached:${baseBranch}`);
+    return this.finishWorktreeSetup(mainRoot, worktreePath, `detached:${label}`, {
+      mode: 'detached',
+      ref: label,
+      commit: pinned.trim(),
+    });
   }
 
   private async finishWorktreeSetup(
     mainRoot: string,
     worktreePath: string,
-    branch: string
-  ): Promise<{ worktreePath: string; branch: string }> {
+    branch: string,
+    checkout?: DetachedCheckout
+  ): Promise<WorktreeCreation> {
     const pkgJson = await access(path.join(worktreePath, 'package.json'))
       .then(() => true)
       .catch(() => false);
@@ -707,7 +827,7 @@ export class StudioOverflowService {
     }
     await ensureStudioSettings(worktreePath).catch(() => undefined);
 
-    return { worktreePath, branch };
+    return checkout ? { worktreePath, branch, checkout } : { worktreePath, branch };
   }
 
   /**

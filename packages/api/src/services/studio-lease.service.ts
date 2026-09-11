@@ -315,10 +315,14 @@ export async function captureWorktreeState(
     // Anchor them with an `ink-rescue/*` branch before anyone deletes the
     // checkout. Named by label + commit so re-rescuing the same HEAD converges
     // on the same branch instead of erroring; `-f` makes it idempotent.
+    // Remote-tracking refs count as reachable: a PR review detaches at a
+    // fetched `origin/pr/<n>` head, and those commits already live on the
+    // remote — rescuing them would mint a branch per review, the litter this
+    // whole design exists to end. Only work ON TOP of the fetched head is new.
     if (opts.rescue && state.branch === 'HEAD' && state.commit) {
       const { stdout: unreachable } = await execFileAsync(
         'git',
-        ['rev-list', '-n', '1', 'HEAD', '--not', '--branches'],
+        ['rev-list', '-n', '1', 'HEAD', '--not', '--branches', '--remotes'],
         { cwd: worktreePath }
       );
       if (unreachable.trim()) {
