@@ -1759,13 +1759,19 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
           }
 
           const unreadBaseline = lastReadAt || joinedAt;
-          const threadMsgs = msgsByThread.get(t.id) || [];
+          // Unread is counted over DELIVERABLE messages only, the same rule
+          // as SQL candidacy (get_unread_thread_candidates excludes system
+          // events). Now that closed threads stay on this page, a thread
+          // whose only post-pointer row is its own closure audit event must
+          // read as zero unread, not one (Lumen, PR #613).
+          const deliverableMsgs = (msgsByThread.get(t.id) || []).filter(
+            (m) => m.message_type !== 'system'
+          );
           const unreadCount = unreadBaseline
-            ? threadMsgs.filter((m) => m.created_at > unreadBaseline).length
-            : threadMsgs.length;
+            ? deliverableMsgs.filter((m) => m.created_at > unreadBaseline).length
+            : deliverableMsgs.length;
 
-          const previewMessages = threadMsgs
-            .filter((m) => m.message_type !== 'system')
+          const previewMessages = deliverableMsgs
             .slice(0, 3)
             .reverse()
             .map((m) => ({
@@ -2267,9 +2273,12 @@ export async function handleGetAgentSummaries(args: unknown, dataComposer: DataC
       .order('started_at', { ascending: false })
       .then((r: { data: unknown }) => r.data || []),
 
-    // 3. All thread participation for these agents
+    // 3. All thread participation for these agents. joined_at is the unread
+    // floor for a participant with no read pointer yet — pre-join history is
+    // not that participant's unread (same rule as get_inbox and SQL
+    // candidacy; Lumen, PR #613).
     threadTable(supabase, 'inbox_thread_participants')
-      .select('thread_id, agent_id')
+      .select('thread_id, agent_id, joined_at')
       .in('agent_id', agentIds)
       .then((r: { data: unknown }) => r.data || [])
       .catch(() => []), // Thread tables may not exist yet
@@ -2363,12 +2372,18 @@ export async function handleGetAgentSummaries(args: unknown, dataComposer: DataC
       }>;
     })(),
 
-    // 7. All messages in participant threads (just thread_id + created_at for counting)
+    // 7. All DELIVERABLE messages in participant threads (thread_id +
+    // created_at for counting). System events — a thread's own closure
+    // marker, a participant-added note — are not mail and never count as
+    // unread, matching SQL candidacy. With closed threads now in scope, a
+    // closed thread must not read as one unread forever because of its
+    // closure event (Lumen, PR #613).
     (async () => {
       if (!participantThreadIds.length) return [];
       const { data } = await threadTable(supabase, 'inbox_thread_messages')
         .select('thread_id, created_at')
-        .in('thread_id', participantThreadIds);
+        .in('thread_id', participantThreadIds)
+        .neq('message_type', 'system');
       return (data || []) as Array<{ thread_id: string; created_at: string }>;
     })(),
   ]);
@@ -2390,23 +2405,37 @@ export async function handleGetAgentSummaries(args: unknown, dataComposer: DataC
     threadReadMap.set(`${rs.thread_id}:${rs.agent_id}`, rs.last_read_at);
   }
 
-  // Build agent → set of thread IDs they participate in (any status)
+  // Build agent → set of thread IDs they participate in (any status), and
+  // remember when each participant joined: a message older than the join is
+  // history the participant was never handed, not unread mail.
   const agentThreads = new Map<string, Set<string>>();
+  const joinedAtMap = new Map<string, string>(); // "threadId:agentId" → joined_at
   const participantThreadIdSet = new Set(participantThreadIds);
-  for (const p of allParticipation as Array<{ thread_id: string; agent_id: string }>) {
+  for (const p of allParticipation as Array<{
+    thread_id: string;
+    agent_id: string;
+    joined_at?: string | null;
+  }>) {
     if (!participantThreadIdSet.has(p.thread_id)) continue;
     if (!agentThreads.has(p.agent_id)) agentThreads.set(p.agent_id, new Set());
     agentThreads.get(p.agent_id)!.add(p.thread_id);
+    if (p.joined_at) joinedAtMap.set(`${p.thread_id}:${p.agent_id}`, p.joined_at);
   }
 
-  // Count unread thread messages per agent
+  // Count unread thread messages per agent. The floor is the LATER of the
+  // read pointer and the join time — exactly what get_inbox and the SQL
+  // candidacy function use — so a pointer-less late joiner is not credited
+  // with every message that predates them.
   const threadUnreadMap = new Map<string, number>();
   for (const msg of threadMessages) {
     // For each agent that participates in this thread, check if message is unread
     for (const [aid, threads] of agentThreads) {
       if (!threads.has(msg.thread_id)) continue;
       const lastRead = threadReadMap.get(`${msg.thread_id}:${aid}`);
-      if (!lastRead || msg.created_at > lastRead) {
+      const joinedAt = joinedAtMap.get(`${msg.thread_id}:${aid}`);
+      const floor =
+        lastRead && joinedAt ? (lastRead > joinedAt ? lastRead : joinedAt) : lastRead || joinedAt;
+      if (!floor || msg.created_at > floor) {
         threadUnreadMap.set(aid, (threadUnreadMap.get(aid) || 0) + 1);
       }
     }

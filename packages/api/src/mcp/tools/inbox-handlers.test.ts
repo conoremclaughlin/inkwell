@@ -2717,3 +2717,160 @@ describe('Closed threads accept replies and stay deliverable (spec inkmail-threa
     expect(wren.threadUnread).toBe(1);
   });
 });
+
+/**
+ * A Supabase mock that FILTERS: eq/neq/in/gt narrow the configured rows the
+ * way PostgREST would, so a query's predicate is part of what the test
+ * checks. The recording mock above never filters, which is right for
+ * asserting which predicates were sent and wrong for asserting what a
+ * predicate excludes.
+ */
+function createFilteringSupabase(rows: Record<string, Array<Record<string, unknown>>>) {
+  return {
+    from: (table: string) => {
+      let data = rows[table] ?? [];
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const q: any = {};
+      q.select = () => q;
+      q.eq = (k: string, v: unknown) => {
+        data = data.filter((r) => r[k] === v);
+        return q;
+      };
+      q.neq = (k: string, v: unknown) => {
+        data = data.filter((r) => r[k] !== v);
+        return q;
+      };
+      q.in = (k: string, v: unknown[]) => {
+        data = data.filter((r) => v.includes(r[k]));
+        return q;
+      };
+      q.gt = (k: string, v: string) => {
+        data = data.filter((r) => String(r[k]) > v);
+        return q;
+      };
+      q.or = () => q;
+      q.order = () => q;
+      q.limit = () => q;
+      q.maybeSingle = () => Promise.resolve({ data: data[0] ?? null, error: null });
+      q.then = (onFulfilled: (v: unknown) => unknown, onRejected?: (e: unknown) => unknown) =>
+        Promise.resolve({ data, error: null }).then(onFulfilled, onRejected);
+      q.catch = (onRejected: (e: unknown) => unknown) =>
+        Promise.resolve({ data, error: null }).catch(onRejected);
+      return q;
+    },
+    rpc: vi.fn().mockResolvedValue({ data: null, error: null }),
+  };
+}
+
+describe('Unread parity with SQL candidacy once closed threads are in scope (Lumen, PR #613)', () => {
+  // Before this PR the status filter hid closed threads from both handlers,
+  // so their closure audit events never had a chance to count. Now that the
+  // threads are visible, the handlers must apply the same two rules the SQL
+  // candidacy function does: only DELIVERABLE (non-system) messages count,
+  // and a participant's floor is the later of their read pointer and their
+  // join time.
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    const { getRequestContext, getSessionContext, getPinnedAgentId } =
+      await import('../../utils/request-context');
+    vi.mocked(getRequestContext).mockReturnValue({ sessionId: 'session-mock-123' } as never);
+    vi.mocked(getSessionContext).mockReturnValue(undefined as never);
+    vi.mocked(getPinnedAgentId).mockReturnValue(undefined as never);
+  });
+
+  async function summariesUnread(opts: {
+    joined: string;
+    lastRead?: string;
+    messageAt: string;
+    type: string;
+  }) {
+    const { handleGetAgentSummaries } = await import('./inbox-handlers');
+    const db = createFilteringSupabase({
+      inbox_thread_participants: [
+        { thread_id: 'closed-thread', agent_id: 'lumen', joined_at: opts.joined },
+      ],
+      inbox_threads: [{ id: 'closed-thread', user_id: 'user-123', status: 'closed' }],
+      inbox_thread_read_status: opts.lastRead
+        ? [{ thread_id: 'closed-thread', agent_id: 'lumen', last_read_at: opts.lastRead }]
+        : [],
+      inbox_thread_messages: [
+        { thread_id: 'closed-thread', message_type: opts.type, created_at: opts.messageAt },
+      ],
+    });
+    const result = await handleGetAgentSummaries(
+      { email: 'test@test.com', agentIds: ['lumen'] },
+      createMockDataComposer(db as never) as never
+    );
+    return JSON.parse(result.content[0].text).agents[0].threadUnread as number;
+  }
+
+  it('get_agent_summaries does not count the closure audit event after all mail was read', async () => {
+    expect(
+      await summariesUnread({
+        joined: '2026-09-01T00:00:00Z',
+        lastRead: '2026-09-02T00:00:00Z',
+        messageAt: '2026-09-03T00:00:00Z',
+        type: 'system',
+      })
+    ).toBe(0);
+  });
+
+  it('get_agent_summaries does not count pre-join history for a late joiner with no pointer', async () => {
+    expect(
+      await summariesUnread({
+        joined: '2026-09-03T00:00:00Z',
+        messageAt: '2026-09-02T00:00:00Z',
+        type: 'message',
+      })
+    ).toBe(0);
+  });
+
+  it('get_agent_summaries still counts a deliverable reply after the pointer', async () => {
+    expect(
+      await summariesUnread({
+        joined: '2026-09-01T00:00:00Z',
+        lastRead: '2026-09-02T00:00:00Z',
+        messageAt: '2026-09-03T00:00:00Z',
+        type: 'message',
+      })
+    ).toBe(1);
+  });
+
+  it('get_inbox recency page does not count a closure-only tail as unread', async () => {
+    const db = createFilteringSupabase({
+      inbox_threads: [
+        {
+          id: 'closed-thread',
+          user_id: 'user-123',
+          status: 'closed',
+          thread_key: 'pr:closed',
+          // The recency page filters membership through the embedded join;
+          // the filtering mock sees that as a column on the thread row.
+          'inbox_thread_participants.agent_id': 'lumen',
+        },
+      ],
+      inbox_thread_participants: [
+        { thread_id: 'closed-thread', agent_id: 'lumen', joined_at: '2026-09-01T00:00:00Z' },
+      ],
+      inbox_thread_read_status: [
+        { thread_id: 'closed-thread', agent_id: 'lumen', last_read_at: '2026-09-02T00:00:00Z' },
+      ],
+      inbox_thread_messages: [
+        {
+          thread_id: 'closed-thread',
+          message_type: 'system',
+          sender_agent_id: 'system',
+          content: 'Thread closed',
+          created_at: '2026-09-03T00:00:00Z',
+        },
+      ],
+    });
+    const result = await handleGetInbox(
+      { email: 'test@test.com', agentId: 'lumen', markRead: false },
+      createMockDataComposer(db as never) as never
+    );
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(true);
+    expect(parsed.threadUnreadCount).toBe(0);
+  });
+});
