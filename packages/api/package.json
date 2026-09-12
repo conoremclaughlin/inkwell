@@ -63,7 +63,7 @@
     "googleapis": "^171.0.0",
     "helmet": "^7.1.0",
     "jsonwebtoken": "^9.0.2",
-    "link-preview-js": "^4.0.1",
+    "link-preview-js": "^4.0.4",
     "node-cron": "^4.2.1",
     "node-diff3": "^3.2.0",
     "pdf-parse": "^2.4.5",
