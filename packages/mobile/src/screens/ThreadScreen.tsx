@@ -41,9 +41,10 @@ export function ThreadScreen({ route }: Props) {
   // reply into nowhere.
   const missing = !isLoading && !error && data != null && data.thread == null;
   const canStart = missing && !!recipients && recipients.length > 0;
-  // A closed thread refuses replies server-side (409); don't offer a composer
-  // whose sends can only fail.
-  const composerDisabled = (missing && !canStart) || closed;
+  // A closed thread still takes replies — closed is a work-state signal, not
+  // a lock — so the composer stays live. Only a thread that does not exist
+  // and cannot be started has nowhere for a reply to go.
+  const composerDisabled = missing && !canStart;
   const pending = sendReply.isPending || startThread.isPending;
   const sendError = sendReply.isError
     ? (sendReply.error as Error).message
@@ -108,7 +109,9 @@ export function ThreadScreen({ route }: Props) {
 
       {closed ? (
         <View style={styles.closedBar}>
-          <Text style={styles.closedText}>Thread is closed — it no longer accepts replies.</Text>
+          <Text style={styles.closedText}>
+            Thread is closed — a reply still lands and wakes its participants.
+          </Text>
         </View>
       ) : null}
 
@@ -124,11 +127,9 @@ export function ThreadScreen({ route }: Props) {
           placeholder={
             canStart
               ? `Message ${title ?? recipients?.join(', ')}…`
-              : closed
-                ? 'Thread is closed'
-                : composerDisabled
-                  ? 'This thread does not exist'
-                  : `Reply to ${threadKey}…`
+              : composerDisabled
+                ? 'This thread does not exist'
+                : `Reply to ${threadKey}…`
           }
           placeholderTextColor={colors.textMuted}
           value={draft}

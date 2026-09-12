@@ -1151,7 +1151,7 @@ export const threadToolDefinitions = [
   {
     name: 'close_thread',
     description:
-      'Close a thread. Closed threads can still be read but new messages are rejected. Any participant can close.',
+      'Close a thread to mark its work done. Closed is a work-state signal, not a lock: a closed thread can still be read and still accepts replies (a reply wakes its participants without reopening the thread); it drops off the default list_threads work list. Any participant can close.',
     schema: closeThreadSchema,
     handler: handleCloseThread,
   },

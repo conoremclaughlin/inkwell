@@ -2578,3 +2578,142 @@ describe('handleSendToInbox — a thread home resolves the recipient session bef
     );
   });
 });
+
+// =====================================================
+// CLOSED IS NOT A DELIVERY FILTER (spec inkmail-thread-scope §2)
+// =====================================================
+
+/**
+ * A chainable Supabase mock that records every `.eq(col, val)` per table and
+ * resolves each query with the rows configured for that table. Unlike the
+ * poll mock above, every builder method (including `.or`) stays chainable, so
+ * handlers that fan out several differently shaped queries — summaries — run
+ * to completion instead of failing on the first non-chainable step.
+ */
+function createRecordingSupabase(rows: Record<string, unknown[]>) {
+  const eqCalls: Record<string, Array<[string, unknown]>> = {};
+  const from = vi.fn().mockImplementation((table: string) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const self: any = {};
+    for (const method of [
+      'select',
+      'eq',
+      'neq',
+      'in',
+      'is',
+      'or',
+      'gt',
+      'gte',
+      'lt',
+      'lte',
+      'order',
+      'limit',
+    ]) {
+      self[method] = vi.fn().mockImplementation((col?: string, val?: unknown) => {
+        if (method === 'eq') (eqCalls[table] ||= []).push([col as string, val]);
+        return self;
+      });
+    }
+    self.maybeSingle = vi.fn().mockResolvedValue({ data: null, error: null });
+    const resolved = () => Promise.resolve({ data: rows[table] ?? [], error: null, count: 0 });
+    self.then = (onFulfilled: (v: unknown) => unknown, onRejected?: (e: unknown) => unknown) =>
+      resolved().then(onFulfilled, onRejected);
+    self.catch = (onRejected: (e: unknown) => unknown) => resolved().catch(onRejected);
+    return self;
+  });
+  return {
+    from,
+    rpc: vi.fn().mockResolvedValue({ data: null, error: null }),
+    getEqCalls: () => eqCalls,
+  };
+}
+
+describe('Closed threads accept replies and stay deliverable (spec inkmail-thread-scope §2)', () => {
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    const { getRequestContext, getSessionContext, getPinnedAgentId } =
+      await import('../../utils/request-context');
+    vi.mocked(getRequestContext).mockReturnValue({ sessionId: 'session-mock-123' } as never);
+    vi.mocked(getSessionContext).mockReturnValue(undefined as never);
+    vi.mocked(getPinnedAgentId).mockReturnValue(undefined as never);
+  });
+
+  it('stores a reply on a closed thread instead of refusing it', async () => {
+    // Closed is a work-state signal, not a lock. The thread row says closed
+    // both ways (status + closed_at) so a gate on either field fails here.
+    const { findThread, getParticipants } = await import('./thread-handlers.js');
+    vi.mocked(findThread).mockResolvedValue({
+      id: 'thread-closed',
+      thread_key: 'pr:210',
+      user_id: 'user-123',
+      created_by_agent_id: 'wren',
+      title: null,
+      status: 'closed',
+      metadata: null,
+      created_at: '2026-03-09T10:00:00Z',
+      updated_at: '2026-03-09T10:00:00Z',
+      closed_at: '2026-03-10T10:00:00Z',
+      closed_by_agent_id: 'lumen',
+    });
+    vi.mocked(getParticipants).mockResolvedValue(['wren', 'lumen']);
+    const mockSb = createThreadMockSupabase({ existingThread: { id: 'thread-closed' } });
+    const mockDc = createThreadMockDataComposer(mockSb);
+
+    const result = await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        recipientAgentId: 'lumen',
+        senderAgentId: 'wren',
+        threadKey: 'pr:210',
+        content: 'one more thing, after the close',
+      },
+      mockDc as never
+    );
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.error).toBeUndefined();
+    // The message row was inserted (its metadata was enriched on the way in)
+    // and the caller got its id back — the proof a reply landed.
+    expect(mockSb.getInsertedMetadata()).not.toBeNull();
+    expect(parsed.messageId).toBe('tmsg-123');
+  });
+
+  it('get_inbox recency page does not filter threads by status', async () => {
+    const mockSb = createScopedPollMockSupabase();
+    await handleGetInbox(
+      { email: 'test@test.com', agentId: 'wren' },
+      createMockDataComposer(mockSb as never) as never
+    );
+    const threadEqs = mockSb.getEqCalls()['inbox_threads'] || [];
+    // The page ran — membership was applied through the join …
+    expect(threadEqs).toContainEqual(['inbox_thread_participants.agent_id', 'wren']);
+    // … and no status predicate narrowed it. A reply on a closed thread is
+    // unread until read, so the thread has to stay on this page.
+    expect(threadEqs).not.toContainEqual(['status', 'open']);
+  });
+
+  it('get_agent_summaries counts an unread reply on a closed thread', async () => {
+    // Mission read zero for mail that existed: summaries only looked at open
+    // threads, so a reply after close never reached the per-agent unread.
+    const { handleGetAgentSummaries } = await import('./inbox-handlers');
+    const mockSb = createRecordingSupabase({
+      inbox_thread_participants: [{ thread_id: 't-closed', agent_id: 'wren' }],
+      inbox_threads: [{ id: 't-closed' }],
+      inbox_thread_read_status: [],
+      inbox_thread_messages: [{ thread_id: 't-closed', created_at: '2026-09-12T10:00:00Z' }],
+    });
+
+    const result = await handleGetAgentSummaries(
+      { email: 'test@test.com', agentIds: ['wren'] },
+      createMockDataComposer(mockSb as never) as never
+    );
+    const parsed = JSON.parse(result.content[0].text);
+
+    const threadEqs = mockSb.getEqCalls()['inbox_threads'] || [];
+    expect(threadEqs).toContainEqual(['user_id', expect.any(String)]);
+    expect(threadEqs).not.toContainEqual(['status', 'open']);
+    const wren = parsed.agents.find((a: { agentId: string }) => a.agentId === 'wren');
+    expect(wren).toBeDefined();
+    expect(wren.threadUnread).toBe(1);
+  });
+});
