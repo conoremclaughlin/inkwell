@@ -160,8 +160,12 @@ vite.config.ts.timestamp-*
 # until someone's `git add -A` swept them in.
 **/.ink/identity.json
 
-# PCP hook runtime state (transient, per-session)
+# PCP hook runtime state (transient, per-session). The turn-epoch and
+# pending-takeover records are written by the on-prompt hook and the wrapper
+# watcher beside whatever cwd they run in, same as identity.json above.
 **/.ink/runtime/
+**/.ink/cli-turn-epoch.json
+**/.ink/pending-takeover*.json
 
 # Local automation / benchmark artifacts
 .playwright-cli/
