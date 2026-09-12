@@ -2422,19 +2422,20 @@ export async function handleGetAgentSummaries(args: unknown, dataComposer: DataC
     if (p.joined_at) joinedAtMap.set(`${p.thread_id}:${p.agent_id}`, p.joined_at);
   }
 
-  // Count unread thread messages per agent. The floor is the LATER of the
-  // read pointer and the join time — exactly what get_inbox and the SQL
+  // Count unread thread messages per agent. The floor is the read pointer
+  // when one exists and the join time only as the fallback —
+  // COALESCE(last_read_at, joined_at), exactly what get_inbox and the SQL
   // candidacy function use — so a pointer-less late joiner is not credited
-  // with every message that predates them.
+  // with every message that predates them, and an explicit pointer that
+  // happens to precede the join time still wins, as it does everywhere
+  // else (a later-of expression would diverge there; Lumen, PR #613 r2).
   const threadUnreadMap = new Map<string, number>();
   for (const msg of threadMessages) {
     // For each agent that participates in this thread, check if message is unread
     for (const [aid, threads] of agentThreads) {
       if (!threads.has(msg.thread_id)) continue;
-      const lastRead = threadReadMap.get(`${msg.thread_id}:${aid}`);
-      const joinedAt = joinedAtMap.get(`${msg.thread_id}:${aid}`);
       const floor =
-        lastRead && joinedAt ? (lastRead > joinedAt ? lastRead : joinedAt) : lastRead || joinedAt;
+        threadReadMap.get(`${msg.thread_id}:${aid}`) ?? joinedAtMap.get(`${msg.thread_id}:${aid}`);
       if (!floor || msg.created_at > floor) {
         threadUnreadMap.set(aid, (threadUnreadMap.get(aid) || 0) + 1);
       }

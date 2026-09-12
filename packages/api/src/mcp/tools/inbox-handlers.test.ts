@@ -2825,6 +2825,19 @@ describe('Unread parity with SQL candidacy once closed threads are in scope (Lum
     ).toBe(0);
   });
 
+  it('get_agent_summaries lets an explicit pointer win over a later join time, as SQL candidacy does', async () => {
+    // COALESCE(last_read_at, joined_at): the pointer is the floor whenever it
+    // exists. A later-of expression would silently hide the message below.
+    expect(
+      await summariesUnread({
+        joined: '2026-09-03T00:00:00Z',
+        lastRead: '2026-09-01T00:00:00Z',
+        messageAt: '2026-09-02T00:00:00Z',
+        type: 'message',
+      })
+    ).toBe(1);
+  });
+
   it('get_agent_summaries still counts a deliverable reply after the pointer', async () => {
     expect(
       await summariesUnread({
