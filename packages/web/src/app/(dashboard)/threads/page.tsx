@@ -15,11 +15,13 @@ import {
   ListTodo,
   MessageSquare,
   MonitorDot,
+  Send,
   ShieldCheck,
   Workflow,
   Wrench,
 } from 'lucide-react';
 import { useApiQuery } from '@/lib/api';
+import { ReplyComposer, senderLabel } from '@/components/threads/reply-composer';
 import clsx from 'clsx';
 
 // ─── Types mirroring GET /api/admin/threads ───
@@ -122,6 +124,13 @@ interface ThreadMessagesResponse {
     content: string;
     messageType: string;
     priority: string;
+    /**
+     * A person's reply carries { sentBy: 'user' } here while its sender slot
+     * says 'unknown' (see POST /threads/reply). Until the principal columns
+     * of spec inkmail-thread-scope §3 land, this marker is how the page tells
+     * a person from a genuinely unattributed sender.
+     */
+    metadata?: Record<string, unknown> | null;
     createdAt: string;
   }>;
   meta?: FeedMeta;
@@ -774,7 +783,7 @@ function SpineDetail({ spine, onBack }: { spine: ThreadSpine; onBack: () => void
                   )}
                   <div className="rounded-md border px-3 py-2">
                     <div className="flex items-center gap-2 text-[10px] text-muted-foreground">
-                      <span className="font-medium text-foreground">{m.senderAgentId}</span>
+                      <span className="font-medium text-foreground">{senderLabel(m)}</span>
                       {m.messageType !== 'message' && (
                         <span className="rounded bg-muted px-1 py-0.5">{m.messageType}</span>
                       )}
@@ -792,6 +801,16 @@ function SpineDetail({ spine, onBack }: { spine: ThreadSpine; onBack: () => void
           </div>
         )}
       </section>
+
+      {spine.sources.includes('thread') && (
+        <section>
+          <SectionLabel icon={Send} label="Reply" />
+          <ReplyComposer
+            threadKey={spine.key}
+            closed={messagesData?.thread?.status === 'closed' || !!messagesData?.thread?.closedAt}
+          />
+        </section>
+      )}
     </div>
   );
 }

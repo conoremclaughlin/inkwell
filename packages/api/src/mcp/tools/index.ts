@@ -4232,7 +4232,7 @@ Thread routing:
 When threadKey is provided, messages are stored in thread tables (inbox_thread_messages). All recipients are auto-added as thread participants. Late joiners see full thread history. Without threadKey, messages go to the simple agent_inbox.
 
 For existing threads, reply semantics are applied automatically:
-- Closed threads are rejected
+- Closed threads still accept replies: closed is a work-state signal, not a lock. The reply is stored and wakes its recipients; the thread stays closed.
 - Smart trigger defaults: 1:1 thread → trigger other participant; group with explicit recipient → that recipient; group thread (non-creator) → trigger creator; group thread (creator) → all others
 - Override with triggerAll (everyone) or triggerAgents (specific agents)
 
@@ -4492,7 +4492,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   server.registerTool(
     'close_thread',
     {
-      description: `Close a thread. Closed threads can still be read but new messages are rejected. Any participant can close a thread.
+      description: `Close a thread to mark its work done. Closed is a work-state signal, not a lock: a closed thread can still be read and still accepts replies (a reply wakes its participants without reopening the thread); it drops off the default list_threads work list. Any participant can close a thread.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: threadToolDefinitions[2].schema,

@@ -7638,6 +7638,10 @@ router.post('/threads', async (req: Request, res: Response) => {
  * Existing threads only: a reply is "into the conversation I'm following".
  * Creating threads needs recipient selection, which is a different screen and
  * a different endpoint when it's wanted.
+ *
+ * A closed thread takes a reply like an open one. Closed is a work-state
+ * signal, not a lock (spec inkmail-thread-scope §2): the reply is stored and
+ * wakes the participants; the thread stays closed.
  */
 router.post('/threads/reply', async (req: Request, res: Response) => {
   try {
@@ -7664,7 +7668,7 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
 
     const { data: thread, error: threadError } = await supabase
       .from('inbox_threads')
-      .select('id, thread_key, status, closed_at')
+      .select('id, thread_key')
       .eq('user_id', authReq.pcpUserId)
       .eq('thread_key', key)
       .maybeSingle();
@@ -7675,12 +7679,6 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
     }
     if (!thread) {
       res.status(404).json({ error: `No thread with key "${key}"` });
-      return;
-    }
-    if (thread.status === 'closed' || thread.closed_at) {
-      // The inbox handler refuses closed threads; say so with a status no
-      // client can mistake for delivery.
-      res.status(409).json({ error: `Thread "${key}" is closed and no longer accepts replies` });
       return;
     }
 
@@ -7712,11 +7710,11 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
       unknown
     >;
     if (parsed.messageId == null) {
-      // Nothing stored — the handler refused (closed thread, unknown
-      // participant, refused key). A 2xx here would let the client clear a
-      // draft that never landed.
+      // Nothing stored — the handler refused (unknown participant, refused
+      // key). A 2xx here would let the client clear a draft that never
+      // landed.
       const reason = typeof parsed.error === 'string' ? parsed.error : 'Reply was not stored';
-      res.status(/closed/i.test(reason) ? 409 : 400).json({ error: reason });
+      res.status(400).json({ error: reason });
       return;
     }
 
