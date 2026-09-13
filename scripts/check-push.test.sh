@@ -195,6 +195,37 @@ out=$(git -C "$r" push -u origin topic 2>&1); rc=$?
 c=$(echo "$out" | grep -c -- '^--- ')
 [ "$c" -eq 1 ] && echo "$out" | grep -q -- "--- $st" && ok "a new branch replays only the commits no remote has" || bad "a new branch replays only the commits no remote has" "printed $c headers: $(echo "$out" | tr '\n' ' ')"
 
+echo "PREVIEW (scripts/check-push.sh --preview, the read-back before pushing)"
+
+replay="$hooks_dir/../scripts/check-push.sh"
+
+# The `clean` repo has origin/main from its pushes above; add one more commit.
+r="$work/clean"
+commit_file "$r" d.txt 'four' 'docs: a fourth, unpushed commit'
+s4=$(git -C "$r" rev-parse --short HEAD)
+out=$(cd "$r" && sh "$replay" --preview 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "--preview exits 0 for clean unpushed commits" || bad "--preview exits 0 for clean unpushed commits" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+c=$(echo "$out" | grep -c -- '^--- ')
+[ "$c" -eq 1 ] && echo "$out" | grep -q -- "--- $s4" && ok "--preview replays exactly origin/main..HEAD" || bad "--preview replays exactly origin/main..HEAD" "printed $c headers: $(echo "$out" | tr '\n' ' ')"
+echo "$out" | grep -q 'a fourth, unpushed commit' && ok "--preview prints the clean message" || bad "--preview prints the clean message" "$(echo "$out" | tr '\n' ' ')"
+[ "$(remote_head "$work/clean.git" main)" != "$(git -C "$r" rev-parse HEAD)" ] && ok "--preview does not push" || bad "--preview does not push" "remote moved"
+
+# The `badmsg` repo never pushed, so name its first commit as the base.
+r="$work/badmsg"
+b=$(git -C "$r" rev-parse HEAD~1)
+out=$(cd "$r" && sh "$replay" --preview "$b" 2>&1); rc=$?
+[ "$rc" -eq 1 ] && ok "--preview exits 1 when a message is refused" || bad "--preview exits 1 when a message is refused" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+echo "$out" | grep -q 'CANARYVALUE9182' && bad "--preview does not print the refused value" "value bytes in output" || ok "--preview does not print the refused value"
+echo "$out" | grep -q 'message withheld' && ok "--preview withholds the refused body" || bad "--preview withholds the refused body" "$(echo "$out" | tr '\n' ' ')"
+echo "$out" | grep -q 'Do not push this' && ok "--preview says not to push" || bad "--preview says not to push" "$(echo "$out" | tr '\n' ' ')"
+
+out=$(cd "$r" && sh "$replay" --preview no-such-ref 2>&1); rc=$?
+[ "$rc" -eq 2 ] && ok "--preview with an unknown base fails closed (exit 2)" || bad "--preview with an unknown base fails closed" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+
+r="$work/clean"
+out=$(cd "$r" && sh "$replay" --preview HEAD 2>&1); rc=$?
+[ "$rc" -eq 0 ] && echo "$out" | grep -q 'Nothing to push' && ok "--preview with an empty range says so and exits 0" || bad "--preview with an empty range says so" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+
 echo "WIRING (.husky/pre-push fails closed)"
 
 mkdir -p "$work/broken-hooks/.husky"
