@@ -330,6 +330,118 @@ d('heartbeat notification store — real schema', () => {
     expect((data as { status: string; attempts: number } | null)?.status).toBe('delivered');
   });
 
+  it('does not reopen a recovered episode when only the close write failed', async () => {
+    // Round five, finding 1. The close is a separate write and it can fail on
+    // its own, leaving a finished episode with `episode_closed_at` still null.
+    // `openEpisode` used to trust that column alone, hand the stale key to the
+    // next outage, and find its outage notice already marked delivered — so the
+    // next outage announced NOTHING, after the human had been explicitly told
+    // the monitor was back. Delivery of the all-clear is what ends an episode.
+    //
+    // Its own reminder: a row left behind by an earlier test in this file would
+    // decide the outcome, which is how a green here could mean nothing.
+    const isolatedReminder = randomUUID();
+    const recoveredEpisode = randomUUID();
+
+    await client.from('scheduled_reminders').insert({
+      id: isolatedReminder,
+      user_id: userId,
+      title: 'failed close must not suppress the next outage',
+      delivery_channel: 'telegram',
+      delivery_target: 'chat-4',
+      next_run_at: new Date().toISOString(),
+      status: 'active',
+    } as never);
+
+    const base = {
+      reminderId: isolatedReminder,
+      userId,
+      episodeKey: recoveredEpisode,
+      destination: 'sb-test|telegram|chat-4',
+    };
+
+    // Outage announced and delivered; all-clear announced and delivered.
+    await store.claimNotice({ ...base, kind: 'outage' });
+    await store.settleNotice({ ...base, kind: 'outage' }, { delivered: true });
+    await store.claimNotice({ ...base, kind: 'recovery' });
+    await store.settleNotice({ ...base, kind: 'recovery' }, { delivered: true });
+
+    // The close never lands. This is the whole scenario, so assert the state
+    // really is the one under test rather than assuming it.
+    const { data: stillOpen } = await client
+      .from('heartbeat_notifications' as never)
+      .select('episode_closed_at')
+      .eq('reminder_id', isolatedReminder)
+      .eq('kind', 'outage')
+      .eq('episode_key', recoveredEpisode)
+      .single();
+    expect((stillOpen as { episode_closed_at: string | null }).episode_closed_at).toBeNull();
+
+    // The next failing beat must get a FRESH episode, or its outage is silent.
+    expect(await store.openEpisode(isolatedReminder)).not.toBe(recoveredEpisode);
+
+    await client.from('scheduled_reminders').delete().eq('id', isolatedReminder);
+  });
+
+  it('owes the all-clear when the outage send landed but its acknowledgement did not', async () => {
+    // Round five, finding 2. A pending outage row does not prove the human was
+    // never warned — it equally means the send succeeded and the UPDATE that
+    // should have recorded it is what failed. The sweep used to require a
+    // DELIVERED outage, so this obligation was invisible forever.
+    //
+    // The proof that the outage WAS announced is the recovery row: only an
+    // attempted all-clear writes one, and an all-clear is only attempted for an
+    // announced outage.
+    const isolatedReminder = randomUUID();
+    const episode = randomUUID();
+
+    await client.from('scheduled_reminders').insert({
+      id: isolatedReminder,
+      user_id: userId,
+      title: 'lost outage acknowledgement still owes an all-clear',
+      delivery_channel: 'telegram',
+      delivery_target: 'chat-5',
+      next_run_at: new Date().toISOString(),
+      status: 'active',
+    } as never);
+
+    const base = {
+      reminderId: isolatedReminder,
+      userId,
+      episodeKey: episode,
+      destination: 'sb-test|telegram|chat-5',
+    };
+
+    // Outage row exists but never reaches 'delivered' — the settle was the write
+    // that failed. No settleNotice call at all leaves exactly that row.
+    await store.claimNotice({ ...base, kind: 'outage' });
+
+    // The all-clear was attempted and failed, writing its pending recovery row.
+    await store.claimNotice({ ...base, kind: 'recovery' });
+    await store.settleNotice({ ...base, kind: 'recovery' }, { delivered: false, error: 'down' });
+    // Step past the backoff that attempt just wrote, so the debt is due now.
+    await client
+      .from('heartbeat_notifications' as never)
+      .update({ next_attempt_at: new Date(Date.now() - 1000).toISOString() } as never)
+      .eq('reminder_id', isolatedReminder)
+      .eq('kind', 'recovery')
+      .eq('episode_key', episode);
+
+    const { data: outageRow } = await client
+      .from('heartbeat_notifications' as never)
+      .select('status')
+      .eq('reminder_id', isolatedReminder)
+      .eq('kind', 'outage')
+      .eq('episode_key', episode)
+      .single();
+    expect((outageRow as { status: string }).status).toBe('pending');
+
+    const owed = await store.findOwedRecovery(isolatedReminder);
+    expect(owed?.episodeKey).toBe(episode);
+
+    await client.from('scheduled_reminders').delete().eq('id', isolatedReminder);
+  });
+
   it('enforces one notice per (reminder, kind, episode)', async () => {
     // The whole design leans on this constraint: without it, two server
     // incarnations racing the same beat would each create a row, each see its

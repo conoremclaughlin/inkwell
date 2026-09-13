@@ -170,16 +170,23 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
   /**
    * Resolve the agent whose beat this was, so the notice lands in their inbox.
    *
+   * Returns null when the beat names an owner we could not resolve. That is not
+   * the same as having no owner: `defaultAgentId` is the answer for a beat that
+   * genuinely belongs to nobody, and using it for an owner we merely failed to
+   * look up would file one SB's "Your scheduled heartbeat" notice in a different
+   * SB's inbox. An unrelated SB reading that would be told a beat of theirs is
+   * down when it is not, and the SB who actually owns it still hears nothing.
+   * A missing inbox copy is recoverable from the logs; a misaddressed one is
+   * misinformation sitting in someone's queue.
+   *
    * Never throws. This is a detail of the INBOX copy — the destination that
    * cannot reach a human while the SB is down — and it ran outside the guard
    * below, so a transport failure here aborted `onFailure` before the channel
    * send. The durable copy taking the useful copy down with it is the exact
-   * coupling the two-destination split exists to prevent, and the identity
-   * lookup is as much a part of the inbox dependency as the insert is. Falling
-   * back to the default agent costs a slightly misaddressed inbox row; throwing
-   * costs the alert.
+   * coupling the two-destination split exists to prevent. The channel alert
+   * below does not depend on this resolving at all.
    */
-  const resolveFailedAgentId = async (reminder: DueReminder): Promise<string> => {
+  const resolveFailedAgentId = async (reminder: DueReminder): Promise<string | null> => {
     if (!reminder.sb_id) return defaultAgentId;
     try {
       const { data: identity, error } = await client
@@ -188,21 +195,29 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
         .eq('id', reminder.sb_id)
         .single();
       if (error) {
-        logger.warn('[Heartbeat] Could not resolve the failed beat’s agent — using the default', {
+        logger.warn('[Heartbeat] Could not resolve the failed beat’s agent — skipping inbox copy', {
           reminderId: reminder.id,
           sbId: reminder.sb_id,
           error: error.message,
         });
-        return defaultAgentId;
+        return null;
       }
-      return (identity as { agent_id?: string } | null)?.agent_id || defaultAgentId;
+      const resolved = (identity as { agent_id?: string } | null)?.agent_id;
+      if (!resolved) {
+        logger.warn('[Heartbeat] Failed beat’s agent resolved to nothing — skipping inbox copy', {
+          reminderId: reminder.id,
+          sbId: reminder.sb_id,
+        });
+        return null;
+      }
+      return resolved;
     } catch (err) {
-      logger.warn('[Heartbeat] Agent identity lookup threw — using the default', {
+      logger.warn('[Heartbeat] Agent identity lookup threw — skipping inbox copy', {
         reminderId: reminder.id,
         sbId: reminder.sb_id,
         error: err instanceof Error ? err.message : String(err),
       });
-      return defaultAgentId;
+      return null;
     }
   };
 
@@ -263,31 +278,38 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
     // the channel attempt below, which is the one that can actually reach a
     // human while the SB is down.
     let inboxError: string | null = null;
-    try {
-      const { error: insertError } = await client.from('agent_inbox').insert({
-        recipient_user_id: reminder.user_id,
-        recipient_agent_id: failedAgentId,
-        sender_agent_id: null,
-        message_type: 'notification',
-        priority: consecutive >= 3 ? 'urgent' : 'high',
-        subject: `Heartbeat FAILED (${consecutive}x): ${reminder.title}`,
-        content:
-          `Your scheduled heartbeat "${reminder.title}" did not run.\n\n` +
-          `Consecutive failures: ${consecutive}\n` +
-          `Category: ${classification.category} (retryable: ${classification.retryable})\n` +
-          `Error: ${error}\n\n` +
-          `Whatever this beat monitors has NOT been checked since it started failing. ` +
-          `If a human depends on it, tell them — a monitor that fails quietly is worse ` +
-          `than no monitor, because they believe they are covered.`,
-        status: 'unread',
-      } as never);
+    if (failedAgentId === null) {
+      // The beat names an owner we could not resolve. Skipping the durable copy
+      // loses a record; guessing a recipient would plant a false outage report
+      // in an uninvolved SB's inbox. The channel alert below is unaffected.
+      inboxError = 'unresolved owner — inbox copy skipped rather than misaddressed';
+    } else {
+      try {
+        const { error: insertError } = await client.from('agent_inbox').insert({
+          recipient_user_id: reminder.user_id,
+          recipient_agent_id: failedAgentId,
+          sender_agent_id: null,
+          message_type: 'notification',
+          priority: consecutive >= 3 ? 'urgent' : 'high',
+          subject: `Heartbeat FAILED (${consecutive}x): ${reminder.title}`,
+          content:
+            `Your scheduled heartbeat "${reminder.title}" did not run.\n\n` +
+            `Consecutive failures: ${consecutive}\n` +
+            `Category: ${classification.category} (retryable: ${classification.retryable})\n` +
+            `Error: ${error}\n\n` +
+            `Whatever this beat monitors has NOT been checked since it started failing. ` +
+            `If a human depends on it, tell them — a monitor that fails quietly is worse ` +
+            `than no monitor, because they believe they are covered.`,
+          status: 'unread',
+        } as never);
 
-      // PostgREST resolves with `{ error }` on an HTTP/DB failure rather than
-      // throwing. Discarding it meant a 403 logged as a successful escalation —
-      // the silence bug reproduced one level up, inside its own fix.
-      if (insertError) inboxError = insertError.message;
-    } catch (err) {
-      inboxError = err instanceof Error ? err.message : String(err);
+        // PostgREST resolves with `{ error }` on an HTTP/DB failure rather than
+        // throwing. Discarding it meant a 403 logged as a successful escalation —
+        // the silence bug reproduced one level up, inside its own fix.
+        if (insertError) inboxError = insertError.message;
+      } catch (err) {
+        inboxError = err instanceof Error ? err.message : String(err);
+      }
     }
 
     if (inboxError) {

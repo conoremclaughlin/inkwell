@@ -147,10 +147,16 @@ export interface HeartbeatNotificationStore {
   /**
    * An all-clear that is owed and has not been delivered.
    *
-   * Derived from the OUTAGE row, not the recovery row, so an episode whose
-   * recovery notice was never successfully written is still found. This is the
-   * sweep that gives a failed all-clear an edge to fire on again: once the beat
-   * is healthy the failure streak is zero and the recovery branch never runs.
+   * This is the sweep that gives a failed all-clear an edge to fire on again:
+   * once the beat is healthy the failure streak is zero and the recovery branch
+   * never runs, so without this the debt would never be retried.
+   *
+   * An episode is anchored on its OUTAGE row — that is where open/closed lives —
+   * but the debt is proven by EITHER a delivered outage (the recovery row may
+   * never have been written, and is reconstructed) OR the existence of an
+   * undelivered recovery row (which proves the outage was announced even if the
+   * outage row's own acknowledgement write failed). Each proof covers a write
+   * failure the other one misses.
    */
   findOwedRecovery(reminderId: string): Promise<OwedRecovery | null>;
   /**
@@ -201,10 +207,32 @@ export function createHeartbeatNotificationStore(
     return (data as NoticeRow | null) ?? null;
   };
 
+  /**
+   * Whether an episode is recovered in substance: its all-clear was DELIVERED.
+   *
+   * Delivery of the all-clear is what ends an episode. `episode_closed_at` is
+   * only the record of that, and the two can disagree — the close is a separate
+   * write and it can fail on its own.
+   */
+  const recoveryWasDelivered = async (
+    reminderId: string,
+    episodeKey: string,
+    destination: string | null
+  ): Promise<boolean> => {
+    const recovery = await load({
+      reminderId,
+      userId: '',
+      kind: 'recovery',
+      episodeKey,
+      destination,
+    });
+    return recovery?.status === 'delivered';
+  };
+
   const openEpisode: HeartbeatNotificationStore['openEpisode'] = async (reminderId) => {
     try {
       const { data, error } = await table()
-        .select('episode_key')
+        .select('episode_key, destination')
         .eq('reminder_id', reminderId)
         .eq('kind', 'outage')
         .is('episode_closed_at', null)
@@ -219,8 +247,27 @@ export function createHeartbeatNotificationStore(
         return randomUUID();
       }
 
-      const existing = (data as { episode_key: string }[] | null)?.[0]?.episode_key;
-      return existing ?? randomUUID();
+      const existing = (data as { episode_key: string; destination: string | null }[] | null)?.[0];
+      if (!existing) return randomUUID();
+
+      // An episode whose all-clear was delivered is over, whatever the close
+      // write did. If the close failed, the row still looks open — and reusing
+      // it here would hand the next outage an episode whose outage notice is
+      // already marked delivered, so it would announce nothing. That is a new
+      // outage silenced by the bookkeeping of the previous one, after the human
+      // was explicitly told the monitor was back. Reconcile and start fresh.
+      if (await recoveryWasDelivered(reminderId, existing.episode_key, existing.destination)) {
+        await closeEpisode({
+          reminderId,
+          userId: '',
+          kind: 'recovery',
+          episodeKey: existing.episode_key,
+          destination: existing.destination,
+        });
+        return randomUUID();
+      }
+
+      return existing.episode_key;
     } catch (err) {
       logger.warn('[Heartbeat] Open-episode lookup threw', {
         reminderId,
@@ -399,7 +446,11 @@ export function createHeartbeatNotificationStore(
         .eq('episode_key', key.episodeKey);
 
       if (error) {
-        // Degrades toward a duplicate all-clear on a later beat, never silence.
+        // Degrades toward a duplicate all-clear on a later beat, never silence —
+        // but only because `openEpisode` re-checks whether the all-clear was
+        // delivered instead of trusting this column. Left to itself, a failed
+        // close leaves a finished episode looking open, and the next outage
+        // inherits an already-delivered outage notice and says nothing.
         logger.warn('[Heartbeat] Could not close the outage episode', {
           reminderId: key.reminderId,
           episodeKey: key.episodeKey,
@@ -469,14 +520,16 @@ export function createHeartbeatNotificationStore(
 
   const findOwedRecovery: HeartbeatNotificationStore['findOwedRecovery'] = async (reminderId) => {
     try {
-      // The debt lives on the outage row: an episode we announced and have not
-      // yet closed. Deliberately NOT a search for a pending recovery row — the
-      // case this exists for is the one where that row was never written.
+      // The debt lives on the episode, and there are two independent proofs of
+      // it — see below. The outage row is the anchor because it is the row that
+      // carries the open/closed state; its own `status` is deliberately NOT a
+      // filter here, because a pending outage does not mean the human never
+      // heard it. It can equally mean the send succeeded and the acknowledgement
+      // write that should have recorded it is the thing that failed.
       const { data, error } = await table()
         .select(NOTICE_COLUMNS)
         .eq('reminder_id', reminderId)
         .eq('kind', 'outage')
-        .eq('status', 'delivered')
         .is('episode_closed_at', null)
         .order('created_at', { ascending: false })
         .limit(1);
@@ -513,6 +566,21 @@ export function createHeartbeatNotificationStore(
         });
         return null;
       }
+
+      // Two independent proofs that an all-clear is owed, and we need both
+      // tests because each one covers a write failure the other misses:
+      //
+      //   - the OUTAGE row is delivered. The recovery row may never have been
+      //     written at all; it is reconstructed from the outage row below.
+      //   - a RECOVERY row exists and is not delivered. Only an attempted
+      //     all-clear writes that row, and an all-clear is only attempted for an
+      //     announced outage — so its existence proves the outage was announced
+      //     even when the outage row's own acknowledgement write is what failed.
+      //
+      // A pending outage with no recovery row is the one case that is genuinely
+      // not owed: nothing here says the human was ever told.
+      const owed = outage.status === 'delivered' || recovery !== null;
+      if (!owed) return null;
 
       // Respect the recovery notice's own backoff if it has one.
       if (recovery?.next_attempt_at) {

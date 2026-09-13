@@ -888,7 +888,9 @@ describe('heartbeat escalation', () => {
       const { onFailure } = createHeartbeatEscalation({
         client: { from } as never,
         sendToChannel,
-        defaultAgentId: 'myra',
+        // DISTINCT from the agent this reminder belongs to. If the default were
+        // also 'myra' this test could not tell a correct address from a guess.
+        defaultAgentId: 'unrelated-sb',
         store,
       });
 
@@ -896,9 +898,60 @@ describe('heartbeat escalation', () => {
 
       expect(result).toEqual({ alerted: true });
       expect(sendToChannel).toHaveBeenCalledTimes(1);
-      // Still addressed, just to the fallback agent.
+      // Round five, finding 3. The beat NAMES an owner; we just could not look
+      // it up. Filing it under the default would put "Your scheduled heartbeat
+      // did not run" in an uninvolved SB's inbox — telling them a beat of
+      // theirs is down when it is not, while the real owner still hears
+      // nothing. Skipping the copy loses a record; guessing invents one.
+      expect(insert).not.toHaveBeenCalled();
+    });
+
+    it('skips the inbox copy when an explicit owner resolves to nothing', async () => {
+      // The lookup SUCCEEDS and simply returns no agent_id — a dangling sb_id.
+      // Same rule: an owner we cannot name is not the default owner.
+      const insert = vi.fn().mockResolvedValue({ error: null });
+      const from = vi.fn().mockImplementation((table: string) => {
+        if (table === 'agent_identities') {
+          return {
+            select: () => ({
+              eq: () => ({ single: vi.fn().mockResolvedValue({ data: {}, error: null }) }),
+            }),
+          };
+        }
+        return { insert };
+      });
+
+      const store = makeFakeStore();
+      const { onFailure } = createHeartbeatEscalation({
+        client: { from } as never,
+        sendToChannel,
+        defaultAgentId: 'unrelated-sb',
+        store,
+      });
+
+      const result = await onFailure(makeReminder(), AUTH_ERROR, 1, FIRST_FOR_DESTINATION);
+
+      expect(result).toEqual({ alerted: true });
+      expect(sendToChannel).toHaveBeenCalledTimes(1);
+      expect(insert).not.toHaveBeenCalled();
+    });
+
+    it('still uses the default agent for a beat that genuinely has no owner', async () => {
+      // The control that keeps the fix from becoming "never use the default".
+      // A null sb_id is not a failed lookup — there is no owner to misaddress.
+      const { client, insert } = makeClient();
+      const store = makeFakeStore();
+      const { onFailure } = createHeartbeatEscalation({
+        client,
+        sendToChannel,
+        defaultAgentId: 'unrelated-sb',
+        store,
+      });
+
+      await onFailure(makeReminder({ sb_id: null }), AUTH_ERROR, 1, FIRST_FOR_DESTINATION);
+
       expect(insert).toHaveBeenCalledTimes(1);
-      expect(insert.mock.calls[0][0].recipient_agent_id).toBe('myra');
+      expect(insert.mock.calls[0][0].recipient_agent_id).toBe('unrelated-sb');
     });
   });
 });
