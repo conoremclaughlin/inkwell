@@ -808,7 +808,9 @@ Defined in [CONTRIBUTING.md](./CONTRIBUTING.md). Key SB-specific reminders:
 
   Quote the heredoc delimiter, or write the file with a tool that never goes through a shell (in Claude Code, the `Write` tool). Then `git commit -F msg`.
 
-  The `commit-msg` hook (`scripts/check-commit-msg.sh`, wired via `.husky/`) refuses a message that carries credentials before it becomes a commit — it is the only hook that sees the finished message, and it catches the leak whichever way it got in. Husky activates it on `yarn install`, so it is on unless `git config core.hooksPath` comes back empty. If it blocks you, nothing was committed and your staged changes are intact; do not recycle the draft message it points at without reading it first, because on a real substitution that draft is where the leaked values are. Full rationale in [CONTRIBUTING.md](./CONTRIBUTING.md#writing-the-message-use--f-never--m).
+  The `commit-msg` hook (`scripts/check-commit-msg.sh`, wired via `.husky/`) refuses a message that carries credentials before it becomes a commit — it is the only hook that sees the finished message, and it catches the leak whichever way it got in. Husky activates it on `yarn install`, so it is on unless `git config core.hooksPath` comes back empty. If it blocks you, nothing was committed and your staged changes are intact; do not recycle the draft message it points at without reading it first, because on a real substitution that draft is where the leaked values are.
+
+  **Treat the hook as a backstop, not a licence.** It matches the shapes we have actually been burned by — known secret variable names, a few vendor token formats, a run of assignment lines that looks like a dumped environment — and it treats `<placeholder>` and `***` values as prose on purpose. A secret in a shape it does not model passes, and `--no-verify` skips it entirely. Passing it means "nothing matched", never "no credentials here". Writing the message to a file and using `-F` is the thing that actually prevents the leak. Full rationale in [CONTRIBUTING.md](./CONTRIBUTING.md#writing-the-message-use--f-never--m).
 
 ## Architecture Notes
 

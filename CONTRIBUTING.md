@@ -83,9 +83,27 @@ message carrying named secret assignments, vendor token shapes, or an environmen
 reports variable names and line numbers only, never values, so the hook output does not
 become the next place a secret is written down.
 
+**It is a heuristic backstop, not universal detection, and `-F` is still the actual fix.**
+It recognises the shapes we have actually been burned by: a list of known secret variable
+names, a handful of vendor token formats, and a run of assignment lines that looks like a
+dumped environment. A secret it has never been told to recognise, in a shape it does not
+model, will pass — and deliberately so at the edges: a value written as `<placeholder>` or
+`***` is treated as prose, because prose about this guard is something we write far more
+often than we leak. Passing the hook means "nothing matched", never "no credentials here".
+Do not let it become the reason you stop being careful about how the message is written.
+
+It is also skippable with `--no-verify` and only active where `core.hooksPath` points at a
+checkout that has it, which is why the durable protection is the `-F` habit above rather
+than the hook.
+
 If it blocks you, nothing has been committed and your staged changes are untouched. Read the
 draft message it points at before reusing it — if the guard fired on a real substitution, the
 draft contains the leaked values and must not be recycled into the next attempt.
+
+If it blocks you and you are _sure_ it is prose rather than a leak, rewrite the prose rather
+than reaching for `--no-verify`: keep a placeholder like `<value>` or `***` immediately after
+the `=`, or avoid putting a credential-shaped run right after one. Every false positive so
+far has been a commit message _about_ this guard.
 
 Its regression suite is `scripts/check-commit-msg.test.sh` (synthetic fixtures, runs in CI).
 `scripts/check-commit-msg.history.sh` is the local-only check that replays the three real

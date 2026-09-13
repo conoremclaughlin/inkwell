@@ -21,8 +21,15 @@
 set -u
 
 root=$(cd "$(dirname "$0")/.." && pwd) || exit 1
-guard="$root/scripts/check-commit-msg.sh"
-hook="$root/.husky/commit-msg"
+guard="${GUARD_UNDER_TEST:-$root/scripts/check-commit-msg.sh}"
+hook="${HOOK_UNDER_TEST:-$root/.husky/commit-msg}"
+
+# The two overrides exist so the suite can be pointed at a deliberately broken
+# copy and checked for going red. A test tier that cannot fail is not evidence,
+# and this one has been in that state before: an earlier harness built fixtures
+# the hook could never resolve, so every rejection case passed without anything
+# being scanned. Mutating .husky/commit-msg is also the only way to exercise it
+# from a worktree where that path is permission-gated.
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/check-commit-msg-test.XXXXXX") || exit 1
 trap 'rm -rf "$work"' EXIT INT TERM
@@ -374,133 +381,221 @@ done
 # Tier 2: the wiring
 # ---------------------------------------------------------------------------
 #
-# The scanner passing proves nothing about whether a commit is actually
-# refused. These cases drive a real `git commit` through a real hook.
+# The scanner passing proves nothing about whether a commit is actually refused.
+# These cases drive a real `git commit` through the real hook.
+#
+# THE LAYOUT MATTERS, and getting it wrong is how this tier fooled itself once
+# already. `core.hooksPath` on this machine is one shared directory serving the
+# main checkout and every worktree, so the hook file is never the one on the
+# branch being committed. The hook resolves its scanner as
+# "$(dirname "$0")/../scripts/check-commit-msg.sh" -- i.e. beside itself, in the
+# checkout that PROVIDES the hook, not in the worktree that invokes it.
+#
+# So every fixture is two separate trees:
+#
+#   <name>-provider/          the checkout that owns core.hooksPath
+#     .husky/commit-msg       the hook under test
+#     scripts/check-commit-msg.sh
+#   <name>/                   the invoking repo -- deliberately has NO scripts/,
+#                             which is what an older branch looks like
+#
+# An earlier version of this file created the hooks directory with no sibling
+# scripts/, so the hook could never find a scanner and EVERY wiring case took the
+# missing-provider branch. The rejection cases still passed -- because nothing was
+# scanned, not because scanning worked. That is why each rejection below also
+# asserts the scanner's own marker, and the missing-provider cases assert the
+# hook's distinct diagnostic. "Refused" on its own cannot tell a working guard
+# from a dead one.
 
 echo "WIRING (.husky/commit-msg via a real git commit)"
 
-# new_repo <name> — a disposable repo whose core.hooksPath is a SEPARATE
-# directory holding a copy of .husky/commit-msg. That mirrors how this machine
-# is really configured: one shared hooks directory serves the main checkout and
-# every worktree, so the hook file is never the one on the branch being
-# committed. Pointing hooksPath inside the repo would test a layout we do not
-# run and would hide the bug this tier exists to catch.
-new_repo() {
-  repo="$work/$1"
-  hooks="$work/$1-hooks"
-  mkdir -p "$repo/scripts" "$hooks" || return 1
-  cp "$hook" "$hooks/commit-msg" || return 1
-  chmod +x "$hooks/commit-msg" || return 1
-  git -C "$repo" init -q || return 1
-  git -C "$repo" config user.email test@example.invalid || return 1
-  git -C "$repo" config user.name "Guard Test" || return 1
-  git -C "$repo" config commit.gpgsign false || return 1
-  git -C "$repo" config core.hooksPath "$hooks" || return 1
-  echo "$repo"
+SCAN_MARKER="looks like it contains credentials"
+PROVIDER_MARKER="missing its readable credential scanner"
+
+# new_provider <dir> — a checkout that owns the hook and the scanner.
+new_provider() {
+  mkdir -p "$1/.husky" "$1/scripts" || return 1
+  cp "$hook" "$1/.husky/commit-msg" || return 1
+  chmod 755 "$1/.husky/commit-msg" || return 1
+  cp "$guard" "$1/scripts/check-commit-msg.sh" || return 1
 }
 
-repo=$(new_repo blocked) || exit 1
-cp "$guard" "$repo/scripts/check-commit-msg.sh"
-echo "source line" > "$repo/app.txt"
-git -C "$repo" add app.txt scripts/check-commit-msg.sh
-cat > "$work/poisoned.txt" <<EOF
+# new_repo <dir> <hooks-path> — an invoking repo with no scanner of its own.
+new_repo() {
+  mkdir -p "$1" || return 1
+  git -C "$1" init -q || return 1
+  git -C "$1" config user.email test@example.invalid || return 1
+  git -C "$1" config user.name "Guard Test" || return 1
+  git -C "$1" config commit.gpgsign false || return 1
+  git -C "$1" config core.hooksPath "$2" || return 1
+  echo "source line" > "$1/app.txt" || return 1
+  git -C "$1" add app.txt || return 1
+}
+
+cat > "$work/clean.txt" <<'EOF'
+fix(cache): honour a `local` flag on the cache entry
+EOF
+
+cat > "$work/poisoned.txt" <<'EOF'
 fix: an innocent looking subject
 
 SUPABASE_SECRET_KEY=CANARYVALUE9182
 EOF
-commit_out=$(git -C "$repo" commit -F "$work/poisoned.txt" 2>&1)
-commit_rc=$?
 
-if [ "$commit_rc" -ne 0 ]; then
-  ok "poisoned message: git commit exits non-zero"
+# expect_clean <label> <repo> [commit-dir]
+expect_clean() {
+  label=$1
+  repo=$2
+  dir=${3:-$2}
+  out=$(git -C "$dir" commit -F "$work/clean.txt" 2>&1)
+  rc=$?
+  if [ "$rc" -eq 0 ] && git -C "$repo" rev-parse HEAD >/dev/null 2>&1; then
+    ok "$label"
+  else
+    bad "$label" "exit $rc: $(echo "$out" | tr '\n' ' ' | cut -c1-160)"
+  fi
+}
+
+# expect_blocked <label> <repo> <marker> [commit-dir]
+# Asserts, for every rejection: non-zero through git, the RIGHT diagnostic (so a
+# dead hook cannot masquerade as a working one), no commit created, the index
+# preserved, and no synthetic value anywhere in the output.
+expect_blocked() {
+  label=$1
+  repo=$2
+  marker=$3
+  dir=${4:-$2}
+  before=$(git -C "$repo" diff --cached --name-only | sort | tr '\n' ' ')
+  out=$(git -C "$dir" commit -F "$work/poisoned.txt" 2>&1)
+  rc=$?
+  after=$(git -C "$repo" diff --cached --name-only | sort | tr '\n' ' ')
+
+  if [ "$rc" -eq 0 ]; then
+    bad "$label: refused" "git commit succeeded"
+  else
+    ok "$label: refused"
+  fi
+
+  if echo "$out" | grep -qF "$marker"; then
+    ok "$label: refused by the expected path"
+  else
+    bad "$label: refused by the expected path" "no [$marker] in: $(echo "$out" | tr '\n' ' ' | cut -c1-160)"
+  fi
+
+  if git -C "$repo" rev-parse HEAD >/dev/null 2>&1; then
+    bad "$label: no commit created" "HEAD exists"
+  else
+    ok "$label: no commit created"
+  fi
+
+  if [ "$before" = "$after" ]; then
+    ok "$label: index preserved"
+  else
+    bad "$label: index preserved" "[$before] -> [$after]"
+  fi
+
+  if echo "$out" | grep -q CANARYVALUE9182; then
+    bad "$label: value not echoed" "the synthetic value appeared in git output"
+  else
+    ok "$label: value not echoed"
+  fi
+}
+
+# --- the case this wrapper exists for: an older invoking checkout -----------
+# The invoking repo has no scripts/ at all. Under the old --show-toplevel hook
+# this could not work; under provider-relative resolution it borrows the
+# provider's scanner, which is the whole point of the change.
+
+new_provider "$work/old-clean-provider"
+new_repo "$work/old-clean" "$work/old-clean-provider/.husky"
+expect_clean "older invoking checkout, clean message" "$work/old-clean"
+
+new_provider "$work/old-poison-provider"
+new_repo "$work/old-poison" "$work/old-poison-provider/.husky"
+expect_blocked "older invoking checkout, poisoned message" "$work/old-poison" "$SCAN_MARKER"
+
+# --- a path containing spaces ----------------------------------------------
+new_provider "$work/sp ace provider"
+new_repo "$work/sp ace repo" "$work/sp ace provider/.husky"
+expect_clean "provider path with spaces, clean message" "$work/sp ace repo"
+
+new_provider "$work/sp ace provider2"
+new_repo "$work/sp ace repo2" "$work/sp ace provider2/.husky"
+expect_blocked "provider path with spaces, poisoned message" "$work/sp ace repo2" "$SCAN_MARKER"
+
+# --- a RELATIVE hooksPath ---------------------------------------------------
+# Git resolves a relative core.hooksPath against the top of the working tree, so
+# this is the ordinary in-repo `.husky` arrangement rather than the shared one.
+new_provider "$work/relative"
+git -C "$work/relative" init -q
+git -C "$work/relative" config user.email test@example.invalid
+git -C "$work/relative" config user.name "Guard Test"
+git -C "$work/relative" config commit.gpgsign false
+git -C "$work/relative" config core.hooksPath .husky
+echo "source line" > "$work/relative/app.txt"
+git -C "$work/relative" add app.txt scripts/check-commit-msg.sh
+expect_blocked "relative hooksPath, poisoned message" "$work/relative" "$SCAN_MARKER"
+expect_clean "relative hooksPath, clean message" "$work/relative"
+
+# --- committing from a subdirectory ----------------------------------------
+# Git runs hooks from the top of the working tree and passes $1 relative to it.
+# This is the case that breaks if anything ever resolves $1 against the caller.
+new_provider "$work/subdir-provider"
+new_repo "$work/subdir" "$work/subdir-provider/.husky"
+mkdir -p "$work/subdir/packages/api/src"
+echo "source line" > "$work/subdir/packages/api/src/app.ts"
+git -C "$work/subdir" add packages/api/src/app.ts
+expect_blocked "commit from a subdirectory" "$work/subdir" "$SCAN_MARKER" "$work/subdir/packages/api/src"
+expect_clean "commit from a subdirectory, clean message" "$work/subdir" "$work/subdir/packages/api/src"
+
+# --- a broken provider ------------------------------------------------------
+# With provider-relative resolution, "no scanner" no longer means "old branch" --
+# it means the checkout that owns core.hooksPath is broken. That must block, and
+# say so distinctly enough to tell it apart from a credential hit.
+
+new_provider "$work/noscanner-provider"
+rm -f "$work/noscanner-provider/scripts/check-commit-msg.sh"
+new_repo "$work/noscanner" "$work/noscanner-provider/.husky"
+out=$(git -C "$work/noscanner" commit -F "$work/clean.txt" 2>&1)
+rc=$?
+if [ "$rc" -ne 0 ]; then
+  ok "provider missing its scanner: blocks even a clean message"
 else
-  bad "poisoned message: git commit exits non-zero" "commit succeeded"
+  bad "provider missing its scanner: blocks even a clean message" "commit succeeded with no scanner"
+fi
+if echo "$out" | grep -qF "$PROVIDER_MARKER"; then
+  ok "provider missing its scanner: distinct diagnostic, not a credential report"
+else
+  bad "provider missing its scanner: distinct diagnostic, not a credential report" "$(echo "$out" | tr '\n' ' ' | cut -c1-160)"
+fi
+if echo "$out" | grep -qF "$SCAN_MARKER"; then
+  bad "provider missing its scanner: not reported as a credential hit" "claimed credentials were found"
+else
+  ok "provider missing its scanner: not reported as a credential hit"
 fi
 
-if git -C "$repo" rev-parse HEAD >/dev/null 2>&1; then
-  bad "poisoned message: no commit is created" "HEAD exists"
+new_provider "$work/unreadable-provider"
+chmod 000 "$work/unreadable-provider/scripts/check-commit-msg.sh"
+new_repo "$work/unreadable" "$work/unreadable-provider/.husky"
+out=$(git -C "$work/unreadable" commit -F "$work/clean.txt" 2>&1)
+rc=$?
+chmod 644 "$work/unreadable-provider/scripts/check-commit-msg.sh"
+if [ "$rc" -ne 0 ] && echo "$out" | grep -qF "$PROVIDER_MARKER"; then
+  ok "provider scanner unreadable: blocks with the provider diagnostic"
 else
-  ok "poisoned message: no commit is created"
+  bad "provider scanner unreadable: blocks with the provider diagnostic" "exit $rc: $(echo "$out" | tr '\n' ' ' | cut -c1-160)"
 fi
 
-# The scanner promises staged work is untouched. If that is false, people learn
-# to run with --no-verify and the guard is over.
-staged=$(git -C "$repo" diff --cached --name-only | sort | tr '\n' ' ')
-if [ "$staged" = "app.txt scripts/check-commit-msg.sh " ]; then
-  ok "poisoned message: staged changes are preserved"
+# Git maps any non-zero hook status onto commit exit 1, so the hook's own exit 2
+# is only observable by invoking it directly. Pinned both ways so neither is
+# asserted in the wrong place.
+out=$(cd "$work/noscanner" && sh "$work/noscanner-provider/.husky/commit-msg" "$work/clean.txt" 2>&1)
+rc=$?
+if [ "$rc" -eq 2 ]; then
+  ok "hook invoked directly with a broken provider exits 2"
 else
-  bad "poisoned message: staged changes are preserved" "staged: [$staged]"
+  bad "hook invoked directly with a broken provider exits 2" "got $rc"
 fi
-
-if echo "$commit_out" | grep -q CANARYVALUE9182; then
-  bad "poisoned message: git output does not echo the value" "value appeared in git output"
-else
-  ok "poisoned message: git output does not echo the value"
-fi
-
-# A guard that also blocks good commits gets removed. Prove the happy path.
-repo=$(new_repo allowed) || exit 1
-cp "$guard" "$repo/scripts/check-commit-msg.sh"
-echo "source line" > "$repo/app.txt"
-git -C "$repo" add app.txt scripts/check-commit-msg.sh
-printf 'fix(cache): honour a `local` flag on the cache entry\n' > "$work/clean.txt"
-if git -C "$repo" commit -q -F "$work/clean.txt" >/dev/null 2>&1; then
-  ok "clean message: commit succeeds through the hook"
-else
-  bad "clean message: commit succeeds through the hook" "commit was refused"
-fi
-
-# Git runs hooks from the top of the working tree and passes $1 as a path
-# relative to it. Committing from a subdirectory is the case that breaks if a
-# future edit ever cds or resolves $1 against the caller's cwd.
-repo=$(new_repo subdir) || exit 1
-cp "$guard" "$repo/scripts/check-commit-msg.sh"
-mkdir -p "$repo/packages/api/src"
-echo "source line" > "$repo/packages/api/src/app.ts"
-git -C "$repo" add .
-printf 'fix: committed from a subdirectory\n' > "$work/sub.txt"
-if git -C "$repo/packages/api/src" commit -q -F "$work/sub.txt" >/dev/null 2>&1; then
-  ok "commit from a subdirectory still runs the guard"
-else
-  bad "commit from a subdirectory still runs the guard" "commit was refused"
-fi
-
-# And it must still BLOCK from a subdirectory — succeeding there could just mean
-# the hook silently failed to find the scanner.
-repo=$(new_repo subdir-blocked) || exit 1
-cp "$guard" "$repo/scripts/check-commit-msg.sh"
-mkdir -p "$repo/packages/api/src"
-echo "source line" > "$repo/packages/api/src/app.ts"
-git -C "$repo" add .
-if git -C "$repo/packages/api/src" commit -F "$work/poisoned.txt" >/dev/null 2>&1; then
-  bad "poisoned commit from a subdirectory is blocked" "commit succeeded"
-else
-  ok "poisoned commit from a subdirectory is blocked"
-fi
-
-# The branch-predates-the-guard case. core.hooksPath is one shared directory for
-# every worktree on the machine, so the moment this hook reaches the main
-# checkout it runs for branches that do not carry scripts/check-commit-msg.sh --
-# old branches, bisects, tags. Those commits must still go through, and the
-# operator must be told the guard is inactive rather than left guessing.
-repo=$(new_repo no-scanner) || exit 1
-echo "source line" > "$repo/app.txt"
-git -C "$repo" add app.txt
-printf 'chore: a commit on a branch that predates the guard\n' > "$work/old.txt"
-out=$(git -C "$repo" commit -F "$work/old.txt" 2>&1)
-if [ $? -eq 0 ]; then
-  ok "scanner absent: commit is allowed through"
-else
-  bad "scanner absent: commit is allowed through" "$(echo "$out" | tr '\n' ' ')"
-fi
-if echo "$out" | grep -qi "inactive"; then
-  ok "scanner absent: operator is warned the guard is inactive"
-else
-  bad "scanner absent: operator is warned the guard is inactive" "$(echo "$out" | tr '\n' ' ')"
-fi
-
-# ---------------------------------------------------------------------------
-
 echo ""
 echo "ran $((pass + fail)) checks: $pass passed, $fail failed"
 [ "$fail" -eq 0 ] || exit 1
