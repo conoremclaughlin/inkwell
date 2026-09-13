@@ -77,7 +77,7 @@ function ThreadReplyComposer({ threadKey, closed }: { threadKey: string; closed:
       {closed && (
         <div className="rounded-md border border-dashed px-3 py-2 text-[11px] text-muted-foreground">
           This thread is closed. A reply still lands and wakes its participants; it does not reopen
-          the thread.
+          the thread. Reopen, next to the status badge, is how you say the work is back on.
         </div>
       )}
       <textarea

@@ -12,7 +12,12 @@ import {
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { useHeaderHeight } from '@react-navigation/elements';
 import { MessageBubble } from '../components/MessageBubble';
-import { useSendReply, useStartThread, useThreadMessages } from '../hooks/useInkwell';
+import {
+  useReopenThread,
+  useSendReply,
+  useStartThread,
+  useThreadMessages,
+} from '../hooks/useInkwell';
 import type { RootStackParamList } from '../navigation';
 import { colors, spacing, type } from '../ui/theme';
 
@@ -28,6 +33,7 @@ export function ThreadScreen({ route }: Props) {
   const { threadKey, title, recipients, studioSlug } = route.params;
   const { data, isLoading, error } = useThreadMessages(threadKey);
   const sendReply = useSendReply(threadKey);
+  const reopenThread = useReopenThread(threadKey);
   const startThread = useStartThread();
   const [draft, setDraft] = useState('');
   const headerHeight = useHeaderHeight();
@@ -112,6 +118,20 @@ export function ThreadScreen({ route }: Props) {
           <Text style={styles.closedText}>
             Thread is closed — a reply still lands and wakes its participants.
           </Text>
+          <Pressable
+            onPress={() => reopenThread.mutate()}
+            disabled={reopenThread.isPending}
+            style={({ pressed }) => [styles.reopenButton, pressed && { opacity: 0.7 }]}
+            accessibilityRole="button"
+            accessibilityLabel="Reopen thread"
+          >
+            <Text style={styles.reopenText}>
+              {reopenThread.isPending ? 'Reopening…' : 'Reopen'}
+            </Text>
+          </Pressable>
+          {reopenThread.isError ? (
+            <Text style={styles.errorText}>{(reopenThread.error as Error).message}</Text>
+          ) : null}
         </View>
       ) : null}
 
@@ -171,8 +191,21 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     paddingVertical: spacing.sm,
   },
-  closedBar: { paddingVertical: 6, alignItems: 'center', backgroundColor: colors.well },
+  closedBar: {
+    paddingVertical: 6,
+    alignItems: 'center',
+    gap: 4,
+    backgroundColor: colors.well,
+  },
   closedText: { ...type.caption, color: colors.textMuted },
+  reopenButton: {
+    paddingHorizontal: spacing.md,
+    paddingVertical: 4,
+    borderRadius: 6,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.textMuted,
+  },
+  reopenText: { ...type.caption, color: colors.text },
   errorBar: { paddingVertical: 6, paddingHorizontal: spacing.lg, backgroundColor: colors.well },
   errorText: { ...type.caption, color: colors.negative },
   composer: {
