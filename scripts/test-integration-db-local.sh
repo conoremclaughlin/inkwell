@@ -108,12 +108,23 @@ echo "[integration-db] Resetting DB (migrations + seed)..."
 supabase db reset --workdir "${SUPABASE_WORKDIR}" --local >/dev/null
 
 echo "[integration-db] Exporting local Supabase env..."
+# The isolated stack's values, and ONLY those. These used to be
+# `${SUPABASE_URL:-${API_URL}}`: a shell that already carried the main
+# server's SUPABASE_URL (every dev shell here does) sent the whole suite —
+# fixture writes included — to the shared local database while the banner
+# still named the isolated stack (Lumen, #621). Every name that could have
+# been inherited is unset BEFORE the stack's output is read, so whatever is
+# set afterwards came from the stack. The CLI's output has changed names
+# across versions (ANON_KEY/PUBLISHABLE_KEY, SERVICE_ROLE_KEY/SECRET_KEY,
+# JWT_SECRET/AUTH_JWT_SECRET); either generation is accepted.
+unset SUPABASE_URL SUPABASE_PUBLISHABLE_KEY SUPABASE_SECRET_KEY JWT_SECRET DB_URL \
+  API_URL ANON_KEY PUBLISHABLE_KEY SERVICE_ROLE_KEY SECRET_KEY AUTH_JWT_SECRET
 STATUS_ENV="$(supabase status --workdir "${SUPABASE_WORKDIR}" -o env)"
 eval "${STATUS_ENV}"
 
-export SUPABASE_URL="${SUPABASE_URL:-${API_URL:-}}"
-export SUPABASE_PUBLISHABLE_KEY="${SUPABASE_PUBLISHABLE_KEY:-${ANON_KEY:-}}"
-export SUPABASE_SECRET_KEY="${SUPABASE_SECRET_KEY:-${SERVICE_ROLE_KEY:-}}"
+export SUPABASE_URL="${API_URL:-}"
+export SUPABASE_PUBLISHABLE_KEY="${PUBLISHABLE_KEY:-${ANON_KEY:-}}"
+export SUPABASE_SECRET_KEY="${SECRET_KEY:-${SERVICE_ROLE_KEY:-}}"
 export JWT_SECRET="${JWT_SECRET:-${AUTH_JWT_SECRET:-}}"
 export NODE_ENV="test"
 export INK_ALLOW_REMOTE_INTEGRATION_DB="0"
@@ -121,12 +132,19 @@ export INTEGRATION_SUPABASE_WORKDIR="${SUPABASE_WORKDIR}"
 # Direct Postgres URL, for the few tests that need a SECOND connection and so
 # cannot go through PostgREST — concurrency regressions where one transaction
 # must hold a row lock while another statement waits on it. PostgREST gives one
-# transaction per request and cannot express that.
-export INTEGRATION_DB_URL="${DB_URL:-postgresql://postgres:postgres@127.0.0.1:${DB_PORT}/postgres}"
+# transaction per request and cannot express that. Same rule: the stack's port.
+export INTEGRATION_DB_URL="postgresql://postgres:postgres@127.0.0.1:${DB_PORT}/postgres"
 
 if [[ -z "${SUPABASE_URL}" || -z "${SUPABASE_SECRET_KEY}" || -z "${JWT_SECRET}" ]]; then
   echo "[integration-db] Failed to derive required env vars from supabase status output." >&2
   echo "${STATUS_ENV}" >&2
+  exit 1
+fi
+
+# Prove the target before a single test runs: the API URL must name the
+# port this script reserved for the isolated stack.
+if [[ "${SUPABASE_URL}" != *":${API_PORT}"* ]]; then
+  echo "[integration-db] Refusing to run: SUPABASE_URL=${SUPABASE_URL} is not the isolated stack (expected port ${API_PORT})." >&2
   exit 1
 fi
 
