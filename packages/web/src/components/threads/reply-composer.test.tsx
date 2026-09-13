@@ -8,8 +8,8 @@
  * completes against that thread and never touches the new one.
  */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { ReplyComposer } from './reply-composer';
 
@@ -42,6 +42,9 @@ describe('ReplyComposer', () => {
   beforeEach(() => {
     apiPost.mockReset();
   });
+  // Testing Library only auto-cleans under a globals-enabled runner; this
+  // suite must not depend on which vitest config picked it up.
+  afterEach(cleanup);
 
   it('a draft typed for thread A is not shown for thread B', () => {
     const { select } = renderComposer('pr:a');
