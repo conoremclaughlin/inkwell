@@ -789,7 +789,34 @@ Defined in [CONTRIBUTING.md](./CONTRIBUTING.md). Key SB-specific reminders:
 - **ALL PRs require a sibling review before merge.** No exceptions unless Conor explicitly says otherwise. Do not merge your own PR without at least one other SB's LGTM. This is a hard rule — merging without review has caused bugs that could have been caught. Use `ink wait --thread pr:<number>` to hold for the review.
 - **Verify CI passes before merging.** Check `gh run list --branch <branch>` for the CI status. If tests fail, fix them before merging — don't merge red. When fixing CI, run the full test suite locally (`npx vitest run`) to catch issues before pushing.
 - **Simple PR wait helper**: for short review loops, use `yarn pr:wait-reply <prNumber> --timeout 120 --interval 10` instead of manual `sleep`, then re-check review status via MCP GitHub tools.
-- **Commit messages**: pass multi-line messages directly to `-m "..."` — bash handles literal newlines in double-quoted strings. Do not use `$(cat <<'EOF' ... EOF)` or other command substitution patterns; they add complexity for no benefit.
+- **Commit messages: write the message to a file and use `git commit -F <file>`. Never `-m`, not even for a one-line subject.** A double-quoted `-m` string is shell input, so a backtick or `$(...)` anywhere in it is **executed** and its output pasted into the commit. Markdown backticks around an identifier — ``a `local` flag`` — are the normal way we write, which makes this a trap rather than an edge case: it hit Lumen twice in February 2026 and Wren on 2026-09-13, and the 2026-09-13 commit pasted ten live credentials into a public repository. The diff stays clean, so review cannot catch it.
+
+  A subject line is **not** the safe exception it looks like. Backticks in a subject are substituted exactly as they are in a body:
+
+  ```bash
+  git commit -m "fix: honour the `pwd` flag"   # git receives: fix: honour the /Users/you/ws/pcp flag
+  ```
+
+  That example substitutes `pwd`, not the builtin that caused the incident — the snippet is runnable, and the real one would dump your environment into a commit. Same mechanism, harmless payload.
+
+  Single-quoting is not the fix either: an apostrophe in a word like `don't` closes the string, and the remainder of your message is re-parsed as shell.
+
+  **How you write the file matters as much as `-F` does.** `-F` reads bytes and never expands them, but the shell still expands whatever you use to _create_ the file:
+
+  ```bash
+  cat > msg <<'EOF'     # SAFE — quoted delimiter, every byte literal
+  cat > msg <<EOF       # UNSAFE — backticks and $VAR expand as the file is written
+  ```
+
+  Quote the heredoc delimiter, or write the file with a tool that never goes through a shell (in Claude Code, the `Write` tool). Then `git commit -F msg`.
+
+  The `commit-msg` hook (`scripts/check-commit-msg.sh`, wired via `.husky/`) refuses a message that carries credentials before it becomes a commit — it is the only hook that sees the finished message, whichever way the credentials got in. If it blocks you, nothing was committed and your staged changes are intact; do not recycle the draft message it points at without reading it first, because on a real substitution that draft is where the leaked values are.
+
+  **A non-empty `core.hooksPath` does not mean the guard is on.** The hook runs from whichever checkout that path points at, which on a machine with worktrees is one shared directory serving all of them. If that checkout does not carry `.husky/commit-msg`, nothing is checked and nothing says so. To confirm: `ls "$(git config core.hooksPath)"/commit-msg`.
+
+  **Treat the hook as a backstop, not a licence.** It matches the shapes we have actually been burned by — known secret variable names, a few vendor token formats, a run of assignment lines that looks like a dumped environment. A secret in a shape it does not model passes, and `--no-verify` skips it entirely. Passing it means "nothing matched", never "no credentials here". Writing the message to a file and using `-F` is the thing that actually prevents the leak.
+
+  It has one false positive you will meet, and it is deliberate: **any** assignment to a name it knows — `JWT_SECRET=`, `GITHUB_TOKEN=` — is refused, including `=<placeholder>`, `=***` and a bare `=` with nothing after it. Exempting those meant exempting real credentials that happen to start with the same byte, so prose names the variable without assigning to it: "the `JWT_SECRET` value", not `JWT_SECRET=<value>`. Full rationale in [CONTRIBUTING.md](./CONTRIBUTING.md#writing-the-message-use--f-never--m).
 
 ## Architecture Notes
 
