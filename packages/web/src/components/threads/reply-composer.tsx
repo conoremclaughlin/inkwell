@@ -11,20 +11,7 @@ export interface ReplyResponse {
   threadId: string;
 }
 
-/**
- * Display name for a message sender. A person's reply carries
- * `{ sentBy: 'user' }` in its metadata while its sender slot says 'unknown'
- * (see POST /threads/reply). Until the principal columns of spec
- * inkmail-thread-scope §3 land, this marker is how the page tells a person
- * from a genuinely unattributed sender.
- */
-export function senderLabel(m: {
-  senderAgentId: string;
-  metadata?: Record<string, unknown> | null;
-}): string {
-  const sentBy = m.metadata ? (m.metadata as { sentBy?: unknown }).sentBy : undefined;
-  return sentBy === 'user' ? 'You' : m.senderAgentId;
-}
+export { senderLabel } from './sender-label';
 
 /**
  * A person's way into a thread from the dashboard. Posts through the same

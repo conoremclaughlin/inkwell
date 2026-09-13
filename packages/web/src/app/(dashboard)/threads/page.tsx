@@ -72,6 +72,8 @@ interface ThreadSpine {
     status: string;
     createdByAgentId: string;
     participants: string[];
+    /** People on the thread, named for the viewer — never woken, never in `participants`. */
+    people?: Array<{ userId: string; name: string; isOwn: boolean }>;
     closedAt: string | null;
   } | null;
   sessions: SpineSession[];
@@ -121,19 +123,22 @@ interface ThreadMessagesResponse {
   } | null;
   messages: Array<{
     id: string;
-    senderAgentId: string;
+    senderKind: 'sb' | 'user' | 'system';
+    senderAgentId: string | null;
+    senderSbId: string | null;
+    senderUserId: string | null;
+    /** Named on the server: the SB's slug, the person's profile name, or 'system'. */
+    senderName: string;
+    /** The viewer's own message — decided on the server against the PCP user. */
+    isOwn: boolean;
     content: string;
     messageType: string;
     priority: string;
-    /**
-     * A person's reply carries { sentBy: 'user' } here while its sender slot
-     * says 'unknown' (see POST /threads/reply). Until the principal columns
-     * of spec inkmail-thread-scope §3 land, this marker is how the page tells
-     * a person from a genuinely unattributed sender.
-     */
     metadata?: Record<string, unknown> | null;
     createdAt: string;
   }>;
+  /** The PCP user this response was rendered for. */
+  viewerUserId?: string;
   meta?: FeedMeta;
 }
 
@@ -611,6 +616,12 @@ function SpineDetail({ spine, onBack }: { spine: ThreadSpine; onBack: () => void
         {displayTitle(spine) && <div className="mt-1 text-sm">{displayTitle(spine)}</div>}
         <div className="mt-1 text-xs text-muted-foreground">
           {spine.participants.length > 0 && <>Participants: {spine.participants.join(', ')} · </>}
+          {(spine.thread?.people?.length ?? 0) > 0 && (
+            <>
+              People: {spine.thread!.people!.map((p) => (p.isOwn ? 'You' : p.name)).join(', ')}{' '}
+              ·{' '}
+            </>
+          )}
           Last activity {formatRelativeTime(spine.lastActivityAt)}
         </div>
       </div>

@@ -25,6 +25,7 @@ import {
   reopenThreadRow,
 } from '../mcp/tools/thread-handlers';
 import { resolveSbsByIds, userPrincipal } from '../services/principals';
+import { describePeople, resolvePersonNames } from '../services/person-display';
 import { FixedWindowLimiter } from '../utils/fixed-window-limiter';
 import { notifyPlatformOfApprovalRequest } from '../channels/approval-interceptor';
 
@@ -7314,6 +7315,10 @@ router.get('/threads', async (req: Request, res: Response) => {
     const slugBySbId = new Map(
       (await resolveSbsByIds(supabase, [...participantSbIds])).map((sb) => [sb.sbId, sb.agentId])
     );
+    const personNames = await resolvePersonNames(
+      supabase,
+      participantRows.flatMap((row) => (row.user_id ? [row.user_id] : []))
+    );
     for (const row of participantRows) {
       if (row.sb_id) {
         const list = participantsByThreadId.get(row.thread_id) ?? [];
@@ -7358,7 +7363,8 @@ router.get('/threads', async (req: Request, res: Response) => {
         updatedAt: t.updated_at,
         closedAt: t.closed_at ?? null,
         participants: participantsByThreadId.get(t.id) ?? [],
-        people: peopleByThreadId.get(t.id) ?? [],
+        // Named for THIS viewer: a person's own row says so (spec §3).
+        people: describePeople(peopleByThreadId.get(t.id) ?? [], personNames, authReq.pcpUserId),
       })),
       sessions: sessionRows,
       studios: studioRows,
@@ -7537,8 +7543,31 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
 
     const fetched = (messageRows || []).length;
     const total = messagesCount ?? fetched;
+
+    // Every author is named here, for this viewer. A person is named from
+    // their profile and is "own" only when they are the PCP user this
+    // request resolved to — a client comparing against its auth provider's
+    // id would compare the wrong id (Lumen, #620).
+    const viewerUserId = authReq.pcpUserId;
+    const personNames = await resolvePersonNames(
+      supabase,
+      (messageRows || []).flatMap((m) => (m.sender_user_id ? [m.sender_user_id] : []))
+    );
+    const senderName = (m: {
+      sender_kind: string;
+      sender_agent_id: string | null;
+      sender_user_id: string | null;
+    }) => {
+      if (m.sender_kind === 'user' && m.sender_user_id) {
+        return describePeople([m.sender_user_id], personNames, viewerUserId)[0].name;
+      }
+      if (m.sender_kind === 'sb') return m.sender_agent_id ?? 'an SB';
+      return 'system';
+    };
+
     res.json({
       studioHistory,
+      viewerUserId,
       thread: {
         threadKey: thread.thread_key,
         title: thread.title ?? null,
@@ -7565,6 +7594,11 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
           senderAgentId: m.sender_agent_id ?? m.sender_kind,
           senderSbId: m.sender_sb_id,
           senderUserId: m.sender_user_id,
+          // Resolved on the server: SB slug, the person's profile name, or
+          // 'system'. Never "You" — that is `isOwn`, the reader's call.
+          senderName: senderName(m),
+          isOwn:
+            m.sender_kind === 'user' && !!m.sender_user_id && m.sender_user_id === viewerUserId,
           content: m.content,
           messageType: m.message_type,
           priority: m.priority,
