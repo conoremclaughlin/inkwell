@@ -62,7 +62,12 @@ export interface ThreadsResponse {
 
 export interface ThreadMessage {
   id: string;
-  senderAgentId: string;
+  /** Who wrote it (spec inkmail-thread-scope §3): an SB, a person, or the system. */
+  senderKind: 'sb' | 'user' | 'system';
+  /** The SB's display slug; the kind for a person or the system. */
+  senderAgentId: string | null;
+  senderSbId: string | null;
+  senderUserId: string | null;
   content: string;
   messageType: string;
   priority: string;

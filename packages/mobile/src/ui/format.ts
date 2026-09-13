@@ -36,19 +36,19 @@ export function messageTime(iso: string, nowMs: number = Date.now()): string {
 }
 
 /**
- * Display name for a message sender. Human replies land with the sender slot
- * 'unknown' and metadata.sentBy = 'user' (see POST /threads/reply); that
- * metadata is the only way to tell a person from a genuinely unattributed
- * sender, so it is checked first.
+ * Display name for a message sender. Since the thread-scope cutover a
+ * message names its author by kind (spec inkmail-thread-scope §3): an SB by
+ * identity with its slug for display, a person by user id, or the system
+ * with neither. The kind is authoritative; the old `metadata.sentBy` hint
+ * is no longer consulted.
  */
-export function senderName(
-  senderAgentId: string,
-  metadata: Record<string, unknown> | null | undefined
-): { name: string; isUser: boolean } {
-  if (metadata && (metadata as { sentBy?: unknown }).sentBy === 'user') {
-    return { name: 'You', isUser: true };
-  }
-  return { name: senderAgentId, isUser: false };
+export function senderName(message: {
+  senderKind?: 'sb' | 'user' | 'system' | string | null;
+  senderAgentId?: string | null;
+}): { name: string; isUser: boolean } {
+  if (message.senderKind === 'user') return { name: 'You', isUser: true };
+  if (message.senderKind === 'system') return { name: 'system', isUser: false };
+  return { name: message.senderAgentId ?? 'system', isUser: false };
 }
 
 /** "runtime:idle" → "idle"; "active:implementing" → "implementing". */

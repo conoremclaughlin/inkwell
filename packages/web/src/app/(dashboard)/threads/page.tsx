@@ -72,6 +72,8 @@ interface ThreadSpine {
     status: string;
     createdByAgentId: string;
     participants: string[];
+    /** People on the thread, by user id — never woken, never in `participants`. */
+    people?: string[];
     closedAt: string | null;
   } | null;
   sessions: SpineSession[];
@@ -121,7 +123,10 @@ interface ThreadMessagesResponse {
   } | null;
   messages: Array<{
     id: string;
-    senderAgentId: string;
+    senderKind: 'sb' | 'user' | 'system';
+    senderAgentId: string | null;
+    senderSbId: string | null;
+    senderUserId: string | null;
     content: string;
     messageType: string;
     priority: string;

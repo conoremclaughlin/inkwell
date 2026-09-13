@@ -20,19 +20,24 @@ describe('relativeTime', () => {
 });
 
 describe('senderName', () => {
-  it('recognizes a human reply by metadata, not by the sender slot', () => {
-    // The server stores human replies with sender 'unknown' — the metadata
-    // flag is the ONLY distinguishing fact. If this stops passing, every
-    // reply the user sends renders as "unknown" in their own thread.
-    expect(senderName('unknown', { sentBy: 'user' })).toEqual({ name: 'You', isUser: true });
+  it('names a person "You" from the kind, not from a metadata hint', () => {
+    expect(senderName({ senderKind: 'user', senderAgentId: null })).toEqual({
+      name: 'You',
+      isUser: true,
+    });
   });
 
-  it('leaves agent senders alone', () => {
-    expect(senderName('wren', null)).toEqual({ name: 'wren', isUser: false });
-    expect(senderName('unknown', {})).toEqual({ name: 'unknown', isUser: false });
+  it('names an SB by its slug and the system as system', () => {
+    expect(senderName({ senderKind: 'sb', senderAgentId: 'wren' })).toEqual({
+      name: 'wren',
+      isUser: false,
+    });
+    expect(senderName({ senderKind: 'system', senderAgentId: null })).toEqual({
+      name: 'system',
+      isUser: false,
+    });
   });
 });
-
 describe('shortPhase', () => {
   it('drops the namespace prefix', () => {
     expect(shortPhase('runtime:idle')).toBe('idle');
