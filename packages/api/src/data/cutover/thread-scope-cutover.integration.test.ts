@@ -517,13 +517,16 @@ describe.skipIf(!REHEARSAL)(
         ).rejects.toThrow(/workspace_id/);
         await pg.query('ROLLBACK TO SAVEPOINT s2');
         // An SB from another workspace cannot join a thread here (composite FK).
+        // The SB edge is DEFERRED (so a workspace deletion can cascade), so
+        // the refusal lands at the boundary, not at the INSERT.
         await pg.query('SAVEPOINT s3');
-        await expect(
-          pg.query(
-            `INSERT INTO public.inbox_thread_participants (thread_id, workspace_id, sb_id) VALUES ($1, $2, $3)`,
-            [open, w.w1, w.aster]
-          )
-        ).rejects.toThrow(/inbox_thread_participants_sb_workspace_fkey/);
+        await pg.query(
+          `INSERT INTO public.inbox_thread_participants (thread_id, workspace_id, sb_id) VALUES ($1, $2, $3)`,
+          [open, w.w1, w.aster]
+        );
+        await expect(pg.query('SET CONSTRAINTS ALL IMMEDIATE')).rejects.toThrow(
+          /inbox_thread_participants_sb_workspace_fkey/
+        );
         await pg.query('ROLLBACK TO SAVEPOINT s3');
       } finally {
         await rollback();
