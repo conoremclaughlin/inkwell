@@ -4251,6 +4251,10 @@ router.get('/individuals/:agentId/inbox', async (req: Request, res: Response) =>
       senderAgentId: string | null;
       senderSbId: string | null;
       senderIdentityId: string | null;
+      /** Thread messages only (spec inkmail-thread-scope §3). */
+      senderKind?: string;
+      senderName?: string;
+      isOwn?: boolean;
       recipientAgentId: string;
       recipientSbId: string | null;
       recipientIdentityId: string | null;
@@ -4263,6 +4267,8 @@ router.get('/individuals/:agentId/inbox', async (req: Request, res: Response) =>
       acknowledgedAt: string | null;
       expiresAt: string | null;
     }
+
+    type ThreadMessageRow = Database['public']['Tables']['inbox_thread_messages']['Row'];
 
     const mapMessage = (m: (typeof allMessages)[0]): MappedMessage => ({
       id: m.id,
@@ -4351,6 +4357,8 @@ router.get('/individuals/:agentId/inbox', async (req: Request, res: Response) =>
       title: string | null;
       status: string;
       participants: string[];
+      /** People on the thread, named for this viewer — never in `participants`. */
+      people: Array<{ userId: string; name: string; isOwn: boolean }>;
       messageCount: number;
       unreadCount: number;
       lastMessage: MappedMessage | null;
@@ -4361,84 +4369,137 @@ router.get('/individuals/:agentId/inbox', async (req: Request, res: Response) =>
     const groupThreads: GroupThread[] = [];
     let threadTableUnreadCount = 0;
 
+    let groupThreadsUnavailable = false;
     try {
-      // Find threads this agent participates in (from thread tables)
-      const { data: threadParticipantRows } = await (supabase as any)
+      // Threads this agent's identities are on. Since the cutover a
+      // participant row names an SB by identity (spec inkmail-thread-scope
+      // §3); slugs and people are resolved once, for this viewer. Every read
+      // is checked: this section used to swallow its errors at debug level,
+      // which is how a dropped column would have emptied the page silently
+      // (Lumen, #621).
+      const { data: threadParticipantRows, error: participantErr } = await supabase
         .from('inbox_thread_participants')
         .select('thread_id')
-        .eq('agent_id', agentId);
-
-      const threadIds = (threadParticipantRows || []).map(
-        (p: { thread_id: string }) => p.thread_id
-      );
+        .in('sb_id', scopedIdentityIds);
+      if (participantErr) throw participantErr;
+      const threadIds = [...new Set((threadParticipantRows || []).map((p) => p.thread_id))];
 
       if (threadIds.length > 0) {
-        // Get thread metadata
-        let threadQuery = (supabase as any)
+        const { data: threadRows, error: threadErr } = await supabase
           .from('inbox_threads')
           .select('*')
-          .eq('user_id', authReq.pcpUserId)
+          .eq('workspace_id', authReq.pcpWorkspaceId)
           .in('id', threadIds)
           .order('updated_at', { ascending: false });
-
-        const { data: threadRows } = await threadQuery;
+        if (threadErr) throw threadErr;
 
         if (threadRows?.length) {
-          // Get read status for all threads
-          const { data: readStatusRows } = await (supabase as any)
+          const visibleIds = threadRows.map((t) => t.id);
+
+          const { data: readStatusRows, error: readErr } = await supabase
             .from('inbox_thread_read_status')
             .select('thread_id, last_read_at')
-            .eq('agent_id', agentId)
-            .in('thread_id', threadIds);
-
+            .in('sb_id', scopedIdentityIds)
+            .in('thread_id', visibleIds);
+          if (readErr) throw readErr;
+          // Should one slug resolve to several identities, the furthest
+          // pointer counts.
           const readStatusMap = new Map<string, string>();
           for (const rs of readStatusRows || []) {
-            readStatusMap.set(rs.thread_id, rs.last_read_at);
+            if (!rs.last_read_at) continue;
+            const prev = readStatusMap.get(rs.thread_id);
+            if (!prev || new Date(rs.last_read_at) > new Date(prev)) {
+              readStatusMap.set(rs.thread_id, rs.last_read_at);
+            }
           }
 
-          for (const t of threadRows) {
-            // Get participants
-            const { data: parts } = await (supabase as any)
-              .from('inbox_thread_participants')
-              .select('agent_id')
-              .eq('thread_id', t.id);
-            const participants = (parts || []).map((p: { agent_id: string }) => p.agent_id);
+          const { data: partRows, error: partsErr } = await supabase
+            .from('inbox_thread_participants')
+            .select('thread_id, sb_id, user_id')
+            .in('thread_id', visibleIds)
+            .order('principal_key', { ascending: true });
+          if (partsErr) throw partsErr;
+          const participantSbIds = [
+            ...new Set((partRows || []).flatMap((p) => (p.sb_id ? [p.sb_id] : []))),
+          ];
+          const slugBySbId = new Map(
+            (await resolveSbsByIds(supabase, participantSbIds)).map((sb) => [sb.sbId, sb.agentId])
+          );
+          const sbSlugsByThread = new Map<string, string[]>();
+          const peopleByThread = new Map<string, string[]>();
+          for (const p of partRows || []) {
+            if (p.sb_id) {
+              const list = sbSlugsByThread.get(p.thread_id) ?? [];
+              list.push(slugBySbId.get(p.sb_id) ?? p.sb_id);
+              sbSlugsByThread.set(p.thread_id, list);
+            } else if (p.user_id) {
+              const list = peopleByThread.get(p.thread_id) ?? [];
+              list.push(p.user_id);
+              peopleByThread.set(p.thread_id, list);
+            }
+          }
 
-            // Get messages
-            let msgQuery = (supabase as any)
+          // Messages per thread (capped as before), then one name lookup
+          // for every person who wrote or is on any of them.
+          const messagesByThread = new Map<string, ThreadMessageRow[]>();
+          for (const t of threadRows) {
+            let msgQuery = supabase
               .from('inbox_thread_messages')
               .select('*')
               .eq('thread_id', t.id)
               .order('created_at', { ascending: true })
               .limit(200);
-
-            if (status !== 'all') {
-              // Thread messages don't have a status field — filter by read status instead
-              // For 'unread' filter, only include messages after last_read_at
+            if (messageType) msgQuery = msgQuery.eq('message_type', messageType);
+            const { data: msgRows, error: msgErr } = await msgQuery;
+            if (msgErr) throw msgErr;
+            messagesByThread.set(t.id, (msgRows || []) as ThreadMessageRow[]);
+          }
+          const personNames = await resolvePersonNames(supabase, [
+            ...[...peopleByThread.values()].flat(),
+            ...[...messagesByThread.values()]
+              .flat()
+              .flatMap((m) => (m.sender_user_id ? [m.sender_user_id] : [])),
+          ]);
+          const viewerUserId = authReq.pcpUserId;
+          const nameOf = (m: ThreadMessageRow): string => {
+            if (m.sender_kind === 'user' && m.sender_user_id) {
+              return describePeople([m.sender_user_id], personNames, viewerUserId)[0].name;
             }
-            if (messageType) {
-              msgQuery = msgQuery.eq('message_type', messageType);
-            }
+            if (m.sender_kind === 'sb') return m.sender_agent_id ?? 'an SB';
+            return 'system';
+          };
 
-            const { data: msgRows } = await msgQuery;
-            const threadMsgs: MappedMessage[] = (msgRows || []).map((m: Record<string, any>) => ({
+          for (const t of threadRows) {
+            const participants = sbSlugsByThread.get(t.id) ?? [];
+            const people = describePeople(
+              peopleByThread.get(t.id) ?? [],
+              personNames,
+              viewerUserId
+            );
+            const threadMsgs: MappedMessage[] = (messagesByThread.get(t.id) ?? []).map((m) => ({
               id: m.id,
               subject: null,
               content: m.content,
               messageType: m.message_type,
               priority: m.priority,
               status: 'unread', // computed below
-              senderAgentId: m.sender_agent_id,
-              senderSbId: null,
-              senderIdentityId: null,
+              // The author is a principal (spec §3): the SB's slug for
+              // display, else the kind; named for this viewer alongside.
+              senderKind: m.sender_kind,
+              senderAgentId: m.sender_agent_id ?? m.sender_kind,
+              senderSbId: m.sender_sb_id,
+              senderIdentityId: m.sender_sb_id,
+              senderName: nameOf(m),
+              isOwn:
+                m.sender_kind === 'user' && !!m.sender_user_id && m.sender_user_id === viewerUserId,
               recipientAgentId: agentId, // thread messages don't have a single recipient
               recipientSbId: null,
               recipientIdentityId: null,
               threadKey: t.thread_key,
               recipientSessionId: null,
               relatedArtifactUri: null,
-              metadata: m.metadata as Record<string, unknown> | null,
-              createdAt: m.created_at,
+              metadata: (m.metadata as Record<string, unknown> | null) ?? null,
+              createdAt: m.created_at ?? '',
               readAt: null,
               acknowledgedAt: null,
               expiresAt: null,
@@ -4465,6 +4526,7 @@ router.get('/individuals/:agentId/inbox', async (req: Request, res: Response) =>
                 title: t.title,
                 status: t.status,
                 participants,
+                people,
                 messageCount: threadMsgs.length,
                 unreadCount: unread,
                 lastMessage: threadMsgs[threadMsgs.length - 1],
@@ -4477,8 +4539,21 @@ router.get('/individuals/:agentId/inbox', async (req: Request, res: Response) =>
         }
       }
     } catch (err) {
-      // Thread tables may not exist yet — graceful fallback
-      logger.debug('Failed to fetch group threads (tables may not exist)', { err });
+      // Checked reads above: a failure here means the page is missing its
+      // group threads. That is said in the log and in the response — never
+      // a debug line and a quietly shorter page.
+      groupThreadsUnavailable = true;
+      // PostgREST errors are plain objects, not Errors: read their message.
+      const message =
+        err instanceof Error
+          ? err.message
+          : err && typeof err === 'object' && 'message' in err
+            ? String((err as { message: unknown }).message)
+            : String(err);
+      logger.warn('[AdminInbox] Group threads unavailable for this page', {
+        agentId,
+        error: message,
+      });
     }
 
     // Sort group threads by latest message
@@ -4510,6 +4585,7 @@ router.get('/individuals/:agentId/inbox', async (req: Request, res: Response) =>
         totalUnreadCount,
         threadCount: threads.length,
         groupThreadCount: groupThreads.length,
+        groupThreadsUnavailable,
         flatCount: flatMessages.length,
       },
       threads: paginatedThreads,

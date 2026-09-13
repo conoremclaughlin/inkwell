@@ -36,6 +36,9 @@ interface InboxMessage {
   priority: string;
   status: string;
   senderAgentId: string | null;
+  /** Thread messages only: the author named for the viewer (spec inkmail-thread-scope §3). */
+  senderName?: string;
+  isOwn?: boolean;
   senderSbId: string | null;
   recipientAgentId: string;
   recipientSbId: string | null;
@@ -66,6 +69,8 @@ interface GroupThread {
   title: string | null;
   status: string;
   participants: string[];
+  /** People on the thread, named for the viewer — never in `participants`. */
+  people?: Array<{ userId: string; name: string; isOwn: boolean }>;
   messageCount: number;
   unreadCount: number;
   lastMessage: InboxMessage | null;
@@ -174,7 +179,7 @@ function MessageItem({
   inboxAgentId: string;
   onShowRouting?: (message: InboxMessage) => void;
 }) {
-  const sender = message.senderAgentId || 'unknown';
+  const sender = message.isOwn ? 'You' : message.senderName || message.senderAgentId || 'unknown';
   const isAgent = !!message.senderAgentId;
   const isSent = message.senderAgentId === inboxAgentId;
 
