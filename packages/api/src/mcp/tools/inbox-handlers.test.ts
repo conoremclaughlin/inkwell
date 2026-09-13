@@ -12,6 +12,20 @@ import {
   isThreadOwnedByStudio,
 } from './inbox-handlers';
 import { userPrincipal } from '../../services/principals';
+import { SYSTEM_PRINCIPAL } from '../../services/principals';
+
+// The caller's owner is a member of the identity's workspace — SBs act with
+// their owner's role (spec inkmail-thread-scope §1), read here as one row.
+function membershipChain() {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const self: any = {};
+  for (const method of ['select', 'eq', 'neq', 'in', 'is', 'not', 'or', 'order', 'limit']) {
+    self[method] = vi.fn().mockReturnValue(self);
+  }
+  self.maybeSingle = vi.fn().mockResolvedValue({ data: { role: 'member' }, error: null });
+  self.single = self.maybeSingle;
+  return self;
+}
 
 // Mock user-resolver
 vi.mock('../../services/user-resolver', async (importOriginal) => {
@@ -254,6 +268,7 @@ function createMockSupabase(
   };
 
   const fromFn = vi.fn().mockImplementation((table: string) => {
+    if (table === 'workspace_members') return membershipChain();
     if (table === 'agent_identities') return identityChainable;
     if (table === 'agent_inbox_read_status') return readPointerChainable;
     return chainable;
@@ -732,6 +747,8 @@ function createThreadMockSupabase(
         return messagesChain;
       case 'inbox_thread_read_status':
         return readStatusChain;
+      case 'workspace_members':
+        return membershipChain();
       case 'agent_identities':
         return identityChain;
       default:
@@ -1470,6 +1487,7 @@ describe('handleUpdateInboxMessage — thread message fallback', () => {
           }),
         };
       }
+      if (table === 'workspace_members') return membershipChain();
       if (table === 'agent_identities') {
         return createIdentityChain();
       }
@@ -1571,12 +1589,13 @@ describe('handleSendToInbox — system sender and cross-agent studio routing', (
       {
         email: 'test@test.com',
         recipientAgentId: 'wren',
-        senderAgentId: 'system',
         threadKey: 'strategy:group-1',
         content: 'Resume strategy task',
         messageType: 'session_resume',
       },
-      mockDc as never
+      mockDc as never,
+      // The server's own system send: the trusted internal context, never a slug (Lumen, #624).
+      { sender: { principal: SYSTEM_PRINCIPAL, workspaceId: null } }
     );
 
     const parsed = JSON.parse(result.content[0].text);
@@ -1612,14 +1631,15 @@ describe('handleSendToInbox — system sender and cross-agent studio routing', (
       {
         email: 'test@test.com',
         recipientAgentId: 'wren',
-        senderAgentId: 'system',
         threadKey: 'strategy:group-1',
         content: 'Kick off the strategy task',
         messageType: 'session_resume',
         trigger: true,
         metadata: { source: 'strategy_service', strategyTrigger: true, groupId: 'group-1' },
       },
-      mockDc as never
+      mockDc as never,
+      // The server's own system send: the trusted internal context, never a slug (Lumen, #624).
+      { sender: { principal: SYSTEM_PRINCIPAL, workspaceId: null } }
     );
 
     expect(JSON.parse(result.content[0].text).success).toBe(true);
@@ -1634,13 +1654,14 @@ describe('handleSendToInbox — system sender and cross-agent studio routing', (
       {
         email: 'test@test.com',
         recipientAgentId: 'wren',
-        senderAgentId: 'system',
         threadKey: 'strategy:group-1',
         content: 'plain message',
         messageType: 'notification',
         trigger: true,
       },
-      mockDc as never
+      mockDc as never,
+      // The server's own system send: the trusted internal context, never a slug (Lumen, #624).
+      { sender: { principal: SYSTEM_PRINCIPAL, workspaceId: null } }
     );
     const plainPayload = vi.mocked(mockGateway.dispatchTrigger).mock.calls[0]?.[0] as Record<
       string,
@@ -1897,13 +1918,14 @@ describe('handleSendToInbox — system sender and cross-agent studio routing', (
       {
         email: 'test@test.com',
         recipientAgentId: 'wren',
-        senderAgentId: 'system',
         threadKey: 'strategy:group-1',
         content: 'Resume strategy task',
         messageType: 'session_resume',
         recipientStudioId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
       },
-      mockDc as never
+      mockDc as never,
+      // The server's own system send: the trusted internal context, never a slug (Lumen, #624).
+      { sender: { principal: SYSTEM_PRINCIPAL, workspaceId: null } }
     );
 
     expect(mockGateway.dispatchTrigger).toHaveBeenCalledWith(
@@ -1929,13 +1951,14 @@ describe('handleSendToInbox — system sender and cross-agent studio routing', (
       {
         email: 'test@test.com',
         recipientAgentId: 'wren',
-        senderAgentId: 'system',
         threadKey: 'strategy:group-2',
         content: 'Resume strategy task',
         messageType: 'session_resume',
         recipientStudioSlug: 'wren-omega',
       },
-      mockDc as never
+      mockDc as never,
+      // The server's own system send: the trusted internal context, never a slug (Lumen, #624).
+      { sender: { principal: SYSTEM_PRINCIPAL, workspaceId: null } }
     );
 
     expect(mockGateway.dispatchTrigger).toHaveBeenCalledWith(
@@ -2268,6 +2291,7 @@ function createScopedPollMockSupabase(
   const identityChain = createIdentityChain();
 
   const fromFn = vi.fn().mockImplementation((table: string) => {
+    if (table === 'workspace_members') return membershipChain();
     if (table === 'agent_identities') return identityChain;
     return makeChain(table);
   });
@@ -2637,6 +2661,7 @@ function createRecordingSupabase(rows: Record<string, unknown[]>) {
   const from = vi.fn().mockImplementation((table: string) => {
     // Identities must FILTER (a slug resolves to exactly one row), so they
     // get the filtering chain regardless of the recording mode.
+    if (table === 'workspace_members') return membershipChain();
     if (table === 'agent_identities') {
       return createIdentityChain(
         (rows.agent_identities as Array<Record<string, unknown>> | undefined) ?? IDENTITY_ROWS

@@ -556,6 +556,10 @@ vi.mock('../../services/principals', async (importOriginal) => {
   };
 });
 vi.mock('./caller-principal', () => ({
+  assertWriteRole: (role: string, action: string) => {
+    if (role === 'viewer')
+      throw new Error(`Your role in this workspace (${role}) cannot ${action}`);
+  },
   resolveCallerSb: vi.fn(async (_c: unknown, userId: string, agentId: string) => ({
     kind: 'sb',
     sbId: `sb-${agentId}`,
@@ -676,6 +680,9 @@ function createThreadMockSupabase() {
           data: [{ id: 'identity-123' }],
           error: null,
         });
+      } else if (name === 'workspace_members') {
+        // The caller's owner is a member: SBs act with their owner's role (§1).
+        tables[name] = makeChainable({ data: { role: 'member' }, error: null });
       } else {
         tables[name] = makeChainable({ data: null, error: null });
       }
@@ -1347,11 +1354,20 @@ describe('handleCloseThread — lease/teardown wiring (v18 S2)', () => {
       const payload = JSON.parse((result.content[0] as { text: string }).text);
       expect(payload.success).toBe(true);
 
-      expect(releaseSpy).toHaveBeenCalledWith('user-1', 'pr:9', { reason: 'thread-closed' });
-      expect(teardownSpy).toHaveBeenCalledWith('user-1', 'pr:9', {
-        reason: 'thread pr:9 closed',
-        candidateStudioIds: ['eph-1'],
-      });
+      // By the thread's workspace, with the closing owner only as the legacy
+      // match for leases that carry no identity (spec §1; Lumen, #621).
+      expect(releaseSpy).toHaveBeenCalledWith(
+        { workspaceId: 'ws-1', threadKey: 'pr:9' },
+        { reason: 'thread-closed', legacyOwnerUserId: 'user-1' }
+      );
+      expect(teardownSpy).toHaveBeenCalledWith(
+        { workspaceId: 'ws-1', threadKey: 'pr:9' },
+        {
+          reason: 'thread pr:9 closed',
+          legacyOwnerUserId: 'user-1',
+          candidateStudioIds: ['eph-1'],
+        }
+      );
     } finally {
       resolveSpy.mockRestore();
       releaseSpy.mockRestore();
@@ -1488,6 +1504,7 @@ describe('handleReopenThread — explicit reopen (spec inkmail-thread-scope §2)
         user_id: 'user-1',
         workspace_id: 'ws-1',
       })),
+      workspace_members: [{ workspace_id: 'ws-1', user_id: 'user-1', role: 'member' }],
     };
     const supabase = makeFakeSupabase(tables);
     const dataComposer = { getClient: () => supabase, repositories: {} } as never;
@@ -1681,5 +1698,36 @@ describe('dispatchTriggers names the target by identity (spec inkmail-thread-sco
     expect(mockGateway.dispatchTrigger).toHaveBeenCalledWith(
       expect.objectContaining({ toAgentId: 'aster', toSbId: 'sb-aster', threadId: 't1' })
     );
+  });
+});
+
+describe("write tools refuse a viewer's SB (spec §1; Lumen, #621 P1)", () => {
+  it('close_thread and reopen_thread stop at the role, before touching the thread', async () => {
+    const callerPrincipal = await import('./caller-principal');
+    const userResolver = await import('../../services/user-resolver');
+    const { handleCloseThread, handleReopenThread } = await import('./thread-handlers');
+    const viewer = {
+      kind: 'sb' as const,
+      sbId: 'sb-wren',
+      agentId: 'wren',
+      userId: 'user-1',
+      workspaceId: 'ws-1',
+      ownerRole: 'viewer' as const,
+    };
+    vi.spyOn(userResolver, 'resolveUserOrThrow').mockResolvedValue({
+      user: { id: 'user-1' },
+    } as never);
+    vi.mocked(callerPrincipal.resolveCallerSb).mockResolvedValue(viewer);
+    const from = vi.fn();
+    const dataComposer = { getClient: () => ({ from }), repositories: {} } as never;
+    await expect(
+      handleCloseThread({ threadKey: 'pr:9', agentId: 'wren' }, dataComposer)
+    ).rejects.toThrow('cannot close a thread');
+    await expect(
+      handleReopenThread({ threadKey: 'pr:9', agentId: 'wren' }, dataComposer)
+    ).rejects.toThrow('cannot reopen a thread');
+    // Refused before any thread read.
+    expect(from).not.toHaveBeenCalled();
+    vi.restoreAllMocks();
   });
 });

@@ -34,6 +34,10 @@ function composer() {
       { id: 'ws-b', user_id: 'user-a', type: 'team', slug: 'team', archived_at: null },
     ],
     agent_identities: [{ id: 'sb-b', agent_id: 'wren', user_id: 'user-a', workspace_id: 'ws-b' }],
+    workspace_members: [
+      { workspace_id: 'ws-a', user_id: 'user-a', role: 'owner' },
+      { workspace_id: 'ws-b', user_id: 'user-a', role: 'member' },
+    ],
     thread_key_types: [
       { type: 'pr', workspace_id: null },
       { type: 'ticket', workspace_id: 'ws-b' },

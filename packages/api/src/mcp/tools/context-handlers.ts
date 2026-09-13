@@ -2,7 +2,7 @@ import { z } from 'zod';
 import type { DataComposer } from '../../data/composer';
 import { logger } from '../../utils/logger';
 import { userIdentifierBaseSchema, resolveUserOrThrow } from '../../services/user-resolver';
-import { resolveCallerWorkspace } from './caller-principal';
+import { assertWriteRole, resolveCallerWorkspace } from './caller-principal';
 
 // =====================================================
 // PROJECT TOOLS
@@ -46,7 +46,8 @@ export async function handleSaveProject(args: unknown, dataComposer: DataCompose
   // A project lives in a workspace (spec inkmail-thread-scope §1b): the
   // caller's SB workspace when an SB is calling, else the person's personal
   // workspace. Server-resolved, never a caller-claimed value.
-  const { workspaceId } = await resolveCallerWorkspace(dataComposer.getClient(), user.id);
+  const { workspaceId, role } = await resolveCallerWorkspace(dataComposer.getClient(), user.id);
+  assertWriteRole(role, 'save a project');
 
   // Reserved-name rule (thread-key-grammar v2): a project slug must not
   // collide with a registered thread-key TYPE — template or this

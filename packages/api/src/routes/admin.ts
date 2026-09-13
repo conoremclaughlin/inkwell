@@ -26,6 +26,7 @@ import {
 } from '../mcp/tools/thread-handlers';
 import { resolveSbsByIds, userPrincipal } from '../services/principals';
 import { describePeople, resolvePersonNames } from '../services/person-display';
+import { carrierScopeFilter, workspaceSbIds } from '../services/carrier-scope';
 import { FixedWindowLimiter } from '../utils/fixed-window-limiter';
 import { notifyPlatformOfApprovalRequest } from '../channels/approval-interceptor';
 
@@ -7242,6 +7243,10 @@ router.get('/threads', async (req: Request, res: Response) => {
     const SESSIONS_CAP = 500;
     const GROUPS_CAP = 500;
 
+    // Carriers by the workspace's identities, not the viewer's user id: a
+    // same-key session from another workspace is another conversation.
+    const carrierScope = carrierScopeFilter(await workspaceSbIds(supabase, workspaceId), userId);
+
     const [threadsRes, sessionsRes, studiosRes, groupsRes] = await Promise.all([
       supabase
         .from('inbox_threads')
@@ -7258,21 +7263,21 @@ router.get('/threads', async (req: Request, res: Response) => {
           'id, agent_id, lifecycle, status, current_phase, thread_key, active_thread_key, updated_at, studio_id',
           { count: 'exact' }
         )
-        .eq('user_id', userId)
+        .or(carrierScope)
         .or('thread_key.not.is.null,active_thread_key.not.is.null')
         .order('updated_at', { ascending: false })
         .limit(SESSIONS_CAP),
       supabase
         .from('studios')
         .select('id, slug, branch, agent_id, thread_key, lease, updated_at')
-        .eq('user_id', userId)
+        .or(carrierScope)
         .neq('status', 'cleaned'),
       supabase
         .from('task_groups')
         .select('id, title, status, thread_key, execution_model, execution_phase, updated_at', {
           count: 'exact',
         })
-        .eq('user_id', userId)
+        .or(carrierScope)
         .not('thread_key', 'is', null)
         .order('updated_at', { ascending: false })
         .limit(GROUPS_CAP),
@@ -7482,6 +7487,7 @@ router.get('/threads', async (req: Request, res: Response) => {
 async function loadThreadStudioHistory(
   supabase: SupabaseClient<Database>,
   userId: string,
+  workspaceId: string,
   threadKey: string
 ): Promise<
   Array<{
@@ -7502,7 +7508,10 @@ async function loadThreadStudioHistory(
   const { data: leaseEvents, error: leaseEventsError } = await supabase
     .from('studio_lease_events')
     .select('studio_id, agent_id, event, created_at')
-    .eq('user_id', userId)
+    // The thread's workspace, through each event's identity — not the
+    // viewer's user id, which showed a same-owner namesake's history from
+    // elsewhere and hid another owner's on this thread (Lumen, #624).
+    .or(carrierScopeFilter(await workspaceSbIds(supabase, workspaceId), userId))
     .eq('thread_key', threadKey)
     .in('event', ['acquired', 'released', 'expired', 'reclaimed'])
     .order('created_at', { ascending: false })
@@ -7588,6 +7597,7 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
     const studioHistory = await loadThreadStudioHistory(
       supabase as SupabaseClient<Database>,
       authReq.pcpUserId,
+      authReq.pcpWorkspaceId,
       key
     );
 
@@ -8057,6 +8067,14 @@ router.get('/threads/graph-evidence', async (req: Request, res: Response) => {
     // current run survives the cap; reversed below for oldest-first
     // display within the window.
     const GROUPS_CAP = 10;
+    // Evidence follows the thread's workspace (spec inkmail-thread-scope §1):
+    // groups by the workspace's identities, their tasks and gate events by
+    // the groups — not by the viewer's user id, which hid another owner's
+    // graph on this thread and showed a namesake from elsewhere.
+    const evidenceScope = carrierScopeFilter(
+      await workspaceSbIds(supabase, authReq.pcpWorkspaceId),
+      userId
+    );
     const {
       data: cappedGroupRows,
       error: groupsError,
@@ -8066,7 +8084,7 @@ router.get('/threads/graph-evidence', async (req: Request, res: Response) => {
       .select('id, title, status, execution_model, execution_phase, created_at', {
         count: 'exact',
       })
-      .eq('user_id', userId)
+      .or(evidenceScope)
       .eq('thread_key', key)
       .eq('execution_model', 'graph')
       .order('created_at', { ascending: false })
@@ -8091,7 +8109,6 @@ router.get('/threads/graph-evidence', async (req: Request, res: Response) => {
       .select(
         'id, task_group_id, title, node_slug, task_type, status, outcome, gate_state, gate_attempt, assignee_identity_id, assignee_user_id, created_at'
       )
-      .eq('user_id', userId)
       .in('task_group_id', groupIds)
       .order('created_at', { ascending: true });
     if (tasksError) {
@@ -8128,7 +8145,6 @@ router.get('/threads/graph-evidence', async (req: Request, res: Response) => {
           'task_id, event, attempt, gate_version, session_id, actor_identity_id, actor_user_id, evidence, reason, created_at',
           { count: 'exact' }
         )
-        .eq('user_id', userId)
         .in(
           'task_id',
           nodes.map((node) => node.id)

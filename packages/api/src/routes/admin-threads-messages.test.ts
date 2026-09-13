@@ -23,17 +23,34 @@ const tables = vi.hoisted(() => ({
   thread: null as Record<string, unknown> | null,
   messages: [] as Array<Record<string, unknown>>,
   users: [] as Array<Record<string, unknown>>,
+  identities: [] as Array<Record<string, unknown>>,
+  /** Every filter applied, per table: [table, method, column-or-expression]. */
+  filters: [] as Array<[string, string, string]>,
 }));
 
 // A chain that answers by table: rows from the fixtures above, empty
 // elsewhere (studio history, identities), so the route runs end to end.
 function chainFor(table: string) {
   const rows =
-    table === 'inbox_thread_messages' ? tables.messages : table === 'users' ? tables.users : [];
+    table === 'inbox_thread_messages'
+      ? tables.messages
+      : table === 'users'
+        ? tables.users
+        : table === 'agent_identities'
+          ? tables.identities
+          : [];
   let filteredIds: unknown[] | null = null;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const q: any = {};
-  for (const m of ['select', 'eq', 'order', 'limit', 'is', 'not']) q[m] = () => q;
+  for (const m of ['select', 'order', 'limit', 'is', 'not']) q[m] = () => q;
+  q.eq = (col: string) => {
+    tables.filters.push([table, 'eq', col]);
+    return q;
+  };
+  q.or = (expr: string) => {
+    tables.filters.push([table, 'or', expr]);
+    return q;
+  };
   q.in = (_col: string, ids: unknown[]) => {
     filteredIds = ids;
     return q;
@@ -138,6 +155,11 @@ async function readAs(viewerUserId: string) {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  tables.filters = [];
+  tables.identities = [
+    { id: 'sb-1', agent_id: 'wren', user_id: 'user-a', workspace_id: 'ws-1' },
+    { id: 'sb-2', agent_id: 'lumen', user_id: 'user-b', workspace_id: 'ws-1' },
+  ];
   tables.thread = {
     id: 'thread-1',
     thread_key: 'pr:620',
@@ -242,5 +264,16 @@ describe('GET /threads/messages names every author for the viewer', () => {
     await readAs('user-a');
     const userQueries = mockSupabaseFrom.mock.calls.filter(([t]) => t === 'users');
     expect(userQueries).toHaveLength(1);
+  });
+
+  it("the studio history is the workspace's, through its identities — never the viewer's user id (#624)", async () => {
+    await readAs('user-a');
+    const history = tables.filters.filter(([t]) => t === 'studio_lease_events');
+    expect(history).toContainEqual([
+      'studio_lease_events',
+      'or',
+      'sb_id.in.(sb-1,sb-2),and(sb_id.is.null,user_id.eq.user-a)',
+    ]);
+    expect(history.filter(([, m, c]) => m === 'eq' && c === 'user_id')).toEqual([]);
   });
 });

@@ -104,6 +104,7 @@ function setup() {
       { id: SB, user_id: USER, agent_id: 'lumen', workspace_id: 'ws' },
       { id: 'other-sb', user_id: USER, agent_id: 'wren', workspace_id: 'ws' },
     ],
+    workspace_members: [{ workspace_id: 'ws', user_id: USER, role: 'member' }],
     inbox_threads: [
       {
         id: 'thread',

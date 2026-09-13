@@ -10,6 +10,7 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { Database, Json } from '../supabase/types';
 import { resolveIdentityId } from '../../auth/resolve-identity';
+import { resolveSbsByIds } from '../../services/principals';
 
 type StudiosTable = Database['public']['Tables']['studios'];
 
@@ -105,6 +106,19 @@ export function deriveStudioSlug(worktreePath: string): string | null {
   const idx = folder.indexOf('--');
   if (idx === -1) return null;
   return folder.slice(idx + 2) || null;
+}
+
+/**
+ * The identity a studio acts under: its LIVE lease's, else the row's. The
+ * lease is canonical — a studio created for one workspace can be leased by
+ * an identity in another, and the lease is what release keys on, so
+ * selection for teardown must not override it with the row or the owner
+ * (Lumen, #624).
+ */
+export function studioIdentityId(studio: Pick<Studio, 'sbId' | 'lease'>): string | null {
+  const lease = studio.lease as { sbId?: unknown } | null | undefined;
+  if (lease && typeof lease.sbId === 'string' && lease.sbId) return lease.sbId;
+  return studio.sbId ?? null;
 }
 
 export class StudiosRepository {
@@ -315,11 +329,15 @@ export class StudiosRepository {
   }
 
   /** Ephemeral studios created for a thread's overflow. Indexed on (user_id, thread_key). */
-  async listEphemeralByThread(userId: string, threadKey: string): Promise<Studio[]> {
+  /**
+   * Open ephemerals created for a thread key, every owner. The caller
+   * narrows them to one workspace with `inWorkspace` — a key repeats across
+   * workspaces on purpose (spec inkmail-thread-scope §1).
+   */
+  async listEphemeralByThread(threadKey: string): Promise<Studio[]> {
     const { data, error } = await this.client
       .from('studios')
       .select('*')
-      .eq('user_id', userId)
       .eq('ephemeral', true)
       .eq('thread_key', threadKey)
       .in('status', ['active', 'idle']);
@@ -329,6 +347,31 @@ export class StudiosRepository {
     }
 
     return (data || []).map((row) => this.mapRow(row as Record<string, unknown>));
+  }
+
+  /**
+   * The studios among these that belong to one workspace, attributed through
+   * each studio's identity. A legacy studio with no identity belongs to the
+   * workspace only if it is the given owner's — the pre-cutover rule, kept
+   * for rows the cutover could not attribute.
+   */
+  async inWorkspace(
+    studios: Studio[],
+    workspaceId: string,
+    legacyOwnerUserId?: string
+  ): Promise<Studio[]> {
+    const identityIds = [
+      ...new Set(studios.map((s) => studioIdentityId(s)).filter(Boolean)),
+    ] as string[];
+    const workspaceBySbId = new Map(
+      (await resolveSbsByIds(this.client, identityIds)).map((sb) => [sb.sbId, sb.workspaceId])
+    );
+    return studios.filter((s) => {
+      const identityId = studioIdentityId(s);
+      return identityId
+        ? workspaceBySbId.get(identityId) === workspaceId
+        : !!legacyOwnerUserId && s.userId === legacyOwnerUserId;
+    });
   }
 
   /** Ephemeral studios past their expires_at, still open. Sweep candidates. */

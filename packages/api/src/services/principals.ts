@@ -224,6 +224,38 @@ export async function personalWorkspaceOf(client: Client, userId: string): Promi
   return data.id as string;
 }
 
+/**
+ * The one workspace-scoped identity a user owns under a slug — read from
+ * the table alone, never from the request's bound identity. The server's
+ * own sends resolve their recipient this way: inside an ambient SB request
+ * the pin would otherwise be consulted and refuse a recipient that is not
+ * the caller (Lumen, #624).
+ */
+export async function resolveSbOwnedBy(
+  client: Client,
+  userId: string,
+  agentId: string
+): Promise<SbPrincipal> {
+  const { data, error } = await client
+    .from('agent_identities')
+    .select('id, agent_id, user_id, workspace_id')
+    .eq('user_id', userId)
+    .eq('agent_id', agentId)
+    .not('workspace_id', 'is', null);
+  if (error) {
+    throw new Error(`Failed to resolve ${agentId} for its owner: ${error.message}`);
+  }
+  const rows = (data || []) as IdentityRow[];
+  if (rows.length !== 1) {
+    throw new Error(
+      rows.length === 0
+        ? `Unknown recipient: ${agentId} (no identity owned by this user)`
+        : `Ambiguous recipient: ${agentId} exists in ${rows.length} of this user's workspaces`
+    );
+  }
+  return toSb(rows[0]);
+}
+
 /** Is this user a member of the workspace (any role)? */
 export async function isWorkspaceMember(
   client: Client,

@@ -961,7 +961,12 @@ export class StudioOverflowService {
    */
   async teardownEphemeralStudio(
     studio: Studio,
-    opts: { reason: string; expectedThreadKey?: string }
+    opts: {
+      reason: string;
+      expectedThreadKey?: string;
+      /** The closing thread's workspace: the claim refuses a lease canonically elsewhere. */
+      expectedWorkspaceId?: string;
+    }
   ): Promise<void> {
     if (!studio.ephemeral) {
       logger.warn('[StudioOverflow] Refusing to tear down non-ephemeral studio', {
@@ -974,6 +979,7 @@ export class StudioOverflowService {
     // another worker's active claim aborts.
     const claim = await this.leases.claimForTeardown(studio.id, studio.userId, {
       expectedThreadKey: opts.expectedThreadKey,
+      expectedWorkspaceId: opts.expectedWorkspaceId,
       reason: `teardown-claim (${opts.reason})`,
     });
     if (!claim) {
@@ -1129,10 +1135,11 @@ export class StudioOverflowService {
    * studio a different thread has since acquired is skipped, not destroyed.
    */
   async teardownEphemeralStudiosForThread(
-    userId: string,
-    threadKey: string,
+    thread: { workspaceId: string; threadKey: string },
     opts: {
       reason: string;
+      /** Owner of a legacy studio with no identity — the pre-cutover match. */
+      legacyOwnerUserId?: string;
       /**
        * Studios whose lease this thread actually rode, from releaseByThread
        * (v18 S2, Lumen r1 P1-2). `studios.thread_key` is the CREATED-FOR
@@ -1144,19 +1151,28 @@ export class StudioOverflowService {
       candidateStudioIds?: string[];
     }
   ): Promise<number> {
+    const { threadKey } = thread;
     const byThread = await this.studios
-      .listEphemeralByThread(userId, threadKey)
+      .listEphemeralByThread(threadKey)
       .catch(() => [] as Studio[]);
     const seen = new Set(byThread.map((s) => s.id));
-    const studios = [...byThread];
+    const candidates = [...byThread];
     for (const id of opts.candidateStudioIds ?? []) {
       if (seen.has(id)) continue;
       seen.add(id);
       const studio = await this.studios.findById(id).catch(() => null);
-      // Ownership boundary: a candidate id never widens scope past this
-      // user's own ephemerals.
-      if (studio && studio.ephemeral && studio.userId === userId) studios.push(studio);
+      if (studio && studio.ephemeral) candidates.push(studio);
     }
+    // Scope boundary: the thread's WORKSPACE, through each studio's identity
+    // (spec inkmail-thread-scope §1) — every owner's ephemeral riding this
+    // thread, never a same-key ephemeral of the same owner elsewhere. It was
+    // the closing owner's own ephemerals, which missed the first and took
+    // the second (Lumen, #621 P1).
+    const studios = await this.studios.inWorkspace(
+      candidates,
+      thread.workspaceId,
+      opts.legacyOwnerUserId
+    );
     let closed = 0;
     for (const studio of studios) {
       // The minimal close invariant (v18 S2): `studios.thread_key` selected
@@ -1180,6 +1196,7 @@ export class StudioOverflowService {
       await this.teardownEphemeralStudio(studio, {
         reason: opts.reason,
         expectedThreadKey: threadKey,
+        expectedWorkspaceId: thread.workspaceId,
       });
       closed += 1;
     }

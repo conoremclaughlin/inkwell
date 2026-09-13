@@ -9,13 +9,19 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { makeFakeSupabase } from '../../services/sessions/fake-supabase.js';
 import * as requestContext from '../../utils/request-context';
-import { resolveCallerSb, resolveCallerWorkspace } from './caller-principal';
+import { assertWriteRole, resolveCallerSb, resolveCallerWorkspace } from './caller-principal';
 
 const identities = () => [
   { id: 'sb-wren-1', agent_id: 'wren', user_id: 'user-1', workspace_id: 'ws-1' },
   { id: 'sb-wren-2', agent_id: 'wren', user_id: 'user-1', workspace_id: 'ws-2' },
   { id: 'sb-lumen-1', agent_id: 'lumen', user_id: 'user-1', workspace_id: 'ws-1' },
   { id: 'sb-legacy', agent_id: 'myra', user_id: 'user-1', workspace_id: null },
+];
+// The owner's membership in each workspace: what their SBs may do there (§1).
+const members = () => [
+  { workspace_id: 'ws-1', user_id: 'user-1', role: 'member' },
+  { workspace_id: 'ws-2', user_id: 'user-1', role: 'viewer' },
+  { workspace_id: 'ws-personal', user_id: 'user-1', role: 'owner' },
 ];
 
 afterEach(() => {
@@ -28,7 +34,10 @@ describe('resolveCallerSb', () => {
       sbId: 'sb-wren-2',
       timestamp: 0,
     } as never);
-    const client = makeFakeSupabase({ agent_identities: identities() });
+    const client = makeFakeSupabase({
+      agent_identities: identities(),
+      workspace_members: members(),
+    });
     expect((await resolveCallerSb(client as never, 'user-1', 'wren')).workspaceId).toBe('ws-2');
   });
 
@@ -37,7 +46,10 @@ describe('resolveCallerSb', () => {
       sbId: 'sb-lumen-1',
       timestamp: 0,
     } as never);
-    const client = makeFakeSupabase({ agent_identities: identities() });
+    const client = makeFakeSupabase({
+      agent_identities: identities(),
+      workspace_members: members(),
+    });
     await expect(resolveCallerSb(client as never, 'user-1', 'wren')).rejects.toThrow(
       'Agent identity mismatch: token is lumen, call names wren'
     );
@@ -46,14 +58,20 @@ describe('resolveCallerSb', () => {
   it("falls back to the user's single workspace-scoped identity for the slug", async () => {
     vi.spyOn(requestContext, 'getRequestContext').mockReturnValue(undefined);
     vi.spyOn(requestContext, 'getSessionContext').mockReturnValue(undefined);
-    const client = makeFakeSupabase({ agent_identities: identities() });
+    const client = makeFakeSupabase({
+      agent_identities: identities(),
+      workspace_members: members(),
+    });
     expect((await resolveCallerSb(client as never, 'user-1', 'lumen')).sbId).toBe('sb-lumen-1');
   });
 
   it("fails closed when the slug lives in two of the user's workspaces and nothing is bound", async () => {
     vi.spyOn(requestContext, 'getRequestContext').mockReturnValue(undefined);
     vi.spyOn(requestContext, 'getSessionContext').mockReturnValue(undefined);
-    const client = makeFakeSupabase({ agent_identities: identities() });
+    const client = makeFakeSupabase({
+      agent_identities: identities(),
+      workspace_members: members(),
+    });
     await expect(resolveCallerSb(client as never, 'user-1', 'wren')).rejects.toThrow(
       'exists in 2 of your workspaces'
     );
@@ -62,7 +80,10 @@ describe('resolveCallerSb', () => {
   it('fails closed on an unknown slug, and on a legacy identity with no workspace', async () => {
     vi.spyOn(requestContext, 'getRequestContext').mockReturnValue(undefined);
     vi.spyOn(requestContext, 'getSessionContext').mockReturnValue(undefined);
-    const client = makeFakeSupabase({ agent_identities: identities() });
+    const client = makeFakeSupabase({
+      agent_identities: identities(),
+      workspace_members: members(),
+    });
     await expect(resolveCallerSb(client as never, 'user-1', 'nobody')).rejects.toThrow(
       'Unknown agent for user: nobody'
     );
@@ -78,6 +99,7 @@ describe('resolveCallerWorkspace', () => {
     vi.spyOn(requestContext, 'getSessionContext').mockReturnValue(undefined);
     const client = makeFakeSupabase({
       agent_identities: identities(),
+      workspace_members: members(),
       workspaces: [
         {
           id: 'ws-personal',
@@ -96,5 +118,92 @@ describe('resolveCallerWorkspace', () => {
     );
     ctx.mockReturnValue({ sbId: 'sb-wren-2', timestamp: 0 } as never);
     expect((await resolveCallerWorkspace(client as never, 'user-1')).workspaceId).toBe('ws-2');
+  });
+});
+
+describe("an SB acts with its OWNER's membership (spec §1; Lumen, #621 P1)", () => {
+  it("carries the owner's role in the identity's workspace on both resolution paths", async () => {
+    const bound = vi.spyOn(requestContext, 'getRequestContext').mockReturnValue({
+      sbId: 'sb-wren-2',
+      timestamp: 0,
+    } as never);
+    vi.spyOn(requestContext, 'getSessionContext').mockReturnValue(undefined);
+    const client = makeFakeSupabase({
+      agent_identities: identities(),
+      workspace_members: members(),
+    });
+    expect((await resolveCallerSb(client as never, 'user-1', 'wren')).ownerRole).toBe('viewer');
+    bound.mockReturnValue(undefined);
+    expect((await resolveCallerSb(client as never, 'user-1', 'lumen')).ownerRole).toBe('member');
+  });
+
+  it('an identity whose owner is no longer a member acts on nothing — read or write', async () => {
+    vi.spyOn(requestContext, 'getRequestContext').mockReturnValue(undefined);
+    vi.spyOn(requestContext, 'getSessionContext').mockReturnValue(undefined);
+    const revoked = members().filter((m) => m.workspace_id !== 'ws-1');
+    const client = makeFakeSupabase({ agent_identities: identities(), workspace_members: revoked });
+    await expect(resolveCallerSb(client as never, 'user-1', 'lumen')).rejects.toThrow(
+      "lumen's owner cannot act in this workspace: not a member"
+    );
+  });
+
+  it('a membership read that fails closes the door', async () => {
+    vi.spyOn(requestContext, 'getRequestContext').mockReturnValue(undefined);
+    vi.spyOn(requestContext, 'getSessionContext').mockReturnValue(undefined);
+    const client = makeFakeSupabase({
+      agent_identities: identities(),
+      workspace_members: members(),
+    });
+    const from = client.from.bind(client);
+    client.from = ((table: string) => {
+      const q = from(table);
+      if (table === 'workspace_members') {
+        const select = q.select.bind(q);
+        return {
+          ...q,
+          select: () => {
+            const chain = select();
+            chain.maybeSingle = (() =>
+              Promise.resolve({ data: null, error: { message: 'members unavailable' } })) as never;
+            return chain;
+          },
+        };
+      }
+      return q;
+    }) as never;
+    await expect(resolveCallerSb(client as never, 'user-1', 'lumen')).rejects.toThrow(
+      'Failed to check workspace membership'
+    );
+  });
+
+  it("resolveCallerWorkspace reports the role too — the SB's owner's, or the person's own", async () => {
+    const ctx = vi.spyOn(requestContext, 'getRequestContext').mockReturnValue(undefined);
+    vi.spyOn(requestContext, 'getSessionContext').mockReturnValue(undefined);
+    const client = makeFakeSupabase({
+      agent_identities: identities(),
+      workspace_members: members(),
+      workspaces: [
+        {
+          id: 'ws-personal',
+          user_id: 'user-1',
+          type: 'personal',
+          slug: 'personal',
+          archived_at: null,
+        },
+      ],
+    });
+    expect((await resolveCallerWorkspace(client as never, 'user-1', 'lumen')).role).toBe('member');
+    expect((await resolveCallerWorkspace(client as never, 'user-1')).role).toBe('owner');
+    ctx.mockReturnValue({ sbId: 'sb-wren-2', timestamp: 0 } as never);
+    expect((await resolveCallerWorkspace(client as never, 'user-1')).role).toBe('viewer');
+  });
+
+  it('assertWriteRole refuses a viewer and names the action; every other role writes', () => {
+    expect(() => assertWriteRole('viewer', 'close a thread')).toThrow(
+      'Your role in this workspace (viewer) cannot close a thread'
+    );
+    for (const role of ['owner', 'admin', 'member'] as const) {
+      expect(() => assertWriteRole(role, 'close a thread')).not.toThrow();
+    }
   });
 });

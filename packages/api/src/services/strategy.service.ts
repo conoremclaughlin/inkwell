@@ -31,6 +31,7 @@ import { logger } from '../utils/logger';
 import { ephemeralWorktreePath } from './studio-paths';
 import { ensureStudioSettings } from './studio-settings';
 import type { SandboxOrchestrator, SandboxSpinUpResult } from './sandbox/orchestrator';
+import { SYSTEM_PRINCIPAL } from './principals';
 
 const execFileAsync = promisify(execFile);
 
@@ -1019,15 +1020,16 @@ export class StrategyService {
     try {
       const threadKey = group.thread_key || `strategy:${group.id}`;
       // The owner's slug names an SB principal; with no owner the notice is
-      // the system's (spec inkmail-thread-scope §3) — a made-up slug would
-      // now fail to resolve to an identity and refuse the send.
-      const senderSlug = (await this.resolveOwnerSlug(group)) || 'system';
+      // the system's (spec inkmail-thread-scope §3) — authored through the
+      // trusted internal context, which is the only way a message is the
+      // system's: a tool call naming 'system' is refused (Lumen, #624).
+      const ownerSlug = await this.resolveOwnerSlug(group);
 
       await handleSendToInbox(
         {
           userId,
           recipientAgentId: notifyAgentId,
-          senderAgentId: senderSlug,
+          ...(ownerSlug ? { senderAgentId: ownerSlug } : {}),
           recipientStudioSlug: 'main',
           content: message,
           messageType: 'notification',
@@ -1042,7 +1044,12 @@ export class StrategyService {
             source: 'strategy_service',
           },
         },
-        this.dataComposer
+        this.dataComposer,
+        // Only the ownerless notice carries the internal system context; an
+        // owner's notice is that SB's own send, with no third argument.
+        ...(ownerSlug
+          ? []
+          : [{ sender: { principal: SYSTEM_PRINCIPAL, workspaceId: null } } as const])
       );
 
       logger.info(`Strategy notification sent to ${notifyAgentId} for group ${group.id}`);
