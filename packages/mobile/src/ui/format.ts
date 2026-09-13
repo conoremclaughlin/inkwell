@@ -36,19 +36,25 @@ export function messageTime(iso: string, nowMs: number = Date.now()): string {
 }
 
 /**
- * Display name for a message sender. Since the thread-scope cutover a
- * message names its author by kind (spec inkmail-thread-scope §3): an SB by
- * identity with its slug for display, a person by user id, or the system
- * with neither. The kind is authoritative; the old `metadata.sentBy` hint
- * is no longer consulted.
+ * Display name for a message sender, and whether it is the viewer's own.
+ * The server names every author (spec inkmail-thread-scope §3) and says
+ * which person is the viewer — `isOwn` is compared there against the PCP
+ * user, which is not the id this app holds from its auth provider. Only an
+ * own message reads "You" and sits on the right; another person's message
+ * carries their name and sits with the agents'.
  */
 export function senderName(message: {
   senderKind?: 'sb' | 'user' | 'system' | string | null;
   senderAgentId?: string | null;
-}): { name: string; isUser: boolean } {
-  if (message.senderKind === 'user') return { name: 'You', isUser: true };
-  if (message.senderKind === 'system') return { name: 'system', isUser: false };
-  return { name: message.senderAgentId ?? 'system', isUser: false };
+  senderName?: string | null;
+  isOwn?: boolean | null;
+}): { name: string; isOwn: boolean } {
+  if (message.isOwn) return { name: 'You', isOwn: true };
+  if (message.senderName) return { name: message.senderName, isOwn: false };
+  // Older payloads name nobody: fall back to what the kind says.
+  if (message.senderKind === 'user') return { name: 'a workspace member', isOwn: false };
+  if (message.senderKind === 'system') return { name: 'system', isOwn: false };
+  return { name: message.senderAgentId ?? 'system', isOwn: false };
 }
 
 /** "runtime:idle" → "idle"; "active:implementing" → "implementing". */

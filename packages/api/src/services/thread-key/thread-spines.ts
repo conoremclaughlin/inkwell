@@ -29,6 +29,14 @@ export interface SpineThreadRow {
   updatedAt: string;
   closedAt: string | null;
   participants: string[];
+  /** People on the thread, named for the viewer — never woken, never in `participants`. */
+  people?: SpinePerson[];
+}
+
+export interface SpinePerson {
+  userId: string;
+  name: string;
+  isOwn: boolean;
 }
 
 export interface SpineSessionRow {
@@ -86,6 +94,7 @@ export interface ThreadSpine {
     status: string;
     createdByAgentId: string;
     participants: string[];
+    people: SpinePerson[];
     closedAt: string | null;
   } | null;
   sessions: Array<{
@@ -297,6 +306,9 @@ export function mergeThreadSpines(input: MergeThreadSpinesInput): ThreadSpine[] 
       status: t.status,
       createdByAgentId: t.createdByAgentId,
       participants: t.participants,
+      // Carried through, not merged into `participants`: a person is not an
+      // agent to wake (Lumen, #620 — the merger used to drop this).
+      people: t.people ?? [],
       closedAt: t.closedAt,
     };
     // Pinned identity is authoritative even when all three components are

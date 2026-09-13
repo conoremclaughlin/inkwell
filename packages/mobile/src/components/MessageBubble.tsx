@@ -27,12 +27,12 @@ export function MessageBubble({ message }: { message: ThreadMessage }) {
   }
 
   return (
-    <View style={[styles.wrap, sender.isUser ? styles.wrapUser : styles.wrapAgent]}>
+    <View style={[styles.wrap, sender.isOwn ? styles.wrapUser : styles.wrapAgent]}>
       <View style={styles.header}>
         <Text
           style={[
             styles.sender,
-            { color: sender.isUser ? colors.accentBright : agentColor(sender.name) },
+            { color: sender.isOwn ? colors.accentBright : agentColor(sender.name) },
           ]}
         >
           {sender.name}
@@ -46,7 +46,7 @@ export function MessageBubble({ message }: { message: ThreadMessage }) {
           </Text>
         ) : null}
       </View>
-      <View style={[styles.bubble, sender.isUser ? styles.bubbleUser : styles.bubbleAgent]}>
+      <View style={[styles.bubble, sender.isOwn ? styles.bubbleUser : styles.bubbleAgent]}>
         <Text style={styles.content} selectable>
           {message.content}
         </Text>
