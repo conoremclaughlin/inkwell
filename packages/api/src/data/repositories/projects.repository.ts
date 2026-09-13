@@ -7,6 +7,7 @@ export type ProjectStatus = 'active' | 'paused' | 'completed' | 'archived';
 export interface Project {
   id: string;
   user_id: string;
+  workspace_id: string;
   name: string;
   description: string | null;
   status: ProjectStatus;
@@ -77,6 +78,25 @@ export class ProjectsRepository extends BaseRepository {
       return data as Project | null;
     } catch (error) {
       this.handleError(error, 'findByUserAndName');
+    }
+  }
+
+  /** The projects of one workspace — the namespace (spec inkmail-thread-scope §1b). */
+  async findAllByWorkspace(workspaceId: string, status?: ProjectStatus): Promise<Project[]> {
+    try {
+      let query = this.client
+        .from('projects')
+        .select('*')
+        .eq('workspace_id', workspaceId)
+        .order('updated_at', { ascending: false });
+      if (status) {
+        query = query.eq('status', status);
+      }
+      const { data, error } = await query;
+      if (error) throw error;
+      return (data as Project[]) || [];
+    } catch (error) {
+      this.handleError(error, 'findAllByWorkspace');
     }
   }
 

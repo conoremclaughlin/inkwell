@@ -16,6 +16,7 @@ import { getRequestContext, getSessionContext } from '../../utils/request-contex
 import { GraphExecutorService, type GraphEvaluation } from '../../services/graph-executor.service';
 import { isBareDate, resolveDueDate, InvalidDueDateError } from '../../utils/due-date';
 import { logger } from '../../utils/logger';
+import { resolveCallerWorkspace } from './caller-principal';
 
 export const DUE_DATE_DESCRIPTION =
   'Deadline. Bare YYYY-MM-DD (e.g. "2026-09-14") resolves to the end of that day in the ' +
@@ -1721,8 +1722,13 @@ export async function handleListTaskGroups(
 
     let projectId = args.projectId;
     if (!projectId && args.projectName) {
-      const project = await dataComposer.repositories.projects.findByUserAndName(
-        resolved.user.id,
+      // The name is resolved in the caller's workspace (spec inkmail-thread-scope §1b).
+      const { workspaceId } = await resolveCallerWorkspace(
+        dataComposer.getClient(),
+        resolved.user.id
+      );
+      const project = await dataComposer.repositories.projects.findByWorkspaceAndName(
+        workspaceId,
         args.projectName
       );
       if (!project) {

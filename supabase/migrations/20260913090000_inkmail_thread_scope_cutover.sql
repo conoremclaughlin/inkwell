@@ -232,6 +232,30 @@ CREATE INDEX idx_projects_workspace_id ON public.projects (workspace_id);
 DROP INDEX public.projects_user_slug;
 CREATE UNIQUE INDEX projects_workspace_slug
   ON public.projects (workspace_id, slug) WHERE slug IS NOT NULL;
+-- The same rule for the name: unique within a workspace, not across one
+-- owner's workspaces. The slug index went in the first cut and the name
+-- constraint stayed, so the same owner could not keep a project of one
+-- name in two workspaces (Lumen, #622). Per-owner uniqueness implies
+-- per-workspace uniqueness after the backfill, so the new index holds.
+-- Policy for a same-workspace name collision: there cannot be one — every
+-- project was unique per owner and each owner's projects all landed in that
+-- owner's personal workspace — so one is a bad snapshot, and the cutover
+-- refuses rather than picking a survivor.
+DO $$
+DECLARE
+  v_collisions integer;
+BEGIN
+  SELECT count(*) INTO v_collisions
+  FROM (
+    SELECT workspace_id, name FROM public.projects GROUP BY workspace_id, name HAVING count(*) > 1
+  ) dup;
+  IF v_collisions > 0 THEN
+    RAISE EXCEPTION 'cutover: % project name(s) collide within one workspace; resolve before the cutover',
+      v_collisions;
+  END IF;
+END $$;
+ALTER TABLE public.projects DROP CONSTRAINT projects_user_id_name_key;
+CREATE UNIQUE INDEX projects_workspace_name ON public.projects (workspace_id, name);
 
 -- Aliases live in their project's workspace.
 ALTER TABLE public.project_slug_aliases DISABLE TRIGGER enforce_alias_namespace;

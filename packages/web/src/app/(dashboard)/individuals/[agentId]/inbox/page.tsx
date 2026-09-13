@@ -27,6 +27,7 @@ import {
 } from 'lucide-react';
 import { useApiQuery } from '@/lib/api';
 import clsx from 'clsx';
+import { authorLabel, sameAuthor } from './author';
 
 interface InboxMessage {
   id: string;
@@ -37,6 +38,7 @@ interface InboxMessage {
   status: string;
   senderAgentId: string | null;
   /** Thread messages only: the author named for the viewer (spec inkmail-thread-scope §3). */
+  senderUserId?: string | null;
   senderName?: string;
   isOwn?: boolean;
   senderSbId: string | null;
@@ -179,7 +181,7 @@ function MessageItem({
   inboxAgentId: string;
   onShowRouting?: (message: InboxMessage) => void;
 }) {
-  const sender = message.isOwn ? 'You' : message.senderName || message.senderAgentId || 'unknown';
+  const sender = authorLabel(message);
   const isAgent = !!message.senderAgentId;
   const isSent = message.senderAgentId === inboxAgentId;
 
@@ -369,7 +371,10 @@ function ThreadMessages({
     <div className="flex-1 overflow-y-auto px-1 py-3">
       {displayMessages.map((msg, i) => {
         const prevMsg = i > 0 ? displayMessages[i - 1] : null;
-        const sameSender = prevMsg?.senderAgentId === msg.senderAgentId;
+        // Consecutive messages compact under one author only when they are
+        // the same PRINCIPAL: two people both read as 'user' by slug, and a
+        // second person's messages vanished under the first (Lumen, #622).
+        const sameSender = sameAuthor(prevMsg, msg);
         return (
           <MessageItem
             key={msg.id}
@@ -710,7 +715,7 @@ export default function InboxPage() {
                         <p className="mt-0.5 text-sm text-gray-600 truncate">
                           {gt.lastMessage ? (
                             <>
-                              <span className="font-medium">{gt.lastMessage.senderAgentId}:</span>{' '}
+                              <span className="font-medium">{authorLabel(gt.lastMessage)}:</span>{' '}
                               {gt.lastMessage.content}
                             </>
                           ) : (
