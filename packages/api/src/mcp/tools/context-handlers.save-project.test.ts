@@ -9,7 +9,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { makeFakeSupabase } from '../../services/sessions/fake-supabase';
 import { ProjectsRepository } from '../../data/repositories/projects.repository';
-import { handleSaveProject } from './context-handlers';
+import { handleGetProject, handleListProjects, handleSaveProject } from './context-handlers';
 
 const ctx = vi.hoisted(() => ({ sbId: undefined as string | undefined }));
 
@@ -120,5 +120,62 @@ describe('handleSaveProject — the workspace is the namespace', () => {
     const { db, dataComposer } = composer();
     await handleSaveProject({ name: 'T', slug: 'ticket' }, dataComposer);
     expect(await rows(db)).toMatchObject([{ workspace_id: 'ws-a', slug: 'ticket' }]);
+  });
+});
+
+describe('list_projects / get_project read the same namespace as writes (Lumen, #622)', () => {
+  const text = (r: { content: Array<{ text?: string }> }) => JSON.parse(r.content[0].text ?? '{}');
+
+  it("lists the caller's workspace's projects, whoever created them, and none from elsewhere", async () => {
+    const { db, dataComposer } = composer();
+    await db.from('projects').insert({
+      id: '00000000-0000-4000-8000-00000000c001',
+      user_id: 'user-z',
+      workspace_id: 'ws-b',
+      name: 'Colleague',
+      status: 'active',
+    });
+    await db.from('projects').insert({
+      id: '00000000-0000-4000-8000-00000000a001',
+      user_id: 'user-a',
+      workspace_id: 'ws-a',
+      name: 'Mine',
+      status: 'active',
+    });
+    expect(
+      text(await handleListProjects({}, dataComposer)).projects.map((p: { name: string }) => p.name)
+    ).toEqual(['Mine']);
+    ctx.sbId = 'sb-b';
+    expect(
+      text(await handleListProjects({}, dataComposer)).projects.map((p: { name: string }) => p.name)
+    ).toEqual(['Colleague']);
+  });
+
+  it("gets a project by id or name only inside the caller's workspace", async () => {
+    const { db, dataComposer } = composer();
+    await db.from('projects').insert({
+      id: '00000000-0000-4000-8000-00000000c001',
+      user_id: 'user-z',
+      workspace_id: 'ws-b',
+      name: 'Colleague',
+      status: 'active',
+    });
+    // From the personal workspace: not visible by id or by name.
+    expect(
+      text(
+        await handleGetProject({ projectId: '00000000-0000-4000-8000-00000000c001' }, dataComposer)
+      ).success
+    ).toBe(false);
+    expect(text(await handleGetProject({ name: 'Colleague' }, dataComposer)).success).toBe(false);
+    // From the SB's workspace: readable, though another member created it.
+    ctx.sbId = 'sb-b';
+    expect(
+      text(
+        await handleGetProject({ projectId: '00000000-0000-4000-8000-00000000c001' }, dataComposer)
+      ).project.name
+    ).toBe('Colleague');
+    expect(text(await handleGetProject({ name: 'Colleague' }, dataComposer)).project.id).toBe(
+      '00000000-0000-4000-8000-00000000c001'
+    );
   });
 });

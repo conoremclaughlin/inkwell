@@ -867,6 +867,37 @@ describe.skipIf(!REHEARSAL)(
       }
     });
 
+    it("a project name is unique within a workspace, not across one owner's workspaces", async () => {
+      await begin();
+      try {
+        const w = await world();
+        await member(w.w2, w.owner);
+        expect(await runCutover()).toEqual({ ok: true });
+
+        // The same owner keeps a project of one name in two workspaces —
+        // the per-owner name constraint is gone with the slug index.
+        await one<{ id: string }>(
+          `INSERT INTO public.projects (user_id, workspace_id, name) VALUES ($1, $2, 'Inkwell') RETURNING id`,
+          [w.owner, w.w1]
+        );
+        await one<{ id: string }>(
+          `INSERT INTO public.projects (user_id, workspace_id, name) VALUES ($1, $2, 'Inkwell') RETURNING id`,
+          [w.owner, w.w2]
+        );
+        // Within one workspace the name is taken, whoever creates it.
+        await pg.query('SAVEPOINT n1');
+        await expect(
+          pg.query(
+            `INSERT INTO public.projects (user_id, workspace_id, name) VALUES ($1, $2, 'Inkwell')`,
+            [w.owner, w.w1]
+          )
+        ).rejects.toThrow(/projects_workspace_name/);
+        await pg.query('ROLLBACK TO SAVEPOINT n1');
+      } finally {
+        await rollback();
+      }
+    });
+
     it('(Lumen P2) deleting a workspace cascades through identities, threads and participants; deleting an identity on its own is still refused', async () => {
       await begin();
       try {

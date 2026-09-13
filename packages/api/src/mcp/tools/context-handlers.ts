@@ -120,9 +120,17 @@ export async function handleListProjects(args: unknown, dataComposer: DataCompos
   const params = listProjectsSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
 
-  const projects = await dataComposer.repositories.projects.findAllByUser(user.id, params.status);
+  // Reads follow the same namespace as writes (spec inkmail-thread-scope
+  // §1b): the caller's workspace, whoever created each project. Scoped by
+  // owner, a member could update a colleague's project and then not list
+  // it (Lumen, #622).
+  const { workspaceId } = await resolveCallerWorkspace(dataComposer.getClient(), user.id);
+  const projects = await dataComposer.repositories.projects.findAllByWorkspace(
+    workspaceId,
+    params.status
+  );
 
-  logger.info(`Listed ${projects.length} projects for user ${user.id}`);
+  logger.info(`Listed ${projects.length} projects in workspace ${workspaceId} for user ${user.id}`);
 
   return {
     content: [
@@ -156,15 +164,19 @@ export async function handleGetProject(args: unknown, dataComposer: DataComposer
   const params = getProjectSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
 
+  // A project is readable by its workspace's members, not only its creator.
+  const { workspaceId } = await resolveCallerWorkspace(dataComposer.getClient(), user.id);
   let project;
   if (params.projectId) {
     project = await dataComposer.repositories.projects.findById(params.projectId);
-    // Verify ownership
-    if (project && project.user_id !== user.id) {
+    if (project && project.workspace_id !== workspaceId) {
       project = null;
     }
   } else if (params.name) {
-    project = await dataComposer.repositories.projects.findByUserAndName(user.id, params.name);
+    project = await dataComposer.repositories.projects.findByWorkspaceAndName(
+      workspaceId,
+      params.name
+    );
   }
 
   if (!project) {
@@ -236,8 +248,9 @@ export async function handleSetFocus(args: unknown, dataComposer: DataComposer) 
   // Resolve project if name provided
   let projectId = params.projectId;
   if (params.projectName && !projectId) {
-    const project = await dataComposer.repositories.projects.findByUserAndName(
-      user.id,
+    const { workspaceId } = await resolveCallerWorkspace(dataComposer.getClient(), user.id);
+    const project = await dataComposer.repositories.projects.findByWorkspaceAndName(
+      workspaceId,
       params.projectName
     );
     if (project) {

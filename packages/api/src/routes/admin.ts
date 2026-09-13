@@ -4254,6 +4254,7 @@ router.get('/individuals/:agentId/inbox', async (req: Request, res: Response) =>
       senderIdentityId: string | null;
       /** Thread messages only (spec inkmail-thread-scope §3). */
       senderKind?: string;
+      senderUserId?: string | null;
       senderName?: string;
       isOwn?: boolean;
       recipientAgentId: string;
@@ -4490,6 +4491,7 @@ router.get('/individuals/:agentId/inbox', async (req: Request, res: Response) =>
               senderAgentId: m.sender_agent_id ?? m.sender_kind,
               senderSbId: m.sender_sb_id,
               senderIdentityId: m.sender_sb_id,
+              senderUserId: m.sender_user_id,
               senderName: nameOf(m),
               isOwn:
                 m.sender_kind === 'user' && !!m.sender_user_id && m.sender_user_id === viewerUserId,
