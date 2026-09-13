@@ -48,8 +48,12 @@ A subject line is **not** a safe exception. It is shell input on exactly the sam
 subject is where our backticked identifiers most often appear:
 
 ```bash
-git commit -m "fix: honour the `local` flag"   # git receives: fix: honour the  flag
+git commit -m "fix: honour the `pwd` flag"   # git receives: fix: honour the /Users/you/ws/pcp flag
 ```
+
+The example substitutes `pwd` rather than the builtin that actually caused the incident,
+because this snippet is runnable and the real one dumps your environment into a commit. The
+mechanism is identical; only the payload is harmless.
 
 Single-quoting is not the fix either — an apostrophe in a word like `don't` closes the string
 and the remainder of the message is re-parsed as shell.
@@ -77,33 +81,42 @@ reviewer looking at the change sees nothing wrong. `-F` never goes through shell
 and has no quoting rules to get wrong.
 
 The enforcing half is `scripts/check-commit-msg.sh`, wired as the `commit-msg` hook (the one
-hook that sees the finished message; a `pre-commit` hook never does). Husky installs it via
-`yarn install`, so it should already be active — see [Formatting](#formatting). It refuses a
-message carrying named secret assignments, vendor token shapes, or an environment dump, and
-reports variable names and line numbers only, never values, so the hook output does not
-become the next place a secret is written down.
+hook that sees the finished message; a `pre-commit` hook never does). It refuses a message
+carrying named secret assignments, vendor token shapes, or an environment dump, and reports
+variable names and line numbers only, never values, so the hook output does not become the
+next place a secret is written down.
+
+**Check that it is actually on, rather than assuming.** `yarn install` runs Husky, but what
+runs at commit time is `$(git config core.hooksPath)/commit-msg` — and on a machine with
+worktrees that path is one shared directory serving all of them, belonging to whichever
+checkout configured it. A non-empty `core.hooksPath` therefore says nothing about whether
+the guard exists there. `ls "$(git config core.hooksPath)"/commit-msg` is the question worth
+asking; if it is missing, nothing is being checked and nothing will tell you so.
 
 **It is a heuristic backstop, not universal detection, and `-F` is still the actual fix.**
 It recognises the shapes we have actually been burned by: a list of known secret variable
 names, a handful of vendor token formats, and a run of assignment lines that looks like a
 dumped environment. A secret it has never been told to recognise, in a shape it does not
-model, will pass — and deliberately so at the edges: a value written as `<placeholder>` or
-`***` is treated as prose, because prose about this guard is something we write far more
-often than we leak. Passing the hook means "nothing matched", never "no credentials here".
-Do not let it become the reason you stop being careful about how the message is written.
-
-It is also skippable with `--no-verify` and only active where `core.hooksPath` points at a
-checkout that has it, which is why the durable protection is the `-F` habit above rather
-than the hook.
+model, will pass. It is skippable with `--no-verify`, and inactive wherever the hook is not
+installed. Passing it means "nothing matched", never "no credentials here". Do not let it
+become the reason you stop being careful about how the message is written.
 
 If it blocks you, nothing has been committed and your staged changes are untouched. Read the
 draft message it points at before reusing it — if the guard fired on a real substitution, the
 draft contains the leaked values and must not be recycled into the next attempt.
 
-If it blocks you and you are _sure_ it is prose rather than a leak, rewrite the prose rather
-than reaching for `--no-verify`: keep a placeholder like `<value>` or `***` immediately after
-the `=`, or avoid putting a credential-shaped run right after one. Every false positive so
-far has been a commit message _about_ this guard.
+**Writing prose about these variables: name them, do not assign to them.** The guard refuses
+_any_ assignment to a name it knows, whatever follows the `=` — including `<placeholder>`,
+`***`, a quoted value, a three-letter default, and a bare `=` with nothing after it at all.
+That is a deliberate false positive, and it replaced two narrower rules that each tried to
+keep the assignment form writable. Both failed the same way: an exemption defined by what the
+value _looks like_ exempts every real credential that happens to look like that too — one
+starting with `*`, or quoted, or short. Three leaked messages is not a sample that can license
+a rule about what credentials never look like.
+
+So write ``the `JWT_SECRET` value`` rather than `JWT_SECRET=<value>`. It reads no worse and
+has no ambiguity. Every false positive so far has been a commit message _about_ this guard,
+and this is the rewrite that clears it — reach for that before `--no-verify`.
 
 Its regression suite is `scripts/check-commit-msg.test.sh` (synthetic fixtures, runs in CI).
 `scripts/check-commit-msg.history.sh` is the local-only check that replays the three real
@@ -240,10 +253,18 @@ deleted.
 
 Prettier runs automatically on every commit via Husky + lint-staged. You do **not** need to run prettier manually — just commit and it handles formatting for `*.{ts,tsx,js,jsx,json,css,md}` files.
 
-Husky is installed by the `prepare` script, so a plain `yarn install` activates every hook in
-`.husky/` — including `commit-msg`, the credential guard described under
+Husky is installed by the `prepare` script, so a plain `yarn install` points `core.hooksPath`
+at a `.husky/` directory — including `commit-msg`, the credential guard described under
 [Commits](#writing-the-message-use--f-never--m). If `git config core.hooksPath` prints nothing,
 hooks are not active in this checkout; run `yarn install` to wire them up.
+
+A path that _does_ print is only half the answer. Hooks run from the checkout that owns that
+directory, not from the one you are committing in, so on a machine with worktrees one stale or
+incomplete `.husky/` serves all of them. Check for the hook itself:
+
+```bash
+ls "$(git config core.hooksPath)"/commit-msg
+```
 
 To format without committing:
 

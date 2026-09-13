@@ -32,19 +32,28 @@ fi
 # costs nothing measurable: across the same 1500 main commits used to calibrate
 # the dump threshold, both forms flag zero.
 #
-# The trailing class keeps prose from tripping it: a bare "set JWT_SECRET= in
-# your env" has whitespace after the =, and a placeholder is written <like-this>
-# or ***. This arm caught the commit message introducing it, which is how the
-# exclusion got here -- and then caught the message introducing the prefix group
-# below, on "... or MY_GITHUB_TOKEN=." where the value byte was a full stop.
+# There is deliberately NO constraint on the value. Earlier revisions tried two,
+# and both were bypasses dressed as precision:
 #
-# So the class is now a whitelist of bytes a credential can actually START with,
-# rather than a blacklist of the punctuation we have been bitten by so far. The
-# blacklist was losing a byte at a time to ordinary prose about the guard, which
-# is a losing shape: every future commit discussing this file is a new chance to
-# find one we had not thought of. Checked against the leaks rather than assumed
-# -- none of the three quotes its values, and every named assignment in all
-# three starts inside this class.
+#   a blacklist of first bytes (excluding < and * so that <placeholder> and ***
+#   read as prose) lost a byte at a time to ordinary prose about this guard, and
+#   exempted any secret starting with one of them;
+#
+#   a whitelist of first bytes plus a minimum run length was worse -- it exempted
+#   quoted values outright, and a length floor exempts short passwords and
+#   signing keys, which are exactly the credentials a floor should not excuse.
+#
+# Both were calibrated against three leaked messages, which is not a sample that
+# can license an exemption. So the rule is now the conservative one: an
+# assignment to a name we know carries a secret is refused, whatever follows the
+# `=`, and whether anything follows it at all.
+#
+# The cost is real and accepted: prose that writes JWT_SECRET=<value> or
+# GITHUB_TOKEN=*** is refused too. Write the bare name instead -- "the
+# JWT_SECRET value", not "JWT_SECRET=<value>" -- which reads no worse and is the
+# only shape with no ambiguity. Recognising exact whole placeholders is a
+# refinement we can consider later; it is not a prerequisite for shipping, and
+# every past false positive was a commit message about this file.
 #
 # The optional ([A-Za-z0-9_]*_) prefix matters more than it looks. The word
 # boundary before it excludes _, so without the prefix group a name like
@@ -54,7 +63,7 @@ fi
 # was only ever open for a mid-line splice or a one- or two-line partial: the
 # same two shapes the named arm exists to cover. It also keeps the report honest,
 # naming PCP_JWT_SECRET rather than the JWT_SECRET tail it matched on.
-named='(^|[^A-Za-z0-9_])([A-Za-z0-9_]*_)?(SUPABASE_SECRET_KEY|SUPABASE_PUBLISHABLE_KEY|JWT_SECRET|GITHUB_TOKEN|GOOGLE_CLIENT_SECRET|GOOGLE_CLIENT_ID|TELEGRAM_[A-Z_]*BOT_TOKEN|SB_TEST_PASSWORD|ANTHROPIC_API_KEY|OPENAI_API_KEY|INK_ACCESS_TOKEN|CLAUDE_CODE_MESSAGING_TOKEN|ZSH_EXECUTION_STRING)=["'\'']?[A-Za-z0-9_/+-][^[:space:]]{7,}'
+named='(^|[^A-Za-z0-9_])([A-Za-z0-9_]*_)?(SUPABASE_SECRET_KEY|SUPABASE_PUBLISHABLE_KEY|JWT_SECRET|GITHUB_TOKEN|GOOGLE_CLIENT_SECRET|GOOGLE_CLIENT_ID|TELEGRAM_[A-Z_]*BOT_TOKEN|SB_TEST_PASSWORD|ANTHROPIC_API_KEY|OPENAI_API_KEY|INK_ACCESS_TOKEN|CLAUDE_CODE_MESSAGING_TOKEN|ZSH_EXECUTION_STRING)='
 
 # Vendor token shapes, for secrets not named above.
 shapes='(gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{20}|GOCSPX-[A-Za-z0-9_-]{20}|sb_secret_[A-Za-z0-9_-]{20}|sk-ant-[A-Za-z0-9_-]{20}|[0-9]{8,10}:AA[A-Za-z0-9_-]{33})'
@@ -84,8 +93,12 @@ scan_failed() {
 
 # Report variable names and line numbers only — never the values, or the hook
 # output becomes the next place the secret is written down.
-# -o so the report names the variable rather than echoing the prose around it;
-# the two sed passes drop the matched value and the leading word boundary.
+#
+# -o so the report names the variable rather than echoing the prose around it.
+# The match now ends at the `=`, so a value byte cannot ride along in the first
+# place; the `s/=.*$//` pass stays anyway, because it is what keeps that property
+# true if the pattern ever grows a value class again. The second pass drops the
+# leading word-boundary byte the match had to consume.
 named_raw=$(grep -inoE "$named" "$msg_file")
 rc=$?
 [ "$rc" -ge 2 ] && scan_failed "named variables" "$rc"

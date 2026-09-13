@@ -174,12 +174,14 @@ else
   bad "scanner output names the offending variable" "output: $(echo "$out" | tr '\n' ' ')"
 fi
 
-# Checking for the whole canary is too weak to pin this. The named arm matches
-# one byte past the `=`, and `grep -o` reports what it matched, so dropping the
-# strip leaks the first character of the secret and the whole-value check stays
-# green. One byte is still disclosure, and a one-byte regression is exactly the
-# kind that survives review. Assert the shape instead: a reported line is
-# "line N: NAME" and carries no `=` at all, so no value byte can ride along.
+# Checking for the whole canary is too weak to pin this. When the named arm still
+# had a value class it matched past the `=`, and `grep -o` reports what it
+# matched, so dropping the strip leaked the first character of the secret while
+# the whole-value check stayed green. One byte is still disclosure, and a one-byte
+# regression is exactly the kind that survives review. Assert the shape instead: a
+# reported line is "line N: NAME" and carries no `=` at all. The pattern no longer
+# captures value bytes, so this now pins a property the regex and the strip
+# uphold together — and it goes red if either of them stops.
 reported=$(echo "$out" | grep '^   line ')
 if [ -z "$reported" ]; then
   bad "reported hit lines carry no value bytes" "no 'line N:' output to check"
@@ -215,67 +217,74 @@ else
 fi
 
 # The other side of unanchoring: prose about these variables must still pass, or
-# every future commit discussing the guard trips it. Placeholders are written
-# <like-this> or ***, and no real credential starts with either byte.
-f=$(write_msg placeholder-prose <<'EOF'
+# every future commit discussing the guard trips it. What makes prose safe is now
+# the BARE NAME -- no `=` after it. Two earlier revisions tried to keep the `=`
+# writable by exempting the value (first a blacklist of punctuation bytes, then a
+# whitelist plus a length floor); both were bypasses, so the assignment form is
+# simply refused and prose says the name on its own.
+f=$(write_msg bare-name-prose <<'EOF'
 docs: explain the guard
 
-A spliced span looks like JWT_SECRET=<value> once it lands. Redacted logs
-render it as GITHUB_TOKEN=*** instead. To run locally, set JWT_SECRET= in
+A spliced span assigns to JWT_SECRET once it lands, and redacted logs show a
+GITHUB_TOKEN with its value starred out. To run locally, set JWT_SECRET in
 your env first.
 EOF
 )
-expect_exit 0 "placeholder and bare-assignment prose is allowed" "$f"
+expect_exit 0 "prose naming secret variables without an assignment is allowed" "$f"
 
-# The value byte is a whitelist rather than a punctuation blacklist, because a
-# blacklist kept losing a byte at a time to ordinary prose about this guard.
-# Both of these were live false positives on real commit messages for this PR:
-# a name list where the sentence ends on the =, and a quoted short example.
-f=$(write_msg prose-ends-on-equals <<'EOF'
+# The list shape that was a live false positive on this PR's own commit messages,
+# rewritten to bare names. This is the form the docs now ask for, so it is pinned:
+# if naming these variables in prose ever stops being possible, every commit that
+# discusses the guard is blocked and the guard gets disabled.
+f=$(write_msg bare-name-list <<'EOF'
 fix: widen the named arm
 
-The boundary excluded underscore, so the arm matched JWT_SECRET= but not
-PCP_JWT_SECRET= or MY_GITHUB_TOKEN=. Both were allowed; both are closed now,
-and a list like GITHUB_TOKEN=, JWT_SECRET= reads as prose rather than a leak.
+The boundary excluded underscore, so the arm matched JWT_SECRET but not the
+prefixed PCP_JWT_SECRET or MY_GITHUB_TOKEN. Both were allowed; both are closed
+now, and a list like GITHUB_TOKEN, JWT_SECRET reads as prose rather than a leak.
 EOF
 )
-expect_exit 0 "prose whose sentence ends on the equals sign is allowed" "$f"
+expect_exit 0 "a list of bare secret names is allowed" "$f"
 
-# A quoted value is the bypass the first-byte blacklist left open: a value class
-# that only admits credential bytes rejects its own opening quote and the whole
-# assignment reads through. Both quote styles, because a dump may emit either.
-f=$(write_msg quoted-double <<'EOF'
-fix: an ordinary subject
+# --- the exemptions that are now gone --------------------------------------
+#
+# Every one of these exited 0 under an earlier value class. They are the reason
+# the value constraint was removed rather than refined: each is a shape a real
+# credential can take, and each was waved through by a rule calibrated on three
+# leaked messages. One case per shape, so a partial regression is still caught.
+# Labelled by shape rather than by fixture text, so the suite's own output never
+# carries an assignment-shaped line.
+for probe in \
+  'leading-asterisk:*starsfirst9182' \
+  'leading-angle-bracket:<anglefirst9182' \
+  'leading-bang:!bangfirst9182' \
+  'double-quoted:"doublequoted9182"' \
+  "single-quoted:'singlequoted9182'" \
+  'unquoted-short:dev' \
+  'empty:' \
+; do
+  label=${probe%%:*}
+  value=${probe#*:}
+  f=$(printf 'fix: an ordinary subject line\n\nJWT_SECRET=%s\n' "$value" | write_msg "shapeless-$label")
+  expect_exit 1 "shapeless value blocked: $label" "$f"
+done
 
-JWT_SECRET="s3cretvaluehere"
-EOF
-)
-expect_exit 1 "double-quoted secret value is blocked" "$f"
-
-f=$(write_msg quoted-single <<'EOF'
-fix: an ordinary subject
-
-JWT_SECRET='s3cretvaluehere'
-EOF
-)
-expect_exit 1 "single-quoted secret value is blocked" "$f"
-
-# What separates a secret from prose here is a run of credential-shaped bytes,
-# not the punctuation we happen to have been bitten by. That makes the rule a
-# length threshold, and a threshold has a documented floor: below it the named
-# arm does not fire and the dump arm and vendor shapes are what remain. Pinned
-# so the floor cannot drift without a failing test.
+# The length floor specifically. A short password or signing key is still a
+# credential, and a floor exempts exactly those. Pinned as its own case because
+# it is the exemption most likely to look reasonable to a future editor.
 f=$(write_msg short-value <<'EOF'
-fix: prose naming a short default like JWT_SECRET=dev in a sentence
+fix: an ordinary subject
+
+SB_TEST_PASSWORD=hunter2
 EOF
 )
-expect_exit 0 "value shorter than the credential-run floor is allowed" "$f"
+expect_exit 1 "short value is blocked — no length floor" "$f"
 
 f=$(write_msg long-value <<'EOF'
 fix: prose naming JWT_SECRET=abcdefghijkl in a sentence
 EOF
 )
-expect_exit 1 "value at or above the credential-run floor is blocked" "$f"
+expect_exit 1 "assignment spliced into a sentence is blocked" "$f"
 
 f=$(write_msg dump-three <<'EOF'
 fix: a message that swallowed an environment dump

@@ -794,8 +794,10 @@ Defined in [CONTRIBUTING.md](./CONTRIBUTING.md). Key SB-specific reminders:
   A subject line is **not** the safe exception it looks like. Backticks in a subject are substituted exactly as they are in a body:
 
   ```bash
-  git commit -m "fix: honour the `local` flag"   # git receives: fix: honour the  flag
+  git commit -m "fix: honour the `pwd` flag"   # git receives: fix: honour the /Users/you/ws/pcp flag
   ```
+
+  That example substitutes `pwd`, not the builtin that caused the incident — the snippet is runnable, and the real one would dump your environment into a commit. Same mechanism, harmless payload.
 
   Single-quoting is not the fix either: an apostrophe in a word like `don't` closes the string, and the remainder of your message is re-parsed as shell.
 
@@ -808,9 +810,13 @@ Defined in [CONTRIBUTING.md](./CONTRIBUTING.md). Key SB-specific reminders:
 
   Quote the heredoc delimiter, or write the file with a tool that never goes through a shell (in Claude Code, the `Write` tool). Then `git commit -F msg`.
 
-  The `commit-msg` hook (`scripts/check-commit-msg.sh`, wired via `.husky/`) refuses a message that carries credentials before it becomes a commit — it is the only hook that sees the finished message, and it catches the leak whichever way it got in. Husky activates it on `yarn install`, so it is on unless `git config core.hooksPath` comes back empty. If it blocks you, nothing was committed and your staged changes are intact; do not recycle the draft message it points at without reading it first, because on a real substitution that draft is where the leaked values are.
+  The `commit-msg` hook (`scripts/check-commit-msg.sh`, wired via `.husky/`) refuses a message that carries credentials before it becomes a commit — it is the only hook that sees the finished message, whichever way the credentials got in. If it blocks you, nothing was committed and your staged changes are intact; do not recycle the draft message it points at without reading it first, because on a real substitution that draft is where the leaked values are.
 
-  **Treat the hook as a backstop, not a licence.** It matches the shapes we have actually been burned by — known secret variable names, a few vendor token formats, a run of assignment lines that looks like a dumped environment — and it treats `<placeholder>` and `***` values as prose on purpose. A secret in a shape it does not model passes, and `--no-verify` skips it entirely. Passing it means "nothing matched", never "no credentials here". Writing the message to a file and using `-F` is the thing that actually prevents the leak. Full rationale in [CONTRIBUTING.md](./CONTRIBUTING.md#writing-the-message-use--f-never--m).
+  **A non-empty `core.hooksPath` does not mean the guard is on.** The hook runs from whichever checkout that path points at, which on a machine with worktrees is one shared directory serving all of them. If that checkout does not carry `.husky/commit-msg`, nothing is checked and nothing says so. To confirm: `ls "$(git config core.hooksPath)"/commit-msg`.
+
+  **Treat the hook as a backstop, not a licence.** It matches the shapes we have actually been burned by — known secret variable names, a few vendor token formats, a run of assignment lines that looks like a dumped environment. A secret in a shape it does not model passes, and `--no-verify` skips it entirely. Passing it means "nothing matched", never "no credentials here". Writing the message to a file and using `-F` is the thing that actually prevents the leak.
+
+  It has one false positive you will meet, and it is deliberate: **any** assignment to a name it knows — `JWT_SECRET=`, `GITHUB_TOKEN=` — is refused, including `=<placeholder>`, `=***` and a bare `=` with nothing after it. Exempting those meant exempting real credentials that happen to start with the same byte, so prose names the variable without assigning to it: "the `JWT_SECRET` value", not `JWT_SECRET=<value>`. Full rationale in [CONTRIBUTING.md](./CONTRIBUTING.md#writing-the-message-use--f-never--m).
 
 ## Architecture Notes
 
