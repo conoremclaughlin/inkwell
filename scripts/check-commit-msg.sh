@@ -20,8 +20,12 @@
 #         scanner through `git rev-parse --show-toplevel`, which is the worktree
 #         you are COMMITTING FROM, not the checkout providing the hook. Those are
 #         the same directory only in the root repo. From a worktree it runs that
-#         worktree's copy of this scanner, or nothing at all if the copy is
-#         missing, which is the fail-open case the tracked hook exists to close.
+#         worktree's copy of this scanner -- whichever version that checkout
+#         happens to carry, silently, including one predating the patterns you
+#         think you are enforcing. A copy that is missing entirely does NOT fail
+#         open: `sh` on a nonexistent path exits nonzero (127, or 2 under dash)
+#         and the commit is refused. The fail-open path is a missing HOOK, which
+#         is the paragraph below, not a missing scanner.
 #
 #         Activation is a git config setting, not a file to create:
 #
