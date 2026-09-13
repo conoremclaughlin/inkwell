@@ -108,6 +108,19 @@ export function deriveStudioSlug(worktreePath: string): string | null {
   return folder.slice(idx + 2) || null;
 }
 
+/**
+ * The identity a studio acts under: its LIVE lease's, else the row's. The
+ * lease is canonical — a studio created for one workspace can be leased by
+ * an identity in another, and the lease is what release keys on, so
+ * selection for teardown must not override it with the row or the owner
+ * (Lumen, #624).
+ */
+export function studioIdentityId(studio: Pick<Studio, 'sbId' | 'lease'>): string | null {
+  const lease = studio.lease as { sbId?: unknown } | null | undefined;
+  if (lease && typeof lease.sbId === 'string' && lease.sbId) return lease.sbId;
+  return studio.sbId ?? null;
+}
+
 export class StudiosRepository {
   constructor(private client: SupabaseClient<Database>) {}
 
@@ -347,15 +360,18 @@ export class StudiosRepository {
     workspaceId: string,
     legacyOwnerUserId?: string
   ): Promise<Studio[]> {
-    const identityIds = [...new Set(studios.map((s) => s.sbId).filter(Boolean))] as string[];
+    const identityIds = [
+      ...new Set(studios.map((s) => studioIdentityId(s)).filter(Boolean)),
+    ] as string[];
     const workspaceBySbId = new Map(
       (await resolveSbsByIds(this.client, identityIds)).map((sb) => [sb.sbId, sb.workspaceId])
     );
-    return studios.filter((s) =>
-      s.sbId
-        ? workspaceBySbId.get(s.sbId) === workspaceId
-        : !!legacyOwnerUserId && s.userId === legacyOwnerUserId
-    );
+    return studios.filter((s) => {
+      const identityId = studioIdentityId(s);
+      return identityId
+        ? workspaceBySbId.get(identityId) === workspaceId
+        : !!legacyOwnerUserId && s.userId === legacyOwnerUserId;
+    });
   }
 
   /** Ephemeral studios past their expires_at, still open. Sweep candidates. */

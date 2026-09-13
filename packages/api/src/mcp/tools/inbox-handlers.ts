@@ -11,7 +11,7 @@ import type { DataComposer } from '../../data/composer';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
 import { resolveIdentityId, resolveAgentSlug } from '../../auth/resolve-identity';
 import {
-  SYSTEM_PRINCIPAL,
+  personalWorkspaceOf,
   principalColumns,
   resolveSbsByIds,
   resolveSbsInWorkspace,
@@ -20,8 +20,14 @@ import {
   type SbPrincipal,
   type SystemPrincipal,
   type UserPrincipal,
+  userPrincipal,
 } from '../../services/principals';
-import { assertWriteRole, resolveCallerSb } from './caller-principal';
+import {
+  assertWriteRole,
+  resolveCallerSb,
+  resolveCallerWorkspace,
+  roleOfUserIn,
+} from './caller-principal';
 import { advanceThreadReadPointer, advanceAgentInboxReadPointer } from './read-state.js';
 import { getEffectiveAgentId } from '../../auth/enforce-identity';
 import { logger } from '../../utils/logger';
@@ -34,9 +40,9 @@ import {
   mayHaveProjectPrefix,
 } from '../../services/thread-key/unregistered-prefix';
 import {
+  getPinnedAgentId,
   getRequestContext,
   getSessionContext,
-  getPinnedAgentId,
 } from '../../utils/request-context';
 import { getAgentGateway, type AgentTriggerPayload } from '../../channels/agent-gateway.js';
 import {
@@ -356,7 +362,13 @@ async function warnOnUnregisteredProjectPrefix(
  * server code pass it here, after authenticating it themselves.
  */
 export interface InternalSendContext {
-  sender: { principal: UserPrincipal | SystemPrincipal; workspaceId: string };
+  /**
+   * The trusted server-side sender. A system sender may leave `workspaceId`
+   * null: the message lands in the first recipient's workspace, as a
+   * watchdog or heartbeat send always has. This context is the ONLY way a
+   * message is authored as the system — no tool call reaches it.
+   */
+  sender: { principal: UserPrincipal | SystemPrincipal; workspaceId: string | null };
 }
 
 export async function handleSendToInbox(
@@ -425,7 +437,9 @@ export async function handleSendToInbox(
       senderAgentId = reqCtx.agentId;
     }
   }
-  const triggerSenderId = senderAgentId || 'unknown';
+  // Provisional: an SB's slug when one is named. Re-derived from the
+  // resolved sender principal once threads resolve it (below).
+  let triggerSenderId = senderAgentId || 'unknown';
 
   // SECURITY: permission_grant messages can only originate from the system layer
   // (platform listeners verifying human identity), never from agents.
@@ -533,12 +547,47 @@ export async function handleSendToInbox(
       workspaceId = sb.workspaceId;
     } else if (internal?.sender) {
       sender = internal.sender.principal;
-      workspaceId = internal.sender.workspaceId;
+      workspaceId =
+        internal.sender.workspaceId ??
+        (await resolveCallerSb(supabase, resolved.user.id, allRecipients[0])).workspaceId;
     } else {
-      sender = SYSTEM_PRINCIPAL;
-      const first = await resolveCallerSb(supabase, resolved.user.id, allRecipients[0]);
-      workspaceId = first.workspaceId;
+      // No sender named and no server-internal context: an external token
+      // is calling — the bound SB if there is one, else the person
+      // themselves — and the message is THEIRS. It used to be stored as the
+      // system's with no role check, so a viewer's token could post system
+      // messages to their own SB's thread. System authorship is the server's
+      // alone (the internal context above); a tool call naming 'system' is
+      // refused rather than laundered (Lumen, #624).
+      if (senderAgentId === 'system') {
+        throw new Error(
+          'System authorship is reserved for the server; omit senderAgentId to send as yourself'
+        );
+      }
+      const reqCtx = getRequestContext() || getSessionContext();
+      const bound = reqCtx?.sbId
+        ? (await resolveCallerWorkspace(supabase, resolved.user.id)).sb
+        : null;
+      if (bound) {
+        assertWriteRole(bound.ownerRole, 'send to a thread');
+        sender = bound;
+        workspaceId = bound.workspaceId;
+      } else {
+        // A person: the workspace the server resolved for the request
+        // (header or session), else their personal one — and their role in it.
+        workspaceId =
+          reqCtx?.workspaceId ?? (await personalWorkspaceOf(supabase, resolved.user.id));
+        assertWriteRole(
+          await roleOfUserIn(supabase, workspaceId, resolved.user.id, 'You'),
+          'send to a thread'
+        );
+        sender = userPrincipal(resolved.user.id);
+      }
     }
+    // The trigger names its sender by principal: the SB's slug, 'system'
+    // for the server's own send, 'user' for a person (Lumen, #624 — an
+    // internal system send no longer carries a slug).
+    triggerSenderId =
+      sender.kind === 'sb' ? sender.agentId : sender.kind === 'system' ? 'system' : 'user';
     const senderSb: SbPrincipal | null = sender.kind === 'sb' ? sender : null;
     const recipientSbs = await resolveSbsInWorkspace(supabase, workspaceId, allRecipients);
     const participantSbs: SbPrincipal[] = [];

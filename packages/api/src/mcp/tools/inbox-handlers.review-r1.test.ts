@@ -200,4 +200,57 @@ describe('send boundary (Lumen, #618 round 1)', () => {
     expect((await db.from('inbox_thread_messages').select('*')).data).toHaveLength(0);
     expect(getAgentGateway().dispatchTrigger).not.toHaveBeenCalled();
   });
+
+  it("a person's token sending without a sender name writes as THEMSELVES — a viewer is refused, a member's message is the person's, and 'system' from a tool is refused (#624)", async () => {
+    // No senderAgentId and no internal context: an external token whose
+    // user is a person. The message is theirs, their role gates it, and
+    // system authorship is not something a tool call can claim.
+    // The server resolved ws-a for this person's request (header or session).
+    const requestContext = await import('../../utils/request-context');
+    vi.mocked(requestContext.getRequestContext).mockReturnValue({
+      userId: 'user-a',
+      sessionId: 'session-a',
+      workspaceId: 'ws-a',
+    } as never);
+    const viewer = client();
+    await viewer.from('workspace_members').update({ role: 'viewer' }).eq('user_id', 'user-a');
+    await expect(
+      handleSendToInbox(
+        { recipientAgentId: 'wren', threadKey: 'pr:618', content: 'hello', trigger: false },
+        { getClient: () => viewer } as never
+      )
+    ).rejects.toThrow('Your role in this workspace (viewer) cannot send to a thread');
+    expect((await viewer.from('inbox_thread_messages').select('*')).data).toHaveLength(0);
+
+    const member = client();
+    await handleSendToInbox(
+      { recipientAgentId: 'wren', threadKey: 'pr:618', content: 'hello', trigger: false },
+      { getClient: () => member } as never
+    );
+    const rows = (await member.from('inbox_thread_messages').select('*')).data;
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      sender_kind: 'user',
+      sender_user_id: 'user-a',
+      content: 'hello',
+    });
+    expect(
+      (await member.from('inbox_thread_participants').select('*')).data.some(
+        (p) => p.user_id === 'user-a'
+      )
+    ).toBe(true);
+
+    await expect(
+      handleSendToInbox(
+        {
+          senderAgentId: 'system',
+          recipientAgentId: 'wren',
+          threadKey: 'pr:618',
+          content: 'x',
+          trigger: false,
+        },
+        { getClient: () => client() } as never
+      )
+    ).rejects.toThrow('System authorship is reserved for the server');
+  });
 });

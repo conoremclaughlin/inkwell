@@ -7487,6 +7487,7 @@ router.get('/threads', async (req: Request, res: Response) => {
 async function loadThreadStudioHistory(
   supabase: SupabaseClient<Database>,
   userId: string,
+  workspaceId: string,
   threadKey: string
 ): Promise<
   Array<{
@@ -7507,7 +7508,10 @@ async function loadThreadStudioHistory(
   const { data: leaseEvents, error: leaseEventsError } = await supabase
     .from('studio_lease_events')
     .select('studio_id, agent_id, event, created_at')
-    .eq('user_id', userId)
+    // The thread's workspace, through each event's identity — not the
+    // viewer's user id, which showed a same-owner namesake's history from
+    // elsewhere and hid another owner's on this thread (Lumen, #624).
+    .or(carrierScopeFilter(await workspaceSbIds(supabase, workspaceId), userId))
     .eq('thread_key', threadKey)
     .in('event', ['acquired', 'released', 'expired', 'reclaimed'])
     .order('created_at', { ascending: false })
@@ -7593,6 +7597,7 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
     const studioHistory = await loadThreadStudioHistory(
       supabase as SupabaseClient<Database>,
       authReq.pcpUserId,
+      authReq.pcpWorkspaceId,
       key
     );
 

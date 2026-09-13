@@ -447,10 +447,12 @@ export class StudioLeaseService {
     worktreePath?: string;
     ephemeral?: boolean;
     status?: string;
+    /** The row's identity, for callers deciding scope from fresh state. */
+    sbId?: string | null;
   } | null> {
     let query = this.supabase
       .from('studios')
-      .select('lease, worktree_path, ephemeral, status')
+      .select('lease, worktree_path, ephemeral, status, sb_id')
       .eq('id', studioId);
     if (userId) query = query.eq('user_id', userId);
     const { data, error } = await query.maybeSingle();
@@ -461,6 +463,7 @@ export class StudioLeaseService {
     if (!data) return null;
     return {
       lease: parseStudioLease(data.lease),
+      sbId: (data as { sb_id?: string | null }).sb_id ?? null,
       worktreePath: data.worktree_path,
       ephemeral: data.ephemeral,
       status: data.status,
@@ -2158,11 +2161,33 @@ export class StudioLeaseService {
   async claimForTeardown(
     studioId: string,
     userId: string,
-    opts: { expectedThreadKey?: string; reason: string }
+    opts: { expectedThreadKey?: string; expectedWorkspaceId?: string; reason: string }
   ): Promise<StudioLease | null> {
     const current = await this.getLease(studioId, userId);
     if (!current) return null;
     const holder = current.lease;
+
+    // Scope from FRESH state, lease first: a studio selected for a close in
+    // workspace A whose live lease belongs to an identity in workspace B is
+    // B's, whatever the row or the owner says. A canonical foreign lease is
+    // never overridden by row or legacy-owner attribution; a studio with no
+    // identity at all keeps the owner boundary this claim already enforces
+    // (Lumen, #624).
+    if (opts.expectedWorkspaceId) {
+      const identityId = holder?.sbId ?? current.sbId ?? null;
+      if (identityId) {
+        const leaseWorkspace = await workspaceOfSb(this.supabase, identityId);
+        if (leaseWorkspace !== opts.expectedWorkspaceId) {
+          logger.info('[StudioLease] Teardown claim refused — lease belongs to another workspace', {
+            studioId,
+            identityId,
+            leaseWorkspace,
+            expectedWorkspaceId: opts.expectedWorkspaceId,
+          });
+          return null;
+        }
+      }
+    }
 
     const claim = this.claimRecord(holder, 'teardown', opts.reason, opts.expectedThreadKey);
 

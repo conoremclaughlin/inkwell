@@ -39,4 +39,25 @@ describe('StudiosRepository.inWorkspace (spec inkmail-thread-scope §1)', () => 
     ]);
     expect(await repo.inWorkspace(legacy, 'ws-1')).toEqual([]);
   });
+
+  it("the LIVE lease's identity wins over the row's — a studio leased elsewhere is not this workspace's (#624)", async () => {
+    const leasedElsewhere = studio({
+      id: 'row-ws1-lease-ws2',
+      sbId: 'sb-u1-ws1',
+      lease: { sbId: 'sb-u1-ws2' } as never,
+    });
+    const rowlessLeaseHere = studio({
+      id: 'row-null-lease-ws1',
+      sbId: null,
+      lease: { sbId: 'sb-u2-ws1' } as never,
+    });
+    expect(
+      (await repo.inWorkspace([leasedElsewhere, rowlessLeaseHere], 'ws-1', 'user-1')).map(
+        (s) => s.id
+      )
+    ).toEqual(['row-null-lease-ws1']);
+    expect((await repo.inWorkspace([leasedElsewhere], 'ws-2')).map((s) => s.id)).toEqual([
+      'row-ws1-lease-ws2',
+    ]);
+  });
 });

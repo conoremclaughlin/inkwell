@@ -961,7 +961,12 @@ export class StudioOverflowService {
    */
   async teardownEphemeralStudio(
     studio: Studio,
-    opts: { reason: string; expectedThreadKey?: string }
+    opts: {
+      reason: string;
+      expectedThreadKey?: string;
+      /** The closing thread's workspace: the claim refuses a lease canonically elsewhere. */
+      expectedWorkspaceId?: string;
+    }
   ): Promise<void> {
     if (!studio.ephemeral) {
       logger.warn('[StudioOverflow] Refusing to tear down non-ephemeral studio', {
@@ -974,6 +979,7 @@ export class StudioOverflowService {
     // another worker's active claim aborts.
     const claim = await this.leases.claimForTeardown(studio.id, studio.userId, {
       expectedThreadKey: opts.expectedThreadKey,
+      expectedWorkspaceId: opts.expectedWorkspaceId,
       reason: `teardown-claim (${opts.reason})`,
     });
     if (!claim) {
@@ -1190,6 +1196,7 @@ export class StudioOverflowService {
       await this.teardownEphemeralStudio(studio, {
         reason: opts.reason,
         expectedThreadKey: threadKey,
+        expectedWorkspaceId: thread.workspaceId,
       });
       closed += 1;
     }

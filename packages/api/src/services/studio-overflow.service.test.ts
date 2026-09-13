@@ -1031,6 +1031,7 @@ describe('S2: teardownEphemeralStudiosForThread under multiplexing (spec v18)', 
     expect(closed).toBe(1);
     expect(claimForTeardown).toHaveBeenCalledWith('parent-1', 'user-1', {
       expectedThreadKey: 'pr:B',
+      expectedWorkspaceId: 'ws-1',
       reason: 'teardown-claim (thread pr:B closed)',
     });
   });
@@ -1082,6 +1083,7 @@ describe('S2: teardownEphemeralStudiosForThread under multiplexing (spec v18)', 
     expect(closed).toBe(1);
     expect(claimForTeardown).toHaveBeenCalledWith('parent-1', 'user-1', {
       expectedThreadKey: 'pr:B',
+      expectedWorkspaceId: 'ws-1',
       reason: 'teardown-claim (thread pr:B closed)',
     });
   });

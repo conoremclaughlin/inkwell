@@ -186,6 +186,20 @@ describe("SB callers act with their owner's membership; carriers follow the work
         dataComposer
       )
     ).rejects.toThrow('Your role in this workspace (viewer) cannot send to a thread');
+    // Without a sender name the token's own user is writing; the write is
+    // theirs and their role gates it (Lumen, #624).
+    await expect(
+      handleSendToInbox(
+        {
+          userId: viewerUserId,
+          recipientAgentId: VIEWER_SB,
+          threadKey,
+          content: 'as system',
+          trigger: false,
+        },
+        dataComposer
+      )
+    ).rejects.toThrow('Your role in this workspace (viewer) cannot send to a thread');
     const { data: after } = await supabase
       .from('inbox_thread_messages')
       .select('id')

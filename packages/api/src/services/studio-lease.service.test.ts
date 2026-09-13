@@ -3549,3 +3549,74 @@ describe("releaseByThread follows the thread's workspace (spec §1; Lumen, #621 
     expect(result.studioIds.sort()).toEqual(['legacy-mine', 'mine-here', 'theirs-here']);
   });
 });
+
+describe("claimForTeardown checks the fresh lease's workspace (Lumen, #624)", () => {
+  let tables: Record<string, Row[]>;
+  beforeEach(() => {
+    resetActiveRuns();
+    tables = baseTables();
+    tables.agent_identities = [
+      { id: 'sb-u1-ws1', agent_id: 'wren', user_id: 'user-1', workspace_id: 'ws-1' },
+      { id: 'sb-u1-ws2', agent_id: 'wren', user_id: 'user-1', workspace_id: 'ws-2' },
+    ];
+    // The holder is terminal: the claim's release-now proof holds, so only
+    // the workspace check decides.
+    tables.sessions = [{ id: 'session-a', user_id: 'user-1', ended_at: new Date().toISOString() }];
+    tables.studios = [
+      {
+        id: 'eph',
+        user_id: 'user-1',
+        sb_id: 'sb-u1-ws1',
+        ephemeral: true,
+        status: 'active',
+        // Created in ws-1 (row identity), but its live lease is ws-2's.
+        lease: freshLease({ sessionId: 'session-a', threadKey: 'pr:7', sbId: 'sb-u1-ws2' }),
+        worktree_path: null,
+      },
+    ];
+  });
+  afterEach(() => resetActiveRuns());
+
+  it('refuses when the lease belongs to another workspace, whatever the row says; claims for its own', async () => {
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+    expect(
+      await service.claimForTeardown('eph', 'user-1', {
+        expectedThreadKey: 'pr:7',
+        expectedWorkspaceId: 'ws-1',
+        reason: 'teardown-claim (test)',
+      })
+    ).toBeNull();
+    expect((tables.studios[0].lease as StudioLease).quarantined).toBeFalsy();
+    const claim = await service.claimForTeardown('eph', 'user-1', {
+      expectedThreadKey: 'pr:7',
+      expectedWorkspaceId: 'ws-2',
+      reason: 'teardown-claim (test)',
+    });
+    expect(claim?.quarantined).toBe(true);
+  });
+
+  it('a studio with no identity at all keeps the owner boundary the claim already enforces', async () => {
+    tables.studios[0].sb_id = null;
+    tables.studios[0].lease = freshLease({
+      sessionId: 'session-a',
+      threadKey: 'pr:7',
+    }) as unknown as Row;
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+    expect(
+      await service.claimForTeardown('eph', 'user-2', {
+        expectedThreadKey: 'pr:7',
+        expectedWorkspaceId: 'ws-1',
+        reason: 'x',
+      })
+    ).toBeNull();
+    expect(
+      (
+        await service.claimForTeardown('eph', 'user-1', {
+          expectedThreadKey: 'pr:7',
+          expectedWorkspaceId: 'ws-1',
+          reason: 'x',
+        })
+      )?.quarantined
+    ).toBe(true);
+  });
+});

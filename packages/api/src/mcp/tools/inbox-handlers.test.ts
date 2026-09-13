@@ -12,6 +12,7 @@ import {
   isThreadOwnedByStudio,
 } from './inbox-handlers';
 import { userPrincipal } from '../../services/principals';
+import { SYSTEM_PRINCIPAL } from '../../services/principals';
 
 // The caller's owner is a member of the identity's workspace — SBs act with
 // their owner's role (spec inkmail-thread-scope §1), read here as one row.
@@ -1588,12 +1589,13 @@ describe('handleSendToInbox — system sender and cross-agent studio routing', (
       {
         email: 'test@test.com',
         recipientAgentId: 'wren',
-        senderAgentId: 'system',
         threadKey: 'strategy:group-1',
         content: 'Resume strategy task',
         messageType: 'session_resume',
       },
-      mockDc as never
+      mockDc as never,
+      // The server's own system send: the trusted internal context, never a slug (Lumen, #624).
+      { sender: { principal: SYSTEM_PRINCIPAL, workspaceId: null } }
     );
 
     const parsed = JSON.parse(result.content[0].text);
@@ -1629,14 +1631,15 @@ describe('handleSendToInbox — system sender and cross-agent studio routing', (
       {
         email: 'test@test.com',
         recipientAgentId: 'wren',
-        senderAgentId: 'system',
         threadKey: 'strategy:group-1',
         content: 'Kick off the strategy task',
         messageType: 'session_resume',
         trigger: true,
         metadata: { source: 'strategy_service', strategyTrigger: true, groupId: 'group-1' },
       },
-      mockDc as never
+      mockDc as never,
+      // The server's own system send: the trusted internal context, never a slug (Lumen, #624).
+      { sender: { principal: SYSTEM_PRINCIPAL, workspaceId: null } }
     );
 
     expect(JSON.parse(result.content[0].text).success).toBe(true);
@@ -1651,13 +1654,14 @@ describe('handleSendToInbox — system sender and cross-agent studio routing', (
       {
         email: 'test@test.com',
         recipientAgentId: 'wren',
-        senderAgentId: 'system',
         threadKey: 'strategy:group-1',
         content: 'plain message',
         messageType: 'notification',
         trigger: true,
       },
-      mockDc as never
+      mockDc as never,
+      // The server's own system send: the trusted internal context, never a slug (Lumen, #624).
+      { sender: { principal: SYSTEM_PRINCIPAL, workspaceId: null } }
     );
     const plainPayload = vi.mocked(mockGateway.dispatchTrigger).mock.calls[0]?.[0] as Record<
       string,
@@ -1914,13 +1918,14 @@ describe('handleSendToInbox — system sender and cross-agent studio routing', (
       {
         email: 'test@test.com',
         recipientAgentId: 'wren',
-        senderAgentId: 'system',
         threadKey: 'strategy:group-1',
         content: 'Resume strategy task',
         messageType: 'session_resume',
         recipientStudioId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
       },
-      mockDc as never
+      mockDc as never,
+      // The server's own system send: the trusted internal context, never a slug (Lumen, #624).
+      { sender: { principal: SYSTEM_PRINCIPAL, workspaceId: null } }
     );
 
     expect(mockGateway.dispatchTrigger).toHaveBeenCalledWith(
@@ -1946,13 +1951,14 @@ describe('handleSendToInbox — system sender and cross-agent studio routing', (
       {
         email: 'test@test.com',
         recipientAgentId: 'wren',
-        senderAgentId: 'system',
         threadKey: 'strategy:group-2',
         content: 'Resume strategy task',
         messageType: 'session_resume',
         recipientStudioSlug: 'wren-omega',
       },
-      mockDc as never
+      mockDc as never,
+      // The server's own system send: the trusted internal context, never a slug (Lumen, #624).
+      { sender: { principal: SYSTEM_PRINCIPAL, workspaceId: null } }
     );
 
     expect(mockGateway.dispatchTrigger).toHaveBeenCalledWith(

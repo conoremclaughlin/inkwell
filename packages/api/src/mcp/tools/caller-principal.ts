@@ -37,7 +37,8 @@ export function assertWriteRole(role: WorkspaceMemberRole, action: string): void
   }
 }
 
-async function ownerRoleIn(
+/** A person's role in a workspace — refused when they are not a member. */
+export async function roleOfUserIn(
   client: Client,
   workspaceId: string,
   userId: string,
@@ -59,7 +60,7 @@ async function ownerRoleIn(
 }
 
 async function withOwnerMembership(client: Client, sb: SbPrincipal): Promise<CallerSb> {
-  const ownerRole = await ownerRoleIn(client, sb.workspaceId, sb.userId, `${sb.agentId}'s owner`);
+  const ownerRole = await roleOfUserIn(client, sb.workspaceId, sb.userId, `${sb.agentId}'s owner`);
   return { ...sb, ownerRole };
 }
 
@@ -144,6 +145,6 @@ export async function resolveCallerWorkspace(
   // The person themselves, in their personal workspace — whose membership
   // row still says what they may do there.
   const workspaceId = await personalWorkspaceOf(client, userId);
-  const role = await ownerRoleIn(client, workspaceId, userId, 'You');
+  const role = await roleOfUserIn(client, workspaceId, userId, 'You');
   return { workspaceId, sb: null, role };
 }
