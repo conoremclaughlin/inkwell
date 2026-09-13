@@ -18,7 +18,12 @@ import { getHeartbeatProcessingConfig } from '../config/heartbeat-flags';
 import { runWithRequestContext } from '../utils/request-context';
 import { getDataComposer } from '../data/composer';
 import { handleSendToInbox } from '../mcp/tools/inbox-handlers';
-import { getParticipants, participantSlugs, reopenThreadRow } from '../mcp/tools/thread-handlers';
+import {
+  getParticipants,
+  isParticipant,
+  participantSlugs,
+  reopenThreadRow,
+} from '../mcp/tools/thread-handlers';
 import { resolveSbsByIds, userPrincipal } from '../services/principals';
 import { FixedWindowLimiter } from '../utils/fixed-window-limiter';
 import { notifyPlatformOfApprovalRequest } from '../channels/approval-interceptor';
@@ -1169,14 +1174,19 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
       });
     };
 
+    // The role is the membership row's, read once here and carried on the
+    // request; every write guard downstream decides on it. A direct member
+    // used to be stamped 'member' regardless of the row, which let a viewer
+    // write and stopped an owner recovering a thread (Lumen, #619).
     let activeWorkspaceId = '';
     let activeWorkspaceRole: WorkspaceMemberRole | 'trusted' = 'trusted';
     let hasDirectMembership = false;
 
     if (requestedWorkspaceId) {
-      const requestedWorkspace = await workspaceRepo.findById(requestedWorkspaceId, pcpUserId!);
-      if (requestedWorkspace) {
-        activeWorkspaceId = requestedWorkspace.id;
+      const direct = await workspaceRepo.findByIdWithRole(requestedWorkspaceId, pcpUserId!);
+      if (direct) {
+        activeWorkspaceId = direct.workspace.id;
+        activeWorkspaceRole = direct.role;
         hasDirectMembership = true;
       } else {
         const requestedWorkspaceExists = await workspaceRepo.findRawById(requestedWorkspaceId);
@@ -1196,7 +1206,16 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
       }
     } else {
       const personalWorkspace = await workspaceRepo.ensurePersonalWorkspace(pcpUserId!);
+      // Provisioned with an 'owner' row (repository and DB trigger alike), but
+      // the row is what says so; a personal workspace with no membership row
+      // is refused rather than assumed.
+      const personalRole = await workspaceRepo.getMemberRole(personalWorkspace.id, pcpUserId!);
+      if (!personalRole) {
+        res.status(403).json({ error: 'Insufficient permissions' });
+        return;
+      }
       activeWorkspaceId = personalWorkspace.id;
+      activeWorkspaceRole = personalRole;
       hasDirectMembership = true;
     }
 
@@ -1206,10 +1225,6 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
         res.status(403).json({ error: 'Insufficient permissions' });
         return;
       }
-    }
-
-    if (hasDirectMembership) {
-      activeWorkspaceRole = 'member';
     }
 
     // --- Issue cookies (Tier 3 success) ---
@@ -7117,6 +7132,20 @@ router.post('/skills/manage/:skillId/fork', async (req: Request, res: Response) 
  * announced — is a first-class row with `thread: null`, not an absence.
  * Merge semantics live in services/thread-key/thread-spines.ts.
  */
+// ── Thread ACL (spec inkmail-thread-scope §1) ──
+// read: every role, trusted included; reply / start / reopen: member, admin,
+// owner; recover a thread you are not on: admin, owner. A trusted non-member
+// gets the explicit rule the spec asks for — read-only — not an implicit hole.
+const THREAD_WRITE_ROLES: ReadonlySet<string> = new Set(['owner', 'admin', 'member']);
+const THREAD_RECOVER_ROLES: ReadonlySet<string> = new Set(['owner', 'admin']);
+
+function refuseThreadWrite(res: Response, role: string, action: string): void {
+  res.status(403).json({
+    error: `Your role in this workspace (${role}) cannot ${action}`,
+    role,
+  });
+}
+
 router.get('/threads', async (req: Request, res: Response) => {
   try {
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
@@ -7615,6 +7644,11 @@ router.post('/threads', async (req: Request, res: Response) => {
       return;
     }
 
+    if (!THREAD_WRITE_ROLES.has(authReq.pcpWorkspaceRole)) {
+      refuseThreadWrite(res, authReq.pcpWorkspaceRole, 'start a thread');
+      return;
+    }
+
     const dataComposer = await getDataComposer();
     const supabase = dataComposer.getClient();
     const { data: existing } = await supabase
@@ -7720,6 +7754,10 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
       auth: { autoRefreshToken: false, persistSession: false },
     });
     const authReq = req as AdminAuthRequest;
+    if (!THREAD_WRITE_ROLES.has(authReq.pcpWorkspaceRole)) {
+      refuseThreadWrite(res, authReq.pcpWorkspaceRole, 'reply');
+      return;
+    }
 
     const { data: thread, error: threadError } = await supabase
       .from('inbox_threads')
@@ -7843,12 +7881,27 @@ router.post('/threads/reopen', async (req: Request, res: Response) => {
       res.status(404).json({ error: `No thread with key "${key}"` });
       return;
     }
+    if (!THREAD_WRITE_ROLES.has(authReq.pcpWorkspaceRole)) {
+      refuseThreadWrite(res, authReq.pcpWorkspaceRole, 'reopen a thread');
+      return;
+    }
+    // A participant reopens their own thread; anyone else needs the
+    // recovery role (§2, §6: owner/admin may recover any thread).
+    const dataComposer = await getDataComposer();
+    const onThread = await isParticipant(
+      dataComposer.getClient(),
+      thread.id,
+      userPrincipal(authReq.pcpUserId)
+    );
+    if (!onThread && !THREAD_RECOVER_ROLES.has(authReq.pcpWorkspaceRole)) {
+      refuseThreadWrite(res, authReq.pcpWorkspaceRole, 'reopen a thread you are not on');
+      return;
+    }
     if (thread.status !== 'closed') {
       res.json({ success: true, threadKey: key, reopened: false, alreadyOpen: true });
       return;
     }
 
-    const dataComposer = await getDataComposer();
     const { reopened } = await reopenThreadRow(dataComposer.getClient(), thread.id, {
       kind: 'user',
       userId: authReq.pcpUserId,

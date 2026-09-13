@@ -72,7 +72,7 @@ function getCreateHandler(): Handler {
   return layer.route.stack[layer.route.stack.length - 1].handle;
 }
 
-function createReq(body: Record<string, unknown>): Request {
+function createReq(body: Record<string, unknown>, role = 'owner'): Request {
   return {
     body,
     headers: {},
@@ -80,6 +80,7 @@ function createReq(body: Record<string, unknown>): Request {
     params: {},
     pcpUserId: 'user-1',
     pcpWorkspaceId: 'ws-1',
+    pcpWorkspaceRole: role,
   } as unknown as Request;
 }
 
@@ -140,6 +141,17 @@ describe('POST /threads', () => {
       const res = createRes();
       await create(createReq(body), res);
       expect(res._status, JSON.stringify(body)).toBe(400);
+    }
+    expect(mockHandleSendToInbox).not.toHaveBeenCalled();
+  });
+
+  it('a viewer or a trusted non-member cannot start a thread — read is every role, write is member and up (§1)', async () => {
+    mockThreadLookup(null);
+    for (const role of ['viewer', 'trusted']) {
+      const res = createRes();
+      await create(createReq({ key: 'pr:545', recipients: ['wren'], content: 'hi' }, role), res);
+      expect(res._status).toBe(403);
+      expect(res._json).toMatchObject({ role });
     }
     expect(mockHandleSendToInbox).not.toHaveBeenCalled();
   });
