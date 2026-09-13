@@ -38,6 +38,15 @@ jobs:
       - name: Commit-message credential guard
         run: sh scripts/check-commit-msg.test.sh
 
+      # The staged-file guard (pre-commit) and the pre-push replay, plus the
+      # parity check that keeps their vendor patterns identical to the
+      # commit-message guard's.
+      - name: Staged-file credential guard
+        run: sh scripts/check-staged-files.test.sh
+
+      - name: Pre-push commit replay
+        run: sh scripts/check-push.test.sh
+
   integration-db-local:
     name: Integration DB Tests (Local Supabase)
     runs-on: ubuntu-latest
