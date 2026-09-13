@@ -14,7 +14,7 @@
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { getDataComposer } from '../../data/composer';
-import { ensureEchoIntegrationFixture } from '../../test/integration-fixtures';
+import { ensureEchoIntegrationFixture, ensureSuiteIdentity } from '../../test/integration-fixtures';
 
 // Uniquely namespaced per run so this suite's participant and pointer rows
 // can never collide with another suite's use of the shared Echo fixture.
@@ -25,14 +25,17 @@ type CandidateRow = { thread_id: string; latest_message_at: string; total_candid
 describe('get_unread_thread_candidates over closed threads (integration)', () => {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let supabase: any;
-  let userId: string;
+  let workspaceId: string;
+  let echoSbId: string;
+  // The polling SB: a suite-owned identity in the fixture workspace
+  // (candidacy is per SB principal since the cutover, spec §3).
+  let agentSbId: string;
   let threadId: string | undefined;
   const threadKey = `test:closed-candidacy-${Date.now()}`;
 
   async function candidates(): Promise<CandidateRow[]> {
     const { data, error } = await supabase.rpc('get_unread_thread_candidates', {
-      p_user_id: userId,
-      p_agent_id: AGENT,
+      p_sb_id: agentSbId,
       p_session_id: null,
       p_limit: 50,
     });
@@ -44,7 +47,9 @@ describe('get_unread_thread_candidates over closed threads (integration)', () =>
     const dataComposer = await getDataComposer();
     supabase = dataComposer.getClient();
     const fixture = await ensureEchoIntegrationFixture(dataComposer);
-    userId = fixture.userId;
+    workspaceId = fixture.workspaceId;
+    echoSbId = fixture.echoSbId;
+    agentSbId = await ensureSuiteIdentity(dataComposer, fixture, AGENT);
 
     // A thread that is closed both ways — status and closed_at — with a
     // participant who joined before the reply, and no read pointer yet.
@@ -52,12 +57,14 @@ describe('get_unread_thread_candidates over closed threads (integration)', () =>
       .from('inbox_threads')
       .insert({
         thread_key: threadKey,
-        user_id: userId,
-        created_by_agent_id: 'echo',
+        workspace_id: workspaceId,
+        created_by_kind: 'sb',
+        created_by_sb_id: echoSbId,
         title: 'closed-thread candidacy',
         status: 'closed',
         closed_at: '2026-09-01T00:00:00Z',
-        closed_by_agent_id: 'echo',
+        closed_by_kind: 'sb',
+        closed_by_sb_id: echoSbId,
       })
       .select('id')
       .single();
@@ -66,13 +73,16 @@ describe('get_unread_thread_candidates over closed threads (integration)', () =>
 
     const { error: partErr } = await supabase.from('inbox_thread_participants').insert({
       thread_id: threadId,
-      agent_id: AGENT,
+      workspace_id: workspaceId,
+      sb_id: agentSbId,
       joined_at: '2026-09-01T00:00:00Z',
     });
     if (partErr) throw new Error(`Failed to add participant: ${partErr.message}`);
 
     const { error: msgErr } = await supabase.from('inbox_thread_messages').insert({
       thread_id: threadId,
+      sender_kind: 'sb',
+      sender_sb_id: echoSbId,
       sender_agent_id: 'echo',
       content: 'a reply after the thread was closed',
       message_type: 'message',
@@ -83,11 +93,13 @@ describe('get_unread_thread_candidates over closed threads (integration)', () =>
 
   afterAll(async () => {
     // Suite-owned cleanup only: exactly the rows this suite created.
-    if (!threadId) return;
-    await supabase.from('inbox_thread_read_status').delete().eq('thread_id', threadId);
-    await supabase.from('inbox_thread_messages').delete().eq('thread_id', threadId);
-    await supabase.from('inbox_thread_participants').delete().eq('thread_id', threadId);
-    await supabase.from('inbox_threads').delete().eq('id', threadId);
+    if (threadId) {
+      await supabase.from('inbox_thread_read_status').delete().eq('thread_id', threadId);
+      await supabase.from('inbox_thread_messages').delete().eq('thread_id', threadId);
+      await supabase.from('inbox_thread_participants').delete().eq('thread_id', threadId);
+      await supabase.from('inbox_threads').delete().eq('id', threadId);
+    }
+    if (agentSbId) await supabase.from('agent_identities').delete().eq('id', agentSbId);
   });
 
   it('offers a closed thread with an unseen deliverable reply as a candidate', async () => {
@@ -105,12 +117,12 @@ describe('get_unread_thread_candidates over closed threads (integration)', () =>
     await supabase
       .from('inbox_thread_read_status')
       .upsert(
-        { thread_id: threadId, agent_id: AGENT, last_read_at: '2026-09-02T00:00:00Z' },
-        { onConflict: 'thread_id,agent_id' }
+        { thread_id: threadId, sb_id: agentSbId, last_read_at: '2026-09-02T00:00:00Z' },
+        { onConflict: 'thread_id,principal_key' }
       );
     const { error } = await supabase.from('inbox_thread_messages').insert({
       thread_id: threadId,
-      sender_agent_id: 'system',
+      sender_kind: 'system',
       content: 'Thread closed by echo',
       message_type: 'system',
       created_at: '2026-09-03T00:00:00Z',
@@ -124,6 +136,8 @@ describe('get_unread_thread_candidates over closed threads (integration)', () =>
   it('drops the closed thread once the reply is read — the pointer decides, not the status', async () => {
     const { error } = await supabase.from('inbox_thread_messages').insert({
       thread_id: threadId,
+      sender_kind: 'sb',
+      sender_sb_id: echoSbId,
       sender_agent_id: 'echo',
       content: 'a second reply after the close',
       message_type: 'message',
@@ -135,8 +149,8 @@ describe('get_unread_thread_candidates over closed threads (integration)', () =>
     await supabase
       .from('inbox_thread_read_status')
       .upsert(
-        { thread_id: threadId, agent_id: AGENT, last_read_at: '2026-09-04T00:00:00Z' },
-        { onConflict: 'thread_id,agent_id' }
+        { thread_id: threadId, sb_id: agentSbId, last_read_at: '2026-09-04T00:00:00Z' },
+        { onConflict: 'thread_id,principal_key' }
       );
     expect((await candidates()).map((r) => r.thread_id)).not.toContain(threadId);
   });
