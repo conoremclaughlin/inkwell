@@ -412,14 +412,38 @@ describe('resolveTriggeredAgents', () => {
       expect(result).toEqual(sbs('wren', 'lumen'));
     });
 
-    it("a person's thread start wakes the addressed SBs", () => {
+    it("a person's reply is never narrowed by addressed recipients — every SB hears (§7; Lumen, #618)", () => {
+      // Addressing narrows a thread START, which the creation branch handles
+      // before this function is ever called; on an existing thread the
+      // addressed list is whatever the caller happened to pass, and the
+      // person's reply must reach every SB regardless.
       const result = resolveTriggeredAgents({
         sender: PERSON,
         sbParticipants: sbs('wren', 'lumen', 'aster'),
         creator: PERSON,
-        recipients: ids(sbs('lumen', 'aster')),
+        recipients: ids(sbs('lumen')),
       });
-      expect(result).toEqual(sbs('lumen', 'aster'));
+      expect(result).toEqual(sbs('wren', 'lumen', 'aster'));
+    });
+
+    it('an explicit wake list that was given but resolves to nobody wakes nobody — never the defaults (Lumen, #618)', () => {
+      expect(
+        resolveTriggeredAgents({
+          sender: sender('wren'),
+          sbParticipants: sbs('wren', 'lumen', 'aster'),
+          creator: sender('wren'),
+          recipients: ids(sbs('lumen')),
+          triggerAgents: [],
+        })
+      ).toEqual([]);
+      expect(
+        resolveTriggeredAgents({
+          sender: PERSON,
+          sbParticipants: sbs('wren', 'lumen'),
+          creator: PERSON,
+          triggerAgents: [],
+        })
+      ).toEqual([]);
     });
 
     it('explicit triggerAgents from a person are honoured, filtered to SB participants', () => {

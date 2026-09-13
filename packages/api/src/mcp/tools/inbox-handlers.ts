@@ -631,11 +631,21 @@ export async function handleSendToInbox(
         .eq('user_id', sender.userId)
         .maybeSingle();
       if (!personRow) {
-        await threadTable(supabase, 'inbox_thread_participants').insert({
+        const { error: personErr } = await threadTable(
+          supabase,
+          'inbox_thread_participants'
+        ).insert({
           thread_id: thread.id,
           workspace_id: workspaceId,
           ...principalColumns(sender),
         });
+        // A concurrent reply by the same person may have won the insert
+        // (UNIQUE (thread_id, principal_key)); that row is the one we want.
+        // Anything else means the author would not be a participant when
+        // the message lands, so the message is not written (§7; Lumen, #618).
+        if (personErr && personErr.code !== '23505') {
+          throw new Error(`Failed to add participant: ${personErr.message}`);
+        }
       }
     }
 
@@ -763,10 +773,15 @@ export async function handleSendToInbox(
         : sender.kind === 'user'
           ? { kind: 'user' }
           : { kind: 'system' };
-      // Explicit wake targets are slugs; non-participants are silently ignored.
-      const triggerSbIds = (triggerAgents || [])
-        .map((slug) => sbParts.find((p) => p.agentId === slug)?.sbId)
-        .filter((id): id is string => !!id);
+      // Explicit wake targets are slugs; non-participants are silently
+      // ignored — but a wake list that was GIVEN stays given, even when
+      // nothing in it resolves: an empty explicit intersection wakes nobody,
+      // it never falls back to defaults (Lumen, #618).
+      const triggerSbIds = triggerAgents
+        ? triggerAgents
+            .map((slug) => sbParts.find((p) => p.agentId === slug)?.sbId)
+            .filter((id): id is string => !!id)
+        : undefined;
       const recipientSbIds = recipientSbs.map((r) => r.sbId);
 
       if (existingThread) {
@@ -927,6 +942,7 @@ export async function handleSendToInbox(
         );
         const payload: AgentTriggerPayload = {
           fromAgentId: triggerSenderId,
+          ...(senderSb ? { fromSbId: senderSb.sbId } : {}),
           toAgentId,
           toSbId: target.sbId,
           threadId: thread.id,
@@ -1285,7 +1301,17 @@ export async function findOrCreateThread(
     });
   }
   if (participantRows.length > 0) {
-    await threadTable(supabase, 'inbox_thread_participants').insert(participantRows);
+    const { error: participantsErr } = await threadTable(
+      supabase,
+      'inbox_thread_participants'
+    ).insert(participantRows);
+    // A fresh thread's rows cannot collide with anyone else's — a duplicate
+    // here means a concurrent creator raced this insert and won; anything
+    // else is a real failure and the thread must not be handed back as
+    // usable (Lumen, #618).
+    if (participantsErr && participantsErr.code !== '23505') {
+      throw new Error(`Failed to add participants: ${participantsErr.message}`);
+    }
   }
 
   return { id: thread.id, isNew: true };
@@ -1786,7 +1812,10 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
         let recencyQuery = threadTable(supabase, 'inbox_threads')
           .select(
             callerSb
-              ? 'id, thread_key, title, workspace_id, created_by_kind, created_by_sb_id, updated_at, inbox_thread_participants!inner(sb_id)'
+              ? // The FK is named: since the cutover there are two relationships
+                // between the tables (thread_id, and (thread_id, workspace_id)),
+                // and an unqualified embed is PGRST201-ambiguous (Lumen, #618).
+                'id, thread_key, title, workspace_id, created_by_kind, created_by_sb_id, updated_at, inbox_thread_participants!inbox_thread_participants_thread_id_fkey!inner(sb_id)'
               : 'id, thread_key, title, workspace_id, created_by_kind, created_by_sb_id, updated_at'
           )
           .in('workspace_id', threadWorkspaceIds);

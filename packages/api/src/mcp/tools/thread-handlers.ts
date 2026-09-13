@@ -384,19 +384,25 @@ export function resolveTriggeredAgents(opts: {
     return out;
   };
 
-  // A person or the system: never "self"; explicit targets win, otherwise
-  // every SB in the thread hears (§7: a human's reply wakes every SB).
+  // A person's reply wakes EVERY SB in the thread (§7): addressed
+  // recipients narrow a thread START (handled by the creator, not here),
+  // never a reply. An explicit wake list still wins, empty or not. The
+  // system addresses whom it names (a strategy notice to one SB on a group
+  // thread), else everyone. (Lumen, #618.)
   if (sender.kind !== 'sb') {
-    if (triggerAgents && triggerAgents.length > 0) return pick(triggerAgents);
-    if (opts.recipients && opts.recipients.length > 0) return pick(opts.recipients);
+    if (triggerAgents) return pick(triggerAgents);
+    if (sender.kind === 'system' && opts.recipients && opts.recipients.length > 0) {
+      return pick(opts.recipients);
+    }
     return [...participants];
   }
 
   const senderSbId = sender.sbId;
   const excludeSelf = (id: string) => (selfStudioTarget ? true : id !== senderSbId);
 
-  // Precedence 1: explicit triggerAgents (filter to actual SB participants)
-  if (triggerAgents && triggerAgents.length > 0) {
+  // Precedence 1: an explicit wake list — given is given, even when nothing
+  // in it is a participant: the empty intersection is the answer.
+  if (triggerAgents) {
     return pick(triggerAgents.filter(excludeSelf));
   }
 
@@ -454,6 +460,8 @@ export function dispatchTriggers(
   targets: SbRef[],
   opts: {
     fromAgentId: string;
+    /** The sender's canonical identity, when it is an SB (failure notices go to its owner). */
+    fromSbId?: string;
     threadKey: string;
     summary: string;
     priority: string;
@@ -469,6 +477,7 @@ export function dispatchTriggers(
   for (const target of targets) {
     const payload: AgentTriggerPayload = {
       fromAgentId: opts.fromAgentId,
+      ...(opts.fromSbId ? { fromSbId: opts.fromSbId } : {}),
       toAgentId: target.agentId,
       toSbId: target.sbId,
       threadMessageId: opts.threadMessageId,

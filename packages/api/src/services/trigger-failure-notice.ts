@@ -32,6 +32,13 @@ export interface TriggerFailureNotice {
   threadKey?: string | null;
   /** The thread's workspace, when known — the only way a bare key resolves. */
   workspaceId?: string | null;
+  /**
+   * Whether the legacy agent_inbox lane may be used. `userId` is that lane's
+   * recipient owner, so a caller that cannot name the SENDER's owner must
+   * say false: a person or the system holds no agent inbox, and the
+   * target's owner is the wrong person (Lumen, #618). Default true.
+   */
+  legacyLane?: boolean;
   subject: string;
   content: string;
   metadata: Record<string, unknown>;
@@ -117,7 +124,17 @@ export async function sendTriggerFailureNotice(
     });
   }
 
-  // Threadless (or thread write failed): legacy agent-scoped inbox.
+  // Threadless (or thread write failed): legacy agent-scoped inbox — only
+  // when the caller established whose inbox that is.
+  if (notice.legacyLane === false) {
+    logger.warn('[TriggerFailure] No legacy lane for this sender — notice not delivered', {
+      threadId: threadId || null,
+      threadKey: threadKey || null,
+      to: fromAgentId,
+      failedTarget: toAgentId,
+    });
+    return { via: 'legacy', ok: false };
+  }
   const { error: legacyErr } = await client.from('agent_inbox').insert({
     recipient_user_id: userId,
     recipient_agent_id: fromAgentId,

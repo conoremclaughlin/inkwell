@@ -7262,7 +7262,11 @@ router.get('/threads', async (req: Request, res: Response) => {
     for (let from = 0; ; from += PARTICIPANT_PAGE) {
       const { data: pageRows, error: participantsError } = await supabase
         .from('inbox_thread_participants')
-        .select('thread_id, sb_id, user_id, inbox_threads!inner(workspace_id)')
+        // The FK is named: two relationships exist between the tables since
+        // the cutover, and an unqualified embed is PGRST201-ambiguous.
+        .select(
+          'thread_id, sb_id, user_id, inbox_threads!inbox_thread_participants_thread_id_fkey!inner(workspace_id)'
+        )
         .eq('inbox_threads.workspace_id', workspaceId)
         .order('thread_id', { ascending: true })
         .order('principal_key', { ascending: true })
