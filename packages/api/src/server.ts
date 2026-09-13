@@ -54,9 +54,12 @@ import { storedTriggerMedia } from './channels/agent-media';
 import { resolveRouteAgentId } from './services/routing/resolve-route';
 import { resolveAgentFromMention } from './services/routing/resolve-mention';
 import { getHeartbeatProcessingConfig } from './config/heartbeat-flags';
-import { classifyError } from '@inklabs/shared';
 import { logger } from './utils/logger';
-import { resolveFailureNoticeAddress, resolveThreadTriggerScope } from './services/trigger-scope';
+import { resolveThreadTriggerScope } from './services/trigger-scope';
+import {
+  handleTriggerFailure,
+  type TriggerFailureEvent,
+} from './services/trigger-failure-listener';
 import {
   decideChannelForward,
   applyChannelForward,
@@ -75,7 +78,6 @@ import { GraphExecutorService } from './services/graph-executor.service';
 import { interruptActiveRuns } from './services/sessions/interrupt-active-runs';
 import type { ActivityType } from './data/repositories/activity-stream.repository';
 import { resolveTaskGroupForThreadKey } from './services/task-group-resolver';
-import { sendTriggerFailureNotice } from './services/trigger-failure-notice';
 import { StudioLeaseService } from './services/studio-lease.service';
 import { StudioOverflowService } from './services/studio-overflow.service';
 
@@ -1511,145 +1513,11 @@ When you complete a task_request, mark it as completed using update_inbox_messag
   logger.info('Default agent trigger handler registered (stateless, database-driven)');
 
   // 7b. Listen for trigger failures — restore inbox message + notify sender
-  agentGateway.on(
-    'trigger:error',
-    async ({
-      triggerId,
-      payload,
-      error,
-    }: {
-      triggerId: string;
-      payload: AgentTriggerPayload;
-      error: unknown;
-    }) => {
-      const errorText = error instanceof Error ? error.message : String(error);
-      const classification = classifyError({ errorText });
-
-      // Log full error text — truncateSummary only keeps the first line,
-      // which loses stderr content that's critical for diagnosis.
-      logger.warn('[TriggerFailure] Processing failure notification', {
-        triggerId,
-        from: payload.fromAgentId,
-        to: payload.toAgentId,
-        category: classification.category,
-        retryable: classification.retryable,
-        inboxMessageId: payload.inboxMessageId,
-        threadKey: payload.threadKey,
-        errorText: errorText.slice(0, 2000),
-      });
-
-      const client = dataComposer?.getClient();
-      if (!client) return;
-
-      // 1. Restore inbox message to unread (only for agent_inbox rows — not thread messages)
-      if (payload.inboxMessageId) {
-        const { error: restoreErr } = await client
-          .from('agent_inbox')
-          .update({ status: 'unread', read_at: null })
-          .eq('id', payload.inboxMessageId)
-          .eq('status', 'read');
-
-        if (restoreErr) {
-          logger.warn('[TriggerFailure] Failed to restore inbox message', {
-            inboxMessageId: payload.inboxMessageId,
-            error: restoreErr.message,
-          });
-        } else {
-          logger.info('[TriggerFailure] Restored inbox message to unread', {
-            inboxMessageId: payload.inboxMessageId,
-          });
-        }
-      }
-
-      // 2. Notify sender agent (if there is one) — skip if no sender to avoid loops
-      if (!payload.fromAgentId) return;
-
-      // Where the notice belongs. The target's owner attributes the activity;
-      // the SENDER's owner is whose inbox a legacy-lane notice may land in —
-      // they differ in a shared workspace (Lumen, #618). A person or the
-      // system holds no agent inbox: their notice has only the thread lane.
-      let recipientUserId: string | undefined;
-      let resolvedThreadId: string | undefined;
-      let resolvedThreadWorkspaceId: string | undefined;
-      let senderOwnerUserId: string | undefined;
-      if (payload.inboxMessageId) {
-        const { data: origMsg } = await client
-          .from('agent_inbox')
-          .select('recipient_user_id')
-          .eq('id', payload.inboxMessageId)
-          .single();
-        // Legacy lane: one owner for both agents, by construction.
-        recipientUserId = origMsg?.recipient_user_id;
-        senderOwnerUserId = recipientUserId;
-      } else if (payload.threadMessageId || payload.threadId) {
-        const address = await resolveFailureNoticeAddress(client, payload);
-        resolvedThreadId = address.threadId;
-        resolvedThreadWorkspaceId = address.threadWorkspaceId;
-        recipientUserId = address.targetOwnerUserId;
-        senderOwnerUserId = address.senderOwnerUserId;
-      }
-
-      // Bare trigger_agent (no source row, possibly just a threadKey): fall
-      // back to the user stamped server-side post-auth by handleTriggerAgent.
-      // Row-derived resolution stays preferred; this fallback is what lets a
-      // threadKey-only failure reach thread resolution at all (PR #487).
-      if (!recipientUserId && payload.recipientUserId) {
-        recipientUserId = payload.recipientUserId;
-      }
-      // A bare trigger has one owner for both agents by construction, and
-      // handleTriggerAgent stamps that owner: the sender's inbox is theirs.
-      if (!senderOwnerUserId && !payload.toSbId && payload.recipientUserId) {
-        senderOwnerUserId = payload.recipientUserId;
-      }
-
-      if (recipientUserId) {
-        await logInkmail('inkmail_fail', payload, recipientUserId, {
-          error: errorText.slice(0, 2000),
-        });
-      }
-
-      if (!recipientUserId) {
-        logger.warn('[TriggerFailure] Cannot notify sender — no userId from inbox message');
-        return;
-      }
-
-      const categoryLabel =
-        classification.category !== 'unknown' ? ` (${classification.category})` : '';
-      const notificationContent = `Trigger to ${payload.toAgentId} failed${categoryLabel}: ${classification.summary}`;
-
-      // Thread-borne trigger → notice joins the thread (participants and
-      // session stamps already exist; stamped-only delivery lands it in
-      // exactly one session per participant). Threadless → legacy inbox.
-      const noticeResult = await sendTriggerFailureNotice(client, {
-        // The legacy lane's recipient owner is the SENDER's; without one
-        // the notice has only the thread lane.
-        userId: senderOwnerUserId ?? recipientUserId,
-        legacyLane: !!senderOwnerUserId,
-        fromAgentId: payload.fromAgentId,
-        toAgentId: payload.toAgentId,
-        threadId: resolvedThreadId,
-        threadKey: payload.threadKey,
-        workspaceId: resolvedThreadWorkspaceId ?? null,
-        subject: `Trigger failed: ${payload.toAgentId}`,
-        content: notificationContent,
-        metadata: {
-          triggerFailure: true,
-          triggerId,
-          errorCategory: classification.category,
-          errorSummary: classification.summary,
-          errorDetail: errorText.slice(0, 4000),
-          retryable: classification.retryable,
-          originalInboxMessageId: payload.inboxMessageId || null,
-        },
-      });
-      if (noticeResult.ok) {
-        logger.info('[TriggerFailure] Sent failure notification to sender', {
-          sender: payload.fromAgentId,
-          category: classification.category,
-          via: noticeResult.via,
-        });
-      }
-    }
+  agentGateway.on('trigger:error', (event: TriggerFailureEvent) =>
+    handleTriggerFailure(dataComposer?.getClient(), event, {
+      logInkmailFailure: (payload, userId, extra) =>
+        logInkmail('inkmail_fail', payload, userId, extra),
+    })
   );
 
   // 8. Print status

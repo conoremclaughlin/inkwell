@@ -22,8 +22,11 @@ import { logger } from '../utils/logger';
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
 export interface TriggerFailureNotice {
-  /** Owner of the thread / inbox. */
-  userId: string;
+  /**
+   * Owner of the inbox the legacy lane may write to — the sender's. Without
+   * one the notice has only the thread lane.
+   */
+  userId?: string;
   /** Original trigger sender — the agent being notified. */
   fromAgentId: string;
   /** Failed trigger target — named in content; legacy-lane attributed sender. */
@@ -126,7 +129,7 @@ export async function sendTriggerFailureNotice(
 
   // Threadless (or thread write failed): legacy agent-scoped inbox — only
   // when the caller established whose inbox that is.
-  if (notice.legacyLane === false) {
+  if (notice.legacyLane === false || !userId) {
     logger.warn('[TriggerFailure] No legacy lane for this sender — notice not delivered', {
       threadId: threadId || null,
       threadKey: threadKey || null,
