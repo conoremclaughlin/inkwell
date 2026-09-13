@@ -516,8 +516,14 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       : process.env.NODE_ENV !== 'production';
   const heartbeatInterval = process.env.HEARTBEAT_INTERVAL || '*/5 * * * *';
 
+  // cwd is in here because its absence cost a day. This line said
+  // `heartbeatServiceEnabled: true` on a worktree server for thirteen hours and
+  // there was no way to tell from the log WHICH checkout was claiming Myra's
+  // reminders — the two servers share one log file, so the duplicate ticks read
+  // as one chatty process. The directory is the whole diagnosis.
   logger.info('Heartbeat service flags evaluated', {
     heartbeatServiceEnabled,
+    cwd: process.cwd(),
     ...heartbeatServiceFlags,
   });
 
