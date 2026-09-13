@@ -4484,6 +4484,14 @@ export type Database = {
         };
         Returns: string;
       };
+      reopen_inbox_thread: {
+        Args: {
+          p_thread_id: string;
+          p_actor_kind: string;
+          p_actor_agent_id?: string | null;
+        };
+        Returns: boolean;
+      };
       add_graph_nodes: {
         Args: {
           p_user_id: string;

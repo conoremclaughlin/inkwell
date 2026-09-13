@@ -9,6 +9,7 @@ import { apiFetch } from '../lib/api';
 import { getWorkspaceId, setWorkspaceId } from '../lib/storage';
 import type {
   IndividualsResponse,
+  ReopenResponse,
   ReplyResponse,
   StartThreadInput,
   StartThreadResponse,
@@ -86,6 +87,26 @@ export function useSessionLogs(sessionId: string, enabled: boolean) {
         `/api/admin/sessions/${sessionId}/logs?limit=200&offset=0&includeLocal=true`
       ),
     enabled,
+  });
+}
+
+/**
+ * Reopen a closed thread — explicitly. A reply never reopens (spec
+ * inkmail-thread-scope §2); this is the action that says the work is back
+ * on. It wakes nobody; a reply afterwards is how the participants hear.
+ */
+export function useReopenThread(threadKey: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: () =>
+      apiFetch<ReopenResponse>('/api/admin/threads/reopen', {
+        method: 'POST',
+        body: JSON.stringify({ key: threadKey }),
+      }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['thread', threadKey] });
+      void queryClient.invalidateQueries({ queryKey: ['threads'] });
+    },
   });
 }
 

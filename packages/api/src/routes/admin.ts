@@ -18,7 +18,7 @@ import { getHeartbeatProcessingConfig } from '../config/heartbeat-flags';
 import { runWithRequestContext } from '../utils/request-context';
 import { getDataComposer } from '../data/composer';
 import { handleSendToInbox } from '../mcp/tools/inbox-handlers';
-import { getParticipants } from '../mcp/tools/thread-handlers';
+import { getParticipants, reopenThreadRow } from '../mcp/tools/thread-handlers';
 import { FixedWindowLimiter } from '../utils/fixed-window-limiter';
 import { notifyPlatformOfApprovalRequest } from '../channels/approval-interceptor';
 
@@ -7733,6 +7733,64 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
   } catch (error) {
     logger.error('Failed to send thread reply:', error);
     res.status(500).json(errorJson('Failed to send reply', error));
+  }
+});
+
+/**
+ * POST /api/admin/threads/reopen
+ * Body: { key } → { success, threadKey, reopened, alreadyOpen }
+ *
+ * The owner's recovery path (spec inkmail-thread-scope §2, §6): a participant
+ * reopens through reopen_thread; the workspace owner or admin recovers any
+ * thread. Until the workspace cutover a thread's owner is its user_id, so
+ * that is the scope check here. Idempotent from the caller's side: an
+ * already-open thread answers 200 with reopened: false — the state the person
+ * asked for holds either way.
+ *
+ * Reopening wakes nobody. It says the work is back on; a reply is how the
+ * participants hear about it. A reply never reopens (see /threads/reply).
+ */
+router.post('/threads/reopen', async (req: Request, res: Response) => {
+  try {
+    const key = typeof req.body?.key === 'string' ? req.body.key.trim() : '';
+    if (!key) {
+      res.status(400).json({ error: 'key is required' });
+      return;
+    }
+
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const authReq = req as AdminAuthRequest;
+
+    const { data: thread, error: threadError } = await supabase
+      .from('inbox_threads')
+      .select('id, thread_key, status')
+      .eq('user_id', authReq.pcpUserId)
+      .eq('thread_key', key)
+      .maybeSingle();
+    if (threadError) {
+      logger.error('Failed to load thread for reopen:', threadError);
+      res.status(500).json(errorJson('Failed to reopen thread', threadError));
+      return;
+    }
+    if (!thread) {
+      res.status(404).json({ error: `No thread with key "${key}"` });
+      return;
+    }
+    if (thread.status !== 'closed') {
+      res.json({ success: true, threadKey: key, reopened: false, alreadyOpen: true });
+      return;
+    }
+
+    const dataComposer = await getDataComposer();
+    const { reopened } = await reopenThreadRow(dataComposer.getClient(), thread.id, {
+      kind: 'user',
+    });
+    res.json({ success: true, threadKey: key, reopened, alreadyOpen: !reopened });
+  } catch (error) {
+    logger.error('Failed to reopen thread:', error);
+    res.status(500).json(errorJson('Failed to reopen thread', error));
   }
 });
 

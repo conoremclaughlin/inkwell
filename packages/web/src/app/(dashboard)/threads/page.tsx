@@ -22,6 +22,7 @@ import {
 } from 'lucide-react';
 import { useApiQuery } from '@/lib/api';
 import { ReplyComposer, senderLabel } from '@/components/threads/reply-composer';
+import { ReopenThreadButton } from '@/components/threads/reopen-button';
 import clsx from 'clsx';
 
 // ─── Types mirroring GET /api/admin/threads ───
@@ -605,6 +606,7 @@ function SpineDetail({ spine, onBack }: { spine: ThreadSpine; onBack: () => void
               no thread yet
             </Badge>
           )}
+          {spine.thread?.status === 'closed' && <ReopenThreadButton threadKey={spine.key} />}
         </div>
         {displayTitle(spine) && <div className="mt-1 text-sm">{displayTitle(spine)}</div>}
         <div className="mt-1 text-xs text-muted-foreground">
