@@ -150,6 +150,73 @@ else
   bad "scanner output names the offending variable" "output: $(echo "$out" | tr '\n' ' ')"
 fi
 
+# Checking for the whole canary is too weak to pin this. The named arm matches
+# one byte past the `=`, and `grep -o` reports what it matched, so dropping the
+# strip leaks the first character of the secret and the whole-value check stays
+# green. One byte is still disclosure, and a one-byte regression is exactly the
+# kind that survives review. Assert the shape instead: a reported line is
+# "line N: NAME" and carries no `=` at all, so no value byte can ride along.
+reported=$(echo "$out" | grep '^   line ')
+if [ -z "$reported" ]; then
+  bad "reported hit lines carry no value bytes" "no 'line N:' output to check"
+elif echo "$reported" | grep -q '='; then
+  bad "reported hit lines carry no value bytes" "reported: $(echo "$reported" | tr '\n' ' ')"
+else
+  ok "reported hit lines carry no value bytes"
+fi
+
+# A $(...) span splices its output into the middle of a sentence rather than
+# onto a line of its own, so the named arm is not anchored to line start. That
+# is the shape an anchored pattern reads straight past.
+f=$(write_msg midline-splice <<'EOF'
+fix: honour the JWT_SECRET=s3cretvalue flag on the cache entry
+EOF
+)
+expect_exit 1 "secret spliced mid-sentence is blocked" "$f"
+
+# Prefixed names. The word boundary in front of the named list excludes _, so
+# without the optional prefix group these read through -- and a dump prints the
+# names the environment really has, which here are routinely prefixed.
+f=$(write_msg prefixed-name <<'EOF'
+fix: honour the PCP_JWT_SECRET=s3cretvalue flag
+EOF
+)
+expect_exit 1 "prefixed secret name is blocked" "$f"
+
+out=$(sh "$guard" "$f" 2>&1)
+if echo "$out" | grep -q "PCP_JWT_SECRET"; then
+  ok "prefixed name is reported in full, not just the matched tail"
+else
+  bad "prefixed name is reported in full, not just the matched tail" "output: $(echo "$out" | tr '\n' ' ')"
+fi
+
+# The other side of unanchoring: prose about these variables must still pass, or
+# every future commit discussing the guard trips it. Placeholders are written
+# <like-this> or ***, and no real credential starts with either byte.
+f=$(write_msg placeholder-prose <<'EOF'
+docs: explain the guard
+
+A spliced span looks like JWT_SECRET=<value> once it lands. Redacted logs
+render it as GITHUB_TOKEN=*** instead. To run locally, set JWT_SECRET= in
+your env first.
+EOF
+)
+expect_exit 0 "placeholder and bare-assignment prose is allowed" "$f"
+
+# The value byte is a whitelist rather than a punctuation blacklist, because a
+# blacklist kept losing a byte at a time to ordinary prose about this guard.
+# Both of these were live false positives on real commit messages for this PR:
+# a name list where the sentence ends on the =, and a quoted short example.
+f=$(write_msg prose-ends-on-equals <<'EOF'
+fix: widen the named arm
+
+The boundary excluded underscore, so the arm matched JWT_SECRET= but not
+PCP_JWT_SECRET= or MY_GITHUB_TOKEN=. Both were allowed; both are closed now,
+and a list like GITHUB_TOKEN=, JWT_SECRET= reads as prose rather than a leak.
+EOF
+)
+expect_exit 0 "prose whose sentence ends on the equals sign is allowed" "$f"
+
 f=$(write_msg dump-three <<'EOF'
 fix: a message that swallowed an environment dump
 

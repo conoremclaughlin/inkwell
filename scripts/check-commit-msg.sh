@@ -34,9 +34,27 @@ fi
 #
 # The trailing class keeps prose from tripping it: a bare "set JWT_SECRET= in
 # your env" has whitespace after the =, and a placeholder is written <like-this>
-# or ***. No real credential begins with < or *. This arm caught the commit
-# message introducing it, which is how the exclusion got here.
-named='(^|[^A-Za-z0-9_])(SUPABASE_SECRET_KEY|SUPABASE_PUBLISHABLE_KEY|JWT_SECRET|GITHUB_TOKEN|GOOGLE_CLIENT_SECRET|GOOGLE_CLIENT_ID|TELEGRAM_[A-Z_]*BOT_TOKEN|SB_TEST_PASSWORD|ANTHROPIC_API_KEY|OPENAI_API_KEY|INK_ACCESS_TOKEN|CLAUDE_CODE_MESSAGING_TOKEN|ZSH_EXECUTION_STRING)=[^[:space:]<*]'
+# or ***. This arm caught the commit message introducing it, which is how the
+# exclusion got here -- and then caught the message introducing the prefix group
+# below, on "... or MY_GITHUB_TOKEN=." where the value byte was a full stop.
+#
+# So the class is now a whitelist of bytes a credential can actually START with,
+# rather than a blacklist of the punctuation we have been bitten by so far. The
+# blacklist was losing a byte at a time to ordinary prose about the guard, which
+# is a losing shape: every future commit discussing this file is a new chance to
+# find one we had not thought of. Checked against the leaks rather than assumed
+# -- none of the three quotes its values, and every named assignment in all
+# three starts inside this class.
+#
+# The optional ([A-Za-z0-9_]*_) prefix matters more than it looks. The word
+# boundary before it excludes _, so without the prefix group a name like
+# PCP_JWT_SECRET= or MY_GITHUB_TOKEN= read straight through — and a dump prints
+# whatever names the environment actually has, which in this repo are routinely
+# prefixed. The dump arm still caught a full env dump at three lines, so the gap
+# was only ever open for a mid-line splice or a one- or two-line partial: the
+# same two shapes the named arm exists to cover. It also keeps the report honest,
+# naming PCP_JWT_SECRET rather than the JWT_SECRET tail it matched on.
+named='(^|[^A-Za-z0-9_])([A-Za-z0-9_]*_)?(SUPABASE_SECRET_KEY|SUPABASE_PUBLISHABLE_KEY|JWT_SECRET|GITHUB_TOKEN|GOOGLE_CLIENT_SECRET|GOOGLE_CLIENT_ID|TELEGRAM_[A-Z_]*BOT_TOKEN|SB_TEST_PASSWORD|ANTHROPIC_API_KEY|OPENAI_API_KEY|INK_ACCESS_TOKEN|CLAUDE_CODE_MESSAGING_TOKEN|ZSH_EXECUTION_STRING)=[A-Za-z0-9_/+-]'
 
 # Vendor token shapes, for secrets not named above.
 shapes='(gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{20}|GOCSPX-[A-Za-z0-9_-]{20}|sb_secret_[A-Za-z0-9_-]{20}|sk-ant-[A-Za-z0-9_-]{20}|[0-9]{8,10}:AA[A-Za-z0-9_-]{33})'
