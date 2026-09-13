@@ -777,12 +777,33 @@ function guardMsg(id: string, ageHours: number): GuardMsg {
  */
 function createGuardMockSupabase(
   rows: GuardMsg[],
-  opts: { lastReadAt?: string | null; joinedAt?: string | null } = {}
+  opts: {
+    lastReadAt?: string | null;
+    joinedAt?: string | null;
+    /**
+     * Make every `head: true` count query resolve with a PostgREST error.
+     * This is the shape a count timeout actually takes — it resolves with
+     * `{ count: null, error }` rather than throwing, which is precisely how
+     * discarding the error turned an unknown into a confident zero.
+     */
+    countError?: string;
+    /**
+     * A message that lands between the main query and the diagnostic count —
+     * a concurrent insert. It is unread by definition, so it must never be
+     * counted as something the read pointer already withheld.
+     */
+    lateRow?: GuardMsg;
+  } = {}
 ) {
+  // Flips once the main (non-head) message query has run, so `lateRow` can
+  // appear only to the diagnostic count that follows it.
+  let mainQueryDone = false;
+
   const messagesChain = () => {
     const state = {
       gts: [] as string[],
       lts: [] as string[],
+      ltes: [] as string[],
       neqType: null as string | null,
       idEq: null as string | null,
       asc: true,
@@ -811,6 +832,10 @@ function createGuardMockSupabase(
       state.lts.push(val);
       return self;
     });
+    self.lte = vi.fn((_col: string, val: string) => {
+      state.ltes.push(val);
+      return self;
+    });
     self.order = vi.fn((_col: string, o?: { ascending?: boolean }) => {
       state.asc = o?.ascending !== false;
       return self;
@@ -820,10 +845,16 @@ function createGuardMockSupabase(
       return self;
     });
     const compute = () => {
+      if (!state.head) {
+        mainQueryDone = true;
+      } else if (mainQueryDone && opts.lateRow && !rows.includes(opts.lateRow)) {
+        rows.push(opts.lateRow);
+      }
       let out = rows.filter(
         (r) =>
           state.gts.every((g) => r.created_at > g) &&
           state.lts.every((l) => r.created_at < l) &&
+          state.ltes.every((l) => r.created_at <= l) &&
           (state.neqType === null || r.message_type !== state.neqType)
       );
       out = out.sort((a, b) =>
@@ -833,6 +864,9 @@ function createGuardMockSupabase(
       );
       const count = out.length;
       if (state.limit !== null) out = out.slice(0, state.limit);
+      if (state.head && opts.countError) {
+        return { data: null, error: { message: opts.countError }, count: null };
+      }
       return { data: state.head ? null : out, error: null, count };
     };
     self.single = vi.fn(() => {
@@ -1310,5 +1344,168 @@ describe('handleGetThreadMessages — empty vs already-consumed', () => {
 
     expect(parsed.messageCount).toBe(10);
     expect(parsed.truncatedNewerCount).toBeUndefined();
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// Round-two review (Lumen, 2026-09-11). Three findings, one shape: a value
+// the handler does not actually know, presented as one it does.
+//
+//   - a message excluded by the caller's OWN filter, reported as already read
+//   - `latestN` callers given the bare empty list the PR exists to abolish
+//   - a failed count reported as zero, which reads as "nothing there"
+// ═══════════════════════════════════════════════════════════════════
+describe('handleGetThreadMessages — an unknown is never reported as a fact', () => {
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    const userResolver = await import('../../services/user-resolver');
+    vi.mocked(userResolver.resolveUserOrThrow).mockResolvedValue({
+      user: { id: 'user-123' },
+      resolvedBy: 'userId',
+    } as never);
+  });
+
+  it('does not blame read state for a message excluded by newerThan', async () => {
+    // Lumen's exact reproduction: pointer 5h ago, one message 3h ago, caller
+    // asks for anything newer than 1h ago. The message IS newer than the
+    // pointer — only the explicit filter excluded it. Calling that
+    // "hiddenByReadState" sends the caller to a fullHistory retry that also
+    // returns nothing, because read state was never the reason.
+    const rows = [guardMsg('m-1', 3)];
+    const parsed = await callGuard(createGuardMockSupabase(rows, { lastReadAt: hoursAgo(5) }), {
+      newerThan: hoursAgo(1),
+    });
+
+    expect(parsed.messageCount).toBe(0);
+    expect(parsed.hiddenByReadState).toBeUndefined();
+    expect(parsed.hint).toBeUndefined();
+  });
+
+  it('still reports what the pointer withheld when newerThan is older than it', async () => {
+    // The positive control for the test above: the explicit filter is in play
+    // but the read floor is what actually cut the message, so we must still say
+    // so rather than going quiet out of caution.
+    const rows = [guardMsg('m-1', 6)];
+    const parsed = await callGuard(createGuardMockSupabase(rows, { lastReadAt: hoursAgo(5) }), {
+      newerThan: hoursAgo(8),
+    });
+
+    expect(parsed.messageCount).toBe(0);
+    expect(parsed.hiddenByReadState).toBe(1);
+  });
+
+  it('does not count messages the caller filtered out BELOW their own floor', async () => {
+    // The case that isolates filter preservation from the read-floor bound.
+    // Message is 20h old; the caller asked for nothing older than 10h; the
+    // pointer is at 5h. The message sits below BOTH, so the read floor is not
+    // the only reason it is missing — counting it would promise a fullHistory
+    // retry that `newerThan` would filter out all over again.
+    const rows = [guardMsg('m-1', 20)];
+    const parsed = await callGuard(createGuardMockSupabase(rows, { lastReadAt: hoursAgo(5) }), {
+      newerThan: hoursAgo(10),
+    });
+
+    expect(parsed.messageCount).toBe(0);
+    expect(parsed.hiddenByReadState).toBeUndefined();
+  });
+
+  it('diagnoses a consumed thread for an ordinary latestN caller', async () => {
+    // `latestN` flips the query newest-first, which is not the same thing as
+    // being a delivery poll. Asking for recent context is a normal agent call
+    // and used to get the same bare empty list as a genuinely empty thread.
+    const rows = [guardMsg('m-1', 5), guardMsg('m-2', 4)];
+    const parsed = await callGuard(createGuardMockSupabase(rows, { lastReadAt: hoursAgo(1) }), {
+      latestN: 10,
+    });
+
+    expect(parsed.messageCount).toBe(0);
+    expect(parsed.hiddenByReadState).toBe(2);
+    expect(parsed.hint).toContain('fullHistory');
+  });
+
+  it('leaves a channel poll undiagnosed — it owns its own cursor', async () => {
+    // The control Lumen asked to retain: a cold poll must not pay for an extra
+    // count query, and an empty poll is an expected outcome there.
+    const rows = [guardMsg('m-1', 5)];
+    const parsed = await callGuard(createGuardMockSupabase(rows, { lastReadAt: hoursAgo(1) }), {
+      channelPoll: true,
+    });
+
+    expect(parsed.messageCount).toBe(0);
+    expect(parsed.hiddenByReadState).toBeUndefined();
+  });
+
+  it('says the diagnostic is unavailable rather than reporting zero', async () => {
+    const rows = [guardMsg('m-1', 5)];
+    const parsed = await callGuard(
+      createGuardMockSupabase(rows, {
+        lastReadAt: hoursAgo(1),
+        countError: 'canceling statement due to statement timeout',
+      })
+    );
+
+    expect(parsed.messageCount).toBe(0);
+    // The failure mode being prevented: `hiddenByReadState: 0` plus no hint is
+    // indistinguishable from a genuinely empty thread.
+    expect(parsed.hiddenByReadState).toBeUndefined();
+    expect(parsed.diagnosticsUnavailable).toBe(true);
+    expect(parsed.warning).toContain('NOT evidence');
+  });
+
+  it('says so when the truncation count fails too', async () => {
+    const rows = Array.from({ length: 60 }, (_, i) => guardMsg(`m-${i}`, 100 - i));
+    const parsed = await callGuard(
+      createGuardMockSupabase(rows, { countError: 'connection reset by peer' }),
+      { fullHistory: true, limit: 50 }
+    );
+
+    expect(parsed.messageCount).toBe(50);
+    // A full page with no truncation count is not a complete page.
+    expect(parsed.truncatedNewerCount).toBeUndefined();
+    expect(parsed.diagnosticsUnavailable).toBe(true);
+  });
+
+  it('does not claim previous delivery when only joined_at supplied the floor', async () => {
+    // A brand-new participant has been sent nothing. Telling it the history
+    // "may already have been delivered to you" is false and sends it looking
+    // for a delivery that never happened.
+    const rows = [guardMsg('m-1', 5)];
+    const parsed = await callGuard(
+      createGuardMockSupabase(rows, { lastReadAt: null, joinedAt: hoursAgo(1) })
+    );
+
+    expect(parsed.hiddenByReadState).toBe(1);
+    expect(parsed.hint).toContain('pre-join history');
+    expect(parsed.hint).not.toContain('read pointer');
+  });
+});
+
+describe('handleGetThreadMessages — a concurrent insert is not something you read', () => {
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    const userResolver = await import('../../services/user-resolver');
+    vi.mocked(userResolver.resolveUserOrThrow).mockResolvedValue({
+      user: { id: 'user-123' },
+      resolvedBy: 'userId',
+    } as never);
+  });
+
+  it('does not count a message that arrived after the read floor was captured', async () => {
+    // The main query runs, finds nothing past the pointer, and THEN a message
+    // lands. The diagnostic count that follows can see it. Counting it would
+    // tell the caller it had already been given a message written moments ago —
+    // and, worse, suppress the impression that anything new is waiting.
+    //
+    // Bounding the count at the floor we captured is what keeps "already read"
+    // meaning strictly "at or below the pointer".
+    const parsed = await callGuard(
+      createGuardMockSupabase([], {
+        lastReadAt: hoursAgo(5),
+        lateRow: guardMsg('arrived-mid-request', 0),
+      })
+    );
+
+    expect(parsed.messageCount).toBe(0);
+    expect(parsed.hiddenByReadState).toBeUndefined();
   });
 });
