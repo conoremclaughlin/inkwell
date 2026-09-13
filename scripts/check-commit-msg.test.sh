@@ -217,6 +217,42 @@ EOF
 )
 expect_exit 0 "prose whose sentence ends on the equals sign is allowed" "$f"
 
+# A quoted value is the bypass the first-byte blacklist left open: a value class
+# that only admits credential bytes rejects its own opening quote and the whole
+# assignment reads through. Both quote styles, because a dump may emit either.
+f=$(write_msg quoted-double <<'EOF'
+fix: an ordinary subject
+
+JWT_SECRET="s3cretvaluehere"
+EOF
+)
+expect_exit 1 "double-quoted secret value is blocked" "$f"
+
+f=$(write_msg quoted-single <<'EOF'
+fix: an ordinary subject
+
+JWT_SECRET='s3cretvaluehere'
+EOF
+)
+expect_exit 1 "single-quoted secret value is blocked" "$f"
+
+# What separates a secret from prose here is a run of credential-shaped bytes,
+# not the punctuation we happen to have been bitten by. That makes the rule a
+# length threshold, and a threshold has a documented floor: below it the named
+# arm does not fire and the dump arm and vendor shapes are what remain. Pinned
+# so the floor cannot drift without a failing test.
+f=$(write_msg short-value <<'EOF'
+fix: prose naming a short default like JWT_SECRET=dev in a sentence
+EOF
+)
+expect_exit 0 "value shorter than the credential-run floor is allowed" "$f"
+
+f=$(write_msg long-value <<'EOF'
+fix: prose naming JWT_SECRET=abcdefghijkl in a sentence
+EOF
+)
+expect_exit 1 "value at or above the credential-run floor is blocked" "$f"
+
 f=$(write_msg dump-three <<'EOF'
 fix: a message that swallowed an environment dump
 
@@ -260,6 +296,79 @@ if [ "$got" -eq 2 ]; then
 else
   bad "nonexistent message file exits 2" "got $got"
 fi
+
+# A scan that did not complete must not read as a scan that found nothing.
+# grep exits >=2 on error; collapsing that into "no match" fails OPEN exactly
+# when the guard is malfunctioning. An unreadable regular file gets past the
+# -f check at the top and reaches grep, which is the cheapest way to drive a
+# real grep error rather than a simulated one.
+unreadable="$work/unreadable.msg"
+printf 'fix: an entirely clean message\n' > "$unreadable"
+chmod 000 "$unreadable"
+out=$(sh "$guard" "$unreadable" 2>&1)
+got=$?
+chmod 644 "$unreadable"
+if [ "$got" -eq 2 ]; then
+  ok "unreadable message file fails closed (exit 2)"
+else
+  bad "unreadable message file fails closed (exit 2)" "got $got — a failed scan passed as clean"
+fi
+if echo "$out" | grep -q "scan did not complete"; then
+  ok "failed scan says so, rather than reporting a clean result"
+else
+  bad "failed scan says so, rather than reporting a clean result" "$(echo "$out" | tr '\n' ' ')"
+fi
+
+# The unreadable-file case above breaks EVERY scan at once, so it passes as long
+# as any one arm still guards -- it cannot tell which. Removing the guard from a
+# single arm leaves it green, which is the "passes for the wrong reason" shape
+# this suite exists to avoid. So fault one grep invocation at a time, via a stub
+# on PATH that delegates to the real grep except on its Nth call. The code under
+# test is the real script; only the external tool it depends on is faulted, which
+# is exactly the failure being guarded against.
+#
+# Call order for a clean message: 1 named, 2 vendor shapes, 3 dump count.
+REAL_GREP=$(command -v grep)
+clean_for_fault="$work/clean-for-fault.msg"
+printf 'fix: an entirely clean message\n' > "$clean_for_fault"
+
+fault_grep() {
+  n=$1
+  bindir="$work/faultbin$n"
+  mkdir -p "$bindir"
+  rm -f "$bindir/count"
+  cat > "$bindir/grep" <<EOF
+#!/bin/sh
+c=\$(cat "$bindir/count" 2>/dev/null || echo 0)
+c=\$((c + 1))
+echo "\$c" > "$bindir/count"
+[ "\$c" -eq $n ] && exit 2
+exec "$REAL_GREP" "\$@"
+EOF
+  chmod +x "$bindir/grep"
+  PATH="$bindir:$PATH" sh "$guard" "$clean_for_fault" >/dev/null 2>&1
+}
+
+# Sanity: the stub must be transparent when it is not faulting, or a "blocked"
+# result below would just mean the harness broke.
+fault_grep 99
+if [ $? -eq 0 ]; then
+  ok "grep stub is transparent when not faulting"
+else
+  bad "grep stub is transparent when not faulting" "clean message did not pass through the stub"
+fi
+
+for arm in "1:named-variable" "2:vendor-shape" "3:dump-count"; do
+  n=${arm%%:*}
+  what=${arm#*:}
+  fault_grep "$n"
+  rc=$?
+  if [ "$rc" -eq 2 ]; then
+    ok "$what scan failure fails closed"
+  else
+    bad "$what scan failure fails closed" "exit $rc — this arm's error passed as a clean result"
+  fi
+done
 
 # ---------------------------------------------------------------------------
 # Tier 2: the wiring

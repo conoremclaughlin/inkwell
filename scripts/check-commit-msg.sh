@@ -54,20 +54,52 @@ fi
 # was only ever open for a mid-line splice or a one- or two-line partial: the
 # same two shapes the named arm exists to cover. It also keeps the report honest,
 # naming PCP_JWT_SECRET rather than the JWT_SECRET tail it matched on.
-named='(^|[^A-Za-z0-9_])([A-Za-z0-9_]*_)?(SUPABASE_SECRET_KEY|SUPABASE_PUBLISHABLE_KEY|JWT_SECRET|GITHUB_TOKEN|GOOGLE_CLIENT_SECRET|GOOGLE_CLIENT_ID|TELEGRAM_[A-Z_]*BOT_TOKEN|SB_TEST_PASSWORD|ANTHROPIC_API_KEY|OPENAI_API_KEY|INK_ACCESS_TOKEN|CLAUDE_CODE_MESSAGING_TOKEN|ZSH_EXECUTION_STRING)=[A-Za-z0-9_/+-]'
+named='(^|[^A-Za-z0-9_])([A-Za-z0-9_]*_)?(SUPABASE_SECRET_KEY|SUPABASE_PUBLISHABLE_KEY|JWT_SECRET|GITHUB_TOKEN|GOOGLE_CLIENT_SECRET|GOOGLE_CLIENT_ID|TELEGRAM_[A-Z_]*BOT_TOKEN|SB_TEST_PASSWORD|ANTHROPIC_API_KEY|OPENAI_API_KEY|INK_ACCESS_TOKEN|CLAUDE_CODE_MESSAGING_TOKEN|ZSH_EXECUTION_STRING)=["'\'']?[A-Za-z0-9_/+-][^[:space:]]{7,}'
 
 # Vendor token shapes, for secrets not named above.
 shapes='(gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{20}|GOCSPX-[A-Za-z0-9_-]{20}|sb_secret_[A-Za-z0-9_-]{20}|sk-ant-[A-Za-z0-9_-]{20}|[0-9]{8,10}:AA[A-Za-z0-9_-]{33})'
 
+# A scan that did not complete is not a scan that found nothing.
+#
+# grep exits 0 for a match, 1 for no match, and >=2 for an error — an unreadable
+# file, an invalid pattern after an edit, a read fault. Collapsing >=2 into "no
+# match" makes the guard fail OPEN exactly when it is malfunctioning, which is
+# the worst available direction for a credential check. Each scan therefore
+# captures its own status before any pipe (a pipeline reports the LAST command's
+# status, so grep's would be discarded by the sed that follows it), and a failed
+# scan refuses the commit rather than passing an unchecked message.
+scan_failed() {
+  echo "" >&2
+  echo "Commit blocked: the credential scan did not complete." >&2
+  echo "" >&2
+  echo "   grep exited $2 while scanning for $1 — that is an error, not a clean" >&2
+  echo "   result, so the message has NOT been checked and is refused rather" >&2
+  echo "   than assumed safe." >&2
+  echo "" >&2
+  echo "   Nothing has been committed; your staged changes are untouched." >&2
+  echo "   The draft message is at: $msg_file" >&2
+  echo "" >&2
+  exit 2
+}
+
 # Report variable names and line numbers only — never the values, or the hook
 # output becomes the next place the secret is written down.
 # -o so the report names the variable rather than echoing the prose around it;
-# the two sed passes drop the matched value byte and the leading word boundary.
-hits=$(grep -inoE "$named" "$msg_file" \
-  | sed -E 's/=[^[:space:]]*$//' \
+# the two sed passes drop the matched value and the leading word boundary.
+named_raw=$(grep -inoE "$named" "$msg_file")
+rc=$?
+[ "$rc" -ge 2 ] && scan_failed "named variables" "$rc"
+
+hits=$(printf '%s' "$named_raw" \
+  | sed -E 's/=.*$//' \
   | sed -E 's/^([0-9]+):[^A-Za-z0-9_]*/\1: /')
+
 if [ -z "$hits" ]; then
-  hits=$(grep -inoE "$shapes" "$msg_file" | cut -d: -f1 | sed 's/$/: vendor token pattern/')
+  shapes_raw=$(grep -inoE "$shapes" "$msg_file")
+  rc=$?
+  [ "$rc" -ge 2 ] && scan_failed "vendor token shapes" "$rc"
+
+  hits=$(printf '%s' "$shapes_raw" | cut -d: -f1 | sed 's/$/: vendor token pattern/')
 fi
 
 # An environment dump is many uppercase assignments at once, even when none is
@@ -81,6 +113,14 @@ fi
 # only two and four assignment lines, so this arm alone would have missed one of
 # them; the named list above is what catches a partial dump.
 dump=$(grep -cE '^[A-Z][A-Z0-9_]{3,}=' "$msg_file")
+rc=$?
+[ "$rc" -ge 2 ] && scan_failed "environment-style assignments" "$rc"
+
+# grep -c prints a count even when it exits 1, but a malformed count would make
+# the -ge comparison itself an error, and `[` failing is another silent pass.
+case "$dump" in
+  '' | *[!0-9]*) scan_failed "environment-style assignments (non-numeric count)" 2 ;;
+esac
 
 if [ -n "$hits" ] || [ "$dump" -ge 3 ]; then
   echo ""
