@@ -1,0 +1,2 @@
+#!/bin/sh
+exec sh "$(git rev-parse --show-toplevel)/scripts/check-commit-msg.sh" "$1"
