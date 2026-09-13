@@ -789,7 +789,20 @@ Defined in [CONTRIBUTING.md](./CONTRIBUTING.md). Key SB-specific reminders:
 - **ALL PRs require a sibling review before merge.** No exceptions unless Conor explicitly says otherwise. Do not merge your own PR without at least one other SB's LGTM. This is a hard rule — merging without review has caused bugs that could have been caught. Use `ink wait --thread pr:<number>` to hold for the review.
 - **Verify CI passes before merging.** Check `gh run list --branch <branch>` for the CI status. If tests fail, fix them before merging — don't merge red. When fixing CI, run the full test suite locally (`npx vitest run`) to catch issues before pushing.
 - **Simple PR wait helper**: for short review loops, use `yarn pr:wait-reply <prNumber> --timeout 120 --interval 10` instead of manual `sleep`, then re-check review status via MCP GitHub tools.
-- **Commit messages: write the message to a file and use `git commit -F <file>`. Never `-m "..."` for anything but a one-line subject.** A double-quoted `-m` string is shell input, so a backtick or `$(...)` anywhere in the message is **executed** and its output pasted into the commit. Markdown backticks around an identifier — ``a `local` flag`` — are the normal way we write, which makes this a trap rather than an edge case: it hit Lumen twice in February 2026 and Wren on 2026-09-13, and the 2026-09-13 commit pasted ten live credentials into a public repository. The diff stays clean, so review cannot catch it. `-F` never goes through expansion, and it handles multi-line bodies without any quoting rules to get right. Run `scripts/check-commit-msg.sh` as your `commit-msg` hook so a message that carries credentials is refused before it becomes a commit.
+- **Commit messages: write the message to a file and use `git commit -F <file>`. Never `-m`, not even for a one-line subject.** A double-quoted `-m` string is shell input, so a backtick or `$(...)` anywhere in it is **executed** and its output pasted into the commit. Markdown backticks around an identifier — ``a `local` flag`` — are the normal way we write, which makes this a trap rather than an edge case: it hit Lumen twice in February 2026 and Wren on 2026-09-13, and the 2026-09-13 commit pasted ten live credentials into a public repository. The diff stays clean, so review cannot catch it.
+
+  A subject line is **not** the safe exception it looks like — `-m "fix: honour the \`local\` flag"`hands git`fix: honour the flag` with the builtin's output spliced in, exactly like a body would. Single-quoting is not the fix either: an apostrophe in `don't` closes the string and the remainder of your message is re-parsed as shell.
+
+  **How you write the file matters as much as `-F` does.** `-F` reads bytes and never expands them, but the shell still expands whatever you use to _create_ the file:
+
+  ```bash
+  cat > msg <<'EOF'     # SAFE — quoted delimiter, every byte literal
+  cat > msg <<EOF       # UNSAFE — backticks and $VAR expand as the file is written
+  ```
+
+  Quote the heredoc delimiter, or write the file with a tool that never goes through a shell (in Claude Code, the `Write` tool). Then `git commit -F msg`.
+
+  Run `scripts/check-commit-msg.sh` as your `commit-msg` hook so a message that carries credentials is refused before it becomes a commit — it is the only hook that sees the finished message, and it catches the leak whichever way it got in.
 
 ## Architecture Notes
 

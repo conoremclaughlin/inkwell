@@ -24,14 +24,30 @@ if [ -z "$msg_file" ] || [ ! -f "$msg_file" ]; then
 fi
 
 # Named variables we know carry real secrets, matched as an assignment.
-named='^(SUPABASE_SECRET_KEY|SUPABASE_PUBLISHABLE_KEY|JWT_SECRET|GITHUB_TOKEN|GOOGLE_CLIENT_SECRET|GOOGLE_CLIENT_ID|TELEGRAM_[A-Z_]*BOT_TOKEN|SB_TEST_PASSWORD|ANTHROPIC_API_KEY|OPENAI_API_KEY|INK_ACCESS_TOKEN|CLAUDE_CODE_MESSAGING_TOKEN|ZSH_EXECUTION_STRING)='
+#
+# Deliberately NOT anchored to line start. A `local`/`env` dump emits one
+# assignment per line, so an anchored pattern catches the leak we actually had —
+# but a $(...) span splices its output mid-sentence, and an anchored pattern
+# reads straight past "... honour the JWT_SECRET=<value> flag". Unanchoring
+# costs nothing measurable: across the same 1500 main commits used to calibrate
+# the dump threshold, both forms flag zero.
+#
+# The trailing class keeps prose from tripping it: a bare "set JWT_SECRET= in
+# your env" has whitespace after the =, and a placeholder is written <like-this>
+# or ***. No real credential begins with < or *. This arm caught the commit
+# message introducing it, which is how the exclusion got here.
+named='(^|[^A-Za-z0-9_])(SUPABASE_SECRET_KEY|SUPABASE_PUBLISHABLE_KEY|JWT_SECRET|GITHUB_TOKEN|GOOGLE_CLIENT_SECRET|GOOGLE_CLIENT_ID|TELEGRAM_[A-Z_]*BOT_TOKEN|SB_TEST_PASSWORD|ANTHROPIC_API_KEY|OPENAI_API_KEY|INK_ACCESS_TOKEN|CLAUDE_CODE_MESSAGING_TOKEN|ZSH_EXECUTION_STRING)=[^[:space:]<*]'
 
 # Vendor token shapes, for secrets not named above.
 shapes='(gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{20}|GOCSPX-[A-Za-z0-9_-]{20}|sb_secret_[A-Za-z0-9_-]{20}|sk-ant-[A-Za-z0-9_-]{20}|[0-9]{8,10}:AA[A-Za-z0-9_-]{33})'
 
 # Report variable names and line numbers only — never the values, or the hook
 # output becomes the next place the secret is written down.
-hits=$(grep -inE "$named" "$msg_file" | cut -d: -f1,2 | sed 's/=.*//')
+# -o so the report names the variable rather than echoing the prose around it;
+# the two sed passes drop the matched value byte and the leading word boundary.
+hits=$(grep -inoE "$named" "$msg_file" \
+  | sed -E 's/=[^[:space:]]*$//' \
+  | sed -E 's/^([0-9]+):[^A-Za-z0-9_]*/\1: /')
 if [ -z "$hits" ]; then
   hits=$(grep -inoE "$shapes" "$msg_file" | cut -d: -f1 | sed 's/$/: vendor token pattern/')
 fi
