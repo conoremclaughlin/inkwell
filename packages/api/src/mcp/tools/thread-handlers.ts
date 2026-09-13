@@ -890,9 +890,15 @@ export async function handleCloseThread(args: unknown, dataComposer: DataCompose
 export type ReopenActor = { kind: 'sb'; agentId: string } | { kind: 'user' };
 
 /**
- * Flip a closed thread back to open and record it. One UPDATE, guarded on
- * the row still being closed, so two reopens racing each other (or a reopen
- * racing a close) cannot both claim to have done it; then the audit event.
+ * Flip a closed thread back to open and record it — in ONE transaction, the
+ * `reopen_inbox_thread` SQL function (migration 20260913083000). The UPDATE is
+ * guarded on the row still being closed, so two reopens racing each other (or
+ * a reopen racing a close) cannot both claim to have done it; the audit event
+ * is written in the same transaction, so a rejected event means the row did
+ * not flip either, and a retry does the whole thing. (Lumen, #615 review:
+ * as two PostgREST round trips, a failed audit INSERT left the thread open
+ * with no event, and the retry saw "already open" and skipped it for good.)
+ *
  * Answers `reopened: false` when the row was not closed at the moment of the
  * write — nothing is written in that case.
  *
@@ -912,37 +918,20 @@ export async function reopenThreadRow(
   threadId: string,
   actor: ReopenActor
 ): Promise<{ reopened: boolean }> {
-  const now = new Date().toISOString();
-  const { data, error } = await threadTable(supabase, 'inbox_threads')
-    .update({ status: 'open', closed_at: null, closed_by_agent_id: null, updated_at: now })
-    .eq('id', threadId)
-    .eq('status', 'closed')
-    .select('id');
+  const { data, error } = await supabase.rpc('reopen_inbox_thread', {
+    p_thread_id: threadId,
+    p_actor_kind: actor.kind,
+    p_actor_agent_id: actor.kind === 'sb' ? actor.agentId : null,
+  });
   if (error) {
     throw new Error(`Failed to reopen thread: ${error.message}`);
   }
-  if (!data || data.length === 0) {
-    return { reopened: false };
+  if (typeof data !== 'boolean') {
+    // The function returns exactly a boolean; anything else means the call
+    // did not reach it (a missing migration, a mocked client).
+    throw new Error(`Failed to reopen thread: unexpected reply ${JSON.stringify(data)}`);
   }
-
-  const { error: auditError } = await threadTable(supabase, 'inbox_thread_messages').insert({
-    thread_id: threadId,
-    sender_agent_id: 'system',
-    content:
-      actor.kind === 'sb'
-        ? `Thread reopened by ${actor.agentId}`
-        : 'Thread reopened by the workspace owner',
-    message_type: 'system',
-    metadata: {
-      type: 'thread_reopened',
-      reopenedBy: actor.kind === 'sb' ? actor.agentId : 'user',
-      ...(actor.kind === 'user' ? { channel: 'admin-api' } : {}),
-    } as Json,
-  });
-  if (auditError) {
-    throw new Error(`Failed to record thread reopen: ${auditError.message}`);
-  }
-  return { reopened: true };
+  return { reopened: data };
 }
 
 /**

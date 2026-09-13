@@ -1240,9 +1240,10 @@ describe('read floors compare instants, not spellings', () => {
  * these tests drive the tool that does. What they pin is the shape of the
  * write (status, both closure fields, and the audit event move together),
  * who may ask (a participant, same rule as close), and that a reopen which
- * loses a race writes nothing — the guard on the UPDATE is what makes the
- * flip atomic, and dropping it makes the second call below write a second
- * audit row.
+ * loses a race writes nothing. The flip and the audit event are one SQL
+ * function (reopen_inbox_thread, migration 20260913083000); the fake client
+ * mirrors it, and thread-reopen.integration.test.ts pins the real one —
+ * including that a rejected audit event rolls the flip back.
  */
 describe('handleReopenThread — explicit reopen (spec inkmail-thread-scope §2)', () => {
   async function setup(opts: { status?: string; participants?: string[] } = {}) {
@@ -1379,54 +1380,54 @@ describe('handleReopenThread — explicit reopen (spec inkmail-thread-scope §2)
   });
 });
 
-describe('reopenThreadRow — a failed write is an error, never a silent success', () => {
-  // The fake client never fails, so these branches get a hand-rolled one:
-  // the UPDATE and the audit INSERT each answer with an error, and the
-  // function must throw rather than report `reopened` for a row it did
-  // not (fully) change.
-  function clientWhere(opts: { updateError?: string; insertError?: string }) {
-    const chain = (result: unknown) => {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const q: Record<string, any> = {};
-      q.eq = () => q;
-      q.select = () => q;
-      q.then = (resolve: (v: unknown) => unknown) => Promise.resolve(result).then(resolve);
-      return q;
-    };
-    return {
-      from: (table: string) => ({
-        update: () =>
-          chain(
-            opts.updateError
-              ? { data: null, error: { message: opts.updateError } }
-              : { data: [{ id: 't1' }], error: null }
-          ),
-        insert: () =>
-          chain(
-            opts.insertError
-              ? { data: null, error: { message: `${table}: ${opts.insertError}` } }
-              : { data: [{}], error: null }
-          ),
-      }),
-    };
-  }
-
-  it('propagates an UPDATE error', async () => {
-    const { reopenThreadRow } = await import('./thread-handlers');
-    await expect(
-      reopenThreadRow(clientWhere({ updateError: 'connection reset' }) as never, 't1', {
-        kind: 'user',
-      })
-    ).rejects.toThrow('Failed to reopen thread: connection reset');
+describe('reopenThreadRow — a failed call is an error, never a silent success', () => {
+  // The flip and the audit event are one SQL function now (migration
+  // 20260913083000); the client sees one reply. An error reply throws, and a
+  // reply that is not the function's boolean throws too — a mocked or
+  // unmigrated client must not be read as "reopened".
+  const rpcClient = (reply: { data: unknown; error: { message: string } | null }) => ({
+    rpc: async () => reply,
   });
 
-  it('propagates an audit INSERT error instead of answering reopened', async () => {
+  it('propagates an RPC error', async () => {
     const { reopenThreadRow } = await import('./thread-handlers');
     await expect(
-      reopenThreadRow(clientWhere({ insertError: 'permission denied' }) as never, 't1', {
+      reopenThreadRow(
+        rpcClient({ data: null, error: { message: 'audit rejected' } }) as never,
+        't1',
+        { kind: 'user' }
+      )
+    ).rejects.toThrow('Failed to reopen thread: audit rejected');
+  });
+
+  it('refuses a reply that is not the boolean the function returns', async () => {
+    const { reopenThreadRow } = await import('./thread-handlers');
+    await expect(
+      reopenThreadRow(rpcClient({ data: null, error: null }) as never, 't1', {
         kind: 'sb',
         agentId: 'wren',
       })
-    ).rejects.toThrow('Failed to record thread reopen: inbox_thread_messages: permission denied');
+    ).rejects.toThrow('Failed to reopen thread: unexpected reply null');
+  });
+
+  it('passes the actor to the function as kind + agent id', async () => {
+    const { reopenThreadRow } = await import('./thread-handlers');
+    const calls: Array<[string, Record<string, unknown>]> = [];
+    const client = {
+      rpc: async (fn: string, args: Record<string, unknown>) => {
+        calls.push([fn, args]);
+        return { data: true, error: null };
+      },
+    };
+    expect(await reopenThreadRow(client as never, 't1', { kind: 'sb', agentId: 'wren' })).toEqual({
+      reopened: true,
+    });
+    expect(await reopenThreadRow(client as never, 't1', { kind: 'user' })).toEqual({
+      reopened: true,
+    });
+    expect(calls).toEqual([
+      ['reopen_inbox_thread', { p_thread_id: 't1', p_actor_kind: 'sb', p_actor_agent_id: 'wren' }],
+      ['reopen_inbox_thread', { p_thread_id: 't1', p_actor_kind: 'user', p_actor_agent_id: null }],
+    ]);
   });
 });
