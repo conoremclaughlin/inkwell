@@ -63,6 +63,69 @@ d('heartbeat notification store — real schema', () => {
     destination: 'sb-test|telegram|chat-1',
   };
 
+  /**
+   * The same real client, with exactly one response forced: a single-row read of
+   * a RECOVERY notice resolves with a PostgREST error instead of a row.
+   *
+   * A read failure is the one state in this module that cannot be provoked from
+   * the outside — the schema is correct, so PostgREST has no reason to refuse.
+   * This forces the refusal and nothing else: every other query the store makes
+   * still goes to the real table. That matters, because a test whose whole world
+   * is a double I wrote can only confirm the belief I wrote into it.
+   */
+  const withUnreadableRecovery = (): typeof client =>
+    new Proxy(client, {
+      get(target, prop, receiver) {
+        if (prop !== 'from') return Reflect.get(target, prop, receiver);
+        return (table: string) => {
+          const builder = target.from(table as never);
+          if (table !== 'heartbeat_notifications') return builder;
+
+          // `.select()` hands back a different builder object than `.from()`,
+          // and the filters chain off that one — so the wrapper has to follow
+          // the chain rather than assume every call returns `this`. The flags
+          // are shared by closure, so what the whole chain asked for is known by
+          // the time it is awaited.
+          let readsRecovery = false;
+          let readsOneRow = false;
+          const isBuilder = (value: unknown): boolean =>
+            typeof value === 'object' &&
+            value !== null &&
+            typeof (value as { eq?: unknown }).eq === 'function';
+
+          const follow = (chain: Record<string, unknown>): unknown =>
+            new Proxy(chain, {
+              get(target, key) {
+                const value = target[key as string];
+                if (key === 'then') {
+                  if (readsRecovery && readsOneRow) {
+                    return (resolve: (value: unknown) => unknown) =>
+                      Promise.resolve().then(() =>
+                        resolve({
+                          data: null,
+                          error: { message: 'recovery read unavailable', code: '503' },
+                        })
+                      );
+                  }
+                  return (...args: unknown[]) =>
+                    (value as (...a: unknown[]) => unknown).apply(target, args);
+                }
+                if (typeof value !== 'function') return value;
+                return (...args: unknown[]) => {
+                  if (key === 'eq' && args[0] === 'kind' && args[1] === 'recovery')
+                    readsRecovery = true;
+                  if (key === 'maybeSingle' || key === 'single') readsOneRow = true;
+                  const next = (value as (...a: unknown[]) => unknown).apply(target, args);
+                  return isBuilder(next) ? follow(next as Record<string, unknown>) : next;
+                };
+              },
+            });
+
+          return follow(builder as unknown as Record<string, unknown>);
+        };
+      },
+    }) as typeof client;
+
   beforeAll(async () => {
     await client.from('users').insert({
       id: userId,
@@ -122,9 +185,37 @@ d('heartbeat notification store — real schema', () => {
     // derived from reminder_history and differed between the first beat of an
     // outage and the second — two keys, two rows, two alarms. It is now read
     // back from this table, so the second beat must get the first beat's key.
-    const open = await store.openEpisode(reminderId);
-    expect(open).toBe(episodeKey);
-    expect(await store.openEpisode(reminderId)).toBe(open);
+    //
+    // Its own reminder. This used to run on the shared fixture, where an earlier
+    // test in this file had already written a pending recovery row — which under
+    // the round-six boundary rule ends the episode. The test would have gone red
+    // for a reason that has nothing to do with the property it names.
+    const isolatedReminder = randomUUID();
+    const openEpisodeKey = randomUUID();
+
+    await client.from('scheduled_reminders').insert({
+      id: isolatedReminder,
+      user_id: userId,
+      title: 'one outage keeps one key',
+      delivery_channel: 'telegram',
+      delivery_target: 'chat-6',
+      next_run_at: new Date().toISOString(),
+      status: 'active',
+    } as never);
+
+    await store.claimNotice({
+      reminderId: isolatedReminder,
+      userId,
+      episodeKey: openEpisodeKey,
+      destination: 'sb-test|telegram|chat-6',
+      kind: 'outage',
+    });
+
+    const open = await store.openEpisode(isolatedReminder);
+    expect(open).toBe(openEpisodeKey);
+    expect(await store.openEpisode(isolatedReminder)).toBe(open);
+
+    await client.from('scheduled_reminders').delete().eq('id', isolatedReminder);
   });
 
   it('finds the owed all-clear from the outage row, not from a recovery row', async () => {
@@ -438,6 +529,269 @@ d('heartbeat notification store — real schema', () => {
 
     const owed = await store.findOwedRecovery(isolatedReminder);
     expect(owed?.episodeKey).toBe(episode);
+
+    await client.from('scheduled_reminders').delete().eq('id', isolatedReminder);
+  });
+
+  it('does not read a FAILED recovery lookup as an absent one', async () => {
+    // Round six, finding 3. PostgREST reports a failed read by RESOLVING with an
+    // error rather than throwing, so "there is no recovery row" and "we could
+    // not find out" reach the caller in the same shape: `data: null`. The store
+    // collapsed them, read the second as the first, concluded no all-clear had
+    // been sent, reused the old episode — and suppressed the next outage on a
+    // notice row already marked delivered.
+    //
+    // A read that did not happen is not evidence that a notice was never sent.
+    // The asymmetry this module is built on says an unreadable store costs a
+    // duplicate alert; here it was buying silence, which is the opposite.
+    const isolatedReminder = randomUUID();
+    const episode = randomUUID();
+
+    await client.from('scheduled_reminders').insert({
+      id: isolatedReminder,
+      user_id: userId,
+      title: 'an unreadable acknowledgement is not a negative one',
+      delivery_channel: 'telegram',
+      delivery_target: 'chat-11',
+      next_run_at: new Date().toISOString(),
+      status: 'active',
+    } as never);
+
+    const base = {
+      reminderId: isolatedReminder,
+      userId,
+      episodeKey: episode,
+      destination: 'sb-test|telegram|chat-11',
+    };
+
+    // An ordinary open outage with no recovery row — the state in which reusing
+    // the episode is exactly right.
+    await store.claimNotice({ ...base, kind: 'outage' });
+    await store.settleNotice({ ...base, kind: 'outage' }, { delivered: true });
+
+    // The control and the case differ in one thing only: whether the recovery
+    // read answers. Same table, same rows, same code.
+    expect(await store.openEpisode(isolatedReminder)).toBe(episode);
+
+    const blindStore = createHeartbeatNotificationStore(withUnreadableRecovery());
+    expect(await blindStore.openEpisode(isolatedReminder)).not.toBe(episode);
+
+    await client.from('scheduled_reminders').delete().eq('id', isolatedReminder);
+  });
+
+  it('finds a pending all-clear whose outage row was never written', async () => {
+    // Round six, finding 1. The sweep used to start exclusively from an outage
+    // row, which holds until there is no outage row — and a failing store
+    // produces exactly that. The outage INSERT fails, its recreation at settle
+    // time fails too, and the direct channel send succeeds anyway, because this
+    // module deliberately lets the alert go out ahead of its bookkeeping. The
+    // human has been warned by a beat that left no trace.
+    //
+    // The next healthy beat writes its recovery row and its send fails. That
+    // pending row is now the only record of the debt, and an anchored-only sweep
+    // cannot see it: owed forever, retried never. The silence this module exists
+    // to prevent, arrived at from a direction the outage row cannot cover.
+    const isolatedReminder = randomUUID();
+    const episode = randomUUID();
+
+    await client.from('scheduled_reminders').insert({
+      id: isolatedReminder,
+      user_id: userId,
+      title: 'pending all-clear with no outage row',
+      delivery_channel: 'telegram',
+      delivery_target: 'chat-7',
+      next_run_at: new Date().toISOString(),
+      status: 'active',
+    } as never);
+
+    const recoveryKey = {
+      reminderId: isolatedReminder,
+      userId,
+      episodeKey: episode,
+      destination: 'sb-test|telegram|chat-7',
+      kind: 'recovery' as const,
+    };
+
+    // Only the recovery row is ever written, and its send failed.
+    await store.claimNotice(recoveryKey);
+    await store.settleNotice(recoveryKey, { delivered: false, error: 'telegram unreachable' });
+    await client
+      .from('heartbeat_notifications' as never)
+      .update({ next_attempt_at: new Date(Date.now() - 1000).toISOString() } as never)
+      .eq('reminder_id', isolatedReminder)
+      .eq('kind', 'recovery')
+      .eq('episode_key', episode);
+
+    // Assert the state really is the one under test: no anchor, anywhere.
+    const { data: outageRows } = await client
+      .from('heartbeat_notifications' as never)
+      .select('id')
+      .eq('reminder_id', isolatedReminder)
+      .eq('kind', 'outage');
+    expect((outageRows as unknown[] | null) ?? []).toHaveLength(0);
+
+    const owed = await store.findOwedRecovery(isolatedReminder);
+    expect(owed?.episodeKey).toBe(episode);
+
+    await client.from('scheduled_reminders').delete().eq('id', isolatedReminder);
+  });
+
+  it('does not re-announce a pending all-clear whose episode is already closed', async () => {
+    // The control for the test above, and the reason the unanchored scan checks
+    // for an anchor at all rather than sweeping every pending recovery row. An
+    // episode is only closed by an all-clear that was DELIVERED, so a closed
+    // episode whose recovery row still reads pending is a lost acknowledgement
+    // write, not an undelivered notice. Re-announcing it would tell the human a
+    // second time about an outage they already watched resolve.
+    const isolatedReminder = randomUUID();
+    const episode = randomUUID();
+
+    await client.from('scheduled_reminders').insert({
+      id: isolatedReminder,
+      user_id: userId,
+      title: 'closed episode owes nothing further',
+      delivery_channel: 'telegram',
+      delivery_target: 'chat-8',
+      next_run_at: new Date().toISOString(),
+      status: 'active',
+    } as never);
+
+    const base = {
+      reminderId: isolatedReminder,
+      userId,
+      episodeKey: episode,
+      destination: 'sb-test|telegram|chat-8',
+    };
+
+    await store.claimNotice({ ...base, kind: 'outage' });
+    await store.settleNotice({ ...base, kind: 'outage' }, { delivered: true });
+    await store.claimNotice({ ...base, kind: 'recovery' });
+    // The all-clear landed — that is what closes the episode — but the write
+    // recording it did not, so the row still reads pending.
+    await store.closeEpisode({ ...base, kind: 'recovery' });
+
+    const { data: recoveryRow } = await client
+      .from('heartbeat_notifications' as never)
+      .select('status')
+      .eq('reminder_id', isolatedReminder)
+      .eq('kind', 'recovery')
+      .eq('episode_key', episode)
+      .single();
+    expect((recoveryRow as { status: string }).status).toBe('pending');
+
+    expect(await store.findOwedRecovery(isolatedReminder)).toBeNull();
+
+    await client.from('scheduled_reminders').delete().eq('id', isolatedReminder);
+  });
+
+  it('ends an episode at an ATTEMPTED all-clear, without dropping its debt', async () => {
+    // Round six, finding 2. A pending recovery row is UNCERTAIN delivery, not a
+    // no: the send may well have landed with only its acknowledgement write
+    // failing, which is the state a failing store leaves behind. `openEpisode`
+    // used to reuse that episode for the next failure — handing it an outage
+    // notice already marked delivered, so the new outage announced nothing after
+    // the human had been told "recovered".
+    //
+    // Both halves are the test. The episode must end, AND its all-clear must
+    // still be owed: ending it by quietly closing it would trade this silence
+    // for the other one.
+    const isolatedReminder = randomUUID();
+    const episode = randomUUID();
+
+    await client.from('scheduled_reminders').insert({
+      id: isolatedReminder,
+      user_id: userId,
+      title: 'an attempted all-clear ends the episode',
+      delivery_channel: 'telegram',
+      delivery_target: 'chat-9',
+      next_run_at: new Date().toISOString(),
+      status: 'active',
+    } as never);
+
+    const base = {
+      reminderId: isolatedReminder,
+      userId,
+      episodeKey: episode,
+      destination: 'sb-test|telegram|chat-9',
+    };
+
+    await store.claimNotice({ ...base, kind: 'outage' });
+    await store.settleNotice({ ...base, kind: 'outage' }, { delivered: true });
+    await store.claimNotice({ ...base, kind: 'recovery' });
+    await store.settleNotice({ ...base, kind: 'recovery' }, { delivered: false, error: 'blip' });
+
+    // Nothing closed the episode — the close write is not even attempted for an
+    // all-clear that did not report success.
+    const { data: outageRow } = await client
+      .from('heartbeat_notifications' as never)
+      .select('episode_closed_at')
+      .eq('reminder_id', isolatedReminder)
+      .eq('kind', 'outage')
+      .eq('episode_key', episode)
+      .single();
+    expect((outageRow as { episode_closed_at: string | null }).episode_closed_at).toBeNull();
+
+    expect(await store.openEpisode(isolatedReminder)).not.toBe(episode);
+
+    const owed = await store.findOwedRecovery(isolatedReminder);
+    expect(owed?.episodeKey).toBe(episode);
+
+    await client.from('scheduled_reminders').delete().eq('id', isolatedReminder);
+  });
+
+  it('finds an older debt behind a newer open outage that owes nothing', async () => {
+    // The consequence of the test above: ending an episode at the attempted
+    // all-clear leaves it OPEN behind a freshly minted one, so a reminder can
+    // now carry several open outage rows at once. A sweep that looked at only
+    // the newest would stop at an episode that owes nothing — an outage whose
+    // own alert never landed, so nobody is waiting on an all-clear for it — and
+    // report no debt at all, while an older episode the human WAS warned about
+    // waits behind it.
+    const isolatedReminder = randomUUID();
+    const olderEpisode = randomUUID();
+    const newerEpisode = randomUUID();
+
+    await client.from('scheduled_reminders').insert({
+      id: isolatedReminder,
+      user_id: userId,
+      title: 'a newer silent outage must not hide an older debt',
+      delivery_channel: 'telegram',
+      delivery_target: 'chat-10',
+      next_run_at: new Date().toISOString(),
+      status: 'active',
+    } as never);
+
+    const older = {
+      reminderId: isolatedReminder,
+      userId,
+      episodeKey: olderEpisode,
+      destination: 'sb-test|telegram|chat-10',
+    };
+
+    // The older episode: announced, heard, and its all-clear attempted and lost.
+    await store.claimNotice({ ...older, kind: 'outage' });
+    await store.settleNotice({ ...older, kind: 'outage' }, { delivered: true });
+    await store.claimNotice({ ...older, kind: 'recovery' });
+    await store.settleNotice({ ...older, kind: 'recovery' }, { delivered: false, error: 'blip' });
+    await client
+      .from('heartbeat_notifications' as never)
+      .update({ next_attempt_at: new Date(Date.now() - 1000).toISOString() } as never)
+      .eq('reminder_id', isolatedReminder)
+      .eq('kind', 'recovery')
+      .eq('episode_key', olderEpisode);
+
+    // The newer episode: its outage alert was never delivered, so it owes
+    // nothing — and it is the row a newest-first scan sees first.
+    await store.claimNotice({
+      reminderId: isolatedReminder,
+      userId,
+      episodeKey: newerEpisode,
+      destination: 'sb-test|telegram|chat-10',
+      kind: 'outage',
+    });
+
+    const owed = await store.findOwedRecovery(isolatedReminder);
+    expect(owed?.episodeKey).toBe(olderEpisode);
 
     await client.from('scheduled_reminders').delete().eq('id', isolatedReminder);
   });

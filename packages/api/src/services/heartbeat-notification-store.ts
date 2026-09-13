@@ -38,10 +38,16 @@
  * forever. That is silence produced by a store failure, which is the one
  * outcome this module promises never to produce.
  *
- * The obligation is therefore carried by the OUTAGE row, which already exists
+ * The obligation is therefore carried by the OUTAGE row, which usually exists
  * by then: `episode_closed_at` stays null until the all-clear is delivered, and
  * `findOwedRecovery` reconstructs the owed notice from it. The recovery row is
  * bookkeeping; the outage row is the debt.
+ *
+ * Except that the outage row is one more write, and a store that is failing can
+ * lose that one too while the channel send succeeds — a human warned by a beat
+ * that left no trace. So the sweep also finds a pending recovery row on its own,
+ * with no anchor behind it. Neither row is load-bearing alone; between them the
+ * debt survives losing either.
  *
  * FAILING TOWARD NOISE, DELIBERATELY.
  *
@@ -77,6 +83,16 @@ import { logger } from '../utils/logger.js';
  * being owed, it just stops being frequent.
  */
 export const NOTICE_BACKOFF_MS = [0, 60_000, 5 * 60_000, 30 * 60_000, 2 * 60 * 60_000];
+
+/**
+ * How many rows one owed-all-clear sweep will consider per kind.
+ *
+ * Episodes can pile up on a reminder — every uncertain all-clear leaves its
+ * episode open behind a freshly minted one — so the sweep cannot look at a
+ * single row. It does not need to look at all of them either: one all-clear is
+ * sent per beat regardless, and a debt that loses a race stays owed.
+ */
+const OWED_SCAN_LIMIT = 10;
 
 /** Backoff for the Nth consecutive failed attempt (1-based). */
 export function backoffForAttempt(attempts: number): number {
@@ -151,12 +167,16 @@ export interface HeartbeatNotificationStore {
    * once the beat is healthy the failure streak is zero and the recovery branch
    * never runs, so without this the debt would never be retried.
    *
-   * An episode is anchored on its OUTAGE row — that is where open/closed lives —
-   * but the debt is proven by EITHER a delivered outage (the recovery row may
-   * never have been written, and is reconstructed) OR the existence of an
-   * undelivered recovery row (which proves the outage was announced even if the
-   * outage row's own acknowledgement write failed). Each proof covers a write
-   * failure the other one misses.
+   * An episode is normally anchored on its OUTAGE row — that is where
+   * open/closed lives — and the debt is proven by EITHER a delivered outage (the
+   * recovery row may never have been written, and is reconstructed) OR the
+   * existence of an undelivered recovery row (which proves the outage was
+   * announced even if the outage row's own acknowledgement write failed). Each
+   * proof covers a write failure the other one misses.
+   *
+   * Discovery itself cannot depend on the anchor, though, because the outage row
+   * is one more thing a failing store can lose. A pending recovery row with no
+   * outage row behind it is found on its own terms.
    */
   findOwedRecovery(reminderId: string): Promise<OwedRecovery | null>;
   /**
@@ -187,7 +207,19 @@ export function createHeartbeatNotificationStore(
 ): HeartbeatNotificationStore {
   const table = () => client.from('heartbeat_notifications');
 
-  const load = async (key: NoticeKey): Promise<NoticeRow | null> => {
+  /**
+   * Read one notice row, keeping "there is no such row" and "we could not find
+   * out" apart.
+   *
+   * PostgREST reports a failed read by RESOLVING with an `error`, not by
+   * throwing, so the two arrive at a caller in the same shape — `data: null` —
+   * and collapsing them is how a store failure buys silence. A caller that
+   * suppresses on absence must treat `readFailed` as the loud case: a read that
+   * did not happen is not evidence that a notice was never sent.
+   */
+  const readNotice = async (
+    key: NoticeKey
+  ): Promise<{ row: NoticeRow | null; readFailed: boolean }> => {
     const { data, error } = await table()
       .select(NOTICE_COLUMNS)
       .eq('reminder_id', key.reminderId)
@@ -202,32 +234,12 @@ export function createHeartbeatNotificationStore(
         kind: key.kind,
         error: error.message,
       });
-      return null;
+      return { row: null, readFailed: true };
     }
-    return (data as NoticeRow | null) ?? null;
+    return { row: (data as NoticeRow | null) ?? null, readFailed: false };
   };
 
-  /**
-   * Whether an episode is recovered in substance: its all-clear was DELIVERED.
-   *
-   * Delivery of the all-clear is what ends an episode. `episode_closed_at` is
-   * only the record of that, and the two can disagree — the close is a separate
-   * write and it can fail on its own.
-   */
-  const recoveryWasDelivered = async (
-    reminderId: string,
-    episodeKey: string,
-    destination: string | null
-  ): Promise<boolean> => {
-    const recovery = await load({
-      reminderId,
-      userId: '',
-      kind: 'recovery',
-      episodeKey,
-      destination,
-    });
-    return recovery?.status === 'delivered';
-  };
+  const load = async (key: NoticeKey): Promise<NoticeRow | null> => (await readNotice(key)).row;
 
   const openEpisode: HeartbeatNotificationStore['openEpisode'] = async (reminderId) => {
     try {
@@ -250,20 +262,48 @@ export function createHeartbeatNotificationStore(
       const existing = (data as { episode_key: string; destination: string | null }[] | null)?.[0];
       if (!existing) return randomUUID();
 
-      // An episode whose all-clear was delivered is over, whatever the close
-      // write did. If the close failed, the row still looks open — and reusing
-      // it here would hand the next outage an episode whose outage notice is
-      // already marked delivered, so it would announce nothing. That is a new
-      // outage silenced by the bookkeeping of the previous one, after the human
-      // was explicitly told the monitor was back. Reconcile and start fresh.
-      if (await recoveryWasDelivered(reminderId, existing.episode_key, existing.destination)) {
-        await closeEpisode({
-          reminderId,
-          userId: '',
-          kind: 'recovery',
-          episodeKey: existing.episode_key,
-          destination: existing.destination,
-        });
+      // AN EPISODE'S IDENTITY ENDS WHERE ITS ALL-CLEAR IS ATTEMPTED.
+      //
+      // Two different questions get asked about the same recovery row, and
+      // conflating them is the bug. Whether the DEBT is settled turns on
+      // delivery — that is `findOwedRecovery`'s business, and a failed all-clear
+      // stays owed. Whether the EPISODE is still the current one turns on the
+      // attempt, because the existence of a recovery row means this outage was
+      // already treated as over. A later failure is a new outage.
+      //
+      // Reusing a key past that boundary is what silences the new outage: its
+      // notice row is the old episode's, which may already be marked delivered,
+      // so `claimNotice` suppresses and nobody is told. A pending recovery row
+      // does not rescue that — pending is UNCERTAIN delivery, not a no. The send
+      // may well have landed with only its acknowledgement write failing, which
+      // is precisely the state a failing store leaves behind. And a read we
+      // could not complete is not an absence either.
+      //
+      // So a recovery row that exists, in any status, and a recovery row we
+      // could not read both end the episode here. The cost is a duplicate
+      // outage alert; the alternative is a silent one.
+      const recovery = await readNotice({
+        reminderId,
+        userId: '',
+        kind: 'recovery',
+        episodeKey: existing.episode_key,
+        destination: existing.destination,
+      });
+
+      if (recovery.row || recovery.readFailed) {
+        // A delivered all-clear means the episode is finished in substance and
+        // its outage row simply missed the close write. Reconcile it. A pending
+        // one is deliberately left open: its all-clear is still owed, and the
+        // sweep has to keep finding it.
+        if (recovery.row?.status === 'delivered') {
+          await closeEpisode({
+            reminderId,
+            userId: '',
+            kind: 'recovery',
+            episodeKey: existing.episode_key,
+            destination: existing.destination,
+          });
+        }
         return randomUUID();
       }
 
@@ -518,82 +558,177 @@ export function createHeartbeatNotificationStore(
     }
   };
 
+  /**
+   * Pending all-clears whose outage row is not there to anchor them.
+   *
+   * The anchored scan below starts from the outage row, which works right up
+   * until there is no outage row — and a failing store produces exactly that:
+   * the outage INSERT fails, its recreation at settle time fails too, and the
+   * direct channel send succeeds anyway, as this module deliberately allows. The
+   * human has been warned by a beat that left no trace. When the next healthy
+   * beat writes a recovery row and its send fails, that pending row is the ONLY
+   * record of the debt, and an anchored-only sweep can never see it. Owed
+   * forever, retried never.
+   *
+   * A pending recovery row proves its own debt: only an attempted all-clear
+   * writes one, and an all-clear is only attempted for an outage that was
+   * announced. What it cannot prove is that the debt is still outstanding, so a
+   * row whose episode has a CLOSED outage row is left alone — that episode was
+   * closed by a delivered all-clear and re-announcing it would be noise about
+   * an outage the human already saw resolved.
+   */
+  const orphanedRecoveries = async (reminderId: string): Promise<NoticeRow[]> => {
+    const { data, error } = await table()
+      .select(NOTICE_COLUMNS)
+      .eq('reminder_id', reminderId)
+      .eq('kind', 'recovery')
+      .eq('status', 'pending')
+      .order('created_at', { ascending: false })
+      .limit(OWED_SCAN_LIMIT);
+
+    if (error) {
+      logger.warn('[Heartbeat] Could not scan for unanchored all-clears', {
+        reminderId,
+        error: error.message,
+      });
+      return [];
+    }
+
+    const pending = (data as NoticeRow[] | null) ?? [];
+    if (pending.length === 0) return [];
+
+    // Ask only about the episodes actually in hand, so this stays bounded and
+    // cannot mistake an old episode that scrolled out of a window for one that
+    // was never written.
+    const { data: anchors, error: anchorError } = await table()
+      .select('episode_key')
+      .eq('reminder_id', reminderId)
+      .eq('kind', 'outage')
+      .in(
+        'episode_key',
+        pending.map((row) => row.episode_key)
+      );
+
+    if (anchorError) {
+      // Unknown which of these are anchored. Treating them all as orphans risks
+      // a duplicate all-clear; treating none as orphans risks losing the debt
+      // entirely. Noise, every time.
+      logger.warn('[Heartbeat] Could not check all-clear anchors — treating them as owed', {
+        reminderId,
+        error: anchorError.message,
+      });
+      return pending;
+    }
+
+    const anchored = new Set(
+      ((anchors as { episode_key: string }[] | null) ?? []).map((row) => row.episode_key)
+    );
+    return pending.filter((row) => !anchored.has(row.episode_key));
+  };
+
   const findOwedRecovery: HeartbeatNotificationStore['findOwedRecovery'] = async (reminderId) => {
     try {
-      // The debt lives on the episode, and there are two independent proofs of
-      // it — see below. The outage row is the anchor because it is the row that
-      // carries the open/closed state; its own `status` is deliberately NOT a
-      // filter here, because a pending outage does not mean the human never
-      // heard it. It can equally mean the send succeeded and the acknowledgement
-      // write that should have recorded it is the thing that failed.
+      const candidates: { owed: OwedRecovery; nextAttemptAt: string | null }[] = [];
+
+      // ANCHORED — episodes whose outage row is open.
+      //
+      // The outage row carries the open/closed state, so it is the anchor. Its
+      // own `status` is deliberately NOT a filter: a pending outage does not
+      // mean the human never heard it, it can equally mean the send succeeded
+      // and the acknowledgement write that should have recorded it is the thing
+      // that failed.
+      //
+      // More than one can be open at a time. `openEpisode` mints a fresh episode
+      // when the previous one's all-clear was attempted but not confirmed, and
+      // deliberately leaves that older episode open because its debt survives —
+      // so a sweep that looked only at the newest would strand it.
       const { data, error } = await table()
         .select(NOTICE_COLUMNS)
         .eq('reminder_id', reminderId)
         .eq('kind', 'outage')
         .is('episode_closed_at', null)
         .order('created_at', { ascending: false })
-        .limit(1);
+        .limit(OWED_SCAN_LIMIT);
 
+      // A failed anchored scan is not the end of the sweep — it falls through to
+      // the unanchored one, which may still turn up a debt. Returning here would
+      // let one unreadable query buy the silence this module forbids.
       if (error) {
         logger.warn('[Heartbeat] Could not scan for owed all-clears', {
           reminderId,
           error: error.message,
         });
-        return null;
       }
+      const openOutages = error ? [] : ((data as NoticeRow[] | null) ?? []);
 
-      const outage = (data as NoticeRow[] | null)?.[0];
-      if (!outage) return null;
-
-      // The recovery row may or may not exist. If it does and it is already
-      // delivered, the episode is closed in substance and the outage row simply
-      // missed its update — close it and stand down.
-      const recovery = await load({
-        reminderId,
-        userId: '',
-        kind: 'recovery',
-        episodeKey: outage.episode_key,
-        destination: outage.destination,
-      });
-
-      if (recovery?.status === 'delivered') {
-        await closeEpisode({
+      for (const outage of openOutages) {
+        const episode = {
           reminderId,
           userId: '',
-          kind: 'recovery',
+          kind: 'recovery' as const,
           episodeKey: outage.episode_key,
           destination: outage.destination,
+        };
+
+        // The recovery row may or may not exist. If it does and it is already
+        // delivered, the episode is closed in substance and the outage row
+        // simply missed its update — close it and move on.
+        const recovery = await load(episode);
+        if (recovery?.status === 'delivered') {
+          await closeEpisode(episode);
+          continue;
+        }
+
+        // Two independent proofs that an all-clear is owed, and we need both
+        // tests because each one covers a write failure the other misses:
+        //
+        //   - the OUTAGE row is delivered. The recovery row may never have been
+        //     written at all; it is reconstructed from the outage row below.
+        //   - a RECOVERY row exists and is not delivered. Only an attempted
+        //     all-clear writes that row, and an all-clear is only attempted for
+        //     an announced outage — so its existence proves the outage was
+        //     announced even when the outage row's own acknowledgement write is
+        //     what failed.
+        //
+        // A pending outage with no recovery row is the one case that is
+        // genuinely not owed: nothing here says the human was ever told.
+        if (outage.status !== 'delivered' && recovery === null) continue;
+
+        candidates.push({
+          owed: {
+            episodeKey: outage.episode_key,
+            destination: outage.destination,
+            failedBeats: recovery?.failed_beats ?? outage.failed_beats ?? 0,
+            attempts: recovery?.attempts ?? 0,
+          },
+          nextAttemptAt: recovery?.next_attempt_at ?? null,
         });
-        return null;
       }
 
-      // Two independent proofs that an all-clear is owed, and we need both
-      // tests because each one covers a write failure the other misses:
-      //
-      //   - the OUTAGE row is delivered. The recovery row may never have been
-      //     written at all; it is reconstructed from the outage row below.
-      //   - a RECOVERY row exists and is not delivered. Only an attempted
-      //     all-clear writes that row, and an all-clear is only attempted for an
-      //     announced outage — so its existence proves the outage was announced
-      //     even when the outage row's own acknowledgement write is what failed.
-      //
-      // A pending outage with no recovery row is the one case that is genuinely
-      // not owed: nothing here says the human was ever told.
-      const owed = outage.status === 'delivered' || recovery !== null;
-      if (!owed) return null;
-
-      // Respect the recovery notice's own backoff if it has one.
-      if (recovery?.next_attempt_at) {
-        const due = Date.parse(recovery.next_attempt_at);
-        if (Number.isFinite(due) && due > Date.now()) return null;
+      // ORPHANED — the debt whose anchor was never written. See above.
+      for (const recovery of await orphanedRecoveries(reminderId)) {
+        candidates.push({
+          owed: {
+            episodeKey: recovery.episode_key,
+            destination: recovery.destination,
+            failedBeats: recovery.failed_beats ?? 0,
+            attempts: recovery.attempts,
+          },
+          nextAttemptAt: recovery.next_attempt_at,
+        });
       }
 
-      return {
-        episodeKey: outage.episode_key,
-        destination: outage.destination,
-        failedBeats: recovery?.failed_beats ?? outage.failed_beats ?? 0,
-        attempts: recovery?.attempts ?? 0,
-      };
+      // The first debt whose own backoff is due. One all-clear per beat: a
+      // candidate that is gated, or that loses the race, is not dropped — it is
+      // still owed, and the next sweep comes round again.
+      for (const candidate of candidates) {
+        if (candidate.nextAttemptAt) {
+          const due = Date.parse(candidate.nextAttemptAt);
+          if (Number.isFinite(due) && due > Date.now()) continue;
+        }
+        return candidate.owed;
+      }
+      return null;
     } catch (err) {
       logger.warn('[Heartbeat] Owed all-clear scan threw', {
         reminderId,
