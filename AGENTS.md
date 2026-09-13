@@ -791,7 +791,13 @@ Defined in [CONTRIBUTING.md](./CONTRIBUTING.md). Key SB-specific reminders:
 - **Simple PR wait helper**: for short review loops, use `yarn pr:wait-reply <prNumber> --timeout 120 --interval 10` instead of manual `sleep`, then re-check review status via MCP GitHub tools.
 - **Commit messages: write the message to a file and use `git commit -F <file>`. Never `-m`, not even for a one-line subject.** A double-quoted `-m` string is shell input, so a backtick or `$(...)` anywhere in it is **executed** and its output pasted into the commit. Markdown backticks around an identifier — ``a `local` flag`` — are the normal way we write, which makes this a trap rather than an edge case: it hit Lumen twice in February 2026 and Wren on 2026-09-13, and the 2026-09-13 commit pasted ten live credentials into a public repository. The diff stays clean, so review cannot catch it.
 
-  A subject line is **not** the safe exception it looks like — `-m "fix: honour the \`local\` flag"`hands git`fix: honour the flag` with the builtin's output spliced in, exactly like a body would. Single-quoting is not the fix either: an apostrophe in `don't` closes the string and the remainder of your message is re-parsed as shell.
+  A subject line is **not** the safe exception it looks like. Backticks in a subject are substituted exactly as they are in a body:
+
+  ```bash
+  git commit -m "fix: honour the `local` flag"   # git receives: fix: honour the  flag
+  ```
+
+  Single-quoting is not the fix either: an apostrophe in a word like `don't` closes the string, and the remainder of your message is re-parsed as shell.
 
   **How you write the file matters as much as `-F` does.** `-F` reads bytes and never expands them, but the shell still expands whatever you use to _create_ the file:
 
