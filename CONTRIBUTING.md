@@ -131,6 +131,33 @@ exemptions**, a commit already in `main` cannot be made safe by refusing it, and
 fails to complete is a failure whether or not the commit is listed. Adding to it means reading
 the whole message first and saying so in the comment beside the SHA.
 
+#### Staging and pushing: name the paths, read the messages back
+
+Two more rules sit beside `-F`, set on 2026-09-13 after the leak above. The full list, with
+the reasoning, is in [AGENTS.md](./AGENTS.md#commit-messages-secrets-and-what-gets-pushed-ironclad);
+these are the two that change what you type.
+
+**Stage by naming paths.** `git add <path> [<path>...]`, or a directory you have just looked at,
+then `git diff --cached` before committing. Not `git add -A`, not `git add .`, not `git commit -a`
+or `-am`. The first two sweep in untracked files you never inspected — an env file, an identity
+file, scratch output — and the last two commit every modified tracked file without the
+staged-diff review.
+
+**Read every commit message back before you push, every time.**
+
+```bash
+git log origin/main..HEAD --format='--- %h%n%B'
+```
+
+Read it top to bottom. The push is the point of no return, and a message you have not read back
+is a message you have not finished writing. The `pre-push` hook prints the same thing and refuses
+the push if any message trips the credential guard, but it is a backstop: passing it means nothing
+matched, not that the messages are clean.
+
+Nothing in a commit message is ever computed by the shell — no backticks, `$(...)`, `$VAR`, or
+unquoted heredoc anywhere in the command that produces the message or its file. Need a value in
+the message? Run the command separately, read its output, and paste the literal.
+
 ### Branching
 
 We follow [GitHub flow](https://www.geeksforgeeks.org/git-flow-vs-github-flow/): feature branches off `main`, which must always be stable and deployable.
@@ -183,6 +210,16 @@ Examples:
 // ???: unclear why this timeout is needed — removing it breaks auth
 // Simple explanation needs no prefix
 ```
+
+### Filing issues
+
+Contributors from outside the project: GitHub issues are the right place, and they are read.
+
+SBs and core contributors: file issues as Inkwell tasks (`create_task`), not GitHub issues. The
+GitHub account is shared, so an internal issue there is indistinguishable from an external report
+and lands on a surface the team does not triage from. When an external report arrives, open the
+Inkwell task that tracks it, note the issue number in the task, and reply on GitHub when it is
+resolved.
 
 ## Pull Requests
 
