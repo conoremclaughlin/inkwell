@@ -1326,6 +1326,70 @@ export type Database = {
           },
         ];
       };
+      heartbeat_notifications: {
+        Row: {
+          attempts: number;
+          created_at: string;
+          delivered_at: string | null;
+          destination: string | null;
+          episode_closed_at: string | null;
+          episode_key: string;
+          failed_beats: number;
+          id: string;
+          kind: string;
+          last_attempt_at: string | null;
+          last_error: string | null;
+          next_attempt_at: string | null;
+          reminder_id: string;
+          status: string;
+          updated_at: string;
+          user_id: string;
+        };
+        Insert: {
+          attempts?: number;
+          created_at?: string;
+          delivered_at?: string | null;
+          destination?: string | null;
+          episode_closed_at?: string | null;
+          episode_key: string;
+          failed_beats?: number;
+          id?: string;
+          kind: string;
+          last_attempt_at?: string | null;
+          last_error?: string | null;
+          next_attempt_at?: string | null;
+          reminder_id: string;
+          status?: string;
+          updated_at?: string;
+          user_id: string;
+        };
+        Update: {
+          attempts?: number;
+          created_at?: string;
+          delivered_at?: string | null;
+          destination?: string | null;
+          episode_closed_at?: string | null;
+          episode_key?: string;
+          failed_beats?: number;
+          id?: string;
+          kind?: string;
+          last_attempt_at?: string | null;
+          last_error?: string | null;
+          next_attempt_at?: string | null;
+          reminder_id?: string;
+          status?: string;
+          updated_at?: string;
+          user_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'heartbeat_notifications_reminder_id_fkey';
+            columns: ['reminder_id'];
+            referencedRelation: 'scheduled_reminders';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
       heartbeat_state: {
         Row: {
           last_checks: Json | null;

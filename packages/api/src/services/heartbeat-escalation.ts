@@ -64,13 +64,21 @@
  * Both are the same mistake, and it is the mistake this whole module exists to
  * correct: treating an attempt as if it were an outcome. So suppression now
  * keys off durable DELIVERY acknowledgement (`heartbeat-notification-store`),
- * a pending notice is retried under a bounded cap, and a destination is claimed
- * only after a send actually succeeds.
+ * a pending notice stays owed until it lands — bounded in frequency, never
+ * retired — and a destination is claimed only after a send actually succeeds.
+ *
+ * Round four found the same mistake a third time, on the closing edge: an
+ * all-clear whose send failed still counted as settled, because the obligation
+ * lived on a row the failing store had never managed to write. The debt is on
+ * the OUTAGE row now, and only a DELIVERED all-clear closes the episode.
  *
  * The two destinations are also genuinely independent now. The inbox write used
  * to throw on a PostgREST error, which exited before the channel attempt — so
  * the durable copy, the one that cannot reach a human on its own, could cancel
- * the one that can. Each is attempted and reported separately.
+ * the one that can. Round four found the identity lookup that ADDRESSES the
+ * inbox copy sitting outside that guard, with the same effect. Each destination
+ * is attempted and reported separately, and every part of the inbox dependency
+ * is inside the guard.
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js';

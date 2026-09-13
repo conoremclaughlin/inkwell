@@ -137,6 +137,84 @@ d('heartbeat notification store — real schema', () => {
     expect(owed?.episodeKey).toBe(episodeKey);
   });
 
+  it('owes the all-clear even when no recovery row was ever written', async () => {
+    // Lumen's round-four P1, end to end against the real table, and the reason
+    // the test above is not sufficient on its own: a pending recovery row
+    // happens to exist there, so a sweep that (wrongly) queried the RECOVERY
+    // row would still find something and the test would pass for the wrong
+    // reason. Here the recovery INSERT never happened at all — the exact state
+    // left behind when the store was failing at the moment an all-clear was
+    // owed — and the debt must still be discoverable.
+    const isolatedReminder = randomUUID();
+    const isolatedEpisode = randomUUID();
+
+    await client.from('scheduled_reminders').insert({
+      id: isolatedReminder,
+      user_id: userId,
+      title: 'owed all-clear with no recovery row',
+      delivery_channel: 'telegram',
+      delivery_target: 'chat-2',
+      next_run_at: new Date().toISOString(),
+      status: 'active',
+    } as never);
+
+    const key = {
+      reminderId: isolatedReminder,
+      userId,
+      episodeKey: isolatedEpisode,
+      destination: 'sb-test|telegram|chat-2',
+      kind: 'outage' as const,
+    };
+
+    // The outage was announced and landed. Nothing else is ever written.
+    await store.claimNotice(key);
+    await store.settleNotice(key, { delivered: true });
+
+    const { data: recoveryRows } = await client
+      .from('heartbeat_notifications' as never)
+      .select('id')
+      .eq('reminder_id', isolatedReminder)
+      .eq('kind', 'recovery');
+    expect((recoveryRows as unknown[] | null) ?? []).toHaveLength(0);
+
+    const owed = await store.findOwedRecovery(isolatedReminder);
+    expect(owed?.episodeKey).toBe(isolatedEpisode);
+
+    await client.from('scheduled_reminders').delete().eq('id', isolatedReminder);
+  });
+
+  it('does not owe an all-clear for an outage that was never delivered', async () => {
+    // Positive control. Only an outage the human actually heard about creates a
+    // debt; otherwise every undeliverable beat would generate an all-clear for
+    // an alarm that never rang.
+    const isolatedReminder = randomUUID();
+
+    await client.from('scheduled_reminders').insert({
+      id: isolatedReminder,
+      user_id: userId,
+      title: 'undelivered outage owes nothing',
+      delivery_channel: 'telegram',
+      delivery_target: 'chat-3',
+      next_run_at: new Date().toISOString(),
+      status: 'active',
+    } as never);
+
+    const key = {
+      reminderId: isolatedReminder,
+      userId,
+      episodeKey: randomUUID(),
+      destination: 'sb-test|telegram|chat-3',
+      kind: 'outage' as const,
+    };
+
+    await store.claimNotice(key);
+    await store.settleNotice(key, { delivered: false, error: 'telegram unreachable' });
+
+    expect(await store.findOwedRecovery(isolatedReminder)).toBeNull();
+
+    await client.from('scheduled_reminders').delete().eq('id', isolatedReminder);
+  });
+
   it('stops owing the all-clear once the episode is closed', async () => {
     await store.closeEpisode({ ...baseKey, kind: 'recovery' });
 
@@ -175,17 +253,81 @@ d('heartbeat notification store — real schema', () => {
     expect(gated.record?.status).toBe('pending');
   });
 
+  it('stays eligible far past the attempt cap it used to have', async () => {
+    // Round four, finding 4, against the real store rather than a fake. The old
+    // rule retired a notice after three attempts; Lumen rejected it because
+    // under a no-silence contract a cap turns a long channel outage into the
+    // exact silence this table exists to prevent. Six failed attempts here —
+    // double the old cap — and the notice must still be owed and sendable.
+    const key = { ...baseKey, kind: 'recovery' as const, episodeKey: randomUUID() };
+
+    await store.claimNotice(key);
+    for (let attempt = 1; attempt <= 6; attempt++) {
+      await store.settleNotice(key, { delivered: false, error: `unreachable #${attempt}` });
+      // Step past the backoff this attempt just wrote, so the next one is due.
+      await client
+        .from('heartbeat_notifications' as never)
+        .update({ next_attempt_at: new Date(Date.now() - 1000).toISOString() } as never)
+        .eq('reminder_id', reminderId)
+        .eq('kind', 'recovery')
+        .eq('episode_key', key.episodeKey);
+    }
+
+    const after = await store.claimNotice(key);
+    expect(after.record?.attempts).toBe(6);
+    expect(after.record?.status).toBe('pending');
+    expect(after.shouldSend).toBe(true);
+  });
+
   it('recreates the obligation when a settle matches no row', async () => {
-    // A zero-row UPDATE is not an error in PostgREST. Settling a notice whose
-    // row was never created used to vanish silently, leaving the notice neither
-    // delivered nor owed — the shape of the silence this table exists to stop.
+    // A zero-row UPDATE is not an error in PostgREST — it resolves with an empty
+    // array. Settling a notice whose row was never created used to vanish
+    // silently, leaving the notice neither delivered nor owed: the shape of the
+    // silence this table exists to stop.
+    //
+    // The assertion has to READ THE TABLE rather than call claimNotice, because
+    // claimNotice creates a missing row itself and would paper over the loss —
+    // a first draft of this test asserted status via claimNotice and passed with
+    // the zero-row detection deleted.
     const key = { ...baseKey, kind: 'recovery' as const, episodeKey: randomUUID() };
 
     await store.settleNotice(key, { delivered: false, error: 'never inserted' });
 
-    const after = await store.claimNotice(key);
-    expect(after.record).not.toBeNull();
-    expect(after.record?.status).toBe('pending');
+    const { data } = await client
+      .from('heartbeat_notifications' as never)
+      .select('status, attempts, last_error')
+      .eq('reminder_id', reminderId)
+      .eq('kind', 'recovery')
+      .eq('episode_key', key.episodeKey)
+      .maybeSingle();
+
+    const row = data as { status: string; attempts: number; last_error: string | null } | null;
+    expect(row).not.toBeNull();
+    expect(row?.status).toBe('pending');
+    // The attempt is on the rebuilt row: the notice is still owed AND we know
+    // one try has already been spent on it.
+    expect(row?.attempts).toBe(1);
+    expect(row?.last_error).toBe('never inserted');
+  });
+
+  it('records a delivered settle whose row went missing, rather than losing it', async () => {
+    // The same hole in the other direction. If the row is gone and the send
+    // SUCCEEDED, dropping the update means the notice is never marked
+    // delivered — so it is resent on every later beat, which is the duplicate
+    // storm rather than the silence, but still wrong.
+    const key = { ...baseKey, kind: 'recovery' as const, episodeKey: randomUUID() };
+
+    await store.settleNotice(key, { delivered: true });
+
+    const { data } = await client
+      .from('heartbeat_notifications' as never)
+      .select('status, attempts')
+      .eq('reminder_id', reminderId)
+      .eq('kind', 'recovery')
+      .eq('episode_key', key.episodeKey)
+      .maybeSingle();
+
+    expect((data as { status: string; attempts: number } | null)?.status).toBe('delivered');
   });
 
   it('enforces one notice per (reminder, kind, episode)', async () => {

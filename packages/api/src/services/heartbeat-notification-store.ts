@@ -179,7 +179,7 @@ const NOTICE_COLUMNS =
 export function createHeartbeatNotificationStore(
   client: SupabaseClient<Database>
 ): HeartbeatNotificationStore {
-  const table = () => client.from('heartbeat_notifications' as never);
+  const table = () => client.from('heartbeat_notifications');
 
   const load = async (key: NoticeKey): Promise<NoticeRow | null> => {
     const { data, error } = await table()
@@ -242,7 +242,7 @@ export function createHeartbeatNotificationStore(
         failed_beats: key.failedBeats ?? 0,
         status: 'pending',
         attempts: 0,
-      } as never)
+      })
       .select(NOTICE_COLUMNS)
       .single();
 
@@ -326,7 +326,7 @@ export function createHeartbeatNotificationStore(
       };
 
       const { data, error } = await table()
-        .update(patch as never)
+        .update(patch)
         .eq('reminder_id', key.reminderId)
         .eq('kind', key.kind)
         .eq('episode_key', key.episodeKey)
@@ -356,9 +356,7 @@ export function createHeartbeatNotificationStore(
         });
         const created = await insertNotice(key);
         if (created) {
-          const { error: patchError } = await table()
-            .update(patch as never)
-            .eq('id', created.id);
+          const { error: patchError } = await table().update(patch).eq('id', created.id);
           if (patchError) {
             logger.warn('[Heartbeat] Could not settle the recreated notice row', {
               reminderId: key.reminderId,
@@ -395,7 +393,7 @@ export function createHeartbeatNotificationStore(
   const closeEpisode = async (key: NoticeKey): Promise<void> => {
     try {
       const { error } = await table()
-        .update({ episode_closed_at: new Date().toISOString() } as never)
+        .update({ episode_closed_at: new Date().toISOString() })
         .eq('reminder_id', key.reminderId)
         .eq('kind', 'outage')
         .eq('episode_key', key.episodeKey);
@@ -429,7 +427,7 @@ export function createHeartbeatNotificationStore(
         last_attempt_at: now,
         last_error: null,
         next_attempt_at: null,
-      } as never)
+      })
       .eq('reminder_id', key.reminderId)
       .eq('kind', key.kind)
       .eq('episode_key', key.episodeKey)
