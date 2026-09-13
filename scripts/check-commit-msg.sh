@@ -91,6 +91,29 @@ scan_failed() {
   exit 2
 }
 
+# DETECTION AND REPORTING ARE SEPARATE DECISIONS, and this is the second half of
+# the same lesson the scan_failed helper above encodes.
+#
+# The refusal used to be driven by `hits` — the FORMATTED report. That made every
+# sed and cut below load-bearing for the security decision: fault any one of them
+# and the detected credential produced an empty report, an empty report read as
+# "nothing found", and the commit went through. Fail-open again, one layer up,
+# and invisible for the same reason as before — the formatting stage is the part
+# that looks cosmetic.
+#
+# So `detected` is set from grep's own exit status, which is what actually knows
+# whether a credential is in the message, and nothing downstream can clear it.
+# Formatting failures set `report_failed` instead and cost us the line numbers,
+# never the refusal.
+#
+# The fallback on a formatting failure is a generic diagnostic, NOT the raw
+# matches. Raw grep output is the one thing that may carry value bytes — printing
+# it as a "best effort" report would turn a formatting bug into the disclosure
+# the formatting exists to prevent.
+detected=0
+report_failed=0
+hits=''
+
 # Report variable names and line numbers only — never the values, or the hook
 # output becomes the next place the secret is written down.
 #
@@ -103,16 +126,30 @@ named_raw=$(grep -inoE "$named" "$msg_file")
 rc=$?
 [ "$rc" -ge 2 ] && scan_failed "named variables" "$rc"
 
-hits=$(printf '%s' "$named_raw" \
-  | sed -E 's/=.*$//' \
-  | sed -E 's/^([0-9]+):[^A-Za-z0-9_]*/\1: /')
+if [ "$rc" -eq 0 ]; then
+  detected=1
 
-if [ -z "$hits" ]; then
+  stripped=$(printf '%s' "$named_raw" | sed -E 's/=.*$//')
+  [ $? -ne 0 ] && report_failed=1
+
+  hits=$(printf '%s' "$stripped" | sed -E 's/^([0-9]+):[^A-Za-z0-9_]*/\1: /')
+  [ $? -ne 0 ] && report_failed=1
+fi
+
+if [ "$detected" -eq 0 ]; then
   shapes_raw=$(grep -inoE "$shapes" "$msg_file")
   rc=$?
   [ "$rc" -ge 2 ] && scan_failed "vendor token shapes" "$rc"
 
-  hits=$(printf '%s' "$shapes_raw" | cut -d: -f1 | sed 's/$/: vendor token pattern/')
+  if [ "$rc" -eq 0 ]; then
+    detected=1
+
+    lineno=$(printf '%s' "$shapes_raw" | cut -d: -f1)
+    [ $? -ne 0 ] && report_failed=1
+
+    hits=$(printf '%s' "$lineno" | sed 's/$/: vendor token pattern/')
+    [ $? -ne 0 ] && report_failed=1
+  fi
 fi
 
 # An environment dump is many uppercase assignments at once, even when none is
@@ -135,11 +172,22 @@ case "$dump" in
   '' | *[!0-9]*) scan_failed "environment-style assignments (non-numeric count)" 2 ;;
 esac
 
-if [ -n "$hits" ] || [ "$dump" -ge 3 ]; then
+if [ "$detected" -eq 1 ] || [ "$dump" -ge 3 ]; then
   echo ""
   echo "Commit blocked: the message looks like it contains credentials."
   echo ""
-  [ -n "$hits" ] && echo "$hits" | sed 's/^/   line /'
+  if [ "$report_failed" -eq 1 ]; then
+    echo "   A credential was detected, but the report could not be formatted, so"
+    echo "   the locations are withheld. They are NOT printed unformatted: the"
+    echo "   unformatted form is the one that carries the value."
+  elif [ -n "$hits" ]; then
+    # A shell loop rather than another sed: this is the last formatting stage,
+    # and the fewer external commands the report depends on, the fewer places a
+    # failure can silence it. Its input is already value-free.
+    printf '%s\n' "$hits" | while IFS= read -r hit; do
+      [ -n "$hit" ] && printf '   line %s\n' "$hit"
+    done
+  fi
   [ "$dump" -ge 3 ] && echo "   $dump environment-style assignments (VAR=value) in the message"
   echo ""
   echo "   If you used -m \"...\", a backtick or \$(...) in the message was executed"
