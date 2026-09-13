@@ -18,7 +18,8 @@ import { getHeartbeatProcessingConfig } from '../config/heartbeat-flags';
 import { runWithRequestContext } from '../utils/request-context';
 import { getDataComposer } from '../data/composer';
 import { handleSendToInbox } from '../mcp/tools/inbox-handlers';
-import { getParticipants, reopenThreadRow } from '../mcp/tools/thread-handlers';
+import { getParticipants, participantSlugs, reopenThreadRow } from '../mcp/tools/thread-handlers';
+import { resolveSbsByIds, userPrincipal } from '../services/principals';
 import { FixedWindowLimiter } from '../utils/fixed-window-limiter';
 import { notifyPlatformOfApprovalRequest } from '../channels/approval-interceptor';
 
@@ -7123,6 +7124,9 @@ router.get('/threads', async (req: Request, res: Response) => {
     });
     const authReq = req as AdminAuthRequest;
     const userId = authReq.pcpUserId;
+    // Threads are workspace rows (spec inkmail-thread-scope §1): the page is
+    // the person's active workspace, resolved by the auth middleware.
+    const workspaceId = authReq.pcpWorkspaceId;
 
     // Reported caps, same contract as /tasks and /task-groups: the response
     // says what was dropped instead of silently truncating.
@@ -7134,10 +7138,10 @@ router.get('/threads', async (req: Request, res: Response) => {
       supabase
         .from('inbox_threads')
         .select(
-          'id, thread_key, key_project, key_type, key_id, title, status, created_by_agent_id, updated_at, closed_at',
+          'id, thread_key, key_project, key_type, key_id, title, status, created_by_kind, created_by_sb_id, updated_at, closed_at',
           { count: 'exact' }
         )
-        .eq('user_id', userId)
+        .eq('workspace_id', workspaceId)
         .order('updated_at', { ascending: false })
         .limit(THREADS_CAP),
       supabase
@@ -7226,9 +7230,9 @@ router.get('/threads', async (req: Request, res: Response) => {
       const { data: extraRows, error: extraError } = await supabase
         .from('inbox_threads')
         .select(
-          'id, thread_key, key_project, key_type, key_id, title, status, created_by_agent_id, updated_at, closed_at'
+          'id, thread_key, key_project, key_type, key_id, title, status, created_by_kind, created_by_sb_id, updated_at, closed_at'
         )
-        .eq('user_id', userId)
+        .eq('workspace_id', workspaceId)
         .in('thread_key', missing.slice(i, i + 50));
       if (extraError) {
         logger.error('Failed to hydrate thread rows for carrier keys:', extraError);
@@ -7243,17 +7247,25 @@ router.get('/threads', async (req: Request, res: Response) => {
     // ~20KB GET URL — rejected live with "URI too long"), and paginated
     // past the PostgREST page ceiling: production already returns 992
     // participant rows, one row-capped page away from silently dropping
-    // participants. The (thread_id, agent_id) PK gives a total order, so
-    // pages never skip or duplicate.
+    // participants. (thread_id, principal_key) is unique, so ordering by it
+    // gives a total order and pages never skip or duplicate. SB rows carry
+    // an identity id; the slug for display comes from one identity lookup.
     const participantsByThreadId = new Map<string, string[]>();
+    const peopleByThreadId = new Map<string, string[]>();
+    const participantSbIds = new Set<string>();
+    const participantRows: Array<{
+      thread_id: string;
+      sb_id: string | null;
+      user_id: string | null;
+    }> = [];
     const PARTICIPANT_PAGE = 1000;
     for (let from = 0; ; from += PARTICIPANT_PAGE) {
       const { data: pageRows, error: participantsError } = await supabase
         .from('inbox_thread_participants')
-        .select('thread_id, agent_id, inbox_threads!inner(user_id)')
-        .eq('inbox_threads.user_id', userId)
+        .select('thread_id, sb_id, user_id, inbox_threads!inner(workspace_id)')
+        .eq('inbox_threads.workspace_id', workspaceId)
         .order('thread_id', { ascending: true })
-        .order('agent_id', { ascending: true })
+        .order('principal_key', { ascending: true })
         .range(from, from + PARTICIPANT_PAGE - 1);
       if (participantsError) {
         logger.error('Failed to list thread participants:', participantsError);
@@ -7261,11 +7273,24 @@ router.get('/threads', async (req: Request, res: Response) => {
         return;
       }
       for (const row of pageRows || []) {
-        const list = participantsByThreadId.get(row.thread_id) ?? [];
-        list.push(row.agent_id);
-        participantsByThreadId.set(row.thread_id, list);
+        participantRows.push(row);
+        if (row.sb_id) participantSbIds.add(row.sb_id);
       }
       if (!pageRows || pageRows.length < PARTICIPANT_PAGE) break;
+    }
+    const slugBySbId = new Map(
+      (await resolveSbsByIds(supabase, [...participantSbIds])).map((sb) => [sb.sbId, sb.agentId])
+    );
+    for (const row of participantRows) {
+      if (row.sb_id) {
+        const list = participantsByThreadId.get(row.thread_id) ?? [];
+        list.push(slugBySbId.get(row.sb_id) ?? row.sb_id);
+        participantsByThreadId.set(row.thread_id, list);
+      } else if (row.user_id) {
+        const list = peopleByThreadId.get(row.thread_id) ?? [];
+        list.push(row.user_id);
+        peopleByThreadId.set(row.thread_id, list);
+      }
     }
 
     // Provisional identity for keys with no pinned thread row. Fail-closed
@@ -7277,7 +7302,7 @@ router.get('/threads', async (req: Request, res: Response) => {
     try {
       const slugLookup = await new ThreadKeyService(
         supabase as SupabaseClient<Database>
-      ).projectSlugLookup(userId);
+      ).projectSlugLookup(workspaceId);
       parse = (key) => parseThreadKey(key, slugLookup);
     } catch (error) {
       logger.warn('Thread spine slug lookup failed; provisional identities disabled:', error);
@@ -7293,10 +7318,14 @@ router.get('/threads', async (req: Request, res: Response) => {
         keyId: t.key_id ?? null,
         title: t.title ?? null,
         status: t.status,
-        createdByAgentId: t.created_by_agent_id,
+        createdByAgentId:
+          t.created_by_kind === 'sb' && t.created_by_sb_id
+            ? (slugBySbId.get(t.created_by_sb_id) ?? t.created_by_sb_id)
+            : t.created_by_kind,
         updatedAt: t.updated_at,
         closedAt: t.closed_at ?? null,
         participants: participantsByThreadId.get(t.id) ?? [],
+        people: peopleByThreadId.get(t.id) ?? [],
       })),
       sessions: sessionRows,
       studios: studioRows,
@@ -7428,8 +7457,10 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
 
     const { data: thread, error: threadError } = await supabase
       .from('inbox_threads')
-      .select('id, thread_key, title, status, created_by_agent_id, created_at, closed_at')
-      .eq('user_id', authReq.pcpUserId)
+      .select(
+        'id, thread_key, title, status, created_by_kind, created_by_sb_id, created_by_user_id, created_at, closed_at'
+      )
+      .eq('workspace_id', authReq.pcpWorkspaceId)
       .eq('thread_key', key)
       .maybeSingle();
     if (threadError) {
@@ -7458,9 +7489,10 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
       count: messagesCount,
     } = await supabase
       .from('inbox_thread_messages')
-      .select('id, sender_agent_id, content, message_type, priority, metadata, created_at', {
-        count: 'exact',
-      })
+      .select(
+        'id, sender_kind, sender_sb_id, sender_user_id, sender_agent_id, content, message_type, priority, metadata, created_at',
+        { count: 'exact' }
+      )
       .eq('thread_id', thread.id)
       .order('created_at', { ascending: false })
       .limit(MESSAGES_CAP);
@@ -7478,20 +7510,31 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
         threadKey: thread.thread_key,
         title: thread.title ?? null,
         status: thread.status,
-        createdByAgentId: thread.created_by_agent_id,
+        createdByKind: thread.created_by_kind,
+        createdByAgentId:
+          thread.created_by_kind === 'sb' && thread.created_by_sb_id
+            ? ((await resolveSbsByIds(supabase, [thread.created_by_sb_id]))[0]?.agentId ??
+              thread.created_by_sb_id)
+            : thread.created_by_kind,
+        createdByUserId: thread.created_by_user_id ?? null,
         createdAt: thread.created_at,
         closedAt: thread.closed_at ?? null,
       },
       messages: (messageRows || [])
         .map((m) => ({
           id: m.id,
-          senderAgentId: m.sender_agent_id,
+          // The author is a principal (spec inkmail-thread-scope §3): an SB
+          // by identity with its display slug, a person by user id, or the
+          // system with neither. The 'unknown' sentinel is gone.
+          senderKind: m.sender_kind,
+          // Display label: the SB's slug, else the kind ('user' | 'system'),
+          // so a client that renders one name still renders one.
+          senderAgentId: m.sender_agent_id ?? m.sender_kind,
+          senderSbId: m.sender_sb_id,
+          senderUserId: m.sender_user_id,
           content: m.content,
           messageType: m.message_type,
           priority: m.priority,
-          // Human replies land with sender_agent_id 'unknown' (no agent in the
-          // request context); metadata.sentBy = 'user' is how clients tell a
-          // person's message from a genuinely unattributed one.
           metadata: (m.metadata as Record<string, unknown> | null) ?? null,
           createdAt: m.created_at,
         }))
@@ -7573,7 +7616,7 @@ router.post('/threads', async (req: Request, res: Response) => {
     const { data: existing } = await supabase
       .from('inbox_threads')
       .select('id')
-      .eq('user_id', authReq.pcpUserId)
+      .eq('workspace_id', authReq.pcpWorkspaceId)
       .eq('thread_key', key)
       .maybeSingle();
 
@@ -7591,7 +7634,15 @@ router.post('/threads', async (req: Request, res: Response) => {
         ...(priority ? { priority } : {}),
         metadata: { sentBy: 'user', channel: 'admin-api' },
       },
-      dataComposer
+      dataComposer,
+      // The person is the sender, in the workspace the middleware resolved —
+      // server-side context the public tool schema never carries (§3, §6).
+      {
+        sender: {
+          principal: userPrincipal(authReq.pcpUserId),
+          workspaceId: authReq.pcpWorkspaceId,
+        },
+      }
     );
 
     const text = result.content?.[0]?.type === 'text' ? result.content[0].text : '{}';
@@ -7669,7 +7720,7 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
     const { data: thread, error: threadError } = await supabase
       .from('inbox_threads')
       .select('id, thread_key')
-      .eq('user_id', authReq.pcpUserId)
+      .eq('workspace_id', authReq.pcpWorkspaceId)
       .eq('thread_key', key)
       .maybeSingle();
     if (threadError) {
@@ -7683,9 +7734,13 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
     }
 
     const dataComposer = await getDataComposer();
-    const participants = await getParticipants(dataComposer.getClient(), thread.id);
+    // Dispatch operates on the SB participants (§7): a person's reply wakes
+    // every SB in the thread; the people reading it are never spawned.
+    const participants = participantSlugs(
+      await getParticipants(dataComposer.getClient(), thread.id)
+    );
     if (participants.length === 0) {
-      // A thread without participants has nobody to wake; refuse loudly
+      // A thread without SB participants has nobody to wake; refuse loudly
       // rather than storing a message no agent will ever see.
       res.status(409).json({ error: 'Thread has no participants to notify' });
       return;
@@ -7702,7 +7757,13 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
         ...(priority ? { priority } : {}),
         metadata: { sentBy: 'user', channel: 'admin-api' },
       },
-      dataComposer
+      dataComposer,
+      {
+        sender: {
+          principal: userPrincipal(authReq.pcpUserId),
+          workspaceId: authReq.pcpWorkspaceId,
+        },
+      }
     );
 
     const parsed = JSON.parse((result.content[0] as { text: string }).text) as Record<
@@ -7766,7 +7827,7 @@ router.post('/threads/reopen', async (req: Request, res: Response) => {
     const { data: thread, error: threadError } = await supabase
       .from('inbox_threads')
       .select('id, thread_key, status')
-      .eq('user_id', authReq.pcpUserId)
+      .eq('workspace_id', authReq.pcpWorkspaceId)
       .eq('thread_key', key)
       .maybeSingle();
     if (threadError) {
@@ -7786,6 +7847,7 @@ router.post('/threads/reopen', async (req: Request, res: Response) => {
     const dataComposer = await getDataComposer();
     const { reopened } = await reopenThreadRow(dataComposer.getClient(), thread.id, {
       kind: 'user',
+      userId: authReq.pcpUserId,
     });
     res.json({ success: true, threadKey: key, reopened, alreadyOpen: !reopened });
   } catch (error) {

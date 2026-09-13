@@ -30,6 +30,8 @@ export interface TriggerFailureNotice {
   toAgentId: string;
   threadId?: string | null;
   threadKey?: string | null;
+  /** The thread's workspace, when known — the only way a bare key resolves. */
+  workspaceId?: string | null;
   subject: string;
   content: string;
   metadata: Record<string, unknown>;
@@ -46,13 +48,17 @@ export async function sendTriggerFailureNotice(
 ): Promise<NoticeResult> {
   const { userId, fromAgentId, toAgentId, threadKey, subject, content, metadata } = notice;
 
-  // Resolve the thread: explicit id wins; else look up by (user, threadKey).
+  // Resolve the thread: the explicit id, or the one row (workspace, key)
+  // names when the caller knows the workspace. A bare key is not enough —
+  // workspace-local keys repeat across workspaces on purpose (spec
+  // inkmail-thread-scope §1) — so a keyed notice without a workspace takes
+  // the legacy lane rather than guessing.
   let threadId = notice.threadId || null;
-  if (!threadId && threadKey) {
+  if (!threadId && threadKey && notice.workspaceId) {
     const { data: thread, error: lookupErr } = await client
       .from('inbox_threads')
       .select('id')
-      .eq('user_id', userId)
+      .eq('workspace_id', notice.workspaceId)
       .eq('thread_key', threadKey)
       .maybeSingle();
     if (lookupErr) {
@@ -74,7 +80,11 @@ export async function sendTriggerFailureNotice(
   if (threadId) {
     const { error: insertErr } = await client.from('inbox_thread_messages').insert({
       thread_id: threadId,
-      sender_agent_id: 'system',
+      // The system borrows nobody's identity (spec inkmail-thread-scope §3).
+      sender_kind: 'system',
+      sender_sb_id: null,
+      sender_user_id: null,
+      sender_agent_id: null,
       content,
       message_type: 'notification',
       priority: 'high',

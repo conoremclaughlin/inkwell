@@ -56,6 +56,7 @@ import { resolveAgentFromMention } from './services/routing/resolve-mention';
 import { getHeartbeatProcessingConfig } from './config/heartbeat-flags';
 import { classifyError } from '@inklabs/shared';
 import { logger } from './utils/logger';
+import { isWorkspaceMember } from './services/principals';
 import {
   decideChannelForward,
   applyChannelForward,
@@ -846,6 +847,9 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
     // is blocked and logged as a security warning.
     let userId: string | undefined;
     let recipientSbId: string | undefined;
+    // The thread's workspace, once a thread-borne payload resolves it: holds
+    // are stamped and cleared against (thread, workspace).
+    let threadWorkspaceId: string | undefined;
 
     const authUser = getUserFromContext();
     const authUserId = authUser?.userId;
@@ -882,72 +886,100 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
 
       userId = inboxMsg?.recipient_user_id;
       recipientSbId = inboxMsg?.recipient_sb_id || undefined;
-    } else if (payload.threadMessageId) {
-      // Thread message: resolve user_id via inbox_thread_messages → inbox_threads
+    } else if (payload.threadMessageId || payload.threadId) {
+      // Thread-borne trigger (spec inkmail-thread-scope §1a): the target is
+      // the recipient participant's IDENTITY, named canonically by the
+      // dispatcher (toSbId). The runtime owner is that identity's user and
+      // the workspace is the identity's; the thread must live in the same
+      // workspace; and the authenticated sender must be a member of it. The
+      // thread's legacy owner is gone — a member of a shared workspace can
+      // reach an SB another member owns, which is the point.
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const supabase = dataComposer!.getClient() as any;
-      const { data: threadMsg, error: tmError } = await supabase
-        .from('inbox_thread_messages')
-        .select('thread_id')
-        .eq('id', payload.threadMessageId)
-        .single();
-      if (tmError) {
-        logger.error('[Trigger] Failed to look up thread message', {
-          threadMessageId: payload.threadMessageId,
-          error: tmError.message,
-        });
+      let threadId: string | undefined = payload.threadId;
+      if (!threadId && payload.threadMessageId) {
+        const { data: threadMsg, error: tmError } = await supabase
+          .from('inbox_thread_messages')
+          .select('thread_id')
+          .eq('id', payload.threadMessageId)
+          .single();
+        if (tmError) {
+          logger.error('[Trigger] Failed to look up thread message', {
+            threadMessageId: payload.threadMessageId,
+            error: tmError.message,
+          });
+        }
+        threadId = threadMsg?.thread_id ?? undefined;
       }
-      if (threadMsg?.thread_id) {
+      if (threadId) {
         const { data: thread, error: threadError } = await supabase
           .from('inbox_threads')
-          .select('user_id')
-          .eq('id', threadMsg.thread_id)
+          .select('id, workspace_id')
+          .eq('id', threadId)
           .single();
         if (threadError) {
-          logger.error('[Trigger] Failed to look up thread from message', {
-            threadId: threadMsg.thread_id,
+          logger.error('[Trigger] Failed to look up thread', {
+            threadId,
             error: threadError.message,
           });
         }
-        const threadUserId = thread?.user_id as string | undefined;
-        if (threadUserId && authUserId && threadUserId !== authUserId) {
-          logger.warn('[Trigger] SECURITY: thread owner does not match authenticated user', {
-            threadMessageId: payload.threadMessageId,
-            threadUserId,
+        threadWorkspaceId = (thread?.workspace_id as string | undefined) ?? undefined;
+      }
+
+      if (payload.toSbId) {
+        const { data: identity } = await supabase
+          .from('agent_identities')
+          .select('id, agent_id, user_id, workspace_id')
+          .eq('id', payload.toSbId)
+          .maybeSingle();
+        if (!identity) {
+          throw new Error(`Trigger denied: unknown target identity for ${targetAgentId}`);
+        }
+        if (identity.agent_id !== targetAgentId) {
+          throw new Error(
+            `Trigger denied: target identity is "${identity.agent_id}", not "${targetAgentId}"`
+          );
+        }
+        if (threadWorkspaceId && identity.workspace_id !== threadWorkspaceId) {
+          logger.warn('[Trigger] SECURITY: target identity is not in the thread workspace', {
+            threadId,
+            threadWorkspaceId,
+            identityWorkspaceId: identity.workspace_id,
+            targetAgentId,
+            fromAgentId: payload.fromAgentId,
+          });
+          throw new Error('Trigger denied: target identity is not in the thread workspace');
+        }
+        if (
+          threadWorkspaceId &&
+          authUserId &&
+          !(await isWorkspaceMember(supabase, threadWorkspaceId, authUserId))
+        ) {
+          logger.warn('[Trigger] SECURITY: sender is not a member of the thread workspace', {
+            threadId,
+            threadWorkspaceId,
             authUserId,
             targetAgentId,
             fromAgentId: payload.fromAgentId,
           });
-          throw new Error('Trigger denied: thread does not belong to authenticated user');
+          throw new Error('Trigger denied: sender is not a member of the thread workspace');
         }
-        userId = threadUserId;
+        userId = identity.user_id;
+        recipientSbId = identity.id;
+      } else if (threadWorkspaceId && authUserId) {
+        // No canonical target (a bare trigger_agent naming a thread): the
+        // authenticated caller must at least belong to the thread's
+        // workspace before the slug is resolved under their own identities.
+        if (!(await isWorkspaceMember(supabase, threadWorkspaceId, authUserId))) {
+          logger.warn('[Trigger] SECURITY: caller is not a member of the thread workspace', {
+            threadId,
+            threadWorkspaceId,
+            authUserId,
+            targetAgentId,
+          });
+          throw new Error('Trigger denied: caller is not a member of the thread workspace');
+        }
       }
-    } else if (payload.threadId) {
-      // Thread (add_thread_participant): resolve user_id directly from inbox_threads
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const { data: thread, error: threadError } = await (dataComposer!.getClient() as any)
-        .from('inbox_threads')
-        .select('user_id')
-        .eq('id', payload.threadId)
-        .single();
-      if (threadError) {
-        logger.error('[Trigger] Failed to look up thread', {
-          threadId: payload.threadId,
-          error: threadError.message,
-        });
-      }
-      const threadUserId = thread?.user_id as string | undefined;
-      if (threadUserId && authUserId && threadUserId !== authUserId) {
-        logger.warn('[Trigger] SECURITY: thread owner does not match authenticated user', {
-          threadId: payload.threadId,
-          threadUserId,
-          authUserId,
-          targetAgentId,
-          fromAgentId: payload.fromAgentId,
-        });
-        throw new Error('Trigger denied: thread does not belong to authenticated user');
-      }
-      userId = threadUserId;
     }
 
     // Fall back to authenticated user from OAuth context (trigger_agent called directly)
@@ -1134,9 +1166,10 @@ When you complete a task_request, mark it as completed using update_inbox_messag
     // stamp (PR #514 round 2).
     const clearHoldAtTerminal = async (): Promise<void> => {
       if (!payload.threadId || !assignmentLanded) return;
+      if (!threadWorkspaceId) return;
       await clearRoutingHold(dataComposer!.getClient(), {
         threadId: payload.threadId,
-        userId,
+        workspaceId: threadWorkspaceId,
         agentId: targetAgentId,
         routedSince: routeStartedAt,
       });
@@ -1184,10 +1217,10 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       // is. Goes through the tested routing-hold boundary — this call site
       // previously drifted out of sync with the RPC signature and every
       // refusal went unstamped, with a green suite (Lumen, round 4).
-      if (payload.threadId) {
+      if (payload.threadId && threadWorkspaceId) {
         await stampRoutingHold(dataComposer!.getClient(), {
           threadId: payload.threadId,
-          userId,
+          workspaceId: threadWorkspaceId,
           agentId: targetAgentId,
           attemptStartedAt: routeStartedAt,
           detail: {
@@ -1250,7 +1283,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         try {
           const assignment = await assignThreadParticipant(dataComposer!.getClient(), {
             threadId: payload.threadId,
-            agentId: targetAgentId,
+            sbId: resolvedIdentityId,
             candidateSessionId: routedSession.id,
             explicitAnchor: !!payload.explicitRecipientTarget,
             source: 'trigger-handler',
@@ -1607,6 +1640,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
       // Look up the userId from the original source row (needed for sender inbox insert).
       let recipientUserId: string | undefined;
       let resolvedThreadId: string | undefined;
+      let resolvedThreadWorkspaceId: string | undefined;
       if (payload.inboxMessageId) {
         const { data: origMsg } = await client
           .from('agent_inbox')
@@ -1614,32 +1648,37 @@ When you complete a task_request, mark it as completed using update_inbox_messag
           .eq('id', payload.inboxMessageId)
           .single();
         recipientUserId = origMsg?.recipient_user_id;
-      } else if (payload.threadMessageId) {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const { data: threadMsg } = await (client as any)
-          .from('inbox_thread_messages')
-          .select('thread_id')
-          .eq('id', payload.threadMessageId)
-          .single();
-        if (threadMsg?.thread_id) {
-          resolvedThreadId = threadMsg.thread_id;
+      } else if (payload.threadMessageId || payload.threadId) {
+        resolvedThreadId = payload.threadId;
+        if (!resolvedThreadId && payload.threadMessageId) {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const { data: threadMsg } = await (client as any)
+            .from('inbox_thread_messages')
+            .select('thread_id')
+            .eq('id', payload.threadMessageId)
+            .single();
+          resolvedThreadId = threadMsg?.thread_id ?? undefined;
+        }
+        if (resolvedThreadId) {
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           const { data: thread } = await (client as any)
             .from('inbox_threads')
-            .select('user_id')
-            .eq('id', threadMsg.thread_id)
+            .select('workspace_id')
+            .eq('id', resolvedThreadId)
             .single();
-          recipientUserId = thread?.user_id;
+          resolvedThreadWorkspaceId = thread?.workspace_id ?? undefined;
         }
-      } else if (payload.threadId) {
-        resolvedThreadId = payload.threadId;
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const { data: thread } = await (client as any)
-          .from('inbox_threads')
-          .select('user_id')
-          .eq('id', payload.threadId)
-          .single();
-        recipientUserId = thread?.user_id;
+        // The runtime owner of the failed target is its identity's user
+        // (§1a); the thread no longer carries an owner.
+        if (payload.toSbId) {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const { data: identity } = await (client as any)
+            .from('agent_identities')
+            .select('user_id')
+            .eq('id', payload.toSbId)
+            .maybeSingle();
+          recipientUserId = identity?.user_id ?? undefined;
+        }
       }
 
       // Bare trigger_agent (no source row, possibly just a threadKey): fall
@@ -1674,6 +1713,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
         toAgentId: payload.toAgentId,
         threadId: resolvedThreadId,
         threadKey: payload.threadKey,
+        workspaceId: resolvedThreadWorkspaceId ?? null,
         subject: `Trigger failed: ${payload.toAgentId}`,
         content: notificationContent,
         metadata: {

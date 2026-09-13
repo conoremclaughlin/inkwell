@@ -20,6 +20,12 @@ export interface AgentTriggerPayload {
   fromAgentId: string;
   /** Target agent to wake up (e.g., "myra") */
   toAgentId: string;
+  /**
+   * Canonical identity of the target (agent_identities.id). Set by thread
+   * dispatch; the trigger handler resolves the runtime owner and workspace
+   * from it rather than from the thread's owner (spec inkmail-thread-scope §1a).
+   */
+  toSbId?: string;
   /** Optional inbox message ID that prompted this trigger (agent_inbox rows only) */
   inboxMessageId?: string;
   /** Optional thread message ID that prompted this trigger (inbox_thread_messages rows) */

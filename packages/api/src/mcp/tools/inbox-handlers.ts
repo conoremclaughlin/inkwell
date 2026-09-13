@@ -10,6 +10,18 @@ import { isoDateTime } from './schema-primitives.js';
 import type { DataComposer } from '../../data/composer';
 import { resolveUserOrThrow, userIdentifierBaseSchema } from '../../services/user-resolver';
 import { resolveIdentityId, resolveAgentSlug } from '../../auth/resolve-identity';
+import {
+  SYSTEM_PRINCIPAL,
+  principalColumns,
+  resolveSbsByIds,
+  resolveSbsInWorkspace,
+  senderColumns,
+  type Principal,
+  type SbPrincipal,
+  type SystemPrincipal,
+  type UserPrincipal,
+} from '../../services/principals';
+import { resolveCallerSb } from './caller-principal';
 import { advanceThreadReadPointer, advanceAgentInboxReadPointer } from './read-state.js';
 import { getEffectiveAgentId } from '../../auth/enforce-identity';
 import { logger } from '../../utils/logger';
@@ -34,6 +46,10 @@ import {
 } from './sender-context.js';
 import {
   findThread as findExistingThread,
+  sbParticipants,
+  creatorForDispatch,
+  type SbRef,
+  type TriggerPrincipal,
   getParticipants,
   resolveTriggeredAgents,
   handleGetThreadMessages,
@@ -148,8 +164,9 @@ export interface ThreadPageRow {
   id: string;
   thread_key: string;
   title: string | null;
-  user_id: string;
-  created_by_agent_id: string;
+  workspace_id: string;
+  created_by_kind: string;
+  created_by_sb_id: string | null;
   updated_at: string | null;
 }
 
@@ -299,7 +316,7 @@ const getAgentSummariesSchema = userIdentifierBaseSchema.extend({
  */
 async function warnOnUnregisteredProjectPrefix(
   supabase: SupabaseClient<Database>,
-  userId: string,
+  workspaceId: string,
   threadKey: string
 ): Promise<string | undefined> {
   // Skip the registry entirely for keys that could never warn. Two-segment
@@ -309,8 +326,8 @@ async function warnOnUnregisteredProjectPrefix(
   try {
     const service = new ThreadKeyService(supabase);
     const [slugLookup, knownTypes] = await Promise.all([
-      service.projectSlugLookup(userId),
-      service.knownTypeNames(userId),
+      service.projectSlugLookup(workspaceId),
+      service.knownTypeNames(workspaceId),
     ]);
 
     const found = detectUnregisteredProjectPrefix(threadKey, slugLookup, knownTypes);
@@ -318,7 +335,7 @@ async function warnOnUnregisteredProjectPrefix(
 
     const message = describeUnregisteredProjectPrefix(threadKey, found);
     logger.warn('Thread key uses an unregistered project prefix', {
-      userId,
+      workspaceId,
       threadKey,
       suspectedProject: found.suspectedProject,
       pinnedAsType: found.pinnedAsType,
@@ -333,7 +350,20 @@ async function warnOnUnregisteredProjectPrefix(
   }
 }
 
-export async function handleSendToInbox(args: unknown, dataComposer: DataComposer) {
+/**
+ * Server-only sender context. The public tool schema never carries who a
+ * person is or which workspace they act in — the admin routes and other
+ * server code pass it here, after authenticating it themselves.
+ */
+export interface InternalSendContext {
+  sender: { principal: UserPrincipal | SystemPrincipal; workspaceId: string };
+}
+
+export async function handleSendToInbox(
+  args: unknown,
+  dataComposer: DataComposer,
+  internal?: InternalSendContext
+) {
   const supabase = dataComposer.getClient();
   const parsed = sendToInboxSchema.parse(args);
   const resolved = await resolveUserOrThrow(parsed, dataComposer);
@@ -487,13 +517,40 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
   if (threadKey) {
     const allRecipients = recipients || [recipientAgentId!];
 
+    // ── Principals and workspace (spec inkmail-thread-scope §3, §6) ──
+    // An SB sends from its own workspace; a person from the one the server
+    // resolved for the request; the system addresses an SB and lands in
+    // that SB's workspace. Recipients are slugs resolved inside that
+    // workspace to exactly one identity each — none or several fails the
+    // send (§1c: routing fails closed on an unresolvable principal).
+    let sender: Principal;
+    let workspaceId: string;
+    if (senderAgentId && senderAgentId !== 'system') {
+      const sb = await resolveCallerSb(supabase, resolved.user.id, senderAgentId);
+      sender = sb;
+      workspaceId = sb.workspaceId;
+    } else if (internal?.sender) {
+      sender = internal.sender.principal;
+      workspaceId = internal.sender.workspaceId;
+    } else {
+      sender = SYSTEM_PRINCIPAL;
+      const first = await resolveCallerSb(supabase, resolved.user.id, allRecipients[0]);
+      workspaceId = first.workspaceId;
+    }
+    const senderSb: SbPrincipal | null = sender.kind === 'sb' ? sender : null;
+    const recipientSbs = await resolveSbsInWorkspace(supabase, workspaceId, allRecipients);
+    const participantSbs: SbPrincipal[] = [];
+    for (const sb of senderSb ? [senderSb, ...recipientSbs] : recipientSbs) {
+      if (!participantSbs.some((p) => p.sbId === sb.sbId)) participantSbs.push(sb);
+    }
+
     // Check if thread already exists — determines reply vs create behavior
-    const existingThread = await findExistingThread(supabase, resolved.user.id, threadKey);
+    const existingThread = await findExistingThread(supabase, workspaceId, threadKey);
 
     // Only meaningful before creation: an existing thread's identity was pinned
     // when it was made and cannot be revised now.
     if (!existingThread) {
-      prefixWarning = await warnOnUnregisteredProjectPrefix(supabase, resolved.user.id, threadKey);
+      prefixWarning = await warnOnUnregisteredProjectPrefix(supabase, workspaceId, threadKey);
     }
 
     // ── Reply semantics ──
@@ -506,21 +563,17 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
 
     // Find or create thread
     let thread = await findOrCreateThread(supabase, {
-      userId: resolved.user.id,
+      workspaceId,
       threadKey,
-      creatorAgentId: triggerSenderId,
+      creator: sender,
       title: subject || null,
-      participants: senderAgentId ? [...new Set([senderAgentId, ...allRecipients])] : allRecipients,
+      participants: participantSbs,
+      person: sender.kind === 'user' ? sender : null,
     });
 
-    // Include sender as participant if they have an identity
-    const allParticipants = senderAgentId
-      ? [...new Set([senderAgentId, ...allRecipients])]
-      : allRecipients;
-
     // Cross-studio self-message: sender targets themselves in a different studio.
-    // The PK is (thread_id, agent_id) so there's only ONE participant row — stamping
-    // session_id would scope it to one studio and hide it from the other. Leave null
+    // There is only ONE participant row per principal — stamping session_id
+    // would scope it to one studio and hide it from the other. Leave null
     // so both sessions see the thread.
     const isCrossStudioSelf = !!(
       senderAgentId &&
@@ -528,27 +581,28 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
       (recipientStudioId || recipientStudioSlugOrHint)
     );
 
-    // Ensure all participants are registered (recipients + sender for existing threads).
+    // Ensure all SB participants are registered (recipients + sender for existing threads).
     // Stamp session_id so channel plugins can filter threads to their session.
-    for (const participantAgentId of allParticipants) {
-      const isSender = participantAgentId === senderAgentId;
+    for (const participant of participantSbs) {
+      const isSender = senderSb?.sbId === participant.sbId;
       const participantSessionId =
-        isCrossStudioSelf && participantAgentId === senderAgentId
+        isCrossStudioSelf && isSender
           ? null
           : isSender
             ? senderSessionId
             : recipientSessionId || null;
 
       const { data: existing } = await threadTable(supabase, 'inbox_thread_participants')
-        .select('agent_id, session_id')
+        .select('sb_id, session_id')
         .eq('thread_id', thread.id)
-        .eq('agent_id', participantAgentId)
+        .eq('sb_id', participant.sbId)
         .maybeSingle();
 
       if (!existing) {
         await threadTable(supabase, 'inbox_thread_participants').insert({
           thread_id: thread.id,
-          agent_id: participantAgentId,
+          workspace_id: workspaceId,
+          ...principalColumns(participant),
           ...(participantSessionId ? { session_id: participantSessionId } : {}),
         });
       } else if (participantSessionId) {
@@ -562,8 +616,26 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
           await threadTable(supabase, 'inbox_thread_participants')
             .update({ session_id: participantSessionId })
             .eq('thread_id', thread.id)
-            .eq('agent_id', participantAgentId);
+            .eq('sb_id', participant.sbId);
         }
+      }
+    }
+
+    // A person's reply upserts their participant row BEFORE the message
+    // lands (§7), so the author is a real principal by the time anything
+    // reads the thread. No session stamp: people are never spawned.
+    if (sender.kind === 'user') {
+      const { data: personRow } = await threadTable(supabase, 'inbox_thread_participants')
+        .select('user_id')
+        .eq('thread_id', thread.id)
+        .eq('user_id', sender.userId)
+        .maybeSingle();
+      if (!personRow) {
+        await threadTable(supabase, 'inbox_thread_participants').insert({
+          thread_id: thread.id,
+          workspace_id: workspaceId,
+          ...principalColumns(sender),
+        });
       }
     }
 
@@ -607,7 +679,10 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
       pcp: {
         ...existingPcpMeta,
         sender: {
-          agentId: triggerSenderId,
+          kind: sender.kind,
+          agentId: senderSb ? senderSb.agentId : null,
+          sbId: senderSb ? senderSb.sbId : null,
+          userId: sender.kind === 'user' ? sender.userId : null,
           sessionId: senderSessionId,
           studioId: senderStudioId,
         },
@@ -622,7 +697,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     )
       .insert({
         thread_id: thread.id,
-        sender_agent_id: triggerSenderId,
+        ...senderColumns(sender),
         content,
         message_type: messageType === 'permission_grant' ? 'message' : messageType,
         priority,
@@ -660,10 +735,10 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
       allRecipients.includes(senderAgentId) &&
       (recipientStudioId || recipientStudioSlugOrHint || recipientSessionId || sessionAlias)
     );
-    if (senderAgentId && threadMessage?.id && !explicitSelfTarget) {
+    if (sender.kind !== 'system' && threadMessage?.id && !explicitSelfTarget) {
       await advanceThreadReadPointer(supabase, {
         threadId: thread.id,
-        agentId: senderAgentId,
+        ...(sender.kind === 'sb' ? { sbId: sender.sbId } : { userId: sender.userId }),
         throughMessageId: threadMessage.id,
         source: 'send_to_inbox:sender',
       });
@@ -672,32 +747,47 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     // ── Trigger resolution ──
     // For existing threads (replies), use smart trigger rules from resolveTriggeredAgents.
     // For new threads, trigger all recipients (existing behavior).
-    let agentsToTrigger: string[] = [];
+    let agentsToTrigger: SbRef[] = [];
 
     // Cross-studio/session self-messaging must not exclude self from trigger
     // resolution — same predicate as the sender-advance exemption above.
     const selfStudioTarget = explicitSelfTarget;
 
     if (trigger !== false && !missingSenderSession) {
-      if (existingThread && senderAgentId) {
-        // Reply: fetch current participants from DB for accurate trigger resolution
-        const currentParticipants = await getParticipants(supabase, thread.id);
+      // Dispatch operates on the SB participants only (§7): a person's row
+      // never changes the routing, and a person's reply wakes every SB.
+      const currentParticipants = await getParticipants(supabase, thread.id);
+      const sbParts = sbParticipants(currentParticipants);
+      const senderForDispatch: TriggerPrincipal = senderSb
+        ? { kind: 'sb', sbId: senderSb.sbId, agentId: senderSb.agentId }
+        : sender.kind === 'user'
+          ? { kind: 'user' }
+          : { kind: 'system' };
+      // Explicit wake targets are slugs; non-participants are silently ignored.
+      const triggerSbIds = (triggerAgents || [])
+        .map((slug) => sbParts.find((p) => p.agentId === slug)?.sbId)
+        .filter((id): id is string => !!id);
+      const recipientSbIds = recipientSbs.map((r) => r.sbId);
+
+      if (existingThread) {
         agentsToTrigger = resolveTriggeredAgents({
-          senderAgentId,
-          participants: currentParticipants,
-          creatorAgentId: existingThread.created_by_agent_id,
-          triggerAgents,
+          sender: senderForDispatch,
+          sbParticipants: sbParts,
+          creator: creatorForDispatch(existingThread, currentParticipants),
+          triggerAgents: triggerSbIds,
           triggerAll,
           messageType,
-          recipients: allRecipients,
+          recipients: recipientSbIds,
           selfStudioTarget,
         });
       } else {
-        // New thread: trigger all recipients (exclude sender unless cross-studio
-        // self-message or actionable self-target like strategy kickoff)
+        // New thread: trigger all addressed SBs (exclude sender unless
+        // cross-studio self-message or actionable self-target like strategy kickoff)
         const actionableSelf = new Set(['task_request', 'session_resume']);
         const allowSelf = selfStudioTarget || (!!messageType && actionableSelf.has(messageType));
-        agentsToTrigger = allRecipients.filter((a) => allowSelf || a !== senderAgentId);
+        agentsToTrigger = recipientSbs
+          .filter((r) => allowSelf || r.sbId !== senderSb?.sbId)
+          .map((r) => ({ sbId: r.sbId, agentId: r.agentId }));
       }
     }
 
@@ -708,7 +798,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
       from: triggerSenderId,
       type: messageType,
       isNewThread: thread.isNew,
-      triggering: agentsToTrigger,
+      triggering: agentsToTrigger.map((t) => t.agentId),
       recipientStudioId: recipientStudioId || null,
       recipientStudioHint: recipientStudioHint || null,
       resolvedRecipientStudioId: resolvedRecipientStudioId || null,
@@ -728,17 +818,21 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
     // Union with agentsToTrigger: actionable self-sends (session_resume /
     // task_request strategy kickoffs) wake self without an explicit
     // studio/session target and must keep dispatching.
-    const routingSet = [
-      ...new Set([
-        ...allRecipients.filter((a) => a !== senderAgentId || explicitSelfTarget),
-        ...agentsToTrigger,
-      ]),
-    ];
+    const routingById = new Map<string, SbRef>();
+    for (const r of recipientSbs) {
+      if (r.sbId !== senderSb?.sbId || explicitSelfTarget) {
+        routingById.set(r.sbId, { sbId: r.sbId, agentId: r.agentId });
+      }
+    }
+    for (const t of agentsToTrigger) routingById.set(t.sbId, t);
+    const routingSet = [...routingById.values()];
+    const wakeIds = new Set(agentsToTrigger.map((t) => t.sbId));
     if (routingSet.length > 0) {
       const gateway = getAgentGateway();
 
-      for (const toAgentId of routingSet) {
-        const wake = agentsToTrigger.includes(toAgentId);
+      for (const target of routingSet) {
+        const toAgentId = target.agentId;
+        const wake = wakeIds.has(target.sbId);
         // Auto-resolve recipientSessionId: find the recipient's most recent
         // message on this thread to extract their sender session. This ensures
         // replies route back to the session that originated the conversation,
@@ -755,7 +849,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
             const { data: recipientMsg } = await threadTable(supabase, 'inbox_thread_messages')
               .select('metadata')
               .eq('thread_id', thread.id)
-              .eq('sender_agent_id', toAgentId)
+              .eq('sender_sb_id', target.sbId)
               .order('created_at', { ascending: false })
               .limit(1)
               .maybeSingle();
@@ -789,7 +883,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
               const { data: participant } = await threadTable(supabase, 'inbox_thread_participants')
                 .select('session_id')
                 .eq('thread_id', thread.id)
-                .eq('agent_id', toAgentId)
+                .eq('sb_id', target.sbId)
                 .maybeSingle();
               if (participant?.session_id && typeof participant.session_id === 'string') {
                 resolvedRecipientSessionId = participant.session_id;
@@ -834,6 +928,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
         const payload: AgentTriggerPayload = {
           fromAgentId: triggerSenderId,
           toAgentId,
+          toSbId: target.sbId,
           threadId: thread.id,
           threadMessageId: threadMessage.id,
           triggerType: triggerType || 'message',
@@ -926,7 +1021,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
             // problem can both be reported on the same send.
             ...(prefixWarning ? { threadKeyWarning: prefixWarning } : {}),
             recipients: allRecipients,
-            participants: allParticipants,
+            participants: participantSbs.map((p) => p.agentId),
             messageType,
             priority,
             triggered: triggeredAgents,
@@ -1118,22 +1213,26 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
 }
 
 /**
- * Find or create a thread. Returns the thread row with an `isNew` flag.
+ * Find or create a thread in a workspace. Returns the thread id with an
+ * `isNew` flag. The creator is a principal (§3: creation always has an
+ * event — an SB, a person, or the system); the participants are SBs, plus
+ * the creating person when there is one.
  */
 export async function findOrCreateThread(
   supabase: ReturnType<DataComposer['getClient']>,
   opts: {
-    userId: string;
+    workspaceId: string;
     threadKey: string;
-    creatorAgentId: string;
+    creator: Principal;
     title: string | null;
-    participants: string[];
+    participants: SbPrincipal[];
+    person?: UserPrincipal | null;
   }
 ): Promise<{ id: string; isNew: boolean }> {
   // Try to find existing
   const { data: existing } = await threadTable(supabase, 'inbox_threads')
     .select('id')
-    .eq('user_id', opts.userId)
+    .eq('workspace_id', opts.workspaceId)
     .eq('thread_key', opts.threadKey)
     .maybeSingle();
 
@@ -1146,11 +1245,14 @@ export async function findOrCreateThread(
   // pin_thread_key_before_insert — the DB, not the app, is the pinning
   // authority, so no deploy gap can create an unpinned thread (grammar v4;
   // Lumen PR #516 round 2 conditions 1/4/6).
+  const creator = opts.creator;
   const { data: thread, error } = await threadTable(supabase, 'inbox_threads')
     .insert({
       thread_key: opts.threadKey,
-      user_id: opts.userId,
-      created_by_agent_id: opts.creatorAgentId,
+      workspace_id: opts.workspaceId,
+      created_by_kind: creator.kind,
+      created_by_sb_id: creator.kind === 'sb' ? creator.sbId : null,
+      created_by_user_id: creator.kind === 'user' ? creator.userId : null,
       title: opts.title,
     })
     .select()
@@ -1161,7 +1263,7 @@ export async function findOrCreateThread(
     if (error.code === '23505') {
       const { data: retry } = await threadTable(supabase, 'inbox_threads')
         .select('id')
-        .eq('user_id', opts.userId)
+        .eq('workspace_id', opts.workspaceId)
         .eq('thread_key', opts.threadKey)
         .single();
       if (retry) return { id: retry.id, isNew: false };
@@ -1170,11 +1272,21 @@ export async function findOrCreateThread(
   }
 
   // Add all participants
-  const participantRows = opts.participants.map((agentId) => ({
+  const participantRows: Array<Record<string, unknown>> = opts.participants.map((sb) => ({
     thread_id: thread.id,
-    agent_id: agentId,
+    workspace_id: opts.workspaceId,
+    ...principalColumns(sb),
   }));
-  await threadTable(supabase, 'inbox_thread_participants').insert(participantRows);
+  if (opts.person) {
+    participantRows.push({
+      thread_id: thread.id,
+      workspace_id: opts.workspaceId,
+      ...principalColumns(opts.person),
+    });
+  }
+  if (participantRows.length > 0) {
+    await threadTable(supabase, 'inbox_thread_participants').insert(participantRows);
+  }
 
   return { id: thread.id, isNew: true };
 }
@@ -1543,7 +1655,8 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
     unreadCount: number;
     lastMessageAt: string | null;
     previewMessages: Array<{
-      senderAgentId: string;
+      senderKind: string;
+      senderAgentId: string | null;
       content: string;
       messageType: string;
       createdAt: string;
@@ -1597,8 +1710,23 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
       // messages have I seen." Filtering threads by updated_at would
       // cause missed messages when lastPollTime advances past the
       // thread's updated_at between polls.
+      // The caller SB fixes the workspace; a view over every agent spans
+      // every workspace the user belongs to.
+      const callerSb = agentId ? await resolveCallerSb(supabase, resolved.user.id, agentId) : null;
+      let threadWorkspaceIds: string[];
+      if (callerSb) {
+        threadWorkspaceIds = [callerSb.workspaceId];
+      } else {
+        const { data: memberships } = await supabase
+          .from('workspace_members')
+          .select('workspace_id')
+          .eq('user_id', resolved.user.id);
+        threadWorkspaceIds = (memberships || []).map(
+          (m: { workspace_id: string }) => m.workspace_id
+        );
+      }
       let threads: ThreadPageRow[] | null = null;
-      if (channelPoll && agentId) {
+      if (channelPoll && callerSb) {
         // Delivery polls page by EXACT candidacy in SQL (Lumen, PR #473
         // round 3): candidacy compares the read pointer against the latest
         // MESSAGE timestamp — thread.updated_at is bumped AFTER the message
@@ -1609,8 +1737,7 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
         const { data: candRows, error: candErr } = await supabase.rpc(
           'get_unread_thread_candidates',
           {
-            p_user_id: resolved.user.id,
-            p_agent_id: agentId,
+            p_sb_id: callerSb.sbId,
             p_session_id: callerSessionId ?? undefined,
             p_limit: THREAD_PAGE_LIMIT,
           }
@@ -1633,7 +1760,9 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
           const candIds = cands.map((c) => c.thread_id);
           const pageRows = checkedRead<ThreadPageRow[]>(
             await threadTable(supabase, 'inbox_threads')
-              .select('id, thread_key, title, user_id, created_by_agent_id, updated_at')
+              .select(
+                'id, thread_key, title, workspace_id, created_by_kind, created_by_sb_id, updated_at'
+              )
               .in('id', candIds),
             'thread_page'
           );
@@ -1656,13 +1785,13 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
         // list_threads(status='open') is the explicit work-list filter.
         let recencyQuery = threadTable(supabase, 'inbox_threads')
           .select(
-            agentId
-              ? 'id, thread_key, title, user_id, created_by_agent_id, updated_at, inbox_thread_participants!inner(agent_id)'
-              : 'id, thread_key, title, user_id, created_by_agent_id, updated_at'
+            callerSb
+              ? 'id, thread_key, title, workspace_id, created_by_kind, created_by_sb_id, updated_at, inbox_thread_participants!inner(sb_id)'
+              : 'id, thread_key, title, workspace_id, created_by_kind, created_by_sb_id, updated_at'
           )
-          .eq('user_id', resolved.user.id);
-        if (agentId) {
-          recencyQuery = recencyQuery.eq('inbox_thread_participants.agent_id', agentId);
+          .in('workspace_id', threadWorkspaceIds);
+        if (callerSb) {
+          recencyQuery = recencyQuery.eq('inbox_thread_participants.sb_id', callerSb.sbId);
         }
         const data = checkedRead<ThreadPageRow[]>(
           await recencyQuery.order('updated_at', { ascending: false }).limit(THREAD_PAGE_LIMIT),
@@ -1676,19 +1805,32 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
 
         // Batch 1: all participants for all threads (was N queries)
         const allParts = checkedRead<
-          Array<{ thread_id: string; agent_id: string; joined_at?: string }>
+          Array<{
+            thread_id: string;
+            sb_id: string | null;
+            user_id: string | null;
+            joined_at?: string;
+          }>
         >(
           await threadTable(supabase, 'inbox_thread_participants')
-            .select('thread_id, agent_id, joined_at')
+            .select('thread_id, sb_id, user_id, joined_at')
             .in('thread_id', tIds),
           'thread_participants'
         );
-        const partsByThread = new Map<string, Array<{ agent_id: string; joined_at?: string }>>();
+        type PartRow = { sb_id: string | null; user_id: string | null; joined_at?: string };
+        const partsByThread = new Map<string, PartRow[]>();
         for (const p of allParts || []) {
           const arr = partsByThread.get(p.thread_id) || [];
           arr.push(p);
           partsByThread.set(p.thread_id, arr);
         }
+        // Slugs for display, one lookup for every SB on the page.
+        const pageSbIds = [
+          ...new Set((allParts || []).map((p) => p.sb_id).filter((id): id is string => !!id)),
+        ];
+        const slugBySbId = new Map(
+          (await resolveSbsByIds(supabase, pageSbIds)).map((sb) => [sb.sbId, sb.agentId])
+        );
 
         // Batch 2: all read statuses for all threads (was N queries)
         const readStatusByThread = new Map<string, string | null>();
@@ -1699,7 +1841,7 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
             await threadTable(supabase, 'inbox_thread_read_status')
               .select('thread_id, last_read_at')
               .in('thread_id', tIds)
-              .eq('agent_id', agentId),
+              .eq('sb_id', callerSb!.sbId),
             'thread_read_status'
           );
           for (const rs of allReadStatuses || []) {
@@ -1714,7 +1856,9 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
         const allMsgs = checkedRead<
           Array<{
             thread_id: string;
-            sender_agent_id: string;
+            sender_kind: string;
+            sender_sb_id: string | null;
+            sender_agent_id: string | null;
             content: string;
             message_type: string;
             created_at: string;
@@ -1722,7 +1866,9 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
           }>
         >(
           await threadTable(supabase, 'inbox_thread_messages')
-            .select('thread_id, sender_agent_id, content, message_type, created_at, metadata')
+            .select(
+              'thread_id, sender_kind, sender_sb_id, sender_agent_id, content, message_type, created_at, metadata'
+            )
             .in('thread_id', tIds)
             .order('created_at', { ascending: false })
             .limit(MSG_BATCH_LIMIT),
@@ -1733,7 +1879,9 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
           string,
           Array<{
             thread_id: string;
-            sender_agent_id: string;
+            sender_kind: string;
+            sender_sb_id: string | null;
+            sender_agent_id: string | null;
             content: string;
             message_type: string;
             created_at: string;
@@ -1749,12 +1897,14 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
         // Assemble thread summaries from batched data (pure JS, zero queries)
         threadsWithUnread = threads.map((t: ThreadPageRow) => {
           const parts = partsByThread.get(t.id) || [];
-          const participants = parts.map((p) => p.agent_id);
+          const participants = parts
+            .filter((p) => p.sb_id)
+            .map((p) => slugBySbId.get(p.sb_id as string) ?? (p.sb_id as string));
 
           let lastReadAt: string | null = readStatusByThread.get(t.id) || null;
           let joinedAt: string | null = null;
-          if (agentId) {
-            const callerPart = parts.find((p) => p.agent_id === agentId);
+          if (callerSb) {
+            const callerPart = parts.find((p) => p.sb_id === callerSb.sbId);
             joinedAt = callerPart?.joined_at || null;
           }
 
@@ -1775,7 +1925,8 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
             .slice(0, 3)
             .reverse()
             .map((m) => ({
-              senderAgentId: m.sender_agent_id,
+              senderKind: m.sender_kind,
+              senderAgentId: m.sender_agent_id ?? m.sender_kind,
               content: m.content,
               messageType: m.message_type,
               createdAt: m.created_at,
@@ -1797,7 +1948,7 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
         // Channel poll studio filtering (defense-in-depth): when channelPoll=true
         // and no session_id filter was applied, fall back to message-metadata-based
         // studio ownership check. Uses the already-batched messages (no extra queries).
-        if (channelPoll && agentId && !callerSessionId) {
+        if (channelPoll && callerSb && !callerSessionId) {
           const reqCtx = getRequestContext();
           const sessCtx = getSessionContext();
           const callerStudioId = reqCtx?.studioId || sessCtx?.studioId || null;
@@ -1812,7 +1963,7 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
               const tid = keyToId.get(thread.threadKey);
               if (!tid) return true; // safety fallback
               const ourMsgs = (msgsByThread.get(tid) || [])
-                .filter((m) => m.sender_agent_id === agentId)
+                .filter((m) => m.sender_sb_id === callerSb.sbId)
                 .slice(0, 5);
               const owned = isThreadOwnedByStudio(ourMsgs, callerStudioId);
               if (!owned) {
@@ -1957,22 +2108,13 @@ export async function handleUpdateInboxMessage(args: unknown, dataComposer: Data
     .maybeSingle();
 
   if (threadMsg) {
-    // Verify the thread belongs to this user
-    const { data: thread } = await threadTable(supabase, 'inbox_threads')
-      .select('id')
-      .eq('id', threadMsg.thread_id)
-      .eq('user_id', resolved.user.id)
-      .maybeSingle();
-
-    if (!thread) {
-      throw new Error(`Message not found or not accessible: ${messageId}`);
-    }
-
-    // Verify this agent is a participant on the thread
+    // The caller's identity is a participant on the thread, or the message
+    // is not theirs to touch. (The participant row carries the workspace.)
+    const callerSb = await resolveCallerSb(supabase, resolved.user.id, agentId);
     const { data: participant } = await threadTable(supabase, 'inbox_thread_participants')
-      .select('agent_id')
+      .select('sb_id')
       .eq('thread_id', threadMsg.thread_id)
-      .eq('agent_id', agentId)
+      .eq('sb_id', callerSb.sbId)
       .maybeSingle();
 
     if (!participant) {
@@ -1987,7 +2129,7 @@ export async function handleUpdateInboxMessage(args: unknown, dataComposer: Data
     if (status === 'read' || status === 'acknowledged' || status === 'completed') {
       const advanced = await advanceThreadReadPointer(supabase, {
         threadId: threadMsg.thread_id,
-        agentId,
+        sbId: callerSb.sbId,
         throughMessageId: messageId,
         source: 'update_inbox_message:thread-fallback',
       });
@@ -2237,13 +2379,24 @@ export async function handleGetAgentSummaries(args: unknown, dataComposer: DataC
 
   // Discover agents
   let agentIds = parsed.agentIds;
-  if (!agentIds?.length) {
-    const { data: identities } = await supabase
-      .from('agent_identities')
-      .select('agent_id')
-      .eq('user_id', userId);
-    agentIds = (identities || []).map((i: { agent_id: string }) => i.agent_id);
+  // Every identity this user owns, by canonical id: thread rows name SBs by
+  // id, and a slug may exist in more than one of the user's workspaces —
+  // the per-slug summary sums across them.
+  const { data: ownedIdentities } = await supabase
+    .from('agent_identities')
+    .select('id, agent_id')
+    .eq('user_id', userId);
+  const slugOfSb = new Map<string, string>();
+  for (const i of (ownedIdentities || []) as Array<{ id: string; agent_id: string }>) {
+    slugOfSb.set(i.id, i.agent_id);
   }
+  if (!agentIds?.length) {
+    agentIds = [...new Set(slugOfSb.values())];
+  }
+  const requestedSlugs = new Set(agentIds);
+  const requestedSbIds = [...slugOfSb.entries()]
+    .filter(([, slug]) => requestedSlugs.has(slug))
+    .map(([id]) => id);
 
   if (!agentIds.length) {
     return {
@@ -2278,9 +2431,17 @@ export async function handleGetAgentSummaries(args: unknown, dataComposer: DataC
     // not that participant's unread (same rule as get_inbox and SQL
     // candidacy; Lumen, PR #613).
     threadTable(supabase, 'inbox_thread_participants')
-      .select('thread_id, agent_id, joined_at')
-      .in('agent_id', agentIds)
-      .then((r: { data: unknown }) => r.data || [])
+      .select('thread_id, sb_id, joined_at')
+      .in('sb_id', requestedSbIds)
+      .then((r: { data: unknown }) =>
+        (
+          (r.data || []) as Array<{ thread_id: string; sb_id: string; joined_at?: string | null }>
+        ).map((p) => ({
+          thread_id: p.thread_id,
+          agent_id: slugOfSb.get(p.sb_id) ?? p.sb_id,
+          joined_at: p.joined_at,
+        }))
+      )
       .catch(() => []), // Thread tables may not exist yet
 
     // 4. Studios per agent (ownership-based, not session-based)
@@ -2348,7 +2509,6 @@ export async function handleGetAgentSummaries(args: unknown, dataComposer: DataC
       if (!allThreadIds.length) return [];
       const { data } = await threadTable(supabase, 'inbox_threads')
         .select('id')
-        .eq('user_id', userId)
         .in('id', allThreadIds);
       return (data || []) as Array<{ id: string }>;
     })(),
@@ -2362,14 +2522,16 @@ export async function handleGetAgentSummaries(args: unknown, dataComposer: DataC
     (async () => {
       if (!participantThreadIds.length) return [];
       const { data } = await threadTable(supabase, 'inbox_thread_read_status')
-        .select('thread_id, agent_id, last_read_at')
+        .select('thread_id, sb_id, last_read_at')
         .in('thread_id', participantThreadIds)
-        .in('agent_id', agentIds);
-      return (data || []) as Array<{
-        thread_id: string;
-        agent_id: string;
-        last_read_at: string;
-      }>;
+        .in('sb_id', requestedSbIds);
+      return (
+        (data || []) as Array<{ thread_id: string; sb_id: string; last_read_at: string }>
+      ).map((rs) => ({
+        thread_id: rs.thread_id,
+        agent_id: slugOfSb.get(rs.sb_id) ?? rs.sb_id,
+        last_read_at: rs.last_read_at,
+      }));
     })(),
 
     // 7. All DELIVERABLE messages in participant threads (thread_id +
