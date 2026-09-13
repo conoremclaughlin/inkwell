@@ -1,2 +1,7 @@
 #!/bin/sh
-exec sh "$(git rev-parse --show-toplevel)/scripts/check-commit-msg.sh" "$1"
+scanner="$(dirname "$0")/../scripts/check-commit-msg.sh"
+if [ ! -f "$scanner" ] || [ ! -r "$scanner" ]; then
+  printf '%s\n' 'Commit blocked: the checkout providing commit-msg is missing its readable credential scanner.' 'Update or repair the checkout owning core.hooksPath; no commit was created.' >&2
+  exit 2
+fi
+exec sh "$scanner" "$1"
