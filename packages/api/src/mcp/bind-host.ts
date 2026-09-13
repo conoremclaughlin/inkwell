@@ -16,6 +16,22 @@ const LOOPBACK_HOSTS = new Set(['127.0.0.1', '::1', 'localhost']);
  * execution to everyone on the network. Containers opt in to `0.0.0.0`
  * explicitly so that exposure is always something someone wrote down.
  */
-export function isLoopbackHost(host: string): boolean {
-  return LOOPBACK_HOSTS.has(host.trim().toLowerCase());
+export function isLoopbackHost(host: string | undefined | null): boolean {
+  return typeof host === 'string' && LOOPBACK_HOSTS.has(host.trim().toLowerCase());
+}
+
+/** Interface used when nothing is configured. */
+export const DEFAULT_BIND_HOST = '127.0.0.1';
+
+/**
+ * The interface to bind, defaulting closed.
+ *
+ * The zod schema already defaults `MCP_BIND_HOST`, but config does not always
+ * arrive through it — anything constructing `env` by hand leaves the key
+ * undefined, and `listen(port, undefined)` binds *every* interface. An absent
+ * value must therefore mean loopback, not "whatever the OS picks".
+ */
+export function resolveBindHost(configured: string | undefined | null): string {
+  const trimmed = typeof configured === 'string' ? configured.trim() : '';
+  return trimmed === '' ? DEFAULT_BIND_HOST : trimmed;
 }

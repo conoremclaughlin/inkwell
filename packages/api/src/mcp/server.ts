@@ -8,7 +8,7 @@ import type { Server } from 'http';
 import { MCP_SERVER_NAME, MCP_SERVER_VERSION, MCP_SERVER_DESCRIPTION } from '../config/constants';
 import { env } from '../config/env';
 import { logger } from '../utils/logger';
-import { isLoopbackHost } from './bind-host';
+import { isLoopbackHost, resolveBindHost } from './bind-host';
 import type { DataComposer } from '../data/composer';
 import { GraphExecutorService } from '../services/graph-executor.service';
 import {
@@ -1066,7 +1066,7 @@ export class MCPServer {
     // ============================================================================
     // Start listening
     // ============================================================================
-    const host = env.MCP_BIND_HOST;
+    const host = resolveBindHost(env.MCP_BIND_HOST);
     this.httpServer = await new Promise<Server>((resolve, reject) => {
       const server = app.listen(port, host, () => {
         logger.info(`MCP Server started with Streamable HTTP transport on ${host}:${port}`);
