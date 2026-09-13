@@ -141,12 +141,13 @@ if [[ -z "${SUPABASE_URL}" || -z "${SUPABASE_SECRET_KEY}" || -z "${JWT_SECRET}" 
   exit 1
 fi
 
-# Prove the target before a single test runs: the API URL must name the
-# port this script reserved for the isolated stack.
-if [[ "${SUPABASE_URL}" != *":${API_PORT}"* ]]; then
-  echo "[integration-db] Refusing to run: SUPABASE_URL=${SUPABASE_URL} is not the isolated stack (expected port ${API_PORT})." >&2
-  exit 1
-fi
+# Prove the target before a single test runs: the API URL must be exactly
+# the loopback endpoint on the port this script reserved — not merely
+# contain the port (Lumen, #623: a substring test passed foreign hosts and
+# fragments). The check lives in scripts/lib so it can be tested alone.
+# shellcheck source=lib/assert-isolated-supabase-url.sh
+source "${ROOT_DIR}/scripts/lib/assert-isolated-supabase-url.sh"
+assert_isolated_supabase_url "${SUPABASE_URL}" "${API_PORT}" || exit 1
 
 # Non-empty is not the same as service-role. A key that parses but resolves to
 # `anon` sails past the check above and then fails every single test with
