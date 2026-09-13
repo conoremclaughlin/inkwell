@@ -81,9 +81,9 @@ function getReplyHandler(): Handler {
   return layer.route.stack[layer.route.stack.length - 1].handle;
 }
 
-function createReq(body: Record<string, unknown>): Request {
-  // pcpUserId / pcpWorkspaceId are what adminAuthMiddleware attaches; the
-  // handler is driven directly here, so they are injected.
+function createReq(body: Record<string, unknown>, role = 'owner'): Request {
+  // pcpUserId / pcpWorkspaceId / pcpWorkspaceRole are what adminAuthMiddleware
+  // attaches; the handler is driven directly here, so they are injected.
   return {
     body,
     headers: {},
@@ -91,6 +91,7 @@ function createReq(body: Record<string, unknown>): Request {
     params: {},
     pcpUserId: 'user-1',
     pcpWorkspaceId: 'ws-1',
+    pcpWorkspaceRole: role,
   } as unknown as Request;
 }
 
@@ -304,5 +305,24 @@ describe('POST /threads/reply', () => {
     await reply(createReq({ key: 'pr:545', content: 'hello' }), res);
 
     expect(res._status).toBe(500);
+  });
+
+  it('a viewer or a trusted non-member cannot reply — read is every role, reply is member and up (§1)', async () => {
+    mockThreadLookup({ id: 'thread-1', thread_key: 'pr:545', status: 'open' });
+    mockGetParticipants.mockResolvedValue([sb('wren')]);
+    for (const role of ['viewer', 'trusted']) {
+      const res = createRes();
+      await reply(createReq({ key: 'pr:545', content: 'hi' }, role), res);
+      expect(res._status).toBe(403);
+      expect(res._json).toMatchObject({ role });
+    }
+    expect(mockHandleSendToInbox).not.toHaveBeenCalled();
+
+    const res = createRes();
+    mockHandleSendToInbox.mockResolvedValue(
+      sendToInboxResult({ success: true, messageId: 'msg-9', threadId: 'thread-1' })
+    );
+    await reply(createReq({ key: 'pr:545', content: 'hi' }, 'member'), res);
+    expect(res._status).toBe(200);
   });
 });

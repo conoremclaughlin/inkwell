@@ -15,12 +15,14 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Request, Response } from 'express';
 
 const mockReopenThreadRow = vi.fn();
+const mockIsParticipant = vi.fn();
 
 vi.mock('../mcp/tools/inbox-handlers', () => ({
   handleSendToInbox: vi.fn(),
 }));
 vi.mock('../mcp/tools/thread-handlers', () => ({
   getParticipants: vi.fn(),
+  isParticipant: (...args: unknown[]) => mockIsParticipant(...args),
   reopenThreadRow: (...args: unknown[]) => mockReopenThreadRow(...args),
 }));
 
@@ -77,9 +79,9 @@ function getReopenHandler(): Handler {
   return layer.route.stack[layer.route.stack.length - 1].handle;
 }
 
-function createReq(body: Record<string, unknown>): Request {
-  // pcpUserId / pcpWorkspaceId are what adminAuthMiddleware attaches; the
-  // handler is driven directly here, so they are injected.
+function createReq(body: Record<string, unknown>, role = 'owner'): Request {
+  // pcpUserId / pcpWorkspaceId / pcpWorkspaceRole are what adminAuthMiddleware
+  // attaches; the handler is driven directly here, so they are injected.
   return {
     body,
     headers: {},
@@ -87,6 +89,7 @@ function createReq(body: Record<string, unknown>): Request {
     params: {},
     pcpUserId: 'user-1',
     pcpWorkspaceId: 'ws-1',
+    pcpWorkspaceRole: role,
   } as unknown as Request;
 }
 
@@ -131,6 +134,8 @@ const reopen = getReopenHandler();
 beforeEach(() => {
   vi.clearAllMocks();
   mockGetClient.mockReturnValue(composerClient);
+  // The person is on the thread unless a case says otherwise.
+  mockIsParticipant.mockResolvedValue(true);
 });
 
 describe('POST /threads/reopen', () => {
@@ -208,5 +213,49 @@ describe('POST /threads/reopen', () => {
     const res = createRes();
     await reopen(createReq({ key: 'pr:545' }), res);
     expect(res._status).toBe(500);
+  });
+
+  describe('ACL (spec inkmail-thread-scope §1, §2, §6)', () => {
+    it('a viewer or a trusted non-member cannot reopen: read-only', async () => {
+      mockThreadLookup({ id: 'thread-1', thread_key: 'pr:545', status: 'closed' });
+      for (const role of ['viewer', 'trusted']) {
+        const res = createRes();
+        await reopen(createReq({ key: 'pr:545' }, role), res);
+        expect(res._status).toBe(403);
+        expect(res._json).toMatchObject({ role });
+      }
+      expect(mockReopenThreadRow).not.toHaveBeenCalled();
+    });
+
+    it('a member reopens a thread they are on', async () => {
+      mockThreadLookup({ id: 'thread-1', thread_key: 'pr:545', status: 'closed' });
+      mockIsParticipant.mockResolvedValue(true);
+      mockReopenThreadRow.mockResolvedValue({ reopened: true });
+      const res = createRes();
+      await reopen(createReq({ key: 'pr:545' }, 'member'), res);
+      expect(res._status).toBe(200);
+      expect(mockIsParticipant).toHaveBeenCalledWith(composerClient, 'thread-1', {
+        kind: 'user',
+        userId: 'user-1',
+      });
+      expect(mockReopenThreadRow).toHaveBeenCalledTimes(1);
+    });
+
+    it('a member cannot recover a thread they are not on; an admin or the owner can', async () => {
+      mockThreadLookup({ id: 'thread-1', thread_key: 'pr:545', status: 'closed' });
+      mockIsParticipant.mockResolvedValue(false);
+      let res = createRes();
+      await reopen(createReq({ key: 'pr:545' }, 'member'), res);
+      expect(res._status).toBe(403);
+      expect(mockReopenThreadRow).not.toHaveBeenCalled();
+
+      mockReopenThreadRow.mockResolvedValue({ reopened: true });
+      for (const role of ['admin', 'owner']) {
+        res = createRes();
+        await reopen(createReq({ key: 'pr:545' }, role), res);
+        expect(res._status).toBe(200);
+      }
+      expect(mockReopenThreadRow).toHaveBeenCalledTimes(2);
+    });
   });
 });
