@@ -1634,3 +1634,28 @@ describe('reopenThreadRow — a failed call is an error, never a silent success'
     ]);
   });
 });
+
+describe('dispatchTriggers names the target by identity (spec inkmail-thread-scope §1a)', () => {
+  it('every payload carries toSbId beside the slug', async () => {
+    const { dispatchTriggers } = await import('./thread-handlers');
+    const { getAgentGateway } = await import('../../channels/agent-gateway.js');
+    const mockGateway = (getAgentGateway as ReturnType<typeof vi.fn>)();
+    (mockGateway.dispatchTrigger as ReturnType<typeof vi.fn>).mockClear();
+
+    dispatchTriggers(
+      [
+        { sbId: 'sb-lumen', agentId: 'lumen' },
+        { sbId: 'sb-aster', agentId: 'aster' },
+      ],
+      { fromAgentId: 'wren', threadKey: 'pr:1', summary: 's', priority: 'normal', threadId: 't1' }
+    );
+
+    expect(mockGateway.dispatchTrigger).toHaveBeenCalledTimes(2);
+    expect(mockGateway.dispatchTrigger).toHaveBeenCalledWith(
+      expect.objectContaining({ toAgentId: 'lumen', toSbId: 'sb-lumen', threadId: 't1' })
+    );
+    expect(mockGateway.dispatchTrigger).toHaveBeenCalledWith(
+      expect.objectContaining({ toAgentId: 'aster', toSbId: 'sb-aster', threadId: 't1' })
+    );
+  });
+});
