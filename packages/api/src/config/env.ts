@@ -109,7 +109,8 @@ const optionalNumber = z
   .transform((val) => (val === '' || val === undefined ? undefined : Number(val)));
 
 // Environment variable schema
-const envSchema = z.object({
+// Exported so tests can assert real production defaults rather than a mock's.
+export const envSchema = z.object({
   // Server
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
   INK_PORT_BASE: z.string().transform(Number).optional(),
@@ -138,6 +139,11 @@ const envSchema = z.object({
     .enum(['true', 'false'])
     .default('true')
     .transform((v) => v === 'true'),
+  // Interface the HTTP transport binds to. Defaults to loopback: local MCP
+  // clients (.mcp.json) connect without credentials, so an off-host bind would
+  // expose authenticated-equivalent tool execution to the whole network.
+  // Containers set this to 0.0.0.0 explicitly — see docker-compose.app.yml.
+  MCP_BIND_HOST: z.string().default('127.0.0.1'),
 
   // Myra (persistent messaging process)
   MYRA_HTTP_PORT: z.string().transform(Number).optional(),

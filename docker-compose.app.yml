@@ -24,6 +24,10 @@ services:
       ENABLE_REMINDERS: ${ENABLE_REMINDERS:-true}
       MCP_TRANSPORT: ${MCP_TRANSPORT:-http}
       MCP_REQUIRE_OAUTH: ${MCP_REQUIRE_OAUTH:-true}
+      # Containers must bind every interface or the published port reaches
+      # nothing. Safe here only because MCP_REQUIRE_OAUTH defaults to true —
+      # do not pair 0.0.0.0 with anonymous access. See packages/api/src/mcp/bind-host.ts.
+      MCP_BIND_HOST: ${MCP_BIND_HOST:-0.0.0.0}
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
       OAUTH_REDIRECT_BASE_URL: ${OAUTH_REDIRECT_BASE_URL:-http://localhost:3001}

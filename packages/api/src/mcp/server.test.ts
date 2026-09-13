@@ -19,6 +19,9 @@ vi.mock('../config/env', () => ({
     MCP_TRANSPORT: 'http',
     MCP_HTTP_PORT: 0, // will be overridden
     MCP_REQUIRE_OAUTH: false,
+    // Must be set: the server binds whatever this says, so leaving it undefined
+    // would put every test run's listener on all interfaces.
+    MCP_BIND_HOST: '127.0.0.1',
     SUPABASE_URL: 'http://localhost:54321',
     SUPABASE_SECRET_KEY: 'test-key',
     SUPABASE_ANON_KEY: 'test-anon-key',
@@ -1004,5 +1007,57 @@ describe('enrichIdentityFromContextSession + workspace derivation (canonical ide
       }
     ).enrichIdentityFromContextSession(USER, { sessionId: SID, agentId: 'myra' });
     expect(enriched?.agentId).toBeUndefined();
+  });
+});
+
+/**
+ * The transport must bind the interface config names, not a hardcoded one.
+ *
+ * Regression: the bind host used to be
+ * `process.env.NODE_ENV === 'test' ? '127.0.0.1' : '0.0.0.0'`, which shipped a
+ * listener on every interface while binding loopback under test — so a test
+ * asserting "binds loopback" passed against the bug. Anonymous `tools/call` is
+ * permitted whenever MCP_REQUIRE_OAUTH is false, so that bind handed
+ * user-scoped tool execution to the whole network.
+ *
+ * This asserts against IPv6 loopback specifically: the old code would bind
+ * 127.0.0.1 here regardless, so the assertion fails on it, while the listener
+ * still never leaves the host.
+ */
+describe('MCP transport bind host', () => {
+  it('binds the configured interface rather than a hardcoded default', async () => {
+    const { env } = await import('../config/env');
+    const previousHost = (env as any).MCP_BIND_HOST;
+    (env as any).MCP_BIND_HOST = '::1';
+    (env as any).MCP_HTTP_PORT = 0;
+    (env as any).MCP_TRANSPORT = 'http';
+
+    const scopedDataComposer = {
+      getClient: () => ({
+        from: () => ({ select: () => ({ eq: () => ({ single: vi.fn() }) }) }),
+      }),
+      repositories: {
+        memory: { getSession: vi.fn(async () => null) },
+        workspaces: { findById: vi.fn(async () => null) },
+      },
+    } as any;
+
+    const scopedServer = new MCPServer(scopedDataComposer);
+    try {
+      await scopedServer.start();
+    } catch (error) {
+      const err = error instanceof Error ? error : new Error(String(error));
+      // Same escape hatch the main suite uses for sandboxes that forbid listen().
+      if (err.message.includes('EPERM: operation not permitted')) return;
+      throw err;
+    }
+
+    try {
+      const address = (scopedServer as any).httpServer.address();
+      expect(address.address).toBe('::1');
+    } finally {
+      await scopedServer.shutdown();
+      (env as any).MCP_BIND_HOST = previousHost;
+    }
   });
 });

@@ -8,6 +8,7 @@ import type { Server } from 'http';
 import { MCP_SERVER_NAME, MCP_SERVER_VERSION, MCP_SERVER_DESCRIPTION } from '../config/constants';
 import { env } from '../config/env';
 import { logger } from '../utils/logger';
+import { isLoopbackHost } from './bind-host';
 import type { DataComposer } from '../data/composer';
 import { GraphExecutorService } from '../services/graph-executor.service';
 import {
@@ -1065,11 +1066,18 @@ export class MCPServer {
     // ============================================================================
     // Start listening
     // ============================================================================
-    const host = process.env.NODE_ENV === 'test' ? '127.0.0.1' : '0.0.0.0';
+    const host = env.MCP_BIND_HOST;
     this.httpServer = await new Promise<Server>((resolve, reject) => {
       const server = app.listen(port, host, () => {
         logger.info(`MCP Server started with Streamable HTTP transport on ${host}:${port}`);
         logger.info(`MCP endpoint: http://localhost:${port}/mcp`);
+        if (!isLoopbackHost(host)) {
+          logger.warn(
+            `MCP transport is bound to ${host}, reachable beyond this host. ` +
+              `Anonymous tool execution is permitted whenever MCP_REQUIRE_OAUTH is false ` +
+              `(currently ${env.MCP_REQUIRE_OAUTH}) — ensure this listener is not on an untrusted network.`
+          );
+        }
         resolve(server);
       });
 
