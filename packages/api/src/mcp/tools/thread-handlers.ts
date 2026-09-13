@@ -817,7 +817,11 @@ export async function handleAddThreadParticipant(args: unknown, dataComposer: Da
 
   // The thread lives in the caller's workspace; the newcomer must resolve
   // there too — a foreign SB cannot be placed in this thread (§6).
-  const { workspaceId } = await resolveCallerWorkspace(supabase, resolved.user.id, addedByAgentId);
+  const { workspaceId, sb: actor } = await resolveCallerWorkspace(
+    supabase,
+    resolved.user.id,
+    addedByAgentId
+  );
   const thread = await findThread(supabase, workspaceId, threadKey);
   if (!thread) {
     return {
@@ -885,6 +889,10 @@ export async function handleAddThreadParticipant(args: unknown, dataComposer: Da
   if (triggerNewParticipant) {
     dispatchTriggers([{ sbId: newcomer.sbId, agentId: newcomer.agentId }], {
       fromAgentId: addedByAgentId || 'system',
+      // The actor's identity rides with the trigger so a failure notice can
+      // find the sender's owner; without it the notice had only the thread
+      // lane on this path (Lumen, #618 round 2).
+      fromSbId: actor?.sbId,
       // Without this the option added in round 1 was never passed by ANY
       // caller here, so bridge exclusion stayed dead on this path
       // (Lumen, PR #514 round 2).

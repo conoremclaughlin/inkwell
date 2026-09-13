@@ -10,6 +10,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { makeFakeSupabase } from '../../services/sessions/fake-supabase';
 import { userPrincipal } from '../../services/principals';
 import { handleSendToInbox } from './inbox-handlers';
+import { handleAddThreadParticipant } from './thread-handlers';
 import { getAgentGateway } from '../../channels/agent-gateway';
 
 vi.mock('../../services/user-resolver', async (original) => ({
@@ -154,5 +155,30 @@ describe('send boundary (Lumen, #618 round 1)', () => {
     );
     const payloads = vi.mocked(getAgentGateway().dispatchTrigger).mock.calls.map((c) => c[0]);
     expect(payloads.map((p) => [p.fromSbId, p.toSbId])).toEqual([['sb-a', 'sb-b']]);
+  });
+
+  it("an SB adding a participant carries its own identity in the newcomer's trigger (round 2)", async () => {
+    const db = makeFakeSupabase({
+      agent_identities: identities.map((i) => ({ ...i })),
+      inbox_threads: [{ ...thread }],
+      inbox_thread_participants: [
+        {
+          thread_id: 'thread-a',
+          workspace_id: 'ws-a',
+          sb_id: 'sb-a',
+          user_id: null,
+          session_id: null,
+        },
+      ],
+      inbox_thread_messages: [],
+    });
+    await handleAddThreadParticipant(
+      { threadKey: 'pr:618', addedByAgentId: 'wren', agentId: 'lumen' },
+      { getClient: () => db } as never
+    );
+    const payloads = vi.mocked(getAgentGateway().dispatchTrigger).mock.calls.map((c) => c[0]);
+    expect(payloads.map((p) => [p.fromAgentId, p.fromSbId, p.toSbId])).toEqual([
+      ['wren', 'sb-a', 'sb-b'],
+    ]);
   });
 });
