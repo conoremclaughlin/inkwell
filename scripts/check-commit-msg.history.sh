@@ -7,8 +7,20 @@
 #   2. Does it stay quiet on everything else we have ever committed?
 #
 # Both are answered by reading git objects. Nothing is copied into a tracked
-# file, so no credential value enters the repository a second time, and the
-# script prints exit codes and counts only -- never message content.
+# file, so no credential value enters the repository a second time.
+#
+# THE OUTPUT INVARIANT: this script prints SHAs, exit codes and counts. It never
+# prints message content, in any branch, including the failure branches. That is
+# not a nicety -- every commit this script names is one the scanner FLAGGED, so
+# the one case where it is tempting to show context is precisely the case where
+# the context may be a live credential. An earlier revision printed the first 60
+# characters of a flagged commit's subject, which disclosed the whole of a
+# synthetic canary whose secret was in the subject line. A credential pasted by a
+# shell substitution lands wherever the cursor was, and that includes line one.
+# If you need to see what was flagged, look it up yourself with the SHA.
+#
+# scripts/check-commit-msg.test.sh pins this with a synthetic local history whose
+# subject IS an assignment, and fails if any of it reaches the output.
 #
 # This is deliberately NOT part of the CI suite: it depends on local history
 # that a shallow CI clone does not have, and the SHAs are only meaningful in
@@ -59,7 +71,9 @@ for sha in $(git -C "$root" rev-list origin/main -n "$depth" 2>/dev/null); do
   git -C "$root" log -1 --format=%B "$sha" > "$tmp"
   if ! sh "$guard" "$tmp" >/dev/null 2>&1; then
     flagged=$((flagged + 1))
-    echo "  FAIL $sha flagged: $(git -C "$root" log -1 --format=%s "$sha" | cut -c1-60)"
+    # SHA only. See the output invariant at the top of this file: a flagged
+    # commit is the last one whose text should be echoed anywhere.
+    echo "  FAIL $sha flagged (content withheld; inspect it yourself if you must)"
   fi
   swept=$((swept + 1))
 done

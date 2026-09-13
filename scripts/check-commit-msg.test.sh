@@ -31,6 +31,23 @@ hook="${HOOK_UNDER_TEST:-$root/.husky/commit-msg}"
 # being scanned. Mutating .husky/commit-msg is also the only way to exercise it
 # from a worktree where that path is permission-gated.
 
+# Isolate every git operation below from the environment this suite inherits.
+#
+# This matters more than it looks. The suite is meant to run from a commit hook's
+# neighbourhood and from CI, and git exports GIT_DIR, GIT_INDEX_FILE and
+# GIT_WORK_TREE to the hooks it runs — so a disposable repo created underneath one
+# would quietly operate on the REAL repository's index instead of its own, and the
+# wiring tier would be reporting on something it did not build. A global
+# core.hooksPath or init.templateDir does the same thing to the hook itself,
+# supplying a different hook than the one under test.
+unset GIT_DIR GIT_INDEX_FILE GIT_WORK_TREE GIT_OBJECT_DIRECTORY \
+  GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_NAMESPACE GIT_PREFIX \
+  GIT_CONFIG GIT_CEILING_DIRECTORIES GIT_TEMPLATE_DIR GIT_INDEX_VERSION 2>/dev/null
+GIT_CONFIG_GLOBAL=/dev/null
+GIT_CONFIG_SYSTEM=/dev/null
+GIT_CONFIG_NOSYSTEM=1
+export GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_CONFIG_NOSYSTEM
+
 work=$(mktemp -d "${TMPDIR:-/tmp}/check-commit-msg-test.XXXXXX") || exit 1
 trap 'rm -rf "$work"' EXIT INT TERM
 
@@ -596,6 +613,93 @@ if [ "$rc" -eq 2 ]; then
 else
   bad "hook invoked directly with a broken provider exits 2" "got $rc"
 fi
+# ---------------------------------------------------------------------------
+# Tier 3: the history runner's output
+# ---------------------------------------------------------------------------
+#
+# scripts/check-commit-msg.history.sh reads real commit messages, so what it
+# PRINTS is a disclosure surface of its own. Every commit it names is one the
+# scanner flagged, which means any context it shows alongside the SHA may be a
+# live credential. It printed 60 characters of the subject line until this tier
+# existed, and a credential spliced by a shell substitution lands wherever the
+# cursor was -- line one included.
+#
+# The fixture is a repo of our own making with a synthetic canary in the SUBJECT.
+# No real history is read: the runner sweeps origin/main, so the fixture creates
+# that ref locally.
+
+echo "HISTORY RUNNER (scripts/check-commit-msg.history.sh)"
+
+history_runner="${HISTORY_UNDER_TEST:-$root/scripts/check-commit-msg.history.sh}"
+HISTORY_CANARY=HISTORYCANARY9182
+
+# new_history_repo <dir> <subject> — one commit, reachable as origin/main.
+new_history_repo() {
+  mkdir -p "$1/scripts" || return 1
+  git -C "$1" init -q || return 1
+  git -C "$1" config user.email test@example.invalid || return 1
+  git -C "$1" config user.name "Guard Test" || return 1
+  git -C "$1" config commit.gpgsign false || return 1
+  cp "$guard" "$1/scripts/check-commit-msg.sh" || return 1
+  cp "$history_runner" "$1/scripts/check-commit-msg.history.sh" || return 1
+  echo "source line" > "$1/app.txt" || return 1
+  git -C "$1" add app.txt scripts || return 1
+  printf '%s\n' "$2" > "$work/history-subject.txt" || return 1
+  git -C "$1" commit -q --no-verify -F "$work/history-subject.txt" || return 1
+  git -C "$1" update-ref refs/remotes/origin/main HEAD || return 1
+}
+
+# The control comes first. "The canary did not appear" is worth nothing if the
+# sweep never ran -- an empty output passes that check trivially, which is the
+# shape of false comfort this suite has already been caught by twice. So prove
+# the runner sweeps and reports on a repo of this construction before asking it
+# to stay quiet about one.
+new_history_repo "$work/history-clean" "fix: an entirely ordinary subject line"
+clean_out=$(cd "$work/history-clean" && sh scripts/check-commit-msg.history.sh 10 2>&1)
+clean_rc=$?
+if [ "$clean_rc" -eq 0 ] && echo "$clean_out" | grep -q "swept 1, flagged 0"; then
+  ok "history runner sweeps a synthetic repo and reports it clean"
+else
+  bad "history runner sweeps a synthetic repo and reports it clean" \
+    "exit $clean_rc: $(echo "$clean_out" | tr '\n' ' ' | cut -c1-200)"
+fi
+
+new_history_repo "$work/history-leak" "JWT_SECRET=$HISTORY_CANARY"
+leak_sha=$(git -C "$work/history-leak" rev-parse HEAD)
+leak_out=$(cd "$work/history-leak" && sh scripts/check-commit-msg.history.sh 10 2>&1)
+leak_rc=$?
+
+# Discrimination first: the runner must actually have flagged this commit. If it
+# did not, the disclosure check below is vacuous.
+if [ "$leak_rc" -ne 0 ] && echo "$leak_out" | grep -q "flagged 1"; then
+  ok "history runner flags a commit whose subject is a secret assignment"
+else
+  bad "history runner flags a commit whose subject is a secret assignment" \
+    "exit $leak_rc: $(echo "$leak_out" | tr '\n' ' ' | cut -c1-200)"
+fi
+
+if echo "$leak_out" | grep -q "$leak_sha"; then
+  ok "history runner names the flagged commit by SHA"
+else
+  bad "history runner names the flagged commit by SHA" \
+    "$(echo "$leak_out" | tr '\n' ' ' | cut -c1-200)"
+fi
+
+# The property itself. Checked against the canary AND against the assignment
+# shape, because a future report that printed only "JWT_SECRET=" would still be
+# echoing the flagged message back out.
+if echo "$leak_out" | grep -q "$HISTORY_CANARY"; then
+  bad "history runner does not print the flagged message" "the synthetic canary reached the output"
+else
+  ok "history runner does not print the flagged message"
+fi
+
+if echo "$leak_out" | grep -q 'JWT_SECRET'; then
+  bad "history runner does not echo the flagged subject line" "flagged subject text reached the output"
+else
+  ok "history runner does not echo the flagged subject line"
+fi
+
 echo ""
 echo "ran $((pass + fail)) checks: $pass passed, $fail failed"
 [ "$fail" -eq 0 ] || exit 1
