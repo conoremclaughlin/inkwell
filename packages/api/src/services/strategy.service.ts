@@ -1018,7 +1018,10 @@ export class StrategyService {
 
     try {
       const threadKey = group.thread_key || `strategy:${group.id}`;
-      const senderSlug = (await this.resolveOwnerSlug(group)) || group.sb_id || 'strategy';
+      // The owner's slug names an SB principal; with no owner the notice is
+      // the system's (spec inkmail-thread-scope §3) — a made-up slug would
+      // now fail to resolve to an identity and refuse the send.
+      const senderSlug = (await this.resolveOwnerSlug(group)) || 'system';
 
       await handleSendToInbox(
         {

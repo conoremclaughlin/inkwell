@@ -23,6 +23,8 @@ describe('reopenThreadRow (integration)', () => {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let supabase: any;
   let userId: string;
+  let workspaceId: string;
+  let echoSbId: string;
   const threadIds: string[] = [];
 
   async function closedThread(): Promise<string> {
@@ -30,12 +32,14 @@ describe('reopenThreadRow (integration)', () => {
       .from('inbox_threads')
       .insert({
         thread_key: `test:reopen-${Date.now()}-${threadIds.length}`,
-        user_id: userId,
-        created_by_agent_id: 'echo',
+        workspace_id: workspaceId,
+        created_by_kind: 'sb',
+        created_by_sb_id: echoSbId,
         title: 'reopen fixture',
         status: 'closed',
         closed_at: '2026-09-01T00:00:00Z',
-        closed_by_agent_id: 'echo',
+        closed_by_kind: 'sb',
+        closed_by_sb_id: echoSbId,
       })
       .select('id')
       .single();
@@ -47,7 +51,7 @@ describe('reopenThreadRow (integration)', () => {
   async function threadState(threadId: string) {
     const { data } = await supabase
       .from('inbox_threads')
-      .select('status, closed_at, closed_by_agent_id')
+      .select('status, closed_at, closed_by_kind, closed_by_sb_id, closed_by_user_id')
       .eq('id', threadId)
       .single();
     return data;
@@ -56,7 +60,7 @@ describe('reopenThreadRow (integration)', () => {
   async function events(threadId: string) {
     const { data } = await supabase
       .from('inbox_thread_messages')
-      .select('sender_agent_id, message_type, metadata')
+      .select('sender_kind, sender_sb_id, sender_agent_id, message_type, metadata')
       .eq('thread_id', threadId);
     return data as Array<Record<string, unknown>>;
   }
@@ -66,6 +70,8 @@ describe('reopenThreadRow (integration)', () => {
     supabase = dataComposer.getClient();
     const fixture = await ensureEchoIntegrationFixture(dataComposer);
     userId = fixture.userId;
+    workspaceId = fixture.workspaceId;
+    echoSbId = fixture.echoSbId;
   });
 
   afterAll(async () => {
@@ -75,26 +81,32 @@ describe('reopenThreadRow (integration)', () => {
     }
   });
 
-  it('reopens once: status open, both closure fields null, one audit event', async () => {
+  it('reopens once: status open, every closer column null, one system-kind audit event', async () => {
     const threadId = await closedThread();
-    expect(await reopenThreadRow(supabase, threadId, { kind: 'sb', agentId: 'echo' })).toEqual({
+    expect(await reopenThreadRow(supabase, threadId, { kind: 'sb', sbId: echoSbId })).toEqual({
       reopened: true,
     });
     expect(await threadState(threadId)).toEqual({
       status: 'open',
       closed_at: null,
-      closed_by_agent_id: null,
+      closed_by_kind: null,
+      closed_by_sb_id: null,
+      closed_by_user_id: null,
     });
     const rows = await events(threadId);
     expect(rows).toHaveLength(1);
+    // The system borrows nobody's identity (§3): kind says system, both ids
+    // null, no slug; the actor is in the event's metadata.
     expect(rows[0]).toMatchObject({
-      sender_agent_id: 'system',
+      sender_kind: 'system',
+      sender_sb_id: null,
+      sender_agent_id: null,
       message_type: 'system',
-      metadata: { type: 'thread_reopened', reopenedBy: 'echo' },
+      metadata: { type: 'thread_reopened', reopenedBySbId: echoSbId },
     });
 
     // The guard: a second reopen matches no row and records nothing.
-    expect(await reopenThreadRow(supabase, threadId, { kind: 'user' })).toEqual({
+    expect(await reopenThreadRow(supabase, threadId, { kind: 'user', userId })).toEqual({
       reopened: false,
     });
     expect(await events(threadId)).toHaveLength(1);
@@ -124,21 +136,23 @@ describe('reopenThreadRow (integration)', () => {
         `);
 
         await expect(
-          reopenThreadRow(supabase, threadId, { kind: 'sb', agentId: 'echo' })
+          reopenThreadRow(supabase, threadId, { kind: 'sb', sbId: echoSbId })
         ).rejects.toThrow('audit rejected by test');
 
         // Nothing changed: not the row, not the events.
         expect(await threadState(threadId)).toEqual({
           status: 'closed',
           closed_at: '2026-09-01T00:00:00+00:00',
-          closed_by_agent_id: 'echo',
+          closed_by_kind: 'sb',
+          closed_by_sb_id: echoSbId,
+          closed_by_user_id: null,
         });
         expect(await events(threadId)).toHaveLength(0);
 
         await pg.query(`DROP TRIGGER ${rejectAudit} ON public.inbox_thread_messages;`);
 
         // The retry is the whole thing, once.
-        expect(await reopenThreadRow(supabase, threadId, { kind: 'sb', agentId: 'echo' })).toEqual({
+        expect(await reopenThreadRow(supabase, threadId, { kind: 'sb', sbId: echoSbId })).toEqual({
           reopened: true,
         });
         expect(await threadState(threadId)).toMatchObject({ status: 'open', closed_at: null });

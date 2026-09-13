@@ -73,7 +73,14 @@ function getCreateHandler(): Handler {
 }
 
 function createReq(body: Record<string, unknown>): Request {
-  return { body, headers: {}, cookies: {}, params: {}, pcpUserId: 'user-1' } as unknown as Request;
+  return {
+    body,
+    headers: {},
+    cookies: {},
+    params: {},
+    pcpUserId: 'user-1',
+    pcpWorkspaceId: 'ws-1',
+  } as unknown as Request;
 }
 
 interface MockResponse extends Response {
@@ -176,6 +183,11 @@ describe('POST /threads', () => {
     });
     expect(args.senderAgentId).toBeUndefined();
     expect(args.metadata).toMatchObject({ sentBy: 'user' });
+    // The person and the workspace they act in are server-side context, not
+    // tool args (spec inkmail-thread-scope §3, §6).
+    expect(mockHandleSendToInbox.mock.calls[0][2]).toEqual({
+      sender: { principal: { kind: 'user', userId: 'user-1' }, workspaceId: 'ws-1' },
+    });
   });
 
   it("pins a single-recipient send to a studio by slug, in the handler's single form", async () => {

@@ -11,6 +11,7 @@ import {
   handleUpdateInboxMessage,
   isThreadOwnedByStudio,
 } from './inbox-handlers';
+import { userPrincipal } from '../../services/principals';
 
 // Mock user-resolver
 vi.mock('../../services/user-resolver', async (importOriginal) => {
@@ -67,12 +68,111 @@ vi.mock('../../channels/agent-gateway.js', () => ({
 // Mock thread-handlers (imported by inbox-handlers for reply semantics and
 // the get_inbox threadKey alias)
 const mockHandleGetThreadMessages = vi.fn();
-vi.mock('./thread-handlers.js', () => ({
-  findThread: vi.fn().mockResolvedValue(null),
-  getParticipants: vi.fn().mockResolvedValue([]),
-  resolveTriggeredAgents: vi.fn().mockReturnValue([]),
-  handleGetThreadMessages: (...args: unknown[]) => mockHandleGetThreadMessages(...args),
+vi.mock('./thread-handlers.js', async (importOriginal) => {
+  // The pure helpers (sbParticipants, creatorForDispatch) run for real; the
+  // three that touch the database are faked per test.
+  const actual = await importOriginal<typeof import('./thread-handlers.js')>();
+  return {
+    ...actual,
+    findThread: vi.fn().mockResolvedValue(null),
+    getParticipants: vi.fn().mockResolvedValue([]),
+    resolveTriggeredAgents: vi.fn().mockReturnValue([]),
+    handleGetThreadMessages: (...args: unknown[]) => mockHandleGetThreadMessages(...args),
+  };
+});
+
+// ── Principals (spec inkmail-thread-scope §3) ──
+// Every thread row names an SB by identity id, never by slug; a slug is
+// resolved inside ONE workspace to exactly one identity. The fixtures below
+// give the test user one identity per slug in workspace ws-1, so slugs in
+// test inputs resolve deterministically and assertions can name the ids.
+const WS = 'ws-1';
+const SB_IDS: Record<string, string> = {
+  wren: 'sb-wren',
+  lumen: 'sb-lumen',
+  myra: 'sb-myra',
+  aster: 'sb-aster',
+};
+const IDENTITY_ROWS = Object.entries(SB_IDS).map(([slug, id]) => ({
+  id,
+  agent_id: slug,
+  user_id: 'user-123',
+  workspace_id: WS,
+  updated_at: null,
 }));
+
+/** A ThreadParticipant as getParticipants returns it. */
+const P = (slug: string, sessionId: string | null = null) => ({
+  sbId: SB_IDS[slug],
+  userId: null,
+  agentId: slug,
+  sessionId,
+  joinedAt: '2026-03-09T10:00:00Z',
+});
+/** A person's participant row. */
+const PERSON = (userId: string) => ({
+  sbId: null,
+  userId,
+  agentId: null,
+  sessionId: null,
+  joinedAt: '2026-03-09T10:00:00Z',
+});
+/** An SbRef as resolveTriggeredAgents returns it. */
+const REF = (slug: string) => ({ sbId: SB_IDS[slug], agentId: slug });
+/** A post-cutover inbox_threads row. */
+const THREAD_ROW = (overrides: Record<string, unknown> = {}) => ({
+  id: 'thread-pr210',
+  thread_key: 'pr:210',
+  workspace_id: WS,
+  created_by_kind: 'sb' as const,
+  created_by_sb_id: SB_IDS.wren,
+  created_by_user_id: null,
+  title: null,
+  status: 'open',
+  metadata: null,
+  created_at: '2026-03-09T10:00:00Z',
+  updated_at: '2026-03-09T10:00:00Z',
+  closed_at: null,
+  closed_by_kind: null,
+  closed_by_sb_id: null,
+  closed_by_user_id: null,
+  ...overrides,
+});
+
+/**
+ * An agent_identities chain that FILTERS like PostgREST: eq / in / not
+ * narrow the rows, maybeSingle takes the first, awaiting yields the list.
+ * Every principal resolver (resolveCallerSb, resolveSbInWorkspace,
+ * resolveSbsByIds) and the legacy resolveIdentityId run against it.
+ */
+function createIdentityChain(rows: Array<Record<string, unknown>> = IDENTITY_ROWS) {
+  const make = () => {
+    let data = [...rows];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const q: any = {};
+    q.select = () => q;
+    q.eq = (col: string, val: unknown) => {
+      data = data.filter((r) => r[col] === val);
+      return q;
+    };
+    q.in = (col: string, vals: unknown[]) => {
+      data = data.filter((r) => vals.includes(r[col]));
+      return q;
+    };
+    q.not = (col: string, op: string, val: unknown) => {
+      if (op === 'is' && val === null) data = data.filter((r) => r[col] != null);
+      return q;
+    };
+    q.order = () => q;
+    q.limit = () => q;
+    q.maybeSingle = () => Promise.resolve({ data: data[0] ?? null, error: null });
+    q.single = () => Promise.resolve({ data: data[0] ?? null, error: null });
+    q.then = (onFulfilled: (v: unknown) => unknown, onRejected?: (e: unknown) => unknown) =>
+      Promise.resolve({ data, error: null }).then(onFulfilled, onRejected);
+    return q;
+  };
+  return { select: (...args: unknown[]) => make().select(...args) };
+}
 
 function createMockSupabase(
   overrides: {
@@ -137,17 +237,9 @@ function createMockSupabase(
     }),
   };
 
-  // For identity resolution (resolveIdentityId calls .select().eq().eq().maybeSingle())
-  const identityRows = [{ id: 'identity-123', workspace_id: 'workspace-1', updated_at: null }];
-  const identityChainable = {
-    select: vi.fn().mockReturnValue({
-      eq: vi.fn().mockReturnValue({
-        eq: vi.fn().mockReturnValue({
-          order: vi.fn().mockResolvedValue({ data: identityRows, error: null }),
-        }),
-      }),
-    }),
-  };
+  // Identity resolution — the legacy recipient_sb_id lookup and the
+  // principal resolvers alike — runs against the filtering identity chain.
+  const identityChainable = createIdentityChain();
 
   // Read pointer for agent_inbox_read_status (pointer-based unread tracking)
   const readPointerChainable = {
@@ -528,6 +620,10 @@ function createThreadMockSupabase(
   const threadId = options.existingThread?.id || 'thread-999';
   const threadMessageId = options.threadMessageId || 'tmsg-123';
   let insertedMetadata: Record<string, unknown> | null = null;
+  let insertedMessage: Record<string, unknown> | null = null;
+  // Every write, in order — the person's participant row must land before
+  // the message (§7), and only a sequence can show that.
+  const writes: Array<{ table: string; row: Record<string, unknown> }> = [];
 
   // inbox_threads table mock
   const threadsFindChain = {
@@ -554,19 +650,32 @@ function createThreadMockSupabase(
     }),
   };
 
-  // inbox_thread_participants table mock
+  // inbox_thread_participants table mock. A lookup keyed by sb_id finds an
+  // existing SB row (with whatever session stamp the test configured); a
+  // lookup keyed by user_id finds no person row yet, so a person's reply
+  // inserts one.
   const participantsChain = {
-    select: vi.fn().mockReturnValue({
-      eq: vi.fn().mockReturnValue({
-        eq: vi.fn().mockReturnValue({
-          maybeSingle: vi.fn().mockResolvedValue({
-            data: { agent_id: 'existing', session_id: options.participantSessionId ?? null },
-            error: null,
-          }),
-        }),
-      }),
+    select: vi.fn().mockImplementation(() => {
+      const cols: string[] = [];
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const q: any = {};
+      q.eq = (col: string) => {
+        cols.push(col);
+        return q;
+      };
+      q.maybeSingle = () =>
+        Promise.resolve({
+          data: cols.includes('user_id')
+            ? null
+            : { sb_id: 'existing', session_id: options.participantSessionId ?? null },
+          error: null,
+        });
+      return q;
     }),
-    insert: vi.fn().mockResolvedValue({ data: null, error: null }),
+    insert: vi.fn().mockImplementation((row: Record<string, unknown>) => {
+      writes.push({ table: 'inbox_thread_participants', row });
+      return Promise.resolve({ data: null, error: null });
+    }),
     update: vi.fn().mockReturnValue({
       eq: vi.fn().mockReturnValue({
         eq: vi.fn().mockResolvedValue({ data: null, error: null }),
@@ -578,6 +687,8 @@ function createThreadMockSupabase(
   const messagesChain = {
     insert: vi.fn().mockImplementation((row: Record<string, unknown>) => {
       insertedMetadata = row.metadata as Record<string, unknown>;
+      insertedMessage = row;
+      writes.push({ table: 'inbox_thread_messages', row });
       return {
         select: vi.fn().mockReturnValue({
           single: vi.fn().mockResolvedValue({
@@ -608,19 +719,8 @@ function createThreadMockSupabase(
     upsert: vi.fn().mockResolvedValue({ data: null, error: null }),
   };
 
-  // identity mock (for resolveIdentityId)
-  const identityChain = {
-    select: vi.fn().mockReturnValue({
-      eq: vi.fn().mockReturnValue({
-        eq: vi.fn().mockReturnValue({
-          order: vi.fn().mockResolvedValue({
-            data: [{ id: 'identity-123', workspace_id: 'ws-1', updated_at: null }],
-            error: null,
-          }),
-        }),
-      }),
-    }),
-  };
+  // identity mock: every principal resolver runs against the filtering chain
+  const identityChain = createIdentityChain();
 
   const fromFn = vi.fn().mockImplementation((table: string) => {
     switch (table) {
@@ -650,6 +750,8 @@ function createThreadMockSupabase(
     from: fromFn,
     rpc: rpcFn,
     getInsertedMetadata: () => insertedMetadata,
+    getInsertedMessage: () => insertedMessage,
+    getWrites: () => writes,
     getRpcCalls: () => rpcCalls,
   };
 }
@@ -671,21 +773,9 @@ describe('Reply Routing — thread message metadata enrichment', () => {
     vi.clearAllMocks();
     // Configure findThread mock to return existing thread for these tests
     const { findThread } = await import('./thread-handlers.js');
-    vi.mocked(findThread).mockResolvedValue({
-      id: 'thread-pr210',
-      thread_key: 'pr:210',
-      user_id: 'user-123',
-      created_by_agent_id: 'wren',
-      title: null,
-      status: 'open',
-      metadata: null,
-      created_at: '2026-03-09T10:00:00Z',
-      updated_at: '2026-03-09T10:00:00Z',
-      closed_at: null,
-      closed_by_agent_id: null,
-    });
+    vi.mocked(findThread).mockResolvedValue(THREAD_ROW());
     const { getParticipants } = await import('./thread-handlers.js');
-    vi.mocked(getParticipants).mockResolvedValue(['wren', 'lumen']);
+    vi.mocked(getParticipants).mockResolvedValue([P('wren'), P('lumen')]);
   });
 
   it('should enrich thread message metadata with pcp.sender context', async () => {
@@ -717,8 +807,13 @@ describe('Reply Routing — thread message metadata enrichment', () => {
     expect(insertedMeta).toBeDefined();
     expect(insertedMeta!.pcp).toBeDefined();
     const pcpMeta = insertedMeta!.pcp as Record<string, unknown>;
+    // The sender is a principal (spec inkmail-thread-scope §3): kind and
+    // canonical id beside the slug, never the slug alone.
     expect(pcpMeta.sender).toEqual({
+      kind: 'sb',
       agentId: 'wren',
+      sbId: SB_IDS.wren,
+      userId: null,
       sessionId: 'wren-session-123',
       studioId: 'studio-wren',
     });
@@ -762,22 +857,10 @@ describe('Reply Routing — trigger recipientSessionId auto-resolution', () => {
     // Configure findThread to return existing thread for reply tests
     const { findThread, getParticipants, resolveTriggeredAgents } =
       await import('./thread-handlers.js');
-    vi.mocked(findThread).mockResolvedValue({
-      id: 'thread-pr210',
-      thread_key: 'pr:210',
-      user_id: 'user-123',
-      created_by_agent_id: 'wren',
-      title: null,
-      status: 'open',
-      metadata: null,
-      created_at: '2026-03-09T10:00:00Z',
-      updated_at: '2026-03-09T10:00:00Z',
-      closed_at: null,
-      closed_by_agent_id: null,
-    });
-    vi.mocked(getParticipants).mockResolvedValue(['wren', 'lumen']);
+    vi.mocked(findThread).mockResolvedValue(THREAD_ROW());
+    vi.mocked(getParticipants).mockResolvedValue([P('wren'), P('lumen')]);
     // For reply triggers, resolveTriggeredAgents should return the other participant
-    vi.mocked(resolveTriggeredAgents).mockReturnValue(['lumen']);
+    vi.mocked(resolveTriggeredAgents).mockReturnValue([REF('lumen')]);
   });
 
   it('should auto-resolve recipientSessionId from prior thread message', async () => {
@@ -912,21 +995,9 @@ describe('Reply Routing — sender session fallback behavior', () => {
     // Configure findThread to return existing thread for reply tests
     const { findThread, getParticipants, resolveTriggeredAgents } =
       await import('./thread-handlers.js');
-    vi.mocked(findThread).mockResolvedValue({
-      id: 'thread-pr42',
-      thread_key: 'pr:42',
-      user_id: 'user-123',
-      created_by_agent_id: 'wren',
-      title: null,
-      status: 'open',
-      metadata: null,
-      created_at: '2026-03-09T10:00:00Z',
-      updated_at: '2026-03-09T10:00:00Z',
-      closed_at: null,
-      closed_by_agent_id: null,
-    });
-    vi.mocked(getParticipants).mockResolvedValue(['wren', 'lumen']);
-    vi.mocked(resolveTriggeredAgents).mockReturnValue(['lumen']);
+    vi.mocked(findThread).mockResolvedValue(THREAD_ROW({ id: 'thread-pr42', thread_key: 'pr:42' }));
+    vi.mocked(getParticipants).mockResolvedValue([P('wren'), P('lumen')]);
+    vi.mocked(resolveTriggeredAgents).mockReturnValue([REF('lumen')]);
   });
 
   it('should use threadKey-scoped lookup when no request context provides sessionId', async () => {
@@ -1377,13 +1448,13 @@ describe('handleUpdateInboxMessage — thread message fallback', () => {
         };
       }
       if (table === 'inbox_thread_participants') {
-        // Agent is a participant
+        // The caller's identity is a participant
         return {
           select: vi.fn().mockReturnValue({
             eq: vi.fn().mockReturnValue({
               eq: vi.fn().mockReturnValue({
                 maybeSingle: vi.fn().mockResolvedValue({
-                  data: { agent_id: 'wren' },
+                  data: { sb_id: SB_IDS.wren },
                   error: null,
                 }),
               }),
@@ -1400,15 +1471,7 @@ describe('handleUpdateInboxMessage — thread message fallback', () => {
         };
       }
       if (table === 'agent_identities') {
-        return {
-          select: vi.fn().mockReturnValue({
-            eq: vi.fn().mockReturnValue({
-              eq: vi.fn().mockReturnValue({
-                order: vi.fn().mockResolvedValue({ data: [], error: null }),
-              }),
-            }),
-          }),
-        };
+        return createIdentityChain();
       }
       return { select: vi.fn().mockReturnThis(), eq: vi.fn().mockReturnThis() };
     });
@@ -1447,7 +1510,8 @@ describe('handleUpdateInboxMessage — thread message fallback', () => {
         fn: 'advance_thread_read_pointer',
         args: {
           p_thread_id: threadId,
-          p_agent_id: 'wren',
+          p_sb_id: SB_IDS.wren,
+          p_user_id: null,
           p_through_message_id: threadMsgId,
         },
       },
@@ -1639,13 +1703,11 @@ describe('handleSendToInbox — system sender and cross-agent studio routing', (
     });
     const { findThread, getParticipants, resolveTriggeredAgents } =
       await import('./thread-handlers.js');
-    vi.mocked(findThread).mockResolvedValue({
-      id: 'thread-hist',
-      status: 'open',
-      created_by_agent_id: 'wren',
-    } as never);
+    vi.mocked(findThread).mockResolvedValue(
+      THREAD_ROW({ id: 'thread-hist', thread_key: 'pr:hist' })
+    );
     vi.mocked(getParticipants).mockResolvedValue([]);
-    vi.mocked(resolveTriggeredAgents).mockReturnValue(['lumen']);
+    vi.mocked(resolveTriggeredAgents).mockReturnValue([REF('lumen')]);
 
     await handleSendToInbox(
       {
@@ -1747,7 +1809,8 @@ describe('handleSendToInbox — system sender and cross-agent studio routing', (
     const advances = mockSb.getRpcCalls().filter((c) => c.fn === 'advance_thread_read_pointer');
     expect(advances).toHaveLength(1);
     expect(advances[0]!.args).toMatchObject({
-      p_agent_id: 'wren',
+      p_sb_id: SB_IDS.wren,
+      p_user_id: null,
       p_through_message_id: 'tmsg-777',
     });
   });
@@ -1893,21 +1956,9 @@ describe('Session-scoped thread filtering', () => {
     vi.clearAllMocks();
     const { findThread, getParticipants, resolveTriggeredAgents } =
       await import('./thread-handlers.js');
-    vi.mocked(findThread).mockResolvedValue({
-      id: 'thread-pr210',
-      thread_key: 'pr:210',
-      user_id: 'user-123',
-      created_by_agent_id: 'wren',
-      title: null,
-      status: 'open',
-      metadata: null,
-      created_at: '2026-03-09T10:00:00Z',
-      updated_at: '2026-03-09T10:00:00Z',
-      closed_at: null,
-      closed_by_agent_id: null,
-    });
-    vi.mocked(getParticipants).mockResolvedValue(['wren', 'lumen']);
-    vi.mocked(resolveTriggeredAgents).mockReturnValue(['lumen']);
+    vi.mocked(findThread).mockResolvedValue(THREAD_ROW());
+    vi.mocked(getParticipants).mockResolvedValue([P('wren'), P('lumen')]);
+    vi.mocked(resolveTriggeredAgents).mockReturnValue([REF('lumen')]);
   });
 
   it('should include threadId in trigger payload', async () => {
@@ -1965,7 +2016,7 @@ describe('Session-scoped thread filtering', () => {
         eq: vi.fn().mockReturnValue({
           eq: vi.fn().mockReturnValue({
             maybeSingle: vi.fn().mockResolvedValue({
-              data: { agent_id: 'wren', session_id: 'old-session-123' },
+              data: { sb_id: SB_IDS.wren, session_id: 'old-session-123' },
               error: null,
             }),
           }),
@@ -2214,18 +2265,7 @@ function createScopedPollMockSupabase(
     return self;
   };
 
-  const identityChain = {
-    select: vi.fn().mockReturnValue({
-      eq: vi.fn().mockReturnValue({
-        eq: vi.fn().mockReturnValue({
-          order: vi.fn().mockResolvedValue({
-            data: [{ id: 'identity-123', workspace_id: 'ws-1', updated_at: null }],
-            error: null,
-          }),
-        }),
-      }),
-    }),
-  };
+  const identityChain = createIdentityChain();
 
   const fromFn = vi.fn().mockImplementation((table: string) => {
     if (table === 'agent_identities') return identityChain;
@@ -2384,8 +2424,10 @@ describe('handleGetInbox — channelPoll thread paging via get_unread_thread_can
     expect(parsed.success).toBe(true);
     const call = rpcCalls.find((c) => c.fn === 'get_unread_thread_candidates');
     expect(call).toBeDefined();
-    expect(call!.args).toMatchObject({
-      p_agent_id: 'wren',
+    // Candidacy is per SB principal now (spec inkmail-thread-scope §3): the
+    // canonical id, the session, the page — never a user + slug pair.
+    expect(call!.args).toEqual({
+      p_sb_id: SB_IDS.wren,
       p_session_id: 'session-mock-123',
       p_limit: 20,
     });
@@ -2426,8 +2468,8 @@ describe('handleGetInbox — channelPoll thread paging via get_unread_thread_can
     expect(tablesTouched).not.toContain('inbox_thread_participants');
     // Membership filtered in SQL via the embedded join, not an id list.
     expect(mockSb.getEqCalls()['inbox_threads']).toContainEqual([
-      'inbox_thread_participants.agent_id',
-      'wren',
+      'inbox_thread_participants.sb_id',
+      SB_IDS.wren,
     ]);
   });
 
@@ -2452,8 +2494,9 @@ describe('handleGetInbox — channelPoll thread paging via get_unread_thread_can
             id: 't-1',
             thread_key: 'pr:t1',
             title: null,
-            user_id: 'user-123',
-            created_by_agent_id: 'lumen',
+            workspace_id: WS,
+            created_by_kind: 'sb',
+            created_by_sb_id: SB_IDS.lumen,
             updated_at: '2026-08-12T00:00:01Z',
           },
         ],
@@ -2506,13 +2549,11 @@ describe('handleSendToInbox — a thread home resolves the recipient session bef
     vi.clearAllMocks();
     const { findThread, getParticipants, resolveTriggeredAgents } =
       await import('./thread-handlers.js');
-    vi.mocked(findThread).mockResolvedValue({
-      id: 'thread-home',
-      thread_key: 'pr:600',
-      created_by_agent_id: 'wren',
-    } as never);
-    vi.mocked(getParticipants).mockResolvedValue(['wren', 'lumen']);
-    vi.mocked(resolveTriggeredAgents).mockReturnValue(['wren']);
+    vi.mocked(findThread).mockResolvedValue(
+      THREAD_ROW({ id: 'thread-home', thread_key: 'pr:600' })
+    );
+    vi.mocked(getParticipants).mockResolvedValue([P('wren'), P('lumen')]);
+    vi.mocked(resolveTriggeredAgents).mockReturnValue([REF('wren')]);
   });
 
   it('uses the participant stamp when the recipient has never written on the thread', async () => {
@@ -2592,7 +2633,15 @@ describe('handleSendToInbox — a thread home resolves the recipient session bef
  */
 function createRecordingSupabase(rows: Record<string, unknown[]>) {
   const eqCalls: Record<string, Array<[string, unknown]>> = {};
+  const inCalls: Record<string, Array<[string, unknown]>> = {};
   const from = vi.fn().mockImplementation((table: string) => {
+    // Identities must FILTER (a slug resolves to exactly one row), so they
+    // get the filtering chain regardless of the recording mode.
+    if (table === 'agent_identities') {
+      return createIdentityChain(
+        (rows.agent_identities as Array<Record<string, unknown>> | undefined) ?? IDENTITY_ROWS
+      );
+    }
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const self: any = {};
     for (const method of [
@@ -2611,6 +2660,7 @@ function createRecordingSupabase(rows: Record<string, unknown[]>) {
     ]) {
       self[method] = vi.fn().mockImplementation((col?: string, val?: unknown) => {
         if (method === 'eq') (eqCalls[table] ||= []).push([col as string, val]);
+        if (method === 'in') (inCalls[table] ||= []).push([col as string, val]);
         return self;
       });
     }
@@ -2625,6 +2675,7 @@ function createRecordingSupabase(rows: Record<string, unknown[]>) {
     from,
     rpc: vi.fn().mockResolvedValue({ data: null, error: null }),
     getEqCalls: () => eqCalls,
+    getInCalls: () => inCalls,
   };
 }
 
@@ -2642,20 +2693,16 @@ describe('Closed threads accept replies and stay deliverable (spec inkmail-threa
     // Closed is a work-state signal, not a lock. The thread row says closed
     // both ways (status + closed_at) so a gate on either field fails here.
     const { findThread, getParticipants } = await import('./thread-handlers.js');
-    vi.mocked(findThread).mockResolvedValue({
-      id: 'thread-closed',
-      thread_key: 'pr:210',
-      user_id: 'user-123',
-      created_by_agent_id: 'wren',
-      title: null,
-      status: 'closed',
-      metadata: null,
-      created_at: '2026-03-09T10:00:00Z',
-      updated_at: '2026-03-09T10:00:00Z',
-      closed_at: '2026-03-10T10:00:00Z',
-      closed_by_agent_id: 'lumen',
-    });
-    vi.mocked(getParticipants).mockResolvedValue(['wren', 'lumen']);
+    vi.mocked(findThread).mockResolvedValue(
+      THREAD_ROW({
+        id: 'thread-closed',
+        status: 'closed',
+        closed_at: '2026-03-10T10:00:00Z',
+        closed_by_kind: 'sb',
+        closed_by_sb_id: SB_IDS.lumen,
+      })
+    );
+    vi.mocked(getParticipants).mockResolvedValue([P('wren'), P('lumen')]);
     const mockSb = createThreadMockSupabase({ existingThread: { id: 'thread-closed' } });
     const mockDc = createThreadMockDataComposer(mockSb);
 
@@ -2686,7 +2733,7 @@ describe('Closed threads accept replies and stay deliverable (spec inkmail-threa
     );
     const threadEqs = mockSb.getEqCalls()['inbox_threads'] || [];
     // The page ran — membership was applied through the join …
-    expect(threadEqs).toContainEqual(['inbox_thread_participants.agent_id', 'wren']);
+    expect(threadEqs).toContainEqual(['inbox_thread_participants.sb_id', SB_IDS.wren]);
     // … and no status predicate narrowed it. A reply on a closed thread is
     // unread until read, so the thread has to stay on this page.
     expect(threadEqs).not.toContainEqual(['status', 'open']);
@@ -2697,7 +2744,7 @@ describe('Closed threads accept replies and stay deliverable (spec inkmail-threa
     // threads, so a reply after close never reached the per-agent unread.
     const { handleGetAgentSummaries } = await import('./inbox-handlers');
     const mockSb = createRecordingSupabase({
-      inbox_thread_participants: [{ thread_id: 't-closed', agent_id: 'wren' }],
+      inbox_thread_participants: [{ thread_id: 't-closed', sb_id: SB_IDS.wren }],
       inbox_threads: [{ id: 't-closed' }],
       inbox_thread_read_status: [],
       inbox_thread_messages: [{ thread_id: 't-closed', created_at: '2026-09-12T10:00:00Z' }],
@@ -2709,12 +2756,126 @@ describe('Closed threads accept replies and stay deliverable (spec inkmail-threa
     );
     const parsed = JSON.parse(result.content[0].text);
 
+    // Participation is read by identity id (§3), and the thread page is the
+    // participant's threads, whatever their status.
+    expect(mockSb.getInCalls()['inbox_thread_participants']).toContainEqual([
+      'sb_id',
+      [SB_IDS.wren],
+    ]);
     const threadEqs = mockSb.getEqCalls()['inbox_threads'] || [];
-    expect(threadEqs).toContainEqual(['user_id', expect.any(String)]);
     expect(threadEqs).not.toContainEqual(['status', 'open']);
     const wren = parsed.agents.find((a: { agentId: string }) => a.agentId === 'wren');
     expect(wren).toBeDefined();
     expect(wren.threadUnread).toBe(1);
+  });
+
+  it("a person's reply lands as a real principal: their participant row first, then a message authored by user", async () => {
+    // Spec inkmail-thread-scope §3, §7: the author of a person's reply is the
+    // person — sender_kind 'user' with their id, never an 'unknown' slug —
+    // and their participant row is upserted BEFORE the message is inserted,
+    // so the author is a principal by the time anything reads the thread.
+    // The person and their workspace arrive as server-side context, never
+    // through the public tool args.
+    const { findThread, getParticipants } = await import('./thread-handlers.js');
+    vi.mocked(findThread).mockResolvedValue(THREAD_ROW({ id: 'thread-person' }));
+    vi.mocked(getParticipants).mockResolvedValue([P('wren'), P('lumen')]);
+    const mockSb = createThreadMockSupabase({ existingThread: { id: 'thread-person' } });
+    const mockDc = createThreadMockDataComposer(mockSb);
+
+    const result = await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        threadKey: 'pr:210',
+        content: 'keep going — reviewer here',
+        recipients: ['wren', 'lumen'],
+        triggerAll: true,
+        metadata: { sentBy: 'user', channel: 'admin-api' },
+      },
+      mockDc as never,
+      { sender: { principal: userPrincipal('user-123'), workspaceId: WS } }
+    );
+    expect(JSON.parse(result.content[0].text).success).toBe(true);
+
+    const writes = mockSb.getWrites();
+    const personRow = writes.findIndex(
+      (w) => w.table === 'inbox_thread_participants' && w.row.user_id === 'user-123'
+    );
+    const messageRow = writes.findIndex((w) => w.table === 'inbox_thread_messages');
+    expect(personRow).toBeGreaterThanOrEqual(0);
+    expect(messageRow).toBeGreaterThan(personRow);
+    expect(writes[personRow]!.row).toEqual({
+      thread_id: 'thread-person',
+      workspace_id: WS,
+      sb_id: null,
+      user_id: 'user-123',
+    });
+    // No session stamp on a person's row: people are never spawned.
+    expect(writes[personRow]!.row.session_id).toBeUndefined();
+
+    expect(mockSb.getInsertedMessage()).toMatchObject({
+      sender_kind: 'user',
+      sender_user_id: 'user-123',
+      sender_sb_id: null,
+      sender_agent_id: null,
+    });
+    const sender = (mockSb.getInsertedMetadata()!.pcp as Record<string, unknown>).sender as Record<
+      string,
+      unknown
+    >;
+    expect(sender).toMatchObject({ kind: 'user', userId: 'user-123', agentId: null, sbId: null });
+    // The person's own pointer advanced through their message — by user id.
+    expect(
+      mockSb.getRpcCalls().find((c) => c.fn === 'advance_thread_read_pointer')?.args
+    ).toMatchObject({ p_sb_id: null, p_user_id: 'user-123' });
+  });
+
+  it("a person's reply wakes every SB participant and never a person's row (§7)", async () => {
+    // Dispatch operates on the SB participants only. A person reading the
+    // thread holds a participant row; that row is never a wake target, and
+    // it never changes the routing of the SBs around it.
+    const actual =
+      await vi.importActual<typeof import('./thread-handlers.js')>('./thread-handlers.js');
+    const { findThread, getParticipants, resolveTriggeredAgents } =
+      await import('./thread-handlers.js');
+    vi.mocked(findThread).mockResolvedValue(THREAD_ROW({ id: 'thread-person' }));
+    vi.mocked(getParticipants).mockResolvedValue([P('wren'), P('lumen'), PERSON('user-123')]);
+    vi.mocked(resolveTriggeredAgents).mockImplementation(actual.resolveTriggeredAgents);
+    const { getAgentGateway } = await import('../../channels/agent-gateway.js');
+    const mockGateway = (getAgentGateway as ReturnType<typeof vi.fn>)();
+    const mockSb = createThreadMockSupabase({ existingThread: { id: 'thread-person' } });
+    const mockDc = createThreadMockDataComposer(mockSb);
+
+    const result = await handleSendToInbox(
+      {
+        email: 'test@test.com',
+        threadKey: 'pr:210',
+        content: 'both of you: carry on',
+        recipients: ['wren', 'lumen'],
+        triggerAll: true,
+      },
+      mockDc as never,
+      { sender: { principal: userPrincipal('user-123'), workspaceId: WS } }
+    );
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.success).toBe(true);
+    expect(parsed.triggered.sort()).toEqual(['lumen', 'wren']);
+
+    const wakes = vi
+      .mocked(mockGateway.dispatchTrigger)
+      .mock.calls.map((c: unknown[]) => c[0] as Record<string, unknown>);
+    expect(wakes.map((w) => w.toSbId).sort()).toEqual([SB_IDS.lumen, SB_IDS.wren]);
+    // Every wake names an SB by canonical id; no payload was built for the person.
+    for (const w of wakes) {
+      expect(typeof w.toSbId).toBe('string');
+      expect(typeof w.toAgentId).toBe('string');
+      expect(w.threadId).toBe('thread-person');
+    }
+    expect(resolveTriggeredAgents).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sender: { kind: 'user' },
+        sbParticipants: [REF('wren'), REF('lumen')],
+      })
+    );
   });
 });
 
@@ -2746,6 +2907,10 @@ function createFilteringSupabase(rows: Record<string, Array<Record<string, unkno
       };
       q.gt = (k: string, v: string) => {
         data = data.filter((r) => String(r[k]) > v);
+        return q;
+      };
+      q.not = (k: string, op: string, v: unknown) => {
+        if (op === 'is' && v === null) data = data.filter((r) => r[k] != null);
         return q;
       };
       q.or = () => q;
@@ -2786,12 +2951,13 @@ describe('Unread parity with SQL candidacy once closed threads are in scope (Lum
   }) {
     const { handleGetAgentSummaries } = await import('./inbox-handlers');
     const db = createFilteringSupabase({
+      agent_identities: IDENTITY_ROWS,
       inbox_thread_participants: [
-        { thread_id: 'closed-thread', agent_id: 'lumen', joined_at: opts.joined },
+        { thread_id: 'closed-thread', sb_id: SB_IDS.lumen, joined_at: opts.joined },
       ],
-      inbox_threads: [{ id: 'closed-thread', user_id: 'user-123', status: 'closed' }],
+      inbox_threads: [{ id: 'closed-thread', workspace_id: WS, status: 'closed' }],
       inbox_thread_read_status: opts.lastRead
-        ? [{ thread_id: 'closed-thread', agent_id: 'lumen', last_read_at: opts.lastRead }]
+        ? [{ thread_id: 'closed-thread', sb_id: SB_IDS.lumen, last_read_at: opts.lastRead }]
         : [],
       inbox_thread_messages: [
         { thread_id: 'closed-thread', message_type: opts.type, created_at: opts.messageAt },
@@ -2851,28 +3017,31 @@ describe('Unread parity with SQL candidacy once closed threads are in scope (Lum
 
   it('get_inbox recency page does not count a closure-only tail as unread', async () => {
     const db = createFilteringSupabase({
+      agent_identities: IDENTITY_ROWS,
       inbox_threads: [
         {
           id: 'closed-thread',
-          user_id: 'user-123',
+          workspace_id: WS,
           status: 'closed',
           thread_key: 'pr:closed',
           // The recency page filters membership through the embedded join;
           // the filtering mock sees that as a column on the thread row.
-          'inbox_thread_participants.agent_id': 'lumen',
+          'inbox_thread_participants.sb_id': SB_IDS.lumen,
         },
       ],
       inbox_thread_participants: [
-        { thread_id: 'closed-thread', agent_id: 'lumen', joined_at: '2026-09-01T00:00:00Z' },
+        { thread_id: 'closed-thread', sb_id: SB_IDS.lumen, joined_at: '2026-09-01T00:00:00Z' },
       ],
       inbox_thread_read_status: [
-        { thread_id: 'closed-thread', agent_id: 'lumen', last_read_at: '2026-09-02T00:00:00Z' },
+        { thread_id: 'closed-thread', sb_id: SB_IDS.lumen, last_read_at: '2026-09-02T00:00:00Z' },
       ],
       inbox_thread_messages: [
         {
           thread_id: 'closed-thread',
           message_type: 'system',
-          sender_agent_id: 'system',
+          sender_kind: 'system',
+          sender_sb_id: null,
+          sender_agent_id: null,
           content: 'Thread closed',
           created_at: '2026-09-03T00:00:00Z',
         },

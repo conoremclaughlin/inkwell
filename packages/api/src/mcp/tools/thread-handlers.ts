@@ -18,6 +18,17 @@ import { logger } from '../../utils/logger';
 import type { Json } from '../../data/supabase/types';
 import { getAgentGateway, type AgentTriggerPayload } from '../../channels/agent-gateway.js';
 import { advanceThreadReadPointer } from './read-state.js';
+import {
+  SYSTEM_PRINCIPAL,
+  principalColumns,
+  resolveSbInWorkspace,
+  resolveSbsByIds,
+  senderColumns,
+  type Principal,
+  type SbPrincipal,
+  type UserPrincipal,
+} from '../../services/principals';
+import { resolveCallerSb, resolveCallerWorkspace } from './caller-principal';
 import { StudioLeaseService } from '../../services/studio-lease.service.js';
 import { StudioOverflowService } from '../../services/studio-overflow.service.js';
 
@@ -171,31 +182,85 @@ const markThreadReadSchema = userIdentifierBaseSchema.extend({
 
 // ============== Helpers (exported for use by inbox-handlers) ==============
 
-interface ThreadRow {
+export interface ThreadRow {
   id: string;
   thread_key: string;
-  user_id: string;
-  created_by_agent_id: string;
+  workspace_id: string;
+  created_by_kind: 'sb' | 'user' | 'system';
+  created_by_sb_id: string | null;
+  created_by_user_id: string | null;
   title: string | null;
   status: string;
   metadata: Json;
   created_at: string;
   updated_at: string;
   closed_at: string | null;
-  closed_by_agent_id: string | null;
+  closed_by_kind: 'sb' | 'user' | 'system' | null;
+  closed_by_sb_id: string | null;
+  closed_by_user_id: string | null;
+}
+
+/** A participant row with its principal resolved for display. */
+export interface ThreadParticipant {
+  sbId: string | null;
+  userId: string | null;
+  /** The SB's slug (null for a person). */
+  agentId: string | null;
+  sessionId: string | null;
+  joinedAt: string | null;
+}
+
+/** The SB participants only — the set dispatch operates on (§7). */
+export function sbParticipants(ps: ThreadParticipant[]): SbRef[] {
+  return ps
+    .filter((p): p is ThreadParticipant & { sbId: string; agentId: string } => !!p.sbId)
+    .map((p) => ({ sbId: p.sbId, agentId: p.agentId ?? p.sbId }));
+}
+
+/** Slugs of the SB participants, for tool output and legacy callers. */
+export function participantSlugs(ps: ThreadParticipant[]): string[] {
+  return sbParticipants(ps).map((p) => p.agentId);
+}
+
+/** An SB named for dispatch: canonical id plus its slug for display. */
+export interface SbRef {
+  sbId: string;
+  agentId: string;
+}
+
+/** The creator or closer of a thread as a principal, from the row. */
+export function threadCreator(t: ThreadRow): Principal {
+  if (t.created_by_kind === 'sb' && t.created_by_sb_id) {
+    return {
+      kind: 'sb',
+      sbId: t.created_by_sb_id,
+      agentId: '',
+      userId: '',
+      workspaceId: t.workspace_id,
+    };
+  }
+  if (t.created_by_kind === 'user' && t.created_by_user_id) {
+    return { kind: 'user', userId: t.created_by_user_id };
+  }
+  return SYSTEM_PRINCIPAL;
 }
 
 /**
  * Look up a thread by (user_id, thread_key). Returns null if not found.
  */
+/**
+ * A thread is one row per (workspace, key) (spec inkmail-thread-scope §1).
+ * The workspace is the caller's: an SB's identity lives in exactly one, a
+ * person acts in their selected one.
+ */
 export async function findThread(
   supabase: ReturnType<DataComposer['getClient']>,
-  userId: string,
+  workspaceId: string,
   threadKey: string
 ): Promise<ThreadRow | null> {
   const { data, error } = await threadTable(supabase, 'inbox_threads')
     .select('*')
-    .eq('user_id', userId)
+    .eq('workspace_id', workspaceId)
     .eq('thread_key', threadKey)
     .maybeSingle();
 
@@ -207,137 +272,196 @@ export async function findThread(
 }
 
 /**
- * Get all participant agent IDs for a thread.
+ * Every participant of a thread — SBs and people — with SB slugs resolved
+ * for display. Two queries rather than an embedded select so the fake client
+ * used by the unit tests sees the same shape production does.
  */
 export async function getParticipants(
   supabase: ReturnType<DataComposer['getClient']>,
   threadId: string
-): Promise<string[]> {
+): Promise<ThreadParticipant[]> {
   const { data, error } = await threadTable(supabase, 'inbox_thread_participants')
-    .select('agent_id')
+    .select('sb_id, user_id, session_id, joined_at')
     .eq('thread_id', threadId);
 
   if (error) {
     logger.error('Failed to get participants', { error, threadId });
     throw new Error(`Failed to get participants: ${error.message}`);
   }
-  return (data || []).map((p: { agent_id: string }) => p.agent_id);
+  const rows = (data || []) as Array<{
+    sb_id: string | null;
+    user_id: string | null;
+    session_id: string | null;
+    joined_at: string | null;
+  }>;
+  const sbIds = rows.map((r) => r.sb_id).filter((id): id is string => !!id);
+  const slugById = new Map(
+    (await resolveSbsByIds(supabase, sbIds)).map((sb) => [sb.sbId, sb.agentId])
+  );
+  return rows.map((r) => ({
+    sbId: r.sb_id,
+    userId: r.user_id,
+    agentId: r.sb_id ? (slugById.get(r.sb_id) ?? null) : null,
+    sessionId: r.session_id,
+    joinedAt: r.joined_at,
+  }));
 }
 
 /**
- * Check if an agent is a participant in a thread.
+ * Is this principal a participant in the thread?
  */
 export async function isParticipant(
   supabase: ReturnType<DataComposer['getClient']>,
   threadId: string,
-  agentId: string
+  principal: SbPrincipal | UserPrincipal
 ): Promise<boolean> {
-  const { data } = await threadTable(supabase, 'inbox_thread_participants')
-    .select('agent_id')
-    .eq('thread_id', threadId)
-    .eq('agent_id', agentId)
-    .maybeSingle();
+  let q = threadTable(supabase, 'inbox_thread_participants')
+    .select('thread_id')
+    .eq('thread_id', threadId);
+  q = principal.kind === 'sb' ? q.eq('sb_id', principal.sbId) : q.eq('user_id', principal.userId);
+  const { data } = await q.maybeSingle();
   return !!data;
 }
 
+/** A principal as dispatch sees it: an SB with its slug, or not an SB at all. */
+export type TriggerPrincipal = ({ kind: 'sb' } & SbRef) | { kind: 'user' } | { kind: 'system' };
+
 /**
- * Determine which agents to trigger based on thread context.
+ * Determine which SBs to wake for a message (spec inkmail-thread-scope §7).
  *
- * Rules:
- * 1. triggerAgents [...] → wake exactly these (filter to participants)
- * 2. triggerAll: true → wake all participants except sender
- * 3. Actionable messages (task_request, session_resume) → trigger all recipients
- * 4. Default: 1:1 → other participant; group with explicit recipients → those recipients;
- *    group non-creator → creator; group creator → all others
+ * Dispatch operates on the ordered set of SB participants only. A person
+ * holding a participant row never changes the routing and is never woken
+ * here ("wake" means spawning a session); "1:1" means one other SB, however
+ * many people are reading. Rows, in order:
  *
- * Cross-studio self-messaging: when selfStudioTarget is true, the sender is NOT
- * excluded from trigger lists. This allows an agent to message themselves in a
- * different studio (e.g., wren-omega sends a review request to wren-review).
+ *   SB sender, explicit triggerAgents → those ∩ SB participants (self excluded unless selfStudioTarget)
+ *   SB sender, triggerAll            → all SB participants (self excluded unless selfStudioTarget)
+ *   SB sender, no other SB           → self iff actionable type or selfStudioTarget, else nobody
+ *   SB sender, one other SB          → that SB
+ *   SB sender, ≥2 others, actionable → explicit recipients if given, else all others
+ *   SB sender, ≥2 others, recipients → those ∩ SB participants — even when empty
+ *   SB sender, ≥2 others, non-creator reply, SB creator    → the creator
+ *   SB sender, ≥2 others, non-creator reply, human creator → all other SBs (a decision, not a fallthrough)
+ *   SB sender, ≥2 others, creator reply                    → all other SBs
+ *   person / system sender, thread start → the addressed SBs; reply → all SB participants
+ *
+ * Cross-studio self-messaging: when selfStudioTarget is true, the sender is
+ * NOT excluded, so an agent can message itself in another studio.
  */
 export function resolveTriggeredAgents(opts: {
-  senderAgentId: string;
-  participants: string[];
-  creatorAgentId: string;
+  sender: TriggerPrincipal;
+  sbParticipants: SbRef[];
+  creator: TriggerPrincipal;
+  /** Canonical ids of the SBs to wake (highest precedence). */
   triggerAgents?: string[];
   triggerAll?: boolean;
   messageType?: string;
+  /** Canonical ids of the addressed SBs. */
   recipients?: string[];
   selfStudioTarget?: boolean;
-}): string[] {
+}): SbRef[] {
   const {
-    senderAgentId,
-    participants,
-    creatorAgentId,
+    sender,
+    sbParticipants: participants,
+    creator,
     triggerAgents,
     triggerAll,
     messageType,
-    selfStudioTarget,
   } = opts;
+  const selfStudioTarget = !!opts.selfStudioTarget;
+  const actionable = new Set(['task_request', 'session_resume']);
+  const byId = new Map(participants.map((p) => [p.sbId, p]));
+  const pick = (ids: string[]): SbRef[] => {
+    const seen = new Set<string>();
+    const out: SbRef[] = [];
+    for (const id of ids) {
+      const p = byId.get(id);
+      if (p && !seen.has(id)) {
+        seen.add(id);
+        out.push(p);
+      }
+    }
+    return out;
+  };
 
-  // When targeting self in a different studio, don't exclude sender from triggers
-  const excludeSelf = (a: string) => (selfStudioTarget ? true : a !== senderAgentId);
-
-  // Precedence 1: explicit triggerAgents (filter to actual participants)
-  if (triggerAgents && triggerAgents.length > 0) {
-    const participantSet = new Set(participants);
-    return triggerAgents.filter((a) => excludeSelf(a) && participantSet.has(a));
+  // A person's reply wakes EVERY SB in the thread (§7): addressed
+  // recipients narrow a thread START (handled by the creator, not here),
+  // never a reply. An explicit wake list still wins, empty or not. The
+  // system addresses whom it names (a strategy notice to one SB on a group
+  // thread), else everyone. (Lumen, #618.)
+  if (sender.kind !== 'sb') {
+    if (triggerAgents) return pick(triggerAgents);
+    if (sender.kind === 'system' && opts.recipients && opts.recipients.length > 0) {
+      return pick(opts.recipients);
+    }
+    return [...participants];
   }
 
-  // Precedence 2: triggerAll — everyone (except sender unless selfStudioTarget)
+  const senderSbId = sender.sbId;
+  const excludeSelf = (id: string) => (selfStudioTarget ? true : id !== senderSbId);
+
+  // Precedence 1: an explicit wake list — given is given, even when nothing
+  // in it is a participant: the empty intersection is the answer.
+  if (triggerAgents) {
+    return pick(triggerAgents.filter(excludeSelf));
+  }
+
+  // Precedence 2: triggerAll — every SB (except sender unless selfStudioTarget)
   if (triggerAll) {
-    return participants.filter(excludeSelf);
+    return participants.filter((p) => excludeSelf(p.sbId));
   }
 
-  // Precedence 3: default rules by thread size
-  const otherParticipants = participants.filter((a) => a !== senderAgentId);
+  // Precedence 3: default rules by SB cardinality
+  const others = participants.filter((p) => p.sbId !== senderSbId);
+  const self: SbRef = byId.get(senderSbId) ?? { sbId: senderSbId, agentId: sender.agentId };
 
-  // Self-thread (1 participant): trigger if cross-studio OR actionable message type.
-  // session_resume / task_request to self are inherently "wake me up" signals
-  // (e.g., strategy triggers) and must not be silently dropped.
-  if (otherParticipants.length === 0) {
-    if (selfStudioTarget) return [senderAgentId];
-    const selfActionable = new Set(['task_request', 'session_resume']);
-    if (messageType && selfActionable.has(messageType)) return [senderAgentId];
+  // Self-thread (no other SB): wake self only on cross-studio or actionable
+  // types — session_resume / task_request to self are "wake me up" signals.
+  if (others.length === 0) {
+    if (selfStudioTarget) return [self];
+    if (messageType && actionable.has(messageType)) return [self];
     return [];
   }
 
-  // 1:1 thread (2 participants): trigger the other one
-  if (participants.length === 2) {
-    return otherParticipants;
+  // One other SB: wake it, however many people are reading.
+  if (others.length === 1) {
+    return others;
   }
 
-  // Group thread: actionable message types (task_request, session_resume) always
-  // trigger all recipients. The sender explicitly wants someone to act — silently
-  // triggering nobody violates the contract that "all message types trigger by default."
-  const actionableTypes = new Set(['task_request', 'session_resume']);
-  if (messageType && actionableTypes.has(messageType)) {
-    // Trigger explicit recipients if provided, otherwise all other participants
-    const targets = opts.recipients?.filter(excludeSelf) ?? otherParticipants;
-    return targets.filter((a) => participants.includes(a));
+  // Group: actionable types always wake — explicit recipients if given,
+  // otherwise all the others. Silently waking nobody would violate "every
+  // message type triggers by default".
+  if (messageType && actionable.has(messageType)) {
+    return opts.recipients && opts.recipients.length > 0
+      ? pick(opts.recipients.filter(excludeSelf))
+      : others;
   }
 
-  // Group thread: when explicit recipients are provided, use them — even if the
-  // filtered result is empty (e.g., self-target without selfStudioTarget). This
-  // respects the caller's intent rather than falling through to role-based defaults.
+  // Group: explicit recipients are the answer — even when the filtered
+  // result is empty (self-target without selfStudioTarget).
   if (opts.recipients && opts.recipients.length > 0) {
-    return opts.recipients.filter((a) => excludeSelf(a) && participants.includes(a));
+    return pick(opts.recipients.filter(excludeSelf));
   }
 
-  // No explicit recipients — fall back to role-based defaults:
-  // Non-creator → trigger creator only; Creator → trigger all others
-  if (senderAgentId !== creatorAgentId) {
-    return [creatorAgentId];
+  // No explicit recipients: a non-creator wakes the SB creator; the creator
+  // (or anyone, when the creator is a person or the system) wakes the others.
+  if (creator.kind === 'sb' && creator.sbId !== senderSbId) {
+    return [byId.get(creator.sbId) ?? { sbId: creator.sbId, agentId: creator.agentId }];
   }
-  return otherParticipants;
+  return others;
 }
 
 /**
- * Dispatch triggers to a list of agents.
+ * Dispatch triggers to SBs. The payload carries the canonical identity
+ * (`toSbId`) beside the slug: the trigger handler resolves the runtime owner
+ * and workspace from the identity, not from the thread (§1a).
  */
 export function dispatchTriggers(
-  agentsToTrigger: string[],
+  targets: SbRef[],
   opts: {
     fromAgentId: string;
+    /** The sender's canonical identity, when it is an SB (failure notices go to its owner). */
+    fromSbId?: string;
     threadKey: string;
     summary: string;
     priority: string;
@@ -347,13 +471,15 @@ export function dispatchTriggers(
     senderIsBridge?: boolean;
   }
 ): void {
-  if (agentsToTrigger.length === 0) return;
+  if (targets.length === 0) return;
 
   const gateway = getAgentGateway();
-  for (const toAgentId of agentsToTrigger) {
+  for (const target of targets) {
     const payload: AgentTriggerPayload = {
       fromAgentId: opts.fromAgentId,
-      toAgentId,
+      ...(opts.fromSbId ? { fromSbId: opts.fromSbId } : {}),
+      toAgentId: target.agentId,
+      toSbId: target.sbId,
       threadMessageId: opts.threadMessageId,
       threadId: opts.threadId,
       triggerType: 'message',
@@ -366,6 +492,33 @@ export function dispatchTriggers(
     };
     gateway.dispatchTrigger(payload);
   }
+}
+
+/** The display label of a thread's creator: the SB's slug, 'user', or 'system'. */
+export async function creatorLabel(
+  supabase: ReturnType<DataComposer['getClient']>,
+  thread: ThreadRow,
+  participants: ThreadParticipant[]
+): Promise<string> {
+  if (thread.created_by_kind === 'sb' && thread.created_by_sb_id) {
+    const known = participants.find((p) => p.sbId === thread.created_by_sb_id)?.agentId;
+    if (known) return known;
+    const [sb] = await resolveSbsByIds(supabase, [thread.created_by_sb_id]);
+    return sb?.agentId ?? thread.created_by_sb_id;
+  }
+  return thread.created_by_kind;
+}
+
+/** The creator as dispatch sees it, with the slug filled in from the participants. */
+export function creatorForDispatch(
+  thread: ThreadRow,
+  participants: ThreadParticipant[]
+): TriggerPrincipal {
+  if (thread.created_by_kind === 'sb' && thread.created_by_sb_id) {
+    const known = participants.find((p) => p.sbId === thread.created_by_sb_id)?.agentId;
+    return { kind: 'sb', sbId: thread.created_by_sb_id, agentId: known ?? thread.created_by_sb_id };
+  }
+  return thread.created_by_kind === 'user' ? { kind: 'user' } : { kind: 'system' };
 }
 
 // ============== Handlers ==============
@@ -388,8 +541,9 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
     channelPoll,
   } = parsed;
 
-  // Find thread
-  const thread = await findThread(supabase, resolved.user.id, threadKey);
+  // The caller's identity fixes the workspace the thread is looked up in.
+  const caller = await resolveCallerSb(supabase, resolved.user.id, agentId);
+  const thread = await findThread(supabase, caller.workspaceId, threadKey);
   if (!thread) {
     return {
       content: [
@@ -402,7 +556,7 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
   }
 
   // Verify participant membership
-  if (!(await isParticipant(supabase, thread.id, agentId))) {
+  if (!(await isParticipant(supabase, thread.id, caller))) {
     return {
       content: [
         {
@@ -445,7 +599,7 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
     const { data: readStatus } = await threadTable(supabase, 'inbox_thread_read_status')
       .select('last_read_at')
       .eq('thread_id', thread.id)
-      .eq('agent_id', agentId)
+      .eq('sb_id', caller.sbId)
       .maybeSingle();
     readStateFloor = (readStatus as { last_read_at?: string } | null)?.last_read_at || null;
 
@@ -453,7 +607,7 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
       const { data: participant } = await threadTable(supabase, 'inbox_thread_participants')
         .select('joined_at')
         .eq('thread_id', thread.id)
-        .eq('agent_id', agentId)
+        .eq('sb_id', caller.sbId)
         .maybeSingle();
       readStateFloor = (participant as { joined_at?: string } | null)?.joined_at || null;
     }
@@ -562,7 +716,7 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
           if (newestSkipped?.id) {
             const advanced = await advanceThreadReadPointer(supabase, {
               threadId: thread.id,
-              agentId,
+              sbId: caller.sbId,
               throughMessageId: newestSkipped.id,
               source: 'get_thread_messages:deliberate_skip',
             });
@@ -592,7 +746,7 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
       if (maxMessageId) {
         const advanced = await advanceThreadReadPointer(supabase, {
           threadId: thread.id,
-          agentId,
+          sbId: caller.sbId,
           throughMessageId: maxMessageId,
           source: 'get_thread_messages:markRead',
         });
@@ -618,8 +772,9 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
           threadId: thread.id,
           title: thread.title,
           status: thread.status,
-          createdBy: thread.created_by_agent_id,
-          participants,
+          createdBy: await creatorLabel(supabase, thread, participants),
+          participants: participantSlugs(participants),
+          people: participants.map((p) => p.userId).filter((id): id is string => !!id),
           messageCount: messages?.length || 0,
           // Truncation is visible, never silent: how many older matching
           // messages were cut by the cold-start guard or latestN window.
@@ -637,7 +792,9 @@ export async function handleGetThreadMessages(args: unknown, dataComposer: DataC
             : {}),
           messages: (messages || []).map((m: Record<string, unknown>) => ({
             id: m.id,
-            senderAgentId: m.sender_agent_id,
+            senderKind: m.sender_kind,
+            senderAgentId: m.sender_agent_id ?? m.sender_kind,
+            senderUserId: m.sender_user_id,
             content: m.content,
             messageType: m.message_type,
             priority: m.priority,
@@ -658,8 +815,14 @@ export async function handleAddThreadParticipant(args: unknown, dataComposer: Da
   const { threadKey, agentId, reason, triggerNewParticipant, metadata } = parsed;
   const addedByAgentId = getEffectiveAgentId(parsed.addedByAgentId) ?? parsed.addedByAgentId;
 
-  // Find thread
-  const thread = await findThread(supabase, resolved.user.id, threadKey);
+  // The thread lives in the caller's workspace; the newcomer must resolve
+  // there too — a foreign SB cannot be placed in this thread (§6).
+  const { workspaceId, sb: actor } = await resolveCallerWorkspace(
+    supabase,
+    resolved.user.id,
+    addedByAgentId
+  );
+  const thread = await findThread(supabase, workspaceId, threadKey);
   if (!thread) {
     return {
       content: [
@@ -670,9 +833,10 @@ export async function handleAddThreadParticipant(args: unknown, dataComposer: Da
       ],
     };
   }
+  const newcomer = await resolveSbInWorkspace(supabase, thread.workspace_id, agentId);
 
   // Idempotent: check if already participant
-  if (await isParticipant(supabase, thread.id, agentId)) {
+  if (await isParticipant(supabase, thread.id, newcomer)) {
     return {
       content: [
         {
@@ -691,7 +855,8 @@ export async function handleAddThreadParticipant(args: unknown, dataComposer: Da
   // Add participant
   const { error: addError } = await threadTable(supabase, 'inbox_thread_participants').insert({
     thread_id: thread.id,
-    agent_id: agentId,
+    workspace_id: thread.workspace_id,
+    ...principalColumns(newcomer),
   });
 
   if (addError) {
@@ -705,12 +870,13 @@ export async function handleAddThreadParticipant(args: unknown, dataComposer: Da
 
   await threadTable(supabase, 'inbox_thread_messages').insert({
     thread_id: thread.id,
-    sender_agent_id: 'system',
+    ...senderColumns(SYSTEM_PRINCIPAL),
     content: systemContent,
     message_type: 'system',
     metadata: {
       type: 'participant_added',
       agentId,
+      sbId: newcomer.sbId,
       addedBy: addedByAgentId || null,
       reason: reason || null,
       ...(metadata || {}),
@@ -721,8 +887,12 @@ export async function handleAddThreadParticipant(args: unknown, dataComposer: Da
 
   // Trigger the new participant
   if (triggerNewParticipant) {
-    dispatchTriggers([agentId], {
+    dispatchTriggers([{ sbId: newcomer.sbId, agentId: newcomer.agentId }], {
       fromAgentId: addedByAgentId || 'system',
+      // The actor's identity rides with the trigger so a failure notice can
+      // find the sender's owner; without it the notice had only the thread
+      // lane on this path (Lumen, #618 round 2).
+      fromSbId: actor?.sbId,
       // Without this the option added in round 1 was never passed by ANY
       // caller here, so bridge exclusion stayed dead on this path
       // (Lumen, PR #514 round 2).
@@ -763,8 +933,8 @@ export async function handleCloseThread(args: unknown, dataComposer: DataCompose
   const agentId = getEffectiveAgentId(parsed.agentId) ?? parsed.agentId;
   const { threadKey } = parsed;
 
-  // Find thread
-  const thread = await findThread(supabase, resolved.user.id, threadKey);
+  const caller = await resolveCallerSb(supabase, resolved.user.id, agentId);
+  const thread = await findThread(supabase, caller.workspaceId, threadKey);
   if (!thread) {
     return {
       content: [
@@ -792,7 +962,7 @@ export async function handleCloseThread(args: unknown, dataComposer: DataCompose
   }
 
   // Verify participant
-  if (!(await isParticipant(supabase, thread.id, agentId))) {
+  if (!(await isParticipant(supabase, thread.id, caller))) {
     return {
       content: [
         {
@@ -806,12 +976,14 @@ export async function handleCloseThread(args: unknown, dataComposer: DataCompose
     };
   }
 
-  // Close the thread
+  // Close the thread: the closer is a principal (§3), never a slug.
   const now = new Date().toISOString();
   const { error } = await threadTable(supabase, 'inbox_threads')
     .update({
       status: 'closed',
-      closed_by_agent_id: agentId,
+      closed_by_kind: 'sb',
+      closed_by_sb_id: caller.sbId,
+      closed_by_user_id: null,
       closed_at: now,
       updated_at: now,
     })
@@ -824,10 +996,10 @@ export async function handleCloseThread(args: unknown, dataComposer: DataCompose
   // Add system message
   await threadTable(supabase, 'inbox_thread_messages').insert({
     thread_id: thread.id,
-    sender_agent_id: 'system',
+    ...senderColumns(SYSTEM_PRINCIPAL),
     content: `Thread closed by ${agentId}`,
     message_type: 'system',
-    metadata: { type: 'thread_closed', closedBy: agentId } as Json,
+    metadata: { type: 'thread_closed', closedBy: agentId, closedBySbId: caller.sbId } as Json,
   });
 
   // Automatic lease release — the work unit completing is what lets studios
@@ -886,8 +1058,8 @@ export async function handleCloseThread(args: unknown, dataComposer: DataCompose
   };
 }
 
-/** Who is reopening: a participant SB, or the owner recovering from the dashboard. */
-export type ReopenActor = { kind: 'sb'; agentId: string } | { kind: 'user' };
+/** Who is reopening: a participant SB, or a person recovering from the dashboard (§2). */
+export type ReopenActor = { kind: 'sb'; sbId: string } | { kind: 'user'; userId: string };
 
 /**
  * Flip a closed thread back to open and record it — in ONE transaction, the
@@ -918,11 +1090,14 @@ export async function reopenThreadRow(
   threadId: string,
   actor: ReopenActor
 ): Promise<{ reopened: boolean }> {
-  const { data, error } = await supabase.rpc('reopen_inbox_thread', {
+  // The generated Args type marks both actor ids required (no SQL default);
+  // the function takes NULL for the absent one, which is the contract.
+  const args = {
     p_thread_id: threadId,
-    p_actor_kind: actor.kind,
-    p_actor_agent_id: actor.kind === 'sb' ? actor.agentId : null,
-  });
+    p_actor_sb_id: actor.kind === 'sb' ? actor.sbId : null,
+    p_actor_user_id: actor.kind === 'user' ? actor.userId : null,
+  };
+  const { data, error } = await supabase.rpc('reopen_inbox_thread', args as never);
   if (error) {
     throw new Error(`Failed to reopen thread: ${error.message}`);
   }
@@ -952,13 +1127,14 @@ export async function handleReopenThread(args: unknown, dataComposer: DataCompos
     content: [{ type: 'text' as const, text: JSON.stringify(payload) }],
   });
 
-  const thread = await findThread(supabase, resolved.user.id, threadKey);
+  const caller = await resolveCallerSb(supabase, resolved.user.id, agentId);
+  const thread = await findThread(supabase, caller.workspaceId, threadKey);
   if (!thread) {
     return reply({ success: false, error: `Thread not found: ${threadKey}` });
   }
 
   // Who is asking comes before what state the thread is in.
-  if (!(await isParticipant(supabase, thread.id, agentId))) {
+  if (!(await isParticipant(supabase, thread.id, caller))) {
     return reply({
       success: false,
       error: `Agent ${agentId} is not a participant in thread ${threadKey}`,
@@ -974,7 +1150,10 @@ export async function handleReopenThread(args: unknown, dataComposer: DataCompos
     });
   }
 
-  const { reopened } = await reopenThreadRow(supabase, thread.id, { kind: 'sb', agentId });
+  const { reopened } = await reopenThreadRow(supabase, thread.id, {
+    kind: 'sb',
+    sbId: caller.sbId,
+  });
   if (!reopened) {
     // Closed when we looked, open by the time we wrote: someone else's
     // reopen landed first. The state the caller asked for holds, and
@@ -1004,14 +1183,15 @@ export async function handleListThreads(args: unknown, dataComposer: DataCompose
 
   const agentId = getEffectiveAgentId(parsed.agentId) ?? parsed.agentId;
   const { status, limit } = parsed;
+  const caller = await resolveCallerSb(supabase, resolved.user.id, agentId);
 
-  // Get thread IDs where this agent is a participant
+  // Get thread IDs where this SB is a participant
   const { data: participantRows, error: pError } = await threadTable(
     supabase,
     'inbox_thread_participants'
   )
     .select('thread_id')
-    .eq('agent_id', agentId);
+    .eq('sb_id', caller.sbId);
 
   if (pError) {
     throw new Error(`Failed to list threads: ${pError.message}`);
@@ -1032,7 +1212,7 @@ export async function handleListThreads(args: unknown, dataComposer: DataCompose
   // Get threads
   let query = threadTable(supabase, 'inbox_threads')
     .select('*')
-    .eq('user_id', resolved.user.id)
+    .eq('workspace_id', caller.workspaceId)
     .in('id', threadIds)
     .order('updated_at', { ascending: false })
     .limit(limit);
@@ -1051,11 +1231,11 @@ export async function handleListThreads(args: unknown, dataComposer: DataCompose
     (threads || []).map(async (t: ThreadRow) => {
       const participants = await getParticipants(supabase, t.id);
 
-      // Get last read timestamp for this agent
+      // Get last read timestamp for this SB
       const { data: readStatus } = await threadTable(supabase, 'inbox_thread_read_status')
         .select('last_read_at')
         .eq('thread_id', t.id)
-        .eq('agent_id', agentId)
+        .eq('sb_id', caller.sbId)
         .maybeSingle();
 
       // Count messages after last read
@@ -1071,7 +1251,7 @@ export async function handleListThreads(args: unknown, dataComposer: DataCompose
 
       // Get latest message preview
       const { data: latestMsg } = await threadTable(supabase, 'inbox_thread_messages')
-        .select('sender_agent_id, content, created_at')
+        .select('sender_kind, sender_agent_id, content, created_at')
         .eq('thread_id', t.id)
         .neq('message_type', 'system')
         .order('created_at', { ascending: false })
@@ -1082,12 +1262,13 @@ export async function handleListThreads(args: unknown, dataComposer: DataCompose
         threadKey: t.thread_key,
         title: t.title,
         status: t.status,
-        createdBy: t.created_by_agent_id,
-        participants,
+        createdBy: await creatorLabel(supabase, t, participants),
+        participants: participantSlugs(participants),
+        people: participants.map((p) => p.userId).filter((id): id is string => !!id),
         unreadCount: unreadCount || 0,
         lastMessage: latestMsg
           ? {
-              from: latestMsg.sender_agent_id,
+              from: latestMsg.sender_agent_id ?? latestMsg.sender_kind,
               preview: latestMsg.content.slice(0, 120),
               at: latestMsg.created_at,
             }
@@ -1121,8 +1302,8 @@ export async function handleMarkThreadRead(args: unknown, dataComposer: DataComp
   const agentId = getEffectiveAgentId(parsed.agentId) ?? parsed.agentId;
   const { threadKey } = parsed;
 
-  // Find thread
-  const thread = await findThread(supabase, resolved.user.id, threadKey);
+  const caller = await resolveCallerSb(supabase, resolved.user.id, agentId);
+  const thread = await findThread(supabase, caller.workspaceId, threadKey);
   if (!thread) {
     return {
       content: [
@@ -1135,7 +1316,7 @@ export async function handleMarkThreadRead(args: unknown, dataComposer: DataComp
   }
 
   // Verify participant membership
-  if (!(await isParticipant(supabase, thread.id, agentId))) {
+  if (!(await isParticipant(supabase, thread.id, caller))) {
     return {
       content: [
         {
@@ -1176,7 +1357,7 @@ export async function handleMarkThreadRead(args: unknown, dataComposer: DataComp
     }
     const advanced = await advanceThreadReadPointer(supabase, {
       threadId: thread.id,
-      agentId,
+      sbId: caller.sbId,
       throughMessageId: ackMsg.id,
       source: 'mark_thread_read:ack',
     });
@@ -1221,7 +1402,7 @@ export async function handleMarkThreadRead(args: unknown, dataComposer: DataComp
   if (latestMsg?.id) {
     const advanced = await advanceThreadReadPointer(supabase, {
       threadId: thread.id,
-      agentId,
+      sbId: caller.sbId,
       throughMessageId: latestMsg.id,
       source: 'mark_thread_read',
     });

@@ -61,6 +61,7 @@ import type { Database, Json } from '../data/supabase/types';
 import { hasActiveRun } from './sessions/active-runs';
 import { resolveIdentityId } from '../auth/resolve-identity';
 import { logger } from '../utils/logger';
+import { workspaceOfSb } from './principals';
 import { grantStudioLease, studioPathConflict, type GrantOutcome } from './lease-grant';
 
 const execFileAsync = promisify(execFile);
@@ -1341,6 +1342,7 @@ export class StudioLeaseService {
     Array<{
       id: string;
       user_id: string;
+      sb_id: string | null;
       lease: StudioLease;
       worktree_path: string | null;
       ephemeral: boolean;
@@ -1349,7 +1351,7 @@ export class StudioLeaseService {
   > {
     let query = this.supabase
       .from('studios')
-      .select('id, user_id, lease, worktree_path, ephemeral, expires_at')
+      .select('id, user_id, sb_id, lease, worktree_path, ephemeral, expires_at')
       .eq('lease->>sessionId', sessionId);
     if (userId) query = query.eq('user_id', userId);
     const { data } = await query;
@@ -1362,6 +1364,7 @@ export class StudioLeaseService {
       held.push({
         id: row.id,
         user_id: row.user_id,
+        sb_id: (row.sb_id as string | null) ?? null,
         lease,
         worktree_path: row.worktree_path ?? null,
         ephemeral: row.ephemeral === true,
@@ -1858,7 +1861,7 @@ export class StudioLeaseService {
     // A thread-close release stamps the CLOSING thread's record — under
     // multiplexing the last live key need not be the scalar first-acquirer.
     await this.stampThreadFinalState(
-      userId,
+      lease.sbId ?? null,
       opts.closingThreadKey ?? lease.threadKey,
       studioId,
       finalState
@@ -1871,17 +1874,23 @@ export class StudioLeaseService {
    * thread's metadata so the thread records where its work ended up.
    */
   private async stampThreadFinalState(
-    userId: string,
+    sbId: string | null,
     threadKey: string,
     studioId: string,
     finalState?: WorktreeFinalState
   ): Promise<void> {
     if (!finalState || finalState.error) return;
+    // The thread is one row per (workspace, key); the workspace is the
+    // holding identity's. A lease with no canonical identity names no
+    // workspace, so it stamps nothing rather than guessing among namesakes.
+    if (!sbId) return;
     try {
+      const workspaceId = await workspaceOfSb(this.supabase, sbId);
+      if (!workspaceId) return;
       const { data: thread } = await this.supabase
         .from('inbox_threads')
         .select('id, metadata')
-        .eq('user_id', userId)
+        .eq('workspace_id', workspaceId)
         .eq('thread_key', threadKey)
         .maybeSingle();
       if (!thread) return;
@@ -1933,7 +1942,7 @@ export class StudioLeaseService {
   }> {
     const { data, error } = await this.supabase
       .from('studios')
-      .select('id, user_id, lease, worktree_path, ephemeral, expires_at')
+      .select('id, user_id, sb_id, lease, worktree_path, ephemeral, expires_at')
       .not('lease', 'is', null);
     if (error || !data?.length) return { expired: 0, renewed: 0, quarantined: 0, released: 0 };
 
@@ -2105,7 +2114,7 @@ export class StudioLeaseService {
         },
       });
       if (claim.heldThreadKey) {
-        await this.stampThreadFinalState(row.user_id, claim.heldThreadKey, row.id, rescue);
+        await this.stampThreadFinalState(row.sb_id ?? null, claim.heldThreadKey, row.id, rescue);
       }
       expired += 1;
     }

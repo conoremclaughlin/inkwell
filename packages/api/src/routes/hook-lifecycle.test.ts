@@ -22,6 +22,15 @@ vi.mock('../mcp/auth/pcp-auth-provider', () => ({
   },
 }));
 
+// The regrant's workspace is resolved by the server from the session's
+// identity (spec inkmail-thread-scope §1; Lumen, #616): sb-uuid-1 lives in
+// ws-1, anything else names no workspace.
+vi.mock('../services/principals', () => ({
+  workspaceOfSb: vi.fn(async (_client: unknown, sbId: string) =>
+    sbId === 'sb-uuid-1' ? 'ws-1' : null
+  ),
+}));
+
 vi.mock('../services/graph-executor.service', () => ({
   releaseGraphClaimsForSession: vi.fn(async () => undefined),
 }));
@@ -797,7 +806,33 @@ describe('hook-lifecycle CLI turn signal', () => {
       });
 
       const args = rpcCalls[0]![1] as Record<string, unknown>;
-      expect(args.p_regrant).toMatchObject({ sbId: 'sb-uuid-1' });
+      expect(args.p_regrant).toMatchObject({ sbId: 'sb-uuid-1', workspaceId: 'ws-1' });
+    });
+
+    it('the regrant names the workspace the server resolved from that identity — and none without one', async () => {
+      // The RPC refuses a regrant with no workspaceId (spec inkmail-thread-scope
+      // §1; #616 P1): the check reads the one (workspace, key) row, never a
+      // namesake the owner can see. A session with no canonical identity
+      // therefore sends no workspace, and the RPC's refusal is the outcome.
+      getSession.mockResolvedValueOnce({
+        id: SESSION_ID,
+        userId: 'user-1',
+        endedAt: null,
+        status: 'active',
+        lifecycle: 'idle',
+        sbId: null,
+      } as never);
+
+      await post({
+        lifecycle: 'running',
+        event: 'prompt',
+        studioId: '5bea57f3-6b24-4126-abe4-0d1cc2bd9647',
+      });
+
+      const args = rpcCalls[0]![1] as Record<string, unknown>;
+      const regrant = args.p_regrant as Record<string, unknown>;
+      expect(regrant.workspaceId).toBeUndefined();
+      expect(regrant.sbId).toBeUndefined();
     });
 
     it('an UNRECOGNIZED claim verdict fails closed — never success without ownership (round 13)', async () => {

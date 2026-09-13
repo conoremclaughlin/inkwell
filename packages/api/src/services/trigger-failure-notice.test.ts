@@ -6,7 +6,7 @@ vi.mock('../utils/logger', () => ({
 }));
 
 interface MockOpts {
-  /** Row returned by the (user, threadKey) lookup; null = not found. */
+  /** Row returned by the (workspace, threadKey) lookup; null = not found. */
   threadLookup?: { id: string } | null;
   threadLookupError?: string;
   threadInsertError?: string;
@@ -88,10 +88,15 @@ describe('sendTriggerFailureNotice', () => {
     expect(client.threadInserts).toHaveLength(1);
     expect(client.threadInserts[0]).toMatchObject({
       thread_id: 't-1',
-      // 'system' attribution — a synthetic row bearing the failed agent's
-      // name would shadow their newest REAL message in the recipient-session
-      // lookup and misroute the next reply (Lumen, PR #487 review).
-      sender_agent_id: 'system',
+      // System attribution BY KIND (spec inkmail-thread-scope §3): the
+      // system borrows nobody's identity, so every sender id and the slug
+      // are null. A synthetic row bearing the failed agent's name would
+      // shadow their newest REAL message in the recipient-session lookup
+      // and misroute the next reply (Lumen, PR #487 review).
+      sender_kind: 'system',
+      sender_sb_id: null,
+      sender_user_id: null,
+      sender_agent_id: null,
       // 'notification' TYPE, not 'system' — system-type events are excluded
       // from delivery and candidacy, which would bury the notice.
       message_type: 'notification',
@@ -102,15 +107,30 @@ describe('sendTriggerFailureNotice', () => {
     expect(client.threadUpdates).toHaveLength(1);
   });
 
-  it('resolves the thread from (user, threadKey) when only the key is present', async () => {
+  it('resolves the thread from (workspace, threadKey) when the key and its workspace are present', async () => {
+    const client = createMockClient({ threadLookup: { id: 't-9' } });
+    const r = await sendTriggerFailureNotice(client, {
+      ...BASE,
+      threadKey: 'spec:artifact-graph-lifecycle',
+      workspaceId: 'ws-1',
+    });
+    expect(r).toEqual({ via: 'thread', ok: true });
+    expect(client.threadInserts[0]).toMatchObject({ thread_id: 't-9' });
+    expect(client.legacyInserts).toHaveLength(0);
+  });
+
+  it('a bare threadKey with no workspace never guesses among namesakes — legacy lane, key kept', async () => {
+    // Workspace-local keys repeat across workspaces on purpose (spec
+    // inkmail-thread-scope §1); a key alone names no single row.
     const client = createMockClient({ threadLookup: { id: 't-9' } });
     const r = await sendTriggerFailureNotice(client, {
       ...BASE,
       threadKey: 'spec:artifact-graph-lifecycle',
     });
-    expect(r).toEqual({ via: 'thread', ok: true });
-    expect(client.threadInserts[0]).toMatchObject({ thread_id: 't-9' });
-    expect(client.legacyInserts).toHaveLength(0);
+    expect(r).toEqual({ via: 'legacy', ok: true });
+    expect(client.from).not.toHaveBeenCalledWith('inbox_threads');
+    expect(client.threadInserts).toHaveLength(0);
+    expect(client.legacyInserts[0]).toMatchObject({ thread_key: 'spec:artifact-graph-lifecycle' });
   });
 
   it('threadless failure falls back to the legacy agent-scoped inbox', async () => {
@@ -128,7 +148,11 @@ describe('sendTriggerFailureNotice', () => {
 
   it('unresolvable threadKey (thread gone / lookup error) falls back to legacy WITH the key as metadata', async () => {
     const client = createMockClient({ threadLookupError: 'connection reset' });
-    const r = await sendTriggerFailureNotice(client, { ...BASE, threadKey: 'pr:404' });
+    const r = await sendTriggerFailureNotice(client, {
+      ...BASE,
+      threadKey: 'pr:404',
+      workspaceId: 'ws-1',
+    });
     expect(r).toEqual({ via: 'legacy', ok: true });
     expect(client.legacyInserts[0]).toMatchObject({ thread_key: 'pr:404' });
   });
@@ -138,6 +162,18 @@ describe('sendTriggerFailureNotice', () => {
     const r = await sendTriggerFailureNotice(client, { ...BASE, threadId: 't-1' });
     expect(r).toEqual({ via: 'legacy', ok: true });
     expect(client.legacyInserts).toHaveLength(1);
+  });
+
+  it('without an owner there is no legacy lane, whatever the caller said about it', async () => {
+    const client = createMockClient({ threadInsertError: 'permission denied' });
+    const r = await sendTriggerFailureNotice(client, {
+      ...BASE,
+      userId: undefined,
+      legacyLane: true,
+      threadId: 't-1',
+    });
+    expect(r).toEqual({ via: 'legacy', ok: false });
+    expect(client.legacyInserts).toHaveLength(0);
   });
 
   it('reports ok:false only when BOTH lanes fail', async () => {
