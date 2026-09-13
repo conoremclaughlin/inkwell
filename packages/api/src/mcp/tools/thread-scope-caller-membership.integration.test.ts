@@ -18,6 +18,7 @@ import { ensureEchoIntegrationFixture } from '../../test/integration-fixtures';
 import { handleCloseThread, handleGetThreadMessages } from './thread-handlers';
 import { handleSendToInbox } from './inbox-handlers';
 import router from '../../routes/admin';
+import { runWithRequestContext } from '../../utils/request-context';
 
 const RUN = Math.random().toString(36).slice(2, 8);
 const VIEWER_SB = `viewer-sb-${RUN}`;
@@ -186,18 +187,22 @@ describe("SB callers act with their owner's membership; carriers follow the work
         dataComposer
       )
     ).rejects.toThrow('Your role in this workspace (viewer) cannot send to a thread');
-    // Without a sender name the token's own user is writing; the write is
-    // theirs and their role gates it (Lumen, #624).
+    // Without a sender name the token's own user is writing, in the
+    // workspace the server resolved for the request; the write is theirs
+    // and their role gates it (Lumen, #624). Outside a request there is no
+    // resolved workspace, so the test supplies the one a header would.
     await expect(
-      handleSendToInbox(
-        {
-          userId: viewerUserId,
-          recipientAgentId: VIEWER_SB,
-          threadKey,
-          content: 'as system',
-          trigger: false,
-        },
-        dataComposer
+      runWithRequestContext({ userId: viewerUserId, workspaceId }, () =>
+        handleSendToInbox(
+          {
+            userId: viewerUserId,
+            recipientAgentId: VIEWER_SB,
+            threadKey,
+            content: 'as myself',
+            trigger: false,
+          },
+          dataComposer
+        )
       )
     ).rejects.toThrow('Your role in this workspace (viewer) cannot send to a thread');
     const { data: after } = await supabase
