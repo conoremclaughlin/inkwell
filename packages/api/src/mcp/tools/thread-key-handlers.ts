@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import type { DataComposer } from '../../data/composer';
 import { logger } from '../../utils/logger';
-import { resolveCallerWorkspace } from './caller-principal';
+import { assertWriteRole, resolveCallerWorkspace } from './caller-principal';
 import { userIdentifierBaseSchema, resolveUserOrThrow } from '../../services/user-resolver';
 import {
   ThreadKeyTypesRepository,
@@ -84,7 +84,8 @@ export async function handleSetThreadKeyType(args: unknown, dataComposer: DataCo
   const params = setThreadKeyTypeSchema.parse(args);
   const { user, resolvedBy } = await resolveUserOrThrow(params, dataComposer);
   const repo = new ThreadKeyTypesRepository(dataComposer.getClient());
-  const { workspaceId } = await resolveCallerWorkspace(dataComposer.getClient(), user.id);
+  const { workspaceId, role } = await resolveCallerWorkspace(dataComposer.getClient(), user.id);
+  assertWriteRole(role, 'change thread-key types');
 
   if (params.reset) {
     const removed = await repo.clearOverride(workspaceId, params.type);

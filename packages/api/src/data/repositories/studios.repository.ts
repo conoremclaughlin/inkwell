@@ -10,6 +10,7 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { Database, Json } from '../supabase/types';
 import { resolveIdentityId } from '../../auth/resolve-identity';
+import { resolveSbsByIds } from '../../services/principals';
 
 type StudiosTable = Database['public']['Tables']['studios'];
 
@@ -315,11 +316,15 @@ export class StudiosRepository {
   }
 
   /** Ephemeral studios created for a thread's overflow. Indexed on (user_id, thread_key). */
-  async listEphemeralByThread(userId: string, threadKey: string): Promise<Studio[]> {
+  /**
+   * Open ephemerals created for a thread key, every owner. The caller
+   * narrows them to one workspace with `inWorkspace` — a key repeats across
+   * workspaces on purpose (spec inkmail-thread-scope §1).
+   */
+  async listEphemeralByThread(threadKey: string): Promise<Studio[]> {
     const { data, error } = await this.client
       .from('studios')
       .select('*')
-      .eq('user_id', userId)
       .eq('ephemeral', true)
       .eq('thread_key', threadKey)
       .in('status', ['active', 'idle']);
@@ -329,6 +334,28 @@ export class StudiosRepository {
     }
 
     return (data || []).map((row) => this.mapRow(row as Record<string, unknown>));
+  }
+
+  /**
+   * The studios among these that belong to one workspace, attributed through
+   * each studio's identity. A legacy studio with no identity belongs to the
+   * workspace only if it is the given owner's — the pre-cutover rule, kept
+   * for rows the cutover could not attribute.
+   */
+  async inWorkspace(
+    studios: Studio[],
+    workspaceId: string,
+    legacyOwnerUserId?: string
+  ): Promise<Studio[]> {
+    const identityIds = [...new Set(studios.map((s) => s.sbId).filter(Boolean))] as string[];
+    const workspaceBySbId = new Map(
+      (await resolveSbsByIds(this.client, identityIds)).map((sb) => [sb.sbId, sb.workspaceId])
+    );
+    return studios.filter((s) =>
+      s.sbId
+        ? workspaceBySbId.get(s.sbId) === workspaceId
+        : !!legacyOwnerUserId && s.userId === legacyOwnerUserId
+    );
   }
 
   /** Ephemeral studios past their expires_at, still open. Sweep candidates. */

@@ -1335,9 +1335,13 @@ describe('StudioLeaseService release paths', () => {
     // row not terminal. Releasing now would clear the lease under it.
     tables.sessions[0].ended_at = null;
 
-    const byThread = await service.releaseByThread('user-1', 'pr:100', {
-      reason: 'thread-closed',
-    });
+    const byThread = await service.releaseByThread(
+      { workspaceId: 'ws-1', threadKey: 'pr:100' },
+      {
+        legacyOwnerUserId: 'user-1',
+        reason: 'thread-closed',
+      }
+    );
     // session-a (fresh, non-terminal) deferred; session-b (terminal) released.
     expect(byThread).toEqual({
       released: 1,
@@ -1357,7 +1361,10 @@ describe('StudioLeaseService release paths', () => {
   });
 
   it('releaseByThread clears every studio the thread holds', async () => {
-    const result = await service.releaseByThread('user-1', 'pr:100');
+    const result = await service.releaseByThread(
+      { workspaceId: 'ws-1', threadKey: 'pr:100' },
+      { legacyOwnerUserId: 'user-1' }
+    );
     expect(result).toEqual({
       released: 2,
       deferred: 0,
@@ -1377,7 +1384,13 @@ describe('StudioLeaseService release paths', () => {
       startedAt: Date.now(),
     });
 
-    const result = await service.releaseByThread('user-1', 'pr:100', { reason: 'thread-closed' });
+    const result = await service.releaseByThread(
+      { workspaceId: 'ws-1', threadKey: 'pr:100' },
+      {
+        legacyOwnerUserId: 'user-1',
+        reason: 'thread-closed',
+      }
+    );
     expect(result).toEqual({
       released: 1,
       deferred: 1,
@@ -2908,7 +2921,13 @@ describe('S2: the minimal close invariant (spec v18, Lumen r2)', () => {
     liveHolder();
     const service = new StudioLeaseService(makeFakeSupabase(tables));
 
-    const result = await service.releaseByThread('user-1', 'pr:A', { reason: 'thread-closed' });
+    const result = await service.releaseByThread(
+      { workspaceId: 'ws-1', threadKey: 'pr:A' },
+      {
+        legacyOwnerUserId: 'user-1',
+        reason: 'thread-closed',
+      }
+    );
     expect(result).toEqual({ released: 0, deferred: 0, removed: 1, studioIds: ['studio-1'] });
     // The lease, the holder, and the worktree all survive for pr:B.
     expect(storedLease()?.sessionId).toBe('session-b');
@@ -2926,7 +2945,13 @@ describe('S2: the minimal close invariant (spec v18, Lumen r2)', () => {
     liveHolder();
     const service = new StudioLeaseService(makeFakeSupabase(tables));
 
-    const result = await service.releaseByThread('user-1', 'pr:A', { reason: 'thread-closed' });
+    const result = await service.releaseByThread(
+      { workspaceId: 'ws-1', threadKey: 'pr:A' },
+      {
+        legacyOwnerUserId: 'user-1',
+        reason: 'thread-closed',
+      }
+    );
     expect(result).toEqual({ released: 0, deferred: 1, removed: 0, studioIds: ['studio-1'] });
     expect(storedLease()?.threadKeys).toEqual(['pr:A']);
     expect(storedLease()?.pendingRelease?.reason).toBe('thread-closed');
@@ -2940,7 +2965,13 @@ describe('S2: the minimal close invariant (spec v18, Lumen r2)', () => {
     }) as unknown as Row;
     const service = new StudioLeaseService(makeFakeSupabase(tables));
 
-    const result = await service.releaseByThread('user-1', 'pr:B', { reason: 'thread-closed' });
+    const result = await service.releaseByThread(
+      { workspaceId: 'ws-1', threadKey: 'pr:B' },
+      {
+        legacyOwnerUserId: 'user-1',
+        reason: 'thread-closed',
+      }
+    );
     expect(result).toEqual({ released: 1, deferred: 0, removed: 0, studioIds: ['studio-1'] });
     expect(storedLease()).toBeNull();
     expect(tables.studio_lease_events.map((e) => e.event)).toContain('released');
@@ -2954,7 +2985,13 @@ describe('S2: the minimal close invariant (spec v18, Lumen r2)', () => {
     }) as unknown as Row;
     const service = new StudioLeaseService(makeFakeSupabase(tables));
 
-    const result = await service.releaseByThread('user-1', 'pr:A', { reason: 'thread-closed' });
+    const result = await service.releaseByThread(
+      { workspaceId: 'ws-1', threadKey: 'pr:A' },
+      {
+        legacyOwnerUserId: 'user-1',
+        reason: 'thread-closed',
+      }
+    );
     expect(result).toEqual({ released: 0, deferred: 0, removed: 0, studioIds: [] });
     expect(storedLease()?.threadKeys).toEqual(['pr:B']);
   });
@@ -2978,7 +3015,13 @@ describe('S2: the minimal close invariant (spec v18, Lumen r2)', () => {
       })
     );
 
-    const result = await service.releaseByThread('user-1', 'pr:A', { reason: 'thread-closed' });
+    const result = await service.releaseByThread(
+      { workspaceId: 'ws-1', threadKey: 'pr:A' },
+      {
+        legacyOwnerUserId: 'user-1',
+        reason: 'thread-closed',
+      }
+    );
     // Our stale remove (write ['pr:B']) must LOSE: pr:B was already closed and
     // must stay closed. The re-read finds pr:A is now the last key, and the
     // live holder defers it — the honest outcome for that state.
@@ -3014,7 +3057,13 @@ describe('S2: the minimal close invariant (spec v18, Lumen r2)', () => {
       })
     );
 
-    const result = await service.releaseByThread('user-1', 'pr:A', { reason: 'thread-closed' });
+    const result = await service.releaseByThread(
+      { workspaceId: 'ws-1', threadKey: 'pr:A' },
+      {
+        legacyOwnerUserId: 'user-1',
+        reason: 'thread-closed',
+      }
+    );
     expect(result).toEqual({ released: 0, deferred: 0, removed: 1, studioIds: ['studio-1'] });
     expect(storedLease()?.threadKeys).toEqual(['pr:B']);
     // The whole lease was NOT marked for release — B lives on undisturbed.
@@ -3045,7 +3094,13 @@ describe('S2: the minimal close invariant (spec v18, Lumen r2)', () => {
       })
     );
 
-    const result = await service.releaseByThread('user-1', 'pr:A', { reason: 'thread-closed' });
+    const result = await service.releaseByThread(
+      { workspaceId: 'ws-1', threadKey: 'pr:A' },
+      {
+        legacyOwnerUserId: 'user-1',
+        reason: 'thread-closed',
+      }
+    );
     expect(result).toEqual({ released: 0, deferred: 0, removed: 1, studioIds: ['studio-1'] });
     expect(storedLease()?.sessionId).toBe('session-b'); // lease survives for B
     expect(storedLease()?.threadKeys).toEqual(['pr:B']); // A is gone, not stranded
@@ -3067,7 +3122,13 @@ describe('S2: the minimal close invariant (spec v18, Lumen r2)', () => {
     liveHolder();
     const service = new StudioLeaseService(makeFakeSupabase(tables));
 
-    const closed = await service.releaseByThread('user-1', 'pr:A', { reason: 'thread-closed' });
+    const closed = await service.releaseByThread(
+      { workspaceId: 'ws-1', threadKey: 'pr:A' },
+      {
+        legacyOwnerUserId: 'user-1',
+        reason: 'thread-closed',
+      }
+    );
     expect(closed.deferred).toBe(1);
     expect(storedLease()?.pendingRelease?.threadKey).toBe('pr:A');
 
@@ -3398,5 +3459,93 @@ describe('R9: lease turn-generation fence (PR #563 round 9)', () => {
       })
     ).toBe(true);
     expect(storedLease()).toBeNull();
+  });
+});
+
+describe("releaseByThread follows the thread's workspace (spec §1; Lumen, #621 P1)", () => {
+  let tables: Record<string, Row[]>;
+
+  beforeEach(() => {
+    resetActiveRuns();
+    tables = baseTables();
+    tables.agent_identities = [
+      { id: 'sb-u1-ws1', agent_id: 'wren', user_id: 'user-1', workspace_id: 'ws-1' },
+      { id: 'sb-u1-ws2', agent_id: 'wren', user_id: 'user-1', workspace_id: 'ws-2' },
+      { id: 'sb-u2-ws1', agent_id: 'lumen', user_id: 'user-2', workspace_id: 'ws-1' },
+    ];
+    tables.sessions = [
+      { id: 'session-a', user_id: 'user-1', ended_at: new Date().toISOString() },
+      { id: 'session-b', user_id: 'user-1', ended_at: new Date().toISOString() },
+      { id: 'session-c', user_id: 'user-2', ended_at: new Date().toISOString() },
+    ];
+    tables.studios = [
+      // The closing owner's lease on THIS thread.
+      {
+        id: 'mine-here',
+        user_id: 'user-1',
+        sb_id: 'sb-u1-ws1',
+        status: 'active',
+        lease: freshLease({ sessionId: 'session-a', threadKey: 'pr:7', sbId: 'sb-u1-ws1' }),
+        worktree_path: null,
+      },
+      // The same owner's lease on a same-key thread in ANOTHER workspace.
+      {
+        id: 'mine-elsewhere',
+        user_id: 'user-1',
+        sb_id: 'sb-u1-ws2',
+        status: 'active',
+        lease: freshLease({ sessionId: 'session-b', threadKey: 'pr:7', sbId: 'sb-u1-ws2' }),
+        worktree_path: null,
+      },
+      // Another owner's lease on THIS thread.
+      {
+        id: 'theirs-here',
+        user_id: 'user-2',
+        sb_id: 'sb-u2-ws1',
+        status: 'active',
+        lease: freshLease({ sessionId: 'session-c', threadKey: 'pr:7', sbId: 'sb-u2-ws1' }),
+        worktree_path: null,
+      },
+    ];
+  });
+
+  afterEach(() => resetActiveRuns());
+
+  it("releases every owner's lease on the thread and leaves the same owner's namesake elsewhere", async () => {
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+    const result = await service.releaseByThread(
+      { workspaceId: 'ws-1', threadKey: 'pr:7' },
+      { reason: 'thread-closed', legacyOwnerUserId: 'user-1' }
+    );
+    expect(result.studioIds.sort()).toEqual(['mine-here', 'theirs-here']);
+    expect(result.released).toBe(2);
+    expect(tables.studios.find((s) => s.id === 'mine-here')?.lease).toBeNull();
+    expect(tables.studios.find((s) => s.id === 'theirs-here')?.lease).toBeNull();
+    expect(tables.studios.find((s) => s.id === 'mine-elsewhere')?.lease).not.toBeNull();
+  });
+
+  it('a legacy lease with no identity is matched by owner, as before — and only by the closing owner', async () => {
+    tables.studios.push({
+      id: 'legacy-mine',
+      user_id: 'user-1',
+      sb_id: null,
+      status: 'active',
+      lease: freshLease({ sessionId: 'session-a', threadKey: 'pr:7' }),
+      worktree_path: null,
+    });
+    tables.studios.push({
+      id: 'legacy-theirs',
+      user_id: 'user-2',
+      sb_id: null,
+      status: 'active',
+      lease: freshLease({ sessionId: 'session-c', threadKey: 'pr:7' }),
+      worktree_path: null,
+    });
+    const service = new StudioLeaseService(makeFakeSupabase(tables));
+    const result = await service.releaseByThread(
+      { workspaceId: 'ws-1', threadKey: 'pr:7' },
+      { reason: 'thread-closed', legacyOwnerUserId: 'user-1' }
+    );
+    expect(result.studioIds.sort()).toEqual(['legacy-mine', 'mine-here', 'theirs-here']);
   });
 });

@@ -28,7 +28,7 @@ import {
   type SbPrincipal,
   type UserPrincipal,
 } from '../../services/principals';
-import { resolveCallerSb, resolveCallerWorkspace } from './caller-principal';
+import { assertWriteRole, resolveCallerSb, resolveCallerWorkspace } from './caller-principal';
 import { StudioLeaseService } from '../../services/studio-lease.service.js';
 import { StudioOverflowService } from '../../services/studio-overflow.service.js';
 
@@ -817,11 +817,12 @@ export async function handleAddThreadParticipant(args: unknown, dataComposer: Da
 
   // The thread lives in the caller's workspace; the newcomer must resolve
   // there too — a foreign SB cannot be placed in this thread (§6).
-  const { workspaceId, sb: actor } = await resolveCallerWorkspace(
-    supabase,
-    resolved.user.id,
-    addedByAgentId
-  );
+  const {
+    workspaceId,
+    sb: actor,
+    role,
+  } = await resolveCallerWorkspace(supabase, resolved.user.id, addedByAgentId);
+  assertWriteRole(role, 'add a participant');
   const thread = await findThread(supabase, workspaceId, threadKey);
   if (!thread) {
     return {
@@ -934,6 +935,7 @@ export async function handleCloseThread(args: unknown, dataComposer: DataCompose
   const { threadKey } = parsed;
 
   const caller = await resolveCallerSb(supabase, resolved.user.id, agentId);
+  assertWriteRole(caller.ownerRole, 'close a thread');
   const thread = await findThread(supabase, caller.workspaceId, threadKey);
   if (!thread) {
     return {
@@ -1010,16 +1012,18 @@ export async function handleCloseThread(args: unknown, dataComposer: DataCompose
   // and skips anything still held.
   try {
     const leases = new StudioLeaseService(supabase);
-    const { released, deferred, removed, studioIds } = await leases.releaseByThread(
-      resolved.user.id,
-      threadKey,
-      {
-        reason: 'thread-closed',
-      }
-    );
+    // The thread is a workspace row (§1): the leases and ephemerals it
+    // releases are the ones riding THIS thread — any owner in the workspace,
+    // and never a same-key thread of the same owner elsewhere (Lumen, #621).
+    const scope = { workspaceId: thread.workspace_id, threadKey };
+    const { released, deferred, removed, studioIds } = await leases.releaseByThread(scope, {
+      reason: 'thread-closed',
+      legacyOwnerUserId: resolved.user.id,
+    });
     const overflow = new StudioOverflowService(dataComposer.repositories.studios, leases);
-    const cleaned = await overflow.teardownEphemeralStudiosForThread(resolved.user.id, threadKey, {
+    const cleaned = await overflow.teardownEphemeralStudiosForThread(scope, {
       reason: `thread ${threadKey} closed`,
+      legacyOwnerUserId: resolved.user.id,
       // The studios this thread's lease actually rode — created-for discovery
       // alone misses an ephemeral whose final surviving thread was not the
       // one it was built for (v18 S2).
@@ -1128,6 +1132,7 @@ export async function handleReopenThread(args: unknown, dataComposer: DataCompos
   });
 
   const caller = await resolveCallerSb(supabase, resolved.user.id, agentId);
+  assertWriteRole(caller.ownerRole, 'reopen a thread');
   const thread = await findThread(supabase, caller.workspaceId, threadKey);
   if (!thread) {
     return reply({ success: false, error: `Thread not found: ${threadKey}` });

@@ -44,14 +44,21 @@ vi.mock('../../auth/resolve-identity', () => ({
 // mocked here so these tests stay about the handler.
 const WORKSPACE_ID = 'ws-1';
 vi.mock('./caller-principal', () => ({
+  assertWriteRole: (role: string, action: string) => {
+    if (role === 'viewer')
+      throw new Error(`Your role in this workspace (${role}) cannot ${action}`);
+  },
   resolveCallerSb: vi.fn().mockResolvedValue({
     kind: 'sb',
     sbId: 'sb-wren',
     agentId: 'wren',
     userId: '11111111-1111-1111-1111-111111111111',
     workspaceId: 'ws-1',
+    ownerRole: 'member',
   }),
-  resolveCallerWorkspace: vi.fn().mockResolvedValue({ workspaceId: 'ws-1', sb: null }),
+  resolveCallerWorkspace: vi
+    .fn()
+    .mockResolvedValue({ workspaceId: 'ws-1', sb: null, role: 'owner' }),
 }));
 
 // findThread decides new-vs-existing, which is exactly the branch under test.

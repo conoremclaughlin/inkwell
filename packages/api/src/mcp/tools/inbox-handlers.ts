@@ -21,7 +21,7 @@ import {
   type SystemPrincipal,
   type UserPrincipal,
 } from '../../services/principals';
-import { resolveCallerSb } from './caller-principal';
+import { assertWriteRole, resolveCallerSb } from './caller-principal';
 import { advanceThreadReadPointer, advanceAgentInboxReadPointer } from './read-state.js';
 import { getEffectiveAgentId } from '../../auth/enforce-identity';
 import { logger } from '../../utils/logger';
@@ -527,6 +527,8 @@ export async function handleSendToInbox(
     let workspaceId: string;
     if (senderAgentId && senderAgentId !== 'system') {
       const sb = await resolveCallerSb(supabase, resolved.user.id, senderAgentId);
+      // An SB writes with its owner's role (§1): a viewer's SB reads only.
+      assertWriteRole(sb.ownerRole, 'send to a thread');
       sender = sb;
       workspaceId = sb.workspaceId;
     } else if (internal?.sender) {

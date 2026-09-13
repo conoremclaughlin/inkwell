@@ -18,8 +18,14 @@ vi.mock('../../utils/logger', () => ({
 // The registry is workspace-scoped (spec inkmail-thread-scope §1b): the
 // tools resolve the caller's workspace at the boundary. Mocked here so these
 // tests stay about the handlers; the resolver has its own tests.
-const resolveCallerWorkspace = vi.fn().mockResolvedValue({ workspaceId: 'ws-1', sb: null });
+const resolveCallerWorkspace = vi
+  .fn()
+  .mockResolvedValue({ workspaceId: 'ws-1', sb: null, role: 'owner' });
 vi.mock('./caller-principal', () => ({
+  assertWriteRole: (role: string, action: string) => {
+    if (role === 'viewer')
+      throw new Error(`Your role in this workspace (${role}) cannot ${action}`);
+  },
   resolveCallerWorkspace: (...args: unknown[]) => resolveCallerWorkspace(...args),
 }));
 

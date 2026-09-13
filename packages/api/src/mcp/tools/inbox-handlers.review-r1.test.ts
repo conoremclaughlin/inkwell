@@ -171,6 +171,7 @@ describe('send boundary (Lumen, #618 round 1)', () => {
         },
       ],
       inbox_thread_messages: [],
+      workspace_members: [{ workspace_id: 'ws-a', user_id: 'user-a', role: 'member' }],
     });
     await handleAddThreadParticipant(
       { threadKey: 'pr:618', addedByAgentId: 'wren', agentId: 'lumen' },
@@ -180,5 +181,23 @@ describe('send boundary (Lumen, #618 round 1)', () => {
     expect(payloads.map((p) => [p.fromAgentId, p.fromSbId, p.toSbId])).toEqual([
       ['wren', 'sb-a', 'sb-b'],
     ]);
+  });
+
+  it("a viewer's SB is refused at send, and at add_thread_participant, before any row is written", async () => {
+    const db = client();
+    await db.from('workspace_members').update({ role: 'viewer' }).eq('user_id', 'user-a');
+    await expect(
+      handleSendToInbox(
+        { senderAgentId: 'wren', recipientAgentId: 'lumen', threadKey: 'pr:618', content: 'hi' },
+        { getClient: () => db } as never
+      )
+    ).rejects.toThrow('Your role in this workspace (viewer) cannot send to a thread');
+    await expect(
+      handleAddThreadParticipant({ threadKey: 'pr:618', addedByAgentId: 'wren', agentId: 'myra' }, {
+        getClient: () => db,
+      } as never)
+    ).rejects.toThrow('Your role in this workspace (viewer) cannot add a participant');
+    expect((await db.from('inbox_thread_messages').select('*')).data).toHaveLength(0);
+    expect(getAgentGateway().dispatchTrigger).not.toHaveBeenCalled();
   });
 });
