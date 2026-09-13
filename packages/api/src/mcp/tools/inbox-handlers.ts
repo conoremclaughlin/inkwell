@@ -13,6 +13,7 @@ import { resolveIdentityId, resolveAgentSlug } from '../../auth/resolve-identity
 import {
   personalWorkspaceOf,
   principalColumns,
+  resolveSbOwnedBy,
   resolveSbsByIds,
   resolveSbsInWorkspace,
   senderColumns,
@@ -427,8 +428,12 @@ export async function handleSendToInbox(
   }
 
   // Resolve sender identity: pinned/explicit → request context sbId → context agentId → unknown
-  let senderAgentId = getEffectiveAgentId(parsed.senderAgentId);
-  if (!senderAgentId) {
+  // A server-internal sender is the principal, full stop: the ambient
+  // request's bound identity is whoever happened to be running the tool
+  // (strategy advancement runs inside complete_task / update_task), and
+  // must not be inferred as the sender (Lumen, #624).
+  let senderAgentId = internal?.sender ? undefined : getEffectiveAgentId(parsed.senderAgentId);
+  if (!senderAgentId && !internal?.sender) {
     const reqCtx = getRequestContext() || getSessionContext();
     if (reqCtx?.sbId) {
       senderAgentId =
@@ -539,17 +544,21 @@ export async function handleSendToInbox(
     // send (§1c: routing fails closed on an unresolvable principal).
     let sender: Principal;
     let workspaceId: string;
-    if (senderAgentId && senderAgentId !== 'system') {
+    if (internal?.sender) {
+      // Trusted server-side sender, checked before any inferred identity.
+      // With no workspace given, the message lands in the first recipient's
+      // — resolved from the table by owner and slug, never through the
+      // ambient request's pin.
+      sender = internal.sender.principal;
+      workspaceId =
+        internal.sender.workspaceId ??
+        (await resolveSbOwnedBy(supabase, resolved.user.id, allRecipients[0])).workspaceId;
+    } else if (senderAgentId && senderAgentId !== 'system') {
       const sb = await resolveCallerSb(supabase, resolved.user.id, senderAgentId);
       // An SB writes with its owner's role (§1): a viewer's SB reads only.
       assertWriteRole(sb.ownerRole, 'send to a thread');
       sender = sb;
       workspaceId = sb.workspaceId;
-    } else if (internal?.sender) {
-      sender = internal.sender.principal;
-      workspaceId =
-        internal.sender.workspaceId ??
-        (await resolveCallerSb(supabase, resolved.user.id, allRecipients[0])).workspaceId;
     } else {
       // No sender named and no server-internal context: an external token
       // is calling — the bound SB if there is one, else the person

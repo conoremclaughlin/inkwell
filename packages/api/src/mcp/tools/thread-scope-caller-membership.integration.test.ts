@@ -14,9 +14,10 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { randomUUID } from 'crypto';
 import type { Request, Response } from 'express';
 import { getDataComposer } from '../../data/composer';
-import { ensureEchoIntegrationFixture } from '../../test/integration-fixtures';
+import { ensureEchoIntegrationFixture, ensureSuiteIdentity } from '../../test/integration-fixtures';
 import { handleCloseThread, handleGetThreadMessages } from './thread-handlers';
 import { handleSendToInbox } from './inbox-handlers';
+import { SYSTEM_PRINCIPAL } from '../../services/principals';
 import router from '../../routes/admin';
 import { runWithRequestContext } from '../../utils/request-context';
 
@@ -237,6 +238,49 @@ describe("SB callers act with their owner's membership; carriers follow the work
     const onKey = spine!.sessions.map((sess) => sess.id);
     expect(onKey).toContain(sessionIds[0]);
     expect(onKey).not.toContain(sessionIds[1]);
+  });
+
+  it("the server's own send inside an ambient SB request is the system's, not the caller's (#624)", async () => {
+    // A second SB of the owner's, the notice's recipient; echo's token is ambient.
+    const dispatcherSbId = await ensureSuiteIdentity(
+      dataComposer,
+      { userId: ownerUserId, email: '', workspaceId, echoSbId },
+      `dispatcher-${RUN}`
+    );
+    try {
+      await runWithRequestContext(
+        {
+          userId: ownerUserId,
+          workspaceId,
+          sbId: echoSbId,
+          agentId: 'echo',
+          agentTokenBound: true,
+        },
+        () =>
+          handleSendToInbox(
+            {
+              userId: ownerUserId,
+              recipientAgentId: `dispatcher-${RUN}`,
+              threadKey,
+              content: 'strategy notice',
+              trigger: false,
+            },
+            dataComposer,
+            { sender: { principal: SYSTEM_PRINCIPAL, workspaceId: null } }
+          )
+      );
+      const { data: rows } = await supabase
+        .from('inbox_thread_messages')
+        .select('sender_kind, sender_sb_id, content')
+        .eq('thread_id', threadId)
+        .eq('content', 'strategy notice');
+      expect(rows).toEqual([
+        { sender_kind: 'system', sender_sb_id: null, content: 'strategy notice' },
+      ]);
+    } finally {
+      await supabase.from('inbox_thread_participants').delete().eq('sb_id', dispatcherSbId);
+      await supabase.from('agent_identities').delete().eq('id', dispatcherSbId);
+    }
   });
 
   it("an SB whose owner's membership ended reads nothing", async () => {

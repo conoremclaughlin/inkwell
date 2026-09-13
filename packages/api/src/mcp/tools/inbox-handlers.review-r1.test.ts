@@ -8,7 +8,7 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { makeFakeSupabase } from '../../services/sessions/fake-supabase';
-import { userPrincipal } from '../../services/principals';
+import { SYSTEM_PRINCIPAL, userPrincipal } from '../../services/principals';
 import { handleSendToInbox } from './inbox-handlers';
 import { handleAddThreadParticipant } from './thread-handlers';
 import { getAgentGateway } from '../../channels/agent-gateway';
@@ -252,5 +252,37 @@ describe('send boundary (Lumen, #618 round 1)', () => {
         { getClient: () => client() } as never
       )
     ).rejects.toThrow('System authorship is reserved for the server');
+  });
+
+  it("the server's own send inside an ambient SB request is the SYSTEM's, and its recipient is not read through the caller's pin (#624)", async () => {
+    // Strategy advancement runs inside complete_task/update_task: wren's
+    // bound token is ambient, and the ownerless notice goes to echo, an SB
+    // wren's owner also owns. The message must be the system's, not wren's,
+    // and resolving echo must not trip over the pin on wren.
+    const requestContext = await import('../../utils/request-context');
+    vi.mocked(requestContext.getRequestContext).mockReturnValue({
+      userId: 'user-a',
+      sessionId: 'session-a',
+      sbId: 'sb-a',
+      agentId: 'wren',
+      agentTokenBound: true,
+    } as never);
+    vi.mocked(requestContext.getPinnedAgentId).mockReturnValue('wren');
+    const db = client();
+    await db
+      .from('agent_identities')
+      .insert({ id: 'sb-e', agent_id: 'echo', user_id: 'user-a', workspace_id: 'ws-a' });
+    await handleSendToInbox(
+      { recipientAgentId: 'echo', threadKey: 'pr:618', content: 'strategy notice', trigger: false },
+      { getClient: () => db } as never,
+      { sender: { principal: SYSTEM_PRINCIPAL, workspaceId: null } }
+    );
+    const rows = (await db.from('inbox_thread_messages').select('*')).data;
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      sender_kind: 'system',
+      sender_sb_id: null,
+      sender_user_id: null,
+    });
   });
 });
