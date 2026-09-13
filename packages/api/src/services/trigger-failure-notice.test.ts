@@ -164,6 +164,18 @@ describe('sendTriggerFailureNotice', () => {
     expect(client.legacyInserts).toHaveLength(1);
   });
 
+  it('without an owner there is no legacy lane, whatever the caller said about it', async () => {
+    const client = createMockClient({ threadInsertError: 'permission denied' });
+    const r = await sendTriggerFailureNotice(client, {
+      ...BASE,
+      userId: undefined,
+      legacyLane: true,
+      threadId: 't-1',
+    });
+    expect(r).toEqual({ via: 'legacy', ok: false });
+    expect(client.legacyInserts).toHaveLength(0);
+  });
+
   it('reports ok:false only when BOTH lanes fail', async () => {
     const client = createMockClient({
       threadInsertError: 'permission denied',
