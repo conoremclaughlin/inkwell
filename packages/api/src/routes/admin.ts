@@ -1174,14 +1174,19 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
       });
     };
 
+    // The role is the membership row's, read once here and carried on the
+    // request; every write guard downstream decides on it. A direct member
+    // used to be stamped 'member' regardless of the row, which let a viewer
+    // write and stopped an owner recovering a thread (Lumen, #619).
     let activeWorkspaceId = '';
     let activeWorkspaceRole: WorkspaceMemberRole | 'trusted' = 'trusted';
     let hasDirectMembership = false;
 
     if (requestedWorkspaceId) {
-      const requestedWorkspace = await workspaceRepo.findById(requestedWorkspaceId, pcpUserId!);
-      if (requestedWorkspace) {
-        activeWorkspaceId = requestedWorkspace.id;
+      const direct = await workspaceRepo.findByIdWithRole(requestedWorkspaceId, pcpUserId!);
+      if (direct) {
+        activeWorkspaceId = direct.workspace.id;
+        activeWorkspaceRole = direct.role;
         hasDirectMembership = true;
       } else {
         const requestedWorkspaceExists = await workspaceRepo.findRawById(requestedWorkspaceId);
@@ -1201,7 +1206,16 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
       }
     } else {
       const personalWorkspace = await workspaceRepo.ensurePersonalWorkspace(pcpUserId!);
+      // Provisioned with an 'owner' row (repository and DB trigger alike), but
+      // the row is what says so; a personal workspace with no membership row
+      // is refused rather than assumed.
+      const personalRole = await workspaceRepo.getMemberRole(personalWorkspace.id, pcpUserId!);
+      if (!personalRole) {
+        res.status(403).json({ error: 'Insufficient permissions' });
+        return;
+      }
       activeWorkspaceId = personalWorkspace.id;
+      activeWorkspaceRole = personalRole;
       hasDirectMembership = true;
     }
 
@@ -1211,10 +1225,6 @@ async function adminAuthMiddleware(req: Request, res: Response, next: NextFuncti
         res.status(403).json({ error: 'Insufficient permissions' });
         return;
       }
-    }
-
-    if (hasDirectMembership) {
-      activeWorkspaceRole = 'member';
     }
 
     // --- Issue cookies (Tier 3 success) ---
