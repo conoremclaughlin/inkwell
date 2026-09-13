@@ -40,13 +40,48 @@ hook="${HOOK_UNDER_TEST:-$root/.husky/commit-msg}"
 # wiring tier would be reporting on something it did not build. A global
 # core.hooksPath or init.templateDir does the same thing to the hook itself,
 # supplying a different hook than the one under test.
-unset GIT_DIR GIT_INDEX_FILE GIT_WORK_TREE GIT_OBJECT_DIRECTORY \
-  GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_NAMESPACE GIT_PREFIX \
-  GIT_CONFIG GIT_CEILING_DIRECTORIES GIT_TEMPLATE_DIR GIT_INDEX_VERSION 2>/dev/null
-GIT_CONFIG_GLOBAL=/dev/null
-GIT_CONFIG_SYSTEM=/dev/null
-GIT_CONFIG_NOSYSTEM=1
-export GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_CONFIG_NOSYSTEM
+#
+# A function rather than a straight-line block, so the sentinel regressions in
+# tier 2 can poison the environment deliberately and call the REAL isolation on
+# it. An isolation step that only ever runs on an already-clean environment is
+# untestable, and untestable is how the GIT_CONFIG_COUNT hole below survived a
+# round of review: the first version of this block cleaned what it had been
+# burned by and nothing checked what it had missed.
+git_isolate() {
+  unset GIT_DIR GIT_INDEX_FILE GIT_WORK_TREE GIT_OBJECT_DIRECTORY \
+    GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_NAMESPACE GIT_PREFIX \
+    GIT_CONFIG GIT_CEILING_DIRECTORIES GIT_TEMPLATE_DIR GIT_INDEX_VERSION 2>/dev/null
+
+  # Command-scope config, which is a separate mechanism from the files above and
+  # outranks every one of them — including the repo-local core.hooksPath each
+  # fixture sets for itself. Git reads it in two forms and honouring either is
+  # enough to hand the suite a hook that is not the one under test:
+  #
+  #   GIT_CONFIG_COUNT with GIT_CONFIG_KEY_<n> / GIT_CONFIG_VALUE_<n>
+  #   GIT_CONFIG_PARAMETERS — git's own transport for `-c`, also read on input
+  #
+  # In a real environment that substituted hook is a real external program, run
+  # by a suite whose entire purpose is to check which hook runs.
+  isolate_count=${GIT_CONFIG_COUNT:-0}
+  case "$isolate_count" in '' | *[!0-9]*) isolate_count=0 ;; esac
+  # Clear the inherited entries and a fixed floor beyond them: the keys outlive
+  # the count, so a later GIT_CONFIG_COUNT set by anything else would pick up
+  # whatever indices were left behind.
+  [ "$isolate_count" -lt 32 ] && isolate_count=32
+  isolate_i=0
+  while [ "$isolate_i" -lt "$isolate_count" ]; do
+    unset "GIT_CONFIG_KEY_$isolate_i" "GIT_CONFIG_VALUE_$isolate_i" 2>/dev/null
+    isolate_i=$((isolate_i + 1))
+  done
+  unset GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS 2>/dev/null
+
+  GIT_CONFIG_GLOBAL=/dev/null
+  GIT_CONFIG_SYSTEM=/dev/null
+  GIT_CONFIG_NOSYSTEM=1
+  export GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_CONFIG_NOSYSTEM
+}
+
+git_isolate
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/check-commit-msg-test.XXXXXX") || exit 1
 trap 'rm -rf "$work"' EXIT INT TERM
@@ -403,6 +438,121 @@ for arm in "1:named-variable" "2:vendor-shape" "3:dump-count"; do
   fi
 done
 
+# --- report formatting must not be able to clear a detection ----------------
+#
+# The arms above fault DETECTION. This block faults REPORTING, which is the same
+# fail-open shape one layer up and much easier to miss, because the sed and cut
+# calls that build the report look cosmetic. They were not: the refusal used to
+# be driven by the formatted `hits` string, so faulting any single formatting
+# stage emptied the report, and an empty report read as "nothing found" — a
+# detected credential exited 0.
+#
+# Each stage is faulted on its own, via the same delegating-stub technique, so a
+# guard restored for one stage and not another is still caught. The assertions
+# are: still blocked, still says why, and — the property that makes the fallback
+# safe — the synthetic value does NOT appear, because the fallback is a generic
+# diagnostic rather than the raw matches.
+#
+# Stage call order. Named fixture: sed 1 strips values, sed 2 trims the boundary
+# byte. Vendor fixture: the named arm finds nothing and runs no sed, so cut 1
+# takes the line number and sed 1 labels it.
+
+# fault_tool <tool> <nth-call> <fixture> — stdout+stderr of the guard, exit in $?
+fault_tool() {
+  tool=$1
+  n=$2
+  file=$3
+  real=$(command -v "$tool")
+  bindir="$work/faulttool-$tool-$n"
+  mkdir -p "$bindir"
+  rm -f "$bindir/count"
+  cat > "$bindir/$tool" <<EOF
+#!/bin/sh
+c=\$(cat "$bindir/count" 2>/dev/null || echo 0)
+c=\$((c + 1))
+echo "\$c" > "$bindir/count"
+[ "\$c" -eq $n ] && exit 2
+exec "$real" "\$@"
+EOF
+  chmod +x "$bindir/$tool"
+  PATH="$bindir:$PATH" sh "$guard" "$file" 2>&1
+}
+
+named_fixture=$(write_msg format-fault-named <<EOF
+fix: something ordinary
+
+SUPABASE_SECRET_KEY=CANARYVALUE9182
+EOF
+)
+vendor_fixture=$(printf 'fix: an ordinary subject line\n\nPasted: ghp_%s\n' "$F36" \
+  | write_msg format-fault-vendor)
+
+# Transparency controls. A stub that silently broke everything would make every
+# case below "blocked" for the wrong reason, which is the exact failure mode this
+# suite keeps rediscovering. Fault a call number the guard never reaches and
+# require the ordinary result.
+for probe in "sed:named:$named_fixture" "cut:vendor:$vendor_fixture"; do
+  tool=${probe%%:*}
+  rest=${probe#*:}
+  what=${rest%%:*}
+  fixture=${rest#*:}
+  out=$(fault_tool "$tool" 99 "$fixture")
+  rc=$?
+  if [ "$rc" -eq 1 ] && echo "$out" | grep -q '^   line '; then
+    ok "$tool stub is transparent when not faulting ($what)"
+  else
+    bad "$tool stub is transparent when not faulting ($what)" \
+      "exit $rc: $(echo "$out" | tr '\n' ' ' | cut -c1-160)"
+  fi
+done
+
+for stage in \
+  "sed:1:$named_fixture:CANARYVALUE9182:named-report value strip" \
+  "sed:2:$named_fixture:CANARYVALUE9182:named-report boundary trim" \
+  "cut:1:$vendor_fixture:ghp_$F36:vendor-report line number" \
+  "sed:1:$vendor_fixture:ghp_$F36:vendor-report label" \
+; do
+  tool=$(printf '%s' "$stage" | cut -d: -f1)
+  n=$(printf '%s' "$stage" | cut -d: -f2)
+  fixture=$(printf '%s' "$stage" | cut -d: -f3)
+  secret=$(printf '%s' "$stage" | cut -d: -f4)
+  what=$(printf '%s' "$stage" | cut -d: -f5)
+
+  out=$(fault_tool "$tool" "$n" "$fixture")
+  rc=$?
+
+  if [ "$rc" -eq 1 ]; then
+    ok "$what failure still blocks"
+  else
+    bad "$what failure still blocks" "exit $rc — a formatting fault cleared a real detection"
+  fi
+
+  if echo "$out" | grep -qF "$secret"; then
+    bad "$what failure withholds the value" "the synthetic value appeared in the fallback output"
+  else
+    ok "$what failure withholds the value"
+  fi
+
+  # Checking for the synthetic value alone is too weak for the NAMED stages, and
+  # mutation is what showed it: a fallback that prints the raw matches leaks
+  # nothing there, because the named pattern ends at the `=` and its raw output is
+  # already value-free. That property belongs to the regex, not to the fallback,
+  # so the check above passes for a reason it is not testing. The shape is the
+  # thing to assert — a value-free refusal carries no `=` anywhere — and it goes
+  # red for all four stages the moment raw matches are forwarded.
+  if echo "$out" | grep -q '='; then
+    bad "$what failure forwards no raw match" "an assignment-shaped byte reached the output"
+  else
+    ok "$what failure forwards no raw match"
+  fi
+
+  if echo "$out" | grep -q "could not be formatted"; then
+    ok "$what failure says the report was withheld"
+  else
+    bad "$what failure says the report was withheld" "$(echo "$out" | tr '\n' ' ' | cut -c1-160)"
+  fi
+done
+
 # ---------------------------------------------------------------------------
 # Tier 2: the wiring
 # ---------------------------------------------------------------------------
@@ -622,6 +772,128 @@ if [ "$rc" -eq 2 ]; then
 else
   bad "hook invoked directly with a broken provider exits 2" "got $rc"
 fi
+
+# --- the environment this suite refuses to inherit --------------------------
+#
+# Everything above assumes the fixtures' own git config is the config git uses.
+# Three inherited inputs break that assumption, and each has a sentinel here
+# because git_isolate is otherwise a block of unsets that nothing exercises.
+#
+# Each case is a CONTROL and then the regression. The control poisons the
+# environment and shows the injection really does take effect — without it,
+# "the sentinel was not touched" is equally the result of a misspelled variable
+# name, and the regression would pass while testing nothing. That is the shape of
+# false comfort this suite has been caught by before, so the control runs first
+# and its absence would be the bug.
+
+sentinel_hooks="$work/inherited-hooks"
+mkdir -p "$sentinel_hooks"
+sentinel_flag="$work/inherited-hook-fired"
+cat > "$sentinel_hooks/commit-msg" <<EOF
+#!/bin/sh
+echo fired > "$sentinel_flag"
+exit 0
+EOF
+chmod +x "$sentinel_hooks/commit-msg"
+
+# sentinel_commit <name> — a fresh provider/repo pair whose own core.hooksPath is
+# the real hook, then one attempt at the poisoned message; git's output on stdout.
+# The flag file is the evidence: it exists only if some OTHER hook ran instead.
+sentinel_commit() {
+  new_provider "$work/$1-provider" || return 1
+  new_repo "$work/$1" "$work/$1-provider/.husky" || return 1
+  rm -f "$sentinel_flag"
+  git -C "$work/$1" commit -F "$work/poisoned.txt" 2>&1
+}
+
+# sentinel_control <label> — the injection must beat the repo-local hooksPath.
+sentinel_control() {
+  if [ -f "$sentinel_flag" ]; then
+    ok "$1: control — injected hooksPath really does take effect"
+  else
+    bad "$1: control — injected hooksPath really does take effect" \
+      "sentinel never fired, so the regression below would prove nothing"
+  fi
+}
+
+# sentinel_isolated <label> <git-output> — after git_isolate, the real hook runs.
+sentinel_isolated() {
+  if [ -f "$sentinel_flag" ]; then
+    bad "$1: cleared before any git operation" "the inherited hook ran"
+  else
+    ok "$1: cleared before any git operation"
+  fi
+  if echo "$2" | grep -qF "$SCAN_MARKER"; then
+    ok "$1: the hook under test is the one that ran"
+  else
+    bad "$1: the hook under test is the one that ran" "$(echo "$2" | tr '\n' ' ' | cut -c1-160)"
+  fi
+}
+
+# --- form 1: GIT_CONFIG_COUNT + GIT_CONFIG_KEY_n / GIT_CONFIG_VALUE_n -------
+GIT_CONFIG_COUNT=1
+GIT_CONFIG_KEY_0=core.hooksPath
+GIT_CONFIG_VALUE_0="$sentinel_hooks"
+export GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
+
+sentinel_commit count-control >/dev/null
+sentinel_control "GIT_CONFIG_COUNT"
+
+git_isolate
+out=$(sentinel_commit count-isolated)
+sentinel_isolated "GIT_CONFIG_COUNT" "$out"
+
+# --- form 2: GIT_CONFIG_PARAMETERS ------------------------------------------
+GIT_CONFIG_PARAMETERS="'core.hooksPath'='$sentinel_hooks'"
+export GIT_CONFIG_PARAMETERS
+
+sentinel_commit params-control >/dev/null
+sentinel_control "GIT_CONFIG_PARAMETERS"
+
+git_isolate
+out=$(sentinel_commit params-isolated)
+sentinel_isolated "GIT_CONFIG_PARAMETERS" "$out"
+
+# --- form 3: GIT_INDEX_FILE --------------------------------------------------
+# Not a hook substitution but the same class of inheritance, and the one with the
+# worst consequence: git exports it to every hook it runs, so a suite invoked
+# from a commit hook would stage its fixtures into the REAL repository's index.
+# The sentinel is a file git must never write.
+#
+# The sentinel is a path git must never create. A path rather than a file with
+# known contents, because git reads an existing index before writing one and
+# refuses outright on a bad signature — which leaves the file untouched for a
+# reason that has nothing to do with isolation, and a control that fails for that
+# reason is how this check was written the first time.
+sentinel_index="$work/inherited-index"
+rm -f "$sentinel_index"
+GIT_INDEX_FILE="$sentinel_index"
+export GIT_INDEX_FILE
+
+mkdir -p "$work/index-control"
+git -C "$work/index-control" init -q
+git -C "$work/index-control" config user.email test@example.invalid
+git -C "$work/index-control" config user.name "Guard Test"
+echo "source line" > "$work/index-control/app.txt"
+git -C "$work/index-control" add app.txt >/dev/null 2>&1
+if [ -f "$sentinel_index" ]; then
+  ok "GIT_INDEX_FILE: control — an inherited index really is the one git writes"
+else
+  bad "GIT_INDEX_FILE: control — an inherited index really is the one git writes" \
+    "git ignored it, so the regression below would prove nothing"
+fi
+
+rm -f "$sentinel_index"
+git_isolate
+new_provider "$work/index-isolated-provider"
+new_repo "$work/index-isolated" "$work/index-isolated-provider/.husky"
+git -C "$work/index-isolated" commit -F "$work/poisoned.txt" >/dev/null 2>&1
+if [ -f "$sentinel_index" ]; then
+  bad "GIT_INDEX_FILE: cleared, so the inherited index is untouched" \
+    "the supplied index was written"
+else
+  ok "GIT_INDEX_FILE: cleared, so the inherited index is untouched"
+fi
 # ---------------------------------------------------------------------------
 # Tier 3: the history runner's output
 # ---------------------------------------------------------------------------
@@ -707,6 +979,160 @@ if echo "$leak_out" | grep -q 'JWT_SECRET'; then
   bad "history runner does not echo the flagged subject line" "flagged subject text reached the output"
 else
   ok "history runner does not echo the flagged subject line"
+fi
+
+# --- known-prose classification ---------------------------------------------
+#
+# The runner carries a full-SHA list of commits the scanner flags that were read
+# and found to hold no credential — prose about this guard that writes an
+# assignment. It classifies a refusal; it does not suppress one. Three things
+# have to hold, and the third is the one that decides whether the list is an
+# audit record or a mute button:
+#
+#   a listed commit is reported as known prose and the sweep passes
+#   an unlisted flagged commit still fails, in the same run as a listed one
+#   a scan ERROR on a listed commit still fails — a pin speaks for a message
+#   that was read, and a scanner that did not complete has read nothing
+#
+# The fixture pins a synthetic SHA into its own copy of the runner, so nothing
+# here depends on this repository's history.
+
+# pin_known_prose <repo> <sha>... — rewrite the fixture copy's pin list.
+pin_known_prose() {
+  repo=$1
+  shift
+  runner="$repo/scripts/check-commit-msg.history.sh"
+  sed "s|^KNOWN_PROSE=.*|KNOWN_PROSE=\"$*\"|" "$runner" > "$runner.new" || return 1
+  mv "$runner.new" "$runner" || return 1
+  # Loud if the rewrite missed: a silent no-op here would leave every check
+  # below testing the unpinned path while claiming to test the pinned one.
+  grep -q "^KNOWN_PROSE=\"$*\"\$" "$runner"
+}
+
+# add_history_commit <dir> <subject> — one more commit on origin/main.
+history_seq=0
+add_history_commit() {
+  history_seq=$((history_seq + 1))
+  echo "line $history_seq" >> "$1/app.txt" || return 1
+  git -C "$1" add app.txt || return 1
+  printf '%s\n' "$2" > "$work/history-subject.txt" || return 1
+  git -C "$1" commit -q --no-verify -F "$work/history-subject.txt" || return 1
+  git -C "$1" update-ref refs/remotes/origin/main HEAD || return 1
+}
+
+new_history_repo "$work/history-known" "JWT_SECRET=$HISTORY_CANARY"
+known_sha=$(git -C "$work/history-known" rev-parse HEAD)
+if pin_known_prose "$work/history-known" "$known_sha"; then
+  ok "the pin rewrite landed in the runner under test"
+else
+  bad "the pin rewrite landed in the runner under test" "KNOWN_PROSE was not replaced"
+fi
+
+known_out=$(cd "$work/history-known" && sh scripts/check-commit-msg.history.sh 10 2>&1)
+known_rc=$?
+if [ "$known_rc" -eq 0 ] && echo "$known_out" | grep -q "known prose"; then
+  ok "a pinned flagged commit is classified as known prose and the sweep passes"
+else
+  bad "a pinned flagged commit is classified as known prose and the sweep passes" \
+    "exit $known_rc: $(echo "$known_out" | tr '\n' ' ' | cut -c1-200)"
+fi
+if echo "$known_out" | grep -q "unexpected 0"; then
+  ok "a pinned commit is reported separately from unexpected findings"
+else
+  bad "a pinned commit is reported separately from unexpected findings" \
+    "$(echo "$known_out" | tr '\n' ' ' | cut -c1-200)"
+fi
+# Classification is not a licence to print. The known path names a flagged commit
+# too, so it is the same disclosure surface as the failure path.
+if echo "$known_out" | grep -q "$HISTORY_CANARY"; then
+  bad "the known-prose path prints no message content" "the synthetic canary reached the output"
+else
+  ok "the known-prose path prints no message content"
+fi
+
+# An unlisted flagged commit, in the same sweep as the listed one. Together they
+# pin that the list classifies the commit it names and nothing else.
+add_history_commit "$work/history-known" "GITHUB_TOKEN=$HISTORY_CANARY"
+unlisted_sha=$(git -C "$work/history-known" rev-parse HEAD)
+mixed_out=$(cd "$work/history-known" && sh scripts/check-commit-msg.history.sh 10 2>&1)
+mixed_rc=$?
+if [ "$mixed_rc" -ne 0 ] && echo "$mixed_out" | grep -q "unexpected 1"; then
+  ok "an unlisted flagged commit still fails the sweep"
+else
+  bad "an unlisted flagged commit still fails the sweep" \
+    "exit $mixed_rc: $(echo "$mixed_out" | tr '\n' ' ' | cut -c1-200)"
+fi
+if echo "$mixed_out" | grep -q "$unlisted_sha"; then
+  ok "the unlisted commit is named by SHA"
+else
+  bad "the unlisted commit is named by SHA" "$(echo "$mixed_out" | tr '\n' ' ' | cut -c1-200)"
+fi
+if echo "$mixed_out" | grep -q "$HISTORY_CANARY"; then
+  bad "a mixed sweep prints no message content" "the synthetic canary reached the output"
+else
+  ok "a mixed sweep prints no message content"
+fi
+
+# The property that keeps the list an audit record. Same repo shape, same pin,
+# but the scanner cannot complete: a pin must not convert that into success.
+new_history_repo "$work/history-pin-error" "JWT_SECRET=$HISTORY_CANARY"
+pin_error_sha=$(git -C "$work/history-pin-error" rev-parse HEAD)
+pin_known_prose "$work/history-pin-error" "$pin_error_sha" || \
+  bad "pin rewrite for the scan-error case" "KNOWN_PROSE was not replaced"
+printf '#!/bin/sh\nexit 2\n' > "$work/history-pin-error/scripts/check-commit-msg.sh"
+pin_error_out=$(cd "$work/history-pin-error" && sh scripts/check-commit-msg.history.sh 10 2>&1)
+pin_error_rc=$?
+if [ "$pin_error_rc" -ne 0 ] && echo "$pin_error_out" | grep -q "scan did not complete"; then
+  ok "a scan error on a pinned commit fails rather than passing as known prose"
+else
+  bad "a scan error on a pinned commit fails rather than passing as known prose" \
+    "exit $pin_error_rc: $(echo "$pin_error_out" | tr '\n' ' ' | cut -c1-200)"
+fi
+if echo "$pin_error_out" | grep -q "known prose"; then
+  bad "a scan error is not classified" "the pin absorbed an operational error"
+else
+  ok "a scan error is not classified"
+fi
+
+# The one result that is allowed to pass without sweeping anything, pinned so it
+# stays the only one. This runner is local-only by design, so a clone with no
+# origin/main genuinely has nothing to sweep — but "the sweep did not run" used to
+# be indistinguishable from "rev-list failed", because rev-list's status was
+# discarded and an empty list fell through to the same SKIP.
+new_history_repo "$work/history-noref" "fix: an entirely ordinary subject line"
+git -C "$work/history-noref" update-ref -d refs/remotes/origin/main
+noref_out=$(cd "$work/history-noref" && sh scripts/check-commit-msg.history.sh 10 2>&1)
+noref_rc=$?
+if [ "$noref_rc" -eq 0 ] && echo "$noref_out" | grep -q "SKIP no origin/main"; then
+  ok "a clone with no origin/main skips the sweep and says which reason"
+else
+  bad "a clone with no origin/main skips the sweep and says which reason" \
+    "exit $noref_rc: $(echo "$noref_out" | tr '\n' ' ' | cut -c1-200)"
+fi
+
+# The other side of it, and the case that pins the difference. origin/main
+# resolves — so there IS something to sweep and the SKIP above is not available —
+# but the walk yields no commits. The ref is pointed at a tree, which resolves as
+# an object and produces an empty walk.
+#
+# Zero commits swept must not print as zero findings. That is the same fail-open
+# shape as everything else in this file: nothing was checked, and "nothing was
+# checked" reads identically to "nothing was found" unless something says so.
+#
+# One honest gap: rev-list's own non-zero status is handled and is NOT exercised
+# here. This fixture reaches the empty-walk guard instead, and I could not induce
+# a genuine rev-list failure on a ref that rev-parse --verify still accepts. The
+# status check is defensive; the guard below is the one under test.
+new_history_repo "$work/history-badref" "fix: an entirely ordinary subject line"
+git -C "$work/history-badref" update-ref refs/remotes/origin/main \
+  "$(git -C "$work/history-badref" rev-parse 'HEAD^{tree}')"
+badref_out=$(cd "$work/history-badref" && sh scripts/check-commit-msg.history.sh 10 2>&1)
+badref_rc=$?
+if [ "$badref_rc" -ne 0 ] && echo "$badref_out" | grep -q "nothing was swept"; then
+  ok "a resolved ref that sweeps nothing fails rather than passing as clean"
+else
+  bad "a resolved ref that sweeps nothing fails rather than passing as clean" \
+    "exit $badref_rc: $(echo "$badref_out" | tr '\n' ' ' | cut -c1-200)"
 fi
 
 echo ""
