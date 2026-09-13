@@ -1,0 +1,16 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "composite": false,
+    "declaration": false,
+    "declarationMap": false,
+    "incremental": false,
+    "noEmit": true
+  },
+  "include": [
+    "src/audit-locomo.ts",
+    "src/benchmark-locomo*.ts",
+    "src/benchmark-data/locomo-loader*.ts"
+  ],
+  "exclude": ["node_modules", "dist"]
+}

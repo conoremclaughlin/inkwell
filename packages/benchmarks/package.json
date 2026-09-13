@@ -5,17 +5,22 @@
   "license": "SEE LICENSE IN LICENSE",
   "description": "Benchmark harnesses for Inkwell memory and runtime evaluation",
   "scripts": {
+    "audit:locomo": "tsx src/audit-locomo.ts",
+    "benchmark:locomo": "tsx src/benchmark-locomo.ts",
     "benchmark:memory-recall": "tsx src/benchmark-memory-recall.ts",
     "benchmark:bootstrap-relevance": "tsx src/benchmark-bootstrap-relevance.ts",
+    "type-check:locomo": "yarn workspace @inklabs/shared build && tsc -p tsconfig.locomo.json --noEmit",
     "test": "vitest run --config vitest.config.ts",
     "benchmark:memory-answer": "tsx src/benchmark-memory-answer.ts",
     "benchmark:memory-dream": "tsx src/benchmark-memory-dream.ts"
   },
   "dependencies": {
-    "@inklabs/api": "workspace:*"
+    "@inklabs/api": "workspace:*",
+    "zod": "^3.25.0"
   },
   "devDependencies": {
     "tsx": "^4.20.6",
+    "typescript": "^5.3.3",
     "vitest": "^4.0.18"
   }
 }
