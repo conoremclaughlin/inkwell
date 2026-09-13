@@ -1232,3 +1232,149 @@ describe('read floors compare instants, not spellings', () => {
     );
   });
 });
+
+/**
+ * reopen_thread — spec inkmail-thread-scope §2, §6.
+ *
+ * Reopening is explicit: a reply into a closed thread never reopens it, and
+ * these tests drive the tool that does. What they pin is the shape of the
+ * write (status, both closure fields, and the audit event move together),
+ * who may ask (a participant, same rule as close), and that a reopen which
+ * loses a race writes nothing — the guard on the UPDATE is what makes the
+ * flip atomic, and dropping it makes the second call below write a second
+ * audit row.
+ */
+describe('handleReopenThread — explicit reopen (spec inkmail-thread-scope §2)', () => {
+  async function setup(opts: { status?: string; participants?: string[] } = {}) {
+    const { handleReopenThread, reopenThreadRow } = await import('./thread-handlers');
+    const userResolver = await import('../../services/user-resolver');
+    const { StudioLeaseService } = await import('../../services/studio-lease.service.js');
+    const { makeFakeSupabase } = await import('../../services/sessions/fake-supabase.js');
+
+    const resolveSpy = vi
+      .spyOn(userResolver, 'resolveUserOrThrow')
+      .mockResolvedValue({ user: { id: 'user-1' } } as never);
+    const releaseSpy = vi.spyOn(StudioLeaseService.prototype, 'releaseByThread');
+
+    const closed = (opts.status ?? 'closed') === 'closed';
+    const tables = {
+      inbox_threads: [
+        {
+          id: 't1',
+          user_id: 'user-1',
+          thread_key: 'pr:9',
+          status: closed ? 'closed' : 'open',
+          closed_at: closed ? '2026-09-01T00:00:00Z' : null,
+          closed_by_agent_id: closed ? 'lumen' : null,
+          created_by_agent_id: 'wren',
+        },
+      ],
+      inbox_thread_participants: (opts.participants ?? ['wren', 'lumen']).map((agent_id) => ({
+        thread_id: 't1',
+        agent_id,
+      })),
+      inbox_thread_messages: [] as Array<Record<string, unknown>>,
+    };
+    const supabase = makeFakeSupabase(tables);
+    const dataComposer = { getClient: () => supabase, repositories: {} } as never;
+    const call = async (agentId: string) => {
+      const result = await handleReopenThread({ threadKey: 'pr:9', agentId }, dataComposer);
+      return JSON.parse((result.content[0] as { text: string }).text) as Record<string, unknown>;
+    };
+    const restore = () => {
+      resolveSpy.mockRestore();
+      releaseSpy.mockRestore();
+    };
+    return { call, tables, supabase, reopenThreadRow, releaseSpy, restore };
+  }
+
+  it('a participant reopens: status open, both closure fields cleared, one system audit event, nobody woken', async () => {
+    const { call, tables, releaseSpy, restore } = await setup();
+    try {
+      const payload = await call('wren');
+      expect(payload).toMatchObject({ success: true, threadKey: 'pr:9', reopenedBy: 'wren' });
+      expect(payload.alreadyOpen).toBeUndefined();
+
+      const thread = tables.inbox_threads[0];
+      expect(thread.status).toBe('open');
+      expect(thread.closed_at).toBeNull();
+      expect(thread.closed_by_agent_id).toBeNull();
+
+      // Exactly one row landed, and it is an audit event — not a deliverable
+      // message that would count as unread or wake anyone.
+      expect(tables.inbox_thread_messages).toHaveLength(1);
+      expect(tables.inbox_thread_messages[0]).toMatchObject({
+        thread_id: 't1',
+        sender_agent_id: 'system',
+        message_type: 'system',
+        metadata: { type: 'thread_reopened', reopenedBy: 'wren' },
+      });
+      // Close releases studio leases; reopen touches none of that.
+      expect(releaseSpy).not.toHaveBeenCalled();
+    } finally {
+      restore();
+    }
+  });
+
+  it('a non-participant is refused and nothing changes', async () => {
+    const { call, tables, restore } = await setup({ participants: ['lumen'] });
+    try {
+      const payload = await call('wren');
+      expect(payload.success).toBe(false);
+      expect(String(payload.error)).toMatch(/not a participant/);
+      expect(tables.inbox_threads[0]).toMatchObject({
+        status: 'closed',
+        closed_at: '2026-09-01T00:00:00Z',
+        closed_by_agent_id: 'lumen',
+      });
+      expect(tables.inbox_thread_messages).toHaveLength(0);
+    } finally {
+      restore();
+    }
+  });
+
+  it('an open thread answers alreadyOpen and records no event', async () => {
+    const { call, tables, restore } = await setup({ status: 'open' });
+    try {
+      const payload = await call('wren');
+      expect(payload).toMatchObject({ success: true, alreadyOpen: true });
+      expect(tables.inbox_thread_messages).toHaveLength(0);
+    } finally {
+      restore();
+    }
+  });
+
+  it('the flip is guarded on the row still being closed: a second reopen writes nothing', async () => {
+    // Two callers can both read "closed" and both try to write. The UPDATE
+    // itself carries the guard, so only one of them records the event.
+    const { supabase, tables, reopenThreadRow, restore } = await setup();
+    try {
+      expect(
+        await reopenThreadRow(supabase as never, 't1', { kind: 'sb', agentId: 'wren' })
+      ).toEqual({ reopened: true });
+      expect(await reopenThreadRow(supabase as never, 't1', { kind: 'user' })).toEqual({
+        reopened: false,
+      });
+      expect(tables.inbox_thread_messages).toHaveLength(1);
+      expect(tables.inbox_thread_messages[0]).toMatchObject({
+        metadata: { type: 'thread_reopened', reopenedBy: 'wren' },
+      });
+    } finally {
+      restore();
+    }
+  });
+
+  it("the owner's recovery is recorded as the owner, not as an SB", async () => {
+    const { supabase, tables, reopenThreadRow, restore } = await setup();
+    try {
+      await reopenThreadRow(supabase as never, 't1', { kind: 'user' });
+      expect(tables.inbox_thread_messages[0]).toMatchObject({
+        sender_agent_id: 'system',
+        message_type: 'system',
+        metadata: { type: 'thread_reopened', reopenedBy: 'user', channel: 'admin-api' },
+      });
+    } finally {
+      restore();
+    }
+  });
+});

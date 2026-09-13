@@ -146,6 +146,11 @@ const closeThreadSchema = userIdentifierBaseSchema.extend({
   agentId: agentIdSchema.describe('Agent ID closing the thread (must be a participant)'),
 });
 
+const reopenThreadSchema = userIdentifierBaseSchema.extend({
+  threadKey: threadKeySchema,
+  agentId: agentIdSchema.describe('Agent ID reopening the thread (must be a participant)'),
+});
+
 const listThreadsSchema = userIdentifierBaseSchema.extend({
   agentId: agentIdSchema.describe('Agent ID to list threads for'),
   status: z.enum(['open', 'closed', 'all']).optional().default('open'),
@@ -881,6 +886,128 @@ export async function handleCloseThread(args: unknown, dataComposer: DataCompose
   };
 }
 
+/** Who is reopening: a participant SB, or the owner recovering from the dashboard. */
+export type ReopenActor = { kind: 'sb'; agentId: string } | { kind: 'user' };
+
+/**
+ * Flip a closed thread back to open and record it. One UPDATE, guarded on
+ * the row still being closed, so two reopens racing each other (or a reopen
+ * racing a close) cannot both claim to have done it; then the audit event.
+ * Answers `reopened: false` when the row was not closed at the moment of the
+ * write — nothing is written in that case.
+ *
+ * What a reopen does NOT do (spec inkmail-thread-scope §2, §6):
+ * - wake anyone — a reopen says the work is back on; waking someone is an
+ *   explicit message, and a reply is how the participants hear;
+ * - take back a studio lease — close released them (handleCloseThread), and
+ *   the next message on the thread claims what it needs as usual.
+ *
+ * Shared by the MCP tool (a participant reopens) and the admin route (the
+ * owner recovers), so both write the same row and the same event. The actor
+ * lands in the audit event's metadata for now; the principal columns of
+ * spec §3 give it a real home at the cutover.
+ */
+export async function reopenThreadRow(
+  supabase: SupabaseClient,
+  threadId: string,
+  actor: ReopenActor
+): Promise<{ reopened: boolean }> {
+  const now = new Date().toISOString();
+  const { data, error } = await threadTable(supabase, 'inbox_threads')
+    .update({ status: 'open', closed_at: null, closed_by_agent_id: null, updated_at: now })
+    .eq('id', threadId)
+    .eq('status', 'closed')
+    .select('id');
+  if (error) {
+    throw new Error(`Failed to reopen thread: ${error.message}`);
+  }
+  if (!data || data.length === 0) {
+    return { reopened: false };
+  }
+
+  const { error: auditError } = await threadTable(supabase, 'inbox_thread_messages').insert({
+    thread_id: threadId,
+    sender_agent_id: 'system',
+    content:
+      actor.kind === 'sb'
+        ? `Thread reopened by ${actor.agentId}`
+        : 'Thread reopened by the workspace owner',
+    message_type: 'system',
+    metadata: {
+      type: 'thread_reopened',
+      reopenedBy: actor.kind === 'sb' ? actor.agentId : 'user',
+      ...(actor.kind === 'user' ? { channel: 'admin-api' } : {}),
+    } as Json,
+  });
+  if (auditError) {
+    throw new Error(`Failed to record thread reopen: ${auditError.message}`);
+  }
+  return { reopened: true };
+}
+
+/**
+ * reopen_thread — the explicit counterpart of close_thread.
+ *
+ * A reply to a closed thread never reopens it; this tool is how a participant
+ * says the work is back on. Same authority rule as close (any participant),
+ * and the same shape of audit trail.
+ */
+export async function handleReopenThread(args: unknown, dataComposer: DataComposer) {
+  const supabase = dataComposer.getClient();
+  const parsed = reopenThreadSchema.parse(args);
+  const resolved = await resolveUserOrThrow(parsed, dataComposer);
+
+  const agentId = getEffectiveAgentId(parsed.agentId) ?? parsed.agentId;
+  const { threadKey } = parsed;
+  const reply = (payload: Record<string, unknown>) => ({
+    content: [{ type: 'text' as const, text: JSON.stringify(payload) }],
+  });
+
+  const thread = await findThread(supabase, resolved.user.id, threadKey);
+  if (!thread) {
+    return reply({ success: false, error: `Thread not found: ${threadKey}` });
+  }
+
+  // Who is asking comes before what state the thread is in.
+  if (!(await isParticipant(supabase, thread.id, agentId))) {
+    return reply({
+      success: false,
+      error: `Agent ${agentId} is not a participant in thread ${threadKey}`,
+    });
+  }
+
+  if (thread.status !== 'closed') {
+    return reply({
+      success: true,
+      message: `Thread ${threadKey} is already open`,
+      threadKey,
+      alreadyOpen: true,
+    });
+  }
+
+  const { reopened } = await reopenThreadRow(supabase, thread.id, { kind: 'sb', agentId });
+  if (!reopened) {
+    // Closed when we looked, open by the time we wrote: someone else's
+    // reopen landed first. The state the caller asked for holds, and
+    // nothing was recorded twice.
+    return reply({
+      success: true,
+      message: `Thread ${threadKey} is already open`,
+      threadKey,
+      alreadyOpen: true,
+    });
+  }
+
+  logger.info('Thread reopened', { threadKey, reopenedBy: agentId });
+
+  return reply({
+    success: true,
+    message: `Thread ${threadKey} reopened`,
+    threadKey,
+    reopenedBy: agentId,
+  });
+}
+
 export async function handleListThreads(args: unknown, dataComposer: DataComposer) {
   const supabase = dataComposer.getClient();
   const parsed = listThreadsSchema.parse(args);
@@ -1151,7 +1278,7 @@ export const threadToolDefinitions = [
   {
     name: 'close_thread',
     description:
-      'Close a thread to mark its work done. Closed is a work-state signal, not a lock: a closed thread can still be read and still accepts replies (a reply wakes its participants without reopening the thread); it drops off the default list_threads work list. Any participant can close.',
+      'Close a thread to mark its work done. Closed is a work-state signal, not a lock: a closed thread can still be read and still accepts replies (a reply wakes its participants without reopening the thread); it drops off the default list_threads work list. Any participant can close; reopen_thread puts the work back on.',
     schema: closeThreadSchema,
     handler: handleCloseThread,
   },
@@ -1168,5 +1295,12 @@ export const threadToolDefinitions = [
       'Mark a thread as read without fetching messages. Useful when you see thread activity in get_inbox and want to acknowledge it without reading the full history.',
     schema: markThreadReadSchema,
     handler: handleMarkThreadRead,
+  },
+  {
+    name: 'reopen_thread',
+    description:
+      'Reopen a closed thread to say its work is back on. Explicit by design: a reply to a closed thread never reopens it. Atomic — status returns to open and the closure fields clear together — and audited with a system event. Wakes nobody: send a message to wake the participants. Any participant can reopen.',
+    schema: reopenThreadSchema,
+    handler: handleReopenThread,
   },
 ];

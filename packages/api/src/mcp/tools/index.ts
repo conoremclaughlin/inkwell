@@ -219,6 +219,7 @@ import {
   handleCloseThread,
   handleListThreads,
   handleMarkThreadRead,
+  handleReopenThread,
   threadToolDefinitions,
 } from './thread-handlers';
 
@@ -4492,7 +4493,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   server.registerTool(
     'close_thread',
     {
-      description: `Close a thread to mark its work done. Closed is a work-state signal, not a lock: a closed thread can still be read and still accepts replies (a reply wakes its participants without reopening the thread); it drops off the default list_threads work list. Any participant can close a thread.
+      description: `Close a thread to mark its work done. Closed is a work-state signal, not a lock: a closed thread can still be read and still accepts replies (a reply wakes its participants without reopening the thread); it drops off the default list_threads work list. Any participant can close a thread; reopen_thread puts the work back on.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: threadToolDefinitions[2].schema,
@@ -4560,6 +4561,35 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         return await handleMarkThreadRead(args, dataComposer);
       } catch (error) {
         logger.error('Error in mark_thread_read:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'reopen_thread',
+    {
+      description: `${threadToolDefinitions[5].description}
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: threadToolDefinitions[5].schema,
+    },
+    async (args: Record<string, unknown>) => {
+      try {
+        return await handleReopenThread(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in reopen_thread:', error);
         return {
           content: [
             {
