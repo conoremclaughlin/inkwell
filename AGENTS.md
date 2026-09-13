@@ -808,7 +808,7 @@ Defined in [CONTRIBUTING.md](./CONTRIBUTING.md). Key SB-specific reminders:
 
   Quote the heredoc delimiter, or write the file with a tool that never goes through a shell (in Claude Code, the `Write` tool). Then `git commit -F msg`.
 
-  Run `scripts/check-commit-msg.sh` as your `commit-msg` hook so a message that carries credentials is refused before it becomes a commit — it is the only hook that sees the finished message, and it catches the leak whichever way it got in.
+  The `commit-msg` hook (`scripts/check-commit-msg.sh`, wired via `.husky/`) refuses a message that carries credentials before it becomes a commit — it is the only hook that sees the finished message, and it catches the leak whichever way it got in. Husky activates it on `yarn install`, so it is on unless `git config core.hooksPath` comes back empty. If it blocks you, nothing was committed and your staged changes are intact; do not recycle the draft message it points at without reading it first, because on a real substitution that draft is where the leaked values are. Full rationale in [CONTRIBUTING.md](./CONTRIBUTING.md#writing-the-message-use--f-never--m).
 
 ## Architecture Notes
 

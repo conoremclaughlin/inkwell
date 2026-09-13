@@ -27,6 +27,71 @@ refactor(mcp): extract identity resolution into service
 chore: bump typescript to 5.4
 ```
 
+#### Writing the message: use `-F`, never `-m`
+
+**Write the message to a file and commit with `git commit -F <file>`.** Never `-m` — not even
+for a one-line subject.
+
+```bash
+cat > /tmp/msg.txt <<'EOF'     # note the QUOTED delimiter
+fix(cache): honour a `local` flag on the cache entry
+EOF
+git commit -F /tmp/msg.txt
+```
+
+A double-quoted `-m` string is shell input. A backtick or `$(...)` anywhere inside it is
+**executed**, and its output is pasted into the commit. Markdown backticks around an
+identifier — ``a `local` flag`` — are how we normally write, which makes this a trap rather
+than an edge case.
+
+A subject line is **not** a safe exception. It is shell input on exactly the same terms, and a
+subject is where our backticked identifiers most often appear:
+
+```bash
+git commit -m "fix: honour the `local` flag"   # git receives: fix: honour the  flag
+```
+
+Single-quoting is not the fix either — an apostrophe in a word like `don't` closes the string
+and the remainder of the message is re-parsed as shell.
+
+**How the file gets written matters as much as `-F` does.** `-F` reads bytes and never expands
+them, but the shell still expands whatever _creates_ the file, one step earlier:
+
+```bash
+cat > msg <<'EOF'     # SAFE — quoted delimiter, every byte literal
+cat > msg <<EOF       # UNSAFE — backticks and $VAR expand as the file is written
+```
+
+Quote the heredoc delimiter, or write the file with a tool that never goes through a shell (in
+Claude Code, the `Write` tool).
+
+On 2026-09-13 a message containing the phrase ``a `local` flag on the cache entry`` ran the
+zsh `local` builtin, which at top level prints every parameter, and pasted the entire
+environment into the commit. Ten live credentials reached a public repository. Two earlier
+commits from February 2026 did the same thing and sat on public `main` for seven months.
+Different people, seven months apart, following what the docs said at the time.
+
+Review cannot catch it. The substitution happens between typing the message and the commit
+existing, so the author never reads back what was written, and the diff is unaffected — a
+reviewer looking at the change sees nothing wrong. `-F` never goes through shell expansion
+and has no quoting rules to get wrong.
+
+The enforcing half is `scripts/check-commit-msg.sh`, wired as the `commit-msg` hook (the one
+hook that sees the finished message; a `pre-commit` hook never does). Husky installs it via
+`yarn install`, so it should already be active — see [Formatting](#formatting). It refuses a
+message carrying named secret assignments, vendor token shapes, or an environment dump, and
+reports variable names and line numbers only, never values, so the hook output does not
+become the next place a secret is written down.
+
+If it blocks you, nothing has been committed and your staged changes are untouched. Read the
+draft message it points at before reusing it — if the guard fired on a real substitution, the
+draft contains the leaked values and must not be recycled into the next attempt.
+
+Its regression suite is `scripts/check-commit-msg.test.sh` (synthetic fixtures, runs in CI).
+`scripts/check-commit-msg.history.sh` is the local-only check that replays the three real
+leaking commits by SHA and sweeps `main` for false positives; it is not in CI because a
+shallow clone does not have the history it needs.
+
 ### Branching
 
 We follow [GitHub flow](https://www.geeksforgeeks.org/git-flow-vs-github-flow/): feature branches off `main`, which must always be stable and deployable.
@@ -156,6 +221,11 @@ deleted.
 ### Formatting
 
 Prettier runs automatically on every commit via Husky + lint-staged. You do **not** need to run prettier manually — just commit and it handles formatting for `*.{ts,tsx,js,jsx,json,css,md}` files.
+
+Husky is installed by the `prepare` script, so a plain `yarn install` activates every hook in
+`.husky/` — including `commit-msg`, the credential guard described under
+[Commits](#writing-the-message-use--f-never--m). If `git config core.hooksPath` prints nothing,
+hooks are not active in this checkout; run `yarn install` to wire them up.
 
 To format without committing:
 
