@@ -8,10 +8,17 @@ vi.mock('child_process', () => ({
   execFile: mockExecFile,
 }));
 
-// Mock fs/promises for pathExists
+// Mock fs/promises for pathExists and the executable-file check.
+//
+// `access` is called two ways: bare (F_OK, "does the name resolve") and with
+// X_OK ("can it be run"). A mock that ignores the mode cannot tell those apart,
+// which is exactly the distinction the local-first path turns on — so the
+// helpers below drive them separately.
 const mockAccess = vi.fn();
+const mockStat = vi.fn();
 vi.mock('fs/promises', () => ({
   access: mockAccess,
+  stat: mockStat,
 }));
 
 vi.mock('../../utils/logger.js', () => ({
@@ -55,8 +62,10 @@ function mockWhichError() {
 describe('resolveBinaryPath', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    // Default: pathExists returns true for any path
+    // Default: pathExists returns true for any path, and anything that exists
+    // is a runnable regular file.
     mockAccess.mockResolvedValue(undefined);
+    mockStat.mockResolvedValue({ isFile: () => true });
   });
 
   it('resolves a binary found via which', async () => {
@@ -148,16 +157,32 @@ describe('resolveBinaryPath', () => {
 // hardening of a fallback, not a never-PATH guarantee, and these tests should
 // not be read as claiming otherwise.
 //
-// WHY THE FALLBACK STILL DESERVES HARDENING. `which ink` resolved to a
-// 2026-04-09 build in a sibling worktree predating --require-bootstrap;
-// Commander rejected the flag and the spawn died in 633ms. Eleven worktrees
-// on that machine each carry a node_modules/.bin/ink and eight were stale.
-// The successful resolution is cached process-wide, so one bad answer pins
-// every subsequent spawn until restart. Whichever agent spawns next wears it.
+// WHY THE FALLBACK STILL DESERVES HARDENING, stated carefully, because two
+// earlier versions of this header got the attribution wrong.
 //
-// (That incident is NOT what caused the Sep 9 outage — that was a genuinely
-// logged-out backend — nor the Sep 11 recurrence, which was two API servers
-// racing for reminders. See #609.)
+// An `ink` dated 2026-04-09, predating --require-bootstrap, was spawned and
+// Commander rejected the flag; the spawn died in 633ms. That was NOT `which`
+// reaching into a sibling worktree. There were two API servers on one database
+// and the second was RUNNING FROM the stale worktree, so it spawned from its
+// own directory — correctly — and its own directory held the old build.
+// Resolving against the server's own checkout would have picked the very same
+// binary. The fix for that outage is #609, not this file.
+//
+// What remains true and is worth hardening: eleven worktrees on that machine
+// each carry a node_modules/.bin/ink and eight were stale, so a PATH lookup has
+// plenty of wrong answers available to it on some future day with a different
+// cause. A successful resolution is then cached process-wide, and whichever
+// agent spawns next wears it.
+//
+// That cache does NOT last "until restart" — an earlier version of this header
+// said so and it was wrong. Entries are revalidated (see `resolveBinaryPath`),
+// so one survives only while its path still exists and, for a locally-selected
+// path, still runs. The real reuse window is bounded by nothing we control,
+// which is the argument for not depending on PATH here rather than a claim that
+// the cache is permanent.
+//
+// (The Sep 9 outage was a genuinely logged-out backend; the Sep 11 recurrence
+// was two API servers racing for reminders. Neither was this. See #609.)
 //
 // Each test re-imports the module so it starts with an empty cache — the
 // cache is exactly what makes a single wrong answer durable.
@@ -168,16 +193,36 @@ describe('resolveBinaryPath - first-party binaries', () => {
     return await import('./resolve-binary.js');
   }
 
-  /** Treat only paths satisfying `predicate` as existing on disk. */
+  /**
+   * Treat only paths satisfying `predicate` as existing — and as runnable
+   * regular files, which is the ordinary case.
+   */
   function existsOnly(predicate: (p: string) => boolean) {
     mockAccess.mockImplementation((p: string) =>
       predicate(p) ? Promise.resolve(undefined) : Promise.reject(new Error('ENOENT'))
     );
+    mockStat.mockImplementation((p: string) =>
+      predicate(p) ? Promise.resolve({ isFile: () => true }) : Promise.reject(new Error('ENOENT'))
+    );
+  }
+
+  /**
+   * A path that exists but cannot be run: present to F_OK, EACCES to X_OK.
+   * A `node_modules/.bin/ink` left at mode 0644 by a partial install.
+   */
+  function existsButNotExecutable(notExecutable: (p: string) => boolean) {
+    mockAccess.mockImplementation((p: string, mode?: number) =>
+      mode !== undefined && notExecutable(p)
+        ? Promise.reject(new Error('EACCES'))
+        : Promise.resolve(undefined)
+    );
+    mockStat.mockResolvedValue({ isFile: () => true });
   }
 
   beforeEach(() => {
     vi.clearAllMocks();
     mockAccess.mockResolvedValue(undefined);
+    mockStat.mockResolvedValue({ isFile: () => true });
   });
 
   it("prefers this server's own .bin over a stale sibling on PATH", async () => {
@@ -226,6 +271,55 @@ describe('resolveBinaryPath - first-party binaries', () => {
     expect(mockExecFile).toHaveBeenCalled();
     // Silent fallback is how a stale sibling gets picked unnoticed.
     expect(vi.mocked(logger.warn)).toHaveBeenCalledWith(expect.stringContaining('first-party'));
+  });
+
+  it('does not let a non-executable local shim eclipse a usable PATH binary', async () => {
+    // Lumen's P2 on #617. The local-first branch bypasses `which`, so nothing
+    // else checks the candidate can be run. Selecting on existence alone meant a
+    // shim at mode 0644 beat a working PATH executable, got cached, and then
+    // died at spawn with EACCES — a fallback that made things worse than the
+    // ambient PATH it was hardening against.
+    const { resolveBinaryPath } = await freshModule();
+    const { logger } = await import('../../utils/logger.js');
+    mockWhichResult('/usr/local/bin/ink\n');
+    existsButNotExecutable((p) => p.endsWith('/node_modules/.bin/ink'));
+
+    const result = await resolveBinaryPath('ink');
+
+    expect(result).toBe('/usr/local/bin/ink');
+    expect(vi.mocked(logger.warn)).toHaveBeenCalledWith(
+      expect.stringContaining('not an executable file')
+    );
+  });
+
+  it('does not let a directory named ink eclipse a usable PATH binary', async () => {
+    // F_OK says a name resolves, not that it is a file. A directory passes it.
+    const { resolveBinaryPath } = await freshModule();
+    mockWhichResult('/usr/local/bin/ink\n');
+    mockAccess.mockResolvedValue(undefined);
+    mockStat.mockImplementation((p: string) =>
+      Promise.resolve({ isFile: () => !p.endsWith('/node_modules/.bin/ink') })
+    );
+
+    expect(await resolveBinaryPath('ink')).toBe('/usr/local/bin/ink');
+  });
+
+  it('re-resolves a cached local shim that has lost its executable bit', async () => {
+    // The cache is what makes one bad answer durable, so revalidation has to
+    // check the same property selection did. Existence alone would keep
+    // returning a path that can no longer be run for the life of the process.
+    const { resolveBinaryPath } = await freshModule();
+    mockWhichResult('/usr/local/bin/ink\n');
+    existsOnly((p) => p.endsWith('/node_modules/.bin/ink'));
+
+    const first = await resolveBinaryPath('ink');
+    expect(first).toMatch(/node_modules\/\.bin\/ink$/);
+
+    // Same file, still present, no longer runnable. PATH now has the answer.
+    mockWhichResult('/usr/local/bin/ink\n');
+    existsButNotExecutable((p) => p.endsWith('/node_modules/.bin/ink'));
+
+    expect(await resolveBinaryPath('ink')).toBe('/usr/local/bin/ink');
   });
 
   it('leaves third-party binaries on the PATH lookup', async () => {

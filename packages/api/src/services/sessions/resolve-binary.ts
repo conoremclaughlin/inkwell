@@ -17,7 +17,8 @@
  */
 
 import { execFile } from 'child_process';
-import { access } from 'fs/promises';
+import { access, stat } from 'fs/promises';
+import { constants as fsConstants } from 'fs';
 import { delimiter, dirname, isAbsolute, join, parse } from 'path';
 import { promisify } from 'util';
 import { logger } from '../../utils/logger.js';
@@ -27,6 +28,14 @@ const execFileAsync = promisify(execFile);
 interface CacheEntry {
   path: string | null;
   timestamp: number;
+  /**
+   * Resolved from this server's own workspace rather than PATH.
+   *
+   * Revalidation is stricter for these. A PATH entry was vetted by `which`,
+   * which already refuses a non-executable; a local candidate bypasses `which`
+   * entirely, so nothing else checks that it can still be run.
+   */
+  local?: boolean;
 }
 
 const resolvedPaths = new Map<string, CacheEntry>();
@@ -108,6 +117,31 @@ async function pathExists(filePath: string): Promise<boolean> {
 }
 
 /**
+ * Verify that a path is something we can actually execute.
+ *
+ * Existence is the wrong test for a candidate we picked ourselves. `access()`
+ * with no mode is F_OK — it says a name resolves, not that it is a file or that
+ * it can be run. A `node_modules/.bin/ink` left at mode 0644 by a failed or
+ * partial install passes F_OK, and so does a DIRECTORY named `ink`. Either one
+ * would be selected here, cached, and then handed to spawn, which fails with
+ * EACCES — and because the selection happened before the PATH fallback, a
+ * perfectly good executable on PATH never got its turn.
+ *
+ * `stat` follows symlinks, so a dangling shim still fails this and correctly
+ * falls through to PATH.
+ */
+async function isUsableExecutable(filePath: string): Promise<boolean> {
+  try {
+    const stats = await stat(filePath);
+    if (!stats.isFile()) return false;
+    await access(filePath, fsConstants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Resolve a binary name to its full path, with zsh login shell fallback.
  * Returns the binary name unchanged if resolution fails (spawn will produce
  * a clear ENOENT error).
@@ -116,12 +150,19 @@ export async function resolveBinaryPath(binary: string): Promise<string> {
   const cached = resolvedPaths.get(binary);
   if (cached) {
     if (cached.path) {
-      // Successful resolution — verify it still exists (nvm version switch, etc.)
-      if (await pathExists(cached.path)) {
+      // Successful resolution — verify it is still usable (nvm version switch,
+      // a reinstall that dropped the mode bit, etc.). A locally-selected path
+      // has to clear the same bar it was selected on: it never went through
+      // `which`, so this is the only thing standing between a shim that lost
+      // its +x and an EACCES on every spawn for the life of the process.
+      const stillUsable = cached.local
+        ? await isUsableExecutable(cached.path)
+        : await pathExists(cached.path);
+      if (stillUsable) {
         return cached.path;
       }
-      // Stale cache — path no longer exists, re-resolve
-      logger.warn(`Cached path for ${binary} no longer exists: ${cached.path}. Re-resolving.`);
+      // Stale cache — path is gone or no longer runnable, re-resolve
+      logger.warn(`Cached path for ${binary} is no longer usable: ${cached.path}. Re-resolving.`);
       resolvedPaths.delete(binary);
     } else {
       // Failed resolution — check if TTL has expired
@@ -138,10 +179,19 @@ export async function resolveBinaryPath(binary: string): Promise<string> {
   //    the ambient PATH. Deterministic, and immune to sibling worktrees.
   if (FIRST_PARTY_BINARIES.has(binary)) {
     for (const candidate of workspaceBinCandidates(binary)) {
-      if (await pathExists(candidate)) {
-        resolvedPaths.set(binary, { path: candidate, timestamp: Date.now() });
+      if (await isUsableExecutable(candidate)) {
+        resolvedPaths.set(binary, { path: candidate, timestamp: Date.now(), local: true });
         logger.info(`Resolved ${binary} from the server's own workspace: ${candidate}`);
         return candidate;
+      }
+      // Present but not runnable — a directory, or a file without +x. Preferring
+      // it would mask a working PATH executable and fail at spawn with EACCES,
+      // so skip it and keep looking. Worth a line: a shim that exists and cannot
+      // run is a broken install, and silence here would make it look absent.
+      if (await pathExists(candidate)) {
+        logger.warn(
+          `${binary} candidate exists but is not an executable file, skipping: ${candidate}`
+        );
       }
     }
     // Falling through to PATH means this checkout has no build of its own
