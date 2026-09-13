@@ -1119,10 +1119,9 @@ fi
 # shape as everything else in this file: nothing was checked, and "nothing was
 # checked" reads identically to "nothing was found" unless something says so.
 #
-# One honest gap: rev-list's own non-zero status is handled and is NOT exercised
-# here. This fixture reaches the empty-walk guard instead, and I could not induce
-# a genuine rev-list failure on a ref that rev-parse --verify still accepts. The
-# status check is defensive; the guard below is the one under test.
+# This fixture reaches the empty-walk guard, not the rev-list status check —
+# rev-list on a tree exits 0 with no output. The status check is exercised
+# separately, further down, with a git stub.
 new_history_repo "$work/history-badref" "fix: an entirely ordinary subject line"
 git -C "$work/history-badref" update-ref refs/remotes/origin/main \
   "$(git -C "$work/history-badref" rev-parse 'HEAD^{tree}')"
@@ -1133,6 +1132,71 @@ if [ "$badref_rc" -ne 0 ] && echo "$badref_out" | grep -q "nothing was swept"; t
 else
   bad "a resolved ref that sweeps nothing fails rather than passing as clean" \
     "exit $badref_rc: $(echo "$badref_out" | tr '\n' ' ' | cut -c1-200)"
+fi
+
+# rev-list failing on a ref that resolves. I could not induce this with a real
+# repository — a ref rev-parse --verify accepts is one rev-list walks — and left
+# the branch unexercised, which Lumen then covered with a git stub that delegates
+# every invocation except the one under test. That pattern is the missing piece:
+# it reaches the branch without corrupting a repository, because the stub only
+# has to lie about one subcommand.
+#
+# It is on PATH, so it intercepts the runner's git without the runner knowing.
+# The real git is resolved once, here, and baked in — a stub that found git by
+# searching PATH itself would find the stub.
+revlist_stub="$work/revlist-stub-bin"
+mkdir -p "$revlist_stub"
+real_git=$(command -v git)
+printf '#!/bin/sh\nreal_git=%s\n' "'$real_git'" > "$revlist_stub/git"
+cat >> "$revlist_stub/git" <<'STUB'
+if [ -n "${STUB_FAIL_REVLIST:-}" ]; then
+  for a in "$@"; do
+    [ "$a" = "rev-list" ] || continue
+    echo "synthetic rev-list failure" >&2
+    exit 3
+  done
+fi
+exec "$real_git" "$@"
+STUB
+chmod +x "$revlist_stub/git"
+
+new_history_repo "$work/history-revlistfail" "fix: an entirely ordinary subject line"
+
+# Control first, and here it earns its place twice over. It proves the stub
+# delegates — that a git call through it still builds and sweeps a repository —
+# so the failure below is attributable to the one intercepted subcommand and not
+# to a stub that broke git generally. Without it, a stub that failed everything
+# would drive the runner into the "no origin/main" SKIP, which exits 0.
+revlist_control_out=$(cd "$work/history-revlistfail" \
+  && PATH="$revlist_stub:$PATH" sh scripts/check-commit-msg.history.sh 10 2>&1)
+revlist_control_rc=$?
+if [ "$revlist_control_rc" -eq 0 ] && echo "$revlist_control_out" | grep -q "swept"; then
+  ok "rev-list stub: control — a delegating stub sweeps normally"
+else
+  bad "rev-list stub: control — a delegating stub sweeps normally" \
+    "exit $revlist_control_rc: $(echo "$revlist_control_out" | tr '\n' ' ' | cut -c1-200)"
+fi
+
+revlist_out=$(cd "$work/history-revlistfail" \
+  && PATH="$revlist_stub:$PATH" STUB_FAIL_REVLIST=1 sh scripts/check-commit-msg.history.sh 10 2>&1)
+revlist_rc=$?
+if [ "$revlist_rc" -ne 0 ] && echo "$revlist_out" | grep -q "rev-list over origin/main failed"; then
+  ok "rev-list failing on a ref that resolves fails rather than passing as clean"
+else
+  bad "rev-list failing on a ref that resolves fails rather than passing as clean" \
+    "exit $revlist_rc: $(echo "$revlist_out" | tr '\n' ' ' | cut -c1-200)"
+fi
+
+# A failed walk must not read as the one skip that is allowed to pass. The
+# pattern is narrow because two broader ones were wrong against correct code
+# before this one was right: a bare "SKIP" matches the leak section, which
+# legitimately skips three SHAs a synthetic fixture does not contain, and a bare
+# "sweep did not run" matches the FAIL line, which says the same words for the
+# opposite outcome. Only the SKIP form of that line is the failure here.
+if echo "$revlist_out" | grep -q "SKIP.*sweep did not run"; then
+  bad "a failed rev-list is not reported as a skipped sweep" "the failure read as a legitimate skip"
+else
+  ok "a failed rev-list is not reported as a skipped sweep"
 fi
 
 echo ""
