@@ -52,6 +52,25 @@ fi
 echo "[integration-db] Preparing isolated Supabase workdir: ${SUPABASE_WORKDIR}"
 cp -R "${ROOT_DIR}/supabase" "${SUPABASE_DIR}"
 
+# Rehearsal mode (spec inkmail-thread-scope §4): withhold every migration at or
+# after a timestamp so the stack comes up at the OLDER schema, and a test can
+# execute a withheld migration file itself — inside a transaction it rolls
+# back — against fixtures it seeded. The withheld files are read from the
+# real repository (INTEGRATION_MIGRATIONS_DIR), never from this copy.
+if [[ -n "${INTEGRATION_MIGRATIONS_UNTIL:-}" ]]; then
+  withheld=0
+  for migration in "${SUPABASE_DIR}/migrations/"*.sql; do
+    stamp="$(basename "${migration}")"
+    stamp="${stamp%%_*}"
+    if [[ "${stamp}" > "${INTEGRATION_MIGRATIONS_UNTIL}" || "${stamp}" == "${INTEGRATION_MIGRATIONS_UNTIL}" ]]; then
+      rm "${migration}"
+      withheld=$((withheld + 1))
+    fi
+  done
+  echo "[integration-db] Rehearsal: applying migrations before ${INTEGRATION_MIGRATIONS_UNTIL} (${withheld} withheld)"
+fi
+export INTEGRATION_MIGRATIONS_DIR="${ROOT_DIR}/supabase/migrations"
+
 python3 - "$CONFIG_PATH" "$API_PORT" "$DB_PORT" "$STUDIO_PORT" "$INBUCKET_PORT" "$INBUCKET_SMTP_PORT" "$INBUCKET_POP3_PORT" "$PROJECT_ID" <<'PY'
 import pathlib
 import re
@@ -181,7 +200,10 @@ dump_stack_diagnostics() {
 }
 
 echo "[integration-db] Running API DB integration suite against ${SUPABASE_URL}"
-if ! yarn --cwd "${ROOT_DIR}" workspace @inklabs/api test:integration:db; then
+# INTEGRATION_VITEST_ARGS narrows the run (a path filter, a -t pattern); the
+# rehearsal job uses it to run only the cutover suite at the older schema.
+# shellcheck disable=SC2086
+if ! yarn --cwd "${ROOT_DIR}" workspace @inklabs/api test:integration:db ${INTEGRATION_VITEST_ARGS:-}; then
   dump_stack_diagnostics
   exit 1
 fi

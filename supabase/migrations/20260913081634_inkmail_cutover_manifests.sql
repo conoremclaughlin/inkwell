@@ -93,7 +93,7 @@ LANGUAGE sql
 STABLE
 SET search_path TO 'public'
 AS $$
-  SELECT CASE WHEN count(*) = 1 THEN min(w.id) END
+  SELECT CASE WHEN count(*) = 1 THEN (array_agg(w.id))[1] END
   FROM public.workspaces w
   WHERE w.user_id = p_user_id
     AND w.type = 'personal'

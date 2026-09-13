@@ -65,6 +65,36 @@ jobs:
       - name: Run DB integration suite with isolated local Supabase
         run: yarn test:integration:db:local
 
+  integration-db-cutover-rehearsal:
+    name: Cutover Rehearsal (inkmail thread scope, pre-cutover schema)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: yarn
+
+      - run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+
+      - uses: supabase/setup-cli@v1
+        with:
+          version: 2.84.2
+
+      - run: yarn install --immutable
+
+      # The stack comes up at the schema BEFORE the cutover migration; the
+      # cutover suite executes that migration itself, per synthetic fixture,
+      # inside a transaction it rolls back (spec inkmail-thread-scope §4:
+      # rehearsal is mandatory, once through and once per provoked abort).
+      - name: Run the cutover rehearsal suite at the pre-cutover schema
+        run: yarn test:integration:db:local
+        env:
+          INTEGRATION_MIGRATIONS_UNTIL: '20260913090000'
+          INTEGRATION_VITEST_ARGS: 'src/data/cutover'
+
   integration-runtime:
     name: Integration Runtime Tests
     runs-on: ubuntu-latest
