@@ -3,8 +3,9 @@
  * inkmail-thread-scope §2, §6).
  *
  * The route is a thin adapter over reopenThreadRow, so what is pinned is
- * the adaptation: the thread is looked up under the caller's own user (the
- * pre-cutover meaning of "owner"), an unknown key is a 404 rather than an
+ * the adaptation: the thread is looked up in the caller's active workspace
+ * (spec inkmail-thread-scope §1: one thread per workspace and key; the
+ * middleware resolved the workspace), an unknown key is a 404 rather than an
  * invented thread, an already-open thread is answered without a write, and
  * a reopen that lost a race is reported as alreadyOpen rather than as a
  * failure — the state the person asked for holds either way.
@@ -77,7 +78,16 @@ function getReopenHandler(): Handler {
 }
 
 function createReq(body: Record<string, unknown>): Request {
-  return { body, headers: {}, cookies: {}, params: {}, pcpUserId: 'user-1' } as unknown as Request;
+  // pcpUserId / pcpWorkspaceId are what adminAuthMiddleware attaches; the
+  // handler is driven directly here, so they are injected.
+  return {
+    body,
+    headers: {},
+    cookies: {},
+    params: {},
+    pcpUserId: 'user-1',
+    pcpWorkspaceId: 'ws-1',
+  } as unknown as Request;
 }
 
 interface MockResponse extends Response {
@@ -139,7 +149,7 @@ describe('POST /threads/reopen', () => {
     expect(mockReopenThreadRow).not.toHaveBeenCalled();
   });
 
-  it("looks the thread up under the caller's own user and reopens it as the owner", async () => {
+  it("looks the thread up in the caller's workspace and reopens it as the person", async () => {
     const { eqCalls } = mockThreadLookup({
       id: 'thread-1',
       thread_key: 'pr:545',
@@ -158,12 +168,14 @@ describe('POST /threads/reopen', () => {
       alreadyOpen: false,
     });
     expect(eqCalls).toEqual([
-      ['user_id', 'user-1'],
+      ['workspace_id', 'ws-1'],
       ['thread_key', 'pr:545'],
     ]);
     expect(mockReopenThreadRow).toHaveBeenCalledTimes(1);
+    // The actor is a principal (§3): the person, by user id.
     expect(mockReopenThreadRow).toHaveBeenCalledWith(composerClient, 'thread-1', {
       kind: 'user',
+      userId: 'user-1',
     });
   });
 

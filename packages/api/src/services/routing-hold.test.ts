@@ -25,7 +25,7 @@ function rpcClient(result: { data?: unknown; error?: { message: string } }) {
 
 const STAMP = {
   threadId: 't-1',
-  userId: 'u-1',
+  workspaceId: 'ws-1',
   agentId: 'wren',
   attemptStartedAt: '2026-08-19T02:00:00.000Z',
   detail: { triedCallerRepo: true, callerRepoRoot: '/repos/inkwell' },
@@ -39,7 +39,7 @@ describe('stampRoutingHold', () => {
 
     expect(rpc).toHaveBeenCalledWith('stamp_routing_hold', {
       p_thread_id: 't-1',
-      p_user_id: 'u-1',
+      p_workspace_id: 'ws-1',
       p_agent_id: 'wren',
       p_attempt_started: '2026-08-19T02:00:00.000Z',
       p_hold: {
@@ -113,7 +113,7 @@ describe('clearRoutingHold', () => {
     await expect(
       clearRoutingHold(client, {
         threadId: 't-1',
-        userId: 'u-1',
+        workspaceId: 'ws-1',
         agentId: 'wren',
         routedSince: '2026-08-19T02:00:00.000Z',
       })
@@ -121,7 +121,7 @@ describe('clearRoutingHold', () => {
 
     expect(rpc).toHaveBeenCalledWith('clear_routing_hold', {
       p_thread_id: 't-1',
-      p_user_id: 'u-1',
+      p_workspace_id: 'ws-1',
       p_agent_id: 'wren',
       p_routed_since: '2026-08-19T02:00:00.000Z',
     });
@@ -132,7 +132,7 @@ describe('clearRoutingHold', () => {
     await expect(
       clearRoutingHold(nothing.client, {
         threadId: 't-1',
-        userId: 'u-1',
+        workspaceId: 'ws-1',
         agentId: 'wren',
         routedSince: 'x',
       })
@@ -142,7 +142,7 @@ describe('clearRoutingHold', () => {
     await expect(
       clearRoutingHold(failed.client, {
         threadId: 't-1',
-        userId: 'u-1',
+        workspaceId: 'ws-1',
         agentId: 'wren',
         routedSince: 'x',
       })
@@ -153,7 +153,7 @@ describe('clearRoutingHold', () => {
   it('never throws', async () => {
     const client = { rpc: vi.fn().mockRejectedValue(new Error('boom')) };
     await expect(
-      clearRoutingHold(client, { threadId: 't', userId: 'u', agentId: 'a', routedSince: 'x' })
+      clearRoutingHold(client, { threadId: 't', workspaceId: 'ws', agentId: 'a', routedSince: 'x' })
     ).resolves.toBe(false);
   });
 });
@@ -216,7 +216,7 @@ describe('the admission-refusal generation interaction (v18 S3)', () => {
 
   const holdArgs = (attemptStartedAt: string) => ({
     threadId: 't-1',
-    userId: 'u-1',
+    workspaceId: 'ws-1',
     agentId: 'wren',
     attemptStartedAt,
     detail: { triedCallerRepo: false, reason: 'occupied' as const },
@@ -232,7 +232,7 @@ describe('the admission-refusal generation interaction (v18 S3)', () => {
     // generation.
     await clearRoutingHold(client, {
       threadId: 't-1',
-      userId: 'u-1',
+      workspaceId: 'ws-1',
       agentId: 'wren',
       routedSince: T1,
     });
@@ -255,7 +255,12 @@ describe('the admission-refusal generation interaction (v18 S3)', () => {
     // A later dispatch actually delivers → its terminal clear removes the
     // hold and records the recovery.
     await expect(
-      clearRoutingHold(client, { threadId: 't-1', userId: 'u-1', agentId: 'wren', routedSince: T2 })
+      clearRoutingHold(client, {
+        threadId: 't-1',
+        workspaceId: 'ws-1',
+        agentId: 'wren',
+        routedSince: T2,
+      })
     ).resolves.toBe(true);
     expect(metadata.routingHold).toBeUndefined();
     expect(metadata.routingRecovery?.wren).toBe(T2);
@@ -266,7 +271,7 @@ describe('the admission-refusal generation interaction (v18 S3)', () => {
     // Newer dispatch (T2) succeeded and cleared at its terminal.
     await clearRoutingHold(client, {
       threadId: 't-1',
-      userId: 'u-1',
+      workspaceId: 'ws-1',
       agentId: 'wren',
       routedSince: T2,
     });
