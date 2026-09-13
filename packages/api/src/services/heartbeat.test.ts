@@ -105,6 +105,25 @@ vi.mock('@supabase/supabase-js', () => ({
   createClient: vi.fn(() => mockSupabase),
 }));
 
+// ─── Mock: notification store ───
+// Episode identity is the store's job now, so processHeartbeat's side of it is
+// "asks, and passes on what it is told". Mocked at the module boundary rather
+// than through the query builder above, because that builder returns itself for
+// every method and so cannot tell one query from another — which is precisely
+// how a sort on a nonexistent column survived sixty-one passing tests.
+const openEpisodeMock = vi.fn(async () => 'episode-default');
+const findOwedRecoveryMock = vi.fn(async () => null);
+vi.mock('./heartbeat-notification-store.js', () => ({
+  createHeartbeatNotificationStore: vi.fn(() => ({
+    openEpisode: openEpisodeMock,
+    findOwedRecovery: findOwedRecoveryMock,
+    claimNotice: vi.fn(async () => ({ shouldSend: true, record: null })),
+    settleNotice: vi.fn(async () => {}),
+    markCoveredBySibling: vi.fn(async () => {}),
+    closeEpisode: vi.fn(async () => {}),
+  })),
+}));
+
 // ─── Import module under test AFTER mocks ───
 import * as cron from 'node-cron';
 import {
@@ -159,6 +178,10 @@ describe('Heartbeat Service', () => {
     setQueryResult('heartbeat_state', null);
     // Default: history inserts succeed (return value not checked)
     setQueryResult('reminder_history', { id: 'hist-001' });
+
+    // vi.clearAllMocks() wipes the implementations above, not just the calls.
+    openEpisodeMock.mockResolvedValue('episode-default');
+    findOwedRecoveryMock.mockResolvedValue(null);
   });
 
   afterEach(() => {
@@ -1110,18 +1133,31 @@ describe('Heartbeat Service', () => {
       expect(onFailure.mock.calls[1][3]).toMatchObject({ destinationAlreadyAlerted: false });
     });
 
-    it('gives every beat of one outage the same episode key', async () => {
+    /**
+     * Round four, finding 1. This test used to assert that the episode key WAS
+     * the oldest failure's `triggered_at` — a literal copied from the history
+     * rows above it. It passed, and the behaviour it described was broken: the
+     * first beat of an outage has no prior failure row, so it fell back to an
+     * application timestamp, while the second beat read the first's
+     * `triggered_at` out of the database. Different value, different encoding,
+     * two alarms for one outage — and the test could not see it, because it
+     * asserted my belief about one beat rather than making two beats agree.
+     *
+     * The identity now comes from the store, which mints it once and hands the
+     * same string back on every later beat. So what belongs here is that
+     * delegation; that the minted key is actually stable across beats is proven
+     * against the real table in heartbeat-notification-store.integration.test.
+     */
+    it('takes the episode key from the store rather than deriving it from history', async () => {
       initHeartbeatService({ enableLocalCron: false });
 
       setQueryResult('scheduled_reminders', [makeDueReminder()]);
-      // Two failures already on the record, newest first — the OLDEST of the
-      // contiguous run is when this outage began, and therefore its identity.
-      // The delivered row below it ends the run and must not be counted.
       queueHistory([
         { status: 'failed', triggered_at: '2026-09-09T02:00:00.000Z' },
         { status: 'failed', triggered_at: '2026-09-09T01:00:00.000Z' },
         { status: 'delivered', triggered_at: '2026-09-09T00:00:00.000Z' },
       ]);
+      openEpisodeMock.mockResolvedValue('episode-minted-by-the-store');
 
       const onFailure = vi.fn().mockResolvedValue(ALERTED);
       await processHeartbeat(
@@ -1129,8 +1165,31 @@ describe('Heartbeat Service', () => {
         onFailure
       );
 
-      expect(onFailure.mock.calls[0][3]).toMatchObject({
-        episodeKey: '2026-09-09T01:00:00.000Z',
+      const context = onFailure.mock.calls[0][3];
+      expect(context).toMatchObject({ episodeKey: 'episode-minted-by-the-store' });
+      // And explicitly not any of the history timestamps that used to supply it.
+      expect(context.episodeKey).not.toBe('2026-09-09T01:00:00.000Z');
+      expect(context.episodeKey).not.toBe('2026-09-09T02:00:00.000Z');
+    });
+
+    it('asks the store for the episode of the outage it is closing, too', async () => {
+      initHeartbeatService({ enableLocalCron: false });
+
+      setQueryResult('scheduled_reminders', [makeDueReminder()]);
+      queueHistory([{ status: 'failed', triggered_at: '2026-09-09T02:00:00.000Z' }]);
+      openEpisodeMock.mockResolvedValue('episode-minted-by-the-store');
+
+      const onRecovery = vi.fn().mockResolvedValue(ALERTED);
+      await processHeartbeat(
+        vi.fn().mockResolvedValue({ status: 'delivered' }),
+        undefined,
+        onRecovery
+      );
+
+      // Both edges of one outage must name the same episode, or the all-clear
+      // can never be matched to the alarm it is closing.
+      expect(onRecovery.mock.calls[0][2]).toMatchObject({
+        episodeKey: 'episode-minted-by-the-store',
       });
     });
 

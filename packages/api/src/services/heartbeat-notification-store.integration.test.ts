@@ -1,0 +1,218 @@
+/**
+ * Notification acknowledgement store — Integration Tests (real DB)
+ *
+ * WHY THIS TIER.
+ *
+ * The unit tests for this store run against an in-memory fake, which proves the
+ * suppression RULE is right and proves nothing about the queries. Every way this
+ * module can be silently wrong lives in the part a fake cannot see: a column
+ * that does not exist, a unique constraint that does not match the key we
+ * deduplicate on, `maybeSingle()` on a query that can return more than one row.
+ *
+ * That is not a hypothetical class of bug on this branch. The failure streak
+ * this store replaces sorted `reminder_history` by `created_at`, a column that
+ * table does not have, and sixty-one unit tests passed through it because a
+ * mocked `order()` accepts any string. PostgREST answered 42703, the catch
+ * turned that into a streak of zero, and the whole alerting policy inverted.
+ *
+ * So these ask the schema, not a mock.
+ *
+ * Requires .env.local with SUPABASE_URL + SUPABASE_SECRET_KEY.
+ * Skipped automatically when credentials are unavailable.
+ */
+
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import dotenv from 'dotenv';
+import { createClient } from '@supabase/supabase-js';
+import { readFileSync, existsSync } from 'fs';
+import { resolve } from 'path';
+import { randomUUID } from 'crypto';
+import type { Database } from '../data/supabase/types';
+import { createHeartbeatNotificationStore } from './heartbeat-notification-store';
+
+const projectRoot = resolve(__dirname, '../../../../');
+const envLocalPath = resolve(projectRoot, '.env.local');
+if (existsSync(envLocalPath)) {
+  const parsed = dotenv.parse(readFileSync(envLocalPath));
+  for (const [key, value] of Object.entries(parsed)) {
+    if (!process.env[key]) process.env[key] = value;
+  }
+}
+
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_KEY;
+const available = !!(SUPABASE_URL && SUPABASE_KEY);
+
+const d = available ? describe : describe.skip;
+
+d('heartbeat notification store — real schema', () => {
+  const client = createClient<Database>(SUPABASE_URL!, SUPABASE_KEY!, {
+    auth: { autoRefreshToken: false, persistSession: false },
+  });
+  const store = createHeartbeatNotificationStore(client);
+
+  // A real reminder row, because the table carries an FK to it. Creating one is
+  // cheaper than discovering at 3am that the FK rejects our writes.
+  const userId = randomUUID();
+  const reminderId = randomUUID();
+  const episodeKey = randomUUID();
+  const baseKey = {
+    reminderId,
+    userId,
+    episodeKey,
+    destination: 'sb-test|telegram|chat-1',
+  };
+
+  beforeAll(async () => {
+    await client.from('users').insert({
+      id: userId,
+      email: `heartbeat-store-${reminderId}@example.test`,
+    } as never);
+    await client.from('scheduled_reminders').insert({
+      id: reminderId,
+      user_id: userId,
+      title: 'notification store integration fixture',
+      delivery_channel: 'telegram',
+      delivery_target: 'chat-1',
+      next_run_at: new Date().toISOString(),
+      status: 'active',
+    } as never);
+  });
+
+  afterAll(async () => {
+    // ON DELETE CASCADE takes the notification rows with it.
+    await client.from('scheduled_reminders').delete().eq('id', reminderId);
+    await client.from('users').delete().eq('id', userId);
+  });
+
+  it('creates a notice and reports that it should be sent', async () => {
+    const { shouldSend, record } = await store.claimNotice({ ...baseKey, kind: 'outage' });
+
+    // If any column in the insert were misnamed, PostgREST would reject it and
+    // the store would degrade to `record: null` — which still says shouldSend,
+    // so the record is the assertion that matters here.
+    expect(record).not.toBeNull();
+    expect(record?.status).toBe('pending');
+    expect(shouldSend).toBe(true);
+  });
+
+  it('suppresses only after a DELIVERED settle, and reads back that way', async () => {
+    const key = { ...baseKey, kind: 'outage' as const };
+
+    await store.settleNotice(key, { delivered: true });
+    const after = await store.claimNotice(key);
+
+    expect(after.record?.status).toBe('delivered');
+    expect(after.shouldSend).toBe(false);
+  });
+
+  it('keeps a failed notice retryable and counts its attempts', async () => {
+    const key = { ...baseKey, kind: 'recovery' as const };
+
+    await store.claimNotice(key);
+    await store.settleNotice(key, { delivered: false, error: 'telegram unreachable' });
+
+    const after = await store.claimNotice(key);
+    expect(after.record?.attempts).toBe(1);
+    expect(after.shouldSend).toBe(true);
+  });
+
+  it('reuses the same episode key while the outage stays open', async () => {
+    // Finding 1 of round four, against the real table. The key used to be
+    // derived from reminder_history and differed between the first beat of an
+    // outage and the second — two keys, two rows, two alarms. It is now read
+    // back from this table, so the second beat must get the first beat's key.
+    const open = await store.openEpisode(reminderId);
+    expect(open).toBe(episodeKey);
+    expect(await store.openEpisode(reminderId)).toBe(open);
+  });
+
+  it('finds the owed all-clear from the outage row, not from a recovery row', async () => {
+    // The sweep queries the OUTAGE row by (reminder, kind, status) with
+    // `episode_closed_at IS NULL`. Every one of those has to exist on the real
+    // table or a recovered outage is never announced as recovered.
+    const owed = await store.findOwedRecovery(reminderId);
+
+    expect(owed).not.toBeNull();
+    expect(owed?.episodeKey).toBe(episodeKey);
+  });
+
+  it('stops owing the all-clear once the episode is closed', async () => {
+    await store.closeEpisode({ ...baseKey, kind: 'recovery' });
+
+    expect(await store.findOwedRecovery(reminderId)).toBeNull();
+    // And a closed episode is no longer the open one, so the next failure
+    // mints a fresh key rather than reopening a settled outage.
+    expect(await store.openEpisode(reminderId)).not.toBe(episodeKey);
+  });
+
+  it('writes a backoff gate that the real column accepts', async () => {
+    // `next_attempt_at` replaced the attempt cap. If the column were misnamed
+    // the UPDATE would fail, the notice would never be gated, and a dead
+    // channel would be retried on every beat forever.
+    const key = { ...baseKey, kind: 'recovery' as const, episodeKey: randomUUID() };
+
+    await store.claimNotice(key);
+    await store.settleNotice(key, { delivered: false, error: 'unreachable' });
+    await store.settleNotice(key, { delivered: false, error: 'still unreachable' });
+
+    const { data } = await client
+      .from('heartbeat_notifications' as never)
+      .select('attempts, next_attempt_at, status')
+      .eq('reminder_id', reminderId)
+      .eq('kind', 'recovery')
+      .eq('episode_key', key.episodeKey)
+      .single();
+
+    const row = data as { attempts: number; next_attempt_at: string | null; status: string };
+    expect(row.attempts).toBe(2);
+    expect(row.status).toBe('pending');
+    expect(Date.parse(row.next_attempt_at!)).toBeGreaterThan(Date.now());
+
+    // Eligibility is retained — the cap is on frequency, not on ever trying.
+    const gated = await store.claimNotice(key);
+    expect(gated.shouldSend).toBe(false);
+    expect(gated.record?.status).toBe('pending');
+  });
+
+  it('recreates the obligation when a settle matches no row', async () => {
+    // A zero-row UPDATE is not an error in PostgREST. Settling a notice whose
+    // row was never created used to vanish silently, leaving the notice neither
+    // delivered nor owed — the shape of the silence this table exists to stop.
+    const key = { ...baseKey, kind: 'recovery' as const, episodeKey: randomUUID() };
+
+    await store.settleNotice(key, { delivered: false, error: 'never inserted' });
+
+    const after = await store.claimNotice(key);
+    expect(after.record).not.toBeNull();
+    expect(after.record?.status).toBe('pending');
+  });
+
+  it('enforces one notice per (reminder, kind, episode)', async () => {
+    // The whole design leans on this constraint: without it, two server
+    // incarnations racing the same beat would each create a row, each see its
+    // own as unsent, and both alert.
+    const { error } = await client.from('heartbeat_notifications' as never).insert({
+      reminder_id: reminderId,
+      user_id: userId,
+      kind: 'outage',
+      episode_key: episodeKey,
+      destination: 'sb-test|telegram|chat-1',
+    } as never);
+
+    expect(error).not.toBeNull();
+    expect(error?.code).toBe('23505');
+  });
+
+  it('rejects a status outside the allowed set', async () => {
+    const { error } = await client.from('heartbeat_notifications' as never).insert({
+      reminder_id: reminderId,
+      user_id: userId,
+      kind: 'outage',
+      episode_key: `${episodeKey}-bad-status`,
+      status: 'sent-probably',
+    } as never);
+
+    expect(error?.code).toBe('23514');
+  });
+});

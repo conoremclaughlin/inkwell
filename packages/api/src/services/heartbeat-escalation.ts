@@ -159,15 +159,43 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
     failedBeats,
   });
 
-  /** Resolve the agent whose beat this was, so the notice lands in their inbox. */
+  /**
+   * Resolve the agent whose beat this was, so the notice lands in their inbox.
+   *
+   * Never throws. This is a detail of the INBOX copy — the destination that
+   * cannot reach a human while the SB is down — and it ran outside the guard
+   * below, so a transport failure here aborted `onFailure` before the channel
+   * send. The durable copy taking the useful copy down with it is the exact
+   * coupling the two-destination split exists to prevent, and the identity
+   * lookup is as much a part of the inbox dependency as the insert is. Falling
+   * back to the default agent costs a slightly misaddressed inbox row; throwing
+   * costs the alert.
+   */
   const resolveFailedAgentId = async (reminder: DueReminder): Promise<string> => {
     if (!reminder.sb_id) return defaultAgentId;
-    const { data: identity } = await client
-      .from('agent_identities')
-      .select('agent_id')
-      .eq('id', reminder.sb_id)
-      .single();
-    return (identity as { agent_id?: string } | null)?.agent_id || defaultAgentId;
+    try {
+      const { data: identity, error } = await client
+        .from('agent_identities')
+        .select('agent_id')
+        .eq('id', reminder.sb_id)
+        .single();
+      if (error) {
+        logger.warn('[Heartbeat] Could not resolve the failed beat’s agent — using the default', {
+          reminderId: reminder.id,
+          sbId: reminder.sb_id,
+          error: error.message,
+        });
+        return defaultAgentId;
+      }
+      return (identity as { agent_id?: string } | null)?.agent_id || defaultAgentId;
+    } catch (err) {
+      logger.warn('[Heartbeat] Agent identity lookup threw — using the default', {
+        reminderId: reminder.id,
+        sbId: reminder.sb_id,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return defaultAgentId;
+    }
   };
 
   /**
@@ -384,6 +412,10 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
     );
 
     await store.settleNotice(key, { delivered: alert.sent, error: alert.reason });
+
+    // The debt is settled only by delivery. A failed all-clear leaves the
+    // episode open so the sweep on the next healthy beat finds it again.
+    if (alert.sent) await store.closeEpisode(key);
 
     logger.info('[Heartbeat] Announced recovery', {
       reminderId: reminder.id,
