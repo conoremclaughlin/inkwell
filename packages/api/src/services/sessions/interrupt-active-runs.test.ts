@@ -487,15 +487,23 @@ function makeClient(
 ) {
   const sessionUpdates: Record<string, unknown>[] = [];
   const threadMessages: Record<string, unknown>[] = [];
+  const legacyInserts: Record<string, unknown>[] = [];
   let reads = 0;
 
   const client = {
     from(table: string) {
       if (table === 'sessions') {
         return {
-          select: () => ({
+          select: (columns?: string) => ({
             eq: () => ({
               maybeSingle: async () => {
+                // The notice path reads the session's identity separately
+                // (spec inkmail-thread-scope §1: the thread's workspace is
+                // the identity's). That read is not the state re-read.
+                if (columns === 'sb_id') {
+                  const row = { sb_id: 'sb-lumen', ...sessionRow };
+                  return { data: { sb_id: row.sb_id }, error: null };
+                }
                 // The re-read after a zero-row match sees the row as it is
                 // NOW, which is the whole point of going back to look.
                 const row = reads++ === 0 ? sessionRow : (rowAfter ?? sessionRow);
@@ -540,11 +548,33 @@ function makeClient(
           },
         };
       }
+      if (table === 'agent_identities') {
+        // lumen's identity lives in ws-1; the notice resolves the thread there.
+        return {
+          select: () => ({
+            eq: (_col: string, id: unknown) => ({
+              maybeSingle: async () => ({
+                data:
+                  id === 'sb-lumen'
+                    ? { id: 'sb-lumen', agent_id: 'lumen', user_id: 'user-1', workspace_id: 'ws-1' }
+                    : null,
+                error: null,
+              }),
+            }),
+          }),
+        };
+      }
       if (table === 'inbox_threads') {
         return {
           select: () => ({
-            eq: () => ({
-              eq: () => ({ maybeSingle: async () => ({ data: { id: 'thread-1' }, error: null }) }),
+            eq: (_col: string, workspaceId: unknown) => ({
+              eq: () => ({
+                maybeSingle: async () => ({
+                  // One row per (workspace, key): only ws-1 has pr:485.
+                  data: workspaceId === 'ws-1' ? { id: 'thread-1' } : null,
+                  error: null,
+                }),
+              }),
             }),
           }),
           update: () => ({ eq: async () => ({ error: null }) }),
@@ -558,11 +588,19 @@ function makeClient(
           },
         };
       }
+      if (table === 'agent_inbox') {
+        return {
+          insert: async (row: Record<string, unknown>) => {
+            legacyInserts.push(row);
+            return { error: null };
+          },
+        };
+      }
       return { insert: async () => ({ error: null }) };
     },
   };
 
-  return { client, sessionUpdates, threadMessages };
+  return { client, sessionUpdates, threadMessages, legacyInserts };
 }
 
 describe('interruptActiveRuns', () => {
@@ -610,13 +648,38 @@ describe('interruptActiveRuns', () => {
     expect(threadMessages).toHaveLength(1);
     const posted = threadMessages[0]!;
     expect(posted.thread_id).toBe('thread-1');
-    // 'system', never the interrupted agent — a synthetic row in their name
-    // would shadow their newest real message in recipient-session lookup.
-    expect(posted.sender_agent_id).toBe('system');
+    // The system, never the interrupted agent — a synthetic row in their
+    // name would shadow their newest real message in recipient-session
+    // lookup. Since the cutover the system is a KIND with no identity and
+    // no slug (spec inkmail-thread-scope §3).
+    expect(posted).toMatchObject({
+      sender_kind: 'system',
+      sender_sb_id: null,
+      sender_user_id: null,
+      sender_agent_id: null,
+    });
     expect(String(posted.content)).toContain('cut short');
     expect(String(posted.content)).toContain('codex-cli');
     expect(String(posted.content)).toContain('lumen');
     expect(String(posted.content)).toContain('pr:485');
+  });
+
+  it('a session with no identity names no workspace: the notice takes the legacy lane, not the thread', async () => {
+    // A bare thread key resolves only inside a workspace — keys repeat across
+    // workspaces on purpose (§1). With no identity to derive one from, the
+    // notice is not posted into a guessed thread; the agent-scoped inbox
+    // still carries it.
+    const { client, threadMessages, legacyInserts } = makeClient({ sb_id: null });
+    const [outcome] = await interruptActiveRuns(client, [run()]);
+
+    expect(threadMessages).toHaveLength(0);
+    expect(legacyInserts).toHaveLength(1);
+    expect(legacyInserts[0]).toMatchObject({
+      recipient_user_id: 'user-1',
+      recipient_agent_id: 'wren',
+      thread_key: 'pr:485',
+    });
+    expect(outcome).toMatchObject({ marked: true, noticed: true });
   });
 
   it('still terminalizes a threadless run, with no notice to post', async () => {

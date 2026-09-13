@@ -15,6 +15,14 @@ vi.mock('../../utils/logger', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
+// The registry is workspace-scoped (spec inkmail-thread-scope §1b): the
+// tools resolve the caller's workspace at the boundary. Mocked here so these
+// tests stay about the handlers; the resolver has its own tests.
+const resolveCallerWorkspace = vi.fn().mockResolvedValue({ workspaceId: 'ws-1', sb: null });
+vi.mock('./caller-principal', () => ({
+  resolveCallerWorkspace: (...args: unknown[]) => resolveCallerWorkspace(...args),
+}));
+
 interface TableResults {
   [table: string]: { data?: unknown; error?: { message: string } | null };
 }
@@ -56,6 +64,8 @@ describe('handleSetThreadKeyType', () => {
         composer as any
       )
     ).rejects.toThrow(/collides with your project slug/);
+    // The check ran in the caller's workspace, resolved for this user.
+    expect(resolveCallerWorkspace).toHaveBeenCalledWith(expect.anything(), 'user-1');
   });
 
   it('FAILS CLOSED when the slug-collision check itself errors', async () => {
@@ -101,7 +111,7 @@ describe('handleSetThreadKeyType', () => {
       thread_key_types: {
         data: {
           id: 'o2',
-          user_id: 'user-1',
+          workspace_id: 'ws-1',
           type: 'standup',
           write_intent: 'presence',
           studio_policy: 'reuse-only',
@@ -132,7 +142,7 @@ describe('handleSetThreadKeyType', () => {
       thread_key_types: {
         data: {
           id: 'o1',
-          user_id: 'user-1',
+          workspace_id: 'ws-1',
           type: 'standup',
           write_intent: 'write',
           studio_policy: 'provision',
@@ -165,7 +175,7 @@ describe('handleListThreadKeyTypes', () => {
         data: [
           {
             id: 't1',
-            user_id: null,
+            workspace_id: null,
             type: 'pr',
             write_intent: 'write',
             studio_policy: 'provision',
@@ -175,7 +185,7 @@ describe('handleListThreadKeyTypes', () => {
           },
           {
             id: 't2',
-            user_id: null,
+            workspace_id: null,
             type: 'spec',
             write_intent: 'presence',
             studio_policy: 'reuse-only',
