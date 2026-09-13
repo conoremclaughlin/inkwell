@@ -93,7 +93,9 @@ describe("SB callers act with their owner's membership; carriers follow the work
       return data.id as string;
     };
     viewerSbId = await identity(workspaceId, VIEWER_SB);
-    viewerHomeSbId = await identity(viewerPersonalWorkspaceId, VIEWER_SB);
+    // A different slug at home: the same slug in two of the viewer's
+    // workspaces would (rightly) fail the unbound caller closed as ambiguous.
+    viewerHomeSbId = await identity(viewerPersonalWorkspaceId, `${VIEWER_SB}-home`);
 
     const { data: thread, error: threadErr } = await supabase
       .from('inbox_threads')
@@ -135,7 +137,7 @@ describe("SB callers act with their owner's membership; carriers follow the work
       },
       {
         user_id: viewerUserId,
-        agent_id: VIEWER_SB,
+        agent_id: `${VIEWER_SB}-home`,
         sb_id: viewerHomeSbId,
         thread_key: threadKey,
         status: 'active',
@@ -208,8 +210,12 @@ describe("SB callers act with their owner's membership; carriers follow the work
       res as unknown as Response
     );
     expect(res._status).toBe(200);
-    const body = res._json as { sessions: Array<{ id: string; threadKey: string | null }> };
-    const onKey = body.sessions.filter((s) => s.threadKey === threadKey).map((s) => s.id);
+    const body = res._json as {
+      spines: Array<{ key: string; sessions: Array<{ id: string }> }>;
+    };
+    const spine = body.spines.find((sp) => sp.key === threadKey);
+    expect(spine).toBeDefined();
+    const onKey = spine!.sessions.map((sess) => sess.id);
     expect(onKey).toContain(sessionIds[0]);
     expect(onKey).not.toContain(sessionIds[1]);
   });
