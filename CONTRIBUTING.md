@@ -123,6 +123,14 @@ Its regression suite is `scripts/check-commit-msg.test.sh` (synthetic fixtures, 
 leaking commits by SHA and sweeps `main` for false positives; it is not in CI because a
 shallow clone does not have the history it needs.
 
+That sweep carries a short list of full SHAs whose messages it flags and which have been read
+and confirmed to hold no credential — prose about this guard, written before the guidance above
+existed. They are reported as known prose rather than as findings, so the sweep stays green and
+stays worth running. The list lives only in the history sweep: **the hook itself has no
+exemptions**, a commit already in `main` cannot be made safe by refusing it, and a scan that
+fails to complete is a failure whether or not the commit is listed. Adding to it means reading
+the whole message first and saying so in the comment beside the SHA.
+
 ### Branching
 
 We follow [GitHub flow](https://www.geeksforgeeks.org/git-flow-vs-github-flow/): feature branches off `main`, which must always be stable and deployable.
