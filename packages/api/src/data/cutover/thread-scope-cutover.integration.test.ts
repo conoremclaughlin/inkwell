@@ -723,5 +723,240 @@ describe.skipIf(!REHEARSAL)(
         await rollback();
       }
     });
+    // ── Lumen's #616 review, round 1: each reproduced on the c95f7aaa head ──
+
+    it('(Lumen P1) the regrant refusal reads one row: a closed namesake in another workspace does not refuse a regrant here, and a regrant without a workspace is refused', async () => {
+      await begin();
+      try {
+        const w = await world();
+        await member(w.w2, w.owner);
+        const a = await thread(w.owner, { key: 'pr:shared-name' });
+        const b = await thread(w.other, {
+          key: 'pr:shared-name',
+          createdBy: 'aster',
+          closedBy: 'aster',
+          participants: ['aster'],
+        });
+        await attestThread(a, w.w1);
+        await attestAllAsSlugs(a);
+        await attestThread(b, w.w2);
+        await attestAllAsSlugs(b);
+        expect(await runCutover()).toEqual({ ok: true });
+
+        const session = await one<{ id: string }>(
+          `INSERT INTO public.sessions (user_id, agent_id, lifecycle) VALUES ($1, 'wren', 'idle') RETURNING id`,
+          [w.owner]
+        );
+        const studio = await one<{ id: string }>(
+          `INSERT INTO public.studios (user_id, agent_id, session_id, repo_root, worktree_path, branch, status, lease)
+         VALUES ($1, 'wren', $2, '/tmp/pr616-regrant', '/tmp/pr616-regrant', 'wren/regrant', 'active', NULL) RETURNING id`,
+          [w.owner, session.id]
+        );
+        const claim = (regrant: Record<string, unknown>) =>
+          one<{ r: { outcome: string } }>(
+            `SELECT public.claim_turn_epoch($1, true, NULL, $2, $3::jsonb, 'probe') AS r`,
+            [
+              session.id,
+              studio.id,
+              JSON.stringify({ sessionId: session.id, agentId: 'wren', ...regrant }),
+            ]
+          );
+
+        // Open A in w1, closed B in w2, same key. The regrant names its workspace.
+        expect((await claim({ threadKey: 'pr:shared-name', workspaceId: w.w1 })).r.outcome).toBe(
+          'claimed'
+        );
+        // Reset the lease so the next claims go through the regrant branch again.
+        await pg.query(`UPDATE public.studios SET lease = NULL WHERE id = $1`, [studio.id]);
+        expect((await claim({ threadKey: 'pr:shared-name', workspaceId: w.w2 })).r.outcome).toBe(
+          'lease-lost'
+        );
+        await pg.query(`UPDATE public.studios SET lease = NULL WHERE id = $1`, [studio.id]);
+        // No workspace: cannot be checked, so refused rather than guessed.
+        expect((await claim({ threadKey: 'pr:shared-name' })).r.outcome).toBe('lease-lost');
+      } finally {
+        await rollback();
+      }
+    });
+
+    it('(Lumen P2) an existing closure needs a non-null principal kind: NULL kind fails with and without ids; a real closer passes', async () => {
+      await begin();
+      try {
+        const w = await world();
+        const t = await thread(w.owner);
+        await attestThread(t, w.w1);
+        await attestAllAsSlugs(t);
+        expect(await runCutover()).toEqual({ ok: true });
+
+        await pg.query('SAVEPOINT k1');
+        await expect(
+          pg.query(
+            `UPDATE public.inbox_threads SET status = 'closed', closed_at = now() WHERE id = $1`,
+            [t]
+          )
+        ).rejects.toThrow(/inbox_threads_closer_principal/);
+        await pg.query('ROLLBACK TO SAVEPOINT k1');
+        await pg.query('SAVEPOINT k2');
+        await expect(
+          pg.query(
+            `UPDATE public.inbox_threads SET status = 'closed', closed_at = now(), closed_by_sb_id = $2 WHERE id = $1`,
+            [t, w.lumen]
+          )
+        ).rejects.toThrow(/inbox_threads_closer_principal/);
+        await pg.query('ROLLBACK TO SAVEPOINT k2');
+        await pg.query(
+          `UPDATE public.inbox_threads SET status = 'closed', closed_at = now(), closed_by_kind = 'sb', closed_by_sb_id = $2 WHERE id = $1`,
+          [t, w.lumen]
+        );
+        expect(
+          await one(`SELECT status, closed_by_kind FROM public.inbox_threads WHERE id = $1`, [t])
+        ).toEqual({
+          status: 'closed',
+          closed_by_kind: 'sb',
+        });
+      } finally {
+        await rollback();
+      }
+    });
+
+    it('(Lumen P2) the namespace is the workspace: one owner reuses a slug and an alias across two workspaces, and neither twice in one', async () => {
+      await begin();
+      try {
+        const w = await world();
+        await member(w.w2, w.owner);
+        expect(await runCutover()).toEqual({ ok: true });
+
+        const a = await one<{ id: string }>(
+          `INSERT INTO public.projects (user_id, workspace_id, name, slug) VALUES ($1, $2, 'A', 'demo') RETURNING id`,
+          [w.owner, w.w1]
+        );
+        const b = await one<{ id: string }>(
+          `INSERT INTO public.projects (user_id, workspace_id, name, slug) VALUES ($1, $2, 'B', 'demo') RETURNING id`,
+          [w.owner, w.w2]
+        );
+        await pg.query('SAVEPOINT u1');
+        await expect(
+          pg.query(
+            `INSERT INTO public.projects (user_id, workspace_id, name, slug) VALUES ($1, $2, 'C', 'demo')`,
+            [w.owner, w.w1]
+          )
+        ).rejects.toThrow(/projects_workspace_slug/);
+        await pg.query('ROLLBACK TO SAVEPOINT u1');
+
+        await pg.query(
+          `INSERT INTO public.project_slug_aliases (user_id, workspace_id, alias, project_id) VALUES ($1, $2, 'old-demo', $3)`,
+          [w.owner, w.w1, a.id]
+        );
+        await pg.query(
+          `INSERT INTO public.project_slug_aliases (user_id, workspace_id, alias, project_id) VALUES ($1, $2, 'old-demo', $3)`,
+          [w.owner, w.w2, b.id]
+        );
+        await pg.query('SAVEPOINT u2');
+        await expect(
+          pg.query(
+            `INSERT INTO public.project_slug_aliases (user_id, workspace_id, alias, project_id) VALUES ($1, $2, 'old-demo', $3)`,
+            [w.owner, w.w1, a.id]
+          )
+        ).rejects.toThrow(/project_slug_aliases_workspace_alias_key/);
+        await pg.query('ROLLBACK TO SAVEPOINT u2');
+      } finally {
+        await rollback();
+      }
+    });
+
+    it('(Lumen P2) deleting a workspace cascades through identities, threads and participants; deleting an identity on its own is still refused', async () => {
+      await begin();
+      try {
+        const w = await world();
+        const t = await thread(w.owner);
+        await attestThread(t, w.w1);
+        await attestAllAsSlugs(t);
+        expect(await runCutover()).toEqual({ ok: true });
+
+        // Standalone: the deferred check fires at the boundary.
+        await pg.query('SAVEPOINT d1');
+        await pg.query(`DELETE FROM public.agent_identities WHERE id = $1`, [w.wren]);
+        await expect(pg.query(`SET CONSTRAINTS ALL IMMEDIATE`)).rejects.toThrow(
+          /inbox_thread_participants_sb_workspace_fkey/
+        );
+        await pg.query('ROLLBACK TO SAVEPOINT d1');
+
+        // The whole workspace: identities and threads go together, and by the
+        // boundary nothing dangles.
+        await pg.query(`DELETE FROM public.workspaces WHERE id = $1`, [w.w1]);
+        await pg.query(`SET CONSTRAINTS ALL IMMEDIATE`);
+        expect(await many(`SELECT id FROM public.inbox_threads WHERE id = $1`, [t])).toEqual([]);
+        expect(
+          await many(`SELECT id FROM public.agent_identities WHERE id = $1`, [w.wren])
+        ).toEqual([]);
+      } finally {
+        await rollback();
+      }
+    });
+
+    it('(Lumen) a row attestation overrides a differently classified batch for that row only', async () => {
+      await begin();
+      try {
+        const w = await world();
+        const t = await thread(w.owner);
+        const a = await message(t, 'unknown');
+        const b = await message(t, 'unknown');
+        await attestThread(t, w.w1);
+        await attestAllAsSlugs(t);
+        await attest('message', t, 'unknown', { kind: 'system' });
+        await attest('message', t, 'unknown', { kind: 'user', userId: w.owner }, a);
+        expect(await runCutover()).toEqual({ ok: true });
+        expect(
+          await one(
+            `SELECT sender_kind, sender_user_id FROM public.inbox_thread_messages WHERE id = $1`,
+            [a]
+          )
+        ).toEqual({
+          sender_kind: 'user',
+          sender_user_id: w.owner,
+        });
+        expect(
+          await one(`SELECT sender_kind FROM public.inbox_thread_messages WHERE id = $1`, [b])
+        ).toEqual({
+          sender_kind: 'system',
+        });
+      } finally {
+        await rollback();
+      }
+    });
+
+    it('(Lumen) moving a project between workspaces carries its aliases and refuses a destination type collision', async () => {
+      await begin();
+      try {
+        const w = await world();
+        await member(w.w2, w.owner);
+        expect(await runCutover()).toEqual({ ok: true });
+        const p = await one<{ id: string }>(
+          `INSERT INTO public.projects (user_id, workspace_id, name, slug) VALUES ($1, $2, 'A', 'demo-a') RETURNING id`,
+          [w.owner, w.w1]
+        );
+        await pg.query(
+          `INSERT INTO public.project_slug_aliases (user_id, workspace_id, alias, project_id) VALUES ($1, $2, 'old-demo', $3)`,
+          [w.owner, w.w1, p.id]
+        );
+        await pg.query(`UPDATE public.projects SET workspace_id = $1 WHERE id = $2`, [w.w2, p.id]);
+        expect(
+          await one(`SELECT workspace_id FROM public.project_slug_aliases WHERE project_id = $1`, [
+            p.id,
+          ])
+        ).toEqual({
+          workspace_id: w.w2,
+        });
+        await pg.query(
+          `INSERT INTO public.thread_key_types (workspace_id, type, write_intent, studio_policy) VALUES ($1, 'old-demo', 'write', 'provision')`,
+          [w.w1]
+        );
+        await expect(
+          pg.query(`UPDATE public.projects SET workspace_id = $1 WHERE id = $2`, [w.w1, p.id])
+        ).rejects.toThrow(/collides/);
+      } finally {
+        await rollback();
+      }
+    });
   }
 );

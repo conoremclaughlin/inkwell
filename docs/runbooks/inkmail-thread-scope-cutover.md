@@ -66,6 +66,9 @@ closer, and attesting one aborts).
    (`integration-db-cutover-rehearsal`: the stack comes up at the pre-cutover
    schema and `packages/api/src/data/cutover/thread-scope-cutover.integration.test.ts`
    executes the migration file per fixture inside a rolled-back transaction).
+   CI runs for pushes and pull requests on `main` and `release/**`; a local
+   green run is evidence for the PR body, the CI check on the exact head is
+   the gate.
 
 ## The window
 
@@ -106,7 +109,8 @@ the fallback. The old binary cannot run against the dropped columns.
 7. SQL rewritten for the new columns: `get_unread_thread_candidates(p_sb_id, …)`,
    `advance_thread_read_pointer(p_thread_id, p_sb_id, p_user_id, …)`,
    `stamp_routing_hold` / `clear_routing_hold` (`p_workspace_id`),
-   `claim_turn_epoch` (closed-thread regrant refusal via the studio owner's workspaces),
+   `claim_turn_epoch` (the closed-thread regrant refusal reads the one row
+   `(p_regrant->>'workspaceId', threadKey)`; a regrant without a workspace is refused),
    `reopen_inbox_thread(p_thread_id, p_actor_sb_id, p_actor_user_id)`.
 8. Drops `inbox_threads.user_id`, `created_by_agent_id`, `closed_by_agent_id`,
    `inbox_thread_participants.agent_id`, `inbox_thread_read_status.agent_id`.

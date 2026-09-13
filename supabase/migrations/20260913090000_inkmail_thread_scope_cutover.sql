@@ -227,6 +227,9 @@ ALTER TABLE public.projects
   ADD CONSTRAINT projects_workspace_id_fkey
     FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE;
 CREATE INDEX idx_projects_workspace_id ON public.projects (workspace_id);
+-- The namespace is the workspace now: one owner may use one slug in two of
+-- their workspaces, so the per-user uniqueness goes (Lumen, #616 P2).
+DROP INDEX public.projects_user_slug;
 CREATE UNIQUE INDEX projects_workspace_slug
   ON public.projects (workspace_id, slug) WHERE slug IS NOT NULL;
 
@@ -244,7 +247,8 @@ ALTER TABLE public.project_slug_aliases
   ALTER COLUMN workspace_id SET NOT NULL,
   ADD CONSTRAINT project_slug_aliases_workspace_id_fkey
     FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id) ON DELETE CASCADE,
-  ADD CONSTRAINT project_slug_aliases_workspace_alias_key UNIQUE (workspace_id, alias);
+  ADD CONSTRAINT project_slug_aliases_workspace_alias_key UNIQUE (workspace_id, alias),
+  DROP CONSTRAINT project_slug_aliases_user_id_alias_key;
 
 -- Thread-key types: NULL workspace = global template, exactly the shape the
 -- per-user override used (two partial unique indexes). user_id goes.
@@ -542,14 +546,17 @@ ALTER TABLE public.inbox_threads
     OR (created_by_kind = 'system' AND created_by_sb_id IS NULL AND created_by_user_id IS NULL)
   ),
   -- Closure may not have happened: no closed_at means no closer at all (§3).
-  ADD CONSTRAINT inbox_threads_closer_principal CHECK (
+  -- `IS TRUE`: a NULL kind on a closed thread must fail, not pass as
+  -- unknown — a closure without a principal is exactly what §3 forbids
+  -- (Lumen, #616 P2).
+  ADD CONSTRAINT inbox_threads_closer_principal CHECK ((
     (closed_at IS NULL AND closed_by_kind IS NULL AND closed_by_sb_id IS NULL AND closed_by_user_id IS NULL)
-    OR (closed_at IS NOT NULL AND (
+    OR (closed_at IS NOT NULL AND closed_by_kind IS NOT NULL AND (
       (closed_by_kind = 'sb' AND closed_by_sb_id IS NOT NULL AND closed_by_user_id IS NULL)
       OR (closed_by_kind = 'user' AND closed_by_user_id IS NOT NULL AND closed_by_sb_id IS NULL)
       OR (closed_by_kind = 'system' AND closed_by_sb_id IS NULL AND closed_by_user_id IS NULL)
     ))
-  );
+  ) IS TRUE);
 CREATE INDEX idx_inbox_threads_workspace_status ON public.inbox_threads (workspace_id, status);
 
 ALTER TABLE public.inbox_thread_participants
@@ -564,8 +571,14 @@ ALTER TABLE public.inbox_thread_participants
   -- of the workspace fails against its live participant rows.
   ADD CONSTRAINT inbox_thread_participants_thread_workspace_fkey
     FOREIGN KEY (thread_id, workspace_id) REFERENCES public.inbox_threads (id, workspace_id) ON DELETE CASCADE,
+  -- NO ACTION, checked at commit: deleting an identity on its own still
+  -- fails against its live participant rows, while deleting a whole
+  -- workspace — which cascades to identities AND (through threads) to these
+  -- rows — completes, because by commit nothing dangles. RESTRICT checked
+  -- the identity edge before the thread cascade had run (Lumen, #616 P2).
   ADD CONSTRAINT inbox_thread_participants_sb_workspace_fkey
-    FOREIGN KEY (sb_id, workspace_id) REFERENCES public.agent_identities (id, workspace_id) ON DELETE RESTRICT,
+    FOREIGN KEY (sb_id, workspace_id) REFERENCES public.agent_identities (id, workspace_id)
+    ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED,
   ADD CONSTRAINT inbox_thread_participants_user_id_fkey
     FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
 CREATE INDEX idx_inbox_thread_participants_sb
@@ -839,10 +852,10 @@ REVOKE ALL ON FUNCTION public.reopen_inbox_thread(uuid, uuid, uuid) FROM anon, a
 GRANT EXECUTE ON FUNCTION public.reopen_inbox_thread(uuid, uuid, uuid) TO service_role;
 
 -- claim_turn_epoch: the closed-thread regrant refusal addressed the thread
--- by (user_id, thread_key). A studio belongs to a user; a thread to a
--- workspace. The refusal now looks across the workspaces the studio's owner
--- is a member of. Everything else in the function is unchanged (verbatim
--- from 20260902052443).
+-- by (user_id, thread_key). The canonical key is (workspace_id, thread_key)
+-- now, so the regrant payload names the workspace and the check reads that
+-- one row; a payload without one is refused. Everything else in the
+-- function is unchanged (verbatim from 20260902052443).
 DROP FUNCTION IF EXISTS public.claim_turn_epoch(uuid, boolean, timestamptz, uuid, jsonb, text);
 
 CREATE FUNCTION public.claim_turn_epoch(
@@ -923,10 +936,15 @@ BEGIN
       IF p_regrant IS NULL
          OR v_studio.status NOT IN ('active', 'idle')
          OR (v_studio.expires_at IS NOT NULL AND v_studio.expires_at <= now())
+         -- The thread a regrant is for is one row: (workspace_id, thread_key)
+         -- is the canonical key now, and workspace-local keys repeat across
+         -- workspaces on purpose. A regrant that does not say which workspace
+         -- cannot be checked, so it is refused (fail closed) rather than
+         -- matched against every namesake the owner can see. (Lumen, #616 P1.)
+         OR (p_regrant->>'workspaceId') IS NULL
          OR EXISTS (
            SELECT 1 FROM public.inbox_threads t
-           JOIN public.workspace_members wm ON wm.workspace_id = t.workspace_id
-           WHERE wm.user_id = v_studio.user_id
+           WHERE t.workspace_id = (p_regrant->>'workspaceId')::uuid
              AND t.thread_key = p_regrant->>'threadKey'
              AND t.status = 'closed'
          )
