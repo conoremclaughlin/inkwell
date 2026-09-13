@@ -18,6 +18,7 @@ import { CronExpressionParser } from 'cron-parser';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { env } from '../config/env.js';
 import { logger } from '../utils/logger.js';
+import { createHeartbeatNotificationStore } from './heartbeat-notification-store.js';
 import type { Database, Json } from '../data/supabase/types.js';
 
 // DueReminder is the subset of fields we need for processing
@@ -181,15 +182,50 @@ export type HeartbeatDeliveryOutcome =
 export type HeartbeatDeliverResult = boolean | HeartbeatDeliveryOutcome;
 
 /**
- * What else this run already said to the same place.
+ * What else this run already said to the same place, and which outage we are
+ * talking about.
  *
  * `destinationAlreadyAlerted` means a sibling beat — same SB, same channel,
- * same address — has already produced this run's outage alert or all-clear.
+ * same address — has already SUCCESSFULLY produced this run's outage alert or
+ * all-clear. Successfully is the operative word: an attempted-but-failed send
+ * does not claim the destination, or one dead send would silence every sibling.
  * The durable per-reminder record is still written either way; it is only the
  * unsolicited message to the human that collapses.
+ *
+ * `episodeKey` identifies the outage itself, so "have we already told them
+ * about THIS one" is answerable across beats and across restarts. It is the
+ * timestamp of the oldest failure in the current contiguous run of failures —
+ * stable for as long as the outage lasts, and shared by the outage notice and
+ * the recovery notice that closes it.
  */
 export interface HeartbeatEscalationContext {
   destinationAlreadyAlerted: boolean;
+  episodeKey: string;
+  destination: string | null;
+}
+
+/**
+ * What a hook reports back.
+ *
+ * `alerted` must mean a notice actually reached the human, not that one was
+ * attempted. It is what decides whether the destination is claimed for the rest
+ * of the run, and treating an attempt as an outcome here is precisely the defect
+ * that made a single failed send silence every subsequent beat.
+ */
+export interface HeartbeatNoticeResult {
+  alerted: boolean;
+}
+
+/**
+ * The current run of consecutive failures, and when it began.
+ *
+ * `episodeStartedAt` is null when there is no run — either the last beat
+ * succeeded, or the streak could not be read. Callers treat an unknown episode
+ * as a new one, which fails toward alerting.
+ */
+interface FailureStreak {
+  streak: number;
+  episodeStartedAt: string | null;
 }
 
 export type HeartbeatFailureHook = (
@@ -197,13 +233,13 @@ export type HeartbeatFailureHook = (
   error: string,
   consecutive: number,
   context: HeartbeatEscalationContext
-) => Promise<void>;
+) => Promise<HeartbeatNoticeResult | void>;
 
 export type HeartbeatRecoveryHook = (
   reminder: DueReminder,
   failedBeats: number,
   context: HeartbeatEscalationContext
-) => Promise<void>;
+) => Promise<HeartbeatNoticeResult | void>;
 
 function normalizeDeliveryOutcome(result: HeartbeatDeliverResult): HeartbeatDeliveryOutcome {
   if (typeof result !== 'boolean') return result;
@@ -286,13 +322,25 @@ export async function processHeartbeat(
   const alertedThisRun = new Set<string>();
   const recoveredThisRun = new Set<string>();
 
-  /** Records the destination and reports whether it had already been told. */
-  const claimDestination = (seen: Set<string>, reminder: DueReminder): boolean => {
+  /**
+   * Whether this destination has already been told, WITHOUT claiming it.
+   *
+   * Peek and claim are separate because the claim has to wait for the send to
+   * succeed. The original single `claimDestination` added the key before the
+   * hook ran — so if the first beat's send failed, it had still claimed the
+   * destination and silenced its sibling, and no alert reached anyone. An
+   * attempt is not an outcome.
+   */
+  const destinationAlreadyTold = (seen: Set<string>, reminder: DueReminder): boolean => {
     const destination = alertDestination(reminder);
     if (!destination) return false;
-    if (seen.has(destination)) return true;
-    seen.add(destination);
-    return false;
+    return seen.has(destination);
+  };
+
+  /** Claim the destination — only ever called after a notice actually landed. */
+  const markDestinationTold = (seen: Set<string>, reminder: DueReminder): void => {
+    const destination = alertDestination(reminder);
+    if (destination) seen.add(destination);
   };
 
   // Process each reminder
@@ -348,19 +396,34 @@ export async function processHeartbeat(
       // Read the streak BEFORE recording this attempt, so it describes the run
       // of beats leading up to now. Recording first would make every failure
       // look like at least its own predecessor.
-      const priorFailures =
-        outcome.status === 'skipped' ? 0 : await consecutiveFailureCount(reminder.id);
+      const history: FailureStreak =
+        outcome.status === 'skipped'
+          ? { streak: 0, episodeStartedAt: null }
+          : await consecutiveFailureCount(reminder.id);
+      const priorFailures = history.streak;
 
       if (outcome.status === 'delivered') {
         stats.delivered++;
         await recordDeliveryAttempt(reminder.id, 'delivered');
         if (priorFailures > 0) {
-          await announceRecovery(
+          const alerted = await announceRecovery(
             reminder,
             priorFailures,
             onRecovery,
-            claimDestination(recoveredThisRun, reminder)
+            destinationAlreadyTold(recoveredThisRun, reminder),
+            // The episode that just ended. Shares its key with the outage
+            // notice, so the two edges of one outage pair up.
+            history.episodeStartedAt ?? new Date().toISOString(),
+            alertDestination(reminder)
           );
+          if (alerted) markDestinationTold(recoveredThisRun, reminder);
+        } else {
+          // A recovery notice whose send failed has no edge to fire on again:
+          // once the beat is healthy the streak is zero, so the branch above
+          // never runs. This is its retry. Without it, round two's "a failed
+          // recovery send has no triggering edge on the next healthy beat"
+          // stays true no matter how durable the record is.
+          await retryPendingRecovery(reminder, onRecovery, recoveredThisRun);
         }
       } else if (outcome.status === 'skipped') {
         // Deliberate no-op — a self-cancelling watchdog on a finished group,
@@ -385,28 +448,36 @@ export async function processHeartbeat(
           error: reason,
         });
         await recordDeliveryAttempt(reminder.id, 'failed', reason);
-        await escalate(
+        const alerted = await escalate(
           reminder,
           reason,
           priorFailures + 1,
           onFailure,
-          claimDestination(alertedThisRun, reminder)
+          destinationAlreadyTold(alertedThisRun, reminder),
+          // On the first failure of an outage there is no prior failure row to
+          // date it from, so this attempt IS the start of the episode.
+          history.episodeStartedAt ?? new Date().toISOString(),
+          alertDestination(reminder)
         );
+        if (alerted) markDestinationTold(alertedThisRun, reminder);
       }
     } catch (error) {
       logger.error(`Failed to process reminder ${reminder.id}:`, error);
       stats.failed++;
       const reason = error instanceof Error ? error.message : 'Unknown error';
-      const priorFailures = await consecutiveFailureCount(reminder.id);
+      const history = await consecutiveFailureCount(reminder.id);
       await recordDeliveryAttempt(reminder.id, 'failed', reason);
       // A throw is exactly as silent as a false return — escalate both.
-      await escalate(
+      const alerted = await escalate(
         reminder,
         reason,
-        priorFailures + 1,
+        history.streak + 1,
         onFailure,
-        claimDestination(alertedThisRun, reminder)
+        destinationAlreadyTold(alertedThisRun, reminder),
+        history.episodeStartedAt ?? new Date().toISOString(),
+        alertDestination(reminder)
       );
+      if (alerted) markDestinationTold(alertedThisRun, reminder);
     }
   }
 
@@ -433,17 +504,27 @@ async function escalate(
   reason: string,
   consecutive: number,
   onFailure?: HeartbeatFailureHook,
-  destinationAlreadyAlerted = false
-): Promise<void> {
-  if (!onFailure) return;
+  destinationAlreadyAlerted = false,
+  episodeKey = new Date().toISOString(),
+  destination: string | null = null
+): Promise<boolean> {
+  if (!onFailure) return false;
   try {
-    await onFailure(reminder, reason, consecutive, { destinationAlreadyAlerted });
+    const result = await onFailure(reminder, reason, consecutive, {
+      destinationAlreadyAlerted,
+      episodeKey,
+      destination,
+    });
+    return typeof result === 'object' && result !== null && result.alerted === true;
   } catch (err) {
     logger.error('[Heartbeat] Escalation itself failed', {
       reminderId: reminder.id,
       originalError: reason,
       escalationError: err instanceof Error ? err.message : String(err),
     });
+    // A hook that threw did not alert anyone, so the destination stays unclaimed
+    // and a sibling beat is still free to try.
+    return false;
   }
 }
 
@@ -458,21 +539,78 @@ async function announceRecovery(
   reminder: DueReminder,
   failedBeats: number,
   onRecovery?: HeartbeatRecoveryHook,
-  destinationAlreadyAlerted = false
-): Promise<void> {
+  destinationAlreadyAlerted = false,
+  episodeKey = new Date().toISOString(),
+  destination: string | null = null
+): Promise<boolean> {
   logger.info('[Heartbeat] Recovered after failures', {
     reminderId: reminder.id,
     title: reminder.title,
     failedBeats,
   });
-  if (!onRecovery) return;
+  if (!onRecovery) return false;
   try {
-    await onRecovery(reminder, failedBeats, { destinationAlreadyAlerted });
+    const result = await onRecovery(reminder, failedBeats, {
+      destinationAlreadyAlerted,
+      episodeKey,
+      destination,
+    });
+    return typeof result === 'object' && result !== null && result.alerted === true;
   } catch (err) {
     logger.error('[Heartbeat] Recovery notice itself failed', {
       reminderId: reminder.id,
       failedBeats,
       recoveryError: err instanceof Error ? err.message : String(err),
+    });
+    return false;
+  }
+}
+
+/**
+ * Retry an all-clear that was owed but never landed.
+ *
+ * A recovery notice only has one natural trigger: the beat that goes from
+ * failing to healthy. If its send fails there, the streak is already zero by
+ * the next beat, so that edge never comes round again and the human is left
+ * holding an outage alert for something that recovered hours ago. This sweep
+ * runs on healthy beats that are NOT a recovery edge and gives the pending
+ * notice its remaining attempts.
+ */
+async function retryPendingRecovery(
+  reminder: DueReminder,
+  onRecovery: HeartbeatRecoveryHook | undefined,
+  recoveredThisRun: Set<string>
+): Promise<void> {
+  if (!onRecovery || !supabase) return;
+
+  try {
+    const store = createHeartbeatNotificationStore(supabase);
+    const pending = await store.findRetryableRecovery(reminder.id);
+    if (!pending) return;
+
+    const destination = alertDestination(reminder);
+    const alreadyTold = destination ? recoveredThisRun.has(destination) : false;
+
+    logger.info('[Heartbeat] Retrying an all-clear that never landed', {
+      reminderId: reminder.id,
+      episodeKey: pending.episodeKey,
+      priorAttempts: pending.attempts,
+    });
+
+    const alerted = await announceRecovery(
+      reminder,
+      pending.failedBeats,
+      onRecovery,
+      alreadyTold,
+      pending.episodeKey,
+      destination
+    );
+    if (alerted && destination) recoveredThisRun.add(destination);
+  } catch (err) {
+    // Never let the retry take down the beat it is describing.
+    logger.warn('[Heartbeat] Pending-recovery retry threw', {
+      reminderId: reminder.id,
+      error: err instanceof Error ? err.message : String(err),
     });
   }
 }
@@ -490,8 +628,8 @@ async function announceRecovery(
  * a watchdog that self-cancels mid-outage has not fixed anything, and should
  * not read as a recovery.
  */
-async function consecutiveFailureCount(reminderId: string): Promise<number> {
-  if (!supabase) return 0;
+async function consecutiveFailureCount(reminderId: string): Promise<FailureStreak> {
+  if (!supabase) return { streak: 0, episodeStartedAt: null };
 
   // Never let the streak lookup take down the beat it is describing, whether
   // it resolves with an error (PostgREST's usual shape) or throws (a transport
@@ -500,7 +638,7 @@ async function consecutiveFailureCount(reminderId: string): Promise<number> {
   try {
     const { data, error } = await supabase
       .from('reminder_history')
-      .select('status')
+      .select('status, triggered_at')
       .eq('reminder_id', reminderId)
       .in('status', ['delivered', 'failed'])
       .order(FAILURE_STREAK_ORDER_COLUMN, { ascending: false })
@@ -511,23 +649,28 @@ async function consecutiveFailureCount(reminderId: string): Promise<number> {
         reminderId,
         error: error.message,
       });
-      return 0;
+      return { streak: 0, episodeStartedAt: null };
     }
 
-    if (!Array.isArray(data)) return 0;
+    if (!Array.isArray(data)) return { streak: 0, episodeStartedAt: null };
 
+    // Rows arrive newest first, so the LAST failure we walk past before hitting
+    // a success (or the end) is the oldest in this run — the moment the outage
+    // began, and therefore its stable identity.
     let streak = 0;
-    for (const row of data as { status: string }[]) {
+    let episodeStartedAt: string | null = null;
+    for (const row of data as { status: string; triggered_at: string | null }[]) {
       if (row?.status !== 'failed') break;
       streak++;
+      if (row.triggered_at) episodeStartedAt = row.triggered_at;
     }
-    return streak;
+    return { streak, episodeStartedAt };
   } catch (err) {
     logger.warn('[Heartbeat] Failure streak lookup threw', {
       reminderId,
       error: err instanceof Error ? err.message : String(err),
     });
-    return 0;
+    return { streak: 0, episodeStartedAt: null };
   }
 }
 

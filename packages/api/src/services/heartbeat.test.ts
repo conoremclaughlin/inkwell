@@ -119,7 +119,17 @@ import {
 const TEST_USER_ID = '00000000-0000-0000-0000-000000000001';
 
 /** The escalation context of the first beat to reach a destination in a run. */
-const FIRST_FOR_DESTINATION = { destinationAlreadyAlerted: false };
+/**
+ * Matcher for the context handed to a hook that is first to its destination.
+ *
+ * Partial on purpose: `episodeKey` is a timestamp and `destination` is null for
+ * a beat with no owning SB, so pinning either exactly would assert facts about
+ * the fixture rather than about the collapse rule under test.
+ */
+const FIRST_FOR_DESTINATION = expect.objectContaining({ destinationAlreadyAlerted: false });
+
+/** A hook that reports a notice actually reached the human. */
+const ALERTED = { alerted: true };
 
 function makeDueReminder(overrides: Record<string, unknown> = {}) {
   return {
@@ -1002,11 +1012,16 @@ describe('Heartbeat Service', () => {
      * beforeEach first — it sits at the head of the FIFO and would otherwise
      * answer the SELECT with a non-array, making every streak read as zero.
      */
-    function queueHistory(priorStatuses: string[]) {
+    function queueHistory(prior: (string | { status: string; triggered_at: string })[]) {
       queryResultQueues.delete('reminder_history');
       setQueryResult(
         'reminder_history',
-        priorStatuses.map((status) => ({ status }))
+        // `triggered_at` matters as well as status: it is what dates the start
+        // of an outage, and therefore what identifies the episode a notice
+        // belongs to. Entries may give it explicitly or leave it null.
+        prior.map((entry) =>
+          typeof entry === 'string' ? { status: entry, triggered_at: null } : entry
+        )
       );
       setQueryResult('reminder_history', { id: 'hist-001' });
     }
@@ -1031,7 +1046,9 @@ describe('Heartbeat Service', () => {
       setQueryResult('scheduled_reminders', [{ id: 'rem-hourly' }]);
       setQueryResult('scheduled_reminders', [{ id: 'rem-daily' }]);
 
-      const onFailure = vi.fn().mockResolvedValue(undefined);
+      // The hook reports that its alert LANDED. Only then is the destination
+      // claimed — see the sibling test below for what happens when it does not.
+      const onFailure = vi.fn().mockResolvedValue(ALERTED);
       await processHeartbeat(
         vi.fn().mockResolvedValue({ status: 'failed', error: AUTH_ERROR }),
         onFailure
@@ -1041,8 +1058,80 @@ describe('Heartbeat Service', () => {
       // monitors genuinely stopped. It is the unsolicited message to the human
       // that collapses, and the flag is what collapses it.
       expect(onFailure).toHaveBeenCalledTimes(2);
-      expect(onFailure.mock.calls[0][3]).toEqual({ destinationAlreadyAlerted: false });
-      expect(onFailure.mock.calls[1][3]).toEqual({ destinationAlreadyAlerted: true });
+      expect(onFailure.mock.calls[0][3]).toMatchObject({ destinationAlreadyAlerted: false });
+      expect(onFailure.mock.calls[1][3]).toMatchObject({ destinationAlreadyAlerted: true });
+    });
+
+    // Lumen's round-three P1, at the level that owns the decision. The original
+    // `claimDestination` added the key BEFORE the hook ran, so a first beat
+    // whose send failed still silenced its sibling and nobody heard anything.
+    it('does NOT claim the destination when the first beat failed to alert', async () => {
+      initHeartbeatService({ enableLocalCron: false });
+
+      setQueryResult('scheduled_reminders', makeCollidingBeats());
+      setQueryResult('scheduled_reminders', [{ id: 'rem-hourly' }]);
+      setQueryResult('scheduled_reminders', [{ id: 'rem-daily' }]);
+
+      // The first beat tried and its channel send rejected.
+      const onFailure = vi
+        .fn()
+        .mockResolvedValueOnce({ alerted: false })
+        .mockResolvedValue(ALERTED);
+
+      await processHeartbeat(
+        vi.fn().mockResolvedValue({ status: 'failed', error: AUTH_ERROR }),
+        onFailure
+      );
+
+      // So the second beat must still be free to reach the human. One dead send
+      // must never buy silence for the whole destination.
+      expect(onFailure).toHaveBeenCalledTimes(2);
+      expect(onFailure.mock.calls[1][3]).toMatchObject({ destinationAlreadyAlerted: false });
+    });
+
+    it('does not claim the destination when the hook itself throws', async () => {
+      initHeartbeatService({ enableLocalCron: false });
+
+      setQueryResult('scheduled_reminders', makeCollidingBeats());
+      setQueryResult('scheduled_reminders', [{ id: 'rem-hourly' }]);
+      setQueryResult('scheduled_reminders', [{ id: 'rem-daily' }]);
+
+      const onFailure = vi
+        .fn()
+        .mockRejectedValueOnce(new Error('escalation exploded'))
+        .mockResolvedValue(ALERTED);
+
+      await processHeartbeat(
+        vi.fn().mockResolvedValue({ status: 'failed', error: AUTH_ERROR }),
+        onFailure
+      );
+
+      // A hook that threw told nobody anything.
+      expect(onFailure.mock.calls[1][3]).toMatchObject({ destinationAlreadyAlerted: false });
+    });
+
+    it('gives every beat of one outage the same episode key', async () => {
+      initHeartbeatService({ enableLocalCron: false });
+
+      setQueryResult('scheduled_reminders', [makeDueReminder()]);
+      // Two failures already on the record, newest first — the OLDEST of the
+      // contiguous run is when this outage began, and therefore its identity.
+      // The delivered row below it ends the run and must not be counted.
+      queueHistory([
+        { status: 'failed', triggered_at: '2026-09-09T02:00:00.000Z' },
+        { status: 'failed', triggered_at: '2026-09-09T01:00:00.000Z' },
+        { status: 'delivered', triggered_at: '2026-09-09T00:00:00.000Z' },
+      ]);
+
+      const onFailure = vi.fn().mockResolvedValue(ALERTED);
+      await processHeartbeat(
+        vi.fn().mockResolvedValue({ status: 'failed', error: AUTH_ERROR }),
+        onFailure
+      );
+
+      expect(onFailure.mock.calls[0][3]).toMatchObject({
+        episodeKey: '2026-09-09T01:00:00.000Z',
+      });
     });
 
     it('does not collapse beats that reach different destinations', async () => {
@@ -1064,8 +1153,8 @@ describe('Heartbeat Service', () => {
       );
 
       expect(onFailure).toHaveBeenCalledTimes(2);
-      expect(onFailure.mock.calls[0][3]).toEqual({ destinationAlreadyAlerted: false });
-      expect(onFailure.mock.calls[1][3]).toEqual({ destinationAlreadyAlerted: false });
+      expect(onFailure.mock.calls[0][3]).toMatchObject({ destinationAlreadyAlerted: false });
+      expect(onFailure.mock.calls[1][3]).toMatchObject({ destinationAlreadyAlerted: false });
     });
 
     it('leaves beats with no owning SB to dedupe on their own streak', async () => {
@@ -1086,8 +1175,8 @@ describe('Heartbeat Service', () => {
         onFailure
       );
 
-      expect(onFailure.mock.calls[0][3]).toEqual({ destinationAlreadyAlerted: false });
-      expect(onFailure.mock.calls[1][3]).toEqual({ destinationAlreadyAlerted: false });
+      expect(onFailure.mock.calls[0][3]).toMatchObject({ destinationAlreadyAlerted: false });
+      expect(onFailure.mock.calls[1][3]).toMatchObject({ destinationAlreadyAlerted: false });
     });
 
     it('derives the consecutive count from history, not from process memory', async () => {
