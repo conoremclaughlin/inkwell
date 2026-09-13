@@ -14,7 +14,25 @@
 # read back what they wrote. The finished message is the only place it shows up.
 #
 # Usage:  scripts/check-commit-msg.sh <path-to-message-file>
-# Hook:   echo 'sh "$(git rev-parse --show-toplevel)"/scripts/check-commit-msg.sh "$1"' > .husky/commit-msg
+#
+# Hook:   .husky/commit-msg, tracked, already wired to this file. Do not write a
+#         replacement -- the recipe that used to sit on this line resolved the
+#         scanner through `git rev-parse --show-toplevel`, which is the worktree
+#         you are COMMITTING FROM, not the checkout providing the hook. Those are
+#         the same directory only in the root repo. From a worktree it runs that
+#         worktree's copy of this scanner, or nothing at all if the copy is
+#         missing, which is the fail-open case the tracked hook exists to close.
+#
+#         Activation is a git config setting, not a file to create:
+#
+#           core.hooksPath must point at the .husky of a checkout that carries
+#           a commit-msg hook. Confirm with:
+#
+#             ls "$(git config core.hooksPath)"/commit-msg
+#
+#         A non-empty core.hooksPath does not mean this guard is on. On a machine
+#         with worktrees one directory serves all of them, and if that checkout
+#         predates this hook nothing is checked and nothing says so.
 
 msg_file="$1"
 
