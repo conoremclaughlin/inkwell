@@ -1378,3 +1378,55 @@ describe('handleReopenThread — explicit reopen (spec inkmail-thread-scope §2)
     }
   });
 });
+
+describe('reopenThreadRow — a failed write is an error, never a silent success', () => {
+  // The fake client never fails, so these branches get a hand-rolled one:
+  // the UPDATE and the audit INSERT each answer with an error, and the
+  // function must throw rather than report `reopened` for a row it did
+  // not (fully) change.
+  function clientWhere(opts: { updateError?: string; insertError?: string }) {
+    const chain = (result: unknown) => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const q: Record<string, any> = {};
+      q.eq = () => q;
+      q.select = () => q;
+      q.then = (resolve: (v: unknown) => unknown) => Promise.resolve(result).then(resolve);
+      return q;
+    };
+    return {
+      from: (table: string) => ({
+        update: () =>
+          chain(
+            opts.updateError
+              ? { data: null, error: { message: opts.updateError } }
+              : { data: [{ id: 't1' }], error: null }
+          ),
+        insert: () =>
+          chain(
+            opts.insertError
+              ? { data: null, error: { message: `${table}: ${opts.insertError}` } }
+              : { data: [{}], error: null }
+          ),
+      }),
+    };
+  }
+
+  it('propagates an UPDATE error', async () => {
+    const { reopenThreadRow } = await import('./thread-handlers');
+    await expect(
+      reopenThreadRow(clientWhere({ updateError: 'connection reset' }) as never, 't1', {
+        kind: 'user',
+      })
+    ).rejects.toThrow('Failed to reopen thread: connection reset');
+  });
+
+  it('propagates an audit INSERT error instead of answering reopened', async () => {
+    const { reopenThreadRow } = await import('./thread-handlers');
+    await expect(
+      reopenThreadRow(clientWhere({ insertError: 'permission denied' }) as never, 't1', {
+        kind: 'sb',
+        agentId: 'wren',
+      })
+    ).rejects.toThrow('Failed to record thread reopen: inbox_thread_messages: permission denied');
+  });
+});
