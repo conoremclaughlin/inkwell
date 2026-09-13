@@ -205,7 +205,7 @@ const styles = StyleSheet.create({
     borderWidth: StyleSheet.hairlineWidth,
     borderColor: colors.textMuted,
   },
-  reopenText: { ...type.caption, color: colors.text },
+  reopenText: { ...type.caption, color: colors.textPrimary },
   errorBar: { paddingVertical: 6, paddingHorizontal: spacing.lg, backgroundColor: colors.well },
   errorText: { ...type.caption, color: colors.negative },
   composer: {
