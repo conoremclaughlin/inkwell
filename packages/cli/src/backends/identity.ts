@@ -68,8 +68,10 @@ export function readIdentityJson(cwd: string): IdentityJson | null {
   if (!existsSync(identityPath)) return null;
   try {
     const parsed: IdentityJson = JSON.parse(readFileSync(identityPath, 'utf-8'));
-    // Single funnel for every reader of this file, so the legacy `agentId` key
-    // is normalized in exactly one place rather than at a dozen call sites.
+    // NOT the only reader of this file — studio (list, default CLI name,
+    // branch-rename planning), doctor and the channel plugin each parse it
+    // themselves. They call normalizeIdentityJson instead. Treating this as the
+    // single funnel is what let those keep reading a key legacy files lack.
     if (!parsed.sbSlug && parsed.agentId) {
       return { ...parsed, sbSlug: parsed.agentId };
     }

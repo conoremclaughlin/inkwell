@@ -64,7 +64,8 @@ export async function stampRoutingHold(client: any, args: StampHoldArgs): Promis
       p_agent_id: sbSlug,
       p_attempt_started: attemptStartedAt,
       p_hold: {
-        // PERSISTED KEY — five SQL functions read metadata -> 'routingHold' ->>
+        // PERSISTED KEY on inbox_threads.metadata — five SQL functions read
+        // metadata -> 'routingHold' ->>
         // 'agentId' (migrations 20260819022604, 20260819024343, 20260819025449,
         // 20260819030642, 20260819030723). Renaming it to sbSlug makes routing
         // holds never clear, silently, with nothing to notice. It stays until a
