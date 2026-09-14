@@ -193,10 +193,21 @@ export function decodeContextToken(header: string | undefined | null): PcpContex
   if (!header) return null;
   try {
     const parsed = JSON.parse(Buffer.from(header, 'base64url').toString());
-    if (typeof parsed.sessionId !== 'string' || typeof parsed.sbSlug !== 'string') {
+    // Tokens minted before the agentId -> sbSlug rename carry `agentId`, and they
+    // live in running processes and already-generated MCP configs that nothing
+    // rewrites. Such a token is otherwise valid: refusing it would discard its
+    // session, studio, runtime and cliAttached together, and take the server's
+    // context-session auth fallback with them (Lumen, PR #635).
+    const sbSlug =
+      typeof parsed.sbSlug === 'string'
+        ? parsed.sbSlug
+        : typeof parsed.agentId === 'string'
+          ? parsed.agentId
+          : undefined;
+    if (typeof parsed.sessionId !== 'string' || sbSlug === undefined) {
       return null;
     }
-    return parsed as PcpContextToken;
+    return { ...parsed, sbSlug } as PcpContextToken;
   } catch {
     return null;
   }

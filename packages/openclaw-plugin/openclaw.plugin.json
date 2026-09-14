@@ -41,6 +41,10 @@
       "sbSlug": {
         "type": "string"
       },
+      "agentId": {
+        "type": "string",
+        "description": "Pre-rename name for sbSlug. Still accepted: nothing rewrites a user's OpenClaw config, and additionalProperties is false."
+      },
       "autoBootstrap": {
         "type": "boolean",
         "default": true

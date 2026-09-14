@@ -56,6 +56,24 @@ export function readRuntimeState(cwd: string): RuntimeSessionState {
 
   try {
     const parsed = JSON.parse(readFileSync(filePath, 'utf-8')) as Partial<RuntimeSessionState>;
+    // sessions.json is still version 1 and every record written before the
+    // agentId -> sbSlug rename carries `agentId`. The owner match below keys on
+    // sbSlug, so an un-normalized record never matches and the upsert inserts a
+    // DUPLICATE instead of merging the previous backend-session lineage
+    // (Lumen, PR #635). Normalize on read, current included.
+    const withSlug = (row: unknown): unknown => {
+      if (!row || typeof row !== 'object') return row;
+      const r = row as { sbSlug?: unknown; agentId?: unknown };
+      return r.sbSlug === undefined && typeof r.agentId === 'string'
+        ? { ...r, sbSlug: r.agentId }
+        : row;
+    };
+    if (Array.isArray(parsed.sessions)) {
+      parsed.sessions = parsed.sessions.map(withSlug) as typeof parsed.sessions;
+    }
+    if (parsed.current) {
+      parsed.current = withSlug(parsed.current) as typeof parsed.current;
+    }
     const sessions = Array.isArray(parsed.sessions)
       ? parsed.sessions.filter(
           (s): s is RuntimeSessionRecord =>

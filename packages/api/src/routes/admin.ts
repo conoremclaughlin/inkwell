@@ -23,6 +23,21 @@ import { FixedWindowLimiter } from '../utils/fixed-window-limiter';
 import { notifyPlatformOfApprovalRequest } from '../channels/approval-interceptor';
 
 /**
+ * The SB slug recorded on an archived memory's metadata.
+ *
+ * memory_history.metadata is persisted JSONB that no migration rewrites, so
+ * rows written before the rename carry the old key. Reading only the new one
+ * makes a deleted memory's history silently disappear from the scoped fallback
+ * (Lumen, PR #635). The sbId/workspaceId reads beside it already accept both
+ * spellings for exactly this reason.
+ */
+export function archivedMetadataSlug(
+  metadata: Record<string, unknown> | null | undefined
+): string | undefined {
+  return (metadata?.sbSlug as string | undefined) || (metadata?.agentId as string | undefined);
+}
+
+/**
  * Build a JSON error response. In development mode, includes the real error
  * message and stack trace so issues are immediately visible in the browser
  * Network tab / dashboard UI instead of requiring server log access.
@@ -3914,7 +3929,7 @@ router.get('/individuals/:sbSlug/memories/timeline', async (req: Request, res: R
         const metadataWorkspaceId =
           (metadata?.workspaceId as string | undefined) ||
           (metadata?.workspace_id as string | undefined);
-        const metadataSlug = metadata?.sbSlug as string | undefined;
+        const metadataSlug = archivedMetadataSlug(metadata);
         const hasScopedMetadata =
           metadataIdentityId === identity.id ||
           (metadataSlug === sbSlug && metadataWorkspaceId === authReq.pcpWorkspaceId);
@@ -4049,7 +4064,7 @@ router.get(
         const metadataWorkspaceId =
           (metadata?.workspaceId as string | undefined) ||
           (metadata?.workspace_id as string | undefined);
-        const metadataSlug = metadata?.sbSlug as string | undefined;
+        const metadataSlug = archivedMetadataSlug(metadata);
         return (
           metadataIdentityId === identity.id ||
           (metadataSlug === sbSlug && metadataWorkspaceId === authReq.pcpWorkspaceId)

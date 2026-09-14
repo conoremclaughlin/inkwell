@@ -66,17 +66,25 @@ function log(level: LogLevel, message: string, data?: Record<string, unknown>): 
 const INK_SERVER_URL = process.env.INK_SERVER_URL || 'http://localhost:3001';
 const POLL_INTERVAL_MS = parseInt(process.env.INK_POLL_INTERVAL_MS || '10000', 10);
 
-function resolveSlug(): string {
+/** Exported so the identity-compat regression exercises THIS resolver, not a copy. */
+export function resolveSlug(): string {
+  // Plugin-specific override first, then the documented primary, then the
+  // pre-rename names that long-running processes still carry.
   if (process.env.INK_SB_SLUG) return process.env.INK_SB_SLUG;
   if (process.env.INK_AGENT_ID) return process.env.INK_AGENT_ID;
+  if (process.env.SB_SLUG) return process.env.SB_SLUG;
   if (process.env.AGENT_ID) return process.env.AGENT_ID;
 
-  // Try .ink/identity.json in cwd
+  // Try .ink/identity.json in cwd. This is a SECOND reader of that file — it
+  // does not share the CLI's readIdentityJson funnel — so the legacy key has
+  // to be normalized here too, or an existing file resolves to the 'wren'
+  // fallback and this plugin polls under the wrong identity (Lumen, PR #635).
   const identityPath = join(process.cwd(), '.ink', 'identity.json');
   if (existsSync(identityPath)) {
     try {
       const identity = JSON.parse(readFileSync(identityPath, 'utf-8'));
-      if (identity.sbSlug) return identity.sbSlug;
+      const slug = identity.sbSlug ?? identity.agentId;
+      if (typeof slug === 'string' && slug) return slug;
     } catch {
       // ignore
     }

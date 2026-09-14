@@ -80,6 +80,19 @@ import { sendTriggerFailureNotice } from './services/trigger-failure-notice';
 import { StudioLeaseService } from './services/studio-lease.service';
 import { StudioOverflowService } from './services/studio-overflow.service';
 
+/**
+ * The slug this server routes as.
+ *
+ * SB_SLUG is the documented variable; AGENT_ID is its pre-rename name, still in
+ * the environment of anything started before the rename. The banner and the
+ * routing configuration MUST read this same function — they drifted once, so
+ * the banner printed one SB while the no-channel-route fallback dispatched to
+ * another (Lumen, PR #635).
+ */
+export function resolveServerSbSlug(): string {
+  return process.env.SB_SLUG || process.env.AGENT_ID || 'myra';
+}
+
 // Server configuration
 interface ServerConfig {
   /** Working directory for Claude Code */
@@ -139,7 +152,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
   // Resolve configuration
   const workingDirectory = config.workingDirectory || path.resolve(__dirname, '../../..');
   const mcpConfigPath = config.mcpConfigPath || path.resolve(workingDirectory, '.mcp.json');
-  const sbSlug = process.env.AGENT_ID || 'myra';
+  const sbSlug = resolveServerSbSlug();
 
   logger.info('Configuration:', {
     workingDirectory,
@@ -1872,7 +1885,7 @@ function printStatus(): void {
   logger.info('Server Status');
   logger.info('='.repeat(60));
   logger.info(`  Architecture: SessionService (stateless)`);
-  logger.info(`  SB slug: ${process.env.SB_SLUG || process.env.AGENT_ID || 'myra'}`);
+  logger.info(`  SB slug: ${resolveServerSbSlug()}`);
   logger.info(`  MCP Port: ${env.MCP_HTTP_PORT}`);
 
   const status = channelGateway?.getStatus();

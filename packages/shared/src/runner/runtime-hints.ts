@@ -45,7 +45,31 @@ export function writeRuntimeSessionHint(
       try {
         const raw = JSON.parse(readFileSync(sessionsPath, 'utf-8')) as RuntimeSessionState;
         if (raw.version === 1 && Array.isArray(raw.sessions)) {
-          state = raw;
+          // Independent raw reader of the same file as the CLI's
+          // readRuntimeState, with the same defect: records written before the
+          // rename carry `agentId`, the match below keys on sbSlug, and an
+          // un-normalized record is duplicated rather than merged
+          // (Lumen, PR #635).
+          const withSlug = (row: Record<string, unknown>): Record<string, unknown> =>
+            row &&
+            typeof row === 'object' &&
+            row.sbSlug === undefined &&
+            typeof row.agentId === 'string'
+              ? { ...row, sbSlug: row.agentId }
+              : row;
+          state = {
+            ...raw,
+            sessions: raw.sessions.map((s) =>
+              withSlug(s as Record<string, unknown>)
+            ) as typeof raw.sessions,
+            ...(raw.current
+              ? {
+                  current: withSlug(
+                    raw.current as unknown as Record<string, unknown>
+                  ) as typeof raw.current,
+                }
+              : {}),
+          };
         }
       } catch {
         // Corrupt file — start fresh.

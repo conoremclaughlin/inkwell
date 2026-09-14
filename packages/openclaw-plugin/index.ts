@@ -26,6 +26,8 @@ interface PcpConfig {
   serverUrl: string;
   accessToken?: string;
   sbSlug?: string;
+  /** Pre-rename name for sbSlug, still present in users' OpenClaw configs. */
+  agentId?: string;
   autoBootstrap: boolean;
   autoSessionEnd: boolean;
 }
@@ -73,7 +75,8 @@ function readJsonFile<T>(path: string): T | null {
   }
 }
 
-function resolveSlug(pluginSlug?: string): string | null {
+/** Exported so the identity-compat regression exercises THIS resolver, not a copy. */
+export function resolveSlug(pluginSlug?: string): string | null {
   if (pluginSlug) return pluginSlug;
 
   // Check ~/.ink/config.json sbMapping (agentMapping is its pre-rename name)
@@ -225,7 +228,10 @@ export default function pcpPlugin(api: OpenClawPluginApi) {
   const autoBootstrap = pluginConfig.autoBootstrap ?? true;
   const autoSessionEnd = pluginConfig.autoSessionEnd ?? true;
 
-  const sbSlug = resolveSlug(pluginConfig.sbSlug);
+  // Accept the pre-rename key: the manifest still declares it because nothing
+  // rewrites a user's OpenClaw config, and reading only sbSlug would silently
+  // drop a working configured identity (Lumen, PR #635). We only ever WRITE sbSlug.
+  const sbSlug = resolveSlug(pluginConfig.sbSlug ?? pluginConfig.agentId);
   const accessToken = resolveAccessToken(pluginConfig.accessToken);
 
   if (!accessToken) {

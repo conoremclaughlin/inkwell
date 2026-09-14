@@ -21,6 +21,19 @@ import {
   exchangeRefreshToken as exchangeRefreshTokenShared,
 } from '../../auth/pcp-tokens';
 
+/**
+ * Carry an SB binding across the rename on a pending-auth JWT.
+ *
+ * handleAuthCallback verifies this JWT with jwt.verify() directly, so it never
+ * reaches the normalization inside verifyPcpAccessToken(). A pending request
+ * created before the deploy is still valid; dropping its slug mints the access
+ * and refresh credentials with no SB binding at all (Lumen, PR #635).
+ */
+export function normalizePendingAuth(payload: PendingAuthPayload): PendingAuthPayload {
+  const raw = payload as PendingAuthPayload & { agentId?: string };
+  return !raw.sbSlug && raw.agentId ? { ...raw, sbSlug: raw.agentId } : raw;
+}
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -141,7 +154,7 @@ export class PcpAuthProvider {
       if (typeof decoded === 'string' || (decoded as PendingAuthPayload).type !== 'pending_auth') {
         return { error: 'invalid_request', error_description: 'Invalid authorization request' };
       }
-      pending = decoded as PendingAuthPayload;
+      pending = normalizePendingAuth(decoded as PendingAuthPayload);
     } catch (err) {
       const desc =
         err instanceof jwt.TokenExpiredError
