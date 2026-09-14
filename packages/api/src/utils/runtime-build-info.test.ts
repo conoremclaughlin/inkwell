@@ -87,10 +87,12 @@ describe('getRuntimeBuildInfo', () => {
     const diffCall = mockExecFile.mock.calls.find((c) => (c[1] as string[])[0] === 'diff');
     expect(diffCall).toBeDefined();
     const gitArgs = diffCall![1] as string[];
-    expect(gitArgs).toContain('packages/api');
-    expect(gitArgs).toContain('packages/shared');
-    expect(gitArgs).not.toContain('packages/cli');
-    expect(gitArgs).not.toContain('packages/web');
+    // Top-anchored: the diff is path-scoped too, so it carried the same
+    // cwd-relative defect as the counts (Lumen, #586 r1 P1).
+    expect(gitArgs).toContain(':(top)packages/api');
+    expect(gitArgs).toContain(':(top)packages/shared');
+    expect(gitArgs.some((a) => a.includes('packages/cli'))).toBe(false);
+    expect(gitArgs.some((a) => a.includes('packages/web'))).toBe(false);
   });
 
   it('mid-refresh reads keep the prior snapshot — sha and delta publish together', async () => {
@@ -320,5 +322,84 @@ describe('getRuntimeBuildInfo — distance from origin', () => {
     // Behind by three, but none of them ours: no restart urgency.
     expect(info.behindOriginCount).toBe(3);
     expect(info.behindOriginApi).toBe(false);
+  });
+
+  /**
+   * P1 (Lumen, #586 r1). A relative pathspec is resolved against the process's
+   * cwd, and this server's cwd is `packages/api` — where `packages/api` matches
+   * nothing. The API-relevant count therefore came back 0 from the only
+   * directory the server actually runs in, and 0 reads as "verified up to
+   * date". Measured on the real repository at 960d87c2..3fa12459: 2 from the
+   * repo root, 0 from packages/api, and 2 from either once anchored.
+   *
+   * Asserted on the argv rather than the count because the count is what the
+   * mock supplies — only the pathspec sent to git distinguishes the fix.
+   */
+  it('anchors API pathspecs to the repo root, not the process cwd', async () => {
+    mockExecSync.mockReturnValue('abc123def456');
+    answerExecFile({
+      'rev-parse': 'abc123def456',
+      diff: '',
+      'rev-list': '75',
+      'rev-list:api': '2',
+    });
+
+    const { getRuntimeBuildInfo } = await import('./runtime-build-info');
+    getRuntimeBuildInfo(20_000);
+    await flushRefresh();
+
+    const pathScoped = mockExecFile.mock.calls
+      .map((call) => call[1] as string[])
+      .filter((args) => args.includes('--'));
+    expect(pathScoped.length).toBeGreaterThan(0);
+
+    for (const args of pathScoped) {
+      const paths = args.slice(args.indexOf('--') + 1);
+      expect(paths.length).toBeGreaterThan(0);
+      for (const p of paths) expect(p.startsWith(':(top)')).toBe(true);
+    }
+  });
+
+  /**
+   * P2 (Lumen, #586 r1). Both counts must describe ONE snapshot. Re-resolving
+   * the mutable names `HEAD` and the upstream per command lets a concurrent
+   * fetch land between the two, publishing an overall count from before it
+   * beside an API count from after — "0 behind, but 1 API commit behind", a
+   * contradiction a reader resolves in the reassuring direction.
+   *
+   * Pinned by asserting both ranges are the identical resolved-ID pair, so a
+   * regression to `HEAD..origin/main` in either call fails here.
+   */
+  it('takes both counts from one pinned commit range', async () => {
+    const HEAD_SHA = '1111111111111111111111111111111111111111';
+    const UPSTREAM_SHA = '2222222222222222222222222222222222222222';
+
+    mockExecSync.mockReturnValue(HEAD_SHA);
+    mockExecFile.mockImplementation((...args: unknown[]) => {
+      const gitArgs = args[1] as string[];
+      const cb = args[args.length - 1] as (err: Error | null, stdout: string) => void;
+      if (gitArgs[0] === 'rev-parse') {
+        if (gitArgs.includes('@{upstream}')) return cb(null, 'origin/main');
+        if (gitArgs.includes('origin/main')) return cb(null, UPSTREAM_SHA);
+        return cb(null, HEAD_SHA);
+      }
+      if (gitArgs[0] === 'rev-list') return cb(null, gitArgs.includes('--') ? '2' : '75');
+      return cb(null, '');
+    });
+
+    const { getRuntimeBuildInfo } = await import('./runtime-build-info');
+    getRuntimeBuildInfo(20_000);
+    await flushRefresh();
+
+    const ranges = mockExecFile.mock.calls
+      .map((call) => call[1] as string[])
+      .filter((a) => a[0] === 'rev-list')
+      .map((a) => a[2]);
+
+    expect(ranges).toHaveLength(2);
+    // Same pair of resolved IDs for both counts...
+    expect(new Set(ranges).size).toBe(1);
+    // ...and resolved IDs, not the mutable names that can move between calls.
+    expect(ranges[0]).toBe(`${HEAD_SHA}..${UPSTREAM_SHA}`);
   });
 });

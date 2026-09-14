@@ -1,4 +1,5 @@
 import { execSync, execFile } from 'child_process';
+import { stat } from 'fs/promises';
 import { APP_VERSION } from '../config/constants';
 
 const STARTED_AT = new Date().toISOString();
@@ -11,15 +12,34 @@ const GIT_SHA_CACHE_TTL_MS = 15_000;
  * binary — so "restart required" is only honest when the delta reaches
  * these paths. (Observed live: a cli-only run of commits kept the banner
  * up for a server whose executable code had not changed at all.)
+ *
+ * Anchored with `:(top)` so they resolve from the repository root rather than
+ * the process's cwd. Plain relative pathspecs are interpreted relative to cwd,
+ * and this server's cwd is `packages/api` under `yarn workspace @inklabs/api
+ * server:dev` — where `packages/api` matches nothing at all. Every path-scoped
+ * count then came back 0, i.e. "verified up to date", which is the precise
+ * fail-toward-reassurance shape this file exists to remove. Measured on
+ * 960d87c2..3fa12459: 2 from the repo root, 0 from `packages/api`, 2 from
+ * either once anchored (Lumen, PR #586 r1 P1).
  */
-const API_RELEVANT_PATHS = ['packages/api', 'packages/shared', 'package.json', 'yarn.lock'];
+const API_RELEVANT_PATHS = [
+  ':(top)packages/api',
+  ':(top)packages/shared',
+  ':(top)package.json',
+  ':(top)yarn.lock',
+];
 
 // Startup resolution is deliberately synchronous: it runs once at module
 // load, before the HTTP listener opens — the documented exception to the
 // no-blocking rule. Everything after startup refreshes asynchronously.
 function resolveGitShaSync(): string | null {
   try {
-    const raw = execSync('git rev-parse --short=12 HEAD', {
+    // Full ID, shortened for display below. `--short=12` returns MORE than 12
+    // characters when 12 would be ambiguous, so resolving startup and refresh
+    // through different commands could yield different-length strings for the
+    // same commit — and these two are compared for equality to decide
+    // `updateAvailable`. Both sides now take a full ID and slice it.
+    const raw = execSync('git rev-parse HEAD', {
       cwd: process.cwd(),
       stdio: ['ignore', 'pipe', 'ignore'],
       encoding: 'utf-8',
@@ -30,7 +50,10 @@ function resolveGitShaSync(): string | null {
   }
 }
 
-const STARTUP_GIT_SHA = resolveGitShaSync();
+/** Full commit ID, for ranges. */
+const STARTUP_GIT_SHA_FULL = resolveGitShaSync();
+/** The same commit, shortened for display and for the equality comparison. */
+const STARTUP_GIT_SHA = STARTUP_GIT_SHA_FULL ? STARTUP_GIT_SHA_FULL.slice(0, 12) : null;
 
 let cachedCurrentGitSha: string | null = STARTUP_GIT_SHA;
 let cachedApiDeltaNonEmpty = false;
@@ -41,6 +64,7 @@ let cachedApiDeltaNonEmpty = false;
 let cachedUpstreamRef: string | null = null;
 let cachedBehindOrigin: number | null = null;
 let cachedApiBehindOrigin: number | null = null;
+let cachedOriginFetchedAt: string | null = null;
 let cachedAtMs = 0;
 let refreshInFlight: Promise<void> | null = null;
 
@@ -58,14 +82,25 @@ async function refresh(): Promise<void> {
   // the NEW sha with the PREVIOUS refresh's delta bit — a torn snapshot
   // that could report a restart verdict belonging to neither state
   // (Lumen, PR #547 r1). Readers always see a matched (sha, delta) pair.
-  const nextCurrentGitSha = (await execFileText(['rev-parse', '--short=12', 'HEAD'])) || null;
+  //
+  // Resolved to an immutable commit ID once, and every range below is built
+  // from that ID rather than from the name `HEAD`. Re-resolving a mutable name
+  // per command lets a concurrent fetch or checkout land between two counts, so
+  // the pair published describes two different repository states — e.g. an
+  // overall count taken before the fetch and an api count taken after, giving
+  // behindOriginCount=0 alongside apiBehindOriginCount=1. That is not merely
+  // imprecise: "0 behind, but 1 api commit behind" is incoherent, and a reader
+  // resolving the contradiction in the reassuring direction is exactly the
+  // failure this file exists to prevent (Lumen, PR #586 r1 P2).
+  const headSha = await execFileText(['rev-parse', 'HEAD']);
+  const nextCurrentGitSha = headSha ? headSha.slice(0, 12) : null;
 
   let nextApiDeltaNonEmpty = false;
   if (STARTUP_GIT_SHA && nextCurrentGitSha && STARTUP_GIT_SHA !== nextCurrentGitSha) {
     const delta = await execFileText([
       'diff',
       '--name-only',
-      `${STARTUP_GIT_SHA}..${nextCurrentGitSha}`,
+      `${STARTUP_GIT_SHA_FULL}..${headSha}`,
       '--',
       ...API_RELEVANT_PATHS,
     ]);
@@ -87,7 +122,7 @@ async function refresh(): Promise<void> {
   //
   // Read from the remote-tracking ref, never by fetching: a health endpoint
   // must not do network I/O. That makes the count only as fresh as the last
-  // fetch, which is why `originFetchedAt` is reported alongside it — a number
+  // fetch, which is why `originFetchedAt` is returned alongside it — a number
   // whose staleness is undisclosed is its own calm wrong answer.
   //
   // Compared against the tracked upstream rather than a hardcoded origin/main,
@@ -101,16 +136,54 @@ async function refresh(): Promise<void> {
   ]);
   let nextBehind: number | null = null;
   let nextApiBehind: number | null = null;
-  if (upstream) {
-    nextBehind = await countRevs([`HEAD..${upstream}`]);
-    nextApiBehind = await countRevs([`HEAD..${upstream}`, '--', ...API_RELEVANT_PATHS]);
+  if (upstream && headSha) {
+    // The upstream NAME is resolved to a commit ID once too, for the same
+    // reason as HEAD: both endpoints of both ranges must name the same two
+    // commits, or the two counts do not describe one snapshot.
+    const upstreamSha = await execFileText(['rev-parse', upstream]);
+    if (upstreamSha) {
+      const range = `${headSha}..${upstreamSha}`;
+      nextBehind = await countRevs([range]);
+      nextApiBehind = await countRevs([range, '--', ...API_RELEVANT_PATHS]);
+    }
   }
+
+  // Awaited into a local like everything else: the publish below must stay one
+  // synchronous block, or a read could combine this timestamp with the
+  // previous refresh's counts — a torn snapshot of exactly the kind #547 r1
+  // closed, and the pairing here is load-bearing because the timestamp is what
+  // qualifies the counts.
+  const nextOriginFetchedAt = await resolveOriginFetchedAt();
 
   cachedCurrentGitSha = nextCurrentGitSha;
   cachedApiDeltaNonEmpty = nextApiDeltaNonEmpty;
   cachedUpstreamRef = upstream;
   cachedBehindOrigin = nextBehind;
   cachedApiBehindOrigin = nextApiBehind;
+  cachedOriginFetchedAt = nextOriginFetchedAt;
+}
+
+/**
+ * When this checkout last fetched, from FETCH_HEAD's mtime.
+ *
+ * The counts are read from the remote-tracking ref and never fetch, so they
+ * are only as fresh as this timestamp. Publishing the count without it would
+ * reproduce the defect the count exists to fix one level up: "0 behind" is
+ * reassuring, and it is worthless if the last fetch was a week ago.
+ *
+ * Null when the repository has never fetched, which is honestly unknown
+ * rather than "never" — and distinct from a timestamp, so a caller cannot
+ * mistake the two (Lumen, #586 r1, on a field this file described but did
+ * not return).
+ */
+async function resolveOriginFetchedAt(): Promise<string | null> {
+  const path = await execFileText(['rev-parse', '--git-path', 'FETCH_HEAD']);
+  if (!path) return null;
+  try {
+    return (await stat(path)).mtime.toISOString();
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -164,6 +237,11 @@ export function getRuntimeBuildInfo(nowMs = Date.now()) {
     behindOriginCount: cachedBehindOrigin,
     /** Of those, the ones touching this server's own inputs. Null = unknown. */
     apiBehindOriginCount: cachedApiBehindOrigin,
+    /**
+     * When this checkout last fetched. The counts above are only as fresh as
+     * this — /health never fetches. Null = never fetched or undeterminable.
+     */
+    originFetchedAt: cachedOriginFetchedAt,
     /**
      * True only when we can SHOW the checkout is missing API-relevant commits.
      * An unknown count leaves this false, so callers must read the count to
