@@ -50,7 +50,6 @@ export async function resolveIdentityId(
 
   if (error) {
     logger.warn('Failed to resolve identity UUID for agent slug', {
-      userId,
       agentId,
       workspaceId: scope,
       error: error.message,
@@ -74,7 +73,6 @@ export async function resolveIdentityId(
     const unscoped = candidates.find((row) => row.workspace_id === null);
     if (unscoped) {
       logger.warn('Resolved agent slug to a legacy identity with no workspace', {
-        userId,
         agentId,
         workspaceId: scope,
         identityId: unscoped.id,
@@ -84,7 +82,6 @@ export async function resolveIdentityId(
     }
 
     logger.warn('Agent slug does not exist in this workspace', {
-      userId,
       agentId,
       workspaceId: scope,
       candidateWorkspaceCount: candidates.length,
@@ -98,7 +95,6 @@ export async function resolveIdentityId(
   // between two SBs who share a slug is a coin flip, and the loser's memories,
   // activity and leases would be written under the winner's UUID.
   logger.error('Refusing to resolve an ambiguous agent slug without a workspace', {
-    userId,
     agentId,
     candidateCount: candidates.length,
   });
