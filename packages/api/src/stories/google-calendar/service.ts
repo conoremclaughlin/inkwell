@@ -18,34 +18,94 @@ import type {
   CreateEventOptions,
 } from './types';
 
+const BARE_DATE = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * Reject a bare date that `Date` would silently rewrite into a different one.
+ *
+ * The YYYY-MM-DD shape above accepts impossible dates and the MCP schema is
+ * only `z.string()`, so "2026-02-31" arrives here intact. `Date` normalizes it
+ * to March 3 rather than refusing it. That used to be survivable: the malformed
+ * string was handed to Google and rejected there. Once an endDate is advanced
+ * by a day before conversion, the same input turns into a *well-formed* query
+ * over days nobody asked for — a bad input becoming a plausible answer, which
+ * is the failure mode this whole file is about. So it has to be caught before
+ * any arithmetic touches it.
+ */
+function assertRealCalendarDate(date: string, field: string): void {
+  const parsed = new Date(`${date}T00:00:00Z`);
+  // Round-trip rather than just a NaN check: month 13 fails to parse at all,
+  // but February 31 parses cleanly and comes back as a different day.
+  if (Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== date) {
+    throw new Error(`${field} "${date}" is not a real calendar date`);
+  }
+}
+
+/** The UTC offset of `timezone` at a given instant, in minutes east of UTC. */
+function zoneOffsetMinutesAt(instant: Date, timezone: string): number {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone,
+    timeZoneName: 'longOffset',
+  }).formatToParts(instant);
+  // "GMT-07:00", "GMT+05:30", or a bare "GMT" exactly at zero offset.
+  const raw = parts.find((p) => p.type === 'timeZoneName')?.value ?? 'GMT';
+  const match = /^GMT([+-])(\d{1,2}):(\d{2})$/.exec(raw);
+  if (!match) return 0;
+
+  const [, sign, hours, minutes] = match;
+  const magnitude = Number(hours) * 60 + Number(minutes);
+  return sign === '-' ? -magnitude : magnitude;
+}
+
+function formatUtcOffset(minutes: number): string {
+  const sign = minutes < 0 ? '-' : '+';
+  const absolute = Math.abs(minutes);
+  const hours = String(Math.floor(absolute / 60)).padStart(2, '0');
+  const rest = String(absolute % 60).padStart(2, '0');
+  return `${sign}${hours}:${rest}`;
+}
+
+/**
+ * The offset in force at the START of `date` in `timezone` — the REQUESTED
+ * zone's midnight, never the host's.
+ *
+ * This used to sample `new Date(date + 'T00:00:00')`, which is midnight where
+ * the server happens to sit, and then read the requested zone's offset at that
+ * unrelated instant. The two coincide only when the server runs in the zone
+ * being asked about, so the bug was invisible to any test whose host zone
+ * matched the zone under test — and invisible in CI, which runs in UTC, for any
+ * request in UTC.
+ *
+ * It bites whenever the sampled instant lands on the far side of a DST
+ * transition from the requested midnight. Under a Los Angeles host,
+ * `Europe/Berlin` on 2026-03-29 resolved to +02:00 when Berlin midnight is
+ * still +01:00, dropping the day's last hour; on 2026-10-25 it resolved to
+ * +01:00 instead of +02:00, pulling in the next day's first hour (found by
+ * Lumen in review).
+ */
+function startOfDayOffset(date: string, timezone: string): string {
+  const utcMidnight = Date.parse(`${date}T00:00:00Z`);
+
+  // Seed with the offset at that calendar date's UTC midnight, then re-read it
+  // at the instant the seed implies for local midnight. When the seed sat on
+  // the far side of a transition, the second reading is the one actually in
+  // force. One correction converges for every real zone, because DST shifts
+  // (an hour or two) are far smaller than the offsets themselves.
+  const seed = zoneOffsetMinutesAt(new Date(utcMidnight), timezone);
+  const atLocalMidnight = zoneOffsetMinutesAt(new Date(utcMidnight - seed * 60_000), timezone);
+
+  return formatUtcOffset(atLocalMidnight);
+}
+
 /**
  * Convert a bare YYYY-MM-DD date to an RFC 3339 timestamp at midnight in the
  * given IANA timezone. Already-qualified timestamps pass through unchanged.
  */
-function bareDateToRfc3339(date: string, timezone: string): string {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return date;
+function bareDateToRfc3339(date: string, timezone: string, field: string): string {
+  if (!BARE_DATE.test(date)) return date;
+  assertRealCalendarDate(date, field);
 
-  // Intl.DateTimeFormat resolves the UTC offset for a given date + timezone.
-  // We construct midnight local, then compute the UTC equivalent.
-  const midnight = new Date(`${date}T00:00:00`);
-  const formatter = new Intl.DateTimeFormat('en-US', {
-    timeZone: timezone,
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hour12: false,
-    timeZoneName: 'longOffset',
-  });
-  const parts = formatter.formatToParts(midnight);
-  const offsetPart = parts.find((p) => p.type === 'timeZoneName');
-  // offsetPart.value is like "GMT-07:00" or "GMT+01:00" or "GMT"
-  const offsetStr = offsetPart?.value?.replace('GMT', '') || '+00:00';
-  const offset = offsetStr === '' ? '+00:00' : offsetStr;
-
-  return `${date}T00:00:00${offset}`;
+  return `${date}T00:00:00${startOfDayOffset(date, timezone)}`;
 }
 
 /**
@@ -84,7 +144,8 @@ function bareDateToRfc3339(date: string, timezone: string): string {
  * opposite direction.
  */
 export function inclusiveEndToRfc3339(endDate: string, timezone: string): string {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(endDate)) return endDate;
+  if (!BARE_DATE.test(endDate)) return endDate;
+  assertRealCalendarDate(endDate, 'endDate');
 
   // UTC arithmetic on the bare date: this only advances the calendar day, and
   // the zone conversion is left entirely to bareDateToRfc3339.
@@ -92,7 +153,7 @@ export function inclusiveEndToRfc3339(endDate: string, timezone: string): string
   next.setUTCDate(next.getUTCDate() + 1);
   const nextBare = next.toISOString().slice(0, 10);
 
-  return bareDateToRfc3339(nextBare, timezone);
+  return bareDateToRfc3339(nextBare, timezone, 'endDate');
 }
 
 /**
@@ -110,7 +171,7 @@ export function calendarWindow(
   timezone: string
 ): { timeMin: string; timeMax: string } {
   return {
-    timeMin: bareDateToRfc3339(startDate, timezone),
+    timeMin: bareDateToRfc3339(startDate, timezone, 'startDate'),
     timeMax: inclusiveEndToRfc3339(endDate, timezone),
   };
 }

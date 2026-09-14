@@ -4710,6 +4710,8 @@ Returns events with start/end times, summary, location, attendees, and status.
 
 Dates can be full ISO 8601 (e.g., "2026-01-30T00:00:00-08:00") or bare YYYY-MM-DD (e.g., "2026-01-30"). Bare dates are resolved to midnight in the specified timezone — always pass timezone when using bare dates to get correct day boundaries.
 
+A bare endDate is INCLUSIVE: the whole of that day is covered, so startDate == endDate returns that day's events. A full ISO timestamp is used as-is, as an exclusive upper bound.
+
 User must have connected their Google account with Calendar permissions.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
