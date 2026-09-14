@@ -1,5 +1,4 @@
 import { execSync, execFile } from 'child_process';
-import { stat } from 'fs/promises';
 import { APP_VERSION } from '../config/constants';
 
 const STARTED_AT = new Date().toISOString();
@@ -64,7 +63,6 @@ let cachedApiDeltaNonEmpty = false;
 let cachedUpstreamRef: string | null = null;
 let cachedBehindOrigin: number | null = null;
 let cachedApiBehindOrigin: number | null = null;
-let cachedOriginFetchedAt: string | null = null;
 let cachedAtMs = 0;
 let refreshInFlight: Promise<void> | null = null;
 
@@ -121,9 +119,25 @@ async function refresh(): Promise<void> {
   // and the unanswered one failed toward reassurance.
   //
   // Read from the remote-tracking ref, never by fetching: a health endpoint
-  // must not do network I/O. That makes the count only as fresh as the last
-  // fetch, which is why `originFetchedAt` is returned alongside it — a number
-  // whose staleness is undisclosed is its own calm wrong answer.
+  // must not do network I/O. The count is therefore bounded by whenever that
+  // ref was last refreshed, AND THAT AGE IS NOT DETERMINABLE FROM THE
+  // REPOSITORY. This is worth stating precisely, because the plausible local
+  // signals all overstate freshness:
+  //
+  //   - FETCH_HEAD's mtime is written by a fetch of ANY remote or refspec, so
+  //     `git fetch origin some-branch` refreshes it while leaving this upstream
+  //     untouched. Measured: a side-branch-only fetch gave an mtime of seconds
+  //     ago next to a count of 0 on a checkout genuinely 1 commit behind —
+  //     a timestamp certifying a false zero, which is this file's own defect
+  //     rebuilt one level up (Lumen, PR #586 r2).
+  //   - The tracking ref's own mtime answers "when did origin/main last MOVE",
+  //     not "when did we last check" — a fetch that finds nothing leaves it
+  //     untouched, so a current ref reads as an ancient one.
+  //
+  // So the honest disclosure is the absence of one: callers are told the count
+  // is as-of-last-fetch and that its age is unknown. Whoever wants a bounded
+  // answer has to make the fetch a scheduled job with its own recorded time,
+  // and read that — not infer it from a file a fetch happens to touch.
   //
   // Compared against the tracked upstream rather than a hardcoded origin/main,
   // so a deployment running a release branch is measured against its own
@@ -148,42 +162,11 @@ async function refresh(): Promise<void> {
     }
   }
 
-  // Awaited into a local like everything else: the publish below must stay one
-  // synchronous block, or a read could combine this timestamp with the
-  // previous refresh's counts — a torn snapshot of exactly the kind #547 r1
-  // closed, and the pairing here is load-bearing because the timestamp is what
-  // qualifies the counts.
-  const nextOriginFetchedAt = await resolveOriginFetchedAt();
-
   cachedCurrentGitSha = nextCurrentGitSha;
   cachedApiDeltaNonEmpty = nextApiDeltaNonEmpty;
   cachedUpstreamRef = upstream;
   cachedBehindOrigin = nextBehind;
   cachedApiBehindOrigin = nextApiBehind;
-  cachedOriginFetchedAt = nextOriginFetchedAt;
-}
-
-/**
- * When this checkout last fetched, from FETCH_HEAD's mtime.
- *
- * The counts are read from the remote-tracking ref and never fetch, so they
- * are only as fresh as this timestamp. Publishing the count without it would
- * reproduce the defect the count exists to fix one level up: "0 behind" is
- * reassuring, and it is worthless if the last fetch was a week ago.
- *
- * Null when the repository has never fetched, which is honestly unknown
- * rather than "never" — and distinct from a timestamp, so a caller cannot
- * mistake the two (Lumen, #586 r1, on a field this file described but did
- * not return).
- */
-async function resolveOriginFetchedAt(): Promise<string | null> {
-  const path = await execFileText(['rev-parse', '--git-path', 'FETCH_HEAD']);
-  if (!path) return null;
-  try {
-    return (await stat(path)).mtime.toISOString();
-  } catch {
-    return null;
-  }
 }
 
 /**
@@ -231,17 +214,19 @@ export function getRuntimeBuildInfo(nowMs = Date.now()) {
     /** The upstream compared against, e.g. "origin/main". Null if untracked. */
     upstreamRef: cachedUpstreamRef,
     /**
-     * Commits on the upstream that this checkout does not have, as of the last
-     * fetch. NULL MEANS UNKNOWN, not up to date.
+     * Commits on the upstream that this checkout does not have, as of whenever
+     * the remote-tracking ref was last refreshed. NULL MEANS UNKNOWN, not up to
+     * date.
+     *
+     * READ THIS AS A LOWER BOUND. /health never fetches, and the age of the
+     * last fetch is not determinable locally (see refresh()), so a 0 means
+     * "nothing new as of a refresh of unknown age", never "verified current
+     * against the remote just now". A caller wanting the stronger claim has to
+     * fetch on a schedule it records the time of.
      */
     behindOriginCount: cachedBehindOrigin,
     /** Of those, the ones touching this server's own inputs. Null = unknown. */
     apiBehindOriginCount: cachedApiBehindOrigin,
-    /**
-     * When this checkout last fetched. The counts above are only as fresh as
-     * this — /health never fetches. Null = never fetched or undeterminable.
-     */
-    originFetchedAt: cachedOriginFetchedAt,
     /**
      * True only when we can SHOW the checkout is missing API-relevant commits.
      * An unknown count leaves this false, so callers must read the count to
