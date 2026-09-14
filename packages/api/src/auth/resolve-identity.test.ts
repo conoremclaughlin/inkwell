@@ -1,5 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { resolveIdentityId, resolveAgentSlug } from './resolve-identity';
+import {
+  resolveIdentityId,
+  resolveIdentityResult,
+  resolveOwnerSbId,
+  resolveAgentSlug,
+} from './resolve-identity';
 import { runWithRequestContext } from '../utils/request-context';
 
 vi.mock('../utils/logger', () => ({
@@ -122,18 +127,70 @@ describe('resolveIdentityId', () => {
     expect(resolved).not.toBe(SB_LEGACY);
   });
 
-  it('takes the workspace from the ambient request context when not passed one', async () => {
+  it('takes the workspace the server DERIVED from the caller when not passed one', async () => {
     const shared = () =>
       fakeSupabase(rows({ id: SB_IN_A, workspace_id: WS_A }, { id: SB_IN_B, workspace_id: WS_B }));
 
-    const inB = await runWithRequestContext({ userId: USER, workspaceId: WS_B }, () =>
-      resolveIdentityId(shared().client, USER, 'wren')
+    const inB = await runWithRequestContext(
+      { userId: USER, workspaceId: WS_B, workspaceSource: 'derived' },
+      () => resolveIdentityId(shared().client, USER, 'wren')
     );
 
     expect(inB).toBe(SB_IN_B);
 
     // Control: the same call outside a request context cannot narrow, and refuses.
     expect(await resolveIdentityId(shared().client, USER, 'wren')).toBeNull();
+  });
+
+  it('does NOT let a header-selected workspace rename the authenticated writer', async () => {
+    const shared = () =>
+      fakeSupabase(rows({ id: SB_IN_A, workspace_id: WS_A }, { id: SB_IN_B, workspace_id: WS_B }));
+
+    // x-ink-workspace-id is a resource-selection scope, accepted whenever the
+    // USER has access. Honouring it here stamped B's UUID on A's writes.
+    const viaHeader = await runWithRequestContext(
+      { userId: USER, workspaceId: WS_B, workspaceSource: 'header' },
+      () => resolveIdentityId(shared().client, USER, 'wren')
+    );
+
+    expect(viaHeader).toBeNull();
+    expect(viaHeader).not.toBe(SB_IN_B);
+  });
+
+  it.each(['session', 'default'] as const)(
+    'ignores a %s workspace as the actor scope too',
+    async (source) => {
+      const f = fakeSupabase(
+        rows({ id: SB_IN_A, workspace_id: WS_A }, { id: SB_IN_B, workspace_id: WS_B })
+      );
+
+      const resolved = await runWithRequestContext(
+        { userId: USER, workspaceId: WS_B, workspaceSource: source },
+        () => resolveIdentityId(f.client, USER, 'wren')
+      );
+
+      expect(resolved).toBeNull();
+    }
+  );
+
+  it('matches a workspace UUID regardless of case', async () => {
+    const f = fakeSupabase(rows({ id: SB_IN_A, workspace_id: WS_A }));
+
+    // Postgres returns uuids lower-cased; a header does not have to be.
+    const resolved = await resolveIdentityId(f.client, USER, 'wren', WS_A.toUpperCase());
+
+    expect(resolved).toBe(SB_IN_A);
+  });
+
+  it('does not fall through to a legacy row just because the case differed', async () => {
+    const f = fakeSupabase(
+      rows({ id: SB_LEGACY, workspace_id: null }, { id: SB_IN_A, workspace_id: WS_A })
+    );
+
+    const resolved = await resolveIdentityId(f.client, USER, 'wren', WS_A.toUpperCase());
+
+    expect(resolved).toBe(SB_IN_A);
+    expect(resolved).not.toBe(SB_LEGACY);
   });
 
   it('lets an explicit workspace win over the ambient one', async () => {
@@ -155,6 +212,109 @@ describe('resolveIdentityId', () => {
       expect.stringContaining('Failed to resolve'),
       expect.objectContaining({ error: 'connection reset' })
     );
+  });
+});
+
+describe('resolveIdentityResult — why it failed', () => {
+  it('reports no-identity when the slug names nobody', async () => {
+    const f = fakeSupabase(rows());
+    expect(await resolveIdentityResult(f.client, USER, 'nobody')).toEqual({
+      ok: false,
+      reason: 'no-identity',
+    });
+  });
+
+  it('reports ambiguous when a slug has two answers and nothing narrows it', async () => {
+    const f = fakeSupabase(
+      rows({ id: SB_IN_A, workspace_id: WS_A }, { id: SB_IN_B, workspace_id: WS_B })
+    );
+    expect(await resolveIdentityResult(f.client, USER, 'wren')).toEqual({
+      ok: false,
+      reason: 'ambiguous',
+    });
+  });
+
+  it('reports not-in-workspace when the slug lives somewhere else', async () => {
+    const f = fakeSupabase(rows({ id: SB_IN_B, workspace_id: WS_B }));
+    expect(await resolveIdentityResult(f.client, USER, 'wren', WS_A)).toEqual({
+      ok: false,
+      reason: 'not-in-workspace',
+    });
+  });
+
+  it('separates "nobody claimed it" from "a claim could not be honoured"', async () => {
+    const nobody = fakeSupabase(rows());
+    const ambiguous = fakeSupabase(
+      rows({ id: SB_IN_A, workspace_id: WS_A }, { id: SB_IN_B, workspace_id: WS_B })
+    );
+
+    // Both are null through the legacy helper; only the result type tells them
+    // apart, and that difference is what owner-bearing writes key off.
+    expect(await resolveIdentityId(nobody.client, USER, 'nobody')).toBeNull();
+    expect(await resolveIdentityId(ambiguous.client, USER, 'wren')).toBeNull();
+
+    const a = await resolveIdentityResult(nobody.client, USER, 'nobody');
+    const b = await resolveIdentityResult(ambiguous.client, USER, 'wren');
+    expect(a.ok).toBe(false);
+    expect(b.ok).toBe(false);
+    expect((a as { reason: string }).reason).not.toBe((b as { reason: string }).reason);
+  });
+});
+
+describe('resolveOwnerSbId — owner-bearing writes fail closed', () => {
+  it('uses a canonical sbId the caller already holds without looking anything up', async () => {
+    const f = fakeSupabase(rows());
+    expect(await resolveOwnerSbId(f.client, USER, 'wren', SB_IN_A)).toBe(SB_IN_A);
+    expect(f.tables).toEqual([]);
+  });
+
+  it('allows a genuinely unattributed write when no slug is claimed', async () => {
+    const f = fakeSupabase(rows());
+    expect(await resolveOwnerSbId(f.client, USER, undefined)).toBeNull();
+  });
+
+  it('allows null when the slug simply names nobody', async () => {
+    const f = fakeSupabase(rows());
+    expect(await resolveOwnerSbId(f.client, USER, 'nobody')).toBeNull();
+  });
+
+  it('refuses to write a null owner when a slug is ambiguous', async () => {
+    const f = fakeSupabase(
+      rows({ id: SB_IN_A, workspace_id: WS_A }, { id: SB_IN_B, workspace_id: WS_B })
+    );
+
+    // The whole point: null here is not "unattributed", it is a row that the
+    // legacy slug-only authorization path will hand to BOTH same-slug SBs.
+    await expect(resolveOwnerSbId(f.client, USER, 'wren')).rejects.toThrow(/ambiguous/);
+  });
+
+  it('refuses when the slug belongs to another workspace', async () => {
+    const f = fakeSupabase(rows({ id: SB_IN_B, workspace_id: WS_B }));
+
+    // Scoped to A by the caller's own derived workspace; the only wren is in B.
+    await expect(
+      runWithRequestContext({ userId: USER, workspaceId: WS_A, workspaceSource: 'derived' }, () =>
+        resolveOwnerSbId(f.client, USER, 'wren')
+      )
+    ).rejects.toThrow(/not-in-workspace/);
+  });
+
+  it('still refuses an ambiguous slug even though a null return would have "worked"', async () => {
+    const f = fakeSupabase(
+      rows({ id: SB_IN_A, workspace_id: WS_A }, { id: SB_IN_B, workspace_id: WS_B })
+    );
+
+    // Control: the permissive helper returns null for the same input. The
+    // difference between the two is the entire fix.
+    expect(await resolveIdentityId(f.client, USER, 'wren')).toBeNull();
+    await expect(
+      resolveOwnerSbId(
+        fakeSupabase(rows({ id: SB_IN_A, workspace_id: WS_A }, { id: SB_IN_B, workspace_id: WS_B }))
+          .client,
+        USER,
+        'wren'
+      )
+    ).rejects.toThrow();
   });
 });
 
