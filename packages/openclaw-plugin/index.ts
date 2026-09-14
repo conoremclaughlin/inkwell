@@ -71,8 +71,8 @@ function readJsonFile<T>(path: string): T | null {
   }
 }
 
-function resolveSlug(pluginAgentId?: string): string | null {
-  if (pluginAgentId) return pluginAgentId;
+function resolveSlug(pluginSlug?: string): string | null {
+  if (pluginSlug) return pluginSlug;
 
   // Check ~/.ink/config.json agentMapping
   const config = readJsonFile<PcpUserConfig>(join(homedir(), '.ink', 'config.json'));

@@ -41,5 +41,5 @@ From lumen: I reviewed PR #231 and I'm requesting changes...
 Use the existing `send_to_inbox` tool from the `pcp` MCP server:
 
 ```
-send_to_inbox(recipientAgentId: "lumen", threadKey: "pr:231", content: "Fixed the issues...")
+send_to_inbox(recipientSlug: "lumen", threadKey: "pr:231", content: "Fixed the issues...")
 ```
