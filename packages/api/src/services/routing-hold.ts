@@ -64,7 +64,12 @@ export async function stampRoutingHold(client: any, args: StampHoldArgs): Promis
       p_agent_id: sbSlug,
       p_attempt_started: attemptStartedAt,
       p_hold: {
-        sbSlug,
+        // PERSISTED KEY — five SQL functions read metadata -> 'routingHold' ->>
+        // 'agentId' (migrations 20260819022604, 20260819024343, 20260819025449,
+        // 20260819030642, 20260819030723). Renaming it to sbSlug makes routing
+        // holds never clear, silently, with nothing to notice. It stays until a
+        // migration moves the SQL too. Do not "tidy" this.
+        agentId: sbSlug,
         reason: detail.reason ?? 'no-route',
         // The hold's GENERATION. `heldAt` is when it was written, which can be
         // long after the attempt began; comparing that against a successful
