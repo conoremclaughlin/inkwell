@@ -95,8 +95,9 @@ fail_closed() { # reason...
 }
 
 raw=$(mktemp "${TMPDIR:-/tmp}/check-staged-paths.XXXXXX") || exit 2
-blob=$(mktemp "${TMPDIR:-/tmp}/check-staged-blob.XXXXXX") || { rm -f "$raw"; exit 2; }
-trap 'rm -f "$raw" "$blob"' EXIT INT TERM
+list=$(mktemp "${TMPDIR:-/tmp}/check-staged-list.XXXXXX") || { rm -f "$raw"; exit 2; }
+blob=$(mktemp "${TMPDIR:-/tmp}/check-staged-blob.XXXXXX") || { rm -f "$raw" "$list"; exit 2; }
+trap 'rm -f "$raw" "$list" "$blob"' EXIT INT TERM
 
 # The comparison base for --commit: the first parent, or the empty tree for a
 # root commit. `git diff-tree <sha>` alone shows NOTHING for a merge commit,
@@ -121,12 +122,22 @@ fi
 [ "$rc" -ne 0 ] && fail_closed "could not list the files to check (git exited $rc)"
 [ -s "$raw" ] || exit 0
 
+# Convert NUL to newline ONCE, into a file, and check that conversion on its
+# own. The count below and the loop further down both read this same file, so
+# a conversion that fails cannot leave the loop with an empty feed and a clean
+# verdict. (It did, once: the feed was a second tr inside a here-doc, whose
+# status nothing looked at.)
+tr '\000' '\n' < "$raw" > "$list" || fail_closed "could not convert the staged path list"
+
 # Lossless-ness check: with -z each path ends in one NUL. If a path itself
-# contains a newline, converting NUL to newline yields more lines than
-# entries, and no line-oriented loop can recover the original path.
+# contains a newline, the converted list has more lines than there were
+# entries, and no line-oriented loop can recover the original path. Each
+# count is validated on its own; a count that is empty or non-numeric is a
+# failed scan, not a zero.
 entries=$(tr -cd '\000' < "$raw" | wc -c | tr -d ' ')
-lines=$(tr '\000' '\n' < "$raw" | grep -c '')
-case "$entries$lines" in *[!0-9]*) fail_closed "could not count the staged paths" ;; esac
+case "$entries" in '' | *[!0-9]*) fail_closed "could not count the staged paths (entries)" ;; esac
+lines=$(grep -c '' < "$list")
+case "$lines" in '' | *[!0-9]*) fail_closed "could not count the staged paths (lines)" ;; esac
 [ "$entries" -ne "$lines" ] && fail_closed "a staged path contains a newline; refusing rather than misreading it"
 
 # NAMES. Matched against the full path with a leading slash so both "/.env" and
@@ -161,10 +172,13 @@ forbidden_name() {
 # pointer) has no blob to read and is skipped by the SHAPES arm; a symlink
 # (120000) reads as its target string, which is harmless to scan.
 entry_mode() {
+  # The mode is the first field of the first line, so no NUL handling is needed
+  # here — and keeping it out means the path-list conversion above is the only
+  # place this guard converts anything.
   if [ "$mode" = index ]; then
-    git ls-files --stage -z -- "$1" 2>/dev/null | tr '\000' '\n' | head -1 | cut -d' ' -f1
+    git ls-files --stage -- "$1" 2>/dev/null | head -1 | cut -d' ' -f1
   else
-    git ls-tree -z "$commit" -- "$1" 2>/dev/null | tr '\000' '\n' | head -1 | cut -d' ' -f1
+    git ls-tree "$commit" -- "$1" 2>/dev/null | head -1 | cut -d' ' -f1
   fi
 }
 
@@ -213,9 +227,7 @@ while IFS= read -r path; do
     shape_hits="$shape_hits$path: line(s) $lines_hit
 "
   fi
-done <<EOF
-$(tr '\000' '\n' < "$raw")
-EOF
+done < "$list"
 
 if [ "$refused" -eq 1 ]; then
   echo ""

@@ -297,6 +297,44 @@ out=$(cd "$r" && PATH="$work/gitstub:$PATH" sh "$guard" 2>&1); rc=$?
 [ "$rc" -eq 2 ] && ok "a failing git show fails closed (exit 2) instead of passing" || bad "a failing git show fails closed" "exit $rc: $(echo "$out" | tr '\n' ' ')"
 echo "$out" | grep -q 'ordinary.txt' && ok "the read failure names the path" || bad "the read failure names the path" "$(echo "$out" | tr '\n' ' ')"
 
+# The conversion that FEEDS THE LOOP must be checked on its own (Lumen r2 #2).
+# The stub counts `tr '\000' '\n'` calls and faults only the second, which is
+# the shape that mattered: the counts succeeded, the feed did not, and the loop
+# then scanned nothing and reported clean. The assertion is the security
+# contract rather than a specific code — with a token staged and a conversion
+# faulted, the guard must NOT report clean.
+mkdir -p "$work/trstub"
+realtr=$(command -v tr)
+cat > "$work/trstub/tr" <<'TRSTUB'
+#!/bin/sh
+if [ "$1" = '\000' ] && [ "$2" = '\n' ]; then
+  n=0
+  [ -f "$TR_COUNT" ] && read -r n < "$TR_COUNT"
+  n=$((n + 1))
+  printf '%s\n' "$n" > "$TR_COUNT"
+  if [ "$n" -eq "$TR_FAIL_AT" ]; then
+    printf '%s\n' 'synthetic path conversion failure' >&2
+    exit 2
+  fi
+fi
+exec "$REAL_TR" "$@"
+TRSTUB
+chmod +x "$work/trstub/tr"
+
+r=$(new_repo scan-trfail-second "$nohooks")
+stage "$r" ordinary.txt "token ghp_$F36"
+rm -f "$work/tr-count"
+out=$(cd "$r" && PATH="$work/trstub:$PATH" TR_COUNT="$work/tr-count" TR_FAIL_AT=2 REAL_TR="$realtr" sh "$guard" 2>&1); rc=$?
+[ "$rc" -ne 0 ] && ok "a faulted second path conversion never reports clean" || bad "a faulted second path conversion never reports clean" "exit 0 with a token staged: $(echo "$out" | tr '\n' ' ')"
+echo "$out" | grep -q "$F36" && bad "second-conversion failure prints no value" "token bytes in output" || ok "second-conversion failure prints no value"
+
+r=$(new_repo scan-trfail-first "$nohooks")
+stage "$r" ordinary.txt "token ghp_$F36"
+rm -f "$work/tr-count"
+out=$(cd "$r" && PATH="$work/trstub:$PATH" TR_COUNT="$work/tr-count" TR_FAIL_AT=1 REAL_TR="$realtr" sh "$guard" 2>&1); rc=$?
+[ "$rc" -eq 2 ] && ok "a faulted path-list conversion fails closed (exit 2)" || bad "a faulted path-list conversion fails closed (exit 2)" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+echo "$out" | grep -q "$F36" && bad "conversion failure prints no value" "token bytes in output" || ok "conversion failure prints no value"
+
 # Merge-only content (Lumen r1 #2): a credential file introduced in the merge
 # resolution, present in neither parent's diff.
 r=$(new_repo scan-merge "$nohooks")

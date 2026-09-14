@@ -245,6 +245,52 @@ out=$(git -C "$r" push -u origin topic 2>&1); rc=$?
 c=$(echo "$out" | grep -c -- '^--- ')
 [ "$c" -eq 1 ] && echo "$out" | grep -q -- "--- $st" && ok "exclusion is measured against the destination, not stale tracking refs" || bad "exclusion is measured against the destination, not stale tracking refs" "printed $c headers: $(echo "$out" | tr '\n' ' ')"
 
+# Distinct fetch and push URLs (Lumen r2 #1): the hook's second argument is
+# the push endpoint, and that is what must be listed. Seed the refused commit
+# in origin's FETCH repo, point --push at an empty second repo: the push must
+# be refused and the second repo must stay empty.
+r=$(new_pair pushurl "$hooks_dir")
+commit_file "$r" a.txt 'one' 'test: synthetic secret assignment
+
+JWT_SECRET=REVIEWCANARY0043' --no-verify
+git -C "$r" -c core.hooksPath="$work/none" push -q origin main >/dev/null 2>&1
+[ -n "$(remote_head "$work/pushurl.git" main)" ] || bad "fixture: fetch repo received the commit" "seed push failed"
+git init -q --bare "$work/pushurl-push.git"
+git -C "$r" remote set-url --push origin "$work/pushurl-push.git"
+out=$(git -C "$r" push origin main 2>&1); rc=$?
+if [ "$rc" -ne 0 ] && [ -z "$(remote_head "$work/pushurl-push.git" main)" ]; then
+  ok "exclusion is measured against the PUSH url, so a commit only on the fetch url is still replayed and blocked"
+else
+  bad "exclusion is measured against the PUSH url" "exit $rc; push repo main: $(remote_head "$work/pushurl-push.git" main)"
+fi
+echo "$out" | grep -q 'REVIEWCANARY0043' && bad "pushurl refusal does not print the value" "value bytes in output" || ok "pushurl refusal does not print the value"
+
+# ...and the other direction: the push endpoint already has the commit while
+# the fetch repo does not, so nothing is replayed and the push is allowed.
+r=$(new_pair pushurl2 "$hooks_dir")
+commit_file "$r" a.txt 'one' 'feat: already on the push endpoint'
+git init -q --bare "$work/pushurl2-push.git"
+git -C "$r" -c core.hooksPath="$work/none" push -q "$work/pushurl2-push.git" main >/dev/null 2>&1
+git -C "$r" remote set-url --push origin "$work/pushurl2-push.git"
+commit_file "$r" b.txt 'two' 'feat: new on both'
+s2=$(git -C "$r" rev-parse --short HEAD)
+out=$(git -C "$r" push origin main 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "a push whose endpoint already has the older commit succeeds" || bad "a push whose endpoint already has the older commit succeeds" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+c=$(echo "$out" | grep -c -- '^--- ')
+[ "$c" -eq 1 ] && echo "$out" | grep -q -- "--- $s2" && ok "only the commit the push endpoint lacks is replayed (fetch repo is empty and ignored)" || bad "only the commit the push endpoint lacks is replayed" "printed $c headers: $(echo "$out" | tr '\n' ' ')"
+
+# A destination that cannot be listed is described, never printed: a URL may
+# carry embedded credentials. Invoked directly, the way git would for a push
+# to a raw URL, with an unreachable endpoint.
+r=$(new_pair unlistable "$hooks_dir")
+commit_file "$r" a.txt 'one' 'feat: fine'
+sha=$(git -C "$r" rev-parse HEAD)
+badurl='https://user:EMBEDDEDSECRET0044@127.0.0.1:1/nowhere.git'
+out=$(cd "$r" && printf 'refs/heads/main %s refs/heads/main 0000000000000000000000000000000000000000\n' "$sha" | sh "$hooks_dir/../scripts/check-push.sh" "$badurl" "$badurl" 2>&1); rc=$?
+echo "$out" | grep -q 'EMBEDDEDSECRET0044' && bad "an unlistable destination URL is never echoed" "URL credential in output" || ok "an unlistable destination URL is never echoed"
+echo "$out" | grep -q 'could not list the refs of the destination URL' && ok "the unlistable destination is described generically" || bad "the unlistable destination is described generically" "$(echo "$out" | tr '\n' ' ')"
+[ "$rc" -eq 0 ] && echo "$out" | grep -q -- "--- $(git -C "$r" rev-parse --short HEAD)" && ok "with nothing excludable, every reachable commit is replayed" || bad "with nothing excludable, every reachable commit is replayed" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+
 echo "PREVIEW (scripts/check-push.sh --preview, the read-back before pushing)"
 
 replay="$hooks_dir/../scripts/check-push.sh"

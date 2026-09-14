@@ -24,8 +24,9 @@
 # all zeros means a delete, which pushes nothing and is not checked.
 #
 # For a ref that is new on the remote, "what leaves the machine" is measured
-# against THAT remote: its heads and tags are listed at push time and only
-# commits it already has are excluded. Remote-tracking refs are not used for
+# against THAT remote's PUSH endpoint (argument 2, the pushurl when one is
+# configured): its heads and tags are listed at push time and only commits it
+# already has are excluded. Remote-tracking refs are not used for
 # this — they include other remotes (a commit already pushed to a private
 # mirror is still leaving for the public one) and they go stale. If the
 # destination cannot be listed, nothing is excluded and every reachable commit
@@ -57,13 +58,25 @@ done
 preview=0
 base=''
 remote_name=${1:-}
+remote_url=${2:-}
 case "${1:-}" in
   --preview)
     preview=1
     base=${2:-origin/main}
     remote_name=''
+    remote_url=''
     ;;
 esac
+
+# For diagnostics only. A URL may carry embedded credentials, so it is never
+# printed: a configured remote is named, anything else is "the destination".
+describe_remote() {
+  if [ -n "$remote_name" ] && git config --get "remote.$remote_name.url" >/dev/null 2>&1; then
+    printf "remote '%s'" "$remote_name"
+  else
+    printf '%s' 'the destination URL'
+  fi
+}
 
 zeros=0000000000000000000000000000000000000000
 tmp=$(mktemp "${TMPDIR:-/tmp}/check-push.XXXXXX") || exit 2
@@ -134,15 +147,18 @@ else
 
     if [ "$remote_sha" = "$zeros" ]; then
       # New ref on the destination. Exclude only what the DESTINATION has,
-      # measured now, and exclude nothing if it cannot be measured.
+      # measured now against the endpoint this push is going to: argument 2 is
+      # the push URL, which is remote.<name>.pushurl when one is configured. A
+      # remote NAME would resolve to the fetch URL, and the two can differ.
+      # Exclude nothing if the endpoint cannot be listed.
       exclude=''
-      if git ls-remote --quiet --heads --tags "$remote_name" > "$have" 2>/dev/null; then
+      if [ -n "$remote_url" ] && git ls-remote --quiet --heads --tags "$remote_url" > "$have" 2>/dev/null; then
         while read -r sha _; do
           [ -n "$sha" ] || continue
           git cat-file -e "$sha" 2>/dev/null && exclude="$exclude ^$sha"
         done < "$have"
       else
-        echo "   (could not list the refs of '$remote_name'; replaying every commit reachable from $local_ref)"
+        echo "   (could not list the refs of $(describe_remote); replaying every commit reachable from $local_ref)"
       fi
       # $exclude is unquoted on purpose: it is a space-separated list of ^<sha>.
       # shellcheck disable=SC2086
