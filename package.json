@@ -80,7 +80,6 @@
   },
   "packageManager": "yarn@4.13.0",
   "resolutions": {
-    "libsignal": "npm:2.0.1",
     "minimatch@9.0.3": "9.0.7",
     "@discordjs/rest/undici": "6.28.1",
     "discord.js/undici": "6.28.1",
