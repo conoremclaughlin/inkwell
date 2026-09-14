@@ -72,9 +72,20 @@ export async function storeLogin(login: LoginResponse): Promise<void> {
 }
 
 export async function storeRefreshedAccess(refreshed: RefreshResponse): Promise<void> {
-  state = { ...state, accessToken: refreshed.accessToken };
+  // The grant rotates on every exchange, so a response carrying a refreshToken
+  // means the one in storage is spent. Persisting the access token alone would
+  // work exactly once and then lock the device out.
+  const rotated = refreshed.refreshToken;
+  state = {
+    ...state,
+    accessToken: refreshed.accessToken,
+    ...(rotated ? { refreshToken: rotated } : {}),
+  };
   notify();
-  await SecureStore.setItemAsync(ACCESS_KEY, refreshed.accessToken);
+  await Promise.all([
+    SecureStore.setItemAsync(ACCESS_KEY, refreshed.accessToken),
+    ...(rotated ? [SecureStore.setItemAsync(REFRESH_KEY, rotated)] : []),
+  ]);
 }
 
 export async function clearAuth(): Promise<void> {

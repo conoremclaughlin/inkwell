@@ -11,14 +11,27 @@ const mockDelete = vi.fn();
 
 function mockChain(terminalData: unknown = null, terminalError: unknown = null) {
   const chain: Record<string, any> = {};
-  chain.select = vi.fn(() => chain);
+  // Tracks whether this chain is an update, so `.select()` can be the terminal
+  // for the rotation write (`update().eq().eq().select()`) while staying a
+  // pass-through for reads.
+  let updating = false;
+  chain.select = vi.fn(() =>
+    updating ? Promise.resolve({ data: mockUpdateRows, error: mockUpdateError }) : chain
+  );
   chain.insert = mockInsert.mockReturnValue(chain);
-  chain.update = mockUpdate.mockReturnValue(chain);
+  chain.update = mockUpdate.mockImplementation(() => {
+    updating = true;
+    return chain;
+  });
   chain.delete = mockDelete.mockReturnValue(chain);
   chain.eq = vi.fn(() => chain);
   chain.single = vi.fn(() => Promise.resolve({ data: terminalData, error: terminalError }));
   return chain;
 }
+
+/** Rows the rotation write reports as updated; [] models a lost race. */
+let mockUpdateRows: unknown = [{ id: 'token-id' }];
+let mockUpdateError: unknown = null;
 
 let currentMcpTokensChain: ReturnType<typeof mockChain>;
 
@@ -399,7 +412,13 @@ describe('pcp-tokens', () => {
       });
 
       mockUpdate.mockReturnValue({
-        eq: vi.fn(() => ({ error: null })),
+        eq: vi.fn(function self() {
+          return {
+            eq: self,
+            select: () => Promise.resolve({ data: [{ id: 'token-id' }], error: null }),
+            error: null,
+          };
+        }),
       });
 
       const result = await exchangeRefreshToken(
@@ -407,7 +426,7 @@ describe('pcp-tokens', () => {
         'pcp-rt-abc',
         'test-client',
         'mcp_access',
-        2592000
+        3600
       );
 
       expect(result).not.toBeNull();
@@ -434,7 +453,13 @@ describe('pcp-tokens', () => {
       });
 
       mockUpdate.mockReturnValue({
-        eq: vi.fn(() => ({ error: null })),
+        eq: vi.fn(function self() {
+          return {
+            eq: self,
+            select: () => Promise.resolve({ data: [{ id: 'token-id' }], error: null }),
+            error: null,
+          };
+        }),
       });
 
       const result = await exchangeRefreshToken(
@@ -464,7 +489,13 @@ describe('pcp-tokens', () => {
       });
 
       mockUpdate.mockReturnValue({
-        eq: vi.fn(() => ({ error: null })),
+        eq: vi.fn(function self() {
+          return {
+            eq: self,
+            select: () => Promise.resolve({ data: [{ id: 'token-id' }], error: null }),
+            error: null,
+          };
+        }),
       });
 
       const result = await exchangeRefreshToken(
@@ -560,7 +591,13 @@ describe('pcp-tokens', () => {
       });
 
       mockUpdate.mockReturnValue({
-        eq: vi.fn(() => ({ error: null })),
+        eq: vi.fn(function self() {
+          return {
+            eq: self,
+            select: () => Promise.resolve({ data: [{ id: 'token-id' }], error: null }),
+            error: null,
+          };
+        }),
       });
 
       await exchangeRefreshToken(
@@ -588,7 +625,13 @@ describe('pcp-tokens', () => {
       });
 
       mockUpdate.mockReturnValue({
-        eq: vi.fn(() => ({ error: null })),
+        eq: vi.fn(function self() {
+          return {
+            eq: self,
+            select: () => Promise.resolve({ data: [{ id: 'token-id' }], error: null }),
+            error: null,
+          };
+        }),
       });
 
       const supabase = getMockSupabase();
@@ -611,7 +654,13 @@ describe('pcp-tokens', () => {
       });
 
       mockUpdate.mockReturnValue({
-        eq: vi.fn(() => ({ error: null })),
+        eq: vi.fn(function self() {
+          return {
+            eq: self,
+            select: () => Promise.resolve({ data: [{ id: 'token-id' }], error: null }),
+            error: null,
+          };
+        }),
       });
 
       const result = await exchangeRefreshToken(

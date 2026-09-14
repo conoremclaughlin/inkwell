@@ -147,6 +147,12 @@ export interface LoginResponse {
 
 export interface RefreshResponse {
   accessToken: string;
+  /**
+   * The rotated refresh grant. Present whenever the server rotates (it always
+   * does now); optional so a response from an older server still type-checks.
+   * Persist it — the token used to obtain this response is already dead.
+   */
+  refreshToken?: string;
   expiresIn: number;
   userId: string;
   email: string;

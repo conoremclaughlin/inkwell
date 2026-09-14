@@ -15,15 +15,27 @@ const mockGetUser = vi.fn();
 // Build a chainable mock for Supabase queries
 function mockChain(terminalData: unknown = null, terminalError: unknown = null) {
   const chain: Record<string, any> = {};
-  chain.select = vi.fn(() => chain);
+  // Tracks whether this chain is an update, so `.select()` can be the terminal
+  // for the rotation write (`update().eq().eq().select()`) while staying a
+  // pass-through for reads.
+  let updating = false;
+  chain.select = vi.fn(() =>
+    updating ? Promise.resolve({ data: mockUpdateRows, error: mockUpdateError }) : chain
+  );
   chain.insert = mockInsert.mockReturnValue(chain);
-  chain.update = mockUpdate.mockReturnValue(chain);
+  chain.update = mockUpdate.mockImplementation(() => {
+    updating = true;
+    return chain;
+  });
   chain.delete = mockDelete.mockReturnValue(chain);
   chain.eq = vi.fn(() => chain);
-  chain.lt = vi.fn(() => chain);
   chain.single = vi.fn(() => Promise.resolve({ data: terminalData, error: terminalError }));
   return chain;
 }
+
+/** Rows the rotation write reports as updated; [] models a lost race. */
+let mockUpdateRows: unknown = [{ id: 'token-id' }];
+let mockUpdateError: unknown = null;
 
 let currentUserChain: ReturnType<typeof mockChain>;
 let currentMcpTokensChain: ReturnType<typeof mockChain>;
@@ -399,7 +411,8 @@ describe('PcpAuthProvider', () => {
 
         expect(result.refresh_token).toMatch(/^pcp-rt-/);
         expect(result.token_type).toBe('Bearer');
-        expect(result.expires_in).toBe(30 * 24 * 60 * 60);
+        // One hour now: a 30-day access token left the refresh grant unexercised.
+        expect(result.expires_in).toBe(60 * 60);
         expect(result.scope).toBe('mcp:tools');
       }
     });
@@ -563,8 +576,15 @@ describe('PcpAuthProvider', () => {
         users: { email: 'test@example.com' },
       });
 
+      // Rotation writes update().eq('id').eq('refresh_token').select('id'),
+      // so the override has to stay chainable and terminate in the row list.
       mockUpdate.mockReturnValue({
-        eq: vi.fn(() => ({ error: null })),
+        eq: vi.fn(function self(): unknown {
+          return {
+            eq: self,
+            select: () => Promise.resolve({ data: [{ id: 'token-id' }], error: null }),
+          };
+        }),
       });
 
       const result = await provider.exchangeRefreshToken({
@@ -581,9 +601,13 @@ describe('PcpAuthProvider', () => {
         expect(decoded.email).toBe('test@example.com');
         expect(decoded.scope).toBe('mcp:tools');
 
-        expect(result.refresh_token).toBe('pcp-rt-abc');
+        // The grant ROTATES: the response must carry a new secret, never the
+        // one presented, or the client is locked out at its next refresh.
+        expect(result.refresh_token).not.toBe('pcp-rt-abc');
+        expect(result.refresh_token).toMatch(/^pcp-rt-[0-9a-f]{64}$/);
         expect(result.token_type).toBe('Bearer');
-        expect(result.expires_in).toBe(30 * 24 * 60 * 60);
+        // One hour now: a 30-day access token left the refresh grant unexercised.
+        expect(result.expires_in).toBe(60 * 60);
       }
     });
 
@@ -600,8 +624,15 @@ describe('PcpAuthProvider', () => {
         users: { email: 'test@example.com' },
       });
 
+      // Rotation writes update().eq('id').eq('refresh_token').select('id'),
+      // so the override has to stay chainable and terminate in the row list.
       mockUpdate.mockReturnValue({
-        eq: vi.fn(() => ({ error: null })),
+        eq: vi.fn(function self(): unknown {
+          return {
+            eq: self,
+            select: () => Promise.resolve({ data: [{ id: 'token-id' }], error: null }),
+          };
+        }),
       });
 
       await provider.exchangeRefreshToken({
@@ -798,8 +829,15 @@ describe('PcpAuthProvider', () => {
         users: { email: 'test@example.com' },
       });
 
+      // Rotation writes update().eq('id').eq('refresh_token').select('id'),
+      // so the override has to stay chainable and terminate in the row list.
       mockUpdate.mockReturnValue({
-        eq: vi.fn(() => ({ error: null })),
+        eq: vi.fn(function self(): unknown {
+          return {
+            eq: self,
+            select: () => Promise.resolve({ data: [{ id: 'token-id' }], error: null }),
+          };
+        }),
       });
 
       const refreshResult = await provider.exchangeRefreshToken({
@@ -817,7 +855,10 @@ describe('PcpAuthProvider', () => {
       >;
       expect(refreshedDecoded.type).toBe('mcp_access');
       expect(refreshedDecoded.sub).toBe('user-123');
-      expect(refreshResult.refresh_token).toBe(tokens.refresh_token);
+      // Rotated, so the end-to-end flow hands back a different grant than the
+      // code exchange issued.
+      expect(refreshResult.refresh_token).not.toBe(tokens.refresh_token);
+      expect(refreshResult.refresh_token).toMatch(/^pcp-rt-[0-9a-f]{64}$/);
 
       // Step 5: Verify the access token
       const verified = provider.verifyAccessToken(`Bearer ${refreshResult.access_token}`);

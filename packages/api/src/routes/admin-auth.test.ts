@@ -422,6 +422,8 @@ describe('adminAuthMiddleware', () => {
     it('should authenticate via refresh cookie and issue new access token cookie', async () => {
       mockExchangeRefreshToken.mockResolvedValue({
         accessToken: 'new-access-jwt',
+        refreshToken: 'pcp-rt-rotated',
+        refreshTokenExpiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
         userId: 'user-456',
         email: 'refreshed@example.com',
       });
@@ -457,8 +459,9 @@ describe('adminAuthMiddleware', () => {
       // Should NOT call Supabase auth
       expect(mockGetUser).not.toHaveBeenCalled();
 
-      // Should NOT issue a new refresh cookie (stays the same)
-      expect(res._cookies['pcp-admin-refresh']).toBeUndefined();
+      // SHOULD issue a new refresh cookie: the grant rotated, so the value the
+      // browser presented is already dead.
+      expect(res._cookies['pcp-admin-refresh'].value).toBe('pcp-rt-rotated');
     });
 
     it('should set correct user context from refresh exchange', async () => {
@@ -577,7 +580,8 @@ describe('adminAuthMiddleware', () => {
         'user-tier3',
         'dashboard',
         ['admin'],
-        90
+        // The grant opens with one IDLE window, not the absolute ceiling.
+        7
       );
     });
 
@@ -857,7 +861,7 @@ describe('adminAuthMiddleware', () => {
       expect(res._cookies['pcp-admin-token'].options.maxAge).toBe(3600 * 1000); // 1 hour in ms
     });
 
-    it('should set refresh token maxAge to 90 days', async () => {
+    it('should set the refresh cookie to the sliding idle window, not the absolute ceiling', async () => {
       mockVerifyPcpAccessToken.mockReturnValue(null);
       mockExchangeRefreshToken.mockResolvedValue(null);
       mockGetUser.mockResolvedValue({
@@ -878,7 +882,9 @@ describe('adminAuthMiddleware', () => {
 
       await middleware(req, res, next);
 
-      expect(res._cookies['pcp-admin-refresh'].options.maxAge).toBe(90 * 24 * 60 * 60 * 1000);
+      // 7 days: expires_at is the IDLE deadline now. The 90-day ceiling is
+      // enforced server-side from created_at, not by the cookie's lifetime.
+      expect(res._cookies['pcp-admin-refresh'].options.maxAge).toBe(7 * 24 * 60 * 60 * 1000);
     });
   });
 
@@ -945,10 +951,12 @@ describe('adminAuthMiddleware', () => {
       expect(mockCreateRefreshToken).not.toHaveBeenCalled();
     });
 
-    it('should not issue refresh cookie when Tier 2 succeeds (only access cookie)', async () => {
+    it('should rewrite the refresh cookie when Tier 2 succeeds, because the grant rotated', async () => {
       mockVerifyPcpAccessToken.mockReturnValue(null);
       mockExchangeRefreshToken.mockResolvedValue({
         accessToken: 'refreshed-jwt',
+        refreshToken: 'pcp-rt-rotated',
+        refreshTokenExpiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
         userId: 'user-t2',
         email: 't2@example.com',
       });
@@ -961,9 +969,10 @@ describe('adminAuthMiddleware', () => {
 
       await middleware(req, res, next);
 
-      // Only access token cookie, not refresh
+      // Both cookies. Leaving the old refresh cookie in place would hand the
+      // browser a token the next exchange refuses — a silent hourly logout.
       expect(res._cookies['pcp-admin-token']).toBeDefined();
-      expect(res._cookies['pcp-admin-refresh']).toBeUndefined();
+      expect(res._cookies['pcp-admin-refresh'].value).toBe('pcp-rt-rotated');
     });
   });
 });
