@@ -159,7 +159,7 @@ export const listCalendarEventsSchema = userIdentifierBaseSchema.extend({
   endDate: z
     .string()
     .describe(
-      'End of date range. Full ISO 8601 or bare date — bare dates are resolved to midnight in the specified timezone.'
+      'End of date range, INCLUSIVE when a bare date: events at any hour of this day are returned, so startDate == endDate means that whole day. Full ISO 8601 is treated as an exact exclusive instant instead. Must be a real calendar date — 2026-02-31 is rejected rather than rolled into March.'
     ),
   timezone: z
     .string()
