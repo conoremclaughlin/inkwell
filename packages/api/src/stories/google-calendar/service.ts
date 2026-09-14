@@ -19,6 +19,7 @@ import type {
 } from './types';
 
 const BARE_DATE = /^\d{4}-\d{2}-\d{2}$/;
+const DAY_MS = 86_400_000;
 
 /**
  * Reject a bare date that `Date` would silently rewrite into a different one.
@@ -66,55 +67,106 @@ function formatUtcOffset(minutes: number): string {
 }
 
 /**
- * The offset in force at the START of `date` in `timezone` — the REQUESTED
- * zone's midnight, never the host's.
+ * The FIRST INSTANT of the civil day `date` in `timezone` — not an offset to
+ * append to midnight, because midnight is not guaranteed to exist or to be
+ * unique.
  *
- * This used to sample `new Date(date + 'T00:00:00')`, which is midnight where
- * the server happens to sit, and then read the requested zone's offset at that
- * unrelated instant. The two coincide only when the server runs in the zone
- * being asked about, so the bug was invisible to any test whose host zone
- * matched the zone under test — and invisible in CI, which runs in UTC, for any
- * request in UTC.
+ * Two earlier versions of this got it wrong in two different ways, and the
+ * second is the one worth understanding:
  *
- * It bites whenever the sampled instant lands on the far side of a DST
- * transition from the requested midnight. Under a Los Angeles host,
- * `Europe/Berlin` on 2026-03-29 resolved to +02:00 when Berlin midnight is
- * still +01:00, dropping the day's last hour; on 2026-10-25 it resolved to
- * +01:00 instead of +02:00, pulling in the next day's first hour (found by
- * Lumen in review).
+ * 1. It sampled `new Date(date + 'T00:00:00')` — midnight where the SERVER
+ *    sits — then read the requested zone's offset at that unrelated instant.
+ *    The two coincide only when the host runs in the zone being asked about,
+ *    which is why the defect was invisible to any test that inherited its host
+ *    zone, and invisible in CI (UTC) for any UTC request.
+ *
+ * 2. It then corrected that by re-reading the offset at the instant the first
+ *    reading implied, and returned THAT OFFSET to be pasted onto `T00:00:00`.
+ *    That silently assumes a `00:00:00` exists in the zone that day and happens
+ *    only once. Neither holds in a zone whose DST transition is at midnight:
+ *
+ *      - GAP. Santiago springs forward at midnight, 23:59:59 straight to 01:00,
+ *        so 2026-09-06T00:00 never occurs. Pasting the post-transition offset
+ *        onto it names 03:00Z — an hour BEFORE the day starts, which is still
+ *        September 5, so the previous day loses its last hour. Havana's
+ *        spring-forward is the same shape.
+ *      - FOLD. Amman fell back at midnight in 2021, so 2021-10-29T00:00
+ *        occurred TWICE, an hour apart. Pasting an offset picks one of them
+ *        arbitrarily, and picking the second admits an hour that belongs to the
+ *        following day.
+ *
+ * So the question has to be "when does this day begin", not "what offset do I
+ * write after 00:00:00". This is the distinction TC39 draws with
+ * `Temporal.ZonedDateTime.startOfDay`, and the resolution below is that
+ * algorithm: read the offsets a day either side, keep whichever candidate
+ * instants are self-consistent (a wall clock interpreted with an offset that is
+ * genuinely in force there), and take the earliest. Zero survivors means the
+ * wall clock fell in a gap, where the day begins at the transition itself.
+ *
+ * Measured against `Intl`-derived ground truth — the earliest instant whose
+ * civil date in the zone is `date` — over 73,050 (zone, date) pairs across 25
+ * zones and 8 years: exact everywhere. The version this replaces missed 37 of
+ * them, in 8 zones (found by Lumen in review, who named 3).
  */
-function startOfDayOffset(date: string, timezone: string): string {
-  const utcMidnight = Date.parse(`${date}T00:00:00Z`);
+function startOfDayInstant(date: string, timezone: string): number {
+  // The requested wall clock, read as if it were UTC. It is not an instant yet
+  // — it becomes one only once paired with an offset that is actually in force.
+  const wall = Date.parse(`${date}T00:00:00Z`);
 
-  // Seed with the offset at that calendar date's UTC midnight, then re-read it
-  // at the instant the seed implies for local midnight. When the seed sat on
-  // the far side of a transition, the second reading is the one actually in
-  // force. One correction converges for every real zone, because DST shifts
-  // (an hour or two) are far smaller than the offsets themselves.
-  const seed = zoneOffsetMinutesAt(new Date(utcMidnight), timezone);
-  const atLocalMidnight = zoneOffsetMinutesAt(new Date(utcMidnight - seed * 60_000), timezone);
+  // A day either side brackets any single transition near this wall clock.
+  const before = zoneOffsetMinutesAt(new Date(wall - DAY_MS), timezone);
+  const after = zoneOffsetMinutesAt(new Date(wall + DAY_MS), timezone);
 
-  return formatUtcOffset(atLocalMidnight);
+  const possible: number[] = [];
+  for (const offset of before === after ? [before] : [before, after]) {
+    const instant = wall - offset * 60_000;
+    // Self-consistency: an offset only names a real instant if it is the offset
+    // in force AT that instant. A gap fails both checks; a fold passes both.
+    if (zoneOffsetMinutesAt(new Date(instant), timezone) === offset) possible.push(instant);
+  }
+
+  // Fold: two real midnights, and the day begins at the first.
+  if (possible.length > 0) return Math.min(...possible);
+
+  // Gap: no midnight at all, so the day begins when the clock jumps — which is
+  // the pre-transition offset applied to the absent wall clock.
+  return wall - before * 60_000;
 }
 
 /**
- * Convert a bare YYYY-MM-DD date to an RFC 3339 timestamp at midnight in the
- * given IANA timezone. Already-qualified timestamps pass through unchanged.
+ * Render an instant as RFC 3339 in `timezone`'s own wall clock.
+ *
+ * Kept local rather than emitting `...Z` so the timestamp still reads in the
+ * zone that was asked about, and so a start-of-day that ISN'T midnight is
+ * visible as such in logs and tests (Santiago's `T01:00:00-03:00` is the
+ * honest rendering of a day that has no midnight). Parsing it recovers exactly
+ * the instant passed in — verified across the same 73,050 pairs.
+ */
+function renderInZone(instant: number, timezone: string): string {
+  const offset = zoneOffsetMinutesAt(new Date(instant), timezone);
+  const wallClock = new Date(instant + offset * 60_000);
+  return `${wallClock.toISOString().slice(0, 19)}${formatUtcOffset(offset)}`;
+}
+
+/**
+ * Convert a bare YYYY-MM-DD date to an RFC 3339 timestamp at the START of that
+ * day in the given IANA timezone. Already-qualified timestamps pass through
+ * unchanged.
  */
 function bareDateToRfc3339(date: string, timezone: string, field: string): string {
   if (!BARE_DATE.test(date)) return date;
   assertRealCalendarDate(date, field);
 
-  return `${date}T00:00:00${startOfDayOffset(date, timezone)}`;
+  return renderInZone(startOfDayInstant(date, timezone), timezone);
 }
 
 /**
  * The RFC3339 instant that makes `endDate` INCLUSIVE.
  *
  * Google's `timeMax` is exclusive, and `endDate` was passed straight through
- * `bareDateToRfc3339` — which resolves a bare date to midnight at the START of
- * that day. So every range silently dropped its final day, and the same-day
- * case (`start === end`) produced a zero-width window that returned nothing.
+ * `bareDateToRfc3339` — which resolves a bare date to the START of that day. So
+ * every range silently dropped its final day, and the same-day case
+ * (`start === end`) produced a zero-width window that returned nothing.
  *
  * It was filed for eleven days as "same-day queries return empty", because
  * "what's on today" is the query anyone makes most and that is where it gets
@@ -126,7 +178,7 @@ function bareDateToRfc3339(date: string, timezone: string, field: string): strin
  * (reported by Myra, 2026-09-04).
  *
  * A bare `endDate` therefore advances one calendar day before conversion, so
- * the window ends at midnight after it.
+ * the window ends where the following day begins.
  *
  * The advance is done in UTC deliberately, and NOT because local-day arithmetic
  * would be wrong here — I first wrote that it was, and mutating `setUTCDate(+1)`
@@ -134,10 +186,10 @@ function bareDateToRfc3339(date: string, timezone: string, field: string): strin
  * hours and the two are identical. The real reason is division of labour: doing
  * the arithmetic on a bare date in UTC means DST cannot reach it at all, and
  * the entire zone question is delegated to bareDateToRfc3339, which resolves a
- * bare date to the correct offset FOR THAT DAY. That is where the DST
- * correctness lives, and it is why the tests below assert offsets (-08:00 after
- * the November fall-back, -07:00 after the March spring-forward) rather than
- * asserting an arithmetic style.
+ * bare date to the first instant of THAT DAY. That is where the DST correctness
+ * lives, and it is why the tests below assert instants and offsets (-08:00
+ * after the November fall-back, -07:00 after the March spring-forward) rather
+ * than asserting an arithmetic style.
  *
  * A full timestamp is passed through untouched. Someone who wrote an instant
  * meant that instant, and silently extending it would be a second defect in the

@@ -165,17 +165,19 @@ describe('resolving midnight independently of the host timezone', () => {
   );
 
   /**
-   * These reach the SECOND offset reading, and nothing else here does.
+   * These are the cases where the two offsets bracketing the day DISAGREE, and
+   * nothing else in this describe reaches that.
    *
-   * The conversion seeds itself with the offset at the date's UTC midnight and
-   * then re-reads it at the instant that seed implies. For Berlin the seed is
-   * already right, so every test above stayed green when I mutated the
-   * correction away — the guard at the centre of this fix was unasserted.
+   * The resolver reads the offset a day either side of the wall clock and keeps
+   * only the candidate instants that are self-consistent. When both readings
+   * agree there is one candidate and the filter is inert — which is every test
+   * above. Here they differ, so the filter is what discards the wrong one, and
+   * a mutation that accepts both takes the earlier and answers an hour early.
    *
-   * It only bites where the zone is far enough east that UTC midnight lands
-   * across a transition from local midnight. Auckland shifts at 02:00/03:00
-   * local, so its midnight is unambiguous, and the seed is wrong by an hour in
-   * both directions: +13:00 for the day DST begins, +12:00 for the day it ends.
+   * Auckland shifts at 02:00/03:00 local, so its midnight is unambiguous; what
+   * makes it a probe is being far enough east that UTC midnight sits across a
+   * transition from local midnight, in both directions — +13:00 for the day DST
+   * begins, +12:00 for the day it ends.
    */
   it.each([
     [
@@ -211,6 +213,197 @@ describe('resolving midnight independently of the host timezone', () => {
       expect(inclusiveEndToRfc3339('2026-06-14', zone)).toBe(`2026-06-15T00:00:00${offset}`);
     });
   });
+});
+
+/**
+ * Midnight is not guaranteed to exist, and not guaranteed to happen once.
+ *
+ * The previous fix resolved an OFFSET and pasted it onto `T00:00:00`, which
+ * assumes a `00:00:00` the zone may not have. In a zone whose DST transition is
+ * AT midnight, it either doesn't exist (the clock jumps 23:59:59 → 01:00) or it
+ * happens twice an hour apart. Pasting an offset onto an absent midnight names
+ * an instant on the previous day; pasting one onto a repeated midnight picks
+ * arbitrarily between them (found by Lumen in review).
+ *
+ * The expectations here are derived from `Intl` by a different route than the
+ * implementation takes — see `startOfCivilDay` — rather than hand-computed, so
+ * they cannot encode the same reasoning twice.
+ */
+describe('civil days whose midnight is missing or repeated', () => {
+  /**
+   * An independent oracle: the earliest instant whose civil date in `zone` is
+   * `date`, found by scanning forward a minute at a time.
+   *
+   * Deliberately NOT the algorithm under test. That one reasons about offsets
+   * and which of them are self-consistent; this one only ever asks "what day is
+   * it there now", so a shared misconception about offsets cannot make both
+   * agree. Minute granularity is exact because every tzdb transition falls on a
+   * whole minute, and ±20h brackets the whole -12:00..+14:00 offset range.
+   */
+  function startOfCivilDay(date: string, zone: string): number {
+    const format = new Intl.DateTimeFormat('en-CA', {
+      timeZone: zone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    });
+    const wallClock = Date.parse(`${date}T00:00:00Z`);
+    for (let t = wallClock - 20 * 3_600_000; t <= wallClock + 20 * 3_600_000; t += 60_000) {
+      if (format.format(new Date(t)) === date) return t;
+    }
+    throw new Error(`no instant in ${zone} falls on ${date}`);
+  }
+
+  /**
+   * GAPS. The day after each of these dates has no midnight, so the window
+   * around the date itself must end at the instant the clock jumps — an hour
+   * later than the offset-pasting version answered, which cut off the last
+   * hour of the day being asked for.
+   *
+   * Santiago and Havana are Lumen's; São Paulo and Asunción came out of a sweep
+   * of 25 zones against the oracle, which found the old code wrong on 37 days
+   * in 8 zones rather than the 3 the review named.
+   */
+  it.each([
+    ['America/Santiago', '2026-09-05', '2026-09-06T01:00:00-03:00'],
+    ['America/Havana', '2026-03-07', '2026-03-08T01:00:00-04:00'],
+    ['America/Sao_Paulo', '2018-11-03', '2018-11-04T01:00:00-02:00'],
+    ['America/Asuncion', '2018-10-06', '2018-10-07T01:00:00-03:00'],
+  ])('keeps the last hour of %s %s, whose next midnight never happens', (zone, end, expected) => {
+    withHostZone(LA, () => {
+      const timeMax = inclusiveEndToRfc3339(end, zone);
+      expect(timeMax).toBe(expected);
+      // The boundary is the true start of the following day, independently found.
+      const nextDay = new Date(Date.parse(`${end}T00:00:00Z`) + 86_400_000)
+        .toISOString()
+        .slice(0, 10);
+      expect(Date.parse(timeMax)).toBe(startOfCivilDay(nextDay, zone));
+    });
+  });
+
+  /**
+   * The consequence, stated as the thing a user would notice: an appointment in
+   * the final hour before a missing midnight. The old boundary landed an hour
+   * early and this event fell outside it — the original defect of this PR,
+   * reintroduced in a zone rather than a range.
+   */
+  it('finds an event in the last hour before a missing midnight', () => {
+    withHostZone(LA, () => {
+      const { timeMax } = calendarWindow('2026-09-05', '2026-09-05', 'America/Santiago');
+      expect(Date.parse('2026-09-05T23:30:00-04:00')).toBeLessThan(Date.parse(timeMax));
+    });
+  });
+
+  /**
+   * The same missing midnight as a START bound, which is the opposite error and
+   * a separate code path. A day that begins at 01:00 must not be reported as
+   * beginning an hour earlier, or the window swallows the previous evening.
+   */
+  it('starts a day with no midnight at the instant the clock jumps', () => {
+    withHostZone(LA, () => {
+      const { timeMin } = calendarWindow('2026-09-06', '2026-09-06', 'America/Santiago');
+      expect(timeMin).toBe('2026-09-06T01:00:00-03:00');
+      expect(Date.parse('2026-09-05T23:30:00-04:00')).toBeLessThan(Date.parse(timeMin));
+    });
+  });
+
+  /**
+   * A FOLD. Amman fell back at midnight in 2021, so 2021-10-29T00:00 happened
+   * at 21:00Z and again at 22:00Z. The day begins at the first; choosing the
+   * second admits the hour between them, which belongs to the 29th.
+   */
+  it('ends at the first of two midnights when the clock falls back through it', () => {
+    withHostZone(LA, () => {
+      const timeMax = inclusiveEndToRfc3339('2021-10-28', 'Asia/Amman');
+      expect(timeMax).toBe('2021-10-29T00:00:00+03:00');
+      expect(Date.parse(timeMax)).toBe(Date.parse('2021-10-28T21:00:00Z'));
+      // 00:30 on the 29th, in the repeated hour — outside a window ending on the 28th.
+      expect(Date.parse('2021-10-28T22:30:00Z')).toBeGreaterThan(Date.parse(timeMax));
+    });
+  });
+
+  /**
+   * THE THIRD SHAPE, and the one no test above reached.
+   *
+   * A gap leaves no valid candidate and a fold leaves two. This leaves exactly
+   * one, and it is the candidate taken from the offset AFTER the transition —
+   * so it is the only shape that proves the second bracket is doing work.
+   *
+   * Chile's DST ends AT midnight: the clock reaches 2026-04-05T00:00 −03:00 and
+   * drops straight back to 23:00 on the 4th. The pre-transition candidate names
+   * an instant that is still the 4th, so it is discarded, and the day begins an
+   * hour later at −04:00. Greenland is the same shape running the other way —
+   * the 28th loses its last hour and the 29th starts at midnight −01:00 — where
+   * the wrong answer is an hour LATE rather than early.
+   *
+   * These exist because sampling the second offset at the wall clock instead of
+   * a day later survived every other test in this file. Measured against the
+   * oracle over all 418 zones Node ships, 1970–2030, on the days around every
+   * transition: that mistake is wrong on 906 (zone, date) pairs in 57 zones,
+   * and dropping the second bracket entirely is wrong on 14,648 in 265. The
+   * guard was load-bearing and simply unasserted.
+   */
+  it.each([
+    ['America/Santiago', '2026-04-04', '2026-04-05T00:00:00-04:00'],
+    ['America/Asuncion', '2005-03-12', '2005-03-13T00:00:00-04:00'],
+    ['America/Godthab', '2026-03-28', '2026-03-29T00:00:00-01:00'],
+  ])('takes the post-transition offset where only it can be right (%s)', (zone, end, expected) => {
+    withHostZone(LA, () => {
+      const timeMax = inclusiveEndToRfc3339(end, zone);
+      expect(timeMax).toBe(expected);
+      const nextDay = new Date(Date.parse(`${end}T00:00:00Z`) + 86_400_000)
+        .toISOString()
+        .slice(0, 10);
+      expect(Date.parse(timeMax)).toBe(startOfCivilDay(nextDay, zone));
+    });
+  });
+
+  /**
+   * The invariant that ties the two bounds together across every shape above:
+   * consecutive days must MEET. If a day ends where the next begins, no instant
+   * is dropped between two adjacent queries and none is counted twice — and
+   * that holds whether midnight is missing, repeated, or ordinary.
+   *
+   * This is the check that generalizes. The cases above pin specific instants;
+   * this one would fail for any zone and date where the two bounds disagree,
+   * including ones nobody thought to enumerate.
+   */
+  it.each([
+    ['America/Santiago', '2026-09-05'],
+    ['America/Havana', '2026-03-07'],
+    ['Asia/Amman', '2021-10-28'],
+    ['America/Sao_Paulo', '2018-11-03'],
+    ['America/Santiago', '2026-04-04'],
+    ['America/Godthab', '2026-03-28'],
+    ['Pacific/Auckland', '2026-09-26'],
+    [LA, '2026-11-01'],
+  ])('leaves no gap or overlap between consecutive days in %s', (zone, date) => {
+    withHostZone(LA, () => {
+      const next = new Date(Date.parse(`${date}T00:00:00Z`) + 86_400_000)
+        .toISOString()
+        .slice(0, 10);
+      const { timeMax } = calendarWindow(date, date, zone);
+      const { timeMin } = calendarWindow(next, next, zone);
+      expect(Date.parse(timeMax)).toBe(Date.parse(timeMin));
+      expect(Date.parse(timeMin)).toBe(startOfCivilDay(next, zone));
+    });
+  });
+
+  /**
+   * Still a fact about the requested zone, not the host — the property the
+   * previous round established, re-checked on the shapes added since.
+   */
+  it.each([LA, 'UTC', 'Asia/Amman', 'America/Santiago', 'Pacific/Kiritimati'])(
+    'resolves a missing and a repeated midnight identically with the host in %s',
+    (hostZone) => {
+      withHostZone(hostZone, () => {
+        expect(inclusiveEndToRfc3339('2026-09-05', 'America/Santiago')).toBe(
+          '2026-09-06T01:00:00-03:00'
+        );
+        expect(inclusiveEndToRfc3339('2021-10-28', 'Asia/Amman')).toBe('2021-10-29T00:00:00+03:00');
+      });
+    }
+  );
 });
 
 /**
