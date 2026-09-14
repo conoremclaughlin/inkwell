@@ -74,12 +74,12 @@ const sendToInboxSchema = userIdentifierBaseSchema.extend({
     .describe('Message priority'),
   recipientSessionId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('Recipient session ID to resume/route to (preferred)'),
   recipientStudioId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('Recipient studio ID hint for session routing'),
   recipientStudioSlug: z
@@ -105,7 +105,7 @@ const sendToInboxSchema = userIdentifierBaseSchema.extend({
       'Target a recipient session by alias (e.g., "main", "review"). The recipient agent must have an active session with this alias.'
     ),
   relatedArtifactUri: z.string().optional().describe('Related artifact URI'),
-  metadata: z.record(z.unknown()).optional().describe('Additional metadata'),
+  metadata: z.record(z.string(), z.unknown()).optional().describe('Additional metadata'),
   expiresAt: isoDateTime().optional().describe('When this message expires'),
   threadKey: z
     .string()
@@ -249,7 +249,7 @@ const getInboxSchema = userIdentifierBaseSchema
   .strict();
 
 const updateInboxMessageSchema = userIdentifierBaseSchema.extend({
-  messageId: z.string().uuid().describe('Message ID to update'),
+  messageId: z.string().guid().describe('Message ID to update'),
   agentId: z.string().describe('Agent ID making the update (must be recipient)'),
   status: z.enum(['read', 'acknowledged', 'completed']).describe('New status'),
 });
@@ -263,7 +263,7 @@ const markInboxReadSchema = userIdentifierBaseSchema.extend({
     ),
   throughMessageId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe(
       'Exact-id acknowledgement: advance the pointer through this specific message. ' +
@@ -496,26 +496,13 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
       prefixWarning = await warnOnUnregisteredProjectPrefix(supabase, resolved.user.id, threadKey);
     }
 
-    // ── Reply semantics: enforce participant membership and closed-thread rejection ──
-    if (existingThread) {
-      // Reject replies on closed threads
-      if (existingThread.status === 'closed') {
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: JSON.stringify({
-                success: false,
-                error: `Thread ${threadKey} is closed. Cannot send to closed threads.`,
-              }),
-            },
-          ],
-        };
-      }
-
-      // If sender is already a participant, this is a reply — enforce membership
-      // If sender is NOT a participant, auto-add them (join-on-send)
-    }
+    // ── Reply semantics ──
+    // A closed thread accepts replies. Closed is a work-state signal, not a
+    // lock (spec inkmail-thread-scope §2): the reply is stored, counts as
+    // unread, and wakes its recipients exactly like a reply on an open
+    // thread. Nothing here reopens the thread — reopening is an explicit act.
+    // If sender is already a participant, this is a reply — enforce membership.
+    // If sender is NOT a participant, auto-add them (join-on-send).
 
     // Find or create thread
     let thread = await findOrCreateThread(supabase, {
@@ -790,6 +777,38 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
               toAgentId,
               error: err instanceof Error ? err.message : String(err),
             });
+          }
+          // Still nothing: the thread may have a HOME for this agent that no
+          // message of theirs established — a studio created FOR the thread binds
+          // its creator here (create_studio threadKey). The stamp is written only by
+          // the sanctioned assignment writer, and the trigger handler still
+          // verifies the session is alive before delivering, so this is a hint to
+          // resolution, never an overwrite.
+          if (!resolvedRecipientSessionId) {
+            try {
+              const { data: participant } = await threadTable(supabase, 'inbox_thread_participants')
+                .select('session_id')
+                .eq('thread_id', thread.id)
+                .eq('agent_id', toAgentId)
+                .maybeSingle();
+              if (participant?.session_id && typeof participant.session_id === 'string') {
+                resolvedRecipientSessionId = participant.session_id;
+                logger.debug(
+                  '[ThreadTrigger] Auto-resolved recipientSessionId from the participant stamp',
+                  {
+                    threadKey,
+                    toAgentId,
+                    recipientSessionId: resolvedRecipientSessionId,
+                  }
+                );
+              }
+            } catch (err) {
+              logger.warn('[ThreadTrigger] Failed to read the participant stamp', {
+                threadKey,
+                toAgentId,
+                error: err instanceof Error ? err.message : String(err),
+              });
+            }
           }
         }
 
@@ -1101,7 +1120,7 @@ export async function handleSendToInbox(args: unknown, dataComposer: DataCompose
 /**
  * Find or create a thread. Returns the thread row with an `isNew` flag.
  */
-async function findOrCreateThread(
+export async function findOrCreateThread(
   supabase: ReturnType<DataComposer['getClient']>,
   opts: {
     userId: string;
@@ -1630,14 +1649,18 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
         // past 8KB once a user has a few hundred threads (HTTP 414). Threads
         // are user-scoped rows, so the agent-less unified view needs no
         // participant filter at all.
+        //
+        // No status filter: closed is a work-state signal, not a delivery
+        // filter (spec inkmail-thread-scope §2). A reply on a closed thread
+        // is unread until it is read, so the thread stays on this page.
+        // list_threads(status='open') is the explicit work-list filter.
         let recencyQuery = threadTable(supabase, 'inbox_threads')
           .select(
             agentId
               ? 'id, thread_key, title, user_id, created_by_agent_id, updated_at, inbox_thread_participants!inner(agent_id)'
               : 'id, thread_key, title, user_id, created_by_agent_id, updated_at'
           )
-          .eq('user_id', resolved.user.id)
-          .eq('status', 'open');
+          .eq('user_id', resolved.user.id);
         if (agentId) {
           recencyQuery = recencyQuery.eq('inbox_thread_participants.agent_id', agentId);
         }
@@ -1736,13 +1759,19 @@ export async function handleGetInbox(args: unknown, dataComposer: DataComposer) 
           }
 
           const unreadBaseline = lastReadAt || joinedAt;
-          const threadMsgs = msgsByThread.get(t.id) || [];
+          // Unread is counted over DELIVERABLE messages only, the same rule
+          // as SQL candidacy (get_unread_thread_candidates excludes system
+          // events). Now that closed threads stay on this page, a thread
+          // whose only post-pointer row is its own closure audit event must
+          // read as zero unread, not one (Lumen, PR #613).
+          const deliverableMsgs = (msgsByThread.get(t.id) || []).filter(
+            (m) => m.message_type !== 'system'
+          );
           const unreadCount = unreadBaseline
-            ? threadMsgs.filter((m) => m.created_at > unreadBaseline).length
-            : threadMsgs.length;
+            ? deliverableMsgs.filter((m) => m.created_at > unreadBaseline).length
+            : deliverableMsgs.length;
 
-          const previewMessages = threadMsgs
-            .filter((m) => m.message_type !== 'system')
+          const previewMessages = deliverableMsgs
             .slice(0, 3)
             .reverse()
             .map((m) => ({
@@ -2244,9 +2273,12 @@ export async function handleGetAgentSummaries(args: unknown, dataComposer: DataC
       .order('started_at', { ascending: false })
       .then((r: { data: unknown }) => r.data || []),
 
-    // 3. All thread participation for these agents
+    // 3. All thread participation for these agents. joined_at is the unread
+    // floor for a participant with no read pointer yet — pre-join history is
+    // not that participant's unread (same rule as get_inbox and SQL
+    // candidacy; Lumen, PR #613).
     threadTable(supabase, 'inbox_thread_participants')
-      .select('thread_id, agent_id')
+      .select('thread_id, agent_id, joined_at')
       .in('agent_id', agentIds)
       .then((r: { data: unknown }) => r.data || [])
       .catch(() => []), // Thread tables may not exist yet
@@ -2307,28 +2339,31 @@ export async function handleGetAgentSummaries(args: unknown, dataComposer: DataC
       return (data || []) as Array<{ recipient_agent_id: string; created_at: string }>;
     })(),
 
-    // 5. Open threads for this user (filtered to threads agents participate in)
+    // 5. This user's threads that the agents participate in — any status.
+    // Closed is a work-state signal, not a delivery filter (spec
+    // inkmail-thread-scope §2): a reply on a closed thread is unread until
+    // its recipient reads it, so it must count here or Mission shows zero
+    // for mail that exists.
     (async () => {
       if (!allThreadIds.length) return [];
       const { data } = await threadTable(supabase, 'inbox_threads')
         .select('id')
         .eq('user_id', userId)
-        .eq('status', 'open')
         .in('id', allThreadIds);
       return (data || []) as Array<{ id: string }>;
     })(),
   ]);
 
-  const openThreadIds = openThreads.map((t) => t.id);
+  const participantThreadIds = openThreads.map((t) => t.id);
 
   // ── Round 3: thread read statuses + thread messages (depend on round 2) ─
   const [threadReadStatuses, threadMessages] = await Promise.all([
-    // 6. All thread read statuses for open threads × agents
+    // 6. All thread read statuses for participant threads × agents
     (async () => {
-      if (!openThreadIds.length) return [];
+      if (!participantThreadIds.length) return [];
       const { data } = await threadTable(supabase, 'inbox_thread_read_status')
         .select('thread_id, agent_id, last_read_at')
-        .in('thread_id', openThreadIds)
+        .in('thread_id', participantThreadIds)
         .in('agent_id', agentIds);
       return (data || []) as Array<{
         thread_id: string;
@@ -2337,12 +2372,18 @@ export async function handleGetAgentSummaries(args: unknown, dataComposer: DataC
       }>;
     })(),
 
-    // 7. All messages in open threads (just thread_id + created_at for counting)
+    // 7. All DELIVERABLE messages in participant threads (thread_id +
+    // created_at for counting). System events — a thread's own closure
+    // marker, a participant-added note — are not mail and never count as
+    // unread, matching SQL candidacy. With closed threads now in scope, a
+    // closed thread must not read as one unread forever because of its
+    // closure event (Lumen, PR #613).
     (async () => {
-      if (!openThreadIds.length) return [];
+      if (!participantThreadIds.length) return [];
       const { data } = await threadTable(supabase, 'inbox_thread_messages')
         .select('thread_id, created_at')
-        .in('thread_id', openThreadIds);
+        .in('thread_id', participantThreadIds)
+        .neq('message_type', 'system');
       return (data || []) as Array<{ thread_id: string; created_at: string }>;
     })(),
   ]);
@@ -2364,23 +2405,38 @@ export async function handleGetAgentSummaries(args: unknown, dataComposer: DataC
     threadReadMap.set(`${rs.thread_id}:${rs.agent_id}`, rs.last_read_at);
   }
 
-  // Build agent → set of open thread IDs they participate in
-  const agentOpenThreads = new Map<string, Set<string>>();
-  const openThreadIdSet = new Set(openThreadIds);
-  for (const p of allParticipation as Array<{ thread_id: string; agent_id: string }>) {
-    if (!openThreadIdSet.has(p.thread_id)) continue;
-    if (!agentOpenThreads.has(p.agent_id)) agentOpenThreads.set(p.agent_id, new Set());
-    agentOpenThreads.get(p.agent_id)!.add(p.thread_id);
+  // Build agent → set of thread IDs they participate in (any status), and
+  // remember when each participant joined: a message older than the join is
+  // history the participant was never handed, not unread mail.
+  const agentThreads = new Map<string, Set<string>>();
+  const joinedAtMap = new Map<string, string>(); // "threadId:agentId" → joined_at
+  const participantThreadIdSet = new Set(participantThreadIds);
+  for (const p of allParticipation as Array<{
+    thread_id: string;
+    agent_id: string;
+    joined_at?: string | null;
+  }>) {
+    if (!participantThreadIdSet.has(p.thread_id)) continue;
+    if (!agentThreads.has(p.agent_id)) agentThreads.set(p.agent_id, new Set());
+    agentThreads.get(p.agent_id)!.add(p.thread_id);
+    if (p.joined_at) joinedAtMap.set(`${p.thread_id}:${p.agent_id}`, p.joined_at);
   }
 
-  // Count unread thread messages per agent
+  // Count unread thread messages per agent. The floor is the read pointer
+  // when one exists and the join time only as the fallback —
+  // COALESCE(last_read_at, joined_at), exactly what get_inbox and the SQL
+  // candidacy function use — so a pointer-less late joiner is not credited
+  // with every message that predates them, and an explicit pointer that
+  // happens to precede the join time still wins, as it does everywhere
+  // else (a later-of expression would diverge there; Lumen, PR #613 r2).
   const threadUnreadMap = new Map<string, number>();
   for (const msg of threadMessages) {
     // For each agent that participates in this thread, check if message is unread
-    for (const [aid, threads] of agentOpenThreads) {
+    for (const [aid, threads] of agentThreads) {
       if (!threads.has(msg.thread_id)) continue;
-      const lastRead = threadReadMap.get(`${msg.thread_id}:${aid}`);
-      if (!lastRead || msg.created_at > lastRead) {
+      const floor =
+        threadReadMap.get(`${msg.thread_id}:${aid}`) ?? joinedAtMap.get(`${msg.thread_id}:${aid}`);
+      if (!floor || msg.created_at > floor) {
         threadUnreadMap.set(aid, (threadUnreadMap.get(aid) || 0) + 1);
       }
     }
@@ -2478,7 +2534,7 @@ export const inboxToolDefinitions = [
   {
     name: 'send_to_inbox',
     description:
-      'Send a message to agent(s) or reply to a thread. Unified tool for all cross-agent messaging.\n\nSingle recipient: send_to_inbox(recipientAgentId: "lumen", content: "...")\nGroup thread: send_to_inbox(recipients: ["lumen", "aster"], threadKey: "pr:165", content: "...")\nReply to thread: send_to_inbox(recipientAgentId: "lumen", threadKey: "pr:165", content: "...")\n\nWhen threadKey is provided, messages go to inbox_thread_messages (thread-first model). Late joiners see full history. Without threadKey, creates a simple agent_inbox row.\n\nFor existing threads, reply semantics are automatic: closed threads are rejected, and smart trigger defaults apply (1:1 → other participant; group with explicit recipient → that recipient; group non-creator → creator; group creator → all others). Override with triggerAll or triggerAgents.\n\nMessage types:\n- message: General communication\n- task_request: Request another agent to do work\n- session_resume: Request agent to resume a specific session\n- notification: FYI, no response needed\n- permission_grant: Grant or revoke tool permissions\n\nTrigger behavior:\nAll message types trigger recipients by default. Set trigger=false only if the message can wait 5+ hours.\n\nUser can be identified by ONE of: userId, email, phone, or platform + platformId',
+      'Send a message to agent(s) or reply to a thread. Unified tool for all cross-agent messaging.\n\nSingle recipient: send_to_inbox(recipientAgentId: "lumen", content: "...")\nGroup thread: send_to_inbox(recipients: ["lumen", "aster"], threadKey: "pr:165", content: "...")\nReply to thread: send_to_inbox(recipientAgentId: "lumen", threadKey: "pr:165", content: "...")\n\nWhen threadKey is provided, messages go to inbox_thread_messages (thread-first model). Late joiners see full history. Without threadKey, creates a simple agent_inbox row.\n\nFor existing threads, reply semantics are automatic: closed threads still accept replies (closed is a work-state signal, not a lock — the reply is stored and wakes its recipients without reopening the thread), and smart trigger defaults apply (1:1 → other participant; group with explicit recipient → that recipient; group non-creator → creator; group creator → all others). Override with triggerAll or triggerAgents.\n\nMessage types:\n- message: General communication\n- task_request: Request another agent to do work\n- session_resume: Request agent to resume a specific session\n- notification: FYI, no response needed\n- permission_grant: Grant or revoke tool permissions\n\nTrigger behavior:\nAll message types trigger recipients by default. Set trigger=false only if the message can wait 5+ hours.\n\nUser can be identified by ONE of: userId, email, phone, or platform + platformId',
     schema: sendToInboxSchema,
     handler: handleSendToInbox,
   },

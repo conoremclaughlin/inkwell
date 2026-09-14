@@ -78,7 +78,7 @@ export const updateIntegrationHealthSchema = userIdentifierBaseSchema.extend({
     .describe('Structured error code (e.g., "oauth_expired", "rate_limited")'),
   errorMessage: z.string().optional().describe('Human-readable error description'),
   agentId: z.string().optional().describe('Which SB is reporting this'),
-  metadata: z.record(z.unknown()).optional().describe('Additional context'),
+  metadata: z.record(z.string(), z.unknown()).optional().describe('Additional context'),
 });
 
 export const getIntegrationHealthSchema = userIdentifierBaseSchema.extend({
@@ -261,6 +261,9 @@ export async function handleGetIntegrationHealth(args: unknown, dataComposer: Da
     const accountState = accountHealthOf(live);
     const account = {
       accountHealth: accountState,
+      // Which credential the verdict is about: the dashboard connection
+      // (`cloud`) or a desktop file from `ink google login` (`desktop`).
+      accountSource: live.source,
       accountStatus: live.accountStatus,
       accountReason: live.reason,
       accountObservedAt: live.observedAt,

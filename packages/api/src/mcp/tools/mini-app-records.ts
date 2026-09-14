@@ -6,27 +6,27 @@
  */
 
 import { z } from 'zod';
-import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import type { McpServer } from '@modelcontextprotocol/server';
 import type { DataComposer } from '../../data/composer';
 import { resolveUser, userIdentifierFields } from '../../services/user-resolver';
 import { logger } from '../../utils/logger';
 import { simplifyDebts, calculatePersonSummary, type Debt } from './debt-utils';
 import type { Json } from '../../data/supabase/types';
 
-const saveRecordSchema = {
+const saveRecordSchema = z.object({
   ...userIdentifierFields,
   appName: z.string().describe('Mini-app name (e.g., "bill-split", "expense-tracker")'),
   type: z.string().describe('Record type (e.g., "split", "expense", "contact")'),
-  data: z.record(z.unknown()).describe('Structured data to store'),
+  data: z.record(z.string(), z.unknown()).describe('Structured data to store'),
   amount: z.number().optional().describe('Monetary value for indexing'),
   recordedAt: z.string().optional().describe('When this occurred (ISO date)'),
   text: z.string().optional().describe('Searchable text content'),
   tags: z.array(z.string()).optional().describe('Tags for categorization'),
-  relatedRecordId: z.string().uuid().optional().describe('ID of related record'),
-  metadata: z.record(z.unknown()).optional().describe('Additional metadata'),
-};
+  relatedRecordId: z.string().guid().optional().describe('ID of related record'),
+  metadata: z.record(z.string(), z.unknown()).optional().describe('Additional metadata'),
+});
 
-const queryRecordsSchema = {
+const queryRecordsSchema = z.object({
   ...userIdentifierFields,
   appName: z.string().optional().describe('Filter by mini-app name'),
   type: z.string().optional().describe('Filter by record type'),
@@ -38,9 +38,9 @@ const queryRecordsSchema = {
   search: z.string().optional().describe('Full-text search in text'),
   limit: z.number().min(1).max(100).optional().describe('Max results (default: 20)'),
   offset: z.number().min(0).optional().describe('Pagination offset'),
-};
+});
 
-const updateBalanceSchema = {
+const updateBalanceSchema = z.object({
   ...userIdentifierFields,
   appName: z.string().describe('Mini-app name'),
   key: z.string().describe('Unique key for this balance (e.g., person name, account ID)'),
@@ -48,14 +48,14 @@ const updateBalanceSchema = {
   description: z.string().optional().describe('Description of this transaction'),
   tags: z.array(z.string()).optional().describe('Tags for categorization'),
   recordedAt: z.string().optional().describe('When this occurred (ISO date, defaults to now)'),
-};
+});
 
-const getRecordSchema = {
+const getRecordSchema = z.object({
   ...userIdentifierFields,
-  recordId: z.string().uuid().describe('Record ID to retrieve'),
-};
+  recordId: z.string().guid().describe('Record ID to retrieve'),
+});
 
-const recordDebtSchema = {
+const recordDebtSchema = z.object({
   ...userIdentifierFields,
   appName: z.string().describe('Mini-app name (e.g., "bill-split")'),
   from: z.string().describe('Person who owes (debtor)'),
@@ -64,20 +64,20 @@ const recordDebtSchema = {
   description: z.string().optional().describe('What this debt is for'),
   recordedAt: z.string().optional().describe('When this occurred (ISO date)'),
   tags: z.array(z.string()).optional().describe('Tags (e.g., group name)'),
-};
+});
 
-const getDebtsSchema = {
+const getDebtsSchema = z.object({
   ...userIdentifierFields,
   appName: z.string().describe('Mini-app name'),
   person: z.string().optional().describe('Filter to debts involving this person'),
   tags: z.array(z.string()).optional().describe('Filter by tags (e.g., group name)'),
   simplify: z.boolean().optional().describe('Simplify/consolidate debts (default: true)'),
-};
+});
 
-const deleteRecordSchema = {
+const deleteRecordSchema = z.object({
   ...userIdentifierFields,
-  recordId: z.string().uuid().describe('Record ID to delete'),
-};
+  recordId: z.string().guid().describe('Record ID to delete'),
+});
 
 export function registerMiniAppRecordTools(server: McpServer, dataComposer: DataComposer): void {
   const supabase = dataComposer.getClient();
@@ -540,11 +540,11 @@ export function registerMiniAppRecordTools(server: McpServer, dataComposer: Data
     {
       description:
         'Get the current balance for a key. Returns balance amount and transaction history.\n\nUser can be identified by ONE of: userId, email, phone, or platform + platformId',
-      inputSchema: {
+      inputSchema: z.object({
         ...userIdentifierFields,
         appName: z.string().describe('Mini-app name'),
         key: z.string().describe('Balance key to look up'),
-      },
+      }),
     },
     async (args) => {
       try {
@@ -640,11 +640,11 @@ export function registerMiniAppRecordTools(server: McpServer, dataComposer: Data
     {
       description:
         'List all balances for a mini-app. Useful for seeing who owes what.\n\nUser can be identified by ONE of: userId, email, phone, or platform + platformId',
-      inputSchema: {
+      inputSchema: z.object({
         ...userIdentifierFields,
         appName: z.string().describe('Mini-app name'),
         tags: z.array(z.string()).optional().describe('Filter by tags'),
-      },
+      }),
     },
     async (args) => {
       try {
@@ -972,15 +972,15 @@ export function registerMiniAppRecordTools(server: McpServer, dataComposer: Data
     {
       description:
         'Mark a debt as settled/paid. Can settle by debt ID or by specifying the parties.\n\nUser can be identified by ONE of: userId, email, phone, or platform + platformId',
-      inputSchema: {
+      inputSchema: z.object({
         ...userIdentifierFields,
         appName: z.string().describe('Mini-app name'),
-        debtId: z.string().uuid().optional().describe('Specific debt ID to settle'),
+        debtId: z.string().guid().optional().describe('Specific debt ID to settle'),
         from: z.string().optional().describe('Debtor name (used with "to" to find debt)'),
         to: z.string().optional().describe('Creditor name (used with "from" to find debt)'),
         amount: z.number().optional().describe('Specific amount to settle (partial settlement)'),
         settleAll: z.boolean().optional().describe('Settle all debts between from/to'),
-      },
+      }),
     },
     async (args) => {
       try {

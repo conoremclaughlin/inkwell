@@ -6,9 +6,22 @@
  */
 
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import {
+  GOOGLE_AUTH_URL,
+  GOOGLE_OAUTH_SCOPES,
+  GOOGLE_REVOKE_URL,
+  GOOGLE_TOKEN_URL,
+  parseGoogleCredentialSources,
+  type GoogleCredentialSource,
+} from '@inklabs/shared';
 import { env } from '../config/env';
 import { logger } from '../utils/logger';
 import { getRequestContext, getSessionContext } from '../utils/request-context';
+import {
+  getDesktopGoogleCredentialStore,
+  type DesktopGoogleCredentialStore,
+} from './google-desktop-credentials';
+import { TOKEN_REFRESH_WINDOW_MS } from './oauth-refresh-window';
 
 // OAuth provider configurations
 interface OAuthProviderConfig {
@@ -22,23 +35,14 @@ interface OAuthProviderConfig {
 
 const OAUTH_PROVIDERS: Record<string, OAuthProviderConfig> = {
   google: {
-    authUrl: 'https://accounts.google.com/o/oauth2/v2/auth',
-    tokenUrl: 'https://oauth2.googleapis.com/token',
-    revokeUrl: 'https://oauth2.googleapis.com/revoke',
+    authUrl: GOOGLE_AUTH_URL,
+    tokenUrl: GOOGLE_TOKEN_URL,
+    revokeUrl: GOOGLE_REVOKE_URL,
     clientId: env.GOOGLE_CLIENT_ID || '',
     clientSecret: env.GOOGLE_CLIENT_SECRET || '',
-    scopes: [
-      'https://www.googleapis.com/auth/gmail.readonly',
-      'https://www.googleapis.com/auth/gmail.send',
-      'https://www.googleapis.com/auth/gmail.modify',
-      'https://www.googleapis.com/auth/userinfo.email',
-      'https://www.googleapis.com/auth/userinfo.profile',
-      'https://www.googleapis.com/auth/calendar.readonly',
-      'https://www.googleapis.com/auth/calendar.events', // Read + write events (respond, update)
-      'https://www.googleapis.com/auth/spreadsheets', // Sheets read/write
-      'https://www.googleapis.com/auth/documents', // Docs read/write
-      'https://www.googleapis.com/auth/drive', // Drive (list/read/write/move/delete)
-    ],
+    // The scope list is shared with `ink google login` (@inklabs/shared), so a
+    // desktop credential covers exactly what the cloud connection covers.
+    scopes: [...GOOGLE_OAUTH_SCOPES],
   },
 };
 
@@ -67,12 +71,6 @@ export interface TokenResponse {
   tokenType: string;
   scope?: string;
 }
-
-/**
- * How close to expiry getValidAccessToken stops trusting a stored token and
- * refreshes it before use.
- */
-const TOKEN_REFRESH_WINDOW_MS = 5 * 60 * 1000;
 
 /**
  * The token getValidAccessToken would refresh with before its next call, or null
@@ -115,6 +113,12 @@ export interface ProviderAccountHealth {
    * - `unknown`: account state could not be read, so there is no verdict.
    */
   state: 'active' | 'refresh_required' | 'unusable' | 'missing' | 'unknown';
+  /**
+   * Which credential source this verdict describes — the `connected_accounts`
+   * row (`cloud`) or a desktop file bound to the user (`desktop`). Null when no
+   * source had anything to say (`missing`, `unknown`).
+   */
+  source: GoogleCredentialSource | null;
   /** The stored account status, when a row exists. */
   accountStatus: 'active' | 'expired' | 'revoked' | 'error' | null;
   reason: string | null;
@@ -125,11 +129,71 @@ export interface ProviderAccountHealth {
   observedAt: string | null;
 }
 
+export interface OAuthServiceOptions {
+  /** Credential sources in the order they are tried; defaults to GOOGLE_CREDENTIAL_SOURCES. */
+  sources?: GoogleCredentialSource[];
+  desktopStore?: DesktopGoogleCredentialStore;
+}
+
+/** A user's email stays valid for a minute — the binding key for desktop files. */
+const USER_EMAIL_CACHE_MS = 60 * 1000;
+
 class OAuthService {
   private supabase: SupabaseClient;
+  private readonly sources: GoogleCredentialSource[];
+  private readonly desktopStore: DesktopGoogleCredentialStore;
+  private readonly userEmails = new Map<string, { email: string | null; at: number }>();
 
-  constructor() {
+  constructor(options: OAuthServiceOptions = {}) {
     this.supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
+    this.sources = options.sources ?? parseGoogleCredentialSources(env.GOOGLE_CREDENTIAL_SOURCES);
+    this.desktopStore = options.desktopStore ?? getDesktopGoogleCredentialStore();
+  }
+
+  /** The credential sources this service tries for Google, in order. */
+  getCredentialSources(): GoogleCredentialSource[] {
+    return [...this.sources];
+  }
+
+  private usesDesktopSource(provider: string): boolean {
+    return provider === 'google' && this.sources.includes('desktop');
+  }
+
+  /**
+   * The email a desktop credential must carry to be used for this user. A
+   * lookup FAILURE is reported as such and never cached: for access it binds
+   * nothing (guessing would hand one person's mailbox to another), and for
+   * health it must read as "could not look", not "nothing there" (Lumen, PR
+   * #588). A successful lookup — including a user with no email — is cached.
+   */
+  private async lookupUserEmail(
+    userId: string
+  ): Promise<{ email: string | null; error: string | null }> {
+    const cached = this.userEmails.get(userId);
+    if (cached && Date.now() - cached.at < USER_EMAIL_CACHE_MS) {
+      return { email: cached.email, error: null };
+    }
+    let failure: string;
+    try {
+      const { data, error } = await this.supabase
+        .from('users')
+        .select('email')
+        .eq('id', userId)
+        .maybeSingle();
+      if (!error) {
+        const email = (data?.email as string | null | undefined) ?? null;
+        this.userEmails.set(userId, { email, at: Date.now() });
+        return { email, error: null };
+      }
+      failure = error.message;
+    } catch (err) {
+      failure = err instanceof Error ? err.message : String(err);
+    }
+    logger.warn('Could not resolve user email for desktop Google credential binding', {
+      userId,
+      error: failure,
+    });
+    return { email: null, error: `Could not resolve the user's email: ${failure}` };
   }
 
   private resolveWorkspaceId(workspaceId?: string | null): string | null | undefined {
@@ -512,7 +576,75 @@ class OAuthService {
     workspaceId?: string | null
   ): Promise<ProviderAccountHealth> {
     const resolvedWorkspaceId = this.resolveWorkspaceId(workspaceId);
+    if (!this.usesDesktopSource(provider)) {
+      return this.inspectCloudAccountHealth(userId, provider, resolvedWorkspaceId);
+    }
 
+    // Same order as getValidAccessToken: the first source that would be tried
+    // and looks usable is the one the next call depends on. When none is, the
+    // most informative failure wins — a refusal over a blank, a blank over an
+    // unreadable table — and with nothing anywhere, the cloud verdict keeps
+    // its long-standing wording.
+    const verdicts = new Map<GoogleCredentialSource, ProviderAccountHealth>();
+    for (const source of this.sources) {
+      const verdict =
+        source === 'cloud'
+          ? await this.inspectCloudAccountHealth(userId, provider, resolvedWorkspaceId)
+          : await this.inspectDesktopAccountHealth(userId);
+      if (verdict.state === 'active' || verdict.state === 'refresh_required') return verdict;
+      verdicts.set(source, verdict);
+    }
+    const all = [...verdicts.values()];
+    return (
+      all.find((v) => v.state === 'unusable') ??
+      all.find((v) => v.state === 'unknown') ??
+      verdicts.get('cloud') ??
+      all[0]
+    );
+  }
+
+  /** The desktop file bound to this user, described in the same vocabulary as the cloud row. */
+  private async inspectDesktopAccountHealth(userId: string): Promise<ProviderAccountHealth> {
+    const blank: Omit<ProviderAccountHealth, 'state' | 'source' | 'reason'> = {
+      accountStatus: null,
+      lastError: null,
+      expiresAt: null,
+      lastUsedAt: null,
+      observedAt: null,
+    };
+    const lookup = await this.lookupUserEmail(userId);
+    if (lookup.error) return { ...blank, state: 'unknown', source: null, reason: lookup.error };
+    const found = await this.desktopStore.findForEmail(lookup.email);
+    if (found.error) return { ...blank, state: 'unknown', source: null, reason: found.error };
+    const record = found.record;
+    if (!record) {
+      return {
+        ...blank,
+        state: 'missing',
+        source: null,
+        reason: lookup.email
+          ? `No desktop Google credential for ${lookup.email} in ${this.desktopStore.dir}`
+          : 'No desktop Google credential can be bound: the user has no email',
+      };
+    }
+    const verdict = this.desktopStore.inspect(record);
+    return {
+      state: verdict.state,
+      source: 'desktop',
+      accountStatus: null,
+      reason: verdict.reason,
+      lastError: verdict.state === 'unusable' ? verdict.reason : null,
+      expiresAt: verdict.expiresAt,
+      lastUsedAt: null,
+      observedAt: new Date(record.mtimeMs).toISOString(),
+    };
+  }
+
+  private async inspectCloudAccountHealth(
+    userId: string,
+    provider: string,
+    resolvedWorkspaceId: string | null | undefined
+  ): Promise<ProviderAccountHealth> {
     let query = this.supabase
       .from('connected_accounts')
       .select('status, last_error, expires_at, last_used_at, updated_at, refresh_token')
@@ -530,6 +662,7 @@ class OAuthService {
     if (error) {
       return {
         state: 'unknown',
+        source: null,
         accountStatus: null,
         reason: `Could not read account state: ${error.message}`,
         lastError: null,
@@ -542,6 +675,7 @@ class OAuthService {
     if (!rows || rows.length === 0) {
       return {
         state: 'missing',
+        source: null,
         accountStatus: null,
         reason: `No ${provider} account has been connected`,
         lastError: null,
@@ -558,6 +692,7 @@ class OAuthService {
     const row = active ?? rows[0];
 
     const base = {
+      source: 'cloud' as const,
       accountStatus: row.status as ProviderAccountHealth['accountStatus'],
       lastError: row.last_error ?? null,
       expiresAt: row.expires_at ?? null,
@@ -601,7 +736,14 @@ class OAuthService {
   }
 
   /**
-   * Get a valid access token, refreshing if necessary
+   * Get a valid access token, refreshing if necessary.
+   *
+   * For Google, the configured credential sources are tried in order and the
+   * first one that yields a token wins. A source with nothing bound to the user
+   * is silently skipped; a source that HAD a credential and failed is named in
+   * the error, so "the cloud row expired and the desktop file was refused" reads
+   * as exactly that. A user with no desktop file sees the message they always
+   * saw.
    */
   async getValidAccessToken(
     userId: string,
@@ -609,6 +751,103 @@ class OAuthService {
     workspaceId?: string | null
   ): Promise<string> {
     const resolvedWorkspaceId = this.resolveWorkspaceId(workspaceId);
+    if (!this.usesDesktopSource(provider)) {
+      const cloud = await this.getCloudAccessToken(userId, provider, resolvedWorkspaceId);
+      if (cloud.token !== null) return cloud.token;
+      throw new Error(cloud.reason);
+    }
+
+    const failures: string[] = [];
+    let cloudReason: string | null = null;
+    for (const source of this.sources) {
+      if (source === 'cloud') {
+        const cloud = await this.getCloudAccessToken(userId, provider, resolvedWorkspaceId);
+        if (cloud.token !== null) return cloud.token;
+        cloudReason = cloud.reason;
+        failures.push(`cloud: ${cloud.reason}`);
+      } else {
+        const desktop = await this.getDesktopAccessToken(userId);
+        if (desktop.token !== null) return desktop.token;
+        if (desktop.reason) failures.push(`desktop: ${desktop.reason}`);
+      }
+    }
+    if (failures.length === 1 && cloudReason) throw new Error(cloudReason);
+    if (failures.length === 0) throw new Error(`No active ${provider} account found`);
+    throw new Error(`No usable ${provider} credential — ${failures.join('; ')}`);
+  }
+
+  /**
+   * The desktop file bound to this user, as a token — or why not. A null reason
+   * means nothing was bound; a failed lookup or unreadable storage binds
+   * nothing too (fail closed) and is logged rather than named here, because
+   * naming it would change the message users without a desktop file see.
+   */
+  private async getDesktopAccessToken(
+    userId: string
+  ): Promise<{ token: string } | { token: null; reason: string | null }> {
+    const lookup = await this.lookupUserEmail(userId);
+    if (lookup.error) return { token: null, reason: null };
+    const found = await this.desktopStore.findForEmail(lookup.email);
+    if (found.error || !found.record) return { token: null, reason: null };
+    try {
+      return { token: await this.desktopStore.getAccessToken(found.record) };
+    } catch (err) {
+      return { token: null, reason: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
+  /**
+   * Desktop credentials bound to this user — the ones a call could actually
+   * use. Files for other emails are not listed: they belong to other people.
+   */
+  async describeDesktopCredentials(userId: string): Promise<{
+    dir: string;
+    email: string | null;
+    /** Why the listing could not be trusted, when it could not (lookup or storage failure). */
+    error: string | null;
+    credentials: Array<{
+      email: string;
+      path: string;
+      scopes: string[];
+      obtainedAt: string | null;
+      state: 'active' | 'refresh_required' | 'unusable';
+      reason: string | null;
+      expiresAt: string | null;
+    }>;
+  }> {
+    const lookup = await this.lookupUserEmail(userId);
+    if (lookup.error) {
+      return { dir: this.desktopStore.dir, email: null, error: lookup.error, credentials: [] };
+    }
+    const found = await this.desktopStore.findForEmail(lookup.email);
+    const record = found.record;
+    const credentials = record
+      ? [
+          {
+            email: record.email,
+            path: record.path,
+            scopes: record.scopes,
+            obtainedAt: record.obtainedAt,
+            ...this.desktopStore.inspect(record),
+          },
+        ]
+      : [];
+    return { dir: this.desktopStore.dir, email: lookup.email, error: found.error, credentials };
+  }
+
+  private async getCloudAccessToken(
+    userId: string,
+    provider: string,
+    resolvedWorkspaceId: string | null | undefined
+  ): Promise<{ token: string; reason?: undefined } | { token: null; reason: string }> {
+    interface CloudAccountRow {
+      id: string;
+      access_token: string;
+      refresh_token: string | null;
+      expires_at: string | null;
+      /** The row version every write below is guarded on. */
+      updated_at: string;
+    }
     let query = this.supabase
       .from('connected_accounts')
       .select('*')
@@ -622,18 +861,36 @@ class OAuthService {
       query = query.eq('workspace_id', resolvedWorkspaceId);
     }
 
-    const { data: account, error } = await query
-      .order('updated_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
+    const result = await query.order('updated_at', { ascending: false }).limit(1).maybeSingle();
+    const account = result.data as CloudAccountRow | null;
 
-    if (error || !account) {
-      throw new Error(`No active ${provider} account found`);
+    if (result.error || !account) {
+      return { token: null, reason: `No active ${provider} account found` };
     }
 
     // Shared with inspectAccountHealth so the health verdict describes the same
     // decision this call actually makes.
     const refreshToken = pendingRefreshToken(account.expires_at, account.refresh_token);
+
+    if (!refreshToken) {
+      // Nothing to refresh with. A stored token past its expiry is not a
+      // token — handing it back would fail at the provider AND stop the next
+      // credential source from being tried, while inspectAccountHealth calls
+      // this row unusable (Lumen, PR #588). Mark it so the dashboard agrees.
+      const expiry = account.expires_at ? new Date(account.expires_at).getTime() : null;
+      if (expiry !== null && !Number.isNaN(expiry) && expiry <= Date.now()) {
+        const reason = 'Access token expired and no refresh token is stored';
+        // Guarded on the snapshot's version: a reconnect that landed on this
+        // row between the read and this write must not be marked expired
+        // with a stale reason (Lumen, PR #588 round 3).
+        await this.supabase
+          .from('connected_accounts')
+          .update({ status: 'expired', last_error: reason, updated_at: new Date().toISOString() })
+          .eq('id', account.id)
+          .eq('updated_at', account.updated_at);
+        return { token: null, reason };
+      }
+    }
 
     if (refreshToken) {
       logger.info(`Refreshing ${provider} token for user ${userId}`);
@@ -646,6 +903,8 @@ class OAuthService {
           ? new Date(Date.now() + tokens.expiresIn * 1000).toISOString()
           : null;
 
+        // Same guard: a reconnect that raced this refresh keeps its own
+        // tokens; the refreshed token is still good for this call.
         await this.supabase
           .from('connected_accounts')
           .update({
@@ -656,9 +915,10 @@ class OAuthService {
             last_error: null,
             updated_at: new Date().toISOString(),
           })
-          .eq('id', account.id);
+          .eq('id', account.id)
+          .eq('updated_at', account.updated_at);
 
-        return tokens.accessToken;
+        return { token: tokens.accessToken };
       } catch (err) {
         // Mark account as expired
         await this.supabase
@@ -668,9 +928,10 @@ class OAuthService {
             last_error: err instanceof Error ? err.message : 'Token refresh failed',
             updated_at: new Date().toISOString(),
           })
-          .eq('id', account.id);
+          .eq('id', account.id)
+          .eq('updated_at', account.updated_at);
 
-        throw new Error(`Failed to refresh ${provider} token`);
+        return { token: null, reason: `Failed to refresh ${provider} token` };
       }
     }
 
@@ -680,7 +941,7 @@ class OAuthService {
       .update({ last_used_at: new Date().toISOString() })
       .eq('id', account.id);
 
-    return account.access_token;
+    return { token: account.access_token };
   }
 
   /**
@@ -789,6 +1050,11 @@ export function getOAuthService(): OAuthService {
     oauthService = new OAuthService();
   }
   return oauthService;
+}
+
+/** Test seam: replace the process-wide service. */
+export function setOAuthService(next: OAuthService | null): void {
+  oauthService = next;
 }
 
 export { OAuthService };

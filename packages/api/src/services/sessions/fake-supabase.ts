@@ -226,6 +226,53 @@ export function makeFakeSupabase(tables: Record<string, Row[]>) {
             : { data: { conflict: false }, error: null };
         }
 
+        if (fn === 'reopen_inbox_thread') {
+          // Mirrors migration 20260913083000: the guarded flip and the audit
+          // event happen together or not at all (JS is single-threaded, as
+          // the function is one transaction in Postgres). false = the row
+          // was not closed; nothing written.
+          const kind = args.p_actor_kind;
+          const agent = args.p_actor_agent_id as string | null | undefined;
+          if (kind !== 'sb' && kind !== 'user') {
+            return {
+              data: null,
+              error: { message: `reopen_inbox_thread: actor kind must be sb or user, got ${kind}` },
+            };
+          }
+          if (kind === 'sb' && !agent) {
+            return {
+              data: null,
+              error: { message: 'reopen_inbox_thread: an sb actor needs an agent id' },
+            };
+          }
+          const thread = (tables['inbox_threads'] ?? []).find(
+            (r) => r.id === args.p_thread_id && r.status === 'closed'
+          );
+          if (!thread) return { data: false, error: null };
+          Object.assign(thread, {
+            status: 'open',
+            closed_at: null,
+            closed_by_agent_id: null,
+            updated_at: new Date().toISOString(),
+          });
+          const messages =
+            tables['inbox_thread_messages'] ?? (tables['inbox_thread_messages'] = []);
+          messages.push({
+            thread_id: args.p_thread_id,
+            sender_agent_id: 'system',
+            content:
+              kind === 'sb'
+                ? `Thread reopened by ${agent}`
+                : 'Thread reopened by the workspace owner',
+            message_type: 'system',
+            metadata:
+              kind === 'sb'
+                ? { type: 'thread_reopened', reopenedBy: agent }
+                : { type: 'thread_reopened', reopenedBy: 'user', channel: 'admin-api' },
+          });
+          return { data: true, error: null };
+        }
+
         if (fn !== 'grant_studio_lease') {
           return { data: null, error: { message: `no fake for rpc ${fn}` } };
         }

@@ -62,7 +62,6 @@ export const READ_ONLY_TOOLS: ReadonlySet<string> = new Set([
   // memory & context
   'bootstrap',
   'recall',
-  'get_context',
   'get_memory_history',
   'get_user_history',
   'get_chat_context',

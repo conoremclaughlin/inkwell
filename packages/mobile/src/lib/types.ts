@@ -83,6 +83,15 @@ export interface ThreadMessagesResponse {
   meta?: { fetched: number; total: number; truncated: boolean };
 }
 
+// ─── POST /api/admin/threads/reopen ───
+
+export interface ReopenResponse {
+  success: boolean;
+  threadKey: string;
+  reopened: boolean;
+  alreadyOpen: boolean;
+}
+
 // ─── POST /api/admin/threads/reply ───
 
 export interface ReplyResponse {

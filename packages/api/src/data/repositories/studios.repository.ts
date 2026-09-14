@@ -9,7 +9,7 @@
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { Database, Json } from '../supabase/types';
-import { resolveIdentityId } from '../../auth/resolve-identity';
+import { resolveOwnerSbId } from '../../auth/resolve-identity';
 
 type StudiosTable = Database['public']['Tables']['studios'];
 
@@ -75,6 +75,8 @@ export interface CreateStudioInput {
 }
 
 export interface UpdateStudioInput {
+  /** Provenance / candidate selection: the thread this studio is for. */
+  threadKey?: string | null;
   status?: StudioStatus;
   sessionId?: string | null;
   purpose?: string;
@@ -139,9 +141,7 @@ export class StudiosRepository {
   }
 
   async create(input: CreateStudioInput): Promise<Studio> {
-    const sbId =
-      input.sbId ||
-      (input.agentId ? await resolveIdentityId(this.client, input.userId, input.agentId) : null);
+    const sbId = await resolveOwnerSbId(this.client, input.userId, input.agentId, input.sbId);
 
     const insertData: StudiosTable['Insert'] = {
       user_id: input.userId,
@@ -375,6 +375,7 @@ export class StudiosRepository {
     if (input.defaultProjectId !== undefined)
       updateData.default_project_id = input.defaultProjectId;
     if (input.metadata !== undefined) updateData.metadata = input.metadata;
+    if (input.threadKey !== undefined) updateData.thread_key = input.threadKey;
     if (input.archivedAt !== undefined) updateData.archived_at = input.archivedAt;
     if (input.cleanedAt !== undefined) updateData.cleaned_at = input.cleanedAt;
     if (input.expiresAt !== undefined) updateData.expires_at = input.expiresAt;

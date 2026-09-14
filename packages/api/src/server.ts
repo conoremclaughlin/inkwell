@@ -45,14 +45,12 @@ import {
   stopHeartbeatService,
   processHeartbeat,
   type DueReminder,
+  type HeartbeatDeliveryOutcome,
 } from './services/heartbeat';
+import { createHeartbeatEscalation } from './services/heartbeat-escalation';
 import { StrategyService } from './services/strategy.service';
 import { getOrchestrator } from './services/sandbox/index.js';
-import {
-  setResponseCallback,
-  hasExplicitResponse,
-  clearExplicitResponse,
-} from './mcp/tools/response-handlers';
+import { setResponseCallback, consumeExplicitResponse } from './mcp/tools/response-handlers';
 import { getAgentGateway, type AgentTriggerPayload } from './channels/agent-gateway';
 import { storedTriggerMedia } from './channels/agent-media';
 import { resolveRouteAgentId } from './services/routing/resolve-route';
@@ -60,6 +58,11 @@ import { resolveAgentFromMention } from './services/routing/resolve-mention';
 import { getHeartbeatProcessingConfig } from './config/heartbeat-flags';
 import { classifyError } from '@inklabs/shared';
 import { logger } from './utils/logger';
+import {
+  decideChannelForward,
+  applyChannelForward,
+  attributeResponses,
+} from './services/channel-forward.js';
 import { getUserFromContext } from './utils/request-context';
 import { env } from './config/env';
 import {
@@ -104,13 +107,15 @@ let isShuttingDown = false;
  * Route responses through the ChannelGateway.
  * This is called after SessionService processes a message and returns responses.
  */
-async function routeResponses(responses: ChannelResponse[]): Promise<void> {
+async function routeResponses(responses: ChannelResponse[], sessionId?: string): Promise<void> {
   if (!channelGateway) {
     logger.warn('Cannot route responses - ChannelGateway not initialized');
     return;
   }
 
-  for (const response of responses) {
+  // Responses a runner synthesised from backend output carry no session;
+  // the turn's session is theirs. See attributeResponses.
+  for (const response of attributeResponses(responses, sessionId)) {
     try {
       await channelGateway.sendResponse(response);
       logger.info(`Response routed to ${response.channel}:${response.conversationId}`, {
@@ -155,7 +160,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
     mcpConfigPath,
     compactionEnabled: env.SERVER_COMPACTION_ENABLED,
     compactionThreshold: config.compactionThreshold || env.COMPACTION_THRESHOLD || 150000,
-    responseHandler: async (responses) => routeResponses(responses),
+    responseHandler: async (responses, sessionId) => routeResponses(responses, sessionId),
     ...(env.DEFAULT_CLAUDE_MODEL ? { defaultModel: env.DEFAULT_CLAUDE_MODEL } : {}),
     ...(env.DEFAULT_CODEX_MODEL ? { defaultCodexModel: env.DEFAULT_CODEX_MODEL } : {}),
     ...(env.DEFAULT_GEMINI_MODEL ? { defaultGeminiModel: env.DEFAULT_GEMINI_MODEL } : {}),
@@ -359,7 +364,7 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
 
     // Route any explicit send_response calls
     if (result.responses && result.responses.length > 0) {
-      await routeResponses(result.responses);
+      await routeResponses(result.responses, result.sessionId);
     }
 
     // For external channels (telegram/whatsapp), ensure the conversation is released
@@ -371,30 +376,38 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       channel === 'slack';
     if (isExternalChannel && channelGateway) {
       // Check if send_response was called via MCP (tracked in response-handlers)
-      const hadExplicitResponse = hasExplicitResponse(channel, conversationId);
+      // Reads AND clears. releaseConversation below drains a pending next turn
+      // synchronously, and a marker still standing then is read by that nested
+      // turn as its own delivery (Lumen, PR #580 r2). One call, no window.
+      const hadExplicitResponse = consumeExplicitResponse(channel, conversationId);
 
-      if (!hadExplicitResponse && result.finalTextResponse && result.success) {
-        // Auto-route Claude's text response back to the originating channel
-        logger.info('Auto-routing text response (no explicit send_response called)', {
-          channel,
-          conversationId,
-          responseLength: result.finalTextResponse.length,
-        });
-        await channelGateway.releaseConversation(channel as GatewayChannel, conversationId, {
-          content: result.finalTextResponse,
-          format: 'markdown',
-        });
-      } else {
-        // Just release the conversation (and process any pending messages)
-        logger.debug('Explicit send_response detected, skipping auto-forward', {
+      // Captured so the deferred release closure keeps the non-null narrowing
+      // from the enclosing guard.
+      const gateway = channelGateway;
+      const forward = decideChannelForward({
+        hadExplicitResponse,
+        success: result.success,
+        finalTextResponse: result.finalTextResponse,
+      });
+
+      await applyChannelForward(
+        forward,
+        {
           channel,
           conversationId,
           hadExplicitResponse,
-        });
-        await channelGateway.releaseConversation(channel as GatewayChannel, conversationId);
-      }
-
-      clearExplicitResponse(channel, conversationId);
+          runSucceeded: result.success,
+          finalTextLength: result.finalTextResponse?.length ?? 0,
+          sessionId: result.sessionId,
+        },
+        {
+          info: (m, meta) => logger.info(m, meta),
+          warn: (m, meta) => logger.warn(m, meta),
+          debug: (m, meta) => logger.debug(m, meta),
+          release: (payload) =>
+            gateway.releaseConversation(channel as GatewayChannel, conversationId, payload),
+        }
+      );
     }
 
     if (!result.success) {
@@ -505,15 +518,28 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
       : process.env.NODE_ENV !== 'production';
   const heartbeatInterval = process.env.HEARTBEAT_INTERVAL || '*/5 * * * *';
 
+  // cwd is in here because its absence cost a day. This line said
+  // `heartbeatServiceEnabled: true` on a worktree server for thirteen hours and
+  // there was no way to tell from the log WHICH checkout was claiming Myra's
+  // reminders — the two servers share one log file, so the duplicate ticks read
+  // as one chatty process. The directory is the whole diagnosis.
   logger.info('Heartbeat service flags evaluated', {
     heartbeatServiceEnabled,
+    cwd: process.cwd(),
     ...heartbeatServiceFlags,
   });
 
   /**
    * Deliver reminder via SessionService - same stateless flow as all other messages.
+   *
+   * The consecutive-failure count that separates a blip from an outage is not
+   * tracked here. It is derived from `reminder_history` inside processHeartbeat,
+   * because a process-local counter resets on restart — and a server restart is
+   * exactly when a monitor is most likely to be broken.
    */
-  const deliverReminderViaSession = async (reminder: DueReminder): Promise<boolean> => {
+  const deliverReminderViaSession = async (
+    reminder: DueReminder
+  ): Promise<HeartbeatDeliveryOutcome> => {
     const userId = reminder.user_id;
 
     // Strategy watchdog branch: reminders created by StrategyService carry
@@ -529,23 +555,36 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
         logger.warn(
           `[Heartbeat] strategyWatchdog reminder ${reminder.id} has no groupId in metadata, skipping`
         );
-        return false;
+        return { status: 'failed', error: 'strategyWatchdog reminder has no groupId in metadata' };
       }
       try {
         const strategyService = new StrategyService(dataComposer, getOrchestrator());
-        const fired = await strategyService.triggerWatchdog(groupId);
-        if (fired) {
+        const result = await strategyService.triggerWatchdog(groupId);
+        if (result.outcome === 'fired') {
           logger.info(
             `[Heartbeat] Strategy watchdog fired for group ${groupId} (reminder ${reminder.id})`
           );
+          return { status: 'delivered' };
         }
-        return fired;
+        if (result.outcome === 'skipped') {
+          // The watchdog cancelled itself because there is nothing left to
+          // watch. That is the watchdog working, not a monitor going down —
+          // escalating it would page a human every time a strategy finished.
+          return {
+            status: 'skipped',
+            reason: `strategy watchdog stood down for group ${groupId}: ${result.reason}`,
+          };
+        }
+        return { status: 'failed', error: result.error };
       } catch (err) {
         logger.error(
           `[Heartbeat] Strategy watchdog failed for group ${groupId} (reminder ${reminder.id}):`,
           err
         );
-        return false;
+        return {
+          status: 'failed',
+          error: err instanceof Error ? err.message : String(err),
+        };
       }
     }
 
@@ -686,15 +725,55 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
 
       // Route any responses
       if (result.responses && result.responses.length > 0) {
-        await routeResponses(result.responses);
+        await routeResponses(result.responses, result.sessionId);
       }
 
-      return result.success;
+      // The error is the point. Returning a bare `result.success` here is what
+      // reduced "Backend claude is not authenticated (not logged in)" to the
+      // recorded reason "Delivery callback returned false".
+      if (result.success) {
+        return { status: 'delivered' };
+      }
+      return {
+        status: 'failed',
+        error: result.error || 'session reported failure',
+      };
     } catch (error) {
       logger.error(`Failed to deliver reminder ${reminder.id}:`, error);
-      return false;
+      return {
+        status: 'failed',
+        error: error instanceof Error ? error.message : String(error),
+      };
     }
   };
+
+  /**
+   * Escalation for a failed beat, and the all-clear when it comes back.
+   *
+   * Heartbeats bypass the agent gateway entirely, so `trigger:error` — and
+   * with it the whole `[TriggerFailure]` path that restores the message and
+   * notifies the sender — never fires for a beat. And even if it did, it
+   * would return at `if (!payload.fromAgentId)`: a heartbeat's sender is
+   * `system`, so there is nobody to notify. Unreportable twice over.
+   *
+   * The implementation lives in `heartbeat-escalation.ts` rather than in this
+   * closure, so it can be tested as the thing that actually reports an outage.
+   * A suite built against a mocked hook proves the hook gets called; it cannot
+   * prove a notice reached anyone.
+   */
+  const heartbeatEscalation = dataComposer
+    ? createHeartbeatEscalation({
+        client: dataComposer.getClient(),
+        // The direct path: straight out over the channel, no session and no
+        // LLM turn anywhere in it. A notice that needs an SB to wake up cannot
+        // be the one that reports an SB failing to wake up.
+        sendToChannel: async (response) => {
+          if (!channelGateway) throw new Error('ChannelGateway not initialized');
+          return channelGateway.sendResponse(response);
+        },
+        defaultAgentId: agentId,
+      })
+    : null;
 
   if (heartbeatServiceEnabled) {
     const sweepLeaseService = new StudioLeaseService(dataComposer!.getClient());
@@ -707,7 +786,11 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
       enableLocalCron,
       onHeartbeat: async () => {
         logger.info('Heartbeat tick — processing due reminders');
-        const stats = await processHeartbeat(deliverReminderViaSession);
+        const stats = await processHeartbeat(
+          deliverReminderViaSession,
+          heartbeatEscalation?.onFailure,
+          heartbeatEscalation?.onRecovery
+        );
         logger.info('Heartbeat complete', stats);
 
         // Lease sweep: expire leases whose heartbeat went stale (rescuing the
@@ -1519,7 +1602,7 @@ When you complete a task_request, mark it as completed using update_inbox_messag
     // should NOT emit trigger:error or send a "Trigger failed" notification.
     try {
       if (result.responses && result.responses.length > 0) {
-        await routeResponses(result.responses);
+        await routeResponses(result.responses, result.sessionId);
       }
     } catch (routeErr) {
       logger.error(

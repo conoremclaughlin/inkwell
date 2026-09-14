@@ -1,4 +1,4 @@
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { McpServer } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 import { isoDateTime } from './schema-primitives.js';
 import type { DataComposer } from '../../data/composer';
@@ -13,13 +13,7 @@ import {
 // Import all tool handlers
 import { handleSaveLink, handleSearchLinks, handleTagLink } from './link-handlers';
 
-import {
-  handleSaveContext,
-  handleGetContext,
-  handleSaveProject,
-  handleListProjects,
-  handleGetProject,
-} from './context-handlers';
+import { handleSaveProject, handleListProjects, handleGetProject } from './context-handlers';
 
 import {
   handleCreateTask,
@@ -225,6 +219,7 @@ import {
   handleCloseThread,
   handleListThreads,
   handleMarkThreadRead,
+  handleReopenThread,
   threadToolDefinitions,
 } from './thread-handlers';
 
@@ -380,7 +375,7 @@ export { setMiniAppsRegistry } from './skill-handlers';
 const userIdentifierFields = {
   userId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('User UUID — usually unnecessary, auto-resolved from OAuth token'),
   email: z
@@ -510,7 +505,7 @@ User can be identified by ONE of:
 - email: Email address
 - phone: Phone number (E.164 format like +14155551234)
 - platform + platformId: Platform name (telegram/whatsapp/discord) and user ID`,
-      inputSchema: {
+      inputSchema: z.object({
         ...userIdentifierFields,
         url: z.string().url().describe('URL to save'),
         title: z.string().optional().describe('Title of the link'),
@@ -520,7 +515,7 @@ User can be identified by ONE of:
           .enum(['telegram', 'whatsapp', 'discord', 'api'])
           .optional()
           .describe('Source platform'),
-      },
+      }),
     },
     async (args) => {
       try {
@@ -554,14 +549,14 @@ User can be identified by ONE of:
 - email: Email address
 - phone: Phone number (E.164 format)
 - platform + platformId: Platform name and user ID`,
-      inputSchema: {
+      inputSchema: z.object({
         ...userIdentifierFields,
         query: z.string().optional().describe('Search query'),
         tags: z.array(z.string()).optional().describe('Filter by tags'),
         startDate: isoDateTime().optional().describe('Start date filter'),
         endDate: isoDateTime().optional().describe('End date filter'),
         limit: z.number().min(1).max(100).default(20).describe('Maximum results to return'),
-      },
+      }),
     },
     async (args) => {
       try {
@@ -595,102 +590,18 @@ User can be identified by ONE of:
 - email: Email address
 - phone: Phone number (E.164 format)
 - platform + platformId: Platform name and user ID`,
-      inputSchema: {
+      inputSchema: z.object({
         ...userIdentifierFields,
-        linkId: z.string().uuid().describe('Link ID to modify'),
+        linkId: z.string().guid().describe('Link ID to modify'),
         addTags: z.array(z.string()).optional().describe('Tags to add'),
         removeTags: z.array(z.string()).optional().describe('Tags to remove'),
-      },
+      }),
     },
     async (args) => {
       try {
         return await handleTagLink(args, dataComposer);
       } catch (error) {
         logger.error('Error in tag_link:', error);
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: JSON.stringify({
-                success: false,
-                error: error instanceof Error ? error.message : 'Unknown error',
-              }),
-            },
-          ],
-          isError: true,
-        };
-      }
-    }
-  );
-
-  // =====================================================
-  // CONTEXT TOOLS
-  // =====================================================
-
-  // Register save_context tool
-  server.registerTool(
-    'save_context',
-    {
-      description: `Save or update a context summary. Context types:
-- user: Information about the user (name, preferences, expertise)
-- assistant: Information about the AI's role and relationship with user
-- project: Project-specific context (use save_project for full project data)
-- session: Current session context
-- relationship: The ongoing relationship between user and assistant
-
-User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: {
-        ...userIdentifierFields,
-        contextType: z
-          .enum(['user', 'assistant', 'project', 'session', 'relationship'])
-          .describe('Type of context'),
-        contextKey: z.string().optional().describe('Optional key for sub-context'),
-        summary: z.string().describe('The summarized context to save'),
-        metadata: z.record(z.unknown()).optional().describe('Additional metadata'),
-      },
-    },
-    async (args) => {
-      try {
-        return await handleSaveContext(args, dataComposer);
-      } catch (error) {
-        logger.error('Error in save_context:', error);
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: JSON.stringify({
-                success: false,
-                error: error instanceof Error ? error.message : 'Unknown error',
-              }),
-            },
-          ],
-          isError: true,
-        };
-      }
-    }
-  );
-
-  // Register get_context tool
-  server.registerTool(
-    'get_context',
-    {
-      description: `Retrieve saved context summaries. Can filter by type and key.
-
-User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: {
-        ...userIdentifierFields,
-        contextType: z
-          .enum(['user', 'assistant', 'project', 'session', 'relationship'])
-          .optional()
-          .describe('Filter by type'),
-        contextKey: z.string().optional().describe('Filter by key'),
-      },
-    },
-    async (args) => {
-      try {
-        return await handleGetContext(args, dataComposer);
-      } catch (error) {
-        logger.error('Error in get_context:', error);
         return {
           content: [
             {
@@ -718,7 +629,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `Create or update a project. Projects track what the user is working on.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: {
+      inputSchema: z.object({
         ...userIdentifierFields,
         name: z.string().describe('Project name (unique per user)'),
         description: z.string().optional().describe('Project description'),
@@ -741,7 +652,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
             'Thread-key project prefix (e.g., "inkread" in inkread:pr:42). Reserved against thread-key type names. Pass null to clear.'
           ),
         goals: z.array(z.string()).optional().describe('Project goals'),
-      },
+      }),
     },
     async (args) => {
       try {
@@ -771,9 +682,9 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `List thread-key type behaviors — write intent and studio policy per type (spec: thread-key-grammar v2). Shipped templates plus your overrides; overrides shadow templates.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: {
+      inputSchema: z.object({
         ...userIdentifierFields,
-      },
+      }),
     },
     async (args) => {
       try {
@@ -803,7 +714,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `Set (or reset) the behavior of a thread-key type — e.g., make "pr:*" threads take the studio write lease and provision worktrees. Creates a per-user override of the shipped template; reset: true removes the override.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: {
+      inputSchema: z.object({
         ...userIdentifierFields,
         type: z
           .string()
@@ -827,7 +738,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           .boolean()
           .optional()
           .describe('Delete the user override so the shipped template (or default) resumes'),
-      },
+      }),
     },
     async (args) => {
       try {
@@ -857,10 +768,10 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `List all projects for a user, optionally filtered by status.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: {
+      inputSchema: z.object({
         ...userIdentifierFields,
         status: z.enum(['active', 'paused', 'completed', 'archived']).optional(),
-      },
+      }),
     },
     async (args) => {
       try {
@@ -890,11 +801,11 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `Get detailed information about a specific project.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: {
+      inputSchema: z.object({
         ...userIdentifierFields,
         name: z.string().optional().describe('Project name'),
-        projectId: z.string().uuid().optional().describe('Project UUID'),
-      },
+        projectId: z.string().guid().optional().describe('Project UUID'),
+      }),
     },
     async (args) => {
       try {
@@ -934,10 +845,10 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
 Set dueDate here when the task has a real deadline — the dashboard sorts and flags overdue work by it.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: {
+      inputSchema: z.object({
         ...userIdentifierFields,
-        projectId: z.string().uuid().optional().describe('Project ID to add the task to'),
-        taskGroupId: z.string().uuid().optional().describe('Task group ID to add the task to'),
+        projectId: z.string().guid().optional().describe('Project ID to add the task to'),
+        taskGroupId: z.string().guid().optional().describe('Task group ID to add the task to'),
         taskOrder: z
           .number()
           .int()
@@ -950,7 +861,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         tags: z.array(z.string()).optional().describe('Tags for categorization'),
         createdBy: z.string().optional().describe('Who created this task (e.g., "claude", "user")'),
         dueDate: z.string().optional().describe(DUE_DATE_DESCRIPTION),
-      },
+      }),
     },
     async (args) => {
       try {
@@ -980,10 +891,10 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `List tasks for a user, optionally filtered by project, task group, or status. Returns task group info, creator, blocked-by, due dates, and metadata.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: {
+      inputSchema: z.object({
         ...userIdentifierFields,
-        projectId: z.string().uuid().optional().describe('Filter by project'),
-        groupId: z.string().uuid().optional().describe('Filter by task group'),
+        projectId: z.string().guid().optional().describe('Filter by project'),
+        groupId: z.string().guid().optional().describe('Filter by task group'),
         status: z.enum(['pending', 'in_progress', 'completed', 'blocked']).optional(),
         activeOnly: z
           .boolean()
@@ -991,7 +902,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           .default(false)
           .describe('Only show pending/in_progress tasks'),
         limit: z.number().optional().default(50),
-      },
+      }),
     },
     async (args) => {
       try {
@@ -1023,9 +934,9 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
 At least one updatable field must be provided. The response echoes the stored values — including dueDate — so the write can be verified without a separate read.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: {
+      inputSchema: z.object({
         ...userIdentifierFields,
-        taskId: z.string().uuid().describe('Task ID to update'),
+        taskId: z.string().guid().describe('Task ID to update'),
         title: z.string().min(1).max(500).optional(),
         description: z.string().optional(),
         status: z.enum(['pending', 'in_progress', 'completed', 'blocked']).optional(),
@@ -1036,7 +947,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           .nullable()
           .optional()
           .describe(`${DUE_DATE_DESCRIPTION} Pass null to clear an existing due date.`),
-      },
+      }),
     },
     async (args) => {
       try {
@@ -1068,9 +979,9 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
 For tasks in graph-mode groups, completion is claim-token-gated: claim the task first (claim_task) and pass claimToken here.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: {
+      inputSchema: z.object({
         ...userIdentifierFields,
-        taskId: z.string().uuid().describe('Task ID to mark as completed'),
+        taskId: z.string().guid().describe('Task ID to mark as completed'),
         summary: z
           .string()
           .max(2000)
@@ -1078,15 +989,15 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           .describe('Brief summary of what was accomplished (shown in mission feed)'),
         claimToken: z
           .string()
-          .uuid()
+          .guid()
           .optional()
           .describe('Required for graph-mode tasks: the claim token from claim_task'),
         sessionId: z
           .string()
-          .uuid()
+          .guid()
           .optional()
           .describe('Claim-holding session for graph-mode tasks — usually resolved from context'),
-      },
+      }),
     },
     async (args) => {
       try {
@@ -1306,10 +1217,10 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `Get task statistics for a project (total, pending, in_progress, completed, blocked counts).
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: {
+      inputSchema: z.object({
         ...userIdentifierFields,
-        projectId: z.string().uuid().describe('Project ID to get stats for'),
-      },
+        projectId: z.string().guid().describe('Project ID to get stats for'),
+      }),
     },
     async (args) => {
       try {
@@ -1339,16 +1250,16 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `Add a comment to a task. Comments are attributed to the calling agent automatically. Use this to leave notes, context, or discussion on tasks.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: {
+      inputSchema: z.object({
         ...userIdentifierFields,
-        taskId: z.string().uuid().describe('Task ID to comment on'),
+        taskId: z.string().guid().describe('Task ID to comment on'),
         content: z.string().min(1).max(5000).describe('Comment content'),
         parentCommentId: z
           .string()
-          .uuid()
+          .guid()
           .optional()
           .describe('Parent comment ID for threaded replies'),
-      },
+      }),
     },
     async (args) => {
       try {
@@ -1505,7 +1416,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `Create a task group — a container for related tasks that share a title, strategy/description, priority, and optionally an autonomous execution plan or output target (spec/pr/report/proposal). Add tasks with create_task(taskGroupId, taskOrder) after creating the group, then activate with start_strategy. Returns the created group with its UUID.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: createTaskGroupSchema.shape,
+      inputSchema: createTaskGroupSchema,
     },
     async (args) => {
       try {
@@ -1538,7 +1449,7 @@ Pass \`closedReason\` as a shorthand to record why a group was closed — it's s
 Metadata is merged into existing metadata by default. Pass \`mergeMetadata: false\` to replace wholesale.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: updateTaskGroupSchema.shape,
+      inputSchema: updateTaskGroupSchema,
     },
     async (args) => {
       try {
@@ -1567,7 +1478,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `List task groups for a user with per-status task counts per group. Omit \`statuses\` (or pass an empty array) to include all statuses. Pass a multi-select array to narrow (e.g. statuses: ["active","paused"]). Also supports projectId, sbId, autonomousOnly, and strategy filters.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: listTaskGroupsSchema.shape,
+      inputSchema: listTaskGroupsSchema,
     },
     async (args) => {
       try {
@@ -1611,7 +1522,7 @@ The agent calling this becomes the strategy owner. After activation, each comple
 Empty task groups are valid — if planUri is set, the agent reads the plan, decomposes it into tasks, and starts working.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: startStrategySchema.shape,
+      inputSchema: startStrategySchema,
     },
     async (args) => {
       try {
@@ -1640,7 +1551,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `Pause an active strategy on a task group. The current task stays in progress but no new tasks will be auto-assigned.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: pauseStrategySchema.shape,
+      inputSchema: pauseStrategySchema,
     },
     async (args) => {
       try {
@@ -1669,7 +1580,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `Resume a paused strategy (also serves as approve_continuation after an approval gate). Resets the approval counter and returns the next task to work on.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: resumeStrategySchema.shape,
+      inputSchema: resumeStrategySchema,
     },
     async (args) => {
       try {
@@ -1698,7 +1609,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `Cancel an active or paused strategy on a task group. Transitions the group to the terminal 'cancelled' state, cancels the watchdog reminder, and logs the optional reason to the activity stream. Cannot be called on groups that are already completed or cancelled. Tasks themselves are not modified — cancelling the strategy stops autonomous progression but leaves task records intact for audit.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: cancelStrategySchema.shape,
+      inputSchema: cancelStrategySchema,
     },
     async (args) => {
       try {
@@ -1727,7 +1638,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `Get the status of a work strategy on a task group. Returns progress, current task, config, and a human-friendly summary suitable for forwarding to Telegram/Slack.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: getStrategyStatusSchema.shape,
+      inputSchema: getStrategyStatusSchema,
     },
     async (args) => {
       try {
@@ -1758,7 +1669,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
 Mutable: checkInInterval, verificationGates, maxIterationsWithoutApproval, verificationMode, supervisorId, watchdogIntervalMinutes, contextSummaryInterval, approvalNotify, checkInNotify, userNotify.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: updateStrategySchema.shape,
+      inputSchema: updateStrategySchema,
     },
     async (args) => {
       try {
@@ -1813,7 +1724,7 @@ Supported types: image, video, audio, document. The \`content\` field is sent as
 
 Set \`voiceReply: true\` to send content as a voice note instead of text. Uses on-device TTS (zero cost).
 Optionally set \`ttsVoice\` to choose a voice. Available voices: serena (default), vivian, sohee, ono_anna, ryan, aiden, eric.`,
-      inputSchema: {
+      inputSchema: z.object({
         channel: z
           .enum(['telegram', 'terminal', 'discord', 'whatsapp', 'http', 'api', 'agent'])
           .describe('Channel to send the response to'),
@@ -1843,7 +1754,7 @@ Optionally set \`ttsVoice\` to choose a voice. Available voices: serena (default
           .describe(
             'Media attachments to send. Each entry is {type, path|url, ...} — a bare path/URL string is also accepted and coerced.'
           ),
-      },
+      }),
     },
     async (args) => {
       try {
@@ -1871,7 +1782,7 @@ Optionally set \`ttsVoice\` to choose a voice. Available voices: serena (default
     'get_pending_messages',
     {
       description: `Get pending messages from other channels. Use this to check if there are new messages from Telegram or other platforms that need your attention.`,
-      inputSchema: {
+      inputSchema: z.object({
         channel: z
           .enum(['telegram', 'terminal', 'discord', 'whatsapp', 'http', 'api', 'all'])
           .optional()
@@ -1885,7 +1796,7 @@ Optionally set \`ttsVoice\` to choose a voice. Available voices: serena (default
           .default(10)
           .describe('Maximum messages to return'),
         since: isoDateTime().optional().describe('Only messages after this timestamp'),
-      },
+      }),
     },
     async (args) => {
       try {
@@ -1913,9 +1824,9 @@ Optionally set \`ttsVoice\` to choose a voice. Available voices: serena (default
     'mark_messages_read',
     {
       description: `Mark messages as read. Use this after you've processed pending messages.`,
-      inputSchema: {
+      inputSchema: z.object({
         messageIds: z.array(z.string()).describe('Message IDs to mark as read'),
-      },
+      }),
     },
     async (args) => {
       try {
@@ -1989,7 +1900,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `Search and retrieve memories using text, semantic vectors, or a hybrid blend.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: {
+      inputSchema: z.object({
         ...userIdentifierFields,
         query: z.string().optional().describe('Search query across memory text and embeddings'),
         recallMode: z
@@ -2019,7 +1930,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           .describe(
             'Include shared memories (agentId=null) when filtering by agentId (default: true)'
           ),
-      },
+      }),
     },
     async (args) => {
       try {
@@ -2052,13 +1963,13 @@ the client can evict them from the active context window. Feedback is stored
 durably for future recall ranking improvements.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: {
+      inputSchema: z.object({
         ...userIdentifierFields,
         query: z.string().describe('The recall query that produced these results'),
         accepted: z
           .array(
             z.object({
-              memoryId: z.string().uuid().describe('ID of the accepted memory'),
+              memoryId: z.string().guid().describe('ID of the accepted memory'),
               semanticScore: z.number().optional().describe('Cosine similarity score from recall'),
               textScore: z.number().optional().describe('Text match score from recall'),
               finalScore: z.number().optional().describe('Blended final score from recall'),
@@ -2069,7 +1980,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         dismissed: z
           .array(
             z.object({
-              memoryId: z.string().uuid().describe('ID of the dismissed memory'),
+              memoryId: z.string().guid().describe('ID of the dismissed memory'),
               semanticScore: z.number().optional().describe('Cosine similarity score from recall'),
               textScore: z.number().optional().describe('Text match score from recall'),
               finalScore: z.number().optional().describe('Blended final score from recall'),
@@ -2078,8 +1989,8 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           .optional()
           .describe('Memories the SB found irrelevant — should be evicted from context'),
         agentId: z.string().optional().describe('Agent identity (e.g., "wren")'),
-        sessionId: z.string().uuid().optional().describe('Current session ID for attribution'),
-      },
+        sessionId: z.string().guid().optional().describe('Current session ID for attribution'),
+      }),
     },
     async (args) => {
       try {
@@ -2109,10 +2020,10 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `Delete a memory permanently.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: {
+      inputSchema: z.object({
         ...userIdentifierFields,
-        memoryId: z.string().uuid().describe('ID of the memory to forget'),
-      },
+        memoryId: z.string().guid().describe('ID of the memory to forget'),
+      }),
     },
     async (args) => {
       try {
@@ -2142,9 +2053,9 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `Update a memory's salience, topics, or metadata.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: {
+      inputSchema: z.object({
         ...userIdentifierFields,
-        memoryId: z.string().uuid().describe('ID of the memory to update'),
+        memoryId: z.string().guid().describe('ID of the memory to update'),
         salience: z
           .enum(['low', 'medium', 'high', 'critical'])
           .optional()
@@ -2153,8 +2064,8 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           .union([z.string(), z.array(z.string())])
           .optional()
           .describe('New topics'),
-        metadata: z.record(z.unknown()).optional().describe('Metadata to merge'),
-      },
+        metadata: z.record(z.string(), z.unknown()).optional().describe('Metadata to merge'),
+      }),
     },
     async (args) => {
       try {
@@ -2196,7 +2107,7 @@ Session matching priority:
 When forceNew=true, start_session always creates a new session (skips active-session reuse). You can optionally provide sessionId to set a client-generated canonical UUID.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-        inputSchema: {
+        inputSchema: z.object({
           ...userIdentifierFields,
           agentId: z
             .string()
@@ -2204,7 +2115,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
             .describe('Agent identifier (e.g., "claude-code", "telegram-myra")'),
           sessionId: z
             .string()
-            .uuid()
+            .guid()
             .optional()
             .describe(
               'Optional PCP session UUID to use when creating a new session (typically with forceNew=true).'
@@ -2235,12 +2146,12 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
             .describe(
               'Absolute path to the repository root. When studioId is "main" and no studio row exists, a studio is auto-created at this path.'
             ),
-          metadata: z.record(z.unknown()).optional().describe('Session metadata'),
+          metadata: z.record(z.string(), z.unknown()).optional().describe('Session metadata'),
           forceNew: z
             .boolean()
             .optional()
             .describe('If true, create a new session even if an active one exists for this scope.'),
-        },
+        }),
       },
       async (args) => {
         try {
@@ -2272,11 +2183,11 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
 Session resolution: sessionId (explicit) > agentId+studioId (scoped) > most recent active (fallback).
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-        inputSchema: {
+        inputSchema: z.object({
           ...userIdentifierFields,
           sessionId: z
             .string()
-            .uuid()
+            .guid()
             .optional()
             .describe('Session ID (uses active session if not provided)'),
           agentId: z
@@ -2290,7 +2201,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
               'Studio ID (UUID or "main") for session resolution when sessionId not provided'
             ),
           summary: z.string().optional().describe('End-of-session summary (saved as memory)'),
-        },
+        }),
       },
       async (args) => {
         try {
@@ -2321,11 +2232,11 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `Get details about a session, optionally including its logs.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: {
+      inputSchema: z.object({
         ...userIdentifierFields,
         sessionId: z
           .string()
-          .uuid()
+          .guid()
           .optional()
           .describe('Session ID (returns active session if not provided)'),
         agentId: z
@@ -2339,7 +2250,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
             'Studio ID (UUID or "main") for session resolution when sessionId not provided'
           ),
         includeLogs: z.boolean().optional().describe('Include session logs (default: false)'),
-      },
+      }),
     },
     async (args) => {
       try {
@@ -2454,10 +2365,10 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `Get version history for a specific memory. Shows all previous versions before updates/deletes.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: {
+      inputSchema: z.object({
         ...userIdentifierFields,
-        memoryId: z.string().uuid().describe('ID of the memory to get history for'),
-      },
+        memoryId: z.string().guid().describe('ID of the memory to get history for'),
+      }),
     },
     async (args) => {
       try {
@@ -2487,11 +2398,11 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `Get recent memory changes (updates and deletes) for a user. Useful for reviewing what changed.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: {
+      inputSchema: z.object({
         ...userIdentifierFields,
         limit: z.number().min(1).max(100).optional().describe('Max results (default: 50)'),
         changeType: z.enum(['update', 'delete']).optional().describe('Filter by change type'),
-      },
+      }),
     },
     async (args) => {
       try {
@@ -2521,10 +2432,10 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `Restore a memory from a previous version in history. Can restore updated or deleted memories.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: {
+      inputSchema: z.object({
         ...userIdentifierFields,
-        historyId: z.string().uuid().describe('ID of the history entry to restore from'),
-      },
+        historyId: z.string().guid().describe('ID of the history entry to restore from'),
+      }),
     },
     async (args) => {
       try {
@@ -2559,17 +2470,16 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
 
 Returns:
 - Identity Files: shared values/user/process docs and agent-specific identity docs from ~/.ink
-- Identity Core: user profile, assistant role, relationship context from DB
-- Active Context: current projects, session context, project-specific context
+- Active Context: current projects and focus
 - Active Session: current session if any
 - Recent Memories: high-salience memories (filtered by agent if provided)
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: {
+      inputSchema: z.object({
         ...userIdentifierFields,
         workspaceId: z
           .string()
-          .uuid()
+          .guid()
           .optional()
           .describe('Optional product workspace scope for shared document resolution'),
         includeRecentMemories: z
@@ -2612,7 +2522,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           .describe(
             'Optional focus text to prioritize bootstrap memories. Falls back to current focus summary when omitted.'
           ),
-      },
+      }),
     },
     async (args) => {
       try {
@@ -2652,11 +2562,11 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
 Use this to convert session activity into durable memories before ending a session.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
-      inputSchema: {
+      inputSchema: z.object({
         ...userIdentifierFields,
         sessionId: z
           .string()
-          .uuid()
+          .guid()
           .optional()
           .describe('Session ID to compact (uses active session if not provided)'),
         agentId: z
@@ -2679,7 +2589,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           .describe(
             'Keep original logs visible after compaction (default: false). Note: Logs are always soft-deleted for audit trail.'
           ),
-      },
+      }),
     },
     async (args) => {
       try {
@@ -2713,12 +2623,12 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `List all available skills (guides, mini-apps, CLI tools). Each skill provides specialized capabilities.
 
 When a user's message matches a skill's triggers, use get_skill to read the full instructions before proceeding. Guide-type skills are behavioral instructions that should be followed when active.`,
-      inputSchema: {
+      inputSchema: z.object({
         includeContent: z
           .boolean()
           .optional()
           .describe('Include full content for guide-type skills (for session injection)'),
-      },
+      }),
     },
     async (args) => {
       try {
@@ -2752,9 +2662,9 @@ The skill document contains:
 - Conversation flow guidelines (mini-apps)
 - How to use the skill's functions correctly
 - Edge case handling`,
-      inputSchema: {
+      inputSchema: z.object({
         skillName: z.string().describe('Name of the skill to get instructions for'),
-      },
+      }),
     },
     async (args) => {
       try {
@@ -2955,7 +2865,7 @@ This implements the "summarize-and-forget" pattern:
 1. Fetch recent messages when you need context
 2. Summarize the relevant parts into your response
 3. Clear the cache - don't store conversation history long-term`,
-      inputSchema: {
+      inputSchema: z.object({
         channel: z
           .enum(['telegram', 'discord', 'whatsapp'])
           .describe('Channel to get context from'),
@@ -2966,7 +2876,7 @@ This implements the "summarize-and-forget" pattern:
           .max(100)
           .optional()
           .describe('Maximum messages to return (default: 50)'),
-      },
+      }),
     },
     async (args) => {
       try {
@@ -2999,12 +2909,12 @@ This implements the "summarize-and-forget" pattern:
       description: `Clear cached messages for a chat. Call this after summarizing context to free memory.
 
 Part of the "summarize-and-forget" pattern - after you've extracted what you need from chat history, clear it to respect privacy.`,
-      inputSchema: {
+      inputSchema: z.object({
         channel: z
           .enum(['telegram', 'discord', 'whatsapp'])
           .describe('Channel to clear context for'),
         conversationId: z.string().describe('Conversation/chat ID to clear'),
-      },
+      }),
     },
     async (args) => {
       try {
@@ -3035,12 +2945,12 @@ Part of the "summarize-and-forget" pattern - after you've extracted what you nee
     'get_cache_stats',
     {
       description: `Get statistics about the message cache. Useful for debugging and monitoring memory usage.`,
-      inputSchema: {
+      inputSchema: z.object({
         channel: z
           .enum(['telegram', 'discord', 'whatsapp'])
           .optional()
           .describe('Specific channel to get stats for (default: all)'),
-      },
+      }),
     },
     async (args) => {
       try {
@@ -4036,7 +3946,7 @@ intended for agent use — calling it leaks no privileged data, it just reports
 what the server saw for the current call.
 
 Only registered when NODE_ENV !== 'production'.`,
-        inputSchema: {},
+        inputSchema: z.object({}),
       },
       async () => {
         try {
@@ -4323,7 +4233,7 @@ Thread routing:
 When threadKey is provided, messages are stored in thread tables (inbox_thread_messages). All recipients are auto-added as thread participants. Late joiners see full thread history. Without threadKey, messages go to the simple agent_inbox.
 
 For existing threads, reply semantics are applied automatically:
-- Closed threads are rejected
+- Closed threads still accept replies: closed is a work-state signal, not a lock. The reply is stored and wakes its recipients; the thread stays closed.
 - Smart trigger defaults: 1:1 thread → trigger other participant; group with explicit recipient → that recipient; group thread (non-creator) → trigger creator; group thread (creator) → all others
 - Override with triggerAll (everyone) or triggerAgents (specific agents)
 
@@ -4583,7 +4493,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   server.registerTool(
     'close_thread',
     {
-      description: `Close a thread. Closed threads can still be read but new messages are rejected. Any participant can close a thread.
+      description: `Close a thread to mark its work done. Closed is a work-state signal, not a lock: a closed thread can still be read and still accepts replies (a reply wakes its participants without reopening the thread); it drops off the default list_threads work list. Any participant can close a thread; reopen_thread puts the work back on.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: threadToolDefinitions[2].schema,
@@ -4651,6 +4561,35 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
         return await handleMarkThreadRead(args, dataComposer);
       } catch (error) {
         logger.error('Error in mark_thread_read:', error);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  server.registerTool(
+    'reopen_thread',
+    {
+      description: `${threadToolDefinitions[5].description}
+
+User can be identified by ONE of: userId, email, phone, or platform + platformId`,
+      inputSchema: threadToolDefinitions[5].schema,
+    },
+    async (args: Record<string, unknown>) => {
+      try {
+        return await handleReopenThread(args, dataComposer);
+      } catch (error) {
+        logger.error('Error in reopen_thread:', error);
         return {
           content: [
             {

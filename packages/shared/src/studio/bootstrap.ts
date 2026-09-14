@@ -14,7 +14,7 @@
  * Both callers go through bootstrapStudio() so the two can't drift again.
  */
 
-import { existsSync, cpSync } from 'fs';
+import { existsSync, cpSync, lstatSync } from 'fs';
 import { join } from 'path';
 import { syncMcpConfig } from './mcp-config-sync.js';
 
@@ -35,6 +35,12 @@ export interface BootstrapStudioResult {
  *
  * Never overwrites: a studio that has already been customised keeps its own
  * copy. Returns the files actually copied.
+ *
+ * "Missing" is decided with lstat, not existsSync. existsSync follows links,
+ * so a dangling symlink at the target reads as absent — and cpSync would then
+ * write THROUGH it to wherever it points, outside the studio. A checkout can
+ * ship such a link (Lumen, PR #604). Any entry at the target, link or not,
+ * means: leave it alone.
  */
 export function copyBootstrapFiles(sourceRoot: string, studioPath: string): string[] {
   if (sourceRoot === studioPath) return [];
@@ -43,10 +49,16 @@ export function copyBootstrapFiles(sourceRoot: string, studioPath: string): stri
   for (const file of BOOTSTRAP_FILES) {
     const source = join(sourceRoot, file);
     const target = join(studioPath, file);
-    if (existsSync(source) && !existsSync(target)) {
-      cpSync(source, target);
-      copied.push(file);
+    if (!existsSync(source)) continue;
+    let occupied = true;
+    try {
+      lstatSync(target);
+    } catch {
+      occupied = false;
     }
+    if (occupied) continue;
+    cpSync(source, target);
+    copied.push(file);
   }
   return copied;
 }

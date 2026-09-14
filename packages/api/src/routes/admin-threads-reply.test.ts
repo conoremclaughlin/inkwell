@@ -207,36 +207,39 @@ describe('POST /threads/reply', () => {
     expect(res._json).toMatchObject({ success: true, messageId: 'msg-10' });
   });
 
-  it('409s on a closed thread before calling the handler', async () => {
-    mockThreadLookup({ id: 'thread-1', thread_key: 'pr:545', status: 'closed' });
+  it('replies into a closed thread like any other — closed is a work-state signal, not a lock', async () => {
+    // spec inkmail-thread-scope §2. The row says closed both ways (status
+    // and closed_at) so a reintroduced gate on either field would fail here.
+    mockThreadLookup({
+      id: 'thread-1',
+      thread_key: 'pr:545',
+      status: 'closed',
+      closed_at: '2026-09-01T00:00:00Z',
+    });
+    mockGetParticipants.mockResolvedValue(['wren']);
+    mockHandleSendToInbox.mockResolvedValue(
+      sendToInboxResult({ success: true, messageId: 'msg-11', threadId: 'thread-1' })
+    );
 
     const res = createRes();
-    await reply(createReq({ key: 'pr:545', content: 'too late?' }), res);
+    await reply(createReq({ key: 'pr:545', content: 'one more thing' }), res);
 
-    expect(res._status).toBe(409);
-    expect((res._json as { error: string }).error).toMatch(/closed/);
-    expect(mockHandleSendToInbox).not.toHaveBeenCalled();
+    expect(res._status).toBe(200);
+    expect(res._json).toMatchObject({ success: true, messageId: 'msg-11', threadId: 'thread-1' });
+    expect(mockHandleSendToInbox).toHaveBeenCalledTimes(1);
+    const args = mockHandleSendToInbox.mock.calls[0][0] as Record<string, unknown>;
+    // The closed thread's participants are woken exactly as an open one's.
+    expect(args).toMatchObject({ recipients: ['wren'], triggerAll: true });
   });
 
   it('returns a non-2xx when the handler stored nothing — a 200 would clear a draft that never landed', async () => {
-    mockThreadLookup({ id: 'thread-1', thread_key: 'pr:545', status: 'open' });
+    mockThreadLookup({ id: 'thread-1', thread_key: 'pr:545' });
     mockGetParticipants.mockResolvedValue(['wren']);
-    mockHandleSendToInbox.mockResolvedValue(
-      sendToInboxResult({
-        success: false,
-        error: 'Thread pr:545 is closed. Cannot send to closed threads.',
-      })
-    );
-
-    let res = createRes();
-    await reply(createReq({ key: 'pr:545', content: 'hello' }), res);
-    expect(res._status).toBe(409);
-    expect((res._json as { error: string }).error).toMatch(/closed/);
-
     mockHandleSendToInbox.mockResolvedValue(
       sendToInboxResult({ success: false, error: 'Unknown recipient: nobody' })
     );
-    res = createRes();
+
+    const res = createRes();
     await reply(createReq({ key: 'pr:545', content: 'hello' }), res);
     expect(res._status).toBe(400);
     expect(res._json).toEqual({ error: 'Unknown recipient: nobody' });

@@ -185,8 +185,6 @@ Read: `get_identity(agentId, file: "identity")`. Write: `save_identity(descripti
 | `save_identity`        | Update identity documents                         |
 | `create_task`          | Create a tracked task                             |
 | `list_tasks`           | List tasks                                        |
-| `save_context`         | Save context summaries                            |
-| `get_context`          | Retrieve context                                  |
 | `log_activity`         | Log structured activity events                    |
 
 ## Conventions

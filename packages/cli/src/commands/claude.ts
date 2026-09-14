@@ -3498,7 +3498,9 @@ async function ensurePcpSessionContext(
 /**
  * PR #563 rounds 9–10: codex/gemini prompt hooks cannot block and run no
  * channel plugin, so the `ink` wrapper — the session's long-lived process —
- * is the pending-takeover marker's consumer. Scoped to the wrapper's OWN
+ * is the pending-takeover marker's consumer. claude-code joined once its
+ * prompt hook went fail-open (it warns instead of refusing the prompt): a
+ * marker with no consumer is the round-8 bug, so the gate opens with it. Scoped to the wrapper's OWN
  * session (round 10: a crashed predecessor's marker for a different session
  * in this checkout belongs to that session's consumer, never this one). A
  * successful reclaim persists the claimed epoch so the on-stop hook can
@@ -3521,7 +3523,7 @@ function startSessionTakeoverWatcher(
    */
   onUnprotected?: () => void
 ): { stop: () => void } | undefined {
-  if (backend !== 'codex' && backend !== 'gemini') return undefined;
+  if (backend !== 'codex' && backend !== 'gemini' && backend !== 'claude') return undefined;
   if (!pcpSessionId) return undefined;
   const cwd = process.cwd();
   const postLifecycle = async (body: Record<string, unknown>) => {
@@ -4006,7 +4008,6 @@ export async function runClaudeInteractive(
           ...(runtimeLinkId ? { INK_RUNTIME_LINK_ID: runtimeLinkId } : {}),
         },
       });
-      interactiveChild = child;
 
       child.stderr?.on('data', (chunk) => {
         const text = chunk.toString();
@@ -4056,32 +4057,32 @@ export async function runClaudeInteractive(
   // process for codex/gemini — the round-9 watcher was wired only into the
   // one-shot path. One watcher spans every retry attempt (retries continue
   // the same session's scope); it is stopped before the wrapper exits.
-  let interactiveChild: ReturnType<typeof spawn> | undefined;
-  let interactiveEnforced = false;
   const interactiveTakeoverWatcher = startSessionTakeoverWatcher(
     options.backend,
     sessionContext.pcpSessionId,
     studioId,
     runtimeLinkId,
     () => {
-      interactiveEnforced = true;
+      // PR #590: an ATTACHED session is warned, never terminated — for every
+      // backend. A permanent refusal here reaches a human sitting at the
+      // terminal; killing their session to protect the checkout is a harsher
+      // outcome than the prompt block this policy replaced. Each later
+      // prompt's hook re-warns the SB in-context, and the human decides.
+      // One-shot runs (runClaude) keep round-15 termination — nobody is
+      // there to steer them.
       console.error(
-        chalk.red(
-          '\nThis worktree\u2019s lease is permanently gone (thread closed or studio revoked). Terminating the backend to protect the checkout.'
+        chalk.yellow(
+          '\nInkwell: this worktree\u2019s studio lease is held by another session or was revoked. ' +
+            'Prompts still run, but edits here are not fenced against whoever holds the lease; the SB is ' +
+            'warned on every prompt until the lease is reclaimed. Close the other session or wait for its ' +
+            'lease to lapse before changing files here.'
         )
       );
-      interactiveChild?.kill('SIGTERM');
     }
   );
 
   while (true) {
     const { code, stderrText } = await runAttempt();
-    // Round 16: an enforced termination (SIGTERM closes with code=null)
-    // must neither retry with a fresh backend session nor exit 0.
-    if (interactiveEnforced) {
-      await interactiveTakeoverWatcher?.stop();
-      process.exit(1);
-    }
     const shouldRetry =
       attempt < maxAttempts &&
       shouldRetryWithFreshBackendSession({
@@ -4116,8 +4117,6 @@ export async function runClaudeInteractive(
     });
 
     await interactiveTakeoverWatcher?.stop();
-    // Round 19: the adjudication tick inside stop() can enforce — re-check.
-    if (interactiveEnforced) process.exit(1);
     process.exit(code || 0);
   }
 }

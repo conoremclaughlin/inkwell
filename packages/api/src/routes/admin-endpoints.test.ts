@@ -70,12 +70,16 @@ vi.mock('../services/authorization', () => ({
 const mockGetConnectedAccounts = vi.fn();
 const mockGetSupportedProviders = vi.fn();
 const mockIsProviderConfigured = vi.fn();
+const mockGetCredentialSources = vi.fn();
+const mockDescribeDesktopCredentials = vi.fn();
 
 vi.mock('../services/oauth', () => ({
   getOAuthService: vi.fn(() => ({
     getConnectedAccounts: mockGetConnectedAccounts,
     getSupportedProviders: mockGetSupportedProviders,
     isProviderConfigured: mockIsProviderConfigured,
+    getCredentialSources: mockGetCredentialSources,
+    describeDesktopCredentials: mockDescribeDesktopCredentials,
   })),
 }));
 
@@ -1218,6 +1222,12 @@ describe('admin endpoint handlers (no-500 regression)', () => {
       mockGetConnectedAccounts.mockResolvedValue([]);
       mockGetSupportedProviders.mockReturnValue(['google']);
       mockIsProviderConfigured.mockReturnValue(true);
+      mockGetCredentialSources.mockReturnValue(['cloud', 'desktop']);
+      mockDescribeDesktopCredentials.mockResolvedValue({
+        dir: '/srv/google',
+        email: null,
+        credentials: [],
+      });
 
       const handler = findRouteHandler('get', '/connected-accounts');
       expect(handler).not.toBeNull();
@@ -1229,6 +1239,70 @@ describe('admin endpoint handlers (no-500 regression)', () => {
       expect(res._status).toBe(200);
       expect(res._json).toHaveProperty('accounts');
       expect(res._json).toHaveProperty('providers');
+      expect((res._json as { desktopCredentials: unknown[] }).desktopCredentials).toEqual([]);
+      expect(
+        (res._json as { providers: Array<{ connected: boolean }> }).providers[0].connected
+      ).toBe(false);
+    });
+
+    it('counts a usable desktop credential as a Google connection', async () => {
+      mockGetConnectedAccounts.mockResolvedValue([]);
+      mockGetSupportedProviders.mockReturnValue(['google']);
+      mockIsProviderConfigured.mockReturnValue(true);
+      mockGetCredentialSources.mockReturnValue(['cloud', 'desktop']);
+      mockDescribeDesktopCredentials.mockResolvedValue({
+        dir: '/srv/google',
+        email: 'me@example.com',
+        credentials: [
+          {
+            email: 'me@example.com',
+            path: '/srv/google/me@example.com.json',
+            scopes: ['a'],
+            obtainedAt: '2026-09-08T18:00:00.000Z',
+            state: 'refresh_required',
+            reason: 'The next call must refresh',
+            expiresAt: null,
+          },
+        ],
+      });
+
+      const handler = findRouteHandler('get', '/connected-accounts');
+      const req = createAuthenticatedReq();
+      const res = createMockRes();
+      await handler!(req, res);
+
+      const body = res._json as {
+        credentialSources: string[];
+        desktopCredentials: Array<{ provider: string; email: string; state: string }>;
+        providers: Array<{ name: string; connected: boolean }>;
+      };
+      expect(body.credentialSources).toEqual(['cloud', 'desktop']);
+      expect(body.desktopCredentials).toEqual([
+        expect.objectContaining({
+          provider: 'google',
+          email: 'me@example.com',
+          state: 'refresh_required',
+        }),
+      ]);
+      expect(body.providers[0]).toEqual({ name: 'google', configured: true, connected: true });
+      // Bound by the authenticated user, never by anything the client sent.
+      expect(mockDescribeDesktopCredentials).toHaveBeenCalledWith(req.pcpUserId);
+    });
+
+    it('does not ask about desktop files when the source is not configured', async () => {
+      mockGetConnectedAccounts.mockResolvedValue([]);
+      mockGetSupportedProviders.mockReturnValue(['google']);
+      mockIsProviderConfigured.mockReturnValue(true);
+      mockGetCredentialSources.mockReturnValue(['cloud']);
+      mockDescribeDesktopCredentials.mockReset();
+
+      const handler = findRouteHandler('get', '/connected-accounts');
+      const res = createMockRes();
+      await handler!(createAuthenticatedReq(), res);
+
+      expect(res._status).toBe(200);
+      expect(mockDescribeDesktopCredentials).not.toHaveBeenCalled();
+      expect((res._json as { desktopCredentials: unknown[] }).desktopCredentials).toEqual([]);
     });
   });
 

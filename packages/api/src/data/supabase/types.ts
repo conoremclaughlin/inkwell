@@ -1237,98 +1237,6 @@ export type Database = {
           },
         ];
       };
-      context_history: {
-        Row: {
-          archived_at: string | null;
-          change_type: string;
-          context_id: string;
-          context_key: string | null;
-          context_type: string;
-          created_at: string;
-          id: string;
-          metadata: Json | null;
-          summary: string;
-          user_id: string;
-          version: number;
-        };
-        Insert: {
-          archived_at?: string | null;
-          change_type?: string;
-          context_id: string;
-          context_key?: string | null;
-          context_type: string;
-          created_at: string;
-          id?: string;
-          metadata?: Json | null;
-          summary: string;
-          user_id: string;
-          version: number;
-        };
-        Update: {
-          archived_at?: string | null;
-          change_type?: string;
-          context_id?: string;
-          context_key?: string | null;
-          context_type?: string;
-          created_at?: string;
-          id?: string;
-          metadata?: Json | null;
-          summary?: string;
-          user_id?: string;
-          version?: number;
-        };
-        Relationships: [
-          {
-            foreignKeyName: 'context_history_user_id_fkey';
-            columns: ['user_id'];
-            referencedRelation: 'users';
-            referencedColumns: ['id'];
-          },
-        ];
-      };
-      context_summaries: {
-        Row: {
-          context_key: string | null;
-          context_type: string;
-          created_at: string | null;
-          id: string;
-          metadata: Json | null;
-          summary: string;
-          updated_at: string | null;
-          user_id: string;
-          version: number | null;
-        };
-        Insert: {
-          context_key?: string | null;
-          context_type: string;
-          created_at?: string | null;
-          id?: string;
-          metadata?: Json | null;
-          summary: string;
-          updated_at?: string | null;
-          user_id: string;
-          version?: number | null;
-        };
-        Update: {
-          context_key?: string | null;
-          context_type?: string;
-          created_at?: string | null;
-          id?: string;
-          metadata?: Json | null;
-          summary?: string;
-          updated_at?: string | null;
-          user_id?: string;
-          version?: number | null;
-        };
-        Relationships: [
-          {
-            foreignKeyName: 'context_summaries_user_id_fkey';
-            columns: ['user_id'];
-            referencedRelation: 'users';
-            referencedColumns: ['id'];
-          },
-        ];
-      };
       conversations: {
         Row: {
           created_at: string | null;
@@ -1414,6 +1322,70 @@ export type Database = {
             foreignKeyName: 'group_challenge_codes_workspace_id_fkey';
             columns: ['workspace_id'];
             referencedRelation: 'workspaces';
+            referencedColumns: ['id'];
+          },
+        ];
+      };
+      heartbeat_notifications: {
+        Row: {
+          attempts: number;
+          created_at: string;
+          delivered_at: string | null;
+          destination: string | null;
+          episode_closed_at: string | null;
+          episode_key: string;
+          failed_beats: number;
+          id: string;
+          kind: string;
+          last_attempt_at: string | null;
+          last_error: string | null;
+          next_attempt_at: string | null;
+          reminder_id: string;
+          status: string;
+          updated_at: string;
+          user_id: string;
+        };
+        Insert: {
+          attempts?: number;
+          created_at?: string;
+          delivered_at?: string | null;
+          destination?: string | null;
+          episode_closed_at?: string | null;
+          episode_key: string;
+          failed_beats?: number;
+          id?: string;
+          kind: string;
+          last_attempt_at?: string | null;
+          last_error?: string | null;
+          next_attempt_at?: string | null;
+          reminder_id: string;
+          status?: string;
+          updated_at?: string;
+          user_id: string;
+        };
+        Update: {
+          attempts?: number;
+          created_at?: string;
+          delivered_at?: string | null;
+          destination?: string | null;
+          episode_closed_at?: string | null;
+          episode_key?: string;
+          failed_beats?: number;
+          id?: string;
+          kind?: string;
+          last_attempt_at?: string | null;
+          last_error?: string | null;
+          next_attempt_at?: string | null;
+          reminder_id?: string;
+          status?: string;
+          updated_at?: string;
+          user_id?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: 'heartbeat_notifications_reminder_id_fkey';
+            columns: ['reminder_id'];
+            referencedRelation: 'scheduled_reminders';
             referencedColumns: ['id'];
           },
         ];
@@ -4575,6 +4547,14 @@ export type Database = {
           p_through_message_id: string;
         };
         Returns: string;
+      };
+      reopen_inbox_thread: {
+        Args: {
+          p_thread_id: string;
+          p_actor_kind: string;
+          p_actor_agent_id?: string | null;
+        };
+        Returns: boolean;
       };
       add_graph_nodes: {
         Args: {

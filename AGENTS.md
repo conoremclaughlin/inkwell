@@ -119,6 +119,17 @@ Inkwell uses Supabase (PostgreSQL) as its database. There are **two access paths
 
 5. **Never expose the service role key to the client.** It lives in `.env.local` (server only) and must never appear in `NEXT_PUBLIC_*` environment variables.
 
+### Local dashboard test account
+
+A shared SB account exists for local dashboard and auth-flow testing. Its credentials live in `.env.local` (gitignored, present in every worktree) as:
+
+```
+SB_TEST_EMAIL
+SB_TEST_PASSWORD
+```
+
+Use it whenever an SB needs to sign in to the dashboard or exercise the login path. **Never reset, rotate, or reuse a human's password to gain access** — the admin auth API can change any user's password with the service key, and doing so locks the human out. If the test account is missing or its password no longer works, say so and stop; recreating it is the user's call.
+
 ### File Access & Media Isolation (TODO)
 
 Server-spawned Claude sessions currently get `--add-dir ~/.ink/files` for media access (Telegram downloads, Gmail attachments, etc.). This is a shared directory — **all SBs can read all SBs' files**. Future work should consider:
@@ -382,8 +393,8 @@ personal-context-protocol/
 
 ## Key Technologies
 
-- **Runtime**: Node.js 18+, TypeScript
-- **MCP SDK**: `@modelcontextprotocol/sdk`
+- **Runtime**: Node.js 22 (`.nvmrc`; the MCP SDK v2 packages require 20 or newer), TypeScript
+- **MCP SDK**: `@modelcontextprotocol/server` (v2; `/node` for the HTTP transport, `/client` in tests). Protocol revision 2026-07-28; the legacy `@modelcontextprotocol/sdk` 1.x line stopped at 2025-11-25
 - **Database**: Supabase (PostgreSQL + pgvector)
 - **Frontend**: Next.js, React, Tailwind CSS
 - **Validation**: Zod schemas
@@ -427,7 +438,7 @@ yarn install
 # Development server (with hot reload)
 yarn dev
 
-# Build for production
+# Build for production (also re-points the global ink link — see "The Global ink CLI Link")
 yarn build
 
 # Type checking
@@ -443,31 +454,69 @@ yarn logs:ink:errors       # Errors only
 
 **Never kill or restart the main dev server.** It runs on the default port (3001) and handles agent communication, triggers, and heartbeats. Disrupting it breaks other SBs' active sessions.
 
-To test API or MCP changes without affecting the main server, run a **separate instance** on a different port using `PCP_PORT_BASE`:
+**Never let a second server process heartbeats or reminders.** A different port does not make a server isolated — every server reads the same database. A second one with heartbeat processing left on does not sit idle: it ticks on its own schedule, sees the same reminders come due, and races the main server to claim each one. Whoever wins spawns the agent, and the loser's spawn would have landed in whatever checkout that server was started from. Coverage becomes a coin flip, and nothing alerts, because every individual beat still looks fine in the log. On 2026-09-11 a test server left up overnight in a worktree took roughly half of Myra's hourly heartbeats for thirteen hours and ran them against an `ink` build dated April 9. We have flags for exactly this — set them.
+
+**Stop your test server when you're done with it.** The 2026-09-11 server had been orphaned since the previous evening: no terminal attached, zero clients on its port, still ticking. A test server is not free to leave running, and the cost does not show up in your own session.
+
+To test API or MCP changes without affecting the main server, run a **separate instance** on a different port using `INK_PORT_BASE`:
 
 ```bash
-# Isolated test server — disable services the main server already handles
-ENABLE_HEARTBEAT_SERVICE=false \
+# Isolated test server — disable services the main server already owns.
+# ENABLE_HEARTBEATS=false is not optional: without it this server races the
+# main one for every due reminder (see above).
+ENABLE_HEARTBEATS=false \
 ENABLE_TELEGRAM=false \
 ENABLE_WHATSAPP=false \
 ENABLE_DISCORD=false \
 ENABLE_GRAPH_SWEEP=false \
-PCP_PORT_BASE=4001 \
+INK_PORT_BASE=4001 \
 yarn dev
 
 # Point the CLI at your test server
 PCP_SERVER_URL=http://localhost:4001 ink mission
 ```
 
+**Use `INK_PORT_BASE`, not `PCP_PORT_BASE`.** The resolution is `INK_PORT_BASE || PCP_PORT_BASE` (`scripts/dev-concurrently.mjs`), and `INK_PORT_BASE=3001` is exported in the inherited shell environment on this machine — so an explicit `PCP_PORT_BASE=4001` is silently discarded and the "isolated" server starts on the main server's port.
+
 **Disable services you aren't testing.** Telegram, WhatsApp, Discord, the heartbeat service, and the workflow-graph sweep (`ENABLE_GRAPH_SWEEP`) should stay `false` on isolated servers — the main server already owns those connections and the sweep's dispatch (both servers share the DB, so two sweeps means duplicate inbox triggers). Only enable them if you're explicitly testing that functionality _and_ you've stopped it on the main server first (e.g., two Telegram listeners will conflict).
 
-Port derivation from `PCP_PORT_BASE`:
+**Heartbeats specifically.** Any of `ENABLE_HEARTBEATS`, `ENABLE_REMINDERS`, or `ENABLE_HEARTBEAT_SERVICE` set to a false-like value (`false`, `0`, `off`, `no`) disables reminder processing. A server started from a git worktree also auto-disables, and needs one of those set to `true` to opt back in.
 
-- **MCP/API**: `PCP_PORT_BASE` (e.g., 4001)
-- **Web**: `PCP_PORT_BASE + 1` (e.g., 4002)
-- **Myra**: `PCP_PORT_BASE + 2` (e.g., 4003)
+**Verify it rather than assume it.** The startup log line `Heartbeat service flags evaluated` reports `heartbeatServiceEnabled`, the `cwd` it resolved from, and `isWorktree` when it detected one. Both servers write to the same log file, so duplicate ticks read as one chatty process and the `cwd` field is what tells the two apart. If you want the direct check, `grep 'Heartbeat tick' ~/.ink/logs/combined.log | tail` — a timestamp appearing twice means two schedulers are live right now.
+
+Both disable paths failed silently until 2026-09-11, so it is worth knowing why. `ENABLE_HEARTBEAT_SERVICE` — the name this recipe used to give — was read by nothing; the only match in the tree was a line in `dev-concurrently.mjs` that printed it. The worktree auto-disable checked `.git` in `process.cwd()`, but the API server's cwd is `packages/api`, so it never detected a worktree either. The operator who started that server set the documented variable correctly and got a no-op, behind a guard that had never once fired. Both mechanisms work now, and the code honours `ENABLE_HEARTBEAT_SERVICE` as well as the two real names — so the older copies of this recipe still checked out in other worktrees now describe something that actually happens.
+
+Port derivation from `INK_PORT_BASE`:
+
+- **MCP/API**: `INK_PORT_BASE` (e.g., 4001)
+- **Web**: `INK_PORT_BASE + 1` (e.g., 4002)
+- **Myra**: `INK_PORT_BASE + 2` (e.g., 4003)
 
 Both servers share the same Supabase database, so data changes are visible to both. The main server stays untouched on 3001.
+
+## The Global `ink` CLI Link (IMPORTANT)
+
+`~/.ink/bin/ink` (compat alias: `~/.local/bin/ink`) is a symlink to **one** checkout's `packages/cli/dist/cli.js`. Every terminal hook, every server-spawned session, and every `ink wait` on this machine runs whatever that link points at. Which checkout it points at is the OB's decision, not yours.
+
+**NEVER re-point the global `ink` link without explicit permission in the current conversation.** All of these re-point it:
+
+- `yarn workspace @inklabs/cli install:cli` — links to the checkout you run it from
+- root `yarn build` — runs `install:cli` as its last step
+- `ln -s` or editing the symlink by hand
+
+A deploy, a merged CLI fix, a build that looks stale, or "the fix should reach terminals" is not permission. Ask, name the checkout you would point it at, and wait for a yes. Permission for one relink does not carry over to the next.
+
+**To test a CLI change, build it where it lives and call that build directly:**
+
+```bash
+# From your studio (create one with: ink studio create <name> --branch <branch> --agent <you>)
+yarn workspace @inklabs/cli build
+node ./packages/cli/dist/cli.js <subcommand>
+```
+
+The global link stays where it was. Your studio's build is for you to exercise, not for every other session on the machine to run.
+
+**The server never uses the global link.** For the hooks it writes and the chat loops it spawns, it resolves its own checkout's `packages/cli/dist/cli.js` (see `packages/api/src/services/ink-cli.ts`), runs it through node, and takes `INK_CLI_PATH` as an explicit override. A checkout with no CLI build falls back to `ink` on PATH with a one-time warning; build it with `yarn workspace @inklabs/cli build`. A new call site that reaches for `ink` without going through that resolver is a code problem, not a reason to relink: route it through `resolveInkCli` and open a PR.
 
 ## Supabase Project ID
 
@@ -535,11 +584,6 @@ The MCP server exposes 60+ tools. Key categories:
 - `get_memory_history` - View all versions of a memory
 - `get_user_history` - See recent changes (updates/deletes)
 - `restore_memory` - Rollback to a previous version
-
-### Context
-
-- `save_context` - Save context summaries (user, assistant, relationship, project)
-- `get_context` - Retrieve context
 
 ### Projects
 
@@ -644,6 +688,7 @@ Optional:
 - `SENTRY_DSN` - Error tracking (optional)
 - `SERVER_COMPACTION_ENABLED` - `true` to let the server rotate claude-code sessions at the compaction threshold (default `false`: Claude Code auto-compacts natively via `--autocompact`)
 - `COMPACTION_THRESHOLD` - context-token threshold for the server-side trigger when enabled (default 150000)
+- `INK_CLI_PATH` - absolute path of the ink CLI the server invokes for hooks and chat loops. Default: this checkout's `packages/cli/dist/cli.js`, run through node. The server never uses the global `~/.ink/bin/ink` link.
 
 ## Testing
 
@@ -744,7 +789,57 @@ Defined in [CONTRIBUTING.md](./CONTRIBUTING.md). Key SB-specific reminders:
 - **ALL PRs require a sibling review before merge.** No exceptions unless Conor explicitly says otherwise. Do not merge your own PR without at least one other SB's LGTM. This is a hard rule — merging without review has caused bugs that could have been caught. Use `ink wait --thread pr:<number>` to hold for the review.
 - **Verify CI passes before merging.** Check `gh run list --branch <branch>` for the CI status. If tests fail, fix them before merging — don't merge red. When fixing CI, run the full test suite locally (`npx vitest run`) to catch issues before pushing.
 - **Simple PR wait helper**: for short review loops, use `yarn pr:wait-reply <prNumber> --timeout 120 --interval 10` instead of manual `sleep`, then re-check review status via MCP GitHub tools.
-- **Commit messages**: pass multi-line messages directly to `-m "..."` — bash handles literal newlines in double-quoted strings. Do not use `$(cat <<'EOF' ... EOF)` or other command substitution patterns; they add complexity for no benefit.
+
+### Commit messages, secrets, and what gets pushed (IRONCLAD)
+
+These rules exist because on 2026-09-13 a commit message pasted 151 shell variables, including live credentials, into a public repository, and because two commits in February 2026 did the same on `main` and sat there for seven months. They apply to every SB and every OB, in every repo, with no exceptions and no "quick one".
+
+1. **Nothing in a commit message is ever evaluated by the shell.** Backticks, `$(...)` and `$VAR` are fine as literal text in a message written through a quoted heredoc (`<<'EOF'`) or the `Write` tool. They are forbidden anywhere the shell would expand them: an `-m` string, an unquoted heredoc, a double-quoted `echo` or `printf` argument. A commit message is literal text you wrote, and only that.
+2. **If you need a value in the message, get it first, look at it, then paste the literal.** Run the command on its own, read its output, and type what you want into the message file by hand. There is no situation where a variable expanding inside a commit message is the right shortcut.
+3. **Write the message to a file and commit with `git commit -F <file>`.** Create the file with a quoted heredoc or the `Write` tool. Never `-m`, not even for a one-line subject. The mechanism and the runnable example are in the reference below.
+4. **Stage by naming paths, and look at what you staged.** `git add <path> [<path>...]` or a directory you have just inspected, then `git diff --cached` before committing. Never `git add -A`, never `git add .`, never `git commit -a` or `-am`. `.` and `-A` sweep in untracked files you never looked at, which is how env files, identity files, and scratch output end up in a commit; `-a` and `-am` commit every modified tracked file and skip the staged-diff review.
+5. **Read every commit message back before you push. All of them, every time, through the guard.** Run `sh scripts/check-push.sh --preview`: it replays `origin/main..HEAD` the way the pre-push hook will, scanning each message first and printing it only if it passes, oldest first, and withholding any that fail with a value-free report. Read the output top to bottom. Do not use a raw `git log` for this from a session whose output is captured: an unscanned message carrying a secret would be written straight into the transcript. "Nobody reads commit messages" is wrong: you do, right before `git push`, because the push is the point of no return. A message you have not read back is a message you have not finished writing.
+6. **The hooks are a backstop, not the safety.** The `commit-msg` guard, the staged-file guard, and the pre-push replay catch the shapes that have already burned us. Passing them means nothing matched. Rules 1 through 5 are what prevent the leak.
+7. **Anything secret-shaped in a commit is an incident before it is anything else.** Do not push. If it was already pushed, do not clean it up quietly: tell Conor, rotate, and follow the purge procedure. A pushed commit is public the moment it lands, and GitHub keeps it reachable by SHA after the branch is gone.
+
+In no scenario do we play fast and loose with secrets or with any path that could carry one. A value that might be a secret is treated as one until measured otherwise.
+
+#### Reference: why `-F`, how the file gets written, and what the hook does
+
+**Commit messages: write the message to a file and use `git commit -F <file>`. Never `-m`, not even for a one-line subject.** A double-quoted `-m` string is shell input, so a backtick or `$(...)` anywhere in it is **executed** and its output pasted into the commit. Markdown backticks around an identifier — ``a `local` flag`` — are the normal way we write, which makes this a trap rather than an edge case: it hit Lumen twice in February 2026 and Wren on 2026-09-13, and the 2026-09-13 commit pasted ten nonempty credential-bearing assignments into a public repository. The diff stays clean, so review cannot catch it.
+
+A subject line is **not** the safe exception it looks like. Backticks in a subject are substituted exactly as they are in a body:
+
+```bash
+git commit -m "fix: honour the `pwd` flag"   # git receives: fix: honour the /Users/you/ws/pcp flag
+```
+
+That example substitutes `pwd`, not the builtin that caused the incident — the snippet is runnable, and the real one would dump your environment into a commit. Same mechanism, harmless payload.
+
+Single-quoting is not the fix either: an apostrophe in a word like `don't` closes the string, and the remainder of your message is re-parsed as shell.
+
+**How you write the file matters as much as `-F` does.** `-F` reads bytes and never expands them, but the shell still expands whatever you use to _create_ the file:
+
+```bash
+cat > msg <<'EOF'     # SAFE — quoted delimiter, every byte literal
+cat > msg <<EOF       # UNSAFE — backticks and $VAR expand as the file is written
+```
+
+Quote the heredoc delimiter, or write the file with a tool that never goes through a shell (in Claude Code, the `Write` tool). Then `git commit -F msg`.
+
+The `commit-msg` hook (`scripts/check-commit-msg.sh`, wired via `.husky/`) refuses a message that carries credentials before it becomes a commit — it is the only hook that sees the finished message, whichever way the credentials got in. If it blocks you, nothing was committed and your staged changes are intact; do not recycle the draft message it points at without reading it first, because on a real substitution that draft is where the leaked values are.
+
+**A non-empty `core.hooksPath` does not mean the guard is on.** The hook runs from whichever checkout that path points at, which on a machine with worktrees is one shared directory serving all of them. If that checkout does not carry `.husky/commit-msg`, nothing is checked and nothing says so. To confirm: `ls "$(git config core.hooksPath)"/commit-msg`.
+
+**Treat the hook as a backstop, not a licence.** It matches the shapes we have actually been burned by — known secret variable names, a few vendor token formats, a run of assignment lines that looks like a dumped environment. A secret in a shape it does not model passes, and `--no-verify` skips it entirely. Passing it means "nothing matched", never "no credentials here". Writing the message to a file and using `-F` is the thing that actually prevents the leak.
+
+It has one false positive you will meet, and it is deliberate: **any** assignment to a name it knows — `JWT_SECRET=`, `GITHUB_TOKEN=` — is refused, including `=<placeholder>`, `=***` and a bare `=` with nothing after it. Exempting those meant exempting real credentials that happen to start with the same byte, so prose names the variable without assigning to it: "the `JWT_SECRET` value", not `JWT_SECRET=<value>`. Full rationale in [CONTRIBUTING.md](./CONTRIBUTING.md#writing-the-message-use--f-never--m).
+
+## Issues Live in Inkwell, Not GitHub
+
+**SBs file issues as Inkwell tasks, never as GitHub issues.** Use `create_task`, or a task group for anything with more than one piece, with the same specificity you would put in a GitHub issue: what happened, how to reproduce it, what you expected, and where in the code. Link the task from the PR or thread that addresses it.
+
+GitHub issues are an **external feed**: the place for people outside the repo to report problems, and the place we track what they report. All SBs share one GitHub account, so an SB-authored GitHub issue is indistinguishable from Conor filing it, and it puts internal triage on a surface the team does not work from. When an external issue arrives, create the Inkwell task that tracks it, put the GitHub issue number in the task, and reply on GitHub when it is resolved.
 
 ## Architecture Notes
 

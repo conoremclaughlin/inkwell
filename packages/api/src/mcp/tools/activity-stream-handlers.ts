@@ -23,7 +23,7 @@ import type {
 const userIdentifierFields = {
   userId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('User UUID — usually unnecessary, auto-resolved from OAuth token'),
   email: z
@@ -68,21 +68,21 @@ export const logActivitySchema = z.object({
   agentId: z.string().describe('Agent identifier (e.g., "wren", "myra", "benson")'),
   type: activityTypeSchema.describe('Type of activity'),
   content: z.string().describe('Human-readable content/description of the activity'),
-  sessionId: z.string().uuid().optional().describe('Session ID if within a session'),
+  sessionId: z.string().guid().optional().describe('Session ID if within a session'),
   subtype: z.string().optional().describe('Optional subtype (e.g., tool name for tool_call)'),
   payload: z
-    .record(z.unknown())
+    .record(z.string(), z.unknown())
     .optional()
     .describe('Structured data specific to the activity type'),
   contactId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('Contact ID if activity involves another person'),
-  parentId: z.string().uuid().optional().describe('Parent activity ID for hierarchical tracking'),
+  parentId: z.string().guid().optional().describe('Parent activity ID for hierarchical tracking'),
   correlationId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('Correlation ID for grouping related activities'),
   platform: z
@@ -95,8 +95,8 @@ export const logActivitySchema = z.object({
     .describe('Platform-specific message ID for deduplication'),
   platformChatId: z.string().optional().describe('Platform-specific chat/conversation ID'),
   isDm: z.boolean().optional().describe('Whether this is a direct message (default: true)'),
-  artifactId: z.string().uuid().optional().describe('Associated artifact ID'),
-  childSessionId: z.string().uuid().optional().describe('Child session ID for agent_spawn'),
+  artifactId: z.string().guid().optional().describe('Associated artifact ID'),
+  childSessionId: z.string().guid().optional().describe('Child session ID for agent_spawn'),
   status: activityStatusSchema.optional().describe('Activity status (default: completed)'),
 });
 
@@ -105,28 +105,28 @@ export const logMessageSchema = z.object({
   agentId: z.string().describe('Agent identifier'),
   direction: z.enum(['in', 'out']).describe('Message direction: "in" for received, "out" for sent'),
   content: z.string().describe('Message content'),
-  sessionId: z.string().uuid().optional().describe('Session ID'),
-  contactId: z.string().uuid().optional().describe('Contact ID of the other party'),
+  sessionId: z.string().guid().optional().describe('Session ID'),
+  contactId: z.string().guid().optional().describe('Contact ID of the other party'),
   platform: z.string().optional().describe('Activity platform (telegram, discord, etc.)'),
   platformMessageId: z.string().optional().describe('Platform message ID'),
   platformChatId: z.string().optional().describe('Platform chat ID'),
   isDm: z.boolean().optional().describe('Is direct message (default: true)'),
-  payload: z.record(z.unknown()).optional().describe('Additional message metadata'),
+  payload: z.record(z.string(), z.unknown()).optional().describe('Additional message metadata'),
 });
 
 export const getActivitySchema = z.object({
   ...userIdentifierFields,
-  sessionId: z.string().uuid().optional().describe('Filter by session'),
+  sessionId: z.string().guid().optional().describe('Filter by session'),
   agentId: z.string().optional().describe('Filter by agent'),
   types: z.array(activityTypeSchema).optional().describe('Filter by activity types'),
-  contactId: z.string().uuid().optional().describe('Filter by contact'),
+  contactId: z.string().guid().optional().describe('Filter by contact'),
   platform: z.string().optional().describe('Filter by activity platform'),
   platformChatId: z.string().optional().describe('Filter by platform chat'),
-  correlationId: z.string().uuid().optional().describe('Filter by correlation ID'),
-  parentId: z.string().uuid().optional().describe('Filter by parent activity'),
+  correlationId: z.string().guid().optional().describe('Filter by correlation ID'),
+  parentId: z.string().guid().optional().describe('Filter by parent activity'),
   taskGroupId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('Filter by task group — returns the full timeline for a mission'),
   since: isoDateTime().optional().describe('Activities after this time (ISO 8601)'),
@@ -137,7 +137,7 @@ export const getActivitySchema = z.object({
 
 export const getConversationHistorySchema = z.object({
   ...userIdentifierFields,
-  contactId: z.string().uuid().optional().describe('Filter by contact'),
+  contactId: z.string().guid().optional().describe('Filter by contact'),
   platform: z.string().optional().describe('Filter by activity platform'),
   platformChatId: z.string().optional().describe('Filter by platform chat'),
   isDm: z.boolean().optional().describe('Filter by DM status'),
@@ -149,8 +149,8 @@ export const getConversationHistorySchema = z.object({
 
 export const getSessionContextSchema = z.object({
   ...userIdentifierFields,
-  sessionId: z.string().uuid().optional().describe('Session to get context for'),
-  contactId: z.string().uuid().optional().describe('Contact for conversation context'),
+  sessionId: z.string().guid().optional().describe('Session to get context for'),
+  contactId: z.string().guid().optional().describe('Contact for conversation context'),
   platform: z.string().optional().describe('Activity platform for chat context'),
   platformChatId: z.string().optional().describe('Platform chat for context'),
   limit: z.number().min(1).max(50).optional().describe('Max activities (default: 20)'),

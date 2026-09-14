@@ -15,7 +15,6 @@
  */
 
 import { z } from 'zod';
-import { zodToJsonSchema } from 'zod-to-json-schema';
 
 type McpResponse = {
   content: Array<{ type: 'text'; text: string }>;
@@ -120,7 +119,9 @@ function toParameterSchema(inputSchema: unknown): unknown {
     inputSchema instanceof z.ZodObject ? inputSchema : z.object(inputSchema as z.ZodRawShape);
 
   try {
-    return zodToJsonSchema(asObject, { $refStrategy: 'none' });
+    // Same conversion the v2 SDK performs for tools/list (draft 2020-12, the
+    // INPUT side of the schema), so describe_tool never disagrees with it.
+    return z.toJSONSchema(asObject, { target: 'draft-2020-12', io: 'input' });
   } catch {
     // Never let introspection be the thing that breaks a call.
     return { type: 'object', properties: {}, note: 'schema could not be serialized' };

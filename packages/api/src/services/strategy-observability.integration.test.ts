@@ -203,9 +203,10 @@ describe.skipIf(!canRun)('Watchdog wakeup/skip observability (integration)', () 
     // Pause the strategy
     await service.pauseStrategy(groupId, TEST_USER_ID!);
 
-    // Trigger watchdog on paused group — should log wakeup + skip
+    // Trigger watchdog on paused group — should log wakeup + skip.
+    // 'skipped' rather than 'failed': a paused group is not an outage.
     const result = await service.triggerWatchdog(groupId);
-    expect(result).toBe(false);
+    expect(result.outcome).toBe('skipped');
 
     const events = await getActivityEvents(client, groupId);
     const skips = events.filter((e) => e.subtype === 'watchdog_skip');
@@ -233,7 +234,7 @@ describe.skipIf(!canRun)('Watchdog wakeup/skip observability (integration)', () 
     });
 
     const result = await service.triggerWatchdog(groupId);
-    expect(result).toBe(false);
+    expect(result.outcome).toBe('skipped');
 
     const events = await getActivityEvents(client, groupId);
     const noTaskSkips = events.filter(

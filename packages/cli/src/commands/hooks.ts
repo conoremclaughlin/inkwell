@@ -84,13 +84,6 @@ interface HookCapabilities {
   };
   supportsCompaction: boolean;
   supportsPromptHook: boolean;
-  /**
-   * The backend's prompt hook can BLOCK the prompt via a non-zero exit
-   * (claude-code's UserPromptSubmit). Backends without this proceed after a
-   * failed turn takeover and rely on the background re-claim to shrink the
-   * stale-epoch window (PR #563 rounds 6–7).
-   */
-  blocksOnFailedTakeover: boolean;
 }
 
 const CLAUDE_CODE: HookCapabilities = {
@@ -106,7 +99,6 @@ const CLAUDE_CODE: HookCapabilities = {
   },
   supportsCompaction: true,
   supportsPromptHook: true,
-  blocksOnFailedTakeover: true,
 };
 
 const CODEX: HookCapabilities = {
@@ -122,7 +114,6 @@ const CODEX: HookCapabilities = {
   },
   supportsCompaction: false,
   supportsPromptHook: true,
-  blocksOnFailedTakeover: false,
 };
 
 const GEMINI: HookCapabilities = {
@@ -142,7 +133,6 @@ const GEMINI: HookCapabilities = {
   },
   supportsCompaction: false,
   supportsPromptHook: true,
-  blocksOnFailedTakeover: false,
 };
 
 interface PcpConfig {
@@ -750,7 +740,31 @@ async function reconcileBackendSignal(
   };
 }
 
-async function updateRuntimeGenerationState(
+/**
+ * Why a prompt's turn takeover failed. Named explicitly (PR #590) because
+ * the honest warning differs: a lost lease means another session may own
+ * this checkout; an unavailable server means nothing is known either way.
+ * `!leaseLost` alone was never proof of transience — a 409 is authoritative.
+ */
+export type TakeoverFailureReason =
+  /** No usable answer after three attempts: network error, timeout, or an unclassified non-2xx. */
+  | 'unavailable'
+  /** HTTP 409 — the server recorded this turn as already stopped. Refused for good. */
+  | 'refused'
+  /** HTTP 403 — the session or studio belongs to another user or tenant. Permanent. */
+  | 'forbidden'
+  /** 2xx with studioLeaseHeld:false — another holder, a closed thread, or a retired studio. */
+  | 'lease-not-held';
+
+export interface TakeoverResult {
+  ok: boolean;
+  turnEpoch?: string;
+  /** The server answered and reported the studio lease is NOT held. */
+  leaseLost?: boolean;
+  reason?: TakeoverFailureReason;
+}
+
+export async function updateRuntimeGenerationState(
   cwd: string,
   _config: PcpConfig | null,
   agentId: string,
@@ -795,7 +809,7 @@ async function updateRuntimeGenerationState(
      */
     studioId?: string;
   }
-): Promise<{ ok: boolean; turnEpoch?: string; leaseLost?: boolean }> {
+): Promise<TakeoverResult> {
   const sessionId = resolveActivePcpSessionId(cwd);
   if (!sessionId) return { ok: true }; // nothing to take over — vacuously fine
 
@@ -803,9 +817,9 @@ async function updateRuntimeGenerationState(
   // server (claim + lifecycle + marker in one statement), so a swallowed
   // failure is no longer just an invisible marker — an interactive prompt
   // that proceeds unclaimed runs under a stale epoch that an old turn's
-  // fenced finalize can still clobber. The claude-code on-prompt hook
-  // therefore BLOCKS the prompt when this returns false (task 0b9bb780);
-  // backends whose hooks cannot block still proceed, loudly.
+  // fenced finalize can still clobber. No prompt hook refuses the prompt
+  // when this returns false (PR #590): the caller names the reason to the
+  // SB, writes the marker, and lets the human decide.
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       const serverUrl = getPcpServerUrl();
@@ -833,13 +847,13 @@ async function updateRuntimeGenerationState(
       });
       if (resp.status === 409) {
         // A refused reclaim is authoritative — the turn is over. No retry.
-        return { ok: false };
+        return { ok: false, reason: 'refused' };
       }
       if (resp.status === 403) {
         // Round 24: a cross-tenant/foreign refusal is as PERMANENT as a
         // lost lease — enforce, never fold into generic failure or retry.
         sbDebugLog('hooks', 'lifecycle_forbidden', { sessionId, lifecycle, attempt });
-        return { ok: false, leaseLost: true };
+        return { ok: false, leaseLost: true, reason: 'forbidden' };
       }
       if (resp.ok) {
         // Round 10: a claimed prompt's response carries the fresh epoch —
@@ -856,8 +870,8 @@ async function updateRuntimeGenerationState(
         if (body?.studioLeaseHeld === false) {
           sbDebugLog('hooks', 'lifecycle_lease_not_held', { sessionId, lifecycle, attempt });
           // Round 23: a lost lease is a distinct verdict — the caller must
-          // ENFORCE it (non-zero exit), not fold it into generic failure.
-          return { ok: false, leaseLost: true };
+          // NAME it (it is not transience), not fold it into generic failure.
+          return { ok: false, leaseLost: true, reason: 'lease-not-held' };
         }
         return {
           ok: true,
@@ -885,7 +899,7 @@ async function updateRuntimeGenerationState(
       await new Promise((r) => setTimeout(r, 250));
     }
   }
-  return { ok: false };
+  return { ok: false, reason: 'unavailable' };
 }
 
 /**
@@ -904,51 +918,102 @@ export function pendingTakeoverMarkerPath(cwd: string, generation?: string): str
   );
 }
 
+const TAKEOVER_FAILURE_CAUSES: Record<
+  TakeoverFailureReason,
+  { cause: string; leaseKnownLost: boolean }
+> = {
+  unavailable: {
+    cause: 'the Inkwell server could not be reached or returned an error',
+    leaseKnownLost: false,
+  },
+  refused: {
+    cause: 'the server refused the claim because it recorded this turn as already stopped',
+    leaseKnownLost: false,
+  },
+  forbidden: {
+    cause:
+      'the server refused this session (the session or studio belongs to another user or tenant)',
+    leaseKnownLost: true,
+  },
+  'lease-not-held': {
+    cause:
+      "this studio's lease is held by another session or was revoked (thread closed or studio retired)",
+    leaseKnownLost: true,
+  },
+};
+
 /**
- * What happens when an INTERACTIVE prompt's turn takeover fails (task
- * 0b9bb780, pulled into PR #563; capability-gated in round 7 after the name
- * comparison bug — 'claude' vs 'claude-code' — made the blocking branch
- * unreachable and only a behavioural test would have caught it).
+ * Prompt-hook policy for a failed turn takeover (PR #590, Conor's decision
+ * on 2026-09-10): the prompt is NEVER refused. With many studios per user,
+ * "lease held elsewhere" is routine, and refusing the prompt froze attached
+ * humans out of their own terminals. What the SB gets instead is an honest
+ * warning: it does not hold (or cannot confirm) the studio lease, nothing
+ * fences its edits against another session that may own the checkout, and
+ * it must clarify ownership with the user before changing files. The human
+ * decides; the hook does not. The per-backend `blocksOnFailedTakeover` knob
+ * is gone with the policy — no shipped backend ever set it, and a knob that
+ * is always off misdescribes what the code does.
  *
- * Blocking backends: the prompt is refused outright — running would execute
- * this turn under a STALE epoch that an old server turn's fenced finalize
- * can still clobber.
+ * Recovery is a durable MARKER file, because this hook process is
+ * short-lived and an in-process timer dies with it (round 8). A long-lived
+ * `ink` wrapper watches the marker and converts it into a claim
+ * (takeover-watcher.ts). WITHOUT a wrapper — plain `claude` with installed
+ * hooks — nothing consumes the marker mid-turn; the on-stop hook adjudicates
+ * it once at the boundary. The warning says which of the two applies rather
+ * than promising a retry that will not happen.
  *
- * Non-blocking backends: the prompt cannot be stopped, and this hook process
- * is SHORT-LIVED — an in-process retry timer dies with it (round 8). So the
- * recovery is a durable MARKER file that the session's long-lived `ink`
- * wrapper watches and converts into a claim (takeover-watcher.ts); the
- * on-stop hook adjudicates any marker still standing at the boundary, which
- * scopes the recovery to this prompt generation.
+ * The SB is told on STDOUT — a prompt hook's stdout is injected into the
+ * model's context; stderr reaches only a human at the terminal.
  *
  * Injectable for tests; onPromptHandler passes the real implementations.
  */
 export function handleFailedTakeover(
-  backend: Pick<HookCapabilities, 'name' | 'blocksOnFailedTakeover'>,
+  backend: Pick<HookCapabilities, 'name'>,
   opts: {
     agentId: string;
     writePendingTakeover: () => void;
-    exit?: (code: number) => never;
+    /** Why the takeover failed; absent when the caller could not classify it. */
+    reason?: TakeoverFailureReason;
+    /**
+     * The `ink` wrapper generation that spawned this backend
+     * (INK_RUNTIME_LINK_ID). Present means a watcher retries the claim in
+     * the background; absent means nothing retries until the turn ends.
+     */
+    wrapperGeneration?: string;
   }
 ): void {
-  const exit = opts.exit ?? ((code: number) => process.exit(code));
-  if (backend.blocksOnFailedTakeover) {
-    hookLog('on_prompt_takeover_failed_blocking', { agentId: opts.agentId });
-    process.stderr.write(
-      'Inkwell turn takeover failed (server unreachable or claim refused). ' +
-        'Prompt blocked to protect session state — retry in a moment.\n'
-    );
-    exit(2);
-    return;
-  }
-
-  hookLog('on_prompt_takeover_failed_nonblocking', {
+  const reason = opts.reason ?? 'unavailable';
+  const wrapped = Boolean(opts.wrapperGeneration);
+  hookLog('on_prompt_takeover_failed', {
     agentId: opts.agentId,
     backend: backend.name,
+    reason,
+    wrapped,
   });
+
+  const { cause, leaseKnownLost } = TAKEOVER_FAILURE_CAUSES[reason];
+  const possession = leaseKnownLost
+    ? 'This session does NOT hold the studio lease for this checkout.'
+    : 'Inkwell could not confirm that this session holds the studio lease for this checkout.';
+  const recovery = wrapped
+    ? 'The ink wrapper is retrying the claim in the background; this warning stops once the lease is reclaimed.'
+    : 'No background retry runs for this launch (no ink wrapper is attached); the claim is retried once when this turn ends.';
+
   process.stderr.write(
-    'Warning: Inkwell turn takeover failed; this turn starts under a stale epoch. ' +
-      'A pending-takeover marker was written for the ink wrapper to reclaim.\n'
+    `Warning: Inkwell turn takeover failed (${cause}). ${possession} ` +
+      `The prompt runs anyway; edits here are not fenced against another session. ${recovery}\n`
+  );
+  process.stdout.write(
+    '\n<ink-warning>\n' +
+      `Inkwell could not take over this turn: ${cause}.\n` +
+      `${possession} The prompt is running anyway (Inkwell never refuses a prompt over a lease), ` +
+      'but nothing fences your edits against another session that may own this worktree, and turn ' +
+      'state may not be attributed to this session.\n' +
+      'Before changing files or running commands that touch this checkout, tell the user and confirm ' +
+      'that this session should take over the studio. Do not force leases, reset credentials, or ' +
+      'restart the server.\n' +
+      `${recovery}\n` +
+      '</ink-warning>\n'
   );
   try {
     opts.writePendingTakeover();
@@ -1269,13 +1334,6 @@ const CODEX_HOOKS_END_MARKER = '# ink-managed:hooks:end';
 // Back-compat with earlier Codex hook marker format.
 const CODEX_LEGACY_HOOKS_START_MARKER = '# ink-managed';
 const CODEX_LEGACY_HOOKS_END_MARKER = '# end ink-managed';
-const PCP_HOOK_SIGNATURES = [
-  'hooks on-session-start',
-  'hooks on-stop',
-  'hooks on-prompt',
-  'hooks pre-compact',
-  'hooks post-compact',
-];
 
 function shellQuote(value: string): string {
   if (/^[A-Za-z0-9_./:@%+=,-]+$/.test(value)) return value;
@@ -1320,12 +1378,91 @@ function resolveSbBinaryPath(cwd: string): string {
   return 'ink';
 }
 
-/** Check if a hook command is Inkwell-managed (handles both bare `ink` and absolute paths) */
-function isPcpHookCommand(cmd: string | undefined): boolean {
+/**
+ * Split a shell command line into words, honoring single quotes, double
+ * quotes, backslash escapes, and a trailing comment. Enough to find the launcher and the hook
+ * name in a managed hook line, whichever writer produced it: this CLI
+ * (`'/nvm/bin/node' '/x/cli.js' hooks on-prompt ...`) or the server's studio
+ * settings generator (`node "/x y/cli.js" hooks on-prompt ...`).
+ */
+function splitShellWords(line: string): string[] {
+  const words: string[] = [];
+  let current = '';
+  let inWord = false;
+  let quote: '"' | "'" | null = null;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (quote === "'") {
+      if (ch === "'") quote = null;
+      else current += ch;
+      continue;
+    }
+    if (quote === '"') {
+      if (ch === '"') quote = null;
+      else if (ch === '\\' && i + 1 < line.length && '"\\$`'.includes(line[i + 1]))
+        current += line[++i];
+      else current += ch;
+      continue;
+    }
+    if (ch === '#' && !inWord) break; // unquoted # at a word start: the rest is a comment
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      inWord = true;
+      continue;
+    }
+    if (ch === '\\' && i + 1 < line.length) {
+      current += line[++i];
+      inWord = true;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (inWord) {
+        words.push(current);
+        current = '';
+        inWord = false;
+      }
+      continue;
+    }
+    current += ch;
+    inWord = true;
+  }
+  if (inWord) words.push(current);
+  return words;
+}
+
+/**
+ * Trailing shell comment that marks a hook line as Inkwell-managed. Hook
+ * commands run through a shell, so the comment is invisible to the CLI. The
+ * server's studio settings generator writes the same marker
+ * (packages/api/src/services/studio-settings.ts); the cross-package install
+ * test pins the two copies to each other.
+ */
+const MANAGED_HOOK_MARKER = '# ink-managed';
+const MANAGED_HOOK_MARKER_RE = /\s#\s?ink-managed\s*$/;
+
+/**
+ * Whether a hook command is Inkwell-managed. The line must have the managed
+ * grammar — a launcher, then `hooks`, then a hook name — and then either:
+ *
+ *   - the launcher is a known ink entrypoint by shape (bare `ink`, a path to
+ *     it, or the CLI's own cli.js), which is what `ink hooks install` writes
+ *     and what older servers wrote; or
+ *   - the line ends with the managed marker, which the server writes for
+ *     every hook because its launcher may be an arbitrary INK_CLI_PATH.
+ *
+ * No hook-name list: a hook either writer adds later must not read as a
+ * conflict. No generic launcher rule: an unrelated CLI that happens to be
+ * called cli.js, or to have a `hooks` subcommand, is someone else's and must
+ * survive an install untouched.
+ */
+export function isPcpHookCommand(cmd: string | undefined): boolean {
   if (!cmd) return false;
-  return (
-    /\bink hooks\b/.test(cmd) || PCP_HOOK_SIGNATURES.some((signature) => cmd.includes(signature))
-  );
+  const words = splitShellWords(cmd);
+  const at = words.indexOf('hooks');
+  if (at < 1) return false;
+  const hookName = words[at + 1];
+  if (!hookName || !/^[a-z][a-z0-9-]*$/.test(hookName)) return false;
+  return MANAGED_HOOK_MARKER_RE.test(cmd) || looksLikeSbEntrypoint(words[at - 1]);
 }
 
 type InstallResult = 'installed' | 'already-installed' | 'conflict';
@@ -1343,6 +1480,11 @@ function buildManagedHookCommand(sbPath: string, hookName: string, backendName: 
   return `${sbPath} hooks ${hookName} --backend ${backendName}`;
 }
 
+/** Claude Code hook line: the managed command plus the marker the recognizer keys on. */
+function buildClaudeCodeHookCommand(sbPath: string, hookName: string): string {
+  return `${buildManagedHookCommand(sbPath, hookName, CLAUDE_CODE.name)} ${MANAGED_HOOK_MARKER}`;
+}
+
 function formatHookHint(backendName: string, hookName: string): string {
   return `ink hooks ${hookName} --backend ${backendName}`;
 }
@@ -1355,7 +1497,7 @@ function buildClaudeCodeHooks(sbPath: string): Record<string, unknown> {
           hooks: [
             {
               type: 'command',
-              command: buildManagedHookCommand(sbPath, 'pre-compact', CLAUDE_CODE.name),
+              command: buildClaudeCodeHookCommand(sbPath, 'pre-compact'),
             },
           ],
         },
@@ -1366,7 +1508,7 @@ function buildClaudeCodeHooks(sbPath: string): Record<string, unknown> {
           hooks: [
             {
               type: 'command',
-              command: buildManagedHookCommand(sbPath, 'post-compact', CLAUDE_CODE.name),
+              command: buildClaudeCodeHookCommand(sbPath, 'post-compact'),
             },
           ],
         },
@@ -1375,7 +1517,7 @@ function buildClaudeCodeHooks(sbPath: string): Record<string, unknown> {
           hooks: [
             {
               type: 'command',
-              command: buildManagedHookCommand(sbPath, 'on-session-start', CLAUDE_CODE.name),
+              command: buildClaudeCodeHookCommand(sbPath, 'on-session-start'),
             },
           ],
         },
@@ -1385,7 +1527,7 @@ function buildClaudeCodeHooks(sbPath: string): Record<string, unknown> {
           hooks: [
             {
               type: 'command',
-              command: buildManagedHookCommand(sbPath, 'on-tool-approval', CLAUDE_CODE.name),
+              command: buildClaudeCodeHookCommand(sbPath, 'on-tool-approval'),
             },
           ],
         },
@@ -1395,7 +1537,7 @@ function buildClaudeCodeHooks(sbPath: string): Record<string, unknown> {
           hooks: [
             {
               type: 'command',
-              command: buildManagedHookCommand(sbPath, 'on-prompt', CLAUDE_CODE.name),
+              command: buildClaudeCodeHookCommand(sbPath, 'on-prompt'),
             },
           ],
         },
@@ -1405,7 +1547,7 @@ function buildClaudeCodeHooks(sbPath: string): Record<string, unknown> {
           hooks: [
             {
               type: 'command',
-              command: buildManagedHookCommand(sbPath, 'on-stop', CLAUDE_CODE.name),
+              command: buildClaudeCodeHookCommand(sbPath, 'on-stop'),
             },
           ],
         },
@@ -2611,6 +2753,8 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
   if (!takeoverOk && !isHeadlessSpawn) {
     handleFailedTakeover(lifecycleBackend, {
       agentId,
+      reason: takeover.reason,
+      wrapperGeneration: process.env.INK_RUNTIME_LINK_ID || undefined,
       writePendingTakeover: () => {
         const markerPath = pendingTakeoverMarkerPath(cwd, process.env.INK_RUNTIME_LINK_ID);
         mkdirSync(dirname(markerPath), { recursive: true });

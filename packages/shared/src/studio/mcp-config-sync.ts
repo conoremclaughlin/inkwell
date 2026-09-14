@@ -12,7 +12,7 @@
  * while Claude sessions there simply had no MCP tools at all.
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, lstatSync } from 'fs';
 import { join } from 'path';
 
 export interface McpServerConfig {
@@ -380,6 +380,20 @@ function ensureGitignoreEntries(repoRoot: string, entries: string[]): string[] {
 /**
  * Core sync logic: read .mcp.json from targetDir and write .codex/ and .gemini/ configs.
  */
+/**
+ * True when the path is a symlink (dangling or not). Generated config is
+ * never written through a link: a checkout can ship `.codex`, `.gemini`, or
+ * the final file as a link to anywhere, and the write would land outside the
+ * studio (Lumen, PR #604 round 2).
+ */
+function isSymlink(p: string): boolean {
+  try {
+    return lstatSync(p).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
 export function syncMcpConfig(
   targetDir: string,
   options?: { sourceMcpPath?: string; sourceEnvPath?: string }
@@ -410,30 +424,40 @@ export function syncMcpConfig(
   // --- Codex: .codex/config.toml ---
   const codexDir = join(targetDir, '.codex');
   const codexPath = join(codexDir, 'config.toml');
-  mkdirSync(codexDir, { recursive: true });
-  const existingCodex = existsSync(codexPath) ? readFileSync(codexPath, 'utf-8') : undefined;
-  const managedBlock = renderCodexManagedBlock(servers);
-  writeFileSync(codexPath, mergeCodexConfig(existingCodex, managedBlock));
+  let codex = false;
+  if (!isSymlink(codexDir) && !isSymlink(codexPath)) {
+    mkdirSync(codexDir, { recursive: true });
+    const existingCodex = existsSync(codexPath) ? readFileSync(codexPath, 'utf-8') : undefined;
+    const managedBlock = renderCodexManagedBlock(servers);
+    writeFileSync(codexPath, mergeCodexConfig(existingCodex, managedBlock));
+    codex = true;
+  }
 
   // --- Gemini: .gemini/settings.json ---
   const geminiDir = join(targetDir, '.gemini');
   const geminiPath = join(geminiDir, 'settings.json');
-  mkdirSync(geminiDir, { recursive: true });
+  let gemini = false;
+  if (!isSymlink(geminiDir) && !isSymlink(geminiPath)) {
+    mkdirSync(geminiDir, { recursive: true });
 
-  let existingGemini: Record<string, unknown> | undefined;
-  if (existsSync(geminiPath)) {
-    try {
-      existingGemini = JSON.parse(readFileSync(geminiPath, 'utf-8'));
-    } catch {
-      /* overwrite if unparseable */
+    let existingGemini: Record<string, unknown> | undefined;
+    if (existsSync(geminiPath)) {
+      try {
+        existingGemini = JSON.parse(readFileSync(geminiPath, 'utf-8'));
+      } catch {
+        /* overwrite if unparseable */
+      }
     }
+
+    const geminiSettings = toGeminiSettings(servers, existingGemini);
+    writeFileSync(geminiPath, JSON.stringify(geminiSettings, null, 2) + '\n');
+    gemini = true;
   }
 
-  const geminiSettings = toGeminiSettings(servers, existingGemini);
-  writeFileSync(geminiPath, JSON.stringify(geminiSettings, null, 2) + '\n');
+  // --- Gitignore --- (same rule: a linked .gitignore is not ours to append to)
+  if (!isSymlink(join(targetDir, '.gitignore'))) {
+    ensureGitignoreEntries(targetDir, ['.codex/', '.gemini/']);
+  }
 
-  // --- Gitignore ---
-  ensureGitignoreEntries(targetDir, ['.codex/', '.gemini/']);
-
-  return { codex: true, gemini: true };
+  return { codex, gemini };
 }

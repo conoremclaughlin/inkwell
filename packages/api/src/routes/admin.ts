@@ -18,7 +18,7 @@ import { getHeartbeatProcessingConfig } from '../config/heartbeat-flags';
 import { runWithRequestContext } from '../utils/request-context';
 import { getDataComposer } from '../data/composer';
 import { handleSendToInbox } from '../mcp/tools/inbox-handlers';
-import { getParticipants } from '../mcp/tools/thread-handlers';
+import { getParticipants, reopenThreadRow } from '../mcp/tools/thread-handlers';
 import { FixedWindowLimiter } from '../utils/fixed-window-limiter';
 import { notifyPlatformOfApprovalRequest } from '../channels/approval-interceptor';
 
@@ -4540,14 +4540,37 @@ router.get('/connected-accounts', async (req: Request, res: Response) => {
       authReq.pcpWorkspaceId
     );
 
+    // Desktop credentials (`ink google login` on the server host) bound to this
+    // user by email. They count as a connection: the server will use one when
+    // the cloud row cannot serve, or first when configured that way.
+    const credentialSources = oauthService.getCredentialSources();
+    const desktop = credentialSources.includes('desktop')
+      ? await oauthService.describeDesktopCredentials(authReq.pcpUserId)
+      : { dir: null, email: null, error: null, credentials: [] };
+    const desktopUsable = desktop.credentials.some((c) => c.state !== 'unusable');
+
     // Get supported providers and their configuration status
     const providers = oauthService.getSupportedProviders().map((provider) => ({
       name: provider,
       configured: oauthService.isProviderConfigured(provider),
-      connected: accounts.some((a) => a.provider === provider && a.status === 'active'),
+      connected:
+        accounts.some((a) => a.provider === provider && a.status === 'active') ||
+        (provider === 'google' && desktopUsable),
     }));
 
     res.json({
+      credentialSources,
+      desktopCredentialsError: desktop.error,
+      desktopCredentials: desktop.credentials.map((c) => ({
+        provider: 'google',
+        email: c.email,
+        path: c.path,
+        scopes: c.scopes,
+        obtainedAt: c.obtainedAt,
+        state: c.state,
+        reason: c.reason,
+        expiresAt: c.expiresAt,
+      })),
       accounts: accounts.map((a) => ({
         id: a.id,
         provider: a.provider,
@@ -7615,6 +7638,10 @@ router.post('/threads', async (req: Request, res: Response) => {
  * Existing threads only: a reply is "into the conversation I'm following".
  * Creating threads needs recipient selection, which is a different screen and
  * a different endpoint when it's wanted.
+ *
+ * A closed thread takes a reply like an open one. Closed is a work-state
+ * signal, not a lock (spec inkmail-thread-scope §2): the reply is stored and
+ * wakes the participants; the thread stays closed.
  */
 router.post('/threads/reply', async (req: Request, res: Response) => {
   try {
@@ -7641,7 +7668,7 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
 
     const { data: thread, error: threadError } = await supabase
       .from('inbox_threads')
-      .select('id, thread_key, status, closed_at')
+      .select('id, thread_key')
       .eq('user_id', authReq.pcpUserId)
       .eq('thread_key', key)
       .maybeSingle();
@@ -7652,12 +7679,6 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
     }
     if (!thread) {
       res.status(404).json({ error: `No thread with key "${key}"` });
-      return;
-    }
-    if (thread.status === 'closed' || thread.closed_at) {
-      // The inbox handler refuses closed threads; say so with a status no
-      // client can mistake for delivery.
-      res.status(409).json({ error: `Thread "${key}" is closed and no longer accepts replies` });
       return;
     }
 
@@ -7689,11 +7710,11 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
       unknown
     >;
     if (parsed.messageId == null) {
-      // Nothing stored — the handler refused (closed thread, unknown
-      // participant, refused key). A 2xx here would let the client clear a
-      // draft that never landed.
+      // Nothing stored — the handler refused (unknown participant, refused
+      // key). A 2xx here would let the client clear a draft that never
+      // landed.
       const reason = typeof parsed.error === 'string' ? parsed.error : 'Reply was not stored';
-      res.status(/closed/i.test(reason) ? 409 : 400).json({ error: reason });
+      res.status(400).json({ error: reason });
       return;
     }
 
@@ -7712,6 +7733,64 @@ router.post('/threads/reply', async (req: Request, res: Response) => {
   } catch (error) {
     logger.error('Failed to send thread reply:', error);
     res.status(500).json(errorJson('Failed to send reply', error));
+  }
+});
+
+/**
+ * POST /api/admin/threads/reopen
+ * Body: { key } → { success, threadKey, reopened, alreadyOpen }
+ *
+ * The owner's recovery path (spec inkmail-thread-scope §2, §6): a participant
+ * reopens through reopen_thread; the workspace owner or admin recovers any
+ * thread. Until the workspace cutover a thread's owner is its user_id, so
+ * that is the scope check here. Idempotent from the caller's side: an
+ * already-open thread answers 200 with reopened: false — the state the person
+ * asked for holds either way.
+ *
+ * Reopening wakes nobody. It says the work is back on; a reply is how the
+ * participants hear about it. A reply never reopens (see /threads/reply).
+ */
+router.post('/threads/reopen', async (req: Request, res: Response) => {
+  try {
+    const key = typeof req.body?.key === 'string' ? req.body.key.trim() : '';
+    if (!key) {
+      res.status(400).json({ error: 'key is required' });
+      return;
+    }
+
+    const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const authReq = req as AdminAuthRequest;
+
+    const { data: thread, error: threadError } = await supabase
+      .from('inbox_threads')
+      .select('id, thread_key, status')
+      .eq('user_id', authReq.pcpUserId)
+      .eq('thread_key', key)
+      .maybeSingle();
+    if (threadError) {
+      logger.error('Failed to load thread for reopen:', threadError);
+      res.status(500).json(errorJson('Failed to reopen thread', threadError));
+      return;
+    }
+    if (!thread) {
+      res.status(404).json({ error: `No thread with key "${key}"` });
+      return;
+    }
+    if (thread.status !== 'closed') {
+      res.json({ success: true, threadKey: key, reopened: false, alreadyOpen: true });
+      return;
+    }
+
+    const dataComposer = await getDataComposer();
+    const { reopened } = await reopenThreadRow(dataComposer.getClient(), thread.id, {
+      kind: 'user',
+    });
+    res.json({ success: true, threadKey: key, reopened, alreadyOpen: !reopened });
+  } catch (error) {
+    logger.error('Failed to reopen thread:', error);
+    res.status(500).json(errorJson('Failed to reopen thread', error));
   }
 });
 

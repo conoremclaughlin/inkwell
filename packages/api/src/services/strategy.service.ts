@@ -51,6 +51,19 @@ export interface StartStrategyInput {
   executionMode?: ExecutionMode;
 }
 
+/**
+ * What a watchdog tick did.
+ *
+ * `skipped` is the one that matters: a watchdog that cancels itself because
+ * its group completed has done its job, and must not be reported as a failed
+ * beat. Collapsing it into `false` made a finished strategy look identical to
+ * a monitor that stopped running.
+ */
+export type WatchdogOutcome =
+  | { outcome: 'fired' }
+  | { outcome: 'skipped'; reason: string }
+  | { outcome: 'failed'; error: string };
+
 export interface StrategyAdvanceResult {
   /** What happened after completing the task */
   action: 'next_task' | 'check_in' | 'approval_required' | 'group_complete';
@@ -1573,18 +1586,25 @@ export class StrategyService {
    * strategy is no longer active or there is no pending work, then routes a
    * task-aware prompt to the owner agent in the assigned studio.
    *
-   * Returns true on successful trigger (reminder should be marked delivered).
-   * Returns false when the watchdog decides no action is needed — the heartbeat
-   * treats this as a failed delivery today, which re-runs the cron next tick.
-   * That's acceptable for now; the strategy will either become active again
-   * (next tick triggers) or be cancelled (watchdog reminder is cancelled).
+   * Three outcomes, and the distinction is load-bearing:
+   *
+   * - `fired`    — the owner agent was triggered. A delivered beat.
+   * - `skipped`  — the watchdog decided no action was needed and cancelled
+   *                itself: the group is gone, finished, paused, or has no
+   *                remaining task. This is the watchdog working correctly.
+   * - `failed`   — the trigger was attempted and did not happen.
+   *
+   * This used to be a bare boolean, so all three collapsed into true/false and
+   * a strategy completing normally was indistinguishable from a monitor going
+   * down. Once failed beats started raising outage alerts (2026-09-11) that
+   * conflation would have paged a human every time a task group finished.
    */
-  async triggerWatchdog(groupId: string): Promise<boolean> {
+  async triggerWatchdog(groupId: string): Promise<WatchdogOutcome> {
     const group = await this.dataComposer.repositories.taskGroups.findById(groupId);
     if (!group) {
       logger.warn(`Strategy watchdog: group ${groupId} not found, cancelling orphaned watchdog`);
       await this.cancelWatchdogReminder(groupId);
-      return false;
+      return { outcome: 'skipped', reason: `group ${groupId} no longer exists` };
     }
 
     // Log every cron wakeup so we can trace heartbeat frequency in the activity stream.
@@ -1607,7 +1627,10 @@ export class StrategyService {
         `Watchdog skipped and self-cancelled: group is ${group.status}`,
         { reason: 'inactive_group' }
       );
-      return false;
+      return {
+        outcome: 'skipped',
+        reason: `group is ${group.status} (strategy=${group.strategy ?? 'null'})`,
+      };
     }
 
     // Find the current in-progress task. If none, fall back to the next
@@ -1631,7 +1654,7 @@ export class StrategyService {
           currentTaskIndex: group.current_task_index,
         }
       );
-      return false;
+      return { outcome: 'skipped', reason: 'no pending or in-progress task remaining' };
     }
 
     // If the strategy uses a sandbox, spin up (or reuse) the container before
@@ -1655,7 +1678,12 @@ export class StrategyService {
           status: 'paused',
           strategy_paused_at: new Date().toISOString(),
         });
-        return false;
+        // A genuine failure, not a no-op: the strategy wanted to run and the
+        // sandbox it requires would not come up.
+        return {
+          outcome: 'failed',
+          error: `sandbox required but spin-up failed: ${sandboxResult.error}`,
+        };
       }
 
       if (sandboxResult?.success) {
@@ -1663,7 +1691,18 @@ export class StrategyService {
       }
     }
 
-    return this.triggerOwnerAgent(group, currentTask, 'watchdog', sandboxContainerName);
+    const fired = await this.triggerOwnerAgent(
+      group,
+      currentTask,
+      'watchdog',
+      sandboxContainerName
+    );
+    return fired
+      ? { outcome: 'fired' }
+      : {
+          outcome: 'failed',
+          error: `could not trigger owner agent for group ${groupId} (task ${currentTask.id})`,
+        };
   }
 
   /**

@@ -24,7 +24,7 @@ import { logger } from '../../utils/logger';
 const userIdentifierSchema = z.object({
   userId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('User UUID — usually unnecessary, auto-resolved from OAuth token'),
   email: z
@@ -91,14 +91,14 @@ async function dispatchAfterMutation(
 
 export const applyTaskGraphSchema = z.object({
   ...userIdentifierSchema.shape,
-  taskGroupId: z.string().uuid().describe('Graph-mode task group to mutate'),
+  taskGroupId: z.string().guid().describe('Graph-mode task group to mutate'),
   expectedVersion: z
     .number()
     .int()
     .min(0)
     .describe('Expected graph_version (CAS) — read it from get_task_graph first'),
   edges: z
-    .array(z.object({ from: z.string().uuid(), to: z.string().uuid() }))
+    .array(z.object({ from: z.string().guid(), to: z.string().guid() }))
     .describe(
       'The COMPLETE desired edge set (from → to means "from must satisfy before to can start"). Edges not listed are removed.'
     ),
@@ -142,7 +142,7 @@ export async function handleApplyTaskGraph(
 
 export const convertTaskGroupToGraphSchema = z.object({
   ...userIdentifierSchema.shape,
-  taskGroupId: z.string().uuid().describe('Linear task group to convert to graph execution'),
+  taskGroupId: z.string().guid().describe('Linear task group to convert to graph execution'),
   expectedVersion: z
     .number()
     .int()
@@ -181,7 +181,7 @@ export async function handleConvertTaskGroupToGraph(
 
 export const getTaskGraphSchema = z.object({
   ...userIdentifierSchema.shape,
-  taskGroupId: z.string().uuid().describe('Task group to read'),
+  taskGroupId: z.string().guid().describe('Task group to read'),
 });
 
 export async function handleGetTaskGraph(
@@ -266,7 +266,7 @@ export const instantiateGraphTemplateSchema = z.object({
     .describe('Template to build — list_graph_templates for the registry (e.g. "pr-ship")'),
   taskGroupId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe(
       'Existing graph-mode group to add to. Omit to create a new group. Required when injecting a fragment.'
@@ -279,21 +279,21 @@ export const instantiateGraphTemplateSchema = z.object({
     .string()
     .optional()
     .describe('Routing spine for the new group, e.g. "pr:551" (ignored when taskGroupId is set)'),
-  projectId: z.string().uuid().optional().describe('Project for the new group'),
+  projectId: z.string().guid().optional().describe('Project for the new group'),
   subject: z.string().optional().describe('What is being shipped — "PR #551", "spec:foo"'),
   reviewerIdentityId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('Sibling reviewer — agent_identities.id, NEVER the agent slug'),
   visualSignoffUserId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('Human who signs off on the visuals (approval gate, never claimed)'),
   visualSignoffIdentityId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('SB that signs off on the visuals when no human is in the loop'),
   includeVisualSignoff: z
@@ -553,7 +553,7 @@ export async function handleInstantiateGraphTemplate(
 
 export const startGraphExecutionSchema = z.object({
   ...userIdentifierSchema.shape,
-  taskGroupId: z.string().uuid().describe('Graph-mode task group to start executing'),
+  taskGroupId: z.string().guid().describe('Graph-mode task group to start executing'),
 });
 
 export async function handleStartGraphExecution(
@@ -581,10 +581,10 @@ export async function handleStartGraphExecution(
 
 export const claimTaskSchema = z.object({
   ...userIdentifierSchema.shape,
-  taskId: z.string().uuid().describe('Ready graph node (work or open executable gate) to claim'),
+  taskId: z.string().guid().describe('Ready graph node (work or open executable gate) to claim'),
   sessionId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('Claiming session — usually unnecessary, resolved from session context'),
 });
@@ -625,9 +625,9 @@ export async function handleClaimTask(
 
 export const releaseClaimSchema = z.object({
   ...userIdentifierSchema.shape,
-  taskId: z.string().uuid().describe('Claimed task to release'),
-  claimToken: z.string().uuid().describe('The claim token returned by claim_task'),
-  sessionId: z.string().uuid().optional().describe('Holding session — resolved from context'),
+  taskId: z.string().guid().describe('Claimed task to release'),
+  claimToken: z.string().guid().describe('The claim token returned by claim_task'),
+  sessionId: z.string().guid().optional().describe('Holding session — resolved from context'),
   reason: z.string().max(500).optional().describe('Why the claim is being released'),
 });
 
@@ -665,7 +665,7 @@ export async function handleReleaseClaim(
 
 export const recordGateVerdictSchema = z.object({
   ...userIdentifierSchema.shape,
-  taskId: z.string().uuid().describe('Verification gate to decide'),
+  taskId: z.string().guid().describe('Verification gate to decide'),
   verdict: z.enum(['passed', 'failed']),
   expectedAttempt: z
     .number()
@@ -684,10 +684,10 @@ export const recordGateVerdictSchema = z.object({
   reason: z.string().max(2000).optional().describe('Required to fail: what is wrong'),
   claimToken: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('Required when you claimed the gate (executable checks)'),
-  sessionId: z.string().uuid().optional().describe('Resolved from context when omitted'),
+  sessionId: z.string().guid().optional().describe('Resolved from context when omitted'),
 });
 
 export async function handleRecordGateVerdict(
@@ -732,7 +732,7 @@ export async function handleRecordGateVerdict(
 
 export const retryGateSchema = z.object({
   ...userIdentifierSchema.shape,
-  taskId: z.string().uuid().describe('Failed verification gate to retry'),
+  taskId: z.string().guid().describe('Failed verification gate to retry'),
   expectedAttempt: z.number().int().min(1).describe('The FAILED attempt number (CAS)'),
   reason: z.string().max(2000).optional().describe('What was remediated'),
 });

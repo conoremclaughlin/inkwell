@@ -18,10 +18,15 @@ import {
   getSessionContext,
   pinSessionAgent,
   getRequestContext,
-  getPinnedAgentId,
 } from '../../utils/request-context';
 import { getEffectiveAgentId } from '../../auth/enforce-identity';
 import type { MemorySource, Salience, Session } from '../../data/models/memory';
+import {
+  isSessionAuthorized,
+  loadAuthorizedAmbientSession,
+  resolveCallerIdentity,
+  type CallerIdentity,
+} from './caller-identity';
 import { getCloudSkillsService } from '../../skills/cloud-service';
 import { resolveMainStudio } from '../../services/sessions/session-service';
 import { StudioLeaseService } from '../../services/studio-lease.service';
@@ -99,81 +104,11 @@ function resolveStudioScope(rawStudioId: string | undefined): string | null | un
 }
 
 /** Why an implicit session lookup came back empty — shapes the error the caller sees. */
-type ImplicitSessionFailure = 'no-agent-identity' | 'no-session' | 'ambiguous';
+export type ImplicitSessionFailure = 'no-agent-identity' | 'no-session' | 'ambiguous';
 
-type ImplicitSessionResult =
+export type ImplicitSessionResult =
   | { session: Session; via: 'context' | 'lookup' }
   | { session: null; reason: ImplicitSessionFailure; candidateCount?: number };
-
-/**
- * The identity behind the current call.
- *
- * `sbId` is the canonical `agent_identities.id`. `agentId` is the slug, which is
- * unique only per (user_id, workspace_id) — two identities named "wren" in
- * different workspaces collide, so the slug alone is not an ownership predicate.
- * `agentBound` distinguishes an SB's token from a human user/admin token, which
- * retains same-user repair authority that agents deliberately do not get.
- */
-interface CallerIdentity {
-  sbId?: string;
-  agentId?: string;
-  /**
-   * Contact scope the caller is confined to; undefined means owner scope
-   * (sessions with no contact). Never taken from a tool parameter — a caller
-   * that could name its own contact scope could name someone else's.
-   */
-  contactId?: string;
-  agentBound: boolean;
-}
-
-/**
- * The authenticated identity behind this call, from verified sources only.
- *
- * Three things here are deliberate, and each one was a hole:
- *
- * 1. On HTTP the bearer token is the ONLY authentication fact. `ctx.agentId`
- *    and `ctx.sbId` may have been enriched from the caller's ambient session
- *    so routing and workspace derivation work for ink-routed user-token calls;
- *    that is a hint, not a credential. Authorization reads `tokenAgentId` /
- *    `tokenSbId`, captured before enrichment.
- * 2. `callerProfile` is NOT an agent-bound signal — it defaults to 'agent' on
- *    every HTTP request, including web-dashboard user tokens.
- * 3. `explicitAgentId` never confers agent authority. It previously flowed
- *    through `getEffectiveAgentId()`, which returns the caller's own value
- *    whenever no identity is pinned, so a request with no verified identity
- *    could name any agent it liked. It survives only as attribution on
- *    non-agent-bound calls.
- */
-function resolveCallerIdentity(explicitAgentId?: string): CallerIdentity {
-  const ctx = getRequestContext();
-
-  if (ctx) {
-    if (ctx.agentTokenBound) {
-      return {
-        sbId: ctx.tokenSbId,
-        agentId: ctx.tokenAgentId,
-        // The SIGNED claim, never ctx.contactId — that one comes from the
-        // unsigned x-ink-context header.
-        contactId: ctx.tokenContactId,
-        agentBound: true,
-      };
-    }
-    // User/admin token: keeps same-user repair authority.
-    return { agentId: explicitAgentId, agentBound: false };
-  }
-
-  // stdio: one session per process, so bootstrap's pin is the identity.
-  const pinned = getPinnedAgentId();
-  if (!pinned) return { agentId: explicitAgentId, agentBound: false };
-
-  const sess = getSessionContext();
-  return {
-    sbId: sess?.agentId === pinned ? sess.sbId : undefined,
-    agentId: pinned,
-    contactId: sess?.contactId,
-    agentBound: true,
-  };
-}
 
 /**
  * Resolve the caller.
@@ -193,72 +128,12 @@ function resolveCallerIdentity(explicitAgentId?: string): CallerIdentity {
  * contact-scoped session to it. That matches resolveObservePermission, which
  * already denies contact sessions to agents outright.
  */
-async function resolveCaller(
+export async function resolveCaller(
   _dataComposer: DataComposer,
   _userId: string,
   explicitAgentId?: string
 ): Promise<CallerIdentity> {
   return resolveCallerIdentity(explicitAgentId);
-}
-
-/**
- * The session the caller is actually running in.
- *
- * Prefers the signed token claim over the `x-ink-context` header. The header
- * still serves callers whose token predates the claim, but it is a caller
- * assertion, so the session it names is authorized before use either way.
- */
-function ambientSessionId(): string | undefined {
-  const ctx = getRequestContext();
-  return ctx?.tokenSessionId ?? ctx?.sessionId;
-}
-
-/**
- * Decide whether `caller` may act on `session`.
- *
- * Same-user is the floor and is never waived — the server repository runs as the
- * service role, so RLS will not stop a cross-user UUID and this check is the only
- * thing that does. Agent-bound callers are further confined to their own identity:
- * naming a peer's session is not an authorization primitive (repairing another
- * agent's row is a user/admin action, not something an SB grants itself).
- */
-function isIdentityAuthorized(session: Session, userId: string, caller: CallerIdentity): boolean {
-  if (session.userId !== userId) return false;
-  if (!caller.agentBound) return true;
-
-  if (session.sbId) {
-    // The target names a canonical owner, so only a canonical caller can match
-    // it. Falling back to the slug when the CALLER lacks an sbId would reopen
-    // the collision this check exists to close: agent-bound tokens without a
-    // canonical claim are valid today, and "wren" in two workspaces is two
-    // different identities wearing the same name.
-    return !!caller.sbId && session.sbId === caller.sbId;
-  }
-
-  // The target row predates sb_id, so the slug is the only identity it carries.
-  return !!caller.agentId && session.agentId === caller.agentId;
-}
-
-/**
- * Decide whether `caller` may act on `session`.
- *
- * Same-user is the floor and is never waived — the server repository runs as the
- * service role, so RLS will not stop a cross-user UUID and this check is the only
- * thing that does. Agent-bound callers are further confined to their own identity
- * AND their own contact scope: naming a peer's session is not an authorization
- * primitive (repairing another agent's row is a user/admin action, not something
- * an SB grants itself), and one SB identity serves many contacts, so identity
- * alone does not keep two conversations apart.
- *
- * The contact comparison is symmetric on purpose. A contact-scoped caller cannot
- * reach an owner session and an owner-scoped caller cannot reach a contact
- * session, which mirrors how `findOwnedActiveSessions` already treats the two as
- * disjoint sets rather than a hierarchy.
- */
-function isSessionAuthorized(session: Session, userId: string, caller: CallerIdentity): boolean {
-  if (!isIdentityAuthorized(session, userId, caller)) return false;
-  if (!caller.agentBound) return true;
-  return (session.contactId ?? null) === (caller.contactId ?? null);
 }
 
 /** Error text for a denied explicit target. Deliberately does not confirm existence. */
@@ -300,7 +175,7 @@ function unauthorizedSessionError(toolName: string): string {
  * Returns `no-agent-identity` when the caller cannot be identified. Callers MUST
  * fail closed on that: an unscoped query is what caused the cross-agent write.
  */
-async function resolveImplicitSession(
+export async function resolveImplicitSession(
   dataComposer: DataComposer,
   userId: string,
   caller: CallerIdentity,
@@ -336,30 +211,14 @@ async function resolveImplicitSession(
   const ctx = getRequestContext();
 
   // The runtime tells us which session it is executing in. Prefer it over any
-  // lookup — but verify ownership first. The signed claim is authenticated; the
-  // header form is a caller-composed assertion that nothing has checked.
-  const ambientId = ambientSessionId();
-  if (ambientId) {
-    try {
-      const contextSession = await dataComposer.repositories.memory.getSession(ambientId);
-      if (contextSession && isSessionAuthorized(contextSession, userId, caller)) {
-        return { session: contextSession, via: 'context' };
-      }
-      if (contextSession) {
-        logger.warn('Ignoring ambient sessionId that does not belong to the caller', {
-          contextSessionId: ambientId,
-          sessionSbId: contextSession.sbId,
-          sessionAgentId: contextSession.agentId,
-          callerSbId: caller.sbId,
-          callerAgentId: caller.agentId,
-        });
-      }
-    } catch (error) {
-      logger.warn('Failed to load the ambient session; falling back to lookup', {
-        contextSessionId: ambientId,
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
+  // lookup — but only once the row is loaded and authorized for this caller.
+  // The signed claim is authenticated; the header form is a caller-composed
+  // assertion that nothing has checked. One loader serves every stamp of a
+  // session onto a record (see caller-identity.ts), so this is the same
+  // decision send_response makes.
+  const ambient = await loadAuthorizedAmbientSession(dataComposer, userId, caller);
+  if (ambient.session) {
+    return { session: ambient.session, via: 'context' };
   }
 
   // No usable context session. Scope by the studio the caller is in when we know
@@ -509,7 +368,7 @@ export const rememberSchema = userIdentifierBaseSchema.extend({
     ),
   salience: salienceSchema.optional().describe('Importance level (default: medium)'),
   topics: topicsSchema.describe('Topics for categorization'),
-  metadata: z.record(z.unknown()).optional().describe('Additional metadata'),
+  metadata: z.record(z.string(), z.unknown()).optional().describe('Additional metadata'),
   expiresAt: isoDateTime().optional().describe('Optional expiration date (ISO 8601)'),
   agentId: z
     .string()
@@ -517,7 +376,7 @@ export const rememberSchema = userIdentifierBaseSchema.extend({
     .describe('Which AI being created this memory (e.g., "wren", "benson"). Null = shared memory.'),
   contactId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe(
       'Contact ID for per-sender memory scoping. Auto-inherited from session context when available. Null = owner/system memory.'
@@ -534,7 +393,7 @@ export const rememberSchema = userIdentifierBaseSchema.extend({
   // heuristic that can resolve to a sibling session in parallel worktrees.
   sessionId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe(
       'Session to attribute this memory to. Takes precedence over the server-side active-session lookup; omit to let the server infer it.'
@@ -568,7 +427,7 @@ export const recallSchema = userIdentifierBaseSchema.extend({
     .describe('Include shared memories (agentId=null) when filtering by agentId (default: true)'),
   contactId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe(
       'Filter by contact ID for per-sender memory isolation. When set, only returns memories scoped to this contact.'
@@ -576,14 +435,14 @@ export const recallSchema = userIdentifierBaseSchema.extend({
 });
 
 export const forgetSchema = userIdentifierBaseSchema.extend({
-  memoryId: z.string().uuid().describe('ID of the memory to forget'),
+  memoryId: z.string().guid().describe('ID of the memory to forget'),
 });
 
 export const updateMemorySchema = userIdentifierBaseSchema.extend({
-  memoryId: z.string().uuid().describe('ID of the memory to update'),
+  memoryId: z.string().guid().describe('ID of the memory to update'),
   salience: salienceSchema.optional().describe('New salience level'),
   topics: topicsSchema.describe('New topics'),
-  metadata: z.record(z.unknown()).optional().describe('Additional metadata to merge'),
+  metadata: z.record(z.string(), z.unknown()).optional().describe('Additional metadata to merge'),
 });
 
 // ==============================================// SESSION TOOLS
@@ -591,7 +450,7 @@ export const updateMemorySchema = userIdentifierBaseSchema.extend({
 export const startSessionSchema = userIdentifierBaseSchema.extend({
   sessionId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe(
       'Optional PCP session UUID to use when creating a new session. Useful for client-generated canonical IDs.'
@@ -619,12 +478,12 @@ export const startSessionSchema = userIdentifierBaseSchema.extend({
   model: z.string().optional().describe('Model identifier (e.g., "opus-4-6", "sonnet", "o3")'),
   contactId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe(
       'Contact ID for per-sender session isolation. When set, the session is scoped to this contact.'
     ),
-  metadata: z.record(z.unknown()).optional().describe('Additional session metadata'),
+  metadata: z.record(z.string(), z.unknown()).optional().describe('Additional session metadata'),
   repoRoot: z
     .string()
     .optional()
@@ -640,7 +499,7 @@ export const startSessionSchema = userIdentifierBaseSchema.extend({
 export const endSessionSchema = userIdentifierBaseSchema.extend({
   sessionId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('Session ID (uses active session if not provided)'),
   agentId: z
@@ -657,7 +516,7 @@ export const endSessionSchema = userIdentifierBaseSchema.extend({
 export const getSessionSchema = userIdentifierBaseSchema.extend({
   sessionId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('Session ID (returns active session if not provided)'),
   agentId: z
@@ -707,7 +566,7 @@ export const listSessionsSchema = userIdentifierBaseSchema.extend({
 export const updateSessionStateSchema = userIdentifierBaseSchema.extend({
   sessionId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe(
       'Session ID (uses active session if not provided). Most reliable way to target a specific session.'
@@ -775,7 +634,7 @@ export const updateSessionStateSchema = userIdentifierBaseSchema.extend({
 // ==============================================// MEMORY HISTORY SCHEMAS
 // ==============================================
 export const getMemoryHistorySchema = userIdentifierBaseSchema.extend({
-  memoryId: z.string().uuid().describe('ID of the memory to get history for'),
+  memoryId: z.string().guid().describe('ID of the memory to get history for'),
 });
 
 export const getUserHistorySchema = userIdentifierBaseSchema.extend({
@@ -784,7 +643,7 @@ export const getUserHistorySchema = userIdentifierBaseSchema.extend({
 });
 
 export const restoreMemorySchema = userIdentifierBaseSchema.extend({
-  historyId: z.string().uuid().describe('ID of the history entry to restore from'),
+  historyId: z.string().guid().describe('ID of the history entry to restore from'),
 });
 
 // ==============================================// BOOTSTRAP SCHEMA
@@ -792,7 +651,7 @@ export const restoreMemorySchema = userIdentifierBaseSchema.extend({
 export const bootstrapSchema = userIdentifierBaseSchema.extend({
   workspaceId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('Optional product workspace scope for shared document resolution'),
   includeRecentMemories: z
@@ -842,7 +701,7 @@ export const bootstrapSchema = userIdentifierBaseSchema.extend({
 export const compactSessionSchema = userIdentifierBaseSchema.extend({
   sessionId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe('Session ID to compact (uses active session if not provided)'),
   agentId: z
@@ -875,21 +734,55 @@ export async function handleRemember(args: unknown, dataComposer: DataComposer) 
   const agentId = getEffectiveAgentId(params.agentId);
 
   // Attach a session ID to the memory metadata for traceability. An explicit
-  // sessionId from the caller wins: it knows which session it is, whereas the
-  // lookup below infers "the active one" and can land on a sibling session in
-  // parallel worktrees. Never require a session — memories are too important
-  // to lose.
+  // sessionId from the caller wins: it knows which session it is.
+  //
+  // Otherwise resolve it the same way every other session-targeting tool does,
+  // which prefers the session the caller is ACTUALLY RUNNING IN (per the signed
+  // token / `x-ink-context`) over any lookup. This handler used to call
+  // `getActiveSession(user.id, agentId, studioScope)` directly — the unscoped
+  // recency lookup described at `resolveImplicitSession`, which returns "the
+  // most recently started open session" for the identity and so deterministically
+  // loses to any newer sibling row.
+  //
+  // That is not hypothetical. On 2026-09-10 routing created myra session
+  // d1d105ec with no process behind it (backend_session_id null, every token
+  // counter 0, lifecycle 'running'). As the newest myra row it captured EVERY
+  // subsequent remember() call — 0 of that day's memories reached her live
+  // session — while `update_session_state`, already on the resolver below, kept
+  // writing to the right one from the same agent in the same minute.
+  //
+  // Attribution failure must never cost a memory, so unlike its peers this
+  // handler does not fail closed: an unresolved session saves with no sessionId
+  // rather than throwing. Absent provenance is recoverable; wrong provenance
+  // silently corrupts the record.
   let sessionId: string | undefined = params.sessionId;
   if (!sessionId) {
     try {
-      const activeSession = await dataComposer.repositories.memory.getActiveSession(
-        user.id,
-        agentId,
-        studioScope
-      );
-      sessionId = activeSession?.id;
-    } catch {
-      // Session lookup failed — save the memory anyway
+      // The effective identity, not the raw parameter. On the normal local
+      // auth shape — a user bearer plus ctx.agentId enriched from the ambient
+      // session — a call that omits its optional agentId still knows who it
+      // is: `agentId` above is already 'myra'. Passing params.agentId here
+      // handed the resolver `undefined`, which exited with no-agent-identity
+      // before ever inspecting a valid, unambiguous ambient session (Lumen,
+      // #596). For an agent-bound token the explicit value is ignored by
+      // resolveCallerIdentity, so this never confers agent authority: the
+      // caller stays a user token, confined to same-user sessions only.
+      const caller = await resolveCaller(dataComposer, user.id, agentId);
+      const resolved = await resolveImplicitSession(dataComposer, user.id, caller, studioScope);
+      sessionId = resolved.session?.id;
+      if (!resolved.session) {
+        logger.warn('Saving memory without session attribution', {
+          agentId: agentId || 'none',
+          reason: resolved.reason,
+          candidateCount: resolved.candidateCount,
+        });
+      }
+    } catch (error) {
+      // Session lookup failed — save the memory anyway, unattributed.
+      logger.warn('Session resolution threw while saving a memory', {
+        agentId: agentId || 'none',
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 
@@ -1021,7 +914,7 @@ export const curateRecallSchema = userIdentifierBaseSchema.extend({
   accepted: z
     .array(
       z.object({
-        memoryId: z.string().uuid(),
+        memoryId: z.string().guid(),
         semanticScore: z.number().optional(),
         textScore: z.number().optional(),
         finalScore: z.number().optional(),
@@ -1033,7 +926,7 @@ export const curateRecallSchema = userIdentifierBaseSchema.extend({
   dismissed: z
     .array(
       z.object({
-        memoryId: z.string().uuid(),
+        memoryId: z.string().guid(),
         semanticScore: z.number().optional(),
         textScore: z.number().optional(),
         finalScore: z.number().optional(),
@@ -1043,7 +936,7 @@ export const curateRecallSchema = userIdentifierBaseSchema.extend({
     .default([])
     .describe('Memories the SB found irrelevant — will be evicted from context'),
   agentId: z.string().optional().describe('Agent identity (e.g., "wren")'),
-  sessionId: z.string().uuid().optional().describe('Current session ID for attribution'),
+  sessionId: z.string().guid().optional().describe('Current session ID for attribution'),
 });
 
 export async function handleCurateRecall(args: unknown, dataComposer: DataComposer) {
@@ -2391,7 +2284,6 @@ export async function handleRestoreMemory(args: unknown, dataComposer: DataCompo
  *
  * Returns:
  * - Constitution: values, user, process (shared) + identity, heartbeat, soul (per-agent)
- * - Identity Core: user, assistant, relationship context from DB
  * - Active Context: current projects, focus, recent high-salience memories
  * - Active Session: current session info if any
  */
@@ -2470,57 +2362,47 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
   // Fetch all context in parallel (including timezone and skills)
   const cloudSkillsService = getCloudSkillsService(dataComposer.getClient());
 
-  const [
-    contexts,
-    projects,
-    focus,
-    activeSessions,
-    dbIdentity,
-    userTimezone,
-    userSkills,
-    siblingIdentities,
-  ] = await Promise.all([
-    // Identity Core: all context summaries
-    dataComposer.repositories.context.findAllByUser(user.id),
-    // Active projects
-    dataComposer.repositories.projects.findAllByUser(user.id, 'active'),
-    // Current focus
-    dataComposer.repositories.sessionFocus.findLatestByUser(user.id),
-    // All active sessions (filter by agentId if provided) — client picks the right one
-    dataComposer.repositories.memory.getActiveSessions(user.id, agentId),
-    // Database identity (for cloud agents, includes metadata, heartbeat, soul)
-    agentId
-      ? dataComposer
-          .getClient()
-          .from('agent_identities')
-          .select('*')
-          .eq('user_id', user.id)
-          .eq('agent_id', agentId)
-          .single()
-          .then(({ data }) => data)
-      : Promise.resolve(null),
-    // User timezone for timestamp conversion
-    dataComposer
-      .getClient()
-      .from('users')
-      .select('timezone')
-      .eq('id', user.id)
-      .single()
-      .then(({ data }) => data?.timezone || 'UTC'),
-    // User's installed skills (local + cloud merged)
-    cloudSkillsService.loadUserSkills(user.id).catch((err) => {
-      logger.warn('Failed to load user skills:', err);
-      return [];
-    }),
-    // Live sibling identities — structural facts for all agents under this user.
-    // Agents cross-reference this with their personal `relationships` notes.
-    supabase
-      .from('agent_identities')
-      .select('agent_id, name, role, backend, session_scope, capabilities, description')
-      .eq('user_id', user.id)
-      .order('created_at', { ascending: true })
-      .then(({ data }) => data || []),
-  ]);
+  const [projects, focus, activeSessions, dbIdentity, userTimezone, userSkills, siblingIdentities] =
+    await Promise.all([
+      // Active projects
+      dataComposer.repositories.projects.findAllByUser(user.id, 'active'),
+      // Current focus
+      dataComposer.repositories.sessionFocus.findLatestByUser(user.id),
+      // All active sessions (filter by agentId if provided) — client picks the right one
+      dataComposer.repositories.memory.getActiveSessions(user.id, agentId),
+      // Database identity (for cloud agents, includes metadata, heartbeat, soul)
+      agentId
+        ? dataComposer
+            .getClient()
+            .from('agent_identities')
+            .select('*')
+            .eq('user_id', user.id)
+            .eq('agent_id', agentId)
+            .single()
+            .then(({ data }) => data)
+        : Promise.resolve(null),
+      // User timezone for timestamp conversion
+      dataComposer
+        .getClient()
+        .from('users')
+        .select('timezone')
+        .eq('id', user.id)
+        .single()
+        .then(({ data }) => data?.timezone || 'UTC'),
+      // User's installed skills (local + cloud merged)
+      cloudSkillsService.loadUserSkills(user.id).catch((err) => {
+        logger.warn('Failed to load user skills:', err);
+        return [];
+      }),
+      // Live sibling identities — structural facts for all agents under this user.
+      // Agents cross-reference this with their personal `relationships` notes.
+      supabase
+        .from('agent_identities')
+        .select('agent_id, name, role, backend, session_scope, capabilities, description')
+        .eq('user_id', user.id)
+        .order('created_at', { ascending: true })
+        .then(({ data }) => data || []),
+    ]);
 
   // Ensure the caller's own session is always in the activeSessions list.
   // getActiveSessions is capped to 10 by started_at — a long-running session
@@ -2606,15 +2488,6 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
         .order('updated_at', { ascending: false })
         .limit(1)
         .maybeSingle();
-
-  // Organize contexts by type
-  const identityCore = {
-    user: contexts.find((c) => c.context_type === 'user' && !c.context_key),
-    assistant: contexts.find((c) => c.context_type === 'assistant' && !c.context_key),
-    relationship: contexts.find((c) => c.context_type === 'relationship' && !c.context_key),
-  };
-
-  const projectContexts = contexts.filter((c) => c.context_type === 'project');
 
   // Compute reflection status from identity metadata
   const identityMetadata = dbIdentity?.metadata as Record<string, unknown> | null;
@@ -2723,7 +2596,6 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
 
   logger.info(`Bootstrap loaded for user ${user.id}`, {
     agentId: agentId || 'none',
-    contextCount: contexts.length,
     projectCount: projects.length,
     memoryCount: knowledgeMemories.length,
     knowledgeSummaryChars: knowledgeSummary.length,
@@ -2768,25 +2640,6 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
             // Constitution (merged: Supabase priority, local fallback)
             identityFiles: mergedIdentity,
 
-            // Tier 1: Identity Core from DB
-            identityCore: {
-              user: identityCore.user
-                ? { summary: identityCore.user.summary, metadata: identityCore.user.metadata }
-                : null,
-              assistant: identityCore.assistant
-                ? {
-                    summary: identityCore.assistant.summary,
-                    metadata: identityCore.assistant.metadata,
-                  }
-                : null,
-              relationship: identityCore.relationship
-                ? {
-                    summary: identityCore.relationship.summary,
-                    metadata: identityCore.relationship.metadata,
-                  }
-                : null,
-            },
-
             // Tier 2: Active Context
             activeContext: {
               projects: projects.map((p) => ({
@@ -2796,10 +2649,6 @@ export async function handleBootstrap(args: unknown, dataComposer: DataComposer)
                 status: p.status,
                 techStack: p.tech_stack,
                 goals: p.goals,
-              })),
-              projectContexts: projectContexts.map((c) => ({
-                key: c.context_key,
-                summary: c.summary,
               })),
               focus: focus
                 ? {

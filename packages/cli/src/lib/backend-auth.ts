@@ -18,6 +18,16 @@ export type BackendAuthStatus = {
   loginArgs: string[];
   canInteractiveLogin: boolean;
   credentialSource: string;
+  /**
+   * The probe did not answer — it is NOT a negative answer.
+   *
+   * `authenticated: false` covers two very different states: the provider
+   * told us it is logged out, and the provider told us nothing. Collapsing
+   * them means a slow keychain reads as a logout, which killed a heartbeat on
+   * 2026-08-20. A non-interactive caller must treat this as "unknown, proceed
+   * and let the real call fail with a real error" rather than as a refusal.
+   */
+  inconclusive?: boolean;
 };
 
 type CommandResult = {
@@ -27,12 +37,22 @@ type CommandResult = {
   timedOut: boolean;
 };
 
-const AUTH_CHECK_TIMEOUT_MS = 5000;
+const DEFAULT_AUTH_CHECK_TIMEOUT_MS = 5000;
+
+/**
+ * Read per-call, not at module load, so it is settable by tests and by anyone
+ * on a machine where the provider's credential store is slow. Five seconds is
+ * a guess, and a probe that overruns it costs a whole turn.
+ */
+function authCheckTimeoutMs(): number {
+  const raw = Number(process.env.INK_AUTH_CHECK_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_AUTH_CHECK_TIMEOUT_MS;
+}
 
 async function runCommand(
   binary: string,
   args: string[],
-  timeoutMs = AUTH_CHECK_TIMEOUT_MS
+  timeoutMs = authCheckTimeoutMs()
 ): Promise<CommandResult> {
   return await new Promise((resolve) => {
     const child = spawn(binary, args, {
@@ -172,6 +192,7 @@ export async function getBackendAuthStatus(
         return {
           backend,
           authenticated: false,
+          inconclusive: true,
           detail: 'auth status check timed out',
           loginCommand: 'claude auth login',
           loginArgs: ['auth', 'login'],
@@ -198,6 +219,7 @@ export async function getBackendAuthStatus(
         return {
           backend,
           authenticated: false,
+          inconclusive: true,
           detail: 'login status check timed out',
           loginCommand: 'codex login',
           loginArgs: ['login'],
@@ -276,12 +298,41 @@ export async function ensureBackendAuthReady(
   mode: { nonInteractive: boolean; hasMessage: boolean; verbose: boolean },
   debugScope = 'chat'
 ): Promise<void> {
-  if (process.env.SB_SKIP_BACKEND_AUTH_CHECK === '1' || process.env.VITEST) {
-    return;
-  }
+  if (process.env.SB_SKIP_BACKEND_AUTH_CHECK === '1') return;
+  // Unit tests must not probe a real provider, but a blanket VITEST bail also
+  // made this function's own behaviour untestable — its tests would pass
+  // without ever reaching a line of it. Opt in explicitly instead.
+  if (process.env.VITEST && process.env.SB_TEST_BACKEND_AUTH !== '1') return;
   if (!isBackendAuthBackend(backend)) return;
 
-  const status = await getBackendAuthStatus(backend);
+  let status = await getBackendAuthStatus(backend);
+
+  // An inconclusive probe is not a logout. Retry once — a single slow keychain
+  // read should not cost a turn — and if it still will not answer, PROCEED.
+  // Failing closed here means a provider that never replied is reported as
+  // "not authenticated", which is a fabricated verdict: it sends the caller to
+  // `claude auth login` for a session that may be perfectly valid, and it
+  // reads identically in the logs to a genuine logout. Letting the real call
+  // run instead produces a real error from the provider if there is one.
+  if (status.inconclusive) {
+    sbDebugLog(debugScope, 'backend_auth_inconclusive_retry', { backend, detail: status.detail });
+    status = await getBackendAuthStatus(backend);
+  }
+  if (status.inconclusive) {
+    sbDebugLog(debugScope, 'backend_auth_inconclusive_proceeding', {
+      backend,
+      detail: status.detail,
+      mode,
+    });
+    console.log(
+      chalk.yellow(
+        `⚠ Could not determine ${backend} auth status (${status.detail}). Proceeding anyway — ` +
+          `a probe that did not answer is not a logout.`
+      )
+    );
+    return;
+  }
+
   sbDebugLog(debugScope, 'backend_auth_status', {
     backend,
     authenticated: status.authenticated,

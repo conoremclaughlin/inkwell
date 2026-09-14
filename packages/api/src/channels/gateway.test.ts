@@ -361,6 +361,24 @@ describe('ChannelGateway', () => {
       expect(processingConversations.has('telegram:chat123')).toBe(false);
     });
 
+    it("passes the auto-response's session through to sendResponse", async () => {
+      // The auto-forwarded reply is attributed to the turn that produced it;
+      // dropping the field here would log the message_out row anonymous again.
+      const processingConversations = (gateway as any).processingConversations;
+      processingConversations.add('telegram:chat123');
+      const sendSpy = vi.spyOn(gateway as any, 'sendResponse').mockResolvedValue(undefined);
+
+      await gateway.releaseConversation('telegram', 'chat123', {
+        content: 'auto-routed reply',
+        format: 'markdown',
+        sessionId: 'session-of-the-turn',
+      });
+
+      expect(sendSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ content: 'auto-routed reply', sessionId: 'session-of-the-turn' })
+      );
+    });
+
     it('drains messages that queued during the turn after a successful auto-response', async () => {
       const processingConversations = (gateway as any).processingConversations;
       const pendingBuffers = (gateway as any).pendingBuffers;

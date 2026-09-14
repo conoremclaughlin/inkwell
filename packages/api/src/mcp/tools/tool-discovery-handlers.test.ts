@@ -1,8 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { Client } from '@modelcontextprotocol/client';
+import { McpServer, InMemoryTransport } from '@modelcontextprotocol/server';
 import { handleDescribeTool, type ToolRegistry } from './tool-discovery-handlers';
 import { registerAllTools } from './index';
 
