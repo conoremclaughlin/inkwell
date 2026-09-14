@@ -318,6 +318,46 @@ describe('resolveOwnerSbId — owner-bearing writes fail closed', () => {
   });
 });
 
+describe('an unreadable lookup response is not an empty one', () => {
+  // PostgREST answers a select-without-single with an array. Anything else means
+  // the lookup did not work, and that must not read as "this slug names nobody" —
+  // no-identity is the ONE reason an owner-bearing write may proceed with null.
+  const unreadable = {
+    'a bare object': { data: { id: SB_IN_A } },
+    'data and error both null': {},
+    'a query error': { error: { message: 'connection reset' } },
+  };
+
+  for (const [label, payload] of Object.entries(unreadable)) {
+    it(`classifies ${label} as lookup-failed, not no-identity`, async () => {
+      const result = await resolveIdentityResult(fakeSupabase(payload).client, USER, 'wren');
+
+      expect(result).toEqual({ ok: false, reason: 'lookup-failed' });
+      expect(result).not.toEqual({ ok: false, reason: 'no-identity' });
+    });
+
+    it(`refuses an owner-bearing write on ${label}`, async () => {
+      await expect(resolveOwnerSbId(fakeSupabase(payload).client, USER, 'wren')).rejects.toThrow(
+        /lookup-failed/
+      );
+    });
+  }
+
+  it('still reports no-identity for a genuinely empty result', async () => {
+    // Control: the valid empty array keeps its meaning, so unattributed writes
+    // are still possible and this did not just become fail-closed for everything.
+    const f = fakeSupabase({ data: [] });
+
+    expect(await resolveIdentityResult(f.client, USER, 'nobody')).toEqual({
+      ok: false,
+      reason: 'no-identity',
+    });
+    await expect(
+      resolveOwnerSbId(fakeSupabase({ data: [] }).client, USER, 'nobody')
+    ).resolves.toBeNull();
+  });
+});
+
 describe('resolveAgentSlug', () => {
   it('resolves a slug from a canonical UUID', async () => {
     const f = fakeSupabase({ data: { agent_id: 'wren' } });

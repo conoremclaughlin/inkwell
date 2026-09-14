@@ -560,6 +560,7 @@ describe('MemoryRepository', () => {
         };
 
         mockSupabase._setReturnData(mockSessionRow);
+        mockSupabase._queueReturnData([{ id: 'sb-claude-code', workspace_id: null }]);
 
         const result = await repo.startSession({
           userId: 'user-456',
@@ -587,6 +588,7 @@ describe('MemoryRepository', () => {
         };
 
         mockSupabase._setReturnData(mockSessionRow);
+        mockSupabase._queueReturnData([{ id: 'sb-claude-code', workspace_id: null }]);
 
         const result = await repo.startSession({
           userId: 'user-456',
@@ -619,6 +621,7 @@ describe('MemoryRepository', () => {
         };
 
         mockSupabase._setReturnData(mockSessionRow);
+        mockSupabase._queueReturnData([{ id: 'sb-claude-code', workspace_id: null }]);
 
         await repo.startSession({
           userId: 'user-456',
@@ -646,6 +649,7 @@ describe('MemoryRepository', () => {
         };
 
         mockSupabase._setReturnData(mockSessionRow);
+        mockSupabase._queueReturnData([{ id: 'sb-claude-code', workspace_id: null }]);
 
         await repo.startSession({
           userId: 'user-456',

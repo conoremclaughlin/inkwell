@@ -34,7 +34,7 @@ interface IdentityCandidate {
  */
 export type IdentityResolution =
   | { ok: true; sbId: string }
-  | { ok: false; reason: 'no-identity' | 'ambiguous' | 'not-in-workspace' };
+  | { ok: false; reason: 'no-identity' | 'ambiguous' | 'not-in-workspace' | 'lookup-failed' };
 
 /** Postgres returns uuid columns canonically lower-cased; header input is not. */
 function sameUuid(a: string | null, b: string | null): boolean {
@@ -87,14 +87,21 @@ export async function resolveIdentityResult(
       workspaceId: scope,
       error: error.message,
     });
-    return { ok: false, reason: 'not-in-workspace' };
+    return { ok: false, reason: 'lookup-failed' };
   }
 
-  // PostgREST returns an array for a select without .single(). Anything else is
-  // a shape we cannot read, and "I did not understand the response" must not be
-  // reported as "this slug has several owners" — that would fail an
-  // owner-bearing write closed for the wrong reason.
-  const candidates = (Array.isArray(data) ? data : []) as IdentityCandidate[];
+  // PostgREST returns an array for a select without .single(). Anything else —
+  // a bare object, or data and error both null — is a response we cannot read,
+  // and that is NOT the same as a successfully queried empty list. Reporting it
+  // as 'no-identity' would let an owner-bearing write insert a fresh null-owned
+  // row, which is precisely the legacy ownership path this change exists to
+  // stop feeding (Lumen, PR #634 round 2).
+  if (!Array.isArray(data)) {
+    logger.warn('Unreadable identity lookup response', { agentId, workspaceId: scope });
+    return { ok: false, reason: 'lookup-failed' };
+  }
+
+  const candidates = data as IdentityCandidate[];
   if (candidates.length === 0) return { ok: false, reason: 'no-identity' };
 
   if (scope) {
