@@ -424,7 +424,7 @@ interface PendingMessage {
   content: string;
   timestamp: Date;
   read: boolean;
-  /** Target agent ID — scopes delivery to the right CLI session */
+  /** Target SB slug — scopes delivery to the right CLI session */
   sbSlug?: string;
   /** Target session ID — for precise routing */
   sessionId?: string;

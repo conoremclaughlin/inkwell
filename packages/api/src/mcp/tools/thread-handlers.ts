@@ -207,7 +207,7 @@ export async function findThread(
 }
 
 /**
- * Get all participant agent IDs for a thread.
+ * Get all participant SB slugs for a thread.
  */
 export async function getParticipants(
   supabase: ReturnType<DataComposer['getClient']>,

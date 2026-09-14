@@ -666,7 +666,7 @@ export interface ClaudeRunnerConfig {
   pcpAccessToken?: string;
   /** PCP session ID for this run — written to runtime hint files so hooks link correctly */
   pcpSessionId?: string;
-  /** Agent ID for this run — written to runtime hint files */
+  /** SB slug for this run — written to runtime hint files */
   sbSlug?: string;
   /** Originating channel (heartbeat, telegram, agent, …) — used by runners that label delivered messages */
   channel?: string;

@@ -53,7 +53,7 @@ export const MCP_SERVER_KEY = 'inkwell';
 
 /** Environment variable names used across CLI, hooks, and runners. */
 export const ENV = {
-  /** Agent ID override */
+  /** SB slug override */
   AGENT_ID: 'AGENT_ID',
   /** Inkwell server URL */
   SERVER_URL: 'INK_SERVER_URL',

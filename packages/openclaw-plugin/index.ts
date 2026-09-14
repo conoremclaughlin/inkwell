@@ -238,7 +238,7 @@ export default function pcpPlugin(api: OpenClawPluginApi) {
 
   if (!sbSlug) {
     api.logger.warn(
-      'pcp: no agent ID resolved. Set plugins.entries.pcp.config.sbSlug ' +
+      'pcp: no SB slug resolved. Set plugins.entries.pcp.config.sbSlug ' +
         'or add an openclaw entry to ~/.ink/config.json sbMapping. PCP hooks disabled.'
     );
     return;

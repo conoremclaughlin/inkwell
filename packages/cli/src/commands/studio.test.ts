@@ -213,7 +213,7 @@ describe('Studio Commands', () => {
       expect(savedIdentity.branch).toBe('wren/studio/test');
     });
 
-    it('should support custom agent ID', () => {
+    it('should support custom SB slug', () => {
       const worktreePath = join(TEST_DIR, 'test-repo--myra');
       git(`worktree add -b myra/studio/myra "${worktreePath}"`, TEST_REPO);
 

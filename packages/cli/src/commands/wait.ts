@@ -36,7 +36,7 @@ export function registerWaitCommand(program: Command): void {
     .option('-g, --group <groupId>', 'Watch an autonomous strategy/task group for progress')
     .option('--timeout <seconds>', 'Max wait time in seconds (default: 300)', '300')
     .option('--interval <seconds>', 'Poll interval in seconds (default: 15)', '15')
-    .option('-a, --agent <sbSlug>', 'Agent ID (default: from env)')
+    .option('-a, --agent <sbSlug>', 'SB slug (default: from env)')
     .option('--pending', 'Also check pending message queue (for CLI-attached sessions)')
     .action(async (options: WaitOptions) => {
       const timeoutSec = Math.max(10, parseInt(options.timeout || '300', 10));

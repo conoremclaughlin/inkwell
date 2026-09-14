@@ -136,7 +136,7 @@ const sendToInboxSchema = userIdentifierBaseSchema.extend({
     .max(16)
     .optional()
     .describe(
-      'Trigger specific thread participants by agent ID. Takes highest precedence. Non-participants are silently ignored.'
+      'Trigger specific thread participants by SB slug. Takes highest precedence. Non-participants are silently ignored.'
     ),
 });
 
@@ -186,7 +186,7 @@ const getInboxSchema = userIdentifierBaseSchema
       .string()
       .optional()
       .describe(
-        'Agent ID to get inbox for. Omit to get inbox across ALL agents (useful for unified timelines).'
+        'SB slug to get inbox for. Omit to get inbox across ALL agents (useful for unified timelines).'
       ),
     status: z
       .enum(['unread', 'read', 'acknowledged', 'completed', 'all'])
@@ -276,7 +276,7 @@ const getAgentSummariesSchema = userIdentifierBaseSchema.extend({
     .array(z.string())
     .optional()
     .describe(
-      'Specific agent IDs to summarize. Omit to auto-discover all agents from agent_identities.'
+      'Specific SB slugs to summarize. Omit to auto-discover all agents from agent_identities.'
     ),
 });
 

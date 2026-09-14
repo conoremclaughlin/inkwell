@@ -29,7 +29,7 @@ export interface RequestContextData {
   platform?: 'telegram' | 'whatsapp' | 'discord';
   /** Platform-specific user ID */
   platformId?: string;
-  /** Agent ID if known (text label) */
+  /** SB slug if known (text label) */
   sbSlug?: string;
   /** Canonical agent_identities UUID (strongest identity binding) */
   sbId?: string;

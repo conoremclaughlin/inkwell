@@ -561,7 +561,7 @@ export function formatInjectedContext(
 
   // Agent identity section
   sections.push(`## Agent Identity
-You are **${context.agent.name}** (agent ID: \`${context.agent.sbSlug}\`).
+You are **${context.agent.name}** (SB slug: \`${context.agent.sbSlug}\`).
 Role: ${context.agent.role}
 ${context.agent.description ? `\n${context.agent.description}` : ''}`);
 

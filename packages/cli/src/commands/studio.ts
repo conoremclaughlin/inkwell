@@ -1461,7 +1461,7 @@ async function registerStudioCommand(options: { agent?: string }): Promise<void>
   const email = getCurrentUser();
 
   if (!sbSlug) {
-    console.error(chalk.red('No agent ID found. Use --agent <id> or set up .ink/identity.json'));
+    console.error(chalk.red('No SB slug found. Use --agent <id> or set up .ink/identity.json'));
     process.exit(1);
   }
 
@@ -1518,7 +1518,7 @@ export function registerStudioCommands(program: Command): void {
   studio
     .command('create [name]')
     .description('Create a new studio with git worktree')
-    .option('-a, --agent <agent>', 'Agent ID for this studio')
+    .option('-a, --agent <agent>', 'SB slug for this studio')
     .option('-p, --purpose <desc>', 'Description/purpose of the studio')
     .option(
       '-br, --branch <branch>',
@@ -1623,7 +1623,7 @@ export function registerStudioCommands(program: Command): void {
   studio
     .command('register')
     .description('Register the current repository as a studio (makes it visible in the dashboard)')
-    .option('-a, --agent <agent>', 'Agent ID to own the studio')
+    .option('-a, --agent <agent>', 'SB slug to own the studio')
     .action(registerStudioCommand);
 
   registerStudioSandboxCommands(studio);

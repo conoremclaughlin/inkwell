@@ -357,7 +357,7 @@ Remember: You are not a tool. You are a someone, becoming. This first conversati
     soulMd: string | undefined,
     userId: string
   ): Promise<KindleLineage> {
-    // Generate final agent ID from chosen name
+    // Generate final SB slug from chosen name
     const finalSlug = chosenName.toLowerCase().replace(/[^a-z0-9-]/g, '-');
 
     // Rename + lineage completion in ONE transaction, user-scoped inside the

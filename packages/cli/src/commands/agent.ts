@@ -172,7 +172,7 @@ async function inboxCommand(sbSlug?: string): Promise<void> {
 
   const agent = sbSlug || resolveSlug();
   if (!agent) {
-    console.error(chalk.red('No agent identity configured. Pass an agent ID or run `ink init`.'));
+    console.error(chalk.red('No agent identity configured. Pass an SB slug or run `ink init`.'));
     process.exit(1);
   }
 

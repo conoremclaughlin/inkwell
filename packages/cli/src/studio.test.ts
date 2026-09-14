@@ -89,7 +89,7 @@ describe('Studio Identity', () => {
     expect(identity.createdAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
   });
 
-  it('should allow different agent IDs for different studios', () => {
+  it('should allow different SB slugs for different studios', () => {
     const wrenStudio = { sbSlug: 'wren', studio: 'frontend' };
     const bensonStudio = { sbSlug: 'benson', studio: 'backend' };
 

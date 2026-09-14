@@ -3264,7 +3264,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   server.registerTool(
     'get_identity',
     {
-      description: `Get an AI being's identity by agent ID. Returns structured identity data including name, role, values, relationships, and capabilities.
+      description: `Get an AI being's identity by SB slug. Returns structured identity data including name, role, values, relationships, and capabilities.
 
 Use the optional 'file' parameter to fetch a single document (heartbeat, soul, identity) for minimal token usage. Omit to get everything. For the values and process documents, use get_team_constitution instead.
 

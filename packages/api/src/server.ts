@@ -1872,7 +1872,7 @@ function printStatus(): void {
   logger.info('Server Status');
   logger.info('='.repeat(60));
   logger.info(`  Architecture: SessionService (stateless)`);
-  logger.info(`  Agent ID: ${process.env.AGENT_ID || 'myra'}`);
+  logger.info(`  SB slug: ${process.env.SB_SLUG || process.env.AGENT_ID || 'myra'}`);
   logger.info(`  MCP Port: ${env.MCP_HTTP_PORT}`);
 
   const status = channelGateway?.getStatus();

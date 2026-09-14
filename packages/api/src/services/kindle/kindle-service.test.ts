@@ -374,7 +374,7 @@ describe('KindleService', () => {
       });
     });
 
-    it('should generate agent ID from chosen name (lowercase, alphanumeric)', async () => {
+    it('should generate SB slug from chosen name (lowercase, alphanumeric)', async () => {
       const lineage = {
         ...LINEAGE,
         id: 'kindle-123',

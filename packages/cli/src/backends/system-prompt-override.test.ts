@@ -25,7 +25,7 @@ describe('buildIdentityPrompt — override', () => {
   it('drops the identity assertion and the bootstrap instruction', () => {
     const prompt = buildIdentityPrompt('nascent', undefined, AWAKENING);
     expect(prompt).not.toContain('Identity Override');
-    expect(prompt).not.toContain('Your agent ID is');
+    expect(prompt).not.toContain('Your slug is');
     expect(prompt).not.toContain('bootstrap');
   });
 

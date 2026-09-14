@@ -108,7 +108,7 @@ export type TriggerCallback = (payload: AgentTriggerPayload) => Promise<void>;
  * Agent Gateway - handles agent-to-agent triggers
  *
  * Similar to TelegramListener/WhatsAppListener but for inter-agent communication.
- * Registered handlers process triggers by agent ID.
+ * Registered handlers process triggers by SB slug.
  *
  * Supports:
  * - Specific handlers: registerHandler(sbSlug, callback) for per-agent handling
