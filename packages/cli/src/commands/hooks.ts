@@ -2186,6 +2186,7 @@ async function postCompactHandler(): Promise<void> {
 
   const template = loadTemplate('hook-post-compact');
   const output = renderTemplate(template, {
+    SB_SLUG: sbSlug,
     AGENT_ID: sbSlug,
     IDENTITY_BLOCK: identityBlock,
     MEMORIES_BLOCK: memoriesBlock,
@@ -2480,6 +2481,7 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
 
   const template = loadTemplate('hook-session-start');
   const output = renderTemplate(template, {
+    SB_SLUG: sbSlug,
     AGENT_ID: sbSlug,
     WORKSPACE_LINE: studioLine,
     SESSION_IDENTITY: sessionIdentityBlock,

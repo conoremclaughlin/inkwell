@@ -169,6 +169,7 @@ export class GeminiAdapter implements BackendAdapter {
       binary: this.binary,
       args,
       env: {
+        SB_SLUG: config.sbSlug,
         AGENT_ID: config.sbSlug,
         GEMINI_SYSTEM_MD: promptFile,
         INK_CONTEXT: contextToken,

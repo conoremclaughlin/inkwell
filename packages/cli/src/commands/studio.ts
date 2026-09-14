@@ -51,6 +51,8 @@ const __dirname = dirname(__filename);
 
 interface StudioIdentity {
   sbSlug: string;
+  /** Mirror of sbSlug for readers older than the rename. Never read from here. */
+  agentId?: string;
   sbId?: string;
   context: string;
   backend?: string;
@@ -963,6 +965,11 @@ async function createStudioInner(
 
   const identity: StudioIdentity = {
     sbSlug,
+    // Written alongside sbSlug, not instead of it: the API server and any ink
+    // build older than this rename still read `agentId` out of identity.json,
+    // and a studio created by a new CLI has to stay legible to them until
+    // everything is on the new name.
+    agentId: sbSlug,
     ...(sbId ? { sbId } : {}),
     context: `studio-${name}`,
     ...(options.backend ? { backend: options.backend } : {}),

@@ -502,6 +502,7 @@ async function awakenCommand(options: {
       ...process.env,
       ...authEnv,
       ...prepared.env,
+      SB_SLUG: 'nascent',
       AGENT_ID: 'nascent',
     },
   });

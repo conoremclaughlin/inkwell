@@ -25,7 +25,7 @@ interface WaitOptions {
 }
 
 function resolveSlug(): string {
-  return process.env.AGENT_ID || 'wren';
+  return process.env.SB_SLUG || process.env.AGENT_ID || 'wren';
 }
 
 export function registerWaitCommand(program: Command): void {

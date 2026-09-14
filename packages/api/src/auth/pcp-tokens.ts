@@ -112,10 +112,19 @@ export function verifyPcpAccessToken(
     const decoded = jwt.verify(token, env.JWT_SECRET);
     if (typeof decoded === 'string') return null;
 
-    const payload = decoded as PcpTokenPayload;
+    const payload = decoded as PcpTokenPayload & { agentId?: string };
     if (!payload.type || !payload.sub) return null;
 
     if (expectedType && payload.type !== expectedType) return null;
+
+    // Tokens minted before the agentId -> sbSlug rename carry `agentId`, and
+    // stay valid for their full lifetime (an hour for runner tokens, days for
+    // refreshed CLI ones). Normalize here, at the single boundary every
+    // consumer goes through, so a session that authenticated before the deploy
+    // does not silently lose its identity binding mid-flight.
+    if (!payload.sbSlug && payload.agentId) {
+      return { ...payload, sbSlug: payload.agentId };
+    }
 
     return payload;
   } catch {

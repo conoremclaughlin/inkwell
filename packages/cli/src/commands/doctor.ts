@@ -81,7 +81,7 @@ function resolveDefaultCliName(fsOps: Pick<DoctorFs, 'existsSync' | 'readFileSyn
     }
   }
 
-  const fromEnv = process.env.AGENT_ID?.trim().toLowerCase();
+  const fromEnv = (process.env.SB_SLUG || process.env.AGENT_ID)?.trim().toLowerCase();
   if (fromEnv) return `ink-${fromEnv}`;
 
   const cwd = process.cwd();

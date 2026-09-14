@@ -260,7 +260,15 @@ export function parseStudioLease(raw: Json | null | undefined): StudioLease | nu
     threadKeys: Array.isArray(obj.threadKeys)
       ? obj.threadKeys.filter((k): k is string => typeof k === 'string')
       : undefined,
-    sbSlug: typeof obj.sbSlug === 'string' ? obj.sbSlug : '',
+    // Every lease row written before the agentId -> sbSlug rename carries
+    // `agentId`, and no migration renames it. Read both: a held lease whose
+    // slug parsed as '' would look like a lease nobody holds.
+    sbSlug:
+      typeof obj.sbSlug === 'string'
+        ? obj.sbSlug
+        : typeof obj.agentId === 'string'
+          ? obj.agentId
+          : '',
     sbId: typeof obj.sbId === 'string' ? obj.sbId : null,
     acquiredAt: typeof obj.acquiredAt === 'string' ? obj.acquiredAt : '',
     heartbeatAt: typeof obj.heartbeatAt === 'string' ? obj.heartbeatAt : '',

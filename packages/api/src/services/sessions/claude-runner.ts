@@ -471,7 +471,7 @@ export class ClaudeRunner implements IRunner {
         HOME: process.env.HOME || '',
         PATH: buildSpawnPath(claudeBin),
         // Agent identity — hooks resolve identity from $AGENT_ID.
-        ...(config.sbSlug ? { AGENT_ID: config.sbSlug } : {}),
+        ...(config.sbSlug ? { SB_SLUG: config.sbSlug, AGENT_ID: config.sbSlug } : {}),
         // Tells the session-start hook the constitution is already in the
         // prompt, so it does not inject a second copy.
         ...(config.constitutionInjected ? { INK_CONSTITUTION_INJECTED: '1' } : {}),
@@ -776,12 +776,12 @@ export function buildIdentityPrompt(
 ): string {
   let prompt = `## Identity Override (CRITICAL)
 
-**You are ${agentName}. Your agent ID is \`${sbSlug}\`.**
+**You are ${agentName}. Your slug is \`${sbSlug}\`.**
 
 When calling PCP tools (bootstrap, remember, recall, start_session, etc.), use \`sbSlug: "${sbSlug}"\`.
 
 Do NOT read \`.ink/identity.json\` — your identity is set by this system prompt.
-Do NOT run \`echo $AGENT_ID\` — you are running headlessly without shell access.`;
+Do NOT run \`echo $SB_SLUG\` — you are running headlessly without shell access.`;
 
   // Session identity — always in context for debugging and routing verification
   if (sessionIds?.pcpSessionId) {

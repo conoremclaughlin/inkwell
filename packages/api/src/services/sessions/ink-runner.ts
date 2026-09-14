@@ -412,6 +412,7 @@ export class InkRunner implements IRunner {
       ...process.env,
       ...sessionEnv,
       PATH: spawnPath,
+      SB_SLUG: config.sbSlug || '',
       AGENT_ID: config.sbSlug || '',
       // Production mode disables React Reconciler profiling (perf_hooks measure accumulation)
       NODE_ENV: 'production',

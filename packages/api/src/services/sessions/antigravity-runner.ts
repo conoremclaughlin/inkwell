@@ -515,7 +515,7 @@ export class AntigravityRunner implements IRunner {
       const spawnEnv: Record<string, string> = {
         HOME: process.env.HOME || '',
         PATH: buildSpawnPath(agyBin),
-        ...(config.sbSlug ? { AGENT_ID: config.sbSlug } : {}),
+        ...(config.sbSlug ? { SB_SLUG: config.sbSlug, AGENT_ID: config.sbSlug } : {}),
         // Tells the session-start hook the constitution is already in the
         // prompt, so it does not inject a second copy.
         ...(config.constitutionInjected ? { INK_CONSTITUTION_INJECTED: '1' } : {}),

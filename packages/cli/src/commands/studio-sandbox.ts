@@ -386,7 +386,7 @@ export function buildStudioSandboxPlan(
     env: {
       HOME: CONTAINER_HOME,
       INK_SERVER_URL: resolveSandboxServerUrl(),
-      ...(context.sbSlug ? { AGENT_ID: context.sbSlug } : {}),
+      ...(context.sbSlug ? { SB_SLUG: context.sbSlug, AGENT_ID: context.sbSlug } : {}),
       ...(context.studioId ? { INK_STUDIO_ID: context.studioId } : {}),
       INK_SANDBOX: 'docker',
       INK_STUDIO_PATH: '/studio',

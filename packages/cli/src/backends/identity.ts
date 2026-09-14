@@ -12,6 +12,8 @@ import { homedir, tmpdir } from 'os';
 interface PcpConfig {
   userId?: string;
   email?: string;
+  sbMapping?: Record<string, string>;
+  /** Pre-rename name for sbMapping. Still read; ~/.ink/config.json is the user's file. */
   agentMapping?: Record<string, string>;
 }
 
@@ -24,6 +26,13 @@ export interface RuntimePreferences {
 
 export interface IdentityJson {
   sbSlug: string;
+  /**
+   * Pre-rename name for sbSlug. Every .ink/identity.json on disk today carries
+   * it, and nothing rewrites those files on upgrade, so it is read forever (or
+   * until we decide to stop). readIdentityJson() normalizes it away, so no
+   * caller downstream should ever look at this field.
+   */
+  agentId?: string;
   sbId?: string;
   context?: string;
   backend?: string;
@@ -41,7 +50,13 @@ export function readIdentityJson(cwd: string): IdentityJson | null {
   const identityPath = join(cwd, '.ink', 'identity.json');
   if (!existsSync(identityPath)) return null;
   try {
-    return JSON.parse(readFileSync(identityPath, 'utf-8'));
+    const parsed: IdentityJson = JSON.parse(readFileSync(identityPath, 'utf-8'));
+    // Single funnel for every reader of this file, so the legacy `agentId` key
+    // is normalized in exactly one place rather than at a dozen call sites.
+    if (!parsed.sbSlug && parsed.agentId) {
+      return { ...parsed, sbSlug: parsed.agentId };
+    }
+    return parsed;
   } catch {
     return null;
   }
@@ -80,11 +95,12 @@ export function readRoleMd(cwd: string): string | null {
 }
 
 /**
- * Resolve agent ID from multiple sources:
+ * Resolve an SB's slug from multiple sources:
  * 1. CLI --agent flag (if provided)
- * 2. AGENT_ID env var (propagated by sb launcher into backend/hook subprocesses)
+ * 2. SB_SLUG env var, or the pre-rename AGENT_ID (propagated by the ink
+ *    launcher into backend/hook subprocesses)
  * 3. .ink/identity.json in current directory
- * 4. ~/.ink/config.json agentMapping (backend-aware when possible)
+ * 4. ~/.ink/config.json sbMapping (backend-aware when possible)
  * 5. null (no identity configured)
  */
 export function resolveSlug(cliAgent?: string, backendHint?: string): string | null {
@@ -92,9 +108,12 @@ export function resolveSlug(cliAgent?: string, backendHint?: string): string | n
     return cliAgent;
   }
 
-  const envAgent = process.env.AGENT_ID?.trim();
-  if (envAgent) {
-    return envAgent;
+  // AGENT_ID is still read because long-running processes started before the
+  // rename (the main server among them) hold it in their environment, and a
+  // subprocess they spawn inherits it.
+  const envSlug = process.env.SB_SLUG?.trim() || process.env.AGENT_ID?.trim();
+  if (envSlug) {
+    return envSlug;
   }
 
   // process.cwd() throws ENOENT if the working directory has been deleted
@@ -110,22 +129,19 @@ export function resolveSlug(cliAgent?: string, backendHint?: string): string | n
   }
 
   if (cwd) {
-    const localIdentity = join(cwd, '.ink', 'identity.json');
-    if (existsSync(localIdentity)) {
-      try {
-        const identity: IdentityJson = JSON.parse(readFileSync(localIdentity, 'utf-8'));
-        if (identity.sbSlug) return identity.sbSlug;
-      } catch {
-        /* ignore */
-      }
-    }
+    // Goes through readIdentityJson so the legacy `agentId` key is normalized
+    // here too — this path used to parse the file itself and would have missed it.
+    const identity = readIdentityJson(cwd);
+    if (identity?.sbSlug) return identity.sbSlug;
   }
 
   const configPath = join(homedir(), '.ink', 'config.json');
   if (existsSync(configPath)) {
     try {
       const config: PcpConfig = JSON.parse(readFileSync(configPath, 'utf-8'));
-      const mapping = config.agentMapping || {};
+      // ~/.ink/config.json belongs to the user and nothing rewrites it, so the
+      // pre-rename key keeps working indefinitely.
+      const mapping = config.sbMapping || config.agentMapping || {};
 
       const normalized = (backendHint || process.env.SB_BACKEND || process.env.INK_BACKEND || '')
         .toLowerCase()
@@ -202,11 +218,11 @@ export function buildIdentityPrompt(
 
   const identityHeader = `## Identity Override (CRITICAL)
 
-**You are ${sbSlug}. Your agent ID is \`${sbSlug}\`.**
+**You are ${sbSlug}. Your slug is \`${sbSlug}\`.**
 
 When calling Inkwell tools (bootstrap, remember, recall, update_session_state, etc.), use \`sbSlug: "${sbSlug}"\`.
 Do NOT read \`.ink/identity.json\` — your identity is set by this system prompt.
-Do NOT run \`echo $AGENT_ID\` — use the sbSlug provided above.`;
+Do NOT run \`echo $SB_SLUG\` — use the slug provided above.`;
 
   const toolPriority = `## Tool Priority (IMPORTANT)
 

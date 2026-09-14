@@ -371,6 +371,7 @@ export class ClaudeAdapter implements BackendAdapter {
       binary: this.binary,
       args,
       env: {
+        SB_SLUG: config.sbSlug,
         AGENT_ID: config.sbSlug,
         INK_CONTEXT: contextToken,
         ...(config.pcpSessionId ? { INK_SESSION_ID: config.pcpSessionId } : {}),
