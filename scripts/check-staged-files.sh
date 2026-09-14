@@ -19,11 +19,21 @@
 #
 # Usage:
 #   scripts/check-staged-files.sh               scan the index (pre-commit)
-#   scripts/check-staged-files.sh --commit SHA  scan the files SHA adds/changes
-#                                               against its first parent (pre-push)
+#   scripts/check-staged-files.sh --commit SHA  scan what SHA changes against
+#                                               its FIRST PARENT (the empty tree
+#                                               for a root commit), so a merge
+#                                               commit's resolution is scanned
+#                                               like any other change (pre-push)
 #
 # Exit codes mirror check-commit-msg.sh: 0 clean, 1 refused, 2 the scan itself
-# failed and the operation is refused rather than assumed safe.
+# could not complete and the operation is refused rather than assumed safe.
+#
+# Paths are taken NUL-separated (-z) so a filename with a quote, a tab, or a
+# non-ASCII byte arrives as bytes rather than as git's C-quoted rendering,
+# which `git show` would not resolve. A path containing a newline cannot be
+# carried through a line-oriented shell loop losslessly, so it is refused
+# (exit 2) rather than misread. Every blob read is checked on its own exit
+# status: a read that fails is a scan that did not happen, never a clean file.
 #
 # Hook: .husky/pre-commit resolves this file relative to ITSELF, not to the
 # worktree being committed from — see the note at the top of
@@ -70,33 +80,62 @@ case "${1:-}" in
     ;;
 esac
 
-# The path list. -z would be stricter, but a newline inside a path is something
-# git itself refuses to print unquoted, and every consumer below is a plain
-# `while read` — so paths are taken one per line, which is what git emits for
-# every path we will ever commit here.
+fail_closed() { # reason...
+  echo "" >&2
+  if [ "$mode" = index ]; then
+    echo "Commit blocked: the staged-file scan did not complete." >&2
+  else
+    echo "Push blocked: the file scan of commit $commit did not complete." >&2
+  fi
+  printf '   %s\n' "$@" >&2
+  echo "   A scan that errors is not a scan that found nothing, so the operation" >&2
+  echo "   is refused. Nothing has been committed or pushed." >&2
+  echo "" >&2
+  exit 2
+}
+
+raw=$(mktemp "${TMPDIR:-/tmp}/check-staged-paths.XXXXXX") || exit 2
+blob=$(mktemp "${TMPDIR:-/tmp}/check-staged-blob.XXXXXX") || { rm -f "$raw"; exit 2; }
+trap 'rm -f "$raw" "$blob"' EXIT INT TERM
+
+# The comparison base for --commit: the first parent, or the empty tree for a
+# root commit. `git diff-tree <sha>` alone shows NOTHING for a merge commit,
+# which is how a credential file introduced in a merge resolution used to pass.
+parent=''
+if [ "$mode" = commit ]; then
+  parent=$(git rev-parse -q --verify "$commit^1" 2>/dev/null)
+  if [ -z "$parent" ]; then
+    parent=$(git hash-object -t tree /dev/null) || fail_closed "could not compute the empty tree"
+  fi
+fi
+
+# The path list, NUL-separated. T (type change) is included: a symlink replaced
+# by a regular file has new content that must be scanned.
 if [ "$mode" = index ]; then
-  paths=$(git diff --cached --name-only --diff-filter=ACMR)
+  git diff --cached --name-only -z --diff-filter=ACMRT > "$raw"
   rc=$?
 else
-  # --root so a repository's first commit is diffed against the empty tree
-  # rather than against nothing.
-  paths=$(git diff-tree --root --no-commit-id --name-only -r --diff-filter=ACMR "$commit")
+  git diff --name-only -z --diff-filter=ACMRT "$parent" "$commit" > "$raw"
   rc=$?
 fi
-if [ "$rc" -ne 0 ]; then
-  echo "Blocked: could not list the files to check (git exited $rc); refusing rather than passing an unchecked set." >&2
-  exit 2
-fi
-[ -z "$paths" ] && exit 0
+[ "$rc" -ne 0 ] && fail_closed "could not list the files to check (git exited $rc)"
+[ -s "$raw" ] || exit 0
+
+# Lossless-ness check: with -z each path ends in one NUL. If a path itself
+# contains a newline, converting NUL to newline yields more lines than
+# entries, and no line-oriented loop can recover the original path.
+entries=$(tr -cd '\000' < "$raw" | wc -c | tr -d ' ')
+lines=$(tr '\000' '\n' < "$raw" | grep -c '')
+case "$entries$lines" in *[!0-9]*) fail_closed "could not count the staged paths" ;; esac
+[ "$entries" -ne "$lines" ] && fail_closed "a staged path contains a newline; refusing rather than misreading it"
 
 # NAMES. Matched against the full path with a leading slash so both "/.env" and
-# "packages/api/.env" are one rule. Order matters only in that the allow list
-# for example/template files is consulted first.
+# "packages/api/.env" are one rule. The allow list for example/template files
+# is consulted first.
 forbidden_name() {
   p="/$1"
   base=${p##*/}
 
-  # Allowed regardless of what follows: templates that ship placeholders.
   case "$base" in
     *.example | *.sample | *.template | *.dist) return 1 ;;
   esac
@@ -118,19 +157,29 @@ forbidden_name() {
   return 1
 }
 
+# The entry's mode in the tree being scanned. A gitlink (160000, a submodule
+# pointer) has no blob to read and is skipped by the SHAPES arm; a symlink
+# (120000) reads as its target string, which is harmless to scan.
+entry_mode() {
+  if [ "$mode" = index ]; then
+    git ls-files --stage -z -- "$1" 2>/dev/null | tr '\000' '\n' | head -1 | cut -d' ' -f1
+  else
+    git ls-tree -z "$commit" -- "$1" 2>/dev/null | tr '\000' '\n' | head -1 | cut -d' ' -f1
+  fi
+}
+
 # Content for a path in the mode we are running in. Never the working tree:
 # the working tree can differ from what is being committed, and the working
 # tree is not what leaves the machine.
-blob_of() {
+read_blob() { # path -> writes $blob, returns git's status
   if [ "$mode" = index ]; then
-    git show ":$1"
+    git show ":$1" > "$blob" 2>/dev/null
   else
-    git show "$commit:$1"
+    git show "$commit:$1" > "$blob" 2>/dev/null
   fi
 }
 
 refused=0
-scan_failed=0
 name_hits=''
 shape_hits=''
 
@@ -145,34 +194,28 @@ while IFS= read -r path; do
     continue
   fi
 
-  # SHAPES. Binary files are skipped by grep -I. A blob that cannot be read at
-  # all is a failed scan, not a clean one.
-  matches=$(blob_of "$path" 2>/dev/null | grep -nIE "$shapes" | cut -d: -f1)
+  case "$(entry_mode "$path")" in
+    160000) continue ;;   # submodule pointer: nothing to read
+  esac
+
+  read_blob "$path"
   rc=$?
-  # $rc is cut's status; capture grep's separately.
-  grep_rc=$(blob_of "$path" 2>/dev/null | grep -qIE "$shapes"; echo $?)
-  if [ "$grep_rc" -ge 2 ] || [ "$rc" -ne 0 ]; then
-    scan_failed=1
-    continue
-  fi
-  if [ "$grep_rc" -eq 0 ]; then
+  [ "$rc" -ne 0 ] && fail_closed "could not read the committed content of '$path' (git show exited $rc)"
+
+  # SHAPES. -I skips binary content. grep's own status decides: 0 matched,
+  # 1 clean, anything else is a failed scan.
+  grep -qIE "$shapes" "$blob"
+  grc=$?
+  [ "$grc" -ge 2 ] && fail_closed "the pattern scan of '$path' failed (grep exited $grc)"
+  if [ "$grc" -eq 0 ]; then
     refused=1
-    lines=$(printf '%s' "$matches" | tr '\n' ',' | sed 's/,$//')
-    shape_hits="$shape_hits$path: line(s) $lines
+    lines_hit=$(grep -nIE "$shapes" "$blob" | cut -d: -f1 | tr '\n' ',' | sed 's/,$//')
+    shape_hits="$shape_hits$path: line(s) $lines_hit
 "
   fi
 done <<EOF
-$paths
+$(tr '\000' '\n' < "$raw")
 EOF
-
-if [ "$scan_failed" -eq 1 ]; then
-  echo "" >&2
-  echo "Blocked: the credential scan did not complete for at least one file." >&2
-  echo "   A scan that errors is not a scan that found nothing, so the operation" >&2
-  echo "   is refused. Nothing has been committed or pushed." >&2
-  echo "" >&2
-  exit 2
-fi
 
 if [ "$refused" -eq 1 ]; then
   echo ""

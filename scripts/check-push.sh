@@ -23,6 +23,14 @@
 # A remote sha of all zeros means the ref is new on the remote; a local sha of
 # all zeros means a delete, which pushes nothing and is not checked.
 #
+# For a ref that is new on the remote, "what leaves the machine" is measured
+# against THAT remote: its heads and tags are listed at push time and only
+# commits it already has are excluded. Remote-tracking refs are not used for
+# this — they include other remotes (a commit already pushed to a private
+# mirror is still leaving for the public one) and they go stale. If the
+# destination cannot be listed, nothing is excluded and every reachable commit
+# is replayed: slower, never quieter.
+#
 # Usage, by hand:  scripts/check-push.sh --preview [<base>]
 # Replays <base>..HEAD (default origin/main) exactly as the hook would, without
 # pushing. This is the read-back to run before `git push`.
@@ -48,17 +56,20 @@ done
 
 preview=0
 base=''
+remote_name=${1:-}
 case "${1:-}" in
   --preview)
     preview=1
     base=${2:-origin/main}
+    remote_name=''
     ;;
 esac
 
 zeros=0000000000000000000000000000000000000000
 tmp=$(mktemp "${TMPDIR:-/tmp}/check-push.XXXXXX") || exit 2
 report=$(mktemp "${TMPDIR:-/tmp}/check-push-report.XXXXXX") || { rm -f "$tmp"; exit 2; }
-trap 'rm -f "$tmp" "$report"' EXIT INT TERM
+have=$(mktemp "${TMPDIR:-/tmp}/check-push-remote.XXXXXX") || { rm -f "$tmp" "$report"; exit 2; }
+trap 'rm -f "$tmp" "$report" "$have"' EXIT INT TERM
 
 failed=0
 total=0
@@ -122,10 +133,20 @@ else
     [ "$local_sha" = "$zeros" ] && continue   # delete: nothing leaves the machine
 
     if [ "$remote_sha" = "$zeros" ]; then
-      # New ref on the remote: everything reachable from it that no remote
-      # already has. Wider than "since origin/main" on purpose — a branch cut
-      # from another branch still pushes those commits for the first time.
-      range=$(git rev-list --reverse "$local_sha" --not --remotes 2>/dev/null)
+      # New ref on the destination. Exclude only what the DESTINATION has,
+      # measured now, and exclude nothing if it cannot be measured.
+      exclude=''
+      if git ls-remote --quiet --heads --tags "$remote_name" > "$have" 2>/dev/null; then
+        while read -r sha _; do
+          [ -n "$sha" ] || continue
+          git cat-file -e "$sha" 2>/dev/null && exclude="$exclude ^$sha"
+        done < "$have"
+      else
+        echo "   (could not list the refs of '$remote_name'; replaying every commit reachable from $local_ref)"
+      fi
+      # $exclude is unquoted on purpose: it is a space-separated list of ^<sha>.
+      # shellcheck disable=SC2086
+      range=$(git rev-list --reverse "$local_sha" $exclude 2>/dev/null)
       rc=$?
     else
       range=$(git rev-list --reverse "$remote_sha..$local_sha" 2>/dev/null)

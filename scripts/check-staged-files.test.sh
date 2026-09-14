@@ -259,6 +259,75 @@ sha=$(git -C "$r" rev-parse HEAD)
 out=$(cd "$r" && sh "$guard" --commit "$sha" 2>&1); rc=$?
 [ "$rc" -eq 0 ] && ok "--commit mode allows a clean commit even when an earlier commit was bad" || bad "--commit mode allows a clean commit" "exit $rc: $(echo "$out" | tr '\n' ' ')"
 
+# Quoted paths (Lumen r1 #1): git's --name-only C-quotes a quote, a tab or a
+# non-ASCII byte, and `git show` of the quoted rendering fails. The token must
+# still be found, and a clean file under such a name must still pass.
+for name in 'café.txt' 'quoted"name.txt' 'tab	name.txt'; do
+  r=$(new_repo "scan-quoted-$pass" "$nohooks")
+  stage "$r" "$name" "token ghp_$F36"
+  out=$(run_index "$r"); rc=$?
+  [ "$rc" -eq 1 ] && ok "token inside a file named [$name] is refused" || bad "token inside a file named [$name] is refused" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+  echo "$out" | grep -qF "$name: line(s) 1" && ok "refusal reports the unquoted path for [$name]" || bad "refusal reports the unquoted path for [$name]" "$(echo "$out" | tr '\n' ' ')"
+done
+r=$(new_repo scan-quoted-env "$nohooks")
+stage "$r" 'ümlaut/.env.local' 'X=1'
+out=$(run_index "$r"); rc=$?
+[ "$rc" -eq 1 ] && ok "a credential file under a non-ASCII directory is refused by name" || bad "a credential file under a non-ASCII directory is refused by name" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+r=$(new_repo scan-quoted-clean "$nohooks")
+stage "$r" 'café.txt' 'nothing to see'
+out=$(run_index "$r"); rc=$?
+[ "$rc" -eq 0 ] && ok "a clean file under a quoted name still passes" || bad "a clean file under a quoted name still passes" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+
+# A path containing a newline cannot be carried losslessly: refuse, never misread.
+r=$(new_repo scan-newline "$nohooks")
+stage "$r" 'two
+lines.txt' 'clean'
+out=$(run_index "$r"); rc=$?
+[ "$rc" -eq 2 ] && ok "a path containing a newline fails closed (exit 2)" || bad "a path containing a newline fails closed" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+
+# A blob read that fails is a scan that did not happen (Lumen r1 #1): stub git
+# so `git show` exits 128 and everything else is real.
+mkdir -p "$work/gitstub"
+realgit=$(command -v git)
+printf '#!/bin/sh\nif [ "$1" = show ]; then exit 128; fi\nexec %s "$@"\n' "$realgit" > "$work/gitstub/git"
+chmod +x "$work/gitstub/git"
+r=$(new_repo scan-readfail "$nohooks")
+stage "$r" ordinary.txt "token ghp_$F36"
+out=$(cd "$r" && PATH="$work/gitstub:$PATH" sh "$guard" 2>&1); rc=$?
+[ "$rc" -eq 2 ] && ok "a failing git show fails closed (exit 2) instead of passing" || bad "a failing git show fails closed" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+echo "$out" | grep -q 'ordinary.txt' && ok "the read failure names the path" || bad "the read failure names the path" "$(echo "$out" | tr '\n' ' ')"
+
+# Merge-only content (Lumen r1 #2): a credential file introduced in the merge
+# resolution, present in neither parent's diff.
+r=$(new_repo scan-merge "$nohooks")
+stage "$r" base.txt 'base'; git -C "$r" commit -q --no-verify -m 'fixture: base' 2>/dev/null
+git -C "$r" checkout -q -b topic; stage "$r" topic.txt 'topic'; git -C "$r" commit -q --no-verify -m 'fixture: topic' 2>/dev/null
+git -C "$r" checkout -q - ; stage "$r" main.txt 'main'; git -C "$r" commit -q --no-verify -m 'fixture: main' 2>/dev/null
+git -C "$r" merge -q --no-commit --no-ff topic >/dev/null 2>&1
+stage "$r" .env.local 'X=1'
+git -C "$r" commit -q --no-verify -m 'fixture: merge resolution' 2>/dev/null
+sha=$(git -C "$r" rev-parse HEAD)
+[ "$(git -C "$r" rev-list --parents -n1 "$sha" | wc -w | tr -d ' ')" -eq 3 ] || bad "fixture is a merge commit" "not a merge"
+out=$(cd "$r" && sh "$guard" --commit "$sha" 2>&1); rc=$?
+[ "$rc" -eq 1 ] && ok "--commit mode refuses a credential file introduced only in a merge resolution" || bad "--commit mode refuses a merge-only credential file" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+out=$(cd "$r" && sh "$guard" --commit "$sha~1" 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "--commit mode still passes the clean first parent" || bad "--commit mode still passes the clean first parent" "exit $rc"
+
+# Type change (Lumen r1 #4): a tracked symlink replaced by a regular file with
+# a token is a T entry, which ACMR skipped.
+r=$(new_repo scan-typechange "$nohooks")
+stage "$r" base.txt 'base'
+ln -s base.txt "$r/config.txt"; git -C "$r" add config.txt
+git -C "$r" commit -q --no-verify -m 'fixture: symlink' 2>/dev/null
+rm "$r/config.txt"; stage "$r" config.txt "token ghp_$F36"
+git -C "$r" diff --cached --name-status | grep -q '^T' || bad "fixture is a type change" "$(git -C "$r" diff --cached --name-status)"
+out=$(run_index "$r"); rc=$?
+[ "$rc" -eq 1 ] && ok "symlink-to-file type change with a token is refused (index)" || bad "symlink-to-file type change with a token is refused (index)" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+git -C "$r" commit -q --no-verify -m 'fixture: typechange' 2>/dev/null
+sha=$(git -C "$r" rev-parse HEAD)
+out=$(cd "$r" && sh "$guard" --commit "$sha" 2>&1); rc=$?
+[ "$rc" -eq 1 ] && ok "symlink-to-file type change with a token is refused (--commit)" || bad "symlink-to-file type change with a token is refused (--commit)" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+
 out=$(cd "$r" && sh "$guard" --commit 2>&1); rc=$?
 [ "$rc" -eq 2 ] && ok "--commit without a SHA is a usage error (exit 2)" || bad "--commit without a SHA is a usage error" "exit $rc"
 out=$(cd "$r" && sh "$guard" --bogus 2>&1); rc=$?

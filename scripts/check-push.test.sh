@@ -195,6 +195,56 @@ out=$(git -C "$r" push -u origin topic 2>&1); rc=$?
 c=$(echo "$out" | grep -c -- '^--- ')
 [ "$c" -eq 1 ] && echo "$out" | grep -q -- "--- $st" && ok "a new branch replays only the commits no remote has" || bad "a new branch replays only the commits no remote has" "printed $c headers: $(echo "$out" | tr '\n' ' ')"
 
+# A credential file introduced only in a merge resolution (Lumen r1 #2),
+# pushed for real.
+r=$(new_pair mergepush "$hooks_dir")
+commit_file "$r" base.txt 'base' 'feat: base'
+git -C "$r" checkout -q -b topic
+commit_file "$r" topic.txt 'topic' 'feat: topic'
+git -C "$r" checkout -q main
+commit_file "$r" main.txt 'main' 'feat: main'
+git -C "$r" merge -q --no-commit --no-ff topic >/dev/null 2>&1
+printf 'X=1' > "$r/.env.local"; git -C "$r" add -f .env.local
+printf 'chore: merge topic\n' > "$r/.git/MSG"; git -C "$r" commit -q --no-verify -F "$r/.git/MSG"
+out=$(git -C "$r" push -u origin main 2>&1); rc=$?
+if [ "$rc" -ne 0 ] && [ -z "$(remote_head "$work/mergepush.git" main)" ]; then
+  ok "a credential file that exists only in a merge resolution blocks the push"
+else
+  bad "a credential file that exists only in a merge resolution blocks the push" "exit $rc; remote main: $(remote_head "$work/mergepush.git" main)"
+fi
+
+# Two remotes (Lumen r1 #3): a refused commit already on a private remote is
+# still leaving the machine when it goes to a public one for the first time.
+r=$(new_pair tworemotes "$hooks_dir")
+commit_file "$r" a.txt 'one' 'test: synthetic secret assignment
+
+JWT_SECRET=REVIEWCANARY0042' --no-verify
+git init -q --bare "$work/tworemotes-private.git"
+git -C "$r" remote add private "$work/tworemotes-private.git"
+git -C "$r" -c core.hooksPath="$work/none" push -q private main >/dev/null 2>&1
+[ -n "$(remote_head "$work/tworemotes-private.git" main)" ] || bad "fixture: private remote received the commit" "private push failed"
+out=$(git -C "$r" push -u origin main 2>&1); rc=$?
+if [ "$rc" -ne 0 ] && [ -z "$(remote_head "$work/tworemotes.git" main)" ]; then
+  ok "a commit already on another remote is still replayed for a new remote and blocked"
+else
+  bad "a commit already on another remote is still replayed for a new remote and blocked" "exit $rc; origin main: $(remote_head "$work/tworemotes.git" main)"
+fi
+echo "$out" | grep -q 'REVIEWCANARY0042' && bad "two-remote refusal does not print the value" "value bytes in output" || ok "two-remote refusal does not print the value"
+
+# ...and a commit the DESTINATION already has is not replayed again, even when
+# the local remote-tracking ref for it is stale.
+r=$(new_pair stale "$hooks_dir")
+commit_file "$r" a.txt 'one' 'feat: already on origin'
+git -C "$r" -c core.hooksPath="$work/none" push -q origin main >/dev/null 2>&1
+git -C "$r" update-ref -d refs/remotes/origin/main 2>/dev/null   # forget what origin has
+git -C "$r" checkout -q -b topic
+commit_file "$r" t.txt 'topic' 'feat: only on topic'
+st=$(git -C "$r" rev-parse --short HEAD)
+out=$(git -C "$r" push -u origin topic 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "a new branch pushes when tracking refs are stale" || bad "a new branch pushes when tracking refs are stale" "exit $rc: $(echo "$out" | tr '\n' ' ')"
+c=$(echo "$out" | grep -c -- '^--- ')
+[ "$c" -eq 1 ] && echo "$out" | grep -q -- "--- $st" && ok "exclusion is measured against the destination, not stale tracking refs" || bad "exclusion is measured against the destination, not stale tracking refs" "printed $c headers: $(echo "$out" | tr '\n' ' ')"
+
 echo "PREVIEW (scripts/check-push.sh --preview, the read-back before pushing)"
 
 replay="$hooks_dir/../scripts/check-push.sh"
