@@ -111,7 +111,7 @@ async function persistRun(
     metadata: {
       benchmarkType: 'bootstrap_relevance',
       benchmarkTopic: BENCHMARK_TOPIC,
-      benchmarkAgentId: BENCHMARK_AGENT_ID,
+      benchmarkSlug: BENCHMARK_AGENT_ID,
     },
   };
 
@@ -160,7 +160,7 @@ async function main() {
       // Intentionally create target first so baseline recency order is disadvantaged.
       const target = await repo.remember({
         userId,
-        agentId: BENCHMARK_AGENT_ID,
+        sbSlug: BENCHMARK_AGENT_ID,
         content: testCase.targetContent,
         summary: `bootstrap target ${testCase.id}`,
         source: 'observation',
@@ -175,7 +175,7 @@ async function main() {
       for (let i = 0; i < testCase.distractors.length; i += 1) {
         const distractor = await repo.remember({
           userId,
-          agentId: BENCHMARK_AGENT_ID,
+          sbSlug: BENCHMARK_AGENT_ID,
           content: testCase.distractors[i],
           summary: `bootstrap distractor ${testCase.id} #${i + 1}`,
           source: 'observation',

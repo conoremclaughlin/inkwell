@@ -51,8 +51,8 @@ export interface PiCodingToolsConfig {
   /** Default bash timeout in seconds when model doesn't specify one (default: 120) */
   bashTimeoutSeconds?: number;
   /** Agent identity — enables bash guard (dangerous command blocking + kill scope) */
-  agentId?: string;
-  /** Bash guard options (requires agentId to be set) */
+  sbSlug?: string;
+  /** Bash guard options (requires sbSlug to be set) */
   bashGuard?: {
     /** Block catastrophic commands before execution (default: true) */
     blockDangerousCommands?: boolean;
@@ -299,7 +299,7 @@ export async function createInkCodingTools(
 
   const enforceRoot = config.enforceWorkspaceRoot !== false;
   const bashTimeout = config.bashTimeoutSeconds ?? DEFAULT_BASH_TIMEOUT_SECONDS;
-  const agentId = config.agentId;
+  const sbSlug = config.sbSlug;
 
   return tools.map((tool) => ({
     schema: {
@@ -333,11 +333,11 @@ export async function createInkCodingTools(
       }
 
       // Bash guard: block dangerous commands and enforce kill scope
-      if (tool.name === 'bash' && agentId) {
+      if (tool.name === 'bash' && sbSlug) {
         const command = params.command as string;
         if (command) {
           const guard = guardBashCommand(command, {
-            agentId,
+            sbSlug,
             ...config.bashGuard,
           });
           if (!guard.allowed) {

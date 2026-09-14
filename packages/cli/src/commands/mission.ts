@@ -46,7 +46,7 @@ export interface MissionActivity {
   id: string;
   type?: string;
   subtype?: string;
-  agentId?: string;
+  sbSlug?: string;
   content?: string;
   sessionId?: string;
   platform?: string;
@@ -62,11 +62,11 @@ export interface InboxMessage {
   messageType?: string;
   priority?: string;
   status?: string;
-  senderAgentId?: string;
+  senderSlug?: string;
   threadKey?: string;
   metadata?: Record<string, unknown>;
   createdAt?: string;
-  recipientAgentId?: string;
+  recipientSlug?: string;
 }
 
 interface MissionFeedRow {
@@ -102,15 +102,14 @@ export function extractInboxMessages(
         messageType: typeof row.messageType === 'string' ? row.messageType : undefined,
         priority: typeof row.priority === 'string' ? row.priority : undefined,
         status: typeof row.status === 'string' ? row.status : undefined,
-        senderAgentId: typeof row.senderAgentId === 'string' ? row.senderAgentId : undefined,
+        senderSlug: typeof row.senderSlug === 'string' ? row.senderSlug : undefined,
         threadKey: typeof row.threadKey === 'string' ? row.threadKey : undefined,
         metadata:
           row.metadata && typeof row.metadata === 'object' && !Array.isArray(row.metadata)
             ? (row.metadata as Record<string, unknown>)
             : undefined,
         createdAt: typeof row.createdAt === 'string' ? row.createdAt : undefined,
-        recipientAgentId:
-          typeof row.recipientAgentId === 'string' ? row.recipientAgentId : undefined,
+        recipientSlug: typeof row.recipientSlug === 'string' ? row.recipientSlug : undefined,
       };
     })
     .filter((msg): msg is InboxMessage => Boolean(msg));
@@ -125,7 +124,7 @@ export function extractInboxMessages(
     const previews = Array.isArray(t.previewMessages) ? t.previewMessages : [];
     for (const preview of previews) {
       const p = preview as Record<string, unknown>;
-      const sender = typeof p.senderAgentId === 'string' ? p.senderAgentId : undefined;
+      const sender = typeof p.senderSlug === 'string' ? p.senderSlug : undefined;
       const content = typeof p.content === 'string' ? p.content : undefined;
       const createdAt = typeof p.createdAt === 'string' ? p.createdAt : undefined;
       const msgType = typeof p.messageType === 'string' ? p.messageType : undefined;
@@ -136,8 +135,8 @@ export function extractInboxMessages(
         id: `thread-${threadKey}-${createdAt}`,
         content,
         messageType: msgType,
-        senderAgentId: sender,
-        recipientAgentId: recipients[0],
+        senderSlug: sender,
+        recipientSlug: recipients[0],
         threadKey,
         createdAt,
       });
@@ -149,8 +148,8 @@ export function extractInboxMessages(
 
 export function inboxMessageToFeedEvent(msg: InboxMessage, timezone?: string): FeedEvent {
   const maxPreview = Math.min(120, (process.stdout.columns || 80) - 25);
-  const sender = msg.senderAgentId || 'user';
-  const recipient = msg.recipientAgentId || 'unknown';
+  const sender = msg.senderSlug || 'user';
+  const recipient = msg.recipientSlug || 'unknown';
 
   // Build content line
   const preview = msg.subject || compactPreview(msg.content, maxPreview);
@@ -204,30 +203,30 @@ export function inboxMessageToFeedEvent(msg: InboxMessage, timezone?: string): F
 export function resolveAttachCommand(
   sessions: Session[],
   target: string
-): { command: string; sessionId: string; agentId: string } | null {
+): { command: string; sessionId: string; sbSlug: string } | null {
   const trimmed = target.trim();
   if (!trimmed) return null;
 
   const directMatch = sessions.find((session) => session.id.startsWith(trimmed));
   if (directMatch) {
-    const agentId = directMatch.agentId || 'wren';
+    const sbSlug = directMatch.sbSlug || 'wren';
     return {
-      command: `ink chat -a ${agentId} --session-id ${directMatch.id}`,
+      command: `ink chat -a ${sbSlug} --session-id ${directMatch.id}`,
       sessionId: directMatch.id,
-      agentId,
+      sbSlug,
     };
   }
 
   const byAgent = sessions
-    .filter((session) => (session.agentId || '').toLowerCase() === trimmed.toLowerCase())
+    .filter((session) => (session.sbSlug || '').toLowerCase() === trimmed.toLowerCase())
     .sort((a, b) => Date.parse(b.startedAt || '') - Date.parse(a.startedAt || ''))[0];
   if (!byAgent) return null;
 
-  const agentId = byAgent.agentId || trimmed;
+  const sbSlug = byAgent.sbSlug || trimmed;
   return {
-    command: `ink chat -a ${agentId} --session-id ${byAgent.id}`,
+    command: `ink chat -a ${sbSlug} --session-id ${byAgent.id}`,
     sessionId: byAgent.id,
-    agentId,
+    sbSlug,
   };
 }
 
@@ -302,9 +301,9 @@ function extractActivities(result: Record<string, unknown> | null | undefined): 
         id,
         type: typeof row.type === 'string' ? row.type : undefined,
         subtype: typeof row.subtype === 'string' ? row.subtype : undefined,
-        agentId:
-          typeof row.agentId === 'string'
-            ? row.agentId
+        sbSlug:
+          typeof row.sbSlug === 'string'
+            ? row.sbSlug
             : typeof row.agent_id === 'string'
               ? row.agent_id
               : undefined,
@@ -530,7 +529,7 @@ export function summarizeMissionFeedRows(
     })
     .map((activity) => {
       const trigger = parseTriggerEnvelope(activity.content);
-      const actor = activity.agentId || 'system';
+      const actor = activity.sbSlug || 'system';
       const platform = activity.platform || '-';
       const sessionStudio = studioLabelForSession(
         activity.sessionId ? sessionsById.get(activity.sessionId) : undefined
@@ -575,8 +574,8 @@ export function summarizeMissionFeedRows(
 }
 
 function inboxMessageToFeedRow(msg: InboxMessage): MissionFeedRow {
-  const sender = msg.senderAgentId || 'user';
-  const recipient = msg.recipientAgentId || 'unknown';
+  const sender = msg.senderSlug || 'user';
+  const recipient = msg.recipientSlug || 'unknown';
 
   const typeTag = msg.messageType
     ? msg.messageType === 'message'
@@ -617,7 +616,7 @@ export function summarizeMissionRows(
   const grouped = new Map<string, Session[]>();
 
   for (const session of sessions) {
-    const agent = session.agentId || 'unknown';
+    const agent = session.sbSlug || 'unknown';
     const list = grouped.get(agent) || [];
     list.push(session);
     grouped.set(agent, list);
@@ -731,12 +730,12 @@ async function fetchMissionSnapshot(options: MissionOptions): Promise<MissionSna
     email: config.email,
     status: 'active',
     limit: Number.parseInt(options.limit || '40', 10),
-    ...(options.agent ? { agentId: options.agent } : {}),
+    ...(options.agent ? { sbSlug: options.agent } : {}),
   })) as Record<string, unknown>;
 
   const sessions = parseSessions(listResult);
   const allAgents = new Set<string>(
-    sessions.map((session) => session.agentId || 'unknown').filter(Boolean)
+    sessions.map((session) => session.sbSlug || 'unknown').filter(Boolean)
   );
 
   if (options.agent) {
@@ -756,21 +755,21 @@ async function fetchMissionSnapshot(options: MissionOptions): Promise<MissionSna
   try {
     const summariesResult = (await pcp.callTool('get_agent_summaries', {
       email: config.email,
-      ...(options.agent ? { agentIds: [options.agent] } : {}),
+      ...(options.agent ? { sbSlugs: [options.agent] } : {}),
     })) as Record<string, unknown>;
 
     const agents = Array.isArray(summariesResult.agents) ? summariesResult.agents : [];
     for (const a of agents) {
       const agent = a as Record<string, unknown>;
-      const agentId = typeof agent.agentId === 'string' ? agent.agentId : 'unknown';
+      const sbSlug = typeof agent.sbSlug === 'string' ? agent.sbSlug : 'unknown';
       const totalUnread = typeof agent.totalUnread === 'number' ? agent.totalUnread : 0;
-      unreadByAgent[agentId] = totalUnread;
-      allAgents.add(agentId);
+      unreadByAgent[sbSlug] = totalUnread;
+      allAgents.add(sbSlug);
 
       // Extract new summary fields
-      if (typeof agent.generating === 'number') generatingByAgent[agentId] = agent.generating;
-      if (typeof agent.sessionsToday === 'number') todayByAgent[agentId] = agent.sessionsToday;
-      if (typeof agent.studioCount === 'number') studiosByAgent[agentId] = agent.studioCount;
+      if (typeof agent.generating === 'number') generatingByAgent[sbSlug] = agent.generating;
+      if (typeof agent.sessionsToday === 'number') todayByAgent[sbSlug] = agent.sessionsToday;
+      if (typeof agent.studioCount === 'number') studiosByAgent[sbSlug] = agent.studioCount;
 
       // Extract session lifecycle breakdown
       const byLc = agent.sessionsByLifecycle;
@@ -779,17 +778,17 @@ async function fetchMissionSnapshot(options: MissionOptions): Promise<MissionSna
         for (const [lc, count] of Object.entries(byLc as Record<string, unknown>)) {
           if (typeof count === 'number') breakdown[lc] = count;
         }
-        if (Object.keys(breakdown).length > 0) lifecycleByAgent[agentId] = breakdown;
+        if (Object.keys(breakdown).length > 0) lifecycleByAgent[sbSlug] = breakdown;
       }
     }
   } catch {
     // Fallback: server doesn't support get_agent_summaries yet — derive from get_inbox
     const agentsToQuery = options.agent ? [options.agent] : Array.from(allAgents);
-    for (const agentId of agentsToQuery) {
+    for (const sbSlug of agentsToQuery) {
       try {
         const inboxResult = (await pcp.callTool('get_inbox', {
           email: config.email,
-          agentId,
+          sbSlug,
           status: 'unread',
           limit: 200,
           // Mission control reports on OTHER agents' mailboxes. Displaying a
@@ -798,9 +797,9 @@ async function fetchMissionSnapshot(options: MissionOptions): Promise<MissionSna
           // marks the whole team's mail read.
           markRead: false,
         })) as Record<string, unknown>;
-        unreadByAgent[agentId] = extractUnreadCount(inboxResult);
+        unreadByAgent[sbSlug] = extractUnreadCount(inboxResult);
       } catch {
-        unreadByAgent[agentId] = 0;
+        unreadByAgent[sbSlug] = 0;
       }
     }
   }
@@ -810,7 +809,7 @@ async function fetchMissionSnapshot(options: MissionOptions): Promise<MissionSna
     try {
       const inboxResult = (await pcp.callTool('get_inbox', {
         email: config.email,
-        ...(options.agent ? { agentId: options.agent } : {}),
+        ...(options.agent ? { sbSlug: options.agent } : {}),
         status: 'all',
         limit: Number.parseInt(options.feedLimit || '40', 10),
         // Same reasoning as the count above — the feed is a display surface.
@@ -985,7 +984,7 @@ export function activityToFeedEvent(
   sessionsById?: Map<string, Session>
 ): FeedEvent {
   const trigger = parseTriggerEnvelope(activity.content);
-  const actor = activity.agentId || 'system';
+  const actor = activity.sbSlug || 'system';
   const type = mapActivityToFeedType(activity);
 
   // Keep feed content compact — terminal width minus icon/agent/time overhead
@@ -1297,7 +1296,7 @@ async function runMission(options: MissionOptions): Promise<void> {
         return;
       }
       console.log(chalk.bold('\nResolved attach target\n'));
-      console.log(chalk.dim(`agent:   ${attach.agentId}`));
+      console.log(chalk.dim(`agent:   ${attach.sbSlug}`));
       console.log(chalk.dim(`session: ${attach.sessionId}`));
       console.log(chalk.green(`\n${attach.command}\n`));
       return;

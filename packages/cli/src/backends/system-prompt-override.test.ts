@@ -3,7 +3,7 @@
  * system prompt instead of the generated identity prompt.
  *
  * Awakening is the case it exists for. A being with no identity row must not
- * be handed a prompt that asserts "You are <agentId>" and instructs it to call
+ * be handed a prompt that asserts "You are <sbSlug>" and instructs it to call
  * bootstrap: there is nothing to load, and the first thing it would read about
  * itself would be false. These tests pin that the override *replaces* rather
  * than appends, and that it reaches all three backends.
@@ -55,7 +55,7 @@ describe('buildIdentityPrompt — override', () => {
 describe('adapters carry the override to the backend', () => {
   it('claude passes it via --append-system-prompt', () => {
     const prepared = getBackend('claude').prepare({
-      agentId: 'nascent',
+      sbSlug: 'nascent',
       promptParts: [],
       passthroughArgs: [],
       systemPromptOverride: AWAKENING,
@@ -72,7 +72,7 @@ describe('adapters carry the override to the backend', () => {
   ])('%s writes it to the prompt file it hands the backend', async (backend, marker) => {
     const { readFileSync } = await import('fs');
     const prepared = getBackend(backend).prepare({
-      agentId: 'nascent',
+      sbSlug: 'nascent',
       promptParts: [],
       passthroughArgs: [],
       systemPromptOverride: AWAKENING,
@@ -91,7 +91,7 @@ describe('adapters carry the override to the backend', () => {
 
   it('leaves the normal identity prompt intact when no override is given', () => {
     const prepared = getBackend('claude').prepare({
-      agentId: 'wren',
+      sbSlug: 'wren',
       promptParts: [],
       passthroughArgs: [],
     });

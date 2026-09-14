@@ -48,7 +48,7 @@ describe('Auto-Create Main Studio Integration', () => {
     const result = await handleStartSession(
       {
         userId: INTEGRATION_TEST_USER_ID,
-        agentId: INTEGRATION_TEST_AGENT_ID,
+        sbSlug: INTEGRATION_TEST_AGENT_ID,
         studioId: 'main',
         repoRoot: TEST_REPO_ROOT,
       },
@@ -90,7 +90,7 @@ describe('Auto-Create Main Studio Integration', () => {
     const result = await handleStartSession(
       {
         userId: INTEGRATION_TEST_USER_ID,
-        agentId: INTEGRATION_TEST_AGENT_ID,
+        sbSlug: INTEGRATION_TEST_AGENT_ID,
         studioId: 'main',
         repoRoot: TEST_REPO_ROOT,
       },
@@ -125,7 +125,7 @@ describe('Auto-Create Main Studio Integration', () => {
     const result = await handleStartSession(
       {
         userId: INTEGRATION_TEST_USER_ID,
-        agentId: INTEGRATION_TEST_AGENT_ID,
+        sbSlug: INTEGRATION_TEST_AGENT_ID,
         studioId: 'main',
         // No repoRoot — can't auto-create
         forceNew: true,
@@ -149,7 +149,7 @@ describe('Auto-Create Main Studio Integration', () => {
     const result = await handleStartSession(
       {
         userId: INTEGRATION_TEST_USER_ID,
-        agentId: INTEGRATION_TEST_AGENT_ID,
+        sbSlug: INTEGRATION_TEST_AGENT_ID,
         studioId: 'main',
         repoRoot: otherRepoRoot,
         forceNew: true,

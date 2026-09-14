@@ -36,7 +36,7 @@ type DbContact = Database['public']['Tables']['contacts']['Row'];
  */
 function mapAgentIdentity(row: DbAgentIdentity): AgentIdentity {
   return {
-    agentId: row.agent_id,
+    sbSlug: row.agent_id,
     name: row.name,
     role: row.role,
     description: row.description || undefined,
@@ -145,20 +145,20 @@ export class ContextBuilder implements IContextBuilder {
     this.memories = new MemoryRepository(supabase);
   }
 
-  async buildContext(userId: string, agentId: string, session: Session): Promise<InjectedContext> {
+  async buildContext(userId: string, sbSlug: string, session: Session): Promise<InjectedContext> {
     // Fetch all required data in parallel
     // The identity resolves first because it names the workspace whose
     // constitution this session should read. Everything else runs alongside it.
     const [agentIdentity, user, contacts, recentMemories, activeProjects] = await Promise.all([
-      this.getAgentIdentity(userId, agentId, session.sbId),
+      this.getAgentIdentity(userId, sbSlug, session.sbId),
       this.getUser(userId),
       this.getContacts(userId),
-      this.getKnowledgeMemories(userId, agentId, session),
+      this.getKnowledgeMemories(userId, sbSlug, session),
       this.getActiveProjects(userId),
     ]);
 
     if (!agentIdentity) {
-      throw new Error(`Agent identity not found: ${agentId} for user ${userId}`);
+      throw new Error(`Agent identity not found: ${sbSlug} for user ${userId}`);
     }
 
     if (!user) {
@@ -233,16 +233,16 @@ export class ContextBuilder implements IContextBuilder {
 
   async buildMinimalContext(
     userId: string,
-    agentId: string,
+    sbSlug: string,
     session?: Session
   ): Promise<Pick<InjectedContext, 'temporal' | 'agent'>> {
     const [agentIdentity, user] = await Promise.all([
-      this.getAgentIdentity(userId, agentId, session?.sbId),
+      this.getAgentIdentity(userId, sbSlug, session?.sbId),
       this.getUser(userId),
     ]);
 
     if (!agentIdentity) {
-      throw new Error(`Agent identity not found: ${agentId} for user ${userId}`);
+      throw new Error(`Agent identity not found: ${sbSlug} for user ${userId}`);
     }
 
     const timezone = user?.timezone || 'UTC';
@@ -256,18 +256,18 @@ export class ContextBuilder implements IContextBuilder {
 
   async getAgentBackend(
     userId: string,
-    agentId: string
+    sbSlug: string
   ): Promise<{ backend: string | null; provider: string | null }> {
     const { data, error } = await this.supabase
       .from('agent_identities')
       .select('backend, provider')
       .eq('user_id', userId)
-      .eq('agent_id', agentId)
+      .eq('agent_id', sbSlug)
       .single();
 
     if (error) {
       if (error.code === 'PGRST116') return { backend: null, provider: null };
-      logger.error('Error fetching agent backend', { userId, agentId, error });
+      logger.error('Error fetching agent backend', { userId, sbSlug, error });
       return { backend: null, provider: null };
     }
 
@@ -279,7 +279,7 @@ export class ContextBuilder implements IContextBuilder {
 
   private async getAgentIdentity(
     userId: string,
-    agentId: string,
+    sbSlug: string,
     sbId?: string
   ): Promise<AgentIdentity | null> {
     if (sbId) {
@@ -288,13 +288,13 @@ export class ContextBuilder implements IContextBuilder {
         .select('*')
         .eq('id', sbId)
         .eq('user_id', userId)
-        .eq('agent_id', agentId)
+        .eq('agent_id', sbSlug)
         .maybeSingle();
 
       if (byIdError) {
         logger.error('Error fetching agent identity by sbId', {
           userId,
-          agentId,
+          sbSlug,
           sbId,
           error: byIdError,
         });
@@ -307,7 +307,7 @@ export class ContextBuilder implements IContextBuilder {
 
       logger.warn('Session sbId did not resolve; falling back to slug lookup', {
         userId,
-        agentId,
+        sbSlug,
         sbId,
       });
     }
@@ -316,16 +316,16 @@ export class ContextBuilder implements IContextBuilder {
       .from('agent_identities')
       .select('*')
       .eq('user_id', userId)
-      .eq('agent_id', agentId)
+      .eq('agent_id', sbSlug)
       .order('updated_at', { ascending: false });
 
     if (error) {
-      logger.error('Error fetching agent identity', { userId, agentId, error });
+      logger.error('Error fetching agent identity', { userId, sbSlug, error });
       throw error;
     }
 
     if (!data || data.length === 0) {
-      logger.warn('Agent identity not found', { userId, agentId });
+      logger.warn('Agent identity not found', { userId, sbSlug });
       return null;
     }
 
@@ -337,7 +337,7 @@ export class ContextBuilder implements IContextBuilder {
       }
       logger.warn('Multiple agent identities found; choosing deterministic row', {
         userId,
-        agentId,
+        sbSlug,
         chosenIdentityId: chosen.id,
         candidateCount: data.length,
       });
@@ -386,20 +386,20 @@ export class ContextBuilder implements IContextBuilder {
    */
   private async getKnowledgeMemories(
     userId: string,
-    agentId: string,
+    sbSlug: string,
     session: Session
   ): Promise<Memory[]> {
     try {
       return await this.memories.getKnowledgeMemories(
         userId,
-        agentId,
+        sbSlug,
         HIGH_MEMORY_LIMIT,
         HIGH_MEMORY_WINDOW_DAYS,
         { threadKey: session.threadKey, focusText: session.taskDescription },
         session.contactId
       );
     } catch (error) {
-      logger.error('Error fetching knowledge memories', { userId, agentId, error });
+      logger.error('Error fetching knowledge memories', { userId, sbSlug, error });
       return [];
     }
   }
@@ -561,7 +561,7 @@ export function formatInjectedContext(
 
   // Agent identity section
   sections.push(`## Agent Identity
-You are **${context.agent.name}** (agent ID: \`${context.agent.agentId}\`).
+You are **${context.agent.name}** (agent ID: \`${context.agent.sbSlug}\`).
 Role: ${context.agent.role}
 ${context.agent.description ? `\n${context.agent.description}` : ''}`);
 

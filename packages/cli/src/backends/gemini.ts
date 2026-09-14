@@ -98,7 +98,7 @@ export class GeminiAdapter implements BackendAdapter {
 
   prepare(config: BackendConfig): PreparedBackend {
     const { promptFile, cleanup: identityCleanup } = createIdentityPromptFile(
-      config.agentId,
+      config.sbSlug,
       undefined,
       config.systemPromptOverride
     );
@@ -146,7 +146,7 @@ export class GeminiAdapter implements BackendAdapter {
     const contextToken = encodeContextToken({
       sessionId: config.pcpSessionId || '',
       studioId: config.studioId || '',
-      agentId: config.agentId,
+      sbSlug: config.sbSlug,
       cliAttached: true,
       runtime: 'gemini',
     });
@@ -169,7 +169,7 @@ export class GeminiAdapter implements BackendAdapter {
       binary: this.binary,
       args,
       env: {
-        AGENT_ID: config.agentId,
+        AGENT_ID: config.sbSlug,
         GEMINI_SYSTEM_MD: promptFile,
         INK_CONTEXT: contextToken,
         ...(config.pcpSessionId ? { INK_SESSION_ID: config.pcpSessionId } : {}),

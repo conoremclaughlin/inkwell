@@ -1023,11 +1023,11 @@ export class StrategyService {
    */
   private async notifyDispatcher(
     group: TaskGroup,
-    notifyAgentId: string | undefined,
+    notifySlug: string | undefined,
     message: string,
     userId: string
   ): Promise<boolean> {
-    if (!notifyAgentId) return false;
+    if (!notifySlug) return false;
 
     try {
       const threadKey = group.thread_key || `strategy:${group.id}`;
@@ -1036,8 +1036,8 @@ export class StrategyService {
       await handleSendToInbox(
         {
           userId,
-          recipientAgentId: notifyAgentId,
-          senderAgentId: senderSlug,
+          recipientSlug: notifySlug,
+          senderSlug: senderSlug,
           recipientStudioSlug: 'main',
           content: message,
           messageType: 'notification',
@@ -1055,7 +1055,7 @@ export class StrategyService {
         this.dataComposer
       );
 
-      logger.info(`Strategy notification sent to ${notifyAgentId} for group ${group.id}`);
+      logger.info(`Strategy notification sent to ${notifySlug} for group ${group.id}`);
       return true;
     } catch (err) {
       logger.warn('Strategy notification failed:', err);
@@ -1112,8 +1112,8 @@ export class StrategyService {
       await handleSendToInbox(
         {
           userId: group.user_id,
-          recipientAgentId: ownerSlug,
-          senderAgentId: ownerSlug,
+          recipientSlug: ownerSlug,
+          senderSlug: ownerSlug,
           // Prefer studioId (UUID); fall back to slug only when UUID is absent.
           recipientStudioId: studioId,
           recipientStudioSlug: studioId ? undefined : studioSlug,
@@ -1212,7 +1212,7 @@ export class StrategyService {
     // siblings (spec:studio-materialization v8; studio-paths.ts). Persistent
     // strategy studios below keep the legacy sibling location — durable.
     const worktreePath = ephemeralWorktreePath({
-      agentId: ownerSlug,
+      sbSlug: ownerSlug,
       repoRoot: mainRoot,
       leaf: slug,
     });
@@ -1255,7 +1255,7 @@ export class StrategyService {
     try {
       const studio = await this.dataComposer.repositories.studios.create({
         userId: group.user_id,
-        agentId: ownerSlug,
+        sbSlug: ownerSlug,
         repoRoot: mainRoot,
         worktreePath,
         branch,
@@ -1307,7 +1307,7 @@ export class StrategyService {
   private async createPersistentStudio(
     group: TaskGroup,
     slug: string,
-    ownerAgentId: string
+    ownerSlug: string
   ): Promise<{ studioId: string; worktreePath: string; branch: string } | null> {
     const metadata = (group.metadata || {}) as Record<string, unknown>;
     const repoRoot = typeof metadata.repoRoot === 'string' ? metadata.repoRoot : undefined;
@@ -1318,8 +1318,8 @@ export class StrategyService {
       return null;
     }
 
-    const agentId = ownerAgentId;
-    const branch = `${agentId}/${slug}`;
+    const sbSlug = ownerSlug;
+    const branch = `${sbSlug}/${slug}`;
 
     let mainRoot = repoRoot;
     try {
@@ -1372,7 +1372,7 @@ export class StrategyService {
     try {
       const studio = await this.dataComposer.repositories.studios.create({
         userId: group.user_id,
-        agentId,
+        sbSlug,
         repoRoot: mainRoot,
         worktreePath,
         branch,
@@ -1538,10 +1538,10 @@ export class StrategyService {
       return { containerName: '', success: false, error: msg };
     }
 
-    const ownerSlug = (await this.resolveOwnerSlug(group)) || studio.agentId || 'unknown';
+    const ownerSlug = (await this.resolveOwnerSlug(group)) || studio.sbSlug || 'unknown';
     const result = await this.sandboxOrchestrator.spinUp({
       userId: group.user_id,
-      agentId: ownerSlug,
+      sbSlug: ownerSlug,
       studioId: studio.id,
       studioSlug: studio.slug || undefined,
       worktreePath: studio.worktreePath,
@@ -1897,7 +1897,7 @@ export class StrategyService {
       const agentSlug = (await this.resolveOwnerSlug(group)) || group.sb_id || 'strategy';
       await this.dataComposer.repositories.activityStream.logActivity({
         userId: group.user_id,
-        agentId: agentSlug,
+        sbSlug: agentSlug,
         type: 'state_change',
         subtype,
         content,

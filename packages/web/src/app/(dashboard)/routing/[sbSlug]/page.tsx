@@ -26,7 +26,7 @@ import { Input } from '@/components/ui/input';
 interface AgentRoute {
   id: string;
   sbId: string;
-  agentId: string | null;
+  sbSlug: string | null;
   agentName: string | null;
   agentRole: string | null;
   backend: string | null;
@@ -71,7 +71,7 @@ interface AgentRoutingResponse {
   heartbeatProcessingEnabled: boolean;
   agent: {
     id: string;
-    agentId: string;
+    sbSlug: string;
     name: string;
     role: string;
     description: string | null;
@@ -142,14 +142,14 @@ const STATUS_COLORS: Record<string, string> = {
 };
 
 export default function AgentRoutingPage() {
-  const params = useParams<{ agentId: string }>();
-  const agentId = decodeURIComponent(params?.agentId || '');
+  const params = useParams<{ sbSlug: string }>();
+  const sbSlug = decodeURIComponent(params?.sbSlug || '');
   const queryClient = useQueryClient();
 
   const { data, isLoading, error } = useApiQuery<AgentRoutingResponse>(
-    ['routing-agent', agentId],
-    `/api/admin/routing/agents/${encodeURIComponent(agentId)}`,
-    { enabled: !!agentId }
+    ['routing-agent', sbSlug],
+    `/api/admin/routing/agents/${encodeURIComponent(sbSlug)}`,
+    { enabled: !!sbSlug }
   );
 
   const studios = data?.studios ?? [];
@@ -168,7 +168,7 @@ export default function AgentRoutingPage() {
       apiPatch(`/api/admin/routing/identities/${sbId}`, { studioHint }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['routing'] });
-      queryClient.invalidateQueries({ queryKey: ['routing-agent', agentId] });
+      queryClient.invalidateQueries({ queryKey: ['routing-agent', sbSlug] });
       setEditingHomeStudio(false);
     },
   });
@@ -181,7 +181,7 @@ export default function AgentRoutingPage() {
     mutationFn: ({ reminderId, studioHint }: { reminderId: string; studioHint: string | null }) =>
       apiPatch(`/api/admin/routing/reminders/${reminderId}`, { studioHint }),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['routing-agent', agentId] });
+      queryClient.invalidateQueries({ queryKey: ['routing-agent', sbSlug] });
       setEditingReminderId(null);
     },
   });
@@ -214,7 +214,7 @@ export default function AgentRoutingPage() {
     {
       onSuccess: () => {
         queryClient.invalidateQueries({ queryKey: ['routing'] });
-        queryClient.invalidateQueries({ queryKey: ['routing-agent', agentId] });
+        queryClient.invalidateQueries({ queryKey: ['routing-agent', sbSlug] });
         setNewRoute({
           platform: 'telegram',
           platformAccountId: '',
@@ -231,7 +231,7 @@ export default function AgentRoutingPage() {
       apiPatch(`/api/admin/routing/routes/${routeId}`, payload),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['routing'] });
-      queryClient.invalidateQueries({ queryKey: ['routing-agent', agentId] });
+      queryClient.invalidateQueries({ queryKey: ['routing-agent', sbSlug] });
     },
   });
 
@@ -239,7 +239,7 @@ export default function AgentRoutingPage() {
     mutationFn: (routeId: string) => apiDelete(`/api/admin/routing/routes/${routeId}`),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['routing'] });
-      queryClient.invalidateQueries({ queryKey: ['routing-agent', agentId] });
+      queryClient.invalidateQueries({ queryKey: ['routing-agent', sbSlug] });
       setEditingRouteId(null);
     },
   });
@@ -266,7 +266,7 @@ export default function AgentRoutingPage() {
             </Link>
           </Button>
           <h1 className="text-3xl font-bold text-gray-900">
-            {data?.agent?.name || agentId} routing
+            {data?.agent?.name || sbSlug} routing
           </h1>
           <p className="mt-2 text-gray-600">
             {data?.agent?.role || 'Configure channel route scope and routing behavior for this SB.'}
@@ -288,7 +288,7 @@ export default function AgentRoutingPage() {
               <CardTitle className="text-base font-semibold">Security & Permissions</CardTitle>
             </div>
             <CardDescription>
-              Default settings for all of {data.agent.name || agentId}&apos;s studios. Individual
+              Default settings for all of {data.agent.name || sbSlug}&apos;s studios. Individual
               studios can override below.
             </CardDescription>
           </CardHeader>
@@ -303,10 +303,10 @@ export default function AgentRoutingPage() {
               <button
                 onClick={async () => {
                   try {
-                    await apiPatch(`/api/admin/identities/${agentId}/settings`, {
+                    await apiPatch(`/api/admin/identities/${sbSlug}/settings`, {
                       sandboxBypass: !data.agent.sandboxBypass,
                     });
-                    queryClient.invalidateQueries({ queryKey: ['routing-agent', agentId] });
+                    queryClient.invalidateQueries({ queryKey: ['routing-agent', sbSlug] });
                   } catch (e) {
                     console.error('Failed to update SB settings:', e);
                   }
@@ -335,10 +335,10 @@ export default function AgentRoutingPage() {
                   try {
                     const newScope =
                       data.agent.sessionScope === 'per_sender' ? 'global' : 'per_sender';
-                    await apiPatch(`/api/admin/identities/${agentId}/settings`, {
+                    await apiPatch(`/api/admin/identities/${sbSlug}/settings`, {
                       sessionScope: newScope,
                     });
-                    queryClient.invalidateQueries({ queryKey: ['routing-agent', agentId] });
+                    queryClient.invalidateQueries({ queryKey: ['routing-agent', sbSlug] });
                   } catch (e) {
                     console.error('Failed to update session scope:', e);
                   }
@@ -718,7 +718,7 @@ export default function AgentRoutingPage() {
                             await apiPatch(`/api/admin/studios/${studio.id}`, {
                               sandboxBypass: newValue,
                             });
-                            queryClient.invalidateQueries({ queryKey: ['routing-agent', agentId] });
+                            queryClient.invalidateQueries({ queryKey: ['routing-agent', sbSlug] });
                           } catch (err) {
                             console.error('Failed to update sandbox bypass:', err);
                           }
@@ -870,7 +870,7 @@ export default function AgentRoutingPage() {
       {/* Add route — moved below existing routes */}
       <Card className="mt-6">
         <CardHeader>
-          <CardTitle>Add route for {data?.agent?.name || agentId}</CardTitle>
+          <CardTitle>Add route for {data?.agent?.name || sbSlug}</CardTitle>
           <CardDescription>
             Start broad (platform only) then narrow to account/chat when needed. Leave studio empty
             to use the default above.

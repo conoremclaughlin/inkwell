@@ -73,7 +73,7 @@ export function injectSessionHeaders(
 
   // Missing config file — nothing to inject into. Note: we still inject the
   // other headers (studio, context, authorization) when pcpSessionId is
-  // absent — x-ink-context carries agentId/studioId/runtime which are useful
+  // absent — x-ink-context carries sbSlug/studioId/runtime which are useful
   // independently of session identity.
   if (!mcpConfigPath || !existsSync(mcpConfigPath)) {
     return { mcpConfigPath, cleanup: () => {}, modified: false };
@@ -169,7 +169,7 @@ export function injectSessionHeaders(
 export interface PcpContextToken {
   sessionId: string;
   studioId: string;
-  agentId: string;
+  sbSlug: string;
   cliAttached: boolean;
   runtime: string; // 'claude' | 'codex' | 'gemini'
   repoRoot?: string; // root repo path for cross-project 'main' resolution
@@ -193,7 +193,7 @@ export function decodeContextToken(header: string | undefined | null): PcpContex
   if (!header) return null;
   try {
     const parsed = JSON.parse(Buffer.from(header, 'base64url').toString());
-    if (typeof parsed.sessionId !== 'string' || typeof parsed.agentId !== 'string') {
+    if (typeof parsed.sessionId !== 'string' || typeof parsed.sbSlug !== 'string') {
       return null;
     }
     return parsed as PcpContextToken;
@@ -217,7 +217,7 @@ export function buildSessionEnv(options: {
   runtimeLinkId?: string;
   studioId?: string;
   accessToken?: string;
-  agentId?: string;
+  sbSlug?: string;
   cliAttached?: boolean;
   runtime?: string;
   repoRoot?: string;
@@ -239,11 +239,11 @@ export function buildSessionEnv(options: {
   }
 
   // Consolidated context token (new — Phase 1)
-  if (options.pcpSessionId && options.agentId) {
+  if (options.pcpSessionId && options.sbSlug) {
     env.INK_CONTEXT = encodeContextToken({
       sessionId: options.pcpSessionId,
       studioId: options.studioId || '',
-      agentId: options.agentId,
+      sbSlug: options.sbSlug,
       cliAttached: options.cliAttached || false,
       runtime: options.runtime || 'claude',
       ...(options.repoRoot ? { repoRoot: options.repoRoot } : {}),

@@ -29,7 +29,7 @@ interface RuntimeSessionState {
 export function writeRuntimeSessionHint(
   workingDirectory: string,
   pcpSessionId: string,
-  agentId: string,
+  sbSlug: string,
   backend: string,
   runtimeLinkId: string,
   studioId?: string
@@ -56,7 +56,7 @@ export function writeRuntimeSessionHint(
     const record: Record<string, unknown> = {
       pcpSessionId,
       backend,
-      agentId,
+      sbSlug,
       runtimeLinkId,
       ...(studioId ? { studioId } : {}),
       updatedAt: now,
@@ -65,7 +65,7 @@ export function writeRuntimeSessionHint(
 
     const idx = state.sessions.findIndex(
       (s) =>
-        s['pcpSessionId'] === pcpSessionId && s['backend'] === backend && s['agentId'] === agentId
+        s['pcpSessionId'] === pcpSessionId && s['backend'] === backend && s['sbSlug'] === sbSlug
     );
     if (idx >= 0) {
       state.sessions[idx] = { ...state.sessions[idx], ...record };
@@ -76,7 +76,7 @@ export function writeRuntimeSessionHint(
     state.current = {
       pcpSessionId,
       backend,
-      agentId,
+      sbSlug,
       ...(studioId ? { studioId } : {}),
       updatedAt: now,
     };

@@ -3,7 +3,7 @@
  *
  * The counterpart of /threads/reply, which refuses to create. Pinned here:
  *  - the key grammar and recipient bounds are checked before anything is sent;
- *  - the human is the sender (no senderAgentId), the title rides as subject,
+ *  - the human is the sender (no senderSlug), the title rides as subject,
  *    every recipient is woken;
  *  - `created` reports whether the key was new, so the client can say
  *    "started" vs "added to" honestly;
@@ -174,7 +174,7 @@ describe('POST /threads', () => {
       subject: 'Wren',
       priority: 'high',
     });
-    expect(args.senderAgentId).toBeUndefined();
+    expect(args.senderSlug).toBeUndefined();
     expect(args.metadata).toMatchObject({ sentBy: 'user' });
   });
 
@@ -192,7 +192,7 @@ describe('POST /threads', () => {
 
     expect(res._status).toBe(200);
     const args = mockHandleSendToInbox.mock.calls[0][0] as Record<string, unknown>;
-    expect(args).toMatchObject({ recipientAgentId: 'wren', recipientStudioSlug: 'main' });
+    expect(args).toMatchObject({ recipientSlug: 'wren', recipientStudioSlug: 'main' });
     // The handler refuses a studio on the group form — so the group form
     // must not be used here.
     expect(args.recipients).toBeUndefined();

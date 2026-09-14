@@ -186,7 +186,7 @@ function parseSSEResult(body: string): unknown {
 function encodeContextHeader(token: {
   sessionId: string;
   studioId: string;
-  agentId: string;
+  sbSlug: string;
   cliAttached: boolean;
   runtime: string;
 }): string {
@@ -536,7 +536,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     const res = await fetch(`${baseUrl}/token/delegate`, {
       method: 'POST',
       headers: { Authorization: 'Bearer valid', 'Content-Type': 'application/json' },
-      body: JSON.stringify({ agentId: 'wren' }),
+      body: JSON.stringify({ sbSlug: 'wren' }),
     });
 
     expect(res.status).toBe(200);
@@ -548,7 +548,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     const token = body.access_token as string;
     const payload = verifyPcpAccessToken(token, 'mcp_access');
     expect(payload?.sub).toBe('user-123');
-    expect(payload?.agentId).toBe('wren');
+    expect(payload?.sbSlug).toBe('wren');
     expect(payload?.identityId).toBe('identity-abc');
   });
 
@@ -559,7 +559,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     const res = await fetch(`${baseUrl}/token/delegate`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ agentId: 'wren' }),
+      body: JSON.stringify({ sbSlug: 'wren' }),
     });
 
     expect(res.status).toBe(401);
@@ -573,7 +573,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     const res = await fetch(`${baseUrl}/token/delegate`, {
       method: 'POST',
       headers: { Authorization: 'Bearer valid', 'Content-Type': 'application/json' },
-      body: JSON.stringify({ agentId: 'aster' }),
+      body: JSON.stringify({ sbSlug: 'aster' }),
     });
 
     expect(res.status).toBe(403);
@@ -589,7 +589,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     mockGetSession.mockResolvedValue({
       id: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
       userId: 'user-456',
-      agentId: 'wren',
+      sbSlug: 'wren',
       lifecycle: 'running',
       startedAt: new Date(),
       endedAt: undefined,
@@ -604,7 +604,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     const contextHeader = encodeContextHeader({
       sessionId: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
       studioId: 'studio-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       cliAttached: true,
       runtime: 'claude',
     });
@@ -628,7 +628,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     mockGetSession.mockResolvedValue({
       id: 'b2c3d4e5-f6a7-8901-bcde-f23456789012',
       userId: 'user-456',
-      agentId: 'myra',
+      sbSlug: 'myra',
       lifecycle: 'running',
       startedAt: new Date(),
       endedAt: undefined,
@@ -643,7 +643,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     const contextHeader = encodeContextHeader({
       sessionId: 'b2c3d4e5-f6a7-8901-bcde-f23456789012',
       studioId: 'studio-1',
-      agentId: 'myra',
+      sbSlug: 'myra',
       cliAttached: false,
       runtime: 'ink',
     });
@@ -668,7 +668,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     mockGetSession.mockResolvedValue({
       id: 'c3d4e5f6-a7b8-9012-cdef-345678901234',
       userId: 'user-999',
-      agentId: 'myra',
+      sbSlug: 'myra',
       lifecycle: 'running',
       startedAt: new Date(),
       endedAt: undefined,
@@ -683,7 +683,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     const contextHeader = encodeContextHeader({
       sessionId: 'c3d4e5f6-a7b8-9012-cdef-345678901234',
       studioId: 'studio-1',
-      agentId: 'myra',
+      sbSlug: 'myra',
       cliAttached: false,
       runtime: 'ink',
     });
@@ -706,7 +706,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     const contextHeader = encodeContextHeader({
       sessionId: 'forged-session-id',
       studioId: 'studio-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       cliAttached: true,
       runtime: 'claude',
     });
@@ -727,7 +727,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     const contextHeader = encodeContextHeader({
       sessionId: 'not-a-uuid',
       studioId: 'studio-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       cliAttached: true,
       runtime: 'claude',
     });
@@ -741,14 +741,14 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     (env as any).MCP_REQUIRE_OAUTH = false;
   });
 
-  it('should reject context when session agentId does not match', async () => {
+  it('should reject context when session sbSlug does not match', async () => {
     if (serverUnavailableError) return;
     (env as any).MCP_REQUIRE_OAUTH = true;
     mockVerifyAccessToken.mockResolvedValue(null);
     mockGetSession.mockResolvedValue({
       id: 'b2c3d4e5-f6a7-8901-bcde-f12345678901',
       userId: 'user-456',
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       lifecycle: 'running',
       startedAt: new Date(),
       endedAt: undefined,
@@ -758,7 +758,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     const contextHeader = encodeContextHeader({
       sessionId: 'b2c3d4e5-f6a7-8901-bcde-f12345678901',
       studioId: 'studio-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       cliAttached: true,
       runtime: 'claude',
     });
@@ -778,7 +778,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     mockGetSession.mockResolvedValue({
       id: 'c3d4e5f6-a7b8-9012-cdef-123456789012',
       userId: 'user-456',
-      agentId: 'wren',
+      sbSlug: 'wren',
       lifecycle: 'completed',
       startedAt: new Date('2026-01-01'),
       endedAt: new Date('2026-01-02'),
@@ -788,7 +788,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     const contextHeader = encodeContextHeader({
       sessionId: 'c3d4e5f6-a7b8-9012-cdef-123456789012',
       studioId: 'studio-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       cliAttached: true,
       runtime: 'claude',
     });
@@ -807,7 +807,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     mockGetSession.mockResolvedValue({
       id: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
       userId: 'user-456',
-      agentId: 'wren',
+      sbSlug: 'wren',
       lifecycle: 'running',
       startedAt: new Date(),
       endedAt: undefined,
@@ -822,7 +822,7 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     const contextHeader = encodeContextHeader({
       sessionId: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
       studioId: 'studio-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       cliAttached: true,
       runtime: 'claude',
     });
@@ -843,14 +843,14 @@ describe('MCP StreamableHTTP Transport (stateless)', () => {
     mockVerifyAccessToken.mockResolvedValue({
       userId: 'oauth-user',
       email: 'oauth@example.com',
-      agentId: 'wren',
+      sbSlug: 'wren',
       sbId: 'oauth-sb',
     });
 
     const contextHeader = encodeContextHeader({
       sessionId: 'd4e5f6a7-b8c9-0123-defa-234567890123',
       studioId: 'studio-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       cliAttached: true,
       runtime: 'claude',
     });
@@ -944,7 +944,7 @@ describe('enrichIdentityFromContextSession + workspace derivation (canonical ide
   const liveSession = (sbId: string | undefined) => ({
     id: SID,
     userId: 'user-456',
-    agentId: 'myra',
+    sbSlug: 'myra',
     sbId,
     lifecycle: 'running',
     startedAt: new Date(),
@@ -959,11 +959,11 @@ describe('enrichIdentityFromContextSession + workspace derivation (canonical ide
         enrichIdentityFromContextSession: (
           u: unknown,
           t: unknown
-        ) => Promise<{ agentId?: string; sbId?: string } | null>;
+        ) => Promise<{ sbSlug?: string; sbId?: string } | null>;
       }
-    ).enrichIdentityFromContextSession(USER, { sessionId: SID, agentId: 'myra' });
+    ).enrichIdentityFromContextSession(USER, { sessionId: SID, sbSlug: 'myra' });
 
-    expect(enriched?.agentId).toBe('myra');
+    expect(enriched?.sbSlug).toBe('myra');
     expect(enriched?.sbId).toBe('sb-uuid-B');
 
     // The header-produced identity flows through to workspace scope,
@@ -986,11 +986,11 @@ describe('enrichIdentityFromContextSession + workspace derivation (canonical ide
         enrichIdentityFromContextSession: (
           u: unknown,
           t: unknown
-        ) => Promise<{ agentId?: string } | null>;
+        ) => Promise<{ sbSlug?: string } | null>;
       }
-    ).enrichIdentityFromContextSession(USER, { sessionId: SID, agentId: 'myra' });
+    ).enrichIdentityFromContextSession(USER, { sessionId: SID, sbSlug: 'myra' });
     // Slug fallback hits the duplicate-row error → no enrichment.
-    expect(enriched?.agentId).toBeUndefined();
+    expect(enriched?.sbSlug).toBeUndefined();
   });
 
   it('refuses enrichment when the session belongs to a different user', async () => {
@@ -1000,9 +1000,9 @@ describe('enrichIdentityFromContextSession + workspace derivation (canonical ide
         enrichIdentityFromContextSession: (
           u: unknown,
           t: unknown
-        ) => Promise<{ agentId?: string } | null>;
+        ) => Promise<{ sbSlug?: string } | null>;
       }
-    ).enrichIdentityFromContextSession(USER, { sessionId: SID, agentId: 'myra' });
-    expect(enriched?.agentId).toBeUndefined();
+    ).enrichIdentityFromContextSession(USER, { sessionId: SID, sbSlug: 'myra' });
+    expect(enriched?.sbSlug).toBeUndefined();
   });
 });

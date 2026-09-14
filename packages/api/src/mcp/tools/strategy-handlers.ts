@@ -15,7 +15,7 @@ import type { Json } from '../../data/repositories/activity-stream.repository';
 import { StrategyService } from '../../services/strategy.service';
 import { getOrchestrator } from '../../services/sandbox/index.js';
 import { resolveUser, type UserIdentifier } from '../../services/user-resolver';
-import { getEffectiveAgentId } from '../../auth/enforce-identity';
+import { getEffectiveSlug } from '../../auth/enforce-identity';
 import { resolveIdentityId } from '../../auth/resolve-identity';
 
 const userIdentifierSchema = z.object({
@@ -160,10 +160,10 @@ export async function handleStartStrategy(
       return mcpResponse({ success: false, error: 'User not found' }, true);
     }
 
-    const agentId = getEffectiveAgentId();
+    const sbSlug = getEffectiveSlug();
 
-    const sbId = agentId
-      ? await resolveIdentityId(dataComposer.getClient(), resolved.user.id, agentId)
+    const sbId = sbSlug
+      ? await resolveIdentityId(dataComposer.getClient(), resolved.user.id, sbSlug)
       : null;
     if (!sbId) {
       return mcpResponse(
@@ -491,11 +491,11 @@ export async function handleUpdateStrategy(
 
     await dataComposer.repositories.taskGroups.update(args.groupId, updatePayload as never);
 
-    const agentId = getEffectiveAgentId(undefined) || 'system';
+    const sbSlug = getEffectiveSlug(undefined) || 'system';
     try {
       await dataComposer.repositories.activityStream.logActivity({
         userId: resolved.user.id,
-        agentId,
+        sbSlug,
         type: 'state_change',
         subtype: 'strategy_config_updated',
         content: `Strategy config updated on "${group.title}"`,

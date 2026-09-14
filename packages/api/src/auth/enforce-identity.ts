@@ -1,40 +1,40 @@
 /**
  * Identity Enforcement Utility
  *
- * Returns the effective agentId for WRITE operations, enforcing identity
+ * Returns the effective sbSlug for WRITE operations, enforcing identity
  * pinning when enabled. Read/query operations should NOT use this — they
- * need to freely specify agentId as a filter parameter.
+ * need to freely specify sbSlug as a filter parameter.
  *
  * Feature flag: ENFORCE_IDENTITY_PINNING (env var, default: 'true')
- *   'true'  — pinned identity overrides explicit agentId on writes
- *   'false' — logs warnings but allows explicit agentId (warn-only mode)
+ *   'true'  — pinned identity overrides explicit sbSlug on writes
+ *   'false' — logs warnings but allows explicit sbSlug (warn-only mode)
  */
 
-import { getPinnedAgentId } from '../utils/request-context';
+import { getPinnedSlug } from '../utils/request-context';
 import { env } from '../config/env';
 import { logger } from '../utils/logger';
 
 /**
- * Returns the effective agentId for a write operation.
+ * Returns the effective sbSlug for a write operation.
  *
  * - If identity is pinned (via bootstrap or token), returns the pinned value
  *   (or the explicit value if enforcement is disabled via feature flag).
  * - If no identity is pinned (human user, pre-bootstrap), returns the explicit value.
  */
-export function getEffectiveAgentId(explicitAgentId?: string): string | undefined {
-  const pinned = getPinnedAgentId();
-  if (!pinned) return explicitAgentId;
+export function getEffectiveSlug(explicitSlug?: string): string | undefined {
+  const pinned = getPinnedSlug();
+  if (!pinned) return explicitSlug;
 
-  if (explicitAgentId && explicitAgentId !== pinned) {
+  if (explicitSlug && explicitSlug !== pinned) {
     const enforced = env.ENFORCE_IDENTITY_PINNING !== 'false';
     logger.warn('Agent identity mismatch detected', {
-      claimed: explicitAgentId,
+      claimed: explicitSlug,
       authenticated: pinned,
       enforced,
     });
 
     if (!enforced) {
-      return explicitAgentId; // Feature flag off: warn but allow
+      return explicitSlug; // Feature flag off: warn but allow
     }
   }
 

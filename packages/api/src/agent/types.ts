@@ -63,7 +63,7 @@ export interface InjectedContext {
   };
   /** Agent's own identity - who am I in this conversation? */
   agentIdentity?: {
-    agentId: string;
+    sbSlug: string;
     name: string;
     role: string;
     description?: string;

@@ -54,7 +54,7 @@ function makeFakeChild(): FakeChild {
   return child;
 }
 
-const baseConfig = { workingDirectory: '/tmp', agentId: 'myra', pcpSessionId: 'sess-1' };
+const baseConfig = { workingDirectory: '/tmp', sbSlug: 'myra', pcpSessionId: 'sess-1' };
 
 describe('InkRunner inactivity timeout', () => {
   let child: FakeChild;

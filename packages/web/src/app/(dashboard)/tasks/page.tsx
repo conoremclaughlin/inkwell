@@ -74,7 +74,7 @@ interface TaskGroupData {
   priority: string;
   tags: string[];
   autonomous: boolean;
-  agentId: string | null;
+  sbSlug: string | null;
   agentName: string | null;
   projectName: string | null;
   taskCount: number;
@@ -95,7 +95,7 @@ interface ActivityEvent {
   type: string;
   subtype: string | null;
   content: string;
-  agentId: string;
+  sbSlug: string;
   sessionId: string | null;
   payload: Record<string, unknown>;
   createdAt: string;
@@ -114,7 +114,7 @@ interface TaskComment {
   taskId: string;
   parentCommentId: string | null;
   content: string;
-  authorAgentId: string | null;
+  authorSlug: string | null;
   authorName: string;
   metadata: Record<string, unknown>;
   createdAt: string;
@@ -304,8 +304,8 @@ function CommentThread({ taskId }: { taskId: string }) {
       ) : comments.length > 0 ? (
         <div className="space-y-2 mb-3">
           {comments.map((c) => {
-            const agentColor = c.authorAgentId
-              ? (AGENT_COLORS[c.authorAgentId] ?? 'bg-muted text-muted-foreground')
+            const agentColor = c.authorSlug
+              ? (AGENT_COLORS[c.authorSlug] ?? 'bg-muted text-muted-foreground')
               : 'bg-muted text-muted-foreground';
             return (
               <div key={c.id} className="flex gap-2">
@@ -447,14 +447,14 @@ function ActivityTimeline({ groupId }: { groupId: string }) {
             <div className="flex-1 min-w-0 -mt-0.5">
               <div className="flex items-center gap-2 flex-wrap">
                 <span className="text-xs font-medium text-foreground/90">{label}</span>
-                {event.agentId && (
+                {event.sbSlug && (
                   <span
                     className={clsx(
                       'text-[10px] font-medium px-1.5 py-0.5 rounded-full',
-                      AGENT_COLORS[event.agentId] ?? 'bg-muted text-muted-foreground'
+                      AGENT_COLORS[event.sbSlug] ?? 'bg-muted text-muted-foreground'
                     )}
                   >
-                    {event.agentId}
+                    {event.sbSlug}
                   </span>
                 )}
                 {event.sessionId && (

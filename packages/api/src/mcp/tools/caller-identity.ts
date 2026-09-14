@@ -18,16 +18,12 @@
 import type { DataComposer } from '../../data/composer';
 import type { Session } from '../../data/models/memory';
 import { logger } from '../../utils/logger';
-import {
-  getPinnedAgentId,
-  getRequestContext,
-  getSessionContext,
-} from '../../utils/request-context';
+import { getPinnedSlug, getRequestContext, getSessionContext } from '../../utils/request-context';
 
 /**
  * The identity behind the current call.
  *
- * `sbId` is the canonical `agent_identities.id`. `agentId` is the slug, which is
+ * `sbId` is the canonical `agent_identities.id`. `sbSlug` is the slug, which is
  * unique only per (user_id, workspace_id) — two identities named "wren" in
  * different workspaces collide, so the slug alone is not an ownership predicate.
  * `agentBound` distinguishes an SB's token from a human user/admin token, which
@@ -35,7 +31,7 @@ import {
  */
 export interface CallerIdentity {
   sbId?: string;
-  agentId?: string;
+  sbSlug?: string;
   /**
    * Contact scope the caller is confined to; undefined means owner scope
    * (sessions with no contact). Never taken from a tool parameter — a caller
@@ -50,27 +46,27 @@ export interface CallerIdentity {
  *
  * Three things here are deliberate, and each one was a hole:
  *
- * 1. On HTTP the bearer token is the ONLY authentication fact. `ctx.agentId`
+ * 1. On HTTP the bearer token is the ONLY authentication fact. `ctx.sbSlug`
  *    and `ctx.sbId` may have been enriched from the caller's ambient session
  *    so routing and workspace derivation work for ink-routed user-token calls;
- *    that is a hint, not a credential. Authorization reads `tokenAgentId` /
+ *    that is a hint, not a credential. Authorization reads `tokenSlug` /
  *    `tokenSbId`, captured before enrichment.
  * 2. `callerProfile` is NOT an agent-bound signal — it defaults to 'agent' on
  *    every HTTP request, including web-dashboard user tokens.
- * 3. `explicitAgentId` never confers agent authority. It previously flowed
- *    through `getEffectiveAgentId()`, which returns the caller's own value
+ * 3. `explicitSlug` never confers agent authority. It previously flowed
+ *    through `getEffectiveSlug()`, which returns the caller's own value
  *    whenever no identity is pinned, so a request with no verified identity
  *    could name any agent it liked. It survives only as attribution on
  *    non-agent-bound calls.
  */
-export function resolveCallerIdentity(explicitAgentId?: string): CallerIdentity {
+export function resolveCallerIdentity(explicitSlug?: string): CallerIdentity {
   const ctx = getRequestContext();
 
   if (ctx) {
     if (ctx.agentTokenBound) {
       return {
         sbId: ctx.tokenSbId,
-        agentId: ctx.tokenAgentId,
+        sbSlug: ctx.tokenSlug,
         // The SIGNED claim, never ctx.contactId — that one comes from the
         // unsigned x-ink-context header.
         contactId: ctx.tokenContactId,
@@ -78,17 +74,17 @@ export function resolveCallerIdentity(explicitAgentId?: string): CallerIdentity 
       };
     }
     // User/admin token: keeps same-user repair authority.
-    return { agentId: explicitAgentId, agentBound: false };
+    return { sbSlug: explicitSlug, agentBound: false };
   }
 
   // stdio: one session per process, so bootstrap's pin is the identity.
-  const pinned = getPinnedAgentId();
-  if (!pinned) return { agentId: explicitAgentId, agentBound: false };
+  const pinned = getPinnedSlug();
+  if (!pinned) return { sbSlug: explicitSlug, agentBound: false };
 
   const sess = getSessionContext();
   return {
-    sbId: sess?.agentId === pinned ? sess.sbId : undefined,
-    agentId: pinned,
+    sbId: sess?.sbSlug === pinned ? sess.sbId : undefined,
+    sbSlug: pinned,
     contactId: sess?.contactId,
     agentBound: true,
   };
@@ -133,7 +129,7 @@ export function isIdentityAuthorized(
   }
 
   // The target row predates sb_id, so the slug is the only identity it carries.
-  return !!caller.agentId && session.agentId === caller.agentId;
+  return !!caller.sbSlug && session.sbSlug === caller.sbSlug;
 }
 
 /**
@@ -212,9 +208,9 @@ export async function loadAuthorizedAmbientSession(
     logger.warn('Ignoring ambient sessionId that does not belong to the caller', {
       contextSessionId: ambientId,
       sessionSbId: session.sbId,
-      sessionAgentId: session.agentId,
+      sessionSlug: session.sbSlug,
       callerSbId: caller.sbId,
-      callerAgentId: caller.agentId,
+      callerSlug: caller.sbSlug,
     });
     return { session: null, reason: 'unauthorized' };
   }

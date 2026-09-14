@@ -51,7 +51,7 @@ vi.mock('../../services/user-resolver', async (importOriginal) => {
 });
 
 vi.mock('../../auth/enforce-identity', () => ({
-  getEffectiveAgentId: vi.fn().mockReturnValue('wren'),
+  getEffectiveSlug: vi.fn().mockReturnValue('wren'),
 }));
 
 vi.mock('../../auth/resolve-identity', () => ({

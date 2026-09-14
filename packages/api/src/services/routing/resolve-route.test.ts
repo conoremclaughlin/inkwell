@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { resolveRouteAgentId } from './resolve-route';
+import { resolveRouteSlug } from './resolve-route';
 
 // Mock Supabase client
 function createMockSupabase(
@@ -44,10 +44,10 @@ function mockClient(routes: any[], error: any = null) {
   } as any;
 }
 
-describe('resolveRouteAgentId', () => {
+describe('resolveRouteSlug', () => {
   it('returns null when no routes exist', async () => {
     const client = mockClient([]);
-    const result = await resolveRouteAgentId(client, 'user-1', 'telegram');
+    const result = await resolveRouteSlug(client, 'user-1', 'telegram');
     expect(result).toBeNull();
   });
 
@@ -62,10 +62,10 @@ describe('resolveRouteAgentId', () => {
       },
     ];
     const client = mockClient(routes);
-    const result = await resolveRouteAgentId(client, 'user-1', 'telegram');
+    const result = await resolveRouteSlug(client, 'user-1', 'telegram');
 
     expect(result).toEqual({
-      agentId: 'myra',
+      sbSlug: 'myra',
       sbId: 'id-1',
       routeId: 'route-1',
       studioHint: null,
@@ -92,8 +92,8 @@ describe('resolveRouteAgentId', () => {
     ];
     const client = mockClient(routes);
 
-    const result = await resolveRouteAgentId(client, 'user-1', 'telegram', 'myra_help_bot');
-    expect(result?.agentId).toBe('benson');
+    const result = await resolveRouteSlug(client, 'user-1', 'telegram', 'myra_help_bot');
+    expect(result?.sbSlug).toBe('benson');
     expect(result?.routeId).toBe('route-account');
   });
 
@@ -116,14 +116,14 @@ describe('resolveRouteAgentId', () => {
     ];
     const client = mockClient(routes);
 
-    const result = await resolveRouteAgentId(
+    const result = await resolveRouteSlug(
       client,
       'user-1',
       'telegram',
       'myra_help_bot',
       'chat-123'
     );
-    expect(result?.agentId).toBe('wren');
+    expect(result?.sbSlug).toBe('wren');
     expect(result?.routeId).toBe('route-chat');
   });
 
@@ -147,8 +147,8 @@ describe('resolveRouteAgentId', () => {
     const client = mockClient(routes);
 
     // Incoming from myra_help_bot — should skip the other_bot route, match platform default
-    const result = await resolveRouteAgentId(client, 'user-1', 'telegram', 'myra_help_bot');
-    expect(result?.agentId).toBe('myra');
+    const result = await resolveRouteSlug(client, 'user-1', 'telegram', 'myra_help_bot');
+    expect(result?.sbSlug).toBe('myra');
     expect(result?.routeId).toBe('route-platform');
   });
 
@@ -171,13 +171,13 @@ describe('resolveRouteAgentId', () => {
     ];
     const client = mockClient(routes);
 
-    const result = await resolveRouteAgentId(client, 'user-1', 'telegram', undefined, 'chat-123');
-    expect(result?.agentId).toBe('myra');
+    const result = await resolveRouteSlug(client, 'user-1', 'telegram', undefined, 'chat-123');
+    expect(result?.sbSlug).toBe('myra');
   });
 
   it('returns null on database error', async () => {
     const client = mockClient(null, { message: 'DB error' });
-    const result = await resolveRouteAgentId(client, 'user-1', 'telegram');
+    const result = await resolveRouteSlug(client, 'user-1', 'telegram');
     expect(result).toBeNull();
   });
 });

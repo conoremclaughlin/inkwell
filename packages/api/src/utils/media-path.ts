@@ -20,7 +20,7 @@
  *
  * The durable simplification is upstream of this file: media should be
  * referenced by a NAME inside a space the producing agent owns
- * (~/.ink/files/<agentId>/…) rather than by filesystem path, turning this
+ * (~/.ink/files/<sbSlug>/…) rather than by filesystem path, turning this
  * into a namespace lookup. Tracked separately; until evidence is authored
  * that way, this module accepts the paths agents already write.
  *

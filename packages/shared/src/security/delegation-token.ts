@@ -14,8 +14,8 @@ export interface DelegationTokenPayload {
 }
 
 export interface MintDelegationTokenInput {
-  issuerAgentId: string;
-  delegateeAgentId: string;
+  issuerSlug: string;
+  delegateeSlug: string;
   scopes: string[];
   ttlSeconds?: number;
   sessionId?: string;
@@ -26,8 +26,8 @@ export interface MintDelegationTokenInput {
 
 export interface VerifyDelegationTokenOptions {
   nowSeconds?: number;
-  expectedIssuerAgentId?: string;
-  expectedDelegateeAgentId?: string;
+  expectedIssuerSlug?: string;
+  expectedDelegateeSlug?: string;
   expectedThreadKey?: string;
   requiredScopes?: string[];
 }
@@ -69,19 +69,15 @@ function safeEqual(a: string, b: string): boolean {
 
 function normalizeScopes(scopes: string[]): string[] {
   return Array.from(
-    new Set(
-      scopes
-        .map((scope) => scope.trim().toLowerCase())
-        .filter(Boolean)
-    )
+    new Set(scopes.map((scope) => scope.trim().toLowerCase()).filter(Boolean))
   ).sort((a, b) => a.localeCompare(b));
 }
 
 export function mintDelegationToken(input: MintDelegationTokenInput, secret: string): string {
-  const issuerAgentId = input.issuerAgentId.trim().toLowerCase();
-  const delegateeAgentId = input.delegateeAgentId.trim().toLowerCase();
-  if (!issuerAgentId || !delegateeAgentId) {
-    throw new Error('issuerAgentId and delegateeAgentId are required');
+  const issuerSlug = input.issuerSlug.trim().toLowerCase();
+  const delegateeSlug = input.delegateeSlug.trim().toLowerCase();
+  if (!issuerSlug || !delegateeSlug) {
+    throw new Error('issuerSlug and delegateeSlug are required');
   }
 
   const scopes = normalizeScopes(input.scopes || []);
@@ -99,8 +95,8 @@ export function mintDelegationToken(input: MintDelegationTokenInput, secret: str
 
   const payload: DelegationTokenPayload = {
     v: 1,
-    iss: issuerAgentId,
-    sub: delegateeAgentId,
+    iss: issuerSlug,
+    sub: delegateeSlug,
     scopes,
     iat: now,
     exp: now + ttl,
@@ -162,11 +158,14 @@ export function verifyDelegationToken(
       return { valid: false, error: 'Token issued in the future' };
     }
 
-    if (options.expectedIssuerAgentId && payload.iss !== options.expectedIssuerAgentId.toLowerCase()) {
+    if (options.expectedIssuerSlug && payload.iss !== options.expectedIssuerSlug.toLowerCase()) {
       return { valid: false, error: 'Unexpected issuer' };
     }
 
-    if (options.expectedDelegateeAgentId && payload.sub !== options.expectedDelegateeAgentId.toLowerCase()) {
+    if (
+      options.expectedDelegateeSlug &&
+      payload.sub !== options.expectedDelegateeSlug.toLowerCase()
+    ) {
       return { valid: false, error: 'Unexpected delegatee' };
     }
 

@@ -35,9 +35,9 @@ interface InboxMessage {
   messageType: string;
   priority: string;
   status: string;
-  senderAgentId: string | null;
+  senderSlug: string | null;
   senderSbId: string | null;
-  recipientAgentId: string;
+  recipientSlug: string;
   recipientSbId: string | null;
   threadKey: string | null;
   recipientSessionId: string | null;
@@ -75,7 +75,7 @@ interface GroupThread {
 }
 
 interface InboxResponse {
-  agentId: string;
+  sbSlug: string;
   stats: {
     totalMessages: number;
     unreadCount: number;
@@ -97,7 +97,7 @@ interface InboxResponse {
 }
 
 interface IndividualsResponse {
-  individuals: { agentId: string; name: string }[];
+  individuals: { sbSlug: string; name: string }[];
 }
 
 // ---------------------------------------------------------------------------
@@ -166,17 +166,17 @@ function agentColor(name: string): string {
 function MessageItem({
   message,
   compact,
-  inboxAgentId,
+  inboxSlug,
   onShowRouting,
 }: {
   message: InboxMessage;
   compact?: boolean;
-  inboxAgentId: string;
+  inboxSlug: string;
   onShowRouting?: (message: InboxMessage) => void;
 }) {
-  const sender = message.senderAgentId || 'unknown';
-  const isAgent = !!message.senderAgentId;
-  const isSent = message.senderAgentId === inboxAgentId;
+  const sender = message.senderSlug || 'unknown';
+  const isAgent = !!message.senderSlug;
+  const isSent = message.senderSlug === inboxSlug;
 
   return (
     <div
@@ -205,7 +205,7 @@ function MessageItem({
           <div className="flex items-baseline gap-2 flex-wrap">
             <span className="text-sm font-semibold text-gray-900">{sender}</span>
             {isSent && (
-              <span className="text-xs text-gray-400">&rarr; {message.recipientAgentId}</span>
+              <span className="text-xs text-gray-400">&rarr; {message.recipientSlug}</span>
             )}
             <span className="text-xs text-gray-400">{formatTimestamp(message.createdAt)}</span>
             {message.messageType !== 'message' && (
@@ -343,12 +343,12 @@ function ThreadRow({
 function ThreadMessages({
   thread,
   messages,
-  agentId,
+  sbSlug,
   onShowRouting,
 }: {
   thread?: ThreadGroup;
   messages?: InboxMessage[];
-  agentId: string;
+  sbSlug: string;
   onShowRouting: (message: InboxMessage) => void;
 }) {
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -364,13 +364,13 @@ function ThreadMessages({
     <div className="flex-1 overflow-y-auto px-1 py-3">
       {displayMessages.map((msg, i) => {
         const prevMsg = i > 0 ? displayMessages[i - 1] : null;
-        const sameSender = prevMsg?.senderAgentId === msg.senderAgentId;
+        const sameSender = prevMsg?.senderSlug === msg.senderSlug;
         return (
           <MessageItem
             key={msg.id}
             message={msg}
             compact={sameSender}
-            inboxAgentId={agentId}
+            inboxSlug={sbSlug}
             onShowRouting={onShowRouting}
           />
         );
@@ -418,7 +418,7 @@ function RoutingField({
 
 export default function InboxPage() {
   const params = useParams();
-  const agentId = params.agentId as string;
+  const sbSlug = params.sbSlug as string;
 
   const [statusFilter, setStatusFilter] = useState('all');
   const [typeFilter, setTypeFilter] = useState('');
@@ -438,11 +438,11 @@ export default function InboxPage() {
     qp.set('offset', String(offset));
     if (statusFilter !== 'all') qp.set('status', statusFilter);
     if (typeFilter) qp.set('messageType', typeFilter);
-    return `/api/admin/individuals/${agentId}/inbox?${qp.toString()}`;
-  }, [agentId, statusFilter, typeFilter, offset]);
+    return `/api/admin/individuals/${sbSlug}/inbox?${qp.toString()}`;
+  }, [sbSlug, statusFilter, typeFilter, offset]);
 
   const { data, isLoading, error } = useApiQuery<InboxResponse>(
-    ['individuals', agentId, 'inbox', statusFilter, typeFilter, offset],
+    ['individuals', sbSlug, 'inbox', statusFilter, typeFilter, offset],
     queryPath,
     { refetchInterval: 15000 }
   );
@@ -452,8 +452,7 @@ export default function InboxPage() {
     '/api/admin/individuals'
   );
 
-  const agentName =
-    individualsData?.individuals.find((i) => i.agentId === agentId)?.name || agentId;
+  const agentName = individualsData?.individuals.find((i) => i.sbSlug === sbSlug)?.name || sbSlug;
 
   const stats = data?.stats;
   const threads = data?.threads || [];
@@ -705,7 +704,7 @@ export default function InboxPage() {
                         <p className="mt-0.5 text-sm text-gray-600 truncate">
                           {gt.lastMessage ? (
                             <>
-                              <span className="font-medium">{gt.lastMessage.senderAgentId}:</span>{' '}
+                              <span className="font-medium">{gt.lastMessage.senderSlug}:</span>{' '}
                               {gt.lastMessage.content}
                             </>
                           ) : (
@@ -748,7 +747,7 @@ export default function InboxPage() {
                   >
                     <MessageItem
                       message={msg}
-                      inboxAgentId={agentId}
+                      inboxSlug={sbSlug}
                       onShowRouting={setRoutingMessage}
                     />
                   </div>
@@ -812,7 +811,7 @@ export default function InboxPage() {
             </SheetTitle>
             {selectedThread && (
               <SheetDescription>
-                {selectedThread.messageCount} messages &middot; {agentId} &harr;{' '}
+                {selectedThread.messageCount} messages &middot; {sbSlug} &harr;{' '}
                 {selectedThread.counterpart}
               </SheetDescription>
             )}
@@ -833,7 +832,7 @@ export default function InboxPage() {
                     ? [selectedMessage]
                     : undefined
               }
-              agentId={agentId}
+              sbSlug={sbSlug}
               onShowRouting={setRoutingMessage}
             />
           )}
@@ -867,7 +866,7 @@ export default function InboxPage() {
                     Sender
                   </h3>
                   <div className="space-y-3">
-                    <RoutingField label="Agent ID" value={routingMessage.senderAgentId} />
+                    <RoutingField label="Agent ID" value={routingMessage.senderSlug} />
                     <RoutingField label="Identity ID" value={routingMessage.senderSbId} mono />
                   </div>
                 </div>
@@ -877,7 +876,7 @@ export default function InboxPage() {
                     Recipient
                   </h3>
                   <div className="space-y-3">
-                    <RoutingField label="Agent ID" value={routingMessage.recipientAgentId} />
+                    <RoutingField label="Agent ID" value={routingMessage.recipientSlug} />
                     <RoutingField label="Identity ID" value={routingMessage.recipientSbId} mono />
                   </div>
                 </div>

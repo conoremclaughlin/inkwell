@@ -36,7 +36,7 @@ interface Reminder {
   status: 'active' | 'paused' | 'completed' | 'cancelled';
   runCount: number;
   maxRuns: number | null;
-  agentId: string | null;
+  sbSlug: string | null;
   agentName: string | null;
   createdAt: string | null;
 }
@@ -48,7 +48,7 @@ interface RemindersResponse {
 type StatusFilter = 'all' | 'active' | 'paused' | 'completed';
 
 interface SBReminderGroup {
-  agentId: string | null;
+  sbSlug: string | null;
   agentName: string;
   reminders: Reminder[];
   activeCount: number;
@@ -59,11 +59,38 @@ interface SBReminderGroup {
 
 const STATUS_ORDER: Record<string, number> = { active: 0, paused: 1, completed: 2, cancelled: 3 };
 
-const statusConfig: Record<string, { icon: typeof Bell; label: string; color: string; bgColor: string; borderColor: string }> = {
-  active: { icon: Bell, label: 'Active', color: 'text-green-700', bgColor: 'bg-green-50', borderColor: 'border-green-200' },
-  paused: { icon: PauseCircle, label: 'Paused', color: 'text-amber-700', bgColor: 'bg-amber-50', borderColor: 'border-amber-200' },
-  completed: { icon: CheckCircle, label: 'Completed', color: 'text-gray-500', bgColor: 'bg-gray-50', borderColor: 'border-gray-200' },
-  cancelled: { icon: XCircle, label: 'Cancelled', color: 'text-gray-400', bgColor: 'bg-gray-50', borderColor: 'border-gray-200' },
+const statusConfig: Record<
+  string,
+  { icon: typeof Bell; label: string; color: string; bgColor: string; borderColor: string }
+> = {
+  active: {
+    icon: Bell,
+    label: 'Active',
+    color: 'text-green-700',
+    bgColor: 'bg-green-50',
+    borderColor: 'border-green-200',
+  },
+  paused: {
+    icon: PauseCircle,
+    label: 'Paused',
+    color: 'text-amber-700',
+    bgColor: 'bg-amber-50',
+    borderColor: 'border-amber-200',
+  },
+  completed: {
+    icon: CheckCircle,
+    label: 'Completed',
+    color: 'text-gray-500',
+    bgColor: 'bg-gray-50',
+    borderColor: 'border-gray-200',
+  },
+  cancelled: {
+    icon: XCircle,
+    label: 'Cancelled',
+    color: 'text-gray-400',
+    bgColor: 'bg-gray-50',
+    borderColor: 'border-gray-200',
+  },
 };
 
 const channelConfig: Record<string, { icon: typeof Send; label: string }> = {
@@ -83,7 +110,15 @@ function formatCron(cron: string | null): string {
   const time = `${hour}:${minute.padStart(2, '0')}`;
   if (dayOfWeek === '*') return `Daily at ${time}`;
   if (dayOfWeek === '1-5') return `Weekdays at ${time}`;
-  const days: Record<string, string> = { '0': 'Sun', '1': 'Mon', '2': 'Tue', '3': 'Wed', '4': 'Thu', '5': 'Fri', '6': 'Sat' };
+  const days: Record<string, string> = {
+    '0': 'Sun',
+    '1': 'Mon',
+    '2': 'Tue',
+    '3': 'Wed',
+    '4': 'Thu',
+    '5': 'Fri',
+    '6': 'Sat',
+  };
   return `${days[dayOfWeek] || dayOfWeek} at ${time}`;
 }
 
@@ -104,7 +139,8 @@ function sortReminders(reminders: Reminder[]): Reminder[] {
   return [...reminders].sort((a, b) => {
     const sd = (STATUS_ORDER[a.status] ?? 9) - (STATUS_ORDER[b.status] ?? 9);
     if (sd !== 0) return sd;
-    if (a.nextRunAt && b.nextRunAt) return new Date(a.nextRunAt).getTime() - new Date(b.nextRunAt).getTime();
+    if (a.nextRunAt && b.nextRunAt)
+      return new Date(a.nextRunAt).getTime() - new Date(b.nextRunAt).getTime();
     if (a.nextRunAt) return -1;
     if (b.nextRunAt) return 1;
     return 0;
@@ -126,14 +162,22 @@ function ReminderCard({ reminder }: { reminder: Reminder }) {
         'rounded-lg border p-4 transition-all',
         reminder.status === 'active' && 'border-green-200 bg-green-50/30',
         reminder.status === 'paused' && 'border-amber-200 bg-amber-50/20',
-        (reminder.status === 'completed' || reminder.status === 'cancelled') && 'border-gray-100 bg-gray-50/30',
+        (reminder.status === 'completed' || reminder.status === 'cancelled') &&
+          'border-gray-100 bg-gray-50/30'
       )}
     >
       <div className="flex items-start justify-between gap-4">
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
             <h4 className="font-medium text-gray-900 text-sm">{reminder.title}</h4>
-            <Badge className={clsx('text-[10px] font-medium border', config.bgColor, config.color, config.borderColor)}>
+            <Badge
+              className={clsx(
+                'text-[10px] font-medium border',
+                config.bgColor,
+                config.color,
+                config.borderColor
+              )}
+            >
               <StatusIcon className="h-3 w-3 mr-0.5" />
               {config.label}
             </Badge>
@@ -159,7 +203,9 @@ function ReminderCard({ reminder }: { reminder: Reminder }) {
             {reminder.runCount > 0 && (
               <span className="flex items-center gap-1">
                 <Hash className="h-3 w-3" />
-                {reminder.runCount}{reminder.maxRuns ? `/${reminder.maxRuns}` : ''} run{reminder.runCount !== 1 ? 's' : ''}
+                {reminder.runCount}
+                {reminder.maxRuns ? `/${reminder.maxRuns}` : ''} run
+                {reminder.runCount !== 1 ? 's' : ''}
               </span>
             )}
           </div>
@@ -171,7 +217,10 @@ function ReminderCard({ reminder }: { reminder: Reminder }) {
                 {formatRelativeTime(reminder.nextRunAt)}
               </div>
               <div className="text-[10px] text-gray-400 mt-0.5">
-                {new Date(reminder.nextRunAt).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })}
+                {new Date(reminder.nextRunAt).toLocaleString([], {
+                  dateStyle: 'short',
+                  timeStyle: 'short',
+                })}
               </div>
             </div>
           )}
@@ -186,13 +235,20 @@ function ReminderCard({ reminder }: { reminder: Reminder }) {
   );
 }
 
-function SBSection({ group, statusFilter }: { group: SBReminderGroup; statusFilter: StatusFilter }) {
+function SBSection({
+  group,
+  statusFilter,
+}: {
+  group: SBReminderGroup;
+  statusFilter: StatusFilter;
+}) {
   const [collapsed, setCollapsed] = useState(group.activeCount === 0);
-  const gradient = getAgentGradient(group.agentId || '__unassigned__');
+  const gradient = getAgentGradient(group.sbSlug || '__unassigned__');
 
-  const filtered = statusFilter === 'all'
-    ? group.reminders
-    : group.reminders.filter((r) => r.status === statusFilter);
+  const filtered =
+    statusFilter === 'all'
+      ? group.reminders
+      : group.reminders.filter((r) => r.status === statusFilter);
 
   if (filtered.length === 0) return null;
 
@@ -205,11 +261,13 @@ function SBSection({ group, statusFilter }: { group: SBReminderGroup; statusFilt
         onClick={() => setCollapsed(!collapsed)}
         className="flex items-center gap-3 w-full px-5 py-3.5 text-left hover:bg-gray-50/50 transition-colors"
       >
-        {group.agentId ? (
-          <div className={clsx(
-            'h-9 w-9 rounded-full bg-gradient-to-br flex items-center justify-center text-white font-semibold text-sm shrink-0',
-            gradient
-          )}>
+        {group.sbSlug ? (
+          <div
+            className={clsx(
+              'h-9 w-9 rounded-full bg-gradient-to-br flex items-center justify-center text-white font-semibold text-sm shrink-0',
+              gradient
+            )}
+          >
             {group.agentName.charAt(0).toUpperCase()}
           </div>
         ) : (
@@ -220,9 +278,7 @@ function SBSection({ group, statusFilter }: { group: SBReminderGroup; statusFilt
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2">
             <span className="font-semibold text-gray-900 text-sm">{group.agentName}</span>
-            {group.agentId && (
-              <span className="text-xs text-gray-400">@{group.agentId}</span>
-            )}
+            {group.sbSlug && <span className="text-xs text-gray-400">@{group.sbSlug}</span>}
           </div>
         </div>
         <div className="flex items-center gap-3 shrink-0">
@@ -231,7 +287,9 @@ function SBSection({ group, statusFilter }: { group: SBReminderGroup; statusFilt
               {activeInGroup} active
             </Badge>
           )}
-          <span className="text-xs text-gray-400">{filtered.length} reminder{filtered.length !== 1 ? 's' : ''}</span>
+          <span className="text-xs text-gray-400">
+            {filtered.length} reminder{filtered.length !== 1 ? 's' : ''}
+          </span>
           {collapsed ? (
             <ChevronRight className="h-4 w-4 text-gray-400" />
           ) : (
@@ -269,11 +327,11 @@ export default function RemindersPage() {
     const groups = new Map<string, SBReminderGroup>();
 
     for (const r of sortReminders(allReminders)) {
-      const key = r.agentId || '__unassigned__';
+      const key = r.sbSlug || '__unassigned__';
       if (!groups.has(key)) {
         groups.set(key, {
-          agentId: r.agentId,
-          agentName: r.agentName || (r.agentId ? r.agentId : 'Unassigned'),
+          sbSlug: r.sbSlug,
+          agentName: r.agentName || (r.sbSlug ? r.sbSlug : 'Unassigned'),
           reminders: [],
           activeCount: 0,
           totalCount: 0,
@@ -289,8 +347,8 @@ export default function RemindersPage() {
     return [...groups.values()].sort((a, b) => {
       if (a.activeCount > 0 && b.activeCount === 0) return -1;
       if (a.activeCount === 0 && b.activeCount > 0) return 1;
-      if (a.agentId === null) return 1; // Unassigned last
-      if (b.agentId === null) return -1;
+      if (a.sbSlug === null) return 1; // Unassigned last
+      if (b.sbSlug === null) return -1;
       return a.agentName.localeCompare(b.agentName);
     });
   }, [allReminders]);
@@ -314,7 +372,9 @@ export default function RemindersPage() {
       {/* Header */}
       <div>
         <h1 className="text-3xl font-bold text-gray-900">Reminders</h1>
-        <p className="mt-1 text-gray-500">Scheduled reminders and recurring check-ins, grouped by SB.</p>
+        <p className="mt-1 text-gray-500">
+          Scheduled reminders and recurring check-ins, grouped by SB.
+        </p>
       </div>
 
       {error && (
@@ -354,10 +414,12 @@ export default function RemindersPage() {
             >
               {btn.label}
               {btn.count > 0 && (
-                <span className={clsx(
-                  'ml-1.5 tabular-nums',
-                  statusFilter === btn.key ? 'text-gray-300' : 'text-gray-400'
-                )}>
+                <span
+                  className={clsx(
+                    'ml-1.5 tabular-nums',
+                    statusFilter === btn.key ? 'text-gray-300' : 'text-gray-400'
+                  )}
+                >
                   {btn.count}
                 </span>
               )}
@@ -384,13 +446,19 @@ export default function RemindersPage() {
               <Bell className="h-10 w-10 mx-auto text-gray-300 mb-3" />
               <p className="text-gray-500">No reminders scheduled yet.</p>
               <p className="text-sm text-gray-400 mt-1">
-                Use <code className="bg-gray-100 px-1.5 py-0.5 rounded text-xs">create_reminder</code> to schedule one.
+                Use{' '}
+                <code className="bg-gray-100 px-1.5 py-0.5 rounded text-xs">create_reminder</code>{' '}
+                to schedule one.
               </p>
             </CardContent>
           </Card>
         ) : (
           sbGroups.map((group) => (
-            <SBSection key={group.agentId || '__unassigned__'} group={group} statusFilter={statusFilter} />
+            <SBSection
+              key={group.sbSlug || '__unassigned__'}
+              group={group}
+              statusFilter={statusFilter}
+            />
           ))
         )}
       </div>

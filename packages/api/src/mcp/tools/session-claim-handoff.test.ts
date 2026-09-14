@@ -84,7 +84,7 @@ const TARGET_UUID = '95f7f160-6599-449d-9f63-e31ca20a43ce';
 const ownerSession = {
   id: 'session-owner',
   userId: USER_ID,
-  agentId: 'myra',
+  sbSlug: 'myra',
   sbId: 'sb-myra',
   startedAt: new Date('2026-08-20T10:00:00Z'),
   metadata: {},
@@ -140,7 +140,7 @@ function runnerBearer(session: { id: string; sbId?: string; contactId?: string }
   const minter = Object.create(SessionService.prototype) as {
     createRunnerAccessToken(
       userId: string,
-      agentId: string,
+      sbSlug: string,
       email: string,
       session: { id: string; sbId?: string; contactId?: string }
     ): string | undefined;
@@ -271,7 +271,7 @@ describe('contact isolation, end to end through the real MCP HTTP path', () => {
 
   it('refuses a peer identity even with a valid bearer', async (ctx) => {
     requireServer(ctx);
-    getSession.mockResolvedValue({ ...ownerSession, agentId: 'lumen', sbId: 'sb-lumen' });
+    getSession.mockResolvedValue({ ...ownerSession, sbSlug: 'lumen', sbId: 'sb-lumen' });
 
     const result = await callTool(runnerBearer(ownerSession), {
       sessionId: TARGET_UUID,
@@ -290,7 +290,7 @@ describe('contact isolation, end to end through the real MCP HTTP path', () => {
       JSON.stringify({
         sessionId: 'session-contact-b',
         studioId: 'main',
-        agentId: 'myra',
+        sbSlug: 'myra',
         cliAttached: false,
         runtime: 'claude',
       })

@@ -6,7 +6,7 @@
  */
 
 export interface StudioIdentity {
-  agentId: string;
+  sbSlug: string;
   sbId?: string;
   context: string;
   description: string;
@@ -41,7 +41,7 @@ export interface PcpConfig {
 
 export interface CreateStudioOptions {
   name: string;
-  agentId?: string;
+  sbSlug?: string;
   gitRoot?: string;
   purpose?: string;
 }

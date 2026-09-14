@@ -625,8 +625,8 @@ export class ChannelGateway extends EventEmitter {
 
     // NOTE: inbound messages are NOT logged to the activity stream here.
     // SessionService.handleMessage logs them first thing with the RESOLVED
-    // agentId and full payload (media, threadKey, sender) — this site used
-    // to log a second copy with a hardcoded agentId of 'myra', producing
+    // sbSlug and full payload (media, threadKey, sender) — this site used
+    // to log a second copy with a hardcoded sbSlug of 'myra', producing
     // duplicate message_in rows (double-rendered in attached CLI views).
 
     // Pass resolved userId to message handler so SessionService can persist messages
@@ -808,7 +808,7 @@ export class ChannelGateway extends EventEmitter {
               }
               await this.dataComposer.repositories.activityStream.logMessage({
                 userId,
-                agentId: 'myra',
+                sbSlug: 'myra',
                 direction: 'out',
                 content: logContent,
                 sessionId,
@@ -871,7 +871,7 @@ export class ChannelGateway extends EventEmitter {
               }
               await this.dataComposer.repositories.activityStream.logMessage({
                 userId,
-                agentId: 'benson',
+                sbSlug: 'benson',
                 direction: 'out',
                 content: logContent,
                 sessionId,
@@ -930,7 +930,7 @@ export class ChannelGateway extends EventEmitter {
               }
               await this.dataComposer.repositories.activityStream.logMessage({
                 userId,
-                agentId: 'slack',
+                sbSlug: 'slack',
                 direction: 'out',
                 content: logContent,
                 sessionId,
@@ -1111,7 +1111,7 @@ export class ChannelGateway extends EventEmitter {
         }
         await this.dataComposer.repositories.activityStream.logMessage({
           userId,
-          agentId: 'myra',
+          sbSlug: 'myra',
           direction: 'out',
           content,
           sessionId,

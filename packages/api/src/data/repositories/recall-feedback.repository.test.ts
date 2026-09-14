@@ -19,7 +19,7 @@ describe('RecallFeedbackRepository', () => {
 
       const saved = await repo.saveFeedback({
         userId: 'user-1',
-        agentId: 'wren',
+        sbSlug: 'wren',
         query: 'merge strategy',
         sessionId: 'sess-1',
         entries: [

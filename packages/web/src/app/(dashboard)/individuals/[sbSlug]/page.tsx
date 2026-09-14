@@ -39,7 +39,7 @@ interface RuntimeConfig {
 
 interface Identity {
   id: string;
-  agentId: string;
+  sbSlug: string;
   name: string;
   role: string;
   backend?: string | null;
@@ -86,7 +86,7 @@ const TOOL_ROUTING = [
   { value: 'backend', label: 'Backend — Native MCP tool calling' },
 ];
 
-function RuntimeSettingsPanel({ agentId, identity }: { agentId: string; identity: Identity }) {
+function RuntimeSettingsPanel({ sbSlug, identity }: { sbSlug: string; identity: Identity }) {
   const queryClient = useQueryClient();
   const rc = identity.runtimeConfig || {};
 
@@ -116,7 +116,7 @@ function RuntimeSettingsPanel({ agentId, identity }: { agentId: string; identity
 
   const handleSave = () => {
     saveSettings.mutate({
-      id: agentId,
+      id: sbSlug,
       body: {
         backend: backend || null,
         toolProfile: toolProfile || null,
@@ -317,10 +317,10 @@ function RuntimeSettingsPanel({ agentId, identity }: { agentId: string; identity
         <CardContent>
           <pre className="bg-gray-900 text-gray-100 p-3 rounded-md text-xs font-mono overflow-x-auto">
             {`# Run ${identity.name} with these settings
-ink chat --agent ${agentId}${backend ? ` --backend ${backend}` : ''}${toolProfile ? ` --profile ${toolProfile}` : ''}${toolRouting ? ` --tool-routing ${toolRouting}` : ''}${maxTurns ? ` --max-turns ${maxTurns}` : ''}
+ink chat --agent ${sbSlug}${backend ? ` --backend ${backend}` : ''}${toolProfile ? ` --profile ${toolProfile}` : ''}${toolRouting ? ` --tool-routing ${toolRouting}` : ''}${maxTurns ? ` --max-turns ${maxTurns}` : ''}
 
 # Heartbeat mode
-ink chat --agent ${agentId}${backend ? ` --backend ${backend}` : ''} --profile ${toolProfile || 'collaborative'} --max-turns ${maxTurns || '5'} --message "Heartbeat check"`}
+ink chat --agent ${sbSlug}${backend ? ` --backend ${backend}` : ''} --profile ${toolProfile || 'collaborative'} --max-turns ${maxTurns || '5'} --message "Heartbeat check"`}
           </pre>
         </CardContent>
       </Card>
@@ -330,7 +330,7 @@ ink chat --agent ${agentId}${backend ? ` --backend ${backend}` : ''} --profile $
 
 export default function AgentDetailPage() {
   const params = useParams();
-  const agentId = params?.agentId as string;
+  const sbSlug = params?.sbSlug as string;
   const router = useRouter();
 
   // Fetch all individuals (since we don't have a single-get endpoint yet)
@@ -355,13 +355,13 @@ export default function AgentDetailPage() {
     );
   }
 
-  const identity = data?.individuals.find((i) => i.agentId === agentId);
+  const identity = data?.individuals.find((i) => i.sbSlug === sbSlug);
 
   if (!identity) {
     return (
       <div className="p-8 text-center">
         <h2 className="text-xl font-bold text-gray-900">Agent Not Found</h2>
-        <p className="mt-2 text-gray-600">Could not find an agent with ID "{agentId}".</p>
+        <p className="mt-2 text-gray-600">Could not find an agent with ID "{sbSlug}".</p>
         <Button className="mt-4" onClick={() => router.push('/individuals')}>
           Back to Individuals
         </Button>
@@ -383,7 +383,7 @@ export default function AgentDetailPage() {
           <h1 className="text-3xl font-bold text-gray-900 flex items-center gap-2">
             {identity.name}
             <Badge variant="outline" className="font-mono text-lg">
-              {identity.agentId}
+              {identity.sbSlug}
             </Badge>
           </h1>
           <p className="mt-1 text-lg text-gray-600">{identity.role}</p>
@@ -391,19 +391,19 @@ export default function AgentDetailPage() {
 
         <div className="flex flex-wrap gap-2">
           <Button variant="outline" size="sm" asChild>
-            <Link href={`/individuals/${agentId}/inbox`}>
+            <Link href={`/individuals/${sbSlug}/inbox`}>
               <Inbox className="mr-2 h-4 w-4" />
               Inbox
             </Link>
           </Button>
           <Button variant="outline" size="sm" asChild>
-            <Link href={`/individuals/${agentId}/memories`}>
+            <Link href={`/individuals/${sbSlug}/memories`}>
               <Brain className="mr-2 h-4 w-4" />
               Memories
             </Link>
           </Button>
           <Button variant="outline" size="sm" asChild>
-            <Link href={`/individuals/${agentId}/versions`}>
+            <Link href={`/individuals/${sbSlug}/versions`}>
               <History className="mr-2 h-4 w-4" />v{identity.version} History
             </Link>
           </Button>
@@ -562,7 +562,7 @@ export default function AgentDetailPage() {
 
         {/* Runtime Settings Tab */}
         <TabsContent value="runtime" className="mt-6">
-          <RuntimeSettingsPanel agentId={agentId} identity={identity} />
+          <RuntimeSettingsPanel sbSlug={sbSlug} identity={identity} />
         </TabsContent>
 
         {/* Raw Identity Tab */}

@@ -16,7 +16,7 @@ interface AutomationItem {
   id: string;
   kind: AutomationKind;
   title: string;
-  agentId: string | null;
+  sbSlug: string | null;
   agentName: string | null;
   cadence: string;
   status: string;
@@ -167,9 +167,9 @@ export default function AutomationsPage() {
                           <CalendarClock className="h-3 w-3" />
                           {automation.cadence}
                         </span>
-                        {automation.agentId && (
+                        {automation.sbSlug && (
                           <Badge className="bg-muted text-[10px] font-medium text-muted-foreground hover:bg-muted">
-                            @{automation.agentId}
+                            @{automation.sbSlug}
                           </Badge>
                         )}
                         {automation.deliveryChannel && (

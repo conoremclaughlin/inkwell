@@ -12,18 +12,18 @@ describe('resolveTriggeredAgents', () => {
   describe('1:1 threads (2 participants)', () => {
     it('should trigger the other participant', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants: ['wren', 'lumen'],
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
       });
       expect(result).toEqual(['lumen']);
     });
 
     it('should trigger creator when non-creator replies in 1:1', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'lumen',
+        senderSlug: 'lumen',
         participants: ['wren', 'lumen'],
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
       });
       expect(result).toEqual(['wren']);
     });
@@ -34,18 +34,18 @@ describe('resolveTriggeredAgents', () => {
 
     it('should trigger creator only when non-creator replies', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'lumen',
+        senderSlug: 'lumen',
         participants,
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
       });
       expect(result).toEqual(['wren']);
     });
 
     it('should trigger all others when creator replies with a plain message', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants,
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         messageType: 'message',
       });
       expect(result).toEqual(['lumen', 'aster', 'myra']);
@@ -53,18 +53,18 @@ describe('resolveTriggeredAgents', () => {
 
     it('should trigger all others when creator replies with no messageType (default)', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants,
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
       });
       expect(result).toEqual(['lumen', 'aster', 'myra']);
     });
 
     it('should trigger only explicit recipient when creator targets one person', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants,
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         recipients: ['myra'],
       });
       expect(result).toEqual(['myra']);
@@ -72,9 +72,9 @@ describe('resolveTriggeredAgents', () => {
 
     it('should trigger only explicit recipient when non-creator targets one person', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'lumen',
+        senderSlug: 'lumen',
         participants,
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         recipients: ['myra'],
       });
       expect(result).toEqual(['myra']);
@@ -82,9 +82,9 @@ describe('resolveTriggeredAgents', () => {
 
     it('should trigger no one when creator explicitly targets self (same studio)', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants,
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         recipients: ['wren'],
       });
       expect(result).toEqual([]);
@@ -92,9 +92,9 @@ describe('resolveTriggeredAgents', () => {
 
     it('should trigger no one when non-creator explicitly targets self (same studio)', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'lumen',
+        senderSlug: 'lumen',
         participants,
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         recipients: ['lumen'],
       });
       expect(result).toEqual([]);
@@ -102,9 +102,9 @@ describe('resolveTriggeredAgents', () => {
 
     it('should trigger self when explicitly targeting self with selfStudioTarget', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants,
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         recipients: ['wren'],
         selfStudioTarget: true,
       });
@@ -113,9 +113,9 @@ describe('resolveTriggeredAgents', () => {
 
     it('should filter explicit recipients to actual participants', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants,
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         recipients: ['myra', 'benson'],
       });
       expect(result).toEqual(['myra']);
@@ -127,9 +127,9 @@ describe('resolveTriggeredAgents', () => {
 
     it('should trigger recipients when creator sends task_request', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants,
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         messageType: 'task_request',
         recipients: ['lumen'],
       });
@@ -138,9 +138,9 @@ describe('resolveTriggeredAgents', () => {
 
     it('should trigger all other participants when creator sends task_request without explicit recipients', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants,
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         messageType: 'task_request',
       });
       expect(result).toEqual(['lumen', 'aster', 'myra']);
@@ -148,9 +148,9 @@ describe('resolveTriggeredAgents', () => {
 
     it('should trigger recipients when creator sends session_resume', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants,
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         messageType: 'session_resume',
         recipients: ['aster'],
       });
@@ -159,9 +159,9 @@ describe('resolveTriggeredAgents', () => {
 
     it('should filter recipients to actual participants only', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants: ['wren', 'lumen'],
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         messageType: 'task_request',
         recipients: ['lumen', 'aster'], // aster is not a participant
       });
@@ -172,18 +172,18 @@ describe('resolveTriggeredAgents', () => {
   describe('self-thread (1 participant)', () => {
     it('should trigger no one for plain messages', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants: ['wren'],
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
       });
       expect(result).toEqual([]);
     });
 
     it('should trigger self for session_resume (strategy self-trigger)', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants: ['wren'],
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         messageType: 'session_resume',
       });
       expect(result).toEqual(['wren']);
@@ -191,9 +191,9 @@ describe('resolveTriggeredAgents', () => {
 
     it('should trigger self for task_request', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants: ['wren'],
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         messageType: 'task_request',
       });
       expect(result).toEqual(['wren']);
@@ -201,9 +201,9 @@ describe('resolveTriggeredAgents', () => {
 
     it('should not trigger self for notification', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants: ['wren'],
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         messageType: 'notification',
       });
       expect(result).toEqual([]);
@@ -213,9 +213,9 @@ describe('resolveTriggeredAgents', () => {
   describe('triggerAll override', () => {
     it('should trigger all participants except sender', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants: ['wren', 'lumen', 'aster', 'myra'],
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         triggerAll: true,
       });
       expect(result).toEqual(['lumen', 'aster', 'myra']);
@@ -223,9 +223,9 @@ describe('resolveTriggeredAgents', () => {
 
     it('should work in 1:1 threads', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants: ['wren', 'lumen'],
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         triggerAll: true,
       });
       expect(result).toEqual(['lumen']);
@@ -235,9 +235,9 @@ describe('resolveTriggeredAgents', () => {
   describe('triggerAgents override', () => {
     it('should trigger only specified participants', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants: ['wren', 'lumen', 'aster', 'myra'],
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         triggerAgents: ['lumen'],
       });
       expect(result).toEqual(['lumen']);
@@ -245,9 +245,9 @@ describe('resolveTriggeredAgents', () => {
 
     it('should silently ignore non-participants', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants: ['wren', 'lumen'],
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         triggerAgents: ['aster', 'lumen'],
       });
       expect(result).toEqual(['lumen']);
@@ -255,9 +255,9 @@ describe('resolveTriggeredAgents', () => {
 
     it('should not trigger the sender even if listed', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants: ['wren', 'lumen', 'aster'],
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         triggerAgents: ['wren', 'lumen'],
       });
       expect(result).toEqual(['lumen']);
@@ -265,9 +265,9 @@ describe('resolveTriggeredAgents', () => {
 
     it('should take precedence over triggerAll', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants: ['wren', 'lumen', 'aster', 'myra'],
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         triggerAgents: ['aster'],
         triggerAll: true,
       });
@@ -279,9 +279,9 @@ describe('resolveTriggeredAgents', () => {
   describe('cross-studio self-messaging (selfStudioTarget)', () => {
     it('should trigger sender on self-thread when selfStudioTarget is true', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants: ['wren'],
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         selfStudioTarget: true,
       });
       expect(result).toEqual(['wren']);
@@ -289,9 +289,9 @@ describe('resolveTriggeredAgents', () => {
 
     it('should NOT trigger sender on self-thread when selfStudioTarget is false', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants: ['wren'],
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         selfStudioTarget: false,
       });
       expect(result).toEqual([]);
@@ -299,9 +299,9 @@ describe('resolveTriggeredAgents', () => {
 
     it('should include sender in triggerAll when selfStudioTarget is true', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants: ['wren', 'lumen'],
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         triggerAll: true,
         selfStudioTarget: true,
       });
@@ -310,9 +310,9 @@ describe('resolveTriggeredAgents', () => {
 
     it('should include sender in explicit triggerAgents when selfStudioTarget is true', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants: ['wren', 'lumen'],
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         triggerAgents: ['wren'],
         selfStudioTarget: true,
       });
@@ -321,9 +321,9 @@ describe('resolveTriggeredAgents', () => {
 
     it('should still exclude sender from explicit triggerAgents without selfStudioTarget', () => {
       const result = resolveTriggeredAgents({
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         participants: ['wren', 'lumen'],
-        creatorAgentId: 'wren',
+        creatorSlug: 'wren',
         triggerAgents: ['wren'],
       });
       expect(result).toEqual([]);
@@ -376,7 +376,7 @@ vi.mock('../../channels/agent-gateway.js', () => ({
 }));
 
 vi.mock('../../auth/enforce-identity', () => ({
-  getEffectiveAgentId: vi.fn((id?: string) => id || null),
+  getEffectiveSlug: vi.fn((id?: string) => id || null),
 }));
 
 vi.mock('../../auth/resolve-identity', () => ({
@@ -512,23 +512,23 @@ describe('handleSendToInbox - validation', () => {
     vi.clearAllMocks();
   });
 
-  it('should reject when both recipientAgentId and recipients are provided', async () => {
+  it('should reject when both recipientSlug and recipients are provided', async () => {
     const mockDc = createMockDataComposer();
     await expect(
       handleSendToInbox(
         {
           email: 'test@test.com',
-          recipientAgentId: 'lumen',
+          recipientSlug: 'lumen',
           recipients: ['lumen', 'aster'],
           threadKey: 'pr:32',
           content: 'test',
         },
         mockDc as never
       )
-    ).rejects.toThrow('Provide exactly one of recipientAgentId or recipients');
+    ).rejects.toThrow('Provide exactly one of recipientSlug or recipients');
   });
 
-  it('should reject when neither recipientAgentId nor recipients are provided', async () => {
+  it('should reject when neither recipientSlug nor recipients are provided', async () => {
     const mockDc = createMockDataComposer();
     await expect(
       handleSendToInbox(
@@ -538,7 +538,7 @@ describe('handleSendToInbox - validation', () => {
         },
         mockDc as never
       )
-    ).rejects.toThrow('Provide exactly one of recipientAgentId or recipients');
+    ).rejects.toThrow('Provide exactly one of recipientSlug or recipients');
   });
 
   it('should reject recipients[] without threadKey', async () => {
@@ -593,15 +593,15 @@ describe('handleSendToInbox - thread routing', () => {
     vi.clearAllMocks();
   });
 
-  it('should route to thread tables when threadKey is provided with recipientAgentId', async () => {
+  it('should route to thread tables when threadKey is provided with recipientSlug', async () => {
     const mockSb = createThreadMockSupabase();
     const mockDc = createMockDataComposer(mockSb);
 
     const result = await handleSendToInbox(
       {
         email: 'test@test.com',
-        recipientAgentId: 'lumen',
-        senderAgentId: 'wren',
+        recipientSlug: 'lumen',
+        senderSlug: 'wren',
         threadKey: 'pr:32',
         content: 'Review PR #32',
       },
@@ -624,7 +624,7 @@ describe('handleSendToInbox - thread routing', () => {
       {
         email: 'test@test.com',
         recipients: ['lumen', 'aster'],
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         threadKey: 'spec:group-threads',
         content: 'RFC for review',
       },
@@ -647,8 +647,8 @@ describe('handleSendToInbox - thread routing', () => {
     const result = await handleSendToInbox(
       {
         email: 'test@test.com',
-        recipientAgentId: 'lumen',
-        senderAgentId: 'wren',
+        recipientSlug: 'lumen',
+        senderSlug: 'wren',
         content: 'Simple message',
       },
       mockDc as never
@@ -668,8 +668,8 @@ describe('handleSendToInbox - thread routing', () => {
     const result = await handleSendToInbox(
       {
         email: 'test@test.com',
-        recipientAgentId: 'lumen',
-        senderAgentId: 'wren',
+        recipientSlug: 'lumen',
+        senderSlug: 'wren',
         recipientStudioSlug: 'wren-review',
         content: 'Direct slug-routed message',
       },
@@ -688,8 +688,8 @@ describe('handleSendToInbox - thread routing', () => {
     const result = await handleSendToInbox(
       {
         email: 'test@test.com',
-        recipientAgentId: 'lumen',
-        senderAgentId: 'wren',
+        recipientSlug: 'lumen',
+        senderSlug: 'wren',
         recipientStudioHint: 'main',
         content: 'Legacy hint caller',
       },
@@ -712,7 +712,7 @@ describe('handleSendToInbox - thread routing', () => {
       {
         email: 'test@test.com',
         recipients: ['lumen', 'aster'],
-        senderAgentId: 'wren',
+        senderSlug: 'wren',
         threadKey: 'spec:test',
         content: 'Hello team',
       },
@@ -723,14 +723,14 @@ describe('handleSendToInbox - thread routing', () => {
     expect(mockGateway.dispatchTrigger).toHaveBeenCalledTimes(2);
     expect(mockGateway.dispatchTrigger).toHaveBeenCalledWith(
       expect.objectContaining({
-        toAgentId: 'lumen',
+        toSlug: 'lumen',
         threadKey: 'spec:test',
         threadMessageId: 'tmsg-123',
       })
     );
     expect(mockGateway.dispatchTrigger).toHaveBeenCalledWith(
       expect.objectContaining({
-        toAgentId: 'aster',
+        toSlug: 'aster',
         threadKey: 'spec:test',
         threadMessageId: 'tmsg-123',
       })
@@ -903,7 +903,7 @@ async function callGuard(
   extra: Record<string, unknown> = {}
 ) {
   const result = await handleGetThreadMessages(
-    { email: 'test@test.com', agentId: 'wren', threadKey: 'pr:guard', ...extra },
+    { email: 'test@test.com', sbSlug: 'wren', threadKey: 'pr:guard', ...extra },
     guardComposer(sb)
   );
   return JSON.parse(result.content[0].text);
@@ -1032,7 +1032,7 @@ describe('handleGetThreadMessages — cold-start guard (spec §4)', () => {
     const result = await handleMarkThreadRead(
       {
         email: 'test@test.com',
-        agentId: 'wren',
+        sbSlug: 'wren',
         threadKey: 'pr:guard',
         throughMessageId: '00000000-0000-0000-0000-000000000000',
       },
@@ -1049,7 +1049,7 @@ describe('handleGetThreadMessages — cold-start guard (spec §4)', () => {
     const rows = [guardMsg(ackId, 3), guardMsg('m-newer', 1)];
     const sb = createGuardMockSupabase(rows);
     const result = await handleMarkThreadRead(
-      { email: 'test@test.com', agentId: 'wren', threadKey: 'pr:guard', throughMessageId: ackId },
+      { email: 'test@test.com', sbSlug: 'wren', threadKey: 'pr:guard', throughMessageId: ackId },
       guardComposer(sb)
     );
     const parsed = JSON.parse(result.content[0].text);
@@ -1140,7 +1140,7 @@ describe('handleCloseThread — lease/teardown wiring (v18 S2)', () => {
     } as never;
 
     try {
-      const result = await handleCloseThread({ threadKey: 'pr:9', agentId: 'wren' }, dataComposer);
+      const result = await handleCloseThread({ threadKey: 'pr:9', sbSlug: 'wren' }, dataComposer);
       const payload = JSON.parse((result.content[0] as { text: string }).text);
       expect(payload.success).toBe(true);
 
@@ -1278,8 +1278,8 @@ describe('handleReopenThread — explicit reopen (spec inkmail-thread-scope §2)
     };
     const supabase = makeFakeSupabase(tables);
     const dataComposer = { getClient: () => supabase, repositories: {} } as never;
-    const call = async (agentId: string) => {
-      const result = await handleReopenThread({ threadKey: 'pr:9', agentId }, dataComposer);
+    const call = async (sbSlug: string) => {
+      const result = await handleReopenThread({ threadKey: 'pr:9', sbSlug }, dataComposer);
       return JSON.parse((result.content[0] as { text: string }).text) as Record<string, unknown>;
     };
     const restore = () => {
@@ -1351,7 +1351,7 @@ describe('handleReopenThread — explicit reopen (spec inkmail-thread-scope §2)
     const { supabase, tables, reopenThreadRow, restore } = await setup();
     try {
       expect(
-        await reopenThreadRow(supabase as never, 't1', { kind: 'sb', agentId: 'wren' })
+        await reopenThreadRow(supabase as never, 't1', { kind: 'sb', sbSlug: 'wren' })
       ).toEqual({ reopened: true });
       expect(await reopenThreadRow(supabase as never, 't1', { kind: 'user' })).toEqual({
         reopened: false,
@@ -1405,7 +1405,7 @@ describe('reopenThreadRow — a failed call is an error, never a silent success'
     await expect(
       reopenThreadRow(rpcClient({ data: null, error: null }) as never, 't1', {
         kind: 'sb',
-        agentId: 'wren',
+        sbSlug: 'wren',
       })
     ).rejects.toThrow('Failed to reopen thread: unexpected reply null');
   });
@@ -1419,7 +1419,7 @@ describe('reopenThreadRow — a failed call is an error, never a silent success'
         return { data: true, error: null };
       },
     };
-    expect(await reopenThreadRow(client as never, 't1', { kind: 'sb', agentId: 'wren' })).toEqual({
+    expect(await reopenThreadRow(client as never, 't1', { kind: 'sb', sbSlug: 'wren' })).toEqual({
       reopened: true,
     });
     expect(await reopenThreadRow(client as never, 't1', { kind: 'user' })).toEqual({

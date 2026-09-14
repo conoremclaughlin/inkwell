@@ -15,7 +15,7 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import { logger } from '../../utils/logger';
 
 export interface MentionResolvedAgent {
-  agentId: string;
+  sbSlug: string;
   sbId: string;
 }
 
@@ -59,45 +59,45 @@ export async function resolveAgentFromMention(
 
     if (mentionedLower.includes(agentIdLower)) {
       logger.debug('[Mention] Matched by mentioned username → agent_id', {
-        agentId: identity.agent_id,
+        sbSlug: identity.agent_id,
         sbId: identity.id,
       });
-      return { agentId: identity.agent_id, sbId: identity.id };
+      return { sbSlug: identity.agent_id, sbId: identity.id };
     }
 
     if (nameLower && mentionedLower.includes(nameLower)) {
       logger.debug('[Mention] Matched by mentioned username → name', {
-        agentId: identity.agent_id,
+        sbSlug: identity.agent_id,
         name: identity.name,
         sbId: identity.id,
       });
-      return { agentId: identity.agent_id, sbId: identity.id };
+      return { sbSlug: identity.agent_id, sbId: identity.id };
     }
   }
 
   // 2. Check message text for agent names (word-boundary match)
   const textLower = messageText.toLowerCase();
   for (const identity of identities) {
-    const agentId = identity.agent_id;
+    const sbSlug = identity.agent_id;
     const name = identity.name;
 
     // Match agent_id as a word boundary (e.g., "wren" but not "wrench")
-    if (new RegExp(`\\b${escapeRegex(agentId)}\\b`, 'i').test(textLower)) {
+    if (new RegExp(`\\b${escapeRegex(sbSlug)}\\b`, 'i').test(textLower)) {
       logger.debug('[Mention] Matched by text mention → agent_id', {
-        agentId: identity.agent_id,
+        sbSlug: identity.agent_id,
         sbId: identity.id,
       });
-      return { agentId: identity.agent_id, sbId: identity.id };
+      return { sbSlug: identity.agent_id, sbId: identity.id };
     }
 
     // Match identity name as word boundary
     if (name && new RegExp(`\\b${escapeRegex(name)}\\b`, 'i').test(textLower)) {
       logger.debug('[Mention] Matched by text mention → name', {
-        agentId: identity.agent_id,
+        sbSlug: identity.agent_id,
         name,
         sbId: identity.id,
       });
-      return { agentId: identity.agent_id, sbId: identity.id };
+      return { sbSlug: identity.agent_id, sbId: identity.id };
     }
   }
 

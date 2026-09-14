@@ -47,8 +47,8 @@ export function ForkCard({
   formatDate: (date: string) => string;
 }) {
   const label =
-    metaString(entry.metadata, 'childAgentId') ||
-    metaString(entry.metadata, 'agentId') ||
+    metaString(entry.metadata, 'childSlug') ||
+    metaString(entry.metadata, 'sbSlug') ||
     metaString(entry.metadata, 'label') ||
     entry.content ||
     'sub-agent';

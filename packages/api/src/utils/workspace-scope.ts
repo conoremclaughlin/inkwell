@@ -10,8 +10,8 @@ export interface ResolvedWorkspaceScope {
 export interface ResolveWorkspaceScopeForWriteParams {
   rawArgs: Record<string, unknown>;
   explicitWorkspaceId?: string;
-  agentId?: string;
-  deriveWorkspaceIdFromAgent?: (agentId: string) => Promise<string | null>;
+  sbSlug?: string;
+  deriveWorkspaceIdFromAgent?: (sbSlug: string) => Promise<string | null>;
 }
 
 export interface ResolveWorkspaceContextForRequestParams {
@@ -29,7 +29,7 @@ export interface ResolveWorkspaceContextForRequestParams {
 export async function resolveWorkspaceScopeForWrite({
   rawArgs,
   explicitWorkspaceId,
-  agentId,
+  sbSlug,
   deriveWorkspaceIdFromAgent,
 }: ResolveWorkspaceScopeForWriteParams): Promise<ResolvedWorkspaceScope | null> {
   const reqCtx = getRequestContext();
@@ -41,8 +41,8 @@ export async function resolveWorkspaceScopeForWrite({
     return { workspaceId: reqCtx.workspaceId, source: 'derived' };
   }
 
-  if (agentId && deriveWorkspaceIdFromAgent) {
-    const derived = await deriveWorkspaceIdFromAgent(agentId);
+  if (sbSlug && deriveWorkspaceIdFromAgent) {
+    const derived = await deriveWorkspaceIdFromAgent(sbSlug);
     if (derived) {
       return { workspaceId: derived, source: 'derived' };
     }

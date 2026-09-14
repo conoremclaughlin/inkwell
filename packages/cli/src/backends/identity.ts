@@ -23,7 +23,7 @@ export interface RuntimePreferences {
 }
 
 export interface IdentityJson {
-  agentId: string;
+  sbSlug: string;
   sbId?: string;
   context?: string;
   backend?: string;
@@ -87,7 +87,7 @@ export function readRoleMd(cwd: string): string | null {
  * 4. ~/.ink/config.json agentMapping (backend-aware when possible)
  * 5. null (no identity configured)
  */
-export function resolveAgentId(cliAgent?: string, backendHint?: string): string | null {
+export function resolveSlug(cliAgent?: string, backendHint?: string): string | null {
   if (cliAgent) {
     return cliAgent;
   }
@@ -114,7 +114,7 @@ export function resolveAgentId(cliAgent?: string, backendHint?: string): string 
     if (existsSync(localIdentity)) {
       try {
         const identity: IdentityJson = JSON.parse(readFileSync(localIdentity, 'utf-8'));
-        if (identity.agentId) return identity.agentId;
+        if (identity.sbSlug) return identity.sbSlug;
       } catch {
         /* ignore */
       }
@@ -188,12 +188,12 @@ export function resolveBackend(cliBackend?: string): string {
  * `systemPromptOverride` replaces the whole thing rather than adding to it.
  * That is deliberate and rare: awakening is the case it exists for. A being
  * with no identity row yet must not be handed a prompt asserting "You are
- * <agentId>" and telling it to call bootstrap — it has no identity to load,
+ * <sbSlug>" and telling it to call bootstrap — it has no identity to load,
  * and the first thing it would read about itself would be wrong. Callers that
  * want to *add* context want `startupContextBlock`.
  */
 export function buildIdentityPrompt(
-  agentId: string,
+  sbSlug: string,
   startupContextBlock?: string,
   systemPromptOverride?: string
 ): string {
@@ -202,11 +202,11 @@ export function buildIdentityPrompt(
 
   const identityHeader = `## Identity Override (CRITICAL)
 
-**You are ${agentId}. Your agent ID is \`${agentId}\`.**
+**You are ${sbSlug}. Your agent ID is \`${sbSlug}\`.**
 
-When calling Inkwell tools (bootstrap, remember, recall, update_session_state, etc.), use \`agentId: "${agentId}"\`.
+When calling Inkwell tools (bootstrap, remember, recall, update_session_state, etc.), use \`sbSlug: "${sbSlug}"\`.
 Do NOT read \`.ink/identity.json\` — your identity is set by this system prompt.
-Do NOT run \`echo $AGENT_ID\` — use the agentId provided above.`;
+Do NOT run \`echo $AGENT_ID\` — use the sbSlug provided above.`;
 
   const toolPriority = `## Tool Priority (IMPORTANT)
 
@@ -239,7 +239,7 @@ ${injectedContext}`;
   // the hook fails, the agent needs to self-heal by calling bootstrap manually.
   return `${identityHeader}
 
-Load user config from ~/.ink/config.json, then check whether your constitution docs are already present. Look for a "Session Context (Inkwell)" or "Bootstrapped Startup Context" section in your context containing your identity, soul, values, process, and user documents. If these are present, the session-start hook succeeded — do NOT call bootstrap again. If these are NOT present, the hook may have failed — call the \`bootstrap\` MCP tool manually as "${agentId}" to load your identity context. Do not proceed without your constitution.
+Load user config from ~/.ink/config.json, then check whether your constitution docs are already present. Look for a "Session Context (Inkwell)" or "Bootstrapped Startup Context" section in your context containing your identity, soul, values, process, and user documents. If these are present, the session-start hook succeeded — do NOT call bootstrap again. If these are NOT present, the hook may have failed — call the \`bootstrap\` MCP tool manually as "${sbSlug}" to load your identity context. Do not proceed without your constitution.
 
 ${toolPriority}`;
 }
@@ -249,14 +249,14 @@ ${toolPriority}`;
  * Returns the file path and a cleanup function.
  */
 export function createIdentityPromptFile(
-  agentId: string,
+  sbSlug: string,
   startupContextBlock?: string,
   systemPromptOverride?: string
 ): {
   promptFile: string;
   cleanup: () => void;
 } {
-  const content = buildIdentityPrompt(agentId, startupContextBlock, systemPromptOverride);
+  const content = buildIdentityPrompt(sbSlug, startupContextBlock, systemPromptOverride);
   const tempDir = mkdtempSync(join(tmpdir(), 'sb-'));
   const promptFile = join(tempDir, 'identity-prompt.md');
   writeFileSync(promptFile, content);

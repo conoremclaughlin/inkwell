@@ -5,7 +5,7 @@ import { create } from 'zustand';
 export type SkinId = 'pixel' | 'scifi' | 'minimal';
 
 export interface AgentState {
-  agentId: string;
+  sbSlug: string;
   name: string;
   role: string | null;
   backend: string | null;
@@ -36,7 +36,7 @@ export interface AgentState {
 export interface StudioLeaseView {
   sessionId: string;
   threadKey: string;
-  agentId: string;
+  sbSlug: string;
   acquiredAt: string;
   heartbeatAt: string;
   reason?: string;
@@ -55,7 +55,7 @@ export interface StudioNode {
   purpose: string | null;
   workType: string | null;
   status: string;
-  agentId: string;
+  sbSlug: string;
   /** Repo this studio's worktree belongs to — the Level 0 territory key. */
   repoRoot: string | null;
   lease: StudioLeaseView | null;
@@ -73,7 +73,7 @@ export interface TaskNode {
   groupId: string | null;
   groupTitle: string | null;
   taskOrder: number | null;
-  agentId: string | null;
+  sbSlug: string | null;
   /** Task IDs that must complete before this one — the real graph edges. */
   blockedBy: string[];
   // Workflow graph execution state (spec: ink://specs/workflow-graph v10).
@@ -108,7 +108,7 @@ export interface ActivityEvent {
   id: string;
   type: string;
   subtype: string | null;
-  agentId: string | null;
+  sbSlug: string | null;
   content: string | null;
   status: string | null;
   timestamp: string;
@@ -149,7 +149,7 @@ interface CommandStore {
   setActivity: (events: ActivityEvent[]) => void;
 
   selectedAgent: string | null;
-  selectAgent: (agentId: string | null) => void;
+  selectAgent: (sbSlug: string | null) => void;
 
   selectedStudio: string | null;
   selectStudio: (studioId: string | null) => void;
@@ -190,7 +190,7 @@ export const useCommandStore = create<CommandStore>((set) => ({
   setActivity: (events) => set({ activity: events }),
 
   selectedAgent: null,
-  selectAgent: (agentId) => set({ selectedAgent: agentId }),
+  selectAgent: (sbSlug) => set({ selectedAgent: sbSlug }),
 
   selectedStudio: null,
   selectStudio: (studioId) => set({ selectedStudio: studioId }),

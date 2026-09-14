@@ -20,7 +20,7 @@ const MarkdownVersionDiff = dynamic(() => import('@/stories/diff-versions/markdo
 
 interface Identity {
   id: string;
-  agentId: string;
+  sbSlug: string;
   name: string;
   role: string;
   description?: string;
@@ -110,7 +110,7 @@ function generateIdentityMarkdown(version: HistoryEntry): string {
 
 export default function VersionExplorerPage() {
   const params = useParams();
-  const agentId = params.agentId as string;
+  const sbSlug = params.sbSlug as string;
 
   const [selectedVersionIndex, setSelectedVersionIndex] = React.useState(0);
 
@@ -127,11 +127,11 @@ export default function VersionExplorerPage() {
     isLoading: historyLoading,
     error: historyError,
   } = useApiQuery<HistoryResponse>(
-    ['individuals', agentId, 'history'],
-    `/api/admin/individuals/${agentId}/history`
+    ['individuals', sbSlug, 'history'],
+    `/api/admin/individuals/${sbSlug}/history`
   );
 
-  const identity = individualsData?.individuals.find((i) => i.agentId === agentId) ?? null;
+  const identity = individualsData?.individuals.find((i) => i.sbSlug === sbSlug) ?? null;
   const history = historyData?.history ?? [];
 
   const isLoading = individualsLoading || historyLoading;
@@ -200,7 +200,7 @@ export default function VersionExplorerPage() {
   if (!identity) {
     return (
       <div className="rounded-md bg-yellow-50 p-4 text-yellow-800">
-        Identity not found: {agentId}
+        Identity not found: {sbSlug}
         <Link href="/individuals" className="ml-2 underline">
           Back to Individuals
         </Link>

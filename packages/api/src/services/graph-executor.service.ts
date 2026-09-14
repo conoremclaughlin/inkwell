@@ -656,8 +656,8 @@ export class GraphExecutorService {
       await handleSendToInbox(
         {
           userId,
-          recipientAgentId: recipientSlug,
-          senderAgentId: recipientSlug,
+          recipientSlug: recipientSlug,
+          senderSlug: recipientSlug,
           recipientStudioId: studioId,
           recipientStudioSlug: studioId ? undefined : studioSlug,
           content,
@@ -743,7 +743,7 @@ export class GraphExecutorService {
     try {
       await this.dataComposer.repositories.activityStream.logActivity({
         userId,
-        agentId: 'system',
+        sbSlug: 'system',
         type: 'state_change',
         subtype,
         content:

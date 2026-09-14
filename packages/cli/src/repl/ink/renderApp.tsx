@@ -94,7 +94,7 @@ function nextMessageId(): string {
  * the user presses Enter in the Ink PromptInput.
  */
 export function renderInkChat(options: {
-  agentId: string;
+  sbSlug: string;
   timezone?: string;
   infoItems: string[];
   fullscreen?: boolean;
@@ -128,7 +128,7 @@ export function renderInkChat(options: {
   const { unmount } = render(
     <ChatApp
       ref={handleRef}
-      agentId={options.agentId}
+      sbSlug={options.sbSlug}
       timezone={options.timezone}
       infoItems={options.infoItems}
       fullscreen={fullscreen}

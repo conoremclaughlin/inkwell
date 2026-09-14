@@ -212,7 +212,7 @@ describe('heartbeat escalation', () => {
       const { onFailure } = createHeartbeatEscalation({
         client,
         sendToChannel,
-        defaultAgentId: 'myra',
+        defaultSlug: 'myra',
       });
 
       await onFailure(makeReminder(), AUTH_ERROR, 1, FIRST_FOR_DESTINATION);
@@ -233,7 +233,7 @@ describe('heartbeat escalation', () => {
       const { onFailure } = createHeartbeatEscalation({
         client,
         sendToChannel,
-        defaultAgentId: 'myra',
+        defaultSlug: 'myra',
       });
 
       await onFailure(
@@ -254,7 +254,7 @@ describe('heartbeat escalation', () => {
       const { onFailure } = createHeartbeatEscalation({
         client,
         sendToChannel,
-        defaultAgentId: 'myra',
+        defaultSlug: 'myra',
       });
 
       await onFailure(
@@ -276,7 +276,7 @@ describe('heartbeat escalation', () => {
       const { onFailure } = createHeartbeatEscalation({
         client,
         sendToChannel,
-        defaultAgentId: 'myra',
+        defaultSlug: 'myra',
       });
 
       await expect(
@@ -292,7 +292,7 @@ describe('heartbeat escalation', () => {
       const { onFailure } = createHeartbeatEscalation({
         client,
         sendToChannel,
-        defaultAgentId: 'myra',
+        defaultSlug: 'myra',
       });
 
       await onFailure(makeReminder(), AUTH_ERROR, 1, FIRST_FOR_DESTINATION);
@@ -305,7 +305,7 @@ describe('heartbeat escalation', () => {
       const { onFailure } = createHeartbeatEscalation({
         client,
         sendToChannel,
-        defaultAgentId: 'myra',
+        defaultSlug: 'myra',
         store,
       });
 
@@ -327,7 +327,7 @@ describe('heartbeat escalation', () => {
       const { onRecovery } = createHeartbeatEscalation({
         client,
         sendToChannel,
-        defaultAgentId: 'myra',
+        defaultSlug: 'myra',
       });
 
       await onRecovery(makeReminder(), 8, FIRST_FOR_DESTINATION);
@@ -345,7 +345,7 @@ describe('heartbeat escalation', () => {
       const { onRecovery } = createHeartbeatEscalation({
         client,
         sendToChannel,
-        defaultAgentId: 'myra',
+        defaultSlug: 'myra',
       });
 
       await expect(onRecovery(makeReminder(), 3, FIRST_FOR_DESTINATION)).resolves.toEqual({
@@ -368,7 +368,7 @@ describe('heartbeat escalation', () => {
       const { onFailure } = createHeartbeatEscalation({
         client,
         sendToChannel,
-        defaultAgentId: 'myra',
+        defaultSlug: 'myra',
         store,
       });
 
@@ -386,7 +386,7 @@ describe('heartbeat escalation', () => {
       const { onFailure } = createHeartbeatEscalation({
         client,
         sendToChannel,
-        defaultAgentId: 'myra',
+        defaultSlug: 'myra',
         store: makeFakeStore(),
       });
 
@@ -401,7 +401,7 @@ describe('heartbeat escalation', () => {
       const { onFailure } = createHeartbeatEscalation({
         client,
         sendToChannel,
-        defaultAgentId: 'myra',
+        defaultSlug: 'myra',
         store: makeFakeStore(),
       });
 
@@ -420,7 +420,7 @@ describe('heartbeat escalation', () => {
       const { onFailure } = createHeartbeatEscalation({
         client,
         sendToChannel,
-        defaultAgentId: 'fallback-agent',
+        defaultSlug: 'fallback-agent',
       });
 
       await onFailure(makeReminder(), AUTH_ERROR, 1, FIRST_FOR_DESTINATION);
@@ -435,7 +435,7 @@ describe('heartbeat escalation', () => {
       const { onFailure } = createHeartbeatEscalation({
         client,
         sendToChannel,
-        defaultAgentId: 'fallback-agent',
+        defaultSlug: 'fallback-agent',
       });
 
       await onFailure(makeReminder({ sb_id: null }), AUTH_ERROR, 1, FIRST_FOR_DESTINATION);
@@ -450,7 +450,7 @@ describe('heartbeat escalation', () => {
       const { onFailure } = createHeartbeatEscalation({
         client,
         sendToChannel,
-        defaultAgentId: 'myra',
+        defaultSlug: 'myra',
       });
 
       await onFailure(makeReminder(), AUTH_ERROR, 1, FIRST_FOR_DESTINATION);
@@ -465,7 +465,7 @@ describe('heartbeat escalation', () => {
       const { onFailure } = createHeartbeatEscalation({
         client,
         sendToChannel,
-        defaultAgentId: 'myra',
+        defaultSlug: 'myra',
       });
 
       await onFailure(makeReminder(), AUTH_ERROR, 2, FIRST_FOR_DESTINATION);
@@ -493,7 +493,7 @@ describe('heartbeat escalation', () => {
       const { onFailure } = createHeartbeatEscalation({
         client,
         sendToChannel,
-        defaultAgentId: 'myra',
+        defaultSlug: 'myra',
       });
 
       await onFailure(makeReminder(), AUTH_ERROR, 1, ALREADY_ALERTED);
@@ -509,7 +509,7 @@ describe('heartbeat escalation', () => {
       const { onRecovery } = createHeartbeatEscalation({
         client,
         sendToChannel,
-        defaultAgentId: 'myra',
+        defaultSlug: 'myra',
       });
 
       await onRecovery(makeReminder(), 8, ALREADY_ALERTED);
@@ -524,7 +524,7 @@ describe('heartbeat escalation', () => {
       const { onFailure } = createHeartbeatEscalation({
         client,
         sendToChannel,
-        defaultAgentId: 'myra',
+        defaultSlug: 'myra',
       });
 
       await onFailure(makeReminder(), AUTH_ERROR, 1, FIRST_FOR_DESTINATION);
@@ -544,7 +544,7 @@ describe('heartbeat escalation', () => {
       const { onFailure } = createHeartbeatEscalation({
         client,
         sendToChannel,
-        defaultAgentId: 'myra',
+        defaultSlug: 'myra',
         store,
       });
 
@@ -570,7 +570,7 @@ describe('heartbeat escalation', () => {
       const { onFailure } = createHeartbeatEscalation({
         client,
         sendToChannel,
-        defaultAgentId: 'myra',
+        defaultSlug: 'myra',
         store,
       });
 
@@ -591,7 +591,7 @@ describe('heartbeat escalation', () => {
       const { onFailure } = createHeartbeatEscalation({
         client,
         sendToChannel,
-        defaultAgentId: 'myra',
+        defaultSlug: 'myra',
         store,
       });
 
@@ -616,7 +616,7 @@ describe('heartbeat escalation', () => {
       const { onFailure } = createHeartbeatEscalation({
         client,
         sendToChannel,
-        defaultAgentId: 'myra',
+        defaultSlug: 'myra',
         store,
       });
 
@@ -641,7 +641,7 @@ describe('heartbeat escalation', () => {
       const { onFailure } = createHeartbeatEscalation({
         client,
         sendToChannel,
-        defaultAgentId: 'myra',
+        defaultSlug: 'myra',
         store,
       });
 
@@ -687,7 +687,7 @@ describe('heartbeat escalation', () => {
       const { onRecovery } = createHeartbeatEscalation({
         client,
         sendToChannel,
-        defaultAgentId: 'myra',
+        defaultSlug: 'myra',
         store,
       });
 
@@ -707,7 +707,7 @@ describe('heartbeat escalation', () => {
       const { onRecovery } = createHeartbeatEscalation({
         client,
         sendToChannel,
-        defaultAgentId: 'myra',
+        defaultSlug: 'myra',
         store,
       });
 
@@ -725,7 +725,7 @@ describe('heartbeat escalation', () => {
       const { onFailure } = createHeartbeatEscalation({
         client,
         sendToChannel,
-        defaultAgentId: 'myra',
+        defaultSlug: 'myra',
         store,
       });
 
@@ -759,7 +759,7 @@ describe('heartbeat escalation', () => {
       const { onFailure, onRecovery } = createHeartbeatEscalation({
         client,
         sendToChannel,
-        defaultAgentId: 'myra',
+        defaultSlug: 'myra',
         store,
       });
 
@@ -796,7 +796,7 @@ describe('heartbeat escalation', () => {
       const { onFailure, onRecovery } = createHeartbeatEscalation({
         client,
         sendToChannel,
-        defaultAgentId: 'myra',
+        defaultSlug: 'myra',
         store,
       });
 
@@ -816,7 +816,7 @@ describe('heartbeat escalation', () => {
       const { onFailure, onRecovery } = createHeartbeatEscalation({
         client,
         sendToChannel,
-        defaultAgentId: 'myra',
+        defaultSlug: 'myra',
         store,
       });
 
@@ -857,7 +857,7 @@ describe('heartbeat escalation', () => {
       const { onFailure } = createHeartbeatEscalation({
         client: { from } as never,
         sendToChannel,
-        defaultAgentId: 'myra',
+        defaultSlug: 'myra',
         store,
       });
 
@@ -890,7 +890,7 @@ describe('heartbeat escalation', () => {
         sendToChannel,
         // DISTINCT from the agent this reminder belongs to. If the default were
         // also 'myra' this test could not tell a correct address from a guess.
-        defaultAgentId: 'unrelated-sb',
+        defaultSlug: 'unrelated-sb',
         store,
       });
 
@@ -925,7 +925,7 @@ describe('heartbeat escalation', () => {
       const { onFailure } = createHeartbeatEscalation({
         client: { from } as never,
         sendToChannel,
-        defaultAgentId: 'unrelated-sb',
+        defaultSlug: 'unrelated-sb',
         store,
       });
 
@@ -944,7 +944,7 @@ describe('heartbeat escalation', () => {
       const { onFailure } = createHeartbeatEscalation({
         client,
         sendToChannel,
-        defaultAgentId: 'unrelated-sb',
+        defaultSlug: 'unrelated-sb',
         store,
       });
 

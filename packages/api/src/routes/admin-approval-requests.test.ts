@@ -326,13 +326,13 @@ describe('POST /approval-requests', () => {
     );
   });
 
-  it('resolves requestingAgentId from the x-ink-context header', async () => {
+  it('resolves requestingSlug from the x-ink-context header', async () => {
     installInsertMock({
       data: { id: 'req-xyz', status: 'pending', expires_at: futureIso() },
       error: null,
     });
 
-    const contextToken = Buffer.from(JSON.stringify({ agentId: 'wren' })).toString('base64url');
+    const contextToken = Buffer.from(JSON.stringify({ sbSlug: 'wren' })).toString('base64url');
     const handler = findRouteHandler('post', '/approval-requests');
     const req = createAuthenticatedReq({
       body: { tool: 'Bash', args: 'ls' },

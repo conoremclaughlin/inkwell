@@ -35,7 +35,7 @@ interface Artifact {
   content: string;
   contentType: string;
   artifactType: 'spec' | 'design' | 'decision' | 'document' | 'note';
-  createdByAgentId?: string;
+  createdBySlug?: string;
   editMode: 'workspace' | 'editors';
   editors: string[];
   collaborators?: string[];
@@ -53,7 +53,7 @@ interface ArtifactResponse {
 
 interface ArtifactCommentIdentity {
   id: string;
-  agentId: string;
+  sbSlug: string;
   name: string;
   backend: string | null;
 }
@@ -71,7 +71,7 @@ interface ArtifactComment {
   parentCommentId: string | null;
   content: string;
   metadata?: Record<string, unknown>;
-  createdByAgentId: string | null;
+  createdBySlug: string | null;
   createdByUserId: string | null;
   createdByUser: ArtifactCommentUser | null;
   createdByIdentityId: string | null;
@@ -87,7 +87,7 @@ interface ArtifactCommentsResponse {
 
 interface IndividualIdentity {
   id: string;
-  agentId: string;
+  sbSlug: string;
   name: string;
 }
 
@@ -148,7 +148,7 @@ export default function ArtifactDetailPage() {
   const artifactId = params.artifactId as string;
   const queryClient = useQueryClient();
   const [commentDraft, setCommentDraft] = useState('');
-  const [commentAgentId, setCommentAgentId] = useState('');
+  const [commentSlug, setCommentSlug] = useState('');
   const [permissionEditMode, setPermissionEditMode] = useState<'workspace' | 'editors'>(
     'workspace'
   );
@@ -182,7 +182,7 @@ export default function ArtifactDetailPage() {
     { comment: ArtifactComment },
     {
       content: string;
-      agentId?: string;
+      sbSlug?: string;
     }
   >(`/api/admin/artifacts/${artifactId}/comments`, {
     onSuccess: () => {
@@ -205,11 +205,11 @@ export default function ArtifactDetailPage() {
     () => new Map(identityOptions.map((identity) => [identity.id, identity.name] as const)),
     [identityOptions]
   );
-  const sbIdByAgentId = useMemo(
+  const sbIdBySlug = useMemo(
     () =>
       new Map(
         (identitiesData?.individuals ?? []).map(
-          (identity) => [identity.agentId, identity.id] as const
+          (identity) => [identity.sbSlug, identity.id] as const
         )
       ),
     [identitiesData?.individuals]
@@ -222,12 +222,12 @@ export default function ArtifactDetailPage() {
         (artifact.editors || [])
           .map((value) => value.trim())
           .filter((value) => value.length > 0)
-          .map((value) => (identityNameById.get(value) ? value : sbIdByAgentId.get(value) || value))
+          .map((value) => (identityNameById.get(value) ? value : sbIdBySlug.get(value) || value))
       )
     );
     setPermissionEditMode(artifact.editMode || 'workspace');
     setPermissionEditorIdentityIds(normalizedEditorIds);
-  }, [artifact, identityNameById, sbIdByAgentId]);
+  }, [artifact, identityNameById, sbIdBySlug]);
 
   useEffect(() => {
     if (!permissionSuccess) return;
@@ -278,7 +278,7 @@ export default function ArtifactDetailPage() {
 
     addCommentMutation.mutate({
       content: commentDraft.trim(),
-      ...(commentAgentId.trim() ? { agentId: commentAgentId.trim() } : {}),
+      ...(commentSlug.trim() ? { sbSlug: commentSlug.trim() } : {}),
     });
   };
 
@@ -398,8 +398,8 @@ export default function ArtifactDetailPage() {
             />
             <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
               <input
-                value={commentAgentId}
-                onChange={(event) => setCommentAgentId(event.target.value)}
+                value={commentSlug}
+                onChange={(event) => setCommentSlug(event.target.value)}
                 placeholder="Agent ID (optional, e.g. lumen)"
                 className="w-full rounded-md border border-gray-300 px-3 py-2 text-sm sm:max-w-xs focus:border-gray-400 focus:outline-none"
               />
@@ -428,11 +428,11 @@ export default function ArtifactDetailPage() {
               {comments.map((comment) => {
                 const identityName =
                   comment.createdByIdentity?.name ||
-                  comment.createdByIdentity?.agentId ||
+                  comment.createdByIdentity?.sbSlug ||
                   comment.createdByUser?.name ||
                   comment.createdByUser?.username ||
                   comment.createdByUser?.email ||
-                  comment.createdByAgentId ||
+                  comment.createdBySlug ||
                   'You';
                 return (
                   <div key={comment.id} className="rounded-md border border-gray-200 p-4">
@@ -459,7 +459,7 @@ export default function ArtifactDetailPage() {
       {/* Metadata footer */}
       <div className="mt-6 flex items-center justify-between text-sm text-gray-500">
         <div className="flex items-center gap-4">
-          {artifact.createdByAgentId && <span>Created by: {artifact.createdByAgentId}</span>}
+          {artifact.createdBySlug && <span>Created by: {artifact.createdBySlug}</span>}
           <span>
             Edit mode:{' '}
             {artifact.editMode === 'workspace' ? 'workspace editors' : 'specific editor list'}
@@ -471,7 +471,7 @@ export default function ArtifactDetailPage() {
                 .map((sbId) => {
                   const identityName = identityNameById.get(sbId);
                   if (identityName) return identityName;
-                  const remappedId = sbIdByAgentId.get(sbId);
+                  const remappedId = sbIdBySlug.get(sbId);
                   const remappedIdentityName = remappedId ? identityNameById.get(remappedId) : null;
                   return remappedIdentityName || sbId;
                 })

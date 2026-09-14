@@ -619,7 +619,7 @@ describe.skipIf(!canRun)('Runner crash activity logging (integration)', () => {
     // Simulate what session-service does on runner crash
     await activityStream.logActivity({
       userId: TEST_USER_ID!,
-      agentId: 'integration-test',
+      sbSlug: 'integration-test',
       type: 'error',
       subtype: 'backend_crash:claude-code',
       content: 'Backend crashed (claude-code): SIGTERM: process killed',
@@ -660,7 +660,7 @@ describe.skipIf(!canRun)('Runner crash activity logging (integration)', () => {
 
     await activityStream.logActivity({
       userId: TEST_USER_ID!,
-      agentId: 'integration-test',
+      sbSlug: 'integration-test',
       type: 'state_change',
       subtype: 'strategy_started',
       content: 'Strategy started for crash test group',

@@ -198,7 +198,7 @@ describe('Chat Route Handlers', () => {
   });
 
   describe('POST /message validation', () => {
-    it('should validate that agentId and content are present', async () => {
+    it('should validate that sbSlug and content are present', async () => {
       // Import and create router to get access to internal handlers
       const { createChatRouter } = await import('./chat');
 
@@ -208,9 +208,9 @@ describe('Chat Route Handlers', () => {
 
       const router = createChatRouter(() => mockSessionService as never);
 
-      // The router's POST handler checks for agentId and content
+      // The router's POST handler checks for sbSlug and content
       // We can verify this by testing the validation logic
-      // agentId missing → 400
+      // sbSlug missing → 400
       expect(mockSessionService.handleMessage).not.toHaveBeenCalled();
     });
   });
@@ -219,16 +219,16 @@ describe('Chat Route Handlers', () => {
     it('should build correct SessionRequest from chat message', () => {
       // Verify the expected shape of a SessionRequest built from chat input
       const userId = 'pcp-user-123';
-      const agentId = 'wren';
+      const sbSlug = 'wren';
       const userEmail = 'test@example.com';
       const content = 'Hello, Wren!';
 
       // This mirrors the logic in chat.ts POST /message
       const sessionRequest = {
         userId,
-        agentId,
+        sbSlug,
         channel: 'web' as const,
-        conversationId: `web:${userId}:${agentId}`,
+        conversationId: `web:${userId}:${sbSlug}`,
         sender: {
           id: userId,
           name: userEmail,
@@ -272,7 +272,7 @@ describe('Chat Route Handlers', () => {
         id: m.id,
         direction: m.direction,
         content: m.content,
-        agentId: m.agent_id,
+        sbSlug: m.agent_id,
         createdAt: m.created_at,
       }));
 
@@ -281,7 +281,7 @@ describe('Chat Route Handlers', () => {
       expect(messages[0].id).toBe('msg-1');
       expect(messages[1].id).toBe('msg-2');
       // snake_case → camelCase
-      expect(messages[0].agentId).toBe('wren');
+      expect(messages[0].sbSlug).toBe('wren');
       expect(messages[0].createdAt).toBeDefined();
     });
   });

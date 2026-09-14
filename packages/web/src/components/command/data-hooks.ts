@@ -33,7 +33,7 @@ interface AgentLatestSession {
 }
 
 interface AgentWithStudios {
-  agentId: string;
+  sbSlug: string;
   agentName: string;
   agentRole: string | null;
   backend: string | null;
@@ -69,7 +69,7 @@ interface TaskGroupItem {
   id: string;
   title: string;
   status?: string;
-  agentId: string | null;
+  sbSlug: string | null;
   agentName: string | null;
   executionModel?: 'linear' | 'graph';
   executionPhase?: string;
@@ -85,7 +85,7 @@ interface ActivityEventItem {
   id: string;
   type: string;
   subtype: string | null;
-  agentId: string | null;
+  sbSlug: string | null;
   content: string | null;
   status: string | null;
   createdAt: string;
@@ -121,7 +121,7 @@ function studioRingRadius(count: number): number {
 
 function arrangeStudiosInCircle(
   studios: StudioInfo[],
-  agentId: string,
+  sbSlug: string,
   centerX: number,
   centerY: number,
   radius: number
@@ -135,7 +135,7 @@ function arrangeStudiosInCircle(
       purpose: s.purpose,
       workType: s.workType,
       status: s.status,
-      agentId,
+      sbSlug,
       repoRoot: s.repoRoot ?? null,
       lease: s.lease ?? null,
       ephemeral: s.ephemeral ?? false,
@@ -227,7 +227,7 @@ export function useCommandData() {
       const heldStudio = heldStudios[0] ?? null;
 
       agentStates.push({
-        agentId: agent.agentId,
+        sbSlug: agent.sbSlug,
         name: agent.agentName,
         role: agent.agentRole,
         backend: agent.backend,
@@ -246,7 +246,7 @@ export function useCommandData() {
       const visibleStudios = agent.studios.filter((s) => s.status !== 'cleaned');
       const arranged = arrangeStudiosInCircle(
         visibleStudios,
-        agent.agentId,
+        agent.sbSlug,
         centerX,
         centerY,
         studioRingRadius(visibleStudios.length)
@@ -279,7 +279,7 @@ export function useCommandData() {
         groupId: t.taskGroupId,
         groupTitle: group?.title ?? null,
         taskOrder: t.taskOrder,
-        agentId: t.createdBy,
+        sbSlug: t.createdBy,
         blockedBy: t.blockedBy ?? [],
         taskType: t.taskType ?? 'work',
         outcome: t.outcome ?? null,
@@ -313,7 +313,7 @@ export function useCommandData() {
         id: e.id,
         type: e.type,
         subtype: e.subtype,
-        agentId: e.agentId,
+        sbSlug: e.sbSlug,
         content: e.content,
         status: e.status,
         timestamp: e.createdAt,

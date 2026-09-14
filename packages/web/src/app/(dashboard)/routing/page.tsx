@@ -29,7 +29,7 @@ import { getAgentGradient } from '@/lib/utils';
 
 interface RoutingIdentity {
   id: string;
-  agentId: string;
+  sbSlug: string;
   name: string;
   role: string;
   backend: string | null;
@@ -39,7 +39,7 @@ interface RoutingIdentity {
 interface RoutingRoute {
   id: string;
   sbId: string;
-  agentId: string | null;
+  sbSlug: string | null;
   agentName: string | null;
   agentRole: string | null;
   backend: string | null;
@@ -77,7 +77,7 @@ interface CreateRouteInput {
 }
 
 interface SBGroup {
-  agentId: string;
+  sbSlug: string;
   agentName: string;
   agentRole: string | null;
   sbId: string;
@@ -208,12 +208,12 @@ export default function RoutingPage() {
   const sbGroups = useMemo<SBGroup[]>(() => {
     const groups = new Map<string, SBGroup>();
     for (const route of routes) {
-      const key = route.agentId || route.sbId;
+      const key = route.sbSlug || route.sbId;
       if (!groups.has(key)) {
         const identity = identityMap.get(route.sbId);
         groups.set(key, {
-          agentId: route.agentId || 'unknown',
-          agentName: route.agentName || route.agentId || 'Unknown agent',
+          sbSlug: route.sbSlug || 'unknown',
+          agentName: route.agentName || route.sbSlug || 'Unknown agent',
           agentRole: route.agentRole || null,
           sbId: route.sbId,
           studioHint: identity?.studioHint || 'home',
@@ -320,7 +320,7 @@ export default function RoutingPage() {
                     <option value="">Select an SB...</option>
                     {identities.map((identity) => (
                       <option key={identity.id} value={identity.id}>
-                        {identity.name} ({identity.agentId})
+                        {identity.name} ({identity.sbSlug})
                       </option>
                     ))}
                   </select>
@@ -412,9 +412,9 @@ export default function RoutingPage() {
           </Card>
         ) : (
           sbGroups.map((group) => {
-            const gradient = getAgentGradient(group.agentId);
+            const gradient = getAgentGradient(group.sbSlug);
             return (
-              <Card key={group.agentId} className="overflow-hidden">
+              <Card key={group.sbSlug} className="overflow-hidden">
                 {/* SB Header */}
                 <div className="flex items-center gap-4 px-5 py-4 border-b bg-gray-50/50">
                   <div
@@ -428,7 +428,7 @@ export default function RoutingPage() {
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2">
                       <h3 className="font-semibold text-gray-900">{group.agentName}</h3>
-                      <span className="text-xs text-gray-400">@{group.agentId}</span>
+                      <span className="text-xs text-gray-400">@{group.sbSlug}</span>
                     </div>
                     {group.agentRole && (
                       <p className="text-sm text-gray-500 truncate">{group.agentRole}</p>
@@ -450,7 +450,7 @@ export default function RoutingPage() {
                       </div>
                     </div>
                     <Link
-                      href={`/routing/${group.agentId}`}
+                      href={`/routing/${group.sbSlug}`}
                       className="flex items-center gap-1 text-sm font-medium text-gray-600 hover:text-gray-900 transition-colors"
                     >
                       Manage

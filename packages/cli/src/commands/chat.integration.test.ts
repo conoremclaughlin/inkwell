@@ -18,7 +18,7 @@ vi.mock('../backends/identity.js', async (importOriginal) => {
   const original = await importOriginal<typeof import('../backends/identity.js')>();
   return {
     ...original,
-    resolveAgentId: (agent?: string) => agent || 'lumen',
+    resolveSlug: (agent?: string) => agent || 'lumen',
     readIdentityJson: () => testState.identity,
   };
 });
@@ -165,7 +165,7 @@ describe('runChat integration', () => {
 
     const startCall = testState.pcpCalls.find((call) => call.tool === 'start_session');
     expect(startCall?.args).toMatchObject({
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       threadKey: 'heartbeat:myra',
       studioId: 'studio-test',
     });
@@ -690,7 +690,7 @@ describe('runChat integration', () => {
             sessions: [
               {
                 id: 'sess-a111',
-                agentId: 'lumen',
+                sbSlug: 'lumen',
                 status: 'active',
                 currentPhase: 'implementing',
                 threadKey: 'pr:61',
@@ -700,7 +700,7 @@ describe('runChat integration', () => {
               },
               {
                 id: 'sess-b222',
-                agentId: 'lumen',
+                sbSlug: 'lumen',
                 status: 'active',
                 currentPhase: 'reviewing',
                 threadKey: 'spec:cli-session-hooks',
@@ -744,7 +744,7 @@ describe('runChat integration', () => {
             sessions: [
               {
                 id: 'sess-a111',
-                agentId: 'lumen',
+                sbSlug: 'lumen',
                 status: 'active',
                 currentPhase: 'implementing',
                 threadKey: 'pr:61',
@@ -754,7 +754,7 @@ describe('runChat integration', () => {
               },
               {
                 id: 'sess-b222',
-                agentId: 'lumen',
+                sbSlug: 'lumen',
                 status: 'active',
                 currentPhase: 'reviewing',
                 threadKey: 'spec:cli-session-hooks',
@@ -821,14 +821,14 @@ describe('runChat integration', () => {
             sessions: [
               {
                 id: 'sess-old',
-                agentId: 'lumen',
+                sbSlug: 'lumen',
                 status: 'active',
                 threadKey: 'pr:1',
                 startedAt: '2026-02-18T18:00:00.000Z',
               },
               {
                 id: 'sess-new',
-                agentId: 'lumen',
+                sbSlug: 'lumen',
                 status: 'active',
                 threadKey: 'pr:2',
                 startedAt: '2026-02-18T19:00:00.000Z',
@@ -900,14 +900,14 @@ describe('runChat integration', () => {
             sessions: [
               {
                 id: 'sess-old',
-                agentId: 'lumen',
+                sbSlug: 'lumen',
                 status: 'active',
                 threadKey: 'pr:9',
                 startedAt: '2026-02-18T18:00:00.000Z',
               },
               {
                 id: 'sess-latest',
-                agentId: 'lumen',
+                sbSlug: 'lumen',
                 status: 'active',
                 threadKey: 'pr:10',
                 startedAt: '2026-02-18T19:00:00.000Z',
@@ -945,14 +945,14 @@ describe('runChat integration', () => {
             sessions: [
               {
                 id: 'sess-wren-latest',
-                agentId: 'wren',
+                sbSlug: 'wren',
                 status: 'active',
                 threadKey: 'pr:99',
                 startedAt: '2026-02-18T20:00:00.000Z',
               },
               {
                 id: 'sess-lumen-older',
-                agentId: 'lumen',
+                sbSlug: 'lumen',
                 status: 'active',
                 threadKey: 'pr:12',
                 startedAt: '2026-02-18T18:00:00.000Z',
@@ -988,7 +988,7 @@ describe('runChat integration', () => {
             sessions: [
               {
                 id: 'sess-wren-new',
-                agentId: 'wren',
+                sbSlug: 'wren',
                 studioId: 'studio-test',
                 status: 'active',
                 threadKey: 'pr:900',
@@ -996,7 +996,7 @@ describe('runChat integration', () => {
               },
               {
                 id: 'sess-lumen-mid',
-                agentId: 'lumen',
+                sbSlug: 'lumen',
                 studioId: 'studio-2',
                 status: 'active',
                 threadKey: 'pr:901',
@@ -1004,7 +1004,7 @@ describe('runChat integration', () => {
               },
               {
                 id: 'sess-lumen-old',
-                agentId: 'lumen',
+                sbSlug: 'lumen',
                 studioId: 'studio-3',
                 status: 'active',
                 threadKey: 'pr:902',
@@ -1070,7 +1070,7 @@ describe('runChat integration', () => {
   });
 
   it('supports gated /pcp tool execution with inline approval', async () => {
-    testState.inputs = ['/pcp send_to_inbox {"recipientAgentId":"wren"}', 'y', '/quit'];
+    testState.inputs = ['/pcp send_to_inbox {"recipientSlug":"wren"}', 'y', '/quit'];
 
     await runChat({
       agent: 'lumen',
@@ -1079,7 +1079,7 @@ describe('runChat integration', () => {
     });
 
     const sendCall = testState.pcpCalls.find((call) => call.tool === 'send_to_inbox');
-    expect(sendCall?.args).toEqual({ recipientAgentId: 'wren' });
+    expect(sendCall?.args).toEqual({ recipientSlug: 'wren' });
     expect(testState.runBackendImpl).toHaveBeenCalledTimes(0);
 
     const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
@@ -1102,7 +1102,7 @@ describe('runChat integration', () => {
                 {
                   id: 'm-1',
                   content: 'please re-review',
-                  senderAgentId: 'wren',
+                  senderSlug: 'wren',
                   subject: 'PR #50',
                   threadKey: 'pr:50',
                   createdAt: '2026-02-26T04:03:04.000Z',
@@ -1149,13 +1149,13 @@ describe('runChat integration', () => {
                 {
                   id: 'm-2',
                   content: 'second',
-                  senderAgentId: 'wren',
+                  senderSlug: 'wren',
                   createdAt: '2026-02-26T04:10:05.000Z',
                 },
                 {
                   id: 'm-1',
                   content: 'first',
-                  senderAgentId: 'wren',
+                  senderSlug: 'wren',
                   createdAt: '2026-02-26T04:10:01.000Z',
                 },
               ],
@@ -1200,7 +1200,7 @@ describe('runChat integration', () => {
                 {
                   id: 'm-auto-1',
                   content: 'Please handle PR 77 now.',
-                  senderAgentId: 'wren',
+                  senderSlug: 'wren',
                   subject: 'Task request',
                   messageType: 'task_request',
                   threadKey: 'pr:77',
@@ -1257,7 +1257,7 @@ describe('runChat integration', () => {
             sessions: [
               {
                 id: 'sess-existing',
-                agentId: 'lumen',
+                sbSlug: 'lumen',
                 status: 'active',
                 startedAt: '2026-02-26T04:16:00.000Z',
               },
@@ -1271,7 +1271,7 @@ describe('runChat integration', () => {
                 {
                   id: 'm-hydrated-1',
                   content: 'already hydrated',
-                  senderAgentId: 'wren',
+                  senderSlug: 'wren',
                   subject: 'PR #77',
                   createdAt: '2026-02-26T04:15:00.000Z',
                 },
@@ -1318,20 +1318,20 @@ describe('runChat integration', () => {
                 {
                   id: 'm-skip-thread',
                   content: 'Wrong thread',
-                  senderAgentId: 'wren',
+                  senderSlug: 'wren',
                   threadKey: 'pr:999',
                   messageType: 'task_request',
                 },
                 {
                   id: 'm-skip-unscoped',
                   content: 'Missing thread/session metadata',
-                  senderAgentId: 'wren',
+                  senderSlug: 'wren',
                   messageType: 'task_request',
                 },
                 {
                   id: 'm-run',
                   content: 'Right thread',
-                  senderAgentId: 'wren',
+                  senderSlug: 'wren',
                   threadKey: 'pr:123',
                   messageType: 'task_request',
                 },
@@ -1617,7 +1617,7 @@ describe('runChat integration', () => {
   });
 
   it('applies policy gate to /mcp call with inline approval', async () => {
-    testState.inputs = ['/mcp call send_to_inbox {"recipientAgentId":"wren"}', 'y', '/quit'];
+    testState.inputs = ['/mcp call send_to_inbox {"recipientSlug":"wren"}', 'y', '/quit'];
 
     await runChat({
       agent: 'lumen',
@@ -1626,7 +1626,7 @@ describe('runChat integration', () => {
     });
 
     const sendCall = testState.pcpCalls.find((call) => call.tool === 'send_to_inbox');
-    expect(sendCall?.args).toEqual({ recipientAgentId: 'wren' });
+    expect(sendCall?.args).toEqual({ recipientSlug: 'wren' });
     const logText = stripAnsi(logSpy.mock.calls.flat().join('\n'));
     expect(logText).toContain('Granted once.');
   });
@@ -1635,7 +1635,7 @@ describe('runChat integration', () => {
     testState.runBackendImpl.mockResolvedValue({
       success: true,
       stdout:
-        'Running local tool.\n```ink-tool\n{"tool":"get_inbox","args":{"agentId":"lumen","status":"unread","limit":1}}\n```\nDone.',
+        'Running local tool.\n```ink-tool\n{"tool":"get_inbox","args":{"sbSlug":"lumen","status":"unread","limit":1}}\n```\nDone.',
       stderr: '',
       exitCode: 0,
       durationMs: 5,
@@ -1684,7 +1684,7 @@ describe('runChat integration', () => {
     testState.runBackendImpl.mockResolvedValue({
       success: true,
       stdout:
-        '```ink-tool\n{"tool":"get_inbox","args":{"agentId":"lumen","status":"unread","limit":2}}\n```',
+        '```ink-tool\n{"tool":"get_inbox","args":{"sbSlug":"lumen","status":"unread","limit":2}}\n```',
       stderr: '',
       exitCode: 0,
       durationMs: 5,
@@ -1730,7 +1730,7 @@ describe('runChat integration', () => {
     testState.runBackendImpl.mockResolvedValue({
       success: true,
       stdout:
-        '```ink-tool\n{"tool":"get_inbox","args":{"agentId":"lumen","status":"unread","limit":3}}\n```',
+        '```ink-tool\n{"tool":"get_inbox","args":{"sbSlug":"lumen","status":"unread","limit":3}}\n```',
       stderr: '',
       exitCode: 0,
       durationMs: 5,
@@ -1836,7 +1836,7 @@ describe('runChat integration', () => {
         return {
           success: true,
           stdout:
-            '```ink-tool\n{"tool":"get_inbox","args":{"agentId":"wren","status":"unread","limit":2}}\n```',
+            '```ink-tool\n{"tool":"get_inbox","args":{"sbSlug":"wren","status":"unread","limit":2}}\n```',
           stderr: '',
           exitCode: 0,
           durationMs: 5,
@@ -1902,7 +1902,7 @@ describe('runChat integration', () => {
     testState.runBackendImpl.mockResolvedValue({
       success: true,
       stdout:
-        '```ink-tool\n{"tool":"get_inbox","args":{"agentId":"wren","status":"unread","limit":1}}\n```',
+        '```ink-tool\n{"tool":"get_inbox","args":{"sbSlug":"wren","status":"unread","limit":1}}\n```',
       stderr: '',
       exitCode: 0,
       durationMs: 5,
@@ -1947,7 +1947,7 @@ describe('runChat integration', () => {
     testState.runBackendImpl.mockResolvedValue({
       success: true,
       stdout:
-        '```ink-tool\n{"tool":"send_to_inbox","args":{"recipientAgentId":"wren","content":"ping"}}\n```',
+        '```ink-tool\n{"tool":"send_to_inbox","args":{"recipientSlug":"wren","content":"ping"}}\n```',
       stderr: '',
       exitCode: 0,
       durationMs: 5,
@@ -1982,7 +1982,7 @@ describe('runChat integration', () => {
         return {
           success: true,
           stdout:
-            '```ink-tool\n{"tool":"get_inbox","args":{"agentId":"lumen","status":"unread","limit":1}}\n```',
+            '```ink-tool\n{"tool":"get_inbox","args":{"sbSlug":"lumen","status":"unread","limit":1}}\n```',
           stderr: '',
           exitCode: 0,
           durationMs: 5,
@@ -2040,7 +2040,7 @@ describe('runChat integration', () => {
     testState.runBackendImpl.mockResolvedValue({
       success: true,
       stdout:
-        '```ink-tool\n{"tool":"send_to_inbox","args":{"recipientAgentId":"myra","content":"hello"}}\n```',
+        '```ink-tool\n{"tool":"send_to_inbox","args":{"recipientSlug":"myra","content":"hello"}}\n```',
       stderr: '',
       exitCode: 0,
       durationMs: 5,
@@ -2072,7 +2072,7 @@ describe('runChat integration', () => {
         return {
           success: true,
           stdout:
-            '```ink-tool\n{"tool":"send_to_inbox","args":{"recipientAgentId":"myra","content":"hi"}}\n```',
+            '```ink-tool\n{"tool":"send_to_inbox","args":{"recipientSlug":"myra","content":"hi"}}\n```',
           stderr: '',
           exitCode: 0,
           durationMs: 5,
@@ -2359,8 +2359,8 @@ describe('runChat integration', () => {
     expect(typeof token).toBe('string');
 
     const verified = verifyDelegationToken(String(token), process.env.INK_DELEGATION_SECRET || '', {
-      expectedIssuerAgentId: 'lumen',
-      expectedDelegateeAgentId: 'wren',
+      expectedIssuerSlug: 'lumen',
+      expectedDelegateeSlug: 'wren',
       expectedThreadKey: 'pr:123',
       requiredScopes: ['send_to_inbox', 'trigger_agent'],
     });
@@ -2370,8 +2370,8 @@ describe('runChat integration', () => {
   it('renders delegation metadata label for inbox messages', async () => {
     const delegationToken = mintDelegationToken(
       {
-        issuerAgentId: 'wren',
-        delegateeAgentId: 'lumen',
+        issuerSlug: 'wren',
+        delegateeSlug: 'lumen',
         scopes: ['send_to_inbox'],
         threadKey: 'pr:50',
       },
@@ -2393,7 +2393,7 @@ describe('runChat integration', () => {
                 {
                   id: 'delegated-1',
                   content: 'please take this action',
-                  senderAgentId: 'wren',
+                  senderSlug: 'wren',
                   subject: 'Delegated task',
                   threadKey: 'pr:50',
                   metadata: { delegationToken },

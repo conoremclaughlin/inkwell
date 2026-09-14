@@ -138,7 +138,7 @@ describe('KindleService', () => {
 
       const seed = await service.extractValueSeed('user-123', 'wren');
 
-      expect(seed.parentAgentId).toBe('wren');
+      expect(seed.parentSlug).toBe('wren');
       expect(seed.parentName).toBe('Wren');
       expect(seed.coreValues).toEqual(['curiosity', 'authenticity', 'growth']);
       expect(seed.philosophicalOrientation).toContain('I value deep understanding');
@@ -172,7 +172,7 @@ describe('KindleService', () => {
 
       const seed = await service.extractValueSeed('user-123', 'nonexistent');
 
-      expect(seed.parentAgentId).toBe('nonexistent');
+      expect(seed.parentSlug).toBe('nonexistent');
       expect(seed.parentName).toBe('nonexistent');
       expect(seed.coreValues).toEqual([]);
       expect(seed.philosophicalOrientation).toBe('');
@@ -202,7 +202,7 @@ describe('KindleService', () => {
       expect(result.id).toBe('token-uuid-123');
       expect(result.token).toBe('abc123hex');
       expect(result.creatorUserId).toBe('user-123');
-      expect(result.creatorAgentId).toBeNull();
+      expect(result.creatorSlug).toBeNull();
       expect(result.status).toBe('active');
       expect(mockSupabase.from).toHaveBeenCalledWith('kindle_tokens');
     });
@@ -214,7 +214,7 @@ describe('KindleService', () => {
         creator_user_id: 'user-123',
         creator_agent_id: 'wren',
         value_seed: {
-          parentAgentId: 'wren',
+          parentSlug: 'wren',
           parentName: 'Wren',
           coreValues: ['growth'],
           philosophicalOrientation: 'I value growth.',
@@ -232,7 +232,7 @@ describe('KindleService', () => {
 
       const result = await service.createKindleToken('user-123', 'wren');
 
-      expect(result.creatorAgentId).toBe('wren');
+      expect(result.creatorSlug).toBe('wren');
       expect(mockSupabase.from).toHaveBeenCalledWith('kindle_tokens');
     });
 
@@ -312,7 +312,7 @@ describe('KindleService', () => {
 
       expect(result.childUserId).toBe('new-user');
       expect(result.onboardingStatus).toBe('values_interview');
-      expect(result.parentAgentId).toBe('wren');
+      expect(result.parentSlug).toBe('wren');
       expect(mockSupabase.from).toHaveBeenCalledWith('kindle_tokens');
       // Lineage + identity + token consumption all live inside the atomic
       // redeem_kindle_token RPC — no client-side table writes.
@@ -364,7 +364,7 @@ describe('KindleService', () => {
 
       expect(result.chosenName).toBe('Ember');
       expect(result.onboardingStatus).toBe('complete');
-      expect(result.childAgentId).toBe('ember');
+      expect(result.childSlug).toBe('ember');
       // Rename + lineage completion live in ONE transaction, user-scoped.
       expect(rpcCalls[0].fn).toBe('complete_kindle_onboarding');
       expect(rpcCalls[0].args).toMatchObject({

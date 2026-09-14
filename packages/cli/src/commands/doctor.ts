@@ -89,7 +89,7 @@ function resolveDefaultCliName(fsOps: Pick<DoctorFs, 'existsSync' | 'readFileSyn
   if (fsOps.existsSync(identityPath)) {
     try {
       const identity = JSON.parse(fsOps.readFileSync(identityPath, 'utf-8'));
-      if (identity.agentId) return `ink-${identity.agentId}`;
+      if (identity.sbSlug) return `ink-${identity.sbSlug}`;
     } catch {
       // fall through
     }

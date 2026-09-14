@@ -26,7 +26,7 @@ function rpcClient(result: { data?: unknown; error?: { message: string } }) {
 const STAMP = {
   threadId: 't-1',
   userId: 'u-1',
-  agentId: 'wren',
+  sbSlug: 'wren',
   attemptStartedAt: '2026-08-19T02:00:00.000Z',
   detail: { triedCallerRepo: true, callerRepoRoot: '/repos/inkwell' },
   now: '2026-08-19T02:00:05.000Z',
@@ -43,7 +43,7 @@ describe('stampRoutingHold', () => {
       p_agent_id: 'wren',
       p_attempt_started: '2026-08-19T02:00:00.000Z',
       p_hold: {
-        agentId: 'wren',
+        sbSlug: 'wren',
         reason: 'no-route',
         // Generation, not just wall-clock: the clear compares this against
         // the successful route's start.
@@ -114,7 +114,7 @@ describe('clearRoutingHold', () => {
       clearRoutingHold(client, {
         threadId: 't-1',
         userId: 'u-1',
-        agentId: 'wren',
+        sbSlug: 'wren',
         routedSince: '2026-08-19T02:00:00.000Z',
       })
     ).resolves.toBe(true);
@@ -133,7 +133,7 @@ describe('clearRoutingHold', () => {
       clearRoutingHold(nothing.client, {
         threadId: 't-1',
         userId: 'u-1',
-        agentId: 'wren',
+        sbSlug: 'wren',
         routedSince: 'x',
       })
     ).resolves.toBe(false);
@@ -143,7 +143,7 @@ describe('clearRoutingHold', () => {
       clearRoutingHold(failed.client, {
         threadId: 't-1',
         userId: 'u-1',
-        agentId: 'wren',
+        sbSlug: 'wren',
         routedSince: 'x',
       })
     ).resolves.toBe(false);
@@ -153,7 +153,7 @@ describe('clearRoutingHold', () => {
   it('never throws', async () => {
     const client = { rpc: vi.fn().mockRejectedValue(new Error('boom')) };
     await expect(
-      clearRoutingHold(client, { threadId: 't', userId: 'u', agentId: 'a', routedSince: 'x' })
+      clearRoutingHold(client, { threadId: 't', userId: 'u', sbSlug: 'a', routedSince: 'x' })
     ).resolves.toBe(false);
   });
 });
@@ -198,7 +198,7 @@ describe('the admission-refusal generation interaction (v18 S3)', () => {
         const holdGeneration = hold ? (hold.attemptStartedAt ?? hold.heldAt) : undefined;
         const didClear =
           Boolean(hold) &&
-          hold.agentId === args.p_agent_id &&
+          hold.sbSlug === args.p_agent_id &&
           at(holdGeneration) <= at(args.p_routed_since);
         if (didClear) delete metadata.routingHold;
         const prev = metadata.routingRecovery?.[args.p_agent_id];
@@ -217,7 +217,7 @@ describe('the admission-refusal generation interaction (v18 S3)', () => {
   const holdArgs = (attemptStartedAt: string) => ({
     threadId: 't-1',
     userId: 'u-1',
-    agentId: 'wren',
+    sbSlug: 'wren',
     attemptStartedAt,
     detail: { triedCallerRepo: false, reason: 'occupied' as const },
   });
@@ -233,7 +233,7 @@ describe('the admission-refusal generation interaction (v18 S3)', () => {
     await clearRoutingHold(client, {
       threadId: 't-1',
       userId: 'u-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       routedSince: T1,
     });
     await expect(stampRoutingHold(client, holdArgs(T1))).resolves.toBe(false);
@@ -255,7 +255,7 @@ describe('the admission-refusal generation interaction (v18 S3)', () => {
     // A later dispatch actually delivers → its terminal clear removes the
     // hold and records the recovery.
     await expect(
-      clearRoutingHold(client, { threadId: 't-1', userId: 'u-1', agentId: 'wren', routedSince: T2 })
+      clearRoutingHold(client, { threadId: 't-1', userId: 'u-1', sbSlug: 'wren', routedSince: T2 })
     ).resolves.toBe(true);
     expect(metadata.routingHold).toBeUndefined();
     expect(metadata.routingRecovery?.wren).toBe(T2);
@@ -267,7 +267,7 @@ describe('the admission-refusal generation interaction (v18 S3)', () => {
     await clearRoutingHold(client, {
       threadId: 't-1',
       userId: 'u-1',
-      agentId: 'wren',
+      sbSlug: 'wren',
       routedSince: T2,
     });
     // An older, slower dispatch's refusal (generation T1 < T2) must not

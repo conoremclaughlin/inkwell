@@ -30,7 +30,7 @@ export interface PendingAuth {
   codeChallenge: string;
   redirectUri: string;
   state: string;
-  agentId?: string;
+  sbSlug?: string;
   expiresAt: number;
 }
 
@@ -41,7 +41,7 @@ interface PendingAuthPayload {
   codeChallenge: string;
   redirectUri: string;
   state: string;
-  agentId?: string;
+  sbSlug?: string;
 }
 
 export interface AuthCode {
@@ -50,7 +50,7 @@ export interface AuthCode {
   redirectUri: string;
   userId: string;
   userEmail: string;
-  agentId?: string;
+  sbSlug?: string;
   expiresAt: number;
 }
 
@@ -108,7 +108,7 @@ export class PcpAuthProvider {
     codeChallenge: string;
     redirectUri: string;
     state: string;
-    agentId?: string;
+    sbSlug?: string;
   }): string {
     const payload: PendingAuthPayload = {
       type: 'pending_auth',
@@ -116,7 +116,7 @@ export class PcpAuthProvider {
       codeChallenge: params.codeChallenge,
       redirectUri: params.redirectUri,
       state: params.state,
-      ...(params.agentId ? { agentId: params.agentId } : {}),
+      ...(params.sbSlug ? { sbSlug: params.sbSlug } : {}),
     };
 
     return jwt.sign(payload, env.JWT_SECRET, {
@@ -219,7 +219,7 @@ export class PcpAuthProvider {
         redirectUri: pending.redirectUri,
         userId: pcpUser.id,
         userEmail: pcpUser.email || '',
-        ...(pending.agentId ? { agentId: pending.agentId } : {}),
+        ...(pending.sbSlug ? { sbSlug: pending.sbSlug } : {}),
         expiresAt: Date.now() + AUTH_CODE_LIFETIME_MS,
       });
 
@@ -287,18 +287,18 @@ export class PcpAuthProvider {
 
     // Resolve canonical identity UUID when agent_id is provided
     let sbId: string | undefined;
-    if (codeData.agentId) {
+    if (codeData.sbSlug) {
       const { data: identity } = await this.supabase
         .from('agent_identities')
         .select('id')
         .eq('user_id', codeData.userId)
-        .eq('agent_id', codeData.agentId)
+        .eq('agent_id', codeData.sbSlug)
         .maybeSingle();
       sbId = identity?.id;
       if (!sbId) {
         logger.warn('No agent_identities record found for token binding', {
           userId: codeData.userId,
-          agentId: codeData.agentId,
+          sbSlug: codeData.sbSlug,
         });
       }
     }
@@ -313,7 +313,7 @@ export class PcpAuthProvider {
         clientId,
         ['mcp:tools'],
         REFRESH_TOKEN_LIFETIME_DAYS,
-        codeData.agentId,
+        codeData.sbSlug,
         sbId
       );
       refreshToken = result.refreshToken;
@@ -332,7 +332,7 @@ export class PcpAuthProvider {
         sub: codeData.userId,
         email: codeData.userEmail,
         scope: 'mcp:tools',
-        ...(codeData.agentId ? { agentId: codeData.agentId } : {}),
+        ...(codeData.sbSlug ? { sbSlug: codeData.sbSlug } : {}),
         ...(sbId ? { identityId: sbId } : {}),
       },
       ACCESS_TOKEN_LIFETIME_SECONDS
@@ -342,7 +342,7 @@ export class PcpAuthProvider {
       userId: codeData.userId,
       email: codeData.userEmail,
       clientId,
-      agentId: codeData.agentId || 'none',
+      sbSlug: codeData.sbSlug || 'none',
       sbId: sbId || 'none',
       refreshTokenExpires: expiresAt.toISOString(),
     });
@@ -397,7 +397,7 @@ export class PcpAuthProvider {
   verifyAccessToken(authHeader: string | undefined): {
     userId: string;
     email: string;
-    agentId?: string;
+    sbSlug?: string;
     sbId?: string;
     /** Signed runner binding — authenticated, unlike the x-ink-context header. */
     sessionId?: string;
@@ -412,7 +412,7 @@ export class PcpAuthProvider {
     return {
       userId: payload.sub,
       email: payload.email,
-      ...(payload.agentId ? { agentId: payload.agentId } : {}),
+      ...(payload.sbSlug ? { sbSlug: payload.sbSlug } : {}),
       ...(payload.sbId
         ? { sbId: payload.sbId }
         : payload.identityId

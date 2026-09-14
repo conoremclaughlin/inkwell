@@ -170,7 +170,7 @@ type WorkspaceIdentityScope = {
     role: string | null;
   }>;
   sbIds: string[];
-  agentIds: Set<string>;
+  sbSlugs: Set<string>;
 };
 
 type WorkspaceScopedSessionRow = {
@@ -255,7 +255,7 @@ function toRoutingRoute(
     id: route.id,
     sbId: route.sb_id,
     identityId: route.sb_id,
-    agentId: identity?.agent_id ?? null,
+    sbSlug: identity?.agent_id ?? null,
     agentName: identity?.name ?? null,
     agentRole: identity?.role ?? null,
     backend: identity?.backend ?? null,
@@ -944,7 +944,7 @@ async function resolveWorkspaceIdentityScope(
     scope: {
       rows,
       sbIds: rows.map((row) => row.id),
-      agentIds: new Set(rows.map((row) => row.agent_id)),
+      sbSlugs: new Set(rows.map((row) => row.agent_id)),
     },
     error: null,
   };
@@ -956,7 +956,7 @@ function isSessionInWorkspace(
 ): boolean {
   if (!session) return false;
   if (session.sb_id && scope.sbIds.includes(session.sb_id)) return true;
-  if (!session.sb_id && session.agent_id && scope.agentIds.has(session.agent_id)) return true;
+  if (!session.sb_id && session.agent_id && scope.sbSlugs.has(session.agent_id)) return true;
   return false;
 }
 
@@ -2414,7 +2414,7 @@ router.get('/whatsapp/qr', (req: Request, res: Response) => {
 /**
  * GET /api/admin/events
  * Generic SSE stream of activity_stream events for the authenticated user.
- * Filters: ?sessionId= &taskGroupId= &agentId= — optional, ANDed together.
+ * Filters: ?sessionId= &taskGroupId= &sbSlug= — optional, ANDed together.
  * Backfill: ?since=<ISO timestamp> replays persisted rows before going live.
  * Reconnect: Last-Event-ID header (or ?since) — clients pass the last seen
  * activity id/timestamp to resume without gaps.
@@ -2426,7 +2426,7 @@ router.get('/events', async (req: Request, res: Response) => {
   const authReq = req as AdminAuthRequest;
   const sessionId = typeof req.query.sessionId === 'string' ? req.query.sessionId : undefined;
   const taskGroupId = typeof req.query.taskGroupId === 'string' ? req.query.taskGroupId : undefined;
-  const agentId = typeof req.query.agentId === 'string' ? req.query.agentId : undefined;
+  const sbSlug = typeof req.query.sbSlug === 'string' ? req.query.sbSlug : undefined;
   // Cursor priority: explicit ?since= > Last-Event-ID reconnect header
   // (format "<ISO>|<id>", set by writeEvent below).
   const lastEventId = req.headers['last-event-id'];
@@ -2464,7 +2464,7 @@ router.get('/events', async (req: Request, res: Response) => {
   let heartbeat: ReturnType<typeof setInterval> | undefined;
 
   const unsubscribe = activityBus.subscribe(
-    { userId: authReq.pcpUserId, sessionId, taskGroupId, agentId },
+    { userId: authReq.pcpUserId, sessionId, taskGroupId, sbSlug },
     (activity) => {
       if (closed) return;
       if (backfilling) {
@@ -2493,7 +2493,7 @@ router.get('/events', async (req: Request, res: Response) => {
       const backfill = await activityRepo.getActivity(authReq.pcpUserId, {
         sessionId,
         taskGroupId,
-        agentId,
+        sbSlug,
         since,
         limit: 500,
       });
@@ -2689,7 +2689,7 @@ router.get('/routing', async (req: Request, res: Response) => {
 
     const { enabled: heartbeatProcessingEnabled } = getHeartbeatProcessingConfig();
 
-    const uniqueAgents = new Set(routes.map((route) => route.agentId).filter(Boolean));
+    const uniqueAgents = new Set(routes.map((route) => route.sbSlug).filter(Boolean));
     const uniquePlatforms = new Set(routes.map((route) => route.platform));
 
     res.json({
@@ -2703,7 +2703,7 @@ router.get('/routing', async (req: Request, res: Response) => {
       },
       identities: (identitiesData || []).map((identity) => ({
         id: identity.id,
-        agentId: identity.agent_id,
+        sbSlug: identity.agent_id,
         name: identity.name,
         role: identity.role,
         backend: identity.backend,
@@ -2718,12 +2718,12 @@ router.get('/routing', async (req: Request, res: Response) => {
 });
 
 /**
- * GET /api/admin/routing/agents/:agentId
+ * GET /api/admin/routing/agents/:sbSlug
  * Get routing detail for a specific SB.
  */
-router.get('/routing/agents/:agentId', async (req: Request, res: Response) => {
+router.get('/routing/agents/:sbSlug', async (req: Request, res: Response) => {
   try {
-    const { agentId } = req.params;
+    const { sbSlug } = req.params;
     const authReq = req as AdminAuthRequest;
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
       auth: { autoRefreshToken: false, persistSession: false },
@@ -2736,7 +2736,7 @@ router.get('/routing/agents/:agentId', async (req: Request, res: Response) => {
       )
       .eq('user_id', authReq.pcpUserId)
       .eq('workspace_id', authReq.pcpWorkspaceId)
-      .eq('agent_id', agentId)
+      .eq('agent_id', sbSlug)
       .single();
 
     if (identityError || !identity) {
@@ -2839,7 +2839,7 @@ router.get('/routing/agents/:agentId', async (req: Request, res: Response) => {
       heartbeatProcessingEnabled,
       agent: {
         id: identity.id,
-        agentId: identity.agent_id,
+        sbSlug: identity.agent_id,
         name: identity.name,
         role: identity.role,
         description: identity.description,
@@ -2881,14 +2881,14 @@ router.get('/routing/agents/:agentId', async (req: Request, res: Response) => {
 });
 
 /**
- * PATCH /api/admin/identities/:agentId/settings
+ * PATCH /api/admin/identities/:sbSlug/settings
  * Update SB-level settings: sandbox_bypass, session_scope, backend, runtime config
  * (tool profile, tool routing, max turns, passive recall). Admin-only — not exposed via MCP.
  */
-router.patch('/identities/:agentId/settings', async (req: Request, res: Response) => {
+router.patch('/identities/:sbSlug/settings', async (req: Request, res: Response) => {
   try {
     const authReq = req as AdminAuthRequest;
-    const { agentId } = req.params;
+    const { sbSlug } = req.params;
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY, {
       auth: { autoRefreshToken: false, persistSession: false },
     });
@@ -2899,7 +2899,7 @@ router.patch('/identities/:agentId/settings', async (req: Request, res: Response
       .select('id, metadata')
       .eq('user_id', authReq.pcpUserId)
       .eq('workspace_id', authReq.pcpWorkspaceId)
-      .eq('agent_id', agentId)
+      .eq('agent_id', sbSlug)
       .maybeSingle();
 
     if (fetchErr || !identity) {
@@ -2985,10 +2985,10 @@ router.patch('/identities/:agentId/settings', async (req: Request, res: Response
     }
 
     const meta = (updated.metadata || {}) as Record<string, unknown>;
-    logger.info('Identity settings updated', { agentId, updates });
+    logger.info('Identity settings updated', { sbSlug, updates });
     res.json({
       success: true,
-      agentId,
+      sbSlug,
       backend: updated.backend || null,
       sandbox_bypass: updated.sandbox_bypass,
       runtimeConfig: (meta.runtimeConfig as Record<string, unknown>) || null,
@@ -3491,7 +3491,7 @@ router.get('/reminders', async (req: Request, res: Response) => {
         runCount: r.run_count,
         maxRuns: r.max_runs,
         studioHint: r.studio_hint ?? null,
-        agentId: r.agent_identities?.agent_id ?? null,
+        sbSlug: r.agent_identities?.agent_id ?? null,
         agentName: r.agent_identities?.name ?? null,
         createdAt: r.created_at,
       })),
@@ -3722,7 +3722,7 @@ router.get('/individuals', async (req: Request, res: Response) => {
         const meta = (identity.metadata || {}) as Record<string, unknown>;
         return {
           id: identity.id,
-          agentId: identity.agent_id,
+          sbSlug: identity.agent_id,
           name: identity.name,
           role: identity.role,
           backend: identity.backend || null,
@@ -3749,12 +3749,12 @@ router.get('/individuals', async (req: Request, res: Response) => {
 });
 
 /**
- * GET /api/admin/individuals/:agentId/history
+ * GET /api/admin/individuals/:sbSlug/history
  * Get version history for an AI being
  */
-router.get('/individuals/:agentId/history', async (req: Request, res: Response) => {
+router.get('/individuals/:sbSlug/history', async (req: Request, res: Response) => {
   try {
-    const { agentId } = req.params;
+    const { sbSlug } = req.params;
     const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
     const authReq = req as AdminAuthRequest;
 
@@ -3764,7 +3764,7 @@ router.get('/individuals/:agentId/history', async (req: Request, res: Response) 
       .select('id')
       .eq('user_id', authReq.pcpUserId)
       .eq('workspace_id', authReq.pcpWorkspaceId)
-      .eq('agent_id', agentId)
+      .eq('agent_id', sbSlug)
       .single();
 
     if (!identity) {
@@ -3788,7 +3788,7 @@ router.get('/individuals/:agentId/history', async (req: Request, res: Response) 
     }
 
     res.json({
-      agentId,
+      sbSlug,
       history: (data || []).map((h) => ({
         id: h.id,
         version: h.version,
@@ -3832,12 +3832,12 @@ interface TimelineEntry {
 }
 
 /**
- * GET /api/admin/individuals/:agentId/memories/timeline
+ * GET /api/admin/individuals/:sbSlug/memories/timeline
  * Get full memory activity timeline for an AI being
  */
-router.get('/individuals/:agentId/memories/timeline', async (req: Request, res: Response) => {
+router.get('/individuals/:sbSlug/memories/timeline', async (req: Request, res: Response) => {
   try {
-    const { agentId } = req.params;
+    const { sbSlug } = req.params;
     const limit = Math.min(parseInt(req.query.limit as string) || 100, 500);
     const offset = parseInt(req.query.offset as string) || 0;
     const authReq = req as AdminAuthRequest;
@@ -3849,12 +3849,12 @@ router.get('/individuals/:agentId/memories/timeline', async (req: Request, res: 
       .select('id')
       .eq('user_id', authReq.pcpUserId)
       .eq('workspace_id', authReq.pcpWorkspaceId)
-      .eq('agent_id', agentId)
+      .eq('agent_id', sbSlug)
       .maybeSingle();
 
     if (!identity) {
       res.json({
-        agentId,
+        sbSlug,
         timeline: [],
         total: 0,
         limit,
@@ -3914,10 +3914,10 @@ router.get('/individuals/:agentId/memories/timeline', async (req: Request, res: 
         const metadataWorkspaceId =
           (metadata?.workspaceId as string | undefined) ||
           (metadata?.workspace_id as string | undefined);
-        const metadataAgentId = metadata?.agentId as string | undefined;
+        const metadataSlug = metadata?.sbSlug as string | undefined;
         const hasScopedMetadata =
           metadataIdentityId === identity.id ||
-          (metadataAgentId === agentId && metadataWorkspaceId === authReq.pcpWorkspaceId);
+          (metadataSlug === sbSlug && metadataWorkspaceId === authReq.pcpWorkspaceId);
 
         if (isAgentMemory || hasScopedMetadata) {
           timeline.push({
@@ -3944,7 +3944,7 @@ router.get('/individuals/:agentId/memories/timeline', async (req: Request, res: 
       .eq('user_id', authReq.pcpUserId)
       .eq('workspace_id', authReq.pcpWorkspaceId)
       .eq('sb_id', identity.id)
-      .eq('agent_id', agentId);
+      .eq('agent_id', sbSlug);
 
     if (sessionsError) {
       logger.error('Failed to fetch sessions:', sessionsError);
@@ -3982,7 +3982,7 @@ router.get('/individuals/:agentId/memories/timeline', async (req: Request, res: 
     const paginatedTimeline = timeline.slice(offset, offset + limit);
 
     res.json({
-      agentId,
+      sbSlug,
       timeline: paginatedTimeline,
       total: timeline.length,
       limit,
@@ -3995,14 +3995,14 @@ router.get('/individuals/:agentId/memories/timeline', async (req: Request, res: 
 });
 
 /**
- * GET /api/admin/individuals/:agentId/memories/:memoryId/history
+ * GET /api/admin/individuals/:sbSlug/memories/:memoryId/history
  * Get version history for a specific memory
  */
 router.get(
-  '/individuals/:agentId/memories/:memoryId/history',
+  '/individuals/:sbSlug/memories/:memoryId/history',
   async (req: Request, res: Response) => {
     try {
-      const { agentId, memoryId } = req.params;
+      const { sbSlug, memoryId } = req.params;
       const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SECRET_KEY);
       const authReq = req as AdminAuthRequest;
 
@@ -4011,7 +4011,7 @@ router.get(
         .select('id')
         .eq('user_id', authReq.pcpUserId)
         .eq('workspace_id', authReq.pcpWorkspaceId)
-        .eq('agent_id', agentId)
+        .eq('agent_id', sbSlug)
         .maybeSingle();
 
       if (!identity) {
@@ -4049,10 +4049,10 @@ router.get(
         const metadataWorkspaceId =
           (metadata?.workspaceId as string | undefined) ||
           (metadata?.workspace_id as string | undefined);
-        const metadataAgentId = metadata?.agentId as string | undefined;
+        const metadataSlug = metadata?.sbSlug as string | undefined;
         return (
           metadataIdentityId === identity.id ||
-          (metadataAgentId === agentId && metadataWorkspaceId === authReq.pcpWorkspaceId)
+          (metadataSlug === sbSlug && metadataWorkspaceId === authReq.pcpWorkspaceId)
         );
       });
 
@@ -4083,13 +4083,13 @@ router.get(
 // =============================================================================
 
 /**
- * GET /api/admin/individuals/:agentId/inbox
+ * GET /api/admin/individuals/:sbSlug/inbox
  * Get threaded inbox view for an agent, grouped by thread_key.
  * Messages without a thread_key are returned as flat messages (routed to the SB's main process).
  */
-router.get('/individuals/:agentId/inbox', async (req: Request, res: Response) => {
+router.get('/individuals/:sbSlug/inbox', async (req: Request, res: Response) => {
   try {
-    const { agentId } = req.params;
+    const { sbSlug } = req.params;
     const authReq = req as AdminAuthRequest;
     const status = (req.query.status as string) || 'all';
     const messageType = req.query.messageType as string | undefined;
@@ -4106,7 +4106,7 @@ router.get('/individuals/:agentId/inbox', async (req: Request, res: Response) =>
       .select('id')
       .eq('user_id', authReq.pcpUserId)
       .eq('workspace_id', authReq.pcpWorkspaceId)
-      .eq('agent_id', agentId);
+      .eq('agent_id', sbSlug);
 
     if (identityError) {
       logger.error('Failed to resolve inbox identities for workspace scope:', identityError);
@@ -4117,7 +4117,7 @@ router.get('/individuals/:agentId/inbox', async (req: Request, res: Response) =>
     const scopedIdentityIds = (identityRows || []).map((row) => row.id);
     if (scopedIdentityIds.length === 0) {
       res.json({
-        agentId,
+        sbSlug,
         stats: {
           totalMessages: 0,
           unreadCount: 0,
@@ -4142,7 +4142,7 @@ router.get('/individuals/:agentId/inbox', async (req: Request, res: Response) =>
       .from('agent_inbox')
       .select('*')
       .eq('recipient_user_id', authReq.pcpUserId)
-      .eq('recipient_agent_id', agentId)
+      .eq('recipient_agent_id', sbSlug)
       .in('recipient_sb_id', scopedIdentityIds)
       .order('created_at', { ascending: false })
       .limit(500);
@@ -4151,7 +4151,7 @@ router.get('/individuals/:agentId/inbox', async (req: Request, res: Response) =>
       .from('agent_inbox')
       .select('*')
       .eq('recipient_user_id', authReq.pcpUserId)
-      .eq('sender_agent_id', agentId)
+      .eq('sender_agent_id', sbSlug)
       .in('sender_sb_id', scopedIdentityIds)
       .order('created_at', { ascending: false })
       .limit(500);
@@ -4231,10 +4231,10 @@ router.get('/individuals/:agentId/inbox', async (req: Request, res: Response) =>
       messageType: string;
       priority: string;
       status: string;
-      senderAgentId: string | null;
+      senderSlug: string | null;
       senderSbId: string | null;
       senderIdentityId: string | null;
-      recipientAgentId: string;
+      recipientSlug: string;
       recipientSbId: string | null;
       recipientIdentityId: string | null;
       threadKey: string | null;
@@ -4254,10 +4254,10 @@ router.get('/individuals/:agentId/inbox', async (req: Request, res: Response) =>
       messageType: m.message_type,
       priority: m.priority,
       status: m.status,
-      senderAgentId: m.sender_agent_id,
+      senderSlug: m.sender_agent_id,
       senderSbId: m.sender_sb_id,
       senderIdentityId: m.sender_sb_id,
-      recipientAgentId: m.recipient_agent_id,
+      recipientSlug: m.recipient_agent_id,
       recipientSbId: m.recipient_sb_id,
       recipientIdentityId: m.recipient_sb_id,
       threadKey: m.thread_key,
@@ -4280,9 +4280,9 @@ router.get('/individuals/:agentId/inbox', async (req: Request, res: Response) =>
       if (m.thread_key) {
         // Determine the counterpart: the "other" agent in this 1-1 exchange
         let counterpart: string;
-        if (m.sender_agent_id === agentId) {
+        if (m.sender_agent_id === sbSlug) {
           counterpart = m.recipient_agent_id;
-        } else if (m.recipient_agent_id === agentId) {
+        } else if (m.recipient_agent_id === sbSlug) {
           counterpart = m.sender_agent_id || 'unknown';
         } else {
           // Cross-agent message (from two-pass) — group by sender
@@ -4311,7 +4311,7 @@ router.get('/individuals/:agentId/inbox', async (req: Request, res: Response) =>
         unreadCount: sorted.filter((m) => m.status === 'unread').length,
         latestMessage: sorted[sorted.length - 1],
         participants: [
-          ...new Set(sorted.flatMap((m) => [m.senderAgentId, m.recipientAgentId]).filter(Boolean)),
+          ...new Set(sorted.flatMap((m) => [m.senderSlug, m.recipientSlug]).filter(Boolean)),
         ] as string[],
         firstMessageAt: sorted[0].createdAt,
         lastMessageAt: sorted[sorted.length - 1].createdAt,
@@ -4349,7 +4349,7 @@ router.get('/individuals/:agentId/inbox', async (req: Request, res: Response) =>
       const { data: threadParticipantRows } = await (supabase as any)
         .from('inbox_thread_participants')
         .select('thread_id')
-        .eq('agent_id', agentId);
+        .eq('agent_id', sbSlug);
 
       const threadIds = (threadParticipantRows || []).map(
         (p: { thread_id: string }) => p.thread_id
@@ -4371,7 +4371,7 @@ router.get('/individuals/:agentId/inbox', async (req: Request, res: Response) =>
           const { data: readStatusRows } = await (supabase as any)
             .from('inbox_thread_read_status')
             .select('thread_id, last_read_at')
-            .eq('agent_id', agentId)
+            .eq('agent_id', sbSlug)
             .in('thread_id', threadIds);
 
           const readStatusMap = new Map<string, string>();
@@ -4411,10 +4411,10 @@ router.get('/individuals/:agentId/inbox', async (req: Request, res: Response) =>
               messageType: m.message_type,
               priority: m.priority,
               status: 'unread', // computed below
-              senderAgentId: m.sender_agent_id,
+              senderSlug: m.sender_agent_id,
               senderSbId: null,
               senderIdentityId: null,
-              recipientAgentId: agentId, // thread messages don't have a single recipient
+              recipientSlug: sbSlug, // thread messages don't have a single recipient
               recipientSbId: null,
               recipientIdentityId: null,
               threadKey: t.thread_key,
@@ -4485,7 +4485,7 @@ router.get('/individuals/:agentId/inbox', async (req: Request, res: Response) =>
     const totalItems = threads.length + flatMessages.length;
 
     res.json({
-      agentId,
+      sbSlug,
       stats: {
         totalMessages: allMessages.length + groupThreads.reduce((s, t) => s + t.messageCount, 0),
         unreadCount: inboxUnreadCount,
@@ -5210,7 +5210,7 @@ router.get('/artifacts/:id/comments', async (req: Request, res: Response) => {
           parentCommentId: comment.parent_comment_id,
           content: comment.content,
           metadata: comment.metadata,
-          createdByAgentId: identity?.agent_id ?? null,
+          createdBySlug: identity?.agent_id ?? null,
           createdByUserId: commentAuthorUserId,
           createdByUser: commentAuthorUser
             ? {
@@ -5224,7 +5224,7 @@ router.get('/artifacts/:id/comments', async (req: Request, res: Response) => {
           createdByIdentity: identity
             ? {
                 id: identity.id,
-                agentId: identity.agent_id,
+                sbSlug: identity.agent_id,
                 name: identity.name,
                 backend: identity.backend,
               }
@@ -5247,9 +5247,9 @@ router.get('/artifacts/:id/comments', async (req: Request, res: Response) => {
 router.post('/artifacts/:id/comments', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-    const { content, agentId, parentCommentId, metadata } = req.body as {
+    const { content, sbSlug, parentCommentId, metadata } = req.body as {
       content?: string;
-      agentId?: string;
+      sbSlug?: string;
       parentCommentId?: string;
       metadata?: Record<string, unknown>;
     };
@@ -5296,20 +5296,20 @@ router.post('/artifacts/:id/comments', async (req: Request, res: Response) => {
 
     let identity: { id: string; agent_id: string; name: string; backend: string | null } | null =
       null;
-    if (agentId) {
+    if (sbSlug) {
       const { data: identityRow, error: identityError } = await supabase
         .from('agent_identities')
         .select('id, agent_id, name, backend')
         .eq('user_id', pcpUserId)
         .eq('workspace_id', workspaceId)
-        .eq('agent_id', agentId)
+        .eq('agent_id', sbSlug)
         .single();
 
       if (identityError || !identityRow) {
         // Deliberately stricter than MCP tool behavior:
         // dashboard/admin writes should reference a known identity explicitly,
         // while MCP handlers allow slug-only fallback for backward compatibility.
-        res.status(400).json({ error: `Unknown agent identity: ${agentId}` });
+        res.status(400).json({ error: `Unknown agent identity: ${sbSlug}` });
         return;
       }
       identity = identityRow;
@@ -5349,7 +5349,7 @@ router.post('/artifacts/:id/comments', async (req: Request, res: Response) => {
         parentCommentId: comment.parent_comment_id,
         content: comment.content,
         metadata: comment.metadata,
-        createdByAgentId: identity?.agent_id ?? null,
+        createdBySlug: identity?.agent_id ?? null,
         createdByUserId: comment.created_by_user_id || pcpUserId,
         createdByUser: commentAuthorUser
           ? {
@@ -5363,7 +5363,7 @@ router.post('/artifacts/:id/comments', async (req: Request, res: Response) => {
         createdByIdentity: identity
           ? {
               id: identity.id,
-              agentId: identity.agent_id,
+              sbSlug: identity.agent_id,
               name: identity.name,
               backend: identity.backend,
             }
@@ -5490,15 +5490,15 @@ router.get('/sessions', async (req: Request, res: Response) => {
 
     const scopedIdentityRows = scopedIdentities || [];
     const scopedIdentityIds = scopedIdentityRows.map((i) => i.id).filter(Boolean);
-    const scopedAgentIds = [
+    const scopedSlugs = [
       ...new Set(
         scopedIdentityRows.map((i) => i.agent_id).filter((id): id is string => Boolean(id))
       ),
     ];
 
-    const identitiesByAgentId = new Map<string, { name: string; role: string | null }>();
+    const identitiesBySlug = new Map<string, { name: string; role: string | null }>();
     for (const identity of scopedIdentityRows) {
-      identitiesByAgentId.set(identity.agent_id, {
+      identitiesBySlug.set(identity.agent_id, {
         name: identity.name,
         role: identity.role,
       });
@@ -5543,13 +5543,13 @@ router.get('/sessions', async (req: Request, res: Response) => {
 
     type SessionRow = NonNullable<typeof identityScopedSessions>[number];
     let legacySessions: SessionRow[] = [];
-    if (scopedAgentIds.length > 0) {
+    if (scopedSlugs.length > 0) {
       let legacyQuery = supabase
         .from('sessions')
         .select('*')
         .eq('user_id', authReq.pcpUserId)
         .is('sb_id', null)
-        .in('agent_id', scopedAgentIds)
+        .in('agent_id', scopedSlugs)
         .order('updated_at', { ascending: false })
         .limit(200);
 
@@ -5766,13 +5766,13 @@ router.get('/sessions', async (req: Request, res: Response) => {
     res.json({
       stats,
       sessions: sessionRows.map((s) => {
-        const identity = s.agent_id ? identitiesByAgentId.get(s.agent_id) : null;
+        const identity = s.agent_id ? identitiesBySlug.get(s.agent_id) : null;
         const studio =
           studiosById.get(s.studio_id || '') || workspacesBySessionId.get(s.id) || null;
         return {
           id: s.id,
           backendSessionId: s.backend_session_id || s.claude_session_id || null,
-          agentId: s.agent_id,
+          sbSlug: s.agent_id,
           agentName: identity?.name || s.agent_id || 'Unknown',
           agentRole: identity?.role || null,
           lifecycle: s.lifecycle || 'idle',
@@ -5820,7 +5820,7 @@ router.get('/sessions', async (req: Request, res: Response) => {
 function describeLease(raw: unknown): {
   sessionId: string;
   threadKey: string;
-  agentId: string;
+  sbSlug: string;
   acquiredAt: string;
   heartbeatAt: string;
   reason?: string;
@@ -5838,7 +5838,7 @@ function describeLease(raw: unknown): {
   return {
     sessionId: lease.sessionId,
     threadKey: lease.threadKey,
-    agentId: lease.agentId,
+    sbSlug: lease.sbSlug,
     acquiredAt: lease.acquiredAt,
     heartbeatAt: lease.heartbeatAt,
     ...(lease.reason ? { reason: lease.reason } : {}),
@@ -5906,7 +5906,7 @@ router.get('/studios', async (req: Request, res: Response) => {
     }
 
     // 3. Fetch latest active session per agent (for status/phase)
-    const agentIds = (identities || []).map((i) => i.agent_id).filter(Boolean);
+    const sbSlugs = (identities || []).map((i) => i.agent_id).filter(Boolean);
     const latestSessionByAgent = new Map<
       string,
       {
@@ -5918,12 +5918,12 @@ router.get('/studios', async (req: Request, res: Response) => {
       }
     >();
 
-    if (agentIds.length > 0) {
+    if (sbSlugs.length > 0) {
       const { data: sessions } = await supabase
         .from('sessions')
         .select('agent_id, lifecycle, current_phase, status, active_thread_key, updated_at')
         .eq('user_id', authReq.pcpUserId)
-        .in('agent_id', agentIds)
+        .in('agent_id', sbSlugs)
         .is('ended_at', null)
         .neq('lifecycle', 'failed')
         .order('updated_at', { ascending: false });
@@ -5955,7 +5955,7 @@ router.get('/studios', async (req: Request, res: Response) => {
       const latestSession = latestSessionByAgent.get(identity.agent_id);
 
       return {
-        agentId: identity.agent_id,
+        sbSlug: identity.agent_id,
         agentName: identity.name,
         agentRole: identity.role,
         backend: identity.backend,
@@ -6096,7 +6096,7 @@ router.get('/sessions/synced', async (req: Request, res: Response) => {
       }
     }
 
-    const identityByAgentId = new Map(
+    const identityBySlug = new Map(
       scope.rows.map((row) => [row.agent_id, { name: row.name, role: row.role }])
     );
 
@@ -6106,7 +6106,7 @@ router.get('/sessions/synced', async (req: Request, res: Response) => {
         if (!session || !isSessionInWorkspace(session, scope)) return null;
 
         const format = inferTranscriptFormatFromPath(row.source_path);
-        const identity = session.agent_id ? identityByAgentId.get(session.agent_id) : null;
+        const identity = session.agent_id ? identityBySlug.get(session.agent_id) : null;
         return {
           archiveId: row.id,
           sessionId: row.session_id,
@@ -6119,7 +6119,7 @@ router.get('/sessions/synced', async (req: Request, res: Response) => {
           syncedAt: row.synced_at,
           session: {
             id: session.id,
-            agentId: session.agent_id,
+            sbSlug: session.agent_id,
             agentName: identity?.name || session.agent_id || 'Unknown',
             agentRole: identity?.role || null,
             backend: session.backend,
@@ -6270,7 +6270,7 @@ router.get('/sessions/:id/conversation', async (req: Request, res: Response) => 
 
     const sessionInfo = {
       id: session.id,
-      agentId: identity?.agent_id ?? session.agent_id ?? 'unknown',
+      sbSlug: identity?.agent_id ?? session.agent_id ?? 'unknown',
       agentName: identity?.name ?? session.agent_id ?? 'Unknown',
       backend: session.backend,
       backendSessionId: session.backend_session_id,
@@ -6357,7 +6357,7 @@ router.get('/sessions/:id/conversation', async (req: Request, res: Response) => 
           type: a.type,
           direction: a.direction,
           content: a.content,
-          agentId: a.agent_id,
+          sbSlug: a.agent_id,
           platform: a.platform,
           timestamp: a.created_at,
           payload: a.payload,
@@ -6549,10 +6549,10 @@ router.get('/sessions/:id/logs', async (req: Request, res: Response) => {
     }
 
     const scopedIdentityIds = (scopedIdentities || []).map((i) => i.id);
-    const scopedAgentIds = new Set(
+    const scopedSlugs = new Set(
       (scopedIdentities || [])
         .map((i) => i.agent_id)
-        .filter((agentId): agentId is string => Boolean(agentId))
+        .filter((sbSlug): sbSlug is string => Boolean(sbSlug))
     );
 
     if (scopedIdentityIds.length === 0) {
@@ -6577,7 +6577,7 @@ router.get('/sessions/:id/logs', async (req: Request, res: Response) => {
     const sessionInWorkspace =
       session &&
       ((session.sb_id && scopedIdentityIds.includes(session.sb_id)) ||
-        (!session.sb_id && session.agent_id && scopedAgentIds.has(session.agent_id)));
+        (!session.sb_id && session.agent_id && scopedSlugs.has(session.agent_id)));
 
     if (sessionError || !session || !sessionInWorkspace) {
       res.status(404).json({ error: 'Session not found' });
@@ -6605,7 +6605,7 @@ router.get('/sessions/:id/logs', async (req: Request, res: Response) => {
     res.json({
       session: {
         id: session.id,
-        agentId: session.agent_id,
+        sbSlug: session.agent_id,
         status: session.status,
         currentPhase: session.current_phase,
         backend: session.backend,
@@ -7176,7 +7176,7 @@ router.get('/threads', async (req: Request, res: Response) => {
     // Carrier rows mapped first — their keys drive thread hydration below.
     const sessionRows = (sessionsRes.data || []).map((s) => ({
       id: s.id,
-      agentId: s.agent_id ?? null,
+      sbSlug: s.agent_id ?? null,
       lifecycle: s.lifecycle ?? null,
       status: s.status ?? null,
       currentPhase: s.current_phase ?? null,
@@ -7191,10 +7191,10 @@ router.get('/threads', async (req: Request, res: Response) => {
         id: st.id,
         slug: st.slug ?? null,
         branch: st.branch,
-        agentId: st.agent_id,
+        sbSlug: st.agent_id,
         threadKey: st.thread_key ?? null,
         leaseThreadKey: lease?.threadKey ?? null,
-        leaseAgentId: lease?.agentId ?? null,
+        leaseSlug: lease?.sbSlug ?? null,
         updatedAt: st.updated_at,
       };
     });
@@ -7293,7 +7293,7 @@ router.get('/threads', async (req: Request, res: Response) => {
         keyId: t.key_id ?? null,
         title: t.title ?? null,
         status: t.status,
-        createdByAgentId: t.created_by_agent_id,
+        createdBySlug: t.created_by_agent_id,
         updatedAt: t.updated_at,
         closedAt: t.closed_at ?? null,
         participants: participantsByThreadId.get(t.id) ?? [],
@@ -7368,7 +7368,7 @@ async function loadThreadStudioHistory(
   const historyEntries = aggregateStudioHistory(
     (leaseEvents || []).map((ev) => ({
       studioId: ev.studio_id,
-      agentId: ev.agent_id ?? null,
+      sbSlug: ev.agent_id ?? null,
       event: ev.event,
       createdAt: ev.created_at,
     }))
@@ -7478,14 +7478,14 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
         threadKey: thread.thread_key,
         title: thread.title ?? null,
         status: thread.status,
-        createdByAgentId: thread.created_by_agent_id,
+        createdBySlug: thread.created_by_agent_id,
         createdAt: thread.created_at,
         closedAt: thread.closed_at ?? null,
       },
       messages: (messageRows || [])
         .map((m) => ({
           id: m.id,
-          senderAgentId: m.sender_agent_id,
+          senderSlug: m.sender_agent_id,
           content: m.content,
           messageType: m.message_type,
           priority: m.priority,
@@ -7515,7 +7515,7 @@ router.get('/threads/messages', async (req: Request, res: Response) => {
  * thread hides typos. Here the recipients are explicit, so the intent is
  * unambiguous: "open a conversation with these participants".
  *
- * The human is the sender (no senderAgentId), the title becomes the thread's
+ * The human is the sender (no senderSlug), the title becomes the thread's
  * title on creation (send_to_inbox stores `subject` there), and every
  * recipient is woken — a first message nobody is woken for is a thread
  * nobody knows exists.
@@ -7585,7 +7585,7 @@ router.post('/threads', async (req: Request, res: Response) => {
         // A studio-pinned send is the handler's single-recipient form; the
         // group form (recipients[]) cannot carry a studio.
         ...(studioSlug
-          ? { recipientAgentId: uniqueRecipients[0], recipientStudioSlug: studioSlug }
+          ? { recipientSlug: uniqueRecipients[0], recipientStudioSlug: studioSlug }
           : { recipients: uniqueRecipients, triggerAll: true }),
         ...(title ? { subject: title } : {}),
         ...(priority ? { priority } : {}),
@@ -7631,7 +7631,7 @@ router.post('/threads', async (req: Request, res: Response) => {
  * A human reply into an existing thread — the dashboard and mobile analogue of
  * send_to_inbox. Delegates to the SAME handler the MCP tool uses, so trigger
  * dispatch, session routing, and thread bookkeeping stay one code path. The
- * admin request context carries no agentId, so the handler classifies the
+ * admin request context carries no sbSlug, so the handler classifies the
  * sender as non-agent ('unknown'); metadata.sentBy = 'user' carries the real
  * attribution for display.
  *
@@ -8305,7 +8305,7 @@ router.get('/activity', async (req: Request, res: Response) => {
         id: e.id,
         type: e.type,
         subtype: e.subtype,
-        agentId: e.agent_id,
+        sbSlug: e.agent_id,
         content: e.content,
         status: e.status,
         createdAt: e.created_at,
@@ -8491,8 +8491,7 @@ router.get('/task-groups', async (req: Request, res: Response) => {
         projectId: g.project_id,
         projectName: (g.projects as { name: string } | null)?.name ?? null,
         sbId: g.sb_id,
-        agentId:
-          (g.agent_identities as { agent_id: string; name: string } | null)?.agent_id ?? null,
+        sbSlug: (g.agent_identities as { agent_id: string; name: string } | null)?.agent_id ?? null,
         agentName: (g.agent_identities as { agent_id: string; name: string } | null)?.name ?? null,
         taskCount: taskCountMap[g.id] || 0,
         strategy: g.strategy ?? null,
@@ -8588,7 +8587,7 @@ router.get('/task-groups/:id', async (req: Request, res: Response) => {
         projectId: group.project_id,
         projectName: (group.projects as { name: string } | null)?.name ?? null,
         sbId: group.sb_id,
-        agentId:
+        sbSlug:
           (group.agent_identities as { agent_id: string; name: string } | null)?.agent_id ?? null,
         agentName:
           (group.agent_identities as { agent_id: string; name: string } | null)?.name ?? null,
@@ -8675,7 +8674,7 @@ router.get('/task-groups/:id/activity', async (req: Request, res: Response) => {
         type: e.type,
         subtype: e.subtype,
         content: e.content,
-        agentId: e.agent_id,
+        sbSlug: e.agent_id,
         sessionId: e.session_id,
         platform: e.platform,
         payload: e.payload,
@@ -8763,13 +8762,13 @@ router.get('/task-groups/:id/comments', async (req: Request, res: Response) => {
           taskGroupId: comment.task_group_id,
           commentType: comment.comment_type,
           content: comment.content,
-          agentId: comment.agent_id,
+          sbSlug: comment.agent_id,
           metadata: comment.metadata,
           createdBySbId: comment.created_by_sb_id,
           createdByIdentity: identity
             ? {
                 id: identity.id,
-                agentId: identity.agent_id,
+                sbSlug: identity.agent_id,
                 name: identity.name,
                 backend: identity.backend,
               }
@@ -8849,7 +8848,7 @@ router.get('/tasks/:id/comments', async (req: Request, res: Response) => {
           taskId: c.task_id,
           parentCommentId: c.parent_comment_id,
           content: c.content,
-          authorAgentId: c.created_by_agent_id || identity?.agent_id || null,
+          authorSlug: c.created_by_agent_id || identity?.agent_id || null,
           authorName: identity?.name || c.created_by_agent_id || 'Unknown',
           metadata: c.metadata,
           createdAt: c.created_at,
@@ -8918,7 +8917,7 @@ router.post('/tasks/:id/comments', async (req: Request, res: Response) => {
         taskId: comment.task_id,
         parentCommentId: comment.parent_comment_id,
         content: comment.content,
-        authorAgentId: null,
+        authorSlug: null,
         authorName: 'You',
         metadata: comment.metadata,
         createdAt: comment.created_at,
@@ -9075,16 +9074,16 @@ router.post('/approval-requests', async (req: Request, res: Response) => {
     // Resolve requesting agent from x-ink-context header (set by CLI hooks).
     // This is the sole trusted identity channel — agents cannot set it themselves.
     const contextHeader = req.headers['x-ink-context'] as string | undefined;
-    let requestingAgentId = 'unknown';
+    let requestingSlug = 'unknown';
     if (contextHeader) {
       try {
         const decoded = JSON.parse(Buffer.from(contextHeader, 'base64url').toString());
-        requestingAgentId = decoded.agentId || 'unknown';
+        requestingSlug = decoded.sbSlug || 'unknown';
       } catch {
         // fall through
       }
     }
-    if (requestingAgentId === 'unknown') {
+    if (requestingSlug === 'unknown') {
       logger.warn('Approval request with unknown agent — missing x-ink-context header', {
         tool,
         studioId,
@@ -9105,7 +9104,7 @@ router.post('/approval-requests', async (req: Request, res: Response) => {
         user_id: authReq.pcpUserId,
         studio_id: studioIdForInsert,
         session_id: sessionIdForInsert,
-        requesting_agent_id: requestingAgentId,
+        requesting_agent_id: requestingSlug,
         tool,
         args: args || null,
         reason: reason || null,
@@ -9140,7 +9139,7 @@ router.post('/approval-requests', async (req: Request, res: Response) => {
       requestId: data.id,
       tool,
       args,
-      requestingAgentId,
+      requestingSlug,
       studioId,
       expiresAt,
     });
@@ -9152,7 +9151,7 @@ router.post('/approval-requests', async (req: Request, res: Response) => {
       tool,
       args,
       reason: req.body.reason,
-      requestingAgentId,
+      requestingSlug,
       origin: cloneOrigin,
       studioId,
       sessionId,

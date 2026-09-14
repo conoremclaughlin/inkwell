@@ -25,9 +25,9 @@ export interface TriggerFailureNotice {
   /** Owner of the thread / inbox. */
   userId: string;
   /** Original trigger sender — the agent being notified. */
-  fromAgentId: string;
+  fromSlug: string;
   /** Failed trigger target — named in content; legacy-lane attributed sender. */
-  toAgentId: string;
+  toSlug: string;
   threadId?: string | null;
   threadKey?: string | null;
   subject: string;
@@ -44,7 +44,7 @@ export async function sendTriggerFailureNotice(
   client: any,
   notice: TriggerFailureNotice
 ): Promise<NoticeResult> {
-  const { userId, fromAgentId, toAgentId, threadKey, subject, content, metadata } = notice;
+  const { userId, fromSlug, toSlug, threadKey, subject, content, metadata } = notice;
 
   // Resolve the thread: explicit id wins; else look up by (user, threadKey).
   let threadId = notice.threadId || null;
@@ -96,8 +96,8 @@ export async function sendTriggerFailureNotice(
       logger.info('[TriggerFailure] Posted failure notice into thread', {
         threadId,
         threadKey: threadKey || null,
-        to: fromAgentId,
-        failedTarget: toAgentId,
+        to: fromSlug,
+        failedTarget: toSlug,
       });
       return { via: 'thread', ok: true };
     }
@@ -110,8 +110,8 @@ export async function sendTriggerFailureNotice(
   // Threadless (or thread write failed): legacy agent-scoped inbox.
   const { error: legacyErr } = await client.from('agent_inbox').insert({
     recipient_user_id: userId,
-    recipient_agent_id: fromAgentId,
-    sender_agent_id: toAgentId,
+    recipient_agent_id: fromSlug,
+    sender_agent_id: toSlug,
     subject,
     content,
     message_type: 'notification',
@@ -122,7 +122,7 @@ export async function sendTriggerFailureNotice(
   });
   if (legacyErr) {
     logger.error('[TriggerFailure] Failed to send failure notification to sender', {
-      sender: fromAgentId,
+      sender: fromSlug,
       error: legacyErr.message,
     });
     return { via: 'legacy', ok: false };

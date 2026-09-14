@@ -29,7 +29,7 @@ interface RecallMemory {
   source: string;
   salience: string;
   topics: string[];
-  agentId: string | null;
+  sbSlug: string | null;
   createdAt: string;
 }
 
@@ -41,7 +41,7 @@ interface RecallResponse {
 
 async function pcpRecall(
   query: string,
-  options?: { limit?: number; agentId?: string; recallMode?: string }
+  options?: { limit?: number; sbSlug?: string; recallMode?: string }
 ): Promise<RecallResponse> {
   const serverUrl = process.env.INK_SERVER_URL || 'http://localhost:3001';
   const authPath = `${process.env.HOME}/.ink/auth.json`;
@@ -58,7 +58,7 @@ async function pcpRecall(
 
   const body = {
     query,
-    agentId: options?.agentId || 'wren',
+    sbSlug: options?.sbSlug || 'wren',
     includeShared: true,
     limit: options?.limit || 5,
     recallMode: options?.recallMode || 'hybrid',
@@ -238,7 +238,7 @@ function createPassiveRecallHook(config?: {
       try {
         recallResult = await pcpRecall(signal, {
           limit: maxInject + 3, // fetch extra for filtering
-          agentId: ctx.runtime.agentId,
+          sbSlug: ctx.runtime.sbSlug,
           recallMode,
         });
       } catch {
@@ -384,7 +384,7 @@ describe('Passive recall hook: live end-to-end', () => {
 
     const result = await registry.fire('turn_end', {
       ledger,
-      runtime: { agentId: 'wren', turnCount: 1, budgetUtilization: 0.3 },
+      runtime: { sbSlug: 'wren', turnCount: 1, budgetUtilization: 0.3 },
       lastTurn: {
         userInput: 'How does session routing work for triggered agents?',
         assistantResponse:
@@ -422,7 +422,7 @@ describe('Passive recall hook: live end-to-end', () => {
     // First turn
     const r1 = await registry.fire('turn_end', {
       ledger,
-      runtime: { agentId: 'wren', turnCount: 1, budgetUtilization: 0.3 },
+      runtime: { sbSlug: 'wren', turnCount: 1, budgetUtilization: 0.3 },
       lastTurn: turn,
     });
     const firstInjectionCount = r1.injected;
@@ -430,7 +430,7 @@ describe('Passive recall hook: live end-to-end', () => {
     // Same topic, second turn — should get fewer/no new memories
     const r2 = await registry.fire('turn_end', {
       ledger,
-      runtime: { agentId: 'wren', turnCount: 2, budgetUtilization: 0.3 },
+      runtime: { sbSlug: 'wren', turnCount: 2, budgetUtilization: 0.3 },
       lastTurn: { ...turn, turnIndex: 2 },
     });
 
@@ -449,7 +449,7 @@ describe('Passive recall hook: live end-to-end', () => {
 
     const result = await registry.fire('turn_end', {
       ledger,
-      runtime: { agentId: 'wren', turnCount: 1, budgetUtilization: 0.85 },
+      runtime: { sbSlug: 'wren', turnCount: 1, budgetUtilization: 0.85 },
       lastTurn: {
         userInput: 'session routing',
         assistantResponse: 'routing explanation',
@@ -475,7 +475,7 @@ describe('Passive recall hook: live end-to-end', () => {
 
     const r1 = await registry.fire('turn_end', {
       ledger,
-      runtime: { agentId: 'wren', turnCount: 1, budgetUtilization: 0.3 },
+      runtime: { sbSlug: 'wren', turnCount: 1, budgetUtilization: 0.3 },
       lastTurn: {
         userInput: 'How does session routing work?',
         assistantResponse: 'Session routing resolves the target studio for triggered agents.',
@@ -502,7 +502,7 @@ describe('Passive recall hook: live end-to-end', () => {
 
     const r2 = await registry.fire('turn_end', {
       ledger,
-      runtime: { agentId: 'wren', turnCount: 2, budgetUtilization: 0.3 },
+      runtime: { sbSlug: 'wren', turnCount: 2, budgetUtilization: 0.3 },
       lastTurn: {
         userInput: 'What about the task comments feature?',
         assistantResponse:

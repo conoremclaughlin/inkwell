@@ -34,7 +34,7 @@ const canRun = Boolean(process.env.SUPABASE_URL && process.env.SUPABASE_SECRET_K
 describe.skipIf(!canRun)('save_identity keeps one row per SB (real database)', () => {
   let dataComposer: DataComposer;
   let workspaceId: string;
-  const agentId = `scope-test-${randomUUID().slice(0, 8)}`;
+  const sbSlug = `scope-test-${randomUUID().slice(0, 8)}`;
 
   const rowsFor = async () => {
     const { data, error } = await dataComposer
@@ -42,7 +42,7 @@ describe.skipIf(!canRun)('save_identity keeps one row per SB (real database)', (
       .from('agent_identities')
       .select('id, workspace_id, version, soul')
       .eq('user_id', INTEGRATION_TEST_USER_ID)
-      .eq('agent_id', agentId);
+      .eq('agent_id', sbSlug);
     if (error) throw new Error(error.message);
     return data ?? [];
   };
@@ -55,8 +55,8 @@ describe.skipIf(!canRun)('save_identity keeps one row per SB (real database)', (
       .from('workspaces')
       .insert({
         user_id: INTEGRATION_TEST_USER_ID,
-        name: `scope-test ${agentId}`,
-        slug: `scope-test-${agentId}`,
+        name: `scope-test ${sbSlug}`,
+        slug: `scope-test-${sbSlug}`,
       })
       .select('id')
       .single();
@@ -64,7 +64,7 @@ describe.skipIf(!canRun)('save_identity keeps one row per SB (real database)', (
     workspaceId = ws.data.id;
     const seeded = await dataComposer.getClient().from('agent_identities').insert({
       user_id: INTEGRATION_TEST_USER_ID,
-      agent_id: agentId,
+      agent_id: sbSlug,
       workspace_id: workspaceId,
       name: 'Scope Test',
       role: 'fixture',
@@ -79,7 +79,7 @@ describe.skipIf(!canRun)('save_identity keeps one row per SB (real database)', (
       .from('agent_identities')
       .delete()
       .eq('user_id', INTEGRATION_TEST_USER_ID)
-      .eq('agent_id', agentId);
+      .eq('agent_id', sbSlug);
     await supabase.from('workspaces').delete().eq('id', workspaceId);
   });
 
@@ -87,7 +87,7 @@ describe.skipIf(!canRun)('save_identity keeps one row per SB (real database)', (
     const result = await handleSaveIdentity(
       {
         userId: INTEGRATION_TEST_USER_ID,
-        agentId,
+        sbSlug,
         name: 'Scope Test',
         role: 'fixture',
         soul: 'v2',
@@ -109,7 +109,7 @@ describe.skipIf(!canRun)('save_identity keeps one row per SB (real database)', (
         handleSaveIdentity(
           {
             userId: INTEGRATION_TEST_USER_ID,
-            agentId,
+            sbSlug,
             name: 'Scope Test',
             role: 'fixture',
             soul: 'v3',
@@ -126,7 +126,7 @@ describe.skipIf(!canRun)('save_identity keeps one row per SB (real database)', (
 
   it('get_identity resolves with no workspaceId — the read that reported "not found" on Sep 10', async () => {
     const result = await handleGetIdentity(
-      { userId: INTEGRATION_TEST_USER_ID, agentId, file: 'identity' },
+      { userId: INTEGRATION_TEST_USER_ID, sbSlug, file: 'identity' },
       dataComposer
     );
     const parsed = JSON.parse(result.content[0].text);

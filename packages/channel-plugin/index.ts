@@ -66,7 +66,7 @@ function log(level: LogLevel, message: string, data?: Record<string, unknown>): 
 const INK_SERVER_URL = process.env.INK_SERVER_URL || 'http://localhost:3001';
 const POLL_INTERVAL_MS = parseInt(process.env.INK_POLL_INTERVAL_MS || '10000', 10);
 
-function resolveAgentId(): string {
+function resolveSlug(): string {
   if (process.env.INK_AGENT_ID) return process.env.INK_AGENT_ID;
   if (process.env.AGENT_ID) return process.env.AGENT_ID;
 
@@ -75,7 +75,7 @@ function resolveAgentId(): string {
   if (existsSync(identityPath)) {
     try {
       const identity = JSON.parse(readFileSync(identityPath, 'utf-8'));
-      if (identity.agentId) return identity.agentId;
+      if (identity.sbSlug) return identity.sbSlug;
     } catch {
       // ignore
     }
@@ -121,7 +121,7 @@ function resolveAccessToken(): string | undefined {
 
 // ─── PCP Client ─────────────────────────────────────────────
 
-const agentId = resolveAgentId();
+const sbSlug = resolveSlug();
 const email = resolveEmail();
 const accessToken = resolveAccessToken();
 const studioId = process.env.INK_STUDIO_ID || undefined;
@@ -146,7 +146,7 @@ function isLegacyMessageForThisStudio(msg: Record<string, unknown>): boolean {
 }
 
 log('info', 'Channel plugin starting', {
-  agentId,
+  sbSlug,
   email: email || '(none)',
   hasToken: !!accessToken,
   studioId: studioId || '(none)',
@@ -330,7 +330,7 @@ async function pollInbox(): Promise<void> {
       // re-serves the same batch next poll.
       const result = await callPcp('get_inbox', {
         email,
-        agentId,
+        sbSlug,
         status: 'unread',
         markRead: false,
         limit: 20,
@@ -360,7 +360,7 @@ async function pollInbox(): Promise<void> {
             });
           },
           log,
-          agentId,
+          sbSlug,
           email,
           studioId,
         },
@@ -389,7 +389,7 @@ async function pollInbox(): Promise<void> {
         // pointer is (user, agent)-global (Lumen #504 r2 P1).
         if (!isLegacyMessageForThisStudio(msg)) return 'foreign' as const;
         // Own messages are skipped unless cross-studio (same as threads).
-        if (msg.senderAgentId === agentId) {
+        if (msg.senderSlug === sbSlug) {
           if (!studioId) return 'skip' as const;
           const msgPcp = (msg.metadata as Record<string, unknown>)?.pcp as
             | Record<string, unknown>
@@ -409,7 +409,7 @@ async function pollInbox(): Promise<void> {
           });
         },
         log,
-        agentId,
+        sbSlug,
         email,
         studioId,
       };
@@ -440,7 +440,7 @@ async function pollInbox(): Promise<void> {
         }
         const next = await callPcp('get_inbox', {
           email,
-          agentId,
+          sbSlug,
           status: 'unread',
           markRead: false,
           limit: 20,

@@ -93,7 +93,7 @@ describe('resolveIdentityId', () => {
     expect(resolved).not.toBe(SB_IN_B);
     expect(logger.error).toHaveBeenCalledWith(
       expect.stringContaining('ambiguous'),
-      expect.objectContaining({ agentId: 'wren', candidateCount: 2 })
+      expect.objectContaining({ sbSlug: 'wren', candidateCount: 2 })
     );
   });
 

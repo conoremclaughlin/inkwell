@@ -121,7 +121,7 @@ describe('MCPServer workspace context resolution', () => {
     const result = await (server as any).resolveWorkspaceContextForMcpRequest(req, {
       userId: 'user-1',
       email: 'user@example.com',
-      agentId: 'lumen',
+      sbSlug: 'lumen',
     });
 
     expect(result).toEqual({ workspaceId: 'ws-header', workspaceSource: 'header' });
@@ -140,7 +140,7 @@ describe('MCPServer workspace context resolution', () => {
       (server as any).resolveWorkspaceContextForMcpRequest(req, {
         userId: 'user-1',
         email: 'user@example.com',
-        agentId: 'lumen',
+        sbSlug: 'lumen',
       })
     ).rejects.toThrow('Workspace not found or not accessible');
   });
@@ -159,7 +159,7 @@ describe('MCPServer workspace context resolution', () => {
     const result = await (server as any).resolveWorkspaceContextForMcpRequest(req, {
       userId: 'user-1',
       email: 'user@example.com',
-      agentId: 'lumen',
+      sbSlug: 'lumen',
     });
 
     expect(result).toEqual({ workspaceId: 'ws-derived', workspaceSource: 'derived' });

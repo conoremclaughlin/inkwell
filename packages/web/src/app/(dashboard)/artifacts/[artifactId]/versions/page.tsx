@@ -40,7 +40,7 @@ interface HistoryEntry {
   version: number;
   title: string;
   content: string;
-  changedByAgentId?: string;
+  changedBySlug?: string;
   changedByUserId?: string;
   changeType: string;
   changeSummary?: string;
@@ -253,10 +253,8 @@ export default function ArtifactVersionsPage() {
                               minute: '2-digit',
                             })}
                           </div>
-                          {v.changedByAgentId && (
-                            <div className="text-xs text-gray-400 mt-1">
-                              by {v.changedByAgentId}
-                            </div>
+                          {v.changedBySlug && (
+                            <div className="text-xs text-gray-400 mt-1">by {v.changedBySlug}</div>
                           )}
                         </div>
                         {isActive && !isLast && (

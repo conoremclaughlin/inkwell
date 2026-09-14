@@ -78,8 +78,8 @@ export interface StudioLease {
    * leases written before S2 — `leaseThreadKeys()` is the one reader.
    */
   threadKeys?: string[];
-  agentId: string;
-  /** Canonical identity UUID (agent_identities.id); agentId is the display slug. */
+  sbSlug: string;
+  /** Canonical identity UUID (agent_identities.id); sbSlug is the display slug. */
   sbId?: string | null;
   acquiredAt: string;
   heartbeatAt: string;
@@ -165,7 +165,7 @@ export interface AcquireRequest {
   studioId: string;
   sessionId: string;
   threadKey: string;
-  agentId: string;
+  sbSlug: string;
   /**
    * Canonical identity of the acquirer (agent_identities.id) when the caller
    * has already verified it — a studio handler acting on a signed credential
@@ -260,7 +260,7 @@ export function parseStudioLease(raw: Json | null | undefined): StudioLease | nu
     threadKeys: Array.isArray(obj.threadKeys)
       ? obj.threadKeys.filter((k): k is string => typeof k === 'string')
       : undefined,
-    agentId: typeof obj.agentId === 'string' ? obj.agentId : '',
+    sbSlug: typeof obj.sbSlug === 'string' ? obj.sbSlug : '',
     sbId: typeof obj.sbId === 'string' ? obj.sbId : null,
     acquiredAt: typeof obj.acquiredAt === 'string' ? obj.acquiredAt : '',
     heartbeatAt: typeof obj.heartbeatAt === 'string' ? obj.heartbeatAt : '',
@@ -646,8 +646,7 @@ export class StudioLeaseService {
    * authorizes a mutation.
    */
   async acquire(req: AcquireRequest): Promise<AcquireResult> {
-    const sbId =
-      req.sbId !== undefined ? req.sbId : await this.resolveSbId(req.userId, req.agentId);
+    const sbId = req.sbId !== undefined ? req.sbId : await this.resolveSbId(req.userId, req.sbSlug);
 
     // Bounded validate→grant ladder. EVERY authoritative read passes through
     // refuseUngrantable() before any grant path runs, and a lost CAS
@@ -666,7 +665,7 @@ export class StudioLeaseService {
         sessionId: req.sessionId,
         threadKey: req.threadKey,
         threadKeys: [req.threadKey],
-        agentId: req.agentId,
+        sbSlug: req.sbSlug,
         sbId,
         acquiredAt: now,
         heartbeatAt: now,
@@ -688,7 +687,7 @@ export class StudioLeaseService {
         await this.logEvent(req.userId, req.studioId, 'acquired', {
           sessionId: req.sessionId,
           threadKey: req.threadKey,
-          agentId: req.agentId,
+          sbSlug: req.sbSlug,
           sbId,
           reason: req.reason,
         });
@@ -703,7 +702,7 @@ export class StudioLeaseService {
         await this.logEvent(req.userId, req.studioId, 'conflict', {
           sessionId: req.sessionId,
           threadKey: req.threadKey,
-          agentId: req.agentId,
+          sbSlug: req.sbSlug,
           sbId,
           reason: `path held by sibling studio ${vacant.conflictStudioId} (${vacant.conflictHolder?.threadKey ?? 'unknown thread'})`,
         });
@@ -830,7 +829,7 @@ export class StudioLeaseService {
     await this.logEvent(req.userId, req.studioId, 'released', {
       sessionId: lease?.holderSessionId ?? lease?.sessionId,
       threadKey: lease?.heldThreadKey ?? lease?.threadKey,
-      agentId: lease?.agentId ?? req.agentId,
+      sbSlug: lease?.sbSlug ?? req.sbSlug,
       sbId: lease?.sbId,
       reason: 'worktree-absent-retired',
     });
@@ -995,7 +994,7 @@ export class StudioLeaseService {
       threadKey: QUARANTINE_THREAD_KEY,
       heldThreadKey: holder?.heldThreadKey ?? holder?.threadKey ?? fallbackThreadKey,
       holderSessionId: holder?.holderSessionId ?? holder?.sessionId,
-      agentId: holder?.agentId ?? 'system',
+      sbSlug: holder?.sbSlug ?? 'system',
       sbId: holder?.sbId ?? null,
       acquiredAt: holder?.acquiredAt ?? new Date().toISOString(),
       heartbeatAt: new Date().toISOString(), // rate-limits retries to LEASE_STALE_MS
@@ -1071,7 +1070,7 @@ export class StudioLeaseService {
         await this.logEvent(req.userId, req.studioId, 'released', {
           sessionId: holder.holderSessionId ?? holder.sessionId,
           threadKey: holder.heldThreadKey ?? holder.threadKey,
-          agentId: holder.agentId,
+          sbSlug: holder.sbSlug,
           sbId: holder.sbId,
           reason: 'worktree-absent-retired',
           detail: { previousHolder: holder as unknown as Json },
@@ -1097,7 +1096,7 @@ export class StudioLeaseService {
         await this.logEvent(req.userId, req.studioId, 'conflict', {
           sessionId: recovery.holderSessionId,
           threadKey: recovery.heldThreadKey,
-          agentId: holder.agentId,
+          sbSlug: holder.sbSlug,
           sbId: holder.sbId,
           reason: 'rescue-failed-quarantined',
           detail: {
@@ -1134,7 +1133,7 @@ export class StudioLeaseService {
       await this.logEvent(req.userId, req.studioId, 'reclaimed', {
         sessionId: req.sessionId,
         threadKey: req.threadKey,
-        agentId: req.agentId,
+        sbSlug: req.sbSlug,
         sbId: lease.sbId,
         reason: eventReason,
         detail: {
@@ -1157,7 +1156,7 @@ export class StudioLeaseService {
     await this.logEvent(req.userId, req.studioId, 'reclaimed', {
       sessionId: req.sessionId,
       threadKey: req.threadKey,
-      agentId: req.agentId,
+      sbSlug: req.sbSlug,
       sbId: lease.sbId,
       reason: eventReason,
       detail: { previousHolder: holder as unknown as Json },
@@ -1210,7 +1209,7 @@ export class StudioLeaseService {
         await this.logEvent(req.userId, req.studioId, 'acquired', {
           sessionId: req.sessionId,
           threadKey: req.threadKey,
-          agentId: req.agentId,
+          sbSlug: req.sbSlug,
           sbId: lease.sbId ?? holder.sbId,
           reason: 'multiplex-append',
           detail: { threadKeys: appended.threadKeys as unknown as Json },
@@ -1270,7 +1269,7 @@ export class StudioLeaseService {
       const adopted: StudioLease = {
         ...holder,
         sessionId: req.sessionId,
-        agentId: req.agentId,
+        sbSlug: req.sbSlug,
         sbId: lease.sbId ?? holder.sbId,
         heartbeatAt: now,
         reason: req.reason ?? holder.reason,
@@ -1846,7 +1845,7 @@ export class StudioLeaseService {
     await this.logEvent(userId, studioId, 'released', {
       sessionId: lease.sessionId,
       threadKey: lease.threadKey,
-      agentId: lease.agentId,
+      sbSlug: lease.sbSlug,
       sbId: lease.sbId,
       reason: opts.reason,
       detail: {
@@ -2035,7 +2034,7 @@ export class StudioLeaseService {
           await this.logEvent(row.user_id, row.id, 'released', {
             sessionId: claim.holderSessionId,
             threadKey: claim.heldThreadKey,
-            agentId: lease.agentId,
+            sbSlug: lease.sbSlug,
             sbId: lease.sbId,
             reason:
               lease.claimKind === 'teardown'
@@ -2066,7 +2065,7 @@ export class StudioLeaseService {
         await this.logEvent(row.user_id, row.id, 'conflict', {
           sessionId: claim.holderSessionId,
           threadKey: claim.heldThreadKey,
-          agentId: lease.agentId,
+          sbSlug: lease.sbSlug,
           sbId: lease.sbId,
           reason: 'expiry-rescue-failed-quarantined',
           detail: { rescue: rescue as unknown as Json },
@@ -2094,7 +2093,7 @@ export class StudioLeaseService {
       await this.logEvent(row.user_id, row.id, 'expired', {
         sessionId: claim.holderSessionId,
         threadKey: claim.heldThreadKey,
-        agentId: lease.agentId,
+        sbSlug: lease.sbSlug,
         sbId: lease.sbId,
         reason: lease.quarantined
           ? 'quarantine-recovered'
@@ -2210,10 +2209,10 @@ export class StudioLeaseService {
     return this.casLease(studioId, userId, claim, null);
   }
 
-  private async resolveSbId(userId: string, agentId: string): Promise<string | null> {
-    if (!agentId) return null;
+  private async resolveSbId(userId: string, sbSlug: string): Promise<string | null> {
+    if (!sbSlug) return null;
     try {
-      return await resolveIdentityId(this.supabase, userId, agentId);
+      return await resolveIdentityId(this.supabase, userId, sbSlug);
     } catch {
       return null;
     }
@@ -2226,7 +2225,7 @@ export class StudioLeaseService {
     opts: {
       sessionId?: string;
       threadKey?: string;
-      agentId?: string;
+      sbSlug?: string;
       sbId?: string | null;
       reason?: string;
       detail?: Record<string, Json | null>;
@@ -2236,15 +2235,15 @@ export class StudioLeaseService {
       const sbId =
         opts.sbId !== undefined
           ? opts.sbId
-          : opts.agentId
-            ? await this.resolveSbId(userId, opts.agentId)
+          : opts.sbSlug
+            ? await this.resolveSbId(userId, opts.sbSlug)
             : null;
       const { error } = await this.supabase.from('studio_lease_events').insert({
         user_id: userId,
         studio_id: studioId,
         session_id: opts.sessionId ?? null,
         thread_key: opts.threadKey ?? null,
-        agent_id: opts.agentId ?? null,
+        agent_id: opts.sbSlug ?? null,
         sb_id: sbId ?? null,
         event,
         reason: opts.reason ?? null,

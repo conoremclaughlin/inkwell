@@ -54,7 +54,7 @@ export function ThreadRow({ spine, onPress }: { spine: ThreadSpine; onPress: () 
           <View style={styles.liveBadge}>
             <View style={styles.liveDot} />
             <Text style={styles.liveText}>
-              {live.length === 1 ? `${live[0].agentId ?? 'agent'} live` : `${live.length} live`}
+              {live.length === 1 ? `${live[0].sbSlug ?? 'agent'} live` : `${live.length} live`}
             </Text>
           </View>
         ) : closed ? (

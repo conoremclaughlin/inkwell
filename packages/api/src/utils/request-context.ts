@@ -30,17 +30,17 @@ export interface RequestContextData {
   /** Platform-specific user ID */
   platformId?: string;
   /** Agent ID if known (text label) */
-  agentId?: string;
+  sbSlug?: string;
   /** Canonical agent_identities UUID (strongest identity binding) */
   sbId?: string;
   /**
    * Identity carried by the bearer token ITSELF, before any session-derived
-   * enrichment. `agentId`/`sbId` above may have been filled in from the
+   * enrichment. `sbSlug`/`sbId` above may have been filled in from the
    * caller's ambient session so that dispatch and workspace derivation work
    * for ink-routed user-token calls — useful for routing, but not an
    * authentication fact. Authorization must use these fields instead.
    */
-  tokenAgentId?: string;
+  tokenSlug?: string;
   tokenSbId?: string;
   /**
    * Session and contact the bearer token was MINTED for — signed, therefore
@@ -90,7 +90,7 @@ let sessionContext: Omit<RequestContextData, 'timestamp'> | null = null;
 
 // Session-scoped identity pin (immutable once set by bootstrap or token)
 // Prevents mid-session identity changes (e.g. via prompt injection)
-let pinnedSessionAgentId: string | null = null;
+let pinnedSessionSlug: string | null = null;
 
 /**
  * The authenticated slice of the request context, derived from the bearer
@@ -105,7 +105,7 @@ let pinnedSessionAgentId: string | null = null;
 export function tokenIdentityContext(
   tokenIdentity:
     | {
-        agentId?: string;
+        sbSlug?: string;
         sbId?: string;
         sessionId?: string;
         contactId?: string;
@@ -113,10 +113,10 @@ export function tokenIdentityContext(
     | null
     | undefined
 ): Partial<RequestContextData> {
-  if (!tokenIdentity?.agentId && !tokenIdentity?.sbId) return {};
+  if (!tokenIdentity?.sbSlug && !tokenIdentity?.sbId) return {};
   return {
     agentTokenBound: true,
-    ...(tokenIdentity.agentId ? { tokenAgentId: tokenIdentity.agentId } : {}),
+    ...(tokenIdentity.sbSlug ? { tokenSlug: tokenIdentity.sbSlug } : {}),
     ...(tokenIdentity.sbId ? { tokenSbId: tokenIdentity.sbId } : {}),
     ...(tokenIdentity.sessionId ? { tokenSessionId: tokenIdentity.sessionId } : {}),
     ...(tokenIdentity.contactId ? { tokenContactId: tokenIdentity.contactId } : {}),
@@ -228,7 +228,7 @@ export function hasUserContext(): boolean {
  * Called by bootstrap() and when an agent-bound token is first used.
  * Throws if already pinned to a different identity.
  */
-export function pinSessionAgent(agentId: string): void {
+export function pinSessionAgent(sbSlug: string): void {
   const reqCtx = getRequestContext();
   if (reqCtx) {
     // HTTP request scope: identity is token-bound per request.
@@ -242,18 +242,18 @@ export function pinSessionAgent(agentId: string): void {
     return;
   }
 
-  if (pinnedSessionAgentId !== null && pinnedSessionAgentId !== agentId) {
+  if (pinnedSessionSlug !== null && pinnedSessionSlug !== sbSlug) {
     throw new Error(
-      `Identity already pinned to "${pinnedSessionAgentId}". Cannot change to "${agentId}".`
+      `Identity already pinned to "${pinnedSessionSlug}". Cannot change to "${sbSlug}".`
     );
   }
-  pinnedSessionAgentId = agentId;
+  pinnedSessionSlug = sbSlug;
 }
 
 /**
  * Get the pinned agent identity.
  *
- * In HTTP mode (request context exists): returns agentId from the token only.
+ * In HTTP mode (request context exists): returns sbSlug from the token only.
  *   The global session pin is NEVER consulted — it's process-global and would
  *   leak identity across concurrent requests from different users/agents.
  *
@@ -262,17 +262,17 @@ export function pinSessionAgent(agentId: string): void {
  *
  * Returns null if no identity is pinned (human user or pre-bootstrap).
  */
-export function getPinnedAgentId(): string | null {
+export function getPinnedSlug(): string | null {
   const reqCtx = getRequestContext();
   if (reqCtx) {
-    // HTTP mode: only trust the token-bound agentId, never the global pin
-    return reqCtx.agentId ?? null;
+    // HTTP mode: only trust the token-bound sbSlug, never the global pin
+    return reqCtx.sbSlug ?? null;
   }
   if (process.env.MCP_TRANSPORT === 'http') {
     return null;
   }
   // stdio mode: use the session pin from bootstrap()
-  return pinnedSessionAgentId;
+  return pinnedSessionSlug;
 }
 
 /**
@@ -280,7 +280,7 @@ export function getPinnedAgentId(): string | null {
  * Used when cleaning up session state.
  */
 export function clearPinnedAgent(): void {
-  pinnedSessionAgentId = null;
+  pinnedSessionSlug = null;
 }
 
 /**

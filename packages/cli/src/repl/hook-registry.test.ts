@@ -16,7 +16,7 @@ function makeLedger(): ContextLedger {
 
 function makeRuntime(overrides?: Partial<HookRuntimeState>): HookRuntimeState {
   return {
-    agentId: 'wren',
+    sbSlug: 'wren',
     backend: 'claude',
     turnCount: 0,
     ...overrides,

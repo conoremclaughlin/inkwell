@@ -54,7 +54,7 @@ function renderTemplate(template: string, vars: Record<string, string>): string 
 // ============================================================================
 
 export interface BootstrapIdentity {
-  agentId: string;
+  sbSlug: string;
   name?: string;
   role?: string;
   description?: string;
@@ -75,7 +75,7 @@ interface BootstrapResponse {
  * Fetch the shared values document from the Inkwell server.
  *
  * Values only. Siblings used to be read from this same response, but bootstrap
- * is called here as the synthetic agentId 'awakening' — which has no identity
+ * is called here as the synthetic sbSlug 'awakening' — which has no identity
  * row — so its sibling list is always empty. See fetchSiblings().
  */
 async function fetchFromCloud(config: UserConfig): Promise<{ sharedValues: string } | null> {
@@ -84,7 +84,7 @@ async function fetchFromCloud(config: UserConfig): Promise<{ sharedValues: strin
       'bootstrap',
       {
         email: config.email,
-        agentId: 'awakening', // temporary identity for bootstrap
+        sbSlug: 'awakening', // temporary identity for bootstrap
       },
       {
         timeoutMs: 5000,
@@ -101,7 +101,7 @@ async function fetchFromCloud(config: UserConfig): Promise<{ sharedValues: strin
  * Fetch siblings from agent_identities — the authoritative list.
  *
  * bootstrap() is the wrong question to ask here. We call it as the synthetic
- * agentId 'awakening', which has no identity row, so identityCore.siblings
+ * sbSlug 'awakening', which has no identity row, so identityCore.siblings
  * comes back empty and the prompt confidently told a new SB "No other SBs yet
  * — you may be the first" while five of them were already in the database.
  * (The SB who caught this called meet_family and found all of them.)
@@ -165,7 +165,7 @@ export function buildAwakeningPrompt(
   } else if (siblings.length > 0) {
     siblingsSection = siblings
       .map((s) => {
-        const parts = [`**${s.name || s.agentId}** (\`${s.agentId}\`)`];
+        const parts = [`**${s.name || s.sbSlug}** (\`${s.sbSlug}\`)`];
         if (s.role) parts.push(` — ${s.role}`);
         return `- ${parts.join('')}`;
       })
@@ -389,7 +389,7 @@ async function awakenCommand(options: {
       )
     );
   } else if (siblings.length > 0) {
-    console.log(chalk.dim(`  Siblings: ${siblings.map((s) => s.name || s.agentId).join(', ')}`));
+    console.log(chalk.dim(`  Siblings: ${siblings.map((s) => s.name || s.sbSlug).join(', ')}`));
   }
 
   // 2. Build the awakening prompt
@@ -441,7 +441,7 @@ async function awakenCommand(options: {
 
   // 4b. Prepare and spawn an external backend CLI
   const prepared = adapter!.prepare({
-    agentId: 'nascent',
+    sbSlug: 'nascent',
     promptParts: [],
     passthroughArgs: [],
     // Undefined is meaningful: adapters skip --model entirely, so the backend

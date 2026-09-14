@@ -116,7 +116,7 @@ export interface HeartbeatEscalationDeps {
    */
   sendToChannel: (response: ChannelResponse) => Promise<unknown>;
   /** Fallback agent when the reminder carries no `sb_id`. */
-  defaultAgentId: string;
+  defaultSlug: string;
   /**
    * Durable record of which notices actually reached a human. Injectable so the
    * suppression rule can be tested against a fake rather than a mocked query
@@ -132,7 +132,7 @@ export interface HeartbeatEscalation {
 }
 
 export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): HeartbeatEscalation {
-  const { client, sendToChannel, defaultAgentId } = deps;
+  const { client, sendToChannel, defaultSlug } = deps;
   const store = deps.store ?? createHeartbeatNotificationStore(client);
 
   /**
@@ -171,7 +171,7 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
    * Resolve the agent whose beat this was, so the notice lands in their inbox.
    *
    * Returns null when the beat names an owner we could not resolve. That is not
-   * the same as having no owner: `defaultAgentId` is the answer for a beat that
+   * the same as having no owner: `defaultSlug` is the answer for a beat that
    * genuinely belongs to nobody, and using it for an owner we merely failed to
    * look up would file one SB's "Your scheduled heartbeat" notice in a different
    * SB's inbox. An unrelated SB reading that would be told a beat of theirs is
@@ -186,8 +186,8 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
    * coupling the two-destination split exists to prevent. The channel alert
    * below does not depend on this resolving at all.
    */
-  const resolveFailedAgentId = async (reminder: DueReminder): Promise<string | null> => {
-    if (!reminder.sb_id) return defaultAgentId;
+  const resolveFailedSlug = async (reminder: DueReminder): Promise<string | null> => {
+    if (!reminder.sb_id) return defaultSlug;
     try {
       const { data: identity, error } = await client
         .from('agent_identities')
@@ -269,7 +269,7 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
     consecutive: number,
     context: HeartbeatEscalationContext
   ): Promise<{ alerted: boolean }> => {
-    const failedAgentId = await resolveFailedAgentId(reminder);
+    const failedSlug = await resolveFailedSlug(reminder);
     const classification = classifyError({ errorText: error });
 
     // DESTINATION ONE: the durable copy. Kept even though it cannot be the only
@@ -278,7 +278,7 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
     // the channel attempt below, which is the one that can actually reach a
     // human while the SB is down.
     let inboxError: string | null = null;
-    if (failedAgentId === null) {
+    if (failedSlug === null) {
       // The beat names an owner we could not resolve. Skipping the durable copy
       // loses a record; guessing a recipient would plant a false outage report
       // in an uninvolved SB's inbox. The channel alert below is unaffected.
@@ -287,7 +287,7 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
       try {
         const { error: insertError } = await client.from('agent_inbox').insert({
           recipient_user_id: reminder.user_id,
-          recipient_agent_id: failedAgentId,
+          recipient_agent_id: failedSlug,
           sender_agent_id: null,
           message_type: 'notification',
           priority: consecutive >= 3 ? 'urgent' : 'high',
@@ -315,7 +315,7 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
     if (inboxError) {
       logger.error('[Heartbeat] Durable inbox copy failed — continuing to the channel', {
         reminderId: reminder.id,
-        agentId: failedAgentId,
+        sbSlug: failedSlug,
         error: inboxError,
       });
     }
@@ -325,7 +325,7 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
     if (!reachable.ok) {
       logger.error('[Heartbeat] Escalated failure — no external destination', {
         reminderId: reminder.id,
-        agentId: failedAgentId,
+        sbSlug: failedSlug,
         consecutive,
         category: classification.category,
         alertSent: false,
@@ -346,7 +346,7 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
       await store.markCoveredBySibling(key);
       logger.warn('[Heartbeat] Sibling beat already alerted this destination — inbox only', {
         reminderId: reminder.id,
-        agentId: failedAgentId,
+        sbSlug: failedSlug,
         channel: reminder.delivery_channel,
         category: classification.category,
       });
@@ -359,7 +359,7 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
     if (!shouldSend) {
       logger.warn('[Heartbeat] Outage already announced for this episode — inbox only', {
         reminderId: reminder.id,
-        agentId: failedAgentId,
+        sbSlug: failedSlug,
         consecutive,
         noticeStatus: record?.status,
         noticeAttempts: record?.attempts,
@@ -382,7 +382,7 @@ export function createHeartbeatEscalation(deps: HeartbeatEscalationDeps): Heartb
 
     logger.error('[Heartbeat] Escalated failure', {
       reminderId: reminder.id,
-      agentId: failedAgentId,
+      sbSlug: failedSlug,
       consecutive,
       category: classification.category,
       alertSent: alert.sent,

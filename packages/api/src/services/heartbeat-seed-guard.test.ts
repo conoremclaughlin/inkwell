@@ -63,7 +63,7 @@ import { logger } from '../utils/logger';
 const params = {
   userId: 'user-1',
   sbId: 'sb-new',
-  agentId: 'myra',
+  sbSlug: 'myra',
   deliveryChannel: 'telegram',
   deliveryTarget: '123',
 };
@@ -81,7 +81,7 @@ describe('ensureDefaultReminders — candidate lookup failure (PR #595, Lumen)',
     expect(state.inserts).toHaveLength(0);
     expect(logger.warn).toHaveBeenCalledWith(
       expect.stringContaining('identity lookup failed'),
-      expect.objectContaining({ agentId: 'myra', sbId: 'sb-new' })
+      expect.objectContaining({ sbSlug: 'myra', sbId: 'sb-new' })
     );
   });
 

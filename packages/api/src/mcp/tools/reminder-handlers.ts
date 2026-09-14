@@ -117,7 +117,7 @@ export const createReminderSchema = z.object({
   ...userIdentifierSchema.shape,
   title: z.string().min(1).max(500).describe('Reminder title/message'),
   description: z.string().optional().describe('Additional details'),
-  agentId: z
+  sbSlug: z
     .string()
     .optional()
     .describe('Agent that should handle this reminder (e.g., "myra", "lumen"). Resolved to sb_id.'),
@@ -125,7 +125,7 @@ export const createReminderSchema = z.object({
     .string()
     .guid()
     .optional()
-    .describe('Direct identity UUID from agent_identities. Takes precedence over agentId.'),
+    .describe('Direct identity UUID from agent_identities. Takes precedence over sbSlug.'),
   deliveryChannel: z
     .enum(['telegram', 'whatsapp', 'email'])
     .optional()
@@ -212,7 +212,7 @@ export async function handleCreateReminder(
       );
     }
 
-    // Resolve sb_id from agentId or direct sbId (always scoped to user)
+    // Resolve sb_id from sbSlug or direct sbId (always scoped to user)
     let sbId: string | null = args.sbId || null;
     if (sbId) {
       // Validate direct sbId belongs to this user
@@ -228,11 +228,11 @@ export async function handleCreateReminder(
           true
         );
       }
-    } else if (args.agentId) {
+    } else if (args.sbSlug) {
       const { data: identity } = await supabase
         .from('agent_identities')
         .select('id')
-        .eq('agent_id', args.agentId)
+        .eq('agent_id', args.sbSlug)
         .eq('user_id', resolved.user.id)
         .limit(1)
         .single();
@@ -242,7 +242,7 @@ export async function handleCreateReminder(
         return mcpResponse(
           {
             success: false,
-            error: `Unknown agent "${args.agentId}" for this user. Check agent_identities table.`,
+            error: `Unknown agent "${args.sbSlug}" for this user. Check agent_identities table.`,
           },
           true
         );
@@ -340,7 +340,7 @@ export async function handleCreateReminder(
         id: data.id,
         title: data.title,
         description: data.description,
-        agentId: args.agentId || null,
+        sbSlug: args.sbSlug || null,
         sbId: data.sb_id,
         deliveryChannel: data.delivery_channel,
         deliveryTarget: data.delivery_target,
@@ -352,7 +352,7 @@ export async function handleCreateReminder(
       },
       ...(!sbId
         ? {
-            hint: 'Consider adding agentId (e.g., "myra") to route this reminder to a specific agent.',
+            hint: 'Consider adding sbSlug (e.g., "myra") to route this reminder to a specific agent.',
           }
         : {}),
     });
@@ -373,7 +373,7 @@ export async function handleCreateReminder(
 
 export const listRemindersSchema = z.object({
   ...userIdentifierSchema.shape,
-  agentId: z
+  sbSlug: z
     .string()
     .optional()
     .describe('Filter reminders assigned to a specific agent (e.g., "myra")'),
@@ -397,13 +397,13 @@ export async function handleListReminders(
 
     const supabase = getSupabase();
 
-    // Resolve sb_id filter if agentId provided (scoped to user)
+    // Resolve sb_id filter if sbSlug provided (scoped to user)
     let sbIdFilter: string | undefined;
-    if (args.agentId) {
+    if (args.sbSlug) {
       const { data: identity } = await supabase
         .from('agent_identities')
         .select('id')
-        .eq('agent_id', args.agentId)
+        .eq('agent_id', args.sbSlug)
         .eq('user_id', resolved.user.id)
         .limit(1)
         .single();
@@ -414,7 +414,7 @@ export async function handleListReminders(
         return mcpResponse({
           success: true,
           reminders: [],
-          hint: `No agent "${args.agentId}" found for this user. No reminders to show.`,
+          hint: `No agent "${args.sbSlug}" found for this user. No reminders to show.`,
         });
       }
     }
@@ -510,7 +510,7 @@ export const updateReminderSchema = z.object({
   reminderId: z.string().guid().describe('Reminder ID to update'),
   title: z.string().min(1).max(500).optional(),
   description: z.string().optional(),
-  agentId: z.string().optional().describe('Reassign to a different agent (e.g., "myra")'),
+  sbSlug: z.string().optional().describe('Reassign to a different agent (e.g., "myra")'),
   cronExpression: z
     .string()
     .optional()
@@ -553,11 +553,11 @@ export async function handleUpdateReminder(
     const updates: Record<string, unknown> = {};
     if (args.title !== undefined) updates.title = args.title;
     if (args.description !== undefined) updates.description = args.description;
-    if (args.agentId !== undefined) {
+    if (args.sbSlug !== undefined) {
       const { data: identity } = await supabase
         .from('agent_identities')
         .select('id')
-        .eq('agent_id', args.agentId)
+        .eq('agent_id', args.sbSlug)
         .eq('user_id', resolved.user.id)
         .limit(1)
         .single();
@@ -565,7 +565,7 @@ export async function handleUpdateReminder(
         updates.sb_id = identity.id;
       } else {
         return mcpResponse(
-          { success: false, error: `Unknown agent "${args.agentId}" for this user.` },
+          { success: false, error: `Unknown agent "${args.sbSlug}" for this user.` },
           true
         );
       }

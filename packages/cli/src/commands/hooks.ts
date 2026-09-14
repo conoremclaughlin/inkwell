@@ -24,7 +24,7 @@ import { fileURLToPath } from 'url';
 import { execSync } from 'child_process';
 import { homedir } from 'os';
 import { createHash } from 'crypto';
-import { resolveAgentId, readIdentityJson, readRoleMd } from '../backends/identity.js';
+import { resolveSlug, readIdentityJson, readRoleMd } from '../backends/identity.js';
 import { getValidAccessToken, getValidDelegatedAccessToken } from '../auth/tokens.js';
 import {
   findRuntimeSessionByLinkId,
@@ -261,9 +261,9 @@ export async function callPcpTool(
   const serverUrl = getPcpServerUrl();
   const url = `${serverUrl}/mcp`;
   const hasInjectedEnvToken = Boolean(process.env.INK_ACCESS_TOKEN?.trim());
-  const delegatedAgentId =
-    typeof args.agentId === 'string' && args.agentId.trim().length > 0
-      ? args.agentId.trim().toLowerCase()
+  const delegatedSlug =
+    typeof args.sbSlug === 'string' && args.sbSlug.trim().length > 0
+      ? args.sbSlug.trim().toLowerCase()
       : null;
 
   // Propagate Inkwell session/studio IDs so the server can resolve studio scope and
@@ -277,7 +277,7 @@ export async function callPcpTool(
     'x-ink-caller-profile': 'runtime',
     // Forward-looking runtime identity signal for stricter server-side enforcement.
     // Today, effective agent identity is still sourced from JWT claims.
-    ...(delegatedAgentId ? { 'x-ink-agent-id': delegatedAgentId } : {}),
+    ...(delegatedSlug ? { 'x-ink-agent-id': delegatedSlug } : {}),
     ...(pcpSessionId ? { 'x-ink-session-id': pcpSessionId } : {}),
     ...(pcpStudioId ? { 'x-ink-studio-id': pcpStudioId } : {}),
   };
@@ -307,8 +307,8 @@ export async function callPcpTool(
     allowEnvToken?: boolean;
     skipDelegated?: boolean;
   }): Promise<{ token: string | null; source: 'delegated' | 'base' }> => {
-    if (delegatedAgentId && !options?.skipDelegated) {
-      const delegatedToken = getValidDelegatedAccessToken(delegatedAgentId);
+    if (delegatedSlug && !options?.skipDelegated) {
+      const delegatedToken = getValidDelegatedAccessToken(delegatedSlug);
       if (delegatedToken) {
         return { token: delegatedToken, source: 'delegated' };
       }
@@ -487,14 +487,14 @@ function resolveActivePcpSessionId(cwd: string): string | undefined {
   const detectedBackend = detectBackend(cwd);
   const sessionBackend = normalizeSessionBackend(detectedBackend.name);
   const { studioId } = getIdentitySessionContext(cwd);
-  const agentId = resolveAgentId() || 'unknown';
+  const sbSlug = resolveSlug() || 'unknown';
 
   // 2. INK_RUNTIME_LINK_ID → sessions.json lookup (server-spawned sessions)
   const runtimeLinkId = process.env.INK_RUNTIME_LINK_ID;
   if (runtimeLinkId) {
     const linked = findRuntimeSessionByLinkId(cwd, runtimeLinkId, {
       backend: sessionBackend,
-      agentId,
+      sbSlug,
       ...(studioId ? { studioId } : {}),
     });
     if (linked?.pcpSessionId) return linked.pcpSessionId;
@@ -542,7 +542,7 @@ function getRuntimeLinkId(): string | undefined {
 
 async function findPcpSessionByBackendSessionId(
   config: PcpConfig | null,
-  agentId: string,
+  sbSlug: string,
   sessionBackend: string,
   backendSessionId: string,
   studioId?: string
@@ -550,7 +550,7 @@ async function findPcpSessionByBackendSessionId(
   try {
     const listArgs: Record<string, unknown> = {
       email: config?.email,
-      agentId,
+      sbSlug,
       limit: 50,
       ...(studioId ? { studioId } : {}),
     };
@@ -588,7 +588,7 @@ async function findPcpSessionByBackendSessionId(
 async function reconcileBackendSignal(
   cwd: string,
   config: PcpConfig | null,
-  agentId: string,
+  sbSlug: string,
   stdin: Record<string, unknown>,
   options?: {
     initialPcpSessionId?: string;
@@ -605,7 +605,7 @@ async function reconcileBackendSignal(
   const runtimeLinkId = getRuntimeLinkId();
   sbDebugLog('hooks', 'reconcile_start', {
     sessionBackend,
-    agentId,
+    sbSlug,
     initialPcpSessionId: options?.initialPcpSessionId || null,
     initialThreadKey: options?.initialThreadKey || null,
     extractedBackendSessionId: backendSessionId || null,
@@ -620,7 +620,7 @@ async function reconcileBackendSignal(
   if (!pcpSessionId && runtimeLinkId) {
     const linked = findRuntimeSessionByLinkId(cwd, runtimeLinkId, {
       backend: sessionBackend,
-      agentId,
+      sbSlug,
       ...(studioId ? { studioId } : {}),
     });
     if (linked?.pcpSessionId) {
@@ -638,7 +638,7 @@ async function reconcileBackendSignal(
   if (!pcpSessionId && backendSessionId) {
     const linkedByBackendSessionId = listRuntimeSessions(cwd, sessionBackend).find(
       (session) =>
-        session.agentId === agentId &&
+        session.sbSlug === sbSlug &&
         (!studioId || session.studioId === studioId) &&
         (session.backendSessionId === backendSessionId ||
           session.backendSessionIds?.includes(backendSessionId))
@@ -660,7 +660,7 @@ async function reconcileBackendSignal(
     const local = listRuntimeSessions(cwd, sessionBackend).find(
       (session) =>
         session.pcpSessionId === pcpSessionId &&
-        session.agentId === agentId &&
+        session.sbSlug === sbSlug &&
         (!studioId || session.studioId === studioId)
     );
     hasLocalBackendLink = !!(
@@ -674,7 +674,7 @@ async function reconcileBackendSignal(
     // Reconcile mismatched pcpSessionId/backendSessionId by checking existing server-side links first.
     const matched = await findPcpSessionByBackendSessionId(
       config,
-      agentId,
+      sbSlug,
       sessionBackend,
       backendSessionId,
       studioId
@@ -710,7 +710,7 @@ async function reconcileBackendSignal(
   upsertRuntimeSession(cwd, {
     pcpSessionId,
     backend: sessionBackend,
-    agentId,
+    sbSlug,
     ...(sbId ? { sbId } : {}),
     ...(studioId ? { studioId } : {}),
     ...(threadKey ? { threadKey } : {}),
@@ -720,7 +720,7 @@ async function reconcileBackendSignal(
     updatedAt: new Date().toISOString(),
   });
   setCurrentRuntimeSession(cwd, pcpSessionId, sessionBackend, {
-    agentId,
+    sbSlug,
     ...(sbId ? { sbId } : {}),
     ...(studioId ? { studioId } : {}),
   });
@@ -767,7 +767,7 @@ export interface TakeoverResult {
 export async function updateRuntimeGenerationState(
   cwd: string,
   _config: PcpConfig | null,
-  agentId: string,
+  sbSlug: string,
   lifecycle: 'running' | 'idle' | 'compacting',
   // Which hook fired. Lifecycle values are ambiguous (post-compact and
   // on-stop both send 'idle'); the server uses the event to manage the
@@ -840,7 +840,7 @@ export async function updateRuntimeGenerationState(
           ...(opts?.reclaimOf ? { reclaimOf: opts.reclaimOf } : {}),
           ...(opts?.attemptId ? { attemptId: opts.attemptId } : {}),
           ...(opts?.studioId && opts.studioId !== 'main' ? { studioId: opts.studioId } : {}),
-          agentId,
+          sbSlug,
           workingDir: cwd,
         }),
         signal: AbortSignal.timeout(5000),
@@ -970,7 +970,7 @@ const TAKEOVER_FAILURE_CAUSES: Record<
 export function handleFailedTakeover(
   backend: Pick<HookCapabilities, 'name'>,
   opts: {
-    agentId: string;
+    sbSlug: string;
     writePendingTakeover: () => void;
     /** Why the takeover failed; absent when the caller could not classify it. */
     reason?: TakeoverFailureReason;
@@ -985,7 +985,7 @@ export function handleFailedTakeover(
   const reason = opts.reason ?? 'unavailable';
   const wrapped = Boolean(opts.wrapperGeneration);
   hookLog('on_prompt_takeover_failed', {
-    agentId: opts.agentId,
+    sbSlug: opts.sbSlug,
     backend: backend.name,
     reason,
     wrapped,
@@ -1019,7 +1019,7 @@ export function handleFailedTakeover(
     opts.writePendingTakeover();
   } catch (err) {
     hookLog('on_prompt_takeover_marker_failed', {
-      agentId: opts.agentId,
+      sbSlug: opts.sbSlug,
       error: String(err),
     });
   }
@@ -1214,7 +1214,7 @@ function buildSessionsBlock(sessions: Array<Record<string, unknown>> | undefined
   const lines = ['### Active Sessions'];
   for (const s of sessions) {
     const id = (s.id as string)?.substring(0, 8) || 'unknown';
-    const agent = s.agentId ? ` (${s.agentId})` : '';
+    const agent = s.sbSlug ? ` (${s.sbSlug})` : '';
     const phase = s.currentPhase ? ` — phase: ${s.currentPhase}` : '';
     const lifecycle = s.lifecycle ? ` [${s.lifecycle}]` : '';
     lines.push(`- ${id}${agent}${lifecycle}${phase}`);
@@ -2117,14 +2117,14 @@ async function preCompactHandler(options?: { backend?: string }): Promise<void> 
 
   const cwd = process.cwd();
   const config = getPcpConfig();
-  const agentId = resolveAgentId() || 'unknown';
+  const sbSlug = resolveSlug() || 'unknown';
   const backend = resolveLifecycleBackend(cwd, options?.backend);
 
   // Only set 'compacting' lifecycle if this backend has a postCompact event
   // that will reset it to 'idle'. Without postCompact (e.g., Gemini/PreCompress),
   // the lifecycle gets stuck at 'compacting' permanently.
   if (backend.events.postCompact) {
-    await updateRuntimeGenerationState(cwd, config, agentId, 'compacting', 'pre-compact');
+    await updateRuntimeGenerationState(cwd, config, sbSlug, 'compacting', 'pre-compact');
   }
 
   process.stdout.write(loadTemplate('hook-pre-compact'));
@@ -2135,11 +2135,11 @@ async function postCompactHandler(): Promise<void> {
 
   const cwd = process.cwd();
   const config = getPcpConfig();
-  const agentId = resolveAgentId() || 'unknown';
+  const sbSlug = resolveSlug() || 'unknown';
 
   // Reset lifecycle from compacting back to idle. NOT a turn boundary —
   // the same turn resumes after compaction (PR #492 round 4).
-  await updateRuntimeGenerationState(cwd, config, agentId, 'idle', 'post-compact');
+  await updateRuntimeGenerationState(cwd, config, sbSlug, 'idle', 'post-compact');
 
   let identityBlock = '';
   let memoriesBlock = '';
@@ -2150,7 +2150,7 @@ async function postCompactHandler(): Promise<void> {
   try {
     const bootstrap = await callPcpTool('bootstrap', {
       email: config?.email,
-      agentId,
+      sbSlug,
       postCompact: true,
     });
     identityBlock = buildIdentityBlock(bootstrap);
@@ -2164,7 +2164,7 @@ async function postCompactHandler(): Promise<void> {
   try {
     const inbox = await callPcpTool('get_inbox', {
       email: config?.email,
-      agentId,
+      sbSlug,
       limit: 10,
     });
     inboxBlock = buildInboxBlock(inbox.messages as Array<Record<string, unknown>> | undefined);
@@ -2186,7 +2186,7 @@ async function postCompactHandler(): Promise<void> {
 
   const template = loadTemplate('hook-post-compact');
   const output = renderTemplate(template, {
-    AGENT_ID: agentId,
+    AGENT_ID: sbSlug,
     IDENTITY_BLOCK: identityBlock,
     MEMORIES_BLOCK: memoriesBlock,
     SKILLS_BLOCK: skillsBlock,
@@ -2238,11 +2238,11 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
   const stdin = await readStdin();
   const cwd = process.cwd();
   const config = getPcpConfig();
-  const agentId = resolveAgentId() || 'unknown';
+  const sbSlug = resolveSlug() || 'unknown';
   const resolvedBackend = resolveLifecycleBackend(cwd, options?.backend);
 
   hookLog('on_session_start', {
-    agentId,
+    sbSlug,
     backend: resolvedBackend.name,
     hasInkContextToken: !!process.env.INK_CONTEXT,
     hasInkSessionId: !!process.env.INK_SESSION_ID,
@@ -2276,7 +2276,7 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
   try {
     const bootstrapArgs: Record<string, unknown> = {
       email: config?.email,
-      agentId,
+      sbSlug,
     };
     if (studioId) bootstrapArgs.studioId = studioId;
 
@@ -2312,7 +2312,7 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
     try {
       const createArgs: Record<string, unknown> = {
         email: config?.email,
-        agentId,
+        sbSlug,
         repoRoot: repoRoot || cwd,
         slug: studioName,
         skipGitOperations: true,
@@ -2345,7 +2345,7 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
   try {
     const inbox = await callPcpTool('get_inbox', {
       email: config?.email,
-      agentId,
+      sbSlug,
       limit: 10,
     });
     inboxBlock = buildInboxBlock(inbox.messages as Array<Record<string, unknown>> | undefined);
@@ -2382,14 +2382,14 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
     const groups = groupsResult.groups as Array<Record<string, unknown>> | undefined;
     const allActiveTasks = standaloneResult.tasks as Array<Record<string, unknown>> | undefined;
     // Standalone = assigned to this agent but not in any group.
-    // Check metadata.assignment.agentId first (set by strategy service),
+    // Check metadata.assignment.sbSlug first (set by strategy service),
     // fall back to createdBy for tasks predating assignment metadata.
     const standalone = allActiveTasks?.filter((t) => {
       if (t.taskGroupId) return false;
       const meta = t.metadata as Record<string, unknown> | undefined;
       const assignment = meta?.assignment as Record<string, unknown> | undefined;
-      if (assignment?.agentId) return assignment.agentId === agentId;
-      return t.createdBy === agentId;
+      if (assignment?.sbSlug) return assignment.sbSlug === sbSlug;
+      return t.createdBy === sbSlug;
     });
     tasksBlock = buildTasksBlock(groups, standalone);
   } catch {
@@ -2410,7 +2410,7 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
     if (!pcpSessionId) {
       const startArgs: Record<string, unknown> = {
         email: config?.email,
-        agentId,
+        sbSlug,
         backend: sessionBackend,
       };
       if (studioId) startArgs.studioId = studioId;
@@ -2431,7 +2431,7 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
   }
 
   const startedAt = new Date().toISOString();
-  const reconciled = await reconcileBackendSignal(cwd, config, agentId, stdin, {
+  const reconciled = await reconcileBackendSignal(cwd, config, sbSlug, stdin, {
     initialPcpSessionId: pcpSessionId,
     initialThreadKey: pcpThreadKey,
     startedAt,
@@ -2453,7 +2453,7 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
     try {
       const updateArgs: Record<string, unknown> = {
         email: config?.email,
-        agentId,
+        sbSlug,
         sessionId: pcpSessionId,
         lifecycle: 'idle',
         workingDir: cwd,
@@ -2480,7 +2480,7 @@ async function onSessionStartHandler(options?: { backend?: string }): Promise<vo
 
   const template = loadTemplate('hook-session-start');
   const output = renderTemplate(template, {
-    AGENT_ID: agentId,
+    AGENT_ID: sbSlug,
     WORKSPACE_LINE: studioLine,
     SESSION_IDENTITY: sessionIdentityBlock,
     ROLE_BLOCK: roleBlock,
@@ -2604,11 +2604,11 @@ async function onToolApprovalHandler(options?: { backend?: string }): Promise<vo
   // synthesize a minimal token from available identity info.
   let contextToken = process.env.INK_CONTEXT?.trim();
   if (!contextToken) {
-    const agentId = resolveAgentId();
-    if (agentId) {
+    const sbSlug = resolveSlug();
+    if (sbSlug) {
       const { studioId: ctxStudioId } = getIdentitySessionContext(cwd);
       contextToken = Buffer.from(
-        JSON.stringify({ agentId, studioId: ctxStudioId || 'main', cliAttached: true })
+        JSON.stringify({ sbSlug, studioId: ctxStudioId || 'main', cliAttached: true })
       ).toString('base64url');
     }
   }
@@ -2715,17 +2715,17 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
   });
 
   const config = getPcpConfig();
-  const agentId = resolveAgentId() || 'unknown';
+  const sbSlug = resolveSlug() || 'unknown';
   hookLog('on_prompt', {
-    agentId,
+    sbSlug,
     backend: lifecycleBackend.name,
   });
 
-  const reconciled = await reconcileBackendSignal(cwd, config, agentId, stdin, {
+  const reconciled = await reconcileBackendSignal(cwd, config, sbSlug, stdin, {
     hookBackend: lifecycleBackend.name,
   });
   hookLog('on_prompt_reconciled', {
-    agentId,
+    sbSlug,
     backend: lifecycleBackend.name,
     pcpSessionId: reconciled.pcpSessionId || null,
     threadKey: reconciled.threadKey || null,
@@ -2745,14 +2745,14 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
   // Round 11: name our studio so the server exact-CAS-touches ITS lease and
   // the response's held report covers the worktree this prompt runs in.
   const { studioId: promptStudioId } = getIdentitySessionContext(cwd);
-  const takeover = await updateRuntimeGenerationState(cwd, config, agentId, 'running', 'prompt', {
+  const takeover = await updateRuntimeGenerationState(cwd, config, sbSlug, 'running', 'prompt', {
     headless: isHeadlessSpawn,
     studioId: promptStudioId,
   });
   const takeoverOk = takeover.ok;
   if (!takeoverOk && !isHeadlessSpawn) {
     handleFailedTakeover(lifecycleBackend, {
-      agentId,
+      sbSlug,
       reason: takeover.reason,
       wrapperGeneration: process.env.INK_RUNTIME_LINK_ID || undefined,
       writePendingTakeover: () => {
@@ -2762,7 +2762,7 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
           markerPath,
           JSON.stringify({
             sessionId: resolveActivePcpSessionId(cwd),
-            agentId,
+            sbSlug,
             at: new Date().toISOString(),
             // Round 21: a FRESH attempt token — the fence is per attempt,
             // so abandoning this one never refuses a later prompt.
@@ -2803,7 +2803,7 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
         // destructive boundary releases). Blocking here instead would strand
         // the row running under the committed claim with no process behind
         // it — the exact zombie class this PR removes.
-        hookLog('on_prompt_epoch_record_failed', { agentId, sessionId: claimedSessionId });
+        hookLog('on_prompt_epoch_record_failed', { sbSlug, sessionId: claimedSessionId });
         sbDebugLog('hooks', 'epoch_record_write_failed', { sessionId: claimedSessionId });
       }
     }
@@ -2836,14 +2836,14 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
         signal: AbortSignal.timeout(5000),
       });
       hookLog('cli_attached_cleared', {
-        agentId,
+        sbSlug,
         backend: lifecycleBackend.name,
         reason: 'headless spawn (cliAttached=false in INK_CONTEXT)',
         sessionId: reconciled.pcpSessionId,
       });
     } catch (err) {
       hookLog('cli_attached_clear_failed', {
-        agentId,
+        sbSlug,
         backend: lifecycleBackend.name,
         sessionId: reconciled.pcpSessionId,
         error: err instanceof Error ? err.message : String(err),
@@ -2851,7 +2851,7 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
     }
   } else if (isHeadlessSpawn) {
     hookLog('cli_attached_skipped', {
-      agentId,
+      sbSlug,
       backend: lifecycleBackend.name,
       reason: 'headless spawn, no pcpSessionId',
       sessionId: null,
@@ -2872,7 +2872,7 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
         signal: AbortSignal.timeout(5000),
       });
       hookLog('cli_attached_set', {
-        agentId,
+        sbSlug,
         backend: lifecycleBackend.name,
         sessionId: reconciled.pcpSessionId,
         status: lifecycleResp.status,
@@ -2880,7 +2880,7 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
       });
     } catch (err) {
       hookLog('cli_attached_failed', {
-        agentId,
+        sbSlug,
         backend: lifecycleBackend.name,
         sessionId: reconciled.pcpSessionId,
         error: err instanceof Error ? err.message : String(err),
@@ -2888,7 +2888,7 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
     }
   } else {
     hookLog('cli_attached_skipped', {
-      agentId,
+      sbSlug,
       backend: lifecycleBackend.name,
       reason: 'no pcpSessionId',
       backendSessionId: reconciled.backendSessionId || null,
@@ -2937,7 +2937,7 @@ async function onPromptHandler(options?: { backend?: string }): Promise<void> {
   try {
     const inbox = await callPcpTool('get_inbox', {
       email: config?.email,
-      agentId,
+      sbSlug,
       since: lastCheck || undefined,
     });
 
@@ -2960,9 +2960,9 @@ async function onStopHandler(options?: { backend?: string }): Promise<void> {
   const lifecycleBackend = resolveLifecycleBackend(cwd, options?.backend);
 
   const config = getPcpConfig();
-  const agentId = resolveAgentId() || 'unknown';
+  const sbSlug = resolveSlug() || 'unknown';
   hookLog('on_stop', {
-    agentId,
+    sbSlug,
     backend: lifecycleBackend.name,
   });
   sbDebugLog('hooks', 'on_stop_begin', {
@@ -2971,7 +2971,7 @@ async function onStopHandler(options?: { backend?: string }): Promise<void> {
   });
 
   const parts: string[] = [];
-  const reconciled = await reconcileBackendSignal(cwd, config, agentId, stdin, {
+  const reconciled = await reconcileBackendSignal(cwd, config, sbSlug, stdin, {
     hookBackend: lifecycleBackend.name,
   });
   sbDebugLog('hooks', 'on_stop_reconciled', {
@@ -3011,18 +3011,11 @@ async function onStopHandler(options?: { backend?: string }): Promise<void> {
       // the claim skips the lease/revocation boundary entirely, and a
       // short turn whose lease was revoked would be accepted at stop.
       const { studioId: stopStudioId } = getIdentitySessionContext(cwd);
-      const reclaim = await updateRuntimeGenerationState(
-        cwd,
-        config,
-        agentId,
-        'running',
-        'prompt',
-        {
-          reclaimOf: rawMarker.at,
-          ...(rawMarker.attemptId ? { attemptId: rawMarker.attemptId } : {}),
-          studioId: stopStudioId,
-        }
-      );
+      const reclaim = await updateRuntimeGenerationState(cwd, config, sbSlug, 'running', 'prompt', {
+        reclaimOf: rawMarker.at,
+        ...(rawMarker.attemptId ? { attemptId: rawMarker.attemptId } : {}),
+        studioId: stopStudioId,
+      });
       if (reclaim.ok && reclaim.turnEpoch) {
         adjudicatedEpoch = reclaim.turnEpoch;
       } else {
@@ -3048,7 +3041,7 @@ async function onStopHandler(options?: { backend?: string }): Promise<void> {
     epochRecord.sessionId === stopSessionId &&
     (epochRecord.wrapperGeneration ?? undefined) === (stopGeneration ?? undefined);
   const stopEpoch = adjudicatedEpoch ?? (recordIsOurs ? epochRecord?.turnEpoch : undefined);
-  const stopResult = await updateRuntimeGenerationState(cwd, config, agentId, 'idle', 'stop', {
+  const stopResult = await updateRuntimeGenerationState(cwd, config, sbSlug, 'idle', 'stop', {
     ...(stopEpoch
       ? { turnEpoch: stopEpoch }
       : {
@@ -3086,7 +3079,7 @@ async function onStopHandler(options?: { backend?: string }): Promise<void> {
       });
     }
     hookLog('on_stop_unacknowledged', {
-      agentId,
+      sbSlug,
       sessionId: stopSessionId ?? null,
       adjudicatedEpoch: adjudicatedEpoch ?? null,
     });
@@ -3138,7 +3131,7 @@ async function onStopHandler(options?: { backend?: string }): Promise<void> {
     try {
       const inbox = await callPcpTool('get_inbox', {
         email: config?.email,
-        agentId,
+        sbSlug,
         since: lastCheck || undefined,
       });
 

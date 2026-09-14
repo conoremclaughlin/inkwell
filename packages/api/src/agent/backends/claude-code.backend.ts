@@ -566,7 +566,7 @@ export class ClaudeCodeBackend extends EventEmitter implements AgentBackend {
     // Agent identity - who am I?
     if (context.agentIdentity) {
       sections.push('## My Identity');
-      sections.push(`I am **${context.agentIdentity.name}** (${context.agentIdentity.agentId})`);
+      sections.push(`I am **${context.agentIdentity.name}** (${context.agentIdentity.sbSlug})`);
       sections.push(`Role: ${context.agentIdentity.role}`);
       if (context.agentIdentity.description) {
         sections.push(context.agentIdentity.description);

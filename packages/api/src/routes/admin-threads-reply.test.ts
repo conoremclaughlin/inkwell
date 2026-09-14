@@ -9,7 +9,7 @@
  *  - recipients are the thread's OWN participants, and triggerAll wakes them —
  *    a reply nobody is woken for may never be seen;
  *  - metadata.sentBy = 'user' rides along, because the admin context has no
- *    agentId and 'unknown' alone can't be told apart from a real unknown.
+ *    sbSlug and 'unknown' alone can't be told apart from a real unknown.
  */
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -183,9 +183,9 @@ describe('POST /threads/reply', () => {
       triggerAll: true,
       priority: 'high',
     });
-    // No senderAgentId: the human IS the sender; the handler's non-agent
+    // No senderSlug: the human IS the sender; the handler's non-agent
     // path depends on this being absent.
-    expect(args.senderAgentId).toBeUndefined();
+    expect(args.senderSlug).toBeUndefined();
     expect(args.metadata).toMatchObject({ sentBy: 'user' });
   });
 

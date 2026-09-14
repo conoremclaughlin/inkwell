@@ -103,7 +103,7 @@ export class GeminiRunner implements IRunner {
       const contextToken = encodeContextToken({
         sessionId: config.pcpSessionId || '',
         studioId: config.studioId || '',
-        agentId: config.agentId || 'unknown',
+        sbSlug: config.sbSlug || 'unknown',
         cliAttached: false,
         runtime: 'gemini',
       });
@@ -247,7 +247,7 @@ export class GeminiRunner implements IRunner {
       const spawnEnv: Record<string, string> = {
         HOME: process.env.HOME || '',
         PATH: buildSpawnPath(geminiBin),
-        ...(config.agentId ? { AGENT_ID: config.agentId } : {}),
+        ...(config.sbSlug ? { AGENT_ID: config.sbSlug } : {}),
         // Tells the session-start hook the constitution is already in the
         // prompt, so it does not inject a second copy.
         ...(config.constitutionInjected ? { INK_CONSTITUTION_INJECTED: '1' } : {}),
@@ -256,7 +256,7 @@ export class GeminiRunner implements IRunner {
           pcpSessionId: config.pcpSessionId,
           studioId: config.studioId,
           accessToken: config.pcpAccessToken,
-          agentId: config.agentId,
+          sbSlug: config.sbSlug,
           runtime: 'gemini',
           repoRoot: config.repoRoot,
         }),

@@ -137,7 +137,7 @@ describe('Memory session attribution', () => {
 
   async function remember(args: Record<string, unknown>) {
     const result = await handleRemember(
-      { userId: testUserId, agentId: AGENT, content: 'attribution probe', ...args },
+      { userId: testUserId, sbSlug: AGENT, content: 'attribution probe', ...args },
       dataComposer
     );
     const parsed = JSON.parse(result.content[0].text);
@@ -165,7 +165,7 @@ describe('Memory session attribution', () => {
   });
 
   it('does not attribute a memory to a newer same-identity session in another studio', async () => {
-    // The incident itself. The old call — getActiveSession(user, agentId,
+    // The incident itself. The old call — getActiveSession(user, sbSlug,
     // undefined) — filtered on agent_id but not studio, so the phantom won.
     const parsed = await remember({});
 
@@ -206,14 +206,14 @@ describe('Memory session attribution', () => {
     expect(await readMemorySession(parsed.memory.id)).toBe(liveSessionId);
   });
 
-  it('attributes a user-token call that omits agentId to the ambient session it runs in', async () => {
+  it('attributes a user-token call that omits sbSlug to the ambient session it runs in', async () => {
     // Lumen's #596 probe against the real rows. The normal local auth shape: a
-    // user bearer, ctx.agentId enriched from the ambient session, no signed
-    // session claim, and no agentId on the call. The effective identity is
+    // user bearer, ctx.sbSlug enriched from the ambient session, no signed
+    // session claim, and no sbSlug on the call. The effective identity is
     // still this agent, so attribution must land on the session the caller is
     // in — and never on the phantom, which is newer.
     const result = await runWithRequestContext(
-      { userId: testUserId, agentId: AGENT, sessionId: liveSessionId },
+      { userId: testUserId, sbSlug: AGENT, sessionId: liveSessionId },
       () =>
         handleRemember({ userId: testUserId, content: 'ambient attribution probe' }, dataComposer)
     );
@@ -232,9 +232,9 @@ describe('Memory session attribution', () => {
     const result = await runWithRequestContext(
       {
         userId: testUserId,
-        agentId: AGENT,
+        sbSlug: AGENT,
         agentTokenBound: true,
-        tokenAgentId: AGENT,
+        tokenSlug: AGENT,
         tokenSessionId: liveSessionId,
         sessionId: phantomSessionId,
       },

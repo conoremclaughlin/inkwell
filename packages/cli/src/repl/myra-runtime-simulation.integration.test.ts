@@ -53,7 +53,7 @@ async function createPcpClient() {
 describe('Myra simulation: Phase 1 — Bootstrap', () => {
   it.skipIf(!serverAvailable)('bootstraps as Myra with identity and memories', async () => {
     const pcp = await createPcpClient();
-    const result = await pcp.callTool('bootstrap', { agentId: AGENT_ID });
+    const result = await pcp.callTool('bootstrap', { sbSlug: AGENT_ID });
     const parsed = result as Record<string, unknown>;
 
     console.log('\n=== Phase 1: Bootstrap as Myra ===');
@@ -89,7 +89,7 @@ describe('Myra simulation: Phase 1 — Bootstrap', () => {
 describe('Myra simulation: Phase 2 — Inbox', () => {
   it.skipIf(!serverAvailable)('retrieves inbox messages', async () => {
     const pcp = await createPcpClient();
-    const result = await pcp.callTool('get_inbox', { agentId: AGENT_ID });
+    const result = await pcp.callTool('get_inbox', { sbSlug: AGENT_ID });
     const parsed = result as Record<string, unknown>;
 
     console.log('=== Phase 2: Inbox Check ===');
@@ -101,7 +101,7 @@ describe('Myra simulation: Phase 2 — Inbox', () => {
 
     if (messages && messages.length > 0) {
       for (const msg of messages.slice(0, 3)) {
-        const from = msg.senderAgentId || msg.from || 'unknown';
+        const from = msg.senderSlug || msg.from || 'unknown';
         const content = ((msg.content as string) || '').slice(0, 80);
         console.log(`  - from ${from}: "${content}..."`);
       }
@@ -124,7 +124,7 @@ describe('Myra simulation: Phase 3 — Passive Recall', () => {
     const callRecall = async (query: string, limit: number) => {
       const result = await pcp.callTool('recall', {
         query,
-        agentId: AGENT_ID,
+        sbSlug: AGENT_ID,
         includeShared: true,
         limit,
         recallMode: 'hybrid',
@@ -157,7 +157,7 @@ describe('Myra simulation: Phase 3 — Passive Recall', () => {
 
     const result = await registry.fire('turn_end', {
       ledger,
-      runtime: { agentId: AGENT_ID, turnCount: 1, budgetUtilization: 0.2 },
+      runtime: { sbSlug: AGENT_ID, turnCount: 1, budgetUtilization: 0.2 },
       lastTurn: { userInput, assistantResponse, turnIndex: 1 },
     });
 
@@ -190,7 +190,7 @@ describe('Myra simulation: Phase 4 — Context Management', () => {
     const callRecall = async (query: string, limit: number) => {
       const result = await pcp.callTool('recall', {
         query,
-        agentId: AGENT_ID,
+        sbSlug: AGENT_ID,
         includeShared: true,
         limit,
         recallMode: 'hybrid',
@@ -252,7 +252,7 @@ describe('Myra simulation: Phase 4 — Context Management', () => {
       // Fire turn_end
       await registry.fire('turn_end', {
         ledger,
-        runtime: { agentId: AGENT_ID, turnCount: i + 1, budgetUtilization: util },
+        runtime: { sbSlug: AGENT_ID, turnCount: i + 1, budgetUtilization: util },
         lastTurn: {
           userInput: turns[i].user,
           assistantResponse: turns[i].assistant,
@@ -346,7 +346,7 @@ describe('Myra simulation: Phase 6 — Full Heartbeat Cycle', () => {
     console.log('=== Phase 6: Full Heartbeat Cycle ===');
 
     // 1. Bootstrap
-    const bootstrap = await pcp.callTool('bootstrap', { agentId: AGENT_ID });
+    const bootstrap = await pcp.callTool('bootstrap', { sbSlug: AGENT_ID });
     const bootstrapParsed = bootstrap as Record<string, unknown>;
     expect(bootstrapParsed.user || bootstrapParsed.constitution).toBeTruthy();
     console.log('  1. Bootstrap: OK');
@@ -358,7 +358,7 @@ describe('Myra simulation: Phase 6 — Full Heartbeat Cycle', () => {
     const callRecall = async (query: string, limit: number) => {
       const result = await pcp.callTool('recall', {
         query,
-        agentId: AGENT_ID,
+        sbSlug: AGENT_ID,
         includeShared: true,
         limit,
         recallMode: 'hybrid',
@@ -387,7 +387,7 @@ describe('Myra simulation: Phase 6 — Full Heartbeat Cycle', () => {
     console.log('  2. Context initialized');
 
     // 4. Check inbox
-    const inbox = await pcp.callTool('get_inbox', { agentId: AGENT_ID });
+    const inbox = await pcp.callTool('get_inbox', { sbSlug: AGENT_ID });
     const inboxParsed = inbox as Record<string, unknown>;
     const messages = (inboxParsed.messages as Array<Record<string, unknown>>) || [];
     console.log(`  3. Inbox: ${messages.length} messages`);
@@ -395,7 +395,7 @@ describe('Myra simulation: Phase 6 — Full Heartbeat Cycle', () => {
     // 5. Add inbox content to ledger
     if (messages.length > 0) {
       for (const msg of messages.slice(0, 3)) {
-        const content = `From ${msg.senderAgentId || 'unknown'}: ${((msg.content as string) || '').slice(0, 200)}`;
+        const content = `From ${msg.senderSlug || 'unknown'}: ${((msg.content as string) || '').slice(0, 200)}`;
         ledger.addEntry('inbox', content, 'inkmail');
       }
     }
@@ -409,7 +409,7 @@ describe('Myra simulation: Phase 6 — Full Heartbeat Cycle', () => {
     // 7. Fire turn_end — passive recall
     const turnResult = await registry.fire('turn_end', {
       ledger,
-      runtime: { agentId: AGENT_ID, turnCount: 1, budgetUtilization: 0.3 },
+      runtime: { sbSlug: AGENT_ID, turnCount: 1, budgetUtilization: 0.3 },
       lastTurn: { userInput, assistantResponse, turnIndex: 1 },
     });
     console.log(`  4. Passive recall: +${turnResult.injected} memories`);

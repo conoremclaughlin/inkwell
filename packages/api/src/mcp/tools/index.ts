@@ -1920,7 +1920,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           .describe('Filter by topics (any match)'),
         limit: z.number().min(1).max(100).optional().describe('Max results (default: 20)'),
         includeExpired: z.boolean().optional().describe('Include expired memories'),
-        agentId: z
+        sbSlug: z
           .string()
           .optional()
           .describe('Filter by agent (e.g., "wren"). Omit to include all memories.'),
@@ -1928,7 +1928,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           .boolean()
           .optional()
           .describe(
-            'Include shared memories (agentId=null) when filtering by agentId (default: true)'
+            'Include shared memories (sbSlug=null) when filtering by sbSlug (default: true)'
           ),
       }),
     },
@@ -1988,7 +1988,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           )
           .optional()
           .describe('Memories the SB found irrelevant — should be evicted from context'),
-        agentId: z.string().optional().describe('Agent identity (e.g., "wren")'),
+        sbSlug: z.string().optional().describe('Agent identity (e.g., "wren")'),
         sessionId: z.string().guid().optional().describe('Current session ID for attribution'),
       }),
     },
@@ -2109,7 +2109,7 @@ When forceNew=true, start_session always creates a new session (skips active-ses
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
         inputSchema: z.object({
           ...userIdentifierFields,
-          agentId: z
+          sbSlug: z
             .string()
             .optional()
             .describe('Agent identifier (e.g., "claude-code", "telegram-myra")'),
@@ -2180,7 +2180,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       {
         description: `End a session with an optional summary. The summary is automatically saved as a high-salience memory.
 
-Session resolution: sessionId (explicit) > agentId+studioId (scoped) > most recent active (fallback).
+Session resolution: sessionId (explicit) > sbSlug+studioId (scoped) > most recent active (fallback).
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
         inputSchema: z.object({
@@ -2190,7 +2190,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
             .guid()
             .optional()
             .describe('Session ID (uses active session if not provided)'),
-          agentId: z
+          sbSlug: z
             .string()
             .optional()
             .describe('Agent identifier for session resolution (e.g., "wren", "benson")'),
@@ -2239,7 +2239,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           .guid()
           .optional()
           .describe('Session ID (returns active session if not provided)'),
-        agentId: z
+        sbSlug: z
           .string()
           .optional()
           .describe('Agent identifier for session resolution (e.g., "wren", "benson")'),
@@ -2500,7 +2500,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           .describe(
             'Set true when bootstrapping after context compaction. Includes the most recent memories regardless of salience to restore context continuity.'
           ),
-        agentId: z
+        sbSlug: z
           .string()
           .optional()
           .describe(
@@ -2569,7 +2569,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
           .guid()
           .optional()
           .describe('Session ID to compact (uses active session if not provided)'),
-        agentId: z
+        sbSlug: z
           .string()
           .optional()
           .describe('Agent identifier for session resolution (e.g., "wren", "benson")'),
@@ -3582,13 +3582,13 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
     {
       description: `Create a scheduled reminder. Can be one-time or recurring.
 
-Use agentId to assign which agent handles the reminder (e.g., "myra" for monitoring tasks,
-"lumen" for dev tasks). Without agentId, the reminder routes to the server's default agent.
+Use sbSlug to assign which agent handles the reminder (e.g., "myra" for monitoring tasks,
+"lumen" for dev tasks). Without sbSlug, the reminder routes to the server's default agent.
 
 Examples:
 - "Remind me to call mom tomorrow at 9am" → runAt: "2024-01-28T09:00:00Z"
-- "Remind me daily at 9am to take vitamins" → cronExpression: "0 9 * * *", agentId: "myra"
-- "Run nightly test suite" → cronExpression: "0 2 * * *", agentId: "lumen"
+- "Remind me daily at 9am to take vitamins" → cronExpression: "0 9 * * *", sbSlug: "myra"
+- "Run nightly test suite" → cronExpression: "0 2 * * *", sbSlug: "lumen"
 
 Common cron patterns:
 - "0 9 * * *" - Daily at 9am
@@ -3624,7 +3624,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
     'list_reminders',
     {
       description: `List a user's scheduled reminders. By default shows only active reminders.
-Use agentId to filter reminders assigned to a specific agent.
+Use sbSlug to filter reminders assigned to a specific agent.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: listRemindersSchema,
@@ -3653,7 +3653,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   server.registerTool(
     'update_reminder',
     {
-      description: `Update an existing reminder. Can change title, description, schedule, pause/resume, or reassign to a different agent via agentId.
+      description: `Update an existing reminder. Can change title, description, schedule, pause/resume, or reassign to a different agent via sbSlug.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: updateReminderSchema,
@@ -4134,7 +4134,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `Add a comment to a document without modifying the document body.
 
 Use this for collaborative review/discussion to avoid overwrite conflicts.
-Stores canonical author identity via agent_identities.id while preserving agentId slug for display.
+Stores canonical author identity via agent_identities.id while preserving sbSlug slug for display.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: getArtifactToolSchema('add_artifact_comment'),
@@ -4226,7 +4226,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
       description: `Send a message to another agent's inbox or reply to a thread. This is the unified tool for all cross-agent messaging.
 
 Recipient modes (provide exactly one):
-- recipientAgentId: Single recipient. Works with or without threadKey.
+- recipientSlug: Single recipient. Works with or without threadKey.
 - recipients[]: Multiple recipients. Requires threadKey. Creates a group thread automatically.
 
 Thread routing:
@@ -4398,7 +4398,7 @@ User can be identified by ONE of: userId, email, phone, or platform + platformId
   server.registerTool(
     'get_agent_summaries',
     {
-      description: `Get summaries for all agents in one call. Returns per-agent unread counts (legacy inbox + thread-aware), generating count, sessions today, studio count, and latest session lifecycle/phase. Ideal for dashboards and mission control. Omit agentIds to auto-discover all agents.
+      description: `Get summaries for all agents in one call. Returns per-agent unread counts (legacy inbox + thread-aware), generating count, sessions today, studio count, and latest session lifecycle/phase. Ideal for dashboards and mission control. Omit sbSlugs to auto-discover all agents.
 
 User can be identified by ONE of: userId, email, phone, or platform + platformId`,
       inputSchema: inboxToolDefinitions.find((d) => d.name === 'get_agent_summaries')!.schema,

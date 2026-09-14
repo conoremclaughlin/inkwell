@@ -70,7 +70,7 @@ function ambientActorWorkspace(): string | undefined {
 export async function resolveIdentityResult(
   supabase: SupabaseClient<Database>,
   userId: string,
-  agentId: string,
+  sbSlug: string,
   workspaceId?: string
 ): Promise<IdentityResolution> {
   const scope = workspaceId ?? ambientActorWorkspace();
@@ -79,11 +79,11 @@ export async function resolveIdentityResult(
     .from('agent_identities')
     .select('id, workspace_id')
     .eq('user_id', userId)
-    .eq('agent_id', agentId);
+    .eq('agent_id', sbSlug);
 
   if (error) {
     logger.warn('Failed to resolve identity UUID for agent slug', {
-      agentId,
+      sbSlug,
       workspaceId: scope,
       error: error.message,
     });
@@ -117,7 +117,7 @@ export async function resolveIdentityResult(
     const unscoped = candidates.find((row) => row.workspace_id === null);
     if (unscoped) {
       logger.warn('Resolved agent slug to a legacy identity with no workspace', {
-        agentId,
+        sbSlug,
         workspaceId: scope,
         identityId: unscoped.id,
         hint: 'Backfill agent_identities.workspace_id for this row',
@@ -126,7 +126,7 @@ export async function resolveIdentityResult(
     }
 
     logger.warn('Agent slug does not exist in this workspace', {
-      agentId,
+      sbSlug,
       workspaceId: scope,
       candidateWorkspaceCount: candidates.length,
     });
@@ -139,7 +139,7 @@ export async function resolveIdentityResult(
   // between two SBs who share a slug is a coin flip, and the loser's memories,
   // activity and leases would be written under the winner's UUID.
   logger.error('Refusing to resolve an ambiguous agent slug without a workspace', {
-    agentId,
+    sbSlug,
     candidateCount: candidates.length,
   });
   return { ok: false, reason: 'ambiguous' };

@@ -77,7 +77,7 @@ describe('reopenThreadRow (integration)', () => {
 
   it('reopens once: status open, both closure fields null, one audit event', async () => {
     const threadId = await closedThread();
-    expect(await reopenThreadRow(supabase, threadId, { kind: 'sb', agentId: 'echo' })).toEqual({
+    expect(await reopenThreadRow(supabase, threadId, { kind: 'sb', sbSlug: 'echo' })).toEqual({
       reopened: true,
     });
     expect(await threadState(threadId)).toEqual({
@@ -124,7 +124,7 @@ describe('reopenThreadRow (integration)', () => {
         `);
 
         await expect(
-          reopenThreadRow(supabase, threadId, { kind: 'sb', agentId: 'echo' })
+          reopenThreadRow(supabase, threadId, { kind: 'sb', sbSlug: 'echo' })
         ).rejects.toThrow('audit rejected by test');
 
         // Nothing changed: not the row, not the events.
@@ -138,7 +138,7 @@ describe('reopenThreadRow (integration)', () => {
         await pg.query(`DROP TRIGGER ${rejectAudit} ON public.inbox_thread_messages;`);
 
         // The retry is the whole thing, once.
-        expect(await reopenThreadRow(supabase, threadId, { kind: 'sb', agentId: 'echo' })).toEqual({
+        expect(await reopenThreadRow(supabase, threadId, { kind: 'sb', sbSlug: 'echo' })).toEqual({
           reopened: true,
         });
         expect(await threadState(threadId)).toMatchObject({ status: 'open', closed_at: null });

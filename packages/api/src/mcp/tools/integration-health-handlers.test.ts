@@ -601,7 +601,7 @@ describe('handleUpdateIntegrationHealth — last_healthy_at retention', () => {
         status: 'error',
         errorCode: 'oauth_expired',
         errorMessage: 'Failed to refresh google token',
-        agentId: 'myra',
+        sbSlug: 'myra',
       },
       composer
     );
@@ -640,7 +640,7 @@ describe('handleUpdateIntegrationHealth — last_healthy_at retention', () => {
     });
 
     await handleUpdateIntegrationHealth(
-      { userId: USER_ID, service: 'telegram', status: 'healthy', agentId: 'wren' },
+      { userId: USER_ID, service: 'telegram', status: 'healthy', sbSlug: 'wren' },
       composer
     );
 

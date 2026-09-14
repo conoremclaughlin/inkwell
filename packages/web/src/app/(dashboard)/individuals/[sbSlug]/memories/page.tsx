@@ -38,7 +38,7 @@ interface TimelineEntry {
 }
 
 interface TimelineResponse {
-  agentId: string;
+  sbSlug: string;
   timeline: TimelineEntry[];
   total: number;
   limit: number;
@@ -46,7 +46,7 @@ interface TimelineResponse {
 }
 
 interface IndividualsResponse {
-  individuals: { agentId: string; name: string }[];
+  individuals: { sbSlug: string; name: string }[];
 }
 
 const typeConfig = {
@@ -201,7 +201,7 @@ function TimelineCard({ entry }: { entry: TimelineEntry }) {
 
 export default function MemoryTimelinePage() {
   const params = useParams();
-  const agentId = params.agentId as string;
+  const sbSlug = params.sbSlug as string;
   const [typeFilter, setTypeFilter] = React.useState<string | null>(null);
   const [salienceFilter, setSalienceFilter] = React.useState<string | null>(null);
 
@@ -213,11 +213,11 @@ export default function MemoryTimelinePage() {
 
   // Fetch timeline
   const { data, isLoading, error } = useApiQuery<TimelineResponse>(
-    ['individuals', agentId, 'memories', 'timeline'],
-    `/api/admin/individuals/${agentId}/memories/timeline?limit=200`
+    ['individuals', sbSlug, 'memories', 'timeline'],
+    `/api/admin/individuals/${sbSlug}/memories/timeline?limit=200`
   );
 
-  const individual = individualsData?.individuals.find((i) => i.agentId === agentId);
+  const individual = individualsData?.individuals.find((i) => i.sbSlug === sbSlug);
   const timeline = data?.timeline ?? [];
 
   // Apply filters
@@ -287,7 +287,7 @@ export default function MemoryTimelinePage() {
           </Button>
           <div>
             <h1 className="text-2xl font-bold text-gray-900">
-              {individual?.name || agentId} Memory Timeline
+              {individual?.name || sbSlug} Memory Timeline
             </h1>
             <p className="text-gray-600">{data?.total || 0} total events</p>
           </div>

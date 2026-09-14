@@ -35,7 +35,7 @@ export interface RoutingHoldDetail {
 export interface StampHoldArgs {
   threadId: string;
   userId: string;
-  agentId: string;
+  sbSlug: string;
   /** When this delivery attempt began — its generation. */
   attemptStartedAt: string;
   detail: RoutingHoldDetail;
@@ -45,7 +45,7 @@ export interface StampHoldArgs {
 export interface ClearHoldArgs {
   threadId: string;
   userId: string;
-  agentId: string;
+  sbSlug: string;
   /** When the successful route began; older holds only. */
   routedSince: string;
 }
@@ -56,15 +56,15 @@ export interface ClearHoldArgs {
  * attempt cannot resurrect a hold a later success already disproved.
  */
 export async function stampRoutingHold(client: any, args: StampHoldArgs): Promise<boolean> {
-  const { threadId, userId, agentId, attemptStartedAt, detail } = args;
+  const { threadId, userId, sbSlug, attemptStartedAt, detail } = args;
   try {
     const { data, error } = await client.rpc('stamp_routing_hold', {
       p_thread_id: threadId,
       p_user_id: userId,
-      p_agent_id: agentId,
+      p_agent_id: sbSlug,
       p_attempt_started: attemptStartedAt,
       p_hold: {
-        agentId,
+        sbSlug,
         reason: detail.reason ?? 'no-route',
         // The hold's GENERATION. `heldAt` is when it was written, which can be
         // long after the attempt began; comparing that against a successful
@@ -87,13 +87,13 @@ export async function stampRoutingHold(client: any, args: StampHoldArgs): Promis
     if (error) {
       // An unstamped hold is invisible on the thread, so it has to be loud
       // somewhere. Never assumed successful.
-      logger.error('[RoutingHold] Stamp failed', { threadId, agentId, error: error.message });
+      logger.error('[RoutingHold] Stamp failed', { threadId, sbSlug, error: error.message });
       return false;
     }
     if (!data) {
       logger.info('[RoutingHold] Stamp skipped — a newer route already recovered this thread', {
         threadId,
-        agentId,
+        sbSlug,
       });
       return false;
     }
@@ -101,7 +101,7 @@ export async function stampRoutingHold(client: any, args: StampHoldArgs): Promis
   } catch (err) {
     logger.error('[RoutingHold] Stamp threw', {
       threadId,
-      agentId,
+      sbSlug,
       error: err instanceof Error ? err.message : String(err),
     });
     return false;
@@ -114,21 +114,21 @@ export async function stampRoutingHold(client: any, args: StampHoldArgs): Promis
  * from stamping afterwards, so it must be written even when no hold existed.
  */
 export async function clearRoutingHold(client: any, args: ClearHoldArgs): Promise<boolean> {
-  const { threadId, userId, agentId, routedSince } = args;
+  const { threadId, userId, sbSlug, routedSince } = args;
   try {
     const { data, error } = await client.rpc('clear_routing_hold', {
       p_thread_id: threadId,
       p_user_id: userId,
-      p_agent_id: agentId,
+      p_agent_id: sbSlug,
       p_routed_since: routedSince,
     });
 
     if (error) {
-      logger.warn('[RoutingHold] Clear failed', { threadId, agentId, error: error.message });
+      logger.warn('[RoutingHold] Clear failed', { threadId, sbSlug, error: error.message });
       return false;
     }
     if (data) {
-      logger.info('[RoutingHold] Cleared hold after successful route', { threadId, agentId });
+      logger.info('[RoutingHold] Cleared hold after successful route', { threadId, sbSlug });
       return true;
     }
     return false;

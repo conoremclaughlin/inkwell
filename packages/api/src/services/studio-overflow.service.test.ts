@@ -58,7 +58,7 @@ function makeStudio(overrides: Partial<Studio> = {}): Studio {
   return {
     id: 'parent-1',
     userId: 'user-1',
-    agentId: 'lumen',
+    sbSlug: 'lumen',
     sessionId: null,
     repoRoot: '/ws/pcp/inkwell',
     worktreePath: '/ws/pcp/inkwell--lumen-review',
@@ -89,7 +89,7 @@ function makeTeardownClaim(): StudioLease {
   return {
     sessionId: '00000000-0000-0000-0000-000000000000',
     threadKey: '__quarantine__',
-    agentId: 'system',
+    sbSlug: 'system',
     acquiredAt: now,
     heartbeatAt: now,
     quarantined: true,
@@ -159,7 +159,7 @@ describe('StudioOverflowService.ensureOverflowStudio — reuse', () => {
       const service = new StudioOverflowService(studios, leases);
       const result = await service.ensureOverflowStudio({
         userId: 'user-1',
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         parentStudio: makeStudio(),
         threadKey: 'pr:476',
       });
@@ -198,7 +198,7 @@ describe('StudioOverflowService.ensureOverflowStudio — reuse', () => {
     // NOT revived.
     const result = await service.ensureOverflowStudio({
       userId: 'user-1',
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       parentStudio: makeStudio({ repoRoot: '/nonexistent/repo' }),
       threadKey: 'pr:476',
     });
@@ -234,7 +234,7 @@ describe('StudioOverflowService.ensureOverflowStudio — reuse', () => {
     const service = new StudioOverflowService(studios, leases);
     const result = await service.ensureOverflowStudio({
       userId: 'user-1',
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       parentStudio: makeStudio({ repoRoot: '/nonexistent/repo' }),
       threadKey: 'pr:476',
     });
@@ -372,7 +372,7 @@ describe('StudioOverflowService.ensureOverflowStudio — durable anchoring', () 
     // decides its name.
     await service.ensureOverflowStudio({
       userId: 'user-1',
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       parentStudio: chainEnd,
       threadKey: 'pr:474',
     });
@@ -412,7 +412,7 @@ describe('StudioOverflowService.ensureOverflowStudio — durable anchoring', () 
       const service = new StudioOverflowService(studios, leases);
       const result = await service.ensureOverflowStudio({
         userId: 'user-1',
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         parentStudio: own,
         threadKey: 'pr:476',
       });
@@ -435,7 +435,7 @@ describe('StudioOverflowService.ensureOverflowStudio — durable anchoring', () 
     const blocker = path.join(path.dirname(repoRoot), `${path.basename(repoRoot)}--legacy-chain`);
     const primarySlug = 'lumen-review--pr-476';
     const primaryWorktree = ephemeralWorktreePath({
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       repoRoot,
       leaf: primarySlug,
     });
@@ -459,7 +459,7 @@ describe('StudioOverflowService.ensureOverflowStudio — durable anchoring', () 
       const service = new StudioOverflowService(studios, leases);
       const result = await service.ensureOverflowStudio({
         userId: 'user-1',
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         parentStudio: makeStudio({ repoRoot, worktreePath: repoRoot }),
         threadKey: 'pr:476',
       });
@@ -501,7 +501,7 @@ describe('StudioOverflowService.ensureOverflowStudio — durable anchoring', () 
     const repoRoot = await makeGitRepo();
     const hashWorktree = await mkdtemp(path.join(tmpdir(), 'overflow-hash-'));
     const primaryWorktree = ephemeralWorktreePath({
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       repoRoot,
       leaf: 'lumen-review--pr-476',
     });
@@ -531,7 +531,7 @@ describe('StudioOverflowService.ensureOverflowStudio — durable anchoring', () 
       const service = new StudioOverflowService(studios, leases);
       const result = await service.ensureOverflowStudio({
         userId: 'user-1',
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         parentStudio: root,
         threadKey: 'pr:476',
       });
@@ -560,7 +560,7 @@ describe('StudioOverflowService.ensureOverflowStudio — durable anchoring', () 
   it('a revive loss with no live winner fails the call and removes the created worktree', async () => {
     const repoRoot = await makeGitRepo();
     const primaryWorktree = ephemeralWorktreePath({
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       repoRoot,
       leaf: 'lumen-review--pr-476',
     });
@@ -590,7 +590,7 @@ describe('StudioOverflowService.ensureOverflowStudio — durable anchoring', () 
       const service = new StudioOverflowService(studios, leases);
       const result = await service.ensureOverflowStudio({
         userId: 'user-1',
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         parentStudio: makeStudio({ repoRoot, worktreePath: repoRoot }),
         threadKey: 'pr:476',
       });
@@ -616,7 +616,7 @@ describe('StudioOverflowService.ensureOverflowStudio — durable anchoring', () 
     const repoRoot = await makeGitRepo();
     const winnerWorktree = await mkdtemp(path.join(tmpdir(), 'overflow-winner-'));
     const primaryWorktree = ephemeralWorktreePath({
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       repoRoot,
       leaf: 'lumen-review--pr-476',
     });
@@ -656,7 +656,7 @@ describe('StudioOverflowService.ensureOverflowStudio — durable anchoring', () 
       const service = new StudioOverflowService(studios, leases);
       const result = await service.ensureOverflowStudio({
         userId: 'user-1',
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         parentStudio: makeStudio({ repoRoot, worktreePath: repoRoot }),
         threadKey: 'pr:476',
       });
@@ -682,7 +682,7 @@ describe('StudioOverflowService.ensureOverflowStudio — durable anchoring', () 
   it('reviving an archived studio clears archived_at as well as cleaned_at', async () => {
     const repoRoot = await makeGitRepo();
     const primaryWorktree = ephemeralWorktreePath({
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       repoRoot,
       leaf: 'lumen-review--pr-476',
     });
@@ -716,7 +716,7 @@ describe('StudioOverflowService.ensureOverflowStudio — durable anchoring', () 
       const service = new StudioOverflowService(studios, leases);
       const result = await service.ensureOverflowStudio({
         userId: 'user-1',
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         parentStudio: makeStudio({ repoRoot, worktreePath: repoRoot }),
         threadKey: 'pr:476',
       });
@@ -764,7 +764,7 @@ describe('StudioOverflowService.ensureOverflowStudio — durable anchoring', () 
     const service = new StudioOverflowService(studios, leases);
     const result = await service.ensureOverflowStudio({
       userId: 'user-1',
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       parentStudio: ephA,
       threadKey: 'pr:476',
     });
@@ -822,7 +822,7 @@ describe('StudioOverflowService — canonical ephemeral root (spec v8)', () => {
       const service = new StudioOverflowService(studios, leases);
       const result = await service.ensureOverflowStudio({
         userId: 'user-1',
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         parentStudio: makeStudio({ repoRoot, worktreePath: repoRoot }),
         threadKey: 'pr:476',
       });
@@ -862,7 +862,7 @@ describe('StudioOverflowService — canonical ephemeral root (spec v8)', () => {
       const service = new StudioOverflowService(studios, leases);
       const result = await service.ensureParentStudio({
         userId: 'user-1',
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         repoRoot,
       });
 
@@ -965,7 +965,7 @@ describe('S2: teardownEphemeralStudiosForThread under multiplexing (spec v18)', 
         sessionId: 'session-b',
         threadKey: 'pr:A',
         threadKeys,
-        agentId: 'wren',
+        sbSlug: 'wren',
         acquiredAt: now,
         heartbeatAt: now,
       } as unknown as Studio['lease'],
@@ -1234,7 +1234,7 @@ describe('StudioOverflowService.ensureOverflowStudio — PR threads detach at th
   it('checks out the PR head, pins the commit on the row, and mints no branch', async () => {
     const { repoRoot, origin, prHead } = await makeGitRepoWithPullRef(7);
     const slug = 'lumen-review--pr-7';
-    const worktree = ephemeralWorktreePath({ agentId: 'lumen', repoRoot, leaf: slug });
+    const worktree = ephemeralWorktreePath({ sbSlug: 'lumen', repoRoot, leaf: slug });
     try {
       const createdInputs: Array<Record<string, unknown>> = [];
       const service = new StudioOverflowService(capturingRepo(createdInputs), {
@@ -1243,7 +1243,7 @@ describe('StudioOverflowService.ensureOverflowStudio — PR threads detach at th
 
       const result = await service.ensureOverflowStudio({
         userId: 'user-1',
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         parentStudio: makeStudio({ repoRoot, worktreePath: repoRoot }),
         threadKey: 'pr:7',
       });
@@ -1297,7 +1297,7 @@ describe('StudioOverflowService.ensureOverflowStudio — PR threads detach at th
   it('falls back to the base branch when the PR ref cannot be fetched — still detached, still no branch', async () => {
     const { repoRoot, origin, mainHead } = await makeGitRepoWithPullRef(7);
     const slug = 'lumen-review--pr-404';
-    const worktree = ephemeralWorktreePath({ agentId: 'lumen', repoRoot, leaf: slug });
+    const worktree = ephemeralWorktreePath({ sbSlug: 'lumen', repoRoot, leaf: slug });
     try {
       const createdInputs: Array<Record<string, unknown>> = [];
       const service = new StudioOverflowService(capturingRepo(createdInputs), {
@@ -1307,7 +1307,7 @@ describe('StudioOverflowService.ensureOverflowStudio — PR threads detach at th
       // origin exists, but no PR 404 does.
       const result = await service.ensureOverflowStudio({
         userId: 'user-1',
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         parentStudio: makeStudio({ repoRoot, worktreePath: repoRoot }),
         threadKey: 'pr:404',
       });
@@ -1339,7 +1339,7 @@ describe('StudioOverflowService.ensureOverflowStudio — PR threads detach at th
     const { repoRoot, origin, prHead } = await makeGitRepoWithPullRef(7);
     const parent = makeStudio({ repoRoot, worktreePath: repoRoot });
     const slug = overflowSlug(parent, 'pr:7');
-    const worktree = ephemeralWorktreePath({ agentId: 'lumen', repoRoot, leaf: slug });
+    const worktree = ephemeralWorktreePath({ sbSlug: 'lumen', repoRoot, leaf: slug });
     try {
       // A cleaned row for this exact (parent, thread): its worktree is gone,
       // so the ensure revives it rather than inserting beside it.
@@ -1375,7 +1375,7 @@ describe('StudioOverflowService.ensureOverflowStudio — PR threads detach at th
 
       const revived = await service.ensureOverflowStudio({
         userId: 'user-1',
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         parentStudio: parent,
         threadKey: 'pr:7',
       });
@@ -1401,7 +1401,7 @@ describe('StudioOverflowService.ensureOverflowStudio — PR threads detach at th
   it('never runs the package manager on an unreviewed PR head — the PR chooses the binary via yarnPath (Lumen, PR #604 P1)', async () => {
     const { repoRoot, origin } = await makeGitRepoWithPullRef(7, { yarnTrap: true });
     const slug = 'lumen-review--pr-7';
-    const worktree = ephemeralWorktreePath({ agentId: 'lumen', repoRoot, leaf: slug });
+    const worktree = ephemeralWorktreePath({ sbSlug: 'lumen', repoRoot, leaf: slug });
     try {
       const createdInputs: Array<Record<string, unknown>> = [];
       const service = new StudioOverflowService(capturingRepo(createdInputs), {
@@ -1409,7 +1409,7 @@ describe('StudioOverflowService.ensureOverflowStudio — PR threads detach at th
       } as unknown as StudioLeaseService);
       const result = await service.ensureOverflowStudio({
         userId: 'user-1',
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         parentStudio: makeStudio({ repoRoot, worktreePath: repoRoot }),
         threadKey: 'pr:7',
       });
@@ -1433,7 +1433,7 @@ describe('StudioOverflowService.ensureOverflowStudio — PR threads detach at th
   it('control: the same trap fires for a non-PR ephemeral at the base, so the test can see execution', async () => {
     const { repoRoot, origin } = await makeGitRepoWithPullRef(7, { yarnTrap: true });
     const slug = 'lumen-review--task-abc';
-    const worktree = ephemeralWorktreePath({ agentId: 'lumen', repoRoot, leaf: slug });
+    const worktree = ephemeralWorktreePath({ sbSlug: 'lumen', repoRoot, leaf: slug });
     try {
       const createdInputs: Array<Record<string, unknown>> = [];
       const service = new StudioOverflowService(capturingRepo(createdInputs), {
@@ -1441,7 +1441,7 @@ describe('StudioOverflowService.ensureOverflowStudio — PR threads detach at th
       } as unknown as StudioLeaseService);
       const result = await service.ensureOverflowStudio({
         userId: 'user-1',
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         parentStudio: makeStudio({ repoRoot, worktreePath: repoRoot }),
         threadKey: 'task:abc',
       });
@@ -1459,7 +1459,7 @@ describe('StudioOverflowService.ensureOverflowStudio — PR threads detach at th
   it('teardown rescues only what the reviewer added on top of the fetched head', async () => {
     const { repoRoot, origin } = await makeGitRepoWithPullRef(7);
     const slug = 'lumen-review--pr-7';
-    const worktree = ephemeralWorktreePath({ agentId: 'lumen', repoRoot, leaf: slug });
+    const worktree = ephemeralWorktreePath({ sbSlug: 'lumen', repoRoot, leaf: slug });
     const parent = makeStudio({ repoRoot, worktreePath: repoRoot });
     try {
       const createdInputs: Array<Record<string, unknown>> = [];
@@ -1484,7 +1484,7 @@ describe('StudioOverflowService.ensureOverflowStudio — PR threads detach at th
       const ensure = () =>
         service.ensureOverflowStudio({
           userId: 'user-1',
-          agentId: 'lumen',
+          sbSlug: 'lumen',
           parentStudio: parent,
           threadKey: 'pr:7',
         });
@@ -1546,7 +1546,7 @@ describe('StudioOverflowService.ensureOverflowStudio — PR threads detach at th
   it("quarantines PR-supplied startup config before bootstrap — the checkout ends with the main root's copies (Lumen, PR #604 r2)", async () => {
     const { repoRoot, origin } = await makeGitRepoWithPullRef(7, { startupTrap: true });
     const slug = 'lumen-review--pr-7';
-    const worktree = ephemeralWorktreePath({ agentId: 'lumen', repoRoot, leaf: slug });
+    const worktree = ephemeralWorktreePath({ sbSlug: 'lumen', repoRoot, leaf: slug });
     try {
       const createdInputs: Array<Record<string, unknown>> = [];
       const service = new StudioOverflowService(capturingRepo(createdInputs), {
@@ -1554,7 +1554,7 @@ describe('StudioOverflowService.ensureOverflowStudio — PR threads detach at th
       } as unknown as StudioLeaseService);
       const result = await service.ensureOverflowStudio({
         userId: 'user-1',
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         parentStudio: makeStudio({ repoRoot, worktreePath: repoRoot }),
         threadKey: 'pr:7',
       });
@@ -1594,7 +1594,7 @@ describe('StudioOverflowService.ensureOverflowStudio — PR threads detach at th
       symlinkTrap: path.join('..', outsideName),
     });
     const slug = 'lumen-review--pr-7';
-    const worktree = ephemeralWorktreePath({ agentId: 'lumen', repoRoot, leaf: slug });
+    const worktree = ephemeralWorktreePath({ sbSlug: 'lumen', repoRoot, leaf: slug });
     const outside = path.join(path.dirname(worktree), outsideName);
     try {
       await mkdir(outside, { recursive: true });
@@ -1604,7 +1604,7 @@ describe('StudioOverflowService.ensureOverflowStudio — PR threads detach at th
       } as unknown as StudioLeaseService);
       const result = await service.ensureOverflowStudio({
         userId: 'user-1',
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         parentStudio: makeStudio({ repoRoot, worktreePath: repoRoot }),
         threadKey: 'pr:7',
       });
@@ -1649,7 +1649,7 @@ describe('StudioOverflowService.ensureOverflowStudio — PR threads detach at th
       'base config',
     ]);
     const slug = 'lumen-review--task-abc';
-    const worktree = ephemeralWorktreePath({ agentId: 'lumen', repoRoot, leaf: slug });
+    const worktree = ephemeralWorktreePath({ sbSlug: 'lumen', repoRoot, leaf: slug });
     try {
       const createdInputs: Array<Record<string, unknown>> = [];
       const service = new StudioOverflowService(capturingRepo(createdInputs), {
@@ -1657,7 +1657,7 @@ describe('StudioOverflowService.ensureOverflowStudio — PR threads detach at th
       } as unknown as StudioLeaseService);
       const result = await service.ensureOverflowStudio({
         userId: 'user-1',
-        agentId: 'lumen',
+        sbSlug: 'lumen',
         parentStudio: makeStudio({ repoRoot, worktreePath: repoRoot }),
         threadKey: 'task:abc',
       });

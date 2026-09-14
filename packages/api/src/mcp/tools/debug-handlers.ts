@@ -9,11 +9,7 @@
  */
 
 import { z } from 'zod';
-import {
-  getRequestContext,
-  getSessionContext,
-  getPinnedAgentId,
-} from '../../utils/request-context';
+import { getRequestContext, getSessionContext, getPinnedSlug } from '../../utils/request-context';
 
 export const debugRequestContextSchema = {} as const;
 
@@ -21,7 +17,7 @@ export type DebugRequestContextInput = z.infer<z.ZodObject<Record<string, never>
 
 export interface DebugRequestContextResult {
   transport: string;
-  pinnedAgentId: string | null;
+  pinnedSlug: string | null;
   requestContext: ReturnType<typeof getRequestContext> | null;
   sessionContext: ReturnType<typeof getSessionContext> | null;
 }
@@ -31,7 +27,7 @@ export async function handleDebugRequestContext(
 ): Promise<DebugRequestContextResult> {
   return {
     transport: process.env.MCP_TRANSPORT || 'stdio',
-    pinnedAgentId: getPinnedAgentId(),
+    pinnedSlug: getPinnedSlug(),
     requestContext: getRequestContext() ?? null,
     sessionContext: getSessionContext() ?? null,
   };

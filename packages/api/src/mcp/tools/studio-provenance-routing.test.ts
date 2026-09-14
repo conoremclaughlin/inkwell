@@ -46,7 +46,7 @@ function fixture() {
         ephemeral: true,
         lease: {
           sessionId: OWN,
-          agentId: 'lumen',
+          sbSlug: 'lumen',
           sbId: SB,
           threadKey: 'pr:probe',
           threadKeys: ['pr:probe'],
@@ -91,7 +91,7 @@ function fixture() {
     id: OWN,
     userId: USER,
     sbId: SB,
-    agentId: 'lumen',
+    sbSlug: 'lumen',
     studioId: 'creator-original-studio',
     threadKey: 'thread:original',
     endedAt: null,

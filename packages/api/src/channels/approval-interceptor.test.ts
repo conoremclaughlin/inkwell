@@ -495,7 +495,7 @@ describe('notifyPlatformOfApprovalRequest', () => {
     tool: 'Bash',
     args: 'docker push',
     reason: 'deploying to prod',
-    requestingAgentId: 'wren',
+    requestingSlug: 'wren',
     studioId: 'studio-1',
     sessionId: 'session-1',
     expiresAt: futureIso(),
@@ -713,7 +713,7 @@ describe('approval notifications — shadow clone origin', () => {
     tool: 'save_link',
     args: null,
     reason: 'Tool requires approval.',
-    requestingAgentId: 'wren',
+    requestingSlug: 'wren',
     studioId: null,
     sessionId: null,
     expiresAt: new Date(Date.now() + 300_000).toISOString(),
@@ -724,7 +724,7 @@ describe('approval notifications — shadow clone origin', () => {
   });
 
   it('names the clone that asked, not just its parent', () => {
-    // A clone carries its parent's identity, so requestingAgentId alone reads
+    // A clone carries its parent's identity, so requestingSlug alone reads
     // as the parent asking. Away mode means approving a call whose context the
     // user cannot see — which clone wants it is the whole judgement.
     const msg = formatSingleNotification({
@@ -773,7 +773,7 @@ describe('approval notifications — batch clone mapping', () => {
     tool: 'save_link',
     args: null,
     reason: null,
-    requestingAgentId: 'wren',
+    requestingSlug: 'wren',
     studioId: null,
     sessionId: null,
     expiresAt: new Date(Date.now() + 300_000).toISOString(),

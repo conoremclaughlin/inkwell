@@ -110,15 +110,15 @@ describe('AgentGateway Integration (database-driven)', () => {
           .getClient()
           .from('agent_identities')
           .select('agent_id')
-          .eq('agent_id', payload.toAgentId)
+          .eq('agent_id', payload.toSlug)
           .limit(1);
 
         const knownAgents = ['myra', 'wren', 'benson'];
         const existsInDb = agentIdentity && agentIdentity.length > 0;
-        const isKnownAgent = knownAgents.includes(payload.toAgentId);
+        const isKnownAgent = knownAgents.includes(payload.toSlug);
 
         if (!existsInDb && !isKnownAgent) {
-          throw new Error(`Unknown agent: ${payload.toAgentId}`);
+          throw new Error(`Unknown agent: ${payload.toSlug}`);
         }
 
         // Derive userId from inbox message
@@ -139,8 +139,8 @@ describe('AgentGateway Integration (database-driven)', () => {
       });
 
       const payload: AgentTriggerPayload = {
-        fromAgentId: 'test-sender',
-        toAgentId: 'echo', // Exists in DB
+        fromSlug: 'test-sender',
+        toSlug: 'echo', // Exists in DB
         inboxMessageId: testInboxMessageId,
         triggerType: 'message',
         summary: 'Integration test trigger',
@@ -159,21 +159,21 @@ describe('AgentGateway Integration (database-driven)', () => {
           .getClient()
           .from('agent_identities')
           .select('agent_id')
-          .eq('agent_id', payload.toAgentId)
+          .eq('agent_id', payload.toSlug)
           .limit(1);
 
         const knownAgents = ['myra', 'wren', 'benson'];
         const existsInDb = agentIdentity && agentIdentity.length > 0;
-        const isKnownAgent = knownAgents.includes(payload.toAgentId);
+        const isKnownAgent = knownAgents.includes(payload.toSlug);
 
         if (!existsInDb && !isKnownAgent) {
-          throw new Error(`Unknown agent: ${payload.toAgentId}`);
+          throw new Error(`Unknown agent: ${payload.toSlug}`);
         }
       });
 
       const payload: AgentTriggerPayload = {
-        fromAgentId: 'test-sender',
-        toAgentId: 'fake-agent-does-not-exist',
+        fromSlug: 'test-sender',
+        toSlug: 'fake-agent-does-not-exist',
         triggerType: 'message',
       };
 
@@ -185,38 +185,38 @@ describe('AgentGateway Integration (database-driven)', () => {
     });
 
     it('should process trigger for hardcoded known agent (myra) even without DB entry', async () => {
-      let processedAgentId: string | null = null;
+      let processedSlug: string | null = null;
 
       gateway.setDefaultHandler(async (payload) => {
         const { data: agentIdentity } = await dataComposer
           .getClient()
           .from('agent_identities')
           .select('agent_id')
-          .eq('agent_id', payload.toAgentId)
+          .eq('agent_id', payload.toSlug)
           .limit(1);
 
         const knownAgents = ['myra', 'wren', 'benson'];
         const existsInDb = agentIdentity && agentIdentity.length > 0;
-        const isKnownAgent = knownAgents.includes(payload.toAgentId);
+        const isKnownAgent = knownAgents.includes(payload.toSlug);
 
         if (!existsInDb && !isKnownAgent) {
-          throw new Error(`Unknown agent: ${payload.toAgentId}`);
+          throw new Error(`Unknown agent: ${payload.toSlug}`);
         }
 
-        processedAgentId = payload.toAgentId;
+        processedSlug = payload.toSlug;
       });
 
       // myra is in knownAgents list, should work even if not in agent_identities
       const payload: AgentTriggerPayload = {
-        fromAgentId: 'test-sender',
-        toAgentId: 'myra',
+        fromSlug: 'test-sender',
+        toSlug: 'myra',
         triggerType: 'message',
       };
 
       const result = await gateway.processTrigger(payload);
 
       expect(result.success).toBe(true);
-      expect(processedAgentId).toBe('myra');
+      expect(processedSlug).toBe('myra');
     });
   });
 });

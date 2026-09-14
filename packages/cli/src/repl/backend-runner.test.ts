@@ -64,7 +64,7 @@ describe('runBackendTurn', () => {
 
     await runBackendTurn({
       backend: 'codex',
-      agentId: 'lumen',
+      sbSlug: 'lumen',
       prompt: 'ping',
     });
 
@@ -82,7 +82,7 @@ describe('runBackendTurn', () => {
 
     await runBackendTurn({
       backend: 'claude',
-      agentId: 'wren',
+      sbSlug: 'wren',
       prompt: 'ping',
     });
 
@@ -114,7 +114,7 @@ describe('runBackendTurn', () => {
 
       const resultPromise = runBackendTurn({
         backend: 'claude',
-        agentId: 'wren',
+        sbSlug: 'wren',
         prompt: 'marathon',
       });
 
