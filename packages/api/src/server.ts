@@ -45,7 +45,9 @@ import {
   stopHeartbeatService,
   processHeartbeat,
   type DueReminder,
+  type HeartbeatDeliveryOutcome,
 } from './services/heartbeat';
+import { createHeartbeatEscalation } from './services/heartbeat-escalation';
 import { StrategyService } from './services/strategy.service';
 import { getOrchestrator } from './services/sandbox/index.js';
 import { setResponseCallback, consumeExplicitResponse } from './mcp/tools/response-handlers';
@@ -529,8 +531,15 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
 
   /**
    * Deliver reminder via SessionService - same stateless flow as all other messages.
+   *
+   * The consecutive-failure count that separates a blip from an outage is not
+   * tracked here. It is derived from `reminder_history` inside processHeartbeat,
+   * because a process-local counter resets on restart — and a server restart is
+   * exactly when a monitor is most likely to be broken.
    */
-  const deliverReminderViaSession = async (reminder: DueReminder): Promise<boolean> => {
+  const deliverReminderViaSession = async (
+    reminder: DueReminder
+  ): Promise<HeartbeatDeliveryOutcome> => {
     const userId = reminder.user_id;
 
     // Strategy watchdog branch: reminders created by StrategyService carry
@@ -546,23 +555,36 @@ async function startServer(config: ServerConfig = {}): Promise<void> {
         logger.warn(
           `[Heartbeat] strategyWatchdog reminder ${reminder.id} has no groupId in metadata, skipping`
         );
-        return false;
+        return { status: 'failed', error: 'strategyWatchdog reminder has no groupId in metadata' };
       }
       try {
         const strategyService = new StrategyService(dataComposer, getOrchestrator());
-        const fired = await strategyService.triggerWatchdog(groupId);
-        if (fired) {
+        const result = await strategyService.triggerWatchdog(groupId);
+        if (result.outcome === 'fired') {
           logger.info(
             `[Heartbeat] Strategy watchdog fired for group ${groupId} (reminder ${reminder.id})`
           );
+          return { status: 'delivered' };
         }
-        return fired;
+        if (result.outcome === 'skipped') {
+          // The watchdog cancelled itself because there is nothing left to
+          // watch. That is the watchdog working, not a monitor going down —
+          // escalating it would page a human every time a strategy finished.
+          return {
+            status: 'skipped',
+            reason: `strategy watchdog stood down for group ${groupId}: ${result.reason}`,
+          };
+        }
+        return { status: 'failed', error: result.error };
       } catch (err) {
         logger.error(
           `[Heartbeat] Strategy watchdog failed for group ${groupId} (reminder ${reminder.id}):`,
           err
         );
-        return false;
+        return {
+          status: 'failed',
+          error: err instanceof Error ? err.message : String(err),
+        };
       }
     }
 
@@ -706,12 +728,52 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
         await routeResponses(result.responses, result.sessionId);
       }
 
-      return result.success;
+      // The error is the point. Returning a bare `result.success` here is what
+      // reduced "Backend claude is not authenticated (not logged in)" to the
+      // recorded reason "Delivery callback returned false".
+      if (result.success) {
+        return { status: 'delivered' };
+      }
+      return {
+        status: 'failed',
+        error: result.error || 'session reported failure',
+      };
     } catch (error) {
       logger.error(`Failed to deliver reminder ${reminder.id}:`, error);
-      return false;
+      return {
+        status: 'failed',
+        error: error instanceof Error ? error.message : String(error),
+      };
     }
   };
+
+  /**
+   * Escalation for a failed beat, and the all-clear when it comes back.
+   *
+   * Heartbeats bypass the agent gateway entirely, so `trigger:error` — and
+   * with it the whole `[TriggerFailure]` path that restores the message and
+   * notifies the sender — never fires for a beat. And even if it did, it
+   * would return at `if (!payload.fromAgentId)`: a heartbeat's sender is
+   * `system`, so there is nobody to notify. Unreportable twice over.
+   *
+   * The implementation lives in `heartbeat-escalation.ts` rather than in this
+   * closure, so it can be tested as the thing that actually reports an outage.
+   * A suite built against a mocked hook proves the hook gets called; it cannot
+   * prove a notice reached anyone.
+   */
+  const heartbeatEscalation = dataComposer
+    ? createHeartbeatEscalation({
+        client: dataComposer.getClient(),
+        // The direct path: straight out over the channel, no session and no
+        // LLM turn anywhere in it. A notice that needs an SB to wake up cannot
+        // be the one that reports an SB failing to wake up.
+        sendToChannel: async (response) => {
+          if (!channelGateway) throw new Error('ChannelGateway not initialized');
+          return channelGateway.sendResponse(response);
+        },
+        defaultAgentId: agentId,
+      })
+    : null;
 
   if (heartbeatServiceEnabled) {
     const sweepLeaseService = new StudioLeaseService(dataComposer!.getClient());
@@ -724,7 +786,11 @@ Do NOT just respond here — you MUST explicitly call send_response to reach ext
       enableLocalCron,
       onHeartbeat: async () => {
         logger.info('Heartbeat tick — processing due reminders');
-        const stats = await processHeartbeat(deliverReminderViaSession);
+        const stats = await processHeartbeat(
+          deliverReminderViaSession,
+          heartbeatEscalation?.onFailure,
+          heartbeatEscalation?.onRecovery
+        );
         logger.info('Heartbeat complete', stats);
 
         // Lease sweep: expire leases whose heartbeat went stale (rescuing the

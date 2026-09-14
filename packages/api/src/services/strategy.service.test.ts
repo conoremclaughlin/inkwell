@@ -2211,9 +2211,9 @@ describe('StrategyService', () => {
       dc.repositories.taskGroups.findById.mockResolvedValue(group);
       setupChains(dc, [chainGroupTasks(tasks)]);
 
-      const fired = await service.triggerWatchdog('group-1');
+      const result = await service.triggerWatchdog('group-1');
 
-      expect(fired).toBe(true);
+      expect(result.outcome).toBe('fired');
       expect(sendMock).toHaveBeenCalledTimes(1);
       const call = (sendMock as unknown as { mock: { calls: unknown[][] } }).mock.calls[0];
       const payload = call[0] as Record<string, unknown>;
@@ -2223,34 +2223,72 @@ describe('StrategyService', () => {
       expect((payload.metadata as Record<string, unknown>).reason).toBe('watchdog');
     });
 
-    it('triggerWatchdog returns false and cancels watchdog when group is not active', async () => {
+    // 'skipped', not 'failed'. A paused group is the watchdog standing down
+    // because there is nothing left to watch — if this reported a failure, the
+    // heartbeat would raise an outage alert every time a strategy was paused.
+    it('triggerWatchdog SKIPS (does not fail) and cancels watchdog when group is not active', async () => {
       const { handleSendToInbox: sendMock } = await import('../mcp/tools/inbox-handlers');
 
       const group = createMockGroup({ strategy: 'persistence', status: 'paused' });
       dc.repositories.taskGroups.findById.mockResolvedValue(group);
       setupChains(dc, [chainNoop()]); // cancelWatchdogReminder
 
-      const fired = await service.triggerWatchdog('group-1');
+      const result = await service.triggerWatchdog('group-1');
 
-      expect(fired).toBe(false);
+      expect(result.outcome).toBe('skipped');
+      expect(result).toMatchObject({ reason: expect.stringContaining('paused') });
       expect(sendMock).not.toHaveBeenCalled();
       // Verify the watchdog cancelled itself
       const client = dc.getClient();
       expect(client.from).toHaveBeenCalledWith('scheduled_reminders');
     });
 
-    it('triggerWatchdog returns false and cancels watchdog when group is not found', async () => {
+    it('triggerWatchdog SKIPS (does not fail) and cancels watchdog when group is not found', async () => {
       const { handleSendToInbox: sendMock } = await import('../mcp/tools/inbox-handlers');
 
       dc.repositories.taskGroups.findById.mockResolvedValue(null);
       setupChains(dc, [chainNoop()]); // cancelWatchdogReminder
 
-      const fired = await service.triggerWatchdog('group-missing');
+      const result = await service.triggerWatchdog('group-missing');
 
-      expect(fired).toBe(false);
+      expect(result.outcome).toBe('skipped');
       expect(sendMock).not.toHaveBeenCalled();
       const client = dc.getClient();
       expect(client.from).toHaveBeenCalledWith('scheduled_reminders');
+    });
+
+    it('triggerWatchdog SKIPS when the group has no remaining task', async () => {
+      const group = createMockGroup({ strategy: 'persistence', status: 'active' });
+      dc.repositories.taskGroups.findById.mockResolvedValue(group);
+      // No tasks at all, and the current_task_index fallback finds nothing
+      // either — the strategy has run out of work, which is completion, not
+      // an outage.
+      // getTaskByOrder misses on the exact-order query, then misses again on
+      // its created_at fallback, which has a different chain shape.
+      const chainTaskFallbackEmpty = {
+        select: vi.fn().mockReturnValue({
+          eq: vi.fn().mockReturnValue({
+            in: vi.fn().mockReturnValue({
+              order: vi.fn().mockReturnValue({
+                order: vi.fn().mockReturnValue({
+                  limit: vi.fn().mockResolvedValue({ data: [], error: null }),
+                }),
+              }),
+            }),
+          }),
+        }),
+      };
+      setupChains(dc, [
+        chainGroupTasks([]),
+        chainTaskFound(null as unknown as ProjectTask),
+        chainTaskFallbackEmpty,
+        chainNoop(),
+      ]);
+
+      const result = await service.triggerWatchdog('group-1');
+
+      expect(result.outcome).toBe('skipped');
+      expect(result).toMatchObject({ reason: expect.stringContaining('no pending') });
     });
 
     it('triggerWatchdog falls back to current_task_index when no in-progress task', async () => {
@@ -2273,9 +2311,9 @@ describe('StrategyService', () => {
       // getTaskByOrder fallback which returns the pending task.
       setupChains(dc, [chainGroupTasks(tasks), chainTaskFound(pendingTask)]);
 
-      const fired = await service.triggerWatchdog('group-1');
+      const result = await service.triggerWatchdog('group-1');
 
-      expect(fired).toBe(true);
+      expect(result.outcome).toBe('fired');
       const call = (sendMock as unknown as { mock: { calls: unknown[][] } }).mock.calls[0];
       const payload = call[0] as Record<string, unknown>;
       expect(payload.content).toContain(pendingTask.title);
