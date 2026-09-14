@@ -4,7 +4,7 @@
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { Database } from '../supabase/types';
-import { resolveIdentityId } from '../../auth/resolve-identity';
+import { resolveIdentityId, resolveOwnerSbId } from '../../auth/resolve-identity';
 import { logger } from '../../utils/logger';
 import {
   buildChunkMetadataUpdate,
@@ -1485,11 +1485,7 @@ export class MemoryRepository {
     // slug is a fallback for callers that have none: `agent_id` is unique only
     // per (user_id, workspace_id), so the lookup can land on a same-named
     // identity in another workspace and stamp the row with the wrong owner.
-    const sbId =
-      input.sbId ??
-      (input.agentId && input.userId
-        ? await resolveIdentityId(this.supabase, input.userId, input.agentId)
-        : null);
+    const sbId = await resolveOwnerSbId(this.supabase, input.userId, input.agentId, input.sbId);
 
     const insertData: Record<string, unknown> = {
       ...(input.id ? { id: input.id } : {}),

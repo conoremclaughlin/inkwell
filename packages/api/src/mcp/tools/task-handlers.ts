@@ -16,6 +16,7 @@ import { getRequestContext, getSessionContext } from '../../utils/request-contex
 import { GraphExecutorService, type GraphEvaluation } from '../../services/graph-executor.service';
 import { isBareDate, resolveDueDate, InvalidDueDateError } from '../../utils/due-date';
 import { logger } from '../../utils/logger';
+import { resolveIdentityId } from '../../auth/resolve-identity';
 
 export const DUE_DATE_DESCRIPTION =
   'Deadline. Bare YYYY-MM-DD (e.g. "2026-09-14") resolves to the end of that day in the ' +
@@ -909,6 +910,15 @@ export const addTaskCommentSchema = z.object({
   agentId: z.string().optional().describe('Agent ID for identity attribution'),
 });
 
+/**
+ * Slug -> canonical identity UUID, via the shared resolver.
+ *
+ * This used to query agent_identities itself with .limit(1).single(), which
+ * differed from the shared resolver in two ways that both lost attribution:
+ * with no workspace it silently took whichever row came back first, and WITH a
+ * workspace it matched workspace_id exactly, so an identity not yet backfilled
+ * (workspace_id IS NULL) resolved to nothing and the comment lost its sbId.
+ */
 async function resolveIdentityIdForAgent(
   dataComposer: DataComposer,
   userId: string,
@@ -916,17 +926,7 @@ async function resolveIdentityIdForAgent(
   workspaceId: string | undefined
 ): Promise<string | null> {
   if (!agentId) return null;
-  let query = dataComposer
-    .getClient()
-    .from('agent_identities')
-    .select('id')
-    .eq('agent_id', agentId)
-    .eq('user_id', userId);
-  if (workspaceId) {
-    query = query.eq('workspace_id', workspaceId);
-  }
-  const { data } = await query.limit(1).single();
-  return (data as { id: string } | null)?.id ?? null;
+  return resolveIdentityId(dataComposer.getClient(), userId, agentId, workspaceId);
 }
 
 export async function handleAddTaskComment(

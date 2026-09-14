@@ -9,7 +9,7 @@
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { Database, Json } from '../supabase/types';
-import { resolveIdentityId } from '../../auth/resolve-identity';
+import { resolveOwnerSbId } from '../../auth/resolve-identity';
 
 type StudiosTable = Database['public']['Tables']['studios'];
 
@@ -141,9 +141,7 @@ export class StudiosRepository {
   }
 
   async create(input: CreateStudioInput): Promise<Studio> {
-    const sbId =
-      input.sbId ||
-      (input.agentId ? await resolveIdentityId(this.client, input.userId, input.agentId) : null);
+    const sbId = await resolveOwnerSbId(this.client, input.userId, input.agentId, input.sbId);
 
     const insertData: StudiosTable['Insert'] = {
       user_id: input.userId,
