@@ -12,7 +12,9 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { resolveSlug } from './index';
+// NOT from './index': that entrypoint logs at module scope and ends in
+// main(), which arms the inbox poller. Importing it from a test runs that.
+import { resolveSlug } from './identity';
 
 const ENV_KEYS = ['INK_SB_SLUG', 'INK_AGENT_ID', 'SB_SLUG', 'AGENT_ID'] as const;
 

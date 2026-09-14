@@ -31,7 +31,9 @@ vi.mock('../utils/logger', () => ({
 // the code under review. Mutating the source left such a test green.
 import { decodeContextToken, encodeContextToken } from '../../../shared/src/runner/mcp-config';
 import { normalizePendingAuth } from '../mcp/auth/pcp-auth-provider';
-import { archivedMetadataSlug } from '../routes/admin';
+// NOT from '../routes/admin': that module registers ~100 Express routes and
+// an auth middleware at module scope.
+import { archivedMetadataSlug } from '../utils/archived-metadata';
 // NOT from '../server': that module ends in an unconditional startServer(...),
 // so importing it starts a real server from inside the test run.
 import { resolveServerSbSlug } from '../config/server-identity';
